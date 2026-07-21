@@ -303,7 +303,9 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
         ),
         require_reasoning_content_model_ids=_DEEPSEEK_V4_MODEL_IDS,
         allow_post_terminal_noop_choice=True,
-        post_terminal_metadata_keys=frozenset({"cost_cny", "trace_id"}),
+        post_terminal_metadata_keys=frozenset(
+            {"billing_pending", "cost_cny", "reasoning_available", "trace_id"}
+        ),
     ),
     "lm_studio": OpenAICompatPolicy(display_name="LM Studio"),
     "ovms": OpenAICompatPolicy(display_name="OpenVINO Model Server"),
