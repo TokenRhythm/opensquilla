@@ -214,6 +214,7 @@ class _TurnRunnerPromptAssemblerAdapter(PromptAssemblerPort):
         prompt_metadata: dict[str, Any],
         bootstrap_context_mode: str | None,
         fresh_user_session: bool = False,
+        workspace_dir: str | None = None,
     ) -> str | tuple[str, str]:
         return self._runner._assemble_prompt(
             agent_id,
@@ -224,6 +225,7 @@ class _TurnRunnerPromptAssemblerAdapter(PromptAssemblerPort):
             prompt_metadata=prompt_metadata,
             bootstrap_context_mode=bootstrap_context_mode,
             fresh_user_session=fresh_user_session,
+            workspace_dir=workspace_dir,
         )
 
 class _TurnRunnerPipelineExecutionAdapter(PipelineExecutionPort):
@@ -1032,6 +1034,7 @@ class _TurnRunnerSystemPromptRefreshAdapter(SystemPromptRefreshPort):
             tool_defs,
             session_key=session_key,
             bootstrap_context_mode=bootstrap_context_mode,
+            workspace_dir=getattr(agent.config, "workspace_dir", None),
         )
         refreshed_prompt = (
             assembled[0] if isinstance(assembled, tuple) else assembled

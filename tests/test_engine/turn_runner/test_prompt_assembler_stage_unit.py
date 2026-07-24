@@ -28,6 +28,7 @@ from opensquilla.engine.turn_runner.prompt_assembler_stage import (
     SessionIdResolverPort,
 )
 from opensquilla.observability.prompt_report import PromptReport
+from opensquilla.tools.types import ToolContext
 
 # ---------------------------------------------------------------------------
 # Recording fakes (one per port)
@@ -52,6 +53,7 @@ class _RecordingPromptAssembler:
         prompt_metadata,
         bootstrap_context_mode,
         fresh_user_session=False,
+        workspace_dir=None,
     ):
         self.calls += 1
         self.last_kwargs = dict(
@@ -62,6 +64,7 @@ class _RecordingPromptAssembler:
             extra_context=extra_context,
             bootstrap_context_mode=bootstrap_context_mode,
             fresh_user_session=fresh_user_session,
+            workspace_dir=workspace_dir,
         )
         prompt_metadata.update(self.metadata_to_emit)
         return self.base_prompt
@@ -335,6 +338,22 @@ async def test_prompt_assembler_forwards_fresh_user_session_flag():
     await stage.run(_make_input(fresh_user_session=True))
 
     assert prompt_assembler.last_kwargs["fresh_user_session"] is True
+
+
+@pytest.mark.asyncio
+async def test_prompt_assembler_uses_effective_tool_workspace() -> None:
+    prompt_assembler = _RecordingPromptAssembler()
+    stage = _make_stage(assembler=prompt_assembler)
+
+    await stage.run(
+        _make_input(
+            effective_tool_context=ToolContext(
+                workspace_dir="D:\\lrk\\opensquilla",
+            )
+        )
+    )
+
+    assert prompt_assembler.last_kwargs["workspace_dir"] == "D:\\lrk\\opensquilla"
 
 
 async def test_prompt_assembler_forwards_bound_user_message_id_to_router_context():

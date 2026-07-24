@@ -95,6 +95,32 @@ def test_unattended_bootstrap_context_skips_only_bootstrap_md(tmp_path) -> None:
     assert {"AGENTS.md", "SOUL.md", "IDENTITY.md", "TOOLS.md", "USER.md"} <= filenames
 
 
+def test_prompt_reports_the_effective_execution_workspace(tmp_path) -> None:
+    default_workspace = tmp_path / "default-workspace"
+    project_workspace = tmp_path / "project-workspace"
+    default_workspace.mkdir()
+    project_workspace.mkdir()
+    runner = TurnRunner(
+        provider_selector=None,
+        config=SimpleNamespace(
+            workspace_dir=str(default_workspace),
+            memory=SimpleNamespace(source="workspace"),
+            tools=SimpleNamespace(profile=None),
+        ),
+    )
+
+    assembled = runner._assemble_prompt(
+        "main",
+        [],
+        session_key="agent:main:webchat:project-task",
+        workspace_dir=str(project_workspace),
+    )
+
+    base_prompt = assembled[0] if isinstance(assembled, tuple) else assembled
+    assert f"Working directory: {project_workspace}" in base_prompt
+    assert f"Working directory: {default_workspace}" not in base_prompt
+
+
 def test_prompt_metadata_uses_effective_memory_retrieval_metadata(tmp_path) -> None:
     (tmp_path / "AGENTS.md").write_text("agents\n", encoding="utf-8")
 

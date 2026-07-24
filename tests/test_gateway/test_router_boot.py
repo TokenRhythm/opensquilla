@@ -2067,6 +2067,70 @@ async def test_task_runtime_turn_uses_agent_registry_model_when_session_has_no_m
 
 
 @pytest.mark.asyncio
+async def test_task_runtime_turn_uses_workspace_from_saved_run_context(
+    tmp_path: Path,
+) -> None:
+    class RecordingTurnRunner:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            self.calls.append(kwargs)
+            yield DoneEvent()
+
+    default_workspace = tmp_path / "default-workspace"
+    project_workspace = tmp_path / "project-workspace"
+    default_workspace.mkdir()
+    project_workspace.mkdir()
+    envelope = build_cli_route_envelope(
+        session_key="agent:main:project-task",
+        agent_id="main",
+    )
+    envelope.metadata["sandbox_run_context"] = {
+        "run_mode": "trusted",
+        "workspace": str(project_workspace),
+        "mounts": [],
+        "domains": [],
+        "bundles": [],
+        "public_network": [],
+        "temporary_grants": [],
+    }
+    object.__setattr__(envelope, "sandbox_run_context_fresh", True)
+    run = SimpleNamespace(
+        agent_id="main",
+        task_id="task-project-workspace",
+        session_key="agent:main:project-task",
+        message="pwd",
+        envelope=envelope,
+        attachments=[],
+        input_provenance={},
+        run_kind="interactive",
+        no_memory_capture=False,
+        ingress_pipeline_steps=[],
+        semantic_message=None,
+        stream_event_sink=None,
+    )
+    runner = RecordingTurnRunner()
+
+    async def emit(_session_key: str, _event_name: str, _payload: dict[str, Any]) -> None:
+        return None
+
+    await dispatch_task_runtime_turn(
+        run,
+        config=GatewayConfig(
+            workspace_dir=str(default_workspace),
+            agent_stream_heartbeat_interval_seconds=0.0,
+            agent_stream_idle_timeout_seconds=1.0,
+        ),
+        session_manager=None,
+        turn_runner=runner,
+        event_emitter=emit,
+    )
+
+    assert runner.calls[0]["tool_context"].workspace_dir == str(project_workspace)
+
+
+@pytest.mark.asyncio
 async def test_task_runtime_turn_uses_acceptance_time_model_routing_config() -> None:
     live_config = GatewayConfig(
         squilla_router={"enabled": False, "rollout_phase": "observe"},

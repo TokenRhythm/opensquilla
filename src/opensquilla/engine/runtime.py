@@ -4988,6 +4988,7 @@ class TurnRunner:
         prompt_metadata: dict[str, Any] | None = None,
         bootstrap_context_mode: str | None = None,
         fresh_user_session: bool = False,
+        workspace_dir: str | None = None,
     ) -> str | tuple[str, str]:
         """Assemble identity system prompt via Jinja2 template.
 
@@ -5164,7 +5165,7 @@ class TurnRunner:
         runtime_info = {
             "os": os_name,
             "shell": os.environ.get("SHELL", ""),
-            "workspace_dir": str(bootstrap_workspace_dir),
+            "workspace_dir": str(workspace_dir or bootstrap_workspace_dir),
         }
         base_prompt = assemble_system_prompt(
             agent_profile,
