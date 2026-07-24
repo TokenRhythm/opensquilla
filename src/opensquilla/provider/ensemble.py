@@ -63,6 +63,13 @@ _ENSEMBLE_CANCEL_CLEANUP_TIMEOUT_SECONDS = 5.0
 # this a single 429/5xx blip would discard the whole billed proposer round.
 _ENSEMBLE_AGGREGATOR_MAX_RETRIES = 2
 _ENSEMBLE_AGGREGATOR_RETRY_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 4.0)
+# A completed aggregator request can still be unusable when a reasoning model
+# exhausts its completion allowance before emitting any text or tool call.  The
+# proposal round is already complete, so retry only this final physical leg.
+_ENSEMBLE_AGGREGATOR_REASONING_ONLY_RETRY_PROMPT = (
+    "Return the visible final answer or the appropriate tool call now. "
+    "Do not spend the remaining response budget expanding private reasoning."
+)
 _AGGREGATOR_RETRYABLE_FAILURE_KINDS = frozenset(
     {
         ProviderFailureKind.RATE_LIMITED,
@@ -1626,9 +1633,12 @@ class EnsembleProvider:
                 error=error,
             )
 
-        def ensemble_done(event: DoneEvent, *, aggregator_elapsed_ms: int) -> DoneEvent:
-            output_text = "".join(final_text_parts)
-            _attach_final_request_output(trace, event=event, output_text=output_text)
+        retried_aggregator_rows: list[dict[str, Any]] = []
+        missing_aggregator_receipts = 0
+
+        def aggregator_usage_row(
+            event: DoneEvent, *, aggregator_elapsed_ms: int
+        ) -> tuple[_AggregatorAccumulator, dict[str, Any]]:
             acc = _AggregatorAccumulator(
                 input_tokens=event.input_tokens,
                 output_tokens=event.output_tokens,
@@ -1640,8 +1650,8 @@ class EnsembleProvider:
                 billing_receipt=event.billing_receipt,
                 model=event.model or self.aggregator.provider_config.model,
             )
-            rows = [
-                *prior_rows,
+            return (
+                acc,
                 acc.usage_row(
                     profile=self.profile_name,
                     member=self.aggregator,
@@ -1649,7 +1659,15 @@ class EnsembleProvider:
                     label="aggregator",
                     elapsed_ms=aggregator_elapsed_ms,
                 ),
-            ]
+            )
+
+        def ensemble_done(event: DoneEvent, *, aggregator_elapsed_ms: int) -> DoneEvent:
+            output_text = "".join(final_text_parts)
+            _attach_final_request_output(trace, event=event, output_text=output_text)
+            acc, current_row = aggregator_usage_row(
+                event, aggregator_elapsed_ms=aggregator_elapsed_ms
+            )
+            rows = [*prior_rows, *retried_aggregator_rows, current_row]
             return replace(
                 event,
                 input_tokens=_summed_int(rows, "input_tokens"),
@@ -1663,28 +1681,32 @@ class EnsembleProvider:
                 cost_source=_rollup_cost_source(rows),
                 model_usage_breakdown=rows,
                 ensemble_trace=trace,
-                # Each retried aggregator attempt started a request that never
-                # produced a usage receipt.
-                usage_missing_count=prior_missing_count + attempt,
+                usage_missing_count=prior_missing_count + missing_aggregator_receipts,
                 billing_receipt=None,
             )
 
         def partial_error(event: ErrorEvent) -> ErrorEvent:
             return replace(
                 event,
-                model_usage_breakdown=list(prior_rows),
-                usage_missing_count=prior_missing_count + attempt + 1,
+                model_usage_breakdown=[*prior_rows, *retried_aggregator_rows],
+                usage_missing_count=(
+                    prior_missing_count + missing_aggregator_receipts + 1
+                ),
             )
 
         yield aggregator_progress("aggregator_start")
         attempt = 0
+        reasoning_only_retry_done = False
+        request_messages = messages
         while True:
             content_streamed = False
+            buffered_reasoning_events: list[ReasoningDeltaEvent] = []
             retry_error: ErrorEvent | None = None
+            retry_reason: str | None = None
             heartbeat_stream: AsyncIterator[StreamEvent] | None = None
             try:
                 _mark_final_request_started(trace)
-                stream = provider.chat(messages, tools=tools, config=config)
+                stream = provider.chat(request_messages, tools=tools, config=config)
                 timeout_seconds = (
                     self.aggregator_timeout_seconds
                     if self.aggregator_timeout_seconds > 0
@@ -1701,6 +1723,33 @@ class EnsembleProvider:
                         aggregator_elapsed_ms = int(
                             (time.monotonic() - aggregator_started) * 1000
                         )
+                        has_reasoning = bool(
+                            buffered_reasoning_events
+                            or (event.reasoning_content and event.reasoning_content.strip())
+                            or event.reasoning_tokens > 0
+                        )
+                        if (
+                            not reasoning_only_retry_done
+                            and not content_streamed
+                            and event.stop_reason == "length"
+                            and has_reasoning
+                        ):
+                            _, failed_row = aggregator_usage_row(
+                                event, aggregator_elapsed_ms=aggregator_elapsed_ms
+                            )
+                            retried_aggregator_rows.append(failed_row)
+                            reasoning_only_retry_done = True
+                            retry_reason = "reasoning_only_length"
+                            request_messages = [
+                                *messages,
+                                Message(
+                                    role="user",
+                                    content=_ENSEMBLE_AGGREGATOR_REASONING_ONLY_RETRY_PROMPT,
+                                ),
+                            ]
+                            break
+                        for reasoning_event in buffered_reasoning_events:
+                            yield reasoning_event
                         done_event = ensemble_done(
                             event,
                             aggregator_elapsed_ms=aggregator_elapsed_ms,
@@ -1741,30 +1790,42 @@ class EnsembleProvider:
                         )
                         if (
                             not content_streamed
+                            and not buffered_reasoning_events
                             and attempt < _ENSEMBLE_AGGREGATOR_MAX_RETRIES
                             and self._aggregator_error_is_retryable(
                                 message=safe_event.message,
                                 code=safe_event.code,
                             )
                         ):
+                            missing_aggregator_receipts += 1
                             retry_error = safe_event
                             break
+                        for reasoning_event in buffered_reasoning_events:
+                            yield reasoning_event
                         yield aggregator_progress(
                             "aggregator_finish",
                             error=safe_event.message,
                         )
                         yield partial_error(safe_event)
                         return
+                    elif isinstance(event, ReasoningDeltaEvent):
+                        if content_streamed:
+                            yield event
+                        else:
+                            buffered_reasoning_events.append(event)
                     elif isinstance(event, TextDeltaEvent):
+                        for reasoning_event in buffered_reasoning_events:
+                            yield reasoning_event
+                        buffered_reasoning_events.clear()
                         content_streamed = True
                         final_text_parts.append(event.text)
                         yield event
                     elif isinstance(event, ProviderHeartbeatEvent):
                         yield event
                     else:
-                        # Reasoning/tool-use deltas are user-visible; replaying
-                        # the aggregator after emitting them would duplicate
-                        # output downstream, so they pin this attempt.
+                        for reasoning_event in buffered_reasoning_events:
+                            yield reasoning_event
+                        buffered_reasoning_events.clear()
                         content_streamed = True
                         yield event
             except TimeoutError:
@@ -1786,6 +1847,7 @@ class EnsembleProvider:
                 )
                 if (
                     not content_streamed
+                    and not buffered_reasoning_events
                     and attempt < _ENSEMBLE_AGGREGATOR_MAX_RETRIES
                     and self._aggregator_error_is_retryable(
                         message=safe_message,
@@ -1804,7 +1866,7 @@ class EnsembleProvider:
                     yield aggregator_progress("aggregator_finish", error=error.message)
                     yield partial_error(error)
                     return
-            if retry_error is None:
+            if retry_error is None and retry_reason is None:
                 error = ErrorEvent(
                     message="ensemble aggregator stream ended before DoneEvent",
                     code="ensemble_aggregator_incomplete",
@@ -1820,8 +1882,25 @@ class EnsembleProvider:
             final_request = trace.get("final_request")
             if isinstance(final_request, dict):
                 final_request["retry_count"] = attempt
+                if retry_reason is not None:
+                    final_request["retry_reason"] = retry_reason
             # The retried attempt is one more real upstream request.
             trace["llm_request_count"] = int(trace.get("llm_request_count") or 0) + 1
+            if retry_reason == "reasoning_only_length":
+                log.warning(
+                    "ensemble.aggregator_reasoning_only_retry",
+                    attempt=attempt,
+                    provider=self.aggregator.provider_config.provider,
+                )
+                yield ProviderHeartbeatEvent(
+                    phase="ensemble_aggregator_reasoning_only_retry",
+                    message=(
+                        "Ensemble aggregator exhausted reasoning before visible output; "
+                        "retrying once"
+                    ),
+                )
+                continue
+            assert retry_error is not None
             log.warning(
                 "ensemble.aggregator_retry",
                 attempt=attempt,

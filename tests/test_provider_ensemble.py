@@ -22,6 +22,7 @@ from opensquilla.provider import (
     Message,
     ProviderHeartbeatEvent,
     ProviderRequestCorrelation,
+    ReasoningDeltaEvent,
     TextDeltaEvent,
     ToolDefinition,
     ToolInputSchema,
@@ -2618,6 +2619,152 @@ async def test_aggregator_transient_error_is_retried_in_place(
     ]
     assert len(finishes) == 1
     assert not finishes[0].error
+
+
+@pytest.mark.asyncio
+async def test_aggregator_reasoning_only_length_retries_in_place_without_replaying_proposers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, call_count = _flaky_aggregator_harness(
+        monkeypatch,
+        [
+            [
+                ReasoningDeltaEvent(text="discarded private reasoning"),
+                DoneEvent(
+                    stop_reason="length",
+                    input_tokens=10,
+                    output_tokens=20,
+                    reasoning_tokens=19,
+                    model="agg",
+                ),
+            ],
+            [
+                TextDeltaEvent(text="visible final"),
+                DoneEvent(
+                    stop_reason="stop",
+                    input_tokens=2,
+                    output_tokens=3,
+                    model="agg",
+                ),
+            ],
+        ],
+    )
+
+    events = await _collect(_retry_test_provider())
+
+    assert call_count[0] == 2
+    assert sum(call["model"] == "p1" for call in registry.calls) == 1
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert not any(
+        isinstance(event, ReasoningDeltaEvent)
+        and event.text == "discarded private reasoning"
+        for event in events
+    )
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    aggregator_rows = [
+        row for row in done.model_usage_breakdown if row.get("role") == "aggregator"
+    ]
+    assert len(aggregator_rows) == 2
+    assert done.input_tokens == 12
+    assert done.output_tokens == 23
+    assert done.reasoning_tokens == 19
+    assert done.ensemble_trace is not None
+    assert done.ensemble_trace["final_request"]["retry_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_aggregator_reasoning_only_length_recovery_is_bounded_to_one_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, call_count = _flaky_aggregator_harness(
+        monkeypatch,
+        [
+            [
+                ReasoningDeltaEvent(text="first private reasoning"),
+                DoneEvent(
+                    stop_reason="length",
+                    input_tokens=10,
+                    output_tokens=20,
+                    reasoning_tokens=19,
+                    model="agg",
+                ),
+            ],
+            [
+                ReasoningDeltaEvent(text="second private reasoning"),
+                DoneEvent(
+                    stop_reason="length",
+                    input_tokens=2,
+                    output_tokens=3,
+                    reasoning_tokens=2,
+                    model="agg",
+                ),
+            ],
+        ],
+    )
+
+    events = await _collect(_retry_test_provider())
+
+    assert call_count[0] == 2
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.stop_reason == "length"
+    assert len(
+        [row for row in done.model_usage_breakdown if row.get("role") == "aggregator"]
+    ) == 2
+
+
+@pytest.mark.asyncio
+async def test_aggregator_length_after_visible_text_does_not_use_reasoning_only_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, call_count = _flaky_aggregator_harness(
+        monkeypatch,
+        [
+            [
+                TextDeltaEvent(text="partial"),
+                DoneEvent(
+                    stop_reason="length",
+                    input_tokens=10,
+                    output_tokens=20,
+                    model="agg",
+                ),
+            ],
+            [TextDeltaEvent(text="must not run"), DoneEvent(model="agg")],
+        ],
+    )
+
+    events = await _collect(_retry_test_provider())
+
+    assert call_count[0] == 1
+    assert any(
+        isinstance(event, DoneEvent) and event.stop_reason == "length" for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_aggregator_length_after_tool_use_does_not_use_reasoning_only_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, call_count = _flaky_aggregator_harness(
+        monkeypatch,
+        [
+            [
+                ToolUseStartEvent(tool_use_id="call-1", tool_name="read_file"),
+                DoneEvent(
+                    stop_reason="length",
+                    input_tokens=10,
+                    output_tokens=20,
+                    reasoning_tokens=19,
+                    model="agg",
+                ),
+            ],
+            [TextDeltaEvent(text="must not run"), DoneEvent(model="agg")],
+        ],
+    )
+
+    events = await _collect(_retry_test_provider())
+
+    assert call_count[0] == 1
+    assert any(isinstance(event, ToolUseStartEvent) for event in events)
 
 
 @pytest.mark.asyncio

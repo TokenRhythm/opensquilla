@@ -1401,6 +1401,39 @@ class _IterationStreamTimeoutError(TimeoutError):
     """Raised when provider streaming exceeds the active Agent iteration budget."""
 
 
+def _terminal_physical_input_tokens(
+    provider_done: ProviderDoneEvent | None,
+    *,
+    fallback_input_tokens: int,
+) -> int:
+    """Return the last physical final-leg input size, not ensemble billing total."""
+
+    if provider_done is None:
+        return fallback_input_tokens
+    breakdown = getattr(provider_done, "model_usage_breakdown", None)
+    if not isinstance(breakdown, list):
+        return fallback_input_tokens
+    for row in reversed(breakdown):
+        if not isinstance(row, Mapping):
+            continue
+        if str(row.get("role") or "").strip().lower() not in {
+            "aggregator",
+            "fallback",
+            "single",
+        }:
+            continue
+        raw_input_tokens = row.get("input_tokens")
+        if raw_input_tokens is None or isinstance(raw_input_tokens, bool):
+            continue
+        try:
+            input_tokens = int(raw_input_tokens)
+        except (TypeError, ValueError):
+            continue
+        if input_tokens >= 0:
+            return input_tokens
+    return fallback_input_tokens
+
+
 def _is_large_context_invalid_response(
     kind: _ProviderAttemptKind,
     *,
@@ -6047,6 +6080,10 @@ class Agent:
                             output_tokens=iter_output_tokens,
                         )
                     if not _got_error and attempt_classification.kind != _ProviderAttemptKind.OK:
+                        terminal_request_input_tokens = _terminal_physical_input_tokens(
+                            provider_done_for_log,
+                            fallback_input_tokens=iter_input_tokens,
+                        )
                         logger.warning(
                             "provider.invalid_response",
                             session_key=self._session_key,
@@ -6060,6 +6097,7 @@ class Agent:
                             got_done_event=_got_done_event,
                             stop_reason=stop_reason,
                             iter_input_tokens=iter_input_tokens,
+                            terminal_request_input_tokens=terminal_request_input_tokens,
                             iter_output_tokens=iter_output_tokens,
                             iter_reasoning_tokens=iter_reasoning_tokens,
                             reasoning_chars=len(iter_reasoning_content or ""),
@@ -6067,7 +6105,7 @@ class Agent:
 
                         large_context_invalid = _is_large_context_invalid_response(
                             attempt_classification.kind,
-                            input_tokens=iter_input_tokens,
+                            input_tokens=terminal_request_input_tokens,
                         )
                         supports_reasoning_replay = supports_reasoning_prefill_replay(
                             model_capabilities=self.config.model_capabilities,
