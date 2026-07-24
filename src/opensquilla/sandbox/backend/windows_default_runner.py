@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -19,6 +20,8 @@ from pathlib import Path, PureWindowsPath
 from typing import Any
 
 HELPER_MODULE = "opensquilla.sandbox.backend.windows_default_runner"
+_LOCK_ACQUIRE_TIMEOUT_S = 30.0
+_LOCK_RETRY_INTERVAL_S = 0.05
 DISABLE_MAX_PRIVILEGE = 0x01
 LUA_TOKEN = 0x04
 WRITE_RESTRICTED = 0x08
@@ -1633,6 +1636,10 @@ def _sync_deny_acl_state_locked(
     desired_by_key = {
         _acl_path_key(path): (path, mask) for path, mask in normalized_desired.items()
     }
+    if {
+        key: mask for key, (_path, mask) in previous_by_key.items()
+    } == {key: mask for key, (_path, mask) in desired_by_key.items()}:
+        return
 
     _mark_acl_state_tainted(
         state_path,
@@ -1705,7 +1712,18 @@ def _cross_process_file_lock(lock_path: Path) -> Iterator[None]:
         if os.name == "nt":
             import msvcrt
 
-            msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+            deadline = time.monotonic() + max(0.0, _LOCK_ACQUIRE_TIMEOUT_S)
+            while True:
+                try:
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise SystemExit(
+                            f"windows_default execution lease is busy: {lock_path}"
+                        ) from None
+                    time.sleep(min(_LOCK_RETRY_INTERVAL_S, remaining))
             try:
                 yield
             finally:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import io
 import json
+import os
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -482,6 +483,30 @@ def test_cross_process_execution_lease_serializes_concurrent_runs(tmp_path: Path
     one.join(2)
     two.join(2)
     assert second_entered.is_set()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows file locking")
+def test_cross_process_execution_lease_reports_bounded_contention(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import msvcrt
+
+    from opensquilla.sandbox.backend import windows_default_runner as mod
+
+    real_locking = msvcrt.locking
+
+    def always_busy(fd: int, mode: int, size: int) -> None:
+        if mode == msvcrt.LK_NBLCK:
+            raise OSError(13, "permission denied")
+        real_locking(fd, mode, size)
+
+    monkeypatch.setattr(mod, "_LOCK_ACQUIRE_TIMEOUT_S", 0.0, raising=False)
+    monkeypatch.setattr(msvcrt, "locking", always_busy)
+
+    with pytest.raises(SystemExit, match="execution lease is busy"):
+        with mod._cross_process_file_lock(tmp_path / "execution.lock"):
+            pytest.fail("contended lease must not be entered")
 
 
 def test_offline_parent_reconciles_capability_denies_before_transition(
@@ -1184,6 +1209,52 @@ def test_deny_acl_state_sync_materializes_desired_and_removes_stale(
     assert persisted["principals"]["S-1-test"] == [
         {"mask": mod.FILE_MUTATION_DENY_MASK, "path": str(desired)}
     ]
+
+
+def test_deny_acl_state_sync_skips_unchanged_denies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_runner as mod
+
+    state_path = tmp_path / "deny_acl_state.json"
+    denied = tmp_path / "denied"
+    denied.mkdir()
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "principals": {
+                    "S-1-test": [
+                        {
+                            "path": str(denied),
+                            "mask": mod.FILE_MUTATION_DENY_MASK,
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+    monkeypatch.setattr(
+        mod,
+        "_deny_path_to_sid",
+        lambda path, sid, *, mask, label: calls.append(("deny", path, mask)),
+    )
+    monkeypatch.setattr(
+        mod,
+        "_revoke_path_for_sid",
+        lambda path, sid: calls.append(("revoke", path, None)),
+    )
+
+    mod._sync_deny_acl_state(
+        state_path,
+        "S-1-test",
+        {denied: mod.FILE_MUTATION_DENY_MASK},
+    )
+
+    assert calls == []
 
 
 def test_deny_acl_state_sync_rolls_back_acl_when_state_write_fails(

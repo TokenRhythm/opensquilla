@@ -89,6 +89,10 @@ _USER_MESSAGES: Final[dict[str, str]] = {
     "ConnectError": "The tool could not connect to the remote service.",
     "JSONDecodeError": "The tool received an invalid response payload.",
     "ToolRunBudgetExceededError": "The tool run budget for this turn is exhausted.",
+    "SandboxBackendError": (
+        "The sandbox environment could not run this operation. Do not retry with another "
+        "tool; report the sandbox failure once."
+    ),
     "policy_denial": "The action was blocked by policy. See user-facing reason for details.",
 }
 

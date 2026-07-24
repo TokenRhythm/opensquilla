@@ -296,6 +296,10 @@ def _filesystem_operation_request(
             env_allowlist=(
                 "PATH",
                 "PYTHONPATH",
+                "HOME",
+                "USERPROFILE",
+                "HOMEDRIVE",
+                "HOMEPATH",
                 "SystemRoot",
                 "WINDIR",
                 "ComSpec",
@@ -308,6 +312,7 @@ def _filesystem_operation_request(
         "PATH": str(_python_executable().parent),
         "PYTHONPATH": _pythonpath_for_worker(),
     }
+    _preserve_windows_home_env(env, host_env=os.environ)
     return SandboxRequest(
         argv=(
             str(_python_executable()),
@@ -328,6 +333,24 @@ def _filesystem_operation_request(
 
 def _python_executable() -> Path:
     return Path(sys.executable)
+
+
+def _preserve_windows_home_env(
+    env: dict[str, str],
+    *,
+    host_env: Mapping[str, str],
+) -> None:
+    profile = str(host_env.get("USERPROFILE") or host_env.get("HOME") or "").strip()
+    if not profile:
+        try:
+            profile = str(Path.home())
+        except (OSError, RuntimeError):
+            return
+    drive, tail = ntpath.splitdrive(profile)
+    env.setdefault("USERPROFILE", profile)
+    env.setdefault("HOME", profile)
+    env.setdefault("HOMEDRIVE", str(host_env.get("HOMEDRIVE") or drive))
+    env.setdefault("HOMEPATH", str(host_env.get("HOMEPATH") or tail or profile))
 
 
 def _capability_store_path() -> Path:
@@ -466,10 +489,10 @@ def _validate_filesystem_private_transport_roots(
 
 
 def _validate_profile_is_windows_compilable(profile: FileSystemPermissionProfile) -> None:
-    if profile.default_access is not FileSystemAccess.DENY:
+    if profile.default_access is FileSystemAccess.WRITE:
         raise SandboxBackendError(
-            "windows_default cannot compile non-deny default filesystem access; "
-            "the Windows platform profile must project explicit roots"
+            "windows_default cannot compile default filesystem access with write "
+            "authority; writable roots must be explicit"
         )
     if profile.denied_read_globs:
         raise SandboxBackendError(
@@ -612,13 +635,17 @@ def _acl_plan_payload(
     process_rx_roots = tuple(
         root for root in process_executable_rx_roots(request.argv, request.env) if root.exists()
     )
-    tool_rx_roots = tuple(
-        root
-        for root in _windows_tool_path_roots(
-            _process_base_env(request),
-            host_env=_host_tool_env(request),
+    tool_rx_roots = (
+        ()
+        if _is_filesystem_worker_request(request)
+        else tuple(
+            root
+            for root in _windows_tool_path_roots(
+                _process_base_env(request),
+                host_env=_host_tool_env(request),
+            )
+            if _acl_sensitive_marker(root) is None
         )
-        if _acl_sensitive_marker(root) is None
     )
     tool_traversal_roots = _windows_tool_traversal_roots(
         tool_rx_roots,
@@ -717,7 +744,9 @@ def _profile_acl_grants(
         if entry.access is FileSystemAccess.DENY or not path.exists():
             continue
         access = AclAccess.RWX if entry.access is FileSystemAccess.WRITE else AclAccess.RX
-        if access is AclAccess.RX and not _rx_root_needs_acl_grant(path, request.env):
+        if access is AclAccess.RX and (
+            _is_filesystem_root(path) or not _rx_root_needs_acl_grant(path, request.env)
+        ):
             continue
         grants.append(AclGrant(path, access, AclGrantKind.POLICY))
     return tuple(grants)
@@ -926,8 +955,13 @@ def _process_base_env(request: SandboxRequest) -> dict[str, str]:
         value = request.env.get(key) or os.environ.get(key)
         if isinstance(value, str) and value:
             env[key] = value
-    _prepend_windows_tool_paths(env, host_env=_host_tool_env(request))
+    if not _is_filesystem_worker_request(request):
+        _prepend_windows_tool_paths(env, host_env=_host_tool_env(request))
     return env
+
+
+def _is_filesystem_worker_request(request: SandboxRequest) -> bool:
+    return request.action_kind.startswith("fs.worker.")
 
 
 def _host_tool_env(request: SandboxRequest) -> dict[str, str]:

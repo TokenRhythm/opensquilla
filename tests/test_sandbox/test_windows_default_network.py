@@ -14,6 +14,20 @@ from opensquilla.sandbox.backend.windows_default_network import (
 )
 
 
+def _symlink_or_skip(
+    link: Path,
+    target: Path,
+    *,
+    target_is_directory: bool = False,
+) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=target_is_directory)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symbolic-link privilege is unavailable")
+        raise
+
+
 def test_proxy_ports_from_env_collects_loopback_proxy_ports() -> None:
     env = {
         "HTTP_PROXY": "http://127.0.0.1:43128",
@@ -443,7 +457,7 @@ def test_elevated_setup_rejects_precreated_junction_before_writing(monkeypatch, 
     outside = tmp_path / "outside"
     profile.mkdir()
     outside.mkdir()
-    (profile / ".opensquilla").symlink_to(outside, target_is_directory=True)
+    _symlink_or_skip(profile / ".opensquilla", outside, target_is_directory=True)
     marker = mod.default_setup_marker_path(profile)
     payload = mod._encode_setup_helper_payload(marker, user_sid="S-1-real")
     reports = []
@@ -490,7 +504,7 @@ def test_setup_marker_replaces_symlink_without_writing_its_target(tmp_path) -> N
     outside = tmp_path / "outside.json"
     outside.write_text("do not touch", encoding="utf-8")
     marker = tmp_path / "setup_marker.json"
-    marker.symlink_to(outside)
+    _symlink_or_skip(marker, outside)
 
     mod.write_setup_marker(marker)
 
@@ -508,7 +522,7 @@ def test_setup_marker_windows_writer_atomically_replaces_symlink(
     outside = tmp_path / "outside.json"
     outside.write_text("do not touch", encoding="utf-8")
     marker = tmp_path / "setup_marker.json"
-    marker.symlink_to(outside)
+    _symlink_or_skip(marker, outside)
     writer_paths = []
 
     def fake_windows_writer(path, data):

@@ -948,10 +948,13 @@ def _workspace_strict_read_block(
 ) -> dict[str, object] | None:
     """Return a block envelope when *resolved* escapes the strict workspace."""
 
+    candidate = resolved.expanduser().resolve(strict=False)
+    profile = active_file_system_profile(_workspace_root())
+    if profile is not None and profile.resolve(candidate) is not FileSystemAccess.DENY:
+        return _cross_session_attachment_block(tool_name, candidate, original_path)
     roots = _strict_read_roots()
     if not roots:
         return None
-    candidate = resolved.expanduser().resolve(strict=False)
     if not _is_within_any_root(candidate, roots):
         root_labels = ", ".join(str(root) for root in roots)
         return {
@@ -1001,6 +1004,15 @@ def _workspace_strict_candidate_marker(
         if resolved_candidate is not None
         else candidate.expanduser().resolve(strict=False)
     )
+    profile = active_file_system_profile(_workspace_root())
+    if profile is not None and profile.resolve(resolved) is not FileSystemAccess.DENY:
+        if _cross_session_attachment_block(
+            tool_name,
+            resolved,
+            original_path or str(candidate),
+        ):
+            return f"[blocked] {candidate}: another session's materialized attachments"
+        return None
     if not _is_within_any_root(resolved, roots):
         root_labels = ", ".join(str(root) for root in roots)
         return f"[blocked] {candidate}: outside active read roots ({root_labels})"

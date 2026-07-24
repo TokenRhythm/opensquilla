@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path, PureWindowsPath
 
 import pytest
@@ -13,6 +14,23 @@ from opensquilla.sandbox.permissions import (
 from opensquilla.sandbox.platform_permissions import FileSystemPlatformContext
 from opensquilla.sandbox.policy import build_policy
 from opensquilla.sandbox.types import SecurityLevel
+
+
+def _directory_link(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except OSError as exc:
+        if os.name != "nt" or getattr(exc, "winerror", None) != 1314:
+            raise
+    result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"directory links unavailable: {result.stderr or result.stdout}")
 
 
 def test_workspace_profile_reads_root_and_writes_declared_roots(
@@ -71,6 +89,37 @@ def test_unmatched_path_is_not_an_explicit_denied_read(tmp_path: Path) -> None:
     assert not profile.is_explicitly_denied(outside)
 
 
+def test_windows_workspace_profile_reads_all_drives_without_read_approval() -> None:
+    workspace = PureWindowsPath(r"D:\projects\opensquilla")
+    denied = PureWindowsPath(r"C:\Users\lrk\.ssh")
+    context = FileSystemPlatformContext(
+        platform="windows",
+        cwd=workspace,
+        home=PureWindowsPath(r"C:\Users\lrk"),
+        writable_roots=(workspace,),
+        env={},
+    )
+
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        denied_read_roots=(denied,),
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+        platform_context=context,
+    )
+
+    assert profile.default_access is FileSystemAccess.READ
+    assert profile.has_full_disk_read_baseline
+    assert (
+        profile.resolve(PureWindowsPath(r"C:\Windows\System32\drivers\etc\hosts"))
+        is FileSystemAccess.READ
+    )
+    assert profile.resolve(PureWindowsPath(r"D:\lrk\notes.txt")) is FileSystemAccess.READ
+    assert profile.resolve(PureWindowsPath(r"E:\archive\data.json")) is FileSystemAccess.READ
+    assert profile.resolve(workspace / "src" / "app.py") is FileSystemAccess.WRITE
+    assert profile.resolve(denied / "id_ed25519") is FileSystemAccess.DENY
+
+
 def test_denied_read_glob_takes_precedence_over_writable_root(tmp_path: Path) -> None:
     profile = FileSystemPermissionProfile.workspace(
         workspace=tmp_path,
@@ -85,7 +134,7 @@ def test_denied_read_glob_matches_canonical_symlink_path(tmp_path: Path) -> None
     real_root = tmp_path / "real"
     real_root.mkdir()
     alias_root = tmp_path / "alias"
-    alias_root.symlink_to(real_root, target_is_directory=True)
+    _directory_link(alias_root, real_root)
     profile = FileSystemPermissionProfile.workspace(
         workspace=tmp_path / "workspace",
         denied_read_globs=(str(alias_root / "**" / "*.pem"),),

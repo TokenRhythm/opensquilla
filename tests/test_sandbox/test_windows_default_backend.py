@@ -27,6 +27,23 @@ from opensquilla.sandbox.types import (
 from opensquilla.tools.types import ToolContext, current_tool_context
 
 
+def _directory_link(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except OSError as exc:
+        if os.name != "nt" or getattr(exc, "winerror", None) != 1314:
+            raise
+    result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"directory links unavailable: {result.stderr or result.stdout}")
+
+
 def _policy() -> SandboxPolicy:
     return SandboxPolicy(
         level=SecurityLevel.STANDARD,
@@ -104,6 +121,39 @@ def test_windows_acl_plan_compiles_profile_reads_writes_and_denies(
     assert plan["denyAclStatePath"] == str(tmp_path / "deny-acl.json")
 
 
+def test_windows_acl_plan_never_grants_read_access_on_filesystem_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+
+    filesystem_root = Path(tmp_path.anchor)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    profile = FileSystemPermissionProfile(
+        entries=(
+            FileSystemPermissionEntry(filesystem_root, FileSystemAccess.READ),
+            FileSystemPermissionEntry(workspace, FileSystemAccess.WRITE),
+        )
+    )
+    request = _request(workspace).with_policy(replace(_policy(), file_system=profile))
+    monkeypatch.setattr(
+        mod,
+        "capability_sids_for_command",
+        lambda store, roots, **kwargs: tuple(f"S-{i}" for i, _ in enumerate(roots)),
+    )
+    monkeypatch.setattr(mod, "_runtime_readonly_roots", lambda: ())
+    monkeypatch.setattr(mod, "runtime_rx_roots", lambda executable: ())
+    monkeypatch.setattr(mod, "process_executable_rx_roots", lambda argv, env: ())
+    monkeypatch.setattr(mod, "_windows_tool_path_roots", lambda *args, **kwargs: ())
+
+    plan = mod._acl_plan_payload(request)
+    grants = {item["path"]: item["access"] for item in plan["autoGrants"]}
+
+    assert str(filesystem_root) not in grants
+    assert grants[str(workspace)] == "RWX"
+
+
 def test_windows_acl_plan_preserves_lexical_and_canonical_denied_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -113,7 +163,7 @@ def test_windows_acl_plan_preserves_lexical_and_canonical_denied_paths(
     target = tmp_path / "target-secret"
     lexical = tmp_path / "configured-secret"
     target.mkdir()
-    lexical.symlink_to(target, target_is_directory=True)
+    _directory_link(lexical, target)
     profile = FileSystemPermissionProfile.read_only(
         readable_roots=(tmp_path,),
         denied_read_roots=(lexical,),
@@ -148,7 +198,7 @@ def test_windows_acl_plan_denies_write_through_lexical_and_canonical_aliases(
     canonical_secret = workspace / "secret"
     lexical_secret = alias / "secret"
     canonical_secret.mkdir(parents=True)
-    alias.symlink_to(workspace, target_is_directory=True)
+    _directory_link(alias, workspace)
     profile = FileSystemPermissionProfile.workspace(
         workspace=workspace,
         readable_roots=((lexical_secret,) if carveout_access is FileSystemAccess.READ else ()),
@@ -190,7 +240,7 @@ def test_windows_acl_plan_protects_reparse_ancestor_when_target_is_outside_write
     canonical_secret = outside / "secret"
     workspace.mkdir()
     canonical_secret.mkdir(parents=True)
-    alias.symlink_to(outside, target_is_directory=True)
+    _directory_link(alias, outside)
     profile = FileSystemPermissionProfile.workspace(
         workspace=workspace,
         denied_read_roots=(lexical_secret,),
@@ -414,18 +464,49 @@ def test_windows_acl_plan_requires_resolved_filesystem_profile(tmp_path: Path) -
         mod._acl_plan_payload(_request(tmp_path).with_policy(_policy()))
 
 
-@pytest.mark.parametrize("default_access", [FileSystemAccess.READ, FileSystemAccess.WRITE])
 def test_windows_acl_plan_fails_closed_for_unprojected_default_access(
     tmp_path: Path,
-    default_access: FileSystemAccess,
 ) -> None:
     from opensquilla.sandbox.backend import windows_default as mod
 
-    profile = FileSystemPermissionProfile(entries=(), default_access=default_access)
+    profile = FileSystemPermissionProfile(
+        entries=(),
+        default_access=FileSystemAccess.WRITE,
+    )
     request = _request(tmp_path).with_policy(replace(_policy(), file_system=profile))
 
     with pytest.raises(SandboxBackendError, match="default filesystem access"):
         mod._acl_plan_payload(request)
+
+
+def test_windows_acl_plan_accepts_implicit_full_disk_read_baseline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    profile = FileSystemPermissionProfile(
+        entries=(FileSystemPermissionEntry(workspace, FileSystemAccess.WRITE),),
+        default_access=FileSystemAccess.READ,
+    )
+    request = _request(workspace).with_policy(replace(_policy(), file_system=profile))
+    monkeypatch.setattr(
+        mod,
+        "capability_sids_for_command",
+        lambda store, roots, **kwargs: tuple(f"S-{i}" for i, _ in enumerate(roots)),
+    )
+    monkeypatch.setattr(mod, "_runtime_readonly_roots", lambda: ())
+    monkeypatch.setattr(mod, "runtime_rx_roots", lambda executable: ())
+    monkeypatch.setattr(mod, "process_executable_rx_roots", lambda argv, env: ())
+    monkeypatch.setattr(mod, "_windows_tool_path_roots", lambda *args, **kwargs: ())
+
+    plan = mod._acl_plan_payload(request)
+
+    assert {
+        item["path"]: item["access"] for item in plan["autoGrants"]
+    } == {str(workspace): "RWX"}
 
 
 def test_windows_profile_grants_keep_final_pure_windows_declaration(
@@ -1330,7 +1411,7 @@ def test_windows_filesystem_operation_request_uses_stdin_and_shared_profile(
     assert not (workspace / ".opensquilla-cache").exists()
 
 
-def test_windows_filesystem_operation_request_uses_minimal_environment(
+def test_windows_filesystem_operation_request_preserves_minimal_home_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1344,8 +1425,14 @@ def test_windows_filesystem_operation_request_uses_minimal_environment(
     python_exe = tmp_path / "runtime" / "Scripts" / "python.exe"
     python_exe.parent.mkdir(parents=True)
     python_exe.write_text("", encoding="utf-8")
+    host_profile = tmp_path / "host-profile"
+    host_profile.mkdir()
 
     monkeypatch.setattr(mod, "_python_executable", lambda: python_exe)
+    monkeypatch.setenv("USERPROFILE", str(host_profile))
+    monkeypatch.delenv("HOME", raising=False)
+    monkeypatch.delenv("HOMEDRIVE", raising=False)
+    monkeypatch.delenv("HOMEPATH", raising=False)
 
     operation = SandboxOperation.filesystem(
         kind="read_file",
@@ -1362,7 +1449,68 @@ def test_windows_filesystem_operation_request_uses_minimal_environment(
 
     assert request.env["PATH"] == str(python_exe.parent)
     assert "PYTHONPATH" in request.env
-    assert "USERPROFILE" not in request.env
+    assert request.env["USERPROFILE"] == str(host_profile)
+    assert request.env["HOME"] == str(host_profile)
+    assert request.env["HOMEDRIVE"] == host_profile.drive
+    assert request.env["HOMEPATH"] == str(host_profile)[len(host_profile.drive) :]
+    assert {"HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"} <= set(
+        request.policy.env_allowlist
+    )
+
+
+def test_windows_filesystem_worker_does_not_expand_general_tool_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+    from opensquilla.sandbox.operation_runtime import SandboxOperation
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "notes.txt"
+    target.write_text("notes", encoding="utf-8")
+    python_exe = tmp_path / "runtime" / "Scripts" / "python.exe"
+    python_exe.parent.mkdir(parents=True)
+    python_exe.write_text("", encoding="utf-8")
+    unrelated_tool_dir = tmp_path / "general-tools"
+    unrelated_tool_dir.mkdir()
+
+    monkeypatch.setattr(mod, "_python_executable", lambda: python_exe)
+    monkeypatch.setattr(mod, "_opensquilla_import_roots", lambda: ())
+    monkeypatch.setattr(mod, "_runtime_readonly_roots", lambda: ())
+    monkeypatch.setattr(
+        mod,
+        "_windows_tool_path_roots",
+        lambda *args, **kwargs: (unrelated_tool_dir,),
+    )
+    monkeypatch.setattr(
+        mod,
+        "capability_sids_for_command",
+        lambda store, roots, **kwargs: tuple(f"S-{i}" for i, _ in enumerate(roots)),
+    )
+
+    operation = SandboxOperation.filesystem(
+        kind="read_file",
+        workspace=workspace,
+        run_mode=RunMode.STANDARD.value,
+        path=target,
+        paths=(target,),
+        file_system_profile=FileSystemPermissionProfile(
+            entries=(FileSystemPermissionEntry(workspace, FileSystemAccess.READ),)
+        ),
+    )
+    request = mod._filesystem_operation_request(operation)
+
+    payload = mod._payload_for_request(
+        request,
+        rehome_user_state=False,
+        private_mounts_are_required=True,
+    )
+
+    assert payload["env"]["PATH"] == str(python_exe.parent)
+    assert str(unrelated_tool_dir) not in {
+        grant["path"] for grant in payload["policy"]["windowsAclPlan"]["autoGrants"]
+    }
 
 
 def test_windows_filesystem_operation_missing_read_target_fails_before_acl(

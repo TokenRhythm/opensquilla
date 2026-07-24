@@ -88,8 +88,9 @@ class FileSystemPermissionProfile:
         )
         declared_writable = list(_deduplicate_paths(declared_writable))
 
+        windows_host_read_baseline = host_root_readonly and context.platform == "windows"
         entries: list[FileSystemPermissionEntry] = []
-        if host_root_readonly:
+        if host_root_readonly and not windows_host_read_baseline:
             entries.extend(
                 FileSystemPermissionEntry(
                     _canonical_platform_path(path, context),
@@ -117,6 +118,11 @@ class FileSystemPermissionProfile:
         return cls(
             entries=tuple(entries),
             denied_read_globs=tuple(str(pattern) for pattern in denied_read_globs),
+            default_access=(
+                FileSystemAccess.READ
+                if windows_host_read_baseline
+                else FileSystemAccess.DENY
+            ),
         )
 
     @classmethod
@@ -130,8 +136,9 @@ class FileSystemPermissionProfile:
         platform_context: FileSystemPlatformContext | None = None,
     ) -> FileSystemPermissionProfile:
         context = platform_context or current_platform_context(cwd=Path.cwd())
+        windows_host_read_baseline = host_root_readonly and context.platform == "windows"
         entries: list[FileSystemPermissionEntry] = []
-        if host_root_readonly:
+        if host_root_readonly and not windows_host_read_baseline:
             entries.extend(
                 FileSystemPermissionEntry(
                     _canonical_platform_path(path, context),
@@ -147,7 +154,15 @@ class FileSystemPermissionProfile:
             FileSystemPermissionEntry(_lexical_absolute(path), FileSystemAccess.DENY)
             for path in denied_read_roots
         )
-        return cls(tuple(entries), tuple(str(pattern) for pattern in denied_read_globs))
+        return cls(
+            tuple(entries),
+            tuple(str(pattern) for pattern in denied_read_globs),
+            (
+                FileSystemAccess.READ
+                if windows_host_read_baseline
+                else FileSystemAccess.DENY
+            ),
+        )
 
     @classmethod
     def full_access(cls) -> FileSystemPermissionProfile:
