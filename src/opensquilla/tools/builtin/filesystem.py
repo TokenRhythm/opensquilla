@@ -736,6 +736,58 @@ async def _run_sandbox_operation_if_required(
     runtime = get_runtime()
     ctx = current_tool_context.get()
     if (
+        operation.domain == "filesystem"
+        and ctx is not None
+        and ctx.workspace_strict
+    ):
+        filesystem_permissions = dict(operation.permissions.filesystem)
+        filesystem_permissions["workspaceStrict"] = True
+        workspace = operation.workspace
+        if workspace is not None and ctx.artifact_session_id:
+            from opensquilla.attachment_workspace import _safe_path_segment
+
+            attachment_base = (
+                workspace.expanduser().resolve(strict=False)
+                / ".opensquilla"
+                / "attachments"
+            )
+            attachment_segment = _safe_path_segment(
+                ctx.artifact_session_id,
+                fallback="session",
+            )
+            filesystem_permissions.update(
+                {
+                    "attachmentBase": str(attachment_base),
+                    "attachmentSessionRoot": str(
+                        attachment_base / attachment_segment
+                    ),
+                }
+            )
+        if ctx.artifact_media_root and ctx.artifact_session_id:
+            from opensquilla.attachment_refs import transcript_material_dir
+
+            media_root = Path(ctx.artifact_media_root).expanduser().resolve(
+                strict=False
+            )
+            filesystem_permissions.update(
+                {
+                    "transcriptBase": str(media_root / "transcripts"),
+                    "transcriptSessionRoot": str(
+                        transcript_material_dir(
+                            media_root,
+                            ctx.artifact_session_id,
+                        ).resolve(strict=False)
+                    ),
+                }
+            )
+        operation = replace(
+            operation,
+            permissions=replace(
+                operation.permissions,
+                filesystem=filesystem_permissions,
+            ),
+        )
+    if (
         trusted_sandbox_active()
         and ctx is not None
         and ctx.is_owner

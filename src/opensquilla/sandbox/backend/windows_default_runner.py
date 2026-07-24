@@ -333,8 +333,8 @@ def _run_windows_default_with_acl_lease(
         _prepare_deny_acl_targets(acl_plan)
         _apply_acl_refresh(acl_plan)
         return _run_payload_as_offline_identity(payload, credentials=credentials)
-    _prepare_deny_acl_targets(acl_plan)
     if not payload.offline_child:
+        _prepare_deny_acl_targets(acl_plan)
         _apply_acl_refresh(acl_plan)
     return _run_restricted_process_native(payload, capability_sids)
 
@@ -434,16 +434,18 @@ def _windows_acl_plan(policy: dict[str, Any]) -> dict[str, Any]:
     grant_current_user_access = plan.get("grantCurrentUserAccess", False)
     if not isinstance(grant_current_user_access, bool):
         raise SystemExit("invalid windows_default policy: grantCurrentUserAccess must be boolean")
-    sync_deny_acl = plan.get("syncDenyAcl", True)
-    if not isinstance(sync_deny_acl, bool):
-        raise SystemExit("invalid windows_default policy: syncDenyAcl must be boolean")
+    revalidate_deny_acl = plan.get("revalidateDenyAcl", True)
+    if not isinstance(revalidate_deny_acl, bool):
+        raise SystemExit(
+            "invalid windows_default policy: revalidateDenyAcl must be boolean"
+        )
     state_path = _trusted_deny_acl_state_path(plan)
     return {
         **plan,
         "denyWritePaths": deny_write_paths,
         "denyReadPaths": deny_read_paths,
         "denyAclStatePath": str(state_path),
-        "syncDenyAcl": sync_deny_acl,
+        "revalidateDenyAcl": revalidate_deny_acl,
         "grantCurrentUserAccess": grant_current_user_access,
     }
 
@@ -502,13 +504,14 @@ def _apply_acl_refresh(plan: dict[str, Any], *, apply_deny_write: bool = True) -
                 continue
             normal_access_seen.add(key)
             _grant_path_to_sid(grant_path, "HOST_RWX", normal_access_sid)
-    if apply_deny_write and plan.get("syncDenyAcl", True) and "denyAclStatePath" in plan:
+    if apply_deny_write and "denyAclStatePath" in plan:
         state_path = Path(str(plan["denyAclStatePath"]))
         for sid in _capability_sids(plan):
             _sync_deny_acl_state(
                 state_path,
                 sid,
                 _capability_write_deny_entries(plan, sid),
+                revalidate_live=bool(plan.get("revalidateDenyAcl", True)),
             )
 
 
@@ -693,12 +696,12 @@ def _run_payload_as_offline_identity(
     launch = credentials or _resolve_offline_launch_credentials(payload)
     acl_plan = _windows_acl_plan(payload.policy)
     _prepare_deny_acl_targets(acl_plan)
-    if acl_plan.get("syncDenyAcl", True):
-        _sync_deny_acl_state(
-            Path(str(acl_plan["denyAclStatePath"])),
-            launch.sid,
-            _offline_identity_deny_entries(acl_plan),
-        )
+    _sync_deny_acl_state(
+        Path(str(acl_plan["denyAclStatePath"])),
+        launch.sid,
+        _offline_identity_deny_entries(acl_plan),
+        revalidate_live=bool(acl_plan.get("revalidateDenyAcl", True)),
+    )
     _sync_allow_acl_state(
         _default_allow_acl_state_path(),
         launch.sid,
@@ -1694,10 +1697,17 @@ def _sync_deny_acl_state(
     state_path: Path,
     sid: str,
     desired: dict[Path, int],
+    *,
+    revalidate_live: bool = True,
 ) -> None:
     try:
         with _deny_acl_state_lock(state_path):
-            _sync_deny_acl_state_locked(state_path, sid, desired)
+            _sync_deny_acl_state_locked(
+                state_path,
+                sid,
+                desired,
+                revalidate_live=revalidate_live,
+            )
     except (OSError, TimeoutError) as exc:
         raise SystemExit(
             f"windows_default ACL desired-state lock failed: {state_path}: {exc}"
@@ -1708,6 +1718,8 @@ def _sync_deny_acl_state_locked(
     state_path: Path,
     sid: str,
     desired: dict[Path, int],
+    *,
+    revalidate_live: bool = True,
 ) -> None:
     if not sid:
         raise SystemExit("windows_default ACL state sync requires a principal SID")
@@ -1724,13 +1736,14 @@ def _sync_deny_acl_state_locked(
     if {
         key: mask for key, (_path, mask) in previous_by_key.items()
     } == {key: mask for key, (_path, mask) in desired_by_key.items()}:
-        for path, mask in normalized_desired.items():
-            _deny_path_to_sid(
-                path,
-                sid,
-                mask=mask,
-                label="desired-state-verify",
-            )
+        if revalidate_live:
+            for path, mask in normalized_desired.items():
+                _deny_path_to_sid(
+                    path,
+                    sid,
+                    mask=mask,
+                    label="desired-state-verify",
+                )
         return
 
     _mark_acl_state_tainted(

@@ -215,7 +215,7 @@ def test_windows_acl_plan_never_grants_required_mount_on_filesystem_root(
         )
 
 
-def test_windows_filesystem_worker_does_not_resync_process_deny_acls(
+def test_windows_filesystem_worker_uses_cached_deny_acl_validation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -236,8 +236,8 @@ def test_windows_filesystem_worker_does_not_resync_process_deny_acls(
 
     plan = mod._acl_plan_payload(request)
 
-    assert plan["syncDenyAcl"] is False
-    assert mod._acl_plan_payload(_request(workspace))["syncDenyAcl"] is True
+    assert plan["revalidateDenyAcl"] is False
+    assert mod._acl_plan_payload(_request(workspace))["revalidateDenyAcl"] is True
 
 
 def test_windows_acl_filter_resolves_parent_segments_before_root_check(
@@ -1551,7 +1551,10 @@ def test_windows_filesystem_operation_request_uses_stdin_and_shared_profile(
     assert mounts[str(runtime_scripts)] == "ro"
     assert mounts[str(runtime_scripts.parent)] == "ro"
     assert mounts[str(source_root)] == "ro"
-    assert "rw" not in mounts.values()
+    worker_temp = workspace / ".opensquilla-cache" / "filesystem-worker-temp"
+    assert mounts[str(worker_temp)] == "rw"
+    assert request.env["TEMP"] == str(worker_temp)
+    assert request.env["TMP"] == str(worker_temp)
     assert request.policy.file_system is operation.file_system_profile
     assert request.policy.tmp_writable is False
     assert request.argv == (
@@ -1561,8 +1564,16 @@ def test_windows_filesystem_operation_request_uses_stdin_and_shared_profile(
         "opensquilla.sandbox.filesystem_worker",
         "-",
     )
-    assert request.stdin == json.dumps(operation.to_payload(), ensure_ascii=False).encode("utf-8")
-    assert not (workspace / ".opensquilla-cache").exists()
+    assert request.stdin is not None
+    worker_payload = json.loads(request.stdin)
+    assert worker_payload["kind"] == "write_text"
+    assert worker_payload["path"] == str(target)
+    assert worker_payload["permissions"]["filesystem"]["profile"] == {
+        "entries": [{"path": str(workspace), "access": "write"}],
+        "deniedReadGlobs": [],
+        "defaultAccess": "deny",
+    }
+    assert worker_temp.is_dir()
 
 
 def test_windows_filesystem_operation_request_preserves_minimal_home_environment(

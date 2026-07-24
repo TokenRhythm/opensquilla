@@ -11,6 +11,11 @@ from pathlib import Path
 from typing import Any
 
 from opensquilla.sandbox.directory_listing import format_directory_entry
+from opensquilla.sandbox.permissions import (
+    FileSystemAccess,
+    FileSystemPermissionEntry,
+    FileSystemPermissionProfile,
+)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -101,10 +106,178 @@ def _optional_positive_int(payload: dict[str, Any], key: str) -> int | None:
     return value if value > 0 else None
 
 
+def _filesystem_boundary(payload: dict[str, Any]) -> dict[str, Any]:
+    permissions = payload.get("permissions")
+    if not isinstance(permissions, dict):
+        return {}
+    filesystem = permissions.get("filesystem")
+    return filesystem if isinstance(filesystem, dict) else {}
+
+
+def _filesystem_profile(payload: dict[str, Any]) -> FileSystemPermissionProfile | None:
+    cached = payload.get("_filesystemProfileCache")
+    if isinstance(cached, FileSystemPermissionProfile):
+        return cached
+    raw = _filesystem_boundary(payload).get("profile")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("filesystem worker profile must be an object")
+    raw_entries = raw.get("entries")
+    raw_globs = raw.get("deniedReadGlobs", [])
+    raw_default = raw.get("defaultAccess")
+    if (
+        not isinstance(raw_entries, list)
+        or not isinstance(raw_globs, list)
+        or not all(isinstance(pattern, str) for pattern in raw_globs)
+        or not isinstance(raw_default, str)
+    ):
+        raise ValueError("filesystem worker profile is invalid")
+    entries: list[FileSystemPermissionEntry] = []
+    for item in raw_entries:
+        if not isinstance(item, dict):
+            raise ValueError("filesystem worker profile entry must be an object")
+        path = item.get("path")
+        access = item.get("access")
+        if not isinstance(path, str) or not isinstance(access, str):
+            raise ValueError("filesystem worker profile entry is invalid")
+        entries.append(
+            FileSystemPermissionEntry(
+                Path(path),
+                FileSystemAccess(access),
+            )
+        )
+    profile = FileSystemPermissionProfile(
+        entries=tuple(entries),
+        denied_read_globs=tuple(raw_globs),
+        default_access=FileSystemAccess(raw_default),
+    )
+    payload["_filesystemProfileCache"] = profile
+    return profile
+
+
+def _is_relative_to(candidate: Path, root: Path) -> bool:
+    try:
+        candidate.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _enforce_candidate_access(
+    payload: dict[str, Any],
+    candidate: Path,
+    *,
+    write: bool = False,
+    traversal: bool = False,
+) -> Path:
+    resolved = candidate.expanduser().resolve(strict=False)
+    profile = _filesystem_profile(payload)
+    if profile is not None:
+        access = profile.resolve(resolved)
+        if access is FileSystemAccess.DENY or (
+            write and access is not FileSystemAccess.WRITE
+        ):
+            raise PermissionError(f"filesystem profile denies access to {resolved}")
+    if write:
+        return resolved
+
+    boundary = _filesystem_boundary(payload)
+    if not boundary.get("workspaceStrict"):
+        return resolved
+
+    attachment_base_raw = boundary.get("attachmentBase")
+    attachment_session_raw = boundary.get("attachmentSessionRoot")
+    if isinstance(attachment_base_raw, str) and attachment_base_raw:
+        attachment_base = Path(attachment_base_raw).resolve(strict=False)
+        if _is_relative_to(resolved, attachment_base):
+            if resolved == attachment_base:
+                return resolved
+            if not (
+                isinstance(attachment_session_raw, str)
+                and attachment_session_raw
+                and _is_relative_to(
+                    resolved,
+                    Path(attachment_session_raw).resolve(strict=False),
+                )
+            ):
+                raise PermissionError(
+                    f"filesystem worker blocks another session's attachments: {resolved}"
+                )
+
+    transcript_base_raw = boundary.get("transcriptBase")
+    transcript_session_raw = boundary.get("transcriptSessionRoot")
+    if isinstance(transcript_base_raw, str) and transcript_base_raw:
+        transcript_base = Path(transcript_base_raw).resolve(strict=False)
+        if _is_relative_to(resolved, transcript_base):
+            if traversal and resolved == transcript_base:
+                return resolved
+            if not (
+                isinstance(transcript_session_raw, str)
+                and transcript_session_raw
+                and _is_relative_to(
+                    resolved,
+                    Path(transcript_session_raw).resolve(strict=False),
+                )
+            ):
+                raise PermissionError(
+                    f"filesystem worker blocks another session's transcript: {resolved}"
+                )
+    return resolved
+
+
+def _safe_descendants(payload: dict[str, Any], base: Path):
+    _enforce_candidate_access(payload, base, traversal=True)
+    pending = [base]
+    visited: set[str] = set()
+    while pending:
+        directory = pending.pop()
+        canonical = str(directory.resolve(strict=False)).casefold()
+        if canonical in visited:
+            continue
+        visited.add(canonical)
+        try:
+            children = sorted(directory.iterdir(), key=lambda item: str(item))
+        except (PermissionError, OSError):
+            continue
+        for child in children:
+            try:
+                _enforce_candidate_access(payload, child, traversal=True)
+            except PermissionError:
+                continue
+            yield child
+            try:
+                if child.is_dir():
+                    pending.append(child)
+            except (PermissionError, OSError):
+                continue
+
+
+def _candidate_is_readable(payload: dict[str, Any], candidate: Path) -> bool:
+    try:
+        _enforce_candidate_access(payload, candidate, traversal=True)
+    except PermissionError:
+        return False
+    return True
+
+
+def _relative_glob_match(base: Path, candidate: Path, pattern: str) -> bool:
+    relative = candidate.relative_to(base)
+    normalized_pattern = pattern.replace("\\", "/")
+    if "/" not in normalized_pattern and "**" not in normalized_pattern:
+        return len(relative.parts) == 1 and fnmatch.fnmatch(relative.name, normalized_pattern)
+    if relative.match(normalized_pattern):
+        return True
+    if normalized_pattern.startswith("**/"):
+        return relative.match(normalized_pattern[3:])
+    return False
+
+
 def _read_file(payload: dict[str, Any]) -> dict[str, object]:
     from opensquilla.tools.builtin import filesystem as filesystem_tool
 
     path = _required_path(payload, "path")
+    _enforce_candidate_access(payload, path)
     display_path = payload.get("displayPath") or str(path)
     if not path.exists():
         raise FileNotFoundError(f"File not found: {display_path}")
@@ -133,6 +306,7 @@ def _read_file(payload: dict[str, Any]) -> dict[str, object]:
 
 def _list_dir(payload: dict[str, Any]) -> dict[str, object]:
     path = _required_path(payload, "path")
+    _enforce_candidate_access(payload, path)
     display_path = payload.get("displayPath") or str(path)
     if not path.exists():
         raise FileNotFoundError(f"Path not found: {display_path}")
@@ -142,6 +316,10 @@ def _list_dir(payload: dict[str, Any]) -> dict[str, object]:
     dirs: list[str] = []
     files: list[str] = []
     for entry in sorted(path.iterdir(), key=lambda item: item.name):
+        try:
+            _enforce_candidate_access(payload, entry)
+        except PermissionError:
+            continue
         is_directory, line = format_directory_entry(entry)
         (dirs if is_directory else files).append(line)
     entries = dirs + files
@@ -150,12 +328,24 @@ def _list_dir(payload: dict[str, Any]) -> dict[str, object]:
 
 def _glob_search(payload: dict[str, Any]) -> dict[str, object]:
     base = _required_path(payload, "path")
+    _enforce_candidate_access(payload, base, traversal=True)
     pattern = _required_string(payload, "pattern")
     if not base.exists():
         raise FileNotFoundError(f"Path not found: {base}")
+    recursive = "**" in pattern or "/" in pattern or "\\" in pattern
+    candidates = (
+        _safe_descendants(payload, base)
+        if recursive
+        else (
+            candidate
+            for candidate in sorted(base.iterdir(), key=lambda item: str(item))
+            if _candidate_is_readable(payload, candidate)
+        )
+    )
     matches = [
         str(candidate)
-        for candidate in sorted(base.glob(pattern), key=lambda item: str(item))
+        for candidate in candidates
+        if _relative_glob_match(base, candidate, pattern)
     ]
     return {
         "message": "\n".join(matches)
@@ -166,6 +356,7 @@ def _glob_search(payload: dict[str, Any]) -> dict[str, object]:
 
 def _grep_search(payload: dict[str, Any]) -> dict[str, object]:
     base = _required_path(payload, "path")
+    _enforce_candidate_access(payload, base, traversal=True)
     pattern = _required_string(payload, "pattern")
     include = payload.get("include")
     if include is not None and not isinstance(include, str):
@@ -175,6 +366,10 @@ def _grep_search(payload: dict[str, Any]) -> dict[str, object]:
     results: list[str] = []
 
     def search_file(path: Path) -> None:
+        try:
+            _enforce_candidate_access(payload, path)
+        except PermissionError:
+            return
         if include and not fnmatch.fnmatch(path.name, include):
             return
         try:
@@ -190,7 +385,7 @@ def _grep_search(payload: dict[str, Any]) -> dict[str, object]:
     if base.is_file():
         search_file(base)
     else:
-        for path in base.rglob("*"):
+        for path in _safe_descendants(payload, base):
             if len(results) >= max_results:
                 break
             if path.is_file():
@@ -205,6 +400,7 @@ def _grep_search(payload: dict[str, Any]) -> dict[str, object]:
 
 def _write_text(payload: dict[str, Any]) -> dict[str, object]:
     path = _required_path(payload, "path")
+    _enforce_candidate_access(payload, path, write=True)
     content = _required_string(payload, "content")
     created = not path.exists()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -217,6 +413,7 @@ def _write_text(payload: dict[str, Any]) -> dict[str, object]:
 
 def _edit_text(payload: dict[str, Any]) -> dict[str, object]:
     path = _required_path(payload, "path")
+    _enforce_candidate_access(payload, path, write=True)
     old_text = _required_string(payload, "oldText")
     new_text = _required_string(payload, "newText")
     if not path.exists():
@@ -240,6 +437,8 @@ def _apply_patch(payload: dict[str, Any]) -> dict[str, object]:
     patch = _required_string(payload, "patch")
     root = _required_path(payload, "root")
     authorized_paths = _required_paths(payload, "paths")
+    for path in authorized_paths:
+        _enforce_candidate_access(payload, path, write=True)
     ops = patch_tool._parse_patch(patch)
     added, modified, deleted, _planned = patch_tool._apply_ops(
         ops,

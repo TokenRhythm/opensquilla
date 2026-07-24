@@ -331,14 +331,19 @@ def _filesystem_operation_request(
     runtime_roots = _runtime_readonly_roots()
     _validate_filesystem_operation_targets(operation, request, targets, runtime_roots)
     _validate_filesystem_private_transport_roots(profile, runtime_roots)
+    worker_temp = workspace / ".opensquilla-cache" / "filesystem-worker-temp"
+    worker_temp.mkdir(parents=True, exist_ok=True)
     policy = replace(
         build_filesystem_worker_policy(
             operation,
-            private_rw_roots=(),
+            private_rw_roots=(worker_temp,),
             private_ro_roots=runtime_roots,
             env_allowlist=(
                 "PATH",
                 "PYTHONPATH",
+                "TEMP",
+                "TMP",
+                "TMPDIR",
                 "HOME",
                 "USERPROFILE",
                 "HOMEDRIVE",
@@ -354,8 +359,33 @@ def _filesystem_operation_request(
     env = {
         "PATH": str(_python_executable().parent),
         "PYTHONPATH": _pythonpath_for_worker(),
+        "TEMP": str(worker_temp),
+        "TMP": str(worker_temp),
+        "TMPDIR": str(worker_temp),
     }
     _preserve_windows_home_env(env, host_env=os.environ)
+    worker_payload = operation.to_payload()
+    permissions = worker_payload.get("permissions")
+    if not isinstance(permissions, dict):
+        permissions = {}
+        worker_payload["permissions"] = permissions
+    filesystem_permissions = permissions.get("filesystem")
+    if not isinstance(filesystem_permissions, dict):
+        filesystem_permissions = {}
+    permissions["filesystem"] = {
+        **filesystem_permissions,
+        "profile": {
+            "entries": [
+                {
+                    "path": str(entry.path),
+                    "access": entry.access.value,
+                }
+                for entry in profile.entries
+            ],
+            "deniedReadGlobs": list(profile.denied_read_globs),
+            "defaultAccess": profile.default_access.value,
+        },
+    }
     return SandboxRequest(
         argv=(
             str(_python_executable()),
@@ -367,7 +397,7 @@ def _filesystem_operation_request(
         cwd=workspace,
         action_kind=f"fs.worker.{operation.kind}",
         policy=policy,
-        stdin=json.dumps(operation.to_payload(), ensure_ascii=False).encode("utf-8"),
+        stdin=json.dumps(worker_payload, ensure_ascii=False).encode("utf-8"),
         env=env,
         reason="sandboxed filesystem side-effect worker",
         run_mode=normalize_run_mode(operation.run_mode).value,
@@ -775,7 +805,7 @@ def _acl_plan_payload(
         "denyWritePaths": [str(path) for path in deny_write_paths],
         "denyReadPaths": [str(path) for path in deny_read_paths],
         "denyAclStatePath": str(_deny_acl_state_path()),
-        "syncDenyAcl": not request.action_kind.startswith("fs.worker."),
+        "revalidateDenyAcl": not request.action_kind.startswith("fs.worker."),
         "grantCurrentUserAccess": True,
     }
 

@@ -185,6 +185,54 @@ async def test_filesystem_sandbox_boundary_preserves_existing_profile(
     assert seen_operations[0].file_system_profile is profile
 
 
+@pytest.mark.asyncio
+async def test_filesystem_sandbox_boundary_carries_session_read_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media_root = tmp_path / "media"
+    profile = FileSystemPermissionProfile.read_only(readable_roots=(tmp_path,))
+    operation = fs.SandboxOperation.filesystem(
+        kind="grep_search",
+        workspace=tmp_path,
+        run_mode="trusted",
+        path=tmp_path,
+        pattern="needle",
+        file_system_profile=profile,
+    )
+    seen_operations: list[fs.SandboxOperation] = []
+
+    class _RecordingRuntime:
+        def __init__(self, _runtime: object, *, host_execution_active: bool) -> None:
+            assert host_execution_active is False
+
+        async def run(self, actual_operation: fs.SandboxOperation) -> None:
+            seen_operations.append(actual_operation)
+
+    monkeypatch.setattr(fs, "get_runtime", object)
+    monkeypatch.setattr(fs, "full_host_access_active", lambda: False)
+    monkeypatch.setattr(fs, "SandboxOperationRuntime", _RecordingRuntime)
+
+    with tool_context(
+        tmp_path,
+        artifact_media_root=media_root,
+        artifact_session_id="session-current",
+    ):
+        await fs._run_sandbox_operation_if_required(operation)
+
+    filesystem_permissions = seen_operations[0].permissions.filesystem
+    assert filesystem_permissions["workspaceStrict"] is True
+    assert filesystem_permissions["attachmentBase"] == str(
+        tmp_path / ".opensquilla" / "attachments"
+    )
+    assert filesystem_permissions["transcriptBase"] == str(
+        media_root / "transcripts"
+    )
+    assert filesystem_permissions["transcriptSessionRoot"] == str(
+        media_root / "transcripts" / "session-current"
+    )
+
+
 @pytest.mark.parametrize(
     ("full_host_access", "explicit_host_execution", "expected"),
     (

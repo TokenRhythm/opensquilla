@@ -399,6 +399,13 @@ def test_runner_applies_acl_refresh_before_process_launch(tmp_path, monkeypatch)
     monkeypatch.setattr(mod, "_apply_acl_refresh", lambda plan: calls.append(("acl", plan)))
     monkeypatch.setattr(
         mod,
+        "_prepare_deny_acl_targets",
+        lambda *_args, **_kwargs: pytest.fail(
+            "offline child must not touch already-installed deny targets"
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
         "_run_restricted_process_native",
         lambda payload, sids: calls.append(("run", sids)) or 0,
     )
@@ -831,7 +838,7 @@ def test_acl_refresh_grants_current_user_normal_access_when_requested(
     ]
 
 
-def test_acl_refresh_skips_deny_state_sync_for_filesystem_worker(
+def test_acl_refresh_skips_only_live_deny_revalidation_for_filesystem_worker(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -849,11 +856,12 @@ def test_acl_refresh_skips_deny_state_sync_for_filesystem_worker(
             "autoGrants": [],
             "capabilitySids": ["S-1-capability"],
             "denyAclStatePath": str(tmp_path / "deny-state.json"),
-            "syncDenyAcl": False,
+            "revalidateDenyAcl": False,
         }
     )
 
-    assert calls == []
+    assert len(calls) == 1
+    assert calls[0][1] == {"revalidate_live": False}
 
 
 def test_acl_refresh_skips_missing_policy_grants(
@@ -1033,7 +1041,9 @@ def test_acl_refresh_materializes_missing_deny_write_target(
     monkeypatch.setattr(
         mod,
         "_sync_deny_acl_state",
-        lambda _state, _sid, desired: observed.append(all(path.exists() for path in desired)),
+        lambda _state, _sid, desired, **_kwargs: observed.append(
+            all(path.exists() for path in desired)
+        ),
         raising=False,
     )
 
@@ -1203,7 +1213,7 @@ def test_offline_identity_launch_syncs_read_and_write_denies_to_actual_identity(
     monkeypatch.setattr(
         mod,
         "_sync_deny_acl_state",
-        lambda state, sid, desired: syncs.append((state, sid, desired)),
+        lambda state, sid, desired, **_kwargs: syncs.append((state, sid, desired)),
         raising=False,
     )
     monkeypatch.setattr(mod, "_grant_path_to_sid", lambda *_args: None)
@@ -1242,7 +1252,7 @@ def test_offline_identity_launch_combines_read_and_write_denies_for_same_path(
     monkeypatch.setattr(
         mod,
         "_sync_deny_acl_state",
-        lambda _state, _sid, desired: desired_entries.append(desired),
+        lambda _state, _sid, desired, **_kwargs: desired_entries.append(desired),
         raising=False,
     )
 
@@ -1384,6 +1394,58 @@ def test_deny_acl_state_sync_revalidates_unchanged_denies(
 
     assert calls == [
         ("deny", denied, mod.FILE_MUTATION_DENY_MASK),
+    ]
+
+
+def test_cached_deny_acl_validation_still_applies_desired_state_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_runner as mod
+
+    state_path = tmp_path / "deny_acl_state.json"
+    previous = tmp_path / "previous"
+    desired = tmp_path / "desired"
+    previous.mkdir()
+    desired.mkdir()
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "principals": {
+                    "S-1-test": [
+                        {
+                            "path": str(previous),
+                            "mask": mod.FILE_MUTATION_DENY_MASK,
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+    monkeypatch.setattr(
+        mod,
+        "_deny_path_to_sid",
+        lambda path, sid, *, mask, label: calls.append(("deny", path, mask)),
+    )
+    monkeypatch.setattr(
+        mod,
+        "_revoke_path_for_sid",
+        lambda path, sid: calls.append(("revoke", path, None)),
+    )
+
+    mod._sync_deny_acl_state(
+        state_path,
+        "S-1-test",
+        {desired: mod.FILE_MUTATION_DENY_MASK},
+        revalidate_live=False,
+    )
+
+    assert calls == [
+        ("deny", desired, mod.FILE_MUTATION_DENY_MASK),
+        ("revoke", previous, None),
     ]
 
 

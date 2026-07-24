@@ -210,6 +210,74 @@ def test_list_dir_preserves_requested_directory_permission_error(
         filesystem_worker._list_dir({"path": str(tmp_path)})
 
 
+def test_grep_search_does_not_enter_explicitly_denied_subtree(tmp_path: Path) -> None:
+    visible = tmp_path / "visible.txt"
+    denied = tmp_path / "denied"
+    denied.mkdir()
+    secret = denied / "secret.txt"
+    visible.write_text("needle visible", encoding="utf-8")
+    secret.write_text("needle secret", encoding="utf-8")
+    payload = {
+        "kind": "grep_search",
+        "path": str(tmp_path),
+        "pattern": "needle",
+        "permissions": {
+            "filesystem": {
+                "profile": {
+                    "entries": [
+                        {"path": str(tmp_path), "access": "read"},
+                        {"path": str(denied), "access": "deny"},
+                    ],
+                    "deniedReadGlobs": [],
+                    "defaultAccess": "deny",
+                }
+            }
+        },
+    }
+
+    result = filesystem_worker._grep_search(payload)
+
+    assert str(visible) in result["message"]
+    assert str(secret) not in result["message"]
+    assert "needle secret" not in result["message"]
+
+
+def test_grep_search_only_enters_current_transcript_session(tmp_path: Path) -> None:
+    media_root = tmp_path / "media"
+    transcript_root = media_root / "transcripts"
+    current = transcript_root / "session-current"
+    other = transcript_root / "session-other"
+    current.mkdir(parents=True)
+    other.mkdir()
+    current_file = current / "current.txt"
+    other_file = other / "other.txt"
+    current_file.write_text("needle current", encoding="utf-8")
+    other_file.write_text("needle other", encoding="utf-8")
+    payload = {
+        "kind": "grep_search",
+        "path": str(media_root),
+        "pattern": "needle",
+        "permissions": {
+            "filesystem": {
+                "profile": {
+                    "entries": [{"path": str(media_root), "access": "read"}],
+                    "deniedReadGlobs": [],
+                    "defaultAccess": "deny",
+                },
+                "workspaceStrict": True,
+                "transcriptBase": str(transcript_root),
+                "transcriptSessionRoot": str(current),
+            }
+        },
+    }
+
+    result = filesystem_worker._grep_search(payload)
+
+    assert str(current_file) in result["message"]
+    assert str(other_file) not in result["message"]
+    assert "needle other" not in result["message"]
+
+
 def test_apply_patch_accepts_explicit_target_outside_patch_root(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
