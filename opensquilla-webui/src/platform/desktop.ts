@@ -201,6 +201,7 @@ export function createDesktopPlatform(): Platform {
     },
     files: {
       openArtifact: (payload) => requireDesktopApi().openArtifact(payload),
+      chooseProjectDirectory: () => requireDesktopApi().chooseProjectDirectory(),
     },
     updates: {
       async getState() {

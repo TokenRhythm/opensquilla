@@ -64,6 +64,7 @@ declare global {
     abandonCleanupTransaction?: () => Promise<unknown>
     setNativeTheme?: (payload: { source: 'light' | 'dark' | 'system' }) => Promise<unknown>
     openArtifact: (payload: ArtifactOpenRequest) => Promise<ArtifactNativeOpenResult>
+    chooseProjectDirectory: () => Promise<{ path: string } | null>
     getOnboardingDefaults: () => Promise<unknown>
     saveOnboarding: (payload: unknown) => Promise<unknown>
     cancelOnboarding: () => Promise<unknown>

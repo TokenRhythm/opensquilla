@@ -24,6 +24,7 @@
     "test:update-resolver": "npm run build && node scripts/test-update-resolver.mjs",
     "test:update-scheduler": "npm run build && node scripts/test-update-check-scheduler.mjs",
     "test:desktop-locale": "npm run build && node scripts/test-desktop-locale.mjs",
+    "test:project-workspace-picker": "node scripts/test-project-workspace-picker.mjs",
     "test:gateway-ownership": "npm run build && node scripts/test-desktop-gateway-ownership.mjs",
     "test:gateway-lifecycle": "npm run build && node scripts/test-desktop-gateway-lifecycle.mjs",
     "test:gateway-orphan-recovery-flow": "npm run build && node scripts/test-desktop-gateway-orphan-recovery-flow.mjs",

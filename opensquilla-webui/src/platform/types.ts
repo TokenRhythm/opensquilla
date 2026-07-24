@@ -133,6 +133,8 @@ export interface ArtifactNativeOpenResult {
 export interface PlatformFilesApi {
   /** Write the bytes to a temp file and open it with the OS default app. */
   openArtifact?: (payload: ArtifactOpenRequest) => Promise<ArtifactNativeOpenResult>
+  /** Open the trusted host's native folder picker. Undefined on the web. */
+  chooseProjectDirectory?: () => Promise<{ path: string } | null>
 }
 
 export interface CliInvocation {

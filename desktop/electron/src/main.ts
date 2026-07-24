@@ -8211,6 +8211,15 @@ ipcMain.handle('desktop:settings:reset', async (event) => {
   return await resetDesktopSettingsThroughCleanup()
 })
 ipcMain.handle('desktop:artifact:open', async (_event, payload: ArtifactOpenRequest) => openArtifactWithDefaultApp(payload))
+ipcMain.handle('desktop:workspace:choose-directory', async (event) => {
+  if (!trustedControlUiIpc(event)) return null
+  const choice = await dialog.showOpenDialog(currentMainWindow()!, {
+    title: 'Choose a project',
+    properties: ['openDirectory'],
+  })
+  if (choice.canceled || choice.filePaths.length !== 1) return null
+  return { path: resolve(choice.filePaths[0]!) }
+})
 
 // ── Desktop data cleanup ───────────────────────────────────────────────────
 // Python owns inventory, locking, CAS, no-follow deletion, and partial recovery.
