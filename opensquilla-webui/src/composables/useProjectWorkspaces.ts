@@ -1,6 +1,7 @@
 import { computed, ref } from 'vue'
 import { useRpcStore } from '@/stores/rpc'
 import type {
+  ProjectWorkspaceHistoryDeleteResponse,
   ProjectWorkspaceItem,
   ProjectWorkspacesResponse,
 } from '@/types/rpc'
@@ -10,6 +11,7 @@ export type { ProjectWorkspaceItem } from '@/types/rpc'
 const workspaces = ref<ProjectWorkspaceItem[]>([])
 const isLoading = ref(false)
 const error = ref<string | null>(null)
+const hasLoaded = ref(false)
 
 function normalizeWorkspace(value: unknown): ProjectWorkspaceItem | null {
   if (!value || typeof value !== 'object') return null
@@ -40,6 +42,7 @@ export function useProjectWorkspaces() {
       workspaces.value = (response?.workspaces || [])
         .map(normalizeWorkspace)
         .filter((item): item is ProjectWorkspaceItem => item !== null)
+      hasLoaded.value = true
       return workspaces.value
     } catch (cause) {
       error.value = cause instanceof Error ? cause.message : String(cause)
@@ -69,6 +72,36 @@ export function useProjectWorkspaces() {
     return normalizeWorkspace(response?.workspace)
   }
 
+  async function deleteWorkspaceHistory(
+    workspaceId: string,
+  ): Promise<Required<ProjectWorkspaceHistoryDeleteResponse>> {
+    error.value = null
+    let response: ProjectWorkspaceHistoryDeleteResponse
+    try {
+      response = await rpc.call<ProjectWorkspaceHistoryDeleteResponse>(
+        'workspaces.history.delete',
+        { workspaceId },
+      )
+    } catch (cause) {
+      error.value = cause instanceof Error ? cause.message : String(cause)
+      throw cause
+    }
+    // The destructive RPC is authoritative. A follow-up list refresh may fail,
+    // but that cannot turn an already-completed deletion into a failed action.
+    try {
+      await loadWorkspaces()
+    } catch {
+      // loadWorkspaces records its own error for the UI/retry path.
+    }
+    return {
+      workspaceId: response?.workspaceId || workspaceId,
+      deletedTaskCount: Math.max(0, Number(response?.deletedTaskCount) || 0),
+      deletedSessionKeys: Array.isArray(response?.deletedSessionKeys)
+        ? response.deletedSessionKeys.filter(key => typeof key === 'string' && key.length > 0)
+        : [],
+    }
+  }
+
   const byId = computed(() => new Map(workspaces.value.map(item => [item.id, item])))
 
   return {
@@ -76,6 +109,7 @@ export function useProjectWorkspaces() {
     byId,
     isLoading,
     error,
+    hasLoaded,
     loadWorkspaces,
     openWorkspace,
     renameWorkspace: (workspaceId: string, name: string) =>
@@ -84,7 +118,6 @@ export function useProjectWorkspaces() {
       mutate('workspaces.pin', { workspaceId, pinned }),
     removeWorkspace: (workspaceId: string) =>
       mutate('workspaces.remove', { workspaceId }),
-    deleteWorkspaceHistory: (workspaceId: string) =>
-      mutate('workspaces.history.delete', { workspaceId }),
+    deleteWorkspaceHistory,
   }
 }

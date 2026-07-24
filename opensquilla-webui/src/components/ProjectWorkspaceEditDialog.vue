@@ -1,8 +1,15 @@
 <template>
   <Teleport to="body">
     <div v-if="open" class="modal-overlay" @click="emit('close')">
-      <section ref="dialogRef" class="modal project-edit" role="dialog" aria-modal="true" @click.stop>
-        <h3>{{ t('workspaces.editProject') }}</h3>
+      <section
+        ref="dialogRef"
+        class="modal project-edit"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="project-workspace-edit-title"
+        @click.stop
+      >
+        <h3 id="project-workspace-edit-title">{{ t('workspaces.editProject') }}</h3>
         <label>
           <span>{{ t('workspaces.projectName') }}</span>
           <input ref="nameInputRef" v-model="name" maxlength="120" @keydown.enter.prevent="save" />

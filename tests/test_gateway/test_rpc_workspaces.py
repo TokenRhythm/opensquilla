@@ -179,6 +179,9 @@ async def test_remove_restores_identity_and_history_delete_keeps_project(
         {"workspaceId": opened["id"]}, ctx
     )
     assert deleted["deletedTaskCount"] == 1
+    assert deleted["deletedSessionKeys"] == [
+        "agent:main:webchat:project-history"
+    ]
     assert (await rpc_workspaces._handle_workspaces_list(None, ctx))[
         "workspaces"
     ][0]["taskCount"] == 0

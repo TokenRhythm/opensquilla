@@ -171,6 +171,7 @@ async def _handle_workspaces_history_delete(
     return {
         "workspaceId": workspace_id,
         "deletedTaskCount": len(deleted),
+        "deletedSessionKeys": deleted,
     }
 
 

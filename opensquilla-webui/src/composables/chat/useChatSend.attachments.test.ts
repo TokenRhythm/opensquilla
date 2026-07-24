@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { nextTick, ref } from 'vue'
+import { nextTick, ref, watch } from 'vue'
 
 import { useChatSend, type UseChatSendOptions } from './useChatSend'
 import { useChatMessageActions } from './useChatMessageActions'
@@ -112,6 +112,138 @@ describe('useChatSend attachment payloads', () => {
       workspaceId: 'project-a',
     }))
     expect(pendingWorkspaceId.value).toBeNull()
+  })
+
+  it('does not materialize a project draft before chat.send accepts it', async () => {
+    const pendingSessionIntent = ref<string | null>('new_chat')
+    const pendingWorkspaceId = ref<string | null>('project-a')
+    const materializeDraftSession = vi.fn()
+    const intentTransitions: Array<string | null> = []
+    watch(pendingSessionIntent, value => intentTransitions.push(value))
+    let rejectSend!: (reason: unknown) => void
+    const rpc = {
+      call: vi.fn(() => new Promise((_, reject) => {
+        rejectSend = reject
+      })) as UseChatSendOptions['rpc']['call'],
+    }
+    const { api, options, stream } = makeOptions({
+      rpc,
+      pendingSessionIntent,
+      pendingWorkspaceId,
+      materializeDraftSession,
+    })
+    vi.mocked(stream.startStreaming).mockImplementation(() => {
+      stream.isStreaming.value = true
+    })
+
+    const send = api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledOnce())
+    await nextTick()
+
+    expect(pendingSessionIntent.value).toBeNull()
+    expect(intentTransitions).toEqual([null])
+    expect(materializeDraftSession).not.toHaveBeenCalled()
+
+    options.inputText.value = 'follow-up while first send is pending'
+    await api.onSend()
+    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(options.enqueuePendingInput).toHaveBeenCalledWith(
+      'follow-up while first send is pending',
+      undefined,
+    )
+
+    rejectSend(Object.assign(new Error('database busy'), { accepted: false }))
+    await send
+    await nextTick()
+
+    expect(pendingSessionIntent.value).toBe('new_chat')
+    expect(pendingWorkspaceId.value).toBe('project-a')
+    expect(intentTransitions).toEqual([null, 'new_chat'])
+    expect(materializeDraftSession).not.toHaveBeenCalled()
+  })
+
+  it('materializes a new project task only after chat.send accepts it', async () => {
+    const pendingSessionIntent = ref<string | null>('new_chat')
+    const pendingWorkspaceId = ref<string | null>('project-a')
+    const materializeDraftSession = vi.fn()
+    const { api, options } = makeOptions({
+      pendingSessionIntent,
+      pendingWorkspaceId,
+      materializeDraftSession,
+    })
+
+    await api.onSend()
+
+    expect(materializeDraftSession).toHaveBeenCalledWith(options.sessionKey.value)
+    expect(pendingSessionIntent.value).toBeNull()
+  })
+
+  it('keeps the project binding owned by the pending first send when a steer succeeds first', async () => {
+    const pendingSessionIntent = ref<string | null>('new_chat')
+    const pendingWorkspaceId = ref<string | null>('project-a')
+    const busySendMode = ref<BusySendMode>('steer')
+    let rejectFirst!: (reason: unknown) => void
+    const rpc = {
+      call: vi.fn()
+        .mockImplementationOnce(() => new Promise((_, reject) => {
+          rejectFirst = reject
+        }))
+        .mockResolvedValueOnce({ sessionKey: 'agent:main:webchat:test' }),
+    }
+    const { api, options, stream } = makeOptions({
+      rpc,
+      pendingSessionIntent,
+      pendingWorkspaceId,
+      busySendMode,
+    })
+    vi.mocked(stream.startStreaming).mockImplementation(() => {
+      stream.isStreaming.value = true
+    })
+
+    const firstSend = api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledOnce())
+    options.inputText.value = 'steer while first send is pending'
+
+    await api.onSend()
+
+    expect(rpc.call).toHaveBeenCalledTimes(2)
+    expect(rpc.call.mock.calls[1]?.[1]).toEqual(expect.objectContaining({
+      queueMode: 'steer',
+    }))
+    expect(rpc.call.mock.calls[1]?.[1]).not.toHaveProperty('intent')
+    expect(rpc.call.mock.calls[1]?.[1]).not.toHaveProperty('workspaceId')
+    expect(pendingWorkspaceId.value).toBe('project-a')
+
+    rejectFirst(Object.assign(new Error('database busy'), { accepted: false }))
+    await firstSend
+    expect(pendingWorkspaceId.value).toBe('project-a')
+  })
+
+  it('reuses an ambiguous steer fingerprint while a project first send owns the workspace', async () => {
+    const pendingWorkspaceId = ref<string | null>('project-a')
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(Object.assign(new Error('response lost'), {
+          accepted: false,
+          retryable: true,
+        }))
+        .mockResolvedValueOnce({ sessionKey: 'agent:main:webchat:test' }),
+    }
+    const { api, stream } = makeOptions({
+      rpc,
+      busySendMode: ref<BusySendMode>('steer'),
+      pendingSessionIntent: ref(null),
+      pendingWorkspaceId,
+    })
+    stream.isStreaming.value = true
+
+    await api.onSend()
+    const firstParams = rpc.call.mock.calls[0]?.[1]
+    await api.onSend()
+
+    expect(rpc.call.mock.calls[1]?.[1]).toEqual(firstParams)
+    expect(firstParams).not.toHaveProperty('workspaceId')
+    expect(pendingWorkspaceId.value).toBe('project-a')
   })
 
   it('sends the selected sandbox run mode as trusted source metadata', async () => {

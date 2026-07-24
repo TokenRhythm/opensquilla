@@ -48,4 +48,17 @@ describe('persisted project sidebar arrangement', () => {
     expect(rows.filter(row => row.rowKind === 'workspace').map(row => row.key))
       .toEqual(['workspace:b', 'workspace:a'])
   })
+
+  it('keeps workspace-bound tasks visible while the canonical project list is unavailable', () => {
+    const rows = arrangeSidebarSections([
+      session({
+        key: 'agent:main:webchat:project-task',
+        title: 'Project task',
+        updatedAt: 100,
+        workspaceId: 'project-a',
+      }),
+    ], undefined)[0].rows
+
+    expect(rows.map(row => row.key)).toContain('agent:main:webchat:project-task')
+  })
 })

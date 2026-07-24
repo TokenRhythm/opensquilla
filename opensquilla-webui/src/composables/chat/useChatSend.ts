@@ -212,6 +212,7 @@ export interface UseChatSendOptions {
   pendingSessionIntent: Ref<string | null>
   pendingForkBeforeMessageId: Ref<string | null>
   pendingWorkspaceId?: Ref<string | null>
+  materializeDraftSession?: (sessionKey: string) => void
   aborted: Ref<boolean>
   // Task id rendered by the live stream; a fresh turn binds it from the
   // chat.send response so a prior task's late events can't leak in (issue #344).
@@ -253,6 +254,12 @@ export function useChatSend(options: UseChatSendOptions) {
   let activeFreshSendToken: FreshSendToken | null = null
   let activeResponseHandoff: ResponseHandoffGate | null = null
   let recoveredAttempt: SendAttempt | null = null
+
+  function pendingWorkspaceForIntent(intent: string | null): string | null {
+    return intent === 'new_chat'
+      ? options.pendingWorkspaceId?.value || null
+      : null
+  }
 
   function modelImageSendBlocked(attachments: readonly Attachment[]): boolean {
     if (!hasSendableModelInputImageAttachment(attachments)) return false
@@ -531,7 +538,7 @@ export function useChatSend(options: UseChatSendOptions) {
         attachments: sendableAttachments,
         intent: options.pendingSessionIntent.value,
         forkBeforeMessageId: options.pendingForkBeforeMessageId.value,
-        workspaceId: options.pendingWorkspaceId?.value || null,
+        workspaceId: pendingWorkspaceForIntent(options.pendingSessionIntent.value),
       })
     ) {
       await dispatchSend(text, {
@@ -600,7 +607,7 @@ export function useChatSend(options: UseChatSendOptions) {
         attachments: initialSendableAttachments,
         intent: options.pendingSessionIntent.value,
         forkBeforeMessageId: options.pendingForkBeforeMessageId.value,
-        workspaceId: options.pendingWorkspaceId?.value || null,
+        workspaceId: pendingWorkspaceForIntent(options.pendingSessionIntent.value),
       }) &&
       retryCandidate.queueMode === sendOpts?.queueMode,
     )
@@ -635,7 +642,10 @@ export function useChatSend(options: UseChatSendOptions) {
     const userText = text
     const intent = options.pendingSessionIntent.value
     const forkBeforeMessageId = options.pendingForkBeforeMessageId.value
-    const workspaceId = options.pendingWorkspaceId?.value || null
+    // Only the first new-task attempt owns the pending workspace. Follow-up
+    // queue/steer sends may run before it is accepted, but must neither inherit
+    // nor clear that project binding.
+    const workspaceId = pendingWorkspaceForIntent(intent)
     let attempt = retryAttempt
     if (!attempt) {
       const clientMessageId = createClientMessageId()
@@ -688,7 +698,6 @@ export function useChatSend(options: UseChatSendOptions) {
     if (options.pendingForkBeforeMessageId.value === forkBeforeMessageId) {
       options.pendingForkBeforeMessageId.value = null
     }
-
     // A steer send rides an already-active stream; restarting it would wipe
     // the partial output of the run being steered.
     const wasStreaming = options.stream.isStreaming.value
@@ -704,7 +713,15 @@ export function useChatSend(options: UseChatSendOptions) {
     try {
       const res = await options.rpc.call<ChatSendResponse>('chat.send', attempt.params)
       if (
+        options.sessionKey.value === requestSessionKey
+        && attempt.intent === 'new_chat'
+      ) {
+        options.materializeDraftSession?.(requestSessionKey)
+      }
+      if (
         options.pendingWorkspaceId
+        && attempt.intent === 'new_chat'
+        && options.sessionKey.value === requestSessionKey
         && options.pendingWorkspaceId.value === attempt.workspaceId
       ) {
         options.pendingWorkspaceId.value = null
@@ -799,6 +816,22 @@ export function useChatSend(options: UseChatSendOptions) {
       }
     } catch (err: unknown) {
       const acceptedError = acceptedErrorInfo(err)
+      if (acceptedError) {
+        if (
+          options.sessionKey.value === requestSessionKey
+          && attempt.intent === 'new_chat'
+        ) {
+          options.materializeDraftSession?.(requestSessionKey)
+        }
+        if (
+          options.pendingWorkspaceId
+          && attempt.intent === 'new_chat'
+          && options.sessionKey.value === requestSessionKey
+          && options.pendingWorkspaceId.value === attempt.workspaceId
+        ) {
+          options.pendingWorkspaceId.value = null
+        }
+      }
       const acceptedSessionKey = acceptedError?.sessionKey || requestSessionKey
       const stoppedByUser = freshSendToken?.stoppedByUser === true
         || responseHandoff?.stoppedByUser === true

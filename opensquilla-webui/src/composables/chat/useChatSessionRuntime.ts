@@ -49,6 +49,7 @@ export interface UseChatSessionRuntimeOptions {
   resetSavingsPopupCooldown: () => void
   restoreWidgetState: () => void
   resetStreamLiveTurnState: () => void
+  resetDraftComposer?: () => void
 }
 
 const EMPTY_USAGE: ChatUsageAccumulator = {
@@ -151,6 +152,7 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     options.sessionKey.value = key
     resetSessionRuntimeState()
     options.pendingSessionIntent.value = 'new_chat'
+    options.resetDraftComposer?.()
     resetSessionViewState()
     options.subscribeSession()
   }

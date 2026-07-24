@@ -30,6 +30,7 @@ function i18n() {
           chooseProject: 'Choose project',
           webPickerScope: 'Paths are on the gateway host.',
           pathPlaceholder: 'Project path',
+          projectPath: 'Project path',
           browse: 'Browse',
           choose: 'Choose',
         },
@@ -97,5 +98,7 @@ describe('ProjectWorkspacePickerDialog', () => {
       browseChildren: true,
     })
     expect(document.body.textContent).toContain('project-a')
+    expect(document.querySelector('input')?.getAttribute('aria-label')).toBe('Project path')
+    expect(document.querySelector('[role="option"]')?.getAttribute('aria-selected')).toBe('false')
   })
 })

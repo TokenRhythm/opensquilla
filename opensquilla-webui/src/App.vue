@@ -51,7 +51,7 @@
     <div class="sidebar-actions">
       <button
         class="sidebar-new-session"
-        :title="newChatHint ? `Start a new chat (${newChatHint})` : 'Start a new chat'"
+        :title="newChatHint ? `${t('chrome.newChat')} (${newChatHint})` : t('chrome.newChat')"
         @click="startNewChatInstant"
       >
         <Icon name="plus" :size="16" />
@@ -436,6 +436,7 @@ import { useSessionListSubscription } from './composables/useSessionListSubscrip
 import { useToasts } from './composables/useToasts'
 import { useConfirm } from './composables/useConfirm'
 import { useProjectWorkspaces } from './composables/useProjectWorkspaces'
+import { useFreshTaskDraft } from './composables/useFreshTaskDraft'
 import { useNavigation } from './app/useNavigation'
 import { useSurfaceSkin } from './themes/useSurfaceSkin'
 import { themePickerOptions, getManifest } from './themes/registry'
@@ -451,6 +452,7 @@ import {
   localSessionsDeletedDetail,
   LOCAL_SESSIONS_DELETED_EVENT,
 } from './utils/sessionSync'
+import { activeTaskWasDeletedWithProjectHistory } from './utils/projectHistory'
 
 const appStore = useAppStore()
 const rpcStore = useRpcStore()
@@ -508,6 +510,7 @@ const { skinId, variants } = useSurfaceSkin()
 const { pushToast } = useToasts()
 const { confirm } = useConfirm()
 const projectWorkspaces = useProjectWorkspaces()
+const freshTaskDraft = useFreshTaskDraft()
 const projectPickerOpen = ref(false)
 const editingProjectId = ref('')
 const editingProject = computed(() =>
@@ -656,7 +659,7 @@ function sidebarConversationTitle(item: SessionItem): string {
     const text = String(candidate || '').trim()
     if (text && !looksLikeRawSessionId(text)) return text
   }
-  return 'Untitled session'
+  return t('shared.sidebar.untitledTask')
 }
 
 // A draft / current-session row the backend list does not yet carry. The
@@ -706,12 +709,12 @@ const sidebarSessionItems = computed((): SessionItem[] => {
   for (const [key, local] of Object.entries(localChatSessions.value)) {
     if (seen.has(key)) continue
     seen.add(key)
-    items.push(syntheticChatSession(key, local.effectiveAgentId, local.title || 'New chat', local.updatedAt))
+    items.push(syntheticChatSession(key, local.effectiveAgentId, local.title || t('chrome.newChat'), local.updatedAt))
   }
   const current = currentSessionKey.value
   if (current && !seen.has(current)) {
     const currentAgentId = normalizeAgentId(current.split(':')[1] || 'main')
-    items.push(syntheticChatSession(current, currentAgentId, 'Current session', Date.now()))
+    items.push(syntheticChatSession(current, currentAgentId, t('shared.sidebar.currentTask'), Date.now()))
   }
   return items
 })
@@ -723,7 +726,9 @@ const sidebarSections = computed((): SidebarSection[] => {
   const byKey = new Map(sidebarSessionItems.value.map(item => [item.key, item]))
   return arrangeSidebarSections(
     sidebarSessionItems.value,
-    projectWorkspaces.workspaces.value,
+    projectWorkspaces.hasLoaded.value
+      ? projectWorkspaces.workspaces.value
+      : undefined,
   ).map(section => ({
     ...section,
     rows: section.rows.map((row): SidebarSectionRow => {
@@ -856,6 +861,7 @@ watch(sidebarDynamicMaximum, () => {
 // Explicit custom-Agent launches still receive their Agent-scoped session key
 // from advanced Agent administration.
 function openDefaultDraft() {
+  freshTaskDraft.requestFreshTask('main')
   return router.push({ path: '/chat/new', query: { agent: 'main' } })
 }
 
@@ -872,6 +878,7 @@ function openProjectPicker() {
 function startProjectTask(workspaceId: string) {
   if (!workspaceId) return
   handleNavClick()
+  freshTaskDraft.requestFreshTask('main', workspaceId)
   void router.push({
     path: '/chat/new',
     query: { agent: 'main', project: workspaceId },
@@ -919,13 +926,16 @@ async function onProjectRename(name: string) {
 }
 
 async function onProjectDeleteHistory(workspaceId: string) {
-  const activeProjectId = allSessions.value.find(
-    session => session.key === currentSessionKey.value,
-  )?.workspaceId
   try {
-    await projectWorkspaces.deleteWorkspaceHistory(workspaceId)
+    const result = await projectWorkspaces.deleteWorkspaceHistory(workspaceId)
+    const leaveDeletedTask = activeTaskWasDeletedWithProjectHistory({
+      workspaceId,
+      currentSessionKey: currentSessionKey.value,
+      sessions: allSessions.value,
+      deletedSessionKeys: result.deletedSessionKeys,
+    })
     await loadSessions()
-    if (activeProjectId === workspaceId) void openDefaultDraft()
+    if (leaveDeletedTask) void openDefaultDraft()
     pushToast(t('workspaces.historyDeleted'), { tone: 'ok' })
   } catch (err) {
     pushToast(t('workspaces.deleteHistoryFailed', { error: errorMessage(err) }), { tone: 'danger' })

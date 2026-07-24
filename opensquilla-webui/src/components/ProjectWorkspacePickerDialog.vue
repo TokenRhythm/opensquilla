@@ -21,6 +21,7 @@
             ref="pathInputRef"
             v-model="path"
             type="text"
+            :aria-label="t('workspaces.projectPath')"
             :placeholder="t('workspaces.pathPlaceholder')"
             @keydown.enter.prevent="browse(path)"
           />
@@ -34,6 +35,8 @@
             v-for="entry in directories"
             :key="entry.path"
             type="button"
+            role="option"
+            :aria-selected="path === entry.path"
             class="project-picker__entry"
             :class="{ 'is-selected': path === entry.path }"
             @click="path = entry.path"

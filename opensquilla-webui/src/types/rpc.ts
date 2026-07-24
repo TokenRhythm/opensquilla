@@ -132,6 +132,12 @@ export interface ProjectWorkspacesResponse {
   workspaces?: ProjectWorkspaceItem[]
 }
 
+export interface ProjectWorkspaceHistoryDeleteResponse {
+  workspaceId?: string
+  deletedTaskCount?: number
+  deletedSessionKeys?: string[]
+}
+
 /** One title/subject match from `sessions.search`. */
 export interface SessionSearchHit {
   key: string

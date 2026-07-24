@@ -557,6 +557,7 @@ import { hasOpenDialogLayer } from '@/composables/useDialogA11y'
 import { useToasts } from '@/composables/useToasts'
 import { useConfirm } from '@/composables/useConfirm'
 import { useProjectWorkspaces } from '@/composables/useProjectWorkspaces'
+import { useFreshTaskDraft } from '@/composables/useFreshTaskDraft'
 import type {
   ChatMessage,
   ChatRenderedMessage,
@@ -744,6 +745,7 @@ let bindActiveStreamTask = (taskId: string) => { activeStreamTaskId.value = task
 const pendingSessionIntent = ref<string | null>(null)
 const pendingForkBeforeMessageId = ref<string | null>(null)
 const pendingWorkspaceId = ref<string | null>(null)
+const freshTaskDraft = useFreshTaskDraft()
 const pendingWorkspace = computed(() => {
   const workspaceId = pendingWorkspaceId.value
   return workspaceId ? projectWorkspaces.byId.value.get(workspaceId) || null : null
@@ -1195,6 +1197,12 @@ const chatSessionRuntime = useChatSessionRuntime({
   resetSavingsPopupCooldown,
   restoreWidgetState,
   resetStreamLiveTurnState,
+  resetDraftComposer: () => {
+    inputText.value = ''
+    pendingAttachments.value = []
+    resetComposerInputHistory()
+    autoResizeTextarea()
+  },
 })
 const {
   resetCurrentSessionAfterSlash,
@@ -1213,7 +1221,10 @@ const chatSlashCommands = useChatSlashCommands({
   inputText,
   sessionKey,
   autoResizeTextarea,
-  newSession: () => goToDraft({ agentId: 'main' }),
+  newSession: () => {
+    freshTaskDraft.requestFreshTask('main')
+    goToDraft({ agentId: 'main' })
+  },
   resetCurrentSession: resetCurrentSessionAfterSlash,
   setCompactInFlight,
   showCompactStatus,
@@ -1271,6 +1282,10 @@ const chatSend = useChatSend({
   pendingSessionIntent,
   pendingWorkspaceId,
   pendingForkBeforeMessageId,
+  materializeDraftSession: key => {
+    if (!isDraftRoute()) return
+    persistSession(key, { source: 'chatView.draftAccepted' })
+  },
   aborted,
   activeStreamTaskId,
   activeStreamSessionKey,
@@ -2163,8 +2178,7 @@ async function chooseProjectPath(path: string) {
   try {
     const workspace = await projectWorkspaces.openWorkspace(path)
     if (!workspace) return
-    pendingWorkspaceId.value = workspace.id
-    pendingSessionIntent.value = 'new_chat'
+    freshTaskDraft.requestFreshTask(draftAgentId(), workspace.id)
     goToDraft({
       agentId: draftAgentId(),
       projectId: workspace.id,
@@ -2177,7 +2191,7 @@ async function chooseProjectPath(path: string) {
 }
 
 function closeProjectDraft() {
-  pendingWorkspaceId.value = null
+  freshTaskDraft.requestFreshTask(draftAgentId())
   goToDraft({
     agentId: draftAgentId(),
     projectId: null,
@@ -2311,17 +2325,19 @@ watch(() => [route.path, route.query.agent, route.query.project], async () => {
   enterDraft()
 })
 
+// Explicit new-task actions must reset even when navigation targets the exact
+// draft URL already on screen (for example, clicking the same project pencil).
+watch(freshTaskDraft.request, request => {
+  if (!request) return
+  landingPrefilled.value = false
+  pendingWorkspaceId.value = request.workspaceId
+  startDraftSession(request.agentId)
+  if (isDesktopViewport.value) composerRef.value?.focusTextarea()
+})
+
 // Legacy ?newChat=1 / ?new=1 links land on the draft route, then the params disappear.
 watch(() => [route.query.newChat, route.query.new], () => {
   if (hasLegacyNewChatQuery()) goToDraft({ replace: true })
-})
-
-// A draft materializes its session key in the URL only when the first message
-// actually goes out.
-watch(pendingSessionIntent, (intent, previous) => {
-  if (previous !== 'new_chat' || intent !== null) return
-  if (!isDraftRoute()) return
-  persistSession(sessionKey.value, { source: 'chatView.draftMaterialized' })
 })
 
 watch(sessionKey, () => {
