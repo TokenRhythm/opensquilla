@@ -587,7 +587,39 @@ def _dedupe_acl_paths(paths: Sequence[Path]) -> tuple[Path, ...]:
 
 
 def _ace_mask_covers(existing_mask: int, required_mask: int) -> bool:
-    return existing_mask & required_mask == required_mask
+    existing = _canonical_acl_mask(existing_mask)
+    required = _canonical_acl_mask(required_mask)
+    return existing & required == required
+
+
+def _canonical_acl_mask(mask: int) -> int:
+    canonical = mask
+    if canonical & GENERIC_READ:
+        canonical = (canonical & ~GENERIC_READ) | FILE_GENERIC_READ
+    if canonical & GENERIC_WRITE:
+        canonical = (canonical & ~GENERIC_WRITE) | FILE_GENERIC_WRITE
+    return canonical
+
+
+def _deny_ace_entries_match_expected(
+    ace_entries: Sequence[tuple[int, int]],
+    expected_mask: int,
+) -> bool:
+    managed_mask = _canonical_acl_mask(MANAGED_DENY_MASK)
+    expected = _canonical_acl_mask(expected_mask) & managed_mask
+    direct_count = 0
+    inherit_only_count = 0
+    for mask, flags in ace_entries:
+        managed = _canonical_acl_mask(mask) & managed_mask
+        if not managed:
+            continue
+        if managed != expected:
+            return False
+        if flags & INHERIT_ONLY_ACE_FLAG:
+            inherit_only_count += 1
+        else:
+            direct_count += 1
+    return direct_count == 1 and inherit_only_count <= 1
 
 
 def _explicit_allow_ace_status(
@@ -1324,7 +1356,7 @@ def _deny_path_to_sid_native(
     TRUSTEE_IS_SID = 0
     TRUSTEE_IS_UNKNOWN = 0
     ACCESS_DENIED_ACE_TYPE = 1
-    INHERIT_ONLY_ACE = 0x08
+    INHERITED_ACE = 0x10
     OBJECT_INHERIT_ACE = 0x1
     CONTAINER_INHERIT_ACE = 0x2
 
@@ -1332,9 +1364,12 @@ def _deny_path_to_sid_native(
         error_code = ctypes.get_last_error() if code is None else code
         return OSError(error_code, f"{label} failed: {ctypes.FormatError(error_code)}")
 
-    def dacl_has_deny_for_sid(dacl: object, sid_to_check: object) -> bool:
+    def explicit_deny_entries_for_sid(
+        dacl: object,
+        sid_to_check: object,
+    ) -> tuple[tuple[int, int], ...]:
         if not dacl:
-            return False
+            return ()
         info = ACL_SIZE_INFORMATION()
         if not advapi32.GetAclInformation(
             dacl,
@@ -1342,7 +1377,8 @@ def _deny_path_to_sid_native(
             ctypes.sizeof(info),
             ACL_SIZE_INFORMATION_CLASS,
         ):
-            return False
+            return ()
+        entries: list[tuple[int, int]] = []
         for index in range(int(info.AceCount)):
             ace_ptr = LPVOID()
             if not advapi32.GetAce(dacl, index, ctypes.byref(ace_ptr)) or not ace_ptr:
@@ -1350,20 +1386,21 @@ def _deny_path_to_sid_native(
             header = ctypes.cast(ace_ptr, ctypes.POINTER(ACE_HEADER)).contents
             if header.AceType != ACCESS_DENIED_ACE_TYPE:
                 continue
-            if header.AceFlags & INHERIT_ONLY_ACE:
+            if header.AceFlags & INHERITED_ACE:
                 continue
             ace = ctypes.cast(ace_ptr, ctypes.POINTER(ACCESS_DENIED_ACE)).contents
             sid_ptr_value = int(ace_ptr.value) + ctypes.sizeof(ACE_HEADER) + ctypes.sizeof(DWORD)
             ace_sid = LPVOID(sid_ptr_value)
-            if advapi32.EqualSid(ace_sid, sid_to_check) and _ace_mask_covers(int(ace.Mask), mask):
-                return True
-        return False
+            if advapi32.EqualSid(ace_sid, sid_to_check):
+                entries.append((int(ace.Mask), int(header.AceFlags)))
+        return tuple(entries)
 
     sid_ptr = LPVOID()
     security_descriptor = LPVOID()
     old_dacl = LPVOID()
     new_dacl = LPVOID()
     path_buffer = ctypes.create_unicode_buffer(str(path))
+    rebuild_existing = False
 
     try:
         if not advapi32.ConvertStringSidToSidW(sid, ctypes.byref(sid_ptr)):
@@ -1380,42 +1417,48 @@ def _deny_path_to_sid_native(
         )
         if code != ERROR_SUCCESS:
             raise win32_error("GetNamedSecurityInfoW", code)
-        if dacl_has_deny_for_sid(old_dacl, sid_ptr):
+        existing_entries = explicit_deny_entries_for_sid(old_dacl, sid_ptr)
+        if _deny_ace_entries_match_expected(existing_entries, mask):
             return
+        if existing_entries:
+            rebuild_existing = True
+        else:
+            explicit = EXPLICIT_ACCESS_W()
+            explicit.grfAccessPermissions = mask
+            explicit.grfAccessMode = DENY_ACCESS
+            explicit.grfInheritance = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+            explicit.Trustee.pMultipleTrustee = None
+            explicit.Trustee.MultipleTrusteeOperation = 0
+            explicit.Trustee.TrusteeForm = TRUSTEE_IS_SID
+            explicit.Trustee.TrusteeType = TRUSTEE_IS_UNKNOWN
+            explicit.Trustee.ptstrName = sid_ptr
 
-        explicit = EXPLICIT_ACCESS_W()
-        explicit.grfAccessPermissions = mask
-        explicit.grfAccessMode = DENY_ACCESS
-        explicit.grfInheritance = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
-        explicit.Trustee.pMultipleTrustee = None
-        explicit.Trustee.MultipleTrusteeOperation = 0
-        explicit.Trustee.TrusteeForm = TRUSTEE_IS_SID
-        explicit.Trustee.TrusteeType = TRUSTEE_IS_UNKNOWN
-        explicit.Trustee.ptstrName = sid_ptr
-
-        code = advapi32.SetEntriesInAclW(
-            1,
-            ctypes.byref(explicit),
-            old_dacl,
-            ctypes.byref(new_dacl),
-        )
-        if code != ERROR_SUCCESS:
-            raise win32_error("SetEntriesInAclW", code)
-        code = advapi32.SetNamedSecurityInfoW(
-            path_buffer,
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            new_dacl,
-            None,
-        )
-        if code != ERROR_SUCCESS:
-            raise win32_error("SetNamedSecurityInfoW", code)
+            code = advapi32.SetEntriesInAclW(
+                1,
+                ctypes.byref(explicit),
+                old_dacl,
+                ctypes.byref(new_dacl),
+            )
+            if code != ERROR_SUCCESS:
+                raise win32_error("SetEntriesInAclW", code)
+            code = advapi32.SetNamedSecurityInfoW(
+                path_buffer,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                new_dacl,
+                None,
+            )
+            if code != ERROR_SUCCESS:
+                raise win32_error("SetNamedSecurityInfoW", code)
     finally:
         for pointer in (new_dacl, security_descriptor, sid_ptr):
             if pointer:
                 kernel32.LocalFree(pointer)
+    if rebuild_existing:
+        _revoke_path_for_sid_native(path, sid)
+        _deny_path_to_sid_native(path, sid, mask=mask)
 
 
 def _environment_block(env: dict[str, str]) -> str:

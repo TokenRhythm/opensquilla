@@ -954,7 +954,8 @@ def _filter_filesystem_root_acl_grants(
 ) -> tuple[AclGrant, ...]:
     filtered: list[AclGrant] = []
     for grant in grants:
-        if not _is_filesystem_root(grant.path):
+        canonical_path = grant.path.resolve(strict=False)
+        if not _is_filesystem_root(canonical_path):
             filtered.append(grant)
             continue
         if grant.access is AclAccess.RWX:

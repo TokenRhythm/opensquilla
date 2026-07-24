@@ -675,6 +675,34 @@ def test_deny_masks_require_all_requested_bits() -> None:
 
     assert not mod._ace_mask_covers(mod.FILE_WRITE_DENY_MASK, mod.FILE_READ_DENY_MASK)
     assert mod._ace_mask_covers(mod.FILE_READ_DENY_MASK, mod.FILE_READ_DENY_MASK)
+    expanded_write_mask = mod.FILE_WRITE_DENY_MASK & ~mod.GENERIC_WRITE
+    assert mod._ace_mask_covers(expanded_write_mask, mod.FILE_WRITE_DENY_MASK)
+
+
+def test_live_deny_acl_requires_exact_nonduplicated_managed_aces() -> None:
+    from opensquilla.sandbox.backend import windows_default_runner as mod
+
+    stored_write_mask = mod.FILE_WRITE_DENY_MASK & ~mod.GENERIC_WRITE
+
+    assert mod._deny_ace_entries_match_expected(
+        ((stored_write_mask, 0),),
+        mod.FILE_WRITE_DENY_MASK,
+    )
+    assert mod._deny_ace_entries_match_expected(
+        (
+            (stored_write_mask, 0),
+            (stored_write_mask, mod.INHERIT_ONLY_ACE_FLAG),
+        ),
+        mod.FILE_WRITE_DENY_MASK,
+    )
+    assert not mod._deny_ace_entries_match_expected(
+        ((stored_write_mask | mod.FILE_READ_DENY_MASK, 0),),
+        mod.FILE_WRITE_DENY_MASK,
+    )
+    assert not mod._deny_ace_entries_match_expected(
+        ((stored_write_mask, 0), (stored_write_mask, 0)),
+        mod.FILE_WRITE_DENY_MASK,
+    )
 
 
 def test_acl_refresh_skips_missing_expansion_grants(tmp_path, monkeypatch) -> None:

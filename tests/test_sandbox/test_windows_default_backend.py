@@ -215,6 +215,44 @@ def test_windows_acl_plan_never_grants_required_mount_on_filesystem_root(
         )
 
 
+def test_windows_acl_filter_resolves_parent_segments_before_root_check(
+    tmp_path: Path,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+
+    disguised_root = Path(tmp_path.anchor) / "missing-segment" / ".."
+
+    assert mod._filter_filesystem_root_acl_grants(
+        (mod.AclGrant(disguised_root, mod.AclAccess.RX, mod.AclGrantKind.REQUIRED),)
+    ) == ()
+    with pytest.raises(
+        SandboxBackendError,
+        match="cannot grant write access to a filesystem root",
+    ):
+        mod._filter_filesystem_root_acl_grants(
+            (
+                mod.AclGrant(
+                    disguised_root,
+                    mod.AclAccess.RWX,
+                    mod.AclGrantKind.REQUIRED,
+                ),
+            )
+        )
+
+
+def test_windows_acl_filter_resolves_directory_link_before_root_check(
+    tmp_path: Path,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+
+    root_alias = tmp_path / "root-alias"
+    _directory_link(root_alias, Path(tmp_path.anchor))
+
+    assert mod._filter_filesystem_root_acl_grants(
+        (mod.AclGrant(root_alias, mod.AclAccess.RX, mod.AclGrantKind.REQUIRED),)
+    ) == ()
+
+
 def test_windows_acl_plan_preserves_lexical_and_canonical_denied_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
