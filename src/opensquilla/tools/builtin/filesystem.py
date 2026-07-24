@@ -941,6 +941,65 @@ def _cross_session_attachment_block(
     }
 
 
+def _cross_session_transcript_material_block(
+    tool_name: str,
+    candidate: Path,
+    original_path: str,
+) -> dict[str, object] | None:
+    """Block the shared transcript store except for the active session."""
+
+    ctx = current_tool_context.get()
+    if (
+        ctx is None
+        or not ctx.workspace_strict
+        or not ctx.artifact_media_root
+        or not ctx.artifact_session_id
+    ):
+        return None
+    transcript_root = (
+        Path(ctx.artifact_media_root).expanduser() / "transcripts"
+    ).resolve(strict=False)
+    try:
+        candidate.relative_to(transcript_root)
+    except ValueError:
+        return None
+    current_material_root = _strict_read_material_root()
+    if current_material_root is not None:
+        try:
+            candidate.relative_to(current_material_root)
+            return None
+        except ValueError:
+            pass
+    return {
+        "status": "blocked",
+        "reason": "cross_session_transcript_material",
+        "tool": tool_name,
+        "path": original_path,
+        "resolved_path": str(candidate),
+        "message": (
+            f"{tool_name} blocked: {candidate} is outside this session's "
+            "session-scoped transcript materials."
+        ),
+        "retryable": False,
+    }
+
+
+def _cross_session_read_block(
+    tool_name: str,
+    candidate: Path,
+    original_path: str,
+) -> dict[str, object] | None:
+    return _cross_session_attachment_block(
+        tool_name,
+        candidate,
+        original_path,
+    ) or _cross_session_transcript_material_block(
+        tool_name,
+        candidate,
+        original_path,
+    )
+
+
 def _workspace_strict_read_block(
     tool_name: str,
     resolved: Path,
@@ -951,7 +1010,7 @@ def _workspace_strict_read_block(
     candidate = resolved.expanduser().resolve(strict=False)
     profile = active_file_system_profile(_workspace_root())
     if profile is not None and profile.resolve(candidate) is not FileSystemAccess.DENY:
-        return _cross_session_attachment_block(tool_name, candidate, original_path)
+        return _cross_session_read_block(tool_name, candidate, original_path)
     roots = _strict_read_roots()
     if not roots:
         return None
@@ -970,7 +1029,7 @@ def _workspace_strict_read_block(
             ),
             "retryable": False,
         }
-    return _cross_session_attachment_block(tool_name, candidate, original_path)
+    return _cross_session_read_block(tool_name, candidate, original_path)
 
 
 def _gate_workspace_strict_read(tool_name: str, resolved: Path, original_path: str) -> None:
@@ -1006,18 +1065,18 @@ def _workspace_strict_candidate_marker(
     )
     profile = active_file_system_profile(_workspace_root())
     if profile is not None and profile.resolve(resolved) is not FileSystemAccess.DENY:
-        if _cross_session_attachment_block(
+        if _cross_session_read_block(
             tool_name,
             resolved,
             original_path or str(candidate),
         ):
-            return f"[blocked] {candidate}: another session's materialized attachments"
+            return f"[blocked] {candidate}: another session's private material"
         return None
     if not _is_within_any_root(resolved, roots):
         root_labels = ", ".join(str(root) for root in roots)
         return f"[blocked] {candidate}: outside active read roots ({root_labels})"
-    if _cross_session_attachment_block(tool_name, resolved, original_path or str(candidate)):
-        return f"[blocked] {candidate}: another session's materialized attachments"
+    if _cross_session_read_block(tool_name, resolved, original_path or str(candidate)):
+        return f"[blocked] {candidate}: another session's private material"
     return None
 
 

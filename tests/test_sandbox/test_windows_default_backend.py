@@ -154,6 +154,67 @@ def test_windows_acl_plan_never_grants_read_access_on_filesystem_root(
     assert grants[str(workspace)] == "RWX"
 
 
+def test_windows_acl_plan_never_grants_required_mount_on_filesystem_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+
+    filesystem_root = Path(tmp_path.anchor)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    request = _request(workspace)
+    request = SandboxRequest(
+        argv=request.argv,
+        cwd=request.cwd,
+        action_kind=request.action_kind,
+        policy=replace(
+            request.policy,
+            mounts=(
+                MountSpec(
+                    host_path=filesystem_root,
+                    sandbox_path=filesystem_root,
+                    mode="ro",
+                    required=True,
+                ),
+            ),
+        ),
+        env=request.env,
+        run_mode=request.run_mode,
+    )
+    monkeypatch.setattr(
+        mod,
+        "capability_sids_for_command",
+        lambda store, roots, **kwargs: tuple(f"S-{i}" for i, _ in enumerate(roots)),
+    )
+    monkeypatch.setattr(mod, "_runtime_readonly_roots", lambda: ())
+    monkeypatch.setattr(mod, "runtime_rx_roots", lambda executable: ())
+    monkeypatch.setattr(mod, "process_executable_rx_roots", lambda argv, env: ())
+    monkeypatch.setattr(mod, "_windows_tool_path_roots", lambda *args, **kwargs: ())
+
+    plan = mod._acl_plan_payload(request, private_mounts_are_required=True)
+
+    assert str(filesystem_root) not in {
+        item["path"] for item in plan["autoGrants"]
+    }
+
+    writable_mount = replace(
+        request.policy.mounts[0],
+        mode="rw",
+    )
+    writable_request = request.with_policy(
+        replace(request.policy, mounts=(writable_mount,))
+    )
+    with pytest.raises(
+        SandboxBackendError,
+        match="cannot grant write access to a filesystem root",
+    ):
+        mod._acl_plan_payload(
+            writable_request,
+            private_mounts_are_required=True,
+        )
+
+
 def test_windows_acl_plan_preserves_lexical_and_canonical_denied_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -952,6 +1013,36 @@ async def test_backend_returns_helper_result(
     assert "--payload-env" in captured["argv"]
     payload_env = captured["env"]["OPENSQUILLA_WINDOWS_DEFAULT_PAYLOAD"]
     assert '"argv":["python","-c","print(\'ok\')"]' in payload_env
+
+
+@pytest.mark.asyncio
+async def test_backend_raises_terminal_error_for_authenticated_helper_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+    from opensquilla.sandbox.backend.windows_default import WindowsDefaultBackend
+
+    class _Proc:
+        returncode = 1
+
+        async def communicate(self):
+            marker = (
+                'OPENSQUILLA_WINDOWS_DEFAULT_HELPER_ERROR '
+                '{"nonce":"nonce-123","message":"execution lease is busy"}\n'
+            )
+            return b"", marker.encode()
+
+    async def fake_exec(*argv, stdout=None, stderr=None, env=None):
+        return _Proc()
+
+    monkeypatch.setattr(mod, "_support_ready", lambda: True)
+    monkeypatch.setattr(mod, "_capability_store_path", lambda: tmp_path / "cap_sids.json")
+    monkeypatch.setattr(mod, "_new_helper_nonce", lambda: "nonce-123", raising=False)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    with pytest.raises(SandboxBackendError, match="execution lease is busy"):
+        await WindowsDefaultBackend().run(_request(tmp_path))
 
 
 @pytest.mark.asyncio

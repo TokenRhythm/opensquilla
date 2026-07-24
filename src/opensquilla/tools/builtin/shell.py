@@ -4975,7 +4975,7 @@ async def exec_command(
                     if isinstance(escalation, DenialResult):
                         return finish(json.dumps(escalation.to_dict(), ensure_ascii=False))
                     return finish(json.dumps(escalation.to_envelope(), ensure_ascii=False))
-                raise ToolError(f"Sandboxed shell execution failed: {exc}") from exc
+                raise
             except Exception as exc:
                 raise ToolError(f"Sandboxed shell execution failed: {exc}") from exc
             if is_likely_sandbox_denied(sandbox_result):

@@ -14,7 +14,7 @@ from opensquilla.engine.types import ToolCall
 from opensquilla.sandbox import filesystem_worker, sensitive_paths
 from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.sandbox.integration import configure_runtime, reset_runtime
-from opensquilla.sandbox.permissions import FileSystemPermissionProfile
+from opensquilla.sandbox.permissions import FileSystemAccess, FileSystemPermissionProfile
 from opensquilla.tools.builtin import filesystem as fs
 from opensquilla.tools.dispatch import build_tool_handler
 from opensquilla.tools.registry import get_default_registry
@@ -29,6 +29,7 @@ def tool_context(
     artifact_media_root: Path | None = None,
     artifact_session_id: str | None = None,
     run_mode: str | None = None,
+    sandbox_profile: FileSystemPermissionProfile | None = None,
 ) -> Iterator[None]:
     token = current_tool_context.set(
         ToolContext(
@@ -40,6 +41,7 @@ def tool_context(
             artifact_media_root=str(artifact_media_root) if artifact_media_root else None,
             artifact_session_id=artifact_session_id,
             run_mode=run_mode,
+            sandbox_file_system_profile=sandbox_profile,
         )
     )
     try:
@@ -386,9 +388,42 @@ async def test_workspace_strict_blocks_other_session_material_read(tmp_path: Pat
         workspace,
         artifact_media_root=media_root,
         artifact_session_id="s1",
+        sandbox_profile=FileSystemPermissionProfile(
+            entries=(),
+            default_access=FileSystemAccess.READ,
+        ),
     ):
-        with pytest.raises(ToolError, match="outside active read roots"):
+        with pytest.raises(ToolError, match="session-scoped transcript materials"):
             await fs.read_file(str(other_material_path))
+
+
+@pytest.mark.asyncio
+async def test_workspace_strict_blocks_other_session_material_discovery(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    media_root = tmp_path / "media"
+    write_transcript_material(
+        media_root=media_root,
+        session_id="s2",
+        payload=b"other material\n",
+    )
+    readable_profile = FileSystemPermissionProfile(
+        entries=(),
+        default_access=FileSystemAccess.READ,
+    )
+
+    with tool_context(
+        workspace,
+        artifact_media_root=media_root,
+        artifact_session_id="s1",
+        sandbox_profile=readable_profile,
+    ):
+        with pytest.raises(ToolError, match="session-scoped transcript materials"):
+            await fs.glob_search("*", path=str(media_root / "transcripts"))
+        with pytest.raises(ToolError, match="session-scoped transcript materials"):
+            await fs.grep_search("material", path=str(media_root / "transcripts"))
 
 
 @pytest.mark.asyncio

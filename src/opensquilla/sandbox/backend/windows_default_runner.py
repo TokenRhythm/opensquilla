@@ -72,6 +72,7 @@ SEM_NOGPFAULTERRORBOX = 0x0002
 SEM_NOOPENFILEERRORBOX = 0x8000
 OFFLINE_PAYLOAD_ENV = "OPENSQUILLA_WINDOWS_DEFAULT_PAYLOAD"
 OFFLINE_PAYLOAD_STDIN_ARG = "--payload-stdin"
+HELPER_ERROR_PREFIX = "OPENSQUILLA_WINDOWS_DEFAULT_HELPER_ERROR "
 _ICMP_TOOL_NAMES = frozenset(
     {
         "ping",
@@ -125,6 +126,7 @@ class HelperPayload:
     timeout: float
     stdin: bytes | None = None
     offline_child: bool = False
+    helper_nonce: str = ""
 
 
 @dataclass(frozen=True)
@@ -136,6 +138,7 @@ class OfflineLaunchCredentials:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = list(sys.argv[1:] if argv is None else argv)
+    payload: HelperPayload | None = None
     try:
         if not sys.platform.startswith("win"):
             raise SystemExit("windows_default runner only runs on native Windows")
@@ -144,9 +147,25 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit(_run_windows_default(payload))
     except SystemExit as exc:
         if isinstance(exc.code, str):
-            print(exc.code, file=sys.stderr)
+            _emit_helper_error(payload, exc.code)
             raise SystemExit(1) from None
         raise
+    except Exception as exc:
+        _emit_helper_error(payload, f"{type(exc).__name__}: {exc}")
+        raise SystemExit(1) from None
+
+
+def _emit_helper_error(payload: HelperPayload | None, message: str) -> None:
+    nonce = payload.helper_nonce if payload is not None else ""
+    if nonce:
+        encoded = json.dumps(
+            {"nonce": nonce, "message": message},
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        print(f"{HELPER_ERROR_PREFIX}{encoded}", file=sys.stderr)
+        return
+    print(message, file=sys.stderr)
 
 
 def _parse_payload(args: Sequence[str]) -> HelperPayload:
@@ -215,6 +234,9 @@ def _parse_payload(args: Sequence[str]) -> HelperPayload:
     offline_child = raw.get("offlineChild", False)
     if not isinstance(offline_child, bool):
         raise SystemExit("invalid windows_default payload: offlineChild must be boolean")
+    helper_nonce = raw.get("helperNonce", "")
+    if not isinstance(helper_nonce, str):
+        raise SystemExit("invalid windows_default payload: helperNonce must be a string")
 
     return HelperPayload(
         argv=tuple(argv),
@@ -225,6 +247,7 @@ def _parse_payload(args: Sequence[str]) -> HelperPayload:
         timeout=float(timeout),
         stdin=stdin,
         offline_child=offline_child,
+        helper_nonce=helper_nonce,
     )
 
 
@@ -1420,6 +1443,7 @@ def _payload_to_json(payload: HelperPayload) -> str:
             base64.b64encode(payload.stdin).decode("ascii") if payload.stdin is not None else None
         ),
         "offlineChild": payload.offline_child,
+        "helperNonce": payload.helper_nonce,
     }
     return json.dumps(raw, separators=(",", ":"), sort_keys=True)
 
@@ -1639,6 +1663,13 @@ def _sync_deny_acl_state_locked(
     if {
         key: mask for key, (_path, mask) in previous_by_key.items()
     } == {key: mask for key, (_path, mask) in desired_by_key.items()}:
+        for path, mask in normalized_desired.items():
+            _deny_path_to_sid(
+                path,
+                sid,
+                mask=mask,
+                label="desired-state-verify",
+            )
         return
 
     _mark_acl_state_tainted(

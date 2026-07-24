@@ -7,6 +7,7 @@ import base64
 import json
 import ntpath
 import os
+import secrets
 import sys
 import time
 from collections.abc import Iterable, Mapping
@@ -61,6 +62,7 @@ _HELPER_MODULE = "opensquilla.sandbox.backend.windows_default_runner"
 _FILESYSTEM_WORKER_MODULE = "opensquilla.sandbox.filesystem_worker"
 _OUTPUT_BYTE_CAP = 1_048_576
 _HELPER_PAYLOAD_ENV = "OPENSQUILLA_WINDOWS_DEFAULT_PAYLOAD"
+_HELPER_ERROR_PREFIX = "OPENSQUILLA_WINDOWS_DEFAULT_HELPER_ERROR "
 _HELPER_TIMEOUT_GRACE_S = 30.0
 _WINDOWS_PROCESS_BASE_ENV_KEYS = (
     "SystemRoot",
@@ -201,6 +203,14 @@ class WindowsDefaultBackend(Backend):
         elapsed = time.monotonic() - started
         stdout, trunc_out = _decode_capped(stdout_bytes)
         stderr, trunc_err = _decode_capped(stderr_bytes)
+        helper_error = _authenticated_helper_error(
+            stderr,
+            expected_nonce=str(payload["helperNonce"]),
+        )
+        if proc.returncode not in {None, 0} and helper_error is not None:
+            raise SandboxBackendError(
+                f"windows_default helper infrastructure failed: {helper_error}"
+            )
         return SandboxResult(
             returncode=proc.returncode if proc.returncode is not None else -1,
             stdout=stdout,
@@ -252,6 +262,7 @@ def _payload_for_request(
     )
     return {
         "backend": "windows_default",
+        "helperNonce": _new_helper_nonce(),
         "argv": list(request.argv),
         "cwd": str(request.cwd),
         "env": env,
@@ -260,6 +271,38 @@ def _payload_for_request(
         "timeout": request.policy.limits.wall_timeout_s,
         "stdinBase64": stdin_b64,
     }
+
+
+def _new_helper_nonce() -> str:
+    return secrets.token_hex(16)
+
+
+def _authenticated_helper_error(
+    stderr: str,
+    *,
+    expected_nonce: str,
+) -> str | None:
+    if not expected_nonce:
+        return None
+    for line in stderr.splitlines():
+        if not line.startswith(_HELPER_ERROR_PREFIX):
+            continue
+        try:
+            payload = json.loads(line[len(_HELPER_ERROR_PREFIX) :])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        nonce = payload.get("nonce")
+        message = payload.get("message")
+        if (
+            isinstance(nonce, str)
+            and secrets.compare_digest(nonce, expected_nonce)
+            and isinstance(message, str)
+            and message.strip()
+        ):
+            return message.strip()
+    return None
 
 
 def _windows_network_boundary_payload(request: SandboxRequest) -> dict[str, object] | None:
@@ -704,7 +747,9 @@ def _acl_plan_payload(
         include_private_mounts=private_mounts_are_required,
     )
     deny_read_paths = _profile_denied_read_paths(profile)
-    merged_grants = _merge_acl_grants(plan.auto_grants)
+    merged_grants = _filter_filesystem_root_acl_grants(
+        _merge_acl_grants(plan.auto_grants)
+    )
     roots = tuple(grant.path for grant in merged_grants)
     accesses = tuple(grant.access.value for grant in merged_grants)
     sids = capability_sids_for_command(
@@ -902,6 +947,21 @@ def _merge_acl_grants(grants: Iterable[AclGrant]) -> tuple[AclGrant, ...]:
             AclGrant(path=grant.path, access=access, kind=kind),
         )
     return tuple(grant for _index, grant in sorted(merged.values()))
+
+
+def _filter_filesystem_root_acl_grants(
+    grants: Iterable[AclGrant],
+) -> tuple[AclGrant, ...]:
+    filtered: list[AclGrant] = []
+    for grant in grants:
+        if not _is_filesystem_root(grant.path):
+            filtered.append(grant)
+            continue
+        if grant.access is AclAccess.RWX:
+            raise SandboxBackendError(
+                "windows_default cannot grant write access to a filesystem root"
+            )
+    return tuple(filtered)
 
 
 def _windows_acl_path_key(path: Path) -> str:

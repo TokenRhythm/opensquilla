@@ -42,6 +42,33 @@ def test_parse_payload_accepts_valid_windows_default_payload(tmp_path) -> None:
     assert parsed.run_mode == "trusted"
 
 
+def test_helper_error_marker_and_offline_payload_keep_authentication_nonce(
+    tmp_path,
+    capsys,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_runner as mod
+
+    payload = mod.HelperPayload(
+        argv=("cmd", "/c", "echo ok"),
+        cwd=tmp_path,
+        env={},
+        policy={"network": "none", "mounts": []},
+        run_mode="trusted",
+        timeout=5,
+        helper_nonce="nonce-123",
+    )
+
+    mod._emit_helper_error(payload, "ACL preparation failed")
+
+    marker = capsys.readouterr().err.strip()
+    assert marker.startswith(mod.HELPER_ERROR_PREFIX)
+    assert json.loads(marker[len(mod.HELPER_ERROR_PREFIX) :]) == {
+        "nonce": "nonce-123",
+        "message": "ACL preparation failed",
+    }
+    assert json.loads(mod._payload_to_json(payload))["helperNonce"] == "nonce-123"
+
+
 def test_parse_payload_decodes_stdin_base64(tmp_path) -> None:
     from opensquilla.sandbox.backend.windows_default_runner import _parse_payload
 
@@ -1211,7 +1238,7 @@ def test_deny_acl_state_sync_materializes_desired_and_removes_stale(
     ]
 
 
-def test_deny_acl_state_sync_skips_unchanged_denies(
+def test_deny_acl_state_sync_revalidates_unchanged_denies(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1254,7 +1281,9 @@ def test_deny_acl_state_sync_skips_unchanged_denies(
         {denied: mod.FILE_MUTATION_DENY_MASK},
     )
 
-    assert calls == []
+    assert calls == [
+        ("deny", denied, mod.FILE_MUTATION_DENY_MASK),
+    ]
 
 
 def test_deny_acl_state_sync_rolls_back_acl_when_state_write_fails(
