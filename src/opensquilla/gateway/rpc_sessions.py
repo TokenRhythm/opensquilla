@@ -44,10 +44,11 @@ from opensquilla.gateway.turn_ingress import (
 from opensquilla.paths import media_root_from_config
 from opensquilla.sandbox.run_context import (
     RUN_CONTEXT_ORIGIN_KEY,
+    RunContext,
     get_run_context,
     run_context_from_origin_payload,
 )
-from opensquilla.sandbox.run_mode import RunMode, normalize_run_mode
+from opensquilla.sandbox.run_mode import RunMode, config_run_mode, normalize_run_mode
 from opensquilla.sandbox.run_mode_policy import (
     coerce_run_mode_for_principal,
     run_mode_allowed_for_principal,
@@ -1243,6 +1244,8 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
             "forked_from_parent": bool(getattr(s, "forked_from_parent", False)),
             "forkedFromParent": bool(getattr(s, "forked_from_parent", False)),
             "origin": getattr(s, "origin", None),
+            "workspace_id": getattr(s, "workspace_id", None),
+            "workspaceId": getattr(s, "workspace_id", None),
             "message_count": entry_count,
             "entry_count": entry_count,
             "size_bytes": None,
@@ -1734,6 +1737,19 @@ async def _handle_sessions_send(
     )
     if fork_before_message_id is not None and session_intent is not SessionIntent.CONTINUE:
         raise ValueError("forkBeforeMessageId cannot be combined with non-continue intent")
+    raw_workspace_id = params.get("workspaceId", params.get("workspace_id"))
+    workspace_id: str | None = None
+    if raw_workspace_id is not None:
+        if not isinstance(raw_workspace_id, str) or not raw_workspace_id.strip():
+            raise ValueError("workspaceId must be a non-empty string")
+        workspace_id = raw_workspace_id.strip()
+        if session_intent is not SessionIntent.NEW_CHAT:
+            raise ValueError("workspaceId is only valid for a new task")
+        if not ctx.principal.is_owner:
+            raise RpcHandlerError(
+                "OWNER_REQUIRED",
+                "Project workspaces require a locally proven owner.",
+            )
 
     if ctx.session_manager is None:
         raise KeyError("No session manager available")
@@ -1742,6 +1758,23 @@ async def _handle_sessions_send(
     if storage_candidate is None:
         raise KeyError("No session storage available")
     storage = cast(SessionStorage, storage_candidate)
+    selected_workspace = None
+    if workspace_id is not None:
+        selected_workspace = await storage.get_project_workspace(workspace_id)
+        if selected_workspace is None or selected_workspace.removed_at is not None:
+            raise RpcHandlerError(
+                "WORKSPACE_NOT_FOUND",
+                "Project workspace not found.",
+            )
+        try:
+            workspace_available = Path(selected_workspace.path).is_dir()
+        except OSError:
+            workspace_available = False
+        if not workspace_available:
+            raise RpcHandlerError(
+                "WORKSPACE_UNAVAILABLE",
+                "The project directory is unavailable.",
+            )
 
     ingress_identity = request_identity(
         params,
@@ -1778,6 +1811,15 @@ async def _handle_sessions_send(
     create_kwargs: dict[str, Any] = {}
     if source_hint.get("caller_kind") == "web":
         create_kwargs["display_name"] = "WebChat"
+    if selected_workspace is not None:
+        create_kwargs["workspace_id"] = selected_workspace.workspace_id
+        create_kwargs["origin"] = {
+            RUN_CONTEXT_ORIGIN_KEY: RunContext(
+                run_mode=config_run_mode(ctx.config),
+                workspace=selected_workspace.path,
+                source="project_workspace",
+            ).to_origin_payload()
+        }
     supports_atomic_intent = (
         fork_before_message_id is None
         and task_runtime_candidate is not None
@@ -1979,6 +2021,7 @@ async def _handle_sessions_send(
         key,
         config=ctx.config,
         workspace=workspace_dir,
+        session_node=session,
     )
     run_context = replace(
         run_context,
@@ -1990,6 +2033,7 @@ async def _handle_sessions_send(
             run_mode=run_mode_hint,
             source="request",
         )
+    workspace_dir = run_context.workspace or workspace_dir
     if source_hint.get("caller_kind") == "cli" or source_hint.get("channel_kind") == "cli":
         route_envelope = build_cli_route_envelope(
             session_key=key,
@@ -4514,7 +4558,15 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
     from opensquilla.agents.scope import resolve_agent_workspace_dir
 
     workspace_path = resolve_agent_workspace_dir(agent_id, ctx.config)
-    workspace = str(workspace_path) if workspace_path is not None else None
+    default_workspace = str(workspace_path) if workspace_path is not None else None
+    bootstrap_run_context = await get_run_context(
+        ctx.session_manager,
+        session_key,
+        config=ctx.config,
+        workspace=default_workspace,
+        session_node=session,
+    )
+    workspace = bootstrap_run_context.workspace or default_workspace
     from opensquilla.gateway.model_routing import model_routing_snapshot
 
     metadata = {
@@ -4525,6 +4577,8 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
         "model": getattr(session, "model", None),
         "effective_model": effective_model,
         "workspace": workspace,
+        "workspace_id": getattr(session, "workspace_id", None),
+        "workspaceId": getattr(session, "workspace_id", None),
         "created_at": session.created_at,
         "updated_at": session.updated_at,
         "display_name": getattr(session, "display_name", None),

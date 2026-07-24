@@ -432,6 +432,14 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
     intent = params.get("intent")
     intent_was_provided = intent is not None
     requested_intent = intent
+    if intent is None and (
+        isinstance(params.get("workspaceId"), str)
+        or isinstance(params.get("workspace_id"), str)
+    ):
+        # A project draft is always a first-turn request. Keeping this intent
+        # stable on retries lets sessions.send consult the durable ingress
+        # receipt before an already-created session can change the strategy.
+        intent = "new_chat"
 
     # WebChat must accept the turn even when existing history is oversized.
     # Context shaping happens inside TurnRunner so it can produce a request-scoped
@@ -496,6 +504,8 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
             ("client_message_id", "client_message_id"),
             ("surfaceId", "surfaceId"),
             ("surface_id", "surface_id"),
+            ("workspaceId", "workspaceId"),
+            ("workspace_id", "workspace_id"),
         ):
             if source_key in params:
                 extra[target_key] = params[source_key]

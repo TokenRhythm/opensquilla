@@ -36,6 +36,7 @@ _FINGERPRINT_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("inputProvenanceKind", "input_provenance_kind", "provenance_kind"),
     ),
     ("run_kind", ("runKind", "run_kind")),
+    ("workspace_id", ("workspaceId", "workspace_id")),
 )
 
 

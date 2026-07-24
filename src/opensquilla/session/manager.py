@@ -853,6 +853,7 @@ class SessionManager:
             channel=parent.channel,
             chat_type=parent.chat_type,
             origin=_branch_origin(parent.origin),
+            workspace_id=parent.workspace_id,
         )
 
         if fork_transcript:
@@ -1043,6 +1044,8 @@ class SessionManager:
             chat_type=parent.chat_type,
             display_name=parent.display_name,
             forked_from_parent=True,
+            origin=_branch_origin(parent.origin),
+            workspace_id=parent.workspace_id,
         )
         child.compaction_count = (
             0

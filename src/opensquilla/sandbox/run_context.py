@@ -524,9 +524,14 @@ async def get_run_context(
     config: Any,
     workspace: str | None,
     include_user_grants: bool = True,
+    session_node: Any | None = None,
 ) -> RunContext:
     configured_mode = config_run_mode(config)
-    node = await _get_session_node(session_manager, session_key)
+    node = (
+        session_node
+        if session_node is not None
+        else await _get_session_node(session_manager, session_key)
+    )
     if node is not None:
         origin = _origin_dict(node)
         saved = _context_from_payload(
