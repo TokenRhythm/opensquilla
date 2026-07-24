@@ -38,6 +38,8 @@ FILE_GENERIC_EXECUTE = 0x001200A0
 FILE_WRITE_ATTRIBUTES = 0x00000100
 FILE_WRITE_DATA = 0x00000002
 FILE_WRITE_EA = 0x00000010
+OBJECT_INHERIT_ACE_FLAG = 0x01
+CONTAINER_INHERIT_ACE_FLAG = 0x02
 INHERIT_ONLY_ACE_FLAG = 0x08
 INHERITED_ACE_FLAG = 0x10
 FILE_MUTATION_DENY_MASK = (
@@ -432,12 +434,16 @@ def _windows_acl_plan(policy: dict[str, Any]) -> dict[str, Any]:
     grant_current_user_access = plan.get("grantCurrentUserAccess", False)
     if not isinstance(grant_current_user_access, bool):
         raise SystemExit("invalid windows_default policy: grantCurrentUserAccess must be boolean")
+    sync_deny_acl = plan.get("syncDenyAcl", True)
+    if not isinstance(sync_deny_acl, bool):
+        raise SystemExit("invalid windows_default policy: syncDenyAcl must be boolean")
     state_path = _trusted_deny_acl_state_path(plan)
     return {
         **plan,
         "denyWritePaths": deny_write_paths,
         "denyReadPaths": deny_read_paths,
         "denyAclStatePath": str(state_path),
+        "syncDenyAcl": sync_deny_acl,
         "grantCurrentUserAccess": grant_current_user_access,
     }
 
@@ -496,7 +502,7 @@ def _apply_acl_refresh(plan: dict[str, Any], *, apply_deny_write: bool = True) -
                 continue
             normal_access_seen.add(key)
             _grant_path_to_sid(grant_path, "HOST_RWX", normal_access_sid)
-    if apply_deny_write and "denyAclStatePath" in plan:
+    if apply_deny_write and plan.get("syncDenyAcl", True) and "denyAclStatePath" in plan:
         state_path = Path(str(plan["denyAclStatePath"]))
         for sid in _capability_sids(plan):
             _sync_deny_acl_state(
@@ -604,22 +610,30 @@ def _canonical_acl_mask(mask: int) -> int:
 def _deny_ace_entries_match_expected(
     ace_entries: Sequence[tuple[int, int]],
     expected_mask: int,
+    *,
+    is_directory: bool,
 ) -> bool:
     managed_mask = _canonical_acl_mask(MANAGED_DENY_MASK)
     expected = _canonical_acl_mask(expected_mask) & managed_mask
-    direct_count = 0
-    inherit_only_count = 0
+    inheritance_bits = (
+        OBJECT_INHERIT_ACE_FLAG
+        | CONTAINER_INHERIT_ACE_FLAG
+        | INHERIT_ONLY_ACE_FLAG
+    )
+    actual_flags: list[int] = []
     for mask, flags in ace_entries:
         managed = _canonical_acl_mask(mask) & managed_mask
         if not managed:
             continue
         if managed != expected:
             return False
-        if flags & INHERIT_ONLY_ACE_FLAG:
-            inherit_only_count += 1
-        else:
-            direct_count += 1
-    return direct_count == 1 and inherit_only_count <= 1
+        actual_flags.append(flags & inheritance_bits)
+    if is_directory:
+        return sorted(actual_flags) == [
+            0,
+            inheritance_bits,
+        ]
+    return actual_flags == [0]
 
 
 def _explicit_allow_ace_status(
@@ -679,11 +693,12 @@ def _run_payload_as_offline_identity(
     launch = credentials or _resolve_offline_launch_credentials(payload)
     acl_plan = _windows_acl_plan(payload.policy)
     _prepare_deny_acl_targets(acl_plan)
-    _sync_deny_acl_state(
-        Path(str(acl_plan["denyAclStatePath"])),
-        launch.sid,
-        _offline_identity_deny_entries(acl_plan),
-    )
+    if acl_plan.get("syncDenyAcl", True):
+        _sync_deny_acl_state(
+            Path(str(acl_plan["denyAclStatePath"])),
+            launch.sid,
+            _offline_identity_deny_entries(acl_plan),
+        )
     _sync_allow_acl_state(
         _default_allow_acl_state_path(),
         launch.sid,
@@ -1357,9 +1372,6 @@ def _deny_path_to_sid_native(
     TRUSTEE_IS_UNKNOWN = 0
     ACCESS_DENIED_ACE_TYPE = 1
     INHERITED_ACE = 0x10
-    OBJECT_INHERIT_ACE = 0x1
-    CONTAINER_INHERIT_ACE = 0x2
-
     def win32_error(label: str, code: int | None = None) -> OSError:
         error_code = ctypes.get_last_error() if code is None else code
         return OSError(error_code, f"{label} failed: {ctypes.FormatError(error_code)}")
@@ -1418,7 +1430,11 @@ def _deny_path_to_sid_native(
         if code != ERROR_SUCCESS:
             raise win32_error("GetNamedSecurityInfoW", code)
         existing_entries = explicit_deny_entries_for_sid(old_dacl, sid_ptr)
-        if _deny_ace_entries_match_expected(existing_entries, mask):
+        if _deny_ace_entries_match_expected(
+            existing_entries,
+            mask,
+            is_directory=path.is_dir(),
+        ):
             return
         if existing_entries:
             rebuild_existing = True
@@ -1426,7 +1442,9 @@ def _deny_path_to_sid_native(
             explicit = EXPLICIT_ACCESS_W()
             explicit.grfAccessPermissions = mask
             explicit.grfAccessMode = DENY_ACCESS
-            explicit.grfInheritance = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+            explicit.grfInheritance = (
+                OBJECT_INHERIT_ACE_FLAG | CONTAINER_INHERIT_ACE_FLAG
+            )
             explicit.Trustee.pMultipleTrustee = None
             explicit.Trustee.MultipleTrusteeOperation = 0
             explicit.Trustee.TrusteeForm = TRUSTEE_IS_SID

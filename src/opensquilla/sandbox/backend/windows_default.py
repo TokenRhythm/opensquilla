@@ -775,6 +775,7 @@ def _acl_plan_payload(
         "denyWritePaths": [str(path) for path in deny_write_paths],
         "denyReadPaths": [str(path) for path in deny_read_paths],
         "denyAclStatePath": str(_deny_acl_state_path()),
+        "syncDenyAcl": not request.action_kind.startswith("fs.worker."),
         "grantCurrentUserAccess": True,
     }
 

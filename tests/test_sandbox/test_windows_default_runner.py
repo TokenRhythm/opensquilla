@@ -683,25 +683,73 @@ def test_live_deny_acl_requires_exact_nonduplicated_managed_aces() -> None:
     from opensquilla.sandbox.backend import windows_default_runner as mod
 
     stored_write_mask = mod.FILE_WRITE_DENY_MASK & ~mod.GENERIC_WRITE
+    inherited_children = (
+        mod.OBJECT_INHERIT_ACE_FLAG
+        | mod.CONTAINER_INHERIT_ACE_FLAG
+        | mod.INHERIT_ONLY_ACE_FLAG
+    )
 
     assert mod._deny_ace_entries_match_expected(
         ((stored_write_mask, 0),),
         mod.FILE_WRITE_DENY_MASK,
+        is_directory=False,
     )
     assert mod._deny_ace_entries_match_expected(
         (
             (stored_write_mask, 0),
-            (stored_write_mask, mod.INHERIT_ONLY_ACE_FLAG),
+            (stored_write_mask, inherited_children),
         ),
         mod.FILE_WRITE_DENY_MASK,
+        is_directory=True,
     )
     assert not mod._deny_ace_entries_match_expected(
         ((stored_write_mask | mod.FILE_READ_DENY_MASK, 0),),
         mod.FILE_WRITE_DENY_MASK,
+        is_directory=False,
     )
     assert not mod._deny_ace_entries_match_expected(
         ((stored_write_mask, 0), (stored_write_mask, 0)),
         mod.FILE_WRITE_DENY_MASK,
+        is_directory=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        lambda mod, mask: ((mask, 0),),
+        lambda mod, mask: (
+            (mask, 0),
+            (
+                mask,
+                mod.OBJECT_INHERIT_ACE_FLAG | mod.INHERIT_ONLY_ACE_FLAG,
+            ),
+        ),
+        lambda mod, mask: (
+            (mask, 0),
+            (
+                mask,
+                mod.CONTAINER_INHERIT_ACE_FLAG | mod.INHERIT_ONLY_ACE_FLAG,
+            ),
+        ),
+        lambda mod, mask: (
+            (mask, 0),
+            (
+                mask,
+                mod.OBJECT_INHERIT_ACE_FLAG | mod.CONTAINER_INHERIT_ACE_FLAG,
+            ),
+        ),
+    ],
+)
+def test_directory_deny_acl_rejects_incomplete_inheritance(entries) -> None:
+    from opensquilla.sandbox.backend import windows_default_runner as mod
+
+    stored_write_mask = mod.FILE_WRITE_DENY_MASK & ~mod.GENERIC_WRITE
+
+    assert not mod._deny_ace_entries_match_expected(
+        entries(mod, stored_write_mask),
+        mod.FILE_WRITE_DENY_MASK,
+        is_directory=True,
     )
 
 
@@ -781,6 +829,31 @@ def test_acl_refresh_grants_current_user_normal_access_when_requested(
         (workspace, "RWX", "S-1-5-21-capability"),
         (workspace, "HOST_RWX", "S-1-5-21-user"),
     ]
+
+
+def test_acl_refresh_skips_deny_state_sync_for_filesystem_worker(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_runner as mod
+
+    calls = []
+    monkeypatch.setattr(
+        mod,
+        "_sync_deny_acl_state",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    mod._apply_acl_refresh(
+        {
+            "autoGrants": [],
+            "capabilitySids": ["S-1-capability"],
+            "denyAclStatePath": str(tmp_path / "deny-state.json"),
+            "syncDenyAcl": False,
+        }
+    )
+
+    assert calls == []
 
 
 def test_acl_refresh_skips_missing_policy_grants(

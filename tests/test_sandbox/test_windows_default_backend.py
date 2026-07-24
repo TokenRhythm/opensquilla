@@ -215,6 +215,31 @@ def test_windows_acl_plan_never_grants_required_mount_on_filesystem_root(
         )
 
 
+def test_windows_filesystem_worker_does_not_resync_process_deny_acls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    request = replace(_request(workspace), action_kind="fs.worker.list_dir")
+    monkeypatch.setattr(
+        mod,
+        "capability_sids_for_command",
+        lambda store, roots, **kwargs: tuple(f"S-{i}" for i, _ in enumerate(roots)),
+    )
+    monkeypatch.setattr(mod, "_runtime_readonly_roots", lambda: ())
+    monkeypatch.setattr(mod, "runtime_rx_roots", lambda executable: ())
+    monkeypatch.setattr(mod, "process_executable_rx_roots", lambda argv, env: ())
+    monkeypatch.setattr(mod, "_windows_tool_path_roots", lambda *args, **kwargs: ())
+
+    plan = mod._acl_plan_payload(request)
+
+    assert plan["syncDenyAcl"] is False
+    assert mod._acl_plan_payload(_request(workspace))["syncDenyAcl"] is True
+
+
 def test_windows_acl_filter_resolves_parent_segments_before_root_check(
     tmp_path: Path,
 ) -> None:
