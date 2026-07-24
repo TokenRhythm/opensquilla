@@ -14,6 +14,21 @@ SandboxPermissionIntent = Literal["use_default", "require_escalated"]
 ApprovalReviewerName = Literal["user", "auto_review"]
 
 
+def effective_approval_reviewer(
+    configured: object,
+    run_mode: object,
+) -> ApprovalReviewerName:
+    """Resolve the reviewer, with Standard mode always owned by the user."""
+
+    mode = getattr(run_mode, "value", run_mode)
+    if str(mode or "").strip().lower() == "standard":
+        return "user"
+    return cast(
+        "ApprovalReviewerName",
+        configured if configured in {"user", "auto_review"} else "user",
+    )
+
+
 @dataclass(frozen=True)
 class ElevationAction:
     """The material side effects an approval is allowed to authorize."""
@@ -192,6 +207,22 @@ def request_elevation(
         session_key=session_key,
     )
     if pending_id is not None:
+        if reviewer == "user":
+            entry = queue.get(pending_id)
+            if (
+                entry.params.get("reviewer") != "user"
+                or entry.params.get("humanActionable") is not True
+            ):
+                params = dict(entry.params)
+                params.update(
+                    {
+                        "reviewer": "user",
+                        "humanActionable": True,
+                        "reviewStatus": "human_confirmation_required",
+                        "reviewSource": "standard_mode_policy",
+                    }
+                )
+                queue.update_params(pending_id, params)
         return ElevationGateResult(
             requested=True,
             allowed=False,
@@ -228,6 +259,7 @@ def consume_approved_elevation(
     action: ElevationAction,
     *,
     expected_session_key: str | None = None,
+    expected_reviewer: ApprovalReviewerName | None = None,
 ) -> ElevationGateResult:
     """Validate and consume an approved grant before its side effect starts."""
 
@@ -257,6 +289,20 @@ def consume_approved_elevation(
             status="approval_session_mismatch",
             approval_id=approval_id,
             reason="approval_session_mismatch",
+        )
+    if expected_reviewer is not None and (
+        entry.params.get("reviewer") != expected_reviewer
+        or (
+            expected_reviewer == "user"
+            and entry.params.get("humanActionable") is not True
+        )
+    ):
+        return ElevationGateResult(
+            requested=True,
+            allowed=False,
+            status="approval_reviewer_mismatch",
+            approval_id=approval_id,
+            reason="approval_reviewer_mismatch",
         )
     if not entry.resolved:
         return ElevationGateResult(
@@ -337,18 +383,31 @@ def gate_elevated_action(
 
         runtime = get_runtime()
         configured = getattr(getattr(runtime, "settings", None), "approvals_reviewer", None)
-        reviewer = cast(
-            "ApprovalReviewerName",
+        reviewer = effective_approval_reviewer(
             configured if configured in {"user", "auto_review"} else "auto_review",
+            None,
         )
+    from opensquilla.tools.run_mode import current_run_mode
+
+    reviewer = effective_approval_reviewer(reviewer, current_run_mode())
     if approval_id:
         try:
-            return consume_approved_elevation(
+            consumed = consume_approved_elevation(
                 queue,
                 approval_id,
                 action,
                 expected_session_key=session_key,
+                expected_reviewer=reviewer,
             )
+            if consumed.status == "approval_reviewer_mismatch":
+                return request_elevation(
+                    queue,
+                    action,
+                    session_key=session_key,
+                    reviewer=reviewer,
+                    metadata=metadata,
+                )
+            return consumed
         except KeyError:
             reason = "approval not found"
         except ValueError as exc:
@@ -375,6 +434,7 @@ __all__ = [
     "ElevationGateResult",
     "SandboxPermissionIntent",
     "consume_approved_elevation",
+    "effective_approval_reviewer",
     "gate_elevated_action",
     "request_elevation",
 ]

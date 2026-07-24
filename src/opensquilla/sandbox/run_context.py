@@ -539,8 +539,6 @@ async def get_run_context(
             "saved",
         )
         if saved is not None:
-            if configured_mode == RunMode.FULL and saved.run_mode != RunMode.FULL:
-                saved = replace(saved, run_mode=RunMode.FULL, source="global_full")
             return _with_user_grants(saved) if include_user_grants else saved
     context = RunContext(
         run_mode=configured_mode,

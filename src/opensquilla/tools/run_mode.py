@@ -15,11 +15,13 @@ def full_host_access_for_context(ctx: object | None) -> bool:
 
     if ctx is not None:
         mode = getattr(ctx, "run_mode", None)
-        if getattr(mode, "value", mode) == "full":
-            return True
+        mode_value = getattr(mode, "value", mode)
+        if mode_value in _VALID_RUN_MODES:
+            return mode_value == "full"
         run_context_mode = getattr(getattr(ctx, "sandbox_run_context", None), "run_mode", None)
-        if getattr(run_context_mode, "value", run_context_mode) == "full":
-            return True
+        run_context_mode_value = getattr(run_context_mode, "value", run_context_mode)
+        if run_context_mode_value in _VALID_RUN_MODES:
+            return run_context_mode_value == "full"
         if getattr(ctx, "elevated", None) == "full":
             return True
     try:

@@ -113,7 +113,7 @@ async def test_set_run_mode_persists_first_workspace_and_preserves_origin_keys()
 
 
 @pytest.mark.asyncio
-async def test_globally_disabled_sandbox_overrides_saved_restricted_mode() -> None:
+async def test_saved_restricted_mode_overrides_globally_disabled_sandbox() -> None:
     from opensquilla.sandbox.run_context import get_run_context, normalize_workspace_path
 
     manager = _SessionManager()
@@ -131,9 +131,9 @@ async def test_globally_disabled_sandbox_overrides_saved_restricted_mode() -> No
         workspace="/tmp/new",
     )
 
-    assert ctx.run_mode == RunMode.FULL
+    assert ctx.run_mode == RunMode.STANDARD
     assert ctx.workspace == expected_workspace
-    assert ctx.source == "global_full"
+    assert ctx.source == "saved"
 
 
 @pytest.mark.asyncio

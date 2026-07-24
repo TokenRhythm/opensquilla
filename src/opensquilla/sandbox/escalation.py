@@ -131,6 +131,8 @@ def _add_network_reviewer_params(
     workspace: str | None,
 ) -> None:
     if reviewer == "user":
+        params["reviewer"] = "user"
+        params["humanActionable"] = True
         params["choices"] = _standard_approval_choices()
         return
     action = ElevationAction(

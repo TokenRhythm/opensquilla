@@ -38,7 +38,7 @@ from opensquilla.sandbox.types import (
     SandboxRequest,
     SecurityLevel,
 )
-from opensquilla.tools.types import ToolContext
+from opensquilla.tools.types import ToolContext, current_tool_context
 
 
 class _OneApprovalToolProvider:
@@ -319,6 +319,48 @@ async def test_local_low_risk_review_allows_without_model_call() -> None:
 
 
 @pytest.mark.asyncio
+async def test_standard_mode_converts_legacy_auto_review_to_human() -> None:
+    reset_approval_queue()
+    action = ElevationAction(
+        tool_name="exec_command",
+        action_kind="shell.exec",
+        argv=("powershell", "-Command", "New-Item D:\\legacy-auto-probe"),
+        cwd="D:\\workspace",
+        sandbox_permissions="require_escalated",
+        justification="Create the exact user-requested probe.",
+        target_paths=(("D:\\legacy-auto-probe", "write"),),
+    )
+    pending = gate_elevated_action(
+        action,
+        approval_id=None,
+        session_key="legacy-auto-standard",
+        queue=get_approval_queue(),
+        reviewer="auto_review",
+    )
+    token = current_tool_context.set(
+        ToolContext(
+            session_key="legacy-auto-standard",
+            run_mode="standard",
+        )
+    )
+    try:
+        assessment = await _review_pending_elevation_if_configured(
+            pending.to_envelope(),
+            transcript=[Message(role="user", content="Create the exact probe.")],
+            runtime_events_path=None,
+        )
+        entry = get_approval_queue().get(pending.approval_id or "")
+    finally:
+        current_tool_context.reset(token)
+        reset_approval_queue()
+
+    assert assessment is None
+    assert entry.resolved is False
+    assert entry.params["reviewer"] == "user"
+    assert entry.params["humanActionable"] is True
+
+
+@pytest.mark.asyncio
 async def test_critical_rule_review_requires_human_confirmation_without_model_call() -> None:
     reset_approval_queue()
     provider = _AutoReviewProvider(
@@ -460,7 +502,9 @@ async def test_unknown_high_risk_action_defaults_to_rule_allow() -> None:
 
 
 @pytest.mark.asyncio
-async def test_explicit_named_network_approval_uses_rules(tmp_path) -> None:
+async def test_explicit_named_network_approval_in_standard_requires_human(
+    tmp_path,
+) -> None:
     reset_approval_queue()
     provider = _AutoReviewProvider(
         json.dumps(
@@ -542,16 +586,16 @@ async def test_explicit_named_network_approval_uses_rules(tmp_path) -> None:
     try:
         _ = [event async for event in agent.run_turn("Fetch the exact unknown.test URL")]
 
-        assert decisions == ["allow"]
+        assert decisions == ["block"]
         assert provider.review_model_calls == 0
         assert len(approval_ids) == 1
         entry = get_approval_queue().get(approval_ids[0])
-        assert entry.approved is True
-        assert entry.params["humanActionable"] is False
-        assert entry.params["reviewOutcome"] == "allow"
+        assert entry.approved is False
+        assert entry.params["reviewer"] == "user"
+        assert entry.params["humanActionable"] is True
+        assert "reviewOutcome" not in entry.params
         overlay = resolved_run_context_overlay("network-agent", str(tmp_path))
-        assert overlay is not None
-        assert overlay.temporary_grants == ()
+        assert overlay is None
     finally:
         reset_approval_queue()
 

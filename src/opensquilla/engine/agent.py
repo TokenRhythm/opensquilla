@@ -165,7 +165,10 @@ from opensquilla.result_budget import (
 from opensquilla.router_control import router_control_replay_event_from_payload
 from opensquilla.safety.secret_redaction import redact_secret_value
 from opensquilla.sandbox.approval_runtime import ApprovalAction, SuspendedToolRequest
-from opensquilla.sandbox.elevation import ElevationAction
+from opensquilla.sandbox.elevation import (
+    ElevationAction,
+    effective_approval_reviewer,
+)
 from opensquilla.session.compaction import (
     CompactionConfig,
     CompactionRequest,
@@ -1072,6 +1075,27 @@ async def _review_pending_elevation_if_configured(
     ):
         return None
     if entry.resolved:
+        return None
+
+    from opensquilla.tools.run_mode import current_run_mode
+
+    if effective_approval_reviewer("auto_review", current_run_mode()) == "user":
+        updated_params = dict(params)
+        updated_params.update(
+            {
+                "reviewer": "user",
+                "humanActionable": True,
+                "reviewStatus": "human_confirmation_required",
+                "reviewSource": "standard_mode_policy",
+                "reviewRationale": (
+                    "Standard mode requires explicit user approval for elevation."
+                ),
+            }
+        )
+        try:
+            queue.update_params(approval_id, updated_params)
+        except ValueError:
+            return None
         return None
 
     fingerprint = str(

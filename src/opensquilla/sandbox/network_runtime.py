@@ -12,9 +12,12 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Protocol, cast
+from typing import Any, Protocol
 
-from opensquilla.sandbox.elevation import ApprovalReviewerName
+from opensquilla.sandbox.elevation import (
+    ApprovalReviewerName,
+    effective_approval_reviewer,
+)
 from opensquilla.sandbox.escalation import (
     build_network_approval_params,
     consume_persisted_temporary_network_grant,
@@ -225,6 +228,11 @@ class NetworkApprovalService:
             except KeyError:
                 return
             if not entry.resolved:
+                if (
+                    entry.params.get("reviewer") == "user"
+                    and entry.params.get("humanActionable") is True
+                ):
+                    return
                 self._fail_auto_review_closed(
                     approval_id,
                     "Automatic network review returned without a decision and failed closed.",
@@ -307,9 +315,9 @@ class NetworkApprovalService:
     def approval_reviewer(self) -> ApprovalReviewerName:
         settings = getattr(self.runtime, "settings", None)
         reviewer = str(getattr(settings, "approvals_reviewer", "user") or "user")
-        return cast(
-            "ApprovalReviewerName",
-            reviewer if reviewer in {"user", "auto_review"} else "user",
+        return effective_approval_reviewer(
+            reviewer,
+            self.context.run_mode,
         )
 
 

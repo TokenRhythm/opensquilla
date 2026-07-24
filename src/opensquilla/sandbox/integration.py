@@ -50,6 +50,7 @@ from opensquilla.sandbox.elevation import (
     ElevationAction,
     ElevationGateResult,
     consume_approved_elevation,
+    effective_approval_reviewer,
     gate_elevated_action,
 )
 from opensquilla.sandbox.escalation import (
@@ -918,13 +919,13 @@ def _network_grant_workspace(request: SandboxRequest, runtime: SandboxRuntime) -
     return str(getattr(runtime, "workspace", None) or request.cwd)
 
 
-def _configured_approval_reviewer(runtime: SandboxRuntime | object) -> ApprovalReviewerName:
+def _configured_approval_reviewer(
+    runtime: SandboxRuntime | object,
+    run_mode: object = None,
+) -> ApprovalReviewerName:
     settings = getattr(runtime, "settings", None)
     reviewer = str(getattr(settings, "approvals_reviewer", "user") or "user")
-    return cast(
-        "ApprovalReviewerName",
-        reviewer if reviewer in {"user", "auto_review"} else "user",
-    )
+    return effective_approval_reviewer(reviewer, run_mode)
 
 
 def _current_sandbox_persistence_handles() -> tuple[Any | None, Any | None]:
@@ -1499,7 +1500,7 @@ async def _preflight_cached_network_artifact_access(
                 session_key=_resolve_session_id(runtime, None),
                 workspace=_network_grant_workspace(request, runtime),
                 fingerprint=fingerprint,
-                reviewer=_configured_approval_reviewer(runtime),
+                reviewer=_configured_approval_reviewer(runtime, context.run_mode),
             )
             if params is not None:
                 return request_sandbox_approval(
@@ -1559,7 +1560,7 @@ async def _preflight_request_package_bundle(
         session_key=_resolve_session_id(runtime, None),
         workspace=_network_grant_workspace(request, runtime),
         fingerprint=fingerprint,
-        reviewer=_configured_approval_reviewer(runtime),
+        reviewer=_configured_approval_reviewer(runtime, context.run_mode),
     )
     return request_sandbox_approval(
         params,
@@ -2016,11 +2017,14 @@ def consume_backend_denial_retry(
                 "profile contains denied reads."
             ),
         )
+    from opensquilla.tools.run_mode import current_run_mode
+
     return consume_approved_elevation(
         rt.approval_queue,  # type: ignore[arg-type]
         approval_id,
         action,
         expected_session_key=_resolve_session_id(rt, None),
+        expected_reviewer=_configured_approval_reviewer(rt, current_run_mode()),
     )
 
 

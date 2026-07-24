@@ -868,7 +868,8 @@ async def test_write_file_exact_elevation_grant_is_consumed_once(
         )
         approval_id = requested["approval_id"]
         pending = get_approval_queue().get(approval_id)
-        assert pending.params["humanActionable"] is False
+        assert pending.params["reviewer"] == "user"
+        assert pending.params["humanActionable"] is True
         assert pending.params["action"]["content_digest"]
         assert "outside body" not in json.dumps(pending.params)
 
