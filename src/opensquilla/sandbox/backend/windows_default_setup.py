@@ -891,7 +891,6 @@ def lock_persistent_sandbox_dirs(
             _validate_setup_directory_lease(active_lease, recursive=True)
             commands = (
                 ["icacls", str(root), "/reset", "/t", "/c"],
-                ["icacls", str(root), "/inheritance:r", "/t", "/c"],
                 [
                     "icacls",
                     str(root),
@@ -902,6 +901,7 @@ def lock_persistent_sandbox_dirs(
                     "/t",
                     "/c",
                 ],
+                ["icacls", str(root), "/inheritance:r", "/t", "/c"],
                 ["icacls", str(root), "/remove:g", f"*{offline_sid}", "/t", "/c"],
             )
             for command in commands:

@@ -104,6 +104,11 @@ def test_persistent_sandbox_dirs_remove_inheritance_and_limit_control(
     assert "*S-1-5-18:(OI)(CI)F" in flattened
     assert "*S-1-5-32-544:(OI)(CI)F" in flattened
     assert "/remove:g *S-1-offline" in flattened
+    for index in range(0, len(calls), 4):
+        assert "/reset" in calls[index]
+        assert "/grant:r" in calls[index + 1]
+        assert "/inheritance:r" in calls[index + 2]
+        assert "/remove:g" in calls[index + 3]
 
 
 def test_support_probe_requires_network_marker_for_proxy_enforcement(
