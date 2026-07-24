@@ -57,6 +57,8 @@ export interface RawSessionItem {
   subtitle?: string
   groupLabel?: string
   workspace?: string
+  workspaceId?: string
+  workspace_id?: string
   workspaceLabel?: string
   workspaceDisplayPath?: string
   updatedAt?: number | string
@@ -115,6 +117,19 @@ export type RawSessionListEntry = RawSessionItem | string
 export interface SessionsListResponse {
   sessions?: RawSessionListEntry[]
   keys?: RawSessionListEntry[]
+}
+
+export interface ProjectWorkspaceItem {
+  id: string
+  name: string
+  path: string
+  taskCount: number
+  pinned: boolean
+  available: boolean
+}
+
+export interface ProjectWorkspacesResponse {
+  workspaces?: ProjectWorkspaceItem[]
 }
 
 /** One title/subject match from `sessions.search`. */

@@ -2,6 +2,7 @@ import { ref, computed } from 'vue'
 import i18n from '@/i18n'
 import { useRpcStore } from '@/stores/rpc'
 import type { RawSessionItem, RawSessionListEntry, SessionsListResponse } from '@/types/rpc'
+import type { ProjectWorkspaceItem } from '@/types/rpc'
 
 export const SESSION_LIST_VIEW = 'session-list-v1'
 
@@ -13,6 +14,7 @@ export interface SessionItem {
   subtitle: string
   groupLabel: string
   workspace?: string
+  workspaceId?: string
   workspaceLabel?: string
   workspaceDisplayPath?: string
   effectiveAgentId: string
@@ -279,6 +281,7 @@ export function normalizeSessionItem(item: unknown): SessionItem | null {
   const surface = deriveSurface(raw, key, sessionKind)
   const groupLabel = deriveGroupLabel(raw, key, sessionKind, derivedAgentId)
   const workspace = textValue(raw.workspace)
+  const workspaceId = textValue(raw.workspaceId) || textValue(raw.workspace_id)
   const workspaceLabel = textValue(raw.workspaceLabel)
   const workspaceDisplayPath = textValue(raw.workspaceDisplayPath)
   let title = normalizeRequiredString(raw, 'title', fallbackSessionTitle(raw, key, sessionKind), gaps)
@@ -304,6 +307,7 @@ export function normalizeSessionItem(item: unknown): SessionItem | null {
     subtitle,
     groupLabel,
     workspace: workspace || undefined,
+    workspaceId: workspaceId || undefined,
     workspaceLabel: workspaceLabel || undefined,
     workspaceDisplayPath: workspaceDisplayPath || undefined,
     effectiveAgentId,
@@ -397,7 +401,7 @@ export type SidebarSectionFamily = 'chats' | 'channels' | 'automations'
 
 /** A single rendered sidebar row, flattened with its indent depth. */
 export interface SidebarSectionRow {
-  rowKind: 'session' | 'workspace'
+  rowKind: 'session' | 'workspace' | 'workspace-empty'
   key: string
   title: string
   effectiveAgentId: string
@@ -411,6 +415,7 @@ export interface SidebarSectionRow {
   updatedAt: number
   hasContractGaps: boolean
   workspace?: string
+  workspaceId?: string
   workspaceLabel?: string
   workspaceDisplayPath?: string
 }
@@ -457,7 +462,10 @@ const SIDEBAR_SECTION_ORDER: SidebarSectionFamily[] = ['chats', 'channels', 'aut
  * spawn-depth fallback). The helper is pure: it returns all three families
  * (callers drop empty ones at render time).
  */
-export function arrangeSidebarSections(items: SessionItem[]): SidebarSection[] {
+export function arrangeSidebarSections(
+  items: SessionItem[],
+  projects?: readonly ProjectWorkspaceItem[],
+): SidebarSection[] {
   const buckets: Record<SidebarSectionFamily, SessionItem[]> = {
     chats: [],
     channels: [],
@@ -484,6 +492,7 @@ export function arrangeSidebarSections(items: SessionItem[]): SidebarSection[] {
     updatedAt: item.updatedAt || 0,
     hasContractGaps: item.contractGaps.length > 0,
     workspace: item.workspace,
+    workspaceId: item.workspaceId,
     workspaceLabel: item.workspaceLabel,
     workspaceDisplayPath: item.workspaceDisplayPath,
   })
@@ -557,6 +566,65 @@ export function arrangeSidebarSections(items: SessionItem[]): SidebarSection[] {
       })
   }
 
+  const arrangePersistedProjectRows = (
+    entries: SessionLedgerEntry[],
+    persistedProjects: readonly ProjectWorkspaceItem[],
+  ): SidebarSectionRow[] => {
+    const rows: SidebarSectionRow[] = []
+    for (const project of persistedProjects) {
+      const projectEntries = entries.filter(entry => entry.item.workspaceId === project.id)
+      rows.push({
+        rowKind: 'workspace',
+        key: `workspace:${project.id}`,
+        title: project.name,
+        effectiveAgentId: '',
+        agentName: '',
+        sessionKind: 'workspace',
+        depth: 0,
+        runStatus: 'idle',
+        runLabel: '',
+        updatedAt: 0,
+        hasContractGaps: false,
+        workspace: project.path,
+        workspaceId: project.id,
+        workspaceLabel: project.name,
+        workspaceDisplayPath: project.path,
+      })
+      if (projectEntries.length === 0) {
+        rows.push({
+          rowKind: 'workspace-empty',
+          key: `workspace:${project.id}:empty`,
+          title: i18n.global.t('workspaces.noTasks'),
+          effectiveAgentId: '',
+          agentName: '',
+          sessionKind: 'workspace-empty',
+          depth: 1,
+          runStatus: 'idle',
+          runLabel: '',
+          updatedAt: 0,
+          hasContractGaps: false,
+          workspace: project.path,
+          workspaceId: project.id,
+          workspaceLabel: project.name,
+          workspaceDisplayPath: project.path,
+        })
+      } else {
+        rows.push(...projectEntries.map(entry => ({
+          ...toRow(entry.item, Math.min(entry.depth + 1, 4)),
+          workspaceId: project.id,
+        })))
+      }
+    }
+    rows.push(
+      ...entries
+        .filter(entry => !entry.item.workspaceId)
+        .map(entry => toRow(entry.item, entry.depth)),
+    )
+    // Sessions belonging to a removed project remain durable but hidden until
+    // that project is restored to the canonical project list.
+    return rows
+  }
+
   return SIDEBAR_SECTION_ORDER.map(family => {
     const bucket = buckets[family]
     let rows: SidebarSectionRow[]
@@ -564,7 +632,9 @@ export function arrangeSidebarSections(items: SessionItem[]): SidebarSection[] {
       // Recency-sort first so the ledger's root ordering follows recency, then
       // flatten parent → child so subagents indent directly beneath their chat.
       const ledger = arrangeSessionLedger([...bucket].sort(byRecency))
-      rows = arrangeWorkspaceRows(ledger)
+      rows = projects === undefined
+        ? arrangeWorkspaceRows(ledger)
+        : arrangePersistedProjectRows(ledger, projects)
     } else {
       rows = [...bucket].sort(byRecency).map(item => toRow(item, 0))
     }
