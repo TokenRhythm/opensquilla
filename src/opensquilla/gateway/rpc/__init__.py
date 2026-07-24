@@ -75,6 +75,7 @@ import opensquilla.gateway.rpc_skills  # noqa: E402, F401
 import opensquilla.gateway.rpc_system  # noqa: E402, F401
 import opensquilla.gateway.rpc_tools  # noqa: E402, F401
 import opensquilla.gateway.rpc_usage  # noqa: E402, F401
+import opensquilla.gateway.rpc_workspaces  # noqa: E402, F401
 import opensquilla.gateway.rpc_wizard  # noqa: E402, F401
 
 # Fail fast if any registered handler disagrees with ``gateway.scopes``.

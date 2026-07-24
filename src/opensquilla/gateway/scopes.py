@@ -100,6 +100,7 @@ METHOD_SCOPES: dict[str, str] = {
     "sessions.bootstrap": READ_SCOPE,
     "sessions.subscribe": READ_SCOPE,
     "sessions.unsubscribe": READ_SCOPE,
+    "workspaces.list": READ_SCOPE,  # OpenSquilla-only; owner-guarded local paths.
     "sessions.messages.subscribe": READ_SCOPE,
     "sessions.messages.unsubscribe": READ_SCOPE,
     "gateway.identity.get": READ_SCOPE,
@@ -182,6 +183,11 @@ METHOD_SCOPES: dict[str, str] = {
     "sessions.contextCompact": WRITE_SCOPE,
     "sessions.compact": WRITE_SCOPE,
     "sessions.truncate": WRITE_SCOPE,
+    "workspaces.open": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded project lifecycle.
+    "workspaces.update": WRITE_SCOPE,
+    "workspaces.pin": WRITE_SCOPE,
+    "workspaces.remove": WRITE_SCOPE,
+    "workspaces.history.delete": WRITE_SCOPE,
     "models.routing.set": WRITE_SCOPE,
     # Deleting a session is a routine, per-user write op like reset/truncate above,
     # so it is write-scoped rather than admin-gated. Admin-gating it broke deletion
