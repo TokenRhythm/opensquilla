@@ -23,6 +23,7 @@ from opensquilla.session.models import (
     AgentTaskRecord,
     AgentTaskStatus,
     MemoryDurableReceipt,
+    ProjectWorkspace,
     SessionContextState,
     SessionNode,
     SessionStatus,
@@ -160,7 +161,8 @@ def _serialized_read[**P, R](
 # Version 9 added durable turn-ingress receipts.
 # Version 10 added the durable provider usage ledger and content-free daily usage
 # telemetry aggregates. Version 11 added per-item provider-native billing receipts.
-SCHEMA_VERSION = 11
+# Version 12 added persistent project workspaces and optional session bindings.
+SCHEMA_VERSION = 12
 
 # Session rows at or above this semantic version were created by fork logic
 # that records enough existing metadata for canonical coverage to be checked
@@ -223,10 +225,35 @@ CREATE TABLE IF NOT EXISTS sessions (
     group_id TEXT,
     subject TEXT,
     origin TEXT,
+    workspace_id TEXT,
     agent_id TEXT NOT NULL DEFAULT 'main',
     schema_version INTEGER NOT NULL DEFAULT 1,
     epoch INTEGER NOT NULL DEFAULT 0
 )
+"""
+
+_CREATE_PROJECT_WORKSPACES = """
+CREATE TABLE IF NOT EXISTS project_workspaces (
+    workspace_id TEXT PRIMARY KEY,
+    path TEXT NOT NULL,
+    path_key TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    position_at INTEGER NOT NULL,
+    pinned_at INTEGER,
+    removed_at INTEGER,
+    trusted_at INTEGER
+)
+"""
+
+_CREATE_IDX_PROJECT_WORKSPACES_ORDER = """
+CREATE INDEX IF NOT EXISTS idx_project_workspaces_order
+ON project_workspaces(removed_at, pinned_at DESC, position_at DESC)
+"""
+
+_CREATE_IDX_SESSIONS_WORKSPACE = """
+CREATE INDEX IF NOT EXISTS idx_sessions_workspace_id ON sessions(workspace_id)
 """
 
 # Recency ordering for list_sessions and the title search (ORDER BY updated_at
@@ -1154,6 +1181,8 @@ class SessionStorage:
     async def _initialize_schema(self) -> None:
         assert self._conn is not None
         await self._conn.execute(_CREATE_SESSIONS)
+        await self._conn.execute(_CREATE_PROJECT_WORKSPACES)
+        await self._conn.execute(_CREATE_IDX_PROJECT_WORKSPACES_ORDER)
         await self._conn.execute(_CREATE_TRANSCRIPT)
         await self._conn.execute(_CREATE_IDX_TRANSCRIPT_SESSION)
         await self._conn.execute(_CREATE_IDX_TRANSCRIPT_KEY)
@@ -1209,6 +1238,7 @@ class SessionStorage:
         await self._conn.commit()
         # Migrate older databases — add the epoch column if missing.
         await self._migrate_epoch_column()
+        await self._migrate_workspace_id_column()
         await self._migrate_derived_title_column()
         await self._migrate_transcript_reasoning_content_column()
         await self._migrate_transcript_turn_usage_column()
@@ -1223,6 +1253,8 @@ class SessionStorage:
             session_columns = {row[1] for row in await cur.fetchall()}
         if "updated_at" in session_columns:
             await self._conn.execute(_CREATE_IDX_SESSIONS_UPDATED)
+        if "workspace_id" in session_columns:
+            await self._conn.execute(_CREATE_IDX_SESSIONS_WORKSPACE)
         await self._conn.commit()
         required_recovery_columns = {
             "status",
@@ -1370,6 +1402,18 @@ class SessionStorage:
         if null_count > 0:
             await self._conn.execute(
                 "UPDATE sessions SET epoch = 0 WHERE epoch IS NULL"
+            )
+            await self._conn.commit()
+
+    async def _migrate_workspace_id_column(self) -> None:
+        """Idempotently add the optional project-workspace session binding."""
+
+        assert self._conn is not None
+        async with self._conn.execute("PRAGMA table_info(sessions)") as cur:
+            columns = {str(row[1]) for row in await cur.fetchall()}
+        if "workspace_id" not in columns:
+            await self._conn.execute(
+                "ALTER TABLE sessions ADD COLUMN workspace_id TEXT"
             )
             await self._conn.commit()
 
@@ -2673,6 +2717,248 @@ class SessionStorage:
             return updated
 
     # ── Session CRUD ────────────────────────────────────────────────────────
+
+    async def create_or_restore_project_workspace(
+        self,
+        *,
+        path: str,
+        path_key: str,
+        display_name: str,
+        trusted_at: int | None,
+        now_ms: int | None = None,
+    ) -> ProjectWorkspace:
+        now = _now_ms() if now_ms is None else int(now_ms)
+        async with self._write_transaction("create_or_restore_project_workspace") as conn:
+            async with conn.execute(
+                "SELECT * FROM project_workspaces WHERE path_key = ?",
+                (path_key,),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                workspace = ProjectWorkspace(
+                    path=path,
+                    path_key=path_key,
+                    display_name=display_name,
+                    created_at=now,
+                    updated_at=now,
+                    position_at=now,
+                    trusted_at=trusted_at,
+                )
+                data = workspace.model_dump()
+                columns = list(data)
+                await conn.execute(
+                    f"INSERT INTO project_workspaces ({', '.join(columns)}) "  # noqa: S608
+                    f"VALUES ({', '.join('?' for _ in columns)})",
+                    [_serialize(data[column]) for column in columns],
+                )
+                return workspace
+
+            workspace = ProjectWorkspace(**dict(row))
+            if workspace.removed_at is None:
+                if workspace.trusted_at is None and trusted_at is not None:
+                    await conn.execute(
+                        """
+                        UPDATE project_workspaces
+                        SET trusted_at = ?, updated_at = ?, path = ?
+                        WHERE workspace_id = ?
+                        """,
+                        (trusted_at, now, path, workspace.workspace_id),
+                    )
+                    workspace.trusted_at = trusted_at
+                    workspace.updated_at = now
+                    workspace.path = path
+                return workspace
+
+            await conn.execute(
+                """
+                UPDATE project_workspaces
+                SET removed_at = NULL, position_at = ?, updated_at = ?,
+                    trusted_at = COALESCE(?, trusted_at), path = ?
+                WHERE workspace_id = ?
+                """,
+                (now, now, trusted_at, path, workspace.workspace_id),
+            )
+            workspace.removed_at = None
+            workspace.position_at = now
+            workspace.updated_at = now
+            workspace.trusted_at = trusted_at or workspace.trusted_at
+            workspace.path = path
+            return workspace
+
+    @_serialized_read
+    async def get_project_workspace(self, workspace_id: str) -> ProjectWorkspace | None:
+        async with self.conn.execute(
+            "SELECT * FROM project_workspaces WHERE workspace_id = ?",
+            (workspace_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return ProjectWorkspace(**dict(row)) if row is not None else None
+
+    @_serialized_read
+    async def get_project_workspace_by_path_key(
+        self,
+        path_key: str,
+    ) -> ProjectWorkspace | None:
+        async with self.conn.execute(
+            "SELECT * FROM project_workspaces WHERE path_key = ?",
+            (path_key,),
+        ) as cur:
+            row = await cur.fetchone()
+        return ProjectWorkspace(**dict(row)) if row is not None else None
+
+    @_serialized_read
+    async def list_project_workspaces(
+        self,
+        *,
+        include_removed: bool = False,
+    ) -> list[ProjectWorkspace]:
+        where = "" if include_removed else "WHERE removed_at IS NULL"
+        async with self.conn.execute(
+            f"""
+            SELECT * FROM project_workspaces
+            {where}
+            ORDER BY
+                CASE WHEN pinned_at IS NULL THEN 1 ELSE 0 END ASC,
+                pinned_at DESC,
+                position_at DESC,
+                created_at DESC
+            """  # noqa: S608 - fixed optional clause
+        ) as cur:
+            rows = await cur.fetchall()
+        return [ProjectWorkspace(**dict(row)) for row in rows]
+
+    async def update_project_workspace(
+        self,
+        workspace_id: str,
+        *,
+        display_name: str,
+        now_ms: int | None = None,
+    ) -> ProjectWorkspace:
+        now = _now_ms() if now_ms is None else int(now_ms)
+        async with self._write_transaction("update_project_workspace") as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE project_workspaces
+                SET display_name = ?, updated_at = ?
+                WHERE workspace_id = ?
+                """,
+                (display_name, now, workspace_id),
+            )
+            if int(cursor.rowcount or 0) == 0:
+                raise KeyError(f"Project workspace not found: {workspace_id}")
+            async with conn.execute(
+                "SELECT * FROM project_workspaces WHERE workspace_id = ?",
+                (workspace_id,),
+            ) as cur:
+                row = await cur.fetchone()
+        assert row is not None
+        return ProjectWorkspace(**dict(row))
+
+    async def set_project_workspace_pin(
+        self,
+        workspace_id: str,
+        *,
+        pinned: bool,
+        now_ms: int | None = None,
+    ) -> ProjectWorkspace:
+        now = _now_ms() if now_ms is None else int(now_ms)
+        async with self._write_transaction("set_project_workspace_pin") as conn:
+            if pinned:
+                cursor = await conn.execute(
+                    """
+                    UPDATE project_workspaces
+                    SET pinned_at = ?, updated_at = ?
+                    WHERE workspace_id = ? AND removed_at IS NULL
+                    """,
+                    (now, now, workspace_id),
+                )
+            else:
+                cursor = await conn.execute(
+                    """
+                    UPDATE project_workspaces
+                    SET pinned_at = NULL, position_at = ?, updated_at = ?
+                    WHERE workspace_id = ? AND removed_at IS NULL
+                    """,
+                    (now, now, workspace_id),
+                )
+            if int(cursor.rowcount or 0) == 0:
+                raise KeyError(f"Project workspace not found: {workspace_id}")
+            async with conn.execute(
+                "SELECT * FROM project_workspaces WHERE workspace_id = ?",
+                (workspace_id,),
+            ) as cur:
+                row = await cur.fetchone()
+        assert row is not None
+        return ProjectWorkspace(**dict(row))
+
+    async def remove_project_workspace(
+        self,
+        workspace_id: str,
+        *,
+        now_ms: int | None = None,
+    ) -> None:
+        now = _now_ms() if now_ms is None else int(now_ms)
+        async with self._write_transaction("remove_project_workspace") as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE project_workspaces
+                SET removed_at = ?, pinned_at = NULL, updated_at = ?
+                WHERE workspace_id = ? AND removed_at IS NULL
+                """,
+                (now, now, workspace_id),
+            )
+            if int(cursor.rowcount or 0) == 0:
+                raise KeyError(f"Project workspace not found: {workspace_id}")
+
+    async def bind_session_workspace(
+        self,
+        session_key: str,
+        workspace_id: str | None,
+    ) -> None:
+        session_key = canonicalize_session_key(session_key)
+        async with self._write_transaction("bind_session_workspace") as conn:
+            cursor = await conn.execute(
+                "UPDATE sessions SET workspace_id = ? WHERE session_key = ?",
+                (workspace_id, session_key),
+            )
+            if int(cursor.rowcount or 0) == 0:
+                raise KeyError(f"Session not found: {session_key}")
+
+    @_serialized_read
+    async def count_project_workspace_tasks(self, workspace_id: str) -> int:
+        async with self.conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM sessions
+            WHERE workspace_id = ? AND spawn_depth = 0
+            """,
+            (workspace_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row[0] if row is not None else 0)
+
+    @_serialized_read
+    async def list_project_workspace_session_keys(
+        self,
+        workspace_id: str,
+    ) -> list[str]:
+        async with self.conn.execute(
+            """
+            SELECT session_key
+            FROM sessions
+            WHERE workspace_id = ?
+            ORDER BY created_at ASC
+            """,
+            (workspace_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [str(row[0]) for row in rows]
+
+    async def delete_project_workspace_sessions(self, workspace_id: str) -> list[str]:
+        keys = await self.list_project_workspace_session_keys(workspace_id)
+        for session_key in keys:
+            await self.delete_session(session_key)
+        return keys
 
     async def upsert_session(self, node: SessionNode) -> None:
         node.session_key = canonicalize_session_key(node.session_key)

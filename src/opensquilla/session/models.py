@@ -71,6 +71,23 @@ def _new_uuid() -> str:
     return str(uuid.uuid4())
 
 
+class ProjectWorkspace(SQLModel, table=True):
+    """A user-selected project directory that exists independently of sessions."""
+
+    __tablename__ = "project_workspaces"
+
+    workspace_id: str = Field(default_factory=_new_uuid, primary_key=True)
+    path: str
+    path_key: str = Field(unique=True)
+    display_name: str
+    created_at: int = Field(default_factory=_now_ms)
+    updated_at: int = Field(default_factory=_now_ms)
+    position_at: int = Field(default_factory=_now_ms)
+    pinned_at: int | None = None
+    removed_at: int | None = None
+    trusted_at: int | None = None
+
+
 class SessionNode(SQLModel, table=True):
     """Persisted session entry keyed by session_key."""
 
@@ -152,6 +169,10 @@ class SessionNode(SQLModel, table=True):
 
     # Origin metadata (JSON blob)
     origin: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
+
+    # Optional user-selected project workspace. Ordinary tasks keep this NULL
+    # and continue to resolve the Agent/default OpenSquilla workspace.
+    workspace_id: str | None = Field(default=None, index=True)
 
     # Agent id for multi-agent support
     agent_id: str = "main"
