@@ -320,3 +320,72 @@ async def test_bootstrap_and_fork_preserve_project_workspace(tmp_path: Path) -> 
         assert bootstrap.payload["session"]["workspace"] == project.path
         assert child.workspace_id == project.workspace_id
         assert child.origin == parent.origin
+
+
+@pytest.mark.asyncio
+async def test_chat_fork_stays_in_project_workspace_and_sidebar_group(
+    tmp_path: Path,
+) -> None:
+    async with open_stack(tmp_path / "sessions.db") as stack:
+        project = await add_project(stack, tmp_path / "project")
+        assert project is not None
+        parent = await stack.manager.create(
+            "agent:main:webchat:project-fork-parent",
+            workspace_id=project.workspace_id,
+            origin={
+                RUN_CONTEXT_ORIGIN_KEY: {
+                    "run_mode": "standard",
+                    "workspace": project.path,
+                }
+            },
+        )
+        await stack.manager.append_message(parent.session_key, "user", "A marker")
+        fork_before = await stack.manager.append_message(
+            parent.session_key,
+            "user",
+            "B marker",
+        )
+        await stack.manager.append_message(parent.session_key, "user", "C marker")
+
+        response = await get_dispatcher().dispatch(
+            "project-fork-send",
+            "chat.send",
+            {
+                "sessionKey": parent.session_key,
+                "message": "B edited",
+                "forkBeforeMessageId": fork_before.message_id,
+                "clientRequestId": "project-fork-request-1",
+            },
+            stack.context,
+        )
+        await asyncio.wait_for(stack.started.wait(), timeout=2.0)
+
+        assert response.ok is True
+        child_key = response.payload["sessionKey"]
+        assert child_key != parent.session_key
+
+        child = await stack.storage.get_session(child_key)
+        assert child is not None
+        assert child.workspace_id == project.workspace_id
+        assert child.origin == parent.origin
+        assert stack.runs[0].envelope.session_key == child_key
+        assert (
+            stack.runs[0].envelope.metadata["sandbox_run_context"]["workspace"]
+            == project.path
+        )
+
+        child_entries = await stack.manager.get_transcript(child_key)
+        assert [entry.content for entry in child_entries] == ["A marker", "B edited"]
+
+        listed = await get_dispatcher().dispatch(
+            "project-fork-list",
+            "sessions.list",
+            {"limit": 50},
+            stack.context,
+        )
+        assert listed.ok is True
+        child_row = next(
+            row for row in listed.payload["sessions"] if row["key"] == child_key
+        )
+        assert child_row["workspaceId"] == project.workspace_id
+        assert child_row["workspace"] == project.path
