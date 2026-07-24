@@ -5,9 +5,10 @@ from __future__ import annotations
 import fnmatch
 import json
 import re
+import stat
 import sys
 from collections.abc import Sequence
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any
 
 from opensquilla.sandbox.directory_listing import format_directory_entry
@@ -170,11 +171,26 @@ def _enforce_candidate_access(
     *,
     write: bool = False,
     traversal: bool = False,
+    metadata_only: bool = False,
 ) -> Path:
-    resolved = candidate.expanduser().resolve(strict=False)
+    try:
+        resolved = candidate.expanduser().resolve(strict=False)
+        profile_candidate: PurePath = resolved
+    except (OSError, RuntimeError) as exc:
+        lexical = candidate.expanduser().absolute()
+        try:
+            is_link = stat.S_ISLNK(lexical.lstat().st_mode)
+        except OSError:
+            is_link = False
+        if not metadata_only or not is_link:
+            raise PermissionError(f"cannot safely resolve filesystem path: {candidate}") from exc
+        # Listing a directory only needs the link's own metadata. Keep its
+        # lexical name so an unresolvable target cannot fail the whole list.
+        resolved = lexical
+        profile_candidate = PurePath(str(lexical))
     profile = _filesystem_profile(payload)
     if profile is not None:
-        access = profile.resolve(resolved)
+        access = profile.resolve(profile_candidate)
         if access is FileSystemAccess.DENY or (
             write and access is not FileSystemAccess.WRITE
         ):
@@ -227,12 +243,12 @@ def _enforce_candidate_access(
 
 
 def _safe_descendants(payload: dict[str, Any], base: Path):
-    _enforce_candidate_access(payload, base, traversal=True)
+    base = _enforce_candidate_access(payload, base, traversal=True)
     pending = [base]
     visited: set[str] = set()
     while pending:
         directory = pending.pop()
-        canonical = str(directory.resolve(strict=False)).casefold()
+        canonical = str(directory).casefold()
         if canonical in visited:
             continue
         visited.add(canonical)
@@ -242,23 +258,25 @@ def _safe_descendants(payload: dict[str, Any], base: Path):
             continue
         for child in children:
             try:
-                _enforce_candidate_access(payload, child, traversal=True)
+                checked = _enforce_candidate_access(payload, child, traversal=True)
             except PermissionError:
                 continue
-            yield child
+            yield checked
             try:
-                if child.is_dir():
-                    pending.append(child)
+                if checked.is_dir():
+                    pending.append(checked)
             except (PermissionError, OSError):
                 continue
 
 
-def _candidate_is_readable(payload: dict[str, Any], candidate: Path) -> bool:
+def _readable_candidate(
+    payload: dict[str, Any],
+    candidate: Path,
+) -> Path | None:
     try:
-        _enforce_candidate_access(payload, candidate, traversal=True)
+        return _enforce_candidate_access(payload, candidate, traversal=True)
     except PermissionError:
-        return False
-    return True
+        return None
 
 
 def _relative_glob_match(base: Path, candidate: Path, pattern: str) -> bool:
@@ -277,7 +295,7 @@ def _read_file(payload: dict[str, Any]) -> dict[str, object]:
     from opensquilla.tools.builtin import filesystem as filesystem_tool
 
     path = _required_path(payload, "path")
-    _enforce_candidate_access(payload, path)
+    path = _enforce_candidate_access(payload, path)
     display_path = payload.get("displayPath") or str(path)
     if not path.exists():
         raise FileNotFoundError(f"File not found: {display_path}")
@@ -306,7 +324,7 @@ def _read_file(payload: dict[str, Any]) -> dict[str, object]:
 
 def _list_dir(payload: dict[str, Any]) -> dict[str, object]:
     path = _required_path(payload, "path")
-    _enforce_candidate_access(payload, path)
+    path = _enforce_candidate_access(payload, path)
     display_path = payload.get("displayPath") or str(path)
     if not path.exists():
         raise FileNotFoundError(f"Path not found: {display_path}")
@@ -317,7 +335,7 @@ def _list_dir(payload: dict[str, Any]) -> dict[str, object]:
     files: list[str] = []
     for entry in sorted(path.iterdir(), key=lambda item: item.name):
         try:
-            _enforce_candidate_access(payload, entry)
+            _enforce_candidate_access(payload, entry, metadata_only=True)
         except PermissionError:
             continue
         is_directory, line = format_directory_entry(entry)
@@ -328,7 +346,7 @@ def _list_dir(payload: dict[str, Any]) -> dict[str, object]:
 
 def _glob_search(payload: dict[str, Any]) -> dict[str, object]:
     base = _required_path(payload, "path")
-    _enforce_candidate_access(payload, base, traversal=True)
+    base = _enforce_candidate_access(payload, base, traversal=True)
     pattern = _required_string(payload, "pattern")
     if not base.exists():
         raise FileNotFoundError(f"Path not found: {base}")
@@ -337,9 +355,9 @@ def _glob_search(payload: dict[str, Any]) -> dict[str, object]:
         _safe_descendants(payload, base)
         if recursive
         else (
-            candidate
+            checked
             for candidate in sorted(base.iterdir(), key=lambda item: str(item))
-            if _candidate_is_readable(payload, candidate)
+            if (checked := _readable_candidate(payload, candidate)) is not None
         )
     )
     matches = [
@@ -356,7 +374,7 @@ def _glob_search(payload: dict[str, Any]) -> dict[str, object]:
 
 def _grep_search(payload: dict[str, Any]) -> dict[str, object]:
     base = _required_path(payload, "path")
-    _enforce_candidate_access(payload, base, traversal=True)
+    base = _enforce_candidate_access(payload, base, traversal=True)
     pattern = _required_string(payload, "pattern")
     include = payload.get("include")
     if include is not None and not isinstance(include, str):
@@ -367,7 +385,7 @@ def _grep_search(payload: dict[str, Any]) -> dict[str, object]:
 
     def search_file(path: Path) -> None:
         try:
-            _enforce_candidate_access(payload, path)
+            path = _enforce_candidate_access(payload, path)
         except PermissionError:
             return
         if include and not fnmatch.fnmatch(path.name, include):
@@ -400,7 +418,7 @@ def _grep_search(payload: dict[str, Any]) -> dict[str, object]:
 
 def _write_text(payload: dict[str, Any]) -> dict[str, object]:
     path = _required_path(payload, "path")
-    _enforce_candidate_access(payload, path, write=True)
+    path = _enforce_candidate_access(payload, path, write=True)
     content = _required_string(payload, "content")
     created = not path.exists()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -413,7 +431,7 @@ def _write_text(payload: dict[str, Any]) -> dict[str, object]:
 
 def _edit_text(payload: dict[str, Any]) -> dict[str, object]:
     path = _required_path(payload, "path")
-    _enforce_candidate_access(payload, path, write=True)
+    path = _enforce_candidate_access(payload, path, write=True)
     old_text = _required_string(payload, "oldText")
     new_text = _required_string(payload, "newText")
     if not path.exists():
@@ -436,9 +454,10 @@ def _apply_patch(payload: dict[str, Any]) -> dict[str, object]:
 
     patch = _required_string(payload, "patch")
     root = _required_path(payload, "root")
-    authorized_paths = _required_paths(payload, "paths")
-    for path in authorized_paths:
+    authorized_paths = tuple(
         _enforce_candidate_access(payload, path, write=True)
+        for path in _required_paths(payload, "paths")
+    )
     ops = patch_tool._parse_patch(patch)
     added, modified, deleted, _planned = patch_tool._apply_ops(
         ops,

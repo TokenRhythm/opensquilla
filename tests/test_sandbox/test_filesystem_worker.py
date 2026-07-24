@@ -76,6 +76,74 @@ def test_list_dir_keeps_siblings_when_symlink_target_is_missing(tmp_path: Path) 
     assert "[link] dangling (broken symlink)" in result["message"]
 
 
+def test_list_dir_keeps_siblings_when_symlink_target_loops(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "ok.txt").write_text("hello", encoding="utf-8")
+    loop = tmp_path / "loop"
+    loop.write_text("placeholder", encoding="utf-8")
+    original_resolve = Path.resolve
+    original_lstat = Path.lstat
+    original_format = filesystem_worker.format_directory_entry
+
+    def selective_resolve(path: Path, *args: object, **kwargs: object):
+        if path == loop:
+            raise RuntimeError("Symlink loop")
+        return original_resolve(path, *args, **kwargs)
+
+    def selective_lstat(path: Path):
+        if path == loop:
+            metadata = original_lstat(path)
+            values = list(metadata)
+            values[stat.ST_MODE] = stat.S_IFLNK
+            return os.stat_result(values)
+        return original_lstat(path)
+
+    def selective_format(path: Path):
+        if path == loop:
+            return False, "[link] loop (broken symlink)"
+        return original_format(path)
+
+    monkeypatch.setattr(Path, "resolve", selective_resolve)
+    monkeypatch.setattr(Path, "lstat", selective_lstat)
+    monkeypatch.setattr(filesystem_worker, "format_directory_entry", selective_format)
+
+    result = filesystem_worker._list_dir(
+        {"path": str(tmp_path), "displayPath": str(tmp_path)}
+    )
+
+    assert "[file] ok.txt (5 bytes)" in result["message"]
+    assert "[link] loop" in result["message"]
+
+
+def test_read_file_uses_verified_target_after_symlink_is_retargeted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allowed = tmp_path / "allowed.txt"
+    link = tmp_path / "link.txt"
+    allowed.write_text("allowed", encoding="utf-8")
+    link.write_text("secret", encoding="utf-8")
+
+    def verified_target(payload, candidate, **kwargs):
+        assert Path(candidate) == link
+        return allowed
+
+    monkeypatch.setattr(
+        filesystem_worker,
+        "_enforce_candidate_access",
+        verified_target,
+    )
+
+    result = filesystem_worker._read_file(
+        {"path": str(link), "displayPath": str(link)}
+    )
+
+    assert "allowed" in result["message"]
+    assert "secret" not in result["message"]
+
+
 def test_list_dir_keeps_siblings_when_regular_file_size_stat_raises(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
