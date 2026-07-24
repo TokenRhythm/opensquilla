@@ -408,6 +408,49 @@ def test_write_text_blocks_another_attachment_session(tmp_path: Path) -> None:
     assert not target.exists()
 
 
+def test_write_text_rejects_redirected_current_attachment_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    attachment_root = workspace / ".opensquilla" / "attachments"
+    current = attachment_root / "session-current"
+    other = attachment_root / "session-other"
+    current.mkdir(parents=True)
+    other.mkdir()
+    target = other / "blocked.txt"
+    original_resolve = Path.resolve
+
+    def redirected_session_root(path: Path, *args: object, **kwargs: object):
+        if path == current:
+            return other
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", redirected_session_root)
+    payload = {
+        "kind": "write_text",
+        "path": str(target),
+        "content": "must not be written",
+        "permissions": {
+            "filesystem": {
+                "profile": {
+                    "entries": [{"path": str(workspace), "access": "write"}],
+                    "deniedReadGlobs": [],
+                    "defaultAccess": "read",
+                },
+                "workspaceStrict": True,
+                "attachmentBase": str(attachment_root),
+                "attachmentSessionRoot": str(current),
+            }
+        },
+    }
+
+    with pytest.raises(PermissionError, match="must not be a redirected path"):
+        filesystem_worker._write_text(payload)
+
+    assert not target.exists()
+
+
 def test_apply_patch_accepts_explicit_target_outside_patch_root(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -441,7 +484,7 @@ def test_apply_patch_rejects_target_missing_from_explicit_paths(tmp_path: Path) 
     authorized.parent.mkdir()
     unauthorized.write_text("before\n", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="outside patch root"):
+    with pytest.raises(ValueError, match="authorization changed after validation"):
         filesystem_worker._run(
             {
                 "kind": "apply_patch",
@@ -457,3 +500,29 @@ def test_apply_patch_rejects_target_missing_from_explicit_paths(tmp_path: Path) 
         )
 
     assert unauthorized.read_text(encoding="utf-8") == "before\n"
+
+
+def test_apply_patch_rejects_changed_target_inside_patch_root(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    authorized = workspace / "authorized.txt"
+    changed = workspace / "changed.txt"
+    authorized.write_text("before\n", encoding="utf-8")
+    changed.write_text("before\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="authorization changed after validation"):
+        filesystem_worker._run(
+            {
+                "kind": "apply_patch",
+                "root": str(workspace),
+                "paths": [str(authorized)],
+                "patch": """*** Begin Patch
+*** Update File: changed.txt
+@@ -1,1 +1,1 @@
+-before
++after
+*** End Patch""",
+            }
+        )
+
+    assert changed.read_text(encoding="utf-8") == "before\n"

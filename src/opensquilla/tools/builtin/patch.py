@@ -308,6 +308,10 @@ def _validate_path(
     resolved = _resolve_path(path, root)
     if allow_outside_root is None:
         allow_outside_root = full_host_access_active()
+    if authorized_paths and resolved not in authorized_paths:
+        raise ValueError(
+            f"Path authorization changed after validation: {path!r} resolves to {resolved}"
+        )
     if not resolved.is_relative_to(root) and not allow_outside_root:
         if resolved in authorized_paths:
             return resolved

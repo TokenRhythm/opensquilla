@@ -165,6 +165,31 @@ def _is_relative_to(candidate: Path, root: Path) -> bool:
         return False
 
 
+def _session_boundary_root(
+    base_raw: str,
+    session_raw: str,
+    *,
+    label: str,
+) -> tuple[Path, Path]:
+    """Return stable base/session roots, rejecting a redirected session root."""
+
+    try:
+        lexical_base = Path(base_raw).expanduser().absolute()
+        resolved_base = lexical_base.resolve(strict=False)
+        lexical_session = Path(session_raw).expanduser().absolute()
+        resolved_session = lexical_session.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise PermissionError(f"{label} session boundary cannot be resolved safely") from exc
+    try:
+        relative_session = lexical_session.relative_to(lexical_base)
+    except ValueError as exc:
+        raise PermissionError(f"{label} session root is outside its boundary") from exc
+    expected_session = resolved_base / relative_session
+    if str(expected_session).casefold() != str(resolved_session).casefold():
+        raise PermissionError(f"{label} session root must not be a redirected path")
+    return resolved_base, resolved_session
+
+
 def _enforce_candidate_access(
     payload: dict[str, Any],
     candidate: Path,
@@ -212,13 +237,18 @@ def _enforce_candidate_access(
         if _is_relative_to(resolved, attachment_base):
             if resolved == attachment_base:
                 return resolved
-            if not (
-                isinstance(attachment_session_raw, str)
-                and attachment_session_raw
-                and _is_relative_to(
-                    resolved,
-                    Path(attachment_session_raw).resolve(strict=False),
+            if not isinstance(attachment_session_raw, str) or not attachment_session_raw:
+                raise PermissionError(
+                    f"filesystem worker blocks another session's attachments: {resolved}"
                 )
+            attachment_base, attachment_session = _session_boundary_root(
+                attachment_base_raw,
+                attachment_session_raw,
+                label="attachment",
+            )
+            if not _is_relative_to(resolved, attachment_base) or not _is_relative_to(
+                resolved,
+                attachment_session,
             ):
                 raise PermissionError(
                     f"filesystem worker blocks another session's attachments: {resolved}"
@@ -231,13 +261,18 @@ def _enforce_candidate_access(
         if _is_relative_to(resolved, transcript_base):
             if traversal and resolved == transcript_base:
                 return resolved
-            if not (
-                isinstance(transcript_session_raw, str)
-                and transcript_session_raw
-                and _is_relative_to(
-                    resolved,
-                    Path(transcript_session_raw).resolve(strict=False),
+            if not isinstance(transcript_session_raw, str) or not transcript_session_raw:
+                raise PermissionError(
+                    f"filesystem worker blocks another session's transcript: {resolved}"
                 )
+            transcript_base, transcript_session = _session_boundary_root(
+                transcript_base_raw,
+                transcript_session_raw,
+                label="transcript",
+            )
+            if not _is_relative_to(resolved, transcript_base) or not _is_relative_to(
+                resolved,
+                transcript_session,
             ):
                 raise PermissionError(
                     f"filesystem worker blocks another session's transcript: {resolved}"
