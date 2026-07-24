@@ -85,7 +85,7 @@ def test_list_dir_keeps_siblings_when_symlink_target_loops(
     loop.write_text("placeholder", encoding="utf-8")
     original_resolve = Path.resolve
     original_lstat = Path.lstat
-    original_format = filesystem_worker.format_directory_entry
+    original_stat = Path.stat
 
     def selective_resolve(path: Path, *args: object, **kwargs: object):
         if path == loop:
@@ -100,21 +100,21 @@ def test_list_dir_keeps_siblings_when_symlink_target_loops(
             return os.stat_result(values)
         return original_lstat(path)
 
-    def selective_format(path: Path):
-        if path == loop:
-            return False, "[link] loop (broken symlink)"
-        return original_format(path)
+    def selective_stat(path: Path, *args: object, **kwargs: object):
+        if path == loop and kwargs.get("follow_symlinks", True):
+            raise AssertionError("unresolvable link target must not be followed")
+        return original_stat(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "resolve", selective_resolve)
     monkeypatch.setattr(Path, "lstat", selective_lstat)
-    monkeypatch.setattr(filesystem_worker, "format_directory_entry", selective_format)
+    monkeypatch.setattr(Path, "stat", selective_stat)
 
     result = filesystem_worker._list_dir(
         {"path": str(tmp_path), "displayPath": str(tmp_path)}
     )
 
     assert "[file] ok.txt (5 bytes)" in result["message"]
-    assert "[link] loop" in result["message"]
+    assert "[link] loop (target metadata unavailable)" in result["message"]
 
 
 def test_read_file_uses_verified_target_after_symlink_is_retargeted(
@@ -142,6 +142,36 @@ def test_read_file_uses_verified_target_after_symlink_is_retargeted(
 
     assert "allowed" in result["message"]
     assert "secret" not in result["message"]
+
+
+def test_glob_keeps_logical_link_name_when_verified_target_is_outside_base(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = tmp_path / "base"
+    base.mkdir()
+    logical = base / "link.txt"
+    logical.write_text("placeholder", encoding="utf-8")
+    verified = tmp_path / "outside.txt"
+    verified.write_text("allowed", encoding="utf-8")
+    original_enforce = filesystem_worker._enforce_candidate_access
+
+    def verified_target(payload, candidate, **kwargs):
+        if Path(candidate) == logical:
+            return verified
+        return original_enforce(payload, candidate, **kwargs)
+
+    monkeypatch.setattr(
+        filesystem_worker,
+        "_enforce_candidate_access",
+        verified_target,
+    )
+
+    result = filesystem_worker._glob_search(
+        {"path": str(base), "pattern": "link.txt"}
+    )
+
+    assert result["message"] == str(logical)
 
 
 def test_list_dir_keeps_siblings_when_regular_file_size_stat_raises(
@@ -344,6 +374,38 @@ def test_grep_search_only_enters_current_transcript_session(tmp_path: Path) -> N
     assert str(current_file) in result["message"]
     assert str(other_file) not in result["message"]
     assert "needle other" not in result["message"]
+
+
+def test_write_text_blocks_another_attachment_session(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    attachment_root = workspace / ".opensquilla" / "attachments"
+    current = attachment_root / "session-current"
+    other = attachment_root / "session-other"
+    current.mkdir(parents=True)
+    other.mkdir()
+    target = other / "blocked.txt"
+    payload = {
+        "kind": "write_text",
+        "path": str(target),
+        "content": "must not be written",
+        "permissions": {
+            "filesystem": {
+                "profile": {
+                    "entries": [{"path": str(workspace), "access": "write"}],
+                    "deniedReadGlobs": [],
+                    "defaultAccess": "read",
+                },
+                "workspaceStrict": True,
+                "attachmentBase": str(attachment_root),
+                "attachmentSessionRoot": str(current),
+            }
+        },
+    }
+
+    with pytest.raises(PermissionError, match="another session's attachments"):
+        filesystem_worker._write_text(payload)
+
+    assert not target.exists()
 
 
 def test_apply_patch_accepts_explicit_target_outside_patch_root(tmp_path: Path) -> None:

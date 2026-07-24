@@ -173,6 +173,12 @@ def _enforce_candidate_access(
     traversal: bool = False,
     metadata_only: bool = False,
 ) -> Path:
+    """Resolve and preflight one path inside an already-confined worker.
+
+    The platform backend remains the security boundary (Windows restricted
+    token plus ACLs, bwrap, or Seatbelt).  This check mirrors that policy for
+    useful errors and prunes workspace-strict session data before access.
+    """
     try:
         resolved = candidate.expanduser().resolve(strict=False)
         profile_candidate: PurePath = resolved
@@ -195,9 +201,6 @@ def _enforce_candidate_access(
             write and access is not FileSystemAccess.WRITE
         ):
             raise PermissionError(f"filesystem profile denies access to {resolved}")
-    if write:
-        return resolved
-
     boundary = _filesystem_boundary(payload)
     if not boundary.get("workspaceStrict"):
         return resolved
@@ -242,18 +245,21 @@ def _enforce_candidate_access(
     return resolved
 
 
-def _safe_descendants(payload: dict[str, Any], base: Path):
-    base = _enforce_candidate_access(payload, base, traversal=True)
-    pending = [base]
+def _safe_descendants(
+    payload: dict[str, Any],
+    logical_base: Path,
+    verified_base: Path,
+):
+    pending = [(logical_base, verified_base)]
     visited: set[str] = set()
     while pending:
-        directory = pending.pop()
-        canonical = str(directory).casefold()
+        logical_directory, verified_directory = pending.pop()
+        canonical = str(verified_directory).casefold()
         if canonical in visited:
             continue
         visited.add(canonical)
         try:
-            children = sorted(directory.iterdir(), key=lambda item: str(item))
+            children = sorted(verified_directory.iterdir(), key=lambda item: str(item))
         except (PermissionError, OSError):
             continue
         for child in children:
@@ -261,10 +267,11 @@ def _safe_descendants(payload: dict[str, Any], base: Path):
                 checked = _enforce_candidate_access(payload, child, traversal=True)
             except PermissionError:
                 continue
-            yield checked
+            logical_child = logical_directory / child.name
+            yield logical_child, checked
             try:
                 if checked.is_dir():
-                    pending.append(checked)
+                    pending.append((logical_child, checked))
             except (PermissionError, OSError):
                 continue
 
@@ -334,36 +341,51 @@ def _list_dir(payload: dict[str, Any]) -> dict[str, object]:
     dirs: list[str] = []
     files: list[str] = []
     for entry in sorted(path.iterdir(), key=lambda item: item.name):
+        follow_target = True
         try:
-            _enforce_candidate_access(payload, entry, metadata_only=True)
+            _enforce_candidate_access(payload, entry)
         except PermissionError:
-            continue
-        is_directory, line = format_directory_entry(entry)
+            try:
+                _enforce_candidate_access(payload, entry, metadata_only=True)
+            except PermissionError:
+                continue
+            follow_target = False
+        is_directory, line = format_directory_entry(
+            entry,
+            follow_target=follow_target,
+        )
         (dirs if is_directory else files).append(line)
     entries = dirs + files
     return {"message": "\n".join(entries) if entries else f"{display_path}: (empty directory)"}
 
 
 def _glob_search(payload: dict[str, Any]) -> dict[str, object]:
-    base = _required_path(payload, "path")
-    base = _enforce_candidate_access(payload, base, traversal=True)
+    logical_base = _required_path(payload, "path")
+    base = _enforce_candidate_access(payload, logical_base, traversal=True)
     pattern = _required_string(payload, "pattern")
     if not base.exists():
         raise FileNotFoundError(f"Path not found: {base}")
     recursive = "**" in pattern or "/" in pattern or "\\" in pattern
     candidates = (
-        _safe_descendants(payload, base)
+        (
+            logical
+            for logical, _verified in _safe_descendants(
+                payload,
+                logical_base,
+                base,
+            )
+        )
         if recursive
         else (
-            checked
+            logical_base / candidate.name
             for candidate in sorted(base.iterdir(), key=lambda item: str(item))
-            if (checked := _readable_candidate(payload, candidate)) is not None
+            if _readable_candidate(payload, candidate) is not None
         )
     )
     matches = [
         str(candidate)
         for candidate in candidates
-        if _relative_glob_match(base, candidate, pattern)
+        if _relative_glob_match(logical_base, candidate, pattern)
     ]
     return {
         "message": "\n".join(matches)
@@ -403,7 +425,7 @@ def _grep_search(payload: dict[str, Any]) -> dict[str, object]:
     if base.is_file():
         search_file(base)
     else:
-        for path in _safe_descendants(payload, base):
+        for _logical_path, path in _safe_descendants(payload, base, base):
             if len(results) >= max_results:
                 break
             if path.is_file():
