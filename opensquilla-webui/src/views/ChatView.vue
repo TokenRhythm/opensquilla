@@ -411,6 +411,7 @@
       :voice-busy="voiceBusy"
       :voice-recording="voiceRecording"
       :voice-ready="voiceReady"
+      :project-workspace="pendingWorkspace"
       @composition-change="composing = $event"
       @beforeinput="onTextareaBeforeInput"
       @file-change="onFileInputChange"
@@ -428,6 +429,15 @@
       @export-markdown="exportMarkdown"
       @send="onSend"
       @stop="onStop"
+      @choose-project="projectPickerOpen = true"
+      @close-project="closeProjectDraft"
+    />
+    <ProjectWorkspacePickerDialog
+      :open="projectPickerOpen"
+      :session-key="sessionKey"
+      :initial-path="pendingWorkspace?.path"
+      @close="projectPickerOpen = false"
+      @choose="chooseProjectPath"
     />
     </div>
 
@@ -483,6 +493,7 @@ import ChatArtifactList from '@/components/chat/ChatArtifactList.vue'
 import ChatHeaderActions from '@/components/chat/ChatHeaderActions.vue'
 import DeliverablesDrawer from '@/components/chat/DeliverablesDrawer.vue'
 import ChatComposer from '@/components/chat/ChatComposer.vue'
+import ProjectWorkspacePickerDialog from '@/components/ProjectWorkspacePickerDialog.vue'
 import ChatMessageList from '@/components/chat/ChatMessageList.vue'
 import ChatStallNotice from '@/components/chat/ChatStallNotice.vue'
 import ClarifyCard from '@/components/chat/ClarifyCard.vue'
@@ -544,6 +555,8 @@ import { useVoiceInput } from '@/composables/chat/useVoiceInput'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { hasOpenDialogLayer } from '@/composables/useDialogA11y'
 import { useToasts } from '@/composables/useToasts'
+import { useConfirm } from '@/composables/useConfirm'
+import { useProjectWorkspaces } from '@/composables/useProjectWorkspaces'
 import type {
   ChatMessage,
   ChatRenderedMessage,
@@ -625,6 +638,9 @@ const appStore = useAppStore()
 const router = useRouter()
 const { t } = useI18n()
 const { pushToast } = useToasts()
+const { confirm } = useConfirm()
+const projectWorkspaces = useProjectWorkspaces()
+const projectPickerOpen = ref(false)
 const isCompactViewport = useMediaQuery('(max-width: 480px)')
 const isDesktopViewport = useMediaQuery('(min-width: 769px)')
 const landingAgentId = computed(() => agentIdFromSessionKey(sessionKey.value))
@@ -727,6 +743,11 @@ let bindActiveStreamTask = (taskId: string) => { activeStreamTaskId.value = task
 // Pending session intent
 const pendingSessionIntent = ref<string | null>(null)
 const pendingForkBeforeMessageId = ref<string | null>(null)
+const pendingWorkspaceId = ref<string | null>(null)
+const pendingWorkspace = computed(() => {
+  const workspaceId = pendingWorkspaceId.value
+  return workspaceId ? projectWorkspaces.byId.value.get(workspaceId) || null : null
+})
 let applySessionRunState: (source: ChatRunStatusSource | null | undefined) => void = () => {}
 let resetComposerInputHistory: () => void = () => {}
 
@@ -943,6 +964,7 @@ const {
   hasLegacyNewChatQuery,
   isDraftRoute,
   persistSession,
+  readProjectFromUrl,
   resolveInitialSession,
 } = chatSessionRoute
 
@@ -1177,9 +1199,14 @@ const chatSessionRuntime = useChatSessionRuntime({
 const {
   resetCurrentSessionAfterSlash,
   startDraftSession,
-  switchToSession,
+  switchToSession: switchRuntimeToSession,
   adoptResponseSession,
 } = chatSessionRuntime
+
+function switchToSession(nextSessionKey: string) {
+  pendingWorkspaceId.value = null
+  return switchRuntimeToSession(nextSessionKey)
+}
 
 const chatSlashCommands = useChatSlashCommands({
   rpc,
@@ -1242,6 +1269,7 @@ const chatSend = useChatSend({
   runMode,
   pendingAttachments,
   pendingSessionIntent,
+  pendingWorkspaceId,
   pendingForkBeforeMessageId,
   aborted,
   activeStreamTaskId,
@@ -2123,6 +2151,52 @@ function consumeDraftPrefill() {
   } catch { /* ignore */ }
 }
 
+async function chooseProjectPath(path: string) {
+  projectPickerOpen.value = false
+  const trusted = await confirm({
+    title: t('workspaces.trustTitle'),
+    body: t('workspaces.trustBody', { path }),
+    primaryLabel: t('workspaces.trustConfirm'),
+    primaryClass: 'btn--primary',
+  })
+  if (!trusted) return
+  try {
+    const workspace = await projectWorkspaces.openWorkspace(path)
+    if (!workspace) return
+    pendingWorkspaceId.value = workspace.id
+    pendingSessionIntent.value = 'new_chat'
+    goToDraft({
+      agentId: draftAgentId(),
+      projectId: workspace.id,
+      replace: true,
+    })
+  } catch (cause) {
+    const detail = cause instanceof Error ? cause.message : String(cause)
+    pushToast(t('workspaces.openFailed', { error: detail }), { tone: 'warn' })
+  }
+}
+
+function closeProjectDraft() {
+  pendingWorkspaceId.value = null
+  goToDraft({
+    agentId: draftAgentId(),
+    projectId: null,
+    replace: true,
+  })
+}
+
+async function syncDraftProjectFromRoute() {
+  const workspaceId = readProjectFromUrl()
+  pendingWorkspaceId.value = workspaceId || null
+  if (!workspaceId || projectWorkspaces.byId.value.has(workspaceId)) return
+  try {
+    await projectWorkspaces.loadWorkspaces()
+  } catch (cause) {
+    const detail = cause instanceof Error ? cause.message : String(cause)
+    pushToast(t('workspaces.loadFailed', { error: detail }), { tone: 'warn' })
+  }
+}
+
 // Reset to a clean draft for the agent requested by the draft route. The
 // provisional key stays out of the URL and storage until the first send.
 function enterDraft() {
@@ -2144,6 +2218,7 @@ onMounted(async () => {
   sessionKey.value = initialSession.sessionKey
   if (initialSession.draft) {
     pendingSessionIntent.value = 'new_chat'
+    await syncDraftProjectFromRoute()
     if (!isDraftRoute() || hasLegacyNewChatQuery()) goToDraft({ replace: true })
     consumeDraftPrefill()
   } else {
@@ -2230,8 +2305,10 @@ watch(() => route.query.session, (newSession) => {
 })
 
 // Entering the draft route resets to a clean draft for the requested agent.
-watch(() => [route.path, route.query.agent], () => {
-  if (isDraftRoute()) enterDraft()
+watch(() => [route.path, route.query.agent, route.query.project], async () => {
+  if (!isDraftRoute()) return
+  await syncDraftProjectFromRoute()
+  enterDraft()
 })
 
 // Legacy ?newChat=1 / ?new=1 links land on the draft route, then the params disappear.

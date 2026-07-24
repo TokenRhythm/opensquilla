@@ -80,6 +80,40 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
 }
 
 describe('useChatSend attachment payloads', () => {
+  it('binds a new project task to its workspace and preserves that binding on retry', async () => {
+    const pendingSessionIntent = ref<string | null>('new_chat')
+    const pendingWorkspaceId = ref<string | null>('project-a')
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(Object.assign(new Error('database busy'), { accepted: false }))
+        .mockResolvedValueOnce({ sessionKey: 'agent:main:webchat:test' }),
+    }
+    const { api } = makeOptions({
+      rpc,
+      pendingSessionIntent,
+      pendingWorkspaceId,
+    })
+
+    await api.onSend()
+
+    const firstParams = rpc.call.mock.calls[0]?.[1]
+    expect(firstParams).toEqual(expect.objectContaining({
+      intent: 'new_chat',
+      workspaceId: 'project-a',
+    }))
+    expect(pendingSessionIntent.value).toBe('new_chat')
+    expect(pendingWorkspaceId.value).toBe('project-a')
+
+    await api.onSend()
+
+    expect(rpc.call.mock.calls[1]?.[1]).toEqual(expect.objectContaining({
+      clientRequestId: firstParams.clientRequestId,
+      intent: 'new_chat',
+      workspaceId: 'project-a',
+    }))
+    expect(pendingWorkspaceId.value).toBeNull()
+  })
+
   it('sends the selected sandbox run mode as trusted source metadata', async () => {
     const { api, rpc } = makeOptions({
       runMode: ref('standard'),

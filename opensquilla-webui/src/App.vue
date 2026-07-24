@@ -60,6 +60,15 @@
              disabled (Settings → Keyboard), so it never advertises a dead key. -->
         <kbd v-if="newChatHint" class="sidebar-kbd" aria-hidden="true">{{ newChatHint }}</kbd>
       </button>
+      <button
+        type="button"
+        class="sidebar-cmd-btn"
+        :title="t('workspaces.chooseProject')"
+        :aria-label="t('workspaces.chooseProject')"
+        @click="openProjectPicker"
+      >
+        <Icon name="sessions" :size="16" />
+      </button>
       <!-- Canonical search / go-to. Replaces the rail Search row that truncated;
            the visible chord keeps the shortcut discoverable for mouse users. -->
       <button
@@ -112,11 +121,16 @@
       :current-key="currentSessionKey"
       :contract-debug-enabled="contractDebugEnabled"
       @select="switchToSession"
-      @refresh="loadSessions"
+      @refresh="loadSidebarData"
       @rename="onRenameSession"
       @delete="onDeleteSession"
       @bulk-delete="onBulkDeleteSessions"
       @new-chat="startNewChatInstant"
+      @new-project-task="startProjectTask"
+      @project-pin="onProjectPin"
+      @project-edit="openProjectEditor"
+      @project-delete-history="onProjectDeleteHistory"
+      @project-remove="onProjectRemove"
     />
 
     <!-- Fixed footer: settings + connection state -->
@@ -362,6 +376,21 @@
 
   <ConfirmModal />
 
+  <ProjectWorkspacePickerDialog
+    :open="projectPickerOpen"
+    :session-key="currentSessionKey || 'agent:main:webchat:workspace-picker'"
+    @close="projectPickerOpen = false"
+    @choose="onProjectPathChosen"
+  />
+
+  <ProjectWorkspaceEditDialog
+    :open="Boolean(editingProject)"
+    :initial-name="editingProject?.name || ''"
+    :path="editingProject?.path || ''"
+    @close="editingProjectId = ''"
+    @save="onProjectRename"
+  />
+
   <UpdateBanner />
 
   <!-- Single app-wide announcer for the pending-approval count. The nav badge
@@ -389,6 +418,8 @@ import Icon from './components/Icon.vue'
 import ErrorBoundary from './components/ErrorBoundary.vue'
 import ToastHost from './components/ToastHost.vue'
 import ConfirmModal from './components/ConfirmModal.vue'
+import ProjectWorkspaceEditDialog from './components/ProjectWorkspaceEditDialog.vue'
+import ProjectWorkspacePickerDialog from './components/ProjectWorkspacePickerDialog.vue'
 import UpdateBanner from './components/UpdateBanner.vue'
 import DesktopUpdateIndicator from './components/DesktopUpdateIndicator.vue'
 import SidebarConversations from './components/SidebarConversations.vue'
@@ -403,6 +434,8 @@ import { useDocumentEvent } from './composables/useDocumentEvent'
 import { useAgentOptions } from './composables/useAgentOptions'
 import { useSessionListSubscription } from './composables/useSessionListSubscription'
 import { useToasts } from './composables/useToasts'
+import { useConfirm } from './composables/useConfirm'
+import { useProjectWorkspaces } from './composables/useProjectWorkspaces'
 import { useNavigation } from './app/useNavigation'
 import { useSurfaceSkin } from './themes/useSurfaceSkin'
 import { themePickerOptions, getManifest } from './themes/registry'
@@ -473,6 +506,15 @@ const { bottomRoutes, workNav } = useNavigation()
 // Axis-B: the active expressive skin for the routed content area (meta.skin).
 const { skinId, variants } = useSurfaceSkin()
 const { pushToast } = useToasts()
+const { confirm } = useConfirm()
+const projectWorkspaces = useProjectWorkspaces()
+const projectPickerOpen = ref(false)
+const editingProjectId = ref('')
+const editingProject = computed(() =>
+  editingProjectId.value
+    ? projectWorkspaces.byId.value.get(editingProjectId.value) || null
+    : null,
+)
 // Feature-gated topbar music control; the singleton `enabled` ref is written by
 // Settings → Appearance and the command palette.
 const { enabled: bgmEnabled } = useBgm()
@@ -679,10 +721,13 @@ const sidebarSessionItems = computed((): SessionItem[] => {
 // lookup stay in App.vue; subagents indent under their parent via the helper.
 const sidebarSections = computed((): SidebarSection[] => {
   const byKey = new Map(sidebarSessionItems.value.map(item => [item.key, item]))
-  return arrangeSidebarSections(sidebarSessionItems.value).map(section => ({
+  return arrangeSidebarSections(
+    sidebarSessionItems.value,
+    projectWorkspaces.workspaces.value,
+  ).map(section => ({
     ...section,
     rows: section.rows.map((row): SidebarSectionRow => {
-      if (row.rowKind === 'workspace') return { ...row, agentName: '' }
+      if (row.rowKind !== 'session') return { ...row, agentName: '' }
       const source = byKey.get(row.key)
       const title = renameOverrides.value[row.key]
         || (source ? sidebarConversationTitle(source) : row.title)
@@ -817,6 +862,91 @@ function openDefaultDraft() {
 function startNewChatInstant() {
   handleNavClick()
   void openDefaultDraft()
+}
+
+function openProjectPicker() {
+  handleNavClick()
+  projectPickerOpen.value = true
+}
+
+function startProjectTask(workspaceId: string) {
+  if (!workspaceId) return
+  handleNavClick()
+  void router.push({
+    path: '/chat/new',
+    query: { agent: 'main', project: workspaceId },
+  })
+}
+
+async function onProjectPathChosen(path: string) {
+  projectPickerOpen.value = false
+  const trusted = await confirm({
+    title: t('workspaces.trustTitle'),
+    body: t('workspaces.trustBody', { path }),
+    primaryLabel: t('workspaces.trustConfirm'),
+    primaryClass: 'btn--primary',
+  })
+  if (!trusted) return
+  try {
+    const workspace = await projectWorkspaces.openWorkspace(path)
+    if (workspace) startProjectTask(workspace.id)
+  } catch (err) {
+    pushToast(t('workspaces.openFailed', { error: errorMessage(err) }), { tone: 'danger' })
+  }
+}
+
+async function onProjectPin(payload: { workspaceId: string; pinned: boolean }) {
+  try {
+    await projectWorkspaces.setPinned(payload.workspaceId, payload.pinned)
+  } catch (err) {
+    pushToast(t('workspaces.updateFailed', { error: errorMessage(err) }), { tone: 'danger' })
+  }
+}
+
+function openProjectEditor(workspaceId: string) {
+  editingProjectId.value = workspaceId
+}
+
+async function onProjectRename(name: string) {
+  const workspaceId = editingProjectId.value
+  if (!workspaceId) return
+  try {
+    await projectWorkspaces.renameWorkspace(workspaceId, name)
+    editingProjectId.value = ''
+  } catch (err) {
+    pushToast(t('workspaces.updateFailed', { error: errorMessage(err) }), { tone: 'danger' })
+  }
+}
+
+async function onProjectDeleteHistory(workspaceId: string) {
+  const activeProjectId = allSessions.value.find(
+    session => session.key === currentSessionKey.value,
+  )?.workspaceId
+  try {
+    await projectWorkspaces.deleteWorkspaceHistory(workspaceId)
+    await loadSessions()
+    if (activeProjectId === workspaceId) void openDefaultDraft()
+    pushToast(t('workspaces.historyDeleted'), { tone: 'ok' })
+  } catch (err) {
+    pushToast(t('workspaces.deleteHistoryFailed', { error: errorMessage(err) }), { tone: 'danger' })
+  }
+}
+
+async function onProjectRemove(workspaceId: string) {
+  const project = projectWorkspaces.byId.value.get(workspaceId)
+  if (!project) return
+  const approved = await confirm({
+    title: t('workspaces.removeTitle'),
+    body: t('workspaces.removeBody', { name: project.name }),
+    primaryLabel: t('workspaces.removeConfirm'),
+  })
+  if (!approved) return
+  try {
+    await projectWorkspaces.removeWorkspace(workspaceId)
+    if (editingProjectId.value === workspaceId) editingProjectId.value = ''
+  } catch (err) {
+    pushToast(t('workspaces.removeFailed', { error: errorMessage(err) }), { tone: 'danger' })
+  }
 }
 
 // Command palette: ⌘K / Ctrl+K and the rail "Search / Go to…" row both open it.
@@ -990,14 +1120,21 @@ function scheduleSessionRefresh() {
   if (sessionRefreshTimer) clearTimeout(sessionRefreshTimer)
   sessionRefreshTimer = setTimeout(() => {
     sessionRefreshTimer = null
-    loadSessions()
+    void loadSidebarData()
   }, 150)
+}
+
+async function loadSidebarData() {
+  await Promise.allSettled([
+    loadSessions(),
+    projectWorkspaces.loadWorkspaces(),
+  ])
 }
 
 const sessionListSubscription = useSessionListSubscription({
   rpc: rpcStore,
   isConnected: () => rpcStore.isConnected,
-  refresh: loadSessions,
+  refresh: loadSidebarData,
   scheduleRefresh: scheduleSessionRefresh,
   warn: (message, error) => console.warn(`[App] ${message}:`, errorMessage(error)),
 })
@@ -1210,7 +1347,7 @@ onMounted(() => {
   window.visualViewport?.addEventListener('resize', syncMobileKeyboard)
   window.addEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
   loadAgents()
-  loadSessions()
+  void loadSidebarData()
   sessionListSubscription.subscribe()
   // Keep the approval badge/count live app-wide, not just on the Approvals page.
   subscribeApprovals()

@@ -418,6 +418,9 @@ export interface SidebarSectionRow {
   workspaceId?: string
   workspaceLabel?: string
   workspaceDisplayPath?: string
+  workspaceTaskCount?: number
+  workspacePinned?: boolean
+  workspaceAvailable?: boolean
 }
 
 /** One collapsible family section with its recency-ordered rows. */
@@ -561,6 +564,9 @@ export function arrangeSidebarSections(
           workspace: entry.workspace,
           workspaceLabel: bucket.title,
           workspaceDisplayPath: bucket.displayPath || entry.workspace,
+          workspaceTaskCount: bucket.rows.filter(row => row.depth === 1).length,
+          workspacePinned: false,
+          workspaceAvailable: true,
         }
         return [header, ...bucket.rows]
       })
@@ -589,6 +595,9 @@ export function arrangeSidebarSections(
         workspaceId: project.id,
         workspaceLabel: project.name,
         workspaceDisplayPath: project.path,
+        workspaceTaskCount: project.taskCount,
+        workspacePinned: project.pinned,
+        workspaceAvailable: project.available,
       })
       if (projectEntries.length === 0) {
         rows.push({

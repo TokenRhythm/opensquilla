@@ -318,6 +318,7 @@ export interface ChatSendParams {
   clientMessageId?: string
   _source?: { elevated?: string; runMode?: 'standard' | 'trusted' | 'full' }
   intent?: string
+  workspaceId?: string
   forkBeforeMessageId?: string
   displayText?: string
   attachments?: ChatSendAttachmentPayload[]

@@ -1,6 +1,28 @@
 <template>
   <div ref="composerEl" class="chat-composer" :class="{ 'chat-composer--new-landing': isNewLanding }">
     <div class="chat-composer-inner">
+      <div v-if="projectWorkspace" class="chat-project-chip" :title="projectWorkspace.path">
+        <Icon name="info" :size="14" />
+        <span class="chat-project-chip__name">{{ projectWorkspace.name }}</span>
+        <span class="chat-project-chip__path">{{ projectWorkspace.path }}</span>
+        <button
+          type="button"
+          :aria-label="t('workspaces.closeProjectDraft')"
+          :title="t('workspaces.closeProjectDraft')"
+          @click="emit('closeProject')"
+        >
+          <Icon name="x" :size="12" />
+        </button>
+      </div>
+      <button
+        v-else-if="isNewLanding"
+        type="button"
+        class="chat-project-choose"
+        @click="emit('chooseProject')"
+      >
+        <Icon name="sessions" :size="14" />
+        <span>{{ t('workspaces.chooseProject') }}</span>
+      </button>
       <div v-if="attachments.length > 0" class="chat-attachments">
         <div
           v-for="(att, i) in attachments"
@@ -231,6 +253,7 @@ defineProps<{
   voiceBusy: boolean
   voiceRecording: boolean
   voiceReady: boolean
+  projectWorkspace?: { id: string; name: string; path: string } | null
 }>()
 
 const emit = defineEmits<{
@@ -251,6 +274,8 @@ const emit = defineEmits<{
   voiceSetup: []
   exportMarkdown: []
   stop: []
+  chooseProject: []
+  closeProject: []
 }>()
 
 const { t } = useI18n()
@@ -424,6 +449,40 @@ defineExpose<ChatComposerExpose>({
   width: min(100%, var(--composer-col, 820px));
   margin: 0 auto;
 }
+
+.chat-project-chip,
+.chat-project-choose {
+  width: fit-content;
+  max-width: 100%;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-2);
+  padding: 5px var(--sp-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+}
+.chat-project-chip__name,
+.chat-project-chip__path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-project-chip__name { flex-shrink: 0; font-weight: 650; }
+.chat-project-chip__path { color: var(--text-muted); font-family: var(--font-mono); }
+.chat-project-chip button {
+  display: inline-flex;
+  padding: 2px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+}
+.chat-project-choose { cursor: pointer; }
+.chat-project-choose:hover { color: var(--text); background: var(--bg-hover); }
 
 .chat-composer--new-landing .chat-composer-inner {
   width: 100%;

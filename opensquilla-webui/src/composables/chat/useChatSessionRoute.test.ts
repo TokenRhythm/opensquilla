@@ -46,4 +46,22 @@ describe('useChatSessionRoute', () => {
     expect(route.draftAgentId()).toBe('main')
     expect(route.resolveInitialSession().sessionKey).toMatch(/^agent:main:webchat:[a-z0-9]+$/)
   })
+
+  it('keeps only the project id in a project draft route and can return to a default draft', () => {
+    routeMock.query = { agent: 'main', project: 'project-a' }
+    const route = useChatSessionRoute(ref(''))
+
+    expect(route.readProjectFromUrl()).toBe('project-a')
+    route.goToDraft({ replace: true })
+    expect(routerMock.replace).toHaveBeenCalledWith({
+      path: '/chat/new',
+      query: { agent: 'main', project: 'project-a' },
+    })
+
+    route.goToDraft({ projectId: null, replace: true })
+    expect(routerMock.replace).toHaveBeenLastCalledWith({
+      path: '/chat/new',
+      query: { agent: 'main' },
+    })
+  })
 })

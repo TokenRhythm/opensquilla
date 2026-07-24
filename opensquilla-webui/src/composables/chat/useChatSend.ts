@@ -47,6 +47,7 @@ interface SendAttempt {
   attachments: SendableAttachment[]
   intent: string | null
   forkBeforeMessageId: string | null
+  workspaceId: string | null
   params: ChatSendParams
 }
 
@@ -175,6 +176,7 @@ function matchesRecoveredDraft(
     attachments: SendableAttachment[]
     intent: string | null
     forkBeforeMessageId: string | null
+    workspaceId: string | null
   },
 ): boolean {
   return (
@@ -182,6 +184,7 @@ function matchesRecoveredDraft(
     attempt.text === input.text &&
     attempt.intent === input.intent &&
     attempt.forkBeforeMessageId === input.forkBeforeMessageId &&
+    attempt.workspaceId === input.workspaceId &&
     sameSendableAttachments(input.attachments, attempt)
   )
 }
@@ -208,6 +211,7 @@ export interface UseChatSendOptions {
   pendingAttachments: Ref<Attachment[]>
   pendingSessionIntent: Ref<string | null>
   pendingForkBeforeMessageId: Ref<string | null>
+  pendingWorkspaceId?: Ref<string | null>
   aborted: Ref<boolean>
   // Task id rendered by the live stream; a fresh turn binds it from the
   // chat.send response so a prior task's late events can't leak in (issue #344).
@@ -527,6 +531,7 @@ export function useChatSend(options: UseChatSendOptions) {
         attachments: sendableAttachments,
         intent: options.pendingSessionIntent.value,
         forkBeforeMessageId: options.pendingForkBeforeMessageId.value,
+        workspaceId: options.pendingWorkspaceId?.value || null,
       })
     ) {
       await dispatchSend(text, {
@@ -595,6 +600,7 @@ export function useChatSend(options: UseChatSendOptions) {
         attachments: initialSendableAttachments,
         intent: options.pendingSessionIntent.value,
         forkBeforeMessageId: options.pendingForkBeforeMessageId.value,
+        workspaceId: options.pendingWorkspaceId?.value || null,
       }) &&
       retryCandidate.queueMode === sendOpts?.queueMode,
     )
@@ -629,6 +635,7 @@ export function useChatSend(options: UseChatSendOptions) {
     const userText = text
     const intent = options.pendingSessionIntent.value
     const forkBeforeMessageId = options.pendingForkBeforeMessageId.value
+    const workspaceId = options.pendingWorkspaceId?.value || null
     let attempt = retryAttempt
     if (!attempt) {
       const clientMessageId = createClientMessageId()
@@ -641,6 +648,7 @@ export function useChatSend(options: UseChatSendOptions) {
       if (sendOpts?.queueMode) params.queueMode = sendOpts.queueMode
       params._source = chatSourceMetadata(options)
       if (intent) params.intent = intent
+      if (intent === 'new_chat' && workspaceId) params.workspaceId = workspaceId
       if (forkBeforeMessageId) params.forkBeforeMessageId = forkBeforeMessageId
       if (attachmentsToSend.length > 0) {
         params.displayText = userText
@@ -656,6 +664,7 @@ export function useChatSend(options: UseChatSendOptions) {
         attachments: attachmentsToSend.map(attachment => ({ ...attachment })),
         intent,
         forkBeforeMessageId,
+        workspaceId,
         params,
       }
       const now = new Date().toISOString()
@@ -694,6 +703,12 @@ export function useChatSend(options: UseChatSendOptions) {
 
     try {
       const res = await options.rpc.call<ChatSendResponse>('chat.send', attempt.params)
+      if (
+        options.pendingWorkspaceId
+        && options.pendingWorkspaceId.value === attempt.workspaceId
+      ) {
+        options.pendingWorkspaceId.value = null
+      }
       const taskId = acceptedTaskId(res)
       const terminalStatus = terminalResponseStatus(res)
       if (responseHandoff) {
@@ -872,6 +887,9 @@ export function useChatSend(options: UseChatSendOptions) {
     if (!options.pendingSessionIntent.value) options.pendingSessionIntent.value = attempt.intent
     if (!options.pendingForkBeforeMessageId.value) {
       options.pendingForkBeforeMessageId.value = attempt.forkBeforeMessageId
+    }
+    if (options.pendingWorkspaceId && !options.pendingWorkspaceId.value) {
+      options.pendingWorkspaceId.value = attempt.workspaceId
     }
     recoveredAttempt = attempt
     options.autoResizeTextarea()
