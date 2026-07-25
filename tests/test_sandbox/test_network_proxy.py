@@ -10,6 +10,33 @@ import pytest
 from opensquilla.sandbox.network_guard import NetworkDecision
 from opensquilla.sandbox.network_proxy import SandboxProxyServer
 
+_UPSTREAM_PROXY_ENV_KEYS = (
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_ambient_upstream_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep an ambient proxy out of the direct-upstream assertions.
+
+    ``_open_upstream`` chains a CONNECT through ``HTTPS_PROXY`` and friends when
+    one is set, which is deliberate — the managed proxy has to work behind a
+    corporate proxy. Most tests here assert the direct path instead, so on any
+    machine that exports one of those variables (corporate networks, sandboxed
+    CI) the proxy tunnels to the ambient endpoint and the assertions fail
+    against it rather than against the resolved upstream. Clear them so the
+    default path under test is the one being asserted;
+    ``test_proxy_tunnels_connect_via_https_proxy_env`` sets the variable it
+    needs afterwards and is unaffected.
+    """
+    for key in _UPSTREAM_PROXY_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
 
 def _allow_decision(host: str) -> NetworkDecision:
     return NetworkDecision(
