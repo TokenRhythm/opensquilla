@@ -16,10 +16,10 @@
             <p id="confirm-modal-description">{{ confirmState.body }}</p>
           </div>
           <div class="modal__footer">
+            <button ref="cancelBtn" class="btn btn--ghost" @click="onCancel">{{ t('common.cancel') }}</button>
             <button :class="['btn', confirmState.primaryClass]" @click="onConfirm">
               {{ confirmState.primaryLabel }}
             </button>
-            <button ref="cancelBtn" class="btn btn--ghost" @click="onCancel">{{ t('common.cancel') }}</button>
           </div>
         </div>
       </div>
@@ -48,8 +48,10 @@ function onCancel() {
   resolveConfirm(false)
 }
 
-// Cancel is the initial focus target so a destructive primary is never
-// auto-focused; Escape and Tab-trapping come from the shared a11y helper.
+// Cancel sits first (leading edge) and is the initial focus target so a
+// destructive primary is never auto-focused; the confirming action stays on the
+// trailing edge, matching the app's other dialog footers. Escape and
+// Tab-trapping come from the shared a11y helper.
 useDialogA11y(modalRef, isOpen, onCancel, { initialFocus: cancelBtn })
 </script>
 

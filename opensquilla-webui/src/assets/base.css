@@ -418,32 +418,28 @@ pre {
   letter-spacing: var(--track-display);
 }
 
-.sidebar-actions {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-2);
-  padding: 4px 10px 6px;
-}
-
+/* Leads the nav index. Shares .sidebar-fn-item's row geometry so the sidebar
+   reads as one list; the weight and the plus glyph carry the emphasis instead
+   of a border, and the row keeps its own class for the New-task selectors. */
 .sidebar-new-session {
-  flex: 1;
   display: flex;
   align-items: center;
   gap: var(--sp-2);
+  min-width: 0;
   min-height: 36px;
-  padding: 8px 12px;
-  background: var(--sidebar-control-bg);
-  border: 1px solid var(--sidebar-border);
+  padding: var(--sp-2) var(--sp-3);
+  margin: 0 var(--sp-2);
+  background: transparent;
+  border: none;
   border-radius: var(--radius-md);
   color: var(--sidebar-text-strong);
   font-size: var(--fs-sm);
   font-weight: 600;
   cursor: pointer;
-  transition: background var(--dur-fast), border-color var(--dur-fast);
+  transition: background var(--dur-fast), color var(--dur-fast);
 }
 .sidebar-new-session:hover {
-  background: var(--sidebar-control-hover);
-  border-color: var(--sidebar-border);
+  background: var(--sidebar-item-hover);
 }
 
 .sidebar-section {
@@ -506,40 +502,27 @@ pre {
   white-space: nowrap;
 }
 
-/* Pending-approvals count on the conditional Approvals row */
-.sidebar-count-badge {
-  margin-left: auto;
-  min-width: 18px;
-  padding: 1px 6px;
-  border-radius: 999px;
-  background: var(--accent);
-  color: var(--accent-foreground);
-  font-size: var(--fs-xs);
-  font-weight: 700;
-  font-variant-numeric: tabular-nums;
-  text-align: center;
-}
-
-/* Brand-area command-palette affordance (replaces the rail Search row). A square
-   icon button beside the New-chat button, so the action row reads as one tidy
-   control cluster; the shortcut lives in the tooltip + aria-label rather than
-   a chip that would compete with the New-chat chord. */
+/* Command-palette affordance on the recents header, sized to match its
+   neighbours (selection mode, refresh). The shortcut lives in the tooltip +
+   aria-label — the header has no room for a chord chip. */
 .sidebar-cmd-btn {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 32px;
-  min-height: 36px;
+  width: 22px;
+  height: 22px;
+  padding: 0;
   flex-shrink: 0;
-  background: var(--sidebar-control-bg);
-  border: 1px solid var(--sidebar-border);
-  border-radius: var(--radius-md);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
   color: var(--sidebar-text-soft);
   cursor: pointer;
   transition: background var(--dur-fast), border-color var(--dur-fast), color var(--dur-fast);
 }
+
 .sidebar-cmd-btn:hover {
-  background: var(--sidebar-control-hover);
+  background: var(--sidebar-item-hover);
   color: var(--sidebar-text-strong);
 }
 .sidebar-cmd-btn:focus-visible {
@@ -1274,7 +1257,7 @@ pre {
 .sidebar--drawer .sidebar-dock-toggle,
 .sidebar--drawer .sidebar-core .sidebar-fn-item,
 .sidebar--drawer .sidebar-foot .sidebar-fn-item,
-.sidebar--drawer .sidebar-cmd-btn,
+.sidebar--drawer .sidebar-new-session,
 .sidebar--drawer .sidebar-history-item {
   min-height: 44px;
 }
@@ -1565,7 +1548,7 @@ pre {
 
   .sidebar-core .sidebar-fn-item,
   .sidebar-foot .sidebar-fn-item,
-  .sidebar-cmd-btn,
+  .sidebar-new-session,
   .sidebar-history-item {
     min-height: 44px;
   }
@@ -1691,11 +1674,6 @@ pre {
 
   .sidebar-brand {
     padding-bottom: 5px;
-  }
-
-  .sidebar-actions {
-    padding-top: 2px;
-    padding-bottom: 4px;
   }
 
   .sidebar-new-session {

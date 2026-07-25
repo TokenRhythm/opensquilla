@@ -644,10 +644,11 @@ async function openDataMaintenance() {
 // One discard prompt shared by every exit path: requestClose (Escape, the
 // close button, backdrop click) and the history-back leave guard below.
 function confirmDiscard(): Promise<boolean> {
+  // No primaryLabel override: the shared "Confirm" default keeps this footer
+  // reading Cancel / Confirm like every other dialog.
   return confirm({
     title: t('settings.dialog.discardTitle'),
     body: t('settings.dialog.discardBody'),
-    primaryLabel: t('settings.dialog.discardPrimary'),
   })
 }
 

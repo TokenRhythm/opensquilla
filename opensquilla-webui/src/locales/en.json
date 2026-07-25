@@ -97,7 +97,9 @@
     "settings": "Settings",
     "theme": "Theme",
     "language": "Language",
-    "newChat": "New chat",
+    "newTask": "New task",
+    "newTaskTitle": "Start a new task",
+    "searchChats": "Search chats",
     "more": "More",
     "moreDestinations": "More destinations",
     "expandSidebar": "Expand sidebar",
@@ -233,8 +235,7 @@
       "copyConfigPath": "Copy config path",
       "applyLiveNote": "Most changes apply live; some need a gateway restart",
       "discardTitle": "Discard unsaved changes?",
-      "discardBody": "You have unsaved edits. Closing now will lose them.",
-      "discardPrimary": "Discard"
+      "discardBody": "You have unsaved edits. Closing now will lose them."
     },
     "rail": {
       "connection": "Connection",

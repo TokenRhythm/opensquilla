@@ -97,7 +97,9 @@
     "settings": "Einstellungen",
     "theme": "Design",
     "language": "Sprache",
-    "newChat": "Neuer Chat",
+    "newTask": "Neue Aufgabe",
+    "newTaskTitle": "Neue Aufgabe starten",
+    "searchChats": "Unterhaltungen suchen",
     "more": "Mehr",
     "moreDestinations": "Weitere Ziele",
     "expandSidebar": "Seitenleiste erweitern",
@@ -233,8 +235,7 @@
       "copyConfigPath": "Konfigurationspfad kopieren",
       "applyLiveNote": "Die meisten Änderungen werden sofort übernommen; einige erfordern einen Neustart des Gateways",
       "discardTitle": "Ungespeicherte Änderungen verwerfen?",
-      "discardBody": "Es gibt ungespeicherte Änderungen. Beim Schließen gehen sie verloren.",
-      "discardPrimary": "Verwerfen"
+      "discardBody": "Es gibt ungespeicherte Änderungen. Beim Schließen gehen sie verloren."
     },
     "rail": {
       "connection": "Verbindung",

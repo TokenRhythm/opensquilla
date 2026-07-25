@@ -97,7 +97,9 @@
     "settings": "設定",
     "theme": "テーマ",
     "language": "言語",
-    "newChat": "新規チャット",
+    "newTask": "新規タスク",
+    "newTaskTitle": "新しいタスクを開始",
+    "searchChats": "会話を検索",
     "more": "その他",
     "moreDestinations": "その他の移動先",
     "expandSidebar": "サイドバーを展開",
@@ -233,8 +235,7 @@
       "copyConfigPath": "設定パスをコピー",
       "applyLiveNote": "ほとんどの変更は即時に反映されます。一部はゲートウェイの再起動が必要です",
       "discardTitle": "未保存の変更を破棄しますか？",
-      "discardBody": "未保存の編集があります。今閉じると失われます。",
-      "discardPrimary": "破棄"
+      "discardBody": "未保存の編集があります。今閉じると失われます。"
     },
     "rail": {
       "connection": "接続",

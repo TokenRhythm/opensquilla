@@ -20,9 +20,13 @@ test.describe('Chat Page', () => {
     // Chat stays the dedicated New-chat action. Long-lived Agent management and
     // the old Build disclosure are intentionally absent from the primary rail.
     await expect(core.getByText('Chat', { exact: true })).toHaveCount(0)
+    // Sessions is routed but off the nav; New task leads the index as an action
+    // row (its own class) rather than a destination.
+    await expect(core.locator('> .sidebar-new-session')).toHaveText(/New task/)
     await expect(core.locator('> .sidebar-fn-item .sidebar-fn-label')).toHaveText(
-      ['Sessions', 'Overview', 'Skills & Channels', 'Cron'],
+      ['Overview', 'Skills & Channels', 'Cron'],
     )
+    await expect(core.getByText('Sessions', { exact: true })).toHaveCount(0)
     await expect(core.getByText('Agents', { exact: true })).toHaveCount(0)
     await expect(core.locator('.sidebar-nav-group-toggle')).toHaveCount(0)
   })
@@ -32,7 +36,7 @@ test.describe('Chat Page', () => {
     const palette = page.getByRole('dialog', { name: 'Search and go to' })
     await expect(palette).toBeVisible()
 
-    for (const name of ['Sessions', 'Overview', 'Skills & Channels', 'Channels', 'Cron']) {
+    for (const name of ['Overview', 'Skills & Channels', 'Channels', 'Cron']) {
       await expect(palette.getByRole('option', { name, exact: true })).toBeVisible()
     }
     const labels = await palette.locator('.cmdp-option__label').allTextContents()
@@ -115,12 +119,9 @@ test.describe('Chat Page', () => {
     await core.getByText('Cron', { exact: true }).click()
     await expect(page).toHaveURL(/\/cron/)
 
-    await core.getByText('Sessions', { exact: true }).click()
-    await expect(page).toHaveURL(/\/sessions/)
-
-    // New chat is instant (no modal): the primary button drops straight to a
-    // draft. `exact` matches the New-chat button precisely.
-    await page.getByRole('button', { name: 'New chat', exact: true }).click()
+    // New task is instant (no modal): the primary row drops straight to a
+    // draft. `exact` matches the New-task button precisely.
+    await page.getByRole('button', { name: 'New task', exact: true }).click()
     await expect(page.getByRole('dialog', { name: 'New chat' })).toHaveCount(0)
     await expect(page).toHaveURL(/\/chat\/new\?agent=[a-z0-9_-]+$/i)
   })

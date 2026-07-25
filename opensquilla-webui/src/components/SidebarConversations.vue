@@ -52,6 +52,8 @@ const props = defineProps<{
   loading: boolean
   currentKey: string
   contractDebugEnabled: boolean
+  /** Command-palette chord, shown in the search button's tooltip. */
+  searchHint: string
 }>()
 
 const emit = defineEmits<{
@@ -61,6 +63,7 @@ const emit = defineEmits<{
   (e: 'delete', key: string): void
   (e: 'bulk-delete', keys: string[]): void
   (e: 'new-chat'): void
+  (e: 'search'): void
 }>()
 
 const { confirm } = useConfirm()
@@ -405,6 +408,20 @@ function onSelectRow(row: SidebarConversationItem) {
         v-if="!selectionMode && visibleSections.length === 1 && totalRows > 0"
         class="sidebar-recents-count"
       >{{ totalRows }}</span>
+      <!-- Conversation search lives on the recents header, beside the selection
+           and refresh controls, because the palette's hits are these rows.
+           Hidden while selecting: that mode owns the header's spare width. -->
+      <button
+        v-if="!selectionMode"
+        type="button"
+        class="sidebar-cmd-btn"
+        :aria-label="`${t('chrome.searchChats')} (${props.searchHint})`"
+        :title="`${t('chrome.searchChats')} (${props.searchHint})`"
+        aria-haspopup="dialog"
+        @click="emit('search')"
+      >
+        <Icon name="search" :size="13" />
+      </button>
       <button
         v-if="selectionMode"
         type="button"

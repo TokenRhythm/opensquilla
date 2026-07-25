@@ -57,7 +57,7 @@ test.describe('Mobile bottom tab bar', () => {
     await expect(page.locator('.sidebar.docked')).toBeVisible()
     await expect(page.locator('.sidebar-scrim')).toBeVisible()
     await expect(page.locator('.sidebar-core .sidebar-fn-label')).toHaveText([
-      'Sessions', 'Overview', 'Skills & Channels', 'Cron',
+      'Overview', 'Skills & Channels', 'Cron',
     ])
 
     // Skills & Channels and Cron live in this same flat drawer instead of a

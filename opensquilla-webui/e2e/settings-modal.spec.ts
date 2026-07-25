@@ -366,7 +366,7 @@ test.describe('Settings modal', () => {
     // Accepting the discard lets the same Back proceed and close the overlay.
     await page.goBack()
     await expect(confirm).toBeVisible()
-    await confirm.getByRole('button', { name: 'Discard' }).click()
+    await confirm.getByRole('button', { name: 'Confirm' }).click()
     await expect(dialog(page)).toBeHidden()
     await expect(page).not.toHaveURL(/\/settings/)
     await expect(settingsRow(page)).toBeFocused()

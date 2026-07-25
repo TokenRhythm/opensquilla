@@ -97,7 +97,9 @@
     "settings": "设置",
     "theme": "主题",
     "language": "语言",
-    "newChat": "新建对话",
+    "newTask": "新建任务",
+    "newTaskTitle": "开始一项新任务",
+    "searchChats": "搜索对话",
     "more": "更多",
     "moreDestinations": "更多去处",
     "expandSidebar": "展开侧边栏",
@@ -233,8 +235,7 @@
       "copyConfigPath": "复制配置路径",
       "applyLiveNote": "大多数更改即时生效；部分需要重启网关",
       "discardTitle": "放弃未保存的修改？",
-      "discardBody": "有尚未保存的编辑，现在关闭将丢失它们。",
-      "discardPrimary": "放弃"
+      "discardBody": "有尚未保存的编辑，现在关闭将丢失它们。"
     },
     "rail": {
       "connection": "连接",
@@ -3018,7 +3019,7 @@
       "dismiss": "关闭通知"
     },
     "confirm": {
-      "defaultPrimary": "确认"
+      "defaultPrimary": "确定"
     },
     "errorState": {
       "retry": "重试"

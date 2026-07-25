@@ -97,7 +97,9 @@
     "settings": "Ajustes",
     "theme": "Tema",
     "language": "Idioma",
-    "newChat": "Nuevo chat",
+    "newTask": "Nueva tarea",
+    "newTaskTitle": "Iniciar una tarea nueva",
+    "searchChats": "Buscar conversaciones",
     "more": "Más",
     "moreDestinations": "Más destinos",
     "expandSidebar": "Expandir barra lateral",
@@ -233,8 +235,7 @@
       "copyConfigPath": "Copiar ruta de configuración",
       "applyLiveNote": "La mayoría de los cambios se aplican en vivo; algunos requieren reiniciar la puerta de enlace",
       "discardTitle": "¿Descartar los cambios sin guardar?",
-      "discardBody": "Tienes ediciones sin guardar. Si cierras ahora se perderán.",
-      "discardPrimary": "Descartar"
+      "discardBody": "Tienes ediciones sin guardar. Si cierras ahora se perderán."
     },
     "rail": {
       "connection": "Conexión",

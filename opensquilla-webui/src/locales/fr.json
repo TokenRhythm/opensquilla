@@ -97,7 +97,9 @@
     "settings": "Paramètres",
     "theme": "Thème",
     "language": "Langue",
-    "newChat": "Nouveau chat",
+    "newTask": "Nouvelle tâche",
+    "newTaskTitle": "Démarrer une nouvelle tâche",
+    "searchChats": "Rechercher des conversations",
     "more": "Plus",
     "moreDestinations": "Plus de destinations",
     "expandSidebar": "Déplier la barre latérale",
@@ -233,8 +235,7 @@
       "copyConfigPath": "Copier le chemin de configuration",
       "applyLiveNote": "La plupart des changements s'appliquent à chaud ; certains nécessitent un redémarrage de la passerelle",
       "discardTitle": "Abandonner les modifications non enregistrées ?",
-      "discardBody": "Vous avez des modifications non enregistrées. Fermer maintenant les perdra.",
-      "discardPrimary": "Abandonner"
+      "discardBody": "Vous avez des modifications non enregistrées. Fermer maintenant les perdra."
     },
     "rail": {
       "connection": "Connexion",
