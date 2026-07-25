@@ -434,7 +434,7 @@ pre {
   border-radius: var(--radius-md);
   color: var(--sidebar-text-strong);
   font-size: var(--fs-sm);
-  font-weight: 600;
+  font-weight: 500;
   cursor: pointer;
   transition: background var(--dur-fast), color var(--dur-fast);
 }
@@ -567,25 +567,23 @@ pre {
   box-shadow: inset 2px 0 0 var(--accent);
 }
 
-.sidebar-refresh-btn {
-  width: 20px;
-  height: 20px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+/* Retry inside the load-error state. A plain text button: the header carries no
+   standing refresh control, so this is the only place it appears. */
+.sidebar-history-retry {
+  margin-top: var(--sp-2);
+  padding: 0;
   background: transparent;
   border: none;
-  color: var(--sidebar-text-soft);
-  cursor: pointer;
-  border-radius: var(--radius-sm);
-  transition: color var(--dur-fast), background var(--dur-fast);
-}
-.sidebar-refresh-btn:hover {
   color: var(--sidebar-text-strong);
-  background: var(--sidebar-item-hover);
+  font-family: inherit;
+  font-size: inherit;
+  text-decoration: underline;
+  cursor: pointer;
 }
-.sidebar-refresh-btn.spinning {
-  animation: spin 1s linear infinite;
+.sidebar-history-retry:disabled {
+  cursor: default;
+  opacity: 0.55;
+  text-decoration: none;
 }
 
 @keyframes spin {
@@ -607,7 +605,7 @@ pre {
   color: var(--sidebar-text-strong);
   font-family: var(--font-sans);
   font-size: var(--fs-sm);
-  font-weight: 600;
+  font-weight: 500;
   position: relative;
   text-align: left;
   text-decoration: none;
@@ -615,7 +613,10 @@ pre {
   cursor: pointer;
 }
 
-.sidebar-core .sidebar-fn-item {
+/* New task shares this geometry exactly: inside the index it is a row like any
+   other, with no inset or extra height setting it apart. */
+.sidebar-core .sidebar-fn-item,
+.sidebar-core .sidebar-new-session {
   min-height: 32px;
   margin: 0;
   padding: 5px var(--sp-2);
@@ -636,9 +637,11 @@ pre {
   background: var(--sidebar-item-active);
   color: var(--sidebar-text-strong);
 }
-/* Active destination in the nav index: accent left-bar is the signal. */
+/* Active destination in the nav index: the brand orange left-bar is the signal,
+   matching the palette's active row so "where I am" reads the same warm mark on
+   both surfaces. Weight is no longer part of it. */
 .sidebar-core .sidebar-fn-item.is-active {
-  box-shadow: inset 2px 0 0 var(--accent);
+  box-shadow: inset 2px 0 0 var(--accent-secondary);
 }
 
 /* Recents: the only scrollable sidebar region */
@@ -665,11 +668,14 @@ pre {
   flex-shrink: 0;
 }
 
+/* Sits tight against its count — the two read as one "Tasks 24" label. The
+   controls after them take the spare width (see .sidebar-recents-count). */
 .sidebar-recents-eyebrow {
-  flex: 1;
   min-width: 0;
   font-size: var(--fs-xs);
-  font-weight: 700;
+  /* Same eyebrow family as the palette's group labels — share the token rather
+     than carrying a heavier literal. */
+  font-weight: var(--fw-eyebrow);
   text-transform: uppercase;
   letter-spacing: 0.08em;
   color: var(--sidebar-text-soft);
@@ -681,16 +687,16 @@ pre {
 /* Total count beside the single-family eyebrow (the per-family header row is
    skipped when there is only one family, so the count moves up here). */
 .sidebar-recents-count {
-  flex-shrink: 0;
+  /* Absorbs the header's spare width so the controls that follow are pushed to
+     the trailing edge while the count stays beside the label. */
+  flex: 1;
   min-width: 18px;
   padding: 0 6px;
-  border-radius: 999px;
-  background: var(--sidebar-item-hover);
   color: var(--sidebar-text-soft);
   font-size: 11px;
-  font-weight: 600;
+  font-weight: var(--fw-eyebrow);
   font-variant-numeric: tabular-nums;
-  text-align: center;
+  text-align: left;
   line-height: 17px;
 }
 

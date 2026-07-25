@@ -31,19 +31,39 @@ test.describe('Chat Page', () => {
     await expect(core.locator('.sidebar-nav-group-toggle')).toHaveCount(0)
   })
 
+  test('command palette opens on recent tasks, not on a list of destinations', async ({ page }) => {
+    await page.locator('.sidebar-cmd-btn').click()
+    const palette = page.getByRole('dialog', { name: 'Search and go to' })
+    await expect(palette).toBeVisible()
+
+    // Untyped state answers "which task?" — the button promises task search, so
+    // destinations must not be the resting content.
+    await expect(palette.locator('.cmdp-group-label')).toHaveText(['Recent tasks'])
+    for (const name of ['Overview', 'Skills & Channels', 'Cron']) {
+      await expect(palette.getByRole('option', { name, exact: true })).toHaveCount(0)
+    }
+  })
+
   test('command palette keeps the Skills & Channels hub together in Work', async ({ page }) => {
     await page.locator('.sidebar-cmd-btn').click()
     const palette = page.getByRole('dialog', { name: 'Search and go to' })
     await expect(palette).toBeVisible()
 
-    for (const name of ['Overview', 'Skills & Channels', 'Channels', 'Cron']) {
+    // Destinations surface by name rather than by default, so the grouping
+    // contract is asserted against a query that matches the whole hub.
+    await palette.getByRole('combobox').fill('channels')
+    for (const name of ['Skills & Channels', 'Channels']) {
       await expect(palette.getByRole('option', { name, exact: true })).toBeVisible()
     }
     const labels = await palette.locator('.cmdp-option__label').allTextContents()
     expect(labels.indexOf('Channels')).toBe(labels.indexOf('Skills & Channels') + 1)
-    await expect(palette.locator('.cmdp-group-label', { hasText: /^Overview$/ })).toBeVisible()
     await expect(palette.getByRole('option', { name: 'Agents', exact: true })).toHaveCount(0)
     await expect(palette.locator('.cmdp-group-label', { hasText: /^Build$/ })).toHaveCount(0)
+
+    // Usage and Logs stay reachable from their own band despite being off the rail.
+    await palette.getByRole('combobox').fill('usage')
+    await expect(palette.locator('.cmdp-group-label', { hasText: /^Overview$/ })).toBeVisible()
+    await expect(palette.getByRole('option', { name: 'Usage', exact: true })).toBeVisible()
   })
 
   test('Overview and Skills & Channels own disjoint route families', async ({ page }) => {

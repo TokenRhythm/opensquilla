@@ -112,7 +112,10 @@
   /* One unified eyebrow idiom (control-panel / control-section / sidebar nav
      groups all read these), and one "quiet" weight for demoted metric labels. */
   --eyebrow-track: 0.12em;
-  --fw-eyebrow: 600;
+  /* Eyebrow labels are already set apart by size, tracking, and a muted colour;
+     a semibold on top of that reads heavy at 10-13px. 500 keeps them legible
+     without shouting. */
+  --fw-eyebrow: 500;
   --fw-quiet: 500;
 
   /* Radius — a hierarchy-tied ladder (0 / 4 / 8 / 12 / 16 / 20 + pill). Each tier

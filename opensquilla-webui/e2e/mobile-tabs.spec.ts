@@ -19,8 +19,8 @@ test.describe('Mobile bottom tab bar', () => {
     await expect(tabbar.locator('.mobile-tab')).toHaveCount(4)
     await expect(tabbar.getByRole('link', { name: 'Agents' })).toHaveCount(0)
 
-    // Chat is the active tab on the chat route.
-    const chatTab = tabbar.getByRole('link', { name: 'Chat' })
+    // Task (the chat route) is the active tab.
+    const chatTab = tabbar.getByRole('link', { name: 'Task', exact: true })
     await expect(chatTab).toHaveClass(/is-active/)
 
     await tabbar.getByRole('link', { name: 'Sessions' }).click()

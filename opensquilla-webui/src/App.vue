@@ -142,7 +142,7 @@
 
   <CommandPalette
     v-model:open="commandPaletteOpen"
-    :hint="commandPaletteHint"
+    :recents="sidebarSections"
     @new-chat="onPaletteNewChat"
     @open-settings="onPaletteOpenSettings"
     @toggle-theme="onPaletteToggleTheme"

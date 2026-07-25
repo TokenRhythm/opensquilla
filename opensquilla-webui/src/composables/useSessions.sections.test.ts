@@ -32,7 +32,7 @@ describe('arrangeSidebarSections — family bucketing', () => {
 
     // The helper always returns all three families, in display order.
     expect(sections.map(s => s.family)).toEqual(['chats', 'channels', 'automations'])
-    expect(sections.map(s => s.label)).toEqual(['Chats', 'Channels', 'Automations'])
+    expect(sections.map(s => s.label)).toEqual(['Tasks', 'Channels', 'Automations'])
 
     expect(sectionFor(sections, 'chats').rows.map(r => r.title)).toEqual(['A chat'])
     expect(sectionFor(sections, 'channels').rows.map(r => r.title)).toEqual(['A channel'])

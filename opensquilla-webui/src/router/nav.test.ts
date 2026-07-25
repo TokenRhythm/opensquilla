@@ -9,16 +9,18 @@ import { sharedRoutes } from './sharedRoutes'
 describe('getWorkNavigationSection', () => {
   it('returns the flat sidebar order after the dedicated chat action', () => {
     expect(getWorkNavigationSection().map((item) => item.path)).toEqual([
-      '/sessions',
       '/overview',
       '/skills',
       '/cron',
     ])
   })
 
-  it('excludes Chat and advanced Agent administration', () => {
+  it('excludes Chat, the task ledger, and advanced Agent administration', () => {
     const paths = getWorkNavigationSection().map((item) => item.path)
     expect(paths).not.toContain('/chat')
+    // Sessions stays routed for deep links and the Not Found fallback, but
+    // "New task" leads the sidebar and the recents list covers session access.
+    expect(paths).not.toContain('/sessions')
     expect(paths).not.toContain('/agents')
   })
 
@@ -45,7 +47,6 @@ describe('navigation taxonomy invariants', () => {
   it('keeps Agents out of every primary navigation consumer', () => {
     expect(getNavigationItems('primary').map((item) => item.path)).toEqual([
       '/chat',
-      '/sessions',
       '/overview',
       '/skills',
       '/cron',

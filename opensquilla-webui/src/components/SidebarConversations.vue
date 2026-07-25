@@ -455,15 +455,6 @@ function onSelectRow(row: SidebarConversationItem) {
       >
         <Icon :name="selectionMode ? 'x' : 'listChecks'" :size="13" />
       </button>
-      <button
-        class="sidebar-refresh-btn"
-        :title="t('shared.sidebar.refresh')"
-        :aria-label="t('shared.sidebar.refresh')"
-        :class="{ spinning: loading }"
-        @click="emit('refresh')"
-      >
-        <Icon name="refresh" :size="12" />
-      </button>
     </div>
 
     <div v-if="agentFilter" class="sidebar-filter-row">
@@ -477,8 +468,18 @@ function onSelectRow(row: SidebarConversationItem) {
       </button>
     </div>
 
+    <!-- The header no longer carries a standing refresh control, so the retry
+         lives here — the one moment it is actually needed. -->
     <div v-if="error" class="sidebar-history-empty">
-      {{ t('shared.sidebar.loadError') }}
+      <p>{{ t('shared.sidebar.loadError') }}</p>
+      <button
+        type="button"
+        class="sidebar-history-retry"
+        :disabled="loading"
+        @click="emit('refresh')"
+      >
+        {{ t('shared.sidebar.refresh') }}
+      </button>
     </div>
 
     <!-- Filtered to nothing within the Chats agent filter -->
