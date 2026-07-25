@@ -52,10 +52,9 @@
   padding: var(--sp-1) var(--sp-2);
 }
 
-/* Tier table */
+/* Tier table — mist: no outer frame, rows separated by hairlines only; the
+   surrounding panel supplies the surface. */
 .setup-tier-table {
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
   display: flex;
   flex-direction: column;
   margin-bottom: var(--sp-4);
@@ -64,11 +63,11 @@
 
 .setup-tier-table__row {
   align-items: center;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--hairline);
   display: grid;
   gap: var(--sp-2);
   grid-template-columns: 140px 1fr 1fr 120px 60px;
-  padding: var(--sp-2) var(--sp-3);
+  padding: var(--sp-2) var(--sp-1);
 }
 
 /* First column shows the human tier label ("Balanced default (c1)") rather than
@@ -79,9 +78,11 @@
 }
 
 .setup-tier-table__row.is-head {
-  background: var(--bg-elevated);
+  border-bottom-color: var(--border);
+  color: var(--text-dim);
   font-size: 11px;
   font-weight: 600;
+  letter-spacing: 0.06em;
   text-transform: uppercase;
 }
 
@@ -91,12 +92,18 @@
 
 .setup-tier-table__row input,
 .setup-tier-table__row select {
-  background: var(--bg);
-  border: 1px solid var(--border);
+  background: var(--bg-surface);
+  border: 1px solid var(--hairline);
   border-radius: var(--radius-sm);
   color: var(--text);
   font-size: 12px;
   padding: var(--sp-1) var(--sp-2);
+  transition: border-color var(--dur-fast) var(--ease-out);
+}
+
+.setup-tier-table__row input:hover,
+.setup-tier-table__row select:hover {
+  border-color: var(--border-strong);
 }
 
 .setup-tier-table__readonly {

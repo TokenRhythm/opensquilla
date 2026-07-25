@@ -389,7 +389,7 @@ describe('SetupProviderPanel — configured provider management', () => {
     expect(test?.textContent?.trim()).toBe('Verify saved configuration')
     expect(test?.getAttribute('aria-describedby')).toBe('setup-provider-configured-desc')
     expect(el.querySelector('#setup-provider-configured-desc')?.textContent).toContain(
-      'Verification sends one small model request and may incur provider charges.',
+      'Testing sends one small model request.',
     )
 
     app.unmount()
@@ -758,7 +758,7 @@ describe('SetupProviderPanel — configured provider management', () => {
       configuredProviders: [configured[0]],
     })
 
-    expect(el.textContent).toContain('1 of 1 credentials ready')
+    expect(el.textContent).toContain('1 of 1 ready')
     expect(el.textContent).not.toContain('Multi-provider features')
 
     app.unmount()
@@ -1272,6 +1272,17 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
       {
         providerSelected: 'openrouter',
         runtimeProviders: [OPENROUTER_PROVIDER, TOKENRHYTHM_PROVIDER],
+        // The acquisition promo only renders while no provider is ready.
+        configuredProviders: [{
+          providerId: 'openrouter',
+          label: 'OpenRouter',
+          active: true,
+          ready: false,
+          credentialSource: 'missing_env',
+          credentialEnv: 'OPENROUTER_API_KEY',
+          endpointSource: 'registry',
+          reason: 'missing_credentials',
+        }],
         credentialPanel: {
           ...(panel().credentialPanel as Record<string, unknown>),
           providerLabel: 'OpenRouter',
@@ -1300,8 +1311,6 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
     expect(recommendation(el)?.textContent).toContain('Recommended: TokenRhythm')
     expect(recommendation(el)?.textContent)
       .toContain('TokenRhythm API calls are free for a limited time.')
-    expect(recommendation(el)?.textContent)
-      .toContain('During the promotion, register and get an API key to call DeepSeek, GLM, MiniMax, Kimi, and other leading models for free.')
     expect(
       Array.from(recommendation(el)?.querySelectorAll('[data-testid="tokenrhythm-recommendation-step"]') || [])
         .map(step => step.textContent?.replace(/\s+/g, ' ').trim()),
@@ -1326,6 +1335,7 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
     const { app, el } = await mountPanel({
       providerSelected: 'openrouter',
       runtimeProviders: [OPENROUTER_PROVIDER, TOKENRHYTHM_PROVIDER],
+      configuredProviders: [],
     })
     const card = recommendation(el)
     const link = card?.querySelector<HTMLAnchorElement>('a')
@@ -1344,6 +1354,7 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
     const { app, el } = await mountPanel({
       providerSelected: 'tokenrhythm',
       runtimeProviders: [OPENROUTER_PROVIDER, TOKENRHYTHM_PROVIDER],
+      configuredProviders: [],
       credentialPanel: tokenRhythmCredential(),
     })
     const card = recommendation(el)
@@ -1370,6 +1381,7 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
     const { app, el } = await mountPanel({
       providerSelected: 'tokenrhythm',
       runtimeProviders: [OPENROUTER_PROVIDER, TOKENRHYTHM_PROVIDER],
+      configuredProviders: [],
       credentialPanel: tokenRhythmCredential(),
     })
 
@@ -1382,6 +1394,7 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
     const { app, el } = await mountPanel({
       providerSelected: 'tokenrhythm',
       runtimeProviders: [OPENROUTER_PROVIDER, TOKENRHYTHM_PROVIDER],
+      configuredProviders: [],
       credentialPanel: tokenRhythmCredential({
         available: true,
         source: 'explicit',
@@ -1412,6 +1425,7 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
     const { app, el } = await mountPanel({
       providerSelected: 'tokenrhythm',
       runtimeProviders: [OPENROUTER_PROVIDER, TOKENRHYTHM_PROVIDER],
+      configuredProviders: [],
       credentialPanel: tokenRhythmCredential({ apiKeyValue: 'tr-test-key' }),
     })
 
@@ -1433,6 +1447,7 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
     const { app, el } = await mountPanel({
       providerSelected: 'tokenrhythm',
       runtimeProviders: [OPENROUTER_PROVIDER, TOKENRHYTHM_PROVIDER],
+      configuredProviders: [],
       credentialPanel: tokenRhythmCredential({
         available: true,
         source: 'explicit',
@@ -1471,6 +1486,7 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
     const { app, el } = await mountPanel({
       providerSelected: '',
       runtimeProviders: [TOKENRHYTHM_PROVIDER],
+      configuredProviders: [],
       credentialPanel: null,
     })
 
@@ -1488,6 +1504,7 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
     const { app, el } = await mountPanel({
       providerSelected: 'openrouter',
       runtimeProviders: [OPENROUTER_PROVIDER, TOKENRHYTHM_PROVIDER],
+      configuredProviders: [],
     })
     const card = recommendation(el)
 
@@ -1495,8 +1512,8 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
       .toBe('推荐使用 TokenRhythm')
     expect(card?.querySelector('[data-testid="tokenrhythm-recommendation-value"]')?.textContent)
       .toBe('TokenRhythm API 调用限时免费。')
-    expect(card?.querySelector('[data-testid="tokenrhythm-recommendation-registration"]')?.textContent)
-      .toBe('活动期间，注册并获取 API Key，即可免费调用 DeepSeek、GLM、MiniMax、Kimi 等主流模型。')
+    // The mist declutter pass dropped the second promo paragraph.
+    expect(card?.querySelector('[data-testid="tokenrhythm-recommendation-registration"]')).toBeNull()
     expect(
       Array.from(card?.querySelectorAll('[data-testid="tokenrhythm-recommendation-step"]') || [])
         .map(step => step.textContent?.replace(/\s+/g, ' ').trim()),

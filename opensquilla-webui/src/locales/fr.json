@@ -334,10 +334,10 @@
     "provider": {
       "title": "Fournisseur",
       "pageTitle": "Service de modèles",
-      "pageDesc": "Connectez des fournisseurs de modèles et gérez les identifiants, les points de terminaison et le modèle direct/de secours. Choisissez comment les modèles sont utilisés dans Routage des modèles.",
+      "pageDesc": "Connectez des fournisseurs et gérez leurs identifiants et modèles.",
       "configuredTitle": "Fournisseurs configurés",
       "configuredCount": "{count}",
-      "configuredSummary": "{ready} identifiants prêts sur {count}. La vérification envoie une petite requête et peut entraîner des frais.",
+      "configuredSummary": "{ready} sur {count} prêts. Le test envoie une petite requête.",
       "configuredDesc": "Les fournisseurs enregistrés restent disponibles pour le routage jusqu’à leur suppression. La vérification de la configuration envoie une petite requête au modèle avec les réglages enregistrés ; des frais du fournisseur peuvent s’appliquer.",
       "activeBadge": "Actif",
       "editingBadge": "En cours d’édition",
@@ -459,7 +459,6 @@
       "recommendation": {
         "title": "Recommandé : TokenRhythm",
         "value": "Les appels à l’API TokenRhythm sont gratuits pendant une durée limitée.",
-        "registration": "Pendant l’offre, inscrivez-vous et obtenez une clé API pour appeler gratuitement DeepSeek, GLM, MiniMax, Kimi et d’autres modèles majeurs.",
         "cta": "S’inscrire et obtenir une clé API",
         "externalLabel": "S’inscrire et obtenir une clé API — TokenRhythm (s’ouvre dans un nouvel onglet)",
         "stepsLabel": "Comment connecter TokenRhythm",
@@ -606,42 +605,40 @@
     },
     "modelStrategy": {
       "title": "Routage des modèles",
-      "desc": "Choisissez comment Squilla sélectionne et utilise les modèles configurés pour les nouvelles requêtes.",
+      "desc": "Choisissez comment le modèle est sélectionné pour chaque requête.",
       "modeTitle": "Choisir l’utilisation des modèles",
-      "modeDesc": "Choisissez selon l’objectif : le routage intelligent équilibre l’usage des tokens et les capacités ; un modèle fixe garde une sélection prévisible ; la collaboration multimodèle privilégie les capacités pour les tâches complexes et utilise généralement plus de tokens.",
       "providerFirstTitle": "Ajouter d’abord un service de modèles",
-      "providerFirst": "Le routage des modèles nécessite au moins un fournisseur enregistré. Un seul fournisseur suffit pour router entre ses modèles configurés.",
+      "providerFirst": "Le routage de modèles nécessite au moins un fournisseur enregistré.",
       "providerAction": "Accéder au service de modèles",
-      "configuredProvidersOnly": "Les fournisseurs et modèles disponibles proviennent du service de modèles.",
+      "configuredProvidersOnly": "Les modèles proviennent du Service de modèles.",
       "manageProviders": "Gérer le service de modèles",
       "routerTitle": "Routage intelligent des modèles",
       "fallbackTierLabel": "Quand le routage est incertain",
-      "fallbackTierDesc": "Utilisez ce niveau par défaut lorsque le routage ne peut pas déterminer avec certitude le niveau de la requête.",
+      "fallbackTierDesc": "Utilisé quand le routage ne peut pas déterminer le niveau.",
       "modelRolesTitle": "Rôles des modèles",
-      "modelRolesDesc": "Définissez le modèle chargé de chaque niveau de complexité des requêtes.",
-      "advancedTitle": "Options d’affichage",
-      "advancedDesc": "Modifiez l’affichage des informations de routage dans le chat sans affecter la sélection des modèles.",
+      "advancedTitle": "Options avancées",
+      "advancedDesc": "Niveau de repli et affichage du routage dans le chat.",
       "visualModeLabel": "Style du panneau de décision de routage",
-      "visualModeDesc": "Choisissez l’apparence du panneau de décision de routage dans les réponses du chat. Cela ne modifie pas le comportement du routage.",
+      "visualModeDesc": "Affichage de la décision de routage dans les réponses.",
       "crossProviderNotice": "Le routage inter-fournisseurs est actif. Vérifie chaque niveau avant d’enregistrer.",
       "cards": {
         "router": {
           "title": "Routage intelligent des modèles",
           "badge": "Économe en tokens",
-          "desc": "Associe chaque requête à un modèle adapté afin d’éviter d’utiliser inutilement les modèles les plus puissants pour les tâches simples."
+          "desc": "Chaque requête va au modèle adapté ; les tâches simples restent économes."
         },
         "ensemble": {
           "title": "Collaboration multimodèle",
           "badge": "Capacités prioritaires",
-          "desc": "Exécute plusieurs modèles en parallèle et combine leurs résultats pour les tâches complexes ; cela utilise généralement plus de tokens."
+          "desc": "Plusieurs modèles collaborent sur les tâches complexes. Consomme plus de tokens."
         },
         "single": {
           "title": "Modèle fixe",
           "badge": "Prévisible",
-          "desc": "Utilise toujours le modèle choisi, ce qui rend la sélection et l’usage plus faciles à prévoir."
+          "desc": "Un seul modèle pour tout. Prévisible et simple."
         }
       },
-      "routerDependency": "Choisissez les modèles pour chaque niveau de requête. Un fournisseur peut couvrir tous les niveaux.",
+      "routerDependency": "Choisissez un modèle par niveau de requête. Un seul fournisseur peut tous les couvrir.",
       "ensembleTitle": "Collaboration multimodèle",
       "ensembleDependency": "Utilise les identifiants {provider} ; le modèle par défaut du fournisseur est {model}.",
       "ensembleMinimum": "Ajoutez au moins un autre candidat pour bénéficier du routage agrégé.",
@@ -669,7 +666,7 @@
       "removeCandidateAria": "Retirer {model}",
       "ensembleEmpty": "Aucun modèle candidat pour le moment. Enregistrez les paramètres du service de modèles pour générer les niveaux de routage, ou ajoutez des candidats manuellement.",
       "ensemblePipeline": "Fonctionnement : les modèles proposants rédigent en parallèle, puis l'agrégateur fusionne les brouillons en réponse finale. Seul l'agrégateur peut appeler des outils.",
-      "ensembleFlowDesc": "Plusieurs modèles rédigent en parallèle, puis un agrégateur combine leur travail en une réponse finale. Cela utilise plus d’appels de modèles et peut coûter plus cher.",
+      "ensembleFlowDesc": "Plusieurs modèles rédigent en parallèle ; un agrégateur les fusionne en une réponse. Plus d'appels.",
       "legacyDynamicNotice": "Cette configuration utilise l'ancien mode d'ensemble automatique retiré. Convertissez-la en composition personnalisée pour continuer à l'éditer.",
       "legacyDynamicMigrate": "Convertir en composition personnalisée",
       "schemeLabel": "Schéma d'ensemble",

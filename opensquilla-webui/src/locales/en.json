@@ -334,10 +334,10 @@
     "provider": {
       "title": "Provider",
       "pageTitle": "Model Service",
-      "pageDesc": "Connect model providers and manage credentials, endpoints, and the direct/fallback model. Choose how models are used in Model Routing.",
+      "pageDesc": "Connect providers and manage their credentials and models.",
       "configuredTitle": "Configured providers",
       "configuredCount": "{count}",
-      "configuredSummary": "{ready} of {count} credentials ready. Verification sends one small model request and may incur provider charges.",
+      "configuredSummary": "{ready} of {count} ready. Testing sends one small model request.",
       "configuredDesc": "Saved providers remain available for routing until you remove them. Configuration verification sends a small model request using the saved settings; provider charges may apply.",
       "activeBadge": "Active",
       "editingBadge": "Editing",
@@ -459,7 +459,6 @@
       "recommendation": {
         "title": "Recommended: TokenRhythm",
         "value": "TokenRhythm API calls are free for a limited time.",
-        "registration": "During the promotion, register and get an API key to call DeepSeek, GLM, MiniMax, Kimi, and other leading models for free.",
         "cta": "Register and get an API key",
         "externalLabel": "Register and get an API key — TokenRhythm (opens in a new tab)",
         "stepsLabel": "How to connect TokenRhythm",
@@ -606,24 +605,22 @@
     },
     "modelStrategy": {
       "title": "Model routing",
-      "desc": "Choose how Squilla selects and uses configured models for new requests.",
+      "desc": "Choose how models are picked for each request.",
       "modeTitle": "Choose how models are used",
-      "modeDesc": "Choose by outcome: intelligent routing balances token use and model capability; a fixed model keeps selection predictable; multi-model collaboration prioritizes capability for complex tasks and usually uses more tokens.",
       "providerFirstTitle": "Add a model provider to start",
-      "providerFirst": "Model routing needs at least one saved provider. One provider is enough to route among its configured models.",
+      "providerFirst": "Model routing needs at least one saved provider.",
       "providerAction": "Go to Model Service",
-      "configuredProvidersOnly": "Available providers and models come from Model Service.",
+      "configuredProvidersOnly": "Models come from Model Service.",
       "manageProviders": "Manage Model Service",
       "routerTitle": "Intelligent model routing",
       "fallbackTierLabel": "When routing is uncertain",
-      "fallbackTierDesc": "Use this default tier when routing cannot confidently determine the request level.",
+      "fallbackTierDesc": "Used when routing can't judge a request's level.",
       "modelRolesTitle": "Model roles",
-      "modelRolesDesc": "Define which model handles each request complexity level.",
-      "advancedTitle": "Display options",
-      "advancedDesc": "Change how routing information appears in chat without affecting model selection.",
+      "advancedTitle": "Advanced options",
+      "advancedDesc": "Fallback tier and how routing appears in chat.",
       "visualModeLabel": "Routing decision panel style",
-      "visualModeDesc": "Choose how the routing decision panel appears in chat replies. This does not change routing behavior.",
-      "routerDependency": "Choose models for each request level. One provider can supply every level.",
+      "visualModeDesc": "How the routing decision appears in chat replies.",
+      "routerDependency": "Pick a model for each request level. One provider can supply every level.",
       "ensembleTitle": "Multi-model collaboration",
       "ensembleDependency": "Uses {provider} credentials; provider default model is {model}.",
       "ensembleMinimum": "Add at least one more candidate to benefit from ensemble routing.",
@@ -640,17 +637,17 @@
         "router": {
           "title": "Intelligent model routing",
           "badge": "Token-efficient",
-          "desc": "Match each request to an appropriate model so simple tasks avoid unnecessary high-capability usage."
+          "desc": "Each request goes to a fitting model, so simple tasks stay cheap."
         },
         "ensemble": {
           "title": "Multi-model collaboration",
           "badge": "Capability-first",
-          "desc": "Run multiple models in parallel and combine their work for complex tasks; this usually uses more tokens."
+          "desc": "Several models tackle complex tasks together. Uses more tokens."
         },
         "single": {
           "title": "Fixed model",
           "badge": "Predictable",
-          "desc": "Always use the model you choose, making model selection and usage easier to anticipate."
+          "desc": "One model for everything. Predictable and simple."
         }
       },
       "openrouterFixedTitle": "{provider} fixed ensemble",
@@ -669,7 +666,7 @@
       "removeCandidateAria": "Remove {model}",
       "ensembleEmpty": "No candidate models yet. Save your Model Service settings to seed model tiers, or add candidates manually.",
       "ensemblePipeline": "How it works: proposer models draft in parallel, then the aggregator fuses the drafts into the final reply. Only the aggregator can call tools.",
-      "ensembleFlowDesc": "Several models draft in parallel, then an aggregator combines their work into one final answer. This uses more model calls and may cost more.",
+      "ensembleFlowDesc": "Models draft in parallel; an aggregator merges them into one answer. Uses more calls.",
       "legacyDynamicNotice": "This configuration uses the retired automatic ensemble mode. Convert it to a custom lineup to keep editing it here.",
       "legacyDynamicMigrate": "Convert to custom lineup",
       "schemeLabel": "Ensemble scheme",

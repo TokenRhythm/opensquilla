@@ -334,10 +334,10 @@
     "provider": {
       "title": "Anbieter",
       "pageTitle": "Modelldienst",
-      "pageDesc": "Verbinden Sie Modellanbieter und verwalten Sie Zugangsdaten, Endpunkte sowie das Direkt-/Fallback-Modell. Wie Modelle verwendet werden, legen Sie unter Modell-Routing fest.",
+      "pageDesc": "Anbieter verbinden und ihre Zugangsdaten und Modelle verwalten.",
       "configuredTitle": "Konfigurierte Anbieter",
       "configuredCount": "{count}",
-      "configuredSummary": "{ready} von {count} Zugangsdaten einsatzbereit. Die Prüfung sendet eine kleine Modellanfrage und kann Anbietergebühren verursachen.",
+      "configuredSummary": "{ready} von {count} bereit. Der Test sendet eine kleine Modellanfrage.",
       "configuredDesc": "Gespeicherte Anbieter bleiben für das Routing verfügbar, bis sie entfernt werden. Die Konfigurationsprüfung sendet mit den gespeicherten Einstellungen eine kleine Modellanfrage; dabei können Anbietergebühren anfallen.",
       "activeBadge": "Aktiv",
       "editingBadge": "In Bearbeitung",
@@ -459,7 +459,6 @@
       "recommendation": {
         "title": "Empfohlen: TokenRhythm",
         "value": "TokenRhythm-API-Aufrufe sind für kurze Zeit kostenlos.",
-        "registration": "Während der Aktion registrieren, API-Schlüssel erhalten und DeepSeek, GLM, MiniMax, Kimi und weitere führende Modelle kostenlos aufrufen.",
         "cta": "Registrieren und API-Schlüssel erhalten",
         "externalLabel": "Registrieren und API-Schlüssel erhalten — TokenRhythm (wird in einem neuen Tab geöffnet)",
         "stepsLabel": "TokenRhythm verbinden",
@@ -606,42 +605,40 @@
     },
     "modelStrategy": {
       "title": "Modellrouting",
-      "desc": "Lege fest, wie Squilla konfigurierte Modelle für neue Anfragen auswählt und einsetzt.",
+      "desc": "Lege fest, wie Modelle für jede Anfrage ausgewählt werden.",
       "modeTitle": "Modellnutzung auswählen",
-      "modeDesc": "Nach dem gewünschten Ergebnis auswählen: Intelligentes Routing gleicht Token-Nutzung und Modellleistung aus; ein festes Modell macht die Auswahl vorhersehbar; die Zusammenarbeit mehrerer Modelle priorisiert Leistung bei komplexen Aufgaben und verbraucht meist mehr Tokens.",
       "providerFirstTitle": "Zuerst einen Modelldienst hinzufügen",
-      "providerFirst": "Modellrouting benötigt mindestens einen gespeicherten Anbieter. Ein Anbieter genügt, um zwischen seinen konfigurierten Modellen zu routen.",
+      "providerFirst": "Modell-Routing benötigt mindestens einen gespeicherten Anbieter.",
       "providerAction": "Zum Modelldienst",
-      "configuredProvidersOnly": "Verfügbare Anbieter und Modelle stammen aus dem Modelldienst.",
+      "configuredProvidersOnly": "Modelle stammen aus dem Modelldienst.",
       "manageProviders": "Modelldienst verwalten",
       "routerTitle": "Intelligentes Modellrouting",
       "fallbackTierLabel": "Wenn das Routing unsicher ist",
-      "fallbackTierDesc": "Diese Standardstufe wird verwendet, wenn das Routing die Anforderungsstufe nicht sicher bestimmen kann.",
+      "fallbackTierDesc": "Wird verwendet, wenn das Routing die Stufe nicht sicher bestimmen kann.",
       "modelRolesTitle": "Modellrollen",
-      "modelRolesDesc": "Lege fest, welches Modell die jeweilige Komplexitätsstufe bearbeitet.",
-      "advancedTitle": "Anzeigeoptionen",
-      "advancedDesc": "Passe die Routing-Anzeige im Chat an, ohne die Modellauswahl zu verändern.",
+      "advancedTitle": "Erweiterte Optionen",
+      "advancedDesc": "Fallback-Stufe und Darstellung des Routings im Chat.",
       "visualModeLabel": "Stil des Routing-Entscheidungspanels",
-      "visualModeDesc": "Lege fest, wie das Routing-Entscheidungspanel in Chat-Antworten erscheint. Das Routing-Verhalten bleibt unverändert.",
+      "visualModeDesc": "Darstellung der Routing-Entscheidung in Chat-Antworten.",
       "crossProviderNotice": "Provider-übergreifendes Routing ist aktiv. Prüfe jeden Tier vor dem Speichern.",
       "cards": {
         "router": {
           "title": "Intelligentes Modellrouting",
           "badge": "Token-effizient",
-          "desc": "Ordnet jeder Anfrage ein passendes Modell zu, damit einfache Aufgaben nicht unnötig mit leistungsstarken Modellen ausgeführt werden."
+          "desc": "Jede Anfrage geht an ein passendes Modell — einfache Aufgaben bleiben günstig."
         },
         "ensemble": {
           "title": "Zusammenarbeit mehrerer Modelle",
           "badge": "Leistung im Fokus",
-          "desc": "Lässt mehrere Modelle parallel arbeiten und kombiniert ihre Ergebnisse für komplexe Aufgaben; dabei werden meist mehr Tokens verbraucht."
+          "desc": "Mehrere Modelle bearbeiten komplexe Aufgaben gemeinsam. Verbraucht mehr Tokens."
         },
         "single": {
           "title": "Festes Modell",
           "badge": "Vorhersehbar",
-          "desc": "Nutzt immer das von dir gewählte Modell; Auswahl und Verbrauch sind dadurch leichter abzuschätzen."
+          "desc": "Ein Modell für alles. Vorhersehbar und einfach."
         }
       },
-      "routerDependency": "Lege Modelle für jede Anforderungsstufe fest. Ein Anbieter kann alle Stufen abdecken.",
+      "routerDependency": "Wähle je Anfragestufe ein Modell. Ein Anbieter kann alle Stufen abdecken.",
       "ensembleTitle": "Zusammenarbeit mehrerer Modelle",
       "ensembleDependency": "Nutzt {provider}-Zugangsdaten; das Standardmodell des Anbieters ist {model}.",
       "ensembleMinimum": "Füge mindestens einen weiteren Kandidaten hinzu, um Ensemble-Routing zu nutzen.",
@@ -669,7 +666,7 @@
       "removeCandidateAria": "{model} entfernen",
       "ensembleEmpty": "Noch keine Kandidatenmodelle. Speichere zuerst die Modelldienst-Einstellungen, um Routing-Stufen zu erzeugen, oder füge Kandidaten manuell hinzu.",
       "ensemblePipeline": "So funktioniert es: Die Entwurfsmodelle schreiben parallel, dann verschmilzt der Aggregator die Entwürfe zur endgültigen Antwort. Nur der Aggregator kann Tools aufrufen.",
-      "ensembleFlowDesc": "Mehrere Modelle erstellen parallel Entwürfe; ein Aggregator führt sie zu einer Antwort zusammen. Das benötigt mehr Modellaufrufe und kann mehr kosten.",
+      "ensembleFlowDesc": "Modelle entwerfen parallel; ein Aggregator führt sie zu einer Antwort zusammen. Mehr Aufrufe.",
       "legacyDynamicNotice": "Diese Konfiguration nutzt den eingestellten automatischen Ensemble-Modus. Zum Weiterbearbeiten in eine eigene Aufstellung umwandeln.",
       "legacyDynamicMigrate": "In eigene Aufstellung umwandeln",
       "schemeLabel": "Ensemble-Schema",

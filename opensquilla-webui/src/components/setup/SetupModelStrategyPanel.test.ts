@@ -218,22 +218,21 @@ describe('SetupModelStrategyPanel', () => {
   it('shows router details when model router is active', async () => {
     const { app, el } = await mountPanel({ activeStrategy: 'router' })
 
-    expect(el.textContent).toContain('When routing is uncertain')
     expect(el.textContent).toContain('Model roles')
-    expect(el.textContent).toContain('Choose models for each request level. One provider can supply every level.')
+    expect(el.textContent).toContain('Pick a model for each request level. One provider can supply every level.')
     expect(el.textContent).not.toContain('Preset and credentials from OpenRouter')
     expect(el.querySelector('[role="table"]')).toBeTruthy()
-    // The chat-panel visualization picker rides with the router details; losing
-    // it strands a saved legacy_grid choice with no UI path back.
-    const visualMode = el.querySelector<HTMLSelectElement>('select[name="setup_model_strategy_router_visual_mode"]')
-    expect(visualMode?.value).toBe('real_candidates')
-    const advanced = visualMode?.closest<HTMLDetailsElement>('details')
+    // The fallback tier rides in the collapsed advanced fold: rarely needed,
+    // but a saved non-default tier must stay reachable from the UI.
+    const fallbackTier = el.querySelector<HTMLSelectElement>('select[name="setup_model_strategy_router_default_tier"]')
+    expect(fallbackTier).toBeTruthy()
+    const advanced = fallbackTier?.closest<HTMLDetailsElement>('details')
     expect(advanced?.open).toBe(false)
-    expect(advanced?.querySelector('summary')?.textContent).toContain('Display options')
+    expect(advanced?.querySelector('summary')?.textContent).toContain('Advanced options')
     advanced?.querySelector<HTMLElement>('summary')?.click()
     await nextTick()
     expect(advanced?.open).toBe(true)
-    expect(el.textContent).toContain('Routing decision panel style')
+    expect(el.textContent).toContain('When routing is uncertain')
 
     app.unmount()
   })
@@ -282,27 +281,19 @@ describe('SetupModelStrategyPanel', () => {
     app.unmount()
   })
 
-  it('emits the routing panel style from the visual-mode select', async () => {
-    const onUpdateRouterVisualMode = vi.fn()
-    const { app, el } = await mountPanel(
-      {
-        router: {
-          routerVisualModeOptions: [
-            { value: 'real_candidates', label: 'Real routing candidates' },
-            { value: 'legacy_grid', label: 'Three-tier visual panel' },
-          ],
-        },
+  it('no longer renders the retired routing-panel-style select', async () => {
+    // The cosmetic visual-mode picker was cut in the mist declutter pass; the
+    // saved value keeps applying, it is just not editable from this page.
+    const { app, el } = await mountPanel({
+      router: {
+        routerVisualModeOptions: [
+          { value: 'real_candidates', label: 'Real routing candidates' },
+          { value: 'legacy_grid', label: 'Three-tier visual panel' },
+        ],
       },
-      { onUpdateRouterVisualMode },
-    )
+    })
 
-    const select = el.querySelector<HTMLSelectElement>('select[name="setup_model_strategy_router_visual_mode"]')
-    expect(select).toBeTruthy()
-    select!.value = 'legacy_grid'
-    select!.dispatchEvent(new Event('change', { bubbles: true }))
-    await nextTick()
-
-    expect(onUpdateRouterVisualMode).toHaveBeenCalledWith('legacy_grid')
+    expect(el.querySelector('select[name="setup_model_strategy_router_visual_mode"]')).toBeNull()
     app.unmount()
   })
 
@@ -1171,10 +1162,14 @@ describe('SetupModelStrategyPanel', () => {
       .toEqual(['Model routing'])
     expect(Array.from(el.querySelectorAll('h4')).map(node => node.textContent?.trim()))
       .toEqual(expect.arrayContaining([
-        'Choose how models are used',
         'Intelligent model routing',
         'Fixed and fallback model',
       ]))
+    // The redundant "Choose how models are used" section heading was removed;
+    // the mode radiogroup is labelled for AT via aria-label instead.
+    expect(el.textContent).not.toContain('Choose how models are used')
+    expect(el.querySelector('.setup-model-strategy__cards')?.getAttribute('aria-label'))
+      .toBe('Choose how models are used')
     expect(el.querySelector('.setup-model-strategy__roles-head h5')?.textContent)
       .toContain('Model roles')
 

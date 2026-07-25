@@ -46,9 +46,8 @@ function localizeNeed(item: string): string {
 
 <style scoped>
 .setup-need-list {
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
+  background: var(--bg-surface-2);
+  border-radius: var(--radius-card);
   font-size: var(--fs-sm);
   padding: var(--sp-3);
 }

@@ -564,9 +564,13 @@ const showContextWindowWarning = computed(() => (
 ))
 
 const showTokenRhythmRecommendation = computed(() => {
-  return props.panel.runtimeProviders.some(
+  const hasTokenRhythm = props.panel.runtimeProviders.some(
     provider => provider.providerId.trim().toLowerCase() === 'tokenrhythm',
   )
+  if (!hasTokenRhythm) return false
+  // Acquisition aid only: once any provider is credential-ready, the promo
+  // retires so the page stays about the user's own providers.
+  return !props.panel.configuredProviders.some(provider => provider.ready)
 })
 
 const tokenRhythmSelected = computed(() => (
@@ -1000,11 +1004,10 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 
 .setup-provider-overview {
   align-items: center;
-  border-bottom: 1px solid var(--border);
   display: flex;
   gap: var(--sp-3);
   justify-content: space-between;
-  padding-bottom: var(--sp-3);
+  padding-bottom: var(--sp-2);
 }
 
 .setup-provider-overview__title-row {
@@ -1028,8 +1031,8 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 .setup-provider-empty {
   align-items: flex-start;
   background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-card);
+  box-shadow: var(--elev-1);
   display: flex;
   gap: var(--sp-3);
   margin-block: var(--sp-3);
@@ -1063,18 +1066,22 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 .setup-provider-card {
   align-items: center;
   background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-card);
+  box-shadow: var(--elev-1);
   display: flex;
   gap: var(--sp-3);
   justify-content: space-between;
   min-height: 54px;
   padding: var(--sp-2) var(--sp-3);
+  transition: box-shadow var(--dur-base) var(--ease-out);
+}
+
+.setup-provider-card:hover {
+  box-shadow: var(--elev-1-hover);
 }
 
 .setup-provider-card.is-selected {
-  border-color: var(--accent);
-  box-shadow: inset 3px 0 0 var(--accent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 78%, var(--border)), var(--elev-1);
 }
 
 .setup-provider-card__identity {
@@ -1152,12 +1159,37 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
   margin-top: calc(var(--sp-2) * -1);
 }
 
+/* Status reads as a small semantic dot + quiet text (green = ready,
+   amber = needs attention) — hue stays a pinpoint, per mist discipline. */
+.setup-provider-card__status.is-ready,
+.setup-provider-card__status.is-warn {
+  align-items: center;
+  display: inline-flex;
+  gap: 6px;
+}
+
+.setup-provider-card__status.is-ready::before,
+.setup-provider-card__status.is-warn::before {
+  border-radius: var(--radius-full);
+  content: '';
+  height: 7px;
+  width: 7px;
+}
+
 .setup-provider-card__status.is-ready {
   color: var(--ok);
 }
 
+.setup-provider-card__status.is-ready::before {
+  background: var(--ok-fill, var(--ok));
+}
+
 .setup-provider-card__status.is-warn {
   color: var(--warn);
+}
+
+.setup-provider-card__status.is-warn::before {
+  background: var(--warn-fill, var(--warn));
 }
 
 .setup-provider-list__empty {
@@ -1179,8 +1211,8 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 
 .setup-provider-routing {
   align-items: center;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
+  background: var(--bg-surface-2);
+  border-radius: var(--radius-card);
   display: flex;
   gap: var(--sp-3);
   justify-content: space-between;
@@ -1200,11 +1232,6 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
   display: inline-flex;
   flex: 0 0 auto;
   gap: var(--sp-1);
-}
-
-.setup-provider-routing {
-  background: transparent;
-  border-color: var(--border);
 }
 
 .setup-provider-routing p {

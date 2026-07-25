@@ -113,6 +113,14 @@ const emit = defineEmits<{
 }>()
 
 const showRouterDetails = computed(() => props.panel.activeStrategy === 'router')
+
+// Mist four-hue discipline: each strategy badge carries its semantic hue —
+// green = token-efficient, violet = capability-first, blue = predictable.
+function strategyBadgeClass(id: ModelStrategy): string {
+  if (id === 'router') return 'control-pill--ok'
+  if (id === 'ensemble') return 'control-pill--queued'
+  return 'control-pill--info'
+}
 const fixedModelIsPrimaryStrategy = computed(() => props.panel.activeStrategy === 'single')
 const routerEditingDisabled = computed(() => !props.panel.hasSavedProvider)
 const newCandidateProvider = ref('')
@@ -457,11 +465,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
     </div>
 
     <template v-else>
-      <section class="setup-model-strategy__mode" aria-labelledby="setup-model-strategy-mode-title">
-        <div class="setup-model-strategy__mode-head">
-          <h4 id="setup-model-strategy-mode-title">{{ t('setup.modelStrategy.modeTitle') }}</h4>
-          <p>{{ t('setup.modelStrategy.modeDesc') }}</p>
-        </div>
+      <section class="setup-model-strategy__mode" :aria-label="t('setup.modelStrategy.modeTitle')">
         <div class="setup-model-strategy__cards" role="radiogroup" :aria-label="t('setup.modelStrategy.modeTitle')">
           <label
             v-for="card in panel.cards"
@@ -483,6 +487,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
               <span
                 v-if="card.badgeKey"
                 class="control-pill"
+                :class="strategyBadgeClass(card.id)"
               >{{ t(card.badgeKey) }}</span>
             </span>
             <span class="setup-model-strategy__card-desc">{{ t(card.descKey) }}</span>
@@ -509,27 +514,8 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
           </p>
         </div>
 
-        <label class="control-row">
-          <div class="control-row__label-block">
-            <span class="control-row__label">{{ t('setup.modelStrategy.fallbackTierLabel') }}</span>
-            <span class="control-row__desc">{{ t('setup.modelStrategy.fallbackTierDesc') }}</span>
-          </div>
-          <div class="control-row__control">
-            <select
-              class="control-input"
-              :value="panel.router.routerDefaultTier"
-              name="setup_model_strategy_router_default_tier"
-              :disabled="routerEditingDisabled"
-              @change="emit('updateRouterDefaultTier', ($event.target as HTMLSelectElement).value)"
-            >
-              <option v-for="tier in panel.router.textTiers" :key="tier" :value="tier">{{ panel.router.tierLabel(tier) }}</option>
-            </select>
-          </div>
-        </label>
-
         <div class="setup-model-strategy__roles-head">
           <h5>{{ t('setup.modelStrategy.modelRolesTitle') }}</h5>
-          <p>{{ t('setup.modelStrategy.modelRolesDesc') }}</p>
         </div>
 
         <SetupTierTable
@@ -550,28 +536,24 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
             <Icon name="gear" :size="16" aria-hidden="true" />
             <span class="setup-model-strategy__runtime-title">
               {{ t('setup.modelStrategy.advancedTitle') }}
-              <small>{{ t('setup.modelStrategy.advancedDesc') }}</small>
             </span>
             <Icon class="setup-model-strategy__runtime-chevron" name="chevronDown" :size="15" aria-hidden="true" />
           </summary>
           <div class="setup-model-strategy__runtime-body">
             <label class="control-row">
               <div class="control-row__label-block">
-                <span class="control-row__label">{{ t('setup.modelStrategy.visualModeLabel') }}</span>
-                <span class="control-row__desc">{{ t('setup.modelStrategy.visualModeDesc') }}</span>
+                <span class="control-row__label">{{ t('setup.modelStrategy.fallbackTierLabel') }}</span>
+                <span class="control-row__desc">{{ t('setup.modelStrategy.fallbackTierDesc') }}</span>
               </div>
               <div class="control-row__control">
-                <!-- Chat-panel visualization for routing decisions (squilla_router.visual_mode):
-                     cosmetic only, but user-persisted — without this row a saved
-                     legacy_grid choice becomes unreachable from the UI. -->
                 <select
                   class="control-input"
-                  :value="panel.router.routerVisualMode"
-                  name="setup_model_strategy_router_visual_mode"
+                  :value="panel.router.routerDefaultTier"
+                  name="setup_model_strategy_router_default_tier"
                   :disabled="routerEditingDisabled"
-                  @change="emit('updateRouterVisualMode', ($event.target as HTMLSelectElement).value)"
+                  @change="emit('updateRouterDefaultTier', ($event.target as HTMLSelectElement).value)"
                 >
-                  <option v-for="option in panel.router.routerVisualModeOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
+                  <option v-for="tier in panel.router.textTiers" :key="tier" :value="tier">{{ panel.router.tierLabel(tier) }}</option>
                 </select>
               </div>
             </label>
@@ -1259,6 +1241,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
 
       <section
         class="control-section setup-model-strategy__detail"
+        :class="{ 'setup-model-strategy__detail--secondary': !fixedModelIsPrimaryStrategy }"
         data-testid="setup-model-strategy-fixed-section"
       >
         <div class="control-section__head">
@@ -1315,8 +1298,8 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
 .setup-model-strategy__empty {
   align-items: flex-start;
   background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-card);
+  box-shadow: var(--elev-1);
   display: flex;
   gap: var(--sp-3);
   padding: var(--sp-4);
@@ -1340,24 +1323,9 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
   margin: var(--sp-1) 0 var(--sp-3);
 }
 
-.setup-model-strategy__mode,
-.setup-model-strategy__mode-head {
+.setup-model-strategy__mode {
   display: grid;
   gap: var(--sp-2);
-}
-
-.setup-model-strategy__mode-head {
-  gap: var(--sp-1);
-}
-
-.setup-model-strategy__mode-head h4,
-.setup-model-strategy__mode-head p {
-  margin: 0;
-}
-
-.setup-model-strategy__mode-head p {
-  color: var(--text-muted);
-  font-size: var(--fs-xs);
 }
 
 .setup-model-strategy__cards {
@@ -1366,17 +1334,20 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
 }
 
+/* Mist cards: floating paper — hairline ring + soft shadow, selected = ink ring. */
 .setup-model-strategy__card {
   background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-card);
+  box-shadow: var(--elev-1);
   color: var(--text);
   cursor: pointer;
   display: grid;
   gap: var(--sp-1);
   min-height: 5.5rem;
-  padding: var(--sp-2);
+  padding: var(--sp-3);
   text-align: left;
+  transition: box-shadow var(--dur-base) var(--ease-out), border-color var(--dur-base) var(--ease-out), transform var(--dur-base) var(--ease-out);
 }
 
 .setup-model-strategy__card:focus-within {
@@ -1394,12 +1365,21 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
 }
 
 .setup-model-strategy__card:hover {
-  border-color: color-mix(in srgb, var(--accent) 48%, var(--border));
+  box-shadow: var(--elev-1-hover);
+  transform: translateY(-1px);
 }
 
 .setup-model-strategy__card.is-active {
-  background: color-mix(in srgb, var(--accent) 8%, var(--bg-elevated));
-  border-color: color-mix(in srgb, var(--accent) 62%, var(--border));
+  border-color: color-mix(in srgb, var(--accent) 78%, var(--border));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 78%, var(--border)), var(--elev-1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .setup-model-strategy__card,
+  .setup-model-strategy__card:hover {
+    transform: none;
+    transition: none;
+  }
 }
 
 .setup-model-strategy__card-title {
@@ -1448,20 +1428,28 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
   text-decoration: underline;
 }
 
+/* Sections separate by whitespace, not rules — mist keeps line-work minimal. */
 .setup-model-strategy__detail {
-  border-top: 1px solid var(--border);
-  padding-top: var(--sp-3);
+  padding-top: var(--sp-4);
+}
+
+/* In router/ensemble mode the fixed model is only the fallback — keep it
+   present but visually quiet so the active strategy owns the page. */
+.setup-model-strategy__detail--secondary {
+  opacity: 0.92;
+}
+
+.setup-model-strategy__detail--secondary .control-section__title {
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
 }
 
 .setup-model-strategy__single-provider {
   align-items: center;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
   display: flex;
   gap: var(--sp-2);
   justify-content: space-between;
-  padding: var(--sp-2) var(--sp-3);
+  padding: var(--sp-1) 0;
 }
 
 .setup-model-strategy__single-provider span {

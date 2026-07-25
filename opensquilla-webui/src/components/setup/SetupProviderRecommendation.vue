@@ -43,10 +43,6 @@ const stepKeys = computed(() => [
       class="setup-provider-recommendation__copy"
       data-testid="tokenrhythm-recommendation-value"
     >{{ t('setup.provider.recommendation.value') }}</p>
-    <p
-      class="setup-provider-recommendation__copy"
-      data-testid="tokenrhythm-recommendation-registration"
-    >{{ t('setup.provider.recommendation.registration') }}</p>
     <ol
       class="setup-provider-recommendation__steps"
       :aria-label="t('setup.provider.recommendation.stepsLabel')"
@@ -73,8 +69,9 @@ const stepKeys = computed(() => [
 
 <style scoped>
 .setup-provider-recommendation {
-  background: color-mix(in srgb, var(--accent) 5%, var(--bg-elevated));
-  border-left: 3px solid color-mix(in srgb, var(--accent) 72%, var(--border));
+  background: var(--bg-elevated);
+  border-radius: var(--radius-card);
+  box-shadow: var(--elev-1);
   margin: var(--sp-4) 0;
 }
 

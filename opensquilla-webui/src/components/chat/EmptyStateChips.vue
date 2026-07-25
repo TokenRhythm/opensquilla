@@ -87,7 +87,22 @@ const chips = computed(() => {
   flex-direction: column;
   align-items: center;
   gap: var(--sp-2);
+  position: relative;
   text-align: center;
+}
+
+/* Dawn halo behind the greeting — themes without --atmosphere-dawn simply
+   render no halo. Kept behind text via z-index, never intercepts input. */
+.empty-state::before {
+  background: var(--atmosphere-dawn, transparent);
+  border-radius: var(--radius-full);
+  content: '';
+  filter: blur(48px);
+  inset: -34% -16%;
+  opacity: 0.55;
+  pointer-events: none;
+  position: absolute;
+  z-index: -1;
 }
 
 .empty-state__greeting {

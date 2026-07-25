@@ -1,49 +1,58 @@
-/* Theme: light (value) — L1 token block. Split out of base.css (P0).
-   Values unchanged. See src/themes/light/manifest.ts. */
-/* Light theme — neutral paper: white cards on a faintly-grey off-white field
-   (achromatic, the daylight analogue of the graphite dark). Spectrum darkened
-   for contrast on the light surface. */
+/* Theme: light (value) — L1 token block. See src/themes/light/manifest.ts. */
+/* Light theme — "Morning Mist" (晨雾): white cards floating on a cool mist-grey
+   field. Primary action is ink-black (pill buttons); color appears only in
+   small functional accents — blue = in progress (info), green = done (ok),
+   warm orange = status/brand (accent-secondary), violet = queued/templates.
+   Discipline: the four hues never cover large areas; the canvas stays
+   mist/paper/ink. */
 [data-theme="light"] {
-  /* Instrument light — a cool neutral off-white (faint graphite cast, not cream).
-     Cards are the brightest plane; separation comes from the --elev shadow +
-     the graduated border, not tint. */
-  --bg: #F4F5F7;
+  /* Mist neutrals — cool near-white field, pure-white cards. Separation comes
+     from the soft --elev shadow + hairline border, not tint. */
+  --bg: #F1F2F5;
   --bg-surface: #FFFFFF;
-  --bg-surface-2: #EDEFF2;
+  --bg-surface-2: #EBECF1;
   --bg-elevated: #FFFFFF;
-  --bg-hover: #E2E6EB;
-  --text: #15181C;
-  --text-muted: #565D66;
-  --text-dim: #6C737C;
-  --border: #D5D9DE;
-  --border-strong: #B9BFC7;
-  --border-focus: #9AA1AA;
+  --bg-hover: #E5E7ED;
+  --text: #1C1E24;
+  --text-muted: #565C68;
+  --text-dim: #6E7380;
+  --border: #E2E4EA;
+  --border-strong: #C9CDD6;
+  --border-focus: #9CA3B0;
   --card: #FFFFFF;
-  --hairline: #E4E7EB;
+  --hairline: #ECEDF1;
 
-  /* Strike darkened for AA (4.5:1) as text on the light canvas — accent is used
-     as `color:` for links/nav/inline status in 100+ sites, not only as a fill. */
-  --accent: #BA4D0F;
-  --accent-hover: #A5440C;
-  --accent-deep: #8E3A0A;
-  --accent-secondary: #B6501C;
+  /* Ink-black accent — the "black pill" primary. Interactive emphasis is
+     achromatic; hue is reserved for the semantic roles below. accent-secondary
+     is the warm brand orange, AA-darkened (4.5:1) for use as text. */
+  --accent: #1C1E24;
+  --accent-hover: #2E323B;
+  --accent-deep: #0C0D10;
+  --accent-secondary: #A34712;
   --accent-foreground: #FFFFFF;
 
-  /* Machined elevation (light) — soft neutral shadows + a graduated border do
-     the lifting; drop the inner white highlight (it reads as glare on paper). */
+  /* Mist elevation — thin hairline ring + soft, wide, low-opacity shadows
+     (floating paper, no glare). */
   --elev-highlight: rgba(255,255,255,0.9);
-  --elev-1: 0 0 0 1px var(--border), 0 1px 2px rgba(16,20,26,0.05), 0 4px 12px -4px rgba(16,20,26,0.10);
-  --elev-1-hover: 0 0 0 1px var(--border-strong), 0 2px 4px rgba(16,20,26,0.08), 0 10px 22px -6px rgba(16,20,26,0.14);
-  --elev-2: 0 0 0 1px var(--border-strong), 0 8px 24px -6px rgba(16,20,26,0.16);
-  --elev-3: 0 0 0 1px var(--border-strong), 0 16px 40px -10px rgba(16,20,26,0.22);
-  --ok: #0E7A52;
+  --elev-1: 0 0 0 1px var(--hairline), 0 1px 2px rgba(28,30,36,0.04), 0 6px 16px -6px rgba(28,30,36,0.06);
+  --elev-1-hover: 0 0 0 1px var(--border), 0 2px 6px rgba(28,30,36,0.05), 0 12px 28px -8px rgba(28,30,36,0.10);
+  --elev-2: 0 0 0 1px var(--border), 0 10px 30px -8px rgba(28,30,36,0.12);
+  --elev-3: 0 0 0 1px var(--border), 0 18px 48px -12px rgba(28,30,36,0.16);
+
+  /* Functional hues — AA ink versions (text on bg/surface); brighter siblings
+     live in the -fill roles for small non-text marks (dots, bars, chips). */
+  --ok: #257552;
+  --ok-fill: #2E8A5F;
   --warn: #8A6410;
   /* Light fills: a true amber that reads as "warn" at small sizes, where the
      text-AA-tuned dark --warn looks like olive/brown. */
   --warn-fill: #B2820B;
   --danger: #C2382E;
-  --info: #1E6E8C;
-  --queued: #5A48C0;
+  --danger-fill: #E0564A;
+  --info: #4353B8;
+  --info-fill: #6478D9;
+  --queued: #6B51C6;
+  --queued-fill: #8B6FE0;
 
   /* Syntax highlighting (chat code blocks) */
   --syntax-comment: #5F6B7A;
@@ -53,20 +62,27 @@
   --syntax-title: #1E55C7;
   --syntax-attr: #0E7490;
 
-  --shadow: rgba(0,0,0,0.10);
-  --shadow-color: rgba(0,0,0,0.10);
-  --scrim: rgba(0, 0, 0, 0.40);
-  --grain-opacity: 0.03;
+  --shadow: rgba(28,30,36,0.08);
+  --shadow-color: rgba(28,30,36,0.08);
+  --scrim: rgba(23, 24, 28, 0.40);
+  --grain-opacity: 0.02;
 
-  --sidebar-bg: #F2F2F3;
+  /* Dawn atmosphere — sky-blue melting into warm peach, the "morning" in
+     Morning Mist. Reserved for ceremony moments only (empty-state greeting,
+     onboarding, completion) — never behind operational UI. */
+  --atmosphere-dawn: linear-gradient(180deg, #D9E5F6 0%, #EEF0F5 48%, #F8E9D8 100%);
+
+  /* Sidebar sits on the mist field itself (no separate plate); rows brighten
+     to paper on hover/active. */
+  --sidebar-bg: #F1F2F5;
   --sidebar-control-bg: #FFFFFF;
-  --sidebar-control-hover: #F0F0F2;
-  --sidebar-item-hover: #ECECEE;
-  --sidebar-item-active: #E7E7EA;
-  --sidebar-text-strong: #18181A;
-  --sidebar-text: #56565A;
-  --sidebar-text-soft: #6C6C70;
-  --sidebar-border: #E4E4E7;
+  --sidebar-control-hover: #ECEDF1;
+  --sidebar-item-hover: #E7E9EE;
+  --sidebar-item-active: #E2E4EA;
+  --sidebar-text-strong: #1C1E24;
+  --sidebar-text: #565C68;
+  --sidebar-text-soft: #6E7480;
+  --sidebar-border: #EAEBF0;
 }
 
 /* Structural identity — light explicitly re-asserts the foundation type + radius

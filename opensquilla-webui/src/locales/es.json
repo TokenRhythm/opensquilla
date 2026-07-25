@@ -334,10 +334,10 @@
     "provider": {
       "title": "Proveedor",
       "pageTitle": "Servicio de modelos",
-      "pageDesc": "Conecta proveedores de modelos y gestiona credenciales, endpoints y el modelo directo/de respaldo. Decide cómo se usan los modelos en Enrutamiento de modelos.",
+      "pageDesc": "Conecta proveedores y gestiona sus credenciales y modelos.",
       "configuredTitle": "Proveedores configurados",
       "configuredCount": "{count}",
-      "configuredSummary": "{ready} de {count} credenciales disponibles. La verificación envía una pequeña solicitud y puede generar cargos.",
+      "configuredSummary": "{ready} de {count} listos. La prueba envía una pequeña solicitud.",
       "configuredDesc": "Los proveedores guardados siguen disponibles para el enrutamiento hasta que los elimines. La verificación de la configuración envía una solicitud breve al modelo con los ajustes guardados; el proveedor puede aplicar cargos.",
       "activeBadge": "Activo",
       "editingBadge": "Editando",
@@ -459,7 +459,6 @@
       "recommendation": {
         "title": "Recomendado: TokenRhythm",
         "value": "Las llamadas a la API de TokenRhythm son gratis por tiempo limitado.",
-        "registration": "Durante la promoción, regístrate y obtén una clave API para usar gratis DeepSeek, GLM, MiniMax, Kimi y otros modelos líderes.",
         "cta": "Registrarse y obtener una clave API",
         "externalLabel": "Registrarse y obtener una clave API — TokenRhythm (se abre en una pestaña nueva)",
         "stepsLabel": "Cómo conectar TokenRhythm",
@@ -606,42 +605,40 @@
     },
     "modelStrategy": {
       "title": "Enrutamiento de modelos",
-      "desc": "Elige cómo Squilla selecciona y usa los modelos configurados para las solicitudes nuevas.",
+      "desc": "Elige cómo se selecciona el modelo para cada solicitud.",
       "modeTitle": "Elige cómo usar los modelos",
-      "modeDesc": "Elige según el objetivo: el enrutamiento inteligente equilibra el uso de tokens y la capacidad; el modelo fijo mantiene una selección predecible; la colaboración entre varios modelos prioriza la capacidad en tareas complejas y suele usar más tokens.",
       "providerFirstTitle": "Añade primero un servicio de modelos",
-      "providerFirst": "El enrutamiento de modelos necesita al menos un proveedor guardado. Un solo proveedor basta para enrutar entre sus modelos configurados.",
+      "providerFirst": "El enrutado de modelos necesita al menos un proveedor guardado.",
       "providerAction": "Ir al servicio de modelos",
-      "configuredProvidersOnly": "Los proveedores y modelos disponibles proceden del servicio de modelos.",
+      "configuredProvidersOnly": "Los modelos provienen del Servicio de modelos.",
       "manageProviders": "Gestionar el servicio de modelos",
       "routerTitle": "Enrutamiento inteligente de modelos",
       "fallbackTierLabel": "Cuando el enrutamiento no esté seguro",
-      "fallbackTierDesc": "Usa este nivel predeterminado cuando el enrutamiento no pueda determinar con seguridad el nivel de la solicitud.",
+      "fallbackTierDesc": "Se usa cuando el enrutado no puede determinar el nivel.",
       "modelRolesTitle": "Roles de los modelos",
-      "modelRolesDesc": "Define qué modelo gestiona cada nivel de complejidad de las solicitudes.",
-      "advancedTitle": "Opciones de visualización",
-      "advancedDesc": "Cambia cómo aparece la información de enrutamiento en el chat sin afectar la selección de modelos.",
+      "advancedTitle": "Opciones avanzadas",
+      "advancedDesc": "Nivel de respaldo y presentación del enrutado en el chat.",
       "visualModeLabel": "Estilo del panel de decisión de enrutamiento",
-      "visualModeDesc": "Elige cómo aparece el panel de decisión de enrutamiento en las respuestas del chat. Esto no cambia el comportamiento del enrutamiento.",
+      "visualModeDesc": "Cómo se muestra la decisión de enrutado en las respuestas.",
       "crossProviderNotice": "El routing entre proveedores está activo. Revisa cada nivel antes de guardar.",
       "cards": {
         "router": {
           "title": "Enrutamiento inteligente de modelos",
           "badge": "Uso eficiente de tokens",
-          "desc": "Asigna un modelo adecuado a cada solicitud para evitar usar modelos de mayor capacidad en tareas sencillas."
+          "desc": "Cada solicitud va a un modelo adecuado; las tareas simples salen baratas."
         },
         "ensemble": {
           "title": "Colaboración entre varios modelos",
           "badge": "Prioriza capacidad",
-          "desc": "Ejecuta varios modelos en paralelo y combina sus resultados para tareas complejas; normalmente usa más tokens."
+          "desc": "Varios modelos colaboran en tareas complejas. Usa más tokens."
         },
         "single": {
           "title": "Modelo fijo",
           "badge": "Predecible",
-          "desc": "Usa siempre el modelo que elijas, por lo que la selección y el consumo son más fáciles de prever."
+          "desc": "Un solo modelo para todo. Predecible y simple."
         }
       },
-      "routerDependency": "Elige modelos para cada nivel de solicitud. Un proveedor puede cubrir todos los niveles.",
+      "routerDependency": "Elige un modelo para cada nivel de solicitud. Un solo proveedor puede cubrirlos todos.",
       "ensembleTitle": "Colaboración entre varios modelos",
       "ensembleDependency": "Usa credenciales de {provider}; el modelo predeterminado del proveedor es {model}.",
       "ensembleMinimum": "Agrega al menos otro candidato para aprovechar el enrutamiento agregado.",
@@ -669,7 +666,7 @@
       "removeCandidateAria": "Quitar {model}",
       "ensembleEmpty": "Aún no hay modelos candidatos. Guarda la configuración del servicio de modelos para generar niveles de enrutamiento, o agrega candidatos manualmente.",
       "ensemblePipeline": "Cómo funciona: los modelos proponentes redactan en paralelo y el agregador fusiona los borradores en la respuesta final. Solo el agregador puede invocar herramientas.",
-      "ensembleFlowDesc": "Varios modelos redactan en paralelo y un agregador combina su trabajo en una respuesta final. Esto usa más llamadas de modelos y puede costar más.",
+      "ensembleFlowDesc": "Varios modelos redactan en paralelo y un agregador las combina en una respuesta. Usa más llamadas.",
       "legacyDynamicNotice": "Esta configuración usa el modo de ensamble automático retirado. Conviértela en una alineación personalizada para seguir editándola.",
       "legacyDynamicMigrate": "Convertir en alineación personalizada",
       "schemeLabel": "Esquema de ensamble",
