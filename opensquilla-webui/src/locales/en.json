@@ -144,7 +144,8 @@
       "themeLabel": "Theme",
       "themeDesc": "Follow your system, or force light or dark. The sidebar toggle is a shortcut to this same setting.",
       "languageLabel": "Language",
-      "languageDesc": "Display language for the interface. Applies instantly to this browser.",
+      "languageDesc": "Display language for the interface and channel system notices. Applies instantly here and saves the Gateway-wide notice language.",
+      "channelNoticeLocaleSyncPending": "The interface language changed, but the channel system-message language has not been saved yet. It will retry when the Gateway reconnects.",
       "toolDetailsLabel": "Tool details by default",
       "toolDetailsDesc": "Auto follows the tool type; Compact collapses ordinary tools; Expanded opens them. Errors open automatically by default and can still be collapsed.",
       "toolDetailsAuto": "Auto",
@@ -811,7 +812,7 @@
         "credentials_link": "Open credentials page (App id / App secret)",
         "quick_apply_link": "Pre-fill the permission request for all required scopes",
         "needAppId": "fill in App id first",
-        "ws_order_note": "You're connected — one step left in the Feishu console: open 事件与回调 and switch event delivery to 使用长连接接收事件. The console only saves that choice while a client is connected, which is why it comes after this save. This notice clears once the first event arrives."
+        "ws_order_note": "Check event subscription in the Feishu console: open 事件与回调 and confirm event delivery is set to 使用长连接接收事件. This notice appears while the WebSocket is connected and no inbound event has been recorded; it does not by itself mean the console is misconfigured. It clears after the first event arrives."
       }
     },
     "search": {
@@ -1941,7 +1942,7 @@
         "capabilityReference": "Capability reference",
         "copyBotId": "Copy bot ID: {id}",
         "botIdCopied": "Bot ID copied",
-        "finalStepTitle": "Final step in the Feishu console"
+        "eventSubscriptionTitle": "Check Feishu event subscription"
       }
     },
     "overview": {

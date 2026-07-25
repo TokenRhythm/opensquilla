@@ -74,3 +74,10 @@ def test_catalog_payload_serializes_setup_aids() -> None:
     # Channels without aids serialize an empty list, not a missing key.
     slack = next(row for row in channel_catalog_payload() if row["type"] == "slack")
     assert slack["setupAids"] == []
+
+
+def test_headless_help_treats_zero_ingress_as_guidance_not_proof() -> None:
+    help_text = get_channel_setup_spec("feishu").help
+    assert "check Event & Callbacks" in help_text
+    assert "zero ingress count alone does not prove" in help_text
+    assert "only persists that choice" not in help_text

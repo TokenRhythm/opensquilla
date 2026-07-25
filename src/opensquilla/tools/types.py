@@ -129,6 +129,11 @@ class ToolContext:
     # guidance pointing at <scratch_dir>/verify-mirror/<workspace-relative-path>.
     scratch_verify_mirror_active: bool = False
 
+    # Set only by the authenticated channel ingress boundary. Keeping this
+    # separate from ``is_owner`` prevents a generic owner-context leak from
+    # promoting a channel caller through the admin-only tool matrix.
+    channel_admin_verified: bool = False
+
     def __post_init__(self) -> None:
         self.validate_path_roots()
 

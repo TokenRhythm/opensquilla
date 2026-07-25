@@ -144,8 +144,9 @@ class ControlUiConfig(BaseSettings):
     # ``legacy`` spelling to it with a deprecation warning.
     frontend: Literal["vue"] = "vue"
     # Default UI locale served on first paint when the browser has no saved
-    # preference. The client (localStorage) and a manual switch always override
-    # it. Anything zh* clamps to zh-Hans; anything else to en.
+    # preference, and the Gateway-wide language for fixed channel notices.
+    # The client (localStorage) and a manual switch always override it. Anything
+    # zh* clamps to zh-Hans; anything else to en.
     default_locale: Literal["en", "zh-Hans", "ja", "fr", "de", "es"] = "en"
     allowed_origins: list[str] = Field(default_factory=list)
 

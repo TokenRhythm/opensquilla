@@ -13,6 +13,11 @@ from opensquilla.sandbox.permissions import FileSystemPermissionProfile
 SandboxPermissionIntent = Literal["use_default", "require_escalated"]
 ApprovalReviewerName = Literal["user", "auto_review"]
 
+_CHANNEL_APPROVAL_ROUTING_UNAVAILABLE = (
+    "This elevated action cannot request channel approval because the authenticated "
+    "administrator sender or session route is unavailable."
+)
+
 
 @dataclass(frozen=True)
 class ElevationAction:
@@ -149,12 +154,80 @@ class ElevationGateResult:
         return payload
 
 
+def _active_channel_context() -> Any | None:
+    """Return the active Channel context without trusting generic owner state."""
+
+    try:
+        from opensquilla.tools.types import CallerKind, current_tool_context
+
+        ctx = current_tool_context.get()
+    except Exception:  # pragma: no cover - defensive context lookup
+        return None
+    if ctx is None:
+        return None
+    caller_kind = getattr(ctx, "caller_kind", None)
+    if caller_kind is CallerKind.CHANNEL or str(caller_kind) == CallerKind.CHANNEL.value:
+        return ctx
+    return None
+
+
+def channel_admin_approval_identity() -> tuple[str, str] | None:
+    """Return the authenticated sender/session binding for a Channel admin.
+
+    The ingress boundary alone sets ``channel_admin_verified``.  Requiring it
+    here prevents an internally constructed ``is_owner`` Channel context from
+    creating an approval whose recipient cannot be authenticated on reply.
+    """
+
+    ctx = _active_channel_context()
+    if (
+        ctx is None
+        or not bool(getattr(ctx, "is_owner", False))
+        or not bool(getattr(ctx, "channel_admin_verified", False))
+    ):
+        return None
+    sender_id = str(getattr(ctx, "sender_id", "") or "").strip()
+    session_key = str(getattr(ctx, "session_key", "") or "").strip()
+    if not sender_id or not session_key:
+        return None
+    return sender_id, session_key
+
+
+def _channel_elevation_metadata(
+    *,
+    session_key: str | None,
+    metadata: dict[str, object] | None,
+) -> tuple[dict[str, object], ElevationGateResult | None]:
+    """Bind a Channel elevation request to its verified approval recipient."""
+
+    if _active_channel_context() is None:
+        return dict(metadata or {}), None
+
+    identity = channel_admin_approval_identity()
+    requested_session_key = str(session_key or "").strip()
+    if identity is None or not requested_session_key or requested_session_key != identity[1]:
+        return {}, ElevationGateResult(
+            requested=False,
+            allowed=False,
+            status="approval_denied",
+            reason=_CHANNEL_APPROVAL_ROUTING_UNAVAILABLE,
+        )
+
+    routed_metadata = dict(metadata or {})
+    # Do not let a call-site supplied metadata value select a different
+    # recipient. The authenticated ingress identity is the only authority.
+    routed_metadata["senderId"] = identity[0]
+    return routed_metadata, None
+
+
 def _pending_elevation_id(
     queue: ApprovalQueue,
     *,
     fingerprint: str,
     session_key: str | None,
+    sender_id: str | None,
 ) -> str | None:
+    expected_sender_id = str(sender_id or "").strip()
     for pending in queue.list_pending("exec"):
         params = pending.get("params")
         if not isinstance(params, dict):
@@ -164,6 +237,8 @@ def _pending_elevation_id(
         if str(params.get("fingerprint") or "") != fingerprint:
             continue
         if str(params.get("sessionKey") or "") != str(session_key or ""):
+            continue
+        if str(params.get("senderId") or "").strip() != expected_sender_id:
             continue
         approval_id = str(pending.get("id") or "")
         if approval_id:
@@ -185,11 +260,19 @@ def request_elevation(
         raise ValueError("require_escalated_required")
     if not action.justification.strip():
         raise ValueError("justification_required")
+    routed_metadata, routing_denial = _channel_elevation_metadata(
+        session_key=session_key,
+        metadata=metadata,
+    )
+    if routing_denial is not None:
+        return routing_denial
+
     fingerprint = action.fingerprint()
     pending_id = _pending_elevation_id(
         queue,
         fingerprint=fingerprint,
         session_key=session_key,
+        sender_id=str(routed_metadata.get("senderId") or ""),
     )
     if pending_id is not None:
         return ElevationGateResult(
@@ -207,7 +290,7 @@ def request_elevation(
         "action": action.canonical_payload(),
         "sessionKey": str(session_key or ""),
     }
-    for key, value in (metadata or {}).items():
+    for key, value in routed_metadata.items():
         if key not in params:
             params[str(key)] = value
     approval_id = queue.request(
@@ -228,6 +311,7 @@ def consume_approved_elevation(
     action: ElevationAction,
     *,
     expected_session_key: str | None = None,
+    expected_sender_id: str | None = None,
 ) -> ElevationGateResult:
     """Validate and consume an approved grant before its side effect starts."""
 
@@ -257,6 +341,16 @@ def consume_approved_elevation(
             status="approval_session_mismatch",
             approval_id=approval_id,
             reason="approval_session_mismatch",
+        )
+    if expected_sender_id is not None and str(
+        entry.params.get("senderId") or ""
+    ).strip() != str(expected_sender_id or "").strip():
+        return ElevationGateResult(
+            requested=True,
+            allowed=False,
+            status="approval_sender_mismatch",
+            approval_id=approval_id,
+            reason="approval_sender_mismatch",
         )
     if not entry.resolved:
         return ElevationGateResult(
@@ -341,6 +435,14 @@ def gate_elevated_action(
             "ApprovalReviewerName",
             configured if configured in {"user", "auto_review"} else "auto_review",
         )
+    routed_metadata, routing_denial = _channel_elevation_metadata(
+        session_key=session_key,
+        metadata=metadata,
+    )
+    if routing_denial is not None:
+        return routing_denial
+    expected_sender_id = str(routed_metadata.get("senderId") or "").strip() or None
+
     if approval_id:
         try:
             return consume_approved_elevation(
@@ -348,6 +450,7 @@ def gate_elevated_action(
                 approval_id,
                 action,
                 expected_session_key=session_key,
+                expected_sender_id=expected_sender_id,
             )
         except KeyError:
             reason = "approval not found"
@@ -365,7 +468,7 @@ def gate_elevated_action(
         action,
         session_key=session_key,
         reviewer=reviewer,
-        metadata=metadata,
+        metadata=routed_metadata,
     )
 
 
@@ -374,6 +477,7 @@ __all__ = [
     "ElevationAction",
     "ElevationGateResult",
     "SandboxPermissionIntent",
+    "channel_admin_approval_identity",
     "consume_approved_elevation",
     "gate_elevated_action",
     "request_elevation",

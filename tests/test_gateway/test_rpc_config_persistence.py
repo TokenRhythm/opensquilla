@@ -173,6 +173,21 @@ async def test_routing_mode_toggle_persists_only_its_paths(cfg_path) -> None:
     assert "auth" not in data
 
 
+async def test_safe_patch_persists_the_gateway_channel_notice_locale(cfg_path) -> None:
+    _write_small_config(cfg_path)
+    cfg = GatewayConfig.load(str(cfg_path))
+
+    result = await _handle_config_patch_safe(
+        {"patches": {"control_ui.default_locale": "zh-Hans"}},
+        _ctx(cfg),
+    )
+
+    assert result["restartRequired"] is False
+    assert cfg.control_ui.default_locale == "zh-Hans"
+    data = tomllib.loads(cfg_path.read_text())
+    assert data["control_ui"]["default_locale"] == "zh-Hans"
+
+
 # --- set-heartbeats (third _persist_config caller) -----------------------------
 
 

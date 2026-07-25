@@ -15,7 +15,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from opensquilla.channels._util import sender_is_channel_admin
+from opensquilla.channels.admission import has_verified_channel_admin_stamp
+from opensquilla.channels.system_messages import ChannelSystemMessageKey, render_channel_message
 from opensquilla.channels.types import OutgoingMessage
 from opensquilla.engine.commands import DEFAULT_REGISTRY, ExecutionKind, ParamsFactory, Surface
 from opensquilla.gateway.auth import Principal
@@ -58,6 +59,7 @@ class CommandRegistry:
         message_content: str,
         rpc_dispatcher: Any,
         context_factory: Any,
+        config: Any = None,
     ) -> OutgoingMessage | None:
         match = self.match(envelope, message_content)
         if match is None:
@@ -71,7 +73,7 @@ class CommandRegistry:
         )
         if params is None:
             return OutgoingMessage(
-                content="Usage: /sandbox standard | trusted | full",
+                content=render_channel_message("command_usage_sandbox", config=config),
                 reply_to=envelope.thread_id or envelope.channel_id,
                 metadata={"command": name, "method": method, "denied": False},
             )
@@ -87,6 +89,7 @@ class CommandRegistry:
             method=method,
             res=res,
             reply_to=reply_to,
+            config=config,
         )
         if sandbox_reply is not None:
             return sandbox_reply
@@ -95,6 +98,7 @@ class CommandRegistry:
             method=method,
             res=res,
             reply_to=reply_to,
+            config=config,
         )
         if compact_reply is not None:
             return compact_reply
@@ -103,14 +107,22 @@ class CommandRegistry:
             method=method,
             res=res,
             reply_to=reply_to,
+            config=config,
         )
         if meta_reply is not None:
             return meta_reply
         denied = bool(not res.ok and getattr(res.error, "code", "") == "UNAUTHORIZED")
         reason = "" if res.ok else f": {getattr(res.error, 'message', 'command failed')}"
-        state = "completed" if res.ok else ("denied" if denied else "failed")
+        if res.ok:
+            message_key: ChannelSystemMessageKey = "command_completed"
+        elif denied:
+            message_key = "command_denied"
+        else:
+            message_key = "command_failed"
         return OutgoingMessage(
-            content=f"/{name} {state}{reason}",
+            content=render_channel_message(
+                message_key, config=config, name=name, reason=reason
+            ),
             reply_to=envelope.thread_id or envelope.channel_id,
             metadata={"command": name, "method": method, "denied": denied},
         )
@@ -141,6 +153,7 @@ def _format_channel_sandbox_reply(
     method: str,
     res: Any,
     reply_to: str | None,
+    config: Any = None,
 ) -> OutgoingMessage | None:
     if name != "sandbox" or method != "sandbox.run_context.set":
         return None
@@ -148,21 +161,28 @@ def _format_channel_sandbox_reply(
     metadata = {"command": name, "method": method, "denied": denied}
     if not res.ok:
         error_message = getattr(res.error, "message", "command failed")
-        state = "denied" if denied else "failed"
+        message_key: ChannelSystemMessageKey = (
+            "command_sandbox_denied" if denied else "command_sandbox_failed"
+        )
         return OutgoingMessage(
-            content=f"Sandbox mode {state}: {error_message}",
+            content=render_channel_message(
+                message_key, config=config, reason=error_message
+            ),
             reply_to=reply_to,
             metadata=metadata,
         )
     payload = res.payload if isinstance(res.payload, dict) else {}
     run_mode = str(payload.get("runMode") or "").strip()
-    label = {
-        "standard": "Standard-Sandbox",
-        "trusted": "Managed Execution",
-        "full": "Full Host Access",
-    }.get(run_mode, run_mode or "updated")
+    if run_mode == "standard":
+        label = render_channel_message("command_sandbox_standard", config=config)
+    elif run_mode == "trusted":
+        label = render_channel_message("command_sandbox_trusted", config=config)
+    elif run_mode == "full":
+        label = render_channel_message("command_sandbox_full", config=config)
+    else:
+        label = run_mode or render_channel_message("command_sandbox_unknown_mode", config=config)
     return OutgoingMessage(
-        content=f"Sandbox mode set to {label}.",
+        content=render_channel_message("command_sandbox_updated", config=config, mode=label),
         reply_to=reply_to,
         metadata=metadata,
     )
@@ -174,6 +194,7 @@ def _format_channel_compact_reply(
     method: str,
     res: Any,
     reply_to: str | None,
+    config: Any = None,
 ) -> OutgoingMessage | None:
     if name != "compact" or method != "sessions.contextCompact":
         return None
@@ -181,9 +202,13 @@ def _format_channel_compact_reply(
     metadata = {"command": name, "method": method, "denied": denied}
     if not res.ok:
         error_message = getattr(res.error, "message", "command failed")
-        state = "denied" if denied else "failed"
+        message_key: ChannelSystemMessageKey = (
+            "command_compact_denied" if denied else "command_compact_failed"
+        )
         return OutgoingMessage(
-            content=f"Compact {state}: {error_message}",
+            content=render_channel_message(
+                message_key, config=config, reason=error_message
+            ),
             reply_to=reply_to,
             metadata=metadata,
         )
@@ -192,18 +217,18 @@ def _format_channel_compact_reply(
     compacted = bool(payload.get("compacted"))
     if compacted or status == "completed":
         return OutgoingMessage(
-            content="Context compacted.",
+            content=render_channel_message("command_compact_completed", config=config),
             reply_to=reply_to,
             metadata=metadata,
         )
     if status == "skipped" or payload.get("compacted") is False:
         return OutgoingMessage(
-            content="Already within context budget; no compact was applied.",
+            content=render_channel_message("command_compact_skipped", config=config),
             reply_to=reply_to,
             metadata=metadata,
         )
     return OutgoingMessage(
-        content="/compact completed",
+        content=render_channel_message("command_completed", config=config, name="compact"),
         reply_to=reply_to,
         metadata=metadata,
     )
@@ -215,6 +240,7 @@ def _format_channel_meta_list_reply(
     method: str,
     res: Any,
     reply_to: str | None,
+    config: Any = None,
 ) -> OutgoingMessage | None:
     if name != "meta" or method != "meta.list":
         return None
@@ -222,9 +248,13 @@ def _format_channel_meta_list_reply(
     metadata = {"command": name, "method": method, "denied": denied}
     if not res.ok:
         error_message = getattr(res.error, "message", "command failed")
-        state = "denied" if denied else "failed"
+        message_key: ChannelSystemMessageKey = (
+            "command_meta_denied" if denied else "command_meta_failed"
+        )
         return OutgoingMessage(
-            content=f"/meta {state}: {error_message}",
+            content=render_channel_message(
+                message_key, config=config, reason=error_message
+            ),
             reply_to=reply_to,
             metadata=metadata,
         )
@@ -232,11 +262,11 @@ def _format_channel_meta_list_reply(
     skills = payload.get("skills") if isinstance(payload.get("skills"), list) else []
     if payload.get("disabled") or not skills:
         return OutgoingMessage(
-            content="No meta-skills available.",
+            content=render_channel_message("command_meta_empty", config=config),
             reply_to=reply_to,
             metadata=metadata,
         )
-    lines = ["Available meta-skills:"]
+    lines = [render_channel_message("command_meta_heading", config=config)]
     for skill in skills:
         if not isinstance(skill, dict):
             continue
@@ -257,12 +287,10 @@ def build_channel_rpc_context(
     gateway_config: Any,
     **handles: Any,
 ) -> RpcContext:
-    admin_senders = getattr(gateway_config, "channel_admin_senders", {})
     sender_id = envelope.sender_id
-    is_operator = sender_is_channel_admin(
-        sender_id,
-        configured=admin_senders.get(envelope.source_name, []),
-    )
+    # The dispatcher has already checked authenticated ingress and stamped
+    # the route. Never recompute operator standing from a raw sender ID here.
+    is_operator = has_verified_channel_admin_stamp(envelope)
     principal = Principal(
         role="operator" if is_operator else "viewer",
         scopes=frozenset({READ_SCOPE, WRITE_SCOPE}) if is_operator else frozenset(),

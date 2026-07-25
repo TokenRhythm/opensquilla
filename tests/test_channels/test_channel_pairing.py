@@ -11,7 +11,7 @@ import pytest
 
 import opensquilla.gateway.rpc_channels  # noqa: F401
 from opensquilla.channels._util import ChannelAccessPolicy, ChannelDmAccess
-from opensquilla.channels.admission import decide_channel_admission
+from opensquilla.channels.admission import decide_channel_admission, is_authenticated_channel_admin
 from opensquilla.channels.delivery_store import ChannelDeliveryStore
 from opensquilla.channels.manager import ChannelManager
 from opensquilla.channels.types import (
@@ -24,8 +24,10 @@ from opensquilla.channels.types import (
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.channel_dispatch import run_channel_dispatch
 from opensquilla.gateway.config import (
+    ControlUiConfig,
     DingTalkChannelEntry,
     DiscordChannelEntry,
+    GatewayConfig,
     MatrixChannelEntry,
     QQChannelEntry,
 )
@@ -73,6 +75,100 @@ def test_authenticated_dm_defaults_to_durable_pending_pairing(tmp_path: Path) ->
     assert record.status == "pending"
     assert record.sender_id == "user-42"
     assert record.sender_name == "Alice"
+    store.close()
+
+
+def test_authenticated_configured_admin_skips_pairing_without_creating_a_row(
+    tmp_path: Path,
+) -> None:
+    store = ChannelDeliveryStore(tmp_path / "delivery.sqlite")
+    channel = _Channel()
+    channel._delivery_store = store
+    channel._delivery_channel_name = "telegram-main"
+    config = SimpleNamespace(channel_admin_senders={"telegram-main": ["user-42"]})
+
+    decision = decide_channel_admission(
+        channel,
+        _message(),
+        "agent:main:telegram:dm:user-42",
+        config=config,
+        channel_name="telegram-main",
+    )
+
+    assert decision.admit is True
+    assert decision.reason == "dm_admitted"
+    assert store.list_pairings(channel_name="telegram-main") == []
+    store.close()
+
+
+@pytest.mark.parametrize(
+    ("message", "config", "channel_name", "expected"),
+    [
+        (
+            _message(),
+            SimpleNamespace(channel_admin_senders={"other-entry": ["user-42"]}),
+            "telegram-main",
+            False,
+        ),
+        (
+            _message().model_copy(
+                update={
+                    "provenance": IngressProvenance(
+                        provider="telegram",
+                        account_id="bot-account",
+                        verification=IngressVerification.OAUTH_TOKEN,
+                        principal=AuthenticatedPrincipal(subject_id="different-user"),
+                    )
+                }
+            ),
+            SimpleNamespace(channel_admin_senders={"telegram-main": ["user-42"]}),
+            "telegram-main",
+            False,
+        ),
+        (
+            _message().model_copy(update={"provenance": IngressProvenance()}),
+            SimpleNamespace(channel_admin_senders={"telegram-main": ["user-42"]}),
+            "telegram-main",
+            False,
+        ),
+    ],
+    ids=["wrong-channel-entry", "principal-mismatch", "unverified"],
+)
+def test_channel_admin_requires_authenticated_matching_provenance(
+    message: IncomingMessage,
+    config: SimpleNamespace,
+    channel_name: str,
+    expected: bool,
+) -> None:
+    assert (
+        is_authenticated_channel_admin(
+            config,
+            channel_name=channel_name,
+            msg=message,
+        )
+        is expected
+    )
+
+
+def test_wrong_channel_admin_entry_still_creates_a_pairing_request(tmp_path: Path) -> None:
+    store = ChannelDeliveryStore(tmp_path / "delivery.sqlite")
+    channel = _Channel()
+    channel._delivery_store = store
+    channel._delivery_channel_name = "telegram-main"
+
+    decision = decide_channel_admission(
+        channel,
+        _message(),
+        "agent:main:telegram:dm:user-42",
+        config=SimpleNamespace(channel_admin_senders={"other-entry": ["user-42"]}),
+        channel_name="telegram-main",
+    )
+
+    assert decision.admit is False
+    assert decision.reason == "pairing_required"
+    assert [record.sender_id for record in store.list_pairings(channel_name="telegram-main")] == [
+        "user-42"
+    ]
     store.close()
 
 
@@ -272,11 +368,12 @@ async def test_pending_pairing_notice_precedes_all_session_and_tool_side_effects
             session_manager=Forbidden(),
             session_key_builder=lambda _msg: "agent:main:telegram:dm:user-42",
             session_prefix="telegram-main",
+            config=GatewayConfig(control_ui=ControlUiConfig(default_locale="zh-Hans")),
         )
 
     assert len(channel.sent) == 1
     notice = channel.sent[0]
-    assert "pairing" in notice.content.lower()
+    assert notice.content.startswith("需要访问审批。配对申请：")
     assert "private input" not in notice.content
     assert notice.metadata["pairing_required"] is True
     assert len(notice.metadata["pairing_code"]) == 8

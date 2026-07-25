@@ -25,6 +25,7 @@ from pydantic import BaseModel
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
+from websockets.protocol import State as WebSocketState
 
 from opensquilla.channels._attachment_io import (
     attachment_limit_for_mime,
@@ -56,6 +57,7 @@ from opensquilla.channels.types import (
     OutgoingMessage,
 )
 from opensquilla.env import trust_env as _trust_env
+from opensquilla.redaction import redact_error_text
 
 log = structlog.get_logger(__name__)
 
@@ -65,8 +67,7 @@ _MARKDOWN_BULLET_RE = re.compile(r"^(\s*)[-*+]\s+")
 _MARKDOWN_BOLD_RE = re.compile(r"(\*\*|__)(.*?)\1")
 _MARKDOWN_INLINE_CODE_RE = re.compile(r"`([^`]+)`")
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
-_FEISHU_WS_STARTUP_TIMEOUT_S = 1.0
-_FEISHU_WS_STARTUP_GRACE_S = 0.05
+_FEISHU_WS_STARTUP_TIMEOUT_S = 15.0
 _FEISHU_WS_JOIN_TIMEOUT_S = 1.0
 _FEISHU_WS_SINGLETON_LOCK = threading.Lock()
 _FEISHU_WS_ACTIVE_TRANSPORT: FeishuWebSocketTransport | None = None
@@ -228,8 +229,60 @@ def _coerce_sdk_event_dict(event: Any, *, lark: Any | None = None) -> dict[str, 
     raise TypeError(f"Unsupported Feishu SDK event object: {type(event)!r}")
 
 
-class FeishuAuthError(Exception):
-    """Raised when Feishu token acquisition or refresh fails."""
+def _feishu_sdk_websocket_state(ws_client: Any | None) -> WebSocketState | None:
+    """Read lark-oapi's current connection state through one compatibility boundary.
+
+    lark-oapi doesn't expose connection health publicly. Keep its private
+    ``_conn`` compatibility boundary in one place and fail closed when either
+    the SDK layout or the websockets state contract isn't recognized.
+    """
+    if ws_client is None:
+        return None
+    try:
+        connection = getattr(ws_client, "_conn")
+        state = getattr(connection, "state")
+    except Exception:
+        return None
+    return state if isinstance(state, WebSocketState) else None
+
+
+def _feishu_sdk_websocket_is_open(ws_client: Any | None) -> bool:
+    """Return whether lark-oapi has a connection proven to be open."""
+    return _feishu_sdk_websocket_state(ws_client) is WebSocketState.OPEN
+
+
+class _FeishuWebSocketRuntimeError(RuntimeError):
+    """Secret-free worker failure carrying the channel diagnostic contract."""
+
+    def __init__(self, diagnostic: dict[str, Any]) -> None:
+        self.diagnostic = dict(diagnostic)
+        super().__init__(str(diagnostic["message"]))
+
+
+class FeishuAuthError(RuntimeError):
+    """Raised when Feishu rejects channel authentication during startup."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        config: Any | None = None,
+        provider_code: str | int | None = None,
+    ) -> None:
+        if isinstance(config, FeishuChannelConfig):
+            message = _redact_feishu_error_text(
+                config,
+                message,
+                fallback="Feishu credentials were rejected",
+            )
+        self.diagnostic: dict[str, str | bool] = {
+            "error_class": "auth_invalid",
+            "message": message,
+            "retryable": False,
+        }
+        if provider_code is not None:
+            self.diagnostic["provider_code"] = str(provider_code)
+        super().__init__(message)
 
 
 class FeishuApiError(Exception):
@@ -245,6 +298,35 @@ class FeishuApiError(Exception):
         self.code = code
         self.data = data or {}
         super().__init__(msg)
+
+
+def _classify_feishu_websocket_error(error: BaseException) -> tuple[str, bool]:
+    """Classify SDK startup failures without importing its private exception API.
+
+    ``lark-oapi`` raises ``ClientException`` when the long-connection endpoint
+    rejects app credentials (and when credentials are absent). Its transient
+    server failures use distinct exception types, so treating only that SDK
+    exception as terminal prevents an invalid app secret from entering the
+    gateway's automatic retry loop.
+    """
+    if isinstance(error, FeishuAuthError):
+        return "auth_invalid", False
+
+    error_type = type(error)
+    if (
+        error_type.__name__ == "ClientException"
+        and error_type.__module__.startswith("lark_oapi.ws")
+    ):
+        return "auth_invalid", False
+
+    response = getattr(error, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if not isinstance(status_code, int):
+        status_code = getattr(error, "status_code", None)
+    if status_code in {401, 403}:
+        return "auth_invalid", False
+
+    return "transport_transient", True
 
 
 class FeishuChannelConfig(BaseModel):
@@ -264,6 +346,31 @@ class FeishuChannelConfig(BaseModel):
     status_reactions_enabled: bool = False
 
     model_config = {}  # explicit params only; no env loading
+
+
+def _redact_feishu_error_text(
+    config: FeishuChannelConfig,
+    error: BaseException | str,
+    *,
+    additional_secrets: tuple[str, ...] = (),
+    fallback: str = "Feishu channel operation failed",
+) -> str:
+    known_secrets = (
+        config.app_id,
+        config.app_secret,
+        config.encrypt_key,
+        config.verification_token,
+        config.default_chat_id,
+        *additional_secrets,
+    )
+    return (
+        redact_error_text(
+            str(error),
+            max_len=500,
+            known_secrets=known_secrets,
+        )
+        or fallback
+    )
 
 
 @dataclass
@@ -383,8 +490,8 @@ class FeishuWebSocketTransport:
         self._handler: InboundEventHandler | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
-        self._connected = False
-        self._last_error: str | None = None
+        self._has_opened_connection = False
+        self._last_error: dict[str, Any] | None = None
         self._ws_client: Any | None = None
         self._lark: Any | None = None
         self._stop_requested = threading.Event()
@@ -397,52 +504,61 @@ class FeishuWebSocketTransport:
         self._handler = handler
         self._loop = asyncio.get_running_loop()
         self._stop_requested.clear()
+        self._has_opened_connection = False
+        self._last_error = None
 
-        builder = lark.EventDispatcherHandler.builder(
-            self.config.encrypt_key or "",
-            self.config.verification_token or "",
-        ).register_p2_im_message_receive_v1(self._on_message_sync)
-        builder = self._register_optional_event(
-            builder,
-            "register_p2_im_message_message_read_v1",
-            self._ignore_message_read_sync,
-        )
-        for registrar_name, event_type in (
-            ("register_p2_im_chat_member_bot_added_v1", "im.chat.member.bot.added_v1"),
-            ("register_p2_im_chat_member_bot_deleted_v1", "im.chat.member.bot.deleted_v1"),
-            ("register_p2_im_message_reaction_created_v1", "im.message.reaction.created_v1"),
-            ("register_p2_im_message_reaction_deleted_v1", "im.message.reaction.deleted_v1"),
-            ("register_p2_card_action_trigger", "card.action.trigger"),
-        ):
+        try:
+            builder = lark.EventDispatcherHandler.builder(
+                self.config.encrypt_key or "",
+                self.config.verification_token or "",
+            ).register_p2_im_message_receive_v1(self._on_message_sync)
             builder = self._register_optional_event(
                 builder,
-                registrar_name,
-                self._event_callback(event_type),
+                "register_p2_im_message_message_read_v1",
+                self._ignore_message_read_sync,
             )
-        event_handler = builder.build()
+            for registrar_name, event_type in (
+                ("register_p2_im_chat_member_bot_added_v1", "im.chat.member.bot.added_v1"),
+                ("register_p2_im_chat_member_bot_deleted_v1", "im.chat.member.bot.deleted_v1"),
+                ("register_p2_im_message_reaction_created_v1", "im.message.reaction.created_v1"),
+                ("register_p2_im_message_reaction_deleted_v1", "im.message.reaction.deleted_v1"),
+                ("register_p2_card_action_trigger", "card.action.trigger"),
+            ):
+                builder = self._register_optional_event(
+                    builder,
+                    registrar_name,
+                    self._event_callback(event_type),
+                )
+            event_handler = builder.build()
 
-        domain = (
-            getattr(lark, "LARK_DOMAIN", None)
-            if self.config.domain == "lark"
-            else getattr(lark, "FEISHU_DOMAIN", None)
-        )
-        kwargs: dict[str, Any] = {
-            "event_handler": event_handler,
-            "log_level": lark.LogLevel.INFO,
-        }
-        if domain is not None:
-            kwargs["domain"] = domain
+            domain = (
+                getattr(lark, "LARK_DOMAIN", None)
+                if self.config.domain == "lark"
+                else getattr(lark, "FEISHU_DOMAIN", None)
+            )
+            kwargs: dict[str, Any] = {
+                "event_handler": event_handler,
+                "log_level": lark.LogLevel.INFO,
+            }
+            if domain is not None:
+                kwargs["domain"] = domain
 
-        self._ws_client = lark.ws.Client(
-            self.config.app_id,
-            self.config.app_secret,
-            **kwargs,
-        )
-        ws_client = self._ws_client
-        if ws_client is None:
-            raise RuntimeError("Feishu WebSocket client failed to initialize")
+            self._ws_client = lark.ws.Client(
+                self.config.app_id,
+                self.config.app_secret,
+                **kwargs,
+            )
+            ws_client = self._ws_client
+            if ws_client is None:
+                raise RuntimeError("Feishu WebSocket client failed to initialize")
+        except Exception as exc:
+            diagnostic = self._record_error(exc)
+            self._handler = None
+            self._loop = None
+            self._lark = None
+            self._ws_client = None
+            raise _FeishuWebSocketRuntimeError(diagnostic) from None
 
-        startup_event = threading.Event()
         startup_error: list[Exception] = []
 
         def _run() -> None:
@@ -451,26 +567,25 @@ class FeishuWebSocketTransport:
             try:
                 asyncio.set_event_loop(worker_loop)
                 self._bind_sdk_event_loop(worker_loop)
-                self._connected = True
-                startup_event.set()
                 ws_client.start()
                 if not self._stop_requested.is_set():
-                    self._last_error = "Feishu WebSocket client stopped during startup"
+                    diagnostic = self._record_error(
+                        "Feishu WebSocket client stopped unexpectedly"
+                    )
+                    startup_error.append(_FeishuWebSocketRuntimeError(diagnostic))
             except asyncio.CancelledError:
                 if not self._stop_requested.is_set():
-                    startup_error.append(RuntimeError("Feishu WebSocket client loop was cancelled"))
-                    self._last_error = "Feishu WebSocket client loop was cancelled"
-                    log.warning("feishu.websocket_cancelled")
-                startup_event.set()
+                    diagnostic = self._record_error(
+                        "Feishu WebSocket client loop was cancelled unexpectedly"
+                    )
+                    startup_error.append(_FeishuWebSocketRuntimeError(diagnostic))
+                    log.warning("feishu.websocket_cancelled", error=diagnostic["message"])
             except Exception as exc:
                 if not self._stop_requested.is_set():
-                    startup_error.append(exc)
-                    log.warning("feishu.websocket_failed", error=str(exc))
-                self._last_error = str(exc)
-                startup_event.set()
+                    diagnostic = self._record_error(exc)
+                    startup_error.append(_FeishuWebSocketRuntimeError(diagnostic))
+                    log.warning("feishu.websocket_failed", error=diagnostic["message"])
             finally:
-                self._connected = False
-                startup_event.set()
                 try:
                     self._unbind_sdk_event_loop(worker_loop)
                     try:
@@ -496,25 +611,34 @@ class FeishuWebSocketTransport:
             self._release_active_client()
             raise
         startup_deadline = time.monotonic() + _FEISHU_WS_STARTUP_TIMEOUT_S
-        while not startup_event.is_set() and time.monotonic() < startup_deadline:
-            await asyncio.sleep(0.01)
-        await asyncio.sleep(_FEISHU_WS_STARTUP_GRACE_S)
-        if startup_error:
-            self._handler = None
-            self._loop = None
-            self._lark = None
-            if self._thread is not None and not self._thread.is_alive():
+        while True:
+            if startup_error:
+                failure = startup_error[0]
+                diagnostic = dict(getattr(failure, "diagnostic", {}))
+                await self.stop()
+                if diagnostic:
+                    self._last_error = diagnostic
+                raise failure
+            if _feishu_sdk_websocket_is_open(ws_client):
+                self._has_opened_connection = True
+                return
+            if self._thread is None or not self._thread.is_alive():
+                self._handler = None
+                self._loop = None
+                self._lark = None
                 self._thread = None
-            raise startup_error[0]
-        if self._thread is not None and not self._thread.is_alive():
-            self._handler = None
-            self._loop = None
-            self._lark = None
-            self._thread = None
-            raise RuntimeError("Feishu WebSocket client stopped during startup")
+                raise RuntimeError("Feishu WebSocket client stopped during startup")
+            if time.monotonic() >= startup_deadline:
+                diagnostic = self._record_error(
+                    "Feishu WebSocket connection did not open during startup",
+                    error_class="transport_transient",
+                    retryable=True,
+                )
+                await self.stop()
+                raise _FeishuWebSocketRuntimeError(diagnostic)
+            await asyncio.sleep(0.01)
 
     async def stop(self) -> None:
-        self._connected = False
         self._stop_requested.set()
         await self._request_sdk_stop()
         thread = self._thread
@@ -524,7 +648,7 @@ class FeishuWebSocketTransport:
                 self._stop_sdk_event_loop()
                 await asyncio.sleep(0.01)
         if thread is not None and thread.is_alive():
-            self._last_error = "Feishu WebSocket worker did not stop within timeout"
+            self._record_error("Feishu WebSocket worker did not stop within timeout")
             self._release_active_client()
             self._thread = None
             self._worker_loop = None
@@ -539,13 +663,59 @@ class FeishuWebSocketTransport:
         self._lark = None
 
     async def health_check(self) -> ChannelHealth:
+        connection_phase = self._connection_phase()
+        extra: dict[str, Any] = {
+            "transport": "websocket",
+            "connection_phase": connection_phase,
+        }
+        if self._last_error is not None:
+            extra["last_error"] = dict(self._last_error)
         return ChannelHealth(
-            connected=self._connected,
-            extra={
-                "transport": "websocket",
-                "last_error": self._last_error,
-            },
+            connected=connection_phase == "open",
+            extra=extra,
         )
+
+    def _connection_phase(self) -> Literal["connecting", "open", "reconnecting", "stopped"]:
+        thread = self._thread
+        if (
+            self._stop_requested.is_set()
+            or thread is None
+            or not thread.is_alive()
+        ):
+            return "stopped"
+        state = _feishu_sdk_websocket_state(self._ws_client)
+        if state is WebSocketState.OPEN:
+            self._has_opened_connection = True
+            return "open"
+        if state is WebSocketState.CLOSING or state is WebSocketState.CLOSED:
+            self._has_opened_connection = True
+        return "reconnecting" if self._has_opened_connection else "connecting"
+
+    def _record_error(
+        self,
+        error: BaseException | str,
+        *,
+        error_class: str | None = None,
+        retryable: bool | None = None,
+    ) -> dict[str, Any]:
+        if error_class is None or retryable is None:
+            inferred_class, inferred_retryable = _classify_feishu_websocket_error(
+                error if isinstance(error, BaseException) else RuntimeError(error)
+            )
+            error_class = error_class or inferred_class
+            retryable = inferred_retryable if retryable is None else retryable
+        message = _redact_feishu_error_text(
+            self.config,
+            error,
+            fallback="Feishu WebSocket transport failed",
+        )
+        diagnostic: dict[str, Any] = {
+            "error_class": error_class,
+            "message": message,
+            "retryable": retryable,
+        }
+        self._last_error = diagnostic
+        return diagnostic
 
     def _on_message_sync(self, event: Any) -> None:
         self._on_event_sync(event, default_event_type="im.message.receive_v1")
@@ -581,8 +751,11 @@ class FeishuWebSocketTransport:
                 received_at=datetime.now(UTC),
             )
         except Exception as exc:
-            self._last_error = str(exc)
-            log.warning("feishu.websocket_event_decode_failed", error=str(exc))
+            diagnostic = self._record_error(exc, error_class="channel_degraded")
+            log.warning(
+                "feishu.websocket_event_decode_failed",
+                error=diagnostic["message"],
+            )
             return
 
         async def _deliver() -> None:
@@ -604,8 +777,8 @@ class FeishuWebSocketTransport:
                 if inspect.isawaitable(result):
                     await result
             except Exception as exc:
-                self._last_error = str(exc)
-                log.warning("feishu.websocket_stop_failed", error=str(exc))
+                diagnostic = self._record_error(exc)
+                log.warning("feishu.websocket_stop_failed", error=diagnostic["message"])
             return
 
         disconnect = getattr(self._ws_client, "_disconnect", None)
@@ -623,8 +796,13 @@ class FeishuWebSocketTransport:
                             timeout=_FEISHU_WS_JOIN_TIMEOUT_S,
                         )
                     except TimeoutError:
-                        self._last_error = "Feishu WebSocket disconnect timed out"
-                        log.warning("feishu.websocket_disconnect_failed", error=self._last_error)
+                        diagnostic = self._record_error(
+                            "Feishu WebSocket disconnect timed out"
+                        )
+                        log.warning(
+                            "feishu.websocket_disconnect_failed",
+                            error=diagnostic["message"],
+                        )
                         future.cancel()
                         self._stop_sdk_event_loop()
                         retry = disconnect()
@@ -639,8 +817,11 @@ class FeishuWebSocketTransport:
             elif hasattr(result, "close"):
                 result.close()
         except Exception as exc:
-            self._last_error = str(exc)
-            log.warning("feishu.websocket_disconnect_failed", error=str(exc))
+            diagnostic = self._record_error(exc)
+            log.warning(
+                "feishu.websocket_disconnect_failed",
+                error=diagnostic["message"],
+            )
         finally:
             self._stop_sdk_event_loop()
 
@@ -780,7 +961,11 @@ class FeishuChannel:
             reactions=self.config.status_reactions_enabled,
             outbound_status_reactions=self.config.status_reactions_enabled,
             cards=True,
-            interactive_cards=True,
+            # lark-oapi's long-connection client discards CARD frames before
+            # dispatching them. Advertise text approvals in that mode so users
+            # receive a functional /approve or /deny prompt rather than inert
+            # buttons. Webhook ingress continues to support card callbacks.
+            interactive_cards=self.config.connection_mode == "webhook",
             member_events=True,
             edit=True,
             delete=True,
@@ -846,7 +1031,11 @@ class FeishuChannel:
             resp.raise_for_status()
             data = resp.json()
             if data.get("code") != 0:
-                raise FeishuAuthError(data.get("msg", "token refresh failed"))
+                raise FeishuAuthError(
+                    str(data.get("msg", "token refresh failed")),
+                    config=self.config,
+                    provider_code=data.get("code"),
+                )
             self._token_state = _TokenState(
                 token=data["tenant_access_token"],
                 expires_at=now + data["expire"],
@@ -876,7 +1065,8 @@ class FeishuChannel:
         # endpoint.
         if not self.config.verification_token and not self.config.encrypt_key:
             raise FeishuAuthError(
-                "Feishu webhook mode requires verification_token or encrypt_key"
+                "Feishu webhook mode requires verification_token or encrypt_key",
+                config=self.config,
             )
 
         await self._refresh_bot_identity()
@@ -915,7 +1105,16 @@ class FeishuChannel:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log.warning("feishu.bot_identity_lookup_failed", error=str(exc))
+            token = self._token_state.token if self._token_state is not None else ""
+            log.warning(
+                "feishu.bot_identity_lookup_failed",
+                error=_redact_feishu_error_text(
+                    self.config,
+                    exc,
+                    additional_secrets=(token,),
+                    fallback="Feishu bot identity lookup failed",
+                ),
+            )
 
     async def probe_connection(self) -> dict[str, Any]:
         """Validate app credentials and bot identity without starting ingress."""
@@ -943,18 +1142,26 @@ class FeishuChannel:
         log.info("feishu.stopped")
 
     def is_connected(self) -> bool:
-        return self._connected
+        if not self._connected:
+            return False
+        if isinstance(self._transport, FeishuWebSocketTransport):
+            return self._transport._connection_phase() == "open"
+        return True
 
     async def health_check(self) -> ChannelHealth:
         transport_health = await self._transport.health_check()
+        extra: dict[str, Any] = {
+            "transport": self.transport_name,
+            "transport_connected": transport_health.connected,
+        }
+        for key in ("connection_phase", "last_error"):
+            if key in transport_health.extra:
+                extra[key] = transport_health.extra[key]
         return ChannelHealth(
             connected=self._connected and transport_health.connected,
             bot_user_id=self.bot_open_id,
             last_message_at=self._last_message_at,
-            extra={
-                "transport": self.transport_name,
-                "transport_connected": transport_health.connected,
-            },
+            extra=extra,
         )
 
     # ------------------------------------------------------------------

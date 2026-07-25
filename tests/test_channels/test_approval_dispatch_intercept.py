@@ -8,12 +8,19 @@ from types import SimpleNamespace
 import pytest
 
 from opensquilla.channels.approval_prompt import bind_short_code, reset_short_codes
-from opensquilla.channels.types import IncomingMessage
+from opensquilla.channels.types import (
+    AuthenticatedPrincipal,
+    IncomingMessage,
+    IngressProvenance,
+    IngressVerification,
+)
 from opensquilla.gateway.approval_queue import get_approval_queue, reset_approval_queue
 from opensquilla.gateway.channel_dispatch import (
     _maybe_resolve_channel_approval,
     _reset_approval_probe_throttle,
+    _stamp_channel_admin_principal,
 )
+from opensquilla.gateway.routing import build_channel_route_envelope
 
 
 @pytest.fixture(autouse=True)
@@ -141,6 +148,21 @@ def _admin_config(channel_name: str, sender_id: str) -> SimpleNamespace:
     return SimpleNamespace(channel_admin_senders={channel_name: [sender_id]})
 
 
+def _authenticated_admin_route(
+    msg: IncomingMessage,
+    *,
+    channel_name: str,
+) -> tuple[SimpleNamespace, object]:
+    config = _admin_config(channel_name, msg.sender_id)
+    envelope = build_channel_route_envelope(
+        msg,
+        session_key="agent:main:chat",
+        session_prefix=channel_name,
+    )
+    assert _stamp_channel_admin_principal(config, envelope, msg) is True
+    return config, envelope
+
+
 def test_always_requires_channel_admin() -> None:
     approval_id, code = _pending_approval(
         owner_sender_id="owner-1", origin_channel_name="feishu-main"
@@ -163,6 +185,38 @@ def test_always_requires_channel_admin() -> None:
     assert get_approval_queue().get(approval_id).resolved is False
 
 
+def test_always_rejects_unverified_configured_sender() -> None:
+    approval_id, code = _pending_approval(
+        owner_sender_id="owner-1", origin_channel_name="feishu-main"
+    )
+    msg = IncomingMessage(
+        sender_id="owner-1",
+        channel_id="c1",
+        content=f"/approve {code} always",
+        metadata={"principal_is_owner": True, "channel_admin_verified": True},
+    )
+    config = _admin_config("feishu-main", "owner-1")
+    route_envelope = build_channel_route_envelope(
+        msg,
+        session_key="agent:main:chat",
+        session_prefix="feishu-main",
+    )
+
+    assert _stamp_channel_admin_principal(config, route_envelope, msg) is False
+    reply = asyncio.run(
+        _maybe_resolve_channel_approval(
+            msg=msg,
+            session_key="agent:main:chat",
+            config=config,
+            route_envelope=route_envelope,
+        )
+    )
+
+    assert reply is not None
+    assert "needs a channel admin" in reply.content
+    assert get_approval_queue().get(approval_id).resolved is False
+
+
 def test_always_from_admin_resolves_plain_exec_approval() -> None:
     # Non-sandbox (plain exec) approvals accept "always" as a plain approve —
     # there is no durable-grant choice to apply.
@@ -170,14 +224,23 @@ def test_always_from_admin_resolves_plain_exec_approval() -> None:
         owner_sender_id="owner-1", origin_channel_name="feishu-main"
     )
     msg = IncomingMessage(
-        sender_id="owner-1", channel_id="c1", content=f"/approve {code} always"
+        sender_id="owner-1",
+        channel_id="c1",
+        content=f"/approve {code} always",
+        provenance=IngressProvenance(
+            provider="feishu",
+            verification=IngressVerification.SDK_SESSION,
+            principal=AuthenticatedPrincipal(subject_id="owner-1"),
+        ),
     )
+    config, route_envelope = _authenticated_admin_route(msg, channel_name="feishu-main")
 
     reply = asyncio.run(
         _maybe_resolve_channel_approval(
             msg=msg,
             session_key="agent:main:chat",
-            config=_admin_config("feishu-main", "owner-1"),
+            config=config,
+            route_envelope=route_envelope,
         )
     )
 
@@ -215,14 +278,23 @@ def test_always_from_admin_applies_sandbox_same_type_choice(monkeypatch) -> None
         },
     )
     msg = IncomingMessage(
-        sender_id="owner-1", channel_id="c1", content=f"/approve {code} always"
+        sender_id="owner-1",
+        channel_id="c1",
+        content=f"/approve {code} always",
+        provenance=IngressProvenance(
+            provider="feishu",
+            verification=IngressVerification.SDK_SESSION,
+            principal=AuthenticatedPrincipal(subject_id="owner-1"),
+        ),
     )
+    config, route_envelope = _authenticated_admin_route(msg, channel_name="feishu-main")
 
     reply = asyncio.run(
         _maybe_resolve_channel_approval(
             msg=msg,
             session_key="agent:main:chat",
-            config=_admin_config("feishu-main", "owner-1"),
+            config=config,
+            route_envelope=route_envelope,
         )
     )
 

@@ -241,6 +241,54 @@ _POLICY_DENY_NEXT_STEP = SuggestedNextStep.REPLAN
 _NETWORK_ACTION_PREFIXES = ("network.", "web.")
 
 
+def _channel_approval_routing(
+    request: SandboxRequest,
+    policy: SandboxPolicy,
+    *,
+    fingerprint: str,
+    session_id: str,
+) -> dict[str, object] | DenialResult | None:
+    """Return the verified route for a Channel approval, or deny it closed.
+
+    Channel turns do not have a local approval surface. A queued approval must
+    therefore carry the authenticated sender and exact session key so the
+    channel notifier can deliver the prompt and authorize its response. Keep
+    this at the common governance gate because Standard-Sandbox actions reach
+    it without going through the managed-execution elevation helpers.
+    """
+
+    try:
+        from opensquilla.tools.types import CallerKind, current_tool_context
+
+        ctx = current_tool_context.get()
+    except Exception:  # pragma: no cover - context lookup is defensive
+        ctx = None
+    if ctx is None:
+        return None
+    caller_kind = getattr(ctx, "caller_kind", None)
+    if caller_kind is not CallerKind.CHANNEL and str(caller_kind) != CallerKind.CHANNEL.value:
+        return None
+
+    from opensquilla.sandbox.elevation import channel_admin_approval_identity
+
+    identity = channel_admin_approval_identity()
+    if identity is not None and session_id == identity[1]:
+        return {"senderId": identity[0], "sessionKey": identity[1]}
+
+    return DenialResult(
+        reason=DenialReason.POLICY_DENIED,
+        suggested_next_step=SuggestedNextStep.ASK_USER,
+        level=policy.level,
+        action_fingerprint=fingerprint,
+        message=(
+            "This Channel action cannot request approval because the authenticated "
+            "administrator sender or session route is unavailable. Ask a configured "
+            "channel administrator to retry it."
+        ),
+        retryable=False,
+    )
+
+
 class ApprovalGate:
     """Turns policy + approval queue into an :data:`ApprovalDecision`.
 
@@ -331,6 +379,27 @@ class ApprovalGate:
         }
         if extra_params:
             params.update(extra_params)
+        channel_routing = _channel_approval_routing(
+            request,
+            policy,
+            fingerprint=fingerprint,
+            session_id=session_id,
+        )
+        if isinstance(channel_routing, DenialResult):
+            _log_decision(
+                request,
+                policy,
+                fingerprint,
+                decision="deny",
+                approval_required=True,
+                session_id=session_id,
+                reason=channel_routing.reason.value,
+            )
+            return channel_routing
+        if channel_routing is not None:
+            # The authenticated ingress identity takes precedence over any
+            # call-site metadata so a tool cannot select another recipient.
+            params.update(channel_routing)
         approval_id = self._queue.request(namespace=self._namespace, params=params)
         try:
             approved = await self._queue.wait(approval_id, timeout=self._timeout)

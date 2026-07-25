@@ -144,7 +144,8 @@
       "themeLabel": "Thème",
       "themeDesc": "Suivez votre système, ou forcez le mode clair ou sombre. Le bouton de la barre latérale est un raccourci vers ce même paramètre.",
       "languageLabel": "Langue",
-      "languageDesc": "Langue d'affichage de l'interface. S'applique immédiatement à ce navigateur.",
+      "languageDesc": "Langue d'affichage de l'interface et des messages système des canaux. Elle s'applique ici immédiatement et enregistre la langue des messages pour toute la passerelle.",
+      "channelNoticeLocaleSyncPending": "La langue de l'interface a changé, mais la langue des messages système des canaux n'est pas encore enregistrée. Une nouvelle tentative aura lieu à la reconnexion de la passerelle.",
       "toolDetailsLabel": "Affichage par défaut des détails d'outil",
       "toolDetailsDesc": "Automatique suit le type d'outil ; Compact réduit les outils ordinaires ; Développé les ouvre. Les erreurs s'ouvrent automatiquement par défaut et peuvent être repliées manuellement.",
       "toolDetailsAuto": "Automatique",
@@ -811,7 +812,7 @@
         "credentials_link": "Ouvrir la page des identifiants (App id / App secret)",
         "quick_apply_link": "Pré-remplir la demande de toutes les permissions requises",
         "needAppId": "renseignez d'abord l'App id",
-        "ws_order_note": "Connexion établie — il reste une étape dans la console Feishu : ouvrez 事件与回调 et basculez la réception des événements sur 使用长连接接收事件. La console n'enregistre ce choix que pendant qu'un client est connecté, d'où cette étape après l'enregistrement. Cet avis disparaît au premier événement reçu."
+        "ws_order_note": "Vérifiez l'abonnement aux événements dans la console Feishu : ouvrez 事件与回调 et confirmez que la réception des événements est réglée sur 使用长连接接收事件. Cet avis apparaît tant que WebSocket est connecté et qu'aucun événement entrant n'a été enregistré ; il ne signifie pas à lui seul que la console est mal configurée. Il disparaît après le premier événement."
       }
     },
     "search": {
@@ -1941,7 +1942,7 @@
         "capabilityReference": "Référence des capacités",
         "copyBotId": "Copier l'ID du bot : {id}",
         "botIdCopied": "ID du bot copié",
-        "finalStepTitle": "Dernière étape dans la console Feishu"
+        "eventSubscriptionTitle": "Vérifier l'abonnement aux événements Feishu"
       }
     },
     "overview": {

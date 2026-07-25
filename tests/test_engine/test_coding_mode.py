@@ -122,6 +122,51 @@ class TestRuntimeToolContextCodingMode:
             "git_commit",
         }.isdisjoint(names)
 
+    @pytest.mark.parametrize("coding_mode", [False, True])
+    def test_verified_channel_admin_matches_web_owner_live_surface(self, coding_mode: bool):
+        """Keep the final tool surface equal after all runtime policy layers."""
+
+        import opensquilla.tools.builtin  # noqa: F401  (registers builtins)
+        from opensquilla.engine.runtime import TurnRunner
+        from opensquilla.tools.registry import get_default_registry
+        from opensquilla.tools.types import CallerKind, InteractionMode, ToolContext
+
+        config = GatewayConfig()
+        config.skills.coding_mode = coding_mode
+        runner = TurnRunner(
+            provider_selector=None,
+            tool_registry=get_default_registry(),
+            session_manager=object(),
+            config=config,
+        )
+        channel_admin = ToolContext(
+            is_owner=True,
+            channel_admin_verified=True,
+            caller_kind=CallerKind.CHANNEL,
+            interaction_mode=InteractionMode.UNATTENDED,
+            session_key="agent:main:feishu:direct:admin",
+            channel_id="oc_channel",
+        )
+        web_owner = ToolContext(
+            is_owner=True,
+            caller_kind=CallerKind.WEB,
+            interaction_mode=InteractionMode.INTERACTIVE,
+            session_key="agent:main:webchat:direct:owner",
+            channel_id="webchat",
+        )
+
+        channel_defs, _ = runner._build_tools(channel_admin)
+        web_defs, _ = runner._build_tools(web_owner)
+        channel_names = {tool.name for tool in channel_defs}
+        web_names = {tool.name for tool in web_defs}
+
+        assert channel_names == web_names
+        assert "agents_list" in channel_names
+        assert "subagents" not in channel_admin.denied_tools
+        assert {"exec_command", "background_process", "process"} <= channel_names
+        if coding_mode:
+            assert coding_mode_denied_tools(True).isdisjoint(channel_names)
+
 
 class TestSkillsFilterGate:
     def test_off_gates_codetask(self):

@@ -144,7 +144,8 @@
       "themeLabel": "Design",
       "themeDesc": "Dem System folgen oder hell bzw. dunkel erzwingen. Der Schalter in der Seitenleiste ist eine Verknüpfung zu dieser Einstellung.",
       "languageLabel": "Sprache",
-      "languageDesc": "Anzeigesprache der Oberfläche. Wird sofort in diesem Browser übernommen.",
+      "languageDesc": "Anzeigesprache der Oberfläche und der Systemhinweise in Kanälen. Sie gilt hier sofort und speichert die Hinweis-Sprache gatewayweit.",
+      "channelNoticeLocaleSyncPending": "Die Oberflächensprache wurde geändert, aber die Sprache der Kanal-Systemhinweise ist noch nicht gespeichert. Beim erneuten Verbinden mit dem Gateway wird es erneut versucht.",
       "toolDetailsLabel": "Werkzeugdetails standardmäßig anzeigen",
       "toolDetailsDesc": "Automatisch folgt dem Werkzeugtyp; Kompakt klappt normale Werkzeuge ein; Ausgeklappt öffnet sie. Fehler werden standardmäßig automatisch geöffnet und können manuell eingeklappt werden.",
       "toolDetailsAuto": "Automatisch",
@@ -811,7 +812,7 @@
         "credentials_link": "Zugangsdaten-Seite öffnen (App id / App secret)",
         "quick_apply_link": "Antrag für alle benötigten Berechtigungen vorausfüllen",
         "needAppId": "zuerst App id eintragen",
-        "ws_order_note": "Verbunden — ein Schritt fehlt noch in der Feishu-Konsole: 事件与回调 öffnen und den Ereignisempfang auf 使用长连接接收事件 umstellen. Die Konsole speichert diese Wahl nur bei aktiver Verbindung, deshalb folgt der Schritt nach dem Speichern. Dieser Hinweis verschwindet mit dem ersten empfangenen Ereignis."
+        "ws_order_note": "Prüfen Sie das Ereignisabonnement in der Feishu-Konsole: Öffnen Sie 事件与回调 und bestätigen Sie, dass der Ereignisempfang auf 使用长连接接收事件 eingestellt ist. Dieser Hinweis erscheint bei bestehender WebSocket-Verbindung, solange kein eingehendes Ereignis erfasst wurde; er bedeutet nicht automatisch, dass die Konsole falsch konfiguriert ist. Nach dem ersten Ereignis verschwindet er."
       }
     },
     "search": {
@@ -1941,7 +1942,7 @@
         "capabilityReference": "Funktionsreferenz",
         "copyBotId": "Bot-ID kopieren: {id}",
         "botIdCopied": "Bot-ID kopiert",
-        "finalStepTitle": "Letzter Schritt in der Feishu-Konsole"
+        "eventSubscriptionTitle": "Feishu-Ereignisabonnement prüfen"
       }
     },
     "overview": {

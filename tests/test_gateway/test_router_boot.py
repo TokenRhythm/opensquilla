@@ -9,12 +9,19 @@ from typing import Any
 
 import pytest
 
+from opensquilla.channels.types import (
+    AuthenticatedPrincipal,
+    IncomingMessage,
+    IngressProvenance,
+    IngressVerification,
+)
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.types import AgentConfig, DoneEvent
 from opensquilla.gateway.boot import (
     _configured_agent_ids,
     _gateway_home,
     _register_dream_crons,
+    _task_runtime_envelope_owner,
     _task_runtime_turn_hard_deadline_s,
     _warn_workspace_state_mismatch,
     build_flush_service,
@@ -24,6 +31,7 @@ from opensquilla.gateway.boot import (
     emit_skill_filter_banner,
     validate_squilla_router_runtime,
 )
+from opensquilla.gateway.channel_dispatch import _stamp_channel_admin_principal
 from opensquilla.gateway.config import (
     AgentEntryConfig,
     GatewayConfig,
@@ -35,7 +43,12 @@ from opensquilla.gateway.model_routing import (
     capture_model_routing_config,
     model_routing_snapshot,
 )
-from opensquilla.gateway.routing import build_cli_route_envelope, build_cron_route_envelope
+from opensquilla.gateway.routing import (
+    build_channel_route_envelope,
+    build_cli_route_envelope,
+    build_cron_route_envelope,
+    tool_context_from_envelope,
+)
 from opensquilla.onboarding.mutations import upsert_channel
 from opensquilla.provider import Message, ProviderRequestCorrelation
 from opensquilla.scheduler.types import CronJob, JobStatus
@@ -2108,6 +2121,121 @@ async def test_task_runtime_turn_uses_agent_registry_model_when_session_has_no_m
     )
 
     assert runner.calls[0]["model"] == "agent/default"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sender_id", "expected_owner"),
+    [("channel-admin", True), ("paired-user", False)],
+)
+async def test_task_runtime_turn_uses_authenticated_channel_admin_boundary(
+    sender_id: str,
+    expected_owner: bool,
+) -> None:
+    class RecordingTurnRunner:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            self.calls.append(kwargs)
+            yield DoneEvent()
+
+    async def emit(_session_key: str, _event_name: str, _payload: dict[str, Any]) -> None:
+        return None
+
+    config = GatewayConfig(
+        channel_admin_senders={"feishu": ["channel-admin"]},
+        agent_stream_heartbeat_interval_seconds=0.0,
+        agent_stream_idle_timeout_seconds=1.0,
+    )
+    msg = IncomingMessage(
+        sender_id=sender_id,
+        channel_id="oc-channel",
+        content="hello",
+        # Adapter metadata must not be able to promote a sender.
+        metadata={"principal_is_owner": True, "channel_admin_verified": True},
+        provenance=IngressProvenance(
+            provider="feishu",
+            verification=IngressVerification.SDK_SESSION,
+            principal=AuthenticatedPrincipal(subject_id=sender_id),
+        ),
+    )
+    envelope = build_channel_route_envelope(
+        msg,
+        session_key=f"agent:main:feishu:{sender_id}",
+        session_prefix="feishu",
+        agent_id="main",
+    )
+    assert "principal_is_owner" not in envelope.metadata
+    assert "channel_admin_verified" not in envelope.metadata
+    assert _stamp_channel_admin_principal(config, envelope, msg) is expected_owner
+    assert envelope.metadata["principal_is_owner"] is expected_owner
+    run = SimpleNamespace(
+        agent_id="main",
+        task_id=f"task-{sender_id}",
+        session_key=envelope.session_key,
+        message="hello",
+        envelope=envelope,
+        attachments=[],
+        input_provenance={},
+        run_kind="channel_turn",
+        no_memory_capture=False,
+        ingress_pipeline_steps=[],
+        semantic_message=None,
+        stream_event_sink=None,
+    )
+    runner = RecordingTurnRunner()
+
+    await dispatch_task_runtime_turn(
+        run,
+        config=config,
+        session_manager=None,
+        turn_runner=runner,
+        event_emitter=emit,
+    )
+
+    tool_context = runner.calls[0]["tool_context"]
+    assert tool_context.is_owner is expected_owner
+    assert tool_context.channel_admin_verified is expected_owner
+    assert tool_context.run_mode == "trusted"
+
+
+@pytest.mark.parametrize(
+    "provenance",
+    [
+        IngressProvenance(),
+        IngressProvenance(
+            provider="feishu",
+            verification=IngressVerification.SDK_SESSION,
+            principal=AuthenticatedPrincipal(subject_id="another-user"),
+        ),
+    ],
+    ids=["unverified", "principal-mismatch"],
+)
+def test_channel_admin_stamp_rejects_unverified_or_mismatched_identity(
+    provenance: IngressProvenance,
+) -> None:
+    msg = IncomingMessage(
+        sender_id="channel-admin",
+        channel_id="oc-channel",
+        content="hello",
+        provenance=provenance,
+    )
+    envelope = build_channel_route_envelope(
+        msg,
+        session_key="agent:main:feishu:channel-admin",
+        session_prefix="feishu",
+    )
+    config = GatewayConfig(channel_admin_senders={"feishu": ["channel-admin"]})
+
+    assert _stamp_channel_admin_principal(config, envelope, msg) is False
+    assert envelope.metadata["principal_is_owner"] is False
+    assert envelope.metadata["channel_admin_verified"] is False
+    assert _task_runtime_envelope_owner(envelope) is False
+
+    context = tool_context_from_envelope(envelope, is_owner=True)
+    assert context.is_owner is False
+    assert context.channel_admin_verified is False
 
 
 @pytest.mark.asyncio

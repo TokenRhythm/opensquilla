@@ -144,7 +144,8 @@
       "themeLabel": "主题",
       "themeDesc": "跟随系统，或强制使用浅色或深色。侧边栏的切换按钮是此设置的快捷方式。",
       "languageLabel": "语言",
-      "languageDesc": "界面的显示语言。即时应用于此浏览器。",
+      "languageDesc": "界面和渠道系统提示的显示语言。此处立即生效，并保存网关范围内的提示语言。",
+      "channelNoticeLocaleSyncPending": "界面语言已切换，但渠道系统提示语言尚未保存。网关重新连接后会自动重试。",
       "toolDetailsLabel": "工具详情默认显示",
       "toolDetailsDesc": "自动模式按工具类型显示；紧凑模式折叠普通工具；展开模式打开全部工具。错误默认自动展开，仍可手动折叠。",
       "toolDetailsAuto": "自动",
@@ -811,7 +812,7 @@
         "credentials_link": "打开凭证页(App id / App secret)",
         "quick_apply_link": "一键预填全部所需权限的申请",
         "needAppId": "先填写 App id",
-        "ws_order_note": "已连接——还差飞书控制台里的最后一步：打开「事件与回调」，把事件订阅方式切换为「使用长连接接收事件」。该选项仅在有活跃连接时才能保存，所以要先保存渠道再去切换。收到第一条事件后本提示自动消失。"
+        "ws_order_note": "检查飞书事件订阅：打开「事件与回调」，确认事件订阅方式为「使用长连接接收事件」。当前长连接已建立，但尚未记录到入站事件；这本身并不代表控制台配置有误。收到第一条事件后本提示自动消失。"
       }
     },
     "search": {
@@ -1941,7 +1942,7 @@
         "capabilityReference": "能力参考",
         "copyBotId": "复制 Bot ID：{id}",
         "botIdCopied": "Bot ID 已复制",
-        "finalStepTitle": "去飞书控制台完成最后一步"
+        "eventSubscriptionTitle": "检查飞书事件订阅"
       }
     },
     "overview": {

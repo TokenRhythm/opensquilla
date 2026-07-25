@@ -8,7 +8,12 @@ import net from 'node:net'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { DESKTOP_LOCALES, resolveLocaleFromTags, type DesktopLocale } from './desktop-locale.js'
+import {
+  DESKTOP_LOCALES,
+  normalizeGatewayLocale,
+  resolveLocaleFromTags,
+  type DesktopLocale,
+} from './desktop-locale.js'
 import {
   allProfileContexts as enumerateDesktopProfileContexts,
   contextForProfile,
@@ -2001,6 +2006,7 @@ async function saveDesktopCredential(
   const disableNetworkObservability = Object.prototype.hasOwnProperty.call(payload, 'disableNetworkObservability')
     ? normalizeBooleanSetting(payload.disableNetworkObservability, existing?.disableNetworkObservability ?? false)
     : configDisableNetworkObservability ?? existing?.disableNetworkObservability ?? false
+  const configLocale = desktopLocaleChoice(payload.locale) ?? desktopLocale
 
   if (defaults.requiresApiKey && !encryptedApiKey) throw new Error('API key is required.')
   if (modelRoutingMode === 'llm_ensemble' && !modelRoutingModeAllowed(modelRoutingMode, provider)) {
@@ -2044,6 +2050,7 @@ async function saveDesktopCredential(
       JSON.stringify(credential, null, 2),
       expectedCredential,
       writerReserved,
+      configLocale,
     )
     return credential
   } finally {
@@ -2190,6 +2197,27 @@ function foreignConfigPreambleLines(raw: string): string[] {
   return out
 }
 
+// The Desktop owns the control-ui section's boot fields, while the Gateway
+// owns the operator's persisted notice locale. Preserve only that scalar
+// instead of retaining a whole section whose other settings Desktop
+// must regenerate deterministically.
+function persistedControlUiDefaultLocale(raw: string | null): DesktopLocale | null {
+  if (raw === null) return null
+  let inControlUi = false
+  for (const rawLine of raw.split(/\r?\n/)) {
+    const header = rawLine.trim().match(/^\[\s*([^\]]+?)\s*\](?:\s*#.*)?$/)
+    if (header) {
+      inControlUi = header[1] === 'control_ui'
+      continue
+    }
+    if (!inControlUi) continue
+    const match = rawLine.match(/^\s*default_locale\s*=\s*["']([^"']*)["']\s*(?:#.*)?$/)
+    if (!match) continue
+    return normalizeGatewayLocale(match[1])
+  }
+  return null
+}
+
 async function readOptionalDesktopText(path: string): Promise<string | null> {
   try {
     return await readFile(path, 'utf8')
@@ -2220,9 +2248,11 @@ function renderDesktopConfigAfterPreflight(
   credential: DesktopConnection,
   inspection: RecoveryProtocolResult,
   existingRaw: string | null,
+  defaultLocale: DesktopLocale,
 ): string {
   let preservedForeignSections: string[] = []
   let preservedForeignPreamble: string[] = []
+  const preservedControlUiLocale = persistedControlUiDefaultLocale(existingRaw)
   if (existingRaw !== null) {
     preservedForeignSections = foreignConfigSectionLines(existingRaw)
     preservedForeignPreamble = foreignConfigPreambleLines(existingRaw)
@@ -2252,6 +2282,7 @@ function renderDesktopConfigAfterPreflight(
     '[control_ui]',
     'enabled = true',
     'base_path = "/control"',
+    `default_locale = ${tomlString(preservedControlUiLocale ?? defaultLocale)}`,
     '',
     ...(preservedForeignSections.length ? [...preservedForeignSections, ''] : []),
   ].join('\n')
@@ -2263,6 +2294,7 @@ async function applyDesktopSettingsPair(
   candidateCredential: string,
   expectedCredential: string | null,
   writerReserved = false,
+  defaultLocale = desktopLocale,
 ): Promise<RecoveryProtocolResult> {
   const targetProfileKey = desktopProfileKey(profile)
   if (desktopProfileKey() !== targetProfileKey) {
@@ -2289,6 +2321,7 @@ async function applyDesktopSettingsPair(
       credential,
       inspection,
       expectedConfig,
+      defaultLocale,
     )
     const result = await runRecoveryCli(
       profile,
@@ -2683,10 +2716,17 @@ function desktopLocalePath(): string {
 function loadPersistedDesktopLocale(): DesktopLocale | null {
   try {
     const raw = readFileSync(desktopLocalePath(), 'utf8').trim()
-    return DESKTOP_LOCALES.includes(raw as DesktopLocale) ? (raw as DesktopLocale) : null
+    return desktopLocaleChoice(raw)
   } catch {
     return null
   }
+}
+
+function desktopLocaleChoice(raw: unknown): DesktopLocale | null {
+  const requested = String(raw ?? '')
+  return DESKTOP_LOCALES.includes(requested as DesktopLocale)
+    ? requested as DesktopLocale
+    : null
 }
 
 function persistDesktopLocale(locale: DesktopLocale): void {
@@ -2699,10 +2739,10 @@ function persistDesktopLocale(locale: DesktopLocale): void {
 }
 
 function applyDesktopLocaleChoice(raw: unknown): void {
-  const requested = String(raw ?? '')
-  if (!DESKTOP_LOCALES.includes(requested as DesktopLocale)) return
+  const requested = desktopLocaleChoice(raw)
+  if (requested === null) return
   if (requested !== desktopLocale) {
-    desktopLocale = requested as DesktopLocale
+    desktopLocale = requested
     createApplicationMenu()
     rebuildWindowsTrayMenu()
   }

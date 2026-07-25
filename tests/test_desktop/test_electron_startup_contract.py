@@ -1411,6 +1411,52 @@ def test_desktop_config_writer_does_not_emit_new_privacy_section_by_default() ->
     )
 
 
+def test_desktop_config_regeneration_preserves_control_ui_locale_and_seeds_new_config() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    credential_save = _section(
+        main_ts,
+        "async function saveDesktopCredential",
+        "function buildImportedDesktopCredential",
+    )
+    locale_reader = _section(
+        main_ts,
+        "function persistedControlUiDefaultLocale",
+        "async function readOptionalDesktopText",
+    )
+    config_renderer = _section(
+        main_ts,
+        "function renderDesktopConfigAfterPreflight",
+        "async function applyDesktopSettingsPair",
+    )
+
+    # A regenerated config must retain the effective Gateway locale from its
+    # own [control_ui] section, including legacy BCP-47 spellings. An absent
+    # field falls back to the current Desktop locale when a new config is
+    # seeded. TOML permits a comment after the table header, which must not
+    # cause the locale reader to miss the section during regeneration.
+    assert "if (raw === null) return null" in locale_reader
+    assert r"match(/^\[\s*([^\]]+?)\s*\](?:\s*#.*)?$/)" in locale_reader
+    assert "inControlUi = header[1] === 'control_ui'" in locale_reader
+    assert 'default_locale\\s*=\\s*["\']([^"\']*)["\']' in locale_reader
+    assert "return normalizeGatewayLocale(match[1])" in locale_reader
+    assert locale_reader.rstrip().endswith("return null\n}")
+
+    preserved_locale = (
+        "const preservedControlUiLocale = persistedControlUiDefaultLocale(existingRaw)"
+    )
+    rendered_locale = "`default_locale = ${tomlString(preservedControlUiLocale ?? defaultLocale)}`"
+    assert preserved_locale in config_renderer
+    assert rendered_locale in config_renderer
+    assert config_renderer.index(preserved_locale) < config_renderer.index(rendered_locale)
+    assert config_renderer.count("default_locale") == 1
+    assert "defaultLocale: DesktopLocale" in config_renderer
+    assert (
+        "const configLocale = desktopLocaleChoice(payload.locale) ?? desktopLocale"
+        in credential_save
+    )
+    assert "writerReserved,\n      configLocale," in credential_save
+
+
 def test_desktop_network_observability_disable_gates_native_update_and_gateway_env() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
     update_managed = _section(

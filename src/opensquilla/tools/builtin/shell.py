@@ -4626,7 +4626,10 @@ def _current_bg_context_is_admin() -> bool:
         return False
     if ctx.caller_kind in {CallerKind.CLI, CallerKind.WEB}:
         return True
-    return ctx.caller_kind is CallerKind.CHANNEL and ctx.elevated in ("on", "bypass", "full")
+    # A verified channel administrator is the same operator principal as a
+    # WebUI owner. The ingress-only marker prevents an arbitrary channel
+    # context with ``is_owner=True`` from managing other sessions' processes.
+    return ctx.caller_kind is CallerKind.CHANNEL and ctx.channel_admin_verified
 
 
 def _current_bg_context_allows(session: _BgSession) -> bool:

@@ -1088,8 +1088,11 @@ def _task_runtime_turn_hard_deadline_s(config: GatewayConfig) -> float | None:
 
 def _task_runtime_envelope_owner(envelope: Any) -> bool:
     """Resolve owner privileges from authenticated route metadata."""
+    from opensquilla.channels.admission import has_verified_channel_admin_stamp
     from opensquilla.gateway.routing import SourceKind
 
+    if getattr(envelope, "source_kind", None) == SourceKind.CHANNEL:
+        return has_verified_channel_admin_stamp(envelope)
     principal_is_owner = getattr(envelope, "metadata", {}).get("principal_is_owner")
     if isinstance(principal_is_owner, bool):
         return principal_is_owner
@@ -3292,6 +3295,7 @@ async def start_gateway_server(
         session_manager=svc.session_manager,
         channel_manager_ref=lambda: _cm_holder[0],
         schedule=create_background_task,
+        config=config,
     )
 
     background_completion_manager = BackgroundCompletionManager(
