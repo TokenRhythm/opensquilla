@@ -92,6 +92,57 @@ opensquilla sessions export <session-key>
 
 Memory is for useful recall. Session export is for exact records.
 
+## Automatic Consolidation (Dream)
+
+Dream promotes recurring facts out of dated memory notes and into the curated
+`MEMORY.md`, so long-lived preferences survive without being restated. It reads
+the dated notes, ranks them against accumulated evidence, and asks the model for
+a constrained patch — only `upsert`, `merge`, or `skip`, one entry at a time.
+Promoted entries land under headings such as `User Preferences` and
+`Project Practices`. `MEMORY.md` itself is never a candidate, so consolidation
+cannot feed on its own output.
+
+**Nothing runs until you opt in.** Consolidation is off by default, and so is
+the session flush that produces the notes it reads:
+
+| Setting | Default | Without it |
+| --- | --- | --- |
+| `memory.flush_enabled` | `false` | no dated notes are written, so Dream has nothing to read |
+| `memory.dream.enabled` | `false` | consolidation never runs |
+| `memory.dream.preview_mode` | `true` | runs report what they would promote, but do not write |
+| `memory.dream.auto_schedule` | `false` | consolidation runs only when you invoke it |
+
+Check what is waiting without running anything:
+
+```sh
+opensquilla memory dream --status
+```
+
+Preview a run. Preview writes nothing and does not advance the cursor, so it is
+safe to repeat while you decide:
+
+```sh
+opensquilla memory dream
+```
+
+To let Dream write, set `preview_mode = false` under `[memory.dream]`, and add
+`auto_schedule = true` if it should run on its own (`interval_h`, default 24,
+or a `cron` expression). Enable `memory.flush_enabled` too, or there will be
+nothing to consolidate.
+
+Each run backs up `MEMORY.md` under `memory/.dream_backups/` before writing and
+records a receipt, so a promotion you dislike can be traced and reverted. A
+cursor tracks which notes have been consumed; re-process everything with:
+
+```sh
+opensquilla memory dream --force
+```
+
+Consolidation makes provider calls and turns conversation into durable
+on-disk notes. Both are reasons the defaults are conservative — review a few
+previews before enabling writes, and keep the guidance in
+[What to Store](#what-to-store) in mind, since promoted entries persist.
+
 ## Maintenance and Repair
 
 Refresh the index after editing memory files or changing memory configuration:
