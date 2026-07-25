@@ -338,11 +338,18 @@ async def test_t3_budget_check_counts_full_tool_call_replay() -> None:
     )
 
     transcript = _tool_heavy_transcript()
-    window = 30_000
     summarized = sum(estimate_entry_replay_tokens(e) for e in transcript)
     model_replay = sum(estimate_entry_model_replay_tokens(e) for e in transcript)
+    # Derive the window from the estimators instead of hard-coding a token
+    # count. estimate_tokens returns cl100k_base counts when tiktoken can load
+    # its encoding and len//4 otherwise, so a literal window silently encodes
+    # one of those two environments; this assertion is about WHICH estimator
+    # the budget check consults, not about absolute token counts. Midpoint of
+    # the valid band keeps margin on both sides under either tokenizer.
+    safety_margin = 1.2
+    window = int((summarized + model_replay) * safety_margin / 2)
     # The summarized estimate looks within budget while the model replay overflows.
-    assert summarized * 1.2 <= window < model_replay * 1.2
+    assert summarized * safety_margin <= window < model_replay * safety_margin
 
     sm = _FakeSessionManager(transcript)
     fs = _FakeFlushService()
