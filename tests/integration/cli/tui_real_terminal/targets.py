@@ -32,6 +32,32 @@ class TuiTarget:
     skip_reason: str | None = None
 
 
+def opentui_host_skip_reason() -> str | None:
+    """Reason the Bun/OpenTUI host cannot launch here, or None when it can.
+
+    Both backends drive the real fd bridge, so without Bun or an installed
+    ``@opentui/core`` the app never prints its readiness marker and the driver
+    fails on a wait timeout that names neither. These scenarios already skip
+    when tmux or the terminal capabilities are missing; a checkout that has not
+    run ``bun install`` is the same kind of missing precondition, and
+    CONTRIBUTING asks the default path to stay fork-safe.
+
+    Kept separate from ``TuiTarget.available`` so target construction keeps
+    describing the target rather than the machine it would run on.
+    """
+    try:
+        from opensquilla.cli.tui.opentui.bridge import (  # type: ignore[import-untyped]
+            check_opentui_host_available,
+        )
+
+        availability = check_opentui_host_available()
+    except Exception as exc:  # noqa: BLE001 - a failed probe is itself a skip reason
+        return f"OpenTUI host probe failed: {exc}"
+    if availability.available:
+        return None
+    return availability.reason or "OpenTUI host unavailable"
+
+
 def build_tui_target(backend_id: str, context: TargetContext) -> TuiTarget:
     if backend_id == "opentui":
         return _opentui_target(context)

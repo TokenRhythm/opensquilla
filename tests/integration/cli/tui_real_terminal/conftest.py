@@ -20,7 +20,11 @@ from tui_real_terminal.driver import (  # noqa: E402
 )
 from tui_real_terminal.evidence import EvidenceBundle, ScenarioResult  # noqa: E402
 from tui_real_terminal.scenarios import TuiScenario, run_scenario  # noqa: E402
-from tui_real_terminal.targets import TargetContext, build_tui_target  # noqa: E402
+from tui_real_terminal.targets import (  # noqa: E402
+    TargetContext,
+    build_tui_target,
+    opentui_host_skip_reason,
+)
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -100,6 +104,9 @@ def run_real_terminal_scenario(
         )
         if not target.available:
             pytest.skip(target.skip_reason or f"TUI backend {tui_backend!r} unavailable")
+        host_skip_reason = opentui_host_skip_reason()
+        if host_skip_reason is not None:
+            pytest.skip(host_skip_reason)
         if (
             target.backend_id == "live-opentui"
             and os.environ.get("OPENSQUILLA_TUI_LIVE_REAL") != "1"

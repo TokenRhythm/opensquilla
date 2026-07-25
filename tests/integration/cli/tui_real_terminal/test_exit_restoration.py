@@ -14,7 +14,11 @@ from tui_real_terminal.driver import (
     probe_terminal_capabilities,
 )
 from tui_real_terminal.evidence import EvidenceBundle
-from tui_real_terminal.targets import TargetContext, build_tui_target
+from tui_real_terminal.targets import (
+    TargetContext,
+    build_tui_target,
+    opentui_host_skip_reason,
+)
 
 pytestmark = pytest.mark.tui_real_terminal
 
@@ -39,6 +43,9 @@ def test_exit_restores_primary_screen_and_shell(
         pytest.skip("exit-restoration requires tmux, not PTY")
     if not probe_terminal_capabilities().tmux_available:
         pytest.skip("exit-restoration requires tmux")
+    host_skip_reason = opentui_host_skip_reason()
+    if host_skip_reason is not None:
+        pytest.skip(host_skip_reason)
 
     evidence = EvidenceBundle.create(
         artifact_root,
