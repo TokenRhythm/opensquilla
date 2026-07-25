@@ -270,6 +270,10 @@ class LlmProviderConfig(BaseSettings):
     # Optional global thinking level: off|minimal|low|medium|high|xhigh|adaptive.
     # When unset, squilla_router may suggest thinking for selected tiers.
     thinking: str | None = None
+    # Alias for thinking: accepts the same values. When both are set,
+    # thinking_level takes precedence. This allows [llm] configs to use
+    # the same field name as squilla_router.tiers for consistency.
+    thinking_level: str | None = None
     # OpenRouter-only: map model id -> upstream provider name. Mapped models
     # send provider.order=[name] so the provider is preferred without disabling
     # OpenRouter fallback.

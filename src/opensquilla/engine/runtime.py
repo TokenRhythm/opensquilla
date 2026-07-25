@@ -3638,6 +3638,18 @@ class TurnRunner:
         if explicit is not None and str(explicit).strip():
             return False
 
+        # [llm] thinking_level: alias accepted alongside thinking for parity
+        # with squilla_router.tiers. Only consulted when thinking is unset.
+        explicit_level = getattr(llm_cfg, "thinking_level", None)
+        parsed_level = self._parse_thinking_level(
+            explicit_level,
+            source="config.thinking_level",
+        )
+        if parsed_level is not None:
+            return parsed_level
+        if explicit_level is not None and str(explicit_level).strip():
+            return False
+
         metadata = getattr(turn, "metadata", {}) or {}
         if not metadata.get("thinking_requested"):
             return False
