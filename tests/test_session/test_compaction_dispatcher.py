@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import pytest
 
+from opensquilla.session import tokenizer
 from opensquilla.session.compaction import (
     CompactionConfig,
     CompactionRequest,
@@ -166,8 +167,18 @@ async def test_new_avoids_mid_turn_cut_for_agent_flattened_tool_blocks():
 
 
 @pytest.mark.asyncio
-async def test_new_skips_when_only_cut_would_orphan_tool_result():
-    """If no clean boundary exists, compaction must not split tool state."""
+async def test_new_skips_when_only_cut_would_orphan_tool_result(monkeypatch):
+    """If no clean boundary exists, compaction must not split tool state.
+
+    The branch under test sits in a two-token-wide window band: one token
+    higher and the transcript is within budget, one lower and a cut is found
+    and the quality gate rejects it. Which absolute window lands in that band
+    depends on whether ``estimate_tokens`` resolved cl100k_base or fell back to
+    ``len // 4``, and ``tiktoken.get_encoding`` needs network on a cold cache.
+    Pin the fallback so the band — and this test — stay put offline.
+    """
+    monkeypatch.setattr(tokenizer, "_encoding", None)
+    monkeypatch.setattr(tokenizer, "_tiktoken_available", False)
     entries = [
         {
             "role": "assistant",
@@ -187,7 +198,7 @@ async def test_new_skips_when_only_cut_would_orphan_tool_result():
     request = CompactionRequest(
         session_id="boundary-start-test",
         entries=entries,
-        context_window_tokens=26,
+        context_window_tokens=23,
         config=CompactionConfig(safety_margin=1.0),
     )
 
