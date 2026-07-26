@@ -1529,7 +1529,6 @@
     "overview": {
       "title": "状态",
       "subtitle": "就绪情况、用量与运行健康状态。",
-      "openChat": "打开聊天",
       "totalTokens": "总 token 数",
       "totalSessions": "会话总数",
       "totalSessionsTitle": "所有状态的会话总数",
@@ -1555,6 +1554,7 @@
       "noFindings": "未返回任何发现项。",
       "recoveryRestart": "恢复需要重启",
       "openSettings": "打开设置",
+      "findingDetails": "详情",
       "findingFallback": "发现项 {n}",
       "copyCommand": "复制命令",
       "step": "步骤",
@@ -1573,11 +1573,6 @@
         "actionRequired": "需要处理",
         "degraded": "降级",
         "unavailable": "不可用"
-      },
-      "steps": {
-        "optional": "可选设置步骤",
-        "reference": "参考步骤",
-        "recovery": "恢复步骤"
       },
       "badge": {
         "diagnostic": "诊断未完成",

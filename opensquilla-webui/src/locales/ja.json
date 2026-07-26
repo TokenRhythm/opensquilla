@@ -1529,7 +1529,6 @@
     "overview": {
       "title": "状態",
       "subtitle": "準備状況、使用量、実行時の健全性を表示します。",
-      "openChat": "チャットを開く",
       "totalTokens": "合計トークン数",
       "totalSessions": "合計セッション数",
       "totalSessionsTitle": "すべての状態を含む合計セッション数",
@@ -1555,6 +1554,7 @@
       "noFindings": "検出結果はありません。",
       "recoveryRestart": "リカバリには再起動が必要です",
       "openSettings": "設定を開く",
+      "findingDetails": "詳細",
       "findingFallback": "検出結果 {n}",
       "copyCommand": "コマンドをコピー",
       "step": "ステップ",
@@ -1573,11 +1573,6 @@
         "actionRequired": "対応が必要",
         "degraded": "劣化",
         "unavailable": "利用不可"
-      },
-      "steps": {
-        "optional": "任意のセットアップ手順",
-        "reference": "参考の手順",
-        "recovery": "リカバリの手順"
       },
       "badge": {
         "diagnostic": "診断が未完了",

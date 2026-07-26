@@ -1529,7 +1529,6 @@
     "overview": {
       "title": "Status",
       "subtitle": "Bereitschaft, Nutzung und Laufzeitzustand.",
-      "openChat": "Chat öffnen",
       "totalTokens": "Tokens gesamt",
       "totalSessions": "Sitzungen gesamt",
       "totalSessionsTitle": "Sitzungen gesamt über alle Status",
@@ -1555,6 +1554,7 @@
       "noFindings": "Keine Befunde zurückgegeben.",
       "recoveryRestart": "Wiederherstellung erfordert Neustart",
       "openSettings": "Einstellungen öffnen",
+      "findingDetails": "Details",
       "findingFallback": "Befund {n}",
       "copyCommand": "Befehl kopieren",
       "step": "Schritt",
@@ -1573,11 +1573,6 @@
         "actionRequired": "Aktion erforderlich",
         "degraded": "Eingeschränkt",
         "unavailable": "Nicht verfügbar"
-      },
-      "steps": {
-        "optional": "Optionale Einrichtungsschritte",
-        "reference": "Referenzschritte",
-        "recovery": "Wiederherstellungsschritte"
       },
       "badge": {
         "diagnostic": "Diagnose unvollständig",

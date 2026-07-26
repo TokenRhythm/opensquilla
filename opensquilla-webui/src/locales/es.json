@@ -1529,7 +1529,6 @@
     "overview": {
       "title": "Estado",
       "subtitle": "Preparación, uso y estado de ejecución.",
-      "openChat": "Abrir chat",
       "totalTokens": "Total de tokens",
       "totalSessions": "Total de sesiones",
       "totalSessionsTitle": "Total de sesiones en todos los estados",
@@ -1555,6 +1554,7 @@
       "noFindings": "No se devolvieron hallazgos.",
       "recoveryRestart": "La recuperación requiere reiniciar",
       "openSettings": "Abrir ajustes",
+      "findingDetails": "Detalles",
       "findingFallback": "Hallazgo {n}",
       "copyCommand": "Copiar comando",
       "step": "Paso",
@@ -1573,11 +1573,6 @@
         "actionRequired": "Acción requerida",
         "degraded": "Degradado",
         "unavailable": "No disponible"
-      },
-      "steps": {
-        "optional": "Pasos de configuración opcionales",
-        "reference": "Pasos de referencia",
-        "recovery": "Pasos de recuperación"
       },
       "badge": {
         "diagnostic": "Diagnósticos incompletos",

@@ -1529,7 +1529,6 @@
     "overview": {
       "title": "État",
       "subtitle": "Préparation, utilisation et santé d'exécution.",
-      "openChat": "Ouvrir le chat",
       "totalTokens": "Total des jetons",
       "totalSessions": "Total des sessions",
       "totalSessionsTitle": "Total des sessions tous statuts confondus",
@@ -1555,6 +1554,7 @@
       "noFindings": "Aucun constat retourné.",
       "recoveryRestart": "La récupération nécessite un redémarrage",
       "openSettings": "Ouvrir les paramètres",
+      "findingDetails": "Détails",
       "findingFallback": "Constat {n}",
       "copyCommand": "Copier la commande",
       "step": "Étape",
@@ -1573,11 +1573,6 @@
         "actionRequired": "Action requise",
         "degraded": "Dégradé",
         "unavailable": "Indisponible"
-      },
-      "steps": {
-        "optional": "Étapes de configuration facultatives",
-        "reference": "Étapes de référence",
-        "recovery": "Étapes de récupération"
       },
       "badge": {
         "diagnostic": "Diagnostics incomplets",

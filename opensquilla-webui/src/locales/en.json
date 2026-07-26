@@ -1529,7 +1529,6 @@
     "overview": {
       "title": "Status",
       "subtitle": "Readiness, usage, and runtime health.",
-      "openChat": "Open chat",
       "totalTokens": "Total tokens",
       "totalSessions": "Total sessions",
       "totalSessionsTitle": "Total sessions across all statuses",
@@ -1555,6 +1554,7 @@
       "noFindings": "No findings returned.",
       "recoveryRestart": "Recovery requires restart",
       "openSettings": "Open settings",
+      "findingDetails": "Details",
       "findingFallback": "Finding {n}",
       "copyCommand": "Copy command",
       "step": "Step",
@@ -1573,11 +1573,6 @@
         "actionRequired": "Action required",
         "degraded": "Degraded",
         "unavailable": "Unavailable"
-      },
-      "steps": {
-        "optional": "Optional setup steps",
-        "reference": "Reference steps",
-        "recovery": "Recovery steps"
       },
       "badge": {
         "diagnostic": "Diagnostics incomplete",
