@@ -504,10 +504,11 @@ function onKeydown(event: KeyboardEvent) {
   flex-direction: column;
   overflow: hidden;
   /* Teleported to <body>; left/top/bottom/width/max-height come from the
-     inline style computed off the input's viewport rect. Sits above the
-     settings dialog (z-index 300). */
+     inline style computed off the input's viewport rect. Keep this above both
+     the settings dialog (300) and its nested provider modal overlay (420), so
+     the list remains interactive and is never visually clipped by the modal. */
   position: fixed;
-  z-index: 400;
+  z-index: 440;
 }
 
 .setup-model-combobox__list {

@@ -34,7 +34,7 @@
         data-testid="sidebar-toggle-expanded"
         @click="toggleDock('sidebar-button')"
       >
-        <Icon name="sidebar-visible" :size="18" />
+        <Icon name="sidebar-toggle" :size="16" />
         <span
           id="sidebar-toggle-tip-expanded"
           class="sidebar-toggle-tip sidebar-toggle-tip--sidebar"
@@ -46,40 +46,25 @@
       </button>
     </div>
 
-    <!-- New chat opens a draft instantly against the default agent; the
-         landing intentionally does not interrupt the flow with a picker. -->
-    <div class="sidebar-actions">
-      <button
-        class="sidebar-new-session"
-        :title="newChatHint ? `Start a new chat (${newChatHint})` : 'Start a new chat'"
-        @click="startNewChatInstant"
-      >
-        <Icon name="plus" :size="16" />
-        <span class="sidebar-new-session__label">{{ t('chrome.newChat') }}</span>
-        <!-- Badge tracks the configured binding and hides when the shortcut is
-             disabled (Settings → Keyboard), so it never advertises a dead key. -->
-        <kbd v-if="newChatHint" class="sidebar-kbd" aria-hidden="true">{{ newChatHint }}</kbd>
-      </button>
-      <!-- Canonical search / go-to. Replaces the rail Search row that truncated;
-           the visible chord keeps the shortcut discoverable for mouse users. -->
-      <button
-        type="button"
-        class="sidebar-cmd-btn"
-        :title="`Search / Go to… (${commandPaletteHint})`"
-        :aria-label="`Search and go to (press ${commandPaletteHint})`"
-        aria-haspopup="dialog"
-        :aria-expanded="commandPaletteOpen"
-        @click="openCommandPalette"
-      >
-        <Icon name="search" :size="16" />
-      </button>
-    </div>
-
     <!-- Always-visible flat nav index. Bounded and self-scrolling under a
          short viewport so it never squeezes Recents, which owns the elastic
          space below; every destination stays a labelled text row. -->
     <div class="sidebar-section sidebar-core" role="navigation" :aria-label="t('chrome.controlNav')">
-      <!-- Sessions / Overview / Skills & Channels / Cron, single-sourced from route
+      <!-- New task leads the index: it opens a draft instantly against the
+           default agent (no picker to interrupt the flow) and reads as a row
+           rather than a boxed button so the sidebar keeps one rhythm. -->
+      <button
+        class="sidebar-new-session"
+        :title="newChatHint ? `${t('chrome.newTaskTitle')} (${newChatHint})` : t('chrome.newTaskTitle')"
+        @click="startNewChatInstant"
+      >
+        <Icon name="plus" :size="16" />
+        <span class="sidebar-new-session__label">{{ t('chrome.newTask') }}</span>
+        <!-- Badge tracks the configured binding and hides when the shortcut is
+             disabled (Settings → Keyboard), so it never advertises a dead key. -->
+        <kbd v-if="newChatHint" class="sidebar-kbd" aria-hidden="true">{{ newChatHint }}</kbd>
+      </button>
+      <!-- Overview / Skills & Channels / Cron, single-sourced from route
            metadata so the rail, mobile drawer, and palette never drift. -->
       <router-link
         v-for="item in workNav"
@@ -92,13 +77,6 @@
       >
         <Icon :name="item.icon" :size="16" />
         <span class="sidebar-fn-label">{{ item.title }}</span>
-        <!-- Live pending-approvals count on the Sessions row: approvals resolve
-             inline in chat; the Sessions attention strip is the queue's home
-             and the topbar pill remains the interrupt affordance. -->
-        <span
-          v-if="item.path === '/sessions' && appStore.approvalCount > 0"
-          class="sidebar-count-badge"
-        >{{ appStore.approvalCount }}</span>
       </router-link>
     </div>
 
@@ -111,12 +89,14 @@
       :loading="isLoading"
       :current-key="currentSessionKey"
       :contract-debug-enabled="contractDebugEnabled"
+      :search-hint="commandPaletteHint"
       @select="switchToSession"
       @refresh="loadSessions"
       @rename="onRenameSession"
       @delete="onDeleteSession"
       @bulk-delete="onBulkDeleteSessions"
       @new-chat="startNewChatInstant"
+      @search="openCommandPalette"
     />
 
     <!-- Fixed footer: settings + connection state -->
@@ -162,7 +142,7 @@
 
   <CommandPalette
     v-model:open="commandPaletteOpen"
-    :hint="commandPaletteHint"
+    :recents="sidebarSections"
     @new-chat="onPaletteNewChat"
     @open-settings="onPaletteOpenSettings"
     @toggle-theme="onPaletteToggleTheme"
@@ -198,7 +178,7 @@
           data-testid="sidebar-toggle-collapsed"
           @click="toggleDock('topbar-button')"
         >
-          <Icon name="sidebar-hidden" :size="18" />
+          <Icon name="sidebar-toggle" :size="16" />
           <span id="sidebar-toggle-tip-collapsed" class="sidebar-toggle-tip" role="tooltip">
             <span>{{ t('chrome.toggleSidebar') }}</span>
             <kbd v-if="sidebarToggleHint">{{ sidebarToggleHint }}</kbd>
@@ -591,7 +571,7 @@ const isMobileMoreActive = computed(() =>
   appStore.sidebarOpen || MOBILE_MORE_PATHS.has($route.path))
 
 function isPrimaryNavActive(path: string): boolean {
-  if (path === '/overview') return isOverviewNavActive.value
+  if (path === '/usage') return isOverviewNavActive.value
   if (path === '/skills') return isSkillsChannelsHubActive.value
   return isNavActive(path)
 }
