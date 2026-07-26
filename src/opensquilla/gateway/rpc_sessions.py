@@ -1622,10 +1622,31 @@ async def _accepted_turn_response(
             payload["surface_id"] = surface_id
             payload["surfaceId"] = surface_id
 
+    async def _apply_persisted_identity_context() -> None:
+        try:
+            get_transcript = getattr(storage, "get_canonical_transcript", None)
+            if not callable(get_transcript):
+                get_transcript = storage.get_transcript
+            entries = await get_transcript(receipt.session_id)
+            accepted_entry = next(
+                (entry for entry in entries if entry.message_id == receipt.message_id),
+                None,
+            )
+            if accepted_entry is not None and isinstance(accepted_entry.turn_context, dict):
+                _apply_identity_context(accepted_entry.turn_context)
+        except Exception:  # noqa: BLE001 - accepted response remains deliverable.
+            log.exception(
+                "sessions.send.accepted_identity_read_failed",
+                session_id=receipt.session_id,
+                message_id=receipt.message_id,
+            )
+
     if isinstance(turn_context, dict):
         _apply_identity_context(turn_context)
 
     if receipt.task_id is None:
+        if turn_context is None:
+            await _apply_persisted_identity_context()
         return payload
     try:
         task_record = await storage.get_agent_task(receipt.task_id)
@@ -1666,23 +1687,7 @@ async def _accepted_turn_response(
             # A collected task can own several independently identified
             # prompts. The transcript row, not the task's first metadata
             # snapshot, is canonical for a replay of a later input.
-            try:
-                get_transcript = getattr(storage, "get_canonical_transcript", None)
-                if not callable(get_transcript):
-                    get_transcript = storage.get_transcript
-                entries = await get_transcript(receipt.session_id)
-                accepted_entry = next(
-                    (entry for entry in entries if entry.message_id == receipt.message_id),
-                    None,
-                )
-                if accepted_entry is not None and isinstance(accepted_entry.turn_context, dict):
-                    _apply_identity_context(accepted_entry.turn_context)
-            except Exception:  # noqa: BLE001 - accepted response remains deliverable.
-                log.exception(
-                    "sessions.send.accepted_identity_read_failed",
-                    session_id=receipt.session_id,
-                    message_id=receipt.message_id,
-                )
+            await _apply_persisted_identity_context()
 
     if result.task_status is None:
         return payload

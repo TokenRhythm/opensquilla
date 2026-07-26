@@ -532,6 +532,8 @@ async def test_project_first_send_without_task_runtime_is_atomic(
             "message": "pwd",
             "workspaceId": project.workspace_id,
             "clientRequestId": "direct-1",
+            "clientMessageId": "direct-client-message",
+            "surfaceId": "webui:direct-project",
         }
         accepted = await get_dispatcher().dispatch(
             "direct-project",
@@ -561,7 +563,10 @@ async def test_project_first_send_without_task_runtime_is_atomic(
         await asyncio.sleep(0)
         assert replay.ok is True
         assert replay.payload["replayed"] is True
+        for field in ("turn_id", "client_message_id", "surface_id"):
+            assert replay.payload[field] == accepted.payload[field]
         assert run_count == 1
+        assert len(await stack.storage.get_transcript(session.session_id)) == 1
 
 
 @pytest.mark.asyncio
