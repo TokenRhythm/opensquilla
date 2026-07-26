@@ -1206,6 +1206,159 @@ def test_claimed_approval_reappears_after_claim_lease_expires(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_rpc_once_rw_mount_preserves_durable_ro_through_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import json
+
+    from opensquilla.gateway.rpc_sandbox import _handle_sandbox_mount_add
+    from opensquilla.sandbox.escalation import (
+        current_tool_run_context,
+        prune_once_mount_grants,
+        reset_resolved_run_context_overlays,
+        resolved_run_context_overlay,
+    )
+    from opensquilla.sandbox.operation_runtime import SandboxOperationResult
+    from opensquilla.sandbox.run_context import (
+        MountGrant,
+        RunContext,
+        get_run_context,
+    )
+    from opensquilla.sandbox.run_mode import RunMode
+    from opensquilla.tools.builtin import filesystem
+    from opensquilla.tools.types import ToolContext, current_tool_context
+
+    manager = _SessionManager()
+    ctx = _ctx(manager)
+    workspace = tmp_path / "workspace"
+    mounted = tmp_path / "mounted"
+    workspace.mkdir()
+    mounted.mkdir()
+    base = RunContext(
+        run_mode=RunMode.STANDARD,
+        workspace=str(workspace),
+        mounts=(MountGrant(path=str(mounted), access="ro", scope="chat"),),
+        run_mode_source="user",
+        source="saved",
+    )
+    manager.node.origin = {RUN_CONTEXT_ORIGIN_KEY: base.to_origin_payload()}
+
+    result = await _handle_sandbox_mount_add(
+        {
+            "sessionKey": manager.node.session_key,
+            "path": str(mounted),
+            "access": "rw",
+            "scope": "once",
+        },
+        ctx,
+    )
+
+    assert result["mounts"] == [
+        {"path": str(mounted), "access": "ro", "scope": "chat"},
+        {"path": str(mounted), "access": "rw", "scope": "once"},
+    ]
+    assert manager.node.origin[RUN_CONTEXT_ORIGIN_KEY]["mounts"] == [
+        {"path": str(mounted), "access": "ro", "scope": "chat"}
+    ]
+
+    backend_operations: list[object] = []
+
+    class RecordingFilesystemBackend:
+        name = "recording-filesystem"
+
+        def operation_domains_supported(self) -> frozenset[str]:
+            return frozenset({"filesystem"})
+
+        async def run_operation(self, operation: object) -> SandboxOperationResult:
+            backend_operations.append(operation)
+            request = operation.request
+            assert request.path is not None
+            request.path.write_text(request.content, encoding="utf-8")
+            return SandboxOperationResult(
+                message=f"sandboxed write: {request.path}",
+                created=True,
+            )
+
+    monkeypatch.setattr(
+        filesystem,
+        "get_runtime",
+        lambda: SimpleNamespace(
+            effective=SimpleNamespace(sandbox_enabled=True),
+            backend=RecordingFilesystemBackend(),
+            settings=SimpleNamespace(host_root_readonly=False),
+            workspace=workspace,
+        ),
+    )
+    active_context = ToolContext(
+        is_owner=True,
+        session_key=manager.node.session_key,
+        workspace_dir=str(workspace),
+        sandbox_run_context=base,
+    )
+    setattr(active_context, "_sandbox_run_context_fresh", True)
+    token = current_tool_context.set(active_context)
+    try:
+        active = current_tool_run_context()
+        assert active is not None
+        assert [(grant.access, grant.scope) for grant in active.mounts] == [
+            ("rw", "once")
+        ]
+        allowed_target = mounted / "rpc-allowed-once.txt"
+        allowed = await filesystem.write_file(
+            str(allowed_target),
+            "allowed",
+        )
+        assert allowed == f"sandboxed write: {allowed_target}"
+        assert allowed_target.read_text(encoding="utf-8") == "allowed"
+    finally:
+        current_tool_context.reset(token)
+
+    assert prune_once_mount_grants(manager.node.session_key) == 1
+    overlay = resolved_run_context_overlay(
+        manager.node.session_key,
+        str(workspace),
+    )
+    assert overlay is not None
+    assert [(grant.access, grant.scope) for grant in overlay.mounts] == [
+        ("ro", "chat")
+    ]
+
+    reset_resolved_run_context_overlays()
+    restored = await get_run_context(
+        manager,
+        manager.node.session_key,
+        config=ctx.config,
+        workspace=str(workspace),
+    )
+    assert [(grant.access, grant.scope) for grant in restored.mounts] == [
+        ("ro", "chat")
+    ]
+    expired_context = ToolContext(
+        is_owner=True,
+        session_key=manager.node.session_key,
+        workspace_dir=str(workspace),
+        sandbox_run_context=restored,
+    )
+    setattr(expired_context, "_sandbox_run_context_fresh", True)
+    expired_token = current_tool_context.set(expired_context)
+    try:
+        blocked_target = mounted / "rpc-blocked-after-expiry.txt"
+        blocked = json.loads(
+            await filesystem.write_file(
+                str(blocked_target),
+                "blocked",
+            )
+        )
+        assert blocked["status"] == "elevation_required"
+        assert blocked["reason"] == "mount_requires_write_access"
+        assert not blocked_target.exists()
+    finally:
+        current_tool_context.reset(expired_token)
+    assert len(backend_operations) == 1
+
+
+@pytest.mark.asyncio
 async def test_rpc_mount_remove_updates_resolved_overlay_for_current_tool_mounts() -> None:
     from opensquilla.gateway.rpc_sandbox import _handle_sandbox_mount_remove
     from opensquilla.sandbox.escalation import current_tool_mounts, remember_resolved_run_context

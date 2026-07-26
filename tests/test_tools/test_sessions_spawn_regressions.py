@@ -16,11 +16,26 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
-from opensquilla.sandbox.run_context import RunContext
+from opensquilla.engine.types import DoneEvent
+from opensquilla.gateway.boot import dispatch_task_runtime_turn
+from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.task_runtime import TaskRun
+from opensquilla.sandbox.run_context import (
+    RUN_CONTEXT_ORIGIN_KEY,
+    DomainGrant,
+    MountGrant,
+    RunContext,
+    TemporaryGrant,
+)
 from opensquilla.sandbox.run_mode import RunMode
+from opensquilla.session.manager import SessionManager
+from opensquilla.session.storage import SessionStorage
 from opensquilla.tools.builtin import sessions as sessions_tool
 from opensquilla.tools.types import CallerKind, ToolContext, current_tool_context
 
@@ -126,7 +141,14 @@ class _StubTaskRuntime:
         self.enqueued: list[dict] = []
 
     async def enqueue(self, envelope, message, mode="followup", run_kind="default"):
-        self.enqueued.append({"envelope": envelope, "run_kind": run_kind})
+        self.enqueued.append(
+            {
+                "envelope": envelope,
+                "message": message,
+                "mode": mode,
+                "run_kind": run_kind,
+            }
+        )
 
         @dataclass
         class _Handle:
@@ -342,3 +364,453 @@ async def test_session_status_uses_current_tool_context_session_key() -> None:
     assert payload["model"] == expected.model
     assert payload["run_mode"] == "full"
     assert payload["sandbox_enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_spawned_child_restart_uses_persisted_inherited_authority_at_boot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.sandbox.escalation import (
+        current_tool_run_context,
+        reset_resolved_run_context_overlays,
+    )
+    from opensquilla.sandbox.network_guard import decide_network_access
+    from opensquilla.sandbox.operation_runtime import SandboxOperationResult
+    from opensquilla.tools.builtin import filesystem
+
+    reset_resolved_run_context_overlays()
+    database = tmp_path / "sessions.db"
+    workspace = tmp_path / "global-workspace"
+    mounted = tmp_path / "parent-scoped-mount"
+    one_shot = tmp_path / "parent-once-mount"
+    for path in (workspace, mounted, one_shot):
+        path.mkdir()
+    config = GatewayConfig(
+        workspace_dir=str(workspace),
+        sandbox={"run_mode": "full"},
+        memory={"flush_enabled": False},
+        naming={"enabled": False},
+        agent_stream_heartbeat_interval_seconds=0.0,
+        agent_stream_idle_timeout_seconds=1.0,
+    )
+    storage = await SessionStorage.open(str(database))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    parent_key = "agent:main:webchat:spawn-parent-restart"
+    parent_context = RunContext(
+        run_mode=RunMode.STANDARD,
+        workspace=str(workspace),
+        mounts=(
+            MountGrant(path=str(mounted), access="rw", scope="chat"),
+            MountGrant(path=str(one_shot), access="rw", scope="once"),
+        ),
+        domains=(
+            DomainGrant(
+                domain="inherited.example",
+                scope="chat",
+                source="manual",
+            ),
+            DomainGrant(
+                domain="parent-once.example",
+                scope="once",
+                source="manual",
+            ),
+        ),
+        temporary_grants=(
+            TemporaryGrant(
+                kind="domain",
+                value="temporary.example",
+                fingerprint="parent-fingerprint",
+            ),
+        ),
+        run_mode_source="user",
+        source="resolved_overlay",
+    )
+    await manager.create(
+        parent_key,
+        origin={RUN_CONTEXT_ORIGIN_KEY: parent_context.to_origin_payload()},
+    )
+    runtime = _StubTaskRuntime()
+    sessions_tool.set_gateway_config(config)
+    sessions_tool.set_session_manager(manager)
+    sessions_tool.set_task_runtime(runtime)
+    parent_tool_context = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.AGENT,
+        subagent_depth=0,
+        agent_id="main",
+        workspace_dir=str(workspace),
+        run_mode="standard",
+        sandbox_mounts=parent_context.to_origin_payload()["mounts"],
+        sandbox_run_context=parent_context,
+        session_key=parent_key,
+        task_id="parent-task-restart",
+    )
+    setattr(parent_tool_context, "_sandbox_run_context_fresh", True)
+    token = current_tool_context.set(parent_tool_context)
+    try:
+        spawned = json.loads(
+            await sessions_tool.sessions_spawn(task="exercise inherited authority")
+        )
+    finally:
+        current_tool_context.reset(token)
+    child_key = spawned["session_key"]
+    queued = runtime.enqueued[0]
+    queued_run = TaskRun(
+        task_id=spawned["task_id"],
+        envelope=queued["envelope"],
+        message=queued["message"],
+        queue_mode=queued["mode"],
+        run_kind=queued["run_kind"],
+    )
+
+    # Mutating the parent after spawn must not affect the isolated child row.
+    await manager.update(
+        parent_key,
+        origin={
+            RUN_CONTEXT_ORIGIN_KEY: RunContext(
+                run_mode=RunMode.FULL,
+                workspace=str(workspace),
+                source="saved",
+            ).to_origin_payload()
+        },
+    )
+    await storage.close()
+
+    restarted_storage = await SessionStorage.open(str(database))
+    restarted_manager = SessionManager(restarted_storage, inject_time_prefix=False)
+    backend_operations: list[Any] = []
+
+    class RecordingFilesystemBackend:
+        name = "recording-filesystem"
+
+        def operation_domains_supported(self) -> frozenset[str]:
+            return frozenset({"filesystem"})
+
+        async def run_operation(self, operation: Any) -> SandboxOperationResult:
+            backend_operations.append(operation)
+            request = operation.request
+            assert request.path is not None
+            request.path.write_text(request.content, encoding="utf-8")
+            return SandboxOperationResult(
+                message=f"sandboxed write: {request.path}",
+                created=True,
+            )
+
+    monkeypatch.setattr(
+        filesystem,
+        "get_runtime",
+        lambda: SimpleNamespace(
+            effective=SimpleNamespace(sandbox_enabled=True),
+            backend=RecordingFilesystemBackend(),
+            settings=SimpleNamespace(host_root_readonly=False),
+            workspace=workspace,
+        ),
+    )
+    observations: dict[str, Any] = {}
+    target = mounted / "child-write.txt"
+
+    class Runner:
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            tool_context = kwargs["tool_context"]
+            child_token = current_tool_context.set(tool_context)
+            try:
+                effective = current_tool_run_context()
+                assert effective is not None
+                observations.update(
+                    {
+                        "mode": effective.run_mode,
+                        "source": effective.source,
+                        "run_mode_source": effective.run_mode_source,
+                        "mounts": effective.mounts,
+                        "granted_network": decide_network_access(
+                            "inherited.example",
+                            effective,
+                        ),
+                        "unknown_network": decide_network_access(
+                            "not-inherited.example",
+                            effective,
+                        ),
+                        "write": await filesystem.write_file(
+                            str(target),
+                            "inherited",
+                        ),
+                        "caller_kind": tool_context.caller_kind,
+                        "subagent_depth": tool_context.subagent_depth,
+                    }
+                )
+            finally:
+                current_tool_context.reset(child_token)
+            yield DoneEvent()
+
+    async def emit(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    try:
+        await dispatch_task_runtime_turn(
+            queued_run,
+            config=config,
+            session_manager=restarted_manager,
+            turn_runner=Runner(),
+            event_emitter=emit,
+        )
+
+        assert observations["mode"] is RunMode.STANDARD
+        assert observations["source"] == "route_metadata"
+        assert observations["run_mode_source"] == "user"
+        assert [(grant.path, grant.access, grant.scope) for grant in observations["mounts"]] == [
+            (str(mounted), "rw", "chat")
+        ]
+        assert observations["granted_network"].reason == "domain_grant"
+        assert observations["unknown_network"].status == "ask"
+        assert observations["unknown_network"].reason == "unknown_domain"
+        assert observations["caller_kind"] is CallerKind.SUBAGENT
+        assert observations["subagent_depth"] == 1
+        assert len(backend_operations) == 1
+        assert target.read_text(encoding="utf-8") == "inherited"
+
+        child = await restarted_storage.get_session(child_key)
+        assert child is not None
+        assert child.spawn_depth == 1
+        assert child.parent_session_key == parent_key
+        assert child.origin is not None
+        assert child.origin["parent_task_id"] == "parent-task-restart"
+        assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["run_mode"] == "standard"
+        assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["run_mode_source"] == "user"
+        assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["mounts"] == [
+            {"path": str(mounted), "access": "rw", "scope": "chat"}
+        ]
+        assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["domains"] == [
+            {
+                "domain": "inherited.example",
+                "scope": "chat",
+                "source": "manual",
+            }
+        ]
+        assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["temporary_grants"] == []
+        assert queued_run.envelope.input_provenance == {
+            "kind": "subagent_task",
+            "parent_session_key": parent_key,
+            "run_id": None,
+            "parent_task_id": "parent-task-restart",
+        }
+    finally:
+        await restarted_storage.close()
+        reset_resolved_run_context_overlays()
+
+
+@pytest.mark.asyncio
+async def test_project_spawned_child_persists_binding_and_revalidates_queued_execution(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.project_workspaces import (
+        ProjectWorkspaceStateError,
+        project_path_key,
+    )
+    from opensquilla.sandbox.escalation import (
+        current_tool_run_context,
+        reset_resolved_run_context_overlays,
+    )
+    from opensquilla.sandbox.network_guard import decide_network_access
+    from opensquilla.sandbox.operation_runtime import SandboxOperationResult
+    from opensquilla.tools.builtin import filesystem
+
+    reset_resolved_run_context_overlays()
+    database = tmp_path / "project-sessions.db"
+    global_workspace = tmp_path / "global-workspace"
+    project_path = tmp_path / "project"
+    stale_workspace = tmp_path / "stale-parent-origin"
+    mounted = tmp_path / "project-parent-scoped-mount"
+    for path in (global_workspace, project_path, stale_workspace, mounted):
+        path.mkdir()
+    config = GatewayConfig(
+        workspace_dir=str(global_workspace),
+        sandbox={"run_mode": "full"},
+        memory={"flush_enabled": False},
+        naming={"enabled": False},
+        agent_stream_heartbeat_interval_seconds=0.0,
+        agent_stream_idle_timeout_seconds=1.0,
+    )
+    storage = await SessionStorage.open(str(database))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    project = await storage.create_or_restore_project_workspace(
+        path=str(project_path),
+        path_key=project_path_key(project_path, strict=True),
+        display_name="Project",
+        trusted_at=1,
+    )
+    parent_key = "agent:main:webchat:project-spawn-parent"
+    await manager.create(
+        parent_key,
+        workspace_id=project.workspace_id,
+        origin={
+            RUN_CONTEXT_ORIGIN_KEY: RunContext(
+                run_mode=RunMode.FULL,
+                workspace=str(stale_workspace),
+                run_mode_source="user",
+                source="saved",
+            ).to_origin_payload()
+        },
+    )
+    authoritative_parent = RunContext(
+        run_mode=RunMode.STANDARD,
+        workspace=str(project_path),
+        mounts=(MountGrant(path=str(mounted), access="rw", scope="chat"),),
+        domains=(
+            DomainGrant(
+                domain="project-inherited.example",
+                scope="chat",
+                source="manual",
+            ),
+        ),
+        run_mode_source="project_default",
+        source="resolved_overlay",
+    )
+    runtime = _StubTaskRuntime()
+    sessions_tool.set_gateway_config(config)
+    sessions_tool.set_session_manager(manager)
+    sessions_tool.set_task_runtime(runtime)
+    parent_tool_context = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.AGENT,
+        subagent_depth=0,
+        agent_id="main",
+        workspace_dir=str(project_path),
+        run_mode="standard",
+        sandbox_mounts=authoritative_parent.to_origin_payload()["mounts"],
+        sandbox_run_context=authoritative_parent,
+        session_key=parent_key,
+        task_id="project-parent-task",
+    )
+    setattr(parent_tool_context, "_sandbox_run_context_fresh", True)
+    token = current_tool_context.set(parent_tool_context)
+    try:
+        spawned = json.loads(
+            await sessions_tool.sessions_spawn(task="exercise project authority")
+        )
+    finally:
+        current_tool_context.reset(token)
+    child_key = spawned["session_key"]
+    queued = runtime.enqueued[0]
+    queued_run = TaskRun(
+        task_id=spawned["task_id"],
+        envelope=queued["envelope"],
+        message=queued["message"],
+        queue_mode=queued["mode"],
+        run_kind=queued["run_kind"],
+    )
+
+    # Parent rebinding after spawn cannot change the child's isolated binding.
+    await storage.bind_session_workspace(parent_key, None)
+    await storage.close()
+    restarted_storage = await SessionStorage.open(str(database))
+    restarted_manager = SessionManager(restarted_storage, inject_time_prefix=False)
+    backend_operations: list[Any] = []
+
+    class RecordingFilesystemBackend:
+        name = "recording-filesystem"
+
+        def operation_domains_supported(self) -> frozenset[str]:
+            return frozenset({"filesystem"})
+
+        async def run_operation(self, operation: Any) -> SandboxOperationResult:
+            backend_operations.append(operation)
+            request = operation.request
+            assert request.path is not None
+            request.path.write_text(request.content, encoding="utf-8")
+            return SandboxOperationResult(
+                message=f"sandboxed write: {request.path}",
+                created=True,
+            )
+
+    monkeypatch.setattr(
+        filesystem,
+        "get_runtime",
+        lambda: SimpleNamespace(
+            effective=SimpleNamespace(sandbox_enabled=True),
+            backend=RecordingFilesystemBackend(),
+            settings=SimpleNamespace(host_root_readonly=False),
+            workspace=project_path,
+        ),
+    )
+    observations: list[dict[str, Any]] = []
+    target = mounted / "project-child-write.txt"
+
+    class Runner:
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            tool_context = kwargs["tool_context"]
+            child_token = current_tool_context.set(tool_context)
+            try:
+                effective = current_tool_run_context()
+                assert effective is not None
+                observations.append(
+                    {
+                        "mode": effective.run_mode,
+                        "workspace": effective.workspace,
+                        "run_mode_source": effective.run_mode_source,
+                        "network": decide_network_access(
+                            "project-inherited.example",
+                            effective,
+                        ),
+                        "write": await filesystem.write_file(
+                            str(target),
+                            "project-inherited",
+                        ),
+                    }
+                )
+            finally:
+                current_tool_context.reset(child_token)
+            yield DoneEvent()
+
+    emitted: list[tuple[Any, ...]] = []
+
+    async def emit(*args: Any, **kwargs: Any) -> None:
+        emitted.append(args)
+
+    try:
+        await dispatch_task_runtime_turn(
+            queued_run,
+            config=config,
+            session_manager=restarted_manager,
+            turn_runner=Runner(),
+            event_emitter=emit,
+        )
+        child = await restarted_storage.get_session(child_key)
+        assert child is not None
+        assert child.workspace_id == project.workspace_id
+        assert child.origin is not None
+        assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["workspace"] == str(project_path)
+        assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["run_mode"] == "standard"
+        assert observations == [
+            {
+                "mode": RunMode.STANDARD,
+                "workspace": str(project_path),
+                "run_mode_source": "project_default",
+                "network": observations[0]["network"],
+                "write": f"sandboxed write: {target}",
+            }
+        ]
+        assert observations[0]["network"].reason == "domain_grant"
+        assert len(backend_operations) == 1
+        assert target.read_text(encoding="utf-8") == "project-inherited"
+
+        await restarted_storage.remove_project_workspace(project.workspace_id)
+        with pytest.raises(ProjectWorkspaceStateError, match="removed"):
+            await dispatch_task_runtime_turn(
+                TaskRun(
+                    task_id="project-child-retry",
+                    envelope=queued_run.envelope,
+                    message="queued after project removal",
+                    run_kind="subagent",
+                ),
+                config=config,
+                session_manager=restarted_manager,
+                turn_runner=Runner(),
+                event_emitter=emit,
+            )
+        assert len(observations) == 1
+        assert emitted
+    finally:
+        await restarted_storage.close()
+        reset_resolved_run_context_overlays()

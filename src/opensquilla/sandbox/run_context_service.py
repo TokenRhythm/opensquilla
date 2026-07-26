@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
@@ -156,6 +157,30 @@ async def add_mount_grant(
     if grant.scope == "workspace":
         def apply_user_store(grant: MountGrant = grant) -> None:
             _upsert_user_mount_grant(grant)
+
+    if grant.scope == "once":
+        grant_key = os.path.normcase(grant.path)
+        mounts = tuple(
+            existing_grant
+            for existing_grant in existing.mounts
+            if not (
+                existing_grant.scope == "once"
+                and os.path.normcase(
+                    _mount_grant_storage_path(existing_grant.path)
+                )
+                == grant_key
+            )
+        ) + (grant,)
+        await persist_run_context(
+            session_manager,
+            session_key,
+            existing,
+        )
+        return replace(
+            existing,
+            mounts=mounts,
+            source="resolved_overlay",
+        )
 
     if grant in existing.mounts:
         if apply_user_store is not None:

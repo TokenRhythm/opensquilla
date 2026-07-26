@@ -3382,6 +3382,190 @@ async def test_same_root_once_rw_overlay_writes_then_expiry_restores_base_ro(
 
 
 @pytest.mark.asyncio
+async def test_path_allow_once_rw_preserves_durable_same_root_ro_after_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.gateway.approval_queue import reset_approval_queue
+    from opensquilla.sandbox import escalation as escalation_state
+    from opensquilla.sandbox.escalation import (
+        apply_sandbox_approval_choice,
+        build_path_approval_params,
+        current_tool_run_context,
+        prune_once_mount_grants,
+        request_sandbox_approval,
+        reset_resolved_run_context_overlays,
+    )
+    from opensquilla.sandbox.operation_runtime import SandboxOperationResult
+    from opensquilla.sandbox.path_validation import MountDecision
+    from opensquilla.sandbox.run_context import (
+        RUN_CONTEXT_ORIGIN_KEY,
+        MountGrant,
+        RunContext,
+        get_run_context,
+    )
+    from opensquilla.sandbox.run_mode import RunMode
+    from opensquilla.tools.builtin import filesystem
+    from opensquilla.tools.types import ToolContext, current_tool_context
+
+    reset_approval_queue()
+    reset_resolved_run_context_overlays()
+    manager = _SessionManager()
+    workspace = tmp_path / "workspace"
+    mounted = tmp_path / "mounted"
+    workspace.mkdir()
+    mounted.mkdir()
+    base = RunContext(
+        run_mode=RunMode.STANDARD,
+        workspace=str(workspace),
+        mounts=(MountGrant(path=str(mounted), access="ro", scope="chat"),),
+        run_mode_source="user",
+        source="saved",
+    )
+    manager.node.origin = {RUN_CONTEXT_ORIGIN_KEY: base.to_origin_payload()}
+    params = build_path_approval_params(
+        MountDecision(
+            status="request",
+            normalized_path=str(mounted),
+            access="rw",
+            reason="mount_requires_write_access",
+        ),
+        session_key=manager.node.session_key,
+        workspace=str(workspace),
+    )
+    assert params is not None
+    approval_context = ToolContext(
+        is_owner=True,
+        session_key=manager.node.session_key,
+        workspace_dir=str(workspace),
+        sandbox_run_context=base,
+    )
+    setattr(approval_context, "_sandbox_run_context_fresh", True)
+    token = current_tool_context.set(approval_context)
+    try:
+        approval = request_sandbox_approval(
+            params,
+            message="Approve one write without replacing durable read access.",
+        )
+    finally:
+        current_tool_context.reset(token)
+    assert approval is not None
+    approval_id = str(approval["approval_id"])
+
+    backend_operations: list[object] = []
+
+    class RecordingFilesystemBackend:
+        name = "recording-filesystem"
+
+        def operation_domains_supported(self) -> frozenset[str]:
+            return frozenset({"filesystem"})
+
+        async def run_operation(self, operation: object) -> SandboxOperationResult:
+            backend_operations.append(operation)
+            request = operation.request
+            assert request.path is not None
+            request.path.write_text(request.content, encoding="utf-8")
+            return SandboxOperationResult(
+                message=f"sandboxed write: {request.path}",
+                created=True,
+            )
+
+    monkeypatch.setattr(
+        filesystem,
+        "get_runtime",
+        lambda: SimpleNamespace(
+            effective=SimpleNamespace(sandbox_enabled=True),
+            backend=RecordingFilesystemBackend(),
+            settings=SimpleNamespace(host_root_readonly=False),
+            workspace=workspace,
+        ),
+    )
+
+    try:
+        await apply_sandbox_approval_choice(
+            params,
+            approval_id=approval_id,
+            choice="allow_once",
+            approved=True,
+            session_manager=manager,
+            config=_config(),
+        )
+
+        persisted = manager.node.origin[RUN_CONTEXT_ORIGIN_KEY]
+        assert persisted["mounts"] == [
+            {"path": str(mounted), "access": "ro", "scope": "chat"}
+        ]
+        assert approval_id not in escalation_state._APPROVAL_RUN_CONTEXT_GENERATIONS
+
+        active_context = ToolContext(
+            is_owner=True,
+            session_key=manager.node.session_key,
+            workspace_dir=str(workspace),
+            sandbox_run_context=base,
+        )
+        setattr(active_context, "_sandbox_run_context_fresh", True)
+        active_token = current_tool_context.set(active_context)
+        try:
+            active = current_tool_run_context()
+            assert active is not None
+            assert [(grant.access, grant.scope) for grant in active.mounts] == [
+                ("rw", "once")
+            ]
+            allowed_target = mounted / "allowed-once.txt"
+            allowed = await filesystem.write_file(
+                str(allowed_target),
+                "allowed",
+            )
+            assert allowed == f"sandboxed write: {allowed_target}"
+            assert allowed_target.read_text(encoding="utf-8") == "allowed"
+        finally:
+            current_tool_context.reset(active_token)
+
+        assert prune_once_mount_grants(manager.node.session_key) == 1
+        reset_resolved_run_context_overlays()
+        restored = await get_run_context(
+            manager,
+            manager.node.session_key,
+            config=_config(),
+            workspace=str(workspace),
+        )
+        assert [(grant.access, grant.scope) for grant in restored.mounts] == [
+            ("ro", "chat")
+        ]
+
+        expired_context = ToolContext(
+            is_owner=True,
+            session_key=manager.node.session_key,
+            workspace_dir=str(workspace),
+            sandbox_run_context=restored,
+        )
+        setattr(expired_context, "_sandbox_run_context_fresh", True)
+        expired_token = current_tool_context.set(expired_context)
+        try:
+            expired = current_tool_run_context()
+            assert expired is not None
+            assert [(grant.access, grant.scope) for grant in expired.mounts] == [
+                ("ro", "chat")
+            ]
+            blocked_target = mounted / "blocked-after-expiry.txt"
+            blocked = json.loads(
+                await filesystem.write_file(
+                    str(blocked_target),
+                    "blocked",
+                )
+            )
+            assert blocked["status"] == "elevation_required"
+            assert blocked["reason"] == "mount_requires_write_access"
+            assert not blocked_target.exists()
+        finally:
+            current_tool_context.reset(expired_token)
+        assert len(backend_operations) == 1
+    finally:
+        reset_approval_queue()
+        reset_resolved_run_context_overlays()
+
+
+@pytest.mark.asyncio
 async def test_project_path_once_preserves_authoritative_tool_context(tmp_path):
     from opensquilla.gateway.approval_queue import reset_approval_queue
     from opensquilla.sandbox.escalation import (
