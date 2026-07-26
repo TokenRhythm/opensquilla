@@ -7,7 +7,9 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -51,6 +53,42 @@ class _RecordingConsole:
 
     def print(self, *args: Any, **kwargs: Any) -> None:
         self.payloads.extend(args)
+
+
+def _retarget_directory_link(link: Path, target: Path, backup: Path) -> None:
+    link.rename(backup)
+    if os.name != "nt":
+        link.symlink_to(target, target_is_directory=True)
+        return
+    result = subprocess.run(
+        [
+            "cmd",
+            "/d",
+            "/s",
+            "/c",
+            "mklink",
+            "/J",
+            str(link),
+            str(target),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        backup.rename(link)
+        pytest.skip(f"could not create junction: {result.stderr or result.stdout}")
+
+
+def _restore_retargeted_directory(link: Path, backup: Path) -> None:
+    if not backup.exists():
+        return
+    if os.path.lexists(link):
+        if os.name == "nt":
+            os.rmdir(link)
+        else:
+            link.unlink()
+    backup.rename(link)
 
 
 def _standalone_deps(
@@ -327,7 +365,6 @@ async def test_standalone_dispatch_uses_bound_project_workspace_over_tampered_or
     assert captured_contexts[0].workspace_dir == project.path
 
 
-@pytest.mark.skipif(os.name == "nt", reason="requires POSIX symlinks")
 @pytest.mark.asyncio
 async def test_standalone_dispatch_revalidates_project_on_every_input(
     monkeypatch: pytest.MonkeyPatch,
@@ -338,6 +375,7 @@ async def test_standalone_dispatch_revalidates_project_on_every_input(
     storage = await SessionStorage.open(str(tmp_path / "tui-retarget.db"))
     manager = SessionManager(storage, inject_time_prefix=False)
     project_path = tmp_path / "project"
+    project_backup = tmp_path / "project-old"
     replacement = tmp_path / "replacement"
     project_path.mkdir()
     replacement.mkdir()
@@ -392,8 +430,7 @@ async def test_standalone_dispatch_revalidates_project_on_every_input(
         )
 
     async def run_repl(*, surface: Surface, scope: Any, dispatch: Any) -> None:
-        project_path.rename(tmp_path / "project-old")
-        project_path.symlink_to(replacement, target_is_directory=True)
+        _retarget_directory_link(project_path, replacement, project_backup)
         assert await dispatch("pwd") is True
 
     deps = _standalone_deps(
@@ -409,6 +446,114 @@ async def test_standalone_dispatch_revalidates_project_on_every_input(
             deps=deps,
         )
     finally:
+        _restore_retargeted_directory(project_path, project_backup)
+        await storage.close()
+
+    assert calls == []
+    assert any("canonical_changed" in str(payload) for payload in output.payloads)
+
+
+@pytest.mark.asyncio
+async def test_standalone_revalidates_session_replaced_by_slash_command_before_execution(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.cli.tui import standalone_runtime
+
+    storage = await SessionStorage.open(str(tmp_path / "tui-replaced-session.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    project_path = tmp_path / "project"
+    project_backup = tmp_path / "project-old"
+    replacement = tmp_path / "replacement"
+    project_path.mkdir()
+    replacement.mkdir()
+    project = await storage.create_or_restore_project_workspace(
+        path=str(project_path.resolve()),
+        path_key=project_path_key(project_path, strict=True),
+        display_name="project",
+        trusted_at=1,
+    )
+    initial_key = "agent:main:standalone:before-new"
+    original_get_or_create = manager.get_or_create
+
+    async def bind_replacement_session(
+        session_key: str,
+        agent_id: str = "main",
+        **kwargs: Any,
+    ):
+        session, created = await original_get_or_create(
+            session_key,
+            agent_id=agent_id,
+            **kwargs,
+        )
+        if session_key != initial_key:
+            session = await manager.update(
+                session_key,
+                workspace_id=project.workspace_id,
+                origin={
+                    RUN_CONTEXT_ORIGIN_KEY: {
+                        "run_mode": "standard",
+                        "workspace": project.path,
+                    }
+                },
+            )
+        return session, created
+
+    manager.get_or_create = bind_replacement_session  # type: ignore[method-assign]
+    services = _FakeServices(
+        config=GatewayConfig(workspace_dir=str(tmp_path / "default")),
+        session_manager=manager,
+    )
+
+    async def fake_build_services() -> _FakeServices:
+        return services
+
+    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
+    monkeypatch.setattr(
+        "opensquilla.gateway.build_turn_runner_from_services",
+        lambda _services: object(),
+    )
+    calls: list[tuple[str, str]] = []
+    output = _RecordingConsole()
+
+    async def stream_response(
+        turn_runner: object,
+        session_key: str,
+        tool_ctx: object,
+        message: str,
+        **kwargs: Any,
+    ) -> TurnResult:
+        del turn_runner, tool_ctx, kwargs
+        calls.append((session_key, message))
+        return TurnResult(
+            text="unsafe",
+            usage=UsageSummary(input_tokens=1, output_tokens=1),
+            model_after=None,
+        )
+
+    async def run_repl(*, surface: Surface, scope: Any, dispatch: Any) -> None:
+        assert await dispatch("/new") is True
+        assert scope["session_key"] != initial_key
+        _retarget_directory_link(project_path, replacement, project_backup)
+        assert await dispatch("pwd") is True
+
+    deps = replace(
+        _standalone_deps(
+            stream_response=stream_response,
+            run_concurrent_repl=run_repl,
+            output_console=output,
+            error_panel_factory=lambda message: message,
+        ),
+        slash_services_factory=standalone_runtime.standalone_slash_services_from_runtime,
+    )
+    try:
+        await standalone_runtime.run_standalone_chat(
+            model=None,
+            session_id=initial_key,
+            deps=deps,
+        )
+    finally:
+        _restore_retargeted_directory(project_path, project_backup)
         await storage.close()
 
     assert calls == []

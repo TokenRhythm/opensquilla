@@ -185,6 +185,17 @@ async def run_agent_once(
             run_mode = normalize_run_mode(explicit_run_mode).value
         elif permissions_profile == "restricted":
             run_mode = configured_default_run_mode(cfg).value
+    accepted_run_mode_override = None
+    if explicit_run_mode and run_mode is not None:
+        from opensquilla.gateway.project_workspace_runtime import (
+            AcceptedRunModeOverride,
+        )
+
+        accepted_run_mode_override = AcceptedRunModeOverride(
+            run_mode=normalize_run_mode(run_mode),
+            run_mode_source="operator_default",
+            source="config",
+        )
     run_attachments: list[dict[str, Any]] = list(attachments or [])
     if attachment_paths:
         run_attachments.extend(attachments_from_paths(tuple(attachment_paths)))
@@ -305,6 +316,7 @@ async def run_agent_once(
             run_mode=run_mode,
         )
         from opensquilla.gateway.project_workspace_runtime import (
+            apply_accepted_run_mode_override,
             authoritative_project_run_context,
         )
         from opensquilla.gateway.session_services import get_session_storage
@@ -322,6 +334,10 @@ async def run_agent_once(
                 default_workspace=tool_workspace_dir,
             )
             if workspace_guard is not None:
+                run_context = apply_accepted_run_mode_override(
+                    run_context,
+                    accepted_run_mode_override,
+                )
                 from opensquilla.gateway.rpc_sessions import (
                     _apply_run_context_route_metadata,
                 )

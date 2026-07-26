@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 from opensquilla.gateway.rpc import RpcHandlerError
@@ -17,10 +17,36 @@ from opensquilla.sandbox.run_context import (
     effective_project_run_mode,
     get_run_context,
 )
+from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.session.models import SessionNode
 from opensquilla.session.storage import SessionStorage
 
 _NOT_FOUND_REASONS = frozenset({"not_found", "removed", "untrusted"})
+
+
+@dataclass(frozen=True)
+class AcceptedRunModeOverride:
+    """Ingress-vetted per-turn mode kept outside mutable route metadata."""
+
+    run_mode: RunMode
+    run_mode_source: str | None
+    source: str
+
+
+def apply_accepted_run_mode_override(
+    context: RunContext,
+    override: Any,
+) -> RunContext:
+    """Overlay only vetted mode provenance onto a freshly resolved context."""
+
+    if not isinstance(override, AcceptedRunModeOverride):
+        return context
+    return replace(
+        context,
+        run_mode=override.run_mode,
+        run_mode_source=override.run_mode_source,
+        source=override.source,
+    )
 
 
 async def resolve_session_project_workspace(
@@ -128,6 +154,8 @@ def map_project_workspace_error(
 
 
 __all__ = [
+    "AcceptedRunModeOverride",
+    "apply_accepted_run_mode_override",
     "authoritative_project_run_context",
     "map_project_workspace_error",
     "project_workspace_snapshot",

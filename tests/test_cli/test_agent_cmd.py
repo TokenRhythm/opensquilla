@@ -567,6 +567,85 @@ async def test_run_agent_once_uses_bound_project_workspace_over_tampered_origin(
     assert result.workspace == project.path
 
 
+@pytest.mark.parametrize(
+    ("saved_mode", "requested_mode"),
+    [("full", "standard"), ("standard", "full")],
+)
+@pytest.mark.asyncio
+async def test_run_agent_once_preserves_explicit_mode_for_bound_project_execution(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    saved_mode: str,
+    requested_mode: str,
+) -> None:
+    storage = await SessionStorage.open(
+        str(tmp_path / f"cli-mode-{saved_mode}-{requested_mode}.db")
+    )
+    manager = SessionManager(storage, inject_time_prefix=False)
+    project_path = tmp_path / f"cli-mode-{saved_mode}-project"
+    project_path.mkdir()
+    project = await storage.create_or_restore_project_workspace(
+        path=str(project_path.resolve()),
+        path_key=project_path_key(project_path, strict=True),
+        display_name="project",
+        trusted_at=1,
+    )
+    key = f"agent:main:cli-mode-{saved_mode}-to-{requested_mode}"
+    await manager.create(
+        key,
+        workspace_id=project.workspace_id,
+        origin={
+            RUN_CONTEXT_ORIGIN_KEY: {
+                "run_mode": saved_mode,
+                "run_mode_source": "user",
+                "workspace": project.path,
+                "domains": [
+                    {
+                        "domain": "example.com",
+                        "scope": "chat",
+                        "source": "manual",
+                    }
+                ],
+            }
+        },
+    )
+    calls: list[dict[str, Any]] = []
+
+    class FakeTurnRunner:
+        def __init__(self, **kwargs: Any) -> None:
+            return None
+
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            calls.append(kwargs)
+            yield DoneEvent(text="ok")
+
+    async def fake_build_services(*, config: GatewayConfig, **kwargs: Any) -> _FakeServices:
+        return _FakeServices(config, manager)
+
+    monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
+    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
+    try:
+        result = await run_agent_once(
+            message="pwd",
+            session_id=key,
+            config=GatewayConfig(
+                workspace_dir=str(tmp_path / "default"),
+                sandbox=SandboxSettings(run_mode=requested_mode),
+            ),
+        )
+    finally:
+        await storage.close()
+
+    tool_context = calls[0]["tool_context"]
+    assert tool_context.run_mode == requested_mode
+    assert tool_context.workspace_dir == project.path
+    assert tool_context.sandbox_run_context.run_mode_source == "operator_default"
+    assert [grant.domain for grant in tool_context.sandbox_run_context.domains] == [
+        "example.com"
+    ]
+    assert result.workspace == project.path
+
+
 @pytest.mark.skipif(os.name == "nt", reason="requires POSIX symlinks")
 @pytest.mark.asyncio
 async def test_run_agent_once_revalidates_bound_project_after_transcript_preparation(

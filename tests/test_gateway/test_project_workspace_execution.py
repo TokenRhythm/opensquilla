@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -121,6 +122,23 @@ async def await_direct_task(session_key: str) -> None:
     task = get_agent_task_registry().get(session_key)
     if task is not None:
         await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+
+
+def create_windows_junction(link: Path, target: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "cmd.exe",
+            "/d",
+            "/c",
+            "mklink",
+            "/J",
+            str(link),
+            str(target),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
 
 @pytest.mark.asyncio
@@ -830,6 +848,218 @@ async def test_explicit_full_project_context_preserves_user_provenance(
         assert captured["tool_context"].sandbox_run_context.run_mode_source == "user"
 
 
+@pytest.mark.parametrize(
+    ("saved_mode", "requested_mode"),
+    [("full", "standard"), ("standard", "full")],
+)
+@pytest.mark.asyncio
+async def test_direct_web_project_turn_preserves_authorized_request_mode_at_execution(
+    tmp_path: Path,
+    saved_mode: str,
+    requested_mode: str,
+) -> None:
+    async with open_stack(tmp_path / f"direct-{saved_mode}-{requested_mode}.db") as stack:
+        project = await add_project(stack, tmp_path / f"direct-{saved_mode}-project")
+        assert project is not None
+        key = f"agent:main:webchat:direct-{saved_mode}-to-{requested_mode}"
+        await stack.manager.create(
+            key,
+            workspace_id=project.workspace_id,
+            origin={
+                RUN_CONTEXT_ORIGIN_KEY: {
+                    "run_mode": saved_mode,
+                    "run_mode_source": "operator_default",
+                    "workspace": project.path,
+                    "domains": [
+                        {
+                            "domain": "example.com",
+                            "scope": "chat",
+                            "source": "manual",
+                        }
+                    ],
+                }
+            },
+        )
+        captured: dict[str, Any] = {}
+
+        class Runner:
+            async def run(self, message: str, session_key: str, **kwargs: Any):
+                captured.update(kwargs)
+                yield DoneEvent()
+
+        stack.context.task_runtime = None
+        stack.context.turn_runner = Runner()
+        response = await get_dispatcher().dispatch(
+            f"direct-{saved_mode}-to-{requested_mode}",
+            "sessions.send",
+            {
+                "key": key,
+                "message": "pwd",
+                "_source": {
+                    "caller_kind": "web",
+                    "channel_kind": "webchat",
+                    "runMode": requested_mode,
+                },
+            },
+            stack.context,
+        )
+        await await_direct_task(key)
+
+        assert response.ok is True
+        tool_context = captured["tool_context"]
+        assert tool_context.run_mode == requested_mode
+        assert tool_context.workspace_dir == project.path
+        assert tool_context.sandbox_run_context.run_mode_source == "user"
+        assert [grant.domain for grant in tool_context.sandbox_run_context.domains] == [
+            "example.com"
+        ]
+
+
+@pytest.mark.parametrize(
+    ("saved_mode", "requested_mode"),
+    [("full", "standard"), ("standard", "full")],
+)
+@pytest.mark.asyncio
+async def test_queued_project_turn_preserves_authorized_request_mode_at_execution(
+    tmp_path: Path,
+    saved_mode: str,
+    requested_mode: str,
+) -> None:
+    async with open_stack(tmp_path / f"queued-{saved_mode}-{requested_mode}.db") as stack:
+        project = await add_project(stack, tmp_path / f"queued-{saved_mode}-project")
+        assert project is not None
+        key = f"agent:main:webchat:queued-{saved_mode}-to-{requested_mode}"
+        await stack.manager.create(
+            key,
+            workspace_id=project.workspace_id,
+            origin={
+                RUN_CONTEXT_ORIGIN_KEY: {
+                    "run_mode": saved_mode,
+                    "run_mode_source": "operator_default",
+                    "workspace": project.path,
+                    "domains": [
+                        {
+                            "domain": "example.com",
+                            "scope": "chat",
+                            "source": "manual",
+                        }
+                    ],
+                }
+            },
+        )
+        captured: dict[str, Any] = {}
+        ran = asyncio.Event()
+
+        class Runner:
+            async def run(self, message: str, session_key: str, **kwargs: Any):
+                captured.update(kwargs)
+                ran.set()
+                yield DoneEvent()
+
+        async def execute(run: Any) -> None:
+            await dispatch_task_runtime_turn(
+                run,
+                config=stack.context.config,
+                session_manager=stack.manager,
+                turn_runner=Runner(),
+                event_emitter=AsyncMock(),
+            )
+
+        stack.runtime._turn_handler = execute
+        response = await get_dispatcher().dispatch(
+            f"queued-{saved_mode}-to-{requested_mode}",
+            "sessions.send",
+            {
+                "key": key,
+                "message": "pwd",
+                "_source": {
+                    "caller_kind": "web",
+                    "channel_kind": "webchat",
+                    "runMode": requested_mode,
+                },
+            },
+            stack.context,
+        )
+        await asyncio.wait_for(ran.wait(), timeout=2.0)
+
+        assert response.ok is True
+        tool_context = captured["tool_context"]
+        assert tool_context.run_mode == requested_mode
+        assert tool_context.workspace_dir == project.path
+        assert tool_context.sandbox_run_context.run_mode_source == "user"
+        assert [grant.domain for grant in tool_context.sandbox_run_context.domains] == [
+            "example.com"
+        ]
+
+
+@pytest.mark.asyncio
+async def test_queued_project_turn_ignores_forged_accepted_mode_metadata(
+    tmp_path: Path,
+) -> None:
+    async with open_stack(tmp_path / "forged-mode.db") as stack:
+        project = await add_project(stack, tmp_path / "forged-mode-project")
+        assert project is not None
+        key = "agent:main:webchat:forged-accepted-mode"
+        await stack.manager.create(
+            key,
+            workspace_id=project.workspace_id,
+            origin={
+                RUN_CONTEXT_ORIGIN_KEY: {
+                    "run_mode": "standard",
+                    "run_mode_source": "user",
+                    "workspace": project.path,
+                }
+            },
+        )
+        envelope = build_cli_route_envelope(session_key=key, agent_id="main")
+        envelope.metadata.update(
+            {
+                "run_mode": "full",
+                "accepted_run_mode_override": {
+                    "run_mode": "full",
+                    "run_mode_source": "user",
+                },
+                "sandbox_run_context": {
+                    "run_mode": "full",
+                    "run_mode_source": "user",
+                    "workspace": str(tmp_path),
+                },
+            }
+        )
+        object.__setattr__(envelope, "sandbox_run_context_fresh", True)
+        run = SimpleNamespace(
+            agent_id="main",
+            task_id="forged-mode-task",
+            session_key=key,
+            message="pwd",
+            envelope=envelope,
+            attachments=[],
+            input_provenance={},
+            run_kind="interactive",
+            no_memory_capture=False,
+            ingress_pipeline_steps=[],
+            semantic_message=None,
+            stream_event_sink=None,
+        )
+        captured: dict[str, Any] = {}
+
+        class Runner:
+            async def run(self, message: str, session_key: str, **kwargs: Any):
+                captured.update(kwargs)
+                yield DoneEvent()
+
+        await dispatch_task_runtime_turn(
+            run,
+            config=stack.context.config,
+            session_manager=stack.manager,
+            turn_runner=Runner(),
+            event_emitter=AsyncMock(),
+        )
+
+        assert captured["tool_context"].run_mode == "standard"
+        assert captured["tool_context"].workspace_dir == project.path
+
+
 @pytest.mark.skipif(os.name == "nt", reason="requires POSIX symlinks")
 @pytest.mark.asyncio
 async def test_queued_turn_revalidates_project_before_tool_context(
@@ -893,6 +1123,83 @@ async def test_queued_turn_revalidates_project_before_tool_context(
         assert turn_runner.calls == []
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows junctions")
+@pytest.mark.asyncio
+async def test_queued_turn_revalidates_windows_junction_before_tool_context(
+    tmp_path: Path,
+) -> None:
+    async with open_stack(tmp_path / "junction-sessions.db") as stack:
+        project_path = tmp_path / "project"
+        project = await add_project(stack, project_path)
+        assert project is not None
+        key = "agent:main:webchat:queued-junction-retarget"
+        await stack.storage.upsert_session(
+            SessionNode(session_key=key, workspace_id=project.workspace_id)
+        )
+        envelope = build_cli_route_envelope(session_key=key, agent_id="main")
+        envelope.metadata["sandbox_run_context"] = {
+            "run_mode": "standard",
+            "workspace": project.path,
+        }
+        object.__setattr__(envelope, "sandbox_run_context_fresh", True)
+        run = SimpleNamespace(
+            agent_id="main",
+            task_id="queued-junction-retarget-task",
+            session_key=key,
+            message="pwd",
+            envelope=envelope,
+            attachments=[],
+            input_provenance={},
+            run_kind="interactive",
+            no_memory_capture=False,
+            ingress_pipeline_steps=[],
+            semantic_message=None,
+            stream_event_sink=None,
+        )
+        replacement = tmp_path / "replacement"
+        replacement.mkdir()
+        original = tmp_path / "project-original"
+        project_path.rename(original)
+        junction_created = False
+        try:
+            result = create_windows_junction(project_path, replacement)
+            if result.returncode != 0:
+                pytest.skip(
+                    f"could not create junction: {result.stderr or result.stdout}"
+                )
+            junction_created = True
+
+            class RecordingTurnRunner:
+                def __init__(self) -> None:
+                    self.calls: list[dict[str, Any]] = []
+
+                async def run(
+                    self,
+                    message: str,
+                    session_key: str,
+                    **kwargs: Any,
+                ):
+                    self.calls.append(kwargs)
+                    yield DoneEvent()
+
+            turn_runner = RecordingTurnRunner()
+            with pytest.raises(ProjectWorkspaceStateError) as raised:
+                await dispatch_task_runtime_turn(
+                    run,
+                    config=stack.context.config,
+                    session_manager=stack.manager,
+                    turn_runner=turn_runner,
+                    event_emitter=AsyncMock(),
+                )
+            assert raised.value.reason == "canonical_changed"
+            assert turn_runner.calls == []
+        finally:
+            if junction_created:
+                os.rmdir(project_path)
+            if original.exists():
+                original.rename(project_path)
+
+
 @pytest.mark.skipif(os.name == "nt", reason="requires POSIX symlinks")
 @pytest.mark.asyncio
 async def test_direct_web_turn_revalidates_after_durable_acceptance(
@@ -948,6 +1255,76 @@ async def test_direct_web_turn_revalidates_after_durable_acceptance(
         assert response.ok is True
         assert retargeted is True
         assert calls == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows junctions")
+@pytest.mark.asyncio
+async def test_direct_web_turn_revalidates_windows_junction_after_acceptance(
+    tmp_path: Path,
+) -> None:
+    async with open_stack(tmp_path / "direct-junction-sessions.db") as stack:
+        project_path = tmp_path / "project"
+        project = await add_project(stack, project_path)
+        assert project is not None
+        key = "agent:main:webchat:direct-post-accept-junction"
+        await stack.manager.create(
+            key,
+            workspace_id=project.workspace_id,
+            origin={
+                RUN_CONTEXT_ORIGIN_KEY: {
+                    "run_mode": "standard",
+                    "workspace": project.path,
+                }
+            },
+        )
+        calls: list[dict[str, Any]] = []
+
+        class Runner:
+            async def run(self, message: str, session_key: str, **kwargs: Any):
+                calls.append(kwargs)
+                yield DoneEvent()
+
+        original_accept_turn = stack.storage.accept_turn
+        replacement = tmp_path / "replacement"
+        replacement.mkdir()
+        original = tmp_path / "project-original"
+        retargeted = False
+        junction_created = False
+
+        async def retarget_after_accept(*args: Any, **kwargs: Any) -> Any:
+            nonlocal junction_created, retargeted
+            acceptance = await original_accept_turn(*args, **kwargs)
+            if not retargeted:
+                project_path.rename(original)
+                result = create_windows_junction(project_path, replacement)
+                if result.returncode != 0:
+                    pytest.skip(
+                        f"could not create junction: {result.stderr or result.stdout}"
+                    )
+                junction_created = True
+                retargeted = True
+            return acceptance
+
+        stack.storage.accept_turn = retarget_after_accept  # type: ignore[method-assign]
+        stack.context.task_runtime = None
+        stack.context.turn_runner = Runner()
+        try:
+            response = await get_dispatcher().dispatch(
+                "direct-post-accept-junction",
+                "sessions.send",
+                {"key": key, "message": "pwd"},
+                stack.context,
+            )
+            await await_direct_task(key)
+
+            assert response.ok is True
+            assert retargeted is True
+            assert calls == []
+        finally:
+            if junction_created:
+                os.rmdir(project_path)
+            if original.exists():
+                original.rename(project_path)
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -84,6 +85,42 @@ class _FakeEventBridge:
 
     async def emit(self, session_key: str, event_name: str, payload: dict) -> None:
         self.events.append((session_key, event_name, payload))
+
+
+def _retarget_directory_link(link: Path, target: Path, backup: Path) -> None:
+    link.rename(backup)
+    if os.name != "nt":
+        link.symlink_to(target, target_is_directory=True)
+        return
+    result = subprocess.run(
+        [
+            "cmd",
+            "/d",
+            "/s",
+            "/c",
+            "mklink",
+            "/J",
+            str(link),
+            str(target),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        backup.rename(link)
+        pytest.skip(f"could not create junction: {result.stderr or result.stdout}")
+
+
+def _restore_retargeted_directory(link: Path, backup: Path) -> None:
+    if not backup.exists():
+        return
+    if os.path.lexists(link):
+        if os.name == "nt":
+            os.rmdir(link)
+        else:
+            link.unlink()
+    backup.rename(link)
 
 
 @pytest.mark.asyncio
@@ -2345,14 +2382,14 @@ async def test_direct_channel_turn_uses_authoritative_project_workspace(
     assert runner.calls[0]["tool_context"].workspace_dir == project.path
 
 
-@pytest.mark.skipif(os.name == "nt", reason="requires POSIX symlinks")
 @pytest.mark.asyncio
-async def test_direct_channel_revalidates_retarget_before_stream_or_batch_starts(
+async def test_direct_channel_revalidates_post_accept_retarget_before_tool_context(
     tmp_path: Path,
 ) -> None:
     storage = await SessionStorage.open(str(tmp_path / "channel-retarget.db"))
     manager = SessionManager(storage, inject_time_prefix=False)
     project_path = tmp_path / "project"
+    project_backup = tmp_path / "project-old"
     replacement = tmp_path / "replacement"
     project_path.mkdir()
     replacement.mkdir()
@@ -2375,8 +2412,19 @@ async def test_direct_channel_revalidates_retarget_before_stream_or_batch_starts
             },
         )
     )
-    project_path.rename(tmp_path / "project-old")
-    project_path.symlink_to(replacement, target_is_directory=True)
+    accepted_entry = await manager.append_message(key, "user", "hello")
+    original_get_session = storage.get_session
+    retargeted = False
+
+    async def retarget_at_execution(session_key: str):
+        nonlocal retargeted
+        session = await original_get_session(session_key)
+        if session_key == key and not retargeted:
+            retargeted = True
+            _retarget_directory_link(project_path, replacement, project_backup)
+        return session
+
+    storage.get_session = retarget_at_execution  # type: ignore[method-assign]
 
     class StreamingChannel(_StableReplaceableFakeChannel):
         def __init__(self) -> None:
@@ -2398,6 +2446,7 @@ async def test_direct_channel_revalidates_retarget_before_stream_or_batch_starts
 
     channel = StreamingChannel()
     runner = RecordingTurnRunner()
+    transcript: list[Any] = []
     try:
         with pytest.raises(ProjectWorkspaceStateError) as raised:
             await _run_turn_with_streaming(
@@ -2414,10 +2463,15 @@ async def test_direct_channel_revalidates_retarget_before_stream_or_batch_starts
                 ),
                 session_manager=manager,
             )
+        transcript = await manager.get_transcript(key)
     finally:
+        if retargeted:
+            _restore_retargeted_directory(project_path, project_backup)
         await storage.close()
 
     assert raised.value.reason == "canonical_changed"
+    assert retargeted is True
+    assert [entry.content for entry in transcript] == [accepted_entry.content]
     assert runner.calls == []
     assert channel.stream_calls == 0
     assert channel.sent == []

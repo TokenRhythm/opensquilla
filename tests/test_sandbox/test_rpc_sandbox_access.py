@@ -326,6 +326,42 @@ async def test_project_sandbox_rpc_fails_when_workspace_becomes_unavailable(
 
 
 @pytest.mark.asyncio
+async def test_project_run_context_set_reports_workspace_before_setup_readiness(
+    project_sandbox_ctx: tuple[RpcContext, SessionNode, ProjectWorkspace],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.gateway import rpc_sandbox
+
+    ctx, project_session, project = project_sandbox_ctx
+    Path(project.path).rmdir()
+    original_origin = dict(project_session.origin or {})
+
+    async def setup_must_not_run(_config: object) -> object:
+        raise AssertionError("setup readiness must follow project revalidation")
+
+    monkeypatch.setattr(
+        rpc_sandbox,
+        "current_sandbox_setup_status",
+        setup_must_not_run,
+    )
+
+    with pytest.raises(RpcHandlerError) as raised:
+        await rpc_sandbox._handle_sandbox_run_context_set(
+            {
+                "sessionKey": project_session.session_key,
+                "runMode": "standard",
+            },
+            ctx,
+        )
+
+    assert raised.value.code == "WORKSPACE_UNAVAILABLE"
+    assert raised.value.details == {"reason": "unavailable"}
+    saved = await ctx.session_manager.get_session(project_session.session_key)
+    assert saved is not None
+    assert saved.origin == original_origin
+
+
+@pytest.mark.asyncio
 async def test_rpc_add_domain_returns_updated_context() -> None:
     from opensquilla.gateway.rpc_sandbox import _handle_sandbox_domain_add
 

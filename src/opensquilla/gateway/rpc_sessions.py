@@ -27,6 +27,8 @@ from opensquilla.gateway.input_normalization import (
     normalize_incoming_text,
 )
 from opensquilla.gateway.project_workspace_runtime import (
+    AcceptedRunModeOverride,
+    apply_accepted_run_mode_override,
     authoritative_project_run_context,
     map_project_workspace_error,
     project_workspace_snapshot,
@@ -2073,11 +2075,16 @@ async def _handle_sessions_send(
         run_context,
         run_mode=coerce_run_mode_for_principal(run_context.run_mode, ctx.principal),
     )
+    accepted_run_mode_override = None
     if run_mode_hint is not None:
-        run_context = replace(
-            run_context,
+        accepted_run_mode_override = AcceptedRunModeOverride(
             run_mode=run_mode_hint,
+            run_mode_source="user",
             source="request",
+        )
+        run_context = apply_accepted_run_mode_override(
+            run_context,
+            accepted_run_mode_override,
         )
     workspace_dir = run_context.workspace or workspace_dir
     if source_hint.get("caller_kind") == "cli" or source_hint.get("channel_kind") == "cli":
@@ -2239,6 +2246,10 @@ async def _handle_sessions_send(
                 default_workspace=workspace_dir,
             )
             if execution_workspace_guard is not None:
+                execution_run_context = apply_accepted_run_mode_override(
+                    execution_run_context,
+                    accepted_run_mode_override,
+                )
                 _apply_run_context_route_metadata(
                     route_envelope,
                     execution_run_context,
@@ -2540,6 +2551,7 @@ async def _handle_sessions_send(
                 no_memory_capture=bool(capture_controls["no_memory_capture"]),
                 semantic_message=semantic_message_text,
                 turn_id=turn_id,
+                accepted_run_mode_override=accepted_run_mode_override,
             )
             try:
                 acceptance = await _accept_task_record(reservation.task_record)
@@ -3072,6 +3084,7 @@ async def _handle_sessions_send(
                 persisted_user_message_id=getattr(legacy_persisted_entry, "message_id", None),
                 fresh_user_session=fresh_user_session,
                 turn_id=turn_id,
+                accepted_run_mode_override=accepted_run_mode_override,
             )
         except Exception as exc:
             # Ensure the uuid eviction does NOT fire on this

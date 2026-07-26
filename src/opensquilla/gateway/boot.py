@@ -1118,6 +1118,7 @@ async def dispatch_task_runtime_turn(
     (including the ``semantic_message`` regression surface).
     """
     from opensquilla.gateway.project_workspace_runtime import (
+        apply_accepted_run_mode_override,
         authoritative_project_run_context,
         map_project_workspace_error,
     )
@@ -1160,6 +1161,10 @@ async def dispatch_task_runtime_turn(
                 _apply_run_context_route_metadata,
             )
 
+            run_context = apply_accepted_run_mode_override(
+                run_context,
+                getattr(run, "accepted_run_mode_override", None),
+            )
             _apply_run_context_route_metadata(
                 run.envelope,
                 run_context,

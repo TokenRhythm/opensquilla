@@ -516,18 +516,31 @@ async def _handle_sandbox_run_context_set(params: dict | None, ctx: RpcContext) 
     run_mode = normalize_run_mode(params.get("runMode"))
     if not run_mode_allowed_for_principal(run_mode, ctx.principal):
         _require_owner(ctx, "sandbox.run_context.set")
-    await _require_sandbox_setup_ready_for_mode(ctx, run_mode)
     manager = _require_session_manager(ctx)
-    session = await _ensure_session_for_set(manager, session_key)
+    session = await _session_for_key(manager, session_key)
+    base_context = None
+    guard = None
+    if session is not None:
+        session, base_context, guard = await _context_for_session(
+            manager,
+            session_key,
+            ctx.config,
+            owner=ctx.principal.is_owner,
+            session=session,
+        )
+    await _require_sandbox_setup_ready_for_mode(ctx, run_mode)
+    if session is None:
+        session = await _ensure_session_for_set(manager, session_key)
     if session is None:
         raise KeyError(f"Session not found: {session_key}")
-    session, base_context, guard = await _context_for_session(
-        manager,
-        session_key,
-        ctx.config,
-        owner=ctx.principal.is_owner,
-        session=session,
-    )
+    if base_context is None:
+        session, base_context, guard = await _context_for_session(
+            manager,
+            session_key,
+            ctx.config,
+            owner=ctx.principal.is_owner,
+            session=session,
+        )
     mutation_manager = _mutation_manager(
         manager,
         session,

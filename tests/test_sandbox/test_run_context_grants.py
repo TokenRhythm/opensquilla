@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -2712,6 +2714,146 @@ async def test_project_network_once_preserves_authoritative_tool_context(tmp_pat
     finally:
         reset_approval_queue()
         reset_resolved_run_context_overlays()
+
+
+async def _assert_project_approval_retarget_fails_closed(
+    tmp_path: Path,
+    *,
+    junction: bool,
+) -> None:
+    from opensquilla.gateway.approval_queue import reset_approval_queue
+    from opensquilla.project_workspaces import ProjectWorkspaceStateError
+    from opensquilla.sandbox.escalation import (
+        apply_sandbox_approval_choice,
+        build_network_approval_params,
+        request_sandbox_approval,
+        reset_resolved_run_context_overlays,
+        resolved_run_context_overlay,
+    )
+    from opensquilla.sandbox.network_guard import NetworkDecision
+    from opensquilla.sandbox.run_context import (
+        RUN_CONTEXT_ORIGIN_KEY,
+        DomainGrant,
+        MountGrant,
+        RunContext,
+    )
+    from opensquilla.sandbox.run_mode import RunMode
+    from opensquilla.tools.types import ToolContext, current_tool_context
+
+    reset_approval_queue()
+    reset_resolved_run_context_overlays()
+    manager = _SessionManager()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    stale_workspace = tmp_path / "tampered-origin"
+    stale_workspace.mkdir()
+    manager.node.origin = {
+        RUN_CONTEXT_ORIGIN_KEY: {
+            "run_mode": "full",
+            "run_mode_source": "user",
+            "workspace": str(stale_workspace),
+        }
+    }
+    params = build_network_approval_params(
+        NetworkDecision(
+            status="ask",
+            normalized_host="example.com",
+            reason="unknown_domain",
+            source=None,
+        ),
+        session_key=manager.node.session_key,
+        workspace=str(workspace),
+        fingerprint="fp-retarget",
+    )
+    assert params is not None
+    authoritative = RunContext(
+        run_mode=RunMode.STANDARD,
+        workspace=str(workspace),
+        mounts=(MountGrant(path=str(workspace), access="rw", scope="chat"),),
+        domains=(
+            DomainGrant(
+                domain="canonical.example",
+                scope="chat",
+                source="manual",
+            ),
+        ),
+        run_mode_source="project_default",
+        source="saved",
+    )
+    token = current_tool_context.set(
+        ToolContext(
+            session_key=manager.node.session_key,
+            workspace_dir=str(workspace),
+            sandbox_run_context=authoritative,
+        )
+    )
+    try:
+        request_sandbox_approval(params, message="Approve managed network access.")
+    finally:
+        current_tool_context.reset(token)
+
+    original = tmp_path / "project-original"
+    workspace.rename(original)
+    if junction:
+        result = subprocess.run(
+            [
+                "cmd.exe",
+                "/d",
+                "/c",
+                "mklink",
+                "/J",
+                str(workspace),
+                str(replacement),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            original.rename(workspace)
+            pytest.skip(f"could not create junction: {result.stderr or result.stdout}")
+    else:
+        workspace.symlink_to(replacement, target_is_directory=True)
+
+    try:
+        with pytest.raises(ProjectWorkspaceStateError, match="canonical_changed"):
+            await apply_sandbox_approval_choice(
+                params,
+                choice="allow_once",
+                approved=True,
+                session_manager=manager,
+                config=_config(),
+            )
+    finally:
+        if junction:
+            os.rmdir(workspace)
+        else:
+            workspace.unlink()
+        original.rename(workspace)
+
+    assert (
+        resolved_run_context_overlay(manager.node.session_key, str(workspace))
+        == authoritative
+    )
+    assert resolved_run_context_overlay(manager.node.session_key, str(replacement)) is None
+    assert manager.node.origin[RUN_CONTEXT_ORIGIN_KEY]["workspace"] == str(stale_workspace)
+    assert manager.node.origin[RUN_CONTEXT_ORIGIN_KEY]["run_mode"] == "full"
+    reset_approval_queue()
+    reset_resolved_run_context_overlays()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX symlinks")
+@pytest.mark.asyncio
+async def test_project_approval_symlink_retarget_fails_closed(tmp_path: Path) -> None:
+    await _assert_project_approval_retarget_fails_closed(tmp_path, junction=False)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows junctions")
+@pytest.mark.asyncio
+async def test_project_approval_junction_retarget_fails_closed(tmp_path: Path) -> None:
+    await _assert_project_approval_retarget_fails_closed(tmp_path, junction=True)
 
 
 @pytest.mark.asyncio

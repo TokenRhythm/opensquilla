@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import os
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -34,8 +34,23 @@ from opensquilla.sandbox.run_mode import RunMode
 SANDBOX_APPROVAL_KINDS = frozenset({"sandbox_network", "sandbox_path"})
 _RESOLVED_RUN_CONTEXT_OVERLAYS: dict[tuple[str, str | None], RunContext] = {}
 _RESOLVED_RUN_CONTEXT_PERSISTORS: dict[tuple[str, str | None], tuple[Any, Any]] = {}
+_RESOLVED_RUN_CONTEXT_BINDINGS: dict[
+    tuple[str, str | None],
+    _WorkspaceBindingIdentity,
+] = {}
+_RESOLVED_RUN_CONTEXT_BINDING_ALIASES: dict[
+    tuple[str, str | None],
+    tuple[str, str | None],
+] = {}
 _DENIED_SANDBOX_APPROVALS: dict[str, str] = {}
 _DURABLE_TEMPORARY_GRANT_SOURCES = frozenset({"saved", "route_metadata", "metadata"})
+
+
+@dataclass(frozen=True)
+class _WorkspaceBindingIdentity:
+    canonical_path: str | None
+    device: int | None
+    inode: int | None
 
 
 class _AuthoritativeRunContextManager:
@@ -445,7 +460,12 @@ def _remember_current_tool_run_context_for_approval(
     )
     if _normalize_workspace(context_workspace) != _normalize_workspace(workspace):
         return
-    remember_resolved_run_context(session_key, workspace, context)
+    remember_resolved_run_context(
+        session_key,
+        workspace,
+        context,
+        guard_workspace=True,
+    )
 
 
 def _approval_mutation_manager(
@@ -734,6 +754,21 @@ def resolved_run_context_overlay(
     key = _overlay_key(session_key, workspace)
     if key is None:
         return None
+    alias_key = _binding_alias_key(session_key, workspace)
+    if alias_key is not None:
+        key = _RESOLVED_RUN_CONTEXT_BINDING_ALIASES.get(alias_key, key)
+    expected_binding = _RESOLVED_RUN_CONTEXT_BINDINGS.get(key)
+    if expected_binding is not None:
+        from opensquilla.project_workspaces import ProjectWorkspaceStateError
+
+        current_binding = _workspace_binding_identity(workspace)
+        if (
+            expected_binding.canonical_path is None
+            or current_binding is None
+        ):
+            raise ProjectWorkspaceStateError("unavailable")
+        if current_binding != expected_binding:
+            raise ProjectWorkspaceStateError("canonical_changed")
     return _RESOLVED_RUN_CONTEXT_OVERLAYS.get(key)
 
 
@@ -744,11 +779,24 @@ def remember_resolved_run_context(
     *,
     session_manager: Any | None = None,
     config: Any | None = None,
+    guard_workspace: bool = False,
 ) -> None:
     key = _overlay_key(session_key, workspace)
     if key is None:
         return
     _RESOLVED_RUN_CONTEXT_OVERLAYS[key] = context
+    if guard_workspace and key[1] is not None:
+        alias_key = _binding_alias_key(session_key, workspace)
+        if alias_key is not None:
+            _RESOLVED_RUN_CONTEXT_BINDING_ALIASES[alias_key] = key
+        _RESOLVED_RUN_CONTEXT_BINDINGS[key] = (
+            _workspace_binding_identity(workspace)
+            or _WorkspaceBindingIdentity(
+                canonical_path=None,
+                device=None,
+                inode=None,
+            )
+        )
     if session_manager is not None and config is not None:
         _RESOLVED_RUN_CONTEXT_PERSISTORS[key] = (session_manager, config)
 
@@ -756,6 +804,8 @@ def remember_resolved_run_context(
 def reset_resolved_run_context_overlays() -> None:
     _RESOLVED_RUN_CONTEXT_OVERLAYS.clear()
     _RESOLVED_RUN_CONTEXT_PERSISTORS.clear()
+    _RESOLVED_RUN_CONTEXT_BINDINGS.clear()
+    _RESOLVED_RUN_CONTEXT_BINDING_ALIASES.clear()
     _DENIED_SANDBOX_APPROVALS.clear()
 
 
@@ -1205,6 +1255,46 @@ def _normalize_workspace(workspace: str | None) -> str | None:
         return str(Path(text).expanduser().resolve(strict=False))
     except (OSError, RuntimeError, ValueError):
         return text
+
+
+def _binding_alias_key(
+    session_key: str | None,
+    workspace: str | None,
+) -> tuple[str, str | None] | None:
+    key = str(session_key or "").strip()
+    if not key:
+        return None
+    text = str(workspace or "").strip()
+    if not text:
+        return key, None
+    try:
+        lexical = os.path.abspath(os.path.expanduser(text))
+        normalized = os.path.normcase(lexical).replace("\\", "/")
+    except (OSError, RuntimeError, ValueError):
+        normalized = text
+    return key, normalized
+
+
+def _workspace_binding_identity(
+    workspace: str | None,
+) -> _WorkspaceBindingIdentity | None:
+    text = str(workspace or "").strip()
+    if not text:
+        return None
+    try:
+        candidate = Path(text).expanduser().resolve(strict=True)
+        if not candidate.is_dir():
+            return None
+        with os.scandir(candidate):
+            pass
+        stat_result = candidate.stat()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return _WorkspaceBindingIdentity(
+        canonical_path=os.path.normcase(str(candidate)).replace("\\", "/"),
+        device=int(stat_result.st_dev),
+        inode=int(stat_result.st_ino),
+    )
 
 
 def _merge_temporary_grants(
