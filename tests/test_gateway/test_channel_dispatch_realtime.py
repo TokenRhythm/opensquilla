@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -41,8 +43,16 @@ from opensquilla.gateway.channel_dispatch import (
 from opensquilla.gateway.config import AgentEntryConfig, GatewayConfig
 from opensquilla.gateway.protocol import make_ok_res
 from opensquilla.gateway.routing import build_channel_route_envelope
+from opensquilla.project_workspaces import (
+    ProjectWorkspaceStateError,
+    project_path_key,
+)
 from opensquilla.safety.permission_matrix import Principal, is_tool_allowed
+from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
 from opensquilla.sandbox.run_mode import RunMode
+from opensquilla.session.manager import SessionManager
+from opensquilla.session.models import SessionNode
+from opensquilla.session.storage import SessionStorage
 from opensquilla.tools.types import CallerKind
 
 
@@ -74,6 +84,21 @@ class _FakeEventBridge:
 
     async def emit(self, session_key: str, event_name: str, payload: dict) -> None:
         self.events.append((session_key, event_name, payload))
+
+
+@pytest.mark.asyncio
+async def test_atomic_channel_acceptance_does_not_hold_session_lock() -> None:
+    from opensquilla.gateway.channel_dispatch import _channel_acceptance_lock
+
+    lock = asyncio.Lock()
+
+    async with _channel_acceptance_lock(lock, atomic=True):
+        assert lock.locked() is False
+
+    async with _channel_acceptance_lock(lock, atomic=False):
+        assert lock.locked() is True
+
+    assert lock.locked() is False
 
 
 class _RunContextSessionManager:
@@ -1369,10 +1394,7 @@ def test_channel_artifact_fallback_uses_only_channel_safe_absolute_links() -> No
                 "signed_download_url": "https://gateway.example/artifacts/art-2?sig=short",
             }
         ]
-    ) == [
-        "Generated file: signed.txt -> "
-        "https://gateway.example/artifacts/art-2?sig=short"
-    ]
+    ) == ["Generated file: signed.txt -> https://gateway.example/artifacts/art-2?sig=short"]
 
     assert _artifact_fallback_lines(
         [
@@ -2064,9 +2086,7 @@ async def test_channel_ingest_honors_opaque_byte_cap_config() -> None:
             )
         ],
     )
-    capped = SimpleNamespace(
-        attachments=SimpleNamespace(accept_opaque=True, opaque_max_bytes=1024)
-    )
+    capped = SimpleNamespace(attachments=SimpleNamespace(accept_opaque=True, opaque_max_bytes=1024))
 
     result = await _ingest_channel_message_attachments(
         channel=ResolvingChannel(), msg=msg, config=capped
@@ -2252,6 +2272,155 @@ async def test_channel_streaming_turn_uses_agent_registry_model() -> None:
     )
 
     assert runner.calls[0]["model"] == "agent/default"
+
+
+@pytest.mark.asyncio
+async def test_direct_channel_turn_uses_authoritative_project_workspace(
+    tmp_path: Path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "channel-project.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    project_path = tmp_path / "project"
+    outside = tmp_path / "outside"
+    project_path.mkdir()
+    outside.mkdir()
+    project = await storage.create_or_restore_project_workspace(
+        path=str(project_path.resolve()),
+        path_key=project_path_key(project_path, strict=True),
+        display_name="project",
+        trusted_at=1,
+    )
+    key = "agent:main:matrix:project-channel"
+    await storage.upsert_session(
+        SessionNode(
+            session_key=key,
+            workspace_id=project.workspace_id,
+            origin={
+                RUN_CONTEXT_ORIGIN_KEY: {
+                    "run_mode": "standard",
+                    "workspace": str(outside),
+                }
+            },
+        )
+    )
+    envelope = build_channel_route_envelope(
+        _message(),
+        session_key=key,
+        session_prefix="matrix",
+    )
+    envelope.metadata["sandbox_run_context"] = {
+        "run_mode": "standard",
+        "workspace": str(outside),
+    }
+    object.__setattr__(envelope, "sandbox_run_context_fresh", True)
+
+    class RecordingTurnRunner:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            self.calls.append(kwargs)
+            yield DoneEvent()
+
+    runner = RecordingTurnRunner()
+    try:
+        await _run_turn_with_streaming(
+            _FakeChannel(),
+            runner,
+            _message(),
+            key,
+            _FakeEventBridge(),
+            None,
+            GatewayConfig(
+                workspace_dir=str(tmp_path / "default"),
+                agent_stream_heartbeat_interval_seconds=0.0,
+                agent_stream_idle_timeout_seconds=1.0,
+            ),
+            route_envelope=envelope,
+            session_manager=manager,
+        )
+    finally:
+        await storage.close()
+
+    assert runner.calls[0]["tool_context"].workspace_dir == project.path
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX symlinks")
+@pytest.mark.asyncio
+async def test_direct_channel_revalidates_retarget_before_stream_or_batch_starts(
+    tmp_path: Path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "channel-retarget.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    project_path = tmp_path / "project"
+    replacement = tmp_path / "replacement"
+    project_path.mkdir()
+    replacement.mkdir()
+    project = await storage.create_or_restore_project_workspace(
+        path=str(project_path.resolve()),
+        path_key=project_path_key(project_path, strict=True),
+        display_name="project",
+        trusted_at=1,
+    )
+    key = "agent:main:matrix:retargeted-project-channel"
+    await storage.upsert_session(
+        SessionNode(
+            session_key=key,
+            workspace_id=project.workspace_id,
+            origin={
+                RUN_CONTEXT_ORIGIN_KEY: {
+                    "run_mode": "standard",
+                    "workspace": project.path,
+                }
+            },
+        )
+    )
+    project_path.rename(tmp_path / "project-old")
+    project_path.symlink_to(replacement, target_is_directory=True)
+
+    class StreamingChannel(_StableReplaceableFakeChannel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stream_calls = 0
+
+        async def send_streaming(self, chunks, **kwargs):
+            self.stream_calls += 1
+            async for _ in chunks:
+                pass
+
+    class RecordingTurnRunner:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            self.calls.append(kwargs)
+            yield DoneEvent()
+
+    channel = StreamingChannel()
+    runner = RecordingTurnRunner()
+    try:
+        with pytest.raises(ProjectWorkspaceStateError) as raised:
+            await _run_turn_with_streaming(
+                channel,
+                runner,
+                _message(),
+                key,
+                _FakeEventBridge(),
+                None,
+                GatewayConfig(
+                    workspace_dir=str(tmp_path / "default"),
+                    agent_stream_heartbeat_interval_seconds=0.0,
+                    agent_stream_idle_timeout_seconds=1.0,
+                ),
+                session_manager=manager,
+            )
+    finally:
+        await storage.close()
+
+    assert raised.value.reason == "canonical_changed"
+    assert runner.calls == []
+    assert channel.stream_calls == 0
+    assert channel.sent == []
 
 
 @pytest.mark.asyncio

@@ -37,8 +37,13 @@ from opensquilla.gateway.model_routing import (
 )
 from opensquilla.gateway.routing import build_cli_route_envelope, build_cron_route_envelope
 from opensquilla.onboarding.mutations import upsert_channel
+from opensquilla.project_workspaces import (
+    ProjectWorkspaceStateError,
+    project_path_key,
+)
 from opensquilla.provider import Message
 from opensquilla.sandbox.config import SandboxSettings
+from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
 from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.scheduler.types import CronJob, JobStatus
 from opensquilla.session.compaction import CompactionConfig
@@ -1185,12 +1190,8 @@ async def test_start_gateway_server_wires_cron_failure_dispatcher(
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
     monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
     monkeypatch.setattr(scheduler_jobs, "set_failure_dispatcher", _record_dispatcher)
-    monkeypatch.setattr(
-        "opensquilla.gateway.pidlock.GatewayPidLock.acquire", lambda self: None
-    )
-    monkeypatch.setattr(
-        "opensquilla.gateway.pidlock.GatewayPidLock.release", lambda self: None
-    )
+    monkeypatch.setattr("opensquilla.gateway.pidlock.GatewayPidLock.acquire", lambda self: None)
+    monkeypatch.setattr("opensquilla.gateway.pidlock.GatewayPidLock.release", lambda self: None)
 
     config = GatewayConfig(
         state_dir=str(tmp_path / "state"),
@@ -1207,10 +1208,7 @@ async def test_start_gateway_server_wires_cron_failure_dispatcher(
         )
         # The wire must register DeliveryChain.dispatch_failure_alert
         # (a bound method), not some unrelated callable.
-        assert (
-            getattr(captured["dispatcher"], "__name__", "")
-            == "dispatch_failure_alert"
-        )
+        assert getattr(captured["dispatcher"], "__name__", "") == "dispatch_failure_alert"
         # Handler factories ran, confirming the wire ran inside the cron-init
         # branch (not just by coincidence).
         assert set(cron_sched.registered) >= {
@@ -1358,27 +1356,15 @@ async def test_start_gateway_server_wires_meta_skill_auto_propose_routes(
         "make_memory_dream_handler",
         fake_make_memory_dream_handler,
     )
-    monkeypatch.setattr(
-        runtime_e2e_mod, "make_runtime_e2e_context", fake_make_runtime_e2e_context
-    )
-    monkeypatch.setattr(
-        proposer_mod, "set_runtime_e2e_context", fake_set_runtime_e2e_context
-    )
-    monkeypatch.setattr(
-        proposer_mod, "reset_runtime_e2e_context", fake_reset_runtime_e2e_context
-    )
-    monkeypatch.setattr(
-        proposer_mod, "set_smoke_fixture_context", fake_set_smoke_fixture_context
-    )
+    monkeypatch.setattr(runtime_e2e_mod, "make_runtime_e2e_context", fake_make_runtime_e2e_context)
+    monkeypatch.setattr(proposer_mod, "set_runtime_e2e_context", fake_set_runtime_e2e_context)
+    monkeypatch.setattr(proposer_mod, "reset_runtime_e2e_context", fake_reset_runtime_e2e_context)
+    monkeypatch.setattr(proposer_mod, "set_smoke_fixture_context", fake_set_smoke_fixture_context)
     monkeypatch.setattr(
         proposer_mod, "reset_smoke_fixture_context", fake_reset_smoke_fixture_context
     )
-    monkeypatch.setattr(
-        "opensquilla.gateway.pidlock.GatewayPidLock.acquire", lambda self: None
-    )
-    monkeypatch.setattr(
-        "opensquilla.gateway.pidlock.GatewayPidLock.release", lambda self: None
-    )
+    monkeypatch.setattr("opensquilla.gateway.pidlock.GatewayPidLock.acquire", lambda self: None)
+    monkeypatch.setattr("opensquilla.gateway.pidlock.GatewayPidLock.release", lambda self: None)
 
     config = GatewayConfig(
         state_dir=str(tmp_path / "state"),
@@ -1490,6 +1476,7 @@ async def test_build_flush_service_archive_workspace_falls_back_to_main_workspac
     assert receipt.mode == "raw"
     assert (main_workspace / receipt.flushed_paths[0]).exists()
     assert not (matching_memory_dir / receipt.flushed_paths[0]).exists()
+
 
 @pytest.mark.asyncio
 async def test_build_flush_service_wires_durable_receipt_writer(tmp_path: Path) -> None:
@@ -1741,9 +1728,7 @@ async def test_build_services_registers_session_search_tool(
     )
     monkeypatch.setattr(
         "opensquilla.sandbox.integration.configure_runtime",
-        lambda *args, **kwargs: SimpleNamespace(
-            effective=SimpleNamespace(as_dict=lambda: {})
-        ),
+        lambda *args, **kwargs: SimpleNamespace(effective=SimpleNamespace(as_dict=lambda: {})),
     )
 
     captured_memory_kwargs: dict[str, Any] = {}
@@ -1778,9 +1763,7 @@ async def test_build_services_registers_session_search_tool(
         assert "Full-text search across persisted session transcripts" in (
             session_search.spec.description
         )
-        assert "defaults to curated memory source files" in (
-            session_search.spec.description
-        )
+        assert "defaults to curated memory source files" in (session_search.spec.description)
         assert "use source=sessions or source=all" in session_search.spec.description
         owner_names = {
             tool["name"]
@@ -1882,9 +1865,7 @@ async def test_build_services_fails_fast_for_explicit_remote_memory_without_key(
 ) -> None:
     monkeypatch.setattr(
         "opensquilla.sandbox.integration.configure_runtime",
-        lambda *args, **kwargs: SimpleNamespace(
-            effective=SimpleNamespace(as_dict=lambda: {})
-        ),
+        lambda *args, **kwargs: SimpleNamespace(effective=SimpleNamespace(as_dict=lambda: {})),
     )
     config = GatewayConfig(
         state_dir=str(tmp_path / "state"),
@@ -2130,6 +2111,180 @@ async def test_task_runtime_turn_uses_workspace_from_saved_run_context(
     )
 
     assert runner.calls[0]["tool_context"].workspace_dir == str(project_workspace)
+
+
+@pytest.mark.asyncio
+async def test_task_runtime_turn_overwrites_forged_envelope_with_bound_project(
+    tmp_path: Path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "queued-project.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    project_path = tmp_path / "project"
+    outside = tmp_path / "outside"
+    project_path.mkdir()
+    outside.mkdir()
+    project = await storage.create_or_restore_project_workspace(
+        path=str(project_path.resolve()),
+        path_key=project_path_key(project_path, strict=True),
+        display_name="project",
+        trusted_at=1,
+    )
+    key = "agent:main:webchat:queued-forged-envelope"
+    await manager.create(
+        key,
+        workspace_id=project.workspace_id,
+        origin={
+            RUN_CONTEXT_ORIGIN_KEY: {
+                "run_mode": "full",
+                "workspace": str(outside),
+            }
+        },
+    )
+    envelope = build_cli_route_envelope(session_key=key, agent_id="main")
+    envelope.metadata["sandbox_run_context"] = {
+        "run_mode": "full",
+        "workspace": str(outside),
+    }
+    object.__setattr__(envelope, "sandbox_run_context_fresh", True)
+    run = SimpleNamespace(
+        agent_id="main",
+        task_id="queued-forged-envelope-task",
+        session_key=key,
+        message="pwd",
+        envelope=envelope,
+        attachments=[],
+        input_provenance={},
+        run_kind="interactive",
+        no_memory_capture=False,
+        ingress_pipeline_steps=[],
+        semantic_message=None,
+        stream_event_sink=None,
+    )
+
+    class RecordingTurnRunner:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            self.calls.append(kwargs)
+            yield DoneEvent()
+
+    runner = RecordingTurnRunner()
+
+    async def emit(_session_key: str, _event_name: str, _payload: dict[str, Any]) -> None:
+        return None
+
+    try:
+        await dispatch_task_runtime_turn(
+            run,
+            config=GatewayConfig(
+                workspace_dir=str(tmp_path / "default"),
+                agent_stream_heartbeat_interval_seconds=0.0,
+                agent_stream_idle_timeout_seconds=1.0,
+            ),
+            session_manager=manager,
+            turn_runner=runner,
+            event_emitter=emit,
+        )
+    finally:
+        await storage.close()
+
+    tool_context = runner.calls[0]["tool_context"]
+    assert tool_context.workspace_dir == project.path
+    assert tool_context.run_mode == "standard"
+    assert envelope.metadata["sandbox_run_context"]["workspace"] == project.path
+
+
+@pytest.mark.parametrize("invalid_kind", ["missing", "file", "root"])
+@pytest.mark.asyncio
+async def test_task_runtime_turn_rejects_unavailable_bound_project_kinds(
+    tmp_path: Path,
+    invalid_kind: str,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / f"queued-{invalid_kind}.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    project_path = tmp_path / f"{invalid_kind}-project"
+    if invalid_kind == "root":
+        canonical = str(Path("/").resolve())
+        path_key = project_path_key(canonical, strict=True)
+    else:
+        project_path.mkdir()
+        canonical = str(project_path.resolve())
+        path_key = project_path_key(project_path, strict=True)
+    project = await storage.create_or_restore_project_workspace(
+        path=canonical,
+        path_key=path_key,
+        display_name=invalid_kind,
+        trusted_at=1,
+    )
+    key = f"agent:main:webchat:queued-{invalid_kind}"
+    await manager.create(
+        key,
+        workspace_id=project.workspace_id,
+        origin={
+            RUN_CONTEXT_ORIGIN_KEY: {
+                "run_mode": "standard",
+                "workspace": project.path,
+            }
+        },
+    )
+    if invalid_kind == "missing":
+        project_path.rmdir()
+    elif invalid_kind == "file":
+        project_path.rmdir()
+        project_path.write_text("not a directory", encoding="utf-8")
+    envelope = build_cli_route_envelope(session_key=key, agent_id="main")
+    envelope.metadata["sandbox_run_context"] = {
+        "run_mode": "standard",
+        "workspace": project.path,
+    }
+    object.__setattr__(envelope, "sandbox_run_context_fresh", True)
+    run = SimpleNamespace(
+        agent_id="main",
+        task_id=f"queued-{invalid_kind}-task",
+        session_key=key,
+        message="pwd",
+        envelope=envelope,
+        attachments=[],
+        input_provenance={},
+        run_kind="interactive",
+        no_memory_capture=False,
+        ingress_pipeline_steps=[],
+        semantic_message=None,
+        stream_event_sink=None,
+    )
+
+    class RecordingTurnRunner:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            self.calls.append(kwargs)
+            yield DoneEvent()
+
+    runner = RecordingTurnRunner()
+
+    async def emit(_session_key: str, _event_name: str, _payload: dict[str, Any]) -> None:
+        return None
+
+    try:
+        with pytest.raises(ProjectWorkspaceStateError) as raised:
+            await dispatch_task_runtime_turn(
+                run,
+                config=GatewayConfig(
+                    workspace_dir=str(tmp_path / "default"),
+                    agent_stream_heartbeat_interval_seconds=0.0,
+                    agent_stream_idle_timeout_seconds=1.0,
+                ),
+                session_manager=manager,
+                turn_runner=runner,
+                event_emitter=emit,
+            )
+    finally:
+        await storage.close()
+
+    assert raised.value.reason == "unavailable"
+    assert runner.calls == []
 
 
 @pytest.mark.asyncio

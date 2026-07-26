@@ -26,6 +26,11 @@ from opensquilla.gateway.input_normalization import (
     materialize_generated_text_attachments,
     normalize_incoming_text,
 )
+from opensquilla.gateway.project_workspace_runtime import (
+    authoritative_project_run_context,
+    map_project_workspace_error,
+    project_workspace_snapshot,
+)
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, RpcUnavailableError, get_dispatcher
 from opensquilla.gateway.session_events import build_sessions_changed_payload
 from opensquilla.gateway.session_services import (
@@ -49,7 +54,6 @@ from opensquilla.project_workspaces import (
 from opensquilla.sandbox.run_context import (
     RUN_CONTEXT_ORIGIN_KEY,
     RunContext,
-    get_run_context,
     run_context_from_origin_payload,
 )
 from opensquilla.sandbox.run_mode import (
@@ -743,9 +747,7 @@ def _workspace_metadata_for_session(session: Any, config: Any) -> dict[str, str]
     origin = getattr(session, "origin", None)
     origin_map = origin if isinstance(origin, dict) else {}
     context_payload = origin_map.get(RUN_CONTEXT_ORIGIN_KEY)
-    workspace = (
-        context_payload.get("workspace") if isinstance(context_payload, dict) else None
-    )
+    workspace = context_payload.get("workspace") if isinstance(context_payload, dict) else None
     workspace_path = _normalize_workspace_display_path(workspace)
 
     if workspace_path is None:
@@ -1804,14 +1806,9 @@ async def _handle_sessions_send(
             )
 
     def _project_workspace_error(exc: ProjectWorkspaceStateError) -> RpcHandlerError:
-        if exc.reason in {"not_found", "removed"}:
-            return RpcHandlerError(
-                "WORKSPACE_NOT_FOUND",
-                "Project workspace not found.",
-            )
-        return RpcHandlerError(
-            "WORKSPACE_UNAVAILABLE",
-            "The project directory is unavailable.",
+        return map_project_workspace_error(
+            exc,
+            owner=ctx.principal.is_owner,
         )
 
     selected_workspace = None
@@ -1837,8 +1834,7 @@ async def _handle_sessions_send(
         mode = project_default_run_mode(ctx.config)
         mode_source = (
             "project_default"
-            if mode is RunMode.STANDARD
-            and config_run_mode(ctx.config) is RunMode.FULL
+            if mode is RunMode.STANDARD and config_run_mode(ctx.config) is RunMode.FULL
             else "operator_default"
         )
         create_kwargs["workspace_id"] = selected_workspace.workspace_id
@@ -1948,10 +1944,7 @@ async def _handle_sessions_send(
 
     bound_workspace_id = getattr(session, "workspace_id", None)
     if isinstance(bound_workspace_id, str) and bound_workspace_id:
-        if (
-            workspace_guard is None
-            or workspace_guard.workspace_id != bound_workspace_id
-        ):
+        if workspace_guard is None or workspace_guard.workspace_id != bound_workspace_id:
             try:
                 validated_workspace = await resolve_validated_project_workspace(
                     storage,
@@ -2064,13 +2057,18 @@ async def _handle_sessions_send(
     workspace_path = resolve_agent_workspace_dir(agent_id, ctx.config)
     workspace_dir = str(workspace_path) if workspace_path is not None else None
     run_mode_hint = _trusted_run_mode_hint(ctx, source_hint)
-    run_context = await get_run_context(
-        ctx.session_manager,
-        key,
-        config=ctx.config,
-        workspace=workspace_dir,
-        session_node=session,
-    )
+    try:
+        run_context, authoritative_guard = await authoritative_project_run_context(
+            storage=storage,
+            session_manager=ctx.session_manager,
+            session=session,
+            config=ctx.config,
+            default_workspace=workspace_dir,
+        )
+    except ProjectWorkspaceStateError as exc:
+        raise _project_workspace_error(exc) from exc
+    if authoritative_guard is not None:
+        workspace_guard = authoritative_guard
     run_context = replace(
         run_context,
         run_mode=coerce_run_mode_for_principal(run_context.run_mode, ctx.principal),
@@ -2226,13 +2224,34 @@ async def _handle_sessions_send(
             from opensquilla.gateway.routing import tool_context_from_envelope
             from opensquilla.permissions import configured_default_elevated
 
+            execution_session = await storage.get_session(key)
+            if execution_session is None:
+                raise KeyError(f"Session not found: {key}")
+            execution_workspace_dir = workspace_dir
+            (
+                execution_run_context,
+                execution_workspace_guard,
+            ) = await authoritative_project_run_context(
+                storage=storage,
+                session_manager=ctx.session_manager,
+                session=execution_session,
+                config=ctx.config,
+                default_workspace=workspace_dir,
+            )
+            if execution_workspace_guard is not None:
+                _apply_run_context_route_metadata(
+                    route_envelope,
+                    execution_run_context,
+                    principal_is_owner=ctx.principal.is_owner,
+                )
+                execution_workspace_dir = execution_run_context.workspace
             workspace_strict = getattr(ctx.config, "workspace_strict", None)
             if not isinstance(workspace_strict, bool):
-                workspace_strict = bool(workspace_dir)
+                workspace_strict = bool(execution_workspace_dir)
             tool_ctx = tool_context_from_envelope(
                 route_envelope,
                 is_owner=ctx.principal.is_owner,
-                workspace_dir=workspace_dir,
+                workspace_dir=execution_workspace_dir,
                 workspace_strict=workspace_strict,
                 default_elevated=configured_default_elevated(ctx.config),
             )
@@ -2241,7 +2260,7 @@ async def _handle_sessions_send(
                 key,
                 tool_context=tool_ctx,
                 agent_id=agent_id,
-                model=_session_turn_model(ctx, session, agent_id),
+                model=_session_turn_model(ctx, execution_session, agent_id),
                 attachments=raw_attachments,
                 session_intent=session_intent.value,
                 input_provenance=route_envelope.input_provenance,
@@ -2303,6 +2322,26 @@ async def _handle_sessions_send(
             await _emit_terminal_once(
                 "session.event.error",
                 {"message": _STREAM_IDLE_TIMEOUT_MESSAGE, "code": _STREAM_IDLE_TIMEOUT_CODE},
+            )
+        except ProjectWorkspaceStateError as exc:
+            mapped = _project_workspace_error(exc)
+            log.warning(
+                "sessions.send.project_workspace_unavailable",
+                session_key=key,
+                reason=exc.reason,
+            )
+            await ctx.session_manager.append_message(
+                key,
+                role="system",
+                content=f"Error: {mapped.message}",
+            )
+            await _emit_terminal_once(
+                "session.event.error",
+                {
+                    "message": mapped.message,
+                    "code": mapped.code,
+                    "details": mapped.details,
+                },
             )
         except Exception as exc:
             error_code, error_message = sanitize_agent_error(
@@ -2802,10 +2841,7 @@ async def _handle_sessions_send(
             _consumed_file_uuids = []
             raise _project_workspace_error(exc) from exc
         except sqlite3.IntegrityError as exc:
-            if (
-                atomic_intent_plan.action != "create"
-                or "sessions.session_key" not in str(exc)
-            ):
+            if atomic_intent_plan.action != "create" or "sessions.session_key" not in str(exc):
                 raise
             _consumed_file_uuids = []
             raise RpcHandlerError(
@@ -2923,9 +2959,7 @@ async def _handle_sessions_send(
             acceptance,
             client_request_id=ingress_identity.client_request_id,
             storage=storage,
-            turn_context=(
-                persisted_entry.turn_context if not acceptance.replayed else None
-            ),
+            turn_context=(persisted_entry.turn_context if not acceptance.replayed else None),
         )
 
     # 1. Persist user message to transcript (include attachment metadata).
@@ -3550,9 +3584,7 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
         for pass_index in range(_ABORT_TREE_STABILIZATION_PASSES):
             tree_keys = await _session_tree_keys(ctx.session_manager, key)
             new_keys = [
-                session_key
-                for session_key in tree_keys
-                if session_key not in processed_keys
+                session_key for session_key in tree_keys if session_key not in processed_keys
             ]
             drains: list[tuple[str, tuple[str, ...]]] = []
             cancelled_this_pass = 0
@@ -3560,9 +3592,7 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
                 first_visit = session_key in new_keys
                 if first_visit:
                     processed_keys.add(session_key)
-                    cancelled_groups += await cancel_background_completion_for_session(
-                        session_key
-                    )
+                    cancelled_groups += await cancel_background_completion_for_session(session_key)
                 active_task_ids = await _active_task_runtime_ids(task_runtime, session_key)
                 new_active_task_ids = tuple(
                     task_id
@@ -4642,10 +4672,19 @@ async def _handle_sessions_messages_subscribe(params: dict | None, ctx: RpcConte
     )
 
     active_task_group_ids = await active_background_completion_group_ids(key)
+    session = await storage.get_session(key) if storage is not None else None
+    workspace_id = session.workspace_id if session is not None else None
+    project_snapshot = (
+        await project_workspace_snapshot(storage, session)
+        if storage is not None and session is not None
+        else None
+    )
 
     return {
         "subscribed": subscription_mgr is not None,
         "key": key,
+        "workspaceId": workspace_id,
+        "projectWorkspace": project_snapshot,
         "current_stream_seq": replay.current_stream_seq,
         "replay_complete": replay.replay_complete,
         "replay_gap_reason": replay.gap_reason,
@@ -4826,14 +4865,20 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
 
     workspace_path = resolve_agent_workspace_dir(agent_id, ctx.config)
     default_workspace = str(workspace_path) if workspace_path is not None else None
-    bootstrap_run_context = await get_run_context(
-        ctx.session_manager,
-        session_key,
-        config=ctx.config,
-        workspace=default_workspace,
-        session_node=session,
-    )
-    workspace = bootstrap_run_context.workspace or default_workspace
+    project_snapshot = await project_workspace_snapshot(storage, session)
+    try:
+        bootstrap_run_context, _workspace_guard = await authoritative_project_run_context(
+            storage=storage,
+            session_manager=ctx.session_manager,
+            session=session,
+            config=ctx.config,
+            default_workspace=default_workspace,
+        )
+        workspace = bootstrap_run_context.workspace or default_workspace
+    except ProjectWorkspaceStateError:
+        workspace = (
+            project_snapshot.get("path") if project_snapshot is not None else default_workspace
+        )
     from opensquilla.gateway.model_routing import model_routing_snapshot
 
     metadata = {
@@ -4846,6 +4891,7 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
         "workspace": workspace,
         "workspace_id": getattr(session, "workspace_id", None),
         "workspaceId": getattr(session, "workspace_id", None),
+        "projectWorkspace": project_snapshot,
         "created_at": session.created_at,
         "updated_at": session.updated_at,
         "display_name": getattr(session, "display_name", None),

@@ -31,6 +31,7 @@ from opensquilla.gateway.rpc_sessions import _normalize_terminal_event_payload
 from opensquilla.gateway.session_streams import get_session_streams
 from opensquilla.gateway.uploads import set_upload_store
 from opensquilla.gateway.websocket import SubscriptionManager, get_registry
+from opensquilla.project_workspaces import ProjectWorkspaceStateError
 from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
 from opensquilla.session.compaction import CompactionConfig
 from opensquilla.session.models import TranscriptEntry
@@ -65,6 +66,113 @@ class FakeSession:
     model: str | None = None
     model_override: str | None = None
     epoch: int = 0
+    workspace_id: str | None = None
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_code"),
+    [
+        ("not_found", "WORKSPACE_NOT_FOUND"),
+        ("removed", "WORKSPACE_NOT_FOUND"),
+        ("untrusted", "WORKSPACE_NOT_FOUND"),
+        ("unavailable", "WORKSPACE_UNAVAILABLE"),
+        ("canonical_changed", "WORKSPACE_UNAVAILABLE"),
+        ("guard_required", "WORKSPACE_UNAVAILABLE"),
+        ("binding_changed", "WORKSPACE_UNAVAILABLE"),
+    ],
+)
+def test_project_workspace_error_mapping_is_stable(
+    reason: str,
+    expected_code: str,
+) -> None:
+    from opensquilla.gateway.project_workspace_runtime import (
+        map_project_workspace_error,
+    )
+
+    mapped = map_project_workspace_error(
+        ProjectWorkspaceStateError(reason),  # type: ignore[arg-type]
+        owner=True,
+    )
+
+    assert mapped.code == expected_code
+    assert mapped.details == {"reason": reason}
+
+
+def test_project_workspace_error_mapping_does_not_leak_path_to_non_owner() -> None:
+    from opensquilla.gateway.project_workspace_runtime import (
+        map_project_workspace_error,
+    )
+
+    secret_path = "/private/owner/project"
+    low_level = "permission denied while opening inode 42"
+    source = OSError(f"{low_level}: {secret_path}")
+    error = ProjectWorkspaceStateError("unavailable")
+    error.__cause__ = source
+
+    mapped = map_project_workspace_error(error, owner=False)
+    rendered = f"{mapped.message} {mapped.details}"
+
+    assert secret_path not in rendered
+    assert low_level not in rendered
+    assert mapped.details == {"reason": "unavailable"}
+
+
+@pytest.mark.asyncio
+async def test_project_workspace_snapshot_retains_missing_binding_id() -> None:
+    from opensquilla.gateway.project_workspace_runtime import (
+        project_workspace_snapshot,
+    )
+
+    class MissingStorage:
+        async def get_project_workspace(self, workspace_id: str) -> None:
+            return None
+
+    snapshot = await project_workspace_snapshot(
+        MissingStorage(),  # type: ignore[arg-type]
+        FakeSession(workspace_id="missing-project"),
+    )
+
+    assert snapshot == {
+        "id": "missing-project",
+        "name": None,
+        "path": None,
+        "available": False,
+        "removed": False,
+        "availabilityReason": "not_found",
+    }
+
+
+@pytest.mark.asyncio
+async def test_project_workspace_snapshot_retains_removed_name_and_path() -> None:
+    from opensquilla.gateway.project_workspace_runtime import (
+        project_workspace_snapshot,
+    )
+
+    removed = SimpleNamespace(
+        workspace_id="removed-project",
+        display_name="Removed project",
+        path="/retained/project/path",
+        removed_at=123,
+        trusted_at=1,
+    )
+
+    class RemovedStorage:
+        async def get_project_workspace(self, workspace_id: str) -> Any:
+            return removed
+
+    snapshot = await project_workspace_snapshot(
+        RemovedStorage(),  # type: ignore[arg-type]
+        FakeSession(workspace_id=removed.workspace_id),
+    )
+
+    assert snapshot == {
+        "id": removed.workspace_id,
+        "name": removed.display_name,
+        "path": removed.path,
+        "available": False,
+        "removed": True,
+        "availabilityReason": "removed",
+    }
 
 
 class FakeStorage:
@@ -1538,9 +1646,7 @@ class TestSessionsSend:
                 message_id: str,
                 context: dict[str, Any],
             ) -> bool:
-                self.turn_context_updates.append(
-                    (session_key, message_id, dict(context))
-                )
+                self.turn_context_updates.append((session_key, message_id, dict(context)))
                 return True
 
         blocker_started = asyncio.Event()
@@ -3052,9 +3158,7 @@ class TestSessionsSteer:
         assert res.ok is True
         assert res.payload["accepted"] is True
         assert res.payload["turn_id"] == "turn-running"
-        assert manager.created_messages == [
-            (session.session_key, "user", "change direction")
-        ]
+        assert manager.created_messages == [(session.session_key, "user", "change direction")]
         assert calls[0]["persisted_user_message_id"] == "msg-1"
         assert calls[0]["client_message_id"] == "client-steer"
         assert manager.updated_turn_contexts[0][2]["disposition"] == "steering"
@@ -3127,14 +3231,10 @@ class TestSessionsSteer:
         assert res.error.retryable is False
         assert res.error.details["fallback_safe"] is False
         assert res.error.details["orphan_message_id"] == "msg-1"
-        assert manager.created_messages == [
-            (session.session_key, "user", "late but durable")
-        ]
+        assert manager.created_messages == [(session.session_key, "user", "late but durable")]
         assert manager.removed_messages == [(session.session_key, "msg-1")]
         assert manager.updated_turn_contexts[-1][2]["disposition"] == "rejected"
-        assert manager.updated_turn_contexts[-1][2]["client_message_id"] == (
-            "client-dirty-steer"
-        )
+        assert manager.updated_turn_contexts[-1][2]["client_message_id"] == ("client-dirty-steer")
 
 
 class TestSessionsAbort:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 from dataclasses import replace
@@ -14,6 +15,7 @@ from opensquilla.sandbox.network_guard import NetworkDecision
 from opensquilla.sandbox.package_bundles import expand_package_bundle
 from opensquilla.sandbox.path_validation import MountDecision
 from opensquilla.sandbox.run_context import (
+    RUN_CONTEXT_ORIGIN_KEY,
     DomainGrant,
     MountGrant,
     PackageBundleGrant,
@@ -34,6 +36,54 @@ _RESOLVED_RUN_CONTEXT_OVERLAYS: dict[tuple[str, str | None], RunContext] = {}
 _RESOLVED_RUN_CONTEXT_PERSISTORS: dict[tuple[str, str | None], tuple[Any, Any]] = {}
 _DENIED_SANDBOX_APPROVALS: dict[str, str] = {}
 _DURABLE_TEMPORARY_GRANT_SOURCES = frozenset({"saved", "route_metadata", "metadata"})
+
+
+class _AuthoritativeRunContextManager:
+    def __init__(
+        self,
+        session_manager: Any,
+        session_key: str,
+        context: RunContext,
+    ) -> None:
+        self._session_manager = session_manager
+        self._session_key = session_key
+        self._context = context
+        self._session: Any | None = None
+
+    async def get_session(self, session_key: str) -> Any | None:
+        if session_key == self._session_key and self._session is not None:
+            return copy.copy(self._session)
+        get_session = getattr(self._session_manager, "get_session", None)
+        if callable(get_session):
+            session = await get_session(session_key)
+        else:
+            storage = getattr(self._session_manager, "_storage", None)
+            storage_get = getattr(storage, "get_session", None)
+            session = await storage_get(session_key) if callable(storage_get) else None
+        if session_key != self._session_key or session is None:
+            return session
+        seeded = copy.copy(session)
+        origin = (
+            dict(getattr(seeded, "origin", None))
+            if isinstance(getattr(seeded, "origin", None), dict)
+            else {}
+        )
+        origin[RUN_CONTEXT_ORIGIN_KEY] = self._context.to_origin_payload()
+        seeded.origin = origin
+        self._session = seeded
+        return copy.copy(seeded)
+
+    async def update(self, session_key: str, **fields: Any) -> Any:
+        update = getattr(self._session_manager, "update", None)
+        if not callable(update):
+            raise RuntimeError("Session manager does not support update")
+        updated = await update(session_key, **fields)
+        if session_key == self._session_key:
+            self._session = copy.copy(updated)
+        return updated
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._session_manager, name)
 
 
 def _choice(
@@ -253,6 +303,8 @@ def request_sandbox_approval(
     if not isinstance(params, dict):
         raise ValueError("sandbox_approval_params_required")
 
+    _remember_current_tool_run_context_for_approval(params)
+
     if _current_tool_context_is_channel():
         admin_identity = _channel_admin_approval_identity()
         if admin_identity is None:
@@ -364,6 +416,51 @@ def _channel_admin_approval_identity() -> tuple[str, str] | None:
         return None
     session_key = str(getattr(ctx, "session_key", "") or "").strip()
     return sender_id, session_key
+
+
+def _remember_current_tool_run_context_for_approval(
+    params: dict[str, object],
+) -> None:
+    session_key = str(params.get("sessionKey") or "").strip()
+    if not session_key:
+        return
+    workspace = _workspace_param(params)
+    try:
+        from opensquilla.tools.types import current_tool_context
+
+        tool_context = current_tool_context.get()
+    except Exception:  # pragma: no cover - defensive
+        return
+    if tool_context is None:
+        return
+    if str(getattr(tool_context, "session_key", None) or "").strip() != session_key:
+        return
+    context = getattr(tool_context, "sandbox_run_context", None)
+    if not isinstance(context, RunContext):
+        return
+    context_workspace = context.workspace or getattr(
+        tool_context,
+        "workspace_dir",
+        None,
+    )
+    if _normalize_workspace(context_workspace) != _normalize_workspace(workspace):
+        return
+    remember_resolved_run_context(session_key, workspace, context)
+
+
+def _approval_mutation_manager(
+    session_manager: Any,
+    session_key: str,
+    workspace: str | None,
+) -> Any:
+    context = resolved_run_context_overlay(session_key, workspace)
+    if context is None:
+        return session_manager
+    return _AuthoritativeRunContextManager(
+        session_manager,
+        session_key,
+        context,
+    )
 
 
 def remember_sandbox_approval_denial(
@@ -723,10 +820,8 @@ def consume_temporary_network_grant(
     if not isinstance(run_context, RunContext):
         return consumed
     if (
-        _normalize_workspace(getattr(ctx, "workspace_dir", None))
-        != _normalize_workspace(workspace)
-        or str(getattr(ctx, "session_key", None) or "").strip()
-        != str(session_key or "").strip()
+        _normalize_workspace(getattr(ctx, "workspace_dir", None)) != _normalize_workspace(workspace)
+        or str(getattr(ctx, "session_key", None) or "").strip() != str(session_key or "").strip()
     ):
         return consumed
     updated = _without_matching_temporary_network_grants(
@@ -759,8 +854,9 @@ async def consume_persisted_temporary_network_grant(
         if persisted is None:
             return False
         manager, cfg = persisted
+    authoritative = resolved_run_context_overlay(key[0], workspace)
     try:
-        existing = await get_run_context(
+        persisted_existing = await get_run_context(
             manager,
             key[0],
             config=cfg,
@@ -768,13 +864,22 @@ async def consume_persisted_temporary_network_grant(
         )
     except Exception:
         return False
-    updated = _without_matching_temporary_network_grants(
-        existing,
+    persisted_updated = _without_matching_temporary_network_grants(
+        persisted_existing,
         host=host,
         fingerprint=fingerprint,
     )
-    if updated is existing:
+    if persisted_updated is persisted_existing:
         return False
+    updated = (
+        _without_matching_temporary_network_grants(
+            authoritative,
+            host=host,
+            fingerprint=fingerprint,
+        )
+        if authoritative is not None
+        else persisted_updated
+    )
     try:
         persisted_context = await persist_run_context(manager, key[0], updated)
     except Exception:
@@ -800,8 +905,7 @@ def has_temporary_network_grant(context: RunContext | None, *, host: str, finger
             or (
                 grant.kind == "bundle"
                 and any(
-                    domain_matches(domain, host)
-                    for domain in expand_package_bundle(grant.value)
+                    domain_matches(domain, host) for domain in expand_package_bundle(grant.value)
                 )
             )
         )
@@ -899,12 +1003,14 @@ async def _apply_network_choice(
         fingerprint = _require_text(params, "fingerprint")
         value = bundle_id or _require_text(params, "host")
         kind = "bundle" if bundle_id else "domain"
-        existing = await get_run_context(
-            session_manager,
-            session_key,
-            config=config,
-            workspace=workspace,
-        )
+        existing = resolved_run_context_overlay(session_key, workspace)
+        if existing is None:
+            existing = await get_run_context(
+                session_manager,
+                session_key,
+                config=config,
+                workspace=workspace,
+            )
         grant = TemporaryGrant(
             kind=kind,
             value=value,
@@ -927,8 +1033,13 @@ async def _apply_network_choice(
         return
 
     if bundle_id:
-        updated = await enable_bundle_grant(
+        mutation_manager = _approval_mutation_manager(
             session_manager,
+            session_key,
+            workspace,
+        )
+        updated = await enable_bundle_grant(
+            mutation_manager,
             session_key,
             bundle_id=bundle_id,
             scope="chat",
@@ -945,8 +1056,13 @@ async def _apply_network_choice(
         return
 
     host = _require_text(params, "host")
-    updated = await add_domain_grant(
+    mutation_manager = _approval_mutation_manager(
         session_manager,
+        session_key,
+        workspace,
+    )
+    updated = await add_domain_grant(
+        mutation_manager,
         session_key,
         domain=host,
         scope="chat",
@@ -979,8 +1095,13 @@ async def _apply_path_choice(
     if requested_access not in {"ro", "rw"}:
         raise ValueError("path_access_required")
 
-    updated = await add_mount_grant(
+    mutation_manager = _approval_mutation_manager(
         session_manager,
+        session_key,
+        workspace,
+    )
+    updated = await add_mount_grant(
+        mutation_manager,
         session_key,
         path=path,
         access=requested_access,

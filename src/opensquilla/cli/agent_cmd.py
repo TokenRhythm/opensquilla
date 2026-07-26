@@ -304,6 +304,36 @@ async def run_agent_once(
             elevated=elevated,
             run_mode=run_mode,
         )
+        from opensquilla.gateway.project_workspace_runtime import (
+            authoritative_project_run_context,
+        )
+        from opensquilla.gateway.session_services import get_session_storage
+
+        storage = get_session_storage(svc.session_manager)
+        if storage is not None:
+            session = await storage.get_session(session_key)
+            if session is None:
+                raise KeyError(f"Session not found: {session_key}")
+            run_context, workspace_guard = await authoritative_project_run_context(
+                storage=storage,
+                session_manager=svc.session_manager,
+                session=session,
+                config=service_cfg,
+                default_workspace=tool_workspace_dir,
+            )
+            if workspace_guard is not None:
+                from opensquilla.gateway.rpc_sessions import (
+                    _apply_run_context_route_metadata,
+                )
+
+                _apply_run_context_route_metadata(
+                    route_envelope,
+                    run_context,
+                    principal_is_owner=True,
+                )
+                tool_workspace_dir = run_context.workspace
+                if not isinstance(workspace_strict, bool):
+                    effective_workspace_strict = True
         tool_ctx = tool_context_from_envelope(
             route_envelope,
             is_owner=True,
@@ -363,9 +393,7 @@ async def run_agent_once(
     if usage_path:
         _write_json(usage_path, usage)
 
-    done_text_present, done_text = (
-        done_text_snapshot(done) if done is not None else (False, "")
-    )
+    done_text_present, done_text = done_text_snapshot(done) if done is not None else (False, "")
     return AgentRunResult(
         status="error" if errors else "ok",
         agent_id=agent_id,
@@ -720,11 +748,11 @@ def _print_no_provider_error() -> None:
             "  opensquilla onboard\n\n"
             "Option 2 — set an environment variable for your provider:\n"
             "  export OPENROUTER_API_KEY=sk-or-...        # POSIX / macOS / Linux\n"
-            "  setx OPENROUTER_API_KEY \"sk-or-...\"  "
+            '  setx OPENROUTER_API_KEY "sk-or-..."  '
             "# Windows cmd: set OPENROUTER_API_KEY=...\n\n"
             "Option 3 — edit ~/.opensquilla/config.toml and add:\n"
             "  [llm]\n"
-            "  api_key = \"your-key-here\"\n"
+            '  api_key = "your-key-here"\n'
         ),
     )
     console.print(Panel(body, title="No Provider Configured", border_style="red"))
@@ -885,9 +913,7 @@ def run_agent_command(
     stateless_keep_project_rules = _unwrap_typer_default(stateless_keep_project_rules)
     permissions = _unwrap_typer_default(permissions)
     json_output = _unwrap_typer_default(json_output)
-    workspace_write_deny_globs = _parse_workspace_write_deny_globs(
-        workspace_lockdown_deny_paths
-    )
+    workspace_write_deny_globs = _parse_workspace_write_deny_globs(workspace_lockdown_deny_paths)
 
     result = asyncio.run(
         run_agent_once(

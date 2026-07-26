@@ -1,9 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import os
+from collections.abc import AsyncIterator
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import pytest_asyncio
+
+from opensquilla.gateway.auth import Principal
+from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.rpc import RpcContext, RpcHandlerError
+from opensquilla.project_workspaces import project_path_key
+from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
+from opensquilla.session.manager import SessionManager
+from opensquilla.session.models import ProjectWorkspace, SessionNode
+from opensquilla.session.storage import SessionStorage
 
 
 class _SessionManager:
@@ -87,6 +100,231 @@ def _reset_resolved_overlays() -> None:
     reset_resolved_run_context_overlays()
 
 
+@pytest_asyncio.fixture
+async def project_sandbox_ctx(
+    tmp_path: Path,
+) -> AsyncIterator[tuple[RpcContext, SessionNode, ProjectWorkspace]]:
+    storage = await SessionStorage.open(str(tmp_path / "sandbox-project.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    project_path = tmp_path / "project"
+    project_path.mkdir()
+    project = await storage.create_or_restore_project_workspace(
+        path=str(project_path.resolve()),
+        path_key=project_path_key(project_path, strict=True),
+        display_name="project",
+        trusted_at=1,
+    )
+    session = await manager.create(
+        "agent:main:webchat:project-sandbox-fixture",
+        workspace_id=project.workspace_id,
+        origin={
+            RUN_CONTEXT_ORIGIN_KEY: {
+                "run_mode": "standard",
+                "workspace": project.path,
+            }
+        },
+    )
+    ctx = RpcContext(
+        conn_id="project-sandbox-fixture",
+        principal=Principal(
+            role="operator",
+            scopes=frozenset({"operator.read", "operator.write"}),
+            is_owner=True,
+            authenticated=True,
+        ),
+        config=GatewayConfig(workspace_dir=str(tmp_path / "agent-default")),
+        session_manager=manager,
+    )
+    try:
+        yield ctx, session, project
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_sandbox_context_get_uses_bound_project_not_agent_default(
+    tmp_path: Path,
+) -> None:
+    from opensquilla.gateway.rpc_sandbox import _handle_sandbox_run_context_get
+
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    manager = SessionManager(storage)
+    project_path = tmp_path / "project"
+    project_path.mkdir()
+    project = await storage.create_or_restore_project_workspace(
+        path=str(project_path.resolve()),
+        path_key=project_path_key(project_path, strict=True),
+        display_name="project",
+        trusted_at=1,
+    )
+    session = await manager.create(
+        "agent:main:webchat:project-sandbox-context",
+        workspace_id=project.workspace_id,
+        origin={
+            RUN_CONTEXT_ORIGIN_KEY: {
+                "run_mode": "standard",
+                "workspace": project.path,
+            }
+        },
+    )
+    ctx = RpcContext(
+        conn_id="project-sandbox-context",
+        principal=Principal(
+            role="operator",
+            scopes=frozenset({"operator.admin"}),
+            is_owner=True,
+            authenticated=True,
+        ),
+        config=GatewayConfig(workspace_dir=str(tmp_path / "default")),
+        session_manager=manager,
+    )
+    try:
+        payload = await _handle_sandbox_run_context_get(
+            {"sessionKey": session.session_key},
+            ctx,
+        )
+        assert payload["workspace"] == project.path
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_sandbox_context_get_uses_bound_project_when_origin_is_missing(
+    project_sandbox_ctx: tuple[RpcContext, SessionNode, ProjectWorkspace],
+) -> None:
+    from opensquilla.gateway.rpc_sandbox import _handle_sandbox_run_context_get
+
+    ctx, project_session, project = project_sandbox_ctx
+    await ctx.session_manager.update(project_session.session_key, origin=None)
+
+    payload = await _handle_sandbox_run_context_get(
+        {"sessionKey": project_session.session_key},
+        ctx,
+    )
+
+    assert payload["workspace"] == project.path
+    assert payload["runMode"] == "standard"
+
+
+@pytest.mark.asyncio
+async def test_bound_project_workspace_cannot_be_changed(
+    project_sandbox_ctx: tuple[RpcContext, SessionNode, ProjectWorkspace],
+    tmp_path: Path,
+) -> None:
+    from opensquilla.gateway.rpc_sandbox import _handle_sandbox_workspace_set
+
+    ctx, project_session, _project = project_sandbox_ctx
+    other = tmp_path / "other"
+    other.mkdir()
+    with pytest.raises(RpcHandlerError) as raised:
+        await _handle_sandbox_workspace_set(
+            {
+                "sessionKey": project_session.session_key,
+                "workspace": str(other),
+            },
+            ctx,
+        )
+    assert raised.value.code == "PROJECT_WORKSPACE_FIXED"
+
+
+@pytest.mark.asyncio
+async def test_project_mount_validation_is_relative_to_authoritative_workspace(
+    project_sandbox_ctx: tuple[RpcContext, SessionNode, ProjectWorkspace],
+    tmp_path: Path,
+) -> None:
+    from opensquilla.gateway.rpc_sandbox import _handle_sandbox_mount_add
+
+    ctx, project_session, project = project_sandbox_ctx
+    inside = Path(project.path) / "inside"
+    inside.mkdir()
+    outside = tmp_path / "tampered-origin"
+    outside.mkdir()
+    project_session.origin = {
+        RUN_CONTEXT_ORIGIN_KEY: {
+            "run_mode": "standard",
+            "workspace": str(outside),
+        }
+    }
+    await ctx.session_manager.update(
+        project_session.session_key,
+        origin=project_session.origin,
+    )
+
+    payload = await _handle_sandbox_mount_add(
+        {
+            "sessionKey": project_session.session_key,
+            "path": str(inside),
+            "access": "rw",
+            "scope": "chat",
+        },
+        ctx,
+    )
+
+    assert payload["workspace"] == project.path
+    assert any(mount["path"] == str(inside) for mount in payload["mounts"])
+
+
+@pytest.mark.asyncio
+async def test_project_run_context_set_preserves_authoritative_workspace(
+    project_sandbox_ctx: tuple[RpcContext, SessionNode, ProjectWorkspace],
+    tmp_path: Path,
+) -> None:
+    from opensquilla.gateway.rpc_sandbox import _handle_sandbox_run_context_set
+
+    ctx, project_session, project = project_sandbox_ctx
+    outside = tmp_path / "tampered-context-origin"
+    outside.mkdir()
+    project_session.origin = {
+        RUN_CONTEXT_ORIGIN_KEY: {
+            "run_mode": "standard",
+            "workspace": str(outside),
+        }
+    }
+    await ctx.session_manager.update(
+        project_session.session_key,
+        origin=project_session.origin,
+    )
+
+    payload = await _handle_sandbox_run_context_set(
+        {
+            "sessionKey": project_session.session_key,
+            "runMode": "full",
+        },
+        ctx,
+    )
+    saved = await ctx.session_manager.get_session(project_session.session_key)
+
+    assert payload["workspace"] == project.path
+    assert payload["runMode"] == "full"
+    assert saved.origin[RUN_CONTEXT_ORIGIN_KEY]["workspace"] == project.path
+    assert saved.origin[RUN_CONTEXT_ORIGIN_KEY]["run_mode_source"] == "user"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX symlinks")
+@pytest.mark.asyncio
+async def test_project_sandbox_rpc_fails_when_workspace_becomes_unavailable(
+    project_sandbox_ctx: tuple[RpcContext, SessionNode, ProjectWorkspace],
+    tmp_path: Path,
+) -> None:
+    from opensquilla.gateway.rpc_sandbox import _handle_sandbox_run_context_get
+
+    ctx, project_session, project = project_sandbox_ctx
+    project_path = Path(project.path)
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    project_path.rename(tmp_path / "project-old")
+    project_path.symlink_to(replacement, target_is_directory=True)
+
+    with pytest.raises(RpcHandlerError) as raised:
+        await _handle_sandbox_run_context_get(
+            {"sessionKey": project_session.session_key},
+            ctx,
+        )
+
+    assert raised.value.code == "WORKSPACE_UNAVAILABLE"
+    assert raised.value.details == {"reason": "canonical_changed"}
+
+
 @pytest.mark.asyncio
 async def test_rpc_add_domain_returns_updated_context() -> None:
     from opensquilla.gateway.rpc_sandbox import _handle_sandbox_domain_add
@@ -102,9 +340,7 @@ async def test_rpc_add_domain_returns_updated_context() -> None:
         _ctx(manager),
     )
 
-    assert result["domains"] == [
-        {"domain": "pypi.org", "scope": "workspace", "source": "manual"}
-    ]
+    assert result["domains"] == [{"domain": "pypi.org", "scope": "workspace", "source": "manual"}]
 
 
 @pytest.mark.asyncio
@@ -1025,9 +1261,7 @@ async def test_rpc_mount_remove_chat_scope_leaves_user_scope_mount_visible() -> 
         ctx,
     )
 
-    assert result["mounts"] == [
-        {"path": normalized_path, "access": "ro", "scope": "workspace"}
-    ]
+    assert result["mounts"] == [{"path": normalized_path, "access": "ro", "scope": "workspace"}]
     context = await get_run_context(
         manager,
         manager.node.session_key,
@@ -1116,9 +1350,7 @@ async def test_rpc_domain_remove_chat_scope_leaves_user_scope_domain_visible() -
 
     manager = _SessionManager()
     ctx = _ctx(manager)
-    upsert_domain_grant(
-        {"domain": "example.com", "scope": "workspace", "source": "manual"}
-    )
+    upsert_domain_grant({"domain": "example.com", "scope": "workspace", "source": "manual"})
     manager.node.origin = {
         "sandbox_run_context": RunContext(
             run_mode=RunMode.STANDARD,
@@ -1167,8 +1399,7 @@ async def test_rpc_sandbox_status_reports_backend_managed_network_and_run_mode()
         "network_default": "proxy_allowlist",
     }
     catalog_by_id = {
-        bundle["bundle_id"]: set(bundle["domains"])
-        for bundle in result["bundle_catalog"]
+        bundle["bundle_id"]: set(bundle["domains"]) for bundle in result["bundle_catalog"]
     }
     expected_catalog_subsets = {
         "python-package-install": {

@@ -1117,9 +1117,55 @@ async def dispatch_task_runtime_turn(
     and capture every kwarg actually flowing into ``turn_runner.run``
     (including the ``semantic_message`` regression surface).
     """
+    from opensquilla.gateway.project_workspace_runtime import (
+        authoritative_project_run_context,
+        map_project_workspace_error,
+    )
     from opensquilla.gateway.routing import tool_context_from_envelope
+    from opensquilla.project_workspaces import ProjectWorkspaceStateError
 
     workspace_dir = resolve_agent_workspace_dir(run.agent_id, config)
+    session = None
+    storage = get_session_storage(session_manager)
+    if storage is not None:
+        session = await storage.get_session(run.session_key)
+        if session is None:
+            raise KeyError(f"Session not found: {run.session_key}")
+        try:
+            run_context, workspace_guard = await authoritative_project_run_context(
+                storage=storage,
+                session_manager=session_manager,
+                session=session,
+                config=config,
+                default_workspace=(str(workspace_dir) if workspace_dir is not None else None),
+            )
+        except ProjectWorkspaceStateError as exc:
+            mapped = map_project_workspace_error(
+                exc,
+                owner=_task_runtime_envelope_owner(run.envelope),
+            )
+            await event_emitter(
+                run.session_key,
+                "session.event.error",
+                {
+                    "message": mapped.message,
+                    "code": mapped.code,
+                    "details": mapped.details,
+                    "task_id": getattr(run, "task_id", None),
+                },
+            )
+            raise
+        if workspace_guard is not None:
+            from opensquilla.gateway.rpc_sessions import (
+                _apply_run_context_route_metadata,
+            )
+
+            _apply_run_context_route_metadata(
+                run.envelope,
+                run_context,
+                principal_is_owner=_task_runtime_envelope_owner(run.envelope),
+            )
+            workspace_dir = run_context.workspace
     workspace_strict = getattr(config, "workspace_strict", None)
     if not isinstance(workspace_strict, bool):
         workspace_strict = bool(workspace_dir)
@@ -1127,13 +1173,19 @@ async def dispatch_task_runtime_turn(
     tool_context = tool_context_from_envelope(
         run.envelope,
         is_owner=is_owner,
-        workspace_dir=str(workspace_dir),
+        workspace_dir=(str(workspace_dir) if workspace_dir is not None else None),
         workspace_strict=workspace_strict,
         default_elevated=configured_default_elevated(config),
     )
     tool_context.task_id = run.task_id
-    session = None
-    if session_manager is not None and hasattr(session_manager, "get_session"):
+    if (
+        session is None
+        and session_manager is not None
+        and hasattr(
+            session_manager,
+            "get_session",
+        )
+    ):
         session = await session_manager.get_session(run.session_key)
     run_kwargs = build_task_runtime_run_kwargs(
         run,
@@ -1165,9 +1217,7 @@ async def dispatch_task_runtime_turn(
                 stream_event_sink=getattr(run, "stream_event_sink", None),
                 task_id=getattr(run, "task_id", None),
                 session_id=getattr(run.envelope, "session_id", None),
-                client_message_id=getattr(run.envelope, "metadata", {}).get(
-                    "client_message_id"
-                ),
+                client_message_id=getattr(run.envelope, "metadata", {}).get("client_message_id"),
                 user_message_id=getattr(run, "persisted_user_message_id", None),
                 surface_id=getattr(run.envelope, "metadata", {}).get("surface_id"),
             )
@@ -1185,11 +1235,7 @@ async def dispatch_task_runtime_turn(
                 getattr(run, "persisted_user_message_id", None),
                 *(raw_message_ids if isinstance(raw_message_ids, list | tuple) else ()),
             ):
-                if (
-                    isinstance(message_id, str)
-                    and message_id
-                    and message_id not in message_ids
-                ):
+                if isinstance(message_id, str) and message_id and message_id not in message_ids:
                     message_ids.append(message_id)
 
             async def _remove_persisted_messages() -> None:
@@ -2797,9 +2843,7 @@ async def build_services(
         router_cfg_for_decisions = getattr(config, "squilla_router", None)
         decisions_storage = get_session_storage(session_manager)
         decisions_db_path = (
-            getattr(decisions_storage, "_db_path", None)
-            if decisions_storage is not None
-            else None
+            getattr(decisions_storage, "_db_path", None) if decisions_storage is not None else None
         )
         if decisions_db_path and decisions_db_path != ":memory:":
             from opensquilla.engine.steps.router_decision_record import (
@@ -2813,8 +2857,7 @@ async def build_services(
             router_decision_writer = open_router_decision_writer(
                 decisions_db_path,
                 retention_days=int(
-                    getattr(router_cfg_for_decisions, "decision_retention_days", 30)
-                    or 30
+                    getattr(router_cfg_for_decisions, "decision_retention_days", 30) or 30
                 ),
             )
             set_decision_writer(router_decision_writer)
@@ -4042,7 +4085,5 @@ async def start_gateway_server(
     if usage_storage is not None and hasattr(usage_storage, "get_usage_backfill_batch"):
         from opensquilla.gateway.usage_backfill import run_usage_backfill
 
-        svc.usage_backfill_task = create_background_task(
-            run_usage_backfill(usage_storage)
-        )
+        svc.usage_backfill_task = create_background_task(run_usage_backfill(usage_storage))
     return server_handle

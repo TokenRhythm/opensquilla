@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import replace
 from typing import Any
 
 from opensquilla.agents.scope import resolve_agent_workspace_dir
+from opensquilla.gateway.project_workspace_runtime import (
+    authoritative_project_run_context,
+    map_project_workspace_error,
+)
 from opensquilla.gateway.rpc import (
     RpcContext,
     RpcHandlerError,
@@ -13,6 +18,10 @@ from opensquilla.gateway.rpc import (
     get_dispatcher,
 )
 from opensquilla.gateway.session_services import get_session_storage
+from opensquilla.project_workspaces import (
+    ProjectWorkspaceGuard,
+    ProjectWorkspaceStateError,
+)
 from opensquilla.sandbox.domain_validation import validate_domain_pattern
 from opensquilla.sandbox.escalation import remember_resolved_run_context
 from opensquilla.sandbox.package_bundles import expand_package_bundle
@@ -22,6 +31,7 @@ from opensquilla.sandbox.path_validation import (
     normalize_path,
 )
 from opensquilla.sandbox.run_context import (
+    RUN_CONTEXT_ORIGIN_KEY,
     RunContext,
     get_run_context,
     normalize_workspace_path,
@@ -215,13 +225,12 @@ async def _ensure_session_for_set(session_manager: Any, session_key: str) -> Any
     return None
 
 
-async def _workspace_for_session_or_config(
-    session_manager: Any,
+def _default_workspace_for_session(
+    session: Any | None,
     session_key: str,
     config: Any,
 ) -> str | None:
     agent_id = parse_agent_id(session_key)
-    session = await _session_for_key(session_manager, session_key)
     session_agent_id = getattr(session, "agent_id", None) if session is not None else None
     if isinstance(session_agent_id, str) and session_agent_id:
         agent_id = session_agent_id
@@ -229,20 +238,89 @@ async def _workspace_for_session_or_config(
     return str(workspace) if workspace is not None else None
 
 
-async def _workspace_for_session(
+async def _context_for_session(
     session_manager: Any,
     session_key: str,
     config: Any,
-) -> str | None:
-    agent_id = parse_agent_id(session_key)
-    session = await _session_for_key(session_manager, session_key)
+    *,
+    owner: bool,
+    session: Any | None = None,
+) -> tuple[Any, RunContext, ProjectWorkspaceGuard | None]:
+    session = session or await _session_for_key(session_manager, session_key)
     if session is None:
         raise KeyError(f"Session not found: {session_key}")
-    session_agent_id = getattr(session, "agent_id", None)
-    if isinstance(session_agent_id, str) and session_agent_id:
-        agent_id = session_agent_id
-    workspace = resolve_agent_workspace_dir(agent_id, config)
-    return str(workspace) if workspace is not None else None
+    default_workspace = _default_workspace_for_session(session, session_key, config)
+    storage = get_session_storage(session_manager)
+    if storage is None:
+        context = await get_run_context(
+            session_manager,
+            session_key,
+            config=config,
+            workspace=default_workspace,
+            session_node=session,
+        )
+        return session, context, None
+    try:
+        context, guard = await authoritative_project_run_context(
+            storage=storage,
+            session_manager=session_manager,
+            session=session,
+            config=config,
+            default_workspace=default_workspace,
+        )
+    except ProjectWorkspaceStateError as exc:
+        raise map_project_workspace_error(exc, owner=owner) from exc
+    return session, context, guard
+
+
+class _AuthoritativeSessionManagerView:
+    """Feed mutation helpers a validated base without a preflight write."""
+
+    def __init__(
+        self,
+        session_manager: Any,
+        session: Any,
+        context: RunContext,
+    ) -> None:
+        self._session_manager = session_manager
+        self._session_key = session.session_key
+        self._session = copy.copy(session)
+        origin = (
+            dict(getattr(session, "origin", None))
+            if isinstance(getattr(session, "origin", None), dict)
+            else {}
+        )
+        origin[RUN_CONTEXT_ORIGIN_KEY] = context.to_origin_payload()
+        self._session.origin = origin
+
+    async def get_session(self, session_key: str) -> Any | None:
+        if session_key == self._session_key:
+            return self._session
+        return await self._session_manager.get_session(session_key)
+
+    async def update(self, session_key: str, **fields: Any) -> Any:
+        updated = await self._session_manager.update(session_key, **fields)
+        if session_key == self._session_key:
+            self._session = copy.copy(updated)
+        return updated
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._session_manager, name)
+
+
+def _mutation_manager(
+    session_manager: Any,
+    session: Any,
+    context: RunContext,
+    guard: ProjectWorkspaceGuard | None,
+) -> Any:
+    if guard is None:
+        return session_manager
+    return _AuthoritativeSessionManagerView(
+        session_manager,
+        session,
+        context,
+    )
 
 
 def _remember_context_overlay(
@@ -271,14 +349,26 @@ async def _validate_mount_path_for_rpc(
     *,
     path: str,
     access: str = "ro",
+    owner: bool,
 ) -> None:
-    workspace = await _workspace_for_session_or_config(session_manager, session_key, config)
-    context = await get_run_context(
-        session_manager,
-        session_key,
-        config=config,
-        workspace=workspace,
-    )
+    session = await _session_for_key(session_manager, session_key)
+    if session is None:
+        workspace = _default_workspace_for_session(None, session_key, config)
+        context = await get_run_context(
+            session_manager,
+            session_key,
+            config=config,
+            workspace=workspace,
+        )
+    else:
+        _session, context, _guard = await _context_for_session(
+            session_manager,
+            session_key,
+            config,
+            owner=owner,
+            session=session,
+        )
+        workspace = context.workspace
     decision = decide_path_access(
         path,
         workspace=context.workspace or workspace,
@@ -346,12 +436,11 @@ async def _handle_sandbox_explain(params: dict | None, ctx: RpcContext) -> dict:
     session_key = params.get("sessionKey")
     if isinstance(session_key, str) and session_key:
         manager = _require_session_manager(ctx)
-        workspace = await _workspace_for_session(manager, session_key, ctx.config)
-        context = await get_run_context(
+        _session, context, _guard = await _context_for_session(
             manager,
             session_key,
-            config=ctx.config,
-            workspace=workspace,
+            ctx.config,
+            owner=ctx.principal.is_owner,
         )
         result["runContext"] = _payload(context)
         result["autonomousPaused"] = await _session_autonomous_paused(session_key)
@@ -410,12 +499,11 @@ async def _handle_sandbox_run_context_get(params: dict | None, ctx: RpcContext) 
     params = _require_params(params)
     session_key = _require_session_key(params)
     manager = _require_session_manager(ctx)
-    workspace = await _workspace_for_session(manager, session_key, ctx.config)
-    context = await get_run_context(
+    _session, context, _guard = await _context_for_session(
         manager,
         session_key,
-        config=ctx.config,
-        workspace=workspace,
+        ctx.config,
+        owner=ctx.principal.is_owner,
     )
     context = _context_for_principal(context, ctx.principal)
     return _payload(context)
@@ -433,12 +521,25 @@ async def _handle_sandbox_run_context_set(params: dict | None, ctx: RpcContext) 
     session = await _ensure_session_for_set(manager, session_key)
     if session is None:
         raise KeyError(f"Session not found: {session_key}")
-    context = await set_run_mode(
+    session, base_context, guard = await _context_for_session(
         manager,
+        session_key,
+        ctx.config,
+        owner=ctx.principal.is_owner,
+        session=session,
+    )
+    mutation_manager = _mutation_manager(
+        manager,
+        session,
+        base_context,
+        guard,
+    )
+    context = await set_run_mode(
+        mutation_manager,
         session_key,
         run_mode,
         config=ctx.config,
-        workspace=await _workspace_for_session(manager, session_key, ctx.config),
+        workspace=base_context.workspace,
     )
     _remember_context_overlay(
         ctx,
@@ -463,13 +564,22 @@ async def _handle_sandbox_mount_add(params: dict | None, ctx: RpcContext) -> dic
         ctx.config,
         path=path,
         access=access,
+        owner=ctx.principal.is_owner,
     )
     session = await _ensure_session_for_set(manager, session_key)
     if session is None:
         raise KeyError(f"Session not found: {session_key}")
-    workspace = await _workspace_for_session(manager, session_key, ctx.config)
-    context = await add_mount_grant(
+    session, base_context, guard = await _context_for_session(
         manager,
+        session_key,
+        ctx.config,
+        owner=ctx.principal.is_owner,
+        session=session,
+    )
+    mutation_manager = _mutation_manager(manager, session, base_context, guard)
+    workspace = base_context.workspace
+    context = await add_mount_grant(
+        mutation_manager,
         session_key,
         path=path,
         access=access,
@@ -493,13 +603,22 @@ async def _handle_sandbox_mount_remove(params: dict | None, ctx: RpcContext) -> 
         session_key,
         ctx.config,
         path=path,
+        owner=ctx.principal.is_owner,
     )
     session = await _ensure_session_for_set(manager, session_key)
     if session is None:
         raise KeyError(f"Session not found: {session_key}")
-    workspace = await _workspace_for_session(manager, session_key, ctx.config)
-    context = await remove_mount_grant(
+    session, base_context, guard = await _context_for_session(
         manager,
+        session_key,
+        ctx.config,
+        owner=ctx.principal.is_owner,
+        session=session,
+    )
+    mutation_manager = _mutation_manager(manager, session, base_context, guard)
+    workspace = base_context.workspace
+    context = await remove_mount_grant(
+        mutation_manager,
         session_key,
         path=path,
         scope=str(params.get("scope") or ""),
@@ -521,9 +640,17 @@ async def _handle_sandbox_domain_add(params: dict | None, ctx: RpcContext) -> di
     session = await _ensure_session_for_set(manager, session_key)
     if session is None:
         raise KeyError(f"Session not found: {session_key}")
-    workspace = await _workspace_for_session(manager, session_key, ctx.config)
-    context = await add_domain_grant(
+    session, base_context, guard = await _context_for_session(
         manager,
+        session_key,
+        ctx.config,
+        owner=ctx.principal.is_owner,
+        session=session,
+    )
+    mutation_manager = _mutation_manager(manager, session, base_context, guard)
+    workspace = base_context.workspace
+    context = await add_domain_grant(
+        mutation_manager,
         session_key,
         domain=domain,
         scope=str(params.get("scope") or "workspace"),
@@ -545,9 +672,17 @@ async def _handle_sandbox_domain_remove(params: dict | None, ctx: RpcContext) ->
     session = await _ensure_session_for_set(manager, session_key)
     if session is None:
         raise KeyError(f"Session not found: {session_key}")
-    workspace = await _workspace_for_session(manager, session_key, ctx.config)
-    context = await remove_domain_grant(
+    session, base_context, guard = await _context_for_session(
         manager,
+        session_key,
+        ctx.config,
+        owner=ctx.principal.is_owner,
+        session=session,
+    )
+    mutation_manager = _mutation_manager(manager, session, base_context, guard)
+    workspace = base_context.workspace
+    context = await remove_domain_grant(
+        mutation_manager,
         session_key,
         domain=domain,
         scope=str(params.get("scope") or ""),
@@ -568,9 +703,17 @@ async def _handle_sandbox_bundle_enable(params: dict | None, ctx: RpcContext) ->
     session = await _ensure_session_for_set(manager, session_key)
     if session is None:
         raise KeyError(f"Session not found: {session_key}")
-    workspace = await _workspace_for_session(manager, session_key, ctx.config)
-    context = await enable_bundle_grant(
+    session, base_context, guard = await _context_for_session(
         manager,
+        session_key,
+        ctx.config,
+        owner=ctx.principal.is_owner,
+        session=session,
+    )
+    mutation_manager = _mutation_manager(manager, session, base_context, guard)
+    workspace = base_context.workspace
+    context = await enable_bundle_grant(
+        mutation_manager,
         session_key,
         bundle_id=bundle_id,
         scope=str(params.get("scope") or "workspace"),
@@ -591,9 +734,17 @@ async def _handle_sandbox_bundle_disable(params: dict | None, ctx: RpcContext) -
     session = await _ensure_session_for_set(manager, session_key)
     if session is None:
         raise KeyError(f"Session not found: {session_key}")
-    workspace = await _workspace_for_session(manager, session_key, ctx.config)
-    context = await disable_bundle_grant(
+    session, base_context, guard = await _context_for_session(
         manager,
+        session_key,
+        ctx.config,
+        owner=ctx.principal.is_owner,
+        session=session,
+    )
+    mutation_manager = _mutation_manager(manager, session, base_context, guard)
+    workspace = base_context.workspace
+    context = await disable_bundle_grant(
+        mutation_manager,
         session_key,
         bundle_id=bundle_id,
         config=ctx.config,
@@ -618,7 +769,9 @@ async def _handle_sandbox_path_list(params: dict | None, ctx: RpcContext) -> dic
     listing_dir = (
         normalized
         if browse_children and normalized.is_dir()
-        else normalized.parent if normalized.parent != normalized else normalized
+        else normalized.parent
+        if normalized.parent != normalized
+        else normalized
     )
     parent_target = normalized.parent if normalized.parent != normalized else normalized
     entries = []
@@ -666,6 +819,7 @@ async def _handle_sandbox_path_pick(params: dict | None, ctx: RpcContext) -> dic
         ctx.config,
         path=selected,
         access=access,
+        owner=ctx.principal.is_owner,
     )
     return {"path": str(normalize_path(selected)), "kind": kind}
 
@@ -685,7 +839,19 @@ async def _handle_sandbox_workspace_set(params: dict | None, ctx: RpcContext) ->
     session = await _ensure_session_for_set(manager, session_key)
     if session is None:
         raise KeyError(f"Session not found: {session_key}")
-    current_workspace = await _workspace_for_session(manager, session_key, ctx.config)
+    if getattr(session, "workspace_id", None) is not None:
+        raise RpcHandlerError(
+            "PROJECT_WORKSPACE_FIXED",
+            "A project-bound session cannot change its workspace.",
+        )
+    _session, base_context, _guard = await _context_for_session(
+        manager,
+        session_key,
+        ctx.config,
+        owner=ctx.principal.is_owner,
+        session=session,
+    )
+    current_workspace = base_context.workspace
     context = await set_workspace(
         manager,
         session_key,

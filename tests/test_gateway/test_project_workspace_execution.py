@@ -6,21 +6,28 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
 from opensquilla.engine.types import DoneEvent
+from opensquilla.gateway.agent_tasks import get_agent_task_registry
 from opensquilla.gateway.auth import Principal
+from opensquilla.gateway.boot import dispatch_task_runtime_turn
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.routing import build_cli_route_envelope
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.task_runtime import TaskRuntime
+from opensquilla.project_workspaces import ProjectWorkspaceStateError
 from opensquilla.sandbox.run_context import (
     RUN_CONTEXT_ORIGIN_KEY,
     run_context_from_origin_payload,
 )
 from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.session.manager import SessionManager
+from opensquilla.session.models import SessionNode
 from opensquilla.session.storage import SessionStorage
 
 OWNER = Principal(
@@ -109,6 +116,13 @@ async def add_project(stack: WorkspaceStack, path: Path):
     return await stack.storage.get_project_workspace(result.payload["workspace"]["id"])
 
 
+async def await_direct_task(session_key: str) -> None:
+    await asyncio.sleep(0)
+    task = get_agent_task_registry().get(session_key)
+    if task is not None:
+        await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+
+
 @pytest.mark.asyncio
 async def test_new_project_uses_standard_with_project_default_provenance(
     tmp_path: Path,
@@ -168,9 +182,7 @@ async def test_explicit_full_project_uses_operator_default_provenance(
         assert response.ok is True
         session = await stack.storage.get_session(key)
         assert session is not None and session.origin is not None
-        restored = run_context_from_origin_payload(
-            session.origin[RUN_CONTEXT_ORIGIN_KEY]
-        )
+        restored = run_context_from_origin_payload(session.origin[RUN_CONTEXT_ORIGIN_KEY])
         assert restored is not None
         assert restored.run_mode is RunMode.FULL
         assert restored.run_mode_source == "operator_default"
@@ -204,9 +216,7 @@ async def test_explicit_standard_and_trusted_project_modes_round_trip(
         assert response.ok is True
         session = await stack.storage.get_session(key)
         assert session is not None and session.origin is not None
-        restored = run_context_from_origin_payload(
-            session.origin[RUN_CONTEXT_ORIGIN_KEY]
-        )
+        restored = run_context_from_origin_payload(session.origin[RUN_CONTEXT_ORIGIN_KEY])
         assert restored is not None
         assert restored.run_mode is mode
         assert restored.run_mode_source == "operator_default"
@@ -634,9 +644,502 @@ async def test_existing_project_continuation_resolves_persisted_binding_guard(
 
         assert accepted.ok is True
         assert [
-            entry.content
-            for entry in await stack.storage.get_transcript(session.session_id)
+            entry.content for entry in await stack.storage.get_transcript(session.session_id)
         ] == ["continue"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX symlinks")
+@pytest.mark.asyncio
+async def test_continue_rejects_retargeted_project_before_runner_starts(
+    tmp_path: Path,
+) -> None:
+    async with open_stack(tmp_path / "sessions.db") as stack:
+        project_path = tmp_path / "project"
+        project = await add_project(stack, project_path)
+        assert project is not None
+        key = "agent:main:webchat:retargeted-continue"
+        await stack.storage.upsert_session(
+            SessionNode(
+                session_key=key,
+                workspace_id=project.workspace_id,
+                origin={
+                    RUN_CONTEXT_ORIGIN_KEY: {
+                        "run_mode": "standard",
+                        "workspace": project.path,
+                    }
+                },
+            )
+        )
+        replacement = tmp_path / "replacement"
+        replacement.mkdir()
+        project_path.rename(tmp_path / "project-old")
+        project_path.symlink_to(replacement, target_is_directory=True)
+
+        class Runner:
+            calls: list[dict[str, Any]] = []
+
+            async def run(self, message: str, session_key: str, **kwargs: Any):
+                self.calls.append(kwargs)
+                yield DoneEvent()
+
+        runner = Runner()
+        stack.context.task_runtime = None
+        stack.context.turn_runner = runner
+        result = await get_dispatcher().dispatch(
+            "retargeted-continue",
+            "chat.send",
+            {"sessionKey": key, "message": "pwd", "intent": "continue"},
+            stack.context,
+        )
+        assert result.ok is False
+        assert result.error.code == "WORKSPACE_UNAVAILABLE"
+        assert result.error.details["reason"] == "canonical_changed"
+        assert runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_origin_workspace_tamper_cannot_change_project_tool_context(
+    tmp_path: Path,
+) -> None:
+    async with open_stack(tmp_path / "sessions.db") as stack:
+        project = await add_project(stack, tmp_path / "project")
+        assert project is not None
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        key = "agent:main:webchat:tampered-origin"
+        await stack.storage.upsert_session(
+            SessionNode(
+                session_key=key,
+                workspace_id=project.workspace_id,
+                origin={
+                    RUN_CONTEXT_ORIGIN_KEY: {
+                        "run_mode": "standard",
+                        "workspace": str(outside),
+                    }
+                },
+            )
+        )
+        captured: dict[str, Any] = {}
+        ran = asyncio.Event()
+
+        class Runner:
+            async def run(self, message: str, session_key: str, **kwargs: Any):
+                captured.update(kwargs)
+                ran.set()
+                yield DoneEvent()
+
+        stack.context.task_runtime = None
+        stack.context.turn_runner = Runner()
+        result = await get_dispatcher().dispatch(
+            "tampered-origin",
+            "chat.send",
+            {"sessionKey": key, "message": "pwd", "intent": "continue"},
+            stack.context,
+        )
+        await asyncio.wait_for(ran.wait(), timeout=2.0)
+        assert result.ok is True
+        assert captured["tool_context"].workspace_dir == project.path
+
+
+@pytest.mark.asyncio
+async def test_legacy_implicit_full_project_context_executes_as_standard(
+    tmp_path: Path,
+) -> None:
+    async with open_stack(tmp_path / "sessions.db") as stack:
+        project = await add_project(stack, tmp_path / "project")
+        assert project is not None
+        key = "agent:main:webchat:legacy-implicit-full"
+        await stack.storage.upsert_session(
+            SessionNode(
+                session_key=key,
+                workspace_id=project.workspace_id,
+                origin={
+                    RUN_CONTEXT_ORIGIN_KEY: {
+                        "run_mode": "full",
+                        "workspace": project.path,
+                    }
+                },
+            )
+        )
+        captured: dict[str, Any] = {}
+        ran = asyncio.Event()
+
+        class Runner:
+            async def run(self, message: str, session_key: str, **kwargs: Any):
+                captured.update(kwargs)
+                ran.set()
+                yield DoneEvent()
+
+        stack.context.task_runtime = None
+        stack.context.turn_runner = Runner()
+        response = await get_dispatcher().dispatch(
+            "legacy-implicit-full",
+            "sessions.send",
+            {"key": key, "message": "pwd"},
+            stack.context,
+        )
+        await asyncio.wait_for(ran.wait(), timeout=2.0)
+
+        assert response.ok is True
+        assert captured["tool_context"].run_mode == "standard"
+        assert captured["tool_context"].sandbox_run_context.run_mode_source == "project_default"
+
+
+@pytest.mark.asyncio
+async def test_explicit_full_project_context_preserves_user_provenance(
+    tmp_path: Path,
+) -> None:
+    async with open_stack(tmp_path / "sessions.db") as stack:
+        project = await add_project(stack, tmp_path / "project")
+        assert project is not None
+        key = "agent:main:webchat:explicit-user-full"
+        await stack.storage.upsert_session(
+            SessionNode(
+                session_key=key,
+                workspace_id=project.workspace_id,
+                origin={
+                    RUN_CONTEXT_ORIGIN_KEY: {
+                        "run_mode": "full",
+                        "run_mode_source": "user",
+                        "workspace": project.path,
+                    }
+                },
+            )
+        )
+        captured: dict[str, Any] = {}
+        ran = asyncio.Event()
+
+        class Runner:
+            async def run(self, message: str, session_key: str, **kwargs: Any):
+                captured.update(kwargs)
+                ran.set()
+                yield DoneEvent()
+
+        stack.context.task_runtime = None
+        stack.context.turn_runner = Runner()
+        response = await get_dispatcher().dispatch(
+            "explicit-user-full",
+            "sessions.send",
+            {"key": key, "message": "pwd"},
+            stack.context,
+        )
+        await asyncio.wait_for(ran.wait(), timeout=2.0)
+
+        assert response.ok is True
+        assert captured["tool_context"].run_mode == "full"
+        assert captured["tool_context"].sandbox_run_context.run_mode_source == "user"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX symlinks")
+@pytest.mark.asyncio
+async def test_queued_turn_revalidates_project_before_tool_context(
+    tmp_path: Path,
+) -> None:
+    async with open_stack(tmp_path / "sessions.db") as stack:
+        project_path = tmp_path / "project"
+        project = await add_project(stack, project_path)
+        assert project is not None
+        key = "agent:main:webchat:queued-retarget"
+        await stack.storage.upsert_session(
+            SessionNode(session_key=key, workspace_id=project.workspace_id)
+        )
+        envelope = build_cli_route_envelope(session_key=key, agent_id="main")
+        envelope.metadata["sandbox_run_context"] = {
+            "run_mode": "standard",
+            "workspace": project.path,
+        }
+        object.__setattr__(envelope, "sandbox_run_context_fresh", True)
+        run = SimpleNamespace(
+            agent_id="main",
+            task_id="queued-retarget-task",
+            session_key=key,
+            message="pwd",
+            envelope=envelope,
+            attachments=[],
+            input_provenance={},
+            run_kind="interactive",
+            no_memory_capture=False,
+            ingress_pipeline_steps=[],
+            semantic_message=None,
+            stream_event_sink=None,
+        )
+        replacement = tmp_path / "replacement"
+        replacement.mkdir()
+        project_path.rename(tmp_path / "project-old")
+        project_path.symlink_to(replacement, target_is_directory=True)
+
+        class RecordingTurnRunner:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = []
+
+            async def run(
+                self,
+                message: str,
+                session_key: str,
+                **kwargs: Any,
+            ):
+                self.calls.append(kwargs)
+                yield DoneEvent()
+
+        turn_runner = RecordingTurnRunner()
+        with pytest.raises(ProjectWorkspaceStateError):
+            await dispatch_task_runtime_turn(
+                run,
+                config=stack.context.config,
+                session_manager=stack.manager,
+                turn_runner=turn_runner,
+                event_emitter=AsyncMock(),
+            )
+        assert turn_runner.calls == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX symlinks")
+@pytest.mark.asyncio
+async def test_direct_web_turn_revalidates_after_durable_acceptance(
+    tmp_path: Path,
+) -> None:
+    async with open_stack(tmp_path / "sessions.db") as stack:
+        project_path = tmp_path / "project"
+        project = await add_project(stack, project_path)
+        assert project is not None
+        key = "agent:main:webchat:direct-post-accept-retarget"
+        await stack.manager.create(
+            key,
+            workspace_id=project.workspace_id,
+            origin={
+                RUN_CONTEXT_ORIGIN_KEY: {
+                    "run_mode": "standard",
+                    "workspace": project.path,
+                }
+            },
+        )
+        calls: list[dict[str, Any]] = []
+
+        class Runner:
+            async def run(self, message: str, session_key: str, **kwargs: Any):
+                calls.append(kwargs)
+                yield DoneEvent()
+
+        original_accept_turn = stack.storage.accept_turn
+        replacement = tmp_path / "replacement"
+        replacement.mkdir()
+        retargeted = False
+
+        async def retarget_after_accept(*args: Any, **kwargs: Any) -> Any:
+            nonlocal retargeted
+            acceptance = await original_accept_turn(*args, **kwargs)
+            if not retargeted:
+                retargeted = True
+                project_path.rename(tmp_path / "project-old")
+                project_path.symlink_to(replacement, target_is_directory=True)
+            return acceptance
+
+        stack.storage.accept_turn = retarget_after_accept  # type: ignore[method-assign]
+        stack.context.task_runtime = None
+        stack.context.turn_runner = Runner()
+        response = await get_dispatcher().dispatch(
+            "direct-post-accept-retarget",
+            "sessions.send",
+            {"key": key, "message": "pwd"},
+            stack.context,
+        )
+        await await_direct_task(key)
+
+        assert response.ok is True
+        assert retargeted is True
+        assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_reset_revalidates_missing_project_after_durable_acceptance(
+    tmp_path: Path,
+) -> None:
+    async with open_stack(tmp_path / "sessions.db") as stack:
+        project_path = tmp_path / "project"
+        project = await add_project(stack, project_path)
+        assert project is not None
+        key = "agent:main:webchat:reset-post-accept-missing"
+        await stack.manager.create(
+            key,
+            workspace_id=project.workspace_id,
+            origin={
+                RUN_CONTEXT_ORIGIN_KEY: {
+                    "run_mode": "standard",
+                    "workspace": project.path,
+                }
+            },
+        )
+        calls: list[dict[str, Any]] = []
+
+        class Runner:
+            async def run(self, message: str, session_key: str, **kwargs: Any):
+                calls.append(kwargs)
+                yield DoneEvent()
+
+        original_accept_turn = stack.storage.accept_turn
+        removed = False
+
+        async def remove_after_accept(*args: Any, **kwargs: Any) -> Any:
+            nonlocal removed
+            acceptance = await original_accept_turn(*args, **kwargs)
+            if not removed:
+                removed = True
+                project_path.rmdir()
+            return acceptance
+
+        stack.storage.accept_turn = remove_after_accept  # type: ignore[method-assign]
+        stack.context.task_runtime = None
+        stack.context.turn_runner = Runner()
+        response = await get_dispatcher().dispatch(
+            "reset-post-accept-missing",
+            "sessions.send",
+            {
+                "key": key,
+                "message": "start over",
+                "intent": "reset_same_key",
+            },
+            stack.context,
+        )
+        await await_direct_task(key)
+
+        assert response.ok is True
+        assert removed is True
+        assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_fork_revalidates_file_replacement_after_durable_acceptance(
+    tmp_path: Path,
+) -> None:
+    async with open_stack(tmp_path / "sessions.db") as stack:
+        project_path = tmp_path / "project"
+        project = await add_project(stack, project_path)
+        assert project is not None
+        parent = await stack.manager.create(
+            "agent:main:webchat:fork-post-accept-file",
+            workspace_id=project.workspace_id,
+            origin={
+                RUN_CONTEXT_ORIGIN_KEY: {
+                    "run_mode": "standard",
+                    "workspace": project.path,
+                }
+            },
+        )
+        fork_before = await stack.manager.append_message(
+            parent.session_key,
+            "user",
+            "fork here",
+        )
+        calls: list[dict[str, Any]] = []
+
+        class Runner:
+            async def run(self, message: str, session_key: str, **kwargs: Any):
+                calls.append(kwargs)
+                yield DoneEvent()
+
+        original_accept_turn = stack.storage.accept_turn
+        replaced = False
+
+        async def replace_after_accept(*args: Any, **kwargs: Any) -> Any:
+            nonlocal replaced
+            acceptance = await original_accept_turn(*args, **kwargs)
+            if not replaced:
+                replaced = True
+                project_path.rmdir()
+                project_path.write_text("not a directory", encoding="utf-8")
+            return acceptance
+
+        stack.storage.accept_turn = replace_after_accept  # type: ignore[method-assign]
+        stack.context.task_runtime = None
+        stack.context.turn_runner = Runner()
+        response = await get_dispatcher().dispatch(
+            "fork-post-accept-file",
+            "sessions.send",
+            {
+                "key": parent.session_key,
+                "message": "forked",
+                "forkBeforeMessageId": fork_before.message_id,
+            },
+            stack.context,
+        )
+        assert response.ok is True
+        child_key = response.payload["sessionKey"]
+        await await_direct_task(child_key)
+
+        assert replaced is True
+        assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_uses_canonical_project_path_and_snapshot(
+    tmp_path: Path,
+) -> None:
+    async with open_stack(tmp_path / "sessions.db") as stack:
+        project = await add_project(stack, tmp_path / "project")
+        assert project is not None
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        session = await stack.manager.create(
+            "agent:main:webchat:bootstrap-authoritative",
+            workspace_id=project.workspace_id,
+            origin={
+                RUN_CONTEXT_ORIGIN_KEY: {
+                    "run_mode": "standard",
+                    "workspace": str(outside),
+                }
+            },
+        )
+
+        response = await get_dispatcher().dispatch(
+            "bootstrap-authoritative",
+            "sessions.bootstrap",
+            {"key": session.session_key},
+            stack.context,
+        )
+
+        assert response.ok is True
+        assert response.payload["session"]["workspace"] == project.path
+        assert response.payload["session"]["projectWorkspace"] == {
+            "id": project.workspace_id,
+            "name": project.display_name,
+            "path": project.path,
+            "available": True,
+            "removed": False,
+            "availabilityReason": None,
+        }
+
+
+@pytest.mark.asyncio
+async def test_messages_subscribe_projects_unavailable_workspace_without_failing_history(
+    tmp_path: Path,
+) -> None:
+    async with open_stack(tmp_path / "sessions.db") as stack:
+        project_path = tmp_path / "project"
+        project = await add_project(stack, project_path)
+        assert project is not None
+        session = await stack.manager.create(
+            "agent:main:webchat:subscribe-unavailable",
+            workspace_id=project.workspace_id,
+        )
+        project_path.rmdir()
+
+        response = await get_dispatcher().dispatch(
+            "subscribe-unavailable",
+            "sessions.messages.subscribe",
+            {"key": session.session_key},
+            stack.context,
+        )
+
+        assert response.ok is True
+        assert response.payload["workspaceId"] == project.workspace_id
+        assert response.payload["projectWorkspace"] == {
+            "id": project.workspace_id,
+            "name": project.display_name,
+            "path": project.path,
+            "available": False,
+            "removed": False,
+            "availabilityReason": "unavailable",
+        }
 
 
 @pytest.mark.asyncio
@@ -815,10 +1318,7 @@ async def test_chat_fork_stays_in_project_workspace_and_sidebar_group(
         assert child.workspace_id == project.workspace_id
         assert child.origin == parent.origin
         assert stack.runs[0].envelope.session_key == child_key
-        assert (
-            stack.runs[0].envelope.metadata["sandbox_run_context"]["workspace"]
-            == project.path
-        )
+        assert stack.runs[0].envelope.metadata["sandbox_run_context"]["workspace"] == project.path
 
         child_entries = await stack.manager.get_transcript(child_key)
         assert [entry.content for entry in child_entries] == ["A marker", "B edited"]
@@ -830,8 +1330,6 @@ async def test_chat_fork_stays_in_project_workspace_and_sidebar_group(
             stack.context,
         )
         assert listed.ok is True
-        child_row = next(
-            row for row in listed.payload["sessions"] if row["key"] == child_key
-        )
+        child_row = next(row for row in listed.payload["sessions"] if row["key"] == child_key)
         assert child_row["workspaceId"] == project.workspace_id
         assert child_row["workspace"] == project.path
