@@ -150,6 +150,25 @@ async def _accept(
     )
 
 
+async def _bind_project_session(
+    stack: _ChannelIngressStack,
+    project_path: Path,
+) -> Any:
+    project_path.mkdir()
+    project = await stack.storage.create_or_restore_project_workspace(
+        path=str(project_path.resolve()),
+        path_key=str(project_path.resolve()),
+        display_name=project_path.name,
+        trusted_at=1,
+    )
+    await stack.manager.create(
+        SESSION_KEY,
+        agent_id="main",
+        workspace_id=project.workspace_id,
+    )
+    return project
+
+
 def _table_counts(db_path: Path) -> dict[str, int]:
     connection = sqlite3.connect(db_path)
     try:
@@ -672,6 +691,56 @@ async def test_channel_turn_rejects_native_message_id_reuse_with_different_conte
             "agent_tasks": 1,
             "turn_ingress_receipts": 1,
         }
+
+
+@pytest.mark.asyncio
+async def test_channel_project_replay_survives_removal_and_missing_directory(
+    tmp_path: Path,
+) -> None:
+    async with _open_stack(tmp_path / "sessions.db") as stack:
+        project_path = tmp_path / "project"
+        project = await _bind_project_session(stack, project_path)
+        first_handle, _, _, first_replayed = await _accept(
+            stack,
+            "project channel payload",
+        )
+        await stack.wait_until_running()
+        await stack.storage.remove_project_workspace(project.workspace_id)
+        project_path.rmdir()
+
+        replay_handle, _, _, replayed = await _accept(
+            stack,
+            "project channel payload",
+        )
+
+        assert first_handle is not None
+        assert first_replayed is False
+        assert replay_handle is not None
+        assert replay_handle.task_id == first_handle.task_id
+        assert replayed is True
+        assert len(stack.received_runs) == 1
+
+
+@pytest.mark.asyncio
+async def test_channel_project_conflict_precedes_workspace_unavailable(
+    tmp_path: Path,
+) -> None:
+    async with _open_stack(tmp_path / "sessions.db") as stack:
+        project_path = tmp_path / "project"
+        project = await _bind_project_session(stack, project_path)
+        first_handle, _, _, _ = await _accept(
+            stack,
+            "original project channel payload",
+        )
+        await stack.wait_until_running()
+        await stack.storage.remove_project_workspace(project.workspace_id)
+        project_path.rmdir()
+
+        with pytest.raises(TurnIngressConflictError):
+            await _accept(stack, "changed project channel payload")
+
+        assert first_handle is not None
+        assert len(stack.received_runs) == 1
 
 
 def test_debounced_channel_native_request_id_is_stable_and_order_sensitive() -> None:

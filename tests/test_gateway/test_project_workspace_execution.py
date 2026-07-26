@@ -443,6 +443,294 @@ async def test_project_replay_and_conflict_precede_mutable_workspace_validation(
 
 
 @pytest.mark.asyncio
+async def test_replay_survives_project_removal_and_missing_directory(
+    tmp_path: Path,
+) -> None:
+    async with open_stack(tmp_path / "sessions.db") as stack:
+        project_path = tmp_path / "project"
+        project = await add_project(stack, project_path)
+        assert project is not None
+        params = {
+            "sessionKey": "agent:main:webchat:workspace-replay",
+            "message": "pwd",
+            "workspaceId": project.workspace_id,
+            "clientRequestId": "stable-project-request",
+        }
+        first = await get_dispatcher().dispatch(
+            "workspace-replay-first",
+            "chat.send",
+            params,
+            stack.context,
+        )
+        assert first.ok is True
+        await stack.storage.remove_project_workspace(project.workspace_id)
+        project_path.rmdir()
+        replay = await get_dispatcher().dispatch(
+            "workspace-replay-second",
+            "chat.send",
+            params,
+            stack.context,
+        )
+        assert replay.ok is True
+        assert replay.payload["replayed"] is True
+        assert replay.payload["task_id"] == first.payload["task_id"]
+
+
+@pytest.mark.asyncio
+async def test_replay_conflict_precedes_workspace_unavailable(
+    tmp_path: Path,
+) -> None:
+    async with open_stack(tmp_path / "sessions.db") as stack:
+        project = await add_project(stack, tmp_path / "project")
+        assert project is not None
+        params = {
+            "sessionKey": "agent:main:webchat:workspace-conflict",
+            "message": "first",
+            "workspaceId": project.workspace_id,
+            "clientRequestId": "stable-conflict-request",
+        }
+        first = await get_dispatcher().dispatch(
+            "workspace-conflict-first",
+            "chat.send",
+            params,
+            stack.context,
+        )
+        assert first.ok is True
+        await stack.storage.remove_project_workspace(project.workspace_id)
+        conflict = await get_dispatcher().dispatch(
+            "workspace-conflict-second",
+            "chat.send",
+            {**params, "message": "changed"},
+            stack.context,
+        )
+        assert conflict.ok is False
+        assert conflict.error.code == "IDEMPOTENCY_CONFLICT"
+
+
+@pytest.mark.asyncio
+async def test_project_first_send_without_task_runtime_is_atomic(
+    tmp_path: Path,
+) -> None:
+    async with open_stack(tmp_path / "sessions.db") as stack:
+        project = await add_project(stack, tmp_path / "project")
+        assert project is not None
+        ran = asyncio.Event()
+        run_count = 0
+
+        class Runner:
+            async def run(self, message: str, session_key: str, **kwargs: Any):
+                nonlocal run_count
+                run_count += 1
+                ran.set()
+                yield DoneEvent()
+
+        stack.context.task_runtime = None
+        stack.context.turn_runner = Runner()
+        key = "agent:main:webchat:direct-project"
+        params = {
+            "sessionKey": key,
+            "message": "pwd",
+            "workspaceId": project.workspace_id,
+            "clientRequestId": "direct-1",
+        }
+        accepted = await get_dispatcher().dispatch(
+            "direct-project",
+            "chat.send",
+            params,
+            stack.context,
+        )
+        assert accepted.ok is True
+        await asyncio.wait_for(ran.wait(), timeout=2)
+        session = await stack.storage.get_session(key)
+        assert session is not None
+        assert len(await stack.storage.get_transcript(session.session_id)) == 1
+        async with stack.storage.conn.execute(
+            "SELECT task_id FROM turn_ingress_receipts WHERE accepted_session_key = ?",
+            (key,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        assert row["task_id"] is None
+
+        replay = await get_dispatcher().dispatch(
+            "direct-project-replay",
+            "chat.send",
+            params,
+            stack.context,
+        )
+        await asyncio.sleep(0)
+        assert replay.ok is True
+        assert replay.payload["replayed"] is True
+        assert run_count == 1
+
+
+@pytest.mark.asyncio
+async def test_attachment_failure_without_task_runtime_leaves_no_project_session(
+    tmp_path: Path,
+) -> None:
+    async with open_stack(tmp_path / "sessions.db") as stack:
+        project = await add_project(stack, tmp_path / "project")
+        assert project is not None
+        stack.context.task_runtime = None
+        key = "agent:main:webchat:missing-attachment-project"
+        failed = await get_dispatcher().dispatch(
+            "missing-attachment-project",
+            "chat.send",
+            {
+                "sessionKey": key,
+                "message": "inspect",
+                "workspaceId": project.workspace_id,
+                "clientRequestId": "missing-attachment-request",
+                "attachments": [
+                    {
+                        "type": "file",
+                        "mime": "text/plain",
+                        "name": "missing.txt",
+                        "file_uuid": "missing-upload",
+                    }
+                ],
+            },
+            stack.context,
+        )
+        assert failed.ok is False
+        assert await stack.storage.get_session(key) is None
+
+
+@pytest.mark.asyncio
+async def test_existing_project_continuation_resolves_persisted_binding_guard(
+    tmp_path: Path,
+) -> None:
+    async with open_stack(tmp_path / "sessions.db") as stack:
+        project = await add_project(stack, tmp_path / "project")
+        assert project is not None
+        key = "agent:main:webchat:project-continuation"
+        session = await stack.manager.create(
+            key,
+            workspace_id=project.workspace_id,
+            origin={
+                RUN_CONTEXT_ORIGIN_KEY: {
+                    "run_mode": "standard",
+                    "workspace": project.path,
+                }
+            },
+        )
+
+        accepted = await get_dispatcher().dispatch(
+            "project-continuation",
+            "sessions.send",
+            {
+                "key": key,
+                "message": "continue",
+                "clientRequestId": "project-continuation-request",
+            },
+            stack.context,
+        )
+        await asyncio.wait_for(stack.started.wait(), timeout=2.0)
+
+        assert accepted.ok is True
+        assert [
+            entry.content
+            for entry in await stack.storage.get_transcript(session.session_id)
+        ] == ["continue"]
+
+
+@pytest.mark.asyncio
+async def test_project_removal_before_atomic_commit_maps_without_partial_writes(
+    tmp_path: Path,
+) -> None:
+    async with open_stack(tmp_path / "sessions.db") as stack:
+        project = await add_project(stack, tmp_path / "project")
+        assert project is not None
+        key = "agent:main:webchat:project-removal-race"
+        session = await stack.manager.create(
+            key,
+            workspace_id=project.workspace_id,
+        )
+        original_accept_turn = stack.storage.accept_turn
+
+        async def remove_before_accept(*args: Any, **kwargs: Any) -> Any:
+            await stack.storage.remove_project_workspace(project.workspace_id)
+            return await original_accept_turn(*args, **kwargs)
+
+        stack.storage.accept_turn = remove_before_accept  # type: ignore[method-assign]
+        rejected = await get_dispatcher().dispatch(
+            "project-removal-race",
+            "sessions.send",
+            {
+                "key": key,
+                "message": "must roll back",
+                "clientRequestId": "project-removal-race-request",
+            },
+            stack.context,
+        )
+
+        assert rejected.ok is False
+        assert rejected.error.code == "WORKSPACE_NOT_FOUND"
+        assert await stack.storage.get_transcript(session.session_id) == []
+        async with stack.storage.conn.execute(
+            "SELECT COUNT(*) FROM turn_ingress_receipts WHERE request_session_key = ?",
+            (key,),
+        ) as cursor:
+            receipt_count = await cursor.fetchone()
+        assert receipt_count is not None
+        assert receipt_count[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_direct_project_cancellation_after_commit_still_starts_once(
+    tmp_path: Path,
+) -> None:
+    async with open_stack(tmp_path / "sessions.db") as stack:
+        project = await add_project(stack, tmp_path / "project")
+        assert project is not None
+        ran = asyncio.Event()
+        run_count = 0
+
+        class Runner:
+            async def run(self, message: str, session_key: str, **kwargs: Any):
+                nonlocal run_count
+                run_count += 1
+                ran.set()
+                yield DoneEvent()
+
+        stack.context.task_runtime = None
+        stack.context.turn_runner = Runner()
+        original_accept_turn = stack.storage.accept_turn
+        committed = asyncio.Event()
+        release_accept = asyncio.Event()
+
+        async def pause_after_commit(*args: Any, **kwargs: Any) -> Any:
+            acceptance = await original_accept_turn(*args, **kwargs)
+            committed.set()
+            await release_accept.wait()
+            return acceptance
+
+        stack.storage.accept_turn = pause_after_commit  # type: ignore[method-assign]
+        request = asyncio.create_task(
+            get_dispatcher().dispatch(
+                "direct-project-cancel",
+                "chat.send",
+                {
+                    "sessionKey": "agent:main:webchat:direct-project-cancel",
+                    "message": "pwd",
+                    "workspaceId": project.workspace_id,
+                    "clientRequestId": "direct-project-cancel-request",
+                },
+                stack.context,
+            )
+        )
+        await asyncio.wait_for(committed.wait(), timeout=2.0)
+        request.cancel()
+        await asyncio.sleep(0)
+        release_accept.set()
+
+        response = await asyncio.wait_for(request, timeout=2.0)
+        await asyncio.wait_for(ran.wait(), timeout=2.0)
+        assert response.ok is True
+        assert run_count == 1
+
+
+@pytest.mark.asyncio
 async def test_bootstrap_and_fork_preserve_project_workspace(tmp_path: Path) -> None:
     async with open_stack(tmp_path / "sessions.db") as stack:
         project = await add_project(stack, tmp_path / "project")

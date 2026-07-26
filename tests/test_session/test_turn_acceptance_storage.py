@@ -3,17 +3,26 @@
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+from opensquilla.project_workspaces import (
+    ProjectWorkspaceGuard,
+    ProjectWorkspaceStateError,
+)
 from opensquilla.session.models import (
     AgentTaskRecord,
     AgentTaskStatus,
     SessionNode,
     TranscriptEntry,
 )
-from opensquilla.session.storage import SessionStorage, StorageBusyError
+from opensquilla.session.storage import (
+    SessionStorage,
+    StorageBusyError,
+    TurnIngressConflictError,
+)
 
 SESSION_KEY = "agent:main:webchat:durable-acceptance"
 SESSION_ID = "session-durable-acceptance"
@@ -376,6 +385,257 @@ async def test_accept_turn_rejects_request_id_reuse_with_a_different_fingerprint
         assert await _row_count(storage, "agent_tasks") == 1
         assert await _row_count(storage, "turn_ingress_receipts") == 1
         assert await storage.get_agent_task("task-conflict") is None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_accept_turn_rechecks_project_guard_in_transaction(tmp_path: Path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        project_path = tmp_path / "project"
+        project_path.mkdir()
+        project = await storage.create_or_restore_project_workspace(
+            path=str(project_path.resolve()),
+            path_key=str(project_path.resolve()),
+            display_name="project",
+            trusted_at=1,
+        )
+        node = _session()
+        node.workspace_id = project.workspace_id
+        guard = ProjectWorkspaceGuard(
+            project.workspace_id,
+            project.path,
+            project.path_key,
+        )
+        await storage.remove_project_workspace(project.workspace_id)
+
+        with pytest.raises(ProjectWorkspaceStateError) as raised:
+            await storage.accept_turn(
+                _entry("guarded-message"),
+                expected_epoch=0,
+                updated_at=200,
+                task_record=None,
+                source_scope="web:test",
+                request_session_key=node.session_key,
+                client_request_id="req-guarded",
+                request_fingerprint="sha256:guarded",
+                session_node=node,
+                workspace_guard=guard,
+            )
+        assert raised.value.reason == "removed"
+        assert await storage.get_session(node.session_key) is None
+        assert await storage.get_turn_ingress_receipt(
+            source_scope="web:test",
+            request_session_key=node.session_key,
+            client_request_id="req-guarded",
+        ) is None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_accept_turn_rejects_project_binding_mismatch(tmp_path: Path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        first_path = tmp_path / "first"
+        second_path = tmp_path / "second"
+        first_path.mkdir()
+        second_path.mkdir()
+        first = await storage.create_or_restore_project_workspace(
+            path=str(first_path.resolve()),
+            path_key=str(first_path.resolve()),
+            display_name="first",
+            trusted_at=1,
+        )
+        second = await storage.create_or_restore_project_workspace(
+            path=str(second_path.resolve()),
+            path_key=str(second_path.resolve()),
+            display_name="second",
+            trusted_at=1,
+        )
+        node = _session()
+        node.workspace_id = first.workspace_id
+        guard = ProjectWorkspaceGuard(
+            second.workspace_id,
+            second.path,
+            second.path_key,
+        )
+
+        with pytest.raises(ProjectWorkspaceStateError) as raised:
+            await storage.accept_turn(
+                _entry("binding-mismatch"),
+                expected_epoch=0,
+                updated_at=200,
+                task_record=None,
+                source_scope="web:test",
+                request_session_key=node.session_key,
+                client_request_id="req-binding-mismatch",
+                request_fingerprint="sha256:binding-mismatch",
+                session_node=node,
+                workspace_guard=guard,
+            )
+
+        assert raised.value.reason == "binding_changed"
+        assert await storage.get_session(node.session_key) is None
+        assert await storage.get_turn_ingress_receipt(
+            source_scope="web:test",
+            request_session_key=node.session_key,
+            client_request_id="req-binding-mismatch",
+        ) is None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_accept_turn_requires_guard_for_bound_session(tmp_path: Path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        project_path = tmp_path / "project"
+        project_path.mkdir()
+        project = await storage.create_or_restore_project_workspace(
+            path=str(project_path.resolve()),
+            path_key=str(project_path.resolve()),
+            display_name="project",
+            trusted_at=1,
+        )
+        node = _session()
+        node.workspace_id = project.workspace_id
+
+        with pytest.raises(ProjectWorkspaceStateError) as raised:
+            await storage.accept_turn(
+                _entry("missing-guard"),
+                expected_epoch=0,
+                updated_at=200,
+                task_record=None,
+                source_scope="web:test",
+                request_session_key=node.session_key,
+                client_request_id="req-missing-guard",
+                request_fingerprint="sha256:missing-guard",
+                session_node=node,
+            )
+
+        assert raised.value.reason == "guard_required"
+        assert await storage.get_session(node.session_key) is None
+        assert await storage.get_turn_ingress_receipt(
+            source_scope="web:test",
+            request_session_key=node.session_key,
+            client_request_id="req-missing-guard",
+        ) is None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_accept_turn_without_task_persists_nullable_receipt(tmp_path: Path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        project_path = tmp_path / "project"
+        project_path.mkdir()
+        project = await storage.create_or_restore_project_workspace(
+            path=str(project_path.resolve()),
+            path_key=str(project_path.resolve()),
+            display_name="project",
+            trusted_at=1,
+        )
+        node = _session()
+        node.workspace_id = project.workspace_id
+        guard = ProjectWorkspaceGuard(
+            project.workspace_id,
+            project.path,
+            project.path_key,
+        )
+
+        accepted = await storage.accept_turn(
+            _entry("taskless-message"),
+            expected_epoch=0,
+            updated_at=200,
+            task_record=None,
+            source_scope="web:test",
+            request_session_key=node.session_key,
+            client_request_id="req-taskless",
+            request_fingerprint="sha256:taskless",
+            session_node=node,
+            workspace_guard=guard,
+        )
+
+        assert accepted.replayed is False
+        assert accepted.receipt.task_id is None
+        assert [
+            item.message_id for item in await storage.get_transcript(node.session_id)
+        ] == ["taskless-message"]
+        receipt = await storage.get_turn_ingress_receipt(
+            source_scope="web:test",
+            request_session_key=node.session_key,
+            client_request_id="req-taskless",
+        )
+        assert receipt is not None
+        assert receipt.receipt.task_id is None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_accept_turn_replays_before_removed_project_guard(tmp_path: Path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        project_path = tmp_path / "project"
+        project_path.mkdir()
+        project = await storage.create_or_restore_project_workspace(
+            path=str(project_path.resolve()),
+            path_key=str(project_path.resolve()),
+            display_name="project",
+            trusted_at=1,
+        )
+        node = _session()
+        node.workspace_id = project.workspace_id
+        guard = ProjectWorkspaceGuard(
+            project.workspace_id,
+            project.path,
+            project.path_key,
+        )
+        first = await storage.accept_turn(
+            _entry("original-project-message"),
+            expected_epoch=0,
+            updated_at=200,
+            task_record=None,
+            source_scope="web:test",
+            request_session_key=node.session_key,
+            client_request_id="req-project-replay",
+            request_fingerprint="sha256:project-replay",
+            session_node=node,
+            workspace_guard=guard,
+        )
+        await storage.remove_project_workspace(project.workspace_id)
+
+        replay = await storage.accept_turn(
+            _entry("prospective-replay"),
+            expected_epoch=0,
+            updated_at=300,
+            task_record=None,
+            source_scope="web:test",
+            request_session_key=node.session_key,
+            client_request_id="req-project-replay",
+            request_fingerprint="sha256:project-replay",
+            session_node=node,
+            workspace_guard=guard,
+        )
+
+        assert replay.replayed is True
+        assert replay.receipt.receipt_id == first.receipt.receipt_id
+        with pytest.raises(TurnIngressConflictError):
+            await storage.accept_turn(
+                _entry("conflicting-replay"),
+                expected_epoch=0,
+                updated_at=300,
+                task_record=None,
+                source_scope="web:test",
+                request_session_key=node.session_key,
+                client_request_id="req-project-replay",
+                request_fingerprint="sha256:changed",
+                session_node=node,
+                workspace_guard=guard,
+            )
     finally:
         await storage.close()
 

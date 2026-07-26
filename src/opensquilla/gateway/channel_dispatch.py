@@ -802,6 +802,7 @@ async def run_channel_dispatch(
                 if stream_relay is not None:
                     await stream_relay.close()
 
+                from opensquilla.project_workspaces import ProjectWorkspaceStateError
                 from opensquilla.session.storage import (
                     StaleEpochError,
                     StorageBusyError,
@@ -846,6 +847,22 @@ async def run_channel_dispatch(
                         delivery_store.complete_inbound(
                             ingress_claim, "ingress_conflict", reason=admission.reason
                         )
+                    continue
+                if isinstance(exc, ProjectWorkspaceStateError):
+                    await status_reactor.failed(msg)
+                    workspace_message = (
+                        "Project workspace not found. Restore it and retry."
+                        if exc.reason in {"not_found", "removed"}
+                        else "The project workspace is unavailable. Restore access and retry."
+                    )
+                    await channel.send(
+                        _route_envelope_reply_message(
+                            workspace_message,
+                            route_envelope,
+                        )
+                    )
+                    if delivery_store is not None:
+                        delivery_store.fail_inbound(ingress_claim, exc)
                     continue
                 if not isinstance(exc, TaskQueueFullError):
                     if delivery_store is not None:
@@ -1552,6 +1569,7 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
         if stream_relay is not None:
             await stream_relay.close()
 
+        from opensquilla.project_workspaces import ProjectWorkspaceStateError
         from opensquilla.session.storage import (
             StaleEpochError,
             StorageBusyError,
@@ -1570,6 +1588,20 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
             await status_reactor.failed(msg)
             log.warning("channel.ingress_idempotency_conflict", session_key=session_key)
             await channel.send(_route_envelope_reply_message("This channel message id was already used; the duplicate was ignored.", route_envelope))  # noqa: E501
+            return
+        if isinstance(exc, ProjectWorkspaceStateError):
+            await status_reactor.failed(msg)
+            workspace_message = (
+                "Project workspace not found. Restore it and retry."
+                if exc.reason in {"not_found", "removed"}
+                else "The project workspace is unavailable. Restore access and retry."
+            )
+            await channel.send(
+                _route_envelope_reply_message(
+                    workspace_message,
+                    route_envelope,
+                )
+            )
             return
         if isinstance(exc, TaskQueueFullError):
             await status_reactor.failed(msg)
@@ -2944,6 +2976,18 @@ async def _accept_channel_runtime_turn(
         agent_id=route_envelope.agent_id,
         **delivery_fields,
     )
+    workspace_guard = None
+    bound_workspace_id = getattr(intent_plan.node, "workspace_id", None)
+    if isinstance(bound_workspace_id, str) and bound_workspace_id:
+        from opensquilla.project_workspaces import (
+            resolve_validated_project_workspace,
+        )
+
+        validated_workspace = await resolve_validated_project_workspace(
+            storage,
+            bound_workspace_id,
+        )
+        workspace_guard = validated_workspace.guard
     entry, expected_epoch, persisted_text = await _prepare_channel_user_message(
         session_manager=session_manager,
         session_key=session_key,
@@ -2989,6 +3033,7 @@ async def _accept_channel_runtime_turn(
                 request_fingerprint=identity.request_fingerprint,
                 session_node=intent_plan.node if intent_plan.action == "create" else None,
                 session_updates=delivery_fields,
+                workspace_guard=workspace_guard,
             )
         except BaseException:
             await task_runtime.abort_reservation(reservation)

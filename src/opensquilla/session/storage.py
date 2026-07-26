@@ -58,6 +58,7 @@ from opensquilla.usage_reasons import normalize_usage_unknown_reason
 
 if TYPE_CHECKING:
     from opensquilla.persistence.meta_run_writer import MetaRunWriter
+    from opensquilla.project_workspaces import ProjectWorkspaceGuard
 
 log = logging.getLogger(__name__)
 
@@ -121,6 +122,62 @@ class TurnAcceptanceResult:
     fresh_user_session: bool
     task_status: AgentTaskStatus | None = None
     reset_archive_snapshot: ResetArchiveSnapshot | None = None
+
+
+async def _verify_project_workspace_guard(
+    conn: aiosqlite.Connection,
+    *,
+    session_node: SessionNode | None,
+    entry_session_key: str,
+    workspace_guard: ProjectWorkspaceGuard | None,
+) -> None:
+    from opensquilla.project_workspaces import ProjectWorkspaceStateError
+
+    async with conn.execute(
+        "SELECT workspace_id FROM sessions WHERE session_key = ?",
+        (entry_session_key,),
+    ) as cursor:
+        session_row = await cursor.fetchone()
+    persisted_bound_id = (
+        session_row["workspace_id"] if session_row is not None else None
+    )
+    prepared_bound_id = (
+        session_node.workspace_id
+        if session_node is not None
+        else persisted_bound_id
+    )
+    if (
+        session_row is not None
+        and session_node is not None
+        and persisted_bound_id != prepared_bound_id
+    ):
+        raise ProjectWorkspaceStateError("binding_changed")
+    bound_id = prepared_bound_id
+    if bound_id is None:
+        if workspace_guard is not None:
+            raise ProjectWorkspaceStateError("binding_changed")
+        return
+    if workspace_guard is None:
+        raise ProjectWorkspaceStateError("guard_required")
+    if workspace_guard.workspace_id != bound_id:
+        raise ProjectWorkspaceStateError("binding_changed")
+    async with conn.execute(
+        """
+        SELECT workspace_id, path, path_key, removed_at, trusted_at
+        FROM project_workspaces
+        WHERE workspace_id = ?
+        """,
+        (bound_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    if row is None:
+        raise ProjectWorkspaceStateError("not_found")
+    if row["removed_at"] is not None:
+        raise ProjectWorkspaceStateError("removed")
+    if row["trusted_at"] is None:
+        raise ProjectWorkspaceStateError("untrusted")
+    if row["path"] != workspace_guard.path or row["path_key"] != workspace_guard.path_key:
+        raise ProjectWorkspaceStateError("binding_changed")
 
 
 _SQLITE_BUSY_TIMEOUT_MS = 100
@@ -3931,7 +3988,7 @@ class SessionStorage:
         *,
         expected_epoch: int,
         updated_at: int,
-        task_record: AgentTaskRecord,
+        task_record: AgentTaskRecord | None,
         source_scope: str,
         request_session_key: str,
         client_request_id: str,
@@ -3941,8 +3998,9 @@ class SessionStorage:
         initial_transcript_entries: tuple[TranscriptEntry, ...] = (),
         session_updates: dict[str, Any] | None = None,
         merge_into_task: bool = False,
+        workspace_guard: ProjectWorkspaceGuard | None = None,
     ) -> TurnAcceptanceResult:
-        """Commit one user message, task, and request receipt atomically.
+        """Commit one user message, optional task, and request receipt atomically.
 
         Repeating the same scoped client request returns the original receipt.
         Reusing its id for a different payload is rejected before any write.
@@ -3959,10 +4017,11 @@ class SessionStorage:
 
         request_session_key = canonicalize_session_key(request_session_key)
         entry.session_key = canonicalize_session_key(entry.session_key)
-        task_record.session_key = canonicalize_session_key(task_record.session_key)
-        task_record.agent_id = normalize_agent_id(task_record.agent_id)
-        if task_record.session_key != entry.session_key:
-            raise ValueError("task and transcript session keys must match")
+        if task_record is not None:
+            task_record.session_key = canonicalize_session_key(task_record.session_key)
+            task_record.agent_id = normalize_agent_id(task_record.agent_id)
+            if task_record.session_key != entry.session_key:
+                raise ValueError("task and transcript session keys must match")
         if session_node is not None:
             session_node.session_key = canonicalize_session_key(session_node.session_key)
             session_node.agent_id = normalize_agent_id(session_node.agent_id)
@@ -3974,6 +4033,8 @@ class SessionStorage:
             raise ValueError("reset_from_session_id requires session_node")
         if initial_transcript_entries and session_node is None:
             raise ValueError("initial transcript entries require session_node")
+        if merge_into_task and task_record is None:
+            raise ValueError("task collection requires task_record")
         if merge_into_task and session_node is not None:
             raise ValueError("task collection cannot create, reset, or fork a session")
         allowed_session_updates = {
@@ -4010,6 +4071,13 @@ class SessionStorage:
                     fresh_user_session=fresh_user_session,
                     task_status=task_status,
                 )
+
+            await _verify_project_workspace_guard(
+                conn,
+                session_node=session_node,
+                entry_session_key=entry.session_key,
+                workspace_guard=workspace_guard,
+            )
 
             reset_archive_snapshot: ResetArchiveSnapshot | None = None
             if session_node is not None:
@@ -4156,103 +4224,104 @@ class SessionStorage:
                     expected_epoch=expected_epoch,
                 )
 
-            incoming_details = dict(task_record.details or {})
-            if merge_into_task:
-                async with conn.execute(
-                    """
-                    SELECT details
-                    FROM agent_tasks
-                    WHERE task_id = ? AND session_key = ? AND status = ?
-                    """,
-                    (
-                        task_record.task_id,
-                        task_record.session_key,
-                        AgentTaskStatus.QUEUED.value,
-                    ),
-                ) as cur:
-                    existing_row = await cur.fetchone()
-                if existing_row is None:
-                    raise TaskCollectionUnavailableError(
-                        "The target task is no longer queued for collection"
+            if task_record is not None:
+                incoming_details = dict(task_record.details or {})
+                if merge_into_task:
+                    async with conn.execute(
+                        """
+                        SELECT details
+                        FROM agent_tasks
+                        WHERE task_id = ? AND session_key = ? AND status = ?
+                        """,
+                        (
+                            task_record.task_id,
+                            task_record.session_key,
+                            AgentTaskStatus.QUEUED.value,
+                        ),
+                    ) as cur:
+                        existing_row = await cur.fetchone()
+                    if existing_row is None:
+                        raise TaskCollectionUnavailableError(
+                            "The target task is no longer queued for collection"
+                        )
+                    deserialized = _deserialize_row({"details": existing_row["details"]})
+                    existing_details_raw = deserialized.get("details")
+                    existing_details = (
+                        dict(existing_details_raw)
+                        if isinstance(existing_details_raw, dict)
+                        else {}
                     )
-                deserialized = _deserialize_row({"details": existing_row["details"]})
-                existing_details_raw = deserialized.get("details")
-                existing_details = (
-                    dict(existing_details_raw)
-                    if isinstance(existing_details_raw, dict)
-                    else {}
-                )
-                details = {**existing_details, **incoming_details}
-                message_ids = _ordered_detail_message_ids(
-                    existing_details.get("persisted_user_message_id"),
-                    existing_details.get("persisted_user_message_ids"),
-                    incoming_details.get("persisted_user_message_id"),
-                    incoming_details.get("persisted_user_message_ids"),
-                    entry.message_id,
-                )
-                existing_count = existing_details.get("message_count")
-                incoming_count = incoming_details.get("message_count")
-                existing_count = (
-                    existing_count
-                    if isinstance(existing_count, int) and existing_count > 0
-                    else 0
-                )
-                incoming_count = (
-                    incoming_count
-                    if isinstance(incoming_count, int) and incoming_count > 0
-                    else 0
-                )
-                details["persisted_user_message_id"] = (
-                    message_ids[0] if message_ids else entry.message_id
-                )
-                details["persisted_user_message_ids"] = message_ids
-                details["message_count"] = max(
-                    1,
-                    incoming_count,
-                    existing_count + 1,
-                )
-                details["fresh_user_session"] = existing_details.get(
-                    "fresh_user_session",
-                    fresh_user_session,
-                )
-                task_record.details = details
-                async with conn.execute(
-                    """
-                    UPDATE agent_tasks
-                    SET details = ?, updated_at = ?
-                    WHERE task_id = ? AND session_key = ? AND status = ?
-                    """,
-                    (
-                        _serialize(details),
-                        task_record.updated_at,
-                        task_record.task_id,
-                        task_record.session_key,
-                        AgentTaskStatus.QUEUED.value,
-                    ),
-                ) as cur:
-                    merged = cur.rowcount or 0
-                if merged == 0:
-                    raise TaskCollectionUnavailableError(
-                        "The target task is no longer queued for collection"
+                    details = {**existing_details, **incoming_details}
+                    message_ids = _ordered_detail_message_ids(
+                        existing_details.get("persisted_user_message_id"),
+                        existing_details.get("persisted_user_message_ids"),
+                        incoming_details.get("persisted_user_message_id"),
+                        incoming_details.get("persisted_user_message_ids"),
+                        entry.message_id,
                     )
-            else:
-                message_ids = _ordered_detail_message_ids(
-                    entry.message_id,
-                    incoming_details.get("persisted_user_message_id"),
-                    incoming_details.get("persisted_user_message_ids"),
-                )
-                incoming_count = incoming_details.get("message_count")
-                details = dict(incoming_details)
-                details["persisted_user_message_id"] = entry.message_id
-                details["persisted_user_message_ids"] = message_ids
-                details["message_count"] = (
-                    incoming_count
-                    if isinstance(incoming_count, int) and incoming_count > 0
-                    else 1
-                )
-                details["fresh_user_session"] = fresh_user_session
-                task_record.details = details
-                await self._insert_agent_task(conn, task_record)
+                    existing_count = existing_details.get("message_count")
+                    incoming_count = incoming_details.get("message_count")
+                    existing_count = (
+                        existing_count
+                        if isinstance(existing_count, int) and existing_count > 0
+                        else 0
+                    )
+                    incoming_count = (
+                        incoming_count
+                        if isinstance(incoming_count, int) and incoming_count > 0
+                        else 0
+                    )
+                    details["persisted_user_message_id"] = (
+                        message_ids[0] if message_ids else entry.message_id
+                    )
+                    details["persisted_user_message_ids"] = message_ids
+                    details["message_count"] = max(
+                        1,
+                        incoming_count,
+                        existing_count + 1,
+                    )
+                    details["fresh_user_session"] = existing_details.get(
+                        "fresh_user_session",
+                        fresh_user_session,
+                    )
+                    task_record.details = details
+                    async with conn.execute(
+                        """
+                        UPDATE agent_tasks
+                        SET details = ?, updated_at = ?
+                        WHERE task_id = ? AND session_key = ? AND status = ?
+                        """,
+                        (
+                            _serialize(details),
+                            task_record.updated_at,
+                            task_record.task_id,
+                            task_record.session_key,
+                            AgentTaskStatus.QUEUED.value,
+                        ),
+                    ) as cur:
+                        merged = cur.rowcount or 0
+                    if merged == 0:
+                        raise TaskCollectionUnavailableError(
+                            "The target task is no longer queued for collection"
+                        )
+                else:
+                    message_ids = _ordered_detail_message_ids(
+                        entry.message_id,
+                        incoming_details.get("persisted_user_message_id"),
+                        incoming_details.get("persisted_user_message_ids"),
+                    )
+                    incoming_count = incoming_details.get("message_count")
+                    details = dict(incoming_details)
+                    details["persisted_user_message_id"] = entry.message_id
+                    details["persisted_user_message_ids"] = message_ids
+                    details["message_count"] = (
+                        incoming_count
+                        if isinstance(incoming_count, int) and incoming_count > 0
+                        else 1
+                    )
+                    details["fresh_user_session"] = fresh_user_session
+                    task_record.details = details
+                    await self._insert_agent_task(conn, task_record)
 
             receipt = TurnIngressReceipt(
                 source_scope=source_scope,
@@ -4262,7 +4331,7 @@ class SessionStorage:
                 accepted_session_key=entry.session_key,
                 session_id=entry.session_id,
                 message_id=entry.message_id,
-                task_id=task_record.task_id,
+                task_id=task_record.task_id if task_record is not None else None,
             )
             data = receipt.model_dump()
             cols = list(data.keys())
@@ -4276,7 +4345,7 @@ class SessionStorage:
                 receipt=receipt,
                 replayed=False,
                 fresh_user_session=fresh_user_session,
-                task_status=task_record.status,
+                task_status=task_record.status if task_record is not None else None,
                 reset_archive_snapshot=reset_archive_snapshot,
             )
 
