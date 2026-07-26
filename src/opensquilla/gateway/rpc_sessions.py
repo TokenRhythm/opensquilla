@@ -2057,7 +2057,8 @@ async def _handle_sessions_send(
 
     agent_id = _effective_agent_id_for_session(session, key)
     workspace_path = resolve_agent_workspace_dir(agent_id, ctx.config)
-    workspace_dir = str(workspace_path) if workspace_path is not None else None
+    configured_workspace_dir = str(workspace_path) if workspace_path is not None else None
+    workspace_dir = configured_workspace_dir
     run_mode_hint = _trusted_run_mode_hint(ctx, source_hint)
     try:
         run_context, authoritative_guard = await authoritative_project_run_context(
@@ -2234,7 +2235,6 @@ async def _handle_sessions_send(
             execution_session = await storage.get_session(key)
             if execution_session is None:
                 raise KeyError(f"Session not found: {key}")
-            execution_workspace_dir = workspace_dir
             (
                 execution_run_context,
                 _execution_workspace_guard,
@@ -2243,7 +2243,7 @@ async def _handle_sessions_send(
                 session_manager=ctx.session_manager,
                 session=execution_session,
                 config=ctx.config,
-                default_workspace=workspace_dir,
+                default_workspace=configured_workspace_dir,
             )
             execution_run_context = apply_accepted_run_mode_override(
                 execution_run_context,
@@ -2254,8 +2254,9 @@ async def _handle_sessions_send(
                 execution_run_context,
                 principal_is_owner=ctx.principal.is_owner,
             )
-            if execution_run_context.workspace is not None:
-                execution_workspace_dir = execution_run_context.workspace
+            execution_workspace_dir = (
+                execution_run_context.workspace or configured_workspace_dir
+            )
             workspace_strict = getattr(ctx.config, "workspace_strict", None)
             if not isinstance(workspace_strict, bool):
                 workspace_strict = bool(execution_workspace_dir)

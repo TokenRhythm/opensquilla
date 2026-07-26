@@ -1043,6 +1043,97 @@ async def test_direct_web_unbound_turn_refreshes_durable_context_before_typed_ov
         assert getattr(tool_context, "_sandbox_run_context_fresh", False) is True
 
 
+@pytest.mark.asyncio
+async def test_direct_web_unbound_workspace_revocation_uses_configured_base(
+    tmp_path: Path,
+) -> None:
+    async with open_stack(tmp_path / "direct-unbound-workspace-revocation.db") as stack:
+        saved_workspace = tmp_path / "saved-workspace"
+        configured_workspace = tmp_path / "default-workspace"
+        saved_workspace.mkdir()
+        configured_workspace.mkdir()
+        key = "agent:main:webchat:direct-unbound-workspace-revocation"
+        await stack.manager.create(
+            key,
+            origin={
+                RUN_CONTEXT_ORIGIN_KEY: {
+                    "run_mode": "standard",
+                    "run_mode_source": "operator_default",
+                    "workspace": str(saved_workspace),
+                    "domains": [
+                        {
+                            "domain": "retained.example",
+                            "scope": "chat",
+                            "source": "manual",
+                        }
+                    ],
+                }
+            },
+        )
+        original_accept_turn = stack.storage.accept_turn
+        workspace_revoked = False
+
+        async def revoke_workspace_after_accept(*args: Any, **kwargs: Any) -> Any:
+            nonlocal workspace_revoked
+            acceptance = await original_accept_turn(*args, **kwargs)
+            if not workspace_revoked:
+                workspace_revoked = True
+                await stack.manager.update(
+                    key,
+                    origin={
+                        RUN_CONTEXT_ORIGIN_KEY: {
+                            "run_mode": "standard",
+                            "run_mode_source": "operator_default",
+                            "workspace": None,
+                            "domains": [
+                                {
+                                    "domain": "retained.example",
+                                    "scope": "chat",
+                                    "source": "manual",
+                                }
+                            ],
+                        }
+                    },
+                )
+            return acceptance
+
+        stack.storage.accept_turn = revoke_workspace_after_accept  # type: ignore[method-assign]
+        captured: dict[str, Any] = {}
+
+        class Runner:
+            async def run(self, message: str, session_key: str, **kwargs: Any):
+                captured.update(kwargs)
+                yield DoneEvent()
+
+        stack.context.task_runtime = None
+        stack.context.turn_runner = Runner()
+        response = await get_dispatcher().dispatch(
+            "direct-unbound-workspace-revocation",
+            "sessions.send",
+            {
+                "key": key,
+                "message": "pwd",
+                "_source": {
+                    "caller_kind": "web",
+                    "channel_kind": "webchat",
+                },
+            },
+            stack.context,
+        )
+        await await_direct_task(key)
+
+        assert response.ok is True
+        assert workspace_revoked is True
+        tool_context = captured["tool_context"]
+        assert tool_context.run_mode == "standard"
+        assert tool_context.workspace_dir == str(configured_workspace.resolve())
+        assert tool_context.workspace_dir != str(saved_workspace.resolve())
+        assert [grant.domain for grant in tool_context.sandbox_run_context.domains] == [
+            "retained.example"
+        ]
+        assert getattr(tool_context, "_sandbox_run_context_fresh", False) is True
+
+
 @pytest.mark.parametrize(
     ("saved_mode", "requested_mode"),
     [("full", "standard"), ("standard", "full")],
