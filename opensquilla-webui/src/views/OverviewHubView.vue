@@ -1,7 +1,7 @@
 <template>
   <RouteHubShell
     :tabs="TABS"
-    ariaLabelKey="nav.overview"
+    ariaLabelKey="nav.viewUsage"
     :keep-alive-max="2"
   >
     <template #actions>
@@ -19,7 +19,7 @@ const OverviewView = defineAsyncComponent(() => import('@/views/OverviewView.vue
 const UsageView = defineAsyncComponent(() => import('@/views/UsageView.vue'))
 
 const TABS = [
-  { path: '/overview', labelKey: 'nav.status', icon: 'home', component: OverviewView },
   { path: '/usage', labelKey: 'nav.usage', icon: 'usage', component: UsageView },
+  { path: '/overview', labelKey: 'nav.overview', icon: 'home', component: OverviewView },
 ] as const
 </script>

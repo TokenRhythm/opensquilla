@@ -63,9 +63,9 @@ describe('route hub views', () => {
     const host = mount(OverviewHubView)
     const probe = host.querySelector('[data-testid="route-hub-probe"]')
 
-    expect(probe?.getAttribute('data-paths')).toBe('/overview,/usage')
+    expect(probe?.getAttribute('data-paths')).toBe('/usage,/overview')
     expect(probe?.getAttribute('data-max')).toBe('2')
-    expect(probe?.getAttribute('data-aria-label-key')).toBe('nav.overview')
+    expect(probe?.getAttribute('data-aria-label-key')).toBe('nav.viewUsage')
     expect(probe?.getAttribute('data-mobile-equal')).toBe('false')
     expect(host.querySelector('[data-testid="support-diagnostics"]')).not.toBeNull()
   })

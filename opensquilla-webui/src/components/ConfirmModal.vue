@@ -16,8 +16,12 @@
             <p id="confirm-modal-description">{{ confirmState.body }}</p>
           </div>
           <div class="modal__footer">
-            <button ref="cancelBtn" class="btn btn--ghost" @click="onCancel">{{ t('common.cancel') }}</button>
-            <button :class="['btn', confirmState.primaryClass]" @click="onConfirm">
+            <button ref="cancelBtn" type="button" class="btn btn--ghost" @click.stop="onCancel">{{ t('common.cancel') }}</button>
+            <button
+              type="button"
+              :class="['btn', 'modal__primary', confirmState.primaryClass]"
+              @click.stop="onConfirm"
+            >
               {{ confirmState.primaryLabel }}
             </button>
           </div>
@@ -100,6 +104,12 @@ useDialogA11y(modalRef, isOpen, onCancel, { initialFocus: cancelBtn })
   display: flex;
   gap: var(--sp-3);
   justify-content: flex-end;
+}
+
+.modal__primary {
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--scrim) 24%, transparent);
+  min-width: 88px;
+  opacity: 1;
 }
 
 .modal-enter-active,

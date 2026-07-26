@@ -527,9 +527,9 @@ function onBackdrop(e: MouseEvent) {
 }
 
 .cmdp-dialog {
-  /* Title-only rows need less width than the old icon + label + meta layout;
-     the taller cap lets ~8 recents show without the list scrolling. */
-  width: min(420px, calc(100vw - 32px));
+  /* Give task titles and message snippets enough horizontal room without
+     turning the palette into a full-page surface. */
+  width: min(560px, calc(100vw - 32px));
   max-height: min(600px, calc(100vh - 18vh));
   display: flex;
   flex-direction: column;
@@ -571,16 +571,19 @@ function onBackdrop(e: MouseEvent) {
   gap: var(--sp-2);
   flex: 1;
   min-width: 0;
-  padding: 8px 12px;
-  background: color-mix(in srgb, var(--bg) 45%, var(--bg-surface));
+  min-height: 44px;
+  padding: 0 12px;
+  background: var(--bg-surface);
   border: 1px solid var(--border);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-control);
   transition: border-color var(--dur-fast), background var(--dur-fast);
 }
-/* Focus only lifts the fill to plain surface; the border stays neutral so the
-   resting and focused field read as the same quiet control. */
 .cmdp-search__field:focus-within {
-  background: var(--bg-surface);
+  border-color: color-mix(in srgb, var(--accent) 70%, var(--border));
+}
+
+.cmdp-search__field:focus-within .cmdp-search__icon {
+  color: var(--accent);
 }
 
 .cmdp-search__icon {
@@ -588,16 +591,23 @@ function onBackdrop(e: MouseEvent) {
   flex-shrink: 0;
 }
 
-.cmdp-search__input {
-  flex: 1;
-  min-width: 0;
-  border: 0;
-  outline: none;
+.cmdp-search__field > input.cmdp-search__input,
+.cmdp-search__field > input.cmdp-search__input:focus {
+  appearance: none;
   background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
   color: var(--text);
+  flex: 1;
   font-family: var(--font-sans);
-  font-size: var(--fs-md);
-  line-height: 1.4;
+  font-size: var(--fs-sm);
+  font-weight: 400;
+  line-height: 20px;
+  min-height: 42px;
+  min-width: 0;
+  outline: none;
+  padding: 0;
 }
 
 .cmdp-search__input::placeholder {
@@ -610,12 +620,12 @@ function onBackdrop(e: MouseEvent) {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 24px;
-  height: 24px;
+  width: 30px;
+  height: 30px;
   flex-shrink: 0;
   padding: 0;
   background: transparent;
-  border: 1px solid transparent;
+  border: 0;
   border-radius: var(--radius-sm);
   color: var(--text-muted);
   cursor: pointer;
@@ -626,8 +636,9 @@ function onBackdrop(e: MouseEvent) {
   color: var(--text);
 }
 .cmdp-search__close:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent);
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
 }
 
 .cmdp-list {
@@ -648,10 +659,9 @@ function onBackdrop(e: MouseEvent) {
 .cmdp-group-label {
   margin: var(--sp-2) 0 2px;
   padding: 0 var(--sp-2);
-  font-size: 10px;
-  font-weight: var(--fw-eyebrow);
-  text-transform: uppercase;
-  letter-spacing: var(--eyebrow-track);
+  font-size: var(--fs-xs);
+  font-weight: 400;
+  line-height: 18px;
   color: var(--text-muted);
 }
 .cmdp-group-label:first-child {
@@ -665,14 +675,15 @@ function onBackdrop(e: MouseEvent) {
   width: 100%;
   /* Roomier rows now that each one is a single line of title: the list is a
      "pick one" surface, so touchable spacing beats packing more in. */
-  min-height: 44px;
+  min-height: 42px;
   padding: var(--sp-2) var(--sp-3);
   border: 1px solid transparent;
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text);
   font-family: var(--font-sans);
   font-size: var(--fs-sm);
+  line-height: 20px;
   /* Regular weight: the active row is marked by its tint, not by getting
      bolder, so a list of task titles stays quiet to read down. */
   font-weight: 400;

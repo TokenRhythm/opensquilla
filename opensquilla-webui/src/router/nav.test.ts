@@ -9,9 +9,9 @@ import { sharedRoutes } from './sharedRoutes'
 describe('getWorkNavigationSection', () => {
   it('returns the flat sidebar order after the dedicated chat action', () => {
     expect(getWorkNavigationSection().map((item) => item.path)).toEqual([
-      '/overview',
       '/skills',
       '/cron',
+      '/usage',
     ])
   })
 
@@ -34,11 +34,11 @@ describe('getWorkNavigationSection', () => {
     })
   })
 
-  it('keeps Overview as the rail label while its page title is Status', () => {
-    const item = getWorkNavigationSection().find(candidate => candidate.path === '/overview')
+  it('uses Usage as the rail entry while preserving the Status deep link', () => {
+    const item = getWorkNavigationSection().find(candidate => candidate.path === '/usage')
     const route = sharedRoutes.find(candidate => candidate.path === '/overview')
 
-    expect(item?.title).toBe('Overview')
+    expect(item?.title).toBe('View usage')
     expect(route?.meta?.titleKey).toBe('nav.status')
   })
 })
@@ -47,9 +47,9 @@ describe('navigation taxonomy invariants', () => {
   it('keeps Agents out of every primary navigation consumer', () => {
     expect(getNavigationItems('primary').map((item) => item.path)).toEqual([
       '/chat',
-      '/overview',
       '/skills',
       '/cron',
+      '/usage',
     ])
   })
 
@@ -63,7 +63,7 @@ describe('navigation taxonomy invariants', () => {
 
   it('keeps retired and hub-hosted routes out of the flat navigation', () => {
     const paths = getWorkNavigationSection().map((item) => item.path)
-    for (const path of ['/approvals', '/agents', '/channels', '/usage', '/logs']) {
+    for (const path of ['/approvals', '/agents', '/channels', '/overview', '/logs']) {
       expect(paths).not.toContain(path)
     }
   })

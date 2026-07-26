@@ -34,7 +34,7 @@
         data-testid="sidebar-toggle-expanded"
         @click="toggleDock('sidebar-button')"
       >
-        <Icon :name="appStore.sidebarOpen ? 'panel-left-close' : 'panel-left-open'" :size="16" />
+        <Icon name="sidebar-toggle" :size="16" />
         <span
           id="sidebar-toggle-tip-expanded"
           class="sidebar-toggle-tip sidebar-toggle-tip--sidebar"
@@ -178,7 +178,7 @@
           data-testid="sidebar-toggle-collapsed"
           @click="toggleDock('topbar-button')"
         >
-          <Icon name="panel-left-open" :size="16" />
+          <Icon name="sidebar-toggle" :size="16" />
           <span id="sidebar-toggle-tip-collapsed" class="sidebar-toggle-tip" role="tooltip">
             <span>{{ t('chrome.toggleSidebar') }}</span>
             <kbd v-if="sidebarToggleHint">{{ sidebarToggleHint }}</kbd>
@@ -571,7 +571,7 @@ const isMobileMoreActive = computed(() =>
   appStore.sidebarOpen || MOBILE_MORE_PATHS.has($route.path))
 
 function isPrimaryNavActive(path: string): boolean {
-  if (path === '/overview') return isOverviewNavActive.value
+  if (path === '/usage') return isOverviewNavActive.value
   if (path === '/skills') return isSkillsChannelsHubActive.value
   return isNavActive(path)
 }
