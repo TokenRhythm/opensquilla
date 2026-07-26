@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from pathlib import Path
@@ -405,6 +406,427 @@ async def test_generation_reset_reopens_real_rpc_approval(tmp_path: Path) -> Non
         assert reopened.claim_token is None
         assert (await _durable_context(manager, node.session_key)).domains == ()
     finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_turn_cleanup_first_prevents_real_rpc_same_type_cas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.gateway.approval_queue import get_approval_queue
+    from opensquilla.gateway.auth import Principal
+    from opensquilla.gateway.rpc import RpcContext
+    from opensquilla.gateway.rpc_approvals import _handle_exec_approval_resolve
+    from opensquilla.sandbox import escalation as escalation_module
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    initial = RunContext(
+        run_mode=RunMode.STANDARD,
+        workspace=str(workspace),
+        source="saved",
+    )
+    storage, manager, node = await _create_session(
+        tmp_path,
+        initial,
+        suffix="cleanup-first-rpc",
+    )
+    params = build_network_approval_params(
+        NetworkDecision(
+            status="ask",
+            normalized_host="cleanup-first.example",
+            reason="unknown_domain",
+            source=None,
+        ),
+        session_key=node.session_key,
+        workspace=str(workspace),
+        fingerprint="fingerprint-cleanup-first",
+    )
+    assert params is not None
+    approval = _request(
+        params,
+        node=node,
+        context=initial,
+        execution_id="execution-cleanup-first",
+    )
+    approval_id = str(approval["approval_id"])
+    rpc_context = RpcContext(
+        conn_id="cleanup-first-rpc",
+        principal=Principal(
+            role="operator",
+            scopes=frozenset({"operator.approvals"}),
+            is_owner=True,
+            authenticated=True,
+        ),
+        session_manager=manager,
+        config=_config(workspace),
+    )
+    cas_entered = asyncio.Event()
+    real_compare_and_set = storage.compare_and_set_session_origin
+
+    async def _paused_compare_and_set(**kwargs: Any):
+        cas_entered.set()
+        return await real_compare_and_set(**kwargs)
+
+    monkeypatch.setattr(
+        storage,
+        "compare_and_set_session_origin",
+        _paused_compare_and_set,
+    )
+
+    try:
+        cleanup_task = asyncio.create_task(
+            escalation_module.clear_approval_run_context_deltas_for_tool_context(
+                _fresh_tool_context(
+                    node,
+                    initial,
+                    execution_id="execution-cleanup-first",
+                )
+            )
+        )
+        await cleanup_task
+
+        with pytest.raises(ProjectWorkspaceStateError, match="unavailable"):
+            await _handle_exec_approval_resolve(
+                {
+                    "id": approval_id,
+                    "approved": True,
+                    "choice": "allow_same_type",
+                },
+                rpc_context,
+            )
+
+        assert not cas_entered.is_set()
+        reopened = get_approval_queue().get(approval_id)
+        assert reopened.resolved is False
+        assert reopened.approved is False
+        assert reopened.claim_token is None
+        assert (await _durable_context(manager, node.session_key)).domains == ()
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_real_rpc_same_type_apply_first_blocks_cancelled_turn_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.gateway.approval_queue import get_approval_queue
+    from opensquilla.gateway.auth import Principal
+    from opensquilla.gateway.rpc import RpcContext
+    from opensquilla.gateway.rpc_approvals import _handle_exec_approval_resolve
+    from opensquilla.sandbox import escalation as escalation_module
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    initial = RunContext(
+        run_mode=RunMode.STANDARD,
+        workspace=str(workspace),
+        source="saved",
+    )
+    storage, manager, node = await _create_session(
+        tmp_path,
+        initial,
+        suffix="apply-first-rpc",
+    )
+    params = build_network_approval_params(
+        NetworkDecision(
+            status="ask",
+            normalized_host="apply-first.example",
+            reason="unknown_domain",
+            source=None,
+        ),
+        session_key=node.session_key,
+        workspace=str(workspace),
+        fingerprint="fingerprint-apply-first",
+    )
+    assert params is not None
+    approval = _request(
+        params,
+        node=node,
+        context=initial,
+        execution_id="execution-apply-first",
+    )
+    approval_id = str(approval["approval_id"])
+    rpc_context = RpcContext(
+        conn_id="apply-first-rpc",
+        principal=Principal(
+            role="operator",
+            scopes=frozenset({"operator.approvals"}),
+            is_owner=True,
+            authenticated=True,
+        ),
+        session_manager=manager,
+        config=_config(workspace),
+    )
+    cas_entered = asyncio.Event()
+    release_cas = asyncio.Event()
+    real_compare_and_set = storage.compare_and_set_session_origin
+
+    async def _paused_compare_and_set(**kwargs: Any):
+        cas_entered.set()
+        await release_cas.wait()
+        return await real_compare_and_set(**kwargs)
+
+    monkeypatch.setattr(
+        storage,
+        "compare_and_set_session_origin",
+        _paused_compare_and_set,
+    )
+    cleanup_started = asyncio.Event()
+    cleanup_completed = asyncio.Event()
+    real_cleanup = escalation_module.clear_approval_run_context_deltas_for_tool_context
+
+    def _recording_cleanup(context: ToolContext | None):
+        cleanup_started.set()
+        result = real_cleanup(context)
+        if not inspect.isawaitable(result):
+            cleanup_completed.set()
+            return result
+
+        async def _record_completion() -> int:
+            try:
+                return await result
+            finally:
+                cleanup_completed.set()
+
+        return _record_completion()
+
+    monkeypatch.setattr(
+        escalation_module,
+        "clear_approval_run_context_deltas_for_tool_context",
+        _recording_cleanup,
+    )
+    rpc_task = asyncio.create_task(
+        _handle_exec_approval_resolve(
+            {
+                "id": approval_id,
+                "approved": True,
+                "choice": "allow_same_type",
+            },
+            rpc_context,
+        )
+    )
+    provider = _LifecycleProvider("cancel")
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_iterations=1),
+        session_key=node.session_key,
+        tool_context=_fresh_tool_context(
+            node,
+            initial,
+            execution_id="execution-apply-first",
+        ),
+    )
+
+    async def _run() -> list[Any]:
+        return [event async for event in agent.run_turn("cancel this turn")]
+
+    turn_task: asyncio.Task[list[Any]] | None = None
+    try:
+        await cas_entered.wait()
+        turn_task = asyncio.create_task(_run())
+        await provider.started.wait()
+        turn_task.cancel()
+        await cleanup_started.wait()
+
+        assert not cleanup_completed.is_set()
+        assert not turn_task.done()
+
+        # Repeated registry cancellation must not pierce the shield and cancel
+        # the cleanup task while it is waiting on the approval lock.
+        turn_task.cancel()
+        await asyncio.sleep(0)
+        turn_task.cancel()
+        await asyncio.sleep(0)
+
+        release_cas.set()
+        payload = await asyncio.wait_for(rpc_task, timeout=1.0)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(turn_task, timeout=1.0)
+
+        assert payload["resolved"] is True
+        assert payload["approved"] is True
+        queue_entry = get_approval_queue().get(approval_id)
+        assert queue_entry.resolved is True
+        assert queue_entry.approved is True
+        assert queue_entry.claim_token is None
+        assert {
+            (grant.domain, grant.scope)
+            for grant in (await _durable_context(manager, node.session_key)).domains
+        } == {("apply-first.example", "chat")}
+        assert approval_id not in escalation_module._APPROVAL_RUN_CONTEXT_GENERATIONS
+        assert approval_id not in escalation_module._APPROVAL_RUN_CONTEXT_DELTAS
+    finally:
+        release_cas.set()
+        for task in (rpc_task, turn_task):
+            if task is not None and not task.done():
+                task.cancel()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_turn_cancel_revokes_generation_after_rpc_reopens(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.gateway.approval_queue import get_approval_queue
+    from opensquilla.gateway.auth import Principal
+    from opensquilla.gateway.rpc import RpcContext
+    from opensquilla.gateway.rpc_approvals import _handle_exec_approval_resolve
+    from opensquilla.sandbox import escalation as escalation_module
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    initial = RunContext(
+        run_mode=RunMode.STANDARD,
+        workspace=str(workspace),
+        source="saved",
+    )
+    storage, manager, node = await _create_session(
+        tmp_path,
+        initial,
+        suffix="repeat-cancel-reopen",
+    )
+    params = build_network_approval_params(
+        NetworkDecision(
+            status="ask",
+            normalized_host="repeat-cancel.example",
+            reason="unknown_domain",
+            source=None,
+        ),
+        session_key=node.session_key,
+        workspace=str(workspace),
+        fingerprint="fingerprint-repeat-cancel",
+    )
+    assert params is not None
+    approval = _request(
+        params,
+        node=node,
+        context=initial,
+        execution_id="execution-repeat-cancel",
+    )
+    approval_id = str(approval["approval_id"])
+    rpc_context = RpcContext(
+        conn_id="repeat-cancel-reopen",
+        principal=Principal(
+            role="operator",
+            scopes=frozenset({"operator.approvals"}),
+            is_owner=True,
+            authenticated=True,
+        ),
+        session_manager=manager,
+        config=_config(workspace),
+    )
+    cas_entered = asyncio.Event()
+    release_first_cas = asyncio.Event()
+    cas_attempts = 0
+    real_compare_and_set = storage.compare_and_set_session_origin
+
+    async def _fail_first_compare_and_set(**kwargs: Any):
+        nonlocal cas_attempts
+        cas_attempts += 1
+        if cas_attempts == 1:
+            cas_entered.set()
+            await release_first_cas.wait()
+            return None
+        return await real_compare_and_set(**kwargs)
+
+    monkeypatch.setattr(
+        storage,
+        "compare_and_set_session_origin",
+        _fail_first_compare_and_set,
+    )
+    cleanup_started = asyncio.Event()
+    real_cleanup = escalation_module.clear_approval_run_context_deltas_for_tool_context
+
+    def _recording_cleanup(context: ToolContext | None):
+        cleanup_started.set()
+        return real_cleanup(context)
+
+    monkeypatch.setattr(
+        escalation_module,
+        "clear_approval_run_context_deltas_for_tool_context",
+        _recording_cleanup,
+    )
+    rpc_task = asyncio.create_task(
+        _handle_exec_approval_resolve(
+            {
+                "id": approval_id,
+                "approved": True,
+                "choice": "allow_same_type",
+            },
+            rpc_context,
+        )
+    )
+    provider = _LifecycleProvider("cancel")
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_iterations=1),
+        session_key=node.session_key,
+        tool_context=_fresh_tool_context(
+            node,
+            initial,
+            execution_id="execution-repeat-cancel",
+        ),
+    )
+
+    async def _run() -> list[Any]:
+        return [event async for event in agent.run_turn("cancel this turn")]
+
+    turn_task: asyncio.Task[list[Any]] | None = None
+    try:
+        await cas_entered.wait()
+        turn_task = asyncio.create_task(_run())
+        await provider.started.wait()
+        turn_task.cancel()
+        await cleanup_started.wait()
+
+        turn_task.cancel()
+        await asyncio.sleep(0)
+        turn_task.cancel()
+        await asyncio.sleep(0)
+
+        release_first_cas.set()
+        with pytest.raises(ProjectWorkspaceStateError, match="unavailable"):
+            await asyncio.wait_for(rpc_task, timeout=1.0)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(turn_task, timeout=1.0)
+
+        reopened = get_approval_queue().get(approval_id)
+        assert reopened.resolved is False
+        assert reopened.approved is False
+        assert reopened.claim_token is None
+
+        retry_error: ProjectWorkspaceStateError | None = None
+        try:
+            await _handle_exec_approval_resolve(
+                {
+                    "id": approval_id,
+                    "approved": True,
+                    "choice": "allow_same_type",
+                },
+                rpc_context,
+            )
+        except ProjectWorkspaceStateError as exc:
+            retry_error = exc
+
+        assert (await _durable_context(manager, node.session_key)).domains == ()
+        assert retry_error is not None
+        assert str(retry_error) == "unavailable"
+        assert cas_attempts == 1
+        assert approval_id not in escalation_module._APPROVAL_RUN_CONTEXT_GENERATIONS
+        assert approval_id not in escalation_module._APPROVAL_RUN_CONTEXT_DELTAS
+        reopened = get_approval_queue().get(approval_id)
+        assert reopened.resolved is False
+        assert reopened.approved is False
+        assert reopened.claim_token is None
+    finally:
+        release_first_cas.set()
+        for task in (rpc_task, turn_task):
+            if task is not None and not task.done():
+                task.cancel()
         await storage.close()
 
 
@@ -1845,7 +2267,7 @@ async def test_agent_turn_finally_clears_only_its_execution_approval_deltas(
 
 
 @pytest.mark.asyncio
-async def test_cancelled_turn_rejects_delta_published_after_finally(
+async def test_cancelled_turn_waits_for_apply_first_then_revokes_delta(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1899,13 +2321,24 @@ async def test_cancelled_turn_rejects_delta_published_after_finally(
         "authoritative_project_run_context",
         _paused_authoritative_context,
     )
+    cleanup_started = asyncio.Event()
     cleanup_completed = asyncio.Event()
     real_cleanup = escalation_module.clear_approval_run_context_deltas_for_tool_context
 
-    def _recording_cleanup(context: ToolContext | None) -> int:
-        removed = real_cleanup(context)
-        cleanup_completed.set()
-        return removed
+    def _recording_cleanup(context: ToolContext | None):
+        cleanup_started.set()
+        result = real_cleanup(context)
+        if not inspect.isawaitable(result):
+            cleanup_completed.set()
+            return result
+
+        async def _record_completion() -> int:
+            try:
+                return await result
+            finally:
+                cleanup_completed.set()
+
+        return _record_completion()
 
     monkeypatch.setattr(
         escalation_module,
@@ -1944,13 +2377,15 @@ async def test_cancelled_turn_rejects_delta_published_after_finally(
         turn_task = asyncio.create_task(_run())
         await provider.started.wait()
         turn_task.cancel()
-        await cleanup_completed.wait()
-        with pytest.raises(asyncio.CancelledError):
-            await turn_task
+        await cleanup_started.wait()
+        assert not cleanup_completed.is_set()
+        assert not turn_task.done()
 
         release_authority.set()
-        with pytest.raises(ProjectWorkspaceStateError, match="unavailable"):
-            await apply_task
+        await apply_task
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(turn_task, timeout=1.0)
+        assert cleanup_completed.is_set()
         assert approval_id not in escalation_module._APPROVAL_RUN_CONTEXT_DELTAS
     finally:
         release_authority.set()
@@ -1961,10 +2396,12 @@ async def test_cancelled_turn_rejects_delta_published_after_finally(
         await storage.close()
 
 
+@pytest.mark.parametrize("choice", ["allow_once", "allow_same_type"])
 @pytest.mark.parametrize("latest_mount_kind", ["exact", "covering"])
 @pytest.mark.asyncio
 async def test_stale_path_ro_approval_preserves_latest_covering_rw_grant(
     tmp_path: Path,
+    choice: str,
     latest_mount_kind: str,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -2015,7 +2452,7 @@ async def test_stale_path_ro_approval_preserves_latest_covering_rw_grant(
         await apply_sandbox_approval_choice(
             params,
             approval_id=str(approval["approval_id"]),
-            choice="allow_same_type",
+            choice=choice,
             approved=True,
             session_manager=manager,
             config=_config(workspace),

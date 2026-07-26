@@ -4242,9 +4242,20 @@ class Agent:
                 ):
                     yield event
         finally:
-            clear_approval_run_context_deltas_for_tool_context(
-                self._tool_context,
+            approval_cleanup = asyncio.create_task(
+                clear_approval_run_context_deltas_for_tool_context(
+                    self._tool_context,
+                )
             )
+            cleanup_wait_cancelled = False
+            while not approval_cleanup.done():
+                try:
+                    await asyncio.shield(approval_cleanup)
+                except asyncio.CancelledError:
+                    cleanup_wait_cancelled = True
+            approval_cleanup.result()
+            if cleanup_wait_cancelled:
+                raise asyncio.CancelledError
 
     async def _turn_generator(
         self,

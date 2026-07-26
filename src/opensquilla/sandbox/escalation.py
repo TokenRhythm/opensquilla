@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import os
@@ -53,11 +54,24 @@ _APPROVAL_RUN_CONTEXT_GENERATIONS: dict[
     _ApprovalRunContextGeneration,
 ] = {}
 _APPROVAL_RUN_CONTEXT_DELTAS: dict[str, _ApprovalRunContextDelta] = {}
+_APPROVAL_RUN_CONTEXT_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
 _APPROVAL_QUEUE_LISTENER_REMOVERS: weakref.WeakKeyDictionary[Any, Any] = (
     weakref.WeakKeyDictionary()
 )
 _DENIED_SANDBOX_APPROVALS: dict[str, str] = {}
 _DURABLE_TEMPORARY_GRANT_SOURCES = frozenset({"saved", "route_metadata", "metadata"})
+
+
+def _approval_run_context_lock(approval_id: str) -> asyncio.Lock:
+    """Return the one in-process linearization lock for an approval ID."""
+
+    lock = _APPROVAL_RUN_CONTEXT_LOCKS.get(approval_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _APPROVAL_RUN_CONTEXT_LOCKS[approval_id] = lock
+    return lock
 
 
 @dataclass(frozen=True)
@@ -320,28 +334,29 @@ async def grant_auto_review_network_once(
         value=value,
         fingerprint=fingerprint,
     )
-    try:
-        if session_manager is None or config is None:
-            raise ProjectWorkspaceStateError("unavailable")
-        authority = await _resolve_approval_authority(
-            params,
-            normalized_id,
-            session_manager=session_manager,
-            config=config,
-        )
-        published = _remember_approval_delta(
-            normalized_id,
-            authority,
-            _approval_delta_context(
+    async with _approval_run_context_lock(normalized_id):
+        try:
+            if session_manager is None or config is None:
+                raise ProjectWorkspaceStateError("unavailable")
+            authority = await _resolve_approval_authority(
+                params,
+                normalized_id,
+                session_manager=session_manager,
+                config=config,
+            )
+            published = _remember_approval_delta(
+                normalized_id,
                 authority,
-                temporary_grants=(grant,),
-            ),
-        )
-    except Exception:
-        _APPROVAL_RUN_CONTEXT_DELTAS.pop(normalized_id, None)
-        return False
-    finally:
-        _APPROVAL_RUN_CONTEXT_GENERATIONS.pop(normalized_id, None)
+                _approval_delta_context(
+                    authority,
+                    temporary_grants=(grant,),
+                ),
+            )
+        except Exception:
+            _APPROVAL_RUN_CONTEXT_DELTAS.pop(normalized_id, None)
+            return False
+        finally:
+            _APPROVAL_RUN_CONTEXT_GENERATIONS.pop(normalized_id, None)
     return published
 
 
@@ -936,6 +951,40 @@ async def apply_sandbox_approval_choice(
         return
 
     validate_sandbox_approval_choice(params, choice=choice, approved=approved)
+    normalized_id = str(approval_id or "").strip()
+    if normalized_id:
+        async with _approval_run_context_lock(normalized_id):
+            await _apply_sandbox_approval_choice_with_live_authority(
+                params,
+                approval_kind=approval_kind,
+                approval_id=normalized_id,
+                choice=choice,
+                session_manager=session_manager,
+                config=config,
+            )
+        return
+
+    await _apply_sandbox_approval_choice_with_live_authority(
+        params,
+        approval_kind=approval_kind,
+        approval_id=None,
+        choice=choice,
+        session_manager=session_manager,
+        config=config,
+    )
+
+
+async def _apply_sandbox_approval_choice_with_live_authority(
+    params: dict[str, Any],
+    *,
+    approval_kind: str,
+    approval_id: str | None,
+    choice: str,
+    session_manager: Any,
+    config: Any,
+) -> None:
+    """Apply one choice while its caller holds the approval's liveness lock."""
+
     authority = await _resolve_approval_authority(
         params,
         approval_id,
@@ -962,7 +1011,7 @@ async def apply_sandbox_approval_choice(
             authority=authority,
         )
     if approval_id:
-        _APPROVAL_RUN_CONTEXT_GENERATIONS.pop(str(approval_id), None)
+        _APPROVAL_RUN_CONTEXT_GENERATIONS.pop(approval_id, None)
 
 
 def context_with_temporary_network_grants(context: Any, *, fingerprint: str) -> Any:
@@ -1035,7 +1084,9 @@ def _remember_approval_delta(
     normalized_id = str(approval_id or "").strip()
     if generation is not None:
         if _APPROVAL_RUN_CONTEXT_GENERATIONS.get(normalized_id) != generation:
-            return False
+            from opensquilla.project_workspaces import ProjectWorkspaceStateError
+
+            raise ProjectWorkspaceStateError("unavailable")
         _store_approval_delta(normalized_id, generation, delta)
         return True
     return False
@@ -1316,24 +1367,41 @@ def reset_resolved_run_context_overlays() -> None:
     _DENIED_SANDBOX_APPROVALS.clear()
 
 
-def clear_approval_run_context_deltas_for_tool_context(ctx: Any) -> int:
+async def clear_approval_run_context_deltas_for_tool_context(ctx: Any) -> int:
     """Close one exact execution and revoke its approval generations/deltas."""
 
     if ctx is None:
         return 0
-    for approval_id in list(_APPROVAL_RUN_CONTEXT_GENERATIONS):
-        generation = _APPROVAL_RUN_CONTEXT_GENERATIONS[approval_id]
-        if not _approval_identity_matches_tool_context(generation, ctx):
-            continue
-        _APPROVAL_RUN_CONTEXT_GENERATIONS.pop(approval_id, None)
     removed = 0
-    for approval_id in list(_APPROVAL_RUN_CONTEXT_DELTAS):
-        delta = _APPROVAL_RUN_CONTEXT_DELTAS[approval_id]
-        if not _approval_identity_matches_tool_context(delta, ctx):
-            continue
-        _APPROVAL_RUN_CONTEXT_DELTAS.pop(approval_id, None)
-        removed += 1
-    return removed
+    while True:
+        approval_ids = {
+            approval_id
+            for approval_id, generation in _APPROVAL_RUN_CONTEXT_GENERATIONS.items()
+            if _approval_identity_matches_tool_context(generation, ctx)
+        }
+        approval_ids.update(
+            approval_id
+            for approval_id, delta in _APPROVAL_RUN_CONTEXT_DELTAS.items()
+            if _approval_identity_matches_tool_context(delta, ctx)
+        )
+        if not approval_ids:
+            return removed
+
+        for approval_id in sorted(approval_ids):
+            async with _approval_run_context_lock(approval_id):
+                generation = _APPROVAL_RUN_CONTEXT_GENERATIONS.get(approval_id)
+                if (
+                    generation is not None
+                    and _approval_identity_matches_tool_context(generation, ctx)
+                ):
+                    _APPROVAL_RUN_CONTEXT_GENERATIONS.pop(approval_id, None)
+                delta = _APPROVAL_RUN_CONTEXT_DELTAS.get(approval_id)
+                if (
+                    delta is not None
+                    and _approval_identity_matches_tool_context(delta, ctx)
+                ):
+                    _APPROVAL_RUN_CONTEXT_DELTAS.pop(approval_id, None)
+                    removed += 1
 
 
 def prune_once_mount_grants(session_key: str | None = None) -> int:
@@ -1784,6 +1852,55 @@ async def _apply_network_choice(
     )
 
 
+def _deepest_latest_mount_satisfying_path(
+    context: RunContext,
+    *,
+    path: str,
+    workspace: str | None,
+    requested_access: str,
+) -> MountGrant | None:
+    requested_write = requested_access == "rw"
+    if (
+        decide_path_access(
+            path,
+            workspace=context.workspace or workspace,
+            mounts=context.mounts,
+            write=requested_write,
+        ).status
+        != "allowed"
+    ):
+        return None
+
+    # Preserve an effective authoritative write capability when a stale read
+    # approval is resolved after a stronger exact/covering mount was persisted.
+    preserve_write = requested_write or (
+        decide_path_access(
+            path,
+            workspace=context.workspace or workspace,
+            mounts=context.mounts,
+            write=True,
+        ).status
+        == "allowed"
+    )
+    satisfying_mounts = tuple(
+        item
+        for item in context.mounts
+        if decide_path_access(
+            path,
+            workspace=None,
+            mounts=(item,),
+            write=preserve_write,
+        ).status
+        == "allowed"
+    )
+    if not satisfying_mounts:
+        return None
+    return max(
+        satisfying_mounts,
+        key=lambda item: len(normalize_path(item.path).parts),
+    )
+
+
 async def _apply_path_choice(
     params: dict[str, Any],
     choice: str,
@@ -1804,12 +1921,21 @@ async def _apply_path_choice(
         raise ValueError("path_access_required")
 
     if choice == "allow_once":
-        grant = validated_mount_grant(
+        requested_grant = validated_mount_grant(
             authority.context,
             path=path,
             access=requested_access,
             scope="once",
             workspace=workspace,
+        )
+        grant = (
+            _deepest_latest_mount_satisfying_path(
+                authority.context,
+                path=path,
+                workspace=workspace,
+                requested_access=requested_access,
+            )
+            or requested_grant
         )
         published = _remember_approval_delta(
             approval_id,
@@ -1825,24 +1951,22 @@ async def _apply_path_choice(
             raise ProjectWorkspaceStateError("unavailable")
         return
 
-    grant = validated_mount_grant(
+    requested_grant = validated_mount_grant(
         authority.context,
         path=path,
         access=requested_access,
         scope="chat",
         workspace=workspace,
     )
-    latest_decision = decide_path_access(
-        path,
-        workspace=authority.context.workspace or workspace,
-        mounts=authority.context.mounts,
-        write=requested_access == "rw",
+    grant = _deepest_latest_mount_satisfying_path(
+        authority.context,
+        path=path,
+        workspace=workspace,
+        requested_access=requested_access,
     )
-    if latest_decision.status == "allowed":
-        # A concurrent exact or covering mount already satisfies this stale
-        # request. Preserve its (possibly stronger) durable access unchanged.
-        updated = authority.context
-    else:
+    if grant is None:
+        # Only mutate when no concurrent exact/covering authoritative mount
+        # already satisfies this stale request.
         mutation_manager = _approval_mutation_manager(
             session_manager,
             authority,
@@ -1856,22 +1980,17 @@ async def _apply_path_choice(
             config=config,
             workspace=workspace,
         )
-    satisfying_mounts = tuple(
-        item
-        for item in updated.mounts
-        if decide_path_access(
-            path,
-            workspace=None,
-            mounts=(item,),
-            write=requested_access == "rw",
-        ).status
-        == "allowed"
-    )
-    if satisfying_mounts:
-        grant = max(
-            satisfying_mounts,
-            key=lambda item: len(normalize_path(item.path).parts),
+        grant = (
+            _deepest_latest_mount_satisfying_path(
+                updated,
+                path=path,
+                workspace=workspace,
+                requested_access=requested_access,
+            )
+            or requested_grant
         )
+    if grant is None:
+        grant = requested_grant
     _remember_approval_delta(
         approval_id,
         authority,
