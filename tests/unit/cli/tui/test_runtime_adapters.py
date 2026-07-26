@@ -366,6 +366,95 @@ async def test_standalone_dispatch_uses_bound_project_workspace_over_tampered_or
 
 
 @pytest.mark.asyncio
+async def test_standalone_dispatch_refreshes_unbound_saved_context(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.cli.tui import standalone_runtime
+
+    storage = await SessionStorage.open(str(tmp_path / "tui-unbound.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    saved_workspace = tmp_path / "saved-workspace"
+    saved_workspace.mkdir()
+    key = "agent:main:standalone:unbound"
+    await manager.create(
+        key,
+        origin={
+            RUN_CONTEXT_ORIGIN_KEY: {
+                "run_mode": "standard",
+                "run_mode_source": "user",
+                "workspace": str(saved_workspace),
+                "domains": [
+                    {
+                        "domain": "saved.example",
+                        "scope": "chat",
+                        "source": "manual",
+                    }
+                ],
+            }
+        },
+    )
+    services = _FakeServices(
+        config=GatewayConfig(workspace_dir=str(tmp_path / "default")),
+        session_manager=manager,
+    )
+
+    async def fake_build_services() -> _FakeServices:
+        return services
+
+    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
+    monkeypatch.setattr(
+        "opensquilla.gateway.build_turn_runner_from_services",
+        lambda _services: object(),
+    )
+    captured_contexts: list[Any] = []
+
+    async def stream_response(
+        turn_runner: object,
+        session_key: str,
+        tool_ctx: object,
+        message: str,
+        model: str | None = None,
+        svc: object = None,
+        timeout: float | None = None,
+        **kwargs: Any,
+    ) -> TurnResult:
+        captured_contexts.append(tool_ctx)
+        return TurnResult(
+            text="reply",
+            usage=UsageSummary(input_tokens=1, output_tokens=1),
+            model_after=None,
+        )
+
+    async def run_repl(*, surface: Surface, scope: Any, dispatch: Any) -> None:
+        assert await dispatch("pwd") is True
+
+    deps = _standalone_deps(
+        stream_response=stream_response,
+        run_concurrent_repl=run_repl,
+        output_console=_RecordingConsole(),
+        error_panel_factory=lambda message: message,
+    )
+    try:
+        await standalone_runtime.run_standalone_chat(
+            model=None,
+            session_id=key,
+            deps=deps,
+        )
+    finally:
+        await storage.close()
+
+    tool_context = captured_contexts[0]
+    assert tool_context.run_mode == "standard"
+    assert tool_context.workspace_dir == str(saved_workspace.resolve())
+    assert tool_context.sandbox_run_context.run_mode_source == "user"
+    assert [grant.domain for grant in tool_context.sandbox_run_context.domains] == [
+        "saved.example"
+    ]
+    assert getattr(tool_context, "_sandbox_run_context_fresh", False) is True
+
+
+@pytest.mark.asyncio
 async def test_standalone_dispatch_revalidates_project_on_every_input(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

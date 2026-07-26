@@ -1895,19 +1895,22 @@ async def _run_turn_with_streaming(
             config=config,
             default_workspace=(str(workspace_dir) if workspace_dir is not None else None),
         )
-        if workspace_guard is not None:
-            from opensquilla.gateway.rpc_sessions import (
-                _apply_run_context_route_metadata,
-            )
+        from opensquilla.gateway.rpc_sessions import (
+            _apply_run_context_route_metadata,
+        )
 
-            _apply_run_context_route_metadata(
-                envelope,
-                run_context,
-                principal_is_owner=_is_channel_admin_sender(config, envelope),
-            )
+        _apply_run_context_route_metadata(
+            envelope,
+            run_context,
+            principal_is_owner=_is_channel_admin_sender(config, envelope),
+        )
+        if run_context.workspace is not None:
             workspace_dir = run_context.workspace
-            if not isinstance(getattr(config, "workspace_strict", None), bool):
-                workspace_strict = True
+        if workspace_guard is not None and not isinstance(
+            getattr(config, "workspace_strict", None),
+            bool,
+        ):
+            workspace_strict = True
     tool_ctx = tool_context_from_envelope(
         envelope,
         is_owner=_is_channel_admin_sender(config, envelope),

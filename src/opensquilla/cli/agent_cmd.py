@@ -333,23 +333,23 @@ async def run_agent_once(
                 config=service_cfg,
                 default_workspace=tool_workspace_dir,
             )
-            if workspace_guard is not None:
-                run_context = apply_accepted_run_mode_override(
-                    run_context,
-                    accepted_run_mode_override,
-                )
-                from opensquilla.gateway.rpc_sessions import (
-                    _apply_run_context_route_metadata,
-                )
+            run_context = apply_accepted_run_mode_override(
+                run_context,
+                accepted_run_mode_override,
+            )
+            from opensquilla.gateway.rpc_sessions import (
+                _apply_run_context_route_metadata,
+            )
 
-                _apply_run_context_route_metadata(
-                    route_envelope,
-                    run_context,
-                    principal_is_owner=True,
-                )
+            _apply_run_context_route_metadata(
+                route_envelope,
+                run_context,
+                principal_is_owner=True,
+            )
+            if run_context.workspace is not None:
                 tool_workspace_dir = run_context.workspace
-                if not isinstance(workspace_strict, bool):
-                    effective_workspace_strict = True
+            if workspace_guard is not None and not isinstance(workspace_strict, bool):
+                effective_workspace_strict = True
         tool_ctx = tool_context_from_envelope(
             route_envelope,
             is_owner=True,

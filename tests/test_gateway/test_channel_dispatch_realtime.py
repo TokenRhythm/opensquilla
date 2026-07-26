@@ -2383,6 +2383,119 @@ async def test_direct_channel_turn_uses_authoritative_project_workspace(
 
 
 @pytest.mark.asyncio
+async def test_direct_channel_unbound_turn_refreshes_durable_context(
+    tmp_path: Path,
+) -> None:
+    from opensquilla.gateway.project_workspace_runtime import (
+        authoritative_project_run_context,
+    )
+    from opensquilla.gateway.rpc_sessions import _apply_run_context_route_metadata
+
+    storage = await SessionStorage.open(str(tmp_path / "channel-unbound.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    stale_workspace = tmp_path / "stale"
+    current_workspace = tmp_path / "current"
+    default_workspace = tmp_path / "default"
+    stale_workspace.mkdir()
+    current_workspace.mkdir()
+    key = "agent:main:matrix:unbound"
+    await manager.create(
+        key,
+        origin={
+            RUN_CONTEXT_ORIGIN_KEY: {
+                "run_mode": "full",
+                "run_mode_source": "user",
+                "workspace": str(stale_workspace),
+                "domains": [
+                    {
+                        "domain": "revoked.example",
+                        "scope": "chat",
+                        "source": "manual",
+                    }
+                ],
+            }
+        },
+    )
+    config = GatewayConfig(
+        workspace_dir=str(default_workspace),
+        channel_admin_senders={"matrix": ["u1"]},
+        agent_stream_heartbeat_interval_seconds=0.0,
+        agent_stream_idle_timeout_seconds=1.0,
+    )
+    envelope = build_channel_route_envelope(
+        _message(),
+        session_key=key,
+        session_prefix="matrix",
+    )
+    session = await storage.get_session(key)
+    assert session is not None
+    stale_context, workspace_guard = await authoritative_project_run_context(
+        storage=storage,
+        session_manager=manager,
+        session=session,
+        config=config,
+        default_workspace=str(default_workspace),
+    )
+    assert workspace_guard is None
+    _apply_run_context_route_metadata(
+        envelope,
+        stale_context,
+        principal_is_owner=True,
+    )
+    await manager.update(
+        key,
+        origin={
+            RUN_CONTEXT_ORIGIN_KEY: {
+                "run_mode": "standard",
+                "run_mode_source": "operator_default",
+                "workspace": str(current_workspace),
+                "domains": [
+                    {
+                        "domain": "current.example",
+                        "scope": "chat",
+                        "source": "manual",
+                    }
+                ],
+            }
+        },
+    )
+
+    class RecordingTurnRunner:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            self.calls.append(kwargs)
+            yield DoneEvent(text="ok")
+
+    channel = _FakeChannel()
+    runner = RecordingTurnRunner()
+    try:
+        await _run_turn_with_streaming(
+            channel,
+            runner,
+            _message(),
+            key,
+            _FakeEventBridge(),
+            None,
+            config,
+            route_envelope=envelope,
+            session_manager=manager,
+        )
+    finally:
+        await storage.close()
+
+    tool_context = runner.calls[0]["tool_context"]
+    assert tool_context.run_mode == "standard"
+    assert tool_context.workspace_dir == str(current_workspace.resolve())
+    assert tool_context.sandbox_run_context.run_mode_source == "operator_default"
+    assert [grant.domain for grant in tool_context.sandbox_run_context.domains] == [
+        "current.example"
+    ]
+    assert getattr(tool_context, "_sandbox_run_context_fresh", False) is True
+
+
+@pytest.mark.asyncio
 async def test_direct_channel_revalidates_post_accept_retarget_before_tool_context(
     tmp_path: Path,
 ) -> None:

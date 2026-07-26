@@ -2237,7 +2237,7 @@ async def _handle_sessions_send(
             execution_workspace_dir = workspace_dir
             (
                 execution_run_context,
-                execution_workspace_guard,
+                _execution_workspace_guard,
             ) = await authoritative_project_run_context(
                 storage=storage,
                 session_manager=ctx.session_manager,
@@ -2245,16 +2245,16 @@ async def _handle_sessions_send(
                 config=ctx.config,
                 default_workspace=workspace_dir,
             )
-            if execution_workspace_guard is not None:
-                execution_run_context = apply_accepted_run_mode_override(
-                    execution_run_context,
-                    accepted_run_mode_override,
-                )
-                _apply_run_context_route_metadata(
-                    route_envelope,
-                    execution_run_context,
-                    principal_is_owner=ctx.principal.is_owner,
-                )
+            execution_run_context = apply_accepted_run_mode_override(
+                execution_run_context,
+                accepted_run_mode_override,
+            )
+            _apply_run_context_route_metadata(
+                route_envelope,
+                execution_run_context,
+                principal_is_owner=ctx.principal.is_owner,
+            )
+            if execution_run_context.workspace is not None:
                 execution_workspace_dir = execution_run_context.workspace
             workspace_strict = getattr(ctx.config, "workspace_strict", None)
             if not isinstance(workspace_strict, bool):

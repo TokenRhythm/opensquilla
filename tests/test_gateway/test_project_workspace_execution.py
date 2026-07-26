@@ -916,6 +916,134 @@ async def test_direct_web_project_turn_preserves_authorized_request_mode_at_exec
 
 
 @pytest.mark.parametrize(
+    ("requested_mode", "expected_mode", "expected_mode_source"),
+    [
+        (None, "standard", "operator_default"),
+        ("full", "full", "user"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_direct_web_unbound_turn_refreshes_durable_context_before_typed_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    requested_mode: str | None,
+    expected_mode: str,
+    expected_mode_source: str,
+) -> None:
+    async with open_stack(tmp_path / f"direct-unbound-{requested_mode or 'saved'}.db") as stack:
+        stale_workspace = tmp_path / "stale-workspace"
+        current_workspace = tmp_path / "current-workspace"
+        stale_workspace.mkdir()
+        current_workspace.mkdir()
+        key = f"agent:main:webchat:direct-unbound-{requested_mode or 'saved'}"
+        await stack.manager.create(
+            key,
+            origin={
+                RUN_CONTEXT_ORIGIN_KEY: {
+                    "run_mode": "full",
+                    "run_mode_source": "user",
+                    "workspace": str(stale_workspace),
+                    "domains": [
+                        {
+                            "domain": "revoked.example",
+                            "scope": "chat",
+                            "source": "manual",
+                        }
+                    ],
+                }
+            },
+        )
+        original_accept_turn = stack.storage.accept_turn
+        durable_context_replaced = False
+
+        async def replace_context_after_accept(*args: Any, **kwargs: Any) -> Any:
+            nonlocal durable_context_replaced
+            acceptance = await original_accept_turn(*args, **kwargs)
+            if not durable_context_replaced:
+                durable_context_replaced = True
+                await stack.manager.update(
+                    key,
+                    origin={
+                        RUN_CONTEXT_ORIGIN_KEY: {
+                            "run_mode": "standard",
+                            "run_mode_source": "operator_default",
+                            "workspace": str(current_workspace),
+                            "domains": [
+                                {
+                                    "domain": "current.example",
+                                    "scope": "chat",
+                                    "source": "manual",
+                                }
+                            ],
+                        }
+                    },
+                )
+            return acceptance
+
+        stack.storage.accept_turn = replace_context_after_accept  # type: ignore[method-assign]
+        captured: dict[str, Any] = {}
+
+        class Runner:
+            async def run(self, message: str, session_key: str, **kwargs: Any):
+                captured.update(kwargs)
+                yield DoneEvent()
+
+        from opensquilla.gateway import routing
+
+        original_build_web_route_envelope = routing.build_web_route_envelope
+        built_envelopes: list[Any] = []
+
+        def build_web_route_envelope_with_forged_metadata(**kwargs: Any) -> Any:
+            envelope = original_build_web_route_envelope(**kwargs)
+            envelope.metadata["accepted_run_mode_override"] = {
+                "run_mode": "full",
+                "run_mode_source": "user",
+                "source": "forged_metadata",
+            }
+            built_envelopes.append(envelope)
+            return envelope
+
+        monkeypatch.setattr(
+            routing,
+            "build_web_route_envelope",
+            build_web_route_envelope_with_forged_metadata,
+        )
+        source: dict[str, Any] = {
+            "caller_kind": "web",
+            "channel_kind": "webchat",
+        }
+        if requested_mode is not None:
+            source["runMode"] = requested_mode
+        stack.context.task_runtime = None
+        stack.context.turn_runner = Runner()
+        response = await get_dispatcher().dispatch(
+            f"direct-unbound-{requested_mode or 'saved'}",
+            "sessions.send",
+            {
+                "key": key,
+                "message": "pwd",
+                "_source": source,
+            },
+            stack.context,
+        )
+        await await_direct_task(key)
+
+        assert response.ok is True
+        assert durable_context_replaced is True
+        assert built_envelopes[0].metadata["accepted_run_mode_override"]["source"] == (
+            "forged_metadata"
+        )
+        tool_context = captured["tool_context"]
+        assert tool_context.run_mode == expected_mode
+        assert tool_context.workspace_dir == str(current_workspace.resolve())
+        assert tool_context.sandbox_run_context.run_mode_source == expected_mode_source
+        assert [grant.domain for grant in tool_context.sandbox_run_context.domains] == [
+            "current.example"
+        ]
+        assert getattr(tool_context, "_sandbox_run_context_fresh", False) is True
+
+
+@pytest.mark.parametrize(
     ("saved_mode", "requested_mode"),
     [("full", "standard"), ("standard", "full")],
 )

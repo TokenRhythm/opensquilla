@@ -568,6 +568,88 @@ async def test_run_agent_once_uses_bound_project_workspace_over_tampered_origin(
 
 
 @pytest.mark.parametrize(
+    ("requested_mode", "expected_mode", "expected_mode_source"),
+    [
+        (None, "standard", "user"),
+        ("full", "full", "operator_default"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_run_agent_once_refreshes_unbound_saved_context_before_typed_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    requested_mode: str | None,
+    expected_mode: str,
+    expected_mode_source: str,
+) -> None:
+    storage = await SessionStorage.open(
+        str(tmp_path / f"cli-unbound-{requested_mode or 'saved'}.db")
+    )
+    manager = SessionManager(storage, inject_time_prefix=False)
+    saved_workspace = tmp_path / f"saved-{requested_mode or 'saved'}"
+    saved_workspace.mkdir()
+    key = f"agent:main:cli-unbound-{requested_mode or 'saved'}"
+    await manager.create(
+        key,
+        origin={
+            RUN_CONTEXT_ORIGIN_KEY: {
+                "run_mode": "standard",
+                "run_mode_source": "user",
+                "workspace": str(saved_workspace),
+                "domains": [
+                    {
+                        "domain": "saved.example",
+                        "scope": "chat",
+                        "source": "manual",
+                    }
+                ],
+            }
+        },
+    )
+    calls: list[dict[str, Any]] = []
+
+    class FakeTurnRunner:
+        def __init__(self, **kwargs: Any) -> None:
+            return None
+
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            calls.append(kwargs)
+            yield DoneEvent(text="ok")
+
+    async def fake_build_services(*, config: GatewayConfig, **kwargs: Any) -> _FakeServices:
+        return _FakeServices(config, manager)
+
+    monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
+    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
+    sandbox = (
+        SandboxSettings()
+        if requested_mode is None
+        else SandboxSettings(run_mode=requested_mode)
+    )
+    try:
+        result = await run_agent_once(
+            message="pwd",
+            session_id=key,
+            config=GatewayConfig(
+                workspace_dir=str(tmp_path / "default"),
+                sandbox=sandbox,
+            ),
+        )
+    finally:
+        await storage.close()
+
+    tool_context = calls[0]["tool_context"]
+    assert tool_context.run_mode == expected_mode
+    assert tool_context.workspace_dir == str(saved_workspace.resolve())
+    assert tool_context.sandbox_run_context.run_mode_source == expected_mode_source
+    assert [grant.domain for grant in tool_context.sandbox_run_context.domains] == [
+        "saved.example"
+    ]
+    assert getattr(tool_context, "_sandbox_run_context_fresh", False) is True
+    assert result.workspace == str(saved_workspace.resolve())
+
+
+@pytest.mark.parametrize(
     ("saved_mode", "requested_mode"),
     [("full", "standard"), ("standard", "full")],
 )

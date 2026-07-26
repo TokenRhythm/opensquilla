@@ -248,8 +248,6 @@ async def run_standalone_chat(
             config=svc.config,
             default_workspace=active_workspace,
         )
-        if workspace_guard is None:
-            return _build_tool_ctx(active_session_key)
         route_envelope = build_cli_route_envelope(
             session_key=active_session_key,
             agent_id="main",
@@ -267,12 +265,12 @@ async def run_standalone_chat(
             principal_is_owner=True,
         )
         project_workspace_strict = effective_workspace_strict
-        if not isinstance(workspace_strict, bool):
+        if workspace_guard is not None and not isinstance(workspace_strict, bool):
             project_workspace_strict = True
         return tool_context_from_envelope(
             route_envelope,
             is_owner=True,
-            workspace_dir=run_context.workspace,
+            workspace_dir=run_context.workspace or active_workspace,
             workspace_strict=project_workspace_strict,
             default_elevated=configured_default_elevated(svc.config),
         )
