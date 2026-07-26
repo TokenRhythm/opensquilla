@@ -1,6 +1,6 @@
 # Project Workspace Sandbox Hardening Design
 
-**Status:** Approved for written-spec review
+**Status:** Approved; submission scope amended by the user on 2026-07-26
 
 **Date:** 2026-07-26
 
@@ -27,10 +27,14 @@ several gaps:
 - the composer treats the pending project selection as the active project, so
   its project indicator disappears after the first successful send;
 - protected metadata symlinks are canonicalized too early, losing the lexical
-  `.git`, `.codex`, or `.agents` path that a backend must also protect; and
-- six sandbox regressions currently fail consistently across Windows payload
-  construction, sandbox-disabled stale context handling, and symlink-loop
-  directory listing parity.
+  `.git`, `.codex`, or `.agents` path that a backend must also protect.
+
+Five additional sandbox failures were reproduced in Windows PATH/probe handling
+and symlink-loop directory listing parity. They predate this workspace work and
+are not causal dependencies of it. Per the user's later scope direction, they
+remain a read-only baseline and are not opportunistically included in this
+submission. The stale disabled-runtime case may change only through the
+workspace-required capability/request-default separation.
 
 The local Codex source is the compatibility reference. In particular:
 
@@ -59,8 +63,8 @@ The local Codex source is the compatibility reference. In particular:
 5. Make project identity and availability visible and consistent across sidebar,
    composer, refresh, first-send handoff, removal, and recovery.
 6. Give Web and Desktop users predictable, race-safe directory selection.
-7. Restore the existing sandbox regression suite and add platform-specific
-   coverage for the new invariants.
+7. Add platform-specific coverage for the new workspace invariants without
+   folding unrelated pre-existing repairs into the submission.
 
 ## Non-goals
 
@@ -70,6 +74,8 @@ The local Codex source is the compatibility reference. In particular:
 - Replacing Electron's native directory dialog with the Web picker.
 - Adding a new database schema version solely for this hardening work.
 - Silently falling back to host execution when a sandbox backend is unavailable.
+- Committing ignored Web build output, local gateway process-state repairs, or
+  unrelated Windows PATH/probe and symlink-loop regression fixes.
 
 ## Chosen Approach
 
@@ -370,20 +376,20 @@ owns the current durable task keeps the history visible but marks it unavailable
 and blocks new sends. Sidebar creation controls are disabled for unavailable
 projects.
 
-### 9. Existing Sandbox Regression Repairs
+### 9. Submission Boundary and Existing Baseline
 
-The six reproduced failures are part of this work:
+The Web outage's ignored static distribution and unmanaged local listener are
+repaired and verified locally, never staged. Production changes are permitted
+only when they are causal dependencies of project workspace authority,
+Codex-compatible sandboxing, project lifecycle, the directory picker, or the
+active-project UI.
 
-1. Windows payload construction uses a Windows-style PATH only when supplied by
-   the Windows request/environment. A non-Windows host PATH is not treated as
-   one Windows path. Tool-directory probing catches `OSError`.
-2. Explicitly disabled sandbox runtime takes precedence over a stale restricted
-   `ToolContext`.
-3. Filesystem worker path verification preserves an `ELOOP`/symlink-loop
-   classification so host and worker directory listings both report a broken
-   symlink.
-
-These are correctness repairs, not platform-test skips.
+The four pre-existing Windows PATH/probe failures and the worker symlink-loop
+failure remain an explicit baseline. They are re-run after implementation to
+prove no additional failures were introduced, but their production/test files
+must not be changed for those unrelated reasons. Explicitly disabled runtime
+precedence is covered only insofar as Task 1's capability/request-default split
+requires it to preserve operator Full semantics.
 
 ## Error Contract
 
@@ -436,8 +442,7 @@ No low-level filesystem path or backend traceback is exposed to a non-owner.
 - explicit sandbox disablement dominates stale Standard context;
 - backend unavailable/setup pending fails project Standard closed;
 - `.git`, `.codex`, and `.agents` symlinks cannot be written through, unlinked,
-  renamed, or replaced on supported backends;
-- Windows PATH/ACL tests and host/worker symlink-loop parity pass.
+  renamed, or replaced on supported backends.
 
 ### Web and Desktop
 
@@ -484,7 +489,8 @@ The work is complete only when:
 6. Web and Desktop picker behavior matches the state/error contract;
 7. the active project remains visible and authoritative after send, reload, and
    removal;
-8. all six reproduced sandbox failures pass without skips;
-9. focused backend, full relevant sandbox, Web unit/type/architecture, Electron,
-   and project-lifecycle E2E verification pass; and
+8. the five unrelated baseline failures have no new companion failures and no
+   unrelated repair diff is staged;
+9. focused backend, scoped relevant sandbox, Web unit/type/architecture,
+   Electron, and project-lifecycle E2E verification pass; and
 10. the rebuilt Control UI and gateway health endpoints return HTTP 200.
