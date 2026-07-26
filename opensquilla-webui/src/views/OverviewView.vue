@@ -1069,42 +1069,41 @@ function gatewayContextUrl(): string {
 .ov-kpis > .control-stat:nth-child(3) { animation-delay: 80ms; }
 
 /* Environment footer readout: quiet, copyable env detail (not hero content) */
+/* Environment readout is reference material, not content: it sits directly on
+   the canvas with no card shell, and each value is quiet text rather than a
+   filled chip. Six pills in a bordered strip read as six things to attend to;
+   this reads as one footnote. */
 .ov-readout {
   align-items: center;
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-card);
-  box-shadow: var(--elev-1);
   color: var(--text-dim);
   column-gap: var(--sp-5);
   display: flex;
   flex-wrap: wrap;
   font-size: var(--fs-xs);
-  padding: 11px var(--sp-4);
+  padding: 2px var(--sp-1);
   row-gap: 6px;
 }
-.ov-readout__kv { align-items: center; display: flex; gap: 7px; min-width: 0; }
-.ov-readout__kv b { color: var(--text-muted); font-weight: 600; }
+.ov-readout__kv { align-items: center; display: flex; gap: 6px; min-width: 0; }
+.ov-readout__kv b { color: var(--text-dim); font-weight: var(--fw-eyebrow); }
 .ov-readout__kv code {
-  background: var(--bg-surface-2);
-  border-radius: var(--radius-sm);
   color: var(--text-muted);
   font-family: var(--font-mono);
   font-size: 12px;
-  padding: 2px 8px;
   white-space: nowrap;
 }
+/* Bare glyph until hovered — a bordered box per copyable value was most of the
+   strip's visual noise. */
 .ov-readout__copy {
   align-items: center;
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
+  background: transparent;
+  border: 1px solid transparent;
   border-radius: var(--radius-sm);
   color: var(--text-dim);
   cursor: pointer;
   display: inline-flex;
-  height: 22px;
+  height: 20px;
   justify-content: center;
-  width: 22px;
+  width: 20px;
 }
 .ov-readout__copy:hover { background: var(--bg-hover); color: var(--text); }
 .ov-readout__copy--ok { color: var(--ok); }
