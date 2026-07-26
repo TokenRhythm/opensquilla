@@ -8,40 +8,60 @@
   <style>
     :root {
       color-scheme: light dark;
-      --bg: #f8f7f3;
-      --surface: #fffefa;
-      --ink: #1d1f1d;
-      --muted: #686e66;
-      --dim: #8b9088;
-      --line: rgba(34, 31, 27, 0.12);
-      --accent: #F26A1B;
-      --danger: #a23a22;
+      --bg: #F7F7F8;
+      --surface: #FFFFFF;
+      --panel: rgba(255, 255, 255, 0.78);
+      --panel-solid: #FFFFFF;
+      --ink: #1D1D1F;
+      --muted: #5F6066;
+      --dim: #85868D;
+      --line: rgba(29, 29, 31, 0.09);
+      --line-strong: rgba(29, 29, 31, 0.15);
+      --accent: #BA4D0F;
+      --accent-soft: rgba(186, 77, 15, 0.11);
+      --glow: rgba(186, 77, 15, 0.08);
+      --danger: #C2382E;
+      --danger-soft: rgba(194, 56, 46, 0.08);
+      --shadow: 0 28px 80px rgba(16, 20, 26, 0.12), 0 2px 8px rgba(16, 20, 26, 0.05);
     }
 
     /* The app theme defaults to "system", so match the OS here — a dark-OS user
        gets a dark splash that hands off to the dark app with no luminance flash.
-       These mirror the app's canonical "Instrument" dark tokens. */
+       These mirror the app's canonical graphite tokens. */
     @media (prefers-color-scheme: dark) {
       :root {
-        --bg: #0E0F11;
-        --surface: #161719;
-        --ink: #e8e8ea;
-        --muted: #9a9aa0;
-        --dim: #6b6b72;
-        --line: rgba(255, 255, 255, 0.12);
+        --bg: #18181A;
+        --surface: #28282B;
+        --panel: rgba(32, 32, 34, 0.78);
+        --panel-solid: #202022;
+        --ink: #F5F5F7;
+        --muted: #B0B0B6;
+        --dim: #87878E;
+        --line: rgba(255, 255, 255, 0.08);
+        --line-strong: rgba(255, 255, 255, 0.14);
         --accent: #F26A1B;
+        --accent-soft: rgba(242, 106, 27, 0.14);
+        --glow: rgba(242, 106, 27, 0.09);
+        --danger: #FF6B6B;
+        --danger-soft: rgba(255, 107, 107, 0.09);
+        --shadow: 0 34px 90px rgba(0, 0, 0, 0.34), 0 2px 10px rgba(0, 0, 0, 0.18);
       }
     }
 
     * { box-sizing: border-box; }
 
+    html { background: var(--bg); }
+
     body {
       margin: 0;
       min-height: 100vh;
       overflow: hidden;
-      background: var(--bg);
+      background:
+        radial-gradient(circle at 50% 43%, var(--glow) 0, transparent 34%),
+        var(--bg);
       color: var(--ink);
       font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      -webkit-font-smoothing: antialiased;
     }
 
     .shell {
@@ -52,75 +72,116 @@
     }
 
     .boot {
-      width: min(520px, calc(100vw - 48px));
+      position: relative;
+      width: min(476px, calc(100vw - 48px));
       display: grid;
-      gap: 34px;
-      padding: 4px;
+      gap: 30px;
+      padding: 46px 44px 40px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 30px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(28px) saturate(1.15);
+      -webkit-backdrop-filter: blur(28px) saturate(1.15);
+    }
+
+    .boot::before {
+      content: "";
+      position: absolute;
+      inset: 0 18% auto;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.72), transparent);
+      pointer-events: none;
     }
 
     .brand {
       display: grid;
-      gap: 12px;
+      justify-items: center;
+      gap: 10px;
+      text-align: center;
     }
 
     .mark-row {
       align-items: center;
-      display: flex;
-      gap: 11px;
+      display: grid;
+      justify-items: center;
+      gap: 18px;
     }
 
-    .mark {
-      width: 22px;
-      height: 22px;
-      border: 2px solid var(--ink);
+    .loader {
       position: relative;
+      width: 58px;
+      height: 58px;
+      display: grid;
+      place-items: center;
     }
 
-    .mark::after {
+    .loader::before {
       content: "";
-      position: absolute;
-      bottom: -2px;
-      right: -7px;
       width: 9px;
-      height: 2px;
-      background: var(--accent);
+      height: 9px;
+      border-radius: 50%;
+      background: var(--accent-soft);
+      box-shadow: 0 0 18px var(--accent-soft);
+      animation: loader-core 1.1s ease-in-out infinite;
+    }
+
+    .loader span {
+      position: absolute;
+      left: 27px;
+      top: 3px;
+      width: 4px;
+      height: 13px;
+      border-radius: 999px;
+      background: var(--muted);
+      opacity: 0.15;
+      transform: rotate(calc(var(--i) * 45deg));
+      transform-origin: 2px 26px;
+      animation: loader-segment 1.1s linear infinite;
+      animation-delay: calc(var(--i) * -0.1375s);
     }
 
     h1 {
       margin: 0;
-      font-size: 28px;
-      font-weight: 760;
-      letter-spacing: 0;
+      font-size: 27px;
+      font-weight: 680;
+      letter-spacing: -0.045em;
       line-height: 1;
     }
 
     .subtitle {
       color: var(--muted);
-      font-size: 14px;
-      line-height: 1.5;
+      font-size: 13px;
+      line-height: 1.45;
       margin: 0;
       max-width: 42ch;
     }
 
     .status {
       display: grid;
-      gap: 13px;
-      padding-top: 2px;
+      gap: 14px;
+      padding: 18px 18px 16px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: color-mix(in srgb, var(--surface) 62%, transparent);
     }
 
     .status-line {
-      height: 2px;
+      height: 5px;
       overflow: hidden;
-      background: rgba(29, 31, 29, 0.1);
+      border-radius: 999px;
+      background: var(--line);
     }
 
     .status-line::before {
-      animation: progress 1.6s ease-in-out infinite;
-      background: var(--accent);
+      animation: progress 1.8s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+      background: linear-gradient(90deg, transparent, var(--accent) 28%, var(--accent) 72%, transparent);
       content: "";
       display: block;
       height: 100%;
-      width: 38%;
+      width: 46%;
+      border-radius: inherit;
     }
 
     /* On a startup failure the splash is paused, not working — freeze the
@@ -131,7 +192,7 @@
     }
 
     .status-copy {
-      align-items: baseline;
+      align-items: center;
       display: flex;
       justify-content: space-between;
       gap: 18px;
@@ -139,52 +200,68 @@
 
     .phase {
       color: var(--ink);
-      font-size: 14px;
-      font-weight: 680;
+      font-size: 13px;
+      font-weight: 590;
       min-width: 0;
     }
 
     .timer {
       color: var(--dim);
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 12px;
+      font-size: 11px;
       font-variant-numeric: tabular-nums;
+      letter-spacing: -0.02em;
       white-space: nowrap;
     }
 
     .steps {
       display: grid;
-      gap: 8px;
+      gap: 6px;
       grid-template-columns: repeat(3, 1fr);
     }
 
     .step {
-      border-top: 1px solid var(--line);
+      position: relative;
       color: var(--dim);
-      font-size: 11px;
-      font-weight: 720;
-      letter-spacing: 0.06em;
-      padding-top: 10px;
-      text-transform: uppercase;
-      transition: color 160ms ease, border-color 160ms ease;
+      font-size: 10px;
+      font-weight: 620;
+      letter-spacing: 0.01em;
+      padding-top: 11px;
+      transition: color 180ms ease;
+    }
+
+    .step::before {
+      content: "";
+      position: absolute;
+      inset: 0 0 auto;
+      height: 2px;
+      border-radius: 999px;
+      background: var(--line-strong);
+      transition: background 180ms ease, box-shadow 180ms ease;
     }
 
     .step.active {
-      border-color: var(--accent);
       color: var(--ink);
     }
 
+    .step.active::before {
+      background: var(--accent);
+      box-shadow: 0 0 10px var(--accent-soft);
+    }
+
     .step.done {
-      border-color: rgba(29, 31, 29, 0.32);
       color: var(--muted);
     }
+
+    .step.done::before { background: var(--muted); }
 
     .error {
       display: none;
       gap: 13px;
-      padding: 16px;
-      border: 1px solid rgba(162, 58, 34, 0.28);
-      background: #fff8f5;
+      padding: 18px;
+      border: 1px solid color-mix(in srgb, var(--danger) 24%, transparent);
+      border-radius: 18px;
+      background: var(--danger-soft);
       color: var(--danger);
     }
 
@@ -194,7 +271,8 @@
       display: none;
       gap: 18px;
       padding: 20px;
-      border: 1px solid rgba(242, 106, 27, 0.28);
+      border: 1px solid var(--line);
+      border-radius: 20px;
       background: var(--surface);
     }
 
@@ -202,6 +280,13 @@
 
     body.recovering .status,
     body.recovering .error { display: none; }
+
+    body.recovering { overflow: auto; }
+
+    body.recovering .boot {
+      width: min(760px, calc(100vw - 48px));
+      margin-block: 32px;
+    }
 
     .recovery h2 {
       margin: 0;
@@ -266,6 +351,7 @@
       font: inherit;
       font-size: 12px;
       padding: 0 9px;
+      border-radius: 9px;
     }
 
     .check-row {
@@ -301,7 +387,7 @@
     }
 
     .error p {
-      color: #75584f;
+      color: var(--muted);
       font-size: 13px;
       line-height: 1.45;
       margin: 0;
@@ -323,31 +409,67 @@
       cursor: pointer;
       font: inherit;
       font-size: 12px;
-      font-weight: 720;
+      font-weight: 620;
       padding: 0 12px;
+      border-radius: 9px;
+      transition: filter 160ms ease, transform 160ms ease, background 160ms ease;
+    }
+
+    button:not(:disabled):hover {
+      filter: brightness(0.97);
+    }
+
+    button:not(:disabled):active {
+      transform: scale(0.98);
     }
 
     button.primary {
       border-color: var(--accent);
       background: var(--accent);
       color: #fff;
+      box-shadow: 0 6px 18px -10px var(--accent);
     }
 
     @keyframes progress {
-      0% { transform: translateX(-110%); opacity: 0.35; }
-      24% { opacity: 1; }
-      100% { transform: translateX(270%); opacity: 0.45; }
+      0% { transform: translateX(-115%); opacity: 0.35; }
+      28%, 68% { opacity: 1; }
+      100% { transform: translateX(250%); opacity: 0.35; }
+    }
+
+    @keyframes loader-segment {
+      0%, 12.5% {
+        background: var(--accent);
+        opacity: 1;
+        box-shadow: 0 0 8px var(--accent-soft);
+      }
+      37.5% { opacity: 0.34; }
+      100% {
+        background: var(--muted);
+        opacity: 0.12;
+        box-shadow: none;
+      }
+    }
+
+    @keyframes loader-core {
+      0%, 100% { transform: scale(0.82); opacity: 0.5; }
+      50% { transform: scale(1); opacity: 1; }
     }
 
     @media (max-width: 560px) {
-      .shell { padding: 28px; }
+      .shell { padding: 16px; }
+      .boot {
+        width: min(100%, 476px);
+        padding: 36px 22px 24px;
+        border-radius: 24px;
+      }
       .status-copy {
         align-items: flex-start;
         flex-direction: column;
         gap: 6px;
       }
-      .steps {
-        grid-template-columns: 1fr;
+      body.recovering .boot {
+        width: calc(100vw - 24px);
+        margin-block: 12px;
       }
     }
 
@@ -365,7 +487,16 @@
     <main class="boot" aria-label="OpenSquilla startup" data-i18n-aria="bootAria">
       <section class="brand">
         <div class="mark-row">
-          <span class="mark" aria-hidden="true"></span>
+          <span class="loader" aria-hidden="true">
+            <span style="--i: 0"></span>
+            <span style="--i: 1"></span>
+            <span style="--i: 2"></span>
+            <span style="--i: 3"></span>
+            <span style="--i: 4"></span>
+            <span style="--i: 5"></span>
+            <span style="--i: 6"></span>
+            <span style="--i: 7"></span>
+          </span>
           <h1>OpenSquilla</h1>
         </div>
         <p class="subtitle" data-i18n="subtitle">Starting the desktop control surface.</p>

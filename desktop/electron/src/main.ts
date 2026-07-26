@@ -6204,7 +6204,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
     // Paint the window in the app's base color from the first frame so launch
     // never flashes white before the splash/app paints. The app theme defaults
     // to 'system', so match the OS; these are the base.css --bg tokens.
-    backgroundColor: nativeTheme.shouldUseDarkColors ? '#08080A' : '#F7F6F3',
+    backgroundColor: nativeTheme.shouldUseDarkColors ? '#18181A' : '#F7F7F8',
     webPreferences: {
       preload: join(__dirname, 'preload.cjs'),
       contextIsolation: true,
