@@ -83,6 +83,9 @@ def test_sandbox_status_reports_run_mode(tmp_path: Path) -> None:
     assert payload["run_mode"] == "trusted"
     assert payload["run_mode_label"] == "Managed Execution"
     assert payload["execution_target"] == "sandbox"
+    assert payload["project_default_run_mode"] == "trusted"
+    assert payload["runtime_capability_run_mode"] == "trusted"
+    assert payload["runtime_sandbox_required"] is True
 
     data = tomllib.loads(config_path.read_text(encoding="utf-8"))
     assert data["sandbox"]["run_mode"] == "trusted"

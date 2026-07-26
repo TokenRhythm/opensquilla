@@ -6,7 +6,14 @@ from typing import Any
 
 from opensquilla.sandbox.default_allowlist import default_allowlist_payload
 from opensquilla.sandbox.package_bundles import PACKAGE_BUNDLES
-from opensquilla.sandbox.run_mode import config_run_mode, display_name, execution_target
+from opensquilla.sandbox.run_mode import (
+    RunMode,
+    config_run_mode,
+    display_name,
+    execution_target,
+    project_default_run_mode,
+    sandbox_runtime_capability_mode,
+)
 
 
 def posture(config: Any) -> str:
@@ -15,6 +22,8 @@ def posture(config: Any) -> str:
 
 def status_payload(config: Any, *, restart_required: bool = False) -> dict[str, Any]:
     run_mode = config_run_mode(config)
+    project_default = project_default_run_mode(config)
+    runtime_capability = sandbox_runtime_capability_mode(config)
     sandbox_cfg = config.sandbox
     network_default = str(getattr(sandbox_cfg, "network_default", "none"))
     target = execution_target(run_mode)
@@ -34,6 +43,9 @@ def status_payload(config: Any, *, restart_required: bool = False) -> dict[str, 
         "run_mode": run_mode.value,
         "run_mode_label": display_name(run_mode),
         "execution_target": target,
+        "project_default_run_mode": project_default.value,
+        "runtime_capability_run_mode": runtime_capability.value,
+        "runtime_sandbox_required": runtime_capability is not RunMode.FULL,
         "posture": run_mode.value,
         "backend": str(getattr(sandbox_cfg, "backend", "auto")),
         "managed_network": managed_network,

@@ -1054,13 +1054,18 @@ async def _ensure_sandbox_setup_on_boot(config: GatewayConfig) -> Any | None:
 def _sandbox_settings_for_runtime(config: GatewayConfig) -> Any:
     """Return sandbox settings normalized to the config-level run mode."""
 
-    from opensquilla.sandbox.run_mode import RunMode, config_run_mode, run_mode_config_patch
+    from opensquilla.sandbox.run_mode import (
+        RunMode,
+        config_run_mode,
+        run_mode_config_patch,
+        sandbox_runtime_capability_mode,
+    )
 
-    mode = config_run_mode(config)
-    if mode != RunMode.FULL:
+    configured = config_run_mode(config)
+    if configured in {RunMode.STANDARD, RunMode.TRUSTED}:
         return config.sandbox
 
-    patch = run_mode_config_patch(mode)
+    patch = run_mode_config_patch(sandbox_runtime_capability_mode(config))
     return config.sandbox.model_copy(
         update={
             "run_mode": patch.run_mode.value,
@@ -2261,11 +2266,13 @@ async def build_services(
     # through the ``@sandboxed`` decorator.
     try:
         from opensquilla.sandbox.integration import configure_runtime
+        from opensquilla.sandbox.run_mode import config_run_mode
 
         sandbox_settings = _sandbox_settings_for_runtime(config)
         effective = configure_runtime(
             sandbox_settings,
             workspace=Path(config.workspace_dir) if config.workspace_dir else None,
+            default_run_mode=config_run_mode(config),
         )
         log.info(
             "build_services.sandbox_ready",

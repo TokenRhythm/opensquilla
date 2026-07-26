@@ -13,6 +13,16 @@ _VALID_RUN_MODES = frozenset({"standard", "trusted", "full"})
 def full_host_access_for_context(ctx: object | None) -> bool:
     """Return Full Host Access state without consulting approval storage."""
 
+    runtime = None
+    try:
+        from opensquilla.sandbox.integration import get_runtime
+
+        runtime = get_runtime()
+    except Exception:
+        pass
+    if runtime is not None and not runtime.effective.sandbox_enabled:
+        return True
+
     if ctx is not None:
         mode = getattr(ctx, "run_mode", None)
         mode_value = getattr(mode, "value", mode)
@@ -24,13 +34,9 @@ def full_host_access_for_context(ctx: object | None) -> bool:
             return run_context_mode_value == "full"
         if getattr(ctx, "elevated", None) == "full":
             return True
-    try:
-        from opensquilla.sandbox.integration import get_runtime
-
-        runtime = get_runtime()
-    except Exception:
-        return False
-    return bool(runtime is not None and not runtime.effective.sandbox_enabled)
+    return bool(
+        runtime is not None and getattr(runtime, "default_run_mode", None) == "full"
+    )
 
 
 def current_run_mode() -> str | None:

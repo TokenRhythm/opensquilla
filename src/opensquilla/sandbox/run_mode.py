@@ -140,6 +140,30 @@ def _field_was_set(model: Any, field_name: str) -> bool:
     return field_name in fields_set if fields_set is not None else False
 
 
+def _full_mode_is_explicit(config: Any) -> bool:
+    sandbox = getattr(config, "sandbox", None)
+    permissions = getattr(config, "permissions", None)
+    if getattr(sandbox, "run_mode", None) is not None:
+        return normalize_run_mode(sandbox.run_mode) is RunMode.FULL
+    if _field_was_set(sandbox, "sandbox") and not bool(sandbox.sandbox):
+        return True
+    return str(getattr(permissions, "default_mode", "")).strip().lower() == "full"
+
+
+def project_default_run_mode(config: Any) -> RunMode:
+    configured = config_run_mode(config)
+    if configured is not RunMode.FULL or _full_mode_is_explicit(config):
+        return configured
+    return RunMode.STANDARD
+
+
+def sandbox_runtime_capability_mode(config: Any) -> RunMode:
+    configured = config_run_mode(config)
+    if configured is RunMode.FULL and not _full_mode_is_explicit(config):
+        return RunMode.STANDARD
+    return configured
+
+
 __all__ = [
     "RunMode",
     "RunModeConfigPatch",
@@ -149,5 +173,7 @@ __all__ = [
     "execution_target",
     "legacy_state_to_run_mode",
     "normalize_run_mode",
+    "project_default_run_mode",
     "run_mode_config_patch",
+    "sandbox_runtime_capability_mode",
 ]

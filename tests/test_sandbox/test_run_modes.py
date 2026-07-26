@@ -4,6 +4,7 @@ import types
 
 import pytest
 
+from opensquilla.gateway.config import PermissionsConfig
 from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.sandbox.run_mode import (
     RunMode,
@@ -12,8 +13,11 @@ from opensquilla.sandbox.run_mode import (
     execution_target,
     legacy_state_to_run_mode,
     normalize_run_mode,
+    project_default_run_mode,
     run_mode_config_patch,
+    sandbox_runtime_capability_mode,
 )
+from opensquilla.sandbox.status import status_payload
 
 
 def test_sandbox_defaults_to_root_readonly_and_auto_review() -> None:
@@ -172,3 +176,85 @@ def test_normalize_run_mode_accepts_user_facing_spellings() -> None:
     assert normalize_run_mode("standard-sandbox") == RunMode.STANDARD
     assert normalize_run_mode("trusted") == RunMode.TRUSTED
     assert normalize_run_mode("full-host-access") == RunMode.FULL
+
+
+def test_bare_config_keeps_ordinary_full_but_project_is_standard() -> None:
+    config = types.SimpleNamespace(
+        sandbox=SandboxSettings(),
+        permissions=PermissionsConfig(),
+    )
+
+    assert config_run_mode(config) is RunMode.FULL
+    assert project_default_run_mode(config) is RunMode.STANDARD
+    assert sandbox_runtime_capability_mode(config) is RunMode.STANDARD
+
+
+@pytest.mark.parametrize(
+    ("sandbox", "permissions", "expected"),
+    [
+        (SandboxSettings(run_mode="full"), PermissionsConfig(), RunMode.FULL),
+        (
+            SandboxSettings(sandbox=False, security_grading=False),
+            PermissionsConfig(),
+            RunMode.FULL,
+        ),
+        (
+            SandboxSettings(),
+            PermissionsConfig(default_mode="full"),
+            RunMode.FULL,
+        ),
+        (SandboxSettings(run_mode="standard"), PermissionsConfig(), RunMode.STANDARD),
+        (SandboxSettings(run_mode="trusted"), PermissionsConfig(), RunMode.TRUSTED),
+    ],
+)
+def test_project_mode_preserves_explicit_operator_choice(
+    sandbox: SandboxSettings,
+    permissions: PermissionsConfig,
+    expected: RunMode,
+) -> None:
+    config = types.SimpleNamespace(sandbox=sandbox, permissions=permissions)
+
+    assert project_default_run_mode(config) is expected
+
+
+@pytest.mark.parametrize(
+    ("sandbox", "permissions", "expected"),
+    [
+        (SandboxSettings(run_mode="full"), PermissionsConfig(), ("full", "full", "full", False)),
+        (
+            SandboxSettings(run_mode="standard"),
+            PermissionsConfig(),
+            ("standard", "standard", "standard", True),
+        ),
+    ],
+)
+def test_status_payload_distinguishes_default_policy_from_runtime_capability(
+    sandbox: SandboxSettings,
+    permissions: PermissionsConfig,
+    expected: tuple[str, str, str, bool],
+) -> None:
+    config = types.SimpleNamespace(sandbox=sandbox, permissions=permissions)
+
+    payload = status_payload(config)
+
+    assert (
+        payload["run_mode"],
+        payload["project_default_run_mode"],
+        payload["runtime_capability_run_mode"],
+        payload["runtime_sandbox_required"],
+    ) == expected
+
+
+def test_bare_config_status_reports_full_ordinary_default_and_standard_capability() -> None:
+    config = types.SimpleNamespace(
+        sandbox=SandboxSettings(),
+        permissions=PermissionsConfig(),
+    )
+
+    payload = status_payload(config)
+
+    assert payload["run_mode"] == "full"
+    assert payload["execution_target"] == "host"
+    assert payload["project_default_run_mode"] == "standard"
+    assert payload["runtime_capability_run_mode"] == "standard"
+    assert payload["runtime_sandbox_required"] is True

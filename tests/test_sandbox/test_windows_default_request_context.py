@@ -7,6 +7,8 @@ from opensquilla.sandbox.integration import build_request, configure_runtime, re
 from opensquilla.sandbox.policy import build_policy
 from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.sandbox.types import NetworkMode, SecurityLevel
+from opensquilla.tools.run_mode import full_host_access_for_context
+from opensquilla.tools.types import ToolContext, current_tool_context
 
 
 class _FakeApprovalQueue:
@@ -47,6 +49,52 @@ def test_build_request_uses_runtime_run_mode_when_no_context(tmp_path: Path) -> 
     )
 
     assert request.run_mode == RunMode.TRUSTED.value
+
+
+def test_hybrid_runtime_uses_full_without_context_and_standard_with_context(
+    tmp_path: Path,
+) -> None:
+    try:
+        runtime = configure_runtime(
+            SandboxSettings(
+                run_mode="standard",
+                backend="noop",
+                allow_legacy_mode=True,
+            ),
+            default_run_mode=RunMode.FULL,
+            workspace=tmp_path,
+        )
+        assert runtime.default_run_mode is RunMode.FULL
+        policy = build_policy(
+            SecurityLevel.STANDARD,
+            "shell.exec",
+            tmp_path,
+            runtime.settings,
+            trusted=True,
+        )
+        request = build_request(
+            action_kind="shell.exec",
+            argv=("cmd", "/c", "echo ok"),
+            cwd=tmp_path,
+            policy=policy,
+        )
+        assert request.run_mode == RunMode.FULL.value
+        assert full_host_access_for_context(None) is True
+        standard_ctx = ToolContext(run_mode="standard")
+        assert full_host_access_for_context(standard_ctx) is False
+        token = current_tool_context.set(standard_ctx)
+        try:
+            standard_request = build_request(
+                action_kind="shell.exec",
+                argv=("cmd", "/c", "echo standard"),
+                cwd=tmp_path,
+                policy=policy,
+            )
+        finally:
+            current_tool_context.reset(token)
+        assert standard_request.run_mode == RunMode.STANDARD.value
+    finally:
+        reset_runtime()
 
 
 def test_managed_network_env_preserves_run_mode(tmp_path: Path) -> None:

@@ -52,7 +52,7 @@ def test_saved_route_run_mode_wins_over_later_global_full_default() -> None:
     assert ctx.elevated is None
 
 
-def test_explicit_standard_context_disables_global_full_fallback(monkeypatch) -> None:
+def test_disabled_runtime_makes_stale_standard_context_resolve_to_full(monkeypatch) -> None:
     from opensquilla.sandbox import integration
 
     monkeypatch.setattr(
@@ -61,7 +61,35 @@ def test_explicit_standard_context_disables_global_full_fallback(monkeypatch) ->
         lambda: type(
             "Runtime",
             (),
-            {"effective": type("Effective", (), {"sandbox_enabled": False})()},
+            {
+                "effective": type("Effective", (), {"sandbox_enabled": False})(),
+                "default_run_mode": RunMode.FULL,
+            },
+        )(),
+    )
+    ctx = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.CLI,
+        session_key="standard-session",
+        run_mode="standard",
+    )
+
+    assert full_host_access_for_context(ctx) is True
+
+
+def test_enabled_runtime_keeps_valid_standard_context_over_full_default(monkeypatch) -> None:
+    from opensquilla.sandbox import integration
+
+    monkeypatch.setattr(
+        integration,
+        "get_runtime",
+        lambda: type(
+            "Runtime",
+            (),
+            {
+                "effective": type("Effective", (), {"sandbox_enabled": True})(),
+                "default_run_mode": RunMode.FULL,
+            },
         )(),
     )
     ctx = ToolContext(

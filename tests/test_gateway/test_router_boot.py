@@ -38,6 +38,8 @@ from opensquilla.gateway.model_routing import (
 from opensquilla.gateway.routing import build_cli_route_envelope, build_cron_route_envelope
 from opensquilla.onboarding.mutations import upsert_channel
 from opensquilla.provider import Message
+from opensquilla.sandbox.config import SandboxSettings
+from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.scheduler.types import CronJob, JobStatus
 from opensquilla.session.compaction import CompactionConfig
 from opensquilla.session.manager import SessionManager
@@ -631,20 +633,20 @@ async def test_service_container_close_cancels_owned_sandbox_setup_task() -> Non
 
 
 @pytest.mark.asyncio
-async def test_build_services_normalizes_default_full_host_access_for_sandbox_runtime(
+async def test_bare_full_default_boots_standard_capability(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     from opensquilla.gateway import boot
 
-    captured_settings: list[Any] = []
+    captured: list[tuple[SandboxSettings, RunMode]] = []
 
-    def fake_configure_runtime(settings: Any, **kwargs: Any) -> Any:
-        captured_settings.append(settings)
+    def fake_configure_runtime(settings: SandboxSettings, **kwargs: Any) -> Any:
+        captured.append((settings, kwargs["default_run_mode"]))
         return SimpleNamespace(
             effective=SimpleNamespace(
-                sandbox_enabled=False,
-                as_dict=lambda: {"sandbox_enabled": False},
+                sandbox_enabled=True,
+                as_dict=lambda: {"sandbox_enabled": True},
             )
         )
 
@@ -666,12 +668,12 @@ async def test_build_services_normalizes_default_full_host_access_for_sandbox_ru
         seed_agent_workspaces=False,
     )
     try:
-        assert len(captured_settings) == 1
-        runtime_settings = captured_settings[0]
-        assert runtime_settings.run_mode == "full"
-        assert runtime_settings.sandbox is False
-        assert runtime_settings.security_grading is False
-        assert runtime_settings.network_default == "none"
+        settings, default_mode = captured[0]
+        assert settings.run_mode == "standard"
+        assert settings.sandbox is True
+        assert settings.security_grading is True
+        assert settings.network_default == "proxy_allowlist"
+        assert default_mode is RunMode.FULL
     finally:
         await services.close()
 

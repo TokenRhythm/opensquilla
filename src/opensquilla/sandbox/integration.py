@@ -161,6 +161,7 @@ class SandboxRuntime:
     cache: StaleOutputCache
     workspace: Path
     approval_queue: Any
+    default_run_mode: RunMode
 
 
 @dataclass(frozen=True)
@@ -181,6 +182,7 @@ def configure_runtime(
     approval_queue: _ApprovalQueueLike | None = None,
     stale_cache: StaleOutputCache | None = None,
     workspace: Path | None = None,
+    default_run_mode: RunMode | str | None = None,
 ) -> SandboxRuntime:
     """Build the process-wide :class:`SandboxRuntime`.
 
@@ -190,6 +192,11 @@ def configure_runtime(
     """
     global _runtime
 
+    request_default = (
+        normalize_run_mode(default_run_mode)
+        if default_run_mode is not None
+        else normalize_run_mode(settings.run_mode)
+    )
     effective = settings.validate_combination()
     cache = stale_cache if stale_cache is not None else get_stale_output_cache()
     ledger = DenialLedger(
@@ -237,6 +244,7 @@ def configure_runtime(
         cache=cache,
         workspace=ws,
         approval_queue=queue,
+        default_run_mode=request_default,
     )
     log.info(
         "sandbox.runtime_configured: backend=%s level=%s grading=%s insecure=%s",
@@ -411,7 +419,7 @@ def _resolve_request_run_mode(runtime: SandboxRuntime | None) -> str:
     if isinstance(context, RunContext):
         return context.run_mode.value
     if runtime is not None:
-        return normalize_run_mode(runtime.settings.run_mode).value
+        return runtime.default_run_mode.value
     return RunMode.FULL.value
 
 
@@ -821,7 +829,7 @@ async def gate_action(
         session_mounts=_session_mounts_for_policy(workspace),
     )
     run_context = current_tool_run_context()
-    configured_mode = getattr(rt.settings, "run_mode", None)
+    configured_mode = rt.default_run_mode
     try:
         from opensquilla.tools.run_mode import current_run_mode
 
@@ -2040,9 +2048,7 @@ def _runtime_is_full_host_access(runtime: SandboxRuntime) -> bool:
     context = current_tool_run_context()
     if context is not None:
         return context.run_mode == RunMode.FULL
-    if runtime.settings.run_mode is not None:
-        return normalize_run_mode(runtime.settings.run_mode) == RunMode.FULL
-    return False
+    return runtime.default_run_mode == RunMode.FULL
 
 
 __all__ = [
