@@ -140,6 +140,8 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_tools/test_edit_file_closest_hint.py",
     "tests/test_tools/test_patch_classification.py",
     "tests/test_tools/test_repeated_call_notice.py",
+    "tests/test_tools/test_admin_audio_config.py",
+    "tests/test_tools/test_admin_gateway_contract.py",
     "tests/test_tools/test_run_mode_full_host_fallback.py",
     "tests/test_tools/test_update_plan.py",
     "tests/test_tools/test_workspace_write_deny_effects.py",
