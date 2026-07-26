@@ -1308,6 +1308,178 @@ async def test_project_turn_fresh_mode_controls_real_filesystem_and_network_enfo
         assert target.read_text(encoding="utf-8") == "guarded"
 
 
+@pytest.mark.asyncio
+async def test_runtime_send_rehydrates_unbound_session_before_real_enforcement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.sandbox.escalation import (
+        current_tool_run_context,
+        reset_resolved_run_context_overlays,
+    )
+    from opensquilla.sandbox.network_guard import decide_network_access
+    from opensquilla.sandbox.operation_runtime import SandboxOperationResult
+    from opensquilla.sandbox.run_context import RunContext
+    from opensquilla.tools.builtin import filesystem
+    from opensquilla.tools.types import current_tool_context
+
+    reset_resolved_run_context_overlays()
+    storage = await SessionStorage.open(str(tmp_path / "runtime-send.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    workspace = tmp_path / "unbound-workspace"
+    workspace.mkdir()
+    key = "agent:main:webchat:runtime-send-rehydrate"
+    full_context = RunContext(
+        run_mode=RunMode.FULL,
+        workspace=str(workspace),
+        run_mode_source="user",
+        source="saved",
+    )
+    standard_context = RunContext(
+        run_mode=RunMode.STANDARD,
+        workspace=str(workspace),
+        run_mode_source="user",
+        source="saved",
+    )
+    await manager.create(
+        key,
+        origin={RUN_CONTEXT_ORIGIN_KEY: full_context.to_origin_payload()},
+    )
+
+    backend_operations: list[Any] = []
+
+    class RecordingFilesystemBackend:
+        name = "recording-filesystem"
+
+        def operation_domains_supported(self) -> frozenset[str]:
+            return frozenset({"filesystem"})
+
+        async def run_operation(self, operation: Any) -> SandboxOperationResult:
+            backend_operations.append(operation)
+            request = operation.request
+            assert request.path is not None
+            request.path.write_text(request.content, encoding="utf-8")
+            return SandboxOperationResult(
+                message=f"sandboxed write: {request.path}",
+                created=True,
+            )
+
+    monkeypatch.setattr(
+        filesystem,
+        "get_runtime",
+        lambda: SimpleNamespace(
+            effective=SimpleNamespace(sandbox_enabled=True),
+            backend=RecordingFilesystemBackend(),
+            settings=SimpleNamespace(host_root_readonly=False),
+            workspace=workspace,
+        ),
+    )
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    observations: list[dict[str, Any]] = []
+
+    class Runner:
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            index = len(observations)
+            tool_context = kwargs["tool_context"]
+            token = current_tool_context.set(tool_context)
+            try:
+                effective = current_tool_run_context()
+                assert effective is not None
+                target = workspace / f"runtime-send-{index}.txt"
+                write_result = await filesystem.write_file(
+                    str(target),
+                    f"turn-{index}",
+                )
+                observations.append(
+                    {
+                        "mode": effective.run_mode.value,
+                        "fresh": bool(
+                            getattr(
+                                tool_context,
+                                "_sandbox_run_context_fresh",
+                                False,
+                            )
+                        ),
+                        "network": decide_network_access(
+                            "runtime-send-unknown.example",
+                            effective,
+                        ),
+                        "write_result": write_result,
+                        "target": target,
+                    }
+                )
+            finally:
+                current_tool_context.reset(token)
+            if index == 0:
+                first_started.set()
+                await release_first.wait()
+            yield DoneEvent()
+
+    config = GatewayConfig(
+        workspace_dir=str(workspace),
+        memory={"flush_enabled": False},
+        naming={"enabled": False},
+        agent_stream_heartbeat_interval_seconds=0.0,
+        agent_stream_idle_timeout_seconds=1.0,
+    )
+
+    async def handle(run: Any) -> None:
+        await dispatch_task_runtime_turn(
+            run,
+            config=config,
+            session_manager=manager,
+            turn_runner=Runner(),
+            event_emitter=AsyncMock(),
+        )
+
+    runtime = TaskRuntime(
+        storage=storage,
+        turn_handler=handle,
+        max_concurrency=1,
+        running_heartbeat_interval_s=None,
+    )
+    envelope = build_cli_route_envelope(
+        session_key=key,
+        agent_id="main",
+        principal_is_owner=True,
+        run_mode="full",
+    )
+    envelope.metadata["sandbox_run_context"] = full_context.to_origin_payload()
+    object.__setattr__(envelope, "sandbox_run_context_fresh", True)
+
+    try:
+        first = await runtime.enqueue(envelope, "first")
+        await asyncio.wait_for(first_started.wait(), timeout=2.0)
+        cached_after_first = runtime._last_envelope_by_session[key]
+        await manager.update(
+            key,
+            origin={RUN_CONTEXT_ORIGIN_KEY: standard_context.to_origin_payload()},
+        )
+        followup = await runtime.send(key, "followup")
+        release_first.set()
+        assert (await runtime.wait(first.task_id, timeout=2.0)).status == "succeeded"
+        assert (await runtime.wait(followup.task_id, timeout=2.0)).status == "succeeded"
+
+        assert [item["mode"] for item in observations] == ["full", "standard"]
+        assert [item["network"].status for item in observations] == ["allow", "ask"]
+        assert [item["network"].reason for item in observations] == [
+            "full_host_access",
+            "unknown_domain",
+        ]
+        assert len(backend_operations) == 1
+        assert observations[0]["target"].read_text(encoding="utf-8") == "turn-0"
+        assert observations[1]["target"].read_text(encoding="utf-8") == "turn-1"
+        assert cached_after_first.sandbox_run_context_fresh is False
+        assert cached_after_first.metadata is not envelope.metadata
+        assert key not in runtime._last_envelope_by_session
+    finally:
+        release_first.set()
+        await runtime.shutdown(cancel=True, timeout=2.0)
+        await storage.close()
+        reset_resolved_run_context_overlays()
+
+
 def test_only_trusted_envelope_freshness_reaches_tool_context() -> None:
     from opensquilla.gateway.routing import tool_context_from_envelope
     from opensquilla.sandbox.run_context import RunContext

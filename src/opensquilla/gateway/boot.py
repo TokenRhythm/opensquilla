@@ -1133,7 +1133,7 @@ async def dispatch_task_runtime_turn(
         if session is None:
             raise KeyError(f"Session not found: {run.session_key}")
         try:
-            run_context, workspace_guard = await authoritative_project_run_context(
+            run_context, _workspace_guard = await authoritative_project_run_context(
                 storage=storage,
                 session_manager=session_manager,
                 session=session,
@@ -1156,20 +1156,20 @@ async def dispatch_task_runtime_turn(
                 },
             )
             raise
-        if workspace_guard is not None:
-            from opensquilla.gateway.rpc_sessions import (
-                _apply_run_context_route_metadata,
-            )
+        from opensquilla.gateway.rpc_sessions import (
+            _apply_run_context_route_metadata,
+        )
 
-            run_context = apply_accepted_run_mode_override(
-                run_context,
-                getattr(run, "accepted_run_mode_override", None),
-            )
-            _apply_run_context_route_metadata(
-                run.envelope,
-                run_context,
-                principal_is_owner=_task_runtime_envelope_owner(run.envelope),
-            )
+        run_context = apply_accepted_run_mode_override(
+            run_context,
+            getattr(run, "accepted_run_mode_override", None),
+        )
+        _apply_run_context_route_metadata(
+            run.envelope,
+            run_context,
+            principal_is_owner=_task_runtime_envelope_owner(run.envelope),
+        )
+        if run_context.workspace is not None:
             workspace_dir = run_context.workspace
     workspace_strict = getattr(config, "workspace_strict", None)
     if not isinstance(workspace_strict, bool):

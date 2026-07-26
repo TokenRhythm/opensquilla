@@ -948,7 +948,12 @@ async def test_older_terminal_task_keeps_newer_route_envelope_cached() -> None:
     await asyncio.wait_for(first_started.wait(), timeout=1.0)
     second = await rt.enqueue(second_envelope, "second")
     second_runtime_task = rt._tasks[second.task_id]
-    assert rt._last_envelope_by_session[session_key] is second_runtime_task.envelope
+    cached = rt._last_envelope_by_session[session_key]
+    assert cached == second_runtime_task.envelope
+    assert cached is not second_runtime_task.envelope
+    assert cached.metadata is not second_runtime_task.envelope.metadata
+    assert cached.sandbox_run_context_fresh is False
+    assert rt._last_envelope_task_id_by_session[session_key] == second.task_id
 
     release_first.set()
     await rt.wait(first.task_id, timeout=1.0)
@@ -956,11 +961,13 @@ async def test_older_terminal_task_keeps_newer_route_envelope_cached() -> None:
 
     # The older task may clean up only the envelope it installed. The newer
     # task's route remains available to TaskRuntime.send until that task ends.
-    assert rt._last_envelope_by_session[session_key] is second_runtime_task.envelope
+    assert rt._last_envelope_by_session[session_key] is cached
+    assert rt._last_envelope_task_id_by_session[session_key] == second.task_id
 
     release_second.set()
     await rt.wait(second.task_id, timeout=1.0)
     assert session_key not in rt._last_envelope_by_session
+    assert session_key not in rt._last_envelope_task_id_by_session
 
 
 # ---------------------------------------------------------------------------

@@ -100,6 +100,16 @@ def _task_identity_payload(
     return payload
 
 
+def _reusable_route_envelope(envelope: RouteEnvelope) -> RouteEnvelope:
+    """Detach one route for reuse without execution-scoped freshness."""
+
+    return replace(
+        envelope,
+        metadata=dict(envelope.metadata),
+        sandbox_run_context_fresh=False,
+    )
+
+
 @dataclass(frozen=True)
 class TaskHandle:
     task_id: str
@@ -515,6 +525,7 @@ class TaskRuntime:
         self._reservations_by_session: dict[str, list[TaskReservation]] = {}
         self._reserved_overflow_victims: set[str] = set()
         self._last_envelope_by_session: dict[str, RouteEnvelope] = {}
+        self._last_envelope_task_id_by_session: dict[str, str] = {}
         self._state_lock = asyncio.Lock()
         # Admission is per session so durable RPC ingress crosses reserve,
         # commit, and activation in order. This prevents resets from overtaking
@@ -1055,7 +1066,12 @@ class TaskRuntime:
                 active.add(session_key)
                 rr.append(session_key)
             if reservation.update_envelope_cache:
-                self._last_envelope_by_session[session_key] = runtime_task.envelope
+                self._last_envelope_by_session[session_key] = (
+                    _reusable_route_envelope(runtime_task.envelope)
+                )
+                self._last_envelope_task_id_by_session[session_key] = (
+                    runtime_task.task_id
+                )
             runtime_task.asyncio_task = asyncio.create_task(self._execute(runtime_task))
             reservation.activated = True
             queue_depth = len(self._pending_by_session.get(session_key, []))
@@ -1295,6 +1311,7 @@ class TaskRuntime:
                 run_kind="runtime_send",
                 stream_event_sink=stream_event_sink,
             )
+        cached = _reusable_route_envelope(cached)
         if provenance is None:
             return await self.enqueue(
                 cached,
@@ -1336,7 +1353,7 @@ class TaskRuntime:
             input_provenance=provenance or envelope.input_provenance,
         )
         return await self.enqueue(
-            routed,
+            _reusable_route_envelope(routed),
             message,
             mode="followup",
             stream_event_sink=stream_event_sink,
@@ -2034,7 +2051,9 @@ class TaskRuntime:
                 "turn_context_revision": 2,
             }
         )
-        envelope = replace(completed_task.envelope, metadata=metadata)
+        envelope = _reusable_route_envelope(
+            replace(completed_task.envelope, metadata=metadata)
+        )
         message = "\n\n".join(item.text for item in items if item.text.strip())
         semantic_parts = [
             item.semantic_message or item.text for item in items if item.text.strip()
@@ -2511,8 +2530,17 @@ class TaskRuntime:
             self._remove_pending(task)
             if self._running_by_session.get(task.envelope.session_key) is task:
                 self._running_by_session.pop(task.envelope.session_key, None)
-            if self._last_envelope_by_session.get(task.envelope.session_key) is task.envelope:
+            if (
+                self._last_envelope_task_id_by_session.get(
+                    task.envelope.session_key
+                )
+                == task.task_id
+            ):
                 self._last_envelope_by_session.pop(task.envelope.session_key, None)
+                self._last_envelope_task_id_by_session.pop(
+                    task.envelope.session_key,
+                    None,
+                )
             # Keep the short write lock stable for this session. Popping it can
             # split callers across old/new lock objects while callbacks or
             # late lifecycle events still reference the old one. The dict grows

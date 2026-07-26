@@ -3230,6 +3230,158 @@ async def test_project_network_once_consumption_preserves_authoritative_overlay(
 
 
 @pytest.mark.asyncio
+async def test_same_root_once_rw_overlay_writes_then_expiry_restores_base_ro(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.sandbox.escalation import (
+        current_tool_run_context,
+        prune_once_mount_grants,
+        remember_resolved_run_context,
+        reset_resolved_run_context_overlays,
+    )
+    from opensquilla.sandbox.operation_runtime import SandboxOperationResult
+    from opensquilla.sandbox.run_context import (
+        DomainGrant,
+        MountGrant,
+        PackageBundleGrant,
+        RunContext,
+    )
+    from opensquilla.sandbox.run_mode import RunMode
+    from opensquilla.tools.builtin import filesystem
+    from opensquilla.tools.types import ToolContext, current_tool_context
+
+    reset_resolved_run_context_overlays()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    mounted = tmp_path / "mounted"
+    mounted.mkdir()
+    session_key = "agent:main:webchat:mount-precedence"
+    shared_domain = DomainGrant(
+        domain="same-root.example",
+        scope="chat",
+        source="manual",
+    )
+    shared_bundle = PackageBundleGrant(
+        bundle_id="python-package-install",
+        scope="chat",
+        source="manual",
+    )
+    base = RunContext(
+        run_mode=RunMode.STANDARD,
+        workspace=str(workspace),
+        mounts=(
+            MountGrant(
+                path=f"{mounted}{os.sep}.{os.sep}",
+                access="ro",
+                scope="chat",
+            ),
+        ),
+        domains=(shared_domain,),
+        bundles=(shared_bundle,),
+        source="saved",
+    )
+    overlay_root = str(mounted.resolve())
+    if os.name == "nt":
+        overlay_root = overlay_root.swapcase()
+    remember_resolved_run_context(
+        session_key,
+        str(workspace),
+        RunContext(
+            run_mode=RunMode.FULL,
+            workspace=str(workspace),
+            mounts=(
+                MountGrant(
+                    path=overlay_root,
+                    access="rw",
+                    scope="once",
+                ),
+            ),
+            domains=(shared_domain,),
+            bundles=(shared_bundle,),
+            source="resolved_overlay",
+        ),
+    )
+    backend_operations: list[object] = []
+
+    class RecordingFilesystemBackend:
+        name = "recording-filesystem"
+
+        def operation_domains_supported(self) -> frozenset[str]:
+            return frozenset({"filesystem"})
+
+        async def run_operation(self, operation: object) -> SandboxOperationResult:
+            backend_operations.append(operation)
+            request = operation.request
+            assert request.path is not None
+            request.path.write_text(request.content, encoding="utf-8")
+            return SandboxOperationResult(
+                message=f"sandboxed write: {request.path}",
+                created=True,
+            )
+
+    monkeypatch.setattr(
+        filesystem,
+        "get_runtime",
+        lambda: SimpleNamespace(
+            effective=SimpleNamespace(sandbox_enabled=True),
+            backend=RecordingFilesystemBackend(),
+            settings=SimpleNamespace(host_root_readonly=False),
+            workspace=workspace,
+        ),
+    )
+    tool_context = ToolContext(
+        is_owner=True,
+        session_key=session_key,
+        workspace_dir=str(workspace),
+        sandbox_run_context=base,
+    )
+    setattr(tool_context, "_sandbox_run_context_fresh", True)
+    token = current_tool_context.set(tool_context)
+    try:
+        allowed_target = mounted / "allowed.txt"
+        allowed_result = await filesystem.write_file(
+            str(allowed_target),
+            "allowed",
+        )
+        assert allowed_result == f"sandboxed write: {allowed_target}"
+        assert allowed_target.read_text(encoding="utf-8") == "allowed"
+        assert len(backend_operations) == 1
+
+        active = current_tool_run_context()
+        assert active is not None
+        assert [(grant.access, grant.scope) for grant in active.mounts] == [
+            ("rw", "once")
+        ]
+        assert active.domains == (shared_domain,)
+        assert active.bundles == (shared_bundle,)
+
+        assert prune_once_mount_grants(session_key) == 1
+        expired = current_tool_run_context()
+        assert expired is not None
+        assert [(grant.access, grant.scope) for grant in expired.mounts] == [
+            ("ro", "chat")
+        ]
+        assert expired.domains == (shared_domain,)
+        assert expired.bundles == (shared_bundle,)
+
+        blocked_target = mounted / "blocked-after-expiry.txt"
+        blocked = json.loads(
+            await filesystem.write_file(
+                str(blocked_target),
+                "blocked",
+            )
+        )
+        assert blocked["status"] == "elevation_required"
+        assert blocked["reason"] == "mount_requires_write_access"
+        assert not blocked_target.exists()
+        assert len(backend_operations) == 1
+    finally:
+        current_tool_context.reset(token)
+        reset_resolved_run_context_overlays()
+
+
+@pytest.mark.asyncio
 async def test_project_path_once_preserves_authoritative_tool_context(tmp_path):
     from opensquilla.gateway.approval_queue import reset_approval_queue
     from opensquilla.sandbox.escalation import (

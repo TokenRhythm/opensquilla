@@ -14,7 +14,7 @@ from opensquilla.sandbox.domain_validation import domain_matches
 from opensquilla.sandbox.elevation import ApprovalReviewerName, ElevationAction
 from opensquilla.sandbox.network_guard import NetworkDecision
 from opensquilla.sandbox.package_bundles import expand_package_bundle
-from opensquilla.sandbox.path_validation import MountDecision
+from opensquilla.sandbox.path_validation import MountDecision, normalize_path
 from opensquilla.sandbox.run_context import (
     RUN_CONTEXT_ORIGIN_KEY,
     DomainGrant,
@@ -1152,7 +1152,7 @@ def merge_run_context_overlay(
         return RunContext(
             run_mode=base.run_mode,
             workspace=base.workspace,
-            mounts=_merge_grants(base.mounts, overlay.mounts),
+            mounts=_merge_mount_grants(base.mounts, overlay.mounts),
             domains=_merge_grants(base.domains, overlay.domains),
             bundles=_merge_grants(base.bundles, overlay.bundles),
             public_network=_merge_grants(
@@ -1188,6 +1188,27 @@ def _merge_grants(
         if grant not in merged:
             merged.append(grant)
     return tuple(merged)
+
+
+def _merge_mount_grants(
+    base: tuple[MountGrant, ...],
+    overlay: tuple[MountGrant, ...],
+) -> tuple[MountGrant, ...]:
+    merged: dict[str, MountGrant] = {}
+    for grant in (*base, *overlay):
+        try:
+            key = os.path.normcase(str(normalize_path(grant.path)))
+        except (OSError, RuntimeError, ValueError):
+            key = os.path.normcase(str(grant.path).strip())
+        existing = merged.get(key)
+        if (
+            existing is not None
+            and existing.access == "rw"
+            and grant.access != "rw"
+        ):
+            continue
+        merged[key] = grant
+    return tuple(merged.values())
 
 
 def _approval_payload(
