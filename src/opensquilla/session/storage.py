@@ -3052,6 +3052,56 @@ class SessionStorage:
             return None
         return SessionNode(**_deserialize_row(dict(row)))
 
+    async def compare_and_set_session_origin(
+        self,
+        *,
+        expected_session: SessionNode,
+        expected_origin: dict[str, Any] | None,
+        origin: dict[str, Any] | None,
+        workspace_guard: ProjectWorkspaceGuard | None,
+    ) -> SessionNode | None:
+        """Replace one origin only while identity, binding, and origin still match."""
+
+        session_key = canonicalize_session_key(expected_session.session_key)
+        async with self._write_transaction("compare_and_set_session_origin") as conn:
+            await _verify_project_workspace_guard(
+                conn,
+                session_node=expected_session,
+                entry_session_key=session_key,
+                workspace_guard=workspace_guard,
+            )
+            async with conn.execute(
+                """
+                UPDATE sessions
+                SET origin = ?, updated_at = ?
+                WHERE session_key = ?
+                  AND session_id = ?
+                  AND epoch = ?
+                  AND workspace_id IS ?
+                  AND origin IS ?
+                """,
+                (
+                    _serialize(origin),
+                    _now_ms(),
+                    session_key,
+                    expected_session.session_id,
+                    int(expected_session.epoch or 0),
+                    expected_session.workspace_id,
+                    _serialize(expected_origin),
+                ),
+            ) as cursor:
+                updated = cursor.rowcount or 0
+            if updated != 1:
+                return None
+            async with conn.execute(
+                "SELECT * FROM sessions WHERE session_key = ?",
+                (session_key,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                return None
+            return SessionNode(**_deserialize_row(dict(row)))
+
     @_serialized_read
     async def list_sessions(
         self,

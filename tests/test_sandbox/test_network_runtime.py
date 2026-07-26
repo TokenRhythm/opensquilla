@@ -20,7 +20,7 @@ from opensquilla.sandbox.network_runtime import (
     NetworkPolicyRequest,
     NetworkProtocol,
 )
-from opensquilla.sandbox.run_context import RunContext
+from opensquilla.sandbox.run_context import DomainGrant, RunContext
 from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.sandbox.types import (
     NetworkMode,
@@ -112,8 +112,16 @@ async def test_proxy_runtime_approval_waits_and_forwards_after_allow(
         run_mode="standard",
     )
     runtime = SimpleNamespace(workspace=tmp_path)
+    tool_context = ToolContext(
+        workspace_dir=str(tmp_path),
+        session_key="s1",
+        sandbox_run_context=RunContext(
+            run_mode=RunMode.STANDARD,
+            workspace=str(tmp_path),
+        ),
+    )
     service = NetworkApprovalService(
-        context=RunContext(run_mode=RunMode.STANDARD),
+        context=tool_context.sandbox_run_context,
         request=request,
         runtime=runtime,
         approval_timeout_seconds=2.0,
@@ -122,6 +130,7 @@ async def test_proxy_runtime_approval_waits_and_forwards_after_allow(
         policy_decider=service,
         resolver=lambda host, port: ("93.184.216.34", upstream_port),
     )
+    context_token = current_tool_context.set(tool_context)
     await server.start()
     try:
         response_task = asyncio.create_task(
@@ -139,9 +148,21 @@ async def test_proxy_runtime_approval_waits_and_forwards_after_allow(
         assert params["sessionKey"] == "s1"
         assert params["fingerprint"]
 
+        tool_context.sandbox_run_context = RunContext(
+            run_mode=RunMode.STANDARD,
+            workspace=str(tmp_path),
+            domains=(
+                DomainGrant(
+                    domain="unknown.test",
+                    scope="once",
+                    source="temporary",
+                ),
+            ),
+        )
         get_approval_queue().resolve(str(pending["id"]), True)
         response = await response_task
     finally:
+        current_tool_context.reset(context_token)
         await server.stop()
         upstream.close()
         await upstream.wait_closed()
@@ -245,6 +266,17 @@ async def test_standard_network_forces_human_reviewer(
 
         seen_params.update(params)
         payload = request_sandbox_approval(params, **kwargs)
+        ctx.sandbox_run_context = RunContext(
+            run_mode=RunMode.STANDARD,
+            workspace=str(tmp_path),
+            domains=(
+                DomainGrant(
+                    domain="standard-human-only.invalid",
+                    scope="once",
+                    source="temporary",
+                ),
+            ),
+        )
         get_approval_queue().resolve(str(payload["approval_id"]), True)
         return payload
 

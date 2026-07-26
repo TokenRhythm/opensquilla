@@ -2781,7 +2781,9 @@ class TurnRunner:
     ) -> ToolContext:
         attachments_cfg = getattr(self._config, "attachments", None)
         media_root = self._attachment_media_root()
-        session_id = await self._resolve_session_id_for_log(session_key)
+        session_id, session_epoch, workspace_id = (
+            await self._resolve_session_identity_for_log(session_key)
+        )
         if not session_id:
             session_id = session_key.split(":")[-1] or session_key
         return replace(
@@ -2791,6 +2793,10 @@ class TurnRunner:
             artifact_session_id=session_id,
             tool_result_store_dir=str(media_root / "tool-results"),
             tool_result_store_session_id=session_id,
+            session_epoch=session_epoch,
+            workspace_id=workspace_id,
+            sandbox_session_manager=self._session_manager,
+            sandbox_gateway_config=self._config,
             workspace_file_writes=[],
             artifact_max_bytes=getattr(attachments_cfg, "artifact_max_bytes", None),
             artifact_disk_budget_bytes=getattr(
@@ -3142,6 +3148,8 @@ class TurnRunner:
         # so latency_ms reflects the full turn.
         turn_started_at = time.monotonic()
         turn_id = uuid.uuid4().hex
+        if tool_context is not None:
+            tool_context = replace(tool_context, execution_id=turn_id)
         resolved_model = ""
         final_prompt_str = ""
         turn_obj: Any | None = None
@@ -3998,11 +4006,14 @@ class TurnRunner:
                 source["input_provenance_kind"] = provenance_kind
         return source
 
-    async def _resolve_session_id_for_log(self, session_key: str) -> str | None:
-        """Best-effort lookup of the transcript identity for observability."""
+    async def _resolve_session_identity_for_log(
+        self,
+        session_key: str,
+    ) -> tuple[str | None, int | None, str | None]:
+        """Best-effort lookup of the current durable session identity."""
 
         if self._session_manager is None:
-            return None
+            return None, None, None
         try:
             if hasattr(self._session_manager, "get_session"):
                 node = await self._session_manager.get_session(session_key)
@@ -4012,15 +4023,29 @@ class TurnRunner:
                 storage = get_session_storage(self._session_manager)
                 node = await storage.get_session(session_key) if storage is not None else None
         except Exception:
-            return None
+            return None, None, None
         session_id = getattr(node, "session_id", None)
+        session_epoch: int | None = None
         if isinstance(session_id, str) and session_id:
             try:
                 session_epoch = max(0, int(getattr(node, "epoch", 0) or 0))
             except (TypeError, ValueError, OverflowError):
                 session_epoch = 0
             self._usage_session_epoch_by_key[session_key] = session_epoch
-        return session_id if isinstance(session_id, str) and session_id else None
+        else:
+            session_id = None
+        workspace_id = getattr(node, "workspace_id", None)
+        if not isinstance(workspace_id, str) or not workspace_id:
+            workspace_id = None
+        return session_id, session_epoch, workspace_id
+
+    async def _resolve_session_id_for_log(self, session_key: str) -> str | None:
+        """Best-effort lookup of the transcript identity for observability."""
+
+        session_id, _session_epoch, _workspace_id = (
+            await self._resolve_session_identity_for_log(session_key)
+        )
+        return session_id
 
     def _resolve_provider(self) -> tuple[Any | None, Any | None]:
         """Clone the selector and resolve provider (no shared state mutation)."""

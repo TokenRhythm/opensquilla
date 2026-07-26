@@ -601,7 +601,9 @@ async def test_explicit_named_network_approval_in_standard_requires_human(
 
 
 @pytest.mark.asyncio
-async def test_unknown_network_review_defaults_to_rule_allow_and_replay(tmp_path) -> None:
+async def test_unknown_network_review_fails_closed_without_session_authority(
+    tmp_path,
+) -> None:
     reset_approval_queue()
     provider = _AutoReviewProvider(
         json.dumps(
@@ -614,6 +616,7 @@ async def test_unknown_network_review_defaults_to_rule_allow_and_replay(tmp_path
         )
     )
     calls: list[dict[str, Any]] = []
+    approval_ids: list[str] = []
 
     async def _handler(call: ToolCall) -> ToolResult:
         calls.append(dict(call.arguments))
@@ -628,6 +631,7 @@ async def test_unknown_network_review_defaults_to_rule_allow_and_replay(tmp_path
             params,
             message="Review one exact network target.",
         )
+        approval_ids.append(str(payload["approval_id"]))
         return ToolResult(call.tool_use_id, call.tool_name, json.dumps(payload))
 
     agent = Agent(
@@ -640,8 +644,13 @@ async def test_unknown_network_review_defaults_to_rule_allow_and_replay(tmp_path
     try:
         _ = [event async for event in agent.run_turn("Inspect the project")]
 
-        assert len(calls) == 2
+        assert len(calls) == 1
         assert provider.review_model_calls == 0
+        assert len(approval_ids) == 1
+        entry = get_approval_queue().get(approval_ids[0])
+        assert entry.resolved is True
+        assert entry.approved is False
+        assert entry.params["reviewSource"] == "authority_validation_failure"
     finally:
         reset_approval_queue()
 

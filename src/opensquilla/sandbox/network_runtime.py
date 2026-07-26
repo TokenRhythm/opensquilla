@@ -23,6 +23,7 @@ from opensquilla.sandbox.escalation import (
     consume_persisted_temporary_network_grant,
     consume_temporary_network_grant,
     context_with_temporary_network_grants,
+    current_tool_run_context,
     request_sandbox_approval,
 )
 from opensquilla.sandbox.governance import action_fingerprint
@@ -193,6 +194,11 @@ class NetworkApprovalService:
             except KeyError:
                 rationale = ""
             return self._blocked(policy_request, rationale or "denied")
+        if not self._current_execution_allows_approved_target(policy_request):
+            return self._blocked(
+                policy_request,
+                "approval_authority_unavailable",
+            )
 
         approved_decision = NetworkDecision(
             status="allow",
@@ -202,6 +208,32 @@ class NetworkApprovalService:
         )
         await self._consume_temporary_grant_if_needed(approved_decision)
         return approved_decision
+
+    def _current_execution_allows_approved_target(
+        self,
+        policy_request: NetworkPolicyRequest,
+    ) -> bool:
+        from opensquilla.tools.types import current_tool_context
+
+        ctx = current_tool_context.get()
+        if ctx is None:
+            return False
+        if (
+            str(getattr(ctx, "session_key", None) or "").strip()
+            != str(self.session_key or "").strip()
+        ):
+            return False
+        context = current_tool_run_context()
+        if context is None:
+            return False
+        effective = context_with_temporary_network_grants(
+            context,
+            fingerprint=self.fingerprint,
+        )
+        return decide_network_access(
+            policy_request.host,
+            effective,
+        ).status == "allow"
 
     async def _run_auto_review(
         self,

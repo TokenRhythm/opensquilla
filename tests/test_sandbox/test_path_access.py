@@ -15,7 +15,7 @@ from opensquilla.sandbox.integration import configure_runtime, get_runtime, rese
 from opensquilla.sandbox.operation_runtime import SandboxOperation, SandboxOperationResult
 from opensquilla.sandbox.path_validation import decide_path_access
 from opensquilla.sandbox.permissions import FileSystemPermissionProfile
-from opensquilla.sandbox.run_context import RunContext
+from opensquilla.sandbox.run_context import MountGrant, RunContext
 from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.sandbox.types import SandboxRequest
 from opensquilla.tools.builtin import filesystem as fs
@@ -106,6 +106,14 @@ def tool_context(
     sandbox_mounts: list[dict[str, object]] | None = None,
     workspace_strict: bool = False,
 ) -> Iterator[ToolContext]:
+    mounts = tuple(
+        MountGrant(
+            path=str(item["path"]),
+            access=str(item.get("access") or "ro"),
+            scope=str(item.get("scope") or "chat"),
+        )
+        for item in (sandbox_mounts or [])
+    )
     ctx = ToolContext(
         is_owner=True,
         caller_kind=CallerKind.CLI,
@@ -114,6 +122,15 @@ def tool_context(
         run_mode=run_mode,
         session_key="s1",
         sandbox_mounts=sandbox_mounts or [],
+        sandbox_run_context=RunContext(
+            run_mode=RunMode(run_mode or "standard"),
+            workspace=str(workspace),
+            mounts=mounts,
+            source="saved",
+        ),
+        artifact_session_id="session-id-s1",
+        session_epoch=0,
+        execution_id="execution-s1",
     )
     token = current_tool_context.set(ctx)
     try:

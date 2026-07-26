@@ -60,7 +60,12 @@ def test_shell_tools_preserve_legacy_approval_id_positions() -> None:
 def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
     field_names = [item.name for item in fields(ToolContext)]
 
-    assert field_names[-2:] == [
+    assert field_names[-7:] == [
         "sandbox_file_system_profile",
         "on_sandbox_auto_review",
+        "session_epoch",
+        "workspace_id",
+        "execution_id",
+        "sandbox_session_manager",
+        "sandbox_gateway_config",
     ]

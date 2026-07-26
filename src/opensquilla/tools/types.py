@@ -113,6 +113,11 @@ class ToolContext:
     # historical positional constructor contract for embedded callers.
     sandbox_file_system_profile: Any | None = None
     on_sandbox_auto_review: Callable[[dict[str, object]], Awaitable[Any]] | None = None
+    session_epoch: int | None = None
+    workspace_id: str | None = None
+    execution_id: str | None = None
+    sandbox_session_manager: Any | None = None
+    sandbox_gateway_config: Any | None = None
 
 
 # Request-scoped context — set by build_tool_handler before each dispatch.

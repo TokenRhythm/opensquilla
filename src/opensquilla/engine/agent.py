@@ -1144,41 +1144,142 @@ async def _review_pending_elevation_if_configured(
             human_confirmation_allowed=False,
         )
 
-    updated_params = dict(params)
     requires_human_confirmation = (
         assessment.risk_level == "critical" and assessment.human_confirmation_allowed
     )
-    updated_params.update(
-        {
-            "reviewRiskLevel": assessment.risk_level,
-            "reviewAuthorization": assessment.user_authorization,
-            "reviewOutcome": assessment.outcome,
-            "reviewStatus": assessment.status,
-            "reviewRationale": assessment.rationale,
-            "reviewSource": review_source,
-        }
-    )
-    if requires_human_confirmation:
-        updated_params.update(
+
+    def _review_params(
+        current_assessment: RuleAssessment,
+        *,
+        source: str,
+        human_confirmation: bool,
+    ) -> dict[str, Any]:
+        reviewed = dict(params)
+        reviewed.update(
             {
-                "reviewer": "user",
-                "humanActionable": True,
-                "ruleReviewOutcome": assessment.outcome,
-                "reviewStatus": "human_confirmation_required",
+                "reviewRiskLevel": current_assessment.risk_level,
+                "reviewAuthorization": current_assessment.user_authorization,
+                "reviewOutcome": current_assessment.outcome,
+                "reviewStatus": current_assessment.status,
+                "reviewRationale": current_assessment.rationale,
+                "reviewSource": source,
             }
         )
-    try:
-        queue.update_params(approval_id, updated_params)
-        if not requires_human_confirmation:
-            queue.resolve(approval_id, assessment.outcome == "allow")
-    except ValueError:
-        # Another resolver won the race. Never override an existing decision.
-        return None
+        if human_confirmation:
+            reviewed.update(
+                {
+                    "reviewer": "user",
+                    "humanActionable": True,
+                    "ruleReviewOutcome": current_assessment.outcome,
+                    "reviewStatus": "human_confirmation_required",
+                }
+            )
+        return reviewed
 
-    if assessment.outcome == "allow" and approval_kind == "sandbox_network":
-        from opensquilla.sandbox.escalation import grant_auto_review_network_once
+    updated_params = _review_params(
+        assessment,
+        source=review_source,
+        human_confirmation=requires_human_confirmation,
+    )
+    if (
+        not requires_human_confirmation
+        and assessment.outcome == "allow"
+        and approval_kind == "sandbox_network"
+    ):
+        from opensquilla.sandbox.escalation import (
+            discard_approval_run_context_authority,
+            grant_auto_review_network_once,
+        )
 
-        grant_auto_review_network_once(updated_params)
+        try:
+            queue.update_params(approval_id, updated_params)
+            claim_token = queue.claim_resolution(approval_id)
+        except (KeyError, ValueError):
+            # Another resolver won the race. Never override its decision.
+            return None
+        try:
+            queue.finalize_claimed_resolution(
+                approval_id,
+                claim_token,
+                True,
+            )
+        except (KeyError, ValueError):
+            queue.release_resolution_claim(approval_id, claim_token)
+            return None
+
+        tool_context = current_tool_context.get()
+        try:
+            published = await grant_auto_review_network_once(
+                updated_params,
+                approval_id=approval_id,
+                session_manager=getattr(
+                    tool_context,
+                    "sandbox_session_manager",
+                    None,
+                ),
+                config=getattr(
+                    tool_context,
+                    "sandbox_gateway_config",
+                    None,
+                ),
+            )
+        except BaseException:
+            discard_approval_run_context_authority(approval_id)
+            try:
+                queue.reopen_resolved_approval(
+                    approval_id,
+                    expected_approved=True,
+                )
+            except (KeyError, ValueError):
+                pass
+            raise
+        if published:
+            try:
+                queue.complete_claimed_resolution(
+                    approval_id,
+                    claim_token,
+                )
+            except (KeyError, ValueError):
+                discard_approval_run_context_authority(approval_id)
+                published = False
+        if not published:
+            discard_approval_run_context_authority(approval_id)
+            try:
+                queue.reopen_resolved_approval(
+                    approval_id,
+                    expected_approved=True,
+                )
+            except (KeyError, ValueError):
+                return None
+            review_source = "authority_validation_failure"
+            assessment = replace(
+                assessment,
+                risk_level="high",
+                outcome="deny",
+                rationale=(
+                    "The exact approval authority changed before the automatic "
+                    "network grant could be published."
+                ),
+                human_confirmation_allowed=False,
+            )
+            updated_params = _review_params(
+                assessment,
+                source=review_source,
+                human_confirmation=False,
+            )
+            try:
+                queue.update_params(approval_id, updated_params)
+                queue.resolve(approval_id, False)
+            except (KeyError, ValueError):
+                return None
+    else:
+        try:
+            queue.update_params(approval_id, updated_params)
+            if not requires_human_confirmation:
+                queue.resolve(approval_id, assessment.outcome == "allow")
+        except (KeyError, ValueError):
+            # Another resolver won the race. Never override its decision.
+            return None
 
     append_runtime_event(
         runtime_events_path,
@@ -4107,37 +4208,43 @@ class Agent:
         Explicit state machine — no recursion. Tool loop iterates until
         the model finishes, unless config.max_iterations is a positive cap.
         """
-        if self._session_key:
-            from opensquilla.sandbox.escalation import (
-                clear_sandbox_approval_denials,
-                prune_once_mount_grants,
-            )
+        from opensquilla.sandbox.escalation import (
+            clear_approval_run_context_deltas_for_tool_context,
+            clear_sandbox_approval_denials,
+            prune_once_mount_grants,
+        )
 
-            clear_sandbox_approval_denials(self._session_key)
-            # "Allow once" path grants authorize at most the granting turn; expire
-            # them at the start of the next turn so a later access re-prompts
-            # instead of being silently allowed for the whole session (issue #418).
-            prune_once_mount_grants(self._session_key)
-        scope = current_usage_accounting_scope()
-        if self._usage_event_sink is not None:
-            context = self._usage_context_for_turn()
-            if not (
-                scope is not None
-                and scope.sink is self._usage_event_sink
-                and scope.context.execution_id == context.execution_id
-            ):
-                scope = UsageAccountingScope(
-                    sink=self._usage_event_sink,
-                    context=context,
-                )
-        with bind_usage_accounting_scope(scope):
-            async for event in self._turn_generator(
-                message,
-                extra_messages,
-                semantic_message,
-                pending_input_provider=pending_input_provider,
-            ):
-                yield event
+        try:
+            if self._session_key:
+                clear_sandbox_approval_denials(self._session_key)
+                # Legacy once overlays still expire defensively at the next turn
+                # boundary. Generation-bound deltas are revoked for their exact
+                # execution in this method's finally block.
+                prune_once_mount_grants(self._session_key)
+            scope = current_usage_accounting_scope()
+            if self._usage_event_sink is not None:
+                context = self._usage_context_for_turn()
+                if not (
+                    scope is not None
+                    and scope.sink is self._usage_event_sink
+                    and scope.context.execution_id == context.execution_id
+                ):
+                    scope = UsageAccountingScope(
+                        sink=self._usage_event_sink,
+                        context=context,
+                    )
+            with bind_usage_accounting_scope(scope):
+                async for event in self._turn_generator(
+                    message,
+                    extra_messages,
+                    semantic_message,
+                    pending_input_provider=pending_input_provider,
+                ):
+                    yield event
+        finally:
+            clear_approval_run_context_deltas_for_tool_context(
+                self._tool_context,
+            )
 
     async def _turn_generator(
         self,

@@ -14,9 +14,13 @@ class _SessionManager:
     def __init__(self):
         self.node = SimpleNamespace(
             session_key="agent:main:webchat:abc",
+            session_id="session-abc",
             agent_id="main",
+            epoch=0,
+            workspace_id=None,
             origin=None,
         )
+        self.storage = self
 
     async def get_session(self, session_key: str):
         return self.node if session_key == self.node.session_key else None
@@ -24,6 +28,26 @@ class _SessionManager:
     async def update(self, session_key: str, **fields):
         for key, value in fields.items():
             setattr(self.node, key, value)
+        return self.node
+
+    async def compare_and_set_session_origin(
+        self,
+        *,
+        expected_session,
+        expected_origin,
+        origin,
+        workspace_guard,
+    ):
+        del workspace_guard
+        if (
+            expected_session.session_key != self.node.session_key
+            or expected_session.session_id != self.node.session_id
+            or expected_session.epoch != self.node.epoch
+            or expected_session.workspace_id != self.node.workspace_id
+            or expected_origin != self.node.origin
+        ):
+            return None
+        self.node.origin = origin
         return self.node
 
 
@@ -38,6 +62,31 @@ def _manager_with_session_key(session_key: str) -> _SessionManager:
     manager = _SessionManager()
     manager.node.session_key = session_key
     return manager
+
+
+def _identified_tool_context(
+    manager: _SessionManager,
+    workspace: str,
+    run_context,
+    *,
+    execution_id: str = "execution-test",
+    fresh: bool = True,
+):
+    from opensquilla.tools.types import ToolContext
+
+    context = ToolContext(
+        is_owner=True,
+        session_key=manager.node.session_key,
+        workspace_dir=workspace,
+        sandbox_run_context=run_context,
+        artifact_session_id=manager.node.session_id,
+        session_epoch=manager.node.epoch,
+        workspace_id=manager.node.workspace_id,
+        execution_id=execution_id,
+    )
+    if fresh:
+        setattr(context, "_sandbox_run_context_fresh", True)
+    return context
 
 
 class _FailingUpdateSessionManager(_SessionManager):
@@ -2439,7 +2488,7 @@ def test_channel_sandbox_approval_request_denies_without_queue() -> None:
     reset_approval_queue()
 
 
-def test_request_sandbox_approval_reuses_pending_network_class_approval() -> None:
+def test_request_sandbox_approval_separates_pending_network_targets() -> None:
     from opensquilla.gateway.approval_queue import get_approval_queue, reset_approval_queue
     from opensquilla.sandbox.escalation import (
         build_network_approval_params,
@@ -2477,10 +2526,10 @@ def test_request_sandbox_approval_reuses_pending_network_class_approval() -> Non
     second = request_sandbox_approval(second_params, message="Resolve this approval and retry.")
 
     assert first["status"] == "approval_required"
-    assert second["status"] == "approval_pending"
-    assert second["approval_id"] == first["approval_id"]
+    assert second["status"] == "approval_required"
+    assert second["approval_id"] != first["approval_id"]
     assert second["host"] == "second.example"
-    assert len(get_approval_queue().list_pending("exec")) == 1
+    assert len(get_approval_queue().list_pending("exec")) == 2
 
     reset_approval_queue()
 
@@ -2575,10 +2624,13 @@ async def test_apply_network_once_choice_stays_transient_and_updates_overlay(tmp
     from opensquilla.sandbox.escalation import (
         apply_sandbox_approval_choice,
         build_network_approval_params,
-        resolved_run_context_overlay,
+        current_tool_run_context,
+        request_sandbox_approval,
     )
     from opensquilla.sandbox.network_guard import NetworkDecision
-    from opensquilla.sandbox.run_context import get_run_context
+    from opensquilla.sandbox.run_context import RunContext, get_run_context
+    from opensquilla.sandbox.run_mode import RunMode
+    from opensquilla.tools.types import current_tool_context
 
     manager = _SessionManager()
     workspace = tmp_path / "workspace"
@@ -2595,13 +2647,30 @@ async def test_apply_network_once_choice_stays_transient_and_updates_overlay(tmp
         fingerprint="fp123",
     )
 
-    await apply_sandbox_approval_choice(
-        params,
-        choice="allow_once",
-        approved=True,
-        session_manager=manager,
-        config=_config(),
+    base = RunContext(
+        run_mode=RunMode.STANDARD,
+        workspace=str(workspace),
+        source="saved",
     )
+    tool_context = _identified_tool_context(manager, str(workspace), base)
+    token = current_tool_context.set(tool_context)
+    try:
+        approval = request_sandbox_approval(
+            params,
+            message="Approve one managed-network target.",
+        )
+        assert approval is not None
+        await apply_sandbox_approval_choice(
+            params,
+            approval_id=str(approval["approval_id"]),
+            choice="allow_once",
+            approved=True,
+            session_manager=manager,
+            config=_config(),
+        )
+        effective = current_tool_run_context()
+    finally:
+        current_tool_context.reset(token)
 
     ctx = await get_run_context(
         manager,
@@ -2610,9 +2679,11 @@ async def test_apply_network_once_choice_stays_transient_and_updates_overlay(tmp
         workspace=str(workspace),
     )
     assert ctx.temporary_grants == ()
-    overlay = resolved_run_context_overlay(manager.node.session_key, str(workspace))
-    assert overlay is not None
-    assert [(grant.kind, grant.value, grant.fingerprint) for grant in overlay.temporary_grants] == [
+    assert effective is not None
+    assert [
+        (grant.kind, grant.value, grant.fingerprint)
+        for grant in effective.temporary_grants
+    ] == [
         ("domain", "example.com", "fp123")
     ]
 
@@ -2639,7 +2710,7 @@ async def test_project_network_once_preserves_authoritative_tool_context(tmp_pat
         TemporaryGrant,
     )
     from opensquilla.sandbox.run_mode import RunMode
-    from opensquilla.tools.types import ToolContext, current_tool_context
+    from opensquilla.tools.types import current_tool_context
 
     reset_approval_queue()
     reset_resolved_run_context_overlays()
@@ -2681,6 +2752,9 @@ async def test_project_network_once_preserves_authoritative_tool_context(tmp_pat
         run_mode_source="project_default",
         source="saved",
     )
+    manager.node.origin = {
+        RUN_CONTEXT_ORIGIN_KEY: authoritative.to_origin_payload()
+    }
     overlay_mount = MountGrant(
         path=str(outside),
         access="ro",
@@ -2715,12 +2789,12 @@ async def test_project_network_once_preserves_authoritative_tool_context(tmp_pat
             source="resolved_overlay",
         ),
     )
-    tool_context = ToolContext(
-        session_key=manager.node.session_key,
-        workspace_dir=str(workspace),
-        sandbox_run_context=authoritative,
+    tool_context = _identified_tool_context(
+        manager,
+        str(workspace),
+        authoritative,
+        execution_id="execution-project-network",
     )
-    setattr(tool_context, "_sandbox_run_context_fresh", True)
     token = current_tool_context.set(tool_context)
     try:
         approval = request_sandbox_approval(
@@ -2735,10 +2809,10 @@ async def test_project_network_once_preserves_authoritative_tool_context(tmp_pat
         str(workspace),
     )
     assert captured is not None
-    assert captured.run_mode is RunMode.STANDARD
-    assert captured.run_mode_source == "project_default"
-    assert captured.mounts == authoritative.mounts + (overlay_mount,)
-    assert captured.domains == authoritative.domains + (overlay_domain,)
+    assert captured.run_mode is RunMode.FULL
+    assert captured.run_mode_source == "user"
+    assert captured.mounts == (overlay_mount,)
+    assert captured.domains == (overlay_domain,)
     assert captured.bundles == (overlay_bundle,)
     assert captured.temporary_grants == (existing_once,)
 
@@ -2758,13 +2832,29 @@ async def test_project_network_once_preserves_authoritative_tool_context(tmp_pat
         )
         assert overlay is not None
         assert overlay.workspace == str(workspace)
-        assert overlay.run_mode is RunMode.STANDARD
-        assert overlay.run_mode_source == "project_default"
-        assert overlay.mounts == authoritative.mounts + (overlay_mount,)
-        assert overlay.domains == authoritative.domains + (overlay_domain,)
+        assert overlay.run_mode is RunMode.FULL
+        assert overlay.run_mode_source == "user"
+        assert overlay.mounts == (overlay_mount,)
+        assert overlay.domains == (overlay_domain,)
         assert overlay.bundles == (overlay_bundle,)
         assert [
             (grant.kind, grant.value, grant.fingerprint) for grant in overlay.temporary_grants
+        ] == [
+            ("domain", "existing-once.example", "fp-existing"),
+        ]
+        active_token = current_tool_context.set(tool_context)
+        try:
+            effective = escalation_state.current_tool_run_context()
+        finally:
+            current_tool_context.reset(active_token)
+        assert effective is not None
+        assert effective.run_mode is RunMode.STANDARD
+        assert effective.mounts == authoritative.mounts + (overlay_mount,)
+        assert effective.domains == authoritative.domains + (overlay_domain,)
+        assert effective.bundles == (overlay_bundle,)
+        assert [
+            (grant.kind, grant.value, grant.fingerprint)
+            for grant in effective.temporary_grants
         ] == [
             ("domain", "existing-once.example", "fp-existing"),
             ("domain", "example.com", "fp-project"),
@@ -2800,7 +2890,7 @@ async def _assert_project_approval_retarget_fails_closed(
         RunContext,
     )
     from opensquilla.sandbox.run_mode import RunMode
-    from opensquilla.tools.types import ToolContext, current_tool_context
+    from opensquilla.tools.types import current_tool_context
 
     reset_approval_queue()
     reset_resolved_run_context_overlays()
@@ -2845,10 +2935,11 @@ async def _assert_project_approval_retarget_fails_closed(
         source="saved",
     )
     token = current_tool_context.set(
-        ToolContext(
-            session_key=manager.node.session_key,
-            workspace_dir=str(workspace),
-            sandbox_run_context=authoritative,
+        _identified_tool_context(
+            manager,
+            str(workspace),
+            authoritative,
+            execution_id="execution-retarget",
         )
     )
     try:
@@ -2900,10 +2991,10 @@ async def _assert_project_approval_retarget_fails_closed(
             workspace.unlink()
         original.rename(workspace)
 
-    assert (
-        resolved_run_context_overlay(manager.node.session_key, str(workspace))
-        == authoritative
-    )
+    assert resolved_run_context_overlay(
+        manager.node.session_key,
+        str(workspace),
+    ) is None
     assert resolved_run_context_overlay(manager.node.session_key, str(replacement)) is None
     assert manager.node.origin[RUN_CONTEXT_ORIGIN_KEY]["workspace"] == str(stale_workspace)
     assert manager.node.origin[RUN_CONTEXT_ORIGIN_KEY]["run_mode"] == "full"
@@ -2925,7 +3016,7 @@ async def test_project_approval_junction_retarget_fails_closed(tmp_path: Path) -
 
 @pytest.mark.parametrize("approval_kind", ["network", "path"])
 @pytest.mark.asyncio
-async def test_project_approval_generation_survives_same_path_directory_replacement(
+async def test_project_approval_generation_does_not_cross_directory_replacement(
     tmp_path: Path,
     approval_kind: str,
 ) -> None:
@@ -2945,7 +3036,7 @@ async def test_project_approval_generation_survives_same_path_directory_replacem
     from opensquilla.sandbox.path_validation import MountDecision
     from opensquilla.sandbox.run_context import DomainGrant, RunContext
     from opensquilla.sandbox.run_mode import RunMode
-    from opensquilla.tools.types import ToolContext, current_tool_context
+    from opensquilla.tools.types import current_tool_context
 
     reset_approval_queue()
     reset_resolved_run_context_overlays()
@@ -2993,11 +3084,11 @@ async def test_project_approval_generation_survives_same_path_directory_replacem
         source="saved",
     )
     token = current_tool_context.set(
-        ToolContext(
-            run_mode="standard",
-            session_key=manager.node.session_key,
-            workspace_dir=str(workspace),
-            sandbox_run_context=first_context,
+        _identified_tool_context(
+            manager,
+            str(workspace),
+            first_context,
+            execution_id="execution-original-generation",
         )
     )
     try:
@@ -3014,7 +3105,7 @@ async def test_project_approval_generation_survives_same_path_directory_replacem
     workspace.rename(original)
     workspace.mkdir()
     replacement_context = RunContext(
-        run_mode=RunMode.FULL,
+        run_mode=RunMode.STANDARD,
         workspace=str(workspace),
         domains=(
             DomainGrant(
@@ -3023,15 +3114,15 @@ async def test_project_approval_generation_survives_same_path_directory_replacem
                 source="manual",
             ),
         ),
-        run_mode_source="user",
+        run_mode_source="project_default",
         source="resolved_overlay",
     )
     token = current_tool_context.set(
-        ToolContext(
-            run_mode="standard",
-            session_key=manager.node.session_key,
-            workspace_dir=str(workspace),
-            sandbox_run_context=replacement_context,
+        _identified_tool_context(
+            manager,
+            str(workspace),
+            replacement_context,
+            execution_id="execution-replacement-generation",
         )
     )
     try:
@@ -3042,8 +3133,8 @@ async def test_project_approval_generation_survives_same_path_directory_replacem
     finally:
         current_tool_context.reset(token)
     assert second is not None
-    assert second["approval_id"] == first_approval_id
-    assert len(get_approval_queue().list_pending("exec")) == 1
+    assert second["approval_id"] != first_approval_id
+    assert len(get_approval_queue().list_pending("exec")) == 2
 
     try:
         for invalid_generation in (None, "another-approval-generation"):
@@ -3089,7 +3180,7 @@ def test_project_approval_generation_is_cleaned_when_queue_stops_waiting(
     from opensquilla.sandbox.network_guard import NetworkDecision
     from opensquilla.sandbox.run_context import RunContext
     from opensquilla.sandbox.run_mode import RunMode
-    from opensquilla.tools.types import ToolContext, current_tool_context
+    from opensquilla.tools.types import current_tool_context
 
     reset_approval_queue()
     escalation.reset_resolved_run_context_overlays()
@@ -3109,15 +3200,15 @@ def test_project_approval_generation_is_cleaned_when_queue_stops_waiting(
     )
     assert params is not None
     token = current_tool_context.set(
-        ToolContext(
-            run_mode="standard",
-            session_key=manager.node.session_key,
-            workspace_dir=str(workspace),
-            sandbox_run_context=RunContext(
+        _identified_tool_context(
+            manager,
+            str(workspace),
+            RunContext(
                 run_mode=RunMode.STANDARD,
                 workspace=str(workspace),
                 source="saved",
             ),
+            execution_id=f"execution-{resolution}",
         )
     )
     try:
@@ -3406,7 +3497,7 @@ async def test_path_allow_once_rw_preserves_durable_same_root_ro_after_expiry(
     )
     from opensquilla.sandbox.run_mode import RunMode
     from opensquilla.tools.builtin import filesystem
-    from opensquilla.tools.types import ToolContext, current_tool_context
+    from opensquilla.tools.types import current_tool_context
 
     reset_approval_queue()
     reset_resolved_run_context_overlays()
@@ -3434,13 +3525,12 @@ async def test_path_allow_once_rw_preserves_durable_same_root_ro_after_expiry(
         workspace=str(workspace),
     )
     assert params is not None
-    approval_context = ToolContext(
-        is_owner=True,
-        session_key=manager.node.session_key,
-        workspace_dir=str(workspace),
-        sandbox_run_context=base,
+    approval_context = _identified_tool_context(
+        manager,
+        str(workspace),
+        base,
+        execution_id="execution-same-root",
     )
-    setattr(approval_context, "_sandbox_run_context_fresh", True)
     token = current_tool_context.set(approval_context)
     try:
         approval = request_sandbox_approval(
@@ -3497,13 +3587,12 @@ async def test_path_allow_once_rw_preserves_durable_same_root_ro_after_expiry(
         ]
         assert approval_id not in escalation_state._APPROVAL_RUN_CONTEXT_GENERATIONS
 
-        active_context = ToolContext(
-            is_owner=True,
-            session_key=manager.node.session_key,
-            workspace_dir=str(workspace),
-            sandbox_run_context=base,
+        active_context = _identified_tool_context(
+            manager,
+            str(workspace),
+            base,
+            execution_id="execution-same-root",
         )
-        setattr(active_context, "_sandbox_run_context_fresh", True)
         active_token = current_tool_context.set(active_context)
         try:
             active = current_tool_run_context()
@@ -3518,10 +3607,10 @@ async def test_path_allow_once_rw_preserves_durable_same_root_ro_after_expiry(
             )
             assert allowed == f"sandboxed write: {allowed_target}"
             assert allowed_target.read_text(encoding="utf-8") == "allowed"
+            assert prune_once_mount_grants(manager.node.session_key) == 1
         finally:
             current_tool_context.reset(active_token)
 
-        assert prune_once_mount_grants(manager.node.session_key) == 1
         reset_resolved_run_context_overlays()
         restored = await get_run_context(
             manager,
@@ -3533,13 +3622,12 @@ async def test_path_allow_once_rw_preserves_durable_same_root_ro_after_expiry(
             ("ro", "chat")
         ]
 
-        expired_context = ToolContext(
-            is_owner=True,
-            session_key=manager.node.session_key,
-            workspace_dir=str(workspace),
-            sandbox_run_context=restored,
+        expired_context = _identified_tool_context(
+            manager,
+            str(workspace),
+            restored,
+            execution_id="execution-after-expiry",
         )
-        setattr(expired_context, "_sandbox_run_context_fresh", True)
         expired_token = current_tool_context.set(expired_context)
         try:
             expired = current_tool_run_context()
@@ -3571,6 +3659,7 @@ async def test_project_path_once_preserves_authoritative_tool_context(tmp_path):
     from opensquilla.sandbox.escalation import (
         apply_sandbox_approval_choice,
         build_path_approval_params,
+        current_tool_run_context,
         request_sandbox_approval,
         reset_resolved_run_context_overlays,
         resolved_run_context_overlay,
@@ -3582,7 +3671,7 @@ async def test_project_path_once_preserves_authoritative_tool_context(tmp_path):
         RunContext,
     )
     from opensquilla.sandbox.run_mode import RunMode
-    from opensquilla.tools.types import ToolContext, current_tool_context
+    from opensquilla.tools.types import current_tool_context
 
     reset_approval_queue()
     reset_resolved_run_context_overlays()
@@ -3623,12 +3712,17 @@ async def test_project_path_once_preserves_authoritative_tool_context(tmp_path):
         run_mode_source="project_default",
         source="saved",
     )
+    manager.node.origin = {
+        RUN_CONTEXT_ORIGIN_KEY: authoritative.to_origin_payload()
+    }
+    approval_context = _identified_tool_context(
+        manager,
+        str(workspace),
+        authoritative,
+        execution_id="execution-project-path",
+    )
     token = current_tool_context.set(
-        ToolContext(
-            session_key=manager.node.session_key,
-            workspace_dir=str(workspace),
-            sandbox_run_context=authoritative,
-        )
+        approval_context
     )
     try:
         approval = request_sandbox_approval(
@@ -3649,16 +3743,24 @@ async def test_project_path_once_preserves_authoritative_tool_context(tmp_path):
             config=_config(),
         )
 
-        overlay = resolved_run_context_overlay(
+        assert resolved_run_context_overlay(
             manager.node.session_key,
             str(workspace),
-        )
-        assert overlay is not None
-        assert overlay.workspace == str(workspace)
-        assert overlay.run_mode is RunMode.STANDARD
-        assert overlay.run_mode_source == "project_default"
-        assert overlay.domains == authoritative.domains
-        assert [(grant.path, grant.access, grant.scope) for grant in overlay.mounts] == [
+        ) is None
+        active_token = current_tool_context.set(approval_context)
+        try:
+            effective = current_tool_run_context()
+        finally:
+            current_tool_context.reset(active_token)
+        assert effective is not None
+        assert effective.workspace == str(workspace)
+        assert effective.run_mode is RunMode.STANDARD
+        assert effective.run_mode_source == "project_default"
+        assert effective.domains == authoritative.domains
+        assert [
+            (grant.path, grant.access, grant.scope)
+            for grant in effective.mounts
+        ] == [
             (str(requested_path), "ro", "once")
         ]
         persisted = manager.node.origin[RUN_CONTEXT_ORIGIN_KEY]

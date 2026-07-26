@@ -23,11 +23,15 @@ class _SessionManager:
     def __init__(self):
         self.node = SimpleNamespace(
             session_key="agent:main:webchat:abc",
+            session_id="session-abc",
             agent_id="main",
+            epoch=0,
+            workspace_id=None,
             origin=None,
         )
         self.sessions = {self.node.session_key: self.node}
         self.created: list[str] = []
+        self.storage = self
 
     async def get_session(self, session_key: str):
         return self.sessions.get(session_key)
@@ -51,6 +55,27 @@ class _SessionManager:
         for key, value in fields.items():
             setattr(node, key, value)
         return node
+
+    async def compare_and_set_session_origin(
+        self,
+        *,
+        expected_session,
+        expected_origin,
+        origin,
+        workspace_guard,
+    ):
+        del workspace_guard
+        current = self.sessions.get(expected_session.session_key)
+        if (
+            current is None
+            or current.session_id != expected_session.session_id
+            or current.epoch != expected_session.epoch
+            or current.workspace_id != expected_session.workspace_id
+            or current.origin != expected_origin
+        ):
+            return None
+        current.origin = origin
+        return current
 
 
 def _ctx(
@@ -89,6 +114,44 @@ def _ctx(
         session_manager=manager,
         config=config,
     )
+
+
+def _request_generated_sandbox_approval(
+    manager: _SessionManager,
+    params: dict[str, object],
+) -> str:
+    from opensquilla.sandbox.escalation import request_sandbox_approval
+    from opensquilla.sandbox.run_context import RunContext
+    from opensquilla.sandbox.run_mode import RunMode
+    from opensquilla.tools.types import ToolContext, current_tool_context
+
+    workspace = str(params.get("workspace") or "/tmp/ws")
+    Path(workspace).mkdir(parents=True, exist_ok=True)
+    tool_context = ToolContext(
+        is_owner=True,
+        session_key=manager.node.session_key,
+        workspace_dir=workspace,
+        sandbox_run_context=RunContext(
+            run_mode=RunMode.STANDARD,
+            workspace=workspace,
+            source="saved",
+        ),
+        artifact_session_id=manager.node.session_id,
+        session_epoch=manager.node.epoch,
+        workspace_id=manager.node.workspace_id,
+        execution_id=f"execution-{params.get('fingerprint') or params.get('path')}",
+    )
+    setattr(tool_context, "_sandbox_run_context_fresh", True)
+    token = current_tool_context.set(tool_context)
+    try:
+        payload = request_sandbox_approval(
+            params,
+            message="Approve the exact sandbox target.",
+        )
+    finally:
+        current_tool_context.reset(token)
+    assert payload is not None
+    return str(payload["approval_id"])
 
 
 @pytest.fixture(autouse=True)
@@ -510,7 +573,7 @@ async def test_rpc_run_context_get_includes_bundles_and_temporary_grants() -> No
 
 @pytest.mark.asyncio
 async def test_exec_approval_resolve_allows_non_owner_chat_scoped_sandbox_grant() -> None:
-    from opensquilla.gateway.approval_queue import get_approval_queue, reset_approval_queue
+    from opensquilla.gateway.approval_queue import reset_approval_queue
     from opensquilla.gateway.rpc_approvals import _handle_exec_approval_resolve
     from opensquilla.sandbox.escalation import build_network_approval_params
     from opensquilla.sandbox.network_guard import NetworkDecision
@@ -530,8 +593,7 @@ async def test_exec_approval_resolve_allows_non_owner_chat_scoped_sandbox_grant(
         fingerprint="fp123",
     )
     assert params is not None
-    queue = get_approval_queue()
-    approval_id = queue.request(namespace="exec", params=params)
+    approval_id = _request_generated_sandbox_approval(manager, params)
     result = await _handle_exec_approval_resolve(
         {"id": approval_id, "approved": True, "choice": "allow_same_type"},
         _ctx(
@@ -576,7 +638,7 @@ async def test_exec_approval_resolve_returns_first_cross_surface_decision() -> N
     )
     assert params is not None
     queue = get_approval_queue()
-    approval_id = queue.request(namespace="exec", params=params)
+    approval_id = _request_generated_sandbox_approval(manager, params)
     context = _ctx(manager)
 
     first = await _handle_exec_approval_resolve(
@@ -621,7 +683,7 @@ async def test_exec_approval_resolve_joins_active_cross_surface_claim(
     )
     assert params is not None
     queue = get_approval_queue()
-    approval_id = queue.request(namespace="exec", params=params)
+    approval_id = _request_generated_sandbox_approval(manager, params)
     context = _ctx(manager)
     apply_started = asyncio.Event()
     release_apply = asyncio.Event()
@@ -686,7 +748,7 @@ async def test_exec_approval_resolve_rejects_legacy_intent_flags() -> None:
     )
     assert params is not None
     queue = get_approval_queue()
-    approval_id = queue.request(namespace="exec", params=params)
+    approval_id = _request_generated_sandbox_approval(manager, params)
 
     with pytest.raises(RpcHandlerError) as excinfo:
         await _handle_exec_approval_resolve(
@@ -734,7 +796,7 @@ async def test_exec_approval_resolve_rejects_non_owner_missing_sandbox_choice() 
     )
     assert params is not None
     queue = get_approval_queue()
-    approval_id = queue.request(namespace="exec", params=params)
+    approval_id = _request_generated_sandbox_approval(manager, params)
 
     with pytest.raises(RpcHandlerError, match="requires owner principal"):
         await _handle_exec_approval_resolve(
@@ -754,7 +816,7 @@ async def test_exec_approval_resolve_rejects_non_owner_missing_sandbox_choice() 
 
 @pytest.mark.asyncio
 async def test_exec_approval_resolve_allows_non_owner_chat_scoped_path_mount(tmp_path) -> None:
-    from opensquilla.gateway.approval_queue import get_approval_queue, reset_approval_queue
+    from opensquilla.gateway.approval_queue import reset_approval_queue
     from opensquilla.gateway.rpc_approvals import _handle_exec_approval_resolve
     from opensquilla.sandbox.escalation import build_path_approval_params
     from opensquilla.sandbox.path_validation import MountDecision
@@ -777,8 +839,7 @@ async def test_exec_approval_resolve_allows_non_owner_chat_scoped_path_mount(tmp
         workspace=str(workspace),
     )
     assert params is not None
-    queue = get_approval_queue()
-    approval_id = queue.request(namespace="exec", params=params)
+    approval_id = _request_generated_sandbox_approval(manager, params)
 
     result = await _handle_exec_approval_resolve(
         {"id": approval_id, "approved": True, "choice": "allow_same_type"},
@@ -806,7 +867,7 @@ async def test_exec_approval_resolve_allows_non_owner_chat_scoped_path_mount(tmp
 
 @pytest.mark.asyncio
 async def test_exec_approval_resolve_allows_non_owner_sandbox_grant_denial() -> None:
-    from opensquilla.gateway.approval_queue import get_approval_queue, reset_approval_queue
+    from opensquilla.gateway.approval_queue import reset_approval_queue
     from opensquilla.gateway.rpc_approvals import _handle_exec_approval_resolve
     from opensquilla.sandbox.escalation import build_network_approval_params
     from opensquilla.sandbox.network_guard import NetworkDecision
@@ -826,8 +887,7 @@ async def test_exec_approval_resolve_allows_non_owner_sandbox_grant_denial() -> 
         fingerprint="fp123",
     )
     assert params is not None
-    queue = get_approval_queue()
-    approval_id = queue.request(namespace="exec", params=params)
+    approval_id = _request_generated_sandbox_approval(manager, params)
 
     result = await _handle_exec_approval_resolve(
         {"id": approval_id, "approved": False, "choice": "deny"},
@@ -876,7 +936,7 @@ async def test_exec_approval_resolve_leaves_sandbox_approval_pending_when_mutati
     )
     assert params is not None
     queue = get_approval_queue()
-    approval_id = queue.request(namespace="exec", params=params)
+    approval_id = _request_generated_sandbox_approval(manager, params)
 
     async def fail_apply(*args, **kwargs) -> None:
         raise RuntimeError("mutation failed")
@@ -936,7 +996,7 @@ async def test_exec_approval_resolve_claim_prevents_deny_race_from_landing_grant
     )
     assert params is not None
     queue = get_approval_queue()
-    approval_id = queue.request(namespace="exec", params=params)
+    approval_id = _request_generated_sandbox_approval(manager, params)
 
     mutation_started = asyncio.Event()
     release_mutation = asyncio.Event()
@@ -1014,7 +1074,7 @@ async def test_exec_approval_wait_and_consume_wait_for_sandbox_grant_apply(
     )
     assert params is not None
     queue = get_approval_queue()
-    approval_id = queue.request(namespace="exec", params=params)
+    approval_id = _request_generated_sandbox_approval(manager, params)
 
     mutation_started = asyncio.Event()
     release_mutation = asyncio.Event()
@@ -1096,7 +1156,7 @@ async def test_exec_approval_resolve_recovers_complete_failure_after_grant_apply
     )
     assert params is not None
     queue = get_approval_queue()
-    approval_id = queue.request(namespace="exec", params=params)
+    approval_id = _request_generated_sandbox_approval(manager, params)
     original_complete = queue.complete_claimed_resolution
     attempts = 0
 
@@ -1157,7 +1217,7 @@ async def test_exec_approval_resolve_finalize_failure_does_not_land_grant(
     )
     assert params is not None
     queue = get_approval_queue()
-    approval_id = queue.request(namespace="exec", params=params)
+    approval_id = _request_generated_sandbox_approval(manager, params)
 
     def fail_finalize(*args, **kwargs) -> None:
         raise RuntimeError("finalize failed")
