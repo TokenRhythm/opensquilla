@@ -825,6 +825,7 @@ def merge_run_context_overlay(
         bundles=overlay.bundles,
         public_network=overlay.public_network,
         temporary_grants=_merge_temporary_grants(base.temporary_grants, overlay.temporary_grants),
+        run_mode_source=overlay.run_mode_source,
         source=overlay.source,
     )
 

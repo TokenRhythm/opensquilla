@@ -41,6 +41,78 @@ class _SessionManager:
         return node
 
 
+def test_run_context_round_trips_mode_source() -> None:
+    from opensquilla.sandbox.run_context import (
+        RunContext,
+        run_context_from_origin_payload,
+    )
+
+    context = RunContext(
+        run_mode=RunMode.STANDARD,
+        workspace="/tmp/project",
+        run_mode_source="project_default",
+    )
+    restored = run_context_from_origin_payload(context.to_origin_payload())
+    assert restored is not None
+    assert restored.run_mode_source == "project_default"
+
+
+def test_run_context_rejects_unknown_mode_source() -> None:
+    from opensquilla.sandbox.run_context import run_context_from_origin_payload
+
+    restored = run_context_from_origin_payload(
+        {
+            "run_mode": "full",
+            "workspace": "/tmp/project",
+            "run_mode_source": "persisted_origin_claim",
+        }
+    )
+
+    assert restored is not None
+    assert restored.run_mode_source is None
+
+
+def test_run_context_rejects_unhashable_mode_source() -> None:
+    from opensquilla.sandbox.run_context import run_context_from_origin_payload
+
+    restored = run_context_from_origin_payload(
+        {
+            "run_mode": "full",
+            "workspace": "/tmp/project",
+            "run_mode_source": {"forged": "user"},
+        }
+    )
+
+    assert restored is not None
+    assert restored.run_mode_source is None
+
+
+def test_effective_legacy_project_full_becomes_implicit_project_standard() -> None:
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.sandbox.run_context import RunContext, effective_project_run_mode
+
+    resolved = effective_project_run_mode(
+        RunContext(run_mode=RunMode.FULL, workspace="/tmp/project"),
+        GatewayConfig(),
+    )
+
+    assert resolved.run_mode is RunMode.STANDARD
+    assert resolved.run_mode_source == "project_default"
+
+
+def test_effective_legacy_project_preserves_explicit_full() -> None:
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.sandbox.run_context import RunContext, effective_project_run_mode
+
+    resolved = effective_project_run_mode(
+        RunContext(run_mode=RunMode.FULL, workspace="/tmp/project"),
+        GatewayConfig(sandbox={"run_mode": "full"}),
+    )
+
+    assert resolved.run_mode is RunMode.FULL
+    assert resolved.run_mode_source is None
+
+
 @pytest.mark.asyncio
 async def test_default_run_context_is_full_host_access() -> None:
     from opensquilla.sandbox.config import SandboxSettings
@@ -64,8 +136,12 @@ async def test_default_run_context_is_full_host_access() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_context_initializes_from_global_default_and_persists_override() -> None:
-    from opensquilla.sandbox.run_context import get_run_context, set_run_mode
+async def test_sandbox_run_mode_set_persists_user_provenance() -> None:
+    from opensquilla.sandbox.run_context import (
+        get_run_context,
+        run_context_from_origin_payload,
+        set_run_mode,
+    )
 
     manager = _SessionManager()
     config = SimpleNamespace(
@@ -84,7 +160,12 @@ async def test_run_context_initializes_from_global_default_and_persists_override
 
     updated = await set_run_mode(manager, manager.node.session_key, RunMode.TRUSTED, config=config)
     assert updated.run_mode == RunMode.TRUSTED
-    assert manager.node.origin["sandbox_run_context"]["run_mode"] == "trusted"
+    restored = run_context_from_origin_payload(
+        manager.node.origin["sandbox_run_context"]
+    )
+    assert restored is not None
+    assert restored.run_mode is RunMode.TRUSTED
+    assert restored.run_mode_source == "user"
 
 
 @pytest.mark.asyncio
@@ -234,6 +315,7 @@ async def test_rpc_run_context_set_allows_owner_full_mode() -> None:
 
     assert result["runMode"] == "full"
     assert manager.node.origin["sandbox_run_context"]["run_mode"] == "full"
+    assert manager.node.origin["sandbox_run_context"]["run_mode_source"] == "user"
 
 
 @pytest.mark.asyncio
@@ -282,6 +364,7 @@ async def test_rpc_run_context_set_allows_non_owner_trusted_mode(
 
     assert result["runMode"] == "trusted"
     assert manager.node.origin["sandbox_run_context"]["run_mode"] == "trusted"
+    assert manager.node.origin["sandbox_run_context"]["run_mode_source"] == "user"
 
 
 @pytest.mark.asyncio
@@ -366,3 +449,8 @@ async def test_rpc_run_context_set_creates_owner_new_webchat_session(
     assert result["runMode"] == "trusted"
     assert manager.created == [(session_key, "main")]
     assert manager.sessions[session_key].origin["sandbox_run_context"]["run_mode"] == "trusted"
+    assert (
+        manager.sessions[session_key]
+        .origin["sandbox_run_context"]["run_mode_source"]
+        == "user"
+    )

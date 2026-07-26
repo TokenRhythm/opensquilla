@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from opensquilla.agents.scope import resolve_agent_workspace_dir
 from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
@@ -19,6 +20,37 @@ class ResolvedProjectPath:
     path: str
     path_key: str
     name: str
+
+
+ProjectWorkspaceStateReason = Literal[
+    "not_found",
+    "removed",
+    "untrusted",
+    "unavailable",
+    "canonical_changed",
+    "guard_required",
+    "binding_changed",
+]
+
+
+class ProjectWorkspaceStateError(RuntimeError):
+    def __init__(self, reason: ProjectWorkspaceStateReason) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+@dataclass(frozen=True)
+class ProjectWorkspaceGuard:
+    workspace_id: str
+    path: str
+    path_key: str
+
+
+@dataclass(frozen=True)
+class ValidatedProjectWorkspace:
+    workspace: ProjectWorkspace
+    canonical_path: str
+    guard: ProjectWorkspaceGuard
 
 
 def _normalized_path(candidate: Path) -> str:
@@ -66,20 +98,80 @@ def _legacy_project_path(value: str) -> ResolvedProjectPath | None:
 
 def workspace_is_available(workspace: ProjectWorkspace) -> bool:
     try:
-        return Path(workspace.path).is_dir()
-    except OSError:
+        _validate_stored_project_path(workspace)
+    except ProjectWorkspaceStateError:
         return False
+    return True
+
+
+def _validate_stored_project_path(workspace: ProjectWorkspace) -> str:
+    try:
+        candidate = Path(workspace.path).expanduser().resolve(strict=True)
+        if not candidate.is_dir() or candidate.parent == candidate:
+            raise ProjectWorkspaceStateError("unavailable")
+        with os.scandir(candidate):
+            pass
+    except ProjectWorkspaceStateError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ProjectWorkspaceStateError("unavailable") from exc
+    canonical = _normalized_path(candidate)
+    if project_path_key(candidate, strict=True) != workspace.path_key:
+        raise ProjectWorkspaceStateError("canonical_changed")
+    if canonical != workspace.path:
+        raise ProjectWorkspaceStateError("canonical_changed")
+    return canonical
+
+
+async def resolve_validated_project_workspace(
+    storage: Any,
+    workspace_id: str,
+) -> ValidatedProjectWorkspace:
+    workspace = await storage.get_project_workspace(workspace_id)
+    if workspace is None:
+        raise ProjectWorkspaceStateError("not_found")
+    if workspace.removed_at is not None:
+        raise ProjectWorkspaceStateError("removed")
+    if workspace.trusted_at is None:
+        raise ProjectWorkspaceStateError("untrusted")
+    canonical_path = await asyncio.to_thread(
+        _validate_stored_project_path,
+        workspace,
+    )
+    return ValidatedProjectWorkspace(
+        workspace=workspace,
+        canonical_path=canonical_path,
+        guard=ProjectWorkspaceGuard(
+            workspace_id=workspace.workspace_id,
+            path=canonical_path,
+            path_key=workspace.path_key,
+        ),
+    )
 
 
 async def project_workspace_payload(storage: Any, workspace: ProjectWorkspace) -> dict[str, Any]:
-    return {
+    availability_reason: ProjectWorkspaceStateReason | None = None
+    try:
+        validated = await resolve_validated_project_workspace(
+            storage,
+            workspace.workspace_id,
+        )
+        workspace = validated.workspace
+    except ProjectWorkspaceStateError as exc:
+        availability_reason = exc.reason
+    payload = {
         "id": workspace.workspace_id,
         "name": workspace.display_name,
         "path": workspace.path,
-        "taskCount": await storage.count_project_workspace_tasks(workspace.workspace_id),
+        "taskCount": await storage.count_project_workspace_tasks(
+            workspace.workspace_id
+        ),
         "pinned": workspace.pinned_at is not None,
-        "available": workspace_is_available(workspace),
+        "available": availability_reason is None,
     }
+    if availability_reason is not None:
+        payload["availabilityReason"] = availability_reason
+    return payload
 
 
 async def adopt_legacy_project_workspaces(
@@ -138,10 +230,15 @@ async def adopt_legacy_project_workspaces(
 
 
 __all__ = [
+    "ProjectWorkspaceGuard",
+    "ProjectWorkspaceStateError",
+    "ProjectWorkspaceStateReason",
     "ResolvedProjectPath",
+    "ValidatedProjectWorkspace",
     "adopt_legacy_project_workspaces",
     "project_path_key",
     "project_workspace_payload",
     "resolve_project_path",
+    "resolve_validated_project_workspace",
     "workspace_is_available",
 ]

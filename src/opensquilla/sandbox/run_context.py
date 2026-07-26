@@ -15,7 +15,12 @@ from opensquilla.sandbox.path_validation import (
     normalize_mount_access,
     normalize_path,
 )
-from opensquilla.sandbox.run_mode import RunMode, config_run_mode, normalize_run_mode
+from opensquilla.sandbox.run_mode import (
+    RunMode,
+    config_run_mode,
+    normalize_run_mode,
+    project_default_run_mode,
+)
 from opensquilla.sandbox.user_grants import load_user_grants_payload
 
 RUN_CONTEXT_ORIGIN_KEY = "sandbox_run_context"
@@ -66,11 +71,13 @@ class RunContext:
     bundles: tuple[PackageBundleGrant, ...] = ()
     public_network: tuple[PublicNetworkGrant, ...] = ()
     temporary_grants: tuple[TemporaryGrant, ...] = ()
+    run_mode_source: str | None = None
     source: str = "default"
 
     def to_origin_payload(self) -> dict[str, Any]:
         return {
             "run_mode": self.run_mode.value,
+            "run_mode_source": self.run_mode_source,
             "workspace": self.workspace,
             "mounts": [
                 {"path": grant.path, "access": grant.access, "scope": grant.scope}
@@ -180,6 +187,16 @@ def _workspace_from_payload(value: Any) -> str | None:
         return normalize_workspace_path(value)
     except ValueError:
         return None
+
+
+def _run_mode_source_from_payload(value: Any) -> str | None:
+    if isinstance(value, str) and value in {
+        "project_default",
+        "operator_default",
+        "user",
+    }:
+        return value
+    return None
 
 
 def _mounts_from_payload(
@@ -332,6 +349,9 @@ def _context_from_payload(payload: Any, source: str) -> RunContext | None:
             payload.get("public_network") or payload.get("publicNetwork")
         ),
         temporary_grants=_temporary_grants_from_payload(payload.get("temporary_grants")),
+        run_mode_source=_run_mode_source_from_payload(
+            payload.get("run_mode_source")
+        ),
         source=source,
     )
 
@@ -480,6 +500,7 @@ def _with_user_grants(context: RunContext) -> RunContext:
         bundles=bundles,
         public_network=public_network,
         temporary_grants=context.temporary_grants,
+        run_mode_source=context.run_mode_source,
         source=context.source,
     )
 
@@ -589,9 +610,25 @@ async def set_run_mode(
         bundles=existing.bundles,
         public_network=existing.public_network,
         temporary_grants=existing.temporary_grants,
+        run_mode_source="user",
         source="saved",
     )
     return await persist_run_context(session_manager, session_key, updated)
+
+
+def effective_project_run_mode(context: RunContext, config: Any) -> RunContext:
+    if (
+        context.run_mode is RunMode.FULL
+        and context.run_mode_source is None
+        and config_run_mode(config) is RunMode.FULL
+        and project_default_run_mode(config) is RunMode.STANDARD
+    ):
+        return replace(
+            context,
+            run_mode=RunMode.STANDARD,
+            run_mode_source="project_default",
+        )
+    return context
 
 
 __all__ = [
@@ -603,6 +640,7 @@ __all__ = [
     "PublicNetworkGrant",
     "RunContext",
     "TemporaryGrant",
+    "effective_project_run_mode",
     "get_run_context",
     "normalize_scope",
     "normalize_workspace_path",

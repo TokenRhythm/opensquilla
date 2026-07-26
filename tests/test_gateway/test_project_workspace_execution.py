@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -14,7 +15,11 @@ from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.task_runtime import TaskRuntime
-from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
+from opensquilla.sandbox.run_context import (
+    RUN_CONTEXT_ORIGIN_KEY,
+    run_context_from_origin_payload,
+)
+from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
 
@@ -105,7 +110,9 @@ async def add_project(stack: WorkspaceStack, path: Path):
 
 
 @pytest.mark.asyncio
-async def test_new_chat_binds_project_and_run_context_atomically(tmp_path: Path) -> None:
+async def test_new_project_uses_standard_with_project_default_provenance(
+    tmp_path: Path,
+) -> None:
     async with open_stack(tmp_path / "sessions.db") as stack:
         project = await add_project(stack, tmp_path / "project")
         assert project is not None
@@ -131,7 +138,78 @@ async def test_new_chat_binds_project_and_run_context_atomically(tmp_path: Path)
         assert session.origin is not None
         saved_context = session.origin[RUN_CONTEXT_ORIGIN_KEY]
         assert saved_context["workspace"] == project.path
-        assert saved_context["run_mode"] == "full"
+        assert saved_context["run_mode"] == "standard"
+        assert saved_context["run_mode_source"] == "project_default"
+
+
+@pytest.mark.asyncio
+async def test_explicit_full_project_uses_operator_default_provenance(
+    tmp_path: Path,
+) -> None:
+    async with open_stack(tmp_path / "sessions.db") as stack:
+        stack.context.config.sandbox.run_mode = "full"
+        project = await add_project(stack, tmp_path / "project")
+        assert project is not None
+        key = "agent:main:webchat:project-explicit-full"
+
+        response = await get_dispatcher().dispatch(
+            "project-explicit-full",
+            "chat.send",
+            {
+                "sessionKey": key,
+                "message": "pwd",
+                "workspaceId": project.workspace_id,
+                "clientRequestId": "project-explicit-full-request",
+            },
+            stack.context,
+        )
+        await asyncio.wait_for(stack.started.wait(), timeout=2.0)
+
+        assert response.ok is True
+        session = await stack.storage.get_session(key)
+        assert session is not None and session.origin is not None
+        restored = run_context_from_origin_payload(
+            session.origin[RUN_CONTEXT_ORIGIN_KEY]
+        )
+        assert restored is not None
+        assert restored.run_mode is RunMode.FULL
+        assert restored.run_mode_source == "operator_default"
+
+
+@pytest.mark.parametrize("mode", [RunMode.STANDARD, RunMode.TRUSTED])
+@pytest.mark.asyncio
+async def test_explicit_standard_and_trusted_project_modes_round_trip(
+    tmp_path: Path,
+    mode: RunMode,
+) -> None:
+    async with open_stack(tmp_path / f"{mode.value}-sessions.db") as stack:
+        stack.context.config.sandbox.run_mode = mode.value
+        project = await add_project(stack, tmp_path / f"{mode.value}-project")
+        assert project is not None
+        key = f"agent:main:webchat:project-explicit-{mode.value}"
+
+        response = await get_dispatcher().dispatch(
+            f"project-explicit-{mode.value}",
+            "chat.send",
+            {
+                "sessionKey": key,
+                "message": "pwd",
+                "workspaceId": project.workspace_id,
+                "clientRequestId": f"project-explicit-{mode.value}-request",
+            },
+            stack.context,
+        )
+        await asyncio.wait_for(stack.started.wait(), timeout=2.0)
+
+        assert response.ok is True
+        session = await stack.storage.get_session(key)
+        assert session is not None and session.origin is not None
+        restored = run_context_from_origin_payload(
+            session.origin[RUN_CONTEXT_ORIGIN_KEY]
+        )
+        assert restored is not None
+        assert restored.run_mode is mode
+        assert restored.run_mode_source == "operator_default"
 
 
 @pytest.mark.asyncio
@@ -256,6 +334,37 @@ async def test_removed_or_missing_project_rejects_without_creating_session(
         )
         assert missing.ok is False
         assert await stack.storage.get_session(missing_key) is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX symlinks")
+@pytest.mark.asyncio
+async def test_retargeted_project_rejects_without_creating_session(
+    tmp_path: Path,
+) -> None:
+    async with open_stack(tmp_path / "sessions.db") as stack:
+        project_path = tmp_path / "project"
+        replacement = tmp_path / "replacement"
+        project = await add_project(stack, project_path)
+        assert project is not None
+        replacement.mkdir()
+        project_path.rename(tmp_path / "project-old")
+        project_path.symlink_to(replacement, target_is_directory=True)
+        key = "agent:main:webchat:retargeted-project"
+
+        response = await get_dispatcher().dispatch(
+            "retargeted-project",
+            "chat.send",
+            {
+                "sessionKey": key,
+                "message": "no",
+                "workspaceId": project.workspace_id,
+            },
+            stack.context,
+        )
+
+        assert response.ok is False
+        assert response.error.code == "WORKSPACE_UNAVAILABLE"
+        assert await stack.storage.get_session(key) is None
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +12,16 @@ import pytest_asyncio
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc import RpcContext
+from opensquilla.gateway.rpc_workspaces import (
+    _handle_workspaces_list,
+    _handle_workspaces_open,
+)
+from opensquilla.project_workspaces import (
+    ProjectWorkspaceGuard,
+    ProjectWorkspaceStateError,
+    project_path_key,
+    resolve_validated_project_workspace,
+)
 from opensquilla.session.models import SessionNode
 from opensquilla.session.storage import SessionStorage
 
@@ -45,6 +59,281 @@ def _remote_ctx(owner_ctx: RpcContext) -> RpcContext:
         session_manager=owner_ctx.session_manager,
         config=owner_ctx.config,
     )
+
+
+async def _assert_workspace_unavailable(
+    ctx: RpcContext,
+    workspace_id: str,
+    reason: str,
+) -> None:
+    listed = await _handle_workspaces_list(None, ctx)
+    row = next(
+        item for item in listed["workspaces"] if item["id"] == workspace_id
+    )
+    assert row["available"] is False
+    assert row["availabilityReason"] == reason
+
+
+@pytest.mark.asyncio
+async def test_validated_workspace_returns_canonical_guard(
+    workspace_ctx: tuple[RpcContext, SessionStorage],
+    tmp_path: Path,
+) -> None:
+    ctx, storage = workspace_ctx
+    project = tmp_path / "guarded"
+    project.mkdir()
+    opened = await _handle_workspaces_open(
+        {"path": str(project), "trusted": True},
+        ctx,
+    )
+
+    resolved = await resolve_validated_project_workspace(
+        storage,
+        opened["workspace"]["id"],
+    )
+
+    assert resolved.canonical_path == str(project.resolve())
+    assert resolved.guard == ProjectWorkspaceGuard(
+        workspace_id=opened["workspace"]["id"],
+        path=str(project.resolve()),
+        path_key=project_path_key(project, strict=True),
+    )
+
+
+@pytest.mark.asyncio
+async def test_validated_workspace_rejects_not_found(
+    workspace_ctx: tuple[RpcContext, SessionStorage],
+) -> None:
+    ctx, storage = workspace_ctx
+
+    with pytest.raises(ProjectWorkspaceStateError) as raised:
+        await resolve_validated_project_workspace(storage, "missing")
+
+    assert raised.value.reason == "not_found"
+    listed = await _handle_workspaces_list(None, ctx)
+    assert all(item["id"] != "missing" for item in listed["workspaces"])
+
+
+@pytest.mark.asyncio
+async def test_validated_workspace_rejects_removed(
+    workspace_ctx: tuple[RpcContext, SessionStorage],
+    tmp_path: Path,
+) -> None:
+    ctx, storage = workspace_ctx
+    project = tmp_path / "removed"
+    project.mkdir()
+    opened = await _handle_workspaces_open(
+        {"path": str(project), "trusted": True},
+        ctx,
+    )
+    workspace_id = opened["workspace"]["id"]
+    await storage.remove_project_workspace(workspace_id)
+
+    with pytest.raises(ProjectWorkspaceStateError) as raised:
+        await resolve_validated_project_workspace(storage, workspace_id)
+
+    assert raised.value.reason == "removed"
+    listed = await _handle_workspaces_list(None, ctx)
+    assert all(item["id"] != workspace_id for item in listed["workspaces"])
+
+
+@pytest.mark.asyncio
+async def test_validated_workspace_rejects_untrusted(
+    workspace_ctx: tuple[RpcContext, SessionStorage],
+    tmp_path: Path,
+) -> None:
+    ctx, storage = workspace_ctx
+    project = tmp_path / "untrusted"
+    project.mkdir()
+    workspace = await storage.create_or_restore_project_workspace(
+        path=str(project.resolve()),
+        path_key=project_path_key(project, strict=True),
+        display_name=project.name,
+        trusted_at=None,
+    )
+
+    with pytest.raises(ProjectWorkspaceStateError) as raised:
+        await resolve_validated_project_workspace(storage, workspace.workspace_id)
+
+    assert raised.value.reason == "untrusted"
+    await _assert_workspace_unavailable(ctx, workspace.workspace_id, "untrusted")
+
+
+@pytest.mark.asyncio
+async def test_validated_workspace_rejects_missing_directory(
+    workspace_ctx: tuple[RpcContext, SessionStorage],
+    tmp_path: Path,
+) -> None:
+    ctx, storage = workspace_ctx
+    project = tmp_path / "missing"
+    project.mkdir()
+    opened = await _handle_workspaces_open(
+        {"path": str(project), "trusted": True},
+        ctx,
+    )
+    project.rmdir()
+    workspace_id = opened["workspace"]["id"]
+
+    with pytest.raises(ProjectWorkspaceStateError) as raised:
+        await resolve_validated_project_workspace(storage, workspace_id)
+
+    assert raised.value.reason == "unavailable"
+    await _assert_workspace_unavailable(ctx, workspace_id, "unavailable")
+
+
+@pytest.mark.asyncio
+async def test_validated_workspace_rejects_file_path(
+    workspace_ctx: tuple[RpcContext, SessionStorage],
+    tmp_path: Path,
+) -> None:
+    ctx, storage = workspace_ctx
+    project = tmp_path / "became-file"
+    project.mkdir()
+    opened = await _handle_workspaces_open(
+        {"path": str(project), "trusted": True},
+        ctx,
+    )
+    project.rmdir()
+    project.write_text("not a directory", encoding="utf-8")
+    workspace_id = opened["workspace"]["id"]
+
+    with pytest.raises(ProjectWorkspaceStateError) as raised:
+        await resolve_validated_project_workspace(storage, workspace_id)
+
+    assert raised.value.reason == "unavailable"
+    await _assert_workspace_unavailable(ctx, workspace_id, "unavailable")
+
+
+@pytest.mark.asyncio
+async def test_validated_workspace_rejects_filesystem_root(
+    workspace_ctx: tuple[RpcContext, SessionStorage],
+    tmp_path: Path,
+) -> None:
+    ctx, storage = workspace_ctx
+    root = Path(tmp_path.anchor)
+    workspace = await storage.create_or_restore_project_workspace(
+        path=str(root),
+        path_key=project_path_key(root, strict=True),
+        display_name="root",
+        trusted_at=1,
+    )
+
+    with pytest.raises(ProjectWorkspaceStateError) as raised:
+        await resolve_validated_project_workspace(storage, workspace.workspace_id)
+
+    assert raised.value.reason == "unavailable"
+    await _assert_workspace_unavailable(ctx, workspace.workspace_id, "unavailable")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX directory permissions")
+@pytest.mark.asyncio
+async def test_validated_workspace_rejects_posix_inaccessible_directory(
+    workspace_ctx: tuple[RpcContext, SessionStorage],
+    tmp_path: Path,
+) -> None:
+    ctx, storage = workspace_ctx
+    project = tmp_path / "inaccessible"
+    project.mkdir()
+    opened = await _handle_workspaces_open(
+        {"path": str(project), "trusted": True},
+        ctx,
+    )
+    workspace_id = opened["workspace"]["id"]
+    project.chmod(0)
+    try:
+        with pytest.raises(ProjectWorkspaceStateError) as raised:
+            await resolve_validated_project_workspace(storage, workspace_id)
+        assert raised.value.reason == "unavailable"
+        await _assert_workspace_unavailable(ctx, workspace_id, "unavailable")
+    finally:
+        project.chmod(0o700)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX symlinks")
+@pytest.mark.asyncio
+async def test_validated_workspace_rejects_symlink_retarget(
+    workspace_ctx: tuple[RpcContext, SessionStorage],
+    tmp_path: Path,
+) -> None:
+    ctx, storage = workspace_ctx
+    trusted = tmp_path / "trusted"
+    replacement = tmp_path / "replacement"
+    trusted.mkdir()
+    replacement.mkdir()
+    opened = await _handle_workspaces_open(
+        {"path": str(trusted), "trusted": True},
+        ctx,
+    )
+    moved = tmp_path / "trusted-old"
+    trusted.rename(moved)
+    trusted.symlink_to(replacement, target_is_directory=True)
+
+    with pytest.raises(ProjectWorkspaceStateError) as raised:
+        await resolve_validated_project_workspace(
+            storage,
+            opened["workspace"]["id"],
+        )
+    assert raised.value.reason == "canonical_changed"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX symlinks")
+@pytest.mark.asyncio
+async def test_workspace_payload_uses_strict_validator_for_availability(
+    workspace_ctx: tuple[RpcContext, SessionStorage],
+    tmp_path: Path,
+) -> None:
+    ctx, _storage = workspace_ctx
+    trusted = tmp_path / "trusted"
+    replacement = tmp_path / "replacement"
+    trusted.mkdir()
+    replacement.mkdir()
+    opened = await _handle_workspaces_open(
+        {"path": str(trusted), "trusted": True},
+        ctx,
+    )
+    trusted.rename(tmp_path / "trusted-old")
+    trusted.symlink_to(replacement, target_is_directory=True)
+    listed = await _handle_workspaces_list(None, ctx)
+    row = next(
+        item
+        for item in listed["workspaces"]
+        if item["id"] == opened["workspace"]["id"]
+    )
+    assert row["available"] is False
+    assert row["availabilityReason"] == "canonical_changed"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires a Windows junction")
+@pytest.mark.asyncio
+async def test_validated_workspace_rejects_windows_junction_retarget(
+    workspace_ctx: tuple[RpcContext, SessionStorage],
+    tmp_path: Path,
+) -> None:
+    ctx, storage = workspace_ctx
+    trusted = tmp_path / "trusted"
+    replacement = tmp_path / "replacement"
+    trusted.mkdir()
+    replacement.mkdir()
+    opened = await _handle_workspaces_open(
+        {"path": str(trusted), "trusted": True},
+        ctx,
+    )
+    trusted.rename(tmp_path / "trusted-old")
+    result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(trusted), str(replacement)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"junction creation unavailable: {result.stderr or result.stdout}")
+    workspace_id = opened["workspace"]["id"]
+
+    with pytest.raises(ProjectWorkspaceStateError) as raised:
+        await resolve_validated_project_workspace(storage, workspace_id)
+
+    assert raised.value.reason == "canonical_changed"
+    await _assert_workspace_unavailable(ctx, workspace_id, "canonical_changed")
 
 
 @pytest.mark.asyncio

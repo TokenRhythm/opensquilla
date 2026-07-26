@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -2213,6 +2214,80 @@ async def test_set_run_mode_preserves_bundle_and_temporary_grants(tmp_path):
     assert updated.bundles == (bundle,)
     assert updated.public_network == (public_network,)
     assert updated.temporary_grants == (temporary,)
+
+
+@pytest.mark.asyncio
+async def test_user_full_provenance_survives_grants_rehydration_and_overlay(
+    tmp_path: Path,
+) -> None:
+    from opensquilla.sandbox.config import SandboxSettings
+    from opensquilla.sandbox.escalation import merge_run_context_overlay
+    from opensquilla.sandbox.run_context import get_run_context, set_run_mode
+    from opensquilla.sandbox.run_context_service import (
+        add_domain_grant,
+        add_mount_grant,
+        enable_bundle_grant,
+    )
+    from opensquilla.sandbox.run_mode import RunMode
+
+    manager = _SessionManager()
+    config = SimpleNamespace(
+        sandbox=SandboxSettings(),
+        permissions=SimpleNamespace(default_mode="off"),
+    )
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+
+    await set_run_mode(
+        manager,
+        manager.node.session_key,
+        RunMode.FULL,
+        config=config,
+        workspace=str(workspace),
+    )
+    await add_mount_grant(
+        manager,
+        manager.node.session_key,
+        path=str(outside),
+        access="ro",
+        scope="chat",
+        config=config,
+        workspace=str(workspace),
+    )
+    await add_domain_grant(
+        manager,
+        manager.node.session_key,
+        domain="example.com",
+        scope="chat",
+        config=config,
+        workspace=str(workspace),
+    )
+    await enable_bundle_grant(
+        manager,
+        manager.node.session_key,
+        bundle_id="python-package-install",
+        scope="chat",
+        config=config,
+        workspace=str(workspace),
+    )
+
+    restored = await get_run_context(
+        manager,
+        manager.node.session_key,
+        config=config,
+        workspace=str(workspace),
+    )
+    overlay = replace(restored, source="resolved_overlay")
+    merged = merge_run_context_overlay(restored, overlay)
+
+    assert merged is not None
+    assert merged.run_mode is RunMode.FULL
+    assert merged.run_mode_source == "user"
+    assert len(merged.mounts) == 1
+    assert len(merged.domains) == 1
+    assert len(merged.bundles) == 1
 
 
 @pytest.mark.asyncio

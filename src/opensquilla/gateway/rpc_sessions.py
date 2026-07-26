@@ -42,13 +42,22 @@ from opensquilla.gateway.turn_ingress import (
     request_identity,
 )
 from opensquilla.paths import media_root_from_config
+from opensquilla.project_workspaces import (
+    ProjectWorkspaceStateError,
+    resolve_validated_project_workspace,
+)
 from opensquilla.sandbox.run_context import (
     RUN_CONTEXT_ORIGIN_KEY,
     RunContext,
     get_run_context,
     run_context_from_origin_payload,
 )
-from opensquilla.sandbox.run_mode import RunMode, config_run_mode, normalize_run_mode
+from opensquilla.sandbox.run_mode import (
+    RunMode,
+    config_run_mode,
+    normalize_run_mode,
+    project_default_run_mode,
+)
 from opensquilla.sandbox.run_mode_policy import (
     coerce_run_mode_for_principal,
     run_mode_allowed_for_principal,
@@ -1760,21 +1769,20 @@ async def _handle_sessions_send(
     storage = cast(SessionStorage, storage_candidate)
     selected_workspace = None
     if workspace_id is not None:
-        selected_workspace = await storage.get_project_workspace(workspace_id)
-        if selected_workspace is None or selected_workspace.removed_at is not None:
-            raise RpcHandlerError(
-                "WORKSPACE_NOT_FOUND",
-                "Project workspace not found.",
-            )
         try:
-            workspace_available = Path(selected_workspace.path).is_dir()
-        except OSError:
-            workspace_available = False
-        if not workspace_available:
+            selected_workspace = (
+                await resolve_validated_project_workspace(storage, workspace_id)
+            ).workspace
+        except ProjectWorkspaceStateError as exc:
+            if exc.reason in {"not_found", "removed"}:
+                raise RpcHandlerError(
+                    "WORKSPACE_NOT_FOUND",
+                    "Project workspace not found.",
+                ) from exc
             raise RpcHandlerError(
                 "WORKSPACE_UNAVAILABLE",
                 "The project directory is unavailable.",
-            )
+            ) from exc
 
     ingress_identity = request_identity(
         params,
@@ -1812,11 +1820,19 @@ async def _handle_sessions_send(
     if source_hint.get("caller_kind") == "web":
         create_kwargs["display_name"] = "WebChat"
     if selected_workspace is not None:
+        mode = project_default_run_mode(ctx.config)
+        mode_source = (
+            "project_default"
+            if mode is RunMode.STANDARD
+            and config_run_mode(ctx.config) is RunMode.FULL
+            else "operator_default"
+        )
         create_kwargs["workspace_id"] = selected_workspace.workspace_id
         create_kwargs["origin"] = {
             RUN_CONTEXT_ORIGIN_KEY: RunContext(
-                run_mode=config_run_mode(ctx.config),
+                run_mode=mode,
                 workspace=selected_workspace.path,
+                run_mode_source=mode_source,
                 source="project_workspace",
             ).to_origin_payload()
         }
