@@ -726,17 +726,15 @@ function onBackdrop(e: MouseEvent) {
 }
 
 
-/* Active row carries the brand orange: a whisper of warm tint plus the same
-   2px leading bar the sidebar's active destination uses. Small-area only — the
-   tint stays under 10% so the title keeps full contrast, and no text is
-   recoloured. */
+/* Lark marks the highlighted row with a plain neutral fill — no leading bar, no
+   tinted border, no recoloured text. The row is being pointed at, not flagged;
+   brand colour stays on the action you press, not on where the cursor is. */
 .cmdp-option.is-active {
-  background: color-mix(in srgb, var(--accent-secondary) 8%, var(--bg-surface));
-  border-color: color-mix(in srgb, var(--accent-secondary) 22%, var(--border));
-  box-shadow: inset 2px 0 0 var(--accent-secondary);
+  background: var(--bg-hover);
+  border-color: transparent;
 }
 .cmdp-option.is-active .cmdp-option__icon {
-  color: var(--accent-secondary);
+  color: var(--text-muted);
 }
 
 @media (max-width: 768px) {

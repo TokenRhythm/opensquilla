@@ -26,7 +26,11 @@
   /* Card border / control border / disabled, per Lark. */
   --border: #DEE0E3;
   --border-strong: #D0D3D6;
-  --border-focus: #BA4D0F;
+  /* Emphasis border for hover/focus rings. Deliberately NEUTRAL: this token is
+     also the hover border on stat cards, the composer, and approval/clarify
+     cards, so tying it to the brand turned every hover orange. Brand colour is
+     applied explicitly where it belongs, not through this. */
+  --border-focus: #8F959E;
   --card: #FFFFFF;
   --hairline: #EFF0F1;
 
@@ -104,9 +108,12 @@
 [data-theme="light"] {
   --font-sans: var(--font-sans-default);
   --font-display: var(--font-display-default);
+  /* Lark keeps corners flat and uniform — one 8px radius from controls up to
+     dialogs, rather than a 8/12/16/20 ladder that made panels and modals read
+     as soft pillows. */
   --radius-control: var(--radius-md);
-  --radius-card: var(--radius-lg);
-  --radius-panel: var(--radius-xl);
-  --radius-modal: var(--radius-2xl);
+  --radius-card: var(--radius-md);
+  --radius-panel: var(--radius-md);
+  --radius-modal: var(--radius-md);
   --radius-pill: var(--radius-full);
 }
