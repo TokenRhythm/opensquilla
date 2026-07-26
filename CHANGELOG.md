@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Shell commands that would terminate the gateway's own process
+  (`Stop-Process -Id <gateway pid>`, `taskkill /PID`, `kill`, and
+  name-targeted variants) are structurally refused in every host mode,
+  before any configurable policy layer; other processes stay manageable.
+- Config persistence explicitly routes non-UTF-8 (e.g. GBK-corrupted)
+  config files into the backup-then-rewrite recovery path, with regression
+  coverage for corrupt-file recovery, CJK round-trips, and mid-write
+  failures leaving the original bytes untouched.
+
 ### Changed
 
 - Closing the Desktop main window now preserves the live Control UI on macOS

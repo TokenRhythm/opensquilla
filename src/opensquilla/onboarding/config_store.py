@@ -594,7 +594,12 @@ def _persist_plan(
         try:
             with target.open("rb") as fh:
                 raw = tomllib.load(fh)
-        except (tomllib.TOMLDecodeError, ValueError) as exc:
+        # UnicodeDecodeError is a ValueError subclass, but list it explicitly:
+        # a config corrupted with non-UTF-8 bytes (seen when an agent edited
+        # the file through a shell with a legacy codepage) must take this
+        # recovery branch — back up the corrupt bytes, then rewrite valid
+        # UTF-8 from the in-memory config — and never propagate as a crash.
+        except (tomllib.TOMLDecodeError, UnicodeDecodeError, ValueError) as exc:
             disk_usable = False
             log.warning(
                 "onboarding.config_persist_unreadable_toml",
