@@ -242,7 +242,7 @@ class TranscriptAppendPort(Protocol):
         reasoning_content: str | None,
         turn_usage: dict[str, Any] | None,
         token_count: int | None,
-    ) -> bool: ...
+    ) -> TranscriptAppendResult | bool: ...
 
 @runtime_checkable
 class TurnMemoryCapturePort(Protocol):
@@ -307,6 +307,7 @@ def _turn_usage_payload(
         "decision_id": getattr(done_event, "decision_id", None),
     }
     optional_fields = {
+        "provider": getattr(done_event, "provider", None),
         "image_route_reason": getattr(done_event, "image_route_reason", None),
         "vision_followup_gate_decision": getattr(
             done_event,
@@ -399,9 +400,29 @@ class TurnErrorPersistPort(Protocol):
         event: ErrorEvent | None,
     ) -> None: ...
 
+
+@runtime_checkable
+class UsageTelemetryPort(Protocol):
+    """Best-effort local aggregation for a completed top-level turn."""
+
+    async def record_turn(self, *, run_kind: str, done_event: DoneEvent | None) -> None: ...
+
+
+class _NullUsageTelemetryPort:
+    async def record_turn(self, *, run_kind: str, done_event: DoneEvent | None) -> None:
+        return None
+
 # ---------------------------------------------------------------------------
-# Cost-rollup result -- exposed for equivalence-harness pinning
+# Finalizer result values
 # ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TranscriptAppendResult:
+    """Assistant transcript persistence result from the concrete adapter."""
+
+    appended: bool
+    message_id: str | None = None
+
 
 @dataclass(frozen=True)
 class CostRollupResult:
@@ -494,6 +515,11 @@ class TurnFinalizerStageOutput:
     cost_rollup: CostRollupResult | None
     # Did the assistant turn actually persist?
     transcript_appended: bool
+    # Exact assistant row and payload persisted for this turn. The gateway
+    # stores these on channel tasks so delivery never has to infer ownership
+    # from whichever assistant row happens to be newest.
+    assistant_message_id: str | None
+    assistant_message_content: str | None
     # Did the memory capture fire?
     memory_captured: bool
 
@@ -541,11 +567,13 @@ class TurnFinalizerStage:
         turn_memory_capture: TurnMemoryCapturePort,
         session_totals: SessionTotalsPort,
         turn_error_persist: TurnErrorPersistPort,
+        usage_telemetry: UsageTelemetryPort | None = None,
     ) -> None:
         self._transcript_append = transcript_append
         self._turn_memory_capture = turn_memory_capture
         self._session_totals = session_totals
         self._turn_error_persist = turn_error_persist
+        self._usage_telemetry = usage_telemetry or _NullUsageTelemetryPort()
 
     async def run(
         self,
@@ -569,7 +597,15 @@ class TurnFinalizerStage:
             heartbeat_ack_max_chars=inp.heartbeat_ack_max_chars,
         )
         turn_segments = inp.turn_segments
-        if (
+        if inp.run_kind == "heartbeat" and original_final_text != final_text:
+            turn_segments = [
+                segment
+                for segment in turn_segments
+                if not (isinstance(segment, dict) and segment.get("type") == "text")
+            ]
+            if final_text:
+                turn_segments.append({"type": "text", "text": final_text})
+        elif (
             original_final_text
             and not final_text
             and turn_segments
@@ -583,6 +619,8 @@ class TurnFinalizerStage:
         final_text = _with_unconfirmed_action_notice(final_text, turn_segments)
 
         transcript_appended = False
+        assistant_message_id: str | None = None
+        assistant_message_content: str | None = None
         memory_captured = False
 
         # 2. Transcript append + 3. memory capture (paired -- memory
@@ -608,7 +646,7 @@ class TurnFinalizerStage:
             token_count = (
                 inp.done_event.output_tokens if inp.done_event is not None else None
             )
-            transcript_appended = await self._transcript_append.append_message(
+            append_result = await self._transcript_append.append_message(
                 inp.session_key,
                 role="assistant",
                 content=persisted_content,
@@ -620,6 +658,15 @@ class TurnFinalizerStage:
                 ),
                 token_count=token_count,
             )
+            if isinstance(append_result, TranscriptAppendResult):
+                transcript_appended = append_result.appended
+                assistant_message_id = append_result.message_id
+            else:
+                # Backward compatibility for third-party/direct stage adapters
+                # that implement the original boolean port contract.
+                transcript_appended = bool(append_result)
+            if transcript_appended:
+                assistant_message_content = persisted_content
             if transcript_appended:
                 try:
                     await self._turn_memory_capture.capture_turn(
@@ -669,6 +716,16 @@ class TurnFinalizerStage:
                     error=str(exc),
                 )
 
+        # 6. Aggregate telemetry governed by the unified privacy switch. The
+        # port stores counters only; failures must never alter the turn result.
+        try:
+            await self._usage_telemetry.record_turn(
+                run_kind=inp.run_kind,
+                done_event=inp.done_event,
+            )
+        except Exception as exc:  # noqa: BLE001 - log-and-continue intentional
+            log.warning("turn_runner.usage_telemetry_persist_failed", error=str(exc))
+
         return StageOutcome.success(
             TurnFinalizerStageOutput(
                 final_text=final_text,
@@ -679,6 +736,8 @@ class TurnFinalizerStage:
                 done_event=inp.done_event,
                 cost_rollup=cost_rollup,
                 transcript_appended=transcript_appended,
+                assistant_message_id=assistant_message_id,
+                assistant_message_content=assistant_message_content,
                 memory_captured=memory_captured,
             )
         )

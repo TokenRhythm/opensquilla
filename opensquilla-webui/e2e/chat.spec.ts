@@ -14,48 +14,106 @@ test.describe('Chat Page', () => {
     await expect(page).toHaveTitle(/OpenSquilla/)
   })
 
-  test('sidebar core shows fixed rows with the Console fold', async ({ page }) => {
+  test('sidebar core shows the flat primary navigation', async ({ page }) => {
     const core = page.locator('.sidebar-core')
 
-    // The old grouped nav (WORK/OPERATE/OBSERVE) and the Chat row are gone;
-    // Approvals only appears while requests are pending (count badge).
-    await expect(page.locator('.sidebar-nav-group-label')).toHaveCount(0)
+    // Chat stays the dedicated New-chat action. Long-lived Agent management and
+    // the old Build disclosure are intentionally absent from the primary rail.
     await expect(core.getByText('Chat', { exact: true })).toHaveCount(0)
-    const hasPendingApprovals = (await page.locator('.approval-inline').count()) > 0
     await expect(core.locator('> .sidebar-fn-item .sidebar-fn-label')).toHaveText(
-      hasPendingApprovals ? ['Sessions', 'Approvals', 'Console'] : ['Sessions', 'Console'],
+      ['Sessions', 'Overview', 'Skills & Channels', 'Cron'],
     )
+    await expect(core.getByText('Agents', { exact: true })).toHaveCount(0)
+    await expect(core.locator('.sidebar-nav-group-toggle')).toHaveCount(0)
+  })
 
-    // Console row toggles the fold without navigating.
-    const urlBefore = page.url()
-    const consoleRow = core.getByRole('button', { name: 'Console' })
-    await expect(consoleRow).toHaveAttribute('aria-expanded', 'false')
-    await expect(page.locator('#sidebar-console-list')).toHaveCount(0)
+  test('command palette keeps the Skills & Channels hub together in Work', async ({ page }) => {
+    await page.locator('.sidebar-cmd-btn').click()
+    const palette = page.getByRole('dialog', { name: 'Search and go to' })
+    await expect(palette).toBeVisible()
 
-    await consoleRow.click()
-    await expect(consoleRow).toHaveAttribute('aria-expanded', 'true')
-    // Health folded into Overview, so the console fold holds seven pages.
-    await expect(page.locator('#sidebar-console-list .sidebar-fn-label')).toHaveText([
-      'Agents', 'Channels', 'Cron', 'Skills',
-      'Overview', 'Usage', 'Logs',
-    ])
-    expect(page.url()).toBe(urlBefore)
+    for (const name of ['Sessions', 'Overview', 'Skills & Channels', 'Channels', 'Cron']) {
+      await expect(palette.getByRole('option', { name, exact: true })).toBeVisible()
+    }
+    const labels = await palette.locator('.cmdp-option__label').allTextContents()
+    expect(labels.indexOf('Channels')).toBe(labels.indexOf('Skills & Channels') + 1)
+    await expect(palette.locator('.cmdp-group-label', { hasText: /^Overview$/ })).toBeVisible()
+    await expect(palette.getByRole('option', { name: 'Agents', exact: true })).toHaveCount(0)
+    await expect(palette.locator('.cmdp-group-label', { hasText: /^Build$/ })).toHaveCount(0)
+  })
 
-    await consoleRow.click()
-    await expect(consoleRow).toHaveAttribute('aria-expanded', 'false')
-    await expect(page.locator('#sidebar-console-list')).toHaveCount(0)
+  test('Overview and Skills & Channels own disjoint route families', async ({ page }) => {
+    const overview = page.locator('.sidebar-core').getByRole('link', { name: 'Overview' })
+    const skillsChannels = page.locator('.sidebar-core').getByRole('link', { name: 'Skills & Channels' })
+    for (const path of ['overview', 'usage', 'logs']) {
+      await page.goto(CONTROL_URL + path)
+      await expect(overview).toHaveClass(/is-active/)
+      await expect(overview).toHaveAttribute('aria-current', 'page')
+      await expect(skillsChannels).not.toHaveClass(/is-active/)
+    }
+    for (const path of ['skills', 'channels']) {
+      await page.goto(CONTROL_URL + path)
+      await expect(skillsChannels).toHaveClass(/is-active/)
+      await expect(skillsChannels).toHaveAttribute('aria-current', 'page')
+      await expect(overview).not.toHaveClass(/is-active/)
+    }
+  })
+
+  test('Skills and Channels use canonical route links through history and reload', async ({ page }) => {
+    await page.goto(CONTROL_URL + 'skills')
+    let hub = page.getByRole('navigation', { name: 'Skills & Channels' })
+    const skills = hub.getByRole('link', { name: 'Skills', exact: true })
+    const channels = hub.getByRole('link', { name: 'Channels', exact: true })
+
+    await expect(skills).toHaveAttribute('aria-current', 'page')
+    await expect(channels).not.toHaveAttribute('aria-current', 'page')
+    await channels.click()
+    await expect(page).toHaveURL(/\/channels$/)
+    await expect(channels).toHaveAttribute('aria-current', 'page')
+
+    await page.goBack()
+    await expect(page).toHaveURL(/\/skills$/)
+    await expect(skills).toHaveAttribute('aria-current', 'page')
+
+    await page.reload()
+    hub = page.getByRole('navigation', { name: 'Skills & Channels' })
+    await expect(hub.getByRole('link', { name: 'Skills', exact: true }))
+      .toHaveAttribute('aria-current', 'page')
+  })
+
+  test('Overview exposes only Status and Usage while keeping Logs directly reachable', async ({ page }) => {
+    await page.goto(CONTROL_URL + 'overview')
+    const hub = page.getByRole('navigation', { name: 'Overview' })
+    const status = hub.getByRole('link', { name: 'Status', exact: true })
+    const usage = hub.getByRole('link', { name: 'Usage', exact: true })
+
+    await expect(hub.getByRole('link')).toHaveCount(2)
+    await expect(status).toHaveAttribute('aria-current', 'page')
+    await expect(hub.getByRole('link', { name: 'Logs', exact: true })).toHaveCount(0)
+    await usage.click()
+    await expect(page).toHaveURL(/\/usage$/)
+    await expect(usage).toHaveAttribute('aria-current', 'page')
+
+    await page.goBack()
+    await expect(page).toHaveURL(/\/overview$/)
+    await expect(status).toHaveAttribute('aria-current', 'page')
+
+    await page.goto(CONTROL_URL + 'logs')
+    await expect(page).toHaveURL(/\/logs$/)
+    await expect(page.getByRole('heading', { name: 'Logs', level: 1 })).toBeVisible()
   })
 
   test('can navigate between views', async ({ page }) => {
     const core = page.locator('.sidebar-core')
 
-    await core.getByRole('button', { name: 'Console' }).click()
     await core.getByText('Overview', { exact: true }).click()
     await expect(page).toHaveURL(/\/overview/)
 
-    // The fold stays open while moving between console pages.
-    await core.getByText('Logs', { exact: true }).click()
-    await expect(page).toHaveURL(/\/logs/)
+    await core.getByText('Skills & Channels', { exact: true }).click()
+    await expect(page).toHaveURL(/\/skills/)
+
+    await core.getByText('Cron', { exact: true }).click()
+    await expect(page).toHaveURL(/\/cron/)
 
     await core.getByText('Sessions', { exact: true }).click()
     await expect(page).toHaveURL(/\/sessions/)

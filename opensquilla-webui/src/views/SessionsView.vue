@@ -22,6 +22,7 @@
       :running-count="runningCount"
       :queued-count="queuedCount"
       :cost-usd="costUsd"
+      :cost-period="costPeriod"
       @open-approvals="openBlockedSession"
       @open-usage="router.push('/usage')"
     />
@@ -84,6 +85,7 @@
         v-else
         :entries="ledgerEntries"
         :agent-names="agentNames"
+        :agents-loaded="agentsLoaded"
         :needs-input-keys="needsInputKeys"
         @open="openSession"
         @remove="removeSession"
@@ -112,6 +114,8 @@ import Icon from '@/components/Icon.vue'
 import ErrorState from '@/components/ErrorState.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import { useConfirm } from '@/composables/useConfirm'
+import { requestUsageSnapshot } from '@/composables/usage/useUsageQuery'
+import type { UsageSnapshot } from '@/types/usage'
 import SessionsTaskInput from '@/components/sessions/SessionsTaskInput.vue'
 import SessionsAttentionStrip from '@/components/sessions/SessionsAttentionStrip.vue'
 import SessionsLedger from '@/components/sessions/SessionsLedger.vue'
@@ -129,15 +133,12 @@ import {
   localSessionsDeletedDetail,
   LOCAL_SESSIONS_DELETED_EVENT,
 } from '@/utils/sessionSync'
+import { sessionAgentIdentity } from '@/components/sessions/sessionDisplay'
 
 type FilterId = 'all' | 'chats' | 'automations' | 'channels'
 
 interface AgentsListResponse {
   agents?: Array<{ id?: string; name?: string }>
-}
-
-interface UsageStatusResponse {
-  totalCostUsd?: number
 }
 
 interface DeleteResponse {
@@ -171,12 +172,16 @@ const { sessionsList, allSessions, isLoading, sessionListError, loadSessions } =
 const filter = ref<FilterId>('all')
 const search = ref('')
 const agentNames = ref<Map<string, string>>(new Map())
+const agentsLoaded = ref(false)
+let agentsRequestGeneration = 0
 const pendingApprovals = ref<string[]>([])
 const costUsd = ref<number | null>(null)
+const costPeriod = ref<'today' | 'total'>('total')
 
 let refreshTimer: ReturnType<typeof setTimeout> | null = null
 let pollTimer: ReturnType<typeof setInterval> | null = null
 let unsubs: Array<() => void> = []
+let lastCostSnapshot: UsageSnapshot | null = null
 
 // ---------------------------------------------------------------------------
 // Derivations
@@ -225,9 +230,14 @@ const inspectParent = computed(() => {
 })
 
 const inspectAgentName = computed(() => {
-  const id = inspectItem.value?.effectiveAgentId
-  if (!id || id === 'unknown') return t('sessions.unknownAgent')
-  return agentNames.value.get(id) || id
+  const identity = sessionAgentIdentity(
+    inspectItem.value?.effectiveAgentId,
+    agentNames.value,
+    agentsLoaded.value,
+  )
+  if (identity.kind === 'unknown') return t('sessions.unknownAgent')
+  if (identity.kind === 'deleted') return t('sessions.deletedAgent', { id: identity.value })
+  return identity.value
 })
 
 // ---------------------------------------------------------------------------
@@ -235,14 +245,21 @@ const inspectAgentName = computed(() => {
 // ---------------------------------------------------------------------------
 
 async function loadAgents() {
+  const generation = ++agentsRequestGeneration
   try {
     const data = await rpc.call<AgentsListResponse>('agents.list')
+    if (generation !== agentsRequestGeneration) return
     agentNames.value = new Map(
       (data?.agents || [])
         .filter(agent => agent.id)
         .map(agent => [String(agent.id), String(agent.name || agent.id)]))
+    agentsLoaded.value = true
   } catch {
-    // Ledger falls back to agent ids.
+    if (generation === agentsRequestGeneration) {
+      // A stale directory must not produce false “Deleted agent” labels after
+      // the current authoritative lookup failed.
+      agentsLoaded.value = false
+    }
   }
 }
 
@@ -270,10 +287,21 @@ async function refreshApprovals() {
 
 async function refreshCost() {
   try {
-    const data = await rpc.call<UsageStatusResponse>('usage.status')
-    costUsd.value = data?.totalCostUsd != null ? Number(data.totalCostUsd) : null
+    const snapshot = await requestUsageSnapshot(rpc, 'today', {
+      days: false,
+      models: false,
+      sessions: false,
+      // Old gateways only expose lifetime totals. Showing that value is safe
+      // as long as the label says total rather than incorrectly claiming today.
+      fallbackRange: 'all',
+      cachedSnapshot: lastCostSnapshot,
+    })
+    lastCostSnapshot = snapshot
+    costUsd.value = snapshot.totals.cost
+    costPeriod.value = snapshot.source === 'usage_ledger' ? 'today' : 'total'
   } catch {
     costUsd.value = null
+    costPeriod.value = 'total'
   }
 }
 

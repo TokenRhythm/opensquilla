@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -27,9 +27,13 @@ class UsageSummary:
     model: str = ""
     aggregate: bool = False
     session_totals: SessionTotalsSnapshot | None = None
+    model_usage_breakdown: list[dict[str, Any]] = field(default_factory=list)
+    ensemble_trace: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_done_event(cls, event: object) -> UsageSummary:
+        raw_breakdown = getattr(event, "model_usage_breakdown", None)
+        raw_trace = getattr(event, "ensemble_trace", None)
         return cls(
             input_tokens=int(getattr(event, "input_tokens", 0) or 0),
             output_tokens=int(getattr(event, "output_tokens", 0) or 0),
@@ -39,6 +43,12 @@ class UsageSummary:
             billed_cost=float(getattr(event, "billed_cost", 0.0) or 0.0),
             cost_source=str(getattr(event, "cost_source", "none") or "none"),
             model=str(getattr(event, "model", "") or ""),
+            model_usage_breakdown=(
+                [dict(row) for row in raw_breakdown if isinstance(row, dict)]
+                if isinstance(raw_breakdown, list)
+                else []
+            ),
+            ensemble_trace=dict(raw_trace) if isinstance(raw_trace, dict) else {},
         )
 
     @classmethod
@@ -56,6 +66,12 @@ class UsageSummary:
                 cost_usd=float(raw_totals.get("cost_usd") or 0.0),
                 billed_cost=float(raw_totals.get("billed_cost") or 0.0),
             )
+        raw_breakdown = payload.get("model_usage_breakdown")
+        if raw_breakdown is None:
+            raw_breakdown = payload.get("modelUsageBreakdown")
+        raw_trace = payload.get("ensemble_trace")
+        if raw_trace is None:
+            raw_trace = payload.get("ensembleTrace")
         return cls(
             input_tokens=int(payload.get("input_tokens") or payload.get("inputTokens") or 0),
             output_tokens=int(payload.get("output_tokens") or payload.get("outputTokens") or 0),
@@ -70,6 +86,12 @@ class UsageSummary:
             ),
             model=str(payload.get("model") or ""),
             session_totals=session_totals,
+            model_usage_breakdown=(
+                [dict(row) for row in raw_breakdown if isinstance(row, dict)]
+                if isinstance(raw_breakdown, list)
+                else []
+            ),
+            ensemble_trace=dict(raw_trace) if isinstance(raw_trace, dict) else {},
         )
 
     def has_values(self) -> bool:

@@ -27,11 +27,22 @@ from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc import RpcContext
 from opensquilla.gateway.scopes import ADMIN_SCOPE, METHOD_SCOPES
 
-# Top-level (and only) envelope. ``latencyMs`` is the wall time of the network
-# round-trip in whole milliseconds; it stays 0 when the probe never reached the
-# network (missing key, provider build failure).
+# Top-level (and only) envelope. ``latencyMs`` remains the legacy end-to-end
+# duration, while ``totalMs`` names that duration explicitly and
+# ``firstResponseMs`` records the first non-empty text/reasoning delta. Timing
+# stays 0/null when the probe never reached the network.
 PROBE_ENVELOPE_KEYS = frozenset(
-    {"ok", "providerId", "model", "failureKind", "message", "code", "latencyMs"}
+    {
+        "ok",
+        "providerId",
+        "model",
+        "failureKind",
+        "message",
+        "code",
+        "latencyMs",
+        "firstResponseMs",
+        "totalMs",
+    }
 )
 
 
@@ -95,6 +106,9 @@ async def test_probe_envelope_keys_are_frozen_on_ok_path(tmp_path, monkeypatch: 
     # type and sign are pinned — never a wall-clock magnitude.
     assert isinstance(payload["latencyMs"], int)
     assert payload["latencyMs"] >= 0
+    assert isinstance(payload["firstResponseMs"], int)
+    assert payload["firstResponseMs"] >= 0
+    assert payload["totalMs"] == payload["latencyMs"]
 
 
 async def test_probe_envelope_keys_are_frozen_on_classified_failure(
@@ -119,6 +133,8 @@ async def test_probe_envelope_keys_are_frozen_on_classified_failure(
     assert payload["code"] == "401"
     assert isinstance(payload["latencyMs"], int)
     assert payload["latencyMs"] >= 0
+    assert payload["firstResponseMs"] is None
+    assert payload["totalMs"] == payload["latencyMs"]
 
 
 async def test_probe_latency_is_zero_when_network_never_reached(
@@ -136,6 +152,8 @@ async def test_probe_latency_is_zero_when_network_never_reached(
     assert payload["ok"] is False
     assert payload["failureKind"] == "auth_invalid"
     assert payload["latencyMs"] == 0
+    assert payload["firstResponseMs"] is None
+    assert payload["totalMs"] == 0
 
 
 def test_probe_method_is_admin_scoped() -> None:

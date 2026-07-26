@@ -16,6 +16,7 @@ from opensquilla.provider.selector import ProviderBuildError, ProviderConfig, _b
         ("gemini", "gemini"),
         ("dashscope", "dashscope"),
         ("bailian_coding", "bailian_coding"),
+        ("bailian_coding_cn", "bailian_coding"),
         ("moonshot", "moonshot"),
         ("kimi_coding_openai", "moonshot"),
         ("minimax_coding_openai", "minimax"),
@@ -57,6 +58,11 @@ def test_new_openai_compatible_profiles_have_vendor_provider_kind(
             "bailian_coding",
             "BAILIAN_API_KEY",
             "https://coding-intl.dashscope.aliyuncs.com/v1",
+        ),
+        (
+            "bailian_coding_cn",
+            "BAILIAN_API_KEY",
+            "https://coding.dashscope.aliyuncs.com/v1",
         ),
         ("moonshot", "MOONSHOT_API_KEY", "https://api.moonshot.ai/v1"),
         (
@@ -249,6 +255,7 @@ def test_mimo_anthropic_profile_is_explicit_anthropic_compatible() -> None:
         ("gemini", "gemini-2.5-flash"),
         ("dashscope", "qwen-plus"),
         ("bailian_coding", "kimi-k2.5"),
+        ("bailian_coding_cn", "qwen3.7-plus"),
         ("moonshot", "kimi-k2.5"),
         ("kimi_coding_openai", "kimi-for-coding"),
         ("mistral", "mistral-large-latest"),

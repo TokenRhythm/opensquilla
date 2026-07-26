@@ -2,15 +2,38 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import os
+import uuid
 from dataclasses import dataclass, field, replace
+from io import BytesIO
 from typing import Protocol
 
 import httpx
+from PIL import Image
 
+from opensquilla.endpoint_identity import credential_env_for_endpoint
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.provider.app_attribution import provider_app_headers
+from opensquilla.provider.correlation_context import (
+    bind_provider_request_correlation,
+    current_provider_request_correlation,
+)
+from opensquilla.provider.image_generation_policy import (
+    conflicting_image_generation_endpoint_provider,
+    image_generation_llm_endpoint_allows_credential_reuse,
+    is_valid_image_generation_base_url,
+    parse_image_generation_model_ref,
+    resolve_image_generation_base_url,
+)
+from opensquilla.provider.tokenrhythm_correlation import (
+    tokenrhythm_correlation_headers,
+)
+from opensquilla.provider.types import (
+    ProviderRequestCorrelation,
+    derive_provider_request_correlation,
+)
 from opensquilla.secrets import clean_header_secret
 
 
@@ -21,6 +44,10 @@ class ImageGenerationRequest:
     size: str
     output_format: str = "png"
     timeout_seconds: float = 180.0
+    provider_request_correlation: ProviderRequestCorrelation | None = field(
+        default=None,
+        repr=False,
+    )
 
 
 @dataclass
@@ -59,10 +86,12 @@ class OpenAIImageGenerationProvider:
         api_key: str | None = None,
         api_key_env: str = "OPENAI_API_KEY",
         base_url: str = "https://api.openai.com/v1",
+        provider_kind: str = "openai",
     ) -> None:
         self._api_key = api_key
         self._api_key_env = api_key_env
         self._base_url = base_url.rstrip("/")
+        self._provider_kind = provider_kind
 
     def _resolve_api_key(self) -> str:
         return clean_header_secret(
@@ -76,6 +105,7 @@ class OpenAIImageGenerationProvider:
         return f"{self._base_url}{path}"
 
     async def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
+        _raise_for_conflicting_official_endpoint(self.provider_id, self._base_url)
         api_key = self._resolve_api_key()
         if not api_key:
             raise RuntimeError(f"{self._api_key_env} is not set")
@@ -87,17 +117,43 @@ class OpenAIImageGenerationProvider:
             "output_format": request.output_format,
             "n": 1,
         }
-        async with httpx.AsyncClient(
-            timeout=request.timeout_seconds,
-            trust_env=_trust_env(),
-        ) as client:
-            response = await client.post(
-                self._api_url("/v1/images/generations"),
-                headers={"Authorization": f"Bearer {api_key}"},
-                json=payload,
-            )
-            response.raise_for_status()
-            data = response.json()
+        from opensquilla.engine.usage_http import reserve_direct_usage_call
+
+        usage = await reserve_direct_usage_call(
+            provider=self.provider_id,
+            model=request.model,
+            base_url=self._base_url,
+        )
+        try:
+            async with httpx.AsyncClient(
+                timeout=request.timeout_seconds,
+                trust_env=_trust_env(),
+                follow_redirects=False,
+            ) as client:
+                response = await client.post(
+                    self._api_url("/v1/images/generations"),
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        **tokenrhythm_correlation_headers(
+                            self._provider_kind,
+                            self._base_url,
+                            request.provider_request_correlation,
+                        ),
+                    },
+                    json=payload,
+                )
+                response.raise_for_status()
+                data = response.json()
+                await usage.finalize_openai_response(
+                    data,
+                    raw_json=str(getattr(response, "text", "") or ""),
+                )
+        except asyncio.CancelledError:
+            await usage.mark_unknown("cancelled")
+            raise
+        except Exception:
+            await usage.mark_unknown("direct_request_failed")
+            raise
 
         items = data.get("data") or []
         if not items:
@@ -129,10 +185,12 @@ class OpenRouterImageGenerationProvider:
         api_key: str | None = None,
         api_key_env: str = "OPENROUTER_API_KEY",
         base_url: str = "https://openrouter.ai/api/v1",
+        provider_kind: str = "openrouter",
     ) -> None:
         self._api_key = api_key
         self._api_key_env = api_key_env
         self._base_url = base_url.rstrip("/")
+        self._provider_kind = provider_kind
 
     def _resolve_api_key(self) -> str:
         return clean_header_secret(
@@ -155,6 +213,7 @@ class OpenRouterImageGenerationProvider:
         return {"aspect_ratio": aspect_ratio, "image_size": "1K"}
 
     async def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
+        _raise_for_conflicting_official_endpoint(self.provider_id, self._base_url)
         api_key = self._resolve_api_key()
         if not api_key:
             raise RuntimeError(f"{self._api_key_env} is not set")
@@ -166,21 +225,45 @@ class OpenRouterImageGenerationProvider:
             "stream": False,
             "image_config": self._image_config_for_size(request.size),
         }
-        async with httpx.AsyncClient(
-            timeout=request.timeout_seconds,
-            trust_env=_trust_env(),
-        ) as client:
-            response = await client.post(
-                self._api_url("/v1/chat/completions"),
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                    **provider_app_headers(self._base_url),
-                },
-                json=payload,
-            )
-            response.raise_for_status()
-            data = response.json()
+        from opensquilla.engine.usage_http import reserve_direct_usage_call
+
+        usage = await reserve_direct_usage_call(
+            provider=self.provider_id,
+            model=request.model,
+            base_url=self._base_url,
+        )
+        try:
+            async with httpx.AsyncClient(
+                timeout=request.timeout_seconds,
+                trust_env=_trust_env(),
+                follow_redirects=False,
+            ) as client:
+                response = await client.post(
+                    self._api_url("/v1/chat/completions"),
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                        **provider_app_headers(self._base_url),
+                        **tokenrhythm_correlation_headers(
+                            self._provider_kind,
+                            self._base_url,
+                            request.provider_request_correlation,
+                        ),
+                    },
+                    json=payload,
+                )
+                response.raise_for_status()
+                data = response.json()
+                await usage.finalize_openai_response(
+                    data,
+                    raw_json=str(getattr(response, "text", "") or ""),
+                )
+        except asyncio.CancelledError:
+            await usage.mark_unknown("cancelled")
+            raise
+        except Exception:
+            await usage.mark_unknown("direct_request_failed")
+            raise
 
         image_url = _extract_openrouter_image_url(data)
         if not image_url:
@@ -213,6 +296,80 @@ def _decode_data_url(data_url: str) -> tuple[str, bytes]:
     return mime_type, base64.b64decode(encoded)
 
 
+def _raise_for_conflicting_official_endpoint(provider_id: str, base_url: str) -> None:
+    if not is_valid_image_generation_base_url(base_url):
+        raise RuntimeError(
+            f"Image generation provider {provider_id!r} has invalid endpoint "
+            f"{base_url!r}; set an absolute http:// or https:// image base URL"
+        )
+    conflicting_provider = conflicting_image_generation_endpoint_provider(
+        provider_id,
+        base_url,
+    )
+    if conflicting_provider is None:
+        return
+    raise RuntimeError(
+        f"Image generation provider {provider_id!r} cannot use "
+        f"{conflicting_provider!r}'s official endpoint {base_url!r}; "
+        f"set the {provider_id!r} image base URL before retrying"
+    )
+
+
+_IMAGE_OUTPUT_FORMATS: dict[str, tuple[str, str]] = {
+    "png": ("PNG", "image/png"),
+    "jpg": ("JPEG", "image/jpeg"),
+    "jpeg": ("JPEG", "image/jpeg"),
+    "webp": ("WEBP", "image/webp"),
+}
+
+
+def _normalize_generated_image(
+    result: ImageGenerationResult,
+    output_format: str,
+) -> ImageGenerationResult:
+    normalized_format = output_format.strip().lower()
+    format_spec = _IMAGE_OUTPUT_FORMATS.get(normalized_format)
+    if format_spec is None:
+        raise RuntimeError(f"Unsupported image output format: {output_format!r}")
+    pillow_format, mime_type = format_spec
+
+    try:
+        with Image.open(BytesIO(result.image_bytes)) as image:
+            image.verify()
+        with Image.open(BytesIO(result.image_bytes)) as image:
+            image.load()
+            output_image: Image.Image = image
+            if pillow_format == "JPEG" and image.mode != "RGB":
+                if image.mode in {"RGBA", "LA"} or (
+                    image.mode == "P" and "transparency" in image.info
+                ):
+                    rgba = image.convert("RGBA")
+                    try:
+                        output_image = Image.new("RGB", image.size, "white")
+                        output_image.paste(rgba, mask=rgba.getchannel("A"))
+                    finally:
+                        rgba.close()
+                else:
+                    output_image = image.convert("RGB")
+
+            buffer = BytesIO()
+            try:
+                output_image.save(buffer, format=pillow_format)
+            finally:
+                if output_image is not image:
+                    output_image.close()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Image generation provider returned invalid image bytes: {exc}"
+        ) from exc
+
+    return replace(
+        result,
+        image_bytes=buffer.getvalue(),
+        mime_type=mime_type,
+    )
+
+
 _PROVIDERS: dict[str, ImageGenerationProvider] = {}
 
 
@@ -226,28 +383,33 @@ def _field_was_set(config: object | None, name: str) -> bool:
     return isinstance(fields_set, set) and name in fields_set
 
 
-def _llm_provider_matches(llm_config: object | None, provider_id: str) -> bool:
-    provider = _get_config_attr(llm_config, "provider").strip().lower()
-    return provider == provider_id
-
-
 def _resolve_configured_api_key(
     *,
     provider_id: str,
     provider_config: object | None,
     llm_config: object | None,
-    default_env: str,
+    api_key_env: str,
+    default_base_url: str,
+    effective_base_url: str,
 ) -> str | None:
-    env_name = _get_config_attr(provider_config, "api_key_env", default_env) or default_env
     explicit = _get_config_attr(provider_config, "api_key")
     if explicit:
         return explicit
 
-    env_value = os.environ.get(env_name, "")
+    env_value = os.environ.get(api_key_env, "")
     if env_value:
         return env_value
 
-    if _llm_provider_matches(llm_config, provider_id):
+    if image_generation_llm_endpoint_allows_credential_reuse(
+        provider_id=provider_id,
+        llm_config=llm_config,
+        default_base_url=default_base_url,
+        effective_base_url=effective_base_url,
+    ):
+        # The primary LLM key is a credential for the LLM's endpoint only:
+        # it must not follow a custom image base_url to a different
+        # scheme/host/effective port. Fail closed so generate() reports the
+        # missing key and the operator enters one for the image endpoint.
         return _get_config_attr(llm_config, "api_key") or None
     return None
 
@@ -259,12 +421,12 @@ def _resolve_configured_base_url(
     llm_config: object | None,
     default_base_url: str,
 ) -> str:
-    base_url = _get_config_attr(provider_config, "base_url", default_base_url) or default_base_url
-    if not _field_was_set(provider_config, "base_url") and _llm_provider_matches(
-        llm_config, provider_id
-    ):
-        return _get_config_attr(llm_config, "base_url", base_url) or base_url
-    return base_url
+    return resolve_image_generation_base_url(
+        provider_id=provider_id,
+        provider_config=provider_config,
+        llm_config=llm_config,
+        default_base_url=default_base_url,
+    )
 
 
 def register_image_generation_provider(provider: ImageGenerationProvider) -> None:
@@ -281,23 +443,49 @@ def reset_image_generation_providers(
     openai_config = getattr(providers_config, "openai", None)
     openrouter_config = getattr(providers_config, "openrouter", None)
 
+    openai_base_url = _resolve_configured_base_url(
+        provider_id="openai",
+        provider_config=openai_config,
+        llm_config=llm_config,
+        default_base_url="https://api.openai.com/v1",
+    )
+    openai_api_key_env = credential_env_for_endpoint(
+        configured_env=_get_config_attr(openai_config, "api_key_env", "OPENAI_API_KEY"),
+        configured_explicitly=_field_was_set(openai_config, "api_key_env"),
+        default_env="OPENAI_API_KEY",
+        default_base_url="https://api.openai.com/v1",
+        effective_base_url=openai_base_url,
+    )
     register_image_generation_provider(
         OpenAIImageGenerationProvider(
             api_key=_resolve_configured_api_key(
                 provider_id="openai",
                 provider_config=openai_config,
                 llm_config=llm_config,
-                default_env="OPENAI_API_KEY",
-            ),
-            api_key_env=_get_config_attr(openai_config, "api_key_env", "OPENAI_API_KEY")
-            or "OPENAI_API_KEY",
-            base_url=_resolve_configured_base_url(
-                provider_id="openai",
-                provider_config=openai_config,
-                llm_config=llm_config,
+                api_key_env=openai_api_key_env,
                 default_base_url="https://api.openai.com/v1",
+                effective_base_url=openai_base_url,
             ),
+            api_key_env=openai_api_key_env,
+            base_url=openai_base_url,
         )
+    )
+    openrouter_base_url = _resolve_configured_base_url(
+        provider_id="openrouter",
+        provider_config=openrouter_config,
+        llm_config=llm_config,
+        default_base_url="https://openrouter.ai/api/v1",
+    )
+    openrouter_api_key_env = credential_env_for_endpoint(
+        configured_env=_get_config_attr(
+            openrouter_config,
+            "api_key_env",
+            "OPENROUTER_API_KEY",
+        ),
+        configured_explicitly=_field_was_set(openrouter_config, "api_key_env"),
+        default_env="OPENROUTER_API_KEY",
+        default_base_url="https://openrouter.ai/api/v1",
+        effective_base_url=openrouter_base_url,
     )
     register_image_generation_provider(
         OpenRouterImageGenerationProvider(
@@ -305,16 +493,12 @@ def reset_image_generation_providers(
                 provider_id="openrouter",
                 provider_config=openrouter_config,
                 llm_config=llm_config,
-                default_env="OPENROUTER_API_KEY",
-            ),
-            api_key_env=_get_config_attr(openrouter_config, "api_key_env", "OPENROUTER_API_KEY")
-            or "OPENROUTER_API_KEY",
-            base_url=_resolve_configured_base_url(
-                provider_id="openrouter",
-                provider_config=openrouter_config,
-                llm_config=llm_config,
+                api_key_env=openrouter_api_key_env,
                 default_base_url="https://openrouter.ai/api/v1",
+                effective_base_url=openrouter_base_url,
             ),
+            api_key_env=openrouter_api_key_env,
+            base_url=openrouter_base_url,
         )
     )
 
@@ -327,11 +511,24 @@ def get_image_generation_provider(provider_id: str) -> ImageGenerationProvider |
     return _PROVIDERS.get(provider_id)
 
 
-def parse_image_generation_model_ref(raw: str) -> tuple[str, str]:
-    provider, sep, model = raw.partition("/")
-    if not sep or not provider.strip() or not model.strip():
-        raise ValueError(f"Invalid image generation model ref: {raw!r}")
-    return provider.strip(), model.strip()
+def _is_image_generation_correlation(
+    correlation: ProviderRequestCorrelation,
+) -> bool:
+    return correlation.call_kind in {
+        "auxiliary.image_generation",
+        "auxiliary.image_generation.provider_fallback",
+    }
+
+
+def _provider_fallback_correlation(
+    correlation: ProviderRequestCorrelation | None,
+) -> ProviderRequestCorrelation | None:
+    if correlation is None or correlation.call_kind.endswith(".provider_fallback"):
+        return correlation
+    return derive_provider_request_correlation(
+        correlation,
+        call_kind=f"{correlation.call_kind}.provider_fallback",
+    )
 
 
 async def generate_with_fallbacks(
@@ -339,13 +536,27 @@ async def generate_with_fallbacks(
     request: ImageGenerationRequest,
     candidates: list[str],
 ) -> ImageGenerationResult:
+    correlation_base = (
+        request.provider_request_correlation
+        or current_provider_request_correlation()
+    )
+    correlation = correlation_base
+    if correlation is not None and not _is_image_generation_correlation(correlation):
+        correlation = derive_provider_request_correlation(
+            correlation,
+            execution_id=uuid.uuid4().hex,
+            call_kind="auxiliary.image_generation",
+        )
+    request = replace(request, provider_request_correlation=correlation)
     attempts: list[ImageGenerationAttempt] = []
     last_error: Exception | None = None
-    for candidate in candidates:
+    for candidate_index, candidate in enumerate(candidates):
         try:
             provider_id, model = parse_image_generation_model_ref(candidate)
         except ValueError as exc:
-            attempts.append(ImageGenerationAttempt(provider="", model=candidate, error=str(exc)))
+            attempts.append(
+                ImageGenerationAttempt(provider="", model=candidate, error=str(exc))
+            )
             last_error = exc
             continue
         provider = get_image_generation_provider(provider_id)
@@ -354,10 +565,23 @@ async def generate_with_fallbacks(
             attempts.append(ImageGenerationAttempt(provider_id, model, error))
             last_error = RuntimeError(error)
             continue
+        call_correlation = (
+            correlation
+            if candidate_index == 0
+            else _provider_fallback_correlation(correlation)
+        )
         try:
-            result = await provider.generate(replace(request, model=model))
+            with bind_provider_request_correlation(call_correlation):
+                result = await provider.generate(
+                    replace(
+                        request,
+                        model=model,
+                        provider_request_correlation=call_correlation,
+                    )
+                )
             if not result.image_bytes:
                 raise RuntimeError("Image generation provider returned empty image")
+            result = _normalize_generated_image(result, request.output_format)
             result.attempts = attempts
             return result
         except Exception as exc:  # noqa: BLE001 - failures are summarized for fallback

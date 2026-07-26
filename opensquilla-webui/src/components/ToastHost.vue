@@ -63,6 +63,11 @@ const { toasts, dismissToast } = useToasts()
   background: color-mix(in srgb, var(--ok) 10%, var(--bg-elevated));
 }
 
+.toast--warn {
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--border-strong));
+  background: color-mix(in srgb, var(--warn) 10%, var(--bg-elevated));
+}
+
 .toast--danger {
   border-color: color-mix(in srgb, var(--danger) 45%, var(--border-strong));
   background: color-mix(in srgb, var(--danger) 10%, var(--bg-elevated));

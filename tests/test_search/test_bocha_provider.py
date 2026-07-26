@@ -114,8 +114,10 @@ async def test_bocha_missing_api_key_raises_auth_error(
 @pytest.mark.parametrize(
     ("status_code", "kind", "retryable"),
     [
+        (400, "http", False),
         (401, "auth", False),
         (403, "auth", False),
+        (408, "http", True),
         (429, "rate_limit", True),
         (500, "http", True),
     ],
@@ -125,7 +127,10 @@ async def test_bocha_http_errors_are_classified(
     kind: str,
     retryable: bool,
 ) -> None:
+    requests: list[httpx.Request] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
         return httpx.Response(status_code, json={"error": "nope"})
 
     provider = BochaSearchProvider(
@@ -140,13 +145,16 @@ async def test_bocha_http_errors_are_classified(
     assert exc_info.value.kind == kind
     assert exc_info.value.retryable is retryable
     assert exc_info.value.status_code == status_code
+    assert len(requests) == 1
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("api_code", "kind", "retryable", "status_code"),
     [
+        ("400", "http", False, 400),
         ("401", "auth", False, 401),
+        ("408", "http", True, 408),
         ("429", "rate_limit", True, 429),
         ("500", "http", True, 500),
     ],
@@ -157,7 +165,10 @@ async def test_bocha_api_error_codes_are_classified(
     retryable: bool,
     status_code: int,
 ) -> None:
+    requests: list[httpx.Request] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
         return httpx.Response(200, json={"code": api_code, "msg": "bocha error"})
 
     provider = BochaSearchProvider(
@@ -173,6 +184,81 @@ async def test_bocha_api_error_codes_are_classified(
     assert exc_info.value.retryable is retryable
     assert exc_info.value.status_code == status_code
     assert str(exc_info.value) == "bocha error"
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_bocha_nonnumeric_api_error_is_terminal() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"code": "INVALID_PARAMETER", "msg": "invalid request"},
+        )
+
+    provider = BochaSearchProvider(
+        api_key="dummy-bocha-key",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(SearchProviderError) as exc_info:
+        await provider.search("OpenSquilla")
+
+    assert exc_info.value.kind == "http"
+    assert exc_info.value.retryable is False
+    assert exc_info.value.status_code is None
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_type", "kind"),
+    [(httpx.ReadTimeout, "timeout"), (httpx.ConnectError, "network")],
+)
+async def test_bocha_transport_errors_are_retryable_once(
+    error_type: type[httpx.HTTPError],
+    kind: str,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        raise error_type("transient failure", request=request)
+
+    provider = BochaSearchProvider(
+        api_key="dummy-bocha-key",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(SearchProviderError) as exc_info:
+        await provider.search("OpenSquilla")
+
+    assert exc_info.value.kind == kind
+    assert exc_info.value.retryable is True
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_bocha_malformed_json_is_terminal_parse_error() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, text="not json")
+
+    provider = BochaSearchProvider(
+        api_key="dummy-bocha-key",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(SearchProviderError) as exc_info:
+        await provider.search("OpenSquilla")
+
+    assert exc_info.value.kind == "parse"
+    assert exc_info.value.retryable is False
+    assert len(requests) == 1
 
 
 def test_bocha_provider_spec_is_runtime_supported_after_import() -> None:

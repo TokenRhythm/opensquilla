@@ -17,8 +17,8 @@ import { hexToRgb, stripAllComments } from './lib/css-utils.mjs'
 // colour. Backgrounds are intentionally out of scope (too many valid neutral
 // shades to allowlist without false positives).
 //
-// The legacy gateway frontend (src/opensquilla/gateway/static/css) is NOT scanned
-// here — its status (resync vs. freeze) is a separate, still-open decision.
+// The gateway serves the generated Vue bundle from static/dist; its source
+// tokens are covered by check-webui-colors.mjs and therefore are not rescanned.
 const repoRoot = fileURLToPath(new URL('../../', import.meta.url))
 
 // The canonical "strike" family — the Instrument accent and its documented

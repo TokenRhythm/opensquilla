@@ -7,10 +7,10 @@ Two boundaries are exercised here:
    probing tool names. The registry-miss envelope they see must be opaque,
    while the structured log retains the actual tool name for operators.
 
-2. The :class:`PermissionMatrixPolicy` must clamp CHANNEL principals to
-   ``role="user"`` even when ``is_owner`` is True, so a future ctx leak
-   cannot promote a channel caller to operator and bypass the
-   ``ADMIN_ONLY`` gate.
+2. The :class:`PermissionMatrixPolicy` must reject a generic owner CHANNEL
+   context unless it also carries the authenticated ingress marker. Only that
+   marker can promote a configured channel admin through the ``ADMIN_ONLY``
+   gate.
 """
 
 from __future__ import annotations
@@ -208,7 +208,7 @@ def _registry_with(name: str) -> ToolRegistry:
 
 
 @pytest.mark.asyncio
-async def test_permission_matrix_clamps_channel_is_owner_leak_to_user_role() -> None:
+async def test_permission_matrix_rejects_unverified_owner_channel_context() -> None:
     """A leaked ``is_owner=True`` on a CHANNEL ctx must not promote to operator.
 
     ``git_push`` is ``ADMIN_ONLY`` in the permission matrix. A genuine
@@ -250,6 +250,35 @@ async def test_permission_matrix_clamps_channel_is_owner_leak_to_user_role() -> 
     ]
     assert matrix_blocks, "permission matrix must record the block"
     assert matrix_blocks[0]["reason"].startswith("admin_only_denied_in_")
+
+
+@pytest.mark.asyncio
+async def test_permission_matrix_allows_authenticated_channel_admin_context() -> None:
+    """The ingress-verified admin marker is sufficient for admin-only tools."""
+    handler = build_tool_handler(_registry_with("git_push"))
+    ctx = ToolContext(
+        is_owner=True,
+        channel_admin_verified=True,
+        caller_kind=CallerKind.CHANNEL,
+        interaction_mode=InteractionMode.UNATTENDED,
+        agent_id="main",
+        session_key="agent:main:hardening",
+        channel_id="oc_channel",
+    )
+    token = current_tool_context.set(ctx)
+    try:
+        result = await handler(
+            ToolCall(
+                tool_use_id="tc-matrix-admin",
+                tool_name="git_push",
+                arguments={},
+            )
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert result.is_error is False
+    assert result.content == "ok"
 
 
 @pytest.mark.asyncio

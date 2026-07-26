@@ -38,7 +38,8 @@ logs
 # --- Docs + tests NOT needed inside the runtime image -----------------------
 tests
 docs
-scripts
+scripts/*
+!scripts/verify_webui_artifact.py
 CHANGELOG.md
 KNOWN_LIMITATIONS.md
 
@@ -47,15 +48,25 @@ install.sh
 install.ps1
 
 # --- Secrets + local config (never shipped) --------------------------------
-.env
-.env.*
+.env*
+**/.env*
+.npmrc
+**/.npmrc
 *.pem
+**/*.pem
 *.key
+**/*.key
 
 # --- Build artefacts --------------------------------------------------------
 dist
 build
 *.egg-info
+**/node_modules
+opensquilla-webui/test-results
+
+# The WebUI bundle is rebuilt in the builder stage. Never merge a local,
+# potentially stale bundle into the generated artifact copied from that stage.
+src/opensquilla/gateway/static/dist
 
 # --- CI / local tooling -----------------------------------------------------
 uv.lock

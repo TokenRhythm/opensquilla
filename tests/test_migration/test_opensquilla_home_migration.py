@@ -377,6 +377,53 @@ def test_dry_run_reports_only_the_session_count_for_candidate_metadata(
     assert "synthetic-session-b" not in serialized
 
 
+def test_code_task_runs_are_left_in_source_for_preview_and_apply(
+    tmp_path: Path,
+) -> None:
+    source = _build_source_home(tmp_path)
+    code_task_python = (
+        source
+        / "code-task"
+        / "codetask-task-synthetic"
+        / "repo"
+        / ".venv"
+        / "bin"
+        / "python"
+    )
+    code_task_python.parent.mkdir(parents=True)
+    link_payload = "/synthetic/uv/python/cpython/bin/python3"
+    if os.name == "nt":
+        code_task_python.write_text("synthetic generated interpreter", encoding="utf-8")
+    else:
+        code_task_python.symlink_to(link_payload)
+    target = tmp_path / "target-home"
+
+    preview = _run(source, target, apply=False)
+    assert not target.exists()
+    applied = _run(source, target, apply=True)
+
+    for report in (preview, applied):
+        assert not _errors(report)
+        skipped = [
+            item
+            for item in report["items"]
+            if item["kind"] == "home-entry"
+            and item["status"] == "skipped"
+            and Path(item["source"]).name == "code-task"
+        ]
+        assert len(skipped) == 1
+        assert "machine-local" in skipped[0]["reason"]
+
+    assert not (target / "code-task").exists()
+    if os.name == "nt":
+        assert code_task_python.read_text(encoding="utf-8") == (
+            "synthetic generated interpreter"
+        )
+    else:
+        assert code_task_python.is_symlink()
+        assert os.readlink(code_task_python) == link_payload
+
+
 def test_direct_migrator_rejects_config_path_without_writing(tmp_path: Path) -> None:
     source = _build_source_home(tmp_path)
     target = tmp_path / "target-home"
@@ -700,6 +747,55 @@ def test_overwrite_takes_timestamped_backups(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX source-link contract; Windows source reparse points stay fail-closed",
+)
+def test_replacement_preserves_old_profile_links_but_excludes_source_code_task(
+    tmp_path: Path,
+) -> None:
+    source = _build_source_home(tmp_path)
+    source_project = source / "workspace" / "project"
+    source_project.mkdir()
+    (source_project / "COPYING").write_text("new license\n", encoding="utf-8")
+    (source_project / "LICENSE").symlink_to("COPYING")
+    source_code_task = source / "code-task" / "run" / "repo" / ".venv" / "bin"
+    source_code_task.mkdir(parents=True)
+    (source_code_task / "python").symlink_to("/missing/source/python")
+
+    target = tmp_path / "target-home"
+    (target / "workspace").mkdir(parents=True)
+    (target / "workspace" / "old-only.txt").write_text("old\n", encoding="utf-8")
+    historical = target / "state" / "workspace"
+    historical.mkdir(parents=True)
+    (historical / "COPYING").write_text("old license\n", encoding="utf-8")
+    (historical / "LICENSE").symlink_to("COPYING")
+    old_code_task = target / "code-task" / "run" / "repo" / ".venv" / "bin"
+    old_code_task.mkdir(parents=True)
+    (old_code_task / "python").symlink_to("/missing/old/python")
+
+    report = _run(
+        source,
+        target,
+        apply=True,
+        replace_target=True,
+        confirm_replace_target=target,
+    )
+
+    assert not _errors(report)
+    assert os.readlink(target / "workspace" / "project" / "LICENSE") == "COPYING"
+    assert not (target / "code-task").exists()
+    backup = next(tmp_path.glob("target-home.backup.*"))
+    assert os.readlink(backup / "state" / "workspace" / "LICENSE") == "COPYING"
+    assert os.readlink(
+        backup / "code-task" / "run" / "repo" / ".venv" / "bin" / "python"
+    ) == "/missing/old/python"
+    history = json.loads(
+        (tmp_path / "profile-replacement-history.json").read_text(encoding="utf-8")
+    )
+    assert history["backups"][0]["backup"] == _normalized_path(backup)
+
+
 def test_published_target_validation_never_ignores_a_replaced_journal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -915,6 +1011,56 @@ def test_live_source_gateway_refused(tmp_path: Path) -> None:
     assert not target.exists()
 
 
+def test_read_only_preview_allows_the_active_target_gateway(tmp_path: Path) -> None:
+    source = _build_source_home(tmp_path / "source-root")
+    target = tmp_path / "target-home"
+    (target / "state").mkdir(parents=True)
+    (target / "config.toml").write_text("port = 18791\n", encoding="utf-8")
+    (target / "state" / "gateway.pid").write_text(
+        json.dumps({"pid": os.getpid(), "start_ts": "2026-01-01T00:00:00+00:00"}),
+        encoding="utf-8",
+    )
+    before = _file_bytes(target)
+
+    report = OpenSquillaHomeMigrator(
+        OpenSquillaMigrationOptions(
+            source=source,
+            target=target,
+            apply=False,
+            replace_target=True,
+            allow_running_target_preview=True,
+        )
+    ).migrate()
+
+    assert report["apply"] is False
+    assert report["preflight"]["target_gateway_running"] is True
+    assert not _errors(report)
+    assert _file_bytes(target) == before
+
+
+def test_running_target_preview_escape_hatch_is_rejected_for_apply(
+    tmp_path: Path,
+) -> None:
+    source = _build_source_home(tmp_path / "source-root")
+    target = tmp_path / "target-home"
+
+    report = OpenSquillaHomeMigrator(
+        OpenSquillaMigrationOptions(
+            source=source,
+            target=target,
+            apply=True,
+            allow_running_target_preview=True,
+        )
+    ).migrate()
+
+    assert any(
+        item["kind"] == "options"
+        and "valid for dry-run only" in item["reason"]
+        for item in _errors(report)
+    )
+    assert not target.exists()
+
+
 def test_schema_ahead_source_refused(tmp_path: Path) -> None:
     source = _build_source_home(
         tmp_path, applied_ids=("V001__initial_schema", "V999__future_thing")
@@ -1103,6 +1249,26 @@ def test_candidate_size_does_not_collapse_when_directory_identity_is_unavailable
 ) -> None:
     source = _build_source_home(tmp_path / "source")
     monkeypatch.setattr(migration_module, "_advisory_identity", lambda _result: None)
+
+    candidate = inspect_opensquilla_home_candidate(source, kind="cli-home")
+
+    assert candidate is not None
+    assert isinstance(candidate.size_bytes, int)
+    assert candidate.size_bytes > 0
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX link metadata contract; Windows reparse points stay fail-closed",
+)
+def test_candidate_size_ignores_workspace_and_excluded_code_task_links(
+    tmp_path: Path,
+) -> None:
+    source = _build_source_home(tmp_path / "source")
+    (source / "workspace" / "MEMORY.alias.md").symlink_to("MEMORY.md")
+    code_task_bin = source / "code-task" / "run" / "repo" / ".venv" / "bin"
+    code_task_bin.mkdir(parents=True)
+    (code_task_bin / "python").symlink_to("/missing/generated/python")
 
     candidate = inspect_opensquilla_home_candidate(source, kind="cli-home")
 
@@ -1600,6 +1766,130 @@ def test_external_agent_workspace_is_snapshotted_and_rebased(tmp_path: Path) -> 
     )
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX link contract; Windows reparse points stay fail-closed",
+)
+def test_in_profile_configured_workspace_links_are_classified_before_copy(
+    tmp_path: Path,
+) -> None:
+    source = _build_source_home(tmp_path)
+    project = source / "custom-workspace" / "project"
+    project.mkdir(parents=True)
+    (project / "COPYING").write_text("license\n", encoding="utf-8")
+    (project / "LICENSE").symlink_to("COPYING")
+    payload = tomllib.loads((source / "config.toml").read_text(encoding="utf-8"))
+    payload["workspace_dir"] = "custom-workspace"
+    (source / "config.toml").write_text(tomli_w.dumps(payload), encoding="utf-8")
+    target = tmp_path / "target-home"
+
+    preview = _run(source, target)
+    applied = _run(source, target, apply=True)
+
+    assert not _errors(preview)
+    assert not _errors(applied)
+    imported = target / "workspace" / "project" / "LICENSE"
+    assert imported.is_symlink()
+    assert os.readlink(imported) == "COPYING"
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX link contract; Windows reparse points stay fail-closed",
+)
+@pytest.mark.parametrize("same_payload", [True, False], ids=["same", "conflicting"])
+def test_split_workspace_link_collisions_are_checked_in_preview_and_apply(
+    tmp_path: Path,
+    same_payload: bool,
+) -> None:
+    source = _build_source_home(tmp_path)
+    canonical = source / "workspace" / "project"
+    configured = source / "custom-workspace" / "project"
+    canonical.mkdir()
+    configured.mkdir(parents=True)
+    for root in (canonical, configured):
+        (root / "COPYING").write_text("license\n", encoding="utf-8")
+    (configured / "OTHER").write_text("other\n", encoding="utf-8")
+    (canonical / "LICENSE").symlink_to("COPYING")
+    (configured / "LICENSE").symlink_to("COPYING" if same_payload else "OTHER")
+    payload = tomllib.loads((source / "config.toml").read_text(encoding="utf-8"))
+    payload["workspace_dir"] = "custom-workspace"
+    (source / "config.toml").write_text(tomli_w.dumps(payload), encoding="utf-8")
+    target = tmp_path / "target-home"
+
+    preview = _run(source, target)
+    applied = _run(source, target, apply=True)
+
+    if same_payload:
+        assert not _errors(preview)
+        assert not _errors(applied)
+        assert os.readlink(target / "workspace" / "project" / "LICENSE") == "COPYING"
+    else:
+        for report in (preview, applied):
+            assert any(
+                item["kind"] == "preflight/data-root" for item in _errors(report)
+            )
+        assert not target.exists()
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX link contract; Windows reparse points stay fail-closed",
+)
+def test_in_profile_agent_workspace_links_are_classified_before_copy(
+    tmp_path: Path,
+) -> None:
+    source = _build_source_home(tmp_path)
+    workspace = source / "custom-agent-workspace"
+    workspace.mkdir()
+    (workspace / "IDENTITY.md").write_text("synthetic agent\n", encoding="utf-8")
+    (workspace / "IDENTITY.alias.md").symlink_to("IDENTITY.md")
+    config_path = source / "config.toml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + '\n[[agents]]\nid = "research"\nworkspace = "custom-agent-workspace"\n',
+        encoding="utf-8",
+    )
+    target = tmp_path / "target-home"
+
+    report = _run(source, target, apply=True)
+
+    assert not _errors(report)
+    imported = target / "workspace" / "agents" / "research" / "IDENTITY.alias.md"
+    assert imported.is_symlink()
+    assert os.readlink(imported) == "IDENTITY.md"
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX link contract; Windows reparse points stay fail-closed",
+)
+def test_agent_snapshot_prefix_cannot_follow_existing_workspace_link(
+    tmp_path: Path,
+) -> None:
+    source = _build_source_home(tmp_path)
+    canonical_agents = source / "workspace" / "agents"
+    redirected = canonical_agents / "redirected-research"
+    redirected.mkdir(parents=True)
+    (canonical_agents / "research").symlink_to("redirected-research")
+    configured = source / "custom-agent-workspace"
+    configured.mkdir()
+    (configured / "IDENTITY.md").write_text("must not merge\n", encoding="utf-8")
+    config_path = source / "config.toml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + '\n[[agents]]\nid = "research"\nworkspace = "custom-agent-workspace"\n',
+        encoding="utf-8",
+    )
+    target = tmp_path / "target-home"
+
+    report = _run(source, target, apply=True)
+
+    assert any(item["kind"] == "apply" for item in _errors(report))
+    assert not target.exists()
+    assert not list(tmp_path.glob(".target-home.profile-staging.*"))
+
+
 def test_dotenv_external_data_roots_are_snapshotted_rebased_and_never_shared(
     tmp_path: Path,
 ) -> None:
@@ -1868,6 +2158,7 @@ def test_configured_data_root_overlapping_target_is_rejected(tmp_path: Path) -> 
 
 def test_external_roots_are_included_in_disk_preflight(tmp_path: Path) -> None:
     source = _build_source_home(tmp_path)
+    baseline = _run(source, tmp_path / "target-baseline")
     external_state = tmp_path / "external-state"
     external_workspace = tmp_path / "external-workspace"
     external_media = tmp_path / "external-media"
@@ -1883,10 +2174,177 @@ def test_external_roots_are_included_in_disk_preflight(tmp_path: Path) -> None:
 
     report = _run(source, tmp_path / "target-home")
 
-    source_only = migration_module._tree_size_bytes(source)
+    assert not _errors(baseline)
+    assert not _errors(report)
     assert report["preflight"]["disk_required_bytes"] >= (
-        source_only + (3 * 4096) + migration_module._DISK_MARGIN_BYTES
+        baseline["preflight"]["disk_required_bytes"] + (3 * 4096)
     )
+
+
+def test_code_task_bytes_are_excluded_from_disk_preflight(tmp_path: Path) -> None:
+    source = _build_source_home(tmp_path)
+
+    before = _run(source, tmp_path / "target-before")
+    (source / "code-task" / "synthetic-run").mkdir(parents=True)
+    (source / "code-task" / "synthetic-run" / "large-worktree.bin").write_bytes(
+        b"x" * 4096
+    )
+    after = _run(source, tmp_path / "target-after")
+
+    assert not _errors(before)
+    assert not _errors(after)
+    assert after["preflight"]["disk_required_bytes"] == before["preflight"][
+        "disk_required_bytes"
+    ]
+
+
+@pytest.mark.parametrize("root_name", ["state", "workspace", "media"])
+@pytest.mark.parametrize("descendant", [False, True], ids=["exact", "descendant"])
+def test_configured_data_root_inside_source_code_task_blocks_import(
+    tmp_path: Path,
+    root_name: str,
+    descendant: bool,
+) -> None:
+    source = _build_source_home(tmp_path)
+    configured = source / "code-task"
+    if descendant:
+        configured = configured / "selected-subdir"
+    configured.mkdir(parents=True)
+    (configured / "must-not-migrate.txt").write_text("local run data\n", encoding="utf-8")
+    payload = tomllib.loads((source / "config.toml").read_text(encoding="utf-8"))
+    if root_name == "media":
+        payload.setdefault("attachments", {})["media_root"] = str(configured)
+    else:
+        payload[f"{root_name}_dir"] = str(configured)
+    (source / "config.toml").write_text(tomli_w.dumps(payload), encoding="utf-8")
+
+    preview = _run(source, tmp_path / f"target-preview-{root_name}-{descendant}")
+    applied_target = tmp_path / f"target-apply-{root_name}-{descendant}"
+    applied = _run(source, applied_target, apply=True)
+
+    for report in (preview, applied):
+        data_root_errors = [
+            item
+            for item in _errors(report)
+            if item["kind"] == "preflight/data-root"
+            and item["source"] == str(configured)
+        ]
+        assert data_root_errors
+        assert "inside source code-task" in data_root_errors[0]["reason"]
+        assert data_root_errors[0]["details"]["stable_code"] == "configured_code_task_root"
+    assert not applied_target.exists()
+
+
+@pytest.mark.parametrize("configured_kind", ["workspace", "agent-workspace"])
+def test_case_alias_root_inside_source_code_task_blocks_import(
+    tmp_path: Path,
+    configured_kind: str,
+) -> None:
+    source = _build_source_home(tmp_path)
+    actual = source / "code-task" / "selected-subdir"
+    actual.mkdir(parents=True)
+    (actual / "must-not-migrate.txt").write_text(
+        "local run data\n",
+        encoding="utf-8",
+    )
+    configured = source / "CODE-TASK" / "selected-subdir"
+    try:
+        if not configured.samefile(actual):
+            pytest.skip("filesystem does not expose a case-insensitive alias")
+    except OSError:
+        pytest.skip("filesystem is case-sensitive")
+
+    payload = tomllib.loads((source / "config.toml").read_text(encoding="utf-8"))
+    if configured_kind == "workspace":
+        payload["workspace_dir"] = str(configured)
+    else:
+        payload["agents"] = [{"id": "research", "workspace": str(configured)}]
+    (source / "config.toml").write_text(tomli_w.dumps(payload), encoding="utf-8")
+    target = tmp_path / "target-home"
+
+    report = _run(source, target, apply=True)
+
+    data_root_errors = [
+        item
+        for item in _errors(report)
+        if item["kind"] == "preflight/data-root"
+        and item["source"] == str(configured)
+    ]
+    assert data_root_errors
+    assert data_root_errors[0]["details"]["stable_code"] == "configured_code_task_root"
+    assert not target.exists()
+
+
+def test_dotenv_data_root_inside_source_code_task_blocks_import(tmp_path: Path) -> None:
+    source = _build_source_home(tmp_path)
+    configured = source / "code-task"
+    configured.mkdir()
+    (configured / "must-not-migrate.txt").write_text("local run data\n", encoding="utf-8")
+    (source / ".env").write_text(
+        "OPENROUTER_API_KEY=dummy\n"
+        f"OPENSQUILLA_GATEWAY_WORKSPACE_DIR={configured}\n",
+        encoding="utf-8",
+    )
+    target = tmp_path / "target-home"
+
+    report = _run(source, target, apply=True)
+
+    data_root_errors = [
+        item
+        for item in _errors(report)
+        if item["kind"] == "preflight/data-root" and item["source"] == str(configured)
+    ]
+    assert data_root_errors
+    assert "inside source code-task" in data_root_errors[0]["reason"]
+    assert data_root_errors[0]["details"]["stable_code"] == "configured_code_task_root"
+    assert not target.exists()
+
+
+def test_agent_workspace_inside_source_code_task_blocks_import(tmp_path: Path) -> None:
+    source = _build_source_home(tmp_path)
+    configured = source / "code-task" / "agent-run"
+    configured.mkdir(parents=True)
+    (configured / "must-not-migrate.txt").write_text("local run data\n", encoding="utf-8")
+    payload = tomllib.loads((source / "config.toml").read_text(encoding="utf-8"))
+    payload["agents"] = [{"id": "research", "workspace": str(configured)}]
+    (source / "config.toml").write_text(tomli_w.dumps(payload), encoding="utf-8")
+    target = tmp_path / "target-home"
+
+    report = _run(source, target, apply=True)
+
+    data_root_errors = [
+        item
+        for item in _errors(report)
+        if item["kind"] == "preflight/data-root" and item["source"] == str(configured)
+    ]
+    assert data_root_errors
+    assert "inside source code-task" in data_root_errors[0]["reason"]
+    assert data_root_errors[0]["details"]["stable_code"] == "configured_code_task_root"
+    assert not target.exists()
+
+
+def test_other_excluded_profile_trees_do_not_block_or_inflate_import(
+    tmp_path: Path,
+) -> None:
+    source = _build_source_home(tmp_path)
+    before = _run(source, tmp_path / "target-before")
+    generated = source / "profiles" / "retired" / "code-task" / "run"
+    generated.mkdir(parents=True)
+    (generated / "large-worktree.bin").write_bytes(b"x" * 4096)
+    if os.name != "nt":
+        (generated / "python").symlink_to("/missing/generated/python")
+    target = tmp_path / "target-home"
+
+    preview = _run(source, target)
+    applied = _run(source, target, apply=True)
+
+    assert not _errors(before)
+    assert not _errors(preview)
+    assert not _errors(applied)
+    assert preview["preflight"]["disk_required_bytes"] == before["preflight"][
+        "disk_required_bytes"
+    ]
+    assert not (target / "profiles").exists()
 
 
 @pytest.mark.parametrize("root_name", ["state", "workspace", "media"])
@@ -2026,11 +2484,109 @@ def test_scheduler_pause_failure_aborts_without_target_or_marker(tmp_path: Path)
     assert not (source / IMPORT_MARKER_FILENAME).exists()
 
 
-def test_symlink_in_source_tree_is_rejected_without_publication(tmp_path: Path) -> None:
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX link contract; Windows reparse points stay fail-closed",
+)
+def test_contained_workspace_symlinks_are_preserved_without_dereferencing(
+    tmp_path: Path,
+) -> None:
+    source = _build_source_home(tmp_path)
+    project = source / "workspace" / "synthetic-project"
+    project.mkdir()
+    (project / "COPYING").write_text("synthetic license\n", encoding="utf-8")
+    license_link = project / "LICENSE"
+    license_payload = "COPYING"
+    license_link.symlink_to(license_payload)
+    bin_dir = project / "node_modules" / ".bin"
+    bin_dir.mkdir(parents=True)
+    dangling_link = bin_dir / "synthetic-tool"
+    dangling_payload = "../missing-package/bin/synthetic-tool"
+    dangling_link.symlink_to(dangling_payload)
+    legacy_project = source / "state" / "workspace" / "legacy-project"
+    legacy_project.mkdir(parents=True)
+    (legacy_project / "COPYING").write_text("legacy license\n", encoding="utf-8")
+    legacy_license = legacy_project / "LICENSE"
+    legacy_license.symlink_to("COPYING")
+    target = tmp_path / "target-home"
+
+    preview = _run(source, target, apply=False)
+    applied = _run(source, target, apply=True)
+
+    assert not _errors(preview)
+    assert not _errors(applied)
+    imported_license = target / "workspace" / "synthetic-project" / "LICENSE"
+    imported_dangling = (
+        target
+        / "workspace"
+        / "synthetic-project"
+        / "node_modules"
+        / ".bin"
+        / "synthetic-tool"
+    )
+    assert imported_license.is_symlink()
+    assert os.readlink(imported_license) == license_payload
+    assert imported_dangling.is_symlink()
+    assert not imported_dangling.exists()
+    assert os.readlink(imported_dangling) == dangling_payload
+    imported_legacy_license = (
+        target / "state" / "workspace" / "legacy-project" / "LICENSE"
+    )
+    assert imported_legacy_license.is_symlink()
+    assert os.readlink(imported_legacy_license) == "COPYING"
+    assert license_link.is_symlink()
+    assert os.readlink(license_link) == license_payload
+    assert dangling_link.is_symlink()
+    assert os.readlink(dangling_link) == dangling_payload
+    assert legacy_license.is_symlink()
+    assert os.readlink(legacy_license) == "COPYING"
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX link contract; Windows reparse points stay fail-closed",
+)
+@pytest.mark.parametrize(
+    "link_kind",
+    ["absolute", "relative-escape", "relative-exit-and-reenter"],
+)
+def test_workspace_link_outside_root_is_rejected_without_publication(
+    tmp_path: Path,
+    link_kind: str,
+) -> None:
     source = _build_source_home(tmp_path)
     outside = tmp_path / "outside.txt"
     outside.write_text("must not be followed", encoding="utf-8")
-    (source / "workspace" / "linked.txt").symlink_to(outside)
+    link = source / "workspace" / "linked.txt"
+    if link_kind == "relative-exit-and-reenter":
+        project = source / "workspace" / "project"
+        project.mkdir()
+        (project / "COPYING").write_text("license\n", encoding="utf-8")
+        link = project / "linked.txt"
+        payload = "../../workspace/project/COPYING"
+    else:
+        payload = str(outside) if link_kind == "absolute" else "../../outside.txt"
+    link.symlink_to(payload)
+    target = tmp_path / "target-home"
+
+    report = _run(source, target, apply=True)
+
+    assert any(item["kind"] == "preflight/manifest" for item in _errors(report))
+    assert not target.exists()
+    assert link.is_symlink()
+    assert os.readlink(link) == payload
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX link contract; Windows reparse points stay fail-closed",
+)
+def test_contained_link_outside_workspace_still_fails_final_role_manifest(
+    tmp_path: Path,
+) -> None:
+    source = _build_source_home(tmp_path)
+    skill = source / "skills" / "dummy-skill"
+    (skill / "SKILL.alias.md").symlink_to("SKILL.md")
     target = tmp_path / "target-home"
 
     report = _run(source, target, apply=True)
@@ -2085,6 +2641,42 @@ def test_source_change_after_copy_aborts_before_target_publication(
     assert any("source changed during import" in item["reason"] for item in _errors(report))
     assert existing.read_text(encoding="utf-8") == "preserve"
     assert not list(tmp_path.glob("target-home.backup.*"))
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX link contract; Windows reparse points stay fail-closed",
+)
+def test_workspace_link_change_after_copy_aborts_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _build_source_home(tmp_path)
+    project = source / "workspace" / "project"
+    project.mkdir()
+    (project / "COPYING").write_text("license\n", encoding="utf-8")
+    (project / "OTHER").write_text("other\n", encoding="utf-8")
+    link = project / "LICENSE"
+    link.symlink_to("COPYING")
+    target = tmp_path / "target-home"
+    migrator = OpenSquillaHomeMigrator(
+        OpenSquillaMigrationOptions(source=source, target=target, apply=True)
+    )
+    original_copy = migrator._copy_source_snapshots
+
+    def copy_then_change_link(staging: Path) -> None:
+        original_copy(staging)
+        link.unlink()
+        link.symlink_to("OTHER")
+
+    monkeypatch.setattr(migrator, "_copy_source_snapshots", copy_then_change_link)
+
+    report = migrator.migrate()
+
+    assert any("source changed during import" in item["reason"] for item in _errors(report))
+    assert not target.exists()
+    assert not list(tmp_path.glob("target-home.backup.*"))
+    assert not list(tmp_path.glob(".target-home.profile-staging.*"))
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX parent-component symlink race")
@@ -3200,6 +3792,7 @@ def test_all_imported_sqlite_stores_are_consistent_without_report_copies(
     source = _build_source_home(tmp_path)
     _write_simple_sqlite(source / "state" / "approval_queue.sqlite", "approval")
     _write_simple_sqlite(source / "state" / "sandbox_user_grants.sqlite", "sandbox")
+    _write_simple_sqlite(source / "state" / "channel_delivery.sqlite", "delivery")
     _write_simple_sqlite(source / "state" / "agents" / "main" / "memory.db", "memory")
     target = tmp_path / "target-home"
 
@@ -3211,6 +3804,7 @@ def test_all_imported_sqlite_stores_are_consistent_without_report_copies(
         Path("scheduler.db"),
         Path("approval_queue.sqlite"),
         Path("sandbox_user_grants.sqlite"),
+        Path("channel_delivery.sqlite"),
         Path("agents/main/memory.db"),
     ]
     for relative in expected:
@@ -3360,6 +3954,43 @@ def test_conflicting_split_state_roots_fail_without_publishing(tmp_path: Path) -
         assert any(item["kind"] == "preflight/data-root" for item in _errors(result))
     assert not target.exists()
     assert not (source / IMPORT_MARKER_FILENAME).exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX staging-link cleanup contract")
+def test_matching_staging_cleanup_handles_legacy_code_task_links_without_following(
+    tmp_path: Path,
+) -> None:
+    staging = tmp_path / ".target.profile-staging.synthetic"
+    code_task_bin = staging / "code-task" / "run" / "repo" / ".venv" / "bin"
+    code_task_bin.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("preserve\n", encoding="utf-8")
+    (code_task_bin / "python").symlink_to(outside)
+    expected = migration_module._path_identity_payload(staging)
+
+    migration_module._remove_matching_staging(staging, expected)
+
+    assert not staging.exists()
+    assert sentinel.read_text(encoding="utf-8") == "preserve\n"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="mkfifo is unavailable on Windows")
+def test_matching_staging_cleanup_still_rejects_specials_inside_code_task(
+    tmp_path: Path,
+) -> None:
+    staging = tmp_path / ".target.profile-staging.synthetic"
+    special = staging / "code-task" / "run" / "synthetic.fifo"
+    special.parent.mkdir(parents=True)
+    os.mkfifo(special)
+    expected = migration_module._path_identity_payload(staging)
+
+    with pytest.raises(RuntimeError, match="special files"):
+        migration_module._remove_matching_staging(staging, expected)
+
+    assert staging.exists()
+    assert special.exists()
 
 
 def test_interrupted_overwrite_is_restored_before_retry(tmp_path: Path) -> None:

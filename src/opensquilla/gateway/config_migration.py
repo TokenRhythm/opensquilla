@@ -312,6 +312,7 @@ def migrate_config_payload(
     )
     _clamp_search_max_results(builder)
     _park_unknown_channel_entries(builder, emit_diagnostics=emit_diagnostics)
+    _disable_unverifiable_feishu_webhook_entries(builder)
     _clear_mismatched_router_tier_profile(builder)
 
     stamped_version = _payload_config_version(builder.payload)
@@ -522,15 +523,60 @@ def _park_unknown_channel_entries(
         _write_legacy_field_log(parked_log_fields, "config_migration")
 
 
+def _disable_unverifiable_feishu_webhook_entries(builder: _MigrationBuilder) -> None:
+    """Always-run: park feishu webhook entries with no ingress credential.
+
+    Feishu webhook entries now require ``verification_token`` or
+    ``encrypt_key`` — with neither, every inbound request would be rejected,
+    so the shape was legal-but-dead in earlier releases. The strict schema
+    rejects it outright, which must not brick an upgraded config file: coerce
+    such entries to ``enabled = false`` (validation skips disabled entries)
+    with a warning telling the operator what to add before re-enabling.
+    """
+    channels_section = builder.payload.get("channels")
+    if not isinstance(channels_section, dict):
+        return
+    entries = channels_section.get("channels")
+    if not isinstance(entries, list):
+        return
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("type") != "feishu":
+            continue
+        if entry.get("connection_mode") != "webhook":
+            continue
+        if not bool(entry.get("enabled", True)):
+            continue
+        verification_token = str(entry.get("verification_token") or "").strip()
+        encrypt_key = str(entry.get("encrypt_key") or "").strip()
+        if verification_token or encrypt_key:
+            continue
+        entry["enabled"] = False
+        name = entry.get("name")
+        label = "channels.channels[type=feishu"
+        label += f", name={name}]" if isinstance(name, str) and name else "]"
+        builder.changes.append(f"{label}: enabled -> false (no webhook credential)")
+        builder.warnings.append(
+            f"{label} uses webhook mode without verification_token or "
+            "encrypt_key and was disabled; add one of them and re-enable the "
+            "channel"
+        )
+
+
 def _clear_mismatched_router_tier_profile(builder: _MigrationBuilder) -> None:
     """Always-run: clear ``squilla_router.tier_profile`` on provider mismatch.
 
     Validation hard-fails when ``tier_profile`` no longer matches
     ``llm.provider`` — the classic hand-edit trap of switching providers
-    without clearing the profile pointer. Clear the profile instead: the
-    inline ``tiers`` table (full dumps always carry one) keeps governing.
-    Only fires when the payload states both values explicitly, so an
-    env-provided provider can never trigger a spurious clear.
+    without clearing the profile pointer. An atomic primary/profile activation
+    is the intentional exception: it leaves the router preset untouched and
+    demotes the preset's provider into ``llm_profiles``. Preserve that shape so
+    a persist/reload cycle keeps the same effective ladder. Otherwise clear the
+    profile and let the inline ``tiers`` table govern. Only fires when the
+    payload states both values explicitly, so an env-provided provider can
+    never trigger a spurious clear.
     """
     router = builder.payload.get("squilla_router")
     if not isinstance(router, dict):
@@ -545,6 +591,12 @@ def _clear_mismatched_router_tier_profile(builder: _MigrationBuilder) -> None:
     if not isinstance(provider, str) or not provider.strip():
         return
     if profile.strip().lower() == provider.strip().lower():
+        return
+    normalized_profile = profile.strip().lower()
+    profiles = builder.payload.get("llm_profiles")
+    if isinstance(profiles, dict) and any(
+        str(key or "").strip().lower() == normalized_profile for key in profiles
+    ):
         return
 
     router.pop("tier_profile", None)

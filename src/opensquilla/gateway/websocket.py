@@ -44,14 +44,14 @@ log = structlog.get_logger(__name__)
 # (events, RPC responses, ticks) is enqueued from any producer task and
 # drained sequentially by a dedicated writer task. WS-frame ``seq`` is
 # minted by the writer at DEQUEUE time so that lossy drops never consume
-# a seq number — the frontend at ``static/js/rpc.js`` closes the socket
-# on any seq gap.
+# a seq number — the Vue RPC client in ``opensquilla-webui/src/lib/rpc.ts``
+# closes the socket on any seq gap.
 #
 # ``_LOSSY_EVENTS`` is intentionally narrow: the lossy event MUST NOT be
 # routed through ``SessionStreamRegistry.record()`` upstream, otherwise a
-# silent drop here would create a ``stream_seq`` gap that the frontend
-# would be filtered by ``chat.js:_acceptStreamSeq`` on reconnect. The
-# only event that satisfies that constraint today is the
+# silent drop here would create a ``stream_seq`` gap that could be rejected by
+# the Vue client's ``utils/chat/streamEvents.ts:acceptStreamSeq`` reconciliation
+# on reconnect. The only event that satisfies that constraint today is the
 # liveness ``tick`` emitted from ``_tick_loop`` — its name is not prefixed
 # ``session.event.`` so ``EventBridge.emit`` skips ``record()`` for it.
 # Any future addition to this set MUST be verified against the same
@@ -326,9 +326,32 @@ class WsConnection:
                             seq=self.next_seq(),
                             meta=item.meta,
                         )
-                        await self.ws.send_text(wire.model_dump_json())
+                        text = wire.model_dump_json()
                     elif item.res_frame is not None:
-                        await self.ws.send_text(item.res_frame.model_dump_json())
+                        text = item.res_frame.model_dump_json()
+                    else:
+                        continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # A frame that cannot be serialized (e.g. a lone surrogate
+                    # in a payload) must not silently kill this task: the
+                    # socket would stay open, requests would keep executing,
+                    # and no response would ever leave. Close instead so the
+                    # reader loop tears the connection down normally.
+                    log.warning(
+                        "gateway.ws_frame_serialize_failed",
+                        conn_id=self.conn_id,
+                        exc_info=True,
+                    )
+                    self._closing = True
+                    try:
+                        await self.ws.close(code=1011)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return
+                try:
+                    await self.ws.send_text(text)
                 except WebSocketDisconnect:
                     return
                 except asyncio.CancelledError:
@@ -523,6 +546,34 @@ def get_registry() -> ConnectionRegistry:
     return _registry
 
 
+def _is_wire_text(value: str) -> bool:
+    """True when ``value`` can be re-serialized onto the wire as UTF-8.
+
+    Valid JSON may carry lone-surrogate escapes (``"\\ud800"``); echoing one
+    into a response frame makes ``model_dump_json`` raise at send time, long
+    after the handler ran.
+    """
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _wire_frame_id(raw_id: Any, fallback: str = "") -> str:
+    """Best-effort string id for correlating a response to a client frame.
+
+    ``ResFrame.id`` must be a string, but a client may send any JSON value.
+    Scalar ids are echoed back stringified so the client can still correlate
+    the error; container and non-encodable ids fall back to ``fallback``.
+    """
+    if isinstance(raw_id, str):
+        return raw_id if _is_wire_text(raw_id) else fallback
+    if isinstance(raw_id, bool | int | float):
+        return str(raw_id)
+    return fallback
+
+
 async def handle_ws_connection(
     ws: WebSocket,
     config: GatewayConfig,
@@ -533,6 +584,7 @@ async def handle_ws_connection(
     subscription_manager: Any = None,
     channel_manager: Any = None,
     usage_tracker: Any = None,
+    usage_event_sink: Any = None,
     meta_run_writer: Any = None,
     skill_loader: Any = None,
     cron_scheduler: Any = None,
@@ -577,9 +629,18 @@ async def handle_ws_connection(
     # Step 3: Parse the connect request
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
+        # ValueError covers JSONDecodeError plus non-decode parse failures
+        # (e.g. the int-digit conversion limit); RecursionError covers
+        # pathological nesting depth.
         await conn.send_res(
             make_error_res("handshake", "INVALID_REQUEST", "Invalid JSON in connect frame")
+        )
+        await conn.close()
+        return
+    if not isinstance(data, dict):
+        await conn.send_res(
+            make_error_res("handshake", "INVALID_REQUEST", "Connect frame must be a JSON object")
         )
         await conn.close()
         return
@@ -587,7 +648,7 @@ async def handle_ws_connection(
     if data.get("type") != "req" or data.get("method") != "connect":
         await conn.send_res(
             make_error_res(
-                data.get("id", "handshake"),
+                _wire_frame_id(data.get("id"), "handshake"),
                 "INVALID_REQUEST",
                 "First message must be connect request",
             )
@@ -595,18 +656,25 @@ async def handle_ws_connection(
         await conn.close()
         return
 
-    req_id = data.get("id", "handshake")
-    params_raw = data.get("params", {}) or {}
+    req_id = _wire_frame_id(data.get("id"), "handshake")
+    params_raw = data.get("params")
+    if not isinstance(params_raw, dict):
+        params_raw = {}
 
     # Step 4: Resolve auth via server-side ScopeResolver
     from opensquilla.gateway.auth import resolve_auth
 
-    auth_params = params_raw.get("auth", {}) or {}
+    auth_params = params_raw.get("auth")
+    if not isinstance(auth_params, dict):
+        auth_params = {}
+    role_claim = params_raw.get("role", "operator")
+    if not isinstance(role_claim, str):
+        role_claim = "operator"
     peer_ip = ws.client.host if ws.client is not None else None
     principal = resolve_auth(
         config,
         auth_params=auth_params,
-        role_claim=params_raw.get("role", "operator"),
+        role_claim=role_claim,
         peer_ip=peer_ip,
     )
     if principal is None:
@@ -619,6 +687,17 @@ async def handle_ws_connection(
     # Step 5: Negotiate protocol version
     min_proto = params_raw.get("minProtocol", 1)
     max_proto = params_raw.get("maxProtocol", PROTOCOL_VERSION)
+    if not all(
+        isinstance(bound, int) and not isinstance(bound, bool)
+        for bound in (min_proto, max_proto)
+    ):
+        await conn.send_res(
+            make_error_res(
+                req_id, "INVALID_REQUEST", "minProtocol and maxProtocol must be integers"
+            )
+        )
+        await conn.close()
+        return
     negotiated = min(max_proto, PROTOCOL_VERSION)
     if negotiated < min_proto:
         await conn.send_res(
@@ -689,6 +768,7 @@ async def handle_ws_connection(
             subscription_manager,
             channel_manager,
             usage_tracker,
+            usage_event_sink,
             meta_run_writer,
             skill_loader,
             cron_scheduler,
@@ -747,6 +827,7 @@ async def _message_loop(
     subscription_manager: Any = None,
     channel_manager: Any = None,
     usage_tracker: Any = None,
+    usage_event_sink: Any = None,
     meta_run_writer: Any = None,
     skill_loader: Any = None,
     cron_scheduler: Any = None,
@@ -786,8 +867,16 @@ async def _message_loop(
 
         try:
             data = json.loads(raw)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
+            # ValueError covers JSONDecodeError plus non-decode parse failures
+            # (e.g. the int-digit conversion limit); RecursionError covers
+            # pathological nesting depth.
             await conn.send_res(make_error_res("", "INVALID_REQUEST", "Invalid JSON"))
+            continue
+        if not isinstance(data, dict):
+            await conn.send_res(
+                make_error_res("", "INVALID_REQUEST", "Frame must be a JSON object")
+            )
             continue
 
         frame_type = data.get("type")
@@ -802,6 +891,24 @@ async def _message_loop(
         if frame_type == "req":
             req_id = data.get("id", "")
             method = data.get("method", "")
+            if (
+                not isinstance(req_id, str)
+                or not isinstance(method, str)
+                or not _is_wire_text(req_id)
+                or not _is_wire_text(method)
+            ):
+                # A non-string or non-encodable id/method would fail ResFrame
+                # validation or serialization after the handler already ran;
+                # reject the frame here so one malformed request cannot kill
+                # the connection.
+                await conn.send_res(
+                    make_error_res(
+                        _wire_frame_id(req_id),
+                        "INVALID_REQUEST",
+                        "Frame id and method must be UTF-8-encodable strings",
+                    )
+                )
+                continue
             params = data.get("params")
 
             ctx = RpcContext(
@@ -812,8 +919,14 @@ async def _message_loop(
                 provider_selector=provider_selector,
                 tool_registry=tool_registry,
                 subscription_manager=subscription_manager,
-                channel_manager=channel_manager,
+                # Live reconcile can create the manager after this connection
+                # opened; a callable is re-resolved per request so long-lived
+                # console sockets see it.
+                channel_manager=(
+                    channel_manager() if callable(channel_manager) else channel_manager
+                ),
                 usage_tracker=usage_tracker,
+                usage_event_sink=usage_event_sink,
                 meta_run_writer=meta_run_writer,
                 skill_loader=skill_loader,
                 cron_scheduler=cron_scheduler,
@@ -832,8 +945,10 @@ async def _message_loop(
             res = await dispatcher.dispatch(req_id, method, params, ctx)
             await conn.send_res(res)
         else:
+            # repr keeps the echo serializable for any client value (lone
+            # surrogates escape to backslash form).
             await conn.send_res(
-                make_error_res("", "INVALID_REQUEST", f"Unknown frame type: {frame_type}")
+                make_error_res("", "INVALID_REQUEST", f"Unknown frame type: {frame_type!r}")
             )
 
 

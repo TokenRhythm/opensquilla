@@ -11,6 +11,7 @@
 // task-B's own events (and legacy untagged events) still flow.
 import { describe, expect, it, vi } from 'vitest'
 import { effectScope, ref, type Ref } from 'vue'
+import i18n, { loadLocaleMessages } from '@/i18n'
 import type { ChatMessage, ChatRunStatus, ChatRunStatusSource } from '@/types/chat'
 import type { ToolUsePayload } from '@/types/rpc'
 import {
@@ -18,7 +19,7 @@ import {
   type ChatRpcStreamApi,
   type UseChatRpcEventHandlersOptions,
 } from './useChatRpcEventHandlers'
-import { FINISHED_STREAM_TASK_ID } from '@/utils/chat/streamEvents'
+import { FINISHED_STREAM_TASK_ID, PENDING_STREAM_TASK_ID } from '@/utils/chat/streamEvents'
 
 const SESSION = 'agent:main:webchat:issue344'
 
@@ -80,6 +81,7 @@ function makeHarness(activeStreamTaskId = '') {
     clearPendingRouterDecision: vi.fn(),
     handleRouterControlReplay: vi.fn(),
     showCompactionToast: vi.fn(),
+    showWarningToast: vi.fn(),
     scheduleHistorySync: vi.fn(),
     schedulePendingDrainAfterTerminal: vi.fn(),
     popAllPendingIntoComposer: vi.fn(() => false),
@@ -220,6 +222,27 @@ describe('issue #344 — live stream is bound to a single task', () => {
     expect(messages.value.some((m) => m.role === 'error')).toBe(true)
   })
 
+  it('localizes the stable Ensemble image error code and keeps the code attached', async () => {
+    await loadLocaleMessages('zh-Hans')
+    i18n.global.locale.value = 'zh-Hans'
+    const { api, messages, scope } = makeHarness('task-B')
+
+    api.handlers.onAny('task.failed', {
+      task_id: 'task-B',
+      session_key: SESSION,
+      code: 'ensemble_multimodal_unsupported',
+      terminal_message: 'server fallback text',
+    })
+
+    expect(messages.value[messages.value.length - 1]).toMatchObject({
+      role: 'error',
+      errorCode: 'ensemble_multimodal_unsupported',
+      text: 'Ensemble 暂不支持图片输入，请切换到单模型路由后重试。',
+    })
+    scope.stop()
+    i18n.global.locale.value = 'en'
+  })
+
   it('binds activeStreamTaskId from task.running, then filters the prior task', () => {
     const { api, options, stream } = makeHarness('')
     api.handlers.onTaskRunning({ task_id: 'task-B', session_key: SESSION })
@@ -228,11 +251,11 @@ describe('issue #344 — live stream is bound to a single task', () => {
     expect(stream.appendToolCall).not.toHaveBeenCalled()
   })
 
-  it('binds a queued task while a fresh send is still pending so early cancellation can end it', () => {
-    const { api, options, stream } = makeHarness('__opensquilla_pending_stream_task__')
+  it('buffers early cancellation until the send response binds the queued task', () => {
+    const { api, options, stream } = makeHarness(PENDING_STREAM_TASK_ID)
 
     api.handlers.onTaskQueued({ task_id: 'task-B', session_key: SESSION })
-    expect(options.activeStreamTaskId.value).toBe('task-B')
+    expect(options.activeStreamTaskId.value).toBe(PENDING_STREAM_TASK_ID)
 
     api.handlers.onAny('task.cancelled', {
       task_id: 'task-B',
@@ -240,7 +263,154 @@ describe('issue #344 — live stream is bound to a single task', () => {
       terminal_message: 'The task was cancelled before it finished.',
     })
 
+    expect(stream.endStreaming).not.toHaveBeenCalled()
+
+    api.bindActiveStreamTask('task-B')
+
     expect(stream.endStreaming).toHaveBeenCalled()
+  })
+
+  it('buffers a tagged terminal event while the accepted task id is pending', () => {
+    const { api, options, stream, messages, activeTaskId } = makeHarness(PENDING_STREAM_TASK_ID)
+
+    api.handlers.onAny('task.failed', {
+      task_id: 'task-B',
+      session_key: SESSION,
+      terminal_message: 'The accepted task failed before the response arrived.',
+    })
+
+    expect(stream.endStreaming).not.toHaveBeenCalled()
+    expect(messages.value).toEqual([])
+
+    api.bindActiveStreamTask('task-B')
+
+    expect(stream.endStreaming).toHaveBeenCalledTimes(1)
+    expect(messages.value[messages.value.length - 1]).toMatchObject({
+      role: 'error',
+      text: 'The accepted task failed before the response arrived.',
+    })
+    expect(options.scheduleHistorySync).toHaveBeenCalledTimes(1)
+    expect(activeTaskId.value).toBe(FINISHED_STREAM_TASK_ID)
+  })
+
+  it('consumes only the buffered terminal event matching the response task id', () => {
+    const { api, stream, messages, activeTaskId } = makeHarness(PENDING_STREAM_TASK_ID)
+
+    api.handlers.onAny('task.failed', {
+      task_id: 'task-A',
+      session_key: SESSION,
+      terminal_message: 'Stale task A failed.',
+    })
+    api.handlers.onAny('task.succeeded', {
+      task_id: 'task-B',
+      session_key: SESSION,
+    })
+
+    api.bindActiveStreamTask('task-B')
+
+    expect(stream.endStreaming).toHaveBeenCalledTimes(1)
+    expect(messages.value.some(message => message.text.includes('Stale task A'))).toBe(false)
+    expect(activeTaskId.value).toBe(FINISHED_STREAM_TASK_ID)
+  })
+
+  it('drops a buffered stale terminal event when the response binds another task', () => {
+    const { api, stream, messages, activeTaskId } = makeHarness(PENDING_STREAM_TASK_ID)
+
+    api.handlers.onAny('task.failed', {
+      task_id: 'task-A',
+      session_key: SESSION,
+      terminal_message: 'Stale task A failed.',
+    })
+
+    api.bindActiveStreamTask('task-B')
+
+    expect(stream.endStreaming).not.toHaveBeenCalled()
+    expect(messages.value).toEqual([])
+    expect(activeTaskId.value).toBe('task-B')
+  })
+
+  it('does not let another running task claim a pending send before its response', () => {
+    const { api, stream, messages, activeTaskId } = makeHarness(PENDING_STREAM_TASK_ID)
+
+    api.handlers.onTaskRunning({ task_id: 'task-A', session_key: SESSION })
+    api.handlers.onAny('task.failed', {
+      task_id: 'task-A',
+      session_key: SESSION,
+      terminal_message: 'Unrelated task A failed.',
+    })
+
+    expect(activeTaskId.value).toBe(PENDING_STREAM_TASK_ID)
+    expect(stream.endStreaming).not.toHaveBeenCalled()
+
+    api.bindActiveStreamTask('task-B')
+
+    expect(activeTaskId.value).toBe('task-B')
+    expect(stream.endStreaming).not.toHaveBeenCalled()
+    expect(messages.value.some(message => message.text.includes('task A'))).toBe(false)
+  })
+
+  it('replays early stream frames only after the response binds their task', () => {
+    const { api, stream, activeTaskId } = makeHarness(PENDING_STREAM_TASK_ID)
+    const earlyTool = toolUse('task-B', 'write_report')
+
+    api.handlers.onTaskRunning({ task_id: 'task-B', session_key: SESSION })
+    api.handlers.onToolUseStart(earlyTool)
+
+    expect(activeTaskId.value).toBe(PENDING_STREAM_TASK_ID)
+    expect(stream.appendToolCall).not.toHaveBeenCalled()
+
+    api.bindActiveStreamTask('task-B')
+
+    expect(activeTaskId.value).toBe('task-B')
+    expect(stream.appendToolCall).toHaveBeenCalledTimes(1)
+    expect(stream.appendToolCall).toHaveBeenCalledWith(earlyTool)
+  })
+
+  it('bounds early stream buffering while preserving the newest frames', () => {
+    const { api, stream } = makeHarness(PENDING_STREAM_TASK_ID)
+
+    for (let index = 0; index < 70; index++) {
+      api.handlers.onTextDelta({
+        task_id: 'task-B',
+        session_key: SESSION,
+        stream_seq: index + 1,
+        text: `delta-${index}`,
+      })
+    }
+
+    api.bindActiveStreamTask('task-B')
+
+    expect(stream.appendDelta).toHaveBeenCalledTimes(64)
+    const calls = vi.mocked(stream.appendDelta).mock.calls
+    expect(calls[0]?.[0]).toBe('delta-6')
+    expect(calls[calls.length - 1]?.[0]).toBe('delta-69')
+  })
+
+  it('bounds pending terminal task buckets and retains the newest tasks', () => {
+    const oldest = makeHarness(PENDING_STREAM_TASK_ID)
+    for (let index = 0; index < 9; index++) {
+      oldest.api.handlers.onAny('task.failed', {
+        task_id: `task-${index}`,
+        session_key: SESSION,
+        terminal_message: `Task ${index} failed.`,
+      })
+    }
+
+    oldest.api.bindActiveStreamTask('task-0')
+    expect(oldest.stream.endStreaming).not.toHaveBeenCalled()
+
+    const newest = makeHarness(PENDING_STREAM_TASK_ID)
+    for (let index = 0; index < 9; index++) {
+      newest.api.handlers.onAny('task.failed', {
+        task_id: `task-${index}`,
+        session_key: SESSION,
+        terminal_message: `Task ${index} failed.`,
+      })
+    }
+
+    newest.api.bindActiveStreamTask('task-8')
+    expect(newest.stream.endStreaming).toHaveBeenCalledTimes(1)
+    expect(newest.messages.value[newest.messages.value.length - 1]?.text).toBe('Task 8 failed.')
   })
 
   it("accepts the stopped task's cancelled terminal event after Stop poisoned the active id", () => {

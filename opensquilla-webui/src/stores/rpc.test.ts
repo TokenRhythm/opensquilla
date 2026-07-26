@@ -112,18 +112,38 @@ describe('rpc link-token bootstrap', () => {
     clients[0].emit('_hello', {
       policy: { allowedRunModes: ['full'] },
       auth: { principal: { isOwner: true } },
+      features: { methods: ['usage.status', 'usage.query'] },
     })
     expect(store.policy).toEqual({ allowedRunModes: ['full'] })
     expect(store.auth).toEqual({ principal: { isOwner: true } })
+    expect(store.supportsMethod('usage.query')).toBe(true)
+
+    store.markMethodUnavailable('usage.query')
+    expect(store.supportsMethod('usage.query')).toBe(false)
 
     window.history.replaceState(null, '', '/control/?token=new-token')
 
     expect(store.applyLinkTokenFromUrl()).toBe(true)
     expect(store.policy).toBeNull()
     expect(store.auth).toBeNull()
+    expect(store.methods).toEqual([])
     expect(connectCalls[connectCalls.length - 1]).toEqual({
       url: 'ws://localhost:3000/ws',
       token: 'new-token',
     })
+  })
+
+  it('treats missing or malformed Hello methods as unsupported', () => {
+    const store = useRpcStore()
+    store.init()
+
+    clients[0].emit('_hello', { features: { methods: ['usage.status', 42, null] } })
+
+    expect(store.methods).toEqual(['usage.status'])
+    expect(store.supportsMethod('usage.status')).toBe(true)
+    expect(store.supportsMethod('usage.query')).toBe(false)
+
+    clients[0].emit('_hello', {})
+    expect(store.methods).toEqual([])
   })
 })

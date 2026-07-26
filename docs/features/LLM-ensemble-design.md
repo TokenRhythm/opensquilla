@@ -132,8 +132,11 @@ Source: `_build_custom_b5_members`, `_custom_b5_candidates`
 `llm_ensemble.candidates`. Each candidate row carries:
 
 - **`provider`** / **`model`** — required, non-empty; provider is lower-cased.
-- **`role`** — advisory label, one of `""` (unassigned), `primary`, `contrast`,
-  `fast_check`, `critic`, or the structural `aggregator`. Unknown values coerce
+- **`role`** — `aggregator` is the only structural value; an empty or omitted
+  role means proposer. The Web UI therefore presents only **Proposer** and
+  **Aggregator**. Released values `primary`, `contrast`, `fast_check`, and
+  `critic` remain accepted and preserved as advisory decision-trace labels,
+  but all execute and appear in settings as proposers. Unknown values coerce
   to `""` instead of failing, so a hand-edited config never blocks boot.
 - **`enabled`** — disabled rows are kept for read compatibility but never
   counted or run.
@@ -176,10 +179,11 @@ unauthenticated, so the wrap is skipped.
 ## 1.3 Shared fixed-lineup defaults
 
 Both static families set `is_static_b5 = True` in
-`build_ensemble_provider_from_config`, which swaps the legacy per-turn defaults
-for the fixed-lineup family defaults. The swap is **only** applied when the
-configured value still equals the legacy default (`_static_default_if_legacy`),
-so any operator override is preserved:
+`build_ensemble_provider_from_config`, which applies the fixed-lineup family
+defaults. For the configurable rows below, replacement is **only** applied when
+the stored value still equals its legacy default (`_static_default_if_legacy`),
+so operator overrides are preserved. Quorum grace is a runtime family policy,
+not a public configuration field:
 
 | Parameter | Legacy (`router_dynamic`) | Fixed-lineup default |
 |-----------|---------------------------|----------------------|
@@ -187,11 +191,23 @@ so any operator override is preserved:
 | `proposer_timeout_seconds` | 3600 | 300 |
 | `aggregator_timeout_seconds` | 3600 | 480 |
 | `shuffle_candidates` | `True` | `False` |
-| `quorum_grace_seconds` | 0 | 30 |
+| `quorum_grace_seconds` | 0 (wait for every proposer) | 10 |
 
 `min_successful_proposers` is additionally clamped down to the actual proposer
 count. Both the configured and effective values (min-success, timeouts, shuffle)
 are recorded in the selection plan for debugging.
+
+The legacy value `0` disables quorum early-exit and waits for every proposer; it
+does not mean an immediate, zero-delay cutoff. Fixed lineups instead allow ten
+seconds after reaching quorum so a nearly complete final draft can still join
+the fusion without waiting for the full proposer timeout.
+
+Proposers never own an executable tool boundary. By default they receive no
+current tool schemas. Setting `proposer_tools = true` exposes those schemas only
+as advisory vocabulary: native or textual tool-shaped output is converted into
+bounded, untrusted candidate text. The aggregator may use that information, but
+must independently issue any real tool call through the normal registry,
+permission, approval, and sandbox checks.
 
 ## 1.4 Member provider resolution
 
@@ -229,12 +245,10 @@ selection_mode = "custom_b5"
 [[llm_ensemble.candidates]]
 provider = "openrouter"
 model = "deepseek/deepseek-v4-pro"
-role = "primary"
 
 [[llm_ensemble.candidates]]
 provider = "openrouter"
 model = "z-ai/glm-5.2"
-role = "contrast"
 
 [[llm_ensemble.candidates]]
 provider = "openrouter"

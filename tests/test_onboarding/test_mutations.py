@@ -7,10 +7,12 @@ import pytest
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.llm_runtime import resolve_llm_runtime_config
 from opensquilla.onboarding.mutations import (
+    LlmProfileActivationError,
     MutationResult,
     list_channel_entries,
     remove_channel,
     set_channel_enabled,
+    upsert_audio_provider,
     upsert_channel,
     upsert_image_generation_provider,
     upsert_llm_ensemble,
@@ -142,6 +144,140 @@ def test_upsert_memory_embedding_auto_without_changes_does_not_require_restart()
     assert res.restart_required is False
 
 
+def _remote_embedding_config(**remote: str) -> GatewayConfig:
+    return GatewayConfig(
+        memory={
+            "embedding": {
+                "provider": "openai",
+                "remote": {"model": "text-embedding-3-small", **remote},
+            }
+        }
+    )
+
+
+def test_upsert_memory_embedding_remote_drops_stored_key_on_changed_origin():
+    # A stored remote embedding key must not follow a changed endpoint
+    # origin; the blank-key resave fails closed so the operator re-enters it.
+    cfg = _remote_embedding_config(
+        api_key="sk-mem-origin-a", base_url="https://a.example.test/v1"
+    )
+
+    with pytest.raises(ValueError, match="requires an api_key or api_key_env"):
+        upsert_memory_embedding(
+            cfg, provider="openai", api_key="", base_url="https://b.example.test/v1"
+        )
+
+
+def test_upsert_memory_embedding_remote_keeps_stored_key_on_same_origin():
+    cfg = _remote_embedding_config(
+        api_key="sk-mem-origin-a", base_url="https://a.example.test/v1"
+    )
+
+    res = upsert_memory_embedding(
+        cfg, provider="openai", api_key="", base_url="https://A.example.test:443/v2"
+    )
+
+    assert res.config.memory.embedding.remote.api_key == "sk-mem-origin-a"
+
+
+def test_upsert_memory_embedding_remote_env_reference_dropped_on_changed_origin():
+    cfg = _remote_embedding_config(
+        api_key_env="MEM_ORIGIN_A_KEY", base_url="https://a.example.test/v1"
+    )
+
+    with pytest.raises(ValueError, match="requires an api_key or api_key_env"):
+        upsert_memory_embedding(
+            cfg, provider="openai", base_url="https://b.example.test/v1"
+        )
+
+    same_origin = upsert_memory_embedding(
+        cfg, provider="openai", base_url="https://a.example.test/v2"
+    )
+    assert same_origin.config.memory.embedding.remote.api_key_env == "MEM_ORIGIN_A_KEY"
+
+
+def test_upsert_memory_embedding_resubmitted_env_reference_never_crosses_origin():
+    # Clients hydrate and re-send the stored env-var name in plaintext: a
+    # resave that re-submits the stored reference while changing the endpoint
+    # origin is "keep current" and must not rebind the secret to the new
+    # origin. A genuinely new env name for the new endpoint is honored.
+    cfg = _remote_embedding_config(
+        api_key_env="MEM_ORIGIN_A_KEY", base_url="https://a.example.test/v1"
+    )
+
+    with pytest.raises(ValueError, match="requires an api_key or api_key_env"):
+        upsert_memory_embedding(
+            cfg,
+            provider="openai",
+            api_key_env="MEM_ORIGIN_A_KEY",
+            base_url="https://b.example.test/v1",
+        )
+
+    fresh_env = upsert_memory_embedding(
+        cfg,
+        provider="openai",
+        api_key_env="MEM_ORIGIN_B_KEY",
+        base_url="https://b.example.test/v1",
+    )
+    assert fresh_env.config.memory.embedding.remote.api_key_env == "MEM_ORIGIN_B_KEY"
+
+    same_origin = upsert_memory_embedding(
+        cfg,
+        provider="openai",
+        api_key_env="MEM_ORIGIN_A_KEY",
+        base_url="https://a.example.test/v2",
+    )
+    assert same_origin.config.memory.embedding.remote.api_key_env == "MEM_ORIGIN_A_KEY"
+
+
+def test_upsert_memory_embedding_auto_resubmitted_env_reference_never_crosses_origin():
+    cfg = GatewayConfig(
+        memory={
+            "embedding": {
+                "provider": "auto",
+                "remote": {
+                    "api_key_env": "MEM_ORIGIN_A_KEY",
+                    "base_url": "https://a.example.test/v1",
+                    "model": "embed-model",
+                },
+            }
+        }
+    )
+
+    res = upsert_memory_embedding(
+        cfg,
+        provider="auto",
+        api_key_env="MEM_ORIGIN_A_KEY",
+        base_url="https://b.example.test/v1",
+    )
+    assert not res.config.memory.embedding.remote.api_key_env
+
+    same_origin = upsert_memory_embedding(
+        cfg,
+        provider="auto",
+        api_key_env="MEM_ORIGIN_A_KEY",
+        base_url="https://a.example.test/v2",
+    )
+    assert same_origin.config.memory.embedding.remote.api_key_env == "MEM_ORIGIN_A_KEY"
+
+
+def test_upsert_memory_embedding_remote_explicit_key_always_used_across_origin():
+    # A freshly supplied key is operator-authored for the new endpoint and is
+    # always honored, even when the origin changes.
+    cfg = _remote_embedding_config(
+        api_key="sk-mem-origin-a", base_url="https://a.example.test/v1"
+    )
+
+    res = upsert_memory_embedding(
+        cfg,
+        provider="openai",
+        api_key="sk-mem-origin-b",
+        base_url="https://b.example.test/v1",
+    )
+
+    assert res.config.memory.embedding.remote.api_key == "sk-mem-origin-b"
+
+
 def test_unsupported_provider_rejected():
     cfg = GatewayConfig()
     with pytest.raises(ValueError, match="not runtime-supported"):
@@ -261,6 +397,27 @@ def test_tokenrhythm_provider_save_seeds_curated_inline_ladder():
     assert persisted["tiers"]["c3"]["model"] == "glm-5.2"
 
 
+def test_provider_default_direct_model_does_not_follow_existing_router_tier():
+    cfg = GatewayConfig(
+        llm={"provider": "openrouter", "model": "", "api_key": "sk-test"},
+        squilla_router={
+            "default_tier": "c2",
+            "tier_profile": "openrouter",
+            "preset_binding": "follow_primary",
+        },
+    )
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="openrouter",
+        model="",
+    )
+
+    assert res.config.llm.model == "deepseek/deepseek-v4-pro"
+    assert res.config.squilla_router.default_tier == "c2"
+    assert res.config.squilla_router.tiers["c2"]["model"] == "z-ai/glm-5.2"
+
+
 def test_upsert_channel_appends_new():
     cfg = GatewayConfig()
     res = upsert_channel(
@@ -358,6 +515,21 @@ def test_remove_channel():
     res2 = remove_channel(res1.config, name="w")
     assert list_channel_entries(res2.config) == []
     assert res2.restart_required is True
+
+
+def test_remove_channel_withdraws_admin_grants():
+    # A dormant channel_admin_senders entry would silently re-arm for any
+    # future channel created under the same name; removal must drop it while
+    # leaving other channels' grants untouched.
+    cfg = GatewayConfig()
+    res1 = upsert_channel(
+        cfg,
+        entry_payload={"type": "slack", "name": "w", "token": "x", "signing_secret": "ss"},
+    )
+    res1.config.channel_admin_senders = {"w": ["U-1"], "other": ["Z-9"]}
+    res2 = remove_channel(res1.config, name="w")
+    assert list_channel_entries(res2.config) == []
+    assert res2.config.channel_admin_senders == {"other": ["Z-9"]}
 
 
 def test_remove_missing_channel_raises():
@@ -472,6 +644,487 @@ def test_upsert_llm_provider_preserves_existing_api_key_on_same_provider():
     assert res2.config.llm.model == "m2"
 
 
+def test_upsert_llm_provider_required_key_dropped_on_changed_origin():
+    # A required provider must not carry a stored explicit key to a new
+    # endpoint origin: the blank-key resave drops it and fails closed so the
+    # operator re-enters the key for the new endpoint.
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openai",
+            "model": "model-a",
+            "api_key": "sk-required",
+            "base_url": "https://a.example.test/v1",
+        }
+    )
+
+    with pytest.raises(ValueError, match="requires an api_key"):
+        upsert_llm_provider(
+            cfg,
+            provider_id="openai",
+            model="model-b",
+            api_key="",
+            base_url="https://b.example.test/v1",
+        )
+
+
+def test_upsert_llm_provider_required_key_kept_on_same_origin_path_change():
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openai",
+            "model": "model-a",
+            "api_key": "sk-required",
+            "base_url": "https://a.example.test/v1",
+        }
+    )
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="openai",
+        model="model-b",
+        api_key="",
+        base_url="https://A.example.test:443/v2",
+    )
+
+    assert res.config.llm.api_key == "sk-required"
+    assert res.config.llm.base_url == "https://A.example.test:443/v2"
+
+
+def test_upsert_llm_provider_required_env_reference_dropped_on_changed_origin():
+    # Env-backed required credentials follow the same boundary: a changed
+    # origin drops the stored env reference and fails closed.
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openai",
+            "model": "model-a",
+            "api_key_env": "OPENAI_ORIGIN_A_KEY",
+            "base_url": "https://a.example.test/v1",
+        }
+    )
+
+    with pytest.raises(ValueError, match="requires an api_key"):
+        upsert_llm_provider(
+            cfg,
+            provider_id="openai",
+            model="model-b",
+            base_url="https://b.example.test/v1",
+        )
+
+    same_origin = upsert_llm_provider(
+        cfg,
+        provider_id="openai",
+        model="model-b",
+        base_url="https://a.example.test/v2",
+    )
+    assert same_origin.config.llm.api_key_env == "OPENAI_ORIGIN_A_KEY"
+
+
+def test_upsert_llm_provider_resubmitted_env_reference_never_crosses_origin():
+    # Clients hydrate and re-send the stored env-var name in plaintext: a
+    # resave that re-submits the stored reference while changing the endpoint
+    # origin is "keep current" and must not rebind the secret to the new
+    # origin. A genuinely new env name for the new endpoint is honored.
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openai",
+            "model": "model-a",
+            "api_key_env": "OPENAI_ORIGIN_A_KEY",
+            "base_url": "https://a.example.test/v1",
+        }
+    )
+
+    with pytest.raises(ValueError, match="requires an api_key"):
+        upsert_llm_provider(
+            cfg,
+            provider_id="openai",
+            model="model-b",
+            api_key_env="OPENAI_ORIGIN_A_KEY",
+            base_url="https://b.example.test/v1",
+        )
+
+    fresh_env = upsert_llm_provider(
+        cfg,
+        provider_id="openai",
+        model="model-b",
+        api_key_env="OPENAI_ORIGIN_B_KEY",
+        base_url="https://b.example.test/v1",
+    )
+    assert fresh_env.config.llm.api_key_env == "OPENAI_ORIGIN_B_KEY"
+
+    same_origin = upsert_llm_provider(
+        cfg,
+        provider_id="openai",
+        model="model-b",
+        api_key_env="OPENAI_ORIGIN_A_KEY",
+        base_url="https://a.example.test/v2",
+    )
+    assert same_origin.config.llm.api_key_env == "OPENAI_ORIGIN_A_KEY"
+
+
+def test_upsert_llm_provider_preserves_optional_key_on_same_custom_provider():
+    cfg = GatewayConfig(
+        llm={
+            "provider": "custom",
+            "model": "model-a",
+            "api_key": "sk-optional",
+            "base_url": "https://llm.example.test/v1",
+        }
+    )
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="custom",
+        model="model-b",
+        api_key="",
+        preserve_api_key=True,
+        base_url="https://LLM.example.test:443/v2",
+    )
+
+    assert res.config.llm.api_key == "sk-optional"
+    assert res.config.llm.model == "model-b"
+
+
+def test_upsert_llm_provider_optional_preserve_treats_whitespace_env_as_blank():
+    cfg = GatewayConfig(
+        llm={
+            "provider": "custom",
+            "model": "model-a",
+            "api_key": "sk-optional",
+            "base_url": "https://llm.example.test/v1",
+        }
+    )
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="custom",
+        model="model-b",
+        api_key_env="   ",
+        preserve_api_key=True,
+        base_url="https://llm.example.test/v2",
+    )
+
+    assert res.config.llm.api_key == "sk-optional"
+    assert res.config.llm.api_key_env == ""
+
+
+@pytest.mark.parametrize(
+    "candidate_base_url",
+    [
+        "https://other.example.test/v1",
+        "http://llm.example.test/v2",
+        "https://llm.example.test:444/v2",
+        "https://llm.example.test:not-a-port/v2",
+    ],
+)
+def test_upsert_llm_provider_optional_preserve_rejects_changed_or_invalid_origin(
+    candidate_base_url: str,
+):
+    cfg = GatewayConfig(
+        llm={
+            "provider": "custom",
+            "model": "model-a",
+            "api_key": "sk-origin-a",
+            "base_url": "https://llm.example.test/v1",
+        }
+    )
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="custom",
+        model="model-b",
+        preserve_api_key=True,
+        base_url=candidate_base_url,
+    )
+
+    assert res.config.llm.api_key == ""
+    assert res.config.llm.base_url == candidate_base_url
+
+
+def test_upsert_llm_provider_optional_preserve_blank_base_uses_default_origin():
+    cfg = GatewayConfig(
+        llm={
+            "provider": "ollama",
+            "model": "model-a",
+            "api_key": "sk-remote-ollama",
+            "base_url": "https://remote-ollama.example.test/v1",
+        }
+    )
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="ollama",
+        model="model-b",
+        preserve_api_key=True,
+        base_url="",
+    )
+
+    assert res.config.llm.base_url == "http://localhost:11434"
+    assert res.config.llm.api_key == ""
+
+
+def test_upsert_llm_provider_optional_preserve_omitted_base_keeps_stored_origin():
+    cfg = GatewayConfig(
+        llm={
+            "provider": "ollama",
+            "model": "model-a",
+            "api_key": "sk-remote-ollama",
+            "base_url": "https://remote-ollama.example.test/v1",
+        }
+    )
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="ollama",
+        model="model-b",
+        preserve_api_key=True,
+    )
+
+    assert res.config.llm.base_url == "https://remote-ollama.example.test/v1"
+    assert res.config.llm.api_key == "sk-remote-ollama"
+
+
+def test_upsert_llm_provider_optional_env_reference_follows_same_origin_path():
+    cfg = GatewayConfig(
+        llm={
+            "provider": "custom",
+            "model": "model-a",
+            "api_key_env": "CUSTOM_ORIGIN_A_KEY",
+            "base_url": "https://a.example.test/v1",
+        }
+    )
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="custom",
+        model="model-b",
+        base_url="https://A.example.test:443/alternate/v2",
+    )
+
+    assert res.config.llm.api_key_env == "CUSTOM_ORIGIN_A_KEY"
+
+
+def test_upsert_llm_provider_optional_env_reference_never_crosses_origin():
+    cfg = GatewayConfig(
+        llm={
+            "provider": "custom",
+            "model": "model-a",
+            "api_key_env": "CUSTOM_ORIGIN_A_KEY",
+            "base_url": "https://a.example.test/v1",
+        }
+    )
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="custom",
+        model="model-b",
+        base_url="https://b.example.test/v1",
+    )
+
+    assert res.config.llm.api_key_env == ""
+
+
+@pytest.mark.parametrize(
+    "ambient_source",
+    ["stored", "registry", "settings_reference", "settings_key"],
+)
+def test_upsert_llm_provider_changed_origin_does_not_recover_ambient_key(
+    monkeypatch,
+    ambient_source: str,
+):
+    monkeypatch.delenv("CUSTOM_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("CUSTOM_ORIGIN_A_KEY", raising=False)
+    monkeypatch.delenv("CUSTOM_SETTINGS_KEY", raising=False)
+    monkeypatch.delenv("OPENSQUILLA_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("OPENSQUILLA_LLM_API_KEY_ENV", raising=False)
+    if ambient_source == "stored":
+        monkeypatch.setenv("CUSTOM_ORIGIN_A_KEY", "sk-ambient-origin-a")
+    elif ambient_source == "registry":
+        monkeypatch.setenv("CUSTOM_LLM_API_KEY", "sk-ambient-origin-a")
+    elif ambient_source == "settings_reference":
+        monkeypatch.setenv("OPENSQUILLA_LLM_API_KEY_ENV", "CUSTOM_SETTINGS_KEY")
+        monkeypatch.setenv("CUSTOM_SETTINGS_KEY", "sk-ambient-origin-a")
+    else:
+        monkeypatch.setenv("OPENSQUILLA_LLM_API_KEY", "sk-ambient-origin-a")
+    cfg = GatewayConfig(
+        llm={
+            "provider": "custom",
+            "model": "model-a",
+            "api_key_env": "CUSTOM_ORIGIN_A_KEY",
+            "base_url": "https://a.example.test/v1",
+        }
+    )
+
+    with pytest.raises(ValueError, match="ambient credential is active"):
+        upsert_llm_provider(
+            cfg,
+            provider_id="custom",
+            model="model-b",
+            base_url="https://b.example.test/v1",
+        )
+
+
+def test_upsert_llm_provider_changed_origin_accepts_new_env_reference(monkeypatch):
+    monkeypatch.setenv("CUSTOM_LLM_API_KEY", "sk-ambient-origin-a")
+    monkeypatch.setenv("CUSTOM_ORIGIN_B_KEY", "sk-explicit-origin-b")
+    cfg = GatewayConfig(
+        llm={
+            "provider": "custom",
+            "model": "model-a",
+            "api_key_env": "CUSTOM_ORIGIN_A_KEY",
+            "base_url": "https://a.example.test/v1",
+        }
+    )
+
+    changed = upsert_llm_provider(
+        cfg,
+        provider_id="custom",
+        model="model-b",
+        api_key_env="CUSTOM_ORIGIN_B_KEY",
+        base_url="https://b.example.test/v1",
+    )
+    runtime = resolve_llm_runtime_config(changed.config)
+
+    assert changed.config.llm.api_key_env == "CUSTOM_ORIGIN_B_KEY"
+    assert runtime.api_key == "sk-explicit-origin-b"
+    assert runtime.api_key_env_name == "CUSTOM_ORIGIN_B_KEY"
+
+
+def test_upsert_llm_provider_changed_origin_unset_new_env_blocks_generic_fallback(
+    monkeypatch,
+):
+    monkeypatch.delenv("CUSTOM_ORIGIN_B_KEY", raising=False)
+    monkeypatch.setenv("OPENSQUILLA_LLM_API_KEY", "sk-generic-origin-a")
+    cfg = GatewayConfig(
+        llm={
+            "provider": "custom",
+            "model": "model-a",
+            "api_key": "",
+            "api_key_env": "CUSTOM_ORIGIN_A_KEY",
+            "base_url": "https://a.example.test/v1",
+        }
+    )
+
+    changed = upsert_llm_provider(
+        cfg,
+        provider_id="custom",
+        model="model-b",
+        api_key_env="CUSTOM_ORIGIN_B_KEY",
+        base_url="https://b.example.test/v1",
+    )
+    runtime = resolve_llm_runtime_config(changed.config)
+
+    assert changed.config.llm.api_key_env == "CUSTOM_ORIGIN_B_KEY"
+    assert runtime.api_key == ""
+    assert runtime.api_key_from_env is False
+    assert runtime.api_key_env_name == "CUSTOM_ORIGIN_B_KEY"
+
+
+def test_upsert_llm_provider_clears_optional_key_by_default():
+    cfg = GatewayConfig(
+        llm={
+            "provider": "custom",
+            "model": "model-a",
+            "api_key": "sk-optional",
+            "base_url": "https://llm.example.test/v1",
+        }
+    )
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="custom",
+        model="model-b",
+        api_key="",
+        base_url="https://llm.example.test/v1",
+    )
+
+    assert res.config.llm.api_key == ""
+
+
+def test_upsert_llm_provider_optional_preserve_yields_to_env_replacement():
+    cfg = GatewayConfig(
+        llm={
+            "provider": "custom",
+            "model": "model-a",
+            "api_key": "sk-optional",
+            "base_url": "https://llm.example.test/v1",
+        }
+    )
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="custom",
+        model="model-b",
+        api_key_env="CUSTOM_REPLACEMENT_KEY",
+        preserve_api_key=True,
+        base_url="https://llm.example.test/v1",
+    )
+
+    assert res.config.llm.api_key == ""
+    assert res.config.llm.api_key_env == "CUSTOM_REPLACEMENT_KEY"
+
+
+def test_upsert_llm_provider_optional_preserve_never_crosses_providers():
+    cfg = GatewayConfig(
+        llm={
+            "provider": "custom",
+            "model": "model-a",
+            "api_key": "sk-custom",
+            "base_url": "https://llm.example.test/v1",
+        },
+        squilla_router={"enabled": False},
+    )
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="ollama",
+        model="llama3.1",
+        preserve_api_key=True,
+    )
+
+    assert res.config.llm.provider == "ollama"
+    assert res.config.llm.api_key == ""
+
+
+def test_upsert_llm_provider_optional_preserve_ignores_oauth_stale_key():
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openai_codex",
+            "model": "gpt-5.1-codex",
+            "api_key": "stale-key",
+        }
+    )
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="openai_codex",
+        model="gpt-5.1-codex",
+        preserve_api_key=True,
+    )
+
+    assert res.config.llm.api_key == ""
+
+
+def test_upsert_llm_provider_optional_preserve_requires_stored_explicit_key():
+    cfg = GatewayConfig(
+        llm={
+            "provider": "custom",
+            "model": "model-a",
+            "api_key": "runtime-env-value",
+            "base_url": "https://llm.example.test/v1",
+        }
+    )
+    cfg.mark_runtime_secret("llm.api_key")
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="custom",
+        model="model-b",
+        preserve_api_key=True,
+        base_url="https://llm.example.test/v1",
+    )
+
+    assert res.config.llm.api_key == ""
+
+
 def test_upsert_llm_provider_can_use_env_key_without_secret():
     cfg = GatewayConfig()
     res = upsert_llm_provider(
@@ -488,7 +1141,10 @@ def test_upsert_llm_provider_can_use_env_key_without_secret():
 
 
 def test_upsert_llm_provider_recomputes_router_preset_on_provider_switch():
-    cfg = GatewayConfig(llm={"provider": "openrouter", "model": "deepseek/x"})
+    cfg = GatewayConfig(
+        llm={"provider": "openrouter", "model": "deepseek/x"},
+        squilla_router={"preset_binding": "follow_primary"},
+    )
     assert cfg.squilla_router.enabled is True
     # Fresh OpenRouter configs remain the openrouter-mix/direct-router shape.
     # Saving a different packaged provider below should still recompute that
@@ -509,12 +1165,11 @@ def test_upsert_llm_provider_recomputes_router_preset_on_provider_switch():
     assert "tiers" not in res.config.to_toml_dict()["squilla_router"]
 
 
-def test_upsert_llm_provider_without_preset_matches_todays_reconcile_behavior():
-    # D18-intact: a plain provider save (no presetId) must behave exactly as
-    # before — the reconcile path assigns the legacy tier_profile and writes
-    # no inline tiers. This freezes that the preset feature did not change the
-    # no-preset default.
-    cfg = GatewayConfig(llm={"provider": "openrouter", "model": "deepseek/x"})
+def test_upsert_llm_provider_without_preset_follows_managed_router_binding():
+    cfg = GatewayConfig(
+        llm={"provider": "openrouter", "model": "deepseek/x"},
+        squilla_router={"preset_binding": "follow_primary"},
+    )
 
     res = upsert_llm_provider(cfg, provider_id="deepseek", model="deepseek-chat",
                               api_key_env="DEEPSEEK_API_KEY")
@@ -522,6 +1177,136 @@ def test_upsert_llm_provider_without_preset_matches_todays_reconcile_behavior():
     persisted = res.config.to_toml_dict()["squilla_router"]
     assert persisted["tier_profile"] == "deepseek"
     assert "tiers" not in persisted
+
+
+def test_first_provider_save_establishes_follow_primary_binding():
+    cfg = GatewayConfig()
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="deepseek",
+        model="deepseek-chat",
+        api_key_env="DEEPSEEK_API_KEY",
+    )
+
+    assert res.config.squilla_router.preset_binding == "follow_primary"
+    assert res.config.squilla_router.tier_profile == "deepseek"
+    assert res.config.to_toml_dict()["squilla_router"]["preset_binding"] == (
+        "follow_primary"
+    )
+
+
+def test_first_provider_save_recognizes_materialized_pristine_defaults():
+    pristine = GatewayConfig()
+    # Runtime resolution and config.get -> config.apply both materialize the
+    # otherwise implicit defaults. Rebuilding from the public-shaped payload
+    # reproduces that loss of pydantic field-presence provenance without any
+    # network or credential dependency.
+    cfg = GatewayConfig(
+        llm=pristine.llm.model_dump(mode="python"),
+        squilla_router=pristine.squilla_router.model_dump(mode="python"),
+    )
+    assert "provider" in cfg.llm.model_fields_set
+    assert cfg.squilla_router.model_fields_set
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="deepseek",
+        model="deepseek-chat",
+        api_key_env="DEEPSEEK_API_KEY",
+    )
+
+    assert res.config.llm.provider == "deepseek"
+    assert res.config.llm.model == "deepseek-chat"
+    assert res.config.squilla_router.preset_binding == "follow_primary"
+    assert res.config.squilla_router.tier_profile == "deepseek"
+
+
+def test_materialized_default_with_explicit_custom_binding_still_conflicts():
+    pristine = GatewayConfig()
+    router_payload = pristine.squilla_router.model_dump(mode="python")
+    router_payload["preset_binding"] = "custom"
+    cfg = GatewayConfig(
+        llm=pristine.llm.model_dump(mode="python"),
+        squilla_router=router_payload,
+    )
+
+    with pytest.raises(LlmProfileActivationError) as error:
+        upsert_llm_provider(
+            cfg,
+            provider_id="deepseek",
+            model="deepseek-chat",
+            api_key_env="DEEPSEEK_API_KEY",
+        )
+
+    assert error.value.reason == "router_provider_conflict"
+    assert error.value.details["conflictProviders"] == ["tokenrhythm"]
+
+
+def test_managed_provider_switch_preserves_router_controls_and_ensemble():
+    cfg = GatewayConfig(
+        llm={"provider": "openrouter", "model": "deepseek/x"},
+        squilla_router={
+            "enabled": False,
+            "preset_binding": "follow_primary",
+            "default_tier": "c2",
+            "visual_mode": "legacy_grid",
+            "cross_provider_tiers": True,
+            "tier_provider_mismatch": "veto",
+            "confidence_threshold": 0.73,
+        },
+        llm_ensemble={
+            "enabled": False,
+            "candidate_max_chars": 12_345,
+            "record_candidates": True,
+        },
+    )
+    ensemble_before = cfg.llm_ensemble.model_dump(mode="python")
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="deepseek",
+        model="deepseek-chat",
+        api_key_env="DEEPSEEK_API_KEY",
+    )
+
+    router = res.config.squilla_router
+    assert router.enabled is False
+    assert router.preset_binding == "follow_primary"
+    assert router.tier_profile is None
+    assert router.default_tier == "c2"
+    assert router.visual_mode == "legacy_grid"
+    assert router.cross_provider_tiers is True
+    assert router.tier_provider_mismatch == "veto"
+    assert router.confidence_threshold == 0.73
+    assert {router.tiers[name]["provider"] for name in ("c0", "c1", "c2", "c3")} == {
+        "deepseek"
+    }
+    assert res.config.llm_ensemble.model_dump(mode="python") == ensemble_before
+
+
+def test_same_provider_save_does_not_reject_existing_custom_foreign_tier():
+    cfg = GatewayConfig(
+        llm={"provider": "openai", "model": "gpt-test", "api_key": "old-key"},
+        squilla_router={
+            "preset_binding": "custom",
+            "cross_provider_tiers": False,
+        },
+    )
+    cfg.squilla_router.tiers["c0"] = {
+        "provider": "deepseek",
+        "model": "deepseek-chat",
+    }
+    router_before = cfg.squilla_router.model_dump(mode="python")
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="openai",
+        model="gpt-test",
+        api_key="new-key",
+    )
+
+    assert res.config.squilla_router.model_dump(mode="python") == router_before
 
 
 def test_upsert_llm_provider_preset_id_legacy_writes_recommended_shape():
@@ -787,18 +1572,39 @@ def test_upsert_router_custom_accepts_explicit_tiers_for_synthesized_presets():
         ),
         "supports_image": False,
     }
-    # The default tier's model syncs into llm.model (same as the other
-    # enabled modes).
-    assert res.config.llm.model == "groq-mid"
+    # Router tier selection is independent from the direct/fallback model.
+    assert res.config.llm.model == "m"
 
 
-def test_upsert_router_custom_sync_llm_model_from_default_tier():
+def test_upsert_router_custom_preserves_direct_fallback_model():
     cfg = GatewayConfig(llm={"provider": "deepseek", "model": "deepseek-chat"})
 
     res = upsert_router(cfg, mode="custom", default_tier="c2")
 
     assert res.config.squilla_router.default_tier == "c2"
-    assert res.config.llm.model == "deepseek-v4-pro"
+    assert res.config.llm.model == "deepseek-chat"
+
+
+def test_upsert_router_mixed_default_does_not_copy_foreign_model_to_primary():
+    cfg = GatewayConfig(llm={"provider": "openai", "model": "gpt-4o-mini"})
+
+    res = upsert_router(
+        cfg,
+        mode="custom",
+        default_tier="c0",
+        cross_provider_tiers=True,
+        tier_provider_mismatch="veto",
+        tiers={
+            "c0": {"provider": "deepseek", "model": "deepseek-chat"},
+            "c1": {"provider": "openai", "model": "gpt-4o-mini"},
+            "c2": {"provider": "openai", "model": "gpt-4o-mini"},
+            "c3": {"provider": "openai", "model": "gpt-4o-mini"},
+        },
+    )
+
+    assert res.config.squilla_router.tiers["c0"]["model"] == "deepseek-chat"
+    assert res.config.llm.provider == "openai"
+    assert res.config.llm.model == "gpt-4o-mini"
 
 
 def test_upsert_llm_provider_keeps_runtime_secret_marker_when_reusing_key():
@@ -1016,6 +1822,85 @@ def test_upsert_image_generation_provider_configures_openrouter(monkeypatch):
     assert res.public_payload["api_key_source"] == "explicit"
 
 
+def test_upsert_image_generation_redacted_key_keeps_direct_credential_with_env_echo(
+    monkeypatch,
+):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    first = upsert_image_generation_provider(
+        GatewayConfig(),
+        provider_id="openrouter",
+        api_key="sk-stored-direct-key",
+    )
+
+    res = upsert_image_generation_provider(
+        first.config,
+        provider_id="openrouter",
+        api_key="***",
+        api_key_env="OPENROUTER_API_KEY",
+    )
+
+    provider = res.config.image_generation.providers.openrouter
+    assert provider.api_key == "sk-stored-direct-key"
+    assert res.public_payload["api_key_source"] == "explicit"
+
+
+def test_upsert_image_generation_legacy_direct_key_accepts_default_env_echo(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    res = upsert_image_generation_provider(
+        GatewayConfig(),
+        provider_id="openrouter",
+        primary=_IMG_PRIMARY,
+        api_key="sk-new-direct-key",
+        api_key_env="OPENROUTER_API_KEY",
+    )
+
+    provider = res.config.image_generation.providers.openrouter
+    assert provider.api_key == "sk-new-direct-key"
+    assert provider.api_key_env == ""
+    assert res.public_payload["api_key_source"] == "explicit"
+
+
+def test_upsert_image_generation_legacy_default_env_echo_keeps_stored_direct_key(
+    monkeypatch,
+):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    cfg = GatewayConfig(
+        image_generation={
+            "enabled": True,
+            "primary": _IMG_PRIMARY,
+            "providers": {
+                "openrouter": {
+                    "api_key": "sk-stored-direct-key",
+                    "api_key_env": "OPENROUTER_API_KEY",
+                }
+            },
+        }
+    )
+
+    res = upsert_image_generation_provider(
+        cfg,
+        provider_id="openrouter",
+        primary=_IMG_PRIMARY,
+        api_key_env="OPENROUTER_API_KEY",
+    )
+
+    provider = res.config.image_generation.providers.openrouter
+    assert provider.api_key == "sk-stored-direct-key"
+    assert res.public_payload["api_key_source"] == "explicit"
+
+
+def test_upsert_image_generation_legacy_direct_key_rejects_custom_env_echo():
+    with pytest.raises(ValueError, match="either api_key or api_key_env"):
+        upsert_image_generation_provider(
+            GatewayConfig(),
+            provider_id="openrouter",
+            primary=_IMG_PRIMARY,
+            api_key="sk-new-direct-key",
+            api_key_env="CUSTOM_IMAGE_KEY",
+        )
+
+
 def test_upsert_image_generation_provider_can_use_matching_llm_key(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     cfg = GatewayConfig()
@@ -1025,6 +1910,34 @@ def test_upsert_image_generation_provider_can_use_matching_llm_key(monkeypatch):
     assert res.config.image_generation.enabled is True
     assert res.config.image_generation.providers.openrouter.api_key == ""
     assert res.public_payload["api_key_source"] == "llm_fallback"
+
+
+def test_upsert_image_generation_provider_llm_fallback_requires_same_origin(monkeypatch):
+    # The matching-LLM-key fallback binds the primary LLM secret to the image
+    # endpoint; a save pointing the image provider at a different origin must
+    # not silently bind it and instead requires a dedicated key.
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    cfg = GatewayConfig()
+    cfg.llm.provider = "openai"
+    cfg.llm.api_key = "sk-real"
+    cfg.llm.base_url = "https://api.openai.com/v1"
+
+    with pytest.raises(ValueError, match="requires an api_key"):
+        upsert_image_generation_provider(
+            cfg,
+            provider_id="openai",
+            base_url="https://other.example.com/v1",
+            api_key="",
+            enabled=True,
+        )
+
+    same_origin = upsert_image_generation_provider(
+        cfg,
+        provider_id="openai",
+        base_url="https://api.openai.com/images/path",
+        api_key="",
+    )
+    assert same_origin.public_payload["api_key_source"] == "llm_fallback"
 
 
 def test_upsert_image_generation_provider_can_disable_without_key(monkeypatch):
@@ -1053,6 +1966,369 @@ def test_upsert_image_generation_provider_rejects_wrong_primary_provider():
             provider_id="openrouter",
             primary="openai/gpt-image-1",
         )
+
+
+def test_upsert_image_generation_provider_drops_stored_key_on_changed_origin(
+    monkeypatch,
+):
+    # A stored explicit image key must not follow a changed endpoint origin.
+    # The disabled resave lets us observe the cleared key directly.
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    first = upsert_image_generation_provider(
+        GatewayConfig(),
+        provider_id="openai",
+        api_key="sk-image-origin-a",
+        base_url="https://a.example.test/v1",
+    )
+
+    changed = upsert_image_generation_provider(
+        first.config,
+        provider_id="openai",
+        api_key="",
+        base_url="https://b.example.test/v1",
+        enabled=False,
+    )
+
+    provider_cfg = changed.config.image_generation.providers.openai
+    assert provider_cfg.api_key == ""
+    assert provider_cfg.base_url == "https://b.example.test/v1"
+
+
+def test_upsert_image_generation_provider_changed_origin_fails_closed(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    first = upsert_image_generation_provider(
+        GatewayConfig(),
+        provider_id="openai",
+        api_key="sk-image-origin-a",
+        base_url="https://a.example.test/v1",
+    )
+
+    with pytest.raises(ValueError, match="requires an api_key"):
+        upsert_image_generation_provider(
+            first.config,
+            provider_id="openai",
+            api_key="",
+            base_url="https://b.example.test/v1",
+        )
+
+
+def test_upsert_image_generation_provider_keeps_stored_key_on_same_origin(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    first = upsert_image_generation_provider(
+        GatewayConfig(),
+        provider_id="openai",
+        api_key="sk-image-origin-a",
+        base_url="https://a.example.test/v1",
+    )
+
+    same = upsert_image_generation_provider(
+        first.config,
+        provider_id="openai",
+        api_key="",
+        base_url="https://A.example.test:443/v2",
+    )
+
+    assert same.config.image_generation.providers.openai.api_key == "sk-image-origin-a"
+
+
+def test_upsert_image_generation_default_env_key_never_crosses_origin(monkeypatch):
+    # The well-known default env var resolves the same shared real secret,
+    # so a cross-origin resave must not keep resolving it for the new
+    # endpoint: the enabled resave fails closed and the disabled resave
+    # persists no env reference.
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-shared-image-env")
+    first = upsert_image_generation_provider(
+        GatewayConfig(),
+        provider_id="openai",
+        api_key="sk-image-origin-a",
+        base_url="https://api.openai.com/v1",
+    )
+
+    with pytest.raises(ValueError, match="requires an api_key"):
+        upsert_image_generation_provider(
+            first.config,
+            provider_id="openai",
+            api_key="***",
+            base_url="https://attacker.example/v1",
+        )
+
+    changed = upsert_image_generation_provider(
+        first.config,
+        provider_id="openai",
+        api_key="***",
+        base_url="https://attacker.example/v1",
+        enabled=False,
+    )
+    provider_cfg = changed.config.image_generation.providers.openai
+    assert provider_cfg.api_key == ""
+    assert provider_cfg.api_key_env != "OPENAI_API_KEY"
+    assert changed.public_payload["api_key_source"] != "env"
+
+
+def test_upsert_image_generation_does_not_restore_default_env_after_origin_change(
+    monkeypatch,
+):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-shared-image-env")
+    first = upsert_image_generation_provider(GatewayConfig(), provider_id="openai")
+    changed = upsert_image_generation_provider(
+        first.config,
+        provider_id="openai",
+        api_key="***",
+        base_url="https://other.example.test/v1",
+        enabled=False,
+    )
+
+    with pytest.raises(ValueError, match="requires an api_key"):
+        upsert_image_generation_provider(
+            changed.config,
+            provider_id="openai",
+            base_url="https://other.example.test/v2",
+            enabled=True,
+        )
+
+    assert changed.config.image_generation.providers.openai.api_key_env == ""
+    reauthorized = upsert_image_generation_provider(
+        changed.config,
+        provider_id="openai",
+        api_key_env="OPENAI_API_KEY",
+        base_url="https://other.example.test/v2",
+        enabled=True,
+    )
+    assert reauthorized.config.image_generation.providers.openai.api_key_env == (
+        "OPENAI_API_KEY"
+    )
+    assert (
+        "image_generation",
+        "providers",
+        "openai",
+        "api_key_env",
+    ) in reauthorized.config.force_persist_path_segments()
+
+
+def test_upsert_image_generation_fresh_default_origin_uses_default_env_key(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-shared-image-env")
+    res = upsert_image_generation_provider(GatewayConfig(), provider_id="openai")
+    assert res.config.image_generation.providers.openai.api_key_env == "OPENAI_API_KEY"
+    assert res.public_payload["api_key_source"] == "env"
+
+
+def test_upsert_image_generation_same_origin_path_change_keeps_default_env_key(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-shared-image-env")
+    first = upsert_image_generation_provider(GatewayConfig(), provider_id="openai")
+
+    same = upsert_image_generation_provider(
+        first.config,
+        provider_id="openai",
+        base_url="https://api.openai.com/v2",
+    )
+
+    assert same.config.image_generation.providers.openai.api_key_env == "OPENAI_API_KEY"
+    assert same.public_payload["api_key_source"] == "env"
+
+
+def test_upsert_image_generation_resubmitted_env_reference_never_crosses_origin(monkeypatch):
+    # Clients hydrate and re-send the stored env-var name in plaintext: a
+    # resave that re-submits the stored reference while changing the endpoint
+    # origin is "keep current" and must not rebind the secret to the new
+    # origin.
+    monkeypatch.setenv("MY_IMG_KEY", "sk-image-env-origin-a")
+    first = upsert_image_generation_provider(
+        GatewayConfig(),
+        provider_id="openai",
+        api_key_env="MY_IMG_KEY",
+        base_url="https://a.example.test/v1",
+    )
+    assert first.config.image_generation.providers.openai.api_key_env == "MY_IMG_KEY"
+
+    with pytest.raises(ValueError, match="requires an api_key"):
+        upsert_image_generation_provider(
+            first.config,
+            provider_id="openai",
+            api_key_env="MY_IMG_KEY",
+            base_url="https://b.example.test/v1",
+        )
+
+    changed = upsert_image_generation_provider(
+        first.config,
+        provider_id="openai",
+        api_key_env="MY_IMG_KEY",
+        base_url="https://b.example.test/v1",
+        enabled=False,
+    )
+    assert changed.config.image_generation.providers.openai.api_key_env == ""
+
+    same_origin = upsert_image_generation_provider(
+        first.config,
+        provider_id="openai",
+        api_key_env="MY_IMG_KEY",
+        base_url="https://a.example.test/v2",
+    )
+    assert same_origin.config.image_generation.providers.openai.api_key_env == "MY_IMG_KEY"
+
+
+def test_upsert_audio_provider_drops_stored_key_on_changed_origin(monkeypatch):
+    # A stored explicit audio key must not follow a changed endpoint origin;
+    # with every credential source dropped the enabled resave fails closed.
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    first = upsert_audio_provider(
+        GatewayConfig(),
+        provider_id="elevenlabs",
+        api_key="sk-audio-origin-a",
+        base_url="https://a.example.test/v1",
+    )
+
+    with pytest.raises(ValueError, match="requires an api_key"):
+        upsert_audio_provider(
+            first.config,
+            provider_id="elevenlabs",
+            api_key="",
+            base_url="https://b.example.test/v1",
+        )
+
+    changed = upsert_audio_provider(
+        first.config,
+        provider_id="elevenlabs",
+        api_key="",
+        base_url="https://b.example.test/v1",
+        enabled=False,
+    )
+
+    provider_cfg = changed.config.audio.providers.elevenlabs
+    assert provider_cfg.api_key == ""
+    assert provider_cfg.api_key_env == ""
+    assert provider_cfg.base_url == "https://b.example.test/v1"
+
+
+def test_upsert_audio_provider_default_env_key_never_crosses_origin(monkeypatch):
+    # The well-known default env var resolves the same shared real secret,
+    # so a cross-origin resave must not keep resolving it for the new
+    # endpoint.
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "sk-shared-audio-env")
+    first = upsert_audio_provider(
+        GatewayConfig(),
+        provider_id="elevenlabs",
+        api_key="sk-audio-origin-a",
+        base_url="https://a.example.test/v1",
+    )
+
+    with pytest.raises(ValueError, match="requires an api_key"):
+        upsert_audio_provider(
+            first.config,
+            provider_id="elevenlabs",
+            api_key="***",
+            base_url="https://b.example.test/v1",
+        )
+
+    changed = upsert_audio_provider(
+        first.config,
+        provider_id="elevenlabs",
+        api_key="***",
+        base_url="https://b.example.test/v1",
+        enabled=False,
+    )
+    provider_cfg = changed.config.audio.providers.elevenlabs
+    assert provider_cfg.api_key == ""
+    assert provider_cfg.api_key_env != "ELEVENLABS_API_KEY"
+    assert changed.public_payload["api_key_source"] != "env"
+
+
+def test_upsert_audio_provider_does_not_restore_default_env_after_origin_change(
+    monkeypatch,
+):
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "sk-shared-audio-env")
+    first = upsert_audio_provider(GatewayConfig(), provider_id="elevenlabs")
+    changed = upsert_audio_provider(
+        first.config,
+        provider_id="elevenlabs",
+        api_key="***",
+        base_url="https://other.example.test/v1",
+        enabled=False,
+    )
+
+    with pytest.raises(ValueError, match="requires an api_key"):
+        upsert_audio_provider(
+            changed.config,
+            provider_id="elevenlabs",
+            base_url="https://other.example.test/v2",
+            enabled=True,
+        )
+
+    assert changed.config.audio.providers.elevenlabs.api_key_env == ""
+    reauthorized = upsert_audio_provider(
+        changed.config,
+        provider_id="elevenlabs",
+        api_key_env="ELEVENLABS_API_KEY",
+        base_url="https://other.example.test/v2",
+        enabled=True,
+    )
+    assert reauthorized.config.audio.providers.elevenlabs.api_key_env == (
+        "ELEVENLABS_API_KEY"
+    )
+    assert (
+        "audio",
+        "providers",
+        "elevenlabs",
+        "api_key_env",
+    ) in reauthorized.config.force_persist_path_segments()
+
+
+def test_upsert_audio_provider_resubmitted_env_reference_never_crosses_origin(monkeypatch):
+    # Clients hydrate and re-send the stored env-var name in plaintext: a
+    # resave that re-submits the stored reference while changing the endpoint
+    # origin is "keep current" and must not rebind the secret to the new
+    # origin.
+    monkeypatch.setenv("MY_AUDIO_KEY", "sk-audio-env-origin-a")
+    first = upsert_audio_provider(
+        GatewayConfig(),
+        provider_id="elevenlabs",
+        api_key_env="MY_AUDIO_KEY",
+        base_url="https://a.example.test/v1",
+    )
+    assert first.config.audio.providers.elevenlabs.api_key_env == "MY_AUDIO_KEY"
+
+    with pytest.raises(ValueError, match="requires an api_key"):
+        upsert_audio_provider(
+            first.config,
+            provider_id="elevenlabs",
+            api_key_env="MY_AUDIO_KEY",
+            base_url="https://b.example.test/v1",
+        )
+
+    changed = upsert_audio_provider(
+        first.config,
+        provider_id="elevenlabs",
+        api_key_env="MY_AUDIO_KEY",
+        base_url="https://b.example.test/v1",
+        enabled=False,
+    )
+    assert changed.config.audio.providers.elevenlabs.api_key_env == ""
+
+    same_origin = upsert_audio_provider(
+        first.config,
+        provider_id="elevenlabs",
+        api_key_env="MY_AUDIO_KEY",
+        base_url="https://a.example.test/v2",
+    )
+    assert same_origin.config.audio.providers.elevenlabs.api_key_env == "MY_AUDIO_KEY"
+
+
+def test_upsert_audio_provider_keeps_stored_key_on_same_origin(monkeypatch):
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    first = upsert_audio_provider(
+        GatewayConfig(),
+        provider_id="elevenlabs",
+        api_key="sk-audio-origin-a",
+        base_url="https://a.example.test/v1",
+    )
+
+    same = upsert_audio_provider(
+        first.config,
+        provider_id="elevenlabs",
+        api_key="",
+        base_url="https://A.example.test:443/v2",
+    )
+
+    assert same.config.audio.providers.elevenlabs.api_key == "sk-audio-origin-a"
 
 
 def test_search_provider_requiring_key_can_reuse_existing_key():
@@ -1143,6 +2419,45 @@ def test_upsert_image_generation_applies_size_format_fallbacks():
     assert res.public_payload["fallbacks"] == ["openai/gpt-image-1", "openrouter/x"]
 
 
+def test_upsert_image_generation_canonicalizes_openrouter_auto_model():
+    res = upsert_image_generation_provider(
+        GatewayConfig(),
+        provider_id="openrouter",
+        primary="openrouter/auto",
+        api_key="sk-img",
+        fallbacks=["openrouter/auto"],
+    )
+
+    assert res.config.image_generation.primary == "openrouter/openrouter/auto"
+    assert res.config.image_generation.fallbacks == ["openrouter/openrouter/auto"]
+
+
+def test_upsert_image_generation_legacy_switch_normalization_requires_saved_source_fields():
+    cfg = GatewayConfig(
+        image_generation={
+            "enabled": True,
+            "primary": "openai/custom-image-model",
+            "fallbacks": ["openai/gpt-image-1"],
+            "providers": {
+                "openai": {"base_url": "https://images.example.test/v1"},
+            },
+        }
+    )
+
+    with pytest.raises(ValueError, match="primary must be a provider/model reference"):
+        upsert_image_generation_provider(
+            cfg,
+            provider_id="openrouter",
+            primary="openai/custom-image-model",
+            api_key="sk-img",
+            api_key_env="OPENROUTER_API_KEY",
+            # This differs from the stored source endpoint, so it is not an
+            # old-client draft and must not receive compatibility rewriting.
+            base_url="https://untrusted.example.test/v1",
+            fallbacks=["openai/gpt-image-1"],
+        )
+
+
 def test_upsert_image_generation_empty_keeps_current():
     cfg = GatewayConfig()
     cfg.image_generation.size = "1024x1536"
@@ -1155,6 +2470,175 @@ def test_upsert_image_generation_empty_keeps_current():
     assert ig.size == "1024x1536"
     assert ig.output_format == "jpeg"
     assert ig.fallbacks == ["openrouter/keep"]
+
+
+def test_upsert_image_generation_legacy_empty_fallbacks_keep_current():
+    cfg = GatewayConfig()
+    cfg.image_generation.fallbacks = ["openrouter/keep"]
+
+    res = upsert_image_generation_provider(
+        cfg,
+        provider_id="openrouter",
+        primary=_IMG_PRIMARY,
+        api_key="sk-img",
+        fallbacks=[],
+    )
+
+    assert res.config.image_generation.fallbacks == ["openrouter/keep"]
+
+
+def test_upsert_image_generation_explicit_empty_fallbacks_clear_current():
+    cfg = GatewayConfig()
+    cfg.image_generation.fallbacks = ["openrouter/keep"]
+
+    res = upsert_image_generation_provider(
+        cfg,
+        provider_id="openrouter",
+        primary=_IMG_PRIMARY,
+        api_key="sk-img",
+        fallbacks=[],
+        clear_fallbacks=True,
+    )
+
+    assert res.config.image_generation.fallbacks == []
+    assert res.public_payload["fallbacks"] == []
+
+
+def test_upsert_image_generation_allows_authenticated_fallback_on_primary_metadata_save(
+    monkeypatch,
+):
+    from opensquilla.onboarding.section_status import (
+        SectionStatus,
+        image_generation_section_status,
+    )
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    cfg = GatewayConfig(
+        image_generation={
+            "enabled": True,
+            "primary": _IMG_PRIMARY,
+            "fallbacks": ["openai/gpt-image-1"],
+            "providers": {"openai": {"api_key": "sk-fallback"}},
+        }
+    )
+
+    res = upsert_image_generation_provider(
+        cfg,
+        provider_id="openrouter",
+        primary=_IMG_PRIMARY,
+        output_format="webp",
+    )
+
+    assert res.config.image_generation.output_format == "webp"
+    assert res.config.image_generation.fallbacks == ["openai/gpt-image-1"]
+    assert image_generation_section_status(res.config) is SectionStatus.OK
+
+
+def test_upsert_image_generation_env_reference_replaces_stored_direct_key():
+    first = upsert_image_generation_provider(
+        GatewayConfig(),
+        provider_id="openrouter",
+        primary=_IMG_PRIMARY,
+        api_key="sk-image-direct",
+    )
+
+    replaced = upsert_image_generation_provider(
+        first.config,
+        provider_id="openrouter",
+        primary=_IMG_PRIMARY,
+        api_key_env="OPENSQUILLA_TEST_IMAGE_KEY",
+        credential_mode="env",
+    )
+
+    provider = replaced.config.image_generation.providers.openrouter
+    assert provider.api_key == ""
+    assert provider.api_key_env == "OPENSQUILLA_TEST_IMAGE_KEY"
+
+
+@pytest.mark.parametrize(
+    ("primary", "fallbacks"),
+    [
+        ("openrouter/", None),
+        ("openrouter/google//image", None),
+        ("openrouter/google image", None),
+        (_IMG_PRIMARY, ["openai/"]),
+        (_IMG_PRIMARY, ["openai/gpt image"]),
+    ],
+)
+def test_upsert_image_generation_rejects_malformed_model_references(primary, fallbacks):
+    with pytest.raises(ValueError, match="provider/model|Invalid image generation model ref"):
+        upsert_image_generation_provider(
+            GatewayConfig(),
+            provider_id="openrouter",
+            primary=primary,
+            api_key="sk-img",
+            fallbacks=fallbacks,
+        )
+
+
+def test_upsert_image_generation_rejects_foreign_official_endpoint():
+    with pytest.raises(ValueError, match="cannot use the official 'openai' endpoint"):
+        upsert_image_generation_provider(
+            GatewayConfig(),
+            provider_id="openrouter",
+            primary=_IMG_PRIMARY,
+            api_key="sk-img",
+            base_url="https://api.openai.com/v1",
+        )
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "not-a-url",
+        "https://openrouter.ai:invalid/v1",
+        "https://openrouter.ai:99999/v1",
+        "https://openrouter.ai/api/v1?tenant=test",
+        "https://openrouter.ai/api/v1#fragment",
+        "https://user:secret@openrouter.ai/api/v1",
+    ],
+)
+def test_upsert_image_generation_rejects_invalid_endpoint(base_url):
+    with pytest.raises(ValueError, match="absolute http:// or https:// URL"):
+        upsert_image_generation_provider(
+            GatewayConfig(),
+            provider_id="openrouter",
+            primary=_IMG_PRIMARY,
+            api_key="sk-img",
+            base_url=base_url,
+        )
+
+
+def test_upsert_image_generation_can_disable_unchanged_legacy_invalid_config():
+    cfg = GatewayConfig(
+        image_generation={
+            "enabled": True,
+            "primary": "openrouter/google//image",
+            "fallbacks": ["openai/"],
+            "providers": {
+                "openrouter": {
+                    "api_key": "sk-synthetic-image",
+                    "base_url": "not-a-url",
+                }
+            },
+        }
+    )
+
+    res = upsert_image_generation_provider(
+        cfg,
+        provider_id="openrouter",
+        primary=cfg.image_generation.primary,
+        fallbacks=list(cfg.image_generation.fallbacks),
+        enabled=False,
+    )
+
+    assert res.config.image_generation.enabled is False
+    assert res.config.image_generation.primary == "openrouter/google//image"
+    assert res.config.image_generation.fallbacks == ["openai/"]
+    provider = res.config.image_generation.providers.openrouter
+    assert provider.base_url == "not-a-url"
+    assert provider.api_key == "sk-synthetic-image"
 
 
 def test_upsert_image_generation_rejects_bad_size():
@@ -1300,6 +2784,7 @@ def test_router_reconcile_still_preserves_hand_authored_ladder():
         api_key="sk-old",
     ).config
     router_payload = seeded.squilla_router.model_dump(mode="python")
+    router_payload["preset_binding"] = "custom"
     router_payload["tiers"]["c0"]["model"] = "model-cheap"
     router_payload["tiers"]["c3"]["model"] = "model-big"
     from opensquilla.gateway.config import SquillaRouterConfig
@@ -1364,3 +2849,86 @@ def test_image_generation_explicit_enabled_decision_is_force_persisted(tmp_path)
 
     data = _tomllib.loads(target.read_text())
     assert data["image_generation"]["enabled"] is False
+
+
+def test_upsert_channel_blank_secret_keeps_stored_value():
+    cfg = GatewayConfig()
+    res1 = upsert_channel(
+        cfg,
+        entry_payload={"type": "telegram", "name": "tg", "token": "tok-stored"},
+    )
+    for blank in ("", "   ", None):
+        payload: dict[str, object] = {"type": "telegram", "name": "tg", "default_chat_id": "42"}
+        if blank is not None:
+            payload["token"] = blank
+        res = upsert_channel(res1.config, entry_payload=payload)
+        raw = res.config.channels.channels[0]
+        assert raw.token == "tok-stored"
+        assert raw.default_chat_id == "42"
+
+
+def test_upsert_channel_redaction_placeholder_keeps_stored_value():
+    # '***' is what channels.get / probe echo for a stored secret; a client
+    # round-tripping that payload means "keep the current value". Enforced
+    # server-side so every RPC/CLI client gets the same trust boundary (the
+    # Web UI scrub is defense in depth only).
+    cfg = GatewayConfig()
+    res1 = upsert_channel(
+        cfg,
+        entry_payload={"type": "telegram", "name": "tg", "token": "tok-real"},
+    )
+    res2 = upsert_channel(
+        res1.config,
+        entry_payload={"type": "telegram", "name": "tg", "token": REDACTED_PLACEHOLDER},
+    )
+    # Raw config access: the redacted *listing* would mask a real value too.
+    assert res2.config.channels.channels[0].token == "tok-real"
+
+
+def test_upsert_channel_redaction_placeholder_without_stored_value_rejected():
+    # With no stored credential to keep, persisting the literal sentinel
+    # would overwrite the channel's token with asterisks — reject instead.
+    cfg = GatewayConfig()
+    with pytest.raises(ValueError, match="looks redacted"):
+        upsert_channel(
+            cfg,
+            entry_payload={
+                "type": "telegram",
+                "name": "tg",
+                "token": REDACTED_PLACEHOLDER,
+            },
+        )
+
+
+def test_upsert_channel_same_name_different_type_replaces_without_secret_merge():
+    # The replace loop matches on name only, while the keep-current secret
+    # merge matches on name AND type: re-saving an existing name under a new
+    # type replaces the entry and preserves no secrets. The Web UI duplicate
+    # guard words its warning ("Save will replace it") on this behavior.
+    cfg = GatewayConfig()
+    res1 = upsert_channel(
+        cfg,
+        entry_payload={"type": "telegram", "name": "bridge", "token": "tg-secret"},
+    )
+    with pytest.raises(ValueError):
+        # Blank secret cannot borrow the other type's stored value.
+        upsert_channel(res1.config, entry_payload={"type": "discord", "name": "bridge"})
+    res2 = upsert_channel(
+        res1.config,
+        entry_payload={"type": "discord", "name": "bridge", "token": "dc-secret"},
+    )
+    raw_entries = res2.config.channels.channels
+    assert len(raw_entries) == 1
+    assert raw_entries[0].type == "discord"
+    assert raw_entries[0].token == "dc-secret"
+
+
+def test_validate_channel_entry_raises_structured_field_errors():
+    from opensquilla.onboarding.mutations import ChannelValidationError, validate_channel_entry
+
+    with pytest.raises(ChannelValidationError) as ei:
+        validate_channel_entry({"type": "slack"})  # missing required name/token
+    assert ei.value.field_errors, "expected per-field detail"
+    assert all("field" in fe and "message" in fe for fe in ei.value.field_errors)
+    # The joined string message is preserved for callers that only read str(exc).
+    assert "invalid channel entry" in str(ei.value)

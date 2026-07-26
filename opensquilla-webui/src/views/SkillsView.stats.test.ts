@@ -1,7 +1,16 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-async function mountSkillsView() {
+async function mountSkillsView(reloadResult: Record<string, unknown> = {
+  success: true,
+  changed: true,
+  partial: false,
+  generation: 2,
+  added: ['new-skill'],
+  removed: [],
+  modified: [],
+  errors: [],
+}, loadDataResult: boolean | undefined = undefined) {
   vi.resetModules()
 
   const { createApp, defineComponent, h, nextTick, ref } = await import('vue')
@@ -9,8 +18,11 @@ async function mountSkillsView() {
   const i18n = (await import('@/i18n')).default
 
   const setStatusFilter = vi.fn()
-  const loadData = vi.fn(async () => {})
+  const loadData = vi.fn(async () => loadDataResult)
   const scrollIntoView = vi.fn()
+  const rpcCall = vi.fn(async () => reloadResult)
+  const waitForConnection = vi.fn(async () => {})
+  const pushToast = vi.fn()
 
   const iconStub = defineComponent({
     name: 'IconStub',
@@ -95,6 +107,12 @@ async function mountSkillsView() {
       },
     }),
   }))
+  vi.doMock('@/stores/rpc', () => ({
+    useRpcStore: () => ({ call: rpcCall, waitForConnection }),
+  }))
+  vi.doMock('@/composables/useToasts', () => ({
+    useToasts: () => ({ pushToast }),
+  }))
 
   vi.doMock('@/composables/skills/useSkillProposals', () => ({
     useSkillProposals: () => ({
@@ -161,7 +179,17 @@ async function mountSkillsView() {
   app.mount(el)
   await nextTick()
 
-  return { app, el, nextTick, setStatusFilter, scrollIntoView }
+  return {
+    app,
+    el,
+    nextTick,
+    setStatusFilter,
+    scrollIntoView,
+    loadData,
+    rpcCall,
+    waitForConnection,
+    pushToast,
+  }
 }
 
 beforeEach(() => {
@@ -181,6 +209,8 @@ afterEach(() => {
   vi.doUnmock('@/composables/skills/useSkillProposals')
   vi.doUnmock('@/composables/skills/useSkillRegistry')
   vi.doUnmock('@/composables/skills/useSkillsCatalog')
+  vi.doUnmock('@/composables/useToasts')
+  vi.doUnmock('@/stores/rpc')
 })
 
 describe('SkillsView stats navigation', () => {
@@ -219,6 +249,72 @@ describe('SkillsView stats navigation', () => {
     expect(installedPanel?.style.display).not.toBe('none')
     expect(registryPanel?.style.display).toBe('none')
     expect(scrollIntoView).toHaveBeenCalledWith({ behavior: 'smooth', block: 'start' })
+    app.unmount()
+  })
+})
+
+describe('SkillsView catalog reload', () => {
+  it('does not force reload when the view is displayed', async () => {
+    const { app, rpcCall } = await mountSkillsView()
+
+    expect(rpcCall).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
+  it('calls reload before listing the published catalog', async () => {
+    const { app, el, loadData, rpcCall, pushToast } = await mountSkillsView()
+    loadData.mockClear()
+
+    el.querySelector<HTMLButtonElement>('[data-testid="skills-reload"]')?.click()
+    await vi.waitFor(() => expect(loadData).toHaveBeenCalledTimes(1))
+
+    expect(rpcCall).toHaveBeenCalledExactlyOnceWith('skills.reload')
+    expect(rpcCall.mock.invocationCallOrder[0]).toBeLessThan(
+      loadData.mock.invocationCallOrder[0],
+    )
+    expect(pushToast).toHaveBeenCalledWith(expect.stringContaining('generation 2'), {
+      tone: 'ok',
+    })
+    app.unmount()
+  })
+
+  it('shows a warning when reload publishes a partial catalog', async () => {
+    const { app, el, pushToast } = await mountSkillsView({
+      success: true,
+      changed: true,
+      partial: true,
+      generation: 3,
+      added: [],
+      removed: [],
+      modified: ['existing-skill'],
+      errors: [{ message: 'invalid frontmatter', kept_previous: true }],
+    })
+
+    el.querySelector<HTMLButtonElement>('[data-testid="skills-reload"]')?.click()
+    await vi.waitFor(() => expect(pushToast).toHaveBeenCalled())
+
+    expect(pushToast).toHaveBeenCalledWith(expect.stringContaining('1 error'), {
+      tone: 'warn',
+    })
+    app.unmount()
+  })
+
+  it('does not report success when the refreshed list fails to load', async () => {
+    const { app, el, pushToast } = await mountSkillsView({
+      success: true,
+      changed: true,
+      partial: false,
+      generation: 4,
+      added: ['new-skill'],
+      removed: [],
+      modified: [],
+      errors: [],
+    }, false)
+
+    el.querySelector<HTMLButtonElement>('[data-testid="skills-reload"]')?.click()
+    await vi.waitFor(() => expect(pushToast).toHaveBeenCalled())
+
+    expect(pushToast).toHaveBeenCalledWith(expect.any(String), { tone: 'danger' })
     app.unmount()
   })
 })

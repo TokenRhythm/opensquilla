@@ -112,6 +112,16 @@ def build_group_key(agent_id: str, channel: str, peer_id: str) -> str:
     return f"agent:{aid}:{channel}:group:{peer_id}"
 
 
+def build_group_sender_key(
+    agent_id: str,
+    channel: str,
+    peer_id: str,
+    sender_id: str,
+) -> str:
+    """Build a group session key isolated to one sender in one room."""
+    return f"{build_group_key(agent_id, channel, peer_id)}:sender:{sender_id}"
+
+
 def build_channel_key(agent_id: str, channel: str, peer_id: str) -> str:
     aid = normalize_agent_id(agent_id)
     return f"agent:{aid}:{channel}:channel:{peer_id}"

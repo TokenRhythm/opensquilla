@@ -223,6 +223,8 @@ def stage_router_decision(
             "probs": extra.get("probabilities"),
             "flags": extra.get("flags"),
             "final_tier": _token(extra.get("final_tier")) or _token(decision.tier),
+            "requested_provider": _token(metadata.get("routed_provider")),
+            "requested_model": _token(getattr(decision, "model", None)),
             "provider": _token(metadata.get("routed_provider")),
             "model": _token(getattr(decision, "model", None)),
             "thinking_level": _token(metadata.get("thinking_level")),
@@ -265,12 +267,54 @@ def _complete_pending_record(
             profile = _token(ensemble_trace.get("profile"))
         record["ensemble_profile"] = profile
         record["fallback_hops"] = int(metadata.get(FALLBACK_HOPS_METADATA_KEY) or 0)
-        if not ensemble_enabled:
-            # Selector fallback realigns metadata["routed_model"] to the model
-            # that actually ran — keep the record naming the executed model.
-            executed_model = _token(metadata.get("routed_model"))
-            if executed_model is not None:
-                record["model"] = executed_model
+        executed_provider = _token(metadata.get("executed_provider"))
+        executed_model = _token(metadata.get("executed_model"))
+        if ensemble_enabled and isinstance(ensemble_trace, Mapping):
+            final_request = ensemble_trace.get("final_request")
+            execution = (
+                final_request.get("execution")
+                if isinstance(final_request, Mapping)
+                else None
+            )
+            if isinstance(execution, Mapping):
+                executed_provider = _token(execution.get("provider")) or executed_provider
+                executed_model = _token(execution.get("model")) or executed_model
+        if executed_provider is None:
+            executed_provider = (
+                _token(metadata.get("routed_provider_applied"))
+                or _token(metadata.get("routed_provider_fallback_provider"))
+                or _token(record.get("requested_provider"))
+                or _token(record.get("provider"))
+            )
+        if executed_model is None:
+            executed_model = (
+                _token(metadata.get("routed_provider_fallback_model"))
+                or _token(metadata.get("routed_model"))
+                or _token(record.get("requested_model"))
+                or _token(record.get("model"))
+            )
+        record["executed_provider"] = executed_provider
+        record["executed_model"] = executed_model
+        fallback_reason = _token(metadata.get("routed_provider_fallback_reason"))
+        if fallback_reason is None and record["fallback_hops"]:
+            fallback_reason = _token(metadata.get("router_fallback_reason")) or "selector_fallback"
+        if (
+            fallback_reason is None
+            and ensemble_enabled
+            and isinstance(ensemble_trace, Mapping)
+            and bool(ensemble_trace.get("fallback_used"))
+        ):
+            fallback_reason = (
+                _token(ensemble_trace.get("fallback_code"))
+                or _token(ensemble_trace.get("fallback_reason"))
+                or "ensemble_fallback_single"
+            )
+        record["fallback_reason"] = fallback_reason
+        if not ensemble_enabled and executed_model is not None:
+            # Preserve the legacy model column's existing executed-model
+            # semantics while the additive requested/executed fields expose
+            # both sides explicitly.
+            record["model"] = executed_model
     except Exception:  # noqa: BLE001 — decision records must never fail a turn
         log.warning("router_decision_record.flush_failed", exc_info=True)
         return None

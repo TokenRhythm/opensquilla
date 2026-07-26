@@ -21,6 +21,7 @@ from opensquilla.provider import (
 )
 from opensquilla.provider import DoneEvent as ProviderDone
 from opensquilla.provider import TextDeltaEvent as ProviderText
+from opensquilla.provider import ToolUseDeltaEvent as ProviderToolUseDelta
 from opensquilla.provider import ToolUseEndEvent as ProviderToolUseEnd
 from opensquilla.provider import ToolUseStartEvent as ProviderToolUseStart
 from opensquilla.session.manager import SessionManager
@@ -1510,3 +1511,254 @@ async def test_discarded_empty_attempt_counts_usage_but_skips_cache_check(
     assert tracked.output_tokens == 1
     assert len(cache_checks) == 1
     assert len([msg for msg in agent._history if msg.role == "assistant"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_duplicate_tool_use_id_in_one_provider_attempt_never_executes() -> None:
+    provider = _SequenceProvider(
+        [
+            [
+                ProviderToolUseStart(tool_use_id="duplicate", tool_name="echo"),
+                ProviderToolUseEnd(
+                    tool_use_id="duplicate",
+                    tool_name="echo",
+                    arguments={"value": "first"},
+                ),
+                ProviderToolUseStart(tool_use_id="duplicate", tool_name="echo"),
+                ProviderToolUseEnd(
+                    tool_use_id="duplicate",
+                    tool_name="echo",
+                    arguments={"value": "second"},
+                ),
+                ProviderDone(stop_reason="tool_use"),
+            ]
+        ]
+    )
+    executed: list[Any] = []
+
+    async def tool_handler(call: Any) -> ToolResult:
+        executed.append(call)
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="unexpected",
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_provider_retries=0,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+        tool_definitions=[
+            ToolDefinition(
+                name="echo",
+                description="Echo.",
+                input_schema=ToolInputSchema(
+                    properties={"value": {"type": "string"}},
+                    required=["value"],
+                ),
+            )
+        ],
+        tool_handler=tool_handler,
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert executed == []
+    assert not any(event.kind == "tool_result" for event in events)
+    assert not any(event.kind == "done" for event in events)
+    assert any(
+        event.kind == "error" and event.code == "provider_protocol_error"
+        for event in events
+    )
+
+
+@pytest.mark.parametrize(
+    "stream",
+    [
+        [
+            ProviderToolUseDelta(tool_use_id="unknown", json_fragment='{"value":"x"}'),
+            ProviderDone(stop_reason="tool_use"),
+        ],
+        [
+            ProviderToolUseStart(tool_use_id="closed", tool_name="echo"),
+            ProviderToolUseEnd(
+                tool_use_id="closed",
+                tool_name="echo",
+                arguments={"value": "first"},
+            ),
+            ProviderToolUseDelta(tool_use_id="closed", json_fragment='{"value":"late"}'),
+            ProviderDone(stop_reason="tool_use"),
+        ],
+    ],
+    ids=["unknown-id", "closed-id"],
+)
+@pytest.mark.asyncio
+async def test_tool_delta_without_active_start_never_executes(stream: list[Any]) -> None:
+    provider = _SequenceProvider([stream])
+    executed: list[Any] = []
+
+    async def tool_handler(call: Any) -> ToolResult:
+        executed.append(call)
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="unexpected",
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_provider_retries=0),
+        tool_definitions=[
+            ToolDefinition(
+                name="echo",
+                description="Echo.",
+                input_schema=ToolInputSchema(),
+            )
+        ],
+        tool_handler=tool_handler,
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert executed == []
+    assert not any(event.kind == "tool_result" for event in events)
+    assert not any(event.kind == "done" for event in events)
+    assert any(
+        event.kind == "error" and event.code == "provider_protocol_error"
+        for event in events
+    )
+
+
+@pytest.mark.parametrize(
+    "malformed_event",
+    [
+        ProviderToolUseDelta(
+            tool_use_id=["unhashable"],  # type: ignore[arg-type]
+            json_fragment='{"value":"x"}',
+        ),
+        ProviderToolUseEnd(
+            tool_use_id=["unhashable"],  # type: ignore[arg-type]
+            tool_name="echo",
+            arguments={"value": "x"},
+        ),
+    ],
+    ids=["delta", "end"],
+)
+@pytest.mark.asyncio
+async def test_unhashable_tool_event_id_is_a_protocol_error(
+    malformed_event: Any,
+) -> None:
+    provider = _SequenceProvider(
+        [
+            [
+                ProviderToolUseStart(tool_use_id="call-1", tool_name="echo"),
+                malformed_event,
+                ProviderDone(stop_reason="tool_use"),
+            ]
+        ]
+    )
+    executed: list[Any] = []
+
+    async def tool_handler(call: Any) -> ToolResult:
+        executed.append(call)
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="unexpected",
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_provider_retries=0),
+        tool_definitions=[
+            ToolDefinition(
+                name="echo",
+                description="Echo.",
+                input_schema=ToolInputSchema(),
+            )
+        ],
+        tool_handler=tool_handler,
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert executed == []
+    assert not any(event.kind in {"tool_result", "done"} for event in events)
+    assert any(
+        event.kind == "error" and event.code == "provider_protocol_error"
+        for event in events
+    )
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        ("other", {"value": "x"}),
+        ("", {"value": "x"}),
+        ("echo", ["not", "an", "object"]),
+        ("echo", {"value": float("nan")}),
+        ("echo", {"nested": {"value": float("inf")}}),
+        ("echo", {"value": {"not-json"}}),
+    ],
+    ids=[
+        "name-mismatch",
+        "empty-name",
+        "non-object",
+        "nan",
+        "nested-infinity",
+        "non-json-value",
+    ],
+)
+@pytest.mark.asyncio
+async def test_tool_end_requires_matching_name_and_finite_json_object(
+    tool_name: str,
+    arguments: Any,
+) -> None:
+    provider = _SequenceProvider(
+        [
+            [
+                ProviderToolUseStart(tool_use_id="call-1", tool_name="echo"),
+                ProviderToolUseEnd(
+                    tool_use_id="call-1",
+                    tool_name=tool_name,
+                    arguments=arguments,
+                ),
+                ProviderDone(stop_reason="tool_use"),
+            ]
+        ]
+    )
+    executed: list[Any] = []
+
+    async def tool_handler(call: Any) -> ToolResult:
+        executed.append(call)
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="unexpected",
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_provider_retries=0),
+        tool_definitions=[
+            ToolDefinition(
+                name="echo",
+                description="Echo.",
+                input_schema=ToolInputSchema(),
+            )
+        ],
+        tool_handler=tool_handler,
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert executed == []
+    assert not any(event.kind == "tool_result" for event in events)
+    assert not any(event.kind == "done" for event in events)
+    assert any(
+        event.kind == "error" and event.code == "provider_protocol_error"
+        for event in events
+    )

@@ -51,6 +51,55 @@ beforeEach(() => {
 })
 
 describe('AssistantMessage ensemble footer metadata', () => {
+  it('marks only cron-provenance assistant rows as scheduled', async () => {
+    const { app, el } = await mountMessage(assistantMessage({
+      provenanceKind: 'cron',
+      provenanceSourceTool: 'cron.run',
+    }))
+
+    const badge = el.querySelector<HTMLElement>('.msg-provenance-chip')
+    expect(badge?.textContent).toContain('Scheduled')
+    expect(badge?.title).toContain('cron.run')
+    app.unmount()
+
+    const regular = await mountMessage(assistantMessage({ provenanceKind: 'internal_system' }))
+    expect(regular.el.querySelector('.msg-provenance-chip')).toBeNull()
+    regular.app.unmount()
+
+    const unsafe = await mountMessage(assistantMessage({
+      provenanceKind: 'cron',
+      provenanceSourceTool: 'cron.run\nBearer secret',
+    }))
+    expect(unsafe.el.querySelector<HTMLElement>('.msg-provenance-chip')?.title).not.toContain('Bearer')
+    unsafe.app.unmount()
+  })
+
+  it('shows the current message token counts in its usage popover', async () => {
+    const { app, el } = await mountMessage(
+      assistantMessage({
+        meta: {
+          model: 'z-ai/glm-5.2-20260616',
+          modelShort: 'glm-5.2-20260616',
+          input: 120,
+          output: 40,
+          hasTokens: true,
+          cachedTokens: 0,
+          reasoningTokens: 0,
+          costUsd: 0.050328,
+          hasSaved: false,
+          savedLabel: '',
+        },
+      }),
+    )
+
+    el.querySelector<HTMLButtonElement>('.msg-meta__more-btn')?.click()
+    await nextTick()
+
+    expect(el.querySelector('.msg-meta-popover__label')?.textContent).toBe('tokens')
+    expect(el.querySelector('.msg-meta-popover__value')?.textContent).toBe('↑120 ↓40')
+    app.unmount()
+  })
+
   it('does not present ensemble aggregate metadata as single-model footer metadata', async () => {
     const { app, el } = await mountMessage(
       assistantMessage({

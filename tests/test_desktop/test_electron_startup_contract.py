@@ -60,24 +60,26 @@ def test_desktop_gateway_completion_uses_current_live_window() -> None:
     assert "if (mainWindow === window) mainWindow = null" in main_ts
 
 
-def test_desktop_activation_retry_and_second_instance_share_resume_helper() -> None:
+def test_desktop_activation_and_second_instance_share_safe_reveal_helper() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
-    retry = _section(
-        main_ts,
-        "ipcMain.handle('desktop:boot:retry'",
-        "ipcMain.handle('desktop:boot:quit'",
-    )
 
     assert "if (process.platform !== 'darwin') app.quit()" in main_ts
-    assert "app.on('activate', () => {\n  void openOrResumeDesktopApp()" in main_ts
-    # second-instance resumes the app via the shared helper (a diagnostic log
+    assert "app.on('activate', () => {\n  revealDesktopApp()" in main_ts
+    assert "function revealDesktopApp(): void" in main_ts
+    assert "if (!canRevealDesktopApp(appExitPhase)) return" in main_ts
+    assert "focusMainWindow()" in _section(
+        main_ts,
+        "function revealDesktopApp(): void",
+        "async function promptForMainWindowClose",
+    )
+    # second-instance reveals the app via the shared helper (a diagnostic log
     # line precedes the resume call — see the #446 relaunch-retry contract).
     second_instance = _section(
         main_ts,
         "app.on('second-instance', () => {",
         "void app.whenReady().then",
     )
-    assert "void openOrResumeDesktopApp()" in second_instance
+    assert "revealDesktopApp()" in second_instance
     assert "void app.whenReady().then" in main_ts
     assert "void openOrResumeDesktopApp()" in _section(
         main_ts,
@@ -85,15 +87,194 @@ def test_desktop_activation_retry_and_second_instance_share_resume_helper() -> N
         "})\n}",
     )
 
+
+def test_desktop_window_close_has_a_visible_background_recovery_surface() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    preload = _read("desktop/electron/src/preload.cts")
+    lifecycle = _read("desktop/electron/src/desktop-window-lifecycle.ts")
+    package = json.loads(_read("desktop/electron/package.json"))
+    ci = _read(".github/workflows/ci.yml")
+
+    close_handler = _section(
+        main_ts,
+        "function handleMainWindowClose",
+        "function installEditingContextMenu",
+    )
+    tray = _section(main_ts, "function createWindowsTray", "function hideMainWindow")
+    hide = _section(main_ts, "function hideMainWindow", "function revealDesktopApp")
+    ready = _section(main_ts, "void app.whenReady().then", "})\n}")
+
+    assert "window.on('close', (event) => handleMainWindowClose(window, event))" in main_ts
+    session_end = _section(
+        main_ts,
+        "window.on('session-end', () => {",
+        "window.once('ready-to-show'",
+    )
+    query_session_end = _section(
+        main_ts,
+        "window.on('query-session-end', () => {",
+        "window.on('session-end', () => {",
+    )
+    assert "windowsSessionEndPreviousPhase = appExitPhase" in main_ts
+    assert "windowsSessionEndResetTimer = setTimeout" in query_session_end
+    assert "systemSessionEnding = false" in query_session_end
+    assert "setAppExitPhase(previousPhase" in query_session_end
+    assert "windowsSessionEndResetTimer.unref()" in query_session_end
+    assert "if (isQuitting" not in query_session_end
+    assert "clearTimeout(windowsSessionEndResetTimer)" in session_end
+    assert "isQuitting = true" in session_end
+    assert "destroyWindowsTray()" in session_end
+    assert "stopGateway()" in session_end
+    assert "mainWindowCloseAction({" in close_handler
+    assert "windowsTrayReady: windowsTray !== null" in close_handler
+    assert "event.preventDefault()" in close_handler
+    assert "hideMainWindow(window)" in close_handler
+    assert "app.quit()" in close_handler
+
+    assert "const tray = new Tray(appIconPath())" in tray
+    assert "tray.on('click', () => revealDesktopApp())" in tray
+    assert "label: desktopT('tray.quit')" in main_ts
+    assert "click: () => app.quit()" in main_ts
+    assert ready.index("createWindowsTray()") < ready.index("openOrResumeDesktopApp()")
+
+    assert "window.webContents.send('desktop:window:hidden')" in hide
+    assert hide.index("desktop:window:hidden") < hide.index("window.hide()")
+    assert "onWindowHidden: (callback: () => void)" in preload
+    assert "ipcRenderer.on('desktop:window:hidden', listener)" in preload
+
+    assert "platform === 'darwin' || platform === 'win32' ? 'background' : 'quit'" in lifecycle
+    assert "platform === 'win32' && context.windowsTrayReady" in lifecycle
+    assert "if (!backgroundSupported) return 'quit'" in lifecycle
+    assert package["scripts"]["test:window-lifecycle"].endswith(
+        "scripts/test-desktop-window-lifecycle.mjs"
+    )
+    assert "node scripts/test-desktop-window-lifecycle.mjs" in ci
+
+
+def test_desktop_explicit_exit_cannot_be_converted_back_to_window_hiding() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    lifecycle = _read("desktop/electron/src/desktop-window-lifecycle.ts")
+    before_quit = _section(main_ts, "app.on('before-quit'", "function shutdownFromSignal")
+
+    assert "context.systemSessionEnding || context.exitPhase === 'committed'" in lifecycle
+    assert "if (context.exitPhase !== 'running') return 'hide'" in lifecycle
+    assert "return phase === 'running'" in lifecycle
+    assert "setAppExitPhase('deferred'" in before_quit
+    assert "setAppExitPhase('draining'" in before_quit
+    assert "setAppExitPhase('committed'" in before_quit
+    assert "setAppExitPhase('running', 'Gateway quit drain failed safely')" in before_quit
+    assert "if (systemSessionEnding)" in before_quit
+    system_exit = _section(before_quit, "if (systemSessionEnding)", "// An updater drain")
+    assert "event.preventDefault()" not in system_exit
+    assert "destroyWindowsTray()" in system_exit
+    assert "stopGateway()" in system_exit
+
+
+def test_desktop_retry_waits_for_all_owned_gateways_and_fails_closed() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    retry = _section(
+        main_ts,
+        "ipcMain.handle('desktop:boot:retry'",
+        "ipcMain.handle('desktop:boot:quit'",
+    )
+
     # Retry backs both the boot-error button and the Control UI "Restart runtime"
     # action, so it forces a real restart: an in-flight start is joined (clearing
-    # the stale error), otherwise an owned gateway is torn down and awaited before
-    # respawn rather than reused, so a healthy-but-misbehaving runtime can restart.
+    # the stale error), otherwise every lifecycle-owned gateway is torn down and
+    # awaited before respawn rather than reused. The join result is a hard safety
+    # boundary: timing out must leave the old runtime authoritative and must not
+    # clear its reusable state or start a competing writer.
     assert "if (gatewayStartPromise)" in retry
-    assert "stopGateway()" in retry
-    assert "await waitForGatewayProcessExit(previousChild)" in retry
-    assert "clearReusableGatewayState()" in retry
-    assert "void openOrResumeDesktopApp()" in retry
+    join_call = "const exited = await stopAndJoinAllLifecycleOwnedGateways()"
+    assert join_call in retry
+    assert "if (!exited)" in retry
+    assert "stopGateway()" not in retry
+    assert "waitForGatewayProcessExit(" not in retry
+
+    failure = _section(retry, "if (!exited)", "clearReusableGatewayState()")
+    assert "gatewayState.status = 'error'" in failure
+    assert "gatewayState.error = message" in failure
+    assert "desktopLog('gateway_restart_wait_timeout'" in failure
+    assert "sendBootError(message)" in failure
+    assert "await restoreMainWindowToBootPage()" in failure
+    assert "return { ok: false, error: message }" in failure
+    assert "clearReusableGatewayState()" not in failure
+    assert "openOrResumeDesktopApp()" not in failure
+
+    join_index = retry.index(join_call)
+    failure_index = retry.index("if (!exited)", join_index)
+    clear_index = retry.index("clearReusableGatewayState()", failure_index)
+    open_index = retry.index("openOrResumeDesktopApp()", clear_index)
+    assert join_index < failure_index < clear_index < open_index
+
+    success = retry[clear_index:]
+    assert success.count("clearReusableGatewayState()") == 1
+    assert success.count("openOrResumeDesktopApp()") == 1
+    assert success.index("clearReusableGatewayState()") < success.index(
+        "openOrResumeDesktopApp()"
+    )
+    assert success.index("openOrResumeDesktopApp()") < success.index("return { ok: true }")
+
+
+def test_desktop_shared_spawn_gate_blocks_still_stopping_gateways() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    start = _section(
+        main_ts,
+        "async function startGateway()",
+        "async function startGatewayWithPortRecovery()",
+    )
+
+    # activate and second-instance both reach this shared boundary. A child that
+    # Retry already moved into the stopping set must therefore block every entry
+    # point, not only the original retry handler.
+    stopping_check = "const alreadyStoppingGateways = liveLifecycleOwnedGatewayProcesses()"
+    assert stopping_check in start
+    assert "if (alreadyStoppingGateways.length > 0)" in start
+    assert "throw new Error(desktopGatewayStillRunningMessage())" in start
+
+    final_gate = _section(
+        start,
+        "const liveOwnedGatewayCount = liveLifecycleOwnedGatewayProcesses().length",
+        "const url = `http://127.0.0.1:${port}`",
+    )
+    assert "lifecycleAllowsProcessSpawn(" in final_gate
+    assert "liveOwnedGatewayCount," in final_gate
+    assert "if (liveOwnedGatewayCount > 0)" in final_gate
+    assert "throw new Error(desktopGatewayStillRunningMessage())" in final_gate
+
+
+def test_boot_retry_surfaces_failed_restart_and_prevents_repeat_clicks() -> None:
+    boot_html = _read("desktop/electron/src/boot.html")
+    apply_error = _section(
+        boot_html,
+        "function applyError(payload)",
+        "function renderRecoveryState",
+    )
+    retry_flow = _section(
+        boot_html,
+        "async function retryStartup()",
+        "function updateTimer()",
+    )
+
+    assert "retryButton.disabled = true" in retry_flow
+    assert "const result = await api.retryStartup()" in retry_flow
+    assert "result && result.ok === false" in retry_flow
+    assert "result.error || msg.errorDefault" in retry_flow
+    assert "applyError({ message: result.error || msg.errorDefault })" in retry_flow
+    assert "errorPanel.classList.add('visible')" in apply_error
+    assert "retryButton.disabled = false" in retry_flow
+    assert retry_flow.index("retryButton.disabled = true") < retry_flow.index(
+        "await api.retryStartup()"
+    )
+    assert retry_flow.index("await api.retryStartup()") < retry_flow.index(
+        "retryButton.disabled = false"
+    )
+    assert (
+        "document.getElementById('retry').addEventListener('click', () => retryStartup())"
+        in boot_html
+    )
+    assert "rawMessage.includes('OPENSQUILLA_PROFILE_IN_USE')" in apply_error
+    assert boot_html.count("profileInUse:") == 6
 
 
 def test_boot_error_panel_exposes_reset_setup_recovery() -> None:
@@ -116,9 +297,9 @@ def test_boot_error_panel_exposes_reset_setup_recovery() -> None:
     assert "msg.resetFailed" in boot_html
     assert "workspace path, identity, memory, and chat history are kept" in boot_html
     assert "await api.resetDesktopSettings()" in reset_flow
-    assert "await api.retryStartup()" in reset_flow
+    assert "await retryStartup()" in reset_flow
     assert reset_flow.index("await api.resetDesktopSettings()") < reset_flow.index(
-        "await api.retryStartup()"
+        "await retryStartup()"
     )
     assert "errorPanel.classList.add('visible')" in reset_flow
 
@@ -271,6 +452,12 @@ def test_reset_desktop_settings_forces_onboarding_before_gateway_reuse() -> None
     assert "report.mode === 'reset-current-settings'" in cleanup_apply
     assert "forceOnboardingOnNextStartup = true" in cleanup_apply
     assert "clearReusableGatewayState()" in cleanup_apply
+    post_delete_exit = _section(cleanup_apply, "if (shouldQuit) {", "} else {")
+    assert "appExitPhase = 'committed'" in post_delete_exit
+    assert "destroyWindowsTray()" in post_delete_exit
+    assert "app.exit(0)" in post_delete_exit
+    assert "setAppExitPhase(" not in post_delete_exit
+    assert "desktopLog(" not in post_delete_exit
 
 
 def test_desktop_gateway_port_selection_is_bind_aware_and_bounded() -> None:
@@ -301,6 +488,16 @@ def test_desktop_gateway_port_selection_is_bind_aware_and_bounded() -> None:
     assert "function gatewayExitLooksLikePortInUse(output: string): boolean" in main_ts
     assert "OPENSQUILLA_GATEWAY_PORT_IN_USE" in main_ts
     assert "gateway port is already in use" in main_ts
+    assert "function gatewayExitLooksLikeProfileInUse(output: string): boolean" in main_ts
+    assert "OPENSQUILLA_PROFILE_IN_USE" in main_ts
+    assert "Another OpenSquilla runtime is still using this profile." in main_ts
+    assert "Do not delete profile lock files." in main_ts
+    port_classifier = _section(
+        main_ts,
+        "function gatewayExitLooksLikePortInUse",
+        "function gatewayExitLooksLikeProfileInUse",
+    )
+    assert "OPENSQUILLA_PROFILE_IN_USE" not in port_classifier
     assert (
         "const maxAttempts = hasExplicitGatewayPort() ? 1 : "
         "GATEWAY_PORT_LAST - GATEWAY_PORT_FIRST + 1"
@@ -325,30 +522,39 @@ def test_windows_gateway_hard_terminate_clears_pid_without_unlinking_lock() -> N
     assert "void clearKnownOwnedGatewayPidFile()" in cleanup
 
 
-def test_windows_quit_rejected_shutdown_uses_short_hard_kill_backstop() -> None:
+def test_quit_rejected_shutdown_preserves_posix_grace_budget() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
-    before_quit = _section(
+    drain = _section(
         main_ts,
+        "async function drainOwnedGatewayForQuit",
         "app.on('before-quit'",
-        "function shutdownFromSignal",
     )
 
     rejected = _section(
-        before_quit,
+        drain,
         "if (!accepted)",
         "} else {",
     )
 
-    assert "hardTerminateGatewayProcess(child)" in rejected
+    assert "hardTerminateGatewayProcess(child, signalBackstop)" in rejected
+    assert "process.platform === 'win32'" in rejected
     assert "GATEWAY_HARD_KILL_BACKSTOP_MS" in rejected
+    assert "GATEWAY_SHUTDOWN_KILL_AFTER_MS" in rejected
     assert "await clearKnownOwnedGatewayPidFile()" in rejected
-    assert "UPDATE_GATEWAY_EXIT_TIMEOUT_MS" not in rejected
 
 
 def test_windows_uninstall_preserves_app_data() -> None:
     package_json = json.loads(_read("desktop/electron/package.json"))
 
     assert package_json["build"]["nsis"]["deleteAppDataOnUninstall"] is False
+
+
+def test_desktop_local_web_build_installs_locked_dependencies_first() -> None:
+    package_json = json.loads(_read("desktop/electron/package.json"))
+
+    assert package_json["scripts"]["build:web"] == (
+        "cd ../../opensquilla-webui && npm ci && npm run build"
+    )
 
 
 def test_desktop_onboarding_is_owned_modal_child_of_main_window() -> None:
@@ -369,10 +575,7 @@ def test_desktop_onboarding_defaults_to_tokenrhythm_with_trusted_registration_ct
     main_ts = _read("desktop/electron/src/main.ts")
     html = _section(main_ts, "function onboardingHtml", "async function runOnboarding")
 
-    assert (
-        "const TOKENRHYTHM_REGISTER_URL = 'https://tokenrhythm.studio/register'"
-        in main_ts
-    )
+    assert "const TOKENRHYTHM_REGISTER_URL = 'https://tokenrhythm.studio/register'" in main_ts
     assert '<input id="provider" type="hidden" value="tokenrhythm" />' in html
     assert 'id="tokenrhythmRegister"' in html
     assert 'href="${TOKENRHYTHM_REGISTER_URL}"' in html
@@ -509,6 +712,62 @@ def test_start_gateway_does_not_attach_to_unrequested_default_dev_gateway() -> N
     assert "gatewayState.url = 'http://127.0.0.1:18791'" not in start
 
 
+def test_desktop_recovers_only_cryptographically_verified_orphan_gateway() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    recovery = _section(
+        main_ts,
+        "async function recoverVerifiedOrphanGatewayBeforeSpawn",
+        "async function startGateway",
+    )
+    start = _section(main_ts, "async function startGateway", "async function loadControlUi")
+
+    assert "loadDesktopGatewayOwnershipRecord(ownershipDir)" in recovery
+    assert "record.profile_fingerprint !== desktopProfileFingerprint(profile.home)" in recovery
+    assert "await verifyDesktopGatewayOwnershipWhenReady(ownershipDir, record)" in recovery
+    assert "await requestVerifiedDesktopGatewayShutdown(record)" in recovery
+    assert "await waitForDesktopGatewayOwnershipRelease(ownershipDir, record" in recovery
+    assert "process.kill(" not in recovery
+    assert "hardTerminateGatewayProcess(" not in recovery
+    assert "unlink(" not in recovery
+    assert "Do not delete profile lock files" in main_ts
+    recovery_call = "await recoverVerifiedOrphanGatewayBeforeSpawn()"
+    assert recovery_call in start
+    assert start.index(recovery_call) < start.index("const port = await findGatewayPort()")
+    inspect = _section(
+        main_ts,
+        "async function inspectActiveProfileBeforeStartup",
+        "async function openOrResumeDesktopApp",
+    )
+    preflight_call = "await recoverVerifiedOrphanGatewayBeforeSpawn(active)"
+    assert preflight_call in inspect
+    assert inspect.index(preflight_call) < inspect.index("inspectDesktopProfile(active)")
+    assert "liveLifecycleOwnedGatewayProcesses().length === 0" in inspect
+    assert "OPENSQUILLA_DESKTOP_GATEWAY_URL" in inspect
+    assert "OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_NONCE" in start
+    assert "createDesktopGatewayInstanceNonce()" in start
+
+
+def test_unverified_or_legacy_gateway_record_never_grants_stop_authority() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    recovery = _section(
+        main_ts,
+        "async function recoverVerifiedOrphanGatewayBeforeSpawn",
+        "async function startGateway",
+    )
+
+    verification = recovery.index(
+        "if (!await verifyDesktopGatewayOwnershipWhenReady(ownershipDir, record))"
+    )
+    shutdown = recovery.index("requestVerifiedDesktopGatewayShutdown(record)")
+    assert verification < shutdown
+    assert "gateway_ownership_record_untrusted" in recovery
+    assert "gateway_ownership_not_verified" in recovery
+    assert "return" in recovery[verification:shutdown]
+    # The old gateway.pid schema has no port/profile/nonce proof and remains
+    # deliberately absent from this recovery authority path.
+    assert "gateway.pid" not in recovery
+
+
 def test_desktop_blocks_macos_app_translocation_without_forcing_applications() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
     start = _section(
@@ -602,7 +861,7 @@ def test_stop_gateway_sigkill_fallback_uses_real_child_exit_state() -> None:
     stop = _section(
         main_ts,
         "function stopGateway(): void",
-        "// ── Auto-update",
+        "// ── Desktop updates",
     )
     hard_terminate = _section(
         main_ts,
@@ -681,7 +940,28 @@ def test_desktop_update_state_bridge_exposes_nonblocking_renderer_api() -> None:
     assert "desktop:update:state-changed" in preload
 
 
-def test_native_update_events_publish_state_without_startup_dialogs() -> None:
+def test_desktop_update_dismiss_and_persistence_cover_errors_and_source_memory() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    persist = _section(
+        main_ts,
+        "function persistDesktopUpdateState",
+        "function activeDesktopUpdateSnoozeFor",
+    )
+    dismiss = _section(
+        main_ts,
+        "async function dismissDesktopUpdate",
+        "// macOS Squirrel",
+    )
+
+    assert "desktopUpdatePersistenceWrite.then" in persist
+    assert "atomicWriteFile" in persist
+    assert "lastSuccessfulSource" in persist
+    assert "!latestVersion && desktopUpdateStatus === 'error'" in dismiss
+    assert "status: 'idle'" in dismiss
+    assert "errorCode: null" in dismiss
+
+
+def test_native_update_provider_events_do_not_publish_unvalidated_availability() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
     update_available = _section(
         main_ts,
@@ -694,8 +974,8 @@ def test_native_update_events_publish_state_without_startup_dialogs() -> None:
         "autoUpdater.on('error'",
     )
 
-    assert "setDesktopUpdateState" in update_available
-    assert "status: 'available'" in update_available
+    assert "setDesktopUpdateState" not in update_available
+    assert "provider reports update available" in update_available
     assert "showUpdateDialog" not in update_available
     assert "downloadUpdate" not in update_available
 
@@ -784,7 +1064,7 @@ def test_desktop_update_actions_are_guarded_against_reentry() -> None:
     check_update = _section(
         main_ts,
         "async function runDesktopUpdateCheck",
-        "function gatewayProcessForUpdateInstall",
+        "async function waitForGatewayProcessExit",
     )
     check_allowed = _section(
         main_ts,
@@ -797,22 +1077,22 @@ def test_desktop_update_actions_are_guarded_against_reentry() -> None:
         "// Lets the gateway-served Control UI",
     )
 
-    reentry_guard = (
-        "if (updateDownloadInProgress || updateApplying || "
-        "desktopUpdateStatus === 'downloaded')"
-    )
-    assert reentry_guard in download_update
-    assert download_update.index("updateDownloadInProgress || updateApplying") < (
+    assert "updateDownloadInProgress" in download_update
+    assert "manualInstallerActionInProgress" in download_update
+    assert "updateApplying" in download_update
+    assert "desktopUpdateStatus === 'downloaded'" in download_update
+    assert download_update.index("updateDownloadInProgress") < (
         download_update.index("const mockVersion = mockUpdateVersion()")
     )
     assert "if (!desktopUpdateCheckAllowed()) return" in check_update
-    assert "downloading: updateDownloadInProgress" in check_allowed
+    assert "downloading: updateDownloadInProgress ||" in check_allowed
     assert "applying: updateApplying" in check_allowed
     assert "downloaded: downloadedUpdateVersion !== null" in check_allowed
     assert "if (!mockDownloadedUpdate && !downloadedUpdateVersion) return" in apply_update
     assert apply_update.index("if (updateApplying) return") < apply_update.index(
         "if (!mockDownloadedUpdate && !downloadedUpdateVersion) return"
     )
+    assert "if (isQuitting || desktopWriters.closed) return" in apply_update
     assert apply_update.index(
         "if (!mockDownloadedUpdate && !downloadedUpdateVersion) return"
     ) < apply_update.index("if (mockDownloadedUpdate)")
@@ -855,8 +1135,8 @@ def test_desktop_mock_update_flow_has_automated_e2e_script() -> None:
     assert "OPENSQUILLA_DESKTOP_MOCK_UPDATE_DIALOG_RESPONSES" in script
     assert "window.opensquillaDesktop.isAutoUpdateEnabled()" in script
     assert "window.opensquillaDesktop.getUpdateState" in script
-    assert "data-testid=\"desktop-update-download\"" in script
-    assert "data-testid=\"update-banner\"" in script
+    assert 'data-testid="desktop-update-download"' in script
+    assert 'data-testid="update-banner"' in script
     assert "Menu.getApplicationMenu()" in script
     assert "Relaunch to Update" in script
 
@@ -916,6 +1196,8 @@ def test_silent_startup_update_error_is_not_published_as_visible_error() -> None
         "updateDownloadInProgress"
     ) in show_error
     assert "if (!shouldNotify)" in show_error
+    assert "desktopUpdateCandidate = silentFallback.candidate" in show_error
+    assert "status: silentFallback.state.status" in show_error
     assert "status: downloadedUpdateVersion ? 'downloaded' : 'idle'" in show_error
     assert "error: null" in show_error
     assert show_error.index("if (!shouldNotify)") < show_error.index("status: 'error'")
@@ -937,8 +1219,8 @@ def test_apply_downloaded_update_waits_for_actual_gateway_exit_before_install() 
     assert "hasGatewayProcessExited(child)" in wait_helper
     assert "child.once('exit', () => finish(true))" in wait_helper
     assert "setTimeout(resolve" not in apply_update
-    assert "waitForGatewayProcessExit(child)" in apply_update
-    assert apply_update.index("waitForGatewayProcessExit(child)") < apply_update.index(
+    assert "await stopAndJoinAllLifecycleOwnedGateways(" in apply_update
+    assert apply_update.index("await stopAndJoinAllLifecycleOwnedGateways(") < apply_update.index(
         "autoUpdater.quitAndInstall(false, true)"
     )
 
@@ -952,17 +1234,16 @@ def test_apply_downloaded_update_timeout_restores_retry_state_before_returning()
     )
 
     assert "const pendingVersion = downloadedUpdateVersion" in apply_update
-    assert "const exited = await waitForGatewayProcessExit(child)" in apply_update
-    assert "if (!exited)" in apply_update
+    assert "const exited = await stopAndJoinAllLifecycleOwnedGateways(" in apply_update
+    assert "if (!exited || liveLifecycleOwnedGatewayProcesses().length > 0)" in apply_update
     timeout_branch = _section(
         apply_update,
-        "if (!exited)",
+        "if (!exited || liveLifecycleOwnedGatewayProcesses().length > 0)",
         "autoUpdater.quitAndInstall(false, true)",
     )
-    assert (
-        "restoreDownloadedUpdateRetryState(pendingVersion, updateWriterAdmission)"
-        in timeout_branch
-    )
+    assert "restoreDownloadedUpdateRetryState(" in timeout_branch
+    assert "pendingVersion," in timeout_branch
+    assert "updateWriterAdmission," in timeout_branch
     assert "return" in timeout_branch
     assert timeout_branch.index("return") < apply_update.index(
         "autoUpdater.quitAndInstall(false, true)"
@@ -986,17 +1267,23 @@ def test_apply_downloaded_update_handoff_error_restores_retry_state() -> None:
     assert "updateApplying = false" in restore
     assert "isQuitting = false" in restore
     assert "desktopWriters.reopen(writerAdmissionToken)" in restore
+    assert "setAppExitPhase('running', 'update handoff did not commit')" in restore
+    assert "createWindowsTray()" in restore
     assert "createApplicationMenu()" in restore
-    assert "try {\n    autoUpdater.quitAndInstall(false, true)\n  } catch (err)" in apply_update
+    handoff_ready = apply_update.index("updateInstallHandoffReady = true")
+    handoff_committed = apply_update.index(
+        "setAppExitPhase('committed', 'handing off to desktop updater')"
+    )
+    handoff = apply_update.index("autoUpdater.quitAndInstall(false, true)")
+    assert handoff_ready < handoff_committed < handoff
     handoff_error = _section(
         apply_update,
         "} catch (err)",
         "}\n}",
     )
-    assert (
-        "restoreDownloadedUpdateRetryState(pendingVersion, updateWriterAdmission)"
-        in handoff_error
-    )
+    assert "restoreDownloadedUpdateRetryState(" in handoff_error
+    assert "pendingVersion," in handoff_error
+    assert "updateWriterAdmission," in handoff_error
     assert "showUpdateDialog" in handoff_error
 
 
@@ -1073,8 +1360,7 @@ def test_desktop_persists_network_observability_privacy_setting() -> None:
     ) in main_ts
     assert (
         "`disable_network_observability = "
-        "${credential.disableNetworkObservability ? 'true' : 'false'}`"
-        in main_ts
+        "${credential.disableNetworkObservability ? 'true' : 'false'}`" in main_ts
     )
 
 
@@ -1092,8 +1378,7 @@ def test_desktop_credential_save_preserves_config_privacy_without_payload_settin
     )
 
     assert (
-        "const configDisableNetworkObservability = "
-        "readDesktopConfigNetworkObservabilitySetting()"
+        "const configDisableNetworkObservability = readDesktopConfigNetworkObservabilitySetting()"
     ) in save
     assert (
         ": configDisableNetworkObservability ?? existing?.disableNetworkObservability ?? false"
@@ -1122,17 +1407,62 @@ def test_desktop_config_writer_does_not_emit_new_privacy_section_by_default() ->
     assert "if (!desktopConfigShouldWritePrivacySection(credential)) return []" in privacy_lines
     assert (
         "credential.disableNetworkObservability || "
-        "readDesktopConfigNetworkObservabilitySetting() !== null"
-        in main_ts
+        "readDesktopConfigNetworkObservabilitySetting() !== null" in main_ts
     )
+
+
+def test_desktop_config_regeneration_preserves_control_ui_locale_and_seeds_new_config() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    credential_save = _section(
+        main_ts,
+        "async function saveDesktopCredential",
+        "function buildImportedDesktopCredential",
+    )
+    locale_reader = _section(
+        main_ts,
+        "function persistedControlUiDefaultLocale",
+        "async function readOptionalDesktopText",
+    )
+    config_renderer = _section(
+        main_ts,
+        "function renderDesktopConfigAfterPreflight",
+        "async function applyDesktopSettingsPair",
+    )
+
+    # A regenerated config must retain the effective Gateway locale from its
+    # own [control_ui] section, including legacy BCP-47 spellings. An absent
+    # field falls back to the current Desktop locale when a new config is
+    # seeded. TOML permits a comment after the table header, which must not
+    # cause the locale reader to miss the section during regeneration.
+    assert "if (raw === null) return null" in locale_reader
+    assert r"match(/^\[\s*([^\]]+?)\s*\](?:\s*#.*)?$/)" in locale_reader
+    assert "inControlUi = header[1] === 'control_ui'" in locale_reader
+    assert 'default_locale\\s*=\\s*["\']([^"\']*)["\']' in locale_reader
+    assert "return normalizeGatewayLocale(match[1])" in locale_reader
+    assert locale_reader.rstrip().endswith("return null\n}")
+
+    preserved_locale = (
+        "const preservedControlUiLocale = persistedControlUiDefaultLocale(existingRaw)"
+    )
+    rendered_locale = "`default_locale = ${tomlString(preservedControlUiLocale ?? defaultLocale)}`"
+    assert preserved_locale in config_renderer
+    assert rendered_locale in config_renderer
+    assert config_renderer.index(preserved_locale) < config_renderer.index(rendered_locale)
+    assert config_renderer.count("default_locale") == 1
+    assert "defaultLocale: DesktopLocale" in config_renderer
+    assert (
+        "const configLocale = desktopLocaleChoice(payload.locale) ?? desktopLocale"
+        in credential_save
+    )
+    assert "writerReserved,\n      configLocale," in credential_save
 
 
 def test_desktop_network_observability_disable_gates_native_update_and_gateway_env() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
-    auto_supported = _section(
+    update_managed = _section(
         main_ts,
-        "function autoUpdateSupported(): boolean",
-        "function nativeAutoUpdateEnabled",
+        "function desktopUpdateManaged(): boolean",
+        "function autoUpdateSupported",
     )
     startup = _section(main_ts, "void app.whenReady().then", "})\n}")
     start = _section(main_ts, "async function startGateway", "async function loadControlUi")
@@ -1171,17 +1501,16 @@ def test_desktop_network_observability_disable_gates_native_update_and_gateway_e
     assert "desktopConfigNetworkObservabilityDisabled()" in main_ts
     assert (
         "return desktopPersistedNetworkObservabilityDisabled() || "
-        "desktopConfigNetworkObservabilityDisabled()"
-        in network_gate
+        "desktopConfigNetworkObservabilityDisabled()" in network_gate
     )
     assert "OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY" in main_ts
     assert "OPENSQUILLA_TELEMETRY_DISABLED" in main_ts
     assert "OPENSQUILLA_UPDATE_CHECK_DISABLED" in main_ts
-    assert "if (desktopNetworkObservabilityDisabled()) return false" in auto_supported
-    assert auto_supported.index("desktopNetworkObservabilityDisabled()") < auto_supported.index(
+    assert "if (desktopNetworkObservabilityDisabled()) return false" in update_managed
+    assert update_managed.index("desktopNetworkObservabilityDisabled()") < update_managed.index(
         "process.env.OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE"
     )
-    assert "if (autoUpdateSupported())" in startup
+    assert "else if (desktopUpdateManaged())" in startup
     assert "desktopUpdateCheckScheduler.start(UPDATE_CHECK_INITIAL_DELAY_MS)" in startup
     assert "connection.disableNetworkObservability" in start
     assert "OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY: '1'" in start
@@ -1230,6 +1559,7 @@ def test_package_verifier_hard_fails_stale_runtime_and_boot_contract() -> None:
     ]:
         assert expected in verifier
 
+
 def test_desktop_gateway_build_and_verifier_cover_runtime_capabilities() -> None:
     build_gateway = _read("desktop/electron/scripts/build-gateway.mjs")
     verifier = _read("desktop/electron/scripts/verify-package.mjs")
@@ -1268,7 +1598,9 @@ def test_desktop_gateway_build_and_verifier_cover_runtime_capabilities() -> None
     assert "function smokeEnv(tempHome, config)" in gateway_smoke
     assert "OPENSQUILLA_STATE_DIR: tempHome" in gateway_smoke
     assert "OPENSQUILLA_STATE_DIR: stateDir" not in gateway_smoke
-    assert "env: smokeEnv(tempHome, config)" in gateway_smoke
+    assert "const env = smokeEnv(tempHome, config)" in gateway_smoke
+    assert "verifyGatewayCaStore(gatewayBinary, env)" in gateway_smoke
+    assert re.search(r"spawn\(gatewayBinary,.*?\{.*?\benv,", gateway_smoke, re.DOTALL)
     assert "const workspaceDir = join(tempHome, 'workspace')" in gateway_smoke
     assert "await mkdir(workspaceDir, { recursive: true })" in gateway_smoke
     assert "writeFile(join(workspaceDir, 'SOUL.md')" in gateway_smoke
@@ -1300,6 +1632,28 @@ def test_packaged_gateway_smoke_profile_satisfies_recovery_guard(
     assert report.outcome == "ready"
     assert report.stable_code == "canonical_workspace"
     assert report.effective_workspace == workspace
+
+
+def test_desktop_gateway_bundle_collects_usage_ledger_and_verifies_query_ui() -> None:
+    """PyInstaller's package contract covers both sides of the upgrade.
+
+    Source checkouts do not carry a generated Vite bundle. The release path
+    verifies that artifact before PyInstaller runs, while this test checks the
+    canonical Usage client source that feeds the bundle.
+    """
+
+    build_script = _read("desktop/electron/scripts/build-gateway.mjs")
+    migration = ROOT / "migrations" / "V021__usage_ledger.py"
+    usage_query = _read("opensquilla-webui/src/composables/usage/useUsageQuery.ts")
+
+    assert "'--collect-all',\n  'opensquilla'," in build_script
+    assert migration.is_file()
+    assert "const USAGE_QUERY_METHOD = 'usage.query'" in usage_query
+    assert "controlUiVerifier" in build_script
+    assert "spawnSync(process.execPath, [controlUiVerifier, controlUiDistDir]" in build_script
+    assert build_script.index("\nassertControlUiArtifactReady()\n") < build_script.index(
+        "'--collect-all',\n  'opensquilla',"
+    )
 
 
 def test_windows_release_workflow_fails_fast_after_gateway_build_failure() -> None:
@@ -1336,7 +1690,12 @@ def test_desktop_native_artifact_open_allows_active_documents_with_file_extensio
 
 def test_desktop_cleanup_does_not_claim_os_app_uninstall() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
-    panel_vue = _read("opensquilla-webui/src/components/settings/DesktopRuntimePanel.vue")
+    runtime_panel_vue = _read(
+        "opensquilla-webui/src/components/settings/DesktopRuntimePanel.vue"
+    )
+    maintenance_panel_vue = _read(
+        "opensquilla-webui/src/components/settings/DataMigrationPanel.vue"
+    )
     en_locale = json.loads(_read("opensquilla-webui/src/locales/en.json"))
     zh_locale = json.loads(_read("opensquilla-webui/src/locales/zh-Hans.json"))
 
@@ -1357,7 +1716,8 @@ def test_desktop_cleanup_does_not_claim_os_app_uninstall() -> None:
     assert "OPENSQUILLA_INSTALL_METHOD: 'desktop'" in child_environment
     assert "OPENSQUILLA_STATE_DIR: profile.home" in child_environment
     assert "installed app itself will remain" in main_ts
-    assert "setup.runtime.cleanup.label" in panel_vue
+    assert "setup.runtime.cleanup.label" not in runtime_panel_vue
+    assert "setup.runtime.cleanup.label" in maintenance_panel_vue
 
     en_runtime = en_locale["setup"]["runtime"]
     zh_runtime = zh_locale["setup"]["runtime"]
@@ -1393,58 +1753,300 @@ def test_desktop_second_launch_retries_lock_and_logs_instead_of_silent_quit() ->
     assert "showErrorBox" in giveup
 
 
-def test_desktop_windows_quit_drains_gateway_before_exit() -> None:
-    # Issue: the daily Windows close path must give the gateway its graceful
-    # drain (like the update/uninstall paths), not a bare TerminateProcess.
+def test_desktop_quit_drains_gateway_before_exit_on_every_platform() -> None:
+    # The daily close path on every platform must wait for the owned gateway's
+    # graceful drain. Otherwise Electron can exit first and leave the gateway
+    # holding the profile writer lock, which blocks the next Desktop launch.
     main_ts = _read("desktop/electron/src/main.ts")
 
     before_quit = _section(main_ts, "app.on('before-quit'", "function shutdownFromSignal")
-    assert "process.platform === 'win32'" in before_quit
+    drain = _section(main_ts, "async function drainOwnedGatewayForQuit", "app.on('before-quit'")
+    assert "process.platform === 'win32'" not in before_quit
     assert "event.preventDefault()" in before_quit
-    assert "requestGatewayShutdown(" in before_quit
-    assert "waitForGatewayProcessExit(child)" in before_quit
+    assert "requestOwnedGatewayShutdown(" in drain
+    assert "waitForGatewayProcessExit(child)" in drain
     assert "app.exit(0)" in before_quit
-    # The drain runs once, then the re-issued quit falls through.
-    assert "windowsQuitDrainDone" in before_quit
+    # Repeated quit events join one in-flight drain and cannot launch competing
+    # shutdown/kill sequences against the same child.
+    assert "let quitGatewayDrainPromise: Promise<boolean> | null = null" in main_ts
+    assert "if (quitGatewayDrainPromise)" in before_quit
+    assert "const children = liveLifecycleOwnedGatewayProcesses()" in before_quit
+    assert "Promise.all(children.map((child) => drainOwnedGatewayForQuit(" in before_quit
+    assert "if (exited)" in before_quit
+    assert before_quit.index("if (exited)") < before_quit.index("app.exit(0)")
 
 
-def test_desktop_macos_prerelease_update_resolver_wires_generic_feed() -> None:
-    # Issue #485: PEP440 rc git tags (v0.5.0rc2) are not npm-semver, so
-    # electron-updater's GitHub provider skips them and a packaged prerelease
-    # discovers no updates. A resolver selects the candidate release and points a
-    # generic feed at its latest-mac.yml; stable tags keep the default provider.
+def test_desktop_signal_quit_keeps_gateway_handle_for_before_quit_drain() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
-    resolver = _read("desktop/electron/src/update-feed-resolver.ts")
+    shutdown = _section(
+        main_ts,
+        "function shutdownFromSignal",
+        "process.on('SIGINT'",
+    )
+
+    assert "stopGateway()" not in shutdown
+    assert "app.quit()" in shutdown
+    assert "process.on('SIGINT', shutdownFromSignal)" in main_ts
+    assert "process.on('SIGTERM', shutdownFromSignal)" in main_ts
+
+
+def test_desktop_quit_joins_children_already_stopping_for_other_lifecycles() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    stop = _section(main_ts, "function stopGateway", "// ── Desktop updates")
+    before_quit = _section(main_ts, "app.on('before-quit'", "function shutdownFromSignal")
+
+    assert "const gatewayStoppingProcesses = new Set" in main_ts
+    assert stop.index("trackStoppingGatewayProcess(child)") < stop.index(
+        "gatewayProcess = null"
+    )
+    assert "requestOwnedGatewayShutdown(child, url)" in stop
+    assert "requestGatewayShutdown(url)" not in stop
+    assert "const children = new Set(gatewayStoppingProcesses)" in main_ts
+    assert "const children = liveLifecycleOwnedGatewayProcesses()" in before_quit
+    assert "currentChild === child" in before_quit
+
+
+def test_desktop_update_and_recovery_join_every_lifecycle_owned_gateway() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    stop_wait = _section(
+        main_ts,
+        "async function stopOwnedGatewayAndWait",
+        "async function inspectActiveProfileBeforeStartup",
+    )
+    coordinator = _section(
+        main_ts,
+        "async function stopAndJoinAllLifecycleOwnedGateways",
+        "function restoreDownloadedUpdateRetryState",
+    )
+    apply_update = _section(
+        main_ts,
+        "async function applyDownloadedUpdate(): Promise<void>",
+        "// Lets the gateway-served Control UI",
+    )
+
+    assert "await stopAndJoinAllLifecycleOwnedGateways()" in stop_wait
+    assert "liveProcesses: liveLifecycleOwnedGatewayProcesses" in coordinator
+    assert "await stopAndJoinAllLifecycleOwnedGateways(" in apply_update
+    assert "liveLifecycleOwnedGatewayProcesses().length > 0" in apply_update
+    assert apply_update.index("liveLifecycleOwnedGatewayProcesses().length > 0") < (
+        apply_update.index("autoUpdater.quitAndInstall(false, true)")
+    )
+
+    start = _section(main_ts, "async function startGateway", "async function loadControlUi")
+    admission = "if (!lifecycleAllowsProcessSpawn("
+    assert admission in start
+    assert "isQuitting," in start
+    assert "desktopWriters.closed," in start
+    assert "liveOwnedGatewayCount," in start
+    assert start.index("const port = await findGatewayPort()") < start.index(admission)
+    assert start.index(admission) < start.index("const child = spawn(")
+
+
+def test_desktop_update_drain_defers_user_quit_until_safe_handoff_or_retry() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    before_quit = _section(main_ts, "app.on('before-quit'", "function shutdownFromSignal")
+    apply_update = _section(
+        main_ts,
+        "async function applyDownloadedUpdate(): Promise<void>",
+        "// Lets the gateway-served Control UI",
+    )
+    restore = _section(
+        main_ts,
+        "function restoreDownloadedUpdateRetryState",
+        "// Stop the owned gateway child",
+    )
+
+    assert "if (updateApplying)" in before_quit
+    updater_handoff = _section(
+        before_quit,
+        "if (updateInstallHandoffReady) {",
+        "event.preventDefault()",
+    )
+    assert "setAppExitPhase('committed', 'desktop updater owns exit')" in updater_handoff
+    assert "destroyWindowsTray()" in updater_handoff
+    assert "return" in updater_handoff
+    assert "quitRequestedDuringUpdateDrain = true" in before_quit
+    assert apply_update.index("updateInstallHandoffReady = true") < apply_update.index(
+        "autoUpdater.quitAndInstall(false, true)"
+    )
+    assert "updateInstallHandoffReady = false" in restore
+    assert "setImmediate(() => app.quit())" in restore
+
+
+def test_desktop_quit_failure_is_fail_closed_and_retryable() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    before_quit = _section(main_ts, "app.on('before-quit'", "function shutdownFromSignal")
+
+    assert "return exited || hasGatewayProcessExited(child)" in main_ts
+    assert "if (exited)" in before_quit
+    assert before_quit.index("if (exited)") < before_quit.index("app.exit(0)")
+    failed = _section(before_quit, "// Fail closed:", "return\n  }")
+    assert "quitGatewayDrainPromise = null" in failed
+    assert "isQuitting = false" in failed
+    assert "desktopWriters.reopen(quitWriterAdmission)" in failed
+    assert "dialog.showErrorBox" in failed
+
+
+def test_desktop_gateway_exit_classification_waits_for_stdio_close() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    start = _section(
+        main_ts,
+        "async function startGateway",
+        "async function startGatewayWithPortRecovery",
+    )
+    classifier = _section(start, "// Classify startup failures", "// A failed spawn")
+
+    assert "child.once('close', (code, signal) =>" in classifier
+    assert "classifyGatewayExitMessage(exitMessage, gatewayOutputTail)" in classifier
+    assert "child.once('exit', (code, signal) =>" not in classifier
+
+
+def test_desktop_gateway_ownership_control_dir_is_outside_profile_data_state() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    helper = _section(
+        main_ts,
+        "function desktopGatewayOwnershipDir",
+        "function credentialPath",
+    )
+    start = _section(
+        main_ts,
+        "async function startGateway",
+        "async function startGatewayWithPortRecovery",
+    )
+
+    assert "app.getPath('userData')" in helper
+    assert "'gateway-ownership'" in helper
+    assert "desktopProfileFingerprint(profile.home)" in helper
+    assert "desktopStateDir()" not in helper
+    assert "OPENSQUILLA_DESKTOP_GATEWAY_OWNERSHIP_DIR: gatewayOwnershipDir" in start
+
+    ownership = _read("desktop/electron/src/desktop-gateway-ownership.ts")
+    launch_match = _section(
+        ownership,
+        "export function desktopGatewayOwnershipMatchesLaunch",
+        "export interface DesktopGatewayIdentityPayload",
+    )
+    assert "record.instance_nonce === authority.instanceNonce" in launch_match
+    assert "record.profile_fingerprint === authority.profileFingerprint" in launch_match
+    assert "record.port === authority.port" in launch_match
+    assert "record.pid" not in launch_match
+
+
+def test_desktop_orphan_recovery_has_a_real_electron_process_flow() -> None:
+    package_json = json.loads(_read("desktop/electron/package.json"))
+    script = _read(
+        "desktop/electron/scripts/test-desktop-gateway-orphan-recovery-flow.mjs"
+    )
+
+    assert package_json["scripts"]["test:gateway-orphan-recovery-flow"] == (
+        "npm run build && node scripts/test-desktop-gateway-orphan-recovery-flow.mjs"
+    )
+    assert "firstMain.kill('SIGKILL')" in script
+    assert "verifyDesktopGatewayOwnership(firstRecord)" in script
+    assert "await launchDesktop()" in script
+    assert "loaded.record.pid !== firstRecord.pid" in script
+    assert "waitForDesktopGatewayOwnershipRelease" in script
+
+
+def test_desktop_dual_source_update_resolver_wires_static_channels() -> None:
+    # Stable and same-base preview discovery uses a rate-limit-free static OSS
+    # manifest. Versioned assets then use a strict OSS/GitHub generic feed with
+    # runtime fallback; unsigned Windows verifies an exact versioned installer
+    # against the canonical GitHub checksum before revealing it.
+    main_ts = _read("desktop/electron/src/main.ts")
+    resolver = _read("desktop/electron/src/update-channel.ts")
+    verification = _read("desktop/electron/src/update-verification.ts")
     package_json = json.loads(_read("desktop/electron/package.json"))
     check = _section(
         main_ts,
         "async function runDesktopUpdateCheck",
-        "function gatewayProcessForUpdateInstall",
+        "async function waitForGatewayProcessExit",
+    )
+    native_check = _section(
+        main_ts,
+        "async function checkNativeDesktopUpdate",
+        "async function downloadNativeDesktopUpdateWithFallback",
+    )
+    native_download = _section(
+        main_ts,
+        "async function downloadNativeDesktopUpdateWithFallback",
+        "function desktopUpdateCheckAllowed",
+    )
+    verified_windows_download = _section(
+        main_ts,
+        "async function downloadVerifiedWindowsInstallerWithFallback",
+        "function alternateDesktopUpdateSource",
+    )
+    manual_download = _section(
+        main_ts,
+        "if (desktopUpdateInstallMode() === 'manual')",
+        "if (!autoUpdateSupported())",
     )
 
-    assert "export function parseOpenSquillaReleaseTag" in resolver
-    assert "export function selectMacPrereleaseCandidate" in resolver
+    assert "export function updateChannelPathForVersion" in resolver
+    assert "'stable.json'" in resolver
+    assert "`preview/${parsed.base}.json`" in resolver
     assert "latest-mac.yml" in resolver
-    # Only same-base upgrades; a different base is not crossed automatically.
-    assert "parsed.base !== current.base" in resolver
+    assert "candidate.base !== current.base" in resolver
+    assert "platform assets do not match the release version" in resolver
+    assert "UPDATE_OSS_RELEASE_ROOT" in resolver
+    assert "UPDATE_GITHUB_RELEASE_ROOT" in resolver
 
-    assert "async function configureDesktopUpdateFeed()" in main_ts
-    assert "if (process.platform !== 'darwin' || !app.isPackaged) return 'default'" in main_ts
-    assert "provider: 'generic', url: candidate.feedUrl, channel: 'latest'" in main_ts
+    assert "function configureDesktopUpdateFeed(resolved: ResolvedDesktopUpdate)" in main_ts
+    assert "provider: 'generic'" in main_ts
+    assert "url: updateFeedBaseUrl(resolved.candidate, resolved.source)" in main_ts
     # Numeric rc order can disagree with electron-updater's string-based semver
     # gate (0.5.0-rc10 sorts below rc9), so the resolved-candidate path allows the
     # "downgrade"; the default path forbids it so stable users never regress.
     resolver_feed = _section(
         main_ts,
-        "async function configureDesktopUpdateFeed()",
-        "async function runDesktopUpdateCheck",
+        "function configureDesktopUpdateFeed(resolved: ResolvedDesktopUpdate)",
+        "async function checkNativeDesktopUpdate",
     )
     assert "autoUpdater.allowDowngrade = false" in resolver_feed
-    assert "autoUpdater.allowDowngrade = true" in resolver_feed
-    # checkForUpdates consults the resolver and reports up-to-date without a
-    # spurious GitHub-provider error when no newer same-base release exists.
-    assert "const feed = await configureDesktopUpdateFeed()" in check
-    assert "if (feed === 'up-to-date')" in check
+    assert "current?.rc !== null" in resolver_feed
+    assert "const resolved = await resolveDesktopUpdate()" in check
+    assert "await checkNativeDesktopUpdate(resolved)" in check
+    assert "result?.isUpdateAvailable !== true" in native_check
+    assert "result?.isUpdateAvailable !== true" in native_download
+    assert "nativeUpdateReady = null" in native_check
+    assert "nativeUpdateReadyFor(readyCandidate)" in native_download
+    assert "nativeUpdateReadyFor(candidate)" in main_ts
+    assert "manualInstallerActionInProgress = true" in manual_download
+    assert "manualInstallerActionInProgress = false" in manual_download
+    assert "desktopUpdateStatus === 'checking'" in manual_download
+    assert "await checkForUpdates(true)" in manual_download
+    assert "desktopUpdateStatus !== 'available'" in manual_download
+    assert "desktopUpdateErrorMessage('source_unreachable')" in manual_download
+    assert "'install_failed'" in manual_download
+    assert "manualInstall" in check
+    assert "updateAssetUrl(resolved.candidate, resolved.source)" in check
+    assert "updateAssetUrl(candidate, 'github', 'SHA256SUMS')" in main_ts
+    assert "await fetchCanonicalWindowsInstallerDigest(candidate)" in manual_download
+    assert "await downloadVerifiedWindowsInstallerWithFallback(" in manual_download
+    assert "alternateDesktopUpdateSource(chosen.source)" in verified_windows_download
+    assert (
+        "err.code === 'download_failed' || err.code === 'integrity_failed'"
+        in verified_windows_download
+    )
+    assert "source: verified.source" in manual_download
+    assert "fallbackUsed: verified.fallbackUsed" in manual_download
+    assert "rememberSuccessfulUpdateSource(verified.source)" in manual_download
+    assert "shell.showItemInFolder(verified.path)" in manual_download
+    assert "shell.openExternal(installerUrl)" not in manual_download
+    manual_discovery = _section(
+        main_ts,
+        "if (manualInstall) {",
+        "await checkNativeDesktopUpdate(resolved)",
+    )
+    assert "rememberSuccessfulUpdateSource" not in manual_discovery
+    assert "parseSha256SumsForAsset" in verification
+    assert "streamResponseToVerifiedFile" in verification
+    assert "actual !== expected" in verification
+    assert "await rm(temporaryPath, { force: true })" in verification
+    assert "received !== totalBytes" in verification
+    assert "ipcMain.handle('desktop:update:managed'" in main_ts
+    assert "'x-user-staging-id': '00000000-0000-4000-8000-000000000000'" in main_ts
 
     assert package_json["scripts"]["test:update-resolver"] == (
         "npm run build && node scripts/test-update-resolver.mjs"
@@ -1519,47 +2121,36 @@ def test_python_recovery_engine_replaces_typescript_layout_relocation() -> None:
     assert "inspection.outcome !== 'recovery_required'" in inspect
 
 
-def test_onboarding_migration_ipc_is_guarded_and_prefills_from_imported_config() -> None:
+def test_attention_is_settings_only_without_native_prompt_or_acknowledgement_consumption() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
-    browse = _section(
+    context_ts = _read("desktop/electron/src/desktop-profile-context.ts")
+    inspect = _section(
         main_ts,
-        "ipcMain.handle('desktop:onboarding:migrate:browse'",
-        "ipcMain.handle('desktop:onboarding:migrate:select'",
+        "async function inspectActiveProfileBeforeStartup",
+        "async function openOrResumeDesktopApp",
     )
-    preview = _section(
-        main_ts,
-        "ipcMain.handle('desktop:onboarding:migrate:preview'",
-        "ipcMain.handle('desktop:onboarding:migrate:apply'",
-    )
-    apply_handler = _section(
-        main_ts,
-        "ipcMain.handle('desktop:onboarding:migrate:apply'",
-        "// Set once the Windows graceful-drain",
-    )
+    resume = _section(main_ts, "async function openOrResumeDesktopApp", "function stopGateway")
 
-    # Same trust boundary as desktop:onboarding:save: the preload bridge is also
-    # attached to the Control UI window, so both handlers must refuse outside an
-    # awaiting onboarding flow, and must take source path/kind from the main
-    # process's own detection rather than the renderer payload.
-    for handler in (preview, apply_handler):
-        assert "!resolveOnboarding || !trustedOnboardingIpc(event)" in handler
-        assert "onboardingPortableTransferError()" in handler
-        assert "onboardingMigrationCandidate" in handler
-        assert "candidate.kind !== 'windows-portable'" in handler
-        assert "'--source', candidate.path, '--kind', candidate.kind" in handler
-        assert "migrateSummaryJson([" in handler
-    assert "'--apply'" not in preview
-    assert "'--apply'," in apply_handler
-    assert "'--replace-target'" not in apply_handler
-    assert "'--confirm-replace-target'" not in apply_handler
-    assert "findAppliedReceiptForIntent(" in apply_handler
-    assert "migrationProviderPrefill(intent)" in apply_handler
-    assert "prepareImportedCredentialBackup(intent)" in apply_handler
-    assert "prefill" in apply_handler
+    assert "showAttentionPrompt" not in main_ts
+    assert "attentionPromptInFlight" not in main_ts
+    assert "attentionAcknowledgementFor" not in main_ts
+    assert "persistAttentionAcknowledgement" not in main_ts
+    assert "provenLegacyAttention" not in inspect
+    assert "inspection.outcome !== 'recovery_required'" in inspect
+    assert "recoveryInspection?.outcome === 'attention'" not in resume
+    assert "parseAttentionAcknowledgement(parsed.attention_acknowledgement)" in context_ts
+    assert "current.persisted.attention_acknowledgement" in main_ts
 
-    # First-run detection is a Windows Portable-only upgrade path. CLI and other
-    # Desktop homes remain explicit Settings actions.
+
+def test_profile_import_is_settings_only_and_windows_portable_remains_discoverable() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
     onboarding = _section(main_ts, "async function runOnboarding", "async function pathExists")
+    onboarding_html = _section(main_ts, "function onboardingHtml", "async function runOnboarding")
+    settings_summary = _section(
+        main_ts,
+        "ipcMain.handle('desktop:migration:summary'",
+        "ipcMain.handle('desktop:migration:run'",
+    )
     portable_detection = _section(
         main_ts,
         "function detectWindowsPortableImportCandidates",
@@ -1581,18 +2172,12 @@ def test_onboarding_migration_ipc_is_guarded_and_prefills_from_imported_config()
     assert "'windows-portable'" in portable_detection
     assert "homedir()" not in portable_detection
     assert "manuallyApprovedMigrationCandidates" not in portable_detection
-    assert "legacyImportCandidate('windows-portable', path)" in browse
-    assert "parseMigrationSourceKind" not in browse
-    assert "manuallyApprovedMigrationCandidates" not in browse
-    assert "isProvenFreshPrimaryDesktopProfile(onboardingDataInput)" in onboarding
-    assert "classifyDesktopOnboardingDataFlow" in onboarding
-    assert "onboardingDataFlow === 'portable-transfer'" in onboarding
-    assert "enrichLegacyImportCandidates(detectWindowsPortableImportCandidates())" in onboarding
-    assert "candidateKinds: detectedCandidates.map((candidate) => candidate.kind)" in onboarding
-    assert onboarding.index("detectWindowsPortableImportCandidates()") < onboarding.index(
-        "new BrowserWindow"
-    )
-    assert "onboardingDataFlow === 'portable-transfer'," in onboarding
+    assert "detectLegacyImportCandidates()" in settings_summary
+    assert "detectWindowsPortableImportCandidates()" not in onboarding
+    assert "desktop:onboarding:migrate:" not in main_ts
+    assert "migrationStepEnabled" not in onboarding_html
+    assert 'data-screen="5"' not in onboarding_html
+    assert "portable-transfer" not in main_ts
 
 
 def test_run_migrate_cli_targets_desktop_home_via_bundled_cli() -> None:
@@ -1678,12 +2263,8 @@ def test_desktop_migration_run_quiesces_then_restarts_without_forcing_onboarding
     assert "if (!exited)" in run
     assert run.index("stopGateway()") < run.index("await runMigrateCli(")
     assert "A gateway is still serving this profile" in run
-    assert run.index("(!gatewayProcess || !gatewayState.owned)") < run.index(
-        "isQuitting = true"
-    )
-    assert run.index("A gateway is still serving this profile") < run.index(
-        "await runMigrateCli("
-    )
+    assert run.index("(!gatewayProcess || !gatewayState.owned)") < run.index("isQuitting = true")
+    assert run.index("A gateway is still serving this profile") < run.index("await runMigrateCli(")
     assert "'--apply'" in run
     assert "'--replace-target'" in run
     assert "'--confirm-replace-target', primaryDesktopHome()" in run
@@ -1789,19 +2370,12 @@ def test_complete_profile_import_holds_exclusive_writer_admission_through_reconc
         "ipcMain.handle('desktop:migration:run'",
         "ipcMain.handle('desktop:migration:last-result'",
     )
-    onboarding_run = _section(
-        main_ts,
-        "ipcMain.handle('desktop:onboarding:migrate:apply'",
-        "// Set once the Windows graceful-drain",
-    )
-
-    for handler in (settings_run, onboarding_run):
-        assert "desktopWriters.tryBeginExclusive" in handler
-        assert "await waitForDesktopWriterOperations(1)" in handler
-        assert "exclusive.finish()" in handler
-        assert "desktopWriters.reopen(exclusive.admissionToken)" in handler
-        assert handler.index("tryBeginExclusive") < handler.index("'--apply'")
-        assert handler.index("'--apply'") < handler.index("exclusive.finish()")
+    assert "desktopWriters.tryBeginExclusive" in settings_run
+    assert "await waitForDesktopWriterOperations(1)" in settings_run
+    assert "exclusive.finish()" in settings_run
+    assert "desktopWriters.reopen(exclusive.admissionToken)" in settings_run
+    assert settings_run.index("tryBeginExclusive") < settings_run.index("'--apply'")
+    assert settings_run.index("'--apply'") < settings_run.index("exclusive.finish()")
 
     assert "reconcileImportedDesktopCredential(intent, true)" in settings_run
     save_credential = _section(
@@ -1820,21 +2394,11 @@ def test_desktop_migration_writes_reconciliation_intent_before_apply() -> None:
         "ipcMain.handle('desktop:migration:run'",
         "ipcMain.handle('desktop:migration:last-result'",
     )
-    onboarding_apply = _section(
-        main_ts,
-        "ipcMain.handle('desktop:onboarding:migrate:apply'",
-        "// Set once the Windows graceful-drain",
+    assert "beginMigrationReconciliationIntent(candidate)" in run
+    assert run.index("beginMigrationReconciliationIntent(candidate)") < run.index(
+        "await runMigrateCli(["
     )
-
-    for handler, invocation in (
-        (run, "await runMigrateCli(["),
-        (onboarding_apply, "migrateSummaryJson(["),
-    ):
-        assert "beginMigrationReconciliationIntent(candidate)" in handler
-        assert handler.index("beginMigrationReconciliationIntent(candidate)") < handler.index(
-            invocation
-        )
-        assert "findAppliedReceiptForIntent(" in handler
+    assert "findAppliedReceiptForIntent(" in run
 
 
 def test_settings_import_reconciles_or_prompts_for_imported_provider() -> None:
@@ -1859,8 +2423,8 @@ def test_settings_import_reconciles_or_prompts_for_imported_provider() -> None:
     assert "readImportedProviderKey" not in main_ts
     assert "apiKey: ''" in main_ts
     assert "onboardingHtml(" in onboarding
-    assert "onboardingMigrationCandidates," in onboarding
     assert "pendingProviderSetup," in onboarding
+    assert "onboardingMigrationCandidates" not in onboarding
     assert "desktopSecretStoragePolicyBackend() === 'safeStorage'" in onboarding
 
     reconcile = _section(
@@ -1929,48 +2493,14 @@ def test_invalid_desktop_credential_fails_closed_instead_of_reonboarding() -> No
     assert "catch {\n    return null" not in load
 
 
-def test_migration_locale_keys_exist_in_all_six_locale_blocks() -> None:
+def test_settings_migration_confirmation_keys_exist_without_onboarding_or_attention_copy() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
     desktop_catalog = _section(
         main_ts,
         "const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {",
         "// Runtime string bag",
     )
-    script_catalog = _section(
-        main_ts,
-        "const ONBOARDING_SCRIPT_MESSAGES",
-        "function desktopT",
-    )
-
     desktop_keys = [
-        "attention.title",
-        "attention.message",
-        "attention.detail",
-        "attention.currentWorkspace",
-        "attention.otherWorkspace",
-        "attention.later",
-        "attention.keepCurrent",
-        "attention.chooseWorkspace",
-        "migration.nav.title",
-        "migration.nav.sub",
-        "migration.step.badge",
-        "migration.step.heading",
-        "migration.step.subtitle",
-        "migration.step.assurance",
-        "migration.step.sourceLabel",
-        "migration.step.selectionHint",
-        "migration.step.candidateVersion",
-        "migration.step.candidateSessions",
-        "migration.step.candidateActivity",
-        "migration.step.manualTypeLabel",
-        "migration.step.manualTypePlaceholder",
-        "migration.source.cli",
-        "migration.source.desktop",
-        "migration.source.portable",
-        "migration.step.browse",
-        "migration.step.preview",
-        "migration.step.import",
-        "migration.step.skip",
         "migration.overwriteTitle",
         "migration.overwriteMessage",
         "migration.overwriteDetail",
@@ -1982,55 +2512,25 @@ def test_migration_locale_keys_exist_in_all_six_locale_blocks() -> None:
     ]
     for key in desktop_keys:
         assert desktop_catalog.count(f"'{key}':") == 6, key
-
-    script_keys = [
-        "migrationPreviewRunning",
-        "migrationApplyRunning",
-        "migrationReady",
-        "migrationSkippedDetails",
-        "migrationTechnicalDetails",
-        "migrationPausedJobs",
-        "migrationDisk",
-        "migrationNotesLabel",
-        "migrationPreviewFailed",
-        "migrationApplyFailed",
-        "migrationDone",
-    ]
-    for key in script_keys:
-        assert script_catalog.count(f"{key}:") == 6, key
+    assert "'attention." not in desktop_catalog
+    assert "'migration.nav." not in desktop_catalog
+    assert "'migration.step." not in desktop_catalog
+    assert "migrationPreviewRunning:" not in main_ts
 
 
-def test_onboarding_route_prepends_portable_copy_only_when_policy_allows() -> None:
+def test_onboarding_route_never_contains_profile_migration() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
     html = _section(main_ts, "function onboardingHtml", "async function runOnboarding")
     route = _section(html, "function routeSteps()", "function routePosition")
 
-    # Only policy-approved Portable candidates are JSON-injected; the optional
-    # copy step (screen 5) leads the route only then.
-    assert "detections: LegacyImportCandidate[] = []" in html
-    assert "portableTransferEnabled = false" in html
-    assert "detections.every((candidate) => candidate.kind === 'windows-portable')" in html
-    assert "const migrationCandidates = ${inlineScriptJson(detections)};" in html
     assert "const initialProviderPrefill = ${inlineScriptJson(pendingProviderSetup)};" in html
-    assert "let migrationCandidate = null;" in html
-    assert 'id="migrationCandidateList"' in html
-    assert 'id="migrationSelectionHint"' in html
-    assert 'id="migrationSource" type="hidden"' in html
-    assert 'id="migrationSourceKind"' not in html
-    assert "browseOnboardingMigration();" in html
-    assert "candidate.session_count !== null" in html
-    assert "candidate.session_count !== undefined" in html
-    assert "const hasDiskEstimate = Number.isFinite(diskRequired) && diskRequired >= 0" in html
-    assert "...(hasDiskEstimate ? [fmt('migrationDisk'" in html
-    assert "migration.source.cli" not in _section(
-        html,
-        '${migrationStepEnabled ? `<section class="setup-card active" data-screen="5">',
-        '<section class="setup-card${migrationStepEnabled ? \'\' : \' active\'}" data-screen="0">',
-    )
-    assert "return migrationStepEnabled ? [5, ...base] : base;" in route
-    assert 'data-screen="5"' in html
-    assert 'data-step-label="5"' in html
-    assert "let step = ${migrationStepEnabled ? 5 : 0};" in html
+    assert "let step = 0;" in html
+    assert "return isSimpleSetup()" in route
+    assert "migrationStepEnabled" not in html
+    assert "migrationCandidates" not in html
+    assert "OnboardingMigration" not in html
+    assert 'data-screen="5"' not in html
+    assert 'data-step-label="5"' not in html
 
 
 def test_onboarding_inline_json_escapes_script_terminators_and_line_separators() -> None:
@@ -2052,8 +2552,6 @@ def test_onboarding_inline_json_escapes_script_terminators_and_line_separators()
         "SEARCH_PROVIDER_CATALOG",
         "ROUTER_PROFILES",
         "TEXT_ROUTER_TIERS",
-        "detections",
-        "migrationStepEnabled",
         "pendingProviderSetup",
     ):
         assert f"${{inlineScriptJson({value})}}" in html
@@ -2072,10 +2570,9 @@ def test_migration_preload_bridge_and_progress_channel() -> None:
     assert "'desktop:migration:peek-last-result'" in preload
     assert "'desktop:migration:dismiss-last-result'" in preload
     assert "'desktop:migration:browse-source'" in preload
-    assert "'desktop:onboarding:migrate:select'" in preload
-    assert "'desktop:onboarding:migrate:browse'" in preload
-    assert "'desktop:onboarding:migrate:preview'" in preload
-    assert "'desktop:onboarding:migrate:apply'" in preload
+    assert "'desktop:onboarding:migrate:" not in preload
+    assert "chooseLegacyAgentDataLocation" in preload
+    assert "'desktop:recovery:choose-legacy-agent-data'" in preload
     assert "onMigrationProgress" in preload
     assert "'desktop:migration:progress'" in preload
 
@@ -2090,6 +2587,18 @@ def test_migration_preload_bridge_and_progress_channel() -> None:
     assert "source_snapshot_unreadable" in main_ts
     assert "gateway_restart_failed" in main_ts
     assert "result.stderr || result.stdout" not in main_ts
+
+    legacy_choice = _section(
+        main_ts,
+        "ipcMain.handle('desktop:recovery:choose-legacy-agent-data'",
+        "ipcMain.handle('desktop:recovery:recover-transaction'",
+    )
+    assert "trustedControlUiIpc(event)" in legacy_choice
+    assert "activeDesktopProfile().kind !== 'primary'" in legacy_choice
+    assert "inspection?.outcome !== 'attention'" in legacy_choice
+    assert "workspace_conflict" in legacy_choice
+    assert "choosePrimaryWorkspace(" in legacy_choice
+    assert "'legacy-agent-data'" in legacy_choice
 
 
 def test_compiled_electron_flows_preserve_xvfb_display_authority() -> None:

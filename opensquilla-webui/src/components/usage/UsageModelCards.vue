@@ -34,7 +34,7 @@
           <div class="usage-model-card__cost-row">
             <dt>{{ t('usageLogs.metrics.cost') }}</dt>
             <dd class="usage-mono usage-cost">
-              {{ fmtCost(m.costUsd) }}
+              {{ fmtCost(m.costUsd, { source: m }) }}
               <span
                 class="usage-source"
                 :class="costSourceClassesForModelCard(m)"
@@ -57,7 +57,10 @@ const { t } = useI18n()
 defineProps<{
   modelCards: ModelCard[]
   modelsMeta: string
-  fmtCost: (cost: number | null | undefined, opts?: { decimals?: number }) => string
+  fmtCost: (
+    cost: number | null | undefined,
+    opts?: { decimals?: number; source?: object },
+  ) => string
   costSourceClassesForModelCard: (m: ModelCard) => Record<string, boolean>
   costSourceLabelForModelCard: (m: ModelCard) => string
   costSourceTooltipForModelCard: (m: ModelCard) => string

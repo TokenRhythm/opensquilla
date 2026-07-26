@@ -19,12 +19,29 @@ from uuid import uuid4
 
 from opensquilla.safety.secret_redaction import redact_secret_value
 
+from .tokenrhythm_correlation import (
+    TOKENRHYTHM_CALL_KIND_HEADER,
+    TOKENRHYTHM_EXECUTION_ID_HEADER,
+    TOKENRHYTHM_SESSION_ID_HEADER,
+    TOKENRHYTHM_TURN_ID_HEADER,
+)
+
 _DEFAULT_TRACE_PATH = "/tmp/opensquilla-llm-calls.jsonl"
 _RECORDER_ENV = "OPENSQUILLA_LLM_TRACE_RECORDER"
 _PATH_ENV = "OPENSQUILLA_LLM_TRACE_PATH"
 _INCLUDE_CHUNKS_ENV = "OPENSQUILLA_LLM_TRACE_INCLUDE_CHUNKS"
 _OFF_VALUES = {"0", "false", "no", "off", "disabled", "disable"}
 _CALL_COUNTER = count(1)
+_PRESENT = "[PRESENT]"
+_CORRELATION_HEADER_NAMES = frozenset(
+    name.lower()
+    for name in (
+        TOKENRHYTHM_SESSION_ID_HEADER,
+        TOKENRHYTHM_TURN_ID_HEADER,
+        TOKENRHYTHM_EXECUTION_ID_HEADER,
+        TOKENRHYTHM_CALL_KIND_HEADER,
+    )
+)
 
 
 def _env_is_off(value: str | None) -> bool:
@@ -49,6 +66,17 @@ def _include_chunks_from_env() -> bool:
 
 def _redact(value: Any, *, key: str | None = None) -> Any:
     return redact_secret_value(value, key=key)
+
+
+def _redact_request_headers(headers: dict[str, Any]) -> dict[str, Any]:
+    return {
+        str(name): (
+            _PRESENT
+            if str(name).lower() in _CORRELATION_HEADER_NAMES
+            else _redact(value, key=str(name))
+        )
+        for name, value in headers.items()
+    }
 
 
 def _stable_json(value: Any) -> str:
@@ -95,7 +123,7 @@ class LLMTraceRecorder:
                 "event": "llm.request",
                 "payload_sha256": _sha256(sanitized_payload),
                 "payload": sanitized_payload,
-                "headers": _redact(headers or {}),
+                "headers": _redact_request_headers(headers or {}),
                 "metadata": _redact(metadata or {}),
             }
         )

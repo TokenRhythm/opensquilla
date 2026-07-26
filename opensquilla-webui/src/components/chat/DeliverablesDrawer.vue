@@ -172,6 +172,7 @@ import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import type { ArtifactPayload } from '@/types/rpc'
+import { useDialogLayer } from '@/composables/useDialogA11y'
 
 const { t } = useI18n()
 import {
@@ -204,6 +205,8 @@ const drawerRef = ref<HTMLElement | null>(null)
 const closeBtn = ref<HTMLButtonElement | null>(null)
 const previewCloseBtn = ref<HTMLButtonElement | null>(null)
 const active = ref<ArtifactPayload | null>(null)
+const drawerIsTopmost = useDialogLayer(computed(() => props.open))
+const previewIsTopmost = useDialogLayer(computed(() => props.open && active.value !== null))
 
 let invokerEl: HTMLElement | null = null
 
@@ -393,6 +396,7 @@ function trapFocus(event: KeyboardEvent, rootEl: HTMLElement | null) {
 
 function onDocumentKeydown(event: KeyboardEvent) {
   if (!props.open) return
+  if (active.value ? !previewIsTopmost.value : !drawerIsTopmost.value) return
   if (event.key === 'Escape') {
     event.preventDefault()
     if (active.value) closePreview()

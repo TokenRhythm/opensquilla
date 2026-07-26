@@ -20,6 +20,11 @@ from opensquilla.artifacts import (
     ArtifactStore,
     artifact_payload,
 )
+from opensquilla.engine.usage_accounting import (
+    account_provider_stream,
+    current_usage_accounting_scope,
+    provider_accounts_physical_usage,
+)
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.provider.audio import (
     AudioGenerationResult,
@@ -36,6 +41,11 @@ from opensquilla.provider.audio import (
     VoiceCloneRequest,
     VoiceConversionRequest,
     VoiceConversionResult,
+    resolve_elevenlabs_api_key_env,
+)
+from opensquilla.provider.correlation_context import (
+    bind_provider_request_correlation,
+    current_provider_request_correlation,
 )
 from opensquilla.provider.image_generation import (
     ImageGenerationRequest,
@@ -45,6 +55,12 @@ from opensquilla.provider.image_generation import (
     parse_image_generation_model_ref,
     reset_image_generation_providers,
 )
+from opensquilla.provider.image_generation_policy import (
+    conflicting_image_generation_endpoint_provider,
+    is_valid_image_generation_base_url,
+)
+from opensquilla.provider.protocol import provider_metadata
+from opensquilla.provider.types import ChatConfig, derive_provider_request_correlation
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
 from opensquilla.tools.path_aliases import resolve_workspace_alias
 from opensquilla.tools.path_policy import reject_foreign_host_path
@@ -70,6 +86,7 @@ _MAX_REDIRECTS = 5
 _VISION_ANALYSIS_TIMEOUT_SECONDS = 180.0
 _image_generation_config: Any | None = None
 _audio_config: Any | None = None
+_media_gateway_config: Any | None = None
 _media_llm_config: Any | None = None
 _media_squilla_router_config: Any | None = None
 
@@ -77,11 +94,14 @@ _media_squilla_router_config: Any | None = None
 def configure_image_generation(
     config: Any | None,
     *,
+    gateway_config: Any | None = None,
     llm_config: Any | None = None,
     squilla_router_config: Any | None = None,
 ) -> None:
-    global _image_generation_config, _media_llm_config, _media_squilla_router_config
+    global _image_generation_config, _media_gateway_config
+    global _media_llm_config, _media_squilla_router_config
     _image_generation_config = config
+    _media_gateway_config = gateway_config
     _media_llm_config = llm_config
     _media_squilla_router_config = squilla_router_config
     reset_image_generation_providers(config, llm_config=llm_config)
@@ -247,8 +267,9 @@ def _resolve_media_path(path: str) -> Path:
 
 def _sensitive_media_path_block(tool_name: str, resolved: Path, original_path: str) -> dict | None:
     from opensquilla.sandbox.sensitive_paths import build_block_envelope, is_sensitive_path
+    from opensquilla.tools.builtin import filesystem
 
-    if full_host_access_active():
+    if full_host_access_active() or filesystem._sandbox_path_access_enabled():
         return None
     sensitive = is_sensitive_path(str(resolved))
     if sensitive is None:
@@ -370,16 +391,46 @@ def _mime_to_ext(content_type: str) -> str:
 
 async def _complete_from_stream(provider: Any, messages: list, config: Any = None) -> str:
     """Consume a chat() stream and return the assembled text response."""
+    correlation = current_provider_request_correlation()
+    if config is None:
+        config = ChatConfig(provider_request_correlation=correlation)
+    elif (
+        correlation is not None
+        and getattr(config, "provider_request_correlation", None) is None
+    ):
+        config = config.model_copy(
+            update={"provider_request_correlation": correlation},
+        )
+    scope = current_usage_accounting_scope()
+    close_stream = None
+    if scope is None:
+        stream = provider.chat(messages=messages, config=config)
+    elif provider_accounts_physical_usage(provider):
+        stream = provider.chat(messages=messages, config=config)
+        close_stream = stream
+    else:
+        metadata = provider_metadata(provider)
+        stream = account_provider_stream(
+            lambda: provider.chat(messages=messages, config=config),
+            provider=metadata.provider_name or metadata.provider_kind,
+            model=metadata.model,
+        )
+        close_stream = stream
     text_parts: list[str] = []
-    async for event in provider.chat(messages=messages, config=config):
-        if hasattr(event, "text"):
-            text_parts.append(event.text)
-        elif hasattr(event, "delta") and isinstance(event.delta, str):
-            text_parts.append(event.delta)
-        elif getattr(event, "kind", None) == "error":
-            code = getattr(event, "code", "") or "provider_error"
-            message = getattr(event, "message", "") or "Provider stream failed"
-            raise RuntimeError(f"Provider stream error ({code}): {message}")
+    try:
+        async for event in stream:
+            if hasattr(event, "text"):
+                text_parts.append(event.text)
+            elif hasattr(event, "delta") and isinstance(event.delta, str):
+                text_parts.append(event.delta)
+            elif getattr(event, "kind", None) == "error":
+                code = getattr(event, "code", "") or "provider_error"
+                message = getattr(event, "message", "") or "Provider stream failed"
+                raise RuntimeError(f"Provider stream error ({code}): {message}")
+    finally:
+        aclose = getattr(close_stream, "aclose", None)
+        if callable(aclose):
+            await aclose()
     return "".join(text_parts)
 
 
@@ -402,7 +453,13 @@ async def _call_vision_provider(b64_data: str, media_type: str, prompt: str) -> 
             ContentBlockText(text=prompt),
         ],
     )
-    return await _complete_from_stream(provider, [vision_message])
+    correlation = derive_provider_request_correlation(
+        current_provider_request_correlation(),
+        execution_id=uuid.uuid4().hex,
+        call_kind="auxiliary.media",
+    )
+    with bind_provider_request_correlation(correlation):
+        return await _complete_from_stream(provider, [vision_message])
 
 
 # ---------------------------------------------------------------------------
@@ -443,7 +500,7 @@ async def _call_vision_provider(b64_data: str, media_type: str, prompt: str) -> 
 )
 async def image_generate(
     prompt: str,
-    size: str = "1024x1024",
+    size: str | None = None,
     model: str | None = None,
     filename: str | None = None,
 ) -> str:
@@ -453,18 +510,21 @@ async def image_generate(
 async def _image_generate_impl(
     *,
     prompt: str,
-    size: str,
+    size: str | None,
     model: str | None,
     filename: str | None,
 ) -> str:
     if not prompt or not prompt.strip():
         raise ToolError("Prompt must not be empty")
 
-    valid_sizes = {"1024x1024", "1536x1024", "1024x1536"}
-    if size not in valid_sizes:
-        raise ToolError(f"Invalid size: {size}. Must be {' | '.join(sorted(valid_sizes))}")
-
     config = _resolve_image_generation_config()
+    effective_size = size if size is not None else getattr(config, "size", "1024x1024")
+    valid_sizes = {"1024x1024", "1536x1024", "1024x1536"}
+    if effective_size not in valid_sizes:
+        raise ToolError(
+            f"Invalid size: {effective_size}. Must be {' | '.join(sorted(valid_sizes))}"
+        )
+
     if not getattr(config, "enabled", False):
         raise ToolError("Image generation is disabled")
 
@@ -479,7 +539,7 @@ async def _image_generate_impl(
             request=ImageGenerationRequest(
                 prompt=prompt,
                 model=candidates[0],
-                size=size or getattr(config, "size", "1024x1024"),
+                size=effective_size,
                 output_format=output_format,
                 timeout_seconds=float(getattr(config, "timeout_seconds", 180.0)),
             ),
@@ -599,6 +659,19 @@ def image_generation_available(config: Any | None = None) -> bool:
 
 
 def _image_generation_provider_has_auth(provider: Any) -> bool:
+    provider_id = str(getattr(provider, "provider_id", "") or "")
+    missing_base_url = object()
+    configured_base_url = getattr(provider, "_base_url", missing_base_url)
+    # Third-party image providers are not required to expose an HTTP endpoint
+    # by the public protocol. Built-in HTTP adapters do, and retain endpoint
+    # validation before they are surfaced as available.
+    if configured_base_url is not missing_base_url:
+        base_url = str(configured_base_url or "")
+        if not is_valid_image_generation_base_url(base_url):
+            return False
+        if conflicting_image_generation_endpoint_provider(provider_id, base_url) is not None:
+            return False
+
     resolve_api_key = getattr(provider, "_resolve_api_key", None)
     if callable(resolve_api_key):
         try:
@@ -623,7 +696,7 @@ def _resolve_generated_image_path(filename: str | None, output_format: str) -> P
         else Path.cwd()
     )
     candidate = Path(raw).expanduser()
-    if not candidate.suffix:
+    if candidate.suffix.lower() != f".{ext}":
         candidate = candidate.with_suffix(f".{ext}")
 
     target = candidate if candidate.is_absolute() else root / candidate
@@ -788,7 +861,13 @@ async def _call_llm_with_text(text: str, prompt: str) -> str:
         selector = ModelSelector(SelectorConfig(primary=cfg))
         provider = selector.resolve()
         message = Message(role="user", content=f"{prompt}\n\n---\n{text}")
-        return await _complete_from_stream(provider, [message])
+        correlation = derive_provider_request_correlation(
+            current_provider_request_correlation(),
+            execution_id=uuid.uuid4().hex,
+            call_kind="auxiliary.media",
+        )
+        with bind_provider_request_correlation(correlation):
+            return await _complete_from_stream(provider, [message])
     except Exception:
         return f"[LLM analysis not available] Extracted text ({len(text)} chars) ready."
 
@@ -827,6 +906,34 @@ def _configured_provider_config(provider_name: str, model: str):
     from opensquilla.provider.selector import ProviderConfig
 
     provider_name = str(provider_name or "").strip().lower() or "openrouter"
+    if _media_gateway_config is not None:
+        from opensquilla.gateway.llm_runtime import resolve_llm_runtime_config
+        from opensquilla.provider.deployment import resolve_provider_deployment
+
+        # Resolve the active provider on a throwaway copy so environment
+        # materialization and provenance tracking cannot mutate the live
+        # gateway config from a media-tool lookup. The shared deployment
+        # resolver then uses this as the inherited primary or independently
+        # resolves a demoted provider from ``llm_profiles``.
+        scratch = _media_gateway_config.model_copy(deep=True)
+        runtime = resolve_llm_runtime_config(scratch)
+        inherited = ProviderConfig(
+            provider=runtime.provider,
+            model=model,
+            api_key=runtime.api_key,
+            base_url=runtime.base_url,
+            proxy=runtime.proxy,
+            provider_routing=runtime.provider_routing,
+        )
+        resolution = resolve_provider_deployment(
+            _media_gateway_config,
+            provider_name,
+            model,
+            inherited_provider_config=inherited,
+        )
+        if resolution.provider_config is not None:
+            return resolution.provider_config
+
     llm_provider = str(_config_value(_media_llm_config, "provider", "") or "").strip().lower()
     use_llm_config = provider_name == llm_provider
 
@@ -937,13 +1044,13 @@ def _audio_configured(config: Any) -> bool:
     if provider_config is None:
         return False
     api_key = str(getattr(provider_config, "api_key", "") or "")
-    api_key_env = str(getattr(provider_config, "api_key_env", "") or "ELEVENLABS_API_KEY")
+    api_key_env = resolve_elevenlabs_api_key_env(provider_config)
     return bool(api_key or os.environ.get(api_key_env))
 
 
 def _elevenlabs_provider(config: Any) -> ElevenLabsAudioProductionProvider:
     provider_config = _audio_provider_config(config)
-    api_key_env = str(getattr(provider_config, "api_key_env", "") or "ELEVENLABS_API_KEY")
+    api_key_env = resolve_elevenlabs_api_key_env(provider_config)
     return ElevenLabsAudioProductionProvider(
         api_key=str(getattr(provider_config, "api_key", "") or "") or None,
         api_key_env=api_key_env,

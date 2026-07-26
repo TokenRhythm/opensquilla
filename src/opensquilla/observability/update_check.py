@@ -1,7 +1,7 @@
 """Passive update-availability check.
 
-Queries the public GitHub Releases API for the latest published OpenSquilla
-release and compares it with the running version, so the Control UI (and the
+Queries the static OpenSquilla release-channel manifest mirrored to Aliyun OSS
+and compares it with the running version, so the Control UI (and the
 ``opensquilla version --check`` command) can show a friendly "a newer version
 is available" notice. This is intentionally passive: it never downloads or
 installs anything, never blocks startup, and never raises.
@@ -48,19 +48,19 @@ TELEMETRY_DISABLED_ENV = "OPENSQUILLA_TELEMETRY_DISABLED"
 UPDATE_CHECK_ENDPOINT_ENV = "OPENSQUILLA_UPDATE_CHECK_ENDPOINT"
 TELEMETRY_TESTING_ENV = "OPENSQUILLA_TESTING"
 
-# The releases/latest endpoint returns the most recent NON-draft, NON-prerelease
-# release, which is exactly the stable channel a passive notice should point at.
-DEFAULT_UPDATE_CHECK_ENDPOINT = (
-    "https://api.github.com/repos/opensquilla/opensquilla/releases/latest"
+DEFAULT_UPDATE_CHANNEL_ROOT = (
+    "https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/channels"
 )
-DEFAULT_RC_UPDATE_CHECK_ENDPOINT = (
-    "https://api.github.com/repos/opensquilla/opensquilla/releases?per_page=50"
-)
+DEFAULT_UPDATE_CHECK_ENDPOINT = f"{DEFAULT_UPDATE_CHANNEL_ROOT}/stable.json"
+# RC checks are scoped to the running release line. ``_channel_for`` expands
+# this template before it reaches the network; keeping it as a named constant
+# also makes the public endpoint contract easy to exercise in tests.
+DEFAULT_RC_UPDATE_CHECK_ENDPOINT = f"{DEFAULT_UPDATE_CHANNEL_ROOT}/preview/{{base}}.json"
+DEFAULT_RELEASE_TAG_PAGE = "https://github.com/opensquilla/opensquilla/releases/tag"
 DEFAULT_RELEASES_INDEX_PAGE = "https://github.com/opensquilla/opensquilla/releases"
 # Compatibility name for callers that imported the old fallback constant.
-# Release discovery still uses /releases/latest for stable builds, but a link
-# without an exact html_url must lead to the generic index rather than implying
-# that GitHub's latest stable release is the selected candidate.
+# A lookup without an exact release URL leads to the generic index rather than
+# implying that any particular GitHub Release was selected.
 DEFAULT_RELEASES_PAGE = DEFAULT_RELEASES_INDEX_PAGE
 
 DEFAULT_TTL_SECONDS = 24 * 60 * 60
@@ -296,9 +296,7 @@ def start_background_update_check(
                 return existing
             if not _refresh_due(path, channel, DEFAULT_TTL_SECONDS):
                 return None
-            thread = threading.Thread(
-                target=_run, name="opensquilla-update-check", daemon=True
-            )
+            thread = threading.Thread(target=_run, name="opensquilla-update-check", daemon=True)
             _BACKGROUND_THREADS[key] = thread
             try:
                 thread.start()
@@ -327,7 +325,7 @@ def _channel_for(current: str) -> _UpdateChannel:
             kind="rc",
             scope=f"rc:{base_text}",
             state_file=RC_UPDATE_CHECK_STATE_FILE,
-            endpoint=DEFAULT_RC_UPDATE_CHECK_ENDPOINT,
+            endpoint=DEFAULT_RC_UPDATE_CHECK_ENDPOINT.format(base=base_text),
             releases_page=DEFAULT_RELEASES_INDEX_PAGE,
             base=base,
         )
@@ -381,9 +379,7 @@ def _cached_latest(state: dict[str, Any]) -> str | None:
     return latest if isinstance(latest, str) and latest.strip() else None
 
 
-def _state_for_channel(
-    state: dict[str, Any], channel: _UpdateChannel
-) -> dict[str, Any]:
+def _state_for_channel(state: dict[str, Any], channel: _UpdateChannel) -> dict[str, Any]:
     scope = state.get("cache_scope")
     if channel.kind == "stable":
         # v1 stable caches have no scope and remain valid. A non-stable scope
@@ -433,17 +429,13 @@ def _info_from_state(
         release_url=str(state.get("release_url") or channel.releases_page),
         checked_at=checked_at if isinstance(checked_at, str) else None,
         error=(
-            error
-            if error is not None
-            else state_error if isinstance(state_error, str) else None
+            error if error is not None else state_error if isinstance(state_error, str) else None
         ),
         from_cache=from_cache,
     )
 
 
-def _recompute(
-    info: UpdateCheckInfo, current: str, channel: _UpdateChannel
-) -> UpdateCheckInfo:
+def _recompute(info: UpdateCheckInfo, current: str, channel: _UpdateChannel) -> UpdateCheckInfo:
     if info.current_version == current:
         return info
     latest = info.latest_version
@@ -539,9 +531,7 @@ def _load_state(path: Path) -> dict[str, Any]:
 
 def _write_state(path: Path, state: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
-    )
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(state, fh, ensure_ascii=False, indent=2, sort_keys=True)
@@ -557,18 +547,89 @@ def _write_state(path: Path, state: dict[str, Any]) -> None:
         raise
 
 
+_MANIFEST_TAG_RE = re.compile(
+    r"^v(0|[1-9]\d*)[.](0|[1-9]\d*)[.](0|[1-9]\d*)"
+    r"(?:rc(0|[1-9]\d*))?$"
+)
+_MANIFEST_VERSION_RE = re.compile(
+    r"^(0|[1-9]\d*)[.](0|[1-9]\d*)[.](0|[1-9]\d*)"
+    r"(?:-rc(0|[1-9]\d*))?$"
+)
+
+
+def _strict_manifest_version(
+    value: object,
+    pattern: re.Pattern[str],
+) -> tuple[tuple[int, int, int], int | None] | None:
+    if not isinstance(value, str):
+        return None
+    match = pattern.fullmatch(value.strip())
+    if match is None:
+        return None
+    base = int(match.group(1)), int(match.group(2)), int(match.group(3))
+    ordinal = int(match.group(4)) if match.group(4) is not None else None
+    return base, ordinal
+
+
+def _manifest_release(
+    payload: object,
+    channel: _UpdateChannel,
+) -> tuple[str, str]:
+    """Validate a v1 channel manifest and return its version and release page.
+
+    Platform assets deliberately remain an Electron concern. This passive
+    checker validates only the common discovery contract it consumes, plus the
+    requested stable/preview scope so a misplaced moving object cannot leak a
+    release from another channel into the cache.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("channel manifest must be an object")
+    schema_version = payload.get("schemaVersion")
+    if type(schema_version) is not int or schema_version != 1:
+        raise ValueError("unsupported channel manifest schemaVersion")
+
+    tag_value = payload.get("tag")
+    version_value = payload.get("version")
+    tag = tag_value.strip() if isinstance(tag_value, str) else ""
+    version = version_value.strip() if isinstance(version_value, str) else ""
+    tag_parsed = _strict_manifest_version(tag, _MANIFEST_TAG_RE)
+    version_parsed = _strict_manifest_version(version, _MANIFEST_VERSION_RE)
+    if tag_parsed is None or version_parsed is None or tag_parsed != version_parsed:
+        raise ValueError("channel manifest tag and version disagree")
+
+    base, ordinal = tag_parsed
+    base_text = ".".join(str(part) for part in base)
+    base_value = payload.get("baseVersion")
+    if not isinstance(base_value, str) or base_value.strip() != base_text:
+        raise ValueError("channel manifest baseVersion disagrees with tag")
+    prerelease = payload.get("prerelease")
+    if type(prerelease) is not bool or prerelease is not (ordinal is not None):
+        raise ValueError("channel manifest prerelease disagrees with tag")
+
+    if channel.kind == "stable":
+        if ordinal is not None:
+            raise ValueError("stable channel manifest contains a prerelease")
+    elif channel.base is None or base != channel.base:
+        raise ValueError("preview channel manifest contains another release line")
+
+    canonical_release_url = f"{DEFAULT_RELEASE_TAG_PAGE}/{tag}"
+    if payload.get("releaseUrl") != canonical_release_url:
+        raise ValueError("channel manifest releaseUrl is not canonical")
+    return version, canonical_release_url
+
+
 def _fetch_latest_release(
     endpoint: str,
     current_version: str,
     *,
     timeout: float,
 ) -> tuple[str | None, str | None, str | None]:
-    """Return (candidate_without_v, html_url, error).
+    """Return ``(manifest_version, canonical_release_url, error)``.
 
-    A 200 response with no release eligible for the current channel returns
-    ``(None, None, None)``. Transport and top-level payload failures return a
-    non-null error, allowing callers to cache a successful empty result without
-    confusing it with an offline check.
+    Transport, HTTP, JSON, and schema failures return a non-null error. This is
+    important for the cache contract: a damaged or temporarily unreachable
+    moving manifest must preserve the last successful same-scope result rather
+    than masquerade as a successful "no update" lookup.
     """
     if not endpoint:
         return None, None, "endpoint_empty"
@@ -576,8 +637,7 @@ def _fetch_latest_release(
         import httpx
 
         headers = {
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
+            "Accept": "application/json",
             "User-Agent": f"opensquilla/{current_version}",
         }
         with httpx.Client(timeout=timeout, follow_redirects=True) as client:
@@ -589,87 +649,15 @@ def _fetch_latest_release(
         log.debug("Update-check fetch failed: %s", exc)
         return None, None, str(exc)
 
-    channel = _channel_for(current_version)
-    releases: list[object]
-    if isinstance(payload, dict):
-        releases = [payload]
-        strict_single = True
-    elif isinstance(payload, list):
-        releases = list(payload)
-        strict_single = False
-    else:
-        return None, None, "unexpected_payload"
-
-    if channel.kind == "rc":
-        candidate = _select_rc_release(releases, channel)
-    else:
-        candidate = _select_stable_release(releases)
-    if candidate is not None:
-        return candidate[0], candidate[1], None
-    if strict_single:
-        tag = payload.get("tag_name") or payload.get("name")
-        if not isinstance(tag, str) or not tag.strip():
-            return None, None, "missing_tag"
-    return None, None, None
-
-
-def _release_fields(item: object) -> tuple[str, str | None] | None:
-    if not isinstance(item, dict) or item.get("draft") is True:
-        return None
-    tag = item.get("tag_name") or item.get("name")
-    if not isinstance(tag, str) or not tag.strip():
-        return None
-    url = item.get("html_url")
-    return (
-        tag.strip(),
-        url if isinstance(url, str) and url else None,
-    )
-
-
-def _strip_single_v(tag: str) -> str:
-    return tag[1:] if tag.startswith(("v", "V")) else tag
-
-
-def _select_rc_release(
-    releases: list[object], channel: _UpdateChannel
-) -> tuple[str, str | None] | None:
-    if channel.base is None:
-        return None
-    selected: tuple[tuple[int, int], str, str | None] | None = None
-    for item in releases:
-        fields = _release_fields(item)
-        if fields is None:
-            continue
-        tag, url = fields
-        parsed = _parse_rc_version(tag)
-        if parsed is None or parsed[0] != channel.base:
-            continue
-        ordinal = parsed[1]
-        # The final release for the same base outranks every RC.
-        rank = (1, 0) if ordinal is None else (0, ordinal)
-        if selected is None or rank > selected[0]:
-            selected = rank, _strip_single_v(tag), url
-    return (selected[1], selected[2]) if selected is not None else None
-
-
-def _select_stable_release(
-    releases: list[object],
-) -> tuple[str, str | None] | None:
-    selected: tuple[tuple[int, int, int], str, str | None] | None = None
-    for item in releases:
-        if isinstance(item, dict) and item.get("prerelease") is True:
-            continue
-        fields = _release_fields(item)
-        if fields is None:
-            continue
-        tag, url = fields
-        parsed = _parse_rc_version(tag)
-        if parsed is None or parsed[1] is not None:
-            continue
-        base = parsed[0]
-        if selected is None or base > selected[0]:
-            selected = base, _strip_single_v(tag), url
-    return (selected[1], selected[2]) if selected is not None else None
+    try:
+        latest, release_url = _manifest_release(
+            payload,
+            _channel_for(current_version),
+        )
+    except ValueError as exc:
+        log.debug("Update-channel manifest rejected: %s", exc)
+        return None, None, "manifest_invalid"
+    return latest, release_url, None
 
 
 _VERSION_RE = re.compile(r"^(\d+)(?:\.(\d+))?(?:\.(\d+))?(.*)$")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -714,23 +715,27 @@ async def test_workspace_grant_removals_update_user_store(
 
 
 @pytest.mark.asyncio
-async def test_sensitive_mount_is_rejected(tmp_path):
+async def test_credential_named_mount_is_allowed_by_permission_model(tmp_path):
     from opensquilla.sandbox.run_context_service import add_mount_grant
 
     manager = _SessionManager()
     workspace = tmp_path / "workspace"
     workspace.mkdir()
 
-    with pytest.raises(ValueError, match="sensitive_path"):
-        await add_mount_grant(
-            manager,
-            manager.node.session_key,
-            path=str(tmp_path / ".ssh" / "id_rsa"),
-            access="ro",
-            scope="chat",
-            config=_config(),
-            workspace=str(workspace),
-        )
+    target = tmp_path / ".ssh" / "id_rsa"
+    updated = await add_mount_grant(
+        manager,
+        manager.node.session_key,
+        path=str(target),
+        access="ro",
+        scope="chat",
+        config=_config(),
+        workspace=str(workspace),
+    )
+
+    assert [(mount.path, mount.access) for mount in updated.mounts] == [
+        (str(target.resolve(strict=False)), "ro")
+    ]
 
 
 @pytest.mark.asyncio
@@ -769,7 +774,7 @@ async def test_remove_mount_grant_normalizes_caller_path(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path_kind", ["root", "sensitive"])
-async def test_remove_mount_grant_rejects_root_or_sensitive_path_without_mutation(
+async def test_remove_absent_root_or_credential_mount_is_a_noop(
     tmp_path,
     path_kind,
 ):
@@ -797,14 +802,13 @@ async def test_remove_mount_grant_rejects_root_or_sensitive_path_without_mutatio
     origin_before = manager.node.origin
     removal_path = "/" if path_kind == "root" else str(sensitive_path)
 
-    with pytest.raises(ValueError, match="sensitive_path"):
-        await remove_mount_grant(
-            manager,
-            manager.node.session_key,
-            path=removal_path,
-            config=_config(),
-            workspace=str(workspace),
-        )
+    await remove_mount_grant(
+        manager,
+        manager.node.session_key,
+        path=removal_path,
+        config=_config(),
+        workspace=str(workspace),
+    )
 
     assert manager.node.origin is origin_before
     assert manager.node.origin["sandbox_run_context"]["mounts"] == [
@@ -1432,8 +1436,11 @@ async def test_set_workspace_same_normalized_path_is_noop(tmp_path):
         None,
     ],
 )
-async def test_set_run_mode_drops_unsafe_fallback_workspace(tmp_path, workspace_path):
-    from opensquilla.sandbox.run_context import set_run_mode
+async def test_set_run_mode_preserves_name_agnostic_fallback_workspace(
+    tmp_path,
+    workspace_path,
+):
+    from opensquilla.sandbox.run_context import normalize_workspace_path, set_run_mode
     from opensquilla.sandbox.run_mode import RunMode
 
     manager = _SessionManager()
@@ -1451,13 +1458,13 @@ async def test_set_run_mode_drops_unsafe_fallback_workspace(tmp_path, workspace_
         workspace=fallback_workspace,
     )
 
-    assert updated.workspace is None
-    assert manager.node.origin["sandbox_run_context"]["workspace"] is None
+    expected = normalize_workspace_path(fallback_workspace)
+    assert updated.workspace == expected
+    assert manager.node.origin["sandbox_run_context"]["workspace"] == expected
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("workspace_path", ["", "/"])
-async def test_set_workspace_rejects_empty_or_root_paths(tmp_path, workspace_path):
+async def test_set_workspace_rejects_empty_path(tmp_path):
     from opensquilla.sandbox.run_context_service import set_workspace
 
     manager = _SessionManager()
@@ -1466,7 +1473,7 @@ async def test_set_workspace_rejects_empty_or_root_paths(tmp_path, workspace_pat
         await set_workspace(
             manager,
             manager.node.session_key,
-            workspace_path=workspace_path,
+            workspace_path="",
             config=_config(),
             current_workspace=str(tmp_path),
         )
@@ -1496,7 +1503,8 @@ async def test_set_workspace_allows_root_nested_deployment_workspace():
 
 
 @pytest.mark.asyncio
-async def test_set_workspace_rejects_sensitive_root_paths():
+async def test_set_workspace_allows_paths_without_sensitive_name_rules():
+    from opensquilla.sandbox.run_context import normalize_workspace_path
     from opensquilla.sandbox.run_context_service import set_workspace
 
     for workspace_path in (
@@ -1527,32 +1535,31 @@ async def test_set_workspace_rejects_sensitive_root_paths():
         "/root/.opensquilla/workspace/project/.env_secret",
     ):
         manager = _SessionManager()
-        with pytest.raises(ValueError):
-            await set_workspace(
-                manager,
-                manager.node.session_key,
-                workspace_path=workspace_path,
-                config=_config(),
-                current_workspace=None,
-            )
-        assert manager.node.origin is None
+        updated = await set_workspace(
+            manager,
+            manager.node.session_key,
+            workspace_path=workspace_path,
+            config=_config(),
+            current_workspace=None,
+        )
+        assert updated.workspace == normalize_workspace_path(workspace_path)
 
 
 @pytest.mark.asyncio
-async def test_set_workspace_rejects_sensitive_path(tmp_path):
+async def test_set_workspace_allows_credential_named_path(tmp_path):
     from opensquilla.sandbox.run_context_service import set_workspace
 
     manager = _SessionManager()
 
-    with pytest.raises(ValueError, match="sensitive_path"):
-        await set_workspace(
-            manager,
-            manager.node.session_key,
-            workspace_path=str(tmp_path / ".ssh" / "id_rsa"),
-            config=_config(),
-            current_workspace=str(tmp_path),
-        )
-    assert manager.node.origin is None
+    target = tmp_path / ".ssh" / "id_rsa"
+    updated = await set_workspace(
+        manager,
+        manager.node.session_key,
+        workspace_path=str(target),
+        config=_config(),
+        current_workspace=str(tmp_path),
+    )
+    assert updated.workspace == str(target.resolve(strict=False))
 
 
 @pytest.mark.asyncio
@@ -1568,7 +1575,7 @@ async def test_set_workspace_rejects_sensitive_path(tmp_path):
         ("ws", ".env_secret"),
     ],
 )
-async def test_set_workspace_rejects_non_root_sensitive_targets(
+async def test_set_workspace_allows_non_root_credential_named_targets(
     tmp_path,
     workspace_parts,
 ):
@@ -1576,16 +1583,16 @@ async def test_set_workspace_rejects_non_root_sensitive_targets(
 
     manager = _SessionManager()
 
-    with pytest.raises(ValueError, match="sensitive_path"):
-        await set_workspace(
-            manager,
-            manager.node.session_key,
-            workspace_path=str(tmp_path.joinpath(*workspace_parts)),
-            config=_config(),
-            current_workspace=None,
-        )
+    target = tmp_path.joinpath(*workspace_parts)
+    updated = await set_workspace(
+        manager,
+        manager.node.session_key,
+        workspace_path=str(target),
+        config=_config(),
+        current_workspace=None,
+    )
 
-    assert manager.node.origin is None
+    assert updated.workspace == str(target.resolve(strict=False))
 
 
 @pytest.mark.asyncio
@@ -1760,7 +1767,7 @@ async def test_saved_duplicate_bundle_payload_keeps_chat_when_workspace_copy_ign
 
 
 @pytest.mark.asyncio
-async def test_saved_root_workspace_is_dropped(tmp_path):
+async def test_saved_root_workspace_is_preserved(tmp_path):
     from opensquilla.sandbox.run_context import get_run_context
 
     manager = _SessionManager()
@@ -1778,7 +1785,7 @@ async def test_saved_root_workspace_is_dropped(tmp_path):
         workspace=str(tmp_path),
     )
 
-    assert ctx.workspace is None
+    assert ctx.workspace == "/"
 
 
 @pytest.mark.asyncio
@@ -1838,8 +1845,8 @@ async def test_saved_root_nested_workspace_is_allowed():
         "/root/.opensquilla/workspace/project/.env_secret",
     ],
 )
-async def test_saved_sensitive_root_workspace_is_dropped(workspace_path):
-    from opensquilla.sandbox.run_context import get_run_context
+async def test_saved_workspace_is_name_agnostic(workspace_path):
+    from opensquilla.sandbox.run_context import get_run_context, normalize_workspace_path
 
     manager = _SessionManager()
     manager.node.origin = {
@@ -1856,11 +1863,11 @@ async def test_saved_sensitive_root_workspace_is_dropped(workspace_path):
         workspace=None,
     )
 
-    assert ctx.workspace is None
+    assert ctx.workspace == normalize_workspace_path(workspace_path)
 
 
 @pytest.mark.asyncio
-async def test_saved_sensitive_workspace_is_dropped(tmp_path):
+async def test_saved_credential_named_workspace_is_preserved(tmp_path):
     from opensquilla.sandbox.run_context import get_run_context
 
     manager = _SessionManager()
@@ -1878,7 +1885,7 @@ async def test_saved_sensitive_workspace_is_dropped(tmp_path):
         workspace=str(tmp_path),
     )
 
-    assert ctx.workspace is None
+    assert ctx.workspace == str((tmp_path / ".ssh" / "id_rsa").resolve(strict=False))
 
 
 @pytest.mark.asyncio
@@ -1894,7 +1901,7 @@ async def test_saved_sensitive_workspace_is_dropped(tmp_path):
         ("ws", ".env_secret"),
     ],
 )
-async def test_saved_non_root_sensitive_workspace_is_dropped(
+async def test_saved_non_root_credential_named_workspace_is_preserved(
     tmp_path,
     workspace_parts,
 ):
@@ -1915,7 +1922,7 @@ async def test_saved_non_root_sensitive_workspace_is_dropped(
         workspace=None,
     )
 
-    assert ctx.workspace is None
+    assert ctx.workspace == str(tmp_path.joinpath(*workspace_parts).resolve(strict=False))
 
 
 @pytest.mark.asyncio
@@ -1928,7 +1935,7 @@ async def test_saved_non_root_sensitive_workspace_is_dropped(
         ("ws", ".env_secret"),
     ],
 )
-async def test_set_run_mode_drops_non_root_sensitive_fallback_workspace(
+async def test_set_run_mode_preserves_non_root_credential_named_fallback_workspace(
     tmp_path,
     workspace_parts,
 ):
@@ -1945,12 +1952,13 @@ async def test_set_run_mode_drops_non_root_sensitive_fallback_workspace(
         workspace=str(tmp_path.joinpath(*workspace_parts)),
     )
 
-    assert updated.workspace is None
-    assert manager.node.origin["sandbox_run_context"]["workspace"] is None
+    expected = str(tmp_path.joinpath(*workspace_parts).resolve(strict=False))
+    assert updated.workspace == expected
+    assert manager.node.origin["sandbox_run_context"]["workspace"] == expected
 
 
 @pytest.mark.asyncio
-async def test_saved_workspace_mount_origin_grant_is_ignored(tmp_path):
+async def test_saved_workspace_mount_ignores_durable_copy_but_keeps_chat_copy(tmp_path):
     from opensquilla.sandbox.run_context import get_run_context
 
     valid = tmp_path / "outside"
@@ -1973,7 +1981,9 @@ async def test_saved_workspace_mount_origin_grant_is_ignored(tmp_path):
         workspace=str(tmp_path / "workspace"),
     )
 
-    assert ctx.mounts == ()
+    assert [(mount.path, mount.access, mount.scope) for mount in ctx.mounts] == [
+        (str((tmp_path / ".ssh" / "id_rsa").resolve(strict=False)), "ro", "chat")
+    ]
 
 
 @pytest.mark.asyncio
@@ -2044,7 +2054,7 @@ async def test_saved_duplicate_mounts_and_domains_keep_chat_when_workspace_copy_
 
 
 @pytest.mark.asyncio
-async def test_unrelated_mutation_does_not_repersist_unsafe_saved_entries(tmp_path):
+async def test_unrelated_mutation_preserves_permission_valid_saved_entries(tmp_path):
     from opensquilla.sandbox.run_context import get_run_context
     from opensquilla.sandbox.run_context_service import enable_bundle_grant
 
@@ -2076,8 +2086,13 @@ async def test_unrelated_mutation_does_not_repersist_unsafe_saved_entries(tmp_pa
     )
 
     saved = manager.node.origin["sandbox_run_context"]
-    assert saved["workspace"] is None
+    assert saved["workspace"] == "/"
     assert saved["mounts"] == [
+        {
+            "path": str((tmp_path / ".ssh" / "id_rsa").resolve(strict=False)),
+            "access": "ro",
+            "scope": "chat",
+        },
         {"path": str(valid_mount.resolve(strict=False)), "access": "rw", "scope": "chat"}
     ]
     assert saved["domains"] == [

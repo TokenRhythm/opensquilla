@@ -34,12 +34,13 @@ interface ConfigData {
     size?: string
     output_format?: string
     fallbacks?: string[]
-    providers?: Record<string, { api_key_env?: string; base_url?: string }>
+    providers?: Record<string, { api_key?: string; api_key_env?: string; base_url?: string }>
   }
 }
 
 interface StatusData {
   imageGenerationEnabled?: boolean
+  imageGenerationConfigured?: boolean
   imageGenerationProvider?: string
   imageGenerationPrimary?: string
 }
@@ -119,13 +120,58 @@ export interface ImageFormValues {
   fallbacks: string
 }
 
+export type ImageTouchedField = 'apiKey' | 'apiKeyEnv' | 'baseUrl' | 'fallbacks'
+
+interface ImagePayloadOptions {
+  clearFallbacks?: boolean
+}
+
+interface ImageProviderDraft {
+  primary: string
+  apiKeyEnv: string
+  baseUrl: string
+  credentialConfigured: boolean
+  touched: Set<ImageTouchedField>
+}
+
 // Fallbacks are entered as one comma/newline-separated string; split to the
 // provider/model array the backend expects.
 export function parseImageFallbacks(raw: string): string[] {
   return raw
     .split(/[\n,]/)
     .map((s) => s.trim())
+    .map((model) => model === 'openrouter/auto' ? 'openrouter/openrouter/auto' : model)
     .filter(Boolean)
+}
+
+export function imageModelForDisplay(providerId: string, raw: string): string {
+  const provider = providerId.trim()
+  const model = raw.trim()
+  const prefix = provider ? `${provider}/` : ''
+  return prefix && model.startsWith(prefix)
+    ? model.slice(prefix.length).trim()
+    : model
+}
+
+function isCanonicalImageModelRef(providerId: string, raw: string): boolean {
+  const provider = providerId.trim()
+  const model = raw.trim()
+  const prefix = provider ? `${provider}/` : ''
+  if (!prefix || !model.startsWith(prefix)) return false
+
+  const nestedModel = model.slice(prefix.length)
+  // `openrouter/auto` is a valid OpenRouter wire model, not a routing prefix
+  // followed by the local model `auto`. Provider catalogs use a second slash
+  // for canonical OpenRouter references such as `openrouter/google/...`.
+  return provider !== 'openrouter' || nestedModel.includes('/')
+}
+
+export function imageModelRefForPayload(providerId: string, raw: string): string {
+  const provider = providerId.trim()
+  const model = isCanonicalImageModelRef(provider, raw)
+    ? imageModelForDisplay(provider, raw)
+    : raw.trim()
+  return provider && model ? `${provider}/${model}` : ''
 }
 
 export function buildSearchPayload(values: SearchFormValues): Record<string, unknown> {
@@ -150,19 +196,36 @@ export function buildMemoryPayload(values: MemoryFormValues): Record<string, unk
   return params
 }
 
-export function buildImagePayload(values: ImageFormValues): Record<string, unknown> {
+export function buildImagePayload(
+  values: ImageFormValues,
+  touched: ReadonlySet<ImageTouchedField> = new Set(),
+  options: ImagePayloadOptions = {},
+): Record<string, unknown> {
+  const apiKey = values.apiKey.trim()
+  const apiKeyEnv = values.apiKeyEnv.trim()
   const params: Record<string, unknown> = {
-    providerId: values.providerId,
+    providerId: values.providerId.trim(),
     enabled: values.enabled,
   }
-  if (values.primary) params.primary = values.primary
-  if (values.apiKey) params.apiKey = values.apiKey
-  if (values.apiKeyEnv) params.apiKeyEnv = values.apiKeyEnv
-  if (values.baseUrl) params.baseUrl = values.baseUrl
-  if (values.size) params.size = values.size
-  if (values.outputFormat) params.outputFormat = values.outputFormat
-  // Empty array is "keep current" backend-side; send the parsed list either way.
-  params.fallbacks = parseImageFallbacks(values.fallbacks)
+  const primary = imageModelRefForPayload(values.providerId, values.primary)
+  if (primary) params.primary = primary
+  // UI edits keep these mutually exclusive. Prefer the direct key as a final
+  // payload guard if a caller constructs an inconsistent form value.
+  if (touched.has('apiKey')) {
+    params.credentialMode = 'direct'
+    if (apiKey) params.apiKey = apiKey
+  } else if (touched.has('apiKeyEnv')) {
+    params.credentialMode = 'env'
+    if (apiKeyEnv) params.apiKeyEnv = apiKeyEnv
+  }
+  if (touched.has('baseUrl')) params.baseUrl = values.baseUrl.trim()
+  if (values.size.trim()) params.size = values.size.trim()
+  if (values.outputFormat.trim()) params.outputFormat = values.outputFormat.trim()
+  if (touched.has('fallbacks')) {
+    const fallbacks = parseImageFallbacks(values.fallbacks)
+    params.fallbacks = fallbacks
+    if (options.clearFallbacks && fallbacks.length === 0) params.clearFallbacks = true
+  }
   return params
 }
 
@@ -192,6 +255,11 @@ export function useSetupCapabilitiesForm() {
   const imageSize = ref('1024x1024')
   const imageOutputFormat = ref('png')
   const imageFallbacks = ref('')
+  const imageKeyConfigured = ref(false)
+  const imageTouchedFields = ref<Set<ImageTouchedField>>(new Set())
+  const imageGlobalTouchedFields = ref<Set<ImageTouchedField>>(new Set())
+  const imageClearFallbacks = ref(false)
+  const imageProviderDrafts = new Map<string, ImageProviderDraft>()
 
   const searchSerialized = computed(() => JSON.stringify([
     searchProvider.value, searchMaxResults.value, searchApiKey.value, searchApiKeyEnv.value,
@@ -224,6 +292,10 @@ export function useSetupCapabilitiesForm() {
   const searchApiKeyEnvValue = computed(() => searchApiKeyEnv.value)
   const memoryApiKeyEnvValue = computed(() => memoryApiKeyEnv.value)
   const imageApiKeyEnvValue = computed(() => imageApiKeyEnv.value)
+  const imageApiKeyValue = computed(() => imageApiKey.value)
+  const imagePrimaryValue = computed(() => imagePrimary.value)
+  const imageBaseUrlValue = computed(() => imageBaseUrl.value)
+  const imageKeyConfiguredValue = computed(() => imageKeyConfigured.value)
   const memoryRemoteOptionsOpen = computed(() => memoryProvider.value !== 'auto' || Boolean(memoryModel.value || memoryApiKey.value || memoryApiKeyEnv.value || memoryBaseUrl.value))
   const memoryRemoteOptionsSummary = computed(() => i18n.global.t(memoryProvider.value === 'auto' ? 'setup.memory.remoteFallbackOptions' : 'setup.memory.connectionOptions'))
   const memoryModelPlaceholder = computed(() => memoryProvider.value === 'ollama' ? 'nomic-embed-text' : (memoryRemoteControlEnabled.value ? 'remote-embedding-model' : i18n.global.t('setup.memory.notUsedByProvider')))
@@ -259,18 +331,126 @@ export function useSetupCapabilitiesForm() {
 
   function initImageFromConfig(config: ConfigData, status: StatusData, providers: ProviderSpec[]) {
     const imageConfig = config.image_generation || {}
-    const selected = status.imageGenerationProvider || (status.imageGenerationPrimary || '').split('/')[0] || providers[0]?.providerId || 'openrouter'
+    const primaryRef = (status.imageGenerationPrimary || '').trim()
+    const primaryProvider = primaryRef.split('/', 1)[0]
+    const selected = providers.find(p => p.providerId === primaryProvider)?.providerId
+      || providers.find(p => p.providerId === status.imageGenerationProvider)?.providerId
+      || providers[0]?.providerId
+      || 'openrouter'
+    imageProviderDrafts.clear()
+    imageGlobalTouchedFields.value = new Set()
+    imageClearFallbacks.value = false
+    for (const spec of providers) {
+      const providerConfig = (imageConfig.providers || {})[spec.providerId] || {}
+      const configuredPrimary = spec.providerId === primaryProvider ? primaryRef : ''
+      const keyConfigured = Boolean(providerConfig.api_key)
+      // A stored direct key is not the only working credential: a saved env
+      // reference, or the backend-computed status (ambient env, LLM-provider
+      // fallback), also mean image generation works. Never label those
+      // "not configured" — that wording invites clearing a credential that
+      // is actually in use.
+      const credentialConfigured = keyConfigured
+        || Boolean(providerConfig.api_key_env)
+        || (status.imageGenerationConfigured === true
+          && spec.providerId === status.imageGenerationProvider)
+      imageProviderDrafts.set(spec.providerId, {
+        primary: imageModelForDisplay(
+          spec.providerId,
+          configuredPrimary || spec.defaultModel || '',
+        ),
+        apiKeyEnv: keyConfigured
+          ? ''
+          : (providerConfig.api_key_env || (spec.requiresApiKey ? spec.envKey || '' : '')),
+        baseUrl: providerConfig.base_url || spec.defaultBaseUrl || '',
+        credentialConfigured,
+        touched: new Set(),
+      })
+    }
     imageProvider.value = selected
-    imagePrimary.value = status.imageGenerationPrimary || ''
-    const providerConfig = (imageConfig.providers || {})[selected] || {}
-    imageApiKeyEnv.value = providerConfig.api_key_env || ''
-    imageBaseUrl.value = providerConfig.base_url || ''
+    applyImageProviderDraft(
+      imageProviderDrafts.get(selected) || createDefaultImageProviderDraft(
+        providers.find(p => p.providerId === selected),
+      ),
+    )
     imageEnabled.value = status.imageGenerationEnabled !== false
     imageSize.value = imageConfig.size || '1024x1024'
     imageOutputFormat.value = imageConfig.output_format || 'png'
     imageFallbacks.value = (imageConfig.fallbacks || []).join(', ')
-    imageApiKey.value = ''
     imageBaseline.value = imageSerialized.value
+  }
+
+  function createDefaultImageProviderDraft(
+    spec: ProviderSpec | null | undefined,
+  ): ImageProviderDraft {
+    return {
+      primary: imageModelForDisplay(spec?.providerId || '', spec?.defaultModel || ''),
+      apiKeyEnv: spec?.requiresApiKey ? spec.envKey || '' : '',
+      baseUrl: spec?.defaultBaseUrl || '',
+      credentialConfigured: false,
+      touched: new Set(),
+    }
+  }
+
+  function applyImageProviderDraft(draft: ImageProviderDraft) {
+    imagePrimary.value = draft.primary
+    imageApiKey.value = ''
+    imageApiKeyEnv.value = draft.apiKeyEnv
+    imageBaseUrl.value = draft.baseUrl
+    imageKeyConfigured.value = draft.credentialConfigured
+    imageTouchedFields.value = new Set(draft.touched)
+  }
+
+  function saveCurrentImageProviderDraft() {
+    const draft = imageProviderDrafts.get(imageProvider.value)
+    if (!draft) return
+    draft.primary = imagePrimary.value
+    draft.baseUrl = imageBaseUrl.value
+    draft.touched = new Set(imageTouchedFields.value)
+    // A pasted key is write-only and must not survive a provider switch. Keep
+    // the prior env-reference draft when discarding that transient secret.
+    if (imageApiKey.value.trim()) {
+      draft.touched.delete('apiKey')
+      draft.touched.delete('apiKeyEnv')
+    } else {
+      draft.apiKeyEnv = imageApiKeyEnv.value
+    }
+  }
+
+  function switchImageProvider(
+    providerId: string,
+    spec?: ProviderSpec | null,
+  ) {
+    const nextProviderId = providerId.trim()
+    if (!nextProviderId) return
+
+    if (nextProviderId === imageProvider.value) {
+      // The 0.5.0 panel emitted updateField(provider) before the dedicated
+      // provider-change event. The first event now performs the switch; the
+      // second must be harmless while still allowing a pre-init caller to
+      // supply the provider defaults that updateField did not have.
+      if (!imageProviderDrafts.has(nextProviderId)) {
+        const draft = createDefaultImageProviderDraft(spec)
+        imageProviderDrafts.set(nextProviderId, draft)
+        applyImageProviderDraft(draft)
+      }
+      return
+    }
+
+    saveCurrentImageProviderDraft()
+    const draft = imageProviderDrafts.get(nextProviderId)
+      || createDefaultImageProviderDraft(spec)
+    imageProviderDrafts.set(nextProviderId, draft)
+    imageProvider.value = nextProviderId
+    applyImageProviderDraft(draft)
+  }
+
+  function touchImageField(field: ImageTouchedField) {
+    const fields = field === 'fallbacks'
+      ? imageGlobalTouchedFields
+      : imageTouchedFields
+    const next = new Set(fields.value)
+    next.add(field)
+    fields.value = next
   }
 
   function onSearchProviderChange(spec: ProviderSpec | null | undefined) {
@@ -290,9 +470,7 @@ export function useSetupCapabilitiesForm() {
 
   function onImageProviderChange(spec: ProviderSpec | null | undefined) {
     if (!spec) return
-    imageApiKeyEnv.value = spec.requiresApiKey ? (spec.envKey || '') : ''
-    if (!imagePrimary.value) imagePrimary.value = spec.defaultModel || ''
-    if (!imageBaseUrl.value) imageBaseUrl.value = spec.defaultBaseUrl || ''
+    switchImageProvider(spec.providerId, spec)
   }
 
   function updateField(
@@ -320,15 +498,48 @@ export function useSetupCapabilitiesForm() {
       else if (key === 'onnxDir') memoryOnnxDir.value = String(value)
       return
     }
-    if (key === 'provider') imageProvider.value = String(value)
+    if (key === 'provider') switchImageProvider(String(value))
     else if (key === 'primary') imagePrimary.value = String(value)
-    else if (key === 'apiKey') imageApiKey.value = String(value)
-    else if (key === 'apiKeyEnv') imageApiKeyEnv.value = String(value)
-    else if (key === 'baseUrl') imageBaseUrl.value = String(value)
+    else if (key === 'apiKey') {
+      imageApiKey.value = String(value)
+      imageApiKeyEnv.value = ''
+      const next = new Set(imageTouchedFields.value)
+      next.delete('apiKeyEnv')
+      // Blank must mean "keep". A field emptied after typing has to be
+      // indistinguishable from an untouched one: a touched-but-empty key
+      // would send credentialMode 'direct' with no key, which the backend
+      // reads as an authored switch to direct mode and deletes a stored
+      // env reference.
+      if (String(value).trim()) next.add('apiKey')
+      else next.delete('apiKey')
+      imageTouchedFields.value = next
+    } else if (key === 'apiKeyEnv') {
+      imageApiKeyEnv.value = String(value)
+      imageApiKey.value = ''
+      const next = new Set(imageTouchedFields.value)
+      next.delete('apiKey')
+      // Same keep-on-blank rule as the direct key: a touched-but-empty env
+      // reference would author credentialMode 'env', which the backend reads
+      // as a source switch and deletes a stored direct key.
+      if (String(value).trim()) next.add('apiKeyEnv')
+      else next.delete('apiKeyEnv')
+      imageTouchedFields.value = next
+    } else if (key === 'baseUrl') {
+      imageBaseUrl.value = String(value)
+      touchImageField('baseUrl')
+    }
     else if (key === 'enabled') imageEnabled.value = Boolean(value)
     else if (key === 'size') imageSize.value = String(value)
     else if (key === 'outputFormat') imageOutputFormat.value = String(value)
-    else if (key === 'fallbacks') imageFallbacks.value = String(value)
+    else if (key === 'fallbacks') {
+      const nextFallbacks = String(value)
+      const hadFallbacks = parseImageFallbacks(imageFallbacks.value).length > 0
+      const hasFallbacks = parseImageFallbacks(nextFallbacks).length > 0
+      imageFallbacks.value = nextFallbacks
+      if (hasFallbacks) imageClearFallbacks.value = false
+      else if (hadFallbacks) imageClearFallbacks.value = true
+      touchImageField('fallbacks')
+    }
   }
 
   function searchPayload(): Record<string, unknown> {
@@ -356,6 +567,10 @@ export function useSetupCapabilitiesForm() {
   }
 
   function imagePayload(): Record<string, unknown> {
+    const touchedFields = new Set([
+      ...imageTouchedFields.value,
+      ...imageGlobalTouchedFields.value,
+    ])
     return buildImagePayload({
       providerId: imageProvider.value,
       enabled: imageEnabled.value,
@@ -366,7 +581,7 @@ export function useSetupCapabilitiesForm() {
       size: imageSize.value,
       outputFormat: imageOutputFormat.value,
       fallbacks: imageFallbacks.value,
-    })
+    }, touchedFields, { clearFallbacks: imageClearFallbacks.value })
   }
 
   function createPanel(context: CapabilitiesPanelContext) {
@@ -389,6 +604,11 @@ export function useSetupCapabilitiesForm() {
         imageProvider: imageProvider.value,
         imagePrimary: imagePrimary.value,
         imageApiKey: imageApiKey.value,
+        // Whether a working credential already exists for the selected
+        // provider — a persisted write-only key, a saved env reference, or
+        // the backend-computed configured status. Drives the key field's
+        // placeholder/state hint; the key itself is never echoed back.
+        imageKeyConfigured: imageKeyConfigured.value,
         imageApiKeyEnv: imageApiKeyEnv.value,
         imageBaseUrl: imageBaseUrl.value,
         imageEnabled: imageEnabled.value,
@@ -457,6 +677,10 @@ export function useSetupCapabilitiesForm() {
     searchApiKeyEnvValue,
     memoryApiKeyEnvValue,
     imageApiKeyEnvValue,
+    imageApiKeyValue,
+    imagePrimaryValue,
+    imageBaseUrlValue,
+    imageKeyConfiguredValue,
     memoryRemoteOptionsOpen,
     memoryRemoteOptionsSummary,
     memoryModelPlaceholder,

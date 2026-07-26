@@ -12,6 +12,7 @@ import mimetypes
 import re
 import threading
 import time
+import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -24,6 +25,7 @@ from pydantic import BaseModel
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
+from websockets.protocol import State as WebSocketState
 
 from opensquilla.channels._attachment_io import (
     attachment_limit_for_mime,
@@ -41,17 +43,21 @@ from opensquilla.channels._util import (
 from opensquilla.channels.contract import (
     ChannelCapabilities,
     ChannelCapabilityProfile,
-    ChannelPlatformManifest,
+    ChannelLengthUnit,
     ChannelSendResult,
 )
 from opensquilla.channels.transports import InboundEventEnvelope, InboundEventHandler
 from opensquilla.channels.types import (
     Attachment,
+    AuthenticatedPrincipal,
     ChannelHealth,
     IncomingMessage,
+    IngressProvenance,
+    IngressVerification,
     OutgoingMessage,
 )
 from opensquilla.env import trust_env as _trust_env
+from opensquilla.redaction import redact_error_text
 
 log = structlog.get_logger(__name__)
 
@@ -61,11 +67,12 @@ _MARKDOWN_BULLET_RE = re.compile(r"^(\s*)[-*+]\s+")
 _MARKDOWN_BOLD_RE = re.compile(r"(\*\*|__)(.*?)\1")
 _MARKDOWN_INLINE_CODE_RE = re.compile(r"`([^`]+)`")
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
-_FEISHU_WS_STARTUP_TIMEOUT_S = 1.0
-_FEISHU_WS_STARTUP_GRACE_S = 0.05
+_FEISHU_WS_STARTUP_TIMEOUT_S = 15.0
 _FEISHU_WS_JOIN_TIMEOUT_S = 1.0
 _FEISHU_WS_SINGLETON_LOCK = threading.Lock()
 _FEISHU_WS_ACTIVE_TRANSPORT: FeishuWebSocketTransport | None = None
+_FEISHU_API_BASE = "https://open.feishu.cn/open-apis"
+_LARK_API_BASE = "https://open.larksuite.com/open-apis"
 _FEISHU_INBOUND_RESOURCE_DEFAULTS: dict[str, tuple[str, str, str, tuple[str, ...]]] = {
     "image": ("image.png", "image/png", "image", ("image_key",)),
     "file": ("file", "application/octet-stream", "file", ("file_key",)),
@@ -75,7 +82,7 @@ _FEISHU_INBOUND_RESOURCE_DEFAULTS: dict[str, tuple[str, str, str, tuple[str, ...
 }
 
 # Channel-contract constants pinned by the adapter audit.
-CAPABILITY_TIER = "GREEN-shipping"
+CAPABILITY_TIER = "YELLOW-experimental"
 
 # Feishu is a DM/group channel; the permission matrix denies admin-only tools.
 DM_SAFETY_TIERS: tuple[str, ...] = ("safe", "confirm")
@@ -143,6 +150,16 @@ def _is_feishu_image_file(path: Path) -> bool:
     return bool(guessed and guessed.startswith("image/"))
 
 
+def _feishu_delivery_uuid(logical_send_id: Any = None) -> str:
+    """Return a provider-safe idempotency key for one create/reply operation."""
+    raw = str(logical_send_id or "").strip()
+    if not raw:
+        return uuid.uuid4().hex
+    if len(raw) <= 50 and re.fullmatch(r"[A-Za-z0-9_-]+", raw):
+        return raw
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+
 def _verify_feishu_signature(
     encrypt_key: str,
     timestamp: str,
@@ -155,13 +172,28 @@ def _verify_feishu_signature(
     return hmac.compare_digest(expected, signature)
 
 
+def _decrypt_feishu_payload(encrypt_key: str, encrypted: str) -> str:
+    """Decrypt a Feishu callback using the official SDK implementation."""
+    try:
+        from lark_oapi.core.utils import AESCipher  # type: ignore[import-untyped]
+    except ImportError as exc:  # pragma: no cover - base dependency is required
+        raise RuntimeError("Feishu adapter dependency missing — reinstall OpenSquilla") from exc
+    return str(AESCipher(encrypt_key).decrypt_str(encrypted))
+
+
+def _feishu_verification_token(data: dict[str, Any]) -> str:
+    """Read a v1 or v2 callback verification token."""
+    header = data.get("header")
+    if isinstance(header, dict) and header.get("token") is not None:
+        return str(header.get("token") or "")
+    return str(data.get("token") or "")
+
+
 def _import_lark_oapi() -> Any:
     try:
         import lark_oapi as lark  # type: ignore[import-not-found, import-untyped]
     except ImportError as exc:
-        raise RuntimeError(
-            "Feishu adapter dependency missing — reinstall OpenSquilla"
-        ) from exc
+        raise RuntimeError("Feishu adapter dependency missing — reinstall OpenSquilla") from exc
     return lark
 
 
@@ -197,8 +229,60 @@ def _coerce_sdk_event_dict(event: Any, *, lark: Any | None = None) -> dict[str, 
     raise TypeError(f"Unsupported Feishu SDK event object: {type(event)!r}")
 
 
-class FeishuAuthError(Exception):
-    """Raised when Feishu token acquisition or refresh fails."""
+def _feishu_sdk_websocket_state(ws_client: Any | None) -> WebSocketState | None:
+    """Read lark-oapi's current connection state through one compatibility boundary.
+
+    lark-oapi doesn't expose connection health publicly. Keep its private
+    ``_conn`` compatibility boundary in one place and fail closed when either
+    the SDK layout or the websockets state contract isn't recognized.
+    """
+    if ws_client is None:
+        return None
+    try:
+        connection = getattr(ws_client, "_conn")
+        state = getattr(connection, "state")
+    except Exception:
+        return None
+    return state if isinstance(state, WebSocketState) else None
+
+
+def _feishu_sdk_websocket_is_open(ws_client: Any | None) -> bool:
+    """Return whether lark-oapi has a connection proven to be open."""
+    return _feishu_sdk_websocket_state(ws_client) is WebSocketState.OPEN
+
+
+class _FeishuWebSocketRuntimeError(RuntimeError):
+    """Secret-free worker failure carrying the channel diagnostic contract."""
+
+    def __init__(self, diagnostic: dict[str, Any]) -> None:
+        self.diagnostic = dict(diagnostic)
+        super().__init__(str(diagnostic["message"]))
+
+
+class FeishuAuthError(RuntimeError):
+    """Raised when Feishu rejects channel authentication during startup."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        config: Any | None = None,
+        provider_code: str | int | None = None,
+    ) -> None:
+        if isinstance(config, FeishuChannelConfig):
+            message = _redact_feishu_error_text(
+                config,
+                message,
+                fallback="Feishu credentials were rejected",
+            )
+        self.diagnostic: dict[str, str | bool] = {
+            "error_class": "auth_invalid",
+            "message": message,
+            "retryable": False,
+        }
+        if provider_code is not None:
+            self.diagnostic["provider_code"] = str(provider_code)
+        super().__init__(message)
 
 
 class FeishuApiError(Exception):
@@ -216,6 +300,35 @@ class FeishuApiError(Exception):
         super().__init__(msg)
 
 
+def _classify_feishu_websocket_error(error: BaseException) -> tuple[str, bool]:
+    """Classify SDK startup failures without importing its private exception API.
+
+    ``lark-oapi`` raises ``ClientException`` when the long-connection endpoint
+    rejects app credentials (and when credentials are absent). Its transient
+    server failures use distinct exception types, so treating only that SDK
+    exception as terminal prevents an invalid app secret from entering the
+    gateway's automatic retry loop.
+    """
+    if isinstance(error, FeishuAuthError):
+        return "auth_invalid", False
+
+    error_type = type(error)
+    if (
+        error_type.__name__ == "ClientException"
+        and error_type.__module__.startswith("lark_oapi.ws")
+    ):
+        return "auth_invalid", False
+
+    response = getattr(error, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if not isinstance(status_code, int):
+        status_code = getattr(error, "status_code", None)
+    if status_code in {401, 403}:
+        return "auth_invalid", False
+
+    return "transport_transient", True
+
+
 class FeishuChannelConfig(BaseModel):
     """Pydantic config for Feishu channel adapter."""
 
@@ -227,12 +340,37 @@ class FeishuChannelConfig(BaseModel):
     webhook_path: str = "/feishu/events"
     connection_mode: Literal["webhook", "websocket"] = "webhook"
     domain: Literal["feishu", "lark"] = "feishu"
-    api_base: str = "https://open.feishu.cn/open-apis"
+    api_base: str = _FEISHU_API_BASE
     event_dedupe_size: int = 10_000
     token_refresh_margin_s: int = 300
     status_reactions_enabled: bool = False
 
     model_config = {}  # explicit params only; no env loading
+
+
+def _redact_feishu_error_text(
+    config: FeishuChannelConfig,
+    error: BaseException | str,
+    *,
+    additional_secrets: tuple[str, ...] = (),
+    fallback: str = "Feishu channel operation failed",
+) -> str:
+    known_secrets = (
+        config.app_id,
+        config.app_secret,
+        config.encrypt_key,
+        config.verification_token,
+        config.default_chat_id,
+        *additional_secrets,
+    )
+    return (
+        redact_error_text(
+            str(error),
+            max_len=500,
+            known_secrets=known_secrets,
+        )
+        or fallback
+    )
 
 
 @dataclass
@@ -271,7 +409,17 @@ class FeishuWebhookTransport:
 
     async def _handle_webhook(self, request: Request) -> Response:
         body_bytes = await request.body()
-        body_str = body_bytes.decode()
+        try:
+            body_str = body_bytes.decode()
+            outer = json.loads(body_str)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return Response(status_code=400)
+        if not isinstance(outer, dict):
+            return Response(status_code=400)
+
+        if not self.config.encrypt_key and not self.config.verification_token:
+            log.error("feishu.webhook_verification_not_configured")
+            return Response(status_code=503)
 
         if self.config.encrypt_key:
             timestamp = request.headers.get("X-Lark-Request-Timestamp", "")
@@ -286,10 +434,29 @@ class FeishuWebhookTransport:
             ):
                 return Response(status_code=401)
 
-        try:
-            data = json.loads(body_str)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            return Response(status_code=400)
+        data = outer
+        encrypted = outer.get("encrypt")
+        if encrypted is not None:
+            if not self.config.encrypt_key or not isinstance(encrypted, str):
+                return Response(status_code=401)
+            try:
+                decrypted = _decrypt_feishu_payload(self.config.encrypt_key, encrypted)
+                parsed = json.loads(decrypted)
+            except (ValueError, TypeError, UnicodeError):
+                log.warning("feishu.webhook_decrypt_failed")
+                return Response(status_code=401)
+            if not isinstance(parsed, dict):
+                return Response(status_code=400)
+            data = parsed
+
+        if self.config.verification_token:
+            token = _feishu_verification_token(data)
+            if not token or not hmac.compare_digest(
+                self.config.verification_token,
+                token,
+            ):
+                log.warning("feishu.webhook_verification_token_invalid")
+                return Response(status_code=401)
 
         if data.get("type") == "url_verification":
             return JSONResponse({"challenge": data.get("challenge", "")})
@@ -323,8 +490,8 @@ class FeishuWebSocketTransport:
         self._handler: InboundEventHandler | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
-        self._connected = False
-        self._last_error: str | None = None
+        self._has_opened_connection = False
+        self._last_error: dict[str, Any] | None = None
         self._ws_client: Any | None = None
         self._lark: Any | None = None
         self._stop_requested = threading.Event()
@@ -337,52 +504,61 @@ class FeishuWebSocketTransport:
         self._handler = handler
         self._loop = asyncio.get_running_loop()
         self._stop_requested.clear()
+        self._has_opened_connection = False
+        self._last_error = None
 
-        builder = lark.EventDispatcherHandler.builder(
-            self.config.encrypt_key or "",
-            self.config.verification_token or "",
-        ).register_p2_im_message_receive_v1(self._on_message_sync)
-        builder = self._register_optional_event(
-            builder,
-            "register_p2_im_message_message_read_v1",
-            self._ignore_message_read_sync,
-        )
-        for registrar_name, event_type in (
-            ("register_p2_im_chat_member_bot_added_v1", "im.chat.member.bot.added_v1"),
-            ("register_p2_im_chat_member_bot_deleted_v1", "im.chat.member.bot.deleted_v1"),
-            ("register_p2_im_message_reaction_created_v1", "im.message.reaction.created_v1"),
-            ("register_p2_im_message_reaction_deleted_v1", "im.message.reaction.deleted_v1"),
-            ("register_p2_card_action_trigger", "card.action.trigger"),
-        ):
+        try:
+            builder = lark.EventDispatcherHandler.builder(
+                self.config.encrypt_key or "",
+                self.config.verification_token or "",
+            ).register_p2_im_message_receive_v1(self._on_message_sync)
             builder = self._register_optional_event(
                 builder,
-                registrar_name,
-                self._event_callback(event_type),
+                "register_p2_im_message_message_read_v1",
+                self._ignore_message_read_sync,
             )
-        event_handler = builder.build()
+            for registrar_name, event_type in (
+                ("register_p2_im_chat_member_bot_added_v1", "im.chat.member.bot.added_v1"),
+                ("register_p2_im_chat_member_bot_deleted_v1", "im.chat.member.bot.deleted_v1"),
+                ("register_p2_im_message_reaction_created_v1", "im.message.reaction.created_v1"),
+                ("register_p2_im_message_reaction_deleted_v1", "im.message.reaction.deleted_v1"),
+                ("register_p2_card_action_trigger", "card.action.trigger"),
+            ):
+                builder = self._register_optional_event(
+                    builder,
+                    registrar_name,
+                    self._event_callback(event_type),
+                )
+            event_handler = builder.build()
 
-        domain = (
-            getattr(lark, "LARK_DOMAIN", None)
-            if self.config.domain == "lark"
-            else getattr(lark, "FEISHU_DOMAIN", None)
-        )
-        kwargs: dict[str, Any] = {
-            "event_handler": event_handler,
-            "log_level": lark.LogLevel.INFO,
-        }
-        if domain is not None:
-            kwargs["domain"] = domain
+            domain = (
+                getattr(lark, "LARK_DOMAIN", None)
+                if self.config.domain == "lark"
+                else getattr(lark, "FEISHU_DOMAIN", None)
+            )
+            kwargs: dict[str, Any] = {
+                "event_handler": event_handler,
+                "log_level": lark.LogLevel.INFO,
+            }
+            if domain is not None:
+                kwargs["domain"] = domain
 
-        self._ws_client = lark.ws.Client(
-            self.config.app_id,
-            self.config.app_secret,
-            **kwargs,
-        )
-        ws_client = self._ws_client
-        if ws_client is None:
-            raise RuntimeError("Feishu WebSocket client failed to initialize")
+            self._ws_client = lark.ws.Client(
+                self.config.app_id,
+                self.config.app_secret,
+                **kwargs,
+            )
+            ws_client = self._ws_client
+            if ws_client is None:
+                raise RuntimeError("Feishu WebSocket client failed to initialize")
+        except Exception as exc:
+            diagnostic = self._record_error(exc)
+            self._handler = None
+            self._loop = None
+            self._lark = None
+            self._ws_client = None
+            raise _FeishuWebSocketRuntimeError(diagnostic) from None
 
-        startup_event = threading.Event()
         startup_error: list[Exception] = []
 
         def _run() -> None:
@@ -391,28 +567,25 @@ class FeishuWebSocketTransport:
             try:
                 asyncio.set_event_loop(worker_loop)
                 self._bind_sdk_event_loop(worker_loop)
-                self._connected = True
-                startup_event.set()
                 ws_client.start()
                 if not self._stop_requested.is_set():
-                    self._last_error = "Feishu WebSocket client stopped during startup"
+                    diagnostic = self._record_error(
+                        "Feishu WebSocket client stopped unexpectedly"
+                    )
+                    startup_error.append(_FeishuWebSocketRuntimeError(diagnostic))
             except asyncio.CancelledError:
                 if not self._stop_requested.is_set():
-                    startup_error.append(
-                        RuntimeError("Feishu WebSocket client loop was cancelled")
+                    diagnostic = self._record_error(
+                        "Feishu WebSocket client loop was cancelled unexpectedly"
                     )
-                    self._last_error = "Feishu WebSocket client loop was cancelled"
-                    log.warning("feishu.websocket_cancelled")
-                startup_event.set()
+                    startup_error.append(_FeishuWebSocketRuntimeError(diagnostic))
+                    log.warning("feishu.websocket_cancelled", error=diagnostic["message"])
             except Exception as exc:
                 if not self._stop_requested.is_set():
-                    startup_error.append(exc)
-                    log.warning("feishu.websocket_failed", error=str(exc))
-                self._last_error = str(exc)
-                startup_event.set()
+                    diagnostic = self._record_error(exc)
+                    startup_error.append(_FeishuWebSocketRuntimeError(diagnostic))
+                    log.warning("feishu.websocket_failed", error=diagnostic["message"])
             finally:
-                self._connected = False
-                startup_event.set()
                 try:
                     self._unbind_sdk_event_loop(worker_loop)
                     try:
@@ -438,25 +611,34 @@ class FeishuWebSocketTransport:
             self._release_active_client()
             raise
         startup_deadline = time.monotonic() + _FEISHU_WS_STARTUP_TIMEOUT_S
-        while not startup_event.is_set() and time.monotonic() < startup_deadline:
-            await asyncio.sleep(0.01)
-        await asyncio.sleep(_FEISHU_WS_STARTUP_GRACE_S)
-        if startup_error:
-            self._handler = None
-            self._loop = None
-            self._lark = None
-            if self._thread is not None and not self._thread.is_alive():
+        while True:
+            if startup_error:
+                failure = startup_error[0]
+                diagnostic = dict(getattr(failure, "diagnostic", {}))
+                await self.stop()
+                if diagnostic:
+                    self._last_error = diagnostic
+                raise failure
+            if _feishu_sdk_websocket_is_open(ws_client):
+                self._has_opened_connection = True
+                return
+            if self._thread is None or not self._thread.is_alive():
+                self._handler = None
+                self._loop = None
+                self._lark = None
                 self._thread = None
-            raise startup_error[0]
-        if self._thread is not None and not self._thread.is_alive():
-            self._handler = None
-            self._loop = None
-            self._lark = None
-            self._thread = None
-            raise RuntimeError("Feishu WebSocket client stopped during startup")
+                raise RuntimeError("Feishu WebSocket client stopped during startup")
+            if time.monotonic() >= startup_deadline:
+                diagnostic = self._record_error(
+                    "Feishu WebSocket connection did not open during startup",
+                    error_class="transport_transient",
+                    retryable=True,
+                )
+                await self.stop()
+                raise _FeishuWebSocketRuntimeError(diagnostic)
+            await asyncio.sleep(0.01)
 
     async def stop(self) -> None:
-        self._connected = False
         self._stop_requested.set()
         await self._request_sdk_stop()
         thread = self._thread
@@ -466,7 +648,7 @@ class FeishuWebSocketTransport:
                 self._stop_sdk_event_loop()
                 await asyncio.sleep(0.01)
         if thread is not None and thread.is_alive():
-            self._last_error = "Feishu WebSocket worker did not stop within timeout"
+            self._record_error("Feishu WebSocket worker did not stop within timeout")
             self._release_active_client()
             self._thread = None
             self._worker_loop = None
@@ -481,13 +663,59 @@ class FeishuWebSocketTransport:
         self._lark = None
 
     async def health_check(self) -> ChannelHealth:
+        connection_phase = self._connection_phase()
+        extra: dict[str, Any] = {
+            "transport": "websocket",
+            "connection_phase": connection_phase,
+        }
+        if self._last_error is not None:
+            extra["last_error"] = dict(self._last_error)
         return ChannelHealth(
-            connected=self._connected,
-            extra={
-                "transport": "websocket",
-                "last_error": self._last_error,
-            },
+            connected=connection_phase == "open",
+            extra=extra,
         )
+
+    def _connection_phase(self) -> Literal["connecting", "open", "reconnecting", "stopped"]:
+        thread = self._thread
+        if (
+            self._stop_requested.is_set()
+            or thread is None
+            or not thread.is_alive()
+        ):
+            return "stopped"
+        state = _feishu_sdk_websocket_state(self._ws_client)
+        if state is WebSocketState.OPEN:
+            self._has_opened_connection = True
+            return "open"
+        if state is WebSocketState.CLOSING or state is WebSocketState.CLOSED:
+            self._has_opened_connection = True
+        return "reconnecting" if self._has_opened_connection else "connecting"
+
+    def _record_error(
+        self,
+        error: BaseException | str,
+        *,
+        error_class: str | None = None,
+        retryable: bool | None = None,
+    ) -> dict[str, Any]:
+        if error_class is None or retryable is None:
+            inferred_class, inferred_retryable = _classify_feishu_websocket_error(
+                error if isinstance(error, BaseException) else RuntimeError(error)
+            )
+            error_class = error_class or inferred_class
+            retryable = inferred_retryable if retryable is None else retryable
+        message = _redact_feishu_error_text(
+            self.config,
+            error,
+            fallback="Feishu WebSocket transport failed",
+        )
+        diagnostic: dict[str, Any] = {
+            "error_class": error_class,
+            "message": message,
+            "retryable": retryable,
+        }
+        self._last_error = diagnostic
+        return diagnostic
 
     def _on_message_sync(self, event: Any) -> None:
         self._on_event_sync(event, default_event_type="im.message.receive_v1")
@@ -523,8 +751,11 @@ class FeishuWebSocketTransport:
                 received_at=datetime.now(UTC),
             )
         except Exception as exc:
-            self._last_error = str(exc)
-            log.warning("feishu.websocket_event_decode_failed", error=str(exc))
+            diagnostic = self._record_error(exc, error_class="channel_degraded")
+            log.warning(
+                "feishu.websocket_event_decode_failed",
+                error=diagnostic["message"],
+            )
             return
 
         async def _deliver() -> None:
@@ -546,8 +777,8 @@ class FeishuWebSocketTransport:
                 if inspect.isawaitable(result):
                     await result
             except Exception as exc:
-                self._last_error = str(exc)
-                log.warning("feishu.websocket_stop_failed", error=str(exc))
+                diagnostic = self._record_error(exc)
+                log.warning("feishu.websocket_stop_failed", error=diagnostic["message"])
             return
 
         disconnect = getattr(self._ws_client, "_disconnect", None)
@@ -565,8 +796,13 @@ class FeishuWebSocketTransport:
                             timeout=_FEISHU_WS_JOIN_TIMEOUT_S,
                         )
                     except TimeoutError:
-                        self._last_error = "Feishu WebSocket disconnect timed out"
-                        log.warning("feishu.websocket_disconnect_failed", error=self._last_error)
+                        diagnostic = self._record_error(
+                            "Feishu WebSocket disconnect timed out"
+                        )
+                        log.warning(
+                            "feishu.websocket_disconnect_failed",
+                            error=diagnostic["message"],
+                        )
                         future.cancel()
                         self._stop_sdk_event_loop()
                         retry = disconnect()
@@ -581,8 +817,11 @@ class FeishuWebSocketTransport:
             elif hasattr(result, "close"):
                 result.close()
         except Exception as exc:
-            self._last_error = str(exc)
-            log.warning("feishu.websocket_disconnect_failed", error=str(exc))
+            diagnostic = self._record_error(exc)
+            log.warning(
+                "feishu.websocket_disconnect_failed",
+                error=diagnostic["message"],
+            )
         finally:
             self._stop_sdk_event_loop()
 
@@ -613,6 +852,7 @@ class FeishuWebSocketTransport:
         sdk_loop = self._sdk_event_loop()
         if sdk_loop is None or sdk_loop.is_closed():
             return
+
         def _cancel_pending_and_stop() -> None:
             for task in asyncio.all_tasks(sdk_loop):
                 task.cancel()
@@ -662,6 +902,8 @@ class FeishuChannel:
     Outbound messages use Feishu REST API via httpx.
     """
 
+    # ``send_streaming`` intentionally buffers and emits one final message; it
+    # does not expose a live preview that dispatch must later reconcile.
     STREAM_UPDATE_STRATEGY = "final_only"
     startup_timeout_s: ClassVar[float] = 90.0
 
@@ -709,6 +951,9 @@ class FeishuChannel:
     def capability_profile(self) -> ChannelCapabilityProfile:
         return ChannelCapabilityProfile(
             channel_type="feishu",
+            max_message_len=4000,
+            length_unit=ChannelLengthUnit.UTF8_BYTES,
+            splits_natively=False,
             group_chat=True,
             mentions=True,
             native_file_upload=True,
@@ -716,7 +961,11 @@ class FeishuChannel:
             reactions=self.config.status_reactions_enabled,
             outbound_status_reactions=self.config.status_reactions_enabled,
             cards=True,
-            interactive_cards=True,
+            # lark-oapi's long-connection client discards CARD frames before
+            # dispatching them. Advertise text approvals in that mode so users
+            # receive a functional /approve or /deny prompt rather than inert
+            # buttons. Webhook ingress continues to support card callbacks.
+            interactive_cards=self.config.connection_mode == "webhook",
             member_events=True,
             edit=True,
             delete=True,
@@ -726,11 +975,10 @@ class FeishuChannel:
             transports=(self.config.connection_mode,),
         )
 
-    @property
-    def platform_capability_manifest(self) -> ChannelPlatformManifest:
-        from opensquilla.tools.builtin.feishu_platform import build_feishu_platform_manifest
-
-        return build_feishu_platform_manifest()
+    # No explicit platform manifest: the honest boundary derives from the
+    # capability profile. Vendor API surfaces (docs/drive/wiki) are Feishu's
+    # own MCP server and CLI, mounted through the MCP client, not channel
+    # tools — the channel advertises only what the conversation surface does.
 
     @property
     def capabilities(self) -> frozenset[str]:
@@ -742,8 +990,11 @@ class FeishuChannel:
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
+            api_base = self.config.api_base
+            if self.config.domain == "lark" and api_base == _FEISHU_API_BASE:
+                api_base = _LARK_API_BASE
             self._client = httpx.AsyncClient(
-                base_url=self.config.api_base,
+                base_url=api_base,
                 timeout=30.0,
                 trust_env=_trust_env(),
             )
@@ -780,7 +1031,11 @@ class FeishuChannel:
             resp.raise_for_status()
             data = resp.json()
             if data.get("code") != 0:
-                raise FeishuAuthError(data.get("msg", "token refresh failed"))
+                raise FeishuAuthError(
+                    str(data.get("msg", "token refresh failed")),
+                    config=self.config,
+                    provider_code=data.get("code"),
+                )
             self._token_state = _TokenState(
                 token=data["tenant_access_token"],
                 expires_at=now + data["expire"],
@@ -804,6 +1059,16 @@ class FeishuChannel:
             log.info("feishu.started", bot_open_id=self.bot_open_id)
             return
 
+        # Webhook ingress authenticates with the encrypt_key HMAC signature
+        # and/or the verification token; with neither, every request would be
+        # rejected (503) — fail closed at start instead of serving a dead
+        # endpoint.
+        if not self.config.verification_token and not self.config.encrypt_key:
+            raise FeishuAuthError(
+                "Feishu webhook mode requires verification_token or encrypt_key",
+                config=self.config,
+            )
+
         await self._refresh_bot_identity()
         await self._transport.start(self._handle_inbound_event)
         self._connected = True
@@ -818,8 +1083,21 @@ class FeishuChannel:
         )
         resp.raise_for_status()
         data = resp.json()
-        if data.get("code") == 0:
-            self.bot_open_id = data.get("bot", {}).get("open_id")
+        if data.get("code") != 0:
+            raise FeishuApiError(
+                data.get("msg", "bot identity lookup failed"),
+                code=data.get("code"),
+                data=data,
+            )
+        bot = data.get("bot")
+        bot_open_id = bot.get("open_id") if isinstance(bot, dict) else None
+        if not isinstance(bot_open_id, str) or not bot_open_id:
+            raise FeishuApiError(
+                "bot identity lookup returned no open_id",
+                code=data.get("code"),
+                data=data,
+            )
+        self.bot_open_id = bot_open_id
 
     async def _refresh_bot_identity_best_effort(self) -> None:
         try:
@@ -827,7 +1105,25 @@ class FeishuChannel:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log.warning("feishu.bot_identity_lookup_failed", error=str(exc))
+            token = self._token_state.token if self._token_state is not None else ""
+            log.warning(
+                "feishu.bot_identity_lookup_failed",
+                error=_redact_feishu_error_text(
+                    self.config,
+                    exc,
+                    additional_secrets=(token,),
+                    fallback="Feishu bot identity lookup failed",
+                ),
+            )
+
+    async def probe_connection(self) -> dict[str, Any]:
+        """Validate app credentials and bot identity without starting ingress."""
+        await self._refresh_bot_identity()
+        return {
+            "authenticated": True,
+            "bot_open_id": self.bot_open_id or "",
+            "domain": self.config.domain,
+        }
 
     async def stop(self) -> None:
         """Gracefully shut down the channel adapter."""
@@ -846,18 +1142,26 @@ class FeishuChannel:
         log.info("feishu.stopped")
 
     def is_connected(self) -> bool:
-        return self._connected
+        if not self._connected:
+            return False
+        if isinstance(self._transport, FeishuWebSocketTransport):
+            return self._transport._connection_phase() == "open"
+        return True
 
     async def health_check(self) -> ChannelHealth:
         transport_health = await self._transport.health_check()
+        extra: dict[str, Any] = {
+            "transport": self.transport_name,
+            "transport_connected": transport_health.connected,
+        }
+        for key in ("connection_phase", "last_error"):
+            if key in transport_health.extra:
+                extra[key] = transport_health.extra[key]
         return ChannelHealth(
-            connected=self._connected,
+            connected=self._connected and transport_health.connected,
             bot_user_id=self.bot_open_id,
             last_message_at=self._last_message_at,
-            extra={
-                "transport": self.transport_name,
-                "transport_connected": transport_health.connected,
-            },
+            extra=extra,
         )
 
     # ------------------------------------------------------------------
@@ -865,7 +1169,9 @@ class FeishuChannel:
     # ------------------------------------------------------------------
 
     def enqueue(self, message: IncomingMessage) -> None:
-        self._queue.put_nowait(message)
+        from opensquilla.channels.delivery_store import durable_enqueue
+
+        durable_enqueue(self, message, self._queue)
 
     async def receive(self) -> IncomingMessage:
         msg = await self._queue.get()
@@ -891,7 +1197,7 @@ class FeishuChannel:
             return
 
         if envelope.event_type == "im.message.receive_v1":
-            self.enqueue(self.parse_event(envelope.raw))
+            self.enqueue(self._with_event_provenance(self.parse_event(envelope.raw), envelope))
         elif envelope.event_type == "im.chat.member.bot.added_v1":
             chat_id = envelope.raw.get("event", {}).get("chat_id", "unknown")
             log.info(
@@ -923,10 +1229,10 @@ class FeishuChannel:
             )
         elif envelope.event_type == "card.action.trigger":
             if msg := self._parse_approval_card_action(envelope.raw):
-                self.enqueue(msg)
+                self.enqueue(self._with_event_provenance(msg, envelope))
                 return
             if msg := self._parse_clarify_card_action(envelope.raw):
-                self.enqueue(msg)
+                self.enqueue(self._with_event_provenance(msg, envelope))
                 return
             log.info("feishu.card_action_ignored", event_id=envelope.event_id)
         else:
@@ -935,6 +1241,34 @@ class FeishuChannel:
                 event_type=envelope.event_type,
                 event_id=envelope.event_id,
             )
+
+    def _with_event_provenance(
+        self,
+        msg: IncomingMessage,
+        envelope: InboundEventEnvelope,
+    ) -> IncomingMessage:
+        if envelope.source == "feishu:websocket":
+            verification = IngressVerification.SDK_SESSION
+            transport = "websocket"
+        elif self.config.encrypt_key:
+            verification = IngressVerification.WEBHOOK_SIGNATURE
+            transport = "webhook"
+        else:
+            verification = IngressVerification.WEBHOOK_TOKEN
+            transport = "webhook"
+        account_id = str(envelope.raw.get("header", {}).get("app_id") or self.config.app_id)
+        return msg.model_copy(
+            update={
+                "provenance": IngressProvenance(
+                    provider="feishu",
+                    account_id=account_id,
+                    transport=transport,
+                    verification=verification,
+                    event_id=str(envelope.event_id or "") or None,
+                    principal=AuthenticatedPrincipal(subject_id=msg.sender_id),
+                )
+            }
+        )
 
     def _verify_signature(self, timestamp: str, nonce: str, body: str, signature: str) -> bool:
         """Verify Feishu event callback signature."""
@@ -947,7 +1281,18 @@ class FeishuChannel:
         clarify-card contract. The action ``value`` (short code + decision) is
         carried verbatim under ``metadata["approval_action"]`` so the dispatch
         intercept resolves it via the shared ``parse_approval_action`` helper.
+        Chat context embedded in the value at render time (``is_group``/
+        ``chat_type``/``thread_id``, mirroring the clarify card) is projected
+        into metadata so the session key rebuilt from this message matches the
+        originating turn's key — a group-origin approval tapped in that group
+        must not be misread as a DM.
         """
+        from opensquilla.channels.approval_prompt import (
+            DECISION_ALWAYS,
+            DECISION_APPROVE,
+            DECISION_DENY,
+        )
+
         event = raw.get("event", {})
         if not isinstance(event, dict):
             return None
@@ -963,7 +1308,7 @@ class FeishuChannel:
         if not isinstance(code, str) or not code.strip():
             return None
         decision = str(value.get("decision") or "").lower()
-        if decision not in {"approve", "deny"}:
+        if decision not in {DECISION_APPROVE, DECISION_DENY, DECISION_ALWAYS}:
             return None
 
         operator = event.get("operator", {})
@@ -977,18 +1322,40 @@ class FeishuChannel:
             or event.get("chat_id")
             or "unknown"
         )
+        # "always" selects the durable same-type grant; render the universal
+        # text-command spelling so transcripts/audit read the same as a typed
+        # "/approve <code> always".
+        if decision == DECISION_ALWAYS:
+            content = f"/approve {code.strip()} always"
+        else:
+            content = f"/{decision} {code.strip()}"
+        metadata: dict[str, Any] = {
+            "conversation_kind": "interaction",
+            "event_id": raw.get("header", {}).get("event_id"),
+            "message_type": "interactive",
+            "native_chat_id": channel_id,
+            "input_provenance": "approval_card",
+            "approval_action": dict(value),
+        }
+        # Only stamp chat context the card/event actually carries: cards
+        # rendered before this contract existed must keep their previous
+        # (DM-shaped) session key rather than being forced to group.
+        raw_is_group = value.get("is_group")
+        chat_type = value.get("chat_type") or event.get("chat_type")
+        if isinstance(raw_is_group, bool):
+            metadata["is_group"] = raw_is_group
+        elif isinstance(chat_type, str) and chat_type:
+            metadata["is_group"] = chat_type in {"group", "topic_group"}
+        if isinstance(chat_type, str) and chat_type:
+            metadata["chat_type"] = chat_type
+        thread_id = value.get("thread_id")
+        if isinstance(thread_id, str) and thread_id:
+            metadata["native_thread_id"] = thread_id
         return IncomingMessage(
             sender_id=sender_id,
             channel_id=channel_id,
-            content=f"/{decision} {code.strip()}",
-            metadata={
-                "conversation_kind": "interaction",
-                "event_id": raw.get("header", {}).get("event_id"),
-                "message_type": "interactive",
-                "native_chat_id": channel_id,
-                "input_provenance": "approval_card",
-                "approval_action": dict(value),
-            },
+            content=content,
+            metadata=metadata,
         )
 
     def _parse_clarify_card_action(self, raw: dict[str, Any]) -> IncomingMessage | None:
@@ -1324,8 +1691,17 @@ class FeishuChannel:
                 data=data,
             )
 
-    async def send_text(self, chat_id: str, content: str) -> str:
+    async def send_text(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        request_uuid: str | None = None,
+    ) -> str:
         """Send a text message to a chat/open_id and return Feishu message_id."""
+        chat_id = str(chat_id or "").strip()
+        if not chat_id:
+            raise ValueError("feishu.send_text: chat target is required")
         await self._rate_limiter.acquire()
         headers = await self._auth_headers()
         client = self._get_client()
@@ -1337,7 +1713,11 @@ class FeishuChannel:
         }
         resp = await retry_request(
             client.post,
-            f"/im/v1/messages?receive_id_type={receive_id_type}",
+            "/im/v1/messages",
+            params={
+                "receive_id_type": receive_id_type,
+                "uuid": _feishu_delivery_uuid(request_uuid),
+            },
             json=payload,
             headers=headers,
         )
@@ -1346,7 +1726,13 @@ class FeishuChannel:
         self._raise_api_error(data, "send failed")
         return str(data.get("data", {}).get("message_id", ""))
 
-    async def reply_text(self, message_id: str, content: str) -> str:
+    async def reply_text(
+        self,
+        message_id: str,
+        content: str,
+        *,
+        request_uuid: str | None = None,
+    ) -> str:
         """Reply to a Feishu message and return the reply message_id."""
         await self._rate_limiter.acquire()
         headers = await self._auth_headers()
@@ -1354,6 +1740,7 @@ class FeishuChannel:
         resp = await retry_request(
             client.post,
             f"/im/v1/messages/{message_id}/reply",
+            params={"uuid": _feishu_delivery_uuid(request_uuid)},
             json={
                 "msg_type": "text",
                 "content": json.dumps({"text": _normalize_outbound_text(content)}),
@@ -1382,12 +1769,20 @@ class FeishuChannel:
         return payload if isinstance(payload, dict) else {}
 
     async def send(self, message: OutgoingMessage) -> None:
+        request_uuid = _feishu_delivery_uuid(message.metadata.get("delivery_id"))
         reply_message_id = message.metadata.get("reply_message_id")
         if isinstance(reply_message_id, str) and reply_message_id:
-            await self.reply_text(reply_message_id, message.content)
+            await self.reply_text(
+                reply_message_id,
+                message.content,
+                request_uuid=request_uuid,
+            )
             log.debug("feishu.reply", message_id=reply_message_id)
             return
         chat_id = message.reply_to or self.config.default_chat_id
+        chat_id = str(chat_id or "").strip()
+        if not chat_id:
+            raise ValueError("feishu.send: chat target is required")
 
         if message.metadata.get("card"):
             await self._rate_limiter.acquire()
@@ -1403,7 +1798,11 @@ class FeishuChannel:
             payload["content"] = json.dumps(message.metadata["card"])
             resp = await retry_request(
                 client.post,
-                f"/im/v1/messages?receive_id_type={receive_id_type}",
+                "/im/v1/messages",
+                params={
+                    "receive_id_type": receive_id_type,
+                    "uuid": request_uuid,
+                },
                 json=payload,
                 headers=headers,
             )
@@ -1411,7 +1810,11 @@ class FeishuChannel:
             data = resp.json()
             self._raise_api_error(data, "send failed")
         else:
-            await self.send_text(chat_id, message.content)
+            await self.send_text(
+                chat_id,
+                message.content,
+                request_uuid=request_uuid,
+            )
         log.debug("feishu.send", chat_id=chat_id)
 
     async def send_file(
@@ -1421,6 +1824,9 @@ class FeishuChannel:
         file_type: str = "file",
     ) -> ChannelSendResult:
         """Upload and send a file to a Feishu chat."""
+        chat_id = str(chat_id or "").strip()
+        if not chat_id:
+            raise ValueError("feishu.send_file: chat target is required")
         await self._rate_limiter.acquire()
         headers = await self._auth_headers()
         client = self._get_client()
@@ -1468,7 +1874,11 @@ class FeishuChannel:
         }
         resp = await retry_request(
             client.post,
-            f"/im/v1/messages?receive_id_type={receive_id_type}",
+            "/im/v1/messages",
+            params={
+                "receive_id_type": receive_id_type,
+                "uuid": _feishu_delivery_uuid(),
+            },
             json=payload,
             headers=headers,
         )

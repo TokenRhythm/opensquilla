@@ -36,6 +36,7 @@
             :placeholder="placeholder"
             maxlength="100000"
             :aria-label="t('chat.messageToSend')"
+            :aria-describedby="sendBlockedMessage ? 'chat-composer-image-send-status' : undefined"
             @beforeinput="emit('beforeinput', $event)"
             @input="emit('input', $event)"
             @keydown="emit('keydown', $event)"
@@ -151,17 +152,34 @@
                 </button>
               </div>
             </Transition>
-            <button class="btn btn--icon btn--primary chat-send-btn" :class="{ 'is-ready': hasSendContent }" :title="sendButtonTitle" :aria-label="t('chat.send')" @click="emit('send')">
+            <button
+              class="btn btn--icon btn--primary chat-send-btn"
+              :class="{ 'is-ready': hasSendContent && !sendBlockedMessage }"
+              :title="sendBlockedMessage || sendButtonTitle"
+              :aria-label="t('chat.send')"
+              :aria-describedby="sendBlockedMessage ? 'chat-composer-image-send-status' : undefined"
+              :disabled="Boolean(sendBlockedMessage)"
+              @click="emit('send')"
+            >
               <Icon name="arrowUp" :size="17" />
             </button>
             <Transition name="composer-ctl">
-              <button v-if="isStreaming" class="btn btn--icon btn--danger chat-send-btn" :title="t('chat.stopResponseEsc')" :aria-label="t('chat.stopResponse')" @click="emit('stop')">
+              <button v-if="canStop" class="btn btn--icon btn--danger chat-send-btn" :title="t('chat.stopResponseEsc')" :aria-label="t('chat.stopResponse')" @click="emit('stop')">
                 <Icon name="stop" :size="16" />
               </button>
             </Transition>
           </div>
         </div>
       </div>
+      <p
+        v-if="sendBlockedMessage"
+        id="chat-composer-image-send-status"
+        class="chat-composer-send-status"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+      >{{ sendBlockedMessage }}</p>
+      <p class="chat-ai-disclaimer" role="note">{{ t('chat.aiDisclaimer') }}</p>
     </div>
     <input
       ref="fileInputEl"
@@ -198,9 +216,11 @@ defineProps<{
   busySendMode: 'queue' | 'steer'
   hasSendContent: boolean
   isStreaming: boolean
+  canStop: boolean
   isNewLanding: boolean
   placeholder: string
   sendButtonTitle: string
+  sendBlockedMessage?: string
   runMode: SandboxRunMode
   allowedRunModes: SandboxRunMode[]
   modelRoutingMode: ModelRoutingMode
@@ -407,6 +427,22 @@ defineExpose<ChatComposerExpose>({
 
 .chat-composer--new-landing .chat-composer-inner {
   width: 100%;
+}
+
+.chat-ai-disclaimer {
+  margin: 0.5rem 0 0;
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  text-align: center;
+}
+
+.chat-composer-send-status {
+  margin: 0.5rem 0 0;
+  color: var(--warning, var(--text-muted));
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  text-align: center;
 }
 
 .chat-attachments {

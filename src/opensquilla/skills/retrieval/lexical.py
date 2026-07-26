@@ -7,6 +7,7 @@ fused with the semantic layer in fusion.rrf.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -23,6 +24,22 @@ def _skill_id(skill: SkillSpec) -> str:
     keyed by `name`; the getattr matches the existing convention at
     engine/steps/skills_filter.py:79 in case `id` is added later."""
     return getattr(skill, "id", None) or skill.name
+
+
+def _skill_cache_fingerprint(skill: SkillSpec) -> str:
+    """Return a stable cache key for retrieval-relevant skill metadata.
+
+    Fusion continues to address skills by name, but the indexes must also be
+    rebuilt when an existing skill changes the text used for retrieval.
+    """
+    payload = "\0".join(
+        (
+            _stringify(skill.name),
+            _stringify(skill.description),
+            _stringify(skill.triggers),
+        )
+    ).encode("utf-8")
+    return f"{_skill_id(skill)}:{hashlib.sha256(payload).hexdigest()}"
 
 
 def _stringify(value: object) -> str:

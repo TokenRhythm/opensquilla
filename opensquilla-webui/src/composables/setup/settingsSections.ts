@@ -15,15 +15,13 @@ export const SETTINGS_SECTIONS = [
   // Connect and never enters the dirty bar, so it is excluded from save/discard.
   { id: 'connection', label: 'Connection', icon: 'home', client: false, desktopOnly: false, group: 'gateway' },
   // Runtime is desktop-only: the owned local gateway's status, log, restart, and
-  // reset. It is client-like (no readiness/RPC state, never dirty) and hidden on
+  // update controls. It is client-like (no readiness/RPC state, never dirty) and hidden on
   // web, where the host does not own a gateway process.
   { id: 'runtime', label: 'Runtime', icon: 'monitor', client: true, desktopOnly: true, group: 'gateway' },
   // --- AI configuration: Model Service -> Model Routing ---
   { id: 'provider', label: 'Model Service', icon: 'agents', client: false, desktopOnly: false, group: 'ai' },
   { id: 'modelStrategy', label: 'Model Routing', icon: 'router', client: false, desktopOnly: false, group: 'ai' },
   { id: 'capabilities', label: 'Capabilities', icon: 'skills', client: false, desktopOnly: false, group: 'capabilities' },
-  // --- Delivery: where the assistant reaches users ---
-  { id: 'channels', label: 'Channels', icon: 'channels', client: false, desktopOnly: false, group: 'delivery' },
   // --- Preferences: assistant behaviour + local app settings ---
   { id: 'behavior', label: 'Behavior', icon: 'chat', client: false, desktopOnly: false, group: 'preferences' },
   { id: 'privacy', label: 'Privacy', icon: 'shield', client: false, desktopOnly: false, group: 'preferences' },
@@ -35,5 +33,12 @@ export const SETTINGS_SECTIONS = [
   { id: 'advanced', label: 'Advanced', icon: 'gauge', client: true, desktopOnly: false, group: 'preferences' },
 ] as const
 
-export type SettingsSectionId = (typeof SETTINGS_SECTIONS)[number]['id']
+// Data maintenance is a nested Advanced destination rather than a first-level
+// rail tab. Keep its stable route id here so existing deep links continue to
+// resolve without making the destination prominent in Settings navigation.
+export const NESTED_SETTINGS_SECTION_IDS = ['dataMigration'] as const
+
+export type SettingsRailSectionId = (typeof SETTINGS_SECTIONS)[number]['id']
+export type NestedSettingsSectionId = (typeof NESTED_SETTINGS_SECTION_IDS)[number]
+export type SettingsSectionId = SettingsRailSectionId | NestedSettingsSectionId
 export type SettingsSectionGroup = (typeof SETTINGS_SECTIONS)[number]['group']

@@ -1,15 +1,67 @@
-import { nextTick, watch, type Ref } from 'vue'
+import { computed, nextTick, onUnmounted, ref, watch, type Ref } from 'vue'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 
 const FOCUSABLE = [
-  'button:not([disabled])',
-  'a[href]',
-  'input:not([disabled])',
-  'textarea:not([disabled])',
-  'select:not([disabled])',
-  'summary',
+  'button:not([disabled]):not([tabindex="-1"])',
+  'a[href]:not([tabindex="-1"])',
+  'input:not([disabled]):not([tabindex="-1"])',
+  'textarea:not([disabled]):not([tabindex="-1"])',
+  'select:not([disabled]):not([tabindex="-1"])',
+  'summary:not([tabindex="-1"])',
   '[tabindex]:not([tabindex="-1"])',
 ].join(', ')
+
+// Dialogs can nest transiently (for example, a discard confirmation opened
+// from the provider catalog). Keep one module-wide LIFO stack so only the
+// visually topmost dialog owns Escape and Tab. Component mount order is not a
+// reliable proxy: ConfirmModal is mounted globally before Settings dialogs.
+const openDialogStack: symbol[] = []
+const openDialogVersion = ref(0)
+
+function registerOpenDialog(token: symbol) {
+  const existing = openDialogStack.indexOf(token)
+  if (existing >= 0) openDialogStack.splice(existing, 1)
+  openDialogStack.push(token)
+  openDialogVersion.value += 1
+}
+
+function unregisterOpenDialog(token: symbol): boolean {
+  const existing = openDialogStack.indexOf(token)
+  if (existing < 0) return false
+  const wasTopmost = existing === openDialogStack.length - 1
+  openDialogStack.splice(existing, 1)
+  openDialogVersion.value += 1
+  return wasTopmost
+}
+
+/** True while any modal/drawer layer has registered global keyboard ownership. */
+export function hasOpenDialogLayer(): boolean {
+  return openDialogStack.length > 0
+}
+
+/**
+ * Register a component that already owns its own focus/Escape implementation in
+ * the same LIFO stack as useDialogA11y. The returned ref lets that implementation
+ * act only while it is visually topmost.
+ */
+export function useDialogLayer(isOpen: Ref<boolean>) {
+  const token = Symbol('dialog-layer')
+  const isTopmost = computed(() => {
+    // The stack is intentionally a small module-local array, but custom layer
+    // ownership is reactive: opening a layer above an already-evaluated one
+    // must invalidate its cached computed value immediately.
+    void openDialogVersion.value
+    return isOpen.value && openDialogStack[openDialogStack.length - 1] === token
+  })
+
+  watch(isOpen, (open) => {
+    if (open) registerOpenDialog(token)
+    else unregisterOpenDialog(token)
+  }, { immediate: true, flush: 'sync' })
+
+  onUnmounted(() => unregisterOpenDialog(token))
+  return isTopmost
+}
 
 interface DialogA11yOptions {
   // Element to focus when the dialog opens. Defaults to the first focusable
@@ -30,11 +82,15 @@ export function useDialogA11y(
   onClose: () => void,
   options: DialogA11yOptions = {},
 ) {
+  const dialogToken = Symbol('dialog-a11y')
   let invokerEl: HTMLElement | null = null
 
   function onKeydown(event: KeyboardEvent) {
+    if (event.defaultPrevented) return
     if (!isOpen.value) return
+    if (openDialogStack[openDialogStack.length - 1] !== dialogToken) return
     if (event.key === 'Escape') {
+      event.stopPropagation()
       event.preventDefault()
       onClose()
       return
@@ -62,6 +118,7 @@ export function useDialogA11y(
   watch(isOpen, (open, wasOpen) => {
     if (open && !wasOpen) {
       invokerEl = document.activeElement instanceof HTMLElement ? document.activeElement : null
+      registerOpenDialog(dialogToken)
       void nextTick(() => {
         const target = options.initialFocus?.value
           ?? rootRef.value?.querySelector<HTMLElement>(FOCUSABLE)
@@ -69,8 +126,14 @@ export function useDialogA11y(
         target?.focus()
       })
     } else if (!open && wasOpen) {
-      if (invokerEl && document.contains(invokerEl)) invokerEl.focus()
+      const wasTopmost = unregisterOpenDialog(dialogToken)
+      if (wasTopmost && invokerEl && document.contains(invokerEl)) invokerEl.focus()
       invokerEl = null
     }
+  }, { immediate: true })
+
+  onUnmounted(() => {
+    unregisterOpenDialog(dialogToken)
+    invokerEl = null
   })
 }

@@ -471,6 +471,7 @@
         stepProfile: 'Profile', stepGateway: 'Gateway', stepControl: 'Control',
         errorTitle: 'Startup needs attention',
         errorDefault: 'The gateway did not finish starting.',
+        profileInUse: 'The previous Gateway has not exited. Wait for it to finish, or quit every OpenSquilla app or terminal using this profile, then try again. If it will not exit, restart the computer. Do not delete profile lock files.',
         revealLog: 'Reveal log', resetSetup: 'Reset setup', quit: 'Quit', retry: 'Retry',
         startupPaused: 'Startup paused',
         resetConfirm: 'Reset desktop setup? This clears the saved provider credential and reopens onboarding. Your workspace path, identity, memory, and chat history are kept.',
@@ -498,6 +499,7 @@
         stepProfile: '配置', stepGateway: '网关', stepControl: '控制',
         errorTitle: '启动需要处理',
         errorDefault: '网关未能完成启动。',
+        profileInUse: '上一个网关尚未退出。请等待其结束，或退出所有正在使用此配置的 OpenSquilla 应用和终端后重试；若仍无法退出，请重启电脑。不要删除配置锁文件。',
         revealLog: '显示日志', resetSetup: '重新配置', quit: '退出', retry: '重试',
         startupPaused: '启动已暂停',
         resetConfirm: '要重置桌面设置吗？这会清除已保存的提供商凭据并重新进入引导。工作区路径、身份、记忆和聊天记录都会保留。',
@@ -525,6 +527,7 @@
         stepProfile: 'プロファイル', stepGateway: 'ゲートウェイ', stepControl: 'コントロール',
         errorTitle: '起動の確認が必要です',
         errorDefault: 'ゲートウェイの起動が完了しませんでした。',
+        profileInUse: '前のゲートウェイがまだ終了していません。終了を待つか、このプロファイルを使用しているすべての OpenSquilla アプリとターミナルを終了してから再試行してください。終了しない場合はコンピューターを再起動してください。プロファイルのロックファイルは削除しないでください。',
         revealLog: 'ログを表示', resetSetup: '設定をリセット', quit: '終了', retry: '再試行',
         startupPaused: '起動を一時停止しました',
         resetConfirm: 'デスクトップ設定をリセットしますか？保存済みのプロバイダー認証情報を消去してオンボーディングを再開します。ワークスペースのパス、ID、メモリ、チャット履歴は保持されます。',
@@ -552,6 +555,7 @@
         stepProfile: 'Profil', stepGateway: 'Passerelle', stepControl: 'Contrôle',
         errorTitle: 'Le démarrage nécessite votre attention',
         errorDefault: 'La passerelle n\'a pas terminé son démarrage.',
+        profileInUse: 'La passerelle précédente n’est pas terminée. Attendez sa fermeture, ou quittez toutes les applications et tous les terminaux OpenSquilla utilisant ce profil, puis réessayez. Si elle ne se ferme pas, redémarrez l’ordinateur. Ne supprimez pas les fichiers de verrouillage du profil.',
         revealLog: 'Afficher le journal', resetSetup: 'Réinitialiser', quit: 'Quitter', retry: 'Réessayer',
         startupPaused: 'Démarrage en pause',
         resetConfirm: 'Réinitialiser la configuration du bureau ? Cela efface les identifiants du fournisseur et relance l’onboarding. Le chemin de l’espace de travail, l’identité, la mémoire et l’historique des discussions sont conservés.',
@@ -579,6 +583,7 @@
         stepProfile: 'Profil', stepGateway: 'Gateway', stepControl: 'Control',
         errorTitle: 'Der Start erfordert Ihre Aufmerksamkeit',
         errorDefault: 'Das Gateway hat den Start nicht abgeschlossen.',
+        profileInUse: 'Das vorherige Gateway wurde noch nicht beendet. Warten Sie, bis es beendet ist, oder schließen Sie alle OpenSquilla-Apps und -Terminals, die dieses Profil verwenden, und versuchen Sie es erneut. Falls es nicht beendet wird, starten Sie den Computer neu. Löschen Sie keine Profilsperrdateien.',
         revealLog: 'Protokoll anzeigen', resetSetup: 'Zurücksetzen', quit: 'Beenden', retry: 'Wiederholen',
         startupPaused: 'Start angehalten',
         resetConfirm: 'Desktop-Einrichtung zurücksetzen? Die gespeicherten Anbieter-Zugangsdaten werden gelöscht und das Onboarding wird neu geöffnet. Arbeitsbereichspfad, Identität, Speicher und Chatverlauf bleiben erhalten.',
@@ -606,6 +611,7 @@
         stepProfile: 'Perfil', stepGateway: 'Pasarela', stepControl: 'Control',
         errorTitle: 'El inicio necesita atención',
         errorDefault: 'La pasarela no terminó de iniciarse.',
+        profileInUse: 'La pasarela anterior aún no ha terminado. Espera a que se cierre o sal de todas las aplicaciones y terminales de OpenSquilla que usen este perfil y vuelve a intentarlo. Si no se cierra, reinicia el equipo. No elimines los archivos de bloqueo del perfil.',
         revealLog: 'Mostrar registro', resetSetup: 'Restablecer', quit: 'Salir', retry: 'Reintentar',
         startupPaused: 'Inicio en pausa',
         resetConfirm: '¿Restablecer la configuración de escritorio? Esto borra la credencial del proveedor y vuelve a abrir la configuración inicial. Se conservan la ruta del espacio de trabajo, la identidad, la memoria y el historial de chat.',
@@ -700,7 +706,10 @@
     }
 
     function applyError(payload) {
-      const message = payload && payload.message ? String(payload.message) : msg.errorDefault;
+      const rawMessage = payload && payload.message ? String(payload.message) : msg.errorDefault;
+      const message = rawMessage.includes('OPENSQUILLA_PROFILE_IN_USE')
+        ? msg.profileInUse
+        : rawMessage;
       phase.textContent = msg.startupPaused;
       errorMessage.textContent = message;
       errorPanel.classList.add('visible');
@@ -852,12 +861,33 @@
         if (result && result.ok === false) {
           throw new Error(String(result.detail || result.error || msg.errorDefault));
         }
-        await api.retryStartup();
+        await retryStartup();
       } catch (err) {
         const message = err && err.message ? err.message : String(err);
         phase.textContent = msg.startupPaused;
         errorMessage.textContent = `${msg.resetFailed}: ${message}`;
         errorPanel.classList.add('visible');
+      }
+    }
+
+    let retryStartupInFlight = false;
+    async function retryStartup() {
+      if (!api || typeof api.retryStartup !== 'function' || retryStartupInFlight) return null;
+      const retryButton = document.getElementById('retry');
+      retryStartupInFlight = true;
+      retryButton.disabled = true;
+      try {
+        const result = await api.retryStartup();
+        if (result && result.ok === false) {
+          applyError({ message: result.error || msg.errorDefault });
+        }
+        return result;
+      } catch (error) {
+        applyError({ message: error && error.message ? error.message : String(error) });
+        return null;
+      } finally {
+        retryStartupInFlight = false;
+        retryButton.disabled = false;
       }
     }
 
@@ -881,7 +911,7 @@
         else if (state && state.error) applyError(state.error);
         else applyStatus(state && state.status ? state.status : null);
       }).catch(() => applyStatus(null));
-      document.getElementById('retry').addEventListener('click', () => api.retryStartup());
+      document.getElementById('retry').addEventListener('click', () => retryStartup());
       document.getElementById('revealLog').addEventListener('click', () => api.revealGatewayLog());
       document.getElementById('quit').addEventListener('click', () => api.quitApp());
       const resetButton = document.getElementById('resetSetup');

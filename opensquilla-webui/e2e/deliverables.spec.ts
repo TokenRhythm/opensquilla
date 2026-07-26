@@ -1,4 +1,4 @@
-import { test, expect, type Page } from '@playwright/test'
+import { test, expect, type Locator, type Page } from '@playwright/test'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2edeliverables'
@@ -66,19 +66,39 @@ async function openSeededSession(page: Page, key: string, withArtifacts: boolean
   await page.waitForSelector('.chat-header', { timeout: 10000 })
 }
 
+async function deliverablesTrigger(page: Page): Promise<Locator> {
+  await expect(page.locator('.msg-artifact-chip').first()).toBeVisible({ timeout: 10000 })
+
+  const directAction = page.getByTestId('chat-session-action-deliverables')
+  if (await directAction.isVisible()) return directAction
+
+  const primaryAction = page.getByTestId('chat-header-primary-action')
+  if (await primaryAction.isVisible()
+    && await primaryAction.getAttribute('data-action') === 'deliverables') {
+    return primaryAction
+  }
+
+  await page.getByTestId('chat-session-actions-trigger').click()
+  const menuAction = page.getByTestId('chat-session-action-deliverables')
+  await expect(menuAction).toBeVisible()
+  return menuAction
+}
+
 test.describe('Per-session deliverables drawer', () => {
   test('trigger is hidden when the session has no artifacts', async ({ page }) => {
     await openSeededSession(page, EMPTY_SESSION_KEY, false)
     await expect(page.locator('.msg-ai-main').last()).toBeVisible({ timeout: 10000 })
-    await expect(page.locator('.chat-deliverables-btn')).toHaveCount(0)
+    await expect(page.getByTestId('chat-session-action-deliverables')).toHaveCount(0)
+    await expect(page.locator('[data-testid="chat-header-primary-action"][data-action="deliverables"]'))
+      .toHaveCount(0)
   })
 
   test('trigger opens the drawer with dialog a11y and lists every deliverable', async ({ page }) => {
     await openSeededSession(page, SESSION_KEY, true)
 
-    const trigger = page.locator('.chat-deliverables-btn')
+    const trigger = await deliverablesTrigger(page)
     await expect(trigger).toBeVisible({ timeout: 10000 })
-    await expect(trigger).toContainText('Deliverables (2)')
+    await expect(trigger).toHaveAccessibleName('Deliverables (2)')
 
     await trigger.click()
 
@@ -105,22 +125,25 @@ test.describe('Per-session deliverables drawer', () => {
   test('Escape closes the drawer and returns focus to the trigger', async ({ page }) => {
     await openSeededSession(page, SESSION_KEY, true)
 
-    const trigger = page.locator('.chat-deliverables-btn')
+    const trigger = await deliverablesTrigger(page)
+    const invokedFromMenu = await trigger.evaluate(element =>
+      Boolean(element.closest('[data-testid="chat-session-actions-menu"]')))
+    const focusTarget = invokedFromMenu
+      ? page.getByTestId('chat-session-actions-trigger')
+      : trigger
     await trigger.click()
     await expect(page.locator('.deliv-drawer')).toBeVisible()
 
     await page.keyboard.press('Escape')
     await expect(page.locator('.deliv-drawer')).toHaveCount(0)
 
-    const triggerFocused = await page.evaluate(() =>
-      document.activeElement?.classList.contains('chat-deliverables-btn') === true)
-    expect(triggerFocused).toBe(true)
+    await expect(focusTarget).toBeFocused()
   })
 
   test('non-image deliverable opens a metadata preview with a download action', async ({ page }) => {
     await openSeededSession(page, SESSION_KEY, true)
 
-    await page.locator('.chat-deliverables-btn').click()
+    await (await deliverablesTrigger(page)).click()
     await page.locator('.deliv-tile').first().click()
 
     const preview = page.locator('.deliv-preview')
@@ -139,7 +162,7 @@ test.describe('Per-session deliverables drawer', () => {
     await page.setViewportSize({ width: 375, height: 667 })
     await openSeededSession(page, SESSION_KEY, true)
 
-    await page.locator('.chat-deliverables-btn').click()
+    await (await deliverablesTrigger(page)).click()
     const drawer = page.locator('.deliv-drawer')
     await expect(drawer).toBeVisible()
 

@@ -147,7 +147,7 @@ async def test_router_configure_recommended_profile(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_router_configure_accepts_tier_overrides_and_syncs_llm_model(
+async def test_router_configure_accepts_tier_overrides_without_rebinding_direct_model(
     tmp_path,
     monkeypatch,
 ):
@@ -177,10 +177,10 @@ async def test_router_configure_accepts_tier_overrides_and_syncs_llm_model(
     )
 
     assert res.error is None, res.error
-    assert ctx.config.llm.model == "gpt-5.5-custom"
+    assert ctx.config.llm.model == "gpt-5.4-mini"
     assert ctx.config.squilla_router.default_tier == "c2"
     persisted = tomllib.loads((tmp_path / "c.toml").read_text())
-    assert persisted["llm"]["model"] == "gpt-5.5-custom"
+    assert persisted["llm"]["model"] == "gpt-5.4-mini"
     assert persisted["squilla_router"]["tiers"]["c2"]["model"] == "gpt-5.5-custom"
     assert persisted["squilla_router"]["tiers"]["image_model"]["supports_image"] is True
 
@@ -259,6 +259,72 @@ async def test_router_configure_persists_cross_provider_tiers(tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_router_configure_mixed_default_preserves_primary_deployment(
+    tmp_path,
+    monkeypatch,
+):
+    """A foreign default tier must not become the primary fallback model."""
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(tmp_path / "c.toml"))
+    from opensquilla.gateway.config import GatewayConfig
+
+    sync_calls: list[object] = []
+
+    class FakeSelector:
+        def sync_primary(self, provider_config):
+            sync_calls.append(provider_config)
+
+    ctx = _admin_ctx()
+    ctx.config = GatewayConfig(
+        llm={"provider": "dashscope", "model": "qwen3.7-plus"}
+    )
+    ctx.config.config_path = str(tmp_path / "c.toml")
+    ctx.provider_selector = FakeSelector()
+
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "onboarding.router.configure",
+        {
+            "mode": "custom",
+            "defaultTier": "c0",
+            "crossProviderTiers": True,
+            "tierProviderMismatch": "veto",
+            "tiers": {
+                "c0": {
+                    "provider": "volcengine",
+                    "model": "doubao-seed-1-6-251015",
+                },
+                "c1": {"provider": "dashscope", "model": "qwen3.7-plus"},
+                "c2": {"provider": "dashscope", "model": "qwen3.7-plus"},
+                "c3": {"provider": "dashscope", "model": "qwen3.7-plus"},
+            },
+        },
+        ctx,
+    )
+
+    assert res.error is None, res.error
+    assert ctx.config.squilla_router.default_tier == "c0"
+    assert ctx.config.squilla_router.tiers["c0"]["provider"] == "volcengine"
+    assert (
+        ctx.config.squilla_router.tiers["c0"]["model"]
+        == "doubao-seed-1-6-251015"
+    )
+    assert ctx.config.llm.provider == "dashscope"
+    assert ctx.config.llm.model == "qwen3.7-plus"
+    assert len(sync_calls) == 1
+    assert sync_calls[0].provider == "dashscope"
+    assert sync_calls[0].model == "qwen3.7-plus"
+
+    persisted = tomllib.loads((tmp_path / "c.toml").read_text())
+    assert persisted["llm"]["provider"] == "dashscope"
+    assert persisted["llm"]["model"] == "qwen3.7-plus"
+    assert persisted["squilla_router"]["default_tier"] == "c0"
+    assert (
+        persisted["squilla_router"]["tiers"]["c0"]["model"]
+        == "doubao-seed-1-6-251015"
+    )
+
+
+@pytest.mark.asyncio
 async def test_router_configure_rejects_image_model_as_default_tier(
     tmp_path,
     monkeypatch,
@@ -289,7 +355,10 @@ async def test_provider_configure_recomputes_existing_router_profile(tmp_path, m
     ctx = _admin_ctx()
     ctx.config = GatewayConfig(
         llm={"provider": "deepseek", "model": "deepseek-chat"},
-        squilla_router={"tier_profile": "deepseek"},
+        squilla_router={
+            "tier_profile": "deepseek",
+            "preset_binding": "follow_primary",
+        },
     )
     ctx.config.config_path = str(tmp_path / "c.toml")
 
@@ -318,7 +387,10 @@ async def test_provider_configure_recomputes_openrouter_mix_router(tmp_path, mon
     from opensquilla.gateway.config import GatewayConfig
 
     ctx = _admin_ctx()
-    ctx.config = GatewayConfig(llm={"provider": "openrouter", "model": "deepseek/x"})
+    ctx.config = GatewayConfig(
+        llm={"provider": "openrouter", "model": "deepseek/x"},
+        squilla_router={"preset_binding": "follow_primary"},
+    )
     ctx.config.config_path = str(tmp_path / "c.toml")
 
     res = await get_dispatcher().dispatch(
@@ -531,7 +603,8 @@ async def test_channel_probe_validates_and_redacts_without_persisting(tmp_path, 
         _admin_ctx(),
     )
     assert res.error is None, res.error
-    assert res.payload["status"] in {"ready", "action_needed"}
+    assert res.payload["status"] == "validated"
+    assert res.payload["probeKind"] == "local_validation"
     assert res.payload["entry"]["token"] == "***"
     assert "123:secret" not in str(res.payload)
     assert not target.exists()
@@ -592,6 +665,242 @@ async def test_image_generation_configure_redacts_api_key(tmp_path, monkeypatch)
         == "openrouter/google/gemini-3.1-flash-image-preview"
     )
     assert data["image_generation"]["providers"]["openrouter"]["api_key"] == "sk-or"
+
+
+@pytest.mark.asyncio
+async def test_image_generation_configure_accepts_exact_legacy_direct_key_payload(
+    tmp_path,
+    monkeypatch,
+):
+    from opensquilla.gateway.config import GatewayConfig
+
+    target = tmp_path / "c.toml"
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    ctx = _admin_ctx()
+    ctx.config = GatewayConfig(config_path=str(target))
+    dispatcher = get_dispatcher()
+
+    public = await dispatcher.dispatch("r0", "config.get", {}, ctx)
+    assert public.error is None, public.error
+    provider = public.payload["image_generation"]["providers"]["openrouter"]
+    # The 0.5.0 form hydrates the default env name, does not clear it when a
+    # direct key is entered, and always emits the fallback array.
+    legacy_payload = {
+        "providerId": "openrouter",
+        "primary": "openrouter/google/gemini-3.1-flash-image-preview",
+        "apiKey": "sk-legacy-direct",
+        "apiKeyEnv": provider["api_key_env"],
+        "baseUrl": provider["base_url"],
+        "fallbacks": [],
+    }
+
+    res = await dispatcher.dispatch(
+        "r1",
+        "onboarding.imageGeneration.configure",
+        legacy_payload,
+        ctx,
+    )
+
+    assert res.error is None, res.error
+    assert ctx.config.image_generation.providers.openrouter.api_key == "sk-legacy-direct"
+    assert ctx.config.image_generation.providers.openrouter.api_key_env == ""
+    assert res.payload["entry"]["api_key_source"] == "explicit"
+
+
+@pytest.mark.asyncio
+async def test_image_generation_configure_normalizes_0_5_0_provider_switch_payload(
+    tmp_path,
+    monkeypatch,
+):
+    from opensquilla.gateway.config import GatewayConfig
+
+    target = tmp_path / "c.toml"
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    ctx = _admin_ctx()
+    ctx.config = GatewayConfig(config_path=str(target))
+    dispatcher = get_dispatcher()
+
+    public = await dispatcher.dispatch("r0", "config.get", {}, ctx)
+    assert public.error is None, public.error
+    image_config = public.payload["image_generation"]
+    # In 0.5.0, changing only the provider updates the env field but leaves
+    # the previous provider's non-empty default model and endpoint in place.
+    legacy_switch_payload = {
+        "providerId": "openrouter",
+        "primary": image_config["primary"],
+        "apiKey": "sk-legacy-switch",
+        "apiKeyEnv": image_config["providers"]["openrouter"]["api_key_env"],
+        "baseUrl": image_config["providers"]["openai"]["base_url"],
+        "enabled": True,
+        "fallbacks": [],
+    }
+
+    res = await dispatcher.dispatch(
+        "r1",
+        "onboarding.imageGeneration.configure",
+        legacy_switch_payload,
+        ctx,
+    )
+
+    assert res.error is None, res.error
+    image_config = ctx.config.image_generation
+    assert image_config.primary == "openrouter/google/gemini-3.1-flash-image-preview"
+    provider = image_config.providers.openrouter
+    assert provider.api_key == "sk-legacy-switch"
+    assert provider.api_key_env == ""
+    assert provider.base_url == "https://openrouter.ai/api/v1"
+
+
+@pytest.mark.asyncio
+async def test_image_generation_configure_normalizes_custom_0_5_0_provider_switch_payload(
+    tmp_path,
+    monkeypatch,
+):
+    from opensquilla.gateway.config import GatewayConfig
+
+    target = tmp_path / "c.toml"
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    ctx = _admin_ctx()
+    ctx.config = GatewayConfig(
+        config_path=str(target),
+        image_generation={
+            "enabled": True,
+            "primary": "openai/custom-image-model",
+            "fallbacks": ["openai/gpt-image-1"],
+            "providers": {
+                "openai": {"base_url": "https://images.example.test/v1"},
+            },
+        },
+    )
+    dispatcher = get_dispatcher()
+
+    # 0.5.0 keeps all source-provider fields after changing the provider. The
+    # target env name is the only field its change handler replaces.
+    legacy_switch_payload = {
+        "providerId": "openrouter",
+        "primary": "openai/custom-image-model",
+        "apiKey": "sk-legacy-switch",
+        "apiKeyEnv": "OPENROUTER_API_KEY",
+        "baseUrl": "https://images.example.test/v1",
+        "enabled": True,
+        "fallbacks": ["openai/gpt-image-1"],
+    }
+
+    res = await dispatcher.dispatch(
+        "r1",
+        "onboarding.imageGeneration.configure",
+        legacy_switch_payload,
+        ctx,
+    )
+
+    assert res.error is None, res.error
+    image_config = ctx.config.image_generation
+    assert image_config.primary == "openrouter/google/gemini-3.1-flash-image-preview"
+    assert image_config.fallbacks == ["openai/gpt-image-1"]
+    provider = image_config.providers.openrouter
+    assert provider.api_key == "sk-legacy-switch"
+    assert provider.base_url == "https://openrouter.ai/api/v1"
+
+
+@pytest.mark.asyncio
+async def test_image_generation_legacy_config_get_resave_preserves_direct_key_and_fallbacks(
+    tmp_path,
+    monkeypatch,
+):
+    from opensquilla.gateway.config import GatewayConfig
+
+    target = tmp_path / "c.toml"
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    ctx = _admin_ctx()
+    ctx.config = GatewayConfig(
+        config_path=str(target),
+        image_generation={
+            "enabled": True,
+            "primary": "openrouter/google/gemini-3.1-flash-image-preview",
+            "fallbacks": ["openai/gpt-image-1"],
+            "providers": {
+                "openrouter": {
+                    "api_key": "sk-stored-direct",
+                    "api_key_env": "OPENROUTER_API_KEY",
+                }
+            },
+        },
+    )
+    dispatcher = get_dispatcher()
+
+    public = await dispatcher.dispatch("r0", "config.get", {}, ctx)
+    assert public.error is None, public.error
+    provider = public.payload["image_generation"]["providers"]["openrouter"]
+    assert provider["api_key"] == "[redacted]"
+    legacy_payload = {
+        "providerId": "openrouter",
+        "primary": public.payload["image_generation"]["primary"],
+        # The write-only 0.5.0 key field stays blank, so apiKey is omitted.
+        "apiKeyEnv": provider["api_key_env"],
+        "baseUrl": provider["base_url"],
+        "fallbacks": [],
+    }
+
+    res = await dispatcher.dispatch(
+        "r1",
+        "onboarding.imageGeneration.configure",
+        legacy_payload,
+        ctx,
+    )
+
+    assert res.error is None, res.error
+    assert ctx.config.image_generation.providers.openrouter.api_key == "sk-stored-direct"
+    assert ctx.config.image_generation.fallbacks == ["openai/gpt-image-1"]
+    assert res.payload["entry"]["api_key_source"] == "explicit"
+
+
+@pytest.mark.asyncio
+async def test_image_generation_configure_replaces_direct_key_and_resets_optional_fields(
+    tmp_path,
+    monkeypatch,
+):
+    target = tmp_path / "c.toml"
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
+    first = await get_dispatcher().dispatch(
+        "r1",
+        "onboarding.imageGeneration.configure",
+        {
+            "providerId": "openrouter",
+            "primary": "openrouter/google/gemini-3.1-flash-image-preview",
+            "apiKey": "sk-direct",
+            "baseUrl": "https://images.example.test/v1",
+            "fallbacks": ["openai/gpt-image-1"],
+        },
+        _admin_ctx(),
+    )
+    assert first.error is None, first.error
+
+    second = await get_dispatcher().dispatch(
+        "r1",
+        "onboarding.imageGeneration.configure",
+        {
+            "providerId": "openrouter",
+            "primary": "openrouter/google/gemini-3.1-flash-image-preview",
+            "apiKeyEnv": "OPENSQUILLA_TEST_IMAGE_KEY",
+            "credentialMode": "env",
+            "baseUrl": "",
+            "fallbacks": [],
+            "clearFallbacks": True,
+        },
+        _admin_ctx(),
+    )
+    assert second.error is None, second.error
+
+    data = tomllib.loads(target.read_text())
+    provider = data["image_generation"]["providers"]["openrouter"]
+    assert provider.get("api_key", "") == ""
+    assert provider["api_key_env"] == "OPENSQUILLA_TEST_IMAGE_KEY"
+    assert provider["base_url"] == "https://openrouter.ai/api/v1"
+    assert data["image_generation"]["fallbacks"] == []
 
 
 @pytest.mark.asyncio
@@ -689,6 +998,56 @@ async def test_image_generation_configure_can_disable_without_visible_key(
 
 
 @pytest.mark.asyncio
+async def test_image_generation_configure_can_disable_legacy_invalid_config(
+    tmp_path,
+    monkeypatch,
+):
+    from opensquilla.gateway.config import GatewayConfig
+
+    target = tmp_path / "c.toml"
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
+    ctx = _admin_ctx()
+    ctx.config = GatewayConfig(
+        config_path=str(target),
+        image_generation={
+            "enabled": True,
+            "primary": "openrouter/google//image",
+            "fallbacks": ["openai/"],
+            "providers": {
+                "openrouter": {
+                    "api_key": "sk-synthetic-image",
+                    "base_url": "not-a-url",
+                }
+            },
+        },
+    )
+
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "onboarding.imageGeneration.configure",
+        {
+            "providerId": "openrouter",
+            "primary": "openrouter/google//image",
+            "baseUrl": "not-a-url",
+            "fallbacks": ["openai/"],
+            "enabled": False,
+        },
+        ctx,
+    )
+
+    assert res.error is None, res.error
+    assert ctx.config.image_generation.enabled is False
+    data = tomllib.loads(target.read_text())
+    assert data["image_generation"]["enabled"] is False
+    assert data["image_generation"]["primary"] == "openrouter/google//image"
+    assert data["image_generation"]["fallbacks"] == ["openai/"]
+    assert (
+        data["image_generation"]["providers"]["openrouter"]["base_url"]
+        == "not-a-url"
+    )
+
+
+@pytest.mark.asyncio
 async def test_onboarding_status_requires_image_generation_enable_for_llm_fallback(
     tmp_path,
     monkeypatch,
@@ -708,6 +1067,40 @@ async def test_onboarding_status_requires_image_generation_enable_for_llm_fallba
     assert res.payload["imageGenerationEnabled"] is False
     assert res.payload["imageGenerationSource"] == "none"
     assert res.payload["imageGenerationProvider"] == ""
+
+
+@pytest.mark.asyncio
+async def test_onboarding_status_marks_legacy_image_endpoint_mismatch_degraded(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(tmp_path / "c.toml"))
+    from opensquilla.gateway.config import GatewayConfig
+
+    ctx = _read_ctx()
+    ctx.config = GatewayConfig()
+    ctx.config.image_generation.enabled = True
+    ctx.config.image_generation.primary = (
+        "openrouter/google/gemini-3.1-flash-image-preview"
+    )
+    openrouter_provider = ctx.config.image_generation.providers.openrouter
+    openrouter_provider.api_key = "sk-synthetic-image"
+    openrouter_provider.base_url = "https://api.openai.com/v1"
+
+    res = await get_dispatcher().dispatch("r1", "onboarding.status", {}, ctx)
+
+    assert res.error is None, res.error
+    assert res.payload["sections"]["image_generation"] == "degraded"
+    assert res.payload["imageGenerationConfigured"] is False
+    assert res.payload["imageGenerationEnabled"] is True
+    assert res.payload["imageGenerationProvider"] == "openrouter"
+    assert res.payload["imageGenerationSource"] == "explicit"
+    detail = res.payload["sectionDetails"]["image_generation"]
+    assert detail["actionRequired"] is True
+    assert detail["blocking"] is False
+    assert detail["detail"] == (
+        "openrouter (endpoint/provider mismatch: configured openai official endpoint)"
+    )
 
 
 @pytest.mark.asyncio
@@ -1030,6 +1423,9 @@ async def test_provider_configure_does_not_persist_runtime_api_key(tmp_path, mon
     ctx.config.config_path = str(target)
     ctx.config.llm.provider = "openrouter"
     ctx.config.llm.model = "m1"
+    # Leave base_url at the provider default so a model-only resave stays on
+    # the same endpoint origin and the runtime-cached key is reused.
+    ctx.config.llm.base_url = ""
     ctx.config.llm.api_key = "from-env"
     ctx.config.mark_runtime_secret("llm.api_key")
 
@@ -1170,6 +1566,96 @@ async def test_provider_configure_syncs_env_key_to_provider_selector(tmp_path, m
 
 
 @pytest.mark.asyncio
+async def test_provider_configure_refreshes_shared_live_catalog_before_return(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(tmp_path / "c.toml"))
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.provider.model_catalog import ModelCatalog, set_shared_catalog
+
+    fetches: list[str] = []
+
+    async def fake_fetch(url: str, shape: str, **kwargs) -> dict:
+        fetches.append(url)
+        return {
+            "qwen3.7-max": {
+                "context_window": 1_000_000,
+                "max_output_tokens": 131_072,
+            }
+        }
+
+    monkeypatch.setattr(
+        "opensquilla.provider.live_catalog.fetch_live_catalog_entries",
+        fake_fetch,
+    )
+    catalog = ModelCatalog()
+    set_shared_catalog(catalog)
+    ctx = _admin_ctx()
+    ctx.config = GatewayConfig()
+    ctx.config.config_path = str(tmp_path / "c.toml")
+
+    try:
+        res = await get_dispatcher().dispatch(
+            "r1",
+            "onboarding.provider.configure",
+            {
+                "providerId": "tokenrhythm",
+                "model": "qwen3.7-max",
+                "apiKey": "dummy-tokenrhythm-key",
+            },
+            ctx,
+        )
+
+        assert res.error is None, res.error
+        assert fetches == ["https://tokenrhythm.studio/api/models"]
+        assert catalog.resolve_entry("qwen3.7-max", provider="tokenrhythm").source == "live"
+        assert catalog.resolve_max_tokens("qwen3.7-max", provider="tokenrhythm") == 131_072
+    finally:
+        set_shared_catalog(None)
+
+
+@pytest.mark.asyncio
+async def test_provider_configure_survives_live_catalog_failure(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(tmp_path / "c.toml"))
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.provider.model_catalog import ModelCatalog, set_shared_catalog
+
+    async def failing_fetch(*args, **kwargs) -> dict:
+        raise OSError("synthetic catalog outage")
+
+    monkeypatch.setattr(
+        "opensquilla.provider.live_catalog.fetch_live_catalog_entries",
+        failing_fetch,
+    )
+    catalog = ModelCatalog()
+    set_shared_catalog(catalog)
+    ctx = _admin_ctx()
+    ctx.config = GatewayConfig()
+    ctx.config.config_path = str(tmp_path / "c.toml")
+
+    try:
+        res = await get_dispatcher().dispatch(
+            "r1",
+            "onboarding.provider.configure",
+            {
+                "providerId": "tokenrhythm",
+                "model": "qwen3.7-max",
+                "apiKey": "dummy-tokenrhythm-key",
+            },
+            ctx,
+        )
+
+        assert res.error is None, res.error
+        assert ctx.config.llm.provider == "tokenrhythm"
+        assert catalog.resolve_max_tokens("qwen3.7-max", provider="tokenrhythm") == 131_072
+        assert catalog.resolve_entry("qwen3.7-max", provider="tokenrhythm").source == "corrections"
+    finally:
+        set_shared_catalog(None)
+
+
+@pytest.mark.asyncio
 async def test_channel_disable_then_remove(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(tmp_path / "c.toml"))
     d = get_dispatcher()
@@ -1260,3 +1746,140 @@ async def test_models_discover_unverified_provider_stays_empty_without_build(
         "source": "none",
         "models": [],
     }
+
+
+@pytest.fixture()
+def _clean_channels_reconciler():
+    from opensquilla.gateway.channels_bridge import reset_channels_reconciler
+
+    reset_channels_reconciler()
+    yield
+    reset_channels_reconciler()
+
+
+@pytest.mark.asyncio
+async def test_channel_upsert_applies_live_when_reconciler_succeeds(
+    tmp_path, monkeypatch, _clean_channels_reconciler
+):
+    from opensquilla.gateway.channels_bridge import register_channels_reconciler
+
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(tmp_path / "c.toml"))
+    calls: list[int] = []
+
+    async def _reconciler() -> dict[str, str]:
+        calls.append(1)
+        return {"w": "started"}
+
+    register_channels_reconciler(_reconciler)
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "onboarding.channel.upsert",
+        {
+            "entry": {
+                "type": "slack",
+                "name": "w",
+                "token": "supersecret",
+                "signing_secret": "signing-secret",
+                "app_token": "xapp-token",
+            }
+        },
+        _admin_ctx(),
+    )
+    assert res.error is None, res.error
+    assert calls == [1]
+    # Applied live: nothing waits on a restart, and the outcome is itemized.
+    assert res.payload["restartRequired"] is False
+    assert res.payload["liveApply"] == {"w": "started"}
+
+
+@pytest.mark.asyncio
+async def test_channel_upsert_stays_restart_gated_for_webhook_outcomes(
+    tmp_path, monkeypatch, _clean_channels_reconciler
+):
+    from opensquilla.gateway.channels_bridge import register_channels_reconciler
+
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(tmp_path / "c.toml"))
+
+    async def _reconciler() -> dict[str, str]:
+        return {"w": "pending_restart"}
+
+    register_channels_reconciler(_reconciler)
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "onboarding.channel.upsert",
+        {
+            "entry": {
+                "type": "slack",
+                "name": "w",
+                "token": "supersecret",
+                "signing_secret": "signing-secret",
+            }
+        },
+        _admin_ctx(),
+    )
+    assert res.error is None, res.error
+    assert res.payload["restartRequired"] is True
+    assert res.payload["liveApply"] == {"w": "pending_restart"}
+
+
+@pytest.mark.asyncio
+async def test_channel_upsert_failed_start_does_not_flag_restart(
+    tmp_path, monkeypatch, _clean_channels_reconciler
+):
+    # A bad entry is not fixed by restarting: it stays visible through
+    # channels.status start errors and is retried via channels.restart.
+    from opensquilla.gateway.channels_bridge import register_channels_reconciler
+
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(tmp_path / "c.toml"))
+
+    async def _reconciler() -> dict[str, str]:
+        return {"w": "failed"}
+
+    register_channels_reconciler(_reconciler)
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "onboarding.channel.upsert",
+        {
+            "entry": {
+                "type": "slack",
+                "name": "w",
+                "token": "supersecret",
+                "signing_secret": "signing-secret",
+            }
+        },
+        _admin_ctx(),
+    )
+    assert res.error is None, res.error
+    assert res.payload["restartRequired"] is False
+    assert res.payload["liveApply"] == {"w": "failed"}
+
+
+@pytest.mark.asyncio
+async def test_channel_remove_degrades_honestly_when_reconciler_raises(
+    tmp_path, monkeypatch, _clean_channels_reconciler
+):
+    from opensquilla.gateway.channels_bridge import register_channels_reconciler
+
+    config_path = tmp_path / "c.toml"
+    config_path.write_text(
+        '[[channels.channels]]\ntype = "slack"\nname = "w"\n'
+        'token = "supersecret"\nsigning_secret = "ss"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(config_path))
+
+    async def _reconciler() -> dict[str, str]:
+        raise RuntimeError("manager exploded")
+
+    register_channels_reconciler(_reconciler)
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "onboarding.channel.remove",
+        {"name": "w"},
+        _admin_ctx(),
+    )
+    # Config change persisted and applied; the live swap failed, so the
+    # response falls back to the pre-reconcile restart contract.
+    assert res.error is None, res.error
+    assert res.payload["restartRequired"] is True
+    assert res.payload["liveApply"] is None

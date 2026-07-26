@@ -56,6 +56,9 @@ export interface RawSessionItem {
   title?: string
   subtitle?: string
   groupLabel?: string
+  workspace?: string
+  workspaceLabel?: string
+  workspaceDisplayPath?: string
   updatedAt?: number | string
   updated_at?: number | string
   lastActivityAt?: number | string
@@ -156,12 +159,16 @@ export interface ArtifactPayload {
   [key: string]: unknown
 }
 
-export interface SessionEventPayload {
+export interface StreamEventEnvelope {
   key?: string
   session_key?: string
   sessionKey?: string
   epoch?: number
   stream_seq?: number
+  [key: string]: unknown
+}
+
+export interface SessionEventPayload extends StreamEventEnvelope {
   task_id?: string
   taskId?: string
   reason?: string
@@ -169,6 +176,7 @@ export interface SessionEventPayload {
   run_status?: string
   runStatus?: string
   terminal_message?: string
+  terminal_reason?: string
   message?: string
   code?: string
   group_id?: string
@@ -177,6 +185,50 @@ export interface SessionEventPayload {
   active_task?: RawSessionTask | null
   last_task?: RawSessionTask | null
   [key: string]: unknown
+}
+
+export interface WarningPayload extends SessionEventPayload {
+  message?: string
+  code?: string
+}
+
+export interface CronResultMessagePayload {
+  role?: string
+  text?: string
+  timestamp?: string | number | null
+  messageId?: string
+  message_id?: string
+  provenanceKind?: string
+  provenanceSourceTool?: string
+  provenanceSourceSessionKey?: string
+}
+
+export type CronResultPayload = StreamEventEnvelope & {
+  message?: CronResultMessagePayload
+}
+
+export interface SubagentCompletionPayload extends SessionEventPayload {
+  type?: 'subagent_completion'
+  parent_session_key?: string
+  child_session_key?: string
+  status?: string
+  terminal_reason?: string
+  message_id?: string
+  messageId?: string
+  result?: { text?: string; [key: string]: unknown }
+}
+
+export interface ApprovalStatusPayload {
+  found?: boolean
+  id?: string
+  namespace?: string
+  pending?: boolean
+  resolved?: boolean
+  approved?: boolean
+  resolution?: string
+  resolutionInProgress?: boolean
+  consumed?: boolean
+  deadline?: number
 }
 
 export interface TextDeltaPayload extends SessionEventPayload {
@@ -230,6 +282,8 @@ export interface SessionMessagesSubscribeResponse extends SessionEventPayload {
   subscribed?: boolean
   replay_complete?: boolean
   current_stream_seq?: number
+  active_task_group_ids?: string[]
+  activeTaskGroupIds?: string[]
 }
 
 export interface ChatSendAttachmentPayload {
@@ -243,6 +297,10 @@ export interface ChatSendAttachmentPayload {
 export interface ChatSendParams {
   message: string
   sessionKey: string
+  /** Stable idempotency key for one logical send attempt. */
+  clientRequestId?: string
+  /** Stable client identity for reconciling the optimistic user row. */
+  clientMessageId?: string
   _source?: { elevated?: string; runMode?: 'standard' | 'trusted' | 'full' }
   intent?: string
   forkBeforeMessageId?: string
@@ -253,8 +311,20 @@ export interface ChatSendParams {
 
 export interface ChatSendResponse {
   sessionKey?: string
+  message_id?: string
+  user_message_id?: string
+  client_message_id?: string
+  clientMessageId?: string
   task_id?: string
   taskId?: string
+  replayed?: boolean
+  task_status?: string
+  taskStatus?: string
+  terminal_reason?: string
+  terminalReason?: string
+  terminal_message?: string
+  terminalMessage?: string
+  reason?: string
 }
 
 export interface ChatHistoryAttachmentPayload {
@@ -290,6 +360,7 @@ export interface ChatHistoryMessage {
   provenance_kind?: string
   provenance_source_session_key?: string
   provenance_source_tool?: string
+  turn_context?: Record<string, unknown>
   reasoning_content?: string
   usage?: unknown
   turn_usage?: unknown
@@ -310,6 +381,10 @@ export interface ChatHistoryResponse {
   newestCursor?: string | number | null
   history_scope?: string
   historyScope?: string
+  canonical_available?: boolean
+  canonicalAvailable?: boolean
+  canonical_complete?: boolean
+  canonicalComplete?: boolean
   limit?: number
   returned?: number
 }

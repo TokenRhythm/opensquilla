@@ -44,6 +44,7 @@ export function useAgentDrawer(
   const drawerModel = ref('')
   const systemPromptHint = ref(false)
   const saving = ref(false)
+  let pendingCloseRequest: Promise<boolean> | null = null
 
   const initialForm = ref<AgentForm>({
     id: '', name: '', description: '', tools: [], workspace: '', agentDir: '', enabled: true,
@@ -95,7 +96,7 @@ export function useAgentDrawer(
     drawerOpen.value = true
   }
 
-  function closeDrawer() {
+  function commitCloseDrawer() {
     drawerOpen.value = false
   }
 
@@ -103,18 +104,24 @@ export function useAgentDrawer(
     drawerMode.value = 'edit'
   }
 
-  function onOverlayClick() {
-    if (drawerMode.value === 'view') {
-      closeDrawer()
-      return
+  function requestCloseDrawer(): Promise<boolean> {
+    if (!drawerOpen.value) return Promise.resolve(true)
+    if (drawerMode.value === 'view' || !isDirty.value) {
+      commitCloseDrawer()
+      return Promise.resolve(true)
     }
-    if (!isDirty.value) {
-      closeDrawer()
-      return
-    }
-    confirmDiscard().then(ok => {
-      if (ok) closeDrawer()
-    })
+    if (pendingCloseRequest) return pendingCloseRequest
+
+    const request = confirmDiscard()
+      .then((ok) => {
+        if (ok && drawerOpen.value) commitCloseDrawer()
+        return ok
+      })
+      .finally(() => {
+        if (pendingCloseRequest === request) pendingCloseRequest = null
+      })
+    pendingCloseRequest = request
+    return request
   }
 
   function onCancelEdit() {
@@ -155,9 +162,8 @@ export function useAgentDrawer(
     toolsInput,
     advancedOpen,
     openDrawer,
-    closeDrawer,
+    requestCloseDrawer,
     enterEditMode,
-    onOverlayClick,
     onCancelEdit,
     buildSavePayload,
     applyUpdatedAgent,

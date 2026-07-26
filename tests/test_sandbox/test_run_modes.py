@@ -16,6 +16,24 @@ from opensquilla.sandbox.run_mode import (
 )
 
 
+def test_sandbox_defaults_to_root_readonly_and_auto_review() -> None:
+    settings = SandboxSettings()
+
+    assert settings.host_root_readonly is True
+    assert settings.approvals_reviewer == "auto_review"
+
+
+def test_removed_model_review_settings_are_ignored_for_upgrade_compatibility() -> None:
+    settings = SandboxSettings(
+        approval_review_timeout_seconds=90,
+        approval_review_max_attempts=3,
+    )
+
+    assert settings.approvals_reviewer == "auto_review"
+    assert "approval_review_timeout_seconds" not in settings.model_fields_set
+    assert "approval_review_max_attempts" not in settings.model_fields_set
+
+
 def test_trusted_sandbox_is_sandboxed_and_skips_only_routine_prompts() -> None:
     patch = run_mode_config_patch(RunMode.TRUSTED)
 

@@ -10,35 +10,132 @@ import asyncio
 import os
 import sys
 from collections.abc import Callable, Coroutine
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import typer
+from rich.markup import escape as markup_escape
 from rich.panel import Panel
 
 from opensquilla.cli.chat.launch import ChatCommandLaunchOverrides, ChatCommandRequest
 from opensquilla.cli.ui import ACCENT, console
 
+if TYPE_CHECKING:
+    from opensquilla.cli.tui.renderers.selection import ChatUiSelection
+
 ChatRunner = Callable[..., Coroutine[Any, Any, None]]
 # Backend id whose host renders its own full-screen UI, so the native launch
 # banner is suppressed to avoid a pre-launch flash. Mirrors OpenTuiRendererBackend.
 _OPENTUI_BACKEND_ID = "opentui"
+# Short human phrases for the once-per-(version, reason) fallback notice.
+# Keys are the stable RendererBackendUnavailableReason values; anything
+# unmapped prints its code, which is stable and doctor-searchable.
+_FALLBACK_NOTICE_PHRASES = {
+    "missing": "no OpenTUI companion in this install",
+    "version_mismatch": "OpenTUI companion version mismatch",
+    "terminal_unsupported": "this terminal is not supported",
+}
 _INTERACTIVE_STRUCTLOG_FILE: Any | None = None
 _INTERACTIVE_STDLIB_LOG_HANDLER: Any | None = None
 _INTERACTIVE_LOG_HANDLER_ATTR = "_opensquilla_interactive_log_handler"
 
 
-def validate_tui_backend_or_exit() -> str:
-    from opensquilla.cli.tui.adapters import runtime_bridge  # noqa: PLC0415
+def resolve_tui_backend_or_exit(ui_mode: str | None = None) -> ChatUiSelection:
     from opensquilla.cli.tui.renderers.selection import (  # noqa: PLC0415
+        OPENSQUILLA_TUI_BACKEND_ENV,
         RendererBackendSelectionError,
         RendererBackendUnavailableError,
+        select_chat_ui_backend,
     )
 
     try:
-        return runtime_bridge.validate_tui_backend_selection()
+        selection = select_chat_ui_backend(ui_mode)
     except (RendererBackendSelectionError, RendererBackendUnavailableError) as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(2) from exc
+    # Runtime adapters still resolve the internal backend through the legacy
+    # environment contract.  Pin the already validated choice for this
+    # short-lived CLI process so later factories cannot make a second choice.
+    os.environ[OPENSQUILLA_TUI_BACKEND_ENV] = selection.backend.backend_id
+    return selection
+
+
+def validate_tui_backend_or_exit(ui_mode: str | None = None) -> str:
+    """Compatibility wrapper returning only the selected internal backend id."""
+
+    return resolve_tui_backend_or_exit(ui_mode).backend.backend_id
+
+
+def _print_tui_fallback_after_clear(
+    selection: ChatUiSelection,
+    *,
+    implicit_ui: bool,
+    output_console: Any,
+) -> None:
+    fallback = selection.fallback
+    if fallback is None:
+        return
+
+    if implicit_ui:
+        from opensquilla.cli.tui.renderers.selection import (  # noqa: PLC0415
+            RendererBackendUnavailableReason,
+        )
+        from opensquilla.cli.tui.source_checkout import (  # noqa: PLC0415
+            resolve_tui_source_checkout_hint,
+        )
+
+        if fallback.code in {
+            RendererBackendUnavailableReason.MISSING,
+            RendererBackendUnavailableReason.VERSION_MISMATCH,
+        }:
+            hint = resolve_tui_source_checkout_hint()
+            if hint is not None:
+                output_console.print(
+                    f"[bold {ACCENT}]Tip:[/] Full-screen TUI source is available in this checkout."
+                )
+                output_console.print(f"[bold {ACCENT}]Exit chat, then run:[/]")
+                output_console.print(
+                    f"[bold]{markup_escape(hint.install_command)}[/bold]",
+                    soft_wrap=True,
+                )
+                output_console.print(
+                    f"[bold]{markup_escape(hint.launch_command)}[/bold]",
+                    soft_wrap=True,
+                )
+                output_console.print("[dim]Continuing in plain mode for this launch.[/dim]")
+                return
+        # Installed packages and unsupported hosts get one dim line per
+        # (product version, unavailability reason): the downgrade is explained
+        # without becoming a per-launch nag, and `opensquilla doctor` carries
+        # the actionable detail. Prefs IO is best effort — if the record cannot
+        # be written the notice repeats, which degrades loud rather than silent.
+        from opensquilla import __version__  # noqa: PLC0415
+        from opensquilla.cli.tui.opentui.prefs import (  # noqa: PLC0415
+            fallback_notice_due,
+            record_fallback_notice,
+        )
+
+        code = fallback.code.value
+        if fallback_notice_due(__version__, code):
+            phrase = _FALLBACK_NOTICE_PHRASES.get(code, code)
+            output_console.print(
+                f"[dim]Full-screen TUI unavailable ({phrase}); using plain mode. "
+                "Run 'opensquilla doctor' for details.[/dim]"
+            )
+            record_fallback_notice(__version__, code)
+        return
+
+    output_console.print(
+        "[dim]OpenTUI unavailable; using plain mode: "
+        f"{markup_escape(_safe_fallback_detail(fallback.detail))}[/dim]"
+    )
+
+
+def _safe_fallback_detail(detail: str) -> str:
+    from opensquilla.cli.tui.backend.render_summary import (  # noqa: PLC0415
+        sanitize_terminal_text,
+    )
+
+    return sanitize_terminal_text(detail).replace("\r", " ").replace("\n", " ")
 
 
 def quiet_logs_for_interactive_chat() -> None:
@@ -133,7 +230,24 @@ def prepare_interactive_chat(
     *,
     input_stream: Any | None = None,
     output_console: Any | None = None,
+    validated: bool = False,
 ) -> None:
+    active_console = console if output_console is None else output_console
+    if not validated:
+        validate_interactive_chat(
+            input_stream=input_stream,
+            output_console=active_console,
+        )
+    quiet_logs_for_interactive_chat()
+    clear_screen_for_interactive_chat(output_console=active_console)
+
+
+def validate_interactive_chat(
+    *,
+    input_stream: Any | None = None,
+    output_console: Any | None = None,
+) -> None:
+    """Reject non-interactive use before Gateway probing or terminal mutation."""
     stream = sys.stdin if input_stream is None else input_stream
     active_console = console if output_console is None else output_console
     if not stream.isatty() or not active_console.is_terminal:
@@ -142,8 +256,19 @@ def prepare_interactive_chat(
             err=True,
         )
         raise typer.Exit(2)
-    quiet_logs_for_interactive_chat()
-    clear_screen_for_interactive_chat(output_console=active_console)
+
+
+def preflight_gateway_chat_or_exit() -> None:
+    from opensquilla.cli.chat.preflight import (  # noqa: PLC0415
+        ChatGatewayPreflightError,
+        preflight_gateway_chat,
+    )
+
+    try:
+        preflight_gateway_chat()
+    except ChatGatewayPreflightError as exc:
+        typer.echo(f"Chat preflight failed [{exc.code}]: {exc}", err=True)
+        raise typer.Exit(1) from exc
 
 
 def launch_chat(
@@ -158,11 +283,25 @@ def launch_chat(
     gateway_runner: ChatRunner | None,
     output_console: Any | None = None,
     input_stream: Any | None = None,
+    ui: str | None = None,
 ) -> None:
     active_console = console if output_console is None else output_console
-    backend_id = validate_tui_backend_or_exit()
+    selection = resolve_tui_backend_or_exit() if ui is None else resolve_tui_backend_or_exit(ui)
+    backend_id = selection.backend.backend_id
+    validate_interactive_chat(
+        input_stream=input_stream,
+        output_console=active_console,
+    )
+    if not standalone:
+        preflight_gateway_chat_or_exit()
     prepare_interactive_chat(
         input_stream=input_stream,
+        output_console=active_console,
+        validated=True,
+    )
+    _print_tui_fallback_after_clear(
+        selection,
+        implicit_ui=ui is None,
         output_console=active_console,
     )
     if standalone:
@@ -248,6 +387,7 @@ def launch_chat_command(
     active_launch_chat(
         model=request.model,
         session_id=request.session_id,
+        ui=request.ui,
         standalone=request.standalone,
         workspace=request.workspace,
         workspace_strict=request.workspace_strict,

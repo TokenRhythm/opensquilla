@@ -16,7 +16,6 @@ export const LAST_ROUTE_KEY = 'opensquilla-last-route'
 const RESTORABLE = new Set<string>([
   '/chat',
   '/sessions',
-  '/agents',
   '/channels',
   '/cron',
   '/skills',

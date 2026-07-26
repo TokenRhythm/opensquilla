@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 
+import httpx
 import pytest
 
 import opensquilla.tools.builtin.web as web_module
@@ -305,6 +306,7 @@ async def test_web_search_tool_rejects_invalid_args_without_calling_core(
         "ok": False,
         "error_kind": "invalid_request",
         "error": message,
+        "retry_allowed": False,
     }
 
 
@@ -352,6 +354,40 @@ async def test_web_discover_keeps_lightweight_result_shape(
             }
         ],
     }
+
+
+@pytest.mark.asyncio
+async def test_web_discover_keeps_explicit_failure_marker_for_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_run_web_discover_payload(
+        query: str,
+        max_results: int | None = None,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        return {
+            "ok": False,
+            "query": query,
+            "provider": "duckduckgo",
+            "results": [],
+            "error_kind": "blocked",
+            "error": {"message": "Search was blocked."},
+            "retry_allowed": False,
+        }
+
+    monkeypatch.setattr(
+        web_module,
+        "run_web_discover_payload",
+        fake_run_web_discover_payload,
+    )
+
+    bare_web_discover = inspect.unwrap(web_module.web_discover)
+    payload = json.loads(await bare_web_discover("python release"))
+
+    assert payload["ok"] is False
+    assert payload["error_kind"] == "blocked"
+    assert payload["error"] == "Search was blocked."
+    assert payload["retry_allowed"] is False
 
 
 @pytest.mark.asyncio
@@ -503,3 +539,89 @@ async def test_web_discover_preserves_network_fallback_for_custom_active_provide
         {"provider": "duckduckgo", "status": "success"},
     ]
     assert calls == [custom_provider, "duckduckgo"]
+
+
+@pytest.mark.asyncio
+async def test_web_discover_preserves_raw_custom_network_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.search.registry as registry
+    from opensquilla.search.registry import register_provider
+
+    custom_provider = "test_custom_discover_raw_network"
+    calls: list[str] = []
+
+    class FailingProvider:
+        name = custom_provider
+
+        async def search(self, query: str, max_results: int = 5) -> list[SearchResult]:
+            request = httpx.Request("GET", "https://custom.example/search")
+            raise httpx.ConnectError("network down", request=request)
+
+    class DuckProvider:
+        name = "duckduckgo"
+
+        async def search(self, query: str, max_results: int = 5) -> list[SearchResult]:
+            return [
+                SearchResult(
+                    title="Duck fallback",
+                    url="https://example.com",
+                    snippet=query,
+                )
+            ]
+
+    def fake_get_provider(name: str, **kwargs: object) -> FailingProvider | DuckProvider:
+        calls.append(name)
+        return FailingProvider() if name == custom_provider else DuckProvider()
+
+    register_provider(
+        custom_provider,
+        FailingProvider,
+        SearchProviderSpec(provider_id=custom_provider),
+    )
+    monkeypatch.setattr(registry, "get_provider", fake_get_provider)
+
+    try:
+        web_module.configure_search(
+            custom_provider,
+            fallback_policy="network",
+            diagnostics=True,
+        )
+        payload = await web_module.run_web_discover_payload("python release")
+    finally:
+        web_module.reset_search_runtime()
+
+    assert payload["ok"] is True
+    assert payload["fallbackFrom"] == custom_provider
+    assert payload["attempts"] == [
+        {"provider": custom_provider, "status": "error", "error_kind": "network"},
+        {"provider": "duckduckgo", "status": "success"},
+    ]
+    assert calls == [custom_provider, "duckduckgo"]
+
+
+def test_web_discover_failure_projection_preserves_canonical_diagnostics() -> None:
+    payload = web_module._web_discover_payload_from_canonical(
+        {
+            "ok": False,
+            "query": "python release",
+            "provider_attempts": [
+                {"provider": "custom", "status": "error", "error_kind": "parse"}
+            ],
+            "diagnostics": {"selected_provider": "", "fallback_from": ""},
+            "error_kind": "parse",
+            "error_class": "ValueError",
+            "error": "custom search request failed.",
+            "provider_retryable": False,
+            "retry_allowed": False,
+        },
+        display_provider="custom",
+    )
+
+    assert payload["ok"] is False
+    assert payload["retry_allowed"] is False
+    assert payload["error_class"] == "ValueError"
+    assert payload["provider_attempts"] == [
+        {"provider": "custom", "status": "error", "error_kind": "parse"}
+    ]
+    assert payload["diagnostics"] == {"selected_provider": "", "fallback_from": ""}

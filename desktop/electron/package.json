@@ -1,6 +1,6 @@
 {
   "name": "@opensquilla/desktop-electron",
-  "version": "0.5.0-rc4",
+  "version": "0.5.0",
   "private": true,
   "description": "Electron desktop shell for the OpenSquilla Control UI.",
   "repository": {
@@ -12,7 +12,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "build:gateway": "node scripts/build-gateway.mjs",
-    "build:web": "cd ../../opensquilla-webui && npm run build",
+    "build:web": "cd ../../opensquilla-webui && npm ci && npm run build",
     "dev": "npm run build && electron .",
     "dist:local": "npm run build:web && npm run build:gateway && npm run dist",
     "pack:local": "npm run build:web && npm run build:gateway && npm run pack",
@@ -24,6 +24,11 @@
     "test:update-resolver": "npm run build && node scripts/test-update-resolver.mjs",
     "test:update-scheduler": "npm run build && node scripts/test-update-check-scheduler.mjs",
     "test:desktop-locale": "npm run build && node scripts/test-desktop-locale.mjs",
+    "test:gateway-ownership": "npm run build && node scripts/test-desktop-gateway-ownership.mjs",
+    "test:gateway-lifecycle": "npm run build && node scripts/test-desktop-gateway-lifecycle.mjs",
+    "test:window-lifecycle": "npm run build && node scripts/test-desktop-window-lifecycle.mjs",
+    "test:window-background-flow": "npm run build && node scripts/test-desktop-window-background-flow.mjs",
+    "test:gateway-orphan-recovery-flow": "npm run build && node scripts/test-desktop-gateway-orphan-recovery-flow.mjs",
     "test:profile-substrate": "npm run build && node scripts/test-desktop-profile-substrate.mjs && node scripts/test-desktop-profile-context.mjs",
     "test:profile-recovery-flow": "npm run build && node scripts/test-profile-recovery-flow.mjs",
     "test:profile-recovery-accessibility": "npm run build && node scripts/test-profile-recovery-accessibility.mjs",
@@ -33,7 +38,7 @@
     "test:desktop-cleanup": "npm run build && node scripts/test-desktop-cleanup-contract.mjs",
     "test:desktop-cleanup-flow": "npm run build && node scripts/test-desktop-cleanup-flow.mjs",
     "test:mock-update-flow": "npm run build && node scripts/test-mock-update-flow.mjs",
-    "test:onboarding-flow": "npm run build && node scripts/test-onboarding-data-flow.mjs && node scripts/test-onboarding-flow.mjs",
+    "test:onboarding-flow": "npm run build && node scripts/test-onboarding-flow.mjs",
     "start": "electron .",
     "pack": "npm run build && electron-builder --dir",
     "dist": "npm run build && electron-builder"

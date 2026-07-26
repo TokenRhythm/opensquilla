@@ -43,9 +43,9 @@ def test_completion_context_includes_surface_commands_skills_and_safe_files(tmp_
     assert "/compact" in catalog
     assert catalog["/compact"].insert_text == "/compact "
 
-    assert "/visible-skill" in catalog
-    assert catalog["/visible-skill"].insert_text == "use the visible-skill skill: "
-    assert "/hidden-from-model" not in catalog
+    assert "/skill:visible-skill" in catalog
+    assert catalog["/skill:visible-skill"].insert_text == "use the visible-skill skill: "
+    assert "/skill:hidden-from-model" not in catalog
 
     assert context.files == ("src/main.py",)
     assert context.filters_sensitive_paths is True

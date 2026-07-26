@@ -1,5 +1,5 @@
 // Condenses the pinned self-migration report wire shape
-// into the compact numbers the desktop Runtime panel renders before an import.
+// into the compact numbers the Data & backups panel renders before an import.
 // The report crosses the desktop preload bridge as `unknown`, so every field is
 // guarded: a partial, absent, or future-shaped report degrades to zeros and
 // empty lists instead of crashing the panel.

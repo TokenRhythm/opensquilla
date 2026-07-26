@@ -13,6 +13,7 @@ Streaming edits use :class:`dingtalk_stream.MarkdownCardInstance` —
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import platform
 import socket
@@ -25,19 +26,23 @@ from typing import TYPE_CHECKING, Any
 
 import requests  # type: ignore[import-untyped]
 import structlog
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from opensquilla.channels._util import EventDedupeCache
 from opensquilla.channels.contract import (
     ChannelCapabilityProfile,
+    ChannelLengthUnit,
     ChannelPlatformCapability,
     ChannelPlatformCapabilityStatus,
     ChannelPlatformCategories,
     ChannelPlatformManifest,
 )
 from opensquilla.channels.types import (
+    AuthenticatedPrincipal,
     ChannelHealth,
     IncomingMessage,
+    IngressProvenance,
+    IngressVerification,
     OutgoingMessage,
     UnsupportedChannelOperation,
 )
@@ -49,7 +54,7 @@ log = structlog.get_logger(__name__)
 
 
 # Channel-contract constants pinned by the adapter audit.
-CAPABILITY_TIER = "GREEN-shipping"
+CAPABILITY_TIER = "YELLOW-experimental"
 
 # DingTalk is a DM/group channel — the permission matrix denies admin-only.
 DM_SAFETY_TIERS: tuple[str, ...] = ("safe", "confirm")
@@ -72,6 +77,8 @@ FATAL_ERROR_CLASSES: tuple[str, ...] = (
 )
 
 _DINGTALK_AUTH_INVALID_MESSAGE = "凭证无效：检查 DingTalk AppKey/AppSecret"
+_STREAM_STOP_TIMEOUT_S = 5.0
+_STREAM_CANCEL_GRACE_S = 0.25
 
 
 class DingTalkAuthError(RuntimeError):
@@ -101,6 +108,8 @@ class DingTalkChannelConfig(BaseModel):
     client_secret: str = ""
     event_dedupe_size: int = 4096
     streaming_update_interval_s: float = 2.0
+    reconnect_initial_delay_s: float = Field(default=1.0, ge=0.0)
+    reconnect_max_delay_s: float = Field(default=30.0, ge=0.0)
 
     model_config = {}  # explicit params only; no env loading
 
@@ -133,6 +142,7 @@ class DingTalkChannel:
     _client: Any = field(default=None, init=False, repr=False)
     _handler: Any = field(default=None, init=False, repr=False)
     _run_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
+    _stop_event: asyncio.Event | None = field(default=None, init=False, repr=False)
     _loop: asyncio.AbstractEventLoop | None = field(default=None, init=False, repr=False)
     _last_incoming: Any = field(default=None, init=False, repr=False)
     _msg_by_id: OrderedDict[str, Any] = field(
@@ -153,6 +163,9 @@ class DingTalkChannel:
     def capability_profile(self) -> ChannelCapabilityProfile:
         return ChannelCapabilityProfile(
             channel_type="dingtalk",
+            max_message_len=16000,
+            length_unit=ChannelLengthUnit.UTF8_BYTES,
+            splits_natively=False,
             group_chat=True,
             mentions=True,
             reply=True,
@@ -262,10 +275,20 @@ class DingTalkChannel:
             channel_id=str(conversation_id),
             content=content,
             metadata=metadata,
+            provenance=IngressProvenance(
+                provider="dingtalk",
+                account_id=self.config.name,
+                transport="websocket",
+                verification=IngressVerification.SDK_SESSION,
+                event_id=str(msg_id or "") or None,
+                principal=AuthenticatedPrincipal(subject_id=str(sender_id)),
+            ),
         )
 
     def enqueue(self, message: IncomingMessage) -> None:
-        self._queue.put_nowait(message)
+        from opensquilla.channels.delivery_store import durable_enqueue
+
+        durable_enqueue(self, message, self._queue)
         self._last_message_at = datetime.now(UTC)
         self._msg_count += 1
 
@@ -345,8 +368,20 @@ class DingTalkChannel:
             or "鉴权失败" in message
         )
 
-    async def _preflight_open_connection(self, *, endpoint: str, callback_topic: str) -> None:
-        """Probe DingTalk auth once so deterministic credential failures are actionable."""
+    async def _preflight_open_connection(
+        self,
+        *,
+        endpoint: str,
+        callback_topic: str,
+        strict_transport: bool = False,
+    ) -> bool:
+        """Validate Stream credentials through DingTalk's connection-open API.
+
+        Startup keeps transient network failures best-effort because the stream
+        supervisor retries the connection lifecycle. Explicit live certification uses
+        ``strict_transport=True`` so a timeout can never be reported as a
+        successful credential check.
+        """
         version = self._sdk_version()
         headers = {
             "Content-Type": "application/json",
@@ -378,7 +413,11 @@ class DingTalkChannel:
                 error_type=type(exc).__name__,
                 error=self._safe_error_text(exc),
             )
-            return
+            if strict_transport:
+                raise RuntimeError(
+                    "DingTalk credential probe could not reach the Stream gateway"
+                ) from None
+            return False
 
         status_code_raw = getattr(response, "status_code", None)
         try:
@@ -407,13 +446,55 @@ class DingTalkChannel:
                     error_type=type(exc).__name__,
                     error=self._safe_error_text(exc),
                 )
+                if strict_transport:
+                    raise RuntimeError(
+                        "DingTalk credential probe received an unsuccessful response"
+                    ) from None
+                return False
+        if strict_transport and not (
+            isinstance(payload.get("endpoint"), str)
+            and payload.get("endpoint")
+            and isinstance(payload.get("ticket"), str)
+            and payload.get("ticket")
+        ):
+            raise RuntimeError(
+                "DingTalk credential probe response omitted connection metadata"
+            )
+        return True
+
+    async def probe_connection(self) -> dict[str, Any]:
+        """Validate Stream credentials without starting the WebSocket loop."""
+        if not self.config.client_id or not self.config.client_secret:
+            raise ValueError(
+                "dingtalk.probe_connection: client_id and client_secret are required"
+            )
+        from dingtalk_stream import (  # type: ignore[import-untyped]
+            ChatbotMessage,
+            DingTalkStreamClient,
+        )
+
+        endpoint = getattr(
+            DingTalkStreamClient,
+            "OPEN_CONNECTION_API",
+            "https://api.dingtalk.com/v1.0/gateway/connections/open",
+        )
+        await self._preflight_open_connection(
+            endpoint=str(endpoint),
+            callback_topic=str(ChatbotMessage.TOPIC),
+            strict_transport=True,
+        )
+        return {
+            "authenticated": True,
+            "supported": True,
+            "transport": "stream",
+        }
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Validate creds, build the SDK client, and launch the WS loop."""
+        """Validate creds, build the SDK client, and launch the stream supervisor."""
         if not self.config.client_id or not self.config.client_secret:
             raise ValueError("dingtalk.start: client_id and client_secret are required")
 
@@ -440,18 +521,16 @@ class DingTalkChannel:
         self._handler = _DingTalkCallbackHandler(channel=self)
         self._client.register_callback_handler(ChatbotMessage.TOPIC, self._handler)
 
-        # ``DingTalkStreamClient.start`` is the async coroutine that drives the
-        # WS loop forever (``start_forever`` wraps it in ``asyncio.run`` and is
-        # therefore unsuitable inside an existing event loop). We spawn it as a
-        # background task and return — per the ManagedChannel async-lifecycle
-        # contract documented in ``channels/types.py``.
         # Capture the running loop so the worker-thread ``_Handler.process``
         # can hand parsed messages back via ``call_soon_threadsafe`` (the
         # SDK's ``AsyncChatbotHandler.raw_process`` runs ``process`` on a
         # ThreadPoolExecutor — see SDK source ``chatbot.py:829-836``).
         self._loop = asyncio.get_running_loop()
-        loop_coro = self._client.start()
-        self._run_task = asyncio.create_task(loop_coro, name="dingtalk:stream")
+        self._stop_event = asyncio.Event()
+        self._run_task = asyncio.create_task(
+            self._run_stream_supervisor(),
+            name="dingtalk:stream-supervisor",
+        )
         log.info(
             "dingtalk.started",
             name=self.config.name,
@@ -459,28 +538,122 @@ class DingTalkChannel:
         )
 
     async def stop(self) -> None:
-        """Cancel the WS task and await its completion (with 5 s timeout)."""
+        """Signal the stream supervisor and await bounded shutdown."""
         task = self._run_task
         self._run_task = None
+        stop_event = self._stop_event
+        self._stop_event = None
+        if stop_event is not None:
+            stop_event.set()
         if task is not None and not task.done():
-            task.cancel()
-            try:
-                await asyncio.wait_for(task, timeout=5.0)
-            except TimeoutError:
-                # ``DingTalkStreamClient.start`` may swallow CancelledError
-                # internally; we log and move on rather than block ``stop``
-                # indefinitely. Channel manager treats this as a soft failure.
+            done, _ = await asyncio.wait((task,), timeout=_STREAM_STOP_TIMEOUT_S)
+            if not done:
+                task.cancel()
+                done, _ = await asyncio.wait(
+                    (task,),
+                    timeout=_STREAM_CANCEL_GRACE_S,
+                )
                 log.warning(
                     "dingtalk.stop_timeout",
                     name=self.config.name,
-                    note="WS task did not honour cancellation within 5 s",
+                    note="stream supervisor did not stop within 5 s",
                 )
-            except (asyncio.CancelledError, Exception):
-                pass
+            if done:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+            else:
+                task.add_done_callback(self._consume_task_result)
         self._client = None
         self._handler = None
         self._loop = None
         log.info("dingtalk.stopped", name=self.config.name)
+
+    async def _run_stream_supervisor(self) -> None:
+        """Restart a completed stream loop with interruptible capped backoff."""
+        stop_event = self._stop_event
+        client = self._client
+        if stop_event is None or client is None:
+            return
+
+        maximum = self.config.reconnect_max_delay_s
+        delay = min(self.config.reconnect_initial_delay_s, maximum)
+        while not stop_event.is_set():
+            stream_task = asyncio.create_task(
+                client.start(),
+                name="dingtalk:stream-attempt",
+            )
+            stop_task = asyncio.create_task(
+                stop_event.wait(),
+                name="dingtalk:stream-stop",
+            )
+            try:
+                done, _ = await asyncio.wait(
+                    (stream_task, stop_task),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if stop_task in done:
+                    await self._cancel_stream_task(stream_task)
+                    return
+                await stream_task
+                log.warning(
+                    "dingtalk.stream_ended",
+                    name=self.config.name,
+                    reconnect_delay_s=delay,
+                )
+            except asyncio.CancelledError:
+                await self._cancel_stream_task(stream_task)
+                raise
+            except Exception as exc:
+                log.warning(
+                    "dingtalk.stream_failed",
+                    name=self.config.name,
+                    error_type=type(exc).__name__,
+                    error=self._safe_error_text(exc),
+                    reconnect_delay_s=delay,
+                )
+            finally:
+                if not stop_task.done():
+                    stop_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await stop_task
+
+            if await self._wait_for_reconnect(delay):
+                return
+            delay = min(delay * 2 if delay else 0.0, maximum)
+
+    async def _wait_for_reconnect(self, delay: float) -> bool:
+        """Return true when shutdown interrupts the reconnect delay."""
+        stop_event = self._stop_event
+        if stop_event is None or stop_event.is_set():
+            return True
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=delay)
+        except TimeoutError:
+            return False
+        return True
+
+    @staticmethod
+    async def _cancel_stream_task(task: asyncio.Task[Any]) -> None:
+        """Cancel one SDK stream attempt without allowing an unbounded drain."""
+        if task.done():
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+            return
+        task.cancel()
+        await asyncio.sleep(0)
+        if not task.done():
+            task.cancel()
+        done, _ = await asyncio.wait((task,), timeout=_STREAM_CANCEL_GRACE_S)
+        if done:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        else:
+            task.add_done_callback(DingTalkChannel._consume_task_result)
+
+    @staticmethod
+    def _consume_task_result(task: asyncio.Task[Any]) -> None:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            task.result()
 
     async def health_check(self) -> ChannelHealth:
         running = self._run_task is not None and not self._run_task.done()
@@ -533,11 +706,41 @@ class DingTalkChannel:
         metadata = message.metadata or {}
         msg_id = metadata.get("dingtalk_reply_msg_id") or metadata.get("msg_id")
         if msg_id:
-            return self._msg_by_id.get(msg_id)
+            return self._valid_reply_target(self._msg_by_id.get(msg_id))
         conv = message.reply_to or metadata.get("conversation_id")
         if conv:
-            return self._msg_by_conversation.get(conv)
-        return self._last_incoming
+            return self._valid_reply_target(self._msg_by_conversation.get(conv))
+        return self._valid_reply_target(self._last_incoming)
+
+    @staticmethod
+    def _valid_reply_target(target: Any) -> Any | None:
+        """Reject an SDK reply context after its sessionWebhook expires."""
+        if target is None:
+            return None
+        expiry = None
+        for attr in (
+            "session_webhook_expired_time",
+            "sessionWebhookExpiredTime",
+        ):
+            value = getattr(target, attr, None)
+            if value is not None:
+                expiry = value
+                break
+        if expiry is None:
+            raw = getattr(target, "raw_data", None) or getattr(target, "source", None)
+            if isinstance(raw, dict):
+                expiry = raw.get("sessionWebhookExpiredTime") or raw.get(
+                    "session_webhook_expired_time"
+                )
+        if expiry is None:
+            return target
+        try:
+            expires_at = float(expiry)
+        except (TypeError, ValueError):
+            return target
+        if expires_at > 10_000_000_000:
+            expires_at /= 1000.0
+        return target if time.time() < expires_at else None
 
     def build_reply_message(self, content: str, inbound: IncomingMessage) -> OutgoingMessage:
         """Bind the reply to the triggering message's DingTalk session.

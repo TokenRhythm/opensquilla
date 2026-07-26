@@ -267,6 +267,12 @@ async function refresh() {
 .usage-bar-row:hover {
   opacity: 0.85;
 }
+.usage-bar-row.is-static {
+  cursor: default;
+}
+.usage-bar-row.is-static:hover {
+  opacity: 1;
+}
 .usage-bar-row__label {
   font-size: var(--fs-xs);
   color: var(--text-muted);

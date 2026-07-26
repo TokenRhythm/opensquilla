@@ -143,6 +143,56 @@ test.describe('Long conversation history rail', () => {
     expect(arrivalPaint.maxTransitionDuration).toBeLessThanOrEqual(0.00001)
   })
 
+  test('keeps the maximum lens clear of the centered conversation column', async ({ page }) => {
+    await page.addInitScript(() => localStorage.removeItem('opensquilla.sidebar.width.v1'))
+    await page.setViewportSize({ width: 1440, height: 900 })
+    await seedLongHistory(page)
+    await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
+    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+
+    const rail = page.getByTestId('conversation-minimap')
+    const markers = page.getByTestId('conversation-minimap-marker')
+    await expect(markers).toHaveCount(12, { timeout: 10000 })
+
+    // The 260px sidebar plus 5px resizer leaves a 1105px chat shell here:
+    // one pixel inside the rail's visible exit edge and closest to collision.
+    await page.setViewportSize({ width: 1370, height: 900 })
+    await expect.poll(async () => Math.round(
+      (await page.locator('.chat-thread-shell').boundingBox())?.width || 0,
+    )).toBe(1105)
+    await expect(markers).toHaveCount(12)
+
+    const marker = markers.nth(5)
+    await marker.focus()
+    await expect(marker).toBeFocused()
+    await expect(rail.getByRole('tooltip')).toBeVisible()
+
+    await expect.poll(async () => {
+      const [lineBox, messageBox, composerBox, shellBox] = await Promise.all([
+        marker.locator('.conversation-minimap__line').boundingBox(),
+        page.locator('.msg-ai').first().boundingBox(),
+        page.locator('.chat-composer').boundingBox(),
+        page.locator('.chat-thread-shell').boundingBox(),
+      ])
+      if (!lineBox || !messageBox || !composerBox || !shellBox) return null
+      const focusRingRight = lineBox.x + lineBox.width + 4
+      const center = (box: { x: number; width: number }) => box.x + box.width / 2
+      return {
+        focusRingHasSafeGap: messageBox.x - focusRingRight >= 8,
+        messageComposerCentersStayAligned:
+          Math.abs(center(messageBox) - center(composerBox)) <= 5,
+        messageShellCentersStayAligned:
+          Math.abs(center(messageBox) - center(shellBox)) <= 5,
+      }
+    }).toEqual({
+      // The thread's stable end-side scrollbar gutter accounts for this 5px
+      // optical offset; the minimap must not add another asymmetric shift.
+      focusRingHasSafeGap: true,
+      messageComposerCentersStayAligned: true,
+      messageShellCentersStayAligned: true,
+    })
+  })
+
   test('stays centered, clears focus when hidden, and respects sidebar hit-area spacing', async ({ page }) => {
     await page.addInitScript(() => localStorage.removeItem('opensquilla.sidebar.width.v1'))
     await page.setViewportSize({ width: 1440, height: 900 })
@@ -230,8 +280,8 @@ test.describe('Long conversation history rail', () => {
     await expect(rail).toHaveCount(0)
     await expect(page.getByRole('tooltip')).toHaveCount(0)
 
-    // 1057–1103px is the hidden middle band after an exit; only crossing the
-    // 1104px enter edge should remount the rail.
+    // 1105–1119px is the hidden middle band after an exit; only crossing the
+    // 1120px enter edge should remount the rail.
     const resizedHandle = await resizer.boundingBox()
     await page.mouse.move(resizedHandle!.x + 1, 420)
     await page.mouse.down()

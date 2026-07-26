@@ -16,6 +16,7 @@ from opensquilla.gateway.uploads import _extract_authorization_token
 from opensquilla.provider.audio import (
     ElevenLabsAudioProductionProvider,
     ElevenLabsSpeechToTextRequest,
+    resolve_elevenlabs_api_key_env,
 )
 
 _MAX_TRANSCRIPTION_BYTES = 30 * 1024 * 1024
@@ -25,7 +26,7 @@ def _default_provider_factory(config: GatewayConfig) -> ElevenLabsAudioProductio
     provider_cfg = config.audio.providers.elevenlabs
     return ElevenLabsAudioProductionProvider(
         api_key=getattr(provider_cfg, "api_key", ""),
-        api_key_env=getattr(provider_cfg, "api_key_env", "ELEVENLABS_API_KEY"),
+        api_key_env=resolve_elevenlabs_api_key_env(provider_cfg),
         base_url=getattr(provider_cfg, "base_url", "https://api.elevenlabs.io"),
     )
 

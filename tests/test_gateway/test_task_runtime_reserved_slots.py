@@ -191,10 +191,8 @@ async def test_no_reservation_leaks_counters_after_handler_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_uses_default_run_kind_for_parent_wake() -> None:
-    """TaskRuntime.send (parent wake path) defaults run_kind=default so wakes
-    don't consume reserved subagent capacity.
-    """
+async def test_send_uses_runtime_send_kind_for_internal_followups() -> None:
+    """Every send path stays non-interactive and outside subagent capacity."""
     storage = _StubStorage.fresh()
     seen: list[str] = []
 
@@ -208,15 +206,24 @@ async def test_send_uses_default_run_kind_for_parent_wake() -> None:
         subagent_reserved_slots=1,
     )
 
-    # Seed envelope cache by enqueueing once, then send.
+    uncached = await rt.send("agent:s:uncached", "wake")
+    await rt.wait(uncached.task_id, timeout=1.0)
+
+    # Seed another session's envelope cache, then exercise both cached paths.
     h0 = await rt.enqueue(_envelope("agent:s:main"), "init", run_kind="default")
     await rt.wait(h0.task_id, timeout=1.0)
 
     h1 = await rt.send("agent:s:main", "wake")
     await rt.wait(h1.task_id, timeout=1.0)
+    h2 = await rt.send(
+        "agent:s:main",
+        "wake with provenance",
+        provenance={"kind": "internal_system"},
+    )
+    await rt.wait(h2.task_id, timeout=1.0)
 
     assert "subagent" not in seen
-    assert seen == ["default", "default"]
+    assert seen == ["runtime_send", "default", "runtime_send", "runtime_send"]
 
 
 @pytest.mark.asyncio

@@ -268,7 +268,8 @@ def solve(
     # if the run crashes unexpectedly. The --json result stays the only thing on
     # stdout, so a consumer reading stdout alone still gets clean JSON.
     from opensquilla.contrib.codetask import config as ct_config
-    from opensquilla.contrib.codetask.runner import _default_run_id, _write_status
+    from opensquilla.contrib.codetask.runner import _default_run_id
+    from opensquilla.recovery.errors import ProfileLockBusyError
 
     rid = run_id or _default_run_id("task")
     run_dir = ct_config.run_dir(rid)
@@ -299,11 +300,9 @@ def solve(
     except WorkspaceError as exc:
         typer.secho(f"workspace error: {exc}", err=True, fg=typer.colors.RED)
         raise typer.Exit(1) from exc
-    except Exception as exc:
-        # Unexpected crash anywhere in solve(): stamp a terminal status so a
-        # watcher does not see status.json frozen mid-phase, then re-raise.
-        _write_status(rid, "crashed", error=str(exc)[:500])
-        raise
+    except ProfileLockBusyError as exc:
+        typer.secho(f"profile is busy: {exc}", err=True, fg=typer.colors.RED)
+        raise typer.Exit(1) from exc
 
     if json_output:
         from opensquilla.contrib.codetask.runner import _result_to_dict

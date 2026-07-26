@@ -8,6 +8,7 @@ const ARTIFACT_MIME_CATEGORIES: Record<string, string> = {
 }
 
 const ARTIFACT_EXTENSION_CATEGORIES: Record<string, string> = {
+  aac: 'audio', flac: 'audio', m4a: 'audio', mp3: 'audio', oga: 'audio', ogg: 'audio', opus: 'audio', wav: 'audio',
   csv: 'data', htm: 'document', html: 'document', ipynb: 'data', json: 'data',
   jsonl: 'data', log: 'document', markdown: 'document', md: 'document',
   ndjson: 'data', pdf: 'document', sql: 'code', tsv: 'data', txt: 'document',
@@ -31,6 +32,7 @@ export function artifactExtension(name: string): string {
 export function artifactCategory(artifact: ArtifactPayload): string {
   const mime = artifactMime(artifact)
   if (mime.startsWith('image/')) return 'visual'
+  if (mime.startsWith('audio/')) return 'audio'
   if (ARTIFACT_MIME_CATEGORIES[mime]) return ARTIFACT_MIME_CATEGORIES[mime]
   if (!mime || mime === 'application/octet-stream') {
     const ext = artifactExtension(artifactName(artifact))
@@ -45,6 +47,7 @@ export function artifactCategoryLabel(artifact: ArtifactPayload): string {
     case 'data': return 'data'
     case 'document': return 'doc'
     case 'code': return 'code'
+    case 'audio': return 'audio'
     default: return 'file'
   }
 }
@@ -54,6 +57,7 @@ export function artifactIconName(artifact: ArtifactPayload): IconName {
   if (cat === 'visual') return 'image'
   if (cat === 'data') return 'table'
   if (cat === 'code') return 'fileCode'
+  if (cat === 'audio') return 'music'
   return 'fileText'
 }
 

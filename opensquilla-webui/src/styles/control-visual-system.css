@@ -649,6 +649,7 @@ summary.control-row--divider:focus-visible {
   gap: var(--sp-2);
   justify-content: flex-end;
   margin-top: var(--sp-4);
+  flex-wrap: wrap;
 }
 
 /* Grouped left-nav block (Settings rail) — quiet uppercase eyebrow over a row
@@ -998,5 +999,18 @@ summary.control-row--divider:focus-visible {
   .control-switch,
   .control-switch::before {
     transition: none;
+  }
+}
+
+/* Below ~560px the two-column control-row would crush the control; stack it
+   so channel-composer and edit fields stay usable on phones. */
+@media (max-width: 560px) {
+  .control-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .control-row__control {
+    justify-content: stretch;
+    width: 100%;
   }
 }

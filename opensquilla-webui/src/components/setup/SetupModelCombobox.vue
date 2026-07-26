@@ -1,8 +1,9 @@
 <script setup lang="ts">
-// Model combobox for the provider "model" field: the plain text input stays
-// the primary control (free text ALWAYS works — discovery is an accelerator,
-// never a gate), with an optional dropdown of live-discovered models layered
-// on top. Presentational only: props in, events out (panel-contract pattern).
+// Shared model picker for provider defaults, router tiers, and ensemble roles:
+// the plain text input stays the primary control (free text ALWAYS works —
+// discovery is an accelerator, never a gate), with an optional dropdown of
+// live-discovered models layered on top. Presentational only: props in, events
+// out (panel-contract pattern).
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
@@ -29,6 +30,9 @@ const props = defineProps<{
   // aria-label. Default (false) renders the full settings-row layout unchanged.
   cell?: boolean
   disabled?: boolean
+  // Embedded form rows can opt into the shared input chrome without changing
+  // compact tier-table cells that already provide their own styling.
+  inputClass?: string
 }>()
 
 const emit = defineEmits<{
@@ -59,11 +63,18 @@ const typedSinceOpen = ref(false)
 
 const fieldId = computed(() => `setup-provider-${String(props.field.name || 'model')}`)
 const fieldName = computed(() => `setup_provider_${String(props.field.name || 'model')}`)
+const fieldDescriptionId = computed(() => `${fieldId.value}-description`)
 
 const query = computed(() => String(props.value || '').trim().toLowerCase())
 const catalogAvailable = computed(() => (
   !props.disabled && props.modelSource === 'live' && props.models.length > 0
 ))
+const describedBy = computed(() => {
+  const ids: string[] = []
+  if (!props.cell && props.field.description) ids.push(fieldDescriptionId.value)
+  if (catalogAvailable.value) ids.push(`${fieldId.value}-catalog-count`)
+  return ids.join(' ') || undefined
+})
 
 // The discovered id exactly matching the field's current value, if any.
 const selectedId = computed(() => {
@@ -130,6 +141,10 @@ function rowMeta(model: DiscoveredModel): string {
   const parts: string[] = []
   const ctx = compactTokens(model.contextWindow)
   if (ctx) parts.push(ctx)
+  const maxOutput = compactTokens(model.maxOutputTokens)
+  if (maxOutput) {
+    parts.push(t('setup.provider.modelMaxOutput', { tokens: maxOutput }))
+  }
   parts.push(...model.capabilities.filter(cap => cap !== 'chat').slice(0, 3))
   return parts.join(' · ')
 }
@@ -280,7 +295,11 @@ function onKeydown(event: KeyboardEvent) {
   <div :class="cell ? 'setup-model-combobox--cellwrap' : 'control-row control-row--stack'" :data-name="cell ? undefined : field.name" :data-scope="cell ? undefined : 'provider'">
     <div v-if="!cell" class="control-row__label-block">
       <label class="control-row__label" :for="fieldId">{{ field.label }}{{ field.required ? ' *' : '' }}</label>
-      <span v-if="field.description" class="control-row__desc">{{ field.description }}</span>
+      <span
+        v-if="field.description"
+        :id="fieldDescriptionId"
+        class="control-row__desc"
+      >{{ field.description }}</span>
     </div>
     <div
       class="setup-model-combobox"
@@ -289,7 +308,7 @@ function onKeydown(event: KeyboardEvent) {
       <input
         :id="fieldId"
         ref="inputEl"
-        :class="cell ? undefined : 'control-input'"
+        :class="[cell ? undefined : 'control-input', inputClass]"
         :name="fieldName"
         type="text"
         :role="catalogAvailable ? 'combobox' : undefined"
@@ -297,7 +316,7 @@ function onKeydown(event: KeyboardEvent) {
         :aria-expanded="catalogAvailable ? (open ? 'true' : 'false') : undefined"
         :aria-controls="catalogAvailable ? `${fieldId}-listbox` : undefined"
         :aria-activedescendant="catalogAvailable ? activeOptionId : undefined"
-        :aria-describedby="catalogAvailable ? `${fieldId}-catalog-count` : undefined"
+        :aria-describedby="describedBy"
         :aria-label="cell ? field.label : undefined"
         autocomplete="off"
         :disabled="disabled"
@@ -324,8 +343,12 @@ function onKeydown(event: KeyboardEvent) {
         @mousedown.prevent
         @click="toggleList"
       >
-        <span class="setup-model-combobox__count">{{ models.length }}</span>
-        <Icon class="setup-model-combobox__chevron" name="chevronDown" :size="14" />
+        <Icon
+          class="setup-model-combobox__chevron"
+          name="chevronDown"
+          :size="14"
+          aria-hidden="true"
+        />
       </button>
       <Teleport to="body">
         <div
@@ -414,6 +437,7 @@ function onKeydown(event: KeyboardEvent) {
 
 .setup-model-combobox--cellwrap .setup-model-combobox input {
   box-sizing: border-box;
+  max-width: none;
   width: 100%;
 }
 
@@ -423,7 +447,7 @@ function onKeydown(event: KeyboardEvent) {
 }
 
 .setup-model-combobox.has-catalog input {
-  padding-right: 58px;
+  padding-right: 36px;
 }
 
 .setup-model-combobox__trigger {
@@ -431,15 +455,16 @@ function onKeydown(event: KeyboardEvent) {
   background: transparent;
   border: 0;
   border-radius: var(--radius-sm);
+  bottom: 2px;
   color: var(--text-dim);
   cursor: pointer;
   display: inline-flex;
-  gap: var(--sp-1);
-  padding: var(--sp-1);
+  justify-content: center;
+  padding: 0;
   position: absolute;
-  right: var(--sp-1);
-  top: 50%;
-  transform: translateY(-50%);
+  right: 2px;
+  top: 2px;
+  width: 32px;
 }
 
 .setup-model-combobox__trigger:hover {
@@ -450,12 +475,6 @@ function onKeydown(event: KeyboardEvent) {
 .setup-model-combobox__trigger:focus-visible {
   box-shadow: var(--focus-ring);
   outline: none;
-}
-
-.setup-model-combobox__count {
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
-  font-variant-numeric: tabular-nums;
 }
 
 .setup-model-combobox__chevron {

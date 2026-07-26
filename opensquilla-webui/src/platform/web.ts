@@ -16,9 +16,14 @@ const unavailableUpdate: DesktopUpdateState = {
   progress: null,
   checkedAt: null,
   error: null,
+  errorCode: null,
   snoozedUntil: null,
+  canCheck: false,
   canNativeInstall: false,
+  installMode: 'unsupported',
   releaseUrl: null,
+  source: null,
+  fallbackUsed: false,
 }
 
 async function webUpdateState(): Promise<DesktopUpdateState> {
@@ -36,6 +41,9 @@ export function createWebPlatform(): Platform {
       return undefined
     },
     async nativeAutoUpdateEnabled() {
+      return false
+    },
+    async desktopUpdateManaged() {
       return false
     },
     gateway: {

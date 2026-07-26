@@ -168,11 +168,55 @@ def run_sandboxed(
             limits=effective,
         )
 
+    # Always reap the child and close its pipes, even when an exception
+    # other than ``TimeoutExpired`` escapes (decode error, pipe OSError,
+    # KeyboardInterrupt, ...). Without this outer finally the running
+    # child would leak together with its stdout/stderr pipes.
+    stdout: bytes | str | None = None
+    stderr: bytes | str | None = None
+    timed_out = False
     try:
         stdout, stderr = proc.communicate(input=stdin, timeout=effective.wall_seconds)
     except subprocess.TimeoutExpired:
+        timed_out = True
         proc.kill()
-        stdout, stderr = proc.communicate()
+        try:
+            stdout, stderr = proc.communicate()
+        except Exception:
+            stdout, stderr = None, None
+        # ``communicate()`` already calls ``wait()`` on success, but if
+        # the second ``communicate()`` above raised we may never have
+        # reaped the child. Guard that explicitly so the timeout branch
+        # upholds the same "always reap" guarantee as the other paths.
+        if proc.returncode is None:
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+    except BaseException:
+        # Propagate cancellation / KeyboardInterrupt but still ensure
+        # the child is killed and waited on so we don't leak it.
+        try:
+            proc.kill()
+        finally:
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        raise
+    finally:
+        # For the success path and the ``TimeoutExpired`` branch above,
+        # close any pipes that ``communicate`` did not drain. ``Popen``
+        # ``__del__`` issues ``ResourceWarning`` if these linger.
+        for stream in (proc.stdout, proc.stderr, proc.stdin):
+            if stream is None:
+                continue
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    if timed_out:
         return SandboxResult(
             returncode=proc.returncode if proc.returncode is not None else -1,
             stdout=_decode_stream(stdout),

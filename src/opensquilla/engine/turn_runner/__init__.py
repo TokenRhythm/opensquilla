@@ -62,6 +62,7 @@ from opensquilla.engine.turn_runner.provider_and_tools_stage import (
     ProviderAndToolsStageInput,
     ProviderAndToolsStageOutput,
     ProviderResolverPort,
+    SkillCatalogResolverPort,
     ToolBuilderPort,
 )
 from opensquilla.engine.turn_runner.stream_consumer_stage import (
@@ -78,6 +79,7 @@ from opensquilla.engine.turn_runner.turn_finalizer_stage import (
     CostRollupResult,
     SessionTotalsPort,
     TranscriptAppendPort,
+    TranscriptAppendResult,
     TurnErrorPersistPort,
     TurnFinalizerStage,
     TurnFinalizerStageInput,
@@ -123,6 +125,7 @@ __all__ = [
     "ProviderAndToolsStageInput",
     "ProviderAndToolsStageOutput",
     "ProviderResolverPort",
+    "SkillCatalogResolverPort",
     "RequestContextPrependPort",
     "RouterContextPort",
     "RunPipelineRequest",
@@ -137,6 +140,7 @@ __all__ = [
     "TimeoutBudgetPort",
     "ToolBuilderPort",
     "TranscriptAppendPort",
+    "TranscriptAppendResult",
     "TurnContext",
     "TurnErrorPersistPort",
     "TurnFinalizerStage",

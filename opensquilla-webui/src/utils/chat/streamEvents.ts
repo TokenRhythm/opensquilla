@@ -1,4 +1,4 @@
-import type { SessionEventPayload } from '@/types/rpc'
+import type { SessionEventPayload, StreamEventEnvelope } from '@/types/rpc'
 
 export interface StreamSeqDecision {
   accepted: boolean
@@ -15,16 +15,16 @@ export const STOPPED_STREAM_TASK_ID = '__opensquilla_stopped_stream_task__'
 // reopening an empty work card after the answer has already completed.
 export const FINISHED_STREAM_TASK_ID = '__opensquilla_finished_stream_task__'
 
-export function payloadSessionKey(payload: SessionEventPayload | null | undefined): string {
+export function payloadSessionKey(payload: StreamEventEnvelope | null | undefined): string {
   return payload?.key || payload?.session_key || payload?.sessionKey || ''
 }
 
-export function isCurrentSessionPayload(payload: SessionEventPayload | null | undefined, sessionKey: string): boolean {
+export function isCurrentSessionPayload(payload: StreamEventEnvelope | null | undefined, sessionKey: string): boolean {
   const key = payloadSessionKey(payload)
   return !key || !sessionKey || key === sessionKey
 }
 
-export function payloadTaskId(payload: SessionEventPayload | null | undefined): string {
+export function payloadTaskId(payload: StreamEventEnvelope | null | undefined): string {
   const record = (payload && typeof payload === 'object' ? payload : {}) as Record<string, unknown>
   const direct = record.task_id ?? record.taskId
   if (typeof direct === 'string') return direct
@@ -44,7 +44,7 @@ export function payloadTaskId(payload: SessionEventPayload | null | undefined): 
 // with no task_id (non-TaskRuntime events: approvals, task groups, router…)
 // always passes, so only positively-mismatched TaskRuntime events are dropped.
 export function isCurrentTaskPayload(
-  payload: SessionEventPayload | null | undefined,
+  payload: StreamEventEnvelope | null | undefined,
   activeTaskId: string,
 ): boolean {
   if (!activeTaskId) return true
@@ -53,14 +53,14 @@ export function isCurrentTaskPayload(
   return taskId === activeTaskId
 }
 
-export function isStaleEpoch(payload: SessionEventPayload | null | undefined, currentEpoch: number): boolean {
+export function isStaleEpoch(payload: StreamEventEnvelope | null | undefined, currentEpoch: number): boolean {
   const ep = payload?.epoch
   if (typeof ep !== 'number' || !Number.isFinite(ep)) return false
   return ep < currentEpoch
 }
 
 export function acceptStreamSeq(
-  payload: SessionEventPayload | null | undefined,
+  payload: StreamEventEnvelope | null | undefined,
   sessionKey: string,
   lastStreamSeq: number,
 ): StreamSeqDecision {
@@ -120,9 +120,16 @@ export function taskTerminalAsSessionEvent(event: string, payload: SessionEventP
   }
   if (!['task.failed', 'task.timeout', 'task.abandoned'].includes(event)) return null
   const status = event.replace('task.', '')
+  const rawCode = payload?.code
+  const payloadCode = typeof rawCode === 'string' ? rawCode.trim().toLowerCase() : ''
+  const rawReason = payload?.terminal_reason
+  const terminalReason = typeof rawReason === 'string' ? rawReason.trim().toLowerCase() : ''
+  const code = /^[a-z][a-z0-9_.-]*$/.test(payloadCode)
+    ? payloadCode
+    : /^[a-z][a-z0-9_.-]*$/.test(terminalReason) ? terminalReason : status
   return {
     event: 'session.event.error',
-    payload: { ...(payload || {}), message: taskTerminalMessage(status, payload), code: status },
+    payload: { ...(payload || {}), message: taskTerminalMessage(status, payload), code },
   }
 }
 

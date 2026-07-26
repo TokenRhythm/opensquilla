@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.config import GatewayConfig, LlmProviderProfile
+from opensquilla.provider.compat_policy import compat_policy_for_kind
 from opensquilla.provider.ensemble import build_ensemble_provider_from_config
+from opensquilla.provider.openai import _build_openai_wire_messages
 from opensquilla.provider.selector import ProviderConfig
+from opensquilla.provider.types import ChatConfig, Message, ModelCapabilities
 
 
 def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> None:
@@ -50,7 +53,7 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
     assert provider.proposer_timeout_seconds == 300.0
     assert provider.aggregator_timeout_seconds == 480.0
     assert provider.shuffle_candidates is False
-    assert provider.quorum_grace_seconds == 30.0
+    assert provider.quorum_grace_seconds == 10.0
 
 
 def test_static_openrouter_b5_does_not_need_model_options() -> None:
@@ -119,7 +122,7 @@ def test_static_tokenrhythm_b5_mirrors_the_openrouter_lineup() -> None:
     assert provider.proposer_timeout_seconds == 300.0
     assert provider.aggregator_timeout_seconds == 480.0
     assert provider.shuffle_candidates is False
-    assert provider.quorum_grace_seconds == 30.0
+    assert provider.quorum_grace_seconds == 10.0
 
 
 def test_static_b5_mode_tables_agree_across_gateway_and_provider() -> None:
@@ -451,13 +454,13 @@ def test_static_openrouter_b5_ensemble_locks_members_across_routed_tiers() -> No
             "effective_aggregator_timeout_seconds": 480.0,
             "configured_shuffle_candidates": False,
             "effective_shuffle_candidates": False,
-            "quorum_grace_seconds": 30.0,
+            "quorum_grace_seconds": 10.0,
         }
         assert provider.min_successful_proposers == 4
         assert provider.proposer_timeout_seconds == 300.0
         assert provider.aggregator_timeout_seconds == 480.0
         assert provider.shuffle_candidates is False
-        assert provider.quorum_grace_seconds == 30.0
+        assert provider.quorum_grace_seconds == 10.0
         members = [*provider.proposers, provider.aggregator]
         assert all(member.provider_config.provider == "openrouter" for member in members)
         assert all(member.provider_config.api_key == "fake" for member in members)
@@ -498,7 +501,7 @@ def test_static_openrouter_b5_ensemble_uses_profile_effective_defaults() -> None
     assert provider.proposer_timeout_seconds == 300.0
     assert provider.aggregator_timeout_seconds == 480.0
     assert provider.shuffle_candidates is False
-    assert provider.quorum_grace_seconds == 30.0
+    assert provider.quorum_grace_seconds == 10.0
 
 
 def test_static_openrouter_b5_ensemble_preserves_custom_effective_values() -> None:
@@ -590,7 +593,7 @@ def test_custom_b5_uses_fixed_lineup_effective_defaults_with_auto_quorum() -> No
     assert provider.proposer_timeout_seconds == 300.0
     assert provider.aggregator_timeout_seconds == 480.0
     assert provider.shuffle_candidates is False
-    assert provider.quorum_grace_seconds == 30.0
+    assert provider.quorum_grace_seconds == 10.0
 
 
 def test_custom_b5_preserves_explicit_quorum_and_timeouts() -> None:
@@ -745,3 +748,379 @@ def test_custom_b5_lineup_ready_gates_on_member_credentials(
     ready, reason = custom_b5_lineup_ready(cfg)
     assert ready is True
     assert reason == ""
+
+
+def test_custom_b5_resolves_each_non_primary_member_from_its_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.provider.ensemble import custom_b5_lineup_ready
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    cfg = GatewayConfig(
+        llm={
+            "provider": "volcengine",
+            "model": "doubao-primary",
+            "api_key": "volc-key",
+            "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        },
+        llm_profiles={
+            "openai": LlmProviderProfile(
+                api_key="openai-profile-key",
+                base_url="https://openai-profile.example/v1",
+                proxy="http://openai-proxy.example:8080",
+            ),
+            "deepseek": LlmProviderProfile(
+                api_key="deepseek-profile-key",
+                base_url="https://deepseek-profile.example/v1",
+            ),
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "custom_b5",
+            "candidates": [
+                {"provider": "volcengine", "model": "doubao-proposer"},
+                {"provider": "openai", "model": "gpt-proposer"},
+                {
+                    "provider": "deepseek",
+                    "model": "deepseek-aggregator",
+                    "role": "aggregator",
+                },
+            ],
+        },
+    )
+    inherited = ProviderConfig(
+        provider="volcengine",
+        model="doubao-primary",
+        api_key="volc-key",
+        base_url="https://ark.cn-beijing.volces.com/api/v3",
+    )
+
+    assert custom_b5_lineup_ready(cfg, inherited) == (True, "")
+    ensemble = build_ensemble_provider_from_config(
+        config=cfg,
+        inherited_provider_config=inherited,
+        fallback_provider=None,
+    )
+
+    members = [*ensemble.proposers, ensemble.aggregator]
+    by_provider = {member.provider_config.provider: member.provider_config for member in members}
+    assert by_provider["volcengine"].api_key == "volc-key"
+    assert by_provider["volcengine"].replay_provider_state is False
+    assert by_provider["openai"].api_key == "openai-profile-key"
+    assert by_provider["openai"].base_url == "https://openai-profile.example/v1"
+    assert by_provider["openai"].proxy == "http://openai-proxy.example:8080"
+    assert by_provider["openai"].replay_provider_state is False
+    assert by_provider["deepseek"].api_key == "deepseek-profile-key"
+    assert by_provider["deepseek"].base_url == "https://deepseek-profile.example/v1"
+    assert by_provider["deepseek"].replay_provider_state is False
+
+
+def test_cross_provider_ensemble_disables_replay_on_internal_fallback_adapters() -> None:
+    from opensquilla.provider.anthropic import AnthropicProvider
+    from opensquilla.provider.openai import OpenAIProvider
+
+    cfg = GatewayConfig(
+        llm={
+            "provider": "volcengine",
+            "model": "doubao-primary",
+            "api_key": "primary-key",
+        },
+        llm_profiles={
+            "openai": LlmProviderProfile(api_key="profile-key"),
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "custom_b5",
+            "candidates": [
+                {"provider": "volcengine", "model": "doubao-proposer"},
+                {"provider": "openai", "model": "gpt-proposer"},
+                {
+                    "provider": "openai",
+                    "model": "gpt-aggregator",
+                    "role": "aggregator",
+                },
+            ],
+        },
+    )
+    inherited = ProviderConfig(
+        provider="volcengine",
+        model="doubao-primary",
+        api_key="primary-key",
+    )
+    fallbacks = [
+        OpenAIProvider(
+            api_key="primary-key",
+            model="deepseek/deepseek-v4-pro",
+            provider_kind="openrouter",
+            replay_provider_state=True,
+        ),
+        AnthropicProvider(
+            api_key="primary-key",
+            model="minimax-primary",
+            replay_provider_state=True,
+        ),
+    ]
+
+    for fallback in fallbacks:
+        build_ensemble_provider_from_config(
+            config=cfg,
+            inherited_provider_config=inherited,
+            fallback_provider=fallback,
+        )
+        assert fallback._replay_provider_state is False
+        if isinstance(fallback, OpenAIProvider):
+            wire_messages = _build_openai_wire_messages(
+                [
+                    Message(
+                        role="assistant",
+                        content="portable answer",
+                        reasoning_content="foreign-private-reasoning",
+                    )
+                ],
+                ChatConfig(
+                    thinking=True,
+                    model_capabilities=ModelCapabilities(
+                        supports_reasoning=True,
+                        reasoning_format="openrouter",
+                    ),
+                ),
+                policy=compat_policy_for_kind("openrouter"),
+                provider_kind="openrouter",
+                model="deepseek/deepseek-v4-pro",
+                replay_provider_state=fallback._replay_provider_state,
+                reasoning_echo_turns=None,
+            )
+            assert "reasoning_content" not in wire_messages[0]
+
+
+@pytest.mark.asyncio
+async def test_cross_provider_ensemble_disables_late_plugin_selector_fallback_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.engine.runtime import _SelectorFallbackProvider
+    from opensquilla.provider.selector import ModelSelector, SelectorConfig
+    from opensquilla.provider.types import DoneEvent, ErrorEvent, TextDeltaEvent
+
+    plugin_fallback_config = ProviderConfig(
+        provider="anthropic",
+        model="plugin-fallback",
+        api_key="plugin-test-key",
+        replay_provider_state=True,
+    )
+
+    class _Plugin:
+        def failover_hook(self, primary_failure: Exception) -> list[ProviderConfig]:
+            del primary_failure
+            return [plugin_fallback_config]
+
+    class _PrimaryAdapter:
+        provider_name = "openrouter"
+
+        def __init__(self) -> None:
+            self.replay_provider_state = True
+
+        def disable_provider_state_replay(self) -> None:
+            self.replay_provider_state = False
+
+    class _FallbackAdapter:
+        provider_name = "anthropic"
+
+        async def chat(self, messages, tools=None, config=None):
+            del messages, tools, config
+            yield TextDeltaEvent(text="fallback answer")
+            yield DoneEvent(model="plugin-fallback", input_tokens=1, output_tokens=1)
+
+    selector_builds: list[ProviderConfig] = []
+
+    def build_selector_provider(provider_config: ProviderConfig):
+        selector_builds.append(provider_config)
+        if provider_config.model == "plugin-fallback":
+            return _FallbackAdapter()
+        return _PrimaryAdapter()
+
+    monkeypatch.setattr(
+        "opensquilla.provider.selector._build_provider",
+        build_selector_provider,
+    )
+
+    class _MemberAdapter:
+        def __init__(self, model: str) -> None:
+            self.model = model
+            self.provider_name = "openai"
+
+        async def chat(self, messages, tools=None, config=None):
+            del messages, tools, config
+            if self.model == "aggregator-model":
+                yield ErrorEvent(message="rate limited", code="429")
+                return
+            yield TextDeltaEvent(text="candidate")
+            yield DoneEvent(model=self.model, input_tokens=1, output_tokens=1)
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        lambda provider_config: _MemberAdapter(provider_config.model),
+    )
+
+    shared_selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig(
+                provider="volcengine",
+                model="primary-model",
+                api_key="primary-test-key",
+                replay_provider_state=True,
+            )
+        ),
+        plugin=_Plugin(),
+    )
+    turn_selector = shared_selector.clone()
+    direct_fallback = turn_selector.resolve()
+    cfg = GatewayConfig(
+        llm={
+            "provider": "volcengine",
+            "model": "primary-model",
+            "api_key": "primary-test-key",
+        },
+        llm_profiles={
+            "openai": LlmProviderProfile(api_key="profile-test-key"),
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "custom_b5",
+            "min_successful_proposers": 1,
+            "shuffle_candidates": False,
+            "candidates": [
+                {"provider": "volcengine", "model": "proposer-model"},
+                {"provider": "volcengine", "model": "proposer-model-2"},
+                {
+                    "provider": "openai",
+                    "model": "aggregator-model",
+                    "role": "aggregator",
+                },
+            ],
+        },
+    )
+    ensemble = build_ensemble_provider_from_config(
+        config=cfg,
+        inherited_provider_config=turn_selector.current_config,
+        fallback_provider=direct_fallback,
+        _fallback_selector=turn_selector,
+    )
+    wrapper = _SelectorFallbackProvider(ensemble, turn_selector)
+
+    events = [
+        event
+        async for event in wrapper.chat([Message(role="user", content="synthetic")])
+    ]
+
+    assert any(
+        isinstance(event, TextDeltaEvent) and event.text == "fallback answer"
+        for event in events
+    )
+    assert selector_builds[-1].model == "plugin-fallback"
+    assert selector_builds[-1].replay_provider_state is False
+    assert turn_selector.current_config.replay_provider_state is False
+    assert direct_fallback.replay_provider_state is False
+    assert plugin_fallback_config.replay_provider_state is True
+    assert shared_selector.current_config.replay_provider_state is True
+
+
+def test_custom_b5_uses_shared_session_pinned_profile_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.engine.selector_override import (
+        acquire_profile_credential,
+        report_profile_credential_failure,
+    )
+    from opensquilla.gateway.llm_runtime import (
+        reset_profile_credential_pools,
+    )
+    from opensquilla.provider.ensemble import custom_b5_lineup_ready
+
+    env_a = "OPENSQUILLA_TEST_ENSEMBLE_OPENAI_A"
+    env_b = "OPENSQUILLA_TEST_ENSEMBLE_OPENAI_B"
+    key_a = "sk-test-ensemble-a"
+    key_b = "sk-test-ensemble-b"
+    monkeypatch.setenv(env_a, key_a)
+    monkeypatch.setenv(env_b, key_b)
+    reset_profile_credential_pools()
+    cfg = GatewayConfig(
+        llm={
+            "provider": "volcengine",
+            "model": "doubao-primary",
+            "api_key": "volc-key",
+            "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        },
+        llm_profiles={
+            "openai": LlmProviderProfile(api_key_env_pool=[env_a, env_b]),
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "custom_b5",
+            "candidates": [
+                {"provider": "volcengine", "model": "doubao-proposer"},
+                {"provider": "openai", "model": "gpt-proposer"},
+                {
+                    "provider": "openai",
+                    "model": "gpt-aggregator",
+                    "role": "aggregator",
+                },
+            ],
+        },
+    )
+    inherited = ProviderConfig(
+        provider="volcengine",
+        model="doubao-primary",
+        api_key="volc-key",
+        base_url="https://ark.cn-beijing.volces.com/api/v3",
+    )
+
+    try:
+        assert custom_b5_lineup_ready(
+            cfg,
+            inherited,
+            credential_pool_acquirer=acquire_profile_credential,
+            session_key="ensemble-session",
+        ) == (True, "")
+        first = build_ensemble_provider_from_config(
+            config=cfg,
+            inherited_provider_config=inherited,
+            fallback_provider=None,
+            _credential_pool_acquirer=acquire_profile_credential,
+            _credential_pool_failure_reporter=report_profile_credential_failure,
+            _session_key="ensemble-session",
+        )
+        first_openai_keys = {
+            member.provider_config.api_key
+            for member in [*first.proposers, first.aggregator]
+            if member.provider_config.provider == "openai"
+        }
+        assert len(first_openai_keys) == 1
+        first_key = first_openai_keys.pop()
+
+        openai_member = next(
+            member
+            for member in [*first.proposers, first.aggregator]
+            if member.provider_config.provider == "openai"
+        )
+        first._report_member_credential_failure(
+            openai_member,
+            message="invalid api key",
+            code="401",
+        )
+        second = build_ensemble_provider_from_config(
+            config=cfg,
+            inherited_provider_config=inherited,
+            fallback_provider=None,
+            _credential_pool_acquirer=acquire_profile_credential,
+            _credential_pool_failure_reporter=report_profile_credential_failure,
+            _session_key="ensemble-session",
+        )
+        second_openai_keys = {
+            member.provider_config.api_key
+            for member in [*second.proposers, second.aggregator]
+            if member.provider_config.provider == "openai"
+        }
+        assert second_openai_keys == ({key_a, key_b} - {first_key})
+    finally:
+        reset_profile_credential_pools()

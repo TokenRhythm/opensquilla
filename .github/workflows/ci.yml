@@ -89,11 +89,13 @@ jobs:
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -color=false
 
   frontend-check:
-    name: Frontend build and typecheck
+    name: Frontend build, tests, and artifact
     needs: classify-changes
-    if: ${{ needs.classify-changes.outputs.frontend_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
+    # This job owns the generated package input. Source-only Python tests stay
+    # parallel; only packaging/browser/desktop consumers wait for this artifact.
+    if: ${{ needs.classify-changes.outputs.frontend_changed == 'true' || needs.classify-changes.outputs.build_wheel_required == 'true' || needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.desktop_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -101,7 +103,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20.19.0'
+          node-version-file: opensquilla-webui/.node-version
           cache: 'npm'
           cache-dependency-path: opensquilla-webui/package-lock.json
 
@@ -110,33 +112,102 @@ jobs:
         run: npm ci
 
       - name: Run frontend unit tests
+        if: ${{ needs.classify-changes.outputs.frontend_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
         working-directory: opensquilla-webui
         run: npm run test:unit
 
-      - name: Build frontend
-        working-directory: opensquilla-webui
-        run: npm run build
-
-      - name: Verify committed dist is fresh
+      - name: Verify generated dist is not tracked
+        shell: bash
         run: |
-          if [ ! -f "src/opensquilla/gateway/static/dist/index.html" ]; then
-            echo "ERROR: Frontend dist not found"
+          tracked="$(git ls-files 'src/opensquilla/gateway/static/dist/**')"
+          if [[ -n "${tracked}" ]]; then
+            echo "ERROR: generated Web UI dist must not be committed:" >&2
+            printf '%s\n' "${tracked}" >&2
             exit 1
           fi
-          # The build above regenerates src/opensquilla/gateway/static/dist. If
-          # the committed dist differs from a fresh build, a Web UI source change
-          # was made without rebuilding + committing the bundle it ships (the
-          # gateway serves the committed dist, not source). Fail so a stale
-          # bundle can never ship (e.g. an approval-button removal that only
-          # lands in source — the #413 residue).
-          if ! git diff --quiet -- src/opensquilla/gateway/static/dist; then
-            echo "ERROR: committed Web UI dist is stale — rebuild and commit it:"
-            echo "  cd opensquilla-webui && npm ci && npm run build"
-            echo "Changed dist files:"
-            git --no-pager diff --stat -- src/opensquilla/gateway/static/dist
+
+      - name: Build verified frontend artifact
+        working-directory: opensquilla-webui
+        shell: bash
+        env:
+          FRONTEND_CHANGED: ${{ needs.classify-changes.outputs.frontend_changed }}
+          FULL_REQUIRED: ${{ needs.classify-changes.outputs.full_required }}
+        run: |
+          # Vite copies public/ verbatim. Prove the canonical normalization
+          # strips harmless Finder metadata before the manifest is written.
+          printf 'CI-only Finder metadata\n' > public/.DS_Store
+          if [[ "${FRONTEND_CHANGED}" == "true" || "${FULL_REQUIRED}" == "true" ]]; then
+            npm run build
+          else
+            npm run build:artifact
+          fi
+          if [[ -e ../src/opensquilla/gateway/static/dist/.DS_Store ]]; then
+            echo "ERROR: Finder metadata survived WebUI artifact normalization" >&2
             exit 1
           fi
-          echo "Frontend dist verified fresh"
+          npm run verify:release-dist
+
+      - name: Set up Python
+        if: ${{ needs.classify-changes.outputs.build_wheel_required == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        if: ${{ needs.classify-changes.outputs.build_wheel_required == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Verify sdist-to-wheel frontend artifact round trip
+        if: ${{ needs.classify-changes.outputs.build_wheel_required == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
+        shell: bash
+        run: |
+          package_dir="${RUNNER_TEMP}/webui-package"
+          wheel_dir="${RUNNER_TEMP}/webui-wheel"
+          mkdir -p "${package_dir}" "${wheel_dir}"
+
+          # Finder metadata is ignored by Git and must not affect the canonical
+          # source fingerprint or enter a source distribution.
+          junk="opensquilla-webui/src/.DS_Store"
+          trap 'rm -f "${junk}"' EXIT
+          printf 'CI-only Finder metadata\n' > "${junk}"
+
+          uv build --sdist --out-dir "${package_dir}"
+          sdists=("${package_dir}"/opensquilla-*.tar.gz)
+          if [[ "${#sdists[@]}" -ne 1 || ! -f "${sdists[0]}" ]]; then
+            echo "ERROR: expected exactly one OpenSquilla sdist" >&2
+            exit 1
+          fi
+          tar_listing="${package_dir}/sdist-files.txt"
+          tar -tzf "${sdists[0]}" > "${tar_listing}"
+          if grep -qE '(^|/)\.DS_Store$' "${tar_listing}"; then
+            echo "ERROR: ignored Finder metadata leaked into the sdist" >&2
+            exit 1
+          fi
+
+          uv build --wheel --out-dir "${wheel_dir}" "${sdists[0]}"
+          wheels=("${wheel_dir}"/opensquilla-*.whl)
+          if [[ "${#wheels[@]}" -ne 1 || ! -f "${wheels[0]}" ]]; then
+            echo "ERROR: expected exactly one OpenSquilla wheel" >&2
+            exit 1
+          fi
+          python scripts/verify_webui_artifact.py \
+            --forbid-personal-bgm \
+            --wheel "${wheels[0]}"
+
+      - name: Upload verified frontend artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # Stable across rerun attempts: "re-run failed jobs" does not rerun
+          # an already-successful producer, so consumers must reuse its name.
+          name: opensquilla-webui-dist
+          path: src/opensquilla/gateway/static/dist/
+          if-no-files-found: error
+          # GitHub permits reruns for 30 days; keep the producer artifact for
+          # the full window so a failed-only consumer rerun can still reuse it.
+          retention-days: 31
+          overwrite: true
 
   tui-check:
     name: OpenTUI package tests
@@ -151,12 +222,12 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20.19.0'
+          node-version-file: opensquilla-webui/.node-version
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: src/opensquilla/cli/tui/opentui/package/.bun-version
 
       - name: Install OpenTUI host dependencies
         working-directory: src/opensquilla/cli/tui/opentui/package
@@ -169,7 +240,20 @@ jobs:
 
       - name: Run OpenTUI Bun tests
         working-directory: src/opensquilla/cli/tui/opentui/package
-        run: bun run test:bun
+        shell: bash
+        run: |
+          set +e
+          for attempt in 1 2; do
+            bun run test:bun
+            status=$?
+            if [ "$status" -eq 0 ]; then
+              exit 0
+            fi
+            if [ "$status" -ne 132 ] || [ "$attempt" -eq 2 ]; then
+              exit "$status"
+            fi
+            echo "::warning::Bun exited with SIGILL (132); retrying once."
+          done
 
   desktop-check:
     name: Desktop Electron unit tests
@@ -189,7 +273,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20.19.0'
+          node-version: '22.12.0'
           cache: 'npm'
           cache-dependency-path: desktop/electron/package-lock.json
 
@@ -204,13 +288,15 @@ jobs:
       - name: Run desktop unit tests
         working-directory: desktop/electron
         run: |
-          node scripts/test-onboarding-data-flow.mjs
           node scripts/test-secret-storage-policy.mjs
           node scripts/test-update-resolver.mjs
           node scripts/test-update-check-scheduler.mjs
           node scripts/test-desktop-locale.mjs
           node scripts/test-desktop-profile-substrate.mjs
           node scripts/test-desktop-profile-context.mjs
+          node scripts/test-desktop-gateway-ownership.mjs
+          node scripts/test-desktop-gateway-lifecycle.mjs
+          node scripts/test-desktop-window-lifecycle.mjs
           node scripts/test-desktop-cleanup-contract.mjs
 
   ubuntu-quality:
@@ -224,6 +310,7 @@ jobs:
       UV_PYTHON: "3.12"
       PYTHONPATH: ${{ github.workspace }}
       OPENSQUILLA_TURN_CALL_LOG: "0"
+      OPENSQUILLA_DOCKERIGNORE_E2E: "1"
 
     steps:
       - name: Check out repository
@@ -278,6 +365,11 @@ jobs:
             tests/test_tools/test_shell_process_isolation.py \
             -q -m "${markers}" --durations=50
 
+      - name: Test Docker build-context exclusions in full CI
+        if: ${{ needs.classify-changes.outputs.full_required == 'true' }}
+        shell: bash
+        run: uv run pytest tests/test_ci/test_dockerignore_context.py -q
+
       - name: Verify metric counter names unchanged
         shell: bash
         run: |
@@ -295,11 +387,6 @@ jobs:
         shell: bash
         run: |
           uv run python -m pytest tests/test_gateway/test_task_runtime_terminal_cleanup.py::test_no_leak_under_load -v
-
-      - name: Build wheel
-        if: ${{ needs.classify-changes.outputs.build_wheel_required == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
-        shell: bash
-        run: uv build --wheel
 
   ubuntu-full:
     name: Full offline tests (ubuntu-latest, ${{ matrix.shard }})
@@ -491,7 +578,7 @@ jobs:
         if: ${{ matrix.shard == 'core' }}
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: src/opensquilla/cli/tui/opentui/package/.bun-version
 
       - name: Install OpenTUI host dependencies
         if: ${{ matrix.shard == 'core' }}
@@ -720,7 +807,7 @@ jobs:
 
   desktop-recovery-e2e:
     name: Desktop recovery E2E (${{ matrix.os }})
-    needs: classify-changes
+    needs: [classify-changes, frontend-check]
     if: ${{ needs.classify-changes.outputs.frontend_changed == 'true' || needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.desktop_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
     strategy:
       fail-fast: false
@@ -753,6 +840,12 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Download verified frontend artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: opensquilla-webui-dist
+          path: src/opensquilla/gateway/static/dist/
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -766,9 +859,13 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20.19.0'
+          node-version: '22.12.0'
           cache: 'npm'
           cache-dependency-path: desktop/electron/package-lock.json
+
+      - name: Verify downloaded frontend artifact on consumer OS
+        shell: bash
+        run: node opensquilla-webui/scripts/verify-dist.mjs src/opensquilla/gateway/static/dist
 
       - name: Install Python dependencies
         shell: bash
@@ -818,6 +915,8 @@ jobs:
             'profile-recovery-flow:scripts/test-profile-recovery-flow.mjs' \
             'profile-recovery-accessibility:scripts/test-profile-recovery-accessibility.mjs' \
             'profile-import-flow:scripts/test-profile-import-flow.mjs' \
+            'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs' \
+            'window-background-flow:scripts/test-desktop-window-background-flow.mjs' \
             'unsafe-profile-no-write:scripts/test-unsafe-profile-no-write.mjs'
           do
             name="${entry%%:*}"
@@ -892,7 +991,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20.19.0'
+          node-version-file: opensquilla-webui/.node-version
 
       - name: Check README locale parity
         working-directory: opensquilla-webui

@@ -1135,6 +1135,11 @@ def move_profile_no_replace(
     compatibility lock handles inside the profile are briefly released and
     reacquired by verified file identity. No copy/delete or replacement
     fallback is permitted.
+
+    Whole-profile moves preserve the profile contract without dereferencing
+    links: descendants of a real ``workspace`` are verified as link leaves,
+    while a real ``code-task`` directory is moved opaquely. The generic native
+    move primitive remains strict unless this wrapper selects that policy.
     """
 
     if move is None:
@@ -1161,13 +1166,17 @@ def move_profile_no_replace(
                 destination_path,
             ),
             _allowed_manifest_mtime_changes=allowed_mtime_changes,
-            _opaque_manifest_directories=frozenset({"sandbox"}),
+            _use_profile_manifest_policy=True,
         )
         return
     with _LOCKS_GUARD:
         _refresh_after_fork()
         moves = _held_legacy_lock_moves(source_path, destination_path)
-        move(source_path, destination_path)
+        move(
+            source_path,
+            destination_path,
+            _use_profile_manifest_policy=True,
+        )
         rebound: list[_LegacyLockMove] = []
         try:
             for item in moves:
@@ -1175,7 +1184,11 @@ def move_profile_no_replace(
                 rebound.append(item)
         except BaseException:
             try:
-                move(destination_path, source_path)
+                move(
+                    destination_path,
+                    source_path,
+                    _use_profile_manifest_policy=True,
+                )
                 for item in reversed(rebound):
                     rebind_legacy_gateway_lock(
                         item.destination_state,

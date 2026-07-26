@@ -6,6 +6,57 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Closing the Desktop main window now preserves the live Control UI on macOS
+  and keeps Windows reachable from a system tray icon. Explicit **Quit
+  OpenSquilla** still drains and stops the local Gateway, and the close behavior
+  can be changed in Runtime settings.
+
+## [0.5.0] - 2026-07-23
+
+OpenSquilla 0.5.0 is the first stable release of the 0.5 line, collecting the
+0.5.0rc1–rc4 preview work below plus the changes since Preview 4.
+
+### Added
+
+- Source checkouts can opt into the full-screen OpenTUI chat with shared
+  Gateway sessions, turn/tool/reasoning presentation, Router/Ensemble controls,
+  and guarded terminal restoration. Companion hosts remain development-only:
+  this change does not add release assets or alter the release installer.
+
+### Changed
+
+- Telegram edited messages no longer start a new agent turn. Previously,
+  editing an earlier message re-triggered the bot; edited updates are now
+  dropped deliberately so an edit is not double-billed as a new request. In
+  private chats the bot replies once per chat explaining that edits are
+  ignored and the corrected text should be sent as a new message.
+- `opensquilla chat` uses automatic renderer selection without treating stale
+  internal backend environment state as a user request. Release installs keep
+  the Python-native chat when no compatible host is installed.
+- Generated Vue control-console files are no longer tracked in Git. Release
+  wheels, Desktop installers, and container images still include the CI-built
+  console and require no Node.js at install time. Source installs and wheelhouse
+  builds now require Node.js 22.12+ with npm and build the console from the
+  locked frontend dependencies before packaging.
+- Optional profile migration is now available only from **Settings → Advanced
+  → Data maintenance**. Onboarding, the sidebar, Doctor, and native upgrade
+  prompts stay silent; gateway startup logs a single advisory line when a
+  fresh profile boots beside importable legacy data so headless operators can
+  find their previous home. Desktop can still preview and apply a guarded
+  whole-profile replacement, while Web administrators receive a path-free,
+  read-only preview.
+
+### Fixed
+
+- OpenSquilla profile transfers now leave machine-local `code-task` run
+  worktrees in the source and preserve lexically contained relative workspace
+  links on POSIX without dereferencing them. Existing-profile backup and
+  restore keeps canonical and historical workspace links as no-follow leaves;
+  source imports still fail closed on absolute or escaping workspace links and
+  Windows reparse points.
+
 ## [0.5.0rc4] - 2026-07-13
 
 ### Added

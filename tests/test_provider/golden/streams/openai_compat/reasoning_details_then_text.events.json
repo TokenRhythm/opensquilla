@@ -21,10 +21,12 @@
     "model": "gpt-test-1",
     "model_usage_breakdown": [],
     "output_tokens": 7,
+    "provider": "openai",
     "reasoning_content": "Check the map. Pick a route.",
     "reasoning_tokens": 5,
     "stop_reason": "stop",
     "thinking_signature": null,
-    "type": "DoneEvent"
+    "type": "DoneEvent",
+    "usage_missing_count": 0
   }
 ]

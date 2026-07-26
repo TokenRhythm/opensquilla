@@ -7,6 +7,7 @@ import { sharedRoutes } from './sharedRoutes'
 import { webRoutes } from './webRoutes'
 import { captureContentScroll, contentScrollBehavior } from './scrollMemory'
 import { saveLastRoute } from './lastRoute'
+import { legacyChannelHashRedirect } from './legacyRedirects'
 
 const basePath = (() => {
   const el = document.getElementById('opensquilla-data')
@@ -15,11 +16,13 @@ const basePath = (() => {
 })()
 
 const platform = getPlatform()
+const NotFoundView = () => import('@/views/NotFoundView.vue')
 
 export const routes: RouteRecordRaw[] = [
   ...sharedRoutes,
   ...(platform.capabilities.hasWebConfig ? webRoutes : []),
   ...(platform.capabilities.hasDesktopOnboarding ? desktopRoutes : []),
+  { path: '/:pathMatch(.*)*', name: 'not-found', component: NotFoundView, meta: { title: 'Not Found', platforms: ['web', 'desktop'] } },
 ]
 
 export const router = createRouter({
@@ -33,11 +36,19 @@ router.beforeEach((_to, from) => {
   captureContentScroll(from)
 })
 
+// Stale channel-setup bookmarks (#channel-… hashes) land on the workspace.
+router.beforeEach((to) => legacyChannelHashRedirect(to) ?? true)
+
 // Localize the document title from the route name token (e.g. `nav.sessions`),
 // falling back to the English meta.title. `applyRouteTitle` is also re-run when
 // the locale changes (App.vue watches the store) since afterEach does not
 // re-fire without a navigation.
 export function routeTitle(route: RouteLocationNormalized): string {
+  const explicitKey = route.meta?.titleKey
+  if (explicitKey) {
+    const translated = i18n.global.t(explicitKey)
+    if (translated !== explicitKey) return translated
+  }
   const name = typeof route.name === 'string' ? route.name : ''
   if (name) {
     const key = `nav.${name}`

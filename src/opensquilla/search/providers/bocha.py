@@ -8,6 +8,7 @@ from typing import Any
 import httpx
 
 from opensquilla.search.registry import register_provider
+from opensquilla.search.retry_policy import is_retryable_http_status
 from opensquilla.search.types import (
     Recency,
     SearchErrorKind,
@@ -131,6 +132,13 @@ class BochaSearchProvider:
                 message="Bocha search returned malformed JSON.",
                 retryable=False,
             ) from exc
+        if not isinstance(data, dict):
+            raise SearchProviderError(
+                provider=self.name,
+                kind="parse",
+                message="Bocha search returned an invalid response payload.",
+                retryable=False,
+            )
 
         _raise_for_api_error(data)
         return [
@@ -148,11 +156,8 @@ def _classify_status(status_code: int) -> SearchErrorKind:
 
 
 def _is_retryable_status(status_code: int, kind: SearchErrorKind) -> bool:
-    if status_code == 429:
-        return True
-    if kind == "http":
-        return True
-    return False
+    del kind
+    return is_retryable_http_status(status_code)
 
 
 def _raise_for_api_error(data: dict[str, Any]) -> None:
@@ -160,13 +165,17 @@ def _raise_for_api_error(data: dict[str, Any]) -> None:
     status_code = _api_status_code(code)
     if code is None or status_code == 200:
         return
-    kind = _classify_status(status_code or 500)
+    kind: SearchErrorKind = (
+        _classify_status(status_code) if status_code is not None else "http"
+    )
     message = str(data.get("msg") or data.get("message") or "Bocha search request failed.")
     raise SearchProviderError(
         provider="bocha",
         kind=kind,
         message=message,
-        retryable=_is_retryable_status(status_code or 500, kind),
+        retryable=(
+            _is_retryable_status(status_code, kind) if status_code is not None else False
+        ),
         status_code=status_code,
     )
 

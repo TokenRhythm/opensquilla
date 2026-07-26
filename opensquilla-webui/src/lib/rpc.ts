@@ -4,6 +4,17 @@ export interface RpcErrorDetail {
   code?: string;
   message?: string;
   details?: unknown;
+  retryable?: boolean;
+  retry_after_ms?: number;
+  accepted?: boolean;
+}
+
+export interface RpcClientError extends Error {
+  code?: string;
+  details?: unknown;
+  retryable?: boolean;
+  retry_after_ms?: number;
+  accepted?: boolean;
 }
 
 export interface RpcFrame {
@@ -18,6 +29,11 @@ export interface RpcFrame {
   error?: string | RpcErrorDetail;
   protocol?: number;
   policy?: Record<string, unknown>;
+  features?: {
+    methods?: string[];
+    events?: string[];
+  };
+  auth?: Record<string, unknown>;
   seq?: number;
 }
 
@@ -25,7 +41,6 @@ export type ConnectionState = 'disconnected' | 'connecting' | 'connected';
 export type RpcEventHandler = {
   bivarianceHack(...args: unknown[]): void;
 }['bivarianceHack'];
-type RpcClientError = Error & { code?: string; details?: unknown };
 
 export class RpcClient {
   private _ws: WebSocket | null = null;
@@ -201,6 +216,9 @@ export class RpcClient {
             if (err && typeof err === 'object') {
               error.code = err.code;
               error.details = err.details;
+              error.retryable = err.retryable;
+              error.retry_after_ms = err.retry_after_ms;
+              error.accepted = err.accepted;
             }
             p.reject(error);
           }

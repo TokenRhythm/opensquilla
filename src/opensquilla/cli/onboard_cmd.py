@@ -438,7 +438,7 @@ def _print_optional_action_handoff(
 
 
 def _probe_saved_provider(cfg) -> bool:
-    """Run a live one-token probe against the just-saved provider config.
+    """Run a small live probe against the just-saved provider config.
 
     Only invoked behind ``--probe`` on the non-interactive provider path so CI
     can gate on real credentials; the default path never touches the network.
@@ -554,7 +554,7 @@ def onboard_command(
         False,
         "--probe",
         help=(
-            "With --provider: verify the saved provider with a live one-token "
+            "With --provider: verify the saved provider with a small live "
             "probe and exit non-zero on probe failure (CI-friendly)."
         ),
     ),
@@ -763,6 +763,7 @@ def _status_payload(status: OnboardingStatus) -> dict:
         "llmSource": status.llm_source,
         "llmEnvKey": status.llm_env_key,
         "llmCredentialStatus": dict(status.llm_credential_status),
+        "llmProfileStatus": [dict(row) for row in status.llm_profile_status],
         "searchConfigured": status.search_configured,
         "searchProvider": status.search_provider,
         "searchSource": status.search_source,
@@ -787,8 +788,8 @@ def _status_payload(status: OnboardingStatus) -> dict:
         "channelCount": status.channel_count,
         "channelsConfigured": status.channels_configured,
         "warnings": list(status.warnings),
-        # Shared with the RPC payload (superset contract): the read-only
-        # legacy-home advisory block, or null when nothing is detected.
+        # Shared with the RPC payload as a frozen compatibility key. Migration
+        # discovery is settings-only, so this remains null.
         "legacyData": legacy_data_payload(),
     }
 

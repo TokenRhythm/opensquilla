@@ -145,11 +145,26 @@ def test_cross_provider_tier_warning_text() -> None:
     warnings = _cross_provider_tier_warnings(
         {"c2": {"provider": "openai", "model": "gpt-5.5"}},
         "openrouter",
+        tier_provider_mismatch="veto",
     )
     assert len(warnings) == 1
     assert "'c2'" in warnings[0]
     assert "'openai'" in warnings[0]
     assert "not enabled" in warnings[0]
+    assert "choice is vetoed" in warnings[0]
+    assert "current 'openrouter' deployment" in warnings[0]
+    assert "model will be requested" not in warnings[0]
+
+
+def test_cross_provider_tier_warning_preserves_legacy_route_semantics() -> None:
+    warnings = _cross_provider_tier_warnings(
+        {"c2": {"provider": "openai", "model": "gpt-5.5"}},
+        "openrouter",
+        tier_provider_mismatch="route",
+    )
+    assert len(warnings) == 1
+    assert "model will be requested from 'openrouter'" in warnings[0]
+    assert "choice is vetoed" not in warnings[0]
 
 
 def test_cross_provider_warning_flips_to_credential_check_when_enabled(monkeypatch) -> None:
@@ -169,6 +184,58 @@ def test_cross_provider_warning_flips_to_credential_check_when_enabled(monkeypat
         )
         == []
     )
+
+
+def test_cross_provider_warning_matches_runtime_for_operator_owned_endpoints(
+    monkeypatch,
+) -> None:
+    """Save-time warnings mirror the runtime deployment resolver: an azure-style
+    tier with the env key set but no profile base_url is vetoed at turn time,
+    so the save must warn (previously the plain env lookup stayed silent)."""
+    from opensquilla.gateway.config import LlmProviderProfile
+
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "sk-azure-env")
+    tiers = {"c2": {"provider": "azure", "model": "gpt-tier"}}
+
+    warnings = _cross_provider_tier_warnings(
+        tiers, "openrouter", cross_provider_enabled=True, llm_profiles=None
+    )
+    assert len(warnings) == 1
+    assert "no endpoint resolves" in warnings[0]
+    assert "llm_profiles.azure" in warnings[0]
+
+    # With the operator-supplied endpoint stored, the registry env key
+    # resolves at runtime — and the save-time check must agree.
+    assert (
+        _cross_provider_tier_warnings(
+            tiers,
+            "openrouter",
+            cross_provider_enabled=True,
+            llm_profiles={
+                "azure": LlmProviderProfile(
+                    base_url="https://acct.azure-endpoint.example/v1"
+                )
+            },
+        )
+        == []
+    )
+
+
+def test_cross_provider_warning_accepts_case_variant_profile_keys(monkeypatch) -> None:
+    from opensquilla.gateway.config import LlmProviderProfile
+
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    tiers = {"c2": {"provider": "deepseek", "model": "deepseek-tier"}}
+
+    warnings = _cross_provider_tier_warnings(
+        tiers,
+        "openrouter",
+        cross_provider_enabled=True,
+        # Hand-authored configs predate key normalization; the runtime
+        # resolver accepts the case variant, so the save-time check must too.
+        llm_profiles={"DeepSeek": LlmProviderProfile(api_key="sk-profile")},
+    )
+    assert warnings == []
 
 
 def test_upsert_router_surfaces_cross_provider_warning() -> None:

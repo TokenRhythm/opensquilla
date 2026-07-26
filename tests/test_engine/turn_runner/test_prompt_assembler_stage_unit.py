@@ -222,6 +222,7 @@ def _make_input(
     bound_user_message_id=None,
     ingress_pipeline_steps=None,
     input_provenance=None,
+    skill_catalog=None,
 ):
     return PromptAssemblerStageInput(
         runtime_message=runtime_message,
@@ -244,6 +245,7 @@ def _make_input(
         bound_user_message_id=bound_user_message_id,
         ingress_pipeline_steps=ingress_pipeline_steps,
         input_provenance=input_provenance,
+        skill_catalog=skill_catalog,
     )
 
 
@@ -296,6 +298,33 @@ async def test_case01_plain_user_turn() -> None:
     assert o.squilla_router_tier == "T1"
     assert o.session_id_for_log == "session-id"
     assert o.trace_context_session_id == "session-id"
+
+
+@pytest.mark.asyncio
+async def test_provider_name_uses_selector_registry_identity_not_adapter_family() -> None:
+    selector = _StubSelector("selector")
+    selector.active_provider_id = "dashscope"
+    adapter = _StubProvider(name="adapter", provider_name="openai")
+    executor = _RecordingPipelineExecutor(turn=_make_turn(), provider=adapter)
+
+    out = await _make_stage(executor=executor).run(
+        _make_input(cloned_selector=selector)
+    )
+
+    assert out.output.provider_name == "dashscope"
+
+
+@pytest.mark.asyncio
+async def test_provider_name_uses_direct_adapter_configured_identity() -> None:
+    adapter = _StubProvider(name="adapter", provider_name="anthropic")
+    adapter.provider_id = "minimax"
+    executor = _RecordingPipelineExecutor(turn=_make_turn(), provider=adapter)
+
+    out = await _make_stage(executor=executor).run(
+        _make_input(provider=adapter, cloned_selector=None)
+    )
+
+    assert out.output.provider_name == "minimax"
 
 
 @pytest.mark.asyncio
@@ -392,6 +421,32 @@ async def test_case04_squilla_router_fires_overrides_model() -> None:
     assert inner is provider_after_pipeline
     assert out.output.resolved_model == "claude-sonnet-4.5"
     assert out.output.squilla_router_tier == "premium"
+
+
+@pytest.mark.asyncio
+async def test_blocked_cross_provider_route_resolves_primary_selector_model() -> None:
+    selector = _StubSelector("primary", current_model="qwen3.7-plus")
+    executor = _RecordingPipelineExecutor(
+        turn=_make_turn(
+            metadata={
+                "routed_provider": "volcengine",
+                "routed_model": "doubao-seed-1-6-251015",
+                "routed_provider_blocked": "missing_credential",
+                "executed_provider": "dashscope",
+                "executed_model": "qwen3.7-plus",
+            },
+            model="doubao-seed-1-6-251015",
+        ),
+        provider=_StubProvider("dashscope-primary"),
+    )
+
+    out = await _make_stage(executor=executor).run(
+        _make_input(cloned_selector=selector)
+    )
+
+    assert out.output.turn.model == "doubao-seed-1-6-251015"
+    assert out.output.selector_model == "qwen3.7-plus"
+    assert out.output.resolved_model == "qwen3.7-plus"
 
 
 @pytest.mark.asyncio
@@ -588,6 +643,17 @@ async def test_no_cloned_selector_skips_selector_block() -> None:
     # Provider is the post-pipeline provider unchanged (no wrap)
     assert type(out.output.provider).__name__ == "_StubProvider"
     assert out.output.selector_model == ""
+
+
+@pytest.mark.asyncio
+async def test_skill_catalog_is_forwarded_to_pipeline_unchanged() -> None:
+    catalog = object()
+    executor = _RecordingPipelineExecutor(turn=_make_turn(), provider=_StubProvider("pp"))
+    stage = _make_stage(executor=executor)
+
+    await stage.run(_make_input(skill_catalog=catalog))
+
+    assert executor.requests[0].skill_catalog is catalog
 
 
 def test_run_pipeline_request_is_frozen() -> None:

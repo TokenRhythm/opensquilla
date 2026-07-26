@@ -4,7 +4,13 @@ from pathlib import Path
 
 import pytest
 
-from opensquilla.sandbox.governance import ALLOW, ApprovalGate
+from opensquilla.sandbox.escalation import request_sandbox_approval
+from opensquilla.sandbox.governance import (
+    ALLOW,
+    ApprovalGate,
+    gate_execution,
+    on_successful_exec,
+)
 from opensquilla.sandbox.types import (
     MountSpec,
     NetworkMode,
@@ -13,6 +19,7 @@ from opensquilla.sandbox.types import (
     SandboxRequest,
     SecurityLevel,
 )
+from opensquilla.tools.types import ToolContext, current_tool_context
 
 
 class _RecordingQueue:
@@ -68,3 +75,86 @@ async def test_gate_enqueues_when_approval_required(tmp_path: Path) -> None:
 
     assert decision is ALLOW
     assert queue.requested is True
+
+
+@pytest.mark.asyncio
+async def test_gate_full_host_does_not_enqueue_required_approval(tmp_path: Path) -> None:
+    request = SandboxRequest(
+        argv=("shell.exec", f"rm {tmp_path / 'x'}"),
+        cwd=tmp_path,
+        action_kind="shell.exec",
+        policy=_policy(tmp_path),
+    )
+    queue = _RecordingQueue()
+    gate = ApprovalGate(queue)
+    token = current_tool_context.set(
+        ToolContext(
+            is_owner=True,
+            run_mode="full",
+            elevated="full",
+            session_key="s-full",
+        )
+    )
+    try:
+        decision = await gate.gate(request, request.policy, session_id="s-full")
+    finally:
+        current_tool_context.reset(token)
+
+    assert decision is ALLOW
+    assert queue.requested is False
+
+
+@pytest.mark.asyncio
+async def test_full_host_skips_ledger_and_success_cache(tmp_path: Path) -> None:
+    request = SandboxRequest(
+        argv=("shell.exec", "echo host"),
+        cwd=tmp_path,
+        action_kind="shell.exec",
+        policy=_policy(tmp_path),
+    )
+
+    class _FailLedger:
+        async def is_paused(self, session_id: str) -> bool:
+            raise AssertionError("Full Host must not access the denial ledger")
+
+    class _FailCache:
+        async def record_success(self, *args: object) -> None:
+            raise AssertionError("Full Host must not access the success cache")
+
+    token = current_tool_context.set(
+        ToolContext(is_owner=True, run_mode="full", session_key="s-full")
+    )
+    try:
+        decision = await gate_execution(
+            request,
+            request.policy,
+            session_id="s-full",
+            ledger=_FailLedger(),  # type: ignore[arg-type]
+            approval_gate=ApprovalGate(_RecordingQueue()),
+        )
+        fingerprint = await on_successful_exec(
+            request,
+            "output",
+            session_id="s-full",
+            cache=_FailCache(),  # type: ignore[arg-type]
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert decision is ALLOW
+    assert fingerprint == ""
+
+
+def test_full_host_sandbox_approval_helper_returns_without_validation_or_queue() -> None:
+    token = current_tool_context.set(
+        ToolContext(is_owner=True, run_mode="full", session_key="s-full")
+    )
+    try:
+        result = request_sandbox_approval(
+            None,  # type: ignore[arg-type]
+            message="must not be used",
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert result is None

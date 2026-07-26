@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -248,6 +249,7 @@ def test_run_elevated_setup_helper_launches_python_module_with_runas(
     marker = tmp_path / "setup_marker.json"
 
     monkeypatch.setattr(mod.sys, "executable", r"C:\Python312\python.exe")
+    monkeypatch.setattr(mod, "_current_windows_user_sid", lambda: "S-1-real")
 
     def fake_runas(*, executable, parameters, directory):
         launched["executable"] = executable
@@ -279,6 +281,7 @@ def test_run_elevated_setup_helper_reports_nonzero_exit(monkeypatch, tmp_path) -
     from opensquilla.sandbox.backend import windows_default_setup as mod
 
     monkeypatch.setattr(mod, "_shell_execute_runas_and_wait", lambda **kwargs: 9)
+    monkeypatch.setattr(mod, "_current_windows_user_sid", lambda: "S-1-real")
 
     with pytest.raises(OSError, match="windows_setup_helper_failed: exit=9"):
         mod.run_elevated_setup_helper(tmp_path / "setup_marker.json")
@@ -287,8 +290,11 @@ def test_run_elevated_setup_helper_reports_nonzero_exit(monkeypatch, tmp_path) -
 def test_elevated_setup_helper_main_writes_failure_report(monkeypatch, tmp_path) -> None:
     from opensquilla.sandbox.backend import windows_default_setup as mod
 
-    marker = tmp_path / "setup_marker.json"
-    payload = mod._encode_setup_helper_payload(marker)
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    marker = mod.default_setup_marker_path(profile)
+    payload = mod._encode_setup_helper_payload(marker, user_sid="S-1-real")
+    monkeypatch.setattr(mod, "_windows_profile_path_for_sid", lambda _sid: profile)
 
     def fail_setup(path):
         raise OSError("Set-LocalUser access denied")
@@ -301,6 +307,295 @@ def test_elevated_setup_helper_main_writes_failure_report(monkeypatch, tmp_path)
     report = json.loads((marker.parent / "setup_helper_report.json").read_text())
     assert report["state"] == "failed"
     assert "Set-LocalUser access denied" in report["detail"]
+
+
+def test_elevated_setup_helper_serializes_mutation_and_rechecks_readiness(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    marker = mod.default_setup_marker_path(profile)
+    payload = mod._encode_setup_helper_payload(marker, user_sid="S-1-real")
+    events = []
+
+    @contextmanager
+    def fake_process_lock(_marker_path):
+        events.append("lock_enter")
+        try:
+            yield
+        finally:
+            events.append("lock_exit")
+
+    monkeypatch.setattr(mod, "_windows_profile_path_for_sid", lambda _sid: profile)
+    monkeypatch.setattr(mod, "_windows_setup_process_lock", fake_process_lock, raising=False)
+    monkeypatch.setattr(
+        mod,
+        "_windows_setup_is_ready",
+        lambda _marker_path, _profile_path: events.append("ready_check") or False,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        mod,
+        "establish_windows_network_setup",
+        lambda _path: (_ for _ in ()).throw(OSError("stop after ordering check")),
+    )
+
+    assert mod.elevated_setup_helper_main(["--elevated-helper", payload]) == 1
+    assert events == ["lock_enter", "ready_check", "lock_exit"]
+
+
+def test_elevated_setup_helper_skips_duplicate_mutation_after_wait(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    marker = mod.default_setup_marker_path(profile)
+    payload = mod._encode_setup_helper_payload(marker, user_sid="S-1-real")
+    reports = []
+
+    monkeypatch.setattr(mod, "_windows_profile_path_for_sid", lambda _sid: profile)
+    monkeypatch.setattr(mod, "_windows_setup_is_ready", lambda *_args: True, raising=False)
+    monkeypatch.setattr(
+        mod,
+        "establish_windows_network_setup",
+        lambda _path: (_ for _ in ()).throw(AssertionError("setup must not run twice")),
+    )
+    monkeypatch.setattr(
+        mod,
+        "write_setup_helper_report",
+        lambda _path, *, state, detail=None: reports.append((state, detail)),
+    )
+
+    assert mod.elevated_setup_helper_main(["--elevated-helper", payload]) == 0
+    assert reports == [("ready", "already_ready")]
+
+
+def test_windows_setup_process_lock_releases_named_mutex(monkeypatch, tmp_path) -> None:
+    import ctypes
+
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+
+    calls = []
+
+    class FakeApi:
+        def __init__(self, name, result):
+            self.name = name
+            self.result = result
+            self.argtypes = None
+            self.restype = None
+
+        def __call__(self, *args):
+            calls.append((self.name, args))
+            return self.result
+
+    kernel32 = type(
+        "FakeKernel32",
+        (),
+        {
+            "CreateMutexW": FakeApi("create", 123),
+            "WaitForSingleObject": FakeApi("wait", 0),
+            "ReleaseMutex": FakeApi("release", True),
+            "CloseHandle": FakeApi("close", True),
+        },
+    )()
+    monkeypatch.setattr(mod.sys, "platform", "win32")
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: kernel32, raising=False)
+
+    with mod._windows_setup_process_lock(tmp_path / "setup_marker.json"):
+        calls.append(("body", ()))
+
+    assert [name for name, _args in calls] == ["create", "wait", "body", "release", "close"]
+    mutex_name = calls[0][1][2]
+    assert mutex_name.startswith("Local\\OpenSquillaSandboxSetup-")
+    assert calls[1][1] == (123, mod.SETUP_PROCESS_LOCK_TIMEOUT_MS)
+
+
+def test_elevated_setup_rejects_payload_path_before_any_report_write(monkeypatch, tmp_path) -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    attacker_marker = tmp_path / "attacker" / "setup_marker.json"
+    payload = mod._encode_setup_helper_payload(attacker_marker, user_sid="S-1-real")
+    reports = []
+    monkeypatch.setattr(mod, "_windows_profile_path_for_sid", lambda _sid: profile)
+    monkeypatch.setattr(
+        mod,
+        "write_setup_helper_report",
+        lambda *args, **kwargs: reports.append((args, kwargs)),
+    )
+
+    assert mod.elevated_setup_helper_main(["--elevated-helper", payload]) == 2
+    assert reports == []
+    assert not attacker_marker.parent.exists()
+
+
+def test_elevated_setup_rejects_precreated_junction_before_writing(monkeypatch, tmp_path) -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+
+    profile = tmp_path / "profile"
+    outside = tmp_path / "outside"
+    profile.mkdir()
+    outside.mkdir()
+    (profile / ".opensquilla").symlink_to(outside, target_is_directory=True)
+    marker = mod.default_setup_marker_path(profile)
+    payload = mod._encode_setup_helper_payload(marker, user_sid="S-1-real")
+    reports = []
+    monkeypatch.setattr(mod, "_windows_profile_path_for_sid", lambda _sid: profile)
+    monkeypatch.setattr(
+        mod,
+        "write_setup_helper_report",
+        lambda *args, **kwargs: reports.append((args, kwargs)),
+    )
+
+    assert mod.elevated_setup_helper_main(["--elevated-helper", payload]) == 2
+    assert reports == []
+    assert list(outside.iterdir()) == []
+
+
+def test_setup_directory_handle_is_no_follow_and_blocks_delete_sharing() -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+
+    source = inspect.getsource(mod._open_directory_no_follow)
+
+    assert "file_flag_open_reparse_point" in source
+    assert "file_flag_backup_semantics" in source
+    assert "file_share_read," in source
+    assert "file_share_write" not in source
+    assert "file_share_delete" not in source
+    assert "CreateFileW.argtypes" in source
+    assert "GetFileInformationByHandleEx.argtypes" in source
+
+
+def test_setup_output_writer_is_no_follow_and_blocks_delete_sharing() -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+
+    source = inspect.getsource(mod._write_json_windows_no_follow)
+
+    assert "file_flag_open_reparse_point" in source
+    assert "GetFileInformationByHandleEx" in source
+    assert "file_share_read | file_share_write" in source
+    assert "file_share_delete" not in source
+
+
+def test_setup_marker_replaces_symlink_without_writing_its_target(tmp_path) -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+
+    outside = tmp_path / "outside.json"
+    outside.write_text("do not touch", encoding="utf-8")
+    marker = tmp_path / "setup_marker.json"
+    marker.symlink_to(outside)
+
+    mod.write_setup_marker(marker)
+
+    assert outside.read_text(encoding="utf-8") == "do not touch"
+    assert not marker.is_symlink()
+    assert json.loads(marker.read_text(encoding="utf-8"))["setupVersion"] == mod.SETUP_VERSION
+
+
+def test_setup_marker_windows_writer_atomically_replaces_symlink(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+
+    outside = tmp_path / "outside.json"
+    outside.write_text("do not touch", encoding="utf-8")
+    marker = tmp_path / "setup_marker.json"
+    marker.symlink_to(outside)
+    writer_paths = []
+
+    def fake_windows_writer(path, data):
+        writer_paths.append(path)
+        path.write_bytes(data)
+
+    monkeypatch.setattr(mod.os, "name", "nt")
+    monkeypatch.setattr(mod, "_write_json_windows_no_follow", fake_windows_writer)
+
+    mod.write_setup_marker(marker)
+
+    assert writer_paths and writer_paths[0] != marker
+    assert outside.read_text(encoding="utf-8") == "do not touch"
+    assert not marker.is_symlink()
+    assert json.loads(marker.read_text(encoding="utf-8"))["setupVersion"] == mod.SETUP_VERSION
+
+
+def test_lock_revalidates_tree_before_each_recursive_acl_mutation(monkeypatch, tmp_path) -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    marker = mod.default_setup_marker_path(profile)
+    validations = []
+    commands = []
+    original_validate = mod._validate_setup_directory_lease
+
+    def record_validate(lease, *, recursive):
+        validations.append(recursive)
+        return original_validate(lease, recursive=recursive)
+
+    class Completed:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(mod, "_validate_setup_directory_lease", record_validate)
+    monkeypatch.setattr(
+        mod.subprocess,
+        "run",
+        lambda command, **_kwargs: commands.append(command) or Completed(),
+    )
+    monkeypatch.setattr(mod, "_current_windows_user_sid", lambda: "S-1-real")
+
+    mod.lock_persistent_sandbox_dirs(marker, offline_sid="S-1-offline")
+
+    assert len(validations) >= len(commands)
+    assert commands
+    assert all("/L" in command for command in commands)
+
+
+def test_elevated_setup_does_not_write_failure_report_after_lease_race(
+    monkeypatch, tmp_path
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    marker = mod.default_setup_marker_path(profile)
+    payload = mod._encode_setup_helper_payload(marker, user_sid="S-1-real")
+    reports = []
+    validations = 0
+    original_validate = mod._validate_setup_directory_lease
+
+    monkeypatch.setattr(mod, "_windows_profile_path_for_sid", lambda _sid: profile)
+    monkeypatch.setattr(
+        mod,
+        "write_setup_helper_report",
+        lambda marker_path, *, state, detail=None: reports.append(state),
+    )
+    monkeypatch.setattr(
+        mod,
+        "establish_windows_network_setup",
+        lambda _path: (_ for _ in ()).throw(OSError("network failed")),
+    )
+
+    def race_on_failure_report(lease, *, recursive):
+        nonlocal validations
+        validations += 1
+        if validations > 1:
+            raise OSError("lease changed")
+        return original_validate(lease, recursive=recursive)
+
+    monkeypatch.setattr(mod, "_validate_setup_directory_lease", race_on_failure_report)
+
+    assert mod.elevated_setup_helper_main(["--elevated-helper", payload]) == 2
+    assert reports == ["running"]
 
 
 def test_run_elevated_setup_helper_includes_failure_report_detail(
@@ -321,6 +616,7 @@ def test_run_elevated_setup_helper_includes_failure_report_detail(
         return 1
 
     monkeypatch.setattr(mod, "_shell_execute_runas_and_wait", fake_runas)
+    monkeypatch.setattr(mod, "_current_windows_user_sid", lambda: "S-1-real")
 
     with pytest.raises(OSError, match="Set-LocalUser access denied"):
         mod.run_elevated_setup_helper(marker)

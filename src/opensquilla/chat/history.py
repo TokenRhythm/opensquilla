@@ -84,6 +84,9 @@ def transcript_entries_to_chat_messages(
         reasoning = getattr(entry, "reasoning_content", None)
         if isinstance(reasoning, str) and reasoning.strip():
             msg["reasoning_content"] = reasoning
+        turn_context = getattr(entry, "turn_context", None)
+        if isinstance(turn_context, dict):
+            msg["turn_context"] = dict(turn_context)
         if attachments:
             msg["attachments"] = attachments
         if artifacts:

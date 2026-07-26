@@ -1,6 +1,6 @@
 import { ref } from 'vue'
 
-export type ToastTone = 'info' | 'ok' | 'danger'
+export type ToastTone = 'info' | 'ok' | 'warn' | 'danger'
 
 export interface ToastItem {
   id: number

@@ -77,24 +77,6 @@ with sqlite3.connect(state / "sessions.db") as connection:
 `, [home, identity, chat])
 }
 
-function readConfiguredDataRoots(home) {
-  return JSON.parse(runPython(`
-import json, sys, tomllib
-from pathlib import Path
-home = Path(sys.argv[1])
-payload = tomllib.loads((home / "config.toml").read_text(encoding="utf-8"))
-print(json.dumps({
-    "workspace_dir": payload.get("workspace_dir") or str(home / "workspace"),
-    "state_dir": payload.get("state_dir") or str(home / "state"),
-}))
-`, [home]))
-}
-
-function comparablePath(value) {
-  const normalized = resolve(String(value || ''))
-  return process.platform === 'win32' ? normalized.toLowerCase() : normalized
-}
-
 async function writeProviderProfileConfig(home, settings) {
   const workspace = join(home, 'workspace')
   const state = join(home, 'state')
@@ -352,177 +334,40 @@ try {
       'portable',
       'portable-temp',
     )
-    const browsedPortable = join(root, 'manually-selected-portable')
     seedProfile(localPortable, SOURCE_IDENTITY, SOURCE_CHAT)
     seedProfile(tempPortable, '# Synthetic second Portable identity\n', 'second portable chat')
-    seedProfile(browsedPortable, '# Synthetic browsed Portable identity\n', 'browsed chat')
     const localPortableBefore = await snapshotTree(localPortable)
     const tempPortableBefore = await snapshotTree(tempPortable)
-    const browsedPortableBefore = await snapshotTree(browsedPortable)
 
-    // Skipping without completing setup is not persisted: relaunch offers the
-    // two Portable candidates again, still unselected and unchanged.
-    const skipUserData = join(root, 'portable-skip-user-data')
-    app = await launchDesktop(skipUserData, portableHome, 18925)
+    // Portable candidates never interrupt first-run setup. They are discovered
+    // only after the user opens the Settings migration surface.
+    const settingsOnlyUserData = join(root, 'portable-settings-only-user-data')
+    app = await launchDesktop(settingsOnlyUserData, portableHome, 18925)
     page = await onboardingPage(app)
-    await page.locator('[data-screen="5"].active').waitFor({ state: 'visible' })
-    assert.equal(await page.locator('[data-screen="5"] h2').evaluate((node) => (
-      node === document.activeElement
-    )), true)
-    assert.equal(await page.locator('[data-migration-candidate]').count(), 2)
-    assert.equal(await page.locator('#migrationSource').inputValue(), '')
-    assert.equal(await page.locator('[data-migration-candidate][aria-pressed="true"]').count(), 0)
-    assert.equal(await page.locator('#migrationPreview').isDisabled(), true)
-    assert.equal(await page.locator('#migrationImport').isVisible(), false)
-    const candidateNames = await page.locator('.migration-candidate-head strong').allTextContents()
-    assert.equal(candidateNames.some((name) => name.includes('portable-local')), true)
-    assert.equal(candidateNames.some((name) => name.includes('portable-temp')), true)
-    assert.equal(candidateNames.some((name) => name.includes(localPortable)), false)
-    assert.equal(
-      (await page.locator('[data-migration-candidate]').allTextContents())
-        .every((value) => !/[?]|unavailable|unknown/i.test(value)),
-      true,
-      'sparse Portable metadata rendered an unknown placeholder',
-    )
-    assert.equal(
-      await page.locator('.migration-candidate-row details').first().textContent()
-        .then((value) => value.includes('portable-')),
-      true,
-    )
-    if (importScreenshotDir) {
-      await page.locator('#onboardingLocale').selectOption('zh-Hans')
-      await page.waitForTimeout(220)
-      await captureOnboarding(app, join(importScreenshotDir, '01-portable-transfer.png'))
-    }
-    await app.evaluate(({ dialog }, selectedPath) => {
-      dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [selectedPath] })
-    }, browsedPortable)
-    await page.locator('#migrationBrowse').evaluate((button) => {
-      button.closest('details').open = true
-    })
-    await page.locator('#migrationBrowse').click()
-    await waitFor(async () => (
-      await page.locator('[data-migration-candidate]').count() === 3
-    ), 'manually browsed Portable candidate')
-    assert.equal(await page.locator('#migrationSource').inputValue(), browsedPortable)
-    assert.equal(
-      (await page.locator('[data-migration-candidate][aria-pressed="true"] strong').textContent())
-        .includes('Portable'),
-      true,
-    )
-    await page.locator('#migrationSkip').click()
     await page.locator('[data-screen="0"].active').waitFor({ state: 'visible' })
-    assert.equal(await page.locator('[data-screen="0"] h2').evaluate((node) => (
-      node === document.activeElement
-    )), true)
-    await app.close()
-    app = null
-
-    app = await launchDesktop(skipUserData, portableHome, 18925)
-    page = await onboardingPage(app)
-    await page.locator('[data-screen="5"].active').waitFor({ state: 'visible' })
-    await page.locator('#migrationSkip').click()
+    assert.equal(await page.locator('[data-screen="5"]').count(), 0)
+    assert.equal(await page.locator('[data-migration-candidate]').count(), 0)
     await selectOllamaAndCompleteOnboarding(page)
-    await controlPage(app)
-    await app.close()
-    app = null
-
-    app = await launchDesktop(skipUserData, portableHome, 18925)
-    await controlPage(app)
-    assert.equal(app.windows().some((window) => window.url().startsWith('data:text/html')), false)
+    const portableControl = await controlPage(app)
+    const portableSources = await portableControl.evaluate(async () => (
+      await window.opensquillaDesktop.migrationSummary()
+    ))
+    assert.equal(portableSources.ok, true, JSON.stringify(portableSources))
+    assert.equal(portableSources.requiresSelection, true)
+    assert.equal(portableSources.candidates.length, 2)
+    assert.equal(
+      portableSources.candidates.some((candidate) => candidate.path === localPortable),
+      true,
+    )
+    assert.equal(
+      portableSources.candidates.some((candidate) => candidate.path === tempPortable),
+      true,
+    )
     await app.close()
     app = null
     assert.deepEqual(await snapshotTree(localPortable), localPortableBefore)
     assert.deepEqual(await snapshotTree(tempPortable), tempPortableBefore)
-    assert.deepEqual(await snapshotTree(browsedPortable), browsedPortableBefore)
 
-    // A selected Portable source is copied as a whole profile into an empty
-    // target. Preview remains read-only and the source stays byte-for-byte intact.
-    const copyUserData = join(root, 'portable-copy-user-data')
-    const copyTarget = join(copyUserData, 'opensquilla')
-    app = await launchDesktop(copyUserData, portableHome, 18926)
-    page = await onboardingPage(app)
-    await page.locator('[data-screen="5"].active').waitFor({ state: 'visible' })
-    await page.locator('[data-migration-candidate]').filter({ hasText: 'portable-local' }).click()
-    await page.locator('#migrationPreview').click()
-    await page.locator('#migrationImport').waitFor({ state: 'visible' })
-    assert.equal((await page.locator('#migrationSummary').textContent()).includes('?'), false)
-    if (importScreenshotDir) {
-      await page.locator('#onboardingLocale').selectOption('zh-Hans')
-      await page.waitForTimeout(220)
-      await captureOnboarding(app, join(importScreenshotDir, '02-portable-reviewed.png'))
-    }
-    assert.equal(
-      await lstat(copyTarget).then(() => true, () => false),
-      false,
-      'Portable preview must not create or mutate the Desktop target',
-    )
-    await page.locator('#migrationImport').click()
-    let copyOutcome
-    try {
-      copyOutcome = await waitFor(async () => {
-        if (await page.locator('#migrationDoneNote').isVisible()) {
-          return { ok: true, detail: '' }
-        }
-        const detail = String(await page.locator('#error').textContent() || '').trim()
-        return detail ? { ok: false, detail } : null
-      }, 'Portable copy result')
-    } catch (error) {
-      if (importScreenshotDir) {
-        await captureOnboarding(app, join(importScreenshotDir, '03-portable-copy-timeout.png'))
-      }
-      throw error
-    }
-    if (!copyOutcome.ok && importScreenshotDir) {
-      await captureOnboarding(app, join(importScreenshotDir, '03-portable-copy-failed.png'))
-    }
-    assert.equal(copyOutcome.ok, true, `Portable copy failed: ${copyOutcome.detail}`)
-    assert.equal((await page.locator('#migrationDoneNote').textContent()).includes(localPortable), true)
-    if (importScreenshotDir) {
-      await captureOnboarding(app, join(importScreenshotDir, '03-portable-copy-complete.png'))
-    }
-    await page.locator('[data-screen="1"].active').waitFor({ state: 'visible', timeout: 90_000 })
-    await selectOllamaAndCompleteOnboarding(page)
-    await controlPage(app)
-    assert.equal(await readFile(join(copyTarget, 'workspace', 'IDENTITY.md'), 'utf8'), SOURCE_IDENTITY)
-    assert.equal(await readFile(join(copyTarget, 'workspace', 'USER.md'), 'utf8'), '# Synthetic user\n')
-    assert.equal(await readFile(join(copyTarget, 'workspace', 'SOUL.md'), 'utf8'), '# Synthetic soul\n')
-    assert.equal(await readFile(join(copyTarget, 'workspace', 'MEMORY.md'), 'utf8'), '# Synthetic memory\n')
-    assert.equal(readSyntheticChat(copyTarget), SOURCE_CHAT)
-    const copiedRoots = readConfiguredDataRoots(copyTarget)
-    assert.equal(
-      comparablePath(copiedRoots.workspace_dir),
-      comparablePath(join(copyTarget, 'workspace')),
-    )
-    assert.equal(
-      comparablePath(copiedRoots.state_dir),
-      comparablePath(join(copyTarget, 'state')),
-    )
-    assert.deepEqual(await snapshotTree(localPortable), localPortableBefore)
-    assert.equal((await readdir(copyUserData)).some((name) => name.startsWith('opensquilla.backup.')), false)
-    await app.close()
-    app = null
-
-    // If the target changes after preview, onboarding must fail closed. It may
-    // never upgrade the operation into Settings' backup-and-replace flow.
-    const changedUserData = join(root, 'portable-changed-user-data')
-    const changedTarget = join(changedUserData, 'opensquilla')
-    app = await launchDesktop(changedUserData, portableHome, 18927)
-    page = await onboardingPage(app)
-    await page.locator('[data-screen="5"].active').waitFor({ state: 'visible' })
-    await page.locator('[data-migration-candidate]').filter({ hasText: 'portable-local' }).click()
-    await page.locator('#migrationPreview').click()
-    await page.locator('#migrationImport').waitFor({ state: 'visible' })
-    seedProfile(changedTarget, TARGET_IDENTITY, 'target created after preview')
-    await page.locator('#migrationImport').click()
-    await waitFor(async () => (
-      (await page.locator('#error').textContent()).includes('Settings')
-    ), 'target changed after onboarding preview refusal')
-    assert.equal(await readFile(join(changedTarget, 'workspace', 'IDENTITY.md'), 'utf8'), TARGET_IDENTITY)
-    assert.equal((await readdir(changedUserData)).some((name) => name.startsWith('opensquilla.backup.')), false)
-    assert.deepEqual(await snapshotTree(localPortable), localPortableBefore)
-    await app.close()
-    app = null
   }
 
   // A usable non-empty Desktop target is an upgrade/current-profile flow, not
@@ -707,13 +552,10 @@ try {
 
   console.log(JSON.stringify({
     cliDoesNotTriggerOnboardingTransfer: true,
-    windowsPortableOnboardingTested: process.platform === 'win32',
-    explicitPortableSelectionAndSkip: process.platform === 'win32',
+    windowsPortableSettingsOnlyTested: process.platform === 'win32',
     multiplePortableCandidates: process.platform === 'win32',
-    targetChangeFailsClosed: process.platform === 'win32',
     wholeReplacement: true,
     sourceUnchanged: true,
-    portableIdentityMemoryAndChatCopied: process.platform === 'win32',
     settingsRequiredKeyCompleted: true,
     importedConfigPreserved: true,
     previousCredentialBackedUp: true,

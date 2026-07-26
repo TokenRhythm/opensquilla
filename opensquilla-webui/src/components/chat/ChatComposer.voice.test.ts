@@ -11,6 +11,7 @@ const BASE_PROPS = {
   busySendMode: 'queue',
   hasSendContent: false,
   isStreaming: false,
+  canStop: false,
   isNewLanding: false,
   placeholder: 'Send a message',
   sendButtonTitle: 'Send',
@@ -54,6 +55,20 @@ beforeEach(() => {
 })
 
 describe('ChatComposer voice-input gate', () => {
+  it('keeps Stop available while a background subagent group is active', async () => {
+    const onStop = vi.fn()
+    const { app, el } = await mount({ canStop: true, isStreaming: false, onStop })
+    const stop = el.querySelector<HTMLButtonElement>(
+      `button[aria-label="${i18n.global.t('chat.stopResponse')}"]`,
+    )
+
+    expect(stop).toBeTruthy()
+    stop?.click()
+    await nextTick()
+    expect(onStop).toHaveBeenCalledOnce()
+    app.unmount()
+  })
+
   it('records when ready: enabled, normal label, emits voiceInput', async () => {
     const onVoiceInput = vi.fn()
     const onVoiceSetup = vi.fn()

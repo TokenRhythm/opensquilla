@@ -190,6 +190,9 @@ async def test_relay_close_on_success() -> None:
     relay.close = AsyncMock()
     relay.text_emitted = False
     relay.stream_error = None
+    relay.has_terminal_snapshot = False
+    relay.delivered_artifact_keys = set()
+    relay.reconcile_final_text = AsyncMock(return_value=True)
 
     rt = _make_task_runtime(succeed=True)
 
@@ -206,6 +209,7 @@ async def test_relay_close_on_success() -> None:
     )
 
     relay.close.assert_awaited_once()
+    relay.reconcile_final_text.assert_awaited_once_with("reply text")
 
 
 # ── done_callback surfaces exceptions ────────────────────────────────────────

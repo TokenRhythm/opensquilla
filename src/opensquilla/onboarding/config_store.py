@@ -32,7 +32,11 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     import tomli as tomllib  # type: ignore[import-not-found, no-redef]
 
-from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.config import (
+    LEGACY_DEFAULT_LLM_PROVIDER,
+    GatewayConfig,
+    LlmProviderConfig,
+)
 from opensquilla.gateway.config_migration import (
     backup_and_write_migrated_config,
     make_config_backup,
@@ -76,6 +80,13 @@ class PersistResult:
     backup_path: Path | None
     restart_required: bool
     warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class CredentialBackupRedaction:
+    """Provider-scoped credential fields a clear must remove from backups."""
+
+    provider_id: str
 
 
 def resolve_config_path(path: str | Path | None = None) -> tuple[Path, str]:
@@ -232,6 +243,114 @@ def _config_to_toml_dict(cfg: GatewayConfig) -> dict[str, Any]:
     coerced = _toml_safe(_model_toml_payload(cfg))
     assert isinstance(coerced, dict)
     return coerced
+
+
+def _redact_backup_credentials(
+    payload: Any,
+    redaction: CredentialBackupRedaction,
+) -> bool:
+    """Remove one provider's LLM credential fields from a parsed backup."""
+
+    if not isinstance(payload, dict):
+        return False
+    provider = str(redaction.provider_id or "").strip().lower()
+    if not provider:
+        return False
+
+    def clear_section(section: Any) -> bool:
+        if not isinstance(section, dict):
+            return False
+        changed = False
+        for key in ("api_key", "api_key_env", "api_key_env_pool"):
+            if key in section:
+                section.pop(key, None)
+                changed = True
+        return changed
+
+    changed = False
+    llm = payload.get("llm")
+    if isinstance(llm, dict):
+        stored_provider = str(llm.get("provider") or "").strip().lower()
+        if not stored_provider:
+            router = payload.get("squilla_router")
+            tier_profile = (
+                str(router.get("tier_profile") or "").strip().lower()
+                if isinstance(router, dict)
+                else ""
+            )
+            legacy_intent = bool(
+                {"model", "base_url", "api_key", "api_key_env"} & llm.keys()
+            ) or tier_profile == LEGACY_DEFAULT_LLM_PROVIDER
+            default_provider = str(
+                LlmProviderConfig.model_fields["provider"].default or ""
+            ).strip().lower()
+            stored_provider = (
+                LEGACY_DEFAULT_LLM_PROVIDER if legacy_intent else default_provider
+            )
+        if stored_provider == provider:
+            changed = clear_section(llm) or changed
+
+    profiles = payload.get("llm_profiles")
+    if isinstance(profiles, dict):
+        for key, profile in profiles.items():
+            if str(key or "").strip().lower() == provider:
+                changed = clear_section(profile) or changed
+    return changed
+
+
+def _atomic_write_toml(target: Path, payload: dict[str, Any]) -> None:
+    """Replace one TOML file atomically with owner-only permissions."""
+
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+    )
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            tomli_w.dump(payload, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, target)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _sanitize_managed_config_backups(
+    target: Path,
+    redaction: CredentialBackupRedaction,
+) -> None:
+    """Remove a cleared credential from every regular managed config backup."""
+
+    prefix = f"{target.name}.backup."
+    backup_paths = sorted(
+        path for path in target.parent.iterdir() if path.name.startswith(prefix)
+    )
+    for backup_path in backup_paths:
+        if backup_path.is_symlink() or not backup_path.is_file():
+            raise OSError(f"Refusing to rewrite non-regular config backup: {backup_path}")
+        try:
+            with backup_path.open("rb") as fh:
+                payload = tomllib.load(fh)
+        except (tomllib.TOMLDecodeError, ValueError) as exc:
+            # An unparseable backup is useless as a restore source, yet its
+            # raw bytes may still hold the credential being cleared in plain
+            # text. Deleting it completes the redaction for this file, while
+            # aborting would leave the LIVE config holding the secret the
+            # user explicitly asked to remove.
+            log.warning(
+                "onboarding.config_backup_unparseable_deleted",
+                path=str(backup_path),
+                error=str(exc),
+                action="deleting corrupt managed backup so the credential clear proceeds",
+            )
+            backup_path.unlink(missing_ok=True)
+            continue
+        if _redact_backup_credentials(payload, redaction):
+            _atomic_write_toml(backup_path, payload)
 
 
 def _remember_load_baseline(
@@ -528,6 +647,7 @@ def persist_config(
     path: str | Path | None = None,
     backup: bool = True,
     restart_required: bool = False,
+    backup_credential_redaction: CredentialBackupRedaction | None = None,
 ) -> PersistResult:
     resolved = _resolve_path(path)
     # The instance baseline only describes the file the config was loaded
@@ -568,6 +688,16 @@ def persist_config(
         GatewayConfig.model_validate(copy.deepcopy(merged))
         next_baseline = copy.deepcopy(current_dump) if same_path else None
         next_raw_base = copy.deepcopy(merged) if same_path else None
+
+        # Credential removal is intentionally stronger than an ordinary config
+        # save: do not create a fresh backup containing the just-cleared secret,
+        # and scrub matching credential fields from every managed backup while
+        # holding the same cross-process config lock.  This runs before the
+        # current-file commit, so a sanitization failure leaves live/disk config
+        # aligned and the RPC can fail closed.
+        if backup_credential_redaction is not None:
+            _sanitize_managed_config_backups(target, backup_credential_redaction)
+            backup = False
 
         backup_path: Path | None = None
         if backup and target.exists():

@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+from opensquilla.sandbox.permissions import FileSystemPermissionProfile
 from opensquilla.sandbox.types import SandboxBackendError, SandboxRequest, SandboxResult
 
 SandboxOperationDomain = Literal[
@@ -422,6 +423,11 @@ class SandboxOperation:
     summary: str = ""
     permissions: OperationPermissions = field(default_factory=OperationPermissions)
     approval: OperationApproval = field(default_factory=OperationApproval)
+    file_system_profile: FileSystemPermissionProfile | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     @classmethod
     def process(cls, request: SandboxRequest) -> SandboxOperation:
@@ -454,6 +460,7 @@ class SandboxOperation:
         pattern: str = "",
         include: str | None = None,
         max_results: int | None = None,
+        file_system_profile: FileSystemPermissionProfile | None = None,
     ) -> SandboxOperation:
         operation_paths = paths or ((path,) if path is not None else ())
         request = FilesystemOperationRequest(
@@ -478,6 +485,7 @@ class SandboxOperation:
             workspace=workspace,
             run_mode=run_mode,
             tool_name="filesystem",
+            file_system_profile=file_system_profile,
         )
 
     def to_payload(self) -> dict[str, object]:
@@ -559,6 +567,8 @@ class SandboxOperationRuntime:
 
     async def run(self, operation: SandboxOperation) -> object | None:
         if self.runtime is None:
+            return None
+        if str(operation.run_mode).strip().lower() == "full":
             return None
         effective = getattr(self.runtime, "effective", None)
         if effective is not None and not effective.sandbox_enabled:

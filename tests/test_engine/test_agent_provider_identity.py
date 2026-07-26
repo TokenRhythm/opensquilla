@@ -15,7 +15,10 @@ import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 
+import pytest
+
 from opensquilla.engine import Agent, AgentConfig
+from opensquilla.engine.runtime import _SelectorFallbackProvider
 from opensquilla.engine.usage import UsageTracker
 from opensquilla.provider import ChatConfig, Message
 from opensquilla.provider import DoneEvent as ProviderDoneEvent
@@ -55,12 +58,17 @@ class _LocalCompatProvider:
         return []
 
 
-def _run_single_turn(config: AgentConfig, session_key: str) -> UsageTracker:
+def _run_single_turn(
+    config: AgentConfig,
+    session_key: str,
+    *,
+    provider: Any | None = None,
+) -> UsageTracker:
     tracker = UsageTracker()
 
     async def run() -> None:
         agent = Agent(
-            provider=_LocalCompatProvider(),
+            provider=provider or _LocalCompatProvider(),
             config=config,
             tool_definitions=[],
             tool_handler=None,
@@ -111,3 +119,54 @@ def test_fallback_branch_without_provider_id_uses_adapter_name() -> None:
     assert mu.provider == "openai"
     # "openai" is not a local-free provider -> cloud default estimate applies
     assert mu.cost > 0.0
+
+
+def test_routed_turn_records_selectors_actual_provider_id() -> None:
+    """Cross-provider routing must not attribute usage to the primary provider."""
+
+    class _Selector:
+        active_provider_id = "deepseek"
+
+    session_key = "agent:test:webchat:routed"
+    tracker = _run_single_turn(
+        AgentConfig(max_iterations=2, provider_id="openrouter"),
+        session_key,
+        provider=_SelectorFallbackProvider(_LocalCompatProvider(), _Selector()),
+    )
+
+    usage = tracker.get(session_key)
+    assert usage is not None
+    [deployment] = usage.deployment_breakdown
+    assert deployment["provider"] == "deepseek"
+    assert deployment["model"] == "qwen3-coder:30b"
+
+
+def test_routed_turn_cost_budget_prices_the_actual_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The live cost gate must not price a routed model as the primary provider."""
+    from opensquilla.engine import pricing
+
+    class _Selector:
+        active_provider_id = "deepseek"
+
+    calls: list[tuple[str, str]] = []
+    original = pricing.resolve_model_price
+
+    def recording_resolver(model_id: str, provider: str = "") -> Any:
+        calls.append((model_id, provider))
+        return original(model_id, provider)
+
+    monkeypatch.setattr(pricing, "resolve_model_price", recording_resolver)
+    _run_single_turn(
+        AgentConfig(
+            max_iterations=2,
+            provider_id="openrouter",
+            max_turn_cost_usd=1000.0,
+        ),
+        "agent:test:webchat:routed-budget",
+        provider=_SelectorFallbackProvider(_LocalCompatProvider(), _Selector()),
+    )
+
+    assert ("qwen3-coder:30b", "deepseek") in calls
+    assert ("qwen3-coder:30b", "openrouter") not in calls

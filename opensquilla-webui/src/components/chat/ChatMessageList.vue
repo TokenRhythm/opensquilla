@@ -17,6 +17,7 @@
       :share-message-id="chatMessageKey(message, index)"
       :strip-time-prefix="stripTimePrefix"
       :copy-message="copyMessage"
+      :download-attachment="downloadAttachment"
       @edit="$emit('editMessage', $event)"
       @toggle-share="$emit('toggleShareMessage', $event)"
     />
@@ -94,6 +95,7 @@ const props = defineProps<{
   toolStatusText: (call: ChatToolCallRenderItem) => string
   toolSecondaryText: (call: ChatToolCallRenderItem) => string
   copyMessage: (message: ChatRenderedMessage) => Promise<boolean>
+  downloadAttachment: (attachment: import('@/types/chat').DisplayAttachment) => Promise<boolean>
   artifactNavigationItems?: ArtifactPayload[]
   sessionKey?: string
   authToken?: string

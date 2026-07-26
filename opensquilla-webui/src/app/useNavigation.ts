@@ -1,16 +1,13 @@
 import { computed } from 'vue'
-import { getConsoleNavigationSections, getNavigationItems, getWorkNavigationSection } from '@/router/nav'
+import { getNavigationItems, getWorkNavigationSection } from '@/router/nav'
 
 export function useNavigation() {
-  // Build / Monitor bands, rendered inline in the rail (full-index layout).
-  const consoleSections = computed(() => getConsoleNavigationSections())
   const bottomRoutes = computed(() => getNavigationItems('bottom'))
-  // The pinned level-1 rail rows (Sessions / Approvals), single-sourced from
-  // the route taxonomy so the rail tracks meta.group without a hardcoded list.
+  // Flat primary rows, single-sourced from route metadata so the desktop rail,
+  // mobile drawer, and command palette stay in the same order.
   const workNav = computed(() => getWorkNavigationSection())
 
   return {
-    consoleSections,
     bottomRoutes,
     workNav,
   }

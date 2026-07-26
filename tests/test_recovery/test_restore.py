@@ -180,6 +180,54 @@ def test_restore_profile_swaps_recorded_backup_and_indexes_previous_target(
     assert not (tmp_path / ".opensquilla.profile-replace.json").exists()
 
 
+def test_restore_profile_preserves_workspace_links_and_opaque_code_task(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "user-state"))
+    target = tmp_path / "opensquilla"
+    transaction_id = str(uuid.uuid4())
+    backup = target.with_name(f"{target.name}.backup.{transaction_id}")
+    _profile(target, "current")
+    _profile(backup, "recorded backup", with_legacy_lock=True)
+
+    def add_links(profile: Path) -> None:
+        code_task_bin = profile / "code-task" / "run" / "repo" / ".venv" / "bin"
+        code_task_bin.mkdir(parents=True)
+        (profile / "workspace" / "SOUL.alias.md").symlink_to("SOUL.md")
+        historical_workspace = profile / "state" / "workspace"
+        historical_workspace.mkdir(parents=True, exist_ok=True)
+        (historical_workspace / "COPYING").write_text("license\n", encoding="utf-8")
+        (historical_workspace / "LICENSE").symlink_to("COPYING")
+        (code_task_bin / "python").symlink_to("../../../../missing-python")
+
+    try:
+        add_links(target)
+        add_links(backup)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+    _record_backup(target, backup, transaction_id)
+
+    report = restore_profile(backup)
+
+    # Both canonical and historical workspaces intentionally remain present,
+    # so post-restore reconciliation asks the user to resolve that ambiguity.
+    assert report.outcome == "attention"
+    assert report.stable_code == "workspace_conflict"
+    assert os.readlink(target / "workspace" / "SOUL.alias.md") == "SOUL.md"
+    assert os.readlink(target / "state" / "workspace" / "LICENSE") == "COPYING"
+    assert os.readlink(
+        target / "code-task" / "run" / "repo" / ".venv" / "bin" / "python"
+    ) == "../../../../missing-python"
+    parked = [path for path in tmp_path.glob("opensquilla.backup.*") if path != backup]
+    assert len(parked) == 1
+    assert os.readlink(parked[0] / "workspace" / "SOUL.alias.md") == "SOUL.md"
+    assert os.readlink(parked[0] / "state" / "workspace" / "LICENSE") == "COPYING"
+    assert os.readlink(
+        parked[0] / "code-task" / "run" / "repo" / ".venv" / "bin" / "python"
+    ) == "../../../../missing-python"
+
+
 def test_restore_cli_uses_history_target_and_primary_profile_kind(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

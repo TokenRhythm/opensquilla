@@ -712,6 +712,7 @@ def test_channels_evaluator_does_not_report_unknown_enabled_status_as_ready() ->
     assert "not recognized" in findings[0].detail
     assert findings[0].evidence == {
         "name": "slack-main",
+        "channelName": "slack-main",
         "status": "warming_up",
         "type": "slack",
     }
@@ -1296,3 +1297,95 @@ def test_squilla_router_runtime_evaluator_describes_default_tier_degradation() -
     assert finding.severity == "warn"
     assert "default tier" in finding.detail
     assert 'routing source "heuristic"' not in finding.detail
+
+
+def _connected_row(name: str = "telegram-main", **overrides) -> dict:
+    row = {
+        "name": name,
+        "type": "telegram",
+        "enabled": True,
+        "configured": True,
+        "status": "connected",
+        "connected": True,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_channels_evaluator_surfaces_pending_pairings_without_degrading_ready() -> None:
+    # A healthy channel silently gating senders is exactly the state doctor
+    # used to call "ready": the sender was told to wait, the operator never was.
+    findings = evaluate_channels({"channels": [_connected_row(pendingPairings=2)]})
+
+    assert [f.id for f in findings] == ["channel.telegram-main.pending_pairings"]
+    finding = findings[0]
+    assert finding.severity == "warn"
+    # Awaiting a human decision, not a malfunction: visible but not degrading.
+    assert _impact(finding) == "optional"
+    assert finding.evidence == {
+        "name": "telegram-main",
+        "channelName": "telegram-main",
+        "pendingPairings": 2,
+    }
+    commands = [step.command for step in finding.fix_steps if step.command]
+    # The first step is the actionable one: the list every decision starts from.
+    assert commands[0] == "opensquilla channels pairings list telegram-main"
+    assert "opensquilla channels status telegram-main --json" in commands
+
+
+def test_channels_evaluator_surfaces_sends_with_unknown_outcome() -> None:
+    findings = evaluate_channels(
+        {
+            "channels": [
+                _connected_row(
+                    diagnostics={
+                        "delivery": {
+                            "outbox": {
+                                "sent": {"count": 40, "oldest_at": 1.0},
+                                "unknown": {"count": 3, "oldest_at": 99.0},
+                            }
+                        }
+                    }
+                )
+            ]
+        }
+    )
+
+    assert [f.id for f in findings] == ["channel.telegram-main.sends_unknown_outcome"]
+    finding = findings[0]
+    assert finding.severity == "warn"
+    # Unknown-outcome rows are terminal until a human resolves them; degrading
+    # readiness would flag the channel forever after one lost send.
+    assert _impact(finding) == "optional"
+    assert finding.evidence["unknownSends"] == 3
+    assert finding.evidence["oldestAt"] == 99.0
+    assert "3 outbound send(s)" in finding.detail
+
+
+def test_channels_evaluator_action_items_ride_alongside_status_findings() -> None:
+    # A dead channel with pending pairings reports both facts — the status
+    # chain picks one finding, but action items are appended independently.
+    findings = evaluate_channels(
+        {"channels": [_connected_row(status="dead", pendingPairings=1)]}
+    )
+
+    assert {f.id for f in findings} == {
+        "channel.telegram-main.dead",
+        "channel.telegram-main.pending_pairings",
+    }
+
+
+def test_channels_evaluator_ignores_malformed_action_item_shapes() -> None:
+    findings = evaluate_channels(
+        {
+            "channels": [
+                _connected_row(
+                    pendingPairings="2",
+                    diagnostics={"delivery": {"outbox": {"unknown": {"count": "3"}}}},
+                ),
+                _connected_row(name="feishu-main", pendingPairings=0, diagnostics={}),
+            ]
+        }
+    )
+
+    assert [f.id for f in findings] == ["channels.ready"]

@@ -29,6 +29,7 @@ import hashlib
 import json
 import re
 import time
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -36,7 +37,24 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 import structlog
 
 from opensquilla.engine.types import AgentConfig, AgentEvent
+from opensquilla.engine.usage_accounting import (
+    UsageAccountingScope,
+    UsageEventSink,
+    UsageExecutionContext,
+    account_provider_stream,
+    bind_usage_accounting_scope,
+    current_usage_accounting_scope,
+    provider_accounts_physical_usage,
+)
+from opensquilla.provider.correlation_context import (
+    bind_provider_request_correlation,
+    current_provider_request_correlation,
+)
 from opensquilla.provider.protocol import LLMProvider
+from opensquilla.provider.types import (
+    ProviderRequestCorrelation,
+    derive_provider_request_correlation,
+)
 from opensquilla.skills.meta.clarify_autofill import (
     autofill_required_clarify_fields,
     is_empty_clarify_submission,
@@ -1681,6 +1699,9 @@ def make_agent_runner_from_parent(
     workspace_dir: str | None = None,
     usage_tracker: Any | None = None,
     session_key: str | None = None,
+    usage_event_sink: Any | None = None,
+    usage_execution_context: Any | None = None,
+    provider_request_correlation: ProviderRequestCorrelation | None = None,
 ) -> AgentRunner:
     """Build an :class:`AgentRunner` that mirrors the parent turn's surface.
 
@@ -1695,6 +1716,10 @@ def make_agent_runner_from_parent(
     sub-Agent both knows the path (system_prompt grounding) and resolves
     file tools against it (sub_config.workspace_dir).
     """
+
+    inherited_provider_request_correlation = (
+        provider_request_correlation or current_provider_request_correlation()
+    )
 
     # Diagnostic: log the workspace_dir this factory was constructed with
     # so we can verify the value flowing into sub-Agents matches the
@@ -1731,6 +1756,25 @@ def make_agent_runner_from_parent(
             )
 
     async def _runner(system_prompt: str, user_message: str) -> AsyncIterator[AgentEvent]:
+        child_provider_request_correlation = (
+            provider_request_correlation
+            or derive_provider_request_correlation(
+                current_provider_request_correlation()
+                or inherited_provider_request_correlation,
+                execution_id=uuid.uuid4().hex,
+                call_kind="subagent.chat",
+            )
+        )
+        child_tool_handler = tool_handler
+        if tool_handler is not None:
+
+            async def _child_tool_handler(call: Any) -> Any:
+                with bind_provider_request_correlation(
+                    child_provider_request_correlation
+                ):
+                    return await tool_handler(call)
+
+            child_tool_handler = _child_tool_handler
         # Per-call recovery: prefer the live tool_context's workspace_dir
         # over the (possibly stale or None) factory closure value. The
         # outer turn's tool_context is set by the gateway and is the
@@ -1829,13 +1873,48 @@ def make_agent_runner_from_parent(
                 )
             )
         ]
+        child_usage_context = None
+        if usage_event_sink is not None:
+            from opensquilla.engine.usage_accounting import UsageExecutionContext
+
+            child_execution_id = uuid.uuid4().hex
+            child_usage_context = UsageExecutionContext(
+                execution_id=child_execution_id,
+                agent_run_id=child_execution_id,
+                turn_id=child_execution_id,
+                parent_turn_id=(
+                    usage_execution_context.turn_id
+                    or usage_execution_context.execution_id
+                    if usage_execution_context is not None
+                    else None
+                ),
+                session_id=(
+                    usage_execution_context.session_id
+                    if usage_execution_context is not None
+                    else None
+                ),
+                session_epoch=(
+                    usage_execution_context.session_epoch
+                    if usage_execution_context is not None
+                    else 0
+                ),
+                agent_id=(
+                    usage_execution_context.agent_id
+                    if usage_execution_context is not None
+                    else ""
+                ),
+                run_kind="meta_subagent",
+            )
         agent = agent_factory(
             provider=provider,
             config=sub_config,
             tool_definitions=filtered_tool_definitions,
-            tool_handler=tool_handler,
+            tool_handler=child_tool_handler,
             usage_tracker=usage_tracker,
             session_key=session_key,
+            usage_event_sink=usage_event_sink,
+            usage_execution_context=child_usage_context,
+            provider_request_correlation=child_provider_request_correlation,
         )
         from opensquilla.engine.agent import _flatten_content_blocks
         from opensquilla.engine.types import TextDeltaEvent
@@ -1878,6 +1957,9 @@ def make_llm_chat_from_provider(
     max_tokens: int = 16384,
     usage_tracker: Any | None = None,
     session_key: str | None = None,
+    usage_event_sink: UsageEventSink | None = None,
+    usage_execution_context: UsageExecutionContext | None = None,
+    provider_request_correlation: ProviderRequestCorrelation | None = None,
 ) -> LLMChat:
     """Build a single-turn LLM caller — no tools, no agent loop.
 
@@ -1903,45 +1985,111 @@ def make_llm_chat_from_provider(
     explicitly; callers that want LESS (classifiers) should also override.
     """
 
+    inherited_provider_request_correlation = (
+        provider_request_correlation or current_provider_request_correlation()
+    )
+
     from opensquilla.provider.types import ChatConfig, DoneEvent, Message
     from opensquilla.provider.types import TextDeltaEvent as ProviderTextDelta
 
     async def _chat(system_prompt: str, user_message: str) -> str:
+        call_provider_request_correlation = (
+            provider_request_correlation
+            or derive_provider_request_correlation(
+                current_provider_request_correlation()
+                or inherited_provider_request_correlation,
+                execution_id=uuid.uuid4().hex,
+                call_kind="auxiliary.meta",
+            )
+        )
         config = ChatConfig(
             system=system_prompt,
             max_tokens=max_tokens,
             temperature=0.0,
+            provider_request_correlation=call_provider_request_correlation,
         )
         messages = [Message(role="user", content=user_message)]
         parts: list[str] = []
         first_error: str = ""
-        async for event in provider.chat(messages, tools=None, config=config):
-            if isinstance(event, ProviderTextDelta):
-                parts.append(event.text)
-            elif isinstance(event, DoneEvent):
-                if usage_tracker is not None and session_key:
-                    usage_tracker.add(
-                        session_key,
-                        input_tokens=event.input_tokens,
-                        output_tokens=event.output_tokens,
-                        model_id=event.model or base_config.model_id or "",
-                        provider=(
-                            getattr(base_config, "provider_id", "")
-                            or getattr(provider, "provider_name", "")
-                            or ""
-                        ),
-                        cache_read_tokens=event.cached_tokens,
-                        cache_write_tokens=event.cache_write_tokens,
-                        billed_cost=event.billed_cost,
-                    )
-            elif type(event).__name__ == "ErrorEvent" and not first_error:
-                # Capture provider-level errors (auth, network, illegal
-                # header, rate-limit) so the caller does not see a
-                # silently-empty response that gets misdiagnosed as
-                # "model returned no content". The empty-string fall
-                # through that happened before this surfaced as JSON
-                # validation failures at the wrong layer.
-                first_error = getattr(event, "message", repr(event))
+        inherited_scope = current_usage_accounting_scope()
+        effective_sink = usage_event_sink or (
+            inherited_scope.sink if inherited_scope is not None else None
+        )
+        parent = usage_execution_context or (
+            inherited_scope.context if inherited_scope is not None else None
+        )
+        scope: UsageAccountingScope | None = None
+        if effective_sink is not None:
+            execution_id = uuid.uuid4().hex
+            scope = UsageAccountingScope(
+                sink=effective_sink,
+                context=UsageExecutionContext(
+                    execution_id=execution_id,
+                    agent_run_id=execution_id,
+                    turn_id=execution_id,
+                    parent_turn_id=(
+                        parent.turn_id
+                        or parent.execution_id
+                        if parent is not None
+                        else None
+                    ),
+                    session_id=parent.session_id if parent is not None else None,
+                    session_epoch=parent.session_epoch if parent is not None else 0,
+                    agent_id=parent.agent_id if parent is not None else "",
+                    run_kind="meta_llm",
+                ),
+            )
+        provider_id = str(
+            getattr(base_config, "provider_id", "")
+            or getattr(provider, "provider_name", "")
+            or ""
+        )
+        model_id = str(getattr(base_config, "model_id", "") or "")
+        with (
+            bind_provider_request_correlation(call_provider_request_correlation),
+            bind_usage_accounting_scope(scope),
+        ):
+            stream = (
+                provider.chat(messages, tools=None, config=config)
+                if scope is not None and provider_accounts_physical_usage(provider)
+                else account_provider_stream(
+                    lambda: provider.chat(messages, tools=None, config=config),
+                    provider=provider_id,
+                    model=model_id,
+                )
+            )
+            async for event in stream:
+                if isinstance(event, ProviderTextDelta):
+                    parts.append(event.text)
+                elif isinstance(event, DoneEvent):
+                    if usage_tracker is not None and session_key:
+                        physical_provider = str(
+                            getattr(event, "_opensquilla_usage_provider", "")
+                            or provider_id
+                        )
+                        physical_model = str(
+                            getattr(event, "_opensquilla_usage_model", "")
+                            or event.model
+                            or model_id
+                        )
+                        usage_tracker.add(
+                            session_key,
+                            input_tokens=event.input_tokens,
+                            output_tokens=event.output_tokens,
+                            model_id=physical_model,
+                            provider=physical_provider,
+                            cache_read_tokens=event.cached_tokens,
+                            cache_write_tokens=event.cache_write_tokens,
+                            billed_cost=event.billed_cost,
+                        )
+                elif type(event).__name__ == "ErrorEvent" and not first_error:
+                    # Capture provider-level errors (auth, network, illegal
+                    # header, rate-limit) so the caller does not see a
+                    # silently-empty response that gets misdiagnosed as
+                    # "model returned no content". The empty-string fall
+                    # through that happened before this surfaced as JSON
+                    # validation failures at the wrong layer.
+                    first_error = getattr(event, "message", repr(event))
         result = "".join(parts).strip()
         if not result and first_error:
             import structlog
@@ -1960,6 +2108,7 @@ def make_llm_chat_from_provider(
 def make_tool_invoker_from_handler(
     *,
     tool_handler: Any,
+    provider_request_correlation: ProviderRequestCorrelation | None = None,
 ) -> ToolInvoker:
     """Build a direct tool caller that bypasses the LLM.
 
@@ -1973,14 +2122,28 @@ def make_tool_invoker_from_handler(
 
     from opensquilla.tool_boundary import ToolCall
 
+    inherited_provider_request_correlation = (
+        provider_request_correlation or current_provider_request_correlation()
+    )
+
     async def _invoke(tool_name: str, arguments: dict[str, Any]) -> str:
+        call_provider_request_correlation = (
+            provider_request_correlation
+            or derive_provider_request_correlation(
+                current_provider_request_correlation()
+                or inherited_provider_request_correlation,
+                execution_id=uuid.uuid4().hex,
+                call_kind="auxiliary.meta",
+            )
+        )
         call = ToolCall(
             tool_use_id=f"meta_tool_{uuid.uuid4().hex[:12]}",
             tool_name=tool_name,
             arguments=arguments,
             origin_trace="meta-orchestrator",
         )
-        result = await tool_handler(call)
+        with bind_provider_request_correlation(call_provider_request_correlation):
+            result = await tool_handler(call)
         if getattr(result, "is_error", False):
             raise RuntimeError(
                 f"tool {tool_name!r} failed: {getattr(result, 'content', '')!s}",

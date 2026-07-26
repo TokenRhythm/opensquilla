@@ -11,12 +11,18 @@ From the repository root:
 
 ```bash
 cd opensquilla-webui
+npm ci
 npm run build
 
 cd ../desktop/electron
-npm install
+npm ci
 npm run dev
 ```
+
+Use Node.js 22.12 or newer. The Vue build under
+`src/opensquilla/gateway/static/dist/` is generated and ignored by Git; local
+Desktop packaging verifies it against the current frontend source before
+PyInstaller runs.
 
 On first run, the shell opens a setup window for provider, model, base URL, and
 API key. The key is encrypted with Electron `safeStorage` when available, and a

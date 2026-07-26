@@ -137,6 +137,11 @@ def test_stage_then_flush_hands_record_to_writer_single() -> None:
     assert record["proposed_tier"] == "c1"
     assert record["final_tier"] == "c2"
     assert record["provider"] == "openrouter"
+    assert record["requested_provider"] == "openrouter"
+    assert record["requested_model"] == "deepseek/deepseek-chat"
+    assert record["executed_provider"] == "openrouter"
+    assert record["executed_model"] == "deepseek/deepseek-chat"
+    assert record["fallback_reason"] is None
     assert record["thinking_level"] == "medium"
     assert record["baseline_model"] == "anthropic/claude-sonnet"
     assert record["savings_pct"] == 42.5  # C2: today's value, verbatim
@@ -158,11 +163,23 @@ def test_flush_records_ensemble_execution_facts() -> None:
     ctx.metadata["routed_model_before_ensemble"] = "deepseek/deepseek-chat"
     flush_router_decision(
         ctx.metadata,
-        ensemble_trace={"mode": "b5_fusion", "profile": "static_openrouter_b5"},
+        ensemble_trace={
+            "mode": "b5_fusion",
+            "profile": "static_openrouter_b5",
+            "fallback_used": True,
+            "fallback_code": "ensemble_insufficient_proposers",
+            "fallback_reason": "ensemble quorum not reached",
+            "final_request": {
+                "execution": {"provider": "openai", "model": "gpt-5-mini"}
+            },
+        },
     )
     record = writer.records[0]
     assert record["executed_kind"] == "ensemble"
     assert record["ensemble_profile"] == "static_openrouter_b5"
+    assert record["executed_provider"] == "openai"
+    assert record["executed_model"] == "gpt-5-mini"
+    assert record["fallback_reason"] == "ensemble_insufficient_proposers"
 
 
 def test_flush_realigns_model_and_counts_fallback_hops() -> None:
@@ -173,11 +190,17 @@ def test_flush_realigns_model_and_counts_fallback_hops() -> None:
 
     # Selector fallback executed a different model and counted two hops.
     ctx.metadata["routed_model"] = "qwen/qwen-plus"
+    ctx.metadata["executed_provider"] = "dashscope"
+    ctx.metadata["executed_model"] = "qwen/qwen-plus"
     ctx.metadata["router_fallback_hops"] = 2
     flush_router_decision(ctx.metadata)
     record = writer.records[0]
     assert record["model"] == "qwen/qwen-plus"
     assert record["fallback_hops"] == 2
+    assert record["requested_model"] == "deepseek/deepseek-chat"
+    assert record["executed_provider"] == "dashscope"
+    assert record["executed_model"] == "qwen/qwen-plus"
+    assert record["fallback_reason"] == "selector_fallback"
     assert record["executed_kind"] == "single"
 
 
@@ -347,7 +370,9 @@ def _synthetic_writer(tmp_path: Path) -> RouterDecisionWriter:
         " decision_id TEXT PRIMARY KEY, session_key TEXT NOT NULL,"
         " turn_index INTEGER, ts_ms INTEGER NOT NULL, classifier TEXT,"
         " proposed_tier TEXT, confidence REAL, probs TEXT, flags TEXT,"
-        " final_tier TEXT, provider TEXT, model TEXT, thinking_level TEXT,"
+        " final_tier TEXT, requested_provider TEXT, requested_model TEXT,"
+        " provider TEXT, model TEXT, executed_provider TEXT, executed_model TEXT,"
+        " fallback_reason TEXT, thinking_level TEXT,"
         " source TEXT, trail TEXT, baseline_model TEXT, savings_pct REAL,"
         " executed_kind TEXT, ensemble_profile TEXT,"
         " fallback_hops INTEGER NOT NULL DEFAULT 0)"

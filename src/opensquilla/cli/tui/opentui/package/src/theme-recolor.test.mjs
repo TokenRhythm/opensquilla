@@ -9,6 +9,7 @@ import { createToolBlock } from "./blocks/toolBlock.mjs";
 import { createThinkingBlock } from "./blocks/thinkingBlock.mjs";
 import { createReasoningBlock } from "./blocks/reasoningBlock.mjs";
 import { createAnswerBlock } from "./blocks/answerBlock.mjs";
+import { textWidth } from "./primitives.mjs";
 
 // A live /theme switch mutates THEME/STATUS in place. Renderables captured their
 // fg at creation, so a dark→light switch would leave prior transcript unreadable
@@ -24,8 +25,8 @@ class FakeNode {
     this.children.push(node);
     return this.children.length;
   }
-  remove(id) {
-    this.children = this.children.filter((child) => child.id !== id);
+  remove(node) {
+    this.children = this.children.filter((child) => child !== node);
   }
   getChildren() {
     return this.children;
@@ -53,7 +54,7 @@ afterEach(() => {
   applyTheme("opensquilla-dark");
 });
 
-test("prompt block recolors every line node and the body rail to the new theme tokens", () => {
+test("prompt block recolors its role, text, rail, and surface to the new theme tokens", () => {
   applyTheme("opensquilla-dark");
   const box = new FakeNode();
   const block = createPromptBlock({
@@ -62,22 +63,34 @@ test("prompt block recolors every line node and the body rail to the new theme t
   block.begin({ text: "line one\nline two" });
 
   const darkRail = THEME.promptAccent;
-  const darkText = THEME.muted;
+  const darkText = THEME.promptText;
+  const darkSurface = THEME.promptSurface;
   const body = findById(box, "p-body");
+  const label = findById(box, "p-label");
+  const content = findById(box, "p-content");
   assert.ok(body);
+  assert.ok(label && content);
   assert.equal(body.borderColor, darkRail);
-  // Compact prompt: one node per line, no header/footer chrome nodes.
+  assert.equal(body.backgroundColor, darkSurface);
+  assert.equal(content.backgroundColor, darkSurface);
+  assert.equal(label.content, "you");
+  assert.equal(label.fg, darkRail);
+  // Compact prompt: one role node + one content column, no card chrome.
   assert.equal(body.children.length, 2);
   assert.equal(findById(box, "p-top"), null);
   assert.equal(findById(box, "p-bot"), null);
-  assert.ok(body.children.every((n) => n.fg === darkText));
+  assert.ok(content.children.every((n) => n.fg === darkText));
 
   applyTheme("opensquilla-light");
   block.recolor();
   assert.notStrictEqual(THEME.promptAccent, darkRail); // the two themes genuinely differ
-  assert.notStrictEqual(THEME.muted, darkText);
-  assert.ok(body.children.every((n) => n.fg === THEME.muted));
+  assert.notStrictEqual(THEME.promptText, darkText);
+  assert.notStrictEqual(THEME.promptSurface, darkSurface);
+  assert.ok(content.children.every((n) => n.fg === THEME.promptText));
+  assert.equal(label.fg, THEME.promptAccent);
   assert.equal(body.borderColor, THEME.promptAccent);
+  assert.equal(body.backgroundColor, THEME.promptSurface);
+  assert.equal(content.backgroundColor, THEME.promptSurface);
 });
 
 test("tool block recolor re-derives the run-state color for its current state", () => {
@@ -139,6 +152,11 @@ test("reasoning marker recolors to the new theme accent while mounted", () => {
   const node = box.children[0];
   const dark = THEME.thinkingAccent;
   assert.equal(node.fg, dark);
+  block.append("retained reasoning");
+  block.end();
+  // Completion collapses the body, but the semantic Thought marker stays
+  // purple instead of becoming indistinguishable from a usage receipt.
+  assert.equal(node.fg, THEME.thinkingAccent);
 
   applyTheme("opensquilla-light");
   block.recolor();
@@ -244,4 +262,64 @@ test("turn card chrome recolors on a theme switch", () => {
   assert.notStrictEqual(THEME.answerFrame, darkFrame);
   assert.equal(cardTop.fg, THEME.answerFrame);
   assert.equal(cardBody.borderColor, THEME.answerFrame);
+});
+
+test("a completed turn settles its connected frame from active accent to muted history", () => {
+  const conversationBox = new FakeNode();
+  const turn = createTurnView(
+    {
+      renderer,
+      BoxRenderable: FakeNode,
+      TextRenderable: FakeNode,
+      MarkdownRenderable: FakeNode,
+      syntaxStyle: {},
+      conversationBox,
+    },
+    "settled",
+  );
+  turn.begin("tool", "tool", { name: "grep", args: "needle" });
+  const box = conversationBox.children[0];
+  const cardTop = findById(box, "turn-settled-cardtop");
+  const cardBody = findById(box, "turn-settled-cardbody");
+  assert.equal(cardTop.fg, THEME.answerFrame);
+  assert.equal(cardBody.borderColor, THEME.answerFrame);
+
+  turn.update("tool", { status: "ok" });
+  turn.end("tool");
+  turn.finish();
+  assert.equal(cardTop.fg, THEME.muted);
+  assert.equal(cardBody.borderColor, THEME.muted);
+});
+
+test("turn headers follow the canonical agent label and refresh retained cards safely", () => {
+  const conversationBox = new FakeNode();
+  let label = "  Mira\x1b[31m Prime  ";
+  const turn = createTurnView(
+    {
+      renderer,
+      BoxRenderable: FakeNode,
+      TextRenderable: FakeNode,
+      MarkdownRenderable: FakeNode,
+      syntaxStyle: {},
+      conversationBox,
+      contentWidth: () => 16,
+      agentLabel: () => label,
+    },
+    "identity",
+  );
+  turn.begin("tool", "tool", { name: "probe" });
+  const header = findById(conversationBox.children[0], "turn-identity-cardtop");
+  assert.ok(header.content.startsWith("╭ Mira Prime"));
+  assert.ok(!header.content.includes("\x1b"));
+  assert.ok(textWidth(header.content) <= 16);
+
+  label = "🦐 Very Long Canonical Agent Name";
+  turn.refreshContext();
+  assert.ok(header.content.startsWith("╭ 🦐"));
+  assert.ok(header.content.endsWith("…"));
+  assert.ok(textWidth(header.content) <= 16);
+
+  label = "";
+  turn.refreshContext();
+  assert.equal(header.content, "╭ squilla");
 });

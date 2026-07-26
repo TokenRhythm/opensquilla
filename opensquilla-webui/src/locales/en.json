@@ -6,11 +6,15 @@
     "desktop": {
       "indicatorAvailable": "Update {version}",
       "indicatorDownloaded": "Update ready",
+      "indicatorInstallerReady": "Installer verified",
       "indicatorDownloading": "Downloading",
       "indicatorDownloadingProgress": "Downloading {progress}%",
       "indicatorError": "Update issue",
       "availableTitle": "OpenSquilla {version} is available",
       "availableDesc": "Download it when you're ready. OpenSquilla will install it only after you relaunch.",
+      "manualAvailableDesc": "Download the versioned Windows installer. Windows will ask you to complete the installation.",
+      "manualDownloadedTitle": "Verified installer ready",
+      "manualDownloadedDesc": "OpenSquilla {version} was verified against the canonical GitHub checksum and shown in its folder. Run the installer when ready.",
       "downloadedTitle": "Ready to install",
       "downloadedDesc": "Relaunch OpenSquilla to finish updating to {version}.",
       "downloadingTitle": "Downloading update",
@@ -19,13 +23,22 @@
       "applyingDesc": "OpenSquilla is preparing to relaunch and install the update.",
       "errorTitle": "Update check failed",
       "errorFallback": "Try checking again from Settings.",
+      "errorSourceUnreachable": "The update sources are temporarily unreachable. Try again later.",
+      "errorManifestInvalid": "The release-channel data is invalid, so OpenSquilla cannot safely confirm an update.",
+      "errorChecksumUnavailable": "The installer cannot be verified because the canonical GitHub checksum is unavailable. No installer was opened.",
+      "errorIntegrityFailed": "The downloaded installer failed integrity verification and was deleted.",
+      "errorDownloadFailed": "OpenSquilla could not download the update. Check your connection and try again.",
+      "errorInstallFailed": "OpenSquilla could not prepare or open the installer. Try again or use the release page.",
       "idleDesc": "Check for a new desktop release.",
+      "manualIdleDesc": "Check for a new desktop release. Windows updates open a versioned installer for manual installation.",
       "upToDateDesc": "Version {version} is the latest available.",
       "settingsTitle": "Desktop updates",
       "currentVersion": "Current",
       "latestVersion": "Latest",
       "unknownVersion": "Unknown",
       "availableStatus": "Available",
+      "manualAvailableStatus": "Manual install",
+      "manualDownloadedStatus": "Verified",
       "downloadedStatus": "Ready to install",
       "downloadingStatus": "Downloading",
       "checkingStatus": "Checking",
@@ -35,8 +48,14 @@
       "idleStatus": "Idle",
       "unavailableStatus": "Unavailable",
       "unsupported": "Native desktop updates are unavailable on this platform. Use the release link when a new version is announced.",
+      "source": "Source",
+      "sourceOss": "Alibaba Cloud OSS mirror",
+      "sourceGithub": "GitHub Releases",
+      "fallbackUsed": "Switched to backup source",
       "check": "Check",
       "download": "Download",
+      "downloadInstaller": "Download installer",
+      "showInstaller": "Show installer",
       "relaunch": "Relaunch",
       "later": "Later"
     }
@@ -45,7 +64,10 @@
     "close": "Close",
     "save": "Save",
     "discard": "Discard",
-    "cancel": "Cancel"
+    "cancel": "Cancel",
+    "edit": "Edit",
+    "delete": "Delete",
+    "dismiss": "Dismiss"
   },
   "nav": {
     "chat": "Chat",
@@ -55,12 +77,22 @@
     "channels": "Channels",
     "cron": "Cron",
     "skills": "Skills",
+    "skillsChannels": "Skills & Channels",
     "overview": "Overview",
+    "status": "Status",
     "usage": "Usage",
     "logs": "Logs",
     "settings": "Settings",
     "groupBuild": "Build",
-    "groupMonitor": "Monitor"
+    "groupMonitor": "Overview",
+    "channelSetup": "Channel setup",
+    "not-found": "Not found"
+  },
+  "notFound": {
+    "title": "Page not found",
+    "body": "This address doesn't match an OpenSquilla page.",
+    "goToChat": "Go to Chat",
+    "sessions": "Sessions"
   },
   "chrome": {
     "settings": "Settings",
@@ -113,7 +145,13 @@
       "themeLabel": "Theme",
       "themeDesc": "Follow your system, or force light or dark. The sidebar toggle is a shortcut to this same setting.",
       "languageLabel": "Language",
-      "languageDesc": "Display language for the interface. Applies instantly to this browser.",
+      "languageDesc": "Display language for the interface and channel system notices. Applies instantly here and saves the Gateway-wide notice language.",
+      "channelNoticeLocaleSyncPending": "The interface language changed, but the channel system-message language has not been saved yet. It will retry when the Gateway reconnects.",
+      "toolDetailsLabel": "Tool details by default",
+      "toolDetailsDesc": "Auto follows the tool type; Compact collapses ordinary tools; Expanded opens them. Errors open automatically by default and can still be collapsed.",
+      "toolDetailsAuto": "Auto",
+      "toolDetailsCompact": "Compact",
+      "toolDetailsExpanded": "Expanded",
       "bgmLabel": "Background music",
       "bgmDesc": "Show the background-music control in the top bar. Off by default; also toggleable from the command palette.",
       "sidebarWidthLabel": "Sidebar width",
@@ -136,6 +174,42 @@
       "sidebarWidthCompactStatus": "Compact layout uses {current}px. Your desktop preference of {saved}px is preserved.",
       "sidebarWidthDrawerStatus": "Drawer layout uses {current}px. Your desktop preference of {saved}px is preserved."
     },
+    "dataMigration": {
+      "title": "Data & backups",
+      "desc": "Find and review data from another OpenSquilla installation. Nothing is scanned until you open this page, and nothing is changed without your confirmation.",
+      "refresh": "Scan again",
+      "scanning": "Looking for importable OpenSquilla data…",
+      "unsupportedTitle": "Update OpenSquilla to preview imports",
+      "unsupportedDesc": "This gateway or Desktop shell does not support the private preview API yet. Update the host, then return to this page.",
+      "invalidResponse": "The gateway returned an unsupported migration preview.",
+      "compatibilityTitle": "Legacy Agent data location",
+      "compatibilityDesc": "OpenSquilla is using a compatible legacy Agent data location. Changing it switches the identity and memory source; it does not move, merge, or delete data.",
+      "chooseLegacyAgentData": "Choose Agent data location",
+      "recoveryTitle": "Import is unavailable in a recovery profile",
+      "loadFailed": "OpenSquilla could not inspect import sources.",
+      "emptyTitle": "No other OpenSquilla data found",
+      "emptyDesc": "You can scan again later. Desktop can also choose a data folder manually.",
+      "chooseSourceDesc": "Review a source before importing. Sources remain unchanged and are never merged with current data.",
+      "previewSource": "Review {source} data",
+      "webReadOnly": "This web connection can preview the import only. Complete it in Desktop or on the gateway host.",
+      "hostCliHint": "To complete the import from a terminal, run the migration tool on the gateway host. No server path is exposed in this browser.",
+      "blockers": {
+        "source_in_use": "The source is currently in use.",
+        "source_schema_newer": "The source was created by a newer OpenSquilla version.",
+        "source_database_invalid": "The source database could not be validated.",
+        "source_config_invalid": "The source configuration could not be validated.",
+        "source_unreadable": "The source could not be read safely.",
+        "insufficient_disk": "There is not enough free disk space.",
+        "target_recovery_required": "The current data must be recovered before importing.",
+        "target_not_replaceable": "The current data cannot be safely replaced.",
+        "preview_unavailable": "A safe preview is not available for this source."
+      },
+      "notices": {
+        "whole_profile_replacement": "The current profile will be backed up and replaced as a whole; data is not merged.",
+        "previously_imported": "This source was imported previously and is still available for review.",
+        "scheduled_jobs_will_be_paused": "Imported scheduled jobs remain paused until you review them."
+      }
+    },
     "dialog": {
       "title": "Settings",
       "actionNeeded": "Action needed ({count})",
@@ -148,9 +222,21 @@
       "openSection": "{label} — open {section}",
       "unsavedSuffix": ", unsaved changes",
       "unsavedIn": "Unsaved changes in {sections}",
+      "unsavedProvider": "Unsaved changes to {provider}",
+      "unsavedCount": "Unsaved changes in {count} sections",
+      "saveProvider": "Save {provider}",
+      "saveRouting": "Save routing changes",
+      "saveAll": "Save all ({count})",
+      "savingChanges": "Saving changes…",
+      "discardProvider": "Discard {provider} changes",
+      "discardRouting": "Discard routing changes",
+      "discardAll": "Discard all ({count})",
       "moreOptionsIn": "More options live in",
       "copyConfigPath": "Copy config path",
-      "applyLiveNote": "Most changes apply live; some need a gateway restart"
+      "applyLiveNote": "Most changes apply live; some need a gateway restart",
+      "discardTitle": "Discard unsaved changes?",
+      "discardBody": "You have unsaved edits. Closing now will lose them.",
+      "discardPrimary": "Discard"
     },
     "rail": {
       "connection": "Connection",
@@ -161,7 +247,6 @@
       "privacy": "Privacy",
       "router": "Router",
       "ensemble": "Ensemble",
-      "channels": "Channels",
       "capabilities": "Capabilities",
       "appearance": "Appearance",
       "keyboard": "Keyboard",
@@ -169,7 +254,6 @@
       "groups": {
         "gateway": "Gateway",
         "ai": "AI configuration",
-        "delivery": "Delivery",
         "preferences": "Preferences",
         "capabilities": "Capabilities"
       }
@@ -251,6 +335,121 @@
     },
     "provider": {
       "title": "Provider",
+      "pageTitle": "Model Service",
+      "pageDesc": "Connect model providers and manage credentials, endpoints, and the direct/fallback model. Choose how models are used in Model Routing.",
+      "configuredTitle": "Configured providers",
+      "configuredCount": "{count}",
+      "configuredSummary": "{ready} of {count} credentials ready. Verification sends one small model request and may incur provider charges.",
+      "configuredDesc": "Saved providers remain available for routing until you remove them. Configuration verification sends a small model request using the saved settings; provider charges may apply.",
+      "activeBadge": "Active",
+      "editingBadge": "Editing",
+      "profileReady": "Credentials ready",
+      "profileNeedsCredentials": "Needs credentials",
+      "profileStatusUnavailable": "Status unavailable",
+      "emptyTitle": "Add your first model provider",
+      "configuredEmpty": "Connect a provider to verify credentials and choose available models.",
+      "emptyRoutingHint": "Once connected, you can set up intelligent routing; one provider can still route between multiple models.",
+      "addProvider": "Add provider",
+      "catalogTitle": "Add provider",
+      "catalogDesc": "Choose a provider. Its configuration will open directly below.",
+      "featuredProviders": "Featured providers",
+      "allProviders": "All providers",
+      "providerResultCount": "{count} available",
+      "recommendedBadge": "Recommended",
+      "browseAllProviders": "Browse all providers ({count})",
+      "providerResults": "Provider results",
+      "viewAllProviders": "View all ({count})",
+      "showFewerProviders": "Show fewer",
+      "searchProviders": "Search providers",
+      "searchProvidersPlaceholder": "Search by provider name",
+      "noProviderMatches": "No providers match this search.",
+      "multiProviderRouting": "Multi-provider routing",
+      "modelRoutingStatus": "Multi-provider features",
+      "routerStatus": "Model Routing",
+      "routerStateOff": "Off",
+      "routerStateFollowPrimary": "Recommended · follows active provider",
+      "routerStateCustom": "Custom · preserved when the active provider changes",
+      "routerStateLegacy": "Existing configuration · preserved when the active provider changes",
+      "routingStatusDesc": "{count} providers saved · {ready} ready. Adding providers does not enable Routing or Ensemble.",
+      "routingStatusDescOne": "1 provider saved · {ready} ready. Adding a provider does not enable Routing or Ensemble.",
+      "crossProviderRouting": "Cross-provider",
+      "ensembleStatus": "Ensemble",
+      "routingOn": "On",
+      "routingOff": "Off",
+      "routingOnDesc": "Model Routing can use your configured providers.",
+      "routingOffDesc": "Providers stay saved while routing is off. Enable it when you want to route across models.",
+      "manageRouting": "Manage routing",
+      "openModelRouting": "Open Model Routing →",
+      "modelUsageTitle": "Model usage",
+      "modelUsageRouter": "Intelligent model routing",
+      "modelUsageEnsemble": "Multi-model collaboration",
+      "modelUsageFixed": "Fixed model",
+      "modelUsageRouterDesc": "Choose one suitable configured model for each request.",
+      "modelUsageEnsembleDesc": "Generate with multiple models, then combine their results.",
+      "modelUsageFixedDesc": "Send every request to the current direct model.",
+      "crossProviderActive": "Cross-provider routing included",
+      "configureModelRouting": "Set up model routing",
+      "enableRouting": "Enable routing",
+      "editProvider": "Edit {provider}",
+      "moreActionsFor": "More actions for {provider}",
+      "actionsFor": "Actions for {provider}",
+      "testProviderConnection": "Verify {provider} configuration",
+      "testSavedConnection": "Verify saved configuration",
+      "addKeyToTest": "Add key to verify",
+      "addKeyToTestHint": "Add an API key before verifying this provider. You can verify an unsaved pasted key.",
+      "addModelToTest": "Add model to verify",
+      "addModelToTestHint": "Choose a model before verifying this provider.",
+      "statusUnavailableTestHint": "Provider status is unavailable, so the saved configuration cannot be verified yet.",
+      "makeActive": "Set active",
+      "activationModelRequired": "Choose and save a model below before making this provider active.",
+      "activationModelRequiredHint": "Choose a direct/fallback model in this provider's editor and save it first.",
+      "activationPoolUnsupported": "This provider uses a key pool and cannot be made active. It remains available to Routing and Ensemble.",
+      "activationStatusUnavailable": "Provider activation status is unavailable. Update and restart the Gateway.",
+      "activationUnavailable": "This provider cannot be made active with its saved configuration.",
+      "activateTitle": "Set {provider} active",
+      "activateDesc": "Choose the direct/fallback model and review what changes before activating this provider.",
+      "activateDirectModelLabel": "Direct / fallback model",
+      "activateDirectModelDesc": "Used for normal direct requests and whenever execution falls back to the active provider.",
+      "activateRouterConflictTitle": "Resolve Model Routing",
+      "activateRouterConflictDesc": "Custom tiers reference another provider while cross-provider routing is off. Choose what should happen.",
+      "activateUseRecommendedRoute": "Use the new provider's recommended route",
+      "activateUseRecommendedRouteDesc": "Replace the current custom tiers with {provider}'s managed preset.",
+      "activateKeepCustomRoute": "Keep the custom route",
+      "activateKeepCustomRouteDesc": "Preserve the tiers and explicitly enable cross-provider routing.",
+      "activateDisableRouter": "Turn Model Routing off",
+      "activateDisableRouterDesc": "Keep the saved tiers, but stop using them until routing is enabled again.",
+      "activateImpactTitle": "After activation",
+      "activateRouterOff": "Stays off.",
+      "activateRouterNeedsChoice": "Choose how to resolve the provider conflict above.",
+      "activateRouterFollowsPrimary": "The managed route switches to {provider}.",
+      "activateRouterCustomPreserved": "The custom route stays unchanged.",
+      "activateRouterLegacyPreserved": "The existing route is preserved for compatibility.",
+      "activateEnsembleOnPreserved": "Stays on; members and aggregator are unchanged.",
+      "activateEnsembleOffPreserved": "Stays off.",
+      "discoveringModels": "Discovering models…",
+      "modelPlaceholder": "Enter a model id",
+      "activating": "Activating…",
+      "modelDiscoveryFailed": "Couldn't discover models. Enter a model id manually.",
+      "upgradeGatewayHint": "Update and restart the Gateway to use provider activation.",
+      "connectedLatency": "Configuration verified · Complete probe {latency} ms",
+      "connectionKeyRejected": "Key rejected",
+      "connectionUnavailable": "Connection unavailable",
+      "discardDraftTitle": "Discard provider edits?",
+      "discardDraftBody": "Switching providers will discard the unsaved edits in this provider form.",
+      "discardDraftPrimary": "Discard and continue",
+      "editingTitle": "Edit {provider}",
+      "editingRolePrimary": "Active provider",
+      "editingRoleNewPrimary": "New active provider",
+      "editingRoleProfile": "Routing profile",
+      "editingRoleNew": "Not saved",
+      "editingPrimary": "Used for direct requests and as the primary fallback.",
+      "editingNewPrimary": "Saving will make this provider active for direct requests and primary fallback.",
+      "editingProfile": "Available to Routing and Ensemble; selecting it here does not make it active.",
+      "editingNew": "Saving makes this provider available to Routing and Ensemble; it will not become active.",
+      "profileModelHint": "This saved model becomes the direct/fallback model if you make this provider active. Routed models remain separate in Model Routing.",
+      "removeConfirmTitle": "Remove provider?",
+      "removeConfirmBody": "Remove {provider} from configured providers? Referenced providers cannot be removed.",
+      "removeConfirmPrimary": "Remove provider",
       "needs": "Provider needs",
       "choose": "Choose a provider",
       "chooseProviderShort": "choose provider",
@@ -269,14 +468,39 @@
         "stepRegister": "Create a TokenRhythm account",
         "stepCopy": "Copy your API key",
         "stepPaste": "Paste it into the API key field below",
-        "stepSelectAndPaste": "Select TokenRhythm above, then paste your API key",
+        "stepSelectAndPaste": "Choose Add provider, select TokenRhythm, then paste your API key",
         "stepReplaceAndPaste": "Choose Replace key below, then paste your API key"
       },
+      "recommendationScope": "OpenSquilla recommendation · Optional",
       "advanced": "Advanced provider options",
+      "providerOptions": "{provider} endpoint & advanced options",
+      "endpointTitle": "{provider} endpoint",
+      "endpointDesc": "These settings apply only when OpenSquilla calls {provider}.",
+      "defaultModelTitle": "Direct and fallback model for {provider}",
+      "defaultModelGroupDesc": "Used when Routing is off or when execution falls back to the active provider.",
+      "defaultModelLabel": "Direct / fallback model",
+      "configuredModelTitle": "Model for {provider}",
+      "configuredModelCurrentLabel": "Current model",
+      "configuredModelFallbackLabel": "Fallback model",
+      "configuredModelDescFixed": "Fixed model mode: every request uses the model below.",
+      "configuredModelDescRouter": "Intelligent model routing mode: each request is routed to a suitable model and falls back to the model below when routing is unavailable.",
+      "configuredModelDescEnsemble": "Multi-model collaboration mode: several models generate together, falling back to the model below when the ensemble cannot complete.",
+      "defaultModelDesc": "Used for direct requests and primary fallback. Routed models are configured in Model Routing.",
+      "defaultModelSemantics": "A recommended model is prefilled when available. Choose or enter another model, then verify it before relying on it.",
+      "profileModelTitle": "Direct and fallback model for {provider}",
+      "profileModelGroupDesc": "Saved with this provider and also used for configuration verification.",
+      "profileModelLabel": "Direct / fallback model",
+      "profileModelDesc": "Used if this provider becomes active. Routed models remain configured in Model Routing.",
+      "runtimeDefaultsTitle": "Runtime defaults · All providers",
+      "runtimeDefaultsDesc": "Gateway-wide behavior shared by every normal model request.",
       "timeoutLabel": "Request timeout (seconds)",
       "timeoutDesc": "How long to wait for a single model response before timing out — raise this for slow local models (Ollama, vLLM, LM Studio).",
+      "timeoutGlobalDesc": "Gateway-wide timeout for normal model requests across all providers. Configuration verification uses a separate 30-second timeout.",
       "contextWindowLabel": "Context window override (tokens)",
       "contextWindowDesc": "Cap the prompt-assembly budget for this model. Leave blank to use the auto-detected window.",
+      "contextWindowIdentityLabel": "Context window · {provider} / {model}",
+      "contextWindowIdentityDesc": "Applies wherever this exact provider/model pair runs, including Routing and Ensemble.",
+      "contextWindowNoModel": "choose a model",
       "contextWindowAuto": "auto",
       "contextWindowUnknown": "unknown",
       "contextWindowNone": "none",
@@ -287,31 +511,59 @@
       "copyKeyCommand": "Copy set provider key command",
       "save": "Save Provider",
       "configureRouter": "Open Model Routing →",
-      "credentialTitle": "{provider} credential",
-      "credentialConnected": "Connected",
+      "credentialTitle": "{provider} authentication",
+      "credentialReady": "Key available",
+      "credentialDraftReady": "Key entered · not saved",
+      "credentialEnvDraftReady": "Environment variable entered · not saved",
+      "credentialOptional": "API key optional",
+      "credentialNotRequired": "No key required",
       "credentialNeedsKey": "Needs key",
       "credentialSourceExplicit": "Current source: saved API key",
       "credentialSourceEnv": "Current source: environment variable {envKey}",
       "credentialSourceMissingEnv": "Current source: environment variable {envKey} is not visible",
+      "credentialSourceOptional": "Current source: no API key configured (optional)",
       "credentialSourceNotRequired": "Current source: no key required",
       "credentialSourceNone": "Current source: no saved API key",
+      "credentialSourceDraft": "Current source: unsaved API key",
+      "credentialSourceEnvDraft": "Current source: unsaved environment variable {envKey}",
       "credentialHiddenPlaceholder": "No saved API key",
       "credentialPublicHint": "Current session can replace this credential but cannot view its secret.",
       "viewCredential": "View",
       "replaceCredential": "Replace key",
+      "removeCredential": "Remove saved key",
+      "removingCredential": "Removing saved key…",
+      "removeCredentialConfirmTitle": "Remove saved credential?",
+      "removeCredentialConfirmBody": "Remove the credential saved for {provider} from this device and configuration? The provider, models, and routing settings will be kept. If it comes from an environment variable, the system environment variable itself will not be deleted.",
+      "removeCredentialConfirmPrimary": "Remove credential",
       "credentialReplacePlaceholder": "Paste a replacement API key",
       "credentialEnterPlaceholder": "Paste your API key",
+      "credentialWriteOnlyPlaceholder": "Saved key kept — paste to replace",
+      "optionalApiKeyLabel": "API key (optional)",
+      "optionalApiKeyHelper": "Enter a key only if this endpoint requires authentication; otherwise leave it blank.",
       "showApiKey": "Show API key",
       "hideApiKey": "Hide API key",
       "credentialAdvanced": "Advanced",
+      "credentialSourceOptions": "Credential source",
       "credentialRevealUnavailable": "Couldn't reveal the saved API key.",
-      "connectionLabel": "Connection",
-      "connectionDesc": "Optional: check that your key and endpoint work before saving.",
-      "testConnection": "Test connection",
-      "testing": "Testing connection…",
-      "connected": "✓ Connected",
+      "connectionLabel": "Current configuration",
+      "connectionDesc": "Sends a small model request using the current key, endpoint, and verification model, then validates that the stream completes. Provider charges may apply.",
+      "testConnection": "Verify configuration",
+      "testCurrentSettings": "Verify current configuration",
+      "testing": "Verifying configuration…",
+      "connectionNotTested": "Not verified",
+      "lastVerifiedAgo": "Verified · {ago}",
+      "verifiedConfigChanged": "Configuration changed since verification — verify again",
+      "lastVerifyFailedAgo": "Last verification failed · {ago}",
+      "currentSettingsNotTested": "Current configuration not verified",
+      "endpointVerified": "Configuration verified",
+      "probeMissingRequired": "Complete required fields before verifying: {fields}.",
+      "requiredFieldJoiner": ", ",
+      "connected": "✓ Configuration verified",
+      "firstModelResponse": "First model response · {duration} ms",
+      "completeProbeDuration": "Complete probe · {duration} ms",
       "keyRejected": "✗ Key rejected — {reason}",
       "notReachable": "✗ Couldn't connect — {reason}",
+      "streamIncompatible": "✗ Streaming response incompatible — The provider accepted the credential and model request, but returned an unsupported stream format.",
       "discoverFailed": "Couldn't list models — type a model id.",
       "verdictModels": "{count} models · e.g. {samples}",
       "verdictSampleJoiner": ", ",
@@ -322,11 +574,16 @@
       "failureModelNotFound": "The provider doesn't recognize this model id.",
       "failureUnreachable": "Couldn't reach the endpoint.",
       "failureBadRequest": "The provider rejected the request.",
-      "failureGeneric": "The connection test failed.",
+      "failureGeneric": "Configuration verification failed.",
       "modelListLabel": "Discovered models",
       "modelOptionsToggle": "Model catalog · {count}",
       "modelListReadout": "Available · {count}",
       "modelLiveSource": "Live",
+      "modelMaxOutput": "Max output {tokens}",
+      "effectiveMaxTokens": "Effective output limit: {tokens} tokens · Source: {source}",
+      "effectiveSourceConfig": "user configuration",
+      "effectiveSourceCatalog": "model catalog",
+      "effectiveSourceDefault": "built-in default",
       "modelSearchOrCustom": "Search models or enter a custom ID",
       "modelSelected": "Selected",
       "modelUseTyped": "Use \"{value}\"",
@@ -351,33 +608,51 @@
     },
     "modelStrategy": {
       "title": "Model routing",
-      "desc": "Choose how Squilla uses the current model for each new request.",
-      "providerFirst": "Choose a Model Service first, then choose how routing should work.",
-      "providerAction": "Go to Model Service →",
-      "routerTitle": "AI single-model routing",
-      "visualModeLabel": "Routing panel style",
-      "visualModeDesc": "How the routing decision panel renders in chat replies.",
-      "routerDependency": "Uses {provider} credentials; provider default model is {model}.",
-      "ensembleTitle": "AI ensemble routing",
+      "desc": "Choose how Squilla selects and uses configured models for new requests.",
+      "modeTitle": "Choose how models are used",
+      "modeDesc": "Choose by outcome: intelligent routing balances token use and model capability; a fixed model keeps selection predictable; multi-model collaboration prioritizes capability for complex tasks and usually uses more tokens.",
+      "providerFirstTitle": "Add a model provider to start",
+      "providerFirst": "Model routing needs at least one saved provider. One provider is enough to route among its configured models.",
+      "providerAction": "Go to Model Service",
+      "configuredProvidersOnly": "Available providers and models come from Model Service.",
+      "manageProviders": "Manage Model Service",
+      "routerTitle": "Intelligent model routing",
+      "fallbackTierLabel": "When routing is uncertain",
+      "fallbackTierDesc": "Use this default tier when routing cannot confidently determine the request level.",
+      "modelRolesTitle": "Model roles",
+      "modelRolesDesc": "Define which model handles each request complexity level.",
+      "advancedTitle": "Display options",
+      "advancedDesc": "Change how routing information appears in chat without affecting model selection.",
+      "visualModeLabel": "Routing decision panel style",
+      "visualModeDesc": "Choose how the routing decision panel appears in chat replies. This does not change routing behavior.",
+      "routerDependency": "Choose models for each request level. One provider can supply every level.",
+      "ensembleTitle": "Multi-model collaboration",
       "ensembleDependency": "Uses {provider} credentials; provider default model is {model}.",
       "ensembleMinimum": "Add at least one more candidate to benefit from ensemble routing.",
       "ensembleFailure": "When fusion cannot proceed, fall back to the current model: {provider} · {model}.",
-      "singleTitle": "Off",
-      "singleDependency": "Every turn goes to the current model: {provider} · {model}.",
-      "singleDesc": "AI routing and ensemble routing are off for new requests.",
+      "singleTitle": "Fixed model",
+      "singleDependency": "Choose the model used for every request.",
+      "singleProviderLabel": "Current model provider",
+      "singleModelLabel": "Fixed and fallback model",
+      "singleModelDesc": "Used for every request in Fixed model mode, and as the fallback when routing or collaboration cannot complete.",
+      "singleModelPlaceholder": "Enter a model ID",
+      "singleDesc": "Use one predictable model without automatic routing or multi-model collaboration.",
       "crossProviderNotice": "Cross-provider routing is active. Review each tier before saving.",
       "cards": {
         "router": {
-          "title": "AI single-model routing",
-          "desc": "AI chooses one suitable model per turn, prioritizing lower cost."
+          "title": "Intelligent model routing",
+          "badge": "Token-efficient",
+          "desc": "Match each request to an appropriate model so simple tasks avoid unnecessary high-capability usage."
         },
         "ensemble": {
-          "title": "AI ensemble routing",
-          "desc": "AI coordinates multiple models for stronger complex-task results."
+          "title": "Multi-model collaboration",
+          "badge": "Capability-first",
+          "desc": "Run multiple models in parallel and combine their work for complex tasks; this usually uses more tokens."
         },
         "single": {
-          "title": "Off",
-          "desc": "Send every turn to the current selected model."
+          "title": "Fixed model",
+          "badge": "Predictable",
+          "desc": "Always use the model you choose, making model selection and usage easier to anticipate."
         }
       },
       "openrouterFixedTitle": "{provider} fixed ensemble",
@@ -396,15 +671,16 @@
       "removeCandidateAria": "Remove {model}",
       "ensembleEmpty": "No candidate models yet. Save your Model Service settings to seed model tiers, or add candidates manually.",
       "ensemblePipeline": "How it works: proposer models draft in parallel, then the aggregator fuses the drafts into the final reply. Only the aggregator can call tools.",
+      "ensembleFlowDesc": "Several models draft in parallel, then an aggregator combines their work into one final answer. This uses more model calls and may cost more.",
       "legacyDynamicNotice": "This configuration uses the retired automatic ensemble mode. Convert it to a custom lineup to keep editing it here.",
       "legacyDynamicMigrate": "Convert to custom lineup",
       "schemeLabel": "Ensemble scheme",
-      "schemePresetTitle": "Preset ensemble",
+      "schemePresetTitle": "Preset",
       "schemePresetBadge": "Recommended",
       "schemePresetDesc": "The provider's tuned lineup: four proposers plus one aggregator, ready to use.",
-      "schemeCustomTitle": "Custom ensemble",
+      "schemeCustomTitle": "Custom",
       "schemeCustomBadge": "Advanced",
-      "schemeCustomDesc": "Build your own lineup with roles; mix providers when needed.",
+      "schemeCustomDesc": "Build a role-based lineup from models available through the current provider.",
       "presetNoteDeepseek": "Reasoning anchor — baseline drafts for complex tasks",
       "presetNoteGlm": "Long-form and structured output — contrasts the DeepSeek family",
       "presetNoteKimi": "Code and tool intent — covers programming requests",
@@ -414,9 +690,14 @@
       "aggregatorSectionLabel": "Aggregator",
       "aggregatorSectionDesc": "Exactly one aggregator produces the final answer. Pick the strongest model in your lineup.",
       "aggregatorInheritedNote": "No aggregator assigned — the current chat model fuses the drafts",
-      "proposerSectionLabel": "Proposer models",
+      "proposerSectionLabel": "Proposers",
+      "proposerRoleLabel": "Proposer",
+      "aggregatorRoleLabel": "Aggregator",
       "proposerSectionDesc": "Proposers draft in parallel; wall-clock time follows the slowest one.",
       "proposerCount": "{count} / {max} · {recommendedMin}–{recommendedMax} recommended",
+      "proposerCountCompact": "{count} of {max}",
+      "presetReadOnlyHint": "This preset lineup is managed by the provider.",
+      "presetProviderMismatchNotice": "Turns still run the saved {presetProvider} preset, not {activeProvider}'s — reselect Preset to switch it to {activeProvider}.",
       "importTierCandidates": "Import from model tiers",
       "roleSelectAria": "Role for {model}",
       "roleUnassigned": "No role",
@@ -426,10 +707,30 @@
       "role_critic": "Critic",
       "role_aggregator": "Aggregator",
       "addCandidateRoleLabel": "Candidate role",
+      "candidateActionsAria": "Actions for {model}",
+      "replaceModel": "Replace model",
+      "promoteAggregator": "Also use as aggregator",
+      "replaceCandidateTitle": "Replace {model}",
+      "replaceCandidateConfirm": "Replace",
+      "candidateDuplicate": "This model is already in the proposer list.",
+      "addProposer": "Add proposer",
+      "chooseAggregator": "Choose aggregator",
+      "aggregatorPickerTitle": "Choose the aggregator",
+      "aggregatorFromProposers": "Use an existing proposer",
+      "aggregatorOtherModel": "Or choose another model",
       "capacityWarn": "{calls} model calls per turn — cost grows linearly and fusion gains taper past 4 proposers.",
       "capacityFull": "Limit of {max} proposers reached — more drafts stop improving fusion; remove one before adding another.",
       "diversityHint": "Several proposers share a model family — adding a different vendor usually improves fusion.",
       "effectiveFacts": "Per turn: {calls} model calls · fuses once {quorum}/{proposers} proposers succeed · proposer timeout {proposerTimeout}s · aggregator timeout {aggregatorTimeout}s · {grace}s grace after quorum",
+      "effectiveSummary": "{proposers} proposers in parallel + 1 aggregator · about {calls} model calls per turn",
+      "runtimeStrategyTitle": "Runtime strategy",
+      "runtimeStrategyDesc": "Success threshold, fallback, and time limits",
+      "successThresholdLabel": "Successful proposers required",
+      "successThresholdAuto": "Automatic · at least {quorum} of {proposers} return normally (allows 1 failure)",
+      "successThresholdExact": "At least {quorum} of {proposers} return normally",
+      "failurePolicyLabel": "If aggregation cannot complete",
+      "runtimeLimitsLabel": "Time limits",
+      "runtimeLimits": "Proposers {proposerTimeout}s · aggregator {aggregatorTimeout}s · {grace}s grace after the threshold",
       "quorumFailureLabel": "If fewer than {quorum} proposers succeed"
     },
     "behavior": {
@@ -489,22 +790,31 @@
     },
     "channels": {
       "title": "Channels",
-      "configuredCount": "{count} configured",
-      "channelType": "Channel type",
-      "needs": "Channel needs",
       "save": "Save Channel",
-      "runtimeStatus": "Runtime status",
-      "connected": "Connected",
-      "actionNeeded": "Action needed",
-      "connecting": "connecting",
-      "none": "No channels configured.",
-      "disabled": "Disabled",
-      "enable": "Enable",
-      "disable": "Disable",
       "remove": "Remove",
       "removeConfirmTitle": "Remove this channel?",
       "removeConfirmBody": "{name} will be removed from the configuration. Restart required to take effect.",
-      "removeConfirmPrimary": "Remove"
+      "removeConfirmPrimary": "Remove",
+      "testConnection": "Test connection",
+      "testing": "Testing…",
+      "nameLocked": "Renaming isn't supported — use Duplicate as new",
+      "saveChanges": "Save changes",
+      "secretReplace": "Replace",
+      "secretReplacePlaceholder": "Paste the new value",
+      "secretKeepStored": "Keep stored value",
+      "advancedGroup": "Advanced",
+      "fieldRequired": "This field is required",
+      "fixRequired": "Fill the highlighted required fields first",
+      "aids": {
+        "title": "Feishu console shortcuts",
+        "scopes_json": "Permission manifest — paste into 权限管理 → 批量导入",
+        "copy": "Copy JSON",
+        "copied": "Copied ✓",
+        "credentials_link": "Open credentials page (App id / App secret)",
+        "quick_apply_link": "Pre-fill the permission request for all required scopes",
+        "needAppId": "fill in App id first",
+        "ws_order_note": "Check event subscription in the Feishu console: open 事件与回调 and confirm event delivery is set to 使用长连接接收事件. This notice appears while the WebSocket is connected and no inbound event has been recorded; it does not by itself mean the console is misconfigured. It clears after the first event arrives."
+      }
     },
     "search": {
       "title": "Web search",
@@ -562,6 +872,15 @@
       "outputFormat": "Output format",
       "fallbacks": "Fallback models",
       "fallbacksHint": "Comma-separated provider/model ids tried in order if the primary fails."
+    },
+    "capabilities": {
+      "imageStatus": {
+        "missingEnv": "Missing environment variable {name}. Paste a key below, or set that variable and restart the gateway."
+      },
+      "imageKeyConfigured": "Key configured",
+      "imageKeyMissing": "Not configured yet",
+      "imageKeyPlaceholderKeep": "Leave blank to keep the saved key",
+      "imageKeyPlaceholderNew": "Paste your API key"
     },
     "audio": {
       "title": "Audio",
@@ -623,6 +942,17 @@
       "revealFailed": "Could not reveal log: {error}",
       "restarting": "Restarting the local runtime…",
       "restartFailed": "Restart failed: {error}",
+      "closeBehaviorLabel": "When closing the main window",
+      "closeBehaviorDesc": "Choose what OpenSquilla does when you click the window close button.",
+      "closeBehaviorBackground": "Keep running in the background",
+      "closeBehaviorQuit": "Quit OpenSquilla",
+      "closeBehaviorAsk": "Ask every time",
+      "closeBehaviorSaving": "Saving…",
+      "closeBehaviorReadFailed": "Could not read the window close setting: {error}",
+      "closeBehaviorSaveFailed": "Could not save the window close setting: {error}",
+      "closeBehaviorBackgroundUnavailable": "Background mode is unavailable on this platform.",
+      "closeBehaviorFallbackQuit": "Background mode is unavailable on this platform, so closing the window will quit the app instead.",
+      "closeBehaviorRetry": "Retry",
       "resetConfirmTitle": "Reset saved setup?",
       "resetConfirmBody": "This clears the saved desktop credential and generated config. The next launch re-runs first-time setup.",
       "resetConfirmPrimary": "Reset",
@@ -772,9 +1102,9 @@
       "desc": "Experimental client preferences for this browser. They apply instantly — no save needed. Items marked",
       "reload": "reload",
       "descReloadSuffix": "take effect after a page refresh.",
-      "foldLabel": "Live turn fold",
-      "foldDesc": "Render the streaming work-card from the new fold engine (off = legacy render).",
-      "foldAria": "Live turn fold (takes effect after reload)",
+      "foldLabel": "New live turn renderer",
+      "foldDesc": "Build the streaming work card from an ordered event log. Turn off only to temporarily restore the compatibility renderer.",
+      "foldAria": "New live turn renderer (takes effect after reload)",
       "revealLabel": "Answer reveal window (ms)",
       "revealDesc": "Hold the live answer's reveal in a [min, max] window so the router can decide first. min ≤ max.",
       "revealMinAria": "Answer reveal minimum milliseconds",
@@ -786,17 +1116,24 @@
       "experimental": "experimental",
       "historyMergeDesc": "On history sync, merge by message id and keep live-only fields (default off, transitioning on).",
       "historyMergeAria": "History reconcile-by-id merge (takes effect after reload)",
+      "agentConfigLabel": "Agent configuration (advanced)",
+      "agentConfigDesc": "Manage existing agent configurations. This area will change in a future multi-agent redesign.",
+      "agentConfigAction": "Open",
+      "dataMaintenanceLabel": "Data maintenance",
+      "dataMaintenanceDesc": "Review imports and backups. Desktop can also reset or delete local profile data.",
+      "dataMaintenanceAction": "Manage",
+      "dataMaintenanceAria": "Open data maintenance",
       "runTraceLabel": "Run-trace drawer in Logs",
       "runTraceDesc": "Make log lines interactive and open a per-line node-step detail drawer in the Logs view.",
       "runTraceAria": "Run-trace drawer in Logs (takes effect after reload)"
     },
     "privacy": {
       "title": "Privacy",
-      "statusEnabled": "Network observability is enabled.",
-      "statusDisabled": "Network observability is disabled.",
-      "statusDisabledByEnv": "Network observability is disabled by environment.",
-      "disableNetworkObservabilityLabel": "Disable network observability",
-      "disableNetworkObservabilityDesc": "Stop gateway network observability calls such as install telemetry and update checks.",
+      "statusEnabled": "Network reporting is on.",
+      "statusDisabled": "Network reporting is off.",
+      "statusDisabledByEnv": "Network reporting is off because an environment setting disables it.",
+      "disableNetworkObservabilityLabel": "Turn off network reporting",
+      "disableNetworkObservabilityDesc": "Stops install telemetry, background update checks, and the anonymous identifiers that link requests from one session together — those identifiers are only ever sent to the official TokenRhythm API. Your own model requests keep working.",
       "save": "Save privacy"
     },
     "toast": {
@@ -805,17 +1142,26 @@
       "envNotVisibleGateway": "{envKey} is not visible to this gateway process.",
       "providerSaved": "Provider saved.",
       "providerSavedRestart": "Provider saved. Restart required.",
+      "providerProfileSaved": "{provider} was saved for routing.",
+      "providerProfileRemoved": "{provider} was removed.",
+      "providerCredentialRemoved": "{provider} credential was removed.",
+      "providerCredentialExternalStillActive": "Cleared {provider}'s saved credential reference, but system environment variable {envKey} is still providing a credential.",
+      "providerActivated": "{provider} is now active.",
+      "providerActivatedRouterDisabled": "{provider} is now active. Model Routing was turned off because its saved tiers use another provider.",
       "behaviorSaved": "Behavior saved.",
       "behaviorSavedRestart": "Behavior saved. Restart required.",
       "privacySaved": "Privacy saved.",
       "privacySavedRestart": "Privacy saved. Restart required.",
       "chooseProviderRouter": "Choose a provider before saving model tiers.",
+      "chooseFixedModel": "Choose a fixed model before saving.",
       "routerSaved": "Router saved.",
       "routerSavedRestart": "Router saved. Restart required.",
       "ensembleSaved": "Ensemble saved.",
       "presetApplied": "Routing preset applied.",
       "presetAppliedRestart": "Routing preset applied. Restart required.",
-      "channelSaved": "Channel saved. Restart required.",
+      "channelSaved": "Channel saved — configuration validated locally; use Test connection to verify credentials",
+      "channelSavedLive": "Channel saved and applied — running with the new configuration",
+      "channelStartFailed": "Channel saved, but it failed to start — open its status for the error, then retry with Restart",
       "searchSaved": "Search saved.",
       "memorySurface": "Memory embedding",
       "memorySaved": "Memory saved.",
@@ -830,8 +1176,11 @@
       "copiedCommand": "Copied command",
       "copiedPath": "Copied path",
       "channelRemoved": "Channel removed. Restart required.",
+      "channelRemovedLive": "Channel removed and stopped.",
       "channelEnabled": "Channel enabled. Restart required.",
-      "channelDisabled": "Channel disabled. Restart required."
+      "channelEnabledLive": "Channel enabled and started.",
+      "channelDisabled": "Channel disabled. Restart required.",
+      "channelDisabledLive": "Channel disabled and stopped."
     },
     "needs": {
       "noApiKey": "No API key required.",
@@ -876,6 +1225,199 @@
         "insufficient_class_diversity": "Not trained yet — corrections cover too few routing tiers"
       },
       "detachedNote": "The base routing weights were upgraded. Learning built on the old weights was archived; your corrections are unaffected and will retrain automatically on the new weights. No action needed."
+    },
+    "field": {
+      "keepCurrentPlaceholder": "leave blank to keep current",
+      "secretComposePlaceholder": "Paste the token or secret"
+    },
+    "channelCatalog": {
+      "fields": {
+        "group_session_scope": {
+          "label": "Group session scope",
+          "choices": {
+            "per_sender": "Per sender",
+            "shared_room": "Shared room"
+          }
+        },
+        "busy_input_mode": {
+          "label": "Input while busy"
+        },
+        "dm_access": {
+          "label": "Direct-message access"
+        },
+        "pairing_approved_notice": {
+          "label": "Tell senders when approved"
+        },
+        "allowed_senders": {
+          "label": "Allowed sender ids"
+        },
+        "status_reactions_enabled": {
+          "label": "Message status reactions"
+        },
+        "api_base": {
+          "label": "API base"
+        },
+        "name": {
+          "label": "Channel name",
+          "description": "Unique identifier for this channel entry."
+        },
+        "agent_id": {
+          "label": "Agent id"
+        },
+        "enabled": {
+          "label": "Enabled"
+        },
+        "default_chat_id": {
+          "label": "Default chat id"
+        },
+        "connection_mode": {
+          "label": "Connection mode",
+          "choices": {
+            "webhook": "Webhook (callback)",
+            "websocket": "WebSocket (long connection)"
+          }
+        },
+        "app_id": {
+          "label": "App id"
+        },
+        "app_secret": {
+          "label": "App secret"
+        },
+        "signing_secret": {
+          "label": "Signing secret"
+        },
+        "client_id": {
+          "label": "Client id"
+        },
+        "client_secret": {
+          "label": "Client secret"
+        },
+        "bot_id": {
+          "label": "Bot ID"
+        },
+        "bot_secret": {
+          "label": "Bot secret"
+        },
+        "corp_secret": {
+          "label": "Corp secret"
+        },
+        "homeserver_url": {
+          "label": "Homeserver URL"
+        },
+        "user_id": {
+          "label": "User id ({'@'}user:server)"
+        },
+        "debounce_window_s": {
+          "label": "Debounce window (s)"
+        },
+        "transport_name": {
+          "choices": {
+            "polling": "Polling",
+            "webhook": "Webhook"
+          }
+        }
+      },
+      "groups": {
+        "basic": "Basic",
+        "credentials": "Credentials",
+        "webhook": "Webhook",
+        "behavior": "Behavior",
+        "access": "Access",
+        "polling": "Polling"
+      },
+      "dingtalk": {
+        "label": "DingTalk",
+        "description": "DingTalk corp robot via stream connection.",
+        "needs": [
+          "Client id.",
+          "Client secret."
+        ]
+      },
+      "discord": {
+        "fields": {
+          "token": {
+            "label": "Bot token"
+          }
+        },
+        "description": "Discord bot using gateway websocket.",
+        "needs": [
+          "Bot token."
+        ]
+      },
+      "feishu": {
+        "label": "Feishu / Lark",
+        "fields": {
+          "domain": {
+            "label": "Region",
+            "description": "Pick the console that issued this App ID.",
+            "choices": {
+              "feishu": "Feishu (China)",
+              "lark": "Lark (international)"
+            }
+          }
+        },
+        "description": "Feishu (or Lark) bot — webhook or websocket connection.",
+        "needs": [
+          "App id.",
+          "App secret."
+        ]
+      },
+      "matrix": {
+        "description": "Matrix homeserver client (sync long-poll).",
+        "needs": [
+          "Homeserver URL.",
+          "User id (@user:server).",
+          "Install the matrix optional extra."
+        ]
+      },
+      "qq": {
+        "label": "QQ Bot",
+        "description": "Tencent QQ Bot via websocket.",
+        "needs": [
+          "App id.",
+          "App secret."
+        ]
+      },
+      "slack": {
+        "fields": {
+          "token": {
+            "label": "Bot token"
+          },
+          "connection_mode": {
+            "choices": {
+              "socket": "Socket Mode",
+              "webhook": "Webhook (callback)"
+            }
+          }
+        },
+        "description": "Slack workspace bot — Socket Mode (websocket) or Events API webhook.",
+        "needs": [
+          "Bot token (xoxb-…).",
+          "Signing secret."
+        ]
+      },
+      "telegram": {
+        "fields": {
+          "token": {
+            "label": "Bot token"
+          }
+        },
+        "description": "Telegram Bot API — polling or webhook transport.",
+        "needs": [
+          "Bot token."
+        ]
+      },
+      "wecom": {
+        "label": "WeCom",
+        "description": "Enterprise WeChat AI Bot over websocket, or corp-app webhook callback.",
+        "needs": [
+          "Corp id.",
+          "Corp secret.",
+          "Agent id (int).",
+          "Token.",
+          "Encoding AES key."
+        ]
+      }
     }
   },
   "sessions": {
@@ -885,6 +1427,7 @@
     "refreshing": "Refreshing…",
     "loading": "Loading sessions…",
     "unknownAgent": "Unknown agent",
+    "deletedAgent": "Deleted agent · {id}",
     "msgCount": "{count} msg",
     "error": {
       "load": "Could not load sessions."
@@ -958,6 +1501,8 @@
       "ariaLabel": "Needs attention",
       "allClear": "All clear",
       "costToday": "{amount} today",
+      "costTodayLabel": "Cost today",
+      "costTotal": "{amount} total",
       "needsApproval": "Needs approval",
       "openBlocked": "open the blocked session →",
       "nothingWaiting": "nothing waiting on you",
@@ -1006,8 +1551,8 @@
       "abortFailed": "Abort failed."
     },
     "overview": {
-      "title": "Overview",
-      "subtitle": "Live status, recent sessions, and the event stream.",
+      "title": "Status",
+      "subtitle": "Readiness, usage, and runtime health.",
       "openChat": "Open chat",
       "totalTokens": "Total tokens",
       "totalSessions": "Total sessions",
@@ -1037,25 +1582,9 @@
       "findingFallback": "Finding {n}",
       "copyCommand": "Copy command",
       "step": "Step",
-      "recentActivity": "Recent activity",
-      "viewAllArrow": "View all →",
-      "noSessions": "No sessions yet — open chat to start your first one.",
-      "connection": "Connection",
-      "gateway": "Gateway",
-      "connHint": "The gateway WebSocket URL and token now live in Settings.",
-      "manageConnection": "Manage connection in Settings →",
-      "live": "Live",
-      "eventStream": "Event stream",
-      "eventCount": "{count} events",
-      "listening": "Listening for events…",
       "checking": "Checking",
       "waitingDoctor": "Waiting for doctor.status",
       "healthUnavailable": "Gateway health report unavailable",
-      "conn": {
-        "connecting": "connecting",
-        "connected": "connected",
-        "disconnected": "disconnected"
-      },
       "impact": {
         "blocksReady": "Blocks readiness",
         "degrades": "Degrades",
@@ -1126,7 +1655,7 @@
       "copyDiagnostics": "Copy diagnostics JSON",
       "copiedDiagnostics": "Diagnostics JSON copied",
       "diagnoseWithAgent": "Diagnose with agent",
-      "diagnosePrompt": "Please troubleshoot this OpenSquilla configuration using the doctor report below; propose the root cause and minimal fix steps; do not run destructive commands.",
+      "diagnosePrompt": "Please troubleshoot this OpenSquilla configuration using the client context and doctor report below. Prefer applicable in-app Settings. When hasTerminalWorkflow is false, do not suggest bare opensquilla commands; an owned Desktop gateway is managed by the app. Data transfer means backup followed by whole-data replacement, never a merge. An optional migration item is not a fault and may remain visible after transfer. Explain and guide only: do not migrate data, restart the gateway, write settings, or claim changes were performed.",
       "environment": "Environment",
       "latency": "Latency"
     }
@@ -1136,7 +1665,9 @@
       "refresh": "Refresh",
       "edit": "Edit",
       "delete": "Delete",
-      "confirm": "Confirm"
+      "confirm": "Confirm",
+      "refreshing": "Refreshing…",
+      "retry": "Retry"
     },
     "agents": {
       "title": "Agents",
@@ -1206,35 +1737,231 @@
     },
     "channels": {
       "title": "Channels",
-      "subtitle": "Runtime status for configured channels. Add or change channel configuration in Settings or the CLI.",
-      "settingsHint": "Channel configuration lives in Settings",
-      "openSettings": "Open settings",
-      "totalChannels": "Total channels",
-      "typeCount": "{n} types",
-      "connected": "Connected",
-      "live": "live",
-      "unhealthy": "{n} unhealthy",
-      "allIdle": "all idle",
-      "inactive": "Inactive",
-      "needAttention": "{n} need attention",
-      "restartAttempts": "Restart attempts",
-      "sinceGatewayStart": "since gateway start",
+      "subtitle": "Runtime status for configured channels. Add, edit, and pair channels right here, or use the CLI.",
       "configuredChannels": "Configured channels",
       "unknown": "Unknown",
-      "adapterConfig": "Adapter config",
       "emptyTitle": "No configured channels.",
-      "emptyMsg": "Channel provisioning lives in Settings and the CLI so credentials, dependency extras, webhook URLs, and restart requirements stay explicit.",
-      "openSettingsBtn": "Open settings",
+      "emptyMsg": "No channels yet. Connect Slack, Telegram, Discord and more so your agent can chat where your team does.",
       "loadFailed": "Failed to load channels",
-      "noInactive": "no inactive channels",
-      "disabledCount": "{n} disabled",
-      "configuredButIdle": "configured but idle",
-      "hintDisabled": "Disabled in config — gateway restart required after re-enabling. Run `opensquilla onboard configure channels` to change.",
-      "hintDead": "Adapter is dead. Inspect gateway logs, then `{cmd}`.",
-      "hintRunning": "Adapter is live in the current gateway process.",
-      "hintRestarting": "Adapter is restarting after dispatch errors.",
-      "hintExhausted": "Adapter exhausted its retry budget. Try `{cmd}`.",
-      "hintConfiguredInactive": "Configured on disk but not active in this gateway process — restart the gateway to load it."
+      "addChannel": "Add channel",
+      "addFirstChannel": "Add your first channel",
+      "detailLabel": "Channel details for {name}",
+      "detailSections": "Channel detail sections",
+      "testConnection": "Test",
+      "testing": "Testing…",
+      "restart": "Restart",
+      "edit": "Edit",
+      "enable": "Enable",
+      "disable": "Disable",
+      "notReported": "Not reported",
+      "tabs": {
+        "overview": "Overview",
+        "pairings": "Members",
+        "capabilities": "Capabilities",
+        "diagnostics": "Diagnostics",
+        "configuration": "Configuration"
+      },
+      "editor": {
+        "editConfiguration": "Edit configuration",
+        "edited": "Edited",
+        "unsavedAria": "Unsaved changes",
+        "unsavedSummary": "Unsaved — {fields}",
+        "moreFields": "+{count} more",
+        "discardQuestion": "Discard unsaved changes?",
+        "keepEditing": "Keep editing",
+        "discard": "Discard",
+        "saving": "Saving…",
+        "saveAnyway": "Save anyway",
+        "saveFailed": "Save failed: {error}",
+        "probeValid": "Configuration checks passed",
+        "probeRunning": "Checking the draft…",
+        "probeLatency": "{ms} ms",
+        "storedSecret": "Stored ······",
+        "otherSettings": "Other settings",
+        "unknownType": "No editor form is available for this channel type ({type}); edit the entry in the configuration file.",
+        "entryMissing": "Channel {name} was not found in the configuration.",
+        "editIntro": "Changes apply on Save. Blank secret fields keep their stored values.",
+        "boolOn": "On",
+        "boolOff": "Off"
+      },
+      "compose": {
+        "back": "Channels",
+        "galleryLabel": "Choose a platform",
+        "change": "Change",
+        "discardQuestion": "Discard the {platform} draft?",
+        "catalogFailed": "The platform catalog could not be loaded: {error}",
+        "addPlatform": "Add {platform}"
+      },
+      "probeVerified": "Connection verified",
+      "probeUnsupported": "Live probe unavailable",
+      "probeLatency": "Provider verified in {ms} ms.",
+      "probeNoDetail": "The provider returned no additional detail.",
+      "implemented": "Implemented",
+      "declaredOnly": "Declared only",
+      "methodEvidence": "Backed by: {methods}",
+      "liveVerified": "Verified by live provider evidence",
+      "declarationEvidence": "Declared by adapter; live proof pending",
+      "noCapabilityEvidence": "This adapter has not published capability evidence.",
+      "lastError": "Last error",
+      "acceptedIngress": "Accepted inbound",
+      "processingIngress": "Processing inbound",
+      "confirmedOutbound": "Confirmed outbound",
+      "savedConfiguration": "Saved configuration",
+      "secretRedactionHint": "Stored secrets are never shown. Press Edit and use Replace to enter a new value.",
+      "toastProbePassed": "{name} verified in {ms} ms",
+      "toastProbeUnsupported": "{name} does not support a safe live probe",
+      "toastProbeFailed": "Could not test {name}: {error}",
+      "toastRestarted": "Restarted {name}",
+      "toastRestartFailed": "Could not restart {name}: {error}",
+      "toastEnabled": "Enabled {name}; restart the gateway to apply",
+      "toastDisabled": "Disabled {name}; restart the gateway to apply",
+      "toastToggleFailed": "Could not update {name}: {error}",
+      "pairings": {
+        "title": "Members",
+        "description": "Review who can start conversations with this channel. Approvals apply only to this channel.",
+        "refresh": "Refresh",
+        "summaryLabel": "Members summary",
+        "pending": "Pending",
+        "approved": "Approved",
+        "loading": "Loading members…",
+        "tryAgain": "Try again",
+        "emptyTitle": "No members yet",
+        "emptyDescription": "New requests and approved senders will appear here.",
+        "pendingRequests": "Pending requests",
+        "approvedAccess": "Approved access",
+        "requestCode": "Request {code}",
+        "requestedAt": "Requested {time}",
+        "approvedAt": "Approved {time}",
+        "approve": "Approve",
+        "approving": "Approving…",
+        "revoke": "Revoke",
+        "revoking": "Revoking…",
+        "approveLabel": "Approve access for {sender}",
+        "revokeLabel": "Revoke access for {sender}",
+        "approveConfirmTitle": "Approve pairing request?",
+        "approveConfirmBody": "Grant {sender} access to {channel}? The bot will let them know they can start chatting.",
+        "revokeConfirmTitle": "Revoke pairing access?",
+        "revokeConfirmBody": "Remove {sender}'s access to {channel}? They will need approval before starting another conversation.",
+        "loadFailed": "Could not load pairing access: {error}",
+        "approveSuccess": "Approved pairing access for {sender}",
+        "revokeSuccess": "Revoked pairing access for {sender}",
+        "approveFailed": "Could not approve {sender}: {error}",
+        "revokeFailed": "Could not revoke {sender}: {error}",
+        "revoked": "Revoked",
+        "revokedAccess": "Revoked access",
+        "reapprove": "Re-approve",
+        "reapproveLabel": "Re-approve access for {sender}",
+        "pendingBadge": "{count} pending pairing requests",
+        "searchLabel": "Search pairings",
+        "searchPlaceholder": "Search by name or pairing code",
+        "adminPill": "Admin",
+        "setAsAdmin": "Set as admin",
+        "removeAdmin": "Remove admin",
+        "updatingAdmin": "Updating…",
+        "setAsAdminLabel": "Make {sender} a channel admin",
+        "removeAdminLabel": "Remove admin from {sender}",
+        "asAdmin": "as admin",
+        "asAdminHint": "Approve with the full tool surface instead of member access.",
+        "asAdminCheckboxLabel": "Approve {sender} as a channel admin",
+        "adminsSubtitle": "Admins",
+        "adminOnlyHint": "Admin added directly",
+        "membersHint": "Members can chat and use safe tools. Admins get the full tool surface, with per-command confirmation for privileged actions.",
+        "approveAdminSuccess": "Approved {sender} as a channel admin",
+        "adminGrantFailedAfterApprove": "Approved {sender}, but the admin grant failed — retry from the members list.",
+        "approveAdminConfirmBody": "Grant {sender} admin access to {channel}? They get the full tool surface, and the bot will let them know they can start chatting.",
+        "setAsAdminConfirmTitle": "Make this member an admin?",
+        "setAsAdminConfirmBody": "Give {sender} the full tool surface on {channel}? Privileged actions still ask for per-command confirmation.",
+        "removeAdminConfirmTitle": "Remove admin access?",
+        "removeAdminConfirmBody": "Return {sender} to member access on {channel}? They can still chat and use safe tools.",
+        "adminGrantedSuccess": "Made {sender} a channel admin",
+        "adminRemovedSuccess": "Removed admin from {sender}",
+        "adminUpdateFailed": "Could not update admin access for {sender}: {error}",
+        "asAdminBootstrap": "This is me — make channel admin"
+      },
+      "probeFailed": "Connection test failed",
+      "editCredentials": "Edit credentials",
+      "toastProbeFailedResult": "{name} failed the connection test: {detail}",
+      "restartNotLoaded": "This channel isn't loaded yet — restart the gateway to start it",
+      "removeChannel": "Remove",
+      "queryNotFound": "Channel {name} was not found — it may have been removed.",
+      "queryNotFoundDismiss": "Dismiss",
+      "needsReview": "Need review",
+      "worksHint": "Platform features this channel type supports, needs configuration for, or cannot do.",
+      "maturityHint": "How complete this adapter is relative to the provider's full API",
+      "supported": "Supported",
+      "notSupported": "Not supported",
+      "needsConfig": "Needs configuration",
+      "messageDelivery": "Message delivery",
+      "connectionOwner": "Account connection owner",
+      "owner": "Owner",
+      "ownerHere": "This gateway holds the connection",
+      "ownerNone": "No gateway currently holds the connection",
+      "lastTest": "Last test",
+      "category": {
+        "chat": "Chat",
+        "files": "Files",
+        "media": "Media",
+        "attachments": "Attachments",
+        "threads": "Threads",
+        "cards": "Cards",
+        "docs": "Docs",
+        "drive": "Drive",
+        "wiki": "Wiki",
+        "permissions": "Permissions",
+        "scopes": "Scopes"
+      },
+      "staleData": "Status may be stale — last updated {time}.",
+      "unconfiguredTitle": "Running but not in config",
+      "unconfiguredHint": "These channels are running in this gateway process but are not in the saved configuration.",
+      "maturityValue": {
+        "experimental": "Experimental",
+        "stable": "Stable",
+        "shipping": "Shipping",
+        "unrated": "Unrated"
+      },
+      "opsActionsLabel": "Runtime actions",
+      "configActionHint": "Writes configuration — takes effect after a gateway restart",
+      "home": {
+        "connectedFor": "Uptime",
+        "membersFact": "Members",
+        "adminsFact": "Admins",
+        "pendingCount": "{count} pending",
+        "details": "Details",
+        "pendingRequest": "{sender} requests pairing · code {code}",
+        "reject": "Reject",
+        "rejectLabel": "Reject the pairing request from {sender}",
+        "rejectSuccess": "Rejected the pairing request from {sender}",
+        "rejectFailed": "Could not reject {sender}: {error}",
+        "fixCredentials": "Fix credentials",
+        "galleryLead": "Choose a platform to get started",
+        "awaitingFact": "Awaiting",
+        "folio": {
+          "allConnected": "All connected",
+          "connectedRatio": "{ratio} connected",
+          "down": "{count} down",
+          "updated": "Updated {time}",
+          "rosterLabel": "Platforms in service: {names}"
+        },
+        "enroll": {
+          "title": "Connect a platform",
+          "chip": "Add {platform}"
+        }
+      },
+      "detail": {
+        "bot": "Bot {id}",
+        "connectedFor": "Uptime {duration}",
+        "restarts": "{count} restart | {count} restarts",
+        "capabilityReference": "Capability reference",
+        "copyBotId": "Copy bot ID: {id}",
+        "botIdCopied": "Bot ID copied",
+        "eventSubscriptionTitle": "Check Feishu event subscription"
+      }
+    },
+    "overview": {
+      "channelsChip": "Channels",
+      "channelsChipConnected": "{connected} connected",
+      "channelsChipFailed": "{failed} failed",
+      "channelsChipPending": "{pending} awaiting approval"
     }
   },
   "cronSkills": {
@@ -1492,6 +2219,15 @@
       "subtitle": "Composable agent capabilities: bundled OpenSquilla skills plus local managed, personal, project, and workspace packs.",
       "filterPlaceholder": "Filter skills...",
       "refresh": "Refresh",
+      "reload": "Reload catalog",
+      "refreshing": "Reloading…",
+      "reloadSummary": "Added {added}, removed {removed}, modified {modified}.",
+      "reloadSuccess": "Skill catalog reloaded at generation {generation}. {summary}",
+      "reloadNoChanges": "Skill catalog is already current (generation {generation}).",
+      "reloadPartial": "Skill catalog reloaded at generation {generation} with {errors} error(s). {summary}",
+      "reloadFailed": "Skill catalog reload failed: {error}",
+      "reloadListFailed": "The catalog reloaded, but the refreshed Skill list could not be loaded.",
+      "reloadUnknownError": "The Gateway kept the previous catalog.",
       "tabsLabel": "Skill source",
       "tabInstalled": "Installed",
       "tabCommunity": "Community",
@@ -1570,7 +2306,13 @@
     },
     "skillCard": {
       "subSkillsTitle": "Sub-skills used by this meta-skill",
-      "uses": "uses"
+      "uses": "uses",
+      "dependencies": "Declared dependencies",
+      "pythonCount": "Python packages: {count}",
+      "binaryCount": "Binaries: {count}",
+      "envCount": "Environment variables: {count}",
+      "missingCount": "Missing dependencies: {count}",
+      "advisoryCount": "Advisories: {count}"
     },
     "skillDetail": {
       "triggers": "Triggers",
@@ -1585,7 +2327,26 @@
       "loadingContent": "Loading SKILL.md...",
       "emptyContent": "No SKILL.md content available.",
       "removing": "Removing...",
-      "remove": "Remove"
+      "remove": "Remove",
+      "declaredDependencies": "Declared dependencies",
+      "pythonPackages": "Python packages",
+      "binaries": "Binaries",
+      "environment": "Environment",
+      "pythonPackage": "Python package",
+      "binaryAny": "Any one binary",
+      "envAny": "Any one environment variable",
+      "noDeclaredDependencies": "No dependencies declared.",
+      "advisories": "Advisories",
+      "notReadiness": "Inferred items are advisory and do not affect readiness.",
+      "inferredPython": "Inferred from {source}",
+      "inferredEnv": "Inferred environment variable",
+      "scanAdvisory": "Dependency scan advisory",
+      "subSkillRollup": "Meta-skill dependency rollup",
+      "subSkillStatus": "{missing} missing · {advisory} advisory",
+      "missingSubSkill": "Referenced sub-skill is unavailable",
+      "installUnavailable": "No installer matches the current missing dependencies.",
+      "installIncomplete": "{count} dependencies still need attention.",
+      "installComplete": "Dependencies are ready."
     },
     "registry": {
       "searchPlaceholder": "Search community skills...",
@@ -1653,6 +2414,36 @@
       "awaitingReview": "awaiting review"
     }
   },
+  "monitorSupport": {
+    "title": "Support & diagnostics",
+    "menuLabel": "Support and diagnostics actions",
+    "viewLogs": "View runtime logs",
+    "viewLogsDescription": "Inspect recent gateway output and errors",
+    "copyReport": "Copy current readiness report",
+    "copyReportDescription": "Share the current connection, configuration, and runtime status",
+    "copySuccess": "Readiness report copied",
+    "copyFailed": "Could not copy readiness report: {error}",
+    "downloadBundle": "Download redacted support bundle",
+    "downloadBundleDescription": "Includes logs, a configuration summary, and diagnostic results",
+    "privacySummary": "Conversation content is excluded by default and known credentials are redacted",
+    "bundleTitle": "Download redacted support bundle",
+    "bundleSubtitle": "Create a ZIP to share with OpenSquilla support.",
+    "bundleDefaultIncludes": "Included by default",
+    "bundleReadiness": "Readiness and diagnostics snapshot",
+    "bundleConfig": "Redacted configuration summary",
+    "bundleLogs": "Errors, logs, and trace information",
+    "bundlePlatform": "Version and platform information",
+    "bundleScopeTitle": "Recent diagnostic records (up to 1 day)",
+    "bundleScopeBody": "Error and trace records cover no more than one day; runtime logs follow local rotation, so actual coverage may differ.",
+    "bundleIncludeContentTitle": "Include conversation content",
+    "bundleIncludeContentBody": "Enable only when support explicitly asks; this may contain sensitive business information.",
+    "bundleCredentialsTitle": "Known credential fields are redacted",
+    "bundleCredentialsBody": "API keys, tokens, and other recognized secret values are redacted before packaging.",
+    "bundleConfirm": "Generate and download",
+    "bundleCancel": "Cancel",
+    "bundleFailed": "Support bundle download failed",
+    "bundleReady": "Support bundle downloaded"
+  },
   "usageLogs": {
     "usage": {
       "title": "Usage",
@@ -1680,7 +2471,20 @@
       "cacheWrite": "Cache W"
     },
     "costHintTitle": "CNY values use baked-in rate {rate}. Verify against current FX for accounting use.",
+    "nativeCostHintTitle": "The original provider bill is in CNY; USD uses the fixed normalization rate recorded on the receipt.",
+    "nativeMixedCostHintTitle": "Mixed-currency or pending billing stays in canonical USD; original confirmed receipts are shown separately.",
+    "nativeBillingSubtotals": "Original receipts: {amounts}",
     "rangeHiddenHint": "{count} undated legacy sessions hidden",
+    "coverage": {
+      "approximate": "Older Gateway: date ranges use approximate session-lifetime totals.",
+      "partial": "Usage-ledger migration is still completing; all known usage is shown.",
+      "timezoneFallback": "Timezone {requested} is invalid; dates are grouped in {effective}.",
+      "legacyIncluded": "Pre-ledger usage is included in the total but cannot be assigned to a date.",
+      "estimated": "Includes {count} estimated calls.",
+      "unpriced": "Known cost shown; {count} calls are unpriced, so cost is incomplete.",
+      "pendingBilling": "{count} provider billing receipts are pending settlement.",
+      "nativeBillingMissing": "{count} billed calls are missing native receipts."
+    },
     "chart": {
       "metric": "Chart metric",
       "dateRange": "Date range",
@@ -1692,6 +2496,7 @@
       "output": "Output",
       "emptyWindow": "No data in the selected window.",
       "openSession": "Open {session}",
+      "daily": "Daily usage",
       "topByCost": "Top sessions by cost",
       "topByTokens": "Top sessions by total tokens",
       "showingOf": "showing {shown} of {total}"
@@ -1780,7 +2585,7 @@
       "loadFailed": "Failed to load usage"
     },
     "logs": {
-      "eyebrow": "Control · Logs",
+      "breadcrumbLabel": "Breadcrumb",
       "title": "Logs",
       "subtitle": "Live gateway log stream — filter and follow.",
       "statusUnavailable": "Log status unavailable",
@@ -1817,6 +2622,9 @@
       "filterPlaceholder": "Filter messages…",
       "autoFollow": "Auto-follow",
       "loading": "Loading logs…",
+      "empty": "No runtime logs yet.",
+      "loadFailed": "Could not load runtime logs.",
+      "retry": "Retry",
       "noMatch": "No lines match the current filter.",
       "lineDetail": "Log line detail",
       "ofLoadedFoot": "{visible} in view · {total} buffered"
@@ -1833,6 +2641,8 @@
     "placeholder": "Send a message...",
     "placeholderCompact": "Message...",
     "placeholderLanding": "Assign a task or ask anything",
+    "aiDisclaimer": "Content generated by AI may be inaccurate. For reference only; verify important information.",
+    "aiGeneratedLabel": "Content generated by AI, for reference only.",
     "removeAttachment": "Remove attachment",
     "remove": "Remove",
     "attachFiles": "Attach files",
@@ -1864,6 +2674,7 @@
     "copied": "Copied",
     "copy": "Copy",
     "copySessionKey": "Copy session key",
+    "sessionActions": "Session actions",
     "share": "Share",
     "shareSendFirst": "Send a message first to share",
     "shareSelectHint": "Select bubbles to save as a share image",
@@ -1894,6 +2705,9 @@
     "open": "Open",
     "downloadTitle": "Download {title}",
     "download": "Download",
+    "playAudio": "Play audio",
+    "audioLoadFailed": "Audio could not be loaded.",
+    "audioUnsupported": "This browser cannot play this audio format. Download the file instead.",
     "previewOf": "Preview: {title}",
     "closePreview": "Close preview",
     "previousImage": "Previous image",
@@ -1918,6 +2732,7 @@
     "latest": "Latest",
     "thinking": "Thinking",
     "thoughtProcess": "Thought process",
+    "thinkingForSeconds": "Thinking · {seconds}s",
     "thoughtForSeconds": "Thought for {seconds}s",
     "thoughtForMinutes": "Thought for {minutes}m {seconds}s",
     "toolResult": "Tool Result",
@@ -1927,6 +2742,27 @@
     "sandboxPausedResume": "Resume execution",
     "sandboxResumed": "Autonomous execution resumed. Resend your request to continue.",
     "sandboxResumeFailed": "Could not resume execution: {error}",
+    "warning": {
+      "default": "The agent reported a warning."
+    },
+    "provenance": {
+      "cron": "Cron",
+      "scheduled": "Scheduled",
+      "cronSource": "Scheduled by {tool}"
+    },
+    "sandboxSetup": {
+      "settingUp": "Setting up…",
+      "settingUpTitle": "Setting up Windows Sandbox",
+      "failedTitle": "Windows Sandbox setup failed",
+      "unavailableTitle": "Sandbox setup unavailable",
+      "requiredTitle": "Windows Sandbox setup required",
+      "settingUpBody": "OpenSquilla is preparing the isolated environment. This may take a moment.",
+      "failedBody": "The isolated environment could not be prepared. Try again when ready.",
+      "unavailableBody": "Sandbox setup is unavailable on this system. Your execution mode was not changed.",
+      "requiredBody": "Set up Windows Sandbox before using this execution mode.",
+      "retry": "Retry",
+      "setup": "Set up"
+    },
     "usageDetails": "Usage details",
     "regenerate": "Regenerate",
     "forkConversation": "Fork conversation",
@@ -1936,6 +2772,7 @@
     "aiModelRouter": "AI model router",
     "aiModelEnsembleRouter": "AI model ensemble router",
     "routerFx": {
+      "selectedModel": "Router selected {model}",
       "ensembleSelecting": "AI model ensemble router · selecting candidates",
       "ensembleHandedOff": "AI model ensemble router · handed off to agent",
       "ensembleRunning": "AI model ensemble router · {count} candidates synthesizing",
@@ -1953,12 +2790,65 @@
       "ensembleTokens": "{count} tok",
       "ensembleUsed": "used",
       "ensembleFailed": "failed",
+      "ensembleQuorumSkipped": "threshold met · skipped",
+      "ensembleQuorumSkippedDetail": "The candidate threshold was already met, so waiting for this candidate was cancelled.",
       "ensembleTracePending": "trace pending",
       "ensembleTraceUnavailable": "trace unavailable until run completes",
       "ensembleDetailUnavailable": "{count} candidates · detail unavailable"
     },
     "sources": "Sources",
+    "activityLabel": "Activity",
     "activitySteps": "Activity · {count} step | Activity · {count} steps",
+    "activityItems": "Activity · {count} item | Activity · {count} items",
+    "activityCompletedItems": "Completed · {count} item | Completed · {count} items",
+    "activityFailures": "{count} failed",
+    "activityFailuresRecovered": "{count} failure recovered | {count} failures recovered",
+    "activityWorking": "Working",
+    "workedForSeconds": "Worked for {seconds}s",
+    "workedForMinutes": "Worked for {minutes}m {seconds}s",
+    "activity": {
+      "lifecycle": {
+        "working": "Working",
+        "answering": "Writing the answer",
+        "settled": "Completed",
+        "interrupted": "Interrupted",
+        "failed": "Failed"
+      },
+      "purpose": {
+        "discover": "Discovered links",
+        "search": "Searched the web",
+        "read": "Read web pages",
+        "inspect": "Inspected files",
+        "change": "Edited files",
+        "run": "Ran commands",
+        "create": "Created artifacts",
+        "recall": "Searched memory",
+        "use": "Used tools"
+      },
+      "purposeRunning": {
+        "discover": "Discovering links",
+        "search": "Searching the web",
+        "read": "Reading web pages",
+        "inspect": "Inspecting files",
+        "change": "Editing files",
+        "run": "Running commands",
+        "create": "Creating artifacts",
+        "recall": "Searching memory",
+        "use": "Using tools"
+      },
+      "footprint": {
+        "web": "{count} web action | {count} web actions",
+        "files": "{count} file | {count} files",
+        "fileOperations": "{count} file operation | {count} file operations",
+        "commands": "{count} command | {count} commands",
+        "artifacts": "{count} artifact | {count} artifacts",
+        "memory": "{count} memory lookup | {count} memory lookups",
+        "tools": "{count} tool call | {count} tool calls"
+      },
+      "more": "{count} more",
+      "stale": "Still working — no recent signal",
+      "liveStep": "step {n}"
+    },
     "suggestedTasks": "Suggested tasks",
     "greetingMorning": "Good morning.",
     "greetingAfternoon": "Good afternoon.",
@@ -1966,6 +2856,9 @@
     "identityReady": "{label} · ready",
     "loadEarlier": "Load earlier messages",
     "loadingEllipsis": "Loading...",
+    "loadingEarlier": "Loading earlier messages…",
+    "loadEarlierFailedRetry": "Earlier messages failed to load · Retry",
+    "legacyHistoryUnavailable": "Earlier original messages were not saved by the older version.",
     "scopeCompacted": "Older content is represented by session summaries.",
     "scopeLatestWindow": "Showing the latest message window.",
     "status": {
@@ -2000,7 +2893,11 @@
       "expiresIn": "Expires in {time}",
       "outcomeExpired": "Expired — not run",
       "outcomeDenied": "Denied",
-      "outcomeApproved": "Approved · run resumed"
+      "outcomeApproved": "Approved · run resumed",
+      "target": "Target",
+      "access": "Access",
+      "workspace": "Workspace",
+      "outcomeUnavailable": "Approval no longer available"
     },
     "clarify": {
       "needsInput": "The agent needs input",
@@ -2025,6 +2922,8 @@
       "routerAnimationOn": "Router animation on",
       "routerAnimationOff": "Router animation off",
       "modelRouting": "Model routing",
+      "ensembleImageUnsupported": "Ensemble doesn't support image input yet. Switch to single-model routing and try again.",
+      "routingUpdateImageBlocked": "Model routing is being updated. Wait before sending images.",
       "modelRoutingOff": "Off",
       "modelRoutingOffDesc": "Send every turn to the selected model.",
       "modelRoutingSquillaRouter": "AI-powered single-model router",
@@ -2097,7 +2996,9 @@
       "results": "{count} results",
       "countRunning": "{count} running",
       "countDone": "{count} done",
-      "countFailed": "{count} failed"
+      "countFailed": "{count} failed",
+      "collapseAll": "Collapse all",
+      "expandAll": "Expand all"
     },
     "chips": {
       "whatCanYouDo": "What can you do?",
@@ -2111,22 +3012,32 @@
       "downloadFailed": "Download failed",
       "forkFailed": "Fork failed",
       "copyFailed": "Copy failed",
-      "shareExportFailed": "Share export failed",
+      "shareSaveFailed": "Couldn't save the image. Try again.",
+      "sharePreviewUpdateFailed": "Couldn't update the preview. Try again.",
       "saved": "Saved {filename}",
       "copiedToClipboard": "Copied to clipboard",
       "copyNotSupported": "Copy not supported — download instead",
       "unsupportedFile": "Unsupported file: {name} ({mime})",
-      "fileTooLarge": "File too large: {name}",
+      "fileTooLarge": "File too large: {name} (max {cap})",
+      "emptyFile": "Empty file: {name}",
+      "tooManyAttachments": "Too many attachments: max {max}",
+      "attachmentsTotalTooLarge": "Attachments too large: {name} would exceed {max} total",
       "couldNotReadFile": "Could not read file: {name}",
       "uploadFailed": "Upload failed for {name}",
       "voiceUnsupported": "Voice input is not supported in this browser",
       "voiceUnavailable": "Voice input isn't available. Enable it in Settings.",
       "voiceTranscribeFailed": "Couldn't transcribe your recording. Please try again.",
       "voiceSetupNeeded": "Voice input needs an ElevenLabs API key — opening Settings…",
+      "voiceCancelledHidden": "Recording stopped when the window was hidden. Start again to dictate.",
+      "voiceMicDenied": "Microphone access was denied — allow it in your browser settings.",
+      "voiceMicDeniedDesktop": "Microphone access is blocked. Allow it in your system settings, then try again.",
+      "voiceMicMissing": "No microphone was found.",
+      "voiceRecordFailed": "Couldn't start recording. Please try again.",
       "waitAttachments": "Wait for file attachment processing to finish",
       "waitCompactionBeforeCommand": "Wait for context compaction before running {command}.",
       "waitResponseBeforeCommand": "Wait for the current response before running {command}.",
       "queueFull": "Queue is full — wait for the current response to finish.",
+      "messageStillSaving": "This message hasn't finished saving — try again in a moment.",
       "artifactOpenFailed": "Artifact open failed. Use Download instead."
     },
     "stream": {
@@ -2137,8 +3048,7 @@
       "preparingOutput": "Preparing output",
       "generatingCandidates": "Generating candidates",
       "synthesizingCandidates": "Synthesizing candidates",
-      "stillWaiting": "Still waiting for model",
-      "stillWorking": "Still working — last signal {seconds}s ago"
+      "stillWaiting": "Still waiting for model"
     },
     "stall": {
       "title": "Response is taking longer than expected",
@@ -2181,7 +3091,7 @@
       "untitledChat": "Untitled chat",
       "groupWork": "Work",
       "groupManage": "Manage",
-      "groupMonitor": "Monitor",
+      "groupMonitor": "Overview",
       "groupActions": "Actions",
       "groupConversations": "Conversations",
       "groupMessages": "Messages",
@@ -2248,14 +3158,6 @@
       "finishSetup": "Finish setup",
       "viewReadiness": "View readiness"
     },
-    "legacyDataBanner": {
-      "ariaLabel": "Another OpenSquilla installation was found",
-      "title": "Another OpenSquilla installation was found",
-      "dismiss": "Not now",
-      "dismissNotice": "Dismiss data transfer notice",
-      "hintWeb": "Your current data is already in use; no action is required. To replace it with the other installation, stop the gateway and run:",
-      "copyCommand": "Copy data transfer command"
-    },
     "shortcuts": {
       "toggleSidebar": {
         "label": "Toggle sidebar",
@@ -2290,7 +3192,47 @@
       "sectionDiagnostics": "diagnostics",
       "sectionResult": "result",
       "sectionError": "error",
-      "viewFull": "view full"
+      "viewFull": "view full",
+      "activityViewDetails": "view details",
+      "activityDetailsTitle": "details",
+      "activityBytesWritten": "{size} written",
+      "activityContentSize": "{lines} lines · {characters} characters",
+      "activityPublished": "Published"
+    }
+  },
+  "channelStatus": {
+    "connected": "Connected",
+    "pendingRestart": "Pending restart",
+    "notRunning": "Not running",
+    "disabled": "Disabled",
+    "restarting": "Restarting",
+    "failed": "Failed",
+    "exhausted": "Retries exhausted",
+    "unknown": "Unknown ({raw})",
+    "hint": {
+      "pendingRestart": "Takes effect after a gateway restart",
+      "notRunning": "Starts after a gateway restart",
+      "restarting": "Reconnecting automatically",
+      "failed": "Automatic restarts exhausted — restart or edit this channel",
+      "exhausted": "Delivery retries used up — check the last error, then restart"
+    },
+    "cause": {
+      "auth_invalid": "credentials rejected",
+      "payload_rejected": "message rejected by the provider",
+      "target_missing": "target chat or channel not found",
+      "contract_violation": "adapter contract violation",
+      "transport_transient": "network issue — retrying",
+      "rate_limited": "rate limited by the provider",
+      "channel_degraded": "channel degraded",
+      "startup_failed": "failed to start — check credentials and configuration"
+    },
+    "banner": {
+      "label": "Pending gateway restart",
+      "message": "{count} saved channel change(s) will take effect after a gateway restart",
+      "dismiss": "Dismiss pending marker for {name}",
+      "copied": "Command copied",
+      "copyFailed": "Could not copy the command",
+      "copyLabel": "Copy the gateway restart command"
     }
   }
 }

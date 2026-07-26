@@ -91,6 +91,38 @@ function agentInitial(name: string): string {
   return name.trim().charAt(0).toUpperCase() || '?'
 }
 
+function isWorkspaceRow(row: SidebarConversationItem): boolean {
+  return row.rowKind === 'workspace'
+}
+
+function filterChatRowsByAgent(rows: SidebarConversationItem[], agentId: string): SidebarConversationItem[] {
+  const result: SidebarConversationItem[] = []
+  let pendingWorkspace: SidebarConversationItem | null = null
+  let pendingWorkspaceHasMatch = false
+
+  const flushPendingWorkspace = () => {
+    if (pendingWorkspace && pendingWorkspaceHasMatch) result.push(pendingWorkspace)
+    pendingWorkspace = null
+    pendingWorkspaceHasMatch = false
+  }
+
+  for (const row of rows) {
+    if (isWorkspaceRow(row)) {
+      flushPendingWorkspace()
+      pendingWorkspace = row
+      continue
+    }
+    if (row.effectiveAgentId !== agentId) continue
+    if (pendingWorkspace && !pendingWorkspaceHasMatch) {
+      result.push(pendingWorkspace)
+      pendingWorkspaceHasMatch = true
+    }
+    result.push(row)
+  }
+  flushPendingWorkspace()
+  return result
+}
+
 /* ── Collapsible sections ──────────────────────────────────────────── */
 
 // Persisted collapse state, keyed by family. A family is open unless an
@@ -113,20 +145,20 @@ const visibleSections = computed(() => {
     .map(section => ({
       ...section,
       rows: section.family === 'chats' && agentFilter.value
-        ? section.rows.filter(row => row.effectiveAgentId === agentFilter.value)
+        ? filterChatRowsByAgent(section.rows, agentFilter.value)
         : section.rows,
     }))
-    .filter(section => section.rows.length > 0)
+    .filter(section => section.rows.some(row => !isWorkspaceRow(row)))
 })
 
 // Total rendered rows: drives the onboarding empty-state and the filter's
 // "No matches" message separately from a true first-run empty list.
 const totalRows = computed(() =>
-  props.sections.reduce((sum, section) => sum + section.rows.length, 0),
+  props.sections.reduce((sum, section) => sum + section.rows.filter(row => !isWorkspaceRow(row)).length, 0),
 )
 
 const hasFilterMatches = computed(() =>
-  visibleSections.value.some(section => section.rows.length > 0),
+  visibleSections.value.some(section => section.rows.some(row => !isWorkspaceRow(row))),
 )
 
 /* ── Bulk selection ───────────────────────────────────────────────── */
@@ -135,7 +167,9 @@ const selectedKeys = ref<Set<string>>(new Set())
 const selectionMode = ref(false)
 
 const visibleSelectableRows = computed(() =>
-  visibleSections.value.flatMap(section => isCollapsed(section.family) ? [] : section.rows),
+  visibleSections.value.flatMap(section =>
+    isCollapsed(section.family) ? [] : section.rows.filter(row => !isWorkspaceRow(row)),
+  ),
 )
 
 const visibleSelectableKeySet = computed(() =>
@@ -481,16 +515,31 @@ function onSelectRow(row: SidebarConversationItem) {
             v-for="row in section.rows"
             :key="row.key"
             class="sidebar-history-row"
-            :class="{ 'is-selected': isRowSelected(row.key) }"
+            :class="{
+              'is-selected': row.rowKind !== 'workspace' && isRowSelected(row.key),
+              'sidebar-history-row--workspace': row.rowKind === 'workspace',
+            }"
             :data-family="section.family"
             :data-depth="row.depth"
             :style="{ '--row-depth': row.depth }"
           >
-            <span v-if="row.depth > 0" class="sidebar-history-rail" aria-hidden="true" />
+            <div
+              v-if="row.rowKind === 'workspace'"
+              class="sidebar-workspace-header"
+              :title="row.workspaceDisplayPath || row.title"
+            >
+              <span class="sidebar-workspace-label">{{ row.title }}</span>
+            </div>
+
+            <span
+              v-if="row.depth > 0 && row.rowKind !== 'workspace'"
+              class="sidebar-history-rail"
+              aria-hidden="true"
+            />
 
             <!-- Inline rename input replaces the row button while editing -->
             <input
-              v-if="renamingKey === row.key"
+              v-if="row.rowKind !== 'workspace' && renamingKey === row.key"
               :ref="setRenameInput"
               v-model="renameDraft"
               class="sidebar-history-rename"
@@ -502,7 +551,7 @@ function onSelectRow(row: SidebarConversationItem) {
             />
 
             <button
-              v-else
+              v-else-if="row.rowKind !== 'workspace'"
               class="sidebar-history-item"
               :class="{ 'is-current': row.key === currentKey }"
               :title="row.title"
@@ -536,7 +585,7 @@ function onSelectRow(row: SidebarConversationItem) {
 
             <!-- Chat-only ⋯ menu: rename + delete -->
             <div
-              v-if="row.sessionKind === 'chat' && renamingKey !== row.key && !selectionMode"
+              v-if="row.rowKind !== 'workspace' && row.sessionKind === 'chat' && renamingKey !== row.key && !selectionMode"
               class="sidebar-row-menu-wrap"
             >
               <button
@@ -584,7 +633,7 @@ function onSelectRow(row: SidebarConversationItem) {
 
             <!-- Agent-initial badge: indicator + click-to-filter (Chats only) -->
             <button
-              v-else-if="shouldShowAgentFilterBadge(section.family, row) && renamingKey !== row.key && !selectionMode"
+              v-else-if="row.rowKind !== 'workspace' && shouldShowAgentFilterBadge(section.family, row) && renamingKey !== row.key && !selectionMode"
               type="button"
               class="sidebar-agent-badge"
               :class="{ 'is-active': agentFilter === row.effectiveAgentId }"

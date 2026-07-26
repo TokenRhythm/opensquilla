@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import time
 import uuid
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from opensquilla.agents.limits import MAX_SPAWN_DEPTH
+from opensquilla.engine.types import done_text_snapshot
 
 if TYPE_CHECKING:
     from .agent import Agent
@@ -194,7 +196,7 @@ class SubagentManager:
     async def spawn(
         self,
         spec: SubagentSpec,
-        agent_factory: Any,  # callable: (spec, depth) -> Agent
+        agent_factory: Any,  # callable: (spec, depth[, execution_id]) -> Agent
     ) -> SubagentHandle:
         """Spawn a child agent for the given spec.
 
@@ -205,16 +207,27 @@ class SubagentManager:
         self._check_concurrent()
 
         run_id = str(uuid.uuid4())
-        child_agent: Agent = agent_factory(spec, self.spawn_depth + 1)
+        depth = self.spawn_depth + 1
+        try:
+            inspect.signature(agent_factory).bind(spec, depth, run_id)
+        except (TypeError, ValueError):
+            # Compatibility for external/test factories implementing the
+            # historical two-argument internal callback.
+            child_agent: Agent = agent_factory(spec, depth)
+        else:
+            child_agent = agent_factory(spec, depth, run_id)
 
         async def _run() -> str:
             collected: list[str] = []
+            terminal_text_present = False
+            terminal_text = ""
             async for event in child_agent.run_turn(spec.task):
                 if hasattr(event, "text") and event.kind == "text_delta":  # type: ignore[union-attr]
                     collected.append(event.text)  # type: ignore[union-attr]
                 elif event.kind == "done":  # type: ignore[union-attr]
+                    terminal_text_present, terminal_text = done_text_snapshot(event)
                     break
-            return "".join(collected)
+            return terminal_text if terminal_text_present else "".join(collected)
 
         async def _run_with_timeout() -> str:
             if spec.timeout <= 0:

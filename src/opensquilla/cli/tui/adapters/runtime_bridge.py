@@ -9,9 +9,12 @@ or standalone runtime dependencies.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
+from urllib.parse import quote, urlsplit, urlunsplit
 
+import typer
 from rich.panel import Panel
+from rich.text import Text
 
 import opensquilla.cli.tui.adapters.native_bridge as _native_bridge
 import opensquilla.cli.tui.adapters.opentui_bridge as _opentui_bridge
@@ -60,9 +63,9 @@ class GatewayTerminalReplRunner(Protocol):
         *,
         surface: Surface,
         scope: GatewayRuntimeScope,
-        dispatch: Callable[[str], Coroutine[Any, Any, bool]]
-        | Callable[[str], Awaitable[bool]],
+        dispatch: Callable[[str], Coroutine[Any, Any, bool]] | Callable[[str], Awaitable[bool]],
         abort_active_turn: Callable[[], Awaitable[None]] | None = None,
+        steer_active_turn: Callable[[str], Awaitable[bool]] | None = None,
         queue_max_size: int | None = None,
     ) -> None: ...
 
@@ -73,16 +76,24 @@ async def run_concurrent_repl(
     scope: GatewayRuntimeScope | StandaloneRuntimeScope,
     dispatch: Callable[[str], Coroutine[Any, Any, bool]] | Callable[[str], Awaitable[bool]],
     abort_active_turn: Callable[[], Awaitable[None]] | None = None,
+    steer_active_turn: Callable[[str], Awaitable[bool]] | None = None,
     queue_max_size: int | None = None,
 ) -> None:
+    kwargs: dict[str, Any] = {
+        "surface": surface,
+        "scope": scope,
+        "dispatch": dispatch,
+        "queue_max_size": (
+            PENDING_QUEUE_MAX_SIZE if queue_max_size is None else queue_max_size
+        ),
+        "abort_active_turn": abort_active_turn,
+    }
+    # Additive compatibility: third-party/older bridges do not accept the
+    # steering callback. Omit it when Gateway steering is not wired.
+    if steer_active_turn is not None:
+        kwargs["steer_active_turn"] = steer_active_turn
     await _runtime_bridge_for_selected_backend().run_concurrent_repl(
-        surface=surface,
-        scope=scope,
-        dispatch=dispatch,
-        queue_max_size=PENDING_QUEUE_MAX_SIZE
-        if queue_max_size is None
-        else queue_max_size,
-        abort_active_turn=abort_active_turn,
+        **kwargs,
     )
 
 
@@ -135,7 +146,10 @@ def _turn_stream_dependencies() -> Any:
 
 
 async def stream_response_gateway(
-    client: GatewayClientLike,
+    # This bridge is shared by the runtime and slash adapters, whose client
+    # protocols intentionally expose different method subsets.  The concrete
+    # GatewayClient satisfies both; the downstream turn bridge is structural.
+    client: Any,
     session_key: str,
     message: str,
     elevated_state: dict[str, str | None] | None = None,
@@ -182,12 +196,14 @@ def _gateway_input_loop_for(
         scope: GatewayRuntimeScope,
         dispatch: Callable[[str], Coroutine[Any, Any, bool]],
         abort_active_turn: Callable[[], Awaitable[None]] | None = None,
+        steer_active_turn: Callable[[str], Awaitable[bool]] | None = None,
     ) -> None:
         await repl_runner(
             surface=Surface.CLI_GATEWAY,
             scope=scope,
             dispatch=dispatch,
             abort_active_turn=abort_active_turn,
+            steer_active_turn=steer_active_turn,
         )
 
     return _run_gateway_input_loop
@@ -199,14 +215,11 @@ def _gateway_runtime_notifier(
 ) -> Callable[[_gateway_runtime.GatewayRuntimeNotice], None]:
     def _notify(notice: _gateway_runtime.GatewayRuntimeNotice) -> None:
         if notice.kind == "created":
-            output_console.print(
-                f"[dim]Connected to gateway. Session: {notice.session_key}[/dim]"
-            )
+            output_console.print(f"[dim]Connected to gateway. Session: {notice.session_key}[/dim]")
             return
         if notice.kind == "resumed":
             output_console.print(
-                "[dim]Connected to gateway. "
-                f"Resuming session: {notice.session_key}[/dim]"
+                f"[dim]Connected to gateway. Resuming session: {notice.session_key}[/dim]"
             )
             return
         if notice.kind == "resume_model_ignored":
@@ -235,6 +248,12 @@ def _gateway_runtime_notifier(
             return
         if notice.kind == "unknown_command":
             output_console.print("[red]Unknown command.[/red] [dim]Use /help.[/dim]")
+            return
+        if notice.kind == "queued_behind_external":
+            output_console.print(
+                "[dim]Queued behind a turn running from another client;"
+                " your message sends when it finishes.[/dim]"
+            )
             return
         if notice.kind == "error":
             output_console.print(error_panel_factory(notice.message or ""))
@@ -307,23 +326,18 @@ async def run_gateway_chat(
     run_concurrent_repl: GatewayTerminalReplRunner | None = None,
     output_console: Any | None = None,
     error_panel_factory: Callable[[str], Any] | None = None,
-) -> None:
+) -> _gateway_runtime.SessionExitSummary | None:
+    from opensquilla.cli.gateway_client import GatewayRPCError
+    from opensquilla.cli.gateway_rpc import rpc_error_exit_code
+
     repl_runner = (
         globals()["run_concurrent_repl"] if run_concurrent_repl is None else run_concurrent_repl
     )
     active_console = console if output_console is None else output_console
-    active_error_panel = (
-        error_panel if error_panel_factory is None else error_panel_factory
-    )
-    active_stream_response = (
-        stream_response_gateway if stream_response is None else stream_response
-    )
+    active_error_panel = error_panel if error_panel_factory is None else error_panel_factory
+    active_stream_response = stream_response_gateway if stream_response is None else stream_response
     if handle_slash_command is None:
-        if (
-            stream_response is None
-            and output_console is None
-            and error_panel_factory is None
-        ):
+        if stream_response is None and output_console is None and error_panel_factory is None:
             active_handle_slash_command = handle_gateway_slash_command
         else:
 
@@ -341,32 +355,90 @@ async def run_gateway_chat(
                     client,
                     elevated_state,
                     tui_output=tui_output,
-                    stream_response=active_stream_response,
+                    stream_response=cast(
+                        _slash_bridge.GatewayStreamResponse,
+                        active_stream_response,
+                    ),
                     output_console=active_console,
                     error_panel_factory=active_error_panel,
                 )
 
-            active_handle_slash_command = (
-                _handle_gateway_slash_command_with_runtime_defaults
-            )
+            active_handle_slash_command = _handle_gateway_slash_command_with_runtime_defaults
     else:
         active_handle_slash_command = handle_slash_command
 
-    await _gateway_runtime.run_gateway_chat(
-        model=model,
-        session_id=session_id,
-        deps=_gateway_runtime.GatewayRuntimeDependencies(
-            stream_response=active_stream_response,
-            handle_slash_command=active_handle_slash_command,
-            run_input_loop=_gateway_input_loop_for(repl_runner),
-            get_tui_output=get_tui_output,
-            is_exit_command=lambda value: _commands.is_exit_command(
-                value,
-                Surface.CLI_GATEWAY,
+    try:
+        summary = await _gateway_runtime.run_gateway_chat(
+            model=model,
+            session_id=session_id,
+            deps=_gateway_runtime.GatewayRuntimeDependencies(
+                stream_response=active_stream_response,
+                handle_slash_command=active_handle_slash_command,
+                run_input_loop=_gateway_input_loop_for(repl_runner),
+                get_tui_output=get_tui_output,
+                is_exit_command=lambda value: _commands.is_exit_command(
+                    value,
+                    Surface.CLI_GATEWAY,
+                ),
+                notify=_gateway_runtime_notifier(active_console, active_error_panel),
             ),
-            notify=_gateway_runtime_notifier(active_console, active_error_panel),
-        ),
+        )
+    except _gateway_runtime.SessionExitError as exc:
+        _print_session_exit_receipt(active_console, exc.summary)
+        raise typer.Exit(code=1) from None
+    except GatewayRPCError as exc:
+        if (
+            session_id
+            and (exc.code or "").upper() == "NOT_FOUND"
+            and exc.method in {"sessions.bootstrap", "sessions.resolve"}
+        ):
+            message = (
+                f"Session '{session_id}' was not found. Run `opensquilla sessions list` "
+                "to find a resumable key, or omit `--session` to create a new session."
+            )
+        else:
+            message = str(exc)
+        active_console.print(active_error_panel(message))
+        raise typer.Exit(code=rpc_error_exit_code(exc.code)) from None
+    if summary is not None:
+        _print_session_exit_receipt(active_console, summary)
+    return summary
+
+
+def _gateway_web_session_url(session_key: str) -> str:
+    from opensquilla.cli.gateway_rpc import default_gateway_url  # noqa: PLC0415
+
+    parsed = urlsplit(default_gateway_url())
+    scheme = "https" if parsed.scheme == "wss" else "http"
+    return urlunsplit(
+        (
+            scheme,
+            parsed.netloc,
+            "/control/chat",
+            f"session={quote(session_key, safe='')}",
+            "",
+        )
     )
+
+
+def _print_session_exit_receipt(
+    output_console: Any,
+    summary: _gateway_runtime.SessionExitSummary,
+) -> None:
+    """Print once, after the active surface has restored the real terminal."""
+
+    label = summary.title or summary.session_key
+    lines = [
+        f"Session saved: {label}",
+        f"Resume: opensquilla chat --session {summary.session_key}",
+        f"Web: {_gateway_web_session_url(summary.session_key)}",
+        f"Exit: {summary.reason}",
+    ]
+    if summary.active or summary.queued:
+        lines.append(
+            f"Remaining work: active={str(summary.active).lower()}, queued={summary.queued}"
+        )
+    output_console.print(Text("\n".join(lines)))
 
 
 async def gateway_chat_runner(model: str | None, session_id: str | None) -> None:
@@ -393,16 +465,12 @@ async def run_standalone_chat(
         globals()["run_concurrent_repl"] if run_concurrent_repl is None else run_concurrent_repl
     )
     active_console = console if output_console is None else output_console
-    active_error_panel = (
-        error_panel if error_panel_factory is None else error_panel_factory
-    )
+    active_error_panel = error_panel if error_panel_factory is None else error_panel_factory
     active_stream_response = (
         stream_response_turnrunner if stream_response is None else stream_response
     )
     active_image_command_handler = (
-        handle_image_command_turnrunner
-        if image_command_handler is None
-        else image_command_handler
+        handle_image_command_turnrunner if image_command_handler is None else image_command_handler
     )
 
     def _sync_slash_adapter_io() -> None:

@@ -60,6 +60,7 @@ from .types import (
     ProviderHeartbeatEvent,
     ProviderMessageCountProjection,
     ProviderMessageLimitProof,
+    ProviderRequestCorrelation,
     QuotaStatus,
     ReasoningDeltaEvent,
     StreamEvent,
@@ -69,6 +70,7 @@ from .types import (
     ToolUseDeltaEvent,
     ToolUseEndEvent,
     ToolUseStartEvent,
+    derive_provider_request_correlation,
     synthetic_failure_event,
 )
 
@@ -127,6 +129,8 @@ __all__ = [
     "ProviderHeartbeatEvent",
     "ProviderMessageCountProjection",
     "ProviderMessageLimitProof",
+    "ProviderRequestCorrelation",
+    "derive_provider_request_correlation",
     "ModelCapabilities",
     "ModelInfo",
     "ChatConfig",

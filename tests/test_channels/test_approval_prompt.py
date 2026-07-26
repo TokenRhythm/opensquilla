@@ -64,9 +64,13 @@ def test_render_with_none_profile_is_text_only() -> None:
 
 
 def test_parse_text_commands_are_case_insensitive() -> None:
-    assert parse_approval_action("/approve AB12") == ("AB12", True)
-    assert parse_approval_action("/deny ab12") == ("AB12", False)
-    assert parse_approval_action("  /APPROVE xy9z  ") == ("XY9Z", True)
+    assert parse_approval_action("/approve AB12") == ("AB12", "approve")
+    assert parse_approval_action("/deny ab12") == ("AB12", "deny")
+    assert parse_approval_action("  /APPROVE xy9z  ") == ("XY9Z", "approve")
+    assert parse_approval_action("/approve AB12 always") == ("AB12", "always")
+    assert parse_approval_action("/approve ab12 ALWAYS") == ("AB12", "always")
+    # "always" on a deny is meaningless and parses as a plain deny.
+    assert parse_approval_action("/deny AB12 always") == ("AB12", "deny")
 
 
 def test_parse_rejects_bare_word_and_missing_code() -> None:
@@ -78,7 +82,7 @@ def test_parse_rejects_bare_word_and_missing_code() -> None:
 
 def test_parse_incoming_message_text() -> None:
     msg = IncomingMessage(sender_id="u1", channel_id="c1", content="/deny AB12")
-    assert parse_approval_action(msg) == ("AB12", False)
+    assert parse_approval_action(msg) == ("AB12", "deny")
 
 
 def test_parse_card_action_from_metadata() -> None:
@@ -94,7 +98,7 @@ def test_parse_card_action_from_metadata() -> None:
             }
         },
     )
-    assert parse_approval_action(msg) == ("AB12", True)
+    assert parse_approval_action(msg) == ("AB12", "approve")
 
 
 def test_parse_card_action_requires_discriminator() -> None:
@@ -130,3 +134,72 @@ def test_release_short_code_drops_binding() -> None:
     assert resolve_short_code(code) is None
     # Idempotent.
     release_short_code("exec-1")
+
+
+def test_parse_strips_leading_bot_mention() -> None:
+    # Mention-gated groups REQUIRE addressing the bot, and Slack/Discord keep
+    # the raw mention markup in content — the command must still parse.
+    assert parse_approval_action("<@U123ABC> /approve AB12") == ("AB12", "approve")
+    assert parse_approval_action("<@!987654> /deny ab12") == ("AB12", "deny")
+    assert parse_approval_action("<@U08AAA|bot> /approve AB12 always") == ("AB12", "always")
+    assert parse_approval_action("  <@U123> /approve AB12") == ("AB12", "approve")
+    # A mention alone, or one that is not leading, is not an approval action.
+    assert parse_approval_action("<@U123ABC>") is None
+    assert parse_approval_action("please <@U123> /deny AB12") is None
+
+
+def test_prompt_renders_summary_label() -> None:
+    request = ApprovalPromptRequest(
+        approval_id="exec-1",
+        namespace="exec",
+        session_key="agent:main:chat",
+        command_or_tool="pypi.org",
+        agent="main",
+        short_code="AB12",
+        summary_label="Network host",
+    )
+    rendered = render_approval_prompt(
+        ChannelCapabilityProfile(channel_type="feishu", interactive_cards=True), request
+    )
+    assert "Network host: pypi.org" in rendered["text"]
+    assert "(unknown command)" not in rendered["text"]
+    card_body = rendered["card"]["elements"][0]["text"]["content"]
+    assert "Network host" in card_body
+    assert "pypi.org" in card_body
+
+
+def test_card_action_value_carries_origin_context() -> None:
+    request = ApprovalPromptRequest(
+        approval_id="exec-1",
+        namespace="exec",
+        session_key="agent:main:feishu:group:oc_1:sender:ou_1",
+        command_or_tool="rm target.txt",
+        agent="main",
+        short_code="AB12",
+        origin_channel_id="oc_1",
+        origin_is_group=True,
+        origin_chat_type="group",
+        origin_thread_id="t-9",
+    )
+    rendered = render_approval_prompt(
+        ChannelCapabilityProfile(channel_type="feishu", interactive_cards=True), request
+    )
+    for action in rendered["card"]["elements"][1]["actions"]:
+        value = action["value"]
+        assert value["channel_id"] == "oc_1"
+        assert value["is_group"] is True
+        assert value["chat_type"] == "group"
+        assert value["thread_id"] == "t-9"
+
+
+def test_card_action_value_omits_absent_origin_context() -> None:
+    rendered = render_approval_prompt(
+        ChannelCapabilityProfile(channel_type="feishu", interactive_cards=True),
+        _request(),
+    )
+    for action in rendered["card"]["elements"][1]["actions"]:
+        value = action["value"]
+        assert "channel_id" not in value
+        assert "is_group" not in value
+        assert "chat_type" not in value
+        assert "thread_id" not in value

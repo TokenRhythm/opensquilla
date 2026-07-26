@@ -175,3 +175,31 @@ def test_build_report_orders_actionable_findings_before_informational_items() ->
         "channels.disabled",
         "gateway.rpc.ready",
     ]
+
+
+def test_build_report_labels_warn_optional_findings_as_operator_action_items() -> None:
+    # A warn-severity optional finding is work someone is blocked on (pending
+    # pairing approvals, unconfirmed sends) — not an "optional setup item".
+    report = build_report(
+        [
+            HealthFinding(
+                id="channel.telegram-main.pending_pairings",
+                severity="warn",
+                readiness_impact="optional",
+                surface="channels",
+                title="Channel telegram-main has pairing requests awaiting approval",
+                detail="2 sender(s) are waiting on operator approval.",
+            ),
+            HealthFinding(
+                id="image_generation.disabled",
+                severity="info",
+                surface="image_generation",
+                title="Image generation is disabled",
+                detail="Image generation is optional and is currently disabled.",
+            ),
+        ]
+    )
+
+    assert report["ready"] is True
+    assert report["status"] == "ready"
+    assert report["summary"] == "Ready, 1 item awaiting operator action, 1 optional setup item"

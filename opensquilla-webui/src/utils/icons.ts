@@ -5,12 +5,13 @@ export type IconName =
   | 'config' | 'logs' | 'skills' | 'agents'
   | 'sun' | 'moon' | 'monitor' | 'x' | 'copy' | 'check'
   | 'send' | 'stop' | 'paperclip' | 'plus' | 'share' | 'trash'
-  | 'refresh' | 'download' | 'save' | 'menu' | 'user' | 'search' | 'eye' | 'eye-off'
+  | 'refresh' | 'download' | 'save' | 'menu' | 'moreHorizontal' | 'user' | 'search' | 'eye' | 'eye-off'
   | 'edit' | 'info' | 'settings' | 'gear' | 'gauge' | 'router' | 'regenerate'
   | 'pencil' | 'fork' | 'listChecks' | 'chevronDown' | 'chevronRight' | 'arrowUp'
-  | 'panel-left-open' | 'panel-left-close' | 'clock' | 'microphone'
+  | 'panel-left-open' | 'panel-left-close' | 'sidebar-visible' | 'sidebar-hidden'
+  | 'clock' | 'microphone'
   | 'cloud' | 'fileText' | 'fileCode' | 'image' | 'table' | 'externalLink'
-  | 'keyboard' | 'languages' | 'shield'
+  | 'keyboard' | 'languages' | 'shield' | 'lock'
   | 'thumbs-up' | 'thumbs-down'
   | 'music' | 'pause' | 'volume';
 
@@ -50,6 +51,7 @@ const ICONS: Record<IconName, IconDef> = {
   download:   { path: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>' },
   save:       { path: '<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/>' },
   menu:       { path: '<line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/>' },
+  moreHorizontal: { path: '<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>', strokeWidth: 2 },
   user:       { path: '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>' },
   search:     { path: '<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>' },
   eye:        { path: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/>' },
@@ -70,6 +72,14 @@ const ICONS: Record<IconName, IconDef> = {
   arrowUp:    { path: '<path d="M12 19V5"/><path d="M5 12l7-7 7 7"/>', strokeWidth: 2 },
   'panel-left-open':  { path: '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/><path d="M14 9l6 6-6 6"/>' },
   'panel-left-close': { path: '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/><path d="M20 9l-6 6 6 6"/>' },
+  'sidebar-visible': {
+    path: '<rect x="3.5" y="4.5" width="17" height="15" rx="3"/><path d="M9.5 4.5v15"/>',
+    strokeWidth: 1.5,
+  },
+  'sidebar-hidden': {
+    path: '<rect x="3.5" y="4.5" width="17" height="15" rx="3"/><path d="M8.5 9v6"/>',
+    strokeWidth: 1.5,
+  },
   clock: { path: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>' },
   microphone: { path: '<path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v3"/><path d="M8 22h8"/>', strokeWidth: 1.7 },
   cloud: { path: '<path d="M17.5 19H8a6 6 0 1 1 1.03-11.91A7 7 0 0 1 22 12.5 4.5 4.5 0 0 1 17.5 19z"/>', strokeWidth: 1.5 },
@@ -80,6 +90,7 @@ const ICONS: Record<IconName, IconDef> = {
   externalLink: { path: '<path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>', strokeWidth: 1.5 },
   keyboard:   { path: '<rect width="20" height="16" x="2" y="4" rx="2"/><path d="M6 8h.01"/><path d="M10 8h.01"/><path d="M14 8h.01"/><path d="M18 8h.01"/><path d="M8 12h.01"/><path d="M12 12h.01"/><path d="M16 12h.01"/><path d="M7 16h10"/>' },
   shield:     { path: '<path d="M20 13c0 5-3.5 7.5-8 9-4.5-1.5-8-4-8-9V5l8-3 8 3v8z"/>', strokeWidth: 1.7 },
+  lock:       { path: '<rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>', strokeWidth: 1.7 },
   music:      { path: '<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>', strokeWidth: 1.7 },
   pause:      { path: '<rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/>', strokeWidth: 1.7 },
   volume:     { path: '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>', strokeWidth: 1.7 },

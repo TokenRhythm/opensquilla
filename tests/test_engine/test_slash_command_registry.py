@@ -4,7 +4,13 @@ import pytest
 
 from opensquilla.engine.commands import (
     DEFAULT_REGISTRY,
+    CommandBusyPolicy,
+    CommandCategory,
+    CommandDef,
+    CommandExecution,
+    CommandPresentation,
     ExecutionKind,
+    SlashCommandRegistry,
     Surface,
     parse_surface,
 )
@@ -74,3 +80,86 @@ def test_aliases_resolve_for_visible_surface_only() -> None:
     assert DEFAULT_REGISTRY.find("/clear", Surface.CHANNEL).name == "/reset"  # type: ignore[union-attr]
     assert DEFAULT_REGISTRY.find("/session", Surface.CHANNEL).name == "/status"  # type: ignore[union-attr]
     assert DEFAULT_REGISTRY.find("/session", Surface.WEB_CHAT) is None
+
+
+def test_registry_preserves_declaration_order() -> None:
+    execution = {Surface.CLI_GATEWAY: CommandExecution(ExecutionKind.LOCAL, "test.action")}
+    registry = SlashCommandRegistry(
+        (
+            CommandDef("/zebra", "/zebra", "First.", execution),
+            CommandDef("/alpha", "/alpha", "Second.", execution),
+        )
+    )
+
+    assert [cmd.name for cmd in registry.for_surface(Surface.CLI_GATEWAY)] == [
+        "/zebra",
+        "/alpha",
+    ]
+
+
+def test_cli_gateway_command_metadata_has_curated_order_and_compatibility() -> None:
+    commands = DEFAULT_REGISTRY.for_surface(Surface.CLI_GATEWAY)
+    palette = sorted(
+        (cmd for cmd in commands if cmd.visible_by_default),
+        key=lambda cmd: cmd.order,
+    )
+
+    assert [cmd.name for cmd in palette[:12]] == [
+        "/model",
+        "/strategy",
+        "/sessions",
+        "/new",
+        "/permissions",
+        "/status",
+        "/compact",
+        "/usage",
+        "/theme",
+        "/help",
+        "/keys",
+        "/exit",
+    ]
+
+    model = DEFAULT_REGISTRY.find("/model", Surface.CLI_GATEWAY)
+    assert model is not None
+    assert model.description_for(Surface.CLI_GATEWAY) == "Choose or inspect the session model."
+    assert model.description_for(Surface.CHANNEL) == "List available models."
+    assert model.usage_for(Surface.CLI_GATEWAY) == "/model [auto|status|name]"
+    assert model.usage_for(Surface.CHANNEL) == "/model [name]"
+    assert model.category is CommandCategory.CONTROL
+    assert model.busy_policy is CommandBusyPolicy.IMMEDIATE
+    assert model.presentation is CommandPresentation.PICKER
+    assert [
+        choice.value for choice in model.argument_choices_for(Surface.CLI_GATEWAY)
+    ] == ["auto", "status"]
+    assert model.argument_choices_for(Surface.CHANNEL) == ()
+    model_execution = model.execution_for(Surface.CLI_GATEWAY)
+    assert model_execution is not None
+    assert model_execution.kind is ExecutionKind.LOCAL
+    assert model_execution.action == "model.select"
+
+    strategy = DEFAULT_REGISTRY.find("/strategy", Surface.CLI_GATEWAY)
+    assert strategy is not None
+    assert strategy.execution_for(Surface.CLI_GATEWAY) == CommandExecution(
+        ExecutionKind.LOCAL,
+        "model.routing.strategy",
+    )
+    assert DEFAULT_REGISTRY.find("/strategy", Surface.CLI_STANDALONE) is None
+
+    router = DEFAULT_REGISTRY.find("/router", Surface.CLI_GATEWAY)
+    ensemble = DEFAULT_REGISTRY.find("/ensemble", Surface.CLI_GATEWAY)
+    assert router is not None and not router.visible_by_default
+    assert ensemble is not None and not ensemble.visible_by_default
+
+    models = DEFAULT_REGISTRY.find("/models", Surface.CLI_GATEWAY)
+    forget = DEFAULT_REGISTRY.find("/forget", Surface.CLI_GATEWAY)
+    assert models is not None and models.deprecated and not models.visible_by_default
+    assert forget is not None and forget.deprecated and not forget.visible_by_default
+    assert models.execution_for(Surface.CLI_GATEWAY) == CommandExecution(
+        ExecutionKind.LOCAL,
+        "models.list",
+    )
+
+    # Existing compatibility names keep resolving to their canonical commands.
+    assert DEFAULT_REGISTRY.find("/clear", Surface.CLI_GATEWAY).name == "/reset"  # type: ignore[union-attr]
+    assert DEFAULT_REGISTRY.find("/session", Surface.CLI_GATEWAY).name == "/status"  # type: ignore[union-attr]
+    assert DEFAULT_REGISTRY.find("/quit", Surface.CLI_GATEWAY).name == "/exit"  # type: ignore[union-attr]

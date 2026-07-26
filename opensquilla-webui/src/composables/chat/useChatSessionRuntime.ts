@@ -4,6 +4,7 @@ import type {
   ChatRunStatusSource,
 } from '@/types/chat'
 import type { PersistSessionOptions } from '@/composables/chat/useChatSessionRoute'
+import type { SessionSubscriptionOutcome } from '@/composables/chat/useChatSessionSubscription'
 
 export interface ChatUsageAccumulator {
   input: number
@@ -13,6 +14,11 @@ export interface ChatUsageAccumulator {
   cost: number | null
   routedTurns: number
   sessionSaved: number
+}
+
+export interface ResponseSessionAdoptionResult {
+  authoritativeIdle: boolean
+  backgroundOnly: boolean
 }
 
 export interface UseChatSessionRuntimeOptions {
@@ -31,13 +37,15 @@ export interface UseChatSessionRuntimeOptions {
   createSessionKey: (agentId?: string) => string
   persistSession: (key: string, options?: PersistSessionOptions) => void
   unsubscribeSession: () => void | Promise<void>
-  subscribeSession: () => void | Promise<void>
+  subscribeSession: () => void | Promise<void | SessionSubscriptionOutcome>
   loadHistory: () => void | Promise<void>
   loadCurrentSessionUsage: () => void | Promise<void>
   applySessionRunState: (source: ChatRunStatusSource | null | undefined) => void
   setCompactInFlight: (active: boolean, key?: string) => void
   hideCompactStatus: () => void
   clearPendingQueue: () => void
+  switchPendingQueue: (targetSessionKey: string) => void
+  adoptPendingQueue: (targetSessionKey: string, ownerRequestId: string) => void
   resetSavingsPopupCooldown: () => void
   restoreWidgetState: () => void
   resetStreamLiveTurnState: () => void
@@ -80,32 +88,57 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     options.resetSavingsPopupCooldown()
   }
 
-  function resetCompactAndQueueState() {
+  function resetCompactState() {
     options.setCompactInFlight(false)
     options.hideCompactStatus()
-    options.clearPendingQueue()
   }
 
   function resetCurrentSessionAfterSlash() {
     resetSessionRuntimeState()
-    resetCompactAndQueueState()
+    resetCompactState()
+    options.clearPendingQueue()
     resetSessionViewState()
   }
 
-  function switchToSession(key: string) {
+  async function switchSession(
+    key: string,
+    pendingQueuePolicy:
+      | { kind: 'navigate' }
+      | { kind: 'response_handoff'; ownerRequestId: string },
+  ): Promise<ResponseSessionAdoptionResult | undefined> {
     if (!key || key === options.sessionKey.value) return
 
     options.unsubscribeSession()
+    resetCompactState()
+    if (pendingQueuePolicy.kind === 'response_handoff') {
+      options.adoptPendingQueue(key, pendingQueuePolicy.ownerRequestId)
+    } else {
+      options.switchPendingQueue(key)
+    }
     options.persistSession(key, { source: 'runtime.switchToSession' })
     resetSessionRuntimeState()
     options.pendingSessionIntent.value = null
-    resetCompactAndQueueState()
     options.applySessionRunState({ run_status: 'idle' })
     resetSessionViewState()
     options.restoreWidgetState()
     options.loadCurrentSessionUsage()
-    options.subscribeSession()
-    options.loadHistory()
+    const subscription = options.subscribeSession()
+    const history = options.loadHistory()
+    const [subscriptionOutcome] = await Promise.all([subscription, history])
+    return {
+      authoritativeIdle: subscriptionOutcome?.authoritative === true
+        && subscriptionOutcome.live === false,
+      backgroundOnly: subscriptionOutcome?.authoritative === true
+        && subscriptionOutcome.backgroundOnly === true,
+    }
+  }
+
+  function switchToSession(key: string) {
+    return switchSession(key, { kind: 'navigate' })
+  }
+
+  function adoptResponseSession(key: string, ownerRequestId: string) {
+    return switchSession(key, { kind: 'response_handoff', ownerRequestId })
   }
 
   // Drafts keep their provisional key out of the URL and local storage; it
@@ -113,9 +146,10 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
   function startDraftSession(agentId?: string) {
     options.unsubscribeSession()
     const key = options.createSessionKey(agentId)
+    resetCompactState()
+    options.switchPendingQueue(key)
     options.sessionKey.value = key
     resetSessionRuntimeState()
-    resetCompactAndQueueState()
     options.pendingSessionIntent.value = 'new_chat'
     resetSessionViewState()
     options.subscribeSession()
@@ -125,5 +159,6 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     resetCurrentSessionAfterSlash,
     startDraftSession,
     switchToSession,
+    adoptResponseSession,
   }
 }

@@ -50,13 +50,41 @@ def assert_no_inline_prompt_chrome_collision(frame: TerminalFrame) -> None:
             raise AssertionError(
                 f"{frame.checkpoint}: inline prompt chrome overlapped output:\n{frame.text}"
             )
-        resize_checkpoint = "narrow" in frame.checkpoint or "wide" in frame.checkpoint
         if (
             sum(line.count(placeholder) for placeholder in _PROMPT_PLACEHOLDERS) > 1
-            and not resize_checkpoint
         ):
             raise AssertionError(
                 f"{frame.checkpoint}: inline prompt chrome was duplicated:\n{frame.text}"
+            )
+
+
+def assert_no_duplicate_fixed_chrome(frame: TerminalFrame) -> None:
+    """Reject old and new fixed-layout surfaces being visible together.
+
+    A viewport remount or wide/narrow transition may move these regions, but a
+    settled framebuffer can contain only one current instance. This catches the
+    duplicated router/footer and side-rail labels seen in embedded terminals.
+    """
+
+    prompt_count = sum(frame.text.count(placeholder) for placeholder in _PROMPT_PLACEHOLDERS)
+    if prompt_count > 1:
+        raise AssertionError(
+            f"{frame.checkpoint}: duplicated composer after viewport recovery:\n"
+            f"{frame.text}"
+        )
+
+    patterns = {
+        "router strip": re.compile(r"^\s*router\s+·\s+model\b"),
+        "context AGENT label": re.compile(r"^.*│\s*AGENT\s*$"),
+        "context RUNTIME label": re.compile(r"^.*│\s*RUNTIME\s*$"),
+    }
+    lines = frame.text.splitlines()
+    for label, pattern in patterns.items():
+        count = sum(bool(pattern.search(line)) for line in lines)
+        if count > 1:
+            raise AssertionError(
+                f"{frame.checkpoint}: duplicated {label} after viewport recovery:\n"
+                f"{frame.text}"
             )
 
 

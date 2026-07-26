@@ -15,10 +15,8 @@ interface ThreadFixture {
 interface MountOptions {
   sessionKey?: string
   historyHasMore?: boolean
-  historyLoading?: boolean
   onNavigate?: ReturnType<typeof vi.fn>
   onNavigateEnd?: ReturnType<typeof vi.fn>
-  onLoadEarlier?: ReturnType<typeof vi.fn>
 }
 
 interface ThreadDimensions {
@@ -27,7 +25,30 @@ interface ThreadDimensions {
   scrollHeight?: number
 }
 
+interface ResizeObserverFixture {
+  callback: ResizeObserverCallback
+  targets: Set<Element>
+}
+
 const mountedApps: App<Element>[] = []
+
+function stubResizeObservers(): ResizeObserverFixture[] {
+  const observers: ResizeObserverFixture[] = []
+  vi.stubGlobal('ResizeObserver', class {
+    callback: ResizeObserverCallback
+    targets = new Set<Element>()
+
+    constructor(callback: ResizeObserverCallback) {
+      this.callback = callback
+      observers.push(this)
+    }
+
+    observe(target: Element) { this.targets.add(target) }
+    unobserve(target: Element) { this.targets.delete(target) }
+    disconnect() { this.targets.clear() }
+  })
+  return observers
+}
 
 function message(role: 'user' | 'assistant', index: number): ChatRenderedMessage {
   return {
@@ -131,10 +152,8 @@ async function mountMinimap(
     stripTimePrefix: (value: string) => value,
     sessionKey: options.sessionKey,
     historyHasMore: options.historyHasMore,
-    historyLoading: options.historyLoading,
     onNavigate: options.onNavigate,
     onNavigateEnd: options.onNavigateEnd,
-    onLoadEarlier: options.onLoadEarlier,
   })
   app.use(i18n)
   app.mount(host)
@@ -325,15 +344,12 @@ describe('ConversationMinimap', () => {
     expect(document.activeElement).toBe(thread.container.querySelector('[data-chat-turn-key="user-3"]'))
   })
 
-  it('labels a partial history window and exposes loading earlier messages', async () => {
-    const onLoadEarlier = vi.fn()
-    const { host } = await mountMinimap(8, { historyHasMore: true, onLoadEarlier })
+  it('labels the loaded range without exposing a manual load-earlier control', async () => {
+    const { host } = await mountMinimap(8, { historyHasMore: true })
 
     expect(host.querySelector('nav')?.getAttribute('aria-label')).toContain('earlier messages available')
     expect(markers(host)[0].getAttribute('aria-label')).toContain('Loaded prompt 1 of 8')
-    const loadButton = host.querySelector<HTMLButtonElement>('[data-testid="conversation-minimap-load-earlier"]')!
-    loadButton.click()
-    expect(onLoadEarlier).toHaveBeenCalledOnce()
+    expect(host.querySelector('[data-testid="conversation-minimap-load-earlier"]')).toBeNull()
   })
 
   it('keeps a focused prompt keyed correctly when earlier history is prepended', async () => {
@@ -368,76 +384,6 @@ describe('ConversationMinimap', () => {
     expect(host.querySelector('[role="tooltip"]')?.textContent).toContain('prompt 2')
     expect(markers(host)[3].tabIndex).toBe(0)
     expect(document.activeElement).toBe(markers(host)[3])
-  })
-
-  it('keeps the load-earlier control focusable while loading and restores focus when it disappears', async () => {
-    const rendered = messages(8)
-    const hasMore = ref(true)
-    const loading = ref(false)
-    const thread = makeThread(rendered)
-    const host = document.createElement('div')
-    document.body.appendChild(host)
-    const Root = defineComponent(() => () => h(ConversationMinimap, {
-      messages: rendered,
-      scrollContainer: thread.container,
-      stripTimePrefix: (value: string) => value,
-      historyHasMore: hasMore.value,
-      historyLoading: loading.value,
-    }))
-    const app = createApp(Root)
-    app.use(i18n)
-    app.mount(host)
-    mountedApps.push(app)
-    await vi.waitFor(() => expect(markers(host)).toHaveLength(8))
-
-    const loadButton = host.querySelector<HTMLButtonElement>('[data-testid="conversation-minimap-load-earlier"]')!
-    loadButton.focus()
-    loadButton.click()
-    loading.value = true
-    await nextTick()
-    expect(loadButton.getAttribute('aria-disabled')).toBe('true')
-    expect(document.activeElement).toBe(loadButton)
-
-    hasMore.value = false
-    loading.value = false
-    await nextTick()
-    await nextTick()
-    expect(document.activeElement).toBe(markers(host)[0])
-  })
-
-  it('does not steal focus when the reader leaves the load-earlier control during loading', async () => {
-    const rendered = messages(8)
-    const hasMore = ref(true)
-    const loading = ref(false)
-    const thread = makeThread(rendered)
-    const host = document.createElement('div')
-    const outsideButton = document.createElement('button')
-    document.body.append(host, outsideButton)
-    const Root = defineComponent(() => () => h(ConversationMinimap, {
-      messages: rendered,
-      scrollContainer: thread.container,
-      stripTimePrefix: (value: string) => value,
-      historyHasMore: hasMore.value,
-      historyLoading: loading.value,
-    }))
-    const app = createApp(Root)
-    app.use(i18n)
-    app.mount(host)
-    mountedApps.push(app)
-    await vi.waitFor(() => expect(markers(host)).toHaveLength(8))
-
-    const loadButton = host.querySelector<HTMLButtonElement>('[data-testid="conversation-minimap-load-earlier"]')!
-    loadButton.focus()
-    loadButton.click()
-    loading.value = true
-    await nextTick()
-    outsideButton.focus()
-
-    hasMore.value = false
-    loading.value = false
-    await nextTick()
-    await nextTick()
-    expect(document.activeElement).toBe(outsideButton)
   })
 
   it('stays hidden below the prompt and scroll-range thresholds', async () => {
@@ -479,9 +425,9 @@ describe('ConversationMinimap', () => {
     expect(markers(host)).toHaveLength(8)
   })
 
-  it('enters only at the 1104px conversation-pane threshold', async () => {
+  it('enters only at the 1120px conversation-pane threshold', async () => {
     const rendered = messages(8)
-    const narrowThread = makeThread(rendered, 1103)
+    const narrowThread = makeThread(rendered, 1119)
     const narrowHost = document.createElement('div')
     document.body.appendChild(narrowHost)
     const narrowApp = createApp(ConversationMinimap, {
@@ -495,30 +441,13 @@ describe('ConversationMinimap', () => {
     await new Promise(resolve => window.setTimeout(resolve, 20))
 
     expect(narrowHost.querySelector('[data-testid="conversation-minimap"]')).toBeNull()
-    const wide = await mountMinimap(8, {}, { clientWidth: 1104 })
+    const wide = await mountMinimap(8, {}, { clientWidth: 1120 })
     expect(markers(wide.host)).toHaveLength(8)
   })
 
-  it('keeps the rail mounted until the pane crosses the 1056px exit threshold', async () => {
-    const observers: Array<{
-      callback: ResizeObserverCallback
-      targets: Set<Element>
-    }> = []
-    vi.stubGlobal('ResizeObserver', class {
-      callback: ResizeObserverCallback
-      targets = new Set<Element>()
-
-      constructor(callback: ResizeObserverCallback) {
-        this.callback = callback
-        observers.push(this)
-      }
-
-      observe(target: Element) { this.targets.add(target) }
-      unobserve(target: Element) { this.targets.delete(target) }
-      disconnect() { this.targets.clear() }
-    })
-
-    const { host, thread } = await mountMinimap(8, {}, { clientWidth: 1104 })
+  it('keeps the rail mounted until the pane crosses the 1104px collision floor', async () => {
+    const observers = stubResizeObservers()
+    const { host, thread } = await mountMinimap(8, {}, { clientWidth: 1120 })
     const shellObserver = observers.find(observer => observer.targets.has(thread.container))!
     const resizeTo = async (width: number) => {
       Object.defineProperty(thread.container, 'clientWidth', { configurable: true, value: width })
@@ -526,27 +455,38 @@ describe('ConversationMinimap', () => {
       await nextTick()
     }
 
-    await resizeTo(1057)
+    await resizeTo(1105)
     expect(markers(host)).toHaveLength(8)
-    await resizeTo(1056)
-    await vi.waitFor(() => expect(host.querySelector('[data-testid="conversation-minimap"]')).toBeNull())
-    await resizeTo(1103)
-    expect(host.querySelector('[data-testid="conversation-minimap"]')).toBeNull()
     await resizeTo(1104)
+    await vi.waitFor(() => expect(host.querySelector('[data-testid="conversation-minimap"]')).toBeNull())
+    await resizeTo(1119)
+    expect(host.querySelector('[data-testid="conversation-minimap"]')).toBeNull()
+    await resizeTo(1120)
     await vi.waitFor(() => expect(markers(host)).toHaveLength(8))
   })
 
   it('uses a lower exit threshold so small layout changes do not flicker the rail', async () => {
+    const observers = stubResizeObservers()
     const { host, thread } = await mountMinimap(8, {}, { scrollHeight: 1500 })
+    const threadObserver = observers.find(observer => observer.targets.size > 1)!
+    const resizeThread = async (scrollHeight: number) => {
+      Object.defineProperty(thread.container, 'scrollHeight', { configurable: true, value: scrollHeight })
+      threadObserver.callback(
+        [{ target: thread.container } as unknown as ResizeObserverEntry],
+        threadObserver as unknown as ResizeObserver,
+      )
+      await new Promise(resolve => window.requestAnimationFrame(() => resolve(undefined)))
+      await nextTick()
+    }
 
-    Object.defineProperty(thread.container, 'scrollHeight', { configurable: true, value: 1200 })
-    thread.container.appendChild(document.createElement('div'))
-    await new Promise(resolve => window.setTimeout(resolve, 20))
+    await resizeThread(1200)
     expect(markers(host)).toHaveLength(8)
 
-    Object.defineProperty(thread.container, 'scrollHeight', { configurable: true, value: 1199 })
-    thread.container.appendChild(document.createElement('div'))
-    await vi.waitFor(() => expect(host.querySelector('[data-testid="conversation-minimap"]')).toBeNull())
+    await resizeThread(1199)
+    expect(
+      host.querySelector('[data-testid="conversation-minimap"]')
+        ?.classList.contains('conversation-minimap-shell-leave-active'),
+    ).toBe(true)
   })
 
   it('resets threshold hysteresis when the session changes even if fallback keys overlap', async () => {

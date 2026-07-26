@@ -7,6 +7,86 @@ export interface SkillInstall {
   bins?: string[]
 }
 
+export interface SkillDeclaredPythonPackage {
+  install_id: string
+  label: string
+  package: string
+  module: string
+}
+
+export interface SkillInferredPythonImport {
+  module: string
+  source: string
+  not_enforced: boolean
+}
+
+export interface SkillInferredApiEnv {
+  name: string
+  sources: string[]
+  not_enforced: boolean
+}
+
+export interface SkillDependencySummary {
+  declared: {
+    binaries: {
+      all: string[]
+      any: string[]
+    }
+    python_packages: SkillDeclaredPythonPackage[]
+    api_env: {
+      all: string[]
+      any: string[]
+    }
+  }
+  missing: {
+    binaries: {
+      all: string[]
+      any: string[][]
+    }
+    api_env: {
+      all: string[]
+      any: string[][]
+    }
+    count: number
+  }
+  inferred: {
+    python_imports: SkillInferredPythonImport[]
+    api_env: SkillInferredApiEnv[]
+    scan_errors: string[]
+  }
+  sub_skill_dependencies: {
+    skills: Array<{
+      name: string
+      summary: SkillDependencySummary
+    }>
+    missing_count: number
+    inferred_count: number
+    missing_references: string[]
+  }
+  declaration_quality: 'declared' | 'partial' | 'undeclared_inferred' | 'none' | string
+}
+
+export interface SkillDependencyCounts {
+  python: number
+  binaries: number
+  env: number
+  missing: number
+  advisory: number
+}
+
+export interface SkillInstallMissingStill {
+  bins: string[]
+  env: string[]
+  env_any: string[][]
+}
+
+export interface SkillDependencyInstallOutcome {
+  success: boolean
+  complete: boolean
+  message: string
+  missingStill: SkillInstallMissingStill
+}
+
 export interface Skill {
   name: string
   description?: string
@@ -20,6 +100,8 @@ export interface Skill {
   triggers?: string[]
   missing_bins?: string[]
   missing_env?: string[]
+  missing_env_any?: string[][]
+  dependency_summary?: SkillDependencySummary
   install?: SkillInstall[]
   homepage?: string
   file_path?: string

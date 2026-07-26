@@ -1,9 +1,5 @@
 import i18n from '@/i18n'
-
-export interface RpcClientError extends Error {
-  code?: string
-  details?: unknown
-}
+import type { RpcClientError } from '@/lib/rpc'
 
 // Stable backend error codes (raised by gateway/rpc_onboarding.py) mapped to
 // i18n message keys. A code not listed here falls back to the raw English

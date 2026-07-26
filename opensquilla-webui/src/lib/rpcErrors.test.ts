@@ -28,7 +28,7 @@ describe('localizeRpcError', () => {
   it('localizes the lead in zh-Hans', async () => {
     await loadLocaleMessages('zh-Hans')
     i18n.global.locale.value = 'zh-Hans'
-    expect(localizeRpcError(rpcErr('onboarding.channel.not_found', 'gone'))).toContain('该频道已不存在')
+    expect(localizeRpcError(rpcErr('onboarding.channel.not_found', 'gone'))).toContain('该渠道已不存在')
   })
 })
 

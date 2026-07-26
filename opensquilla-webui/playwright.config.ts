@@ -23,13 +23,13 @@ export default defineConfig({
           ? { launchOptions: { executablePath: chromiumExecutablePath } }
           : {}),
       },
-      // The fold-authoritative spec sets its own opt-in flag; the default run
-      // stays on the legacy render so the rest of the suite proves the OFF/
-      // SHADOW path. The dedicated project below exercises the ON path.
+      // The fold-authoritative spec pins its flag explicitly and runs in the
+      // dedicated project below. The ordinary project excludes that live-only
+      // proof; production itself defaults to the fold unless explicitly set OFF.
       testIgnore: /fold-live-turn\.spec\.ts/,
     },
     {
-      // Fold-authoritative opt-in: drive the live-stream paths with the fold authoritative
+      // Fold-authoritative proof: drive the live-stream paths with the fold authoritative
       // (opensquilla.chat.foldLiveTurn=1, set per-page in the spec). The spec
       // attaches the `[live-turn parity]` hard-fail, so this project is the
       // deterministic proof the ON path renders byte-faithfully to legacy.

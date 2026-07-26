@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
 
+import opensquilla.gateway.subagent_announce as subagent_announce_module
 from opensquilla.gateway.subagent_announce import (
     _build_subagent_group_outcome,
     _build_terminal_group_payloads,
@@ -91,8 +93,9 @@ class _SessionManager:
         role: str,
         content: str,
         provenance: dict | None = None,
-    ) -> None:
+    ) -> SimpleNamespace:
         self.messages.append((key, role, content, provenance))
+        return SimpleNamespace(message_id=f"parent-message-{len(self.messages)}")
 
     async def get_session(self, key: str):
         return SimpleNamespace(session_key=key, last_channel=None, last_to=None)
@@ -135,6 +138,61 @@ def _clean_tracker():
     yield
     _tracker.evict(PARENT)
     set_background_completion_manager(None)
+
+
+@pytest.mark.asyncio
+async def test_completion_event_carries_persisted_message_id_without_polluting_business_payloads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    child = "agent:worker:subagent:message-id"
+    manager = _SessionManager(
+        [_SessionRow(child, status="done")],
+        tasks_by_session={},
+        transcripts={child: "child output"},
+    )
+    emitted: list[dict] = []
+    channel_payloads: list[dict] = []
+    wake_payloads: list[dict] = []
+
+    async def emit(_session_key: str, _event_name: str, payload: dict) -> None:
+        emitted.append(dict(payload))
+
+    async def capture_channel(payload: dict, **_kwargs) -> None:
+        channel_payloads.append(dict(payload))
+
+    async def capture_wake_payloads(_event, payload: dict, _parent_task_id, **_kwargs):
+        wake_payloads.append(dict(payload))
+        return []
+
+    monkeypatch.setattr(subagent_announce_module, "_announce_to_parent_channel", capture_channel)
+    monkeypatch.setattr(
+        subagent_announce_module,
+        "_build_parent_wake_payloads",
+        capture_wake_payloads,
+    )
+    _tracker.mark_closed(PARENT, PARENT_TASK)
+    event = SubagentCompletionEvent(
+        parent_session_key=PARENT,
+        child_session_key=child,
+        task_id="task-child",
+        status=AgentTaskStatus.SUCCEEDED,
+        terminal_reason="done",
+        agent_id="worker",
+        parent_task_id=PARENT_TASK,
+    )
+
+    await announce_subagent_completion(
+        event,
+        session_manager=manager,
+        event_emitter=emit,
+        channel_manager=object(),
+        task_runtime=_TaskRuntime(),
+    )
+
+    assert emitted[0]["message_id"] == "parent-message-1"
+    assert "message_id" not in json.loads(manager.messages[0][2])
+    assert "message_id" not in channel_payloads[0]
+    assert "message_id" not in wake_payloads[0]
 
 
 @pytest.mark.asyncio

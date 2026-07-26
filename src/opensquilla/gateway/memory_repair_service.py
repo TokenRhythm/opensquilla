@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import time
+import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,10 @@ import structlog
 
 from opensquilla.asyncio_utils import create_background_task
 from opensquilla.gateway.session_services import get_session_storage
+from opensquilla.observability.network_policy import (
+    provider_request_correlation_disabled,
+)
+from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.session.compaction_lifecycle import (
     flush_receipt_allows_destructive_compaction,
     flush_receipt_to_dict,
@@ -34,6 +39,39 @@ _REPAIR_BACKOFF_MS = {
     2: 30 * 60 * 1000,
     3: 6 * 60 * 60 * 1000,
 }
+
+
+def _build_repair_correlation(
+    session_id: object,
+    *,
+    enabled: bool,
+) -> tuple[str, ProviderRequestCorrelation | None]:
+    turn_id = f"maintenance_{uuid.uuid4().hex}"
+    if not enabled or not isinstance(session_id, str) or not session_id:
+        return turn_id, None
+    return (
+        turn_id,
+        ProviderRequestCorrelation(
+            session_id=session_id,
+            turn_id=turn_id,
+            execution_id=uuid.uuid4().hex,
+            call_kind="auxiliary.session_flush",
+        ),
+    )
+
+
+def _correlatable_repair_session_id(source: Any) -> str | None:
+    """Return a real durable session ID, excluding legacy repair namespaces."""
+
+    session_id = getattr(source, "session_id", None)
+    session_key = getattr(source, "session_key", None)
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    if session_id.startswith("legacy-raw:"):
+        return None
+    if isinstance(session_key, str) and ":memory-repair:legacy-raw" in session_key:
+        return None
+    return session_id
 
 
 def repair_receipt_path(receipt: Any) -> str | None:
@@ -271,42 +309,17 @@ async def list_repair_queue(
     if limit == 0:
         return []
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
-    conn = getattr(storage, "conn", None)
-    if conn is not None:
-        placeholders = ", ".join("?" for _ in _REPAIR_QUEUE_STATUSES)
-        due_clause = ""
-        params: list[Any] = [*_REPAIR_QUEUE_STATUSES]
-        if due_only:
-            due_clause = "AND (next_retry_at_ms IS NULL OR next_retry_at_ms <= ?)"
-            params.append(now_ms)
-        path_clause = ""
-        if path is not None:
-            path_clause = "AND (source_path = ? OR target_path = ?)"
-            params.extend((path, path))
-        agent_clause = ""
-        agent_prefix = _agent_session_key_prefix(agent_id)
-        if agent_prefix is not None:
-            agent_clause = "AND substr(session_key, 1, ?) = ?"
-            params.extend((len(agent_prefix), agent_prefix))
-        params.append(limit)
-        async with conn.execute(
-            f"""
-            SELECT * FROM memory_durable_receipts
-            WHERE status IN ({placeholders})
-            {due_clause}
-            {path_clause}
-            {agent_clause}
-            ORDER BY
-                next_retry_at_ms IS NOT NULL ASC,
-                next_retry_at_ms ASC,
-                created_at ASC,
-                rowid ASC
-            LIMIT ?
-            """,
-            params,
-        ) as cur:
-            sql_rows = await cur.fetchall()
-        return [MemoryDurableReceipt(**dict(row)) for row in sql_rows]
+    list_repair_receipts = getattr(storage, "list_memory_repair_receipts", None)
+    if callable(list_repair_receipts):
+        return list(
+            await list_repair_receipts(
+                statuses=_REPAIR_QUEUE_STATUSES,
+                limit=limit,
+                due_before_ms=now_ms if due_only else None,
+                path=path,
+                session_key_prefix=_agent_session_key_prefix(agent_id),
+            )
+        )
 
     list_receipts = getattr(storage, "list_memory_durable_receipts", None)
     if not callable(list_receipts):
@@ -357,36 +370,14 @@ async def claim_repair_receipt(
     receipt_id = getattr(receipt, "receipt_id", None)
     if not receipt_id:
         return None
-    conn = getattr(storage, "conn", None)
-    if conn is not None:
-        placeholders = ", ".join("?" for _ in _REPAIR_QUEUE_STATUSES)
-        cursor = await conn.execute(
-            f"""
-            UPDATE memory_durable_receipts
-            SET status = ?, updated_at = ?
-            WHERE receipt_id = ?
-              AND status IN ({placeholders})
-              AND (next_retry_at_ms IS NULL OR next_retry_at_ms <= ?)
-            """,
-            (
-                _REPAIR_RUNNING_STATUS,
-                now_ms,
-                receipt_id,
-                *_REPAIR_QUEUE_STATUSES,
-                now_ms,
-            ),
+    claim = getattr(storage, "claim_memory_repair_receipt", None)
+    if callable(claim):
+        return await claim(
+            receipt_id,
+            eligible_statuses=_REPAIR_QUEUE_STATUSES,
+            claimed_status=_REPAIR_RUNNING_STATUS,
+            now_ms=now_ms,
         )
-        await conn.commit()
-        if getattr(cursor, "rowcount", 0) != 1:
-            return None
-        async with conn.execute(
-            "SELECT * FROM memory_durable_receipts WHERE receipt_id = ?",
-            (receipt_id,),
-        ) as cur:
-            row = await cur.fetchone()
-        if row is None or dict(row).get("status") != _REPAIR_RUNNING_STATUS:
-            return None
-        return MemoryDurableReceipt(**dict(row))
 
     if getattr(receipt, "status", None) not in _REPAIR_QUEUE_STATUSES:
         return None
@@ -405,30 +396,19 @@ async def recover_stale_repair_claims(
     now_ms: int | None = None,
 ) -> int:
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
-    conn = getattr(storage, "conn", None)
-    if conn is None:
+    recover = getattr(storage, "recover_stale_memory_repair_claims", None)
+    if not callable(recover):
         return 0
-    cursor = await conn.execute(
-        """
-        UPDATE memory_durable_receipts
-        SET status = ?,
-            reason = ?,
-            next_retry_at_ms = ?,
-            updated_at = ?
-        WHERE status = ?
-          AND updated_at <= ?
-        """,
-        (
-            "repair_pending",
-            "stale_repair_claim",
-            now_ms + _REPAIR_BACKOFF_MS[1],
-            now_ms,
-            _REPAIR_RUNNING_STATUS,
-            now_ms - _REPAIR_CLAIM_STALE_MS,
-        ),
+    return int(
+        await recover(
+            running_status=_REPAIR_RUNNING_STATUS,
+            pending_status="repair_pending",
+            stale_before_ms=now_ms - _REPAIR_CLAIM_STALE_MS,
+            next_retry_at_ms=now_ms + _REPAIR_BACKOFF_MS[1],
+            updated_at_ms=now_ms,
+            reason="stale_repair_claim",
+        )
     )
-    await conn.commit()
-    return int(getattr(cursor, "rowcount", 0) or 0)
 
 
 async def _repair_receipt_exists_for_path(
@@ -438,23 +418,11 @@ async def _repair_receipt_exists_for_path(
     agent_id: str | None = None,
 ) -> bool:
     agent_prefix = _agent_session_key_prefix(agent_id)
-    conn = getattr(storage, "conn", None)
-    if conn is not None:
-        agent_clause = ""
-        params: list[Any] = [path, path]
-        if agent_prefix is not None:
-            agent_clause = "AND substr(session_key, 1, ?) = ?"
-            params.extend((len(agent_prefix), agent_prefix))
-        async with conn.execute(
-            f"""
-            SELECT 1 FROM memory_durable_receipts
-            WHERE (source_path = ? OR target_path = ?)
-            {agent_clause}
-            LIMIT 1
-            """,
-            params,
-        ) as cur:
-            return await cur.fetchone() is not None
+    exists_for_path = getattr(storage, "memory_durable_receipt_exists_for_path", None)
+    if callable(exists_for_path):
+        return bool(
+            await exists_for_path(path, session_key_prefix=agent_prefix)
+        )
 
     list_receipts = getattr(storage, "list_memory_durable_receipts", None)
     if not callable(list_receipts):
@@ -591,6 +559,7 @@ async def repair_compaction_source(
     session_manager: Any,
     flush_service: Any,
     agent_id: str,
+    provider_request_correlation_enabled: bool = True,
 ) -> dict[str, Any]:
     get_preimage = getattr(session_manager, "get_compaction_preimage", None)
     mark_status = getattr(session_manager, "mark_compaction_repair_status", None)
@@ -602,6 +571,10 @@ async def repair_compaction_source(
     if not entries:
         await mark_status(summary, "failed_retryable")
         return {**base, **metadata, "status": "failed_retryable", "reason": "missing_preimage"}
+    repair_turn_id, correlation = _build_repair_correlation(
+        _correlatable_repair_session_id(summary),
+        enabled=provider_request_correlation_enabled,
+    )
     try:
         receipt = await flush_service.execute(
             entries,
@@ -610,6 +583,8 @@ async def repair_compaction_source(
             message_window=0,
             segment_mode="auto",
             raw_capture_policy="off",
+            turn_id=repair_turn_id,
+            provider_request_correlation=correlation,
         )
     except Exception as exc:  # noqa: BLE001
         await mark_status(summary, "failed_retryable")
@@ -626,6 +601,8 @@ async def repair_raw_fallback_source(
     *,
     flush_service: Any,
     agent_id: str,
+    turn_id: str | None = None,
+    provider_request_correlation: ProviderRequestCorrelation | None = None,
 ) -> dict[str, Any]:
     rel_path = raw_fallback_rel_path(str(row.get("path") or ""))
     raw_path = (root / rel_path).resolve()
@@ -642,14 +619,23 @@ async def repair_raw_fallback_source(
         _write_raw_repair_status(raw_path, status="failed_retryable", reason="empty_raw_excerpt")
         return {**base, "status": "failed_retryable", "reason": "empty_raw_excerpt"}
     raw_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+    flush_kwargs: dict[str, Any] = {
+        "agent_id": agent_id,
+        "message_window": 0,
+        "segment_mode": "auto",
+        "raw_capture_policy": "off",
+    }
+    if turn_id is not None:
+        flush_kwargs["turn_id"] = turn_id
+    if provider_request_correlation is not None:
+        flush_kwargs["provider_request_correlation"] = (
+            provider_request_correlation
+        )
     try:
         receipt = await flush_service.execute(
             entries,
             f"raw-fallback:{raw_hash}",
-            agent_id=agent_id,
-            message_window=0,
-            segment_mode="auto",
-            raw_capture_policy="off",
+            **flush_kwargs,
         )
     except Exception as exc:  # noqa: BLE001
         _write_raw_repair_status(raw_path, status="failed_retryable", reason=type(exc).__name__)
@@ -667,6 +653,7 @@ async def repair_durable_receipt_source(
     root: Path,
     flush_service: Any,
     agent_id: str,
+    provider_request_correlation_enabled: bool = True,
 ) -> dict[str, Any]:
     base = repair_receipt_to_wire(receipt)
     path = repair_receipt_path(receipt)
@@ -675,11 +662,17 @@ async def repair_durable_receipt_source(
     claimed = await claim_repair_receipt(storage, receipt)
     if claimed is None:
         return {**base, "status": "skipped", "reason": "repair_already_claimed"}
+    repair_turn_id, correlation = _build_repair_correlation(
+        _correlatable_repair_session_id(receipt),
+        enabled=provider_request_correlation_enabled,
+    )
     result = await repair_raw_fallback_source(
         root,
         {**base, "path": path},
         flush_service=flush_service,
         agent_id=agent_id,
+        turn_id=repair_turn_id,
+        provider_request_correlation=correlation,
     )
     if result.get("status") == "repaired":
         await mark_repair_attempt_done(storage, claimed)
@@ -702,6 +695,7 @@ async def run_memory_repair_once(
     limit: int,
     params: Mapping[str, Any] | None = None,
     scan_limit: int = 200,
+    provider_request_correlation_enabled: bool = True,
 ) -> list[dict[str, Any]]:
     params = params or {}
     agent_id = normalize_agent_id(agent_id)
@@ -728,6 +722,9 @@ async def run_memory_repair_once(
                     session_manager=session_manager,
                     flush_service=flush_service,
                     agent_id=agent_id,
+                    provider_request_correlation_enabled=(
+                        provider_request_correlation_enabled
+                    ),
                 )
             )
         return results
@@ -765,6 +762,9 @@ async def run_memory_repair_once(
                 root=root,
                 flush_service=flush_service,
                 agent_id=agent_id,
+                provider_request_correlation_enabled=(
+                    provider_request_correlation_enabled
+                ),
             )
             if result.get("reason") == "repair_already_claimed":
                 continue
@@ -789,6 +789,9 @@ async def run_memory_repair_once(
                 session_manager=session_manager,
                 flush_service=flush_service,
                 agent_id=agent_id,
+                provider_request_correlation_enabled=(
+                    provider_request_correlation_enabled
+                ),
             )
         )
 
@@ -825,6 +828,8 @@ class MemoryRepairService:
         interval_seconds: float = 60.0,
         max_items_per_tick: int = 5,
         enabled: bool = True,
+        usage_event_sink: Any | None = None,
+        config: Any | None = None,
     ) -> None:
         self._session_manager = session_manager
         self._flush_service = flush_service
@@ -836,6 +841,8 @@ class MemoryRepairService:
         self._interval_seconds = max(float(interval_seconds), 0.01)
         self._max_items_per_tick = max(int(max_items_per_tick), 1)
         self._enabled = enabled
+        self._usage_event_sink = usage_event_sink
+        self._config = config
         self._task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
 
@@ -866,15 +873,45 @@ class MemoryRepairService:
         for current_agent_id in agent_ids:
             if len(results) >= limit_value:
                 break
-            results.extend(
-                await run_memory_repair_once(
-                    session_manager=self._session_manager,
-                    flush_service=self._flush_service,
-                    memory_roots=self._memory_roots,
-                    agent_id=current_agent_id,
-                    limit=limit_value - len(results),
+            usage_scope = None
+            if self._usage_event_sink is not None:
+                from opensquilla.engine.usage_accounting import (
+                    UsageAccountingScope,
+                    UsageExecutionContext,
                 )
-            )
+
+                execution_id = uuid.uuid4().hex
+                usage_scope = UsageAccountingScope(
+                    sink=self._usage_event_sink,
+                    context=UsageExecutionContext(
+                        execution_id=execution_id,
+                        agent_run_id=execution_id,
+                        turn_id=execution_id,
+                        session_id=uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            f"opensquilla:system:memory-repair:{current_agent_id}",
+                        ).hex,
+                        agent_id=current_agent_id,
+                        run_kind="memory_repair",
+                    ),
+                )
+            from opensquilla.engine.usage_accounting import bind_usage_accounting_scope
+
+            with bind_usage_accounting_scope(usage_scope):
+                results.extend(
+                    await run_memory_repair_once(
+                        session_manager=self._session_manager,
+                        flush_service=self._flush_service,
+                        memory_roots=self._memory_roots,
+                        agent_id=current_agent_id,
+                        limit=limit_value - len(results),
+                        provider_request_correlation_enabled=(
+                            not provider_request_correlation_disabled(
+                                config=self._config
+                            )
+                        ),
+                    )
+                )
         return results[:limit_value]
 
     async def _loop(self) -> None:

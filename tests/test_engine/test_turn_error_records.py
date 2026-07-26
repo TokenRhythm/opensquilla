@@ -7,7 +7,9 @@ sqlite file with real migrations.
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
+import threading
 from pathlib import Path
 
 from opensquilla.engine.runtime import TurnRunner
@@ -79,6 +81,62 @@ async def test_writer_failure_does_not_mask_error(tmp_path) -> None:
     error_events = [event for event in events if isinstance(event, ErrorEvent)]
     assert len(error_events) == 1
     assert error_events[0].message  # original error still surfaced
+
+
+async def test_locked_error_writer_does_not_block_event_loop(tmp_path) -> None:
+    db = str(tmp_path / "sessions.sqlite")
+    apply_pending(db, MIGRATIONS_DIR)
+    writer = open_turn_error_writer(db)
+    write_started = threading.Event()
+
+    class _SignalingWriter:
+        def record_error(self, record):
+            write_started.set()
+            return writer.record_error(record)
+
+    blocker = sqlite3.connect(db, check_same_thread=False, isolation_level=None)
+    blocker.execute("PRAGMA journal_mode = WAL")
+    blocker.execute("BEGIN IMMEDIATE")
+    release_lock = threading.Timer(0.6, blocker.rollback)
+    runner = TurnRunner(
+        provider_selector=_ExplodingSelector(),
+        turn_error_writer=_SignalingWriter(),
+    )
+    loop = asyncio.get_running_loop()
+    record_task = asyncio.create_task(
+        runner._record_turn_error(
+            session_key="agent:main:test:locked",
+            turn_id="turn-locked",
+            session_id=None,
+            surface="test",
+            error_class="synthetic_error",
+            message="synthetic writer contention",
+            exc=RuntimeError("synthetic writer contention"),
+            provider=None,
+            model=None,
+            fallback_hops=0,
+        )
+    )
+    release_lock.start()
+    try:
+        # A synchronous record_error call would hold the event loop until the
+        # timer releases SQLite's writer lock. Polling can only make progress
+        # while the writer is waiting in a worker thread.
+        deadline = loop.time() + 0.3
+        while not write_started.is_set() and not record_task.done() and loop.time() < deadline:
+            await asyncio.sleep(0.01)
+        assert write_started.is_set()
+        assert not record_task.done()
+
+        error_id = await asyncio.wait_for(record_task, timeout=2)
+        assert error_id
+        assert len(_rows(db)) == 1
+    finally:
+        release_lock.cancel()
+        if blocker.in_transaction:
+            blocker.rollback()
+        blocker.close()
+        writer.close()
 
 
 async def test_no_writer_yields_error_without_ref(tmp_path) -> None:

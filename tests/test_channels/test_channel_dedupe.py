@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import time
 
 import pytest
 
@@ -11,9 +14,20 @@ from opensquilla.channels.types import IncomingMessage
 
 
 class _BodyRequest:
-    def __init__(self, payload: dict) -> None:
+    def __init__(self, payload: dict, *, signing_secret: str | None = None) -> None:
         self._body = json.dumps(payload).encode()
         self.headers: dict[str, str] = {}
+        if signing_secret is not None:
+            timestamp = str(int(time.time()))
+            signature = hmac.new(
+                signing_secret.encode(),
+                f"v0:{timestamp}:".encode() + self._body,
+                hashlib.sha256,
+            ).hexdigest()
+            self.headers = {
+                "X-Slack-Request-Timestamp": timestamp,
+                "X-Slack-Signature": f"v0={signature}",
+            }
 
     async def body(self) -> bytes:
         return self._body
@@ -21,7 +35,12 @@ class _BodyRequest:
 
 @pytest.mark.asyncio
 async def test_slack_webhook_dedupes_retried_event_callback() -> None:
-    channel = SlackChannel(token="xoxb-test", slack_channel_id="C1")
+    signing_secret = "signing-secret"
+    channel = SlackChannel(
+        token="xoxb-test",
+        slack_channel_id="C1",
+        signing_secret=signing_secret,
+    )
     payload = {
         "type": "event_callback",
         "event_id": "Ev123",
@@ -35,11 +54,35 @@ async def test_slack_webhook_dedupes_retried_event_callback() -> None:
         },
     }
 
-    await channel._handle_webhook(_BodyRequest(payload))  # noqa: SLF001
-    await channel._handle_webhook(_BodyRequest(payload))  # noqa: SLF001
+    await channel._handle_webhook(  # noqa: SLF001
+        _BodyRequest(payload, signing_secret=signing_secret)
+    )
+    await channel._handle_webhook(  # noqa: SLF001
+        _BodyRequest(payload, signing_secret=signing_secret)
+    )
 
     assert channel._queue.qsize() == 1  # noqa: SLF001
     assert (await channel.receive()).content == "draw an image"
+
+
+@pytest.mark.asyncio
+async def test_slack_webhook_without_signing_secret_fails_closed() -> None:
+    channel = SlackChannel(token="xoxb-test", slack_channel_id="C1")
+    payload = {
+        "type": "event_callback",
+        "event": {
+            "type": "message",
+            "user": "U1",
+            "channel": "C1",
+            "text": "unsigned input",
+            "ts": "1710000000.000100",
+        },
+    }
+
+    response = await channel._handle_webhook(_BodyRequest(payload))  # noqa: SLF001
+
+    assert response.status_code == 503
+    assert channel._queue.empty()  # noqa: SLF001
 
 
 @pytest.mark.asyncio

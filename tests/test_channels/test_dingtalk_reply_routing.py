@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any
@@ -7,6 +8,7 @@ from typing import Any
 import pytest
 
 from opensquilla.channels.dingtalk import DingTalkChannel, DingTalkChannelConfig
+from opensquilla.channels.types import IngressVerification
 
 
 def _sdk_message(msg_id: str, conversation_id: str, sender_id: str, webhook: str) -> Any:
@@ -58,6 +60,23 @@ def test_dingtalk_streaming_reply_kwargs_pin_triggering_message() -> None:
 
     assert incoming is not None
     assert channel.streaming_reply_kwargs(incoming) == {"reply_msg_id": "msg-1"}
+    assert incoming.provenance.verification == IngressVerification.SDK_SESSION
+    assert incoming.provenance.principal is not None
+    assert incoming.provenance.principal.subject_id == "staff-1"
+
+
+async def test_dingtalk_session_webhook_expiry_fails_closed() -> None:
+    channel = DingTalkChannel(DingTalkChannelConfig(name="dingtalk"))
+    raw = _sdk_message(
+        "msg-expired", "conv-expired", "staff", "https://example.invalid/expired"
+    )
+    raw.sessionWebhookExpiredTime = int((time.time() - 1) * 1000)
+    incoming = channel.parse_message(raw)
+    assert incoming is not None
+    channel._handler = SimpleNamespace(reply_text=lambda *_args: None)
+
+    with pytest.raises(RuntimeError, match="reply context.*expired"):
+        await channel.send(channel.build_reply_message("late", incoming))
 
 
 async def test_dingtalk_expired_explicit_reply_context_fails_closed() -> None:

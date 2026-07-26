@@ -4,8 +4,9 @@ Executes requests through ``sandbox-exec`` with a generated SBPL profile.
 Seatbelt is not a Linux namespace equivalent: paths stay as host paths, there
 is no PID/user namespace, and V1 intentionally supports only host network or
 no network. The profile is still deny-by-default for filesystem and network
-access, with explicit read/write allowances for the workspace, configured
-mounts, system runtime paths, and a backend-owned temporary directory.
+access, with read/write allowances compiled from the shared filesystem
+profile plus private worker runtime transport and backend-owned temporary
+directories.
 """
 
 from __future__ import annotations
@@ -19,14 +20,17 @@ import re
 import shutil
 import signal
 import sys
+import sysconfig
 import tempfile
 import time
-from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePath
 from typing import Any, cast
 
 from opensquilla.sandbox.backend.base import Backend
+from opensquilla.sandbox.backend.filesystem_worker_policy import (
+    build_filesystem_worker_policy,
+)
 from opensquilla.sandbox.managed_proxy_env import managed_proxy_env
 from opensquilla.sandbox.operation_runtime import (
     SANDBOX_FILESYSTEM_WRITE_KINDS,
@@ -35,17 +39,15 @@ from opensquilla.sandbox.operation_runtime import (
     SandboxOperationDomain,
     SandboxOperationResult,
 )
+from opensquilla.sandbox.permissions import FileSystemAccess, FileSystemPermissionProfile
 from opensquilla.sandbox.run_mode import normalize_run_mode
 from opensquilla.sandbox.types import (
-    MountSpec,
     NetworkMode,
     NetworkProxySpec,
-    ResourceLimits,
     SandboxBackendError,
     SandboxPolicy,
     SandboxRequest,
     SandboxResult,
-    SecurityLevel,
 )
 
 log = logging.getLogger(__name__)
@@ -53,6 +55,24 @@ log = logging.getLogger(__name__)
 _SANDBOX_EXEC_NAME = "sandbox-exec"
 _SANDBOX_EXEC_SYSTEM_PATH = Path("/usr/bin/sandbox-exec")
 _FILESYSTEM_WORKER_MODULE = "opensquilla.sandbox.filesystem_worker"
+_FILESYSTEM_PATH_OPERATION_KINDS = frozenset(
+    {
+        "read_file",
+        "list_dir",
+        "glob_search",
+        "grep_search",
+        "write_text",
+        "edit_text",
+    }
+)
+_FILESYSTEM_OPERATION_KINDS = _FILESYSTEM_PATH_OPERATION_KINDS | {"apply_patch"}
+_FILESYSTEM_WORKER_ENV_ALLOWLIST = (
+    "PATH",
+    "PYTHONPATH",
+    "PYTHONDONTWRITEBYTECODE",
+    "LANG",
+    "LC_ALL",
+)
 _OUTPUT_BYTE_CAP = 1_048_576
 _TERMINATE_GRACE_S = 2.0
 
@@ -137,9 +157,31 @@ _SEATBELT_NETWORK_POLICY = """; allow safe AF_SYSTEM sockets used for local plat
   (sysctl-name-regex #"^net.routetable"))
 """
 
-_TMP_RW_PATHS: tuple[Path, ...] = (Path("/tmp"),)
 _PROTECTED_SUBPATH_NAMES = (".git", ".codex", ".agents")
 _SEATBELT_LOOPBACK_PROXY_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+@dataclass(frozen=True)
+class _SeatbeltPrivateTransport:
+    read_roots: tuple[Path, ...] = ()
+    write_roots: tuple[Path, ...] = ()
+
+    def extended(
+        self,
+        *,
+        read_roots: tuple[Path, ...] = (),
+        write_roots: tuple[Path, ...] = (),
+    ) -> _SeatbeltPrivateTransport:
+        return _SeatbeltPrivateTransport(
+            read_roots=(*self.read_roots, *read_roots),
+            write_roots=(*self.write_roots, *write_roots),
+        )
+
+
+@dataclass(frozen=True)
+class _FilesystemWorkerLaunch:
+    request: SandboxRequest
+    private_transport: _SeatbeltPrivateTransport
 
 
 def _sandbox_exec_binary(binary: str | None = None) -> str | None:
@@ -151,10 +193,16 @@ def _sandbox_exec_binary(binary: str | None = None) -> str | None:
 
 
 def _validate_mount_path(path: PurePath, *, kind: str) -> None:
+    if _has_disallowed_path_character(path):
+        raise SandboxBackendError(f"{kind} path contains a control character: {path!r}")
     if not path.is_absolute():
         raise SandboxBackendError(f"{kind} path must be absolute: {path!r}")
     if any(part == ".." for part in path.parts):
         raise SandboxBackendError(f"{kind} path contains '..': {path!r}")
+
+
+def _has_disallowed_path_character(path: PurePath) -> bool:
+    return any(ord(character) < 0x20 or ord(character) == 0x7F for character in str(path))
 
 
 def _validate_request(request: SandboxRequest) -> None:
@@ -187,26 +235,6 @@ def _literal(path: Path) -> str:
 
 def _subpath(path: Path) -> str:
     return f"(subpath {_scheme_string(str(path))})"
-
-
-def _unique_existing(paths: Iterable[Path]) -> list[Path]:
-    seen: set[str] = set()
-    result: list[Path] = []
-    for path in paths:
-        candidates = [path]
-        try:
-            resolved = path.resolve(strict=False)
-        except OSError:
-            resolved = path
-        if resolved != path:
-            candidates.append(resolved)
-        for candidate in candidates:
-            key = str(candidate)
-            if key in seen or not candidate.exists():
-                continue
-            seen.add(key)
-            result.append(candidate)
-    return result
 
 
 def seatbelt_env_for_policy(
@@ -273,17 +301,50 @@ def _protected_metadata_regex(root: Path, name: str) -> str:
     return f"^{escaped_root}/{escaped_name}(/.*)?$"
 
 
-def _write_rules(paths: Iterable[Path]) -> list[str]:
-    rules: list[str] = []
-    for root in _unique_existing(paths):
-        if root.is_file():
+def _seatbelt_path(path: PurePath) -> Path:
+    candidate = Path(str(path))
+    if _has_disallowed_path_character(candidate):
+        raise SandboxBackendError(
+            f"filesystem profile path contains a control character: {candidate!r}"
+        )
+    _validate_mount_path(candidate, kind="filesystem profile")
+    return candidate
+
+
+def _unique_seatbelt_paths(paths: tuple[PurePath, ...]) -> tuple[Path, ...]:
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        candidate = _seatbelt_path(path)
+        key = str(candidate)
+        if key in seen:
             continue
-        require_parts = [_subpath(root)]
+        seen.add(key)
+        unique.append(candidate)
+    return tuple(unique)
+
+
+def _seatbelt_access_rule(
+    action: str,
+    root: Path,
+    excluded: tuple[Path, ...],
+) -> str:
+    if action not in {"file-read*", "file-write*"}:
+        raise ValueError(f"unsupported Seatbelt filesystem action: {action!r}")
+    root = _seatbelt_path(root)
+    excluded = _unique_seatbelt_paths(excluded)
+    guards: list[str] = []
+    for path in excluded:
+        guards.append(f"(require-not {_literal(path)})")
+        guards.append(f"(require-not {_subpath(path)})")
+    if action == "file-write*":
         for name in _PROTECTED_SUBPATH_NAMES:
             regex = _regex_string(_protected_metadata_regex(root, name))
-            require_parts.append(f'(require-not (regex #"{regex}"))')
-        rules.append(f"(allow file-write* (require-all {' '.join(require_parts)}))")
-    return rules
+            guards.append(f'(require-not (regex #"{regex}"))')
+    guard_suffix = f" {' '.join(guards)}" if guards else ""
+    exact = f"(require-all {_literal(root)}{guard_suffix})"
+    descendants = f"(require-all {_subpath(root)}{guard_suffix})"
+    return f"(allow {action} {exact} {descendants})"
 
 
 def _seatbelt_proxy_endpoint(proxy: NetworkProxySpec) -> str:
@@ -305,26 +366,126 @@ def _network_proxy_rule(proxy: NetworkProxySpec) -> str:
     return f"(allow network-outbound (remote ip {_scheme_string(endpoint)}))"
 
 
-def _tmp_write_paths(tmp_dir: Path | None) -> list[Path]:
-    paths: list[Path] = []
-    if tmp_dir is not None:
-        paths.append(tmp_dir)
-    paths.extend(_TMP_RW_PATHS)
-    env_tmp = os.environ.get("TMPDIR")
-    if env_tmp:
-        candidate = Path(env_tmp)
-        if candidate.is_absolute():
-            paths.append(candidate)
-    return paths
+def _filesystem_profile(policy: SandboxPolicy) -> FileSystemPermissionProfile:
+    profile = policy.file_system
+    if profile is None:
+        log.error("sandbox.seatbelt_filesystem_profile_missing: deny all filesystem access")
+        return FileSystemPermissionProfile(entries=())
+    _validate_filesystem_profile_paths(profile)
+    if profile.denied_read_globs:
+        log.error(
+            "sandbox.seatbelt_denied_glob_unsupported: patterns=%r",
+            profile.denied_read_globs,
+        )
+        raise SandboxBackendError("seatbelt cannot safely enforce denied read glob rules")
+    return profile
 
 
-def render_seatbelt_profile(
+def _validate_filesystem_profile_paths(profile: FileSystemPermissionProfile) -> None:
+    for entry in profile.entries:
+        _seatbelt_path(entry.path)
+
+
+def _profile_roots(
+    profile: FileSystemPermissionProfile,
+    accesses: frozenset[FileSystemAccess],
+) -> tuple[Path, ...]:
+    return _unique_seatbelt_paths(
+        tuple(entry.path for entry in profile.effective_entries if entry.access in accesses)
+    )
+
+
+def _profile_exclusions(
+    profile: FileSystemPermissionProfile,
+    root: Path,
+    accesses: frozenset[FileSystemAccess],
+) -> tuple[Path, ...]:
+    excluded: list[PurePath] = []
+    for entry in profile.effective_entries:
+        if entry.access not in accesses:
+            continue
+        path = _seatbelt_path(entry.path)
+        if path.is_relative_to(root):
+            excluded.append(path)
+    return _unique_seatbelt_paths(tuple(excluded))
+
+
+def _private_transport_exclusions(
+    profile: FileSystemPermissionProfile,
+    root: Path,
+    accesses: frozenset[FileSystemAccess],
+) -> tuple[Path, ...]:
+    if profile.is_explicitly_denied(root):
+        raise SandboxBackendError(
+            f"seatbelt private transport root is explicitly denied by filesystem profile: {root}"
+        )
+    return _profile_exclusions(profile, root, accesses)
+
+
+def _profile_read_rules(profile: FileSystemPermissionProfile) -> list[str]:
+    read_roots = list(
+        _profile_roots(
+            profile,
+            frozenset({FileSystemAccess.READ, FileSystemAccess.WRITE}),
+        )
+    )
+    root = Path("/")
+    if profile.has_full_disk_read_baseline and root not in read_roots:
+        read_roots.insert(0, root)
+    denied = frozenset({FileSystemAccess.DENY})
+    return [
+        _seatbelt_access_rule(
+            "file-read*",
+            read_root,
+            _profile_exclusions(profile, read_root, denied),
+        )
+        for read_root in read_roots
+    ]
+
+
+def _profile_write_rules(profile: FileSystemPermissionProfile) -> list[str]:
+    write_roots = list(_profile_roots(profile, frozenset({FileSystemAccess.WRITE})))
+    root = Path("/")
+    if profile.default_access is FileSystemAccess.WRITE and root not in write_roots:
+        write_roots.insert(0, root)
+    carveouts = frozenset({FileSystemAccess.READ, FileSystemAccess.DENY})
+    return [
+        _seatbelt_access_rule(
+            "file-write*",
+            write_root,
+            _profile_exclusions(profile, write_root, carveouts),
+        )
+        for write_root in write_roots
+    ]
+
+
+def _private_transport_roots(
+    private_transport: _SeatbeltPrivateTransport | None,
+    *,
+    require_exists: bool,
+) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+    if private_transport is None:
+        return (), ()
+    readable = _unique_seatbelt_paths(private_transport.read_roots)
+    writable = _unique_seatbelt_paths(private_transport.write_roots)
+    if require_exists:
+        for root in (*readable, *writable):
+            if not root.exists():
+                raise SandboxBackendError(
+                    f"seatbelt private transport root is missing on host: {root!r}"
+                )
+    return readable, writable
+
+
+def _render_seatbelt_profile(
     request: SandboxRequest,
     *,
-    tmp_dir: Path | None = None,
+    private_transport: _SeatbeltPrivateTransport | None,
+    require_private_roots: bool = True,
 ) -> str:
     """Render a deny-by-default SBPL profile for ``request``."""
     policy = request.policy
+    file_system = _filesystem_profile(policy)
     if policy.network == NetworkMode.PROXY_ALLOWLIST:
         if policy.network_proxy is None:
             raise SandboxBackendError(
@@ -332,36 +493,35 @@ def render_seatbelt_profile(
                 "for the seatbelt backend"
             )
 
-    write_paths: list[Path] = []
-    workspace = next(
-        (m for m in policy.mounts if m.sandbox_path.as_posix() == "/workspace"),
-        None,
-    )
-    if workspace is not None:
-        if workspace.mode == "rw" or policy.workspace_rw:
-            write_paths.append(workspace.host_path)
-
-    for spec in policy.mounts:
-        if spec is workspace:
-            continue
-        if not spec.host_path.exists():
-            if spec.required:
-                raise SandboxBackendError(
-                    f"required mount missing on host: {spec.host_path!r}"
-                )
-            log.debug("sandbox.seatbelt_mount_skipped: %s (not present)", spec.host_path)
-            continue
-        if spec.mode == "rw":
-            write_paths.append(spec.host_path)
-
-    if policy.tmp_writable:
-        write_paths.extend(_tmp_write_paths(tmp_dir))
-
     lines: list[str] = [
         _SEATBELT_BASE_POLICY.rstrip(),
         "; allow read-only file operations",
-        "(allow file-read*)",
     ]
+    lines.extend(_profile_read_rules(file_system))
+    lines.extend(_profile_write_rules(file_system))
+
+    private_read_roots, private_write_roots = _private_transport_roots(
+        private_transport,
+        require_exists=require_private_roots,
+    )
+    denied = frozenset({FileSystemAccess.DENY})
+    lines.extend(
+        _seatbelt_access_rule(
+            "file-read*",
+            root,
+            _private_transport_exclusions(file_system, root, denied),
+        )
+        for root in private_read_roots
+    )
+    carveouts = frozenset({FileSystemAccess.READ, FileSystemAccess.DENY})
+    for root in private_write_roots:
+        exclusions = _private_transport_exclusions(file_system, root, carveouts)
+        if root in exclusions:
+            raise SandboxBackendError(
+                f"seatbelt private transport root is explicitly read-only: {root}"
+            )
+        lines.append(_seatbelt_access_rule("file-write*", root, exclusions))
+
     if policy.network == NetworkMode.NONE:
         lines.append("(deny network*)")
     elif policy.network == NetworkMode.HOST:
@@ -379,8 +539,24 @@ def render_seatbelt_profile(
     else:  # pragma: no cover - exhaustive guard for future enum values
         raise SandboxBackendError(f"unsupported seatbelt network mode: {policy.network!r}")
 
-    lines.extend(_write_rules(write_paths))
     return "\n".join(lines) + "\n"
+
+
+def render_seatbelt_profile(
+    request: SandboxRequest,
+    *,
+    tmp_dir: Path | None = None,
+) -> str:
+    """Render a public request without backend-private transport grants."""
+    private_transport = (
+        _SeatbeltPrivateTransport(read_roots=(tmp_dir,), write_roots=(tmp_dir,))
+        if tmp_dir is not None
+        else None
+    )
+    return _render_seatbelt_profile(
+        request,
+        private_transport=private_transport,
+    )
 
 
 def _render_sbpl_skeleton(policy: SandboxPolicy) -> str:
@@ -420,128 +596,296 @@ def _filesystem_request(operation: SandboxOperation) -> FilesystemOperationReque
     return operation.request
 
 
-def _filesystem_operation_payload_path(workspace: Path) -> Path:
-    return workspace / ".opensquilla-cache" / "fs-worker" / f"{time.monotonic_ns()}.json"
+def _canonical_filesystem_target(path: Path, *, kind: str) -> Path:
+    if _has_disallowed_path_character(path):
+        raise SandboxBackendError(
+            f"{kind} path contains a control character: {path!r}"
+        )
+    _validate_mount_path(path, kind=kind)
+    try:
+        return path.expanduser().resolve(strict=False)
+    except OSError as exc:
+        raise SandboxBackendError(f"could not canonicalize {kind} path {path}: {exc}") from exc
+
+
+def _filesystem_operation_targets(
+    operation: SandboxOperation,
+    request: FilesystemOperationRequest,
+) -> tuple[Path, ...]:
+    targets: tuple[Path, ...]
+    if operation.kind in _FILESYSTEM_PATH_OPERATION_KINDS:
+        if request.path is None:
+            raise SandboxBackendError(
+                f"filesystem operation {operation.kind} requires path"
+            )
+        targets = (
+            _canonical_filesystem_target(request.path, kind="filesystem target"),
+        )
+    elif operation.kind == "apply_patch":
+        if request.root is None:
+            raise SandboxBackendError("filesystem operation apply_patch requires root")
+        root = _canonical_filesystem_target(request.root, kind="apply_patch root")
+        try:
+            from opensquilla.tools.builtin import patch as patch_tool
+
+            targets = tuple(
+                dict.fromkeys(
+                    patch_tool._validate_path(patch_op.path, root)
+                    for patch_op in patch_tool._parse_patch(request.patch)
+                )
+            )
+        except Exception as exc:
+            raise SandboxBackendError(f"invalid apply_patch targets: {exc}") from exc
+    else:
+        raise SandboxBackendError(
+            f"unsupported filesystem operation: {operation.kind!r}"
+        )
+
+    declared = tuple(
+        dict.fromkeys(
+            _canonical_filesystem_target(path, kind="declared filesystem target")
+            for path in request.paths
+        )
+    )
+    if set(declared) != set(targets):
+        raise SandboxBackendError(
+            "declared filesystem paths do not match derived operation targets: "
+            f"declared={tuple(str(path) for path in declared)!r}, "
+            f"derived={tuple(str(path) for path in targets)!r}"
+        )
+    return targets
+
+
+def _filesystem_operation_launch(
+    operation: SandboxOperation,
+) -> _FilesystemWorkerLaunch:
+    if operation.workspace is None:
+        raise SandboxBackendError("filesystem operation is missing workspace")
+    workspace = _canonical_filesystem_target(operation.workspace, kind="workspace")
+    if not workspace.exists():
+        raise SandboxBackendError(f"filesystem operation workspace is missing: {workspace}")
+    if not workspace.is_dir():
+        raise NotADirectoryError(f"filesystem operation workspace is not a directory: {workspace}")
+    request = _filesystem_request(operation)
+    if operation.file_system_profile is None:
+        raise ValueError("filesystem operation is missing resolved filesystem profile")
+    _validate_filesystem_profile_paths(operation.file_system_profile)
+    targets = _filesystem_operation_targets(operation, request)
+    runtime_roots = _runtime_readonly_roots()
+    _validate_filesystem_operation_targets(
+        operation,
+        request,
+        targets,
+        runtime_roots,
+    )
+    _validate_filesystem_private_transport_roots(
+        operation.file_system_profile,
+        runtime_roots,
+    )
+    policy = replace(
+        build_filesystem_worker_policy(
+            operation,
+            private_rw_roots=(),
+            private_ro_roots=runtime_roots,
+            env_allowlist=_FILESYSTEM_WORKER_ENV_ALLOWLIST,
+            description=f"macOS filesystem worker policy for {operation.kind}",
+        ),
+        tmp_writable=False,
+    )
+    env = _filesystem_worker_env()
+    stdin = json.dumps(operation.to_payload(), ensure_ascii=False).encode("utf-8")
+    sandbox_request = SandboxRequest(
+        argv=(
+            str(_python_executable()),
+            "-B",
+            "-m",
+            _FILESYSTEM_WORKER_MODULE,
+            "-",
+        ),
+        cwd=workspace,
+        action_kind=f"fs.worker.{operation.kind}",
+        policy=policy,
+        env=env,
+        stdin=stdin,
+        reason="sandboxed filesystem side-effect worker",
+        run_mode=normalize_run_mode(operation.run_mode).value,
+    )
+    private_transport = _filesystem_worker_private_transport(
+        operation,
+        sandbox_request,
+        workspace,
+        runtime_roots,
+    )
+    _render_seatbelt_profile(
+        sandbox_request,
+        private_transport=private_transport,
+        require_private_roots=False,
+    )
+    return _FilesystemWorkerLaunch(
+        request=sandbox_request,
+        private_transport=private_transport,
+    )
 
 
 def _filesystem_operation_request(
     operation: SandboxOperation,
-    payload_path: Path,
 ) -> SandboxRequest:
-    if operation.workspace is None:
-        raise SandboxBackendError("filesystem operation is missing workspace")
-    _filesystem_request(operation)
-    worker_root = payload_path.parent
-    worker_root.mkdir(parents=True, exist_ok=True)
-    _validate_filesystem_operation_targets(operation)
-    policy = _filesystem_operation_policy(operation, worker_root, payload_path)
-    env = {
-        "PATH": str(_python_executable().parent),
-        "PYTHONPATH": _pythonpath_for_worker(),
-        **_worker_home_env(worker_root),
-    }
-    return SandboxRequest(
-        argv=(
-            str(_python_executable()),
-            "-m",
-            _FILESYSTEM_WORKER_MODULE,
-            str(payload_path),
-        ),
-        cwd=worker_root,
-        action_kind=f"fs.worker.{operation.kind}",
-        policy=policy,
-        env=env,
-        reason="sandboxed filesystem side-effect worker",
-        run_mode=normalize_run_mode(operation.run_mode).value,
-    )
+    return _filesystem_operation_launch(operation).request
 
 
-def _filesystem_operation_policy(
+def _filesystem_worker_private_transport(
     operation: SandboxOperation,
-    worker_root: Path,
-    payload_path: Path,
-) -> SandboxPolicy:
-    target_mounts = [
-        MountSpec(
-            host_path=root,
-            sandbox_path=root,
-            mode="rw" if operation.kind in SANDBOX_FILESYSTEM_WRITE_KINDS else "ro",
-            required=True,
+    request: SandboxRequest,
+    workspace: Path,
+    runtime_roots: tuple[Path, ...],
+) -> _SeatbeltPrivateTransport:
+    if operation.kind not in _FILESYSTEM_OPERATION_KINDS:
+        raise SandboxBackendError(
+            f"unsupported filesystem operation: {operation.kind!r}"
         )
-        for root in _filesystem_operation_target_roots(operation)
-    ]
-    runtime_mounts = [
-        MountSpec(host_path=root, sandbox_path=root, mode="ro", required=True)
-        for root in _runtime_readonly_roots()
-    ]
-    worker_mount = MountSpec(
-        host_path=worker_root,
-        sandbox_path=worker_root,
-        mode="rw",
-        required=True,
+    expected_argv = (
+        str(_python_executable()),
+        "-B",
+        "-m",
+        _FILESYSTEM_WORKER_MODULE,
+        "-",
     )
-    payload_mount = MountSpec(
-        host_path=payload_path.parent,
-        sandbox_path=payload_path.parent,
-        mode="rw",
-        required=True,
+    if request.argv != expected_argv:
+        raise SandboxBackendError("seatbelt filesystem worker argv is inconsistent")
+    if request.action_kind != f"fs.worker.{operation.kind}":
+        raise SandboxBackendError("seatbelt filesystem worker action kind is inconsistent")
+    if request.cwd != workspace:
+        raise SandboxBackendError("seatbelt filesystem worker cwd is inconsistent")
+    if (
+        request.env != _filesystem_worker_env()
+        or request.policy.env_allowlist != _FILESYSTEM_WORKER_ENV_ALLOWLIST
+    ):
+        raise SandboxBackendError("seatbelt filesystem worker environment is inconsistent")
+    if request.stdin is None:
+        raise SandboxBackendError("seatbelt filesystem worker stdin must be a JSON object")
+    try:
+        stdin_payload = json.loads(request.stdin.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SandboxBackendError(
+            "seatbelt filesystem worker stdin must be a JSON object"
+        ) from exc
+    if not isinstance(stdin_payload, dict):
+        raise SandboxBackendError("seatbelt filesystem worker stdin must be a JSON object")
+    expected_stdin = json.dumps(operation.to_payload(), ensure_ascii=False).encode("utf-8")
+    if request.stdin != expected_stdin:
+        raise SandboxBackendError("seatbelt filesystem worker stdin is inconsistent")
+    if request.policy.tmp_writable:
+        raise SandboxBackendError("seatbelt filesystem worker must not create backend tmp")
+    readonly_mounts = tuple(
+        mount.host_path for mount in request.policy.mounts if mount.mode == "ro"
     )
-    return SandboxPolicy(
-        level=SecurityLevel.STANDARD,
-        network=NetworkMode.NONE,
-        mounts=tuple(dict.fromkeys((*target_mounts, *runtime_mounts, worker_mount, payload_mount))),
-        workspace_rw=False,
-        tmp_writable=True,
-        limits=ResourceLimits(cpu_seconds=30, memory_mb=1024, pids=64, wall_timeout_s=30),
-        env_allowlist=(
-            "PATH",
-            "PYTHONPATH",
-            "HOME",
-            "TMP",
-            "TEMP",
-            "TMPDIR",
-            "LANG",
-            "LC_ALL",
-        ),
-        require_approval=False,
-        description=f"macOS filesystem worker policy for {operation.kind}",
+    writable_mounts = tuple(
+        mount.host_path for mount in request.policy.mounts if mount.mode == "rw"
+    )
+    if readonly_mounts != runtime_roots or writable_mounts:
+        raise SandboxBackendError("seatbelt filesystem worker transport roots are inconsistent")
+    return _SeatbeltPrivateTransport(
+        read_roots=runtime_roots,
+        write_roots=(),
     )
 
 
-def _filesystem_operation_target_roots(operation: SandboxOperation) -> tuple[Path, ...]:
-    request = _filesystem_request(operation)
-    roots: list[Path] = []
-    for path in request.paths:
-        root = path.parent if operation.kind in SANDBOX_FILESYSTEM_WRITE_KINDS else path
-        roots.append(_nearest_existing_path(root))
-    return tuple(dict.fromkeys(roots))
+def _validate_filesystem_operation_targets(
+    operation: SandboxOperation,
+    request: FilesystemOperationRequest,
+    targets: tuple[Path, ...],
+    runtime_roots: tuple[Path, ...],
+) -> None:
+    target = targets[0] if targets else None
+    if operation.kind == "read_file" and target is not None:
+        display = request.display_path or str(target)
+        if not target.exists():
+            raise FileNotFoundError(f"File not found: {display}")
+        if not target.is_file():
+            raise IsADirectoryError(f"Path is a directory: {display}")
+    elif operation.kind == "list_dir" and target is not None:
+        display = request.display_path or str(target)
+        if not target.exists():
+            raise FileNotFoundError(f"Path not found: {display}")
+        if not target.is_dir():
+            raise NotADirectoryError(f"Not a directory: {display}")
+    elif operation.kind in {"glob_search", "grep_search"} and target is not None:
+        if not target.exists():
+            raise FileNotFoundError(f"Path not found: {target}")
+    elif operation.kind == "edit_text" and target is not None:
+        if not target.exists():
+            raise FileNotFoundError(f"File not found: {target}")
+        if not target.is_file():
+            raise IsADirectoryError(f"Path is a directory: {target}")
+    if operation.kind in SANDBOX_FILESYSTEM_WRITE_KINDS:
+        for path in targets:
+            for root in runtime_roots:
+                if _is_relative_to(path, root):
+                    raise SandboxBackendError(
+                        f"seatbelt denied read-only runtime filesystem target: {path}"
+                    )
+    _validate_filesystem_operation_profile_targets(operation, targets)
 
 
-def _nearest_existing_path(path: Path) -> Path:
-    candidate = path
-    while not candidate.exists():
-        parent = candidate.parent
-        if parent == candidate:
-            break
-        candidate = parent
-    return candidate
-
-
-def _validate_filesystem_operation_targets(operation: SandboxOperation) -> None:
-    if operation.kind not in SANDBOX_FILESYSTEM_WRITE_KINDS:
+def _validate_filesystem_operation_profile_targets(
+    operation: SandboxOperation,
+    targets: tuple[Path, ...],
+) -> None:
+    profile = operation.file_system_profile
+    if profile is None:
         return
-    request = _filesystem_request(operation)
-    readonly_roots = _runtime_readonly_roots()
-    for path in request.paths:
-        for root in readonly_roots:
-            if _is_relative_to_casefold(path, root):
-                raise SandboxBackendError(
-                    f"seatbelt denied read-only runtime filesystem target: {path}"
-                )
+    write_required = operation.kind in SANDBOX_FILESYSTEM_WRITE_KINDS
+    for path in targets:
+        access = profile.resolve(path)
+        if write_required and access is not FileSystemAccess.WRITE:
+            raise SandboxBackendError(
+                "seatbelt filesystem profile requires write access for "
+                f"{operation.kind} target: {path} (resolved {access.value})"
+            )
+        if not write_required and access is FileSystemAccess.DENY:
+            raise SandboxBackendError(
+                "seatbelt filesystem profile denies read access for "
+                f"{operation.kind} target: {path}"
+            )
+
+
+def _validate_filesystem_private_transport_roots(
+    profile: FileSystemPermissionProfile,
+    runtime_roots: tuple[Path, ...],
+) -> None:
+    denied = frozenset({FileSystemAccess.DENY})
+    for root in runtime_roots:
+        _private_transport_exclusions(profile, root, denied)
 
 
 def _runtime_readonly_roots() -> tuple[Path, ...]:
-    return tuple(dict.fromkeys(root for root in _opensquilla_import_roots() if root))
+    executable = _python_executable().expanduser()
+    prefix = Path(sys.prefix).expanduser().resolve(strict=False)
+    base_prefix = Path(sys.base_prefix).expanduser().resolve(strict=False)
+    configured = sysconfig.get_paths()
+    candidates = [
+        executable.parent,
+        executable.resolve(strict=False).parent,
+        *((prefix,) if prefix != base_prefix else ()),
+        *(
+            Path(configured[name])
+            for name in ("stdlib", "platstdlib", "purelib", "platlib")
+            if configured.get(name)
+        ),
+        *_opensquilla_import_roots(),
+    ]
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        root = candidate.expanduser().resolve(strict=False)
+        if root == Path(root.anchor) or not root.exists():
+            continue
+        key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        roots.append(root)
+    return tuple(roots)
 
 
 def _opensquilla_import_roots() -> tuple[Path, ...]:
@@ -565,19 +909,23 @@ def _python_executable() -> Path:
     return Path(sys.executable)
 
 
-def _worker_home_env(worker_root: Path) -> dict[str, str]:
-    home = str(worker_root)
+def _filesystem_worker_env() -> dict[str, str]:
     return {
-        "HOME": home,
-        "TMP": home,
-        "TEMP": home,
+        "PATH": str(_python_executable().parent),
+        "PYTHONPATH": _pythonpath_for_worker(),
+        "PYTHONDONTWRITEBYTECODE": "1",
     }
 
 
-def _is_relative_to_casefold(candidate: Path, root: Path) -> bool:
-    c = str(candidate).replace("\\", "/").rstrip("/").lower()
-    r = str(root).replace("\\", "/").rstrip("/").lower()
-    return c == r or c.startswith(r + "/")
+def _is_relative_to(candidate: Path, root: Path) -> bool:
+    try:
+        canonical_candidate = candidate.expanduser().resolve(strict=False)
+        canonical_root = root.expanduser().resolve(strict=False)
+    except OSError as exc:
+        raise SandboxBackendError(
+            f"seatbelt could not canonicalize filesystem target {candidate}: {exc}"
+        ) from exc
+    return canonical_candidate.is_relative_to(canonical_root)
 
 
 class SeatbeltBackend(Backend):
@@ -607,24 +955,25 @@ class SeatbeltBackend(Backend):
         if operation.workspace is None:
             raise SandboxBackendError("filesystem operation is missing workspace")
         _filesystem_request(operation)
-        payload_path = _filesystem_operation_payload_path(operation.workspace)
-        payload_path.parent.mkdir(parents=True, exist_ok=True)
-        payload_path.write_text(
-            json.dumps(operation.to_payload(), ensure_ascii=False),
-            encoding="utf-8",
+        launch = _filesystem_operation_launch(operation)
+        result = await self._run_request(
+            launch.request,
+            private_transport=launch.private_transport,
         )
-        try:
-            request = _filesystem_operation_request(operation, payload_path)
-            result = await self.run(request)
-        finally:
-            with contextlib.suppress(FileNotFoundError):
-                payload_path.unlink()
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip() or "filesystem worker failed"
             raise SandboxBackendError(f"seatbelt filesystem worker failed: {detail}")
         return SandboxOperationResult.from_worker_stdout(result.stdout)
 
     async def run(self, request: SandboxRequest) -> SandboxResult:
+        return await self._run_request(request, private_transport=None)
+
+    async def _run_request(
+        self,
+        request: SandboxRequest,
+        *,
+        private_transport: _SeatbeltPrivateTransport | None,
+    ) -> SandboxResult:
         if not self.available():
             raise SandboxBackendError(
                 "seatbelt backend unavailable: missing 'sandbox-exec' binary on macOS"
@@ -639,7 +988,18 @@ class SeatbeltBackend(Backend):
                 tmp_ctx = tempfile.TemporaryDirectory(prefix="opensquilla-seatbelt-tmp-")
                 tmp_dir = Path(tmp_ctx.name)
 
-            profile = render_seatbelt_profile(request, tmp_dir=tmp_dir)
+            effective_private_transport = private_transport
+            if tmp_dir is not None:
+                effective_private_transport = (
+                    effective_private_transport or _SeatbeltPrivateTransport()
+                ).extended(
+                    read_roots=(tmp_dir,),
+                    write_roots=(tmp_dir,),
+                )
+            profile = _render_seatbelt_profile(
+                request,
+                private_transport=effective_private_transport,
+            )
             with tempfile.NamedTemporaryFile(
                 "w",
                 encoding="utf-8",

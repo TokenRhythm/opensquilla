@@ -8,7 +8,6 @@ every fresh install would reject the nine legacy profiles at boot.
 from __future__ import annotations
 
 import shutil
-import subprocess
 import zipfile
 from pathlib import Path
 
@@ -34,21 +33,11 @@ PACKAGED_PRESET_IDS = LEGACY_PRESET_IDS + CURATED_INLINE_PRESET_IDS
 
 
 @pytest.mark.skipif(shutil.which("uv") is None, reason="uv not on PATH")
-def test_wheel_contains_all_packaged_router_presets(tmp_path: Path) -> None:
+def test_wheel_contains_all_packaged_router_presets(
+    isolated_core_wheel: Path,
+) -> None:
     """`uv build --wheel` packages opensquilla/provider/presets/<id>.toml."""
-    result = subprocess.run(
-        ["uv", "build", "--wheel", "--out-dir", str(tmp_path)],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    assert result.returncode == 0, f"uv build failed: {result.stderr}"
-
-    wheels = list(tmp_path.glob("opensquilla-*.whl"))
-    assert len(wheels) == 1, f"Expected 1 wheel, got {wheels}"
-
-    with zipfile.ZipFile(wheels[0]) as wheel:
+    with zipfile.ZipFile(isolated_core_wheel) as wheel:
         names = set(wheel.namelist())
 
     missing = [

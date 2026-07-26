@@ -7,7 +7,9 @@ never the real one.
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -107,6 +109,60 @@ async def test_start_stop_is_clean(tmp_path: Path, monkeypatch: Any) -> None:
     service.start()
     await service.stop()  # must not raise; task cancelled cleanly
     await service.stop()  # idempotent
+    writer.close()
+
+
+async def test_background_calibration_does_not_block_event_loop(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "home"))
+    writer = _writer(tmp_path, count=1)
+    service = RouterCalibrationService(writer=writer, interval_seconds=3600.0)
+    started = threading.Event()
+    release = threading.Event()
+
+    def _blocking_run_once():
+        started.set()
+        release.wait(timeout=1.0)
+
+    monkeypatch.setattr(service, "run_once", _blocking_run_once)
+    service.start()
+    try:
+        assert await asyncio.to_thread(started.wait, 0.5)
+        loop = asyncio.get_running_loop()
+        before = loop.time()
+        await asyncio.sleep(0.05)
+        assert loop.time() - before < 0.2
+    finally:
+        release.set()
+        await service.stop()
+        writer.close()
+
+
+async def test_stop_waits_for_inflight_calibration_before_writer_close(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    writer = _writer(tmp_path, count=1)
+    service = RouterCalibrationService(writer=writer, interval_seconds=3600.0)
+    started = threading.Event()
+    release = threading.Event()
+
+    def _blocking_run_once():
+        started.set()
+        release.wait(timeout=2.0)
+
+    monkeypatch.setattr(service, "run_once", _blocking_run_once)
+    service.start()
+    assert await asyncio.to_thread(started.wait, 0.5)
+
+    stop_task = asyncio.create_task(service.stop())
+    await asyncio.sleep(0)
+    assert not stop_task.done()
+
+    release.set()
+    await asyncio.wait_for(stop_task, timeout=1.0)
     writer.close()
 
 

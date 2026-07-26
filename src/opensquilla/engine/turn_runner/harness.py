@@ -12,7 +12,9 @@ the stage boundaries are ready to sequence.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -52,6 +54,7 @@ from opensquilla.engine.turn_runner.prompt_assembler_stage import (
 )
 from opensquilla.engine.turn_runner.provider_and_tools_stage import (
     ProviderResolverPort,
+    SkillCatalogResolverPort,
     ToolBuilderPort,
 )
 from opensquilla.engine.turn_runner.stream_consumer_stage import (
@@ -65,9 +68,12 @@ from opensquilla.engine.turn_runner.turn_finalizer_stage import (
     CostRollupResult,
     SessionTotalsPort,
     TranscriptAppendPort,
+    TranscriptAppendResult,
     TurnErrorPersistPort,
     TurnMemoryCapturePort,
+    UsageTelemetryPort,
 )
+from opensquilla.engine.usage_accounting import UsageExecutionContext
 from opensquilla.provider.model_catalog import resolve_effective_context_window
 from opensquilla.session.compaction_lifecycle import normalize_flush_triggers_strict
 
@@ -128,6 +134,17 @@ class _TurnRunnerProviderResolverAdapter(ProviderResolverPort):
     def resolve_provider(self) -> tuple[Any | None, Any | None]:
         return self._runner._resolve_provider()
 
+
+class _TurnRunnerSkillCatalogResolverAdapter(SkillCatalogResolverPort):
+    """Refresh and pin one immutable skill catalog for the turn."""
+
+    def __init__(self, runner: TurnRunner) -> None:
+        self._runner = runner
+
+    async def resolve_skill_catalog(self) -> Any | None:
+        return await asyncio.to_thread(self._runner._resolve_skill_catalog)
+
+
 class _TurnRunnerToolBuilderAdapter(ToolBuilderPort):
     """Bind ``TurnRunner._build_tools`` and the two ``ToolContext`` mutators.
 
@@ -157,6 +174,23 @@ class _TurnRunnerToolBuilderAdapter(ToolBuilderPort):
         metadata: dict[str, Any] | None = None,
     ) -> tuple[list[Any], ToolHandler | None]:
         return self._runner._build_tools(ctx, metadata=metadata)
+
+    def build_tools_for_catalog(
+        self,
+        ctx: ToolContext | None,
+        *,
+        skill_catalog: Any | None,
+        metadata: dict[str, Any] | None = None,
+    ) -> tuple[list[Any], ToolHandler | None]:
+        if skill_catalog is None or "skill_catalog" not in inspect.signature(
+            self._runner._build_tools
+        ).parameters:
+            return self._runner._build_tools(ctx, metadata=metadata)
+        return self._runner._build_tools(
+            ctx,
+            metadata=metadata,
+            skill_catalog=skill_catalog,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +256,9 @@ class _TurnRunnerPipelineExecutionAdapter(PipelineExecutionPort):
             "tool_context": request.tool_context,
             "normalization_metadata": request.normalization_metadata,
             "input_provenance": request.input_provenance,
+            "skill_catalog": request.skill_catalog,
+            "usage_execution_context": request.usage_execution_context,
+            "provider_request_correlation": request.provider_request_correlation,
         }
         accepted_kwargs = {
             name: value
@@ -695,9 +732,32 @@ class _TurnRunnerAgentFactoryAdapter(AgentFactoryPort):
         turn_call_logger: TurnCallLogger | None,
         memory_sync_manager: Any | None,
         tool_context: ToolContext | None,
+        turn_id: str = "",
+        session_id: str | None = None,
+        session_epoch: int = 0,
+        agent_id: str = "",
+        run_kind: str = "agent",
+        provider_request_correlation: Any | None = None,
     ) -> Agent:
         from opensquilla.engine.agent import Agent
 
+        # Embedding hosts and older test adapters may provide the historical
+        # runner surface without the additive ledger dependency.  Treat that
+        # exactly like an explicitly disabled sink so the upgrade remains
+        # source-compatible outside the Gateway bootstrap.
+        usage_event_sink = getattr(self._runner, "_usage_event_sink", None)
+        usage_execution_context = None
+        if usage_event_sink is not None:
+            execution_id = turn_id or uuid.uuid4().hex
+            usage_execution_context = UsageExecutionContext(
+                execution_id=execution_id,
+                agent_run_id=execution_id,
+                turn_id=turn_id or None,
+                session_id=session_id,
+                session_epoch=max(0, int(session_epoch)),
+                agent_id=agent_id,
+                run_kind=run_kind or "agent",
+            )
         return Agent(
             provider=provider,
             config=config,
@@ -710,6 +770,9 @@ class _TurnRunnerAgentFactoryAdapter(AgentFactoryPort):
             session_flush_service=self._runner._session_flush_service,
             tool_registry=self._runner._tool_registry,
             tool_context=tool_context,
+            usage_event_sink=usage_event_sink,
+            usage_execution_context=usage_execution_context,
+            provider_request_correlation=provider_request_correlation,
         )
 
 
@@ -737,13 +800,25 @@ class _TurnRunnerT3UpgradeCompactionAdapter(T3UpgradeCompactionPort):
         context_window_tokens: int,
         compaction_provider: Any | None,
         compaction_model: str | None,
+        provider_request_correlation: Any | None = None,
     ) -> str:
+        from opensquilla.engine.runtime import _accepts_keyword_arg
+
+        correlation_kwargs: dict[str, Any] = {}
+        if _accepts_keyword_arg(
+            self._runner._maybe_compact_on_t3_upgrade,
+            "provider_request_correlation",
+        ):
+            correlation_kwargs["provider_request_correlation"] = (
+                provider_request_correlation
+            )
         return await self._runner._maybe_compact_on_t3_upgrade(
             session_key,
             turn,
             context_window_tokens,
             compaction_provider=compaction_provider,
             compaction_model=compaction_model,
+            **correlation_kwargs,
         )
 
 class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
@@ -763,12 +838,24 @@ class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
         context_window_tokens: int,
         compaction_provider: Any | None,
         compaction_model: str | None,
+        provider_request_correlation: Any | None = None,
     ) -> None:
+        from opensquilla.engine.runtime import _accepts_keyword_arg
+
+        correlation_kwargs: dict[str, Any] = {}
+        if _accepts_keyword_arg(
+            self._runner._maybe_preflight_compact,
+            "provider_request_correlation",
+        ):
+            correlation_kwargs["provider_request_correlation"] = (
+                provider_request_correlation
+            )
         await self._runner._maybe_preflight_compact(
             session_key,
             context_window_tokens,
             compaction_provider=compaction_provider,
             compaction_model=compaction_model,
+            **correlation_kwargs,
         )
 
 class _TurnRunnerHistoryLoaderAdapter(HistoryLoaderPort):
@@ -1074,12 +1161,12 @@ class _TurnRunnerTranscriptAppendAdapter(TranscriptAppendPort):
         reasoning_content: str | None,
         turn_usage: dict[str, Any] | None,
         token_count: int | None,
-    ) -> bool:
+    ) -> TranscriptAppendResult:
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
         session_manager = self._runner._session_manager
         if session_manager is None:
-            return False
+            return TranscriptAppendResult(appended=False)
         append_kwargs: dict[str, Any] = {
             "role": role,
             "content": content,
@@ -1094,8 +1181,14 @@ class _TurnRunnerTranscriptAppendAdapter(TranscriptAppendPort):
             append_kwargs["turn_usage"] = turn_usage
         if _accepts_keyword_arg(session_manager.append_message, "token_count"):
             append_kwargs["token_count"] = token_count
-        await self._runner._append_session_message(session_key, **append_kwargs)
-        return True
+        entry = await self._runner._append_session_message(session_key, **append_kwargs)
+        raw_message_id = getattr(entry, "message_id", None)
+        message_id = (
+            raw_message_id
+            if isinstance(raw_message_id, str) and raw_message_id
+            else None
+        )
+        return TranscriptAppendResult(appended=True, message_id=message_id)
 
 class _TurnRunnerTurnMemoryCaptureAdapter(TurnMemoryCapturePort):
     """Bind ``TurnRunner._capture_turn_memory`` as a Protocol port.
@@ -1199,10 +1292,21 @@ class _TurnRunnerSessionTotalsAdapter(SessionTotalsPort):
             )
             if event_cost_source == "unavailable":
                 next_missing_entries += 1
+            current_cost_source = str(
+                getattr(current_session, "cost_source", "none") or "none"
+            ).strip().lower()
+            provider_billed_entries = int(
+                current_cost_source in {"provider_billed", "mixed"}
+            ) + int(event_cost_source in {"provider_billed", "mixed"})
+            estimated_cost_entries = int(
+                current_cost_source in {"opensquilla_estimate", "mixed"}
+            ) + int(event_cost_source in {"opensquilla_estimate", "mixed"})
             next_cost_source = rollup_cost_source(
                 billed_cost_usd=next_billed_cost,
                 estimated_cost_component_usd=next_estimated_component,
                 missing_cost_entries=next_missing_entries,
+                provider_billed_entries=provider_billed_entries,
+                estimated_cost_entries=estimated_cost_entries,
             )
             next_input_tokens = (
                 getattr(current_session, "input_tokens", 0) or 0
@@ -1279,3 +1383,23 @@ class _TurnRunnerTurnErrorPersistAdapter(TurnErrorPersistPort):
         event: ErrorEvent | None,
     ) -> None:
         await self._runner._persist_turn_error(session_key, event)
+
+
+class _TurnRunnerUsageTelemetryAdapter(UsageTelemetryPort):
+    """Persist content-free counters for the gateway's hourly upload loop."""
+
+    def __init__(self, runner: TurnRunner) -> None:
+        self._runner = runner
+
+    async def record_turn(self, *, run_kind: str, done_event: DoneEvent | None) -> None:
+        from opensquilla.observability.usage_telemetry import record_completed_turn
+
+        session_manager = self._runner._session_manager
+        if session_manager is None:
+            return
+        await record_completed_turn(
+            session_manager.storage,
+            config=self._runner._config,
+            run_kind=run_kind,
+            done_event=done_event,
+        )

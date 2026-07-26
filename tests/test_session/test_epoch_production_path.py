@@ -83,7 +83,7 @@ async def test_manager_passes_expected_epoch(storage):
 
 @pytest.mark.asyncio
 async def test_manager_passes_expected_epoch_mock():
-    """Verify expected_epoch kwarg is forwarded via mock, not just via error path."""
+    """Append and the narrow session touch must be one storage transaction."""
     mock_storage = MagicMock()
     mock_storage.get_session = AsyncMock(
         return_value=SessionNode(
@@ -94,18 +94,22 @@ async def test_manager_passes_expected_epoch_mock():
     )
     mock_storage.upsert_session = AsyncMock()
     mock_storage.append_transcript_entry = AsyncMock()
+    mock_storage.append_transcript_entry_and_touch = AsyncMock()
 
     mgr = SessionManager(mock_storage)
-    await mgr.append_message("agent:main:mock", "user", "hi")
+    await mgr.append_message("agent:main:mock", "user", "hi", token_count=11)
 
-    mock_storage.append_transcript_entry.assert_awaited_once()
-    _, kwargs = mock_storage.append_transcript_entry.call_args
-    assert "expected_epoch" in kwargs, (
-        "append_transcript_entry must be called with expected_epoch= keyword"
-    )
+    mock_storage.append_transcript_entry_and_touch.assert_awaited_once()
+    args, kwargs = mock_storage.append_transcript_entry_and_touch.call_args
+    assert isinstance(args[0], TranscriptEntry)
     assert kwargs["expected_epoch"] == 7, (
         f"expected_epoch should be 7 (from node.epoch), got {kwargs['expected_epoch']}"
     )
+    assert isinstance(kwargs["updated_at"], int)
+    assert kwargs["token_delta"] == 11
+    assert kwargs["mark_total_tokens_stale"] is True
+    mock_storage.append_transcript_entry.assert_not_awaited()
+    mock_storage.upsert_session.assert_not_awaited()
 
 
 # ── concurrent reset + write is atomic ──────────────────────────────────────

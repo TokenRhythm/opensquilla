@@ -15,6 +15,7 @@
           ref="closeBtn"
           type="button"
           class="btn btn--icon btn--ghost"
+          :disabled="saveAllPending"
           :aria-label="t('common.close')"
           :title="t('common.close')"
           @click="requestClose()"
@@ -102,7 +103,11 @@
       </div>
       </template>
 
-      <div class="settings-body">
+      <div
+        class="settings-body"
+        :inert="saveAllPending ? true : undefined"
+        :aria-busy="saveAllPending ? 'true' : undefined"
+      >
         <nav ref="railRef" class="settings-rail" role="tablist" :aria-label="t('settings.dialog.sections')" :aria-orientation="railOrientation">
           <template v-for="(s, i) in visibleSections" :key="s.id">
             <!-- Presentational group eyebrow: labels the rail without adding a
@@ -119,9 +124,9 @@
               type="button"
               role="tab"
               class="settings-rail__item"
-              :class="{ 'is-active': section === s.id }"
-              :aria-selected="section === s.id ? 'true' : 'false'"
-              :aria-controls="'settings-section-' + s.id"
+              :class="{ 'is-active': activeRailSection === s.id }"
+              :aria-selected="activeRailSection === s.id ? 'true' : 'false'"
+              :aria-controls="'settings-section-' + (activeRailSection === s.id ? section : s.id)"
               :aria-label="s.client ? t('settings.rail.' + s.id) : `${t('settings.rail.' + s.id)}: ${sectionStatus(s.id).label}${sectionDirty(s.id) ? t('settings.dialog.unsavedSuffix') : ''}`"
               @click="selectSection(s.id)"
             >
@@ -139,16 +144,26 @@
           ref="panelRef"
           class="settings-panel"
           role="tabpanel"
-          :aria-labelledby="'settings-rail-' + section"
+          :aria-labelledby="'settings-rail-' + activeRailSection"
         >
+          <fieldset
+            class="settings-panel__interactions"
+            :disabled="saveAllPending"
+            :aria-busy="saveAllPending ? 'true' : undefined"
+          >
           <!-- Connection renders regardless of load state: it is how you point
                the UI at a reachable gateway when nothing has loaded yet. -->
           <SetupConnectionPanel v-if="section === 'connection'" />
 
           <!-- Runtime (desktop only) also renders regardless of load state: it
-               reports the owned gateway and offers restart/reset precisely for
+               reports the owned gateway and offers logs/restart precisely for
                when the gateway is down and config never loaded. -->
           <DesktopRuntimePanel v-else-if="section === 'runtime' && isDesktop" />
+
+          <!-- Optional cross-installation discovery is deliberately mounted
+               only when the user opens this section. It never runs at app or
+               Settings-dialog startup. -->
+          <DataMigrationPanel v-else-if="section === 'dataMigration'" />
 
           <!-- Config-backed sections wait for readiness so their baselines are
                final before any field can be edited. -->
@@ -169,6 +184,11 @@
               @apply-preset="applyProviderPreset"
               @copy="copyCommand"
               @go-to-section="selectSection"
+              @select-configured-provider="requestSelectConfiguredProvider"
+              @remove-provider-profile="removeProviderProfile"
+              @add-provider="requestAddProvider"
+              @probe-configured-provider="probeConfiguredProvider"
+              @activate-provider="activateProvider"
             />
             <SetupBehaviorPanel
               v-else-if="section === 'behavior'"
@@ -184,29 +204,21 @@
               v-else-if="section === 'modelStrategy'"
               :panel="modelStrategyPanel"
               @update-strategy="setModelStrategy"
+              @update-fixed-model="setFixedModel"
               @update-router-default-tier="setRouterDefaultTier"
               @update-router-visual-mode="setRouterVisualMode"
               @update-tier-field="updateTierField"
               @update-ensemble-scheme="setEnsembleScheme"
               @add-ensemble-candidate="addEnsembleCandidate"
               @remove-ensemble-candidate="removeEnsembleCandidate"
-              @set-ensemble-candidate-role="setEnsembleCandidateRole"
+              @replace-ensemble-candidate="replaceEnsembleCandidate"
+              @set-ensemble-aggregator="setEnsembleAggregator"
+              @request-provider-models="discoverModelStrategyProviderModels"
               @import-ensemble-tier-candidates="importEnsembleTierCandidates"
               @migrate-ensemble-legacy="migrateEnsembleLegacy"
               @update-ensemble-min-successful="setEnsembleMinSuccessful"
               @update-ensemble-all-failed-policy="setEnsembleAllFailedPolicy"
               @go-to-section="selectSection"
-            />
-            <SetupChannelsPanel
-              v-else-if="section === 'channels'"
-              :panel="channelsPanel"
-              @update-channel-type="selectChannelType"
-              @channel-type-change="onChannelTypeChange"
-              @update-channel-field="updateChannelField"
-              @save="saveChannel"
-              @enable-channel="enableChannel"
-              @disable-channel="disableChannel"
-              @remove-channel="removeChannel"
             />
             <SetupCapabilitiesPanel
               v-else-if="section === 'capabilities'"
@@ -223,17 +235,36 @@
             />
             <SettingsAppearancePanel v-else-if="section === 'appearance'" />
             <SettingsKeyboardPanel v-else-if="section === 'keyboard'" />
-            <SettingsAdvancedPanel v-else-if="section === 'advanced'" />
+            <SettingsAdvancedPanel
+              v-else-if="section === 'advanced'"
+              @open-agent-configuration="openAgentConfiguration"
+              @open-data-maintenance="openDataMaintenance"
+            />
           </template>
+          </fieldset>
         </div>
       </div>
 
-      <div v-if="loaded && hasUnsavedChanges" class="settings-dirtybar" aria-live="polite">
+      <div
+        v-if="loaded && hasUnsavedChanges"
+        class="settings-dirtybar"
+        :aria-busy="saveAllPending ? 'true' : undefined"
+      >
         <span class="settings-dirtybar__pulse" aria-hidden="true"></span>
-        <span class="settings-dirtybar__text">{{ t('settings.dialog.unsavedIn', { sections: dirtySectionNames }) }}</span>
+        <span class="settings-dirtybar__text" role="status" aria-live="polite" aria-atomic="true">
+          {{ saveAllPending ? t('settings.dialog.savingChanges') : dirtyBarText }}
+        </span>
         <span class="settings-dirtybar__spacer"></span>
-        <button type="button" class="btn" @click="discardChanges">{{ t('common.discard') }}</button>
-        <button type="button" class="btn btn--primary" @click="saveDirtySections">{{ t('common.save') }}</button>
+        <button type="button" class="btn" :disabled="saveAllPending" @click="discardChanges">
+          {{ dirtyDiscardLabel }}
+        </button>
+        <button
+          type="button"
+          class="btn btn--primary"
+          :disabled="saveAllPending"
+          :aria-busy="saveAllPending ? 'true' : undefined"
+          @click="saveDirtySections"
+        >{{ saveAllPending ? t('settings.dialog.savingChanges') : dirtySaveLabel }}</button>
       </div>
 
       <footer class="settings-foot">
@@ -267,13 +298,13 @@ import SetupBehaviorPanel from '@/components/setup/SetupBehaviorPanel.vue'
 import SetupConnectionPanel from '@/components/settings/SetupConnectionPanel.vue'
 import SetupProviderPanel from '@/components/setup/SetupProviderPanel.vue'
 import SetupModelStrategyPanel from '@/components/setup/SetupModelStrategyPanel.vue'
-import SetupChannelsPanel from '@/components/setup/SetupChannelsPanel.vue'
 import SetupCapabilitiesPanel from '@/components/setup/SetupCapabilitiesPanel.vue'
 import SettingsPrivacyPanel from '@/components/settings/SettingsPrivacyPanel.vue'
 import SettingsAppearancePanel from '@/components/settings/SettingsAppearancePanel.vue'
 import SettingsKeyboardPanel from '@/components/settings/SettingsKeyboardPanel.vue'
 import SettingsAdvancedPanel from '@/components/settings/SettingsAdvancedPanel.vue'
 import DesktopRuntimePanel from '@/components/settings/DesktopRuntimePanel.vue'
+import DataMigrationPanel from '@/components/settings/DataMigrationPanel.vue'
 import { useSetupCatalog, SETTINGS_SECTIONS } from '@/composables/setup/useSetupCatalog'
 import { parseProviderHash, sectionFromRouteParam } from '@/composables/setup/useSettingsSection'
 import { useConfirm } from '@/composables/useConfirm'
@@ -302,7 +333,6 @@ const {
   privacyPanel,
   modelStrategyPanel,
   presetPanel,
-  channelsPanel,
   capabilitiesPanel,
   hasSetupAction,
   actionItems,
@@ -316,40 +346,42 @@ const {
   sectionDirty,
   dirtySections,
   hasUnsavedChanges,
+  saveAllPending,
   saveDirtySections,
   discardChanges,
   selectProvider,
+  requestSelectConfiguredProvider,
+  requestAddProvider,
   setAutoSessionTitles,
   setDisableNetworkObservability,
   setModelStrategy,
+  setFixedModel,
   setRouterDefaultTier,
   setRouterVisualMode,
   addEnsembleCandidate,
   removeEnsembleCandidate,
-  setEnsembleCandidateRole,
+  replaceEnsembleCandidate,
+  setEnsembleAggregator,
+  discoverModelStrategyProviderModels,
   importEnsembleTierCandidates,
   migrateEnsembleLegacy,
   setEnsembleScheme,
   setEnsembleMinSuccessful,
   setEnsembleAllFailedPolicy,
   applyProviderPreset,
-  selectChannelType,
   updateProviderField,
   updateLlmTimeout,
   updateContextWindow,
   probeProviderConnection,
+  probeConfiguredProvider,
+  activateProvider,
+  removeProviderProfile,
   updateTierField,
-  updateChannelField,
   updateCapabilityField,
   onProviderChange,
-  onChannelTypeChange,
   onSearchProviderChange,
   onMemoryProviderChange,
   onImageProviderChange,
-  saveChannel,
-  enableChannel,
-  disableChannel,
-  removeChannel,
   saveSearch,
   saveMemory,
   saveImage,
@@ -357,6 +389,13 @@ const {
   copyCommand,
   copyConfigPath,
 } = useSetupCatalog()
+
+// The maintenance screen is a child of Advanced, not a first-level tab. Keep
+// the parent selected while its nested route is open so the rail communicates
+// hierarchy without advertising migration during normal Settings use.
+const activeRailSection = computed(() => (
+  section.value === 'dataMigration' ? 'advanced' : section.value
+))
 
 const modalRef = ref<HTMLElement | null>(null)
 const railRef = ref<HTMLElement | null>(null)
@@ -392,6 +431,43 @@ let userNavigated = false
 
 const railOrientation = computed(() => (isMobile.value ? 'horizontal' : 'vertical'))
 const dirtySectionNames = computed(() => dirtySections.value.map(s => s.label).join(' · '))
+const dirtyProviderLabel = computed(() => (
+  providerPanel.value.credentialPanel?.providerLabel
+  || providerPanel.value.providerSelected
+  || t('settings.rail.provider')
+))
+const onlyDirtySection = computed(() => (
+  dirtySections.value.length === 1 ? dirtySections.value[0]?.id : ''
+))
+const dirtyBarText = computed(() => {
+  if (dirtySections.value.length > 1) {
+    return t('settings.dialog.unsavedCount', { count: dirtySections.value.length })
+  }
+  if (onlyDirtySection.value === 'provider') {
+    return t('settings.dialog.unsavedProvider', { provider: dirtyProviderLabel.value })
+  }
+  return t('settings.dialog.unsavedIn', { sections: dirtySectionNames.value })
+})
+const dirtySaveLabel = computed(() => {
+  if (dirtySections.value.length > 1) {
+    return t('settings.dialog.saveAll', { count: dirtySections.value.length })
+  }
+  if (onlyDirtySection.value === 'provider') {
+    return t('settings.dialog.saveProvider', { provider: dirtyProviderLabel.value })
+  }
+  if (onlyDirtySection.value === 'modelStrategy') return t('settings.dialog.saveRouting')
+  return t('common.save')
+})
+const dirtyDiscardLabel = computed(() => {
+  if (dirtySections.value.length > 1) {
+    return t('settings.dialog.discardAll', { count: dirtySections.value.length })
+  }
+  if (onlyDirtySection.value === 'provider') {
+    return t('settings.dialog.discardProvider', { provider: dirtyProviderLabel.value })
+  }
+  if (onlyDirtySection.value === 'modelStrategy') return t('settings.dialog.discardRouting')
+  return t('common.discard')
+})
 const displayConfigPath = computed(() => configPath.value || '~/.opensquilla/config.toml')
 
 // Where to return when the overlay closes. Captured on open from the route the
@@ -404,6 +480,7 @@ let returnTo: string | null = null
 let invokerEl: HTMLElement | null = null
 let mq: MediaQueryList | null = null
 let closing = false
+let transferringFocus = false
 
 const routeParam = computed(() => route.params.section)
 // `/setup` → `/settings/auto` asks for the first not-ready section once
@@ -436,6 +513,10 @@ function applyRouteSection() {
     return
   }
   const resolved = sectionFromRouteParam(routeParam.value)
+  if (resolved === 'dataMigration') {
+    setSection(resolved)
+    return
+  }
   // A desktopOnly section requested where it is unavailable (e.g. a stale
   // /settings/runtime deep link on web) has no rail entry or panel branch; fall
   // back to the default so the dialog never renders an empty body.
@@ -529,18 +610,50 @@ function closeOverlay() {
   visible.value = false
 }
 
+// This is an intentional modal-to-page transition, not a Settings close/back
+// action. Suppress the old invoker restoration while routing, then focus the
+// destination heading so keyboard and screen-reader users perceive the change.
+async function openAgentConfiguration() {
+  if (transferringFocus) return
+  transferringFocus = true
+  try {
+    const failure = await router.push('/agents')
+    if (failure) {
+      transferringFocus = false
+      return
+    }
+    await nextTick()
+    document.getElementById('agents-page-title')?.focus()
+  } catch (error) {
+    transferringFocus = false
+    throw error
+  }
+}
+
+// Unlike a cold/deep-linked maintenance route (where the modal close button
+// deliberately keeps initial focus), an explicit activation inside Advanced
+// is an in-dialog view transition. Move context to the newly mounted heading
+// after Vue has replaced the panel so keyboard and screen-reader users do not
+// remain focused on a control that just left the DOM.
+async function openDataMaintenance() {
+  selectSection('dataMigration')
+  await nextTick()
+  panelRef.value?.querySelector<HTMLElement>('[data-testid="data-migration-heading"]')?.focus()
+}
+
 // One discard prompt shared by every exit path: requestClose (Escape, the
 // close button, backdrop click) and the history-back leave guard below.
 function confirmDiscard(): Promise<boolean> {
   return confirm({
-    title: 'Discard unsaved changes?',
-    body: 'You have unsaved edits. Closing now will lose them.',
-    primaryLabel: 'Discard',
+    title: t('settings.dialog.discardTitle'),
+    body: t('settings.dialog.discardBody'),
+    primaryLabel: t('settings.dialog.discardPrimary'),
   })
 }
 
 // Closes unless a section carries unsaved edits and the user keeps them.
 async function requestClose(): Promise<boolean> {
+  if (saveAllPending.value) return false
   if (hasUnsavedChanges.value && !(await confirmDiscard())) return false
   closeOverlay()
   return true
@@ -558,6 +671,7 @@ async function requestClose(): Promise<boolean> {
 const removeLeaveGuard = router.beforeEach(async (to) => {
   if (closing) return true
   if (to.path === '/settings' || to.path.startsWith('/settings/')) return true
+  if (saveAllPending.value) return false
   if (!hasUnsavedChanges.value) return true
   // requestClose already has the prompt up — hold this navigation instead of
   // stacking a second prompt (useConfirm cancels a pending request).
@@ -566,6 +680,7 @@ const removeLeaveGuard = router.beforeEach(async (to) => {
 })
 
 function onDocumentKeydown(event: KeyboardEvent) {
+  if (event.defaultPrevented) return
   // The confirm modal owns the keyboard while it is open; let it handle Escape
   // so a single keypress cannot both dismiss the prompt and re-open it.
   if (confirmState.value) return
@@ -602,8 +717,10 @@ function onViewportChange(event: MediaQueryListEvent) {
 // loads; the loaded watcher below completes that case.
 watch(routeParam, () => applyRouteSection())
 
-// A provider deep-link hash can arrive (or change) after mount.
-watch(() => route.hash, () => applyProviderHash())
+// A provider deep-link hash can arrive (or change) after mount. (Legacy
+// #channel- hashes never reach this dialog: a router guard rewrites them to
+// the /channels workspace before the settings route resolves.)
+watch(() => route.hash, () => { applyProviderHash() })
 
 // Whenever the active section changes (rail click, deep link, Back), bring its
 // tab into view on the horizontally-scrolling mobile rail.
@@ -618,7 +735,7 @@ watch(section, () => {
 watch(loaded, (isLoaded) => {
   if (isLoaded && wantsAutoSection.value && !userNavigated) selectInitialSection('auto')
   // Catalog data is required to validate a provider hash, so (re)try now.
-  if (isLoaded) applyProviderHash()
+  if (isLoaded) { applyProviderHash() }
 })
 
 onMounted(() => {
@@ -645,7 +762,7 @@ onUnmounted(() => {
   // A route-driven unmount that did not go through closeOverlay (e.g. the user
   // pressed browser Back) still owes focus restoration: the real invoker, or
   // the sidebar Settings button for a cold deep link, never a detached node.
-  if (!closing) (usableInvoker() ?? sidebarSettingsButton())?.focus()
+  if (!closing && !transferringFocus) (usableInvoker() ?? sidebarSettingsButton())?.focus()
   invokerEl = null
 })
 </script>
@@ -936,6 +1053,13 @@ onUnmounted(() => {
   min-width: 0;
   overflow-y: auto;
   padding: var(--sp-4);
+}
+
+.settings-panel__interactions {
+  border: 0;
+  margin: 0;
+  min-inline-size: 0;
+  padding: 0;
 }
 
 /* Dirty bar */

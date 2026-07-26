@@ -31,14 +31,18 @@ from pydantic import BaseModel
 from opensquilla.channels._util import EventDedupeCache
 from opensquilla.channels.contract import (
     ChannelCapabilityProfile,
+    ChannelLengthUnit,
     ChannelPlatformCapability,
     ChannelPlatformCapabilityStatus,
     ChannelPlatformCategories,
     ChannelPlatformManifest,
 )
 from opensquilla.channels.types import (
+    AuthenticatedPrincipal,
     ChannelHealth,
     IncomingMessage,
+    IngressProvenance,
+    IngressVerification,
     OutgoingMessage,
     UnsupportedChannelOperation,
 )
@@ -47,7 +51,7 @@ log = structlog.get_logger(__name__)
 
 # Channel-contract constants — downstream consumers read the same shape
 # across adapters.
-CAPABILITY_TIER = "GREEN-shipping"
+CAPABILITY_TIER = "YELLOW-experimental"
 
 # QQ official bot is a DM/group channel — the permission matrix denies
 # admin-only.
@@ -148,8 +152,12 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
 
         intents = Intents(public_messages=True, direct_message=True)
         try:
-            asyncio.get_event_loop()
+            asyncio.get_running_loop()
         except RuntimeError:
+            # qq-botpy still captures an event loop during construction.  On
+            # Python 3.13+, get_event_loop() without a current loop is
+            # deprecated, so establish one explicitly for synchronous config
+            # and capability-inspection call sites.
             asyncio.set_event_loop(asyncio.new_event_loop())
         # ``ext_handlers=False`` prevents the default file handler from
         # writing ``botpy.log`` and crashing on read-only filesystems.
@@ -174,6 +182,9 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
     def capability_profile(self) -> ChannelCapabilityProfile:
         return ChannelCapabilityProfile(
             channel_type="qq",
+            max_message_len=2000,
+            length_unit=ChannelLengthUnit.CODE_POINTS,
+            splits_natively=False,
             group_chat=True,
             mentions=True,
             reply=True,
@@ -216,8 +227,7 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
             raise ValueError("qq.start: app_id and app_secret are required")
 
         self._run_task = asyncio.create_task(self._run_forever(), name="qq:gateway")
-        self._connected = True
-        log.info("qq.started", name=cfg.name, app_id=cfg.app_id)
+        log.info("qq.starting", name=cfg.name, app_id=cfg.app_id)
 
     async def _run_forever(self) -> None:
         """Drive the underlying ``botpy.Client.start`` coroutine.
@@ -235,6 +245,13 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
             raise
         except Exception as exc:  # pragma: no cover — surfaces only at runtime
             log.warning("qq.gateway_loop_failed", error=str(exc))
+        finally:
+            self._connected = False
+
+    async def on_ready(self) -> None:
+        """Mark the adapter connected only after the SDK authenticates."""
+        self._connected = True
+        log.info("qq.started", name=self.config.name, app_id=self.config.app_id)
 
     async def stop(self) -> None:
         """Cancel the WebSocket task and close the underlying SDK client."""
@@ -256,7 +273,7 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
         log.info("qq.stopped", name=self.config.name)
 
     async def health_check(self) -> ChannelHealth:
-        running = (self._run_task is not None and not self._run_task.done()) or self._connected
+        running = self._connected and self._run_task is not None and not self._run_task.done()
         return ChannelHealth(
             connected=running,
             last_message_at=self._last_message_at,
@@ -307,13 +324,24 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
         if group_openid:
             metadata["group_openid"] = group_openid
 
+        sender_id = author_id or "unknown"
         msg = IncomingMessage(
-            sender_id=author_id or "unknown",
+            sender_id=sender_id,
             channel_id=channel_id or "unknown",
             content=content,
             metadata=metadata,
+            provenance=IngressProvenance(
+                provider="qq",
+                account_id=self.config.app_id,
+                transport="websocket",
+                verification=IngressVerification.SDK_SESSION,
+                event_id=msg_id or None,
+                principal=AuthenticatedPrincipal(subject_id=sender_id),
+            ),
         )
-        self._inbound_queue.put_nowait(msg)
+        from opensquilla.channels.delivery_store import durable_enqueue
+
+        durable_enqueue(self, msg, self._inbound_queue)
         self._msg_count += 1
         self._last_message_at = datetime.now(UTC)
         log.debug(
@@ -408,7 +436,7 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
         ``c2c``  → ``self.api.post_c2c_message(openid=..., msg_type=0, ...)``
         ``group`` → ``self.api.post_group_message(group_openid=..., msg_type=0, ...)``
 
-        ``msg_id`` (when supplied) and a per-target ``msg_seq`` counter
+        ``msg_id`` (when supplied) and a per-inbound-message ``msg_seq`` counter
         satisfy the QQ API's passive-reply dedup rules.
         """
         meta = message.metadata or {}
@@ -420,7 +448,7 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
             target = meta.get("group_openid", "")
             if not target:
                 raise ValueError("qq.send: metadata['group_openid'] required for group chat_type")
-            seq = self._next_msg_seq(f"group:{target}")
+            seq = self._next_msg_seq(f"group:{msg_id or target}")
             await api.post_group_message(
                 group_openid=target,
                 msg_type=0,
@@ -432,13 +460,13 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
             target = meta.get("openid", "") or meta.get("user_openid", "")
             if not target:
                 raise ValueError("qq.send: metadata['openid'] required for c2c chat_type")
-            seq = self._next_msg_seq(f"c2c:{target}")
+            seq = self._next_msg_seq(f"c2c:{msg_id or target}")
             await api.post_c2c_message(
                 openid=target,
                 msg_type=0,
                 content=message.content,
                 msg_id=msg_id,
-                msg_seq=str(seq),
+                msg_seq=seq,
             )
         else:
             raise ValueError(

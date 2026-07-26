@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from tui_real_terminal.driver import TerminalFrame
+from tui_real_terminal.framebuffer import StyledFramebuffer
 
 ScenarioStatus = Literal["pass", "fail"]
 
@@ -38,6 +39,7 @@ class EvidenceBundle:
         self.scenario_id = scenario_id
         self.backend_id = backend_id
         self.frames_dir = run_dir / "frames"
+        self.framebuffers_dir = run_dir / "framebuffers"
         self.screenshots_dir = run_dir / "screenshots"
         self.transcript_path = run_dir / "transcript.txt"
         self.scrollback_path = run_dir / "scrollback.txt"
@@ -48,8 +50,10 @@ class EvidenceBundle:
     def create(cls, root: Path, *, scenario_id: str, backend_id: str) -> EvidenceBundle:
         run_dir = root / f"{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns()}-{scenario_id}"
         frames_dir = run_dir / "frames"
+        framebuffers_dir = run_dir / "framebuffers"
         screenshots_dir = run_dir / "screenshots"
         frames_dir.mkdir(parents=True, exist_ok=False)
+        framebuffers_dir.mkdir(parents=True, exist_ok=False)
         screenshots_dir.mkdir(parents=True, exist_ok=True)
         bundle = cls(run_dir, scenario_id=scenario_id, backend_id=backend_id)
         for file_path in (
@@ -76,6 +80,18 @@ class EvidenceBundle:
     def write_scrollback(self, frame: TerminalFrame) -> Path:
         self.scrollback_path.write_text(frame.text, encoding="utf-8")
         return self.scrollback_path
+
+    def record_framebuffer(self, frame: StyledFramebuffer) -> tuple[Path, Path]:
+        index = len(tuple(self.framebuffers_dir.glob("*.json")))
+        stem = f"{index:03d}-{_safe_name(frame.checkpoint)}"
+        raw_path = self.framebuffers_dir / f"{stem}.ansi"
+        json_path = self.framebuffers_dir / f"{stem}.json"
+        raw_path.write_text(frame.raw, encoding="utf-8")
+        json_path.write_text(
+            json.dumps(frame.to_json_dict(), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return raw_path, json_path
 
     def write_visual_verdict(self, payload: dict[str, Any]) -> Path:
         return self._write_json("visual-verdict.json", payload)

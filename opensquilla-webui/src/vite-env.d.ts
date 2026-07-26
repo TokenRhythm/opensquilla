@@ -3,6 +3,9 @@
 import type {
   ArtifactNativeOpenResult,
   ArtifactOpenRequest,
+  DesktopMainWindowCloseBehavior,
+  DesktopPreferences,
+  DesktopRetryStartupResult,
   DesktopUpdateState,
   DesktopSettings,
   DesktopSettingsPayload,
@@ -25,6 +28,7 @@ declare global {
   interface OpenSquillaDesktopApi {
     getOsLocale: () => Promise<string | undefined>
     isAutoUpdateEnabled: () => Promise<boolean>
+    isDesktopUpdateManaged?: () => Promise<boolean>
     getUpdateState?: () => Promise<DesktopUpdateState>
     checkForUpdates?: () => Promise<DesktopUpdateState>
     downloadUpdate?: () => Promise<DesktopUpdateState>
@@ -37,6 +41,11 @@ declare global {
     getDesktopSettings: () => Promise<DesktopSettings>
     saveDesktopSettings: (payload: DesktopSettingsPayload) => Promise<DesktopSettings>
     resetDesktopSettings: () => Promise<{ ok: boolean }>
+    getDesktopPreferences?: () => Promise<DesktopPreferences>
+    saveDesktopPreferences?: (
+      payload: { mainWindowCloseBehavior: DesktopMainWindowCloseBehavior },
+    ) => Promise<DesktopPreferences>
+    onWindowHidden?: (callback: () => void) => () => void
     inspectDesktopCleanup?: (payload: { mode: DesktopCleanupMode }) => Promise<{
       ok: boolean
       previewId: string | null
@@ -67,8 +76,9 @@ declare global {
     cancelOnboarding: () => Promise<unknown>
     getBootState: () => Promise<unknown>
     getRecoveryState?: () => Promise<unknown>
+    chooseLegacyAgentDataLocation?: (payload?: Record<string, never>) => Promise<unknown>
     getDesktopProfileKind?: () => Promise<'primary' | 'recovery' | null>
-    retryStartup: () => Promise<unknown>
+    retryStartup: () => Promise<DesktopRetryStartupResult>
     quitApp: () => Promise<unknown>
     migrationSummary?: (payload?: { source?: string }) => Promise<unknown>
     migrationBrowseSource?: (payload: { kind: MigrationSourceKind }) => Promise<unknown>

@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import shutil
 import weakref
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.skills.dependency_summary import build_dependency_summary
@@ -44,6 +45,79 @@ def _deps_lock_for(name: str, install_id: str) -> asyncio.Lock:
 
 def _get_loader(ctx: RpcContext) -> SkillLoader | None:
     return getattr(ctx, "skill_loader", None)
+
+
+async def _catalog_skills(loader: SkillLoader, *, reason: str) -> tuple[Any, ...]:
+    """Probe once at an RPC boundary, then pin all reads to one generation."""
+    await asyncio.to_thread(loader.refresh_if_changed, reason=reason)
+    return loader.snapshot().skills
+
+
+class _PinnedSkillLookup:
+    """Minimal loader view used while serializing one catalog snapshot."""
+
+    def __init__(self, skill_index: dict[str, Any]) -> None:
+        self._skill_index = skill_index
+
+    def get_by_name(self, name: str) -> Any | None:
+        return self._skill_index.get(name)
+
+
+def _reload_failure_payload(
+    message: str,
+    *,
+    loader: SkillLoader | None,
+) -> dict[str, Any]:
+    snapshot = loader.snapshot() if loader is not None else None
+    generation = snapshot.generation if snapshot is not None else 0
+    kept_previous = bool(
+        snapshot is not None and (snapshot.generation or snapshot.manifest or snapshot.skills)
+    )
+    return {
+        "success": False,
+        "changed": False,
+        "partial": False,
+        "generation": generation,
+        "added": [],
+        "removed": [],
+        "modified": [],
+        "errors": [
+            {
+                "name": "",
+                "path": "",
+                "message": message,
+                "kept_previous": kept_previous,
+            }
+        ],
+    }
+
+
+class _NoCatalogMutationError(Exception):
+    """Internal signal used to leave a mutation guard without dirtying it."""
+
+    def __init__(self, result: Any) -> None:
+        super().__init__()
+        self.result = result
+
+
+async def _run_catalog_mutation(
+    loader: SkillLoader | None,
+    *,
+    reason: str,
+    operation: Callable[[], Awaitable[Any]],
+    did_change: Callable[[Any], bool],
+) -> Any:
+    """Keep readers on the old snapshot until a known mutation succeeds."""
+    if loader is None:
+        return await operation()
+    try:
+        with loader.mutation_guard(reason=reason):
+            result = await operation()
+            if not did_change(result):
+                raise _NoCatalogMutationError(result)
+            return result
+    except _NoCatalogMutationError as exc:
+        return exc.result
 
 
 def _loader_managed_dir(ctx: RpcContext) -> Path | None:
@@ -268,9 +342,15 @@ def _skill_to_dict(
     d["declared"] = report.declared
     d["status"] = _status_from_report(report)
     d["status_detail"] = _status_detail(spec, report)
+    dependency_loader = loader
+    if skill_index is not None:
+        # Dependency rollups recursively look up sub-skills. Pin those lookups
+        # too, otherwise a concurrent reload could mix catalog generations in
+        # one RPC response.
+        dependency_loader = cast(SkillLoader, _PinnedSkillLookup(skill_index))
     d["dependency_summary"] = build_dependency_summary(
         spec,
-        loader=loader,
+        loader=dependency_loader,
         ctx=eligibility_ctx,
         report=report,
     )
@@ -293,7 +373,11 @@ async def _handle_skills_status(params: dict | None, ctx: RpcContext) -> list[di
     # Operator gate: skills governed by the coding-mode toggle (code-task) are
     # hidden from the skill manager when the toggle is OFF — unreachable through
     # every skill API, not just the agent prompt (codex review).
-    skills = [s for s in loader.load_all() if is_skill_available_live(s.name)]
+    skills = [
+        s
+        for s in await _catalog_skills(loader, reason="rpc.skills.status")
+        if is_skill_available_live(s.name)
+    ]
     skill_index = {skill.name: skill for skill in skills}
     return [
         _skill_to_dict(
@@ -316,7 +400,7 @@ async def _handle_skills_list(params: dict | None, ctx: RpcContext) -> dict[str,
         return {"skills": []}
 
     ctx_eligible = EligibilityContext.auto()
-    all_skills = loader.load_all()
+    all_skills = await _catalog_skills(loader, reason="rpc.skills.list")
     skill_index = {skill.name: skill for skill in all_skills}
     # Operator gate: coding-mode-gated skills (code-task when OFF) stay out.
     skills = [
@@ -347,7 +431,7 @@ async def _handle_skills_bins(params: dict | None, ctx: RpcContext) -> dict[str,
         return {}
 
     bins_status: dict[str, bool] = {}
-    skills = loader.load_all()
+    skills = await _catalog_skills(loader, reason="rpc.skills.bins")
 
     for skill in skills:
         if skill.metadata and skill.metadata.requires:
@@ -371,7 +455,7 @@ async def _handle_skills_get(params: dict | None, ctx: RpcContext) -> dict[str, 
     if loader is None:
         raise KeyError("No skill loader available")
 
-    skills = loader.load_all()
+    skills = await _catalog_skills(loader, reason="rpc.skills.get")
     skill_index = {item.name: item for item in skills}
     skill = skill_index.get(params["name"])
     if skill is None or not is_skill_available_live(params["name"]):
@@ -449,17 +533,30 @@ async def _handle_skills_search(params: dict | None, ctx: RpcContext) -> dict[st
     }
 
 
-def _invalidate_loader(ctx: RpcContext) -> None:
-    """Drop the loader's in-memory cache so the next read re-scans disk.
-
-    The disk snapshot has its own mtime/size manifest check, but the
-    in-memory ``_cached`` field is populated at boot and would otherwise
-    mask newly-installed (or removed) managed skills until the next
-    restart.
-    """
+@_d.method("skills.reload", scope="operator.admin")
+async def _handle_skills_reload(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    """Force a rescan of the running Gateway's Skill catalog."""
     loader = _get_loader(ctx)
-    if loader is not None:
-        loader.invalidate_cache()
+    if loader is None:
+        return _reload_failure_payload("No skill loader configured", loader=None)
+
+    from opensquilla.engine.steps.skills_filter import (
+        invalidate_skill_eligibility_cache,
+    )
+
+    try:
+        result = await asyncio.to_thread(
+            loader.reload,
+            force=True,
+            reason="rpc.skills.reload",
+        )
+    except Exception as exc:  # Keep the RPC response shape stable on unexpected failures.
+        return _reload_failure_payload(str(exc) or type(exc).__name__, loader=loader)
+    finally:
+        # A force reload is also the operator's escape hatch after changing
+        # binaries/environment outside the catalog writer paths.
+        invalidate_skill_eligibility_cache()
+    return result.to_dict()
 
 
 @_d.method("skills.install", scope="operator.admin")
@@ -478,9 +575,12 @@ async def _handle_skills_install(params: dict | None, ctx: RpcContext) -> dict[s
     identifier = params["identifier"]
     source_id = params.get("source", "clawhub")
     force = params.get("force", False)
-    result = await installer.install(identifier, source_id, force=force)
-    if result.success:
-        _invalidate_loader(ctx)
+    result = await _run_catalog_mutation(
+        loader,
+        reason="rpc.skills.install",
+        operation=lambda: installer.install(identifier, source_id, force=force),
+        did_change=lambda value: bool(value.success),
+    )
     resp: dict[str, Any] = {
         "success": result.success,
         "name": result.name,
@@ -510,15 +610,18 @@ async def _handle_skills_update(params: dict | None, ctx: RpcContext) -> dict[st
 
     name = (params or {}).get("name")
     try:
-        results = await installer.update(name)
+        results = await _run_catalog_mutation(
+            loader,
+            reason="rpc.skills.update",
+            operation=lambda: installer.update(name),
+            did_change=lambda values: any(value.success for value in values),
+        )
     except OSError as exc:
         return {
             "results": [],
             "success": False,
             "message": f"Skill update unavailable: {exc}",
         }
-    if any(r.success for r in results):
-        _invalidate_loader(ctx)
     return {
         "results": [{"success": r.success, "name": r.name, "message": r.message} for r in results]
     }
@@ -534,9 +637,13 @@ async def _handle_skills_uninstall(params: dict | None, ctx: RpcContext) -> dict
     if installer is None:
         return {"success": False, "message": "No skill installer configured"}
 
-    result = await installer.uninstall(params["name"])
-    if result.success:
-        _invalidate_loader(ctx)
+    loader = _get_loader(ctx)
+    result = await _run_catalog_mutation(
+        loader,
+        reason="rpc.skills.uninstall",
+        operation=lambda: installer.uninstall(params["name"]),
+        did_change=lambda value: bool(value.success),
+    )
     return {"success": result.success, "name": result.name, "message": result.message}
 
 
@@ -584,6 +691,12 @@ async def _handle_skills_deps_install(params: dict | None, ctx: RpcContext) -> d
     async with _deps_lock_for(name, install_id):
         results = await install_deps([spec])
         r = results[0]
+        if r.success:
+            from opensquilla.engine.steps.skills_filter import (
+                invalidate_skill_eligibility_cache,
+            )
+
+            invalidate_skill_eligibility_cache()
         report = diagnose_eligibility(skill, ctx_eligible)
 
     return {

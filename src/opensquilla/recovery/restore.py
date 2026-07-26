@@ -16,7 +16,7 @@ from opensquilla.recovery.atomic import (
     PathIdentity,
     _chmod_open_file,
     native_move_no_replace,
-    no_follow_manifest,
+    profile_no_follow_manifest,
 )
 from opensquilla.recovery.config_patch import ConfigSnapshot
 from opensquilla.recovery.engine import inspect_profile
@@ -226,7 +226,7 @@ def _recorded_backup(backup: Path) -> tuple[ConfigSnapshot, dict[str, Any], dict
     attributes = int(getattr(value, "st_file_attributes", 0))
     if stat.S_ISLNK(value.st_mode) or attributes & 0x400 or not stat.S_ISDIR(value.st_mode):
         raise RestoreValidationError("recorded backup is not a real directory")
-    no_follow_manifest(backup)
+    profile_no_follow_manifest(backup)
     return snapshot, history, record, target
 
 
@@ -397,7 +397,7 @@ def restore_profile(backup: str | Path, *, lock_timeout: float = 0.0) -> Recover
     current_backup = target.with_name(f"{target.name}.backup.{restore_id}")
     target_existed = os.path.lexists(target)
     if target_existed:
-        no_follow_manifest(target)
+        profile_no_follow_manifest(target)
     selected_identity = _identity_payload(backup_path)
     original_identity = _identity_payload(target) if target_existed else None
     payload: dict[str, Any] = {
@@ -455,7 +455,7 @@ def restore_profile(backup: str | Path, *, lock_timeout: float = 0.0) -> Recover
             ):
                 raise RestoreValidationError("current target changed during restore preflight")
             if target_existed:
-                no_follow_manifest(target)
+                profile_no_follow_manifest(target)
             history = current_history
             from opensquilla.recovery.transaction import (
                 finalize_committed_profile_transaction,

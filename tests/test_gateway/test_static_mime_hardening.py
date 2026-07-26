@@ -61,7 +61,19 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     for name, (body, _mime) in _ASSETS.items():
         (static_dir / name).write_bytes(body)
     (static_dir / "readme.unknownext").write_bytes(b"hello")
+    dist_dir = static_dir / "dist"
+    (dist_dir / "assets").mkdir(parents=True)
+    (dist_dir / "index.html").write_text(
+        """<!doctype html>
+<link rel="stylesheet" href="./assets/control-ui.css">
+<script type="module" src="./assets/control-ui.js"></script>
+""",
+        encoding="utf-8",
+    )
+    (dist_dir / "assets" / "control-ui.js").write_bytes(b"export {};\n")
+    (dist_dir / "assets" / "control-ui.css").write_bytes(b"body{}\n")
     monkeypatch.setattr(control_ui, "_STATIC_DIR", static_dir)
+    monkeypatch.setattr(control_ui, "_DIST_DIR", dist_dir)
     monkeypatch.delenv("OPENSQUILLA_STATIC_NO_CACHE", raising=False)
 
     config = GatewayConfig()
@@ -70,9 +82,7 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     return TestClient(app)
 
 
-def _pollute_mime_db(
-    monkeypatch: pytest.MonkeyPatch, mime: str = "text/plain"
-) -> None:
+def _pollute_mime_db(monkeypatch: pytest.MonkeyPatch, mime: str = "text/plain") -> None:
     """Make guess_type behave like a corrupt Windows registry: everything the
     registry knows about comes back as `mime` (text/plain in the wild)."""
 
@@ -161,29 +171,20 @@ def test_missing_asset_still_404s(client: TestClient) -> None:
     assert response.status_code == 404
 
 
-def test_real_assets_pinned_on_polluted_host(
+def test_vite_entrypoint_is_pinned_on_polluted_host(
     monkeypatch: pytest.MonkeyPatch,
+    client: TestClient,
 ) -> None:
-    # End-to-end against the real shipped static tree: the Vite module entry
-    # (the asset whose text/plain mislabel white-screens the Vue console), the
-    # legacy frontend entry, and the prism vendor scripts the white-screen
-    # reports also named.
+    # End-to-end against a synthetic static tree: the Vite module entry (the
+    # asset whose text/plain mislabel white-screens the Vue console). Keeping the
+    # fixture synthetic lets source-only checkouts run this regression test
+    # without a generated Control UI bundle.
     _pollute_mime_db(monkeypatch)
-    monkeypatch.delenv("OPENSQUILLA_STATIC_NO_CACHE", raising=False)
-    config = GatewayConfig()
-    config.control_ui.enabled = True
-    client = TestClient(Starlette(routes=create_control_ui_routes(config)))
 
-    vite_js_url, _css_urls = control_ui._read_vite_assets(config.control_ui.base_path)
+    vite_js_url, _css_urls = control_ui._read_vite_assets("/control")
     assert vite_js_url.startswith("/control/static/dist/assets/"), vite_js_url
 
-    for path in (
-        vite_js_url,
-        "/control/static/js/app.js",
-        "/control/static/vendor/prism-core.min.js",
-        "/control/static/vendor/prism-autoloader.min.js",
-    ):
-        response = client.get(path)
-        assert response.status_code == 200, path
-        content_type = response.headers.get("content-type", "")
-        assert content_type.startswith("text/javascript"), (path, content_type)
+    response = client.get(vite_js_url)
+    assert response.status_code == 200, vite_js_url
+    content_type = response.headers.get("content-type", "")
+    assert content_type.startswith("text/javascript"), (vite_js_url, content_type)

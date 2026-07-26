@@ -41,6 +41,49 @@ def test_clone_isolates_config_from_original_mutation() -> None:
     assert clone.current_config.provider_routing == {"a": "x"}
 
 
+def test_turn_clone_disables_replay_for_plugin_fallback_without_mutating_shared_selector(
+    monkeypatch,
+) -> None:
+    plugin_fallback = ProviderConfig(
+        provider="anthropic",
+        model="plugin-fallback",
+        api_key="plugin-test-key",
+        replay_provider_state=True,
+    )
+
+    class _Plugin:
+        def failover_hook(self, primary_failure: Exception) -> list[ProviderConfig]:
+            del primary_failure
+            return [plugin_fallback]
+
+    built: list[ProviderConfig] = []
+
+    def fake_build_provider(cfg: ProviderConfig) -> ProviderConfig:
+        built.append(cfg)
+        return cfg
+
+    monkeypatch.setattr("opensquilla.provider.selector._build_provider", fake_build_provider)
+    shared = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig(
+                provider="openrouter",
+                model="primary",
+                api_key="primary-test-key",
+            )
+        ),
+        plugin=_Plugin(),
+    )
+    turn_selector = shared.clone()
+
+    turn_selector.disable_provider_state_replay()
+    fallback = turn_selector.next_fallback_after_failure(RuntimeError("primary failed"))
+
+    assert fallback.replay_provider_state is False
+    assert built[-1].replay_provider_state is False
+    assert plugin_fallback.replay_provider_state is True
+    assert shared.current_config.replay_provider_state is True
+
+
 def test_override_model_keeps_original_primary_as_first_fallback(monkeypatch) -> None:
     built: list[ProviderConfig] = []
 

@@ -106,6 +106,13 @@ def test_posix_sensitive_paths_stay_blocked_on_windows_runners() -> None:
     )
 
 
+def test_ordinary_etc_files_are_readable_but_sensitive_entries_stay_blocked() -> None:
+    assert sensitive_path_marker("/etc/hosts") is None
+    assert sensitive_path_marker("/etc/passwd") is None
+    assert sensitive_path_marker("/etc/shadow") == "/etc/shadow"
+    assert sensitive_path_marker("/etc/ssh/sshd_config") == "/etc/ssh"
+
+
 def test_linux_runtime_sensitive_deny_roots_excludes_workspace_parent() -> None:
     workspace = Path("/root/.opensquilla/workspace")
 

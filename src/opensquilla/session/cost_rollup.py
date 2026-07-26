@@ -58,11 +58,13 @@ def rollup_cost_source(
     billed_cost_usd: float,
     estimated_cost_component_usd: float,
     missing_cost_entries: int,
+    provider_billed_entries: int = 0,
+    estimated_cost_entries: int = 0,
 ) -> SessionCostSource:
     """Classify aggregate session cost provenance from persisted components."""
 
-    has_billed = billed_cost_usd > 0.0
-    has_estimate = estimated_cost_component_usd > 0.0
+    has_billed = provider_billed_entries > 0 or billed_cost_usd > 0.0
+    has_estimate = estimated_cost_entries > 0 or estimated_cost_component_usd > 0.0
     has_unavailable = missing_cost_entries > 0
     present = sum((has_billed, has_estimate, has_unavailable))
 

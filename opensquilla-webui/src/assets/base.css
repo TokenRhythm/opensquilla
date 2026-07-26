@@ -479,13 +479,6 @@ pre {
   background-attachment: local, local, scroll, scroll;
 }
 
-/* Candidate A (full index): every destination is a visible labelled row on
-   desktop too. The Manage/Monitor bands flow inline as direct children of
-   .sidebar-core (the scroll/fade container); the "More" popover is retired. */
-.sidebar-core__managed {
-  display: contents;
-}
-
 /* New-chat keyboard hint */
 .sidebar-kbd {
   margin-left: auto;
@@ -576,9 +569,6 @@ pre {
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-lg);
-}
-.sidebar-more-popover .sidebar-nav-group-label {
-  color: var(--text-dim);
 }
 .sidebar-more-popover .sidebar-fn-item {
   margin: 0;
@@ -942,6 +932,30 @@ pre {
   margin: 1px var(--sp-1);
 }
 
+.sidebar-history-row--workspace {
+  margin-top: var(--sp-2);
+}
+
+.sidebar-workspace-header {
+  flex: 1;
+  min-width: 0;
+  min-height: 24px;
+  display: flex;
+  align-items: center;
+  padding: 4px 9px 3px;
+  color: var(--sidebar-text-soft);
+  font-size: 0.6875rem;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.sidebar-workspace-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .sidebar-history-row.is-selected .sidebar-history-item {
   background: var(--sidebar-selection-bg);
   color: var(--sidebar-text-strong);
@@ -1057,76 +1071,6 @@ pre {
   padding: var(--sp-2);
 }
 
-/* Nav index band labels: quiet eyebrow headers for the Manage / Monitor bands.
-   The Work cluster is unlabeled and reads as the default home; each labeled
-   band opens with a hairline divider so the grouping reads from structure, and
-   the label itself stays a quiet 10px eyebrow (matches the control-* eyebrow
-   idiom) rather than competing with the nav rows. */
-.sidebar-nav-group-label {
-  margin: var(--sp-3) 0 2px;
-  padding: var(--sp-2) var(--sp-2) 0;
-  border-top: 1px solid var(--sidebar-border);
-  font-size: 10px;
-  font-weight: var(--fw-eyebrow);
-  text-transform: uppercase;
-  letter-spacing: var(--eyebrow-track);
-  color: var(--sidebar-text-soft);
-}
-.sidebar-nav-group-label:first-child {
-  margin-top: 2px;
-  border-top: none;
-  padding-top: 0;
-}
-
-/* Collapsible console band header: the eyebrow label becomes a full-width
-   disclosure toggle so the Build/Monitor indexes can yield their vertical
-   space to the Recents/Chats list (the rail serves both a console index and a
-   chat history). The label keeps its quiet eyebrow styling; a chevron rotates,
-   and a collapsed band that owns the active route shows an accent dot so
-   "where am I" survives the fold. */
-.sidebar-nav-group-toggle {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  width: 100%;
-  margin: var(--sp-3) 0 2px;
-  padding: var(--sp-2) var(--sp-2) 4px;
-  border: none;
-  border-top: 1px solid var(--sidebar-border);
-  background: none;
-  color: var(--sidebar-text-soft);
-  cursor: pointer;
-  text-align: left;
-}
-.sidebar-nav-group-toggle .sidebar-nav-group-label {
-  margin: 0;
-  padding: 0;
-  border-top: none;
-  flex: 1;
-}
-.sidebar-nav-group-toggle:hover .sidebar-nav-group-label {
-  color: var(--sidebar-text);
-}
-.sidebar-nav-group-toggle:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
-  border-radius: var(--radius-sm);
-}
-.sidebar-band-chevron {
-  color: var(--sidebar-text-soft);
-  transition: transform var(--dur-fast, 120ms) var(--ease-out, ease);
-}
-.sidebar-band-chevron.is-collapsed {
-  transform: rotate(-90deg);
-}
-.sidebar-band-active-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 999px;
-  background: var(--accent);
-  flex-shrink: 0;
-}
-
 /* Setup-health banner: dismissible readiness warning above Recents */
 .sidebar-setup-banner {
   flex-shrink: 0;
@@ -1209,24 +1153,6 @@ pre {
   outline-offset: -1px;
 }
 
-/* Legacy-data advisory variant: informational (accent-tinted) rather than a
-   readiness warning, so the two notices read as distinct even when stacked. */
-.sidebar-setup-banner--legacy {
-  border-color: color-mix(in srgb, var(--accent) 45%, var(--sidebar-border));
-  background: color-mix(in srgb, var(--accent) 10%, var(--sidebar-control-bg));
-}
-.sidebar-setup-banner--legacy .sidebar-setup-banner__icon { color: var(--accent); }
-.sidebar-setup-banner__path {
-  margin: 0;
-  font-size: var(--fs-xs);
-  min-width: 0;
-}
-.sidebar-setup-banner__path code {
-  font-family: var(--font-mono);
-  color: var(--sidebar-text-strong);
-  word-break: break-all;
-}
-
 /* Legacy nav styles (kept for compatibility) */
 .nav-brand {
   display: flex;
@@ -1300,10 +1226,6 @@ pre {
   position: relative;
 }
 
-.main.main--chat.main--chat-sidebar-collapsed .content--chat .chat-header {
-  padding-left: 76px;
-}
-
 /* Main is pushed when sidebar is docked */
 .main.docked {
   margin-left: var(--sidebar-width);
@@ -1331,9 +1253,8 @@ pre {
   min-height: 44px;
 }
 
-/* The compact dock leaves 509–699px for the main pane. Preserve the high-value
-   connection/theme affordances, but collapse language to its icon and hide the
-   optional music control so the chat title and actions retain real space. */
+/* The compact dock leaves 509–699px for the main pane. Collapse language to
+   its icon; the Chat action group responds to the space left after app chrome. */
 .main--sidebar-compact .topbar-right {
   gap: var(--sp-1);
 }
@@ -1344,8 +1265,7 @@ pre {
   padding-inline: 0;
 }
 
-.main--sidebar-compact .topbar-right .lang-menu-current,
-.main--sidebar-compact .topbar-right .bgm-menu-wrap {
+.main--sidebar-compact .topbar-right .lang-menu-current {
   display: none;
 }
 
@@ -1381,10 +1301,33 @@ pre {
 }
 
 .topbar--chat {
-  inset: 5.333px 5.333px auto 5.333px;
-  height: 42px;
-  min-height: 42px;
-  padding: 6px 24px 0 16px;
+  position: relative;
+  inset: auto;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  flex: 0 0 49px;
+  box-sizing: border-box;
+  height: 49px;
+  min-height: 49px;
+  margin: var(--sp-1) 0 0 var(--sp-1);
+  padding: 0 20px 0 12px;
+  border: 1px solid var(--border);
+  border-right: 0;
+  border-radius: var(--radius-lg) 0 0 0;
+  background: var(--bg-surface);
+  gap: var(--sp-2);
+  pointer-events: auto;
+}
+
+.topbar:not(.topbar--chat) .topbar-route-header {
+  display: none;
+}
+
+.topbar-route-header {
+  display: flex;
+  align-items: center;
+  align-self: stretch;
+  min-width: 0;
 }
 
 .topbar-left,
@@ -1398,7 +1341,7 @@ pre {
 }
 
 .topbar--chat .topbar-left {
-  min-width: 34px;
+  min-width: 0;
 }
 
 .topbar-left,
@@ -1504,7 +1447,7 @@ pre {
   /* No right inset: the chat panel meets the screen edge so the thread's
      scrollbar sits where the cursor lands when flung to the edge, instead of
      hiding behind a dead padding strip. */
-  padding: var(--sp-1) 0 var(--sp-1) var(--sp-1);
+  padding: 0 0 var(--sp-1) var(--sp-1);
   background: var(--sidebar-bg);
   border: 0;
   border-radius: 0;
@@ -1512,8 +1455,10 @@ pre {
   overflow: hidden;
 }
 
-.content--chat .chat {
+.main .content--chat .chat {
   border-right: 0;
+  border-top: 0;
+  border-top-left-radius: 0;
   border-top-right-radius: 0;
   border-bottom-right-radius: 0;
 }
@@ -1554,7 +1499,7 @@ pre {
   }
 
   .content--chat {
-    padding: var(--sp-1) 0 var(--sp-1) var(--sp-1);
+    padding: 0 0 var(--sp-1) var(--sp-1);
   }
 
   .topbar {
@@ -1563,6 +1508,41 @@ pre {
     min-height: 40px;
     padding: 0;
     gap: var(--sp-2);
+  }
+
+  .topbar.topbar--chat {
+    position: relative;
+    inset: auto;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    flex-basis: calc(56px + env(safe-area-inset-top, 0px));
+    box-sizing: border-box;
+    height: calc(56px + env(safe-area-inset-top, 0px));
+    min-height: calc(56px + env(safe-area-inset-top, 0px));
+    margin: var(--sp-1) 0 0 var(--sp-1);
+    padding: env(safe-area-inset-top, 0px) 10px 0 8px;
+    gap: var(--sp-1);
+  }
+
+  .topbar--chat .topbar-right {
+    gap: var(--sp-1);
+  }
+
+  .topbar--chat .topbar-right .lang-menu-current,
+  .topbar--chat .topbar-right > .theme-menu-wrap:not(.bgm-menu-wrap):not(.lang-menu-wrap) {
+    display: none;
+  }
+
+  .topbar--chat .topbar-right .lang-menu-trigger {
+    justify-content: center;
+    padding-inline: 0;
+    width: 44px;
+  }
+
+  .topbar--chat .topbar-right--attention .conn-pill,
+  .topbar--chat .topbar-right--attention .bgm-menu-wrap,
+  .topbar--chat .topbar-right--attention .lang-menu-wrap,
+  .topbar--chat .topbar-right--attention > .theme-menu-wrap:not(.bgm-menu-wrap):not(.lang-menu-wrap) {
+    display: none;
   }
 
   .sidebar-dock-toggle {
@@ -1590,15 +1570,7 @@ pre {
     min-height: 44px;
   }
 
-  /* Mobile drawer keeps the full Manage / Monitor band index so the "More"
-     drawer still reaches every destination. `display: contents` re-flows the
-     wrapper's children as direct .sidebar-core rows (band labels + links). */
-  .sidebar-core__managed {
-    display: contents;
-  }
-
-  /* The desktop "More" trigger is redundant on mobile: the bands render inline
-     above (display:contents) and Cron/Skills are pinned rows in .sidebar-core. */
+  /* The desktop "More" trigger is redundant in the mobile drawer. */
   .sidebar-more-btn {
     display: none;
   }
@@ -1637,7 +1609,7 @@ pre {
      so the More drawer and dialogs dim it. */
   .mobile-tabbar {
     display: grid;
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     position: fixed;
     left: 0;
     right: 0;
@@ -1752,6 +1724,14 @@ pre {
 
   .sidebar-foot .sidebar-fn-item {
     min-height: 32px;
+  }
+}
+
+@media (max-width: 400px) {
+  /* Language and theme remain available from the mobile More → Settings path;
+     reclaim their header space so the conversation menu keeps a 44px target. */
+  .topbar--chat .topbar-right .lang-menu-wrap {
+    display: none;
   }
 }
 

@@ -47,6 +47,7 @@ from opensquilla.gateway.scopes import (
     resolve_required_scope,
 )
 from opensquilla.gateway.session_services import get_session_storage
+from opensquilla.session.storage import StorageBusyError
 
 log = structlog.get_logger(__name__)
 
@@ -79,6 +80,7 @@ class RpcContext:
     subscription_manager: Any = None  # SubscriptionManager for session-scoped events
     channel_manager: Any = None  # ChannelManager | None (injected at boot)
     usage_tracker: Any = None  # UsageTracker instance (injected at boot)
+    usage_event_sink: Any = None  # Durable per-provider-call accounting sink.
     meta_run_writer: Any = None  # MetaRunWriter instance (injected at boot)
     skill_loader: Any = None  # SkillLoader instance (injected at boot)
     cron_scheduler: Any = None  # SchedulerEngine instance (injected at boot)
@@ -138,13 +140,22 @@ class RpcHandlerError(Exception):
     """
 
     def __init__(
-        self, code: str, message: str, *, details: Any | None = None, retryable: bool = False
+        self,
+        code: str,
+        message: str,
+        *,
+        details: Any | None = None,
+        retryable: bool = False,
+        retry_after_ms: int | None = None,
+        accepted: bool | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.details = details
         self.retryable = retryable
+        self.retry_after_ms = retry_after_ms
+        self.accepted = accepted
 
 
 class ScopeDriftError(RuntimeError):
@@ -238,10 +249,28 @@ class RpcRegistry:
             return make_ok_res(req_id, result)
         except RpcHandlerError as exc:
             return make_error_res(
-                req_id, exc.code, exc.message, retryable=exc.retryable, details=exc.details
+                req_id,
+                exc.code,
+                exc.message,
+                retryable=exc.retryable,
+                retry_after_ms=exc.retry_after_ms,
+                accepted=exc.accepted,
+                details=exc.details,
             )
         except RpcUnavailableError as exc:
             return make_error_res(req_id, ERROR_UNAVAILABLE, str(exc), retryable=True)
+        except StorageBusyError as exc:
+            return make_error_res(
+                req_id,
+                "STORAGE_BUSY",
+                "Session storage is temporarily busy. Retry this operation.",
+                retryable=True,
+                retry_after_ms=exc.retry_after_ms,
+                details={
+                    "operation": exc.operation,
+                    "waited_ms": exc.waited_ms,
+                },
+            )
         except ValueError as exc:
             return make_error_res(req_id, "INVALID_REQUEST", str(exc))
         except KeyError as exc:

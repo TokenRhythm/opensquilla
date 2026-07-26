@@ -11,6 +11,7 @@ from opensquilla.engine.turn_runner.harness import (
     _coerce_flush_triggers,
     _TurnRunnerAgentFactoryAdapter,
 )
+from opensquilla.provider import ProviderRequestCorrelation
 
 
 def test_harness_flush_triggers_normalize_comma_delimited_aliases() -> None:
@@ -45,6 +46,12 @@ def test_agent_factory_adapter_passes_runner_tool_registry(monkeypatch) -> None:
         _session_flush_service=None,
     )
     adapter = _TurnRunnerAgentFactoryAdapter(runner)
+    correlation = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="execution-1",
+        call_kind="agent.chat",
+    )
 
     adapter.build(
         provider=object(),
@@ -55,9 +62,13 @@ def test_agent_factory_adapter_passes_runner_tool_registry(monkeypatch) -> None:
         turn_call_logger=None,
         memory_sync_manager=None,
         tool_context=None,
+        turn_id="turn-1",
+        session_id="session-1",
+        provider_request_correlation=correlation,
     )
 
     assert captured["tool_registry"] is registry
+    assert captured["provider_request_correlation"] is correlation
 
 
 def _catalog_runner(

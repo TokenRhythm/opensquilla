@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import errno
 import hashlib
@@ -37,6 +38,7 @@ from opensquilla.recovery.atomic import (
     _windows_extended_path,
     _windows_move_no_replace,
     _windows_rename_info,
+    profile_no_follow_manifest,
 )
 from opensquilla.recovery.config_patch import ConfigSnapshot
 from opensquilla.recovery.locking import (
@@ -44,6 +46,17 @@ from opensquilla.recovery.locking import (
     acquire_legacy_gateway_locks,
     user_state_dir,
 )
+
+
+def _create_windows_junction(link: Path, target: Path) -> None:
+    completed = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        pytest.skip(f"junction creation is unavailable: {completed.stderr}")
 
 
 def _contend_for_lock(home: str, state_root: str, queue: multiprocessing.Queue) -> None:
@@ -227,6 +240,54 @@ def test_no_follow_manifest_can_keep_runtime_sandbox_opaque(tmp_path: Path) -> N
     assert "sandbox/runtime-owned.txt" not in manifest
 
 
+@pytest.mark.parametrize(
+    "workspace_relative",
+    [Path("workspace"), Path("state/workspace")],
+    ids=["canonical", "historical-state"],
+)
+def test_profile_manifest_records_workspace_links_and_keeps_code_task_opaque(
+    tmp_path: Path,
+    workspace_relative: Path,
+) -> None:
+    profile = tmp_path / "profile"
+    workspace = profile / workspace_relative
+    code_task_bin = profile / "code-task" / "run" / "repo" / ".venv" / "bin"
+    workspace.mkdir(parents=True)
+    code_task_bin.mkdir(parents=True)
+    (workspace / "COPYING").write_text("license\n", encoding="utf-8")
+    try:
+        (workspace / "LICENSE").symlink_to("COPYING")
+        (code_task_bin / "python").symlink_to("../../../../missing-python")
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+
+    manifest = profile_no_follow_manifest(profile)
+
+    workspace_link = (workspace_relative / "LICENSE").as_posix()
+    assert workspace_link in manifest
+    assert stat.S_ISLNK(manifest[workspace_link].mode)
+    assert "code-task" in manifest
+    assert not any(relative.startswith("code-task/") for relative in manifest)
+
+
+@pytest.mark.parametrize("name", ["workspace", "code-task"])
+def test_profile_manifest_rejects_link_in_place_of_approved_root(
+    tmp_path: Path,
+    name: str,
+) -> None:
+    profile = tmp_path / "profile"
+    outside = tmp_path / "outside"
+    profile.mkdir()
+    outside.mkdir()
+    try:
+        (profile / name).symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable")
+
+    with pytest.raises(UnsafePathError):
+        profile_no_follow_manifest(profile)
+
+
 def test_native_move_never_replaces_existing_destination(tmp_path: Path) -> None:
     source = tmp_path / "source"
     destination = tmp_path / "destination"
@@ -323,12 +384,17 @@ def test_native_move_treats_unsafe_post_move_manifest_as_unknown(
         path: str | Path,
         *,
         opaque_directories: frozenset[str] = frozenset(),
+        link_leaf_directories: frozenset[str] = frozenset(),
     ):
         nonlocal calls
         calls += 1
         if calls == 2:
             raise UnsafePathError("synthetic unsafe post-move tree")
-        return original_manifest(path, opaque_directories=opaque_directories)
+        return original_manifest(
+            path,
+            opaque_directories=opaque_directories,
+            link_leaf_directories=link_leaf_directories,
+        )
 
     monkeypatch.setattr(atomic, "no_follow_manifest", fail_post_move_manifest)
 
@@ -480,6 +546,79 @@ def test_native_move_refuses_symlink_in_source_tree(tmp_path: Path) -> None:
     assert not destination.exists()
 
 
+def test_generic_native_move_remains_strict_for_workspace_link(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    workspace = source / "workspace"
+    workspace.mkdir(parents=True)
+    (workspace / "COPYING").write_text("license\n", encoding="utf-8")
+    try:
+        (workspace / "LICENSE").symlink_to("COPYING")
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+
+    with pytest.raises(UnsafePathError):
+        native_move_no_replace(source, destination)
+
+    assert source.is_dir()
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize(
+    "workspace_relative",
+    [Path("workspace"), Path("state/workspace")],
+    ids=["canonical", "historical-state"],
+)
+def test_profile_move_preserves_workspace_link_and_opaque_code_task(
+    tmp_path: Path,
+    workspace_relative: Path,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    workspace = source / workspace_relative
+    code_task_bin = source / "code-task" / "run" / "repo" / ".venv" / "bin"
+    workspace.mkdir(parents=True)
+    code_task_bin.mkdir(parents=True)
+    (workspace / "COPYING").write_text("license\n", encoding="utf-8")
+    try:
+        (workspace / "LICENSE").symlink_to("COPYING")
+        (code_task_bin / "python").symlink_to("../../../../missing-python")
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+    workspace_link_before = PathIdentity.from_stat((workspace / "LICENSE").lstat())
+    code_task_link_before = PathIdentity.from_stat((code_task_bin / "python").lstat())
+
+    move_profile_no_replace(source, destination)
+
+    moved_workspace_link = destination / workspace_relative / "LICENSE"
+    moved_code_task_link = (
+        destination / "code-task" / "run" / "repo" / ".venv" / "bin" / "python"
+    )
+    assert not source.exists()
+    assert os.readlink(moved_workspace_link) == "COPYING"
+    assert os.readlink(moved_code_task_link) == "../../../../missing-python"
+    assert PathIdentity.from_stat(moved_workspace_link.lstat()) == workspace_link_before
+    assert PathIdentity.from_stat(moved_code_task_link.lstat()) == code_task_link_before
+
+
+def test_profile_move_still_refuses_link_outside_workspace(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    outside = tmp_path / "outside.txt"
+    (source / "media").mkdir(parents=True)
+    outside.write_text("outside\n", encoding="utf-8")
+    try:
+        (source / "media" / "link").symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+
+    with pytest.raises(UnsafePathError):
+        move_profile_no_replace(source, destination)
+
+    assert source.is_dir()
+    assert not destination.exists()
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="requires native Windows long paths")
 def test_windows_native_move_handles_real_path_longer_than_260_characters(
     tmp_path: Path,
@@ -513,13 +652,7 @@ def test_windows_native_move_rejects_real_junction_in_source_tree(tmp_path: Path
     destination = tmp_path / "destination"
     source.mkdir()
     outside.mkdir()
-    completed = subprocess.run(
-        ["cmd", "/c", "mklink", "/J", str(source / "junction"), str(outside)],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert completed.returncode == 0, completed.stderr or completed.stdout
+    _create_windows_junction(source / "junction", outside)
     assert os.path.isjunction(source / "junction")
 
     with pytest.raises(UnsafePathError):
@@ -528,6 +661,95 @@ def test_windows_native_move_rejects_real_junction_in_source_tree(tmp_path: Path
     assert source.is_dir()
     assert outside.is_dir()
     assert not destination.exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires real Windows junctions")
+def test_windows_profile_manifest_records_junction_tag_and_target(tmp_path: Path) -> None:
+    profile = tmp_path / "profile"
+    workspace = profile / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir(parents=True)
+    outside.mkdir()
+    _create_windows_junction(workspace / "junction", outside)
+
+    manifest = profile_no_follow_manifest(profile)
+
+    identity = manifest["workspace/junction"]
+    assert identity.reparse_tag == 0xA0000003
+    assert identity.link_target == os.readlink(workspace / "junction")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires real Windows junctions")
+def test_windows_native_move_detects_junction_target_swap_after_rename(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    workspace = source / "workspace"
+    outside_a = tmp_path / "outside-a"
+    outside_b = tmp_path / "outside-b"
+    workspace.mkdir(parents=True)
+    outside_a.mkdir()
+    outside_b.mkdir()
+    (outside_a / "sentinel.txt").write_text("a\n", encoding="utf-8")
+    (outside_b / "sentinel.txt").write_text("b\n", encoding="utf-8")
+    _create_windows_junction(workspace / "junction", outside_a)
+    original_target = os.readlink(workspace / "junction")
+
+    @contextlib.contextmanager
+    def swap_after_native_rename():
+        yield
+        moved = destination / "workspace" / "junction"
+        moved.rmdir()
+        _create_windows_junction(moved, outside_b)
+
+    with pytest.raises(AtomicStateUnknownError):
+        native_move_no_replace(
+            source,
+            destination,
+            _mutation_guard=swap_after_native_rename,
+            _use_profile_manifest_policy=True,
+        )
+
+    assert not source.exists()
+    assert os.path.isjunction(destination / "workspace" / "junction")
+    assert os.readlink(destination / "workspace" / "junction") != original_target
+    assert (outside_a / "sentinel.txt").read_text(encoding="utf-8") == "a\n"
+    assert (outside_b / "sentinel.txt").read_text(encoding="utf-8") == "b\n"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires real Windows junctions")
+def test_windows_profile_move_preserves_workspace_and_code_task_junctions(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    workspace = source / "workspace"
+    code_task = source / "code-task"
+    workspace_outside = tmp_path / "workspace-outside"
+    code_task_outside = tmp_path / "code-task-outside"
+    workspace.mkdir(parents=True)
+    code_task.mkdir()
+    workspace_outside.mkdir()
+    code_task_outside.mkdir()
+    (workspace_outside / "workspace.txt").write_text("workspace\n", encoding="utf-8")
+    (code_task_outside / "task.txt").write_text("task\n", encoding="utf-8")
+    for link, target in (
+        (workspace / "junction", workspace_outside),
+        (code_task / "junction", code_task_outside),
+    ):
+        _create_windows_junction(link, target)
+
+    move_profile_no_replace(source, destination)
+
+    moved_workspace_junction = destination / "workspace" / "junction"
+    moved_code_task_junction = destination / "code-task" / "junction"
+    assert int(getattr(moved_workspace_junction.lstat(), "st_file_attributes", 0)) & 0x400
+    assert int(getattr(moved_code_task_junction.lstat(), "st_file_attributes", 0)) & 0x400
+    assert (moved_workspace_junction / "workspace.txt").read_text(encoding="utf-8") == (
+        "workspace\n"
+    )
+    assert (moved_code_task_junction / "task.txt").read_text(encoding="utf-8") == "task\n"
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="requires renameatx_np")
@@ -1105,7 +1327,7 @@ def test_windows_handoff_keeps_external_state_lock_open(
             assert _move_options["_allowed_manifest_mtime_changes"] == frozenset(
                 {"state/gateway.pid.lock"}
             )
-            assert _move_options["_opaque_manifest_directories"] == frozenset({"sandbox"})
+            assert _move_options["_use_profile_manifest_policy"] is True
             with _mutation_guard():
                 assert external_claim.fd == external_fd
                 source_path.rename(destination_path)

@@ -122,6 +122,87 @@ describe('arrangeSidebarSections — subagent nesting', () => {
   })
 })
 
+describe('arrangeSidebarSections — workspace grouping', () => {
+  it('groups chat sessions by explicit workspace and keeps sessions without workspace flat', () => {
+    const sections = arrangeSidebarSections([
+      session({
+        key: 'agent:main:webchat:project1-session1',
+        title: 'Session 1',
+        updatedAt: 400,
+        workspace: '/repo/project1',
+        workspaceLabel: 'project1',
+        workspaceDisplayPath: '/repo/project1',
+      } as RawSessionItem),
+      session({
+        key: 'agent:main:webchat:project1-session2',
+        title: 'Session 2',
+        updatedAt: 300,
+        workspace: '/repo/project1',
+        workspaceLabel: 'project1',
+        workspaceDisplayPath: '/repo/project1',
+      } as RawSessionItem),
+      session({
+        key: 'agent:main:webchat:project2-session3',
+        title: 'Session 3',
+        updatedAt: 200,
+        workspace: '/repo/project2',
+        workspaceLabel: 'project2',
+        workspaceDisplayPath: '/repo/project2',
+      } as RawSessionItem),
+      session({
+        key: 'agent:main:webchat:session4',
+        title: 'Session 4',
+        updatedAt: 100,
+      }),
+    ])
+
+    expect(sectionFor(sections, 'chats').rows.map(r => ({
+      rowKind: r.rowKind,
+      key: r.key,
+      title: r.title,
+      depth: r.depth,
+    }))).toEqual([
+      { rowKind: 'workspace', key: 'workspace:/repo/project1', title: 'project1', depth: 0 },
+      { rowKind: 'session', key: 'agent:main:webchat:project1-session1', title: 'Session 1', depth: 1 },
+      { rowKind: 'session', key: 'agent:main:webchat:project1-session2', title: 'Session 2', depth: 1 },
+      { rowKind: 'workspace', key: 'workspace:/repo/project2', title: 'project2', depth: 0 },
+      { rowKind: 'session', key: 'agent:main:webchat:project2-session3', title: 'Session 3', depth: 1 },
+      { rowKind: 'session', key: 'agent:main:webchat:session4', title: 'Session 4', depth: 0 },
+    ])
+  })
+
+  it('nests subagent rows one level deeper inside their workspace group', () => {
+    const parentKey = 'agent:main:webchat:workspace-parent'
+    const sections = arrangeSidebarSections([
+      session({
+        key: parentKey,
+        title: 'Parent chat',
+        updatedAt: 200,
+        workspace: '/repo/project',
+        workspaceLabel: 'project',
+      } as RawSessionItem),
+      session({
+        key: 'agent:main:subagent:workspace-child',
+        title: 'Subagent task',
+        updatedAt: 150,
+        workspace: '/repo/project',
+        workspaceLabel: 'project',
+        parent: { key: parentKey, title: 'Parent chat', spawnDepth: 1 },
+      } as RawSessionItem),
+    ])
+
+    expect(sectionFor(sections, 'chats').rows.map(r => ({
+      rowKind: r.rowKind,
+      key: r.key,
+      depth: r.depth,
+    }))).toEqual([
+      { rowKind: 'workspace', key: 'workspace:/repo/project', depth: 0 },
+      { rowKind: 'session', key: parentKey, depth: 1 },
+      { rowKind: 'session', key: 'agent:main:subagent:workspace-child', depth: 2 },
+    ])
+  })
+})
+
 describe('arrangeSidebarSections — recency ordering', () => {
   it('orders rows within a family newest-first', () => {
     const sections = arrangeSidebarSections([

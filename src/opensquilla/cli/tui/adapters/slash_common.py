@@ -48,6 +48,21 @@ async def dispatch_theme_command(cmd: str, tui_output: TuiOutputHandle | None) -
     await handle_theme_command(cmd, tui_output)
 
 
+def output_supports_host_ui(tui_output: object | None) -> bool:
+    """True when the active chat surface is the OpenTUI host (IPC-capable).
+
+    Mirrors the capability probe in ``handle_theme_command``: the plugin
+    wrapper always exposes a callable ``send_message`` that silently no-ops on
+    the native backend, so prefer its explicit ``supports_send_message`` flag
+    and fall back to ``callable()`` only for an unwrapped handle.
+    """
+    send_message = getattr(tui_output, "send_message", None)
+    supports = getattr(tui_output, "supports_send_message", None)
+    if supports is None:
+        supports = callable(send_message)
+    return bool(supports) and callable(send_message)
+
+
 def record_turn(state: ChatSessionState, prompt: str, result: TurnResult) -> None:
     """Record a completed slash-driven turn on the in-memory session state."""
     state.transcript.add("user", prompt)
@@ -139,6 +154,7 @@ __all__ = [
     "compact_token_stats",
     "default_transcript_path",
     "dispatch_theme_command",
+    "output_supports_host_ui",
     "record_turn",
     "registry_handler_words",
     "resolve_transcript_target",

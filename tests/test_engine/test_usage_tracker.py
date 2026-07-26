@@ -49,6 +49,26 @@ def test_usage_tracker_session_total_equals_sum_across_providers() -> None:
     assert usage._per_model["deepseek/m2"].input_tokens == 2000
 
 
+def test_deployment_breakdown_keeps_same_model_separate_across_providers() -> None:
+    usage = SessionUsage()
+    usage.add(100, 10, "shared-model", provider="provider-a", billed_cost=0.01)
+    usage.add(200, 20, "shared-model", provider="provider-b", billed_cost=0.02)
+
+    # Legacy field remains model-keyed for compatibility.
+    assert usage._per_model is not None
+    assert list(usage._per_model) == ["shared-model"]
+    assert usage._per_model["shared-model"].input_tokens == 300
+
+    by_deployment = {
+        (row["provider"], row["model"]): row for row in usage.deployment_breakdown
+    }
+    assert by_deployment[("provider-a", "shared-model")]["inputTokens"] == 100
+    assert by_deployment[("provider-b", "shared-model")]["inputTokens"] == 200
+    assert sum(row["billedCostUsd"] for row in by_deployment.values()) == pytest.approx(
+        usage.billed_cost
+    )
+
+
 def test_session_usage_add_default_cache_zero() -> None:
     """Existing positional callers (no cache kwargs) still work; cache fields stay at 0."""
     usage = SessionUsage(model_id="claude-opus-4-7")
@@ -286,6 +306,59 @@ def test_usage_tracker_add_forwards_billed_cost() -> None:
     assert usage is not None
     assert usage._per_model is not None
     assert usage._per_model["claude-opus-4-7"].billed_cost == pytest.approx(0.075)
+
+
+def test_confirmed_zero_receipt_is_billed_and_never_reestimated() -> None:
+    tracker = UsageTracker()
+    tracker.add(
+        "session-a",
+        input_tokens=1_000,
+        output_tokens=50,
+        model_id="claude-opus-4-7",
+        billed_cost=0.0,
+        cost_source="provider_billed",
+    )
+
+    usage = tracker.get("session-a")
+    assert usage is not None
+    assert usage.provider_billed_entries == 1
+    assert usage.unbilled_entries == 0
+    assert usage.cost_source == "provider_billed"
+    assert usage.total_cost == 0.0
+    [row] = usage.model_breakdown
+    assert row["costUsd"] == 0.0
+    assert row["billedCostUsd"] == 0.0
+    assert row["estimatedCostUsd"] == 0.0
+    assert row["costSource"] == "provider_billed"
+
+    snapshot = tracker.session_delta_snapshot("session-a", None)
+    assert snapshot is not None
+    assert snapshot.billed_cost == 0.0
+    assert snapshot.cost_usd == 0.0
+    assert snapshot.cost_source == "provider_billed"
+    assert snapshot.provider_billed_entries == 1
+    assert snapshot.unbilled_entries == 0
+
+
+def test_zero_receipt_and_unbilled_call_roll_up_as_mixed() -> None:
+    usage = SessionUsage()
+    usage.add(
+        1_000,
+        50,
+        "claude-opus-4-7",
+        billed_cost=0.0,
+        cost_source="provider_billed",
+    )
+    usage.add(2_000, 80, "claude-opus-4-7", cost_source="opensquilla_estimate")
+
+    assert usage.cost_source == "mixed"
+    assert usage.provider_billed_entries == 1
+    assert usage.unbilled_entries == 1
+    [row] = usage.model_breakdown
+    assert row["costSource"] == "mixed"
+    assert row["billedCostUsd"] == 0.0
+    assert row["estimatedCostUsd"] > 0.0
+    assert row["costUsd"] == row["estimatedCostUsd"]
 
 
 def test_session_billed_cost_aggregates_across_models() -> None:

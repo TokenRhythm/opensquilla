@@ -24,11 +24,26 @@ from opensquilla.sandbox.backend.linux_protected_create import (
     register_protected_create_targets,
     register_synthetic_mount_targets,
 )
+from opensquilla.sandbox.permissions import FileSystemAccess
 
 pytestmark = pytest.mark.skipif(
     not sys.platform.startswith("linux"),
     reason="Linux helper tests require POSIX process-group and seccomp semantics",
 )
+
+
+def test_filesystem_profile_from_legacy_payload_defaults_to_deny() -> None:
+    policy = linux_helper._policy_from_payload(
+        {
+            "fileSystem": {
+                "entries": [],
+                "deniedReadGlobs": [],
+            }
+        }
+    )
+
+    assert policy.file_system is not None
+    assert policy.file_system.default_access is FileSystemAccess.DENY
 
 
 @pytest.mark.asyncio

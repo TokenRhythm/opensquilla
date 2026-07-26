@@ -10,12 +10,14 @@ import pytest
 import structlog.testing
 
 from opensquilla.engine.types import ThinkingLevel
+from opensquilla.provider.compat_policy import compat_policy_for_kind
 from opensquilla.provider.openai import (
     OpenAIProvider,
     _build_openai_tool,
     _stream_timeout,
     _tool_schema_accepts_arguments,
 )
+from opensquilla.provider.selector import build_provider
 from opensquilla.provider.types import (
     ChatConfig,
     ContentBlockToolResult,
@@ -25,6 +27,7 @@ from opensquilla.provider.types import (
     Message,
     ModelCapabilities,
     ProviderHeartbeatEvent,
+    ProviderRequestCorrelation,
     ToolDefinition,
     ToolInputSchema,
     ToolUseEndEvent,
@@ -248,6 +251,44 @@ def _collect(provider: OpenAIProvider, cfg: ChatConfig) -> DoneEvent:
     return asyncio.run(_run())
 
 
+@pytest.mark.parametrize("provider_id", ["dashscope", "deepseek"])
+def test_registry_openai_compat_identity_survives_into_done_event(
+    monkeypatch: Any,
+    provider_id: str,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = build_provider(
+        provider=provider_id,
+        model="test-model",
+        api_key="test-key",
+    )
+
+    assert isinstance(provider, OpenAIProvider)
+    assert provider.provider_name == "openai"  # adapter family stays stable
+    assert provider.provider_id == provider_id
+    assert provider.provider_metadata().provider_kind == provider_id
+    assert provider.provider_metadata().provider_id == provider_id
+
+    done = _collect(provider, ChatConfig())
+    assert done.provider == provider_id
+    assert done.model == "test-model"
+
+
+def test_direct_openai_adapter_defaults_configured_identity_to_family(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(api_key="test-key", model="test-model")
+
+    done = _collect(provider, ChatConfig())
+
+    assert provider.provider_name == "openai"
+    assert provider.provider_id == "openai"
+    assert done.provider == "openai"
+
+
 def test_openrouter_stream_write_timeout_defaults_to_request_timeout(
     monkeypatch: Any,
 ) -> None:
@@ -322,6 +363,71 @@ def test_openrouter_stream_timeout_emits_heartbeat_before_non_stream_fallback(
     )
 
 
+def test_stream_timeout_fallback_preserves_tokenrhythm_correlation_headers(
+    monkeypatch: Any,
+) -> None:
+    stream_headers: dict[str, str] = {}
+    fallback_headers: dict[str, str] = {}
+
+    class TimeoutStream:
+        async def __aenter__(self) -> Any:
+            raise httpx.ReadTimeout("stream idle")
+
+        async def __aexit__(self, *_exc: Any) -> None:
+            return None
+
+    class TimeoutClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> TimeoutClient:
+            return self
+
+        async def __aexit__(self, *_exc: Any) -> None:
+            return None
+
+        def stream(self, *args: Any, **kwargs: Any) -> TimeoutStream:
+            stream_headers.update(kwargs["headers"])
+            return TimeoutStream()
+
+    class CapturingFallbackProvider(OpenAIProvider):
+        async def _complete_non_stream(self, **kwargs: Any):
+            fallback_headers.update(kwargs["headers"])
+            yield DoneEvent(model="deepseek-v4-flash")
+
+    monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", TimeoutClient)
+    provider = CapturingFallbackProvider(
+        api_key="test",
+        model="deepseek-v4-flash",
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+        compat=compat_policy_for_kind("openrouter"),
+    )
+    correlation = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="execution-1",
+        call_kind="agent.chat",
+    )
+
+    _collect(
+        provider,
+        ChatConfig(
+            timeout=1.0,
+            provider_request_correlation=correlation,
+        ),
+    )
+
+    expected = {
+        "X-OpenSquilla-Session-Id": "session-1",
+        "X-OpenSquilla-Turn-Id": "turn-1",
+        "X-OpenSquilla-Execution-Id": "execution-1",
+        "X-OpenSquilla-Call-Kind": "agent.chat",
+    }
+    assert {name: stream_headers[name] for name in expected} == expected
+    assert {name: fallback_headers[name] for name in expected} == expected
+
+
 def test_dashscope_stream_timeout_emits_heartbeat_before_non_stream_fallback(
     monkeypatch: Any,
 ) -> None:
@@ -390,6 +496,145 @@ def test_tokenrhythm_chat_adds_app_attribution_headers(monkeypatch: Any) -> None
     assert captured["url"] == "https://tokenrhythm.studio/v1/chat/completions"
     assert captured["headers"].get("HTTP-Referer") == "https://opensquilla.ai"
     assert captured["headers"].get("X-Title") == "OpenSquilla"
+
+
+def test_tokenrhythm_chat_adds_session_correlation_headers_only(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek-v4-flash",
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+    )
+
+    _collect(
+        provider,
+        ChatConfig(
+            provider_request_correlation=ProviderRequestCorrelation(
+                session_id="session-1",
+                turn_id="turn-1",
+                execution_id="execution-1",
+                call_kind="agent.chat",
+            )
+        ),
+    )
+
+    assert captured["headers"].get("X-OpenSquilla-Session-Id") == "session-1"
+    assert captured["headers"].get("X-OpenSquilla-Turn-Id") == "turn-1"
+    assert captured["headers"].get("X-OpenSquilla-Execution-Id") == "execution-1"
+    assert captured["headers"].get("X-OpenSquilla-Call-Kind") == "agent.chat"
+    serialized_payload = json.dumps(captured["payload"], sort_keys=True)
+    assert "session-1" not in serialized_payload
+    assert "turn-1" not in serialized_payload
+    assert "execution-1" not in serialized_payload
+    assert "agent.chat" not in serialized_payload
+
+
+def test_tokenrhythm_chat_never_forwards_correlation_across_redirects(
+    monkeypatch: Any,
+) -> None:
+    requests: list[httpx.Request] = []
+    client_options: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.host == "tokenrhythm.studio":
+            return httpx.Response(
+                307,
+                headers={"location": "https://untrusted.example/v1/chat/completions"},
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse_body(),
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        client_options["follow_redirects"] = kwargs.get("follow_redirects")
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.httpx.AsyncClient",
+        patched_async_client,
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek-v4-flash",
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+    )
+
+    config = ChatConfig(
+        provider_request_correlation=ProviderRequestCorrelation(
+            session_id="session-1",
+            turn_id="turn-1",
+            execution_id="execution-1",
+            call_kind="agent.chat",
+        )
+    )
+
+    async def collect_events() -> list[Any]:
+        return [
+            event
+            async for event in provider.chat(
+                [Message(role="user", content="hi")],
+                config=config,
+            )
+        ]
+
+    events = asyncio.run(collect_events())
+
+    assert client_options["follow_redirects"] is False
+    assert len(requests) == 1
+    assert requests[0].url.host == "tokenrhythm.studio"
+    assert requests[0].headers["X-OpenSquilla-Session-Id"] == "session-1"
+    assert any(isinstance(event, ErrorEvent) for event in events)
+
+
+@pytest.mark.parametrize(
+    ("provider_kind", "base_url"),
+    [
+        ("openrouter", "https://openrouter.ai/api/v1"),
+        ("tokenrhythm", "https://proxy.example.com/v1"),
+    ],
+)
+def test_session_correlation_is_not_sent_to_other_or_custom_provider_origins(
+    monkeypatch: Any,
+    provider_kind: str,
+    base_url: str,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="test-model",
+        base_url=base_url,
+        provider_kind=provider_kind,
+    )
+
+    _collect(
+        provider,
+        ChatConfig(
+            provider_request_correlation=ProviderRequestCorrelation(
+                session_id="session-1",
+                turn_id="turn-1",
+                execution_id="execution-1",
+                call_kind="agent.chat",
+            )
+        ),
+    )
+
+    assert "X-OpenSquilla-Session-Id" not in captured["headers"]
+    assert "X-OpenSquilla-Turn-Id" not in captured["headers"]
+    assert "X-OpenSquilla-Execution-Id" not in captured["headers"]
+    assert "X-OpenSquilla-Call-Kind" not in captured["headers"]
 
 
 def test_tokenrhythm_list_models_adds_app_attribution_headers(
@@ -608,6 +853,22 @@ def _collect_events(
         ]
 
     return asyncio.run(_run())
+
+
+def _assert_invalid_native_arguments_fail_closed(
+    events: list[Any],
+    *,
+    raw_arguments: str,
+) -> None:
+    assert not any(isinstance(event, ToolUseEndEvent) for event in events)
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    error = next(
+        event
+        for event in events
+        if isinstance(event, ErrorEvent) and event.code == "incomplete_tool_call"
+    )
+    assert raw_arguments not in error.message
+    assert "_raw" not in error.message
 
 
 def test_strict_source_edit_profile_provider_payload_exposes_exact_tool_surface(
@@ -1595,6 +1856,52 @@ def test_dashscope_cache_off_does_not_mark_messages(monkeypatch: Any) -> None:
     assert "cache_control" not in payload
     assert payload["messages"][0] == {"role": "system", "content": "stable base"}
     assert payload["messages"][1] == {"role": "user", "content": "hi"}
+
+
+def test_openrouter_sends_configured_json_output_schema(monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek/deepseek-v4-pro",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"outcome": {"type": "string", "enum": ["allow", "deny"]}},
+        "required": ["outcome"],
+    }
+
+    _collect(
+        provider,
+        ChatConfig(output_json_schema=schema, output_json_schema_strict=False),
+    )
+
+    assert captured["payload"]["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "structured_output",
+            "strict": False,
+            "schema": schema,
+        },
+    }
+
+
+def test_openrouter_omits_response_format_without_output_schema(monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek/deepseek-v4-pro",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+
+    _collect(provider, ChatConfig())
+
+    assert "response_format" not in captured["payload"]
 
 
 def test_dashscope_repeated_history_tool_calls_preserves_duplicate_replay_protocol(
@@ -2818,7 +3125,7 @@ def test_gemini_stream_tool_call_without_index_is_tolerated(monkeypatch: Any) ->
     assert done.model == "gemini-2.5-flash"
 
 
-def test_stream_malformed_tool_arguments_logs_and_preserves_raw(
+def test_stream_malformed_tool_arguments_fail_closed_without_raw_end(
     monkeypatch: Any,
 ) -> None:
     raw_arguments = '{"path":"demo.py","new_text":"unterminated'
@@ -2888,13 +3195,13 @@ def test_stream_malformed_tool_arguments_logs_and_preserves_raw(
     with structlog.testing.capture_logs() as captured:
         events = _collect_events(provider, ChatConfig(), tools=[tool])
 
-    tool_end = next(event for event in events if isinstance(event, ToolUseEndEvent))
     invalid_log = next(
         item for item in captured if item["event"] == "provider.tool_arguments_json_invalid"
     )
-    assert tool_end.tool_use_id == "call_edit"
-    assert tool_end.tool_name == "edit_file"
-    assert tool_end.arguments == {"_raw": raw_arguments}
+    _assert_invalid_native_arguments_fail_closed(
+        events,
+        raw_arguments=raw_arguments,
+    )
     assert invalid_log["provider"] == "dashscope"
     assert invalid_log["model"] == "qwen3.6-flash"
     assert invalid_log["tool"] == "edit_file"
@@ -2991,7 +3298,7 @@ def test_stream_dashscope_recovers_qwen_json_text_tool_call(
     monkeypatch: Any,
 ) -> None:
     text_tool_call = (
-        'thinking out loud<tool_call>{"name":"edit_file","arguments":'
+        'thinking out loud\n<tool_call>{"name":"edit_file","arguments":'
         '{"path":"demo.py","old_text":"old","new_text":"new"}}</tool_call>'
     )
 
@@ -3423,8 +3730,10 @@ def test_stream_dashscope_reports_repaired_edit_file_alias_conflicts(
     with structlog.testing.capture_logs() as captured:
         events = _collect_events(provider, ChatConfig(), tools=[tool])
 
-    tool_end = next(event for event in events if isinstance(event, ToolUseEndEvent))
-    assert tool_end.arguments == {"_raw": raw_arguments}
+    _assert_invalid_native_arguments_fail_closed(
+        events,
+        raw_arguments=raw_arguments,
+    )
     assert any(
         item["event"] == "provider.tool_arguments_alias_conflict" and item["tool"] == "edit_file"
         for item in captured
@@ -3506,8 +3815,10 @@ def test_stream_dashscope_rejects_repaired_tool_arguments_with_wrong_type(
     with structlog.testing.capture_logs() as captured:
         events = _collect_events(provider, ChatConfig(), tools=[tool])
 
-    tool_end = next(event for event in events if isinstance(event, ToolUseEndEvent))
-    assert tool_end.arguments == {"_raw": raw_arguments}
+    _assert_invalid_native_arguments_fail_closed(
+        events,
+        raw_arguments=raw_arguments,
+    )
     assert any(
         item["event"] == "provider.tool_arguments_json_invalid"
         and item["reason"] == "schema_validation_failed"
@@ -3841,8 +4152,10 @@ def test_stream_dashscope_keeps_unrepairable_tool_arguments_invalid(
     with structlog.testing.capture_logs() as captured:
         events = _collect_events(provider, ChatConfig(), tools=[tool])
 
-    tool_end = next(event for event in events if isinstance(event, ToolUseEndEvent))
-    assert tool_end.arguments == {"_raw": raw_arguments}
+    _assert_invalid_native_arguments_fail_closed(
+        events,
+        raw_arguments=raw_arguments,
+    )
     assert any(item["event"] == "provider.tool_arguments_json_invalid" for item in captured)
     assert not any(item["event"] == "provider.tool_arguments_json_repaired" for item in captured)
 
@@ -4002,8 +4315,10 @@ def test_stream_openrouter_does_not_repair_dashscope_wrappers(
     with structlog.testing.capture_logs() as captured:
         events = _collect_events(provider, ChatConfig(), tools=[tool])
 
-    tool_end = next(event for event in events if isinstance(event, ToolUseEndEvent))
-    assert tool_end.arguments == {"_raw": raw_arguments}
+    _assert_invalid_native_arguments_fail_closed(
+        events,
+        raw_arguments=raw_arguments,
+    )
     assert any(item["event"] == "provider.tool_arguments_json_invalid" for item in captured)
     assert not any(item["event"] == "provider.tool_arguments_json_repaired" for item in captured)
 
@@ -4465,7 +4780,7 @@ def _patch_stream_transport(monkeypatch: Any, handler: Any) -> None:
     monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", patched_async_client)
 
 
-def test_stream_error_frame_skipped_by_default(monkeypatch: Any) -> None:
+def test_stream_error_frame_is_unconditionally_terminal(monkeypatch: Any) -> None:
     monkeypatch.delenv("OPENSQUILLA_PROVIDER_STREAM_ERROR_FRAMES", raising=False)
     _patch_stream_transport(monkeypatch, _stream_error_frame_handler)
     provider = OpenAIProvider(
@@ -4477,9 +4792,9 @@ def test_stream_error_frame_skipped_by_default(monkeypatch: Any) -> None:
 
     events = _collect_events(provider, ChatConfig())
 
-    assert not any(isinstance(event, ErrorEvent) for event in events)
-    done = next(event for event in events if isinstance(event, DoneEvent))
-    assert done.stop_reason == "stop"
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "502"
+    assert not any(isinstance(event, DoneEvent) for event in events)
 
 
 def test_stream_error_frame_env_surfaces_error_event(monkeypatch: Any) -> None:

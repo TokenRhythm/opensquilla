@@ -19,10 +19,13 @@ available on all platforms (notably Windows without a libolm wheel).
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
 import html
 import inspect
 import json
 import mimetypes
+import os
 import re
 import sys
 import time
@@ -45,6 +48,7 @@ from opensquilla.channels._util import EventDedupeCache
 from opensquilla.channels.contract import (
     ChannelCapabilities,
     ChannelCapabilityProfile,
+    ChannelLengthUnit,
     ChannelPlatformCapability,
     ChannelPlatformCapabilityStatus,
     ChannelPlatformCategories,
@@ -53,15 +57,18 @@ from opensquilla.channels.contract import (
 )
 from opensquilla.channels.types import (
     Attachment,
+    AuthenticatedPrincipal,
     ChannelHealth,
     IncomingMessage,
+    IngressProvenance,
+    IngressVerification,
     OutgoingMessage,
 )
 
 log = structlog.get_logger(__name__)
 
 # Channel-contract constants pinned by the adapter audit.
-CAPABILITY_TIER = "GREEN-shipping"
+CAPABILITY_TIER = "YELLOW-experimental"
 
 # Matrix is a DM/group channel — the permission matrix denies admin-only.
 DM_SAFETY_TIERS: tuple[str, ...] = ("safe", "confirm")
@@ -78,7 +85,7 @@ FATAL_ERROR_CLASSES: tuple[str, ...] = (
     "contract_violation",
 )
 
-SESSION_SCHEMA_VERSION = 1
+SESSION_SCHEMA_VERSION = 2
 
 
 class MatrixChannelConfig(BaseModel):
@@ -126,6 +133,7 @@ class MatrixChannel:
     _stream_event_id: str | None = field(default=None, init=False, repr=False)
     _last_edit_at: float = field(default=0.0, init=False, repr=False)
     _dedupe: EventDedupeCache = field(init=False, repr=False)
+    _direct_room_ids: set[str] = field(default_factory=set, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._dedupe = EventDedupeCache(max_size=self.config.event_dedupe_size)
@@ -134,6 +142,9 @@ class MatrixChannel:
     def capability_profile(self) -> ChannelCapabilityProfile:
         return ChannelCapabilityProfile(
             channel_type="matrix",
+            max_message_len=20000,
+            length_unit=ChannelLengthUnit.UTF8_BYTES,
+            splits_natively=False,
             group_chat=True,
             mentions=True,
             native_file_upload=True,
@@ -141,7 +152,8 @@ class MatrixChannel:
             reply=True,
             edit=True,
             delete=True,
-            transports=("websocket",),
+            streamed_message_replacement=True,
+            transports=("http_sync",),
         )
 
     @property
@@ -176,8 +188,13 @@ class MatrixChannel:
 
     def _state_dir(self) -> Path:
         base = Path(self.config.workspace_dir) if self.config.workspace_dir else Path.cwd()
-        path = base / "state" / "matrix"
-        path.mkdir(parents=True, exist_ok=True)
+        account_key = hashlib.sha256(
+            (f"{self.config.homeserver_url}\0{self.config.user_id}\0{self.config.name}").encode()
+        ).hexdigest()[:16]
+        path = base / "state" / "matrix" / account_key
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with contextlib.suppress(OSError):
+            path.chmod(0o700)
         return path
 
     def _session_path(self) -> Path:
@@ -205,6 +222,12 @@ class MatrixChannel:
                 found=data.get("schema_version"),
             )
             return None
+        if data.get("homeserver_url") != self.config.homeserver_url:
+            log.warning("matrix.session_homeserver_mismatch")
+            return None
+        if self.config.user_id and data.get("user_id") != self.config.user_id:
+            log.warning("matrix.session_user_mismatch")
+            return None
         log.info("matrix.session_loaded", user_id=data.get("user_id"))
         return cast(dict[str, Any], data)
 
@@ -212,11 +235,27 @@ class MatrixChannel:
         path = self._session_path()
         payload = {
             "schema_version": SESSION_SCHEMA_VERSION,
+            "homeserver_url": self.config.homeserver_url,
             "user_id": user_id,
             "device_id": device_id,
             "access_token": access_token,
         }
-        path.write_text(json.dumps(payload), encoding="utf-8")
+        temporary = path.with_suffix(".tmp")
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.replace(path)
+            path.chmod(0o600)
+        finally:
+            with contextlib.suppress(OSError):
+                temporary.unlink()
 
     # ------------------------------------------------------------------
     # Olm gating
@@ -316,6 +355,22 @@ class MatrixChannel:
 
         client.add_event_callback(self._on_room_message_media, RoomMessageMedia)
 
+        list_direct_rooms = getattr(client, "list_direct_rooms", None)
+        if callable(list_direct_rooms):
+            try:
+                direct_response = await list_direct_rooms()
+                direct_mapping = getattr(direct_response, "rooms", {})
+                if isinstance(direct_mapping, dict):
+                    self._direct_room_ids = {
+                        str(room_id)
+                        for room_ids in direct_mapping.values()
+                        if isinstance(room_ids, list)
+                        for room_id in room_ids
+                        if room_id
+                    }
+            except Exception as exc:
+                log.warning("matrix.direct_rooms_load_failed", error=str(exc))
+
         self._client = client
         self._sync_task = asyncio.create_task(self._sync_forever())
         self._connected = True
@@ -329,6 +384,8 @@ class MatrixChannel:
             raise
         except Exception as exc:  # pragma: no cover - defensive
             log.warning("matrix.sync_failed", error=str(exc))
+        finally:
+            self._connected = False
 
     async def stop(self) -> None:
         """Cancel the sync task and close the underlying client."""
@@ -355,20 +412,16 @@ class MatrixChannel:
 
     async def health_check(self) -> ChannelHealth:
         return ChannelHealth(
-            connected=self._connected,
+            connected=(
+                self._connected and self._sync_task is not None and not self._sync_task.done()
+            ),
             bot_user_id=self._bot_user_id,
             last_message_at=self._last_message_at,
         )
 
-    @staticmethod
-    def _is_direct_room(room: Any) -> bool:
-        member_count = getattr(room, "member_count", None)
-        if isinstance(member_count, int):
-            return member_count <= 2
-        joined_members = getattr(room, "joined_members", None)
-        if isinstance(joined_members, dict):
-            return len(joined_members) <= 2
-        return False
+    def _is_direct_room(self, room: Any) -> bool:
+        """Use the Matrix ``m.direct`` account-data mapping as authority."""
+        return str(getattr(room, "room_id", "")) in self._direct_room_ids
 
     @staticmethod
     def _event_content(event: Any) -> dict[str, Any]:
@@ -414,7 +467,7 @@ class MatrixChannel:
         mention_user_ids = self._extract_mention_user_ids(getattr(event, "source", None))
         is_group = not self._is_direct_room(room)
         msg = IncomingMessage(
-            sender_id=sender,
+            sender_id=str(sender),
             channel_id=room_id,
             content=body,
             metadata={
@@ -426,8 +479,18 @@ class MatrixChannel:
                 "server_timestamp": server_ts,
                 "mention_user_ids": mention_user_ids,
             },
+            provenance=IngressProvenance(
+                provider="matrix",
+                account_id=self.config.name,
+                transport="http_sync",
+                verification=IngressVerification.SDK_SESSION,
+                event_id=str(event_id or "") or None,
+                principal=AuthenticatedPrincipal(subject_id=str(sender)),
+            ),
         )
-        self._queue.put_nowait(msg)
+        from opensquilla.channels.delivery_store import durable_enqueue
+
+        durable_enqueue(self, msg, self._queue)
         log.debug(
             "matrix.inbound_received",
             room_id=room_id,
@@ -477,7 +540,7 @@ class MatrixChannel:
         mention_user_ids = self._extract_mention_user_ids(getattr(event, "source", None))
         is_group = not self._is_direct_room(room)
         msg = IncomingMessage(
-            sender_id=sender,
+            sender_id=str(sender),
             channel_id=room_id,
             content=f"[{kind}] {body}".strip(),
             attachments=attachments,
@@ -491,8 +554,18 @@ class MatrixChannel:
                 "media_kind": kind,
                 "mention_user_ids": mention_user_ids,
             },
+            provenance=IngressProvenance(
+                provider="matrix",
+                account_id=self.config.name,
+                transport="http_sync",
+                verification=IngressVerification.SDK_SESSION,
+                event_id=str(event_id or "") or None,
+                principal=AuthenticatedPrincipal(subject_id=str(sender)),
+            ),
         )
-        self._queue.put_nowait(msg)
+        from opensquilla.channels.delivery_store import durable_enqueue
+
+        durable_enqueue(self, msg, self._queue)
         log.debug(
             "matrix.inbound_media_received",
             room_id=room_id,
@@ -534,9 +607,7 @@ class MatrixChannel:
                 metadata={**attachment.metadata, "matrix_mxc_url": mxc_url},
             )
 
-        raise RuntimeError(
-            "Matrix client does not expose bounded media streaming for attachments"
-        )
+        raise RuntimeError("Matrix client does not expose bounded media streaming for attachments")
 
     async def _stream_matrix_attachment(
         self,
@@ -625,12 +696,38 @@ class MatrixChannel:
             raise RuntimeError("Matrix outbound requires a room_id (reply_to)")
         formatted = self._render_html(message.content)
         content = self._build_text_content(message.content, formatted)
-        await self._client.room_send(
+        reply_event_id = message.metadata.get("reply_event_id")
+        if isinstance(reply_event_id, str) and reply_event_id:
+            content["m.relates_to"] = {"m.in_reply_to": {"event_id": reply_event_id}}
+        response = await self._client.room_send(
             room_id=room_id,
             message_type="m.room.message",
             content=content,
         )
+        if not getattr(response, "event_id", None):
+            raise RuntimeError(f"Matrix send failed: {response!r}")
         log.debug("matrix.outbound_sent", room_id=room_id)
+
+    def build_reply_message(
+        self,
+        content: str,
+        inbound: IncomingMessage,
+    ) -> OutgoingMessage:
+        """Pin a batch reply to the room (and event) that triggered the turn."""
+        metadata: dict[str, Any] = {"room_id": inbound.channel_id}
+        event_id = inbound.metadata.get("event_id")
+        if isinstance(event_id, str) and event_id:
+            metadata["reply_event_id"] = event_id
+        return OutgoingMessage(
+            content=content,
+            reply_to=inbound.channel_id,
+            metadata=metadata,
+        )
+
+    def streaming_reply_kwargs(self, inbound: IncomingMessage) -> dict[str, Any]:
+        """Pin a streaming reply and its terminal replacement to one room."""
+        return {"room_id": inbound.channel_id}
+
 
     async def send_file(
         self,
@@ -679,18 +776,41 @@ class MatrixChannel:
             return str(upload_result.get("content_uri", ""))
         return str(getattr(upload_result, "content_uri", ""))
 
-    async def edit(self, message_id: str, content: str) -> None:
+    @staticmethod
+    def _message_route(
+        message_id: str,
+        room_id: str | None,
+    ) -> tuple[str, str]:
+        encoded_room, separator, encoded_event = message_id.partition("|")
+        if room_id:
+            if separator and encoded_room and encoded_room != room_id:
+                raise RuntimeError("Matrix edit/delete route does not match message handle")
+            event_id = encoded_event if separator else message_id
+            if event_id:
+                return room_id, event_id
+        if separator and encoded_room and encoded_event:
+            return encoded_room, encoded_event
+        raise RuntimeError(
+            "Matrix edit/delete requires room_id or '<room_id>|<event_id>'"
+        )
+
+    async def edit(
+        self,
+        message_id: str,
+        content: str,
+        *,
+        room_id: str | None = None,
+    ) -> None:
         """Edit a previously sent event by ``event_id`` via ``m.replace``.
 
         ``message_id`` is encoded as ``<room_id>|<event_id>`` so the
-        adapter can resolve both halves without storing per-event state
-        on the channel object.
+        adapter can resolve both halves without storing per-event state on the
+        channel object. Streaming dispatch may instead pass the pinned
+        ``room_id`` route alongside the historical raw event-id return value.
         """
         if self._client is None:
             raise RuntimeError("Matrix adapter not started")
-        room_id, _, event_id = message_id.partition("|")
-        if not room_id or not event_id:
-            raise RuntimeError("Matrix edit requires '<room_id>|<event_id>'")
+        target_room, event_id = self._message_route(message_id, room_id)
         formatted = self._render_html(content)
         new_content = self._build_text_content(content, formatted)
         payload = {
@@ -703,19 +823,22 @@ class MatrixChannel:
             },
         }
         await self._client.room_send(
-            room_id=room_id,
+            room_id=target_room,
             message_type="m.room.message",
             content=payload,
         )
 
-    async def delete(self, message_id: str) -> None:
+    async def delete(
+        self,
+        message_id: str,
+        *,
+        room_id: str | None = None,
+    ) -> None:
         """Delete (redact) a previously sent event."""
         if self._client is None:
             raise RuntimeError("Matrix adapter not started")
-        room_id, _, event_id = message_id.partition("|")
-        if not room_id or not event_id:
-            raise RuntimeError("Matrix delete requires '<room_id>|<event_id>'")
-        await self._client.room_redact(room_id=room_id, event_id=event_id)
+        target_room, event_id = self._message_route(message_id, room_id)
+        await self._client.room_redact(room_id=target_room, event_id=event_id)
 
     # ------------------------------------------------------------------
     # Streaming (edit-throttled)

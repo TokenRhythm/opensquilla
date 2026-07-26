@@ -187,31 +187,6 @@
   gap: var(--sp-1);
 }
 
-.setup-runtime {
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  padding: var(--sp-3);
-}
-
-.setup-runtime__row {
-  align-items: center;
-  border-bottom: 1px solid var(--border);
-  display: flex;
-  font-size: var(--fs-sm);
-  gap: var(--sp-2);
-  justify-content: space-between;
-  padding: 6px 0;
-}
-
-.setup-runtime__row.is-ok strong {
-  color: var(--ok);
-}
-
-.setup-runtime__row.is-warn strong {
-  color: var(--warn);
-}
-
 .setup-muted {
   color: var(--text-dim);
   font-size: var(--fs-sm);

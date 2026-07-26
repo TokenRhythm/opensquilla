@@ -68,6 +68,7 @@ _EXPECTED_CATALOG_SOURCES: dict[str, tuple[str, ...]] = {
     "gemini": ("google",),
     "dashscope": ("alibaba-cn", "alibaba"),
     "bailian_coding": ("alibaba", "alibaba-cn"),
+    "bailian_coding_cn": ("alibaba-cn", "alibaba"),
     "moonshot": ("moonshotai",),
     "zhipu": ("zhipuai", "zai"),
     "minimax": ("minimax",),

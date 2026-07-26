@@ -21,70 +21,30 @@
       </div>
     </div>
 
-    <!-- Header -->
-    <div v-if="!isNewChatLanding" class="chat-header">
-      <div class="chat-header-left">
-        <label class="chat-label" :title="sessionKey">{{ currentChatTitle }}</label>
-        <button
-          class="chat-session-copy-btn"
-          :class="{ 'chat-session-copy-btn--ok': sessionCopyState === 'ok' }"
-          :title="sessionCopyState === 'ok' ? t('chat.copied') : t('chat.copySessionKey')"
-          :aria-label="sessionCopyState === 'ok' ? t('chat.copied') : t('chat.copySessionKey')"
-          @click="onSessionCopyClick"
-        >
-          <Icon :name="sessionCopyIcon" :size="14" />
-        </button>
-        <span class="chat-copy-live" aria-live="polite">{{ sessionCopyLiveText }}</span>
-      </div>
-      <div class="chat-header-right">
-        <button
-          v-if="sessionArtifacts.length > 0"
-          type="button"
-          class="chat-share-btn chat-deliverables-btn"
-          :title="t('chat.deliverablesCount', { count: sessionArtifacts.length })"
-          :aria-label="t('chat.deliverablesCount', { count: sessionArtifacts.length })"
-          @click="openDeliverables"
-        >
-          <Icon name="download" :size="14" />
-          <span class="chat-share-btn__label">{{ t('chat.deliverablesCount', { count: sessionArtifacts.length }) }}</span>
-        </button>
-        <button
-          v-if="appStore.features.metaRuns"
-          type="button"
-          class="chat-share-btn"
-          :title="t('chat.metaRunHistory')"
-          :aria-label="t('chat.metaRunHistory')"
-          @click="metaRunsHistoryOpen = true"
-        >
-          <Icon name="clock" :size="14" />
-          <span class="chat-share-btn__label">{{ t('chat.runs') }}</span>
-        </button>
-        <button
-          v-if="!shareMode"
-          ref="shareEntryBtnRef"
-          type="button"
-          class="chat-share-btn"
-          :disabled="shareableMessageCount === 0"
-          :title="shareableMessageCount === 0 ? t('chat.shareSendFirst') : t('chat.shareSelectHint')"
-          :aria-label="shareableMessageCount === 0 ? t('chat.shareSendFirst') : t('chat.share')"
-          @click="startShareMode"
-        >
-          <Icon name="share" :size="14" />
-          <span class="chat-share-btn__label">{{ t('chat.share') }}</span>
-        </button>
-        <span
-          v-if="contextWarning"
-          class="chat-chip chat-ctx-warn"
-          :title="t('chat.contextPressureTitle', { used: contextWarning.usedK, window: contextWarning.windowK, pct: contextWarning.pct })"
-        >{{ t('chat.contextPressure', { pct: contextWarning.pct }) }}</span>
-        <span class="chat-chip" :class="runStatusChipClass" :title="runStatusTitle">{{ runStatusLabel }}</span>
-      </div>
-    </div>
+    <!-- Chat owns the actions; App owns their stable, in-flow shell position. -->
+    <Teleport to="#app-route-header">
+      <ChatHeaderActions
+        v-if="!isNewChatLanding"
+        ref="chatHeaderActionsRef"
+        :title="currentChatTitle"
+        :session-key="sessionKey"
+        :copy-state="sessionCopyState"
+        :copy-icon="sessionCopyIcon"
+        :copy-live-text="sessionCopyLiveText"
+        :deliverable-count="sessionArtifacts.length"
+        :run-history-visible="appStore.features.metaRuns"
+        :share-mode="shareMode"
+        :shareable-message-count="shareableMessageCount"
+        @open-deliverables="openDeliverables"
+        @open-run-history="openMetaRunHistory"
+        @start-share="startShareMode"
+        @copy-session-key="onSessionCopyClick"
+      />
+    </Teleport>
 
     <!-- Thread -->
     <div class="chat-body">
-      <!-- Share-mode banner: pinned above the scrolling thread, below the
-           header, so it can never collide with the floating topbar cluster. -->
+      <!-- Share-mode banner stays pinned above the scrolling thread. -->
       <div
         v-if="shareMode"
         ref="shareBannerRef"
@@ -115,59 +75,12 @@
           ref="threadRef"
           class="chat-thread"
           role="region"
+          tabindex="0"
           :aria-label="t('chat.conversation')"
           :aria-busy="isStreaming"
           @scroll="onThreadScroll"
         >
         <template v-if="isNewChatLanding">
-          <div ref="agentSwitcherRef" class="chat-landing-agent">
-            <button
-              type="button"
-              class="chat-landing-agent__btn"
-              aria-haspopup="menu"
-              :aria-expanded="agentSwitcherOpen"
-              :title="t('chat.agentLabel', { name: landingAgentName })"
-              @click.stop="toggleAgentSwitcher"
-            >
-              <Icon name="agents" :size="14" />
-              <span class="chat-landing-agent__name">{{ landingAgentName }}</span>
-              <Icon class="chat-landing-agent__chevron" name="chevronDown" :size="13" />
-            </button>
-            <div
-              v-if="agentSwitcherOpen"
-              class="chat-landing-agent__menu"
-              role="menu"
-              :aria-label="t('chat.chooseAgent')"
-              @keydown="onAgentSwitcherKeydown"
-            >
-              <button
-                v-for="agent in selectableAgents"
-                :key="agent.id"
-                type="button"
-                class="chat-landing-agent__item"
-                role="menuitemradio"
-                :aria-checked="agent.id === landingAgentId"
-                @click.stop="pickDraftAgent(agent.id)"
-              >
-                <span class="chat-landing-agent__item-name">{{ agent.name }}</span>
-                <Icon
-                  v-if="agent.id === landingAgentId"
-                  class="chat-landing-agent__check"
-                  name="check"
-                  :size="14"
-                />
-              </button>
-              <button
-                type="button"
-                class="chat-landing-agent__item chat-landing-agent__item--create"
-                role="menuitem"
-                @click.stop="createAgentFromSwitcher"
-              >
-                <Icon name="plus" :size="14" />
-                <span>{{ t('chat.createAgent') }}</span>
-              </button>
-            </div>
-          </div>
           <div class="chat-landing-brand" :aria-label="t('chat.newChatBrand')">
             <EmptyStateChips
               :key="landingAgentId"
@@ -178,10 +91,19 @@
           </div>
         </template>
         <div v-else-if="messages.length === 0 && !isStreaming" class="chat-empty">{{ t('chat.noMessagesYet') }}</div>
-        <ChatHistoryScopeRow
+        <HistoryLoadSentinel
           v-if="!isNewChatLanding"
-          :state="historyState"
+          :scroll-container="threadRef"
+          :has-more="historyState.hasMore"
+          :loading="historyState.loadingEarlier"
+          :blocked="historyState.loading"
+          :error="historyState.loadEarlierError"
+          :canonical-available="historyState.canonicalAvailable"
+          :canonical-complete="historyState.canonicalComplete"
+          :cursor="historyState.oldestCursor"
+          :session-key="sessionKey"
           @load-earlier="loadEarlierHistory"
+          @retry="retryHistory"
         />
 
         <ChatMessageList
@@ -203,6 +125,7 @@
           :tool-status-text="toolStatusText"
           :tool-secondary-text="toolSecondaryText"
           :copy-message="copyMessage"
+          :download-attachment="downloadAttachment"
           :fork-busy="forkInFlight"
           @fork-conversation="forkConversation"
           @edit-message="editMessage"
@@ -223,8 +146,8 @@
           </template>
         </ChatMessageList>
 
-        <!-- Pre-reveal router phase: shown only before the live work-card owns
-             the turn. Once the work-card is visible, execution status becomes
+        <!-- Pre-reveal router phase: shown only before the live activity owns
+             the turn. Once activity is visible, execution status becomes
              the single primary progress surface. -->
         <RouterFxStrip
           v-if="routerStripReserve"
@@ -251,56 +174,71 @@
           />
         </template>
 
-        <!-- Streaming AI message: the live run is promoted into a centered
-             work card so it owns the focus while the agent works. -->
-        <div v-if="isStreaming && streamBubble && answerRevealOpen" class="msg-ai" data-history-role="assistant" aria-live="polite">
+        <!-- Streaming AI message: activity stays open and flat while the turn
+             is live. The trailing text segment is rendered below it as the
+             current answer candidate; if a later tool starts, that text moves
+             back into the chronological activity transcript. -->
+        <!-- No blanket aria-live here: the phase label inside ActivityDisclosure
+             is the single live announcement point, so streaming DOM churn (tool
+             rows, answer tokens) is not read out mutation-by-mutation. -->
+        <div v-if="isStreaming && streamBubble && answerRevealOpen" class="msg-ai" data-history-role="assistant">
           <div class="msg-ai-main">
-            <section
-              class="work-card"
-              :class="{ 'work-card--stale': streamActivityStale }"
-              role="status"
-              aria-live="polite"
+            <ActivityDisclosure
+              :lifecycle="liveAnswerPart ? 'answering' : 'working'"
+              :step-count="liveActivityStepCount"
+              :failure-count="liveActivityFailureCount"
+              :phase-label="liveActivityPhaseLabel"
+              :elapsed-label="streamPhaseElapsed"
+              :stale="streamActivityStale"
             >
-              <header v-if="streamActivityVisible" class="work-card__head stream-activity">
-                <span class="work-card__dot" aria-hidden="true" />
-                <span class="work-card__phase" :class="{ 'activity-shimmer': !streamActivityStale }">{{ liveWorkCardPhaseLabel }}</span>
-                <span v-if="streamPhaseElapsed" class="work-card__elapsed">{{ streamPhaseElapsed }}</span>
-                <span class="work-card__step">{{ liveWorkCardStepLabel }}</span>
-              </header>
+              <!-- Reasoning remains available as a flat, secondary disclosure,
+                   rendered by the same part component settled turns use so the
+                   chevron affordance and wording stay consistent; `live`
+                   selects the streaming "Thinking · Ns" label. -->
+              <ReasoningPart v-if="liveReasoningPart" :part="liveReasoningPart" live />
 
-              <!-- Live model reasoning: collapsed by default, expandable mid-turn -->
-              <details v-if="liveThinkingText" class="thinking-fold">
-                <summary class="thinking-fold__summary">
-                  <Icon class="thinking-fold__chevron" name="chevronRight" :size="12" />
-                  <span>{{ t('chat.thinking') }} · {{ streamThinkingElapsedText }}</span>
-                </summary>
-                <div class="thinking-fold__body">{{ liveThinkingText }}</div>
-              </details>
-
-              <ToolCallTimeline
-                v-if="liveTimelineItems.length"
-                class="work-card__timeline"
+              <AssistantActivityTimeline
+                v-if="
+                  liveActivityProjection.activityClusters.length
+                  || liveActivityProjection.statusSteps.length
+                "
                 variant="checklist"
-                :items="liveTimelineItems"
+                :projection="liveActivityProjection"
+                :timeline-items="liveActivityTimelineItems"
+                :state-scope="liveToolStateScope"
                 :is-tool-group-open="isToolGroupOpen"
                 :is-tool-item-open="isToolItemOpen"
                 :tool-group-status-text="toolGroupStatusText"
                 :tool-status-text="toolStatusText"
                 :tool-secondary-text="toolSecondaryText"
-                :tool-elapsed-text="streamToolElapsedText"
+                :tool-elapsed-text="liveToolElapsedText"
                 @toggle-group="toggleToolGroup"
                 @toggle-item="toggleToolItem"
                 @show-result="showToolResultModal"
               />
+            </ActivityDisclosure>
 
-              <!-- Live typing caret: a blinking "still generating" affordance at
-                   the tail of the streamed output. Only once real output exists
-                   (never a lone bar under the header), and hidden when stale. -->
-              <span v-if="!streamActivityStale && streamHasVisibleOutput" class="stream-caret" aria-hidden="true" />
-            </section>
+            <!-- Provisional answer candidate: the left rule + draft tag mark
+                 it as not-final, because a later tool start moves this text
+                 back into the activity transcript. The tag sits outside the
+                 candidate box so the candidate's own text stays the answer. -->
+            <template v-if="liveAnswerPart">
+              <span class="live-answer-candidate-tag">{{ t('chat.metaRuns.draft') }}</span>
+              <div class="live-answer-candidate">
+                <TextPart
+                  :part="liveAnswerPart"
+                  :sources="[]"
+                />
+              </div>
+            </template>
+            <span
+              v-if="liveAnswerPart && !streamActivityStale"
+              class="stream-caret"
+              aria-hidden="true"
+            />
 
             <!-- Live inline interrupts (fold-driven): approval / clarify cards
-                 that block the in-flight turn, rendered after the work-card body
+                 that block the in-flight turn, rendered after the activity body
                  and before the deliverables. -->
             <InterruptPart
               v-for="part in liveInterruptParts"
@@ -383,10 +321,8 @@
           :strip-time-prefix="stripTimePrefix"
           :session-key="sessionKey"
           :history-has-more="historyState.hasMore"
-          :history-loading="historyState.loading"
           @navigate="onHistoryNavigate"
           @navigate-end="onHistoryNavigateEnd"
-          @load-earlier="loadEarlierHistory"
         />
       </div>
     </div>
@@ -422,6 +358,16 @@
         <span v-if="compactStatus.contextWindowLabel">{{ compactStatus.contextWindowLabel }}</span>
       </div>
     </div>
+
+    <SandboxSetupBanner
+      v-if="sandboxSetupVisible"
+      :status="sandboxSetupStatus"
+      :can-setup="sandboxSetupCanSetup"
+      :ensuring="sandboxSetupEnsuring"
+      :error="sandboxSetupError"
+      @setup="ensureSandboxSetup"
+      @dismiss="dismissSandboxSetup"
+    />
 
     <!-- Composer dock: positioning context so the slash menu anchors directly
          above the composer in any layout. The new-chat landing centers the
@@ -464,9 +410,11 @@
       :busy-send-mode="busySendMode"
       :has-send-content="hasSendContent"
       :is-streaming="isStreaming"
+      :can-stop="canStop"
       :is-new-landing="isNewChatLanding"
       :placeholder="composerPlaceholder"
       :send-button-title="sendButtonTitle"
+      :send-blocked-message="modelImageSendBlockedMessage"
       :run-mode="runMode"
       :allowed-run-modes="allowedRunModes"
       :model-routing-mode="modelRoutingMode"
@@ -510,7 +458,7 @@
       :artifacts="sessionArtifacts"
       :session-key="sessionKey"
       :auth-token="readAuthToken()"
-      @close="deliverablesOpen = false"
+      @close="closeDeliverables"
       @download="downloadArtifact"
     />
 
@@ -519,7 +467,7 @@
       :open="metaRunsHistoryOpen"
       :rpc="rpc"
       :session-key="sessionKey"
-      @close="metaRunsHistoryOpen = false"
+      @close="closeMetaRunHistory"
     />
 
     <SharePreviewModal
@@ -534,6 +482,13 @@
       @copy="onShareCopy"
       @set-theme="onShareSetTheme"
     />
+
+    <!-- Persistent completion announcer: the live block's role="status" phase
+         label unmounts with the block when streaming ends, so on its own the
+         settle would never reach a screen reader. This region stays mounted
+         across the streaming boundary; it fills when a live turn settles and
+         clears when the next turn starts so repeat turns announce again. -->
+    <span class="chat-turn-settled-announcer" role="status" aria-live="polite">{{ turnSettledAnnouncement }}</span>
   </div>
 </template>
 
@@ -545,25 +500,30 @@ import { useRpcStore } from '@/stores/rpc'
 import { useRpcCall } from '@/composables/useRpc'
 import { useAppStore } from '@/stores/app'
 import ApprovalCard from '@/components/chat/ApprovalCard.vue'
+import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
+import AssistantActivityTimeline from '@/components/chat/AssistantActivityTimeline.vue'
 import ChatArtifactList from '@/components/chat/ChatArtifactList.vue'
+import ChatHeaderActions from '@/components/chat/ChatHeaderActions.vue'
 import DeliverablesDrawer from '@/components/chat/DeliverablesDrawer.vue'
 import ChatComposer from '@/components/chat/ChatComposer.vue'
-import ChatHistoryScopeRow from '@/components/chat/ChatHistoryScopeRow.vue'
 import ChatMessageList from '@/components/chat/ChatMessageList.vue'
 import ChatStallNotice from '@/components/chat/ChatStallNotice.vue'
 import ClarifyCard from '@/components/chat/ClarifyCard.vue'
 import ConversationMinimap from '@/components/chat/ConversationMinimap.vue'
 import EmptyStateChips from '@/components/chat/EmptyStateChips.vue'
 import InterruptPart from '@/components/chat/parts/InterruptPart.vue'
+import ReasoningPart from '@/components/chat/parts/ReasoningPart.vue'
+import TextPart from '@/components/chat/parts/TextPart.vue'
 import MetaPreflightCard from '@/components/chat/MetaPreflightCard.vue'
 import MetaRibbon from '@/components/chat/MetaRibbon.vue'
 import MetaRunHistoryDrawer from '@/components/chat/MetaRunHistoryDrawer.vue'
 import PendingQueue from '@/components/chat/PendingQueue.vue'
 import RouterFxStrip from '@/components/chat/RouterFxStrip.vue'
+import SandboxSetupBanner from '@/components/chat/SandboxSetupBanner.vue'
 import SharePreviewModal from '@/components/chat/SharePreviewModal.vue'
-import ToolCallTimeline from '@/components/chat/ToolCallTimeline.vue'
 import ToolResultModal from '@/components/chat/ToolResultModal.vue'
 import Icon from '@/components/Icon.vue'
+import HistoryLoadSentinel from '@/components/HistoryLoadSentinel.vue'
 import { useChatApprovals } from '@/composables/chat/useChatApprovals'
 import { useChatAttachments } from '@/composables/chat/useChatAttachments'
 import { useChatCompaction } from '@/composables/chat/useChatCompaction'
@@ -574,7 +534,10 @@ import { useChatFeatureToggles } from '@/composables/chat/useChatFeatureToggles'
 import { useChatHistory } from '@/composables/chat/useChatHistory'
 import { useChatMarkdownExport } from '@/composables/chat/useChatMarkdownExport'
 import { useChatMessageActions } from '@/composables/chat/useChatMessageActions'
-import { useChatPendingQueue } from '@/composables/chat/useChatPendingQueue'
+import {
+  useChatPendingQueue,
+  type PendingQueueOwnerContext,
+} from '@/composables/chat/useChatPendingQueue'
 import { useChatShareExport } from '@/composables/chat/useChatShareExport'
 import type { ShareExportTheme } from '@/composables/chat/useChatShareExport'
 import { useMediaQuery } from '@/composables/chat/useMediaQuery'
@@ -589,9 +552,9 @@ import { useChatAnswerReveal } from '@/composables/chat/useChatAnswerReveal'
 import { useChatRpcEventHandlers } from '@/composables/chat/useChatRpcEventHandlers'
 import { useChatRpcSubscriptions } from '@/composables/chat/useChatRpcSubscriptions'
 import { useChatSend } from '@/composables/chat/useChatSend'
+import { useSandboxSetupRecovery } from '@/composables/chat/useSandboxSetupRecovery'
 import { useChatStallWatchdog } from '@/composables/chat/useChatStallWatchdog'
 import { useMetaRuns } from '@/composables/chat/useMetaRuns'
-import { useAgentOptions } from '@/composables/useAgentOptions'
 import { runStatusLabelText as sessionRunStatusLabelText } from '@/composables/useSessions'
 import { useChatSessionRoute } from '@/composables/chat/useChatSessionRoute'
 import { useChatRunModePreference, type RunModePolicy } from '@/composables/chat/useChatRunModePreference'
@@ -603,6 +566,7 @@ import { useChatTextRendering } from '@/composables/chat/useChatTextRendering'
 import { useChatUsageWidget } from '@/composables/chat/useChatUsageWidget'
 import { useVoiceInput } from '@/composables/chat/useVoiceInput'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
+import { hasOpenDialogLayer } from '@/composables/useDialogA11y'
 import { useToasts } from '@/composables/useToasts'
 import type {
   ChatMessage,
@@ -610,6 +574,9 @@ import type {
   ChatRunStatus,
   ChatRunStatusSource,
   ChatRunStatusState,
+  ChatStreamTimelineItem,
+  ChatToolCall,
+  DisplayAttachment,
   ToolResultContext,
 } from '@/types/chat'
 import type {
@@ -618,10 +585,15 @@ import type {
 } from '@/types/rpc'
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { SandboxRunMode } from '@/types/sandbox'
-import type { InterruptViewState } from '@/types/parts'
+import type { ChatPart, InterruptViewState } from '@/types/parts'
 import { artifactDownloadUrl } from '@/utils/chat/artifacts'
+import { fetchDisplayAttachmentBlob } from '@/utils/chat/attachmentAccess'
 import { createHistoryNavigationScrollLock } from '@/utils/chat/historyNavigationScrollLock'
-import { isCurrentSessionPayload as payloadIsCurrentSession } from '@/utils/chat/streamEvents'
+import {
+  PENDING_STREAM_TASK_ID,
+  STOPPED_STREAM_TASK_ID,
+  isCurrentSessionPayload as payloadIsCurrentSession,
+} from '@/utils/chat/streamEvents'
 import { copyTextWithFallback, copyImageToClipboard, downloadBlob, shareCopyImageSupported } from '@/utils/browser'
 import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
 import { recordSessionNavigationDiag } from '@/utils/chat/sessionNavigationDiag'
@@ -631,9 +603,20 @@ import {
   toolSecondaryText,
   toolStatusText,
 } from '@/utils/chat/toolDisplay'
-import { isSendableAttachment } from '@/utils/chat/attachments'
+import {
+  collectClipboardFiles,
+  hasSendableModelInputImageAttachment,
+  isSendableAttachment,
+  shouldCaptureFilePaste,
+} from '@/utils/chat/attachments'
 import { isShareableChatMessage } from '@/utils/chat/messageIdentity'
-import { agentIdFromSessionKey, normalizeAgentId } from '@/utils/chat/sessionKeys'
+import { agentIdFromSessionKey } from '@/utils/chat/sessionKeys'
+import { clearAssistantActivityExpansionState } from '@/utils/chat/activityDisclosureState'
+import {
+  isSemanticActivityStatusStep,
+  projectAssistantActivityTimeline,
+  splitLiveAssistantTimeline,
+} from '@/utils/chat/assistantActivity'
 
 /* ── Types ─────────────────────────────────────────────────────────── */
 
@@ -691,6 +674,10 @@ const pendingAutoSend = ref('')
 
 const threadRef = ref<HTMLElement | null>(null)
 const composerRef = ref<ChatComposerHandle | null>(null)
+type ChatHeaderActionsHandle = {
+  focusAction: (action: 'deliverables' | 'runs' | 'share' | 'copy-session-key') => boolean
+}
+const chatHeaderActionsRef = ref<ChatHeaderActionsHandle | null>(null)
 
 /* ── State ─────────────────────────────────────────────────────────── */
 
@@ -711,7 +698,6 @@ const shareMode = ref(false)
 const shareSaving = ref(false)
 const selectedShareMessageIds = ref<Set<string>>(new Set())
 const shareBannerRef = ref<HTMLElement | null>(null)
-const shareEntryBtnRef = ref<HTMLButtonElement | null>(null)
 // Preview-before-download: Save renders the PNG to a blob and opens the modal
 // instead of downloading blind. The view owns the object-URL lifecycle.
 const sharePreview = ref<{ url: string; blob: Blob; filename: string } | null>(null)
@@ -744,6 +730,21 @@ const {
   },
 })
 
+const sandboxSetupRecovery = useSandboxSetupRecovery({
+  rpc,
+  connectionState: computed(() => rpc.state),
+  runMode,
+})
+const {
+  status: sandboxSetupStatus,
+  ensuring: sandboxSetupEnsuring,
+  error: sandboxSetupError,
+  visible: sandboxSetupVisible,
+  canSetup: sandboxSetupCanSetup,
+  ensureSetup: ensureSandboxSetup,
+  dismiss: dismissSandboxSetup,
+} = sandboxSetupRecovery
+
 // Run status
 const runStatus = ref<ChatRunStatus>({ status: 'idle', label: t('chat.status.idle'), task: null })
 
@@ -755,6 +756,7 @@ const activeTaskGroups = ref<Set<string>>(new Set())
 // current turn so a prior task can't leak into it (issue 344).
 const activeStreamTaskId = ref<string>('')
 const activeStreamSessionKey = ref<string>('')
+let bindActiveStreamTask = (taskId: string) => { activeStreamTaskId.value = taskId }
 
 // Pending session intent
 const pendingSessionIntent = ref<string | null>(null)
@@ -768,7 +770,6 @@ const {
   sanitizeCopyText,
   stripDirectiveTags,
   stripGeneratedArtifactMarkers,
-  stripProtocolTextLeak,
   stripTimePrefix,
 } = chatTextRendering
 
@@ -787,7 +788,6 @@ const chatStream = useChatStream({
   renderMarkdown,
   stripDirectiveTags,
   stripGeneratedArtifactMarkers,
-  stripProtocolTextLeak,
   scrollToBottom,
   interruptState,
   rpcPolicy: () => rpc.policy,
@@ -798,11 +798,9 @@ const {
   streamBubble,
   streamHasVisibleOutput,
   streamTimelineItems,
-  streamActivityVisible,
   streamActivityStale,
   streamPhaseLabel,
   streamPhaseElapsed,
-  streamStepLabel,
   streamToolElapsedText,
   streamIdleTimeoutMs,
   thinkingVisible,
@@ -823,7 +821,6 @@ const {
   appendInterruptFrame,
   ensureInterruptBubble,
 } = chatStream
-
 const chatAttachments = useChatAttachments()
 const {
   pendingAttachments,
@@ -841,12 +838,18 @@ let sendCurrentInput: () => void = () => {}
 let dispatchHiddenForMeta: (providerText: string, displayText: string) => void = () => {}
 let isCompactInFlightForCurrentSession: () => boolean = () => false
 let dispatchHiddenControl: (providerText: string, displayText: string) => void = () => {}
+const pendingQueueOwnerContext = ref<PendingQueueOwnerContext | null>(null)
 const chatPendingQueue = useChatPendingQueue({
+  sessionKey,
+  ownerContext: pendingQueueOwnerContext,
   inputText,
   pendingAttachments,
   pendingSessionIntent,
   isStreaming,
-  isBlocked: () => isCompactInFlightForCurrentSession(),
+  isBlocked: () => (
+    isCompactInFlightForCurrentSession()
+    || pendingQueueOwnerContext.value?.sessionKey === sessionKey.value
+  ),
   autoResizeTextarea,
   sendCurrentInput: () => sendCurrentInput(),
   resetInputHistory: () => resetComposerInputHistory(),
@@ -862,9 +865,12 @@ const {
   enqueueHiddenControl,
   removePendingChip,
   clearPendingQueue,
+  switchPendingQueue,
+  adoptPendingQueue,
   popPendingTail,
   popAllPendingIntoComposer,
   schedulePendingDrainAfterTerminal,
+  flushDeferredPendingDrain,
   cleanup: cleanupPendingQueue,
 } = chatPendingQueue
 
@@ -897,7 +903,6 @@ const chatUsageWidget = useChatUsageWidget({
 const {
   usageAccum,
   usageModel,
-  contextWarning,
   resetSavingsPopupCooldown,
   saveWidgetState,
   restoreWidgetState,
@@ -973,86 +978,6 @@ const {
   resolveInitialSession,
 } = chatSessionRoute
 
-// In-draft agent switcher (new-chat landing): lets the user swap the draft's
-// agent before the first message. Shares one agents.list path with the sidebar.
-const { selectableAgents, loadAgents: loadAgentOptions } = useAgentOptions()
-const agentSwitcherOpen = ref(false)
-const agentSwitcherRef = ref<HTMLElement | null>(null)
-
-const landingAgentName = computed(() => {
-  const id = landingAgentId.value
-  const match = selectableAgents.value.find(agent => agent.id === id)
-  return match?.name || (id === 'main' ? t('chat.mainAgent') : id)
-})
-
-function toggleAgentSwitcher() {
-  agentSwitcherOpen.value = !agentSwitcherOpen.value
-  if (agentSwitcherOpen.value && selectableAgents.value.length <= 1) {
-    void loadAgentOptions()
-  }
-  if (agentSwitcherOpen.value) {
-    // Land focus on the checked agent if present, else the first item, so the
-    // menu is keyboard-operable the moment it opens.
-    nextTick(() => {
-      const menu = agentSwitcherRef.value?.querySelector('.chat-landing-agent__menu')
-      const items = menu?.querySelectorAll<HTMLElement>('.chat-landing-agent__item')
-      if (!items?.length) return
-      const checked = menu?.querySelector<HTMLElement>('[aria-checked="true"]')
-      ;(checked ?? items[0]).focus()
-    })
-  }
-}
-
-function closeAgentSwitcher() {
-  agentSwitcherOpen.value = false
-}
-
-// Arrow keys rove between the agent items (including "Create agent…"), wrapping
-// at the ends; Escape closes and restores focus to the switcher trigger.
-function onAgentSwitcherKeydown(e: KeyboardEvent) {
-  if (e.key === 'Escape') {
-    e.preventDefault()
-    closeAgentSwitcher()
-    nextTick(() => agentSwitcherRef.value?.querySelector<HTMLElement>('.chat-landing-agent__btn')?.focus())
-    return
-  }
-  // Tab must dismiss the open menu (WAI-ARIA menu pattern) and let focus move on
-  // naturally — the outside-click handler does not fire on a keyboard Tab.
-  if (e.key === 'Tab') {
-    closeAgentSwitcher()
-    return
-  }
-  if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return
-  const menu = agentSwitcherRef.value?.querySelector('.chat-landing-agent__menu')
-  const items = Array.from(menu?.querySelectorAll<HTMLElement>('.chat-landing-agent__item') ?? [])
-  if (!items.length) return
-  e.preventDefault()
-  const current = items.indexOf(document.activeElement as HTMLElement)
-  const delta = e.key === 'ArrowDown' ? 1 : -1
-  const next = (current + delta + items.length) % items.length
-  items[next]?.focus()
-}
-
-// Selecting an agent re-enters the draft for it. The draft carries no messages
-// yet, so swapping with replace semantics is safe and leaves no history entry.
-function pickDraftAgent(agentId: string) {
-  closeAgentSwitcher()
-  const id = normalizeAgentId(agentId)
-  if (id === landingAgentId.value) return
-  goToDraft({ agentId: id, replace: true })
-}
-
-function createAgentFromSwitcher() {
-  closeAgentSwitcher()
-  router.push('/agents')
-}
-
-useDocumentEvent('click', (e) => {
-  if (!agentSwitcherOpen.value) return
-  const host = agentSwitcherRef.value
-  if (host && e.target instanceof Node && !host.contains(e.target)) closeAgentSwitcher()
-})
-
 const renderSourceMessages = computed(() =>
   messagesWithStoppedOutputNotice(
     messages.value,
@@ -1078,16 +1003,9 @@ const chatRenderedMessages = useChatRenderedMessages({
 })
 const { renderedMessages, routerDecisionCells } = chatRenderedMessages
 
-// The live ensemble strip owns the synthesizing narrative — it reveals members
-// as they run and settles in place — so the work-card runs its normal execution
-// phase alongside it. The two are independent progress surfaces on purpose: the
-// strip answers "which models are synthesizing", the work-card "what step now".
-const liveWorkCardPhaseLabel = streamPhaseLabel
-const liveWorkCardStepLabel = streamStepLabel
-
 function shouldRenderRouterStrip(_message: ChatRenderedMessage): boolean {
   // Always surface the router strip — the live ensemble strip is the primary
-  // surface for the synthesizing process and no longer defers to the work-card.
+  // surface for the synthesizing process and no longer defers to activity.
   return true
 }
 
@@ -1144,9 +1062,12 @@ const routerStripReserve = computed<ChatRenderedMessage | null>(() => {
   }
 })
 
+const aiGeneratedLabel = computed(() => t('chat.aiGeneratedLabel'))
+
 const chatShareExport = useChatShareExport({
   threadRef,
   title: shareTitle,
+  aiGeneratedLabel: () => aiGeneratedLabel.value,
 })
 
 const preserveHistoryLiveTail = computed(() =>
@@ -1169,7 +1090,9 @@ const {
   historyState,
   loadHistory,
   loadEarlierHistory,
+  retryHistory,
   scheduleHistorySync,
+  cancelAnchorStabilization,
   cleanup: cleanupHistory,
 } = chatHistory
 
@@ -1199,6 +1122,8 @@ const chatMessageActions = useChatMessageActions({
   sendCurrentInput: () => sendCurrentInput(),
   focusComposer: () => composerRef.value?.focusTextarea(),
   pendingForkBeforeMessageId,
+  aiGeneratedLabel: () => aiGeneratedLabel.value,
+  notifyMessagePending: () => pushToast(t('chat.toast.messageStillSaving'), { tone: 'info' }),
 })
 const {
   copyMessage,
@@ -1214,16 +1139,36 @@ const chatSessionSubscription = useChatSessionSubscription({
   isStreaming,
   hasActiveInterrupt: computed(() =>
     Array.from(interruptState.value.values()).some(state => !state.resolution)),
+  activeStreamTaskId,
+  activeTaskGroups,
   sessionRunStatus,
+  startStreaming,
   loadHistory,
   resetStreamIdleTimer,
   resetStreamLiveTurnState,
+  onAuthoritativeIdle: () => {
+    const taskId = activeStreamTaskId.value
+    if (
+      taskId
+      && taskId !== PENDING_STREAM_TASK_ID
+      && taskId !== STOPPED_STREAM_TASK_ID
+    ) {
+      schedulePendingDrainAfterTerminal()
+    }
+  },
 })
 const {
+  isHydrating: isSessionHydrating,
   subscribeSession,
   unsubscribeSession,
 } = chatSessionSubscription
 applySessionRunState = chatSessionSubscription.applySessionRunState
+const canStop = computed(() => !isSessionHydrating.value && (
+  isStreaming.value
+  || activeTaskGroups.value.size > 0
+  || ['queued', 'running', 'approval_pending'].includes(runStatus.value.status)
+  || pendingQueueOwnerContext.value?.sessionKey === sessionKey.value
+))
 
 const chatSessionRuntime = useChatSessionRuntime({
   sessionKey,
@@ -1248,6 +1193,8 @@ const chatSessionRuntime = useChatSessionRuntime({
   setCompactInFlight,
   hideCompactStatus,
   clearPendingQueue,
+  switchPendingQueue,
+  adoptPendingQueue,
   resetSavingsPopupCooldown,
   restoreWidgetState,
   resetStreamLiveTurnState,
@@ -1256,6 +1203,7 @@ const {
   resetCurrentSessionAfterSlash,
   startDraftSession,
   switchToSession,
+  adoptResponseSession,
 } = chatSessionRuntime
 
 const chatSlashCommands = useChatSlashCommands({
@@ -1263,7 +1211,7 @@ const chatSlashCommands = useChatSlashCommands({
   inputText,
   sessionKey,
   autoResizeTextarea,
-  newSession: () => goToDraft({ agentId: agentIdFromSessionKey(sessionKey.value) }),
+  newSession: () => goToDraft({ agentId: 'main' }),
   resetCurrentSession: resetCurrentSessionAfterSlash,
   setCompactInFlight,
   showCompactStatus,
@@ -1311,7 +1259,10 @@ const chatSend = useChatSend({
   inputText,
   messages,
   sessionKey,
+  pendingQueueOwnerContext,
   busySendMode,
+  modelRoutingMode,
+  modelRoutingSettingsBusy,
   elevatedMode,
   runMode,
   pendingAttachments,
@@ -1322,8 +1273,13 @@ const chatSend = useChatSend({
   activeStreamSessionKey,
   autoScroll,
   stream: chatStream,
+  canStop: () => canStop.value,
   normalizeElevatedMode,
-  persistSession,
+  adoptResponseSession,
+  scheduleHistorySync,
+  schedulePendingDrainAfterTerminal,
+  flushDeferredPendingDrain,
+  bindActiveStreamTask: taskId => bindActiveStreamTask(taskId),
   isCompactInFlightForCurrentSession,
   hasPendingAttachmentWork,
   prepareAttachmentsForSend,
@@ -1401,6 +1357,7 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   clearPendingRouterDecision,
   handleRouterControlReplay,
   showCompactionToast,
+  showWarningToast: message => pushToast(message || t('chat.warning.default'), { tone: 'warn', duration: 5000 }),
   scheduleHistorySync,
   schedulePendingDrainAfterTerminal,
   popAllPendingIntoComposer,
@@ -1409,6 +1366,7 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   loadHistory,
   loadCurrentSessionUsage,
 })
+bindActiveStreamTask = rpcEventHandlers.bindActiveStreamTask
 const {
   streamThinkingText,
   streamThinkingElapsedText,
@@ -1418,27 +1376,103 @@ const {
 // live-turn shadow parity: in DEV/SHADOW, re-check the fold against the legacy
 // live surface whenever a frame lands (the fold and legacy refs are tracked by
 // assertLiveParity). Injects the thinking text owned by the event handlers.
-// No-op in prod/OFF; render stays legacy unless the fold is authoritative (ON).
+// In production ON mode this is a no-op; DEV/SHADOW performs the parity check,
+// while explicit OFF keeps the compatibility renderer without fold assertions.
 watchEffect(() => assertLiveParity(streamThinkingText))
 
-// flag-selected live render source. Only when the fold is
-// authoritative (useReducer === true, opt-in via opensquilla.chat.foldLiveTurn=1)
-// does the work-card body render from the fold; OFF and SHADOW return the
-// IDENTICAL legacy refs, so with the flag off the render is byte-identical.
-// The work-card head (phase/elapsed/step) stays on the legacy activity refs.
+// Flag-selected live render source. In production the fold is authoritative by
+// default; only opensquilla.chat.foldLiveTurn=0 restores legacy. SHADOW and OFF
+// return the IDENTICAL legacy refs, so with the flag off the render is byte-identical.
+// The activity head (phase/elapsed) stays on the legacy activity refs.
 const liveTimelineItems = computed(() =>
   foldLiveTurnMode.value === true ? foldedTurn.value.timelineItems : streamTimelineItems.value,
 )
+const liveTimelineSplit = computed(() => splitLiveAssistantTimeline(liveTimelineItems.value))
+const liveAnswerPart = computed<Extract<ChatPart, { type: 'text' }> | null>(() => {
+  const candidate = liveTimelineSplit.value.answerItem
+  if (!candidate) return null
+  return {
+    type: 'text',
+    key: `${candidate.key}:answer-candidate`,
+    html: candidate.html,
+    rawText: candidate.rawText || '',
+  }
+})
+const liveActivityTimelineItems = computed<ChatStreamTimelineItem[]>(() =>
+  liveTimelineSplit.value.activityItems,
+)
+const liveActivityStatusHistory = computed(() =>
+  foldLiveTurnMode.value === false ? [] : foldedTurn.value.statusHistory,
+)
+const liveActivityProjection = computed(() =>
+  projectAssistantActivityTimeline(liveActivityTimelineItems.value, {
+    lifecycle: liveAnswerPart.value ? 'answering' : 'working',
+    statusHistory: liveActivityStatusHistory.value,
+  }),
+)
+const liveActivityPhaseLabel = computed(() => {
+  if (streamActivityStale.value) return streamPhaseLabel.value
+  const currentStatus = [...liveActivityProjection.value.statusSteps]
+    .reverse()
+    .find(step => step.isCurrent)
+  if (
+    currentStatus
+    && !currentStatus.label.code.startsWith('chat.activity.lifecycle.')
+    && !liveActivityProjection.value.currentClusterKey
+  ) {
+    return String(t(currentStatus.label.code, currentStatus.label.params))
+  }
+  return String(t(
+    liveAnswerPart.value
+      ? 'chat.activity.lifecycle.answering'
+      : 'chat.activity.lifecycle.working',
+  ))
+})
+const liveToolStateScope = computed(() => JSON.stringify([sessionKey.value || '', 'stream']))
+// Elapsed readouts in the live turn round to whole seconds ("4s"), matching
+// streamPhaseElapsed and streamThinkingElapsedText. The shared tool formatter
+// (streamToolElapsedText, useChatStream.ts) emits tenths, so normalise its
+// output here at the call site instead of changing the shared formatter —
+// except sub-second finished tools, which keep their tenths so they never
+// read as a nonsensical "0s".
+function liveToolElapsedText(call: Pick<ChatToolCall, 'toolId'>): string {
+  return streamToolElapsedText(call).replace(/^([1-9]\d*)\.\d+s$/, '$1s')
+}
 const liveArtifacts = computed(() =>
   foldLiveTurnMode.value === true ? foldedTurn.value.artifacts : streamArtifacts.value,
 )
 const liveThinkingText = computed(() =>
   foldLiveTurnMode.value === true ? foldedTurn.value.thinkingText : streamThinkingText.value,
 )
+// Live reasoning rendered through the shared part component, so the live turn
+// and settled turns use one wording and one disclosure affordance. The seconds
+// derive from the ticking elapsed text, which is always `${seconds}s` live.
+const liveReasoningPart = computed<Extract<ChatPart, { type: 'reasoning' }> | null>(() => {
+  if (!liveThinkingText.value) return null
+  const seconds = Number.parseInt(streamThinkingElapsedText.value, 10)
+  return {
+    type: 'reasoning',
+    key: 'live-reasoning',
+    text: liveThinkingText.value,
+    seconds: Number.isFinite(seconds) ? seconds : 0,
+  }
+})
+// No clamp and no raw status count: the header chip must agree with the
+// visible body, which renders clusters plus only the semantic status steps.
+// A text-only turn therefore counts 0 and the disclosure's stepCount > 0
+// gate hides the chip instead of claiming "step 1" over an empty body.
+const liveActivityStepCount = computed(() =>
+  liveActivityProjection.value.activityClusters.length
+    + liveActivityProjection.value.statusSteps.filter(isSemanticActivityStatusStep).length
+    + (liveThinkingText.value ? 1 : 0),
+)
+const liveActivityFailureCount = computed(() =>
+  liveActivityProjection.value.activityClusters.filter(cluster => cluster.isFailure).length,
+)
 // Inline interrupt parts for the live turn come from the fold whenever it is
 // active (ON or SHADOW — frames are appended in both). Only the foldLiveTurn=0
 // OFF rollback renders the legacy standalone ApprovalCard/ClarifyCard block, so
-// the two never both show. Unlike the work-card body (which has a legacy ref to
+// the two never both show. Unlike the activity body (which has a legacy ref to
 // fall back to in SHADOW), interrupts have no legacy live ref, so SHADOW must
 // also render them from the fold.
 const liveInterruptParts = computed(() =>
@@ -1448,6 +1482,18 @@ const liveInterruptParts = computed(() =>
         (part): part is Extract<typeof part, { type: 'interrupt' }> => part.type === 'interrupt',
       ),
 )
+
+// Feeds the persistent visually-hidden status region in the template. It only
+// fills on the true→false streaming transition (a live turn actually settled),
+// and empties as soon as the next turn starts so that setting the same
+// "Completed" text again is a fresh mutation screen readers re-announce.
+const turnSettledAnnouncement = ref('')
+watch(isStreaming, (streaming, wasStreaming) => {
+  if (streaming) turnSettledAnnouncement.value = ''
+  else if (wasStreaming) {
+    turnSettledAnnouncement.value = String(t('chat.activity.lifecycle.settled'))
+  }
+})
 
 // Soft content-silence watchdog: after the high negotiated threshold, surface
 // a neutral long-running notice. Backend-deadline-owned Ensemble phases remain
@@ -1470,7 +1516,10 @@ const chatRpcSubscriptions = useChatRpcSubscriptions(rpc, {
 })
 
 // Session switches drop the previous session's stall tracking entirely.
-watch(sessionKey, () => stallWatchdog.reset())
+watch(sessionKey, () => {
+  stallWatchdog.reset()
+  clearAssistantActivityExpansionState()
+})
 
 // MetaSkill run UI: preflight checkpoint + run-progress ribbon, driven by the
 // four session.event.meta_* frames (delivered via the '*' wildcard, so this
@@ -1540,22 +1589,6 @@ let composerResizeObserver: ResizeObserver | null = null
 
 /* ── Computed ──────────────────────────────────────────────────────── */
 
-const runStatusLabel = computed(() => runStatus.value.label)
-const runStatusChipClass = computed(() => {
-  const cls: Record<string, string> = {
-    queued: 'chat-chip-warn', running: 'chat-chip-ok', approval_pending: 'chat-chip-warn', interrupted: 'chat-chip-warn',
-    failed: 'chat-chip-danger', timeout: 'chat-chip-warn',
-  }
-  return cls[runStatus.value.status] || ''
-})
-const runStatusTitle = computed(() => {
-  const task = runStatus.value.task
-  const parts = [runStatus.value.label]
-  if (task?.task_id) parts.push(task.task_id)
-  if (task?.terminal_reason) parts.push(task.terminal_reason)
-  return parts.filter(Boolean).join(' - ')
-})
-
 const isNewChatLanding = computed(() => {
   // Only the draft route (/chat/new — bare /chat redirects here) shows the
   // "new chat" landing. Without this gate, switching between existing
@@ -1577,7 +1610,18 @@ const hasSendContent = computed(() => {
   return inputText.value.trim().length > 0 || pendingAttachments.value.some(isSendableAttachment)
 })
 
+const modelImageSendBlockedMessage = computed(() => {
+  if (!hasSendableModelInputImageAttachment(pendingAttachments.value)) return ''
+  if (modelRoutingSettingsBusy.value) {
+    return t('chat.composer.routingUpdateImageBlocked')
+  }
+  return modelRoutingMode.value === 'llm_ensemble'
+    ? t('chat.composer.ensembleImageUnsupported')
+    : ''
+})
+
 const sendButtonTitle = computed(() => {
+  if (modelImageSendBlockedMessage.value) return modelImageSendBlockedMessage.value
   if (isCompactInFlightForCurrentSession()) return t('chat.sendQueuesUntilCompaction')
   if (isStreaming.value) {
     return busySendMode.value === 'steer'
@@ -1600,6 +1644,7 @@ const currentChatTitle = computed(() => {
 const chatMarkdownExport = useChatMarkdownExport({
   messages: renderedMessages,
   currentTitle: currentChatTitle,
+  aiGeneratedLabel,
 })
 const { exportMarkdown } = chatMarkdownExport
 
@@ -1727,6 +1772,24 @@ function subagentBody(text: string): string {
 
 /* ── Artifacts ─────────────────────────────────────────────────────── */
 
+async function downloadAttachment(attachment: DisplayAttachment): Promise<boolean> {
+  const result = await fetchDisplayAttachmentBlob(attachment, {
+    baseOrigin: window.location.origin,
+    sessionKey: sessionKey.value,
+    authToken: readAuthToken(),
+  })
+  if (!result.ok) {
+    if (result.status > 0) {
+      pushToast(t('chat.toast.downloadFailedHttp', { status: result.status }), { tone: 'danger' })
+    } else {
+      pushToast(t('chat.toast.downloadFailed'), { tone: 'danger' })
+    }
+    return false
+  }
+  downloadBlob(result.blob, result.filename)
+  return true
+}
+
 async function downloadArtifact(artifact: ArtifactPayload) {
   const token = readAuthToken()
   const url = artifactDownloadUrl(artifact, window.location.origin, {
@@ -1782,9 +1845,27 @@ const sessionArtifacts = computed<ArtifactPayload[]>(() => {
 const deliverablesOpen = ref(false)
 const metaRunsHistoryOpen = ref(false)
 
+function focusHeaderAction(action: 'deliverables' | 'runs' | 'share' | 'copy-session-key') {
+  void nextTick(() => chatHeaderActionsRef.value?.focusAction(action))
+}
+
 function openDeliverables() {
   if (sessionArtifacts.value.length === 0) return
   deliverablesOpen.value = true
+}
+
+function closeDeliverables() {
+  deliverablesOpen.value = false
+  focusHeaderAction('deliverables')
+}
+
+function openMetaRunHistory() {
+  metaRunsHistoryOpen.value = true
+}
+
+function closeMetaRunHistory() {
+  metaRunsHistoryOpen.value = false
+  focusHeaderAction('runs')
 }
 
 /* ── Fork ──────────────────────────────────────────────────────────── */
@@ -1872,7 +1953,7 @@ function endShareMode() {
     URL.revokeObjectURL(sharePreview.value.url)
     sharePreview.value = null
   }
-  if (modeUiHadFocus) nextTick(() => shareEntryBtnRef.value?.focus())
+  if (modeUiHadFocus) focusHeaderAction('share')
 }
 
 function toggleShareMessage(messageId: string) {
@@ -1895,14 +1976,14 @@ async function saveShareImage() {
       theme: shareTheme.value,
     })
     if (!result) {
-      pushToast(t('chat.toast.shareExportFailed'), { tone: 'danger' })
+      pushToast(t('chat.toast.shareSaveFailed'), { tone: 'danger' })
       return
     }
     const url = URL.createObjectURL(result.blob)
     sharePreview.value = { url, blob: result.blob, filename: result.filename }
   } catch (err) {
     console.warn('Share image export failed:', err)
-    pushToast(t('chat.toast.shareExportFailed'), { tone: 'danger' })
+    pushToast(t('chat.toast.shareSaveFailed'), { tone: 'danger' })
   } finally {
     shareSaving.value = false
   }
@@ -1913,12 +1994,11 @@ function onShareDownload() {
   if (!preview) return
   downloadBlob(preview.blob, preview.filename)
   pushToast(t('chat.toast.saved', { filename: preview.filename }), { duration: 4000 })
-  // endShareMode revokes the preview URL and drops the modal, then exits share
-  // mode (which remounts the header Share button); focus lands back on it. The
-  // modal's Download button held focus, outside the banner, so endShareMode's
-  // own conditional restore does not fire — focus the entry button explicitly.
+  // endShareMode revokes the preview URL and drops the modal. The modal's
+  // Download button held focus outside the banner, so restore the best visible
+  // Share entry (or the stable session-actions trigger) explicitly.
   endShareMode()
-  nextTick(() => shareEntryBtnRef.value?.focus())
+  focusHeaderAction('share')
 }
 
 async function onShareCopy() {
@@ -1942,7 +2022,7 @@ async function onShareSetTheme(next: ShareExportTheme) {
   try {
     const result = await chatShareExport.buildShareImage(selectedShareMessageIds.value, { theme: next })
     if (!result) {
-      pushToast(t('chat.toast.shareExportFailed'), { tone: 'danger' })
+      pushToast(t('chat.toast.sharePreviewUpdateFailed'), { tone: 'danger' })
       return
     }
     const previous = sharePreview.value
@@ -1954,7 +2034,9 @@ async function onShareSetTheme(next: ShareExportTheme) {
     if (previous) URL.revokeObjectURL(previous.url)
   } catch (err) {
     console.warn('Share image re-render failed:', err)
-    pushToast(t('chat.toast.shareExportFailed'), { tone: 'danger' })
+    // Not shareSaveFailed: nothing was being saved here — the theme switch
+    // only re-renders the preview, so the copy must name that action.
+    pushToast(t('chat.toast.sharePreviewUpdateFailed'), { tone: 'danger' })
   } finally {
     shareSaving.value = false
   }
@@ -1971,7 +2053,7 @@ function closeSharePreview() {
   sharePreview.value = null
   nextTick(() => {
     if (shareMode.value) shareBannerRef.value?.focus()
-    else shareEntryBtnRef.value?.focus()
+    else chatHeaderActionsRef.value?.focusAction('share')
   })
 }
 
@@ -2004,6 +2086,7 @@ function onThreadScroll() {
 }
 
 function onHistoryNavigate() {
+  cancelAnchorStabilization()
   historyNavigationScrollLock.start()
 }
 
@@ -2019,6 +2102,7 @@ function onHistoryNavigateEnd() {
 // Re-pinning autoScroll lets the stream resume following the bottom.
 const showJumpToLatest = computed(() => !autoScroll.value && messages.value.length > 0)
 function jumpToLatest() {
+  cancelAnchorStabilization()
   historyNavigationScrollLock.finish()
   autoScroll.value = true
   scrollToBottom()
@@ -2079,25 +2163,21 @@ function autoResizeTextarea() {
 /* ── Clipboard paste ───────────────────────────────────────────────── */
 
 function onDocumentPaste(e: ClipboardEvent) {
-  const items = e.clipboardData?.items
-  if (!items) return
-  const files: File[] = []
-  let attachedImage = false
-  for (let i = 0; i < items.length; i++) {
-    if (items[i].type.startsWith('image/')) {
-      const file = items[i].getAsFile()
-      if (file) {
-        files.push(file)
-        attachedImage = true
-      }
-    }
-  }
-  if (files.length > 0) void addAttachments(files)
-  // Screenshot tools put both the image and its local file path on the
-  // clipboard; once we have attached the image, suppress the default paste so
-  // the path text is not also dumped into the composer (and then sent to the
-  // agent). Plain-text pastes with no image fall through unchanged.
-  if (attachedImage) e.preventDefault()
+  // Pastes aimed at another editable surface (clarify/approval inputs, the
+  // command palette) or at an open dialog keep their default behavior — only
+  // composer-bound pastes claim clipboard files, mirroring onDocumentKeydown.
+  if (!shouldCaptureFilePaste(e.target, {
+    composerTextareaFocused: composerRef.value?.isTextareaFocused() ?? false,
+    dialogLayerOpen: hasOpenDialogLayer(),
+  })) return
+  const files = collectClipboardFiles(e.clipboardData)
+  if (files.length === 0) return
+  void addAttachments(files)
+  // File managers and screenshot tools put both the file and its name/path as
+  // text on the clipboard; once we have attached the files, suppress the
+  // default paste so that text is not also dumped into the composer (and then
+  // sent to the agent). Plain-text pastes with no file fall through unchanged.
+  e.preventDefault()
 }
 
 /* ── Document keydown (ESC) ────────────────────────────────────────── */
@@ -2105,14 +2185,7 @@ function onDocumentPaste(e: ClipboardEvent) {
 function onDocumentKeydown(e: KeyboardEvent) {
   if (e.key !== 'Escape') return
   if (e.defaultPrevented) return
-
-  // The landing agent switcher closes first and hands focus back to its trigger.
-  if (agentSwitcherOpen.value) {
-    e.preventDefault()
-    closeAgentSwitcher()
-    nextTick(() => agentSwitcherRef.value?.querySelector<HTMLElement>('.chat-landing-agent__btn')?.focus())
-    return
-  }
+  if (hasOpenDialogLayer()) return
 
   // The share preview modal owns Escape while it is open: it closes only the
   // preview (share mode stays active) via its own handler, so bail here and let
@@ -2125,7 +2198,14 @@ function onDocumentKeydown(e: KeyboardEvent) {
     return
   }
 
-  if (isStreaming.value) {
+  const target = e.target
+  const editableTarget = target instanceof HTMLInputElement
+    || target instanceof HTMLSelectElement
+    || (target instanceof HTMLTextAreaElement && !composerRef.value?.isTextareaFocused())
+    || (target instanceof HTMLElement && target.isContentEditable)
+  if (editableTarget) return
+
+  if (canStop.value) {
     e.preventDefault()
     onStop()
     return
@@ -2185,9 +2265,6 @@ onMounted(async () => {
 
   // Load elevated mode
   loadElevatedMode()
-
-  // Resolve agent display names for the in-draft switcher.
-  void loadAgentOptions()
 
   // Load feature toggles
   await loadFeatureToggles()
@@ -2287,13 +2364,14 @@ watch(sessionKey, () => {
   pendingForkBeforeMessageId.value = null
   if (shareMode.value) endShareMode()
   deliverablesOpen.value = false
+  metaRunsHistoryOpen.value = false
 })
 
 watch(shareableMessageCount, (count) => {
   if (count === 0 && shareMode.value) endShareMode()
 })
 
-// Router-led turns hold the live answer/work-card reveal back for [MIN,MAX] ms,
+// Router-led turns hold the live answer/activity reveal back for [MIN,MAX] ms,
 // then mount a block of content at once. Re-pin the thread on that reveal so it
 // lands at the bottom instead of below the fold.
 watch(answerRevealOpen, (open) => {
@@ -2302,7 +2380,7 @@ watch(answerRevealOpen, (open) => {
 
 // An approval/clarify interrupt is a user-blocking control, not answer content,
 // so it must not sit behind the router-lead reveal window. With the fold
-// authoritative (default), the gated work-card is the only interrupt surface,
+// authoritative (default), the gated activity is the only interrupt surface,
 // so reveal immediately when a live interrupt part appears — otherwise the card
 // can stay invisible for up to the MAX backstop when no router decision lands.
 watch(() => liveInterruptParts.value.length, (n, prev) => {
@@ -2311,3 +2389,20 @@ watch(() => liveInterruptParts.value.length, (n, prev) => {
 </script>
 
 <style scoped src="../styles/chat-view.css"></style>
+
+<style scoped>
+/* No shared sr-only utility exists in this repo (each component scopes its
+   own), so the completion announcer's clip-out lives here: zero visual
+   footprint, still exposed to assistive tech. */
+.chat-turn-settled-announcer {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+</style>

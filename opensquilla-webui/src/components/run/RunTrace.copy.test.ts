@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, defineComponent, h, nextTick, ref } from 'vue'
 import i18n from '@/i18n'
 import type { ChatStreamTimelineItem } from '@/types/chat'
+import type { NodeStep } from '@/types/runTrace'
 import { copyTextWithFallback } from '@/utils/browser'
 import RunTrace from './RunTrace.vue'
 
@@ -37,6 +38,25 @@ async function mountRunTrace(
   return { app, el, items }
 }
 
+async function mountFlatRunTrace(steps: NodeStep[]) {
+  const el = document.createElement('div')
+  document.body.appendChild(el)
+  const Host = defineComponent({
+    setup() {
+      return () => h(RunTrace, {
+        steps,
+        isToolGroupOpen: () => false,
+        isToolItemOpen: () => false,
+      })
+    },
+  })
+  const app = createApp(Host)
+  app.use(i18n)
+  app.mount(el)
+  await nextTick()
+  return { app, el }
+}
+
 beforeEach(() => {
   i18n.global.locale.value = 'en'
   document.body.innerHTML = ''
@@ -44,6 +64,35 @@ beforeEach(() => {
 })
 
 describe('RunTrace code block copy control', () => {
+  it('uses original tool identity for result counts in flat history traces', async () => {
+    const { app, el } = await mountFlatRunTrace([
+      {
+        id: 'fetch-year',
+        title: 'Read web page',
+        toolName: 'web_fetch',
+        operationKey: 'web.read',
+        state: 'output-available',
+        output: JSON.stringify({ text: 'AI industry 2026 results and outlook' }),
+      },
+      {
+        id: 'search-count',
+        title: 'Search web',
+        toolName: 'web_search',
+        operationKey: 'web.search',
+        state: 'output-available',
+        output: JSON.stringify({ results: [{ title: 'One' }, { title: 'Two' }] }),
+      },
+    ])
+
+    const rows = el.querySelectorAll<HTMLElement>('.tool-row')
+    expect(rows).toHaveLength(2)
+    expect(rows[0]?.querySelector('.tool-row__status')).toBeNull()
+    expect(rows[0]?.textContent).not.toContain('2026 results')
+    expect(rows[1]?.querySelector('.tool-row__status')?.textContent).toBe('2 results')
+
+    app.unmount()
+  })
+
   it('decorates code blocks that appear during same-key text updates', async () => {
     const { app, el, items } = await mountRunTrace([
       { type: 'text', key: 'streaming-text', html: '<p>partial result</p>' },

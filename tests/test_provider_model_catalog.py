@@ -43,7 +43,12 @@ def test_provider_scoped_corrections_budget_outranks_snapshot_merge() -> None:
     assert catalog.resolve_context_window("kimi-k2.7-code", provider="tokenrhythm") == 256_000
     assert catalog.resolve_max_tokens("kimi-k2.7-code", provider="tokenrhythm") == 128_000
     assert catalog.resolve_context_window("qwen3.7-max", provider="tokenrhythm") == 1_000_000
-    assert catalog.resolve_max_tokens("qwen3.7-max", provider="tokenrhythm") == 256_000
+    assert catalog.resolve_max_tokens("qwen3.7-max", provider="tokenrhythm") == 131_072
+    # The correction is scoped to TokenRhythm. Direct/provider-less snapshot
+    # routes retain their own 65,536-token output limit.
+    assert catalog.resolve_max_tokens("qwen3.7-max") == 65_536
+    assert catalog.resolve_max_tokens("qwen3.7-max", provider="dashscope") == 65_536
+    assert catalog.resolve_max_tokens("qwen3.7-max", provider="openrouter") == 65_536
     # The same bare id on direct DeepSeek keeps its own snapshot-table
     # budgets — the provider-scoped layer never leaks across providers.
     assert catalog.resolve_context_window("deepseek-v4-flash", "deepseek") == 1_000_000

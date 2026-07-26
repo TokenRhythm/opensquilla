@@ -35,6 +35,40 @@ def test_approval_queue_request_persists_across_queue_restart(tmp_path) -> None:
     reloaded.close()
 
 
+def test_channel_approval_code_binding_persists_across_queue_restart(tmp_path) -> None:
+    db_path = tmp_path / "approval_queue.sqlite"
+    queue = ApprovalQueue(db_path=str(db_path))
+    approval_id = queue.request(
+        "exec",
+        {
+            "toolName": "exec_command",
+            "command": "rm target.txt",
+            "sessionKey": "agent:main:slack:direct:U1",
+        },
+    )
+    assert queue.bind_channel_code(
+        "AB12",
+        approval_id=approval_id,
+        namespace="exec",
+        session_key="agent:main:slack:direct:U1",
+        owner_sender_id="U1",
+        origin_channel_name="slack-main",
+        origin_channel_id="D1",
+    )
+    queue.close()
+
+    reloaded = ApprovalQueue(db_path=str(db_path))
+    try:
+        binding = reloaded.resolve_channel_code("AB12")
+        assert binding is not None
+        assert binding["approval_id"] == approval_id
+        assert binding["owner_sender_id"] == "U1"
+        assert binding["origin_channel_id"] == "D1"
+        assert reloaded.channel_code_for_approval(approval_id) == "AB12"
+    finally:
+        reloaded.close()
+
+
 def test_approval_queue_ignores_corrupt_json_payload(tmp_path) -> None:
     db_path = tmp_path / "approval_queue.sqlite"
     queue = ApprovalQueue(db_path=str(db_path))
@@ -310,8 +344,7 @@ async def test_approval_queue_keeps_stale_resolved_claim_not_ready(tmp_path) -> 
     try:
         queue.finalize_claimed_resolution(approval_id, token, True)
         queue._conn.execute(
-            "UPDATE approval_queue SET claim_token = ?, claim_started_at = 0 "
-            "WHERE approval_id = ?",
+            "UPDATE approval_queue SET claim_token = ?, claim_started_at = 0 WHERE approval_id = ?",
             ("stale-token", approval_id),
         )
         queue._conn.commit()

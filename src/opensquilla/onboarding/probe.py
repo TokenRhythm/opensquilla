@@ -19,6 +19,7 @@ from __future__ import annotations
 import inspect
 import os
 import time
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -34,7 +35,16 @@ from opensquilla.provider.selector import (
     _exception_status_code,
     build_provider,
 )
-from opensquilla.provider.types import ChatConfig, DoneEvent, ErrorEvent, Message, ModelInfo
+from opensquilla.provider.types import (
+    ChatConfig,
+    DoneEvent,
+    ErrorEvent,
+    Message,
+    ModelInfo,
+    ReasoningDeltaEvent,
+    StreamEvent,
+    TextDeltaEvent,
+)
 from opensquilla.redaction import redact_error_text
 
 log = structlog.get_logger(__name__)
@@ -52,9 +62,17 @@ class ProviderProbeResult:
     failure_kind: str = ""
     message: str = ""
     code: str = ""
-    # Wall time of the network round-trip; 0 when the probe never reached the
+    # Legacy end-to-end probe duration; 0 when the probe never reached the
     # network (missing key, build failure).
     latency_ms: int = 0
+    # Time to the first non-empty model response. ``None`` means no text or
+    # reasoning delta arrived before the probe completed or failed.
+    first_response_ms: int | None = None
+
+    @property
+    def total_ms(self) -> int:
+        """Explicit name for the legacy end-to-end ``latency_ms`` value."""
+        return self.latency_ms
 
     def to_payload(self) -> dict[str, object]:
         return {
@@ -65,6 +83,8 @@ class ProviderProbeResult:
             "message": self.message,
             "code": self.code,
             "latencyMs": self.latency_ms,
+            "firstResponseMs": self.first_response_ms,
+            "totalMs": self.total_ms,
         }
 
 
@@ -86,13 +106,20 @@ async def probe_llm_provider(
     api_key_env: str = "",
     base_url: str = "",
     proxy: str = "",
+    allow_default_api_key_env: bool = True,
     timeout: float = _PROBE_TIMEOUT_SECONDS,
+    chat_stream_factory: Callable[
+        [LLMProvider, list[Message], ChatConfig], AsyncIterator[StreamEvent]
+    ]
+    | None = None,
 ) -> ProviderProbeResult:
     """Run a one-token live chat against the candidate provider config.
 
     Raises ``ValueError`` for validation-level problems (unknown provider id,
     missing model) so callers surface those as typed input errors; runtime
     reachability/credential failures come back as a not-ok result.
+    ``allow_default_api_key_env=False`` lets RPC callers suppress the registry
+    env fallback when testing a different endpoint origin.
     """
     provider_id = (provider_id or "").strip()
     model = (model or "").strip()
@@ -102,9 +129,14 @@ async def probe_llm_provider(
     if not spec.runtime_supported:
         raise ValueError(f"Provider '{provider_id}' has no runtime support to probe.")
 
-    resolved_key, key_source = _resolve_probe_api_key(api_key, api_key_env, spec.env_key)
+    default_env_key = spec.env_key if allow_default_api_key_env else ""
+    resolved_key, key_source = _resolve_probe_api_key(
+        api_key,
+        api_key_env,
+        default_env_key,
+    )
     if spec.requires_api_key() and not resolved_key:
-        checked = key_source or (spec.env_key and f"${spec.env_key}") or "no env key"
+        checked = key_source or (default_env_key and f"${default_env_key}") or "no env key"
         return ProviderProbeResult(
             ok=False,
             provider_id=provider_id,
@@ -127,53 +159,79 @@ async def probe_llm_provider(
             provider_id=provider_id,
             model=model,
             failure_kind=ProviderFailureKind.BAD_REQUEST.value,
-            message=str(exc),
+            message=redact_error_text(str(exc), known_secrets=(resolved_key,)),
         )
 
     cfg = ChatConfig(max_tokens=1, timeout=timeout, thinking=False)
     messages = [Message(role="user", content="ping")]
     start = time.monotonic()
+    first_response_ms: int | None = None
     try:
-        async for event in provider.chat(messages, config=cfg):
-            if isinstance(event, ErrorEvent):
-                status_code = int(event.code) if str(event.code).isdigit() else None
-                kind = classify_provider_error(
-                    provider_id,
-                    status_code,
-                    raw_code=event.code,
-                    message=event.message,
-                )
-                return ProviderProbeResult(
-                    ok=False,
-                    provider_id=provider_id,
-                    model=model,
-                    failure_kind=kind.value,
-                    # Provider error bodies can echo credentials (bad keys,
-                    # signed URLs) — never repeat them verbatim.
-                    message=redact_error_text(event.message),
-                    code=str(event.code),
-                    latency_ms=int((time.monotonic() - start) * 1000),
-                )
-            if isinstance(event, DoneEvent):
-                return ProviderProbeResult(
-                    ok=True,
-                    provider_id=provider_id,
-                    model=model,
-                    latency_ms=int((time.monotonic() - start) * 1000),
-                )
+        stream = (
+            chat_stream_factory(provider, messages, cfg)
+            if chat_stream_factory is not None
+            else provider.chat(messages, config=cfg)
+        )
+        try:
+            async for event in stream:
+                if (
+                    first_response_ms is None
+                    and isinstance(event, (TextDeltaEvent, ReasoningDeltaEvent))
+                    and event.text
+                ):
+                    first_response_ms = int((time.monotonic() - start) * 1000)
+                if isinstance(event, ErrorEvent):
+                    status_code = int(event.code) if str(event.code).isdigit() else None
+                    kind = classify_provider_error(
+                        provider_id,
+                        status_code,
+                        raw_code=event.code,
+                        message=event.message,
+                    )
+                    return ProviderProbeResult(
+                        ok=False,
+                        provider_id=provider_id,
+                        model=model,
+                        failure_kind=kind.value,
+                        # Provider error bodies can echo credentials (bad keys,
+                        # signed URLs) — never repeat them verbatim.
+                        message=redact_error_text(
+                            event.message,
+                            known_secrets=(resolved_key,),
+                        ),
+                        code=redact_error_text(
+                            str(event.code),
+                            known_secrets=(resolved_key,),
+                        ),
+                        latency_ms=int((time.monotonic() - start) * 1000),
+                        first_response_ms=first_response_ms,
+                    )
+                if isinstance(event, DoneEvent):
+                    return ProviderProbeResult(
+                        ok=True,
+                        provider_id=provider_id,
+                        model=model,
+                        latency_ms=int((time.monotonic() - start) * 1000),
+                        first_response_ms=first_response_ms,
+                    )
+        finally:
+            aclose = getattr(stream, "aclose", None)
+            if callable(aclose):
+                await aclose()
     except Exception as exc:  # noqa: BLE001 - a probe never raises transport noise
         log.warning(
             "onboarding.provider_probe_failed",
             provider=provider_id,
-            error=redact_error_text(str(exc)),
+            error=redact_error_text(str(exc), known_secrets=(resolved_key,)),
         )
         return ProviderProbeResult(
             ok=False,
             provider_id=provider_id,
             model=model,
             failure_kind=ProviderFailureKind.TRANSPORT_TRANSIENT.value,
-            message=redact_error_text(str(exc)),
+            message=redact_error_text(str(exc), known_secrets=(resolved_key,)),
             latency_ms=int((time.monotonic() - start) * 1000),
+            first_response_ms=first_response_ms,
         )
 
     return ProviderProbeResult(
@@ -183,6 +241,7 @@ async def probe_llm_provider(
         failure_kind=ProviderFailureKind.MALFORMED_RESPONSE.value,
         message="Provider stream ended without a completion event.",
         latency_ms=int((time.monotonic() - start) * 1000),
+        first_response_ms=first_response_ms,
     )
 
 
@@ -301,6 +360,7 @@ async def discover_provider_models(
     api_key_env: str = "",
     base_url: str = "",
     proxy: str = "",
+    allow_default_api_key_env: bool = True,
 ) -> ProviderModelsDiscoverResult:
     """List a candidate provider's live models without persisting anything.
 
@@ -311,15 +371,22 @@ async def discover_provider_models(
 
     Raises ``ValueError`` for validation-level problems (unknown provider id,
     no runtime support) so callers surface those as typed input errors.
+    ``allow_default_api_key_env=False`` suppresses the registry env fallback
+    for a candidate endpoint that must not inherit the active endpoint's key.
     """
     provider_id = (provider_id or "").strip()
     spec = get_provider_spec(provider_id)  # raises UnknownProviderError(ValueError)
     if not spec.runtime_supported:
         raise ValueError(f"Provider '{provider_id}' has no runtime support to discover.")
 
-    resolved_key, key_source = _resolve_probe_api_key(api_key, api_key_env, spec.env_key)
+    default_env_key = spec.env_key if allow_default_api_key_env else ""
+    resolved_key, key_source = _resolve_probe_api_key(
+        api_key,
+        api_key_env,
+        default_env_key,
+    )
     if spec.requires_api_key() and not resolved_key:
-        checked = key_source or (spec.env_key and f"${spec.env_key}") or "no env key"
+        checked = key_source or (default_env_key and f"${default_env_key}") or "no env key"
         return ProviderModelsDiscoverResult(
             ok=False,
             provider_id=provider_id,
@@ -340,7 +407,7 @@ async def discover_provider_models(
             ok=False,
             provider_id=provider_id,
             failure_kind=ProviderFailureKind.BAD_REQUEST.value,
-            detail=str(exc),
+            detail=redact_error_text(str(exc), known_secrets=(resolved_key,)),
         )
 
     try:
@@ -360,7 +427,7 @@ async def discover_provider_models(
             "onboarding.models_discover_failed",
             provider=provider_id,
             kind=kind.value,
-            error=redact_error_text(str(exc)),
+            error=redact_error_text(str(exc), known_secrets=(resolved_key,)),
         )
         return ProviderModelsDiscoverResult(
             ok=False,
@@ -368,7 +435,7 @@ async def discover_provider_models(
             failure_kind=kind.value,
             # Provider error bodies can echo credentials (bad keys, signed
             # URLs) — never repeat them verbatim.
-            detail=redact_error_text(str(exc)),
+            detail=redact_error_text(str(exc), known_secrets=(resolved_key,)),
         )
 
     if not provider_models:
@@ -390,6 +457,7 @@ async def discover_selectable_provider_models(
     api_key_env: str = "",
     base_url: str = "",
     proxy: str = "",
+    allow_default_api_key_env: bool = True,
 ) -> ProviderModelsDiscoverResult:
     """Return only verified live catalogs suitable for a model picker.
 
@@ -425,10 +493,13 @@ async def discover_selectable_provider_models(
     ):
         return ProviderModelsDiscoverResult(ok=True, provider_id=provider_id)
 
-    return await discover_provider_models(
-        provider_id=provider_id,
-        api_key=api_key,
-        api_key_env=api_key_env,
-        base_url=base_url.strip(),
-        proxy=proxy,
-    )
+    discover_kwargs: dict[str, Any] = {
+        "provider_id": provider_id,
+        "api_key": api_key,
+        "api_key_env": api_key_env,
+        "base_url": base_url.strip(),
+        "proxy": proxy,
+    }
+    if not allow_default_api_key_env:
+        discover_kwargs["allow_default_api_key_env"] = False
+    return await discover_provider_models(**discover_kwargs)

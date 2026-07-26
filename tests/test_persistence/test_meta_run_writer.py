@@ -598,6 +598,7 @@ def _open_clocked_writer(
     *,
     retention_days: int = 90,
     prune_every: int = 1,
+    prune_batch: int = 1_000,
 ) -> tuple[MetaRunWriter, dict[str, int]]:
     """Migrated writer with a mutable fake clock for retention tests."""
     import sqlite3
@@ -612,6 +613,7 @@ def _open_clocked_writer(
         conn,
         retention_days=retention_days,
         prune_every=prune_every,
+        prune_batch=prune_batch,
         clock=lambda: clock["now_ms"],
     )
     return writer, clock
@@ -695,6 +697,48 @@ def test_retention_prune_cadence_honours_prune_every(tmp_path: Path) -> None:
 
         _begin(writer, session_key="s-3")  # begin #3 — prune fires
         assert writer.get_run(old) is None
+    finally:
+        writer.close()
+
+
+def test_retention_pruning_is_bounded_and_keeps_live_runs(tmp_path: Path) -> None:
+    writer, clock = _open_clocked_writer(
+        tmp_path,
+        retention_days=90,
+        prune_every=8,
+        prune_batch=2,
+    )
+    try:
+        old_terminal: list[str] = []
+        for index in range(5):
+            run_id = _begin(writer, session_key=f"s-old-{index}")
+            writer.finish_run_sync(run_id=run_id, status="ok", result=None)
+            old_terminal.append(run_id)
+
+        old_running = _begin(writer, session_key="s-running")
+        old_awaiting = _begin(writer, session_key="s-awaiting")
+        assert writer.try_claim_awaiting(
+            run_id=old_awaiting,
+            step_id="collect",
+            schema_json="{}",
+            session_id="s-awaiting",
+            inputs_json="{}",
+            step_outputs_json="{}",
+            awaiting_since=1.0,
+        )
+
+        clock["now_ms"] = 91 * _DAY_MS
+        fresh = _begin(writer, session_key="s-fresh")
+
+        remaining_terminal = [
+            run_id for run_id in old_terminal if writer.get_run(run_id) is not None
+        ]
+        assert len(remaining_terminal) == 3
+        running = writer.get_run(old_running)
+        assert running is not None and running.status == "running"
+        awaiting = writer.get_run(old_awaiting)
+        assert awaiting is not None and awaiting.status == "awaiting_user"
+        assert writer.get_run(fresh) is not None
     finally:
         writer.close()
 

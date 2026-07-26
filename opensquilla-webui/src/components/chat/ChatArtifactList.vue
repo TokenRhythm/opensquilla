@@ -97,7 +97,19 @@
       </figure>
     </TransitionGroup>
 
-    <!-- Non-image artifacts: file cards with explicit Open/Download actions. -->
+    <!-- Audio artifacts fetch authenticated bytes only after an explicit Play. -->
+    <TransitionGroup v-if="audioArtifacts.length" name="artifact-chip" tag="div" class="msg-artifact-files">
+      <AudioArtifactCard
+        v-for="artifact in audioArtifacts"
+        :key="artifactKey(artifact)"
+        :artifact="artifact"
+        :session-key="sessionKey"
+        :auth-token="authToken"
+        @download="$emit('download', $event)"
+      />
+    </TransitionGroup>
+
+    <!-- Non-image/non-audio artifacts: file cards with explicit actions. -->
     <TransitionGroup v-if="fileArtifacts.length" name="artifact-chip" tag="div" class="msg-artifact-files">
       <ArtifactChip
         v-for="artifact in fileArtifacts"
@@ -218,8 +230,10 @@ import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import ArtifactChip from '@/components/chat/ArtifactChip.vue'
+import AudioArtifactCard from '@/components/chat/AudioArtifactCard.vue'
 import type { ArtifactPayload } from '@/types/rpc'
 import { useToasts } from '@/composables/useToasts'
+import { useDialogLayer } from '@/composables/useDialogA11y'
 import {
   createArtifactPreview,
   type ArtifactPreviewController,
@@ -262,11 +276,15 @@ const platform = usePlatform()
 const rpcStore = useRpcStore()
 
 const visualArtifacts = computed(() => props.artifacts.filter(artifact => artifactCategory(artifact) === 'visual'))
+const audioArtifacts = computed(() => props.artifacts.filter(artifact => artifactCategory(artifact) === 'audio'))
 const navigationVisualArtifacts = computed(() => {
   const source = props.navigationArtifacts?.length ? props.navigationArtifacts : props.artifacts
   return source.filter(artifact => artifactCategory(artifact) === 'visual')
 })
-const fileArtifacts = computed(() => props.artifacts.filter(artifact => artifactCategory(artifact) !== 'visual'))
+const fileArtifacts = computed(() => props.artifacts.filter(artifact => {
+  const category = artifactCategory(artifact)
+  return category !== 'visual' && category !== 'audio'
+}))
 
 function artifactKey(artifact: ArtifactPayload): string {
   return String(artifact.id || artifact.download_url || artifact.name || '')
@@ -421,6 +439,7 @@ async function openFile(artifact: ArtifactPayload) {
 // The full-size image is fetched only when Open is invoked, through the shared
 // LRU-bounded controller; the thumbnail path above never loads the full bytes.
 const active = ref<ArtifactPayload | null>(null)
+const lightboxIsTopmost = useDialogLayer(computed(() => active.value !== null))
 const lightboxCloseBtn = ref<HTMLButtonElement | null>(null)
 const lightboxPanel = ref<HTMLElement | null>(null)
 let lightboxInvoker: HTMLElement | null = null
@@ -532,7 +551,7 @@ function trapLightboxFocus(event: KeyboardEvent) {
 }
 
 function onLightboxKeydown(event: KeyboardEvent) {
-  if (!active.value) return
+  if (!active.value || !lightboxIsTopmost.value) return
   if (event.key === 'Escape') {
     event.preventDefault()
     closePreview()

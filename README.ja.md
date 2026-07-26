@@ -40,7 +40,7 @@ OpenSquilla は、Token を効率的に使うマイクロカーネル AI Agent �
 
 すべての入口——Web UI、CLI、チャットチャネル——が同じループ上で動くため、ツールのディスパッチ、リトライ、判断ログの挙動はどこでも同一です。プラグイン可能なプロバイダ層は TokenRhythm、OpenRouter、OpenAI、Anthropic、Ollama、DeepSeek、Gemini、Qwen/DashScope をはじめとする 20 以上の LLM プロバイダと、あなたのコードや設定スキーマを変えることなくやり取りします。
 
-OpenSquilla 0.5.0 Preview 4 が現在のプレビューリリースです。
+OpenSquilla 0.5.0 が現在の安定版リリースです。
 
 タスク指向の製品ドキュメントについては、[OpenSquilla 製品ガイド](README.product.md)または[ドキュメント索引](docs/README.md)から始めてください。
 
@@ -50,11 +50,11 @@ OpenSquilla 0.5.0 Preview 4 が現在のプレビューリリースです。
 
 OpenSquilla は Windows、macOS、Linux で動作します。ご自身のユースケースに合った方法を選んでください。
 
-デスクトップインストーラーとターミナルからのクイックインストールは、ビルド済みの**リリース**版をそのまま入手できます——Git は不要です。残りの 2 つ——ソースからのインストールとソースからの開発——は、**Git のチェックアウトから**ビルドします（`git clone` + Git LFS）。
+デスクトップインストーラーとターミナルからのクイックインストールは、ビルド済みの**リリース**版をそのまま入手できます——Git は不要です。残りの 2 つ——ソースからのインストールとソースからの開発——は、Vue コントロールコンソールを含めて **Git のチェックアウトから**ビルドします（`git clone` + Git LFS）。リリース wheel とデスクトップインストーラーにはコンソールが含まれるため、利用者に Node.js や npm は不要です。
 
 リリース版のインストールコマンドは、公開された GitHub リリースのアセットを使います。Python wheel のインストールでは、バージョン付きの wheel ファイル名を使います。インストーラーが wheel ファイル名に埋め込まれたバージョンを検証するためです。
 
-0.5.0 Preview 4 をデスクトップで使う場合は、GitHub リリースからパッケージ版デスクトップインストーラーを使うことをおすすめします。macOS では `OpenSquilla-0.5.0-rc4-mac-arm64.dmg`、Windows では `OpenSquilla-0.5.0-rc4-win-x64.exe` です。
+0.5.0 をデスクトップで使う場合は、GitHub リリースからパッケージ版デスクトップインストーラーを使うことをおすすめします。macOS では `OpenSquilla-0.5.0-mac-arm64.dmg`、Windows では `OpenSquilla-0.5.0-win-x64.exe` です。
 
 | 方法 | 対象 | 使うべき場面 |
 | --- | --- | --- |
@@ -69,6 +69,7 @@ OpenSquilla は Windows、macOS、Linux で動作します。ご自身のユー�
 | --- | :---: | :---: | :---: |
 | Python 3.12+ | `uv` 経由 | `uv` またはシステム経由 | `uv` 経由 |
 | Git + Git LFS | — | 必須 | 必須 |
+| Node.js 22.12+ + npm | — | Web UI のビルドに必須 | Web UI と wheel のビルドに必須 |
 | `uv` | なければ自動インストール | 推奨 | 必須 |
 
 デフォルトの `recommended` プロファイルは **SquillaRouter**——OpenSquilla のデバイス上モデルルーター——とそのモデルアセットをインストールします。`OPENSQUILLA_INSTALL_PROFILE=core` ではこれらの依存関係を省きます。これとは別の `--router disabled` というオンボーディングフラグは、依存関係はインストールしたまま、実行時にルーターをオフにします。
@@ -79,22 +80,23 @@ macOS のターミナルインストールでは、SquillaRouter の LightGBM �
 
 インストールリンク: [Git](https://git-scm.com/downloads) ·
 [Git LFS](https://git-lfs.com/) ·
+[Node.js](https://nodejs.org/en/download) ·
 [uv](https://docs.astral.sh/uv/getting-started/installation/)。
 
 <a id="desktop-installers"></a>
 
 ### デスクトップインストーラー
 
-0.5.0 Preview 4 のデスクトップインストーラーは、Vue 製コントロールコンソールとゲートウェイランタイムを Electron シェルにまとめています。
+0.5.0 のデスクトップインストーラーは、Vue 製コントロールコンソールとゲートウェイランタイムを Electron シェルにまとめています。
 
-- macOS Apple Silicon: <https://github.com/opensquilla/opensquilla/releases/download/v0.5.0rc4/OpenSquilla-0.5.0-rc4-mac-arm64.dmg>
-- Windows x64: <https://github.com/opensquilla/opensquilla/releases/download/v0.5.0rc4/OpenSquilla-0.5.0-rc4-win-x64.exe>
+- macOS Apple Silicon: <https://github.com/opensquilla/opensquilla/releases/download/v0.5.0/OpenSquilla-0.5.0-mac-arm64.dmg>
+- Windows x64: <https://github.com/opensquilla/opensquilla/releases/download/v0.5.0/OpenSquilla-0.5.0-win-x64.exe>
 
 中国本土からより高速にダウンロードするには、OSS の直接ダウンロード用エイリアスを使用してください。
 - macOS Apple Silicon: <https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/latest/OpenSquilla-mac-arm64.dmg>
 - Windows x64: <https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/latest/OpenSquilla-win-x64.exe>
 
-これらの固定リンクは、リリースミラーリングが成功するたびに更新されます。特定のリリースが必要な場合は、上記のバージョン付き GitHub Release リンクを使用してください。
+これらの固定リンクは、より新しい対象リリースがミラー検証に合格した場合にのみ更新されます。特定のリリースが必要な場合は、上記のバージョン付き GitHub Release リンクを使用してください。
 
 アップグレードの前に、実行中の OpenSquilla デスクトップアプリをすべて終了してください。プラットフォームのアプリデータディレクトリにある既存の Desktop プロファイルが引き続き使用されます。ターミナル版の `~/.opensquilla` は別のプロファイルです。必要な場合は設定から明示的に転送してください。
 
@@ -125,7 +127,7 @@ $env:Path = "$env:USERPROFILE\.local\bin;" + $env:Path
 **2. OpenSquilla をインストールする**——どのプラットフォームでも同じコマンドです。
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.0rc4/opensquilla-0.5.0rc4-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.0/opensquilla-0.5.0-py3-none-any.whl"
 ```
 
 これはリリース URL から OpenSquilla wheel をインストールし、続いて `uv` が、選択した extra が宣言する依存関係をダウンロードします。デフォルトの `recommended` extra には、ONNX Runtime、LightGBM、NumPy、tokenizers といった SquillaRouter のランタイム依存関係が含まれるため、これらの wheel がすでにキャッシュされていない限り、初回インストールにはネットワークアクセスが必要です。`uv` は macOS の `libomp` や Windows の Visual C++ Redistributable のようなシステムネイティブのランタイムはインストールしません。ルーターランタイムがネイティブライブラリの読み込みエラーを報告した場合は、[トラブルシューティング](#troubleshooting)を参照してください。
@@ -141,7 +143,7 @@ opensquilla gateway run
 > 新規の `uv` インストール直後に `opensquilla` が見つからない場合は、新しいターミナルを開くか、ステップ 1 の PATH 設定の行を再実行してください。
 
 完全にバージョンを固定したインストールには、バージョン付きの wheel URL を使ってください:
-`https://github.com/opensquilla/opensquilla/releases/download/v0.5.0rc4/opensquilla-0.5.0rc4-py3-none-any.whl`。
+`https://github.com/opensquilla/opensquilla/releases/download/v0.5.0/opensquilla-0.5.0-py3-none-any.whl`。
 
 <a id="install-from-source"></a>
 
@@ -172,10 +174,18 @@ opensquilla gateway run
    powershell -ExecutionPolicy Bypass -File ./scripts/install_source.ps1
    ```
 
-   このスクリプトは `uv tool install` で `.[recommended]`（SquillaRouter + メモリ +
+   このスクリプトは最初に `opensquilla-webui` で `npm ci` と
+   `npm run build` を実行し、その後 `uv tool install` で `.[recommended]`（SquillaRouter + メモリ +
    ローカルモデル）を専用のユーザー環境にインストールし、`uv` が使えない場合は
-   `python -m pip install --user` にフォールバックします。インストール後に
+   `python -m pip install --user` にフォールバックします。ソースから再インストールするたびに
+   `npm ci` が `node_modules` を作り直し、コンソールを再ビルドします。初回は通常ダウンロード量が
+   最大で、以後は npm キャッシュで通信量を減らせますが、ビルド時間とディスク書き込みは残ります。インストール後に
    `opensquilla` が `PATH` に乗っていない場合は、新しいターミナルを開いてください。
+
+   `pip install .`、`uv tool install .`、VCS URL からの直接インストールは低レベルの
+   ソースビルドであり、このスクリプトの代わりにはなりません。ローカルのチェックアウトでは
+   先に Web UI をビルドする必要があります。VCS URL のチェックアウトには生成物がないため、
+   意図的に拒否されます。ソースインストーラーまたは公式リリース wheel を使用してください。
 
 3. **（任意）高度な extra をインストールする。** ほとんどのチャネル——Feishu、
    Telegram、DingTalk、QQ、WeCom、Slack、Discord——は基本インストールで動作します。オプトインの extra は次のとおりです:
@@ -197,13 +207,14 @@ opensquilla gateway run
 <details>
 <summary>ソースからのインストール——ターミナルでの前提条件とインストーラーのオプション</summary>
 
-**ターミナルから前提条件（Git、Git LFS、uv）をインストールする**
+**ターミナルから前提条件（Git、Git LFS、Node.js 22.12+ と npm、uv）をインストールする**
 
 Windows PowerShell:
 
 ```powershell
 winget install --id Git.Git -e
 winget install --id GitHub.GitLFS -e
+winget install --id OpenJS.NodeJS.LTS -e
 powershell -ExecutionPolicy Bypass -c "irm https://astral.sh/uv/install.ps1 | iex"
 git lfs install
 ```
@@ -211,20 +222,23 @@ git lfs install
 macOS（Homebrew）:
 
 ```sh
-brew install git git-lfs uv
+brew install git git-lfs node uv
 git lfs install
 ```
 
 Debian / Ubuntu:
 
 ```sh
-sudo apt update && sudo apt install -y git git-lfs
+sudo apt update && sudo apt install -y git git-lfs curl
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt install -y nodejs
 curl -LsSf https://astral.sh/uv/install.sh | sh
 git lfs install
 ```
 
 Fedora では `sudo dnf install -y git git-lfs`、Arch では
-`sudo pacman -S --needed git git-lfs` を使い、その後に上記の `curl` コマンドで `uv` を
+`sudo pacman -S --needed git git-lfs` を使い、ディストリビューションまたは
+nodejs.org から Node.js 22.12+ と npm をインストールしてから、上記の `curl` コマンドで `uv` を
 インストールしてください。これらのインストーラーによる PATH の変更は、新しいターミナルセッションで反映されます。
 
 **インストーラーの環境変数と PATH の確認**
@@ -245,9 +259,17 @@ OPENSQUILLA_INSTALL_DRY_RUN=1      bash scripts/install_source.sh   # 計画を�
 この経路は、OpenSquilla のソースコードに手を入れているとき——変更を加える、テストを走らせる、このチェックアウトに対して挙動をデバッグする——に使います。通常のインストール経路ではありません。[ソースからのインストール](#install-from-source)とは異なり、この経路には `uv` が必要です。`uv sync` はリポジトリローカルの `.venv` を作成し、`uv run` はこのチェックアウト内のファイルに対してコマンドを実行します。
 
 ```sh
+cd opensquilla-webui
+npm ci
+npm run build
+cd ..
 uv sync --extra recommended --extra dev
 uv run opensquilla --help
 ```
+
+Web UI のソースを変更した後は `npm run build` を再実行してください。通常の wheel
+ビルドはコンソール成果物がない、または古い場合に失敗します。バックエンドのみの
+editable `uv sync` は引き続き利用できます。
 
 `recommended` extra は開発時にも SquillaRouter を含みます。`dev` extra はテスト、lint、型チェックのツールをインストールします。追加の extra は、実行する環境と同じ環境にインストールしてください:
 
@@ -281,31 +303,48 @@ opensquilla uninstall --purge-all      # すべて（確認の入力を求めら
 
 ## インストールのプライバシー
 
-OpenSquilla は、インストール数、バージョンの採用状況、ランタイムの互換性を推定するために、匿名のインストールテレメトリを使用します。データはゲートウェイの初回起動時と、OpenSquilla のバージョンごとに 1 回送信されます。アップロードは短いタイムアウトで行われ、起動をブロックすることは決してありません。
+OpenSquilla は、インストール数、バージョンの採用状況、ランタイムの互換性を推定するために、匿名のインストールテレメトリを使用します。データはゲートウェイの初回起動時に送信され、OpenSquilla の各バージョンにつき 1 回だけ送信されます。また、完了したトップレベルの会話数とトークン使用量を、会話内容を含めず UTC 日付ごとにローカルで集計し、起動時およびその後 1 時間ごとに、未送信の UTC 日別累積スナップショットを同じテレメトリサービスへ送信しようとします。OpenSquilla は、デスクトップ起動時やアプリの継続実行中に 1 日最大 1 回行われる自動更新確認など、受動的な更新確認を行う場合もあります。アップロードには短いタイムアウトが設定されており、起動をブロックすることはありません。
 
 送信される内容:
 
 - スキーマバージョン
 - ローカルで生成された安定した `install_id` ダイジェスト
 - OpenSquilla のバージョン
-- イベントタイプ（`install` または `version_seen`）
+- イベントタイプ（`install`、`version_seen`、または `daily_usage`）
 - インストール方法（`pip`、`source`、`docker`、`desktop`、または `unknown`）
 - オペレーティングシステム、OS のバージョン、CPU アーキテクチャ、Python のメジャー/マイナー
   バージョン
 - 初回確認時と送信時のタイムスタンプ
 - CI/テスト環境のマーカー（`ci_environment`）
+- 日次利用状況イベントの UTC 日付、完了した会話数、および input/output/cache/cache-write トークン使用量の集計
 
 `install_id` は、利用可能な MAC アドレスから——MAC がない場合はローカル IP アドレスから——導出されるローカルの一方向 SHA-256 ダイジェストで、どちらもない場合はランダムに生成して永続化した値でフォールバックします。生の MAC/IP の値はアップロードされません。
 
 送信されない内容: ユーザー名、ホスト名、パス、API キー、プロバイダ設定、チャット/セッション/メモリ/Agent の内容、ファイル名、ファイルの内容。送信元 IP はトランスポート層で HTTP サーバーから見える場合がありますが、ペイロードには含まれません。
 
-オプトアウトするには:
+ユーザー操作によらないネットワーク可観測性を起動前に無効にするには:
+
+```sh
+OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY=true
+```
+
+または設定ファイルで次のように指定します:
+
+```toml
+[privacy]
+disable_network_observability = true
+```
+
+この統一スイッチは、自動インストールテレメトリ、日次集計利用状況テレメトリ、受動的な更新確認、およびデスクトップ起動時やアプリの継続実行中に行われる自動更新確認に適用されます。統一スイッチまたは互換性維持のためのオプトアウトが有効な間は、ユーザーが明示的に実行する更新確認もこれを回避しません。リリースページを開く、リリース資産をダウンロードする、設定済みのプロバイダ、検索、チャネルを利用するなど、ユーザーが明示的に開始したその他の操作では、ネットワークサービスへ接続する場合があります。
+
+従来のオプトアウト用環境変数も引き続き使用できます:
 
 ```sh
 OPENSQUILLA_TELEMETRY_DISABLED=true
+OPENSQUILLA_UPDATE_CHECK_DISABLED=true
 ```
 
-高度なデプロイでは、独自のエンドポイントを使えます:
+高度なデプロイでは、独自のインストールテレメトリエンドポイントを使用できます:
 
 ```sh
 OPENSQUILLA_TELEMETRY_ENDPOINT=https://example.com/v1/install

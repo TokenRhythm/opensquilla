@@ -8,8 +8,8 @@ unit-tested with a JS runner here, so we lock the SPA source text:
   slash menu (not a toast), via the command's ``argumentChoices``;
 - selecting ``/meta <skill>`` runs it through ``meta.run`` + a hidden turn.
 
-(The legacy ``static/js/views/chat.js`` is NOT served, so it is not the file
-under test.)
+The contract intentionally targets the maintained Vue source rather than a
+generated browser bundle.
 """
 
 from pathlib import Path

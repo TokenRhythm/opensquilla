@@ -1,9 +1,7 @@
-"""Shared legacy-home detection for the Phase 3 advisory surfaces.
+"""Settings-only legacy profile discovery contracts.
 
-``detect_legacy_home`` is consumed by the gateway boot warning, the doctor
-``migration`` surface, and ``onboarding.status``; these tests pin its guard
-behavior (never the live home, portable enumeration only where portable data
-dirs can exist, never raises) and the suggested-command rendering.
+The single-candidate helper remains for CLI compatibility; the settings RPC
+uses bounded multi-candidate discovery against the active target profile.
 """
 
 from __future__ import annotations
@@ -19,7 +17,7 @@ from opensquilla.migration import opensquilla_home
 from opensquilla.migration.legacy_detect import (
     LegacyHomeCandidate,
     detect_legacy_home,
-    suggested_migrate_command,
+    detect_legacy_homes,
 )
 
 
@@ -89,11 +87,71 @@ def test_cli_home_precedes_desktop_home(
     legacy = _make_home(fake_home / ".opensquilla")
     desktop = _make_home(tmp_path / "desktop-home")
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
-    monkeypatch.setattr(opensquilla_home, "detect_desktop_home", lambda: desktop)
+    monkeypatch.setattr(
+        opensquilla_home,
+        "detect_desktop_home",
+        lambda target=None: desktop,
+    )
 
     candidate = detect_legacy_home(tmp_path / "target-home")
 
     assert candidate == LegacyHomeCandidate(path=legacy, kind="cli-home")
+
+
+def test_discovers_all_source_kinds_in_priority_order_and_caps_at_twelve(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_home = tmp_path / "userhome"
+    legacy = _make_home(fake_home / ".opensquilla")
+    desktop = _make_home(tmp_path / "desktop-home")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    monkeypatch.setattr(
+        opensquilla_home,
+        "detect_desktop_home",
+        lambda target=None: desktop,
+    )
+    base = tmp_path / "appdata-local"
+    portable_homes = [
+        _make_home(base / "OpenSquilla" / "portable" / f"release-{index:02d}")
+        for index in range(16)
+    ]
+    for index, home in enumerate(portable_homes):
+        os.utime(home / "config.toml", (float(index + 1), float(index + 1)))
+        os.utime(home, (float(index + 1), float(index + 1)))
+    monkeypatch.setenv("LOCALAPPDATA", str(base))
+    monkeypatch.delenv("TEMP", raising=False)
+
+    candidates = detect_legacy_homes(tmp_path / "target", limit=99)
+
+    assert len(candidates) == 12
+    assert candidates[:2] == [
+        LegacyHomeCandidate(path=legacy, kind="cli-home"),
+        LegacyHomeCandidate(path=desktop, kind="desktop-home"),
+    ]
+    assert [candidate.path for candidate in candidates[2:]] == list(
+        reversed(portable_homes[-10:])
+    )
+    assert all(candidate.kind == "windows-portable" for candidate in candidates[2:])
+
+
+def test_discovery_deduplicates_the_same_directory_object(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _no_portable_bases: None,
+) -> None:
+    fake_home = tmp_path / "userhome"
+    legacy = _make_home(fake_home / ".opensquilla")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    monkeypatch.setattr(
+        opensquilla_home,
+        "detect_desktop_home",
+        lambda target=None: legacy,
+    )
+
+    assert detect_legacy_homes(tmp_path / "target") == [
+        LegacyHomeCandidate(path=legacy, kind="cli-home")
+    ]
 
 
 def test_desktop_home_precedes_portable_and_preserves_kind(
@@ -104,7 +162,11 @@ def test_desktop_home_precedes_portable_and_preserves_kind(
     fake_home.mkdir()  # no ~/.opensquilla: the cli-home probe finds nothing
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
     desktop = _make_home(tmp_path / "desktop-home")
-    monkeypatch.setattr(opensquilla_home, "detect_desktop_home", lambda: desktop)
+    monkeypatch.setattr(
+        opensquilla_home,
+        "detect_desktop_home",
+        lambda target=None: desktop,
+    )
     base = tmp_path / "appdata-local"
     _make_home(base / "OpenSquilla" / "portable" / "dummy-release")
     monkeypatch.setenv("LOCALAPPDATA", str(base))
@@ -128,7 +190,7 @@ def test_desktop_home_matching_target_is_not_offered_but_old_marker_does_not_hid
     monkeypatch.setattr(
         opensquilla_home,
         "detect_desktop_home",
-        lambda: desktop_probes.append(desktop) or desktop,
+        lambda target=None: desktop_probes.append(desktop) or desktop,
     )
 
     assert detect_legacy_home(desktop) is None
@@ -146,6 +208,29 @@ def test_desktop_home_matching_target_is_not_offered_but_old_marker_does_not_hid
         kind="desktop-home",
     )
     assert marker_probes == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="uses the POSIX Desktop path")
+def test_explicit_gateway_target_wins_over_ambient_default_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _no_portable_bases: None,
+) -> None:
+    fake_home = tmp_path / "userhome"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    desktop = _make_home(
+        fake_home / ".config" / "OpenSquilla" / "opensquilla"
+        if sys.platform != "darwin"
+        else fake_home / "Library" / "Application Support" / "OpenSquilla" / "opensquilla"
+    )
+    # An ambient shell setting points at Desktop, but the running gateway's
+    # config-derived target is elsewhere. Discovery must use the latter.
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(desktop))
+
+    assert detect_legacy_homes(tmp_path / "actual-gateway-target") == [
+        LegacyHomeCandidate(path=desktop, kind="desktop-home")
+    ]
 
 
 def test_portable_fallback_offers_newest_candidate(
@@ -260,49 +345,3 @@ def test_detection_swallows_os_errors(
     monkeypatch.setattr(opensquilla_home, "detect_legacy_cli_home", _explode)
 
     assert detect_legacy_home(tmp_path / "target-home") is None
-
-
-def test_suggested_migrate_command_renders_kind_and_source() -> None:
-    source = Path(os.sep) / "legacy" / "home"
-    candidate = LegacyHomeCandidate(path=source, kind="cli-home")
-    rendered_source = f"'{source}'" if os.name == "nt" else str(source)
-
-    assert suggested_migrate_command(candidate) == (
-        f"opensquilla migrate opensquilla --kind cli-home --source {rendered_source}"
-    )
-
-
-def test_suggested_migrate_command_quotes_paths_with_spaces() -> None:
-    source = Path(os.sep) / "legacy homes" / "data dir"
-    candidate = LegacyHomeCandidate(path=source, kind="windows-portable")
-
-    assert suggested_migrate_command(candidate) == (
-        "opensquilla migrate opensquilla --kind windows-portable "
-        f"--source '{source}'"
-    )
-
-
-def test_suggested_migrate_command_quotes_posix_shell_metacharacters(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from opensquilla.onboarding import next_steps
-
-    monkeypatch.setattr(next_steps.platform, "system", lambda: "Linux")
-    source = Path(os.sep) / "legacy$HOME"
-    candidate = LegacyHomeCandidate(path=source, kind="cli-home")
-
-    assert suggested_migrate_command(candidate).endswith(f"--source '{source}'")
-
-
-def test_suggested_migrate_command_uses_powershell_quoting(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from opensquilla.onboarding import next_steps
-
-    monkeypatch.setattr(next_steps.platform, "system", lambda: "Windows")
-    source = Path("C:\\O'Brien Data\\profile")
-    candidate = LegacyHomeCandidate(path=source, kind="windows-portable")
-
-    command = suggested_migrate_command(candidate)
-    assert command.endswith("--source 'C:\\O''Brien Data\\profile'")
-    assert "'\"'\"'" not in command

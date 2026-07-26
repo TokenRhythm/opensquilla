@@ -66,6 +66,46 @@ describe('useSetupProviderForm — runtime provider hydration', () => {
 
     expect(f.selectedProvider.value).toBe('openrouter')
   })
+
+  it('submits the registry env default shown for a fresh provider draft', () => {
+    const f = useSetupProviderForm()
+    const envField = {
+      name: 'api_key_env',
+      label: 'API key env',
+      default: 'DEEPSEEK_API_KEY',
+    }
+
+    f.selectProvider('deepseek')
+    f.resetForProvider({ fields: [envField] })
+
+    expect(f.fieldValue(envField, {})).toBe('DEEPSEEK_API_KEY')
+    expect(f.payload()).toEqual({
+      providerId: 'deepseek',
+      apiKeyEnv: 'DEEPSEEK_API_KEY',
+    })
+  })
+
+  it('hydrates saved profile endpoint fields without exposing secret fields', () => {
+    const f = useSetupProviderForm()
+
+    f.initStoredProfile('custom', {
+      base_url: 'https://llm.example.test/v1',
+      proxy: 'http://proxy.example.test:8080',
+      api_key: '[redacted]',
+      api_key_env: 'CUSTOM_API_KEY',
+    })
+
+    expect(f.providerFieldValues.value).toEqual({
+      base_url: 'https://llm.example.test/v1',
+      proxy: 'http://proxy.example.test:8080',
+    })
+    expect(f.payload()).toEqual({
+      providerId: 'custom',
+      baseUrl: 'https://llm.example.test/v1',
+      proxy: 'http://proxy.example.test:8080',
+    })
+    expect(f.isDirty.value).toBe(false)
+  })
 })
 
 describe('useSetupProviderForm — api_key / api_key_env are mutually exclusive', () => {
@@ -230,6 +270,20 @@ describe('useSetupProviderForm — provider credential state', () => {
     expect(f.revealedCredential.value).toBe('')
   })
 
+  it('hides revealed credentials immediately and cancels the pending expiry', () => {
+    vi.useFakeTimers()
+    const f = useSetupProviderForm()
+
+    f.setRevealedCredential('shown-key')
+    vi.advanceTimersByTime(PROVIDER_CREDENTIAL_REVEAL_TIMEOUT_MS / 2)
+    f.hideRevealedCredential()
+    expect(f.revealedCredential.value).toBe('')
+
+    f.setRevealedCredential('shown-again')
+    vi.advanceTimersByTime(PROVIDER_CREDENTIAL_REVEAL_TIMEOUT_MS / 2)
+    expect(f.revealedCredential.value).toBe('shown-again')
+  })
+
   it('clears revealed credentials when credential inputs change', () => {
     const f = useSetupProviderForm()
     f.setRevealedCredential('shown-key')
@@ -251,7 +305,16 @@ describe('useSetupProviderForm — provider credential state', () => {
 // Connection state machine — probe + model discovery
 // ---------------------------------------------------------------------------
 
-const PROBE_OK = { ok: true, providerId: 'openai', model: 'test-model', failureKind: '', message: '', code: '', latencyMs: 412 }
+const PROBE_OK = {
+  ok: true,
+  providerId: 'openai',
+  model: 'test-model',
+  failureKind: '',
+  message: '',
+  code: '',
+  firstResponseMs: 123,
+  totalMs: 412,
+}
 
 const DISCOVER_ROW = {
   id: 'test-vendor/test-model',
@@ -293,7 +356,9 @@ describe('useSetupProviderForm — connection state machine', () => {
     await pending
 
     expect(f.connection.value.phase).toBe('verified')
-    expect(f.connection.value.latencyMs).toBe(412)
+    expect(f.connection.value.firstResponseMs).toBe(123)
+    expect(f.connection.value.totalMs).toBe(412)
+    expect(f.connection.value.latencyMs).toBeNull()
     expect(f.connection.value.modelSource).toBe('live')
     expect(f.connection.value.models).toHaveLength(1)
     expect(f.connection.value.models[0].id).toBe('test-vendor/test-model')
@@ -321,8 +386,37 @@ describe('useSetupProviderForm — connection state machine', () => {
     })
   })
 
+  it('lets a canonical model override replace the form model for a probe', async () => {
+    mockRpc()
+    const f = useSetupProviderForm()
+    f.selectProvider('openai')
+    f.updateField('model', 'stale-provider-form-model')
+
+    await f.probeConnection({
+      defaultModel: 'fallback-model',
+      modelOverride: 'canonical-fixed-model',
+    })
+
+    expect(callMock).toHaveBeenNthCalledWith(1, 'onboarding.provider.probe', {
+      providerId: 'openai',
+      model: 'canonical-fixed-model',
+    })
+    expect(callMock).toHaveBeenNthCalledWith(2, 'onboarding.models.discover', {
+      providerId: 'openai',
+      model: 'canonical-fixed-model',
+    })
+  })
+
   it('classifies auth_invalid as key_invalid', async () => {
-    mockRpc({ probe: { ok: false, failureKind: 'auth_invalid', message: 'No API key available.', latencyMs: 87 } })
+    mockRpc({
+      probe: {
+        ok: false,
+        failureKind: 'auth_invalid',
+        message: 'No API key available.',
+        firstResponseMs: 25,
+        totalMs: 87,
+      },
+    })
     const f = useSetupProviderForm()
     f.selectProvider('openai')
     await f.probeConnection()
@@ -330,7 +424,8 @@ describe('useSetupProviderForm — connection state machine', () => {
     expect(f.connection.value.phase).toBe('key_invalid')
     expect(f.connection.value.failureKind).toBe('auth_invalid')
     expect(f.connection.value.detail).toBe('No API key available.')
-    expect(f.connection.value.latencyMs).toBe(87) // failures keep their round-trip time too
+    expect(f.connection.value.firstResponseMs).toBe(25)
+    expect(f.connection.value.totalMs).toBe(87) // failures keep reported probe timings too
     expect(callMock).toHaveBeenCalledTimes(1) // no discover after a failed probe
   })
 
@@ -344,17 +439,59 @@ describe('useSetupProviderForm — connection state machine', () => {
     expect(f.connection.value.failureKind).toBe('transport_transient')
   })
 
-  it('normalizes a missing or bogus probe latencyMs to null', async () => {
-    mockRpc({ probe: { ok: true, latencyMs: -5 } })
+  it('normalizes missing or bogus explicit probe timings to null', async () => {
+    mockRpc({ probe: { ok: true, firstResponseMs: -1, totalMs: Number.NaN } })
     const f = useSetupProviderForm()
     f.selectProvider('openai')
     await f.probeConnection({ defaultModel: 'm' })
 
     expect(f.connection.value.phase).toBe('verified')
-    expect(f.connection.value.latencyMs).toBeNull()
+    expect(f.connection.value.firstResponseMs).toBeNull()
+    expect(f.connection.value.totalMs).toBeNull()
   })
 
-  it('treats latencyMs=0 as the never-reached-network sentinel, not a real round trip', async () => {
+  it('falls back to a legacy gateway latency as complete probe duration only', async () => {
+    mockRpc({ probe: { ok: true, latencyMs: 412 } })
+    const f = useSetupProviderForm()
+    f.selectProvider('openai')
+    await f.probeConnection({ defaultModel: 'm' })
+
+    expect(f.connection.value.phase).toBe('verified')
+    expect(f.connection.value.firstResponseMs).toBeNull()
+    expect(f.connection.value.totalMs).toBe(412)
+    expect(f.connection.value.latencyMs).toBe(412)
+  })
+
+  it('accepts legitimate 0ms values in the new explicit timing fields', async () => {
+    mockRpc({ probe: { ok: true, firstResponseMs: 0, totalMs: 0 } })
+    const f = useSetupProviderForm()
+    f.selectProvider('openai')
+    await f.probeConnection({ defaultModel: 'm' })
+
+    expect(f.connection.value.firstResponseMs).toBe(0)
+    expect(f.connection.value.totalMs).toBe(0)
+  })
+
+  it('hides a failure totalMs=0 sentinel when no model response was observed', async () => {
+    mockRpc({
+      probe: {
+        ok: false,
+        failureKind: 'auth_invalid',
+        message: 'No API key available.',
+        firstResponseMs: null,
+        totalMs: 0,
+      },
+    })
+    const f = useSetupProviderForm()
+    f.selectProvider('openai')
+    await f.probeConnection()
+
+    expect(f.connection.value.phase).toBe('key_invalid')
+    expect(f.connection.value.firstResponseMs).toBeNull()
+    expect(f.connection.value.totalMs).toBeNull()
+  })
+
+  it('treats legacy latencyMs=0 as the never-reached-network sentinel', async () => {
     // The gateway sends latencyMs=0 when the call never hit the network (missing
     // key / build failure); it must not render as a bogus "· 0ms" pill.
     mockRpc({ probe: { ok: false, failureKind: 'auth_invalid', message: 'No API key available.', latencyMs: 0 } })
@@ -363,6 +500,8 @@ describe('useSetupProviderForm — connection state machine', () => {
     await f.probeConnection()
 
     expect(f.connection.value.phase).toBe('key_invalid')
+    expect(f.connection.value.firstResponseMs).toBeNull()
+    expect(f.connection.value.totalMs).toBeNull()
     expect(f.connection.value.latencyMs).toBeNull()
   })
 
@@ -374,7 +513,8 @@ describe('useSetupProviderForm — connection state machine', () => {
 
     expect(f.connection.value.phase).toBe('unreachable')
     expect(f.connection.value.detail).toBe('gateway offline')
-    expect(f.connection.value.latencyMs).toBeNull() // no round trip happened
+    expect(f.connection.value.firstResponseMs).toBeNull()
+    expect(f.connection.value.totalMs).toBeNull() // no model probe completed
   })
 
   it('a credential edit resets a verified connection to unverified and clears models', async () => {
@@ -384,26 +524,117 @@ describe('useSetupProviderForm — connection state machine', () => {
     f.updateField('api_key', 'sk-first')
     await f.probeConnection({ defaultModel: 'm' })
     expect(f.connection.value.phase).toBe('verified')
-    expect(f.connection.value.latencyMs).toBe(412)
+    expect(f.connection.value.firstResponseMs).toBe(123)
+    expect(f.connection.value.totalMs).toBe(412)
 
     f.updateField('api_key', 'sk-second')
     expect(f.connection.value.phase).toBe('unverified')
     expect(f.connection.value.models).toEqual([])
-    expect(f.connection.value.latencyMs).toBeNull() // stale verdicts drop their latency too
+    expect(f.connection.value.firstResponseMs).toBeNull()
+    expect(f.connection.value.totalMs).toBeNull() // stale verdicts drop their timings too
   })
 
-  it('a base_url edit resets, a model edit does not', async () => {
+  it('keeps the discovered catalog when a model choice invalidates the probe verdict', async () => {
     mockRpc()
     const f = useSetupProviderForm()
     f.selectProvider('openai')
     await f.probeConnection({ defaultModel: 'm' })
     expect(f.connection.value.phase).toBe('verified')
+    expect(f.connection.value.models).toEqual([expect.objectContaining({ id: 'test-vendor/test-model' })])
+    expect(f.connection.value.modelSource).toBe('live')
 
     f.updateField('model', 'another-model')
+    expect(f.connection.value.phase).toBe('unverified')
+    expect(f.connection.value.firstResponseMs).toBeNull()
+    expect(f.connection.value.totalMs).toBeNull()
+    expect(f.connection.value.models).toEqual([expect.objectContaining({ id: 'test-vendor/test-model' })])
+    expect(f.connection.value.modelSource).toBe('live')
+
+    await f.probeConnection()
     expect(f.connection.value.phase).toBe('verified')
 
     f.updateField('base_url', 'http://127.0.0.1:11434')
     expect(f.connection.value.phase).toBe('unverified')
+    expect(f.connection.value.models).toEqual([])
+    expect(f.connection.value.modelSource).toBe('none')
+  })
+
+  it('uses saved-profile RPCs only when explicitly testing the persisted deployment', async () => {
+    callMock.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.llmProfile.probe') return PROBE_OK
+      if (method === 'onboarding.llmProfile.models.discover') return DISCOVER_OK
+      throw new Error(`unexpected rpc method: ${method}`)
+    })
+    const f = useSetupProviderForm()
+    f.initStoredProfile('deepseek')
+
+    await f.probeConnection({ defaultModel: 'deepseek-chat', storedProfile: true })
+
+    expect(callMock).toHaveBeenNthCalledWith(1, 'onboarding.llmProfile.probe', {
+      providerId: 'deepseek',
+      model: 'deepseek-chat',
+    })
+    expect(callMock).toHaveBeenNthCalledWith(2, 'onboarding.llmProfile.models.discover', {
+      providerId: 'deepseek',
+    })
+  })
+
+  it('tests a saved profile editor as a draft with its current unsaved key, endpoint, proxy, and model', async () => {
+    callMock.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.llmProfile.draft.probe') return PROBE_OK
+      if (method === 'onboarding.llmProfile.draft.models.discover') return DISCOVER_OK
+      throw new Error(`unexpected rpc method: ${method}`)
+    })
+    const f = useSetupProviderForm()
+    f.initStoredProfile('custom', {
+      base_url: 'https://old.example.test/v1',
+      proxy: 'http://old-proxy.example.test:8080',
+    })
+    f.updateField('api_key', 'draft-secret')
+    f.updateField('base_url', 'https://new.example.test/v1')
+    f.updateField('proxy', '')
+    f.updateField('model', 'draft-model')
+
+    await f.probeConnection({ draftProfile: true })
+
+    const expectedDraft = {
+      providerId: 'custom',
+      apiKey: 'draft-secret',
+      baseUrl: 'https://new.example.test/v1',
+      proxy: '',
+      model: 'draft-model',
+      keepCurrentSecret: false,
+    }
+    expect(callMock).toHaveBeenNthCalledWith(
+      1,
+      'onboarding.llmProfile.draft.probe',
+      expectedDraft,
+    )
+    expect(callMock).toHaveBeenNthCalledWith(
+      2,
+      'onboarding.llmProfile.draft.models.discover',
+      expectedDraft,
+    )
+  })
+
+  it('keeps the saved profile secret when current settings do not replace it', async () => {
+    callMock.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.llmProfile.draft.probe') return PROBE_OK
+      if (method === 'onboarding.llmProfile.draft.models.discover') return DISCOVER_OK
+      throw new Error(`unexpected rpc method: ${method}`)
+    })
+    const f = useSetupProviderForm()
+    f.initStoredProfile('deepseek', { base_url: 'https://api.deepseek.com', proxy: '' })
+
+    await f.probeConnection({ defaultModel: 'deepseek-chat', draftProfile: true })
+
+    expect(callMock).toHaveBeenNthCalledWith(1, 'onboarding.llmProfile.draft.probe', {
+      providerId: 'deepseek',
+      baseUrl: 'https://api.deepseek.com',
+      proxy: '',
+      model: 'deepseek-chat',
+      keepCurrentSecret: true,
+    })
   })
 
   it('switching provider resets the connection', async () => {
@@ -487,6 +718,54 @@ describe('useSetupProviderForm — connection state machine', () => {
 
     expect(callMock).toHaveBeenCalledTimes(1)
     expect(f.connection.value.models).toHaveLength(1)
+  })
+
+  it('keeps an in-flight catalog request alive while the user types a model id', async () => {
+    let resolveDiscover!: (value: unknown) => void
+    callMock.mockImplementation((method: string) => {
+      if (method !== 'onboarding.models.discover') {
+        throw new Error(`unexpected rpc method: ${method}`)
+      }
+      return new Promise(resolve => { resolveDiscover = resolve })
+    })
+    const f = useSetupProviderForm()
+    f.selectProvider('openai')
+
+    const pending = f.discoverModels()
+    f.updateField('model', 'gpt-4.1-mini')
+    resolveDiscover(DISCOVER_OK)
+    await pending
+
+    expect(f.connection.value.phase).toBe('unverified')
+    expect(f.connection.value.modelSource).toBe('live')
+    expect(f.connection.value.models).toHaveLength(1)
+  })
+
+  it('discards a model catalog that resolves after the selected provider changes', async () => {
+    let resolveOpenAi!: (value: unknown) => void
+    callMock.mockImplementation((method: string, params?: Record<string, unknown>) => {
+      if (method !== 'onboarding.models.discover') {
+        throw new Error(`unexpected rpc method: ${method}`)
+      }
+      if (params?.providerId === 'openai') {
+        return new Promise(resolve => { resolveOpenAi = resolve })
+      }
+      return Promise.resolve({
+        ...DISCOVER_OK,
+        models: [{ ...DISCOVER_ROW, id: 'deepseek-chat', name: 'DeepSeek Chat' }],
+      })
+    })
+    const f = useSetupProviderForm()
+    f.selectProvider('openai')
+    const stale = f.discoverModels()
+
+    f.selectProvider('deepseek')
+    await f.discoverModels()
+    resolveOpenAi(DISCOVER_OK)
+    await stale
+
+    expect(f.selectedProvider.value).toBe('deepseek')
+    expect(f.connection.value.models.map(model => model.id)).toEqual(['deepseek-chat'])
   })
 
   it('starts fresh discovery when a probe supersedes an in-flight listing', async () => {

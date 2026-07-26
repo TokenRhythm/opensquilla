@@ -27,6 +27,9 @@
 # agent_stream_heartbeat_interval_seconds = 15.0
 # agent_stream_idle_timeout_seconds = 180.0
 # webui_stream_idle_grace_seconds = 210.0
+# Optional absolute Agent deadline for ordinary interactive Web chat turns.
+# Disabled by default; set a positive value such as 1800.0 to enable the cap.
+# web_chat_runtime_timeout_seconds = 0.0
 
 # WebSocket per-connection outbound writer queue. When enabled (default),
 # each WS connection gets a bounded asyncio queue + dedicated writer task.
@@ -55,10 +58,10 @@
 # diagnostics_enabled = false
 
 [control_ui]
-# Vue is the product UI. Use "legacy" only as a maintainer rollback fallback
-# for the frozen vanilla-JS frontend; changing this requires a gateway restart.
-# Env override: OPENSQUILLA_CONTROL_UI_FRONTEND=vue|legacy
-frontend = "vue"
+# Vue is the only Control UI. The optional frontend key is retained temporarily
+# for config compatibility; historical "legacy" values are deprecated and are
+# treated as "vue" rather than selecting the retired vanilla-JS client.
+# frontend = "vue"
 
 # Web search settings
 # Use DuckDuckGo for the no-key path, or configure Bocha, Brave, IQS, Tavily, or Exa.
@@ -208,8 +211,10 @@ enabled = true
 # "custom_b5": an explicit user-authored lineup from [[llm_ensemble.candidates]]
 #   — 2-6 enabled proposer rows plus at most one role = "aggregator" row (the
 #   member that fuses drafts into the final answer; omitted = the current chat
-#   model fuses). Proposer roles ("primary", "contrast", "fast_check",
-#   "critic") are advisory labels shown in the UI and decision trace.
+#   model fuses). The Web UI presents only Proposer and Aggregator. Released
+#   proposer role values ("primary", "contrast", "fast_check", "critic")
+#   remain accepted and preserved as advisory decision-trace labels; they all
+#   run and appear in the settings panel as Proposer.
 # "router_dynamic": legacy automatic selection; kept readable for existing
 #   configs but no longer offered in the Web UI.
 selection_mode = "static_openrouter_b5"
@@ -217,7 +222,7 @@ selection_mode = "static_openrouter_b5"
 # [[llm_ensemble.candidates]]
 # provider = "volcengine"
 # model = "doubao-2.0-pro"
-# role = "primary"
+# No role is needed for a proposer.
 # [[llm_ensemble.candidates]]
 # provider = "volcengine"
 # model = "deepseek-v4-pro"
@@ -244,7 +249,7 @@ all_failed_policy = "fallback_single"
 
 # Advanced knobs — TOML-only (not on the configure RPC surface). Defaults:
 # mode = "b5_fusion"                  # only supported ensemble mode
-# proposer_tools = false              # allow tool calls inside proposer turns
+# proposer_tools = false              # expose tool schemas as non-executable advice
 # candidate_max_chars = 24000         # per-candidate transcript budget (0 = unlimited)
 # proposer_timeout_seconds = 3600.0
 # aggregator_timeout_seconds = 3600.0

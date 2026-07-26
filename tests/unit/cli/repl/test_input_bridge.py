@@ -39,10 +39,8 @@ def test_input_bridge_announces_image_attachment_with_supplied_console(
 
     assert captured["command"] == "/image screen.png describe it"
     assert prompt == "describe it"
-    assert attachments == [
-        {"type": "image/png", "data": "x" * 3072, "name": "screen.png"}
-    ]
-    assert prints == ["[dim]Sending image: screen.png (3KB base64)[/dim]"]
+    assert attachments == [{"type": "image/png", "data": "x" * 3072, "name": "screen.png"}]
+    assert prints == ["[dim]Preparing image: screen.png[/dim]"]
 
 
 def test_input_bridge_announces_image_attachment_with_default_console(
@@ -71,15 +69,11 @@ def test_input_bridge_announces_image_attachment_with_default_console(
     )
     monkeypatch.setattr(input_bridge, "console", FakeConsole())
 
-    prompt, attachments = input_bridge.image_prompt_and_attachments(
-        "/image screen.png describe it"
-    )
+    prompt, attachments = input_bridge.image_prompt_and_attachments("/image screen.png describe it")
 
     assert prompt == "describe it"
-    assert attachments == [
-        {"type": "image/png", "data": "x" * 2048, "name": "screen.png"}
-    ]
-    assert prints == ["[dim]Sending image: screen.png (2KB base64)[/dim]"]
+    assert attachments == [{"type": "image/png", "data": "x" * 2048, "name": "screen.png"}]
+    assert prints == ["[dim]Preparing image: screen.png[/dim]"]
 
 
 def test_input_bridge_does_not_announce_when_image_has_no_attachments(

@@ -12,6 +12,7 @@ from opensquilla.skills.hub.source import SkillMeta
 from opensquilla.skills.loader import SkillLoader
 from opensquilla.tools.builtin import skill_tools as skill_tools_module
 from opensquilla.tools.registry import get_default_registry
+from opensquilla.tools.types import ToolContext, current_tool_context
 
 
 async def _skill_view(name: str, file_path: str | None = None) -> str:
@@ -121,6 +122,28 @@ async def test_skill_view_missing_skill_uses_catalog_guidance(
 
 
 @pytest.mark.asyncio
+async def test_skill_view_uses_catalog_pinned_to_current_turn(
+    skill_loader: SkillLoader,
+) -> None:
+    skill_loader.load_all()
+    pinned = skill_loader.snapshot()
+    skill_file = Path(pinned.get_by_name("deck").file_path)  # type: ignore[union-attr]
+    skill_file.write_text(
+        "---\nname: deck\ndescription: Updated\n---\nnew body\n",
+        encoding="utf-8",
+    )
+    skill_loader.reload(reason="test")
+
+    token = current_tool_context.set(ToolContext(skill_catalog=pinned))
+    try:
+        assert "See [guide]" in await _skill_view("deck")
+    finally:
+        current_tool_context.reset(token)
+
+    assert await _skill_view("deck") == "new body"
+
+
+@pytest.mark.asyncio
 async def test_skill_list_reports_missing_env_any_groups(
     skill_loader: SkillLoader,
     monkeypatch: pytest.MonkeyPatch,
@@ -184,7 +207,7 @@ async def test_skill_search_community_returns_hub_results_with_installed_flag(
 
 
 @pytest.mark.asyncio
-async def test_skill_install_community_uses_loader_managed_dir_and_invalidates_cache(
+async def test_skill_install_community_uses_loader_managed_dir_and_marks_catalog_dirty(
     skill_loader: SkillLoader,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -215,7 +238,8 @@ async def test_skill_install_community_uses_loader_managed_dir_and_invalidates_c
 
     monkeypatch.setattr(skill_tools_module, "build_default_skill_installer", fake_builder)
     skill_loader.load_all()
-    assert skill_loader._cached is not None
+    snapshot = skill_loader.snapshot()
+    assert skill_loader._dirty is False
 
     payload = json.loads(await _skill_install_community("plotter"))
 
@@ -224,11 +248,12 @@ async def test_skill_install_community_uses_loader_managed_dir_and_invalidates_c
     assert payload["status"] == "installed"
     assert payload["success"] is True
     assert Path(payload["path"]).name == "plotter"
-    assert skill_loader._cached is None
+    assert skill_loader._dirty is True
+    assert skill_loader.snapshot() is snapshot
 
 
 @pytest.mark.asyncio
-async def test_skill_install_community_surfaces_scan_failure_without_invalidating_cache(
+async def test_skill_install_community_scan_failure_keeps_catalog_clean(
     skill_loader: SkillLoader,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -263,7 +288,8 @@ async def test_skill_install_community_surfaces_scan_failure_without_invalidatin
         lambda *, managed_dir=None: FakeInstaller(),
     )
     skill_loader.load_all()
-    assert skill_loader._cached is not None
+    snapshot = skill_loader.snapshot()
+    assert skill_loader._dirty is False
 
     payload = json.loads(await _skill_install_community("unsafe"))
 
@@ -271,4 +297,5 @@ async def test_skill_install_community_surfaces_scan_failure_without_invalidatin
     assert payload["success"] is False
     assert payload["scan_verdict"] == "dangerous"
     assert payload["scan_findings"][0]["category"] == "prompt_injection"
-    assert skill_loader._cached is not None
+    assert skill_loader._dirty is False
+    assert skill_loader.snapshot() is snapshot

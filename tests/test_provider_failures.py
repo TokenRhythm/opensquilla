@@ -3,10 +3,13 @@ from __future__ import annotations
 import pytest
 import structlog
 
+from opensquilla.engine.fallback import FallbackPolicy
 from opensquilla.provider.failures import (
     FailureMatcher,
     ProviderFailureKind,
+    ProviderRecoveryAction,
     classify_provider_error,
+    decide_recovery_action,
 )
 from opensquilla.provider.openai import _http_error_body_text
 
@@ -33,6 +36,57 @@ def test_provider_request_budget_exhausted_is_context_overflow() -> None:
         )
         is ProviderFailureKind.CONTEXT_OVERFLOW
     )
+
+
+@pytest.mark.parametrize("provider_name", ["ensemble", "openrouter"])
+def test_ensemble_multimodal_rejection_is_surfaced_without_fallback(
+    provider_name: str,
+) -> None:
+    kind = classify_provider_error(
+        provider_name=provider_name,
+        status_code=None,
+        raw_code="ensemble_multimodal_unsupported",
+        message=(
+            "Ensemble does not support image input yet. "
+            "Switch to a single-model routing mode and try again."
+        ),
+    )
+
+    assert kind is ProviderFailureKind.BAD_REQUEST
+    assert decide_recovery_action(kind) is ProviderRecoveryAction.SURFACE
+    assert FallbackPolicy().should_retry(kind, attempt=0) is False
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "raw_code", "message"),
+    [
+        ("openai", "incomplete_stream", "SomeBackend stream ended before a finish reason"),
+        ("anthropic", "incomplete_stream", "Anthropic stream ended before message_stop"),
+        ("ollama", "incomplete_stream", "Ollama stream ended before done=true"),
+        ("openai", "incomplete_tool_call", "SomeBackend returned invalid native tool arguments"),
+        ("ollama", "incomplete_tool_call", "Ollama stream contained malformed tool calls"),
+    ],
+)
+def test_terminal_evidence_codes_are_retryable_with_provider_fallback(
+    provider_name: str,
+    raw_code: str,
+    message: str,
+) -> None:
+    """A truncated stream or unusable native tool call must not be terminal:
+    the runtime retries the call and then falls back to another provider."""
+    with structlog.testing.capture_logs() as captured:
+        kind = classify_provider_error(
+            provider_name=provider_name,
+            status_code=None,
+            raw_code=raw_code,
+            message=message,
+        )
+
+    assert kind is ProviderFailureKind.TRANSPORT_TRANSIENT
+    assert decide_recovery_action(kind) is ProviderRecoveryAction.RETRY_THEN_FALLBACK
+    assert FallbackPolicy().should_retry(kind, attempt=0) is True
+    # Classified: no unclassified-fingerprint noise on every truncated stream.
+    assert not [e for e in captured if e["event"] == "provider_failure.unclassified"]
 
 
 def test_unknown_classification_emits_redacted_fingerprint_event() -> None:

@@ -521,6 +521,7 @@ def _mock_response(case: GoldenCase) -> httpx.Response:
             200,
             json={
                 "model": "test-model",
+                "status": "completed",
                 "output": [],
                 "usage": {"input_tokens": 2, "output_tokens": 1},
             },

@@ -218,6 +218,18 @@ def _policy_payload(policy: SandboxPolicy) -> dict[str, Any]:
         ],
         "envAllowlist": list(policy.env_allowlist),
         "unreadableGlobs": list(policy.unreadable_globs),
+        "fileSystem": (
+            {
+                "entries": [
+                    {"path": str(entry.path), "access": entry.access.value}
+                    for entry in policy.file_system.entries
+                ],
+                "deniedReadGlobs": list(policy.file_system.denied_read_globs),
+                "defaultAccess": policy.file_system.default_access.value,
+            }
+            if policy.file_system is not None
+            else None
+        ),
         "tmpWritable": policy.tmp_writable,
         "cpuSeconds": policy.limits.cpu_seconds,
         "memoryMb": policy.limits.memory_mb,

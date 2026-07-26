@@ -20,7 +20,16 @@ log = structlog.get_logger(__name__)
 class AuthMiddleware(BaseHTTPMiddleware):
     """Token-based auth middleware. Skips public paths."""
 
-    PUBLIC_PATHS = {"/health", "/healthz", "/ready", "/readyz"}
+    PUBLIC_PATHS = {
+        "/health",
+        "/healthz",
+        "/ready",
+        "/readyz",
+        # These exist only for a Desktop-spawned gateway and authenticate with
+        # the per-instance ownership nonce instead of the operator API token.
+        "/api/desktop/identity",
+        "/api/desktop/shutdown",
+    }
 
     def __init__(self, app: ASGIApp, config: GatewayConfig) -> None:
         super().__init__(app)

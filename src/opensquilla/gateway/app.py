@@ -17,6 +17,7 @@ from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket
 
 from opensquilla import __version__
+from opensquilla.gateway.approval_events import build_approval_snapshot_item
 from opensquilla.gateway.approval_queue import get_approval_queue
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.control_ui import create_control_ui_routes
@@ -32,11 +33,25 @@ from opensquilla.gateway.origin_guard import (
     request_origin_allowed,
 )
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
+from opensquilla.gateway.scopes import is_loopback_address, is_loopback_bind
 from opensquilla.gateway.websocket import handle_ws_connection
 
 log = structlog.get_logger(__name__)
 
 _start_time = time.time()
+
+
+def _human_actionable_approvals(pending: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Exclude internal automatic reviews from operator approval surfaces."""
+
+    return [
+        item
+        for item in pending
+        if not (
+            isinstance(item.get("params"), dict)
+            and item["params"].get("humanActionable") is False
+        )
+    ]
 
 
 def create_gateway_app(
@@ -45,8 +60,12 @@ def create_gateway_app(
     provider_selector: Any = None,
     tool_registry: Any = None,
     subscription_manager: Any = None,
+    # May be a manager instance OR a zero-arg callable resolving to one:
+    # live channel reconcile can create the manager after boot, so contexts
+    # must re-resolve it per request instead of freezing the boot-time value.
     channel_manager: Any = None,
     usage_tracker: Any = None,
+    usage_event_sink: Any = None,
     meta_run_writer: Any = None,
     skill_loader: Any = None,
     cron_scheduler: Any = None,
@@ -71,6 +90,9 @@ def create_gateway_app(
 
     dispatcher = get_dispatcher()
 
+    def _resolve_channel_manager() -> Any:
+        return channel_manager() if callable(channel_manager) else channel_manager
+
     def _rpc_status_code(result: Any, default: int = 500) -> int:
         if result.error is None:
             return default
@@ -81,7 +103,16 @@ def create_gateway_app(
             return 403
         if code in {"NOT_FOUND", "METHOD_NOT_FOUND"}:
             return 404
-        if code == "UNAVAILABLE":
+        if code in {
+            "COLLECT_RACE",
+            "IDEMPOTENCY_CONFLICT",
+            "SESSION_CHANGED",
+            "SESSION_CONFLICT",
+        }:
+            return 409
+        if code == "QUEUE_FULL":
+            return 429
+        if code in {"UNAVAILABLE", "STORAGE_BUSY"}:
             return 503
         return default
 
@@ -157,8 +188,13 @@ def create_gateway_app(
         result = await dispatcher.dispatch("_http", "chat.send", body, ctx)
         if result.ok:
             return JSONResponse({"ok": True, **(result.payload or {})})
+        error = result.error
+        error_payload = error.model_dump(exclude_none=True) if error is not None else {}
         return JSONResponse(
-            {"error": result.error.message if result.error else "error"},
+            {
+                "error": error.message if error is not None else "error",
+                **error_payload,
+            },
             status_code=_rpc_status_code(result, default=400),
         )
 
@@ -246,6 +282,69 @@ def create_gateway_app(
         request_shutdown("api_shutdown")
         return JSONResponse({"status": "accepted"}, status_code=202)
 
+    def _desktop_gateway_owner(request: Request) -> tuple[Any | None, JSONResponse | None]:
+        """Resolve a Desktop ownership proof without exposing profile paths."""
+
+        owner = getattr(request.app.state, "desktop_gateway_ownership", None)
+        if owner is None:
+            return None, JSONResponse({"error": "not found"}, status_code=404)
+        peer_ip = request.client.host if request.client is not None else None
+        if not is_loopback_bind(config.host) or not is_loopback_address(peer_ip):
+            return None, JSONResponse(
+                {"error": "desktop owner privileges required"},
+                status_code=403,
+            )
+        return owner, None
+
+    async def api_desktop_identity(request: Request) -> JSONResponse:
+        """Prove that this listener is the Desktop instance recorded on disk."""
+
+        from opensquilla.gateway.desktop_ownership import valid_desktop_challenge
+
+        owner, error = _desktop_gateway_owner(request)
+        if error is not None:
+            return error
+        assert owner is not None
+        try:
+            body = await request.json()
+        except Exception:
+            body = None
+        challenge = body.get("challenge") if isinstance(body, dict) else None
+        if not valid_desktop_challenge(challenge):
+            return JSONResponse({"error": "invalid challenge"}, status_code=400)
+        response = JSONResponse(owner.identity_response(challenge))
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+        return response
+
+    async def api_desktop_shutdown(request: Request) -> JSONResponse:
+        """Shut down only after a nonce proof binds the request to this instance."""
+
+        owner, error = _desktop_gateway_owner(request)
+        if error is not None:
+            return error
+        assert owner is not None
+        try:
+            body = await request.json()
+        except Exception:
+            body = None
+        challenge = body.get("challenge") if isinstance(body, dict) else None
+        proof = body.get("proof") if isinstance(body, dict) else None
+        if not isinstance(challenge, str) or not isinstance(proof, str):
+            return JSONResponse({"error": "invalid ownership proof"}, status_code=403)
+        if not owner.verify_shutdown_proof(challenge, proof):
+            return JSONResponse({"error": "invalid ownership proof"}, status_code=403)
+        request_shutdown = getattr(request.app.state, "request_shutdown", None)
+        if request_shutdown is None:
+            return JSONResponse(
+                {"error": "graceful shutdown is not available in this mode"},
+                status_code=503,
+            )
+        request_shutdown("desktop_api_shutdown")
+        response = JSONResponse({"status": "accepted"}, status_code=202)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
     async def api_usage(request: Request) -> JSONResponse:
         ctx = _make_ctx(request)
         result = await dispatcher.dispatch("_http", "usage.status", None, ctx)
@@ -289,8 +388,9 @@ def create_gateway_app(
             provider_selector=provider_selector,
             tool_registry=tool_registry,
             subscription_manager=subscription_manager,
-            channel_manager=channel_manager,
+            channel_manager=_resolve_channel_manager(),
             usage_tracker=usage_tracker,
+            usage_event_sink=usage_event_sink,
             meta_run_writer=meta_run_writer,
             skill_loader=skill_loader,
             cron_scheduler=cron_scheduler,
@@ -327,6 +427,46 @@ def create_gateway_app(
         msg = result.error.message if result.error else "error"
         return JSONResponse({"error": msg}, status_code=_rpc_status_code(result, default=400))
 
+    async def api_channel_pairings(request: Request) -> JSONResponse:
+        ctx = _make_ctx(request)
+        result = await dispatcher.dispatch(
+            "_http",
+            "channels.pairings",
+            {"channelName": request.query_params.get("channelName", "")},
+            ctx,
+        )
+        if result.ok:
+            return JSONResponse(result.payload or {"pairings": []})
+        msg = result.error.message if result.error else "error"
+        return JSONResponse({"error": msg}, status_code=_rpc_status_code(result, default=400))
+
+    async def _api_channel_pairing_mutation(
+        request: Request,
+        method: str,
+    ) -> JSONResponse:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+        ctx = _make_ctx(request)
+        result = await dispatcher.dispatch("_http", method, body, ctx)
+        if result.ok:
+            return JSONResponse(result.payload or {"ok": True})
+        msg = result.error.message if result.error else "error"
+        return JSONResponse({"error": msg}, status_code=_rpc_status_code(result, default=400))
+
+    async def api_channel_pairing_approve(request: Request) -> JSONResponse:
+        return await _api_channel_pairing_mutation(
+            request,
+            "channels.pairing.approve",
+        )
+
+    async def api_channel_pairing_revoke(request: Request) -> JSONResponse:
+        return await _api_channel_pairing_mutation(
+            request,
+            "channels.pairing.revoke",
+        )
+
     async def api_approvals(request: Request) -> JSONResponse:
         ctx = _make_ctx(request)
         result = await dispatcher.dispatch("_http", "exec.approvals.get", None, ctx)
@@ -338,35 +478,8 @@ def create_gateway_app(
         settings = result.payload or {}
         mode = settings.get("mode", "prompt")
         queue = get_approval_queue()
-        pending = queue.list_pending()
-        # Enrich pending items with params fields for UI display
-        items = []
-        for p in pending:
-            item = {
-                "id": p["id"],
-                "namespace": p["namespace"],
-                "created_at": p.get("created_at"),
-                "deadline": p.get("deadline"),
-            }
-            params = p.get("params", {})
-            argv = params.get("argv")
-            command = params.get("command")
-            if not command and isinstance(argv, list):
-                command = " ".join(str(part) for part in argv)
-            item["toolName"] = params.get(
-                "toolName",
-                params.get("pluginId", params.get("action_kind", "Unknown")),
-            )
-            item["sessionKey"] = params.get("sessionKey", params.get("session_id", ""))
-            item["agent"] = params.get("agent", "")
-            item["args"] = params.get("args", params.get("permissions"))
-            item["command"] = command or ""
-            item["warning"] = params.get("warning", params.get("reason", ""))
-            item["actionKind"] = params.get("action_kind", "")
-            item["argv"] = argv if isinstance(argv, list) else []
-            item["mode"] = params.get("mode", mode)
-            item["params"] = params
-            items.append(item)
+        pending = _human_actionable_approvals(queue.list_pending())
+        items = [build_approval_snapshot_item(item, default_mode=mode) for item in pending]
         return JSONResponse(
             {
                 "pending": items,
@@ -531,8 +644,9 @@ def create_gateway_app(
             provider_selector=provider_selector,
             tool_registry=tool_registry,
             subscription_manager=subscription_manager,
-            channel_manager=channel_manager,
+            channel_manager=_resolve_channel_manager,
             usage_tracker=usage_tracker,
+            usage_event_sink=usage_event_sink,
             meta_run_writer=meta_run_writer,
             skill_loader=skill_loader,
             cron_scheduler=cron_scheduler,
@@ -566,9 +680,22 @@ def create_gateway_app(
         Route("/api/system/status", api_system_status, methods=["GET"]),
         Route("/api/system/update", api_system_update, methods=["GET"]),
         Route("/api/system/shutdown", _same_origin(api_system_shutdown), methods=["POST"]),
+        Route("/api/desktop/identity", _same_origin(api_desktop_identity), methods=["POST"]),
+        Route("/api/desktop/shutdown", _same_origin(api_desktop_shutdown), methods=["POST"]),
         Route("/api/usage", api_usage, methods=["GET"]),
         Route("/api/channels/status", api_channels_status, methods=["GET"]),
         Route("/api/channels/logout", _same_origin(api_channels_logout), methods=["POST"]),
+        Route("/api/channels/pairings", api_channel_pairings, methods=["GET"]),
+        Route(
+            "/api/channels/pairings/approve",
+            _same_origin(api_channel_pairing_approve),
+            methods=["POST"],
+        ),
+        Route(
+            "/api/channels/pairings/revoke",
+            _same_origin(api_channel_pairing_revoke),
+            methods=["POST"],
+        ),
         Route("/api/approvals", api_approvals, methods=["GET"]),
         Route("/api/approvals/settings", _same_origin(api_approvals_settings), methods=["POST"]),
         Route("/api/approvals/resolve", _same_origin(api_approvals_resolve), methods=["POST"]),

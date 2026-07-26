@@ -10,6 +10,7 @@ function setDesktopApi(api: unknown): void {
 function desktopUpdateApi(state: Record<string, unknown>, overrides: Record<string, unknown> = {}) {
   return {
     isAutoUpdateEnabled: async () => true,
+    isDesktopUpdateManaged: async () => true,
     getUpdateState: async () => ({
       status: 'available',
       currentVersion: '1.0.0',
@@ -17,9 +18,14 @@ function desktopUpdateApi(state: Record<string, unknown>, overrides: Record<stri
       progress: null,
       checkedAt: null,
       error: null,
+      errorCode: null,
       snoozedUntil: null,
+      canCheck: true,
       canNativeInstall: true,
+      installMode: 'native',
       releaseUrl: null,
+      source: null,
+      fallbackUsed: false,
       ...state,
     }),
     checkForUpdates: vi.fn(async () => ({ ok: true })),
@@ -83,6 +89,92 @@ describe('DesktopUpdateIndicator', () => {
     await settle()
 
     expect(api.relaunchToUpdate).toHaveBeenCalledTimes(1)
+    app.unmount()
+  })
+
+  it('offers the versioned installer for a managed Windows update', async () => {
+    const api = desktopUpdateApi({
+      status: 'available',
+      canNativeInstall: false,
+      installMode: 'manual',
+      source: 'oss',
+    }, {
+      isAutoUpdateEnabled: async () => false,
+    })
+    const { app, el } = await mountIndicator(api)
+
+    ;(el.querySelector('[data-testid="desktop-update-indicator"]') as HTMLButtonElement).click()
+    await settle()
+    const download = document.querySelector('[data-testid="desktop-update-download"]') as HTMLButtonElement
+    expect(download.textContent).toContain('Download installer')
+    download.click()
+    await settle()
+
+    expect(api.downloadUpdate).toHaveBeenCalledTimes(1)
+    app.unmount()
+  })
+
+  it('reveals a verified Windows installer without offering native relaunch', async () => {
+    const api = desktopUpdateApi({
+      status: 'downloaded',
+      canNativeInstall: false,
+      installMode: 'manual',
+      source: 'oss',
+    }, {
+      isAutoUpdateEnabled: async () => false,
+    })
+    const { app, el } = await mountIndicator(api)
+
+    ;(el.querySelector('[data-testid="desktop-update-indicator"]') as HTMLButtonElement).click()
+    await settle()
+    expect(document.body.textContent).toContain('Verified installer ready')
+    expect(document.querySelector('[data-testid="desktop-update-relaunch"]')).toBeNull()
+    ;(document.querySelector('[data-testid="desktop-update-show-installer"]') as HTMLButtonElement).click()
+    await settle()
+
+    expect(api.downloadUpdate).toHaveBeenCalledTimes(1)
+    app.unmount()
+  })
+
+  it('keeps a managed unsupported error visible and localizes its error code', async () => {
+    const api = desktopUpdateApi({
+      status: 'error',
+      canNativeInstall: false,
+      installMode: 'unsupported',
+      errorCode: 'manifest_invalid',
+      error: 'GitHub releases request failed: 403',
+    }, {
+      isAutoUpdateEnabled: async () => false,
+    })
+    const { app, el } = await mountIndicator(api)
+
+    const trigger = el.querySelector('[data-testid="desktop-update-indicator"]') as HTMLButtonElement
+    expect(trigger).toBeTruthy()
+    trigger.click()
+    await settle()
+    expect(document.body.textContent).toContain('release-channel data is invalid')
+    expect(document.body.textContent).not.toContain('403')
+    expect(document.querySelector('[data-testid="desktop-update-download"]')).toBeNull()
+
+    app.unmount()
+  })
+
+  it('localizes installer integrity failures without exposing raw transport detail', async () => {
+    const api = desktopUpdateApi({
+      status: 'error',
+      canNativeInstall: false,
+      installMode: 'manual',
+      errorCode: 'integrity_failed',
+      error: 'mirror digest was deadbeef',
+    }, {
+      isAutoUpdateEnabled: async () => false,
+    })
+    const { app, el } = await mountIndicator(api)
+
+    ;(el.querySelector('[data-testid="desktop-update-indicator"]') as HTMLButtonElement).click()
+    await settle()
+    expect(document.body.textContent).toContain('failed integrity verification and was deleted')
+    expect(document.body.textContent).not.toContain('deadbeef')
     app.unmount()
   })
 })

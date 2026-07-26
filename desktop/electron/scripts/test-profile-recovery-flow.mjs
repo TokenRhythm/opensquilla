@@ -416,10 +416,22 @@ try {
     'first prompt at local fake provider',
   )
   assert.deepEqual(await snapshotPrimary(primaryHome, primaryCredential), primaryBefore)
+  const recoverySessionKey = await waitFor(() => {
+    try { return new URL(firstControl.url()).searchParams.get('session') } catch { return '' }
+  }, 'first recovery chat route')
 
   await app.close()
   app = null
   const recoveryDatabase = join(recoveryState, 'sessions.db')
+  const persistedSessions = JSON.parse(runPython(
+    'import json,sqlite3,sys; c=sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True); '
+    + 'rows=c.execute("SELECT session_key,display_name,derived_title,subject,status '
+    + 'FROM sessions ORDER BY session_key").fetchall(); '
+    + 'c.close(); print(json.dumps(rows))',
+    [recoveryDatabase],
+  ))
+  assert.equal(persistedSessions.length, 1, JSON.stringify(persistedSessions))
+  assert.equal(persistedSessions[0][0], recoverySessionKey)
   const firstTranscript = JSON.parse(runPython(
     'import json,sqlite3,sys; c=sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True); '
     + 'rows=c.execute("SELECT role,content FROM transcript_entries ORDER BY id").fetchall(); '
@@ -467,12 +479,18 @@ try {
   assert.equal(activeState.activeProfile.kind, 'recovery')
   assert.equal(activeState.activeProfile.recoveryId, recoveryId)
   assert.equal(activeState.activeProfile.home, recoveryHome)
-  const persistedConversation = secondControl.locator('.sidebar-history-item', {
-    hasText: 'Recovery chat',
-  })
+  const persistedConversations = secondControl.locator('.sidebar-history-item')
+  const persistedConversation = persistedConversations.first()
   await persistedConversation.waitFor({ state: 'visible', timeout: 30_000 })
+  assert.equal(await persistedConversations.count(), 1)
   await persistedConversation.click()
-  await waitFor(() => secondControl.url().includes('?session='), 'persisted recovery chat route')
+  await waitFor(() => {
+    try {
+      return new URL(secondControl.url()).searchParams.get('session') === recoverySessionKey
+    } catch {
+      return false
+    }
+  }, 'persisted recovery chat route')
   await secondControl.locator('.msg-user').filter({ hasText: FIRST_PROMPT }).last().waitFor({
     state: 'visible',
     timeout: 30_000,

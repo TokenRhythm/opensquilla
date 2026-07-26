@@ -251,8 +251,8 @@ def models_probe(
     """Probe configured providers for reachability and credential validity.
 
     Live command: every configured provider (the primary llm entry plus each
-    llm_profiles credential profile) gets a one-token chat probe against its
-    model — or a model-list probe when no model is bound to a credential
+    llm_profiles credential profile) gets a small, provider-bounded chat probe
+    against its model — or a model-list probe when no model is bound to a credential
     profile. Failures are classified through the shared provider failure
     taxonomy and error details are redacted before display. Exits 1 when any
     probe fails, 2 on invalid selection.

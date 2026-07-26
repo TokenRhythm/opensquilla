@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -34,6 +34,7 @@ BackendName = Literal[
 ]
 NetworkDefault = Literal["none", "proxy_allowlist"]
 RunModeName = Literal["standard", "trusted", "full"]
+ApprovalsReviewerName = Literal["user", "auto_review"]
 
 
 @dataclass(frozen=True)
@@ -87,16 +88,32 @@ class SandboxSettings(BaseSettings):
     allow_legacy_mode: bool = False
     run_mode: RunModeName | None = None
     auto_setup: bool = True
+    host_root_readonly: bool = True
+    exclude_slash_tmp: bool = False
+    exclude_tmpdir_env_var: bool = False
+    approvals_reviewer: ApprovalsReviewerName = "auto_review"
 
     network_default: NetworkDefault = "proxy_allowlist"
     denial_threshold: int = 3
 
     extra_ro_mounts: list[str] = Field(default_factory=list)
     extra_rw_mounts: list[str] = Field(default_factory=list)
+    denied_read_roots: list[str] = Field(default_factory=list)
+    denied_read_globs: list[str] = Field(default_factory=list)
 
     cpu_seconds: int = 30
     memory_mb: int = 1024
     wall_seconds: int = 60
+
+    @model_validator(mode="before")
+    @classmethod
+    def _discard_removed_model_review_settings(cls, values: Any) -> Any:
+        if not isinstance(values, dict):
+            return values
+        cleaned = dict(values)
+        cleaned.pop("approval_review_timeout_seconds", None)
+        cleaned.pop("approval_review_max_attempts", None)
+        return cleaned
 
     @field_validator("backend", mode="before")
     @classmethod
@@ -183,6 +200,7 @@ class SandboxSettings(BaseSettings):
 
 
 __all__ = [
+    "ApprovalsReviewerName",
     "BackendName",
     "EffectiveMode",
     "NetworkDefault",

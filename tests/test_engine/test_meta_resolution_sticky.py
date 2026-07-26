@@ -97,6 +97,21 @@ async def test_fresh_match_arms_sticky_cache():
 
 
 @pytest.mark.asyncio
+async def test_pinned_catalog_avoids_reloading_during_meta_resolution():
+    skills = [_meta_spec(name="meta-paper-write", triggers=("帮我写篇论文",))]
+    ctx = _ctx(message="帮我写篇论文", session_id="S-PINNED", skills=[])
+    ctx.skill_catalog = SimpleNamespace(skills=tuple(skills), generation=7)
+    ctx.metadata["skill_loader"].load_all.side_effect = AssertionError(
+        "loader must not be read after the turn snapshot is pinned"
+    )
+
+    out = await meta_resolution(ctx)
+
+    assert out.metadata["meta_match"].plan.name == "meta-paper-write"
+    ctx.metadata["skill_loader"].load_all.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_meta_match_upgrades_low_router_tier_to_c2_entry_model():
     skills = [_meta_spec(name="meta-short-drama", triggers=("生成一个短剧",))]
     tiers = {

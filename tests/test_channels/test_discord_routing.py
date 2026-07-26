@@ -56,13 +56,13 @@ def test_discord_parse_event_distinguishes_dm_group_dm_and_guild_group() -> None
     assert group_dm_msg.metadata["conversation_kind"] == "group_dm"
     assert group_dm_msg.metadata["is_group"] is True
     assert ChannelManager._build_session_key("discord", group_dm_msg) == (
-        "agent:main:discord:group:group-dm-channel"
+        "agent:main:discord:group:group-dm-channel:sender:user-2"
     )
 
     assert guild_msg.metadata["conversation_kind"] == "group"
     assert guild_msg.metadata["is_group"] is True
     assert ChannelManager._build_session_key("discord", guild_msg) == (
-        "agent:main:discord:group:guild-channel"
+        "agent:main:discord:group:guild-channel:sender:user-3"
     )
 
 
@@ -98,7 +98,7 @@ def test_discord_parse_event_preserves_thread_native_metadata() -> None:
     assert msg.metadata["reply_target_id"] == "msg-thread"
     assert msg.metadata["referenced_message_id"] == "parent-message"
     assert ChannelManager._build_session_key("discord", msg) == (
-        "agent:main:discord:group:thread-channel:thread:thread-channel"
+        "agent:main:discord:group:thread-channel:sender:user-1:thread:thread-channel"
     )
 
 
@@ -163,7 +163,7 @@ async def test_discord_gateway_channel_create_cache_classifies_group_dm() -> Non
     assert msg.metadata["conversation_kind"] == "group_dm"
     assert msg.metadata["is_group"] is True
     assert ChannelManager._build_session_key("discord", msg) == (
-        "agent:main:discord:group:group-dm-channel"
+        "agent:main:discord:group:group-dm-channel:sender:user-1"
     )
 
 
@@ -196,7 +196,7 @@ async def test_discord_gateway_thread_create_cache_classifies_thread_message() -
     assert msg.metadata["native_thread_id"] == "thread-channel"
     assert msg.metadata["native_parent_channel_id"] == "parent-channel"
     assert ChannelManager._build_session_key("discord", msg) == (
-        "agent:main:discord:group:thread-channel:thread:thread-channel"
+        "agent:main:discord:group:thread-channel:sender:user-1:thread:thread-channel"
     )
 
 
@@ -233,7 +233,7 @@ async def test_discord_thread_list_sync_cache_classifies_existing_thread_message
     assert msg.metadata["native_thread_id"] == "existing-thread"
     assert msg.metadata["native_parent_channel_id"] == "parent-channel"
     assert ChannelManager._build_session_key("discord", msg) == (
-        "agent:main:discord:group:existing-thread:thread:existing-thread"
+        "agent:main:discord:group:existing-thread:sender:user-1:thread:existing-thread"
     )
 
 
@@ -271,7 +271,7 @@ async def test_discord_guild_create_cache_classifies_active_thread_message() -> 
     assert msg.metadata["native_thread_id"] == "startup-thread"
     assert msg.metadata["native_parent_channel_id"] == "parent-channel"
     assert ChannelManager._build_session_key("discord", msg) == (
-        "agent:main:discord:group:startup-thread:thread:startup-thread"
+        "agent:main:discord:group:startup-thread:sender:user-1:thread:startup-thread"
     )
 
 
@@ -304,7 +304,7 @@ async def test_discord_thread_reaction_uses_cached_thread_session() -> None:
     assert msg.metadata["native_thread_id"] == "thread-channel"
     assert msg.metadata["native_parent_channel_id"] == "parent-channel"
     assert ChannelManager._build_session_key("discord", msg) == (
-        "agent:main:discord:group:thread-channel:thread:thread-channel"
+        "agent:main:discord:group:thread-channel:sender:user-1:thread:thread-channel"
     )
 
 
@@ -335,5 +335,5 @@ async def test_discord_group_dm_interaction_uses_cached_group_session() -> None:
     assert msg.metadata["native_message_id"] == "interaction-1"
     assert msg.metadata["reply_target_id"] == "interaction-1"
     assert ChannelManager._build_session_key("discord", msg) == (
-        "agent:main:discord:group:group-dm-channel"
+        "agent:main:discord:group:group-dm-channel:sender:user-1"
     )

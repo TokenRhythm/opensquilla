@@ -36,6 +36,15 @@
 
 import process from "node:process";
 
+function darkenHex(hex, factor = 0.45) {
+  const value = parseInt(String(hex).replace("#", ""), 16);
+  const channels = [(value >> 16) & 255, (value >> 8) & 255, value & 255];
+  return `#${channels
+    .map((channel) => Math.round(channel * factor).toString(16).padStart(2, "0"))
+    .join("")
+    .toUpperCase()}`;
+}
+
 export const PALETTES = Object.freeze({
   // Canonical — verbatim from opensquilla-webui/src/assets/base.css.
   "opensquilla-dark": {
@@ -79,7 +88,7 @@ export const PALETTES = Object.freeze({
     ok: "#3DF0A8", warn: "#FFD24A", danger: "#FF5C5C", info: "#5AC8FF", queued: "#BB9CFF",
   },
   // Nordic polar night — recognizable cool palette with the brand accent
-  // (brightened so it clears 4.5:1 as status-pill TEXT on bgSurface).
+  // (brightened so accent text clears 4.5:1 on bgSurface).
   nord: {
     bg: "#2E3440", bgSurface: "#3B4252", bgElevated: "#434C5E",
     text: "#ECEFF4", textMuted: "#C0C7D4", textDim: "#B6BDC9",
@@ -110,10 +119,9 @@ export const PALETTES = Object.freeze({
 export const DEFAULT_THEME = "opensquilla-dark";
 export const THEME_NAMES = Object.freeze(Object.keys(PALETTES));
 
-// One coherent run-state color vocabulary, shared by the in-card tool rows AND
-// the composer footer status pill so a step's live state reads the same top and
-// bottom. Derived from the SAME semantic palette as THEME (no new palette values)
-// and repopulated in place on every /theme switch, exactly like THEME.
+// One coherent run-state color vocabulary for in-card tool rows. Derived from
+// the SAME semantic palette as THEME (no new palette values) and repopulated in
+// place on every /theme switch, exactly like THEME.
 function toStatus(p) {
   return {
     running: p.accentSecondary, // a tool/turn in flight (soft brand orange)
@@ -132,6 +140,11 @@ function toTokens(p) {
   return {
     // Brand
     brandAccent: p.accent,
+    // OpenTUI's approved block wordmark has a second color channel for its
+    // outline/drop-shadow geometry. Keep it materially darker than the fill;
+    // collapsing both channels into brandAccent turns the segmented mark into
+    // a visually heavy solid slab.
+    brandShadow: darkenHex(p.accent),
     brandAccentSoft: p.accentSecondary,
     // Neutrals
     text: p.text,
@@ -148,7 +161,12 @@ function toTokens(p) {
     answerFrame: p.accent,
     thinkingAccent: p.queued,
     routeText: p.info,
-    promptAccent: p.textDim,
+    // User turns are the transcript's strongest causal boundary. A dedicated
+    // surface + brand rail + explicit role label distinguish them from model
+    // process rows without relying on color alone.
+    promptAccent: p.accent,
+    promptSurface: p.bgSurface,
+    promptText: p.text,
     // Semantic status triad + savings metric
     success: p.ok,
     warning: p.warn,

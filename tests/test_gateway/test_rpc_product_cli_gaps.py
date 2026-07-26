@@ -1508,6 +1508,7 @@ async def test_search_query_provider_failure_is_ok_false_payload():
 
     assert res.error is None, res.error
     assert res.payload["ok"] is False
+    assert res.payload["retry_allowed"] is False
     assert res.payload["error"]["kind"] == "network"
     assert res.payload["error"]["retryable"] is True
 
@@ -1532,3 +1533,4 @@ async def test_search_sensitive_query_is_not_echoed_by_tool_or_rpc():
     assert repr(rpc_res.payload).find("API_KEY") == -1
     assert rpc_res.payload["query"] == "[redacted]"
     assert rpc_res.payload["ok"] is False
+    assert rpc_res.payload["retry_allowed"] is False

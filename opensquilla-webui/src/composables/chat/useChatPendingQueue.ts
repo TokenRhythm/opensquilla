@@ -5,7 +5,18 @@ const MAX_PENDING = 5
 
 export type BusySendMode = 'queue' | 'steer'
 
+export interface PendingQueueOwner {
+  ownerRequestId?: string
+}
+
+export interface PendingQueueOwnerContext {
+  sessionKey: string
+  ownerRequestId: string
+}
+
 export interface UseChatPendingQueueOptions {
+  sessionKey: Ref<string>
+  ownerContext?: Readonly<Ref<PendingQueueOwnerContext | null>>
   inputText: Ref<string>
   pendingAttachments: Ref<Attachment[]>
   pendingSessionIntent: Ref<string | null>
@@ -22,7 +33,9 @@ export interface UseChatPendingQueueOptions {
 
 export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   const pendingQueue = ref<ChatPendingItem[]>([])
+  const parkedQueues = new Map<string, ChatPendingItem[]>()
   let pendingDrainTimer: ReturnType<typeof setTimeout> | null = null
+  let deferredDrainRequested = false
 
   const canQueueMore = computed(() => pendingQueue.value.length < MAX_PENDING)
 
@@ -32,39 +45,61 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   // safe default whenever streaming stops.
   const busySendMode = ref<BusySendMode>('queue')
   watch(options.isStreaming, (streaming) => {
-    if (!streaming) busySendMode.value = 'queue'
+    if (!streaming) {
+      busySendMode.value = 'queue'
+      flushDeferredPendingDrain()
+    }
   })
 
-  function enqueuePendingInput(text: string) {
+  function resolveOwnerRequestId(owner?: PendingQueueOwner): string | undefined {
+    if (owner?.ownerRequestId) return owner.ownerRequestId
+    const context = options.ownerContext?.value
+    return context?.sessionKey === options.sessionKey.value
+      ? context.ownerRequestId
+      : undefined
+  }
+
+  function enqueuePendingInput(text: string, owner?: PendingQueueOwner) {
     if (pendingQueue.value.length >= MAX_PENDING) {
       console.warn(`Pending queue full (${MAX_PENDING})`)
       return false
     }
+    const ownerRequestId = resolveOwnerRequestId(owner)
     pendingQueue.value.push({
       text,
       attachments: options.pendingAttachments.value.map(a => ({ ...a })),
       intent: options.pendingSessionIntent.value,
+      ownerSessionKey: options.sessionKey.value,
+      ...(ownerRequestId ? { ownerRequestId } : {}),
     })
     options.inputText.value = ''
     options.pendingAttachments.value = []
     options.pendingSessionIntent.value = null
     options.autoResizeTextarea()
+    flushDeferredPendingDrain()
     return true
   }
 
-  function enqueueHiddenControl(item: { text: string; displayText: string }) {
+  function enqueueHiddenControl(
+    item: { text: string; displayText: string },
+    owner?: PendingQueueOwner,
+  ) {
     if (pendingQueue.value.length >= MAX_PENDING) {
       console.warn(`Pending queue full (${MAX_PENDING})`)
       return false
     }
     // A hidden-control send does NOT consume the composer draft/attachments.
+    const ownerRequestId = resolveOwnerRequestId(owner)
     pendingQueue.value.push({
       text: item.text,
       attachments: [],
       intent: null,
+      ownerSessionKey: options.sessionKey.value,
+      ...(ownerRequestId ? { ownerRequestId } : {}),
       hiddenControl: true,
       displayTextOverride: item.displayText,
     })
+    flushDeferredPendingDrain()
     return true
   }
 
@@ -75,6 +110,52 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   function clearPendingQueue() {
     clearPendingDrainAfterTerminalTimer()
     pendingQueue.value = []
+  }
+
+  function switchPendingQueue(targetSessionKey: string) {
+    clearPendingDrainAfterTerminalTimer()
+    const restored = (parkedQueues.get(targetSessionKey) || [])
+      .filter(item => !item.hiddenControl)
+    parkedQueues.delete(targetSessionKey)
+    // Explicit navigation keeps its historical behavior of discarding the
+    // active session's queue. Only items parked during an automatic response
+    // handoff can be restored when their parent is selected again.
+    pendingQueue.value = restored
+  }
+
+  function adoptPendingQueue(targetSessionKey: string, ownerRequestId: string) {
+    clearPendingDrainAfterTerminalTimer()
+    const sourceSessionKey = options.sessionKey.value
+    const carried: ChatPendingItem[] = []
+    const stayingVisible: ChatPendingItem[] = []
+    for (const item of pendingQueue.value) {
+      if (
+        ownerRequestId
+        && item.ownerSessionKey === sourceSessionKey
+        && item.ownerRequestId === ownerRequestId
+      ) {
+        carried.push({
+          ...item,
+          ownerSessionKey: targetSessionKey,
+          ownerRequestId: undefined,
+        })
+      } else if (!item.hiddenControl) {
+        // A hidden control is scoped to the run that created it. Carry the
+        // matching run's controls, but never resurrect an older confirmation
+        // after a later manual navigation back to the parent session.
+        stayingVisible.push(item)
+      }
+    }
+    if (stayingVisible.length > 0) {
+      parkedQueues.set(sourceSessionKey, [
+        ...(parkedQueues.get(sourceSessionKey) || []).filter(item => !item.hiddenControl),
+        ...stayingVisible,
+      ])
+    }
+    const targetItems = (parkedQueues.get(targetSessionKey) || [])
+      .filter(item => !item.hiddenControl)
+    parkedQueues.delete(targetSessionKey)
+    pendingQueue.value = [...targetItems, ...carried]
   }
 
   function popPendingTail() {
@@ -130,24 +211,51 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   }
 
   function schedulePendingDrainAfterTerminal() {
-    if (pendingQueue.value.length === 0) return
-    clearPendingDrainAfterTerminalTimer()
+    if (pendingQueue.value.length === 0) {
+      // A terminal subscription replay can arrive while response handoff is
+      // still hydrating, before the matching follow-up reaches the queue.
+      // Preserve that terminal signal until the blocker releases.
+      deferredDrainRequested = options.isBlocked()
+      return
+    }
+    deferredDrainRequested = true
+    armPendingDrainTimer()
+  }
+
+  function armPendingDrainTimer() {
+    cancelPendingDrainTimer()
     pendingDrainTimer = setTimeout(() => {
       pendingDrainTimer = null
-      if (options.isStreaming.value || options.isBlocked() || pendingQueue.value.length === 0) return
+      if (pendingQueue.value.length === 0) {
+        deferredDrainRequested = false
+        return
+      }
+      if (options.isStreaming.value || options.isBlocked()) return
+      deferredDrainRequested = false
       drainQueueHead()
     }, 50)
   }
 
-  function clearPendingDrainAfterTerminalTimer() {
+  function flushDeferredPendingDrain() {
+    if (!deferredDrainRequested || pendingQueue.value.length === 0) return
+    armPendingDrainTimer()
+  }
+
+  function cancelPendingDrainTimer() {
     if (pendingDrainTimer) {
       clearTimeout(pendingDrainTimer)
       pendingDrainTimer = null
     }
   }
 
+  function clearPendingDrainAfterTerminalTimer() {
+    cancelPendingDrainTimer()
+    deferredDrainRequested = false
+  }
+
   function cleanup() {
     clearPendingDrainAfterTerminalTimer()
+    parkedQueues.clear()
   }
 
   return {
@@ -159,9 +267,12 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     enqueueHiddenControl,
     removePendingChip,
     clearPendingQueue,
+    switchPendingQueue,
+    adoptPendingQueue,
     popPendingTail,
     popAllPendingIntoComposer,
     schedulePendingDrainAfterTerminal,
+    flushDeferredPendingDrain,
     clearPendingDrainAfterTerminalTimer,
     cleanup,
   }

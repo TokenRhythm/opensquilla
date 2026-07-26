@@ -7,6 +7,8 @@ All fixture data is synthetic.
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -46,8 +48,13 @@ EXPECTED_WIRE_KEYS = {
     "probs",
     "flags",
     "finalTier",
+    "requestedProvider",
+    "requestedModel",
     "provider",
     "model",
+    "executedProvider",
+    "executedModel",
+    "fallbackReason",
     "thinkingLevel",
     "source",
     "trail",
@@ -71,8 +78,13 @@ def _base_record(**overrides) -> dict:
         "probs": [0.05, 0.91, 0.03, 0.01],
         "flags": ["code", "multi_step"],
         "final_tier": "c2",
+        "requested_provider": "openrouter",
+        "requested_model": "deepseek/deepseek-chat",
         "provider": "openrouter",
         "model": "deepseek/deepseek-chat",
+        "executed_provider": "deepseek",
+        "executed_model": "deepseek-chat",
+        "fallback_reason": "",
         "thinking_level": "medium",
         "source": "v4_phase3",
         "trail": [
@@ -126,6 +138,139 @@ async def test_decisions_list_empty_without_writer() -> None:
     finally:
         set_decision_writer(previous)
     assert payload == {"decisions": []}
+
+
+async def test_live_router_enable_after_disabled_boot_persists_decisions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The writer must be ready before a restart-free router enable.
+
+    ``onboarding.router.configure`` hot-applies the enabled flag.  A gateway
+    that booted with routing disabled therefore cannot defer construction of
+    the process-wide decision writer until a restart: the shared turn hook
+    would otherwise stage nothing and ``router.decisions.list`` would stay
+    empty even though routed calls were executing.
+    """
+    from types import SimpleNamespace
+
+    from opensquilla.engine.routing import RoutingDecision
+    from opensquilla.engine.steps.router_decision_record import (
+        schedule_router_decision_flush,
+        stage_router_decision,
+    )
+    from opensquilla.gateway.boot import build_services
+    from opensquilla.gateway.rpc_onboarding import _router_configure
+
+    monkeypatch.setattr(
+        "opensquilla.sandbox.integration.configure_runtime",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            effective=SimpleNamespace(as_dict=lambda: {})
+        ),
+    )
+    config_path = tmp_path / "config.toml"
+    config = GatewayConfig(
+        state_dir=str(tmp_path / "state"),
+        workspace_dir=str(tmp_path / "workspace"),
+        control_ui={"enabled": False},
+        channels={"channels": []},
+        mcp={"enabled": False},
+        memory={"flush_enabled": False},
+        sandbox={"auto_setup": False},
+        squilla_router={"enabled": False},
+    )
+    config.config_path = str(config_path)
+    previous = get_decision_writer()
+    services = await build_services(
+        config=config,
+        session_db_path=str(tmp_path / "sessions.sqlite"),
+        seed_agent_workspaces=False,
+    )
+    try:
+        assert services.router_decision_writer is not None
+        assert get_decision_writer() is services.router_decision_writer
+
+        rpc_ctx = RpcContext(
+            conn_id="live-enable",
+            config=config,
+            provider_selector=services.provider_selector,
+        )
+        result = await _router_configure({"mode": "recommended"}, rpc_ctx)
+        assert result["restartRequired"] is False
+        assert config.squilla_router.enabled is True
+
+        tier = config.squilla_router.default_tier
+        tier_cfg = config.squilla_router.tiers[tier]
+        model = str(tier_cfg["model"])
+        provider = str(tier_cfg.get("provider") or config.llm.provider)
+        turn_ctx = SimpleNamespace(
+            session_key="agent:main:webchat:live-enable",
+            metadata={
+                "routed_provider": provider,
+                "routed_model": model,
+                "executed_provider": provider,
+                "executed_model": model,
+            },
+        )
+        stage_router_decision(
+            turn_ctx,
+            decision=RoutingDecision(
+                tier=tier,
+                model=model,
+                confidence=1.0,
+                source="synthetic_live_enable",
+            ),
+            routing_extra={
+                "base_tier": tier,
+                "final_tier": tier,
+                "model_version": "synthetic_live_enable",
+            },
+        )
+        flush_task = schedule_router_decision_flush(turn_ctx.metadata)
+        assert flush_task is not None
+        await flush_task
+
+        payload = await _handle_router_decisions_list(
+            {"sessionKey": turn_ctx.session_key},
+            rpc_ctx,
+        )
+        assert len(payload["decisions"]) == 1
+        decision = payload["decisions"][0]
+        assert decision["sessionKey"] == turn_ctx.session_key
+        assert decision["requestedProvider"] == provider
+        assert decision["requestedModel"] == model
+        assert decision["executedProvider"] == provider
+        assert decision["executedModel"] == model
+    finally:
+        await services.close()
+        set_decision_writer(previous)
+
+
+async def test_decisions_list_writer_wait_does_not_block_event_loop() -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    class _BlockingWriter:
+        def list_decisions(self, **kwargs):
+            started.set()
+            release.wait(timeout=1.0)
+            return []
+
+    previous = get_decision_writer()
+    set_decision_writer(_BlockingWriter())
+    task = asyncio.create_task(
+        _handle_router_decisions_list({}, RpcContext(conn_id="test"))
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 0.5)
+        loop = asyncio.get_running_loop()
+        before = loop.time()
+        await asyncio.sleep(0.05)
+        assert loop.time() - before < 0.2
+    finally:
+        release.set()
+        await task
+        set_decision_writer(previous)
 
 
 async def test_decisions_list_returns_camelcase_envelope(

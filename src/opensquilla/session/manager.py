@@ -9,10 +9,10 @@ import os
 import re
 import uuid
 from collections.abc import AsyncIterator, Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from opensquilla.engine.steps.inject_time_prefix import stamp as _stamp_time_prefix
@@ -38,8 +38,25 @@ from opensquilla.session.models import (
     SessionSummary,
     TranscriptEntry,
 )
-from opensquilla.session.storage import SessionStorage
+from opensquilla.session.storage import (
+    CANONICAL_FORK_PROOF_SCHEMA_VERSION,
+    SessionStorage,
+)
 from opensquilla.session.tokenizer import estimate_tokens
+
+if TYPE_CHECKING:
+    from opensquilla.provider.types import ProviderRequestCorrelation
+
+_SANDBOX_RUN_CONTEXT_ORIGIN_KEY = "sandbox_run_context"
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalTranscriptPage:
+    """Bounded user-visible transcript page and archive coverage metadata."""
+
+    entries: list[TranscriptEntry]
+    has_more: bool
+    canonical_complete: bool
 
 
 def _validate_iana_name(name: str) -> str | None:
@@ -93,6 +110,18 @@ def _now_iso() -> str:
     return datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+@dataclass(frozen=True)
+class PreparedSessionIntent:
+    """Pure session mutation plan consumed by the turn-acceptance transaction."""
+
+    node: SessionNode
+    action: str
+    expected_epoch: int
+    previous_session_id: str | None = None
+    previous_node: SessionNode | None = None
+    initial_transcript_entries: tuple[TranscriptEntry, ...] = ()
+
+
 @contextlib.asynccontextmanager
 async def _null_async_context() -> AsyncIterator[None]:
     yield
@@ -139,6 +168,7 @@ def _compaction_entry_payloads(entries: list[TranscriptEntry]) -> list[dict[str,
             "tool_call_id": e.tool_call_id,
             "reasoning_content": e.reasoning_content,
             "turn_usage": e.turn_usage,
+            "turn_context": e.turn_context,
         }
         for e in entries
     ]
@@ -156,9 +186,19 @@ def _transcript_preimage(entries: list[TranscriptEntry]) -> tuple[tuple[Any, ...
             entry.token_count,
             _stable_json(entry.tool_calls),
             _stable_json(entry.turn_usage),
+            _stable_json(entry.turn_context),
         )
         for entry in entries
     )
+
+
+def _branch_origin(parent_origin: Any) -> dict[str, Any] | None:
+    if not isinstance(parent_origin, dict):
+        return None
+    sandbox_context = parent_origin.get(_SANDBOX_RUN_CONTEXT_ORIGIN_KEY)
+    if not isinstance(sandbox_context, dict):
+        return None
+    return {_SANDBOX_RUN_CONTEXT_ORIGIN_KEY: dict(sandbox_context)}
 
 
 class SessionManager:
@@ -241,6 +281,94 @@ class SessionManager:
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _build_session_node(
+        session_key: str,
+        *,
+        agent_id: str,
+        **kwargs: Any,
+    ) -> SessionNode:
+        now = _now_ms()
+        return SessionNode(
+            session_key=session_key,
+            session_id=str(uuid.uuid4()),
+            agent_id=agent_id,
+            created_at=now,
+            updated_at=now,
+            started_at=now,
+            status=SessionStatus.RUNNING,
+            **kwargs,
+        )
+
+    @staticmethod
+    def _build_reset_node(node: SessionNode) -> SessionNode:
+        reset = node.model_copy(deep=True)
+        reset.session_id = str(uuid.uuid4())
+        reset.epoch = int(node.epoch or 0) + 1
+        reset.updated_at = _now_ms()
+        reset.input_tokens = 0
+        reset.output_tokens = 0
+        reset.total_tokens = 0
+        reset.total_tokens_fresh = False
+        reset.estimated_cost_usd = 0.0
+        reset.total_cost_usd = 0.0
+        reset.billed_cost_usd = 0.0
+        reset.estimated_cost_component_usd = 0.0
+        reset.cost_source = "none"
+        reset.missing_cost_entries = 0
+        reset.cache_read = 0
+        reset.cache_write = 0
+        reset.context_tokens = None
+        reset.compaction_count = 0
+        if reset.forked_from_parent:
+            reset.schema_version = max(
+                reset.schema_version,
+                CANONICAL_FORK_PROOF_SCHEMA_VERSION,
+            )
+        return reset
+
+    async def prepare_intent(
+        self,
+        session_key: str,
+        intent: SessionIntent | str,
+        *,
+        agent_id: str = "main",
+        **create_kwargs: Any,
+    ) -> PreparedSessionIntent:
+        """Prepare create/reset/continue state without writing durable state."""
+
+        session_key = canonicalize_session_key(session_key)
+        agent_id = normalize_agent_id(agent_id)
+        resolved = SessionIntent(intent)
+        existing = await self._storage.get_session(session_key)
+        if resolved is SessionIntent.NEW_CHAT and existing is not None:
+            raise ValueError("session_key conflict")
+        if existing is None:
+            node = self._build_session_node(
+                session_key,
+                agent_id=agent_id,
+                **create_kwargs,
+            )
+            return PreparedSessionIntent(
+                node=node,
+                action="create",
+                expected_epoch=int(node.epoch or 0),
+            )
+        if resolved is SessionIntent.RESET_SAME_KEY:
+            reset = self._build_reset_node(existing)
+            return PreparedSessionIntent(
+                node=reset,
+                action="reset",
+                expected_epoch=int(reset.epoch or 0),
+                previous_session_id=existing.session_id,
+                previous_node=existing,
+            )
+        return PreparedSessionIntent(
+            node=existing,
+            action="continue",
+            expected_epoch=int(existing.epoch or 0),
+        )
+
     async def create(
         self,
         session_key: str,
@@ -254,17 +382,7 @@ class SessionManager:
         if existing is not None:
             raise ValueError(f"Session already exists: {session_key}")
 
-        now = _now_ms()
-        node = SessionNode(
-            session_key=session_key,
-            session_id=str(uuid.uuid4()),
-            agent_id=agent_id,
-            created_at=now,
-            updated_at=now,
-            started_at=now,
-            status=SessionStatus.RUNNING,
-            **kwargs,
-        )
+        node = self._build_session_node(session_key, agent_id=agent_id, **kwargs)
         await self._storage.upsert_session(node)
         return node
 
@@ -490,8 +608,6 @@ class SessionManager:
         if resolved is SessionIntent.RESET_SAME_KEY:
             node = await self._rotate_session_id(existing)
             return node, True
-        existing.updated_at = _now_ms()
-        await self._storage.upsert_session(existing)
         return existing, False
 
     async def _rotate_session_id(self, node: SessionNode) -> SessionNode:
@@ -532,17 +648,44 @@ class SessionManager:
         node.cache_write = 0
         node.context_tokens = None
         node.compaction_count = 0
+        if node.forked_from_parent:
+            node.schema_version = max(
+                node.schema_version,
+                CANONICAL_FORK_PROOF_SCHEMA_VERSION,
+            )
         await self._storage.upsert_session(node)
         return node
 
     async def _archive_session_identity(self, node: SessionNode) -> None:
         """Best-effort raw archive before a same-key transcript reset."""
 
+        entries, summaries = await self.capture_session_archive(node)
+        await self.write_session_archive(node, entries, summaries)
+
+    async def capture_session_archive(
+        self,
+        node: SessionNode,
+    ) -> tuple[list[TranscriptEntry], list[SessionSummary]]:
+        """Read reset archive material without creating filesystem side effects."""
+
         try:
             entries = await self._storage.get_canonical_transcript(node.session_id)
             summaries = await self._storage.get_all_summaries(node.session_id)
-            if not entries and not summaries:
-                return
+            return entries, summaries
+        except Exception:
+            return [], []
+
+    async def write_session_archive(
+        self,
+        node: SessionNode,
+        entries: list[TranscriptEntry],
+        summaries: list[SessionSummary],
+    ) -> None:
+        """Write a previously captured reset archive after acceptance commits."""
+
+        if not entries and not summaries:
+            return
+        try:
             archive_dir = _archive_dir()
             new_dir = not archive_dir.exists()
             archive_dir.mkdir(parents=True, exist_ok=True)
@@ -657,6 +800,28 @@ class SessionManager:
         max_fork_tokens: int | None = None,
         status: SessionStatus | str = SessionStatus.RUNNING,
         fork_before_message_id: str | None = None,
+        *,
+        mutation_context: Callable[[], contextlib.AbstractAsyncContextManager[None]] | None = None,
+    ) -> SessionNode:
+        """Create a child while optionally holding the parent's mutation lock."""
+        async with _session_mutation_context(mutation_context):
+            return await self._branch_locked(
+                parent_session_key,
+                new_session_key,
+                fork_transcript=fork_transcript,
+                max_fork_tokens=max_fork_tokens,
+                status=status,
+                fork_before_message_id=fork_before_message_id,
+            )
+
+    async def _branch_locked(
+        self,
+        parent_session_key: str,
+        new_session_key: str,
+        fork_transcript: bool = False,
+        max_fork_tokens: int | None = None,
+        status: SessionStatus | str = SessionStatus.RUNNING,
+        fork_before_message_id: str | None = None,
     ) -> SessionNode:
         """
         Create a child session branched from parent.
@@ -690,10 +855,16 @@ class SessionManager:
             model_provider=parent.model_provider,
             channel=parent.channel,
             chat_type=parent.chat_type,
+            origin=_branch_origin(parent.origin),
         )
 
         if fork_transcript:
             is_prefix_fork = bool(fork_before_message_id)
+            parent_coverage = await self._storage.get_canonical_transcript_coverage(
+                parent.session_id
+            )
+            parent_canonical_complete = parent_coverage.canonical_complete
+            parent_compaction_count = parent_coverage.compaction_count
             if fork_before_message_id:
                 canonical_entries = await self._storage.get_canonical_transcript(parent.session_id)
                 fork_index = next(
@@ -721,6 +892,31 @@ class SessionManager:
             )
             parent_tokens = sum(e.token_count or 0 for e in parent_entries) + summary_tokens
             if max_fork_tokens is None or parent_tokens <= max_fork_tokens:
+                if is_prefix_fork:
+                    # A prefix fork rewrites every copied canonical row as active raw
+                    # transcript, so a complete parent needs no inherited compaction
+                    # evidence. If the parent's canonical archive is incomplete, keep
+                    # a durable unmatched count so this child cannot claim completeness
+                    # after the missing rows have already been discarded.
+                    child.compaction_count = (
+                        0
+                        if parent_canonical_complete
+                        else max(1, parent_compaction_count)
+                    )
+                else:
+                    # Full forks copy summaries and compacted rows verbatim. Preserve
+                    # the parent's count. If its incomplete legacy lineage has no
+                    # count of its own, persist an unmatched count so the new fork's
+                    # semantic version cannot accidentally certify missing history.
+                    child.compaction_count = (
+                        parent_compaction_count
+                        if parent_canonical_complete
+                        else max(1, parent_compaction_count)
+                    )
+                child.schema_version = max(
+                    child.schema_version,
+                    CANONICAL_FORK_PROOF_SCHEMA_VERSION,
+                )
                 # Copy entries into child session
                 if not is_prefix_fork:
                     await self._storage.copy_compacted_transcript_entries(
@@ -738,6 +934,7 @@ class SessionManager:
                         tool_call_id=entry.tool_call_id,
                         reasoning_content=entry.reasoning_content,
                         turn_usage=entry.turn_usage,
+                        turn_context=entry.turn_context,
                         created_at=entry.created_at,
                         token_count=entry.token_count,
                         provenance_kind=entry.provenance_kind,
@@ -798,6 +995,97 @@ class SessionManager:
         await self._storage.upsert_session(child)
         return child
 
+    async def prepare_prefix_branch(
+        self,
+        parent_session_key: str,
+        new_session_key: str,
+        *,
+        fork_before_message_id: str,
+        status: SessionStatus | str = SessionStatus.DONE,
+    ) -> PreparedSessionIntent:
+        """Prepare a WebChat prefix fork without writing the child session."""
+
+        parent_session_key = canonicalize_session_key(parent_session_key)
+        new_session_key = canonicalize_session_key(new_session_key)
+        parent = await self._storage.get_session(parent_session_key)
+        if parent is None:
+            raise KeyError(f"Parent session not found: {parent_session_key}")
+        parent_coverage = await self._storage.get_canonical_transcript_coverage(
+            parent.session_id
+        )
+        canonical_entries = await self._storage.get_canonical_transcript(parent.session_id)
+        fork_index = next(
+            (
+                index
+                for index, entry in enumerate(canonical_entries)
+                if entry.message_id == fork_before_message_id
+            ),
+            None,
+        )
+        if fork_index is None:
+            raise KeyError(
+                f"Transcript message not found in {parent_session_key}: "
+                f"{fork_before_message_id}"
+            )
+
+        now = _now_ms()
+        child = SessionNode(
+            session_key=new_session_key,
+            session_id=str(uuid.uuid4()),
+            agent_id=parent.agent_id,
+            parent_session_key=parent_session_key,
+            spawned_by=parent_session_key,
+            spawn_depth=(parent.spawn_depth or 0) + 1,
+            created_at=now,
+            updated_at=now,
+            started_at=now,
+            status=status,
+            model=parent.model,
+            model_provider=parent.model_provider,
+            channel=parent.channel,
+            chat_type=parent.chat_type,
+            display_name=parent.display_name,
+            forked_from_parent=True,
+        )
+        child.compaction_count = (
+            0
+            if parent_coverage.canonical_complete
+            else max(1, parent_coverage.compaction_count)
+        )
+        child.schema_version = max(
+            child.schema_version,
+            CANONICAL_FORK_PROOF_SCHEMA_VERSION,
+        )
+        copied_entries = tuple(
+            TranscriptEntry(
+                session_id=child.session_id,
+                session_key=new_session_key,
+                role=entry.role,
+                content=entry.content,
+                tool_calls=entry.tool_calls,
+                tool_call_id=entry.tool_call_id,
+                reasoning_content=entry.reasoning_content,
+                turn_usage=entry.turn_usage,
+                turn_context=entry.turn_context,
+                created_at=entry.created_at,
+                token_count=entry.token_count,
+                provenance_kind=entry.provenance_kind,
+                provenance_origin_session_id=entry.provenance_origin_session_id,
+                provenance_source_session_key=entry.provenance_source_session_key,
+                provenance_source_channel=entry.provenance_source_channel,
+                provenance_source_tool=entry.provenance_source_tool,
+            )
+            for entry in canonical_entries[:fork_index]
+        )
+        return PreparedSessionIntent(
+            node=child,
+            action="fork",
+            expected_epoch=int(child.epoch or 0),
+            previous_session_id=parent.session_id,
+            previous_node=parent,
+            initial_transcript_entries=copied_entries,
+        )
+
     async def _copy_fork_materials(
         self,
         source_session_id: str,
@@ -846,7 +1134,7 @@ class SessionManager:
 
     # ── Transcript ───────────────────────────────────────────────────────────
 
-    async def append_message(
+    async def prepare_message(
         self,
         session_key: str,
         role: str,
@@ -856,16 +1144,28 @@ class SessionManager:
         tool_call_id: str | None = None,
         reasoning_content: str | None = None,
         turn_usage: dict[str, Any] | None = None,
+        turn_context: dict[str, Any] | None = None,
         token_count: int | None = None,
         provenance: dict[str, Any] | None = None,
-    ) -> TranscriptEntry:
-        """Append a message to the session transcript and touch updated_at."""
+        session_node: SessionNode | None = None,
+    ) -> tuple[TranscriptEntry, int]:
+        """Build an epoch-fenced transcript entry without persisting it."""
+
         session_key = canonicalize_session_key(session_key)
-        node = await self._storage.get_session(session_key)
+        node = session_node
+        if node is not None and canonicalize_session_key(node.session_key) != session_key:
+            raise ValueError("session_node does not match session_key")
+        if node is None:
+            node = await self._storage.get_session(session_key)
         if node is None:
             raise KeyError(f"Session not found: {session_key}")
 
         content = self._maybe_stamp_user_message(role, content)
+
+        if turn_context is None:
+            from opensquilla.session.turn_context import current_turn_context
+
+            turn_context = current_turn_context()
 
         entry = TranscriptEntry(
             session_id=node.session_id,
@@ -876,6 +1176,7 @@ class SessionManager:
             tool_call_id=tool_call_id,
             reasoning_content=reasoning_content if role == "assistant" else None,
             turn_usage=turn_usage if role == "assistant" else None,
+            turn_context=dict(turn_context) if turn_context is not None else None,
             token_count=token_count,
         )
 
@@ -890,17 +1191,52 @@ class SessionManager:
         # Pass the epoch we read from the node so storage can perform an
         # atomic INSERT WHERE epoch=? guard against concurrent resets.
         expected_epoch = node.epoch if node.epoch is not None else 0
-        await self._storage.append_transcript_entry(entry, expected_epoch=expected_epoch)
+        return entry, expected_epoch
 
-        node.updated_at = _now_ms()
-        if token_count and turn_usage is None:
-            node.total_tokens += token_count
-            node.total_tokens_fresh = False
-        await self._storage.upsert_session(node)
-        # Notify memory sync of new message delta
-        if self._memory_sync_notify is not None:
-            byte_count = len(content.encode("utf-8")) if content else 0
-            self._memory_sync_notify(byte_count)
+    def notify_message_appended(self, entry: TranscriptEntry) -> None:
+        """Notify memory capture after an entry's transaction has committed."""
+
+        if self._memory_sync_notify is None:
+            return
+        content = entry.content or ""
+        byte_count = len(content.encode("utf-8")) if isinstance(content, str) else 0
+        self._memory_sync_notify(byte_count)
+
+    async def append_message(
+        self,
+        session_key: str,
+        role: str,
+        content: str,
+        *,
+        tool_calls: list[dict[str, Any]] | None = None,
+        tool_call_id: str | None = None,
+        reasoning_content: str | None = None,
+        turn_usage: dict[str, Any] | None = None,
+        token_count: int | None = None,
+        provenance: dict[str, Any] | None = None,
+    ) -> TranscriptEntry:
+        """Append a message and narrowly touch its session in one transaction."""
+
+        entry, expected_epoch = await self.prepare_message(
+            session_key,
+            role,
+            content,
+            tool_calls=tool_calls,
+            tool_call_id=tool_call_id,
+            reasoning_content=reasoning_content,
+            turn_usage=turn_usage,
+            token_count=token_count,
+            provenance=provenance,
+        )
+        token_delta = token_count if token_count and turn_usage is None else 0
+        await self._storage.append_transcript_entry_and_touch(
+            entry,
+            expected_epoch=expected_epoch,
+            updated_at=_now_ms(),
+            token_delta=token_delta,
+            mark_total_tokens_stale=bool(token_delta),
+        )
+        self.notify_message_appended(entry)
         return entry
 
     async def remove_message(self, session_key: str, message_id: str) -> bool:
@@ -917,6 +1253,20 @@ class SessionManager:
         if node is None:
             return False
         return await self._storage.delete_transcript_entry(node.session_id, message_id)
+
+    async def update_message_turn_context(
+        self,
+        session_key: str,
+        message_id: str,
+        turn_context: dict[str, Any],
+    ) -> bool:
+        """Persist the latest disposition for one causally identified input."""
+
+        return await self._storage.update_transcript_turn_context(
+            canonicalize_session_key(session_key),
+            message_id,
+            turn_context,
+        )
 
     async def get_transcript(
         self, session_key: str, limit: int | None = None
@@ -1031,6 +1381,32 @@ class SessionManager:
         if node is None:
             raise KeyError(f"Session not found: {session_key}")
         return await self._storage.get_canonical_transcript(node.session_id, limit=limit)
+
+    async def get_canonical_transcript_page(
+        self,
+        session_key: str,
+        *,
+        limit: int,
+        before: tuple[int, int] | None = None,
+        after: tuple[int, int] | None = None,
+    ) -> CanonicalTranscriptPage:
+        """Return a bounded canonical page without changing provider replay."""
+        session_key = canonicalize_session_key(session_key)
+        node = await self._storage.get_session(session_key)
+        if node is None:
+            raise KeyError(f"Session not found: {session_key}")
+        entries, has_more = await self._storage.get_canonical_transcript_page(
+            node.session_id,
+            limit=limit,
+            before=before,
+            after=after,
+        )
+        canonical_complete = await self._storage.is_canonical_transcript_complete(node.session_id)
+        return CanonicalTranscriptPage(
+            entries=entries,
+            has_more=has_more,
+            canonical_complete=canonical_complete,
+        )
 
     async def get_summaries(self, session_key: str) -> list[SessionSummary]:
         """Return durable compaction summaries for a session key."""
@@ -1152,18 +1528,25 @@ class SessionManager:
         custom_instructions: str | None = None,
         *,
         mutation_context: Callable[[], contextlib.AbstractAsyncContextManager[None]] | None = None,
+        provider_request_correlation: ProviderRequestCorrelation | None = None,
     ) -> str:
         """
         Compact the session transcript when context is filling up.
         Summarizes older entries, keeps recent ones, stores summary out-of-band.
         Returns the summary string.
         """
+        correlation_kwargs: dict[str, Any] = {}
+        if provider_request_correlation is not None:
+            correlation_kwargs["provider_request_correlation"] = (
+                provider_request_correlation
+            )
         result = await self.compact_with_result(
             session_key,
             context_window_tokens,
             config,
             custom_instructions,
             mutation_context=mutation_context,
+            **correlation_kwargs,
         )
         return result.summary if result.removed_count else ""
 
@@ -1178,6 +1561,7 @@ class SessionManager:
         trigger_reason: str | None = None,
         flush_receipt_status: str | None = None,
         mutation_context: Callable[[], contextlib.AbstractAsyncContextManager[None]] | None = None,
+        provider_request_correlation: ProviderRequestCorrelation | None = None,
     ) -> CompactionResult:
         """Compact the session transcript and return full compaction metadata."""
 
@@ -1198,6 +1582,7 @@ class SessionManager:
                 context_window_tokens=context_window_tokens,
                 config=config or CompactionConfig(),
                 custom_instructions=custom_instructions,
+                provider_request_correlation=provider_request_correlation,
             )
         )
 
@@ -1377,6 +1762,7 @@ class SessionManager:
                 tool_calls=raw.get("tool_calls"),
                 tool_call_id=raw.get("tool_call_id"),
                 turn_usage=raw.get("turn_usage"),
+                turn_context=raw.get("turn_context"),
             )
             rewritten_entries.append(entry)
 

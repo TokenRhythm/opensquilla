@@ -27,7 +27,14 @@ from opensquilla.cli.tui.backend.contracts import (
 from opensquilla.cli.tui.backend.output_binding import TuiOutputBinding
 from opensquilla.cli.tui.backend.runtime import run_tui_runtime
 from opensquilla.cli.tui.backend.state import TuiRuntimeState
-from opensquilla.cli.tui.opentui.messages import ModelText, NoticeWrite, PromptEcho
+from opensquilla.cli.tui.opentui.context import context_update_from_bootstrap
+from opensquilla.cli.tui.opentui.messages import (
+    ContextUpdate,
+    HistoryReplace,
+    ModelText,
+    NoticeWrite,
+    PromptEcho,
+)
 from opensquilla.cli.tui.opentui.notice_capture import capture_stdout_as_notices, real_stderr
 from opensquilla.cli.tui.opentui.surface import open_opentui_surface
 from opensquilla.engine.commands import Surface
@@ -57,6 +64,31 @@ class OpenTuiChatRuntimeContext(ChatRuntimeContext):
         if isinstance(ctx_workspace, str) and ctx_workspace:
             return ctx_workspace
         return None
+
+    @property
+    def history_replace(self) -> HistoryReplace | None:
+        value = self.scope.get("history_replace")
+        return value if isinstance(value, HistoryReplace) else None
+
+    @property
+    def workspace_label(self) -> str | None:
+        value = self.scope.get("workspace_label")
+        return value if isinstance(value, str) and value else None
+
+    @property
+    def context_update(self) -> ContextUpdate:
+        snapshot = self.scope.get("bootstrap")
+        bootstrap = snapshot if isinstance(snapshot, dict) else None
+        state = self.scope.get("state")
+        permission = getattr(state, "elevated", None)
+        return context_update_from_bootstrap(
+            bootstrap,
+            surface=self.surface,
+            model=self.model,
+            session_id=self.session_id,
+            workspace_label=self.workspace_label or self.workspace_dir,
+            permission=permission,
+        )
 
 
 def get_tui_output(scope: MutableMapping[str, Any]) -> TuiOutputHandle | None:
@@ -148,7 +180,19 @@ async def echo_opentui_user_input(tui_surface: TuiSurface, text: str) -> None:
         return
     send = getattr(tui_surface, "send_message", None)
     if send is not None:
-        await send("prompt.echo", asdict(PromptEcho(text=text)))
+        from opensquilla.cli.tui.backend.input_identity import (
+            current_tui_client_message_id,
+        )
+
+        await send(
+            "prompt.echo",
+            asdict(
+                PromptEcho(
+                    text=text,
+                    client_message_id=current_tui_client_message_id(),
+                )
+            ),
+        )
 
 
 async def echo_opentui_queued_turn_start(tui_surface: TuiSurface) -> None:
@@ -165,6 +209,7 @@ async def run_opentui_chat_runtime(
     dispatch: Callable[[str], Awaitable[bool]],
     queue_max_size: int,
     abort_active_turn: ChatAbortTurn | None = None,
+    steer_active_turn: Callable[[str], Awaitable[bool]] | None = None,
 ) -> None:
     """Compose the OpenTUI footer adapter with the TUI backend runtime."""
     context = OpenTuiChatRuntimeContext(
@@ -179,9 +224,14 @@ async def run_opentui_chat_runtime(
             "surface": surface,
             "model": context.model,
             "session_id": context.session_id,
+            "context_update": context.context_update,
         }
         if context.workspace_dir is not None:
             kwargs["workspace_dir"] = context.workspace_dir
+        if context.workspace_label is not None:
+            kwargs["workspace_label"] = context.workspace_label
+        if context.history_replace is not None:
+            kwargs["history_replace"] = context.history_replace
         return open_opentui_surface(**kwargs)
 
     notice_tasks: set[asyncio.Task[None]] = set()
@@ -212,7 +262,10 @@ async def run_opentui_chat_runtime(
                     task_name=surface_task_name(surface),
                     queue_max_size=queue_max_size,
                     concurrent_input_during_turn=True,
-                    classify_input=classify_chat_input,
+                    classify_input=lambda user_input: classify_chat_input(
+                        user_input,
+                        surface=surface,
+                    ),
                     state=runtime_state,
                 ),
                 hooks=TuiRuntimeHooks(
@@ -221,6 +274,11 @@ async def run_opentui_chat_runtime(
                     clear_current_cancel=clear_current_cancel,
                     notice=_notice,
                     on_cancel_active_turn=context.abort_turn,
+                    on_steer_active_turn=(
+                        steer_active_turn
+                        if steer_active_turn is not None
+                        else TuiRuntimeHooks().on_steer_active_turn
+                    ),
                     expose_surface=context.expose_surface,
                     clear_exposed_surface=context.clear_output,
                 ),

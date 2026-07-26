@@ -18,13 +18,15 @@
     "cost_source": "none",
     "ensemble_trace": null,
     "input_tokens": 15,
-    "model": "",
+    "model": "claude-test",
     "model_usage_breakdown": [],
     "output_tokens": 9,
+    "provider": "anthropic",
     "reasoning_content": "Let me think about this.",
     "reasoning_tokens": 0,
     "stop_reason": "end_turn",
     "thinking_signature": "sig-test-0001",
-    "type": "DoneEvent"
+    "type": "DoneEvent",
+    "usage_missing_count": 0
   }
 ]

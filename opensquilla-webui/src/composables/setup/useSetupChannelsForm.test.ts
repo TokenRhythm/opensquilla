@@ -15,12 +15,7 @@ const slackFields = [
 const slack = { type: 'slack', label: 'Slack', fields: slackFields }
 
 function panelFor(form: ReturnType<typeof useSetupChannelsForm>) {
-  return form.createPanel({
-    channelRuntimeRows: computed(() => []),
-    catalogChannels: computed(() => [slack]),
-    channelSpec: computed(() => slack),
-    channelSpecFields: computed(() => slackFields),
-  })
+  return form.createPanel(computed(() => slackFields))
 }
 const names = (panel: { value: { channelFields: Array<{ field: { name: string } }> } }) =>
   panel.value.channelFields.map((r) => r.field.name)
@@ -28,7 +23,7 @@ const names = (panel: { value: { channelFields: Array<{ field: { name: string } 
 describe('useSetupChannelsForm — show_when field visibility', () => {
   it('shows only the fields for the default connection mode (webhook)', () => {
     const f = useSetupChannelsForm()
-    f.initFromCatalog([slack])
+    f.resetForSpec(slack)
     const panel = panelFor(f)
     const shown = names(panel)
     expect(shown).toContain('token') // unconditional
@@ -39,7 +34,7 @@ describe('useSetupChannelsForm — show_when field visibility', () => {
 
   it('flips visible fields when the connection mode changes', () => {
     const f = useSetupChannelsForm()
-    f.initFromCatalog([slack])
+    f.resetForSpec(slack)
     const panel = panelFor(f)
     f.updateField('connection_mode', 'socket')
     const shown = names(panel)
@@ -49,7 +44,9 @@ describe('useSetupChannelsForm — show_when field visibility', () => {
 
   it('payload drops a hidden field’s stale value', () => {
     const f = useSetupChannelsForm()
-    f.initFromCatalog([slack])
+    // The gallery leaves nothing preselected; pick the type explicitly.
+    f.selectChannelType('slack')
+    f.resetForSpec(slack)
     // user was in webhook, typed a signing secret, then switched to socket
     f.updateField('signing_secret', 'shh-secret')
     f.updateField('connection_mode', 'socket')

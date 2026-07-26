@@ -972,9 +972,11 @@ def _apply_provider_mismatch_veto(
     ``"veto"`` AND routing applies AND the ``provider_mismatch_veto`` stage
     finds a usable rebind target; every other combination (the default
     ``"route"`` mode above all) leaves the decision byte-identical to the
-    historical flag-and-misroute behavior. The router-control hold path is
-    intentionally exempt: an operator hold pins an explicit
-    tier/model/provider triple and must not be second-guessed.
+    historical flag-and-misroute behavior. A vetoed decision with no usable
+    rebind target instead fails closed at the selector-apply boundary,
+    which keeps the primary deployment (provider and model). The
+    router-control hold path is intentionally exempt: an operator hold pins
+    an explicit tier/model/provider triple and must not be second-guessed.
     """
     mode = str(getattr(router_cfg, "tier_provider_mismatch", "route") or "route").strip().lower()
     if mode != "veto" or not routing_applied:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import platform
@@ -352,6 +353,46 @@ def test_desktop_gateway_run_rejects_config_outside_profile_before_loading_it(
 
     assert result.exit_code == 1
     assert "DESKTOP_CONFIG_OUTSIDE_PROFILE" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "lock_error_name",
+    ["ProfileLockBusyError", "LegacyGatewayRunningError"],
+)
+def test_gateway_run_emits_stable_profile_in_use_error_without_sensitive_path(
+    tmp_path: Path,
+    monkeypatch,
+    lock_error_name: str,
+) -> None:
+    from opensquilla import recovery
+
+    sensitive_profile = tmp_path / "customer-private-profile"
+    lock_error = getattr(recovery, lock_error_name)
+
+    @contextlib.contextmanager
+    def busy_profile_guard():
+        raise lock_error(
+            f"profile is in use by another writer: {sensitive_profile}"
+        )
+        yield  # pragma: no cover - contextmanager shape only
+
+    def fail_run_gateway(**_kwargs) -> None:
+        raise AssertionError("gateway must not start without the profile lock")
+
+    monkeypatch.setattr(recovery, "guarded_desktop_profile", busy_profile_guard)
+    monkeypatch.setattr(gateway_cmd, "run_gateway", fail_run_gateway)
+
+    result = runner.invoke(app, ["gateway", "run"])
+
+    assert result.exit_code == 1
+    output = result.stdout + (result.stderr or "")
+    assert output.count("OPENSQUILLA_PROFILE_IN_USE") == 1
+    assert "Another OpenSquilla process is still using this profile" in output
+    assert "restart the computer" in output
+    assert "Do not delete profile lock files" in output
+    assert str(sensitive_profile) not in output
+    assert lock_error_name not in output
+    assert "Traceback" not in output
 
 
 def test_gateway_help_lists_lifecycle_commands() -> None:

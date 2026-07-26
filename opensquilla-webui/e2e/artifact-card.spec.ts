@@ -11,48 +11,57 @@ const PNG_1x1 = Buffer.from(
 
 // Seed a finished assistant turn carrying one image, one previewable document,
 // and one download-only data file, rewriting chat.history in flight.
-async function seedHistory(page: Page, options: { includeHtml?: boolean } = {}) {
+async function seedHistory(
+  page: Page,
+  options: { artifacts?: Array<Record<string, unknown>>; includeHtml?: boolean } = {},
+) {
+  await page.route('**/api/approvals', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ pending: [] }),
+  }))
   await page.routeWebSocket(/\/ws$/, ws => {
-    const server = ws.connectToServer()
-    const historyIds = new Set<string>()
+    ws.send(JSON.stringify({ type: 'event', event: 'connect.challenge', payload: {} }))
     ws.onMessage(message => {
+      let frame: Record<string, unknown>
       try {
-        const frame = JSON.parse(String(message))
-        if (frame?.type === 'req' && frame.method === 'chat.history') {
-          historyIds.add(String(frame.id))
+        frame = JSON.parse(String(message)) as Record<string, unknown>
+      } catch {
+        return
+      }
+      if (frame.type !== 'req') return
+      const method = String(frame.method || '')
+      if (method === 'connect') {
+        ws.send(JSON.stringify({ protocol: 3, policy: { tick_interval_ms: 30000 } }))
+        return
+      }
+      if (method === 'chat.history') {
+        const artifacts: Array<Record<string, unknown>> = options.artifacts || [
+          {
+            id: 'art-card-img',
+            name: 'generated-image.png',
+            mime: 'image/png',
+            size: 744448,
+            download_url: '/api/v1/artifacts/art-card-img',
+            thumbnail_url: '/api/v1/artifacts/art-card-img?variant=thumb',
+          },
+          { id: 'art-card-pdf', name: 'report-q2.pdf', mime: 'application/pdf', size: 188416 },
+          { id: 'art-card-csv', name: 'pricing.csv', mime: 'text/csv', size: 12288 },
+        ]
+        if (!options.artifacts && options.includeHtml) {
+          artifacts.push({
+            id: 'art-card-html',
+            name: 'interactive.html',
+            mime: 'text/html',
+            size: 4096,
+            download_url: '/api/v1/artifacts/art-card-html',
+          })
         }
-      } catch {}
-      server.send(message)
-    })
-    server.onMessage(message => {
-      try {
-        const frame = JSON.parse(String(message))
-        if (frame?.type === 'res' && frame.id !== undefined && historyIds.has(String(frame.id))) {
-          historyIds.delete(String(frame.id))
-          frame.ok = true
-          delete frame.error
-          const artifacts = [
-            {
-              id: 'art-card-img',
-              name: 'generated-image.png',
-              mime: 'image/png',
-              size: 744448,
-              download_url: '/api/v1/artifacts/art-card-img',
-              thumbnail_url: '/api/v1/artifacts/art-card-img?variant=thumb',
-            },
-            { id: 'art-card-pdf', name: 'report-q2.pdf', mime: 'application/pdf', size: 188416 },
-            { id: 'art-card-csv', name: 'pricing.csv', mime: 'text/csv', size: 12288 },
-          ]
-          if (options.includeHtml) {
-            artifacts.push({
-              id: 'art-card-html',
-              name: 'interactive.html',
-              mime: 'text/html',
-              size: 4096,
-              download_url: '/api/v1/artifacts/art-card-html',
-            })
-          }
-          frame.payload = {
+        ws.send(JSON.stringify({
+          type: 'res',
+          id: frame.id,
+          ok: true,
+          payload: {
             messages: [
               {
                 role: 'user',
@@ -69,12 +78,34 @@ async function seedHistory(page: Page, options: { includeHtml?: boolean } = {}) 
               },
             ],
             has_more: false,
-          }
-          ws.send(JSON.stringify(frame))
-          return
-        }
-      } catch {}
-      ws.send(message)
+          },
+        }))
+        return
+      }
+      const payloads: Record<string, unknown> = {
+        'agents.list': { agents: [] },
+        'commands.list_for_surface': { commands: [] },
+        'config.get': {
+          squilla_router: { enabled: false, rollout_phase: 'observe', tiers: {} },
+          permissions: {},
+          skills: {},
+        },
+        'onboarding.status': { audioConfigured: false },
+        'sessions.list': { sessions: [], has_more: false },
+        'sessions.messages.subscribe': {
+          subscribed: true,
+          replay_complete: true,
+          current_stream_seq: 0,
+          run_status: 'idle',
+        },
+        'usage.status': { sessions: [] },
+      }
+      ws.send(JSON.stringify({
+        type: 'res',
+        id: frame.id,
+        ok: true,
+        payload: payloads[method] ?? {},
+      }))
     })
   })
 }
@@ -86,6 +117,42 @@ async function openSeeded(page: Page) {
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
   await page.waitForSelector('.conn-pill', { timeout: 10000 })
   await page.waitForSelector('.chat-header', { timeout: 10000 })
+}
+
+function silentWav(): Buffer {
+  const sampleRate = 8000
+  const sampleCount = 800
+  const dataSize = sampleCount * 2
+  const wav = Buffer.alloc(44 + dataSize)
+  wav.write('RIFF', 0)
+  wav.writeUInt32LE(36 + dataSize, 4)
+  wav.write('WAVE', 8)
+  wav.write('fmt ', 12)
+  wav.writeUInt32LE(16, 16)
+  wav.writeUInt16LE(1, 20)
+  wav.writeUInt16LE(1, 22)
+  wav.writeUInt32LE(sampleRate, 24)
+  wav.writeUInt32LE(sampleRate * 2, 28)
+  wav.writeUInt16LE(2, 32)
+  wav.writeUInt16LE(16, 34)
+  wav.write('data', 36)
+  wav.writeUInt32LE(dataSize, 40)
+  return wav
+}
+
+async function openAudioSeeded(page: Page) {
+  await seedHistory(page, {
+    artifacts: [{
+      id: 'art-card-audio',
+      name: 'sample.wav',
+      mime: 'audio/wav',
+      size: silentWav().byteLength,
+      download_url: '/api/v1/artifacts/art-card-audio',
+    }],
+  })
+  await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
+  await page.waitForSelector('.chat-header', { timeout: 10000 })
+  await expect(page.locator('.msg-audio-card')).toBeVisible({ timeout: 10000 })
 }
 
 test.describe('Artifact deliverable cards', () => {
@@ -154,8 +221,9 @@ test.describe('Artifact deliverable cards', () => {
     await expect(csvCard.getByRole('button', { name: 'Download pricing.csv' })).toBeVisible()
   })
 
-  test('html file card opens through the gateway native-open endpoint', async ({ page }) => {
+  test('html file card is download-only and never invokes the native-open endpoint', async ({ page }) => {
     let nativeOpenCount = 0
+    let htmlDownloadCount = 0
     await page.route('**/api/v1/artifacts/**', async route => {
       const request = route.request()
       const url = new URL(request.url())
@@ -170,6 +238,15 @@ test.describe('Artifact deliverable cards', () => {
         })
         return
       }
+      if (url.pathname === '/api/v1/artifacts/art-card-html') {
+        htmlDownloadCount += 1
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/html',
+          body: '<html><body>download only</body></html>',
+        })
+        return
+      }
       await route.fulfill({ status: 200, contentType: 'image/png', body: PNG_1x1 })
     })
     await seedHistory(page, { includeHtml: true })
@@ -178,9 +255,75 @@ test.describe('Artifact deliverable cards', () => {
 
     const htmlCard = page.locator('.msg-artifact-chip', { hasText: 'interactive.html' })
     await expect(htmlCard).toBeVisible()
-    await expect(htmlCard.getByRole('button', { name: 'Open interactive.html' })).toBeVisible()
-    await htmlCard.getByRole('button', { name: 'Open interactive.html' }).click()
+    await expect(htmlCard.getByRole('button', { name: 'Open interactive.html' })).toHaveCount(0)
+    const downloadPromise = page.waitForEvent('download')
+    await htmlCard.getByRole('button', { name: 'Download interactive.html' }).click()
+    const download = await downloadPromise
 
-    await expect.poll(() => nativeOpenCount).toBe(1)
+    expect(download.suggestedFilename()).toBe('interactive.html')
+    expect(nativeOpenCount).toBe(0)
+    expect(htmlDownloadCount).toBe(1)
+  })
+
+  test('audio performs zero initial requests and fetches authenticated bytes only after Play', async ({ page }) => {
+    const requests: Array<{
+      authorization?: string
+      sessionKey?: string
+    }> = []
+    await page.addInitScript(() => {
+      sessionStorage.setItem('opensquilla.wsToken', 'audio-token-e2e')
+    })
+    await page.route('**/api/v1/artifacts/art-card-audio*', route => {
+      const request = route.request()
+      requests.push({
+        authorization: request.headers().authorization,
+        sessionKey: request.headers()['x-opensquilla-session-key'],
+      })
+      return route.fulfill({
+        status: 200,
+        contentType: 'audio/wav',
+        body: silentWav(),
+      })
+    })
+    await openAudioSeeded(page)
+
+    await page.waitForTimeout(200)
+    expect(requests).toHaveLength(0)
+
+    await page.getByRole('button', { name: 'Play audio sample.wav' }).click()
+    const player = page.locator('.msg-audio-card__player')
+    await expect(player).toBeVisible({ timeout: 10000 })
+    await expect(player).toHaveAttribute('controls', '')
+    expect(requests).toEqual([{
+      authorization: 'Bearer audio-token-e2e',
+      sessionKey: SESSION_KEY,
+    }])
+  })
+
+  test('audio failure exposes Retry and Download, then recovers to native controls', async ({ page }) => {
+    let shouldFail = true
+    let requests = 0
+    await page.route('**/api/v1/artifacts/art-card-audio*', route => {
+      requests += 1
+      if (shouldFail) return route.fulfill({ status: 500, body: 'audio failed' })
+      return route.fulfill({
+        status: 200,
+        contentType: 'audio/wav',
+        body: silentWav(),
+      })
+    })
+    await openAudioSeeded(page)
+
+    const card = page.locator('.msg-audio-card')
+    await page.getByRole('button', { name: 'Play audio sample.wav' }).click()
+    await expect(card).toHaveAttribute('data-state', 'error')
+    await expect(card.getByText('Audio could not be loaded.')).toBeVisible()
+    await expect(card.getByRole('button', { name: 'Retry sample.wav' })).toBeVisible()
+    await expect(card.getByRole('button', { name: 'Download sample.wav' })).toBeVisible()
+
+    shouldFail = false
+    await card.getByRole('button', { name: 'Retry sample.wav' }).click()
+    await expect(card.locator('.msg-audio-card__player')).toBeVisible({ timeout: 10000 })
+    expect(requests).toBe(2)
   })
 })

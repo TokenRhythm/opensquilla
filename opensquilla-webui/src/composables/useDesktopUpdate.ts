@@ -1,5 +1,6 @@
 import { computed, ref } from 'vue'
-import { getPlatform, type DesktopUpdateState } from '@/platform'
+import { useI18n } from 'vue-i18n'
+import { getPlatform, type DesktopUpdateErrorCode, type DesktopUpdateState } from '@/platform'
 
 const idleUpdateState: DesktopUpdateState = {
   status: 'idle',
@@ -8,9 +9,14 @@ const idleUpdateState: DesktopUpdateState = {
   progress: null,
   checkedAt: null,
   error: null,
+  errorCode: null,
   snoozedUntil: null,
+  canCheck: false,
   canNativeInstall: false,
+  installMode: 'unsupported',
   releaseUrl: null,
+  source: null,
+  fallbackUsed: false,
 }
 
 const TOPBAR_STATUSES = new Set(['available', 'downloading', 'downloaded', 'error'])
@@ -38,6 +44,15 @@ function snoozeActive(value: DesktopUpdateState): boolean {
   return Number.isFinite(expiresAt) && expiresAt > Date.now()
 }
 
+function updateErrorTranslationKey(code: DesktopUpdateErrorCode): string {
+  if (code === 'source_unreachable') return 'updates.desktop.errorSourceUnreachable'
+  if (code === 'manifest_invalid') return 'updates.desktop.errorManifestInvalid'
+  if (code === 'checksum_unavailable') return 'updates.desktop.errorChecksumUnavailable'
+  if (code === 'integrity_failed') return 'updates.desktop.errorIntegrityFailed'
+  if (code === 'download_failed') return 'updates.desktop.errorDownloadFailed'
+  return 'updates.desktop.errorInstallFailed'
+}
+
 async function runAction(action: () => Promise<DesktopUpdateState>) {
   actionBusy.value = true
   try {
@@ -47,6 +62,7 @@ async function runAction(action: () => Promise<DesktopUpdateState>) {
       ...state.value,
       status: 'error',
       error: errorMessage(err),
+      errorCode: null,
       progress: null,
     })
   } finally {
@@ -68,7 +84,10 @@ async function refreshDesktopUpdate() {
       ...idleUpdateState,
       status: 'error',
       error: errorMessage(err),
+      errorCode: null,
+      canCheck: true,
       canNativeInstall: true,
+      installMode: 'native',
     })
   } finally {
     loading.value = false
@@ -86,14 +105,23 @@ function initDesktopUpdate() {
 }
 
 export function useDesktopUpdate() {
+  const { t } = useI18n()
   const platform = getPlatform()
   const isNativeDesktopUpdate = computed(() => platform.capabilities.isDesktop && state.value.canNativeInstall)
+  const isManagedDesktopUpdate = computed(() => (
+    platform.capabilities.isDesktop
+    && state.value.canCheck
+  ))
   const visible = computed(() =>
-    isNativeDesktopUpdate.value &&
+    isManagedDesktopUpdate.value &&
     TOPBAR_STATUSES.has(state.value.status) &&
     !snoozeActive(state.value),
   )
   const latestVersion = computed(() => state.value.latestVersion || state.value.currentVersion || '')
+  const localizedError = computed(() => {
+    if (state.value.errorCode) return t(updateErrorTranslationKey(state.value.errorCode))
+    return state.value.error || t('updates.desktop.errorFallback')
+  })
 
   return {
     state,
@@ -102,7 +130,9 @@ export function useDesktopUpdate() {
     actionBusy,
     visible,
     latestVersion,
+    localizedError,
     isNativeDesktopUpdate,
+    isManagedDesktopUpdate,
     init: initDesktopUpdate,
     refresh: refreshDesktopUpdate,
     check: () => runAction(() => platform.updates.check()),

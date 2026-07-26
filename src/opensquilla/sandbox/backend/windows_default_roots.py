@@ -7,6 +7,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from opensquilla.sandbox.platform_permissions import WINDOWS_PLATFORM_READ_ROOTS
+
 
 @dataclass(frozen=True)
 class WorkspaceWriteRoots:
@@ -50,20 +52,22 @@ def runtime_rx_roots(
 
 def windows_system_root(env: Mapping[str, str] | None = None) -> Path:
     source = env or {}
-    raw = source.get("SystemRoot") or source.get("SYSTEMROOT") or "C:\\Windows"
+    raw = (
+        source.get("SystemRoot") or source.get("SYSTEMROOT") or str(WINDOWS_PLATFORM_READ_ROOTS[0])
+    )
     return Path(raw)
 
 
 def windows_program_data_root(env: Mapping[str, str] | None = None) -> Path:
     source = env or {}
-    return Path(source.get("ProgramData") or "C:\\ProgramData")
+    return Path(source.get("ProgramData") or str(WINDOWS_PLATFORM_READ_ROOTS[3]))
 
 
 def _program_files_roots_from_env(env: Mapping[str, str] | None = None) -> tuple[Path, ...]:
     source = env or {}
     roots = [
-        Path(source.get("ProgramFiles") or "C:\\Program Files"),
-        Path(source.get("ProgramFiles(x86)") or "C:\\Program Files (x86)"),
+        Path(source.get("ProgramFiles") or str(WINDOWS_PLATFORM_READ_ROOTS[1])),
+        Path(source.get("ProgramFiles(x86)") or str(WINDOWS_PLATFORM_READ_ROOTS[2])),
     ]
     return tuple(dict.fromkeys(root for root in roots if str(root)))
 
@@ -157,8 +161,7 @@ def _has_sensitive_user_part(path: Path) -> bool:
     if any(part in sensitive_parts for part in parts):
         return True
     return any(
-        parts[index : index + 2] == (".config", "gh")
-        for index in range(max(0, len(parts) - 1))
+        parts[index : index + 2] == (".config", "gh") for index in range(max(0, len(parts) - 1))
     )
 
 

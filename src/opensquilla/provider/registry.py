@@ -255,6 +255,14 @@ for _provider_spec in [
         catalog_source=("alibaba", "alibaba-cn"),
     ),
     _spec(
+        "bailian_coding_cn",
+        "openai_compat",
+        "bailian_coding",
+        "BAILIAN_API_KEY",
+        "https://coding.dashscope.aliyuncs.com/v1",
+        catalog_source=("alibaba-cn", "alibaba"),
+    ),
+    _spec(
         "moonshot",
         "openai_compat",
         "moonshot",

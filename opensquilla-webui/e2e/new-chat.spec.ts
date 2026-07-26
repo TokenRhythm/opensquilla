@@ -13,7 +13,7 @@ test.describe('New chat draft state', () => {
     await page.locator('.sidebar-new-session').click()
 
     await expect(page.getByRole('dialog', { name: 'New chat' })).toHaveCount(0)
-    await expect(page).toHaveURL(/\/chat\/new\?agent=/)
+    await expect(page).toHaveURL(/\/chat\/new\?agent=main$/)
     expect(new URL(page.url()).searchParams.get('session')).toBeNull()
 
     // Empty transcript: landing brand, no rendered messages.
@@ -54,6 +54,18 @@ test.describe('New chat draft state', () => {
     await page.waitForSelector('.conn-pill', { timeout: 10000 })
     await expect(page).toHaveURL(/\/chat\/new\?agent=main$/)
     expect(page.url()).not.toContain('new=1')
+  })
+
+  test('new task hides Agent selection while preserving Agent deep links', async ({ page }) => {
+    await page.goto(CONTROL_URL + 'chat/new?agent=research')
+    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+
+    await expect(page).toHaveURL(/\/chat\/new\?agent=research$/)
+    await expect(page.locator('.chat-landing-agent')).toHaveCount(0)
+    await expect(page.getByRole('menu', { name: 'Choose agent' })).toHaveCount(0)
+    await expect(page.locator('.chat-landing-brand')).toBeVisible()
+    await expect(page.locator('.empty-state__identity')).toContainText('research')
+    await expect(page.locator('.chat-textarea')).toBeFocused()
   })
 
   test('first send materializes the session key in the URL once', async ({ page }) => {

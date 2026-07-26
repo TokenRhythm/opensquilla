@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from dataclasses import dataclass
 from enum import StrEnum
@@ -140,6 +141,13 @@ async def _windows_setup_status(config: Any) -> SetupResult:
 
 
 async def _ensure_windows_setup(config: Any) -> SetupResult:
+    # Windows setup can wait for UAC consent and for the elevated helper to
+    # finish. Keep that blocking Win32 work off the gateway event loop so
+    # health checks, shutdown, and setup-status RPCs stay responsive.
+    return await asyncio.to_thread(_ensure_windows_setup_sync, config)
+
+
+def _ensure_windows_setup_sync(config: Any) -> SetupResult:
     _ = config
     support = _probe_windows_sandbox_support()
     if support.default_backend_available and support.proxy_allowlist_enforced:

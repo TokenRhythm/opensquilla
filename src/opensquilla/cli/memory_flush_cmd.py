@@ -5,12 +5,17 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import typer
 
+from opensquilla.observability.network_policy import (
+    provider_request_correlation_disabled,
+)
+from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.session.compaction_lifecycle import flush_receipt_is_successful_flush
 
 
@@ -252,6 +257,21 @@ async def run_memory_flush_session(
         if session_manager is None:
             raise RuntimeError("session manager is disabled; cannot read transcript")
         transcript = await session_manager.get_transcript(session_key)
+        maintenance_turn_id = f"maintenance_{uuid.uuid4().hex}"
+        provider_request_correlation = None
+        if not provider_request_correlation_disabled(config=service_cfg):
+            try:
+                session = await session_manager.get_session(session_key)
+            except Exception:  # noqa: BLE001 - correlation must never block the flush
+                session = None
+            durable_session_id = getattr(session, "session_id", None)
+            if isinstance(durable_session_id, str) and durable_session_id:
+                provider_request_correlation = ProviderRequestCorrelation(
+                    session_id=durable_session_id,
+                    turn_id=maintenance_turn_id,
+                    execution_id=uuid.uuid4().hex,
+                    call_kind="auxiliary.session_flush",
+                )
         receipt = await flush_service.execute(
             transcript,
             session_key,
@@ -262,6 +282,8 @@ async def run_memory_flush_session(
             segment_mode=parsed_segment_mode,
             segment_max_chars=parsed_segment_max_chars,
             segment_overlap_messages=parsed_segment_overlap_messages,
+            turn_id=maintenance_turn_id,
+            provider_request_correlation=provider_request_correlation,
         )
         receipt_dict = receipt.to_dict() if hasattr(receipt, "to_dict") else dict(receipt)
         usage = receipt_dict.get("usage")

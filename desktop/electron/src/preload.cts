@@ -3,6 +3,7 @@ import { contextBridge, ipcRenderer } from 'electron'
 contextBridge.exposeInMainWorld('opensquillaDesktop', {
   getOsLocale: () => ipcRenderer.invoke('desktop:os-locale'),
   isAutoUpdateEnabled: () => ipcRenderer.invoke('desktop:update:supported'),
+  isDesktopUpdateManaged: () => ipcRenderer.invoke('desktop:update:managed'),
   getUpdateState: () => ipcRenderer.invoke('desktop:update:state'),
   checkForUpdates: () => ipcRenderer.invoke('desktop:update:check'),
   downloadUpdate: () => ipcRenderer.invoke('desktop:update:download'),
@@ -14,6 +15,8 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
   getDesktopSettings: () => ipcRenderer.invoke('desktop:settings:get'),
   saveDesktopSettings: (payload: unknown) => ipcRenderer.invoke('desktop:settings:save', payload),
   resetDesktopSettings: () => ipcRenderer.invoke('desktop:settings:reset'),
+  getDesktopPreferences: () => ipcRenderer.invoke('desktop:preferences:get'),
+  saveDesktopPreferences: (payload: unknown) => ipcRenderer.invoke('desktop:preferences:save', payload),
   setNativeTheme: (payload: unknown) => ipcRenderer.invoke('desktop:theme:set', payload),
   openArtifact: (payload: unknown) => ipcRenderer.invoke('desktop:artifact:open', payload),
   getOnboardingDefaults: () => ipcRenderer.invoke('desktop:onboarding:defaults'),
@@ -32,6 +35,7 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
     return kind === 'primary' || kind === 'recovery' ? kind : null
   },
   chooseRecoveryWorkspace: (payload: unknown) => ipcRenderer.invoke('desktop:recovery:choose-workspace', payload),
+  chooseLegacyAgentDataLocation: (payload: unknown) => ipcRenderer.invoke('desktop:recovery:choose-legacy-agent-data', payload),
   recoverProfileTransaction: () => ipcRenderer.invoke('desktop:recovery:recover-transaction'),
   launchSafeProfile: (payload: unknown) => ipcRenderer.invoke('desktop:recovery:launch-safe', payload),
   retryPrimaryProfile: () => ipcRenderer.invoke('desktop:recovery:retry-primary'),
@@ -49,10 +53,6 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
   migrationTakeLastResult: () => ipcRenderer.invoke('desktop:migration:last-result'),
   migrationPeekLastResult: () => ipcRenderer.invoke('desktop:migration:peek-last-result'),
   migrationDismissLastResult: () => ipcRenderer.invoke('desktop:migration:dismiss-last-result'),
-  selectOnboardingMigration: (payload: unknown) => ipcRenderer.invoke('desktop:onboarding:migrate:select', payload),
-  browseOnboardingMigration: (payload: unknown) => ipcRenderer.invoke('desktop:onboarding:migrate:browse', payload),
-  previewOnboardingMigration: () => ipcRenderer.invoke('desktop:onboarding:migrate:preview'),
-  applyOnboardingMigration: () => ipcRenderer.invoke('desktop:onboarding:migrate:apply'),
   onBootStatus: (callback: (payload: unknown) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => callback(payload)
     ipcRenderer.on('desktop:boot:status', listener)
@@ -77,5 +77,10 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
     const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => callback(payload)
     ipcRenderer.on('desktop:migration:progress', listener)
     return () => ipcRenderer.removeListener('desktop:migration:progress', listener)
+  },
+  onWindowHidden: (callback: () => void) => {
+    const listener = () => callback()
+    ipcRenderer.on('desktop:window:hidden', listener)
+    return () => ipcRenderer.removeListener('desktop:window:hidden', listener)
   },
 })

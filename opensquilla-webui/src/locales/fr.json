@@ -6,11 +6,15 @@
     "desktop": {
       "indicatorAvailable": "Mise à jour {version}",
       "indicatorDownloaded": "Mise à jour prête",
+      "indicatorInstallerReady": "Installateur vérifié",
       "indicatorDownloading": "Téléchargement",
       "indicatorDownloadingProgress": "Téléchargement {progress}%",
       "indicatorError": "Problème de mise à jour",
       "availableTitle": "OpenSquilla {version} est disponible",
       "availableDesc": "Téléchargez-la quand vous êtes prêt. OpenSquilla ne l'installera qu'après relance.",
+      "manualAvailableDesc": "Téléchargez l’installateur Windows correspondant à cette version. Windows vous guidera pour terminer l’installation.",
+      "manualDownloadedTitle": "Installateur vérifié prêt",
+      "manualDownloadedDesc": "OpenSquilla {version} a été vérifié avec la somme de contrôle GitHub officielle et affiché dans son dossier. Exécutez l’installateur lorsque vous êtes prêt.",
       "downloadedTitle": "Prête à installer",
       "downloadedDesc": "Relancez OpenSquilla pour terminer la mise à jour vers {version}.",
       "downloadingTitle": "Téléchargement de la mise à jour",
@@ -19,13 +23,22 @@
       "applyingDesc": "OpenSquilla prépare la relance et l'installation.",
       "errorTitle": "Échec de la recherche de mises à jour",
       "errorFallback": "Réessayez depuis les paramètres.",
+      "errorSourceUnreachable": "Les sources de mise à jour sont temporairement inaccessibles. Réessayez plus tard.",
+      "errorManifestInvalid": "Les données du canal de publication sont invalides ; OpenSquilla ne peut pas confirmer la mise à jour en toute sécurité.",
+      "errorChecksumUnavailable": "Le programme d’installation ne peut pas être vérifié car la somme de contrôle GitHub officielle est indisponible. Aucun programme n’a été ouvert.",
+      "errorIntegrityFailed": "Le programme d’installation téléchargé a échoué au contrôle d’intégrité et a été supprimé.",
+      "errorDownloadFailed": "OpenSquilla n’a pas pu télécharger la mise à jour. Vérifiez votre connexion et réessayez.",
+      "errorInstallFailed": "OpenSquilla n’a pas pu préparer ou ouvrir l’installateur. Réessayez ou utilisez la page de publication.",
       "idleDesc": "Rechercher une nouvelle version desktop.",
+      "manualIdleDesc": "Recherchez une nouvelle version desktop. Sous Windows, un installateur versionné s’ouvre pour une installation manuelle.",
       "upToDateDesc": "La version {version} est la plus récente disponible.",
       "settingsTitle": "Mises à jour desktop",
       "currentVersion": "Actuelle",
       "latestVersion": "Dernière",
       "unknownVersion": "Inconnue",
       "availableStatus": "Disponible",
+      "manualAvailableStatus": "Installation manuelle",
+      "manualDownloadedStatus": "Vérifié",
       "downloadedStatus": "Prête à installer",
       "downloadingStatus": "Téléchargement",
       "checkingStatus": "Vérification",
@@ -35,8 +48,14 @@
       "idleStatus": "Inactif",
       "unavailableStatus": "Indisponible",
       "unsupported": "Les mises à jour desktop natives ne sont pas disponibles sur cette plateforme. Utilisez le lien de version lorsqu'une nouvelle version est annoncée.",
+      "source": "Source",
+      "sourceOss": "Miroir Alibaba Cloud OSS",
+      "sourceGithub": "Versions GitHub",
+      "fallbackUsed": "Source de secours utilisée",
       "check": "Vérifier",
       "download": "Télécharger",
+      "downloadInstaller": "Télécharger l’installateur",
+      "showInstaller": "Afficher l’installateur",
       "relaunch": "Relancer",
       "later": "Plus tard"
     }
@@ -45,7 +64,10 @@
     "close": "Fermer",
     "save": "Enregistrer",
     "discard": "Abandonner",
-    "cancel": "Annuler"
+    "cancel": "Annuler",
+    "edit": "Modifier",
+    "delete": "Supprimer",
+    "dismiss": "Ignorer"
   },
   "nav": {
     "chat": "Chat",
@@ -55,12 +77,22 @@
     "channels": "Canaux",
     "cron": "Cron",
     "skills": "Compétences",
+    "skillsChannels": "Compétences et canaux",
     "overview": "Vue d'ensemble",
+    "status": "État",
     "usage": "Utilisation",
     "logs": "Journaux",
     "settings": "Paramètres",
     "groupBuild": "Construire",
-    "groupMonitor": "Surveiller"
+    "groupMonitor": "Vue d'ensemble",
+    "channelSetup": "Config. des canaux",
+    "not-found": "Introuvable"
+  },
+  "notFound": {
+    "title": "Page introuvable",
+    "body": "Cette adresse ne correspond à aucune page OpenSquilla.",
+    "goToChat": "Aller au chat",
+    "sessions": "Sessions"
   },
   "chrome": {
     "settings": "Paramètres",
@@ -113,7 +145,13 @@
       "themeLabel": "Thème",
       "themeDesc": "Suivez votre système, ou forcez le mode clair ou sombre. Le bouton de la barre latérale est un raccourci vers ce même paramètre.",
       "languageLabel": "Langue",
-      "languageDesc": "Langue d'affichage de l'interface. S'applique immédiatement à ce navigateur.",
+      "languageDesc": "Langue d'affichage de l'interface et des messages système des canaux. Elle s'applique ici immédiatement et enregistre la langue des messages pour toute la passerelle.",
+      "channelNoticeLocaleSyncPending": "La langue de l'interface a changé, mais la langue des messages système des canaux n'est pas encore enregistrée. Une nouvelle tentative aura lieu à la reconnexion de la passerelle.",
+      "toolDetailsLabel": "Affichage par défaut des détails d'outil",
+      "toolDetailsDesc": "Automatique suit le type d'outil ; Compact réduit les outils ordinaires ; Développé les ouvre. Les erreurs s'ouvrent automatiquement par défaut et peuvent être repliées manuellement.",
+      "toolDetailsAuto": "Automatique",
+      "toolDetailsCompact": "Compact",
+      "toolDetailsExpanded": "Développé",
       "bgmLabel": "Musique de fond",
       "bgmDesc": "Affiche la commande de musique de fond dans la barre supérieure. Désactivé par défaut ; modifiable aussi depuis la palette de commandes.",
       "sidebarWidthLabel": "Largeur de la barre latérale",
@@ -136,6 +174,42 @@
       "sidebarWidthCompactStatus": "La disposition compacte utilise {current} px. Votre préférence sur ordinateur de {saved} px est conservée.",
       "sidebarWidthDrawerStatus": "La disposition en tiroir utilise {current} px. Votre préférence sur ordinateur de {saved} px est conservée."
     },
+    "dataMigration": {
+      "title": "Données et sauvegardes",
+      "desc": "Recherchez et vérifiez les données d’une autre installation OpenSquilla. L’analyse ne commence qu’à l’ouverture de cette page et rien ne change sans confirmation.",
+      "refresh": "Rechercher à nouveau",
+      "scanning": "Recherche de données OpenSquilla importables…",
+      "unsupportedTitle": "Mettez OpenSquilla à jour pour vérifier les imports",
+      "unsupportedDesc": "Cette passerelle ou version Desktop ne prend pas encore en charge l’API de prévisualisation sécurisée. Mettez l’hôte à jour puis revenez ici.",
+      "invalidResponse": "La passerelle a renvoyé une prévisualisation de migration non prise en charge.",
+      "compatibilityTitle": "Emplacement des anciennes données Agent",
+      "compatibilityDesc": "OpenSquilla utilise un emplacement compatible pour les anciennes données Agent. Le changer modifie la source d’identité et de mémoire sans déplacer, fusionner ni supprimer les données.",
+      "chooseLegacyAgentData": "Choisir l’emplacement des données Agent",
+      "recoveryTitle": "L’import est indisponible dans un profil de récupération",
+      "loadFailed": "OpenSquilla n’a pas pu vérifier les sources d’import.",
+      "emptyTitle": "Aucune autre donnée OpenSquilla trouvée",
+      "emptyDesc": "Vous pourrez relancer la recherche plus tard. Desktop permet aussi de choisir manuellement un dossier.",
+      "chooseSourceDesc": "Vérifiez une source avant l’import. Les sources restent intactes et ne sont jamais fusionnées avec les données actuelles.",
+      "previewSource": "Vérifier les données de {source}",
+      "webReadOnly": "Cette connexion Web permet seulement de prévisualiser l’import. Terminez-le dans Desktop ou sur l’hôte de la passerelle.",
+      "hostCliHint": "Pour terminer depuis un terminal, exécutez l’outil de migration sur l’hôte de la passerelle. Aucun chemin serveur n’est exposé ici.",
+      "blockers": {
+        "source_in_use": "La source est actuellement utilisée.",
+        "source_schema_newer": "La source a été créée par une version plus récente d’OpenSquilla.",
+        "source_database_invalid": "La base de données source n’a pas pu être validée.",
+        "source_config_invalid": "La configuration source n’a pas pu être validée.",
+        "source_unreadable": "La source n’a pas pu être lue en toute sécurité.",
+        "insufficient_disk": "L’espace disque disponible est insuffisant.",
+        "target_recovery_required": "Les données actuelles doivent être récupérées avant l’import.",
+        "target_not_replaceable": "Les données actuelles ne peuvent pas être remplacées en toute sécurité.",
+        "preview_unavailable": "Aucune prévisualisation sûre n’est disponible pour cette source."
+      },
+      "notices": {
+        "whole_profile_replacement": "Le profil actuel sera entièrement sauvegardé puis remplacé ; les données ne sont pas fusionnées.",
+        "previously_imported": "Cette source a déjà été importée et reste disponible pour vérification.",
+        "scheduled_jobs_will_be_paused": "Les tâches planifiées importées restent en pause jusqu’à votre vérification."
+      }
+    },
     "dialog": {
       "title": "Paramètres",
       "actionNeeded": "Action requise ({count})",
@@ -148,9 +222,21 @@
       "openSection": "{label} — ouvrir {section}",
       "unsavedSuffix": ", modifications non enregistrées",
       "unsavedIn": "Modifications non enregistrées dans {sections}",
+      "unsavedProvider": "Modifications non enregistrées pour {provider}",
+      "unsavedCount": "Modifications non enregistrées dans {count} sections",
+      "saveProvider": "Enregistrer {provider}",
+      "saveRouting": "Enregistrer les modifications du routage",
+      "saveAll": "Tout enregistrer ({count})",
+      "savingChanges": "Enregistrement des modifications…",
+      "discardProvider": "Ignorer les modifications de {provider}",
+      "discardRouting": "Ignorer les modifications du routage",
+      "discardAll": "Tout ignorer ({count})",
       "moreOptionsIn": "Plus d'options se trouvent dans",
       "copyConfigPath": "Copier le chemin de configuration",
-      "applyLiveNote": "La plupart des changements s'appliquent à chaud ; certains nécessitent un redémarrage de la passerelle"
+      "applyLiveNote": "La plupart des changements s'appliquent à chaud ; certains nécessitent un redémarrage de la passerelle",
+      "discardTitle": "Abandonner les modifications non enregistrées ?",
+      "discardBody": "Vous avez des modifications non enregistrées. Fermer maintenant les perdra.",
+      "discardPrimary": "Abandonner"
     },
     "rail": {
       "connection": "Connexion",
@@ -161,7 +247,6 @@
       "privacy": "Confidentialité",
       "router": "Routeur",
       "ensemble": "Ensemble",
-      "channels": "Canaux",
       "capabilities": "Capacités",
       "appearance": "Apparence",
       "keyboard": "Clavier",
@@ -169,7 +254,6 @@
       "groups": {
         "gateway": "Passerelle",
         "ai": "Configuration IA",
-        "delivery": "Diffusion",
         "preferences": "Préférences",
         "capabilities": "Capacités"
       }
@@ -251,6 +335,121 @@
     },
     "provider": {
       "title": "Fournisseur",
+      "pageTitle": "Service de modèles",
+      "pageDesc": "Connectez des fournisseurs de modèles et gérez les identifiants, les points de terminaison et le modèle direct/de secours. Choisissez comment les modèles sont utilisés dans Routage des modèles.",
+      "configuredTitle": "Fournisseurs configurés",
+      "configuredCount": "{count}",
+      "configuredSummary": "{ready} identifiants prêts sur {count}. La vérification envoie une petite requête et peut entraîner des frais.",
+      "configuredDesc": "Les fournisseurs enregistrés restent disponibles pour le routage jusqu’à leur suppression. La vérification de la configuration envoie une petite requête au modèle avec les réglages enregistrés ; des frais du fournisseur peuvent s’appliquer.",
+      "activeBadge": "Actif",
+      "editingBadge": "En cours d’édition",
+      "profileReady": "Identifiants prêts",
+      "profileNeedsCredentials": "Identifiants requis",
+      "profileStatusUnavailable": "État indisponible",
+      "emptyTitle": "Ajoutez votre premier fournisseur de modèles",
+      "configuredEmpty": "Connectez un fournisseur pour vérifier les identifiants et choisir les modèles disponibles.",
+      "emptyRoutingHint": "Vous pourrez ensuite configurer le routage intelligent ; un seul fournisseur peut aussi router entre plusieurs modèles.",
+      "addProvider": "Ajouter un fournisseur",
+      "catalogTitle": "Ajouter un fournisseur",
+      "catalogDesc": "Choisissez un fournisseur. Sa configuration s’ouvrira juste en dessous.",
+      "featuredProviders": "Fournisseurs en vedette",
+      "allProviders": "Tous les fournisseurs",
+      "providerResultCount": "{count} disponibles",
+      "recommendedBadge": "Recommandé",
+      "browseAllProviders": "Parcourir tous les fournisseurs ({count})",
+      "providerResults": "Résultats des fournisseurs",
+      "viewAllProviders": "Tout afficher ({count})",
+      "showFewerProviders": "Afficher moins",
+      "searchProviders": "Rechercher des fournisseurs",
+      "searchProvidersPlaceholder": "Rechercher par nom",
+      "noProviderMatches": "Aucun fournisseur ne correspond.",
+      "multiProviderRouting": "Routage multi-fournisseurs",
+      "modelRoutingStatus": "Fonctions multi-fournisseurs",
+      "routerStatus": "Model Routing",
+      "routerStateOff": "Off",
+      "routerStateFollowPrimary": "Recommended · follows active provider",
+      "routerStateCustom": "Custom · preserved when the active provider changes",
+      "routerStateLegacy": "Existing configuration · preserved when the active provider changes",
+      "routingStatusDesc": "{count} fournisseurs enregistrés · {ready} prêts. L’ajout de fournisseurs n’active ni le routage ni l’ensemble.",
+      "routingStatusDescOne": "1 fournisseur enregistré · {ready} prêt. L’ajout d’un fournisseur n’active ni le routage ni l’ensemble.",
+      "crossProviderRouting": "Multi-fournisseurs",
+      "ensembleStatus": "Ensemble",
+      "routingOn": "Activé",
+      "routingOff": "Désactivé",
+      "routingOnDesc": "Le routage peut utiliser les fournisseurs configurés.",
+      "routingOffDesc": "Les fournisseurs restent enregistrés lorsque le routage est désactivé.",
+      "manageRouting": "Gérer le routage",
+      "openModelRouting": "Ouvrir Routage des modèles →",
+      "modelUsageTitle": "Utilisation des modèles",
+      "modelUsageRouter": "Routage intelligent des modèles",
+      "modelUsageEnsemble": "Collaboration multimodèle",
+      "modelUsageFixed": "Modèle fixe",
+      "modelUsageRouterDesc": "Choisit un modèle configuré adapté à chaque requête.",
+      "modelUsageEnsembleDesc": "Génère avec plusieurs modèles, puis combine leurs résultats.",
+      "modelUsageFixedDesc": "Envoie chaque requête au modèle direct actuel.",
+      "crossProviderActive": "Routage inter-fournisseurs inclus",
+      "configureModelRouting": "Configurer le routage",
+      "enableRouting": "Activer le routage",
+      "editProvider": "Modifier {provider}",
+      "moreActionsFor": "Plus d’actions pour {provider}",
+      "actionsFor": "Actions pour {provider}",
+      "testProviderConnection": "Vérifier la configuration de {provider}",
+      "testSavedConnection": "Vérifier la configuration enregistrée",
+      "addKeyToTest": "Ajouter une clé pour vérifier",
+      "addKeyToTestHint": "Ajoutez une clé API avant la vérification. Une clé collée non enregistrée peut aussi être vérifiée.",
+      "addModelToTest": "Ajouter un modèle pour vérifier",
+      "addModelToTestHint": "Choisissez un modèle avant de vérifier ce fournisseur.",
+      "statusUnavailableTestHint": "L’état du fournisseur est indisponible ; la configuration enregistrée ne peut pas encore être vérifiée.",
+      "makeActive": "Définir comme actif",
+      "activationModelRequired": "Choisissez et enregistrez un modèle ci-dessous avant d’activer ce fournisseur.",
+      "activationModelRequiredHint": "Choisissez un modèle direct/de repli dans l’éditeur du fournisseur et enregistrez-le d’abord.",
+      "activationPoolUnsupported": "Ce fournisseur utilise un pool de clés et ne peut pas être activé. Il reste disponible pour le routage et l’ensemble.",
+      "activationStatusUnavailable": "L’état d’activation est indisponible. Mettez à jour puis redémarrez la passerelle.",
+      "activationUnavailable": "Ce fournisseur ne peut pas être activé avec sa configuration enregistrée.",
+      "activateTitle": "Activer {provider}",
+      "activateDesc": "Choisissez le modèle des requêtes directes. Les profils de routage restent enregistrés.",
+      "activateDirectModelLabel": "Direct / fallback model",
+      "activateDirectModelDesc": "Used for normal direct requests and whenever execution falls back to the active provider.",
+      "activateRouterConflictTitle": "Resolve Model Routing",
+      "activateRouterConflictDesc": "Custom tiers reference another provider while cross-provider routing is off. Choose what should happen.",
+      "activateUseRecommendedRoute": "Use the new provider's recommended route",
+      "activateUseRecommendedRouteDesc": "Replace the current custom tiers with {provider}'s managed preset.",
+      "activateKeepCustomRoute": "Keep the custom route",
+      "activateKeepCustomRouteDesc": "Preserve the tiers and explicitly enable cross-provider routing.",
+      "activateDisableRouter": "Turn Model Routing off",
+      "activateDisableRouterDesc": "Keep the saved tiers, but stop using them until routing is enabled again.",
+      "activateImpactTitle": "After activation",
+      "activateRouterOff": "Stays off.",
+      "activateRouterNeedsChoice": "Choose how to resolve the provider conflict above.",
+      "activateRouterFollowsPrimary": "The managed route switches to {provider}.",
+      "activateRouterCustomPreserved": "The custom route stays unchanged.",
+      "activateRouterLegacyPreserved": "The existing route is preserved for compatibility.",
+      "activateEnsembleOnPreserved": "Stays on; members and aggregator are unchanged.",
+      "activateEnsembleOffPreserved": "Stays off.",
+      "discoveringModels": "Découverte des modèles…",
+      "modelPlaceholder": "Saisir un identifiant de modèle",
+      "activating": "Activation…",
+      "modelDiscoveryFailed": "Impossible de découvrir les modèles. Saisissez un identifiant manuellement.",
+      "upgradeGatewayHint": "Mettez à jour et redémarrez la passerelle pour activer les fournisseurs.",
+      "connectedLatency": "Configuration vérifiée · Vérification complète {latency} ms",
+      "connectionKeyRejected": "Clé refusée",
+      "connectionUnavailable": "Connexion indisponible",
+      "discardDraftTitle": "Ignorer les modifications du fournisseur ?",
+      "discardDraftBody": "Changer de fournisseur supprimera les modifications non enregistrées.",
+      "discardDraftPrimary": "Ignorer et continuer",
+      "editingTitle": "Modifier {provider}",
+      "editingRolePrimary": "Fournisseur actif",
+      "editingRoleNewPrimary": "Nouveau fournisseur actif",
+      "editingRoleProfile": "Profil de routage",
+      "editingRoleNew": "Non enregistré",
+      "editingPrimary": "Utilisé pour les requêtes directes et comme fournisseur de repli principal.",
+      "editingNewPrimary": "Une fois enregistré, ce fournisseur sera actif pour les requêtes directes et le repli principal.",
+      "editingProfile": "Disponible pour le routage et l’ensemble ; le sélectionner ici ne le rend pas actif.",
+      "editingNew": "L’enregistrement rend ce fournisseur disponible pour le routage et l’ensemble ; il ne deviendra pas actif.",
+      "profileModelHint": "Le modèle enregistré devient le modèle direct/de repli si ce fournisseur est activé. Les modèles routés restent séparés.",
+      "removeConfirmTitle": "Supprimer le fournisseur ?",
+      "removeConfirmBody": "Supprimer {provider} des fournisseurs configurés ? Un fournisseur utilisé ne peut pas être supprimé.",
+      "removeConfirmPrimary": "Supprimer le fournisseur",
       "needs": "Le fournisseur a besoin de",
       "choose": "Choisir un fournisseur",
       "chooseProviderShort": "choisir un fournisseur",
@@ -269,14 +468,39 @@
         "stepRegister": "Créer un compte TokenRhythm",
         "stepCopy": "Copier votre clé API",
         "stepPaste": "La coller dans le champ de clé API ci-dessous",
-        "stepSelectAndPaste": "Sélectionner TokenRhythm ci-dessus, puis coller votre clé API",
+        "stepSelectAndPaste": "Choisir « Ajouter un fournisseur », sélectionner TokenRhythm, puis coller votre clé API",
         "stepReplaceAndPaste": "Sélectionner « Remplacer la clé » ci-dessous, puis coller votre clé API"
       },
+      "recommendationScope": "Recommandation OpenSquilla · Facultative",
       "advanced": "Options avancées du fournisseur",
+      "providerOptions": "Point d’accès et options avancées de {provider}",
+      "endpointTitle": "Point d’accès de {provider}",
+      "endpointDesc": "Ces paramètres s’appliquent uniquement lorsque OpenSquilla appelle {provider}.",
+      "defaultModelTitle": "Modèle par défaut de {provider}",
+      "defaultModelGroupDesc": "Utilisé lorsque le routage est désactivé ou lorsque l’exécution revient au fournisseur actif.",
+      "defaultModelLabel": "Modèle direct / de secours",
+      "configuredModelTitle": "Modèle de {provider}",
+      "configuredModelCurrentLabel": "Modèle actuel",
+      "configuredModelFallbackLabel": "Modèle de repli",
+      "configuredModelDescFixed": "Mode modèle fixe : chaque requête utilise le modèle ci-dessous.",
+      "configuredModelDescRouter": "Mode routage intelligent des modèles : chaque requête est dirigée vers un modèle adapté et revient au modèle ci-dessous si le routage est indisponible.",
+      "configuredModelDescEnsemble": "Mode collaboration multimodèle : plusieurs modèles génèrent ensemble, avec repli sur le modèle ci-dessous si l’ensemble ne peut pas aboutir.",
+      "defaultModelDesc": "Utilisé pour les requêtes directes et le repli principal. Les modèles routés se configurent dans Routage des modèles.",
+      "defaultModelSemantics": "A recommended model is prefilled when available. Choose or enter another model, then verify it before relying on it.",
+      "profileModelTitle": "Modèle direct et de repli pour {provider}",
+      "profileModelGroupDesc": "Enregistré avec ce fournisseur et également utilisé pour vérifier la configuration.",
+      "profileModelLabel": "Modèle direct/de repli",
+      "profileModelDesc": "Utilisé si ce fournisseur devient actif. Les modèles routés restent configurés séparément.",
+      "runtimeDefaultsTitle": "Paramètres d’exécution par défaut · Tous les fournisseurs",
+      "runtimeDefaultsDesc": "Comportement de la passerelle commun à toutes les requêtes de modèle normales.",
       "timeoutLabel": "Délai d'expiration de la requête (secondes)",
       "timeoutDesc": "Durée d'attente d'une réponse de modèle avant expiration — augmentez-la pour les modèles locaux lents (Ollama, vLLM, LM Studio).",
+      "timeoutGlobalDesc": "Délai global de la passerelle pour les requêtes de modèle normales sur tous les fournisseurs. La vérification de la configuration utilise un délai distinct de 30 secondes.",
       "contextWindowLabel": "Remplacement de la fenêtre de contexte (tokens)",
       "contextWindowDesc": "Plafonne le budget d'assemblage du prompt pour ce modèle. Laissez vide pour utiliser la fenêtre détectée automatiquement.",
+      "contextWindowIdentityLabel": "Fenêtre de contexte · {provider} / {model}",
+      "contextWindowIdentityDesc": "S’applique partout où cette paire exacte fournisseur/modèle s’exécute, notamment dans le routage et l’ensemble.",
+      "contextWindowNoModel": "choisir un modèle",
       "contextWindowAuto": "auto",
       "contextWindowUnknown": "inconnu",
       "contextWindowNone": "aucun",
@@ -287,31 +511,59 @@
       "copyKeyCommand": "Copier la commande de définition de la clé du fournisseur",
       "save": "Enregistrer le fournisseur",
       "configureRouter": "Ouvrir le routage des modèles →",
-      "credentialTitle": "{provider} credential",
-      "credentialConnected": "Connected",
+      "credentialTitle": "Authentification de {provider}",
+      "credentialReady": "Clé disponible",
+      "credentialDraftReady": "Clé saisie · non enregistrée",
+      "credentialEnvDraftReady": "Variable d’environnement saisie · non enregistrée",
+      "credentialOptional": "Clé API facultative",
+      "credentialNotRequired": "Aucune clé requise",
       "credentialNeedsKey": "Needs key",
       "credentialSourceExplicit": "Current source: saved API key",
       "credentialSourceEnv": "Current source: environment variable {envKey}",
       "credentialSourceMissingEnv": "Current source: environment variable {envKey} is not visible",
+      "credentialSourceOptional": "Source actuelle : aucune clé API configurée (facultative)",
       "credentialSourceNotRequired": "Current source: no key required",
       "credentialSourceNone": "Current source: no saved API key",
+      "credentialSourceDraft": "Source actuelle : clé API non enregistrée",
+      "credentialSourceEnvDraft": "Source actuelle : variable d’environnement non enregistrée {envKey}",
       "credentialHiddenPlaceholder": "No saved API key",
       "credentialPublicHint": "Current session can replace this credential but cannot view its secret.",
       "viewCredential": "View",
       "replaceCredential": "Remplacer la clé",
-      "credentialReplacePlaceholder": "Paste a replacement API key",
-      "credentialEnterPlaceholder": "Paste your API key",
+      "removeCredential": "Supprimer la clé enregistrée",
+      "removingCredential": "Suppression de la clé enregistrée…",
+      "removeCredentialConfirmTitle": "Supprimer les identifiants enregistrés ?",
+      "removeCredentialConfirmBody": "Supprimer de cet appareil et de cette configuration les identifiants enregistrés pour {provider} ? Le fournisseur, les modèles et les paramètres de routage seront conservés. Si les identifiants proviennent d’une variable d’environnement, celle-ci ne sera pas supprimée du système.",
+      "removeCredentialConfirmPrimary": "Supprimer les identifiants",
+      "credentialReplacePlaceholder": "Collez une clé API de remplacement",
+      "credentialEnterPlaceholder": "Collez votre clé API",
+      "credentialWriteOnlyPlaceholder": "La clé enregistrée est conservée — collez-en une autre pour la remplacer",
+      "optionalApiKeyLabel": "Clé API (facultative)",
+      "optionalApiKeyHelper": "Laissez ce champ vide si ce point d’accès ne nécessite pas d’authentification.",
       "showApiKey": "Show API key",
       "hideApiKey": "Hide API key",
       "credentialAdvanced": "Advanced",
+      "credentialSourceOptions": "Source de l’identifiant",
       "credentialRevealUnavailable": "Couldn't reveal the saved API key.",
-      "connectionLabel": "Connexion",
-      "connectionDesc": "Facultatif : vérifiez la clé et le point d'accès avant d'enregistrer.",
-      "testConnection": "Tester la connexion",
-      "testing": "Test de connexion…",
-      "connected": "✓ Connecté",
+      "connectionLabel": "Configuration actuelle",
+      "connectionDesc": "Envoie une petite requête au modèle avec la clé, le point d’accès et le modèle de vérification actuels, puis confirme la fin du flux. Des frais du fournisseur peuvent s’appliquer.",
+      "testConnection": "Vérifier la configuration",
+      "testCurrentSettings": "Vérifier la configuration actuelle",
+      "testing": "Vérification de la configuration…",
+      "connectionNotTested": "Non vérifiée",
+      "lastVerifiedAgo": "Vérifiée · {ago}",
+      "verifiedConfigChanged": "Configuration modifiée depuis la vérification — vérifiez à nouveau",
+      "lastVerifyFailedAgo": "Dernière vérification échouée · {ago}",
+      "currentSettingsNotTested": "Configuration actuelle non vérifiée",
+      "endpointVerified": "Configuration vérifiée",
+      "probeMissingRequired": "Renseignez les champs obligatoires avant la vérification : {fields}.",
+      "requiredFieldJoiner": ", ",
+      "connected": "✓ Configuration vérifiée",
+      "firstModelResponse": "Première réponse du modèle · {duration} ms",
+      "completeProbeDuration": "Vérification complète · {duration} ms",
       "keyRejected": "✗ Clé refusée — {reason}",
       "notReachable": "✗ Connexion impossible — {reason}",
+      "streamIncompatible": "✗ Réponse en streaming incompatible — Le fournisseur a accepté l’identifiant et la requête du modèle, mais a renvoyé un format de flux non pris en charge.",
       "discoverFailed": "Impossible de lister les modèles — saisissez un id de modèle.",
       "verdictModels": "{count} modèles · p. ex. {samples}",
       "verdictSampleJoiner": ", ",
@@ -322,11 +574,16 @@
       "failureModelNotFound": "Le fournisseur ne reconnaît pas cet id de modèle.",
       "failureUnreachable": "Point d'accès injoignable.",
       "failureBadRequest": "Le fournisseur a refusé la requête.",
-      "failureGeneric": "Le test de connexion a échoué.",
+      "failureGeneric": "La vérification de la configuration a échoué.",
       "modelListLabel": "Modèles découverts",
       "modelOptionsToggle": "Catalogue de modèles · {count}",
       "modelListReadout": "Disponibles · {count}",
       "modelLiveSource": "En direct",
+      "modelMaxOutput": "Sortie max. {tokens}",
+      "effectiveMaxTokens": "Limite de sortie effective : {tokens} tokens · Source : {source}",
+      "effectiveSourceConfig": "configuration utilisateur",
+      "effectiveSourceCatalog": "catalogue de modèles",
+      "effectiveSourceDefault": "valeur intégrée par défaut",
       "modelSearchOrCustom": "Rechercher des modèles ou saisir un ID personnalisé",
       "modelSelected": "Sélectionné",
       "modelUseTyped": "Utiliser « {value} »",
@@ -351,35 +608,53 @@
     },
     "modelStrategy": {
       "title": "Routage des modèles",
-      "desc": "Choisissez comment Squilla utilise le modèle actuel pour chaque nouvelle requête.",
-      "providerFirst": "Choisissez d’abord un service de modèles, puis le fonctionnement du routage.",
-      "providerAction": "Accéder au service de modèles →",
-      "routerTitle": "Routage IA à modèle unique",
-      "visualModeLabel": "Style du panneau de routage",
-      "visualModeDesc": "Présentation du panneau de décision de routage dans les réponses du chat.",
+      "desc": "Choisissez comment Squilla sélectionne et utilise les modèles configurés pour les nouvelles requêtes.",
+      "modeTitle": "Choisir l’utilisation des modèles",
+      "modeDesc": "Choisissez selon l’objectif : le routage intelligent équilibre l’usage des tokens et les capacités ; un modèle fixe garde une sélection prévisible ; la collaboration multimodèle privilégie les capacités pour les tâches complexes et utilise généralement plus de tokens.",
+      "providerFirstTitle": "Ajouter d’abord un service de modèles",
+      "providerFirst": "Le routage des modèles nécessite au moins un fournisseur enregistré. Un seul fournisseur suffit pour router entre ses modèles configurés.",
+      "providerAction": "Accéder au service de modèles",
+      "configuredProvidersOnly": "Les fournisseurs et modèles disponibles proviennent du service de modèles.",
+      "manageProviders": "Gérer le service de modèles",
+      "routerTitle": "Routage intelligent des modèles",
+      "fallbackTierLabel": "Quand le routage est incertain",
+      "fallbackTierDesc": "Utilisez ce niveau par défaut lorsque le routage ne peut pas déterminer avec certitude le niveau de la requête.",
+      "modelRolesTitle": "Rôles des modèles",
+      "modelRolesDesc": "Définissez le modèle chargé de chaque niveau de complexité des requêtes.",
+      "advancedTitle": "Options d’affichage",
+      "advancedDesc": "Modifiez l’affichage des informations de routage dans le chat sans affecter la sélection des modèles.",
+      "visualModeLabel": "Style du panneau de décision de routage",
+      "visualModeDesc": "Choisissez l’apparence du panneau de décision de routage dans les réponses du chat. Cela ne modifie pas le comportement du routage.",
       "crossProviderNotice": "Le routage inter-fournisseurs est actif. Vérifie chaque niveau avant d’enregistrer.",
       "cards": {
         "router": {
-          "title": "Routage IA à modèle unique",
-          "desc": "L’IA choisit un modèle adapté à chaque tour, en privilégiant un coût plus bas."
+          "title": "Routage intelligent des modèles",
+          "badge": "Économe en tokens",
+          "desc": "Associe chaque requête à un modèle adapté afin d’éviter d’utiliser inutilement les modèles les plus puissants pour les tâches simples."
         },
         "ensemble": {
-          "title": "Routage IA agrégé",
-          "desc": "L’IA coordonne plusieurs modèles pour de meilleurs résultats sur les tâches complexes."
+          "title": "Collaboration multimodèle",
+          "badge": "Capacités prioritaires",
+          "desc": "Exécute plusieurs modèles en parallèle et combine leurs résultats pour les tâches complexes ; cela utilise généralement plus de tokens."
         },
         "single": {
-          "title": "Désactivé",
-          "desc": "Envoie chaque tour au modèle actuellement sélectionné."
+          "title": "Modèle fixe",
+          "badge": "Prévisible",
+          "desc": "Utilise toujours le modèle choisi, ce qui rend la sélection et l’usage plus faciles à prévoir."
         }
       },
-      "routerDependency": "Utilise les identifiants {provider} ; le modèle par défaut du fournisseur est {model}.",
-      "ensembleTitle": "Routage IA agrégé",
+      "routerDependency": "Choisissez les modèles pour chaque niveau de requête. Un fournisseur peut couvrir tous les niveaux.",
+      "ensembleTitle": "Collaboration multimodèle",
       "ensembleDependency": "Utilise les identifiants {provider} ; le modèle par défaut du fournisseur est {model}.",
       "ensembleMinimum": "Ajoutez au moins un autre candidat pour bénéficier du routage agrégé.",
       "ensembleFailure": "Si la fusion est impossible, revenir au modèle actuel : {provider} · {model}.",
-      "singleTitle": "Désactivé",
-      "singleDependency": "Chaque tour va au modèle actuellement sélectionné : {provider} · {model}.",
-      "singleDesc": "Le routage IA et le routage agrégé sont désactivés pour les nouvelles requêtes.",
+      "singleTitle": "Modèle fixe",
+      "singleDependency": "Choisissez le modèle utilisé pour chaque requête.",
+      "singleProviderLabel": "Fournisseur de modèles actuel",
+      "singleModelLabel": "Modèle fixe et de repli",
+      "singleModelDesc": "Utilisé pour chaque requête en mode Modèle fixe, et comme solution de repli lorsque le routage ou la collaboration ne peuvent pas aboutir.",
+      "singleModelPlaceholder": "Saisir un identifiant de modèle",
+      "singleDesc": "Utilisez un modèle prévisible sans routage automatique ni collaboration multimodèle.",
       "openrouterFixedTitle": "Ensemble {provider} fixe",
       "openrouterFixedDesc": "Quand le service de modèles utilise {provider}, le routage agrégé utilise quatre modèles proposants et un agrégateur.",
       "openrouterFixedProposer": "Modèle proposant",
@@ -396,15 +671,16 @@
       "removeCandidateAria": "Retirer {model}",
       "ensembleEmpty": "Aucun modèle candidat pour le moment. Enregistrez les paramètres du service de modèles pour générer les niveaux de routage, ou ajoutez des candidats manuellement.",
       "ensemblePipeline": "Fonctionnement : les modèles proposants rédigent en parallèle, puis l'agrégateur fusionne les brouillons en réponse finale. Seul l'agrégateur peut appeler des outils.",
+      "ensembleFlowDesc": "Plusieurs modèles rédigent en parallèle, puis un agrégateur combine leur travail en une réponse finale. Cela utilise plus d’appels de modèles et peut coûter plus cher.",
       "legacyDynamicNotice": "Cette configuration utilise l'ancien mode d'ensemble automatique retiré. Convertissez-la en composition personnalisée pour continuer à l'éditer.",
       "legacyDynamicMigrate": "Convertir en composition personnalisée",
       "schemeLabel": "Schéma d'ensemble",
-      "schemePresetTitle": "Ensemble prédéfini",
+      "schemePresetTitle": "Prédéfini",
       "schemePresetBadge": "Recommandé",
       "schemePresetDesc": "La composition optimisée du fournisseur : quatre proposants plus un agrégateur, prête à l'emploi.",
-      "schemeCustomTitle": "Ensemble personnalisé",
+      "schemeCustomTitle": "Personnalisé",
       "schemeCustomBadge": "Avancé",
-      "schemeCustomDesc": "Composez votre propre alignement avec des rôles ; mélangez les fournisseurs au besoin.",
+      "schemeCustomDesc": "Composez une sélection par rôles avec les modèles du fournisseur actuel.",
       "presetNoteDeepseek": "Ancre de raisonnement — brouillons de référence pour les tâches complexes",
       "presetNoteGlm": "Texte long et sortie structurée — contraste avec la famille DeepSeek",
       "presetNoteKimi": "Code et intention d'outils — couvre les demandes de programmation",
@@ -414,9 +690,14 @@
       "aggregatorSectionLabel": "Agrégateur",
       "aggregatorSectionDesc": "Un seul agrégateur produit la réponse finale. Choisissez le modèle le plus puissant de la composition.",
       "aggregatorInheritedNote": "Aucun agrégateur assigné — le modèle de chat actuel fusionne les brouillons",
-      "proposerSectionLabel": "Modèles proposants",
+      "proposerSectionLabel": "Proposants",
+      "proposerRoleLabel": "Proposant",
+      "aggregatorRoleLabel": "Agrégateur",
       "proposerSectionDesc": "Les proposants rédigent en parallèle ; la durée totale dépend du plus lent.",
       "proposerCount": "{count} / {max} · recommandé {recommendedMin}–{recommendedMax}",
+      "proposerCountCompact": "{count} sur {max}",
+      "presetReadOnlyHint": "Cette composition prédéfinie est gérée par le fournisseur.",
+      "presetProviderMismatchNotice": "Les tours utilisent toujours la composition prédéfinie {presetProvider} enregistrée, pas celle de {activeProvider} — resélectionnez « Prédéfini » pour passer à {activeProvider}.",
       "importTierCandidates": "Importer depuis les niveaux de modèle",
       "roleSelectAria": "Rôle de {model}",
       "roleUnassigned": "Aucun rôle",
@@ -426,10 +707,30 @@
       "role_critic": "Critique",
       "role_aggregator": "Agrégateur",
       "addCandidateRoleLabel": "Rôle du candidat",
+      "candidateActionsAria": "Actions pour {model}",
+      "replaceModel": "Remplacer le modèle",
+      "promoteAggregator": "Utiliser aussi comme agrégateur",
+      "replaceCandidateTitle": "Remplacer {model}",
+      "replaceCandidateConfirm": "Remplacer",
+      "candidateDuplicate": "Ce modèle figure déjà dans la liste des proposants.",
+      "addProposer": "Ajouter un proposant",
+      "chooseAggregator": "Choisir l'agrégateur",
+      "aggregatorPickerTitle": "Choisir l'agrégateur",
+      "aggregatorFromProposers": "Utiliser un proposant existant",
+      "aggregatorOtherModel": "Ou choisir un autre modèle",
       "capacityWarn": "{calls} appels de modèle par tour — le coût croît linéairement et le gain de fusion s'estompe au-delà de 4 proposants.",
       "capacityFull": "Limite de {max} proposants atteinte — davantage de brouillons n'améliore plus la fusion ; retirez-en un d'abord.",
       "diversityHint": "Plusieurs proposants partagent la même famille de modèles — ajouter un autre fournisseur améliore généralement la fusion.",
       "effectiveFacts": "Par tour : {calls} appels de modèle · fusion dès {quorum}/{proposers} proposants réussis · timeout proposant {proposerTimeout}s · timeout agrégateur {aggregatorTimeout}s · {grace}s de grâce après quorum",
+      "effectiveSummary": "{proposers} proposants en parallèle + 1 agrégateur · environ {calls} appels par tour",
+      "runtimeStrategyTitle": "Stratégie d'exécution",
+      "runtimeStrategyDesc": "Seuil de réussite, repli et limites de temps",
+      "successThresholdLabel": "Réponses réussies requises",
+      "successThresholdAuto": "Automatique · {quorum} sur {proposers}",
+      "successThresholdExact": "{quorum} sur {proposers}",
+      "failurePolicyLabel": "Si l'agrégation ne peut pas aboutir",
+      "runtimeLimitsLabel": "Limites de temps",
+      "runtimeLimits": "Proposants {proposerTimeout}s · agrégateur {aggregatorTimeout}s · {grace}s de grâce après le seuil",
       "quorumFailureLabel": "Si moins de {quorum} proposants réussissent"
     },
     "behavior": {
@@ -489,22 +790,31 @@
     },
     "channels": {
       "title": "Canaux",
-      "configuredCount": "{count} configuré(s)",
-      "channelType": "Type de canal",
-      "needs": "Le canal a besoin de",
       "save": "Enregistrer le canal",
-      "runtimeStatus": "État d'exécution",
-      "connected": "Connecté",
-      "actionNeeded": "Action requise",
-      "connecting": "connexion en cours",
-      "none": "Aucun canal configuré.",
-      "disabled": "Désactivé",
-      "enable": "Activer",
-      "disable": "Désactiver",
       "remove": "Supprimer",
       "removeConfirmTitle": "Supprimer ce canal ?",
       "removeConfirmBody": "{name} sera supprimé de la configuration. Redémarrage requis pour prendre effet.",
-      "removeConfirmPrimary": "Supprimer"
+      "removeConfirmPrimary": "Supprimer",
+      "testConnection": "Tester la connexion",
+      "testing": "Test en cours…",
+      "nameLocked": "Le renommage n'est pas pris en charge — utilisez « Dupliquer comme nouveau »",
+      "saveChanges": "Enregistrer les modifications",
+      "secretReplace": "Remplacer",
+      "secretReplacePlaceholder": "Collez la nouvelle valeur",
+      "secretKeepStored": "Conserver la valeur enregistrée",
+      "advancedGroup": "Avancé",
+      "fieldRequired": "Ce champ est obligatoire",
+      "fixRequired": "Renseignez d'abord les champs obligatoires en surbrillance",
+      "aids": {
+        "title": "Raccourcis console Feishu",
+        "scopes_json": "Manifeste de permissions — à coller dans 权限管理 → import groupé",
+        "copy": "Copier le JSON",
+        "copied": "Copié ✓",
+        "credentials_link": "Ouvrir la page des identifiants (App id / App secret)",
+        "quick_apply_link": "Pré-remplir la demande de toutes les permissions requises",
+        "needAppId": "renseignez d'abord l'App id",
+        "ws_order_note": "Vérifiez l'abonnement aux événements dans la console Feishu : ouvrez 事件与回调 et confirmez que la réception des événements est réglée sur 使用长连接接收事件. Cet avis apparaît tant que WebSocket est connecté et qu'aucun événement entrant n'a été enregistré ; il ne signifie pas à lui seul que la console est mal configurée. Il disparaît après le premier événement."
+      }
     },
     "search": {
       "title": "Recherche web",
@@ -562,6 +872,15 @@
       "outputFormat": "Format de sortie",
       "fallbacks": "Modèles de secours",
       "fallbacksHint": "Identifiants fournisseur/modèle séparés par des virgules, essayés dans l'ordre si le modèle principal échoue."
+    },
+    "capabilities": {
+      "imageStatus": {
+        "missingEnv": "Variable d'environnement {name} manquante. Collez une clé ci-dessous, ou définissez cette variable puis redémarrez la passerelle."
+      },
+      "imageKeyConfigured": "Clé configurée",
+      "imageKeyMissing": "Pas encore configurée",
+      "imageKeyPlaceholderKeep": "Laissez vide pour conserver la clé enregistrée",
+      "imageKeyPlaceholderNew": "Collez votre clé API"
     },
     "audio": {
       "title": "Audio",
@@ -623,6 +942,17 @@
       "revealFailed": "Impossible d'afficher le journal : {error}",
       "restarting": "Redémarrage de l'environnement d'exécution local…",
       "restartFailed": "Échec du redémarrage : {error}",
+      "closeBehaviorLabel": "À la fermeture de la fenêtre principale",
+      "closeBehaviorDesc": "Choisissez le comportement d’OpenSquilla lorsque vous fermez la fenêtre principale.",
+      "closeBehaviorBackground": "Continuer en arrière-plan",
+      "closeBehaviorQuit": "Quitter OpenSquilla",
+      "closeBehaviorAsk": "Toujours demander",
+      "closeBehaviorSaving": "Enregistrement…",
+      "closeBehaviorReadFailed": "Impossible de lire le comportement de fermeture : {error}",
+      "closeBehaviorSaveFailed": "Impossible d’enregistrer le comportement de fermeture : {error}",
+      "closeBehaviorBackgroundUnavailable": "L’exécution en arrière-plan n’est pas disponible sur cette plateforme.",
+      "closeBehaviorFallbackQuit": "L’exécution en arrière-plan n’est pas disponible sur cette plateforme ; fermer la fenêtre quittera donc l’application.",
+      "closeBehaviorRetry": "Réessayer",
       "resetConfirmTitle": "Réinitialiser la configuration enregistrée ?",
       "resetConfirmBody": "Ceci efface l'identifiant de bureau enregistré et la configuration générée. Le prochain lancement relancera la configuration initiale.",
       "resetConfirmPrimary": "Réinitialiser",
@@ -772,9 +1102,9 @@
       "desc": "Préférences client expérimentales pour ce navigateur. Elles s'appliquent immédiatement — aucun enregistrement nécessaire. Les éléments marqués",
       "reload": "recharger",
       "descReloadSuffix": "prennent effet après un rafraîchissement de la page.",
-      "foldLabel": "Pliage des tours en direct",
-      "foldDesc": "Affiche la carte de travail en streaming depuis le nouveau moteur de pliage (désactivé = rendu hérité).",
-      "foldAria": "Pliage des tours en direct (prend effet après rechargement)",
+      "foldLabel": "Nouveau rendu des tours en direct",
+      "foldDesc": "Construit la carte de travail en streaming à partir d'un journal d'événements ordonné. Désactivez-le uniquement pour rétablir temporairement le rendu compatible.",
+      "foldAria": "Nouveau rendu des tours en direct (prend effet après rechargement)",
       "revealLabel": "Fenêtre de révélation de la réponse (ms)",
       "revealDesc": "Maintient la révélation de la réponse en direct dans une fenêtre [min, max] pour que le routeur puisse décider en premier. min ≤ max.",
       "revealMinAria": "Millisecondes minimales de révélation de la réponse",
@@ -786,17 +1116,24 @@
       "experimental": "expérimental",
       "historyMergeDesc": "Lors de la synchro de l'historique, fusionne par id de message et conserve les champs en direct uniquement (désactivé par défaut, en transition vers activé).",
       "historyMergeAria": "Fusion de l'historique par réconciliation d'id (prend effet après rechargement)",
+      "agentConfigLabel": "Configuration des agents (avancée)",
+      "agentConfigDesc": "Gérez les configurations d'agents existantes. Cette zone évoluera lors d'une future refonte multi-agent.",
+      "agentConfigAction": "Ouvrir",
+      "dataMaintenanceLabel": "Maintenance des données",
+      "dataMaintenanceDesc": "Consultez les imports et sauvegardes. Sur ordinateur, vous pouvez aussi réinitialiser ou supprimer les données du profil local.",
+      "dataMaintenanceAction": "Gérer",
+      "dataMaintenanceAria": "Ouvrir la maintenance des données",
       "runTraceLabel": "Tiroir de trace d'exécution dans les Journaux",
       "runTraceDesc": "Rend les lignes de journal interactives et ouvre un tiroir de détail par étape de nœud dans la vue Journaux.",
       "runTraceAria": "Tiroir de trace d'exécution dans les Journaux (prend effet après rechargement)"
     },
     "privacy": {
       "title": "Confidentialité",
-      "statusEnabled": "L'observabilité réseau est activée.",
-      "statusDisabled": "L'observabilité réseau est désactivée.",
-      "statusDisabledByEnv": "L'observabilité réseau est désactivée par l'environnement.",
-      "disableNetworkObservabilityLabel": "Désactiver l'observabilité réseau",
-      "disableNetworkObservabilityDesc": "Arrête les appels d'observabilité réseau de la passerelle, comme la télémétrie d'installation et les vérifications de mise à jour.",
+      "statusEnabled": "Les rapports réseau sont activés.",
+      "statusDisabled": "Les rapports réseau sont désactivés.",
+      "statusDisabledByEnv": "Les rapports réseau sont désactivés par une variable d'environnement.",
+      "disableNetworkObservabilityLabel": "Désactiver les rapports réseau",
+      "disableNetworkObservabilityDesc": "Arrête la télémétrie d'installation, les vérifications de mise à jour en arrière-plan et les identifiants anonymes qui relient les requêtes d'une même session — ces identifiants ne sont envoyés qu'à l'API officielle TokenRhythm. Vos propres requêtes de modèle continuent de fonctionner.",
       "save": "Enregistrer la confidentialité"
     },
     "toast": {
@@ -805,17 +1142,26 @@
       "envNotVisibleGateway": "{envKey} n'est pas visible par ce processus de passerelle.",
       "providerSaved": "Fournisseur enregistré.",
       "providerSavedRestart": "Fournisseur enregistré. Redémarrage requis.",
+      "providerProfileSaved": "{provider} a été enregistré pour le routage.",
+      "providerProfileRemoved": "{provider} a été supprimé.",
+      "providerCredentialRemoved": "Les identifiants de {provider} ont été supprimés.",
+      "providerCredentialExternalStillActive": "La référence aux identifiants de {provider} enregistrée dans OpenSquilla a été supprimée, mais la variable d’environnement système {envKey} fournit toujours des identifiants.",
+      "providerActivated": "{provider} est maintenant actif.",
+      "providerActivatedRouterDisabled": "{provider} est maintenant actif. Le routage des modèles a été désactivé car ses niveaux enregistrés utilisent un autre fournisseur.",
       "behaviorSaved": "Comportement enregistré.",
       "behaviorSavedRestart": "Comportement enregistré. Redémarrage requis.",
       "privacySaved": "Confidentialité enregistrée.",
       "privacySavedRestart": "Confidentialité enregistrée. Redémarrage requis.",
       "chooseProviderRouter": "Choisissez un fournisseur avant d'enregistrer les niveaux du routeur.",
+      "chooseFixedModel": "Choisissez un modèle fixe avant d’enregistrer.",
       "routerSaved": "Routeur enregistré.",
       "routerSavedRestart": "Routeur enregistré. Redémarrage requis.",
       "ensembleSaved": "Ensemble enregistré.",
       "presetApplied": "Préréglage de routage appliqué.",
       "presetAppliedRestart": "Préréglage de routage appliqué. Redémarrage requis.",
-      "channelSaved": "Canal enregistré. Redémarrage requis.",
+      "channelSaved": "Canal enregistré — configuration validée localement ; utilisez « Tester la connexion » pour vérifier les identifiants",
+      "channelSavedLive": "Canal enregistré et appliqué — actif avec la nouvelle configuration",
+      "channelStartFailed": "Canal enregistré, mais son démarrage a échoué — consultez son statut pour l'erreur, puis réessayez avec Redémarrer",
       "searchSaved": "Recherche enregistrée.",
       "memorySurface": "Embedding de mémoire",
       "memorySaved": "Mémoire enregistrée.",
@@ -830,8 +1176,11 @@
       "copiedCommand": "Commande copiée",
       "copiedPath": "Chemin copié",
       "channelRemoved": "Canal supprimé. Redémarrage requis.",
+      "channelRemovedLive": "Canal supprimé et arrêté.",
       "channelEnabled": "Canal activé. Redémarrage requis.",
-      "channelDisabled": "Canal désactivé. Redémarrage requis."
+      "channelEnabledLive": "Canal activé et démarré.",
+      "channelDisabled": "Canal désactivé. Redémarrage requis.",
+      "channelDisabledLive": "Canal désactivé et arrêté."
     },
     "needs": {
       "noApiKey": "Aucune clé API requise.",
@@ -876,6 +1225,199 @@
         "insufficient_class_diversity": "Pas encore entraîné — les corrections couvrent trop peu de niveaux de routage"
       },
       "detachedNote": "Les poids de base du routage ont été mis à niveau. L’apprentissage bâti sur les anciens poids a été archivé ; vos corrections sont conservées et seront réapprises automatiquement sur les nouveaux poids. Aucune action requise."
+    },
+    "field": {
+      "keepCurrentPlaceholder": "laisser vide pour conserver la valeur actuelle",
+      "secretComposePlaceholder": "Collez le jeton ou le secret"
+    },
+    "channelCatalog": {
+      "fields": {
+        "group_session_scope": {
+          "label": "Portée de session de groupe",
+          "choices": {
+            "per_sender": "Par expéditeur",
+            "shared_room": "Salon partagé"
+          }
+        },
+        "busy_input_mode": {
+          "label": "Saisie pendant l'exécution"
+        },
+        "dm_access": {
+          "label": "Accès aux messages privés"
+        },
+        "pairing_approved_notice": {
+          "label": "Prévenir l'expéditeur après approbation"
+        },
+        "allowed_senders": {
+          "label": "Ids d'expéditeurs autorisés"
+        },
+        "status_reactions_enabled": {
+          "label": "Réactions d'état des messages"
+        },
+        "api_base": {
+          "label": "Base d'API"
+        },
+        "name": {
+          "label": "Nom du canal",
+          "description": "Identifiant unique de cette entrée de canal."
+        },
+        "agent_id": {
+          "label": "Id d'agent"
+        },
+        "enabled": {
+          "label": "Activé"
+        },
+        "default_chat_id": {
+          "label": "Id de discussion par défaut"
+        },
+        "connection_mode": {
+          "label": "Mode de connexion",
+          "choices": {
+            "webhook": "Webhook (rappel)",
+            "websocket": "WebSocket (connexion longue)"
+          }
+        },
+        "app_id": {
+          "label": "App id"
+        },
+        "app_secret": {
+          "label": "App secret"
+        },
+        "signing_secret": {
+          "label": "Secret de signature"
+        },
+        "client_id": {
+          "label": "ID client"
+        },
+        "client_secret": {
+          "label": "Secret client"
+        },
+        "bot_id": {
+          "label": "ID du bot"
+        },
+        "bot_secret": {
+          "label": "Secret du bot"
+        },
+        "corp_secret": {
+          "label": "Secret d'entreprise"
+        },
+        "homeserver_url": {
+          "label": "URL du homeserver"
+        },
+        "user_id": {
+          "label": "ID utilisateur ({'@'}user:server)"
+        },
+        "debounce_window_s": {
+          "label": "Fenêtre de regroupement (s)"
+        },
+        "transport_name": {
+          "choices": {
+            "polling": "Interrogation (polling)",
+            "webhook": "Webhook"
+          }
+        }
+      },
+      "groups": {
+        "basic": "Général",
+        "credentials": "Identifiants",
+        "webhook": "Webhook",
+        "behavior": "Comportement",
+        "access": "Accès",
+        "polling": "Interrogation"
+      },
+      "dingtalk": {
+        "label": "DingTalk",
+        "description": "Robot d'entreprise DingTalk via connexion stream.",
+        "needs": [
+          "Client id.",
+          "Client secret."
+        ]
+      },
+      "discord": {
+        "fields": {
+          "token": {
+            "label": "Jeton du bot"
+          }
+        },
+        "description": "Bot Discord utilisant le websocket gateway.",
+        "needs": [
+          "Jeton du bot."
+        ]
+      },
+      "feishu": {
+        "label": "Feishu / Lark",
+        "fields": {
+          "domain": {
+            "label": "Région",
+            "description": "Choisissez la console qui a émis cet App ID.",
+            "choices": {
+              "feishu": "Feishu (Chine)",
+              "lark": "Lark (international)"
+            }
+          }
+        },
+        "description": "Bot Feishu (ou Lark) — connexion webhook ou websocket.",
+        "needs": [
+          "App id.",
+          "App secret."
+        ]
+      },
+      "matrix": {
+        "description": "Client de homeserver Matrix (sync long-poll).",
+        "needs": [
+          "URL du homeserver.",
+          "Id utilisateur (@user:server).",
+          "Installer l'extra matrix optionnel."
+        ]
+      },
+      "qq": {
+        "label": "Bot QQ",
+        "description": "Bot QQ de Tencent via websocket.",
+        "needs": [
+          "App id.",
+          "App secret."
+        ]
+      },
+      "slack": {
+        "fields": {
+          "token": {
+            "label": "Jeton du bot"
+          },
+          "connection_mode": {
+            "choices": {
+              "socket": "Socket Mode",
+              "webhook": "Webhook (rappel)"
+            }
+          }
+        },
+        "description": "Bot d'espace Slack — mode Socket (websocket) ou webhook Events API.",
+        "needs": [
+          "Jeton du bot (xoxb-…).",
+          "Secret de signature."
+        ]
+      },
+      "telegram": {
+        "fields": {
+          "token": {
+            "label": "Jeton du bot"
+          }
+        },
+        "description": "API Bot Telegram — transport polling ou webhook.",
+        "needs": [
+          "Jeton du bot."
+        ]
+      },
+      "wecom": {
+        "label": "WeCom",
+        "description": "Bot IA WeChat Entreprise via websocket, ou rappel webhook d'app d'entreprise.",
+        "needs": [
+          "Corp id.",
+          "Corp secret.",
+          "Agent id (entier).",
+          "Jeton.",
+          "Clé AES d'encodage."
+        ]
+      }
     }
   },
   "sessions": {
@@ -885,6 +1427,7 @@
     "refreshing": "Actualisation…",
     "loading": "Chargement des sessions…",
     "unknownAgent": "Agent inconnu",
+    "deletedAgent": "Agent supprimé · {id}",
     "msgCount": "{count} msg",
     "error": {
       "load": "Impossible de charger les sessions."
@@ -958,6 +1501,8 @@
       "ariaLabel": "Nécessite votre attention",
       "allClear": "Tout est en ordre",
       "costToday": "{amount} aujourd'hui",
+      "costTodayLabel": "Coût aujourd’hui",
+      "costTotal": "{amount} au total",
       "needsApproval": "Approbation requise",
       "openBlocked": "ouvrir la session bloquée →",
       "nothingWaiting": "rien n'attend de vous",
@@ -1006,8 +1551,8 @@
       "abortFailed": "Échec de l'abandon."
     },
     "overview": {
-      "title": "Vue d'ensemble",
-      "subtitle": "État en direct, sessions récentes et flux d'événements.",
+      "title": "État",
+      "subtitle": "Préparation, utilisation et santé d'exécution.",
       "openChat": "Ouvrir le chat",
       "totalTokens": "Total des jetons",
       "totalSessions": "Total des sessions",
@@ -1037,25 +1582,9 @@
       "findingFallback": "Constat {n}",
       "copyCommand": "Copier la commande",
       "step": "Étape",
-      "recentActivity": "Activité récente",
-      "viewAllArrow": "Tout voir →",
-      "noSessions": "Aucune session pour l'instant — ouvrez le chat pour démarrer la première.",
-      "connection": "Connexion",
-      "gateway": "Passerelle",
-      "connHint": "L'URL WebSocket et le jeton de la passerelle se trouvent désormais dans les Paramètres.",
-      "manageConnection": "Gérer la connexion dans les Paramètres →",
-      "live": "En direct",
-      "eventStream": "Flux d'événements",
-      "eventCount": "{count} événements",
-      "listening": "À l'écoute des événements…",
       "checking": "Vérification",
       "waitingDoctor": "En attente de doctor.status",
       "healthUnavailable": "Rapport de santé de la passerelle indisponible",
-      "conn": {
-        "connecting": "connexion en cours",
-        "connected": "connecté",
-        "disconnected": "déconnecté"
-      },
       "impact": {
         "blocksReady": "Bloque la préparation",
         "degrades": "Dégrade",
@@ -1126,7 +1655,7 @@
       "copyDiagnostics": "Copier le JSON de diagnostic",
       "copiedDiagnostics": "JSON de diagnostic copié",
       "diagnoseWithAgent": "Diagnostiquer avec l'agent",
-      "diagnosePrompt": "Veuillez diagnostiquer cette configuration OpenSquilla à l'aide du rapport doctor ci-dessous ; proposez la cause racine et des étapes de correction minimales ; n'exécutez pas de commandes destructrices.",
+      "diagnosePrompt": "Veuillez diagnostiquer cette configuration OpenSquilla à l'aide du contexte client et du rapport doctor ci-dessous. Privilégiez les réglages applicables dans l'app. Lorsque hasTerminalWorkflow vaut false, ne proposez pas de commandes opensquilla brutes ; un gateway Desktop détenu est géré par l'app. Un transfert de données signifie une sauvegarde suivie d'un remplacement complet, jamais une fusion. Une migration facultative n'est pas une panne et peut rester visible après le transfert. Contentez-vous d'expliquer et de guider : ne migrez pas les données, ne redémarrez pas le gateway, n'écrivez pas de réglages et ne prétendez pas avoir effectué des changements.",
       "environment": "Environnement",
       "latency": "Latence"
     }
@@ -1136,7 +1665,9 @@
       "refresh": "Actualiser",
       "edit": "Modifier",
       "delete": "Supprimer",
-      "confirm": "Confirmer"
+      "confirm": "Confirmer",
+      "refreshing": "Actualisation…",
+      "retry": "Réessayer"
     },
     "agents": {
       "title": "Agents",
@@ -1206,35 +1737,231 @@
     },
     "channels": {
       "title": "Canaux",
-      "subtitle": "État d'exécution des canaux configurés. Ajoutez ou modifiez la configuration des canaux dans les Paramètres ou la CLI.",
-      "settingsHint": "La configuration des canaux se trouve dans les Paramètres",
-      "openSettings": "Ouvrir les paramètres",
-      "totalChannels": "Total des canaux",
-      "typeCount": "{n} types",
-      "connected": "Connectés",
-      "live": "en direct",
-      "unhealthy": "{n} en mauvaise santé",
-      "allIdle": "tous inactifs",
-      "inactive": "Inactifs",
-      "needAttention": "{n} nécessitent votre attention",
-      "restartAttempts": "Tentatives de redémarrage",
-      "sinceGatewayStart": "depuis le démarrage de la passerelle",
+      "subtitle": "État d'exécution des canaux configurés. Ajoutez, modifiez et associez des canaux directement ici, ou utilisez la CLI.",
       "configuredChannels": "Canaux configurés",
       "unknown": "Inconnu",
-      "adapterConfig": "Configuration de l'adaptateur",
       "emptyTitle": "Aucun canal configuré.",
-      "emptyMsg": "Le provisionnement des canaux se trouve dans les Paramètres et la CLI afin que les identifiants, les extras de dépendances, les URL de webhook et les exigences de redémarrage restent explicites.",
-      "openSettingsBtn": "Ouvrir les paramètres",
+      "emptyMsg": "Aucun canal pour l'instant. Connectez Slack, Telegram, Discord et plus encore pour que votre agent discute là où travaille votre équipe.",
       "loadFailed": "Échec du chargement des canaux",
-      "noInactive": "aucun canal inactif",
-      "disabledCount": "{n} désactivé(s)",
-      "configuredButIdle": "configuré mais inactif",
-      "hintDisabled": "Désactivé dans la configuration — redémarrage de la passerelle requis après réactivation. Exécutez `opensquilla onboard configure channels` pour modifier.",
-      "hintDead": "L'adaptateur est mort. Inspectez les journaux de la passerelle, puis `{cmd}`.",
-      "hintRunning": "L'adaptateur est en direct dans le processus de passerelle actuel.",
-      "hintRestarting": "L'adaptateur redémarre après des erreurs de répartition.",
-      "hintExhausted": "L'adaptateur a épuisé son budget de nouvelles tentatives. Essayez `{cmd}`.",
-      "hintConfiguredInactive": "Configuré sur le disque mais non actif dans ce processus de passerelle — redémarrez la passerelle pour le charger."
+      "addChannel": "Ajouter un canal",
+      "addFirstChannel": "Ajouter votre premier canal",
+      "detailLabel": "Détails du canal {name}",
+      "detailSections": "Sections des détails du canal",
+      "testConnection": "Tester",
+      "testing": "Test en cours…",
+      "restart": "Redémarrer",
+      "edit": "Modifier",
+      "enable": "Activer",
+      "disable": "Désactiver",
+      "notReported": "Non communiqué",
+      "tabs": {
+        "overview": "Vue d'ensemble",
+        "pairings": "Membres",
+        "capabilities": "Fonctionnalités",
+        "diagnostics": "Diagnostics",
+        "configuration": "Configuration"
+      },
+      "editor": {
+        "editConfiguration": "Modifier la configuration",
+        "edited": "Modifié",
+        "unsavedAria": "Modifications non enregistrées",
+        "unsavedSummary": "Non enregistré — {fields}",
+        "moreFields": "+{count} autres",
+        "discardQuestion": "Abandonner les modifications non enregistrées ?",
+        "keepEditing": "Continuer l'édition",
+        "discard": "Abandonner",
+        "saving": "Enregistrement…",
+        "saveAnyway": "Enregistrer quand même",
+        "saveFailed": "Échec de l'enregistrement : {error}",
+        "probeValid": "Vérifications de configuration réussies",
+        "probeRunning": "Vérification du brouillon…",
+        "probeLatency": "{ms} ms",
+        "storedSecret": "Stocké ······",
+        "otherSettings": "Autres réglages",
+        "unknownType": "Aucun formulaire d'édition pour ce type de canal ({type}) ; modifiez l'entrée dans le fichier de configuration.",
+        "entryMissing": "Canal {name} introuvable dans la configuration.",
+        "editIntro": "Les modifications s'appliquent à l'enregistrement. Un champ secret vide conserve la valeur stockée.",
+        "boolOn": "Activé",
+        "boolOff": "Désactivé"
+      },
+      "compose": {
+        "back": "Canaux",
+        "galleryLabel": "Choisir une plateforme",
+        "change": "Changer",
+        "discardQuestion": "Abandonner le brouillon {platform} ?",
+        "catalogFailed": "Impossible de charger le catalogue de plateformes : {error}",
+        "addPlatform": "Ajouter {platform}"
+      },
+      "probeVerified": "Connexion vérifiée",
+      "probeUnsupported": "Test de connexion en direct indisponible",
+      "probeLatency": "Fournisseur vérifié en {ms} ms.",
+      "probeNoDetail": "Le fournisseur n'a renvoyé aucun détail supplémentaire.",
+      "implemented": "Implémenté",
+      "declaredOnly": "Déclaré uniquement",
+      "methodEvidence": "Pris en charge par : {methods}",
+      "liveVerified": "Vérifié en conditions réelles par le fournisseur",
+      "declarationEvidence": "Déclaré par l'adaptateur ; validation en conditions réelles en attente",
+      "noCapabilityEvidence": "Cet adaptateur n'a publié aucune preuve de fonctionnalité.",
+      "lastError": "Dernière erreur",
+      "acceptedIngress": "Entrées acceptées",
+      "processingIngress": "Entrées en cours de traitement",
+      "confirmedOutbound": "Sorties confirmées",
+      "savedConfiguration": "Configuration enregistrée",
+      "secretRedactionHint": "Les secrets stockés ne sont jamais affichés. Utilisez Modifier puis Remplacer pour saisir une nouvelle valeur.",
+      "toastProbePassed": "{name} vérifié en {ms} ms",
+      "toastProbeUnsupported": "{name} ne prend pas en charge les tests en direct sécurisés",
+      "toastProbeFailed": "Impossible de tester {name} : {error}",
+      "toastRestarted": "{name} redémarré",
+      "toastRestartFailed": "Impossible de redémarrer {name} : {error}",
+      "toastEnabled": "{name} activé ; redémarrez la passerelle pour appliquer la modification",
+      "toastDisabled": "{name} désactivé ; redémarrez la passerelle pour appliquer la modification",
+      "toastToggleFailed": "Impossible de mettre à jour {name} : {error}",
+      "pairings": {
+        "title": "Membres",
+        "description": "Vérifiez qui peut démarrer des conversations sur ce canal. Les approbations ne s’appliquent qu’à ce canal.",
+        "refresh": "Actualiser",
+        "summaryLabel": "Résumé des membres",
+        "pending": "En attente",
+        "approved": "Approuvé",
+        "loading": "Chargement des membres…",
+        "tryAgain": "Réessayer",
+        "emptyTitle": "Aucun membre pour l'instant",
+        "emptyDescription": "Les nouvelles demandes et les expéditeurs approuvés apparaîtront ici.",
+        "pendingRequests": "Demandes en attente",
+        "approvedAccess": "Accès approuvé",
+        "requestCode": "Demande {code}",
+        "requestedAt": "Demandé {time}",
+        "approvedAt": "Approuvé {time}",
+        "approve": "Approuver",
+        "approving": "Approbation…",
+        "revoke": "Révoquer",
+        "revoking": "Révocation…",
+        "approveLabel": "Approuver l’accès de {sender}",
+        "revokeLabel": "Révoquer l’accès de {sender}",
+        "approveConfirmTitle": "Approuver la demande d’association ?",
+        "approveConfirmBody": "Accorder à {sender} l'accès à {channel} ? Le bot lui indiquera qu'elle peut commencer à discuter.",
+        "revokeConfirmTitle": "Révoquer l’accès associé ?",
+        "revokeConfirmBody": "Retirer l’accès de {sender} à {channel} ? Une nouvelle approbation sera nécessaire avant une autre conversation.",
+        "loadFailed": "Impossible de charger les accès associés : {error}",
+        "approveSuccess": "Accès associé approuvé pour {sender}",
+        "revokeSuccess": "Accès associé révoqué pour {sender}",
+        "approveFailed": "Impossible d’approuver {sender} : {error}",
+        "revokeFailed": "Impossible de révoquer {sender} : {error}",
+        "revoked": "Révoqué",
+        "revokedAccess": "Accès révoqué",
+        "reapprove": "Ré-approuver",
+        "reapproveLabel": "Ré-approuver l'accès de {sender}",
+        "pendingBadge": "{count} demandes d'appairage en attente",
+        "searchLabel": "Rechercher des appairages",
+        "searchPlaceholder": "Rechercher par nom ou code d'appairage",
+        "adminPill": "Admin",
+        "setAsAdmin": "Définir comme admin",
+        "removeAdmin": "Retirer l'admin",
+        "updatingAdmin": "Mise à jour…",
+        "setAsAdminLabel": "Faire de {sender} un admin du canal",
+        "removeAdminLabel": "Retirer les droits d'admin de {sender}",
+        "asAdmin": "en tant qu'admin",
+        "asAdminHint": "Approuver avec l'accès complet aux outils plutôt qu'un accès membre.",
+        "asAdminCheckboxLabel": "Approuver {sender} en tant qu'admin du canal",
+        "adminsSubtitle": "Admins",
+        "adminOnlyHint": "Admin ajouté directement",
+        "membersHint": "Les membres peuvent discuter et utiliser les outils sûrs. Les admins disposent de tous les outils, avec une confirmation par commande pour les actions privilégiées.",
+        "approveAdminSuccess": "{sender} approuvé comme admin du canal",
+        "adminGrantFailedAfterApprove": "{sender} a été approuvé, mais l'attribution admin a échoué — réessayez depuis la liste des membres.",
+        "approveAdminConfirmBody": "Accorder à {sender} un accès admin à {channel} ? Il obtient tous les outils et le bot l'informera qu'il peut commencer à discuter.",
+        "setAsAdminConfirmTitle": "Faire de ce membre un admin ?",
+        "setAsAdminConfirmBody": "Donner à {sender} tous les outils sur {channel} ? Les actions privilégiées demandent toujours une confirmation par commande.",
+        "removeAdminConfirmTitle": "Retirer l'accès admin ?",
+        "removeAdminConfirmBody": "Ramener {sender} à un accès membre sur {channel} ? Il peut toujours discuter et utiliser les outils sûrs.",
+        "adminGrantedSuccess": "{sender} est désormais admin du canal",
+        "adminRemovedSuccess": "Droits d'admin retirés à {sender}",
+        "adminUpdateFailed": "Impossible de mettre à jour l'accès admin pour {sender} : {error}",
+        "asAdminBootstrap": "C'est moi — définir comme admin"
+      },
+      "probeFailed": "Échec du test de connexion",
+      "editCredentials": "Modifier les identifiants",
+      "toastProbeFailedResult": "{name} a échoué au test de connexion : {detail}",
+      "restartNotLoaded": "Ce canal n'est pas encore chargé — redémarrez la passerelle pour le démarrer",
+      "removeChannel": "Supprimer",
+      "queryNotFound": "Canal {name} introuvable — il a peut-être été supprimé.",
+      "queryNotFoundDismiss": "Fermer",
+      "needsReview": "À vérifier",
+      "worksHint": "Fonctionnalités de la plateforme prises en charge, à configurer ou impossibles pour ce type de canal.",
+      "maturityHint": "Niveau de complétude de cet adaptateur par rapport à l'API complète du fournisseur",
+      "supported": "Pris en charge",
+      "notSupported": "Non pris en charge",
+      "needsConfig": "À configurer",
+      "messageDelivery": "Livraison des messages",
+      "connectionOwner": "Propriétaire de la connexion du compte",
+      "owner": "Propriétaire",
+      "ownerHere": "Cette passerelle détient la connexion",
+      "ownerNone": "Aucune passerelle ne détient actuellement la connexion",
+      "lastTest": "Dernier test",
+      "category": {
+        "chat": "Discussion",
+        "files": "Fichiers",
+        "media": "Médias",
+        "attachments": "Pièces jointes",
+        "threads": "Fils",
+        "cards": "Cartes",
+        "docs": "Documents",
+        "drive": "Drive",
+        "wiki": "Wiki",
+        "permissions": "Autorisations",
+        "scopes": "Portées"
+      },
+      "staleData": "Le statut peut être obsolète — dernière mise à jour {time}.",
+      "unconfiguredTitle": "En cours d'exécution mais absent de la configuration",
+      "unconfiguredHint": "Ces canaux s'exécutent dans cette passerelle mais ne figurent pas dans la configuration enregistrée.",
+      "maturityValue": {
+        "experimental": "Expérimental",
+        "stable": "Stable",
+        "shipping": "Livré",
+        "unrated": "Non évalué"
+      },
+      "opsActionsLabel": "Actions d'exécution",
+      "configActionHint": "Écrit la configuration — prend effet après un redémarrage de la passerelle",
+      "home": {
+        "connectedFor": "Durée active",
+        "membersFact": "Membres",
+        "adminsFact": "Admins",
+        "pendingCount": "{count} en attente",
+        "details": "Détails",
+        "pendingRequest": "{sender} demande un appairage · code {code}",
+        "reject": "Refuser",
+        "rejectLabel": "Refuser la demande d'appairage de {sender}",
+        "rejectSuccess": "Demande d'appairage de {sender} refusée",
+        "rejectFailed": "Impossible de refuser {sender} : {error}",
+        "fixCredentials": "Corriger les identifiants",
+        "galleryLead": "Choisissez une plateforme pour commencer",
+        "awaitingFact": "En attente",
+        "folio": {
+          "allConnected": "Tous connectés",
+          "connectedRatio": "{ratio} connectés",
+          "down": "{count} en panne",
+          "updated": "Mis à jour {time}",
+          "rosterLabel": "Plateformes en service : {names}"
+        },
+        "enroll": {
+          "title": "Connecter une plateforme",
+          "chip": "Ajouter {platform}"
+        }
+      },
+      "detail": {
+        "bot": "Bot {id}",
+        "connectedFor": "Durée active {duration}",
+        "restarts": "{count} redémarrage | {count} redémarrages",
+        "capabilityReference": "Référence des capacités",
+        "copyBotId": "Copier l'ID du bot : {id}",
+        "botIdCopied": "ID du bot copié",
+        "eventSubscriptionTitle": "Vérifier l'abonnement aux événements Feishu"
+      }
+    },
+    "overview": {
+      "channelsChip": "Canaux",
+      "channelsChipConnected": "{connected} connecté(s)",
+      "channelsChipFailed": "{failed} en échec",
+      "channelsChipPending": "{pending} en attente d'approbation"
     }
   },
   "cronSkills": {
@@ -1492,6 +2219,15 @@
       "subtitle": "Capacités d'agent composables : compétences OpenSquilla intégrées plus packs locaux gérés, personnels, de projet et d'espace de travail.",
       "filterPlaceholder": "Filtrer les compétences...",
       "refresh": "Actualiser",
+      "reload": "Recharger le catalogue",
+      "refreshing": "Rechargement du catalogue…",
+      "reloadSummary": "Ajoutées : {added}, supprimées : {removed}, modifiées : {modified}.",
+      "reloadSuccess": "Le catalogue de compétences a été rechargé à la génération {generation}. {summary}",
+      "reloadNoChanges": "Le catalogue de compétences est déjà à jour (génération {generation}).",
+      "reloadPartial": "Le catalogue de compétences a été rechargé à la génération {generation} avec {errors} erreur(s). {summary}",
+      "reloadFailed": "Échec du rechargement du catalogue de compétences : {error}",
+      "reloadListFailed": "Le catalogue a été rechargé, mais la liste actualisée des compétences n’a pas pu être chargée.",
+      "reloadUnknownError": "La Gateway a conservé le catalogue précédent.",
       "tabsLabel": "Source des compétences",
       "tabInstalled": "Installées",
       "tabCommunity": "Communauté",
@@ -1570,7 +2306,13 @@
     },
     "skillCard": {
       "subSkillsTitle": "Sous-compétences utilisées par cette méta-compétence",
-      "uses": "utilise"
+      "uses": "utilise",
+      "dependencies": "Dépendances déclarées",
+      "pythonCount": "Paquets Python : {count}",
+      "binaryCount": "Binaires : {count}",
+      "envCount": "Variables d’environnement : {count}",
+      "missingCount": "Dépendances manquantes : {count}",
+      "advisoryCount": "Avis : {count}"
     },
     "skillDetail": {
       "triggers": "Déclencheurs",
@@ -1585,7 +2327,26 @@
       "loadingContent": "Chargement de SKILL.md...",
       "emptyContent": "Aucun contenu SKILL.md disponible.",
       "removing": "Suppression...",
-      "remove": "Supprimer"
+      "remove": "Supprimer",
+      "declaredDependencies": "Dépendances déclarées",
+      "pythonPackages": "Paquets Python",
+      "binaries": "Binaires",
+      "environment": "Environnement",
+      "pythonPackage": "Paquet Python",
+      "binaryAny": "Un binaire au choix",
+      "envAny": "Une variable d’environnement au choix",
+      "noDeclaredDependencies": "Aucune dépendance déclarée.",
+      "advisories": "Avis",
+      "notReadiness": "Les éléments déduits sont indicatifs et n’affectent pas l’état de préparation.",
+      "inferredPython": "Déduit de {source}",
+      "inferredEnv": "Variable d’environnement déduite",
+      "scanAdvisory": "Avis de l’analyse des dépendances",
+      "subSkillRollup": "Synthèse des dépendances de méta-compétence",
+      "subSkillStatus": "{missing} manquantes · {advisory} avis",
+      "missingSubSkill": "La sous-compétence référencée est indisponible",
+      "installUnavailable": "Aucun programme d’installation ne correspond aux dépendances manquantes.",
+      "installIncomplete": "{count} dépendances nécessitent encore votre attention.",
+      "installComplete": "Les dépendances sont prêtes."
     },
     "registry": {
       "searchPlaceholder": "Rechercher des compétences communautaires...",
@@ -1653,6 +2414,36 @@
       "awaitingReview": "en attente d'examen"
     }
   },
+  "monitorSupport": {
+    "title": "Assistance et diagnostic",
+    "menuLabel": "Actions d’assistance et de diagnostic",
+    "viewLogs": "Voir les journaux d'exécution",
+    "viewLogsDescription": "Examiner les sorties récentes et les erreurs de la passerelle",
+    "copyReport": "Copier le rapport d’état actuel",
+    "copyReportDescription": "Partager l’état actuel de la connexion, de la configuration et de l’exécution",
+    "copySuccess": "Rapport d’état copié",
+    "copyFailed": "Impossible de copier le rapport d’état : {error}",
+    "downloadBundle": "Télécharger le paquet d’assistance expurgé",
+    "downloadBundleDescription": "Inclut les journaux, un résumé de la configuration et les résultats du diagnostic",
+    "privacySummary": "Le contenu des conversations est exclu par défaut et les identifiants connus sont masqués",
+    "bundleTitle": "Télécharger le paquet d’assistance expurgé",
+    "bundleSubtitle": "Créez un fichier ZIP à partager avec l’assistance OpenSquilla.",
+    "bundleDefaultIncludes": "Inclus par défaut",
+    "bundleReadiness": "Instantané de l’état de préparation et du diagnostic",
+    "bundleConfig": "Résumé expurgé de la configuration",
+    "bundleLogs": "Erreurs, journaux et informations de trace",
+    "bundlePlatform": "Informations de version et de plateforme",
+    "bundleScopeTitle": "Enregistrements de diagnostic récents (1 jour maximum)",
+    "bundleScopeBody": "Les erreurs et les traces couvrent au maximum un jour ; les journaux d’exécution suivent la rotation locale, la période réelle peut donc différer.",
+    "bundleIncludeContentTitle": "Inclure le contenu des conversations",
+    "bundleIncludeContentBody": "Activez cette option uniquement à la demande explicite de l’assistance ; elle peut inclure des informations professionnelles sensibles.",
+    "bundleCredentialsTitle": "Les champs d’identifiants connus sont masqués",
+    "bundleCredentialsBody": "Les clés API, les jetons et les autres valeurs secrètes reconnues sont masqués avant la création du paquet.",
+    "bundleConfirm": "Générer et télécharger",
+    "bundleCancel": "Annuler",
+    "bundleFailed": "Échec du téléchargement du paquet d’assistance",
+    "bundleReady": "Paquet d’assistance téléchargé"
+  },
   "usageLogs": {
     "usage": {
       "title": "Utilisation",
@@ -1680,7 +2471,20 @@
       "cacheWrite": "Écriture cache"
     },
     "costHintTitle": "Les valeurs en CNY utilisent le taux intégré {rate}. Vérifiez par rapport au taux de change actuel pour un usage comptable.",
+    "nativeCostHintTitle": "La facture d’origine du fournisseur est en CNY ; la valeur USD utilise le taux fixe enregistré sur le reçu.",
+    "nativeMixedCostHintTitle": "La facturation multidevise ou en attente reste en USD canonique ; les reçus d’origine confirmés sont affichés séparément.",
+    "nativeBillingSubtotals": "Reçus d’origine : {amounts}",
     "rangeHiddenHint": "{count} sessions héritées sans date masquées",
+    "coverage": {
+      "approximate": "Ancienne Gateway : les plages de dates sont estimées à partir des totaux de session.",
+      "partial": "La migration du registre d’usage continue ; tout l’usage connu est affiché.",
+      "timezoneFallback": "Le fuseau {requested} est invalide ; les dates sont regroupées selon {effective}.",
+      "legacyIncluded": "L’usage antérieur au registre est inclus dans le total, sans pouvoir être attribué à une date.",
+      "estimated": "Inclut {count} appels estimés.",
+      "unpriced": "Le coût connu est affiché ; {count} appels n’ont pas de prix, le coût est donc incomplet.",
+      "pendingBilling": "{count} reçus fournisseur sont en attente de règlement.",
+      "nativeBillingMissing": "Il manque le reçu en devise d’origine pour {count} appels facturés."
+    },
     "chart": {
       "metric": "Métrique du graphique",
       "dateRange": "Plage de dates",
@@ -1692,6 +2496,7 @@
       "output": "Sortie",
       "emptyWindow": "Aucune donnée dans la fenêtre sélectionnée.",
       "openSession": "Ouvrir {session}",
+      "daily": "Utilisation quotidienne",
       "topByCost": "Principales sessions par coût",
       "topByTokens": "Principales sessions par total de jetons",
       "showingOf": "affichage de {shown} sur {total}"
@@ -1780,7 +2585,7 @@
       "loadFailed": "Échec du chargement de l'utilisation"
     },
     "logs": {
-      "eyebrow": "Contrôle · Journaux",
+      "breadcrumbLabel": "Fil d’Ariane",
       "title": "Journaux",
       "subtitle": "Flux de journaux de passerelle en direct — filtrez et suivez.",
       "statusUnavailable": "État des journaux indisponible",
@@ -1817,6 +2622,9 @@
       "filterPlaceholder": "Filtrer les messages…",
       "autoFollow": "Suivi automatique",
       "loading": "Chargement des journaux…",
+      "empty": "Aucun journal d'exécution pour le moment.",
+      "loadFailed": "Impossible de charger les journaux d'exécution.",
+      "retry": "Réessayer",
       "noMatch": "Aucune ligne ne correspond au filtre actuel.",
       "lineDetail": "Détail de la ligne de journal",
       "ofLoadedFoot": "{visible} affichées · {total} en mémoire"
@@ -1833,6 +2641,8 @@
     "placeholder": "Envoyer un message...",
     "placeholderCompact": "Message...",
     "placeholderLanding": "Assignez une tâche ou demandez n'importe quoi",
+    "aiDisclaimer": "Contenu généré par l’IA, fourni à titre indicatif. Vérifiez les informations importantes.",
+    "aiGeneratedLabel": "Contenu généré par l’IA, fourni à titre indicatif.",
     "removeAttachment": "Supprimer la pièce jointe",
     "remove": "Supprimer",
     "attachFiles": "Joindre des fichiers",
@@ -1864,6 +2674,7 @@
     "copied": "Copié",
     "copy": "Copier",
     "copySessionKey": "Copier la clé de session",
+    "sessionActions": "Actions de la session",
     "share": "Partager",
     "shareSendFirst": "Envoyez d'abord un message pour partager",
     "shareSelectHint": "Sélectionnez des bulles à enregistrer comme image de partage",
@@ -1894,6 +2705,9 @@
     "open": "Ouvrir",
     "downloadTitle": "Télécharger {title}",
     "download": "Télécharger",
+    "playAudio": "Lire l’audio",
+    "audioLoadFailed": "Impossible de charger l’audio.",
+    "audioUnsupported": "Ce navigateur ne peut pas lire ce format audio. Téléchargez plutôt le fichier.",
     "previewOf": "Aperçu : {title}",
     "closePreview": "Fermer l'aperçu",
     "previousImage": "Image précédente",
@@ -1918,6 +2732,7 @@
     "latest": "Le plus récent",
     "thinking": "Réflexion",
     "thoughtProcess": "Processus de réflexion",
+    "thinkingForSeconds": "Réflexion · {seconds} s",
     "thoughtForSeconds": "A réfléchi pendant {seconds} s",
     "thoughtForMinutes": "A réfléchi pendant {minutes} min {seconds} s",
     "toolResult": "Résultat de l'outil",
@@ -1927,6 +2742,27 @@
     "sandboxPausedResume": "Reprendre l'exécution",
     "sandboxResumed": "Exécution autonome reprise. Renvoyez votre demande pour continuer.",
     "sandboxResumeFailed": "Impossible de reprendre l'exécution : {error}",
+    "warning": {
+      "default": "L’agent a signalé un avertissement."
+    },
+    "provenance": {
+      "cron": "Cron",
+      "scheduled": "Planifié",
+      "cronSource": "Planifié par {tool}"
+    },
+    "sandboxSetup": {
+      "settingUp": "Configuration en cours…",
+      "settingUpTitle": "Configuration de Windows Sandbox",
+      "failedTitle": "Échec de la configuration de Windows Sandbox",
+      "unavailableTitle": "Configuration de la sandbox indisponible",
+      "requiredTitle": "Configuration de Windows Sandbox requise",
+      "settingUpBody": "OpenSquilla prépare l’environnement isolé. Cela peut prendre un moment.",
+      "failedBody": "L’environnement isolé n’a pas pu être préparé. Réessayez lorsque vous êtes prêt.",
+      "unavailableBody": "La configuration de la sandbox est indisponible sur ce système. Votre mode d’exécution n’a pas été modifié.",
+      "requiredBody": "Configurez Windows Sandbox avant d’utiliser ce mode d’exécution.",
+      "retry": "Réessayer",
+      "setup": "Configurer"
+    },
     "usageDetails": "Détails d'utilisation",
     "regenerate": "Régénérer",
     "forkConversation": "Bifurquer la conversation",
@@ -1936,6 +2772,7 @@
     "aiModelRouter": "Routeur de modèle IA",
     "aiModelEnsembleRouter": "Routeur agrégé de modèles IA",
     "routerFx": {
+      "selectedModel": "Le routeur a sélectionné {model}",
       "ensembleSelecting": "Routeur agrégé de modèles IA · sélection des candidats",
       "ensembleHandedOff": "Routeur agrégé de modèles IA · transmis à l'agent",
       "ensembleRunning": "Routeur agrégé de modèles IA · {count} candidats en synthèse",
@@ -1953,12 +2790,65 @@
       "ensembleTokens": "{count} tok",
       "ensembleUsed": "utilisé",
       "ensembleFailed": "échec",
+      "ensembleQuorumSkipped": "seuil atteint · ignoré",
+      "ensembleQuorumSkippedDetail": "Le seuil de candidats était déjà atteint ; l’attente de ce candidat a donc été annulée.",
       "ensembleTracePending": "trace en attente",
       "ensembleTraceUnavailable": "trace disponible à la fin de l'exécution",
       "ensembleDetailUnavailable": "{count} candidats · détail indisponible"
     },
     "sources": "Sources",
+    "activityLabel": "Activité",
     "activitySteps": "Activité · {count} étape | Activité · {count} étapes",
+    "activityItems": "Activité · {count} élément | Activité · {count} éléments",
+    "activityCompletedItems": "Terminé · {count} élément | Terminé · {count} éléments",
+    "activityFailures": "{count} en échec",
+    "activityFailuresRecovered": "{count} échec récupéré | {count} échecs récupérés",
+    "activityWorking": "Travail en cours",
+    "workedForSeconds": "Travail effectué pendant {seconds} s",
+    "workedForMinutes": "Travail effectué pendant {minutes} min {seconds} s",
+    "activity": {
+      "lifecycle": {
+        "working": "En cours",
+        "answering": "Rédaction de la réponse",
+        "settled": "Terminé",
+        "interrupted": "Interrompu",
+        "failed": "Échec"
+      },
+      "purpose": {
+        "discover": "Liens découverts",
+        "search": "Recherche sur le Web",
+        "read": "Pages Web consultées",
+        "inspect": "Fichiers inspectés",
+        "change": "Fichiers modifiés",
+        "run": "Commandes exécutées",
+        "create": "Artefacts créés",
+        "recall": "Mémoire consultée",
+        "use": "Outils utilisés"
+      },
+      "purposeRunning": {
+        "discover": "Découverte de liens",
+        "search": "Recherche sur le Web",
+        "read": "Lecture de pages Web",
+        "inspect": "Inspection des fichiers",
+        "change": "Modification des fichiers",
+        "run": "Exécution de commandes",
+        "create": "Création d’artefacts",
+        "recall": "Consultation de la mémoire",
+        "use": "Utilisation d’outils"
+      },
+      "footprint": {
+        "web": "{count} action Web | {count} actions Web",
+        "files": "{count} fichier | {count} fichiers",
+        "fileOperations": "{count} opération sur un fichier | {count} opérations sur des fichiers",
+        "commands": "{count} commande | {count} commandes",
+        "artifacts": "{count} artefact | {count} artefacts",
+        "memory": "{count} consultation de la mémoire | {count} consultations de la mémoire",
+        "tools": "{count} appel d’outil | {count} appels d’outil"
+      },
+      "more": "{count} de plus",
+      "stale": "Toujours en cours — aucun signal récent",
+      "liveStep": "étape {n}"
+    },
     "suggestedTasks": "Tâches suggérées",
     "greetingMorning": "Bonjour.",
     "greetingAfternoon": "Bon après-midi.",
@@ -1966,6 +2856,9 @@
     "identityReady": "{label} · prêt",
     "loadEarlier": "Charger les messages précédents",
     "loadingEllipsis": "Chargement...",
+    "loadingEarlier": "Chargement des messages précédents…",
+    "loadEarlierFailedRetry": "Échec du chargement des messages précédents · Réessayer",
+    "legacyHistoryUnavailable": "Les messages originaux précédents n’ont pas été enregistrés par l’ancienne version.",
     "scopeCompacted": "Le contenu plus ancien est représenté par des résumés de session.",
     "scopeLatestWindow": "Affichage de la fenêtre de messages la plus récente.",
     "status": {
@@ -2000,7 +2893,11 @@
       "expiresIn": "Expire dans {time}",
       "outcomeExpired": "Expiré — non exécuté",
       "outcomeDenied": "Refusé",
-      "outcomeApproved": "Approuvé · exécution reprise"
+      "outcomeApproved": "Approuvé · exécution reprise",
+      "target": "Cible",
+      "access": "Accès",
+      "workspace": "Espace de travail",
+      "outcomeUnavailable": "Approbation désormais indisponible"
     },
     "clarify": {
       "needsInput": "L'agent a besoin d'une saisie",
@@ -2025,6 +2922,8 @@
       "routerAnimationOn": "Animation du routeur activée",
       "routerAnimationOff": "Animation du routeur désactivée",
       "modelRouting": "Routage des modèles",
+      "ensembleImageUnsupported": "Ensemble ne prend pas encore en charge les images. Passez au routage à modèle unique, puis réessayez.",
+      "routingUpdateImageBlocked": "Le routage des modèles est en cours de mise à jour. Attendez avant d’envoyer des images.",
       "modelRoutingOff": "Désactivé",
       "modelRoutingOffDesc": "Envoie chaque tour au modèle sélectionné.",
       "modelRoutingSquillaRouter": "Routeur mono-modèle avec IA",
@@ -2097,7 +2996,9 @@
       "results": "{count} résultats",
       "countRunning": "{count} en cours",
       "countDone": "{count} terminé(s)",
-      "countFailed": "{count} en échec"
+      "countFailed": "{count} en échec",
+      "collapseAll": "Tout réduire",
+      "expandAll": "Tout développer"
     },
     "chips": {
       "whatCanYouDo": "Que peux-tu faire ?",
@@ -2111,22 +3012,32 @@
       "downloadFailed": "Échec du téléchargement",
       "forkFailed": "Échec de la bifurcation",
       "copyFailed": "Échec de la copie",
-      "shareExportFailed": "Échec de l'exportation du partage",
+      "shareSaveFailed": "Impossible d'enregistrer l'image. Réessayez.",
+      "sharePreviewUpdateFailed": "Impossible de mettre à jour l'aperçu. Réessayez.",
       "saved": "{filename} enregistré",
       "copiedToClipboard": "Copié dans le presse-papiers",
       "copyNotSupported": "Copie non prise en charge — téléchargez à la place",
       "unsupportedFile": "Fichier non pris en charge : {name} ({mime})",
-      "fileTooLarge": "Fichier trop volumineux : {name}",
+      "fileTooLarge": "Fichier trop volumineux : {name} (max {cap})",
+      "emptyFile": "Fichier vide : {name}",
+      "tooManyAttachments": "Trop de pièces jointes : {max} maximum",
+      "attachmentsTotalTooLarge": "Pièces jointes trop volumineuses : {name} dépasserait la limite totale de {max}",
       "couldNotReadFile": "Impossible de lire le fichier : {name}",
       "uploadFailed": "Échec du téléversement pour {name}",
       "voiceUnsupported": "L'entrée vocale n'est pas prise en charge dans ce navigateur",
       "voiceUnavailable": "L'entrée vocale n'est pas disponible. Activez-la dans les Paramètres.",
       "voiceTranscribeFailed": "Impossible de transcrire votre enregistrement. Veuillez réessayer.",
       "voiceSetupNeeded": "L'entrée vocale nécessite une clé API ElevenLabs — ouverture des Paramètres…",
+      "voiceCancelledHidden": "L'enregistrement s'est arrêté lorsque la fenêtre a été masquée. Recommencez pour dicter.",
+      "voiceMicDenied": "L'accès au micro a été refusé. Autorisez-le dans les paramètres du navigateur.",
+      "voiceMicDeniedDesktop": "L'accès au micro est bloqué. Autorisez-le dans les paramètres système, puis réessayez.",
+      "voiceMicMissing": "Aucun micro n'a été détecté.",
+      "voiceRecordFailed": "Impossible de démarrer l'enregistrement. Veuillez réessayer.",
       "waitAttachments": "Attendez la fin du traitement des pièces jointes",
       "waitCompactionBeforeCommand": "Attendez le compactage du contexte avant d'exécuter {command}.",
       "waitResponseBeforeCommand": "Attendez la réponse actuelle avant d'exécuter {command}.",
       "queueFull": "La file d'attente est pleine — attendez la fin de la réponse actuelle.",
+      "messageStillSaving": "Ce message n'est pas encore enregistré — réessayez dans un instant.",
       "artifactOpenFailed": "Échec de l'ouverture de l'artefact. Utilisez Télécharger à la place."
     },
     "stream": {
@@ -2137,8 +3048,7 @@
       "preparingOutput": "Préparation de la sortie",
       "generatingCandidates": "Génération des candidats",
       "synthesizingCandidates": "Synthèse des candidats",
-      "stillWaiting": "Toujours en attente du modèle",
-      "stillWorking": "Toujours en cours — dernier signal il y a {seconds} s"
+      "stillWaiting": "Toujours en attente du modèle"
     },
     "stall": {
       "title": "La réponse prend plus de temps que prévu",
@@ -2181,7 +3091,7 @@
       "untitledChat": "Chat sans titre",
       "groupWork": "Travail",
       "groupManage": "Gérer",
-      "groupMonitor": "Surveiller",
+      "groupMonitor": "Vue d'ensemble",
       "groupActions": "Actions",
       "groupConversations": "Conversations",
       "groupMessages": "Messages",
@@ -2248,14 +3158,6 @@
       "finishSetup": "Terminer la configuration",
       "viewReadiness": "Voir la préparation"
     },
-    "legacyDataBanner": {
-      "ariaLabel": "Une autre installation OpenSquilla a été trouvée",
-      "title": "Une autre installation OpenSquilla a été trouvée",
-      "dismiss": "Pas maintenant",
-      "dismissNotice": "Ignorer l’avis de transfert de données",
-      "hintWeb": "Vos données actuelles sont déjà utilisées ; aucune action n’est requise. Pour les remplacer par l’autre installation, arrêtez la passerelle puis exécutez :",
-      "copyCommand": "Copier la commande de transfert de données"
-    },
     "shortcuts": {
       "toggleSidebar": {
         "label": "Afficher ou masquer la barre latérale",
@@ -2290,7 +3192,47 @@
       "sectionDiagnostics": "diagnostics",
       "sectionResult": "résultat",
       "sectionError": "erreur",
-      "viewFull": "voir en entier"
+      "viewFull": "voir en entier",
+      "activityViewDetails": "voir les détails",
+      "activityDetailsTitle": "détails",
+      "activityBytesWritten": "{size} écrits",
+      "activityContentSize": "{lines} lignes · {characters} caractères",
+      "activityPublished": "Publié"
+    }
+  },
+  "channelStatus": {
+    "connected": "Connecté",
+    "pendingRestart": "En attente de redémarrage",
+    "notRunning": "À l'arrêt",
+    "disabled": "Désactivé",
+    "restarting": "Redémarrage en cours",
+    "failed": "En échec",
+    "exhausted": "Tentatives épuisées",
+    "unknown": "Inconnu ({raw})",
+    "hint": {
+      "pendingRestart": "Prendra effet après un redémarrage de la passerelle",
+      "notRunning": "Démarre après un redémarrage de la passerelle",
+      "restarting": "Reconnexion automatique en cours",
+      "failed": "Redémarrages automatiques épuisés — redémarrez ou modifiez ce canal",
+      "exhausted": "Tentatives de livraison épuisées — vérifiez la dernière erreur puis redémarrez"
+    },
+    "cause": {
+      "auth_invalid": "identifiants rejetés",
+      "payload_rejected": "message rejeté par la plateforme",
+      "target_missing": "conversation ou canal cible introuvable",
+      "contract_violation": "violation du contrat de l'adaptateur",
+      "transport_transient": "problème réseau — nouvelle tentative",
+      "rate_limited": "limité par la plateforme",
+      "channel_degraded": "canal dégradé",
+      "startup_failed": "échec du démarrage — vérifiez les identifiants et la configuration"
+    },
+    "banner": {
+      "label": "Redémarrage de la passerelle en attente",
+      "message": "{count} modification(s) de canal enregistrée(s) prendront effet après un redémarrage de la passerelle",
+      "dismiss": "Ignorer le marqueur en attente de {name}",
+      "copied": "Commande copiée",
+      "copyFailed": "Impossible de copier la commande",
+      "copyLabel": "Copier la commande de redémarrage de la passerelle"
     }
   }
 }

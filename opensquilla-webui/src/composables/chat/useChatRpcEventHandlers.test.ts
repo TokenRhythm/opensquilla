@@ -1,13 +1,16 @@
 import { describe, expect, it, vi } from 'vitest'
 import { effectScope, ref } from 'vue'
 import { useChatRpcEventHandlers, type ChatRpcStreamApi } from './useChatRpcEventHandlers'
-import type { ChatMessage } from '@/types/chat'
+import type { ChatMessage, ChatRunStatus, ChatRunStatusSource } from '@/types/chat'
 
 function createHarness(options: {
   messages?: ChatMessage[]
   endStreaming?: (messages: ChatMessage[]) => void
+  sessionRunStatus?: (source: ChatRunStatusSource | null | undefined) => ChatRunStatus
 } = {}) {
   const messages = ref<ChatMessage[]>(options.messages ?? [])
+  const activeTaskGroups = ref(new Set<string>())
+  const applySessionRunState = vi.fn()
   const stream: ChatRpcStreamApi = {
     isStreaming: ref(true),
     streamBubble: ref(true),
@@ -30,12 +33,15 @@ function createHarness(options: {
     useReducer: ref(false),
   }
   const markEnsembleHandoff = vi.fn()
+  const schedulePendingDrainAfterTerminal = vi.fn()
+  const scheduleHistorySync = vi.fn()
+  const showWarningToast = vi.fn()
   const scope = effectScope()
   const api = scope.run(() => useChatRpcEventHandlers({
     sessionKey: ref('agent:main:test'),
     currentEpoch: ref(0),
     lastStreamSeq: ref(0),
-    activeTaskGroups: ref(new Set<string>()),
+    activeTaskGroups,
     activeStreamTaskId: ref(''),
     aborted: ref(false),
     messages,
@@ -52,8 +58,8 @@ function createHarness(options: {
     usageModel: ref(''),
     stream,
     normalizeRunStatus: (status: string) => status,
-    sessionRunStatus: () => ({ status: 'idle', label: 'Idle', task: null }),
-    applySessionRunState: vi.fn(),
+    sessionRunStatus: options.sessionRunStatus || (() => ({ status: 'idle', label: 'Idle', task: null })),
+    applySessionRunState,
     queueRouterDecision: vi.fn(),
     appendEnsembleProgress: vi.fn(),
     markEnsembleHandoff,
@@ -61,18 +67,292 @@ function createHarness(options: {
     clearPendingRouterDecision: vi.fn(),
     handleRouterControlReplay: vi.fn(),
     showCompactionToast: vi.fn(),
-    scheduleHistorySync: vi.fn(),
-    schedulePendingDrainAfterTerminal: vi.fn(),
+    showWarningToast,
+    scheduleHistorySync,
+    schedulePendingDrainAfterTerminal,
     popAllPendingIntoComposer: vi.fn(() => false),
     saveWidgetState: vi.fn(),
     subscribeSession: vi.fn(),
     loadHistory: vi.fn(),
     loadCurrentSessionUsage: vi.fn(),
   }))!
-  return { api, messages, stream, markEnsembleHandoff, stop: () => scope.stop() }
+  return {
+    api,
+    messages,
+    stream,
+    activeTaskGroups,
+    applySessionRunState,
+    markEnsembleHandoff,
+    schedulePendingDrainAfterTerminal,
+    scheduleHistorySync,
+    showWarningToast,
+    stop: () => scope.stop(),
+  }
 }
 
+describe('useChatRpcEventHandlers durable out-of-band messages', () => {
+  it('shows cron results immediately, preserves provenance, and deduplicates replay by id', () => {
+    const { api, messages, scheduleHistorySync, applySessionRunState, stop } = createHarness()
+    try {
+      api.handlers.onCronResult({
+        sessionKey: 'agent:other:test',
+        stream_seq: 1,
+        message: { text: 'foreign', messageId: 'cron-foreign' },
+      })
+      api.handlers.onCronResult({
+        sessionKey: 'agent:main:test',
+        epoch: -1,
+        stream_seq: 1,
+        message: { text: 'stale', messageId: 'cron-stale' },
+      })
+      const payload = {
+        sessionKey: 'agent:main:test',
+        stream_seq: 2,
+        message: {
+          role: 'assistant',
+          text: 'scheduled result',
+          timestamp: '2026-07-22T10:00:00Z',
+          messageId: 'cron-message-1',
+          provenanceKind: 'cron',
+          provenanceSourceTool: 'cron.run',
+        },
+      }
+      api.handlers.onCronResult(payload)
+      api.handlers.onCronResult({ ...payload, stream_seq: 3 })
+
+      expect(messages.value).toEqual([expect.objectContaining({
+        role: 'assistant',
+        text: 'scheduled result',
+        messageId: 'cron-message-1',
+        provenanceKind: 'cron',
+        provenanceSourceTool: 'cron.run',
+      })])
+      expect(scheduleHistorySync).toHaveBeenCalledOnce()
+      expect(applySessionRunState).not.toHaveBeenCalled()
+    } finally {
+      stop()
+    }
+  })
+
+  it('shows subagent completion immediately and rejects foreign, stale, and replayed events', () => {
+    const { api, messages, scheduleHistorySync, stop } = createHarness()
+    try {
+      api.handlers.onSubagentCompletion({
+        session_key: 'agent:other:test',
+        stream_seq: 1,
+        type: 'subagent_completion',
+        child_session_key: 'agent:main:subagent:foreign',
+        message_id: 'foreign',
+      })
+      api.handlers.onSubagentCompletion({
+        session_key: 'agent:main:test',
+        epoch: -1,
+        stream_seq: 1,
+        type: 'subagent_completion',
+        child_session_key: 'agent:main:subagent:stale',
+        message_id: 'stale',
+      })
+      const current = {
+        session_key: 'agent:main:test',
+        stream_seq: 2,
+        type: 'subagent_completion' as const,
+        child_session_key: 'agent:main:subagent:child',
+        status: 'succeeded',
+        message_id: 'subagent-message-1',
+        result: { text: 'done' },
+      }
+      api.handlers.onSubagentCompletion(current)
+      api.handlers.onSubagentCompletion(current)
+
+      expect(messages.value).toHaveLength(1)
+      expect(messages.value[0]).toEqual(expect.objectContaining({
+        role: 'system',
+        messageId: 'subagent-message-1',
+        provenanceKind: 'internal_system',
+        provenanceSourceTool: 'subagent_completion',
+        provenanceSourceSessionKey: 'agent:main:subagent:child',
+      }))
+      const displayed = JSON.parse(messages.value[0].text)
+      expect(displayed).toEqual(expect.objectContaining({
+        type: 'subagent_completion',
+        result: { text: 'done' },
+      }))
+      expect(displayed).not.toHaveProperty('message_id')
+      expect(scheduleHistorySync).toHaveBeenCalledOnce()
+    } finally {
+      stop()
+    }
+  })
+
+  it('toasts warnings for five-second host handling while consuming silent warning sequences', () => {
+    const { api, showWarningToast, messages, stop } = createHarness()
+    try {
+      api.handlers.onWarning({
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        code: 'provider_reasoning_only_retry',
+        message: 'retrying',
+      })
+      api.handlers.onWarning({
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        message: 'replayed warning',
+      })
+      api.handlers.onWarning({
+        session_key: 'agent:main:test',
+        stream_seq: 2,
+        message: 'Provider is degraded',
+      })
+
+      expect(showWarningToast).toHaveBeenCalledOnce()
+      expect(showWarningToast).toHaveBeenCalledWith('Provider is degraded')
+      expect(messages.value).toHaveLength(0)
+    } finally {
+      stop()
+    }
+  })
+})
+
+describe('useChatRpcEventHandlers task group lifecycle', () => {
+  it('keeps an active child group when the yielding parent task ends normally', () => {
+    const { api, activeTaskGroups, applySessionRunState, stop } = createHarness()
+
+    try {
+      api.handlers.onTaskGroupWaiting({
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        group_id: 'group-live',
+      })
+      api.handlers.onSessionsChanged({
+        session_key: 'agent:main:test',
+        reason: 'task_terminal',
+        run_status: 'idle',
+        last_task: { status: 'succeeded' },
+      })
+
+      expect([...activeTaskGroups.value]).toEqual(['group-live'])
+      expect(applySessionRunState).toHaveBeenLastCalledWith(expect.objectContaining({
+        run_status: 'running',
+      }))
+    } finally {
+      stop()
+    }
+  })
+
+  it('clears active child groups when the parent session is explicitly cancelled', () => {
+    const { api, activeTaskGroups, stream, stop } = createHarness({
+      sessionRunStatus: source => ({
+        status: source?.run_status === 'cancelled' ? 'cancelled' : 'idle',
+        label: '',
+        task: null,
+      }),
+    })
+
+    try {
+      api.handlers.onTaskGroupWaiting({
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        group_id: 'group-live',
+      })
+      api.handlers.onSessionsChanged({
+        session_key: 'agent:main:test',
+        reason: 'task_terminal',
+        run_status: 'cancelled',
+        last_task: { status: 'cancelled' },
+      })
+
+      expect(activeTaskGroups.value.size).toBe(0)
+      expect(stream.endStreaming).toHaveBeenCalled()
+    } finally {
+      stop()
+    }
+  })
+
+  it('releases pending work when the last background-only task group finishes', () => {
+    const {
+      api,
+      activeTaskGroups,
+      stream,
+      schedulePendingDrainAfterTerminal,
+      stop,
+    } = createHarness()
+    stream.isStreaming.value = false
+
+    try {
+      api.handlers.onTaskGroupWaiting({
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        group_id: 'group-live',
+      })
+      api.handlers.onTaskGroupDone({
+        session_key: 'agent:main:test',
+        stream_seq: 2,
+        group_id: 'group-live',
+      })
+
+      expect(activeTaskGroups.value.size).toBe(0)
+      expect(schedulePendingDrainAfterTerminal).toHaveBeenCalledOnce()
+    } finally {
+      stop()
+    }
+  })
+})
+
 describe('useChatRpcEventHandlers done usage attachment', () => {
+  it('distinguishes authoritative snapshots from legacy text fallback', () => {
+    const { api, stream, stop } = createHarness()
+
+    try {
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        text: 'legacy canonical',
+      })
+      expect(stream.reconcileFinalText).toHaveBeenLastCalledWith('legacy canonical')
+
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 2,
+        text: 'legacy canonical with serialized null',
+        text_snapshot: null,
+      })
+      expect(stream.reconcileFinalText).toHaveBeenLastCalledWith('legacy canonical with serialized null')
+
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 3,
+        text: 'stale legacy aggregate',
+        text_snapshot: '',
+      })
+      expect(stream.reconcileFinalText).toHaveBeenLastCalledWith('')
+
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 4,
+        text: '',
+      })
+      expect(stream.reconcileFinalText).toHaveBeenLastCalledWith(null)
+
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 5,
+        text_snapshot: 'outer canonical',
+        usage: { text_snapshot: null },
+      })
+      expect(stream.reconcileFinalText).toHaveBeenLastCalledWith('outer canonical')
+
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 6,
+        text: 'outer legacy canonical',
+        usage: { text: '' },
+      })
+      expect(stream.reconcileFinalText).toHaveBeenLastCalledWith('outer legacy canonical')
+    } finally {
+      stop()
+    }
+  })
+
   it('does not attach done usage to the previous assistant when no new bubble was pushed', () => {
     const previous: ChatMessage = { role: 'assistant', text: 'previous', ts: 'before' }
     const { api, messages, stop } = createHarness({ messages: [previous] })
