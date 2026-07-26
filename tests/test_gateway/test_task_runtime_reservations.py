@@ -14,12 +14,14 @@ from typing import Any
 
 import pytest
 
+from opensquilla.gateway.project_workspace_runtime import AcceptedRunModeOverride
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.task_runtime import (
     PendingOverflowPolicy,
     TaskQueueFullError,
     TaskRuntime,
 )
+from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus
 
 
@@ -344,6 +346,145 @@ async def test_try_collect_atomically_mutates_only_after_persist_and_skips_repla
         "message-first",
         "message-second",
     )
+
+
+@pytest.mark.parametrize(
+    ("pending_mode", "later_mode"),
+    [("full", "standard"), ("standard", "full")],
+)
+@pytest.mark.asyncio
+async def test_try_collect_atomically_rejects_different_accepted_mode_capabilities(
+    pending_mode: str,
+    later_mode: str,
+) -> None:
+    storage = _TrackingStorage()
+    running_started = asyncio.Event()
+    release_running = asyncio.Event()
+
+    async def handler(run: Any) -> None:
+        if run.message == "running":
+            running_started.set()
+            await release_running.wait()
+
+    runtime = TaskRuntime(storage=storage, turn_handler=handler, max_concurrency=1)
+    envelope = _envelope(f"agent-1::collect-{pending_mode}-to-{later_mode}")
+    running = await runtime.enqueue(_envelope("agent-1::collect-blocker"), "running")
+    await asyncio.wait_for(running_started.wait(), timeout=1.0)
+    pending_override = AcceptedRunModeOverride(
+        run_mode=RunMode(pending_mode),
+        run_mode_source="user",
+        source="request",
+    )
+    later_override = AcceptedRunModeOverride(
+        run_mode=RunMode(later_mode),
+        run_mode_source="user",
+        source="request",
+    )
+    candidate_handle = await runtime.enqueue(
+        envelope,
+        "first",
+        mode="collect",
+        accepted_run_mode_override=pending_override,
+    )
+    candidate = runtime._tasks[candidate_handle.task_id]
+    persist_calls = 0
+
+    async def persist(
+        _handle: Any,
+        _details: dict[str, Any],
+    ) -> _PersistenceResult:
+        nonlocal persist_calls
+        persist_calls += 1
+        return _PersistenceResult()
+
+    collected = await runtime.try_collect_atomically(
+        envelope=envelope,
+        message="second",
+        run_kind="default",
+        no_memory_capture=False,
+        accepted_run_mode_override=later_override,
+        persist=persist,
+    )
+
+    assert collected is None
+    assert persist_calls == 0
+    assert candidate.message == "first"
+    assert candidate.accepted_run_mode_override == pending_override
+
+    replacement = await runtime.reserve(
+        envelope,
+        "second",
+        mode="collect",
+        accepted_run_mode_override=later_override,
+    )
+    try:
+        assert replacement.task_id != candidate_handle.task_id
+        assert replacement.runtime_task.accepted_run_mode_override == later_override
+    finally:
+        await runtime.abort_reservation(replacement)
+        release_running.set()
+        await runtime.wait(running.task_id, timeout=1.0)
+        await runtime.wait(candidate_handle.task_id, timeout=1.0)
+
+
+@pytest.mark.parametrize("mode", [None, "standard", "full"])
+@pytest.mark.asyncio
+async def test_try_collect_atomically_accepts_identical_mode_capabilities(
+    mode: str | None,
+) -> None:
+    storage = _TrackingStorage()
+    running_started = asyncio.Event()
+    release_running = asyncio.Event()
+
+    async def handler(run: Any) -> None:
+        if run.message == "running":
+            running_started.set()
+            await release_running.wait()
+
+    runtime = TaskRuntime(storage=storage, turn_handler=handler, max_concurrency=1)
+    envelope = _envelope(f"agent-1::collect-compatible-{mode or 'none'}")
+    running = await runtime.enqueue(_envelope("agent-1::compatible-blocker"), "running")
+    await asyncio.wait_for(running_started.wait(), timeout=1.0)
+    accepted_override = (
+        AcceptedRunModeOverride(
+            run_mode=RunMode(mode),
+            run_mode_source="user",
+            source="request",
+        )
+        if mode is not None
+        else None
+    )
+    candidate_handle = await runtime.enqueue(
+        envelope,
+        "first",
+        mode="collect",
+        accepted_run_mode_override=accepted_override,
+    )
+    candidate = runtime._tasks[candidate_handle.task_id]
+
+    async def persist(
+        _handle: Any,
+        _details: dict[str, Any],
+    ) -> _PersistenceResult:
+        return _PersistenceResult()
+
+    collected = await runtime.try_collect_atomically(
+        envelope=envelope,
+        message="second",
+        run_kind="default",
+        no_memory_capture=False,
+        accepted_run_mode_override=accepted_override,
+        persist=persist,
+    )
+
+    assert collected is not None
+    assert collected[0] == candidate_handle
+    assert candidate.message == "first\nsecond"
+    assert candidate.accepted_run_mode_override == accepted_override
+
+    release_running.set()
+    await runtime.wait(running.task_id, timeout=1.0)
+    await runtime.wait(candidate_handle.task_id, timeout=1.0)
 
 
 @pytest.mark.asyncio

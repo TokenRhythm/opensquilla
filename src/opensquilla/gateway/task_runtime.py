@@ -596,6 +596,7 @@ class TaskRuntime:
                     persisted_user_message_id=persisted_user_message_id,
                     persisted_user_message_ids=persisted_user_message_ids,
                     message_count=message_count,
+                    accepted_run_mode_override=accepted_run_mode_override,
                 )
                 if collected is not None:
                     return collected
@@ -1533,6 +1534,7 @@ class TaskRuntime:
         persisted_user_message_id: str | None = None,
         persisted_user_message_ids: builtins.list[str] | tuple[str, ...] | None = None,
         message_count: int = 1,
+        accepted_run_mode_override: Any | None = None,
     ) -> TaskHandle | None:
         async def persist(
             handle: TaskHandle,
@@ -1599,6 +1601,7 @@ class TaskRuntime:
                 persisted_user_message_id=persisted_user_message_id,
                 persisted_user_message_ids=persisted_user_message_ids,
                 message_count=message_count,
+                accepted_run_mode_override=accepted_run_mode_override,
                 persist=persist,
             )
         except _CollectIdentityRebindError:
@@ -1617,6 +1620,7 @@ class TaskRuntime:
         persisted_user_message_id: str | None = None,
         persisted_user_message_ids: builtins.list[str] | tuple[str, ...] | None = None,
         message_count: int = 1,
+        accepted_run_mode_override: Any | None = None,
         persist: Callable[
             [TaskHandle, dict[str, Any]], Awaitable[_CollectResult]
         ],
@@ -1642,6 +1646,7 @@ class TaskRuntime:
                 persisted_user_message_id=persisted_user_message_id,
                 persisted_user_message_ids=persisted_user_message_ids,
                 message_count=message_count,
+                accepted_run_mode_override=accepted_run_mode_override,
                 persist=persist,
             )
         )
@@ -1665,6 +1670,7 @@ class TaskRuntime:
         persisted_user_message_id: str | None,
         persisted_user_message_ids: builtins.list[str] | tuple[str, ...] | None,
         message_count: int,
+        accepted_run_mode_override: Any | None,
         persist: Callable[
             [TaskHandle, dict[str, Any]], Awaitable[_CollectResult]
         ],
@@ -1699,6 +1705,11 @@ class TaskRuntime:
                     candidate not in pending
                     or candidate.queue_mode != "collect"
                     or candidate.status != AgentTaskStatus.QUEUED
+                ):
+                    return None
+                if (
+                    candidate.accepted_run_mode_override
+                    != accepted_run_mode_override
                 ):
                     return None
                 collected_no_memory_capture = candidate.no_memory_capture

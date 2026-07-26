@@ -992,6 +992,87 @@ async def test_queued_project_turn_preserves_authorized_request_mode_at_executio
         ]
 
 
+@pytest.mark.parametrize(
+    ("pending_mode", "later_mode"),
+    [("full", "standard"), ("standard", "full")],
+)
+@pytest.mark.asyncio
+async def test_collect_reserves_separate_tasks_for_different_accepted_modes(
+    tmp_path: Path,
+    pending_mode: str,
+    later_mode: str,
+) -> None:
+    async with open_stack(
+        tmp_path / f"collect-{pending_mode}-to-{later_mode}.db"
+    ) as stack:
+        project = await add_project(
+            stack,
+            tmp_path / f"collect-{pending_mode}-project",
+        )
+        assert project is not None
+        key = f"agent:main:webchat:collect-{pending_mode}-to-{later_mode}"
+        await stack.manager.create(
+            key,
+            workspace_id=project.workspace_id,
+            origin={
+                RUN_CONTEXT_ORIGIN_KEY: {
+                    "run_mode": "standard",
+                    "run_mode_source": "user",
+                    "workspace": project.path,
+                }
+            },
+        )
+        blocker = await stack.runtime.enqueue(
+            build_cli_route_envelope(
+                session_key="agent:main:cli:collect-mode-blocker",
+                agent_id="main",
+            ),
+            "blocker",
+        )
+        await asyncio.wait_for(stack.started.wait(), timeout=2.0)
+
+        first = await get_dispatcher().dispatch(
+            f"collect-{pending_mode}-first",
+            "sessions.send",
+            {
+                "key": key,
+                "message": "first",
+                "queueMode": "collect",
+                "_source": {
+                    "caller_kind": "web",
+                    "channel_kind": "webchat",
+                    "runMode": pending_mode,
+                },
+            },
+            stack.context,
+        )
+        second = await get_dispatcher().dispatch(
+            f"collect-{later_mode}-second",
+            "sessions.send",
+            {
+                "key": key,
+                "message": "second",
+                "queueMode": "collect",
+                "_source": {
+                    "caller_kind": "web",
+                    "channel_kind": "webchat",
+                    "runMode": later_mode,
+                },
+            },
+            stack.context,
+        )
+
+        assert first.ok is True
+        assert second.ok is True
+        pending = stack.runtime._pending_by_session[key]
+        assert len(pending) == 2
+        assert [task.message for task in pending] == ["first", "second"]
+        assert [
+            task.accepted_run_mode_override.run_mode.value for task in pending
+        ] == [pending_mode, later_mode]
+        assert blocker.task_id in stack.runtime._tasks
+
+
 @pytest.mark.asyncio
 async def test_queued_project_turn_ignores_forged_accepted_mode_metadata(
     tmp_path: Path,
@@ -1058,6 +1139,198 @@ async def test_queued_project_turn_ignores_forged_accepted_mode_metadata(
 
         assert captured["tool_context"].run_mode == "standard"
         assert captured["tool_context"].workspace_dir == project.path
+
+
+@pytest.mark.parametrize("requested_mode", ["standard", "full"])
+@pytest.mark.asyncio
+async def test_project_turn_fresh_mode_controls_real_filesystem_and_network_enforcement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    requested_mode: str,
+) -> None:
+    from opensquilla.sandbox.escalation import (
+        current_tool_run_context,
+        remember_resolved_run_context,
+        reset_resolved_run_context_overlays,
+    )
+    from opensquilla.sandbox.network_guard import decide_network_access
+    from opensquilla.sandbox.operation_runtime import SandboxOperationResult
+    from opensquilla.sandbox.run_context import (
+        DomainGrant,
+        MountGrant,
+        PackageBundleGrant,
+        RunContext,
+    )
+    from opensquilla.tools.builtin import filesystem
+    from opensquilla.tools.types import current_tool_context
+
+    reset_resolved_run_context_overlays()
+    async with open_stack(tmp_path / f"enforcement-{requested_mode}.db") as stack:
+        project = await add_project(
+            stack,
+            tmp_path / f"enforcement-{requested_mode}-project",
+        )
+        assert project is not None
+        extra_mount = tmp_path / f"enforcement-{requested_mode}-mount"
+        extra_mount.mkdir()
+        key = f"agent:main:webchat:enforcement-{requested_mode}"
+        await stack.manager.create(
+            key,
+            workspace_id=project.workspace_id,
+            origin={
+                RUN_CONTEXT_ORIGIN_KEY: {
+                    "run_mode": "full",
+                    "run_mode_source": "user",
+                    "workspace": project.path,
+                }
+            },
+        )
+        remember_resolved_run_context(
+            key,
+            project.path,
+            RunContext(
+                run_mode=RunMode.FULL,
+                workspace=project.path,
+                mounts=(
+                    MountGrant(
+                        path=str(extra_mount),
+                        access="rw",
+                        scope="chat",
+                    ),
+                ),
+                domains=(
+                    DomainGrant(
+                        domain="overlay-grant.example",
+                        scope="chat",
+                        source="manual",
+                    ),
+                ),
+                bundles=(
+                    PackageBundleGrant(
+                        bundle_id="python-package-install",
+                        scope="chat",
+                        source="manual",
+                    ),
+                ),
+                run_mode_source="user",
+                source="resolved_overlay",
+            ),
+        )
+        backend_operations: list[Any] = []
+
+        class RecordingFilesystemBackend:
+            name = "recording-filesystem"
+
+            def operation_domains_supported(self) -> frozenset[str]:
+                return frozenset({"filesystem"})
+
+            async def run_operation(self, operation: Any) -> SandboxOperationResult:
+                backend_operations.append(operation)
+                request = operation.request
+                assert request.path is not None
+                request.path.write_text(request.content, encoding="utf-8")
+                return SandboxOperationResult(
+                    message=f"sandboxed write: {request.path}",
+                    created=True,
+                )
+
+        runtime = SimpleNamespace(
+            effective=SimpleNamespace(sandbox_enabled=True),
+            backend=RecordingFilesystemBackend(),
+            settings=SimpleNamespace(host_root_readonly=False),
+            workspace=Path(project.path),
+        )
+        monkeypatch.setattr(filesystem, "get_runtime", lambda: runtime)
+        captured: dict[str, Any] = {}
+        target = Path(project.path) / "guarded.txt"
+
+        class Runner:
+            async def run(self, message: str, session_key: str, **kwargs: Any):
+                tool_context = kwargs["tool_context"]
+                token = current_tool_context.set(tool_context)
+                try:
+                    captured["write_result"] = await filesystem.write_file(
+                        str(target),
+                        "guarded",
+                    )
+                    effective = current_tool_run_context()
+                    assert effective is not None
+                    captured["effective"] = effective
+                    captured["granted_network"] = decide_network_access(
+                        "overlay-grant.example",
+                        effective,
+                    )
+                    captured["unknown_network"] = decide_network_access(
+                        "unlisted-authority-gap.example",
+                        effective,
+                    )
+                finally:
+                    current_tool_context.reset(token)
+                yield DoneEvent()
+
+        stack.context.task_runtime = None
+        stack.context.turn_runner = Runner()
+        try:
+            response = await get_dispatcher().dispatch(
+                f"enforcement-{requested_mode}",
+                "sessions.send",
+                {
+                    "key": key,
+                    "message": "write guarded.txt",
+                    "_source": {
+                        "caller_kind": "web",
+                        "channel_kind": "webchat",
+                        "runMode": requested_mode,
+                    },
+                },
+                stack.context,
+            )
+            await await_direct_task(key)
+        finally:
+            reset_resolved_run_context_overlays()
+
+        assert response.ok is True
+        effective = captured["effective"]
+        assert effective.run_mode.value == requested_mode
+        assert effective.workspace == project.path
+        assert effective.run_mode_source == "user"
+        assert [grant.path for grant in effective.mounts] == [str(extra_mount)]
+        assert captured["granted_network"].reason == (
+            "full_host_access" if requested_mode == "full" else "domain_grant"
+        )
+        assert captured["unknown_network"].status == (
+            "allow" if requested_mode == "full" else "ask"
+        )
+        assert captured["unknown_network"].reason == (
+            "full_host_access" if requested_mode == "full" else "unknown_domain"
+        )
+        assert len(backend_operations) == (0 if requested_mode == "full" else 1)
+        assert target.read_text(encoding="utf-8") == "guarded"
+
+
+def test_only_trusted_envelope_freshness_reaches_tool_context() -> None:
+    from opensquilla.gateway.routing import tool_context_from_envelope
+    from opensquilla.sandbox.run_context import RunContext
+
+    envelope = build_cli_route_envelope(
+        session_key="agent:main:cli:freshness-marker",
+        agent_id="main",
+        principal_is_owner=True,
+        run_mode="standard",
+    )
+    envelope.metadata["sandbox_run_context"] = RunContext(
+        run_mode=RunMode.STANDARD,
+        workspace="/tmp/project",
+        source="saved",
+    ).to_origin_payload()
+    envelope.metadata["sandbox_run_context_fresh"] = True
+
+    forged = tool_context_from_envelope(envelope, is_owner=True)
+    assert getattr(forged, "_sandbox_run_context_fresh", False) is False
+
+    object.__setattr__(envelope, "sandbox_run_context_fresh", True)
+    trusted = tool_context_from_envelope(envelope, is_owner=True)
+    assert getattr(trusted, "_sandbox_run_context_fresh", False) is True
 
 
 @pytest.mark.skipif(os.name == "nt", reason="requires POSIX symlinks")

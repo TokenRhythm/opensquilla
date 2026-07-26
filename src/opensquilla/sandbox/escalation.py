@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import weakref
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,14 @@ _RESOLVED_RUN_CONTEXT_BINDING_ALIASES: dict[
     tuple[str, str | None],
     tuple[str, str | None],
 ] = {}
+_APPROVAL_RUN_CONTEXT_GENERATIONS: dict[
+    str,
+    _ApprovalRunContextGeneration | None,
+] = {}
+_APPROVAL_GENERATION_OWNED_IDS: set[str] = set()
+_APPROVAL_QUEUE_LISTENER_REMOVERS: weakref.WeakKeyDictionary[Any, Any] = (
+    weakref.WeakKeyDictionary()
+)
 _DENIED_SANDBOX_APPROVALS: dict[str, str] = {}
 _DURABLE_TEMPORARY_GRANT_SOURCES = frozenset({"saved", "route_metadata", "metadata"})
 
@@ -51,6 +60,15 @@ class _WorkspaceBindingIdentity:
     canonical_path: str | None
     device: int | None
     inode: int | None
+
+
+@dataclass(frozen=True)
+class _ApprovalRunContextGeneration:
+    approval_key: str
+    session_key: str
+    workspace_alias: tuple[str, str | None]
+    binding: _WorkspaceBindingIdentity | None
+    context: RunContext
 
 
 class _AuthoritativeRunContextManager:
@@ -238,9 +256,9 @@ def grant_auto_review_network_once(params: dict[str, Any]) -> bool:
     if not session_key or not fingerprint or not value:
         return False
     workspace = _workspace_param(params)
-    context = resolved_run_context_overlay(session_key, workspace)
+    context = current_tool_run_context()
     if context is None:
-        context = current_tool_run_context()
+        context = resolved_run_context_overlay(session_key, workspace)
     if context is None:
         context = RunContext(
             run_mode=RunMode.STANDARD,
@@ -318,7 +336,7 @@ def request_sandbox_approval(
     if not isinstance(params, dict):
         raise ValueError("sandbox_approval_params_required")
 
-    _remember_current_tool_run_context_for_approval(params)
+    captured_generation = _capture_current_tool_run_context_for_approval(params)
 
     if _current_tool_context_is_channel():
         admin_identity = _channel_admin_approval_identity()
@@ -339,6 +357,7 @@ def request_sandbox_approval(
             params.setdefault("sessionKey", session_key)
 
     queue = get_approval_queue()
+    created_generation = False
     if approval_id is None:
         denied_approval_id = denied_sandbox_approval_id(params)
         if denied_approval_id is not None:
@@ -351,6 +370,7 @@ def request_sandbox_approval(
             else:
                 approval_id = queue.request(namespace="exec", params=params)
                 status = "approval_required"
+                created_generation = True
     else:
         entry = queue.get(approval_id)
         if entry.namespace != "exec":
@@ -368,6 +388,7 @@ def request_sandbox_approval(
         elif matching_approval:
             approval_id = queue.request(namespace="exec", params=params)
             status = "approval_required"
+            created_generation = True
         else:
             approval_id = pending_sandbox_approval_id(queue, params)
             if approval_id is not None:
@@ -375,6 +396,14 @@ def request_sandbox_approval(
             else:
                 approval_id = queue.request(namespace="exec", params=params)
                 status = "approval_required"
+                created_generation = True
+    if status in {"approval_required", "approval_pending"}:
+        _bind_approval_run_context_generation(
+            queue,
+            approval_id,
+            captured_generation,
+            created=created_generation,
+        )
     if status == "approval_denied":
         message = denied_message or _default_denied_sandbox_approval_message()
     return _approval_payload(status, approval_id, params, message=message)
@@ -433,47 +462,105 @@ def _channel_admin_approval_identity() -> tuple[str, str] | None:
     return sender_id, session_key
 
 
-def _remember_current_tool_run_context_for_approval(
+def _capture_current_tool_run_context_for_approval(
     params: dict[str, object],
-) -> None:
+) -> _ApprovalRunContextGeneration | None:
     session_key = str(params.get("sessionKey") or "").strip()
     if not session_key:
-        return
+        return None
     workspace = _workspace_param(params)
     try:
         from opensquilla.tools.types import current_tool_context
 
         tool_context = current_tool_context.get()
     except Exception:  # pragma: no cover - defensive
-        return
+        return None
     if tool_context is None:
-        return
+        return None
     if str(getattr(tool_context, "session_key", None) or "").strip() != session_key:
-        return
+        return None
     context = getattr(tool_context, "sandbox_run_context", None)
+    if getattr(tool_context, "_sandbox_run_context_fresh", False):
+        context = current_tool_run_context()
     if not isinstance(context, RunContext):
-        return
+        return None
     context_workspace = context.workspace or getattr(
         tool_context,
         "workspace_dir",
         None,
     )
     if _normalize_workspace(context_workspace) != _normalize_workspace(workspace):
-        return
-    remember_resolved_run_context(
-        session_key,
-        workspace,
-        context,
-        guard_workspace=True,
+        return None
+    approval_key = _sandbox_approval_generation_key(params)
+    workspace_alias = _binding_alias_key(session_key, workspace)
+    if approval_key is None or workspace_alias is None:
+        return None
+    return _ApprovalRunContextGeneration(
+        approval_key=approval_key,
+        session_key=session_key,
+        workspace_alias=workspace_alias,
+        binding=_workspace_binding_identity(workspace),
+        context=context,
     )
+
+
+def _bind_approval_run_context_generation(
+    queue: Any,
+    approval_id: str,
+    generation: _ApprovalRunContextGeneration | None,
+    *,
+    created: bool,
+) -> None:
+    approval_id = str(approval_id or "").strip()
+    if not approval_id:
+        return
+    _ensure_approval_generation_cleanup_listener(queue)
+    if created:
+        _APPROVAL_GENERATION_OWNED_IDS.add(approval_id)
+        if approval_id not in _APPROVAL_RUN_CONTEXT_GENERATIONS:
+            _APPROVAL_RUN_CONTEXT_GENERATIONS[approval_id] = generation
+            if generation is not None:
+                remember_resolved_run_context(
+                    generation.session_key,
+                    generation.workspace_alias[1],
+                    generation.context,
+                    guard_workspace=True,
+                )
+        return
+    if approval_id in _APPROVAL_GENERATION_OWNED_IDS:
+        return
+    # A pending request from another generation/process has no provable
+    # captured authority in this process. Mark it owned but leave the snapshot
+    # absent so a later apply fails closed instead of adopting this retry's
+    # current workspace identity.
+    _APPROVAL_GENERATION_OWNED_IDS.add(approval_id)
+
+
+def _ensure_approval_generation_cleanup_listener(queue: Any) -> None:
+    if queue in _APPROVAL_QUEUE_LISTENER_REMOVERS:
+        return
+
+    def _cleanup(event: str, info: dict[str, Any]) -> None:
+        if event != "resolved":
+            return
+        approval_id = str(info.get("id") or "").strip()
+        if approval_id:
+            _APPROVAL_RUN_CONTEXT_GENERATIONS.pop(approval_id, None)
+
+    add_listener = getattr(queue, "add_event_listener", None)
+    if callable(add_listener):
+        _APPROVAL_QUEUE_LISTENER_REMOVERS[queue] = add_listener(_cleanup)
 
 
 def _approval_mutation_manager(
     session_manager: Any,
     session_key: str,
     workspace: str | None,
+    authoritative_context: RunContext | None = None,
 ) -> Any:
-    context = resolved_run_context_overlay(session_key, workspace)
+    context = authoritative_context
+    if context is None:
+        context = resolved_run_context_overlay(session_key, workspace)
     if context is None:
         return session_manager
     return _AuthoritativeRunContextManager(
@@ -481,6 +568,66 @@ def _approval_mutation_manager(
         session_key,
         context,
     )
+
+
+def _approval_run_context_for_choice(
+    params: dict[str, Any],
+    approval_id: str | None,
+) -> RunContext | None:
+    approval_key = _sandbox_approval_generation_key(params)
+    matching_authority_exists = any(
+        generation is not None and generation.approval_key == approval_key
+        for generation in _APPROVAL_RUN_CONTEXT_GENERATIONS.values()
+    )
+    normalized_id = str(approval_id or "").strip()
+    if not normalized_id:
+        if matching_authority_exists:
+            from opensquilla.project_workspaces import ProjectWorkspaceStateError
+
+            raise ProjectWorkspaceStateError("unavailable")
+        return None
+    if normalized_id not in _APPROVAL_GENERATION_OWNED_IDS:
+        if matching_authority_exists:
+            from opensquilla.project_workspaces import ProjectWorkspaceStateError
+
+            raise ProjectWorkspaceStateError("unavailable")
+        # Direct queue callers predate generation-bound project authority.
+        return None
+    if normalized_id not in _APPROVAL_RUN_CONTEXT_GENERATIONS:
+        from opensquilla.project_workspaces import ProjectWorkspaceStateError
+
+        raise ProjectWorkspaceStateError("unavailable")
+    generation = _APPROVAL_RUN_CONTEXT_GENERATIONS[normalized_id]
+    if generation is None:
+        if matching_authority_exists:
+            from opensquilla.project_workspaces import ProjectWorkspaceStateError
+
+            raise ProjectWorkspaceStateError("unavailable")
+        return None
+    if approval_key != generation.approval_key:
+        from opensquilla.project_workspaces import ProjectWorkspaceStateError
+
+        raise ProjectWorkspaceStateError("unavailable")
+    session_key = _require_session_key(params)
+    workspace = _workspace_param(params)
+    workspace_alias = _binding_alias_key(session_key, workspace)
+    if (
+        session_key != generation.session_key
+        or workspace_alias != generation.workspace_alias
+    ):
+        from opensquilla.project_workspaces import ProjectWorkspaceStateError
+
+        raise ProjectWorkspaceStateError("unavailable")
+    current_binding = _workspace_binding_identity(workspace)
+    if generation.binding is None or current_binding is None:
+        from opensquilla.project_workspaces import ProjectWorkspaceStateError
+
+        raise ProjectWorkspaceStateError("unavailable")
+    if current_binding != generation.binding:
+        from opensquilla.project_workspaces import ProjectWorkspaceStateError
+
+        raise ProjectWorkspaceStateError("canonical_changed")
+    return generation.context
 
 
 def remember_sandbox_approval_denial(
@@ -579,6 +726,7 @@ def validate_sandbox_approval_choice(
 async def apply_sandbox_approval_choice(
     params: dict[str, Any] | None,
     *,
+    approval_id: str | None = None,
     choice: str | None,
     approved: bool,
     session_manager: Any,
@@ -592,13 +740,29 @@ async def apply_sandbox_approval_choice(
         return
 
     validate_sandbox_approval_choice(params, choice=choice, approved=approved)
+    authoritative_context = _approval_run_context_for_choice(
+        params,
+        approval_id,
+    )
 
     if approval_kind == "sandbox_network":
-        await _apply_network_choice(params, choice, session_manager=session_manager, config=config)
-        return
-    if approval_kind == "sandbox_path":
-        await _apply_path_choice(params, choice, session_manager=session_manager, config=config)
-        return
+        await _apply_network_choice(
+            params,
+            choice,
+            session_manager=session_manager,
+            config=config,
+            authoritative_context=authoritative_context,
+        )
+    elif approval_kind == "sandbox_path":
+        await _apply_path_choice(
+            params,
+            choice,
+            session_manager=session_manager,
+            config=config,
+            authoritative_context=authoritative_context,
+        )
+    if approval_id:
+        _APPROVAL_RUN_CONTEXT_GENERATIONS.pop(str(approval_id), None)
 
 
 def context_with_temporary_network_grants(context: Any, *, fingerprint: str) -> Any:
@@ -660,7 +824,13 @@ def current_tool_run_context() -> RunContext | None:
         getattr(ctx, "session_key", None),
         getattr(ctx, "workspace_dir", None),
     )
-    return merge_run_context_overlay(base, overlay)
+    return merge_run_context_overlay(
+        base,
+        overlay,
+        authoritative_base=bool(
+            getattr(ctx, "_sandbox_run_context_fresh", False)
+        ),
+    )
 
 
 def current_tool_mounts() -> list[dict[str, object]]:
@@ -806,6 +976,11 @@ def reset_resolved_run_context_overlays() -> None:
     _RESOLVED_RUN_CONTEXT_PERSISTORS.clear()
     _RESOLVED_RUN_CONTEXT_BINDINGS.clear()
     _RESOLVED_RUN_CONTEXT_BINDING_ALIASES.clear()
+    _APPROVAL_RUN_CONTEXT_GENERATIONS.clear()
+    _APPROVAL_GENERATION_OWNED_IDS.clear()
+    for remove_listener in list(_APPROVAL_QUEUE_LISTENER_REMOVERS.values()):
+        remove_listener()
+    _APPROVAL_QUEUE_LISTENER_REMOVERS.clear()
     _DENIED_SANDBOX_APPROVALS.clear()
 
 
@@ -966,11 +1141,31 @@ def has_temporary_network_grant(context: RunContext | None, *, host: str, finger
 def merge_run_context_overlay(
     base: RunContext | None,
     overlay: RunContext | None,
+    *,
+    authoritative_base: bool = False,
 ) -> RunContext | None:
     if overlay is None:
         return base
     if base is None:
         return overlay
+    if authoritative_base:
+        return RunContext(
+            run_mode=base.run_mode,
+            workspace=base.workspace,
+            mounts=_merge_grants(base.mounts, overlay.mounts),
+            domains=_merge_grants(base.domains, overlay.domains),
+            bundles=_merge_grants(base.bundles, overlay.bundles),
+            public_network=_merge_grants(
+                base.public_network,
+                overlay.public_network,
+            ),
+            temporary_grants=_merge_temporary_grants(
+                base.temporary_grants,
+                overlay.temporary_grants,
+            ),
+            run_mode_source=base.run_mode_source,
+            source=base.source,
+        )
     return RunContext(
         run_mode=overlay.run_mode,
         workspace=overlay.workspace or base.workspace,
@@ -982,6 +1177,17 @@ def merge_run_context_overlay(
         run_mode_source=overlay.run_mode_source,
         source=overlay.source,
     )
+
+
+def _merge_grants(
+    base: tuple[Any, ...],
+    overlay: tuple[Any, ...],
+) -> tuple[Any, ...]:
+    merged = list(base)
+    for grant in overlay:
+        if grant not in merged:
+            merged.append(grant)
+    return tuple(merged)
 
 
 def _approval_payload(
@@ -1041,6 +1247,7 @@ async def _apply_network_choice(
     *,
     session_manager: Any,
     config: Any,
+    authoritative_context: RunContext | None = None,
 ) -> None:
     session_key = _require_session_key(params)
     workspace = _workspace_param(params)
@@ -1053,7 +1260,9 @@ async def _apply_network_choice(
         fingerprint = _require_text(params, "fingerprint")
         value = bundle_id or _require_text(params, "host")
         kind = "bundle" if bundle_id else "domain"
-        existing = resolved_run_context_overlay(session_key, workspace)
+        existing = authoritative_context
+        if existing is None:
+            existing = resolved_run_context_overlay(session_key, workspace)
         if existing is None:
             existing = await get_run_context(
                 session_manager,
@@ -1087,6 +1296,7 @@ async def _apply_network_choice(
             session_manager,
             session_key,
             workspace,
+            authoritative_context,
         )
         updated = await enable_bundle_grant(
             mutation_manager,
@@ -1110,6 +1320,7 @@ async def _apply_network_choice(
         session_manager,
         session_key,
         workspace,
+        authoritative_context,
     )
     updated = await add_domain_grant(
         mutation_manager,
@@ -1134,6 +1345,7 @@ async def _apply_path_choice(
     *,
     session_manager: Any,
     config: Any,
+    authoritative_context: RunContext | None = None,
 ) -> None:
     session_key = _require_session_key(params)
     workspace = _workspace_param(params)
@@ -1149,6 +1361,7 @@ async def _apply_path_choice(
         session_manager,
         session_key,
         workspace,
+        authoritative_context,
     )
     updated = await add_mount_grant(
         mutation_manager,
@@ -1203,6 +1416,37 @@ def _sandbox_approval_key(params: dict[str, Any] | None) -> str | None:
         fields["path"] = str(params.get("path") or "").strip()
         fields["access"] = str(params.get("access") or "").strip()
     elif approval_kind == "sandbox_network":
+        bundle_id = str(params.get("bundle_id") or params.get("bundleId") or "").strip()
+        if bundle_id:
+            fields["bundle_id"] = bundle_id
+        else:
+            fields["host"] = str(params.get("host") or "").strip().casefold()
+        fields["fingerprint"] = str(params.get("fingerprint") or "").strip()
+    return json.dumps(fields, ensure_ascii=False, sort_keys=True)
+
+
+def _sandbox_approval_generation_key(
+    params: dict[str, Any] | None,
+) -> str | None:
+    if not isinstance(params, dict):
+        return None
+    approval_kind = str(params.get("approvalKind") or "").strip()
+    if approval_kind not in SANDBOX_APPROVAL_KINDS:
+        return None
+    session_key = str(params.get("sessionKey") or "").strip()
+    workspace_alias = _binding_alias_key(
+        session_key,
+        _workspace_param(params),
+    )
+    fields: dict[str, object] = {
+        "kind": approval_kind,
+        "sessionKey": session_key,
+        "workspace": workspace_alias[1] if workspace_alias is not None else None,
+    }
+    if approval_kind == "sandbox_path":
+        fields["path"] = str(params.get("path") or "").strip()
+        fields["access"] = str(params.get("access") or "").strip()
+    else:
         bundle_id = str(params.get("bundle_id") or params.get("bundleId") or "").strip()
         if bundle_id:
             fields["bundle_id"] = bundle_id

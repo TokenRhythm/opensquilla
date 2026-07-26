@@ -2535,6 +2535,7 @@ async def _handle_sessions_send(
                     semantic_message=semantic_message_text,
                     persisted_user_message_id=persisted_entry.message_id,
                     message_count=1,
+                    accepted_run_mode_override=accepted_run_mode_override,
                     persist=_persist_collection,
                 )
                 if collected is not None:

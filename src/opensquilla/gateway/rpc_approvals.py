@@ -274,6 +274,7 @@ async def _handle_exec_approval_resolve(params: dict | None, ctx: RpcContext) ->
         try:
             await apply_sandbox_approval_choice(
                 pending.params,
+                approval_id=params["id"],
                 choice=normalized_choice,
                 approved=True,
                 session_manager=ctx.session_manager,

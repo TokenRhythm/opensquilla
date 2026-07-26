@@ -557,6 +557,11 @@ def tool_context_from_envelope(
             envelope.metadata.get("tool_policy") if cron_trusted_owner else None
         ),
     )
+    if sandbox_run_context_fresh:
+        # Runtime-only authority marker copied from the RouteEnvelope field,
+        # never from mutable metadata. Execution-time workspace validation is
+        # the only ingress that sets this field for ordinary turns.
+        setattr(ctx, "_sandbox_run_context_fresh", True)
     if caller_kind is CallerKind.CRON:
         if not cron_trusted_owner:
             ctx = apply_tool_policy_layer(

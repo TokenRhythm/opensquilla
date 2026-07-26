@@ -1294,6 +1294,7 @@ async def _resolve_channel_approval_decision(
         try:
             await apply_sandbox_approval_choice(
                 pending.params,
+                approval_id=approval_id,
                 choice=choice,
                 approved=True,
                 session_manager=session_manager,
