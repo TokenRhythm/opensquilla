@@ -205,6 +205,38 @@ async def test_validated_workspace_rejects_file_path(
 
 
 @pytest.mark.asyncio
+async def test_validated_workspace_normalizes_post_scan_path_key_failure(
+    workspace_ctx: tuple[RpcContext, SessionStorage],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx, storage = workspace_ctx
+    project = tmp_path / "vanishes-after-scan"
+    project.mkdir()
+    opened = await _handle_workspaces_open(
+        {"path": str(project), "trusted": True},
+        ctx,
+    )
+
+    def fail_strict_path_key(value: str | Path, *, strict: bool = False) -> str:
+        assert strict is True
+        raise FileNotFoundError(value)
+
+    monkeypatch.setattr(
+        "opensquilla.project_workspaces.project_path_key",
+        fail_strict_path_key,
+    )
+
+    with pytest.raises(ProjectWorkspaceStateError) as raised:
+        await resolve_validated_project_workspace(
+            storage,
+            opened["workspace"]["id"],
+        )
+
+    assert raised.value.reason == "unavailable"
+
+
+@pytest.mark.asyncio
 async def test_validated_workspace_rejects_filesystem_root(
     workspace_ctx: tuple[RpcContext, SessionStorage],
     tmp_path: Path,

@@ -399,6 +399,50 @@ async def test_workspace_changes_participate_in_idempotency_fingerprint(
 
 
 @pytest.mark.asyncio
+async def test_project_replay_and_conflict_precede_mutable_workspace_validation(
+    tmp_path: Path,
+) -> None:
+    async with open_stack(tmp_path / "sessions.db") as stack:
+        project = await add_project(stack, tmp_path / "project")
+        assert project is not None
+        params = {
+            "sessionKey": "agent:main:webchat:project-replay-order",
+            "message": "accepted once",
+            "workspaceId": project.workspace_id,
+            "clientRequestId": "project-replay-order-request",
+        }
+        accepted = await get_dispatcher().dispatch(
+            "project-replay-order-first",
+            "chat.send",
+            params,
+            stack.context,
+        )
+        await asyncio.wait_for(stack.started.wait(), timeout=2.0)
+        assert accepted.ok is True
+        await stack.storage.remove_project_workspace(project.workspace_id)
+
+        replay = await get_dispatcher().dispatch(
+            "project-replay-order-same",
+            "chat.send",
+            params,
+            stack.context,
+        )
+        conflict = await get_dispatcher().dispatch(
+            "project-replay-order-conflict",
+            "chat.send",
+            {**params, "message": "different fingerprint"},
+            stack.context,
+        )
+
+        assert replay.ok is True
+        assert replay.payload["replayed"] is True
+        assert replay.payload["message_id"] == accepted.payload["message_id"]
+        assert replay.payload["task_id"] == accepted.payload["task_id"]
+        assert conflict.ok is False
+        assert conflict.error.code == "IDEMPOTENCY_CONFLICT"
+
+
+@pytest.mark.asyncio
 async def test_bootstrap_and_fork_preserve_project_workspace(tmp_path: Path) -> None:
     async with open_stack(tmp_path / "sessions.db") as stack:
         project = await add_project(stack, tmp_path / "project")

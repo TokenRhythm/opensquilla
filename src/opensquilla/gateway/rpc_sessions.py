@@ -1767,22 +1767,6 @@ async def _handle_sessions_send(
     if storage_candidate is None:
         raise KeyError("No session storage available")
     storage = cast(SessionStorage, storage_candidate)
-    selected_workspace = None
-    if workspace_id is not None:
-        try:
-            selected_workspace = (
-                await resolve_validated_project_workspace(storage, workspace_id)
-            ).workspace
-        except ProjectWorkspaceStateError as exc:
-            if exc.reason in {"not_found", "removed"}:
-                raise RpcHandlerError(
-                    "WORKSPACE_NOT_FOUND",
-                    "Project workspace not found.",
-                ) from exc
-            raise RpcHandlerError(
-                "WORKSPACE_UNAVAILABLE",
-                "The project directory is unavailable.",
-            ) from exc
 
     ingress_identity = request_identity(
         params,
@@ -1813,6 +1797,23 @@ async def _handle_sessions_send(
                 client_request_id=ingress_identity.client_request_id,
                 storage=storage,
             )
+
+    selected_workspace = None
+    if workspace_id is not None:
+        try:
+            selected_workspace = (
+                await resolve_validated_project_workspace(storage, workspace_id)
+            ).workspace
+        except ProjectWorkspaceStateError as exc:
+            if exc.reason in {"not_found", "removed"}:
+                raise RpcHandlerError(
+                    "WORKSPACE_NOT_FOUND",
+                    "Project workspace not found.",
+                ) from exc
+            raise RpcHandlerError(
+                "WORKSPACE_UNAVAILABLE",
+                "The project directory is unavailable.",
+            ) from exc
 
     task_runtime_candidate = cast("TaskRuntime | None", getattr(ctx, "task_runtime", None))
     prepare_intent = getattr(ctx.session_manager, "prepare_intent", None)

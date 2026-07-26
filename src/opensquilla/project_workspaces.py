@@ -111,16 +111,16 @@ def _validate_stored_project_path(workspace: ProjectWorkspace) -> str:
             raise ProjectWorkspaceStateError("unavailable")
         with os.scandir(candidate):
             pass
+        canonical = _normalized_path(candidate)
+        if project_path_key(candidate, strict=True) != workspace.path_key:
+            raise ProjectWorkspaceStateError("canonical_changed")
+        if canonical != workspace.path:
+            raise ProjectWorkspaceStateError("canonical_changed")
+        return canonical
     except ProjectWorkspaceStateError:
         raise
     except (OSError, RuntimeError, ValueError) as exc:
         raise ProjectWorkspaceStateError("unavailable") from exc
-    canonical = _normalized_path(candidate)
-    if project_path_key(candidate, strict=True) != workspace.path_key:
-        raise ProjectWorkspaceStateError("canonical_changed")
-    if canonical != workspace.path:
-        raise ProjectWorkspaceStateError("canonical_changed")
-    return canonical
 
 
 async def resolve_validated_project_workspace(
