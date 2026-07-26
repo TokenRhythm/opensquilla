@@ -1,34 +1,44 @@
 /* Theme: light (value) — L1 token block. See src/themes/light/manifest.ts. */
-/* Light theme — "Morning Mist" (晨雾): white cards floating on a cool mist-grey
-   field. Primary action is ink-black (pill buttons); color appears only in
-   small functional accents — blue = in progress (info), green = done (ok),
-   warm orange = status/brand (accent-secondary), violet = queued/templates.
-   Discipline: the four hues never cover large areas; the canvas stays
-   mist/paper/ink. */
+/* Light theme — Feishu/Lark structural logic with a warm-orange brand.
+   Neutrals, text hierarchy, and borders follow Lark's published design language
+   (open.feishu.cn/document/design-specification/design-language/color): a
+   near-white field, four levels of grey text carrying the hierarchy, and
+   borders so light they read as separation rather than as frames. Colour is
+   reserved for call-to-action, selected state, and status — never as area.
+   The brand hue is the strike orange shared with the desktop launch sequence,
+   so both surfaces resolve to one family instead of drifting apart. */
 [data-theme="light"] {
-  /* Mist neutrals — cool near-white field, pure-white cards. Separation comes
-     from the soft --elev shadow + hairline border, not tint. */
-  --bg: #F1F2F5;
+  /* Lark neutrals: #F5F6F7 field, pure-white cards, #EFF0F1 for the recessed
+     step (hover fills, inset wells). Separation is border + soft --elev, never
+     tint stacking. */
+  --bg: #F5F6F7;
   --bg-surface: #FFFFFF;
-  --bg-surface-2: #EBECF1;
+  --bg-surface-2: #EFF0F1;
   --bg-elevated: #FFFFFF;
-  --bg-hover: #E5E7ED;
-  --text: #1C1E24;
-  --text-muted: #565C68;
-  --text-dim: #6E7380;
-  --border: #E2E4EA;
-  --border-strong: #C9CDD6;
-  --border-focus: #9CA3B0;
+  --bg-hover: #EFF0F1;
+  /* Four-level text ramp, straight from Lark. --text-dim is #868C95 rather than
+     Lark's #8F959E: the published tertiary lands at 2.79:1 on this field, under
+     the 3:1 floor check-webui-colors.mjs enforces, so it is darkened by the
+     smallest step that clears it (3.13:1). */
+  --text: #1F2329;
+  --text-muted: #646A73;
+  --text-dim: #868C95;
+  /* Card border / control border / disabled, per Lark. */
+  --border: #DEE0E3;
+  --border-strong: #D0D3D6;
+  --border-focus: #BA4D0F;
   --card: #FFFFFF;
-  --hairline: #ECEDF1;
+  --hairline: #EFF0F1;
 
-  /* Ink-black accent — the "black pill" primary. Interactive emphasis is
-     achromatic; hue is reserved for the semantic roles below. accent-secondary
-     is the warm brand orange, AA-darkened (4.5:1) for use as text. */
-  --accent: #1C1E24;
-  --accent-hover: #2E323B;
-  --accent-deep: #0C0D10;
-  --accent-secondary: #A34712;
+  /* Brand orange — the canonical strike accent (the family
+     check-cross-surface-tokens.mjs pins for desktop boot). Following Lark's
+     logic the brand carries the primary call-to-action, so the former ink-black
+     pill is now orange; every AA floor still clears (accent 4.67:1 on the
+     field, white-on-accent 5.05:1). */
+  --accent: #BA4D0F;
+  --accent-hover: #A5440C;
+  --accent-deep: #8E3A0A;
+  --accent-secondary: #B6501C;
   --accent-foreground: #FFFFFF;
 
   /* Mist elevation — thin hairline ring + soft, wide, low-opacity shadows
@@ -72,17 +82,18 @@
      onboarding, completion) — never behind operational UI. */
   --atmosphere-dawn: linear-gradient(180deg, #D9E5F6 0%, #EEF0F5 48%, #F8E9D8 100%);
 
-  /* Sidebar sits on the mist field itself (no separate plate); rows brighten
-     to paper on hover/active. */
-  --sidebar-bg: #F7F8FA;
+  /* Sidebar is the lightest Lark ground (#F8F9FA) with no separate plate; rows
+     step to #EFF0F1 on hover and active. Text reuses the four-level ramp so the
+     rail and the content area share one hierarchy. */
+  --sidebar-bg: #F8F9FA;
   --sidebar-control-bg: #FFFFFF;
-  --sidebar-control-hover: #ECEDF1;
-  --sidebar-item-hover: #E7E9EE;
-  --sidebar-item-active: #E2E4EA;
-  --sidebar-text-strong: #1C1E24;
-  --sidebar-text: #565C68;
-  --sidebar-text-soft: #6E7480;
-  --sidebar-border: #EAEBF0;
+  --sidebar-control-hover: #EFF0F1;
+  --sidebar-item-hover: #EFF0F1;
+  --sidebar-item-active: #E9EBED;
+  --sidebar-text-strong: #1F2329;
+  --sidebar-text: #646A73;
+  --sidebar-text-soft: #868C95;
+  --sidebar-border: #EFF0F1;
 }
 
 /* Structural identity — light explicitly re-asserts the foundation type + radius

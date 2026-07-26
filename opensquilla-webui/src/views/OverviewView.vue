@@ -54,28 +54,24 @@
     <!-- Three real KPIs — quiet Settings-style cards, display numerals. -->
     <section class="ov-kpis" :aria-label="t('sessions.overview.title')">
       <button class="control-stat control-stat--clickable" type="button" @click="router.push('/usage')">
-        <div class="control-stat__icon"><Icon name="usage" :size="18" /></div>
         <div class="control-stat__label">{{ t('sessions.overview.totalTokens') }}</div>
         <div class="control-stat__value">{{ tokensDisplay }}</div>
         <div class="control-stat__hint">{{ costLine }}</div>
       </button>
 
       <button class="control-stat control-stat--clickable" type="button" :title="t('sessions.overview.totalSessionsTitle')" @click="router.push('/sessions')">
-        <div class="control-stat__icon"><Icon name="sessions" :size="18" /></div>
         <div class="control-stat__label">{{ t('sessions.overview.totalSessions') }}</div>
         <div class="control-stat__value">{{ sessionsCount }}</div>
         <div class="control-stat__hint">{{ t('sessions.overview.viewAll') }}</div>
       </button>
 
       <button v-if="channelStats.total > 0" class="control-stat control-stat--clickable" type="button" @click="router.push('/channels')">
-        <div class="control-stat__icon"><Icon name="channels" :size="18" /></div>
         <div class="control-stat__label">{{ t('console.overview.channelsChip') }}</div>
         <div class="control-stat__value">{{ channelStats.total }}</div>
         <div class="control-stat__hint">{{ channelChipHint }}</div>
       </button>
 
       <div class="control-stat control-stat--static">
-        <div class="control-stat__icon"><Icon name="cron" :size="18" /></div>
         <div class="control-stat__label">{{ t('sessions.overview.uptime') }}</div>
         <div class="control-stat__value control-stat__value--mono">{{ uptime }}</div>
         <div class="control-stat__hint">{{ versionLine }}</div>

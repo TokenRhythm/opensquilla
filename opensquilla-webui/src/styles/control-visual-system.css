@@ -72,12 +72,14 @@
   grid-template-columns: repeat(var(--control-stat-columns, 4), minmax(0, 1fr));
 }
 
+/* Flat card, single frame. The tonal step from the field (#F5F6F7) to the card
+   (#FFFFFF) plus one hairline border is the whole separation — --elev-1 also
+   carries a 1px ring, so keeping both drew the card twice. */
 .control-stat {
   animation: control-fade-up var(--dur-enter) var(--ease-out) both;
   background: var(--bg-surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-card);
-  box-shadow: var(--elev-1);
   color: var(--text);
   display: flex;
   flex-direction: column;
@@ -87,7 +89,7 @@
   padding: var(--sp-4);
   position: relative;
   text-align: left;
-  transition: border-color var(--transition), box-shadow var(--transition), transform var(--dur-base) var(--ease-standard);
+  transition: border-color var(--transition), background var(--transition);
 }
 
 .control-stat--clickable {
