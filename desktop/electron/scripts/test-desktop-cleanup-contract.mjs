@@ -73,8 +73,6 @@ assert.throws(
 
 const primarySelection = {
   mode: 'delete-current-profile',
-  profileKind: 'primary',
-  recoveryId: null,
   profileKey: 'primary',
 }
 assert.deepEqual(cleanupSelectorArgs(primarySelection), [
@@ -82,24 +80,12 @@ assert.deepEqual(cleanupSelectorArgs(primarySelection), [
   '--profile-kind', 'primary',
 ])
 
-const recoverySelection = {
-  mode: 'reset-current-settings',
-  profileKind: 'recovery',
-  recoveryId: '01234567-89ab-4cde-8fab-0123456789ab',
-  profileKey: 'recovery:01234567-89ab-4cde-8fab-0123456789ab',
-}
-assert.deepEqual(cleanupSelectorArgs(recoverySelection), [
-  '--mode', 'reset-current-settings',
-  '--profile-kind', 'recovery',
-  '--recovery-id', recoverySelection.recoveryId,
-])
-
 const store = new DesktopCleanupPreviewStore(1_000)
 const preview = store.create(report, primarySelection, 100)
 assert.equal(
-  store.consume(preview.id, 'recovery:other', 200),
+  store.consume(preview.id, 'stale-primary-context', 200),
   null,
-  'a preview must be bound to the exact active profile',
+  'a preview must be bound to the exact primary context',
 )
 assert.equal(
   store.consume(preview.id, 'primary', 200),
@@ -111,11 +97,11 @@ const fresh = store.create(report, primarySelection, 100)
 assert.equal(store.consume(fresh.id, 'primary', 1_101), null, 'expired previews fail closed')
 
 const discardable = store.create(report, primarySelection, 100)
-assert.equal(store.discard(discardable.id, 'recovery:other'), false)
+assert.equal(store.discard(discardable.id, 'stale-primary-context'), false)
 assert.equal(
   store.consume(discardable.id, 'primary', 200)?.id,
   discardable.id,
-  'a stale renderer cannot discard another profile preview',
+  'a stale renderer cannot discard the current primary preview',
 )
 const explicitlyDiscarded = store.create(report, primarySelection, 100)
 assert.equal(store.discard(explicitlyDiscarded.id, 'primary'), true)

@@ -346,6 +346,8 @@ def test_restore_missing_backup_lock_authority_fails_without_mutating_backup(
         restore_profile(backup)
 
     assert exc_info.value.stable_code == "restore_backup_lock_authority_missing"
+    assert "recovery profile" not in str(exc_info.value).lower()
+    assert "primary profile" in str(exc_info.value).lower()
     _assert_profile_snapshot_unchanged(backup, backup_before, backup_file_bytes)
     assert not (backup / "state" / "gateway.pid.lock").exists()
     assert (target / "workspace" / "SOUL.md").read_text(encoding="utf-8") == "current\n"

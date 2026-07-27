@@ -445,6 +445,53 @@ async def test_reset_same_key_atomically_rotates_and_accepts_new_turn(
 
 
 @pytest.mark.asyncio
+async def test_reset_archive_failure_rolls_back_atomic_acceptance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    async with _open_intent_stack(tmp_path / "sessions.db") as stack:
+        old_session_id, old_epoch, _old_message_id = await _seed_reset_state(stack)
+
+        async def fail_archive(*_args: Any, **_kwargs: Any) -> None:
+            raise OSError("archive unavailable")
+
+        monkeypatch.setattr(stack.manager, "write_session_archive", fail_archive)
+        response = await get_dispatcher().dispatch(
+            "rpc-reset-archive-failure",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "must not replace old history",
+                "intent": "reset_same_key",
+                "clientRequestId": "reset-archive-failure",
+            },
+            stack.context,
+        )
+
+        assert response.ok is False
+        persisted = await stack.storage.get_session(SESSION_KEY)
+        assert persisted is not None
+        assert persisted.session_id == old_session_id
+        assert persisted.epoch == old_epoch
+        transcript = await stack.storage.get_transcript(old_session_id)
+        assert [entry.content for entry in transcript] == ["old transcript"]
+        summaries = await stack.storage.get_all_summaries(old_session_id)
+        assert [summary.summary_text for summary in summaries] == ["old summary"]
+        context_states = await stack.manager.get_context_states(SESSION_KEY)
+        assert len(context_states) == 1
+        assert context_states[0].valid is True
+        assert _table_counts(stack.db_path) == {
+            "sessions": 1,
+            "transcript_entries": 1,
+            "session_summaries": 1,
+            "session_context_states": 1,
+            "agent_tasks": 0,
+            "turn_ingress_receipts": 0,
+        }
+
+
+@pytest.mark.asyncio
 async def test_reset_archive_snapshot_includes_append_committed_before_acceptance(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

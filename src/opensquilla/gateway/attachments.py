@@ -13,7 +13,7 @@ from starlette.routing import Route
 
 from opensquilla.attachment_refs import transcript_material_path
 from opensquilla.gateway.config import GatewayConfig
-from opensquilla.paths import media_root_from_config
+from opensquilla.paths import media_root_from_config, native_io_path
 
 
 async def _session_id_for_download(session_manager: Any, session_key: str) -> str | None:
@@ -79,14 +79,15 @@ def register_attachment_routes(
                 {"error": "Attachment not found", "code": "NOT_FOUND"},
                 status_code=404,
             )
-        if not path.exists() or not path.is_file():
+        native_path = native_io_path(path)
+        if not native_path.exists() or not native_path.is_file():
             return JSONResponse(
                 {"error": "Attachment not found", "code": "NOT_FOUND"},
                 status_code=404,
             )
 
         try:
-            actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+            actual_sha = hashlib.sha256(native_path.read_bytes()).hexdigest()
         except OSError:
             return JSONResponse(
                 {"error": "Attachment not found", "code": "NOT_FOUND"},
@@ -99,7 +100,7 @@ def register_attachment_routes(
             )
 
         return FileResponse(
-            path,
+            native_path,
             media_type=_safe_media_type(request.query_params.get("mime")),
             filename=_safe_download_name(request.query_params.get("name")),
         )
