@@ -22,6 +22,11 @@ function harness(
     call: vi.fn().mockResolvedValue({ commands }),
   }
   const activatePlanMode = vi.fn(async () => true)
+  const codingModeEnabled = ref(false)
+  const setCodingModeEnabled = vi.fn(async (enabled: boolean) => {
+    codingModeEnabled.value = enabled
+    return true
+  })
   const dispatchHidden = vi.fn()
   const dispatchPlanPrompt = vi.fn()
   const api = useChatSlashCommands({
@@ -38,8 +43,19 @@ function harness(
     dispatchPlanPrompt,
     activatePlanMode,
     planModeAvailable: () => planModeAvailable,
+    codingModeEnabled,
+    setCodingModeEnabled,
   })
-  return { activatePlanMode, api, dispatchHidden, dispatchPlanPrompt, inputText, rpc }
+  return {
+    activatePlanMode,
+    api,
+    codingModeEnabled,
+    dispatchHidden,
+    dispatchPlanPrompt,
+    inputText,
+    rpc,
+    setCodingModeEnabled,
+  }
 }
 
 describe('useChatSlashCommands plan compatibility', () => {
@@ -148,5 +164,48 @@ describe('useChatSlashCommands plan compatibility', () => {
     expect(inputText.value).toBe('/plan')
     expect(dispatchHidden).not.toHaveBeenCalled()
     expect(dispatchPlanPrompt).not.toHaveBeenCalled()
+  })
+})
+
+describe('useChatSlashCommands Coding mode', () => {
+  const codingCommand = {
+    name: '/coding',
+    description: 'Enable Coding mode, or inspect and disable it.',
+    aliases: [],
+    execution: { action: 'coding.mode' },
+    argument_choices: [
+      { value: 'on', description: 'Enable Coding mode.' },
+      { value: 'off', description: 'Disable Coding mode.' },
+      { value: 'status', description: 'Show whether Coding mode is enabled.' },
+    ],
+  }
+
+  it('enables Coding mode when /coding is entered without arguments', async () => {
+    const { api, inputText, setCodingModeEnabled } = harness(false, [codingCommand])
+    inputText.value = '/coding'
+
+    await api.executeSlashCommand(inputText.value)
+    await Promise.resolve()
+
+    expect(setCodingModeEnabled).toHaveBeenCalledWith(true)
+    expect(inputText.value).toBe('')
+  })
+
+  it('supports disabling and checking Coding mode from the slash command', async () => {
+    const {
+      api,
+      codingModeEnabled,
+      inputText,
+      setCodingModeEnabled,
+    } = harness(false, [codingCommand])
+
+    await api.executeSlashCommand('/coding off')
+    await Promise.resolve()
+    expect(setCodingModeEnabled).toHaveBeenCalledWith(false)
+
+    codingModeEnabled.value = true
+    await api.executeSlashCommand('/coding status')
+    expect(setCodingModeEnabled).toHaveBeenCalledTimes(1)
+    expect(inputText.value).toBe('')
   })
 })

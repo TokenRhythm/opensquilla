@@ -508,9 +508,15 @@ test.describe('Settings modal', () => {
     await expect.poll(() => page.evaluate(() => document.documentElement.getAttribute('data-theme'))).toBe('light')
     expect(await page.evaluate(() => localStorage.getItem('opensquilla-theme'))).toBe('light')
 
-    // The router visual-effects toggle is NOT duplicated here — it stays in the
-    // chat composer where its live state belongs.
-    await expect(dialog(page).locator('input[name="appearance_visual_effects"]')).toHaveCount(0)
+    // Visual effects are a low-frequency browser preference and live here
+    // instead of adding another popover to the chat composer.
+    const visualEffects = dialog(page).getByRole('switch', { name: 'Visual effects' })
+    await expect(visualEffects).toBeVisible()
+    await visualEffects.click()
+    await expect(visualEffects).not.toBeChecked()
+    expect(await page.evaluate(() => (
+      JSON.parse(localStorage.getItem('opensquilla.routerFx') || '{}').enabled
+    ))).toBe(false)
 
     // Client-only: theme changes never raise the settings dirty bar.
     await expect(dialog(page).locator('.settings-dirtybar')).toBeHidden()

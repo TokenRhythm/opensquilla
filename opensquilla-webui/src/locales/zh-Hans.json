@@ -244,6 +244,8 @@
       "toolDetailsAuto": "自动",
       "toolDetailsCompact": "紧凑",
       "toolDetailsExpanded": "展开",
+      "visualEffectsLabel": "动画效果",
+      "visualEffectsDesc": "在对话中显示模型路由决策和回答切换动画。",
       "bgmLabel": "背景音乐",
       "bgmDesc": "在顶栏显示背景音乐控件。默认关闭；也可通过命令面板切换。",
       "sidebarWidthLabel": "侧边栏宽度",
@@ -3140,6 +3142,12 @@
       "sendingReply": "正在发送回复…",
       "sendReply": "发送回复",
       "sendingContinuing": "正在发送回复 · 继续运行…"
+    },
+    "codingMode": {
+      "enabled": "Coding mode 已开启。",
+      "disabled": "Coding mode 已关闭。",
+      "usage": "请使用 /coding、/coding on、/coding off 或 /coding status。",
+      "updateFailed": "无法更新 Coding mode。"
     },
     "composer": {
       "executionMode": "执行模式",

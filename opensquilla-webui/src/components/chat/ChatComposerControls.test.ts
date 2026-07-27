@@ -1,28 +1,18 @@
 import { describe, expect, it } from 'vitest'
-import source from './ChatComposerSettings.vue?raw'
 import runModeSource from './ChatComposerRunMode.vue?raw'
 import modelRoutingSource from './ChatComposerModelRouting.vue?raw'
 import composerSource from './ChatComposer.vue?raw'
 import viewSource from '../../views/ChatView.vue?raw'
+import appearanceSource from '../settings/SettingsAppearancePanel.vue?raw'
+import slashSource from '../../composables/chat/useChatSlashCommands.ts?raw'
 import zhHans from '../../locales/zh-Hans.json'
 
-function controlSwitchBlock(label: string) {
-  const labelIndex = source.indexOf(`label="${label}"`)
-  if (labelIndex === -1) return ''
-  const start = source.lastIndexOf('<ControlSwitch', labelIndex)
-  const end = source.indexOf('/>', labelIndex)
-  return source.slice(start, end)
-}
-
-describe('ChatComposerSettings coding mode contract', () => {
+describe('ChatComposer control hierarchy', () => {
   it('keeps legacy execution mode choices out of the composer settings panel', () => {
-    expect(source).not.toContain('chat.composer.executionMode')
-    expect(source).not.toContain('composer-execution-mode')
-    expect(source).not.toContain('setElevatedMode')
-    expect(source).not.toContain('chat.composer.execOff')
-    expect(source).not.toContain('chat.composer.execPrompt')
-    expect(source).not.toContain('chat.composer.execBypass')
-    expect(source).not.toContain('chat.composer.execFull')
+    expect(composerSource).not.toContain('ChatComposerSettings')
+    expect(composerSource).not.toContain('chat.composer.executionMode')
+    expect(composerSource).not.toContain('composer-execution-mode')
+    expect(composerSource).not.toContain('setElevatedMode')
   })
 
   it('threads the shield run-mode control through ChatComposer and ChatView', () => {
@@ -59,52 +49,29 @@ describe('ChatComposerSettings coding mode contract', () => {
       .toBe('访问项目外文件、网络或更改系统时会询问你。')
   })
 
-  it('places Coding mode after Visual effects', () => {
-    const visualEffectsIndex = source.indexOf('label="Visual effects"')
-    const codingModeIndex = source.indexOf('label="Coding mode"')
-
-    expect(visualEffectsIndex).toBeGreaterThanOrEqual(0)
-    expect(codingModeIndex).toBeGreaterThan(visualEffectsIndex)
+  it('moves visual effects to Appearance settings', () => {
+    expect(appearanceSource).toContain('settings.appearance.visualEffectsLabel')
+    expect(appearanceSource).toContain('name="appearance_visual_effects"')
+    expect(appearanceSource).toContain('@change="setRouterVisualEffectsEnabled"')
+    expect(composerSource).not.toContain('setVisualEffectsEnabled')
   })
 
-  it('binds Coding mode checked and busy state to typed props', () => {
-    const block = controlSwitchBlock('Coding mode')
-
-    expect(block).toContain(':checked="codingModeEnabled"')
-    expect(block).toContain(':busy="codingModeSettingsBusy"')
-    expect(source).toContain('codingModeEnabled: boolean')
-    expect(source).toContain('codingModeSettingsBusy: boolean')
-  })
-
-  it('emits Coding mode changes through the typed settings event', () => {
-    const block = controlSwitchBlock('Coding mode')
-
-    expect(block).toContain('@change="$emit(\'setCodingModeEnabled\', $event)"')
-    expect(source).toContain('setCodingModeEnabled: [enabled: boolean]')
-  })
-
-  it('threads Coding mode props and events through ChatComposer and ChatView', () => {
-    expect(composerSource).toContain(':coding-mode-enabled="codingModeEnabled"')
-    expect(composerSource).toContain(':coding-mode-settings-busy="codingModeSettingsBusy"')
-    expect(composerSource).toContain('@set-coding-mode-enabled="emit(\'setCodingModeEnabled\', $event)"')
-    expect(composerSource).toContain('setCodingModeEnabled: [enabled: boolean]')
-
-    expect(viewSource).toContain(':coding-mode-enabled="codingModeEnabled"')
-    expect(viewSource).toContain(':coding-mode-settings-busy="codingModeSettingsBusy"')
-    expect(viewSource).toContain('@set-coding-mode-enabled="setComposerCodingModeEnabled"')
-    expect(viewSource).toContain('async function setComposerCodingModeEnabled(enabled: boolean)')
-    expect(viewSource).toContain('await setCodingModeEnabled(enabled)')
+  it('makes Coding mode available only through the slash path in Web chat', () => {
+    expect(composerSource).not.toContain('codingModeEnabled')
+    expect(composerSource).not.toContain('setCodingModeEnabled')
+    expect(slashSource).toContain("action === 'coding.mode'")
+    expect(slashSource).toContain("options.setCodingModeEnabled(mode === 'on')")
+    expect(viewSource).toContain('codingModeEnabled,')
+    expect(viewSource).toContain('setCodingModeEnabled,')
   })
 })
 
 describe('ChatComposer model routing contract', () => {
   it('keeps model-routing choices out of the generic composer settings panel', () => {
-    expect(source).not.toContain('label="Squilla Router"')
-    expect(source).not.toContain('label="LLM Ensemble"')
-    expect(source).not.toContain('routerEnabled: boolean')
-    expect(source).not.toContain('llmEnsembleEnabled: boolean')
-    expect(source).not.toContain('setRouterEnabled')
-    expect(source).not.toContain('setLlmEnsembleEnabled')
+    expect(composerSource).not.toContain('label="Squilla Router"')
+    expect(composerSource).not.toContain('label="LLM Ensemble"')
+    expect(composerSource).not.toContain('routerEnabled: boolean')
+    expect(composerSource).not.toContain('llmEnsembleEnabled: boolean')
   })
 
   it('threads the independent model-routing control through ChatComposer and ChatView', () => {

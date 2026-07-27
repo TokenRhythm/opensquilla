@@ -13,6 +13,7 @@ import {
   type ToolDetailDisplayMode,
   useToolDetailPreference,
 } from '@/composables/useToolDetailPreference'
+import { useRouterVisualEffectsPreference } from '@/composables/useRouterVisualEffectsPreference'
 import {
   SIDEBAR_MAX_WIDTH,
   SIDEBAR_MIN_WIDTH,
@@ -61,6 +62,10 @@ const {
   mode: toolDetailDisplayMode,
   setMode: setToolDetailDisplayMode,
 } = useToolDetailPreference()
+const {
+  enabled: routerVisualEffectsEnabled,
+  setEnabled: setRouterVisualEffectsEnabled,
+} = useRouterVisualEffectsPreference()
 
 function pickToolDetailDisplay(mode: ToolDetailDisplayMode) {
   setToolDetailDisplayMode(mode)
@@ -324,6 +329,22 @@ onBeforeUnmount(stopCustomStepRepeat)
             <span>{{ t(option.labelKey) }}</span>
           </label>
         </div>
+      </div>
+    </div>
+
+    <div class="control-row control-row--stack">
+      <div class="control-row__label-block">
+        <span class="control-row__label">{{ t('settings.appearance.visualEffectsLabel') }}</span>
+        <span class="control-row__desc">{{ t('settings.appearance.visualEffectsDesc') }}</span>
+      </div>
+      <div class="control-row__control">
+        <ControlSwitch
+          :checked="routerVisualEffectsEnabled"
+          :aria-label="t('settings.appearance.visualEffectsLabel')"
+          name="appearance_visual_effects"
+          data-testid="settings-visual-effects-toggle"
+          @change="setRouterVisualEffectsEnabled"
+        />
       </div>
     </div>
 

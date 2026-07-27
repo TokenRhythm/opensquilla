@@ -67,6 +67,8 @@ export interface UseChatSlashCommandsOptions {
   dispatchPlanPrompt: (prompt: string, composerText: string) => void
   activatePlanMode?: () => boolean | Promise<boolean>
   planModeAvailable?: () => boolean
+  codingModeEnabled: Ref<boolean>
+  setCodingModeEnabled: (enabled: boolean) => Promise<boolean>
 }
 
 function slashCommandKey(value: string): string {
@@ -224,6 +226,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
   }
 
   function selectSlashCmd(cmd: ChatSlashCommand, args = '') {
+    const action = cmd?.execution?.action || cmd.cmd || cmd.name
     // Argument candidate ("/meta <skill>"): Tab-completes into the composer;
     // the user presses Enter to run it.
     if (cmd.argValue) {
@@ -234,7 +237,12 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     }
     // A command that takes arguments, selected with none yet: complete to
     // "/cmd " and reopen the menu showing its argument candidates.
-    if (!args && (cmd.argumentChoices?.length ?? 0) > 0) {
+    if (
+      action !== 'coding.mode'
+      && action !== '/coding'
+      && !args
+      && (cmd.argumentChoices?.length ?? 0) > 0
+    ) {
       closeSlashMenu()
       options.inputText.value = cmd.cmd + ' '
       options.autoResizeTextarea()
@@ -242,7 +250,6 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       return
     }
 
-    const action = cmd?.execution?.action || cmd.cmd || cmd.name
     if (
       action === 'plans.toggleMode'
       || action === 'plans.setMode'
@@ -259,6 +266,32 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
         }
         options.inputText.value = ''
         options.autoResizeTextarea()
+      })
+      return
+    }
+    if (action === 'coding.mode' || action === '/coding') {
+      closeSlashMenu()
+      const mode = String(args || 'on').trim().toLowerCase()
+      options.inputText.value = ''
+      options.autoResizeTextarea()
+      if (mode === 'status') {
+        options.notify(i18n.global.t(
+          options.codingModeEnabled.value
+            ? 'chat.codingMode.enabled'
+            : 'chat.codingMode.disabled',
+        ))
+        return
+      }
+      if (mode !== 'on' && mode !== 'off') {
+        options.notify(i18n.global.t('chat.codingMode.usage'))
+        return
+      }
+      void options.setCodingModeEnabled(mode === 'on').then((updated) => {
+        options.notify(i18n.global.t(
+          updated
+            ? (mode === 'on' ? 'chat.codingMode.enabled' : 'chat.codingMode.disabled')
+            : 'chat.codingMode.updateFailed',
+        ))
       })
       return
     }

@@ -188,7 +188,7 @@
             <div ref="moreActionsAnchorEl" class="chat-settings-anchor">
               <button
                 class="btn btn--icon btn--ghost chat-more-actions-btn"
-                :class="{ 'is-active': moreActionsOpen || settingsOpen }"
+                :class="{ 'is-active': moreActionsOpen }"
                 :title="t('chrome.more')"
                 :aria-label="t('chrome.more')"
                 aria-haspopup="menu"
@@ -203,15 +203,6 @@
                 role="menu"
                 :aria-label="t('chrome.more')"
               >
-                <button
-                  type="button"
-                  role="menuitem"
-                  :aria-label="t('chat.composerSettings')"
-                  @click="openSettings"
-                >
-                  <Icon name="settings" :size="16" />
-                  <span>{{ t('chat.composerSettings') }}</span>
-                </button>
                 <button
                   type="button"
                   role="menuitem"
@@ -234,15 +225,6 @@
                   <span>{{ t('chat.exportMarkdown') }}</span>
                 </button>
               </div>
-              <ChatComposerSettings
-                v-if="settingsOpen"
-                :visual-effects-enabled="routerVisualEffectsEnabled"
-                :coding-mode-enabled="codingModeEnabled"
-                :coding-mode-settings-busy="codingModeSettingsBusy"
-                @close="settingsOpen = false"
-                @set-visual-effects-enabled="emit('setVisualEffectsEnabled', $event)"
-                @set-coding-mode-enabled="emit('setCodingModeEnabled', $event)"
-              />
             </div>
           </div>
           <ChatComposerPlanMode
@@ -311,7 +293,6 @@ import type { IconName } from '@/utils/icons'
 import ChatComposerAddMenu from '@/components/chat/ChatComposerAddMenu.vue'
 import ChatComposerModelRouting from '@/components/chat/ChatComposerModelRouting.vue'
 import ChatComposerPlanMode from '@/components/chat/ChatComposerPlanMode.vue'
-import ChatComposerSettings from '@/components/chat/ChatComposerSettings.vue'
 import ChatComposerRunMode from '@/components/chat/ChatComposerRunMode.vue'
 import type { Attachment } from '@/types/chat'
 import type { ModelRoutingMode } from '@/types/modelRouting'
@@ -343,9 +324,6 @@ const props = withDefaults(defineProps<{
   runModeLockMessage: string
   modelRoutingMode: ModelRoutingMode
   modelRoutingSettingsBusy: boolean
-  routerVisualEffectsEnabled: boolean
-  codingModeEnabled: boolean
-  codingModeSettingsBusy: boolean
   voiceBusy: boolean
   voiceRecording: boolean
   voiceReady: boolean
@@ -376,8 +354,6 @@ const emit = defineEmits<{
   setBusySendMode: [mode: 'queue' | 'steer']
   setRunMode: [mode: 'standard' | 'trusted' | 'full']
   setModelRoutingMode: [mode: ModelRoutingMode]
-  setVisualEffectsEnabled: [enabled: boolean]
-  setCodingModeEnabled: [enabled: boolean]
   setCollaborationMode: [mode: CollaborationMode]
   cancelReplan: []
   voiceInput: []
@@ -395,7 +371,6 @@ const composerEl = ref<HTMLElement | null>(null)
 const textareaEl = ref<HTMLTextAreaElement | null>(null)
 const fileInputEl = ref<HTMLInputElement | null>(null)
 const addMenuOpen = ref(false)
-const settingsOpen = ref(false)
 const modelRoutingOpen = ref(false)
 const moreActionsOpen = ref(false)
 
@@ -422,7 +397,6 @@ const moreActionsAnchorEl = ref<HTMLElement | null>(null)
 
 const anyPopoverOpen = computed(() =>
   addMenuOpen.value
-  || settingsOpen.value
   || modelRoutingOpen.value
   || runModeOpen.value
   || moreActionsOpen.value,
@@ -440,10 +414,9 @@ function closeOpenPopoversFromOutside(event: PointerEvent) {
     addMenuOpen.value = false
   }
   if (
-    (settingsOpen.value || moreActionsOpen.value) &&
+    moreActionsOpen.value &&
     !eventInsideRoot(event, moreActionsAnchorEl.value)
   ) {
-    settingsOpen.value = false
     moreActionsOpen.value = false
   }
   if (modelRoutingOpen.value && !eventInsideRoot(event, modelRoutingAnchorEl.value)) {
@@ -471,7 +444,6 @@ function toggleModelRouting() {
   if (modelRoutingOpen.value) {
     dismissRouterNewBadge()
     addMenuOpen.value = false
-    settingsOpen.value = false
     runModeOpen.value = false
     moreActionsOpen.value = false
   }
@@ -482,7 +454,6 @@ function toggleRunMode() {
   runModeOpen.value = !runModeOpen.value
   if (runModeOpen.value) {
     addMenuOpen.value = false
-    settingsOpen.value = false
     modelRoutingOpen.value = false
     moreActionsOpen.value = false
   }
@@ -493,12 +464,7 @@ watch(() => props.runModeLocked, (locked) => {
 })
 
 function toggleMoreActions() {
-  if (settingsOpen.value) {
-    settingsOpen.value = false
-    moreActionsOpen.value = true
-  } else {
-    moreActionsOpen.value = !moreActionsOpen.value
-  }
+  moreActionsOpen.value = !moreActionsOpen.value
   if (moreActionsOpen.value) {
     addMenuOpen.value = false
     modelRoutingOpen.value = false
@@ -509,19 +475,10 @@ function toggleMoreActions() {
 function toggleAddMenu() {
   addMenuOpen.value = !addMenuOpen.value
   if (addMenuOpen.value) {
-    settingsOpen.value = false
     moreActionsOpen.value = false
     modelRoutingOpen.value = false
     runModeOpen.value = false
   }
-}
-
-function openSettings() {
-  addMenuOpen.value = false
-  moreActionsOpen.value = false
-  settingsOpen.value = true
-  modelRoutingOpen.value = false
-  runModeOpen.value = false
 }
 
 function triggerVoice() {

@@ -244,6 +244,8 @@
       "toolDetailsAuto": "Automático",
       "toolDetailsCompact": "Compacto",
       "toolDetailsExpanded": "Expandido",
+      "visualEffectsLabel": "Efectos visuales",
+      "visualEffectsDesc": "Anima las decisiones de enrutamiento de modelos y las transiciones de respuestas.",
       "bgmLabel": "Música de fondo",
       "bgmDesc": "Muestra el control de música de fondo en la barra superior. Desactivado por defecto; también se puede alternar desde la paleta de comandos.",
       "sidebarWidthLabel": "Ancho de la barra lateral",
@@ -3140,6 +3142,12 @@
       "sendingReply": "Enviando respuesta…",
       "sendReply": "Enviar respuesta",
       "sendingContinuing": "Enviando respuesta · continuando la ejecución…"
+    },
+    "codingMode": {
+      "enabled": "Coding mode activado.",
+      "disabled": "Coding mode desactivado.",
+      "usage": "Usa /coding, /coding on, /coding off o /coding status.",
+      "updateFailed": "No se pudo actualizar Coding mode."
     },
     "composer": {
       "executionMode": "Modo de ejecución",

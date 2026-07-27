@@ -491,9 +491,6 @@
       :run-mode-lock-message="t('chat.composer.runModeLocked')"
       :model-routing-mode="modelRoutingMode"
       :model-routing-settings-busy="modelRoutingSettingsBusy"
-      :router-visual-effects-enabled="routerVisualEffectsEnabled"
-      :coding-mode-enabled="codingModeEnabled"
-      :coding-mode-settings-busy="codingModeSettingsBusy"
       :voice-busy="voiceBusy"
       :voice-recording="voiceRecording"
       :voice-ready="voiceReady"
@@ -518,8 +515,6 @@
       @set-busy-send-mode="busySendMode = $event"
       @set-run-mode="setComposerRunMode"
       @set-model-routing-mode="setComposerModelRoutingMode"
-      @set-visual-effects-enabled="setComposerVisualEffectsEnabled"
-      @set-coding-mode-enabled="setComposerCodingModeEnabled"
       @set-collaboration-mode="setCollaborationMode"
       @cancel-replan="cancelPlanRevision"
       @voice-input="onVoiceInput"
@@ -1118,12 +1113,10 @@ const {
   routerVisualEffectsEnabled,
   routerVisualMode,
   codingModeEnabled,
-  codingModeSettingsBusy,
   routerTierConfigs,
   loadFeatureToggles,
   setModelRoutingMode,
   setCodingModeEnabled,
-  setRouterVisualEffectsEnabled,
   bindFeatureRefresh,
 } = chatFeatureToggles
 isQueuedDeliveryBlocked = () => (
@@ -1537,6 +1530,8 @@ const chatSlashCommands = useChatSlashCommands({
   },
   activatePlanMode: () => chatPlans.setMode('plan'),
   planModeAvailable: () => planUiAvailable.value,
+  codingModeEnabled,
+  setCodingModeEnabled,
 })
 const {
   slashOpen,
@@ -2305,15 +2300,6 @@ async function setComposerRunMode(mode: SandboxRunMode) {
 async function setComposerModelRoutingMode(mode: ModelRoutingMode) {
   await setModelRoutingMode(mode)
   scheduleHistorySync()
-}
-
-function setComposerVisualEffectsEnabled(enabled: boolean) {
-  setRouterVisualEffectsEnabled(enabled)
-  scheduleHistorySync()
-}
-
-async function setComposerCodingModeEnabled(enabled: boolean) {
-  await setCodingModeEnabled(enabled)
 }
 
 // A suggestion chip is an explicit task choice. Route it through the same

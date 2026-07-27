@@ -244,6 +244,8 @@
       "toolDetailsAuto": "Automatisch",
       "toolDetailsCompact": "Kompakt",
       "toolDetailsExpanded": "Ausgeklappt",
+      "visualEffectsLabel": "Visuelle Effekte",
+      "visualEffectsDesc": "Animiert Modell-Routing-Entscheidungen und Antwortübergänge in Unterhaltungen.",
       "bgmLabel": "Hintergrundmusik",
       "bgmDesc": "Zeigt das Hintergrundmusik-Element in der oberen Leiste. Standardmäßig aus; auch über die Befehlspalette umschaltbar.",
       "sidebarWidthLabel": "Seitenleistenbreite",
@@ -3140,6 +3142,12 @@
       "sendingReply": "Antwort wird gesendet…",
       "sendReply": "Antwort senden",
       "sendingContinuing": "Antwort wird gesendet · Ausführung wird fortgesetzt…"
+    },
+    "codingMode": {
+      "enabled": "Coding mode aktiviert.",
+      "disabled": "Coding mode deaktiviert.",
+      "usage": "Verwende /coding, /coding on, /coding off oder /coding status.",
+      "updateFailed": "Coding mode konnte nicht aktualisiert werden."
     },
     "composer": {
       "executionMode": "Ausführungsmodus",

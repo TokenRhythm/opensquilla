@@ -343,6 +343,21 @@ _COMMANDS: tuple[CommandDef, ...] = (
         presentation=CommandPresentation.NOTICE,
         order=70,
     ),
+    CommandDef(
+        name="/coding",
+        usage="/coding [on|off|status]",
+        description="Enable Coding mode, or inspect and disable it.",
+        execution={_W: _local("coding.mode")},
+        argument_choices=(
+            ArgumentChoice("on", "Enable Coding mode."),
+            ArgumentChoice("off", "Disable Coding mode."),
+            ArgumentChoice("status", "Show whether Coding mode is enabled."),
+        ),
+        category=CommandCategory.CONTROL,
+        busy_policy=CommandBusyPolicy.IMMEDIATE,
+        presentation=CommandPresentation.NOTICE,
+        order=75,
+    ),
     # ---- TUI + Channel ----------------------------------------------------
     CommandDef(
         name="/help",

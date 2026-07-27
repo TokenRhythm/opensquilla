@@ -244,6 +244,8 @@
       "toolDetailsAuto": "Auto",
       "toolDetailsCompact": "Compact",
       "toolDetailsExpanded": "Expanded",
+      "visualEffectsLabel": "Visual effects",
+      "visualEffectsDesc": "Animate model-routing decisions and answer transitions in conversations.",
       "bgmLabel": "Background music",
       "bgmDesc": "Show the background-music control in the top bar. Off by default; also toggleable from the command palette.",
       "sidebarWidthLabel": "Sidebar width",
@@ -3140,6 +3142,12 @@
       "sendingReply": "Sending reply…",
       "sendReply": "Send reply",
       "sendingContinuing": "Sending reply · continuing run…"
+    },
+    "codingMode": {
+      "enabled": "Coding mode enabled.",
+      "disabled": "Coding mode disabled.",
+      "usage": "Use /coding, /coding on, /coding off, or /coding status.",
+      "updateFailed": "Coding mode could not be updated."
     },
     "composer": {
       "executionMode": "Execution mode",

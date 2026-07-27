@@ -10,6 +10,7 @@ import {
   DEFAULT_ROUTER_VISUAL_MODE,
   normalizeRouterVisualMode,
 } from '@/utils/chat/routerVisualMode'
+import { useRouterVisualEffectsPreference } from '@/composables/useRouterVisualEffectsPreference'
 
 type RpcClient = {
   waitForConnection: () => Promise<void>
@@ -53,12 +54,14 @@ interface ModelRoutingSnapshot {
   selection_mode?: string
 }
 
-const ROUTER_FX_PREF_KEY = 'opensquilla.routerFx'
 const ROUTER_SHAPE_KEY = 'opensquilla.router.shape'
 export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
   const { pushToast } = useToasts()
   const routerEnabled = ref(false)
-  const routerVisualEffectsEnabled = ref(true)
+  const {
+    enabled: routerVisualEffectsEnabled,
+    setEnabled: setRouterVisualEffectsEnabled,
+  } = useRouterVisualEffectsPreference()
   const routerVisualMode = ref(DEFAULT_ROUTER_VISUAL_MODE)
   const routerSettingsBusy = ref(false)
   const codingModeEnabled = ref(false)
@@ -104,8 +107,6 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     llmEnsembleEnabled.value = ensembleEnabled
     llmEnsembleSelectionMode.value = String(cfg?.llm_ensemble?.selection_mode || '')
     routerVisualMode.value = normalizeRouterVisualMode(router.visual_mode)
-    loadRouterVisualEffectsPreference()
-
     const tiers = router.tiers
     const tierKeys: string[] = []
     const tierModels: Record<string, string> = {}
@@ -184,37 +185,12 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     } catch {}
   }
 
-  function loadRouterVisualEffectsPreference() {
-    try {
-      const saved = localStorage.getItem(ROUTER_FX_PREF_KEY)
-      if (!saved) return
-      const parsed = JSON.parse(saved) as { enabled?: unknown }
-      if (typeof parsed.enabled === 'boolean') {
-        routerVisualEffectsEnabled.value = parsed.enabled
-      }
-    } catch {}
-  }
-
-  function saveRouterVisualEffectsPreference() {
-    try {
-      localStorage.setItem(ROUTER_FX_PREF_KEY, JSON.stringify({
-        enabled: routerVisualEffectsEnabled.value,
-        variant: 'default',
-      }))
-    } catch {}
-  }
-
-  function setRouterVisualEffectsEnabled(enabled: boolean) {
-    routerVisualEffectsEnabled.value = Boolean(enabled)
-    saveRouterVisualEffectsPreference()
-  }
-
   async function setRouterEnabled(enabled: boolean) {
     await setModelRoutingMode(enabled ? 'squilla_router' : 'off')
   }
 
-  async function setCodingModeEnabled(enabled: boolean) {
-    if (codingModeSettingsBusy.value) return
+  async function setCodingModeEnabled(enabled: boolean): Promise<boolean> {
+    if (codingModeSettingsBusy.value) return false
     const nextEnabled = Boolean(enabled)
     const previous = codingModeEnabled.value
     codingModeSettingsBusy.value = true
@@ -227,9 +203,11 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
       })
       const cfg = await options.rpc.call<ChatFeatureConfig>('config.get')
       await applyFeatureConfig(cfg)
+      return codingModeEnabled.value === nextEnabled
     } catch (err) {
       codingModeEnabled.value = previous
       console.warn('Failed to update Coding mode:', err instanceof Error ? err.message : String(err))
+      return false
     } finally {
       codingModeSettingsBusy.value = false
     }

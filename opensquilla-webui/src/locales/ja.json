@@ -244,6 +244,8 @@
       "toolDetailsAuto": "自動",
       "toolDetailsCompact": "コンパクト",
       "toolDetailsExpanded": "展開",
+      "visualEffectsLabel": "視覚効果",
+      "visualEffectsDesc": "会話内のモデルルーティング判断と回答の切り替えをアニメーション表示します。",
       "bgmLabel": "BGM",
       "bgmDesc": "トップバーにBGMコントロールを表示します。既定ではオフで、コマンドパレットからも切り替えられます。",
       "sidebarWidthLabel": "サイドバーの幅",
@@ -3140,6 +3142,12 @@
       "sendingReply": "返信を送信中…",
       "sendReply": "返信を送信",
       "sendingContinuing": "返信を送信中 · 実行を継続中…"
+    },
+    "codingMode": {
+      "enabled": "Coding mode を有効にしました。",
+      "disabled": "Coding mode を無効にしました。",
+      "usage": "/coding、/coding on、/coding off、または /coding status を使用してください。",
+      "updateFailed": "Coding mode を更新できませんでした。"
     },
     "composer": {
       "executionMode": "実行モード",
