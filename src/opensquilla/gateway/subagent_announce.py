@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+from collections.abc import AsyncIterator, Iterable
 from typing import Any
 
 from opensquilla.gateway.session_lifecycle import session_status_for_task_status
@@ -87,6 +89,21 @@ def set_background_completion_manager(manager: Any | None) -> None:
     """Install the process-local background completion manager."""
     global _background_completion_manager
     _background_completion_manager = manager
+
+
+@contextlib.asynccontextmanager
+async def quiesce_background_completion_sessions(
+    session_keys: Iterable[str],
+) -> AsyncIterator[None]:
+    """Fence parent-wake delivery when a manager is installed."""
+
+    manager = _background_completion_manager
+    quiesce = getattr(manager, "quiesce_sessions", None)
+    if not callable(quiesce):
+        yield
+        return
+    async with quiesce(session_keys):
+        yield
 
 
 async def cancel_background_completion_for_session(parent_session_key: str) -> int:

@@ -6,6 +6,8 @@ import asyncio
 import base64
 import hashlib
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -1472,6 +1474,84 @@ class TestSessionsSend:
         assert ctx_with_sessions.session_manager.applied_intents == [
             (session.session_key, "continue")
         ]
+
+    @pytest.mark.asyncio
+    async def test_legacy_direct_send_holds_registry_admission_through_register(
+        self,
+        dispatcher,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        session = FakeSession(session_key="agent:main:webchat:legacy-direct-admission")
+        manager = FakeSessionManager([session])
+        runner = _RecordingTurnRunner()
+        ctx = make_ctx(
+            session_manager=manager,
+            task_runtime=None,
+            turn_runner=runner,
+        )
+        registry = get_agent_task_registry()
+        admission_attempted = asyncio.Event()
+        append_called = asyncio.Event()
+        original_admission = registry.admission
+        original_append = manager.append_message
+        original_register = registry.register
+        admission_active = False
+
+        @asynccontextmanager
+        async def observed_admission(session_key: str) -> AsyncIterator[None]:
+            nonlocal admission_active
+            admission_attempted.set()
+            async with original_admission(session_key):
+                admission_active = True
+                try:
+                    yield
+                finally:
+                    admission_active = False
+
+        async def observed_append(*args: Any, **kwargs: Any) -> Any:
+            append_called.set()
+            return await original_append(*args, **kwargs)
+
+        def observed_register(session_key: str, task: asyncio.Task) -> None:
+            assert admission_active is True
+            original_register(session_key, task)
+
+        monkeypatch.setattr(registry, "admission", observed_admission)
+        monkeypatch.setattr(registry, "register", observed_register)
+        monkeypatch.setattr(manager, "append_message", observed_append)
+        admission_lock = registry._admission_locks.setdefault(
+            session.session_key,
+            asyncio.Lock(),
+        )
+
+        async with admission_lock:
+            sending = asyncio.create_task(
+                dispatcher.dispatch(
+                    "r-legacy-direct-admission",
+                    "sessions.send",
+                    {"key": session.session_key, "message": "hello"},
+                    ctx,
+                )
+            )
+            admission_wait = asyncio.create_task(admission_attempted.wait())
+            append_wait = asyncio.create_task(append_called.wait())
+            done, _pending = await asyncio.wait(
+                {admission_wait, append_wait},
+                timeout=2.0,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            assert admission_wait in done
+            assert append_wait not in done
+            assert sending.done() is False
+
+        response = await asyncio.wait_for(sending, timeout=2.0)
+        background = registry.get(session.session_key)
+        if background is not None:
+            await background
+        admission_wait.cancel()
+        append_wait.cancel()
+
+        assert response.ok is True
 
     @pytest.mark.asyncio
     async def test_send_apply_intent_waits_for_session_lock(self, dispatcher, session):

@@ -2575,6 +2575,10 @@ class TurnRunner:
         self._turn_compaction_attempted_sessions: set[str] = set()
         self._turn_compacted_sessions: set[str] = set()
         self._active_pre_compaction_flush_tasks: dict[str, asyncio.Task] = {}
+        self._pre_compaction_flush_status_tasks: dict[
+            str,
+            set[asyncio.Task[None]],
+        ] = {}
         self._emergency_compaction_overrides: dict[str, _EmergencyCompactionOverride] = {}
         # TurnRunner stage decomposition InputStage instance. Holds no per-turn state;
         # constructed once. Active unconditionally as of.
@@ -4111,10 +4115,26 @@ class TurnRunner:
             # TurnErrorWriter is deliberately synchronous and may wait for its
             # SQLite busy timeout. Keep that wait off the shared turn loop while
             # preserving its existing best-effort return contract.
-            recorded = await asyncio.to_thread(
-                self._turn_error_writer.record_error,
-                record,
+            operation = asyncio.create_task(
+                asyncio.to_thread(
+                    self._turn_error_writer.record_error,
+                    record,
+                )
             )
+            cancellation: asyncio.CancelledError | None = None
+            while not operation.done():
+                try:
+                    await asyncio.shield(operation)
+                except asyncio.CancelledError as exc:
+                    cancellation = cancellation or exc
+            if cancellation is not None:
+                # ``to_thread`` cancellation cannot stop the worker. Do not
+                # return control to cleanup until its SQLite transaction has
+                # settled; caller cancellation remains authoritative.
+                with contextlib.suppress(BaseException):
+                    operation.result()
+                raise cancellation
+            recorded = operation.result()
             return error_id if recorded else None
         except Exception as record_exc:  # noqa: BLE001 - must not mask the turn error
             log.warning(
@@ -7308,7 +7328,7 @@ class TurnRunner:
         mark_status = getattr(self._session_manager, "mark_compaction_flush_receipt_status", None)
         if not callable(mark_status):
             return
-        asyncio.create_task(
+        task = asyncio.create_task(
             mark_compaction_flush_status_with_retry(
                 mark_status,
                 session_key=session_key,
@@ -7320,6 +7340,90 @@ class TurnRunner:
                 skipped_event=f"{event_prefix}.flush_status_update_skipped",
             )
         )
+        tasks = self._pre_compaction_flush_status_tasks.setdefault(
+            session_key,
+            set(),
+        )
+        tasks.add(task)
+
+        def _discard(completed: asyncio.Task[None]) -> None:
+            current = self._pre_compaction_flush_status_tasks.get(session_key)
+            if current is None:
+                return
+            current.discard(completed)
+            if not current:
+                self._pre_compaction_flush_status_tasks.pop(session_key, None)
+
+        task.add_done_callback(_discard)
+
+    async def drain_session_background_writes(
+        self,
+        session_keys: Sequence[str],
+    ) -> None:
+        """Wait for detached pre-compaction writes for exactly these sessions."""
+
+        keys = tuple(
+            sorted(
+                {
+                    canonicalize_session_key(session_key)
+                    for session_key in session_keys
+                }
+            )
+        )
+        if not keys:
+            return
+
+        def _snapshot_pending() -> set[asyncio.Task[Any]]:
+            pending = {
+                task
+                for session_key in keys
+                if (
+                    task := self._active_pre_compaction_flush_tasks.get(
+                        session_key
+                    )
+                )
+                is not None
+                and not task.done()
+            }
+            pending.update(
+                task
+                for session_key in keys
+                for task in self._pre_compaction_flush_status_tasks.get(
+                    session_key,
+                    (),
+                )
+                if not task.done()
+            )
+            return pending
+
+        cancellation: asyncio.CancelledError | None = None
+        while True:
+            tasks = _snapshot_pending()
+            if not tasks:
+                # Completion callbacks can schedule the status-update tail.
+                # One loop turn plus a complete second snapshot closes both a
+                # new-flush admission and the flush -> status hand-off.
+                try:
+                    await asyncio.sleep(0)
+                except asyncio.CancelledError as exc:
+                    cancellation = cancellation or exc
+                tasks = _snapshot_pending()
+                if not tasks:
+                    if cancellation is not None:
+                        raise cancellation
+                    return
+
+            settling = asyncio.gather(*tasks, return_exceptions=True)
+            while not settling.done():
+                try:
+                    await asyncio.shield(settling)
+                except asyncio.CancelledError as exc:
+                    # Cancelling gather would cancel a flush wrapper while its
+                    # underlying ``to_thread`` writer keeps running. Keep the
+                    # exact tasks alive and settle every retry/status tail
+                    # before cancellation escapes this drain primitive.
+                    cancellation = cancellation or exc
+            settling.result()
 
     def _log_pre_compaction_flush_receipt(
         self,

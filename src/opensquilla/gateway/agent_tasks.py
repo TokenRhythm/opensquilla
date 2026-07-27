@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+from collections.abc import AsyncIterator, Iterable
 
 import structlog
+
+from opensquilla.session.keys import canonicalize_session_key
 
 log = structlog.get_logger(__name__)
 
@@ -14,6 +18,69 @@ class AgentTaskRegistry:
 
     def __init__(self) -> None:
         self._tasks: dict[str, asyncio.Task] = {}
+        self._admission_locks: dict[str, asyncio.Lock] = {}
+
+    @contextlib.asynccontextmanager
+    async def admission(self, session_key: str) -> AsyncIterator[None]:
+        """Serialize durable direct acceptance through task registration."""
+
+        key = canonicalize_session_key(session_key)
+        lock = self._admission_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            yield
+
+    @contextlib.asynccontextmanager
+    async def quiesce_sessions(
+        self,
+        session_keys: Iterable[str],
+    ) -> AsyncIterator[None]:
+        """Cancel/drain direct tasks, then hold their admission fences."""
+
+        keys = tuple(
+            sorted(
+                {
+                    canonicalize_session_key(session_key)
+                    for session_key in session_keys
+                }
+            )
+        )
+        if not keys:
+            yield
+            return
+
+        while True:
+            tasks = {
+                task
+                for session_key in keys
+                if (task := self._tasks.get(session_key)) is not None
+                and not task.done()
+            }
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+                for session_key in keys:
+                    task = self._tasks.get(session_key)
+                    if task in tasks and task.done():
+                        self._tasks.pop(session_key, None)
+
+            async with contextlib.AsyncExitStack() as fences:
+                for session_key in keys:
+                    await fences.enter_async_context(
+                        self.admission(session_key)
+                    )
+                if any(
+                    (task := self._tasks.get(session_key)) is not None
+                    and not task.done()
+                    for session_key in keys
+                ):
+                    continue
+                for session_key in keys:
+                    task = self._tasks.get(session_key)
+                    if task is not None and task.done():
+                        self._tasks.pop(session_key, None)
+                yield
+                return
 
     def register(
         self,
@@ -46,7 +113,8 @@ class AgentTaskRegistry:
         self._tasks[session_key] = task
 
         def _on_done(t: asyncio.Task) -> None:
-            self._tasks.pop(session_key, None)
+            if self._tasks.get(session_key) is t:
+                self._tasks.pop(session_key, None)
             try:
                 if t.cancelled():
                     log.info("agent_task.cancelled", session_key=session_key)

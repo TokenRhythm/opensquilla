@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import importlib
+
 import pytest
 
 from opensquilla.engine.steps.squilla_router import _history_store
@@ -17,7 +19,8 @@ class _MemoryStorage:
     async def get_session(self, session_key: str):
         return self._sessions.get(session_key)
 
-    async def upsert_session(self, node) -> None:
+    async def upsert_session(self, node, *, expected_session_id=None) -> None:
+        assert expected_session_id is None or expected_session_id == node.session_id
         self._sessions[node.session_key] = node
 
 
@@ -47,3 +50,30 @@ async def test_finish_evicts_spawn_group_tracker_and_routing_history() -> None:
 
     assert not _tracker.is_closed("agent:main:main", "task-X")
     assert _history_store.get("agent:main:main") is None
+
+
+def test_explicit_runtime_eviction_drops_all_session_identity_caches() -> None:
+    from opensquilla.tools.builtin import sessions as sessions_tool
+
+    meta_resolution = importlib.import_module(
+        "opensquilla.engine.steps.meta_resolution"
+    )
+    session_key = "agent:main:webchat:history-eviction"
+    session_id = "history-eviction-generation"
+    manager = SessionManager(_MemoryStorage())  # type: ignore[arg-type]
+    manager.set_cached_epoch(session_key, 7)
+    _tracker.mark_closed(session_key, "child-task")
+    _history_store.set(session_key, [{"turn_index": 3}])
+    sessions_tool._get_spawn_lock(session_key)
+    meta_resolution._sticky_put(session_id, "meta-skill", "follow up")
+
+    manager.evict_session_runtime_state(
+        session_key,
+        session_id=session_id,
+    )
+
+    assert manager.get_cached_epoch(session_key) is None
+    assert not _tracker.is_closed(session_key, "child-task")
+    assert _history_store.get(session_key) is None
+    assert session_key not in sessions_tool._spawn_locks
+    assert session_id not in meta_resolution._meta_sticky_cache

@@ -17,6 +17,7 @@ from opensquilla.session.models import AgentTaskStatus
 
 PARENT = "agent:main:channel:parent"
 PARENT_TASK = "task-parent"
+OTHER_PARENT = "agent:main:channel:other-parent"
 
 
 @pytest.mark.asyncio
@@ -130,6 +131,64 @@ class _TaskRuntime:
         await self.stream_event_sink(DoneEvent(text=text))
 
 
+class _BlockingSendRuntime:
+    def __init__(self) -> None:
+        self.send_entered: dict[str, asyncio.Event] = {}
+        self.send_release: dict[str, asyncio.Event] = {}
+        self.send_cancelled: list[str] = []
+        self.send_calls: list[str] = []
+        self.sent: list[str] = []
+        self.cancel_cleanup_release: dict[str, asyncio.Event] = {}
+
+    def _event(self, events: dict[str, asyncio.Event], session_key: str) -> asyncio.Event:
+        return events.setdefault(session_key, asyncio.Event())
+
+    async def send(
+        self,
+        session_key: str,
+        _message: str,
+        **_kwargs: Any,
+    ) -> Any:
+        self.send_calls.append(session_key)
+        self._event(self.send_entered, session_key).set()
+        try:
+            await self._event(self.send_release, session_key).wait()
+        except asyncio.CancelledError:
+            self.send_cancelled.append(session_key)
+            cleanup_release = self.cancel_cleanup_release.get(session_key)
+            if cleanup_release is not None:
+                await cleanup_release.wait()
+            raise
+        self.sent.append(session_key)
+        return SimpleNamespace(task_id=f"synthesis:{session_key}")
+
+    async def wait(self, _task_id: str) -> Any:
+        return SimpleNamespace(status=AgentTaskStatus.SUCCEEDED)
+
+
+class _ReplacementRuntime:
+    def __init__(self) -> None:
+        self.send_count = 0
+        self.synthesis_release: dict[str, asyncio.Event] = {}
+        self.wait_cancelled: list[str] = []
+
+    async def send(self, _session_key: str, _message: str, **_kwargs: Any) -> Any:
+        self.send_count += 1
+        task_id = f"synthesis-{self.send_count}"
+        self.synthesis_release[task_id] = asyncio.Event()
+        return SimpleNamespace(task_id=task_id)
+
+    async def wait(self, task_id: str) -> Any:
+        if not task_id.startswith("synthesis-"):
+            return SimpleNamespace(status=AgentTaskStatus.SUCCEEDED)
+        try:
+            await self.synthesis_release[task_id].wait()
+        except asyncio.CancelledError:
+            self.wait_cancelled.append(task_id)
+            raise
+        return SimpleNamespace(status=AgentTaskStatus.SUCCEEDED)
+
+
 async def _wait_until(predicate, *, timeout: float = 1.0) -> None:
     deadline = asyncio.get_running_loop().time() + timeout
     while not predicate():
@@ -240,9 +299,7 @@ async def test_cancel_session_blocks_late_subagent_parent_wake() -> None:
         parent_task_id=PARENT_TASK,
         pending_count=1,
     )
-    assert await manager.active_group_ids(PARENT) == [
-        f"subagent:{PARENT}:{PARENT_TASK}"
-    ]
+    assert await manager.active_group_ids(PARENT) == [f"subagent:{PARENT}:{PARENT_TASK}"]
     cancelled = await manager.cancel_session(PARENT)
     await manager.send_parent_wake(
         parent_session_key=PARENT,
@@ -258,6 +315,357 @@ async def test_cancel_session_blocks_late_subagent_parent_wake() -> None:
     assert cancelled == 1
     assert await manager.active_group_ids(PARENT) == []
     assert runtime.sent == []
+
+
+@pytest.mark.asyncio
+async def test_quiesce_sessions_cancels_only_target_watcher_and_fences_new_groups() -> None:
+    runtime = _BlockingSendRuntime()
+    manager = BackgroundCompletionManager(session_manager=_SessionManager())
+
+    await manager.send_parent_wake(
+        parent_session_key=PARENT,
+        parent_task_id=PARENT_TASK,
+        payloads=[],
+        task_runtime=runtime,
+        message="target wake",
+        provenance={"kind": "internal_system"},
+    )
+    await manager.send_parent_wake(
+        parent_session_key=OTHER_PARENT,
+        parent_task_id="other-task",
+        payloads=[],
+        task_runtime=runtime,
+        message="unrelated wake",
+        provenance={"kind": "internal_system"},
+    )
+    await asyncio.wait_for(runtime._event(runtime.send_entered, PARENT).wait(), timeout=1)
+    await asyncio.wait_for(runtime._event(runtime.send_entered, OTHER_PARENT).wait(), timeout=1)
+
+    fence_entered = asyncio.Event()
+    release_fence = asyncio.Event()
+
+    async def _hold_fence() -> None:
+        async with manager.quiesce_sessions([PARENT]):
+            fence_entered.set()
+            await release_fence.wait()
+
+    fence_task = asyncio.create_task(_hold_fence())
+    await asyncio.wait_for(fence_entered.wait(), timeout=1)
+
+    assert runtime.send_cancelled == [PARENT]
+    assert await manager.active_group_ids(PARENT) == []
+    assert await manager.active_group_ids(OTHER_PARENT) == [f"subagent:{OTHER_PARENT}:other-task"]
+
+    await manager.emit_waiting(
+        parent_session_key=PARENT,
+        parent_task_id="fenced-task",
+    )
+    await manager.send_parent_wake(
+        parent_session_key=PARENT,
+        parent_task_id="fenced-task",
+        payloads=[],
+        task_runtime=runtime,
+        message="must stay suppressed",
+        provenance={"kind": "internal_system"},
+    )
+    release_fence.set()
+    await fence_task
+
+    await manager.send_parent_wake(
+        parent_session_key=PARENT,
+        parent_task_id="fenced-task",
+        payloads=[],
+        task_runtime=runtime,
+        message="cancelled group must not revive",
+        provenance={"kind": "internal_system"},
+    )
+    assert runtime.send_calls.count(PARENT) == 1
+    assert runtime.sent == []
+
+    runtime._event(runtime.send_release, OTHER_PARENT).set()
+    await manager.drain(timeout=1)
+    assert runtime.sent == [OTHER_PARENT]
+
+
+@pytest.mark.asyncio
+async def test_quiesce_sessions_does_not_cancel_prefix_related_parent() -> None:
+    prefix_related_parent = f"{PARENT}:nested"
+    runtime = _BlockingSendRuntime()
+    manager = BackgroundCompletionManager(session_manager=_SessionManager())
+
+    await manager.send_parent_wake(
+        parent_session_key=prefix_related_parent,
+        parent_task_id="prefix-related-task",
+        payloads=[],
+        task_runtime=runtime,
+        message="unrelated wake",
+        provenance={"kind": "internal_system"},
+    )
+    await asyncio.wait_for(
+        runtime._event(runtime.send_entered, prefix_related_parent).wait(),
+        timeout=1,
+    )
+    assert await manager.active_group_ids(PARENT) == []
+
+    async with manager.quiesce_sessions([PARENT]):
+        assert runtime.send_cancelled == []
+        assert await manager.active_group_ids(prefix_related_parent) == [
+            f"subagent:{prefix_related_parent}:prefix-related-task"
+        ]
+
+    runtime._event(runtime.send_release, prefix_related_parent).set()
+    await manager.drain(timeout=1)
+    assert runtime.sent == [prefix_related_parent]
+
+
+@pytest.mark.asyncio
+async def test_quiesce_sessions_waits_for_inflight_wake_registration() -> None:
+    capture_entered = asyncio.Event()
+    release_capture = asyncio.Event()
+
+    class _BlockingSessionManager(_SessionManager):
+        async def get_session(self, session_key: str) -> Any | None:
+            capture_entered.set()
+            await release_capture.wait()
+            return None
+
+    runtime = _BlockingSendRuntime()
+    manager = BackgroundCompletionManager(session_manager=_BlockingSessionManager())
+    sending = asyncio.create_task(
+        manager.send_parent_wake(
+            parent_session_key=PARENT,
+            parent_task_id=PARENT_TASK,
+            payloads=[],
+            task_runtime=runtime,
+            message="wake",
+            provenance={"kind": "internal_system"},
+        )
+    )
+    await asyncio.wait_for(capture_entered.wait(), timeout=1)
+
+    fence_entered = asyncio.Event()
+    release_fence = asyncio.Event()
+
+    async def _hold_fence() -> None:
+        async with manager.quiesce_sessions([PARENT]):
+            fence_entered.set()
+            await release_fence.wait()
+
+    fence_task = asyncio.create_task(_hold_fence())
+    await asyncio.sleep(0)
+    assert not fence_entered.is_set()
+
+    release_capture.set()
+    await sending
+    await asyncio.wait_for(fence_entered.wait(), timeout=1)
+    release_fence.set()
+    await fence_task
+
+    await manager.send_parent_wake(
+        parent_session_key=PARENT,
+        parent_task_id=PARENT_TASK,
+        payloads=[],
+        task_runtime=runtime,
+        message="same group must stay cancelled",
+        provenance={"kind": "internal_system"},
+    )
+    await asyncio.sleep(0)
+    assert PARENT not in runtime.send_entered
+
+
+@pytest.mark.asyncio
+async def test_concurrent_quiesce_sessions_receive_independent_state_changes() -> None:
+    parents = (PARENT, OTHER_PARENT)
+    capture_entered = {parent: asyncio.Event() for parent in parents}
+    release_capture = {parent: asyncio.Event() for parent in parents}
+
+    class _PerParentBlockingSessionManager(_SessionManager):
+        async def get_session(self, session_key: str) -> Any | None:
+            capture_entered[session_key].set()
+            await release_capture[session_key].wait()
+            return None
+
+    runtime = _BlockingSendRuntime()
+    manager = BackgroundCompletionManager(session_manager=_PerParentBlockingSessionManager())
+    sending = [
+        asyncio.create_task(
+            manager.send_parent_wake(
+                parent_session_key=parent,
+                parent_task_id=f"task-{index}",
+                payloads=[],
+                task_runtime=runtime,
+                message="wake",
+                provenance={"kind": "internal_system"},
+            )
+        )
+        for index, parent in enumerate(parents)
+    ]
+    await asyncio.gather(*(capture_entered[parent].wait() for parent in parents))
+
+    fence_entered = {parent: asyncio.Event() for parent in parents}
+    release_fence = {parent: asyncio.Event() for parent in parents}
+
+    async def _hold_fence(parent: str) -> None:
+        async with manager.quiesce_sessions([parent]):
+            fence_entered[parent].set()
+            await release_fence[parent].wait()
+
+    fences = {parent: asyncio.create_task(_hold_fence(parent)) for parent in parents}
+    await asyncio.sleep(0)
+    assert not any(event.is_set() for event in fence_entered.values())
+
+    release_capture[PARENT].set()
+    await sending[0]
+    await asyncio.wait_for(fence_entered[PARENT].wait(), timeout=1)
+    assert not fence_entered[OTHER_PARENT].is_set()
+    release_fence[PARENT].set()
+    await fences[PARENT]
+
+    release_capture[OTHER_PARENT].set()
+    await sending[1]
+    await asyncio.wait_for(fence_entered[OTHER_PARENT].wait(), timeout=1)
+    release_fence[OTHER_PARENT].set()
+    await fences[OTHER_PARENT]
+
+    assert runtime.send_calls == []
+
+
+@pytest.mark.asyncio
+async def test_quiesce_sessions_keeps_nested_parent_fence_until_outer_exit() -> None:
+    runtime = _BlockingSendRuntime()
+    manager = BackgroundCompletionManager(session_manager=_SessionManager())
+
+    async with manager.quiesce_sessions([PARENT]):
+        async with manager.quiesce_sessions([PARENT]):
+            await manager.send_parent_wake(
+                parent_session_key=PARENT,
+                parent_task_id="blocked-inner",
+                payloads=[],
+                task_runtime=runtime,
+                message="blocked",
+                provenance={"kind": "internal_system"},
+            )
+        await manager.send_parent_wake(
+            parent_session_key=PARENT,
+            parent_task_id="blocked-outer",
+            payloads=[],
+            task_runtime=runtime,
+            message="still blocked",
+            provenance={"kind": "internal_system"},
+        )
+
+    await manager.send_parent_wake(
+        parent_session_key=PARENT,
+        parent_task_id="allowed-after-outer",
+        payloads=[],
+        task_runtime=runtime,
+        message="allowed",
+        provenance={"kind": "internal_system"},
+    )
+    await asyncio.wait_for(runtime._event(runtime.send_entered, PARENT).wait(), timeout=1)
+
+    runtime._event(runtime.send_release, PARENT).set()
+    await manager.drain(timeout=1)
+    assert runtime.send_calls == [PARENT]
+    assert runtime.sent == [PARENT]
+
+
+@pytest.mark.asyncio
+async def test_old_watcher_done_callback_does_not_untrack_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _ReplacementRuntime()
+    manager = BackgroundCompletionManager(session_manager=_SessionManager())
+    first_evicted = asyncio.Event()
+    release_first_watcher = asyncio.Event()
+    real_evict = manager._evict_group
+    evict_count = 0
+
+    async def _pause_first_evict(group_id: str) -> None:
+        nonlocal evict_count
+        await real_evict(group_id)
+        evict_count += 1
+        if evict_count == 1:
+            first_evicted.set()
+            await release_first_watcher.wait()
+
+    monkeypatch.setattr(manager, "_evict_group", _pause_first_evict)
+
+    await manager.send_parent_wake(
+        parent_session_key=PARENT,
+        parent_task_id=PARENT_TASK,
+        payloads=[],
+        task_runtime=runtime,
+        message="first",
+        provenance={"kind": "internal_system"},
+    )
+    await _wait_until(lambda: runtime.send_count == 1)
+    runtime.synthesis_release["synthesis-1"].set()
+    await asyncio.wait_for(first_evicted.wait(), timeout=1)
+
+    await manager.send_parent_wake(
+        parent_session_key=PARENT,
+        parent_task_id=PARENT_TASK,
+        payloads=[],
+        task_runtime=runtime,
+        message="replacement",
+        provenance={"kind": "internal_system"},
+    )
+    await _wait_until(lambda: runtime.send_count == 2)
+    release_first_watcher.set()
+    await _wait_until(lambda: len(manager._watch_tasks) == 1)
+
+    async with manager.quiesce_sessions([PARENT]):
+        pass
+
+    assert runtime.wait_cancelled == ["synthesis-2"]
+
+
+@pytest.mark.asyncio
+async def test_shielded_quiesce_finishes_target_watcher_cancel_cleanup() -> None:
+    runtime = _BlockingSendRuntime()
+    cleanup_release = asyncio.Event()
+    runtime.cancel_cleanup_release[PARENT] = cleanup_release
+    manager = BackgroundCompletionManager(session_manager=_SessionManager())
+
+    await manager.send_parent_wake(
+        parent_session_key=PARENT,
+        parent_task_id=PARENT_TASK,
+        payloads=[],
+        task_runtime=runtime,
+        message="wake",
+        provenance={"kind": "internal_system"},
+    )
+    await asyncio.wait_for(runtime._event(runtime.send_entered, PARENT).wait(), timeout=1)
+
+    fence_entered = asyncio.Event()
+    release_fence = asyncio.Event()
+
+    async def _operation() -> None:
+        async with manager.quiesce_sessions([PARENT]):
+            fence_entered.set()
+            await release_fence.wait()
+
+    operation = asyncio.create_task(_operation())
+
+    async def _caller() -> None:
+        await asyncio.shield(operation)
+
+    for _ in range(2):
+        caller = asyncio.create_task(_caller())
+        await asyncio.sleep(0)
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+
+    assert not operation.done()
+    assert not fence_entered.is_set()
+
+    cleanup_release.set()
+    await asyncio.wait_for(fence_entered.wait(), timeout=1)
+    release_fence.set()
+    await operation
+    assert runtime.send_cancelled == [PARENT]
 
 
 @pytest.mark.asyncio

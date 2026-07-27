@@ -104,6 +104,10 @@ class TaskCollectionUnavailableError(RuntimeError):
     """Raised when a queued task stopped being collectable before acceptance."""
 
 
+class ProjectSessionSnapshotMismatchError(RuntimeError):
+    """Raised when a locked project-session snapshot changed before deletion."""
+
+
 @dataclass(frozen=True)
 class ResetArchiveSnapshot:
     """Pre-reset session state captured under the acceptance write transaction."""
@@ -3004,20 +3008,120 @@ class SessionStorage:
             SELECT session_key
             FROM sessions
             WHERE workspace_id = ?
-            ORDER BY created_at ASC
+            ORDER BY created_at ASC, session_key ASC
             """,
             (workspace_id,),
         ) as cur:
             rows = await cur.fetchall()
         return [str(row[0]) for row in rows]
 
-    async def delete_project_workspace_sessions(self, workspace_id: str) -> list[str]:
-        keys = await self.list_project_workspace_session_keys(workspace_id)
-        for session_key in keys:
-            await self.delete_session(session_key)
-        return keys
+    async def _delete_project_workspace_sessions(
+        self,
+        workspace_id: str,
+        expected_session_keys: Sequence[str] | None,
+    ) -> list[str]:
+        deleted: list[SessionNode] = []
+        async with self._write_transaction("delete_project_workspace_sessions") as conn:
+            async with conn.execute(
+                """
+                SELECT removed_at
+                FROM project_workspaces
+                WHERE workspace_id = ?
+                """,
+                (workspace_id,),
+            ) as cursor:
+                workspace_row = await cursor.fetchone()
+            if workspace_row is None or workspace_row["removed_at"] is not None:
+                raise KeyError(f"Project workspace not found: {workspace_id}")
 
-    async def upsert_session(self, node: SessionNode) -> None:
+            async with conn.execute(
+                """
+                SELECT *
+                FROM sessions
+                WHERE workspace_id = ?
+                ORDER BY created_at ASC, session_key ASC
+                """,
+                (workspace_id,),
+            ) as cursor:
+                deleted = [
+                    SessionNode(**_deserialize_row(dict(row)))
+                    for row in await cursor.fetchall()
+                ]
+            deleted_keys = [session.session_key for session in deleted]
+            if (
+                expected_session_keys is not None
+                and deleted_keys != list(expected_session_keys)
+            ):
+                raise ProjectSessionSnapshotMismatchError(
+                    "Project session snapshot changed before deletion"
+                )
+
+            for session in deleted:
+                await self._delete_session_rows(conn, session)
+
+        for session in deleted:
+            try:
+                await self._cleanup_deleted_session(session)
+            except Exception:  # noqa: BLE001 - the database commit is authoritative.
+                log.warning(
+                    "project_workspace.session_cleanup_failed "
+                    "workspace_id=%s session_key=%s",
+                    workspace_id,
+                    session.session_key,
+                    exc_info=True,
+                )
+        return [session.session_key for session in deleted]
+
+    async def delete_project_workspace_sessions(
+        self,
+        workspace_id: str,
+        *,
+        expected_session_keys: Sequence[str] | None = None,
+    ) -> list[str]:
+        """Atomically delete one project's history and exhaust post-commit cleanup.
+
+        The database transaction and every cleanup attempt run in a child task
+        shielded from caller cancellation. Cancellation is propagated only
+        after that operation settles, so a committed delete cannot strand
+        session material merely because its RPC transport disappeared.
+        """
+
+        operation = asyncio.create_task(
+            self._delete_project_workspace_sessions(
+                workspace_id,
+                expected_session_keys,
+            )
+        )
+        cancellation: asyncio.CancelledError | None = None
+        while not operation.done():
+            try:
+                await asyncio.shield(operation)
+            except asyncio.CancelledError as exc:
+                cancellation = cancellation or exc
+        if cancellation is not None:
+            # The operation outcome is now known and all cleanup attempts have
+            # settled. Retrieve it to avoid an unobserved child exception;
+            # cancellation remains authoritative for the interrupted caller.
+            with contextlib.suppress(BaseException):
+                operation.result()
+            raise cancellation
+        return operation.result()
+
+    async def upsert_session(
+        self,
+        node: SessionNode,
+        *,
+        expected_session_id: str | None = None,
+    ) -> None:
+        """Insert or update a session, optionally fencing an existing generation.
+
+        ``expected_session_id`` is for delayed mutations of an already-read
+        session. When supplied, a missing row or a different session id raises
+        ``KeyError`` inside the write transaction, before the UPSERT can recreate
+        a deleted row or overwrite a same-key replacement. Omitting it preserves
+        the create/repair behavior of the legacy UPSERT.
+        """
+
         node.session_key = canonicalize_session_key(node.session_key)
         node.agent_id = normalize_agent_id(node.agent_id)
         data = node.model_dump()
@@ -3039,6 +3143,20 @@ class SessionStorage:
             f"ON CONFLICT(session_key) DO UPDATE SET {updates}"
         )
         async with self._write_transaction("upsert_session") as conn:
+            if expected_session_id is not None:
+                if node.session_id != expected_session_id:
+                    raise KeyError(
+                        f"Session generation changed: {node.session_key}"
+                    )
+                async with conn.execute(
+                    "SELECT session_id FROM sessions WHERE session_key = ?",
+                    (node.session_key,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                if row is None or str(row["session_id"]) != expected_session_id:
+                    raise KeyError(
+                        f"Session generation changed: {node.session_key}"
+                    )
             await conn.execute(sql, values)
 
     @_serialized_read
@@ -3156,61 +3274,59 @@ class SessionStorage:
             rows = await cur.fetchall()
         return [SessionNode(**_deserialize_row(dict(r))) for r in rows]
 
-    async def delete_session(self, session_key: str) -> None:
-        session_key = canonicalize_session_key(session_key)
-        session: SessionNode | None = None
-        async with self._write_transaction("delete_session") as conn:
-            async with conn.execute(
-                "SELECT * FROM sessions WHERE session_key = ?", (session_key,)
-            ) as cur:
-                row = await cur.fetchone()
-            if row is None:
-                return
-            session = SessionNode(**_deserialize_row(dict(row)))
-            for table in (
-                "transcript_entries",
-                "compacted_transcript_entries",
-                "session_summaries",
-            ):
-                await conn.execute(
-                    f"DELETE FROM {table} WHERE session_id = ?",  # noqa: S608 - fixed literals
-                    (session.session_id,),
-                )
+    async def _delete_session_rows(
+        self,
+        conn: aiosqlite.Connection,
+        session: SessionNode,
+    ) -> None:
+        for table in (
+            "transcript_entries",
+            "compacted_transcript_entries",
+            "session_summaries",
+        ):
             await conn.execute(
-                "DELETE FROM session_context_states WHERE session_id = ?",
+                f"DELETE FROM {table} WHERE session_id = ?",  # noqa: S608 - fixed literals
                 (session.session_id,),
             )
-            for table in ("router_decisions", "turn_errors"):
-                async with conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
-                    (table,),
-                ) as cur:
-                    exists = await cur.fetchone() is not None
-                if exists:
-                    await conn.execute(
-                        f"DELETE FROM {table} WHERE session_key = ?",  # noqa: S608 - fixed literals
-                        (session_key,),
-                    )
-            for table in ("agent_tasks", "memory_durable_receipts"):
+        # A reset rotates session_id but deliberately retains invalid context
+        # rows from older epochs. The stable session key owns every one.
+        await conn.execute(
+            "DELETE FROM session_context_states WHERE session_key = ?",
+            (session.session_key,),
+        )
+        for table in ("router_decisions", "turn_errors"):
+            async with conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+                (table,),
+            ) as cursor:
+                exists = await cursor.fetchone() is not None
+            if exists:
                 await conn.execute(
                     f"DELETE FROM {table} WHERE session_key = ?",  # noqa: S608 - fixed literals
-                    (session_key,),
+                    (session.session_key,),
                 )
+        for table in ("agent_tasks", "memory_durable_receipts"):
             await conn.execute(
-                "DELETE FROM turn_ingress_receipts WHERE accepted_session_key = ?",
-                (session_key,),
+                f"DELETE FROM {table} WHERE session_key = ?",  # noqa: S608 - fixed literals
+                (session.session_key,),
             )
-            await conn.execute("DELETE FROM sessions WHERE session_key = ?", (session_key,))
+        await conn.execute(
+            "DELETE FROM turn_ingress_receipts WHERE accepted_session_key = ?",
+            (session.session_key,),
+        )
+        await conn.execute(
+            "DELETE FROM sessions WHERE session_key = ?",
+            (session.session_key,),
+        )
 
-        assert session is not None
-
+    async def _cleanup_deleted_session(self, session: SessionNode) -> None:
         # Cascade the on-disk session material (transcript media + workspace
         # attachment copies). DB-only deletion otherwise leaks both stores until
         # the transcript disk budget hard-fails. Best-effort via the registered
         # process-global hook; never fails the delete.
         from opensquilla.session.material_cleanup import run_session_material_cleanup
 
-        await run_session_material_cleanup(session.session_id, session_key)
+        await run_session_material_cleanup(session.session_id, session.session_key)
 
         # G4 cleanup: cascade meta-skill audit rows for this session. The
         # sessions table is created lazily at runtime (not via yoyo), so
@@ -3219,9 +3335,28 @@ class SessionStorage:
             try:
                 # The writer commits synchronously (busy_timeout=5000); keep the
                 # delete off the event loop like every other writer call site.
-                await asyncio.to_thread(self._meta_run_writer.purge_for_session, session_key)
+                await asyncio.to_thread(
+                    self._meta_run_writer.purge_for_session,
+                    session.session_key,
+                )
             except Exception as exc:  # noqa: BLE001
                 log.warning("session_delete.purge_meta_runs_failed: %s", exc)
+
+    async def delete_session(self, session_key: str) -> None:
+        session_key = canonicalize_session_key(session_key)
+        session: SessionNode | None = None
+        async with self._write_transaction("delete_session") as conn:
+            async with conn.execute(
+                "SELECT * FROM sessions WHERE session_key = ?", (session_key,)
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                return
+            session = SessionNode(**_deserialize_row(dict(row)))
+            await self._delete_session_rows(conn, session)
+
+        assert session is not None
+        await self._cleanup_deleted_session(session)
 
     async def prune_stale_sessions(self, before_ms: int) -> int:
         """Delete sessions not updated since before_ms epoch ms. Returns count deleted."""
@@ -3361,7 +3496,16 @@ class SessionStorage:
     async def upsert_memory_durable_receipt(
         self,
         receipt: MemoryDurableReceipt,
+        *,
+        expected_session_id: str | None = None,
     ) -> MemoryDurableReceipt:
+        """Upsert a receipt, optionally requiring its live session generation.
+
+        ``expected_session_id`` is checked in the same write transaction as the
+        receipt UPSERT. A missing or replaced session raises ``KeyError``.
+        Omitting it intentionally retains synthetic repair and legacy behavior.
+        """
+
         receipt.session_key = canonicalize_session_key(receipt.session_key)
         receipt.updated_at = _now_ms()
         data = receipt.model_dump()
@@ -3374,6 +3518,20 @@ class SessionStorage:
         )
         values = [_serialize(data[col]) for col in cols]
         async with self._write_transaction("upsert_memory_durable_receipt") as conn:
+            if expected_session_id is not None:
+                if receipt.session_id != expected_session_id:
+                    raise KeyError(
+                        f"Session generation changed: {receipt.session_key}"
+                    )
+                async with conn.execute(
+                    "SELECT session_id FROM sessions WHERE session_key = ?",
+                    (receipt.session_key,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                if row is None or str(row["session_id"]) != expected_session_id:
+                    raise KeyError(
+                        f"Session generation changed: {receipt.session_key}"
+                    )
             await conn.execute(
                 f"""
                 INSERT INTO memory_durable_receipts ({", ".join(cols)})

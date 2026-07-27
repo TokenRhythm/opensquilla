@@ -255,6 +255,56 @@ async def test_channel_turn_atomically_creates_delivery_session_message_task_and
 
 
 @pytest.mark.asyncio
+async def test_channel_reserve_waits_inside_atomic_session_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _open_stack(tmp_path / "sessions.db") as stack:
+        reserve_called = asyncio.Event()
+        admission_attempted = asyncio.Event()
+        original_reserve = stack.runtime.reserve
+        original_admission = stack.runtime.collect_admission
+
+        async def observed_reserve(*args: Any, **kwargs: Any) -> Any:
+            reserve_called.set()
+            return await original_reserve(*args, **kwargs)
+
+        @asynccontextmanager
+        async def observed_admission(session_key: str) -> AsyncIterator[None]:
+            admission_attempted.set()
+            async with original_admission(session_key):
+                yield
+
+        monkeypatch.setattr(stack.runtime, "reserve", observed_reserve)
+        monkeypatch.setattr(
+            stack.runtime,
+            "collect_admission",
+            observed_admission,
+        )
+        admission_lock = stack.runtime._collect_admission_locks.setdefault(
+            SESSION_KEY,
+            asyncio.Lock(),
+        )
+        async with admission_lock:
+            accepting = asyncio.create_task(
+                _accept(stack, "reserve must remain behind admission")
+            )
+            await asyncio.wait_for(admission_attempted.wait(), timeout=1.0)
+
+            assert accepting.done() is False
+            assert reserve_called.is_set() is False
+            assert stack.runtime._reservations_by_session == {}
+            assert await stack.storage.get_session(SESSION_KEY) is None
+
+        handle, _text, _relay, replayed = await asyncio.wait_for(
+            accepting,
+            timeout=2.0,
+        )
+        assert handle is not None
+        assert replayed is False
+
+
+@pytest.mark.asyncio
 async def test_channel_running_receipt_redelivery_attaches_reply_waiter_without_rerun(
     tmp_path: Path,
 ) -> None:

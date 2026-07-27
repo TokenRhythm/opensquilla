@@ -313,6 +313,34 @@ async def test_resume_missing_raises(manager):
         await manager.resume("agent:main:nope")
 
 
+@pytest.mark.parametrize("operation", ["resume", "update", "finish"])
+@pytest.mark.asyncio
+async def test_existing_session_mutations_do_not_recreate_deleted_generation(
+    manager,
+    monkeypatch,
+    operation,
+):
+    key = "agent:main:generation-race"
+    await manager.create(key)
+    original_upsert = manager._storage.upsert_session
+
+    async def delete_before_upsert(node, **kwargs):
+        await manager._storage.delete_session(key)
+        return await original_upsert(node, **kwargs)
+
+    monkeypatch.setattr(manager._storage, "upsert_session", delete_before_upsert)
+
+    with pytest.raises(KeyError, match="Session generation changed"):
+        if operation == "resume":
+            await manager.resume(key)
+        elif operation == "update":
+            await manager.update(key, derived_title="Late title")
+        else:
+            await manager.finish(key)
+
+    assert await manager._storage.get_session(key) is None
+
+
 @pytest.mark.asyncio
 async def test_update_fields(manager):
     await manager.create("agent:main:main")

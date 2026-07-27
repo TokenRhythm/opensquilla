@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 
+from opensquilla.gateway.agent_tasks import get_agent_task_registry
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
@@ -168,6 +169,70 @@ async def test_sessions_send_atomically_accepts_message_task_and_receipt(tmp_pat
             "agent_tasks": 1,
             "turn_ingress_receipts": 1,
         }
+
+
+@pytest.mark.asyncio
+async def test_atomic_direct_send_enters_registry_admission_before_accept_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _open_real_stack(tmp_path / "sessions.db") as stack:
+        stack.context.task_runtime = None
+        registry = get_agent_task_registry()
+        admission_attempted = asyncio.Event()
+        accept_called = asyncio.Event()
+        original_admission = registry.admission
+        original_accept = stack.storage.accept_turn
+
+        @asynccontextmanager
+        async def observed_admission(session_key: str) -> AsyncIterator[None]:
+            admission_attempted.set()
+            async with original_admission(session_key):
+                yield
+
+        async def observed_accept(*args: Any, **kwargs: Any) -> Any:
+            accept_called.set()
+            return await original_accept(*args, **kwargs)
+
+        monkeypatch.setattr(registry, "admission", observed_admission)
+        monkeypatch.setattr(stack.storage, "accept_turn", observed_accept)
+        admission_lock = registry._admission_locks.setdefault(
+            SESSION_KEY,
+            asyncio.Lock(),
+        )
+
+        async with admission_lock:
+            sending = asyncio.create_task(
+                get_dispatcher().dispatch(
+                    "rpc-direct-admission",
+                    "sessions.send",
+                    {
+                        "key": SESSION_KEY,
+                        "message": "direct accepted turn",
+                        "clientRequestId": "direct-admission-request",
+                    },
+                    stack.context,
+                )
+            )
+            admission_wait = asyncio.create_task(admission_attempted.wait())
+            accept_wait = asyncio.create_task(accept_called.wait())
+            done, _pending = await asyncio.wait(
+                {admission_wait, accept_wait},
+                timeout=2.0,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            assert admission_wait in done
+            assert accept_wait not in done
+            assert sending.done() is False
+
+        response = await asyncio.wait_for(sending, timeout=2.0)
+        task = registry.get(SESSION_KEY)
+        if task is not None:
+            await task
+        admission_wait.cancel()
+        accept_wait.cancel()
+
+        assert response.ok is True
 
 
 @pytest.mark.asyncio

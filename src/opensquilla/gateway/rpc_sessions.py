@@ -2777,6 +2777,7 @@ async def _handle_sessions_send(
     if prepared_acceptance:
         assert atomic_intent_plan is not None
         assert persisted_entry is not None
+        direct_registry = get_agent_task_registry()
 
         async def _commit_and_schedule_direct() -> TurnAcceptanceResult:
             nonlocal fresh_user_session, user_message_id
@@ -2817,11 +2818,12 @@ async def _handle_sessions_send(
             task = asyncio.create_task(_run_direct_turn())
             setattr(task, "_opensquilla_started", False)
             setattr(task, "_opensquilla_terminal_emitted", False)
-            get_agent_task_registry().register(key, task)
+            direct_registry.register(key, task)
             return acceptance
 
         try:
-            acceptance = await complete_durable_ingress(_commit_and_schedule_direct())
+            async with direct_registry.admission(key):
+                acceptance = await complete_durable_ingress(_commit_and_schedule_direct())
         except StorageBusyError as exc:
             _consumed_file_uuids = []
             raise RpcHandlerError(
@@ -3028,12 +3030,64 @@ async def _handle_sessions_send(
             ):
                 message_text = legacy_persisted_entry.content
 
-    if _persist_lock is None:
-        await _persist_user_message()
-    else:
-        async with _persist_lock:
+    async def _persist_user_message_with_lock() -> None:
+        if _persist_lock is None:
             await _persist_user_message()
+        else:
+            async with _persist_lock:
+                await _persist_user_message()
 
+    task_runtime = task_runtime_candidate
+    if task_runtime is None:
+        direct_registry = get_agent_task_registry()
+        async with direct_registry.admission(key):
+            await _persist_user_message_with_lock()
+            user_message_id = getattr(legacy_persisted_entry, "message_id", None)
+            task = asyncio.create_task(_run_direct_turn())
+            setattr(task, "_opensquilla_started", False)
+            setattr(task, "_opensquilla_terminal_emitted", False)
+            direct_registry.register(key, task)
+
+        await _emit_to_subscribers(
+            ctx,
+            key,
+            "session.event.input_disposition",
+            {
+                "session_key": key,
+                "user_message_id": user_message_id,
+                **ingress_turn_context,
+            },
+        )
+        # Same eviction semantic as the task_runtime success path: the turn was
+        # accepted into a background TurnRunner task, so consumed uuids can be
+        # evicted from the upload store rather than waiting out the TTL window.
+        if _consumed_file_uuids:
+            from opensquilla.gateway.uploads import get_upload_store
+
+            _store = get_upload_store()
+            for _u in _consumed_file_uuids:
+                try:
+                    await _store.evict(_u)
+                except Exception:  # noqa: BLE001 — eviction is best-effort
+                    log.warning("uploads.evict_failed_post_turn uuid=%s", _u[:8])
+        _schedule_auto_title(
+            ctx,
+            key,
+            semantic_message_text or message_text,
+            enabled=generate_title,
+        )
+        return {
+            "status": "accepted",
+            "key": key,
+            "session_key": key,
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "client_message_id": client_message_id,
+            "user_message_id": user_message_id,
+            "surface_id": surface_id,
+        }
+
+    await _persist_user_message_with_lock()
     user_message_id = getattr(legacy_persisted_entry, "message_id", None)
 
     async def _rollback_persisted_user_message(reason: str) -> tuple[str | None, bool]:
@@ -3064,7 +3118,6 @@ async def _handle_sessions_send(
             )
         return message_id, bool(removed)
 
-    task_runtime = getattr(ctx, "task_runtime", None)
     if task_runtime is not None:
         requested_mode = (
             params.get("queueMode")
@@ -3188,49 +3241,7 @@ async def _handle_sessions_send(
             "surface_id": surface_id,
         }
 
-    # 2. Run agent turn in background via TurnRunner
-    task = asyncio.create_task(_run_direct_turn())
-    setattr(task, "_opensquilla_started", False)
-    setattr(task, "_opensquilla_terminal_emitted", False)
-    get_agent_task_registry().register(key, task)
-    await _emit_to_subscribers(
-        ctx,
-        key,
-        "session.event.input_disposition",
-        {
-            "session_key": key,
-            "user_message_id": user_message_id,
-            **ingress_turn_context,
-        },
-    )
-    # Same eviction semantic as the task_runtime success path: the turn was
-    # accepted into a background TurnRunner task, so consumed uuids can be
-    # evicted from the upload store rather than waiting out the TTL window.
-    if _consumed_file_uuids:
-        from opensquilla.gateway.uploads import get_upload_store
-
-        _store = get_upload_store()
-        for _u in _consumed_file_uuids:
-            try:
-                await _store.evict(_u)
-            except Exception:  # noqa: BLE001 — eviction is best-effort
-                log.warning("uploads.evict_failed_post_turn uuid=%s", _u[:8])
-    _schedule_auto_title(
-        ctx,
-        key,
-        semantic_message_text or message_text,
-        enabled=generate_title,
-    )
-    return {
-        "status": "accepted",
-        "key": key,
-        "session_key": key,
-        "session_id": session_id,
-        "turn_id": turn_id,
-        "client_message_id": client_message_id,
-        "user_message_id": user_message_id,
-        "surface_id": surface_id,
-    }
+    raise AssertionError("unreachable: direct sends return before runtime dispatch")
 
 
 @_d.method("sessions.steer", scope="operator.write")

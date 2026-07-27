@@ -134,7 +134,12 @@ class _FlushReceiptSessionStorage(Protocol):
 
     async def list_memory_durable_receipts(self, **kwargs: Any) -> list[Any]: ...
 
-    async def upsert_memory_durable_receipt(self, receipt: Any) -> Any: ...
+    async def upsert_memory_durable_receipt(
+        self,
+        receipt: Any,
+        *,
+        expected_session_id: str | None = None,
+    ) -> Any: ...
 
 
 _AUTO_PROPOSE_TOOL_ALLOWLIST = frozenset(
@@ -1985,7 +1990,16 @@ def build_flush_service(
             if current_session is not None
             else ""
         )
-        if current_session_id and current_session_id != captured_session_id:
+        if not current_session_id:
+            log.warning(
+                "session_flush.receipt_write_skipped",
+                reason="session_missing",
+                session_key=session_key,
+                captured_session_id=captured_session_id,
+                result_status=getattr(receipt, "result_status", None),
+            )
+            return
+        if current_session_id != captured_session_id:
             log.warning(
                 "session_flush.receipt_session_mismatch",
                 session_key=session_key,
@@ -1993,6 +2007,7 @@ def build_flush_service(
                 current_session_id=current_session_id,
                 result_status=getattr(receipt, "result_status", None),
             )
+            return
 
         scope = str(row.get("scope") or "")
         status = str(row.get("status") or "")
@@ -2035,7 +2050,8 @@ def build_flush_service(
                 status=status,
                 reason=str(reason) if reason else None,
                 attempt_count=1,
-            )
+            ),
+            expected_session_id=captured_session_id,
         )
 
     def _resolve_archive_workspace(agent_id: str) -> Path | None:

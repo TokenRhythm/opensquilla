@@ -98,9 +98,37 @@ async def _to_thread(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     The writer commits SQLite transactions with ``busy_timeout=5000``; a
     contended commit executed on the loop would stall every surface for up
     to five seconds. Offloading keeps the module docstring's executor
-    contract honest for every async caller in this file.
+    contract honest for every async caller in this file. Cancellation is
+    deferred until the worker settles because cancelling ``to_thread`` does
+    not stop its underlying thread; returning early could otherwise let a
+    later cleanup race a still-running writer call.
     """
-    return await asyncio.to_thread(fn, *args, **kwargs)
+    operation = asyncio.create_task(asyncio.to_thread(fn, *args, **kwargs))
+    cancellation_requested = False
+
+    while True:
+        try:
+            result = await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if operation.cancelled() and (current is None or current.cancelling() == 0):
+                raise
+            cancellation_requested = True
+            if not operation.done():
+                continue
+            break
+        except BaseException:
+            if not cancellation_requested:
+                raise
+            break
+        else:
+            if cancellation_requested:
+                raise asyncio.CancelledError
+            return result
+
+    if not operation.cancelled():
+        operation.exception()
+    raise asyncio.CancelledError
 
 
 def _preflight_confirmation_run_id(inputs: dict[str, Any]) -> str:

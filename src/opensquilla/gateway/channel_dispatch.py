@@ -3001,17 +3001,6 @@ async def _accept_channel_runtime_turn(
         config,
     )
     overflow_policy = _resolve_channel_overflow_policy(channel, config)
-    reservation = await reserve_turn_via_runtime(
-        task_runtime,
-        route_envelope,
-        msg.content,
-        attachments=ingested.attachments,
-        mode=_resolve_channel_busy_input_mode(task_runtime, busy_input_mode),
-        run_kind="channel_turn",
-        semantic_message=raw_content,
-        stream_event_sink=stream_relay.emit if stream_relay is not None else None,
-        overflow_policy=overflow_policy,
-    )
 
     async def _commit_and_activate() -> tuple[
         Any | None,
@@ -3020,6 +3009,19 @@ async def _accept_channel_runtime_turn(
         bool,
     ]:
         nonlocal stream_relay
+        reservation = await reserve_turn_via_runtime(
+            task_runtime,
+            route_envelope,
+            msg.content,
+            attachments=ingested.attachments,
+            mode=_resolve_channel_busy_input_mode(task_runtime, busy_input_mode),
+            run_kind="channel_turn",
+            semantic_message=raw_content,
+            stream_event_sink=(
+                stream_relay.emit if stream_relay is not None else None
+            ),
+            overflow_policy=overflow_policy,
+        )
         try:
             acceptance = await storage.accept_turn(
                 entry,
@@ -3114,7 +3116,16 @@ async def _accept_channel_runtime_turn(
         )
         return handle, persisted_text, stream_relay, False
 
-    return await complete_durable_ingress(_commit_and_activate())
+    async def _commit_with_session_admission() -> tuple[
+        Any | None,
+        str,
+        _RuntimeChannelStreamRelay | None,
+        bool,
+    ]:
+        async with task_runtime.collect_admission(route_envelope.session_key):
+            return await _commit_and_activate()
+
+    return await complete_durable_ingress(_commit_with_session_admission())
 
 
 async def _append_channel_user_message(

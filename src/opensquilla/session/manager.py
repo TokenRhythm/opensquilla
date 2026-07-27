@@ -724,7 +724,10 @@ class SessionManager:
         if node is None:
             raise KeyError(f"Session not found: {session_key}")
         node.updated_at = _now_ms()
-        await self._storage.upsert_session(node)
+        await self._storage.upsert_session(
+            node,
+            expected_session_id=node.session_id,
+        )
         return node
 
     async def update(self, session_key: str, **fields: Any) -> SessionNode:
@@ -737,7 +740,10 @@ class SessionManager:
             if hasattr(node, k):
                 setattr(node, k, v)
         node.updated_at = _now_ms()
-        await self._storage.upsert_session(node)
+        await self._storage.upsert_session(
+            node,
+            expected_session_id=node.session_id,
+        )
         return node
 
     async def finish(
@@ -756,18 +762,31 @@ class SessionManager:
         node.updated_at = now
         if node.started_at:
             node.runtime_ms = now - node.started_at
-        await self._storage.upsert_session(node)
-        self._evict_session_runtime_state(session_key)
+        await self._storage.upsert_session(
+            node,
+            expected_session_id=node.session_id,
+        )
+        self.evict_session_runtime_state(
+            session_key,
+            session_id=node.session_id,
+        )
         return node
 
-    @staticmethod
-    def _evict_session_runtime_state(session_key: str) -> None:
+    def evict_session_runtime_state(
+        self,
+        session_key: str,
+        *,
+        session_id: str | None = None,
+    ) -> None:
         """Drop in-memory subagent and routing bookkeeping for ``session_key``.
 
-        Called from ``finish`` so terminal sessions don't leak unbounded
-        entries in long-running gateway processes. Imports are local to
-        avoid import cycles with engine/gateway packages.
+        History deletion calls this while its runtime/admission fences are
+        still held. ``session_id`` identifies the deleted generation for
+        caches that intentionally survive same-key resets. Imports are local
+        to avoid cycles with engine/gateway packages.
         """
+        session_key = canonicalize_session_key(session_key)
+        self._epoch_cache.pop(session_key, None)
         try:
             from opensquilla.gateway.subagent_announce import _tracker as _spawn_tracker
 
@@ -788,6 +807,15 @@ class SessionManager:
             evict_spawn_lock(session_key)
         except Exception:
             pass
+        if session_id:
+            try:
+                from opensquilla.engine.steps.meta_resolution import (
+                    evict_meta_sticky,
+                )
+
+                evict_meta_sticky(session_id)
+            except Exception:
+                pass
 
     async def branch(
         self,
@@ -1349,7 +1377,10 @@ class SessionManager:
                 attempt_count=1,
             )
             try:
-                await self._storage.upsert_memory_durable_receipt(receipt)
+                await self._storage.upsert_memory_durable_receipt(
+                    receipt,
+                    expected_session_id=node.session_id,
+                )
             except Exception:
                 pass
             raise
@@ -1370,7 +1401,10 @@ class SessionManager:
             status="checkpoint_saved",
             attempt_count=1,
         )
-        return await self._storage.upsert_memory_durable_receipt(receipt)
+        return await self._storage.upsert_memory_durable_receipt(
+            receipt,
+            expected_session_id=node.session_id,
+        )
 
     async def get_canonical_transcript(
         self, session_key: str, limit: int | None = None

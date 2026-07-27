@@ -1540,7 +1540,7 @@ async def test_build_flush_service_wires_durable_receipt_writer(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_build_flush_service_receipt_uses_session_id_captured_before_rotation(
+async def test_build_flush_service_skips_receipt_after_session_rotation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1594,11 +1594,62 @@ async def test_build_flush_service_receipt_uses_session_id_captured_before_rotat
         assert did_rotate
         assert rotated.session_id != original.session_id
         assert receipt.session_id == original.session_id
-        assert len(rows) == 2
-        assert {row.scope for row in rows} == {"preimage", "repair"}
-        for row in rows:
-            assert row.session_id == original.session_id
-            assert row.session_id != rotated.session_id
+        assert rows == []
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_build_flush_service_skips_receipt_after_session_delete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.sqlite"))
+    session_manager = SessionManager(storage)
+    registry = ToolRegistry()
+    archive_started = Event()
+    allow_archive = Event()
+
+    from opensquilla.memory import session_flush as session_flush_module
+
+    real_archive_writer = session_flush_module.write_raw_fallback_archive
+
+    def archive_writer(*args: Any, **kwargs: Any) -> Any:
+        archive_started.set()
+        assert allow_archive.wait(timeout=2.0)
+        return real_archive_writer(*args, **kwargs)
+
+    monkeypatch.setattr(
+        session_flush_module,
+        "write_raw_fallback_archive",
+        archive_writer,
+    )
+    try:
+        session_key = "agent:main:webchat:deleted-during-flush"
+        original = await session_manager.create(session_key)
+        service = build_flush_service(
+            tool_registry=registry,
+            provider_selector=SimpleNamespace(resolve=lambda: None),
+            config=GatewayConfig(memory={"flush_enabled": True}),
+            session_manager=session_manager,
+            memory_managers={"main": SimpleNamespace(workspace_dir=tmp_path)},
+        )
+
+        task = asyncio.create_task(
+            service.execute(
+                [Message(role="user", content="temporary transcript")],
+                session_key,
+                agent_id="main",
+            )
+        )
+        await asyncio.wait_for(asyncio.to_thread(archive_started.wait), timeout=2.0)
+        await storage.delete_session(session_key)
+        allow_archive.set()
+        receipt = await task
+
+        assert receipt.session_id == original.session_id
+        assert await storage.get_session(session_key) is None
+        assert await storage.list_memory_durable_receipts(session_key=session_key) == []
     finally:
         await storage.close()
 

@@ -9,6 +9,7 @@ only after the transaction commits.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -68,6 +69,10 @@ def _envelope(session_key: str = "agent-1::reservation") -> RouteEnvelope:
         session_key=session_key,
         input_provenance={"kind": "synthetic-test"},
     )
+
+
+async def _noop_turn_handler(_run: Any) -> None:
+    return
 
 
 @pytest.mark.asyncio
@@ -1042,3 +1047,348 @@ async def test_aborted_interrupt_reservation_does_not_cancel_existing_task() -> 
     release_old.set()
     record = await runtime.wait(old.task_id, timeout=1.0)
     assert record.status == AgentTaskStatus.SUCCEEDED
+
+
+@pytest.mark.parametrize("mode", ["followup", "interrupt", "steer"])
+@pytest.mark.asyncio
+async def test_every_direct_enqueue_mode_waits_for_session_admission(
+    mode: str,
+) -> None:
+    storage = _TrackingStorage()
+    session_key = f"agent-1::admission-{mode}"
+
+    async def handler(_run: Any) -> None:
+        return
+
+    runtime = TaskRuntime(storage=storage, turn_handler=handler)
+    async with runtime.collect_admission(session_key):
+        enqueueing = asyncio.create_task(
+            runtime.enqueue(
+                _envelope(session_key),
+                "held behind admission",
+                mode=mode,
+            )
+        )
+        await asyncio.sleep(0)
+
+        assert enqueueing.done() is False
+        assert storage.create_calls == []
+        assert session_key not in runtime._reservations_by_session
+
+    handle = await asyncio.wait_for(enqueueing, timeout=1.0)
+    assert (await runtime.wait(handle.task_id, timeout=1.0)).status == (
+        AgentTaskStatus.SUCCEEDED
+    )
+
+
+@pytest.mark.asyncio
+async def test_quiesce_sessions_cancels_running_and_queued_and_waits_for_driver_tail() -> None:
+    storage = _TrackingStorage()
+    session_key = "agent-1::quiesce-driver-tail"
+    running_started = asyncio.Event()
+    terminal_tail_started = asyncio.Event()
+    release_terminal_tail = asyncio.Event()
+    quiesce_entered = asyncio.Event()
+    release_quiesce = asyncio.Event()
+
+    async def handler(run: Any) -> None:
+        if run.message == "running":
+            running_started.set()
+            await asyncio.Event().wait()
+
+    async def terminal_listener(_event: Any) -> None:
+        terminal_tail_started.set()
+        await release_terminal_tail.wait()
+
+    runtime = TaskRuntime(
+        storage=storage,
+        turn_handler=handler,
+        terminal_listener=terminal_listener,
+        max_concurrency=1,
+    )
+    envelope = _envelope(session_key)
+    envelope.metadata["parent_session_key"] = "agent-1::parent"
+    running = await runtime.enqueue(
+        envelope,
+        "running",
+        run_kind="subagent",
+    )
+    await asyncio.wait_for(running_started.wait(), timeout=1.0)
+    queued = await runtime.enqueue(envelope, "queued")
+
+    async def quiesce() -> None:
+        async with runtime.quiesce_sessions([session_key]):
+            quiesce_entered.set()
+            await release_quiesce.wait()
+
+    quiescing = asyncio.create_task(quiesce())
+    await asyncio.sleep(0)
+    assert quiescing.done() is False
+    await asyncio.wait_for(terminal_tail_started.wait(), timeout=1.0)
+
+    assert (await runtime.wait(running.task_id, timeout=1.0)).status == (
+        AgentTaskStatus.CANCELLED
+    )
+    assert quiesce_entered.is_set() is False
+    assert quiescing.done() is False
+
+    release_terminal_tail.set()
+    await asyncio.wait_for(quiesce_entered.wait(), timeout=1.0)
+    assert runtime._tasks == {}
+    assert runtime._reservations_by_session == {}
+    assert runtime._driver_tasks_by_session == {}
+    assert storage.records[queued.task_id].status == AgentTaskStatus.CANCELLED
+
+    blocked_enqueue = asyncio.create_task(
+        runtime.enqueue(envelope, "after quiesce")
+    )
+    await asyncio.sleep(0)
+    assert blocked_enqueue.done() is False
+
+    release_quiesce.set()
+    await asyncio.wait_for(quiescing, timeout=1.0)
+    after = await asyncio.wait_for(blocked_enqueue, timeout=1.0)
+    assert (await runtime.wait(after.task_id, timeout=1.0)).status == (
+        AgentTaskStatus.SUCCEEDED
+    )
+
+
+@pytest.mark.asyncio
+async def test_quiesce_sessions_retries_a_committed_reservation_before_activation() -> None:
+    storage = _TrackingStorage()
+    session_key = "agent-1::quiesce-commit-before-activate"
+    quiesce_entered = asyncio.Event()
+    release_quiesce = asyncio.Event()
+
+    async def handler(_run: Any) -> None:
+        await asyncio.Event().wait()
+
+    runtime = TaskRuntime(storage=storage, turn_handler=handler)
+    envelope = _envelope(session_key)
+    reservation = await runtime.reserve(envelope, "committed")
+    storage.accept(reservation.task_record)
+
+    async def quiesce() -> None:
+        async with runtime.quiesce_sessions([session_key]):
+            quiesce_entered.set()
+            await release_quiesce.wait()
+
+    async def activate() -> Any:
+        async with runtime.collect_admission(session_key):
+            return await runtime.activate(reservation)
+
+    async with runtime.collect_admission(session_key):
+        quiescing = asyncio.create_task(quiesce())
+        await asyncio.sleep(0)
+        activating = asyncio.create_task(activate())
+        await asyncio.sleep(0)
+
+    entered_wait = asyncio.create_task(quiesce_entered.wait())
+    try:
+        done, _pending = await asyncio.wait(
+            {activating, entered_wait},
+            timeout=1.0,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        assert activating in done
+        assert entered_wait not in done
+
+        handle = activating.result()
+        await asyncio.wait_for(quiesce_entered.wait(), timeout=1.0)
+        assert storage.records[handle.task_id].status == AgentTaskStatus.CANCELLED
+        assert runtime._tasks == {}
+        assert runtime._reservations_by_session == {}
+        assert runtime._driver_tasks_by_session == {}
+    finally:
+        release_quiesce.set()
+        if not activating.done():
+            await asyncio.wait_for(activating, timeout=1.0)
+        await asyncio.wait_for(quiescing, timeout=1.0)
+        entered_wait.cancel()
+
+
+@pytest.mark.asyncio
+async def test_quiesce_sessions_cancels_driver_that_wins_execution_lock_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _TrackingStorage()
+    session_key = "agent-1::quiesce-execution-acquire-gap"
+    driver_started = asyncio.Event()
+    release_driver = asyncio.Event()
+
+    async def handler(_run: Any) -> None:
+        driver_started.set()
+        await release_driver.wait()
+
+    runtime = TaskRuntime(storage=storage, turn_handler=handler)
+    reservation = await runtime.reserve(_envelope(session_key), "gap winner")
+    storage.accept(reservation.task_record)
+    original_drain = runtime._cancel_and_drain_session_drivers
+    injected = False
+
+    async def inject_after_initial_drain(*args: Any, **kwargs: Any) -> None:
+        nonlocal injected
+        await original_drain(*args, **kwargs)
+        if not injected:
+            injected = True
+            await runtime.activate(reservation)
+            await asyncio.wait_for(driver_started.wait(), timeout=1.0)
+
+    monkeypatch.setattr(
+        runtime,
+        "_cancel_and_drain_session_drivers",
+        inject_after_initial_drain,
+    )
+
+    async def quiesce() -> None:
+        async with runtime.quiesce_sessions([session_key]):
+            return
+
+    try:
+        await asyncio.wait_for(quiesce(), timeout=1.0)
+        assert storage.records[reservation.task_id].status == (
+            AgentTaskStatus.CANCELLED
+        )
+        assert runtime._driver_tasks_by_session == {}
+    finally:
+        release_driver.set()
+        with contextlib.suppress(Exception):
+            await runtime.shutdown(cancel=True, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_execution_fence_acquire_releases_lock_when_cancelled_after_acquire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = TaskRuntime(
+        storage=_TrackingStorage(),
+        turn_handler=_noop_turn_handler,
+    )
+    execution_lock = asyncio.Lock()
+
+    async def cancel_after_acquire(*_args: Any, **_kwargs: Any) -> None:
+        await asyncio.sleep(0)
+        assert execution_lock.locked() is True
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        runtime,
+        "_cancel_and_drain_session_drivers",
+        cancel_after_acquire,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await runtime._acquire_execution_lock_while_quiescing(
+            execution_lock,
+            ("agent-1::cancelled-fence",),
+            frozenset({"agent-1::cancelled-fence"}),
+        )
+
+    assert execution_lock.locked() is False
+
+
+@pytest.mark.asyncio
+async def test_execution_fence_cancellation_cleans_driver_change_waiter() -> None:
+    runtime = TaskRuntime(
+        storage=_TrackingStorage(),
+        turn_handler=_noop_turn_handler,
+    )
+    execution_lock = asyncio.Lock()
+    await execution_lock.acquire()
+    waiting_event = runtime._driver_state_changed
+    acquiring = asyncio.create_task(
+        runtime._acquire_execution_lock_while_quiescing(
+            execution_lock,
+            ("agent-1::cancelled-waiter",),
+            frozenset({"agent-1::cancelled-waiter"}),
+        )
+    )
+    try:
+        for _ in range(20):
+            if waiting_event._waiters:
+                break
+            await asyncio.sleep(0)
+        assert len(waiting_event._waiters) == 1
+
+        acquiring.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await acquiring
+
+        assert len(waiting_event._waiters) == 0
+        assert execution_lock.locked() is True
+    finally:
+        execution_lock.release()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_execution_fences_cannot_erase_driver_change_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = TaskRuntime(
+        storage=_TrackingStorage(),
+        turn_handler=_noop_turn_handler,
+    )
+    first_key = "agent-1::first-concurrent-quiescer"
+    second_key = "agent-1::second-concurrent-quiescer"
+    first_lock = asyncio.Lock()
+    second_lock = asyncio.Lock()
+    await first_lock.acquire()
+    await second_lock.acquire()
+    first_snapshot_taken = asyncio.Event()
+    release_first_snapshot = asyncio.Event()
+    second_snapshot_taken = asyncio.Event()
+    first_redrained = asyncio.Event()
+    first_drain_calls = 0
+
+    async def controlled_drain(
+        keys: tuple[str, ...],
+        _key_set: frozenset[str],
+    ) -> None:
+        nonlocal first_drain_calls
+        if keys == (first_key,):
+            first_drain_calls += 1
+            if first_drain_calls == 1:
+                first_snapshot_taken.set()
+                await release_first_snapshot.wait()
+            else:
+                first_redrained.set()
+            return
+        second_snapshot_taken.set()
+
+    monkeypatch.setattr(
+        runtime,
+        "_cancel_and_drain_session_drivers",
+        controlled_drain,
+    )
+    first = asyncio.create_task(
+        runtime._acquire_execution_lock_while_quiescing(
+            first_lock,
+            (first_key,),
+            frozenset({first_key}),
+        )
+    )
+    second: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(first_snapshot_taken.wait(), timeout=1.0)
+        runtime._signal_driver_state_changed()
+        second = asyncio.create_task(
+            runtime._acquire_execution_lock_while_quiescing(
+                second_lock,
+                (second_key,),
+                frozenset({second_key}),
+            )
+        )
+        await asyncio.wait_for(second_snapshot_taken.wait(), timeout=1.0)
+        release_first_snapshot.set()
+
+        await asyncio.wait_for(first_redrained.wait(), timeout=1.0)
+    finally:
+        first_lock.release()
+        second_lock.release()
+        for task in (first, second):
+            if task is None:
+                continue
+            if not task.done():
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task

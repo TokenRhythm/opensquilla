@@ -2,19 +2,48 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import time
-from typing import Any
+from collections.abc import Awaitable
+from contextlib import AsyncExitStack
+from typing import Any, cast
 
+from opensquilla.engine.steps.router_decision_record import (
+    drain_pending_flushes_for_sessions,
+)
+from opensquilla.gateway.agent_tasks import get_agent_task_registry
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
-from opensquilla.gateway.session_services import get_session_storage
+from opensquilla.gateway.session_services import get_session_lock, get_session_storage
+from opensquilla.gateway.subagent_announce import (
+    quiesce_background_completion_sessions,
+)
 from opensquilla.project_workspaces import (
     adopt_legacy_project_workspaces,
     project_workspace_payload,
     resolve_project_path,
 )
 from opensquilla.session.models import ProjectWorkspace
+from opensquilla.session.storage import ProjectSessionSnapshotMismatchError
 
 _d = get_dispatcher()
+
+
+async def _settle_despite_cancellation[T](awaitable: Awaitable[T]) -> T:
+    """Settle one irreversible operation before propagating caller cancellation."""
+
+    operation = asyncio.ensure_future(awaitable)
+    cancellation: asyncio.CancelledError | None = None
+    while not operation.done():
+        try:
+            await asyncio.shield(operation)
+        except asyncio.CancelledError as exc:
+            cancellation = cancellation or exc
+    if cancellation is not None:
+        with contextlib.suppress(BaseException):
+            operation.result()
+        raise cancellation
+    return operation.result()
 
 
 def _require_owner(ctx: RpcContext) -> None:
@@ -52,7 +81,7 @@ async def _active_workspace(
     workspace = await storage.get_project_workspace(workspace_id)
     if workspace is None or workspace.removed_at is not None:
         raise RpcHandlerError("WORKSPACE_NOT_FOUND", "Project workspace not found.")
-    return workspace
+    return cast(ProjectWorkspace, workspace)
 
 
 async def _payload(storage: Any, workspace: ProjectWorkspace) -> dict[str, Any]:
@@ -166,13 +195,89 @@ async def _handle_workspaces_history_delete(
     _require_owner(ctx)
     workspace_id = _workspace_id(params)
     storage = _storage(ctx)
-    await _active_workspace(storage, workspace_id)
-    deleted = await storage.delete_project_workspace_sessions(workspace_id)
-    return {
-        "workspaceId": workspace_id,
-        "deletedTaskCount": len(deleted),
-        "deletedSessionKeys": deleted,
-    }
+
+    async def _delete_fenced_history() -> dict[str, Any]:
+        while True:
+            candidate_keys = await storage.list_project_workspace_session_keys(
+                workspace_id
+            )
+            async with AsyncExitStack() as fences:
+                # A child terminal tail can schedule a parent wake, so install
+                # this fence before cancelling/draining TaskRuntime drivers.
+                await fences.enter_async_context(
+                    quiesce_background_completion_sessions(candidate_keys)
+                )
+
+                task_runtime = getattr(ctx, "task_runtime", None)
+                quiesce_runtime = getattr(task_runtime, "quiesce_sessions", None)
+                if callable(quiesce_runtime):
+                    await fences.enter_async_context(
+                        quiesce_runtime(candidate_keys)
+                    )
+
+                await fences.enter_async_context(
+                    get_agent_task_registry().quiesce_sessions(candidate_keys)
+                )
+
+                for session_key in sorted(candidate_keys):
+                    lock = get_session_lock(ctx.turn_runner, session_key)
+                    if lock is not None:
+                        await fences.enter_async_context(lock)
+
+                # These fire-and-forget durable writes are outside the driver
+                # tasks above. Let matching work settle naturally: cancelling a
+                # wrapper cannot stop an underlying writer thread.
+                await drain_pending_flushes_for_sessions(candidate_keys)
+                drain_turn_writes = getattr(
+                    ctx.turn_runner,
+                    "drain_session_background_writes",
+                    None,
+                )
+                if callable(drain_turn_writes):
+                    await drain_turn_writes(candidate_keys)
+
+                session_ids: dict[str, str] = {}
+                for session_key in candidate_keys:
+                    node = await storage.get_session(session_key)
+                    session_id = getattr(node, "session_id", None)
+                    if isinstance(session_id, str) and session_id:
+                        session_ids[session_key] = session_id
+
+                try:
+                    deleted = await storage.delete_project_workspace_sessions(
+                        workspace_id,
+                        expected_session_keys=candidate_keys,
+                    )
+                except ProjectSessionSnapshotMismatchError:
+                    # Release this stale generation of every fence, then
+                    # resnapshot the whole project and retry.
+                    continue
+                except KeyError as exc:
+                    raise RpcHandlerError(
+                        "WORKSPACE_NOT_FOUND",
+                        "Project workspace not found.",
+                    ) from exc
+
+                evict_runtime_state = getattr(
+                    ctx.session_manager,
+                    "evict_session_runtime_state",
+                    None,
+                )
+                if callable(evict_runtime_state):
+                    for session_key in deleted:
+                        evict_runtime_state(
+                            session_key,
+                            session_id=session_ids.get(session_key),
+                        )
+
+                return {
+                    "workspaceId": workspace_id,
+                    # Counts every deleted project session: roots and children.
+                    "deletedTaskCount": len(deleted),
+                    "deletedSessionKeys": deleted,
+                }
+
+    return await _settle_despite_cancellation(_delete_fenced_history())
 
 
 __all__ = [

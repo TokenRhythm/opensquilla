@@ -8,8 +8,11 @@ context actually leave the loop thread.
 
 from __future__ import annotations
 
+import asyncio
 import threading
 from typing import Any
+
+import pytest
 
 from opensquilla.skills.meta.orchestrator import MetaOrchestrator, _to_thread
 from opensquilla.skills.meta.types import MetaPlan, MetaStep
@@ -26,6 +29,67 @@ async def test_to_thread_forwards_args_and_kwargs() -> None:
         return a + b
 
     assert await _to_thread(combine, 2, b=3) == 5
+
+
+async def test_to_thread_preserves_worker_exception() -> None:
+    def fail() -> None:
+        raise RuntimeError("writer failed")
+
+    with pytest.raises(RuntimeError, match="writer failed"):
+        await _to_thread(fail)
+
+
+class _BlockingBeginRunWriter:
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+        self._lock = threading.Lock()
+        self._root_ids: list[str] = []
+
+    def begin_run_sync(self, *, root_id: str) -> str:
+        self.started.set()
+        if not self.release.wait(timeout=5):
+            raise TimeoutError("test did not release begin_run_sync")
+        with self._lock:
+            self._root_ids.append(root_id)
+        self.finished.set()
+        return root_id
+
+    def purge(self) -> None:
+        with self._lock:
+            self._root_ids.clear()
+
+    def root_ids(self) -> list[str]:
+        with self._lock:
+            return list(self._root_ids)
+
+
+async def test_to_thread_drains_writer_before_repeated_cancellation_propagates() -> None:
+    writer = _BlockingBeginRunWriter()
+    call = asyncio.create_task(
+        _to_thread(writer.begin_run_sync, root_id="root"),
+    )
+    assert await asyncio.to_thread(writer.started.wait, 1)
+
+    try:
+        call.cancel()
+        await asyncio.sleep(0)
+        assert not call.done()
+
+        call.cancel()
+        await asyncio.sleep(0)
+        assert not call.done()
+    finally:
+        writer.release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await call
+
+    assert writer.finished.is_set()
+    writer.purge()
+    await asyncio.sleep(0)
+    assert writer.root_ids() == []
 
 
 class _ThreadRecordingWriter:
