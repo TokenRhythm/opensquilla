@@ -11,47 +11,43 @@ from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus
 from opensquilla.session.storage import SessionStorage
 
 
-def test_restart_recovery_expires_approvals_for_every_abandoned_session() -> None:
+def test_restart_recovery_expires_every_pending_approval_once() -> None:
     storage = SimpleNamespace(
         restart_abandoned_session_keys=(
             "agent:main:webchat:first",
             "agent:main:webchat:second",
-        )
+        ),
+        take_restart_abandoned_session_keys=Mock(
+            return_value=(
+                "agent:main:webchat:first",
+                "agent:main:webchat:second",
+            )
+        ),
     )
     queue = Mock()
-    queue.expire_pending_for_session.side_effect = [2, 1]
+    queue.expire_all_pending.return_value = 3
 
     expired = boot._expire_restart_orphaned_approvals(storage, queue)
 
     assert expired == 3
-    assert queue.expire_pending_for_session.call_args_list == [
-        (("agent:main:webchat:first",),),
-        (("agent:main:webchat:second",),),
-    ]
+    storage.take_restart_abandoned_session_keys.assert_called_once_with()
+    queue.expire_all_pending.assert_called_once_with()
 
 
-def test_restart_recovery_continues_when_one_session_cleanup_fails(
+def test_restart_recovery_reports_global_cleanup_failure(
     monkeypatch,
 ) -> None:
-    storage = SimpleNamespace(
-        restart_abandoned_session_keys=(
-            "agent:main:webchat:broken",
-            "agent:main:webchat:healthy",
-        )
-    )
+    storage = SimpleNamespace(restart_abandoned_session_keys=())
     queue = Mock()
-    queue.expire_pending_for_session.side_effect = [RuntimeError("locked"), 1]
+    queue.expire_all_pending.side_effect = RuntimeError("locked")
     logger = Mock()
     monkeypatch.setattr(boot, "log", logger)
 
     expired = boot._expire_restart_orphaned_approvals(storage, queue)
 
-    assert expired == 1
-    assert queue.expire_pending_for_session.call_count == 2
-    logger.exception.assert_called_once_with(
-        "approval.restart_recovery_failed",
-        session_key="agent:main:webchat:broken",
-    )
+    assert expired == 0
+    queue.expire_all_pending.assert_called_once_with()
+    logger.exception.assert_called_once_with("approval.restart_recovery_failed")
 
 
 @pytest.mark.asyncio
@@ -84,19 +80,27 @@ async def test_process_restart_terminalizes_task_and_its_orphaned_approval(
             "humanActionable": True,
         },
     )
+    unrelated_id = queue.request(
+        "plugin",
+        {
+            "sessionKey": "agent:main:webchat:already-terminal",
+            "pluginId": "example",
+        },
+    )
+    unscoped_id = queue.request("plugin", {"pluginId": "unscoped"})
     queue.close()
 
     restarted_storage = await SessionStorage.open(str(session_db))
     restarted_queue = ApprovalQueue(db_path=str(approval_db))
     try:
-        assert restarted_queue.list_pending()
+        assert len(restarted_queue.list_pending()) == 3
 
         assert (
             boot._expire_restart_orphaned_approvals(
                 restarted_storage,
                 restarted_queue,
             )
-            == 1
+            == 3
         )
 
         assert restarted_queue.list_pending() == []
@@ -104,6 +108,8 @@ async def test_process_restart_terminalizes_task_and_its_orphaned_approval(
         approval = restarted_queue.get(approval_id)
         assert approval.resolved is True
         assert approval.resolution == "expired"
+        assert restarted_queue.get(unrelated_id).resolution == "expired"
+        assert restarted_queue.get(unscoped_id).resolution == "expired"
         task = await restarted_storage.get_agent_task("crashed-task")
         assert task is not None
         assert task.status == AgentTaskStatus.ABANDONED

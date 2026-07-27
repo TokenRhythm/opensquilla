@@ -1105,9 +1105,8 @@ async function onDeleteSession(key: string) {
 // Topbar approval pill: jump straight to the blocked session's chat so the
 // in-thread card can be answered. The live `pendingApprovals` list (kept fresh
 // by the push subscription + reconnect seed) is the source of truth — no
-// re-fetch — and the oldest pending session (closest to timeout) is the
-// deterministic target. With no routable session, fall back to the Approvals
-// page.
+// re-fetch — and the oldest pending session is the deterministic target. With
+// no routable session, fall back to the Sessions page.
 function openBlockedApprovalSession() {
   const oldest = appStore.oldestPendingWithSession
   if (oldest?.sessionKey) {
@@ -1317,7 +1316,11 @@ function onApprovalResolved(payload: ApprovalPushPayload) {
 // Reconnect re-seeds the list (recovers approvals that arrived while the socket
 // was down); the push events keep it live thereafter.
 function onApprovalConnectionState(state: unknown) {
-  if (state === 'connected') void seedPendingApprovals()
+  if (state !== 'connected') {
+    appStore.setPendingApprovals([])
+    return
+  }
+  void seedPendingApprovals()
 }
 
 function subscribeApprovals() {

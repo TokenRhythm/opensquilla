@@ -66,6 +66,15 @@ describe('ApprovalCard safe context', () => {
     app.unmount()
   })
 
+  it('never shows an expiry countdown for a human approval', async () => {
+    const { app, root } = await mountCard(approval({
+      deadline: Date.now() / 1000 + 30,
+    }))
+    expect(root.querySelector('.approval-card__timer')).toBeNull()
+    expect(root.textContent).not.toContain('Expires in')
+    app.unmount()
+  })
+
   it('folds a missing status into a neutral unavailable outcome', async () => {
     const { app, root } = await mountCard(approval(), 'unavailable')
     expect(root.querySelector('.approval-outcome--unavailable')).not.toBeNull()

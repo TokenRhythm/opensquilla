@@ -10,6 +10,11 @@ describe('pending approval navigation wiring', () => {
     )
   })
 
+  it('clears stale global approval attention while the gateway is disconnected', () => {
+    expect(appSource).toContain("if (state !== 'connected')")
+    expect(appSource).toContain('appStore.setPendingApprovals([])')
+  })
+
   it('keeps new pending approvals at the bottom and handles exact focus requests', () => {
     expect(chatViewSource).toContain('focusPendingApprovalCard')
     expect(chatViewSource).toContain('livePendingInterruptParts')

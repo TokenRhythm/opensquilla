@@ -51,7 +51,7 @@ from opensquilla.sandbox.types import (
 log = logging.getLogger(__name__)
 
 DEFAULT_DENIAL_THRESHOLD = 3
-DEFAULT_APPROVAL_TIMEOUT_S = 300.0
+DEFAULT_APPROVAL_TIMEOUT_S: float | None = None
 
 
 # ─── Fingerprinting ────────────────────────────────────────────────────────
@@ -299,7 +299,7 @@ class ApprovalGate:
     * If ``policy.require_approval`` is false, :meth:`gate` returns
       :data:`ALLOW` immediately.
     * Otherwise it enqueues an approval request on the provided queue,
-      awaits the human decision (with a timeout → deny), and returns
+      awaits the human decision for as long as the owning task lives, and returns
       :data:`ALLOW` on approve or a :class:`DenialResult` on reject.
     * ``namespace`` selects which approval queue namespace to use — the
       existing code uses ``"exec"`` for shell/code and ``"plugin"`` for
@@ -311,7 +311,7 @@ class ApprovalGate:
         queue: _ApprovalQueueLike,
         *,
         namespace: str = "exec",
-        timeout: float = DEFAULT_APPROVAL_TIMEOUT_S,
+        timeout: float | None = DEFAULT_APPROVAL_TIMEOUT_S,
     ) -> None:
         self._queue = queue
         self._namespace = namespace

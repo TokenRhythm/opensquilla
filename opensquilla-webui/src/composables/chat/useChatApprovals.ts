@@ -18,8 +18,8 @@ const MAX_RESOLVED_OUTCOMES = 4
 // 2s interval as a recovery fallback (resolve-from-another-client self-healing).
 const APPROVAL_POLL_INTERVAL_MS = 2000
 
-// Seconds an Extend click pushes the approval deadline out by (mirrors the
-// backend default re-arm window).
+// Legacy compatibility for explicitly timed approvals from older Gateways.
+// Current human approval cards have no deadline and expose no Extend control.
 const APPROVAL_EXTEND_SECONDS = 300
 
 /** Format a whole-second remaining count as a compact `m:ss` / `s` countdown.
@@ -50,7 +50,7 @@ export interface ChatApprovalItem {
   warning: string
   agent: string
   sessionKey: string
-  deadline: number          // epoch seconds the request expires; 0 when unknown
+  deadline: number          // legacy/internal epoch deadline; 0 for human review
 }
 
 export type ChatApprovalResolution = 'approved' | 'denied' | 'expired' | 'unavailable'
@@ -460,9 +460,8 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   // list (which the hydration-only path no longer populates).
   const interruptNamespaces = new Map<string, string>()
 
-  // Last-seen approval data per id, so extendInterrupt can re-append a frame
-  // carrying the bumped deadline (the fold merges it onto the existing part) and
-  // the countdown re-arms live without a snapshot round-trip.
+  // Last-seen approval data per id. Deadline mutation remains compatible with
+  // explicitly timed approvals from older Gateways, but current human cards use 0.
   const interruptApprovals = new Map<string, InterruptApprovalData>()
 
   // The clarify frame is keyed by a runId|step composite (a clarify has no
@@ -707,12 +706,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     }
   }
 
-  /**
-   * Push an inline approval's deadline out (WCAG 2.2.1 extend mechanism). Calls
-   * the `<namespace>.approval.extend` RPC and re-appends the frame with the
-   * bumped deadline so the countdown re-arms live (the fold merges by id). A
-   * busy or already-resolved request is a no-op.
-   */
+  /** Compatibility path for explicitly timed approvals from older Gateways. */
   async function extendInterrupt(id: string, seconds = APPROVAL_EXTEND_SECONDS) {
     const current = interruptState.value.get(id)
     if (approvalBusyIds.value.has(id) || current?.resolution) return
@@ -752,8 +746,8 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   // args/warning rather than duplicating the part.
   function appendApprovalInterrupt(data: InterruptApprovalData) {
     interruptNamespaces.set(data.approvalId, data.namespace)
-    // A lean push (or backfill) may omit the deadline (0); keep the latest
-    // known non-zero deadline so a countdown never regresses to "unknown".
+    // A lean push (or backfill) may omit the legacy deadline (0); keep any
+    // explicit deadline already received for compatibility.
     const prior = interruptApprovals.get(data.approvalId)
     const merged: InterruptApprovalData = {
       ...data,

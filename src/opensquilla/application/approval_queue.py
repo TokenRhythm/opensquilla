@@ -99,14 +99,18 @@ ApprovalEventListener = Callable[[str, dict], None]
 class ApprovalQueue:
     def __init__(
         self,
-        default_timeout: float = 300.0,
+        default_timeout: float | None = None,
         *,
         db_path: str | None = None,
         poll_interval: float = 0.25,
         claim_ttl_seconds: float = 60.0,
     ):
         self._pending: dict[str, PendingApproval] = {}
-        self._timeout = default_timeout
+        self._timeout = (
+            max(0.0, float(default_timeout))
+            if default_timeout is not None
+            else None
+        )
         self._poll_interval = max(0.01, float(poll_interval))
         self._claim_ttl_seconds = max(0.0, float(claim_ttl_seconds))
         self._global_settings = ApprovalSettings()
@@ -372,7 +376,7 @@ class ApprovalQueue:
         while True:
             approval_id = uuid.uuid4().hex[:12]
             now = time.time()
-            deadline = now + self._timeout
+            deadline = now + self._timeout if self._timeout else 0.0
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
                 self._conn.execute(
@@ -450,8 +454,8 @@ class ApprovalQueue:
             entry = self.get(approval_id)
             if entry.resolved and entry.claim_token is None:
                 return entry.approved
-            remaining = entry.deadline - time.time()
-            if remaining <= 0:
+            remaining = entry.deadline - time.time() if entry.deadline > 0 else None
+            if remaining is not None and remaining <= 0:
                 outcome = self._expire_if_unresolved(approval_id)
                 if outcome is not None:
                     return outcome
@@ -459,7 +463,11 @@ class ApprovalQueue:
             try:
                 await asyncio.wait_for(
                     entry._event.wait(),
-                    timeout=min(self._poll_interval, remaining),
+                    timeout=(
+                        self._poll_interval
+                        if remaining is None
+                        else min(self._poll_interval, remaining)
+                    ),
                 )
             except TimeoutError:
                 pass
@@ -573,6 +581,21 @@ class ApprovalQueue:
             ).strip()
             if owner_key != key:
                 continue
+            if self._expire_if_unresolved(
+                str(row["approval_id"]),
+                force=True,
+            ) is not None:
+                count += 1
+        return count
+
+    def expire_all_pending(self) -> int:
+        """Expire every unresolved approval left by an earlier process."""
+
+        rows = self._conn.execute(
+            "SELECT approval_id FROM approval_queue WHERE resolved = 0"
+        ).fetchall()
+        count = 0
+        for row in rows:
             if self._expire_if_unresolved(
                 str(row["approval_id"]),
                 force=True,

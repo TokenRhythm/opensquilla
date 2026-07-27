@@ -46,7 +46,7 @@ function hydrateSidebarWidthPreference(): SidebarWidthPreference {
   }
 }
 
-/** One pending approval, ordered oldest-first (closest to timeout). */
+/** One pending approval, ordered oldest-first. */
 export interface PendingApproval {
   approvalId: string
   sessionKey: string
@@ -92,7 +92,7 @@ export const useAppStore = defineStore('app', () => {
   const approvalCount = computed(() =>
     approvalsLive.value ? pendingApprovals.value.length : approvalCountRaw.value)
 
-  // The oldest pending approval with a routable session (closest to timeout).
+  // The oldest pending approval with a routable session.
   const oldestPendingWithSession = computed<PendingApproval | null>(() =>
     pendingApprovals.value.find(item => !!item.sessionKey) ?? null)
 

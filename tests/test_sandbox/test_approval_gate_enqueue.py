@@ -168,7 +168,10 @@ async def test_gate_enqueues_when_approval_required(tmp_path: Path) -> None:
     )
 
     class _ResolvingQueue(_RecordingQueue):
+        waited_timeout: float | None | object = object()
+
         async def wait(self, approval_id: str, timeout: float | None = None) -> bool:
+            self.waited_timeout = timeout
             return True
 
     queue = _ResolvingQueue()
@@ -178,6 +181,7 @@ async def test_gate_enqueues_when_approval_required(tmp_path: Path) -> None:
 
     assert decision is ALLOW
     assert queue.requested is True
+    assert queue.waited_timeout is None
 
 
 @pytest.mark.asyncio

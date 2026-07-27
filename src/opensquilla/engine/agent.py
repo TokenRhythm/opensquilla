@@ -1323,7 +1323,7 @@ def _suspend_tool_request(
 async def _wait_for_pending_approval_resolution(
     payload: dict[str, Any],
     *,
-    timeout: float,
+    timeout: float | None = None,
 ) -> None:
     approval_id = payload.get("approval_id")
     if not isinstance(approval_id, str) or not approval_id:
@@ -1332,7 +1332,10 @@ async def _wait_for_pending_approval_resolution(
         from opensquilla.gateway.approval_queue import get_approval_queue
 
         queue = get_approval_queue()
-        await queue.wait(approval_id, timeout=max(0.0, timeout))
+        await queue.wait(
+            approval_id,
+            timeout=max(0.0, timeout) if timeout is not None else None,
+        )
     except KeyError:
         return
 
@@ -2491,13 +2494,6 @@ class Agent:
             return float(raw_interval)
         except (TypeError, ValueError):
             return 15.0
-
-    def _approval_wait_timeout(self) -> float:
-        raw_timeout = self.config.metadata.get("approval_wait_timeout_seconds", 180.0)
-        try:
-            return max(0.0, float(raw_timeout))
-        except (TypeError, ValueError):
-            return 180.0
 
     def _max_safe_tool_concurrency(self) -> int:
         try:
@@ -9402,10 +9398,18 @@ class Agent:
                                 arguments=tc.arguments,
                                 execution_status=projected_result.execution_status,
                             )
-                        await _wait_for_pending_approval_resolution(
-                            pending_approval,
-                            timeout=_cap_timeout_by_deadlines(self._approval_wait_timeout()),
+                        approval_wait_started = _loop.time()
+                        await _wait_for_pending_approval_resolution(pending_approval)
+                        approval_wait_duration = max(
+                            0.0,
+                            _loop.time() - approval_wait_started,
                         )
+                        # Human review is a suspended state, not execution time.
+                        # Shift both active deadlines so an approval that arrives
+                        # much later still resumes with the same tool/turn budget.
+                        tool_deadline += approval_wait_duration
+                        if _total_deadline is not None:
+                            _total_deadline += approval_wait_duration
                         approval_entry = None
                         from opensquilla.gateway.approval_queue import get_approval_queue
 

@@ -2253,34 +2253,20 @@ def _expire_restart_orphaned_approvals(
     session_storage: Any,
     approval_queue: Any,
 ) -> int:
-    """Expire approvals whose owning task was abandoned during this startup."""
+    """Expire every approval whose in-memory continuation died on restart."""
 
     take_session_keys = getattr(
         session_storage,
         "take_restart_abandoned_session_keys",
         None,
     )
-    session_keys = (
+    if callable(take_session_keys):
         take_session_keys()
-        if callable(take_session_keys)
-        else getattr(session_storage, "restart_abandoned_session_keys", ())
-    )
-    if not isinstance(session_keys, (tuple, list, set, frozenset)):
+    try:
+        expired = int(approval_queue.expire_all_pending() or 0)
+    except Exception:
+        log.exception("approval.restart_recovery_failed")
         return 0
-    expired = 0
-    for raw_key in session_keys:
-        session_key = str(raw_key or "").strip()
-        if not session_key:
-            continue
-        try:
-            expired += int(
-                approval_queue.expire_pending_for_session(session_key) or 0
-            )
-        except Exception:
-            log.exception(
-                "approval.restart_recovery_failed",
-                session_key=session_key,
-            )
     if expired:
         log.info(
             "approval.restart_recovery_completed",

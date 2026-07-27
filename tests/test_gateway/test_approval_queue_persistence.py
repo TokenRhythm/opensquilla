@@ -38,6 +38,37 @@ def test_approval_queue_request_persists_across_queue_restart(tmp_path) -> None:
     reloaded.close()
 
 
+@pytest.mark.asyncio
+async def test_default_approval_wait_remains_pending_until_human_decides(tmp_path) -> None:
+    queue = ApprovalQueue(
+        db_path=str(tmp_path / "approval_queue.sqlite"),
+        poll_interval=0.01,
+    )
+    approval_id = queue.request(
+        "exec",
+        {
+            "toolName": "exec_command",
+            "command": "rm -f target.txt",
+            "sessionKey": "agent:main:webchat:indefinite",
+        },
+    )
+    waiter = asyncio.create_task(queue.wait(approval_id))
+    try:
+        await asyncio.sleep(0.03)
+
+        entry = queue.get(approval_id)
+        assert entry.deadline == 0.0
+        assert entry.resolved is False
+        assert waiter.done() is False
+
+        queue.resolve(approval_id, True)
+        assert await asyncio.wait_for(waiter, timeout=0.2) is True
+    finally:
+        if not waiter.done():
+            waiter.cancel()
+        queue.close()
+
+
 def test_expire_pending_for_session_only_terminalizes_matching_approvals(tmp_path) -> None:
     queue = ApprovalQueue(db_path=str(tmp_path / "approval_queue.sqlite"))
     restarted_key = "agent:main:webchat:restart"
@@ -68,6 +99,28 @@ def test_expire_pending_for_session_only_terminalizes_matching_approvals(tmp_pat
             assert entry.resolution == "expired"
         assert queue.get(other_id).resolved is False
         assert queue.get(unscoped_id).resolved is False
+    finally:
+        queue.close()
+
+
+def test_expire_all_pending_terminalizes_scoped_unscoped_and_claimed_approvals(
+    tmp_path,
+) -> None:
+    queue = ApprovalQueue(db_path=str(tmp_path / "approval_queue.sqlite"))
+    approval_ids = [
+        queue.request("exec", {"sessionKey": "agent:main:webchat:a"}),
+        queue.request("plugin", {"sessionKey": "agent:main:webchat:b"}),
+        queue.request("plugin", {"pluginId": "unscoped"}),
+    ]
+    queue.claim_resolution(approval_ids[-1])
+    try:
+        assert queue.expire_all_pending() == 3
+        assert queue.list_pending() == []
+        for approval_id in approval_ids:
+            entry = queue.get(approval_id)
+            assert entry.resolved is True
+            assert entry.approved is False
+            assert entry.resolution == "expired"
     finally:
         queue.close()
 

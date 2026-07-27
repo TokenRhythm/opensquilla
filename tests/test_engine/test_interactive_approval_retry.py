@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import AsyncIterator
 from typing import Any
@@ -823,6 +824,7 @@ async def test_agent_waits_for_approval_resolution_before_retry_result_reaches_m
                     }
                 ),
             )
+        await asyncio.sleep(0.01)
         return ToolResult(
             tool_use_id=call.tool_use_id,
             tool_name=call.tool_name,
@@ -834,7 +836,8 @@ async def test_agent_waits_for_approval_resolution_before_retry_result_reaches_m
         provider=provider,
         config=AgentConfig(
             max_iterations=2,
-            metadata={"approval_wait_timeout_seconds": 1.0},
+            timeout=0.05,
+            iteration_timeout=0.05,
         ),
         tool_definitions=[_exec_definition()],
         tool_handler=_handler,
@@ -851,7 +854,7 @@ async def test_agent_waits_for_approval_resolution_before_retry_result_reaches_m
     try:
         task = asyncio.create_task(_drive())
         await asyncio.wait_for(approval_prompt_seen.wait(), timeout=2.0)
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.08)
 
         assert len(provider.calls) == 1
         assert len(tool_calls) == 1
@@ -886,7 +889,7 @@ async def test_agent_waits_for_approval_resolution_before_retry_result_reaches_m
 
 
 @pytest.mark.asyncio
-async def test_timed_out_approval_expires_and_pauses_turn_without_model_fallback(
+async def test_pending_approval_ignores_legacy_timeout_and_waits_for_decision(
     tmp_path: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -937,29 +940,37 @@ async def test_timed_out_approval_expires_and_pauses_turn_without_model_fallback
         tool_handler=_handler,
     )
 
-    events = [event async for event in agent.run_turn("what is on this page?")]
+    events: list[Any] = []
+    prompt_seen = asyncio.Event()
 
-    assert len(provider.calls) == 1
-    assert not any(
-        getattr(event, "kind", "") == "text_delta"
-        and "fallback from training knowledge" in event.text
-        for event in events
-    )
-    assert any(
-        isinstance(event, ToolResultEvent) and "approval_required" in event.result
-        for event in events
-    )
-    required_event = next(
-        event
-        for event in events
-        if isinstance(event, ToolResultEvent) and "approval_required" in event.result
-    )
-    approval_id = str(json.loads(required_event.result)["approval_id"])
-    entry = get_approval_queue().get(approval_id)
-    assert get_approval_queue().list_pending("exec") == []
-    assert entry.resolved is True
-    assert entry.approved is False
-    assert entry.resolution == "expired"
+    async def _drive() -> None:
+        async for event in agent.run_turn("what is on this page?"):
+            events.append(event)
+            if isinstance(event, ToolResultEvent) and "approval_required" in event.result:
+                prompt_seen.set()
+
+    task = asyncio.create_task(_drive())
+    try:
+        await asyncio.wait_for(prompt_seen.wait(), timeout=2.0)
+        await asyncio.sleep(0.05)
+
+        required_event = next(
+            event
+            for event in events
+            if isinstance(event, ToolResultEvent) and "approval_required" in event.result
+        )
+        approval_id = str(json.loads(required_event.result)["approval_id"])
+        entry = get_approval_queue().get(approval_id)
+        assert task.done() is False
+        assert get_approval_queue().list_pending("exec")
+        assert entry.resolved is False
+        assert entry.deadline == 0.0
+        assert len(provider.calls) == 1
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        reset_approval_queue()
 
 
 @pytest.mark.asyncio
