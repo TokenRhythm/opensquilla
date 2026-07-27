@@ -25,6 +25,9 @@ describe('ActivityToolDetails text hierarchy', () => {
     expect(ruleBody('.activity-tool-details__fallback')).toContain(
       'color: var(--text-muted);',
     )
+    const error = ruleBody('.activity-tool-details__line--error')
+    expect(error).toContain('color: var(--text-muted);')
+    expect(error).not.toContain('var(--danger)')
   })
 })
 
@@ -64,5 +67,13 @@ describe('ActivityToolDetails byte units', () => {
   it('labels 1024-based sizes with binary units', () => {
     expect(activityToolDetailsSource).toContain("['KiB', 'MiB', 'GiB']")
     expect(activityToolDetailsSource).not.toContain("['KB', 'MB', 'GB']")
+  })
+})
+
+describe('ActivityToolDetails localized facts', () => {
+  it('formats projected exit codes through i18n', () => {
+    expect(activityToolDetailsSource).toContain(
+      "t('shared.runTrace.activityExitCode', { code: formatNumber(line.code) })",
+    )
   })
 })

@@ -6,6 +6,7 @@
         v-for="artifact in visualArtifacts"
         :key="`media-${artifactKey(artifact)}`"
         class="msg-media-card"
+        :data-artifact-key="artifactKey(artifact)"
         :aria-label="t('chat.artifactTitleSubtitle', { title: artifactFileTitle(artifact), subtitle: artifactFileSubtitle(artifact) })"
       >
         <!-- Reserved aspect-ratio box: the preview only fetches once this scrolls
@@ -102,6 +103,7 @@
       <AudioArtifactCard
         v-for="artifact in audioArtifacts"
         :key="artifactKey(artifact)"
+        :data-artifact-key="artifactKey(artifact)"
         :artifact="artifact"
         :session-key="sessionKey"
         :auth-token="authToken"
@@ -109,11 +111,25 @@
       />
     </TransitionGroup>
 
-    <!-- Non-image/non-audio artifacts: file cards with explicit actions. -->
+    <!-- Video artifacts follow the same authenticated, explicit-load contract. -->
+    <TransitionGroup v-if="videoArtifacts.length" name="artifact-chip" tag="div" class="msg-artifact-files">
+      <VideoArtifactCard
+        v-for="artifact in videoArtifacts"
+        :key="artifactKey(artifact)"
+        :data-artifact-key="artifactKey(artifact)"
+        :artifact="artifact"
+        :session-key="sessionKey"
+        :auth-token="authToken"
+        @download="$emit('download', $event)"
+      />
+    </TransitionGroup>
+
+    <!-- Non-image/non-media artifacts: file cards with explicit actions. -->
     <TransitionGroup v-if="fileArtifacts.length" name="artifact-chip" tag="div" class="msg-artifact-files">
       <ArtifactChip
         v-for="artifact in fileArtifacts"
         :key="artifactKey(artifact)"
+        :data-artifact-key="artifactKey(artifact)"
         :artifact="artifact"
         :category="artifactCategory(artifact)"
         :icon-name="artifactIconName(artifact)"
@@ -127,113 +143,18 @@
       />
     </TransitionGroup>
 
-    <!-- In-app image lightbox: Open shows the full image here, not a new tab. -->
-    <div
-      v-if="active"
-      class="deliv-preview"
-      role="dialog"
-      aria-modal="true"
-      :aria-label="t('chat.previewOf', { title: artifactFileTitle(active) })"
-      @click.self="closePreview"
-    >
-      <!-- Always media mode: this lightbox only ever opens image artifacts. -->
-      <div ref="lightboxPanel" class="deliv-preview__panel deliv-preview__panel--media">
-        <header class="deliv-preview__head">
-          <span class="deliv-preview__title">{{ artifactFileTitle(active) }}</span>
-          <button
-            ref="lightboxCloseBtn"
-            type="button"
-            class="btn btn--icon btn--ghost"
-            :aria-label="t('chat.closePreview')"
-            :title="t('chat.closePreview')"
-            @click="closePreview"
-          >
-            <Icon name="x" :size="16" />
-          </button>
-        </header>
-        <div class="deliv-preview__body">
-          <button
-            v-if="canNavigateImages"
-            type="button"
-            class="deliv-preview__nav deliv-preview__nav--prev"
-            :aria-label="t('chat.previousImage')"
-            :title="t('chat.previousImage')"
-            :disabled="!canGoPreviousImage"
-            @click="showPreviousImage"
-          >
-            <Icon name="chevronRight" :size="22" />
-          </button>
-          <img
-            v-if="fullState === 'loaded' && fullUrl"
-            class="deliv-preview__image"
-            :src="fullUrl"
-            :alt="artifactFileTitle(active)"
-            decoding="async"
-          />
-          <div
-            v-else-if="fullState === 'timeout' || fullState === 'error'"
-            class="deliv-preview__file"
-            role="status"
-          >
-            <p class="deliv-preview__meta">
-              {{ fullState === 'timeout' ? t('chat.previewTimedOut') : t('chat.previewFailed') }}
-            </p>
-            <button type="button" class="btn btn--ghost" @click="retryFull">
-              <Icon name="refresh" :size="14" />
-              <span>{{ t('chat.retry') }}</span>
-            </button>
-          </div>
-          <div
-            v-else
-            class="deliv-preview__loading"
-            role="status"
-            :aria-label="t('chat.loadingPreview')"
-          >
-            <div
-              v-if="fullProgress !== null"
-              class="deliv-preview__progress"
-              role="progressbar"
-              aria-label="Preview download"
-              :aria-valuenow="fullProgress ?? 0"
-              aria-valuemin="0"
-              aria-valuemax="100"
-            >
-              <span class="deliv-preview__progress-bar" :style="{ width: `${fullProgress}%` }" />
-            </div>
-            <span v-else class="deliv-preview__progress-shimmer" aria-hidden="true" />
-          </div>
-          <button
-            v-if="canNavigateImages"
-            type="button"
-            class="deliv-preview__nav deliv-preview__nav--next"
-            :aria-label="t('chat.nextImage')"
-            :title="t('chat.nextImage')"
-            :disabled="!canGoNextImage"
-            @click="showNextImage"
-          >
-            <Icon name="chevronRight" :size="22" />
-          </button>
-        </div>
-        <footer class="deliv-preview__actions">
-          <button type="button" class="btn btn--primary" @click="$emit('download', active)">
-            <Icon name="download" :size="14" />
-            <span>{{ t('chat.download') }}</span>
-          </button>
-        </footer>
-      </div>
-    </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
+import { computed, onUnmounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import ArtifactChip from '@/components/chat/ArtifactChip.vue'
 import AudioArtifactCard from '@/components/chat/AudioArtifactCard.vue'
+import VideoArtifactCard from '@/components/chat/VideoArtifactCard.vue'
 import type { ArtifactPayload } from '@/types/rpc'
 import { useToasts } from '@/composables/useToasts'
-import { useDialogLayer } from '@/composables/useDialogA11y'
 import {
   createArtifactPreview,
   type ArtifactPreviewController,
@@ -249,7 +170,6 @@ import { usePlatform } from '@/platform'
 import { useRpcStore } from '@/stores/rpc'
 import {
   artifactCategory,
-  artifactDownloadUrl,
   artifactFileSubtitle,
   artifactFileTitle,
   artifactIconName,
@@ -264,10 +184,13 @@ const props = defineProps<{
   navigationArtifacts?: ArtifactPayload[]
   sessionKey?: string
   authToken?: string
+  /** Route previewable document artifacts into the app-level Workbench. */
+  preferWorkbench?: boolean
 }>()
 
-defineEmits<{
+const emit = defineEmits<{
   download: [artifact: ArtifactPayload]
+  open: [artifact: ArtifactPayload]
 }>()
 
 const { t } = useI18n()
@@ -277,13 +200,10 @@ const rpcStore = useRpcStore()
 
 const visualArtifacts = computed(() => props.artifacts.filter(artifact => artifactCategory(artifact) === 'visual'))
 const audioArtifacts = computed(() => props.artifacts.filter(artifact => artifactCategory(artifact) === 'audio'))
-const navigationVisualArtifacts = computed(() => {
-  const source = props.navigationArtifacts?.length ? props.navigationArtifacts : props.artifacts
-  return source.filter(artifact => artifactCategory(artifact) === 'visual')
-})
+const videoArtifacts = computed(() => props.artifacts.filter(artifact => artifactCategory(artifact) === 'video'))
 const fileArtifacts = computed(() => props.artifacts.filter(artifact => {
   const category = artifactCategory(artifact)
-  return category !== 'visual' && category !== 'audio'
+  return category !== 'visual' && category !== 'audio' && category !== 'video'
 }))
 
 function artifactKey(artifact: ArtifactPayload): string {
@@ -303,6 +223,7 @@ const webOwnerCanNativeOpen = computed(() => {
 
 function artifactCanOpen(artifact: ArtifactPayload): boolean {
   if (!canPreview(artifact)) return false
+  if (props.preferWorkbench) return true
   if (!isActiveDocumentArtifactCandidate(artifact)) return true
   if (platform.capabilities.canOpenArtifactsNatively && platform.files.openArtifact) return true
   return webOwnerCanNativeOpen.value
@@ -374,15 +295,10 @@ function retryPreview(artifact: ArtifactPayload) {
   controllerFor(artifact).retry()
 }
 
-// Open the image in an in-app lightbox (role=dialog) rather than navigating
-// away. The lightbox fetches the FULL download URL (never the thumbnail);
-// Download stays fully decoupled from this preview path.
+// App owns image preview so images opened from a message and from the
+// Workbench collection share one Lightbox.
 function openPreview(artifact: ArtifactPayload) {
-  lightboxInvoker = document.activeElement instanceof HTMLElement ? document.activeElement : null
-  active.value = artifact
-  loadFull(artifact)
-  document.addEventListener('keydown', onLightboxKeydown)
-  nextTick(() => lightboxCloseBtn.value?.focus())
+  emit('open', artifact)
 }
 
 // Open a previewable non-image file (pdf/html/text).
@@ -393,6 +309,10 @@ function openPreview(artifact: ArtifactPayload) {
 // default app. Web keeps the in-browser new-tab path and its active-document
 // guard.
 async function openFile(artifact: ArtifactPayload) {
+  if (props.preferWorkbench) {
+    emit('open', artifact)
+    return
+  }
   if (platform.capabilities.canOpenArtifactsNatively && platform.files.openArtifact) {
     const fetched = await fetchArtifactBlob(artifact, {
       baseOrigin: window.location.origin,
@@ -435,145 +355,6 @@ async function openFile(artifact: ArtifactPayload) {
   pushToast(result.message, { tone: 'danger' })
 }
 
-// ── In-app image lightbox ──────────────────────────────────────────────────
-// The full-size image is fetched only when Open is invoked, through the shared
-// LRU-bounded controller; the thumbnail path above never loads the full bytes.
-const active = ref<ArtifactPayload | null>(null)
-const lightboxIsTopmost = useDialogLayer(computed(() => active.value !== null))
-const lightboxCloseBtn = ref<HTMLButtonElement | null>(null)
-const lightboxPanel = ref<HTMLElement | null>(null)
-let lightboxInvoker: HTMLElement | null = null
-
-const activeImageIndex = computed(() => {
-  const current = active.value
-  if (!current) return -1
-  const currentKey = artifactKey(current)
-  return navigationVisualArtifacts.value.findIndex(artifact => artifactKey(artifact) === currentKey)
-})
-const canNavigateImages = computed(() => navigationVisualArtifacts.value.length > 1)
-const canGoPreviousImage = computed(() => activeImageIndex.value > 0)
-const canGoNextImage = computed(() =>
-  activeImageIndex.value >= 0 && activeImageIndex.value < navigationVisualArtifacts.value.length - 1)
-
-let fullController: ArtifactPreviewController | null = null
-const fullState = ref<ArtifactPreviewState>('idle')
-const fullProgress = ref<number | null>(null)
-const fullUrl = ref<string>('')
-let stopFullState: (() => void) | null = null
-
-function disposeFull() {
-  stopFullState?.()
-  stopFullState = null
-  fullController?.dispose()
-  fullController = null
-  fullState.value = 'idle'
-  fullProgress.value = null
-  fullUrl.value = ''
-}
-
-function loadFull(artifact: ArtifactPayload) {
-  disposeFull()
-  fullController = createArtifactPreview({
-    resolveUrl: () => artifactDownloadUrl(artifact, window.location.origin, {
-      sessionKey: props.sessionKey,
-      includeSessionKey: false,
-    }),
-    headers: () => previewHeaders(artifactDownloadUrl(artifact, window.location.origin, {
-      sessionKey: props.sessionKey,
-      includeSessionKey: false,
-    })),
-    sameOrigin,
-    fullSize: true,
-  })
-  const ctrl = fullController
-  stopFullState = watch(
-    [ctrl.state, ctrl.progress, ctrl.objectUrl],
-    ([s, p, u]) => {
-      fullState.value = s as ArtifactPreviewState
-      fullProgress.value = (p as number | null) ?? null
-      fullUrl.value = (u as string) || ''
-    },
-    { immediate: true },
-  )
-  ctrl.load()
-}
-
-function retryFull() {
-  fullController?.retry()
-}
-
-function showImageAt(index: number) {
-  const artifact = navigationVisualArtifacts.value[index]
-  if (!artifact) return
-  active.value = artifact
-  loadFull(artifact)
-}
-
-function showPreviousImage() {
-  if (!canGoPreviousImage.value) return
-  showImageAt(activeImageIndex.value - 1)
-}
-
-function showNextImage() {
-  if (!canGoNextImage.value) return
-  showImageAt(activeImageIndex.value + 1)
-}
-
-function closePreview() {
-  if (!active.value) return
-  active.value = null
-  disposeFull()
-  document.removeEventListener('keydown', onLightboxKeydown)
-  const invoker = lightboxInvoker
-  lightboxInvoker = null
-  nextTick(() => {
-    if (invoker && document.contains(invoker)) invoker.focus()
-  })
-}
-
-function trapLightboxFocus(event: KeyboardEvent) {
-  const rootEl = lightboxPanel.value
-  if (!rootEl) return
-  const focusables = Array.from(rootEl.querySelectorAll<HTMLElement>(
-    'button:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])'))
-  if (focusables.length === 0) return
-  const first = focusables[0]
-  const last = focusables[focusables.length - 1]
-  const activeEl = document.activeElement as HTMLElement | null
-  const inside = !!activeEl && rootEl.contains(activeEl)
-  if (event.shiftKey && (!inside || activeEl === first)) {
-    event.preventDefault()
-    last.focus()
-  } else if (!event.shiftKey && (!inside || activeEl === last)) {
-    event.preventDefault()
-    first.focus()
-  }
-}
-
-function onLightboxKeydown(event: KeyboardEvent) {
-  if (!active.value || !lightboxIsTopmost.value) return
-  if (event.key === 'Escape') {
-    event.preventDefault()
-    closePreview()
-    return
-  }
-  if (event.key === 'ArrowLeft') {
-    if (canGoPreviousImage.value) {
-      event.preventDefault()
-      showPreviousImage()
-    }
-    return
-  }
-  if (event.key === 'ArrowRight') {
-    if (canGoNextImage.value) {
-      event.preventDefault()
-      showNextImage()
-    }
-    return
-  }
-  if (event.key === 'Tab') trapLightboxFocus(event)
-}
-
 function disposeStaleControllers() {
   const live = new Set(visualArtifacts.value.map(artifactKey))
   for (const [key, controller] of controllers) {
@@ -592,8 +373,6 @@ watch(
 )
 
 onUnmounted(() => {
-  document.removeEventListener('keydown', onLightboxKeydown)
-  disposeFull()
   for (const controller of controllers.values()) controller.dispose()
   controllers.clear()
 })

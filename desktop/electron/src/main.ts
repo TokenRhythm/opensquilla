@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, safeStorage, shell, Tray } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, protocol, safeStorage, shell, Tray } from 'electron'
 import electronUpdater from 'electron-updater'
 import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
@@ -83,6 +83,26 @@ import {
   type DesktopMainWindowCloseBehavior,
   type DesktopPreferencesFile,
 } from './desktop-window-lifecycle.js'
+import {
+  NATIVE_WORKBENCH_ARTIFACT_SCHEME,
+  parseNativeWorkbenchCreateRequest,
+  parseNativeWorkbenchSurfaceId,
+  parseNativeWorkbenchSurfaceRectRequest,
+} from './native-workbench-surface-contract.js'
+import {
+  NativeWorkbenchSurfaceManager,
+} from './native-workbench-surface.js'
+
+protocol.registerSchemesAsPrivileged([{
+  scheme: NATIVE_WORKBENCH_ARTIFACT_SCHEME,
+  privileges: {
+    standard: true,
+    secure: true,
+    supportFetchAPI: true,
+    corsEnabled: true,
+    stream: true,
+  },
+}])
 
 interface GatewayState {
   url: string
@@ -413,6 +433,19 @@ const gatewayState: GatewayState = {
   logPath: '',
 }
 
+const nativeWorkbenchSurfaces = new NativeWorkbenchSurfaceManager({
+  getWindow: () => currentMainWindow(),
+  emit: event => {
+    const window = currentMainWindow()
+    if (
+      !window
+      || !gatewayState.owned
+      || !gatewayState.url
+      || !isCurrentWindowAtControlUi(window, gatewayState.url)
+    ) return
+    window.webContents.send('desktop:workbench:surface-event', event)
+  },
+})
 function activeDesktopProfile(): DesktopProfilePaths {
   return primaryProfilePaths(app.getPath('userData'))
 }
@@ -7318,6 +7351,13 @@ async function createMainWindow(): Promise<BrowserWindow> {
   }
   window.webContents.on('will-navigate', guardMainWindowNavigation)
   window.webContents.on('will-redirect', guardMainWindowNavigation)
+  window.webContents.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
+    // Native child views sit above the renderer DOM. A full document change
+    // must remove them before boot/recovery/another Control UI can become
+    // visible; same-document SPA navigation keeps the Workbench lifecycle in
+    // Vue and is intentionally left alone.
+    if (isMainFrame && !isInPlace) void nativeWorkbenchSurfaces.destroyAll()
+  })
 
   window.on('close', (event) => handleMainWindowClose(window, event))
   if (process.platform === 'win32') {
@@ -9333,6 +9373,44 @@ ipcMain.handle('desktop:workspace:choose-directory', async (event) => {
   })
   if (choice.canceled || choice.filePaths.length !== 1) return null
   return { path: resolve(choice.filePaths[0]!) }
+})
+ipcMain.handle('desktop:workbench:surface:create', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  try {
+    return await nativeWorkbenchSurfaces.createSurface(
+      parseNativeWorkbenchCreateRequest(payload),
+    )
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
+})
+ipcMain.handle('desktop:workbench:surface:set-rect', (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  try {
+    return nativeWorkbenchSurfaces.setSurfaceRect(
+      parseNativeWorkbenchSurfaceRectRequest(payload),
+    )
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
+})
+ipcMain.handle('desktop:workbench:surface:activate', (event, surfaceId: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  try {
+    return nativeWorkbenchSurfaces.activateSurface(parseNativeWorkbenchSurfaceId(surfaceId))
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
+})
+ipcMain.handle('desktop:workbench:surface:destroy', async (event, surfaceId: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  try {
+    return await nativeWorkbenchSurfaces.destroySurface(
+      parseNativeWorkbenchSurfaceId(surfaceId),
+    )
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
 })
 
 // ── Desktop data cleanup ───────────────────────────────────────────────────
@@ -11492,6 +11570,9 @@ async function drainOwnedGatewayForQuit(
 
 app.on('before-quit', (event) => {
   desktopUpdateCheckScheduler.stop()
+  // Remove native child views immediately so they cannot outlive the trusted
+  // Control UI while the gateway/writer shutdown drain keeps Electron alive.
+  void nativeWorkbenchSurfaces.destroyAll()
   // Windows session shutdown cannot wait on our normal asynchronous quit
   // drain. Let the OS-owned close proceed and synchronously signal the current
   // child so the window can never be converted back into background mode.

@@ -9,13 +9,18 @@ const ARTIFACT_MIME_CATEGORIES: Record<string, string> = {
 
 const ARTIFACT_EXTENSION_CATEGORIES: Record<string, string> = {
   aac: 'audio', flac: 'audio', m4a: 'audio', mp3: 'audio', oga: 'audio', ogg: 'audio', opus: 'audio', wav: 'audio',
+  avi: 'video', m4v: 'video', mkv: 'video', mov: 'video', mp4: 'video', ogv: 'video', webm: 'video',
+  avif: 'visual', bmp: 'visual', gif: 'visual', ico: 'visual', jpeg: 'visual',
+  jpg: 'visual', png: 'visual', svg: 'visual', webp: 'visual',
   csv: 'data', htm: 'document', html: 'document', ipynb: 'data', json: 'data',
   jsonl: 'data', log: 'document', markdown: 'document', md: 'document',
   ndjson: 'data', pdf: 'document', sql: 'code', tsv: 'data', txt: 'document',
 }
 
 export function artifactMime(artifact: ArtifactPayload): string {
-  return artifact?.mime ? String(artifact.mime).toLowerCase() : ''
+  return artifact?.mime
+    ? String(artifact.mime).split(';', 1)[0].trim().toLowerCase()
+    : ''
 }
 
 export function artifactName(artifact: ArtifactPayload): string {
@@ -33,6 +38,7 @@ export function artifactCategory(artifact: ArtifactPayload): string {
   const mime = artifactMime(artifact)
   if (mime.startsWith('image/')) return 'visual'
   if (mime.startsWith('audio/')) return 'audio'
+  if (mime.startsWith('video/')) return 'video'
   if (ARTIFACT_MIME_CATEGORIES[mime]) return ARTIFACT_MIME_CATEGORIES[mime]
   if (!mime || mime === 'application/octet-stream') {
     const ext = artifactExtension(artifactName(artifact))
@@ -48,6 +54,7 @@ export function artifactCategoryLabel(artifact: ArtifactPayload): string {
     case 'document': return 'doc'
     case 'code': return 'code'
     case 'audio': return 'audio'
+    case 'video': return 'video'
     default: return 'file'
   }
 }
@@ -58,7 +65,14 @@ export function artifactIconName(artifact: ArtifactPayload): IconName {
   if (cat === 'data') return 'table'
   if (cat === 'code') return 'fileCode'
   if (cat === 'audio') return 'music'
+  if (cat === 'video') return 'video'
   return 'fileText'
+}
+
+/** Media that is playable in the chat transcript rather than the Workbench. */
+export function isInlineMediaArtifact(artifact: ArtifactPayload): boolean {
+  const category = artifactCategory(artifact)
+  return category === 'audio' || category === 'video'
 }
 
 export function artifactFileTitle(artifact: ArtifactPayload): string {

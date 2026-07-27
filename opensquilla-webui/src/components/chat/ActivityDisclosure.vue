@@ -262,7 +262,7 @@ const resolvedFailureLabel = computed(() =>
 
 .assistant-activity__live-failure {
   flex: 0 0 auto;
-  color: var(--danger);
+  color: var(--warn);
   font-size: 0.75rem;
   white-space: nowrap;
 }
@@ -317,8 +317,17 @@ const resolvedFailureLabel = computed(() =>
 
 .assistant-activity__failure {
   flex: 0 0 auto;
-  color: var(--danger);
+  color: var(--text-muted);
   white-space: nowrap;
+}
+
+.assistant-activity--failed .assistant-activity__failure {
+  color: var(--danger);
+}
+
+.assistant-activity--failed :deep(.tool-timeline--activity .tool-row--error .tool-row__status),
+.assistant-activity--failed :deep(.tool-timeline--activity .tool-row__activity-icon--error) {
+  color: var(--danger);
 }
 
 .assistant-activity__summary-arrow {

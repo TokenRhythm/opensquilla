@@ -20,6 +20,18 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
   setNativeTheme: (payload: unknown) => ipcRenderer.invoke('desktop:theme:set', payload),
   openArtifact: (payload: unknown) => ipcRenderer.invoke('desktop:artifact:open', payload),
   chooseProjectDirectory: () => ipcRenderer.invoke('desktop:workspace:choose-directory'),
+  createWorkbenchSurface: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:surface:create', payload)
+  ),
+  setWorkbenchSurfaceRect: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:surface:set-rect', payload)
+  ),
+  activateWorkbenchSurface: (surfaceId: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:surface:activate', surfaceId)
+  ),
+  destroyWorkbenchSurface: (surfaceId: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:surface:destroy', surfaceId)
+  ),
   getOnboardingDefaults: () => ipcRenderer.invoke('desktop:onboarding:defaults'),
   saveOnboarding: (payload: unknown) => ipcRenderer.invoke('desktop:onboarding:save', payload),
   cancelOnboarding: () => ipcRenderer.invoke('desktop:onboarding:cancel'),
@@ -72,5 +84,10 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
     const listener = () => callback()
     ipcRenderer.on('desktop:window:hidden', listener)
     return () => ipcRenderer.removeListener('desktop:window:hidden', listener)
+  },
+  onWorkbenchSurfaceEvent: (callback: (payload: unknown) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => callback(payload)
+    ipcRenderer.on('desktop:workbench:surface-event', listener)
+    return () => ipcRenderer.removeListener('desktop:workbench:surface-event', listener)
   },
 })

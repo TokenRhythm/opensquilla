@@ -183,7 +183,7 @@
                   <span v-if="resultCountText(call)" class="tool-row__status">{{ resultCountText(call) }}</span>
                   <span v-if="elapsedFor(call)" class="tool-row__elapsed">{{ elapsedFor(call) }}</span>
                   <Icon v-if="presentation !== 'activity' && iconFor(call).glyph === 'check'" class="tool-row__state-icon tool-row__state-icon--ok" name="check" :size="13" />
-                  <Icon v-else-if="iconFor(call).glyph === 'x'" class="tool-row__state-icon tool-row__state-icon--err" name="x" :size="13" />
+                  <Icon v-else-if="presentation !== 'activity' && iconFor(call).glyph === 'x'" class="tool-row__state-icon tool-row__state-icon--err" name="x" :size="13" />
                   <Icon v-if="presentation !== 'activity'" class="step-chevron" name="chevronRight" :size="14" />
                 </span>
               </button>
@@ -241,7 +241,7 @@
                 <span v-if="resultCountText(call)" class="tool-row__status">{{ resultCountText(call) }}</span>
                 <span v-if="elapsedFor(call)" class="tool-row__elapsed">{{ elapsedFor(call) }}</span>
                 <Icon v-if="presentation !== 'activity' && iconFor(call).glyph === 'check'" class="tool-row__state-icon tool-row__state-icon--ok" name="check" :size="13" />
-                <Icon v-else-if="iconFor(call).glyph === 'x'" class="tool-row__state-icon tool-row__state-icon--err" name="x" :size="13" />
+                <Icon v-else-if="presentation !== 'activity' && iconFor(call).glyph === 'x'" class="tool-row__state-icon tool-row__state-icon--err" name="x" :size="13" />
                 <Icon v-if="presentation !== 'activity'" class="step-chevron" name="chevronRight" :size="14" />
               </span>
             </button>
@@ -1123,7 +1123,16 @@ function elapsedFor(call: ChatToolCallRenderItem): string {
 }
 
 function resolvedGroupStatusText(group: ChatToolCallGroup): string {
-  return (props.toolGroupStatusText ?? defaultToolGroupStatusText)(group)
+  const fallback = defaultToolGroupStatusText(group)
+  const injected = (props.toolGroupStatusText ?? defaultToolGroupStatusText)(group).trim()
+  if (
+    props.presentation === 'activity'
+    && group.isError
+    && (!injected || injected === fallback)
+  ) {
+    return t('shared.runTrace.activityNotCompleted')
+  }
+  return injected || fallback
 }
 
 function resolvedSecondaryText(call: ChatToolCallRenderItem): string {
@@ -1134,8 +1143,12 @@ function activityTerminalStatusText(call: ChatToolCallRenderItem): string {
   if (props.presentation !== 'activity' || (!call.isError && call.status !== 'error')) {
     return ''
   }
+  const fallback = defaultToolStatusText(call)
   const injected = props.toolStatusText?.(call)?.trim()
-  return injected || defaultToolStatusText(call)
+  if (!injected || injected === fallback) {
+    return t('shared.runTrace.activityNotCompleted')
+  }
+  return injected
 }
 
 function forwardShowResult(content: string, title: string, context?: ToolResultContext) {
@@ -1698,7 +1711,7 @@ function fmtTok(n?: number | null): string {
 }
 
 .tool-timeline--activity .tool-row--error .tool-row__status {
-  color: var(--danger);
+  color: var(--warn);
 }
 
 .tool-timeline--activity .tool-row__arg {
@@ -1727,7 +1740,7 @@ function fmtTok(n?: number | null): string {
 }
 
 .tool-timeline--activity .tool-row__activity-icon--error {
-  color: var(--danger);
+  color: var(--warn);
 }
 
 .tool-timeline--activity .tool-row__activity-arrow {

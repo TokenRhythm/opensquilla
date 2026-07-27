@@ -94,6 +94,9 @@ function formatLine(line: ActivityToolDetailLine): string {
       characters: formatNumber(line.characters),
     })
   }
+  if (line.kind === 'exit-code') {
+    return t('shared.runTrace.activityExitCode', { code: formatNumber(line.code) })
+  }
   if (line.kind === 'published') {
     return t('shared.runTrace.activityPublished')
   }
@@ -170,7 +173,7 @@ function showRawDetails() {
   overflow: visible;
   overflow-wrap: anywhere;
   white-space: normal;
-  color: var(--danger);
+  color: var(--text-muted);
 }
 
 .activity-tool-details__summary--interactive .activity-tool-details__line--target,
@@ -212,7 +215,7 @@ function showRawDetails() {
 
 .activity-tool-details__summary--interactive:hover .activity-tool-details__line--error,
 .activity-tool-details__summary--interactive:focus-within .activity-tool-details__line--error {
-  color: var(--danger);
+  color: var(--text);
 }
 
 .activity-tool-details__hit-target:focus-visible {

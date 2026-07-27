@@ -1,7 +1,6 @@
 <template>
   <div class="empty-state">
     <p class="empty-state__greeting">{{ greeting }}</p>
-    <p class="empty-state__identity">{{ identityLine }}</p>
     <div v-if="!suppressed" class="empty-state__chips" role="group" :aria-label="t('chat.suggestedTasks')">
       <button
         v-for="chip in chips"
@@ -50,11 +49,7 @@ interface CapabilityStatus {
   imageGenerationEnabled?: boolean
 }
 
-interface AgentIdentityPayload {
-  name?: string | null
-}
-
-const props = withDefaults(defineProps<{
+withDefaults(defineProps<{
   agentId: string
   metaSkills?: Array<{ value: string; description: string }>
   suppressed?: boolean
@@ -76,19 +71,12 @@ const FALLBACK_CHIPS = computed(() => [
 ])
 
 const capabilityStatus = useRpcCall<CapabilityStatus>('onboarding.status')
-const identity = useRpcCall<AgentIdentityPayload>('agent.identity.get', { agentId: props.agentId })
 
 const greeting = computed(() => {
   const hour = new Date().getHours()
   if (hour >= 5 && hour < 12) return t('chat.greetingMorning')
   if (hour >= 12 && hour < 18) return t('chat.greetingAfternoon')
   return t('chat.greetingEvening')
-})
-
-const identityLine = computed(() => {
-  const name = identity.data.value?.name
-  const label = typeof name === 'string' && name.trim() ? name.trim() : props.agentId
-  return t('chat.identityReady', { label })
 })
 
 const chips = computed(() => {
@@ -147,6 +135,7 @@ function metaSkillIcon(name: string): IconName {
 }
 
 .empty-state__greeting {
+  animation: empty-state-greeting-reveal calc(var(--dur-base) * 2.5) var(--ease-out) both;
   margin: var(--sp-2) 0 0;
   font-family: var(--font-display);
   font-size: clamp(1.75rem, 1rem + 1.8vw, 2.25rem);
@@ -155,11 +144,17 @@ function metaSkillIcon(name: string): IconName {
   color: var(--text);
 }
 
-.empty-state__identity {
-  margin: 0;
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
-  color: var(--text-dim);
+@keyframes empty-state-greeting-reveal {
+  from {
+    filter: blur(5px);
+    opacity: 0;
+    transform: translateY(7px);
+  }
+  to {
+    filter: blur(0);
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .empty-state__chips {
@@ -268,6 +263,10 @@ function metaSkillIcon(name: string): IconName {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .empty-state__greeting {
+    animation: none;
+  }
+
   .empty-state__chip {
     transition: none;
   }

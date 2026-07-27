@@ -202,7 +202,7 @@ select:focus,
 }
 
 .sidebar-new-session {
-  font-weight: 560;
+  font-weight: 400;
   padding: 9px 12px;
 }
 
@@ -221,7 +221,7 @@ select:focus,
 .sidebar-core .sidebar-fn-item,
 .sidebar-foot .sidebar-fn-item {
   border-radius: var(--radius-control);
-  font-weight: 520;
+  font-weight: 400;
   min-height: 40px;
   padding: 9px 11px;
 }
@@ -251,7 +251,7 @@ select:focus,
 
 .sidebar-core .sidebar-fn-item.is-active {
   box-shadow: none;
-  font-weight: 620;
+  font-weight: 400;
 }
 
 .sidebar-core .sidebar-fn-item.is-active:hover {
@@ -597,28 +597,44 @@ select:focus,
 
 /* Sessions: grouped cards and whitespace replace the ledger frame. */
 .content .hub .hub-task {
+  align-items: center;
   background: var(--bg-surface);
-  border-color: transparent;
-  border-radius: var(--radius-panel);
-  box-shadow: var(--elev-1);
+  border-color: var(--hairline);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--text) 4%, transparent);
+  display: grid;
   gap: var(--sp-3);
-  padding: var(--sp-5);
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding: 8px 10px 8px 18px;
 }
 
 .content .hub .hub-task:focus-within {
-  border-color: transparent;
-  box-shadow: var(--focus-ring), var(--elev-1);
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--border));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 10%, transparent);
 }
 
 .content .hub .hub-task__input {
-  font-size: 1.0625rem;
-  line-height: 1.6;
-  min-height: 64px;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  font-size: 1rem;
+  line-height: 1.5;
+  min-height: 40px;
+  padding: 8px 0;
+}
+
+.content .hub .hub-task__input:focus {
+  background: transparent;
+  border: 0;
+  box-shadow: none;
 }
 
 .content .hub .hub-attention-clear {
+  border-bottom: 1px solid var(--hairline);
   color: var(--text-dim);
-  padding: 0 4px;
+  min-height: 34px;
+  padding: 0 4px 10px;
 }
 
 .content .hub .hub-attention-clear__text {
@@ -740,7 +756,75 @@ select:focus,
 }
 
 .chat-composer {
-  filter: drop-shadow(0 16px 28px color-mix(in srgb, var(--shadow) 15%, transparent));
+  filter: none;
+}
+
+/* The composer is a single floating work surface. A quiet hairline, a top
+   highlight, and two shadow depths create separation without a heavy frame. */
+#app .chat .chat-input-panel {
+  background: color-mix(in srgb, var(--bg-surface) 97%, var(--bg-surface-2));
+  border-color: color-mix(in srgb, var(--text) 9%, transparent);
+  box-shadow:
+    inset 0 1px 0 var(--elev-highlight),
+    0 1px 2px color-mix(in srgb, var(--text) 7%, transparent),
+    0 16px 38px -26px color-mix(in srgb, var(--text) 30%, transparent);
+  min-height: 120px;
+  transition: border-color var(--transition), box-shadow var(--transition), background var(--transition);
+}
+
+#app .chat .chat-input-panel:focus-within,
+#app .chat .chat-composer--new-landing .chat-input-panel:focus-within {
+  background: var(--bg-surface);
+  border-color: color-mix(in srgb, var(--text) 18%, transparent);
+  box-shadow:
+    inset 0 1px 0 var(--elev-highlight),
+    0 0 0 3px color-mix(in srgb, var(--accent) 7%, transparent),
+    0 2px 5px color-mix(in srgb, var(--text) 8%, transparent),
+    0 18px 42px -26px color-mix(in srgb, var(--text) 34%, transparent);
+}
+
+#app .chat .chat-textarea,
+#app .chat .chat-textarea:focus {
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+}
+
+#app .chat .chat-input-footer {
+  padding: 2px 10px 10px;
+}
+
+#app .chat .chat-input-panel .btn--icon {
+  height: 32px;
+  min-height: 32px;
+  min-width: 32px;
+  width: 32px;
+}
+
+#app .chat .chat-input-panel .btn--ghost:not(:disabled):hover {
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+}
+
+#app .chat .chat-send-btn.btn--primary {
+  box-shadow: inset 0 1px 0 var(--elev-highlight);
+}
+
+#app .chat .chat-send-btn.btn--primary.is-ready {
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--accent-foreground) 24%, transparent),
+    0 4px 12px -6px color-mix(in srgb, var(--accent) 72%, transparent);
+}
+
+#app .chat .chat-ai-disclaimer {
+  color: var(--text-dim);
+  margin-top: 8px;
+}
+
+/* Landing-page secondary copy shares one quiet type scale. Keep composed text
+   comfortably sized; only its grey placeholder joins the auxiliary rhythm. */
+#app .chat--new-landing .empty-state__chip,
+#app .chat--new-landing .chat-ai-disclaimer {
+  font-size: var(--fs-xs);
 }
 
 .chat-slash,

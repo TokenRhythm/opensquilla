@@ -1,4 +1,4 @@
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
 import type { Attachment } from '@/types/chat'
@@ -29,6 +29,12 @@ type UploadResponseMeta = {
 
 type AttachmentPreparationOptions = {
   isCurrent?: () => boolean
+  /**
+   * Refresh this attachment collection instead of the visible composer.
+   * Queued sends use their own snapshot and must never borrow or mutate a
+   * draft that the operator is still editing.
+   */
+  attachments?: Attachment[]
 }
 
 // Per-addAttachments-call state so batch-wide rejections (the aggregate size
@@ -109,6 +115,13 @@ export function useChatAttachments() {
   const pendingAttachments = ref<Attachment[]>([])
   const nextAttachmentId = ref(1)
   const refreshInFlightAttachmentIds = new Set<number>()
+  const refreshInFlightAttachmentCount = ref(0)
+  const attachmentWorkBusy = computed(() =>
+    refreshInFlightAttachmentCount.value > 0
+    || pendingAttachments.value.some(
+      attachment => attachment.kind === 'inline_pending' || attachment.kind === 'uploading',
+    ),
+  )
 
   function onFileInputChange(e: Event) {
     const target = e.target as HTMLInputElement
@@ -245,10 +258,16 @@ export function useChatAttachments() {
     await addAttachment(attachment.file)
   }
 
-  function markAttachmentFailed(localId: number, file: File, mime: string, error: string) {
-    const idx = pendingAttachments.value.findIndex(a => a.local_id === localId)
+  function markAttachmentFailed(
+    localId: number,
+    file: File,
+    mime: string,
+    error: string,
+    attachments: Attachment[] = pendingAttachments.value,
+  ) {
+    const idx = attachments.findIndex(a => a.local_id === localId)
     if (idx >= 0) {
-      pendingAttachments.value[idx] = {
+      attachments[idx] = {
         kind: 'failed',
         local_id: localId,
         name: file.name || 'Untitled file',
@@ -261,19 +280,20 @@ export function useChatAttachments() {
   }
 
   function hasPendingAttachmentWork(): boolean {
-    return refreshInFlightAttachmentIds.size > 0 || pendingAttachments.value.some(a => a.kind === 'inline_pending' || a.kind === 'uploading')
+    return attachmentWorkBusy.value
   }
 
   async function prepareAttachmentsForSend(options: AttachmentPreparationOptions = {}): Promise<boolean> {
     const isCurrent = options.isCurrent ?? (() => true)
-    const staged = [...pendingAttachments.value].filter(stagedUploadNeedsRefresh)
+    const attachments = options.attachments ?? pendingAttachments.value
+    const staged = [...attachments].filter(stagedUploadNeedsRefresh)
     for (const attachment of staged) {
       if (!isCurrent()) return false
       if (refreshInFlightAttachmentIds.has(attachment.local_id)) return false
-      const idx = pendingAttachments.value.findIndex(a => a.local_id === attachment.local_id)
-      if (idx < 0 || pendingAttachments.value[idx].kind !== 'staged') continue
+      const idx = attachments.findIndex(a => a.local_id === attachment.local_id)
+      if (idx < 0 || attachments[idx].kind !== 'staged') continue
       if (!attachment.file) {
-        pendingAttachments.value[idx] = {
+        attachments[idx] = {
           kind: 'failed',
           local_id: attachment.local_id,
           name: attachment.name,
@@ -285,12 +305,13 @@ export function useChatAttachments() {
         return false
       }
       refreshInFlightAttachmentIds.add(attachment.local_id)
+      refreshInFlightAttachmentCount.value = refreshInFlightAttachmentIds.size
       try {
         const meta = await uploadAttachmentFile(attachment.file, attachment.mime)
         if (!isCurrent()) return false
-        const currentIdx = pendingAttachments.value.findIndex(a => a.local_id === attachment.local_id)
-        if (currentIdx < 0 || pendingAttachments.value[currentIdx].kind !== 'staged') continue
-        pendingAttachments.value[currentIdx] = {
+        const currentIdx = attachments.findIndex(a => a.local_id === attachment.local_id)
+        if (currentIdx < 0 || attachments[currentIdx].kind !== 'staged') continue
+        attachments[currentIdx] = {
           kind: 'staged',
           local_id: attachment.local_id,
           name: attachment.name,
@@ -304,11 +325,18 @@ export function useChatAttachments() {
       } catch (err: unknown) {
         if (!isCurrent()) return false
         const message = uploadFailureMessage(err)
-        markAttachmentFailed(attachment.local_id, attachment.file, attachment.mime, message)
+        markAttachmentFailed(
+          attachment.local_id,
+          attachment.file,
+          attachment.mime,
+          message,
+          attachments,
+        )
         pushToast(`${i18n.global.t('chat.toast.uploadFailed', { name: attachment.name })}: ${message}`, { tone: 'danger' })
         return false
       } finally {
         refreshInFlightAttachmentIds.delete(attachment.local_id)
+        refreshInFlightAttachmentCount.value = refreshInFlightAttachmentIds.size
       }
     }
     return true
@@ -342,6 +370,7 @@ export function useChatAttachments() {
 
   return {
     pendingAttachments,
+    attachmentWorkBusy,
     onFileInputChange,
     addAttachments,
     addAttachment,

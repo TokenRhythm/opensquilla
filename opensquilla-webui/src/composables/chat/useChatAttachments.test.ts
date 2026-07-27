@@ -338,6 +338,48 @@ describe('useChatAttachments', () => {
     ])
   })
 
+  it('refreshes a queued attachment collection without touching the composer', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        file_uuid: 'file-queued-fresh',
+        expires_at: Date.now() / 1000 + 600,
+        ttl_seconds: 600,
+      }),
+      text: async () => '',
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const attachments = useChatAttachments()
+    const composerAttachment: Attachment = {
+      kind: 'inline',
+      local_id: 1,
+      name: 'draft.txt',
+      mime: 'text/plain',
+      data: 'ZHJhZnQ=',
+    }
+    const queuedAttachments: Attachment[] = [{
+      kind: 'staged',
+      local_id: 2,
+      name: 'queued.pdf',
+      mime: 'application/pdf',
+      file_uuid: 'file-queued-expired',
+      expires_at: Date.now() / 1000 - 1,
+      file: stagedPdf('queued.pdf'),
+    }]
+    attachments.pendingAttachments.value = [composerAttachment]
+
+    const ready = await attachments.prepareAttachmentsForSend({
+      attachments: queuedAttachments,
+    })
+
+    expect(ready).toBe(true)
+    expect(attachments.pendingAttachments.value).toEqual([composerAttachment])
+    expect(queuedAttachments).toMatchObject([
+      { kind: 'staged', name: 'queued.pdf', file_uuid: 'file-queued-fresh' },
+    ])
+  })
+
   it('does not refresh staged uploads that are outside the expiration grace window', async () => {
     const fetchMock = vi.fn()
     vi.stubGlobal('fetch', fetchMock)

@@ -22,7 +22,9 @@ async function settle() {
 async function mountList(options: {
   isOwner: boolean
   artifact?: ArtifactPayload
+  preferWorkbench?: boolean
   onDownload?: (artifact: ArtifactPayload) => void
+  onOpen?: (artifact: ArtifactPayload) => void
 }) {
   const el = document.createElement('div')
   document.body.appendChild(el)
@@ -34,7 +36,9 @@ async function mountList(options: {
     artifacts: [options.artifact || htmlArtifact],
     sessionKey: 'agent:main:webchat:ok',
     authToken: 'secret',
+    preferWorkbench: options.preferWorkbench,
     onDownload: options.onDownload,
+    onOpen: options.onOpen,
   })
   app.use(pinia)
   app.use(i18n)
@@ -86,6 +90,64 @@ describe('ChatArtifactList native HTML open', () => {
 
     expect(onDownload).toHaveBeenCalledWith(htmlArtifact)
     expect(fetchImpl).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
+  it('routes previewable artifacts to the Workbench without fetching or opening a popup', async () => {
+    const fetchImpl = vi.fn()
+    vi.stubGlobal('fetch', fetchImpl)
+    const onOpen = vi.fn()
+    const { app, el } = await mountList({
+      isOwner: false,
+      preferWorkbench: true,
+      onOpen,
+    })
+
+    expect(el.textContent).toContain('Open')
+    el.querySelector<HTMLButtonElement>('.msg-artifact-body')?.click()
+    await nextTick()
+
+    expect(onOpen).toHaveBeenCalledWith(htmlArtifact)
+    expect(fetchImpl).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
+  it('keeps video in the transcript player even when Workbench routing is preferred', async () => {
+    const fetchImpl = vi.fn(async () => new Response('video', {
+      status: 200,
+      headers: { 'content-type': 'video/webm' },
+    }))
+    vi.stubGlobal('fetch', fetchImpl)
+    vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('probably')
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:inline-video')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+    const onOpen = vi.fn()
+    const videoArtifact: ArtifactPayload = {
+      id: 'art-video',
+      name: 'clip.webm',
+      mime: 'video/webm',
+      download_url: '/api/v1/artifacts/art-video',
+    }
+    const { app, el } = await mountList({
+      isOwner: false,
+      artifact: videoArtifact,
+      preferWorkbench: true,
+      onOpen,
+    })
+
+    expect(el.querySelectorAll('.msg-video-card')).toHaveLength(1)
+    expect(el.querySelectorAll('.msg-artifact-chip')).toHaveLength(0)
+    expect(fetchImpl).not.toHaveBeenCalled()
+
+    el.querySelector<HTMLButtonElement>('.msg-video-card__action')?.click()
+    await settle()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    await nextTick()
+
+    expect(fetchImpl).toHaveBeenCalledOnce()
+    expect(el.querySelector('.msg-video-card__player')).toBeTruthy()
+    expect(onOpen).not.toHaveBeenCalled()
     app.unmount()
   })
 })

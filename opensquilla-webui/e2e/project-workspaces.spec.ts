@@ -364,6 +364,10 @@ test.describe('Project workspaces', () => {
     const projectChip = page.locator('.chat-project-chip')
     await expect(projectChip).toContainText('/repos/demo')
     await expect(projectChip).toHaveAttribute('data-status', 'ready')
+    await expect.poll(
+      () => state.requestMethods.filter(method => method === 'sessions.messages.subscribe').length,
+    ).toBeGreaterThanOrEqual(3)
+    await expect(projectChip).toHaveAttribute('data-status', 'ready')
 
     await page.getByRole('textbox', { name: 'Message to send' }).fill('pwd')
     await page.getByRole('button', { name: 'Send' }).click()

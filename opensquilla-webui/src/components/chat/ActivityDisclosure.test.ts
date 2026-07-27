@@ -226,7 +226,7 @@ describe('ActivityDisclosure live header', () => {
     expect(elapsed?.getAttribute('aria-hidden')).toBe('true')
 
     const failureRule = cssRule('.assistant-activity__live-failure')
-    expect(failureRule).toContain('color: var(--danger);')
+    expect(failureRule).toContain('color: var(--warn);')
     expect(failureRule).toContain('flex: 0 0 auto;')
     expect(failureRule).toContain('font-size: 0.75rem;')
   })
@@ -349,6 +349,15 @@ describe('ActivityDisclosure expanded boundary', () => {
     )
     expect(separatorRule).toContain('height: 1px;')
     expect(separatorRule).toContain('background: var(--border);')
+  })
+})
+
+describe('ActivityDisclosure failure tone', () => {
+  it('reserves danger for terminal turn failure summaries', () => {
+    expect(cssRule('.assistant-activity__failure'))
+      .toContain('color: var(--text-muted);')
+    expect(cssRule('.assistant-activity--failed .assistant-activity__failure'))
+      .toContain('color: var(--danger);')
   })
 })
 

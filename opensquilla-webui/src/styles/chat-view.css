@@ -532,6 +532,11 @@
   flex-shrink: 0;
 }
 
+.chat-composer-dock > .chat-composer {
+  position: relative;
+  z-index: 2;
+}
+
 /* Slash menu */
 .chat-slash {
   position: absolute;

@@ -37,6 +37,8 @@ export interface ChatPendingItem {
   text: string
   attachments: Attachment[]
   intent: string | null
+  /** Delivery state for an explicit steer attempt that still owns this queue item. */
+  deliveryState?: 'steering' | 'retryable'
   /** Session that owned this item when it entered the in-memory queue. */
   ownerSessionKey?: string
   /** chat.send request whose canonical response may carry this item to a child. */

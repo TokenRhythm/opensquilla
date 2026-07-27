@@ -259,16 +259,23 @@ function clearSelection() {
   selectedKeys.value = new Set()
 }
 
+function exitSelectionMode() {
+  selectionMode.value = false
+  clearSelection()
+}
+
 function toggleSelectionMode() {
-  selectionMode.value = !selectionMode.value
-  if (!selectionMode.value) clearSelection()
+  if (selectionMode.value) {
+    exitSelectionMode()
+    return
+  }
+  selectionMode.value = true
 }
 
 useDocumentEvent('keydown', (event) => {
   if (event.key !== 'Escape' || !selectionMode.value) return
   event.preventDefault()
-  selectionMode.value = false
-  clearSelection()
+  exitSelectionMode()
 })
 
 async function requestBulkDelete() {
@@ -528,6 +535,16 @@ function onSelectRow(row: SidebarConversationItem) {
         @click="requestBulkDelete"
       >
         <Icon name="trash" :size="12" />
+      </button>
+      <button
+        v-if="selectionMode"
+        type="button"
+        class="sidebar-selection-done-btn"
+        :aria-label="t('shared.sidebar.exitSelectionMode')"
+        :title="t('shared.sidebar.exitSelectionMode')"
+        @click="exitSelectionMode"
+      >
+        {{ t('shared.sidebar.selectionDone') }}
       </button>
       <button
         v-if="totalRows > 0 && !selectionMode"

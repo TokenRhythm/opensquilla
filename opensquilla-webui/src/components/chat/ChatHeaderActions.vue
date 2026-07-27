@@ -167,6 +167,7 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import { useDialogLayer } from '@/composables/useDialogA11y'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import type { IconName } from '@/utils/icons'
 
@@ -204,6 +205,7 @@ const wideShareRef = ref<HTMLButtonElement | null>(null)
 const wideCopyRef = ref<HTMLButtonElement | null>(null)
 const layout = ref<Layout>('wide')
 const menuOpen = ref(false)
+useDialogLayer(computed(() => menuOpen.value))
 let resizeObserver: ResizeObserver | null = null
 
 const copyLabel = computed(() => props.copyState === 'ok' ? t('chat.copied') : t('chat.copySessionKey'))

@@ -298,6 +298,7 @@ jobs:
           node scripts/test-desktop-gateway-lifecycle.mjs
           node scripts/test-desktop-window-lifecycle.mjs
           node scripts/test-desktop-cleanup-contract.mjs
+          node scripts/test-native-workbench-surface.mjs
 
   ubuntu-quality:
     name: Lint, test, and build (ubuntu-latest, 3.12)
@@ -918,6 +919,7 @@ jobs:
             'desktop-cleanup-flow:scripts/test-desktop-cleanup-flow.mjs' \
             'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs' \
             'window-background-flow:scripts/test-desktop-window-background-flow.mjs' \
+            'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs' \
             'unsafe-legacy-recovery-no-write:scripts/test-unsafe-legacy-recovery-no-write.mjs'
           do
             name="${entry%%:*}"

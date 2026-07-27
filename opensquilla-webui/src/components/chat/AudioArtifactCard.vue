@@ -52,14 +52,12 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
+import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import { useInlineMediaArtifact } from '@/composables/chat/useInlineMediaArtifact'
 import type { ArtifactPayload } from '@/types/rpc'
-import { fetchArtifactBlob } from '@/utils/chat/artifactAccess'
 import { artifactFileSubtitle, artifactFileTitle } from '@/utils/chat/artifacts'
-
-type AudioState = 'idle' | 'loading' | 'ready' | 'error' | 'unsupported'
 
 const props = defineProps<{
   artifact: ArtifactPayload
@@ -72,100 +70,23 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
-const state = ref<AudioState>('idle')
-const objectUrl = ref('')
 const audioElement = ref<HTMLAudioElement | null>(null)
-let requestController: AbortController | null = null
-
-const identity = computed(() => [
-  props.artifact.id,
-  props.artifact.key,
-  props.artifact.download_url,
-  props.artifact.name,
-  props.artifact.mime,
-  props.artifact.size,
-].map(value => String(value || '')).join('\u0000'))
+const {
+  state,
+  objectUrl,
+  load: loadAudio,
+  markUnsupported,
+} = useInlineMediaArtifact({
+  artifact: () => props.artifact,
+  sessionKey: () => props.sessionKey,
+  authToken: () => props.authToken,
+  kind: 'audio',
+  element: audioElement,
+})
 const primaryActionText = computed(() =>
   state.value === 'error' ? t('chat.retry') : t('chat.playAudio'))
 const primaryActionLabel = computed(() =>
   `${primaryActionText.value} ${artifactFileTitle(props.artifact)}`)
-
-function revokeObjectUrl() {
-  const url = objectUrl.value
-  objectUrl.value = ''
-  if (!url) return
-  try { URL.revokeObjectURL(url) } catch {}
-}
-
-function reset() {
-  requestController?.abort()
-  requestController = null
-  try { audioElement.value?.pause() } catch {}
-  revokeObjectUrl()
-  state.value = 'idle'
-}
-
-function supportedByBrowser(blob: Blob): boolean {
-  const mime = String(blob.type || props.artifact.mime || '').split(';', 1)[0].trim().toLowerCase()
-  if (!mime.startsWith('audio/')) return true
-  try {
-    const probe = document.createElement('audio')
-    return typeof probe.canPlayType !== 'function' || probe.canPlayType(mime) !== ''
-  } catch {
-    return true
-  }
-}
-
-async function loadAudio() {
-  if (state.value === 'loading' || state.value === 'ready') return
-  requestController?.abort()
-  const controller = new AbortController()
-  requestController = controller
-  state.value = 'loading'
-  try {
-    const fetched = await fetchArtifactBlob(props.artifact, {
-      baseOrigin: window.location.origin,
-      sessionKey: props.sessionKey,
-      authToken: props.authToken,
-      signal: controller.signal,
-      requireSameOrigin: true,
-    })
-    if (controller.signal.aborted || requestController !== controller) return
-    requestController = null
-    if (!fetched.ok) {
-      state.value = 'error'
-      return
-    }
-    if (!supportedByBrowser(fetched.blob)) {
-      state.value = 'unsupported'
-      return
-    }
-    objectUrl.value = URL.createObjectURL(fetched.blob)
-    state.value = 'ready'
-    await nextTick()
-    const playback = audioElement.value?.play()
-    if (playback && typeof playback.catch === 'function') void playback.catch(() => undefined)
-  } catch (error) {
-    if (controller.signal.aborted || (
-      typeof DOMException !== 'undefined' && error instanceof DOMException && error.name === 'AbortError'
-    )) return
-    if (requestController === controller) requestController = null
-    state.value = 'error'
-  }
-}
-
-function markUnsupported() {
-  try { audioElement.value?.pause() } catch {}
-  revokeObjectUrl()
-  state.value = 'unsupported'
-}
-
-watch(
-  () => [identity.value, props.sessionKey || '', props.authToken || ''],
-  (_next, previous) => { if (previous) reset() },
-)
-
-onUnmounted(reset)
 </script>
 
 <style scoped>

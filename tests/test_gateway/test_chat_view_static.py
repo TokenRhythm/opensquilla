@@ -29,7 +29,7 @@ def test_chat_view_wires_middle_edit_branch_fork_id() -> None:
     assert "pendingForkBeforeMessageId," in view[actions_start:actions_end]
 
     send_start = view.index("const chatSend = useChatSend({")
-    send_end = view.index("})\nconst { onSend", send_start)
+    send_end = view.index("\n})", send_start)
     assert "pendingForkBeforeMessageId," in view[send_start:send_end]
 
     assert "watch(sessionKey, () => {\n  pendingForkBeforeMessageId.value = null" in view

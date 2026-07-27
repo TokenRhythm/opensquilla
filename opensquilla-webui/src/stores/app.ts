@@ -392,6 +392,9 @@ export const useAppStore = defineStore('app', () => {
     // window.OPENSQUILLA_FEATURES. The preflight + ribbon cards are always-on
     // (driven by stream events) regardless of this flag.
     metaRuns: true,
+    // Application-level artifact Workbench. Operators can temporarily disable
+    // it to retain the previous Drawer/lightbox flow for one release cycle.
+    artifactWorkbench: true,
     ...((window as FeatureWindow).OPENSQUILLA_FEATURES || {}),
   })
 

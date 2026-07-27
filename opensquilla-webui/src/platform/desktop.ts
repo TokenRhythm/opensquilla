@@ -6,6 +6,9 @@ import type {
   DesktopUpdateSource,
   DesktopUpdateState,
   DesktopUpdateStatus,
+  NativeWorkbenchApi,
+  NativeWorkbenchSurfaceEvent,
+  NativeWorkbenchSurfaceEventType,
   Platform,
 } from './types'
 
@@ -36,6 +39,62 @@ const UPDATE_ERROR_CODES = new Set<DesktopUpdateErrorCode>([
   'install_failed',
 ])
 const UPDATE_SOURCES = new Set<DesktopUpdateSource>(['oss', 'github'])
+const NATIVE_SURFACE_EVENT_TYPES = new Set<NativeWorkbenchSurfaceEventType>([
+  'loading',
+  'ready',
+  'missing-resource',
+  'error',
+  'crashed',
+  'escape',
+])
+
+function normalizeNativeSurfaceEvent(payload: unknown): NativeWorkbenchSurfaceEvent | null {
+  if (!payload || typeof payload !== 'object') return null
+  const raw = payload as Record<string, unknown>
+  if (
+    raw.version !== 1
+    || typeof raw.surfaceId !== 'string'
+    || !NATIVE_SURFACE_EVENT_TYPES.has(raw.type as NativeWorkbenchSurfaceEventType)
+  ) return null
+  const rawDetail = raw.detail && typeof raw.detail === 'object'
+    ? raw.detail as Record<string, unknown>
+    : null
+  const detail = rawDetail
+    ? {
+        ...(typeof rawDetail.message === 'string' ? { message: rawDetail.message } : {}),
+        ...(typeof rawDetail.path === 'string' ? { path: rawDetail.path } : {}),
+        ...(typeof rawDetail.reason === 'string' ? { reason: rawDetail.reason } : {}),
+      }
+    : undefined
+  return {
+    version: 1,
+    surfaceId: raw.surfaceId,
+    type: raw.type as NativeWorkbenchSurfaceEventType,
+    ...(detail ? { detail } : {}),
+  }
+}
+
+function desktopNativeWorkbenchApi(api: OpenSquillaDesktopApi): NativeWorkbenchApi | undefined {
+  if (
+    typeof api.createWorkbenchSurface !== 'function'
+    || typeof api.setWorkbenchSurfaceRect !== 'function'
+    || typeof api.activateWorkbenchSurface !== 'function'
+    || typeof api.destroyWorkbenchSurface !== 'function'
+    || typeof api.onWorkbenchSurfaceEvent !== 'function'
+  ) return undefined
+  return {
+    createSurface: payload => api.createWorkbenchSurface!(payload),
+    setSurfaceRect: payload => api.setWorkbenchSurfaceRect!(payload),
+    activateSurface: surfaceId => api.activateWorkbenchSurface!(surfaceId),
+    destroySurface: surfaceId => api.destroyWorkbenchSurface!(surfaceId),
+    onSurfaceEvent(callback) {
+      return api.onWorkbenchSurfaceEvent!((payload) => {
+        const event = normalizeNativeSurfaceEvent(payload)
+        if (event) callback(event)
+      })
+    },
+  }
+}
 
 function idleUpdateState(canNativeInstall: boolean, managed = canNativeInstall): DesktopUpdateState {
   return {
@@ -154,9 +213,14 @@ async function normalizeDesktopUpdatePayload(
 }
 
 export function createDesktopPlatform(): Platform {
+  const desktopApi = requireDesktopApi()
+  const nativeWorkbench = desktopNativeWorkbenchApi(desktopApi)
   return {
     id: 'desktop',
-    capabilities: desktopCapabilities,
+    capabilities: {
+      ...desktopCapabilities,
+      hasNativeWorkbenchSurfaces: nativeWorkbench !== undefined,
+    },
     getOsLocale: () => requireDesktopApi().getOsLocale(),
     async setNativeTheme(payload) {
       const api = requireDesktopApi()
@@ -215,6 +279,9 @@ export function createDesktopPlatform(): Platform {
         if (typeof api.chooseProjectDirectory !== 'function') return null
         return api.chooseProjectDirectory()
       },
+    },
+    workbench: {
+      ...(nativeWorkbench ? { native: nativeWorkbench } : {}),
     },
     updates: {
       async getState() {

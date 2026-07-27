@@ -119,6 +119,44 @@
     "delete": "删除",
     "dismiss": "忽略"
   },
+  "workbench": {
+    "title": "工作区",
+    "expand": "展开工作区",
+    "collapse": "收起工作区",
+    "close": "关闭工作区",
+    "closeItem": "关闭标签",
+    "refresh": "刷新",
+    "openExternal": "在外部打开",
+    "openItems": "已打开的工作区项目",
+    "resize": "调整工作区宽度",
+    "pixels": "像素",
+    "empty": "此项目没有可用的预览。",
+    "artifactPreview": {
+      "refresh": "刷新预览",
+      "openExternal": "在外部打开",
+      "missingResources": "此 HTML 引用了未随产物发布的本地资源，预览可能不完整。",
+      "missingShort": "缺少本地资源",
+      "suspended": "预览已暂停",
+      "nativePreview": "原生 HTML 预览",
+      "allowRemoteResources": "允许加载在线图片、样式和媒体",
+      "blockRemoteResources": "禁止加载在线图片、样式和媒体",
+      "remoteResourcesConfirmTitle": "加载在线资源？",
+      "remoteResourcesConfirmBody": "此 HTML 可以连接外部网站以加载图片、样式、字体或媒体。对方网站将获知你的 IP 地址，也可能收到产物编码在 URL 中的信息。远程脚本和数据请求仍会被拦截。",
+      "remoteResourcesConfirmAction": "仅本次允许",
+      "offline": "当前似乎处于离线状态",
+      "offlineDetail": "恢复连接后重试预览，或下载文件。",
+      "crashed": "预览已停止",
+      "crashedDetail": "重新加载隔离预览后即可继续。",
+      "tooLarge": "无法预览",
+      "tooLargeDetail": "文件过大，无法在应用内安全预览。请改为下载。",
+      "unsupported": "无法预览",
+      "unsupportedDetail": "应用内预览暂不支持这种文件类型。",
+      "integrityError": "产物完整性校验失败",
+      "integrityErrorDetail": "已保存的产物已损坏或与记录的校验值不一致，请重新发布或下载核查。",
+      "invalidContent": "下载的内容与产物类型不一致。",
+      "failedDetail": "请重试预览，或下载文件。"
+    }
+  },
   "nav": {
     "chat": "任务",
     "chat-new": "新建任务",
@@ -1478,40 +1516,40 @@
     }
   },
   "sessions": {
-    "title": "会话",
+    "title": "任务",
     "subtitle": "开始一项任务、解除运行阻塞，或继续之前的工作。",
     "refresh": "刷新",
     "refreshing": "正在刷新…",
-    "loading": "正在加载会话…",
+    "loading": "正在加载任务…",
     "unknownAgent": "未知智能体",
     "deletedAgent": "已删除的智能体 · {id}",
     "msgCount": "{count} 条消息",
     "error": {
-      "load": "无法加载会话。"
+      "load": "无法加载任务。"
     },
     "empty": {
-      "title": "暂无会话。",
-      "body": "在上方开始你的第一个任务——智能体接手工作后会话会显示在这里。"
+      "title": "暂无任务",
+      "body": "在上方开始第一项任务，智能体接手后会显示在这里。"
     },
     "noMatches": {
       "title": "无匹配结果",
-      "body": "没有会话符合当前筛选条件。",
+      "body": "没有任务符合当前筛选条件。",
       "clear": "清除筛选"
     },
     "filter": {
-      "ariaLabel": "筛选会话",
+      "ariaLabel": "筛选任务",
       "all": "全部",
       "chats": "任务",
       "automations": "自动化",
       "channels": "渠道"
     },
     "search": {
-      "placeholder": "搜索会话…",
-      "ariaLabel": "搜索会话"
+      "placeholder": "搜索任务…",
+      "ariaLabel": "搜索任务"
     },
     "delete": {
-      "title": "删除会话",
-      "body": "删除会话“{title}”？此操作无法撤销。\n\n记录不会写入磁盘；如需备份请先使用 /reset。",
+      "title": "删除任务",
+      "body": "删除任务“{title}”？此操作无法撤销。\n\n记录不会写入磁盘；如需备份请先使用 /reset。",
       "confirm": "删除"
     },
     "status": {
@@ -1542,10 +1580,10 @@
       "cron": "自动化运行",
       "channel": "渠道对话",
       "task": "子智能体任务",
-      "untitled": "未命名会话"
+      "untitled": "未命名任务"
     },
     "group": {
-      "operational": "运维会话",
+      "operational": "运维任务",
       "contractGaps": "后端契约缺失"
     },
     "taskInput": {
@@ -1561,7 +1599,7 @@
       "costTodayLabel": "今日成本",
       "costTotal": "累计 {amount}",
       "needsApproval": "需要审批",
-      "openBlocked": "打开被阻塞的会话 →",
+      "openBlocked": "打开被阻塞的任务 →",
       "nothingWaiting": "没有需要你处理的事项",
       "active": "活跃",
       "runningQueued": "{running} 个运行中 · {queued} 个排队中",
@@ -2831,6 +2869,9 @@
     "playAudio": "播放音频",
     "audioLoadFailed": "无法加载音频。",
     "audioUnsupported": "此浏览器无法播放这种音频格式，请改为下载文件。",
+    "playVideo": "播放视频",
+    "videoLoadFailed": "无法加载视频。",
+    "videoUnsupported": "此浏览器无法播放这种视频格式，请改为下载文件。",
     "previewOf": "预览：{title}",
     "closePreview": "关闭预览",
     "previousImage": "上一张图片",
@@ -2901,9 +2942,9 @@
       "ensembleRunning": "AI 模型聚合路由 · {count} 个候选正在合成",
       "ensembleDone": "{count} 个候选已合成",
       "ensembleMode": "聚合",
-      "ensembleViewTrace": "查看 trace",
-      "ensembleToggleTrace": "查看聚合路由 trace",
-      "ensembleTraceTitle": "候选 trace",
+      "ensembleViewTrace": "查看",
+      "ensembleToggleTrace": "查看聚合路由详情",
+      "ensembleTraceTitle": "候选详情",
       "ensemblePlanMeta": "聚合档案 · 候选池 {count}",
       "ensembleTelemetryPendingMeta": "聚合档案 · telemetry 待更新",
       "ensembleFallbackNone": "未使用降级",
@@ -2915,8 +2956,8 @@
       "ensembleFailed": "失败",
       "ensembleQuorumSkipped": "阈值已满足 · 已跳过",
       "ensembleQuorumSkippedDetail": "候选阈值已满足，因此取消等待该候选。",
-      "ensembleTracePending": "trace 待更新",
-      "ensembleTraceUnavailable": "运行完成后可查看 trace",
+      "ensembleTracePending": "详情待更新",
+      "ensembleTraceUnavailable": "运行完成后可查看详情",
       "ensembleDetailUnavailable": "{count} 个候选 · 明细不可用"
     },
     "sources": "来源",
@@ -3070,6 +3111,10 @@
       "steerHint": "引导模式：新发送会立即打断回复；这些排队消息仍会在本轮结束后自动发送",
       "queueHint": "排队模式：这些消息会在当前回复结束后按顺序自动发送",
       "clearAll": "全部清除",
+      "editMessage": "编辑消息",
+      "attachmentNeedsAttention": "附件需处理",
+      "fixAttachmentBeforeSteer": "请先编辑这条消息，重试或移除失败的附件，再执行插队",
+      "clearQueue": "清空队列",
       "removeMessage": "移除待发送消息 {index}"
     },
     "metaRuns": {
@@ -3283,6 +3328,7 @@
       "selectedCountLabel": "已选择 {count} 个",
       "enterSelectionMode": "批量管理任务",
       "exitSelectionMode": "退出选择",
+      "selectionDone": "完成",
       "selectSession": "选择任务 {title}",
       "deleteSelectedAria": "删除已选 {count} 个任务",
       "bulkDeleteTitle": "删除已选任务",
@@ -3340,6 +3386,8 @@
       "activityDetailsTitle": "详情",
       "activityBytesWritten": "已写入 {size}",
       "activityContentSize": "{lines} 行 · {characters} 个字符",
+      "activityExitCode": "退出码 {code}",
+      "activityNotCompleted": "未通过",
       "activityPublished": "已发布"
     }
   },

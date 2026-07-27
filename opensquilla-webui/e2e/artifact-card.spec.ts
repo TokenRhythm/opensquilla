@@ -9,6 +9,12 @@ const PNG_1x1 = Buffer.from(
   'base64',
 )
 
+// Synthetic 16x16 VP9 WebM with a 0.2-second black frame.
+const WEBM_TINY = Buffer.from(
+  'GkXfo59ChoEBQveBAULygQRC84EIQoKEd2VibUKHgQJChYECGFOAZwEAAAAAAAJeEU2bdLpNu4tTq4QVSalmU6yBoU27i1OrhBZUrmtTrIHYTbuMU6uEElTDZ1OsggElTbuMU6uEHFO7a1OsggJI7AEAAAAAAABZAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVSalmsirXsYMPQkBNgI1MYXZmNjIuMTIuMTAyV0GNTGF2ZjYyLjEyLjEwMkSJiEBpAAAAAAAAFlSua8iuAQAAAAAAAD/XgQFzxYg+1LSSKAxeUpyBACK1nIN1bmSIgQCGhVZfVlA5g4EBI+ODhAJiWgDgkLCBELqBEJqBAlW5gQESVMNnQIBzc6BjwIBnyJpFo4dFTkNPREVSRIeNTGF2ZjYyLjEyLjEwMnNz2mPAi2PFiD7UtJIoDF5SZ8ilRaOHRU5DT0RFUkSHmExhdmM2Mi4yOC4xMDIgbGlidnB4LXZwOWfIoUWjiERVUkFUSU9ORIeTMDA6MDA6MDAuMjAwMDAwMDAwAB9DtnVAl+eBAKO+gQAAgIJJg0IAAPAA9gY4JBwYQgAAIEAAIpv//6UT+4KU3o8VSrdtJ/1U/RntlFLTcdJsyP6m92VMvCYMgACjk4EAKACGAECSnChJQAADcAAAQkCjk4EAUACGAECSnCxKwAADcAAAQkCjk4EAeACGAECSnCxJwAADcAAAQkCjk4EAoACGAECSnChIoAADcAAAQkAcU7trkbuPs4EAt4r3gQHxggGr8IED',
+  'base64',
+)
+
 // Seed a finished assistant turn carrying one image, one previewable document,
 // and one download-only data file, rewriting chat.history in flight.
 async function seedHistory(
@@ -111,8 +117,17 @@ async function seedHistory(
 }
 
 async function openSeeded(page: Page) {
-  await page.route('**/api/v1/artifacts/**', route =>
-    route.fulfill({ status: 200, contentType: 'image/png', body: PNG_1x1 }))
+  await page.route('**/api/v1/artifacts/**', route => {
+    const pathname = new URL(route.request().url()).pathname
+    if (pathname.endsWith('/art-card-pdf')) {
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/pdf',
+        body: '%PDF-1.4\n%%EOF',
+      })
+    }
+    return route.fulfill({ status: 200, contentType: 'image/png', body: PNG_1x1 })
+  })
   await seedHistory(page)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
   await page.waitForSelector('.conn-pill', { timeout: 10000 })
@@ -155,6 +170,21 @@ async function openAudioSeeded(page: Page) {
   await expect(page.locator('.msg-audio-card')).toBeVisible({ timeout: 10000 })
 }
 
+async function openVideoSeeded(page: Page) {
+  await seedHistory(page, {
+    artifacts: [{
+      id: 'art-card-video',
+      name: 'sample.webm',
+      mime: 'video/webm',
+      size: WEBM_TINY.byteLength,
+      download_url: '/api/v1/artifacts/art-card-video',
+    }],
+  })
+  await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
+  await page.waitForSelector('.chat-header', { timeout: 10000 })
+  await expect(page.locator('.msg-video-card')).toBeVisible({ timeout: 10000 })
+}
+
 test.describe('Artifact deliverable cards', () => {
   test('image renders one media card and no duplicate file chip', async ({ page }) => {
     await openSeeded(page)
@@ -186,7 +216,7 @@ test.describe('Artifact deliverable cards', () => {
     expect(requested.some(url => url.includes('art-card-img') && url.includes('variant=thumb'))).toBe(true)
   })
 
-  test('previewable file card splits Open from Download', async ({ page }) => {
+  test('previewable file card opens the Workbench without downloading', async ({ page }) => {
     await openSeeded(page)
 
     const pdfCard = page.locator('.msg-artifact-chip', { hasText: 'report-q2.pdf' })
@@ -201,12 +231,16 @@ test.describe('Artifact deliverable cards', () => {
     await expect(openBtn).toBeVisible()
     await expect(downloadBtn).toBeVisible()
 
-    // Open opens a new tab; it never downloads.
-    const popupPromise = page.waitForEvent('popup')
+    let popupCount = 0
+    page.on('popup', () => { popupCount += 1 })
     await openBtn.click()
-    const popup = await popupPromise
-    expect(popup).toBeTruthy()
-    await popup.close()
+    const workbench = page.getByTestId('workbench-host')
+    await expect(workbench).toBeVisible()
+    await expect(workbench).toHaveAttribute('role', 'complementary')
+    await expect(workbench.locator('.workbench-host__single-title')).toContainText('report-q2.pdf')
+    await expect(workbench.locator('.workbench-host__single-title')).toContainText('PDF')
+    await expect(workbench.locator('.artifact-preview__frame--pdf')).toBeVisible()
+    expect(popupCount).toBe(0)
   })
 
   test('download-only file card has a Download control and no Open', async ({ page }) => {
@@ -221,7 +255,7 @@ test.describe('Artifact deliverable cards', () => {
     await expect(csvCard.getByRole('button', { name: 'Download pricing.csv' })).toBeVisible()
   })
 
-  test('html file card is download-only and never invokes the native-open endpoint', async ({ page }) => {
+  test('html file card opens the offline Workbench preview and downloads separately', async ({ page }) => {
     let nativeOpenCount = 0
     let htmlDownloadCount = 0
     await page.route('**/api/v1/artifacts/**', async route => {
@@ -255,14 +289,22 @@ test.describe('Artifact deliverable cards', () => {
 
     const htmlCard = page.locator('.msg-artifact-chip', { hasText: 'interactive.html' })
     await expect(htmlCard).toBeVisible()
-    await expect(htmlCard.getByRole('button', { name: 'Open interactive.html' })).toHaveCount(0)
+    await htmlCard.getByRole('button', { name: 'Open interactive.html' }).click()
+    const workbench = page.getByTestId('workbench-host')
+    await expect(workbench).toBeVisible()
+    await expect(workbench.locator('.workbench-host__single-title')).toContainText('interactive.html')
+    await expect(workbench.locator('.workbench-host__single-title')).toContainText('HTML')
+    const preview = workbench.locator('.artifact-preview__frame--html')
+    await expect(preview).toBeVisible()
+    await expect(preview).toHaveAttribute('sandbox', 'allow-scripts')
+
     const downloadPromise = page.waitForEvent('download')
     await htmlCard.getByRole('button', { name: 'Download interactive.html' }).click()
     const download = await downloadPromise
 
     expect(download.suggestedFilename()).toBe('interactive.html')
     expect(nativeOpenCount).toBe(0)
-    expect(htmlDownloadCount).toBe(1)
+    expect(htmlDownloadCount).toBe(2)
   })
 
   test('audio performs zero initial requests and fetches authenticated bytes only after Play', async ({ page }) => {
@@ -325,5 +367,43 @@ test.describe('Artifact deliverable cards', () => {
     await card.getByRole('button', { name: 'Retry sample.wav' }).click()
     await expect(card.locator('.msg-audio-card__player')).toBeVisible({ timeout: 10000 })
     expect(requests).toBe(2)
+  })
+
+  test('video stays in the message, performs zero initial requests, and loads authenticated controls', async ({ page }) => {
+    const requests: Array<{
+      authorization?: string
+      sessionKey?: string
+    }> = []
+    await page.addInitScript(() => {
+      sessionStorage.setItem('opensquilla.wsToken', 'video-token-e2e')
+    })
+    await page.route('**/api/v1/artifacts/art-card-video*', route => {
+      const request = route.request()
+      requests.push({
+        authorization: request.headers().authorization,
+        sessionKey: request.headers()['x-opensquilla-session-key'],
+      })
+      return route.fulfill({
+        status: 200,
+        contentType: 'video/webm',
+        body: WEBM_TINY,
+      })
+    })
+    await openVideoSeeded(page)
+
+    await expect(page.locator('.msg-artifact-chip')).toHaveCount(0)
+    await page.waitForTimeout(200)
+    expect(requests).toHaveLength(0)
+
+    await page.getByRole('button', { name: 'Play video sample.webm' }).click()
+    const player = page.locator('.msg-video-card__player')
+    await expect(player).toBeVisible({ timeout: 10000 })
+    await expect(player).toHaveAttribute('controls', '')
+    await expect(player).toHaveAttribute('playsinline', '')
+    await expect(player).toHaveAttribute('preload', 'metadata')
+    expect(requests).toEqual([{
+      authorization: 'Bearer video-token-e2e',
+      sessionKey: SESSION_KEY,
+    }])
   })
 })

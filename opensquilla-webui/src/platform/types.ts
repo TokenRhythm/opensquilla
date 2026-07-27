@@ -122,6 +122,8 @@ export interface PlatformCapabilities {
    * in-browser blob-popup path can never succeed.
    */
   canOpenArtifactsNatively: boolean
+  /** The shell can host isolated native Workbench WebContents surfaces. */
+  hasNativeWorkbenchSurfaces: boolean
 }
 
 export interface ArtifactOpenRequest {
@@ -143,6 +145,74 @@ export interface PlatformFilesApi {
   openArtifact?: (payload: ArtifactOpenRequest) => Promise<ArtifactNativeOpenResult>
   /** Open the trusted host's native folder picker. Undefined on the web. */
   chooseProjectDirectory?: () => Promise<{ path: string } | null>
+}
+
+export interface NativeWorkbenchCreateSurfaceRequest {
+  version: 1
+  surfaceId: string
+  kind: 'artifact-html'
+  payload: {
+    /** HTML bytes fetched through the renderer's authenticated Artifact client. */
+    data: ArrayBuffer
+    name: string
+    mime: string
+    scopeId: string
+    /** Explicit, per-surface user choice. Defaults to false in the UI. */
+    allowRemoteResources: boolean
+  }
+}
+
+export interface NativeWorkbenchSurfaceRectRequest {
+  surfaceId: string
+  x: number
+  y: number
+  width: number
+  height: number
+  visible: boolean
+}
+
+export interface NativeWorkbenchSurfaceResult {
+  ok: boolean
+  message?: string
+}
+
+export type NativeWorkbenchSurfaceEventType =
+  | 'loading'
+  | 'ready'
+  | 'missing-resource'
+  | 'error'
+  | 'crashed'
+  | 'escape'
+
+export interface NativeWorkbenchSurfaceEvent {
+  version: 1
+  surfaceId: string
+  type: NativeWorkbenchSurfaceEventType
+  detail?: {
+    message?: string
+    path?: string
+    reason?: string
+  }
+}
+
+export interface NativeWorkbenchApi {
+  createSurface(
+    request: NativeWorkbenchCreateSurfaceRequest,
+  ): Promise<NativeWorkbenchSurfaceResult>
+  setSurfaceRect(
+    request: NativeWorkbenchSurfaceRectRequest,
+  ): Promise<NativeWorkbenchSurfaceResult>
+  activateSurface(surfaceId: string): Promise<NativeWorkbenchSurfaceResult>
+  destroySurface(surfaceId: string): Promise<NativeWorkbenchSurfaceResult>
+  onSurfaceEvent(callback: (event: NativeWorkbenchSurfaceEvent) => void): () => void
+}
+
+export interface PlatformWorkbenchApi {
+  /**
+   * Undefined on web and on older desktop shells. Callers must keep a DOM
+   * sandbox fallback for HTML Artifact preview.
+   */
+  native?: NativeWorkbenchApi
 }
 
 export interface CliInvocation {
@@ -192,6 +262,7 @@ export interface Platform {
   settings: PlatformSettingsApi
   onboarding: PlatformOnboardingApi
   files: PlatformFilesApi
+  workbench: PlatformWorkbenchApi
   updates: PlatformUpdatesApi
   /**
    * The host OS locale (BCP-47), used only to seed the initial UI language on

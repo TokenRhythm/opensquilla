@@ -10,6 +10,7 @@ export const webCapabilities: PlatformCapabilities = {
   hasWebConfig: true,
   hasTerminalWorkflow: true,
   canOpenArtifactsNatively: false,
+  hasNativeWorkbenchSurfaces: false,
 }
 
 export const desktopCapabilities: PlatformCapabilities = {
@@ -27,6 +28,7 @@ export const desktopCapabilities: PlatformCapabilities = {
   // app bundle, off PATH. Command blocks fold away and rewrite instead.
   hasTerminalWorkflow: false,
   canOpenArtifactsNatively: true,
+  hasNativeWorkbenchSurfaces: true,
 }
 
 export function detectPlatformId(): PlatformId {

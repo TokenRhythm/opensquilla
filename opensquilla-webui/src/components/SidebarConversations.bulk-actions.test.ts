@@ -76,12 +76,34 @@ describe('SidebarConversations bulk actions', () => {
     const emptyDelete = root.querySelector<HTMLButtonElement>('[aria-label="Delete 0 selected"]')
     expect(emptyDelete?.disabled).toBe(true)
     expect(emptyDelete?.innerHTML).toContain('M19 6v14')
-    expect(root.querySelector('[aria-label="Exit selection"]')).toBeNull()
+    expect(root.querySelector('[aria-label="Exit selection"]')).not.toBeNull()
 
     root.querySelector<HTMLButtonElement>('.sidebar-history-item')?.click()
     await nextTick()
 
     const selectedDelete = root.querySelector<HTMLButtonElement>('[aria-label="Delete 1 selected"]')
     expect(selectedDelete?.disabled).toBe(false)
+  })
+
+  it('exits selection mode and clears the current selection', async () => {
+    const root = await mountSidebar()
+    root.querySelector<HTMLButtonElement>('[aria-label="Manage tasks"]')?.click()
+    await nextTick()
+
+    root.querySelector<HTMLButtonElement>('.sidebar-history-item')?.click()
+    await nextTick()
+    expect(root.querySelector('[aria-label="Delete 1 selected"]')).not.toBeNull()
+
+    const exit = root.querySelector<HTMLButtonElement>('[aria-label="Exit selection"]')
+    expect(exit?.textContent?.trim()).toBe('Done')
+    exit?.click()
+    await nextTick()
+
+    expect(root.querySelector('[aria-label="Exit selection"]')).toBeNull()
+    expect(root.querySelector('[aria-label="Manage tasks"]')).not.toBeNull()
+
+    root.querySelector<HTMLButtonElement>('[aria-label="Manage tasks"]')?.click()
+    await nextTick()
+    expect(root.querySelector('[aria-label="Delete 0 selected"]')).not.toBeNull()
   })
 })

@@ -31,7 +31,7 @@
         :copy-state="sessionCopyState"
         :copy-icon="sessionCopyIcon"
         :copy-live-text="sessionCopyLiveText"
-        :deliverable-count="sessionArtifacts.length"
+        :deliverable-count="headerDeliverableCount"
         :run-history-visible="appStore.features.metaRuns"
         :share-mode="shareMode"
         :shareable-message-count="shareableMessageCount"
@@ -86,7 +86,7 @@
               :key="landingAgentId"
               :agent-id="landingAgentId"
               :meta-skills="metaSkillChoices"
-              :suppressed="landingPrefilled"
+              :suppressed="landingSuggestionsSuppressed"
               @pick="applyLandingSuggestion"
             />
           </div>
@@ -123,6 +123,7 @@
           :session-key="sessionKey"
           :auth-token="readAuthToken()"
           :artifact-navigation-items="sessionArtifacts"
+          :workbench-enabled="workbenchEnabled"
           :share-mode="shareMode"
           :selected-message-ids="selectedShareMessageIds"
           :strip-time-prefix="stripTimePrefix"
@@ -144,6 +145,7 @@
           @regenerate-message="regenerateMessage"
           @toggle-share-message="toggleShareMessage"
           @download-artifact="downloadArtifact"
+          @open-artifact="openArtifact"
           @toggle-tool-group="toggleToolGroup"
           @toggle-tool-item="toggleToolItem"
           @show-tool-result="showToolResultModal"
@@ -266,7 +268,9 @@
               :navigation-artifacts="sessionArtifacts"
               :session-key="sessionKey"
               :auth-token="readAuthToken()"
+              :prefer-workbench="workbenchEnabled"
               @download="downloadArtifact"
+              @open="openArtifact"
             />
 
           </div>
@@ -361,14 +365,6 @@
       </div>
     </div>
 
-    <PendingQueue
-      :items="pendingQueue"
-      :max-pending="maxPending"
-      :mode="isStreaming ? busySendMode : null"
-      @clear="clearPendingQueue"
-      @remove="removePendingChip"
-    />
-
     <!-- Compaction maintenance card -->
     <div v-if="compactStatus.visible" class="chat-compact-status" :class="`chat-compact-status--${compactStatus.tone}`" role="status" aria-live="polite">
       <div class="chat-compact-status__head">
@@ -436,6 +432,16 @@
         <span class="chat-slash-desc" :title="cmd.desc">{{ cmd.desc }}</span>
       </div>
     </div>
+
+    <PendingQueue
+      :items="pendingQueue"
+      :max-pending="maxPending"
+      :image-blocked-message="queuedImageSendBlockedMessage"
+      @clear="clearPendingQueue"
+      @edit="editPendingMessage"
+      @remove="removePendingChip"
+      @steer="steerPendingMessage"
+    />
 
     <ChatComposer
       ref="composerRef"
@@ -551,6 +557,8 @@ import { useRouter } from 'vue-router'
 import { useRpcStore } from '@/stores/rpc'
 import { useRpcCall } from '@/composables/useRpc'
 import { useAppStore } from '@/stores/app'
+import { useWorkbenchStore } from '@/workbench/store'
+import { usePlatform } from '@/platform'
 import ApprovalCard from '@/components/chat/ApprovalCard.vue'
 import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
 import AssistantActivityTimeline from '@/components/chat/AssistantActivityTimeline.vue'
@@ -605,9 +613,10 @@ import { useChatRouterDecisionRuntime } from '@/composables/chat/useChatRouterDe
 import { useChatAnswerReveal } from '@/composables/chat/useChatAnswerReveal'
 import { useChatRpcEventHandlers } from '@/composables/chat/useChatRpcEventHandlers'
 import { useChatRpcSubscriptions } from '@/composables/chat/useChatRpcSubscriptions'
-import { useChatSend } from '@/composables/chat/useChatSend'
+import { useChatSend, type ChatSendOutcome } from '@/composables/chat/useChatSend'
 import { useSandboxSetupRecovery } from '@/composables/chat/useSandboxSetupRecovery'
 import { useChatStallWatchdog } from '@/composables/chat/useChatStallWatchdog'
+import { useArtifactImageLightbox } from '@/composables/chat/useArtifactImageLightbox'
 import { useMetaRuns } from '@/composables/chat/useMetaRuns'
 import { runStatusLabelText as sessionRunStatusLabelText } from '@/composables/useSessions'
 import { useChatSessionRoute } from '@/composables/chat/useChatSessionRoute'
@@ -638,6 +647,7 @@ import {
 import { useFreshTaskDraft } from '@/composables/useFreshTaskDraft'
 import type {
   ChatMessage,
+  ChatPendingItem,
   ChatRenderedMessage,
   ChatRunStatus,
   ChatRunStatusSource,
@@ -655,7 +665,20 @@ import type {
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import { isSandboxRunMode, type SandboxRunMode } from '@/types/sandbox'
 import type { ChatPart, InterruptViewState } from '@/types/parts'
-import { artifactDownloadUrl } from '@/utils/chat/artifacts'
+import {
+  artifactCategory,
+  artifactDownloadUrl,
+  isInlineMediaArtifact,
+} from '@/utils/chat/artifacts'
+import {
+  artifactFromWorkbenchItem,
+  createArtifactPreviewWorkbenchItem,
+} from '@/workbench/artifactItems'
+import {
+  artifactUsesWorkbenchPreview,
+  artifactWorkbenchPreviewKind,
+} from '@/utils/workbench/artifactPreview'
+import { focusArtifactInTranscript } from '@/utils/chat/artifactFocus'
 import { fetchDisplayAttachmentBlob } from '@/utils/chat/attachmentAccess'
 import { createHistoryNavigationScrollLock } from '@/utils/chat/historyNavigationScrollLock'
 import {
@@ -680,6 +703,7 @@ import {
 } from '@/utils/chat/attachments'
 import { isShareableChatMessage } from '@/utils/chat/messageIdentity'
 import { agentIdFromSessionKey } from '@/utils/chat/sessionKeys'
+import { shouldSuppressLandingSuggestions } from '@/utils/chat/landingSuggestions'
 import { clearAssistantActivityExpansionState } from '@/utils/chat/activityDisclosureState'
 import {
   resolveChatSessionLoadState,
@@ -730,6 +754,9 @@ const toolResultModal = ref<{
 
 const rpc = useRpcStore()
 const appStore = useAppStore()
+const workbenchStore = useWorkbenchStore()
+const artifactImageLightbox = useArtifactImageLightbox()
+const platform = usePlatform()
 const router = useRouter()
 const { t, locale } = useI18n()
 const { pushToast } = useToasts()
@@ -768,6 +795,7 @@ const chatHeaderActionsRef = ref<ChatHeaderActionsHandle | null>(null)
 /* ── State ─────────────────────────────────────────────────────────── */
 
 const sessionKey = ref('')
+const workbenchEnabled = computed(() => appStore.features.artifactWorkbench === true)
 const inputText = ref('')
 const aborted = ref(false)
 const autoScroll = ref(true)
@@ -932,6 +960,7 @@ const {
 const chatAttachments = useChatAttachments()
 const {
   pendingAttachments,
+  attachmentWorkBusy,
   onFileInputChange,
   addAttachments,
   removeAttachment,
@@ -945,7 +974,9 @@ let sendCurrentInput: () => void = () => {}
 // slash handler (useChatSlashCommands, created earlier) needs it at call time.
 let dispatchHiddenForMeta: (providerText: string, displayText: string) => void = () => {}
 let isCompactInFlightForCurrentSession: () => boolean = () => false
+let isQueuedDeliveryBlocked: () => boolean = () => false
 let dispatchHiddenControl: (providerText: string, displayText: string) => void = () => {}
+let dispatchQueuedItem: (item: ChatPendingItem) => Promise<ChatSendOutcome> = async () => 'not_sent'
 const pendingQueueOwnerContext = ref<PendingQueueOwnerContext | null>(null)
 const chatPendingQueue = useChatPendingQueue({
   sessionKey,
@@ -956,6 +987,8 @@ const chatPendingQueue = useChatPendingQueue({
   isStreaming,
   isBlocked: () => (
     isCompactInFlightForCurrentSession()
+    || isQueuedDeliveryBlocked()
+    || hasPendingAttachmentWork()
     || pendingQueueOwnerContext.value?.sessionKey === sessionKey.value
   ),
   autoResizeTextarea,
@@ -963,6 +996,7 @@ const chatPendingQueue = useChatPendingQueue({
   resetInputHistory: () => resetComposerInputHistory(),
   hasComposer: () => Boolean(composerRef.value),
   dispatchHiddenControl: (providerText, displayText) => dispatchHiddenControl(providerText, displayText),
+  dispatchPendingItem: item => dispatchQueuedItem(item),
 })
 const {
   pendingQueue,
@@ -972,6 +1006,8 @@ const {
   enqueuePendingInput,
   enqueueHiddenControl,
   removePendingChip,
+  beginPendingDelivery,
+  settlePendingDelivery,
   clearPendingQueue,
   switchPendingQueue,
   adoptPendingQueue,
@@ -981,6 +1017,9 @@ const {
   flushDeferredPendingDrain,
   cleanup: cleanupPendingQueue,
 } = chatPendingQueue
+watch(attachmentWorkBusy, (busy) => {
+  if (!busy) flushDeferredPendingDrain()
+})
 
 const chatCompaction = useChatCompaction({
   sessionKey,
@@ -1039,6 +1078,22 @@ const {
   setRouterVisualEffectsEnabled,
   bindFeatureRefresh,
 } = chatFeatureToggles
+isQueuedDeliveryBlocked = () => (
+  modelRoutingSettingsBusy.value
+  && hasSendableModelInputImageAttachment(pendingQueue.value[0]?.attachments || [])
+)
+watch(
+  [modelRoutingMode, modelRoutingSettingsBusy],
+  ([mode, busy], [previousMode, wasBusy]) => {
+    const routingUnblocked = (
+      (previousMode === 'llm_ensemble' && mode !== 'llm_ensemble')
+      || (wasBusy && !busy)
+    )
+    if (!routingUnblocked || pendingQueue.value.length === 0) return
+    schedulePendingDrainAfterTerminal()
+    flushDeferredPendingDrain()
+  },
+)
 
 const chatRouterDecisionRuntime = useChatRouterDecisionRuntime({
   messages,
@@ -1467,10 +1522,47 @@ const chatSend = useChatSend({
   autoResizeTextarea,
   scrollToBottom,
 })
-const { onSend, onStop, dispatchHiddenSend, sendHiddenMetaPreflightConfirmation } = chatSend
+const {
+  onSend,
+  onStop,
+  sendQueuedSteer,
+  sendQueuedFollowup,
+  dispatchHiddenSend,
+  sendHiddenMetaPreflightConfirmation,
+} = chatSend
 sendCurrentInput = onSend
 dispatchHiddenForMeta = dispatchHiddenSend
 dispatchHiddenControl = dispatchHiddenSend
+dispatchQueuedItem = sendQueuedFollowup
+
+function takeVisiblePendingItem(index: number) {
+  const item = pendingQueue.value[index]
+  if (!item || item.hiddenControl || item.deliveryState) return null
+  pendingQueue.value.splice(index, 1)
+  return item
+}
+
+function editPendingMessage(index: number) {
+  const item = takeVisiblePendingItem(index)
+  if (!item) return
+  inputText.value = [item.text, inputText.value].filter(text => text.trim()).join('\n')
+  pendingAttachments.value = [...(item.attachments || []), ...pendingAttachments.value]
+  pendingSessionIntent.value = item.intent || pendingSessionIntent.value
+  autoResizeTextarea()
+  nextTick(() => composerRef.value?.focusTextarea())
+}
+
+async function steerPendingMessage(index: number) {
+  const item = beginPendingDelivery(index)
+  if (!item) return
+
+  let outcome: ChatSendOutcome = 'retryable_failure'
+  try {
+    outcome = await sendQueuedSteer(item)
+  } finally {
+    settlePendingDelivery(item, outcome)
+  }
+}
 
 // Deny notes ride the normal send path: queued while the turn is streaming,
 // sent immediately otherwise.
@@ -1872,13 +1964,24 @@ const hasSendContent = computed(() => {
   return inputText.value.trim().length > 0 || pendingAttachments.value.some(isSendableAttachment)
 })
 
-const modelImageSendBlockedMessage = computed(() => {
-  if (!hasSendableModelInputImageAttachment(pendingAttachments.value)) return ''
+const landingSuggestionsSuppressed = computed(() => shouldSuppressLandingSuggestions({
+  landingPrefilled: landingPrefilled.value,
+  composerText: inputText.value,
+  attachmentCount: pendingAttachments.value.length,
+}))
+
+const queuedImageSendBlockedMessage = computed(() => {
   if (modelRoutingSettingsBusy.value) {
     return t('chat.composer.routingUpdateImageBlocked')
   }
   return modelRoutingMode.value === 'llm_ensemble'
     ? t('chat.composer.ensembleImageUnsupported')
+    : ''
+})
+
+const modelImageSendBlockedMessage = computed(() => {
+  return hasSendableModelInputImageAttachment(pendingAttachments.value)
+    ? queuedImageSendBlockedMessage.value
     : ''
 })
 
@@ -1968,12 +2071,12 @@ async function setComposerCodingModeEnabled(enabled: boolean) {
   await setCodingModeEnabled(enabled)
 }
 
-// A landing suggestion chip replaces the draft composer text; the user still
-// reviews and sends it themselves.
+// A suggestion chip is an explicit task choice. Route it through the same
+// composer-backed send path as every other message so routing, attachments,
+// optimistic state, and recovery behavior stay identical.
 function applyLandingSuggestion(text: string) {
-  inputText.value = text
-  autoResizeTextarea()
-  composerRef.value?.focusTextarea()
+  if (landingSuggestionsSuppressed.value) return
+  sendComposerText(text)
 }
 
 function appendComposerText(text: string) {
@@ -2131,16 +2234,119 @@ const sessionArtifacts = computed<ArtifactPayload[]>(() => {
   return collected
 })
 
+const sessionWorkbenchArtifacts = computed(() =>
+  sessionArtifacts.value.filter(artifactUsesWorkbenchPreview),
+)
+
+const headerDeliverableCount = computed(() =>
+  workbenchEnabled.value
+    ? sessionWorkbenchArtifacts.value.length
+    : sessionArtifacts.value.length,
+)
+
 const deliverablesOpen = ref(false)
 const metaRunsHistoryOpen = ref(false)
 
-function focusHeaderAction(action: 'deliverables' | 'runs' | 'share' | 'copy-session-key') {
+function focusHeaderAction(
+  action: 'deliverables' | 'runs' | 'share' | 'copy-session-key',
+) {
   void nextTick(() => chatHeaderActionsRef.value?.focusAction(action))
 }
 
 function openDeliverables() {
   if (sessionArtifacts.value.length === 0) return
+  if (workbenchEnabled.value) {
+    const recentPreview = workbenchStore.findMostRecentItem(item => {
+      if (
+        item.kind !== 'artifact-preview'
+        || item.scope.type !== 'session'
+        || item.scope.id !== sessionKey.value
+      ) return false
+      const artifact = artifactFromWorkbenchItem(item)
+      if (!artifact) return false
+      return artifactUsesWorkbenchPreview(artifact)
+    })
+    if (recentPreview) {
+      workbenchStore.activateItem(recentPreview.id)
+      workbenchStore.setExpanded(true)
+      return
+    }
+
+    for (let index = sessionWorkbenchArtifacts.value.length - 1; index >= 0; index -= 1) {
+      const artifact = sessionWorkbenchArtifacts.value[index]
+      if (!artifact) continue
+      openArtifact(artifact)
+      return
+    }
+
+    const latestArtifact = sessionArtifacts.value[sessionArtifacts.value.length - 1]
+    if (latestArtifact && artifactCategory(latestArtifact) === 'visual') {
+      openArtifact(latestArtifact)
+      return
+    }
+    if (latestArtifact) focusInlineDeliverable(latestArtifact)
+    return
+  }
   deliverablesOpen.value = true
+}
+
+function focusInlineDeliverable(artifact: ArtifactPayload): boolean {
+  const reduceMotion = typeof window !== 'undefined'
+    && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+  return focusArtifactInTranscript(
+    threadRef.value,
+    artifact,
+    reduceMotion ? 'auto' : 'smooth',
+  )
+}
+
+watch(sessionArtifacts, artifacts => {
+  if (!sessionKey.value) return
+  artifactImageLightbox.updateNavigation(artifacts, sessionKey.value)
+  if (!workbenchEnabled.value) return
+  for (const item of workbenchStore.items) {
+    if (
+      item.kind !== 'artifact-preview'
+      || item.scope.type !== 'session'
+      || item.scope.id !== sessionKey.value
+    ) continue
+    const artifact = artifactFromWorkbenchItem(item)
+    if (!artifact) continue
+    workbenchStore.updateItem(createArtifactPreviewWorkbenchItem({
+      artifact,
+      navigationArtifacts: artifacts,
+      nativeHtml: item.hostKind === 'native-webcontents',
+      sessionKey: sessionKey.value,
+    }))
+  }
+})
+
+function openArtifact(artifact: ArtifactPayload): boolean {
+  if (
+    isInlineMediaArtifact(artifact)
+    || artifactWorkbenchPreviewKind(artifact) === 'unsupported'
+  ) {
+    return focusInlineDeliverable(artifact)
+  }
+  if (artifactCategory(artifact) === 'visual' && sessionKey.value) {
+    artifactImageLightbox.open({
+      artifact,
+      navigationArtifacts: sessionArtifacts.value,
+      sessionKey: sessionKey.value,
+    })
+    return true
+  }
+  if (!workbenchEnabled.value || !sessionKey.value) return false
+  workbenchStore.openItem(createArtifactPreviewWorkbenchItem({
+    artifact,
+    navigationArtifacts: sessionArtifacts.value,
+    nativeHtml: Boolean(
+      platform.capabilities.hasNativeWorkbenchSurfaces
+      && platform.workbench.native,
+    ),
+    sessionKey: sessionKey.value,
+  }))
+  return true
 }
 
 function closeDeliverables() {
@@ -2832,6 +3038,7 @@ watch(() => [route.query.newChat, route.query.new], () => {
 
 watch(sessionKey, () => {
   pendingForkBeforeMessageId.value = null
+  if (workbenchEnabled.value) workbenchStore.setSessionScope(sessionKey.value || null)
   if (shareMode.value) endShareMode()
   deliverablesOpen.value = false
   metaRunsHistoryOpen.value = false

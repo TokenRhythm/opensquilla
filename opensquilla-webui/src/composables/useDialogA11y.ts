@@ -8,6 +8,7 @@ const FOCUSABLE = [
   'textarea:not([disabled]):not([tabindex="-1"])',
   'select:not([disabled]):not([tabindex="-1"])',
   'summary:not([tabindex="-1"])',
+  'iframe:not([tabindex="-1"])',
   '[tabindex]:not([tabindex="-1"])',
 ].join(', ')
 
@@ -17,6 +18,8 @@ const FOCUSABLE = [
 // reliable proxy: ConfirmModal is mounted globally before Settings dialogs.
 const openDialogStack: symbol[] = []
 const openDialogVersion = ref(0)
+const nativeSurfaceOcclusionStack: symbol[] = []
+const nativeSurfaceOcclusionVersion = ref(0)
 
 function registerOpenDialog(token: symbol) {
   const existing = openDialogStack.indexOf(token)
@@ -34,9 +37,41 @@ function unregisterOpenDialog(token: symbol): boolean {
   return wasTopmost
 }
 
+function registerNativeSurfaceOcclusion(token: symbol) {
+  const existing = nativeSurfaceOcclusionStack.indexOf(token)
+  if (existing >= 0) nativeSurfaceOcclusionStack.splice(existing, 1)
+  nativeSurfaceOcclusionStack.push(token)
+  nativeSurfaceOcclusionVersion.value += 1
+}
+
+function unregisterNativeSurfaceOcclusion(token: symbol) {
+  const existing = nativeSurfaceOcclusionStack.indexOf(token)
+  if (existing < 0) return
+  nativeSurfaceOcclusionStack.splice(existing, 1)
+  nativeSurfaceOcclusionVersion.value += 1
+}
+
 /** True while any modal/drawer layer has registered global keyboard ownership. */
 export function hasOpenDialogLayer(): boolean {
   return openDialogStack.length > 0
+}
+
+/** Reactive counterpart used by native surfaces that must disappear whenever
+ * a DOM modal owns the window. The returned computed contains no dialog
+ * identity or content; it only exposes whether the shared stack is non-empty. */
+export function useOpenDialogLayerState() {
+  return computed(() => {
+    void openDialogVersion.value
+    return openDialogStack.length > 0
+  })
+}
+
+/** True while a DOM layer that must paint above WebContentsView is open. */
+export function useNativeSurfaceOcclusionState() {
+  return computed(() => {
+    void nativeSurfaceOcclusionVersion.value
+    return nativeSurfaceOcclusionStack.length > 0
+  })
 }
 
 /**
@@ -44,8 +79,12 @@ export function hasOpenDialogLayer(): boolean {
  * the same LIFO stack as useDialogA11y. The returned ref lets that implementation
  * act only while it is visually topmost.
  */
-export function useDialogLayer(isOpen: Ref<boolean>) {
+export function useDialogLayer(
+  isOpen: Ref<boolean>,
+  options: { occludesNativeSurface?: boolean } = {},
+) {
   const token = Symbol('dialog-layer')
+  const occludesNativeSurface = options.occludesNativeSurface !== false
   const isTopmost = computed(() => {
     // The stack is intentionally a small module-local array, but custom layer
     // ownership is reactive: opening a layer above an already-evaluated one
@@ -55,11 +94,19 @@ export function useDialogLayer(isOpen: Ref<boolean>) {
   })
 
   watch(isOpen, (open) => {
-    if (open) registerOpenDialog(token)
-    else unregisterOpenDialog(token)
+    if (open) {
+      registerOpenDialog(token)
+      if (occludesNativeSurface) registerNativeSurfaceOcclusion(token)
+    } else {
+      unregisterOpenDialog(token)
+      unregisterNativeSurfaceOcclusion(token)
+    }
   }, { immediate: true, flush: 'sync' })
 
-  onUnmounted(() => unregisterOpenDialog(token))
+  onUnmounted(() => {
+    unregisterOpenDialog(token)
+    unregisterNativeSurfaceOcclusion(token)
+  })
   return isTopmost
 }
 
@@ -68,6 +115,9 @@ interface DialogA11yOptions {
   // inside the dialog — pass an explicit ref for confirm dialogs so a
   // destructive primary button is not auto-focused.
   initialFocus?: Ref<HTMLElement | null>
+  // Native WebContentsView surfaces sit above renderer DOM. Most dialogs must
+  // hide them while open; the mobile Workbench itself is the one exception.
+  occludesNativeSurface?: boolean
 }
 
 /**
@@ -83,6 +133,7 @@ export function useDialogA11y(
   options: DialogA11yOptions = {},
 ) {
   const dialogToken = Symbol('dialog-a11y')
+  const occludesNativeSurface = options.occludesNativeSurface !== false
   let invokerEl: HTMLElement | null = null
 
   function onKeydown(event: KeyboardEvent) {
@@ -119,6 +170,7 @@ export function useDialogA11y(
     if (open && !wasOpen) {
       invokerEl = document.activeElement instanceof HTMLElement ? document.activeElement : null
       registerOpenDialog(dialogToken)
+      if (occludesNativeSurface) registerNativeSurfaceOcclusion(dialogToken)
       void nextTick(() => {
         const target = options.initialFocus?.value
           ?? rootRef.value?.querySelector<HTMLElement>(FOCUSABLE)
@@ -127,6 +179,7 @@ export function useDialogA11y(
       })
     } else if (!open && wasOpen) {
       const wasTopmost = unregisterOpenDialog(dialogToken)
+      unregisterNativeSurfaceOcclusion(dialogToken)
       if (wasTopmost && invokerEl && document.contains(invokerEl)) invokerEl.focus()
       invokerEl = null
     }
@@ -134,6 +187,7 @@ export function useDialogA11y(
 
   onUnmounted(() => {
     unregisterOpenDialog(dialogToken)
+    unregisterNativeSurfaceOcclusion(dialogToken)
     invokerEl = null
   })
 }

@@ -4,6 +4,7 @@ export type ActivityToolDetailLine =
   | { kind: 'target' | 'code' | 'error'; text: string }
   | { kind: 'bytes'; bytes: number }
   | { kind: 'content-size'; lines: number; characters: number }
+  | { kind: 'exit-code'; code: number }
   | { kind: 'published' }
 
 export interface ActivityToolDetailProjection {
@@ -203,12 +204,56 @@ function safeTarget(value: string): string {
 }
 
 function safeError(value: string): string {
-  const firstLine = String(value || '').split(/\r?\n/, 1)[0] || ''
+  const source = String(value || '')
+  const record = parseRecord(source)
+  const preferred = recordString(record, [
+    'user_message',
+    'userMessage',
+    'message',
+    'error_message',
+    'errorMessage',
+    'detail',
+    'error',
+  ]) || ['error', 'cause', 'details']
+    .map(key => recordString(asRecord(record?.[key]), [
+      'user_message',
+      'userMessage',
+      'message',
+      'error_message',
+      'errorMessage',
+      'detail',
+    ]))
+    .find(Boolean)
+    || source
+  const firstLine = preferred.split(/\r?\n/, 1)[0] || ''
   const withoutAbsolutePaths = firstLine.replace(
     /(?:[A-Za-z]:[\\/]|\/)(?:[^<>:"|?*\s]+[\\/])+([^<>:"|?*\s]+)/g,
     '…/$1',
   )
   return safeInline(withoutAbsolutePaths)
+}
+
+function activityExitCode(value: string): number | null {
+  const source = String(value || '')
+  const record = parseRecord(source)
+  const structured = record?.exit_code ?? record?.exitCode
+  if (
+    typeof structured === 'number'
+    && Number.isSafeInteger(structured)
+  ) {
+    return structured
+  }
+  if (
+    typeof structured === 'string'
+    && /^-?\d+$/.test(structured.trim())
+  ) {
+    const parsed = Number(structured)
+    return Number.isSafeInteger(parsed) ? parsed : null
+  }
+  const match = /(?:^|\r?\n)\s*exit_code\s*=\s*(-?\d+)\b/i.exec(source)
+  if (!match) return null
+  const parsed = Number(match[1])
+  return Number.isSafeInteger(parsed) ? parsed : null
 }
 
 function contentSize(value: string): { lines: number; characters: number } | null {
@@ -312,8 +357,14 @@ export function projectActivityToolDetail(
     ? /\bwritten\s+(\d+)\s+bytes?\b/i.exec(result)
     : null
   if (call.isError || call.status === 'error') {
-    const error = safeError(call.resultPreview || call.result)
-    pushUnique(lines, error ? { kind: 'error', text: error } : null)
+    const errorSource = call.result || call.resultPreview
+    const exitCode = activityExitCode(errorSource)
+    if (exitCode !== null) {
+      pushUnique(lines, { kind: 'exit-code', code: exitCode })
+    } else {
+      const error = safeError(errorSource)
+      pushUnique(lines, error ? { kind: 'error', text: error } : null)
+    }
   } else if (writtenMatch) {
     pushUnique(lines, { kind: 'bytes', bytes: Number(writtenMatch[1]) })
   } else if (

@@ -182,6 +182,46 @@ describe('activity tool detail projection', () => {
     ])
   })
 
+  it('prefers a safe structured user message while retaining raw error details', () => {
+    const raw = JSON.stringify({
+      status: 'error',
+      tool: 'image',
+      error_class: 'SafeToolError',
+      message: 'Internal wrapper failed',
+      user_message: 'Image path is not accessible by the image tool.',
+    })
+    const projection = projectActivityToolDetail(call({
+      status: 'error',
+      isError: true,
+      result: raw,
+      resultPreview: '{"status":"error","tool":"image",…',
+    }), 'tool.image')
+
+    expect(projection.lines).toEqual([
+      {
+        kind: 'error',
+        text: 'Image path is not accessible by the image tool.',
+      },
+    ])
+    expect(projection.rawContent).toContain('"error_class":"SafeToolError"')
+    expect(projection.rawContent).toContain('"message":"Internal wrapper failed"')
+  })
+
+  it('projects failed shell results as a localizable exit-code fact', () => {
+    const projection = projectActivityToolDetail(call({
+      name: 'shell',
+      status: 'error',
+      isError: true,
+      result: 'exit_code=1\nstderr=synthetic failure',
+      resultPreview: 'exit_code=1',
+    }), 'command.run')
+
+    expect(projection.lines).toEqual([
+      { kind: 'exit-code', code: 1 },
+    ])
+    expect(projection.rawContent).toContain('stderr=synthetic failure')
+  })
+
   it('keeps relative paths and hides external directory structure', () => {
     expect(activityDisplayPath('src/components/App.vue')).toBe('src/components/App.vue')
     expect(activityDisplayPath('C:\\Users\\example\\secret\\App.vue')).toBe('…/App.vue')

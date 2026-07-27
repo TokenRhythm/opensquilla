@@ -182,6 +182,15 @@ test.describe('Vue behavior contracts', () => {
 
   test('drawer, nested preview, and lightbox own Escape while composer Escape aborts once', async ({ page }) => {
     const abortCalls: Array<Record<string, unknown>> = []
+    await page.addInitScript(() => {
+      const featureWindow = window as typeof window & {
+        OPENSQUILLA_FEATURES?: Record<string, boolean>
+      }
+      featureWindow.OPENSQUILLA_FEATURES = {
+        ...(featureWindow.OPENSQUILLA_FEATURES || {}),
+        artifactWorkbench: false,
+      }
+    })
     await page.route('**/api/v1/artifacts/**', route => route.fulfill({
       status: 200,
       contentType: 'image/png',

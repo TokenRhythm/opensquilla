@@ -128,7 +128,10 @@ describe('RunTrace activity presentation', () => {
     expect(secondaryTextRule).not.toContain('transparent')
     expect(
       ruleBody('.tool-timeline--activity .tool-row--error .tool-row__status'),
-    ).toContain('color: var(--danger);')
+    ).toContain('color: var(--warn);')
+    expect(
+      ruleBody('.tool-timeline--activity .tool-row__activity-icon--error'),
+    ).toContain('color: var(--warn);')
 
     expect(ruleBody('.tool-timeline--activity .tool-row--running .tool-row__arg')).toContain(
       'color: var(--text-muted);',
@@ -234,13 +237,13 @@ describe('RunTrace activity presentation', () => {
     expect(
       Array.from(el.querySelectorAll('.tool-row--group .tool-row__status'))
         .map(node => node.textContent),
-    ).toEqual(['Failed'])
+    ).toEqual(["Didn't complete"])
     expect(
       el.querySelector('.tool-row--group')?.getAttribute('aria-expanded'),
     ).toBe('false')
     expect(el.querySelector('.tool-row__bullet--err')).toBeNull()
     expect(el.querySelector('.tool-row__activity-icon--error')).not.toBeNull()
-    expect(el.querySelector('.tool-row__state-icon--err')).not.toBeNull()
+    expect(el.querySelector('.tool-row__state-icon--err')).toBeNull()
     expect(el.querySelector('.activity-tool-details__line--error')).not.toBeNull()
     expect(el.querySelector('.tool-row-section--error')).toBeNull()
   })
@@ -273,10 +276,10 @@ describe('RunTrace activity presentation', () => {
     // accessible name; a live region mounted already-populated never announces.
     const row = el.querySelector<HTMLButtonElement>('.tool-row--error')
     const status = row?.querySelector('.tool-row__status')
-    expect(status?.textContent).toBe('Failed')
-    expect(row?.textContent).toContain('Failed')
+    expect(status?.textContent).toBe("Didn't complete")
+    expect(row?.textContent).toContain("Didn't complete")
     expect(el.querySelector('[role="status"]')).toBeNull()
-    expect(el.querySelector('.tool-row__state-icon--err')).not.toBeNull()
+    expect(el.querySelector('.tool-row__state-icon--err')).toBeNull()
     expect(el.querySelector('.tool-row__activity-icon--error')).not.toBeNull()
     expect(el.querySelector('.tool-row__activity-arrow')).not.toBeNull()
     expect(

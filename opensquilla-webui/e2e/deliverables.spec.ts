@@ -85,6 +85,18 @@ async function deliverablesTrigger(page: Page): Promise<Locator> {
 }
 
 test.describe('Per-session deliverables drawer', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.addInitScript(() => {
+      const featureWindow = window as typeof window & {
+        OPENSQUILLA_FEATURES?: Record<string, boolean>
+      }
+      featureWindow.OPENSQUILLA_FEATURES = {
+        ...(featureWindow.OPENSQUILLA_FEATURES || {}),
+        artifactWorkbench: false,
+      }
+    })
+  })
+
   test('trigger is hidden when the session has no artifacts', async ({ page }) => {
     await openSeededSession(page, EMPTY_SESSION_KEY, false)
     await expect(page.locator('.msg-ai-main').last()).toBeVisible({ timeout: 10000 })

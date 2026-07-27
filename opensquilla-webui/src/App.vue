@@ -271,34 +271,43 @@
         </div>
       </div>
     </header>
-    <main
-      class="content"
-      :class="{ 'content--chat': isChatRoute }"
-      :data-skin="skinId || undefined"
-      :data-skin-variant="variants || undefined"
-      id="content"
-    >
-      <ErrorBoundary>
-        <router-view v-slot="{ Component, route }">
-          <!-- out-in: one view in the DOM at a time, so pages never overlap (no
-               double-exposure, and never two composers/textareas mid-swap).
-               Console views are kept-alive, so the entering page is instant —
-               out-in no longer incurs the old remount/fetch "dead gap". -->
-          <template v-if="route.meta.routeTransition === 'none'">
-            <KeepAlive v-if="route.meta.keepAlive" :max="12">
-              <component :is="Component" :key="route.meta.viewKey || route.name" />
-            </KeepAlive>
-            <component v-else :is="Component" :key="route.meta.viewKey || route.name" />
-          </template>
-          <Transition v-else name="route-fade" mode="out-in">
-            <KeepAlive v-if="route.meta.keepAlive" :max="12">
-              <component :is="Component" :key="route.meta.viewKey || route.name" />
-            </KeepAlive>
-            <component v-else :is="Component" :key="route.meta.viewKey || route.name" />
-          </Transition>
-        </router-view>
-      </ErrorBoundary>
-    </main>
+    <div class="app-workspace">
+      <main
+        class="content"
+        :class="{ 'content--chat': isChatRoute }"
+        :data-skin="skinId || undefined"
+        :data-skin-variant="variants || undefined"
+        id="content"
+      >
+        <ErrorBoundary>
+          <router-view v-slot="{ Component, route }">
+            <!-- out-in: one view in the DOM at a time, so pages never overlap (no
+                 double-exposure, and never two composers/textareas mid-swap).
+                 Console views are kept-alive, so the entering page is instant —
+                 out-in no longer incurs the old remount/fetch "dead gap". -->
+            <template v-if="route.meta.routeTransition === 'none'">
+              <KeepAlive v-if="route.meta.keepAlive" :max="12">
+                <component :is="Component" :key="route.meta.viewKey || route.name" />
+              </KeepAlive>
+              <component v-else :is="Component" :key="route.meta.viewKey || route.name" />
+            </template>
+            <Transition v-else name="route-fade" mode="out-in">
+              <KeepAlive v-if="route.meta.keepAlive" :max="12">
+                <component :is="Component" :key="route.meta.viewKey || route.name" />
+              </KeepAlive>
+              <component v-else :is="Component" :key="route.meta.viewKey || route.name" />
+            </Transition>
+          </router-view>
+        </ErrorBoundary>
+      </main>
+      <AppWorkbench
+        :enabled="appStore.features.artifactWorkbench === true"
+        :route-active="isChatRoute"
+        :session-id="currentSessionKey"
+        :modal-blocked="workbenchModalBlocked"
+      />
+      <ArtifactImageLightbox />
+    </div>
   </div>
 
   <!-- Mobile bottom tab bar (<=768px only; hides while the keyboard is up):
@@ -408,9 +417,13 @@ import SidebarResizer from './components/SidebarResizer.vue'
 import CommandPalette from './components/CommandPalette.vue'
 import LanguageSwitcher from './components/LanguageSwitcher.vue'
 import BgmControl from './components/BgmControl.vue'
+import ArtifactImageLightbox from './components/chat/ArtifactImageLightbox.vue'
+import AppWorkbench from './components/workbench/AppWorkbench.vue'
 import { useBgm } from './composables/useBgm'
 import { useSidebarLayout } from './composables/useSidebarLayout'
 import { useDocumentEvent } from './composables/useDocumentEvent'
+import { useDialogLayer } from './composables/useDialogA11y'
+import { provideArtifactImageLightbox } from './composables/chat/useArtifactImageLightbox'
 import { useAgentOptions } from './composables/useAgentOptions'
 import { useSessionListSubscription } from './composables/useSessionListSubscription'
 import { useToasts } from './composables/useToasts'
@@ -437,6 +450,7 @@ import { activeTaskWasDeletedWithProjectHistory } from './utils/projectHistory'
 const appStore = useAppStore()
 const rpcStore = useRpcStore()
 const shortcutsStore = useShortcutsStore()
+const artifactImageLightbox = provideArtifactImageLightbox()
 const { t } = useI18n()
 const $route = useRoute()
 const sidebarRef = ref<HTMLElement | null>(null)
@@ -559,6 +573,7 @@ const themeIconName = computed(() => {
 })
 
 const themeMenuOpen = ref(false)
+useDialogLayer(themeMenuOpen)
 const themeButtonRef = ref<HTMLButtonElement | null>(null)
 
 // The compact topbar menu deliberately lists only the basic modes (Light / Dark
@@ -602,11 +617,31 @@ const currentSessionKey = computed(() => {
 // Chat layout applies to both the session view and the draft route.
 const isChatRoute = computed(() => $route.path === '/chat' || $route.path === '/chat/new')
 
+watch(
+  [
+    currentSessionKey,
+    isChatRoute,
+    () => artifactImageLightbox.request.value?.sessionKey || '',
+  ],
+  ([sessionKey, chatRouteActive]) => {
+    const request = artifactImageLightbox.request.value
+    if (request && (!chatRouteActive || request.sessionKey !== sessionKey)) {
+      artifactImageLightbox.close()
+    }
+  },
+  { flush: 'sync' },
+)
+
 // The Settings overlay (route-mounted dialog) is open on these routes. It owns
 // its own Escape/focus, so App-level keyboard shortcuts defer to it. Both web
 // and desktop mount the same overlay now (webConfigEnabled is true on both).
 const settingsOverlayOpen = computed(() =>
   webConfigEnabled && ($route.name === 'settings' || $route.name === 'settings-section'))
+const workbenchModalBlocked = computed(() =>
+  commandPaletteOpen.value
+  || themeMenuOpen.value
+  || settingsOverlayOpen.value
+  || (appStore.sidebarOpen && isSidebarDrawer.value))
 
 const contractDebugEnabled = computed(() => appStore.features.contractDebug === true)
 
@@ -1392,6 +1427,14 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+.app-workspace {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+}
+
 /* Topbar connection pill as a button (web): inherits the base .conn-pill look
    and state colors, adds button reset + an affordance that it is clickable. */
 .conn-pill--link {

@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useAppStore } from '@/stores/app'
 import { SUPPORTED_LOCALES, type LocaleCode } from '@/i18n'
 import Icon from '@/components/Icon.vue'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
+import { useDialogLayer } from '@/composables/useDialogA11y'
 
 // Topbar language switcher. Mirrors the theme menu next to it (reuses the global
 // .theme-menu* classes) so the two controls can never drift in look or
@@ -27,6 +28,7 @@ const localeOptions = SUPPORTED_LOCALES.map((code) => ({ code, label: LOCALE_LAB
 
 const menuOpen = ref(false)
 const buttonRef = ref<HTMLButtonElement | null>(null)
+useDialogLayer(computed(() => menuOpen.value))
 
 function pick(code: LocaleCode) {
   void appStore.setLocale(code)
