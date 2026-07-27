@@ -218,6 +218,7 @@
               >
                 <template #interrupt="{ part }">
                   <InterruptPart
+                    v-if="part.resolution"
                     :part="part"
                     timeline
                     @resolve="resolveInterrupt"
@@ -258,6 +259,19 @@
 
           </div>
         </div>
+
+        <!-- Pending controls stay outside the collapsible activity timeline at
+             the live edge. A resolution removes this card and leaves its compact
+             outcome in chronological history. -->
+        <InterruptPart
+          v-for="part in livePendingInterruptParts"
+          :key="part.key"
+          :part="part"
+          @resolve="resolveInterrupt"
+          @extend="extendInterrupt"
+          @clarify-submit="(fields, request) => submitClarify(fields, request)"
+          @clarify-dismiss="dismissClarify"
+        />
 
         <!-- Soft long-running banner: content events crossed the high watchdog
              threshold while no backend-deadline-owned phase (tool, approval,
@@ -1609,6 +1623,48 @@ const liveInterruptParts = computed(() =>
         (part): part is Extract<typeof part, { type: 'interrupt' }> => part.type === 'interrupt',
       ),
 )
+const livePendingInterruptParts = computed(() =>
+  liveInterruptParts.value.filter(part => !part.resolution),
+)
+
+const visiblePendingInterruptKeys = computed(() => {
+  const keys = new Set(livePendingInterruptParts.value.map(part => part.key))
+  for (const message of renderedMessages.value) {
+    for (const part of message.parts ?? []) {
+      if (part.type === 'interrupt' && !part.resolution) keys.add(part.key)
+    }
+  }
+  return [...keys]
+})
+
+async function focusPendingApprovalCard() {
+  const request = appStore.approvalFocusRequest
+  if (!request || request.sessionKey !== sessionKey.value) return
+
+  await nextTick()
+  if (
+    appStore.approvalFocusRequest?.requestId !== request.requestId
+    || request.sessionKey !== sessionKey.value
+  ) return
+
+  const card = [...(threadRef.value?.querySelectorAll<HTMLElement>('[data-approval-id]') ?? [])]
+    .find(element => element.dataset.approvalId === request.approvalId)
+  if (!card) return
+
+  card.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  card.focus({ preventScroll: true })
+  appStore.clearApprovalFocusRequest(request.requestId)
+}
+
+watch(
+  [
+    () => appStore.approvalFocusRequest?.requestId ?? 0,
+    sessionKey,
+    () => visiblePendingInterruptKeys.value.join('\u0000'),
+  ],
+  () => { void focusPendingApprovalCard() },
+  { flush: 'post', immediate: true },
+)
 
 // Feeds the persistent visually-hidden status region in the template. It only
 // fills on the true→false streaming transition (a live turn actually settled),
@@ -2676,14 +2732,19 @@ watch(answerRevealOpen, (open) => {
   if (open && autoScroll.value) scrollToBottom()
 })
 
-// An approval/clarify interrupt is a user-blocking control, not answer content,
-// so it must not sit behind the router-lead reveal window. With the fold
-// authoritative (default), the gated activity is the only interrupt surface,
-// so reveal immediately when a live interrupt part appears — otherwise the card
-// can stay invisible for up to the MAX backstop when no router decision lands.
-watch(() => liveInterruptParts.value.length, (n, prev) => {
-  if (n > (prev ?? 0)) revealNow()
-})
+// An approval/clarify interrupt is a user-blocking control, not answer content.
+// Reveal it immediately, re-pin the live edge, and keep it outside the
+// collapsible activity surface so it cannot disappear while the backend waits.
+watch(
+  () => visiblePendingInterruptKeys.value,
+  (keys, previousKeys = []) => {
+    if (!keys.some(key => !previousKeys.includes(key))) return
+    revealNow()
+    autoScroll.value = true
+    scrollToBottom()
+  },
+  { flush: 'post' },
+)
 </script>
 
 <style scoped src="../styles/chat-view.css"></style>

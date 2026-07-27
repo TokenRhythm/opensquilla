@@ -133,6 +133,17 @@ function approvalPart(
   }
 }
 
+function approvalTimelineItem(
+  part: Extract<ChatPart, { type: 'interrupt' }>,
+): ChatStreamTimelineItem {
+  return {
+    type: 'interrupt',
+    key: part.key,
+    approvalId: part.approval?.approvalId || '',
+    part,
+  }
+}
+
 function baseMessage(overrides: Partial<ChatRenderedMessage> = {}): ChatRenderedMessage {
   return {
     id: 'assistant-1',
@@ -316,16 +327,36 @@ describe('AssistantMessage activity disclosure', () => {
   })
 
   it('does not claim completion while approval is unresolved', async () => {
+    const pending = approvalPart(null)
     const el = mountMessage(baseMessage({
-      parts: [approvalPart(null)],
+      timelineItems: [...successfulTimeline(), approvalTimelineItem(pending)],
+      parts: [pending],
     }))
     await nextTick()
 
     const summary = el.querySelector('.assistant-activity__summary')
+    const card = el.querySelector<HTMLElement>('.approval-card')
     expect(summary?.textContent).toContain('1 web action')
-    expect(summary?.textContent).toContain('1 failed')
     expect(summary?.textContent).not.toContain('Completed ·')
-    expect(summary?.textContent).not.toContain('recovered')
+    expect(card).not.toBeNull()
+    expect(el.querySelectorAll('.approval-card')).toHaveLength(1)
+    expect(el.querySelector('.assistant-activity')?.contains(card ?? null)).toBe(false)
+    expect(el.querySelector('.msg-ai-main')?.lastElementChild).toBe(card)
+  })
+
+  it('moves a resolved approval outcome into its chronological activity position', async () => {
+    const approved = approvalPart('approved')
+    const el = mountMessage(baseMessage({
+      timelineItems: [...successfulTimeline(), approvalTimelineItem(approved)],
+      parts: [approved],
+    }))
+    await nextTick()
+
+    const activity = el.querySelector('.assistant-activity')
+    const outcome = el.querySelector<HTMLElement>('.approval-outcome')
+    expect(outcome).not.toBeNull()
+    expect(el.querySelectorAll('.approval-outcome')).toHaveLength(1)
+    expect(activity?.contains(outcome ?? null)).toBe(true)
   })
 
   it('does not claim completion after an approval is denied', async () => {

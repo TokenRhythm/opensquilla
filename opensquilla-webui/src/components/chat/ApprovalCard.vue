@@ -18,6 +18,8 @@
     class="approval-card"
     :class="{ 'approval-card--timeline': timeline }"
     data-testid="approval-card"
+    :data-approval-id="approval.id"
+    tabindex="-1"
     role="group"
     :aria-label="t('chat.approval.requiredFor', { tool: approval.toolName })"
   >
@@ -266,6 +268,11 @@ function emitDeny() {
      scrolls. */
   flex-shrink: 0;
   animation: card-enter var(--dur-enter) var(--ease-out) both;
+}
+
+.approval-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
 }
 
 .approval-card__head {

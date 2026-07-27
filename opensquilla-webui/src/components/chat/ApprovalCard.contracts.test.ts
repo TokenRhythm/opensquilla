@@ -43,7 +43,10 @@ beforeEach(() => {
 describe('ApprovalCard safe context', () => {
   it('renders dedicated sandbox target/access/workspace rows', async () => {
     const { app, root } = await mountCard(approval())
+    const card = root.querySelector<HTMLElement>('.approval-card')
     const text = root.querySelector('.approval-card__context')?.textContent || ''
+    expect(card?.dataset.approvalId).toBe('approval-1')
+    expect(card?.tabIndex).toBe(-1)
     expect(text).toContain('/workspace/report.md')
     expect(text).toContain('write')
     expect(text).toContain('/workspace')

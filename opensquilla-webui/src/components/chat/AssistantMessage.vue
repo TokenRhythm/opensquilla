@@ -57,6 +57,7 @@
           >
             <template #interrupt="{ part }">
               <InterruptPart
+                v-if="part.resolution"
                 :part="part"
                 timeline
                 @resolve="(id, decision, note) => $emit('resolveInterrupt', id, decision, note)"
@@ -94,6 +95,7 @@
         >
           <template #interrupt="{ part }">
             <InterruptPart
+              v-if="part.resolution"
               :part="part"
               timeline
               @resolve="(id, decision, note) => $emit('resolveInterrupt', id, decision, note)"
@@ -108,18 +110,6 @@
           :entries="statusHistory"
         />
       </template>
-
-      <!-- Inline interrupts: approval / clarify requests that blocked the run,
-           rendered after the body and before the ending deliverables. -->
-      <InterruptPart
-        v-for="part in standaloneInterruptParts"
-        :key="part.key"
-        :part="part"
-        @resolve="(id, decision, note) => $emit('resolveInterrupt', id, decision, note)"
-        @extend="id => $emit('extendInterrupt', id)"
-        @clarify-submit="(fields, request) => $emit('clarifySubmit', fields, request)"
-        @clarify-dismiss="$emit('clarifyDismiss')"
-      />
 
       <div
         class="msg-ai-ending"
@@ -280,6 +270,18 @@
           </time>
         </div>
       </div>
+
+      <!-- A pending interrupt is the turn's active control and must remain the
+           final item. Once resolved it folds back into the activity timeline. -->
+      <InterruptPart
+        v-for="part in standaloneInterruptParts"
+        :key="part.key"
+        :part="part"
+        @resolve="(id, decision, note) => $emit('resolveInterrupt', id, decision, note)"
+        @extend="id => $emit('extendInterrupt', id)"
+        @clarify-submit="(fields, request) => $emit('clarifySubmit', fields, request)"
+        @clarify-dismiss="$emit('clarifyDismiss')"
+      />
     </div>
   </div>
 </template>
@@ -403,16 +405,16 @@ const interruptParts = computed(
       (part): part is Extract<ChatPart, { type: 'interrupt' }> => part.type === 'interrupt',
     ) ?? [],
 )
-const timelineInterruptKeys = computed(() => new Set(
+const timelineResolvedInterruptKeys = computed(() => new Set(
   props.message.timelineItems
     ?.filter(
       (item): item is Extract<import('@/types/chat').ChatStreamTimelineItem, { type: 'interrupt' }> =>
-        item.type === 'interrupt',
+        item.type === 'interrupt' && !!item.part.resolution,
     )
     .map(item => item.part.key) ?? [],
 ))
 const standaloneInterruptParts = computed(() =>
-  interruptParts.value.filter(part => !timelineInterruptKeys.value.has(part.key)),
+  interruptParts.value.filter(part => !timelineResolvedInterruptKeys.value.has(part.key)),
 )
 // The persisted activity timeline for this finished turn. Empty (fold hidden)
 // for OFF-mode turns and reloaded threads, which carry no snapshot.
@@ -688,6 +690,14 @@ function ensembleRole(role: string, label: string): string {
 </script>
 
 <style scoped>
+.msg-ai-main > :deep(.approval-card),
+.msg-ai-main > :deep(.clarify-card) {
+  width: 100%;
+  max-width: 100%;
+  margin-inline: 0;
+  box-sizing: border-box;
+}
+
 .msg-ai {
   position: relative;
   display: flex;

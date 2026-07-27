@@ -1111,6 +1111,7 @@ async function onDeleteSession(key: string) {
 function openBlockedApprovalSession() {
   const oldest = appStore.oldestPendingWithSession
   if (oldest?.sessionKey) {
+    appStore.requestApprovalFocus(oldest)
     switchToSession(oldest.sessionKey, 'approval.openBlockedSession')
     return
   }

@@ -54,6 +54,13 @@ export interface PendingApproval {
   command: string
 }
 
+/** One-shot request for ChatView to reveal and focus a pending approval card. */
+export interface ApprovalFocusRequest {
+  requestId: number
+  approvalId: string
+  sessionKey: string
+}
+
 export const useAppStore = defineStore('app', () => {
   const theme = ref<ThemeMode>('system')
   // Active UI locale. Browser-local storage preserves the immediate UI
@@ -73,6 +80,8 @@ export const useAppStore = defineStore('app', () => {
   // still supports snapshot consumers (back-compat).
   const pendingApprovals = ref<PendingApproval[]>([])
   const approvalCountRaw = ref(0)
+  const approvalFocusRequest = ref<ApprovalFocusRequest | null>(null)
+  let approvalFocusRequestId = 0
 
   // True once App.vue has wired the live approval source (push events + seed
   // fetch). While live, `approvalCount` is derived from `pendingApprovals`;
@@ -353,6 +362,26 @@ export const useAppStore = defineStore('app', () => {
   function removePendingApproval(approvalId: string) {
     approvalsLive.value = true
     pendingApprovals.value = pendingApprovals.value.filter(a => a.approvalId !== approvalId)
+    if (approvalFocusRequest.value?.approvalId === approvalId) {
+      approvalFocusRequest.value = null
+    }
+  }
+
+  function requestApprovalFocus(
+    approval: Pick<PendingApproval, 'approvalId' | 'sessionKey'>,
+  ) {
+    if (!approval.approvalId || !approval.sessionKey) return
+    approvalFocusRequest.value = {
+      requestId: ++approvalFocusRequestId,
+      approvalId: approval.approvalId,
+      sessionKey: approval.sessionKey,
+    }
+  }
+
+  function clearApprovalFocusRequest(requestId: number) {
+    if (approvalFocusRequest.value?.requestId === requestId) {
+      approvalFocusRequest.value = null
+    }
   }
 
   const features = ref<Record<string, boolean>>({
@@ -376,6 +405,7 @@ export const useAppStore = defineStore('app', () => {
     approvalCount,
     pendingApprovals,
     oldestPendingWithSession,
+    approvalFocusRequest,
     features,
     initTheme,
     destroyTheme,
@@ -392,5 +422,7 @@ export const useAppStore = defineStore('app', () => {
     setPendingApprovals,
     upsertPendingApproval,
     removePendingApproval,
+    requestApprovalFocus,
+    clearApprovalFocusRequest,
   }
 })
