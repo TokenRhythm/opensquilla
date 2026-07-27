@@ -65,4 +65,26 @@ describe('ConfirmModal accessibility', () => {
     primary?.click()
     await expect(confirmed).resolves.toBe(true)
   })
+
+  it('places Cancel before Trust and open in the project trust prompt', async () => {
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    app = createApp(ConfirmModal)
+    app.use(i18n)
+    app.mount(root)
+
+    void useConfirm().confirm({
+      title: 'Trust this project directory?',
+      body: '/Volumes/workspace/project',
+      primaryLabel: 'Trust and open',
+    })
+    await nextTick()
+    await nextTick()
+
+    const labels = Array.from(
+      document.querySelectorAll<HTMLButtonElement>('.modal__footer button'),
+      button => button.textContent?.trim(),
+    )
+    expect(labels).toEqual(['Cancel', 'Trust and open'])
+  })
 })
