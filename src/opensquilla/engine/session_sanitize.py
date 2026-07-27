@@ -55,6 +55,8 @@ _TOOL_RESULT_PROJECTION_HEADER_PREFIXES = (
     "preview_complete:",
     "retrieve_hint:",
     "search_hints:",
+    "signal_scan:",
+    "signal_next_call:",
 )
 
 

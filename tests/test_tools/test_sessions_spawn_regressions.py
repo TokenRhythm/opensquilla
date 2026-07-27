@@ -140,21 +140,32 @@ class _StubTaskRuntime:
     def __init__(self) -> None:
         self.enqueued: list[dict] = []
 
-    async def enqueue(self, envelope, message, mode="followup", run_kind="default"):
+    async def enqueue(
+        self,
+        envelope,
+        message,
+        mode="followup",
+        run_kind="default",
+        *,
+        task_id=None,
+        provider_request_correlation=None,
+    ):
         self.enqueued.append(
             {
                 "envelope": envelope,
                 "message": message,
                 "mode": mode,
                 "run_kind": run_kind,
+                "task_id": task_id,
+                "provider_request_correlation": provider_request_correlation,
             }
         )
 
         @dataclass
         class _Handle:
-            task_id: str = "task-stub"
+            task_id: str
 
-        return _Handle()
+        return _Handle(task_id or "task-stub")
 
 
 def _ctx() -> ToolContext:
@@ -591,7 +602,7 @@ async def test_spawned_child_restart_uses_persisted_inherited_authority_at_boot(
         assert queued_run.envelope.input_provenance == {
             "kind": "subagent_task",
             "parent_session_key": parent_key,
-            "run_id": None,
+            "run_id": spawned["task_id"],
             "parent_task_id": "parent-task-restart",
         }
     finally:

@@ -14,6 +14,33 @@ interface UseChatRunModePreferenceOptions {
   runModePolicy: () => RunModePolicy | null | undefined
 }
 
+interface RunModeRpc {
+  waitForConnection: () => Promise<unknown>
+  call: (
+    method: string,
+    params?: Record<string, unknown>,
+  ) => Promise<unknown>
+}
+
+interface PersistMaterializedSessionRunModeOptions {
+  rpc: RunModeRpc
+  sessionKey: string
+  isDraft: boolean
+  runMode: SandboxRunMode
+}
+
+export async function persistMaterializedSessionRunMode(
+  options: PersistMaterializedSessionRunModeOptions,
+): Promise<void> {
+  const sessionKey = options.sessionKey.trim()
+  if (options.isDraft || !sessionKey) return
+  await options.rpc.waitForConnection()
+  await options.rpc.call('sandbox.run_context.set', {
+    sessionKey,
+    runMode: options.runMode,
+  })
+}
+
 function availableStorage(): Storage | null {
   if (typeof window === 'undefined') return null
   try {

@@ -90,8 +90,13 @@ const EXIT_SCROLL_RANGE_RATIO = 1
 // not mount/unmount the rail on every sub-pixel wobble around one boundary.
 // A fresh rail must reach the enter threshold; once visible it is allowed to
 // remain until the conversation pane crosses the lower exit threshold.
-const ENTER_INLINE_SIZE = 1104
-const EXIT_INLINE_SIZE = 1056
+// The rail's 30px lens starts 14px from the shell edge; its focus ring reaches
+// another 4px. At the 1104px floor, the shared 980px conversation column still
+// leaves a stable gap after accounting for the thread's scrollbar gutter.
+// Enter a little later than that floor so live sidebar resizing cannot flicker
+// the rail at the exact collision boundary.
+const ENTER_INLINE_SIZE = 1120
+const EXIT_INLINE_SIZE = 1104
 const ARRIVAL_HIGHLIGHT_MS = 650
 const ARRIVAL_TOLERANCE_PX = 4
 const MAX_PREVIEW_LENGTH = 220
@@ -923,9 +928,9 @@ onBeforeUnmount(() => {
   font-size: var(--fs-xs);
 }
 
-/* This is the hard safety floor only. JavaScript owns the 1104px enter / 1056px
+/* This is the hard safety floor only. JavaScript owns the 1120px enter / 1104px
    exit hysteresis; using the enter value here would defeat that hysteresis. */
-@container chat-thread-shell (max-width: 1056px) {
+@container chat-thread-shell (max-width: 1104px) {
   .conversation-minimap {
     display: none;
   }

@@ -7,7 +7,12 @@ from typing import Any
 import pytest
 
 from opensquilla.tools.builtin import filesystem
-from opensquilla.tools.types import CallerKind, ToolContext, current_tool_context
+from opensquilla.tools.types import (
+    CallerKind,
+    RetryableToolInputError,
+    ToolContext,
+    current_tool_context,
+)
 
 
 def _original_async(fn: Callable[..., Awaitable[str]]) -> Callable[..., Awaitable[str]]:
@@ -76,7 +81,7 @@ async def test_write_file_records_noop_semantic_receipt(
 
 
 @pytest.mark.asyncio
-async def test_edit_file_records_noop_semantic_receipt(
+async def test_edit_file_rejects_noop_edit(
     workspace_context: tuple[Path, ToolContext, list[dict[str, Any]]],
 ) -> None:
     workspace, ctx, _events = workspace_context
@@ -86,11 +91,12 @@ async def test_edit_file_records_noop_semantic_receipt(
     edit_file = _original_async(filesystem.edit_file)
 
     await filesystem.read_file(str(target))
-    await edit_file(str(target), old_text="alpha\n", new_text="alpha\n")
+    # An edit whose old_text == new_text changes nothing; it must be rejected so the
+    # model retries with the intended change instead of recording a phantom success.
+    with pytest.raises(RetryableToolInputError):
+        await edit_file(str(target), old_text="alpha\n", new_text="alpha\n")
 
-    receipt = ctx.workspace_mutation_receipts[-1]
-    assert receipt["changed"] is False
-    assert receipt["operation"] == "edit_file"
+    assert target.read_text(encoding="utf-8") == "alpha\n"
     assert ctx.workspace_epoch == 0
 
 

@@ -436,6 +436,8 @@ describe('ChannelsView dashboard home', () => {
     })
     try {
       await flush()
+      expect(el.querySelector('.control-stage--hub-actions')).not.toBeNull()
+      expect(el.querySelector('.control-stage__header--hub-actions')).not.toBeNull()
       // One card per configured channel, no table.
       expect(el.querySelector('table')).toBeNull()
       const ops = channelCard(el, 'ops-slack')
@@ -458,6 +460,7 @@ describe('ChannelsView dashboard home', () => {
 
       // The pending request surfaces on the card: alert figure + inline banner.
       expect(ops.querySelector('.chb-figure--alert dd')?.textContent).toContain('1')
+      expect(ops.querySelector('.chb-story__alerts .chal--pending')).not.toBeNull()
       expect(ops.textContent).toContain('Pending User')
       expect(ops.textContent).toContain('AB12CD34')
 
@@ -470,6 +473,9 @@ describe('ChannelsView dashboard home', () => {
         expect(other.textContent).not.toContain('Pending User')
         expect(other.querySelector('.chb-figure--alert')).toBeNull()
         expect(other.querySelector('[aria-label="Approve access for Pending User"]')).toBeNull()
+        if (name === 'alerts-telegram' || name === 'off-discord') {
+          expect(other.querySelector('.chb-story__alerts')).toBeNull()
+        }
       }
 
       // Unconfigured runtime channel renders as a muted, non-drillable card.
@@ -628,6 +634,7 @@ describe('ChannelsView dashboard home', () => {
       await flush()
       const card = channelCard(el, 'dead-telegram')
       expect(card.textContent).toContain('401 Unauthorized — bot token rejected')
+      expect(card.querySelector('.chb-story__alerts .chal--error')).not.toBeNull()
       buttonWithText(card, 'Fix credentials').click()
       await flush()
       // The escape hatch is a drill (history PUSH) straight into edit mode.
@@ -741,6 +748,44 @@ describe('ChannelsView dashboard home', () => {
         .toContain('2')
     } finally {
       app.unmount()
+    }
+  })
+
+  it('refreshes the open members panel when status reports a new pairing', async () => {
+    let hasPendingPairing = false
+    const loadPairings = vi.fn(async (params?: Record<string, unknown>) => {
+      if (params?.channelName !== 'ops-slack' || !hasPendingPairing) return { pairings: [] }
+      return {
+        pairings: [{
+          pairingId: 'pair-new',
+          pairingCode: 'NEWPAIR1',
+          channelName: 'ops-slack',
+          senderId: 'U-NEW',
+          senderName: 'New Pending User',
+          status: 'pending',
+        }],
+      }
+    })
+    const initialRows = channelRows.map(ch =>
+      ch.name === 'ops-slack' ? { ...ch, pendingPairings: 0 } : ch)
+    const ctx = await mountChannelsView({ channelRows: initialRows, loadPairings })
+    try {
+      await ctx.flush()
+      const page = await openDrill(ctx, 'ops-slack')
+      expect(page.querySelector('.chal--pending')).toBeNull()
+
+      hasPendingPairing = true
+      ctx.channelsData.value = {
+        channels: initialRows.map(ch =>
+          ch.name === 'ops-slack' ? { ...ch, pendingPairings: 1 } : ch),
+      }
+      await ctx.flush()
+      await ctx.flush()
+
+      expect(page.querySelector('.chal--pending')?.textContent).toContain('New Pending User')
+      expect(page.querySelector('.chal--pending')?.textContent).toContain('NEWPAIR1')
+    } finally {
+      ctx.app.unmount()
     }
   })
 
@@ -2031,7 +2076,7 @@ describe('ChannelsView compose takeover', () => {
   })
 })
 
-describe('feishu final-step callout', () => {
+describe('feishu event-subscription guidance', () => {
   const FEISHU_ROW = {
     name: 'fs-main',
     type: 'feishu',
@@ -2067,9 +2112,29 @@ describe('feishu final-step callout', () => {
       const page = await openDrill(ctx, 'fs-main')
       const step = page.querySelector<HTMLElement>('.ch-alert--step')
       expect(step).toBeTruthy()
-      expect(step!.textContent).toContain('Final step in the Feishu console')
-      // The retuned ws_order_note is the body: post-save console guidance.
+      expect(step!.textContent).toContain('Check Feishu event subscription')
+      expect(step!.textContent).not.toContain('Final step')
+      expect(step!.textContent).not.toContain('one step left')
+      // The retuned ws_order_note is neutral console guidance, not a diagnosis.
       expect(step!.textContent).toContain('事件与回调')
+      expect(step!.textContent).toContain('does not by itself mean the console is misconfigured')
+    } finally {
+      ctx.app.unmount()
+    }
+  })
+
+  it.each([
+    { status: 'connected', connected: false, reason: 'transport evidence is false' },
+    { status: 'restarting', connected: true, reason: 'wire status is not connected' },
+  ])('stays hidden when $reason', async ({ status, connected }) => {
+    const ctx = await mountChannelsView({
+      channelRows: [{ ...FEISHU_ROW, status, connected }],
+      channelsGet: feishuGet('websocket'),
+    })
+    try {
+      await ctx.flush()
+      const page = await openDrill(ctx, 'fs-main')
+      expect(page.querySelector('.ch-alert--step')).toBeNull()
     } finally {
       ctx.app.unmount()
     }
@@ -2137,7 +2202,7 @@ describe('feishu final-step callout', () => {
       await ctx.flush()
       const page = await openDrill(ctx, 'fs-main')
       // Mode unknown → no websocket guidance rather than guessing: a webhook
-      // channel must never see the long-connection final-step callout.
+      // channel must never see long-connection subscription guidance.
       expect(page.querySelector('.ch-alert--step')).toBeNull()
     } finally {
       ctx.app.unmount()

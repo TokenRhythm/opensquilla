@@ -83,43 +83,59 @@ async function openSeededSession(page: Page) {
 }
 
 test.describe('Deliverable endings', () => {
-  test('artifact turn groups artifacts, sources, and receipt into one ending block', async ({ page }) => {
+  test('artifact turn keeps the message receipt outside the deliverable surface', async ({ page }) => {
     await openSeededSession(page)
 
-    // Only the artifact-bearing turn gets the deliverable block.
+    // Only the artifact-bearing turn gets the deliverable group.
     const block = page.getByTestId('done-block')
     await expect(block).toHaveCount(1)
     await expect(block).toBeVisible({ timeout: 10000 })
-    // The retired follow-up row never renders; the ending block closes the turn.
+    // The retired follow-up row never renders; the composer continues the turn.
     await expect(page.locator('.done-card')).toHaveCount(0)
 
-    // The block holds the chip, the sources row, and the receipt line.
+    // The deliverable group holds only the artifact and its sources.
     await expect(block.locator('.msg-artifact-chip')).toBeVisible()
     await expect(block.locator('.msg-artifact-name')).toHaveText('report.csv')
     await expect(block.locator('.sources-row')).toBeVisible()
-    await expect(block.locator('.msg-ai-meta .msg-meta__cost')).toContainText('$')
+    await expect(block.locator('.msg-ai-footer')).toHaveCount(0)
 
-    // Block order is artifacts → sources → receipt.
-    const order = await block.evaluate(el => {
+    const messageMain = block.locator('..')
+    const receipt = messageMain.locator(':scope > .msg-ai-footer')
+    await expect(receipt.locator('.msg-ai-meta .msg-meta__cost')).toContainText('$')
+
+    // The old outer card is gone: the artifact chip owns the only visible frame.
+    const surface = await block.evaluate(el => {
+      const style = getComputedStyle(el)
+      return {
+        background: style.backgroundColor,
+        borderTop: style.borderTopWidth,
+        paddingTop: style.paddingTop,
+      }
+    })
+    expect(surface).toEqual({
+      background: 'rgba(0, 0, 0, 0)',
+      borderTop: '0px',
+      paddingTop: '0px',
+    })
+    await expect(block.locator('.msg-artifact-chip')).toHaveCSS('border-top-style', 'solid')
+
+    // Group order is artifacts → sources; the receipt follows as a sibling.
+    const groupOrder = await block.evaluate(el => {
       const children = Array.from(el.children)
       const indexOf = (selector: string) => children.findIndex(child => child.matches(selector))
       return {
         artifacts: indexOf('.msg-artifacts'),
         sources: indexOf('.sources-row'),
-        receipt: indexOf('.msg-ai-footer'),
       }
     })
-    expect(order.artifacts).toBeGreaterThanOrEqual(0)
-    expect(order.sources).toBeGreaterThan(order.artifacts)
-    expect(order.receipt).toBeGreaterThan(order.sources)
+    expect(groupOrder.artifacts).toBeGreaterThanOrEqual(0)
+    expect(groupOrder.sources).toBeGreaterThan(groupOrder.artifacts)
 
-    // Nothing follows the deliverable block inside the message: the block is
-    // the last element of the assistant subtree.
-    const blockIsLast = await page.locator('.msg-ai-main').last().evaluate(el => {
+    const receiptFollowsBlock = await page.locator('.msg-ai-main').last().evaluate(el => {
       const done = el.querySelector('[data-testid="done-block"]')
-      return !!done && done.parentElement?.lastElementChild === done
+      return !!done && done.nextElementSibling?.matches('.msg-ai-footer')
     })
-    expect(blockIsLast).toBe(true)
+    expect(receiptFollowsBlock).toBe(true)
   })
 
   test('completed turns render no follow-up actions; the composer is the continue affordance', async ({ page }) => {
@@ -151,7 +167,8 @@ test.describe('Deliverable endings', () => {
     const block = page.getByTestId('done-block')
     await expect(block).toBeVisible({ timeout: 180000 })
     await expect(block.locator('.msg-artifact-chip').first()).toBeVisible()
-    await expect(block.locator('.msg-ai-footer')).toBeVisible()
+    await expect(block.locator('.msg-ai-footer')).toHaveCount(0)
+    await expect(block.locator('..').locator(':scope > .msg-ai-footer')).toBeVisible()
     // No follow-up action row after completion.
     await expect(page.getByTestId('done-continue')).toHaveCount(0)
     await expect(page.getByTestId('done-new-task')).toHaveCount(0)

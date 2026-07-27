@@ -107,6 +107,188 @@ def test_sub_agent_tool_list_excludes_meta_invoke() -> None:
     )
 
 
+def test_meta_sub_agent_reuses_explicit_provider_request_correlation() -> None:
+    from opensquilla.engine.types import AgentConfig
+    from opensquilla.provider.correlation_context import (
+        bind_provider_request_correlation,
+        current_provider_request_correlation,
+    )
+    from opensquilla.provider.types import (
+        ProviderRequestCorrelation,
+        derive_provider_request_correlation,
+    )
+    from opensquilla.skills.meta.orchestrator import make_agent_runner_from_parent
+
+    meta_correlation = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="meta-execution",
+        call_kind="auxiliary.meta",
+    )
+    parent_correlation = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="parent-execution",
+        call_kind="agent.chat",
+    )
+    captured: dict[str, Any] = {}
+    observed_tool_correlations: list[ProviderRequestCorrelation | None] = []
+    derived_tool_correlations: list[ProviderRequestCorrelation | None] = []
+
+    async def raw_tool_handler(_call: Any) -> SimpleNamespace:
+        active = current_provider_request_correlation()
+        observed_tool_correlations.append(active)
+        derived_tool_correlations.extend(
+            [
+                derive_provider_request_correlation(
+                    active,
+                    execution_id="media-execution",
+                    call_kind="auxiliary.media",
+                ),
+                derive_provider_request_correlation(
+                    active,
+                    execution_id="image-execution",
+                    call_kind="auxiliary.image_generation",
+                ),
+            ]
+        )
+        return SimpleNamespace(is_error=False, content="ok")
+
+    def agent_factory(**kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+
+        class _DummyAgent:
+            async def run_turn(self, _msg: str):
+                if False:
+                    yield None  # pragma: no cover
+
+        return _DummyAgent()
+
+    runner = make_agent_runner_from_parent(
+        provider=None,  # type: ignore[arg-type]
+        base_config=AgentConfig(model_id="stub"),
+        tool_definitions=[],
+        tool_handler=raw_tool_handler,
+        agent_factory=agent_factory,
+        provider_request_correlation=meta_correlation,
+    )
+
+    import asyncio
+
+    async def _drive() -> None:
+        with bind_provider_request_correlation(parent_correlation):
+            async for _ in runner("sys", "user"):
+                pass
+            await captured["tool_handler"](SimpleNamespace())
+            assert current_provider_request_correlation() == parent_correlation
+
+    asyncio.run(_drive())
+
+    assert captured["provider_request_correlation"] == meta_correlation
+    assert observed_tool_correlations == [meta_correlation]
+    assert derived_tool_correlations == [
+        ProviderRequestCorrelation(
+            session_id="session-1",
+            turn_id="turn-1",
+            execution_id="media-execution",
+            call_kind="auxiliary.media",
+        ),
+        ProviderRequestCorrelation(
+            session_id="session-1",
+            turn_id="turn-1",
+            execution_id="image-execution",
+            call_kind="auxiliary.image_generation",
+        ),
+    ]
+    assert current_provider_request_correlation() is None
+
+
+@pytest.mark.asyncio
+async def test_meta_direct_tool_invoker_binds_explicit_correlation() -> None:
+    from opensquilla.provider.correlation_context import (
+        bind_provider_request_correlation,
+        current_provider_request_correlation,
+    )
+    from opensquilla.provider.types import ProviderRequestCorrelation
+    from opensquilla.skills.meta.orchestrator import make_tool_invoker_from_handler
+
+    meta_correlation = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="meta-tool-execution",
+        call_kind="auxiliary.meta",
+    )
+    parent_correlation = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="parent-execution",
+        call_kind="agent.chat",
+    )
+    observed: list[ProviderRequestCorrelation | None] = []
+
+    async def raw_tool_handler(_call: Any) -> SimpleNamespace:
+        observed.append(current_provider_request_correlation())
+        return SimpleNamespace(is_error=False, content="tool-ok")
+
+    invoker = make_tool_invoker_from_handler(
+        tool_handler=raw_tool_handler,
+        provider_request_correlation=meta_correlation,
+    )
+
+    with bind_provider_request_correlation(parent_correlation):
+        assert await invoker("image_generate", {"prompt": "synthetic"}) == "tool-ok"
+        assert current_provider_request_correlation() == parent_correlation
+    assert observed == [meta_correlation]
+    assert current_provider_request_correlation() is None
+
+
+def test_meta_sub_agent_derives_correlation_from_context_when_not_explicit() -> None:
+    from opensquilla.engine.types import AgentConfig
+    from opensquilla.provider.correlation_context import bind_provider_request_correlation
+    from opensquilla.provider.types import ProviderRequestCorrelation
+    from opensquilla.skills.meta.orchestrator import make_agent_runner_from_parent
+
+    root = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="root-execution",
+        call_kind="agent.chat",
+    )
+    captured: dict[str, Any] = {}
+
+    def agent_factory(**kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+
+        class _DummyAgent:
+            async def run_turn(self, _msg: str):
+                if False:
+                    yield None  # pragma: no cover
+
+        return _DummyAgent()
+
+    import asyncio
+
+    async def _drive() -> None:
+        runner = make_agent_runner_from_parent(
+            provider=None,  # type: ignore[arg-type]
+            base_config=AgentConfig(model_id="stub"),
+            tool_definitions=[],
+            tool_handler=None,
+            agent_factory=agent_factory,
+        )
+        async for _ in runner("sys", "user"):
+            pass
+
+    with bind_provider_request_correlation(root):
+        asyncio.run(_drive())
+
+    child = captured["provider_request_correlation"]
+    assert child.session_id == root.session_id
+    assert child.turn_id == root.turn_id
+    assert child.execution_id != root.execution_id
+    assert child.call_kind == "subagent.chat"
+
+
 def test_sub_agent_tool_list_excludes_openai_function_wrapped_meta_invoke() -> None:
     """OpenAI-compatible providers (and OpenRouter/DeepSeek/Gemini) emit
     tool definitions in the function-wrapped shape::

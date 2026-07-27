@@ -355,6 +355,17 @@ _COMMANDS: tuple[CommandDef, ...] = (
         order=100,
     ),
     CommandDef(
+        name="/keys",
+        usage="/keys",
+        description="Show keyboard shortcuts.",
+        execution={_T: _local("keys.show"), _S: _local("keys.show")},
+        aliases=("/shortcuts",),
+        category=CommandCategory.QUERY,
+        busy_policy=CommandBusyPolicy.IMMEDIATE,
+        presentation=CommandPresentation.PANEL,
+        order=101,
+    ),
+    CommandDef(
         name="/theme",
         usage="/theme [name]",
         description="List or switch the OpenTUI color theme.",

@@ -116,7 +116,8 @@
     "discard": "放弃",
     "cancel": "取消",
     "edit": "编辑",
-    "delete": "删除"
+    "delete": "删除",
+    "dismiss": "忽略"
   },
   "nav": {
     "chat": "对话",
@@ -194,7 +195,8 @@
       "themeLabel": "主题",
       "themeDesc": "跟随系统，或强制使用浅色或深色。侧边栏的切换按钮是此设置的快捷方式。",
       "languageLabel": "语言",
-      "languageDesc": "界面的显示语言。即时应用于此浏览器。",
+      "languageDesc": "界面和渠道系统提示的显示语言。此处立即生效，并保存网关范围内的提示语言。",
+      "channelNoticeLocaleSyncPending": "界面语言已切换，但渠道系统提示语言尚未保存。网关重新连接后会自动重试。",
       "toolDetailsLabel": "工具详情默认显示",
       "toolDetailsDesc": "自动模式按工具类型显示；紧凑模式折叠普通工具；展开模式打开全部工具。错误默认自动展开，仍可手动折叠。",
       "toolDetailsAuto": "自动",
@@ -233,7 +235,6 @@
       "compatibilityTitle": "旧版 Agent 数据位置",
       "compatibilityDesc": "OpenSquilla 正在使用兼容的旧版 Agent 数据位置。更改后会切换身份和记忆来源，不会移动、合并或删除数据。",
       "chooseLegacyAgentData": "选择 Agent 数据位置",
-      "recoveryTitle": "恢复 Profile 中不能导入数据",
       "loadFailed": "OpenSquilla 无法检查可导入的数据来源。",
       "emptyTitle": "未发现其他 OpenSquilla 数据",
       "emptyDesc": "以后可以重新扫描；桌面端还可以手动选择数据文件夹。",
@@ -861,7 +862,7 @@
         "credentials_link": "打开凭证页(App id / App secret)",
         "quick_apply_link": "一键预填全部所需权限的申请",
         "needAppId": "先填写 App id",
-        "ws_order_note": "已连接——还差飞书控制台里的最后一步：打开「事件与回调」，把事件订阅方式切换为「使用长连接接收事件」。该选项仅在有活跃连接时才能保存，所以要先保存渠道再去切换。收到第一条事件后本提示自动消失。"
+        "ws_order_note": "检查飞书事件订阅：打开「事件与回调」，确认事件订阅方式为「使用长连接接收事件」。当前长连接已建立，但尚未记录到入站事件；这本身并不代表控制台配置有误。收到第一条事件后本提示自动消失。"
       }
     },
     "search": {
@@ -920,6 +921,15 @@
       "outputFormat": "输出格式",
       "fallbacks": "回退模型",
       "fallbacksHint": "以逗号分隔的“服务商/模型”标识；当主模型失败时按顺序尝试。"
+    },
+    "capabilities": {
+      "imageStatus": {
+        "missingEnv": "缺少环境变量 {name}。在下方填入密钥，或设置该环境变量后重启网关。"
+      },
+      "imageKeyConfigured": "已配置密钥",
+      "imageKeyMissing": "尚未配置",
+      "imageKeyPlaceholderKeep": "留空则保持已保存的密钥",
+      "imageKeyPlaceholderNew": "粘贴 API 密钥"
     },
     "audio": {
       "title": "音频",
@@ -981,6 +991,17 @@
       "revealFailed": "无法显示日志：{error}",
       "restarting": "正在重启本地运行时…",
       "restartFailed": "重启失败：{error}",
+      "closeBehaviorLabel": "关闭主窗口时",
+      "closeBehaviorDesc": "选择点击窗口关闭按钮时 OpenSquilla 的行为。",
+      "closeBehaviorBackground": "在后台继续运行",
+      "closeBehaviorQuit": "退出 OpenSquilla",
+      "closeBehaviorAsk": "每次询问",
+      "closeBehaviorSaving": "正在保存…",
+      "closeBehaviorReadFailed": "无法读取窗口关闭设置：{error}",
+      "closeBehaviorSaveFailed": "无法保存窗口关闭设置：{error}",
+      "closeBehaviorBackgroundUnavailable": "此平台不支持后台运行。",
+      "closeBehaviorFallbackQuit": "此平台不支持后台运行，关闭窗口时将直接退出应用。",
+      "closeBehaviorRetry": "重试",
       "resetConfirmTitle": "重置已保存的设置？",
       "resetConfirmBody": "这将清除已保存的桌面凭据和生成的配置。下次启动将重新运行首次设置。",
       "resetConfirmPrimary": "重置",
@@ -1000,12 +1021,12 @@
         },
         "delete-current-profile": {
           "title": "删除当前配置",
-          "warning": "会删除列出的当前配置、凭据和日志；其他恢复配置和备份都会保留。",
+          "warning": "会删除列出的主配置、凭据和日志；已记录的备份会保留。",
           "apply": "删除配置"
         },
         "delete-all-user-data": {
           "title": "删除全部 OpenSquilla 用户数据",
-          "warning": "OpenSquilla 完全退出后，会删除主配置、所有恢复配置、凭据、日志和已记录的备份。",
+          "warning": "OpenSquilla 完全退出后，会删除主配置、凭据、日志和已记录的备份。",
           "apply": "删除全部数据并退出"
         },
         "inspectFailed": "无法检查清理位置：{detail}",
@@ -1013,7 +1034,6 @@
         "inventoryCount": "列出的 {total} 个位置中，当前有 {existing} 个存在。",
         "inventoryLabel": "清理清单",
         "primaryProfile": "主配置",
-        "recoveryProfile": "恢复配置",
         "present": "存在",
         "missing": "不存在",
         "blocked": "清理已阻止",
@@ -1027,7 +1047,7 @@
         "working": "正在停止本地运行时并执行已确认的清理…",
         "resetConfirmTitle": "重置当前设置？",
         "resetConfirmBody": "当前配置将返回提供商引导，同时保留工作区身份、记忆和聊天。",
-        "partial": "清理在中途停止（{detail}）。OpenSquilla 已保留剩余数据并打开恢复选项。",
+        "partial": "清理在中途停止（{detail}）。OpenSquilla 已保留剩余数据并打开修复选项。",
         "applyFailed": "清理未能开始：{detail}",
         "deleteAllScheduled": "OpenSquilla 即将退出；只有应用完全退出后才会开始删除。",
         "resetDone": "当前设置已重置，将重新打开提供商引导。",
@@ -1049,7 +1069,6 @@
       "migrationLabel": "数据转移",
       "migrationDesc": "使用另一套 OpenSquilla 安装中的数据。继续前会先核对；如果当前桌面端已有数据，会完整备份后再替换。",
       "migrationButton": "从其他安装转移数据",
-      "migrationRecoveryProfile": "恢复配置中不能转移数据。请返回主配置后继续。",
       "migrationNone": "未发现其他 OpenSquilla 数据。",
       "migrationSummaryFailed": "无法核对所选数据：{detail}",
       "migrationSummaryTitle": "核对数据转移",
@@ -1157,11 +1176,11 @@
     },
     "privacy": {
       "title": "隐私",
-      "statusEnabled": "网络可观测性已启用。",
-      "statusDisabled": "网络可观测性已禁用。",
-      "statusDisabledByEnv": "网络可观测性已被环境变量禁用。",
-      "disableNetworkObservabilityLabel": "禁用网络可观测性",
-      "disableNetworkObservabilityDesc": "停止网关网络可观测性调用，例如安装遥测和更新检查。",
+      "statusEnabled": "网络上报已开启。",
+      "statusDisabled": "网络上报已关闭。",
+      "statusDisabledByEnv": "网络上报已被环境变量设置关闭。",
+      "disableNetworkObservabilityLabel": "关闭网络上报",
+      "disableNetworkObservabilityDesc": "停止安装遥测、后台更新检查，以及用于串联同一次会话请求的匿名标识——这些标识只会发送给官方 TokenRhythm API。你主动发起的模型请求不受影响。",
       "save": "保存隐私设置"
     },
     "toast": {
@@ -1982,7 +2001,7 @@
         "capabilityReference": "能力参考",
         "copyBotId": "复制 Bot ID：{id}",
         "botIdCopied": "Bot ID 已复制",
-        "finalStepTitle": "去飞书控制台完成最后一步"
+        "eventSubscriptionTitle": "检查飞书事件订阅"
       }
     },
     "overview": {
@@ -2760,6 +2779,7 @@
     "latest": "最新",
     "thinking": "思考中",
     "thoughtProcess": "思考过程",
+    "thinkingForSeconds": "思考中 · {seconds} 秒",
     "thoughtForSeconds": "思考了 {seconds} 秒",
     "thoughtForMinutes": "思考了 {minutes} 分 {seconds} 秒",
     "toolResult": "工具结果",
@@ -2824,7 +2844,58 @@
       "ensembleDetailUnavailable": "{count} 个候选 · 明细不可用"
     },
     "sources": "来源",
+    "activityLabel": "活动",
     "activitySteps": "活动 · {count} 步",
+    "activityItems": "活动 · {count} 项",
+    "activityCompletedItems": "已完成 · {count} 项",
+    "activityFailures": "{count} 项失败",
+    "activityFailuresRecovered": "{count} 项失败已恢复",
+    "activityWorking": "正在工作",
+    "workedForSeconds": "工作了 {seconds} 秒",
+    "workedForMinutes": "工作了 {minutes} 分 {seconds} 秒",
+    "activity": {
+      "lifecycle": {
+        "working": "正在工作",
+        "answering": "正在组织回答",
+        "settled": "已完成",
+        "interrupted": "已中断",
+        "failed": "已失败"
+      },
+      "purpose": {
+        "discover": "发现链接",
+        "search": "搜索网页",
+        "read": "读取网页",
+        "inspect": "检查文件",
+        "change": "编辑文件",
+        "run": "运行命令",
+        "create": "创建产物",
+        "recall": "检索记忆",
+        "use": "使用工具"
+      },
+      "purposeRunning": {
+        "discover": "正在发现链接",
+        "search": "正在搜索网页",
+        "read": "正在读取网页",
+        "inspect": "正在检查文件",
+        "change": "正在编辑文件",
+        "run": "正在运行命令",
+        "create": "正在创建产物",
+        "recall": "正在检索记忆",
+        "use": "正在使用工具"
+      },
+      "footprint": {
+        "web": "{count} 次网页操作",
+        "files": "{count} 个文件",
+        "fileOperations": "{count} 次文件操作",
+        "commands": "{count} 条命令",
+        "artifacts": "{count} 个产物",
+        "memory": "{count} 次记忆检索",
+        "tools": "{count} 次工具调用"
+      },
+      "more": "另有 {count} 项",
+      "stale": "仍在工作 —— 暂无新信号",
+      "liveStep": "第 {n} 步"
+    },
     "suggestedTasks": "推荐任务",
     "greetingMorning": "早上好。",
     "greetingAfternoon": "下午好。",
@@ -2988,18 +3059,27 @@
       "downloadFailed": "下载失败",
       "forkFailed": "复刻失败",
       "copyFailed": "复制失败",
-      "shareExportFailed": "分享导出失败",
+      "shareSaveFailed": "无法保存图片，请重试。",
+      "sharePreviewUpdateFailed": "无法更新预览，请重试。",
       "saved": "已保存 {filename}",
       "copiedToClipboard": "已复制到剪贴板",
       "copyNotSupported": "不支持复制 — 请改为下载",
       "unsupportedFile": "不支持的文件：{name}（{mime}）",
-      "fileTooLarge": "文件过大：{name}",
+      "fileTooLarge": "文件过大：{name}（上限 {cap}）",
+      "emptyFile": "空文件：{name}",
+      "tooManyAttachments": "附件过多：最多 {max} 个",
+      "attachmentsTotalTooLarge": "附件总量过大：加入 {name} 将超过 {max} 上限",
       "couldNotReadFile": "无法读取文件：{name}",
       "uploadFailed": "{name} 上传失败",
       "voiceUnsupported": "此浏览器不支持语音输入",
       "voiceUnavailable": "语音输入不可用，请在设置中启用。",
       "voiceTranscribeFailed": "无法转写你的录音，请重试。",
       "voiceSetupNeeded": "语音识别需要配置 ElevenLabs API key —— 正在打开设置……",
+      "voiceCancelledHidden": "窗口隐藏时已停止录音。重新开始即可继续口述。",
+      "voiceMicDenied": "麦克风访问被拒绝，请在浏览器设置中允许。",
+      "voiceMicDeniedDesktop": "麦克风访问被拒绝。请在系统设置中允许后重试。",
+      "voiceMicMissing": "未找到麦克风。",
+      "voiceRecordFailed": "无法开始录音，请重试。",
       "waitAttachments": "请等待文件附件处理完成",
       "waitCompactionBeforeCommand": "请等待上下文压缩完成后再运行 {command}。",
       "waitResponseBeforeCommand": "请等待当前回复结束后再运行 {command}。",
@@ -3015,8 +3095,7 @@
       "preparingOutput": "准备输出",
       "generatingCandidates": "正在生成候选",
       "synthesizingCandidates": "正在聚合候选",
-      "stillWaiting": "仍在等待模型",
-      "stillWorking": "仍在处理 — 上次信号 {seconds} 秒前"
+      "stillWaiting": "仍在等待模型"
     },
     "stall": {
       "title": "回复耗时超出预期",
@@ -3162,7 +3241,12 @@
       "sectionDiagnostics": "诊断",
       "sectionResult": "结果",
       "sectionError": "错误",
-      "viewFull": "查看完整内容"
+      "viewFull": "查看完整内容",
+      "activityViewDetails": "查看详情",
+      "activityDetailsTitle": "详情",
+      "activityBytesWritten": "已写入 {size}",
+      "activityContentSize": "{lines} 行 · {characters} 个字符",
+      "activityPublished": "已发布"
     }
   },
   "channelStatus": {

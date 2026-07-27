@@ -269,12 +269,14 @@ test.describe('Sidebar', () => {
     await expect(sidebar).toHaveClass(/docked/)
     await expect(expandedToggle).toHaveAttribute('aria-expanded', 'true')
     await expect(expandedToggle).toHaveAttribute('aria-keyshortcuts', /^(Meta|Control)\+B$/)
+    await expect(expandedToggle.locator('path[d="M9.5 4.5v15"]')).toHaveCount(1)
 
     await expandedToggle.click()
     await expect(sidebar).not.toHaveClass(/docked/)
     const collapsedToggle = page.getByTestId('sidebar-toggle-collapsed')
     await expect(collapsedToggle).toBeFocused()
     await expect(collapsedToggle).toHaveAttribute('aria-expanded', 'false')
+    await expect(collapsedToggle.locator('path[d="M8.5 9v6"]')).toHaveCount(1)
 
     // The former invisible edge hot zone is gone: approaching the history rail
     // can no longer reveal a 260px overlay above it.

@@ -1,6 +1,7 @@
 import type { ChatRenderedMessage } from '@/types/chat'
 
 export function chatMessageKey(message: ChatRenderedMessage, index: number): string {
+  if (message.isRouterStrip && message.routerTurnKey) return message.routerTurnKey
   return message.messageId || message.clientId || message.id || `${message.displayRole || message.role}-${message.sourceIndex ?? index}`
 }
 

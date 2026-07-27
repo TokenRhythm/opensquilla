@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import time
 import uuid
@@ -195,7 +196,7 @@ class SubagentManager:
     async def spawn(
         self,
         spec: SubagentSpec,
-        agent_factory: Any,  # callable: (spec, depth) -> Agent
+        agent_factory: Any,  # callable: (spec, depth[, execution_id]) -> Agent
     ) -> SubagentHandle:
         """Spawn a child agent for the given spec.
 
@@ -206,7 +207,15 @@ class SubagentManager:
         self._check_concurrent()
 
         run_id = str(uuid.uuid4())
-        child_agent: Agent = agent_factory(spec, self.spawn_depth + 1)
+        depth = self.spawn_depth + 1
+        try:
+            inspect.signature(agent_factory).bind(spec, depth, run_id)
+        except (TypeError, ValueError):
+            # Compatibility for external/test factories implementing the
+            # historical two-argument internal callback.
+            child_agent: Agent = agent_factory(spec, depth)
+        else:
+            child_agent = agent_factory(spec, depth, run_id)
 
         async def _run() -> str:
             collected: list[str] = []

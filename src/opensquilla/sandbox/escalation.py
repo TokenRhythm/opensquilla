@@ -12,7 +12,11 @@ from pathlib import Path
 from typing import Any
 
 from opensquilla.sandbox.domain_validation import domain_matches
-from opensquilla.sandbox.elevation import ApprovalReviewerName, ElevationAction
+from opensquilla.sandbox.elevation import (
+    ApprovalReviewerName,
+    ElevationAction,
+    channel_admin_approval_identity,
+)
 from opensquilla.sandbox.network_guard import NetworkDecision
 from opensquilla.sandbox.package_bundles import expand_package_bundle
 from opensquilla.sandbox.path_validation import (
@@ -137,11 +141,8 @@ class _ApprovalMutationManager:
 
     def _seeded_session(self, session: Any) -> Any:
         seeded = copy.copy(session)
-        origin = (
-            dict(getattr(seeded, "origin", None))
-            if isinstance(getattr(seeded, "origin", None), dict)
-            else {}
-        )
+        raw_origin = getattr(seeded, "origin", None)
+        origin = dict(raw_origin) if isinstance(raw_origin, dict) else {}
         origin[RUN_CONTEXT_ORIGIN_KEY] = self._context.to_origin_payload()
         seeded.origin = origin
         return seeded
@@ -415,7 +416,7 @@ def request_sandbox_approval(
     captured_generation = _capture_current_tool_run_context_for_approval(params)
 
     if _current_tool_context_is_channel():
-        admin_identity = _channel_admin_approval_identity()
+        admin_identity = channel_admin_approval_identity()
         if admin_identity is None:
             return _approval_payload(
                 "approval_denied",
@@ -428,9 +429,8 @@ def request_sandbox_approval(
         # where only that sender can resolve it. Non-admin channel callers keep
         # the hard deny above — pairing alone never unlocks host-side asks.
         sender_id, session_key = admin_identity
-        params.setdefault("senderId", sender_id)
-        if session_key:
-            params.setdefault("sessionKey", session_key)
+        params["senderId"] = sender_id
+        params["sessionKey"] = session_key
 
     queue = get_approval_queue()
     created_generation = False
@@ -526,29 +526,6 @@ def _current_tool_context_is_channel() -> bool:
         return False
     caller_kind = getattr(ctx, "caller_kind", None)
     return caller_kind is CallerKind.CHANNEL or str(caller_kind) == CallerKind.CHANNEL.value
-
-
-def _channel_admin_approval_identity() -> tuple[str, str] | None:
-    """Sender/session identity for a channel-admin turn, else ``None``.
-
-    ``is_owner`` on a channel ToolContext is set from
-    ``channel_admin_senders`` at dispatch time; the sender id recorded here is
-    the one the channel resolver later compares against, so a missing sender
-    id means the prompt could never be resolved and we fall back to the deny.
-    """
-    try:
-        from opensquilla.tools.types import current_tool_context
-
-        ctx = current_tool_context.get()
-    except Exception:  # pragma: no cover - defensive
-        return None
-    if ctx is None or not getattr(ctx, "is_owner", False):
-        return None
-    sender_id = str(getattr(ctx, "sender_id", "") or "").strip()
-    if not sender_id:
-        return None
-    session_key = str(getattr(ctx, "session_key", "") or "").strip()
-    return sender_id, session_key
 
 
 def _capture_current_tool_run_context_for_approval(
@@ -1456,15 +1433,15 @@ def prune_once_mount_grants(session_key: str | None = None) -> int:
             active_tool_context,
         ):
             continue
-        once_mounts = tuple(
+        delta_once_mounts = tuple(
             mount for mount in delta.context.mounts if mount.scope == "once"
         )
-        if not once_mounts:
+        if not delta_once_mounts:
             continue
         remaining_mounts = tuple(
             mount for mount in delta.context.mounts if mount.scope != "once"
         )
-        pruned += len(once_mounts)
+        pruned += len(delta_once_mounts)
         updated_context = replace(
             delta.context,
             mounts=remaining_mounts,
@@ -1805,7 +1782,7 @@ async def _apply_network_choice(
             config=config,
             workspace=workspace,
         )
-        grant = next(
+        bundle_grant = next(
             (
                 item
                 for item in updated.bundles
@@ -1820,7 +1797,7 @@ async def _apply_network_choice(
         _remember_approval_delta(
             approval_id,
             authority,
-            _approval_delta_context(authority, bundles=(grant,)),
+            _approval_delta_context(authority, bundles=(bundle_grant,)),
         )
         return
 
@@ -1837,7 +1814,7 @@ async def _apply_network_choice(
         config=config,
         workspace=workspace,
     )
-    grant = next(
+    domain_grant = next(
         (
             item
             for item in updated.domains
@@ -1848,7 +1825,7 @@ async def _apply_network_choice(
     _remember_approval_delta(
         approval_id,
         authority,
-        _approval_delta_context(authority, domains=(grant,)),
+        _approval_delta_context(authority, domains=(domain_grant,)),
     )
 
 
@@ -1928,7 +1905,7 @@ async def _apply_path_choice(
             scope="once",
             workspace=workspace,
         )
-        grant = (
+        once_grant = (
             _deepest_latest_mount_satisfying_path(
                 authority.context,
                 path=path,
@@ -1942,7 +1919,7 @@ async def _apply_path_choice(
             authority,
             _approval_delta_context(
                 authority,
-                mounts=(grant,),
+                mounts=(once_grant,),
             ),
         )
         if not published:
@@ -1958,13 +1935,13 @@ async def _apply_path_choice(
         scope="chat",
         workspace=workspace,
     )
-    grant = _deepest_latest_mount_satisfying_path(
+    existing_grant = _deepest_latest_mount_satisfying_path(
         authority.context,
         path=path,
         workspace=workspace,
         requested_access=requested_access,
     )
-    if grant is None:
+    if existing_grant is None:
         # Only mutate when no concurrent exact/covering authoritative mount
         # already satisfies this stale request.
         mutation_manager = _approval_mutation_manager(
@@ -1980,7 +1957,7 @@ async def _apply_path_choice(
             config=config,
             workspace=workspace,
         )
-        grant = (
+        existing_grant = (
             _deepest_latest_mount_satisfying_path(
                 updated,
                 path=path,
@@ -1989,12 +1966,12 @@ async def _apply_path_choice(
             )
             or requested_grant
         )
-    if grant is None:
-        grant = requested_grant
+    if existing_grant is None:
+        existing_grant = requested_grant
     _remember_approval_delta(
         approval_id,
         authority,
-        _approval_delta_context(authority, mounts=(grant,)),
+        _approval_delta_context(authority, mounts=(existing_grant,)),
     )
 
 

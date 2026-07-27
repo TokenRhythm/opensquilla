@@ -668,6 +668,242 @@ async def test_image_generation_configure_redacts_api_key(tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_image_generation_configure_accepts_exact_legacy_direct_key_payload(
+    tmp_path,
+    monkeypatch,
+):
+    from opensquilla.gateway.config import GatewayConfig
+
+    target = tmp_path / "c.toml"
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    ctx = _admin_ctx()
+    ctx.config = GatewayConfig(config_path=str(target))
+    dispatcher = get_dispatcher()
+
+    public = await dispatcher.dispatch("r0", "config.get", {}, ctx)
+    assert public.error is None, public.error
+    provider = public.payload["image_generation"]["providers"]["openrouter"]
+    # The 0.5.0 form hydrates the default env name, does not clear it when a
+    # direct key is entered, and always emits the fallback array.
+    legacy_payload = {
+        "providerId": "openrouter",
+        "primary": "openrouter/google/gemini-3.1-flash-image-preview",
+        "apiKey": "sk-legacy-direct",
+        "apiKeyEnv": provider["api_key_env"],
+        "baseUrl": provider["base_url"],
+        "fallbacks": [],
+    }
+
+    res = await dispatcher.dispatch(
+        "r1",
+        "onboarding.imageGeneration.configure",
+        legacy_payload,
+        ctx,
+    )
+
+    assert res.error is None, res.error
+    assert ctx.config.image_generation.providers.openrouter.api_key == "sk-legacy-direct"
+    assert ctx.config.image_generation.providers.openrouter.api_key_env == ""
+    assert res.payload["entry"]["api_key_source"] == "explicit"
+
+
+@pytest.mark.asyncio
+async def test_image_generation_configure_normalizes_0_5_0_provider_switch_payload(
+    tmp_path,
+    monkeypatch,
+):
+    from opensquilla.gateway.config import GatewayConfig
+
+    target = tmp_path / "c.toml"
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    ctx = _admin_ctx()
+    ctx.config = GatewayConfig(config_path=str(target))
+    dispatcher = get_dispatcher()
+
+    public = await dispatcher.dispatch("r0", "config.get", {}, ctx)
+    assert public.error is None, public.error
+    image_config = public.payload["image_generation"]
+    # In 0.5.0, changing only the provider updates the env field but leaves
+    # the previous provider's non-empty default model and endpoint in place.
+    legacy_switch_payload = {
+        "providerId": "openrouter",
+        "primary": image_config["primary"],
+        "apiKey": "sk-legacy-switch",
+        "apiKeyEnv": image_config["providers"]["openrouter"]["api_key_env"],
+        "baseUrl": image_config["providers"]["openai"]["base_url"],
+        "enabled": True,
+        "fallbacks": [],
+    }
+
+    res = await dispatcher.dispatch(
+        "r1",
+        "onboarding.imageGeneration.configure",
+        legacy_switch_payload,
+        ctx,
+    )
+
+    assert res.error is None, res.error
+    image_config = ctx.config.image_generation
+    assert image_config.primary == "openrouter/google/gemini-3.1-flash-image-preview"
+    provider = image_config.providers.openrouter
+    assert provider.api_key == "sk-legacy-switch"
+    assert provider.api_key_env == ""
+    assert provider.base_url == "https://openrouter.ai/api/v1"
+
+
+@pytest.mark.asyncio
+async def test_image_generation_configure_normalizes_custom_0_5_0_provider_switch_payload(
+    tmp_path,
+    monkeypatch,
+):
+    from opensquilla.gateway.config import GatewayConfig
+
+    target = tmp_path / "c.toml"
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    ctx = _admin_ctx()
+    ctx.config = GatewayConfig(
+        config_path=str(target),
+        image_generation={
+            "enabled": True,
+            "primary": "openai/custom-image-model",
+            "fallbacks": ["openai/gpt-image-1"],
+            "providers": {
+                "openai": {"base_url": "https://images.example.test/v1"},
+            },
+        },
+    )
+    dispatcher = get_dispatcher()
+
+    # 0.5.0 keeps all source-provider fields after changing the provider. The
+    # target env name is the only field its change handler replaces.
+    legacy_switch_payload = {
+        "providerId": "openrouter",
+        "primary": "openai/custom-image-model",
+        "apiKey": "sk-legacy-switch",
+        "apiKeyEnv": "OPENROUTER_API_KEY",
+        "baseUrl": "https://images.example.test/v1",
+        "enabled": True,
+        "fallbacks": ["openai/gpt-image-1"],
+    }
+
+    res = await dispatcher.dispatch(
+        "r1",
+        "onboarding.imageGeneration.configure",
+        legacy_switch_payload,
+        ctx,
+    )
+
+    assert res.error is None, res.error
+    image_config = ctx.config.image_generation
+    assert image_config.primary == "openrouter/google/gemini-3.1-flash-image-preview"
+    assert image_config.fallbacks == ["openai/gpt-image-1"]
+    provider = image_config.providers.openrouter
+    assert provider.api_key == "sk-legacy-switch"
+    assert provider.base_url == "https://openrouter.ai/api/v1"
+
+
+@pytest.mark.asyncio
+async def test_image_generation_legacy_config_get_resave_preserves_direct_key_and_fallbacks(
+    tmp_path,
+    monkeypatch,
+):
+    from opensquilla.gateway.config import GatewayConfig
+
+    target = tmp_path / "c.toml"
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    ctx = _admin_ctx()
+    ctx.config = GatewayConfig(
+        config_path=str(target),
+        image_generation={
+            "enabled": True,
+            "primary": "openrouter/google/gemini-3.1-flash-image-preview",
+            "fallbacks": ["openai/gpt-image-1"],
+            "providers": {
+                "openrouter": {
+                    "api_key": "sk-stored-direct",
+                    "api_key_env": "OPENROUTER_API_KEY",
+                }
+            },
+        },
+    )
+    dispatcher = get_dispatcher()
+
+    public = await dispatcher.dispatch("r0", "config.get", {}, ctx)
+    assert public.error is None, public.error
+    provider = public.payload["image_generation"]["providers"]["openrouter"]
+    assert provider["api_key"] == "[redacted]"
+    legacy_payload = {
+        "providerId": "openrouter",
+        "primary": public.payload["image_generation"]["primary"],
+        # The write-only 0.5.0 key field stays blank, so apiKey is omitted.
+        "apiKeyEnv": provider["api_key_env"],
+        "baseUrl": provider["base_url"],
+        "fallbacks": [],
+    }
+
+    res = await dispatcher.dispatch(
+        "r1",
+        "onboarding.imageGeneration.configure",
+        legacy_payload,
+        ctx,
+    )
+
+    assert res.error is None, res.error
+    assert ctx.config.image_generation.providers.openrouter.api_key == "sk-stored-direct"
+    assert ctx.config.image_generation.fallbacks == ["openai/gpt-image-1"]
+    assert res.payload["entry"]["api_key_source"] == "explicit"
+
+
+@pytest.mark.asyncio
+async def test_image_generation_configure_replaces_direct_key_and_resets_optional_fields(
+    tmp_path,
+    monkeypatch,
+):
+    target = tmp_path / "c.toml"
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
+    first = await get_dispatcher().dispatch(
+        "r1",
+        "onboarding.imageGeneration.configure",
+        {
+            "providerId": "openrouter",
+            "primary": "openrouter/google/gemini-3.1-flash-image-preview",
+            "apiKey": "sk-direct",
+            "baseUrl": "https://images.example.test/v1",
+            "fallbacks": ["openai/gpt-image-1"],
+        },
+        _admin_ctx(),
+    )
+    assert first.error is None, first.error
+
+    second = await get_dispatcher().dispatch(
+        "r1",
+        "onboarding.imageGeneration.configure",
+        {
+            "providerId": "openrouter",
+            "primary": "openrouter/google/gemini-3.1-flash-image-preview",
+            "apiKeyEnv": "OPENSQUILLA_TEST_IMAGE_KEY",
+            "credentialMode": "env",
+            "baseUrl": "",
+            "fallbacks": [],
+            "clearFallbacks": True,
+        },
+        _admin_ctx(),
+    )
+    assert second.error is None, second.error
+
+    data = tomllib.loads(target.read_text())
+    provider = data["image_generation"]["providers"]["openrouter"]
+    assert provider.get("api_key", "") == ""
+    assert provider["api_key_env"] == "OPENSQUILLA_TEST_IMAGE_KEY"
+    assert provider["base_url"] == "https://openrouter.ai/api/v1"
+    assert data["image_generation"]["fallbacks"] == []
+
+
+@pytest.mark.asyncio
 async def test_image_generation_configure_can_use_custom_env_reference(
     tmp_path,
     monkeypatch,
@@ -762,6 +998,56 @@ async def test_image_generation_configure_can_disable_without_visible_key(
 
 
 @pytest.mark.asyncio
+async def test_image_generation_configure_can_disable_legacy_invalid_config(
+    tmp_path,
+    monkeypatch,
+):
+    from opensquilla.gateway.config import GatewayConfig
+
+    target = tmp_path / "c.toml"
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
+    ctx = _admin_ctx()
+    ctx.config = GatewayConfig(
+        config_path=str(target),
+        image_generation={
+            "enabled": True,
+            "primary": "openrouter/google//image",
+            "fallbacks": ["openai/"],
+            "providers": {
+                "openrouter": {
+                    "api_key": "sk-synthetic-image",
+                    "base_url": "not-a-url",
+                }
+            },
+        },
+    )
+
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "onboarding.imageGeneration.configure",
+        {
+            "providerId": "openrouter",
+            "primary": "openrouter/google//image",
+            "baseUrl": "not-a-url",
+            "fallbacks": ["openai/"],
+            "enabled": False,
+        },
+        ctx,
+    )
+
+    assert res.error is None, res.error
+    assert ctx.config.image_generation.enabled is False
+    data = tomllib.loads(target.read_text())
+    assert data["image_generation"]["enabled"] is False
+    assert data["image_generation"]["primary"] == "openrouter/google//image"
+    assert data["image_generation"]["fallbacks"] == ["openai/"]
+    assert (
+        data["image_generation"]["providers"]["openrouter"]["base_url"]
+        == "not-a-url"
+    )
+
+
+@pytest.mark.asyncio
 async def test_onboarding_status_requires_image_generation_enable_for_llm_fallback(
     tmp_path,
     monkeypatch,
@@ -781,6 +1067,40 @@ async def test_onboarding_status_requires_image_generation_enable_for_llm_fallba
     assert res.payload["imageGenerationEnabled"] is False
     assert res.payload["imageGenerationSource"] == "none"
     assert res.payload["imageGenerationProvider"] == ""
+
+
+@pytest.mark.asyncio
+async def test_onboarding_status_marks_legacy_image_endpoint_mismatch_degraded(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(tmp_path / "c.toml"))
+    from opensquilla.gateway.config import GatewayConfig
+
+    ctx = _read_ctx()
+    ctx.config = GatewayConfig()
+    ctx.config.image_generation.enabled = True
+    ctx.config.image_generation.primary = (
+        "openrouter/google/gemini-3.1-flash-image-preview"
+    )
+    openrouter_provider = ctx.config.image_generation.providers.openrouter
+    openrouter_provider.api_key = "sk-synthetic-image"
+    openrouter_provider.base_url = "https://api.openai.com/v1"
+
+    res = await get_dispatcher().dispatch("r1", "onboarding.status", {}, ctx)
+
+    assert res.error is None, res.error
+    assert res.payload["sections"]["image_generation"] == "degraded"
+    assert res.payload["imageGenerationConfigured"] is False
+    assert res.payload["imageGenerationEnabled"] is True
+    assert res.payload["imageGenerationProvider"] == "openrouter"
+    assert res.payload["imageGenerationSource"] == "explicit"
+    detail = res.payload["sectionDetails"]["image_generation"]
+    assert detail["actionRequired"] is True
+    assert detail["blocking"] is False
+    assert detail["detail"] == (
+        "openrouter (endpoint/provider mismatch: configured openai official endpoint)"
+    )
 
 
 @pytest.mark.asyncio

@@ -17,7 +17,13 @@ from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.runtime import TurnRunner, _SelectorFallbackProvider
 from opensquilla.engine.types import DoneEvent as EngineDoneEvent
 from opensquilla.engine.types import RouterDecisionEvent
-from opensquilla.provider import DoneEvent, ErrorEvent, TextDeltaEvent
+from opensquilla.provider import (
+    ChatConfig,
+    DoneEvent,
+    ErrorEvent,
+    ProviderRequestCorrelation,
+    TextDeltaEvent,
+)
 from opensquilla.tools.types import CallerKind, ToolContext
 
 
@@ -74,6 +80,29 @@ def test_fallback_to_same_model_keeps_savings() -> None:
 def test_fallback_without_metadata_is_noop() -> None:
     wrapper = _SelectorFallbackProvider(object(), _StubSelector("any/model"))
     assert wrapper.fallback_after_invalid_response("upstream 503") is True
+
+
+def test_preselected_fallback_leg_derives_call_kind_only() -> None:
+    wrapper = _SelectorFallbackProvider(object(), _StubSelector("fallback/model"))
+    correlation = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="execution-1",
+        call_kind="agent.chat",
+    )
+    config = ChatConfig(provider_request_correlation=correlation)
+
+    assert wrapper._config_for_active_leg(config) is config
+    assert wrapper.fallback_after_invalid_response("upstream 503") is True
+
+    fallback_config = wrapper._config_for_active_leg(config)
+    assert fallback_config is not config
+    assert fallback_config.provider_request_correlation == ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="execution-1",
+        call_kind="agent.chat.provider_fallback",
+    )
 
 
 PRIMARY_MODEL = "routed-primary"

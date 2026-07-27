@@ -32,6 +32,7 @@ from opensquilla.channels.approval_prompt import (
     render_approval_prompt,
 )
 from opensquilla.channels.contract import channel_capability_profile
+from opensquilla.channels.system_messages import render_channel_message
 from opensquilla.session.keys import derive_chat_type
 
 log = structlog.get_logger(__name__)
@@ -43,7 +44,7 @@ def _get_queue() -> Any:
     return get_approval_queue()
 
 
-def _approval_summary(params: dict[str, Any]) -> tuple[str, str]:
+def _approval_summary(params: dict[str, Any], *, config: Any = None) -> tuple[str, str]:
     """Return ``(label, value)`` naming what the approval actually gates.
 
     Sandbox approvals carry no ``command``/``toolName`` — their identifying
@@ -54,19 +55,28 @@ def _approval_summary(params: dict[str, Any]) -> tuple[str, str]:
     if kind == "sandbox_network":
         bundle_id = str(params.get("bundle_id") or params.get("bundleId") or "").strip()
         if bundle_id:
-            return "Network", f"packages: {bundle_id}"
+            return (
+                render_channel_message("approval_label_network", config=config),
+                render_channel_message("approval_packages", config=config, bundle_id=bundle_id),
+            )
         host = str(params.get("host") or "").strip()
         if host:
-            return "Network host", host
+            return render_channel_message("approval_label_network_host", config=config), host
     elif kind == "sandbox_path":
         path = str(params.get("path") or "").strip()
         if path:
             access = str(params.get("access") or "").strip()
-            return "Path", f"{path} ({access})" if access else path
+            return (
+                render_channel_message("approval_label_path", config=config),
+                f"{path} ({access})" if access else path,
+            )
     command = str(params.get("command") or "")
     if command:
-        return "Command", command
-    return "Command", str(params.get("toolName") or params.get("action_kind") or "")
+        return render_channel_message("approval_label_command", config=config), command
+    return (
+        render_channel_message("approval_label_command", config=config),
+        str(params.get("toolName") or params.get("action_kind") or ""),
+    )
 
 
 def _offers_always(params: dict[str, Any]) -> bool:
@@ -110,6 +120,7 @@ async def _deliver_channel_prompt(
     *,
     session_manager: Any,
     channel_manager: Any,
+    config: Any = None,
 ) -> None:
     params = info.get("params")
     params = params if isinstance(params, dict) else {}
@@ -161,7 +172,7 @@ async def _deliver_channel_prompt(
         origin_channel_id=str(channel_id or ""),
         origin_thread_id=str(thread_id or ""),
     )
-    summary_label, summary_value = _approval_summary(params)
+    summary_label, summary_value = _approval_summary(params, config=config)
     origin_chat_type = derive_chat_type(session_key)
     origin_is_group: bool | None = None
     if origin_chat_type in {"group", "channel"}:
@@ -183,7 +194,7 @@ async def _deliver_channel_prompt(
         origin_thread_id=str(thread_id or ""),
     )
     profile = channel_capability_profile(adapter)
-    rendered = render_approval_prompt(profile, request)
+    rendered = render_approval_prompt(profile, request, config=config)
 
     from opensquilla.channels.types import OutgoingMessage
 
@@ -217,6 +228,7 @@ def register_approval_channel_notifier(
     session_manager: Any,
     channel_manager_ref: Callable[[], Any],
     schedule: Callable[[Any], Any],
+    config: Any = None,
 ) -> Callable[[], None]:
     """Subscribe a notifier to queue transitions; returns the remove callable.
 
@@ -239,6 +251,7 @@ def register_approval_channel_notifier(
             info,
             session_manager=session_manager,
             channel_manager=channel_manager_ref(),
+            config=config,
         )
         try:
             schedule(coro)

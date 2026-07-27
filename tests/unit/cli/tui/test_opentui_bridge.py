@@ -545,3 +545,77 @@ def test_restore_terminal_writes_reset_sequence_once() -> None:
     assert data == TERMINAL_RESET_SEQUENCE
     assert b"\x1b[?1049l" in data
     assert b"\x1b[?25h" in data
+
+
+@pytest.mark.asyncio
+async def test_start_applies_persisted_theme_to_the_host_env(tmp_path, monkeypatch) -> None:
+    # Binds the call site, not just the helper: a saved /theme preference must
+    # reach the spawned host process as OPENSQUILLA_TUI_THEME.
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.delenv("OPENSQUILLA_TUI_THEME", raising=False)
+    from opensquilla.cli.tui.opentui.prefs import save_theme_preference
+
+    save_theme_preference("nord")
+
+    seen_theme = tmp_path / "seen_theme.txt"
+    host_script = tmp_path / "fake_host.py"
+    host_script.write_text(
+        textwrap.dedent(
+            f"""
+            import json
+            import os
+            import socket
+
+            open({str(seen_theme)!r}, "w").write(
+                os.environ.get("OPENSQUILLA_TUI_THEME", "<unset>")
+            )
+            sock = socket.create_connection((
+                os.environ["OPENSQUILLA_OPENTUI_IPC_HOST"],
+                int(os.environ["OPENSQUILLA_OPENTUI_IPC_PORT"]),
+            ))
+            stream = sock.makefile("rwb", buffering=0)
+            auth = {{
+                "type": "auth",
+                "token": os.environ["OPENSQUILLA_OPENTUI_IPC_TOKEN"],
+                "protocol": int(os.environ["OPENSQUILLA_OPENTUI_PROTOCOL_VERSION"]),
+            }}
+            stream.write((json.dumps(auth) + "\\n").encode())
+            assert json.loads(stream.readline())["type"] == "auth.ok"
+            ready = {{
+                "type": "ready",
+                "protocol": 1,
+                "productVersion": os.environ["OPENSQUILLA_PRODUCT_VERSION"],
+                "hostVersion": os.environ["OPENSQUILLA_OPENTUI_HOST_VERSION"],
+                "platform": os.environ["OPENSQUILLA_OPENTUI_HOST_PLATFORM"],
+                "arch": os.environ["OPENSQUILLA_OPENTUI_HOST_ARCH"],
+                "buildId": os.environ["OPENSQUILLA_OPENTUI_BUILD_ID"],
+                "screenMode": "alternate-screen",
+                "capabilities": [
+                    "jsonl",
+                    "loopback",
+                    "authenticated",
+                    "turn.identity.v2",
+                    "scroll.anchor.v1",
+                    "model.routing.control.v1",
+                ],
+            }}
+            stream.write((json.dumps(ready) + "\\n").encode())
+            for line in stream:
+                if json.loads(line).get("type") == "shutdown":
+                    break
+            """
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(host_runtime_module.shutil, "which", lambda _cmd: None)
+    resolver = HostArtifactResolver(
+        package_dir=tmp_path,
+        main_script=host_script,
+        companion_module=_fake_companion((sys.executable, str(host_script))),
+    )
+    bridge = OpenTuiBridge(package_dir=tmp_path, artifact_resolver=resolver)
+
+    await asyncio.wait_for(bridge.start(), timeout=5.0)
+    await asyncio.wait_for(bridge.close(), timeout=5.0)
+
+    assert seen_theme.read_text() == "nord"

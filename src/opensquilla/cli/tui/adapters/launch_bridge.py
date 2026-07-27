@@ -26,6 +26,14 @@ ChatRunner = Callable[..., Coroutine[Any, Any, None]]
 # Backend id whose host renders its own full-screen UI, so the native launch
 # banner is suppressed to avoid a pre-launch flash. Mirrors OpenTuiRendererBackend.
 _OPENTUI_BACKEND_ID = "opentui"
+# Short human phrases for the once-per-(version, reason) fallback notice.
+# Keys are the stable RendererBackendUnavailableReason values; anything
+# unmapped prints its code, which is stable and doctor-searchable.
+_FALLBACK_NOTICE_PHRASES = {
+    "missing": "no OpenTUI companion in this install",
+    "version_mismatch": "OpenTUI companion version mismatch",
+    "terminal_unsupported": "this terminal is not supported",
+}
 _INTERACTIVE_STRUCTLOG_FILE: Any | None = None
 _INTERACTIVE_STDLIB_LOG_HANDLER: Any | None = None
 _INTERACTIVE_LOG_HANDLER_ATTR = "_opensquilla_interactive_log_handler"
@@ -95,9 +103,25 @@ def _print_tui_fallback_after_clear(
                 )
                 output_console.print("[dim]Continuing in plain mode for this launch.[/dim]")
                 return
-        # Installed packages and unsupported hosts stay quiet: this branch does
-        # not publish a companion, so only a verified source checkout gets an
-        # actionable development hint.
+        # Installed packages and unsupported hosts get one dim line per
+        # (product version, unavailability reason): the downgrade is explained
+        # without becoming a per-launch nag, and `opensquilla doctor` carries
+        # the actionable detail. Prefs IO is best effort — if the record cannot
+        # be written the notice repeats, which degrades loud rather than silent.
+        from opensquilla import __version__  # noqa: PLC0415
+        from opensquilla.cli.tui.opentui.prefs import (  # noqa: PLC0415
+            fallback_notice_due,
+            record_fallback_notice,
+        )
+
+        code = fallback.code.value
+        if fallback_notice_due(__version__, code):
+            phrase = _FALLBACK_NOTICE_PHRASES.get(code, code)
+            output_console.print(
+                f"[dim]Full-screen TUI unavailable ({phrase}); using plain mode. "
+                "Run 'opensquilla doctor' for details.[/dim]"
+            )
+            record_fallback_notice(__version__, code)
         return
 
     output_console.print(

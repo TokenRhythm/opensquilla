@@ -143,9 +143,11 @@ def _field_was_set(model: Any, field_name: str) -> bool:
 def _full_mode_is_explicit(config: Any) -> bool:
     sandbox = getattr(config, "sandbox", None)
     permissions = getattr(config, "permissions", None)
-    if getattr(sandbox, "run_mode", None) is not None:
-        return normalize_run_mode(sandbox.run_mode) is RunMode.FULL
-    if _field_was_set(sandbox, "sandbox") and not bool(sandbox.sandbox):
+    configured_run_mode = getattr(sandbox, "run_mode", None)
+    if configured_run_mode is not None:
+        return normalize_run_mode(configured_run_mode) is RunMode.FULL
+    sandbox_enabled = getattr(sandbox, "sandbox", None)
+    if _field_was_set(sandbox, "sandbox") and not bool(sandbox_enabled):
         return True
     return str(getattr(permissions, "default_mode", "")).strip().lower() == "full"
 

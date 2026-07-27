@@ -161,3 +161,48 @@ test("paste while the picker is open never reaches the composer draft", async ()
   expect(sent.find((m) => m.type === "input.submit")?.text).toBe("X");
   renderer.destroy?.();
 });
+
+test("confirming a picker choice reports theme.selected for CLI-side persistence", async () => {
+  applyTheme("opensquilla-dark", { explicit: true });
+  const sent = [];
+  const { renderer } = await createTestRenderer({ width: 50, height: 20 });
+  const conversationBox = new BoxRenderable(renderer, {
+    id: "conversation", position: "absolute", left: 0, top: 0, right: 0, height: 14,
+  });
+  renderer.root.add(conversationBox);
+  const inputBox = new BoxRenderable(renderer, {
+    id: "input-region", position: "absolute", left: 0, right: 0, bottom: 0, height: 6,
+  });
+  renderer.root.add(inputBox);
+  const overlayLayer = new BoxRenderable(renderer, {
+    id: "overlay-layer", position: "absolute", left: 0, top: 0, right: 0, bottom: 0,
+    zIndex: 1000, shouldFill: false, visible: false,
+  });
+  renderer.root.add(overlayLayer);
+  const composer = createComposer({
+    renderer, BoxRenderable, TextRenderable, conversationBox, inputBox, overlayLayer,
+    footerHeight: 6, sendHostMessage: (m) => sent.push(m),
+  });
+  try {
+    composer.install();
+  } catch {
+    composer.rerender();
+  }
+
+  composer.openThemePicker();
+  renderer.keyInput.emit("keypress", { name: "down" }); // preview the next theme
+  renderer.keyInput.emit("keypress", { name: "return" }); // keep it
+
+  const reported = sent.filter((m) => m.type === "theme.selected");
+  expect(reported.length).toBe(1);
+  // The picker opened on the active theme (index 0) and moved down once, so
+  // the exact next palette must be what gets reported for persistence.
+  expect(reported[0].name).toBe(THEME_NAMES[1]);
+
+  // Escape reverts the live preview — a cancelled picker must persist nothing.
+  composer.openThemePicker();
+  renderer.keyInput.emit("keypress", { name: "down" });
+  renderer.keyInput.emit("keypress", { name: "escape" });
+  expect(sent.filter((m) => m.type === "theme.selected").length).toBe(1);
+  renderer.destroy?.();
+});

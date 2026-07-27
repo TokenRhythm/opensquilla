@@ -21,6 +21,7 @@ from opensquilla.provider import (
     ErrorEvent,
     Message,
     ProviderHeartbeatEvent,
+    ProviderRequestCorrelation,
     TextDeltaEvent,
     ToolDefinition,
     ToolInputSchema,
@@ -1007,8 +1008,25 @@ async def test_ensemble_runs_proposers_concurrently_and_tools_only_reach_aggrega
         shuffle_candidates=False,
     )
 
+    correlation = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="execution-1",
+        call_kind="agent.chat",
+    )
     started = time.monotonic()
-    events = await _collect(provider)
+    events = [
+        event
+        async for event in provider.chat(
+            [Message(role="user", content="answer this")],
+            tools=[_tool()],
+            config=ChatConfig(
+                max_tokens=99,
+                thinking=False,
+                provider_request_correlation=correlation,
+            ),
+        )
+    ]
     elapsed = time.monotonic() - started
 
     assert elapsed < 0.18
@@ -1022,6 +1040,22 @@ async def test_ensemble_runs_proposers_concurrently_and_tools_only_reach_aggrega
     assert registry.calls[0]["config"].tool_choice is None
     assert registry.calls[1]["config"].tool_choice is None
     assert registry.calls[2]["config"].candidate_output_mode == "normal"
+    for call in registry.calls[:2]:
+        derived = call["config"].provider_request_correlation
+        assert derived == ProviderRequestCorrelation(
+            session_id="session-1",
+            turn_id="turn-1",
+            execution_id="execution-1",
+            call_kind="agent.ensemble.proposer",
+        )
+    assert registry.calls[2]["config"].provider_request_correlation == (
+        ProviderRequestCorrelation(
+            session_id="session-1",
+            turn_id="turn-1",
+            execution_id="execution-1",
+            call_kind="agent.ensemble.aggregator",
+        )
+    )
     assert "draft one" in str(registry.calls[2]["messages"][-1].content)
     assert "draft two" in str(registry.calls[2]["messages"][-1].content)
 
@@ -1404,13 +1438,29 @@ async def test_ensemble_fallback_forces_normal_candidate_mode(
         event
         async for event in provider.chat(
             [Message(role="user", content="answer this")],
-            config=ChatConfig(candidate_output_mode="inert_artifact"),
+            config=ChatConfig(
+                candidate_output_mode="inert_artifact",
+                provider_request_correlation=ProviderRequestCorrelation(
+                    session_id="session-1",
+                    turn_id="turn-1",
+                    execution_id="execution-1",
+                    call_kind="subagent.chat",
+                ),
+            ),
         )
     ]
 
     assert any(isinstance(event, DoneEvent) for event in events)
     assert captured["config"] is not None
     assert captured["config"].candidate_output_mode == "normal"
+    assert captured["config"].provider_request_correlation == (
+        ProviderRequestCorrelation(
+            session_id="session-1",
+            turn_id="turn-1",
+            execution_id="execution-1",
+            call_kind="subagent.ensemble.fallback_single",
+        )
+    )
 
 
 @pytest.mark.asyncio
@@ -1689,6 +1739,48 @@ def test_member_request_cap_uses_effective_max_tokens_and_thinking_reserve(
     assert effective.max_tokens == 64_000
     assert effective.thinking is (thinking == "high")
     assert effective.provider_request_max_chars == expected_cap
+
+
+@pytest.mark.parametrize(
+    ("base_kind", "role", "expected_kind"),
+    [
+        (
+            "auxiliary.meta",
+            "aggregator",
+            "auxiliary.meta",
+        ),
+        (
+            "agent.chat.provider_fallback",
+            "proposer",
+            "agent.ensemble.proposer.provider_fallback",
+        ),
+    ],
+)
+def test_member_chat_config_derives_composable_correlation_kind(
+    base_kind: str,
+    role: str,
+    expected_kind: str,
+) -> None:
+    correlation = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="execution-1",
+        call_kind=base_kind,
+    )
+
+    effective = _member_chat_config(
+        ChatConfig(provider_request_correlation=correlation),
+        _member("p1"),
+        role=role,
+    )
+
+    assert effective.provider_request_correlation == ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="execution-1",
+        call_kind=expected_kind,
+    )
+    assert correlation.call_kind == base_kind
 
 
 def test_member_request_cap_does_not_rebind_without_base_chat_config() -> None:

@@ -265,7 +265,7 @@
 
 /* Messages */
 
-/* Pre-reveal router phase. It is visible only before the live work-card owns
+/* Pre-reveal router phase. It is visible only before the live activity owns
    the turn; once execution status is visible, router progress must not remain
    as a second primary progress panel. */
 .router-fx-reserve {
@@ -290,86 +290,6 @@
   padding-top: 0.0625rem;
 }
 
-/* Run-state work card: the live turn is promoted from a thin ribbon into a
-   centered, substantial card that owns the focus while the agent works.
-   `.stream-activity` co-classes the head purely as a run-state marker hook;
-   its layout lives in the work-card rules below. */
-.stream-activity {
-  display: block;
-}
-
-.work-card {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-  /* Fill the message column it lives in: the streaming card and the settled
-     answer keep the exact same left edge, so completion never shifts content
-     sideways. The card look comes from the frame, not a narrower width. */
-  width: 100%;
-  margin: 0.25rem 0 0.75rem;
-  padding: 0.875rem 1rem;
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-sm);
-  animation: workCardEnter var(--dur-base) var(--ease-out) both;
-}
-
-.work-card__head {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  min-height: 1.625rem;
-}
-
-.work-card__dot {
-  width: 0.4375rem;
-  height: 0.4375rem;
-  border-radius: var(--radius-full);
-  background: var(--accent);
-  /* One calm, opacity-only ambient pulse shared across the running view — no
-     scale throb, no per-frame box-shadow repaint. */
-  animation: live-pulse var(--dur-pulse) var(--ease-standard) infinite;
-  flex-shrink: 0;
-}
-
-.work-card__phase {
-  font-size: 0.875rem;
-  line-height: 1.5;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.work-card__elapsed {
-  flex-shrink: 0;
-  font-family: var(--font-mono);
-  font-variant-numeric: tabular-nums;
-  font-size: 0.6875rem;
-  line-height: 1.3;
-  padding: 0.0625rem 0.375rem;
-  border-radius: var(--radius-full);
-  color: var(--text-muted);
-  background: var(--bg-hover);
-}
-
-.work-card__step {
-  flex-shrink: 0;
-  margin-left: auto;
-  font-size: 0.6875rem;
-  line-height: 1.3;
-  padding: 0.0625rem 0.5rem;
-  border-radius: var(--radius-full);
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
-  white-space: nowrap;
-}
-
-.work-card__timeline {
-  margin-top: 0.125rem;
-}
-
 /* The thinking indicator reuses the run-state dot. */
 .stream-activity-dot {
   width: 0.375rem;
@@ -380,17 +300,6 @@
   flex-shrink: 0;
 }
 
-/* Honest staleness note: shown when no gateway signal for a while. */
-.work-card--stale .work-card__dot {
-  background: var(--warn-fill);
-  animation: none;
-  box-shadow: none;
-}
-
-.work-card--stale .work-card__phase {
-  color: var(--warn);
-}
-
 /* The live phase label is calm, legible text — the pulsing dot is the single
    "working" signal, so the label no longer carries a looping text shimmer
    (which read as a loading skeleton and added a second, desynced rhythm). */
@@ -398,57 +307,24 @@
   color: var(--text-muted);
 }
 
-/* Live model reasoning disclosure (collapsed by default) */
-.thinking-fold {
-  margin: 0 0 0.5rem;
-  font-size: 0.8125rem;
+/* Live answer candidate: provisional text that can still migrate back into
+   the activity transcript when a later tool starts. A quiet left rule plus a
+   small uppercase tag mark it as a draft — flat, no background, no motion. */
+.live-answer-candidate-tag {
+  display: block;
+  margin: 0.375rem 0 0.125rem;
+  padding-left: 0.75rem;
+  border-left: 2px solid color-mix(in srgb, var(--accent) 40%, transparent);
   color: var(--text-dim);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
 }
 
-.thinking-fold__summary {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.375rem;
-  padding: 0.125rem 0.25rem;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  list-style: none;
-  color: var(--text-dim);
-  line-height: 1.5;
-}
-
-.thinking-fold__summary::-webkit-details-marker {
-  display: none;
-}
-
-.thinking-fold__summary:hover {
-  color: var(--text-muted);
-}
-
-.thinking-fold__summary:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-ring);
-}
-
-.thinking-fold__chevron {
-  flex-shrink: 0;
-  transition: transform var(--dur-fast) var(--ease-standard);
-}
-
-.thinking-fold[open] > .thinking-fold__summary .thinking-fold__chevron {
-  transform: rotate(90deg);
-}
-
-.thinking-fold__body {
-  margin: 0.25rem 0 0.375rem;
-  padding: 0.375rem 0.75rem;
-  border-left: 2px solid var(--border);
-  color: var(--text-muted);
-  line-height: 1.55;
-  white-space: pre-wrap;
-  word-break: break-word;
-  max-height: 16rem;
-  overflow-y: auto;
+.live-answer-candidate {
+  padding-left: 0.75rem;
+  border-left: 2px solid color-mix(in srgb, var(--accent) 40%, transparent);
 }
 
 /* ── Jump-to-latest pill (floats above the composer when scrolled up) ─── */
@@ -504,18 +380,6 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .thinking-fold__chevron {
-    transition: none;
-  }
-
-  .work-card {
-    animation: none;
-  }
-
-  .work-card__dot {
-    animation: none;
-  }
-
   .stream-caret {
     animation: none;
   }
@@ -537,11 +401,6 @@
 .thinking-elapsed {
   font-size: 0.8125rem;
   line-height: 1.5;
-}
-
-@keyframes workCardEnter {
-  from { opacity: 0; transform: translateY(8px); }
-  to { opacity: 1; transform: translateY(0); }
 }
 
 /* Compaction maintenance card — blue (--info) marks maintenance, never the

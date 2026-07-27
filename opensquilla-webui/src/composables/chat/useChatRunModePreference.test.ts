@@ -4,6 +4,7 @@ import { describe, expect, it, vi, afterEach } from 'vitest'
 import { effectScope, ref } from 'vue'
 
 import {
+  persistMaterializedSessionRunMode,
   RUN_MODE_STORAGE_KEY,
   useChatRunModePreference,
   type RunModePolicy,
@@ -79,5 +80,44 @@ describe('useChatRunModePreference', () => {
     expect(api.runModeUserSelected.value).toBe(false)
     expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBeNull()
     scope.stop()
+  })
+})
+
+describe('persistMaterializedSessionRunMode', () => {
+  it('persists the selected mode for an existing session', async () => {
+    const rpc = {
+      waitForConnection: vi.fn().mockResolvedValue(undefined),
+      call: vi.fn().mockResolvedValue({}),
+    }
+
+    await persistMaterializedSessionRunMode({
+      rpc,
+      sessionKey: 'agent:main:webchat:one',
+      isDraft: false,
+      runMode: 'standard',
+    })
+
+    expect(rpc.waitForConnection).toHaveBeenCalledOnce()
+    expect(rpc.call).toHaveBeenCalledWith('sandbox.run_context.set', {
+      sessionKey: 'agent:main:webchat:one',
+      runMode: 'standard',
+    })
+  })
+
+  it('does not create or mutate a session while the route is still a draft', async () => {
+    const rpc = {
+      waitForConnection: vi.fn().mockResolvedValue(undefined),
+      call: vi.fn().mockResolvedValue({}),
+    }
+
+    await persistMaterializedSessionRunMode({
+      rpc,
+      sessionKey: 'agent:main:webchat:draft',
+      isDraft: true,
+      runMode: 'full',
+    })
+
+    expect(rpc.waitForConnection).not.toHaveBeenCalled()
+    expect(rpc.call).not.toHaveBeenCalled()
   })
 })

@@ -97,7 +97,7 @@ def test_gateway_catalog_projects_curated_order_aliases_and_arguments() -> None:
         item.label for item in commands if item.visible_by_default and not item.deprecated
     ]
 
-    assert default_labels[:11] == [
+    assert default_labels[:12] == [
         "/model",
         "/strategy",
         "/sessions",
@@ -108,6 +108,7 @@ def test_gateway_catalog_projects_curated_order_aliases_and_arguments() -> None:
         "/usage",
         "/theme",
         "/help",
+        "/keys",
         "/exit",
     ]
 

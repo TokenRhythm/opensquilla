@@ -5,6 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from opensquilla.provider.image_generation_policy import (
+    IMAGE_GENERATION_OFFICIAL_BASE_URLS,
+)
+
 FieldType = Literal["text", "password", "select", "bool"]
 
 
@@ -42,14 +46,14 @@ _IMAGE_PROVIDER_DATA: dict[str, dict[str, Any]] = {
     "openai": {
         "label": "OpenAI Images",
         "env_key": "OPENAI_API_KEY",
-        "default_base_url": "https://api.openai.com/v1",
+        "default_base_url": IMAGE_GENERATION_OFFICIAL_BASE_URLS["openai"],
         "default_model": "openai/gpt-image-1",
         "suggested_models": ("openai/gpt-image-1",),
     },
     "openrouter": {
         "label": "OpenRouter Images",
         "env_key": "OPENROUTER_API_KEY",
-        "default_base_url": "https://openrouter.ai/api/v1",
+        "default_base_url": IMAGE_GENERATION_OFFICIAL_BASE_URLS["openrouter"],
         "default_model": "openrouter/google/gemini-3.1-flash-image-preview",
         "suggested_models": ("openrouter/google/gemini-3.1-flash-image-preview",),
     },

@@ -160,6 +160,23 @@ function historicalClarifyInterrupts(segments: RawToolCallPayload[] | undefined)
   return out
 }
 
+function terminatesPriorAssistant(message: ChatMessage, priorAssistant?: ChatMessage): boolean {
+  if (message.role === 'error') return true
+  if (message.role !== 'system') return false
+
+  // Terminal errors are persisted inside the same causal turn scope as the
+  // partial assistant row. Ordinary injected or scheduled system messages do
+  // not share that turn identity. Require the positive causal signal rather
+  // than guessing from localized error text or missing provenance.
+  return message.restoredFromHistory === true
+    && Boolean(message.messageId)
+    && !message.provenanceKind
+    && priorAssistant?.restoredFromHistory === true
+    && Boolean(priorAssistant.messageId)
+    && Boolean(message.turnId)
+    && message.turnId === priorAssistant.turnId
+}
+
 export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions) {
   const renderedMessages = computed((): ChatRenderedMessage[] => {
     const result: ChatRenderedMessage[] = []
@@ -167,6 +184,8 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     let prevRole = ''
     let turnRouterIdx = -1
     let turnIdx = 0
+    let turnIdentity = 'turn-0'
+    let lastAssistantResultIndex = -1
     let turnRequestKind: ChatRouterRequestKind = 'text'
 
     // Index of the last user turn — anything after it belongs to the in-flight
@@ -190,13 +209,36 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
 
       if (msg.role === 'user') {
         turnRouterIdx = -1
+        lastAssistantResultIndex = -1
         turnRequestKind = routerRequestKindFromAttachments(msg.attachments)
         turnIdx++
+        turnIdentity = msg.clientId || msg.messageId || String(msg.ts || `turn-${turnIdx}`)
+      }
+
+      if (lastAssistantResultIndex >= 0) {
+        const priorAssistant = result[lastAssistantResultIndex]
+        const priorAssistantMessage = priorAssistant?.sourceIndex === undefined
+          ? undefined
+          : options.messages.value[priorAssistant.sourceIndex]
+        if (
+          priorAssistant?.displayRole === 'assistant'
+          && terminatesPriorAssistant(msg, priorAssistantMessage)
+        ) {
+          priorAssistant.terminalFailure = true
+        }
       }
 
       const routerDecision = normalizeRouterDecision(msg.routerDecision || (msg.provenanceKind === 'router_decision' ? msg : null))
       if (routerDecision) {
-        const stripItem = renderedRouterStrip(msg, routerDecision, turnIdx, i, undefined, turnRequestKind)
+        const stripItem = renderedRouterStrip(
+          msg,
+          routerDecision,
+          turnIdx,
+          i,
+          undefined,
+          turnRequestKind,
+          turnIdentity,
+        )
         if (stripItem) turnRouterIdx = upsertRouterStrip(result, stripItem, turnRouterIdx)
         prevRole = ''
         continue
@@ -214,6 +256,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
           turnIdx,
           i,
           `${msg.messageId || i}-ensemble-router`,
+          turnIdentity,
         )
         if (stripItem) {
           turnRouterIdx = upsertRouterStrip(result, stripItem, turnRouterIdx, {
@@ -224,7 +267,15 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       } else {
         const usageRouterDecision = routerDecisionFromUsage(msg)
         if (usageRouterDecision) {
-          const stripItem = renderedRouterStrip(msg, usageRouterDecision, turnIdx, i, `${msg.messageId || i}-router`, turnRequestKind)
+          const stripItem = renderedRouterStrip(
+            msg,
+            usageRouterDecision,
+            turnIdx,
+            i,
+            `${msg.messageId || i}-router`,
+            turnRequestKind,
+            turnIdentity,
+          )
           if (stripItem) turnRouterIdx = upsertRouterStrip(result, stripItem, turnRouterIdx)
           prevRole = ''
         }
@@ -250,6 +301,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         ts: msg.ts ?? null,
         showHeader: !sameGroup,
         messageId: msg.messageId,
+        turnKey: `turn:${turnIdentity === 'turn-0' ? ownerKey : turnIdentity}`,
         hasAttachments: !!msg.attachments?.length,
         attachments: msg.attachments,
         toolCalls: normalizeToolCalls(msg.tool_calls),
@@ -289,6 +341,9 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         assertPartsParity(rendered, ownerKey)
       }
       result.push(rendered)
+      if (rendered.displayRole === 'assistant') {
+        lastAssistantResultIndex = result.length - 1
+      }
     }
 
     return result
@@ -301,10 +356,18 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     index: number,
     messageId = msg.messageId,
     requestKind: ChatRouterRequestKind = 'text',
+    turnIdentity = `turn-${turnIdx}`,
   ): ChatRenderedMessage | null {
     if (!options.routerVisualEffectsEnabled.value) return null
     if (isEnsembleRouterDecision(decision, msg.restoredFromHistory === true) || msg.ensemble) {
-      return renderedEnsembleRouterStrip(msg, msg.ensemble, turnIdx, index, messageId)
+      return renderedEnsembleRouterStrip(
+        msg,
+        msg.ensemble,
+        turnIdx,
+        index,
+        messageId,
+        turnIdentity,
+      )
     }
     const cells = routerDecisionCellsForRequest(decision, requestKind)
     if (cells.length <= 1) return null
@@ -319,6 +382,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       showHeader: false,
       sourceIndex: index,
       isRouterStrip: true,
+      routerTurnKey: `router-turn:${turnIdentity}`,
       routerState: routerDecisionState(decision),
       routerSource: decision.source || 'none',
       routerObserve: decision.routing_applied === false,
@@ -338,6 +402,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     turnIdx: number,
     index: number,
     messageId = msg.messageId,
+    turnIdentity = `turn-${turnIdx}`,
   ): ChatRenderedMessage | null {
     if (!options.routerVisualEffectsEnabled.value) return null
     return {
@@ -351,6 +416,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       showHeader: false,
       sourceIndex: index,
       isRouterStrip: true,
+      routerTurnKey: `router-turn:${turnIdentity}`,
       routerState: msg.routerSettled === true ? 'settled' : 'pending',
       routerSource: 'llm_ensemble',
       routerObserve: false,

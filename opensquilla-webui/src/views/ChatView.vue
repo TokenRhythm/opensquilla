@@ -146,8 +146,8 @@
           </template>
         </ChatMessageList>
 
-        <!-- Pre-reveal router phase: shown only before the live work-card owns
-             the turn. Once the work-card is visible, execution status becomes
+        <!-- Pre-reveal router phase: shown only before the live activity owns
+             the turn. Once activity is visible, execution status becomes
              the single primary progress surface. -->
         <RouterFxStrip
           v-if="routerStripReserve"
@@ -174,57 +174,71 @@
           />
         </template>
 
-        <!-- Streaming AI message: the live run is promoted into a centered
-             work card so it owns the focus while the agent works. -->
-        <div v-if="isStreaming && streamBubble && answerRevealOpen" class="msg-ai" data-history-role="assistant" aria-live="polite">
+        <!-- Streaming AI message: activity stays open and flat while the turn
+             is live. The trailing text segment is rendered below it as the
+             current answer candidate; if a later tool starts, that text moves
+             back into the chronological activity transcript. -->
+        <!-- No blanket aria-live here: the phase label inside ActivityDisclosure
+             is the single live announcement point, so streaming DOM churn (tool
+             rows, answer tokens) is not read out mutation-by-mutation. -->
+        <div v-if="isStreaming && streamBubble && answerRevealOpen" class="msg-ai" data-history-role="assistant">
           <div class="msg-ai-main">
-            <section
-              class="work-card"
-              :class="{ 'work-card--stale': streamActivityStale }"
-              role="status"
-              aria-live="polite"
+            <ActivityDisclosure
+              :lifecycle="liveAnswerPart ? 'answering' : 'working'"
+              :step-count="liveActivityStepCount"
+              :failure-count="liveActivityFailureCount"
+              :phase-label="liveActivityPhaseLabel"
+              :elapsed-label="streamPhaseElapsed"
+              :stale="streamActivityStale"
             >
-              <header v-if="streamActivityVisible" class="work-card__head stream-activity">
-                <span class="work-card__dot" aria-hidden="true" />
-                <span class="work-card__phase" :class="{ 'activity-shimmer': !streamActivityStale }">{{ liveWorkCardPhaseLabel }}</span>
-                <span v-if="streamPhaseElapsed" class="work-card__elapsed">{{ streamPhaseElapsed }}</span>
-                <span class="work-card__step">{{ liveWorkCardStepLabel }}</span>
-              </header>
+              <!-- Reasoning remains available as a flat, secondary disclosure,
+                   rendered by the same part component settled turns use so the
+                   chevron affordance and wording stay consistent; `live`
+                   selects the streaming "Thinking · Ns" label. -->
+              <ReasoningPart v-if="liveReasoningPart" :part="liveReasoningPart" live />
 
-              <!-- Live model reasoning: collapsed by default, expandable mid-turn -->
-              <details v-if="liveThinkingText" class="thinking-fold">
-                <summary class="thinking-fold__summary">
-                  <Icon class="thinking-fold__chevron" name="chevronRight" :size="12" />
-                  <span>{{ t('chat.thinking') }} · {{ streamThinkingElapsedText }}</span>
-                </summary>
-                <div class="thinking-fold__body">{{ liveThinkingText }}</div>
-              </details>
-
-              <ToolCallTimeline
-                v-if="liveTimelineItems.length"
-                class="work-card__timeline"
+              <AssistantActivityTimeline
+                v-if="
+                  liveActivityProjection.activityClusters.length
+                  || liveActivityProjection.statusSteps.length
+                "
                 variant="checklist"
+                :projection="liveActivityProjection"
+                :timeline-items="liveActivityTimelineItems"
                 :state-scope="liveToolStateScope"
-                :items="liveTimelineItems"
                 :is-tool-group-open="isToolGroupOpen"
                 :is-tool-item-open="isToolItemOpen"
                 :tool-group-status-text="toolGroupStatusText"
                 :tool-status-text="toolStatusText"
                 :tool-secondary-text="toolSecondaryText"
-                :tool-elapsed-text="streamToolElapsedText"
+                :tool-elapsed-text="liveToolElapsedText"
                 @toggle-group="toggleToolGroup"
                 @toggle-item="toggleToolItem"
                 @show-result="showToolResultModal"
               />
+            </ActivityDisclosure>
 
-              <!-- Live typing caret: a blinking "still generating" affordance at
-                   the tail of the streamed output. Only once real output exists
-                   (never a lone bar under the header), and hidden when stale. -->
-              <span v-if="!streamActivityStale && streamHasVisibleOutput" class="stream-caret" aria-hidden="true" />
-            </section>
+            <!-- Provisional answer candidate: the left rule + draft tag mark
+                 it as not-final, because a later tool start moves this text
+                 back into the activity transcript. The tag sits outside the
+                 candidate box so the candidate's own text stays the answer. -->
+            <template v-if="liveAnswerPart">
+              <span class="live-answer-candidate-tag">{{ t('chat.metaRuns.draft') }}</span>
+              <div class="live-answer-candidate">
+                <TextPart
+                  :part="liveAnswerPart"
+                  :sources="[]"
+                />
+              </div>
+            </template>
+            <span
+              v-if="liveAnswerPart && !streamActivityStale"
+              class="stream-caret"
+              aria-hidden="true"
+            />
 
             <!-- Live inline interrupts (fold-driven): approval / clarify cards
-                 that block the in-flight turn, rendered after the work-card body
+                 that block the in-flight turn, rendered after the activity body
                  and before the deliverables. -->
             <InterruptPart
               v-for="part in liveInterruptParts"
@@ -481,6 +495,13 @@
       @copy="onShareCopy"
       @set-theme="onShareSetTheme"
     />
+
+    <!-- Persistent completion announcer: the live block's role="status" phase
+         label unmounts with the block when streaming ends, so on its own the
+         settle would never reach a screen reader. This region stays mounted
+         across the streaming boundary; it fills when a live turn settles and
+         clears when the next turn starts so repeat turns announce again. -->
+    <span class="chat-turn-settled-announcer" role="status" aria-live="polite">{{ turnSettledAnnouncement }}</span>
   </div>
 </template>
 
@@ -492,6 +513,8 @@ import { useRpcStore } from '@/stores/rpc'
 import { useRpcCall } from '@/composables/useRpc'
 import { useAppStore } from '@/stores/app'
 import ApprovalCard from '@/components/chat/ApprovalCard.vue'
+import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
+import AssistantActivityTimeline from '@/components/chat/AssistantActivityTimeline.vue'
 import ChatArtifactList from '@/components/chat/ChatArtifactList.vue'
 import ChatHeaderActions from '@/components/chat/ChatHeaderActions.vue'
 import DeliverablesDrawer from '@/components/chat/DeliverablesDrawer.vue'
@@ -503,6 +526,8 @@ import ClarifyCard from '@/components/chat/ClarifyCard.vue'
 import ConversationMinimap from '@/components/chat/ConversationMinimap.vue'
 import EmptyStateChips from '@/components/chat/EmptyStateChips.vue'
 import InterruptPart from '@/components/chat/parts/InterruptPart.vue'
+import ReasoningPart from '@/components/chat/parts/ReasoningPart.vue'
+import TextPart from '@/components/chat/parts/TextPart.vue'
 import MetaPreflightCard from '@/components/chat/MetaPreflightCard.vue'
 import MetaRibbon from '@/components/chat/MetaRibbon.vue'
 import MetaRunHistoryDrawer from '@/components/chat/MetaRunHistoryDrawer.vue'
@@ -510,7 +535,6 @@ import PendingQueue from '@/components/chat/PendingQueue.vue'
 import RouterFxStrip from '@/components/chat/RouterFxStrip.vue'
 import SandboxSetupBanner from '@/components/chat/SandboxSetupBanner.vue'
 import SharePreviewModal from '@/components/chat/SharePreviewModal.vue'
-import ToolCallTimeline from '@/components/chat/ToolCallTimeline.vue'
 import ToolResultModal from '@/components/chat/ToolResultModal.vue'
 import Icon from '@/components/Icon.vue'
 import HistoryLoadSentinel from '@/components/HistoryLoadSentinel.vue'
@@ -579,6 +603,8 @@ import type {
   ChatRunStatus,
   ChatRunStatusSource,
   ChatRunStatusState,
+  ChatStreamTimelineItem,
+  ChatToolCall,
   DisplayAttachment,
   ToolResultContext,
 } from '@/types/chat'
@@ -588,7 +614,7 @@ import type {
 } from '@/types/rpc'
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { SandboxRunMode } from '@/types/sandbox'
-import type { InterruptViewState } from '@/types/parts'
+import type { ChatPart, InterruptViewState } from '@/types/parts'
 import { artifactDownloadUrl } from '@/utils/chat/artifacts'
 import { fetchDisplayAttachmentBlob } from '@/utils/chat/attachmentAccess'
 import { createHistoryNavigationScrollLock } from '@/utils/chat/historyNavigationScrollLock'
@@ -607,11 +633,19 @@ import {
   toolStatusText,
 } from '@/utils/chat/toolDisplay'
 import {
+  collectClipboardFiles,
   hasSendableModelInputImageAttachment,
   isSendableAttachment,
+  shouldCaptureFilePaste,
 } from '@/utils/chat/attachments'
 import { isShareableChatMessage } from '@/utils/chat/messageIdentity'
 import { agentIdFromSessionKey } from '@/utils/chat/sessionKeys'
+import { clearAssistantActivityExpansionState } from '@/utils/chat/activityDisclosureState'
+import {
+  isSemanticActivityStatusStep,
+  projectAssistantActivityTimeline,
+  splitLiveAssistantTimeline,
+} from '@/utils/chat/assistantActivity'
 
 /* ── Types ─────────────────────────────────────────────────────────── */
 
@@ -819,11 +853,9 @@ const {
   streamBubble,
   streamHasVisibleOutput,
   streamTimelineItems,
-  streamActivityVisible,
   streamActivityStale,
   streamPhaseLabel,
   streamPhaseElapsed,
-  streamStepLabel,
   streamToolElapsedText,
   streamIdleTimeoutMs,
   thinkingVisible,
@@ -1027,16 +1059,9 @@ const chatRenderedMessages = useChatRenderedMessages({
 })
 const { renderedMessages, routerDecisionCells } = chatRenderedMessages
 
-// The live ensemble strip owns the synthesizing narrative — it reveals members
-// as they run and settles in place — so the work-card runs its normal execution
-// phase alongside it. The two are independent progress surfaces on purpose: the
-// strip answers "which models are synthesizing", the work-card "what step now".
-const liveWorkCardPhaseLabel = streamPhaseLabel
-const liveWorkCardStepLabel = streamStepLabel
-
 function shouldRenderRouterStrip(_message: ChatRenderedMessage): boolean {
   // Always surface the router strip — the live ensemble strip is the primary
-  // surface for the synthesizing process and no longer defers to the work-card.
+  // surface for the synthesizing process and no longer defers to activity.
   return true
 }
 
@@ -1450,21 +1475,96 @@ watchEffect(() => assertLiveParity(streamThinkingText))
 // Flag-selected live render source. In production the fold is authoritative by
 // default; only opensquilla.chat.foldLiveTurn=0 restores legacy. SHADOW and OFF
 // return the IDENTICAL legacy refs, so with the flag off the render is byte-identical.
-// The work-card head (phase/elapsed/step) stays on the legacy activity refs.
+// The activity head (phase/elapsed) stays on the legacy activity refs.
 const liveTimelineItems = computed(() =>
   foldLiveTurnMode.value === true ? foldedTurn.value.timelineItems : streamTimelineItems.value,
 )
+const liveTimelineSplit = computed(() => splitLiveAssistantTimeline(liveTimelineItems.value))
+const liveAnswerPart = computed<Extract<ChatPart, { type: 'text' }> | null>(() => {
+  const candidate = liveTimelineSplit.value.answerItem
+  if (!candidate) return null
+  return {
+    type: 'text',
+    key: `${candidate.key}:answer-candidate`,
+    html: candidate.html,
+    rawText: candidate.rawText || '',
+  }
+})
+const liveActivityTimelineItems = computed<ChatStreamTimelineItem[]>(() =>
+  liveTimelineSplit.value.activityItems,
+)
+const liveActivityStatusHistory = computed(() =>
+  foldLiveTurnMode.value === false ? [] : foldedTurn.value.statusHistory,
+)
+const liveActivityProjection = computed(() =>
+  projectAssistantActivityTimeline(liveActivityTimelineItems.value, {
+    lifecycle: liveAnswerPart.value ? 'answering' : 'working',
+    statusHistory: liveActivityStatusHistory.value,
+  }),
+)
+const liveActivityPhaseLabel = computed(() => {
+  if (streamActivityStale.value) return streamPhaseLabel.value
+  const currentStatus = [...liveActivityProjection.value.statusSteps]
+    .reverse()
+    .find(step => step.isCurrent)
+  if (
+    currentStatus
+    && !currentStatus.label.code.startsWith('chat.activity.lifecycle.')
+    && !liveActivityProjection.value.currentClusterKey
+  ) {
+    return String(t(currentStatus.label.code, currentStatus.label.params))
+  }
+  return String(t(
+    liveAnswerPart.value
+      ? 'chat.activity.lifecycle.answering'
+      : 'chat.activity.lifecycle.working',
+  ))
+})
 const liveToolStateScope = computed(() => JSON.stringify([sessionKey.value || '', 'stream']))
+// Elapsed readouts in the live turn round to whole seconds ("4s"), matching
+// streamPhaseElapsed and streamThinkingElapsedText. The shared tool formatter
+// (streamToolElapsedText, useChatStream.ts) emits tenths, so normalise its
+// output here at the call site instead of changing the shared formatter —
+// except sub-second finished tools, which keep their tenths so they never
+// read as a nonsensical "0s".
+function liveToolElapsedText(call: Pick<ChatToolCall, 'toolId'>): string {
+  return streamToolElapsedText(call).replace(/^([1-9]\d*)\.\d+s$/, '$1s')
+}
 const liveArtifacts = computed(() =>
   foldLiveTurnMode.value === true ? foldedTurn.value.artifacts : streamArtifacts.value,
 )
 const liveThinkingText = computed(() =>
   foldLiveTurnMode.value === true ? foldedTurn.value.thinkingText : streamThinkingText.value,
 )
+// Live reasoning rendered through the shared part component, so the live turn
+// and settled turns use one wording and one disclosure affordance. The seconds
+// derive from the ticking elapsed text, which is always `${seconds}s` live.
+const liveReasoningPart = computed<Extract<ChatPart, { type: 'reasoning' }> | null>(() => {
+  if (!liveThinkingText.value) return null
+  const seconds = Number.parseInt(streamThinkingElapsedText.value, 10)
+  return {
+    type: 'reasoning',
+    key: 'live-reasoning',
+    text: liveThinkingText.value,
+    seconds: Number.isFinite(seconds) ? seconds : 0,
+  }
+})
+// No clamp and no raw status count: the header chip must agree with the
+// visible body, which renders clusters plus only the semantic status steps.
+// A text-only turn therefore counts 0 and the disclosure's stepCount > 0
+// gate hides the chip instead of claiming "step 1" over an empty body.
+const liveActivityStepCount = computed(() =>
+  liveActivityProjection.value.activityClusters.length
+    + liveActivityProjection.value.statusSteps.filter(isSemanticActivityStatusStep).length
+    + (liveThinkingText.value ? 1 : 0),
+)
+const liveActivityFailureCount = computed(() =>
+  liveActivityProjection.value.activityClusters.filter(cluster => cluster.isFailure).length,
+)
 // Inline interrupt parts for the live turn come from the fold whenever it is
 // active (ON or SHADOW — frames are appended in both). Only the foldLiveTurn=0
 // OFF rollback renders the legacy standalone ApprovalCard/ClarifyCard block, so
-// the two never both show. Unlike the work-card body (which has a legacy ref to
+// the two never both show. Unlike the activity body (which has a legacy ref to
 // fall back to in SHADOW), interrupts have no legacy live ref, so SHADOW must
 // also render them from the fold.
 const liveInterruptParts = computed(() =>
@@ -1474,6 +1574,18 @@ const liveInterruptParts = computed(() =>
         (part): part is Extract<typeof part, { type: 'interrupt' }> => part.type === 'interrupt',
       ),
 )
+
+// Feeds the persistent visually-hidden status region in the template. It only
+// fills on the true→false streaming transition (a live turn actually settled),
+// and empties as soon as the next turn starts so that setting the same
+// "Completed" text again is a fresh mutation screen readers re-announce.
+const turnSettledAnnouncement = ref('')
+watch(isStreaming, (streaming, wasStreaming) => {
+  if (streaming) turnSettledAnnouncement.value = ''
+  else if (wasStreaming) {
+    turnSettledAnnouncement.value = String(t('chat.activity.lifecycle.settled'))
+  }
+})
 
 // Soft content-silence watchdog: after the high negotiated threshold, surface
 // a neutral long-running notice. Backend-deadline-owned Ensemble phases remain
@@ -1496,7 +1608,10 @@ const chatRpcSubscriptions = useChatRpcSubscriptions(rpc, {
 })
 
 // Session switches drop the previous session's stall tracking entirely.
-watch(sessionKey, () => stallWatchdog.reset())
+watch(sessionKey, () => {
+  stallWatchdog.reset()
+  clearAssistantActivityExpansionState()
+})
 
 // MetaSkill run UI: preflight checkpoint + run-progress ribbon, driven by the
 // four session.event.meta_* frames (delivered via the '*' wildcard, so this
@@ -1985,14 +2100,14 @@ async function saveShareImage() {
       theme: shareTheme.value,
     })
     if (!result) {
-      pushToast(t('chat.toast.shareExportFailed'), { tone: 'danger' })
+      pushToast(t('chat.toast.shareSaveFailed'), { tone: 'danger' })
       return
     }
     const url = URL.createObjectURL(result.blob)
     sharePreview.value = { url, blob: result.blob, filename: result.filename }
   } catch (err) {
     console.warn('Share image export failed:', err)
-    pushToast(t('chat.toast.shareExportFailed'), { tone: 'danger' })
+    pushToast(t('chat.toast.shareSaveFailed'), { tone: 'danger' })
   } finally {
     shareSaving.value = false
   }
@@ -2031,7 +2146,7 @@ async function onShareSetTheme(next: ShareExportTheme) {
   try {
     const result = await chatShareExport.buildShareImage(selectedShareMessageIds.value, { theme: next })
     if (!result) {
-      pushToast(t('chat.toast.shareExportFailed'), { tone: 'danger' })
+      pushToast(t('chat.toast.sharePreviewUpdateFailed'), { tone: 'danger' })
       return
     }
     const previous = sharePreview.value
@@ -2043,7 +2158,9 @@ async function onShareSetTheme(next: ShareExportTheme) {
     if (previous) URL.revokeObjectURL(previous.url)
   } catch (err) {
     console.warn('Share image re-render failed:', err)
-    pushToast(t('chat.toast.shareExportFailed'), { tone: 'danger' })
+    // Not shareSaveFailed: nothing was being saved here — the theme switch
+    // only re-renders the preview, so the copy must name that action.
+    pushToast(t('chat.toast.sharePreviewUpdateFailed'), { tone: 'danger' })
   } finally {
     shareSaving.value = false
   }
@@ -2170,25 +2287,21 @@ function autoResizeTextarea() {
 /* ── Clipboard paste ───────────────────────────────────────────────── */
 
 function onDocumentPaste(e: ClipboardEvent) {
-  const items = e.clipboardData?.items
-  if (!items) return
-  const files: File[] = []
-  let attachedImage = false
-  for (let i = 0; i < items.length; i++) {
-    if (items[i].type.startsWith('image/')) {
-      const file = items[i].getAsFile()
-      if (file) {
-        files.push(file)
-        attachedImage = true
-      }
-    }
-  }
-  if (files.length > 0) void addAttachments(files)
-  // Screenshot tools put both the image and its local file path on the
-  // clipboard; once we have attached the image, suppress the default paste so
-  // the path text is not also dumped into the composer (and then sent to the
-  // agent). Plain-text pastes with no image fall through unchanged.
-  if (attachedImage) e.preventDefault()
+  // Pastes aimed at another editable surface (clarify/approval inputs, the
+  // command palette) or at an open dialog keep their default behavior — only
+  // composer-bound pastes claim clipboard files, mirroring onDocumentKeydown.
+  if (!shouldCaptureFilePaste(e.target, {
+    composerTextareaFocused: composerRef.value?.isTextareaFocused() ?? false,
+    dialogLayerOpen: hasOpenDialogLayer(),
+  })) return
+  const files = collectClipboardFiles(e.clipboardData)
+  if (files.length === 0) return
+  void addAttachments(files)
+  // File managers and screenshot tools put both the file and its name/path as
+  // text on the clipboard; once we have attached the files, suppress the
+  // default paste so that text is not also dumped into the composer (and then
+  // sent to the agent). Plain-text pastes with no file fall through unchanged.
+  e.preventDefault()
 }
 
 /* ── Document keydown (ESC) ────────────────────────────────────────── */
@@ -2507,7 +2620,7 @@ watch(shareableMessageCount, (count) => {
   if (count === 0 && shareMode.value) endShareMode()
 })
 
-// Router-led turns hold the live answer/work-card reveal back for [MIN,MAX] ms,
+// Router-led turns hold the live answer/activity reveal back for [MIN,MAX] ms,
 // then mount a block of content at once. Re-pin the thread on that reveal so it
 // lands at the bottom instead of below the fold.
 watch(answerRevealOpen, (open) => {
@@ -2516,7 +2629,7 @@ watch(answerRevealOpen, (open) => {
 
 // An approval/clarify interrupt is a user-blocking control, not answer content,
 // so it must not sit behind the router-lead reveal window. With the fold
-// authoritative (default), the gated work-card is the only interrupt surface,
+// authoritative (default), the gated activity is the only interrupt surface,
 // so reveal immediately when a live interrupt part appears — otherwise the card
 // can stay invisible for up to the MAX backstop when no router decision lands.
 watch(() => liveInterruptParts.value.length, (n, prev) => {
@@ -2525,3 +2638,20 @@ watch(() => liveInterruptParts.value.length, (n, prev) => {
 </script>
 
 <style scoped src="../styles/chat-view.css"></style>
+
+<style scoped>
+/* No shared sr-only utility exists in this repo (each component scopes its
+   own), so the completion announcer's clip-out lives here: zero visual
+   footprint, still exposed to assistive tech. */
+.chat-turn-settled-announcer {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+</style>

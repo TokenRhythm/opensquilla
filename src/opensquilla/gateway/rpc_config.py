@@ -554,6 +554,7 @@ _SAFE_WRITE_PATCH_PATHS = frozenset(
         "llm_ensemble.enabled",
         "naming.enabled",
         "privacy.disable_network_observability",
+        "control_ui.default_locale",
         "prompt_cache.mode",
         "squilla_router.enabled",
         "squilla_router.rollout_phase",

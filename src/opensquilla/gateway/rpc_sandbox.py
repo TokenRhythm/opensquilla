@@ -333,11 +333,8 @@ class _AuthoritativeSessionManagerView:
         self._session_manager = session_manager
         self._session_key = session.session_key
         self._session = copy.copy(session)
-        origin = (
-            dict(getattr(session, "origin", None))
-            if isinstance(getattr(session, "origin", None), dict)
-            else {}
-        )
+        raw_origin = getattr(session, "origin", None)
+        origin = dict(raw_origin) if isinstance(raw_origin, dict) else {}
         origin[RUN_CONTEXT_ORIGIN_KEY] = context.to_origin_payload()
         self._session.origin = origin
 

@@ -23,7 +23,12 @@ from opensquilla.engine.usage_accounting import (
     normalize_provider_usage,
     usd_to_nanos,
 )
-from opensquilla.provider import ChatConfig, Message, ModelCapabilities
+from opensquilla.provider import (
+    ChatConfig,
+    Message,
+    ModelCapabilities,
+    ProviderRequestCorrelation,
+)
 from opensquilla.provider import DoneEvent as ProviderDone
 from opensquilla.provider import ErrorEvent as ProviderError
 from opensquilla.provider import TextDeltaEvent as ProviderText
@@ -92,6 +97,21 @@ class _DoneProvider:
             cost_source="provider_billed",
             model="model-a",
         )
+
+
+class _CorrelationCapturingProvider(_DoneProvider):
+    def __init__(self, sink: _RecordingSink) -> None:
+        super().__init__(sink)
+        self.configs: list[ChatConfig | None] = []
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        self.configs.append(config)
+        return super().chat(messages, tools=tools, config=config)
 
 
 class _ErrorProvider:
@@ -163,6 +183,21 @@ class _PhysicalLegProvider(_SequenceProvider):
     def __init__(self, name: str, events: list[Any]) -> None:
         super().__init__([events])
         self.provider_name = name
+
+
+class _CorrelationCapturingPhysicalLegProvider(_PhysicalLegProvider):
+    def __init__(self, name: str, events: list[Any]) -> None:
+        super().__init__(name, events)
+        self.configs: list[ChatConfig | None] = []
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        self.configs.append(config)
+        return super().chat(messages, tools=tools, config=config)
 
 
 class _FallbackSelector:
@@ -385,6 +420,37 @@ async def test_provider_call_is_started_before_chat_and_finalized_once() -> None
     assert result.billed_cost_nanos == 123
     assert result.estimated_cost_nanos == 0
     assert result.cost_source == "provider_billed"
+
+
+@pytest.mark.asyncio
+async def test_provider_request_correlation_reaches_provider_call() -> None:
+    sink = _RecordingSink()
+    provider = _CorrelationCapturingProvider(sink)
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_iterations=1, provider_id="fake", model_id="model-a"),
+        usage_event_sink=sink,
+        usage_execution_context=_context(),
+        provider_request_correlation=ProviderRequestCorrelation(
+            session_id="session-1",
+            turn_id="turn-1",
+            execution_id="execution-1",
+            call_kind="agent.chat",
+        ),
+    )
+
+    async for _ in agent.run_turn("hello"):
+        pass
+
+    assert len(provider.configs) == 1
+    config = provider.configs[0]
+    assert config is not None
+    assert config.provider_request_correlation == ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="execution-1",
+        call_kind="agent.chat",
+    )
 
 
 @pytest.mark.asyncio
@@ -970,7 +1036,7 @@ async def test_direct_meta_llm_helper_records_usage_with_parent_attribution() ->
 @pytest.mark.asyncio
 async def test_selector_fallback_accounts_each_physical_leg_without_outer_duplicate() -> None:
     sink = _RecordingSink()
-    fallback = _PhysicalLegProvider(
+    fallback = _CorrelationCapturingPhysicalLegProvider(
         "anthropic",
         [
             ProviderText(text="fallback"),
@@ -982,7 +1048,7 @@ async def test_selector_fallback_accounts_each_physical_leg_without_outer_duplic
             ),
         ],
     )
-    primary = _PhysicalLegProvider(
+    primary = _CorrelationCapturingPhysicalLegProvider(
         "openai",
         [ProviderError(message="rate limited", code="429")],
     )
@@ -1000,6 +1066,12 @@ async def test_selector_fallback_accounts_each_physical_leg_without_outer_duplic
         session_key="agent:main:test",
         usage_event_sink=sink,
         usage_execution_context=_context(),
+        provider_request_correlation=ProviderRequestCorrelation(
+            session_id="session-1",
+            turn_id="turn-1",
+            execution_id="execution-1",
+            call_kind="agent.chat",
+        ),
     )
 
     async for _ in agent.run_turn("hello"):
@@ -1018,6 +1090,19 @@ async def test_selector_fallback_accounts_each_physical_leg_without_outer_duplic
     assert len(sink.started) == 2  # no Agent-level wrapper envelope
     assert tracker.rows[0][1]["provider"] == "anthropic"
     assert tracker.rows[0][1]["model_id"] == "fallback-model"
+    expected_correlation = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="execution-1",
+        call_kind="agent.chat",
+    )
+    assert primary.configs[0].provider_request_correlation == expected_correlation
+    assert fallback.configs[0].provider_request_correlation == ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="execution-1",
+        call_kind="agent.chat.provider_fallback",
+    )
 
 
 @pytest.mark.asyncio

@@ -271,6 +271,78 @@ async def test_deadline_thinking_off_not_armed_when_margin_not_reached() -> None
     assert provider.calls[0]["config"].thinking is True
 
 
+@pytest.mark.asyncio
+async def test_deadline_thinking_off_writes_runtime_event(tmp_path) -> None:
+    # Delivery gates read runtime_events.jsonl (the turn-call log is a raw
+    # debug stream run harnesses do not collect): arming must leave a
+    # deadline_thinking_off.armed event so the thinking-disabled endgame
+    # calls can be told apart from a treatment delivery failure.
+    runtime_events_path = tmp_path / "runtime_events.jsonl"
+    provider = _SequenceProvider([_echo_tool_call("use-1"), _final_text()])
+    agent = _echo_agent(
+        provider,
+        AgentConfig(
+            thinking=ThinkingLevel.MEDIUM,
+            timeout=30.0,
+            deadline_thinking_off_margin_seconds=60,
+            runtime_events_path=str(runtime_events_path),
+            max_iterations=5,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("fix the bug")]
+
+    assert any(event.kind == "done" for event in events)
+    armed_events = [
+        json.loads(line)
+        for line in runtime_events_path.read_text().splitlines()
+        if line.strip()
+        and json.loads(line).get("name") == "deadline_thinking_off.armed"
+    ]
+    # Arming is sticky and one-shot: exactly one event even though two
+    # provider calls run with thinking off.
+    assert len(armed_events) == 1
+    event = armed_events[0]
+    assert event["feature"] == "deadline_thinking_off"
+    assert event["action"] == "disable_thinking_until_deadline"
+    assert event["reason"] == "deadline_margin"
+    assert event["margin_seconds"] == 60
+    assert 0 <= event["remaining_seconds"] <= 30
+
+
+@pytest.mark.asyncio
+async def test_deadline_thinking_off_unarmed_writes_no_runtime_event(
+    tmp_path,
+) -> None:
+    runtime_events_path = tmp_path / "runtime_events.jsonl"
+    provider = _SequenceProvider([_final_text()])
+    # Large timeout, small margin: the trigger stays far in the future.
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            thinking=ThinkingLevel.MEDIUM,
+            timeout=3600.0,
+            deadline_thinking_off_margin_seconds=60,
+            runtime_events_path=str(runtime_events_path),
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("fix the bug")]
+
+    assert any(event.kind == "done" for event in events)
+    armed_events = []
+    if runtime_events_path.exists():
+        armed_events = [
+            json.loads(line)
+            for line in runtime_events_path.read_text().splitlines()
+            if line.strip()
+            and json.loads(line).get("name") == "deadline_thinking_off.armed"
+        ]
+    assert armed_events == []
+
+
 _REASONING_CHUNK = "x" * 300
 
 

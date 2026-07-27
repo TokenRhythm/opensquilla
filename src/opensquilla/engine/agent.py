@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import stat
 import subprocess
 import time
 import uuid
@@ -22,7 +23,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 
@@ -50,6 +51,7 @@ from opensquilla.engine.finalize_evidence_gate import (
     execution_signals_from_result,
     finalize_evidence_challenge_message,
     finalize_evidence_gate_key,
+    is_repro_script_path,
 )
 from opensquilla.engine.finalize_evidence_gate import (
     WRITE_TOOL_NAMES as _GATE_WRITE_TOOL_NAMES,
@@ -82,6 +84,30 @@ from opensquilla.engine.session_sanitize import (
     project_historical_tool_payloads,
     sanitize_session_messages,
     session_payload_chars,
+)
+from opensquilla.engine.submit_review import (
+    SubmitAction,
+    SubmitReviewState,
+    build_submit_review_message,
+    evaluate_explicit_submit,
+)
+from opensquilla.engine.submit_review import (
+    confirmation_message as submit_review_confirmation_message,
+)
+from opensquilla.engine.submit_review import (
+    diff_is_truncated as submit_review_diff_is_truncated,
+)
+from opensquilla.engine.submit_review import (
+    empty_diff_note as submit_review_empty_diff_note,
+)
+from opensquilla.engine.submit_review import (
+    nudge_message as submit_review_nudge_message,
+)
+from opensquilla.engine.submit_review import (
+    observe_tool_activity as submit_review_observe_tool_activity,
+)
+from opensquilla.engine.submit_review import (
+    should_fire_implicit as submit_review_should_fire_implicit,
 )
 from opensquilla.engine.thinking import drop_reasoning
 from opensquilla.engine.tokenjuice_adapter import reduce_tool_result_with_tokenjuice
@@ -140,6 +166,7 @@ from opensquilla.provider import (
 from opensquilla.provider import (
     ToolUseStartEvent as ProviderToolUseStart,
 )
+from opensquilla.provider.correlation_context import bind_provider_request_correlation
 from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
 from opensquilla.provider.protocol import (
     project_provider_message_count,
@@ -150,6 +177,8 @@ from opensquilla.provider.types import (
     FailureInjector,
     ProviderMessageCountProjection,
     ProviderMessageLimitProof,
+    ProviderRequestCorrelation,
+    derive_provider_request_correlation,
 )
 from opensquilla.provider.types import (
     EnsembleProgressEvent as ProviderEnsembleProgressEvent,
@@ -190,9 +219,12 @@ from opensquilla.session.compaction_lifecycle import (
 )
 from opensquilla.session.terminal_reply import build_terminal_reply
 from opensquilla.tool_boundary import AgentToolHandler as ToolHandler
+from opensquilla.tools.patch_classification import is_instrumentation_only_patch
 from opensquilla.tools.projected_arguments import find_projected_tool_argument
 from opensquilla.tools.registry import ToolRegistry
 from opensquilla.tools.types import ToolContext, current_tool_context
+from opensquilla.tools.write_policy import match_workspace_write_deny
+from opensquilla.tools.write_tracking import classify_workspace_path
 from opensquilla.usage_reasons import (
     normalize_usage_unknown_reason,
     provider_error_usage_reason,
@@ -334,6 +366,84 @@ _CLEAN_PASSED_FAILED_SUMMARY_RE = re.compile(
 _PLAIN_PASSED_SUMMARY_RE = re.compile(r"\b\d+\s+passed\b", re.IGNORECASE)
 _CLEAN_ERROR_COUNT_RE = re.compile(r"\b0\s+error\(s\)(?:\W|$)", re.IGNORECASE)
 _FAILED_FINALIZATION_RECOVERY_LIMIT = 3
+_PATCH_HYGIENE_BLOCK_CHALLENGE_LIMIT = 2
+# Scratch verify-mirror (OPENSQUILLA_SCRATCH_VERIFY_MIRROR): directory name
+# under the scratch dir, and the fail-closed cap on mirror files the hash
+# guard will inspect per execution.
+_VERIFY_MIRROR_DIR_NAME = "verify-mirror"
+_VERIFY_MIRROR_MAX_FILES = 200
+
+
+def _patch_hygiene_block_key(offending_paths: list[str]) -> str:
+    """Dedup key: the same set of offending paths never re-fires."""
+
+    encoded = json.dumps(sorted(offending_paths), ensure_ascii=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
+
+
+def _patch_hygiene_block_message(test_paths: list[str]) -> str:
+    rendered = ", ".join(test_paths[:5])
+    if len(test_paths) > 5:
+        rendered += f" (and {len(test_paths) - 5} more)"
+    return (
+        "[Patch hygiene check]\n"
+        "You are about to finish, but the workspace diff still changes test "
+        f"files: {rendered}. The final change must live in the project source; "
+        "the repository's test suite is managed separately and modifications "
+        "to it do not count as part of the fix. Do not finalize yet. Revert "
+        "the listed test-file changes (restore modified or deleted test files "
+        "to their original content and remove newly added ones) so the diff "
+        "contains only non-test changes. If editing a test was your only "
+        "change, implement the actual fix in the source code instead. Keeping "
+        "a copy of any reproduction script under the scratch directory is "
+        "fine; test directories are not."
+    )
+
+
+def _patch_hygiene_block_protected_message(protected_paths: list[str]) -> str:
+    rendered = ", ".join(protected_paths[:5])
+    if len(protected_paths) > 5:
+        rendered += f" (and {len(protected_paths) - 5} more)"
+    return (
+        "[Patch hygiene check]\n"
+        "You are about to finish, but the workspace diff still changes files "
+        f"that this deployment's write policy protects: {rendered}. Protected "
+        "paths must stay unchanged in the final diff; edits to them do not "
+        "count as part of the fix. Do not finalize yet. Revert the listed "
+        "changes (restore modified or deleted files to their original content "
+        "and remove newly added ones) so the diff no longer touches protected "
+        "paths. If a protected file was the only thing you changed, implement "
+        "the actual fix in unprotected project source instead. Keeping copies "
+        "or new files under the scratch directory is fine."
+    )
+
+
+def _finalize_variant_challenge_message() -> str:
+    """Uniform one-shot variant-sweep challenge (finalize_variant_challenge).
+
+    Same text for every task and every fire: the wording names failure
+    classes in the abstract (alternate spellings of a construct, boundary
+    values, sibling shapes handled by the same logic, and reworks that
+    change contracts callers observe) and never any task-specific content.
+    """
+
+    return (
+        "[Variant sweep check]\n"
+        "Before you finish: enumerate the distinct input or construct classes "
+        "that can reach the code paths you changed (for example alternate "
+        "syntaxes or spellings of the same construct, boundary or edge-case "
+        "values, and sibling types or code shapes handled by the same logic). "
+        "Then run your verification against each class you listed, not only "
+        "the case from the task description. If any class fails, fix your "
+        "change and re-run until green. If this leads you to rework your "
+        "approach, preserve the behavior contracts callers can observe "
+        "unless the task itself asks to change them: the types of raised or "
+        "propagated errors, public signatures and return types, and output "
+        "formats. If every class passes, finish and briefly note which "
+        "classes you checked."
+    )
+
+
 _CODE_CHANGE_TASK_MARKERS: tuple[str, ...] = (
     "bug",
     "fix",
@@ -440,6 +550,13 @@ _meta_invoke_depth: ContextVar[int] = ContextVar("opensquilla_meta_invoke_depth"
 _meta_invoke_turn_count: ContextVar[int] = ContextVar(
     "opensquilla_meta_invoke_turn_count", default=0
 )
+
+
+def _normalize_workspace_relative_path(path: str) -> str:
+    normalized = str(path or "").replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.lstrip("/")
 
 
 def _progress_watchdog_guidance_message(reason: str, details: Mapping[str, Any]) -> str:
@@ -791,6 +908,67 @@ _TOOL_RESULT_HINT_PATTERN = re.compile(
 _TOOL_RESULT_HINT_PATH_PATTERN = re.compile(
     r"(?:[A-Za-z]:)?[./\\]?[A-Za-z0-9_.-]+(?:[/\\][A-Za-z0-9_.-]+)+(?::\d+)?"
 )
+_PROJECTION_SIGNAL_HINTS_ENV = "OPENSQUILLA_PROJECTION_SIGNAL_HINTS"
+_PROJECTION_SIGNAL_PATTERNS_ENV = "OPENSQUILLA_PROJECTION_SIGNAL_PATTERNS"
+_PROJECTION_SIGNAL_HINTS_ON = frozenset({"on", "1", "true", "yes"})
+_PROJECTION_SIGNAL_HINTS_OFF = frozenset({"off", "0", "false", "no"})
+# Default failure-signal pattern for the projection signal scan. Kept separate
+# from _TOOL_RESULT_HINT_PATTERN so the env override below can never perturb
+# search_hints selection. Case-sensitive on purpose: the anchors target the
+# capitalized/tool-emitted forms (FAILED, Traceback, AssertionError, ...).
+_PROJECTION_SIGNAL_DEFAULT_PATTERN = re.compile(
+    r"(?:\bFAILED\b|\bFAIL:|\bError\b|\bException\b|\bTraceback\b"
+    r"|\bAssertionError\b|\berror:|\bwarnings? summary\b"
+    r"|\bpanic(?:ked)?\b|\bfatal\b)"
+)
+_PROJECTION_SIGNAL_PATTERN_CACHE: dict[str, re.Pattern[str]] = {}
+
+
+def _projection_signal_hints_enabled(config_value: bool = False) -> bool:
+    """Resolve the projection signal-scan gate.
+
+    Unset defers to ``config_value`` (the AgentConfig field threaded from the
+    same env by the bootstrap stage; off by default). Recognized on/off values
+    override it; unrecognized values raise instead of being silently ignored
+    so a run manifest cannot record an override the run did not actually
+    apply.
+    """
+    raw = os.environ.get(_PROJECTION_SIGNAL_HINTS_ENV, "").strip().lower()
+    if not raw:
+        return bool(config_value)
+    if raw in _PROJECTION_SIGNAL_HINTS_ON:
+        return True
+    if raw in _PROJECTION_SIGNAL_HINTS_OFF:
+        return False
+    raise ValueError(
+        f"{_PROJECTION_SIGNAL_HINTS_ENV} must be one of: "
+        + ", ".join(sorted(_PROJECTION_SIGNAL_HINTS_ON | _PROJECTION_SIGNAL_HINTS_OFF))
+    )
+
+
+def _projection_signal_pattern() -> re.Pattern[str]:
+    """Return the failure-signal regex, honoring the env override.
+
+    A non-blank ``OPENSQUILLA_PROJECTION_SIGNAL_PATTERNS`` value replaces the
+    default pattern wholesale (write alternations into one regex). Compiled
+    overrides are cached by raw string; invalid regexes raise ValueError per
+    the manifest-honesty convention rather than silently falling back.
+    """
+    raw = os.environ.get(_PROJECTION_SIGNAL_PATTERNS_ENV, "").strip()
+    if not raw:
+        return _PROJECTION_SIGNAL_DEFAULT_PATTERN
+    cached = _PROJECTION_SIGNAL_PATTERN_CACHE.get(raw)
+    if cached is not None:
+        return cached
+    try:
+        compiled = re.compile(raw)
+    except re.error as exc:
+        raise ValueError(
+            f"{_PROJECTION_SIGNAL_PATTERNS_ENV} must be a valid regular "
+            f"expression: {exc}"
+        ) from exc
+    _PROJECTION_SIGNAL_PATTERN_CACHE[raw] = compiled
+    return compiled
 _PROVIDER_CONTEXT_REPAIR_PROMPT = (
     "A previous tool call was rejected because it reused provider-only compacted "
     "tool arguments. Regenerate the complete tool arguments from the available "
@@ -829,6 +1007,30 @@ _MID_BUDGET_NO_DIFF_NUDGE_TEMPLATE = (
 _MID_BUDGET_NO_DIFF_NUDGE_PREFIX = _MID_BUDGET_NO_DIFF_NUDGE_TEMPLATE.split(
     "{percent}", 1
 )[0]
+_REASONING_ONLY_ACT_NOW_DIRECTIVE = (
+    "Your previous response was internal reasoning only, so nothing was "
+    "delivered or executed. Act now: issue the tool call that carries out "
+    "your current best next step, or state your final answer directly. "
+    "Decide with the analysis you already have instead of reasoning further."
+)
+_PLAN_ONLY_ACT_NOW_DIRECTIVE = (
+    "The last several responses only updated the plan without acting on it. "
+    "Planning further will not move the task forward. Act now: issue the "
+    "tool call that carries out the current in-progress step, and update "
+    "the plan again only after real progress."
+)
+# One-shot endgame fix directive (OPENSQUILLA_ENDGAME_FIX_DIRECTIVE_MARGIN_
+# SECONDS). The prefix is distinct from the wrap-up's "Time check: roughly "
+# so the nudge-identity predicates can tell them apart.
+_ENDGAME_FIX_DIRECTIVE_TEMPLATE = (
+    "Time check: about {minutes} minute(s) remain and the workspace contains "
+    "no source fix yet beyond diagnostic instrumentation. Stop investigating "
+    "now. Decide on the most likely root cause from the evidence you already "
+    "have, remove leftover debug output, apply your best-supported fix to "
+    "the source code, and verify it directly. An imperfect fix you can "
+    "defend beats no fix."
+)
+_ENDGAME_FIX_DIRECTIVE_PREFIX = "Time check: about "
 _LARGE_CONTEXT_INVALID_RESPONSE_INPUT_TOKENS = 30_000
 _COMPACTED_TOOL_ARGUMENT_MARKERS = frozenset(
     {
@@ -872,6 +1074,95 @@ def _tool_result_search_hints(content: str) -> str:
     if not lines:
         return ""
     return "search_hints:\n" + "\n".join(lines) + "\n"
+
+
+def _tool_result_signal_scan(
+    content: str,
+    *,
+    handle: str | None,
+    head_chars: int | None = None,
+    tail_chars: int | None = None,
+    preview_lines: frozenset[str] | None = None,
+) -> tuple[str, int, int | None]:
+    """Scan the omitted region of a projected tool result for failure signals.
+
+    Returns ``(rendered_lines, match_count, first_line_number)``. Line numbers
+    are 1-based over the FULL original ``content`` (the same coordinates
+    search_hints renders and retrieve_tool_result's ``L<num>`` query resolves
+    against the byte-identical stored record).
+
+    Omission model: with ``head_chars``/``tail_chars`` the omitted region is
+    the contiguous char span between the preserved head and tail; otherwise a
+    line counts as omitted when its exact text is absent from
+    ``preview_lines`` (the reducer-summarized preview). The membership check
+    is an approximation — a reducer that rewrites a matching line makes it
+    count as omitted even though a variant survives — but the rendered line
+    number still points at a real failure line in the original.
+
+    Returns ``("", 0, None)`` when there is nothing to report or no handle
+    exists to retrieve against.
+    """
+    if handle is None or not content:
+        return "", 0, None
+    pattern = _projection_signal_pattern()
+    omitted_start: int | None = None
+    omitted_end: int | None = None
+    if head_chars is not None:
+        omitted_start = max(0, int(head_chars))
+        omitted_end = len(content) - max(0, int(tail_chars or 0))
+        if omitted_end <= omitted_start:
+            return "", 0, None
+    match_count = 0
+    first_line_number: int | None = None
+    offset = 0
+    for line_number, line in enumerate(content.splitlines(), start=1):
+        line_start = offset
+        offset += len(line) + 1
+        if omitted_start is not None and omitted_end is not None:
+            if line_start + len(line) <= omitted_start or line_start >= omitted_end:
+                continue
+        elif preview_lines is not None and line in preview_lines:
+            continue
+        if not pattern.search(line[:_TOOL_RESULT_HINT_SCAN_MAX_CHARS]):
+            continue
+        match_count += 1
+        if first_line_number is None:
+            first_line_number = line_number
+    if match_count == 0 or first_line_number is None:
+        return "", 0, None
+    rendered = _render_projection_signal_lines(
+        handle=handle,
+        match_count=match_count,
+        first_line_number=first_line_number,
+    )
+    return rendered, match_count, first_line_number
+
+
+def _render_projection_signal_lines(
+    *,
+    handle: str | None,
+    match_count: int,
+    first_line_number: int | None,
+) -> str:
+    """Render the signal_scan notice lines for an already-computed scan.
+
+    Kept separate from the scan so the fresh-result path can scan once with
+    the size-gate probe's placeholder handle and re-render with the real
+    stored handle (both handle forms have identical length, so the probe
+    measures the true envelope size).
+    """
+    if handle is None or match_count <= 0 or first_line_number is None:
+        return ""
+    next_call_arguments = json.dumps(
+        {"handle": handle, "mode": "query", "query": f"L{first_line_number}"},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return (
+        f"signal_scan: {match_count} lines matching failure patterns in the "
+        f"omitted region (first at L{first_line_number})\n"
+        f"signal_next_call: retrieve_tool_result {next_call_arguments}\n"
+    )
 
 
 def _projection_event_argument_value(value: Any, *, key: str) -> Any:
@@ -1412,16 +1703,33 @@ def _is_mid_budget_nudge_message(message: Message) -> bool:
     )
 
 
+def _is_runtime_nudge_message(message: Message) -> bool:
+    """Whether a message is a runtime-injected nudge, not conversation history.
+
+    Covers the mid-budget progress nudge, the plan-only act-now directive,
+    and the endgame fix directive — everything the engine appends after tool
+    results that the post-tool shape predicates must see through.
+    """
+
+    if message.role != "user" or not isinstance(message.content, str):
+        return False
+    return (
+        message.content.startswith(_MID_BUDGET_NO_DIFF_NUDGE_PREFIX)
+        or message.content == _PLAN_ONLY_ACT_NOW_DIRECTIVE
+        or message.content.startswith(_ENDGAME_FIX_DIRECTIVE_PREFIX)
+    )
+
+
 def _tail_has_tool_result_ignoring_nudges(messages: list[Message]) -> bool:
     """Post-tool shape of the turn with runtime-injected nudges removed.
 
-    A mid-budget nudge stacked after watchdog or pending-input messages
-    pushes the tool results out of the plain lookback window; the nudge is
-    not conversation history, so the shape is judged as if it were absent.
+    A nudge stacked after watchdog or pending-input messages pushes the tool
+    results out of the plain lookback window; the nudge is not conversation
+    history, so the shape is judged as if it were absent.
     """
 
     return _tail_has_tool_result(
-        [message for message in messages[-4:] if not _is_mid_budget_nudge_message(message)]
+        [message for message in messages[-4:] if not _is_runtime_nudge_message(message)]
     )
 
 
@@ -1557,12 +1865,13 @@ class _ProviderRetryPolicy:
         max_provider_retries: int,
         *,
         length_capped_continuations: int = 3,
+        reasoning_only_retries: int = 1,
     ) -> _ProviderRetryPolicy:
         length_capped_continuations = max(1, length_capped_continuations)
         return cls(
             max_provider_retries=max_provider_retries,
             attempt_budgets={
-                _ProviderAttemptKind.REASONING_ONLY: 1,
+                _ProviderAttemptKind.REASONING_ONLY: max(1, reasoning_only_retries),
                 _ProviderAttemptKind.MALFORMED_EMPTY: 1,
                 _ProviderAttemptKind.STREAM_INCOMPLETE: 1,
                 _ProviderAttemptKind.LENGTH_CAPPED: length_capped_continuations,
@@ -1827,11 +2136,13 @@ class Agent:
         failure_injector: FailureInjector | None = None,
         usage_event_sink: UsageEventSink | None = None,
         usage_execution_context: UsageExecutionContext | None = None,
+        provider_request_correlation: ProviderRequestCorrelation | None = None,
     ) -> None:
         self.provider = provider
         self.config = config or AgentConfig()
         self.tool_definitions = tool_definitions or []
         self._tool_definition_by_name = {tool.name: tool for tool in self.tool_definitions}
+        self._raw_tool_handler = tool_handler
         self.tool_handler = tool_handler
         self.subagent_manager = subagent_manager or SubagentManager()
         self._usage_tracker = usage_tracker
@@ -1871,6 +2182,7 @@ class Agent:
             )
         if tool_context is not None:
             tool_context = self._apply_configured_tool_result_budget(tool_context)
+            tool_context.validate_path_roots()
         self._tool_context: ToolContext | None = tool_context
         # Test-only offline failure seam. ``None`` on every production path,
         # so the provider chat call below stays byte-identical to before when
@@ -1883,6 +2195,7 @@ class Agent:
         # is skipped and the historical runtime path is unchanged.
         self._usage_event_sink = usage_event_sink
         self._usage_execution_context = usage_execution_context
+        self._provider_request_correlation = provider_request_correlation
         if self.tool_handler is not None and self._tool_context is not None:
             self.tool_handler = self._bind_tool_handler_context(
                 self.tool_handler,
@@ -2062,14 +2375,20 @@ class Agent:
         tool_context: ToolContext,
     ) -> ToolHandler:
         async def _handler(tc: ToolCall) -> ToolResult:
-            active = current_tool_context.get()
-            if active is not None and getattr(active, "on_runtime_event", None) is not None:
-                return await tool_handler(tc)
-            token = current_tool_context.set(tool_context)
-            try:
-                return await tool_handler(tc)
-            finally:
-                current_tool_context.reset(token)
+            with bind_provider_request_correlation(
+                self._provider_request_correlation,
+            ):
+                active = current_tool_context.get()
+                if (
+                    active is not None
+                    and getattr(active, "on_runtime_event", None) is not None
+                ):
+                    return await tool_handler(tc)
+                token = current_tool_context.set(tool_context)
+                try:
+                    return await tool_handler(tc)
+                finally:
+                    current_tool_context.reset(token)
 
         return _handler
 
@@ -2656,6 +2975,46 @@ class Agent:
             event["saved_chars"] = max(0, original_chars - projected_chars)
         append_runtime_event(self.config.runtime_events_path, event)
 
+    def _projection_signal_hints_active(self) -> bool:
+        return _projection_signal_hints_enabled(
+            bool(getattr(self.config, "projection_signal_hints", False))
+        )
+
+    def _record_projection_signal_hint_event(
+        self,
+        *,
+        builder: str,
+        tool_name: str,
+        tool_use_id: str,
+        tool_result_handle: str | None,
+        original_chars: int,
+        signal_match_lines: int,
+        signal_first_line: int | None,
+    ) -> None:
+        self.config.metadata["tool_projection_signal_hints"] = (
+            self.config.metadata.get("tool_projection_signal_hints", 0) + 1
+        )
+        append_runtime_event(
+            self.config.runtime_events_path,
+            {
+                "feature": "tool_result_projection",
+                "name": "projection_signal_hints",
+                "action": "hint_appended",
+                "mechanism": "signal_scan",
+                "mode": "log",
+                "session_key": self._session_key,
+                "agent_id": self.config.tool_result_store_agent_id
+                or self.config.metadata.get("agent_id"),
+                "tool_name": tool_name,
+                "tool_use_id": tool_use_id,
+                "tool_result_handle": tool_result_handle,
+                "original_chars": original_chars,
+                "signal_match_lines": signal_match_lines,
+                "signal_first_line": signal_first_line,
+                "builder": builder,
+            },
+        )
+
     @staticmethod
     def _count_image_blocks(messages: list[Message]) -> int:
         count = 0
@@ -2906,6 +3265,24 @@ class Agent:
             handle_line = f"tool_result_handle: {stored.handle}\n" if stored is not None else ""
             retrieve_hint = _TOOL_RESULT_RETRIEVE_HINT if stored is not None else ""
             search_hints = _tool_result_search_hints(content) if stored is not None else ""
+            signal_lines = ""
+            if stored is not None and self._projection_signal_hints_active():
+                signal_lines, signal_matches, signal_first_line = _tool_result_signal_scan(
+                    content,
+                    handle=stored.handle,
+                    head_chars=len(head),
+                    tail_chars=len(tail),
+                )
+                if signal_lines:
+                    self._record_projection_signal_hint_event(
+                        builder="aggregate",
+                        tool_name=tool_name_by_use_id.get(block.tool_use_id, "tool"),
+                        tool_use_id=block.tool_use_id,
+                        tool_result_handle=stored.handle,
+                        original_chars=len(content),
+                        signal_match_lines=signal_matches,
+                        signal_first_line=signal_first_line,
+                    )
             compacted = (
                 "[aggregate_tool_result_compacted]\n"
                 f"tool_use_id: {block.tool_use_id}\n"
@@ -2915,6 +3292,7 @@ class Agent:
                 f"{handle_line}"
                 f"{retrieve_hint}"
                 f"{search_hints}"
+                f"{signal_lines}"
                 f"omitted_chars: {omitted}\n"
                 f"preview_complete: {str(omitted == 0).lower()}\n"
                 "reason: older non-error tool result compacted for provider context budget.\n"
@@ -3255,6 +3633,24 @@ class Agent:
             head = content[:head_chars]
             tail = content[-tail_chars:] if tail_chars else ""
         omitted = max(0, len(content) - len(head) - len(tail))
+        signal_lines = ""
+        if stored is not None and self._projection_signal_hints_active():
+            signal_lines, signal_matches, signal_first_line = _tool_result_signal_scan(
+                content,
+                handle=stored.handle,
+                head_chars=len(head),
+                tail_chars=len(tail),
+            )
+            if signal_lines:
+                self._record_projection_signal_hint_event(
+                    builder="provider_single",
+                    tool_name=tool_name,
+                    tool_use_id=tool_use_id,
+                    tool_result_handle=stored.handle,
+                    original_chars=len(content),
+                    signal_match_lines=signal_matches,
+                    signal_first_line=signal_first_line,
+                )
         projection = (
             "[tool_result_projection]\n"
             f"tool: {tool_name}\n"
@@ -3264,6 +3660,7 @@ class Agent:
             f"{handle_line}"
             f"{retrieve_hint}"
             f"{search_hints}"
+            f"{signal_lines}"
             f"omitted_chars: {omitted}\n"
             f"preview_complete: {str(omitted == 0).lower()}\n"
             f"reason: {reason}.\n"
@@ -3441,12 +3838,13 @@ class Agent:
         self._tool_result_snapshot_cache[cache_key] = record
         return record
 
-    @staticmethod
     def _tool_result_projection_payload(
+        self,
         stored: ToolResultRecord,
         *,
         raw_content: str,
         projected_content: str,
+        signal_lines: str = "",
     ) -> str:
         return (
             "[tool_result_projection]\n"
@@ -3456,6 +3854,7 @@ class Agent:
             "preview_complete: false\n"
             f"{_TOOL_RESULT_RETRIEVE_HINT}"
             f"{_tool_result_search_hints(raw_content)}"
+            f"{signal_lines}"
             f"{projected_content}"
         )
 
@@ -3504,10 +3903,20 @@ class Agent:
         raw_content: str,
         arguments: dict[str, Any] | None = None,
     ) -> ToolResult:
+        signal_lines = ""
+        signal_matches = 0
+        signal_first_line: int | None = None
+        if self._projection_signal_hints_active():
+            signal_lines, signal_matches, signal_first_line = _tool_result_signal_scan(
+                raw_content,
+                handle=stored.handle,
+                preview_lines=frozenset(guarded_result.content.splitlines()),
+            )
         projected_content = self._tool_result_projection_payload(
             stored,
             raw_content=raw_content,
             projected_content=guarded_result.content,
+            signal_lines=signal_lines,
         )
         if len(projected_content) >= len(raw_content):
             return self._tool_result_projection_store_unavailable_noop(
@@ -3516,6 +3925,16 @@ class Agent:
                 arguments=arguments,
                 projected_chars=len(projected_content),
                 json_guard_applied=True,
+            )
+        if signal_lines:
+            self._record_projection_signal_hint_event(
+                builder="json_guard",
+                tool_name=guarded_result.tool_name,
+                tool_use_id=guarded_result.tool_use_id,
+                tool_result_handle=stored.handle,
+                original_chars=len(raw_content),
+                signal_match_lines=signal_matches,
+                signal_first_line=signal_first_line,
             )
 
         tokens_before = get_approx_tokens(raw_content)
@@ -3775,8 +4194,24 @@ class Agent:
 
         stored: ToolResultRecord | None = None
         stored_handle: str | None = None
+        signal_matches = 0
+        signal_first_line: int | None = None
         if self.config.tool_result_store_dir:
             placeholder_handle = "tr-" + ("0" * 32)
+            # Scan once here and re-render with the real handle after the
+            # store write: placeholder and stored handles have identical
+            # length, so the probe below measures the true envelope size.
+            probe_signal_lines = ""
+            if self._projection_signal_hints_active():
+                (
+                    probe_signal_lines,
+                    signal_matches,
+                    signal_first_line,
+                ) = _tool_result_signal_scan(
+                    raw_snapshot_content,
+                    handle=placeholder_handle,
+                    preview_lines=frozenset(projected_content.splitlines()),
+                )
             candidate_with_envelope = (
                 "[tool_result_projection]\n"
                 f"tool_result_handle: {placeholder_handle}\n"
@@ -3784,6 +4219,7 @@ class Agent:
                 f"original_chars: {len(raw_snapshot_content)}\n"
                 f"{_TOOL_RESULT_RETRIEVE_HINT}"
                 f"{_tool_result_search_hints(raw_snapshot_content)}"
+                f"{probe_signal_lines}"
                 f"{projected_content}"
             )
             if len(candidate_with_envelope) >= len(raw_snapshot_content):
@@ -3832,11 +4268,18 @@ class Agent:
                     reducer=reduction.reducer,
                     json_guard_applied=json_guard_applied,
                 )
+        signal_lines = ""
         if stored is not None:
+            signal_lines = _render_projection_signal_lines(
+                handle=stored.handle,
+                match_count=signal_matches,
+                first_line_number=signal_first_line,
+            )
             projected_content = self._tool_result_projection_payload(
                 stored,
                 raw_content=raw_snapshot_content,
                 projected_content=projected_content,
+                signal_lines=signal_lines,
             )
 
         if len(projected_content) >= len(raw_snapshot_content):
@@ -3865,6 +4308,17 @@ class Agent:
                 json_guard_applied=json_guard_applied,
             )
             return original_result
+
+        if signal_lines and stored is not None:
+            self._record_projection_signal_hint_event(
+                builder="fresh",
+                tool_name=result.tool_name,
+                tool_use_id=result.tool_use_id,
+                tool_result_handle=stored.handle,
+                original_chars=len(raw_snapshot_content),
+                signal_match_lines=signal_matches,
+                signal_first_line=signal_first_line,
+            )
 
         tokens_before = get_approx_tokens(raw_snapshot_content)
         tokens_after = get_approx_tokens(projected_content)
@@ -4550,6 +5004,7 @@ class Agent:
         max_iterations_finalization_attempted = False
         max_iterations_finalization_pending = False
         max_iterations_finalization_message: Message | None = None
+        max_iterations_deadline_extension_logged = False
         post_write_convergence_finalization_pending = False
         post_write_convergence_finalization_message: Message | None = None
         placeholder_offense_iterations = 0
@@ -4557,6 +5012,9 @@ class Agent:
         deadline_wrapup_message: Message | None = None
         deadline_thinking_off_armed = False
         endgame_git_freeze_armed = False
+        endgame_fix_directive_fired = False
+        plan_only_iteration_streak = 0
+        reasoning_only_act_now_message: Message | None = None
         mid_budget_nudge_fired_fractions: set[float] = set()
         workspace_diff_recovery_attempted = False
         failed_tool_finalization_recovery_keys: set[str] = set()
@@ -4579,12 +5037,43 @@ class Agent:
         post_write_focused_verification_observed = False
         post_write_focused_verification_success_observed = False
         last_post_write_failed_verification: dict[str, Any] | None = None
+        finalize_evidence_strict = bool(
+            getattr(self.config, "finalize_evidence_strict", False)
+        )
         finalize_evidence_tracker = (
-            FinalizeEvidenceTracker()
-            if bool(getattr(self.config, "finalize_evidence_gate_enabled", False))
+            FinalizeEvidenceTracker(strict=finalize_evidence_strict)
+            if (
+                bool(getattr(self.config, "finalize_evidence_gate_enabled", False))
+                or finalize_evidence_strict
+            )
             else None
         )
         finalize_evidence_gate_keys: set[str] = set()
+        submit_review_enabled = bool(
+            getattr(self.config, "submit_review_enabled", False)
+        )
+        submit_review_state = SubmitReviewState()
+        submit_review_diff_max_chars = int(
+            getattr(self.config, "submit_review_diff_max_chars", 20000)
+        )
+        patch_hygiene_block_mode = str(
+            getattr(self.config, "patch_hygiene_block_mode", "off") or "off"
+        )
+        patch_hygiene_block_keys: set[str] = set()
+        scratch_verify_mirror_enabled = bool(
+            getattr(self.config, "scratch_verify_mirror", False)
+        )
+        if self._tool_context is not None:
+            # Rides the ToolContext in place (endgame_git_freeze precedent):
+            # deny messages append the verify-mirror guidance only while on,
+            # and the flag is reset each turn because the context outlives it.
+            self._tool_context.scratch_verify_mirror_active = (
+                scratch_verify_mirror_enabled
+            )
+        finalize_variant_challenge_enabled = bool(
+            getattr(self.config, "finalize_variant_challenge", False)
+        )
+        finalize_variant_challenge_fired = False
         recent_failure_anchor_summaries: list[str] = []
         progress_watchdog_mode = getattr(self.config, "progress_watchdog_mode", "log")
         progress_watchdog = ProgressWatchdog(
@@ -4691,6 +5180,9 @@ class Agent:
         )
         if endgame_git_freeze_margin_seconds > 0 and self._tool_context is not None:
             self._tool_context.endgame_git_freeze_active = False
+            self._tool_context.endgame_git_freeze_instrumentation_exempt = bool(
+                getattr(self.config, "endgame_git_freeze_instrumentation_exempt", False)
+            )
 
         def _arm_endgame_git_freeze_if_due() -> None:
             nonlocal endgame_git_freeze_armed
@@ -4713,6 +5205,62 @@ class Agent:
                 remaining_seconds=int(max(0.0, _total_deadline - _loop.time())),
                 margin_seconds=endgame_git_freeze_margin_seconds,
             )
+
+        def _defer_max_iterations_cap() -> bool:
+            """Whether the iteration cap yields to remaining wall-clock time.
+
+            True keeps the loop running normal iterations past the cap while
+            more than the extension margin remains before the total deadline;
+            the cap re-applies once the margin is reached. A finalization
+            attempt that already happened is never reopened.
+            """
+            nonlocal max_iterations_deadline_extension_logged
+            extend_seconds = max(
+                0,
+                int(
+                    getattr(self.config, "max_iterations_deadline_extend_seconds", 0)
+                    or 0
+                ),
+            )
+            if (
+                extend_seconds <= 0
+                or _total_deadline is None
+                or max_iterations_finalization_attempted
+                or _loop.time() >= _total_deadline - extend_seconds
+            ):
+                return False
+            if not max_iterations_deadline_extension_logged:
+                max_iterations_deadline_extension_logged = True
+                remaining_seconds = int(max(0.0, _total_deadline - _loop.time()))
+                self._write_turn_call_log(
+                    "turn_policy_decision",
+                    action="max_iterations_deadline_extension",
+                    reason="deadline_headroom",
+                    code="max_iterations_deadline_extension",
+                    iteration=iterations,
+                    max_iterations=self.config.max_iterations,
+                    remaining_seconds=remaining_seconds,
+                    extend_margin_seconds=extend_seconds,
+                )
+                append_runtime_event(
+                    self.config.runtime_events_path,
+                    {
+                        "feature": "max_iterations_deadline_extension",
+                        "name": "max_iterations_deadline_extension.active",
+                        "action": "defer_finalization",
+                        "reason": "deadline_headroom",
+                        "iteration": iterations,
+                        "max_iterations": self.config.max_iterations,
+                        "remaining_seconds": remaining_seconds,
+                        "extend_margin_seconds": extend_seconds,
+                        "session_key": self._session_key,
+                        "agent_id": (
+                            self.config.tool_result_store_agent_id
+                            or self.config.metadata.get("agent_id")
+                        ),
+                    },
+                )
+            return True
 
         tools_supported = True
         if self.config.model_capabilities is not None:
@@ -4843,7 +5391,11 @@ class Agent:
 
         try:
             while True:
-                if self.config.max_iterations > 0 and iterations >= self.config.max_iterations:
+                if (
+                    self.config.max_iterations > 0
+                    and iterations >= self.config.max_iterations
+                    and not _defer_max_iterations_cap()
+                ):
                     max_iterations_source = str(
                         self.config.metadata.get("agent_max_iterations_source", "agent_config")
                     )
@@ -4977,6 +5529,31 @@ class Agent:
                         ),
                         margin_seconds=thinking_off_margin_seconds,
                     )
+                    # The turn-call log is a raw debug stream that run
+                    # harnesses do not collect; the runtime event is what
+                    # lets delivery gates tell this designed endgame
+                    # thinking cutoff (every later call runs
+                    # thinking-disabled) apart from a treatment delivery
+                    # failure.
+                    append_runtime_event(
+                        self.config.runtime_events_path,
+                        {
+                            "feature": "deadline_thinking_off",
+                            "name": "deadline_thinking_off.armed",
+                            "action": "disable_thinking_until_deadline",
+                            "reason": "deadline_margin",
+                            "iteration": iterations,
+                            "remaining_seconds": int(
+                                max(0.0, _total_deadline - _loop.time())
+                            ),
+                            "margin_seconds": thinking_off_margin_seconds,
+                            "session_key": self._session_key,
+                            "agent_id": (
+                                self.config.tool_result_store_agent_id
+                                or self.config.metadata.get("agent_id")
+                            ),
+                        },
+                    )
 
                 # Endgame git freeze arming; re-checked before tool execution
                 # because a long provider stream can cross the margin
@@ -4984,6 +5561,9 @@ class Agent:
                 _arm_endgame_git_freeze_if_due()
 
                 iterations += 1
+                # The act-now message answers one reasoning-only failure; a
+                # fresh iteration starts from a clean request.
+                reasoning_only_act_now_message = None
 
                 # ------ THINKING → STREAMING ------
                 yield self._transition(AgentState.STREAMING)
@@ -5007,6 +5587,14 @@ class Agent:
                 _retry_policy = _ProviderRetryPolicy.from_provider_budget(
                     _fallback.max_retries,
                     length_capped_continuations=self.config.length_capped_continuations,
+                    # The act-now lever injects a directive on the first
+                    # reasoning-only retry; the second budgeted retry gives the
+                    # directive one delivery attempt of its own.
+                    reasoning_only_retries=(
+                        2
+                        if bool(getattr(self.config, "reasoning_only_act_now", False))
+                        else 1
+                    ),
                 )
                 _attempt_retries_used = _retry_policy.used_attempts()
                 _invalid_response_fallback_done = False
@@ -5090,6 +5678,15 @@ class Agent:
                         and max_iterations_finalization_message is not None
                     ):
                         request_suffix_messages = [max_iterations_finalization_message]
+                    elif reasoning_only_act_now_message is not None and (
+                        not turn_messages or turn_messages[-1].role != "assistant"
+                    ):
+                        # Act-now beats the wrap-up directive for this retry:
+                        # it answers the reasoning-only failure that just
+                        # happened, and the wrap-up splice resumes on the next
+                        # request. Withheld on an assistant tail for the same
+                        # reasoning-prefill reason as below.
+                        request_suffix_messages = [reasoning_only_act_now_message]
                     elif deadline_wrapup_message is not None and (
                         not turn_messages or turn_messages[-1].role != "assistant"
                     ):
@@ -5252,6 +5849,14 @@ class Agent:
                     if deadline_thinking_off_armed:
                         call_chat_cfg = _chat_config_with_thinking_disabled(call_chat_cfg)
                         _attempt_thinking_disabled = True
+                    if self._provider_request_correlation is not None:
+                        call_chat_cfg = call_chat_cfg.model_copy(
+                            update={
+                                "provider_request_correlation": (
+                                    self._provider_request_correlation
+                                )
+                            }
+                        )
 
                     self._write_turn_call_log(
                         "llm_request",
@@ -5406,6 +6011,55 @@ class Agent:
                                         ),
                                     )
                                     deadline_wrapup_armed = True
+                                    # The retry runs thinking-disabled: the
+                                    # margin exists to spend the last stretch
+                                    # answering, and a thinking-on retry can
+                                    # burn the entire remainder on another
+                                    # reasoning mega-stream that the hard
+                                    # deadline then kills with nothing
+                                    # delivered.
+                                    _disable_thinking_for_next_provider_call = True
+                                    if bool(
+                                        getattr(
+                                            self.config,
+                                            "deadline_wrapup_sticky_thinking_off",
+                                            False,
+                                        )
+                                    ):
+                                        # Sticky variant: the one-shot above
+                                        # covers only the retry; the next
+                                        # iteration re-enables thinking and can
+                                        # spend the rest of the margin on
+                                        # another mega-stream. Arming the
+                                        # deadline cutoff keeps every remaining
+                                        # call thinking-disabled.
+                                        deadline_thinking_off_armed = True
+                                        append_runtime_event(
+                                            self.config.runtime_events_path,
+                                            {
+                                                "feature": "deadline_wrapup",
+                                                "name": (
+                                                    "deadline_wrapup"
+                                                    ".sticky_thinking_off"
+                                                ),
+                                                "action": (
+                                                    "disable_thinking"
+                                                    "_until_deadline"
+                                                ),
+                                                "reason": (
+                                                    "reasoning_stream_preempt"
+                                                ),
+                                                "iteration": iterations,
+                                                "attempt": _call_attempt,
+                                                "session_key": self._session_key,
+                                                "agent_id": (
+                                                    self.config.tool_result_store_agent_id
+                                                    or self.config.metadata.get(
+                                                        "agent_id"
+                                                    )
+                                                ),
+                                            },
+                                        )
                                     self._write_turn_call_log(
                                         "turn_policy_decision",
                                         action="deadline_wrapup",
@@ -6102,25 +6756,48 @@ class Agent:
                     post_tool_turn = _tail_has_tool_result(request_messages)
                     if (
                         not post_tool_turn
-                        and deadline_wrapup_message is not None
                         and request_turn_messages
-                        and request_turn_messages[-1] is deadline_wrapup_message
+                        and (
+                            (
+                                deadline_wrapup_message is not None
+                                and request_turn_messages[-1] is deadline_wrapup_message
+                            )
+                            or (
+                                reasoning_only_act_now_message is not None
+                                and request_turn_messages[-1]
+                                is reasoning_only_act_now_message
+                            )
+                        )
                     ):
-                        # The spliced wrap-up directive is not conversation
-                        # history; empty-response recovery must still see the
-                        # post-tool shape of the underlying turn. A mid-budget
-                        # nudge stacked after the tool results is likewise
-                        # runtime-injected and must not hide that shape.
+                        # The spliced wrap-up or act-now directive is not
+                        # conversation history; empty-response recovery must
+                        # still see the post-tool shape of the underlying
+                        # turn. A nudge stacked after the tool results is
+                        # likewise runtime-injected and must not hide that
+                        # shape.
                         tail_index = len(turn_messages) - 1
-                        while tail_index >= 0 and _is_mid_budget_nudge_message(
+                        while tail_index >= 0 and _is_runtime_nudge_message(
                             turn_messages[tail_index]
                         ):
                             tail_index -= 1
                         post_tool_turn = tail_index >= 0 and _message_has_tool_result(
                             turn_messages[tail_index]
                         )
-                    if not post_tool_turn and bool(
-                        getattr(self.config, "mid_budget_no_diff_nudge", False)
+                    if not post_tool_turn and (
+                        bool(getattr(self.config, "mid_budget_no_diff_nudge", False))
+                        or int(
+                            getattr(self.config, "plan_only_act_now_threshold", 0) or 0
+                        )
+                        > 0
+                        or int(
+                            getattr(
+                                self.config,
+                                "endgame_fix_directive_margin_seconds",
+                                0,
+                            )
+                            or 0
+                        )
+                        > 0
                     ):
                         # A nudge stacked after watchdog or recovery guidance
                         # pushes the tool results out of the lookback window,
@@ -6473,6 +7150,42 @@ class Agent:
                             )
                         ):
                             _attempt_retries_used[_ProviderAttemptKind.REASONING_ONLY] += 1
+                            if (
+                                bool(
+                                    getattr(
+                                        self.config, "reasoning_only_act_now", False
+                                    )
+                                )
+                                and reasoning_only_act_now_message is None
+                            ):
+                                # Today's bare retry re-sends the identical
+                                # request; the model that just answered it with
+                                # reasoning only usually does so again. Splice
+                                # in an explicit act-now instruction so the
+                                # retry differs where it matters.
+                                reasoning_only_act_now_message = Message(
+                                    role="user",
+                                    content=_REASONING_ONLY_ACT_NOW_DIRECTIVE,
+                                )
+                                append_runtime_event(
+                                    self.config.runtime_events_path,
+                                    {
+                                        "feature": "reasoning_only_act_now",
+                                        "name": "reasoning_only_act_now.injected",
+                                        "action": "retry_with_act_now_directive",
+                                        "reason": "provider_reasoning_only",
+                                        "iteration": iterations,
+                                        "attempt": _call_attempt,
+                                        "reasoning_chars": len(
+                                            iter_reasoning_content or ""
+                                        ),
+                                        "session_key": self._session_key,
+                                        "agent_id": (
+                                            self.config.tool_result_store_agent_id
+                                            or self.config.metadata.get("agent_id")
+                                        ),
+                                    },
+                                )
                             if getattr(
                                 self.config, "reasoning_only_thinking_fallback", False
                             ):
@@ -7702,6 +8415,7 @@ class Agent:
                                 ),
                             )
                             continue
+                    submit_review_red_detected = False
                     if (
                         finalize_evidence_tracker is not None
                         and not max_iterations_finalization_pending
@@ -7713,6 +8427,7 @@ class Agent:
                             has_workspace_diff=bool(gate_status and gate_status.strip()),
                         )
                         if gate_observation.should_challenge:
+                            submit_review_red_detected = True
                             gate_key = finalize_evidence_gate_key(gate_observation)
                             # Never spend the run's last LLM call or deadline
                             # slack on a challenge: with no headroom for a
@@ -7785,6 +8500,200 @@ class Agent:
                                 )
                                 continue
                     if (
+                        patch_hygiene_block_mode in ("test_paths", "protected_paths")
+                        and not max_iterations_finalization_pending
+                        and not artifact_delivery_final_response_pending
+                        and not post_write_convergence_finalization_pending
+                    ):
+                        hygiene_status = await self._workspace_git_status_porcelain()
+                        if patch_hygiene_block_mode == "protected_paths":
+                            hygiene_offending_paths = (
+                                self._porcelain_status_protected_paths(hygiene_status)
+                            )
+                            hygiene_reason = "protected_paths_in_final_diff"
+                        else:
+                            hygiene_offending_paths = self._porcelain_status_test_paths(
+                                hygiene_status
+                            )
+                            hygiene_reason = "test_paths_in_final_diff"
+                        if hygiene_offending_paths:
+                            hygiene_key = _patch_hygiene_block_key(
+                                hygiene_offending_paths
+                            )
+                            # Same headroom rule as the evidence gate: never
+                            # spend the run's last LLM call or deadline slack
+                            # on a challenge.
+                            hygiene_headroom = _turn_llm_call_budget_error(
+                                turn_llm_calls + 1
+                            ) is None and (
+                                _total_deadline is None or _loop.time() < _total_deadline
+                            )
+                            hygiene_suppressed = (
+                                hygiene_key in patch_hygiene_block_keys
+                                or len(patch_hygiene_block_keys)
+                                >= _PATCH_HYGIENE_BLOCK_CHALLENGE_LIMIT
+                                or not hygiene_headroom
+                            )
+                            self.config.metadata["patch_hygiene_block_detections"] = (
+                                self.config.metadata.get(
+                                    "patch_hygiene_block_detections",
+                                    0,
+                                )
+                                + 1
+                            )
+                            if hygiene_suppressed:
+                                hygiene_message = None
+                            elif patch_hygiene_block_mode == "protected_paths":
+                                hygiene_message = (
+                                    _patch_hygiene_block_protected_message(
+                                        hygiene_offending_paths
+                                    )
+                                )
+                            else:
+                                hygiene_message = _patch_hygiene_block_message(
+                                    hygiene_offending_paths
+                                )
+                            self._record_runtime_event(
+                                "patch_hygiene_block.challenge",
+                                feature="patch_hygiene_block",
+                                reason=hygiene_reason,
+                                iteration=iterations,
+                                provider_call_count=turn_llm_calls,
+                                injected_to_model=bool(hygiene_message),
+                                recovery_key=hygiene_key,
+                                details={
+                                    "offending_paths": hygiene_offending_paths[:20],
+                                    "offending_path_count": len(
+                                        hygiene_offending_paths
+                                    ),
+                                },
+                            )
+                            if hygiene_message is not None:
+                                patch_hygiene_block_keys.add(hygiene_key)
+                                if visible_text and final_text_parts:
+                                    final_text_parts.pop()
+                                turn_messages.append(
+                                    Message(role="user", content=hygiene_message)
+                                )
+                                self.config.metadata[
+                                    "patch_hygiene_block_recoveries"
+                                ] = (
+                                    self.config.metadata.get(
+                                        "patch_hygiene_block_recoveries",
+                                        0,
+                                    )
+                                    + 1
+                                )
+                                self._write_turn_call_log(
+                                    "patch_hygiene_block",
+                                    action="warn",
+                                    mode=patch_hygiene_block_mode,
+                                    reason=hygiene_reason,
+                                    details={
+                                        "offending_paths": hygiene_offending_paths[
+                                            :20
+                                        ],
+                                        "offending_path_count": len(
+                                            hygiene_offending_paths
+                                        ),
+                                    },
+                                )
+                                if patch_hygiene_block_mode == "protected_paths":
+                                    hygiene_warning = (
+                                        "The model attempted to finish with "
+                                        "write-policy-protected files still "
+                                        "changed in the workspace diff; asking "
+                                        "it to revert them once."
+                                    )
+                                else:
+                                    hygiene_warning = (
+                                        "The model attempted to finish with test "
+                                        "files still changed in the workspace "
+                                        "diff; asking it to revert them once."
+                                    )
+                                yield WarningEvent(
+                                    code="patch_hygiene_block_recovery",
+                                    message=hygiene_warning,
+                                )
+                                continue
+                    if (
+                        finalize_variant_challenge_enabled
+                        and not finalize_variant_challenge_fired
+                        and not max_iterations_finalization_pending
+                        and not artifact_delivery_final_response_pending
+                        and not post_write_convergence_finalization_pending
+                    ):
+                        variant_status = await self._workspace_git_status_porcelain()
+                        if variant_status and variant_status.strip():
+                            # Same headroom rule as the evidence gate: never
+                            # spend the run's last LLM call or deadline slack
+                            # on a challenge.
+                            variant_headroom = _turn_llm_call_budget_error(
+                                turn_llm_calls + 1
+                            ) is None and (
+                                _total_deadline is None or _loop.time() < _total_deadline
+                            )
+                            variant_message = (
+                                _finalize_variant_challenge_message()
+                                if variant_headroom
+                                else None
+                            )
+                            self.config.metadata[
+                                "finalize_variant_challenge_detections"
+                            ] = (
+                                self.config.metadata.get(
+                                    "finalize_variant_challenge_detections",
+                                    0,
+                                )
+                                + 1
+                            )
+                            self._record_runtime_event(
+                                "finalize_variant_challenge.challenge",
+                                feature="finalize_variant_challenge",
+                                reason="finalize_with_workspace_diff",
+                                iteration=iterations,
+                                provider_call_count=turn_llm_calls,
+                                injected_to_model=bool(variant_message),
+                            )
+                            if variant_message is not None:
+                                # One challenge per turn, fired or not again:
+                                # the sweep is uniform and non-escalating, so
+                                # a second injection would only burn budget.
+                                finalize_variant_challenge_fired = True
+                                if visible_text and final_text_parts:
+                                    final_text_parts.pop()
+                                turn_messages.append(
+                                    Message(role="user", content=variant_message)
+                                )
+                                self.config.metadata[
+                                    "finalize_variant_challenge_recoveries"
+                                ] = (
+                                    self.config.metadata.get(
+                                        "finalize_variant_challenge_recoveries",
+                                        0,
+                                    )
+                                    + 1
+                                )
+                                self._write_turn_call_log(
+                                    "finalize_variant_challenge",
+                                    action="warn",
+                                    mode="on",
+                                    reason="finalize_with_workspace_diff",
+                                    details={
+                                        "iteration": iterations,
+                                        "provider_call_count": turn_llm_calls,
+                                    },
+                                )
+                                yield WarningEvent(
+                                    code="finalize_variant_challenge_recovery",
+                                    message=(
+                                        "The model attempted to finish; asking it "
+                                        "once to sweep the input classes reachable "
+                                        "by its change."
+                                    ),
+                                )
+                                continue
+                    if (
                         progress_watchdog_mode == "warn_model"
                         and not workspace_diff_recovery_attempted
                         and not max_iterations_finalization_pending
@@ -7835,6 +8744,83 @@ class Agent:
                                 message=(
                                     "The model attempted to finish without a clear "
                                     "workspace diff; asking it to reassess once."
+                                ),
+                            )
+                            continue
+                    if (
+                        submit_review_enabled
+                        and submit_review_state.stage == 0
+                        and not submit_review_red_detected
+                        and not max_iterations_finalization_pending
+                        and not artifact_delivery_final_response_pending
+                        and not post_write_convergence_finalization_pending
+                    ):
+                        submit_implicit_headroom_ok = _turn_llm_call_budget_error(
+                            turn_llm_calls + 1
+                        ) is None and (
+                            _total_deadline is None or _loop.time() < _total_deadline
+                        )
+                        (
+                            implicit_file_index,
+                            implicit_diff_text,
+                        ) = await self._workspace_submit_review_capture()
+                        implicit_diff_empty = not (
+                            implicit_file_index.strip() or implicit_diff_text.strip()
+                        )
+                        if submit_review_should_fire_implicit(
+                            submit_review_state,
+                            enabled=submit_review_enabled,
+                            diff_empty=implicit_diff_empty,
+                            headroom_ok=submit_implicit_headroom_ok,
+                            other_gate_injected=False,
+                            red_detected=submit_review_red_detected,
+                            pending_flags_clear=True,
+                        ):
+                            submit_review_message = build_submit_review_message(
+                                implicit_file_index,
+                                implicit_diff_text,
+                                implicit=True,
+                                max_chars=submit_review_diff_max_chars,
+                            )
+                            submit_review_state.mark_reviewed("implicit")
+                            if visible_text and final_text_parts:
+                                final_text_parts.pop()
+                            turn_messages.append(
+                                Message(role="user", content=submit_review_message)
+                            )
+                            self.config.metadata["submit_review_implicit_recoveries"] = (
+                                self.config.metadata.get(
+                                    "submit_review_implicit_recoveries",
+                                    0,
+                                )
+                                + 1
+                            )
+                            self._record_runtime_event(
+                                "submit_review.implicit",
+                                feature="submit_review",
+                                reason="finalize_on_green_diff",
+                                iteration=iterations,
+                                provider_call_count=turn_llm_calls,
+                                injected_to_model=True,
+                                details={
+                                    "diff_truncated": submit_review_diff_is_truncated(
+                                        implicit_diff_text,
+                                        submit_review_diff_max_chars,
+                                    ),
+                                },
+                            )
+                            self._write_turn_call_log(
+                                "submit_review",
+                                action="warn",
+                                mode="implicit",
+                                reason="finalize_on_green_diff",
+                            )
+                            yield WarningEvent(
+                                code="submit_review_implicit",
+                                message=(
+                                    "The model finished with unreviewed workspace "
+                                    "changes; showing it a review of its own diff "
+                                    "once before finalizing."
                                 ),
                             )
                             continue
@@ -7923,6 +8909,8 @@ class Agent:
 
                 # Map tool_use_id -> ToolResult built up below.
                 results_by_id: dict[str, ToolResult] = {}
+                executed_tool_calls_by_id: dict[str, ToolCall] = {}
+                path_patch_snapshots_by_id: dict[str, ToolCall] = {}
 
                 def _cap_timeout_by_deadlines(timeout: float) -> float:
                     remaining = min(timeout, max(0.0, tool_deadline - _loop.time()))
@@ -7942,14 +8930,56 @@ class Agent:
                         name=tc.tool_name,
                         arguments=tc.arguments,
                     )
-                    tool_timeout = _cap_timeout_by_deadlines(self._tool_execution_timeout(tc))
-                    preflight_result = preflight_tool_results.get(tc.tool_use_id)
+                    execution_tc = path_patch_snapshots_by_id.get(tc.tool_use_id)
+                    if execution_tc is None:
+                        execution_tc = self._snapshot_apply_patch_path_call(tc)
+                        if execution_tc is not tc:
+                            path_patch_snapshots_by_id[tc.tool_use_id] = execution_tc
+                    approval_id = self._tool_call_string_arg(tc, "approval_id")
+                    if approval_id is not None and execution_tc is not tc:
+                        execution_arguments = dict(execution_tc.arguments)
+                        execution_arguments["approval_id"] = approval_id
+                        execution_tc = replace(
+                            execution_tc,
+                            arguments=execution_arguments,
+                        )
+                    executed_tool_calls_by_id[tc.tool_use_id] = execution_tc
+                    tool_timeout = _cap_timeout_by_deadlines(
+                        self._tool_execution_timeout(execution_tc)
+                    )
+                    snapshot_failure: ToolResult | None = None
+                    if (
+                        tc.tool_name == "apply_patch"
+                        and self._tool_call_string_arg(tc, "path") is not None
+                        and not (
+                            self._tool_call_string_arg(tc, "patch") or ""
+                        ).strip()
+                        and execution_tc is tc
+                    ):
+                        snapshot_failure = ToolResult(
+                            tool_use_id=tc.tool_use_id,
+                            tool_name=tc.tool_name,
+                            content=(
+                                "apply_patch could not securely snapshot the patch file "
+                                "before execution. Retry with inline patch text or a "
+                                "readable UTF-8 patch file under the workspace or "
+                                "configured scratch directory."
+                            ),
+                            is_error=True,
+                            execution_status=runtime_execution_status(
+                                "error",
+                                reason="patch_snapshot_failed",
+                            ),
+                        )
+                    preflight_result = (
+                        preflight_tool_results.get(tc.tool_use_id) or snapshot_failure
+                    )
                     gate_recovery_read = self._workspace_edit_gate_allows_recovery_read(
-                        tc,
+                        execution_tc,
                         workspace_edit_gate_recovery_read_paths,
                     )
                     gate_result = self._workspace_edit_gate_tool_result(
-                        tc,
+                        execution_tc,
                         workspace_edit_gate_details,
                         recovery_read_paths=workspace_edit_gate_recovery_read_paths,
                         recovery_reads_remaining=(
@@ -7957,7 +8987,7 @@ class Agent:
                         ),
                     )
                     diagnostic_retrieval_gate_result = (
-                        self._projected_diagnostic_retrieval_gate_tool_result(tc)
+                        self._projected_diagnostic_retrieval_gate_tool_result(execution_tc)
                     )
                     if gate_result is not None:
                         self._record_tool_loop_runtime_event(
@@ -7989,7 +9019,7 @@ class Agent:
                     else:
                         try:
                             res = await asyncio.wait_for(
-                                self._execute_tool(tc), timeout=tool_timeout
+                                self._execute_tool(execution_tc), timeout=tool_timeout
                             )
                         except TimeoutError:
                             res = ToolResult(
@@ -8004,7 +9034,7 @@ class Agent:
                                 ),
                             )
                     duration_ms = int((time.monotonic() - started) * 1000)
-                    self._record_focused_diagnostic_retrieval(tc, res)
+                    self._record_focused_diagnostic_retrieval(execution_tc, res)
                     if len(self._effective_workspace_write_records()) > 0:
                         workspace_edit_gate_details = None
                         workspace_edit_gate_recovery_read_paths.clear()
@@ -8015,7 +9045,7 @@ class Agent:
                         and res.is_error
                         and self._workspace_edit_gate_edit_error_allows_read(res)
                     ):
-                        target_paths = self._workspace_edit_gate_target_paths(tc)
+                        target_paths = self._workspace_edit_gate_target_paths(execution_tc)
                         if target_paths:
                             workspace_edit_gate_recovery_read_paths = {
                                 str(path) for path in target_paths
@@ -8050,7 +9080,7 @@ class Agent:
                             workspace_edit_gate_recovery_read_paths.clear()
                     self._record_patch_evidence_tool_result(
                         iteration=iterations,
-                        tool_call=tc,
+                        tool_call=execution_tc,
                         result=res,
                         duration_ms=duration_ms,
                     )
@@ -8231,6 +9261,80 @@ class Agent:
                         yield event
 
                 for tc in tool_calls:
+                    if submit_review_enabled and tc.tool_name == "submit":
+                        # Control-only tool: never dispatched to the registry
+                        # (its body raises). Flush prior work so the captured
+                        # diff reflects every edit in this batch, then answer
+                        # the submit with the review/confirm text directly.
+                        async for event in _flush_parallel_batch(parallel_batch):
+                            yield event
+                        parallel_batch = []
+                        (
+                            submit_file_index,
+                            submit_diff_text,
+                        ) = await self._workspace_submit_review_capture()
+                        submit_diff_empty = not (
+                            submit_file_index.strip() or submit_diff_text.strip()
+                        )
+                        submit_headroom_ok = _turn_llm_call_budget_error(
+                            turn_llm_calls + 1
+                        ) is None and (
+                            _total_deadline is None or _loop.time() < _total_deadline
+                        )
+                        submit_action = evaluate_explicit_submit(
+                            submit_review_state,
+                            diff_empty=submit_diff_empty,
+                            headroom_ok=submit_headroom_ok,
+                        )
+                        if submit_action is SubmitAction.SHOW_CHECKLIST:
+                            submit_content = build_submit_review_message(
+                                submit_file_index,
+                                submit_diff_text,
+                                implicit=False,
+                                max_chars=submit_review_diff_max_chars,
+                            )
+                        elif submit_action is SubmitAction.NUDGE:
+                            submit_content = submit_review_nudge_message()
+                        elif submit_action is SubmitAction.EMPTY_DIFF_NOTE:
+                            submit_content = submit_review_empty_diff_note()
+                        else:
+                            submit_content = submit_review_confirmation_message()
+                        # A confirming submit finalizes the turn: the model has
+                        # cleared the review handshake and asked to submit, so its
+                        # current workspace changes become the final answer and the
+                        # loop ends here — the same outcome as the model going quiet
+                        # with a non-empty diff. Ending on confirm (rather than
+                        # replying and looping) is what makes a repeated submit
+                        # unable to re-enter this branch, so the confirmed state can
+                        # never re-fire. The checklist/nudge/empty-diff replies keep
+                        # the turn open so the model can act on them.
+                        submit_terminates_turn = submit_action is SubmitAction.CONFIRM
+                        self._record_runtime_event(
+                            "submit_review.explicit",
+                            feature="submit_review",
+                            reason=submit_action.value,
+                            iteration=iterations,
+                            provider_call_count=turn_llm_calls,
+                            injected_to_model=True,
+                            details={
+                                "stage": submit_review_state.stage,
+                                "nudges": submit_review_state.nudges,
+                                "diff_empty": submit_diff_empty,
+                                "diff_truncated": submit_review_diff_is_truncated(
+                                    submit_diff_text,
+                                    submit_review_diff_max_chars,
+                                ),
+                                "terminates_turn": submit_terminates_turn,
+                            },
+                        )
+                        results_by_id[tc.tool_use_id] = ToolResult(
+                            tool_use_id=tc.tool_use_id,
+                            tool_name="submit",
+                            content=submit_content,
+                            is_error=False,
+                            terminates_turn=submit_terminates_turn,
+                        )
+                        continue
                     if tc.tool_name == "meta_invoke":
                         async for event in _flush_parallel_batch(parallel_batch):
                             yield event
@@ -8244,6 +9348,11 @@ class Agent:
                             else:
                                 yield ev
                         continue
+                    if submit_review_enabled:
+                        # Any real (non-submit) tool counts as work after a
+                        # review was shown; distinguishes continued work from an
+                        # immediate rubber-stamp re-submit.
+                        submit_review_observe_tool_activity(submit_review_state)
                     policy = _get_tool_concurrency_policy(
                         tc.tool_name,
                         tc.arguments,
@@ -8426,17 +9535,21 @@ class Agent:
                     last_post_write_failed_verification = None
                 if finalize_evidence_tracker is not None:
                     for tc, result in zip(tool_calls, executed_results, strict=False):
+                        executed_tc = executed_tool_calls_by_id.get(tc.tool_use_id, tc)
                         if tc.tool_name in _GATE_WRITE_TOOL_NAMES:
-                            finalize_evidence_tracker.observe_write(
-                                self._tool_call_string_arg(tc, "path", "file_path"),
-                                is_error=bool(result.is_error),
-                                iteration=iterations,
-                                scratch=(tc.tool_name == "write_scratch"),
-                            )
+                            for write_path, is_scratch in (
+                                self._finalize_evidence_write_targets(executed_tc)
+                            ):
+                                finalize_evidence_tracker.observe_write(
+                                    write_path,
+                                    is_error=bool(result.is_error),
+                                    iteration=iterations,
+                                    scratch=is_scratch,
+                                )
                             continue
                         if tc.tool_name not in _GATE_EXECUTION_TOOL_NAMES:
                             continue
-                        gate_command = self._execution_command_for_progress(tc)
+                        gate_command = self._execution_command_for_progress(executed_tc)
                         if not gate_command:
                             continue
                         gate_result_text = self._tool_result_text_for_anchor(result.content)
@@ -8448,6 +9561,21 @@ class Agent:
                                 is_error=bool(result.is_error),
                             )
                         )
+                        gate_evidence_credit = True
+                        if scratch_verify_mirror_enabled:
+                            gate_evidence_credit = (
+                                self._scratch_verify_mirror_evidence_credit(
+                                    gate_command
+                                )
+                            )
+                            if not gate_evidence_credit:
+                                self._record_runtime_event(
+                                    "scratch_verify_mirror.credit_withheld",
+                                    feature="scratch_verify_mirror",
+                                    reason="mirror_diverged_from_workspace",
+                                    iteration=iterations,
+                                    command=gate_command[:500],
+                                )
                         finalize_evidence_tracker.observe_execution(
                             gate_command,
                             red=gate_red,
@@ -8460,6 +9588,7 @@ class Agent:
                                 else []
                             ),
                             iteration=iterations,
+                            evidence_credit=gate_evidence_credit,
                         )
                 focused_verification_success_before_results = (
                     post_write_focused_verification_success_observed
@@ -8919,22 +10048,124 @@ class Agent:
                                 budget_fraction=nudge_fraction,
                                 elapsed_fraction=round(elapsed_fraction, 3),
                             )
-                if source_loop_recovery_guidance is not None:
-                    # Appended last: _drop_runtime_recovery_scaffolding pops
-                    # the one-shot directive from the end of the turn, so no
-                    # other runtime-injected message may follow it.
-                    turn_messages.append(
-                        Message(role="user", content=source_loop_recovery_guidance)
+                # One-shot endgame fix directive: inside the margin with no
+                # source fix beyond diagnostic instrumentation, direct the
+                # model to commit to its best-supported fix now. The margin
+                # crossing is consumed whether or not the directive fires —
+                # a fix present at crossing time that is reverted later must
+                # not trigger a late directive.
+                endgame_fix_margin_seconds = max(
+                    0,
+                    int(
+                        getattr(self.config, "endgame_fix_directive_margin_seconds", 0)
+                        or 0
+                    ),
+                )
+                if (
+                    endgame_fix_margin_seconds > 0
+                    and _total_deadline is not None
+                    and not endgame_fix_directive_fired
+                    and _loop.time() > _total_deadline - endgame_fix_margin_seconds
+                ):
+                    endgame_fix_directive_fired = True
+                    # The probe shells out to git; keep it off the event loop.
+                    has_source_fix = await asyncio.to_thread(
+                        self._workspace_source_fix_beyond_instrumentation
                     )
-                if terminal_projection_preflight_error:
-                    self._write_turn_call_log(
-                        "tool_argument_projection_rehydrate_recovery",
-                        iteration=iterations,
-                        tool_use_ids=sorted(preflight_tool_results),
-                    )
+                    if not has_source_fix:
+                        remaining_seconds = max(0.0, _total_deadline - _loop.time())
+                        turn_messages.append(
+                            Message(
+                                role="user",
+                                content=_ENDGAME_FIX_DIRECTIVE_TEMPLATE.format(
+                                    minutes=max(1, int(remaining_seconds // 60)),
+                                ),
+                            )
+                        )
+                        self._write_turn_call_log(
+                            "turn_policy_decision",
+                            action="endgame_fix_directive",
+                            reason="deadline_margin_no_fix",
+                            code="endgame_fix_directive",
+                            iteration=iterations,
+                            remaining_seconds=int(remaining_seconds),
+                            margin_seconds=endgame_fix_margin_seconds,
+                        )
+                        append_runtime_event(
+                            self.config.runtime_events_path,
+                            {
+                                "feature": "endgame_fix_directive",
+                                "name": "endgame_fix_directive.injected",
+                                "action": "append_fix_directive",
+                                "reason": "deadline_margin_no_fix",
+                                "iteration": iterations,
+                                "remaining_seconds": int(remaining_seconds),
+                                "margin_seconds": endgame_fix_margin_seconds,
+                                "session_key": self._session_key,
+                                "agent_id": (
+                                    self.config.tool_result_store_agent_id
+                                    or self.config.metadata.get("agent_id")
+                                ),
+                            },
+                        )
+                # Plan-only act-now directive: consecutive iterations whose
+                # executed tool calls are all update_plan mean the model is
+                # narrating progress instead of making it.
+                plan_only_threshold = max(
+                    0,
+                    int(getattr(self.config, "plan_only_act_now_threshold", 0) or 0),
+                )
+                if plan_only_threshold > 0:
+                    if executed_results and all(
+                        getattr(result, "tool_name", None) == "update_plan"
+                        for result in executed_results
+                    ):
+                        plan_only_iteration_streak += 1
+                    else:
+                        plan_only_iteration_streak = 0
+                    if plan_only_iteration_streak >= plan_only_threshold:
+                        turn_messages.append(
+                            Message(
+                                role="user",
+                                content=_PLAN_ONLY_ACT_NOW_DIRECTIVE,
+                            )
+                        )
+                        self._write_turn_call_log(
+                            "turn_policy_decision",
+                            action="plan_only_act_now",
+                            reason="plan_only_streak",
+                            code="plan_only_act_now",
+                            iteration=iterations,
+                            streak=plan_only_iteration_streak,
+                            threshold=plan_only_threshold,
+                        )
+                        append_runtime_event(
+                            self.config.runtime_events_path,
+                            {
+                                "feature": "plan_only_act_now",
+                                "name": "plan_only_act_now.injected",
+                                "action": "append_act_now_directive",
+                                "reason": "plan_only_streak",
+                                "iteration": iterations,
+                                "streak": plan_only_iteration_streak,
+                                "threshold": plan_only_threshold,
+                                "session_key": self._session_key,
+                                "agent_id": (
+                                    self.config.tool_result_store_agent_id
+                                    or self.config.metadata.get("agent_id")
+                                ),
+                            },
+                        )
+                        # Reset so the directive re-fires only after another
+                        # full streak, not on every subsequent iteration.
+                        plan_only_iteration_streak = 0
                 # Count iterations that blocked a compacted-placeholder reuse
                 # (preflight or dispatch path) and escalate the recovery
-                # directive once the configured threshold is reached.
+                # directive once the configured threshold is reached. This
+                # runs before the source-loop recovery guidance append below:
+                # that guidance must stay the final runtime-injected message
+                # of the turn so _drop_runtime_recovery_scaffolding can pop it
+                # from the end.
                 if terminal_projection_preflight_error or any(
                     self._is_provider_context_projection_reuse_result(result)
                     for result in executed_results
@@ -8964,6 +10195,40 @@ class Agent:
                             offense_iterations=placeholder_offense_iterations,
                             threshold=placeholder_escalation_threshold,
                         )
+                        # The turn-call log is a raw debug stream that run
+                        # harnesses do not collect; the runtime event is what
+                        # lets delivery gates tell this designed escalation
+                        # apart from a treatment delivery failure.
+                        append_runtime_event(
+                            self.config.runtime_events_path,
+                            {
+                                "feature": "placeholder_escalation",
+                                "name": "placeholder_escalation.injected",
+                                "action": "append_escalation_directive",
+                                "reason": "placeholder_offense_threshold",
+                                "iteration": iterations,
+                                "offense_iterations": placeholder_offense_iterations,
+                                "threshold": placeholder_escalation_threshold,
+                                "session_key": self._session_key,
+                                "agent_id": (
+                                    self.config.tool_result_store_agent_id
+                                    or self.config.metadata.get("agent_id")
+                                ),
+                            },
+                        )
+                if source_loop_recovery_guidance is not None:
+                    # Appended last: _drop_runtime_recovery_scaffolding pops
+                    # the one-shot directive from the end of the turn, so no
+                    # other runtime-injected message may follow it.
+                    turn_messages.append(
+                        Message(role="user", content=source_loop_recovery_guidance)
+                    )
+                if terminal_projection_preflight_error:
+                    self._write_turn_call_log(
+                        "tool_argument_projection_rehydrate_recovery",
+                        iteration=iterations,
+                        tool_use_ids=sorted(preflight_tool_results),
+                    )
                 if terminal_artifacts:
                     _finish_artifact_delivery_without_provider()
                     break
@@ -9219,12 +10484,52 @@ class Agent:
             if any(
                 isinstance(record, dict)
                 and not self._workspace_write_record_looks_synthetic(record)
+                and not self._workspace_write_record_targets_configured_scratch(record)
                 for record in records
             ):
                 return True
             if getattr(ctx, "source_diff_candidates", []) or []:
                 return True
         return bool(self._workspace_tracked_diff_paths_for_nudge())
+
+    def _workspace_source_fix_beyond_instrumentation(self) -> bool:
+        """Whether the tracked diff contains more than diagnostic output.
+
+        Used by the endgame fix directive: an instrumentation-only diff
+        (added print/log lines, nothing removed) means the model has been
+        investigating, not fixing. Probe failures count as a fix existing —
+        the conservative direction, since the directive tells the model to
+        stop investigating and a misfire on a real fix wastes the message.
+        """
+
+        paths = self._workspace_tracked_diff_paths_for_nudge()
+        if not paths:
+            return False
+        ctx = self._tool_context
+        raw_workspace = getattr(ctx, "workspace_dir", None) if ctx is not None else None
+        if not raw_workspace:
+            raw_workspace = self.config.workspace_dir
+        if not raw_workspace:
+            return True
+        workspace_dir = Path(raw_workspace).expanduser().resolve(strict=False)
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(workspace_dir), "diff", "HEAD", "--", *paths],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5.0,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return True
+        if result.returncode != 0:
+            return True
+        patch = result.stdout or ""
+        if not patch.strip():
+            return False
+        return not is_instrumentation_only_patch(patch)
 
     def _workspace_tracked_diff_paths_for_nudge(self) -> list[str]:
         ctx = self._tool_context
@@ -9256,8 +10561,10 @@ class Agent:
             for line in (result.stdout or "").splitlines():
                 text = line.strip()
                 if text:
-                    normalized = text.replace("\\", "/").lstrip("./")
+                    normalized = _normalize_workspace_relative_path(text)
                     if normalized in ignored_paths:
+                        continue
+                    if self._workspace_relative_path_targets_scratch(normalized):
                         continue
                     paths.add(normalized)
         return sorted(paths)
@@ -9267,14 +10574,29 @@ class Agent:
             record
             for record in self._workspace_write_records()
             if not self._workspace_write_record_looks_synthetic(record)
+            and not self._workspace_write_record_targets_configured_scratch(record)
         ]
+
+    def _workspace_write_record_targets_configured_scratch(
+        self,
+        record: Mapping[str, Any],
+    ) -> bool:
+        raw_path = str(record.get("path") or record.get("relative_path") or "")
+        return self._workspace_relative_path_targets_scratch(raw_path)
+
+    def _workspace_relative_path_targets_scratch(self, raw_path: str) -> bool:
+        resolved, _ = self._configured_scratch_path_candidate(
+            raw_path,
+            relative_to="workspace",
+        )
+        return resolved is not None
 
     @staticmethod
     def _workspace_write_record_looks_synthetic(record: Mapping[str, Any]) -> bool:
         if not bool(record.get("created")):
             return False
         raw_path = str(record.get("relative_path") or record.get("path") or "")
-        normalized = raw_path.replace("\\", "/").lstrip("./")
+        normalized = _normalize_workspace_relative_path(raw_path)
         if not normalized:
             return False
         name = Path(normalized).name.lower()
@@ -9318,10 +10640,15 @@ class Agent:
             receipt
             for receipt in self._workspace_mutation_receipts()
             if receipt.get("changed") is True
+            and receipt.get("classification") != "scratch"
         ]
 
     def _workspace_mutation_receipt_counts(self) -> dict[str, int]:
-        receipts = self._workspace_mutation_receipts()
+        receipts = [
+            receipt
+            for receipt in self._workspace_mutation_receipts()
+            if receipt.get("classification") != "scratch"
+        ]
         return {
             "changed_receipt_count": len(self._changed_workspace_mutation_receipts()),
             "noop_receipt_count": sum(
@@ -9365,15 +10692,16 @@ class Agent:
 
     def _final_diff_contract_observation(self) -> FinalDiffContractObservation | None:
         diff_paths = self._workspace_diff_paths_for_final_diff_contract()
-        write_records = self._workspace_write_records()
+        known_scratch_paths = [
+            path for path in diff_paths if self._workspace_relative_path_targets_scratch(path)
+        ]
+        write_records = self._effective_workspace_write_records()
         mutation_receipts = self._workspace_mutation_receipts()
         source_diff_candidates = []
         if self.config.source_diff_candidate_mode != "off" and self._tool_context:
             source_diff_candidates = list(
                 getattr(self._tool_context, "source_diff_candidates", []) or []
             )
-        if not diff_paths:
-            write_records = self._effective_workspace_write_records()
         if not diff_paths and not write_records and not mutation_receipts:
             return None
         return build_final_diff_contract_observation(
@@ -9383,6 +10711,7 @@ class Agent:
             mutation_records=self._workspace_mutation_records(),
             mutation_receipts=mutation_receipts,
             source_diff_candidates=source_diff_candidates,
+            known_scratch_paths=known_scratch_paths,
         )
 
     def _record_final_diff_contract_event(
@@ -9494,6 +10823,28 @@ class Agent:
             patch = candidate.get("patch")
             if not isinstance(patch, str) or not patch.strip():
                 continue
+            if bool(getattr(self.config, "final_diff_salvage_veto", False)):
+                # Vetoed candidates stay out of handled_paths on purpose: an
+                # older, non-vetoed candidate for the same path may still be
+                # worth salvaging.
+                if candidate.get("lost") is True:
+                    # The agent explicitly reverted this patch; resurrecting
+                    # it would score edits the agent chose to abandon.
+                    self._record_final_diff_salvage_event(
+                        candidate,
+                        trigger=trigger,
+                        iteration=iteration,
+                        action="vetoed_lost",
+                    )
+                    continue
+                if is_instrumentation_only_patch(patch):
+                    self._record_final_diff_salvage_event(
+                        candidate,
+                        trigger=trigger,
+                        iteration=iteration,
+                        action="vetoed_instrumentation",
+                    )
+                    continue
             if time.monotonic() >= deadline:
                 self._record_final_diff_salvage_event(
                     candidate,
@@ -9639,6 +10990,93 @@ class Agent:
             return None
         return workspace
 
+    def _scratch_verify_mirror_root(self) -> Path | None:
+        ctx = self._tool_context or current_tool_context.get()
+        scratch_dir = getattr(ctx, "scratch_dir", None) if ctx is not None else None
+        if not scratch_dir:
+            return None
+        return (
+            Path(scratch_dir).expanduser().resolve(strict=False)
+            / _VERIFY_MIRROR_DIR_NAME
+        )
+
+    @staticmethod
+    def _command_references_verify_mirror(command: str, mirror_root: Path) -> bool:
+        if not command:
+            return False
+        if f"{_VERIFY_MIRROR_DIR_NAME}/" in command:
+            return True
+        return mirror_root.as_posix() in command
+
+    @staticmethod
+    def _git_head_blob(workspace: Path, relative_path: str) -> bytes | None:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(workspace), "show", f"HEAD:{relative_path}"],
+                capture_output=True,
+                timeout=2.0,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout
+
+    def _scratch_verify_mirror_evidence_credit(self, command: str) -> bool:
+        """Anti-weakening hash guard for scratch verify-mirror runs.
+
+        A command that references the verify-mirror tree earns verification
+        credit ONLY while every mirror file that shadows a workspace path is
+        byte-identical to that workspace file (or to its HEAD blob when the
+        workspace copy is gone). Mirror files with no counterpart in either
+        place are the model's own new checks and stay allowed — they shadow
+        nothing. Any unreadable or unverifiable state withholds credit: the
+        guard must fail closed, not open.
+        """
+
+        mirror_root = self._scratch_verify_mirror_root()
+        if mirror_root is None or not self._command_references_verify_mirror(
+            command, mirror_root
+        ):
+            return True
+        if not mirror_root.is_dir():
+            return True
+        workspace = self._workspace_dir_for_status()
+        if workspace is None:
+            return False
+        checked = 0
+        for mirror_file in sorted(mirror_root.rglob("*")):
+            if not mirror_file.is_file():
+                continue
+            checked += 1
+            if checked > _VERIFY_MIRROR_MAX_FILES:
+                return False
+            try:
+                relative = mirror_file.relative_to(mirror_root)
+            except ValueError:
+                continue
+            try:
+                mirror_digest = hashlib.sha256(mirror_file.read_bytes()).digest()
+            except OSError:
+                return False
+            original = workspace / relative
+            if original.is_file():
+                try:
+                    original_digest = hashlib.sha256(original.read_bytes()).digest()
+                except OSError:
+                    return False
+                if mirror_digest != original_digest:
+                    return False
+                continue
+            head_blob = self._git_head_blob(workspace, relative.as_posix())
+            if head_blob is None:
+                # Tracked nowhere: a new check file, not a shadowed original.
+                continue
+            if mirror_digest != hashlib.sha256(head_blob).digest():
+                return False
+        return True
+
     async def _workspace_git_status_porcelain(self) -> str | None:
         workspace = self._workspace_dir_for_status()
         if workspace is None:
@@ -9671,6 +11109,39 @@ class Agent:
 
         return await asyncio.to_thread(_run_status)
 
+    async def _workspace_submit_review_capture(self) -> tuple[str, str]:
+        """Capture ``(per-file summary, unified diff)`` for the submit review.
+
+        The per-file summary comes from ``git status`` (so untracked scratch
+        files appear even though they are absent from ``git diff``); the diff
+        body is ``git diff HEAD`` for tracked changes. Best-effort: any failure
+        yields an empty diff and the review degrades to the summary alone.
+        """
+        workspace = self._workspace_dir_for_status()
+        if workspace is None:
+            return "", ""
+
+        def _run_diff() -> str:
+            try:
+                result = subprocess.run(
+                    ["git", "-C", str(workspace), "diff", "HEAD"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=4.0,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                return ""
+            if result.returncode != 0:
+                return ""
+            return result.stdout
+
+        file_index = await self._workspace_git_status_porcelain() or ""
+        diff_text = await asyncio.to_thread(_run_diff)
+        return file_index, diff_text
+
     @staticmethod
     def _porcelain_status_code(line: str) -> str:
         if len(line) >= 2:
@@ -9689,7 +11160,7 @@ class Agent:
         )
         if " -> " in text:
             text = text.split(" -> ", 1)[1].strip()
-        return text.replace("\\", "/").lstrip("./") or None
+        return _normalize_workspace_relative_path(text) or None
 
     @staticmethod
     def _porcelain_status_is_new_file(line: str) -> bool:
@@ -9697,10 +11168,90 @@ class Agent:
         return code == "??" or "A" in code
 
     @staticmethod
+    def _porcelain_status_test_paths(status: str | None) -> list[str]:
+        """Test-classified paths with a live diff, per porcelain-v1 status.
+
+        Renames count both sides: moving a test file away still mutates the
+        test tree. Scratch-classified paths never count even when their name
+        looks test-like (classify_workspace_path puts the scratch check first
+        only for the scratch directory; root scratch artifacts are already
+        filtered out of the status upstream).
+        """
+
+        if not status:
+            return []
+        test_paths: list[str] = []
+        for line in status.splitlines():
+            if not line.strip():
+                continue
+            raw = line.rstrip()
+            text = raw[3:].strip() if len(raw) > 3 else raw.strip()
+            sides = (
+                [side.strip() for side in text.split(" -> ", 1)]
+                if " -> " in text
+                else [text]
+            )
+            for side in sides:
+                path = _normalize_workspace_relative_path(side)
+                if not path:
+                    continue
+                if classify_workspace_path(path) != "test-like":
+                    continue
+                if path not in test_paths:
+                    test_paths.append(path)
+        return test_paths
+
+    def _porcelain_status_protected_paths(self, status: str | None) -> list[str]:
+        """Deny-glob-protected paths with a live diff, per porcelain-v1 status.
+
+        The ``protected_paths`` hygiene mode reuses the deployment's
+        workspace write-deny globs verbatim — the engine carries no path
+        taxonomy of its own here, so whatever the configuration protects
+        from writes is also what the final diff must leave untouched.
+        Renames count both sides: moving a protected file away still
+        mutates the protected tree.
+        """
+
+        if not status:
+            return []
+        workspace = self._workspace_dir_for_status()
+        if workspace is None:
+            return []
+        ctx = self._tool_context or current_tool_context.get()
+        if ctx is None or not getattr(ctx, "workspace_write_deny_globs", None):
+            return []
+        protected: list[str] = []
+        for line in status.splitlines():
+            if not line.strip():
+                continue
+            raw = line.rstrip()
+            text = raw[3:].strip() if len(raw) > 3 else raw.strip()
+            sides = (
+                [side.strip() for side in text.split(" -> ", 1)]
+                if " -> " in text
+                else [text]
+            )
+            for side in sides:
+                path = _normalize_workspace_relative_path(side)
+                if not path:
+                    continue
+                match = match_workspace_write_deny(
+                    workspace / path,
+                    original_path=path,
+                    workspace=workspace,
+                    ctx=ctx,
+                )
+                if match is None:
+                    continue
+                if path not in protected:
+                    protected.append(path)
+        return protected
+
+    @staticmethod
     def _is_root_scratch_artifact_path(path: str | None) -> bool:
         if not path:
             return False
-        normalized = path.replace("\\", "/").lstrip("./")
+        normalized = _normalize_workspace_relative_path(path)
         if not normalized or "/" in normalized:
             return False
         name = Path(normalized).name
@@ -9755,7 +11306,7 @@ class Agent:
         for line in (result.stdout or "").splitlines():
             parts = line.split(None, 3)
             if len(parts) == 4 and parts[0] == "160000":
-                paths.add(parts[3].replace("\\", "/").lstrip("./"))
+                paths.add(_normalize_workspace_relative_path(parts[3]))
         return paths
 
     def _workspace_ignored_diff_paths(self, workspace_dir: Path) -> set[str]:
@@ -9996,7 +11547,7 @@ class Agent:
             if not candidate.is_absolute() and workspace is not None:
                 candidate = workspace / candidate
             resolved = candidate.resolve(strict=False)
-        except OSError:
+        except (OSError, RuntimeError, ValueError):
             return None
         if workspace is None:
             return resolved
@@ -10004,30 +11555,223 @@ class Agent:
             return resolved
         return None
 
-    def _workspace_edit_gate_apply_patch_target_paths(self, tc: ToolCall) -> list[Path]:
+    def _configured_scratch_path_candidate(
+        self,
+        raw_path: str | None,
+        *,
+        relative_to: Literal["scratch", "workspace"] | None = None,
+    ) -> tuple[Path | None, bool]:
+        """Return a contained path and whether it targets configured scratch."""
+
+        if not raw_path:
+            return None, False
+
+        ctx = self._tool_context or current_tool_context.get()
+        raw_scratch = getattr(ctx, "scratch_dir", None) if ctx is not None else None
+        if not raw_scratch:
+            return None, False
+        try:
+            scratch = Path(raw_scratch).expanduser()
+            if not scratch.is_absolute():
+                scratch = Path.cwd() / scratch
+
+            candidate = Path(raw_path).expanduser()
+            if not candidate.is_absolute():
+                if relative_to == "scratch":
+                    candidate = scratch / candidate
+                elif relative_to == "workspace":
+                    workspace = self._workspace_dir_for_status()
+                    if workspace is None:
+                        return None, False
+                    candidate = workspace / candidate
+                else:
+                    return None, False
+        except (OSError, RuntimeError, ValueError):
+            return None, False
+
+        lexical_scratch_target = False
+        try:
+            lexical_relative = candidate.relative_to(scratch)
+            lexical_scratch_target = True
+        except ValueError:
+            lexical_relative = None
+        if lexical_relative is not None and (
+            not lexical_relative.parts or ".." in lexical_relative.parts
+        ):
+            return None, True
+
+        try:
+            resolved_scratch = scratch.resolve(strict=False)
+            resolved = candidate.resolve(strict=False)
+            resolved_relative = resolved.relative_to(resolved_scratch)
+        except (OSError, RuntimeError, ValueError):
+            return None, lexical_scratch_target
+        if not resolved_relative.parts:
+            return None, True
+
+        workspace = self._workspace_dir_for_status()
+        if workspace is not None:
+            try:
+                resolved.relative_to(workspace)
+            except ValueError:
+                pass
+            else:
+                try:
+                    scratch_relative = resolved_scratch.relative_to(workspace)
+                except ValueError:
+                    return None, False
+                if not scratch_relative.parts:
+                    return None, False
+
+        return resolved, True
+
+    def _workspace_edit_gate_external_scratch_repro_target(
+        self,
+        tc: ToolCall,
+    ) -> tuple[Path | None, bool]:
+        """Return an allowed repro target and whether the path claimed scratch."""
+
+        if tc.tool_name not in {"edit_file", "write_file", "write_scratch"}:
+            return None, False
+        resolved, claimed_scratch = self._configured_scratch_path_candidate(
+            self._tool_call_string_arg(tc, "path"),
+            relative_to=("scratch" if tc.tool_name == "write_scratch" else "workspace"),
+        )
+        if resolved is None or not is_repro_script_path(str(resolved)):
+            return None, claimed_scratch
+
+        workspace = self._workspace_dir_for_status()
+        if workspace is not None and (resolved == workspace or workspace in resolved.parents):
+            return None, True
+        return resolved, True
+
+    def _workspace_edit_gate_apply_patch_text(self, tc: ToolCall) -> str | None:
         patch = self._tool_call_string_arg(tc, "patch")
+        if patch and patch.strip():
+            return patch
+        raw_path = self._tool_call_string_arg(tc, "path")
+        workspace = self._workspace_dir_for_status()
+        if not raw_path or workspace is None:
+            return None
+        try:
+            candidate = Path(raw_path).expanduser()
+            if not candidate.is_absolute():
+                candidate = workspace / candidate
+            resolved = candidate.resolve(strict=False)
+            allowed_roots = [workspace]
+            ctx = self._tool_context or current_tool_context.get()
+            raw_scratch = getattr(ctx, "scratch_dir", None) if ctx is not None else None
+            if raw_scratch:
+                allowed_roots.append(Path(raw_scratch).expanduser().resolve(strict=False))
+            if not any(resolved.is_relative_to(root) for root in allowed_roots):
+                return None
+            open_flags = os.O_RDONLY
+            open_flags |= getattr(os, "O_NONBLOCK", 0)
+            open_flags |= getattr(os, "O_CLOEXEC", 0)
+            open_flags |= getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(resolved, open_flags)
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    return None
+                with os.fdopen(fd, encoding="utf-8") as patch_file:
+                    fd = -1
+                    return patch_file.read()
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+        except (OSError, RuntimeError, UnicodeError, ValueError):
+            return None
+
+    def _snapshot_apply_patch_path_call(self, tc: ToolCall) -> ToolCall:
+        """Bind a path-mode patch to the exact text used by this execution."""
+
+        if tc.tool_name != "apply_patch":
+            return tc
+        inline_patch = self._tool_call_string_arg(tc, "patch")
+        if inline_patch and inline_patch.strip():
+            return tc
+        if self._tool_call_string_arg(tc, "path") is None:
+            return tc
+        patch = self._workspace_edit_gate_apply_patch_text(tc)
+        if patch is None or not patch.strip():
+            return tc
+        arguments = dict(tc.arguments)
+        arguments["patch"] = patch
+        return replace(tc, arguments=arguments)
+
+    def _workspace_edit_gate_apply_patch_raw_target_paths(self, tc: ToolCall) -> list[str]:
+        patch = self._workspace_edit_gate_apply_patch_text(tc)
         if not patch:
             return []
-        paths: list[Path] = []
-        seen: set[Path] = set()
+        paths: list[str] = []
+        in_patch = False
         prefixes = (
             "*** Add File: ",
             "*** Update File: ",
             "*** Delete File: ",
         )
         for raw_line in patch.splitlines():
-            line = raw_line.strip()
-            for prefix in prefixes:
-                if not line.startswith(prefix):
-                    continue
-                raw_path = line.removeprefix(prefix).strip()
-                if not raw_path:
-                    continue
-                resolved = self._resolve_workspace_path_candidate(raw_path)
-                if resolved is not None and resolved not in seen:
-                    seen.add(resolved)
-                    paths.append(resolved)
+            line = raw_line.rstrip("\r")
+            marker = line.strip()
+            if marker == "*** Begin Patch":
+                in_patch = True
+                continue
+            if marker == "*** End Patch":
                 break
+            if not in_patch:
+                continue
+            for prefix in prefixes:
+                if line.startswith(prefix):
+                    raw_path = line.removeprefix(prefix).strip()
+                    if raw_path:
+                        paths.append(raw_path)
+                    break
+        return paths
+
+    def _finalize_evidence_write_targets(
+        self,
+        tc: ToolCall,
+    ) -> list[tuple[str | None, bool]]:
+        if tc.tool_name == "apply_patch":
+            patch_targets = self._workspace_edit_gate_apply_patch_raw_target_paths(tc)
+            if patch_targets:
+                return [
+                    (
+                        raw_path,
+                        self._configured_scratch_path_candidate(
+                            raw_path,
+                            relative_to="workspace",
+                        )[0]
+                        is not None,
+                    )
+                    for raw_path in patch_targets
+                ]
+            # A successful apply_patch with unknown targets must invalidate prior
+            # verification instead of treating its input patch file as a write.
+            return [(None, False)]
+
+        raw_path = self._tool_call_string_arg(tc, "path", "file_path")
+        configured_scratch_path: Path | None = None
+        if tc.tool_name in {"edit_file", "edit_source", "write_file", "write_scratch"}:
+            configured_scratch_path, _ = self._configured_scratch_path_candidate(
+                raw_path,
+                relative_to=("scratch" if tc.tool_name == "write_scratch" else "workspace"),
+            )
+        return [
+            (
+                raw_path,
+                tc.tool_name == "write_scratch" or configured_scratch_path is not None,
+            )
+        ]
+
+    def _workspace_edit_gate_apply_patch_target_paths(self, tc: ToolCall) -> list[Path]:
+        paths: list[Path] = []
+        seen: set[Path] = set()
+        for raw_path in self._workspace_edit_gate_apply_patch_raw_target_paths(tc):
+            resolved = self._resolve_workspace_path_candidate(raw_path)
+            if resolved is not None and resolved not in seen:
+                seen.add(resolved)
+                paths.append(resolved)
         return paths
 
     def _workspace_edit_gate_target_paths(self, tc: ToolCall) -> list[Path]:
@@ -10043,6 +11787,17 @@ class Agent:
 
     def _workspace_edit_gate_edit_block_detail(self, tc: ToolCall) -> str | None:
         if tc.tool_name == "apply_patch":
+            if any(
+                self._configured_scratch_path_candidate(
+                    raw_path,
+                    relative_to="workspace",
+                )[1]
+                for raw_path in self._workspace_edit_gate_apply_patch_raw_target_paths(tc)
+            ):
+                return (
+                    "The apply_patch call targets configured scratch. Scratch files do "
+                    "not count as the requested project source fix."
+                )
             if self._workspace_edit_gate_apply_patch_target_paths(tc):
                 return None
             return (
@@ -10052,8 +11807,24 @@ class Agent:
                 "then '@@' hunks, then '*** End Patch'. Do not put the path on the "
                 "Begin Patch or End Patch line."
             )
-        if tc.tool_name not in {"edit_file", "write_file"}:
+        if tc.tool_name not in {"edit_file", "write_file", "write_scratch"}:
             return None
+        scratch_target, claimed_scratch = (
+            self._workspace_edit_gate_external_scratch_repro_target(tc)
+        )
+        if tc.tool_name == "write_scratch":
+            if scratch_target is not None:
+                return None
+            return (
+                "The write_scratch call must target a contained executable reproduction "
+                "script under an external scratch directory before the source fix."
+            )
+        if claimed_scratch:
+            return (
+                f"The {tc.tool_name} call targets configured scratch, but only a "
+                "contained executable reproduction script under an external scratch "
+                "directory may be written before the source fix."
+            )
         raw_path = self._tool_call_string_arg(tc, "path") or "<missing path>"
         resolved = self._resolve_workspace_path_candidate(raw_path)
         if resolved is None:
@@ -10137,15 +11908,21 @@ class Agent:
             and self._workspace_edit_gate_allows_recovery_read(tc, recovery_read_paths)
         ):
             return None
+        scratch_target, _ = self._workspace_edit_gate_external_scratch_repro_target(tc)
+        if scratch_target is not None:
+            return None
+        gate_write_tool = (
+            tc.tool_name in _WORKSPACE_EDIT_TOOL_NAMES or tc.tool_name == "write_scratch"
+        )
         edit_block_detail = (
             self._workspace_edit_gate_edit_block_detail(tc)
-            if tc.tool_name in _WORKSPACE_EDIT_TOOL_NAMES
+            if gate_write_tool
             else None
         )
-        if tc.tool_name in _WORKSPACE_EDIT_TOOL_NAMES and edit_block_detail is None:
+        if gate_write_tool and edit_block_detail is None:
             return None
 
-        if tc.tool_name in _WORKSPACE_EDIT_TOOL_NAMES:
+        if gate_write_tool:
             detail = edit_block_detail or f"The {tc.tool_name} call is not allowed here."
         elif tc.tool_name == "read_file" and recovery_reads_remaining > 0:
             detail = (
@@ -10483,7 +12260,7 @@ class Agent:
             raw = record.get("relative_path")
             if not isinstance(raw, str) or not raw:
                 continue
-            normalized = raw.replace("\\", "/").lstrip("./")
+            normalized = _normalize_workspace_relative_path(raw)
             if normalized and normalized not in seen:
                 seen.add(normalized)
                 paths.append(normalized)
@@ -10518,7 +12295,7 @@ class Agent:
                 else:
                     text = line.strip()
                 if text:
-                    normalized = text.replace("\\", "/").lstrip("./")
+                    normalized = _normalize_workspace_relative_path(text)
                     if normalized in ignored_paths:
                         continue
                     paths.add(normalized)
@@ -10559,7 +12336,7 @@ class Agent:
                 else:
                     text = line.strip()
                 if text:
-                    normalized = text.replace("\\", "/").lstrip("./")
+                    normalized = _normalize_workspace_relative_path(text)
                     if normalized in ignored_paths:
                         continue
                     paths.add(normalized)
@@ -11181,6 +12958,11 @@ class Agent:
             forced_prefix_cut=selected_cut,
             trigger="message_count",
             reason="provider_request_message_limit",
+            provider_request_correlation=derive_provider_request_correlation(
+                self._provider_request_correlation,
+                execution_id=uuid.uuid4().hex,
+                call_kind="auxiliary.compaction",
+            ),
         )
         try:
             result = await compact_context(request)
@@ -11741,6 +13523,11 @@ class Agent:
             entries=entries,
             context_window_tokens=window_tokens,
             config=self._build_compaction_config(),
+            provider_request_correlation=derive_provider_request_correlation(
+                self._provider_request_correlation,
+                execution_id=uuid.uuid4().hex,
+                call_kind="auxiliary.compaction",
+            ),
         )
 
         if self._session_key:
@@ -12026,6 +13813,11 @@ class Agent:
                     timeout=self.config.flush_background_timeout_seconds,
                     message_window=0,
                     segment_mode="auto",
+                    provider_request_correlation=derive_provider_request_correlation(
+                        self._provider_request_correlation,
+                        execution_id=uuid.uuid4().hex,
+                        call_kind="auxiliary.session_flush",
+                    ),
                 )
             except asyncio.CancelledError:
                 logger.debug("memory_flush.cancelled")
@@ -12717,17 +14509,23 @@ class Agent:
             make_tool_invoker_from_handler,
         )
 
+        meta_correlation = derive_provider_request_correlation(
+            self._provider_request_correlation,
+            execution_id=uuid.uuid4().hex,
+            call_kind="auxiliary.meta",
+        )
         runner = make_agent_runner_from_parent(
             provider=self.provider,
             base_config=self.config,
             tool_definitions=self.tool_definitions,
-            tool_handler=self.tool_handler,
+            tool_handler=self._raw_tool_handler,
             agent_factory=type(self),
             workspace_dir=str(workspace_dir) if workspace_dir else None,
             usage_tracker=self._usage_tracker,
             session_key=self._session_key,
             usage_event_sink=self._usage_event_sink,
             usage_execution_context=self._usage_execution_context,
+            provider_request_correlation=meta_correlation,
         )
         llm_chat = (
             getattr(self, "_test_llm_chat_override", None)
@@ -12739,14 +14537,18 @@ class Agent:
                     session_key=self._session_key,
                     usage_event_sink=self._usage_event_sink,
                     usage_execution_context=self._usage_execution_context,
+                    provider_request_correlation=meta_correlation,
                 )
                 if self.provider is not None
                 else None
             )
         )
         tool_invoker = (
-            make_tool_invoker_from_handler(tool_handler=self.tool_handler)
-            if self.tool_handler is not None
+            make_tool_invoker_from_handler(
+                tool_handler=self._raw_tool_handler,
+                provider_request_correlation=meta_correlation,
+            )
+            if self._raw_tool_handler is not None
             else None
         )
         orch = MetaOrchestrator(
@@ -12951,17 +14753,23 @@ class Agent:
                 )
                 return
 
+            meta_correlation = derive_provider_request_correlation(
+                self._provider_request_correlation,
+                execution_id=uuid.uuid4().hex,
+                call_kind="auxiliary.meta",
+            )
             runner = make_agent_runner_from_parent(
                 provider=self.provider,
                 base_config=self.config,
                 tool_definitions=self.tool_definitions,
-                tool_handler=self.tool_handler,
+                tool_handler=self._raw_tool_handler,
                 agent_factory=type(self),
                 workspace_dir=str(workspace_dir) if workspace_dir else None,
                 usage_tracker=self._usage_tracker,
                 session_key=self._session_key,
                 usage_event_sink=self._usage_event_sink,
                 usage_execution_context=self._usage_execution_context,
+                provider_request_correlation=meta_correlation,
             )
             llm_chat = getattr(self, "_test_llm_chat_override", None) or (
                 make_llm_chat_from_provider(
@@ -12971,13 +14779,17 @@ class Agent:
                     session_key=self._session_key,
                     usage_event_sink=self._usage_event_sink,
                     usage_execution_context=self._usage_execution_context,
+                    provider_request_correlation=meta_correlation,
                 )
                 if self.provider is not None
                 else None
             )
             tool_invoker = (
-                make_tool_invoker_from_handler(tool_handler=self.tool_handler)
-                if self.tool_handler is not None
+                make_tool_invoker_from_handler(
+                    tool_handler=self._raw_tool_handler,
+                    provider_request_correlation=meta_correlation,
+                )
+                if self._raw_tool_handler is not None
                 else None
             )
 
@@ -13184,17 +14996,23 @@ class Agent:
             or getattr(self.config, "workspace_dir", None)
         )
 
+        meta_correlation = derive_provider_request_correlation(
+            self._provider_request_correlation,
+            execution_id=uuid.uuid4().hex,
+            call_kind="auxiliary.meta",
+        )
         runner = make_agent_runner_from_parent(
             provider=self.provider,
             base_config=self.config,
             tool_definitions=self.tool_definitions,
-            tool_handler=self.tool_handler,
+            tool_handler=self._raw_tool_handler,
             agent_factory=type(self),
             workspace_dir=str(workspace_dir) if workspace_dir else None,
             usage_tracker=self._usage_tracker,
             session_key=self._session_key,
             usage_event_sink=self._usage_event_sink,
             usage_execution_context=self._usage_execution_context,
+            provider_request_correlation=meta_correlation,
         )
         llm_chat = getattr(self, "_test_llm_chat_override", None) or (
             make_llm_chat_from_provider(
@@ -13204,13 +15022,17 @@ class Agent:
                 session_key=self._session_key,
                 usage_event_sink=self._usage_event_sink,
                 usage_execution_context=self._usage_execution_context,
+                provider_request_correlation=meta_correlation,
             )
             if self.provider is not None
             else None
         )
         tool_invoker = (
-            make_tool_invoker_from_handler(tool_handler=self.tool_handler)
-            if self.tool_handler is not None
+            make_tool_invoker_from_handler(
+                tool_handler=self._raw_tool_handler,
+                provider_request_correlation=meta_correlation,
+            )
+            if self._raw_tool_handler is not None
             else None
         )
 
@@ -13745,7 +15567,12 @@ class Agent:
     # Subagent factory
     # ------------------------------------------------------------------
 
-    def _make_child_agent(self, spec: SubagentSpec, depth: int) -> Agent:
+    def _make_child_agent(
+        self,
+        spec: SubagentSpec,
+        depth: int,
+        execution_id: str | None = None,
+    ) -> Agent:
         from opensquilla.sandbox.run_context import (
             RunContext,
             normalize_scope,
@@ -13762,6 +15589,12 @@ class Agent:
 
         parent_session_key = self._session_key or "unknown"
         subagent_label = spec.label or "subagent"
+        child_execution_id = execution_id or uuid.uuid4().hex
+        child_provider_request_correlation = derive_provider_request_correlation(
+            self._provider_request_correlation,
+            execution_id=child_execution_id,
+            call_kind="subagent.chat",
+        )
         parent_ctx = current_tool_context.get() or self._tool_context
         parent_run_context = getattr(parent_ctx, "sandbox_run_context", None)
         if isinstance(parent_run_context, RunContext):
@@ -13787,7 +15620,6 @@ class Agent:
 
         child_usage_context: UsageExecutionContext | None = None
         if self._usage_event_sink is not None:
-            child_execution_id = uuid.uuid4().hex
             parent_usage_context = self._usage_execution_context
             child_usage_context = UsageExecutionContext(
                 execution_id=child_execution_id,
@@ -13849,7 +15681,7 @@ class Agent:
         )
 
         async def _subagent_tool_handler(tc: ToolCall) -> ToolResult:
-            if self.tool_handler is None:
+            if self._raw_tool_handler is None:
                 return ToolResult(
                     tool_use_id=tc.tool_use_id,
                     tool_name=tc.tool_name,
@@ -13860,11 +15692,14 @@ class Agent:
                         reason="runtime_error",
                     ),
                 )
-            token = current_tool_context.set(subagent_ctx)
-            try:
-                return await self.tool_handler(tc)
-            finally:
-                current_tool_context.reset(token)
+            with bind_provider_request_correlation(
+                child_provider_request_correlation,
+            ):
+                token = current_tool_context.set(subagent_ctx)
+                try:
+                    return await self._raw_tool_handler(tc)
+                finally:
+                    current_tool_context.reset(token)
 
         child_cfg = AgentConfig(
             max_iterations=spec.max_iterations,
@@ -13932,10 +15767,26 @@ class Agent:
                 self.config.deadline_thinking_off_margin_seconds
             ),
             reasoning_stream_char_cap=self.config.reasoning_stream_char_cap,
+            patch_hygiene_block_mode=self.config.patch_hygiene_block_mode,
             final_diff_salvage=self.config.final_diff_salvage,
             endgame_git_freeze_margin_seconds=(
                 self.config.endgame_git_freeze_margin_seconds
             ),
+            max_iterations_deadline_extend_seconds=(
+                self.config.max_iterations_deadline_extend_seconds
+            ),
+            final_diff_salvage_veto=self.config.final_diff_salvage_veto,
+            endgame_git_freeze_instrumentation_exempt=(
+                self.config.endgame_git_freeze_instrumentation_exempt
+            ),
+            deadline_wrapup_sticky_thinking_off=(
+                self.config.deadline_wrapup_sticky_thinking_off
+            ),
+            endgame_fix_directive_margin_seconds=(
+                self.config.endgame_fix_directive_margin_seconds
+            ),
+            reasoning_only_act_now=self.config.reasoning_only_act_now,
+            plan_only_act_now_threshold=self.config.plan_only_act_now_threshold,
             mid_budget_no_diff_nudge=self.config.mid_budget_no_diff_nudge,
             repeated_tool_call_recovery_threshold=(
                 self.config.repeated_tool_call_recovery_threshold
@@ -13947,6 +15798,7 @@ class Agent:
             provider_history_dedup_min_repeats=(
                 self.config.provider_history_dedup_min_repeats
             ),
+            projection_signal_hints=self.config.projection_signal_hints,
             progress_watchdog_mode=self.config.progress_watchdog_mode,
             progress_watchdog_repeated_tool_error_threshold=(
                 self.config.progress_watchdog_repeated_tool_error_threshold
@@ -13994,6 +15846,7 @@ class Agent:
             tool_context=subagent_ctx,
             usage_event_sink=self._usage_event_sink,
             usage_execution_context=child_usage_context,
+            provider_request_correlation=child_provider_request_correlation,
         )
 
     async def spawn_subagent(self, spec: SubagentSpec) -> str:

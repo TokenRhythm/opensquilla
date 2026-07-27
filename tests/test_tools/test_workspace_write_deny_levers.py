@@ -32,6 +32,7 @@ from opensquilla.tools.types import (
 
 _HOST_SHELL_ENV = "OPENSQUILLA_WORKSPACE_WRITE_DENY_HOST_SHELL"
 _COMMAND_TARGETS_ENV = "OPENSQUILLA_WORKSPACE_WRITE_DENY_COMMAND_TARGETS"
+_INTERPRETER_TARGETS_ENV = "OPENSQUILLA_WORKSPACE_WRITE_DENY_INTERPRETER_TARGETS"
 _GUIDANCE_ENV = "OPENSQUILLA_WORKSPACE_WRITE_DENY_GUIDANCE"
 
 
@@ -39,6 +40,7 @@ _GUIDANCE_ENV = "OPENSQUILLA_WORKSPACE_WRITE_DENY_GUIDANCE"
 def _tool_context(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv(_HOST_SHELL_ENV, raising=False)
     monkeypatch.delenv(_COMMAND_TARGETS_ENV, raising=False)
+    monkeypatch.delenv(_INTERPRETER_TARGETS_ENV, raising=False)
     monkeypatch.delenv(_GUIDANCE_ENV, raising=False)
     reset_approval_queue()
     reset_runtime()
@@ -114,6 +116,269 @@ def _configure_ctx(workspace: Path, globs: list[str]) -> ToolContext:
 )
 def test_mutating_command_write_target_extraction(command: str, expected: list[str]) -> None:
     assert shell._mutating_command_write_targets(command) == expected
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        # django-11885's verbatim bypass shape: python -c open().write.
+        (
+            "python3 -c \"open('tests/test_a.py','w').write('x')\"",
+            ["tests/test_a.py"],
+        ),
+        (
+            "python -c \"open('tests/test_a.py', 'a').write('x')\"",
+            ["tests/test_a.py"],
+        ),
+        (
+            "python3 -c \"open('tests/test_a.py', mode='w').write('x')\"",
+            ["tests/test_a.py"],
+        ),
+        # Read-only opens must not match: no mode / explicit 'r' / 'rb'.
+        ("python3 -c \"print(open('tests/test_a.py').read())\"", []),
+        ("python3 -c \"print(open('tests/test_a.py','r').read())\"", []),
+        ("python3 -c \"print(open('tests/test_a.py','rb').read())\"", []),
+        (
+            "python3 -c \"from pathlib import Path; Path('tests/test_a.py').write_text('x')\"",
+            ["tests/test_a.py"],
+        ),
+        (
+            "python3 -c \"import pathlib; pathlib.Path('tests/test_a.py').unlink()\"",
+            ["tests/test_a.py"],
+        ),
+        ("python3 -c \"print(Path('tests/test_a.py').read_text())\"", []),
+        (
+            "python3 -c \"import os; os.remove('tests/test_a.py')\"",
+            ["tests/test_a.py"],
+        ),
+        (
+            "python3 -c \"import shutil; shutil.rmtree('tests')\"",
+            ["tests"],
+        ),
+        (
+            'node -e "require(\'fs\').writeFileSync(\'tests/test_a.py\', \'x\')"',
+            ["tests/test_a.py"],
+        ),
+        (
+            'node --eval "fs.appendFileSync(\'tests/test_a.py\', \'x\')"',
+            ["tests/test_a.py"],
+        ),
+        ('node -e "console.log(fs.readFileSync(\'tests/test_a.py\'))"', []),
+        (
+            'ruby -e "File.write(\'tests/test_a.py\', \'x\')"',
+            ["tests/test_a.py"],
+        ),
+        (
+            'ruby -e "FileUtils.rm_rf(\'tests\')"',
+            ["tests"],
+        ),
+        ('ruby -e "puts File.read(\'tests/test_a.py\')"', []),
+        (
+            "php -r \"file_put_contents('tests/test_a.py', 'x');\"",
+            ["tests/test_a.py"],
+        ),
+        ("php -r \"echo file_get_contents('tests/test_a.py');\"", []),
+        (
+            "perl -e \"open(FH, '>tests/test_a.py'); print FH 'x';\"",
+            ["tests/test_a.py"],
+        ),
+        (
+            "perl -e \"open(my \\$fh, '>', 'tests/test_a.py');\"",
+            ["tests/test_a.py"],
+        ),
+        ("perl -e \"open(FH, '<tests/test_a.py');\"", []),
+        # Fused short flag and env-assignment prefixes.
+        (
+            "PYTHONPATH=. python3 -c\"open('tests/test_a.py','w').write('x')\"",
+            ["tests/test_a.py"],
+        ),
+        # Versioned interpreter names resolve to their base extractor.
+        (
+            "python3.11 -c \"open('tests/test_a.py','w').write('x')\"",
+            ["tests/test_a.py"],
+        ),
+        # Non-interpreter heads and plain scripts are out of scope.
+        ("python3 setup.py build", []),
+        ("gcc -c main.c", []),
+        # Later pipeline segments are scanned too.
+        (
+            "echo x | python3 -c \"open('tests/test_a.py','w').write('x')\"",
+            ["tests/test_a.py"],
+        ),
+    ],
+)
+def test_interpreter_write_target_extraction(command: str, expected: list[str]) -> None:
+    assert shell._interpreter_write_targets_from_command(command) == expected
+
+
+def test_interpreter_stdin_program_is_scanned_as_code() -> None:
+    targets = shell._interpreter_write_targets_from_inputs(
+        "python3 -",
+        stdin="open('tests/test_a.py', 'w').write('x')\n",
+    )
+    assert targets == ["tests/test_a.py"]
+
+    # With -c code present, stdin is data for the program, not more code —
+    # but shell-command scanning of stdin still applies for sh-like heads.
+    targets = shell._interpreter_write_targets_from_inputs(
+        "python3 -c \"print('ok')\"",
+        stdin="open('tests/test_a.py', 'w').write('x')\n",
+    )
+    assert targets == []
+
+
+def test_interpreter_stdin_shell_commands_still_scanned() -> None:
+    targets = shell._interpreter_write_targets_from_inputs(
+        "sh",
+        stdin="python3 -c \"open('tests/test_a.py','w').write('x')\"\n",
+    )
+    assert targets == ["tests/test_a.py"]
+
+
+def test_interpreter_targets_lever_default_off_skips_extraction(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    (workspace / "tests").mkdir(parents=True)
+    _configure_ctx(workspace, ["tests/**"])
+
+    block = shell._workspace_write_deny_shell_block(
+        "exec_command",
+        "python3 -c \"open('tests/test_a.py','w').write('x')\"",
+        str(workspace),
+    )
+
+    assert block is None
+
+
+def test_interpreter_targets_lever_adds_interpreter_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(_INTERPRETER_TARGETS_ENV, "1")
+    workspace = tmp_path / "workspace"
+    (workspace / "tests").mkdir(parents=True)
+    _configure_ctx(workspace, ["tests/**"])
+
+    block = shell._workspace_write_deny_shell_block(
+        "exec_command",
+        "python3 -c \"open('tests/test_a.py','w').write('x')\"",
+        str(workspace),
+    )
+
+    assert block is not None
+    assert block["reason"] == "workspace_write_deny"
+    assert block["matched_pattern"] == "tests/**"
+    assert block["target"] == "tests/test_a.py"
+
+
+def test_interpreter_targets_lever_blocks_directory_operands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(_INTERPRETER_TARGETS_ENV, "1")
+    workspace = tmp_path / "workspace"
+    tests_dir = workspace / "tests"
+    tests_dir.mkdir(parents=True)
+    (tests_dir / "test_a.py").write_text("assert a\n", encoding="utf-8")
+    _configure_ctx(workspace, ["tests/**"])
+
+    block = shell._workspace_write_deny_shell_block(
+        "exec_command",
+        "python3 -c \"import shutil; shutil.rmtree('tests')\"",
+        str(workspace),
+    )
+
+    assert block is not None
+    assert block["reason"] == "workspace_write_deny"
+    assert block["matched_pattern"] == "tests/**"
+    assert block["target"] == "tests"
+
+
+@pytest.mark.asyncio
+async def test_exec_command_blocks_interpreter_write_when_lever_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(_INTERPRETER_TARGETS_ENV, "1")
+    workspace = tmp_path / "workspace"
+    tests_dir = workspace / "tests"
+    tests_dir.mkdir(parents=True)
+    target = tests_dir / "test_a.py"
+    target.write_text("assert a\n", encoding="utf-8")
+    _configure_ctx(workspace, ["tests/**"])
+
+    result = await shell.exec_command(
+        "python3 -c \"open('tests/test_a.py','w').write('assert b')\"",
+        workdir=str(workspace),
+    )
+
+    payload = json.loads(result)
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "workspace_write_deny"
+    assert payload["matched_pattern"] == "tests/**"
+    assert target.read_text(encoding="utf-8") == "assert a\n"
+
+
+@pytest.mark.asyncio
+async def test_exec_command_interpreter_write_passes_through_by_default(
+    tmp_path: Path,
+) -> None:
+    # Documents the default gap the lever closes: interpreter one-liner
+    # writes are not recognized and execute against denied paths.
+    workspace = tmp_path / "workspace"
+    tests_dir = workspace / "tests"
+    tests_dir.mkdir(parents=True)
+    target = tests_dir / "test_a.py"
+    target.write_text("assert a\n", encoding="utf-8")
+    _configure_ctx(workspace, ["tests/**"])
+
+    result = await shell.exec_command(
+        "python3 -c \"open('tests/test_a.py','w').write('assert b')\"",
+        workdir=str(workspace),
+    )
+
+    assert result.startswith("exit_code=0")
+    assert target.read_text(encoding="utf-8") == "assert b"
+
+
+@pytest.mark.asyncio
+async def test_exec_command_interpreter_reads_stay_unblocked_with_lever_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(_INTERPRETER_TARGETS_ENV, "1")
+    workspace = tmp_path / "workspace"
+    tests_dir = workspace / "tests"
+    tests_dir.mkdir(parents=True)
+    (tests_dir / "test_a.py").write_text("assert a\n", encoding="utf-8")
+    _configure_ctx(workspace, ["tests/**"])
+
+    result = await shell.exec_command(
+        "python3 -c \"print(open('tests/test_a.py').read())\"",
+        workdir=str(workspace),
+    )
+
+    assert result.startswith("exit_code=0")
+    assert "assert a" in result
+
+
+@pytest.mark.asyncio
+async def test_exec_command_scans_stdin_program_when_interpreter_lever_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(_INTERPRETER_TARGETS_ENV, "1")
+    workspace = tmp_path / "workspace"
+    tests_dir = workspace / "tests"
+    tests_dir.mkdir(parents=True)
+    (tests_dir / "test_a.py").write_text("assert a\n", encoding="utf-8")
+    _configure_ctx(workspace, ["tests/**"])
+
+    result = await shell.exec_command(
+        "python3 -",
+        workdir=str(workspace),
+        stdin="open('tests/test_a.py', 'w').write('x')\n",
+    )
+
+    payload = json.loads(result)
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "workspace_write_deny"
 
 
 def test_command_targets_lever_default_off_skips_mutator_extraction(
@@ -442,7 +707,7 @@ def test_gate_raise_carries_same_message_as_block_envelope(
 
 
 def test_lever_env_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in (_HOST_SHELL_ENV, _COMMAND_TARGETS_ENV):
+    for name in (_HOST_SHELL_ENV, _COMMAND_TARGETS_ENV, _INTERPRETER_TARGETS_ENV):
         monkeypatch.delenv(name, raising=False)
         assert shell._write_deny_lever_enabled(name) is False
         monkeypatch.setenv(name, "1")

@@ -22,7 +22,14 @@ from opensquilla.memory.session_flush import (
 from opensquilla.memory.store import LongTermMemoryStore
 from opensquilla.memory.sync_manager import MemorySyncManager
 from opensquilla.memory.types import MemorySearchOpts, SearchIntent
-from opensquilla.provider import DoneEvent, Message, ToolUseEndEvent, ToolUseStartEvent
+from opensquilla.provider import (
+    DoneEvent,
+    Message,
+    ProviderRequestCorrelation,
+    TextDeltaEvent,
+    ToolUseEndEvent,
+    ToolUseStartEvent,
+)
 from opensquilla.tool_boundary import ToolCall, ToolResult
 
 
@@ -37,6 +44,70 @@ def test_memory_tool_handler_protocol_uses_tool_boundary_types() -> None:
     typed_handler: MemoryToolHandler = handler
 
     assert typed_handler is handler
+
+
+@pytest.mark.asyncio
+async def test_session_flush_forwards_explicit_provider_request_correlation() -> None:
+    from opensquilla.provider.correlation_context import bind_provider_request_correlation
+
+    correlation = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="flush-execution-1",
+        call_kind="auxiliary.session_flush",
+    )
+    captured_configs: list[Any] = []
+
+    class StreamingProvider:
+        async def chat(self, _messages: list[Message], *, config: Any):
+            captured_configs.append(config)
+            yield TextDeltaEvent(
+                text='{"slug":"durable-fact","markdown":"## Facts\\n- Durable fact."}'
+            )
+            yield DoneEvent()
+
+    async def handler(call: ToolCall) -> ToolResult:
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="Saved to memory/durable-fact.md (1 chunks indexed; integrity=ok).",
+        )
+
+    service = SessionFlushService(
+        provider_selector=lambda _agent_id: StreamingProvider(),
+        tool_registry=SimpleNamespace(
+            to_tool_definitions=lambda: [SimpleNamespace(name="memory_save")]
+        ),
+        tool_handler=handler,
+    )
+
+    receipt = await service.execute(
+        [Message(role="user", content="Remember this durable fact.")],
+        "agent:main:webchat:s1",
+        raw_capture_policy="off",
+        provider_request_correlation=correlation,
+    )
+
+    assert receipt.mode == "llm"
+    assert captured_configs
+    assert captured_configs[0].provider_request_correlation == correlation
+
+    with bind_provider_request_correlation(
+        ProviderRequestCorrelation(
+            session_id="unrelated-session",
+            turn_id="unrelated-turn",
+            execution_id="unrelated-execution",
+            call_kind="agent.chat",
+        )
+    ):
+        uncorrelated_receipt = await service.execute(
+            [Message(role="user", content="Remember another durable fact.")],
+            "agent:main:webchat:s2",
+            raw_capture_policy="off",
+        )
+
+    assert uncorrelated_receipt.mode == "llm"
+    assert captured_configs[1].provider_request_correlation is None
 
 
 def test_resolve_flush_plan_rotates_oversized_daily_archive(tmp_path) -> None:

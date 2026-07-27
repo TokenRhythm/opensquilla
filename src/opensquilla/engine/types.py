@@ -586,6 +586,46 @@ class AgentConfig:
     # Finalize-time red-evidence gate (see engine.finalize_evidence_gate).
     # Off by default; enabled per run via OPENSQUILLA_FINALIZE_EVIDENCE_GATE.
     finalize_evidence_gate_enabled: bool = False
+    # Strict mode for the finalize-time evidence gate: adds the
+    # zero_verification trigger (a change shipped without ever running a
+    # verification-level command draws one bounded challenge). Red-first
+    # state stays report-only. Implies the gate itself (strict on activates
+    # the tracker even when the base flag is off). Off by default; enabled
+    # per run via OPENSQUILLA_FINALIZE_EVIDENCE_STRICT.
+    finalize_evidence_strict: bool = False
+    # Review-on-submit checkpoint (see engine.submit_review). Surfaces a
+    # ``submit`` tool and, when the model finishes with a non-empty diff, shows
+    # it a general hygiene checklist plus its own diff exactly once before the
+    # turn finalizes. Off by default; enabled per run via
+    # OPENSQUILLA_SUBMIT_REVIEW. ``submit_review_diff_max_chars`` bounds the diff
+    # body echoed into context (the per-file summary is always shown in full).
+    submit_review_enabled: bool = False
+    submit_review_diff_max_chars: int = 20000
+    # Finalize-time patch hygiene hard block. "off" (default) leaves patch
+    # hygiene as warn-only text; "test_paths" challenges a finalizing response
+    # while the live workspace diff still touches test-classified paths, so
+    # test edits are reverted before the patch is collected;
+    # "protected_paths" instead challenges while the diff touches paths
+    # matching the deployment's workspace write-deny globs — the same
+    # configured policy the write gates enforce, with no built-in path
+    # taxonomy. Set via OPENSQUILLA_PATCH_HYGIENE_BLOCK.
+    patch_hygiene_block_mode: Literal["off", "test_paths", "protected_paths"] = "off"
+    # Scratch verify-mirror for deny-blocked in-package test edits. When on,
+    # workspace write-deny rejections point the model at a writable mirror
+    # under <scratch>/verify-mirror/<workspace-relative-path>, and the
+    # finalize-time evidence gate credits executions that reference mirror
+    # files ONLY while every mirror copy hash-matches its workspace original
+    # (a diverged mirror would otherwise let weakened tests count as
+    # verification). Off by default; set via
+    # OPENSQUILLA_SCRATCH_VERIFY_MIRROR.
+    scratch_verify_mirror: bool = False
+    # Finalize-time variant-sweep challenge. When on, the first finalizing
+    # response after source edits receives ONE uniform challenge turn asking
+    # the model to enumerate the distinct input/construct classes reachable
+    # by its changed code paths and run its verification against each. Fires
+    # at most once per turn and never spends the last LLM call or deadline
+    # slack. Off by default; set via OPENSQUILLA_FINALIZE_VARIANT_CHALLENGE.
+    finalize_variant_challenge: bool = False
     # Keep rejection feedback visible when blocked compacted-placeholder tool
     # calls are projected out of provider requests: the blocked tool_use keeps
     # a placeholder input and its error tool_result stays in the projection.
@@ -646,6 +686,47 @@ class AgentConfig:
     # revert cannot empty the collected diff. Set via
     # OPENSQUILLA_ENDGAME_GIT_FREEZE_MARGIN_SECONDS.
     endgame_git_freeze_margin_seconds: int = 0
+    # Let the iteration cap yield to remaining wall-clock time. 0 = off. When
+    # positive and a total turn timeout is configured, hitting max_iterations
+    # does NOT enter finalization while more than this many seconds remain;
+    # the loop keeps running normal iterations until the deadline margin is
+    # reached, then the cap applies as usual. Set via
+    # OPENSQUILLA_MAX_ITERATIONS_DEADLINE_EXTEND_SECONDS.
+    max_iterations_deadline_extend_seconds: int = 0
+    # Veto for final-diff salvage: skip candidates the agent explicitly
+    # reverted (marked lost) and candidates whose patch only adds diagnostic
+    # print/log lines — both re-apply abandoned or throwaway edits into the
+    # scored patch. Off by default; only meaningful with final_diff_salvage.
+    # Set via OPENSQUILLA_FINAL_DIFF_SALVAGE_VETO.
+    final_diff_salvage_veto: bool = False
+    # Endgame git freeze exemption: a frozen revert whose targeted diff is
+    # instrumentation-only (added print/log lines, nothing removed) is allowed
+    # through — cleaning up diagnostic output is what the wrap-up window is
+    # for. Off by default; only meaningful with the freeze margin. Set via
+    # OPENSQUILLA_ENDGAME_GIT_FREEZE_INSTRUMENTATION_EXEMPT.
+    endgame_git_freeze_instrumentation_exempt: bool = False
+    # Make the wrap-up preempt's thinking-off sticky: when the wrap-up
+    # directive preempts a reasoning stream, disable thinking for every
+    # remaining provider call this turn instead of the next call only. Off by
+    # default. Set via OPENSQUILLA_DEADLINE_WRAPUP_STICKY_THINKING_OFF.
+    deadline_wrapup_sticky_thinking_off: bool = False
+    # One-shot endgame fix directive. 0 = off. When positive, a total turn
+    # timeout is configured, and remaining wall-clock time drops below this
+    # many seconds while the workspace still shows no source change beyond
+    # diagnostic instrumentation, a single user message directs the model to
+    # commit to its best-supported fix now. Set via
+    # OPENSQUILLA_ENDGAME_FIX_DIRECTIVE_MARGIN_SECONDS.
+    endgame_fix_directive_margin_seconds: int = 0
+    # Inject an act-now user message when a provider response is reasoning
+    # only (no visible text, no tool calls) and grant one extra retry for that
+    # failure kind. Off by default (the bare retry re-requests with nothing
+    # added). Set via OPENSQUILLA_REASONING_ONLY_ACT_NOW.
+    reasoning_only_act_now: bool = False
+    # Consecutive update_plan-only iterations before an act-now directive is
+    # appended after the tool results. 0 = off. Counts iterations whose
+    # executed tool calls are all update_plan; any other tool call resets the
+    # streak. Set via OPENSQUILLA_PLAN_ONLY_ACT_NOW_THRESHOLD.
+    plan_only_act_now_threshold: int = 0
     # Mid-budget progress nudges. Off by default. When enabled and the turn
     # has a wall-clock budget (timeout > 0), a one-shot user message is
     # appended after tool results the first time elapsed time crosses 50% and
@@ -664,6 +745,12 @@ class AgentConfig:
     # elides the older ones (keeps the newest copy full). Set via
     # OPENSQUILLA_PROVIDER_HISTORY_DEDUP_MIN_REPEATS.
     provider_history_dedup_min_repeats: int = 2
+    # Append a failure-signal scan header to tool-result projection notices:
+    # the omitted region of the original output is scanned for failure-pattern
+    # lines and the notice gains a signal_scan summary plus a ready-to-copy
+    # retrieve_tool_result call for the first match. Off by default; enabled
+    # via OPENSQUILLA_PROJECTION_SIGNAL_HINTS.
+    projection_signal_hints: bool = False
     tool_loop_observer_mode: Literal["off", "log"] = "off"
     runtime_recovery_mode: Literal["off", "log", "warn_model"] = "log"
     runtime_recovery_source_loop_max_nudges: int = 1

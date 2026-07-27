@@ -27,7 +27,7 @@ _SCRATCH_PATH_PATTERNS = (
     re.compile(r"(^|/)[^/]*\.(patch|diff)$", re.I),
 )
 _DIAGNOSTIC_SOURCE_LIKE_PATTERNS = (
-    re.compile(r"^(php_cs|php-cs|php-cs-fixer)[^/]*\.(php|dist|json|ya?ml)$", re.I),
+    re.compile(r"^\.?(php_cs|php-cs|php-cs-fixer)[^/]*\.(php|dist|json|ya?ml)$", re.I),
     re.compile(
         r"^[^/]*(check|verify|inspect|investigate|trace|analy[sz]e|analysis)[^/]*"
         r"\.(py|js|ts|rb|php|sh|txt|md|json|yaml|yml|zsh)$",
@@ -165,8 +165,10 @@ def build_final_diff_contract_observation(
     mutation_records: Sequence[Mapping[str, Any]] = (),
     mutation_receipts: Sequence[Mapping[str, Any]] = (),
     source_diff_candidates: Sequence[Mapping[str, Any]] = (),
+    known_scratch_paths: Sequence[str] = (),
 ) -> FinalDiffContractObservation:
     normalized_diff_paths = _unique_paths(diff_paths)
+    known_scratch_set = set(_unique_paths(known_scratch_paths))
     by_kind: dict[str, list[str]] = {
         "source": [],
         "scratch": [],
@@ -175,16 +177,31 @@ def build_final_diff_contract_observation(
         "generated": [],
     }
     for path in normalized_diff_paths:
-        kind = classify_final_diff_path(path)
+        kind = "scratch" if path in known_scratch_set else classify_final_diff_path(path)
         if kind in by_kind:
             by_kind[kind].append(path)
 
-    touched_paths = _paths_from_records([*write_records, *mutation_records])
-    changed_source_receipts = _changed_source_paths_from_receipts(mutation_receipts)
-    touched_source_paths = [
-        path for path in touched_paths if classify_final_diff_path(path) == "source"
+    touched_paths = [
+        path
+        for path in _paths_from_records(
+            [*write_records, *mutation_records],
+            excluded_classifications=frozenset({"scratch"}),
+        )
+        if path not in known_scratch_set
     ]
-    read_source_paths = _source_paths_from_records(read_records)
+    changed_source_receipts = [
+        path
+        for path in _changed_source_paths_from_receipts(mutation_receipts)
+        if path not in known_scratch_set
+    ]
+    touched_source_paths = _source_paths_from_records(
+        [*write_records, *mutation_records],
+        known_scratch_paths=known_scratch_set,
+    )
+    read_source_paths = _source_paths_from_records(
+        read_records,
+        known_scratch_paths=known_scratch_set,
+    )
     candidate_source_paths = (
         touched_source_paths or changed_source_receipts or read_source_paths[-10:]
     )
@@ -319,9 +336,15 @@ def final_diff_contract_recovery_message(
     )
 
 
-def _paths_from_records(records: Sequence[Mapping[str, Any]]) -> list[str]:
+def _paths_from_records(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    excluded_classifications: frozenset[str] = frozenset(),
+) -> list[str]:
     paths: list[str] = []
     for record in records:
+        if record.get("classification") in excluded_classifications:
+            continue
         raw = record.get("relative_path")
         if isinstance(raw, str) and raw:
             paths.append(raw)
@@ -330,15 +353,26 @@ def _paths_from_records(records: Sequence[Mapping[str, Any]]) -> list[str]:
         if isinstance(raw_paths, Iterable) and not isinstance(raw_paths, (str, bytes)):
             for item in raw_paths:
                 if isinstance(item, Mapping):
+                    if item.get("classification") in excluded_classifications:
+                        continue
                     nested = item.get("relative_path")
                     if isinstance(nested, str) and nested:
                         paths.append(nested)
     return _unique_paths(paths)
 
 
-def _source_paths_from_records(records: Sequence[Mapping[str, Any]]) -> list[str]:
+def _source_paths_from_records(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    known_scratch_paths: set[str] | frozenset[str] = frozenset(),
+) -> list[str]:
     return [
-        path for path in _paths_from_records(records) if classify_final_diff_path(path) == "source"
+        path
+        for path in _paths_from_records(
+            records,
+            excluded_classifications=frozenset({"scratch"}),
+        )
+        if path not in known_scratch_paths and classify_final_diff_path(path) == "source"
     ]
 
 
@@ -423,4 +457,7 @@ def _normalize_path(path: str) -> str:
         return text
     if text.startswith("a/") or text.startswith("b/"):
         text = text[2:]
-    return Path(text).as_posix().lstrip("./")
+    normalized = Path(text).as_posix()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.lstrip("/")

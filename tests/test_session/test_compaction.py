@@ -2,6 +2,7 @@
 
 import pytest
 
+from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.session.compaction import (
     CompactionConfig,
     CompactionRequest,
@@ -131,6 +132,41 @@ async def test_message_count_compaction_uses_exact_forced_prefix_within_token_bu
     assert result.tokens_after >= result.tokens_before
     assert result.quality_report["fits_context_window"] is True
     assert result.quality_report["passes_structural_gate"] is True
+
+
+@pytest.mark.asyncio
+async def test_compaction_request_passes_explicit_correlation_to_every_chunk(
+    monkeypatch,
+) -> None:
+    observed: list[ProviderRequestCorrelation | None] = []
+
+    async def fake_llm(**kwargs):
+        observed.append(kwargs.get("provider_request_correlation"))
+        return "bounded historical summary"
+
+    monkeypatch.setattr("opensquilla.session.compaction.call_compaction_llm", fake_llm)
+    correlation = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="compaction-1",
+        call_kind="auxiliary.compaction",
+    )
+    await compact_context(
+        CompactionRequest(
+            session_id="session-1",
+            entries=_make_entries(12, tokens_each=20),
+            context_window_tokens=100,
+            config=CompactionConfig(
+                model="test/model",
+                api_key="test-key",
+                safety_margin=1.0,
+            ),
+            provider_request_correlation=correlation,
+        )
+    )
+
+    assert observed
+    assert all(item is correlation for item in observed)
 
 
 @pytest.mark.asyncio
@@ -746,6 +782,13 @@ async def test_call_compaction_llm_adds_tokenrhythm_app_attribution(monkeypatch)
         model="deepseek-v4-flash",
         api_key="test-key",
         base_url="https://tokenrhythm.studio/v1",
+        provider="tokenrhythm",
+        provider_request_correlation=ProviderRequestCorrelation(
+            session_id="session-1",
+            turn_id="turn-1",
+            execution_id="compaction-1",
+            call_kind="auxiliary.compaction",
+        ),
     )
 
     assert result == "summary"
@@ -753,6 +796,10 @@ async def test_call_compaction_llm_adds_tokenrhythm_app_attribution(monkeypatch)
     headers = captured["headers"]
     assert isinstance(headers, dict)
     assert headers["HTTP-Referer"] == "https://opensquilla.ai"
+    assert headers["X-OpenSquilla-Session-Id"] == "session-1"
+    assert headers["X-OpenSquilla-Turn-Id"] == "turn-1"
+    assert headers["X-OpenSquilla-Execution-Id"] == "compaction-1"
+    assert headers["X-OpenSquilla-Call-Kind"] == "auxiliary.compaction"
     assert headers["X-Title"] == "OpenSquilla"
 
 

@@ -193,6 +193,15 @@ export function createDesktopPlatform(): Platform {
       getDesktopSettings: () => requireDesktopApi().getDesktopSettings(),
       saveDesktopSettings: (payload) => requireDesktopApi().saveDesktopSettings(payload),
       resetDesktopSettings: () => requireDesktopApi().resetDesktopSettings(),
+      ...(typeof window.opensquillaDesktop?.getDesktopPreferences === 'function'
+        && typeof window.opensquillaDesktop?.saveDesktopPreferences === 'function'
+        ? {
+            getDesktopPreferences: () => requireDesktopApi().getDesktopPreferences!(),
+            saveDesktopPreferences: (payload) => (
+              requireDesktopApi().saveDesktopPreferences!(payload)
+            ),
+          }
+        : {}),
     },
     onboarding: {
       getDefaults: () => requireDesktopApi().getOnboardingDefaults(),

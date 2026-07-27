@@ -218,14 +218,32 @@ class SetupEngine:
             if not enabled and not provider_id:
                 res = disable_image_generation(self.config)
             else:
+                fallbacks = payload.get("fallbacks")
+                if fallbacks is not None and not isinstance(fallbacks, list):
+                    raise ValueError("fallbacks must be a list of provider/model references")
                 res = upsert_image_generation_provider(
                     self.config,
                     provider_id=provider_id,
                     primary=str(payload.get("primary") or ""),
                     api_key=str(payload.get("apiKey") or ""),
                     api_key_env=str(payload.get("apiKeyEnv") or ""),
-                    base_url=str(payload.get("baseUrl") or ""),
+                    base_url=_optional_str(payload.get("baseUrl")),
                     enabled=enabled,
+                    size=str(payload.get("size") or ""),
+                    output_format=str(payload.get("outputFormat") or ""),
+                    fallbacks=(
+                        [str(fallback) for fallback in fallbacks]
+                        if fallbacks is not None
+                        else None
+                    ),
+                    clear_fallbacks=_strict_bool(
+                        payload.get("clearFallbacks"), field="clearFallbacks"
+                    ),
+                    credential_mode=(
+                        None
+                        if payload.get("credentialMode") is None
+                        else str(payload.get("credentialMode"))
+                    ),
                 )
         elif normalized in AUDIO_SECTION_ALIASES:
             res = upsert_audio_provider(

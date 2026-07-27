@@ -1426,3 +1426,41 @@ def test_record_turn_updates_transcript_and_usage() -> None:
     assert [turn.role for turn in state.transcript.turns] == ["user", "assistant"]
     assert state.transcript.turns[0].content == "ask"
     assert state.transcript.turns[1].content == "answer"
+
+
+class _HostCapableOutput:
+    supports_send_message = True
+
+    async def send_message(self, *_args: Any) -> None:
+        return None
+
+
+async def test_keys_dispatch_selects_cheatsheet_by_backend_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Binds the wiring, not the parts: a host-capable output must get the
+    # OpenTUI chords, and a native/absent output must get only the honest
+    # plain-mode rows — never OpenTUI-only shortcuts it cannot deliver.
+    gateway_recorder = _patch_gateway_io(monkeypatch)
+    handled = await handle_gateway_slash_command(
+        "/keys", _gateway_context(tui_output=_HostCapableOutput())
+    )
+    assert handled is True
+    table = gateway_recorder.entries[-1]
+    opentui_rows = "\n".join(str(cell) for column in table.columns for cell in column.cells)
+    assert "Ctrl+O" in opentui_rows
+
+    gateway_recorder.entries.clear()
+    handled = await handle_gateway_slash_command("/keys", _gateway_context(tui_output=None))
+    assert handled is True
+    table = gateway_recorder.entries[-1]
+    native_rows = "\n".join(str(cell) for column in table.columns for cell in column.cells)
+    assert "Ctrl+O" not in native_rows
+    assert "Ctrl+C" in native_rows
+
+    standalone_recorder = _patch_standalone_io(monkeypatch)
+    handled = await handle_standalone_slash_command("/shortcuts", _standalone_context())
+    assert handled is True
+    table = standalone_recorder.entries[-1]
+    native_rows = "\n".join(str(cell) for column in table.columns for cell in column.cells)
+    assert "Ctrl+O" not in native_rows

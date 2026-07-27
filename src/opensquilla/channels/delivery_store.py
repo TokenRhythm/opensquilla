@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import ntpath
 import os
 import re
 import sqlite3
@@ -53,6 +54,20 @@ _PAIRING_PRUNE_EVERY = 64
 # events remain tracked until claimed; only claimed pass-through events are
 # eligible for LRU eviction.
 _DEGRADED_INGRESS_DEDUPE_SIZE = 10_000
+
+
+def _native_db_path(path: str | Path) -> str:
+    """Return an internal SQLite spelling without changing the public path."""
+
+    value = os.fspath(path)
+    if value == ":memory:" or os.name != "nt":
+        return value
+    absolute = ntpath.abspath(value)
+    if absolute.startswith("\\\\?\\"):
+        return absolute
+    if absolute.startswith("\\\\"):
+        return f"\\\\?\\UNC\\{absolute[2:]}"
+    return f"\\\\?\\{absolute}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,14 +160,15 @@ class ChannelDeliveryStore:
         pairing_refresh_window_s: float = PAIRING_REFRESH_WINDOW_S,
     ) -> None:
         self.path = Path(db_path) if db_path is not None else state_dir("channel_delivery.sqlite")
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        native_db_path = _native_db_path(self.path)
+        os.makedirs(_native_db_path(self.path.parent), exist_ok=True)
         self._pending_pairing_ttl_s = pending_pairing_ttl_s
         self._max_pending_pairings_per_channel = max_pending_pairings_per_channel
         self._pairing_refresh_window_s = pairing_refresh_window_s
         self._pairing_writes = 0
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(
-            os.fspath(self.path),
+            native_db_path,
             timeout=30.0,
             check_same_thread=False,
         )
@@ -181,7 +197,7 @@ class ChannelDeliveryStore:
         with self._lock:
             self._conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
         with contextlib.suppress(OSError):
-            self.path.chmod(0o600)
+            os.chmod(native_db_path, 0o600)
 
     def _init_schema(self) -> None:
         with self._lock:

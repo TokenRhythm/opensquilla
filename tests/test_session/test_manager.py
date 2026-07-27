@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import os
+import shutil
 import sqlite3
 import stat
 from pathlib import Path
@@ -279,21 +280,318 @@ async def test_apply_intent_reset_same_key_missing_creates_session(manager):
 
 
 @pytest.mark.asyncio
-async def test_apply_intent_reset_same_key_archive_failure_does_not_block(
+async def test_apply_intent_reset_same_key_archive_failure_preserves_history(
     manager, tmp_path, monkeypatch
 ):
     archive_file = tmp_path / "not-a-directory"
     archive_file.write_text("occupied", encoding="utf-8")
     monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(archive_file))
     node = await manager.create("agent:main:main")
+    old_epoch = int(node.epoch or 0)
+    manager.set_cached_epoch(node.session_key, old_epoch)
     old_session_id = node.session_id
     await manager.append_message("agent:main:main", "user", "hello")
+    await manager._storage.save_summary(
+        SessionSummary(
+            session_id=old_session_id,
+            session_key="agent:main:main",
+            summary_text="preserve me",
+        )
+    )
 
-    applied, rotated = await manager.apply_intent("agent:main:main", SessionIntent.RESET_SAME_KEY)
+    with pytest.raises(OSError):
+        await manager.apply_intent("agent:main:main", SessionIntent.RESET_SAME_KEY)
 
-    assert rotated is True
-    assert applied.session_id != old_session_id
-    assert await manager._storage.count_transcript_entries(old_session_id) == 0
+    persisted = await manager.get_session("agent:main:main")
+    assert persisted is not None
+    assert persisted.session_id == old_session_id
+    assert persisted.epoch == old_epoch
+    assert manager.get_cached_epoch(node.session_key) == old_epoch
+    assert await manager._storage.count_transcript_entries(old_session_id) == 1
+    summaries = await manager._storage.get_all_summaries(old_session_id)
+    assert [summary.summary_text for summary in summaries] == ["preserve me"]
+
+
+@pytest.mark.asyncio
+async def test_reset_storage_failure_preserves_identity_history_and_cache(
+    manager,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    node = await manager.create("agent:main:main")
+    old_session_id = node.session_id
+    old_epoch = int(node.epoch or 0)
+    manager.set_cached_epoch(node.session_key, old_epoch)
+    await manager.append_message("agent:main:main", "user", "hello")
+    monkeypatch.setattr(
+        manager._storage,
+        "reset_session",
+        AsyncMock(side_effect=OSError("reset unavailable")),
+    )
+
+    with pytest.raises(OSError, match="reset unavailable"):
+        await manager.apply_intent("agent:main:main", SessionIntent.RESET_SAME_KEY)
+
+    persisted = await manager.get_session("agent:main:main")
+    assert persisted is not None
+    assert persisted.session_id == old_session_id
+    assert persisted.epoch == old_epoch
+    assert node.session_id == old_session_id
+    assert node.epoch == old_epoch
+    assert manager.get_cached_epoch(node.session_key) == old_epoch
+    assert await manager._storage.count_transcript_entries(old_session_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_reset_archive_capture_failure_preserves_identity_and_history(
+    manager,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    node = await manager.create("agent:main:main")
+    old_session_id = node.session_id
+    await manager.append_message("agent:main:main", "user", "hello")
+    monkeypatch.setattr(
+        manager._storage,
+        "_select_canonical_transcript",
+        AsyncMock(side_effect=OSError("transcript unavailable")),
+    )
+
+    with pytest.raises(OSError, match="transcript unavailable"):
+        await manager.apply_intent("agent:main:main", SessionIntent.RESET_SAME_KEY)
+
+    persisted = await manager.get_session("agent:main:main")
+    assert persisted is not None
+    assert persisted.session_id == old_session_id
+    assert await manager._storage.count_transcript_entries(old_session_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_reset_mid_delete_failure_rolls_back_every_database_change(
+    manager,
+    tmp_path,
+    monkeypatch,
+):
+    archive_dir = tmp_path / "archives"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(archive_dir))
+    node = await manager.create("agent:main:main")
+    old_session_id = node.session_id
+    old_epoch = int(node.epoch or 0)
+    manager.set_cached_epoch(node.session_key, old_epoch)
+    await manager.append_message("agent:main:main", "user", "preserve transcript")
+    await manager._storage.save_summary(
+        SessionSummary(
+            session_id=old_session_id,
+            session_key=node.session_key,
+            summary_text="preserve summary",
+        )
+    )
+    await manager.save_context_state(
+        SessionContextState(
+            session_id=old_session_id,
+            session_key=node.session_key,
+            provider="portable",
+            state_kind="structured_summary_v1",
+            payload={"current_status": "preserve context"},
+            covered_through_id=1,
+            valid=True,
+        )
+    )
+
+    async def fail_after_transcript_delete(conn, session_id: str) -> None:
+        await conn.execute(
+            "DELETE FROM transcript_entries WHERE session_id = ?",
+            (session_id,),
+        )
+        await conn.execute(
+            "DELETE FROM compacted_transcript_entries WHERE session_id = ?",
+            (session_id,),
+        )
+        raise OSError("injected mid-delete failure")
+
+    monkeypatch.setattr(
+        manager._storage,
+        "_delete_reset_history",
+        fail_after_transcript_delete,
+    )
+
+    with pytest.raises(OSError, match="injected mid-delete failure"):
+        await manager.apply_intent(node.session_key, SessionIntent.RESET_SAME_KEY)
+
+    persisted = await manager.get_session(node.session_key)
+    assert persisted is not None
+    assert persisted.session_id == old_session_id
+    assert persisted.epoch == old_epoch
+    assert node.session_id == old_session_id
+    assert node.epoch == old_epoch
+    assert manager.get_cached_epoch(node.session_key) == old_epoch
+    transcript = await manager._storage.get_transcript(old_session_id)
+    assert [entry.content for entry in transcript] == ["preserve transcript"]
+    summaries = await manager._storage.get_all_summaries(old_session_id)
+    assert [summary.summary_text for summary in summaries] == ["preserve summary"]
+    context_states = await manager.get_context_states(node.session_key)
+    assert len(context_states) == 1
+    assert context_states[0].valid is True
+
+    archive_files = list(archive_dir.glob("*.json"))
+    assert len(archive_files) == 1
+    archived = json.loads(archive_files[0].read_text(encoding="utf-8"))
+    assert archived["session_id"] == old_session_id
+    assert archived["transcript_entries"][0]["content"] == "preserve transcript"
+    assert archived["summaries"][0]["summary_text"] == "preserve summary"
+
+
+@pytest.mark.asyncio
+async def test_reset_archive_fsyncs_before_atomic_publish_and_avoids_collisions(
+    manager,
+    tmp_path,
+    monkeypatch,
+):
+    from opensquilla.session import manager as manager_module
+
+    archive_dir = tmp_path / "archives"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(archive_dir))
+    monkeypatch.setattr(manager_module, "_now_ms", lambda: 123456789)
+    node = await manager.create("agent:main:main")
+    await manager.append_message(node.session_key, "user", "durable archive")
+    entries = await manager._storage.get_canonical_transcript(node.session_id)
+
+    events: list[str] = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def tracking_fsync(fd: int) -> None:
+        events.append("fsync")
+        real_fsync(fd)
+
+    def tracking_replace(source, destination) -> None:
+        assert "fsync" in events
+        events.append("replace")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(manager_module.os, "fsync", tracking_fsync)
+    monkeypatch.setattr(manager_module.os, "replace", tracking_replace)
+
+    await manager.write_session_archive(node, entries, [])
+    await manager.write_session_archive(node, entries, [])
+
+    assert events.count("replace") == 2
+    assert events[0] == "fsync"
+    archives = list(archive_dir.glob("*.json"))
+    assert len(archives) == 2
+    assert archives[0].name != archives[1].name
+    assert list(archive_dir.glob("*.tmp")) == []
+    for archive in archives:
+        payload = json.loads(archive.read_text(encoding="utf-8"))
+        assert payload["transcript_entries"][0]["content"] == "durable archive"
+
+
+@pytest.mark.asyncio
+async def test_reset_archive_publish_failure_removes_temporary_file(
+    manager,
+    tmp_path,
+    monkeypatch,
+):
+    from opensquilla.session import manager as manager_module
+
+    archive_dir = tmp_path / "archives"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(archive_dir))
+    node = await manager.create("agent:main:main")
+    await manager.append_message(node.session_key, "user", "keep source")
+    entries = await manager._storage.get_canonical_transcript(node.session_id)
+
+    def fail_replace(_source, _destination) -> None:
+        raise OSError("replace unavailable")
+
+    monkeypatch.setattr(manager_module.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace unavailable"):
+        await manager.write_session_archive(node, entries, [])
+
+    assert list(archive_dir.iterdir()) == []
+    persisted = await manager.get_session(node.session_key)
+    assert persisted is not None
+    assert persisted.session_id == node.session_id
+    transcript = await manager._storage.get_transcript(node.session_id)
+    assert [entry.content for entry in transcript] == ["keep source"]
+
+
+@pytest.mark.asyncio
+async def test_reset_archive_bounds_filename_but_preserves_full_session_key(
+    manager,
+    tmp_path,
+    monkeypatch,
+):
+    from opensquilla.paths import native_io_path
+
+    archive_dir = tmp_path / "archives"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(archive_dir))
+    node = await manager.create("agent:main:main")
+    await manager.append_message(node.session_key, "user", "long key archive")
+    entries = await manager._storage.get_canonical_transcript(node.session_id)
+    long_key = "agent:main:" + ("long-key-" * 80)
+    archive_node = node.model_copy(deep=True)
+    archive_node.session_key = long_key
+
+    await manager.write_session_archive(archive_node, entries, [])
+
+    archives = list(archive_dir.glob("*.json"))
+    assert len(archives) == 1
+    archive = archives[0]
+    assert len(archive.name) <= 255
+    payload = json.loads(native_io_path(archive).read_text(encoding="utf-8"))
+    assert payload["session_key"] == long_key
+    assert payload["transcript_entries"][0]["content"] == "long key archive"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length path contract")
+async def test_reset_archive_supports_long_windows_path(
+    manager,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.paths import native_io_path
+
+    long_root = tmp_path / "long-session-archive"
+    archive_root = long_root
+    index = 0
+    while len(str(archive_root)) <= 280:
+        archive_root /= f"segment-{index:02d}-" + ("a" * 40)
+        index += 1
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(archive_root))
+
+    try:
+        node = await manager.create("agent:main:main")
+        old_session_id = node.session_id
+        await manager.append_message("agent:main:main", "user", "long archive")
+        await manager._storage.save_summary(
+            SessionSummary(
+                session_id=old_session_id,
+                session_key="agent:main:main",
+                summary_text="long archive summary",
+            )
+        )
+
+        applied, rotated = await manager.apply_intent(
+            "agent:main:main",
+            SessionIntent.RESET_SAME_KEY,
+        )
+
+        assert rotated is True
+        assert applied.session_id != old_session_id
+        archive_files = list(native_io_path(archive_root).glob("*.json"))
+        assert len(archive_files) == 1
+        archived = json.loads(archive_files[0].read_text(encoding="utf-8"))
+        assert archived["session_id"] == old_session_id
+        assert archived["transcript_entries"][0]["content"] == "long archive"
+        assert archived["summaries"][0]["summary_text"] == "long archive summary"
+    finally:
+        native_root = native_io_path(long_root)
+        if native_root.exists():
+            shutil.rmtree(native_root)
 
 
 @pytest.mark.asyncio

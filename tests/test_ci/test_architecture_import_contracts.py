@@ -35,6 +35,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("cli", "observability"),
     ("cli", "onboarding"),
     ("cli", "persistence"),
+    # CLI maintenance commands attach the same typed provider-correlation
+    # envelope as the shared turn loop; provider remains a lower-level leaf.
+    ("cli", "provider"),
     # The root CLI exposes the offline recovery adapter and writer entrypoints
     # acquire recovery locks; recovery never imports the CLI back.
     ("cli", "recovery"),
@@ -115,6 +118,12 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("memory", "agents"),
     ("memory", "compat"),
     ("memory", "engine"),
+    # The project-workspace aggregate owns validation across agent identity,
+    # sandbox run contexts, and persisted session bindings. It remains a
+    # top-level composition module rather than a dependency of those packages.
+    ("project_workspaces.py", "agents"),
+    ("project_workspaces.py", "sandbox"),
+    ("project_workspaces.py", "session"),
     ("memory", "gateway"),
     ("memory", "identity"),
     ("memory", "provider"),
