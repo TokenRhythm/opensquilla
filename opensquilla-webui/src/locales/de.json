@@ -1988,7 +1988,33 @@
       "next12h": "Nächste 12 Stunden",
       "upcomingRun": "bevorstehender Lauf",
       "nowTick": "jetzt",
-      "deleteFailed": "Löschen fehlgeschlagen: {error}"
+      "deleteFailed": "Löschen fehlgeschlagen: {error}",
+      "bulkManage": "Stapelverwaltung",
+      "exitBulk": "Stapelmodus beenden",
+      "overview": "Ausführungsübersicht",
+      "addFromTemplate": "Aus Vorlage hinzufügen",
+      "addAutomation": "Automatisierung hinzufügen",
+      "heroTitle": "Erste Automatisierung starten",
+      "heroHint": "OpenSquilla erledigt Erinnerungen, Organisation, Prüfungen und Agentenaufgaben automatisch zur festgelegten Zeit.",
+      "overviewDesc": "Status und letzte Ausführungen der Automatisierungen anzeigen.",
+      "templateDesc": "Wählen Sie ein Szenario, um Zeitplan und Aufgabenbeschreibung vorab auszufüllen.",
+      "selectedCount": "{count} ausgewählt",
+      "selectVisible": "Sichtbare auswählen",
+      "clearSelection": "Leeren",
+      "overviewEyebrow": "AUTOMATISIERUNGSÜBERSICHT",
+      "galleryEyebrow": "AUTOMATISIERUNGSVORLAGEN",
+      "bulkDeleteConfirm": "{count} ausgewählte Automatisierungen löschen? Dies kann nicht rückgängig gemacht werden.",
+      "templates": {
+        "ai-daily": { "title": "Täglicher KI-Nachrichtenüberblick", "description": "Fasst wichtige KI-Nachrichten der letzten 24 Stunden mit geprüften Quellen zusammen.", "category": "Nachrichten", "schedule": "Täglich um 08:00" },
+        "weekly-report": { "title": "Wöchentlicher Arbeitsrückblick", "description": "Fasst Fortschritte, Risiken, Ergebnisse und Prioritäten der nächsten Woche zusammen.", "category": "Produktivität", "schedule": "Freitag um 17:30" },
+        "english-five": { "title": "Fünf englische Wörter täglich", "description": "Erstellt eine kurze Vokabellektion mit Beispielen und Quiz.", "category": "Lernen", "schedule": "Täglich um 09:00" },
+        "project-risk": { "title": "Projektrisiken prüfen", "description": "Prüft Verzögerungen, Fehler und offene Punkte und schlägt Maßnahmen vor.", "category": "Projekte", "schedule": "Werktags um 10:00" },
+        "knowledge-review": { "title": "Wöchentlicher Wissensrückblick", "description": "Ordnet neue Notizen und Besprechungen und erstellt eine Nachbereitungsliste.", "category": "Wissen", "schedule": "Sonntag um 18:00" },
+        "daily-idea": { "title": "Tägliche Idee und Wissenshäppchen", "description": "Teilt eine verlässliche Tatsache und eine kleine umsetzbare Idee.", "category": "Alltag", "schedule": "Täglich um 12:00" },
+        "bedtime-story": { "title": "Tägliche Gute-Nacht-Geschichte", "description": "Schreibt eine warme, fantasievolle Kurzgeschichte für Familien.", "category": "Familie", "schedule": "Täglich um 20:30" },
+        "classic-movie": { "title": "Klassische Filmempfehlung", "description": "Empfiehlt einen anerkannten Filmklassiker ohne Spoiler.", "category": "Unterhaltung", "schedule": "Samstag um 19:00" },
+        "today-in-history": { "title": "Heute in der Geschichte", "description": "Stellt ein verlässliches historisches Ereignis aus Wissenschaft, Kultur oder Gesellschaft vor.", "category": "Tägliches Wissen", "schedule": "Täglich um 08:30" }
+      }
     },
     "deleteDialog": {
       "title": "Zeitplan löschen",
@@ -2031,7 +2057,8 @@
       "colSchedule": "Zeitplan",
       "colStatus": "Status",
       "colLastRun": "Letzter Lauf",
-      "colNextRun": "Nächster Lauf"
+      "colNextRun": "Nächster Lauf",
+      "selectJob": "{name} auswählen"
     },
     "runHistory": {
       "eyebrow": "Laufverlauf",
@@ -2102,6 +2129,32 @@
       "fdWebhook": "Ein Webhook",
       "enabled": "Aktiviert",
       "saveSchedule": "Zeitplan speichern"
+      ,"friendlyNamePlaceholder": "Beispiel: Kundenfeedback täglich zusammenfassen"
+      ,"friendlyTypeCron": "Zu einer festen Zeit wiederholen"
+      ,"friendlyTypeEvery": "In festem Abstand wiederholen"
+      ,"friendlyTypeAt": "Einmal zu einer bestimmten Zeit ausführen"
+      ,"executionFrequency": "Häufigkeit"
+      ,"daily": "Täglich"
+      ,"weekdays": "Werktags"
+      ,"weekly": "Wöchentlich"
+      ,"monthly": "Monatlich"
+      ,"customAdvancedTime": "Erweiterter Zeitplan"
+      ,"weekday": "Wochentag"
+      ,"date": "Datum"
+      ,"monthlyDay": "Jeden Monat am {day}."
+      ,"specificTime": "Uhrzeit"
+      ,"customTimeHint": "Verwenden Sie eine flexiblere Zeitregel."
+      ,"openAdvancedTime": "Erweiterten Zeitplan öffnen"
+      ,"everyHowOften": "Wiederholen alle"
+      ,"timeUnit": "Zeiteinheit"
+      ,"minutes": "Minuten"
+      ,"hours": "Stunden"
+      ,"days": "Tage"
+      ,"dateAndTime": "Datum und Uhrzeit"
+      ,"friendlyMessagePlaceholder": "Beispiel: Heutiges Kundenfeedback zusammenfassen und nächste Schritte vorschlagen"
+      ,"moreRuntimeSettings": "Weitere Ausführungseinstellungen (optional)"
+      ,"advancedTimeHint": "Nur verwenden, wenn die obige Zeitauswahl nicht ausreicht."
+      ,"timezoneSimpleHint": "Normalerweise ist keine Änderung erforderlich."
     },
     "form": {
       "cronPreviewPlaceholder": "Geben Sie einen Cron-Ausdruck mit 5 Feldern ein, um eine Vorschau zu sehen",
@@ -2227,6 +2280,8 @@
       "reloadNoChanges": "Der Fähigkeitenkatalog ist bereits aktuell (Generation {generation}).",
       "reloadPartial": "Der Fähigkeitenkatalog wurde als Generation {generation} mit {errors} Fehler(n) geladen. {summary}",
       "reloadFailed": "Der Fähigkeitenkatalog konnte nicht neu geladen werden: {error}",
+      "overviewTitle": "Fähigkeitenübersicht",
+      "overviewDesc": "Installations- und Konfigurationsstatus prüfen und Fähigkeiten nach Kategorie filtern.",
       "reloadListFailed": "Der Katalog wurde neu geladen, aber die aktualisierte Fähigkeitenliste konnte nicht geladen werden.",
       "reloadUnknownError": "Das Gateway verwendet weiterhin den vorherigen Katalog.",
       "tabsLabel": "Fähigkeitenquelle",
@@ -2304,6 +2359,10 @@
       "unknown": "unbekannt",
       "noAudit": "Keine Entscheidung zur automatischen Aktivierung aufgezeichnet.",
       "gates": "Tore"
+    },
+    "tile": {
+      "installed": "Installiert",
+      "add": "Hinzufügen"
     },
     "skillCard": {
       "subSkillsTitle": "Von dieser Meta-Fähigkeit verwendete Unterfähigkeiten",
@@ -2673,6 +2732,14 @@
     "historyTurnLoadedCount": "Geladene Eingabe {number} von {total}",
     "historyAttachmentOnly": "Nachricht nur mit Anhang",
     "historyAttachmentCount": "Anhänge: {count}",
+    "loadingSession": "Unterhaltung wird geladen…",
+    "loadingSessionDescription": "Letzte Nachrichten und der Sitzungsstatus werden wiederhergestellt…",
+    "loadSessionFailed": "Unterhaltung vorübergehend nicht verfügbar",
+    "loadSessionDescription": "Die Verbindung wurde möglicherweise unterbrochen oder der Verlaufsdienst ist vorübergehend nicht verfügbar. Bitte laden Sie erneut.",
+    "reloadSession": "Neu laden",
+    "retryingSession": "Unterhaltung wird neu geladen",
+    "retryingSessionDescription": "Der Unterhaltungsverlauf wird wiederhergestellt…",
+    "retryingSessionAction": "Wird neu geladen…",
     "noMessagesYet": "Noch keine Nachrichten.",
     "newChat": "Neue Aufgabe",
     "chatWithSuffix": "Chat {suffix}",
@@ -3013,6 +3080,21 @@
       "planWeek": "Entwirf einen Plan für meine Woche",
       "searchAiNews": "Suche die heutigen AI-News",
       "generateImage": "Generiere ein Bild eines winzigen Tintenfisch-Maskottchens"
+    },
+    "metaQuick": {
+      "webpage": "Multimedia-Webseite erstellen",
+      "shortDrama": "KI-Kurzfilm erstellen",
+      "paperWriting": "Wissenschaftliche Arbeit schreiben",
+      "webpageDesc": "Eine fertige, einsatzbereite Website erstellen",
+      "shortDramaDesc": "Drehbuch, Szenen und fertiges Video erstellen",
+      "paperWritingDesc": "Recherchieren, schreiben und die Arbeit kompilieren"
+    },
+    "metaDescriptions": {
+      "webpage": "Eine vollständige Multimedia-Website aus einem Thema erstellen.",
+      "kidsProject": "Ein sicheres, altersgerechtes Kreativprojekt für Kinder planen.",
+      "shortDrama": "Einen KI-Kurzfilm vom Drehbuch bis zum fertigen Video erstellen.",
+      "skillCreator": "Bestehende Skills zu einem wiederverwendbaren Workflow verbinden.",
+      "paperWriting": "Eine wissenschaftliche Arbeit recherchieren, schreiben und kompilieren."
     },
     "toast": {
       "downloadFailedHttp": "Download fehlgeschlagen — HTTP {status}",

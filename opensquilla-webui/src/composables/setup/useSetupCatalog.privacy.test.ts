@@ -2961,6 +2961,77 @@ describe('useSetupCatalog configured provider management', () => {
     app.unmount()
   })
 
+  it('removes the active provider with one atomic RPC and never chains activate then remove', async () => {
+    const status = {
+      ...statusWithDeepSeek(),
+      llmProfileStatus: statusWithDeepSeek().llmProfileStatus.map(profile => (
+        profile.provider === 'deepseek'
+          ? { ...profile, primaryEligible: true, primaryBlockReason: '' }
+          : profile
+      )),
+    }
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return { providers }
+      if (method === 'onboarding.status') return status
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') return configWithProfiles('deepseek')
+      if (method === 'onboarding.models.discover') {
+        return { ok: true, source: 'none', models: [] }
+      }
+      if (method === 'onboarding.llmProfile.active.remove') return { changed: true }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    await api.removeProviderProfile('openai')
+
+    expect(rpcCall).toHaveBeenCalledWith('onboarding.llmProfile.active.remove', {
+      providerId: 'openai',
+      replacementProviderId: 'deepseek',
+    })
+    expect(rpcCall.mock.calls.some(call => call[0] === 'onboarding.llmProfile.activate'))
+      .toBe(false)
+    expect(rpcCall.mock.calls.some(call => call[0] === 'onboarding.llmProfile.remove'))
+      .toBe(false)
+    app.unmount()
+  })
+
+  it('does not offer a two-RPC fallback when active removal is unsupported', async () => {
+    supportsMethod.mockImplementation(method => (
+      method !== 'onboarding.llmProfile.active.remove'
+    ))
+    const status = {
+      ...statusWithDeepSeek(),
+      llmProfileStatus: statusWithDeepSeek().llmProfileStatus.map(profile => (
+        profile.provider === 'deepseek'
+          ? { ...profile, primaryEligible: true, primaryBlockReason: '' }
+          : profile
+      )),
+    }
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return { providers }
+      if (method === 'onboarding.status') return status
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') return configWithProfiles('deepseek')
+      if (method === 'onboarding.models.discover') {
+        return { ok: true, source: 'none', models: [] }
+      }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    expect(api.providerPanel.value.primaryProviderRemovalSupported).toBe(false)
+    await api.removeProviderProfile('openai')
+
+    expect(confirmAction).not.toHaveBeenCalled()
+    expect(rpcCall.mock.calls.some(call => [
+      'onboarding.llmProfile.active.remove',
+      'onboarding.llmProfile.activate',
+      'onboarding.llmProfile.remove',
+    ].includes(String(call[0])))).toBe(false)
+    app.unmount()
+  })
+
   it('clears the active provider credential without removing its deployment settings', async () => {
     let credentialCleared = false
     const savedConfig = {

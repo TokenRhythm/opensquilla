@@ -90,6 +90,11 @@ class SkillSpec:
     provenance: SkillProvenance = field(default_factory=SkillProvenance)
     user_invocable: bool = True
     disable_model_invocation: bool = False
+    # Optional localized (Simplified Chinese) one-line description. Falls back
+    # to ``description`` (English) when absent. Sourced from the SKILL.md
+    # front-matter ``description_zh`` field, mirroring the ``_zh/_en``
+    # convention already used by meta-skill clarify prompts.
+    description_zh: str = ""
     homepage: str = ""
     file_path: str = ""
     base_dir: str = ""

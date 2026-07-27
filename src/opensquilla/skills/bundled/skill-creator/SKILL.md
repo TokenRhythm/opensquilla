@@ -1,6 +1,7 @@
 ---
 name: skill-creator
 description: Create, edit, improve, or audit AgentSkills. Use when creating a new skill from scratch or when asked to improve, review, audit, tidy up, or clean up an existing skill or SKILL.md file. Also use when editing or restructuring a skill directory (moving files to references/ or scripts/, removing stale content, validating against the AgentSkills spec). Triggers on phrases like "create a skill", "author a skill", "tidy up a skill", "improve this skill", "review the skill", "clean up the skill", "audit the skill".
+description_zh: "创建、编辑、改进或审查AgentSkills。当从零创建新技能，或被要求改进、审查、审计、整理或清理现有技能或SKILL.md文件时使用。也用于编辑或重构技能目录（将文件移到references/或scripts/、删除过时内容、按AgentSkills规范校验）。触发短语如'创建技能'、'编写技能'、'整理技能'、'改进这个技能'、'审查技能'、'清理技能'、'审计技能'。"
 provenance:
   origin: openclaw-derived
   license: MIT

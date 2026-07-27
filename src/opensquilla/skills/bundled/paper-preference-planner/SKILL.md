@@ -1,6 +1,7 @@
 ---
 name: paper-preference-planner
 description: "Extract paper-writing preferences from a user request before research and drafting, choosing direct generation defaults when the request does not require a preference interview."
+description_zh: "在研究和起草前，从用户请求中提取论文写作偏好；当请求无需偏好访谈时选择直接生成的默认设置。"
 provenance:
   origin: opensquilla-original
   license: Apache-2.0

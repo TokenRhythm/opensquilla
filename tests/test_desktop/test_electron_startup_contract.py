@@ -316,12 +316,12 @@ def test_boot_and_native_window_backgrounds_match_control_ui_theme_tokens() -> N
     light_tokens = _read("opensquilla-webui/src/themes/light/tokens.css")
     dark_tokens = _read("opensquilla-webui/src/themes/dark/tokens.css")
 
-    assert "--bg: #F4F5F7;" in light_tokens
-    assert "--bg: #0E0F11;" in dark_tokens
-    assert "--bg: #F4F5F7;" in boot_html
-    assert "--bg: #0E0F11;" in boot_html
-    assert "const DESKTOP_LIGHT_BACKGROUND_COLOR = '#F4F5F7'" in main_ts
-    assert "const DESKTOP_DARK_BACKGROUND_COLOR = '#0E0F11'" in main_ts
+    assert "--bg: #F7F7F8;" in light_tokens
+    assert "--bg: #18181A;" in dark_tokens
+    assert "--bg: #F7F7F8;" in boot_html
+    assert "--bg: #18181A;" in boot_html
+    assert "const DESKTOP_LIGHT_BACKGROUND_COLOR = '#F7F7F8'" in main_ts
+    assert "const DESKTOP_DARK_BACKGROUND_COLOR = '#18181A'" in main_ts
     assert main_ts.count("backgroundColor: desktopWindowBackgroundColor()") == 1
     assert "const backgroundColor = desktopWindowBackgroundColor()" in main_ts
     assert "#08080A" not in main_ts

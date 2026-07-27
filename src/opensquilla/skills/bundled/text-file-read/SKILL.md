@@ -1,6 +1,7 @@
 ---
 name: text-file-read
 description: "Read a UTF-8 text file and emit its raw content on stdout. Tiny helper for meta-skills that need to round-trip an artefact through disk so the user can hand-edit it between steps (e.g. tweak script.txt during a review pause). Unlike the builtin read_file tool — which returns line-numbered output for model display — this returns bytes verbatim, suitable for downstream parsers."
+description_zh: "读取UTF-8文本文件并将其原始内容输出到stdout。为需要将产物往返磁盘以便用户在步骤间手动编辑的meta-skill提供的小工具（如评审暂停时修改script.txt）。与内置read_file工具（返回带行号的输出供模型显示）不同，本工具逐字节原样返回，适合下游解析器。"
 provenance:
   origin: opensquilla-original
   license: Apache-2.0

@@ -1,6 +1,7 @@
 ---
 name: paper-outline-author
 description: "Author a 5-section paper outline (abstract / introduction / method / results / discussion) for a research topic, citing supplied reference keys when relevant."
+description_zh: "为研究主题撰写五段式论文提纲（摘要/引言/方法/结果/讨论），并在相关处引用给定的参考文献键。"
 provenance:
   origin: opensquilla-original
   license: Apache-2.0

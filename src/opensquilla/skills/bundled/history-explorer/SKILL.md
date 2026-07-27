@@ -1,6 +1,7 @@
 ---
 name: history-explorer
 description: "Query the per-turn DecisionEntry log for skill co-occurrence patterns, meta-skill usage stats, and the router fixture corpus. Returns a JSON summary suitable for downstream LLM consumption. Used by meta-skill-creator's harvest step but also useful standalone for 'which skills did I use most this week?'"
+description_zh: "查询每轮的DecisionEntry日志，分析技能共现模式、元技能使用统计和路由器fixture语料库，返回适合下游LLM消费的JSON摘要。供meta-skill-creator的harvest步骤使用，也可单独用于'本周我最常用哪些技能？'之类的查询。"
 provenance:
   origin: opensquilla-original
   license: Apache-2.0

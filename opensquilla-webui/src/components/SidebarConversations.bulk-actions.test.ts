@@ -12,11 +12,14 @@ afterEach(() => {
   document.body.innerHTML = ''
 })
 
-async function mountSidebar() {
+async function mountSidebar(options: {
+  sections?: SidebarSection[]
+  error?: boolean
+} = {}) {
   i18n.global.locale.value = 'en'
   const root = document.createElement('div')
   document.body.appendChild(root)
-  const sections: SidebarSection[] = [{
+  const sections: SidebarSection[] = options.sections ?? [{
     family: 'chats',
     label: 'Tasks',
     rows: [{
@@ -35,7 +38,7 @@ async function mountSidebar() {
   }]
   const app = createApp(SidebarConversations, {
     sections,
-    error: false,
+    error: options.error ?? false,
     loading: false,
     currentKey: '',
     contractDebugEnabled: false,
@@ -49,6 +52,21 @@ async function mountSidebar() {
 }
 
 describe('SidebarConversations bulk actions', () => {
+  it('does not render the conversations region until a session exists', async () => {
+    const root = await mountSidebar({ sections: [] })
+
+    expect(root.querySelector('.sidebar-history')).toBeNull()
+    expect(root.textContent).not.toContain('No tasks yet')
+    expect(root.textContent).not.toContain('Start a task')
+  })
+
+  it('keeps the retry state visible when loading sessions fails', async () => {
+    const root = await mountSidebar({ sections: [], error: true })
+
+    expect(root.querySelector('.sidebar-history')).toBeTruthy()
+    expect(root.textContent).toContain('Unable to load tasks')
+  })
+
   it('uses a disabled trash action until a task is selected', async () => {
     const root = await mountSidebar()
     const manage = root.querySelector<HTMLButtonElement>('[aria-label="Manage sessions"]')

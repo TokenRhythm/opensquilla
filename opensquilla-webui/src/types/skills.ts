@@ -90,6 +90,7 @@ export interface SkillDependencyInstallOutcome {
 export interface Skill {
   name: string
   description?: string
+  description_zh?: string
   emoji?: string
   status?: string
   status_detail?: string

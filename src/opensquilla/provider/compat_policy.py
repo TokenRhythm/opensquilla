@@ -154,6 +154,13 @@ class OpenAICompatPolicy:
     # when thinking is off (exact ids, lowercase).
     disable_reasoning_by_default_models: frozenset[str] = frozenset()
 
+    # Model id prefixes that reject enable_thinking=False (forced-thinking
+    # endpoints). When a disable-thinking payload would be emitted for a model
+    # matching one of these prefixes, the off-payload is omitted entirely so
+    # the request still succeeds. Checked at the single wire emitter in
+    # openai.py, covering all five agent-loop disable sites at once.
+    thinking_required_model_prefixes: tuple[str, ...] = ()
+
     @property
     def text_tool_synthesis(self) -> bool:
         """Deprecated read-only compatibility view.
@@ -251,6 +258,7 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
         ),
         supports_explicit_prompt_cache=True,
         stream_timeout_fallback=True,
+        thinking_required_model_prefixes=("qwen3.8-",),
     ),
     "bailian_coding": OpenAICompatPolicy(display_name="Bailian Coding"),
     "moonshot": OpenAICompatPolicy(

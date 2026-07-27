@@ -77,7 +77,7 @@
           role="region"
           tabindex="0"
           :aria-label="t('chat.conversation')"
-          :aria-busy="isStreaming"
+          :aria-busy="isStreaming || initialSessionLoadState === 'loading'"
           @scroll="onThreadScroll"
         >
         <template v-if="isNewChatLanding">
@@ -85,19 +85,31 @@
             <EmptyStateChips
               :key="landingAgentId"
               :agent-id="landingAgentId"
+              :meta-skills="metaSkillChoices"
               :suppressed="landingPrefilled"
               @pick="applyLandingSuggestion"
             />
           </div>
         </template>
-        <div v-else-if="messages.length === 0 && !isStreaming" class="chat-empty">{{ t('chat.noMessagesYet') }}</div>
+        <ChatSessionLoadState
+          v-else-if="initialSessionLoadState"
+          :key="sessionKey"
+          :state="initialSessionLoadState"
+          @retry="retryHistory"
+        />
+        <div
+          v-else-if="messages.length === 0 && !isStreaming"
+          class="chat-empty"
+        >
+          {{ t('chat.noMessagesYet') }}
+        </div>
         <HistoryLoadSentinel
-          v-if="!isNewChatLanding"
+          v-if="!isNewChatLanding && !initialSessionLoadState"
           :scroll-container="threadRef"
           :has-more="historyState.hasMore"
-          :loading="historyState.loadingEarlier"
+          :loading="historySentinelLoading"
           :blocked="historyState.loading"
-          :error="historyState.loadEarlierError"
+          :error="historySentinelError"
           :canonical-available="historyState.canonicalAvailable"
           :canonical-complete="historyState.canonicalComplete"
           :cursor="historyState.oldestCursor"
@@ -314,6 +326,16 @@
           />
         </template>
         </div>
+        <!-- Keep the loading announcer outside the busy conversation region:
+             assistive technology may defer live-region updates inside an
+             aria-busy subtree until after this short-lived state unmounts. -->
+        <span
+          class="chat-session-load-announcer"
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+          data-testid="chat-session-load-announcer"
+        >{{ initialSessionLoadAnnouncement }}</span>
         <ConversationMinimap
           v-if="!isNewChatLanding && !shareMode"
           :messages="renderedMessages"
@@ -391,7 +413,7 @@
         @click="selectSlashCmd(cmd)"
       >
         <span class="chat-slash-cmd">{{ cmd.cmd }}</span>
-        <span class="chat-slash-desc">{{ cmd.desc }}</span>
+        <span class="chat-slash-desc" :title="cmd.desc">{{ cmd.desc }}</span>
       </div>
     </div>
 
@@ -508,6 +530,7 @@ import ChatHeaderActions from '@/components/chat/ChatHeaderActions.vue'
 import DeliverablesDrawer from '@/components/chat/DeliverablesDrawer.vue'
 import ChatComposer from '@/components/chat/ChatComposer.vue'
 import ChatMessageList from '@/components/chat/ChatMessageList.vue'
+import ChatSessionLoadState from '@/components/chat/ChatSessionLoadState.vue'
 import ChatStallNotice from '@/components/chat/ChatStallNotice.vue'
 import ClarifyCard from '@/components/chat/ClarifyCard.vue'
 import ConversationMinimap from '@/components/chat/ConversationMinimap.vue'
@@ -614,6 +637,11 @@ import { isShareableChatMessage } from '@/utils/chat/messageIdentity'
 import { agentIdFromSessionKey } from '@/utils/chat/sessionKeys'
 import { clearAssistantActivityExpansionState } from '@/utils/chat/activityDisclosureState'
 import {
+  resolveChatSessionLoadState,
+  shouldShowHistorySentinelError,
+  shouldShowHistorySentinelLoading,
+} from '@/utils/chat/sessionLoadState'
+import {
   isSemanticActivityStatusStep,
   projectAssistantActivityTimeline,
   splitLiveAssistantTimeline,
@@ -658,7 +686,7 @@ const toolResultModal = ref<{
 const rpc = useRpcStore()
 const appStore = useAppStore()
 const router = useRouter()
-const { t } = useI18n()
+const { t, locale } = useI18n()
 const { pushToast } = useToasts()
 const isCompactViewport = useMediaQuery('(max-width: 480px)')
 const isDesktopViewport = useMediaQuery('(min-width: 769px)')
@@ -1222,6 +1250,7 @@ const chatSlashCommands = useChatSlashCommands({
 const {
   slashOpen,
   slashIdx,
+  metaSkillChoices,
   filteredSlashCmds,
   loadSlashCommands,
   handleSlashInput,
@@ -1633,6 +1662,7 @@ watch(messages, () => attachTurnReasoning())
 
 // Unsubscribers
 let unsubs: (() => void)[] = []
+let chatViewDisposed = false
 let composerResizeObserver: ResizeObserver | null = null
 
 /* ── Computed ──────────────────────────────────────────────────────── */
@@ -1648,6 +1678,48 @@ const isNewChatLanding = computed(() => {
     pendingQueue.value.length === 0 &&
     !compactStatus.value.visible
 })
+
+const initialSessionLoadState = computed<'loading' | 'error' | null>(() => {
+  return resolveChatSessionLoadState({
+    isDraftLanding: isNewChatLanding.value,
+    isStreaming: isStreaming.value,
+    messageCount: messages.value.length,
+    initialHistoryStatus: historyState.value.initialLoadStatus,
+    sessionHydrating: isSessionHydrating.value,
+  })
+})
+
+const historySentinelError = computed(() => shouldShowHistorySentinelError({
+  loadEarlierError: historyState.value.loadEarlierError,
+  initialHistoryStatus: historyState.value.initialLoadStatus,
+  initialLoadSurface: initialSessionLoadState.value,
+}))
+
+const historySentinelLoading = computed(() => shouldShowHistorySentinelLoading({
+  loadingEarlier: historyState.value.loadingEarlier,
+  historyLoading: historyState.value.loading,
+  historyRetrying: historyState.value.retrying,
+  initialHistoryStatus: historyState.value.initialLoadStatus,
+  initialLoadSurface: initialSessionLoadState.value,
+}))
+
+const initialSessionLoadAnnouncement = ref('')
+watch(
+  [initialSessionLoadState, locale, sessionKey],
+  ([state, , activeSession]) => {
+    initialSessionLoadAnnouncement.value = ''
+    if (state !== 'loading') return
+    void nextTick(() => {
+      if (
+        initialSessionLoadState.value === 'loading'
+        && sessionKey.value === activeSession
+      ) {
+        initialSessionLoadAnnouncement.value = t('chat.loadingSession')
+      }
+    })
+  },
+  { immediate: true },
+)
 
 const composerPlaceholder = computed(() => {
   if (isNewChatLanding.value) return t('chat.placeholderLanding')
@@ -2298,6 +2370,7 @@ function enterDraft() {
 }
 
 onMounted(async () => {
+  chatViewDisposed = false
   // Initialize session key. Without an explicit ?session= the view opens as a
   // draft instead of restoring a previous session.
   const initialSession = resolveInitialSession()
@@ -2313,14 +2386,19 @@ onMounted(async () => {
   // Load elevated mode
   loadElevatedMode()
 
-  // Load feature toggles
-  await loadFeatureToggles()
-  unsubs.push(bindFeatureRefresh(scheduleHistorySync))
-
-  // Subscribe to RPC events
+  // Register event handlers before sessions.messages.subscribe can replay
+  // buffered events. Session hydration and unrelated feature configuration
+  // then start together, so a slow config/model RPC cannot hold long history
+  // behind it.
   unsubs.push(chatRpcSubscriptions.subscribe())
   unsubs.push(chatApprovals.subscribe())
   unsubs.push(metaRuns.subscribe())
+  const sessionSubscription = subscribeSession()
+  if (!initialSession.draft) loadHistory()
+  void loadFeatureToggles().then(() => {
+    if (!chatViewDisposed) unsubs.push(bindFeatureRefresh(scheduleHistorySync))
+  })
+  loadSlashCommands()
 
   // Composer resize observer
   const composerEl = composerRef.value?.composerElement()
@@ -2331,12 +2409,6 @@ onMounted(async () => {
     })
     composerResizeObserver.observe(composerEl)
   }
-
-  // Load the requested chat state. Drafts subscribe so the first send can
-  // stream, but have no history to load.
-  const sessionSubscription = subscribeSession()
-  if (!initialSession.draft) loadHistory()
-  loadSlashCommands()
 
   // Focus textarea on desktop
   if (isDesktopViewport.value) {
@@ -2355,6 +2427,7 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  chatViewDisposed = true
   unsubs.forEach(fn => fn())
   unsubs = []
   cleanupPendingQueue()
@@ -2439,9 +2512,11 @@ watch(() => liveInterruptParts.value.length, (n, prev) => {
 
 <style scoped>
 /* No shared sr-only utility exists in this repo (each component scopes its
-   own), so the completion announcer's clip-out lives here: zero visual
-   footprint, still exposed to assistive tech. */
-.chat-turn-settled-announcer {
+   own), so these persistent announcers clip out here: zero visual footprint,
+   still exposed to assistive tech. The session announcer intentionally sits
+   outside the aria-busy conversation region. */
+.chat-turn-settled-announcer,
+.chat-session-load-announcer {
   position: absolute;
   width: 1px;
   height: 1px;

@@ -7,7 +7,9 @@ import pytest
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.onboarding.mutations import (
     LlmProfileActivationError,
+    LlmProfileRemovalError,
     activate_llm_profile,
+    remove_active_llm_profile,
     remove_llm_profile,
     upsert_llm_profile,
 )
@@ -249,6 +251,93 @@ def test_profile_remove_accepts_historical_case_variant() -> None:
 
     assert result.config.llm_profiles == {}
     assert result.public_payload == {"provider": "openai", "removed": True}
+
+
+def test_active_profile_remove_atomically_promotes_replacement_and_removes_primary() -> None:
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openai",
+            "model": "gpt-test",
+            "api_key": "synthetic-old-primary-secret",
+        },
+        llm_profiles={
+            "deepseek": {
+                "model": "deepseek-chat",
+                "api_key": "synthetic-new-primary-secret",
+            }
+        },
+        squilla_router={
+            "enabled": True,
+            "preset_binding": "follow_primary",
+            "tier_profile": "openai",
+        },
+    )
+
+    result = remove_active_llm_profile(
+        cfg,
+        provider_id="openai",
+        replacement_provider_id="deepseek",
+    )
+
+    assert cfg.llm.provider == "openai"
+    assert "deepseek" in cfg.llm_profiles
+    assert result.config.llm.provider == "deepseek"
+    assert result.config.llm.model == "deepseek-chat"
+    assert result.config.llm_profiles == {}
+    assert {
+        result.config.squilla_router.tiers[name]["provider"]
+        for name in ("c0", "c1", "c2", "c3")
+    } == {"deepseek"}
+    assert result.public_payload == {
+        "removedProvider": "openai",
+        "removed": True,
+        "activeProvider": "deepseek",
+        "activeModel": "deepseek-chat",
+    }
+    assert "synthetic-old-primary-secret" not in repr(result.public_payload)
+    assert "synthetic-new-primary-secret" not in repr(result.public_payload)
+
+
+def test_active_profile_remove_is_all_or_nothing_when_disabled_ensemble_references_primary(
+) -> None:
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openai",
+            "model": "gpt-test",
+            "api_key": "synthetic-old-primary-secret",
+        },
+        llm_profiles={
+            "deepseek": {
+                "model": "deepseek-chat",
+                "api_key": "synthetic-new-primary-secret",
+            }
+        },
+        squilla_router={"preset_binding": "follow_primary"},
+        llm_ensemble={
+            "enabled": False,
+            "selection_mode": "custom_b5",
+            "candidates": [
+                {"provider": "openai", "model": "gpt-test", "role": "primary"},
+                {
+                    "provider": "deepseek",
+                    "model": "deepseek-chat",
+                    "role": "contrast",
+                },
+            ],
+        },
+    )
+    before = cfg.model_dump(mode="python")
+
+    with pytest.raises(LlmProfileRemovalError) as error:
+        remove_active_llm_profile(
+            cfg,
+            provider_id="openai",
+            replacement_provider_id="deepseek",
+        )
+
+    assert error.value.reason == "profile_referenced"
+    assert error.value.details == {"references": ["llm_ensemble.candidates.0"]}
+    assert cfg.model_dump(mode="python") == before
 
 
 def test_profile_activation_atomically_swaps_primary_without_touching_routes() -> None:
