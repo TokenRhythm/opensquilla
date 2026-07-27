@@ -962,11 +962,15 @@ async def test_history_delete_orders_all_fences_drains_and_identity_eviction(
             session_key="agent:main:webchat:ordered-history-z",
             session_id="ordered-generation-z",
             workspace_id=opened["id"],
+            created_at=100,
+            updated_at=100,
         ),
         SessionNode(
             session_key="agent:main:webchat:ordered-history-a",
             session_id="ordered-generation-a",
             workspace_id=opened["id"],
+            created_at=100,
+            updated_at=100,
         ),
     ]
     for session in sessions:

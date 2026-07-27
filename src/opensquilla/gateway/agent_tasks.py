@@ -18,6 +18,7 @@ class AgentTaskRegistry:
 
     def __init__(self) -> None:
         self._tasks: dict[str, asyncio.Task] = {}
+        self._unsettled_tasks: dict[str, set[asyncio.Task]] = {}
         self._admission_locks: dict[str, asyncio.Lock] = {}
 
     @contextlib.asynccontextmanager
@@ -52,17 +53,20 @@ class AgentTaskRegistry:
             tasks = {
                 task
                 for session_key in keys
-                if (task := self._tasks.get(session_key)) is not None
-                and not task.done()
+                for task in self._unsettled_tasks.get(session_key, ())
+                if not task.done()
             }
             for task in tasks:
                 task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
                 for session_key in keys:
-                    task = self._tasks.get(session_key)
-                    if task in tasks and task.done():
-                        self._tasks.pop(session_key, None)
+                    unsettled = self._unsettled_tasks.get(session_key)
+                    if unsettled is not None:
+                        completed = {task for task in unsettled if task.done()}
+                        unsettled.difference_update(completed)
+                        if not unsettled:
+                            self._unsettled_tasks.pop(session_key, None)
 
             async with contextlib.AsyncExitStack() as fences:
                 for session_key in keys:
@@ -70,14 +74,14 @@ class AgentTaskRegistry:
                         self.admission(session_key)
                     )
                 if any(
-                    (task := self._tasks.get(session_key)) is not None
-                    and not task.done()
+                    not task.done()
                     for session_key in keys
+                    for task in self._unsettled_tasks.get(session_key, ())
                 ):
                     continue
                 for session_key in keys:
-                    task = self._tasks.get(session_key)
-                    if task is not None and task.done():
+                    current_task = self._tasks.get(session_key)
+                    if current_task is not None and current_task.done():
                         self._tasks.pop(session_key, None)
                 yield
                 return
@@ -95,37 +99,44 @@ class AgentTaskRegistry:
         any in-flight task is cancelled before the new one is stored. Callers
         using ``queue``/``followup`` modes must pass ``cancel_existing=False``
         AND must only register when no task is currently running — otherwise
-        the in-flight task is silently orphaned. Automatically removes the task
-        when it completes.
+        registration is rejected. Automatically removes each task when it
+        completes, including cancellation tails replaced by a newer task.
         """
-        existing = self._tasks.get(session_key)
+        key = canonicalize_session_key(session_key)
+        existing = self._tasks.get(key)
         if existing is not None and not existing.done():
             if cancel_existing:
                 existing.cancel()
-                log.warning("agent_task.replaced", session_key=session_key)
+                log.warning("agent_task.replaced", session_key=key)
             else:
                 # Caller violated the contract. Refuse to orphan the live task.
                 raise RuntimeError(
                     f"agent_task.register(cancel_existing=False) called while a "
-                    f"task is still running for session={session_key!r}. "
+                    f"task is still running for session={key!r}. "
                     f"Queue mode must wait for the current task's completion."
                 )
-        self._tasks[session_key] = task
+        self._tasks[key] = task
+        self._unsettled_tasks.setdefault(key, set()).add(task)
 
         def _on_done(t: asyncio.Task) -> None:
-            if self._tasks.get(session_key) is t:
-                self._tasks.pop(session_key, None)
+            if self._tasks.get(key) is t:
+                self._tasks.pop(key, None)
+            unsettled = self._unsettled_tasks.get(key)
+            if unsettled is not None:
+                unsettled.discard(t)
+                if not unsettled:
+                    self._unsettled_tasks.pop(key, None)
             try:
                 if t.cancelled():
-                    log.info("agent_task.cancelled", session_key=session_key)
+                    log.info("agent_task.cancelled", session_key=key)
                 elif t.exception():
                     log.error(
                         "agent_task.failed",
-                        session_key=session_key,
+                        session_key=key,
                         error=str(t.exception()),
                     )
                 else:
-                    log.info("agent_task.completed", session_key=session_key)
+                    log.info("agent_task.completed", session_key=key)
             except BrokenPipeError:
                 pass
 
@@ -136,21 +147,22 @@ class AgentTaskRegistry:
 
         Returns True if a task was cancelled, False if no task was running.
         """
-        task = self._tasks.get(session_key)
+        key = canonicalize_session_key(session_key)
+        task = self._tasks.get(key)
         if task is None or task.done():
             return False
 
         task.cancel()
-        log.info("agent_task.cancel_requested", session_key=session_key)
+        log.info("agent_task.cancel_requested", session_key=key)
         return True
 
     def get(self, session_key: str) -> asyncio.Task | None:
         """Return the tracked task for a session, if any."""
-        return self._tasks.get(session_key)
+        return self._tasks.get(canonicalize_session_key(session_key))
 
     def is_running(self, session_key: str) -> bool:
         """Check if an agent task is currently running for a session."""
-        task = self._tasks.get(session_key)
+        task = self._tasks.get(canonicalize_session_key(session_key))
         return task is not None and not task.done()
 
     def get_all(self) -> dict[str, asyncio.Task]:
