@@ -8,7 +8,7 @@
   <style>
     :root {
       color-scheme: light dark;
-      --bg: #F7F7F8;
+      --bg: #F4F5F7;
       --surface: #FFFFFF;
       --panel: rgba(255, 255, 255, 0.78);
       --panel-solid: #FFFFFF;
@@ -25,12 +25,11 @@
       --shadow: 0 28px 80px rgba(16, 20, 26, 0.12), 0 2px 8px rgba(16, 20, 26, 0.05);
     }
 
-    /* The app theme defaults to "system", so match the OS here — a dark-OS user
-       gets a dark splash that hands off to the dark app with no luminance flash.
-       These mirror the app's canonical graphite tokens. */
+    /* The app theme defaults to "system", so match the OS here and keep the
+       full-window canvas aligned with the Control UI through the handoff. */
     @media (prefers-color-scheme: dark) {
       :root {
-        --bg: #18181A;
+        --bg: #0E0F11;
         --surface: #28282B;
         --panel: rgba(32, 32, 34, 0.78);
         --panel-solid: #202022;
@@ -184,11 +183,16 @@
       border-radius: inherit;
     }
 
-    /* On a startup failure the splash is paused, not working — freeze the
-       indeterminate sweep so it doesn't contradict the "Startup paused" state. */
+    /* On a startup failure the splash is paused, not working — freeze every
+       indeterminate animation so it doesn't contradict the paused state. */
     body.errored .status-line::before {
       animation: none;
       opacity: 0.2;
+    }
+
+    body.errored .loader::before,
+    body.errored .loader span {
+      animation-play-state: paused;
     }
 
     .status-copy {

@@ -277,6 +277,50 @@ def test_boot_retry_surfaces_failed_restart_and_prevents_repeat_clicks() -> None
     assert boot_html.count("profileInUse:") == 6
 
 
+def test_boot_error_and_recovery_states_pause_all_indeterminate_motion() -> None:
+    boot_html = _read("desktop/electron/src/boot.html")
+    paused_styles = _section(
+        boot_html,
+        "body.errored .status-line::before",
+        ".status-copy",
+    )
+    apply_error = _section(
+        boot_html,
+        "function applyError(payload)",
+        "function renderRecoveryState",
+    )
+    render_recovery = _section(
+        boot_html,
+        "function renderRecoveryState(state, moveFocus = true)",
+        "async function runRecoveryAction",
+    )
+
+    assert "animation: none" in paused_styles
+    assert "body.errored .loader::before" in paused_styles
+    assert "body.errored .loader span" in paused_styles
+    assert "animation-play-state: paused" in paused_styles
+    assert "document.body.classList.add('errored')" in apply_error
+    assert "document.body.classList.add('recovering', 'errored')" in render_recovery
+
+
+def test_boot_and_native_window_backgrounds_match_control_ui_theme_tokens() -> None:
+    boot_html = _read("desktop/electron/src/boot.html")
+    main_ts = _read("desktop/electron/src/main.ts")
+    light_tokens = _read("opensquilla-webui/src/themes/light/tokens.css")
+    dark_tokens = _read("opensquilla-webui/src/themes/dark/tokens.css")
+
+    assert "--bg: #F4F5F7;" in light_tokens
+    assert "--bg: #0E0F11;" in dark_tokens
+    assert "--bg: #F4F5F7;" in boot_html
+    assert "--bg: #0E0F11;" in boot_html
+    assert "const DESKTOP_LIGHT_BACKGROUND_COLOR = '#F4F5F7'" in main_ts
+    assert "const DESKTOP_DARK_BACKGROUND_COLOR = '#0E0F11'" in main_ts
+    assert main_ts.count("backgroundColor: desktopWindowBackgroundColor()") == 1
+    assert "const backgroundColor = desktopWindowBackgroundColor()" in main_ts
+    assert "#08080A" not in main_ts
+    assert "#F7F6F3" not in main_ts
+
+
 def test_boot_error_panel_exposes_reset_setup_recovery() -> None:
     boot_html = _read("desktop/electron/src/boot.html")
     reset_flow = _section(

@@ -291,6 +291,15 @@ let desktopPreferencesWritePromise: Promise<void> = Promise.resolve()
 
 type DesktopNativeThemeSource = 'light' | 'dark' | 'system'
 
+const DESKTOP_LIGHT_BACKGROUND_COLOR = '#F4F5F7'
+const DESKTOP_DARK_BACKGROUND_COLOR = '#0E0F11'
+
+function desktopWindowBackgroundColor(): string {
+  return nativeTheme.shouldUseDarkColors
+    ? DESKTOP_DARK_BACKGROUND_COLOR
+    : DESKTOP_LIGHT_BACKGROUND_COLOR
+}
+
 function normalizeDesktopNativeThemeSource(payload: unknown): DesktopNativeThemeSource {
   const source = typeof payload === 'string'
     ? payload
@@ -302,7 +311,7 @@ function normalizeDesktopNativeThemeSource(payload: unknown): DesktopNativeTheme
 
 function applyDesktopNativeTheme(source: DesktopNativeThemeSource): { source: DesktopNativeThemeSource; shouldUseDarkColors: boolean } {
   nativeTheme.themeSource = source
-  const backgroundColor = nativeTheme.shouldUseDarkColors ? '#08080A' : '#F7F6F3'
+  const backgroundColor = desktopWindowBackgroundColor()
   for (const window of [mainWindow, onboardingWindow]) {
     if (window && !window.isDestroyed()) window.setBackgroundColor(backgroundColor)
   }
@@ -6627,8 +6636,8 @@ async function createMainWindow(): Promise<BrowserWindow> {
     show: false,
     // Paint the window in the app's base color from the first frame so launch
     // never flashes white before the splash/app paints. The app theme defaults
-    // to 'system', so match the OS; these are the base.css --bg tokens.
-    backgroundColor: nativeTheme.shouldUseDarkColors ? '#18181A' : '#F7F7F8',
+    // to 'system', so match the Control UI's canonical light/dark canvas.
+    backgroundColor: desktopWindowBackgroundColor(),
     webPreferences: {
       preload: join(__dirname, 'preload.cjs'),
       contextIsolation: true,
