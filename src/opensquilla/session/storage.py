@@ -184,6 +184,24 @@ async def _verify_project_workspace_guard(
         raise ProjectWorkspaceStateError("binding_changed")
 
 
+async def _next_project_workspace_order_value(
+    conn: aiosqlite.Connection,
+    *,
+    column: str,
+    now_ms: int,
+) -> int:
+    """Return a transaction-local order value that cannot tie an older action."""
+
+    if column not in {"position_at", "pinned_at"}:
+        raise ValueError(f"Unsupported project workspace order column: {column}")
+    async with conn.execute(
+        f"SELECT MAX({column}) FROM project_workspaces"  # noqa: S608 - allowlisted column
+    ) as cursor:
+        row = await cursor.fetchone()
+    previous = row[0] if row is not None else None
+    return max(now_ms, int(previous) + 1) if previous is not None else now_ms
+
+
 _SQLITE_BUSY_TIMEOUT_MS = 100
 _INTERACTIVE_BUSY_BUDGET_SECONDS = 2.0
 _BUSY_RETRY_INITIAL_SECONDS = 0.025
@@ -2796,13 +2814,18 @@ class SessionStorage:
             ) as cur:
                 row = await cur.fetchone()
             if row is None:
+                position_at = await _next_project_workspace_order_value(
+                    conn,
+                    column="position_at",
+                    now_ms=now,
+                )
                 workspace = ProjectWorkspace(
                     path=path,
                     path_key=path_key,
                     display_name=display_name,
                     created_at=now,
                     updated_at=now,
-                    position_at=now,
+                    position_at=position_at,
                     trusted_at=trusted_at,
                 )
                 data = workspace.model_dump()
@@ -2830,6 +2853,11 @@ class SessionStorage:
                     workspace.path = path
                 return workspace
 
+            position_at = await _next_project_workspace_order_value(
+                conn,
+                column="position_at",
+                now_ms=now,
+            )
             await conn.execute(
                 """
                 UPDATE project_workspaces
@@ -2837,10 +2865,10 @@ class SessionStorage:
                     trusted_at = COALESCE(?, trusted_at), path = ?
                 WHERE workspace_id = ?
                 """,
-                (now, now, trusted_at, path, workspace.workspace_id),
+                (position_at, now, trusted_at, path, workspace.workspace_id),
             )
             workspace.removed_at = None
-            workspace.position_at = now
+            workspace.position_at = position_at
             workspace.updated_at = now
             workspace.trusted_at = trusted_at or workspace.trusted_at
             workspace.path = path
@@ -2882,7 +2910,8 @@ class SessionStorage:
                 CASE WHEN pinned_at IS NULL THEN 1 ELSE 0 END ASC,
                 pinned_at DESC,
                 position_at DESC,
-                created_at DESC
+                created_at DESC,
+                rowid DESC
             """  # noqa: S608 - fixed optional clause
         ) as cur:
             rows = await cur.fetchall()
@@ -2925,22 +2954,32 @@ class SessionStorage:
         now = _now_ms() if now_ms is None else int(now_ms)
         async with self._write_transaction("set_project_workspace_pin") as conn:
             if pinned:
+                pinned_at = await _next_project_workspace_order_value(
+                    conn,
+                    column="pinned_at",
+                    now_ms=now,
+                )
                 cursor = await conn.execute(
                     """
                     UPDATE project_workspaces
                     SET pinned_at = ?, updated_at = ?
                     WHERE workspace_id = ? AND removed_at IS NULL
                     """,
-                    (now, now, workspace_id),
+                    (pinned_at, now, workspace_id),
                 )
             else:
+                position_at = await _next_project_workspace_order_value(
+                    conn,
+                    column="position_at",
+                    now_ms=now,
+                )
                 cursor = await conn.execute(
                     """
                     UPDATE project_workspaces
                     SET pinned_at = NULL, position_at = ?, updated_at = ?
                     WHERE workspace_id = ? AND removed_at IS NULL
                     """,
-                    (now, now, workspace_id),
+                    (position_at, now, workspace_id),
                 )
             if int(cursor.rowcount or 0) == 0:
                 raise KeyError(f"Project workspace not found: {workspace_id}")

@@ -156,9 +156,10 @@ async def test_project_workspaces_keep_fixed_unpinned_order(tmp_path) -> None:
             path_key="/repo/second",
             display_name="second",
             trusted_at=200,
-            now_ms=200,
+            now_ms=100,
         )
 
+        assert second.position_at > first.position_at
         rows = await storage.list_project_workspaces()
         assert [row.workspace_id for row in rows] == [
             second.workspace_id,
@@ -194,8 +195,11 @@ async def test_newly_pinned_workspace_leads_pinned_region(tmp_path) -> None:
         )
 
         await storage.set_project_workspace_pin(first.workspace_id, pinned=True, now_ms=300)
-        await storage.set_project_workspace_pin(second.workspace_id, pinned=True, now_ms=400)
+        await storage.set_project_workspace_pin(second.workspace_id, pinned=True, now_ms=300)
         rows = await storage.list_project_workspaces()
+        assert rows[0].pinned_at is not None
+        assert rows[1].pinned_at is not None
+        assert rows[0].pinned_at > rows[1].pinned_at
         assert [row.workspace_id for row in rows] == [
             second.workspace_id,
             first.workspace_id,
