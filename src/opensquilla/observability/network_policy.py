@@ -32,6 +32,24 @@ def network_observability_disabled(
     return _config_disables_network_observability(config)
 
 
+def provider_request_correlation_disabled(
+    *,
+    config: Any | None = None,
+    env: Mapping[str, str | None] | None = None,
+) -> bool:
+    """Return whether provider-bound request correlation is disabled.
+
+    Provider correlation follows only the dedicated privacy switch.  Legacy
+    telemetry and update-check switches intentionally remain scoped to their
+    historical passive-network behavior.
+    """
+
+    env_source = os.environ if env is None else env
+    if _is_truthy(env_source.get(NETWORK_OBSERVABILITY_DISABLED_ENV)):
+        return True
+    return _config_disables_network_observability(config)
+
+
 def _config_disables_network_observability(config: Any | None) -> bool:
     privacy = getattr(config, "privacy", None)
     disabled = getattr(privacy, "disable_network_observability", False)

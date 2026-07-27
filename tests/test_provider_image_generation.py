@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 
 from opensquilla.provider.image_generation import (
     ImageGenerationRequest,
@@ -12,6 +14,13 @@ from opensquilla.provider.image_generation import (
     OpenRouterImageGenerationProvider,
     get_image_generation_provider,
 )
+
+
+def _test_png_bytes() -> bytes:
+    buffer = io.BytesIO()
+    with Image.new("RGBA", (2, 1), (30, 120, 210, 128)) as image:
+        image.save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 def _clear_vision_provider_env(monkeypatch) -> None:
@@ -92,6 +101,446 @@ async def test_openrouter_image_provider_adds_app_attribution_headers(monkeypatc
         "X-Title": "OpenSquilla",
     }
     assert result.image_bytes == b"opensquilla"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("candidate", "wire_model"),
+    [
+        (
+            "openrouter/google/gemini-3.1-flash-image-preview",
+            "google/gemini-3.1-flash-image-preview",
+        ),
+        ("openrouter/auto", "openrouter/auto"),
+        ("openrouter/openrouter/auto", "openrouter/auto"),
+    ],
+)
+async def test_openrouter_model_ref_keeps_provider_for_routing_but_not_wire_model(
+    monkeypatch,
+    candidate,
+    wire_model,
+) -> None:
+    from opensquilla.provider import image_generation
+
+    captured: dict[str, object] = {}
+    encoded_image = base64.b64encode(_test_png_bytes()).decode("ascii")
+
+    class FakeResponse:
+        text = ""
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "images": [
+                                {
+                                    "image_url": {
+                                        "url": f"data:image/png;base64,{encoded_image}"
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def post(self, url, *, headers, json):
+            captured["url"] = url
+            captured["json"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        image_generation.httpx,
+        "AsyncClient",
+        lambda **kwargs: FakeClient(),
+    )
+    provider = OpenRouterImageGenerationProvider(api_key="synthetic-openrouter-key")
+    image_generation.register_image_generation_provider(provider)
+    try:
+        result = await image_generation.generate_with_fallbacks(
+            request=ImageGenerationRequest(
+                prompt="draw a squid",
+                model=candidate,
+                size="1024x1024",
+            ),
+            candidates=[candidate],
+        )
+    finally:
+        image_generation.reset_image_generation_providers()
+
+    assert captured["url"] == "https://openrouter.ai/api/v1/chat/completions"
+    assert captured["json"]["model"] == wire_model
+    assert result.provider == "openrouter"
+    assert result.model == wire_model
+    assert result.mime_type == "image/png"
+
+
+@pytest.mark.asyncio
+async def test_image_provider_rejects_foreign_official_endpoint_before_http(
+    monkeypatch,
+) -> None:
+    client_constructed = False
+
+    def fail_if_http_client_is_constructed(**_kwargs):
+        nonlocal client_constructed
+        client_constructed = True
+        raise AssertionError("HTTP client must not be constructed")
+
+    monkeypatch.setattr(
+        "opensquilla.provider.image_generation.httpx.AsyncClient",
+        fail_if_http_client_is_constructed,
+    )
+    provider = OpenRouterImageGenerationProvider(
+        api_key="synthetic-openrouter-key",
+        base_url="https://api.openai.com/v1",
+    )
+
+    with pytest.raises(RuntimeError, match="cannot use 'openai'.*official endpoint"):
+        await provider.generate(
+            ImageGenerationRequest(
+                prompt="draw a squid",
+                model="google/gemini-3.1-flash-image-preview",
+                size="1024x1024",
+            )
+        )
+
+    assert client_constructed is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        " https://openrouter.ai/api/v1 ",
+        "https://openrouter.ai:invalid/v1",
+        "https://openrouter.ai/api/v1?tenant=test",
+    ],
+)
+async def test_image_provider_rejects_invalid_endpoint_before_http(
+    monkeypatch,
+    base_url,
+) -> None:
+    client_constructed = False
+
+    def fail_if_http_client_is_constructed(**_kwargs):
+        nonlocal client_constructed
+        client_constructed = True
+        raise AssertionError("HTTP client must not be constructed")
+
+    monkeypatch.setattr(
+        "opensquilla.provider.image_generation.httpx.AsyncClient",
+        fail_if_http_client_is_constructed,
+    )
+    provider = OpenRouterImageGenerationProvider(
+        api_key="synthetic-openrouter-key",
+        base_url=base_url,
+    )
+
+    with pytest.raises(RuntimeError, match="invalid endpoint"):
+        await provider.generate(
+            ImageGenerationRequest(
+                prompt="draw a squid",
+                model="google/gemini-3.1-flash-image-preview",
+                size="1024x1024",
+            )
+        )
+
+    assert client_constructed is False
+
+
+def test_image_generation_availability_rejects_foreign_official_endpoint() -> None:
+    from opensquilla.gateway.config import ImageGenerationConfig
+    from opensquilla.tools.builtin.media import (
+        configure_image_generation,
+        image_generation_available,
+    )
+
+    config = ImageGenerationConfig(
+        enabled=True,
+        primary="openrouter/google/gemini-3.1-flash-image-preview",
+    )
+    config.providers.openrouter.base_url = "https://api.openai.com/v1"
+    config.providers.openrouter.api_key = "synthetic-openrouter-key"
+    configure_image_generation(config)
+    try:
+        assert image_generation_available() is False
+    finally:
+        configure_image_generation(None)
+
+
+def test_image_generation_availability_allows_endpointless_registered_provider() -> None:
+    from opensquilla.gateway.config import ImageGenerationConfig
+    from opensquilla.provider import image_generation
+    from opensquilla.tools.builtin.media import (
+        configure_image_generation,
+        image_generation_available,
+    )
+
+    class FakeProvider:
+        provider_id = "synthetic"
+        default_model = "image-model"
+        auth_env_vars: tuple[str, ...] = ()
+
+        async def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
+            return ImageGenerationResult(
+                image_bytes=_test_png_bytes(),
+                mime_type="image/png",
+                model=request.model,
+                provider=self.provider_id,
+            )
+
+    configure_image_generation(
+        ImageGenerationConfig(enabled=True, primary="synthetic/image-model")
+    )
+    image_generation.register_image_generation_provider(FakeProvider())
+    try:
+        assert image_generation_available()
+    finally:
+        configure_image_generation(None)
+
+
+@pytest.mark.asyncio
+async def test_image_provider_sends_correlation_only_for_explicit_tokenrhythm_origin(
+    monkeypatch,
+) -> None:
+    from opensquilla.provider.tokenrhythm_correlation import (
+        TOKENRHYTHM_CALL_KIND_HEADER,
+        TOKENRHYTHM_EXECUTION_ID_HEADER,
+        TOKENRHYTHM_SESSION_ID_HEADER,
+        TOKENRHYTHM_TURN_ID_HEADER,
+    )
+    from opensquilla.provider.types import ProviderRequestCorrelation
+
+    captured_headers: list[dict[str, str]] = []
+
+    class FakeResponse:
+        text = ""
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "images": [
+                                {
+                                    "image_url": {
+                                        "url": "data:image/png;base64,b3BlbnNxdWlsbGE="
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def post(self, _url, *, headers, json):
+            captured_headers.append(headers)
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        "opensquilla.provider.image_generation.httpx.AsyncClient",
+        lambda **kwargs: FakeClient(),
+    )
+    correlation = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="image-execution-1",
+        call_kind="auxiliary.image_generation",
+    )
+    request = ImageGenerationRequest(
+        prompt="draw a squid",
+        model="image-model",
+        size="1024x1024",
+        provider_request_correlation=correlation,
+    )
+
+    trusted = OpenRouterImageGenerationProvider(
+        api_key="synthetic-token",
+        base_url="https://api.tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+    )
+    custom = OpenRouterImageGenerationProvider(
+        api_key="synthetic-token",
+        base_url="https://custom.example/v1",
+        provider_kind="tokenrhythm",
+    )
+    untyped_official_origin = OpenRouterImageGenerationProvider(
+        api_key="synthetic-token",
+        base_url="https://api.tokenrhythm.studio/v1",
+    )
+    await trusted.generate(request)
+    await custom.generate(request)
+    await untyped_official_origin.generate(request)
+
+    assert captured_headers[0][TOKENRHYTHM_SESSION_ID_HEADER] == "session-1"
+    assert captured_headers[0][TOKENRHYTHM_TURN_ID_HEADER] == "turn-1"
+    assert captured_headers[0][TOKENRHYTHM_EXECUTION_ID_HEADER] == "image-execution-1"
+    assert (
+        captured_headers[0][TOKENRHYTHM_CALL_KIND_HEADER]
+        == "auxiliary.image_generation"
+    )
+    assert TOKENRHYTHM_SESSION_ID_HEADER not in captured_headers[1]
+    assert TOKENRHYTHM_SESSION_ID_HEADER not in captured_headers[2]
+
+
+@pytest.mark.asyncio
+async def test_image_generation_fallback_operation_derives_one_correlation() -> None:
+    from opensquilla.provider import image_generation
+    from opensquilla.provider.correlation_context import (
+        current_provider_request_correlation,
+    )
+    from opensquilla.provider.types import ProviderRequestCorrelation
+
+    root = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="root-execution",
+        call_kind="agent.chat",
+    )
+    captured: list[tuple[ImageGenerationRequest, object]] = []
+
+    class FakeProvider:
+        provider_id = "fake"
+        default_model = "image-model"
+        auth_env_vars: tuple[str, ...] = ()
+
+        async def generate(
+            self,
+            request: ImageGenerationRequest,
+        ) -> ImageGenerationResult:
+            captured.append((request, current_provider_request_correlation()))
+            if len(captured) == 1:
+                raise RuntimeError("first candidate failed")
+            return ImageGenerationResult(
+                image_bytes=_test_png_bytes(),
+                mime_type="image/png",
+                model=request.model,
+                provider=self.provider_id,
+            )
+
+    image_generation.register_image_generation_provider(FakeProvider())
+    try:
+        await image_generation.generate_with_fallbacks(
+            request=ImageGenerationRequest(
+                prompt="draw a squid",
+                model="fake/image-model-1",
+                size="1024x1024",
+                provider_request_correlation=root,
+            ),
+            candidates=["fake/image-model-1", "fake/image-model-2"],
+        )
+    finally:
+        image_generation.reset_image_generation_providers()
+
+    request_correlation = captured[0][0].provider_request_correlation
+    assert request_correlation == captured[0][1]
+    assert "session-1" not in repr(captured[0][0])
+    assert request_correlation is not None
+    assert request_correlation.session_id == root.session_id
+    assert request_correlation.turn_id == root.turn_id
+    assert request_correlation.execution_id != root.execution_id
+    assert request_correlation.call_kind == "auxiliary.image_generation"
+    fallback_correlation = captured[1][0].provider_request_correlation
+    assert fallback_correlation == captured[1][1]
+    assert fallback_correlation.session_id == request_correlation.session_id
+    assert fallback_correlation.turn_id == request_correlation.turn_id
+    assert fallback_correlation.execution_id == request_correlation.execution_id
+    assert (
+        fallback_correlation.call_kind
+        == "auxiliary.image_generation.provider_fallback"
+    )
+
+
+@pytest.mark.asyncio
+async def test_invalid_provider_image_triggers_fallback_and_requested_format_conversion() -> None:
+    from opensquilla.provider import image_generation
+
+    generated_models: list[str] = []
+
+    class FakeProvider:
+        provider_id = "synthetic"
+        default_model = "image-model"
+        auth_env_vars: tuple[str, ...] = ()
+
+        async def generate(
+            self,
+            request: ImageGenerationRequest,
+        ) -> ImageGenerationResult:
+            generated_models.append(request.model)
+            image_bytes = b"not-an-image" if request.model == "broken" else _test_png_bytes()
+            return ImageGenerationResult(
+                image_bytes=image_bytes,
+                mime_type="image/png",
+                model=request.model,
+                provider=self.provider_id,
+            )
+
+    image_generation.register_image_generation_provider(FakeProvider())
+    try:
+        result = await image_generation.generate_with_fallbacks(
+            request=ImageGenerationRequest(
+                prompt="draw a squid",
+                model="synthetic/broken",
+                size="1024x1024",
+                output_format="webp",
+            ),
+            candidates=["synthetic/broken", "synthetic/working"],
+        )
+    finally:
+        image_generation.reset_image_generation_providers()
+
+    assert generated_models == ["broken", "working"]
+    assert len(result.attempts) == 1
+    assert "invalid image bytes" in result.attempts[0].error
+    assert result.mime_type == "image/webp"
+    with Image.open(io.BytesIO(result.image_bytes)) as image:
+        assert image.format == "WEBP"
+
+
+@pytest.mark.parametrize(
+    "call_kind",
+    [
+        "auxiliary.image_generation",
+        "auxiliary.image_generation.provider_fallback",
+    ],
+)
+def test_image_generation_recognizes_existing_operation_call_kinds(
+    call_kind: str,
+) -> None:
+    from opensquilla.provider.image_generation import (
+        _is_image_generation_correlation,
+    )
+    from opensquilla.provider.types import ProviderRequestCorrelation
+
+    assert _is_image_generation_correlation(
+        ProviderRequestCorrelation(
+            session_id="session-1",
+            turn_id="turn-1",
+            execution_id="image-execution",
+            call_kind=call_kind,
+        )
+    )
 
 
 @pytest.mark.asyncio
@@ -198,6 +647,63 @@ async def test_image_generate_does_not_auto_publish_artifact_for_subagent(
     assert result["status"] == "ok"
     assert "artifact" not in result
     assert ctx.published_artifacts == []
+
+
+@pytest.mark.asyncio
+async def test_image_generate_uses_configured_size_and_matching_output_suffix(
+    tmp_path,
+) -> None:
+    from opensquilla.gateway.config import ImageGenerationConfig
+    from opensquilla.provider import image_generation
+    from opensquilla.tools.builtin import media
+    from opensquilla.tools.types import ToolContext, current_tool_context
+
+    captured_requests: list[ImageGenerationRequest] = []
+
+    class FakeProvider:
+        provider_id = "synthetic"
+        default_model = "image-model"
+        auth_env_vars: tuple[str, ...] = ()
+
+        async def generate(
+            self,
+            request: ImageGenerationRequest,
+        ) -> ImageGenerationResult:
+            captured_requests.append(request)
+            return ImageGenerationResult(
+                image_bytes=_test_png_bytes(),
+                mime_type="image/png",
+                model=request.model,
+                provider=self.provider_id,
+            )
+
+    config = ImageGenerationConfig(
+        enabled=True,
+        primary="synthetic/image-model",
+        size="1536x1024",
+        output_format="webp",
+    )
+    media.configure_image_generation(config)
+    image_generation.register_image_generation_provider(FakeProvider())
+    token = current_tool_context.set(ToolContext(workspace_dir=str(tmp_path)))
+    try:
+        payload = json.loads(
+            await media.image_generate(
+                prompt="draw a squid",
+                filename="configured-format.png",
+            )
+        )
+    finally:
+        current_tool_context.reset(token)
+        media.configure_image_generation(None)
+
+    assert len(captured_requests) == 1
+    assert captured_requests[0].size == "1536x1024"
+    assert captured_requests[0].output_format == "webp"
+    assert payload["path"].endswith("configured-format.webp")
+    assert payload["mime_type"] == "image/webp"
+    with Image.open(payload["path"]) as image:
+        assert image.format == "WEBP"
 
 
 @pytest.mark.asyncio
@@ -626,7 +1132,13 @@ async def test_image_tool_uses_configured_router_vision_provider_for_local_file(
 async def test_vision_provider_sends_provider_native_multimodal_message(monkeypatch) -> None:
     _clear_vision_provider_env(monkeypatch)
 
-    from opensquilla.provider.types import ContentBlockImage, ContentBlockText, Message
+    from opensquilla.provider.correlation_context import bind_provider_request_correlation
+    from opensquilla.provider.types import (
+        ContentBlockImage,
+        ContentBlockText,
+        Message,
+        ProviderRequestCorrelation,
+    )
     from opensquilla.tools.builtin import media
 
     media.configure_image_generation(None)
@@ -647,13 +1159,25 @@ async def test_vision_provider_sends_provider_native_multimodal_message(monkeypa
 
     monkeypatch.setattr("opensquilla.provider.selector.ModelSelector", FakeSelector)
 
-    result = await media._call_vision_provider(
-        b64_data="aW1hZ2UtYnl0ZXM=",
-        media_type="image/png",
-        prompt="What is in this image?",
+    root = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="root-execution",
+        call_kind="agent.chat",
     )
+    with bind_provider_request_correlation(root):
+        result = await media._call_vision_provider(
+            b64_data="aW1hZ2UtYnl0ZXM=",
+            media_type="image/png",
+            prompt="What is in this image?",
+        )
 
     assert result == "described"
+    correlation = captured["config"].provider_request_correlation
+    assert correlation.session_id == root.session_id
+    assert correlation.turn_id == root.turn_id
+    assert correlation.execution_id != root.execution_id
+    assert correlation.call_kind == "auxiliary.media"
     messages = captured["messages"]
     assert isinstance(messages, list)
     assert len(messages) == 1

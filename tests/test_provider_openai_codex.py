@@ -16,7 +16,7 @@ from opensquilla.provider.codex_auth import (
     load_codex_credentials,
     refresh_codex_credentials,
 )
-from opensquilla.provider.openai_codex import OpenAICodexProvider
+from opensquilla.provider.openai_codex import OpenAICodexProvider, _candidate_wire_digest
 from opensquilla.provider.registry import get_provider_spec
 from opensquilla.provider.selector import build_provider
 from opensquilla.provider.types import (
@@ -36,6 +36,15 @@ from opensquilla.provider.types import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def test_candidate_wire_digest_rejects_oversized_id_before_stripping() -> None:
+    class _NoStripString(str):
+        def strip(self, chars: str | None = None) -> str:
+            del chars
+            raise AssertionError("oversized candidate wire IDs must not be copied")
+
+    assert _candidate_wire_digest(_NoStripString(" " * 4097)) is None
 
 
 def _write_auth(path: Path, *, access="tok-access", refresh="tok-refresh", account="acct-1"):
@@ -278,6 +287,318 @@ def test_burst_function_call_without_deltas(tmp_path: Path, monkeypatch) -> None
     ends = [e for e in events if isinstance(e, ToolUseEndEvent)]
     assert len(ends) == 1 and ends[0].arguments == {"query": "y"}
     assert any(isinstance(e, ToolUseStartEvent) for e in events)
+
+
+def test_inert_candidate_demotes_codex_function_call_after_completed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    auth = _write_auth(tmp_path / "auth.json")
+    long_name = "candidate-" + ("x" * 17_000)
+    body = _sse(
+        [
+            {
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc-private",
+                    "call_id": "call-private",
+                    "name": long_name,
+                },
+            },
+            {
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc-private",
+                "delta": "{not-json",
+            },
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc-private",
+                    "call_id": "call-private",
+                    "name": long_name,
+                    "arguments": "{not-json",
+                },
+            },
+            {"type": "response.output_text.delta", "delta": "plain answer"},
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-private",
+                    "model": "gpt-5.5",
+                    "usage": {
+                        "input_tokens": 13,
+                        "output_tokens": 8,
+                        "input_tokens_details": {"cached_tokens": 4},
+                        "output_tokens_details": {"reasoning_tokens": 2},
+                    },
+                },
+            },
+        ]
+    )
+    _patch_codex_transport(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=body,
+        ),
+    )
+    provider = OpenAICodexProvider(auth_path=str(auth))
+
+    events = _collect(
+        provider,
+        tools=[],
+        cfg=ChatConfig(candidate_output_mode="inert_artifact"),
+    )
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert not any(
+        isinstance(event, (ToolUseStartEvent, ToolUseDeltaEvent, ToolUseEndEvent))
+        for event in events
+    )
+    texts = [event for event in events if isinstance(event, TextDeltaEvent)]
+    assert texts[0].text == "plain answer"
+    artifact = json.loads(texts[1].text)
+    assert artifact["kind"] == "inert_proposer_tool_output"
+    assert artifact["executable"] is False
+    assert artifact["actions"] == [
+        {
+            "arguments_text": "{not-json",
+            "issues": [
+                "invalid_arguments_json",
+                "name_over_execution_limit",
+            ],
+            "name_text": long_name,
+        }
+    ]
+    assert "fc-private" not in texts[1].text
+    assert "call-private" not in texts[1].text
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert (done.input_tokens, done.output_tokens) == (13, 8)
+    assert done.cached_tokens == 4
+    assert done.reasoning_tokens == 2
+    assert done.stop_reason == "tool_use"
+    assert events[-2:] == [texts[1], done]
+
+
+def test_inert_candidate_allows_call_id_to_appear_on_done(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    auth = _write_auth(tmp_path / "auth.json")
+    body = _sse(
+        [
+            {
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc-late-call-id",
+                    "name": "get_status",
+                },
+            },
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc-late-call-id",
+                    "call_id": "call-late",
+                    "name": "get_status",
+                    "arguments": "{}",
+                },
+            },
+            {"type": "response.completed", "response": {"status": "completed"}},
+        ]
+    )
+    _patch_codex_transport(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=body,
+        ),
+    )
+
+    events = _collect(
+        OpenAICodexProvider(auth_path=str(auth)),
+        tools=[],
+        cfg=ChatConfig(candidate_output_mode="inert_artifact"),
+    )
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    artifact = json.loads(
+        next(event.text for event in events if isinstance(event, TextDeltaEvent))
+    )
+    assert artifact["actions"] == [
+        {
+            "arguments_text": "{}",
+            "issues": [],
+            "name_text": "get_status",
+        }
+    ]
+    assert next(event for event in events if isinstance(event, DoneEvent)).stop_reason == (
+        "tool_use"
+    )
+
+
+def test_inert_candidate_rejects_changed_call_id_without_committing_artifact(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    auth = _write_auth(tmp_path / "auth.json")
+    body = _sse(
+        [
+            {
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc-stable",
+                    "call_id": "call-original",
+                    "name": "search",
+                },
+            },
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc-stable",
+                    "call_id": "call-conflict",
+                    "name": "search",
+                    "arguments": '{"query":"Shanghai"}',
+                },
+            },
+            {"type": "response.completed", "response": {"status": "completed"}},
+        ]
+    )
+    _patch_codex_transport(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=body,
+        ),
+    )
+
+    events = _collect(
+        OpenAICodexProvider(auth_path=str(auth)),
+        tools=[],
+        cfg=ChatConfig(candidate_output_mode="inert_artifact"),
+    )
+
+    assert not any(isinstance(event, TextDeltaEvent) for event in events)
+    assert not any(
+        isinstance(event, (ToolUseStartEvent, ToolUseDeltaEvent, ToolUseEndEvent))
+        for event in events
+    )
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    assert any(
+        isinstance(event, ErrorEvent) and event.code == "incomplete_tool_call"
+        for event in events
+    )
+
+
+def test_inert_candidate_rejects_argument_delta_after_item_done(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    auth = _write_auth(tmp_path / "auth.json")
+    body = _sse(
+        [
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc-finished",
+                    "call_id": "call-finished",
+                    "name": "search",
+                    "arguments": '{"query":"Shanghai"}',
+                },
+            },
+            {
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc-finished",
+                "delta": '"late"',
+            },
+            {"type": "response.completed", "response": {"status": "completed"}},
+        ]
+    )
+    _patch_codex_transport(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=body,
+        ),
+    )
+
+    events = _collect(
+        OpenAICodexProvider(auth_path=str(auth)),
+        tools=[],
+        cfg=ChatConfig(candidate_output_mode="inert_artifact"),
+    )
+
+    assert not any(isinstance(event, TextDeltaEvent) for event in events)
+    assert not any(
+        isinstance(event, (ToolUseStartEvent, ToolUseDeltaEvent, ToolUseEndEvent))
+        for event in events
+    )
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    assert any(
+        isinstance(event, ErrorEvent) and event.code == "incomplete_tool_call"
+        for event in events
+    )
+
+
+def test_inert_candidate_does_not_publish_partial_codex_artifact(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    auth = _write_auth(tmp_path / "auth.json")
+    body = _sse(
+        [
+            {
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc-partial",
+                    "call_id": "call-partial",
+                    "name": "search",
+                },
+            },
+            {
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc-partial",
+                "delta": '{"query":"partial"}',
+            },
+        ]
+    )
+    _patch_codex_transport(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=body,
+        ),
+    )
+    provider = OpenAICodexProvider(auth_path=str(auth))
+
+    events = _collect(
+        provider,
+        tools=[],
+        cfg=ChatConfig(candidate_output_mode="inert_artifact"),
+    )
+
+    assert not any(isinstance(event, TextDeltaEvent) for event in events)
+    assert not any(
+        isinstance(event, (ToolUseStartEvent, ToolUseDeltaEvent, ToolUseEndEvent))
+        for event in events
+    )
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    assert any(
+        isinstance(event, ErrorEvent) and event.code == "incomplete_stream"
+        for event in events
+    )
 
 
 def test_reasoning_deltas_reach_done_event(tmp_path: Path, monkeypatch) -> None:

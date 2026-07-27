@@ -27,11 +27,16 @@ import asyncio
 import inspect
 from dataclasses import dataclass, field
 from typing import Any
+from uuid import uuid4
 
 import structlog
 
 from opensquilla.engine.cache_break_monitor import notify_compaction
 from opensquilla.gateway.config import ContextOverflowPolicy, GatewayConfig
+from opensquilla.provider.types import (
+    ProviderRequestCorrelation,
+    derive_provider_request_correlation,
+)
 from opensquilla.session.compaction import (
     call_compact_with_optional_config,
     estimate_entry_model_replay_tokens,
@@ -268,6 +273,7 @@ async def _await_auto_summarize_flush_grace(
     wait_for_receipt: bool = False,
     turn_id: str | None = None,
     checkpoint_exists: bool | None = None,
+    provider_request_correlation: ProviderRequestCorrelation | None = None,
 ) -> Any | None:
     if not pre_compaction_flush_enabled(config) or not transcript:
         return None
@@ -285,17 +291,30 @@ async def _await_auto_summarize_flush_grace(
         "flush_background_timeout_seconds",
         120.0,
     )
+    flush_kwargs: dict[str, Any] = {
+        "agent_id": parse_agent_id(session_key),
+        "timeout": background_timeout,
+        "message_window": 0,
+        "segment_mode": "auto",
+        "raw_capture_policy": "required",
+        "turn_id": turn_id,
+        "checkpoint_exists": checkpoint_exists,
+    }
+    if (
+        provider_request_correlation is not None
+        and _accepts_keyword_arg(
+            flush_service.execute,
+            "provider_request_correlation",
+        )
+    ):
+        flush_kwargs["provider_request_correlation"] = (
+            provider_request_correlation
+        )
     task = asyncio.create_task(
         flush_service.execute(
             transcript,
             session_key,
-            agent_id=parse_agent_id(session_key),
-            timeout=background_timeout,
-            message_window=0,
-            segment_mode="auto",
-            raw_capture_policy="required",
-            turn_id=turn_id,
-            checkpoint_exists=checkpoint_exists,
+            **flush_kwargs,
         )
     )
 
@@ -462,6 +481,8 @@ async def apply_context_overflow_policy(
     compaction_marker: Any | None = None,
     policy_override: ContextOverflowPolicy | None = None,
     budget_override: int | None = None,
+    provider_request_correlation: ProviderRequestCorrelation | None = None,
+    root_operation_id: str | None = None,
 ) -> OverflowOutcome:
     """Apply the gateway's overflow policy to the upcoming turn.
 
@@ -566,7 +587,7 @@ async def apply_context_overflow_policy(
                 outcome.refusal = _build_refusal_envelope(post_estimate, budget, outcome.reason)
                 return outcome
 
-            compaction_id = new_compaction_id()
+            compaction_id = root_operation_id or new_compaction_id()
             notify_compaction(
                 session_key,
                 source="automatic",
@@ -601,6 +622,11 @@ async def apply_context_overflow_policy(
                 wait_for_receipt=requires_safe_receipt,
                 turn_id=compaction_id,
                 checkpoint_exists=checkpoint_saved,
+                provider_request_correlation=derive_provider_request_correlation(
+                    provider_request_correlation,
+                    execution_id=uuid4().hex,
+                    call_kind="auxiliary.session_flush",
+                ),
             )
             if pre_compaction_flush_enabled(config):
                 flush_status = flush_receipt_status_for_compaction(
@@ -674,6 +700,16 @@ async def apply_context_overflow_policy(
                     compact_kwargs["trigger_reason"] = "gateway_auto_summarize"
                 if _accepts_keyword_arg(compact_with_result, "flush_receipt_status"):
                     compact_kwargs["flush_receipt_status"] = flush_status
+                if (
+                    provider_request_correlation is not None
+                    and _accepts_keyword_arg(
+                        compact_with_result,
+                        "provider_request_correlation",
+                    )
+                ):
+                    compact_kwargs["provider_request_correlation"] = (
+                        provider_request_correlation
+                    )
                 compaction_result = await compact_with_result(
                     session_key,
                     budget,
@@ -692,6 +728,7 @@ async def apply_context_overflow_policy(
                     session_key,
                     budget,
                     compaction_config,
+                    provider_request_correlation=provider_request_correlation,
                 )
                 outcome.removed_count = 1 if summary else 0
             if (

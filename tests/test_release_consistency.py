@@ -12,8 +12,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-CURRENT_VERSION = "0.5.0rc4"
-CURRENT_DESKTOP_VERSION = "0.5.0-rc4"
+CURRENT_VERSION = "0.5.0"
+CURRENT_DESKTOP_VERSION = "0.5.0"
 CURRENT_TAG = f"v{CURRENT_VERSION}"
 HISTORICAL_PREVIEW_VERSION = "0.2.0rc1"
 HISTORICAL_PREVIEW_TAG = f"v{HISTORICAL_PREVIEW_VERSION}"
@@ -496,7 +496,7 @@ def test_release_docs_warn_rc3_users_to_upgrade_in_place() -> None:
     assert "must install the\nnew version directly over the existing installation" in releases
     assert "must not uninstall RC3\nfirst" in releases
     assert "deleteAppDataOnUninstall=false" in releases
-    assert "uninstall Preview 3 first" in current_notes
+    assert "uninstall a pre-Preview-4 build first" in current_notes
 
 
 def test_privacy_docs_describe_network_observability_controls() -> None:
@@ -763,28 +763,23 @@ def test_current_release_notes_cover_recovery_transfer_upgrade_and_containers() 
     assert f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-mac-arm64.zip" in notes
     assert f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-win-x64.exe" in notes
     assert f"opensquilla-{CURRENT_VERSION}-py3-none-any.whl" in notes
-    assert notes.index("### Profile recovery and upgrade safety") < notes.index(
-        "### Windows Portable transfer"
+    assert notes.index("### Model Ensemble and multi-provider routing") < notes.index(
+        "### Safer upgrades, migration, and profile-data protection"
     )
-    assert notes.index("### Windows Portable transfer") < notes.index(
-        "### Desktop cleanup, credentials, and updates"
+    assert notes.index("### Channels and runtime reliability") < notes.index(
+        "### Container images and mainland-China downloads"
     )
-    assert notes.index("### Model Ensemble, providers, and Control UI") < notes.index(
-        "### Runtime and channel reliability"
-    )
-    assert notes.index("### Runtime and channel reliability") < notes.index(
-        "### Downloads and deployment"
-    )
+    assert notes.index("## Since Preview 4") < notes.index("## Downloads")
     assert "Normal version upgrades do not require a data transfer" in notes
     assert "not silently overwritten, deleted, or merged" in notes
     assert "never silently merged" in notes
     assert "automatic sync" in notes
-    assert "No Windows Portable assets are published for 0.5.0 preview releases" in notes
-    assert "0.5.0rc4 Portable zip" in notes
-    assert "## Upgrading from Preview 3, earlier previews, or 0.4.1" in notes
-    assert "uninstall Preview 3 first" in notes
+    assert "No Windows Portable assets are published for 0.5.0" in notes
+    assert "0.5.0 Portable zip" in notes
+    assert "## Upgrading from 0.4.1 or a 0.5.0 preview" in notes
+    assert "uninstall a pre-Preview-4 build first" in notes
     assert r"%APPDATA%\OpenSquilla" in notes
-    assert "ghcr.io/opensquilla/opensquilla:v0.5.0rc4" in notes
+    assert "ghcr.io/opensquilla/opensquilla:v0.5.0" in notes
     assert "`latest` tag follows the most recently verified release tag" in notes
     assert (
         "https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/latest/"
@@ -817,7 +812,7 @@ def test_docs_index_links_current_release_notes() -> None:
 
 def test_current_contributor_ledger_records_050rc4_attribution() -> None:
     ledger = Path("CONTRIBUTORS.md").read_text(encoding="utf-8")
-    section = ledger.split("## OpenSquilla 0.5.0rc4", 1)[1].split("## OpenSquilla 0.5.0rc3", 1)[0]
+    section = ledger.split("## OpenSquilla 0.5.0", 1)[1].split("## OpenSquilla 0.5.0rc3", 1)[0]
 
     expected = {
         "@HuaXiawithMoon": "#582",

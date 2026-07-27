@@ -92,8 +92,12 @@ def _install_fake_ossutil(tmp_path: Path) -> tuple[Path, Path, Path]:
                 return args[args.index(name) + 1]
 
             if args[:2] == ["api", "get-bucket-versioning"]:
+                # Real ossutil follows the JSON body with extra output (an
+                # elapsed-time trailer); reproduce that shape so the parser
+                # is exercised against production output, not idealized JSON.
                 status = os.environ.get("FAKE_OSS_VERSIONING_STATUS", "")
                 print(json.dumps({"Status": status} if status else {}))
+                print("0.062000(s) elapsed")
                 raise SystemExit(0)
 
             if args[:2] == ["api", "put-object"]:
@@ -272,7 +276,8 @@ def test_aliyun_oss_release_mirror_workflow_contract() -> None:
     )[0]
     assert "--force" not in immutable_put
     assert "get-bucket-versioning" in workflow
-    assert "OSS release mirror bucket must be unversioned" in workflow
+    assert "OSS bucket versioning is " in workflow
+    assert "SHA256 verification before every upload" in workflow
     assert "Refusing to replace immutable OSS release object" in workflow
     assert "Publish corrected release assets under a new release tag" in workflow
     assert 'local_digest="$(sha256sum -- "${source}"' in workflow
@@ -388,6 +393,12 @@ def test_version_scoped_oss_objects_are_write_once_and_race_safe(tmp_path: Path)
     assert "Refusing to replace immutable OSS release object" in raced.stderr
     assert (remote_release / "racy.bin").read_bytes() == b"concurrent-writer"
 
+    # Versioned buckets no longer block the mirror: forbid-overwrite is
+    # advisory there, and immutability rests on the existence check plus
+    # SHA256 verification. An identical re-run stays idempotent and the run
+    # records which versioning regime it executed under.
+    racy_payload.write_bytes(b"concurrent-writer")
+    checksums.write_text("first-published-checksums\n", encoding="utf-8", newline="\n")
     for attempt, status in enumerate(("Enabled", "Suspended"), start=5):
         call_log.write_text("", encoding="utf-8")
         versioned = _run_upload_step(
@@ -398,7 +409,22 @@ def test_version_scoped_oss_objects_are_write_once_and_race_safe(tmp_path: Path)
             attempt=attempt,
             versioning_status=status,
         )
-        assert versioned.returncode != 0
-        assert "OSS release mirror bucket must be unversioned" in versioned.stderr
+        assert versioned.returncode == 0, versioned.stderr
+        assert f"OSS bucket versioning is {status!r}" in versioned.stdout
         versioned_calls = [json.loads(line) for line in call_log.read_text().splitlines()]
         assert not any(call[:2] == ["api", "put-object"] for call in versioned_calls)
+
+    # The write-once contract survives on a versioned bucket: divergent bytes
+    # for an already-mirrored object are still refused before any upload.
+    racy_payload.write_bytes(b"tampered-payload")
+    tampered = _run_upload_step(
+        tmp_path,
+        fake_bin,
+        remote_root,
+        call_log,
+        attempt=7,
+        versioning_status="Enabled",
+    )
+    assert tampered.returncode != 0
+    assert "Refusing to replace immutable OSS release object" in tampered.stderr
+    assert (remote_release / "racy.bin").read_bytes() == b"concurrent-writer"

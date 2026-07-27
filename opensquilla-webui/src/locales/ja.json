@@ -66,7 +66,8 @@
     "discard": "破棄",
     "cancel": "キャンセル",
     "edit": "編集",
-    "delete": "削除"
+    "delete": "削除",
+    "dismiss": "閉じる"
   },
   "nav": {
     "chat": "タスク",
@@ -147,7 +148,8 @@
       "themeLabel": "テーマ",
       "themeDesc": "システムに従うか、ライトまたはダークを指定します。サイドバーの切り替えはこの設定へのショートカットです。",
       "languageLabel": "言語",
-      "languageDesc": "インターフェースの表示言語です。このブラウザーに即時に適用されます。",
+      "languageDesc": "インターフェースとチャンネルのシステム通知の表示言語です。ここにはすぐ反映され、ゲートウェイ全体の通知言語として保存されます。",
+      "channelNoticeLocaleSyncPending": "インターフェースの言語は変更されましたが、チャンネルのシステム通知言語はまだ保存されていません。ゲートウェイの再接続時に再試行します。",
       "toolDetailsLabel": "ツール詳細のデフォルト表示",
       "toolDetailsDesc": "自動はツール種別に従い、コンパクトは通常のツールを折りたたみ、展開はすべて開きます。エラーは既定で自動展開されますが、手動で折りたためます。",
       "toolDetailsAuto": "自動",
@@ -186,7 +188,6 @@
       "compatibilityTitle": "従来の Agent データ保存先",
       "compatibilityDesc": "互換性のある従来の Agent データ保存先を使用しています。変更すると ID とメモリーの参照元が切り替わりますが、データの移動、統合、削除は行いません。",
       "chooseLegacyAgentData": "Agent データ保存先を選択",
-      "recoveryTitle": "リカバリープロファイルではインポートできません",
       "loadFailed": "インポート元を確認できませんでした。",
       "emptyTitle": "他の OpenSquilla データは見つかりませんでした",
       "emptyDesc": "後でもう一度スキャンできます。Desktop ではデータフォルダーを手動選択できます。",
@@ -486,7 +487,7 @@
       "endpointDesc": "OpenSquilla が {provider} を呼び出す場合にのみ適用されます。",
       "defaultModelTitle": "{provider} のデフォルトモデル",
       "defaultModelGroupDesc": "ルーティングがオフの場合、または実行が使用中のプロバイダーにフォールバックする場合に使われます。",
-      "defaultModelLabel": "{provider} のデフォルト直接モデル",
+      "defaultModelLabel": "直接/フォールバックモデル",
       "configuredModelTitle": "{provider} のモデル",
       "configuredModelCurrentLabel": "現在のモデル",
       "configuredModelFallbackLabel": "フォールバックモデル",
@@ -819,7 +820,7 @@
         "credentials_link": "資格情報ページを開く(App id / App secret)",
         "quick_apply_link": "必要な全権限の申請を事前入力",
         "needAppId": "先に App id を入力してください",
-        "ws_order_note": "接続済みです — 残るは飛書コンソールでの最後の 1 ステップ：「事件与回调」を開き、イベント配信を「使用长连接接收事件」に切り替えてください。この設定はクライアント接続中のみ保存できるため、チャネル保存後に行います。最初のイベントを受信するとこの通知は消えます。"
+        "ws_order_note": "飛書コンソールのイベント購読を確認してください。「事件与回调」を開き、イベント配信が「使用长连接接收事件」に設定されていることを確認します。この通知は WebSocket 接続中で受信イベントがまだ記録されていない場合に表示されますが、それだけでコンソールの設定不備を意味するものではありません。最初のイベントを受信すると消えます。"
       }
     },
     "search": {
@@ -878,6 +879,15 @@
       "outputFormat": "出力形式",
       "fallbacks": "フォールバックモデル",
       "fallbacksHint": "主モデルが失敗した場合に順に試す、カンマ区切りの「プロバイダー/モデル」ID。"
+    },
+    "capabilities": {
+      "imageStatus": {
+        "missingEnv": "環境変数 {name} がありません。下にキーを貼り付けるか、その変数を設定してゲートウェイを再起動してください。"
+      },
+      "imageKeyConfigured": "キー設定済み",
+      "imageKeyMissing": "未設定",
+      "imageKeyPlaceholderKeep": "空欄のままにすると保存済みのキーを維持します",
+      "imageKeyPlaceholderNew": "API キーを貼り付け"
     },
     "audio": {
       "title": "オーディオ",
@@ -939,6 +949,17 @@
       "revealFailed": "ログを表示できませんでした: {error}",
       "restarting": "ローカルランタイムを再起動しています…",
       "restartFailed": "再起動に失敗しました: {error}",
+      "closeBehaviorLabel": "メインウィンドウを閉じるとき",
+      "closeBehaviorDesc": "ウィンドウの閉じるボタンを押したときの OpenSquilla の動作を選択します。",
+      "closeBehaviorBackground": "バックグラウンドで実行を続ける",
+      "closeBehaviorQuit": "OpenSquilla を終了",
+      "closeBehaviorAsk": "毎回確認する",
+      "closeBehaviorSaving": "保存中…",
+      "closeBehaviorReadFailed": "ウィンドウを閉じるときの設定を読み込めませんでした: {error}",
+      "closeBehaviorSaveFailed": "ウィンドウを閉じるときの設定を保存できませんでした: {error}",
+      "closeBehaviorBackgroundUnavailable": "このプラットフォームではバックグラウンド実行を利用できません。",
+      "closeBehaviorFallbackQuit": "このプラットフォームではバックグラウンド実行を利用できないため、ウィンドウを閉じるとアプリは終了します。",
+      "closeBehaviorRetry": "再試行",
       "resetConfirmTitle": "保存済みのセットアップをリセットしますか？",
       "resetConfirmBody": "保存済みのデスクトップ認証情報と生成された設定が消去されます。次回起動時に初回セットアップが再実行されます。",
       "resetConfirmPrimary": "リセット",
@@ -958,12 +979,12 @@
         },
         "delete-current-profile": {
           "title": "現在のプロファイルを削除",
-          "warning": "一覧の現在のプロファイル、認証情報、ログを削除します。他の復旧プロファイルとバックアップは保持されます。",
+          "warning": "一覧のプライマリプロファイル、認証情報、ログを削除します。記録済みのバックアップは保持されます。",
           "apply": "プロファイルを削除"
         },
         "delete-all-user-data": {
           "title": "OpenSquilla のすべてのユーザーデータを削除",
-          "warning": "OpenSquilla の完全終了後、プライマリ、すべての復旧プロファイル、認証情報、ログ、記録済みバックアップを削除します。",
+          "warning": "OpenSquilla の完全終了後、プライマリプロファイル、認証情報、ログ、記録済みバックアップを削除します。",
           "apply": "すべて削除して終了"
         },
         "inspectFailed": "クリーンアップ場所を確認できませんでした: {detail}",
@@ -971,7 +992,6 @@
         "inventoryCount": "一覧の {total} か所のうち {existing} か所が存在します。",
         "inventoryLabel": "クリーンアップ対象一覧",
         "primaryProfile": "プライマリプロファイル",
-        "recoveryProfile": "復旧プロファイル",
         "present": "存在",
         "missing": "なし",
         "blocked": "クリーンアップは停止されています",
@@ -985,7 +1005,7 @@
         "working": "ローカルランタイムを停止し、確認済みのクリーンアップを実行しています…",
         "resetConfirmTitle": "現在の設定をリセットしますか？",
         "resetConfirmBody": "ワークスペースの ID、メモリ、チャットを保持したまま、現在のプロファイルをプロバイダー設定に戻します。",
-        "partial": "クリーンアップが途中で停止しました（{detail}）。残りのデータを保持して復旧オプションを開きました。",
+        "partial": "クリーンアップが途中で停止しました（{detail}）。OpenSquilla は残りのデータを保持し、修復オプションを開きました。",
         "applyFailed": "クリーンアップを開始できませんでした: {detail}",
         "deleteAllScheduled": "OpenSquilla を終了します。アプリの完全終了後にのみ削除を開始します。",
         "resetDone": "現在の設定をリセットしました。プロバイダー設定を再度開きます。",
@@ -1007,7 +1027,6 @@
       "migrationLabel": "データ転送",
       "migrationDesc": "別の OpenSquilla インストールのデータを使用します。事前に内容を確認し、現在の Desktop にデータがある場合は、完全にバックアップしてから置き換えます。",
       "migrationButton": "別のインストールからデータを転送",
-      "migrationRecoveryProfile": "リカバリープロファイルではデータを転送できません。続行するにはメインプロファイルに戻ってください。",
       "migrationNone": "他の OpenSquilla データは見つかりませんでした。",
       "migrationSummaryFailed": "選択したデータを確認できませんでした：{detail}",
       "migrationSummaryTitle": "データ転送を確認",
@@ -1115,11 +1134,11 @@
     },
     "privacy": {
       "title": "プライバシー",
-      "statusEnabled": "ネットワーク可観測性は有効です。",
-      "statusDisabled": "ネットワーク可観測性は無効です。",
-      "statusDisabledByEnv": "ネットワーク可観測性は環境変数によって無効です。",
-      "disableNetworkObservabilityLabel": "ネットワーク可観測性を無効化",
-      "disableNetworkObservabilityDesc": "インストールテレメトリや更新確認などのゲートウェイのネットワーク可観測性呼び出しを停止します。",
+      "statusEnabled": "ネットワーク報告はオンです。",
+      "statusDisabled": "ネットワーク報告はオフです。",
+      "statusDisabledByEnv": "環境変数の設定により、ネットワーク報告はオフになっています。",
+      "disableNetworkObservabilityLabel": "ネットワーク報告をオフにする",
+      "disableNetworkObservabilityDesc": "インストールテレメトリ、バックグラウンドの更新確認、同じセッションのリクエストを結び付ける匿名識別子を停止します。この識別子は公式の TokenRhythm API にのみ送信されます。自分で開始したモデルリクエストはそのまま動作します。",
       "save": "プライバシーを保存"
     },
     "toast": {
@@ -1936,7 +1955,7 @@
         "capabilityReference": "機能リファレンス",
         "copyBotId": "Bot ID をコピー: {id}",
         "botIdCopied": "Bot ID をコピーしました",
-        "finalStepTitle": "飛書コンソールで最後のステップ"
+        "eventSubscriptionTitle": "飛書のイベント購読を確認"
       }
     },
     "overview": {
@@ -2718,6 +2737,7 @@
     "latest": "最新",
     "thinking": "思考中",
     "thoughtProcess": "思考プロセス",
+    "thinkingForSeconds": "思考中 · {seconds} 秒",
     "thoughtForSeconds": "{seconds} 秒間思考",
     "thoughtForMinutes": "{minutes} 分 {seconds} 秒間思考",
     "toolResult": "ツールの結果",
@@ -2775,12 +2795,65 @@
       "ensembleTokens": "{count} tok",
       "ensembleUsed": "使用済み",
       "ensembleFailed": "失敗",
+      "ensembleQuorumSkipped": "候補数達成 · スキップ",
+      "ensembleQuorumSkippedDetail": "候補のしきい値を満たしたため、この候補の待機を終了しました。",
       "ensembleTracePending": "trace 待機中",
       "ensembleTraceUnavailable": "実行完了後に trace を表示できます",
       "ensembleDetailUnavailable": "{count} 個の候補 · 詳細は利用できません"
     },
     "sources": "ソース",
+    "activityLabel": "アクティビティ",
     "activitySteps": "アクティビティ · {count} ステップ | アクティビティ · {count} ステップ",
+    "activityItems": "アクティビティ · {count} 件",
+    "activityCompletedItems": "完了 · {count} 件",
+    "activityFailures": "{count} 件失敗",
+    "activityFailuresRecovered": "{count} 件の失敗から復旧",
+    "activityWorking": "作業中",
+    "workedForSeconds": "{seconds} 秒間作業",
+    "workedForMinutes": "{minutes} 分 {seconds} 秒間作業",
+    "activity": {
+      "lifecycle": {
+        "working": "作業中",
+        "answering": "回答を作成中",
+        "settled": "完了",
+        "interrupted": "中断",
+        "failed": "失敗"
+      },
+      "purpose": {
+        "discover": "リンクを検出",
+        "search": "ウェブを検索",
+        "read": "ウェブページを閲覧",
+        "inspect": "ファイルを確認",
+        "change": "ファイルを編集",
+        "run": "コマンドを実行",
+        "create": "成果物を作成",
+        "recall": "メモリを検索",
+        "use": "ツールを使用"
+      },
+      "purposeRunning": {
+        "discover": "リンクを検出中",
+        "search": "ウェブを検索中",
+        "read": "ウェブページを閲覧中",
+        "inspect": "ファイルを確認中",
+        "change": "ファイルを編集中",
+        "run": "コマンドを実行中",
+        "create": "成果物を作成中",
+        "recall": "メモリを検索中",
+        "use": "ツールを使用中"
+      },
+      "footprint": {
+        "web": "{count} 件のウェブ操作",
+        "files": "{count} 件のファイル",
+        "fileOperations": "{count} 件のファイル操作",
+        "commands": "{count} 件のコマンド",
+        "artifacts": "{count} 件の成果物",
+        "memory": "{count} 件のメモリ検索",
+        "tools": "{count} 件のツール呼び出し"
+      },
+      "more": "ほか {count} 項目",
+      "stale": "処理を継続中 — 最近の信号はありません",
+      "liveStep": "ステップ {n}"
+    },
     "suggestedTasks": "おすすめのタスク",
     "greetingMorning": "おはようございます。",
     "greetingAfternoon": "こんにちは。",
@@ -2944,18 +3017,27 @@
       "downloadFailed": "ダウンロードに失敗しました",
       "forkFailed": "フォークに失敗しました",
       "copyFailed": "コピーに失敗しました",
-      "shareExportFailed": "共有のエクスポートに失敗しました",
+      "shareSaveFailed": "画像を保存できませんでした。もう一度お試しください。",
+      "sharePreviewUpdateFailed": "プレビューを更新できませんでした。もう一度お試しください。",
       "saved": "{filename} を保存しました",
       "copiedToClipboard": "クリップボードにコピーしました",
       "copyNotSupported": "コピーはサポートされていません — 代わりにダウンロードしてください",
       "unsupportedFile": "サポートされていないファイル: {name}（{mime}）",
-      "fileTooLarge": "ファイルが大きすぎます: {name}",
+      "fileTooLarge": "ファイルが大きすぎます: {name}（上限 {cap}）",
+      "emptyFile": "空のファイル: {name}",
+      "tooManyAttachments": "添付ファイルが多すぎます（最大 {max} 件）",
+      "attachmentsTotalTooLarge": "添付ファイルの合計が大きすぎます: {name} を追加すると合計 {max} を超えます",
       "couldNotReadFile": "ファイルを読み込めませんでした: {name}",
       "uploadFailed": "{name} のアップロードに失敗しました",
       "voiceUnsupported": "このブラウザーでは音声入力がサポートされていません",
       "voiceUnavailable": "音声入力は利用できません。設定で有効にしてください。",
       "voiceTranscribeFailed": "録音を文字起こしできませんでした。もう一度お試しください。",
       "voiceSetupNeeded": "音声入力には ElevenLabs API キーが必要です — 設定を開きます…",
+      "voiceCancelledHidden": "ウィンドウが非表示になったため録音を停止しました。もう一度開始すると口述できます。",
+      "voiceMicDenied": "マイクへのアクセスが拒否されました。ブラウザーの設定で許可してください。",
+      "voiceMicDeniedDesktop": "マイクへのアクセスがブロックされています。システム設定で許可してから、もう一度お試しください。",
+      "voiceMicMissing": "マイクが見つかりませんでした。",
+      "voiceRecordFailed": "録音を開始できませんでした。もう一度お試しください。",
       "waitAttachments": "ファイル添付の処理が完了するまでお待ちください",
       "waitCompactionBeforeCommand": "{command} を実行する前にコンテキストの圧縮が完了するまでお待ちください。",
       "waitResponseBeforeCommand": "{command} を実行する前に現在の応答が完了するまでお待ちください。",
@@ -2971,8 +3053,7 @@
       "preparingOutput": "出力を準備中",
       "generatingCandidates": "候補を生成中",
       "synthesizingCandidates": "候補を統合中",
-      "stillWaiting": "まだモデルを待機中",
-      "stillWorking": "まだ処理中 — 最後の信号は {seconds} 秒前"
+      "stillWaiting": "まだモデルを待機中"
     },
     "stall": {
       "title": "応答に予想以上の時間がかかっています",
@@ -3118,7 +3199,12 @@
       "sectionDiagnostics": "診断",
       "sectionResult": "結果",
       "sectionError": "エラー",
-      "viewFull": "全文を表示"
+      "viewFull": "全文を表示",
+      "activityViewDetails": "詳細を表示",
+      "activityDetailsTitle": "詳細",
+      "activityBytesWritten": "{size} を書き込み",
+      "activityContentSize": "{lines} 行 · {characters} 文字",
+      "activityPublished": "公開済み"
     }
   },
   "channelStatus": {

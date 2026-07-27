@@ -1,6 +1,8 @@
+// @vitest-environment happy-dom
 import { describe, expect, it } from 'vitest'
 
 import {
+  collectClipboardFiles,
   hasSendableModelInputImageAttachment,
   isImageDisplayAttachment,
   isModelInputImageMime,
@@ -8,6 +10,7 @@ import {
   normalizeDisplayAttachment,
   normalizeDisplayAttachments,
   serializeDisplayAttachment,
+  shouldCaptureFilePaste,
 } from './attachments'
 import type { Attachment } from '@/types/chat'
 
@@ -269,5 +272,83 @@ describe('attachment send display serialization', () => {
     expect(attachment.dataUrl).toBeUndefined()
     expect(attachment.data).toBeUndefined()
     expect(attachment.downloadData).toBe('PHN2Zz4=')
+  })
+})
+
+describe('collectClipboardFiles', () => {
+  function fileItem(file: File): DataTransferItem {
+    return { kind: 'file', type: file.type, getAsFile: () => file } as unknown as DataTransferItem
+  }
+
+  function stringItem(type = 'text/plain'): DataTransferItem {
+    return { kind: 'string', type, getAsFile: () => null } as unknown as DataTransferItem
+  }
+
+  function transfer(items: DataTransferItem[], files: File[] = []): DataTransfer {
+    return { items, files } as unknown as DataTransfer
+  }
+
+  it('returns nothing without clipboard data', () => {
+    expect(collectClipboardFiles(null)).toEqual([])
+  })
+
+  it('lets plain-text pastes fall through unchanged', () => {
+    expect(collectClipboardFiles(transfer([stringItem(), stringItem('text/html')]))).toEqual([])
+  })
+
+  it('collects non-image files, not just images', () => {
+    const pdf = new File(['%PDF'], 'report.pdf', { type: 'application/pdf' })
+    const page = new File(['<html>'], 'page.html', { type: 'text/html' })
+    expect(collectClipboardFiles(transfer([fileItem(pdf), fileItem(page)]))).toEqual([pdf, page])
+  })
+
+  it('keeps only the file when the OS pairs it with its name as text', () => {
+    const doc = new File(['# notes'], 'notes.md', { type: 'text/markdown' })
+    expect(collectClipboardFiles(transfer([stringItem(), fileItem(doc)]))).toEqual([doc])
+  })
+
+  it('skips file items whose payload is unavailable', () => {
+    const broken = { kind: 'file', type: 'image/png', getAsFile: () => null } as unknown as DataTransferItem
+    expect(collectClipboardFiles(transfer([broken]))).toEqual([])
+  })
+
+  it('falls back to DataTransfer.files when items expose no file entries', () => {
+    const image = new File(['png'], 'shot.png', { type: 'image/png' })
+    expect(collectClipboardFiles(transfer([stringItem()], [image]))).toEqual([image])
+  })
+
+  it('does not double-count files present in both items and files', () => {
+    const pdf = new File(['%PDF'], 'report.pdf', { type: 'application/pdf' })
+    expect(collectClipboardFiles(transfer([fileItem(pdf)], [pdf]))).toEqual([pdf])
+  })
+})
+
+describe('shouldCaptureFilePaste', () => {
+  const base = { composerTextareaFocused: false, dialogLayerOpen: false }
+
+  it('captures pastes with no editable target', () => {
+    expect(shouldCaptureFilePaste(null, base)).toBe(true)
+    expect(shouldCaptureFilePaste(document.body, base)).toBe(true)
+  })
+
+  it('captures pastes aimed at the composer textarea', () => {
+    const textarea = document.createElement('textarea')
+    expect(shouldCaptureFilePaste(textarea, { ...base, composerTextareaFocused: true })).toBe(true)
+  })
+
+  it('leaves pastes aimed at other editable surfaces alone', () => {
+    expect(shouldCaptureFilePaste(document.createElement('textarea'), base)).toBe(false)
+    expect(shouldCaptureFilePaste(document.createElement('input'), base)).toBe(false)
+    const editable = document.createElement('div')
+    editable.contentEditable = 'true'
+    expect(shouldCaptureFilePaste(editable, base)).toBe(false)
+  })
+
+  it('yields to open dialog layers even for composer-bound pastes', () => {
+    expect(shouldCaptureFilePaste(document.body, { ...base, dialogLayerOpen: true })).toBe(false)
+    expect(shouldCaptureFilePaste(
+      document.createElement('textarea'),
+      { composerTextareaFocused: true, dialogLayerOpen: true },
+    )).toBe(false)
   })
 })

@@ -24,6 +24,11 @@ from opensquilla.safety.secret_redaction import redact_secret_text
 from opensquilla.secrets import clean_header_secret
 
 from .app_attribution import is_provider_app_host, provider_app_headers
+from .candidate_artifact import (
+    CandidateArtifactBuilder,
+    CandidateArtifactLimitError,
+    strip_candidate_tool_identity,
+)
 from .compat_policy import (
     TEXT_TOOL_DIALECT_MINIMAX_XML,
     TEXT_TOOL_DIALECT_PLAIN_JSON,
@@ -62,6 +67,7 @@ from .text_tool_normalizer import (
     classify_text_tool_segments,
     warn_for_unauthorized_plain_candidate,
 )
+from .tokenrhythm_correlation import tokenrhythm_correlation_headers
 from .trace_recorder import LLMTraceRecorder
 from .types import (
     ChatConfig,
@@ -94,7 +100,85 @@ _MARKDOWN_JSON_FENCE_RE = re.compile(
     re.IGNORECASE,
 )
 
-_OPENAI_TOOL_STATUS_OUTPUT_MAX_CHARS = 4000
+
+class _InertCandidateTextPassthrough:
+    """Keep textual tool syntax literal for non-executable proposer output."""
+
+    native_lifecycle_deferred = False
+    held_chars = 0
+    held_event_count = 0
+
+    def push(self, text: str) -> list[str]:
+        return [text] if text else []
+
+    def observe_native_tool_start(self, _tool_name: str) -> list[TextToolSegment]:
+        return []
+
+    def abandon_native_lifecycle_defer(self) -> list[TextToolSegment]:
+        return []
+
+    def finish(
+        self,
+        *,
+        successful_text_tool_terminal: bool,
+        native_calls: list[tuple[str, dict[str, Any]]] | None = None,
+    ) -> list[TextToolSegment]:
+        del successful_text_tool_terminal, native_calls
+        return []
+
+
+_MAX_CANDIDATE_WIRE_ID_CHARS = 4096
+
+
+def _candidate_wire_digest(value: str) -> bytes | None:
+    """Bound a response-local native identity before using it as an assembly key."""
+
+    if len(value) > _MAX_CANDIDATE_WIRE_ID_CHARS:
+        return None
+    return hashlib.sha256(value.encode("utf-8", errors="surrogatepass")).digest()
+
+
+def _candidate_fragment_has_content(value: object | None) -> bool:
+    """Return whether a malformed native field still carries advisory content."""
+
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, Mapping | list | tuple):
+        return bool(value)
+    return True
+
+
+def _candidate_malformed_tool_wrapper(
+    tool_call: Mapping[str, Any],
+) -> dict[str, object] | None:
+    """Retain non-identity wrapper content when function fields are absent."""
+
+    sanitized = strip_candidate_tool_identity(tool_call)
+    if not isinstance(sanitized, Mapping):
+        return None
+
+    residual = dict(sanitized)
+    residual.pop("index", None)
+    residual.pop("type", None)
+    function = residual.pop("function", None)
+    if isinstance(function, Mapping):
+        function_residual = dict(function)
+        function_residual.pop("name", None)
+        function_residual.pop("arguments", None)
+        if function_residual:
+            residual["function"] = function_residual
+    elif _candidate_fragment_has_content(function):
+        residual["function"] = function
+    if not residual:
+        return None
+    return {"malformed_tool_call": sanitized}
+
+
+_OPENAI_TOOL_STATUS_OUTPUT_MAX_CHARS = 10000
+_OPENAI_TOOL_STATUS_OUTPUT_HEAD_CHARS = 2000
+_OPENAI_TOOL_STATUS_OUTPUT_TAIL_CHARS = 8000
 _OPENAI_STREAM_USAGE_ONLY_KEYS = frozenset(
     {
         "id",
@@ -246,18 +330,31 @@ def _is_inert_post_terminal_stream_frame(
     )
 
 
+def _truncate_tool_status_output(output: str) -> str:
+    """Bound an error tool-result while preserving the failing tail.
+
+    Test/build failures put the actionable evidence (assertion message, ``FAILED``
+    summary, traceback) at the END of the output. The previous head-only slice
+    dropped exactly that tail, so keep a head slice for context plus a larger tail
+    slice, joined by a visible marker that names how many chars were removed.
+    """
+    if len(output) <= _OPENAI_TOOL_STATUS_OUTPUT_MAX_CHARS:
+        return output
+    head = output[:_OPENAI_TOOL_STATUS_OUTPUT_HEAD_CHARS]
+    tail = output[-_OPENAI_TOOL_STATUS_OUTPUT_TAIL_CHARS:]
+    dropped = len(output) - len(head) - len(tail)
+    return f"{head}\n...[{dropped} chars truncated]...\n{tail}"
+
+
 def _openai_tool_result_content(block: Any) -> str:
     content = block.content if isinstance(block.content, str) else json.dumps(block.content)
     status = getattr(block, "execution_status", None)
     if status is None or not derive_is_error(status):
         return content
-    output = content
-    if len(output) > _OPENAI_TOOL_STATUS_OUTPUT_MAX_CHARS:
-        output = output[:_OPENAI_TOOL_STATUS_OUTPUT_MAX_CHARS]
     return json.dumps(
         {
             "execution_status": compact_provider_status(status),
-            "output": output,
+            "output": _truncate_tool_status_output(content),
         },
         ensure_ascii=False,
     )
@@ -2859,9 +2956,22 @@ class OpenAIProvider:
             "Accept": "text/event-stream",
         }
         headers.update(provider_app_headers(self._base_url))
+        headers.update(
+            tokenrhythm_correlation_headers(
+                self._provider_kind,
+                self._base_url,
+                cfg.provider_request_correlation,
+            )
+        )
         if self._org_id:
             headers["OpenAI-Organization"] = self._org_id
 
+        inert_candidate_output = cfg.candidate_output_mode == "inert_artifact"
+        candidate_artifact = (
+            CandidateArtifactBuilder() if inert_candidate_output else None
+        )
+        candidate_artifact_open_keys: set[Any] = set()
+        candidate_artifact_wire_keys: dict[bytes, Any] = {}
         tools_acc = ToolStreamAccumulator()
         # Gemini thought_signature streamed on a non-FC text delta. Kept
         # separate from the tool accumulator (whose keys MUST stay int — see
@@ -2871,12 +2981,18 @@ class OpenAIProvider:
         reasoning = ReasoningAccumulator()
         tools_by_name = _tool_by_name(tools)
         text_tool_dialects = self._compat.text_tool_profile.dialects_for_model(self._model)
-        text_tool_normalizer = TextToolStreamNormalizer(
-            tools=tools,
-            dialects=text_tool_dialects,
-            provider_kind=self._provider_kind,
-            model=self._model,
+        text_tool_normalizer: (
+            TextToolStreamNormalizer | _InertCandidateTextPassthrough
         )
+        if inert_candidate_output:
+            text_tool_normalizer = _InertCandidateTextPassthrough()
+        else:
+            text_tool_normalizer = TextToolStreamNormalizer(
+                tools=tools,
+                dialects=text_tool_dialects,
+                provider_kind=self._provider_kind,
+                model=self._model,
+            )
         assistant_text_parts: list[str] = []
         visible_assistant_text_parts: list[str] = []
         input_tokens = 0
@@ -3001,6 +3117,7 @@ class OpenAIProvider:
                 ),
                 trust_env=_trust_env(),
                 proxy=self._proxy,
+                follow_redirects=False,
             ) as client:
                 async with client.stream(
                     "POST",
@@ -3503,33 +3620,128 @@ class OpenAIProvider:
                             # Tool calls (may stream over multiple chunks)
                             raw_tool_calls = delta.get("tool_calls") or []
                             if not isinstance(raw_tool_calls, list):
-                                invalid_native_structure += 1
-                                log.warning(
-                                    "provider.native_tool_call_invalid",
-                                    provider=self._provider_kind,
-                                    model=self._model,
-                                    reason="tool_calls_not_array",
-                                )
-                                raw_tool_calls = []
-                            for tc in raw_tool_calls:
-                                if not isinstance(tc, Mapping):
+                                if inert_candidate_output:
+                                    assert candidate_artifact is not None
+                                    candidate_artifact.observe_call(
+                                        ("invalid_tool_calls", candidate_artifact.call_count),
+                                        arguments=strip_candidate_tool_identity(
+                                            raw_tool_calls
+                                        ),
+                                    )
+                                    emitted_stream_event = True
+                                else:
                                     invalid_native_structure += 1
                                     log.warning(
                                         "provider.native_tool_call_invalid",
                                         provider=self._provider_kind,
                                         model=self._model,
-                                        reason="tool_call_not_object",
+                                        reason="tool_calls_not_array",
                                     )
+                                raw_tool_calls = []
+                            for tc in raw_tool_calls:
+                                if not isinstance(tc, Mapping):
+                                    if inert_candidate_output:
+                                        assert candidate_artifact is not None
+                                        candidate_artifact.observe_call(
+                                            ("invalid_tool_call", candidate_artifact.call_count),
+                                            arguments=strip_candidate_tool_identity(tc),
+                                        )
+                                        emitted_stream_event = True
+                                    else:
+                                        invalid_native_structure += 1
+                                        log.warning(
+                                            "provider.native_tool_call_invalid",
+                                            provider=self._provider_kind,
+                                            model=self._model,
+                                            reason="tool_call_not_object",
+                                        )
                                     continue
                                 if (
                                     self._provider_kind == "dashscope"
                                     and _dashscope_tool_call_chunk_is_empty(tc)
+                                    and (
+                                        not inert_candidate_output
+                                        or _candidate_malformed_tool_wrapper(tc) is None
+                                    )
                                 ):
                                     log.warning(
                                         "dashscope.stream_tool_chunk_sanitized",
                                         model=self._model,
                                         reason="empty_tool_call_chunk",
                                     )
+                                    continue
+                                if inert_candidate_output:
+                                    assert candidate_artifact is not None
+                                    raw_idx = tc.get("index")
+                                    raw_wire_id = tc.get("id")
+                                    if (
+                                        isinstance(raw_idx, int)
+                                        and not isinstance(raw_idx, bool)
+                                        and raw_idx >= 0
+                                    ):
+                                        # A valid provider index is already a
+                                        # bounded stream-local identity. Do not
+                                        # inspect or retain an attacker-sized ID.
+                                        artifact_key: Any = ("index", raw_idx)
+                                    else:
+                                        wire_digest = (
+                                            _candidate_wire_digest(raw_wire_id)
+                                            if isinstance(raw_wire_id, str)
+                                            and raw_wire_id
+                                            else None
+                                        )
+                                        if wire_digest is not None:
+                                            artifact_key = (
+                                                candidate_artifact_wire_keys.get(
+                                                    wire_digest,
+                                                    ("wire_digest", wire_digest),
+                                                )
+                                            )
+                                            candidate_artifact_wire_keys[wire_digest] = (
+                                                artifact_key
+                                            )
+                                        else:
+                                            if (
+                                                "index" not in tc
+                                                and len(candidate_artifact_open_keys) == 1
+                                            ):
+                                                artifact_key = next(
+                                                    iter(candidate_artifact_open_keys)
+                                                )
+                                            else:
+                                                artifact_key = (
+                                                    "sequence",
+                                                    candidate_artifact.call_count,
+                                                )
+                                    raw_function = tc.get("function")
+                                    if isinstance(raw_function, Mapping):
+                                        name_fragment = raw_function.get("name")
+                                        arguments_fragment = raw_function.get("arguments")
+                                    else:
+                                        name_fragment = None
+                                        arguments_fragment = (
+                                            strip_candidate_tool_identity(raw_function)
+                                            if _candidate_fragment_has_content(raw_function)
+                                            else None
+                                        )
+                                    if (
+                                        not _candidate_fragment_has_content(name_fragment)
+                                        and not _candidate_fragment_has_content(
+                                            arguments_fragment
+                                        )
+                                    ):
+                                        malformed_wrapper = (
+                                            _candidate_malformed_tool_wrapper(tc)
+                                        )
+                                        if malformed_wrapper is not None:
+                                            arguments_fragment = malformed_wrapper
+                                    candidate_artifact.append_or_start(
+                                        artifact_key,
+                                        name_fragment=name_fragment,
+                                        arguments_fragment=arguments_fragment,
+                                    )
+                                    candidate_artifact_open_keys.add(artifact_key)
+                                    emitted_stream_event = True
                                     continue
                                 idx, index_valid = _resolve_tool_call_index(tc, tools_acc)
                                 if not index_valid:
@@ -3810,6 +4022,10 @@ class OpenAIProvider:
                             and not emitted_stream_event
                             and not assistant_text_parts
                             and not tools_acc.has_calls
+                            and not (
+                                candidate_artifact is not None
+                                and candidate_artifact.has_calls
+                            )
                             and input_tokens == 0
                             and output_tokens == 0
                         ):
@@ -3871,13 +4087,14 @@ class OpenAIProvider:
                         saw_done_sentinel=saw_done_sentinel,
                         finish_reasons=finish_reasons,
                     )
-                    warn_for_unauthorized_plain_candidate(
-                        "".join(assistant_text_parts),
-                        tools,
-                        dialects=text_tool_dialects,
-                        provider_kind=self._provider_kind,
-                        model=self._model,
-                    )
+                    if not inert_candidate_output:
+                        warn_for_unauthorized_plain_candidate(
+                            "".join(assistant_text_parts),
+                            tools,
+                            dialects=text_tool_dialects,
+                            provider_kind=self._provider_kind,
+                            model=self._model,
+                        )
 
                     if tools_acc.has_calls and not successful_text_tool_terminal:
                         for pending_event in _segment_text_tool_events(
@@ -4035,6 +4252,25 @@ class OpenAIProvider:
                         yield deferred_event
                     deferred_post_native_events.clear()
 
+                    candidate_artifact_text = ""
+                    if candidate_artifact is not None and candidate_artifact.has_calls:
+                        if successful_text_tool_terminal:
+                            for artifact_key in candidate_artifact_open_keys:
+                                candidate_artifact.finish(artifact_key)
+                        candidate_artifact_text = candidate_artifact.render_text()
+                        if candidate_artifact_text:
+                            visible_assistant_text_parts.append(candidate_artifact_text)
+                        log.info(
+                            "provider.candidate_artifact",
+                            provider=self._provider_kind,
+                            model=self._model,
+                            call_count=candidate_artifact.call_count,
+                            event_count=candidate_artifact.event_count,
+                            char_count=candidate_artifact.char_count,
+                            issue_codes=sorted(candidate_artifact.issue_codes),
+                            truncated=False,
+                        )
+
                     # Assemble reasoning from the structured fields already
                     # streamed in real time via ReasoningDeltaEvent.
                     reasoning_text = reasoning.finalize()
@@ -4064,6 +4300,10 @@ class OpenAIProvider:
                         and not emitted_stream_event
                         and not assistant_text_parts
                         and not tools_acc.has_calls
+                        and not (
+                            candidate_artifact is not None
+                            and candidate_artifact.has_calls
+                        )
                         and input_tokens == 0
                         and output_tokens == 0
                     ):
@@ -4116,6 +4356,8 @@ class OpenAIProvider:
                         response_ids=sorted(response_ids),
                         metadata={"cache_shape": cache_shape},
                     )
+                    if candidate_artifact_text:
+                        yield TextDeltaEvent(text=candidate_artifact_text)
                     yield DoneEvent(
                         stop_reason=stop_reason,
                         input_tokens=input_tokens,
@@ -4172,6 +4414,21 @@ class OpenAIProvider:
                         timeout_exc=exc,
                     ):
                         yield fallback_event
+                except CandidateArtifactLimitError as fallback_exc:
+                    log.warning(
+                        "provider.candidate_artifact_limit",
+                        provider=self._provider_kind,
+                        model=self._model,
+                        phase="non_stream_fallback",
+                        operation=fallback_exc.operation,
+                        reason=fallback_exc.reason,
+                        limit=fallback_exc.limit,
+                        observed=fallback_exc.observed,
+                    )
+                    yield ErrorEvent(
+                        message="Candidate artifact exceeded bounded assembly limits",
+                        code="candidate_artifact_limit_exceeded",
+                    )
                 except ToolStreamProtocolError as fallback_exc:
                     log.warning(
                         "provider.tool_stream_protocol_error",
@@ -4248,6 +4505,35 @@ class OpenAIProvider:
                 yield deferred_event
             deferred_post_native_events.clear()
             yield ErrorEvent(message=safe_error, code="request_error")
+        except CandidateArtifactLimitError as exc:
+            message = "Candidate artifact exceeded bounded assembly limits"
+            log.warning(
+                "provider.candidate_artifact_limit",
+                provider=self._provider_kind,
+                model=self._model,
+                phase="stream",
+                operation=exc.operation,
+                reason=exc.reason,
+                limit=exc.limit,
+                observed=exc.observed,
+            )
+            trace.record_error(
+                code="candidate_artifact_limit_exceeded",
+                message=message,
+                metadata={
+                    "phase": "stream",
+                    "cache_shape": cache_shape,
+                    "reason": exc.reason,
+                    "limit": exc.limit,
+                    "observed": exc.observed,
+                },
+            )
+            deferred_native_events.clear()
+            deferred_post_native_events.clear()
+            yield ErrorEvent(
+                message=message,
+                code="candidate_artifact_limit_exceeded",
+            )
         except ToolStreamProtocolError as exc:
             message = "Provider returned an invalid tool lifecycle"
             log.warning(
@@ -4359,6 +4645,7 @@ class OpenAIProvider:
                 timeout=cfg.timeout,
                 trust_env=_trust_env(),
                 proxy=self._proxy,
+                follow_redirects=False,
             ) as client:
                 response = await client.post(
                     endpoint,
@@ -4564,17 +4851,27 @@ class OpenAIProvider:
         assistant_text_parts: list[str] = []
         visible_assistant_text_parts: list[str] = []
         reasoning = ReasoningAccumulator()
+        inert_candidate_output = cfg.candidate_output_mode == "inert_artifact"
+        candidate_artifact = (
+            CandidateArtifactBuilder() if inert_candidate_output else None
+        )
         tools_acc = ToolStreamAccumulator()
         trace_tool_calls: list[dict[str, Any]] = []
         tools_by_name = _tool_by_name(tools)
         finish_reasons: list[str] = []
         text_tool_dialects = self._compat.text_tool_profile.dialects_for_model(self._model)
-        text_tool_normalizer = TextToolStreamNormalizer(
-            tools=tools,
-            dialects=text_tool_dialects,
-            provider_kind=self._provider_kind,
-            model=self._model,
+        text_tool_normalizer: (
+            TextToolStreamNormalizer | _InertCandidateTextPassthrough
         )
+        if inert_candidate_output:
+            text_tool_normalizer = _InertCandidateTextPassthrough()
+        else:
+            text_tool_normalizer = TextToolStreamNormalizer(
+                tools=tools,
+                dialects=text_tool_dialects,
+                provider_kind=self._provider_kind,
+                model=self._model,
+            )
         native_calls: list[tuple[str, dict[str, Any]]] = []
         pending_native_finishes: list[tuple[Any, dict[str, Any]]] = []
         deferred_native_events = _DeferredStreamEventBuffer()
@@ -4609,22 +4906,62 @@ class OpenAIProvider:
 
             raw_tool_calls = message.get("tool_calls") or []
             if not isinstance(raw_tool_calls, list):
-                invalid_native_arguments += 1
-                log.warning(
-                    "provider.native_tool_call_invalid",
-                    provider=self._provider_kind,
-                    model=self._model,
-                    reason="tool_calls_not_array",
-                )
-                raw_tool_calls = []
-            for tc in raw_tool_calls:
-                if not isinstance(tc, Mapping):
+                if inert_candidate_output:
+                    assert candidate_artifact is not None
+                    candidate_artifact.observe_call(
+                        ("invalid_tool_calls", candidate_artifact.call_count),
+                        arguments=strip_candidate_tool_identity(raw_tool_calls),
+                    )
+                else:
                     invalid_native_arguments += 1
                     log.warning(
                         "provider.native_tool_call_invalid",
                         provider=self._provider_kind,
                         model=self._model,
-                        reason="tool_call_not_object",
+                        reason="tool_calls_not_array",
+                    )
+                raw_tool_calls = []
+            for call_position, tc in enumerate(raw_tool_calls):
+                if not isinstance(tc, Mapping):
+                    if inert_candidate_output:
+                        assert candidate_artifact is not None
+                        candidate_artifact.observe_call(
+                            ("invalid_tool_call", call_position),
+                            arguments=strip_candidate_tool_identity(tc),
+                        )
+                    else:
+                        invalid_native_arguments += 1
+                        log.warning(
+                            "provider.native_tool_call_invalid",
+                            provider=self._provider_kind,
+                            model=self._model,
+                            reason="tool_call_not_object",
+                        )
+                    continue
+                if inert_candidate_output:
+                    assert candidate_artifact is not None
+                    raw_function = tc.get("function")
+                    if isinstance(raw_function, Mapping):
+                        raw_name = raw_function.get("name")
+                        raw_arguments = raw_function.get("arguments")
+                    else:
+                        raw_name = None
+                        raw_arguments = (
+                            strip_candidate_tool_identity(raw_function)
+                            if _candidate_fragment_has_content(raw_function)
+                            else None
+                        )
+                    if (
+                        not _candidate_fragment_has_content(raw_name)
+                        and not _candidate_fragment_has_content(raw_arguments)
+                    ):
+                        malformed_wrapper = _candidate_malformed_tool_wrapper(tc)
+                        if malformed_wrapper is not None:
+                            raw_arguments = malformed_wrapper
+                    candidate_artifact.observe_call(
+                        ("tool_call", call_position),
+                        name_text=raw_name,
+                        arguments=raw_arguments,
                     )
                     continue
                 raw_function = tc.get("function") or {}
@@ -4719,13 +5056,14 @@ class OpenAIProvider:
                 else:
                     invalid_native_arguments += 1
 
-        warn_for_unauthorized_plain_candidate(
-            "".join(assistant_text_parts),
-            tools,
-            dialects=text_tool_dialects,
-            provider_kind=self._provider_kind,
-            model=self._model,
-        )
+        if not inert_candidate_output:
+            warn_for_unauthorized_plain_candidate(
+                "".join(assistant_text_parts),
+                tools,
+                dialects=text_tool_dialects,
+                provider_kind=self._provider_kind,
+                model=self._model,
+            )
         successful_text_tool_terminal = _successful_text_tool_terminal(
             saw_done_sentinel=False,
             finish_reasons=finish_reasons,
@@ -4853,6 +5191,22 @@ class OpenAIProvider:
         for deferred_event in deferred_native_events:
             yield deferred_event
 
+        candidate_artifact_text = ""
+        if candidate_artifact is not None and candidate_artifact.has_calls:
+            candidate_artifact_text = candidate_artifact.render_text()
+            if candidate_artifact_text:
+                visible_assistant_text_parts.append(candidate_artifact_text)
+            log.info(
+                "provider.candidate_artifact",
+                provider=self._provider_kind,
+                model=self._model,
+                call_count=candidate_artifact.call_count,
+                event_count=candidate_artifact.event_count,
+                char_count=candidate_artifact.char_count,
+                issue_codes=sorted(candidate_artifact.issue_codes),
+                truncated=False,
+            )
+
         reasoning_text = reasoning.finalize()
         if (
             not reasoning_text
@@ -4880,6 +5234,8 @@ class OpenAIProvider:
             response_ids=[str(data["id"])] if data.get("id") else [],
             metadata={"cache_shape": cache_shape},
         )
+        if candidate_artifact_text:
+            yield TextDeltaEvent(text=candidate_artifact_text)
         yield DoneEvent(
             stop_reason=stop_reason,
             input_tokens=input_tokens,

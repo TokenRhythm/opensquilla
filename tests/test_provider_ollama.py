@@ -15,11 +15,14 @@ from opensquilla.provider.types import (
     ContentBlockToolResult,
     ContentBlockToolUse,
     DoneEvent,
+    ErrorEvent,
     Message,
     TextDeltaEvent,
     ToolDefinition,
     ToolInputSchema,
+    ToolUseDeltaEvent,
     ToolUseEndEvent,
+    ToolUseStartEvent,
 )
 
 
@@ -272,6 +275,318 @@ def test_stream_tool_call_emits_tool_events(monkeypatch: Any) -> None:
     assert tool_end.tool_name == "lookup"
     assert tool_end.arguments == {"q": "hi"}
     assert captured["payload"]["tools"][0]["function"]["name"] == "lookup"
+
+
+def test_stream_candidate_mode_demotes_oversized_tool_name(monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+    oversized_name = "proposed_action_" + ("x" * 17_000)
+    body = _ndjson(
+        {
+            "model": "llama3",
+            "message": {
+                "role": "assistant",
+                "content": "analysis",
+                "tool_calls": [
+                    {
+                        "id": "call_should_not_escape",
+                        "function": {
+                            "name": oversized_name,
+                            "arguments": {"city": "Shanghai"},
+                        },
+                    }
+                ],
+            },
+        },
+        {
+            "model": "llama3",
+            "message": {"role": "assistant", "content": ""},
+            "done": True,
+            "prompt_eval_count": 8,
+            "eval_count": 3,
+        },
+    )
+    _patch_stream(monkeypatch, captured, body)
+    provider = OllamaProvider(model="llama3")
+
+    events = _collect(
+        provider,
+        [Message(role="user", content="hi")],
+        ChatConfig(candidate_output_mode="inert_artifact"),
+    )
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert not any(
+        isinstance(event, ToolUseStartEvent | ToolUseDeltaEvent | ToolUseEndEvent)
+        for event in events
+    )
+    artifact_event = next(
+        event
+        for event in events
+        if isinstance(event, TextDeltaEvent)
+        and "inert_proposer_tool_output" in event.text
+    )
+    artifact = json.loads(artifact_event.text)
+    assert artifact["kind"] == "inert_proposer_tool_output"
+    assert artifact["executable"] is False
+    assert artifact["actions"] == [
+        {
+            "arguments_text": '{"city":"Shanghai"}',
+            "issues": ["name_over_execution_limit"],
+            "name_text": oversized_name,
+        }
+    ]
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.input_tokens == 8
+    assert done.output_tokens == 3
+    assert "".join(
+        event.text for event in events if isinstance(event, TextDeltaEvent)
+    ).startswith("analysis\n{")
+    assert events.index(artifact_event) < events.index(done)
+
+
+def test_stream_candidate_mode_rejects_rendered_artifact_over_total_limit(
+    monkeypatch: Any,
+) -> None:
+    from opensquilla.provider.candidate_artifact import CandidateArtifactBuilder
+
+    captured: dict[str, Any] = {}
+    body = _ndjson(
+        {
+            "model": "llama3",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "\0" * 20,
+                            "arguments": {},
+                        },
+                    }
+                ],
+            },
+        },
+        {
+            "model": "llama3",
+            "message": {"role": "assistant", "content": ""},
+            "done": True,
+        },
+    )
+    _patch_stream(monkeypatch, captured, body)
+    monkeypatch.setattr(
+        "opensquilla.provider.ollama.CandidateArtifactBuilder",
+        lambda: CandidateArtifactBuilder(max_total_chars=180),
+    )
+    provider = OllamaProvider(model="llama3")
+
+    events = _collect(
+        provider,
+        [Message(role="user", content="hi")],
+        ChatConfig(candidate_output_mode="inert_artifact"),
+    )
+
+    assert not any(isinstance(event, TextDeltaEvent) for event in events)
+    assert not any(
+        isinstance(event, ToolUseStartEvent | ToolUseDeltaEvent | ToolUseEndEvent)
+        for event in events
+    )
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    assert any(
+        isinstance(event, ErrorEvent)
+        and event.code == "candidate_artifact_limit_exceeded"
+        for event in events
+    )
+
+
+def test_stream_normal_mode_keeps_tool_name_limit(monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+    body = _ndjson(
+        {
+            "model": "llama3",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"function": {"name": "x" * 257, "arguments": {"q": "hi"}}}
+                ],
+            },
+        },
+        {
+            "model": "llama3",
+            "message": {"role": "assistant", "content": ""},
+            "done": True,
+        },
+    )
+    _patch_stream(monkeypatch, captured, body)
+    provider = OllamaProvider(model="llama3")
+
+    events = _collect(provider, [Message(role="user", content="hi")])
+
+    assert any(
+        isinstance(event, ErrorEvent) and event.code == "incomplete_tool_call"
+        for event in events
+    )
+    assert not any(isinstance(event, DoneEvent) for event in events)
+
+
+def test_stream_candidate_mode_retains_malformed_tool_shape(monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+    body = _ndjson(
+        {
+            "model": "llama3",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": {
+                    "id": "private-wrapper-id",
+                    "nested": {
+                        "tool_use_id": "private-nested-id",
+                        "confidence": 0,
+                        "unexpected": True,
+                    },
+                },
+            },
+        },
+        {
+            "model": "llama3",
+            "message": {"role": "assistant", "content": ""},
+            "done": True,
+            "prompt_eval_count": 2,
+            "eval_count": 1,
+        },
+    )
+    _patch_stream(monkeypatch, captured, body)
+    provider = OllamaProvider(model="llama3")
+
+    events = _collect(
+        provider,
+        [Message(role="user", content="hi")],
+        ChatConfig(candidate_output_mode="inert_artifact"),
+    )
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert not any(
+        isinstance(event, ToolUseStartEvent | ToolUseDeltaEvent | ToolUseEndEvent)
+        for event in events
+    )
+    artifact_text = next(
+        event.text for event in events if isinstance(event, TextDeltaEvent)
+    )
+    artifact = json.loads(artifact_text)
+    assert artifact["actions"] == [
+        {
+            "arguments_text": (
+                '{"malformed_tool_calls":{"nested":{"confidence":0,"unexpected":true}}}'
+            ),
+            "issues": ["missing_name"],
+            "name_text": "",
+        }
+    ]
+    assert "private-wrapper-id" not in artifact_text
+    assert "private-nested-id" not in artifact_text
+    assert any(isinstance(event, DoneEvent) for event in events)
+
+
+def test_stream_candidate_mode_drops_null_and_empty_tool_wrappers(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    body = _ndjson(
+        {
+            "model": "llama3",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": None,
+            },
+        },
+        {
+            "model": "llama3",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": {},
+            },
+        },
+        {
+            "model": "llama3",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    None,
+                    [],
+                    {"id": "private-empty-id", "function": {}},
+                    {"index": 0, "function": {}},
+                    {"function": {"index": 0}},
+                    {
+                        "type": "function",
+                        "function": {"name": "", "arguments": {}},
+                    },
+                ],
+            },
+        },
+        {
+            "model": "llama3",
+            "message": {"role": "assistant", "content": ""},
+            "done": True,
+            "prompt_eval_count": 2,
+            "eval_count": 1,
+        },
+    )
+    _patch_stream(monkeypatch, captured, body)
+    provider = OllamaProvider(model="llama3")
+
+    events = _collect(
+        provider,
+        [Message(role="user", content="hi")],
+        ChatConfig(candidate_output_mode="inert_artifact"),
+    )
+
+    assert not any(isinstance(event, TextDeltaEvent) for event in events)
+    assert not any(
+        isinstance(event, ToolUseStartEvent | ToolUseDeltaEvent | ToolUseEndEvent)
+        for event in events
+    )
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert any(isinstance(event, DoneEvent) for event in events)
+
+
+def test_stream_candidate_mode_does_not_publish_artifact_before_done(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    body = _ndjson(
+        {
+            "model": "llama3",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"function": {"name": "lookup", "arguments": {"q": "hi"}}}
+                ],
+            },
+        },
+    )
+    _patch_stream(monkeypatch, captured, body)
+    provider = OllamaProvider(model="llama3")
+
+    events = _collect(
+        provider,
+        [Message(role="user", content="hi")],
+        ChatConfig(candidate_output_mode="inert_artifact"),
+    )
+
+    assert any(
+        isinstance(event, ErrorEvent) and event.code == "incomplete_stream"
+        for event in events
+    )
+    assert not any(isinstance(event, TextDeltaEvent) for event in events)
+    assert not any(
+        isinstance(event, ToolUseStartEvent | ToolUseDeltaEvent | ToolUseEndEvent)
+        for event in events
+    )
+    assert not any(isinstance(event, DoneEvent) for event in events)
 
 
 def test_selector_passes_api_key_to_ollama_provider() -> None:

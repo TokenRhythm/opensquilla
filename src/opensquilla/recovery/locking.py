@@ -16,7 +16,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 
-from opensquilla.recovery.atomic import _chmod_open_file, _windows_extended_path
+from opensquilla.recovery.atomic import (
+    _chmod_open_file,
+    _native_io_path,
+    _windows_extended_path,
+)
 from opensquilla.recovery.errors import (
     AtomicStateUnknownError,
     LegacyGatewayRunningError,
@@ -155,8 +159,20 @@ class GatewayLegacyLease:
     owner_thread: int
 
 
+def _logical_path_spelling(path: str | Path) -> str:
+    value = os.fspath(path)
+    if os.name != "nt":
+        return value
+    lowered = value.lower()
+    if lowered.startswith("\\\\?\\unc\\"):
+        return "\\\\" + value[8:]
+    if lowered.startswith("\\\\?\\"):
+        return value[4:]
+    return value
+
+
 def _normalized_path(path: str | Path) -> str:
-    candidate = Path(path).expanduser()
+    candidate = Path(_logical_path_spelling(path)).expanduser()
     try:
         normalized = candidate.resolve(strict=False)
     except (OSError, RuntimeError):
@@ -214,7 +230,7 @@ def _refresh_after_fork() -> None:
 
 def _assert_real_lock_directory(path: Path) -> tuple[int, int]:
     try:
-        value = path.lstat()
+        value = os.lstat(_native_io_path(path))
     except OSError as exc:
         raise UnsafePathError(f"profile lock directory is unavailable: {path}") from exc
     attributes = int(getattr(value, "st_file_attributes", 0))
@@ -264,9 +280,7 @@ def _prepare_posix_lock_file(path: Path, root: Path) -> int:
             child_stat = os.fstat(child_fd)
             if not stat.S_ISDIR(child_stat.st_mode):
                 os.close(child_fd)
-                raise UnsafePathError(
-                    f"profile lock directory must be real: {current_path / name}"
-                )
+                raise UnsafePathError(f"profile lock directory must be real: {current_path / name}")
             current_path /= name
             child_identity = (int(child_stat.st_dev), int(child_stat.st_ino))
             opened.append((current_path, child_fd, child_identity))
@@ -298,9 +312,7 @@ def _prepare_posix_lock_file(path: Path, root: Path) -> int:
                 or (int(lock_path_stat.st_dev), int(lock_path_stat.st_ino))
                 != (int(value.st_dev), int(value.st_ino))
             ):
-                raise UnsafePathError(
-                    f"profile lock is not a regular single-link file: {path}"
-                )
+                raise UnsafePathError(f"profile lock is not a regular single-link file: {path}")
             with contextlib.suppress(OSError):
                 _chmod_open_file(fd, 0o600)
             os.lseek(fd, 0, os.SEEK_SET)
@@ -312,9 +324,7 @@ def _prepare_posix_lock_file(path: Path, root: Path) -> int:
         for opened_path, _opened_fd, expected in opened:
             if _assert_real_lock_directory(opened_path) != expected:
                 os.close(fd)
-                raise UnsafePathError(
-                    f"profile lock directory identity changed: {opened_path}"
-                )
+                raise UnsafePathError(f"profile lock directory identity changed: {opened_path}")
         return fd
     finally:
         closed: set[int] = set()
@@ -374,11 +384,7 @@ def _windows_nt_create_relative(
     status_value = int(status)
     handle_value = getattr(handle, "value", None)
     invalid_handle = ctypes.c_void_p(-1).value
-    if (
-        status_value < 0
-        or status_value & 0x80000000
-        or handle_value in {None, 0, invalid_handle}
-    ):
+    if status_value < 0 or status_value & 0x80000000 or handle_value in {None, 0, invalid_handle}:
         raise UnsafePathError(
             "cannot create profile lock component safely "
             f"(NTSTATUS 0x{status_value & 0xFFFFFFFF:08x}): {name}"
@@ -404,9 +410,7 @@ def _windows_assert_lock_handle(
         ctypes.sizeof(attributes),
     ):
         error_number = getattr(ctypes, "get_last_error")()
-        raise UnsafePathError(
-            f"cannot inspect {label} handle (Windows error {error_number})"
-        )
+        raise UnsafePathError(f"cannot inspect {label} handle (Windows error {error_number})")
     if attributes.file_attributes & 0x400:
         raise UnsafePathError(f"{label} must not be a reparse point")
     is_directory = bool(attributes.file_attributes & _WINDOWS_FILE_ATTRIBUTE_DIRECTORY)
@@ -422,9 +426,7 @@ def _windows_assert_lock_handle(
         ctypes.sizeof(file_id),
     ):
         error_number = getattr(ctypes, "get_last_error")()
-        raise UnsafePathError(
-            f"cannot inspect {label} identity (Windows error {error_number})"
-        )
+        raise UnsafePathError(f"cannot inspect {label} identity (Windows error {error_number})")
     actual = (
         int(file_id.volume_serial_number),
         int.from_bytes(bytes(file_id.file_id.identifier), "little"),
@@ -439,7 +441,7 @@ def _windows_open_profile_lock_file(path: Path, root: Path) -> int:
     import msvcrt
 
     try:
-        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.makedirs(_native_io_path(root), mode=0o700, exist_ok=True)
     except OSError as exc:
         raise UnsafePathError(f"cannot create profile lock root safely: {root}") from exc
     root_identity = _assert_real_lock_directory(root)
@@ -578,7 +580,7 @@ def _windows_open_profile_lock_file(path: Path, root: Path) -> int:
             create_options=file_options,
         )
         try:
-            path_value = path.lstat()
+            path_value = os.lstat(_native_io_path(path))
         except OSError as exc:
             raise UnsafePathError(f"profile lock path disappeared while opening: {path}") from exc
         attributes = int(getattr(path_value, "st_file_attributes", 0))
@@ -649,7 +651,7 @@ def _prepare_lock_file(path: Path) -> int:
 
 def _state_directory_identity(path: Path) -> tuple[int, int, int]:
     try:
-        value = path.lstat()
+        value = os.lstat(_native_io_path(path))
     except OSError as exc:
         raise UnsafePathError(f"cannot inspect legacy state directory safely: {path}") from exc
     attributes = int(getattr(value, "st_file_attributes", 0))
@@ -662,7 +664,7 @@ def _lockable_state_path(path: Path, *, allow_state_symlink: bool) -> Path:
     """Return the real state directory used solely for runtime lock placement."""
 
     try:
-        value = path.lstat()
+        value = os.lstat(_native_io_path(path))
     except OSError as exc:
         raise UnsafePathError(f"cannot inspect legacy state directory safely: {path}") from exc
     attributes = int(getattr(value, "st_file_attributes", 0))
@@ -671,7 +673,9 @@ def _lockable_state_path(path: Path, *, allow_state_symlink: bool) -> Path:
     if not allow_state_symlink:
         raise UnsafePathError(f"legacy state directory must not be a link: {path}")
     try:
-        resolved = path.resolve(strict=True)
+        resolved = Path(
+            _logical_path_spelling(os.path.realpath(_native_io_path(path), strict=True))
+        )
     except (OSError, RuntimeError) as exc:
         raise UnsafePathError(f"configured state link cannot be resolved safely: {path}") from exc
     # The final resolved leaf must itself be a real directory. Intermediate
@@ -767,7 +771,7 @@ def _prepare_legacy_lock_file(state_path: Path, *, create_if_missing: bool) -> i
         attributes = int(getattr(value, "st_file_attributes", 0))
         if attributes & 0x400 or not stat.S_ISREG(value.st_mode) or value.st_nlink != 1:
             raise UnsafePathError(f"legacy gateway lock is not a regular file: {path}")
-        current_path = path.lstat()
+        current_path = os.lstat(_native_io_path(path))
         current_attributes = int(getattr(current_path, "st_file_attributes", 0))
         if (
             stat.S_ISLNK(current_path.st_mode)
@@ -820,12 +824,12 @@ def rebind_legacy_gateway_lock(
     destination_key = _normalized_path(destination_path)
     if source_key == destination_key:
         raise UnsafePathError("legacy gateway lock handoff paths are identical")
-    if os.path.lexists(source_state):
+    if os.path.lexists(_native_io_path(source_state)):
         raise UnsafePathError("legacy gateway lock source still exists after handoff")
 
     destination_state_identity = _state_directory_identity(destination_state)
     try:
-        path_value = destination_path.lstat()
+        path_value = os.lstat(_native_io_path(destination_path))
     except OSError as exc:
         raise UnsafePathError("moved legacy gateway lock is missing at destination") from exc
     path_attributes = int(getattr(path_value, "st_file_attributes", 0))
@@ -929,7 +933,7 @@ def _profile_relative_path(path: Path, root: Path) -> Path | None:
 
 def _legacy_lock_file_identity(path: Path) -> tuple[int, int]:
     try:
-        value = path.lstat()
+        value = os.lstat(_native_io_path(path))
     except OSError as exc:
         raise UnsafePathError(f"legacy gateway lock is unavailable: {path}") from exc
     attributes = int(getattr(value, "st_file_attributes", 0))
@@ -1127,6 +1131,9 @@ def move_profile_no_replace(
     destination: str | Path,
     *,
     move: Callable[..., None] | None = None,
+    link_leaf_manifest_directories: frozenset[str] = frozenset(),
+    opaque_manifest_directories: frozenset[str] = frozenset(),
+    use_profile_manifest_policy: bool = True,
 ) -> None:
     """Move a locked profile without dropping old-gateway exclusion silently.
 
@@ -1166,7 +1173,9 @@ def move_profile_no_replace(
                 destination_path,
             ),
             _allowed_manifest_mtime_changes=allowed_mtime_changes,
-            _use_profile_manifest_policy=True,
+            _link_leaf_manifest_directories=link_leaf_manifest_directories,
+            _opaque_manifest_directories=opaque_manifest_directories,
+            _use_profile_manifest_policy=use_profile_manifest_policy,
         )
         return
     with _LOCKS_GUARD:
@@ -1175,7 +1184,9 @@ def move_profile_no_replace(
         move(
             source_path,
             destination_path,
-            _use_profile_manifest_policy=True,
+            _link_leaf_manifest_directories=link_leaf_manifest_directories,
+            _opaque_manifest_directories=opaque_manifest_directories,
+            _use_profile_manifest_policy=use_profile_manifest_policy,
         )
         rebound: list[_LegacyLockMove] = []
         try:
@@ -1363,8 +1374,7 @@ class LegacyGatewayLock:
             specs = _effective_state_root_specs(self.home)
         else:
             specs = tuple(
-                (Path(root).expanduser().absolute(), allow_state_symlinks)
-                for root in state_roots
+                (Path(root).expanduser().absolute(), allow_state_symlinks) for root in state_roots
             )
         unique: dict[str, tuple[Path, bool]] = {}
         for root, explicit in specs:
@@ -1375,9 +1385,7 @@ class LegacyGatewayLock:
                 explicit if previous is None else previous[1] or explicit,
             )
         self.state_roots = tuple(unique[key][0] for key in sorted(unique))
-        self._allow_symlink_by_key = {
-            key: unique[key][1] for key in sorted(unique)
-        }
+        self._allow_symlink_by_key = {key: unique[key][1] for key in sorted(unique)}
         self.paths = tuple(root / "gateway.pid.lock" for root in self.state_roots)
         # Compatibility with callers/tests that historically inspected the one
         # canonical lock path.
@@ -1393,7 +1401,7 @@ class LegacyGatewayLock:
         self._owner_thread = threading.get_ident()
         try:
             for root in self.state_roots:
-                if not os.path.lexists(root):
+                if not os.path.lexists(_native_io_path(root)):
                     continue
                 self._acquire_one(root)
             return self
@@ -1409,9 +1417,7 @@ class LegacyGatewayLock:
         already present and locked without creating it as a side effect.
         """
 
-        expected = _normalized_path(
-            Path(state_root).expanduser().absolute() / "gateway.pid.lock"
-        )
+        expected = _normalized_path(Path(state_root).expanduser().absolute() / "gateway.pid.lock")
         owner_thread = threading.get_ident()
         with _LOCKS_GUARD:
             _refresh_after_fork()
@@ -1435,9 +1441,7 @@ class LegacyGatewayLock:
         older gateway.
         """
 
-        expected = _normalized_path(
-            Path(state_root).expanduser().absolute() / "gateway.pid.lock"
-        )
+        expected = _normalized_path(Path(state_root).expanduser().absolute() / "gateway.pid.lock")
         owner_thread = threading.get_ident()
         with _LOCKS_GUARD:
             _refresh_after_fork()
@@ -1627,7 +1631,7 @@ def _effective_state_root_specs(
     home_path = Path(home).expanduser().absolute()
     candidates: list[tuple[Path, bool]] = [(home_path / "state", False)]
     config_path = home_path / "config.toml"
-    if os.path.lexists(config_path):
+    if os.path.lexists(_native_io_path(config_path)):
         from opensquilla.recovery.config_patch import ConfigSnapshot, state_override
 
         snapshot = ConfigSnapshot.capture(config_path)
@@ -1769,18 +1773,27 @@ def release_gateway_legacy_lease(lease: GatewayLegacyLease | None) -> None:
 def acquire_legacy_gateway_locks(
     *homes: str | Path,
     read_only_homes: Iterable[str | Path] = (),
+    canonical_only_homes: Iterable[str | Path] = (),
+    required_state_roots: Iterable[str | Path] = (),
     timeout: float = 0.0,
 ) -> Iterator[tuple[LegacyGatewayLock, ...]]:
     """Acquire all source/target legacy leases in globally sorted root order."""
 
     read_only_keys = {_normalized_path(home) for home in read_only_homes}
+    canonical_only_keys = {_normalized_path(home) for home in canonical_only_homes}
     roots: dict[str, tuple[Path, bool, bool]] = {}
     for home in homes:
-        home_is_read_only = _normalized_path(home) in read_only_keys
-        for root, explicit in _effective_state_root_specs(
-            home,
-            include_process_environment=not home_is_read_only,
-        ):
+        home_key = _normalized_path(home)
+        home_is_read_only = home_key in read_only_keys
+        root_specs = (
+            ((Path(home).expanduser().absolute() / "state", False),)
+            if home_key in canonical_only_keys
+            else _effective_state_root_specs(
+                home,
+                include_process_environment=not home_is_read_only,
+            )
+        )
+        for root, explicit in root_specs:
             key = _normalized_path(root)
             create = not home_is_read_only
             previous = roots.get(key)
@@ -1790,12 +1803,21 @@ def acquire_legacy_gateway_locks(
                 create if previous is None else previous[1] and create,
                 explicit if previous is None else previous[2] or explicit,
             )
-    if not homes:
+    for required_root in required_state_roots:
+        root = Path(required_root).expanduser().absolute()
+        key = _normalized_path(root)
+        roots[key] = (
+            root,
+            True,
+            False,
+        )
+    if not homes and not roots:
         yield ()
         return
+    lock_home = homes[0] if homes else next(iter(roots.values()))[0]
     locks = tuple(
         LegacyGatewayLock(
-            homes[0],
+            lock_home,
             state_roots=(roots[key][0],),
             create_if_missing=roots[key][1],
             allow_state_symlinks=roots[key][2],

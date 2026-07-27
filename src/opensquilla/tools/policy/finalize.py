@@ -34,7 +34,7 @@ from opensquilla.router_control import router_control_payload_terminates_turn
 from opensquilla.safety.secret_redaction import redact_secret_value
 from opensquilla.tool_boundary import ToolCall, ToolResult
 from opensquilla.tools.envelope import build_tool_failure_envelope, is_denial_payload
-from opensquilla.tools.types import InteractionMode, ToolContext
+from opensquilla.tools.types import CallerKind, InteractionMode, ToolContext
 
 log = structlog.get_logger("opensquilla.tools.dispatch")
 
@@ -45,7 +45,7 @@ _PENDING_APPROVAL_STATUSES: frozenset[str] = frozenset(
 
 _DISPATCH_TRUNCATION_RETRIEVE_HINT = (
     "This tool result was truncated before entering model context. "
-    "Use retrieve_tool_result with tool_result_handle to inspect the original raw output."
+    "Use retrieve_tool_result with handle=<tool_result_handle> to inspect the original raw output."
 )
 
 
@@ -148,7 +148,14 @@ def _denial_reason(content: Any) -> str:
     return "denied"
 
 def _has_live_approval_surface(ctx: ToolContext | None) -> bool:
-    return ctx is None or ctx.interaction_mode is InteractionMode.INTERACTIVE
+    return (
+        ctx is None
+        or ctx.interaction_mode is InteractionMode.INTERACTIVE
+        # Channel turns are unattended from the process perspective, but the
+        # channel approval notifier delivers a card/text decision back to the
+        # originating sender. Treat that as an approval-capable surface.
+        or ctx.caller_kind is CallerKind.CHANNEL
+    )
 
 
 def _uses_automatic_review(payload: dict[str, Any]) -> bool:

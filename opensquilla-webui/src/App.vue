@@ -34,7 +34,7 @@
         data-testid="sidebar-toggle-expanded"
         @click="toggleDock('sidebar-button')"
       >
-        <Icon name="sidebar-toggle" :size="16" />
+        <Icon name="sidebar-visible" :size="18" />
         <span
           id="sidebar-toggle-tip-expanded"
           class="sidebar-toggle-tip sidebar-toggle-tip--sidebar"
@@ -178,7 +178,7 @@
           data-testid="sidebar-toggle-collapsed"
           @click="toggleDock('topbar-button')"
         >
-          <Icon name="sidebar-toggle" :size="16" />
+          <Icon name="sidebar-hidden" :size="18" />
           <span id="sidebar-toggle-tip-collapsed" class="sidebar-toggle-tip" role="tooltip">
             <span>{{ t('chrome.toggleSidebar') }}</span>
             <kbd v-if="sidebarToggleHint">{{ sidebarToggleHint }}</kbd>

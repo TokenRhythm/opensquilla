@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import csv
+import difflib
 import fnmatch
 import hashlib
 import json
@@ -1354,7 +1355,6 @@ async def read_source(path: str, start_line: int = 1, end_line: int | None = Non
         raise FileNotFoundError(f"File not found: {path}")
     if not p.is_file():
         raise IsADirectoryError(f"Path is a directory: {path}")
-
     loop = asyncio.get_event_loop()
     sample: bytes = await loop.run_in_executor(None, _read_binary_sample, p)
     if sample:
@@ -1778,6 +1778,25 @@ def _resolve_scratch_write_path(path: str) -> tuple[Path, str]:
         ) from exc
     if not relative_path or relative_path == ".":
         raise ToolError("write_scratch requires a file path inside the scratch directory.")
+    if ctx.workspace_dir:
+        workspace = Path(ctx.workspace_dir).expanduser().resolve(strict=False)
+        try:
+            resolved.relative_to(workspace)
+        except ValueError:
+            pass
+        else:
+            try:
+                scratch_relative = scratch.relative_to(workspace)
+            except ValueError as exc:
+                raise ToolError(
+                    "write_scratch refused a workspace target because scratch_dir "
+                    "contains the active workspace."
+                ) from exc
+            if not scratch_relative.parts:
+                raise ToolError(
+                    "write_scratch refused a workspace target because scratch_dir "
+                    "equals the active workspace."
+                )
     return resolved, relative_path
 
 
@@ -2339,6 +2358,8 @@ async def edit_source(
         raise FileNotFoundError(f"File not found: {path}")
     if not p.is_file():
         raise IsADirectoryError(f"Path is a directory: {path}")
+    if _is_under_configured_scratch_dir(p):
+        raise ToolError("edit_source refused a scratch path; use edit_file instead.")
 
     loop = asyncio.get_event_loop()
     try:
@@ -2500,6 +2521,11 @@ def _normalize_edit_replacements(
                 f"edit_file {replacement.label} must not be empty. "
                 "Retry with exact non-empty text from the file."
             )
+        if replacement.old_text == replacement.new_text:
+            raise RetryableToolInputError(
+                f"edit_file {replacement.label} is unchanged: old_text and new_text are "
+                "identical, so the edit would do nothing. Retry with the intended new_text."
+            )
     return replacements
 
 
@@ -2519,11 +2545,22 @@ def _apply_edit_replacements(
                 path=path,
             )
             if recovered is None:
+                hint = _edit_file_closest_lines_hint(replacement.old_text, original)
+                if hint:
+                    _record_edit_recovery_event(
+                        name="edit_file.no_match_hint",
+                        path=path,
+                        replacement=replacement,
+                        outcome="hint",
+                        reason="closest_lines",
+                        matches=hint.count("\n---\n") + 1,
+                    )
                 raise RetryableToolInputError(
                     f"edit_file could not find {replacement.label} in {path}. "
                     "Read the current file content, then retry with exact text from that file. "
                     "Do not include read_file line-number prefixes like '12\\t', "
                     f"{_edit_file_retry_guidance()}"
+                    f"{hint}"
                 )
             start, end, replacement_text = recovered
             spans.append((start, end, replacement_text, replacement))
@@ -2557,6 +2594,31 @@ def _apply_edit_replacements(
     return "".join(chunks)
 
 
+_READ_FILE_LINE_PREFIX_RE = re.compile(r"^\s*\d+\t")
+
+
+def _strip_read_file_line_prefixes(value: str) -> str:
+    """Strip ``{lineno}\\t`` prefixes left when read_file output is pasted as old_text.
+
+    read_file renders lines as ``{lineno}\\t{line}``; models frequently copy that
+    rendered block straight into edit_file.old_text, which then fails to match the
+    real source. Only strip when *every* non-empty line carries the prefix, so
+    ordinary source that merely starts a line with a number+tab is never mangled.
+    """
+    lines = value.split("\n")
+    non_empty = 0
+    prefixed = 0
+    for line in lines:
+        if line == "":
+            continue
+        non_empty += 1
+        if _READ_FILE_LINE_PREFIX_RE.match(line):
+            prefixed += 1
+    if non_empty == 0 or prefixed != non_empty:
+        return value
+    return "\n".join(_READ_FILE_LINE_PREFIX_RE.sub("", line) for line in lines)
+
+
 def _recover_edit_replacement(
     original: str,
     replacement: _EditReplacement,
@@ -2575,21 +2637,26 @@ def _recover_edit_replacement(
         )
         return None
 
-    candidates = [replacement.old_text]
+    candidates: list[tuple[str, str]] = [("original", replacement.old_text)]
     unescaped = _unescape_edit_search_text(replacement.old_text)
     if unescaped != replacement.old_text:
-        candidates.append(unescaped)
+        candidates.append(("unescape", unescaped))
+    line_prefix_stripped = _strip_read_file_line_prefixes(replacement.old_text)
+    if line_prefix_stripped != replacement.old_text:
+        candidates.append(("line_prefix", line_prefix_stripped))
 
-    for index, candidate in enumerate(candidates):
-        if index > 0:
+    for kind, candidate in candidates:
+        transformed = kind != "original"
+        repair_event = f"edit_file.{kind}_repair_used"
+        if transformed:
             count = original.count(candidate)
             if count == 1:
                 _record_edit_recovery_event(
-                    name="edit_file.unescape_repair_used",
+                    name=repair_event,
                     path=path,
                     replacement=replacement,
                     outcome="used",
-                    reason="exact_match_after_unescape",
+                    reason=f"exact_match_after_{kind}",
                     matches=count,
                 )
                 start = original.index(candidate)
@@ -2600,7 +2667,7 @@ def _recover_edit_replacement(
                     path=path,
                     replacement=replacement,
                     outcome="rejected",
-                    reason="multiple_matches_after_unescape",
+                    reason=f"multiple_matches_after_{kind}",
                     matches=count,
                 )
                 return None
@@ -2623,13 +2690,13 @@ def _recover_edit_replacement(
             )
             return None
         _tag, start, end, replacement_text = flexible
-        if index > 0:
+        if transformed:
             _record_edit_recovery_event(
-                name="edit_file.unescape_repair_used",
+                name=repair_event,
                 path=path,
                 replacement=replacement,
                 outcome="used",
-                reason="flexible_match_after_unescape",
+                reason=f"flexible_match_after_{kind}",
                 matches=1,
             )
         _record_edit_recovery_event(
@@ -2669,7 +2736,7 @@ def _find_unique_flexible_edit_match(
     if not any(stripped_search):
         return None
 
-    source_lines = original.replace("\r\n", "\n").splitlines(keepends=True)
+    source_lines = original.splitlines(keepends=True)
     if len(search_lines) > len(source_lines):
         return None
 
@@ -2758,6 +2825,85 @@ def _unescape_edit_search_text(value: str) -> str:
         output.append(replacement)
         index += 2
     return "".join(output)
+
+
+_EDIT_HINT_MAX_CHARS = 1200
+_EDIT_HINT_MAX_LINE_CHARS = 200
+
+
+def _edit_file_closest_lines_hint(
+    old_text: str,
+    original: str,
+    *,
+    context_lines: int = 2,
+    max_results: int = 3,
+) -> str:
+    """Build a "did you mean" hint for an edit_file exact-match failure.
+
+    Scores every non-blank source line against the first non-blank line of
+    ``old_text`` (difflib similarity) and returns up to ``max_results`` numbered,
+    context-padded snippets of the closest regions, or "" when nothing is close
+    enough. Only meant for the count==0 no-match path; the returned string is
+    already formatted for appending to the retry error (leading blank line and
+    header included). Output length is bounded so it never floods the turn.
+    """
+    if not old_text or not original:
+        return ""
+    old_lines = old_text.splitlines()
+    content_lines = original.splitlines()
+    if not old_lines or not content_lines:
+        return ""
+
+    anchor = ""
+    for line in old_lines:
+        if line.strip():
+            anchor = line.strip()
+            break
+    if not anchor:
+        return ""
+
+    matcher = difflib.SequenceMatcher(autojunk=False)
+    matcher.set_seq2(anchor)
+    scored: list[tuple[float, int]] = []
+    for i, line in enumerate(content_lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        matcher.set_seq1(stripped)
+        if matcher.real_quick_ratio() <= 0.3 or matcher.quick_ratio() <= 0.3:
+            continue
+        ratio = matcher.ratio()
+        if ratio > 0.3:
+            scored.append((ratio, i))
+    if not scored:
+        return ""
+    scored.sort(key=lambda item: (-item[0], item[1]))
+
+    parts: list[str] = []
+    seen_ranges: set[tuple[int, int]] = set()
+    for _ratio, line_idx in scored:
+        if len(parts) >= max_results:
+            break
+        start = max(0, line_idx - context_lines)
+        end = min(len(content_lines), line_idx + len(old_lines) + context_lines)
+        key = (start, end)
+        if key in seen_ranges:
+            continue
+        seen_ranges.add(key)
+        snippet_lines = []
+        for j in range(start, end):
+            text = content_lines[j]
+            if len(text) > _EDIT_HINT_MAX_LINE_CHARS:
+                text = text[:_EDIT_HINT_MAX_LINE_CHARS] + "…"
+            snippet_lines.append(f"{j + 1:4d}| {text}")
+        parts.append("\n".join(snippet_lines))
+    if not parts:
+        return ""
+
+    body = "\n---\n".join(parts)
+    if len(body) > _EDIT_HINT_MAX_CHARS:
+        body = body[:_EDIT_HINT_MAX_CHARS] + "\n… (truncated)"
+    return "\n\nDid you mean one of these sections?\n" + body
 
 
 def _record_edit_recovery_event(

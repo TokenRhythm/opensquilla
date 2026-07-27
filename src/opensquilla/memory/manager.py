@@ -20,6 +20,7 @@ extra patches at this module's path.
 
 from __future__ import annotations
 
+import ntpath
 import os
 import re
 import shutil
@@ -38,6 +39,20 @@ if TYPE_CHECKING:
     from .turn_capture import TurnCaptureService
 
 log = structlog.get_logger(__name__)
+
+
+def _native_io_path(path: str | Path) -> Path:
+    """Return an internal OS spelling while public memory paths stay logical."""
+
+    candidate = Path(path).expanduser()
+    if os.name != "nt":
+        return candidate
+    value = ntpath.abspath(str(candidate))
+    if value.startswith("\\\\?\\"):
+        return Path(value)
+    if value.startswith("\\\\"):
+        return Path(f"\\\\?\\UNC\\{value[2:]}")
+    return Path(f"\\\\?\\{value}")
 
 
 @dataclass(frozen=True)
@@ -254,12 +269,8 @@ def effective_retrieval_metadata(
     vector_weight: float,
     text_weight: float,
 ) -> dict[str, str]:
-    configured_mode = _metadata_value(
-        _nested_value(memory_config, "retrieval_mode", "hybrid")
-    )
-    effective_provider = _metadata_value(
-        getattr(embedding_decision, "effective_provider", "none")
-    )
+    configured_mode = _metadata_value(_nested_value(memory_config, "retrieval_mode", "hybrid"))
+    effective_provider = _metadata_value(getattr(embedding_decision, "effective_provider", "none"))
     effective_mode = "fts_only" if effective_provider == "none" else configured_mode
     return {
         "configured_retrieval_mode": configured_mode,
@@ -487,11 +498,12 @@ async def build_memory_managers(
                 db_path = Path(os.environ["OPENSQUILLA_MEMORY_DB"])
             else:
                 db_path = resolve_agent_memory_db(agent_id, config.state_dir)
-            db_path.parent.mkdir(parents=True, exist_ok=True)
+            native_db_path = _native_io_path(db_path)
+            native_db_path.parent.mkdir(parents=True, exist_ok=True)
 
             # Build + initialize store
             in_flight_store = LongTermMemoryStore(
-                db_path=str(db_path),
+                db_path=str(native_db_path),
                 embedding_provider=embed_provider,
                 query_embedding_cache_mode=getattr(
                     getattr(cfg, "cost", None), "query_embedding_cache", "on"
@@ -508,20 +520,24 @@ async def build_memory_managers(
                 mem_dir = os.environ["OPENSQUILLA_MEMORY_DIR"]
                 agent_workspace = resolve_agent_data_dir(agent_id)
             else:
-                mem_dir = str(resolve_agent_memory_dir(agent_id))
-                agent_workspace = resolve_agent_data_dir(agent_id)
-            Path(mem_dir).mkdir(parents=True, exist_ok=True)
-            agent_workspace.mkdir(parents=True, exist_ok=True)
+                mem_dir = str(resolve_agent_memory_dir(agent_id, config.state_dir))
+                agent_workspace = resolve_agent_data_dir(agent_id, config.state_dir)
+            logical_memory_dir = Path(mem_dir)
+            native_memory_dir = _native_io_path(logical_memory_dir)
+            native_agent_workspace = _native_io_path(agent_workspace)
+            native_turns_dir = _native_io_path(db_path.parent / "turns")
+            native_memory_dir.mkdir(parents=True, exist_ok=True)
+            native_agent_workspace.mkdir(parents=True, exist_ok=True)
 
             # One-shot migration: legacy raw-dump fallback files used to be
             # written under canonical ``memory/`` and got picked up by the
             # sync scanner, polluting retrieval. Move them into the
             # ``.raw_fallbacks/`` sidecar BEFORE sync_manager starts so the
             # next scan drops their indexed rows naturally.
-            _migrate_legacy_raw_fallbacks(mem_dir)
+            _migrate_legacy_raw_fallbacks(native_memory_dir)
             migrated_turn_archives = _migrate_legacy_turn_archives(
-                mem_dir,
-                db_path.parent / "turns",
+                native_memory_dir,
+                native_turns_dir,
             )
             for rel_path in migrated_turn_archives:
                 try:
@@ -539,31 +555,24 @@ async def build_memory_managers(
                     store=in_flight_store,
                     agent_id=agent_id,
                 )
-                if session_storage is not None
-                and getattr(cfg, "session_source_enabled", False)
+                if session_storage is not None and getattr(cfg, "session_source_enabled", False)
                 else None
             )
 
             # Build + start sync_manager
             in_flight_sync = MemorySyncManager(
                 store=in_flight_store,
-                workspace_dir=agent_workspace,
-                memory_dir=mem_dir,
+                workspace_dir=native_agent_workspace,
+                memory_dir=native_memory_dir,
                 interval_minutes=getattr(cfg, "sync_interval_minutes", 0.0),
                 ttl_days=int(getattr(cfg, "entry_ttl_days", 0) or 0),
-                ttl_sweep_interval_minutes=getattr(
-                    cfg, "ttl_sweep_interval_minutes", 0.0
-                ),
+                ttl_sweep_interval_minutes=getattr(cfg, "ttl_sweep_interval_minutes", 0.0),
                 session_indexer=session_indexer,
             )
             await in_flight_sync.start()
 
-            effective_vector_weight = (
-                0.0 if _force_fts_only else getattr(cfg, "vector_weight", 0.7)
-            )
-            effective_text_weight = (
-                1.0 if _force_fts_only else getattr(cfg, "text_weight", 0.3)
-            )
+            effective_vector_weight = 0.0 if _force_fts_only else getattr(cfg, "vector_weight", 0.7)
+            effective_text_weight = 1.0 if _force_fts_only else getattr(cfg, "text_weight", 0.3)
             retrieval_metadata = effective_retrieval_metadata(
                 cfg,
                 embedding_decision,
@@ -583,8 +592,8 @@ async def build_memory_managers(
             )
 
             turn_capture = TurnCaptureService(
-                workspace_dir=agent_workspace,
-                turns_dir=db_path.parent / "turns",
+                workspace_dir=native_agent_workspace,
+                turns_dir=native_turns_dir,
                 memory_config=config.memory,
             )
 
@@ -597,7 +606,7 @@ async def build_memory_managers(
                 turn_capture=turn_capture,
                 memory_config=cfg,
                 workspace_dir=agent_workspace,
-                memory_dir=Path(mem_dir),
+                memory_dir=logical_memory_dir,
                 embedding_decision=embedding_decision,
                 vector_weight=effective_vector_weight,
                 text_weight=effective_text_weight,

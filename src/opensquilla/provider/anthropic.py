@@ -12,6 +12,7 @@ import structlog
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.execution_status import derive_is_error
 
+from .candidate_artifact import CandidateArtifactBuilder, CandidateArtifactLimitError
 from .error_redaction import redact_upstream_error_code, redact_upstream_error_text
 from .failures import retry_after_from_headers
 from .model_catalog import shared_catalog
@@ -450,7 +451,14 @@ class AnthropicProvider:
             },
         )
 
-        # Tool calls keyed by Anthropic's global content-block index.
+        # Tool calls keyed by Anthropic's global content-block index. Proposer
+        # calls are retained as inert evidence instead of entering the
+        # executable ToolUse lifecycle.
+        candidate_artifact = (
+            CandidateArtifactBuilder()
+            if cfg.candidate_output_mode == "inert_artifact"
+            else None
+        )
         tools_acc = ToolStreamAccumulator()
         text_parts: list[str] = []
         trace_tool_calls: list[dict[str, Any]] = []
@@ -489,6 +497,10 @@ class AnthropicProvider:
         message_terminal_seen = False
         deferred_tool_ends: list[tuple[ToolUseEndEvent, str]] = []
         invalid_tool_call_ids: set[str] = set()
+        candidate_open_blocks: set[Any] = set()
+        candidate_closed_blocks: set[Any] = set()
+        candidate_argument_content_blocks: set[Any] = set()
+        candidate_lifecycle_invalid = False
         # Content-block indices opened with a non-client-tool type (text,
         # thinking, server-side tool blocks). Their input_json_delta frames
         # are tolerated diagnostics, never client tool calls; only deltas for
@@ -629,6 +641,17 @@ class AnthropicProvider:
                             index = event.get("index", -1)
                             block = event.get("content_block", {})
                             btype = block.get("type")
+                            if candidate_artifact is not None:
+                                if (
+                                    index in candidate_open_blocks
+                                    or index in candidate_closed_blocks
+                                ):
+                                    candidate_lifecycle_invalid = True
+                                    continue
+                                # Track every native content block so an
+                                # unmatched/duplicate stop cannot be laundered
+                                # into a successful candidate terminal.
+                                candidate_open_blocks.add(index)
                             if btype != "tool_use":
                                 non_tool_block_indices.add(index)
                             else:
@@ -639,6 +662,20 @@ class AnthropicProvider:
                                 tool_name = (
                                     raw_tool_name if isinstance(raw_tool_name, str) else ""
                                 )
+                                if candidate_artifact is not None:
+                                    candidate_artifact.start(
+                                        index,
+                                        name_text=raw_tool_name,
+                                    )
+                                    if "input" in block:
+                                        initial_input = block.get("input")
+                                        if initial_input not in (None, {}, ""):
+                                            candidate_artifact.append_arguments(
+                                                index,
+                                                initial_input,
+                                            )
+                                            candidate_argument_content_blocks.add(index)
+                                    continue
                                 try:
                                     tool_events = tools_acc.start(
                                         index,
@@ -676,6 +713,17 @@ class AnthropicProvider:
                                     )
                                     continue
                                 fragment = delta.get("partial_json", "")
+                                if candidate_artifact is not None:
+                                    if (
+                                        index not in candidate_open_blocks
+                                        or index in candidate_closed_blocks
+                                    ):
+                                        candidate_lifecycle_invalid = True
+                                        continue
+                                    if fragment not in (None, ""):
+                                        candidate_argument_content_blocks.add(index)
+                                    candidate_artifact.append_arguments(index, fragment)
+                                    continue
                                 try:
                                     tool_events = tools_acc.append(index, fragment)
                                 except ToolStreamProtocolError as exc:
@@ -703,6 +751,20 @@ class AnthropicProvider:
 
                         elif etype == "content_block_stop":
                             index = event.get("index", -1)
+                            if candidate_artifact is not None:
+                                if (
+                                    index not in candidate_open_blocks
+                                    or index in candidate_closed_blocks
+                                ):
+                                    candidate_lifecycle_invalid = True
+                                    continue
+                                candidate_open_blocks.discard(index)
+                                candidate_closed_blocks.add(index)
+                                if index not in non_tool_block_indices:
+                                    if index not in candidate_argument_content_blocks:
+                                        candidate_artifact.append_arguments(index, "{}")
+                                    candidate_artifact.finish(index)
+                                continue
                             pending_call = next(
                                 (
                                     (tool_use_id, tool_name, text)
@@ -840,7 +902,13 @@ class AnthropicProvider:
                         return
 
                     pending_tool_calls = tools_acc.pending_raw_arguments()
-                    if pending_tool_calls or invalid_tool_call_ids:
+                    if (
+                        candidate_artifact is not None
+                        and (candidate_open_blocks or candidate_lifecycle_invalid)
+                    ) or (
+                        candidate_artifact is None
+                        and (pending_tool_calls or invalid_tool_call_ids)
+                    ):
                         message = "Anthropic response ended with an incomplete tool call"
                         trace.record_error(code="incomplete_tool_call", message=message)
                         yield ErrorEvent(message=message, code="incomplete_tool_call")
@@ -852,6 +920,21 @@ class AnthropicProvider:
                     for tool_event, raw in deferred_tool_ends:
                         _trace_tool_call(tool_event, raw)
                         yield tool_event
+                    if candidate_artifact is not None and candidate_artifact.has_calls:
+                        artifact_text = candidate_artifact.render_text()
+                        if artifact_text:
+                            text_parts.append(artifact_text)
+                            yield TextDeltaEvent(text=artifact_text)
+                        log.info(
+                            "provider.candidate_artifact",
+                            provider=self.provider_name,
+                            model=self._model,
+                            call_count=candidate_artifact.call_count,
+                            event_count=candidate_artifact.event_count,
+                            char_count=candidate_artifact.char_count,
+                            issue_codes=list(candidate_artifact.issue_codes),
+                            truncated=False,
+                        )
                     reasoning_content = reasoning.finalize()
                     trace.record_response(
                         usage={
@@ -880,6 +963,28 @@ class AnthropicProvider:
                         provider=self.provider_id,
                     )
 
+        except CandidateArtifactLimitError as exc:
+            message = "Anthropic candidate artifact exceeded safety limits"
+            trace.record_error(
+                code="candidate_artifact_limit_exceeded",
+                message=message,
+                metadata={
+                    "operation": exc.operation,
+                    "reason": exc.reason,
+                    "limit": exc.limit,
+                    "observed": exc.observed,
+                },
+            )
+            log.warning(
+                "provider.candidate_artifact_limit",
+                provider=self.provider_name,
+                model=self._model,
+                operation=exc.operation,
+                reason=exc.reason,
+                limit=exc.limit,
+                observed=exc.observed,
+            )
+            yield ErrorEvent(message=message, code="candidate_artifact_limit_exceeded")
         except httpx.TimeoutException as exc:
             message = redact_upstream_error_text(
                 f"Request timed out: {str(exc) or repr(exc)}",

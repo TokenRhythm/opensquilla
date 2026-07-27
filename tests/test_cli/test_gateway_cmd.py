@@ -329,6 +329,9 @@ def test_desktop_lifecycle_rejects_config_outside_profile_before_write(
     assert result.ok is False
     assert result.code == "DESKTOP_PROFILE_RECOVERY_REQUIRED"
     assert result.details["stableCode"] == "desktop_config_outside_profile"
+    assert result.details["allowedActions"] == ["retry-primary"]
+    assert "launch-recovery-profile" not in result.details["allowedActions"]
+    assert "primary profile" in result.message
     assert _profile_tree_snapshot(home) == before
     assert not user_state.exists()
 

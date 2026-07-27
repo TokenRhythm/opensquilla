@@ -15,9 +15,12 @@ from opensquilla.provider.types import (
     DoneEvent,
     ErrorEvent,
     Message,
+    TextDeltaEvent,
     ToolDefinition,
     ToolInputSchema,
+    ToolUseDeltaEvent,
     ToolUseEndEvent,
+    ToolUseStartEvent,
 )
 
 _TOOL = ToolDefinition(
@@ -55,14 +58,19 @@ def _patch_body(monkeypatch: pytest.MonkeyPatch, body: bytes) -> None:
     monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", patched_async_client)
 
 
-def _collect(provider: OpenAIProvider) -> list[Any]:
+def _collect(
+    provider: OpenAIProvider,
+    *,
+    config: ChatConfig | None = None,
+    tools: list[ToolDefinition] | None = None,
+) -> list[Any]:
     async def run() -> list[Any]:
         return [
             event
             async for event in provider.chat(
                 [Message(role="user", content="hi")],
-                tools=[_TOOL],
-                config=ChatConfig(),
+                tools=[_TOOL] if tools is None else tools,
+                config=config or ChatConfig(),
             )
         ]
 
@@ -76,6 +84,607 @@ def _assert_not_committed(events: list[Any], code: str | None = None) -> None:
     assert errors
     if code is not None:
         assert errors[-1].code == code
+
+
+def _tokenrhythm_long_tool_name_sse(
+    long_name: str,
+    *,
+    tool_call_id: str = "private-upstream-id",
+) -> bytes:
+    return _sse(
+        {
+            "id": "synthetic-tokenrhythm-response",
+            "model": "glm-5.2",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": tool_call_id,
+                                "function": {
+                                    "name": long_name,
+                                    "arguments": '{"city":"Shanghai"}',
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            "id": "synthetic-tokenrhythm-response",
+            "model": "glm-5.2",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 11},
+        },
+    )
+
+
+def test_tokenrhythm_inert_candidate_demotes_overlong_native_tool_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    long_name = "candidate answer misplaced in function.name: " + ("x" * 17_000)
+    long_tool_call_id = "private-upstream-id-" + ("i" * 300_000)
+    monkeypatch.setattr(
+        "opensquilla.provider.openai._candidate_wire_digest",
+        lambda _value: pytest.fail("a valid stream index must take priority over wire IDs"),
+    )
+    _patch_body(
+        monkeypatch,
+        _tokenrhythm_long_tool_name_sse(
+            long_name,
+            tool_call_id=long_tool_call_id,
+        ),
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        model="glm-5.2",
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+    )
+
+    events = _collect(
+        provider,
+        config=ChatConfig(candidate_output_mode="inert_artifact"),
+        tools=[],
+    )
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert not any(
+        isinstance(event, (ToolUseStartEvent, ToolUseDeltaEvent, ToolUseEndEvent))
+        for event in events
+    )
+    text_events = [event for event in events if isinstance(event, TextDeltaEvent)]
+    assert len(text_events) == 1
+    artifact = json.loads(text_events[0].text)
+    assert artifact["kind"] == "inert_proposer_tool_output"
+    assert artifact["executable"] is False
+    assert artifact["actions"] == [
+        {
+            "arguments_text": '{"city":"Shanghai"}',
+            "issues": ["name_over_execution_limit"],
+            "name_text": long_name,
+        }
+    ]
+    assert long_tool_call_id not in text_events[0].text
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert (done.input_tokens, done.output_tokens) == (7, 11)
+    assert events[-2:] == [text_events[0], done]
+
+
+def test_tokenrhythm_normal_mode_keeps_overlong_tool_name_safety_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_body(
+        monkeypatch,
+        _tokenrhythm_long_tool_name_sse("x" * 17_000),
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        model="glm-5.2",
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+    )
+
+    events = _collect(provider, tools=[])
+
+    _assert_not_committed(events, "provider_protocol_error")
+
+
+def test_openai_inert_candidate_reuses_single_call_for_identityless_continuations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_body(
+        monkeypatch,
+        _sse(
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "id": "private-call-id",
+                                    "function": {
+                                        "name": "draft_action",
+                                        "arguments": '{"city":',
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {"function": {"arguments": '"Shanghai"'}}
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{"function": {"arguments": "}"}}]
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "tool_calls",
+                    }
+                ]
+            },
+        ),
+    )
+    provider = OpenAIProvider(api_key="test", model="compat-model")
+
+    events = _collect(
+        provider,
+        config=ChatConfig(candidate_output_mode="inert_artifact"),
+        tools=[],
+    )
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    artifact_text = next(
+        event.text for event in events if isinstance(event, TextDeltaEvent)
+    )
+    assert json.loads(artifact_text)["actions"] == [
+        {
+            "arguments_text": '{"city":"Shanghai"}',
+            "issues": [],
+            "name_text": "draft_action",
+        }
+    ]
+    assert "private-call-id" not in artifact_text
+    assert isinstance(events[-1], DoneEvent)
+
+
+def test_openai_inert_candidate_does_not_publish_without_terminal_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_body(
+        monkeypatch,
+        _sse(
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "function": {
+                                        "name": "draft_action",
+                                        "arguments": '{"partial":true}',
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            done=False,
+        ),
+    )
+    provider = OpenAIProvider(api_key="test", model="glm-5.2")
+
+    events = _collect(
+        provider,
+        config=ChatConfig(candidate_output_mode="inert_artifact"),
+        tools=[],
+    )
+
+    assert not any(isinstance(event, TextDeltaEvent) for event in events)
+    assert not any(
+        isinstance(event, (ToolUseStartEvent, ToolUseDeltaEvent, ToolUseEndEvent))
+        for event in events
+    )
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    assert any(
+        isinstance(event, ErrorEvent) and event.code == "incomplete_stream"
+        for event in events
+    )
+
+
+def test_openai_inert_candidate_strips_ids_from_malformed_tool_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_body(
+        monkeypatch,
+        _sse(
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": {
+                                "id": "private-id",
+                                "call_id": "private-call-id",
+                                "payload": {
+                                    "tool_use_id": "private-tool-use-id",
+                                    "value": "keep",
+                                },
+                            }
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        ),
+    )
+    provider = OpenAIProvider(api_key="test", model="glm-5.2")
+
+    events = _collect(
+        provider,
+        config=ChatConfig(candidate_output_mode="inert_artifact"),
+        tools=[],
+    )
+
+    artifact_event = next(event for event in events if isinstance(event, TextDeltaEvent))
+    assert "private-id" not in artifact_event.text
+    assert "private-call-id" not in artifact_event.text
+    assert "private-tool-use-id" not in artifact_event.text
+    action = json.loads(artifact_event.text)["actions"][0]
+    assert json.loads(action["arguments_text"]) == {"payload": {"value": "keep"}}
+    assert isinstance(events[-1], DoneEvent)
+
+
+def test_openai_inert_candidate_keeps_textual_tool_syntax_literal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    textual_call = (
+        '<tool_call>{"name":"lookup","arguments":{"q":"Shanghai"}}</tool_call>'
+    )
+    _patch_body(
+        monkeypatch,
+        _sse(
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": textual_call},
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        ),
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        model="qwen3.6-flash",
+        provider_kind="dashscope",
+    )
+
+    events = _collect(
+        provider,
+        config=ChatConfig(candidate_output_mode="inert_artifact"),
+        tools=[_TOOL],
+    )
+
+    assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
+        textual_call
+    ]
+    assert not any(
+        isinstance(event, (ToolUseStartEvent, ToolUseDeltaEvent, ToolUseEndEvent))
+        for event in events
+    )
+    assert isinstance(events[-1], DoneEvent)
+
+
+def test_openai_stream_inert_candidate_preserves_malformed_mapping_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_body(
+        monkeypatch,
+        _sse(
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "private-wrapper-id",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "",
+                                        "arguments": {},
+                                    },
+                                    "name": "draft_action",
+                                    "arguments": {"city": "Shanghai"},
+                                    "payload": {
+                                        "tool_use_id": "private-nested-id",
+                                        "keep": "advisory",
+                                    },
+                                },
+                                {
+                                    "index": 1,
+                                    "id": "private-no-arg-id",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_status",
+                                        "arguments": {},
+                                    },
+                                },
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "tool_calls",
+                    }
+                ]
+            },
+        ),
+    )
+    provider = OpenAIProvider(api_key="test", model="compat-model")
+
+    events = _collect(
+        provider,
+        config=ChatConfig(candidate_output_mode="inert_artifact"),
+        tools=[],
+    )
+
+    artifact_text = next(
+        event.text for event in events if isinstance(event, TextDeltaEvent)
+    )
+    assert "private-wrapper-id" not in artifact_text
+    assert "private-nested-id" not in artifact_text
+    assert "private-no-arg-id" not in artifact_text
+    actions = json.loads(artifact_text)["actions"]
+    action = actions[0]
+    assert action["name_text"] == ""
+    assert action["issues"] == ["missing_name"]
+    assert json.loads(action["arguments_text"]) == {
+        "malformed_tool_call": {
+            "arguments": {"city": "Shanghai"},
+            "function": {"arguments": {}, "name": ""},
+            "index": 0,
+            "name": "draft_action",
+            "payload": {"keep": "advisory"},
+            "type": "function",
+        }
+    }
+    assert actions[1] == {
+        "arguments_text": "{}",
+        "issues": [],
+        "name_text": "get_status",
+    }
+    assert isinstance(events[-1], DoneEvent)
+
+
+def test_openai_nonstream_inert_candidate_preserves_invalid_action_as_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response_payload = {
+        "id": "synthetic-nonstream-response",
+        "model": "glm-5.2",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "private-nonstream-id",
+                            "function": {
+                                "name": "draft_action",
+                                "arguments": "{not-json",
+                            },
+                        }
+                    ],
+                },
+            }
+        ],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 5},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_payload = json.loads(request.content)
+        if request_payload.get("stream"):
+            raise httpx.ReadTimeout("force fallback", request=request)
+        return httpx.Response(200, json=response_payload)
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", patched_async_client)
+    compat = replace(
+        compat_policy_for_kind("tokenrhythm"),
+        stream_timeout_fallback=True,
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        model="glm-5.2",
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+        compat=compat,
+    )
+
+    events = _collect(
+        provider,
+        config=ChatConfig(candidate_output_mode="inert_artifact"),
+        tools=[],
+    )
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert not any(
+        isinstance(event, (ToolUseStartEvent, ToolUseDeltaEvent, ToolUseEndEvent))
+        for event in events
+    )
+    artifact_event = next(event for event in events if isinstance(event, TextDeltaEvent))
+    artifact = json.loads(artifact_event.text)
+    assert artifact["actions"][0] == {
+        "arguments_text": "{not-json",
+        "issues": ["invalid_arguments_json"],
+        "name_text": "draft_action",
+    }
+    assert "private-nonstream-id" not in artifact_event.text
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert (done.input_tokens, done.output_tokens) == (3, 5)
+    assert events[-2:] == [artifact_event, done]
+
+
+def test_openai_nonstream_inert_candidate_preserves_malformed_mapping_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response_payload = {
+        "id": "synthetic-nonstream-wrapper",
+        "model": "glm-5.2",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "private-nonstream-wrapper-id",
+                            "type": "function",
+                            "function": {
+                                "name": "",
+                                "arguments": {},
+                            },
+                            "name": "draft_action",
+                            "arguments": {"city": "Shanghai"},
+                            "payload": {
+                                "tool_use_id": "private-nested-id",
+                                "keep": "advisory",
+                            },
+                        }
+                    ],
+                },
+            }
+        ],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 5},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_payload = json.loads(request.content)
+        if request_payload.get("stream"):
+            raise httpx.ReadTimeout("force fallback", request=request)
+        return httpx.Response(200, json=response_payload)
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", patched_async_client)
+    compat = replace(
+        compat_policy_for_kind("tokenrhythm"),
+        stream_timeout_fallback=True,
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        model="glm-5.2",
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+        compat=compat,
+    )
+
+    events = _collect(
+        provider,
+        config=ChatConfig(candidate_output_mode="inert_artifact"),
+        tools=[],
+    )
+
+    artifact_text = next(
+        event.text for event in events if isinstance(event, TextDeltaEvent)
+    )
+    assert "private-nonstream-wrapper-id" not in artifact_text
+    assert "private-nested-id" not in artifact_text
+    action = json.loads(artifact_text)["actions"][0]
+    assert action["issues"] == ["missing_name"]
+    assert json.loads(action["arguments_text"]) == {
+        "malformed_tool_call": {
+            "arguments": {"city": "Shanghai"},
+            "function": {"arguments": {}, "name": ""},
+            "name": "draft_action",
+            "payload": {"keep": "advisory"},
+            "type": "function",
+        }
+    }
+    assert isinstance(events[-1], DoneEvent)
 
 
 def test_tokenrhythm_nonstream_fallback_preserves_confirmed_receipt(

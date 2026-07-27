@@ -8,6 +8,7 @@ the first-message trigger gate.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 from types import SimpleNamespace
@@ -18,6 +19,7 @@ import pytest_asyncio
 from opensquilla.compat import aiosqlite
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.provider.protocol import ProviderConnectionConfig
+from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import SessionNode
 from opensquilla.session.naming import (
@@ -379,11 +381,22 @@ async def test_call_naming_llm_adds_tokenrhythm_app_attribution(monkeypatch):
         model="deepseek-v4-flash",
         api_key="test-key",
         base_url="https://tokenrhythm.studio/v1",
+        provider="tokenrhythm",
+        provider_request_correlation=ProviderRequestCorrelation(
+            session_id="session-1",
+            turn_id="turn-1",
+            execution_id="naming-1",
+            call_kind="auxiliary.naming",
+        ),
     )
 
     assert captured["url"] == "https://tokenrhythm.studio/v1/chat/completions"
     assert captured["headers"]["HTTP-Referer"] == "https://opensquilla.ai"
     assert captured["headers"]["X-Title"] == "OpenSquilla"
+    assert captured["headers"]["X-OpenSquilla-Session-Id"] == "session-1"
+    assert captured["headers"]["X-OpenSquilla-Turn-Id"] == "turn-1"
+    assert captured["headers"]["X-OpenSquilla-Execution-Id"] == "naming-1"
+    assert captured["headers"]["X-OpenSquilla-Call-Kind"] == "auxiliary.naming"
 
 
 @pytest.mark.asyncio
@@ -540,6 +553,7 @@ def _patch_provider_and_emit(monkeypatch, *, title: str | None):
     async def fake_llm(first_message, **kwargs):
         calls["llm"] += 1
         calls["first_message"] = first_message
+        calls["kwargs"] = kwargs
         return title
 
     monkeypatch.setattr(naming_mod, "call_naming_llm", fake_llm)
@@ -562,15 +576,78 @@ async def test_generate_session_title_writes_and_broadcasts(storage, mgr, monkey
     )
     ctx = SimpleNamespace(config=GatewayConfig(), session_manager=mgr, provider_selector=None)
 
-    await generate_session_title(ctx, key, "Please help me reset my password")
+    correlation = ProviderRequestCorrelation(
+        session_id="sid-s1",
+        turn_id="turn-1",
+        execution_id="naming-1",
+        call_kind="auxiliary.naming",
+    )
+    await generate_session_title(
+        ctx,
+        key,
+        "Please help me reset my password",
+        provider_request_correlation=correlation,
+    )
 
     assert calls["llm"] == 1
+    assert calls["kwargs"]["provider_request_correlation"] is correlation
     assert (await storage.get_session(key)).derived_title == "Reset Password"
     assert len(emits) == 1
     emit_key, event_name, payload = emits[0]
     assert emit_key == key
     assert event_name == "sessions.changed"
     assert payload["reason"] == "auto_titled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disabled", [False, True])
+async def test_auto_title_schedule_explicitly_captures_turn_correlation(
+    disabled: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.gateway.rpc_sessions as rpc_sessions_mod
+
+    observed: list[ProviderRequestCorrelation | None] = []
+    done = asyncio.Event()
+
+    async def _generate(
+        _ctx,
+        _key,
+        _message,
+        *,
+        provider_request_correlation=None,
+    ) -> None:
+        observed.append(provider_request_correlation)
+        done.set()
+
+    monkeypatch.setattr(rpc_sessions_mod, "generate_session_title", _generate)
+    monkeypatch.delenv(
+        "OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY",
+        raising=False,
+    )
+    config = GatewayConfig()
+    config.privacy.disable_network_observability = disabled
+    ctx = SimpleNamespace(config=config)
+
+    rpc_sessions_mod._schedule_auto_title(
+        ctx,
+        "agent:main:webchat:s1",
+        "hello",
+        enabled=True,
+        session_id="session-1",
+        root_turn_id="turn-1",
+    )
+    await done.wait()
+
+    if disabled:
+        assert observed == [None]
+    else:
+        correlation = observed[0]
+        assert correlation is not None
+        assert correlation.session_id == "session-1"
+        assert correlation.turn_id == "turn-1"
+        assert correlation.execution_id not in {"", "turn-1"}
+        assert correlation.call_kind == "auxiliary.naming"
 
 
 @pytest.mark.asyncio

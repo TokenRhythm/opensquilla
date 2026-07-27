@@ -60,7 +60,13 @@ def test_shell_tools_preserve_legacy_approval_id_positions() -> None:
 def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
     field_names = [item.name for item in fields(ToolContext)]
 
-    assert field_names[-2:] == [
+    legacy_runtime_tail = [
         "sandbox_file_system_profile",
         "on_sandbox_auto_review",
+        "tool_description_overrides",
+        "tool_description_overrides_source",
+        "endgame_git_freeze_instrumentation_exempt",
+        "scratch_verify_mirror_active",
     ]
+    assert field_names[-7:-1] == legacy_runtime_tail
+    assert field_names[-1] == "channel_admin_verified"

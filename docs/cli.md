@@ -147,7 +147,7 @@ combined with `--repo`.
 install path. It requires Docker plus the `swebench` extra.
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended,swebench] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.0rc4/opensquilla-0.5.0rc4-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended,swebench] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.0/opensquilla-0.5.0-py3-none-any.whl"
 opensquilla swebench pull django__django-16429 --dataset verified
 opensquilla swebench solve django__django-16429 --dataset verified --json
 opensquilla swebench eval predictions.jsonl --dataset verified

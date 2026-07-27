@@ -6,9 +6,15 @@ from typing import Any
 
 from typer.testing import CliRunner
 
+from opensquilla.cli import doctor_cmd as _doctor_cmd
 from opensquilla.cli.main import app
 
 runner = CliRunner()
+
+# Captured at import time, before the autouse ``_no_local_tui_findings``
+# fixture in tests/test_cli/conftest.py stubs the module attribute per test;
+# the dedicated TUI-finding tests reinstate this real probe explicitly.
+_REAL_LOCAL_TUI_FINDINGS = _doctor_cmd._local_tui_findings
 
 
 def _config_arg(path: Any) -> str:
@@ -420,9 +426,12 @@ def test_doctor_table_shows_gateway_config_and_agent_context(tmp_path, monkeypat
     )
 
     assert result.exit_code == 0
-    assert "Gateway: ws://127.0.0.1:20003/ws" in result.stdout
-    assert f"Config: {target}" in result.stdout
-    assert "Agent: worker" in result.stdout
+    # The context line soft-wraps when the pytest tmp path is long, so compare
+    # against a wrap-insensitive projection of the output.
+    unwrapped = " ".join(result.stdout.split())
+    assert "Gateway: ws://127.0.0.1:20003/ws" in unwrapped
+    assert f"Config: {target}" in unwrapped
+    assert "Agent: worker" in unwrapped
 
 
 def test_doctor_config_reports_running_gateway_config_mismatch(
@@ -1004,11 +1013,10 @@ def test_doctor_gateway_unavailable_does_not_start_remote_gateway(monkeypatch) -
 
 
 def test_doctor_offline_prioritizes_local_config_before_gateway_restart(monkeypatch) -> None:
-    from opensquilla.cli import doctor_cmd
     from opensquilla.health.model import HealthFinding
 
     monkeypatch.setattr(
-        doctor_cmd,
+        _doctor_cmd,
         "_local_config_findings",
         lambda: [
             HealthFinding(
@@ -1022,7 +1030,7 @@ def test_doctor_offline_prioritizes_local_config_before_gateway_restart(monkeypa
         ],
     )
 
-    report = doctor_cmd._offline_report(
+    report = _doctor_cmd._offline_report(
         ConnectionError("connection refused"),
         gateway_url="ws://127.0.0.1:19999/ws",
     )
@@ -1037,11 +1045,10 @@ def test_doctor_offline_prioritizes_local_config_before_gateway_restart(monkeypa
 
 
 def test_doctor_offline_does_not_mix_local_config_into_remote_gateway(monkeypatch) -> None:
-    from opensquilla.cli import doctor_cmd
     from opensquilla.health.model import HealthFinding
 
     monkeypatch.setattr(
-        doctor_cmd,
+        _doctor_cmd,
         "_local_config_findings",
         lambda: [
             HealthFinding(
@@ -1054,7 +1061,7 @@ def test_doctor_offline_does_not_mix_local_config_into_remote_gateway(monkeypatc
         ],
     )
 
-    report = doctor_cmd._offline_report(
+    report = _doctor_cmd._offline_report(
         ConnectionError("connection refused"),
         gateway_url="wss://squilla.example.com/ws",
     )
@@ -1063,7 +1070,6 @@ def test_doctor_offline_does_not_mix_local_config_into_remote_gateway(monkeypatc
 
 
 def test_local_config_findings_explain_missing_llm_env(monkeypatch) -> None:
-    from opensquilla.cli import doctor_cmd
     from opensquilla.gateway.config import GatewayConfig
 
     monkeypatch.delenv("CUSTOM_LLM_KEY", raising=False)
@@ -1076,7 +1082,7 @@ def test_local_config_findings_explain_missing_llm_env(monkeypatch) -> None:
         }
     )
 
-    findings = doctor_cmd._local_onboarding_findings(cfg)
+    findings = _doctor_cmd._local_onboarding_findings(cfg)
 
     assert len(findings) == 1
     finding = findings[0]
@@ -1096,7 +1102,6 @@ def test_local_config_findings_explain_missing_llm_env(monkeypatch) -> None:
 
 
 def test_local_config_findings_explain_optional_env_references(monkeypatch) -> None:
-    from opensquilla.cli import doctor_cmd
     from opensquilla.gateway.config import GatewayConfig
 
     monkeypatch.delenv("CUSTOM_SEARCH_KEY", raising=False)
@@ -1123,7 +1128,7 @@ def test_local_config_findings_explain_optional_env_references(monkeypatch) -> N
         },
     )
 
-    findings = doctor_cmd._local_onboarding_findings(cfg)
+    findings = _doctor_cmd._local_onboarding_findings(cfg)
 
     assert len(findings) == 1
     finding = findings[0]
@@ -1170,3 +1175,207 @@ def test_refresh_report_readiness_labels_operator_action_items() -> None:
     assert report["ready"] is True
     assert report["status"] == "ready"
     assert report["summary"] == "Ready, 1 item awaiting operator action, 1 optional setup item"
+
+
+def test_doctor_appends_local_tui_finding_when_opentui_unavailable(monkeypatch) -> None:
+    from opensquilla.cli.tui.renderers.selection import (
+        ChatUiFallback,
+        ChatUiSelection,
+        RendererBackendUnavailableReason,
+    )
+
+    class _PlainBackend:
+        backend_id = "native"
+
+    monkeypatch.setattr(_doctor_cmd, "_local_tui_findings", _REAL_LOCAL_TUI_FINDINGS)
+    monkeypatch.setattr(
+        "opensquilla.cli.tui.renderers.selection.select_chat_ui_backend",
+        lambda mode=None: ChatUiSelection(
+            requested_mode="auto",
+            backend=_PlainBackend(),
+            fallback=ChatUiFallback(
+                code=RendererBackendUnavailableReason.MISSING,
+                detail="OpenTUI companion is not installed.",
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "opensquilla.cli.tui.source_checkout.resolve_tui_source_checkout_hint",
+        lambda: None,
+    )
+    _ReadyGatewayClient.calls = []
+    monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", _ReadyGatewayClient)
+
+    result = runner.invoke(app, ["doctor", "--json"])
+
+    assert result.exit_code == 0
+    report = json.loads(result.stdout)
+    tui = [f for f in report["findings"] if f["id"] == "tui.opentui_unavailable"]
+    assert len(tui) == 1
+    assert tui[0]["severity"] == "info"
+    assert tui[0]["readinessImpact"] == "optional"
+    assert tui[0]["evidence"]["reasonCode"] == "missing"
+    assert tui[0]["evidence"]["selectedBackend"] == "native"
+    # An optional UI note never affects readiness.
+    assert report["ready"] is True
+
+    # The human rendering surfaces the same finding.
+    rendered = runner.invoke(app, ["doctor"])
+    assert "Full-screen terminal UI not active" in rendered.stdout
+
+
+def test_doctor_reports_nothing_when_opentui_is_active(monkeypatch) -> None:
+    from opensquilla.cli.tui.renderers.selection import ChatUiSelection
+
+    class _OpenTuiBackend:
+        backend_id = "opentui"
+
+    monkeypatch.setattr(_doctor_cmd, "_local_tui_findings", _REAL_LOCAL_TUI_FINDINGS)
+    monkeypatch.setattr(
+        "opensquilla.cli.tui.renderers.selection.select_chat_ui_backend",
+        lambda mode=None: ChatUiSelection(
+            requested_mode="auto",
+            backend=_OpenTuiBackend(),
+            fallback=None,
+        ),
+    )
+    _ReadyGatewayClient.calls = []
+    monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", _ReadyGatewayClient)
+
+    result = runner.invoke(app, ["doctor"])
+
+    assert result.exit_code == 0
+    assert "No action needed" in result.stdout
+
+
+def test_local_tui_findings_reports_probe_crash_as_warn(monkeypatch) -> None:
+    def _boom(mode=None):
+        raise RuntimeError("selection exploded")
+
+    monkeypatch.setattr("opensquilla.cli.tui.renderers.selection.select_chat_ui_backend", _boom)
+
+    findings = _REAL_LOCAL_TUI_FINDINGS()
+
+    assert [f.id for f in findings] == ["tui.selection_failed"]
+    assert findings[0].severity == "warn"
+    assert findings[0].readiness_impact == "optional"
+    assert "selection exploded" in findings[0].detail
+
+
+def test_local_tui_findings_offers_source_checkout_fix_steps(monkeypatch) -> None:
+    from opensquilla.cli.tui.renderers.selection import (
+        ChatUiFallback,
+        ChatUiSelection,
+        RendererBackendUnavailableReason,
+    )
+    from opensquilla.cli.tui.source_checkout import TuiSourceCheckoutHint
+
+    class _PlainBackend:
+        backend_id = "native"
+
+    monkeypatch.setattr(
+        "opensquilla.cli.tui.renderers.selection.select_chat_ui_backend",
+        lambda mode=None: ChatUiSelection(
+            requested_mode="auto",
+            backend=_PlainBackend(),
+            fallback=ChatUiFallback(
+                code=RendererBackendUnavailableReason.MISSING,
+                detail="dependency @opentui/core is not installed\x1b[0m",
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "opensquilla.cli.tui.source_checkout.resolve_tui_source_checkout_hint",
+        lambda: TuiSourceCheckoutHint(
+            install_command="bun install --cwd /repo/package",
+            launch_command="OPENSQUILLA_TUI_DEV_SOURCE_HOST=1 opensquilla chat --ui tui",
+        ),
+    )
+
+    findings = _REAL_LOCAL_TUI_FINDINGS()
+
+    assert [f.id for f in findings] == ["tui.opentui_unavailable"]
+    commands = [step.command for step in findings[0].fix_steps]
+    assert commands == [
+        "bun install --cwd /repo/package",
+        "OPENSQUILLA_TUI_DEV_SOURCE_HOST=1 opensquilla chat --ui tui",
+    ]
+    # Host-derived detail is sanitized before it reaches a report.
+    assert "\x1b" not in findings[0].detail
+
+
+def test_doctor_merge_keeps_counts_and_summary_consistent(monkeypatch) -> None:
+    from opensquilla.cli.tui.renderers.selection import (
+        ChatUiFallback,
+        ChatUiSelection,
+        RendererBackendUnavailableReason,
+    )
+
+    class _PlainBackend:
+        backend_id = "native"
+
+    monkeypatch.setattr(_doctor_cmd, "_local_tui_findings", _REAL_LOCAL_TUI_FINDINGS)
+    monkeypatch.setattr(
+        "opensquilla.cli.tui.renderers.selection.select_chat_ui_backend",
+        lambda mode=None: ChatUiSelection(
+            requested_mode="auto",
+            backend=_PlainBackend(),
+            fallback=ChatUiFallback(
+                code=RendererBackendUnavailableReason.MISSING,
+                detail="OpenTUI companion is not installed.",
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "opensquilla.cli.tui.source_checkout.resolve_tui_source_checkout_hint",
+        lambda: None,
+    )
+    _ReadyGatewayClient.calls = []
+    monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", _ReadyGatewayClient)
+
+    result = runner.invoke(app, ["doctor", "--json"])
+
+    report = json.loads(result.stdout)
+    # Counts, impact counts, and the summary all reflect the merged findings.
+    assert report["counts"]["info"] == 1
+    assert report["impactCounts"]["optional"] == 1
+    assert report["summary"] == "Ready, 1 optional setup item"
+    assert report["ready"] is True
+    severities = [f["severity"] for f in report["findings"]]
+    assert severities.count("info") == 1
+
+
+def test_doctor_merge_preserves_offline_unavailable_sentinel(monkeypatch) -> None:
+    from opensquilla.cli.tui.renderers.selection import (
+        ChatUiFallback,
+        ChatUiSelection,
+        RendererBackendUnavailableReason,
+    )
+
+    class _PlainBackend:
+        backend_id = "native"
+
+    monkeypatch.setattr(_doctor_cmd, "_local_tui_findings", _REAL_LOCAL_TUI_FINDINGS)
+    monkeypatch.setattr(
+        "opensquilla.cli.tui.renderers.selection.select_chat_ui_backend",
+        lambda mode=None: ChatUiSelection(
+            requested_mode="auto",
+            backend=_PlainBackend(),
+            fallback=ChatUiFallback(
+                code=RendererBackendUnavailableReason.MISSING,
+                detail="OpenTUI companion is not installed.",
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "opensquilla.cli.tui.source_checkout.resolve_tui_source_checkout_hint",
+        lambda: None,
+    )
+    monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", _OfflineGatewayClient)
+
+    result = runner.invoke(app, ["doctor", "--json"])
+
+    report = json.loads(result.stdout)
+    assert report["status"] == "unavailable"
+    assert report["ready"] is False
+    assert any(f["id"] == "tui.opentui_unavailable" for f in report["findings"])

@@ -1033,8 +1033,11 @@ async def test_no_leak_under_load(monkeypatch: pytest.MonkeyPatch) -> None:
         h = await rt.enqueue(env, f"msg-{i}")
         handles.append(h)
 
-    # Wait for all to complete.
-    await asyncio.gather(*(rt.wait(h.task_id, timeout=30.0) for h in handles))
+    # Wait for all to complete under one shared deadline. Giving every waiter
+    # its own timer schedules 10 000 timeout callbacks and makes this leak
+    # check sensitive to event-loop scheduling on slower CI runners.
+    async with asyncio.timeout(60.0):
+        await asyncio.gather(*(rt.wait(h.task_id) for h in handles))
 
     # --- post-GC snapshot ---
     gc.collect()

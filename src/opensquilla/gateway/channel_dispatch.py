@@ -35,8 +35,11 @@ from opensquilla.channels._util import (
     truncate_to_limit,
 )
 from opensquilla.channels.admission import (
+    CHANNEL_ADMIN_VERIFIED_METADATA_KEY,
     ChannelAdmissionDecision,
     decide_channel_admission,
+    has_verified_channel_admin_stamp,
+    is_authenticated_channel_admin,
 )
 from opensquilla.channels.artifact_delivery import (
     artifact_delivery_key as _artifact_delivery_key,
@@ -63,6 +66,7 @@ from opensquilla.channels.contract import (
     classify_channel_send_error,
 )
 from opensquilla.channels.stream_policy import resolve_channel_stream_policy
+from opensquilla.channels.system_messages import render_channel_message
 from opensquilla.channels.types import IncomingMessage, OutgoingMessage
 from opensquilla.engine.start_turn import reserve_turn_via_runtime, start_turn_via_runtime
 from opensquilla.engine.types import (
@@ -522,7 +526,13 @@ async def run_channel_dispatch(
                 )
                 continue
         session_key = session_key_builder(msg)
-        admission = decide_channel_admission(channel, msg, session_key)
+        admission = decide_channel_admission(
+            channel,
+            msg,
+            session_key,
+            config=config,
+            channel_name=session_prefix,
+        )
         if not admission.admit:
             log.info(
                 "channel.admission_denied",
@@ -543,10 +553,13 @@ async def run_channel_dispatch(
                     session_prefix=session_prefix,
                 )
                 pairing_code = admission.pairing_id[:8]
+
                 notice = _route_envelope_reply_message(
-                    "Access approval is required. "
-                    f"Pairing request: {pairing_code}. "
-                    "Ask an OpenSquilla operator to approve it before sending another message.",
+                    render_channel_message(
+                        "pairing_required",
+                        config=config,
+                        pairing_code=pairing_code,
+                    ),
                     route_envelope,
                     metadata={"pairing_required": True, "pairing_code": pairing_code},
                 )
@@ -574,11 +587,13 @@ async def run_channel_dispatch(
             session_key=session_key,
             session_prefix=session_prefix,
         )
+        principal_is_owner = _stamp_channel_admin_principal(config, route_envelope, msg)
         approval_reply = await _maybe_resolve_channel_approval(
             msg=msg,
             session_key=session_key,
             config=config,
             session_manager=session_manager,
+            route_envelope=route_envelope,
         )
         if approval_reply is not None:
             try:
@@ -602,7 +617,7 @@ async def run_channel_dispatch(
         # fmt: off
         if getattr(channel, "supports_slash_commands", False) and rpc_dispatcher is not None and channel_rpc_context_factory is not None:  # noqa: E501
             command_reply = await _dispatch_channel_slash_command(
-                route_envelope=route_envelope, msg=msg, session_manager=session_manager, session_key=session_key, session_prefix=session_prefix, rpc_dispatcher=rpc_dispatcher, context_factory=channel_rpc_context_factory  # noqa: E501
+                route_envelope=route_envelope, msg=msg, session_manager=session_manager, session_key=session_key, session_prefix=session_prefix, rpc_dispatcher=rpc_dispatcher, context_factory=channel_rpc_context_factory, config=config  # noqa: E501
             )
             if command_reply is not None:
                 emit = log.warning if command_reply.metadata.get("denied") else log.info
@@ -676,7 +691,7 @@ async def run_channel_dispatch(
             session_manager=session_manager,
             config=config,
             workspace_dir=None,
-            principal_is_owner=_is_channel_admin_sender(config, route_envelope),
+            principal_is_owner=principal_is_owner,
         )
 
         ingested = await _ingest_channel_message_attachments(
@@ -1055,6 +1070,7 @@ async def _maybe_resolve_channel_approval(
     session_key: str,
     config: Any = None,
     session_manager: Any = None,
+    route_envelope: Any = None,
 ) -> OutgoingMessage | None:
     """Resolve a channel approval action without starting an agent turn.
 
@@ -1071,8 +1087,9 @@ async def _maybe_resolve_channel_approval(
     cross-chat attempts get the same reply as an unknown code — response text
     must not become a short-code existence oracle — and repeated failed
     attempts per sender hit a cooldown. The ``always`` decision additionally
-    requires the sender to still be a configured channel admin at resolution
-    time — the card payload is never trusted for that. A plain approval
+    requires the sender to carry the authenticated channel-admin stamp from
+    ingress — the card payload and raw sender ID are never trusted for that.
+    A plain approval
     forces ``elevated_mode=None`` so it permits one gated command, never
     session-wide elevation. Returns the reply to send, or ``None`` when the
     message is not an approval action.
@@ -1108,14 +1125,16 @@ async def _maybe_resolve_channel_approval(
         # Constant reply regardless of the attempted code: a throttled probe
         # must learn nothing about code validity.
         return OutgoingMessage(
-            content="Too many failed approval attempts — wait a minute and try again."
+            content=render_channel_message("approval_probe_throttled", config=config)
         )
 
     binding = resolve_short_code(code)
     if binding is None:
         log.info("channel.approval_unknown_code", code=code, session_key=session_key)
         _record_approval_probe_failure(probe_key)
-        return OutgoingMessage(content=f"No pending approval {code}.")
+        return OutgoingMessage(
+            content=render_channel_message("approval_no_pending", config=config, code=code)
+        )
 
     # Cross-session and cross-chat attempts reuse the unknown-code reply on
     # purpose: distinct texts would confirm that a guessed code is live and
@@ -1127,7 +1146,9 @@ async def _maybe_resolve_channel_approval(
             session_key=session_key,
         )
         _record_approval_probe_failure(probe_key)
-        return OutgoingMessage(content=f"No pending approval {code}.")
+        return OutgoingMessage(
+            content=render_channel_message("approval_no_pending", config=config, code=code)
+        )
 
     if binding.origin_channel_id and msg.channel_id != binding.origin_channel_id:
         log.warning(
@@ -1137,7 +1158,9 @@ async def _maybe_resolve_channel_approval(
             channel_id=msg.channel_id,
         )
         _record_approval_probe_failure(probe_key)
-        return OutgoingMessage(content=f"No pending approval {code}.")
+        return OutgoingMessage(
+            content=render_channel_message("approval_no_pending", config=config, code=code)
+        )
 
     if not sender_id or sender_id != binding.owner_sender_id:
         # Reaching this check requires matching the binding's session AND
@@ -1151,15 +1174,10 @@ async def _maybe_resolve_channel_approval(
         )
         _record_approval_probe_failure(probe_key)
         return OutgoingMessage(
-            content=(
-                "Only the session owner can resolve this. "
-                f"Ask them to reply /approve {code}."
-            )
+            content=render_channel_message("approval_owner_only", config=config, code=code)
         )
 
-    if decision == DECISION_ALWAYS and not _sender_is_channel_admin(
-        config, binding.origin_channel_name, sender_id
-    ):
+    if decision == DECISION_ALWAYS and not has_verified_channel_admin_stamp(route_envelope):
         log.warning(
             "channel.approval_always_requires_admin",
             code=code,
@@ -1167,9 +1185,8 @@ async def _maybe_resolve_channel_approval(
             sender_id=sender_id,
         )
         return OutgoingMessage(
-            content=(
-                f"'Always' needs a channel admin. Reply /approve {code} "
-                "to allow just this once."
+            content=render_channel_message(
+                "approval_always_requires_admin", config=config, code=code
             )
         )
 
@@ -1188,7 +1205,9 @@ async def _maybe_resolve_channel_approval(
         )
     except KeyError:
         log.info("channel.approval_expired", code=code, session_key=session_key)
-        return OutgoingMessage(content=f"No pending approval {code}.")
+        return OutgoingMessage(
+            content=render_channel_message("approval_no_pending", config=config, code=code)
+        )
     except _SandboxChoiceError as exc:
         # Malformed/incompatible choice payload — nothing was claimed, the
         # approval is genuinely still pending (distinct from the resolved
@@ -1200,15 +1219,16 @@ async def _maybe_resolve_channel_approval(
             error=str(exc),
         )
         return OutgoingMessage(
-            content=(
-                f"Could not apply approval {code} — it is still pending. "
-                "Resolve it from the console."
-            )
+            content=render_channel_message("approval_invalid_choice", config=config, code=code)
         )
     except ValueError:
         # Already resolved (race) — report idempotently rather than erroring.
         log.info("channel.approval_already_resolved", code=code, session_key=session_key)
-        return OutgoingMessage(content=f"Approval {code} was already resolved.")
+        return OutgoingMessage(
+            content=render_channel_message(
+                "approval_already_resolved", config=config, code=code
+            )
+        )
     except Exception:
         # Transient storage/session failures (e.g. a busy SQLite write while
         # applying a grant) must not escape into the dispatch loop and burn
@@ -1220,9 +1240,8 @@ async def _maybe_resolve_channel_approval(
             session_key=session_key,
         )
         return OutgoingMessage(
-            content=(
-                f"Could not apply approval {code} — it is still pending, "
-                "please try again."
+            content=render_channel_message(
+                "approval_resolution_failed", config=config, code=code
             )
         )
 
@@ -1326,12 +1345,18 @@ async def _resolve_channel_approval_decision(
             )
 
     if not approved:
-        return OutgoingMessage(content=f"Denied {code}.")
+        return OutgoingMessage(
+            content=render_channel_message("approval_denied", config=config, code=code)
+        )
     if choice == "allow_same_type":
         return OutgoingMessage(
-            content=f"Approved {code} — this kind won't ask again this session."
+            content=render_channel_message(
+                "approval_approved_always", config=config, code=code
+            )
         )
-    return OutgoingMessage(content=f"Approved {code} — running …")
+    return OutgoingMessage(
+        content=render_channel_message("approval_approved_once", config=config, code=code)
+    )
 
 
 async def _dispatch_channel_slash_command(
@@ -1343,6 +1368,7 @@ async def _dispatch_channel_slash_command(
     session_prefix: str,
     rpc_dispatcher: Any,
     context_factory: Callable[[Any], Any],
+    config: Any = None,
 ) -> OutgoingMessage | None:
     from opensquilla.channels.command_registry import DEFAULT_COMMAND_REGISTRY
 
@@ -1352,7 +1378,7 @@ async def _dispatch_channel_slash_command(
         if head is None:
             return None
         return _route_envelope_reply_message(
-            f"Unsupported command: {head}. Try /help.",
+            render_channel_message("command_unsupported", config=config, command=head),
             route_envelope,
             metadata={"command": head[1:].lower(), "method": None, "unsupported": True},
         )
@@ -1367,6 +1393,7 @@ async def _dispatch_channel_slash_command(
             session_prefix=session_prefix,
             rpc_dispatcher=rpc_dispatcher,
             context_factory=context_factory,
+            config=config,
         )
 
     reply = await DEFAULT_COMMAND_REGISTRY.dispatch(
@@ -1374,6 +1401,7 @@ async def _dispatch_channel_slash_command(
         message_content=msg.content,
         rpc_dispatcher=rpc_dispatcher,
         context_factory=context_factory,
+        config=config,
     )
     if reply is None:
         return None
@@ -1389,6 +1417,7 @@ async def _dispatch_channel_new_command(
     session_prefix: str,
     rpc_dispatcher: Any,
     context_factory: Callable[[Any], Any],
+    config: Any = None,
 ) -> OutgoingMessage:
     from opensquilla.channels.command_registry import DEFAULT_COMMAND_REGISTRY
     from opensquilla.gateway.scopes import WRITE_SCOPE, authorize_call
@@ -1402,11 +1431,17 @@ async def _dispatch_channel_new_command(
         getattr(principal, "scopes", frozenset()),
     )
     if not allowed:
-        detail = f": missing {missing}" if missing else ""
+        detail = (
+            render_channel_message("command_missing_scope", config=config, missing=missing)
+            if missing
+            else ""
+        )
         return _route_envelope_reply_message(
-            (
-                "/new denied: Insufficient scope for method: "
-                f"sessions.reset{detail}"
+            render_channel_message(
+                "command_new_denied",
+                config=config,
+                method="sessions.reset",
+                detail=detail,
             ),
             route_envelope,
             metadata={"command": "new", "method": "sessions.reset", "denied": True},
@@ -1424,10 +1459,11 @@ async def _dispatch_channel_new_command(
         message_content=msg.content,
         rpc_dispatcher=rpc_dispatcher,
         context_factory=lambda _envelope: ctx,
+        config=config,
     )
     if reply is None:
         return _route_envelope_reply_message(
-            "/new failed: command unavailable",
+            render_channel_message("command_new_unavailable", config=config),
             route_envelope,
             metadata={"command": "new", "method": "sessions.reset", "denied": False},
         )
@@ -1439,16 +1475,24 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
     from opensquilla.gateway.routing import build_channel_route_envelope
 
     msg = combined.message
-    admission = admission_decision or decide_channel_admission(channel, msg, session_key)
+    admission = admission_decision or decide_channel_admission(
+        channel,
+        msg,
+        session_key,
+        config=config,
+        channel_name=session_prefix,
+    )
     if not admission.admit:
         log.info("channel.admission_denied", channel=session_prefix, reason=admission.reason, is_group=admission.is_group)  # noqa: E501
         return
     route_envelope = build_channel_route_envelope(msg, session_key=session_key, session_prefix=session_prefix)  # noqa: E501
+    principal_is_owner = _stamp_channel_admin_principal(config, route_envelope, msg)
     approval_reply = await _maybe_resolve_channel_approval(
         msg=msg,
         session_key=session_key,
         config=config,
         session_manager=session_manager,
+        route_envelope=route_envelope,
     )
     if approval_reply is not None:
         await channel.send(_preserve_route_channel_metadata(approval_reply, route_envelope))
@@ -1470,7 +1514,7 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
         session_manager=session_manager,
         config=config,
         workspace_dir=None,
-        principal_is_owner=_is_channel_admin_sender(config, route_envelope),
+        principal_is_owner=principal_is_owner,
     )
 
     ingested = await _ingest_channel_message_attachments(channel=channel, msg=msg, config=config)
@@ -1826,11 +1870,51 @@ async def _emit_run_heartbeat(
 
 
 def _is_channel_admin_sender(config: Any, envelope: Any) -> bool:
+    """Compatibility matcher for callers that only have a route envelope.
+
+    This helper intentionally does not authorize a turn.  Channel dispatch
+    uses ``_stamp_channel_admin_principal`` below, which also proves the
+    authenticated ingress principal.
+    """
+
     source_name = getattr(envelope, "source_name", None)
     sender_id = getattr(envelope, "sender_id", None)
     if not isinstance(source_name, str) or not isinstance(sender_id, str):
         return False
     return _sender_is_channel_admin(config, source_name, sender_id)
+
+
+def _stamp_channel_admin_principal(
+    config: Any,
+    envelope: Any,
+    msg: IncomingMessage,
+) -> bool:
+    """Persist authenticated channel-admin standing on an accepted route.
+
+    TaskRuntime runs after ingress has returned, so it cannot consult the
+    mutable channel configuration safely or infer ownership from a session key.
+    Record only the result of the authenticated ingress check here; raw
+    adapter metadata and a configured sender ID alone are never authorization
+    sources.
+    """
+    source_kind = getattr(envelope, "source_kind", None)
+    source_kind_value = getattr(source_kind, "value", source_kind)
+    source_name = getattr(envelope, "source_name", None)
+    route_sender_id = getattr(envelope, "sender_id", None)
+    is_owner = bool(
+        source_kind_value == "channel"
+        and route_sender_id == msg.sender_id
+        and is_authenticated_channel_admin(
+            config,
+            channel_name=source_name if isinstance(source_name, str) else None,
+            msg=msg,
+        )
+    )
+    metadata = getattr(envelope, "metadata", None)
+    if isinstance(metadata, dict):
+        metadata["principal_is_owner"] = is_owner
+        metadata[CHANNEL_ADMIN_VERIFIED_METADATA_KEY] = is_owner
+    return is_owner
 
 
 async def _run_turn_with_streaming(
@@ -1869,9 +1953,10 @@ async def _run_turn_with_streaming(
         session_prefix=getattr(channel, "channel_id", None) or "unknown",
         agent_id=agent_id,
     )
+    principal_is_owner = _stamp_channel_admin_principal(config, envelope, msg)
     tool_ctx = tool_context_from_envelope(
         envelope,
-        is_owner=_is_channel_admin_sender(config, envelope),
+        is_owner=principal_is_owner,
         workspace_dir=str(workspace_dir),
         workspace_strict=workspace_strict,
         default_elevated=configured_default_elevated(config),

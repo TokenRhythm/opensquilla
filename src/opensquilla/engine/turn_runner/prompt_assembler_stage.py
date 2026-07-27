@@ -22,7 +22,7 @@ future prompt-failure early-yield branch.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from opensquilla.provider.protocol import configured_provider_id
@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from opensquilla.engine.turn_runner.outcome import StageOutcome
     from opensquilla.observability.decision_log import PipelineStepRecord
     from opensquilla.observability.prompt_report import PromptReport
+    from opensquilla.provider.types import ProviderRequestCorrelation
     from opensquilla.tools.types import ToolContext
 
 # ---------------------------------------------------------------------------
@@ -78,6 +79,10 @@ class RunPipelineRequest:
     input_provenance: dict[str, Any] | str | None = None
     skill_catalog: Any | None = None
     usage_execution_context: Any | None = None
+    provider_request_correlation: ProviderRequestCorrelation | None = field(
+        default=None,
+        repr=False,
+    )
 
 # ---------------------------------------------------------------------------
 # Ports — narrow Protocols so the stage is unit-testable without the full
@@ -246,6 +251,10 @@ class PromptAssemblerStageInput:
     input_provenance: dict[str, Any] | str | None = None
     skill_catalog: Any | None = None
     usage_execution_context: Any | None = None
+    provider_request_correlation: ProviderRequestCorrelation | None = field(
+        default=None,
+        repr=False,
+    )
 
 @dataclass(frozen=True)
 class PromptAssemblerStageOutput:
@@ -440,6 +449,7 @@ class PromptAssemblerStage:
             input_provenance=inp.input_provenance,
             skill_catalog=inp.skill_catalog,
             usage_execution_context=inp.usage_execution_context,
+            provider_request_correlation=inp.provider_request_correlation,
         )
         turn, provider = await self._pipeline_executor.run_pipeline(request)
 

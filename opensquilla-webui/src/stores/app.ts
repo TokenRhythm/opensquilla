@@ -7,6 +7,8 @@ import i18n, {
   isSupportedLocale,
   type LocaleCode,
 } from '@/i18n'
+import { useToasts } from '@/composables/useToasts'
+import { useRpcStore } from '@/stores/rpc'
 import { getManifest, isValueThemeId, normalizeThemeId, themePickerOptions } from '@/themes/registry'
 import { ensureThemeWorld } from '@/themes/apply'
 import {
@@ -20,6 +22,17 @@ import {
 // 'system' or any registered value-theme id. The string branch keeps custom
 // themes typeable while preserving autocomplete for the built-ins.
 export type ThemeMode = 'light' | 'dark' | 'system' | (string & {})
+
+const LOCALE_SYNC_PENDING_KEY = 'opensquilla-locale-sync-pending'
+
+function readPendingLocaleSync(): LocaleCode | null {
+  try {
+    const saved = localStorage.getItem(LOCALE_SYNC_PENDING_KEY)
+    return isSupportedLocale(saved) ? saved : null
+  } catch {
+    return null
+  }
+}
 
 type FeatureWindow = Window & {
   OPENSQUILLA_FEATURES?: Record<string, boolean>
@@ -43,11 +56,12 @@ export interface PendingApproval {
 
 export const useAppStore = defineStore('app', () => {
   const theme = ref<ThemeMode>('system')
-  // Active UI locale. Mirrors the theme pattern: localStorage is the source of
-  // truth, set instantly with no save, applied to <html lang>/dir and the
-  // vue-i18n instance. The sidebar/topbar switcher and the Settings Appearance
-  // Language row both write through setLocale, so they can never drift.
+  // Active UI locale. Browser-local storage preserves the immediate UI
+  // preference; an explicit selection also syncs the Gateway-wide language
+  // used for fixed channel notices. The sidebar/topbar switcher and the
+  // Settings Appearance Language row both write through setLocale.
   const locale = ref<LocaleCode>('en')
+  const pendingChannelNoticeLocale = ref<LocaleCode | null>(readPendingLocaleSync())
   const sidebarOpen = ref(true)
   // Browser-local layout preference, hydrated synchronously so the first
   // mounted frame uses the saved width. Viewport clamping is intentionally a
@@ -94,6 +108,10 @@ export const useAppStore = defineStore('app', () => {
   let mq: MediaQueryList | null = null
   let mqHandler: ((e: MediaQueryListEvent) => void) | null = null
   let themeWatchStop: (() => void) | null = null
+  let localeSyncPromise: Promise<void> | null = null
+  let localeSyncWarningShown = false
+  const rpcStore = useRpcStore()
+  const { pushToast } = useToasts()
 
   function applyTheme() {
     const platform = getPlatform()
@@ -182,14 +200,70 @@ export const useAppStore = defineStore('app', () => {
     document.documentElement.setAttribute('dir', 'ltr')
   }
 
+  function savePendingLocaleSync(code: LocaleCode) {
+    pendingChannelNoticeLocale.value = code
+    try { localStorage.setItem(LOCALE_SYNC_PENDING_KEY, code) } catch {}
+  }
+
+  function clearPendingLocaleSync(code: LocaleCode) {
+    if (pendingChannelNoticeLocale.value !== code) return
+    pendingChannelNoticeLocale.value = null
+    try { localStorage.removeItem(LOCALE_SYNC_PENDING_KEY) } catch {}
+  }
+
+  function notifyLocaleSyncPending() {
+    if (localeSyncWarningShown) return
+    localeSyncWarningShown = true
+    pushToast(i18n.global.t('settings.appearance.channelNoticeLocaleSyncPending'), { tone: 'warn' })
+  }
+
+  async function syncLocaleToGateway(
+    { warnOnUnavailable = true }: { warnOnUnavailable?: boolean } = {},
+  ): Promise<void> {
+    if (localeSyncPromise) return localeSyncPromise
+    localeSyncPromise = (async () => {
+      while (pendingChannelNoticeLocale.value) {
+        if (!rpcStore.isConnected || !rpcStore.supportsMethod('config.patch.safe')) {
+          if (warnOnUnavailable) notifyLocaleSyncPending()
+          return
+        }
+        const target = pendingChannelNoticeLocale.value
+        try {
+          await rpcStore.call('config.patch.safe', {
+            patches: { 'control_ui.default_locale': target },
+          })
+          clearPendingLocaleSync(target)
+          localeSyncWarningShown = false
+        } catch {
+          // Keep the latest explicit selection for the next successful connection.
+          if (warnOnUnavailable) notifyLocaleSyncPending()
+          return
+        }
+      }
+    })().finally(() => {
+      localeSyncPromise = null
+    })
+    return localeSyncPromise
+  }
+
+  watch([() => rpcStore.state, () => rpcStore.methods], ([state]) => {
+    if (state === 'connected' && pendingChannelNoticeLocale.value) {
+      void syncLocaleToGateway()
+    }
+  })
+
   // Resolve and apply the startup locale (saved → OS locale → data-locale →
   // <html lang> → navigator → en). Loads the locale chunk before applying so the
   // first paint is never half-translated; a failed chunk load falls back to en.
-  // Does NOT write localStorage — it only reflects what is already chosen.
+  // It does not replace the browser's saved UI preference.
+  // Desktop has one native client locale, so it queues that value for the
+  // Gateway-wide channel-notice setting without making a disconnected startup
+  // noisy. Browser clients remain read-only until an explicit language choice.
   async function initLocale() {
     let osLocale: string | undefined
+    const platform = getPlatform()
     try {
-      osLocale = await getPlatform().getOsLocale()
+      osLocale = await platform.getOsLocale()
     } catch {
       osLocale = undefined
     }
@@ -198,6 +272,10 @@ export const useAppStore = defineStore('app', () => {
       await loadLocaleMessages(resolved)
       locale.value = resolved
       applyLocale(resolved)
+      if (platform.capabilities.isDesktop) {
+        savePendingLocaleSync(resolved)
+        void syncLocaleToGateway({ warnOnUnavailable: false })
+      }
     } catch {
       locale.value = 'en'
       applyLocale('en')
@@ -215,6 +293,8 @@ export const useAppStore = defineStore('app', () => {
     locale.value = target
     try { localStorage.setItem('opensquilla-locale', target) } catch {}
     applyLocale(target)
+    savePendingLocaleSync(target)
+    await syncLocaleToGateway()
   }
 
   function setSidebarOpen(open: boolean) {
@@ -289,6 +369,7 @@ export const useAppStore = defineStore('app', () => {
   return {
     theme,
     locale,
+    pendingChannelNoticeLocale,
     resolvedTheme,
     sidebarOpen,
     sidebarWidthPreference,
@@ -302,6 +383,7 @@ export const useAppStore = defineStore('app', () => {
     cycleTheme,
     initLocale,
     setLocale,
+    syncLocaleToGateway,
     setSidebarOpen,
     toggleSidebar,
     setSidebarWidthPreference,

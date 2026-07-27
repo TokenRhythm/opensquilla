@@ -15,6 +15,8 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
   getDesktopSettings: () => ipcRenderer.invoke('desktop:settings:get'),
   saveDesktopSettings: (payload: unknown) => ipcRenderer.invoke('desktop:settings:save', payload),
   resetDesktopSettings: () => ipcRenderer.invoke('desktop:settings:reset'),
+  getDesktopPreferences: () => ipcRenderer.invoke('desktop:preferences:get'),
+  saveDesktopPreferences: (payload: unknown) => ipcRenderer.invoke('desktop:preferences:save', payload),
   setNativeTheme: (payload: unknown) => ipcRenderer.invoke('desktop:theme:set', payload),
   openArtifact: (payload: unknown) => ipcRenderer.invoke('desktop:artifact:open', payload),
   getOnboardingDefaults: () => ipcRenderer.invoke('desktop:onboarding:defaults'),
@@ -24,20 +26,9 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
   retryStartup: () => ipcRenderer.invoke('desktop:boot:retry'),
   quitApp: () => ipcRenderer.invoke('desktop:boot:quit'),
   getRecoveryState: () => ipcRenderer.invoke('desktop:recovery:state'),
-  getDesktopProfileKind: async () => {
-    const value = await ipcRenderer.invoke('desktop:recovery:state')
-    if (!value || typeof value !== 'object') return null
-    const active = (value as Record<string, unknown>).activeProfile
-    if (!active || typeof active !== 'object') return null
-    const kind = (active as Record<string, unknown>).kind
-    return kind === 'primary' || kind === 'recovery' ? kind : null
-  },
   chooseRecoveryWorkspace: (payload: unknown) => ipcRenderer.invoke('desktop:recovery:choose-workspace', payload),
   chooseLegacyAgentDataLocation: (payload: unknown) => ipcRenderer.invoke('desktop:recovery:choose-legacy-agent-data', payload),
   recoverProfileTransaction: () => ipcRenderer.invoke('desktop:recovery:recover-transaction'),
-  launchSafeProfile: (payload: unknown) => ipcRenderer.invoke('desktop:recovery:launch-safe', payload),
-  retryPrimaryProfile: () => ipcRenderer.invoke('desktop:recovery:retry-primary'),
-  returnPrimaryProfile: () => ipcRenderer.invoke('desktop:recovery:return-primary'),
   revealRecoveryPath: (payload: unknown) => ipcRenderer.invoke('desktop:recovery:reveal-path', payload),
   copyRecoveryDiagnostics: () => ipcRenderer.invoke('desktop:recovery:copy-diagnostics'),
   abandonCleanupTransaction: () => ipcRenderer.invoke('desktop:recovery:abandon-cleanup'),
@@ -75,5 +66,10 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
     const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => callback(payload)
     ipcRenderer.on('desktop:migration:progress', listener)
     return () => ipcRenderer.removeListener('desktop:migration:progress', listener)
+  },
+  onWindowHidden: (callback: () => void) => {
+    const listener = () => callback()
+    ipcRenderer.on('desktop:window:hidden', listener)
+    return () => ipcRenderer.removeListener('desktop:window:hidden', listener)
   },
 })

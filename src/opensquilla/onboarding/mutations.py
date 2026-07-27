@@ -50,6 +50,12 @@ from opensquilla.onboarding.redaction import (
 )
 from opensquilla.onboarding.search_specs import get_search_provider_setup_spec
 from opensquilla.provider.environment import environment_value
+from opensquilla.provider.image_generation_policy import (
+    conflicting_image_generation_endpoint_provider,
+    image_generation_llm_endpoint_allows_credential_reuse,
+    is_valid_image_generation_base_url,
+    parse_image_generation_model_ref,
+)
 from opensquilla.provider.preset_registry import ProviderPreset, get_preset
 from opensquilla.router_tiers import (
     DEFAULT_TEXT_TIER,
@@ -1328,30 +1334,82 @@ def _image_generation_api_key_source(
         return "explicit"
     if env_key and os.environ.get(env_key):
         return "env"
-    # The primary LLM key is a credential for the LLM's endpoint only; a
-    # save that would bind it to a different image endpoint origin must fail
-    # closed so the operator enters a dedicated key. This mirrors the
-    # resolution-time gate in provider/image_generation.py: an llm base_url
-    # equal to the pydantic field default is derived for another provider,
-    # not chosen, and means the matched provider's own default endpoint.
-    field = type(config.llm).model_fields.get("base_url")
-    derived_default = str(getattr(field, "default", "") or "") if field is not None else ""
-    stored_llm_base = str(config.llm.base_url or "")
-    llm_base_url = (
-        stored_llm_base if stored_llm_base != derived_default else ""
-    ) or default_base_url
-    if (
-        config.llm.provider == provider_id
-        and config.llm.api_key
-        and base_url_allows_credential_reuse(llm_base_url, effective_base_url)
-    ):
+    if image_generation_llm_endpoint_allows_credential_reuse(
+        provider_id=provider_id,
+        llm_config=config.llm,
+        default_base_url=default_base_url,
+        effective_base_url=effective_base_url,
+    ) and config.llm.api_key:
         return "llm_fallback"
     return "none"
 
 
 ImageOutputFormat = Literal["png", "jpeg", "webp"]
+ImageGenerationCredentialMode = Literal["direct", "env"]
 _VALID_IMAGE_SIZES = ("1024x1024", "1536x1024", "1024x1536")
 _VALID_IMAGE_OUTPUT_FORMATS: tuple[ImageOutputFormat, ...] = ("png", "jpeg", "webp")
+
+
+def _normalize_image_generation_credential_mode(
+    value: str | None,
+) -> ImageGenerationCredentialMode | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return None
+    if normalized not in {"direct", "env"}:
+        raise ValueError("credential_mode must be 'direct' or 'env'")
+    return cast(ImageGenerationCredentialMode, normalized)
+
+
+def _is_legacy_image_generation_provider_switch_payload(
+    *,
+    config: GatewayConfig,
+    provider_id: str,
+    target_spec: Any,
+    primary: str,
+    api_key_env: str,
+    base_url: str | None,
+    enabled: bool,
+    fallbacks: list[str] | None,
+    clear_fallbacks: bool,
+    credential_mode: str | None,
+) -> bool:
+    """Recognize a stale 0.5.0 provider-switch payload.
+
+    The old WebUI changed the selected provider and its default env-var name,
+    but retained the source provider's primary, endpoint, and fallback draft.
+    Anchor every stale field to the stored source configuration so an arbitrary
+    cross-provider RPC request is still rejected.
+    """
+
+    if (
+        enabled is not True
+        or credential_mode is not None
+        or clear_fallbacks is not False
+        or not isinstance(primary, str)
+        or not isinstance(base_url, str)
+        or fallbacks is None
+        or api_key_env != target_spec.env_key
+    ):
+        return False
+    stored_primary = str(getattr(config.image_generation, "primary", "") or "")
+    if primary != stored_primary:
+        return False
+    try:
+        source_provider_id, _source_model = parse_image_generation_model_ref(stored_primary)
+        source_spec = get_image_generation_provider_setup_spec(source_provider_id)
+        source_provider_cfg = _image_generation_provider_config(config, source_provider_id)
+    except (KeyError, ValueError):
+        return False
+    if source_provider_id == provider_id or not source_spec.runtime_supported:
+        return False
+    stored_base_url = str(getattr(source_provider_cfg, "base_url", "") or "")
+    return (
+        base_url == stored_base_url
+        and fallbacks == list(getattr(config.image_generation, "fallbacks", []) or [])
+    )
 
 
 def upsert_image_generation_provider(
@@ -1361,11 +1419,13 @@ def upsert_image_generation_provider(
     primary: str = "",
     api_key: str = "",
     api_key_env: str = "",
-    base_url: str = "",
+    base_url: str | None = None,
     enabled: bool = True,
     size: str = "",
     output_format: str = "",
     fallbacks: list[str] | None = None,
+    clear_fallbacks: bool = False,
+    credential_mode: str | None = None,
 ) -> MutationResult:
     spec = get_image_generation_provider_setup_spec(provider_id)
     if not spec.runtime_supported:
@@ -1373,9 +1433,37 @@ def upsert_image_generation_provider(
             f"image generation provider {provider_id!r} is not runtime-supported "
             "and cannot be configured"
         )
-    primary_model = primary or spec.default_model
-    primary_provider, sep, _model = primary_model.partition("/")
-    if not sep or primary_provider != provider_id:
+    if _is_legacy_image_generation_provider_switch_payload(
+        config=config,
+        provider_id=provider_id,
+        target_spec=spec,
+        primary=primary,
+        api_key_env=api_key_env,
+        base_url=base_url,
+        enabled=enabled,
+        fallbacks=fallbacks,
+        clear_fallbacks=clear_fallbacks,
+        credential_mode=credential_mode,
+    ):
+        primary = spec.default_model
+        base_url = spec.default_base_url
+    stored_primary = str(getattr(config.image_generation, "primary", "") or "")
+    requested_primary = primary or (
+        stored_primary if not enabled and stored_primary else spec.default_model
+    )
+    preserve_legacy_primary = not enabled and requested_primary == stored_primary
+    try:
+        primary_provider, primary_model_name = parse_image_generation_model_ref(
+            requested_primary
+        )
+    except ValueError:
+        if not preserve_legacy_primary:
+            raise
+        primary_provider = provider_id
+        primary_model = requested_primary
+    else:
+        primary_model = f"{primary_provider}/{primary_model_name}"
+    if primary_provider != provider_id and not preserve_legacy_primary:
         raise ValueError(
             "primary must be a provider/model reference for "
             f"image generation provider {provider_id!r}"
@@ -1392,25 +1480,106 @@ def upsert_image_generation_provider(
         raise ValueError(
             f"image output format must be one of {', '.join(_VALID_IMAGE_OUTPUT_FORMATS)}"
         )
-    # fallbacks: each must be a provider/model reference; an empty list keeps current.
-    cleaned_fallbacks = [f.strip() for f in (fallbacks or []) if f and f.strip()]
-    for fb in cleaned_fallbacks:
-        if "/" not in fb:
-            raise ValueError(
-                f"image fallback {fb!r} must be a provider/model reference"
-            )
-    effective_fallbacks = cleaned_fallbacks or list(config.image_generation.fallbacks)
+    if not isinstance(clear_fallbacks, bool):
+        raise ValueError("clear_fallbacks must be a boolean")
+    if clear_fallbacks and fallbacks is None:
+        raise ValueError("clear_fallbacks requires a fallbacks list")
+    credential_source = _normalize_image_generation_credential_mode(credential_mode)
+
+    # Older 0.5.0 clients always sent ``fallbacks: []`` for an untouched
+    # field, so an empty list remains keep-current unless the new additive
+    # clear intent is present. Non-empty lists still replace the chain.
+    current_fallbacks = list(config.image_generation.fallbacks)
+    cleaned_fallbacks: list[str] = []
+    preserve_legacy_fallbacks = (
+        not enabled
+        and fallbacks is not None
+        and list(fallbacks) == current_fallbacks
+    )
+    if preserve_legacy_fallbacks:
+        cleaned_fallbacks = current_fallbacks
+    elif fallbacks is not None:
+        for fallback in fallbacks:
+            if isinstance(fallback, str) and not fallback.strip():
+                continue
+            try:
+                fallback_provider, fallback_model = parse_image_generation_model_ref(fallback)
+            except ValueError as exc:
+                raise ValueError(
+                    f"image fallback {fallback!r} must be a provider/model reference"
+                ) from exc
+            cleaned_fallbacks.append(f"{fallback_provider}/{fallback_model}")
+    fallbacks_updated = (
+        not preserve_legacy_fallbacks
+        and (bool(cleaned_fallbacks) or clear_fallbacks)
+    )
+    effective_fallbacks = (
+        cleaned_fallbacks
+        if fallbacks_updated
+        else current_fallbacks
+    )
 
     current_provider_cfg = _image_generation_provider_config(config, provider_id)
-    if is_redacted_secret_sentinel(api_key):
+    api_key_is_redacted = is_redacted_secret_sentinel(api_key)
+    if api_key_is_redacted:
         # Round-tripped redaction mask: keep the stored key (see
         # upsert_llm_provider for the server-side trust-boundary rationale).
         api_key = ""
     explicit_env_key = _clean_optional_str(api_key_env)
-    if api_key and explicit_env_key:
-        raise ValueError("configure either api_key or api_key_env, not both")
+    if credential_source == "direct":
+        # New clients state which credential control was edited. The direct
+        # value wins even if a stale draft still carries an env name.
+        explicit_env_key = ""
+    elif credential_source == "env":
+        # Conversely, switching to an env reference intentionally replaces a
+        # stored direct key even when the write-only key field is redacted.
+        api_key = ""
+    elif api_key_is_redacted:
+        # A legacy read-modify-write echo is never an instruction to switch
+        # sources. Preserve the stored direct key and ignore display state.
+        explicit_env_key = ""
+    elif api_key and explicit_env_key:
+        # The 0.5.0 WebUI keeps the selected provider's default env name in
+        # the form while a user pastes a direct key. Treat only that default
+        # echo as non-authoritative; a custom env plus a direct key remains
+        # ambiguous and is rejected.
+        if explicit_env_key == spec.env_key:
+            explicit_env_key = ""
+        else:
+            raise ValueError("configure either api_key or api_key_env, not both")
+    elif (
+        not api_key
+        and explicit_env_key == spec.env_key
+        and bool(getattr(current_provider_cfg, "api_key", ""))
+    ):
+        # Old clients send their default env field during every save. Without
+        # a credentialMode it must not erase a stored direct key.
+        explicit_env_key = ""
     stored_base_url = str(getattr(current_provider_cfg, "base_url", "") or "")
-    effective_base_url = base_url or stored_base_url or spec.default_base_url
+    if base_url is None:
+        effective_base_url = stored_base_url or spec.default_base_url
+    else:
+        effective_base_url = str(base_url).strip() or spec.default_base_url
+    preserve_legacy_base_url = (
+        not enabled
+        and bool(stored_base_url)
+        and effective_base_url == stored_base_url
+    )
+    if (
+        not is_valid_image_generation_base_url(effective_base_url)
+        and not preserve_legacy_base_url
+    ):
+        raise ValueError("image base_url must be an absolute http:// or https:// URL")
+    conflicting_provider = conflicting_image_generation_endpoint_provider(
+        provider_id,
+        effective_base_url,
+    )
+    if enabled and conflicting_provider:
+        raise ValueError(
+            f"image generation provider {provider_id!r} cannot use the official "
+            f"{conflicting_provider!r} endpoint; use {spec.default_base_url!r} "
+            "or a custom compatible endpoint"
+        )
     # A stored credential must not follow a changed endpoint origin: on a
     # scheme/host/effective-port change every reusable secret source —
     # including the well-known registry default env var — is dropped
@@ -1425,12 +1594,20 @@ def upsert_image_generation_provider(
         if endpoint_allows_reuse
         else ""
     )
+    # A newly selected env reference replaces a stored direct key. Without
+    # this branch the runtime keeps preferring the old direct key, so the UI
+    # appears to switch sources while the effective credential does not.
+    replace_stored_api_key = credential_source == "env" or bool(explicit_env_key)
     effective_api_key = clean_header_secret(
-        api_key or stored_api_key,
+        api_key or ("" if replace_stored_api_key else stored_api_key),
         label="Image API key",
     )
     stored_env_key = str(getattr(current_provider_cfg, "api_key_env", spec.env_key) or "")
-    if not endpoint_allows_reuse and explicit_env_key == stored_env_key:
+    if (
+        not endpoint_allows_reuse
+        and credential_source != "env"
+        and explicit_env_key == stored_env_key
+    ):
         # Clients hydrate and re-send the stored env-var name verbatim: a
         # re-submitted value equal to the stored reference means "keep the
         # current credential", not a credential authored for the changed
@@ -1446,10 +1623,14 @@ def upsert_image_generation_provider(
         if base_url_allows_credential_reuse(spec.default_base_url, effective_base_url)
         else ""
     )
-    if api_key:
+    if credential_source == "direct" or api_key:
         env_key = ""
+    elif credential_source == "env":
+        env_key = explicit_env_key
+    elif explicit_env_key:
+        env_key = explicit_env_key
     else:
-        env_key = explicit_env_key or current_env_key or default_env_key
+        env_key = current_env_key or default_env_key
     has_saved_env_reference = bool(
         explicit_env_key or (current_env_key and current_env_key != spec.env_key)
     )
@@ -1461,16 +1642,6 @@ def upsert_image_generation_provider(
         effective_base_url=effective_base_url,
         default_base_url=spec.default_base_url,
     )
-    if (
-        enabled
-        and spec.requires_api_key
-        and api_key_source == "none"
-        and not has_saved_env_reference
-    ):
-        raise ValueError(
-            f"image generation provider {provider_id!r} requires an api_key, "
-            f"{spec.env_key}, or a matching configured LLM provider"
-        )
     if api_key_source == "none" and has_saved_env_reference:
         api_key_source = "missing_env"
 
@@ -1486,10 +1657,36 @@ def upsert_image_generation_provider(
     new_cfg.image_generation.size = effective_size
     new_cfg.image_generation.output_format = cast(ImageOutputFormat, effective_output_format)
     new_cfg.image_generation.fallbacks = effective_fallbacks
+    if fallbacks_updated:
+        new_cfg.mark_force_persist("image_generation.fallbacks")
     next_provider_cfg = _image_generation_provider_config(new_cfg, provider_id)
     next_provider_cfg.api_key = effective_api_key
     next_provider_cfg.api_key_env = env_key
     next_provider_cfg.base_url = effective_base_url
+    if (
+        enabled
+        and spec.requires_api_key
+        and api_key_source == "none"
+        and not has_saved_env_reference
+    ):
+        # Fallback routes are executable candidates, so a missing credential
+        # on this primary does not make an otherwise healthy chain unusable.
+        # Consult the shared onboarding verifier only after the prospective
+        # selected-provider state has been applied.
+        from opensquilla.onboarding.section_status import (
+            SectionStatus,
+            image_generation_section_status,
+        )
+
+        if image_generation_section_status(new_cfg) is not SectionStatus.OK:
+            raise ValueError(
+                f"image generation provider {provider_id!r} requires an api_key, "
+                f"{spec.env_key}, or a matching configured LLM provider"
+            )
+    if base_url is not None:
+        new_cfg.mark_force_persist(
+            f"image_generation.providers.{provider_id}.base_url"
+        )
     if explicit_env_key == spec.env_key and not base_url_allows_credential_reuse(
         spec.default_base_url,
         effective_base_url,

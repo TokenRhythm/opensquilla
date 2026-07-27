@@ -26,6 +26,22 @@ trailers.
 | [@ab2ence](https://github.com/ab2ence) | macOS Seatbelt backend execution, denial escalation, and release-candidate type-check cleanup. | [#46](https://github.com/opensquilla/opensquilla/pull/46), [`fb1e6225`](https://github.com/opensquilla/opensquilla/pull/46/commits/fb1e6225e4db9cb0801ea347a89c2066e3e0601b), [`f73ac3eb`](https://github.com/opensquilla/opensquilla/pull/46/commits/f73ac3eb0044c64c79cfd18f9ec03d1bba9128ff), [`cf3b046f`](https://github.com/opensquilla/opensquilla/pull/46/commits/cf3b046f42a42efc951320b0af80e9d066dcf7d2) |
 | [@kimjune01](https://github.com/kimjune01) | Provider stream timeout cleanup fix that prevents double-closing provider streams. | [#46](https://github.com/opensquilla/opensquilla/pull/46), [`06e3126d`](https://github.com/opensquilla/opensquilla/pull/46/commits/06e3126d8ebda4ad4cf349ca7be0d0804e0c008d) |
 
+## OpenSquilla 0.5.0
+
+The 0.5.0 stable release records new human contributor work after the 0.5.0
+Preview 4 release. The published 0.5.0 release notes additionally thank every
+contributor across the full 0.4.1 → 0.5.0 range; the per-preview sections
+below keep the detailed evidence for work that shipped in Previews 1–4.
+
+| Contributor | 0.5.0 contribution | Evidence |
+| --- | --- | --- |
+| [@jiaoqingrui](https://github.com/jiaoqingrui) | Unified channel platform workflows with hardened heartbeat delivery, and added daily usage reporting. | [#763](https://github.com/opensquilla/opensquilla/pull/763), [#736](https://github.com/opensquilla/opensquilla/pull/736) |
+| [@Liu-RK](https://github.com/Liu-RK) | Aligned managed sandbox elevation, Full Host propagation, and workspace sessions, and aligned CodeTask with sandbox-off host access. | [#544](https://github.com/opensquilla/opensquilla/pull/544), [#669](https://github.com/opensquilla/opensquilla/pull/669) |
+| [@LiuXinchen1997](https://github.com/LiuXinchen1997) | Optimized Model Ensemble quorum latency and timeouts. | [#704](https://github.com/opensquilla/opensquilla/pull/704) |
+| [@nankingjing](https://github.com/nankingjing) | Hardened atomic file writes and failure cleanup. | [#594](https://github.com/opensquilla/opensquilla/pull/594) |
+| [@nice-code-la](https://github.com/nice-code-la) | Published stable OSS installer aliases for the release mirror. | [#664](https://github.com/opensquilla/opensquilla/pull/664) |
+| [@openvictory](https://github.com/openvictory) | Announced the Agentic Routing report's arXiv release in the README News section. | [#667](https://github.com/opensquilla/opensquilla/pull/667) |
+
 ## OpenSquilla 0.5.0rc4
 
 The 0.5.0 Preview 4 release records new human contributor work after the

@@ -242,6 +242,10 @@ export interface ChatEnsembleUsageRow {
   costSource?: string
   elapsed_ms?: number
   elapsedMs?: number
+  ok?: boolean
+  error?: string
+  error_code?: string
+  errorCode?: string
   [key: string]: unknown
 }
 
@@ -267,10 +271,12 @@ export interface ChatEnsembleMetaModel {
   input: number
   output: number
   costUsd: number
-  // Live per-member lifecycle during streaming. Absent for settled/history rows.
-  status?: 'running' | 'done' | 'failed'
+  sampleIndex?: number
+  // Per-member lifecycle from live progress or a settled ensemble trace.
+  status?: 'running' | 'done' | 'failed' | 'skipped'
   elapsedMs?: number
   error?: string
+  errorCode?: string
 }
 
 export interface ChatEnsembleMeta {
@@ -307,6 +313,8 @@ export interface ChatMessage {
   provenanceKind?: string
   provenanceSourceSessionKey?: string
   provenanceSourceTool?: string
+  /** Durable causal turn identity restored from transcript turn_context. */
+  turnId?: string
   interrupted?: boolean
   routerState?: string
   routerSettled?: boolean
@@ -363,6 +371,8 @@ export interface ChatRenderedMessage {
   showHeader: boolean
   isStreaming?: boolean
   messageId?: string
+  /** Stable identity of the owning user turn for client-only UI continuity. */
+  turnKey?: string
   hasAttachments?: boolean
   attachments?: DisplayAttachment[]
   toolCalls?: ChatToolCall[]
@@ -371,12 +381,17 @@ export interface ChatRenderedMessage {
   meta?: ChatMessageMeta
   reasoning?: ChatReasoning
   interrupted?: boolean
+  /** The turn ended with a terminal error after this partial assistant output. */
+  terminalFailure?: boolean
   provenanceKind?: string
   provenanceSourceSessionKey?: string
   provenanceSourceTool?: string
   daySeparator?: boolean
   dayLabel?: string
   isRouterStrip?: boolean
+  /** Stable per-turn render identity. Unlike the router event message id, this
+   *  does not change when a live strip is replaced by its settled trace. */
+  routerTurnKey?: string
   routerState?: string
   routerSource?: string
   routerObserve?: boolean

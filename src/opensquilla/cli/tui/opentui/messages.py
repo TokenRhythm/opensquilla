@@ -318,6 +318,18 @@ class HostApprovalResponse:
     choice: str | None = None
 
 
+@dataclass(frozen=True)
+class HostThemeSelected:
+    """Theme kept in the host's interactive picker.
+
+    The ``/theme <name>`` command path persists CLI-side because Python knows
+    the name it sent; a picker confirmation happens entirely in the host, so
+    it reports the kept name for the same persistence.
+    """
+
+    name: str
+
+
 type HostToPythonMessage = (
     HostReady
     | HostInputSubmit
@@ -328,6 +340,7 @@ type HostToPythonMessage = (
     | HostError
     | HostProtocolUnknown
     | HostApprovalResponse
+    | HostThemeSelected
 )
 
 
@@ -381,6 +394,7 @@ HOST_TO_PYTHON_TYPES: dict[str, type] = {
     "error": HostError,
     "protocol.unknown": HostProtocolUnknown,
     "approval.response": HostApprovalResponse,
+    "theme.selected": HostThemeSelected,
 }
 
 
@@ -459,6 +473,8 @@ def host_message_from_json(raw: str) -> HostToPythonMessage:
             approved=_required_bool(payload, "approval.response.approved", "approved"),
             choice=_optional_str(payload, "choice"),
         )
+    if message_type == "theme.selected":
+        return HostThemeSelected(name=_required_str(payload, "theme.selected.name", "name"))
 
     raise HostToPythonMessageError(f"Unknown OpenTUI host message type: {message_type}")
 

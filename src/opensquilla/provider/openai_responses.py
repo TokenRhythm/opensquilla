@@ -18,6 +18,11 @@ import structlog
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.secrets import clean_header_secret
 
+from .candidate_artifact import (
+    CandidateArtifactBuilder,
+    CandidateArtifactLimitError,
+    strip_candidate_tool_identity,
+)
 from .error_redaction import (
     redact_upstream_error_code,
     redact_upstream_error_text,
@@ -141,6 +146,32 @@ def _usage_fields(usage: Any) -> tuple[int, int, int, int]:
         int(output_details.get("reasoning_tokens") or 0) if isinstance(output_details, dict) else 0
     )
     return input_tokens, output_tokens, reasoning_tokens, cached_tokens
+
+
+def _candidate_field_has_content(value: object | None) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, dict | list | tuple):
+        return bool(value)
+    return True
+
+
+def _candidate_malformed_function_call(
+    item: dict[str, Any],
+) -> dict[str, object] | None:
+    """Retain malformed function-call data only when non-structural content remains."""
+
+    sanitized = strip_candidate_tool_identity(item)
+    if not isinstance(sanitized, dict):
+        return None
+    residual = dict(sanitized)
+    for field in ("type", "status", "name", "arguments"):
+        residual.pop(field, None)
+    if not residual:
+        return None
+    return {"malformed_function_call": sanitized}
 
 
 class OpenAIResponsesProvider:
@@ -394,6 +425,11 @@ class OpenAIResponsesProvider:
             yield ErrorEvent(message=message, code="invalid_response")
             return
         output_items = raw_output_items if isinstance(raw_output_items, list) else []
+        candidate_artifact = (
+            CandidateArtifactBuilder()
+            if config.candidate_output_mode == "inert_artifact"
+            else None
+        )
         parsed_tool_arguments: dict[
             int,
             tuple[str, str, str, str, dict[str, Any]],
@@ -434,68 +470,119 @@ class OpenAIResponsesProvider:
                         invalid_output_shape = True
                 validated_message_text[item_index] = rendered_parts
                 continue
-            if item_type != "function_call" or not response_completed:
+            if item_type != "function_call":
                 # Unknown but well-shaped output item types are provider state
                 # that this adapter does not need to surface.
                 continue
-            if response_completed:
-                raw_call_id = item.get("call_id")
-                raw_item_id = item.get("id")
+            if candidate_artifact is not None and (
+                response_completed or truncated_by_length
+            ):
+                candidate_name = item.get("name")
+                candidate_arguments = item.get("arguments")
                 if (
-                    raw_call_id is not None
-                    and (not isinstance(raw_call_id, str) or not raw_call_id.strip())
-                ) or (
-                    raw_item_id is not None
-                    and (not isinstance(raw_item_id, str) or not raw_item_id.strip())
+                    not _candidate_field_has_content(candidate_name)
+                    and not _candidate_field_has_content(candidate_arguments)
                 ):
-                    invalid_tool_call_count += 1
-                    continue
-                tool_name = item.get("name")
-                if not isinstance(tool_name, str) or not tool_name.strip():
-                    invalid_tool_call_count += 1
-                    continue
-                raw_arguments = item.get("arguments")
-                if raw_arguments is None:
-                    raw_arguments = ""
-                if not isinstance(raw_arguments, str):
-                    invalid_tool_call_count += 1
-                    continue
+                    candidate_arguments = _candidate_malformed_function_call(item)
                 try:
-                    arguments = (
-                        json.loads(
-                            raw_arguments,
-                            parse_constant=lambda value: (_ for _ in ()).throw(
-                                ValueError(value)
-                            ),
+                    if truncated_by_length:
+                        candidate_artifact.append_or_start(
+                            item_index,
+                            name_fragment=candidate_name,
+                            arguments_fragment=candidate_arguments,
                         )
-                        if raw_arguments.strip()
-                        else {}
+                    else:
+                        candidate_artifact.observe_call(
+                            item_index,
+                            name_text=candidate_name,
+                            arguments=candidate_arguments,
+                        )
+                except CandidateArtifactLimitError as exc:
+                    message = "OpenAI Responses candidate artifact exceeded safety limits"
+                    trace.record_error(
+                        code="candidate_artifact_limit_exceeded",
+                        message=message,
+                        metadata={
+                            "operation": exc.operation,
+                            "reason": exc.reason,
+                            "limit": exc.limit,
+                            "observed": exc.observed,
+                        },
                     )
-                except (
-                    json.JSONDecodeError,
-                    RecursionError,
-                    TypeError,
-                    ValueError,
-                ):
-                    invalid_tool_call_count += 1
-                    continue
-                if not isinstance(arguments, dict):
-                    invalid_tool_call_count += 1
-                    continue
-                try:
-                    json.dumps(arguments, allow_nan=False)
-                except (RecursionError, TypeError, ValueError):
-                    invalid_tool_call_count += 1
-                    continue
-                call_id = raw_call_id or raw_item_id or f"call_{uuid4().hex[:12]}"
-                key = raw_item_id or call_id
-                parsed_tool_arguments[item_index] = (
-                    call_id,
-                    key,
-                    tool_name,
-                    raw_arguments,
-                    arguments,
+                    log.warning(
+                        "provider.candidate_artifact_limit",
+                        provider=self.provider_name,
+                        model=self._model,
+                        operation=exc.operation,
+                        reason=exc.reason,
+                        limit=exc.limit,
+                        observed=exc.observed,
+                    )
+                    yield ErrorEvent(
+                        message=message,
+                        code="candidate_artifact_limit_exceeded",
+                    )
+                    return
+                continue
+            if not response_completed:
+                continue
+            raw_call_id = item.get("call_id")
+            raw_item_id = item.get("id")
+            if (
+                raw_call_id is not None
+                and (not isinstance(raw_call_id, str) or not raw_call_id.strip())
+            ) or (
+                raw_item_id is not None
+                and (not isinstance(raw_item_id, str) or not raw_item_id.strip())
+            ):
+                invalid_tool_call_count += 1
+                continue
+            tool_name = item.get("name")
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                invalid_tool_call_count += 1
+                continue
+            raw_arguments = item.get("arguments")
+            if raw_arguments is None:
+                raw_arguments = ""
+            if not isinstance(raw_arguments, str):
+                invalid_tool_call_count += 1
+                continue
+            try:
+                arguments = (
+                    json.loads(
+                        raw_arguments,
+                        parse_constant=lambda value: (_ for _ in ()).throw(
+                            ValueError(value)
+                        ),
+                    )
+                    if raw_arguments.strip()
+                    else {}
                 )
+            except (
+                json.JSONDecodeError,
+                RecursionError,
+                TypeError,
+                ValueError,
+            ):
+                invalid_tool_call_count += 1
+                continue
+            if not isinstance(arguments, dict):
+                invalid_tool_call_count += 1
+                continue
+            try:
+                json.dumps(arguments, allow_nan=False)
+            except (RecursionError, TypeError, ValueError):
+                invalid_tool_call_count += 1
+                continue
+            call_id = raw_call_id or raw_item_id or f"call_{uuid4().hex[:12]}"
+            key = raw_item_id or call_id
+            parsed_tool_arguments[item_index] = (
+                call_id,
+                key,
+                tool_name,
+                raw_arguments,
+                arguments,
+            )
 
         if invalid_output_shape:
             message = "OpenAI Responses API response has malformed output items"
@@ -649,10 +736,27 @@ class OpenAIResponsesProvider:
             )
             yield ErrorEvent(message=message, code="incomplete_tool_call")
             return
-        elif emitted_tool:
+        elif emitted_tool or (
+            candidate_artifact is not None and candidate_artifact.has_calls
+        ):
             stop_reason = "tool_use"
         else:
             stop_reason = "end_turn"
+        if candidate_artifact is not None and candidate_artifact.has_calls:
+            artifact_text = candidate_artifact.render_text()
+            if artifact_text:
+                assistant_text_parts.append(artifact_text)
+                yield TextDeltaEvent(text=artifact_text)
+            log.info(
+                "provider.candidate_artifact",
+                provider=self.provider_name,
+                model=self._model,
+                call_count=candidate_artifact.call_count,
+                event_count=candidate_artifact.event_count,
+                char_count=candidate_artifact.char_count,
+                issue_codes=list(candidate_artifact.issue_codes),
+                truncated=False,
+            )
         trace.record_response(
             response=data,
             usage={

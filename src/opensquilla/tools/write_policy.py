@@ -4,11 +4,78 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
 
 from opensquilla.tools.types import SafeToolError, ToolContext, current_tool_context
+
+# Env levers in the workspace-write-deny family. Values are read at dispatch
+# time (tools layer, no AgentConfig field); validate_workspace_write_deny_env
+# gives deployments a strict bootstrap-time check so a typo fails the run at
+# startup instead of silently disabling enforcement.
+_WRITE_DENY_EFFECT_ENV = "OPENSQUILLA_WORKSPACE_WRITE_DENY_EFFECT"
+_WRITE_DENY_EFFECT_MODES = ("off", "warn", "revert")
+_WRITE_DENY_TRACKED_ONLY_ENV = "OPENSQUILLA_WORKSPACE_WRITE_DENY_TRACKED_ONLY"
+_WRITE_DENY_SYMLINK_GUARD_ENV = "OPENSQUILLA_WORKSPACE_WRITE_DENY_SYMLINK_GUARD"
+_WRITE_DENY_BOOL_ENVS = (
+    _WRITE_DENY_TRACKED_ONLY_ENV,
+    _WRITE_DENY_SYMLINK_GUARD_ENV,
+    "OPENSQUILLA_WORKSPACE_WRITE_DENY_HOST_SHELL",
+    "OPENSQUILLA_WORKSPACE_WRITE_DENY_COMMAND_TARGETS",
+    "OPENSQUILLA_WORKSPACE_WRITE_DENY_INTERPRETER_TARGETS",
+)
+_WRITE_DENY_TRUE_VALUES = frozenset({"1", "true", "yes", "on", "enabled"})
+_WRITE_DENY_FALSE_VALUES = frozenset({"", "0", "false", "no", "off", "disabled"})
+
+
+def workspace_write_deny_effect_mode() -> str:
+    """Post-execution effect enforcement mode: off (default), warn, or revert.
+
+    Dispatch-time reads fail safe (unrecognized -> off); strict rejection of
+    unrecognized values happens once at bootstrap via
+    validate_workspace_write_deny_env.
+    """
+
+    raw = os.environ.get(_WRITE_DENY_EFFECT_ENV, "").strip().lower()
+    if raw in _WRITE_DENY_EFFECT_MODES:
+        return raw
+    return "off"
+
+
+def workspace_write_deny_tracked_only() -> bool:
+    raw = os.environ.get(_WRITE_DENY_TRACKED_ONLY_ENV, "").strip().lower()
+    return raw in _WRITE_DENY_TRUE_VALUES
+
+
+def workspace_write_deny_symlink_guard() -> bool:
+    raw = os.environ.get(_WRITE_DENY_SYMLINK_GUARD_ENV, "").strip().lower()
+    return raw in _WRITE_DENY_TRUE_VALUES
+
+
+def validate_workspace_write_deny_env() -> None:
+    """Strictly validate the write-deny env lever family; raise on typos.
+
+    Called from engine bootstrap so an unrecognized value stops the run at
+    startup. The tools layer itself stays lenient (fail-safe to off) because
+    it can run outside the engine.
+    """
+
+    raw = os.environ.get(_WRITE_DENY_EFFECT_ENV, "").strip().lower()
+    if raw and raw not in _WRITE_DENY_EFFECT_MODES:
+        raise ValueError(
+            f"{_WRITE_DENY_EFFECT_ENV} must be one of "
+            f"{', '.join(_WRITE_DENY_EFFECT_MODES)}; got {raw!r}"
+        )
+    for name in _WRITE_DENY_BOOL_ENVS:
+        value = os.environ.get(name, "").strip().lower()
+        if value not in _WRITE_DENY_TRUE_VALUES | _WRITE_DENY_FALSE_VALUES:
+            raise ValueError(
+                f"{name} must be a boolean flag "
+                f"(one of {sorted(_WRITE_DENY_TRUE_VALUES | _WRITE_DENY_FALSE_VALUES)}); "
+                f"got {value!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -105,12 +172,21 @@ def match_workspace_write_deny(
         return None
     resolved = path.expanduser().resolve(strict=False)
     workspace = workspace if workspace is not None else _workspace_root(ctx)
+    original = original_path if original_path is not None else str(path)
     if workspace is not None:
         try:
             resolved.relative_to(workspace)
         except ValueError:
-            return None
-    original = original_path if original_path is not None else str(path)
+            # A workspace-internal spelling can resolve outside the workspace
+            # when a path component is a symlink. The symlink guard keeps
+            # matching against the lexical (non-resolved) view so a protected
+            # name cannot be dodged by routing the write through a link.
+            if not workspace_write_deny_symlink_guard():
+                return None
+            lexical = _lexical_workspace_path(original, workspace)
+            if lexical is None:
+                return None
+            resolved = lexical
     candidates = _candidate_strings(resolved, original, workspace, as_directory=as_directory)
 
     for pattern in patterns:
@@ -120,12 +196,88 @@ def match_workspace_write_deny(
             if fnmatchcase(normalized_candidate, normalized_pattern) or fnmatchcase(
                 f"/{normalized_candidate}", normalized_pattern
             ):
+                if (
+                    workspace is not None
+                    and workspace_write_deny_tracked_only()
+                    and not _workspace_path_is_git_tracked(
+                        resolved, workspace, as_directory=as_directory
+                    )
+                ):
+                    # Tracked-only mode: deny globs protect files under
+                    # version control; files the agent created itself stay
+                    # writable. Tracked-ness is a property of the path, so
+                    # one untracked verdict settles every pattern.
+                    return None
                 return WorkspaceWriteDenyMatch(
                     pattern=pattern,
                     path=original,
                     resolved_path=str(resolved),
                 )
     return None
+
+
+def _lexical_workspace_path(original: str, workspace: Path) -> Path | None:
+    """Lexical (symlink-free) workspace view of a path spelling, or None.
+
+    normpath collapses ``..`` without resolving symlinks, so ``tests/link``
+    keeps its workspace spelling even when the link target lives elsewhere.
+    Relative spellings are joined against the workspace root, which matches
+    how the shell and filesystem tools run in practice.
+    """
+
+    raw = os.path.expanduser(original.replace("\\", "/"))
+    if not os.path.isabs(raw):
+        raw = os.path.join(str(workspace), raw)
+    lexical = Path(os.path.normpath(raw))
+    try:
+        lexical.relative_to(workspace)
+    except ValueError:
+        return None
+    return lexical
+
+
+def _workspace_path_is_git_tracked(
+    resolved: Path, workspace: Path, *, as_directory: bool = False
+) -> bool:
+    """Whether git tracks the path; lookup failures fail closed (tracked).
+
+    Tracked-only mode narrows deny enforcement to files under version
+    control, so anything other than an authoritative "untracked" answer from
+    git must not widen the allow set.
+    """
+
+    try:
+        relative = resolved.relative_to(workspace).as_posix()
+    except ValueError:
+        return True
+    if not relative or relative == ".":
+        return True
+    try:
+        if as_directory:
+            completed = subprocess.run(
+                ["git", "ls-files", "--", f"{relative}/"],
+                cwd=str(workspace),
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if completed.returncode != 0:
+                return True
+            return bool(completed.stdout.strip())
+        completed = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--", relative],
+            cwd=str(workspace),
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True
+    if completed.returncode == 0:
+        return True
+    # --error-unmatch exits 1 for a valid repo with no matching tracked file;
+    # any other status (e.g. 128 outside a repo) is a lookup failure.
+    return completed.returncode != 1
 
 
 def match_workspace_scratch_artifact(
@@ -216,7 +368,11 @@ def gate_workspace_scratch_artifact(
     )
     if match is None:
         return
-    raise SafeToolError(str(workspace_scratch_artifact_block(tool_name, match)["message"]))
+    # The mark lets opensquilla.tools.envelope apply the policy-deny
+    # user_message cap override to this error; str(error) is unaffected.
+    error = SafeToolError(str(workspace_scratch_artifact_block(tool_name, match)["message"]))
+    error.policy_gate_denial = True
+    raise error
 
 
 def workspace_write_deny_block(
@@ -226,6 +382,7 @@ def workspace_write_deny_block(
     command: str | None = None,
 ) -> dict[str, object]:
     guidance = _deny_retry_guidance()
+    guidance += _verify_mirror_guidance(match)
     payload: dict[str, object] = {
         "status": "blocked",
         "reason": "workspace_write_deny",
@@ -255,7 +412,9 @@ def gate_workspace_write_deny(
     match = match_workspace_write_deny(path, original_path=original_path, workspace=workspace)
     if match is None:
         return
-    raise SafeToolError(str(workspace_write_deny_block(tool_name, match)["message"]))
+    error = SafeToolError(str(workspace_write_deny_block(tool_name, match)["message"]))
+    error.policy_gate_denial = True
+    raise error
 
 
 def _deny_retry_guidance(ctx: ToolContext | None = None) -> str:
@@ -278,4 +437,51 @@ def _scratch_retry_guidance(ctx: ToolContext | None = None) -> str:
     return (
         " Temporary reproduction, debug, verification, or candidate-patch files "
         f"must be written under the configured scratch directory instead: {scratch_dir}."
+    )
+
+
+def verify_mirror_path(
+    match_path: str, resolved_path: str, ctx: ToolContext | None = None
+) -> str | None:
+    """Writable mirror path for a deny-blocked workspace file, or None.
+
+    Mirrors live under ``<scratch_dir>/verify-mirror/<workspace-relative-path>``
+    so a denied in-package test edit can still be exercised in scratch. Only
+    resolvable when a scratch directory and a workspace root are both
+    configured and the target sits inside the workspace.
+    """
+
+    active = ctx if ctx is not None else current_tool_context.get()
+    scratch_dir = getattr(active, "scratch_dir", None) if active is not None else None
+    if not scratch_dir:
+        return None
+    workspace = _workspace_root(active)
+    if workspace is None:
+        return None
+    try:
+        relative = (
+            Path(resolved_path).expanduser().resolve(strict=False).relative_to(workspace)
+        ).as_posix()
+    except ValueError:
+        return None
+    if not relative:
+        return None
+    scratch = Path(scratch_dir).expanduser().resolve(strict=False)
+    return (scratch / "verify-mirror" / relative).as_posix()
+
+
+def _verify_mirror_guidance(
+    match: WorkspaceWriteDenyMatch, ctx: ToolContext | None = None
+) -> str:
+    active = ctx if ctx is not None else current_tool_context.get()
+    if active is None or not getattr(active, "scratch_verify_mirror_active", False):
+        return ""
+    mirror = verify_mirror_path(match.path, match.resolved_path, active)
+    if not mirror:
+        return ""
+    return (
+        f" To exercise this file's checks without modifying it, copy it to the "
+        f"writable mirror {mirror} first, keep the mirror copy identical to the "
+        "workspace original, and add any new checks as separate files under the "
+        "same verify-mirror directory."
     )

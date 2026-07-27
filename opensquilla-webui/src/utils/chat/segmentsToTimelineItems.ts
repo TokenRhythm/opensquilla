@@ -23,7 +23,12 @@ export function segmentsToTimelineItems(
   return segments.flatMap((seg, idx): ChatStreamTimelineItem[] => {
     if (seg.type === 'text') {
       if (!seg.raw && !seg.html) return []
-      return [{ type: 'text', key: `text-${idx}`, html: seg.html || '' }]
+      return [{
+        type: 'text',
+        key: `text-${idx}`,
+        html: seg.html || '',
+        rawText: seg.raw || '',
+      }]
     }
     const group = seg.groupId ? groupsById.get(seg.groupId) : null
     return group ? [{ type: 'tool-group', key: seg.groupId || `tool-${idx}`, group }] : []

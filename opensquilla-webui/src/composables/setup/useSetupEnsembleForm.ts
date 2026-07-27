@@ -110,7 +110,7 @@ const DEFAULT_ALL_FAILED_POLICY = 'fallback_single'
 const STATIC_B5_EFFECTIVE_QUORUM = 3
 const STATIC_B5_PROPOSER_TIMEOUT_SECONDS = 300
 const STATIC_B5_AGGREGATOR_TIMEOUT_SECONDS = 480
-const STATIC_B5_QUORUM_GRACE_SECONDS = 5
+const STATIC_B5_QUORUM_GRACE_SECONDS = 10
 // The gateway builder substitutes the static-B5 timeout defaults above ONLY
 // when the stored value still equals this legacy default; an explicit
 // operator override (e.g. proposer_timeout_seconds = 600 in TOML) runs as

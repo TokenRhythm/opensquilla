@@ -459,9 +459,12 @@ jobs:
             exit "${status}"
           }
 
-          # OSS ignores x-oss-forbid-overwrite when bucket versioning is enabled
-          # or suspended. Query the bucket through its standard regional
-          # endpoint and fail closed before relying on conditional writes.
+          # Version-scoped immutability is enforced by the existence check plus
+          # SHA256 verification in upload_immutable_asset; x-oss-forbid-overwrite
+          # only narrows the check-to-write race and is ignored by OSS while
+          # bucket versioning is enabled or suspended. Query and log the
+          # versioning state so every mirror run records which regime it ran
+          # under.
           versioning_endpoint="oss-${OSS_REGION}.aliyuncs.com"
           ossutil api get-bucket-versioning \
             --addressing-style virtual \
@@ -475,11 +478,33 @@ jobs:
 
           path = Path("channel-assets/bucket-versioning.json")
           try:
-              payload = json.loads(path.read_text(encoding="utf-8"))
-          except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+              raw = path.read_text(encoding="utf-8")
+          except (OSError, UnicodeError) as exc:
               raise SystemExit(f"Unable to verify OSS bucket versioning state: {exc}") from exc
-          if not isinstance(payload, dict):
-              raise SystemExit("OSS bucket versioning response must be a JSON object")
+
+          # ossutil emits the JSON body followed by extra output (for example an
+          # elapsed-time trailer or additional metadata documents). Parse every
+          # leading JSON document and fail closed only when none can be parsed.
+          decoder = json.JSONDecoder()
+          documents = []
+          index = 0
+          while index < len(raw):
+              while index < len(raw) and raw[index].isspace():
+                  index += 1
+              if index >= len(raw):
+                  break
+              try:
+                  document, index = decoder.raw_decode(raw, index)
+              except json.JSONDecodeError:
+                  break
+              documents.append(document)
+
+          if not documents:
+              snippet = " ".join(raw.split())[:300]
+              raise SystemExit(
+                  "Unable to verify OSS bucket versioning state: no JSON document "
+                  f"in ossutil output: {snippet!r}"
+              )
 
           def statuses(value):
               if isinstance(value, dict):
@@ -491,12 +516,25 @@ jobs:
                   for nested in value:
                       yield from statuses(nested)
 
-          reported = [value for value in statuses(payload) if value not in (None, "")]
+          # Only real versioning states matter here. Response envelopes may
+          # carry unrelated "status" fields (HTTP codes), so match the two
+          # states the OSS API can report for a versioned bucket.
+          reported = [
+              value
+              for document in documents
+              for value in statuses(document)
+              if isinstance(value, str) and value.casefold() in ("enabled", "suspended")
+          ]
           if reported:
-              raise SystemExit(
-                  "OSS release mirror bucket must be unversioned; reported Status: "
+              print(
+                  "OSS bucket versioning is "
                   + ", ".join(repr(value) for value in reported)
+                  + "; x-oss-forbid-overwrite is advisory there. Version-scoped "
+                  "immutability remains enforced by the existence check plus "
+                  "SHA256 verification before every upload."
               )
+          else:
+              print("OSS bucket versioning is not configured.")
           PY
           trap rollback_promotions EXIT
 

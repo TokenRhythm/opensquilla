@@ -22,6 +22,8 @@ export type {
   ArtifactNativeOpenResult,
   ArtifactOpenRequest,
   CliInvocation,
+  DesktopMainWindowCloseBehavior,
+  DesktopPreferences,
   DesktopSettings,
   DesktopSettingsPayload,
   DesktopUpdateState,

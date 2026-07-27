@@ -107,6 +107,33 @@ test.describe('Console clarity', () => {
     }
   })
 
+  test('Channels aligns its refresh action with the hub tabs only on desktop', async ({ page }) => {
+    for (const scenario of [
+      { width: 900, height: 800, inline: true },
+      { width: 390, height: 844, inline: false },
+    ]) {
+      await page.setViewportSize({ width: scenario.width, height: scenario.height })
+      await openControl(page, 'channels')
+
+      const tabs = await page.locator('.route-hub__tabs').boundingBox()
+      const actions = await page.locator('.ch-stage__actions').boundingBox()
+      expect(tabs).not.toBeNull()
+      expect(actions).not.toBeNull()
+
+      if (scenario.inline) {
+        const tabsCenter = tabs!.y + tabs!.height / 2
+        const actionsCenter = actions!.y + actions!.height / 2
+        expect(Math.abs(tabsCenter - actionsCenter)).toBeLessThanOrEqual(2)
+      } else {
+        expect(actions!.y).toBeGreaterThanOrEqual(tabs!.y + tabs!.height)
+      }
+
+      const overflow = await page.evaluate(() =>
+        document.documentElement.scrollWidth - document.documentElement.clientWidth)
+      expect(overflow).toBeLessThanOrEqual(0)
+    }
+  })
+
   test('Status impact count jumps to the inline readiness report', async ({ page }) => {
     await openControl(page, 'overview')
 

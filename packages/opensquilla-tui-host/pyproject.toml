@@ -1,6 +1,6 @@
 [project]
 name = "opensquilla-tui-host"
-version = "0.5.0rc4"
+version = "0.5.0"
 description = "Self-contained OpenTUI companion host for OpenSquilla"
 license = "Apache-2.0"
 requires-python = ">=3.12"

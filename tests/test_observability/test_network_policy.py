@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from opensquilla.gateway.config import GatewayConfig, PrivacyConfig
-from opensquilla.observability.network_policy import network_observability_disabled
+from opensquilla.observability.network_policy import (
+    network_observability_disabled,
+    provider_request_correlation_disabled,
+)
 
 GLOBAL_DISABLE_ENV = "OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY"
 TELEMETRY_DISABLED_ENV = "OPENSQUILLA_TELEMETRY_DISABLED"
@@ -47,6 +50,37 @@ def test_legacy_update_check_env_disables_network_observability() -> None:
     )
 
 
+def test_provider_correlation_ignores_legacy_network_disable_envs() -> None:
+    assert (
+        provider_request_correlation_disabled(
+            env={
+                TELEMETRY_DISABLED_ENV: "true",
+                UPDATE_CHECK_DISABLED_ENV: "true",
+            },
+        )
+        is False
+    )
+
+
+def test_provider_correlation_honors_dedicated_env() -> None:
+    assert (
+        provider_request_correlation_disabled(
+            env={GLOBAL_DISABLE_ENV: "yes"},
+        )
+        is True
+    )
+
+
+def test_provider_correlation_honors_config_without_base_settings() -> None:
+    class _Privacy:
+        disable_network_observability = "on"
+
+    class _Config:
+        privacy = _Privacy()
+
+    assert provider_request_correlation_disabled(config=_Config(), env={}) is True
+
+
 def test_false_env_does_not_override_config_disable() -> None:
     config = GatewayConfig(
         privacy=PrivacyConfig(disable_network_observability=True),
@@ -65,10 +99,24 @@ def test_false_env_does_not_override_config_disable() -> None:
     )
 
 
-def test_gateway_public_config_exposes_effective_legacy_disable(
+def test_gateway_public_config_does_not_expose_legacy_disable_as_unified(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv(UPDATE_CHECK_DISABLED_ENV, "1")
+    config = GatewayConfig(
+        privacy=PrivacyConfig(disable_network_observability=False),
+    )
+
+    public = config.to_public_dict()
+
+    assert public["privacy"]["disable_network_observability"] is False
+    assert public["privacy"]["network_observability_disabled_effective"] is False
+
+
+def test_gateway_public_config_exposes_effective_dedicated_privacy_env(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(GLOBAL_DISABLE_ENV, "1")
     config = GatewayConfig(
         privacy=PrivacyConfig(disable_network_observability=False),
     )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, cast
 from urllib.parse import quote
+from uuid import uuid4
 
 import structlog
 
@@ -14,7 +15,12 @@ from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.context_overflow import apply_context_overflow_policy
 from opensquilla.gateway.rpc import RpcContext, RpcUnavailableError, get_dispatcher
 from opensquilla.gateway.session_services import get_session_lock
+from opensquilla.observability.network_policy import (
+    provider_request_correlation_disabled,
+)
+from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.session.compaction import build_compaction_config_from_provider
+from opensquilla.session.compaction_lifecycle import new_compaction_id
 from opensquilla.session.keys import build_webchat_key, canonicalize_session_key, parse_agent_id
 
 _d = get_dispatcher()
@@ -378,6 +384,21 @@ async def _enforce_context_overflow(
         session_key,
         run_kind="session_compaction",
     )
+    root_operation_id = new_compaction_id()
+    provider_request_correlation = None
+    if not provider_request_correlation_disabled(config=config):
+        try:
+            session = await ctx.session_manager.get_session(session_key)
+        except Exception:  # noqa: BLE001 - observability is best-effort
+            session = None
+        durable_session_id = getattr(session, "session_id", None)
+        if isinstance(durable_session_id, str) and durable_session_id:
+            provider_request_correlation = ProviderRequestCorrelation(
+                session_id=durable_session_id,
+                turn_id=root_operation_id,
+                execution_id=uuid4().hex,
+                call_kind="auxiliary.compaction",
+            )
     with bind_usage_accounting_scope(usage_scope):
         outcome = await apply_context_overflow_policy(
             config=config,
@@ -392,6 +413,8 @@ async def _enforce_context_overflow(
             compaction_marker=getattr(ctx, "turn_runner", None),
             policy_override=policy_override,
             budget_override=budget_override,
+            provider_request_correlation=provider_request_correlation,
+            root_operation_id=root_operation_id,
         )
 
     if outcome.refusal is not None:

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import structlog
@@ -35,7 +35,13 @@ from opensquilla.provider.protocol import (
     configured_provider_id,
     provider_connection_config,
 )
+from opensquilla.provider.tokenrhythm_correlation import (
+    tokenrhythm_correlation_headers,
+)
 from opensquilla.router_tiers import DEFAULT_TEXT_TIER, normalize_text_tier
+
+if TYPE_CHECKING:
+    from opensquilla.provider.types import ProviderRequestCorrelation
 
 log = structlog.get_logger(__name__)
 
@@ -272,6 +278,7 @@ async def call_naming_llm(
     max_chars: int = 48,
     language: str = "auto",
     provider: str = "",
+    provider_request_correlation: ProviderRequestCorrelation | None = None,
 ) -> str | None:
     """Summarize ``first_message`` into a short title. Returns ``None`` on failure."""
 
@@ -303,6 +310,13 @@ async def call_naming_llm(
         "Content-Type": "application/json",
     }
     headers.update(provider_app_headers(url))
+    headers.update(
+        tokenrhythm_correlation_headers(
+            provider,
+            url,
+            provider_request_correlation,
+        )
+    )
 
     # Keep this import local: engine types import session lifecycle helpers
     # while the session package initializes this module.
@@ -316,7 +330,11 @@ async def call_naming_llm(
     )
 
     try:
-        async with httpx.AsyncClient(timeout=timeout, trust_env=_trust_env()) as client:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            trust_env=_trust_env(),
+            follow_redirects=False,
+        ) as client:
             resp = await client.post(url, json=payload, headers=headers)
             resp.raise_for_status()
             data = resp.json()
@@ -340,6 +358,8 @@ async def generate_session_title(
     ctx: Any,
     session_key: str,
     first_message: str,
+    *,
+    provider_request_correlation: ProviderRequestCorrelation | None = None,
 ) -> None:
     """Background entry point: generate + persist a title, then refresh the UI.
 
@@ -392,6 +412,11 @@ async def generate_session_title(
             run_kind="session_naming",
         )
         with bind_usage_accounting_scope(usage_scope):
+            correlation_kwargs: dict[str, Any] = {}
+            if provider_request_correlation is not None:
+                correlation_kwargs["provider_request_correlation"] = (
+                    provider_request_correlation
+                )
             title = await call_naming_llm(
                 first_message,
                 model=target.model,
@@ -401,6 +426,7 @@ async def generate_session_title(
                 max_chars=int(getattr(naming_cfg, "max_chars", 48)),
                 language=str(getattr(naming_cfg, "language", "auto")),
                 provider=target.provider,
+                **correlation_kwargs,
             )
         if not title:
             return

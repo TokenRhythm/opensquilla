@@ -2361,23 +2361,75 @@ async def test_meta_orchestrator_repairs_chinese_leakage_in_english_final_text()
 
 @pytest.mark.asyncio
 async def test_make_llm_chat_from_provider_uses_deliverable_sized_token_budget() -> None:
-    from opensquilla.provider.types import TextDeltaEvent as ProviderTextDelta
+    from opensquilla.provider.types import (
+        ProviderRequestCorrelation,
+    )
+    from opensquilla.provider.types import (
+        TextDeltaEvent as ProviderTextDelta,
+    )
 
-    captured: dict[str, int | None] = {}
+    captured: dict[str, object] = {}
 
     class FakeProvider:
         async def chat(self, _messages, *, tools, config):
             assert tools is None
             captured["max_tokens"] = config.max_tokens
+            captured["correlation"] = config.provider_request_correlation
             yield ProviderTextDelta(text="ok")
 
+    root = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="meta-execution",
+        call_kind="auxiliary.meta",
+    )
     llm_chat = make_llm_chat_from_provider(
         provider=FakeProvider(),
         base_config=AgentConfig(model_id="fake"),
+        provider_request_correlation=root,
     )
 
     assert await llm_chat("system", "user") == "ok"
     assert captured["max_tokens"] == 16384
+    assert captured["correlation"] == root
+
+
+@pytest.mark.asyncio
+async def test_make_llm_chat_from_provider_derives_context_correlation() -> None:
+    from opensquilla.provider.correlation_context import bind_provider_request_correlation
+    from opensquilla.provider.types import (
+        ProviderRequestCorrelation,
+    )
+    from opensquilla.provider.types import (
+        TextDeltaEvent as ProviderTextDelta,
+    )
+
+    captured: dict[str, object] = {}
+
+    class FakeProvider:
+        async def chat(self, _messages, *, tools, config):
+            captured["correlation"] = config.provider_request_correlation
+            yield ProviderTextDelta(text="ok")
+
+    root = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="root-execution",
+        call_kind="agent.chat",
+    )
+    with bind_provider_request_correlation(root):
+        llm_chat = make_llm_chat_from_provider(
+            provider=FakeProvider(),
+            base_config=AgentConfig(model_id="fake"),
+        )
+        assert await llm_chat("system", "user") == "ok"
+
+    correlation = captured["correlation"]
+    assert isinstance(correlation, ProviderRequestCorrelation)
+    assert correlation.session_id == root.session_id
+    assert correlation.turn_id == root.turn_id
+    assert correlation.execution_id != root.execution_id
+    assert correlation.call_kind == "auxiliary.meta"
 
 
 @pytest.mark.asyncio

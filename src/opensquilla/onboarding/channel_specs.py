@@ -254,9 +254,10 @@ def _feishu_spec() -> ChannelSetupSpec:
         help=(
             "Default websocket mode only needs App id and App secret. "
             "Webhook verification fields are only needed when connection_mode=webhook. "
-            "Websocket order: save the channel first so the connection is live, then "
-            "enable long-connection event delivery in the Feishu console — it only "
-            "persists that choice while a client is connected."
+            "After the channel reports an open websocket connection, check Event & "
+            "Callbacks in the Feishu console and confirm long-connection event delivery "
+            "if expected events do not arrive. A zero ingress count alone does not prove "
+            "the console is misconfigured."
         ),
         fields=(
             *_common_fields(),
@@ -268,9 +269,8 @@ def _feishu_spec() -> ChannelSetupSpec:
             # Folded: websocket is the default and right for almost everyone;
             # switching to webhook happens inside Advanced, where the mode
             # select is declared FIRST so the webhook fields it reveals appear
-            # below it. The websocket save-order guidance lives post-save (the
-            # channel page's final-step callout) plus the spec help above for
-            # headless clients.
+            # below it. Websocket subscription guidance lives post-save on the
+            # channel page plus in the spec help above for headless clients.
             ChannelSetupField("connection_mode", "Connection mode", "select",
                               required=False, default="websocket",
                               choices=("webhook", "websocket"),

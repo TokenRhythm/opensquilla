@@ -19,6 +19,7 @@ from opensquilla.provider.types import (
     DoneEvent,
     Message,
     ModelInfo,
+    ProviderRequestCorrelation,
     StreamEvent,
     TextDeltaEvent,
     ToolDefinition,
@@ -219,6 +220,12 @@ async def test_gate_prefers_dedicated_gate_chat_over_primary_provider() -> None:
             "router_vision_followup_gate_model": "deepseek/deepseek-v4-flash",
         },
     )
+    ctx.provider_request_correlation = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="root-execution",
+        call_kind="agent.chat",
+    )
 
     out = await apply_vision_followup_gate(ctx)
 
@@ -226,6 +233,11 @@ async def test_gate_prefers_dedicated_gate_chat_over_primary_provider() -> None:
     assert out.metadata["router_vision_followup_gate_source"] == "llm"
     assert out.metadata["router_vision_followup_gate_model"] == "deepseek/deepseek-v4-flash"
     assert gate_chat.calls
+    correlation = gate_chat.calls[0]["config"].provider_request_correlation
+    assert correlation.session_id == "session-1"
+    assert correlation.turn_id == "turn-1"
+    assert correlation.execution_id != "root-execution"
+    assert correlation.call_kind == "auxiliary.vision_gate"
 
 
 @pytest.mark.asyncio

@@ -6,6 +6,10 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any
 
+from opensquilla.channels.admission import (
+    CHANNEL_ADMIN_VERIFIED_METADATA_KEY,
+    has_verified_channel_admin_stamp,
+)
 from opensquilla.channels.types import IncomingMessage
 from opensquilla.sandbox.run_context import (
     normalize_scope,
@@ -112,6 +116,11 @@ def build_channel_route_envelope(
 ) -> RouteEnvelope:
     """Build a route for a normalized inbound channel message."""
     metadata = dict(msg.metadata or {})
+    # Channel adapters provide transport metadata, not authorization claims.
+    # ``channel_dispatch`` stamps this after authenticating the sender against
+    # the configured channel-admin mapping.
+    metadata.pop("principal_is_owner", None)
+    metadata.pop(CHANNEL_ADMIN_VERIFIED_METADATA_KEY, None)
     metadata.setdefault("run_mode", RunMode.TRUSTED.value)
     resolved_agent_id = _agent_id(agent_id, session_key)
     resolved_channel_type = channel_type or session_prefix
@@ -420,19 +429,6 @@ def delivery_fields_from_envelope(envelope: RouteEnvelope) -> dict[str, Any]:
     }
 
 
-def _channel_run_mode_explicitly_chosen(envelope: RouteEnvelope) -> bool:
-    """True when a channel turn carries an explicit per-session run-mode choice.
-
-    Every channel envelope carries a ``run_mode`` in metadata —
-    ``build_channel_route_envelope`` seeds the Managed-Execution default — so the
-    raw string cannot distinguish "defaulted trusted" from an explicit
-    ``/sandbox trusted``. ``_apply_run_context_route_metadata`` marks a genuine
-    per-session sandbox choice with ``run_mode_explicit``; only that overrides
-    the channel-admin host-access default.
-    """
-    return bool(envelope.metadata.get("run_mode_explicit"))
-
-
 def _filtered_legacy_sandbox_mounts(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
@@ -456,6 +452,17 @@ def tool_context_from_envelope(
 ) -> ToolContext:
     """Build the runtime ToolContext from the canonical route envelope."""
     caller_kind = _caller_kind(envelope.source_kind)
+    channel_admin_verified = (
+        caller_kind is CallerKind.CHANNEL
+        and is_owner
+        and has_verified_channel_admin_stamp(envelope)
+    )
+    if caller_kind is CallerKind.CHANNEL:
+        # A Channel caller can gain owner capabilities only through the
+        # authenticated ingress stamp.  Do this before profile and run-mode
+        # resolution so a generic ``is_owner=True`` cannot widen a Channel
+        # context if a future caller forgets the ingress boundary.
+        is_owner = channel_admin_verified
     allowed_tools: set[str] | None = None
     denied_tools: set[str] = set()
     interaction_mode = _interaction_mode(envelope.interaction_mode)
@@ -490,20 +497,6 @@ def tool_context_from_envelope(
         run_mode = RunMode.FULL
     else:
         run_mode = None
-    if (
-        caller_kind is CallerKind.CHANNEL
-        and is_owner
-        and run_mode == RunMode.TRUSTED
-        and not _channel_run_mode_explicitly_chosen(envelope)
-    ):
-        # Channel admins get Full Host Access by default: host execution with
-        # no approval cards, identical to an explicit /sandbox full. This is a
-        # deliberate trust grant — a channel admin can run arbitrary host
-        # commands and read or write any path, so mark only trusted senders as
-        # channel admins. A per-session /sandbox choice (surfaced as
-        # run_mode_explicit) still wins; only the default Managed-Execution run
-        # mode is upgraded. Non-admin channel callers stay in the sandbox.
-        run_mode = RunMode.FULL
     if run_mode == RunMode.FULL and is_owner:
         elevated = "full"
     elif legacy_elevated in ("on", "bypass") and is_owner:
@@ -530,6 +523,7 @@ def tool_context_from_envelope(
         )
     ctx = ToolContext(
         is_owner=is_owner,
+        channel_admin_verified=channel_admin_verified,
         caller_kind=caller_kind,
         interaction_mode=interaction_mode,
         subagent_depth=int(envelope.metadata.get("spawn_depth") or 0),

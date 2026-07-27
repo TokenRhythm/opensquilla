@@ -191,16 +191,23 @@ not a public configuration field:
 | `proposer_timeout_seconds` | 3600 | 300 |
 | `aggregator_timeout_seconds` | 3600 | 480 |
 | `shuffle_candidates` | `True` | `False` |
-| `quorum_grace_seconds` | 0 (wait for every proposer) | 5 |
+| `quorum_grace_seconds` | 0 (wait for every proposer) | 10 |
 
 `min_successful_proposers` is additionally clamped down to the actual proposer
 count. Both the configured and effective values (min-success, timeouts, shuffle)
 are recorded in the selection plan for debugging.
 
 The legacy value `0` disables quorum early-exit and waits for every proposer; it
-does not mean an immediate, zero-delay cutoff. Fixed lineups instead allow five
+does not mean an immediate, zero-delay cutoff. Fixed lineups instead allow ten
 seconds after reaching quorum so a nearly complete final draft can still join
-the fusion without letting a straggler add up to 30 seconds of tail latency.
+the fusion without waiting for the full proposer timeout.
+
+Proposers never own an executable tool boundary. By default they receive no
+current tool schemas. Setting `proposer_tools = true` exposes those schemas only
+as advisory vocabulary: native or textual tool-shaped output is converted into
+bounded, untrusted candidate text. The aggregator may use that information, but
+must independently issue any real tool call through the normal registry,
+permission, approval, and sandbox checks.
 
 ## 1.4 Member provider resolution
 

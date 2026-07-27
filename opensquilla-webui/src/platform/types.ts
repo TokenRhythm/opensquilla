@@ -93,6 +93,14 @@ export interface DesktopSettingsPayload {
   disableNetworkObservability?: boolean
 }
 
+export type DesktopMainWindowCloseBehavior = 'background' | 'quit' | 'ask'
+
+export interface DesktopPreferences {
+  mainWindowCloseBehavior: DesktopMainWindowCloseBehavior
+  canRunInBackground: boolean
+  platform: 'darwin' | 'win32' | 'linux' | 'other'
+}
+
 export interface PlatformCapabilities {
   isDesktop: boolean
   ownsGateway: boolean
@@ -154,6 +162,10 @@ export interface PlatformSettingsApi {
   getDesktopSettings?: () => Promise<DesktopSettings>
   saveDesktopSettings?: (payload: DesktopSettingsPayload) => Promise<DesktopSettings>
   resetDesktopSettings?: () => Promise<{ ok: boolean }>
+  getDesktopPreferences?: () => Promise<DesktopPreferences>
+  saveDesktopPreferences?: (
+    payload: { mainWindowCloseBehavior: DesktopMainWindowCloseBehavior },
+  ) => Promise<DesktopPreferences>
 }
 
 export interface PlatformOnboardingApi {

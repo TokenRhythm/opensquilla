@@ -309,4 +309,63 @@ describe('RouterFxStrip ensemble panel', () => {
     expect(el.querySelector('[data-testid="router-ensemble-toggle"]')?.getAttribute('aria-busy')).toBe('false')
     app.unmount()
   })
+
+  it('shows a quorum-cancelled candidate as a neutral skipped row', async () => {
+    const { app, el } = await mountStrip(ensembleStrip({
+      routerSettled: true,
+      ensemble: {
+        profile: 'llm_ensemble',
+        modelCount: 1,
+        totalCandidates: 1,
+        requestCount: 2,
+        fallbackUsed: false,
+        fallbackReason: '',
+        costUsd: 0,
+        savedUsd: 0,
+        savedPct: 0,
+        models: [
+          {
+            role: 'critic',
+            label: 'critic',
+            provider: 'openrouter',
+            model: 'z-ai/glm-5.2',
+            modelShort: 'glm-5.2',
+            input: 0,
+            output: 0,
+            costUsd: 0,
+            status: 'skipped',
+            elapsedMs: 21_000,
+            error: 'proposer cancelled after ensemble quorum grace',
+            errorCode: 'quorum_cancelled',
+          },
+          {
+            role: 'aggregator',
+            label: 'aggregator',
+            provider: 'openrouter',
+            model: 'anthropic/claude-sonnet',
+            modelShort: 'claude-sonnet',
+            input: 200,
+            output: 40,
+            costUsd: 0,
+            status: 'done',
+            elapsedMs: 12_000,
+          },
+        ],
+      },
+    }))
+
+    el.querySelector<HTMLButtonElement>('[data-testid="router-ensemble-toggle"]')
+      ?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await nextTick()
+
+    const skipped = el.querySelector('[data-status="skipped"]')
+    expect(skipped).toBeTruthy()
+    expect(skipped?.classList.contains('router-fx-inspector__row--failed')).toBe(false)
+    expect(skipped?.classList.contains('router-fx-inspector__row--skipped')).toBe(true)
+    expect(skipped?.textContent).toContain('threshold met · skipped · 21s')
+    expect(skipped?.textContent).not.toContain('failed')
+    expect(skipped?.querySelector('.router-fx-inspector__usage')?.getAttribute('title'))
+      .toBe('The candidate threshold was already met, so waiting for this candidate was cancelled.')
+    app.unmount()
+  })
 })

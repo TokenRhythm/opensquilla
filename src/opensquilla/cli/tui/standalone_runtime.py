@@ -130,6 +130,11 @@ def standalone_slash_services_from_runtime(
         if session_manager is not None
         else None
     )
+    get_session = (
+        getattr(session_manager, "get_session", None)
+        if session_manager is not None
+        else None
+    )
     truncate_session = (
         getattr(session_manager, "truncate", None)
         if session_manager is not None
@@ -153,6 +158,11 @@ def standalone_slash_services_from_runtime(
     create_session_callable = (
         cast(_standalone_slash_adapter.StandaloneCreateSession, create_session)
         if callable(create_session)
+        else None
+    )
+    get_session_callable = (
+        cast(_standalone_slash_adapter.StandaloneGetSession, get_session)
+        if callable(get_session)
         else None
     )
     truncate_session_callable = (
@@ -184,6 +194,7 @@ def standalone_slash_services_from_runtime(
 
     return _standalone_slash_adapter.StandaloneSlashServices(
         create_session=create_session_callable,
+        get_session=get_session_callable,
         read_transcript=_read_transcript if session_manager is not None else None,
         truncate_session=truncate_session_callable,
         compact_session=compact_session_callable,

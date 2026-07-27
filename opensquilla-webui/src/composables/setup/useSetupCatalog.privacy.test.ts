@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick } from 'vue'
-import { useSetupCatalog } from './useSetupCatalog'
+import { localizeImageActionableDetail, useSetupCatalog } from './useSetupCatalog'
 import { LEGACY_OPENROUTER_MODEL_OPTIONS } from './useSetupEnsembleForm'
 import { PROVIDER_CREDENTIAL_REVEAL_TIMEOUT_MS } from './useSetupProviderForm'
 
@@ -127,7 +127,7 @@ describe('useSetupCatalog privacy settings', () => {
     app.unmount()
   })
 
-  it('shows the effective disabled state when legacy environment variables disable observability', async () => {
+  it('shows the effective disabled state when the dedicated privacy environment switch is active', async () => {
     mockConfigSequence([
       {
         privacy: {
@@ -139,7 +139,9 @@ describe('useSetupCatalog privacy settings', () => {
     const { api, app } = await mountCatalog()
 
     expect(api.privacyPanel.value.disableNetworkObservability).toBe(false)
-    expect(api.privacyPanel.value.statusText).toBe('Network observability is disabled by environment.')
+    expect(api.privacyPanel.value.statusText).toBe(
+      'Network reporting is off because an environment setting disables it.',
+    )
     expect(api.sectionDirty('privacy')).toBe(false)
     app.unmount()
   })
@@ -157,7 +159,9 @@ describe('useSetupCatalog privacy settings', () => {
 
     api.setDisableNetworkObservability(false)
 
-    expect(api.privacyPanel.value.statusText).toBe('Network observability is enabled.')
+    expect(api.privacyPanel.value.statusText).toBe(
+      'Network reporting is on.',
+    )
     expect(api.sectionDirty('privacy')).toBe(true)
     app.unmount()
   })
@@ -3819,6 +3823,95 @@ describe('useSetupCatalog providerIsLocal', () => {
     const { api, app } = await mountCatalog()
 
     expect(api.providerPanel.value.providerIsLocal).toBe(false)
+    app.unmount()
+  })
+})
+
+describe('useSetupCatalog image status localization', () => {
+  const missingEnvText = (name: string) => (
+    `Missing environment variable ${name}. Paste a key below, or set that variable and restart the gateway.`
+  )
+
+  it('localizes every known backend missing-env detail shape', () => {
+    // onboarding/status.py: _with_provider(provider, _source_detail('missing_env', key))
+    expect(localizeImageActionableDetail('openai (env key not visible: OPENAI_API_KEY)'))
+      .toBe(missingEnvText('OPENAI_API_KEY'))
+    // onboarding/status.py: bare _source_detail shape (no provider wrap)
+    expect(localizeImageActionableDetail('env key not visible: OPENROUTER_API_KEY'))
+      .toBe(missingEnvText('OPENROUTER_API_KEY'))
+    // onboarding/next_steps.py: _missing_env_warning
+    expect(localizeImageActionableDetail(
+      'Image generation provider: $GEMINI_API_KEY is not set in this shell. '
+      + 'The config saved the environment-variable reference, but this feature '
+      + 'will not work until the gateway is started with that variable set.',
+    )).toBe(missingEnvText('GEMINI_API_KEY'))
+    expect(localizeImageActionableDetail('missing environment variable IMAGE_API_KEY'))
+      .toBe(missingEnvText('IMAGE_API_KEY'))
+  })
+
+  it('passes unrecognised details through unchanged so no information is lost', () => {
+    expect(localizeImageActionableDetail('openai (unknown image provider)'))
+      .toBe('openai (unknown image provider)')
+    expect(localizeImageActionableDetail('invalid image provider/model reference'))
+      .toBe('invalid image provider/model reference')
+    expect(localizeImageActionableDetail(
+      'openai (invalid image endpoint; use an absolute http:// or https:// URL)',
+    )).toBe('openai (invalid image endpoint; use an absolute http:// or https:// URL)')
+  })
+
+  it('renders a blocking missing-env detail localized through the capabilities panel', async () => {
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return {}
+      if (method === 'onboarding.status') {
+        return {
+          hasConfig: true,
+          imageGenerationEnabled: true,
+          sectionDetails: {
+            image_generation: {
+              status: 'missing',
+              blocking: true,
+              label: 'Image generation',
+              detail: 'openai (env key not visible: OPENAI_API_KEY)',
+            },
+          },
+        }
+      }
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') return { llm: { provider: 'openrouter', model: 'openrouter/auto' } }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    expect(api.capabilitiesPanel.value.state.imageStatusText)
+      .toBe(missingEnvText('OPENAI_API_KEY'))
+    app.unmount()
+  })
+
+  it('renders an unrecognised action-required detail verbatim through the capabilities panel', async () => {
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return {}
+      if (method === 'onboarding.status') {
+        return {
+          hasConfig: true,
+          imageGenerationEnabled: true,
+          sectionDetails: {
+            image_generation: {
+              status: 'degraded',
+              actionRequired: true,
+              label: 'Image generation',
+              detail: 'openai (endpoint/provider mismatch: configured openrouter official endpoint)',
+            },
+          },
+        }
+      }
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') return { llm: { provider: 'openrouter', model: 'openrouter/auto' } }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    expect(api.capabilitiesPanel.value.state.imageStatusText)
+      .toBe('openai (endpoint/provider mismatch: configured openrouter official endpoint)')
     app.unmount()
   })
 })

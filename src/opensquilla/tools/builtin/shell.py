@@ -124,6 +124,7 @@ from opensquilla.tools.types import (
 )
 from opensquilla.tools.write_tracking import (
     classify_workspace_path,
+    enforce_workspace_write_deny_effects,
     mutation_ledger_text_hash,
     record_observed_workspace_mutations,
     snapshot_current_workspace_mutations,
@@ -150,6 +151,7 @@ _EXEC_STDIN_WRITE_CHUNK_BYTES = 64 * 1024
 _EXEC_STDIN_GUARD_CHUNK_CHARS = 64 * 1024
 _EXEC_STDIN_GUARD_OVERLAP_CHARS = 1024
 _COMMAND_AUDIT_MAX_CHARS = 4096
+_EXEC_TIMEOUT_OUTPUT_TAIL_CHARS = 20000
 _POWERSHELL_SCRIPT_PROFILE_MAX_CHARS = 128 * 1024
 _WINDOWS_ENV_CANONICAL_KEYS = {
     "COMSPEC": "ComSpec",
@@ -3050,6 +3052,22 @@ def _write_deny_lever_enabled(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in _WRITE_DENY_TRUE_ENV_VALUES
 
 
+# Screen widenings that shipped alongside effect enforcement: ln/link link
+# names, sh -c wrapper unwrapping, deno eval, and the bun/lua interpreter
+# code flags. They stay behind the effect lever so a deployment that leaves
+# OPENSQUILLA_WORKSPACE_WRITE_DENY_EFFECT unset keeps the pre-lever screen
+# surface byte-for-byte, even with the older COMMAND_TARGETS/
+# INTERPRETER_TARGETS screens enabled.
+_HARDENED_ONLY_MUTATORS = frozenset({"ln", "link"})
+_HARDENED_ONLY_INTERPRETERS = frozenset({"bun", "lua", "luajit"})
+
+
+def _write_deny_matcher_hardening_enabled() -> bool:
+    from opensquilla.tools.write_policy import workspace_write_deny_effect_mode
+
+    return workspace_write_deny_effect_mode() != "off"
+
+
 _SHORT_OPTIONS_WITH_I_RE = re.compile(r"^-[A-Za-z]*i")
 _ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _COMMAND_PREFIX_WORDS = frozenset({"command", "env", "nohup", "sudo", "time"})
@@ -3307,6 +3325,35 @@ def _git_write_targets(argv: list[str]) -> list[str]:
     return _positional_args(sub_args)
 
 
+def _ln_write_targets(argv: list[str]) -> list[str]:
+    # ln writes the link NAME (a symlink or hardlink appearing at a protected
+    # path is a mutation of that path); the link target is only read.
+    options = argv[1:]
+    targets = [
+        token.split("=", 1)[1]
+        for token in options
+        if token.startswith("--target-directory=")
+    ]
+    targets.extend(
+        options[index + 1]
+        for index, token in enumerate(options)
+        if token in ("-t", "--target-directory") and index + 1 < len(options)
+    )
+    positionals = _positional_args(
+        options,
+        value_flags=frozenset({"-t", "--target-directory", "-S", "--suffix"}),
+    )
+    if targets:
+        return targets
+    if len(positionals) >= 2:
+        return [positionals[-1]]
+    if len(positionals) == 1:
+        # `ln [-s] TARGET` creates ./<basename of TARGET> in the cwd.
+        base = positionals[0].replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        return [base] if base else []
+    return []
+
+
 _MUTATOR_WRITE_TARGET_EXTRACTORS: dict[str, Callable[[list[str]], list[str]]] = {
     "sed": _sed_write_targets,
     "gsed": _sed_write_targets,
@@ -3321,29 +3368,45 @@ _MUTATOR_WRITE_TARGET_EXTRACTORS: dict[str, Callable[[list[str]], list[str]]] = 
     "mkdir": _rm_write_targets,
     "rmdir": _rm_write_targets,
     "git": _git_write_targets,
+    "ln": _ln_write_targets,
+    "link": _ln_write_targets,
 }
 
 
-def _mutating_command_write_targets(command: str) -> list[str]:
+def _strip_command_prefix_tokens(argv: list[str]) -> list[str]:
+    while argv and (
+        _ENV_ASSIGNMENT_RE.match(argv[0])
+        or argv[0].lower() in _COMMAND_PREFIX_WORDS
+    ):
+        argv = argv[1:]
+    return argv
+
+
+def _mutating_command_write_targets(command: str, depth: int = 0) -> list[str]:
     """Best-effort write targets of common in-place file mutators.
 
     Only consulted by the workspace write deny gate when
     OPENSQUILLA_WORKSPACE_WRITE_DENY_COMMAND_TARGETS is enabled; plain
     redirection and tee targets are covered by _shell_write_targets_from_inputs
     unconditionally. Variable expansion, command substitution, and interpreter
-    one-liners are out of scope.
+    one-liners are out of scope (the latter behind
+    OPENSQUILLA_WORKSPACE_WRITE_DENY_INTERPRETER_TARGETS).
     """
 
+    hardened = _write_deny_matcher_hardening_enabled()
     targets: list[str] = []
     for segment in _mutator_command_segments(command):
-        argv = _segment_argv(segment)
-        while argv and (
-            _ENV_ASSIGNMENT_RE.match(argv[0]) or argv[0].lower() in _COMMAND_PREFIX_WORDS
-        ):
-            argv = argv[1:]
+        argv = _strip_command_prefix_tokens(_segment_argv(segment))
         if not argv:
             continue
+        if hardened and depth < _SHELL_WRAPPER_MAX_DEPTH:
+            for inner_command in _shell_wrapper_inner_commands(argv):
+                for target in _mutating_command_write_targets(inner_command, depth + 1):
+                    if target and target not in targets:
+                        targets.append(target)
         name = argv[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if not hardened and name in _HARDENED_ONLY_MUTATORS:
+            continue
         extractor = _MUTATOR_WRITE_TARGET_EXTRACTORS.get(name)
         if extractor is None:
             continue
@@ -3364,6 +3427,245 @@ def _mutating_command_write_targets_from_inputs(
     ):
         for stdin_chunk in _iter_stdin_guard_chunks(stdin):
             for target in _mutating_command_write_targets(stdin_chunk):
+                if target not in targets:
+                    targets.append(target)
+    return targets
+
+
+_INTERPRETER_CODE_FLAGS: dict[str, frozenset[str]] = {
+    "python": frozenset({"-c"}),
+    "ruby": frozenset({"-e"}),
+    "perl": frozenset({"-e", "-E"}),
+    "php": frozenset({"-r"}),
+    "node": frozenset({"-e", "--eval", "-p", "--print"}),
+    "nodejs": frozenset({"-e", "--eval", "-p", "--print"}),
+    "bun": frozenset({"-e", "--eval", "-p", "--print"}),
+    "lua": frozenset({"-e"}),
+    "luajit": frozenset({"-e"}),
+}
+
+_INTERPRETER_WRITE_MODE_CHARS = frozenset("wax+")
+
+# Literal-path write forms inside interpreter code strings. Only string
+# literals are extractable; variables and computed paths stay out of scope.
+_INTERPRETER_OPEN_CALL_RE = re.compile(
+    r"\b(?:open|fopen)\s*\(\s*(?P<pq>['\"])(?P<path>(?:(?!(?P=pq)).)+)(?P=pq)"
+    r"\s*,\s*(?:mode\s*=\s*)?(?P<mq>['\"])(?P<mode>(?:(?!(?P=mq)).)*)(?P=mq)"
+)
+_INTERPRETER_PATH_MUTATE_RE = re.compile(
+    r"\bPath\s*\(\s*(?P<pq>['\"])(?P<path>(?:(?!(?P=pq)).)+)(?P=pq)\s*\)"
+    r"\s*\.\s*(?:write_text|write_bytes|unlink|rmdir|touch|rename|replace)\s*\("
+)
+_INTERPRETER_FS_WRITE_RE = re.compile(
+    r"\b(?:writeFileSync|appendFileSync|writeFile|appendFile"
+    r"|writeTextFileSync|writeTextFile"
+    r"|unlinkSync|rmSync|rmdirSync|renameSync|truncateSync|removeSync)"
+    r"\s*\(\s*(?P<pq>['\"])(?P<path>(?:(?!(?P=pq)).)+)(?P=pq)"
+)
+_INTERPRETER_FILE_WRITE_RE = re.compile(
+    r"\b(?:(?:File|IO)\s*\.\s*(?:write|binwrite|append|delete|unlink|truncate)"
+    r"|FileUtils\s*\.\s*(?:rm_rf|rm_r|rm|remove|mv|move|touch)"
+    r"|file_put_contents"
+    r"|os\s*\.\s*(?:remove|unlink|rename|replace|truncate)"
+    r"|shutil\s*\.\s*(?:rmtree|move))"
+    r"\s*\(\s*(?P<pq>['\"])(?P<path>(?:(?!(?P=pq)).)+)(?P=pq)"
+)
+# Perl two-arg open with the mode fused into the path string: open(FH, '>f').
+_INTERPRETER_PERL_OPEN2_RE = re.compile(
+    r"\bopen\s*\([^()]*?(?P<pq>['\"])\s*>{1,2}\s*(?P<path>(?:(?!(?P=pq)).)+)(?P=pq)"
+)
+# Perl three-arg open: open(FH, '>', 'f').
+_INTERPRETER_PERL_OPEN3_RE = re.compile(
+    r"\bopen\s*\([^()]*?(?P<mq>['\"])\s*>{1,2}\s*(?P=mq)"
+    r"\s*,\s*(?P<pq>['\"])(?P<path>(?:(?!(?P=pq)).)+)(?P=pq)"
+)
+
+
+def _normalized_command_name(token: str) -> str:
+    return token.replace("\\", "/").rsplit("/", 1)[-1].lower()
+
+
+def _interpreter_code_flag_set(name: str) -> frozenset[str] | None:
+    flags = _INTERPRETER_CODE_FLAGS.get(name)
+    if flags is not None:
+        return flags
+    return _INTERPRETER_CODE_FLAGS.get(name.rstrip("0123456789."))
+
+
+def _deno_eval_code_strings(argv: list[str]) -> list[str]:
+    # deno delivers inline code via the `eval` subcommand instead of a flag.
+    if not argv or _normalized_command_name(argv[0]) != "deno":
+        return []
+    tokens = argv[1:]
+    if not tokens or tokens[0] != "eval":
+        return []
+    positionals = _positional_args(tokens[1:], value_flags=frozenset({"--ext"}))
+    return positionals[:1]
+
+
+_SHELL_WRAPPER_NAMES = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+_SHELL_WRAPPER_DASH_C_RE = re.compile(r"^-[A-Za-z]*c$")
+_SHELL_WRAPPER_MAX_DEPTH = 3
+
+
+def _shell_wrapper_inner_commands(argv: list[str]) -> list[str]:
+    """Command strings run by a `sh -c` style wrapper, if any.
+
+    Handles busybox indirection and bundled short options (`bash -lc cmd`).
+    Only the first -c operand is the command string; later positionals become
+    $0/$@ for it.
+    """
+
+    argv = _strip_command_prefix_tokens(argv)
+    if argv and _normalized_command_name(argv[0]) == "busybox":
+        argv = argv[1:]
+    if not argv or _normalized_command_name(argv[0]) not in _SHELL_WRAPPER_NAMES:
+        return []
+    tokens = argv[1:]
+    for index, token in enumerate(tokens):
+        if token == "--":
+            break
+        if _SHELL_WRAPPER_DASH_C_RE.match(token) and index + 1 < len(tokens):
+            return [tokens[index + 1]]
+    return []
+
+
+def _interpreter_code_strings(
+    argv: list[str],
+    code_flags: frozenset[str],
+) -> list[str]:
+    codes: list[str] = []
+    tokens = argv[1:]
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            break
+        if token in code_flags:
+            if index + 1 < len(tokens):
+                codes.append(tokens[index + 1])
+                index += 2
+                continue
+        elif token.startswith("-"):
+            for flag in code_flags:
+                if len(flag) == 2 and len(token) > 2 and token.startswith(flag):
+                    codes.append(token[2:])
+                    break
+                if flag.startswith("--") and token.startswith(flag + "="):
+                    codes.append(token[len(flag) + 1 :])
+                    break
+        index += 1
+    return codes
+
+
+def _interpreter_code_write_targets(code: str) -> list[str]:
+    targets: list[str] = []
+
+    def add(path: str) -> None:
+        cleaned = path.strip()
+        if (
+            cleaned
+            and not _is_special_shell_write_target(cleaned)
+            and cleaned not in targets
+        ):
+            targets.append(cleaned)
+
+    for match in _INTERPRETER_OPEN_CALL_RE.finditer(code):
+        mode = match.group("mode").lower()
+        if any(char in _INTERPRETER_WRITE_MODE_CHARS for char in mode):
+            add(match.group("path"))
+    for pattern in (
+        _INTERPRETER_PATH_MUTATE_RE,
+        _INTERPRETER_FS_WRITE_RE,
+        _INTERPRETER_FILE_WRITE_RE,
+        _INTERPRETER_PERL_OPEN2_RE,
+        _INTERPRETER_PERL_OPEN3_RE,
+    ):
+        for match in pattern.finditer(code):
+            add(match.group("path"))
+    return targets
+
+
+def _interpreter_write_targets(argv: list[str]) -> list[str]:
+    argv = _strip_command_prefix_tokens(argv)
+    if not argv:
+        return []
+    hardened = _write_deny_matcher_hardening_enabled()
+    codes = _deno_eval_code_strings(argv) if hardened else []
+    if not codes:
+        name = _normalized_command_name(argv[0])
+        if not hardened and name in _HARDENED_ONLY_INTERPRETERS:
+            return []
+        code_flags = _interpreter_code_flag_set(name)
+        if code_flags is None:
+            return []
+        codes = _interpreter_code_strings(argv, code_flags)
+    targets: list[str] = []
+    for code in codes:
+        for target in _interpreter_code_write_targets(code):
+            if target not in targets:
+                targets.append(target)
+    return targets
+
+
+def _command_reads_interpreter_program_from_stdin(command: str) -> bool:
+    for segment in _mutator_command_segments(command):
+        argv = _strip_command_prefix_tokens(_segment_argv(segment))
+        if not argv:
+            continue
+        code_flags = _interpreter_code_flag_set(_normalized_command_name(argv[0]))
+        if code_flags is None:
+            continue
+        if _interpreter_code_strings(argv, code_flags):
+            # Program came from -c/-e; stdin is data for it.
+            continue
+        positionals = _positional_args(argv[1:], value_flags=code_flags)
+        if not positionals or positionals[0] == "-":
+            # Bare `python3` / `python3 -`: stdin is the program text.
+            return True
+    return False
+
+
+def _interpreter_write_targets_from_command(command: str, depth: int = 0) -> list[str]:
+    """Best-effort write targets of interpreter one-liners.
+
+    Only consulted by the workspace write deny gate when
+    OPENSQUILLA_WORKSPACE_WRITE_DENY_INTERPRETER_TARGETS is enabled. Covers
+    literal write-path forms in -c/-e/-r code strings; variable expansion and
+    computed paths remain out of scope.
+    """
+
+    hardened = _write_deny_matcher_hardening_enabled()
+    targets: list[str] = []
+    for segment in _mutator_command_segments(command):
+        argv = _segment_argv(segment)
+        if hardened and depth < _SHELL_WRAPPER_MAX_DEPTH:
+            for inner_command in _shell_wrapper_inner_commands(argv):
+                for target in _interpreter_write_targets_from_command(
+                    inner_command, depth + 1
+                ):
+                    if target not in targets:
+                        targets.append(target)
+        for target in _interpreter_write_targets(argv):
+            if target not in targets:
+                targets.append(target)
+    return targets
+
+
+def _interpreter_write_targets_from_inputs(
+    command: str,
+    stdin: str | None = None,
+) -> list[str]:
+    targets = _interpreter_write_targets_from_command(command)
+    if stdin is not None:
+        stdin_is_program = _command_reads_interpreter_program_from_stdin(command)
+        for stdin_chunk in _iter_stdin_guard_chunks(stdin):
+            extra = _interpreter_write_targets_from_command(stdin_chunk)
+            if stdin_is_program:
+                # `python3 - <<EOF` / piped program text: the stdin itself is
+                # interpreter code, not shell commands.
+                extra = extra + _interpreter_code_write_targets(stdin_chunk)
+            for target in extra:
                 if target not in targets:
                     targets.append(target)
     return targets
@@ -3893,6 +4195,13 @@ def _workspace_write_deny_shell_block(
             if extra_target not in candidate_targets:
                 candidate_targets.append(extra_target)
                 mutator_targets.add(extra_target)
+    if _write_deny_lever_enabled(
+        "OPENSQUILLA_WORKSPACE_WRITE_DENY_INTERPRETER_TARGETS"
+    ):
+        for extra_target in _interpreter_write_targets_from_inputs(command, stdin):
+            if extra_target not in candidate_targets:
+                candidate_targets.append(extra_target)
+                mutator_targets.add(extra_target)
     for target in candidate_targets:
         resolved = _resolve_shell_write_target(target, target_workdir)
         deny_match = match_workspace_write_deny(
@@ -4317,7 +4626,10 @@ def _current_bg_context_is_admin() -> bool:
         return False
     if ctx.caller_kind in {CallerKind.CLI, CallerKind.WEB}:
         return True
-    return ctx.caller_kind is CallerKind.CHANNEL and ctx.elevated in ("on", "bypass", "full")
+    # A verified channel administrator is the same operator principal as a
+    # WebUI owner. The ingress-only marker prevents an arbitrary channel
+    # context with ``is_owner=True`` from managing other sessions' processes.
+    return ctx.caller_kind is CallerKind.CHANNEL and ctx.channel_admin_verified
 
 
 def _current_bg_context_allows(session: _BgSession) -> bool:
@@ -4517,6 +4829,24 @@ async def _await_bg_output_task(output_task: asyncio.Task[None]) -> None:
             await output_task
 
 
+def _exec_timeout_output(effective_timeout: float, command: str, raw: bytes | str) -> str:
+    """Build the exec-timeout result, preserving partial output captured so far.
+
+    Keeps the ``[timeout after Ns]`` marker (asserted by tests and recognised by the
+    model as a timeout signal) and appends a tail slice of whatever the command
+    emitted before it was killed, so the model can see which test hung instead of a
+    bare marker with no evidence.
+    """
+    text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+    text = text.strip()
+    base = f"[timeout after {effective_timeout}s]\ncommand: {command}"
+    if not text:
+        return base
+    if len(text) > _EXEC_TIMEOUT_OUTPUT_TAIL_CHARS:
+        text = "...[partial output truncated]...\n" + text[-_EXEC_TIMEOUT_OUTPUT_TAIL_CHARS:]
+    return f"{base}\n--- partial output before timeout ---\n{text}"
+
+
 async def _run_host_shell_command(
     command: str,
     *,
@@ -4543,31 +4873,37 @@ async def _run_host_shell_command(
 
             loop = asyncio.get_running_loop()
             deadline = loop.time() + effective_timeout
-            timeout_result = f"[timeout after {effective_timeout}s]\ncommand: {command}"
+
+            def timeout_result() -> str:
+                output_file.flush()
+                output_file.seek(0)
+                return _exec_timeout_output(
+                    effective_timeout, command, output_file.read()
+                )
 
             proc = await _create_host_shell_subprocess(command, **subprocess_kwargs)
             stdin_writer: asyncio.Task[None] | None = None
             remaining = deadline - loop.time()
             if remaining <= 0:
                 await _terminate_exec_process_tree(proc)
-                return timeout_result
+                return timeout_result()
             try:
                 if stdin_bytes is not None:
                     stdin_writer = asyncio.create_task(_write_exec_stdin(proc, stdin_bytes))
                     if not await _wait_exec_stdin_writer(stdin_writer, remaining):
                         await _cancel_exec_stdin_writer(proc, stdin_writer)
                         await _terminate_exec_process_tree(proc)
-                        return timeout_result
+                        return timeout_result()
             except TimeoutError:
                 await _cancel_exec_stdin_writer(proc, stdin_writer)
                 await _terminate_exec_process_tree(proc)
-                return timeout_result
+                return timeout_result()
 
             remaining = deadline - loop.time()
             if remaining <= 0 or not await _wait_exec_process(proc, remaining):
                 await _cancel_exec_stdin_writer(proc, stdin_writer)
                 await _terminate_exec_process_tree(proc)
-                return timeout_result
+                return timeout_result()
             if os.name == "posix":
                 _signal_exec_process_tree(proc, signal.SIGTERM)
 
@@ -4636,7 +4972,10 @@ async def _create_host_shell_subprocess(
     params={
         "command": {"type": "string", "description": "Shell command to execute."},
         "workdir": {"type": "string", "description": "Working directory (default: cwd)."},
-        "timeout": {"type": "number", "description": "Timeout in seconds (default 60)."},
+        "timeout": {
+            "type": "number",
+            "description": "Timeout in seconds (default 60, max 600).",
+        },
         "env": {
             "type": "object",
             "description": "Extra environment variable overrides.",
@@ -4894,7 +5233,13 @@ async def exec_command(
             before=mutation_before,
             metadata=metadata,
         )
-        return output
+        # Effect enforcement runs after the ledger so the raw escape stays
+        # honestly recorded before any revert rewrites the workspace.
+        return enforce_workspace_write_deny_effects(
+            tool_name="exec_command",
+            before=mutation_before,
+            output=output,
+        )
 
     if runtime is not None and runtime.effective.sandbox_enabled and not host_execution:
         if windows_process_sandbox:

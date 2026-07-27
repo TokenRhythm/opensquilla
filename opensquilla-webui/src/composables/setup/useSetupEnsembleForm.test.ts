@@ -898,7 +898,7 @@ describe('useSetupEnsembleForm — panel contract', () => {
     expect(makePanel(f, 'volcengine').value.custom.canAddProposer).toBe(false)
   })
 
-  it('surfaces the effective preset facts (quorum 3/4, 300/480s, 5s grace)', () => {
+  it('surfaces the effective preset facts (quorum 3/4, 300/480s, 10s grace)', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig({ enabled: true, selection_mode: 'static_openrouter_b5' })
     const facts = makePanel(f, 'openrouter').value.presetFacts
@@ -908,7 +908,7 @@ describe('useSetupEnsembleForm — panel contract', () => {
       proposerCount: 4,
       proposerTimeoutSeconds: 300,
       aggregatorTimeoutSeconds: 480,
-      quorumGraceSeconds: 5,
+      quorumGraceSeconds: 10,
     })
   })
 
@@ -966,7 +966,7 @@ describe('useSetupEnsembleForm — effective timeout facts', () => {
     const facts = makePanel(f, 'openrouter').value.presetFacts
     expect(facts.proposerTimeoutSeconds).toBe(600)
     expect(facts.aggregatorTimeoutSeconds).toBe(900)
-    expect(facts.quorumGraceSeconds).toBe(5)
+    expect(facts.quorumGraceSeconds).toBe(10)
     // The stored timeouts are read-only facts, never a pending edit.
     expect(f.isDirty.value).toBe(false)
     expect(f.payload()).toEqual({})
@@ -1006,7 +1006,7 @@ describe('useSetupEnsembleForm — effective timeout facts', () => {
     const facts = makePanel(f, 'deepseek').value.custom.facts
     expect(facts.proposerTimeoutSeconds).toBe(720)
     expect(facts.aggregatorTimeoutSeconds).toBe(480)
-    expect(facts.quorumGraceSeconds).toBe(5)
+    expect(facts.quorumGraceSeconds).toBe(10)
   })
 
   it('reports raw stored timeouts and no grace for the legacy router_dynamic mode', () => {

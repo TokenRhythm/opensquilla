@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 from collections.abc import AsyncIterator
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -44,14 +45,18 @@ from opensquilla.provider.request_proof import (
     ProviderRequestBudgetExceeded,
     prove_provider_payload,
 )
+from opensquilla.sandbox.config import SandboxSettings
+from opensquilla.sandbox.integration import configure_runtime, reset_runtime
 from opensquilla.sandbox.run_context import RunContext
 from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.session.compaction import CompactionResult
+from opensquilla.tools.dispatch import build_tool_handler
 from opensquilla.tools.mutation_receipts import (
     fingerprint_path,
     record_semantic_mutation_receipt,
 )
-from opensquilla.tools.types import CallerKind, ToolContext
+from opensquilla.tools.registry import get_default_registry
+from opensquilla.tools.types import CallerKind, InteractionMode, ToolContext
 
 RAW_CURRENT_TURN_OVERFLOW_MESSAGE = (
     "Context overflow is in the current turn's recent tool calls or "
@@ -604,12 +609,130 @@ class _NoWorkspaceWriteThenPatchProvider:
                     "patch": (
                         "*** Begin Patch\n"
                         "*** Update File: src.py\n"
-                        "@@\n"
+                        "@@ -1,1 +1,1 @@\n"
                         "-old\n"
                         "+new\n"
                         "*** End Patch\n"
                     )
                 },
+            )
+            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
+            return
+        yield ProviderText(text="done")
+        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
+
+    async def list_models(self) -> list[Any]:
+        return []
+
+
+class _ScratchReproThenPatchProvider(_NoWorkspaceWriteThenPatchProvider):
+    def __init__(self, scratch_dir: Path) -> None:
+        super().__init__()
+        self.scratch_dir = scratch_dir
+
+    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
+        if call_number <= 17:
+            async for event in super()._stream(call_number):
+                yield event
+            return
+        if call_number in {18, 19, 21}:
+            name_by_call = {
+                18: "repro_issue.tcl",
+                19: "notes.md",
+                21: "notes_after_source.md",
+            }
+            name = name_by_call[call_number]
+            tool_use_id = {
+                18: "write-repro",
+                19: "write-notes",
+                21: "write-notes-after-source",
+            }[call_number]
+            yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="write_file")
+            yield ProviderToolUseEnd(
+                tool_use_id=tool_use_id,
+                tool_name="write_file",
+                arguments={
+                    "path": str(self.scratch_dir / name),
+                    "content": (
+                        "puts repro\n" if call_number == 18 else "investigation notes\n"
+                    ),
+                },
+            )
+            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
+            return
+        if call_number == 20:
+            async for event in super()._stream(18):
+                yield event
+            return
+        yield ProviderText(text="done")
+        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
+
+
+class _WritePatchFileThenApplyProvider:
+    provider_name = "fake"
+
+    def __init__(self, patch_path: Path, patch_text: str) -> None:
+        self.patch_path = patch_path
+        self.patch_text = patch_text
+        self.calls = 0
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        del messages, tools, config
+        self.calls += 1
+        return self._stream(self.calls)
+
+    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
+        if call_number == 1:
+            yield ProviderToolUseStart(tool_use_id="write-patch", tool_name="write_file")
+            yield ProviderToolUseEnd(
+                tool_use_id="write-patch",
+                tool_name="write_file",
+                arguments={"path": str(self.patch_path), "content": self.patch_text},
+            )
+            yield ProviderToolUseStart(tool_use_id="apply-path", tool_name="apply_patch")
+            yield ProviderToolUseEnd(
+                tool_use_id="apply-path",
+                tool_name="apply_patch",
+                arguments={"path": str(self.patch_path)},
+            )
+            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
+            return
+        yield ProviderText(text="done")
+        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
+
+    async def list_models(self) -> list[Any]:
+        return []
+
+
+class _PathPatchThenFinalProvider:
+    provider_name = "fake"
+
+    def __init__(self, patch_path: Path) -> None:
+        self.patch_path = patch_path
+        self.calls = 0
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        del messages, tools, config
+        self.calls += 1
+        return self._stream(self.calls)
+
+    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
+        if call_number == 1:
+            yield ProviderToolUseStart(tool_use_id="apply-path", tool_name="apply_patch")
+            yield ProviderToolUseEnd(
+                tool_use_id="apply-path",
+                tool_name="apply_patch",
+                arguments={"path": str(self.patch_path)},
             )
             yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
             return
@@ -2276,7 +2399,7 @@ def test_progress_watchdog_code_fix_no_write_guidance_requires_workspace_edit() 
     assert "apply_patch, edit_file, or write_file" not in message
 
 
-def test_workspace_edit_gate_rejects_scratch_write_file(tmp_path) -> None:
+def test_workspace_edit_gate_rejects_unconfigured_external_write_file(tmp_path) -> None:
     agent = Agent(
         provider=_ContextOverflowProvider(success_after=1),
         tool_context=ToolContext(workspace_dir=str(tmp_path)),
@@ -2312,6 +2435,915 @@ def test_workspace_edit_gate_rejects_scratch_write_file(tmp_path) -> None:
     assert scratch_result.is_error is True
     assert scratch_result.execution_status["reason"] == "workspace_edit_required"
     assert workspace_result is None
+
+
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+def test_workspace_edit_gate_allows_configured_scratch_repro_file(
+    tmp_path,
+    tool_name: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    workspace.mkdir()
+    scratch.mkdir()
+    tool_context = ToolContext(
+        workspace_dir=str(workspace),
+        scratch_dir=str(scratch),
+    )
+    agent = Agent(
+        provider=_ContextOverflowProvider(success_after=1),
+        tool_context=tool_context,
+    )
+    gate_details = {
+        "reason": "tool_activity_without_workspace_write",
+        "count": 16,
+        "threshold": 8,
+    }
+    target = scratch / "repro_issue.tcl"
+    if tool_name == "edit_file":
+        target.write_text("before\n", encoding="utf-8")
+    arguments = (
+        {"path": str(target), "content": "puts repro\n"}
+        if tool_name == "write_file"
+        else {"path": str(target), "old_text": "before", "new_text": "after"}
+    )
+    tool_call = ToolCall(
+        tool_use_id=f"{tool_name}-scratch",
+        tool_name=tool_name,
+        arguments=arguments,
+    )
+
+    result = agent._workspace_edit_gate_tool_result(
+        tool_call,
+        gate_details,
+        recovery_read_paths=set(),
+        recovery_reads_remaining=0,
+    )
+
+    assert result is None
+    assert agent._tool_call_targets_workspace_path(tool_call) is False
+    tool_context.scratch_file_writes.append(
+        {
+            "path": str(target),
+            "relative_path": "repro_issue.tcl",
+            "name": "repro_issue.tcl",
+            "suffix": ".tcl",
+        }
+    )
+    assert agent._effective_workspace_write_records() == []
+
+
+def test_workspace_edit_gate_allows_custom_external_scratch_root(tmp_path) -> None:
+    # Anchored to the temp drive so the path is absolute on Windows too;
+    # a bare "/opt/..." has no drive there and falls back to cwd-relative.
+    scratch = Path(tmp_path.anchor) / "opensquilla-custom-scratch"
+    agent = Agent(
+        provider=_ContextOverflowProvider(success_after=1),
+        tool_context=ToolContext(
+            workspace_dir=str(tmp_path),
+            scratch_dir=str(scratch),
+        ),
+    )
+
+    result = agent._workspace_edit_gate_tool_result(
+        ToolCall(
+            tool_use_id="write-custom-scratch",
+            tool_name="write_file",
+            arguments={
+                "path": str(scratch / "reproduce_issue.py"),
+                "content": "print('repro')\n",
+            },
+        ),
+        {
+            "reason": "tool_activity_without_workspace_write",
+            "count": 16,
+            "threshold": 8,
+        },
+        recovery_read_paths=set(),
+        recovery_reads_remaining=0,
+    )
+
+    assert result is None
+
+
+@pytest.mark.parametrize("scratch_relation", ["workspace_ancestor", "same_root"])
+def test_tool_context_rejects_scratch_root_containing_workspace(
+    tmp_path,
+    scratch_relation: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    scratch = tmp_path if scratch_relation == "workspace_ancestor" else workspace
+
+    with pytest.raises(ValueError, match="must not equal or contain workspace_dir"):
+        ToolContext(
+            workspace_dir=str(workspace),
+            scratch_dir=str(scratch),
+        )
+
+
+def test_agent_revalidates_mutated_tool_context_roots(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    tool_context = ToolContext(workspace_dir=str(workspace))
+    tool_context.scratch_dir = str(tmp_path)
+
+    with pytest.raises(ValueError, match="must not equal or contain workspace_dir"):
+        Agent(
+            provider=_ContextOverflowProvider(success_after=1),
+            tool_context=tool_context,
+        )
+
+
+def test_configured_hidden_scratch_diff_is_not_source_progress(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    scratch = workspace / ".artifacts"
+    scratch.mkdir()
+    target = scratch / "repro.py"
+    target.write_text("before\n", encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=workspace, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=workspace,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"],
+        cwd=workspace,
+        check=True,
+    )
+    subprocess.run(["git", "add", ".artifacts/repro.py"], cwd=workspace, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=workspace, check=True)
+    target.write_text("after\n", encoding="utf-8")
+    agent = Agent(
+        provider=_ContextOverflowProvider(success_after=1),
+        tool_context=ToolContext(
+            workspace_dir=str(workspace),
+            scratch_dir=str(scratch),
+        ),
+    )
+
+    assert agent._workspace_tracked_diff_paths_for_nudge() == []
+    assert agent._workspace_has_source_change_evidence() is False
+    observation = agent._final_diff_contract_observation()
+    assert observation is not None
+    assert observation.source_paths == []
+    assert observation.scratch_paths == [".artifacts/repro.py"]
+
+
+@pytest.mark.asyncio
+async def test_workspace_edit_gate_allows_real_configured_scratch_edit_file(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    # Scratch write tracking is a workspace policy layer; opt out of the
+    # sandbox-disabled Full Host Access fallback so it stays active.
+    monkeypatch.setenv("OPENSQUILLA_SANDBOX_DISABLED_FULL_HOST", "off")
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    workspace.mkdir()
+    scratch.mkdir()
+    target = scratch / "repro_issue.py"
+    target.write_text("before\n", encoding="utf-8")
+    tool_context = ToolContext(
+        is_owner=True,
+        interaction_mode=InteractionMode.UNATTENDED,
+        workspace_dir=str(workspace),
+        scratch_dir=str(scratch),
+        file_edit_requires_fresh_read=True,
+    )
+    configure_runtime(
+        SandboxSettings(
+            sandbox=False,
+            security_grading=False,
+            allow_legacy_mode=True,
+        ),
+        workspace=workspace,
+    )
+    try:
+        real_handler = build_tool_handler(get_default_registry(), tool_context)
+        agent = Agent(
+            provider=_ContextOverflowProvider(success_after=1),
+            tool_handler=real_handler,
+            tool_context=tool_context,
+        )
+        read_result = await agent._execute_tool(
+            ToolCall(
+                tool_use_id="read-scratch-repro",
+                tool_name="read_file",
+                arguments={"path": str(target)},
+            )
+        )
+        edit_call = ToolCall(
+            tool_use_id="edit-scratch-repro",
+            tool_name="edit_file",
+            arguments={
+                "path": str(target),
+                "old_text": "before",
+                "new_text": "after",
+            },
+        )
+        gate_result = agent._workspace_edit_gate_tool_result(
+            edit_call,
+            {
+                "reason": "tool_activity_without_workspace_write",
+                "count": 16,
+                "threshold": 8,
+            },
+            recovery_read_paths=set(),
+            recovery_reads_remaining=0,
+        )
+        edit_result = await agent._execute_tool(edit_call)
+    finally:
+        reset_runtime()
+
+    assert read_result.is_error is False
+    assert gate_result is None
+    assert edit_result.is_error is False
+    assert target.read_text(encoding="utf-8") == "after\n"
+    assert [record["relative_path"] for record in tool_context.scratch_file_writes] == [
+        "repro_issue.py"
+    ]
+    assert agent._effective_workspace_write_records() == []
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "notes.md",
+        "notes.txt",
+        "notes",
+        "../outside/repro.py",
+        "../workspace/source.py",
+    ],
+)
+def test_workspace_edit_gate_rejects_non_repro_or_escaped_configured_scratch_write(
+    tmp_path,
+    relative_path: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    workspace.mkdir()
+    scratch.mkdir()
+    agent = Agent(
+        provider=_ContextOverflowProvider(success_after=1),
+        tool_context=ToolContext(
+            workspace_dir=str(workspace),
+            scratch_dir=str(scratch),
+        ),
+    )
+    gate_details = {
+        "reason": "tool_activity_without_workspace_write",
+        "count": 16,
+        "threshold": 8,
+    }
+
+    result = agent._workspace_edit_gate_tool_result(
+        ToolCall(
+            tool_use_id="write-scratch",
+            tool_name="write_file",
+            arguments={
+                "path": str(scratch / relative_path),
+                "content": "not source progress\n",
+            },
+        ),
+        gate_details,
+        recovery_read_paths=set(),
+        recovery_reads_remaining=0,
+    )
+
+    assert result is not None
+    assert result.is_error is True
+    assert result.execution_status["reason"] == "workspace_edit_required"
+
+
+@pytest.mark.parametrize(
+    ("path", "allowed"),
+    [
+        ("repro.py", True),
+        ("case.tcl", True),
+        ("notes.md", False),
+        ("../outside/repro.py", False),
+    ],
+)
+def test_workspace_edit_gate_only_allows_write_scratch_repro_scripts(
+    tmp_path,
+    path: str,
+    allowed: bool,
+) -> None:
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    workspace.mkdir()
+    scratch.mkdir()
+    agent = Agent(
+        provider=_ContextOverflowProvider(success_after=1),
+        tool_context=ToolContext(
+            workspace_dir=str(workspace),
+            scratch_dir=str(scratch),
+        ),
+    )
+
+    result = agent._workspace_edit_gate_tool_result(
+        ToolCall(
+            tool_use_id="write-scratch-tool",
+            tool_name="write_scratch",
+            arguments={"path": path, "content": "diagnostic\n"},
+        ),
+        {
+            "reason": "tool_activity_without_workspace_write",
+            "count": 16,
+            "threshold": 8,
+        },
+        recovery_read_paths=set(),
+        recovery_reads_remaining=0,
+    )
+
+    assert (result is None) is allowed
+    if result is not None:
+        assert result.is_error is True
+        assert result.execution_status["reason"] == "workspace_edit_required"
+
+
+def test_workspace_edit_gate_rejects_configured_scratch_prefix_collision(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    scratch_collision = tmp_path / "scratch-elsewhere"
+    workspace.mkdir()
+    scratch.mkdir()
+    scratch_collision.mkdir()
+    agent = Agent(
+        provider=_ContextOverflowProvider(success_after=1),
+        tool_context=ToolContext(
+            workspace_dir=str(workspace),
+            scratch_dir=str(scratch),
+        ),
+    )
+
+    result = agent._workspace_edit_gate_tool_result(
+        ToolCall(
+            tool_use_id="write-prefix-collision",
+            tool_name="write_file",
+            arguments={
+                "path": str(scratch_collision / "repro.py"),
+                "content": "print('outside')\n",
+            },
+        ),
+        {
+            "reason": "tool_activity_without_workspace_write",
+            "count": 16,
+            "threshold": 8,
+        },
+        recovery_read_paths=set(),
+        recovery_reads_remaining=0,
+    )
+
+    assert result is not None
+    assert result.is_error is True
+    assert result.execution_status["reason"] == "workspace_edit_required"
+
+
+@pytest.mark.parametrize("path_form", ["absolute", "relative"])
+def test_workspace_edit_gate_rejects_configured_scratch_inside_workspace(
+    tmp_path,
+    path_form: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    scratch = workspace / ".scratch"
+    scratch.mkdir(parents=True)
+    tool_context = ToolContext(
+        workspace_dir=str(workspace),
+        scratch_dir=str(scratch),
+    )
+    agent = Agent(
+        provider=_ContextOverflowProvider(success_after=1),
+        tool_context=tool_context,
+    )
+
+    result = agent._workspace_edit_gate_tool_result(
+        ToolCall(
+            tool_use_id="write-nested-scratch",
+            tool_name="write_file",
+            arguments={
+                "path": (
+                    str(scratch / "repro.py")
+                    if path_form == "absolute"
+                    else ".scratch/repro.py"
+                ),
+                "content": "print('repro')\n",
+            },
+        ),
+        {
+            "reason": "tool_activity_without_workspace_write",
+            "count": 16,
+            "threshold": 8,
+        },
+        recovery_read_paths=set(),
+        recovery_reads_remaining=0,
+    )
+
+    assert result is not None
+    assert result.is_error is True
+    assert result.execution_status["reason"] == "workspace_edit_required"
+    tool_context.workspace_file_writes.append(
+        {
+            "path": str(scratch / "repro.py"),
+            "relative_path": ".scratch/repro.py",
+            "created": True,
+        }
+    )
+    tool_context.workspace_mutation_receipts.append(
+        {
+            "relative_path": ".scratch/repro.py",
+            "classification": "scratch",
+            "changed": True,
+            "partial": False,
+        }
+    )
+    assert agent._effective_workspace_write_records() == []
+    assert agent._workspace_mutation_receipt_counts() == {
+        "changed_receipt_count": 0,
+        "noop_receipt_count": 0,
+        "partial_receipt_count": 0,
+    }
+    assert agent._workspace_has_source_change_evidence() is False
+
+
+@pytest.mark.parametrize("escape_destination", ["outside", "workspace"])
+def test_workspace_edit_gate_rejects_configured_scratch_symlink_escape(
+    tmp_path,
+    escape_destination: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    scratch.mkdir()
+    outside.mkdir()
+    escape = scratch / "escape"
+    try:
+        escape.symlink_to(
+            workspace if escape_destination == "workspace" else outside,
+            target_is_directory=True,
+        )
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+    agent = Agent(
+        provider=_ContextOverflowProvider(success_after=1),
+        tool_context=ToolContext(
+            workspace_dir=str(workspace),
+            scratch_dir=str(scratch),
+        ),
+    )
+
+    result = agent._workspace_edit_gate_tool_result(
+        ToolCall(
+            tool_use_id="write-symlink-escape",
+            tool_name="write_file",
+            arguments={
+                "path": str(escape / "repro.py"),
+                "content": "print('outside')\n",
+            },
+        ),
+        {
+            "reason": "tool_activity_without_workspace_write",
+            "count": 16,
+            "threshold": 8,
+        },
+        recovery_read_paths=set(),
+        recovery_reads_remaining=0,
+    )
+
+    assert result is not None
+    assert result.is_error is True
+    assert result.execution_status["reason"] == "workspace_edit_required"
+
+
+@pytest.mark.parametrize(("filename", "allowed"), [("repro.py", True), ("notes.md", False)])
+def test_workspace_edit_gate_classifies_workspace_symlink_into_scratch(
+    tmp_path,
+    filename: str,
+    allowed: bool,
+) -> None:
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    workspace.mkdir()
+    scratch.mkdir()
+    scratch_alias = workspace / "scratch-alias"
+    try:
+        scratch_alias.symlink_to(scratch, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+    agent = Agent(
+        provider=_ContextOverflowProvider(success_after=1),
+        tool_context=ToolContext(
+            workspace_dir=str(workspace),
+            scratch_dir=str(scratch),
+        ),
+    )
+
+    result = agent._workspace_edit_gate_tool_result(
+        ToolCall(
+            tool_use_id="write-scratch-alias",
+            tool_name="write_file",
+            arguments={
+                "path": f"scratch-alias/{filename}",
+                "content": "diagnostic\n",
+            },
+        ),
+        {
+            "reason": "tool_activity_without_workspace_write",
+            "count": 16,
+            "threshold": 8,
+        },
+        recovery_read_paths=set(),
+        recovery_reads_remaining=0,
+    )
+
+    assert (result is None) is allowed
+    if result is not None:
+        assert result.execution_status["reason"] == "workspace_edit_required"
+
+
+@pytest.mark.parametrize("target_kind", ["external", "nested", "nested_escape"])
+def test_workspace_edit_gate_rejects_apply_patch_to_configured_scratch(
+    tmp_path,
+    target_kind: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    scratch = (
+        tmp_path / "scratch" if target_kind == "external" else workspace / ".scratch"
+    )
+    scratch.mkdir()
+    patch_target = {
+        "external": str(scratch / "repro.py"),
+        "nested": ".scratch/repro.py",
+        "nested_escape": ".scratch/../src.py",
+    }[target_kind]
+    agent = Agent(
+        provider=_ContextOverflowProvider(success_after=1),
+        tool_context=ToolContext(
+            workspace_dir=str(workspace),
+            scratch_dir=str(scratch),
+        ),
+    )
+
+    result = agent._workspace_edit_gate_tool_result(
+        ToolCall(
+            tool_use_id="patch-scratch",
+            tool_name="apply_patch",
+            arguments={
+                "patch": "\n".join(
+                    [
+                        "*** Begin Patch",
+                        f"*** Add File: {patch_target}",
+                        "+print('repro')",
+                        "*** End Patch",
+                    ]
+                )
+            },
+        ),
+        {
+            "reason": "tool_activity_without_workspace_write",
+            "count": 16,
+            "threshold": 8,
+        },
+        recovery_read_paths=set(),
+        recovery_reads_remaining=0,
+    )
+
+    assert result is not None
+    assert result.is_error is True
+    assert result.execution_status["reason"] == "workspace_edit_required"
+
+
+def test_finalize_evidence_classifies_each_apply_patch_target(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    scratch = workspace / ".scratch"
+    scratch.mkdir(parents=True)
+    agent = Agent(
+        provider=_ContextOverflowProvider(success_after=1),
+        tool_context=ToolContext(
+            workspace_dir=str(workspace),
+            scratch_dir=str(scratch),
+        ),
+    )
+    tool_call = ToolCall(
+        tool_use_id="patch-mixed",
+        tool_name="apply_patch",
+        arguments={
+            "patch": (
+                "*** Begin Patch\n"
+                "*** Add File: .scratch/repro.py\n"
+                "+print('repro')\n"
+                "*** Update File: src.py\n"
+                "@@ -1,1 +1,1 @@\n"
+                "-old\n"
+                "+new\n"
+                "*** End Patch\n"
+            )
+        },
+    )
+
+    assert agent._finalize_evidence_write_targets(tool_call) == [
+        (".scratch/repro.py", True),
+        ("src.py", False),
+    ]
+
+    context_literal_call = ToolCall(
+        tool_use_id="patch-context-literal",
+        tool_name="apply_patch",
+        arguments={
+            "patch": (
+                "  *** Begin Patch  \n"
+                "*** Update File: docs/example.txt\n"
+                "@@ -1,1 +1,1 @@\n"
+                " *** Add File: .scratch/repro.py\n"
+                "-old\n"
+                "+new\n"
+                "  *** End Patch  \n"
+            )
+        },
+    )
+    assert agent._workspace_edit_gate_apply_patch_raw_target_paths(
+        context_literal_call
+    ) == ["docs/example.txt"]
+    assert agent._finalize_evidence_write_targets(
+        ToolCall(
+            tool_use_id="edit-source-scratch",
+            tool_name="edit_source",
+            arguments={"path": ".scratch/repro.py"},
+        )
+    ) == [(".scratch/repro.py", True)]
+
+    source_patch_file = scratch / "source.patch"
+    source_patch_file.write_text(
+        "*** Begin Patch\n"
+        "*** Update File: src.py\n"
+        "@@ -1,1 +1,1 @@\n"
+        "-old\n"
+        "+new\n"
+        "*** End Patch\n",
+        encoding="utf-8",
+    )
+    scratch_patch_file = scratch / "scratch.patch"
+    scratch_patch_file.write_text(
+        "*** Begin Patch\n"
+        "*** Add File: .scratch/repro.py\n"
+        "+print('repro')\n"
+        "*** End Patch\n",
+        encoding="utf-8",
+    )
+    source_patch_call = ToolCall(
+        tool_use_id="source-patch-file",
+        tool_name="apply_patch",
+        arguments={"path": str(source_patch_file)},
+    )
+    scratch_patch_call = ToolCall(
+        tool_use_id="scratch-patch-file",
+        tool_name="apply_patch",
+        arguments={"path": str(scratch_patch_file)},
+    )
+    gate_details = {
+        "reason": "tool_activity_without_workspace_write",
+        "count": 16,
+        "threshold": 8,
+    }
+
+    assert agent._finalize_evidence_write_targets(source_patch_call) == [("src.py", False)]
+    assert agent._finalize_evidence_write_targets(scratch_patch_call) == [
+        (".scratch/repro.py", True)
+    ]
+    assert (
+        agent._workspace_edit_gate_tool_result(
+            source_patch_call,
+            gate_details,
+            recovery_read_paths=set(),
+            recovery_reads_remaining=0,
+        )
+        is None
+    )
+    blocked = agent._workspace_edit_gate_tool_result(
+        scratch_patch_call,
+        gate_details,
+        recovery_read_paths=set(),
+        recovery_reads_remaining=0,
+    )
+    assert blocked is not None
+    assert blocked.execution_status["reason"] == "workspace_edit_required"
+
+    frozen_source_patch_call = agent._snapshot_apply_patch_path_call(source_patch_call)
+    assert frozen_source_patch_call is not source_patch_call
+    assert frozen_source_patch_call.arguments["path"] == str(source_patch_file)
+    source_patch_file.unlink()
+    assert agent._finalize_evidence_write_targets(frozen_source_patch_call) == [
+        ("src.py", False)
+    ]
+    assert agent._finalize_evidence_write_targets(source_patch_call) == [(None, False)]
+
+
+def test_workspace_edit_gate_handles_unexpandable_paths(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    workspace.mkdir()
+    scratch.mkdir()
+    agent = Agent(
+        provider=_ContextOverflowProvider(success_after=1),
+        tool_context=ToolContext(
+            workspace_dir=str(workspace),
+            scratch_dir=str(scratch),
+        ),
+    )
+    tool_call = ToolCall(
+        tool_use_id="unexpandable-patch-path",
+        tool_name="apply_patch",
+        arguments={"path": "~opensquilla_user_that_does_not_exist/fix.patch"},
+    )
+
+    assert agent._snapshot_apply_patch_path_call(tool_call) is tool_call
+    assert agent._workspace_edit_gate_apply_patch_raw_target_paths(tool_call) == []
+    assert agent._configured_scratch_path_candidate(
+        "~opensquilla_user_that_does_not_exist/repro.py",
+        relative_to="workspace",
+    ) == (None, False)
+    blocked = agent._workspace_edit_gate_tool_result(
+        tool_call,
+        {
+            "reason": "tool_activity_without_workspace_write",
+            "count": 16,
+            "threshold": 8,
+        },
+        recovery_read_paths=set(),
+        recovery_reads_remaining=0,
+    )
+    assert blocked is not None
+    assert blocked.execution_status["reason"] == "workspace_edit_required"
+
+
+def test_apply_patch_snapshot_rejects_fifo_without_blocking(tmp_path) -> None:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO creation is unavailable")
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    workspace.mkdir()
+    scratch.mkdir()
+    fifo = scratch / "fix.patch"
+    os.mkfifo(fifo)
+    agent = Agent(
+        provider=_ContextOverflowProvider(success_after=1),
+        tool_context=ToolContext(
+            workspace_dir=str(workspace),
+            scratch_dir=str(scratch),
+        ),
+    )
+    tool_call = ToolCall(
+        tool_use_id="fifo-patch-path",
+        tool_name="apply_patch",
+        arguments={"path": str(fifo)},
+    )
+
+    assert agent._workspace_edit_gate_apply_patch_text(tool_call) is None
+    assert agent._snapshot_apply_patch_path_call(tool_call) is tool_call
+
+
+def test_apply_patch_snapshot_rejects_blank_patch_file(tmp_path) -> None:
+    patch_file = tmp_path / "blank.patch"
+    patch_file.write_text(" \n", encoding="utf-8")
+    agent = Agent(
+        provider=_ContextOverflowProvider(success_after=1),
+        tool_context=ToolContext(workspace_dir=str(tmp_path)),
+    )
+    tool_call = ToolCall(
+        tool_use_id="blank-patch-path",
+        tool_name="apply_patch",
+        arguments={"path": str(patch_file)},
+    )
+
+    assert agent._snapshot_apply_patch_path_call(tool_call) is tool_call
+
+
+@pytest.mark.asyncio
+async def test_failed_path_patch_snapshot_cannot_execute_later_created_file(
+    tmp_path,
+) -> None:
+    patch_file = tmp_path / "late.patch"
+    patch_text = (
+        "*** Begin Patch\n"
+        "*** Add File: late.py\n"
+        "+created\n"
+        "*** End Patch\n"
+    )
+
+    class _CreateAfterFailedSnapshotAgent(Agent):
+        def _snapshot_apply_patch_path_call(self, tc: ToolCall) -> ToolCall:
+            frozen = super()._snapshot_apply_patch_path_call(tc)
+            if frozen is tc and tc.tool_name == "apply_patch":
+                patch_file.write_text(patch_text, encoding="utf-8")
+            return frozen
+
+    handler_calls: list[ToolCall] = []
+
+    async def _tool(call: ToolCall) -> ToolResult:
+        handler_calls.append(call)
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="unexpected execution",
+        )
+
+    agent = _CreateAfterFailedSnapshotAgent(
+        provider=_PathPatchThenFinalProvider(patch_file),
+        config=AgentConfig(max_iterations=3, flush_enabled=False),
+        tool_definitions=[
+            ToolDefinition(
+                name="apply_patch",
+                description="apply_patch tool.",
+                input_schema=ToolInputSchema(),
+            )
+        ],
+        tool_handler=_tool,
+        tool_context=ToolContext(workspace_dir=str(tmp_path)),
+    )
+
+    events = [event async for event in agent.run_turn("Fix the issue")]
+
+    assert patch_file.read_text(encoding="utf-8") == patch_text
+    assert handler_calls == []
+    assert any(
+        getattr(event, "kind", None) == "tool_result"
+        and (getattr(event, "execution_status", None) or {}).get("reason")
+        == "patch_snapshot_failed"
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_path_patch_snapshot_respects_mutex_order_and_survives_self_delete(
+    tmp_path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    scratch = workspace / ".scratch"
+    scratch.mkdir(parents=True)
+    source = workspace / "src.py"
+    source.write_text("old\n", encoding="utf-8")
+    patch_file = scratch / "fix.patch"
+    patch_text = (
+        "*** Begin Patch\n"
+        "*** Update File: src.py\n"
+        "@@ -1,1 +1,1 @@\n"
+        "-old\n"
+        "+new\n"
+        "*** End Patch\n"
+    )
+    provider = _WritePatchFileThenApplyProvider(patch_file, patch_text)
+    tool_context = ToolContext(
+        workspace_dir=str(workspace),
+        scratch_dir=str(scratch),
+    )
+    handled_calls: list[ToolCall] = []
+
+    async def _tool(call: ToolCall) -> ToolResult:
+        handled_calls.append(call)
+        if call.tool_name == "write_file":
+            patch_file.write_text(str(call.arguments["content"]), encoding="utf-8")
+        elif call.tool_name == "apply_patch":
+            assert call.arguments["path"] == str(patch_file)
+            assert call.arguments["patch"] == patch_text
+            source.write_text("new\n", encoding="utf-8")
+            patch_file.unlink()
+            tool_context.workspace_file_writes.append(
+                {"relative_path": "src.py", "path": str(source)}
+            )
+        else:
+            raise AssertionError(f"unexpected tool: {call.tool_name}")
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="ok",
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_iterations=4, flush_enabled=False),
+        tool_definitions=[
+            ToolDefinition(
+                name=name,
+                description=f"{name} tool.",
+                input_schema=ToolInputSchema(),
+            )
+            for name in ["write_file", "apply_patch"]
+        ],
+        tool_handler=_tool,
+        tool_context=tool_context,
+    )
+
+    events = [event async for event in agent.run_turn("Fix src.py")]
+
+    assert [call.tool_name for call in handled_calls] == ["write_file", "apply_patch"]
+    assert source.read_text(encoding="utf-8") == "new\n"
+    assert not patch_file.exists()
+    assert any(isinstance(event, DoneEvent) for event in events)
 
 
 def test_workspace_edit_gate_rejects_synthetic_marker_write_file(tmp_path) -> None:
@@ -2490,6 +3522,94 @@ async def test_workspace_edit_gate_preserves_source_tools_after_repeated_no_writ
         == "workspace_edit_required"
         for event in events
     )
+
+
+@pytest.mark.asyncio
+async def test_workspace_edit_gate_scratch_repro_does_not_clear_gate(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    # Scratch write tracking is a workspace policy layer; opt out of the
+    # sandbox-disabled Full Host Access fallback so it stays active.
+    monkeypatch.setenv("OPENSQUILLA_SANDBOX_DISABLED_FULL_HOST", "off")
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    workspace.mkdir()
+    scratch.mkdir()
+    source = workspace / "src.py"
+    source.write_text("old\n", encoding="utf-8")
+    tool_context = ToolContext(
+        is_owner=True,
+        interaction_mode=InteractionMode.UNATTENDED,
+        workspace_dir=str(workspace),
+        scratch_dir=str(scratch),
+    )
+    handler_call_ids: list[str] = []
+    provider = _ScratchReproThenPatchProvider(scratch)
+    configure_runtime(
+        SandboxSettings(
+            sandbox=False,
+            security_grading=False,
+            allow_legacy_mode=True,
+        ),
+        workspace=workspace,
+    )
+    try:
+        registry = get_default_registry()
+        real_handler = build_tool_handler(registry, tool_context)
+
+        async def _recording_handler(call: Any) -> ToolResult:
+            handler_call_ids.append(call.tool_use_id)
+            return await real_handler(call)
+
+        visible_names = {"apply_patch", "read_file", "write_file"}
+        agent = Agent(
+            provider=provider,
+            config=AgentConfig(
+                max_iterations=25,
+                flush_enabled=False,
+                progress_watchdog_mode="warn_model",
+            ),
+            tool_definitions=[
+                tool
+                for tool in registry.to_tool_definitions(tool_context)
+                if tool.name in visible_names
+            ],
+            tool_handler=_recording_handler,
+            tool_context=tool_context,
+        )
+        events = [event async for event in agent.run_turn("Fix the failing parser test")]
+    finally:
+        reset_runtime()
+
+    assert (scratch / "repro_issue.tcl").read_text(encoding="utf-8") == "puts repro\n"
+    assert not (scratch / "notes.md").exists()
+    assert (scratch / "notes_after_source.md").read_text(encoding="utf-8") == (
+        "investigation notes\n"
+    )
+    assert source.read_text(encoding="utf-8") == "new\n"
+    assert handler_call_ids.count("write-repro") == 1
+    assert "write-notes" not in handler_call_ids
+    assert handler_call_ids.count("patch-1") == 1
+    assert handler_call_ids.count("write-notes-after-source") == 1
+    assert agent.config.metadata["workspace_edit_gate_activations"] == 1
+    assert [record["relative_path"] for record in tool_context.scratch_file_writes] == [
+        "repro_issue.tcl",
+        "notes_after_source.md",
+    ]
+    assert [record["relative_path"] for record in agent._effective_workspace_write_records()] == [
+        "src.py"
+    ]
+    blocked_events = [
+        event
+        for event in events
+        if getattr(event, "kind", None) == "tool_result"
+        and getattr(event, "tool_name", None) == "write_file"
+        and (getattr(event, "execution_status", None) or {}).get("reason")
+        == "workspace_edit_required"
+    ]
+    assert len(blocked_events) == 1
+    assert any(isinstance(event, DoneEvent) for event in events)
 
 
 @pytest.mark.asyncio

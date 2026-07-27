@@ -8,6 +8,9 @@ import {
   shortModelName,
 } from '@/composables/chat/useChatRenderedMessages'
 
+const LEGACY_QUORUM_CANCELLED_ERROR =
+  /^proposer cancelled after \d+(?:\.\d+)?s ensemble quorum grace$/
+
 export interface UseChatRouterDecisionRuntimeOptions {
   messages: Ref<ChatMessage[]>
   sessionKey: Ref<string>
@@ -119,6 +122,9 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     const label = String(payload.proposer_label || '').trim() || (isAggregator ? 'aggregator' : 'proposer')
     const finished = payload.event_type === 'proposer_finish' || payload.event_type === 'aggregator_finish'
     const error = String(payload.error || '').trim()
+    const explicitErrorCode = String(payload.error_code || '').trim()
+    const errorCode = explicitErrorCode
+      || (LEGACY_QUORUM_CANCELLED_ERROR.test(error) ? 'quorum_cancelled' : '')
     return {
       role: isAggregator ? 'aggregator' : label,
       label,
@@ -128,9 +134,16 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
       input: Number(payload.input_tokens || 0),
       output: Number(payload.output_tokens || 0),
       costUsd: Number(payload.cost_usd || 0),
-      status: finished ? (error ? 'failed' : 'done') : 'running',
+      status: finished
+        ? errorCode === 'quorum_cancelled'
+          ? 'skipped'
+          : error
+            ? 'failed'
+            : 'done'
+        : 'running',
       elapsedMs: Math.max(0, Number(payload.elapsed_ms || 0)),
       error: error || undefined,
+      errorCode: errorCode || undefined,
     }
   }
 

@@ -9,6 +9,7 @@ const repoRoot = resolve(packageRoot, '..', '..')
 const runtimeGatewayDir = join(packageRoot, 'runtime', 'gateway')
 const pyinstallerWorkDir = join(packageRoot, '.pyinstaller')
 const entryPath = join(scriptDir, 'gateway-entry.py')
+const caRuntimeHookPath = join(scriptDir, 'pyinstaller_runtime_hooks', 'ensure_ca_trust.py')
 const controlUiDistDir = join(repoRoot, 'src', 'opensquilla', 'gateway', 'static', 'dist')
 const controlUiVerifier = join(repoRoot, 'opensquilla-webui', 'scripts', 'verify-dist.mjs')
 const routerBundleDir = join(repoRoot, 'src', 'opensquilla', 'squilla_router', 'models', 'v4.2_phase3_inference')
@@ -270,6 +271,10 @@ const args = [
   'opensquilla',
   '--collect-all',
   'sqlite_vec',
+  '--collect-data',
+  'certifi',
+  '--hidden-import',
+  'certifi',
   '--collect-binaries',
   'sklearn',
   '--copy-metadata',
@@ -304,6 +309,8 @@ const args = [
   'mcp',
   '--hidden-import',
   'yoyo.backends.core.sqlite3',
+  '--runtime-hook',
+  caRuntimeHookPath,
   '--add-data',
   `${join(repoRoot, 'migrations')}${addDataSeparator}opensquilla/_migrations`,
   '--add-data',

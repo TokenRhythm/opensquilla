@@ -72,14 +72,14 @@ def _patch_stream(monkeypatch: Any, module: str, body: bytes) -> None:
     )
 
 
-def _collect(provider: Any) -> list[Any]:
+def _collect(provider: Any, *, config: ChatConfig | None = None) -> list[Any]:
     async def run() -> list[Any]:
         return [
             event
             async for event in provider.chat(
                 [Message(role="user", content="hi")],
                 tools=[_SEARCH_TOOL],
-                config=ChatConfig(),
+                config=config or ChatConfig(),
             )
         ]
 
@@ -244,6 +244,246 @@ def test_anthropic_invalid_tool_name_does_not_close_on_message_stop(
         observed,
         code="incomplete_tool_call",
         expect_start=False,
+    )
+
+
+def test_anthropic_candidate_mode_demotes_oversized_tool_name_after_terminal(
+    monkeypatch: Any,
+) -> None:
+    oversized_name = "proposed_action_" + ("x" * 17_000)
+    events = [
+        *_anthropic_tool_prefix(
+            tool_name=oversized_name,
+            arguments='{"city":"Shanghai"}',
+        ),
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {"type": "text", "text": ""},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {"type": "text_delta", "text": "analysis"},
+        },
+        {"type": "content_block_stop", "index": 1},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use"},
+            "usage": {"output_tokens": 7},
+        },
+        {"type": "message_stop"},
+    ]
+    _patch_stream(monkeypatch, "anthropic", _sse(events, anthropic=True))
+
+    observed = _collect(
+        AnthropicProvider(api_key="test", model="claude-test"),
+        config=ChatConfig(candidate_output_mode="inert_artifact"),
+    )
+
+    assert not any(isinstance(event, ErrorEvent) for event in observed)
+    assert not any(
+        isinstance(event, ToolUseStartEvent | ToolUseDeltaEvent | ToolUseEndEvent)
+        for event in observed
+    )
+    artifact_event = next(
+        event
+        for event in observed
+        if isinstance(event, TextDeltaEvent)
+        and "inert_proposer_tool_output" in event.text
+    )
+    artifact = json.loads(artifact_event.text)
+    assert artifact["kind"] == "inert_proposer_tool_output"
+    assert artifact["executable"] is False
+    assert artifact["actions"] == [
+        {
+            "arguments_text": '{"city":"Shanghai"}',
+            "issues": ["name_over_execution_limit"],
+            "name_text": oversized_name,
+        }
+    ]
+    done = next(event for event in observed if isinstance(event, DoneEvent))
+    assert done.stop_reason == "tool_use"
+    assert done.input_tokens == 2
+    assert done.output_tokens == 7
+    assert "".join(
+        event.text for event in observed if isinstance(event, TextDeltaEvent)
+    ).startswith("analysis\n{")
+    assert observed.index(artifact_event) < observed.index(done)
+
+
+def test_anthropic_candidate_mode_does_not_publish_artifact_before_message_stop(
+    monkeypatch: Any,
+) -> None:
+    events = [
+        *_anthropic_tool_prefix(),
+        {"type": "content_block_stop", "index": 0},
+    ]
+    _patch_stream(monkeypatch, "anthropic", _sse(events, anthropic=True))
+
+    observed = _collect(
+        AnthropicProvider(api_key="test", model="claude-test"),
+        config=ChatConfig(candidate_output_mode="inert_artifact"),
+    )
+
+    assert any(
+        isinstance(event, ErrorEvent) and event.code == "incomplete_stream"
+        for event in observed
+    )
+    assert not any(isinstance(event, TextDeltaEvent) for event in observed)
+    assert not any(
+        isinstance(event, ToolUseStartEvent | ToolUseDeltaEvent | ToolUseEndEvent)
+        for event in observed
+    )
+    assert not any(isinstance(event, DoneEvent) for event in observed)
+
+
+def test_anthropic_candidate_mode_keeps_empty_initial_tool_input(
+    monkeypatch: Any,
+) -> None:
+    events = [
+        {
+            "type": "message_start",
+            "message": {"id": "msg_1", "usage": {"input_tokens": 2}},
+        },
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "get_status",
+                "input": {},
+            },
+        },
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use"},
+            "usage": {"output_tokens": 1},
+        },
+        {"type": "message_stop"},
+    ]
+    _patch_stream(monkeypatch, "anthropic", _sse(events, anthropic=True))
+
+    observed = _collect(
+        AnthropicProvider(api_key="test", model="claude-test"),
+        config=ChatConfig(candidate_output_mode="inert_artifact"),
+    )
+
+    artifact_text = next(
+        event.text for event in observed if isinstance(event, TextDeltaEvent)
+    )
+    assert json.loads(artifact_text)["actions"] == [
+        {
+            "arguments_text": "{}",
+            "issues": [],
+            "name_text": "get_status",
+        }
+    ]
+    assert not any(isinstance(event, ErrorEvent) for event in observed)
+    assert any(isinstance(event, DoneEvent) for event in observed)
+
+
+def test_anthropic_candidate_mode_drops_nameless_empty_tool_block(
+    monkeypatch: Any,
+) -> None:
+    events = [
+        {
+            "type": "message_start",
+            "message": {"id": "msg_1", "usage": {"input_tokens": 2}},
+        },
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": "toolu_private",
+                "input": {},
+            },
+        },
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use"},
+            "usage": {"output_tokens": 1},
+        },
+        {"type": "message_stop"},
+    ]
+    _patch_stream(monkeypatch, "anthropic", _sse(events, anthropic=True))
+
+    observed = _collect(
+        AnthropicProvider(api_key="test", model="claude-test"),
+        config=ChatConfig(candidate_output_mode="inert_artifact"),
+    )
+
+    assert not any(isinstance(event, TextDeltaEvent) for event in observed)
+    assert not any(
+        isinstance(event, ToolUseStartEvent | ToolUseDeltaEvent | ToolUseEndEvent)
+        for event in observed
+    )
+    assert not any(isinstance(event, ErrorEvent) for event in observed)
+    assert any(isinstance(event, DoneEvent) for event in observed)
+
+
+def test_anthropic_candidate_mode_rejects_duplicate_tool_block_stop(
+    monkeypatch: Any,
+) -> None:
+    events = [
+        *_anthropic_tool_prefix(),
+        {"type": "content_block_stop", "index": 0},
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use"},
+            "usage": {"output_tokens": 1},
+        },
+        {"type": "message_stop"},
+    ]
+    _patch_stream(monkeypatch, "anthropic", _sse(events, anthropic=True))
+
+    observed = _collect(
+        AnthropicProvider(api_key="test", model="claude-test"),
+        config=ChatConfig(candidate_output_mode="inert_artifact"),
+    )
+
+    assert not any(isinstance(event, TextDeltaEvent) for event in observed)
+    assert not any(isinstance(event, DoneEvent) for event in observed)
+    assert any(
+        isinstance(event, ErrorEvent) and event.code == "incomplete_tool_call"
+        for event in observed
+    )
+
+
+def test_anthropic_candidate_mode_rejects_unmatched_content_block_stop(
+    monkeypatch: Any,
+) -> None:
+    events = [
+        {
+            "type": "message_start",
+            "message": {"id": "msg_1", "usage": {"input_tokens": 2}},
+        },
+        {"type": "content_block_stop", "index": 9},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 1},
+        },
+        {"type": "message_stop"},
+    ]
+    _patch_stream(monkeypatch, "anthropic", _sse(events, anthropic=True))
+
+    observed = _collect(
+        AnthropicProvider(api_key="test", model="claude-test"),
+        config=ChatConfig(candidate_output_mode="inert_artifact"),
+    )
+
+    assert not any(isinstance(event, TextDeltaEvent) for event in observed)
+    assert not any(isinstance(event, DoneEvent) for event in observed)
+    assert any(
+        isinstance(event, ErrorEvent) and event.code == "incomplete_tool_call"
+        for event in observed
     )
 
 

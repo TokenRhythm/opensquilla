@@ -274,6 +274,28 @@ async def test_create_source_rejects_scratch_path(
 
 
 @pytest.mark.asyncio
+async def test_edit_source_rejects_scratch_path(
+    workspace_context: tuple[Path, ToolContext],
+) -> None:
+    workspace, ctx = workspace_context
+    edit_source = _original_async(filesystem.edit_source)
+    scratch = workspace / ".opensquilla-scratch"
+    scratch.mkdir()
+    target = scratch / "repro.py"
+    target.write_text("before\n", encoding="utf-8")
+    ctx.scratch_dir = str(scratch)
+
+    with pytest.raises(ToolError, match="edit_source refused a scratch path"):
+        await edit_source(
+            ".opensquilla-scratch/repro.py",
+            "unused-revision",
+            [{"start_line": 1, "end_line": 1, "replacement": "after\n"}],
+        )
+
+    assert target.read_text(encoding="utf-8") == "before\n"
+
+
+@pytest.mark.asyncio
 async def test_write_scratch_writes_only_configured_scratch_dir(
     workspace_context: tuple[Path, ToolContext],
 ) -> None:
@@ -296,6 +318,25 @@ async def test_write_scratch_writes_only_configured_scratch_dir(
     assert target.read_text(encoding="utf-8") == "print('x')\n"
     assert ctx.scratch_file_writes[-1]["relative_path"] == "repro.py"
     assert ctx.workspace_mutation_receipts == []
+
+
+@pytest.mark.parametrize("scratch_relation", ["workspace_ancestor", "same_root"])
+@pytest.mark.asyncio
+async def test_write_scratch_rejects_workspace_target_for_overlapping_roots(
+    workspace_context: tuple[Path, ToolContext],
+    scratch_relation: str,
+) -> None:
+    workspace, ctx = workspace_context
+    write_scratch = _original_async(filesystem.write_scratch)
+    ctx.scratch_dir = str(
+        workspace.parent if scratch_relation == "workspace_ancestor" else workspace
+    )
+
+    target = workspace / "src.py"
+    with pytest.raises(ToolError, match="workspace target"):
+        await write_scratch(str(target), "changed\n")
+
+    assert not target.exists()
 
 
 @pytest.mark.asyncio

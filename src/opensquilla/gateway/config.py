@@ -30,7 +30,7 @@ from opensquilla.gateway.config_migration import (
     backup_and_write_migrated_config,
     migrate_config_payload,
 )
-from opensquilla.paths import default_opensquilla_home
+from opensquilla.paths import default_opensquilla_home, native_io_path
 from opensquilla.provider.preset_registry import get_preset, legacy_profile_ids
 from opensquilla.router_tiers import (
     DEFAULT_TEXT_TIER,
@@ -144,8 +144,9 @@ class ControlUiConfig(BaseSettings):
     # ``legacy`` spelling to it with a deprecation warning.
     frontend: Literal["vue"] = "vue"
     # Default UI locale served on first paint when the browser has no saved
-    # preference. The client (localStorage) and a manual switch always override
-    # it. Anything zh* clamps to zh-Hans; anything else to en.
+    # preference, and the Gateway-wide language for fixed channel notices.
+    # The client (localStorage) and a manual switch always override it. Anything
+    # zh* clamps to zh-Hans; anything else to en.
     default_locale: Literal["en", "zh-Hans", "ja", "fr", "de", "es"] = "en"
     allowed_origins: list[str] = Field(default_factory=list)
 
@@ -244,6 +245,12 @@ class ToolsConfig(BaseModel):
     allow: list[str] = Field(default_factory=list)
     deny: list[str] = Field(default_factory=list)
     also_allow: list[str] = Field(default_factory=list)
+    # Model-facing tool description overrides. Keys name a tool
+    # ("exec_command") or a parameter ("exec_command.command" — dotted keys
+    # must be quoted in TOML); values replace the matching description
+    # verbatim. Inert unless the OPENSQUILLA_TOOL_DESCRIPTION_OVERRIDES env
+    # var enables them ("config"/"on", or a .toml/.json override file path).
+    description_overrides: dict[str, str] = Field(default_factory=dict)
     workspace_write_deny_globs: list[str] = Field(default_factory=list)
     file_edit_requires_fresh_read: bool | None = None
     file_edit_flexible_recovery: bool | None = None
@@ -473,6 +480,9 @@ class LlmEnsembleConfig(BaseSettings):
     selection_mode: Literal[
         "router_dynamic", "static_openrouter_b5", "static_tokenrhythm_b5", "custom_b5"
     ] = "static_openrouter_b5"
+    # Expose tool schemas to proposers as advisory vocabulary only. Proposer
+    # output is never dispatched; only the aggregator owns an executable tool
+    # boundary.
     proposer_tools: bool = False
     min_successful_proposers: int = Field(default=1, ge=1)
     all_failed_policy: Literal["fallback_single", "error"] = "fallback_single"
@@ -2564,6 +2574,11 @@ class GatewayConfig(BaseSettings):
             data.pop("search_api_key_env", None)
         elif not data.get("search_api_key"):
             data.pop("search_api_key", None)
+        tools_table = data.get("tools")
+        if isinstance(tools_table, dict) and not tools_table.get("description_overrides"):
+            # Keep written configs byte-identical to pre-mechanism output when
+            # no overrides are configured.
+            tools_table.pop("description_overrides", None)
         # Heuristic guard for the pre-provenance era: a value equal to the
         # env var is assumed env-sourced and dropped. Skipped when the
         # operator explicitly entered the key (recorded by
@@ -2607,11 +2622,11 @@ class GatewayConfig(BaseSettings):
         privacy = data.get("privacy")
         if isinstance(privacy, dict):
             from opensquilla.observability.network_policy import (
-                network_observability_disabled,
+                provider_request_correlation_disabled,
             )
 
             privacy["network_observability_disabled_effective"] = (
-                network_observability_disabled(config=self)
+                provider_request_correlation_disabled(config=self)
             )
         return data
 
@@ -2795,7 +2810,7 @@ class GatewayConfig(BaseSettings):
         import tomllib
 
         target = Path(path)
-        with open(target, "rb") as f:
+        with open(native_io_path(target), "rb") as f:
             data = tomllib.load(f)
         migration = migrate_config_payload(data)
         cfg = cls(**migration.payload)
@@ -2832,8 +2847,9 @@ class GatewayConfig(BaseSettings):
             candidates.append((default_opensquilla_home() / "config.toml").expanduser())
 
         for path in candidates:
-            if path.is_file():
-                with open(path, "rb") as f:
+            native_path = native_io_path(path)
+            if native_path.is_file():
+                with open(native_path, "rb") as f:
                     data = tomllib.load(f)
                 migration = migrate_config_payload(data, emit_diagnostics=not read_only)
                 cfg = cls(**migration.payload)

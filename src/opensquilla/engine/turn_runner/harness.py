@@ -258,6 +258,7 @@ class _TurnRunnerPipelineExecutionAdapter(PipelineExecutionPort):
             "input_provenance": request.input_provenance,
             "skill_catalog": request.skill_catalog,
             "usage_execution_context": request.usage_execution_context,
+            "provider_request_correlation": request.provider_request_correlation,
         }
         accepted_kwargs = {
             name: value
@@ -736,6 +737,7 @@ class _TurnRunnerAgentFactoryAdapter(AgentFactoryPort):
         session_epoch: int = 0,
         agent_id: str = "",
         run_kind: str = "agent",
+        provider_request_correlation: Any | None = None,
     ) -> Agent:
         from opensquilla.engine.agent import Agent
 
@@ -770,6 +772,7 @@ class _TurnRunnerAgentFactoryAdapter(AgentFactoryPort):
             tool_context=tool_context,
             usage_event_sink=usage_event_sink,
             usage_execution_context=usage_execution_context,
+            provider_request_correlation=provider_request_correlation,
         )
 
 
@@ -797,13 +800,25 @@ class _TurnRunnerT3UpgradeCompactionAdapter(T3UpgradeCompactionPort):
         context_window_tokens: int,
         compaction_provider: Any | None,
         compaction_model: str | None,
+        provider_request_correlation: Any | None = None,
     ) -> str:
+        from opensquilla.engine.runtime import _accepts_keyword_arg
+
+        correlation_kwargs: dict[str, Any] = {}
+        if _accepts_keyword_arg(
+            self._runner._maybe_compact_on_t3_upgrade,
+            "provider_request_correlation",
+        ):
+            correlation_kwargs["provider_request_correlation"] = (
+                provider_request_correlation
+            )
         return await self._runner._maybe_compact_on_t3_upgrade(
             session_key,
             turn,
             context_window_tokens,
             compaction_provider=compaction_provider,
             compaction_model=compaction_model,
+            **correlation_kwargs,
         )
 
 class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
@@ -823,12 +838,24 @@ class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
         context_window_tokens: int,
         compaction_provider: Any | None,
         compaction_model: str | None,
+        provider_request_correlation: Any | None = None,
     ) -> None:
+        from opensquilla.engine.runtime import _accepts_keyword_arg
+
+        correlation_kwargs: dict[str, Any] = {}
+        if _accepts_keyword_arg(
+            self._runner._maybe_preflight_compact,
+            "provider_request_correlation",
+        ):
+            correlation_kwargs["provider_request_correlation"] = (
+                provider_request_correlation
+            )
         await self._runner._maybe_preflight_compact(
             session_key,
             context_window_tokens,
             compaction_provider=compaction_provider,
             compaction_model=compaction_model,
+            **correlation_kwargs,
         )
 
 class _TurnRunnerHistoryLoaderAdapter(HistoryLoaderPort):

@@ -118,8 +118,9 @@ def test_bare_chat_ignores_stale_internal_backend_and_falls_back(
     assert os.environ[OPENSQUILLA_TUI_BACKEND_ENV] == "native"
 
 
-def test_bare_chat_keeps_installed_or_unsupported_fallback_quiet(
+def test_bare_chat_installed_fallback_notice_shows_once_per_version_and_reason(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     from opensquilla.cli.tui import source_checkout
@@ -131,14 +132,16 @@ def test_bare_chat_keeps_installed_or_unsupported_fallback_quiet(
         RendererBackendUnavailableReason,
     )
 
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path))
     original_backend = os.environ.pop(OPENSQUILLA_TUI_BACKEND_ENV, None)
+    reason_code = RendererBackendUnavailableReason.MISSING
     monkeypatch.setattr(
         opentui_bridge.OpenTuiRendererBackend,
         "is_available",
         lambda self: RendererBackendAvailability(
             available=False,
             reason="host missing",
-            reason_code=RendererBackendUnavailableReason.MISSING,
+            reason_code=reason_code,
         ),
     )
     monkeypatch.setattr(source_checkout, "resolve_tui_source_checkout_hint", lambda: None)
@@ -164,7 +167,7 @@ def test_bare_chat_keeps_installed_or_unsupported_fallback_quiet(
     async def fake_gateway(**_kwargs: Any) -> None:
         events.append("run")
 
-    try:
+    def launch() -> None:
         launch_bridge.launch_chat(
             model="",
             session_id="",
@@ -177,9 +180,27 @@ def test_bare_chat_keeps_installed_or_unsupported_fallback_quiet(
             output_console=output_console,
         )
 
+    try:
+        # First launch on this install: exactly one dim explanation with the
+        # remedy pointer, after the screen clear.
+        launch()
         assert events == ["validate", "preflight", "clear", "run"]
         assert os.environ[OPENSQUILLA_TUI_BACKEND_ENV] == "native"
-        assert output_console.prints == []
+        assert len(output_console.prints) == 1
+        notice = str(output_console.prints[0])
+        assert "Full-screen TUI unavailable" in notice
+        assert "using plain mode" in notice
+        assert "opensquilla doctor" in notice
+
+        # Second launch with the same version and reason: quiet again.
+        launch()
+        assert len(output_console.prints) == 1
+
+        # A different unavailability reason is new information: one fresh line.
+        reason_code = RendererBackendUnavailableReason.VERSION_MISMATCH
+        launch()
+        assert len(output_console.prints) == 2
+
         captured = capsys.readouterr()
         assert captured.out == ""
         assert captured.err == ""
@@ -729,3 +750,78 @@ def test_launch_chat_command_keeps_legacy_override_mapping() -> None:
             "gateway_runner": fake_gateway,
         }
     ]
+
+
+def test_fallback_notice_phrases_key_only_stable_reason_codes() -> None:
+    from opensquilla.cli.tui.adapters.launch_bridge import _FALLBACK_NOTICE_PHRASES
+    from opensquilla.cli.tui.renderers.selection import RendererBackendUnavailableReason
+
+    codes = {reason.value for reason in RendererBackendUnavailableReason}
+    assert set(_FALLBACK_NOTICE_PHRASES) <= codes
+
+
+def test_fallback_notice_prints_raw_code_for_unmapped_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.cli.tui import source_checkout
+    from opensquilla.cli.tui.adapters import launch_bridge
+    from opensquilla.cli.tui.renderers.selection import (
+        ChatUiFallback,
+        RendererBackendUnavailableReason,
+    )
+
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(source_checkout, "resolve_tui_source_checkout_hint", lambda: None)
+    console = FakeConsole()
+    selection = SimpleNamespace(
+        fallback=ChatUiFallback(
+            code=RendererBackendUnavailableReason.RUNTIME_CRASH,
+            detail="host exited 1",
+        )
+    )
+
+    launch_bridge._print_tui_fallback_after_clear(
+        selection, implicit_ui=True, output_console=console
+    )
+
+    assert len(console.prints) == 1
+    # No phrase mapping for runtime_crash: the stable code itself is printed.
+    assert "runtime_crash" in str(console.prints[0])
+
+
+def test_fallback_notice_repeats_when_the_record_cannot_be_written(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.cli.tui import source_checkout
+    from opensquilla.cli.tui.adapters import launch_bridge
+    from opensquilla.cli.tui.opentui import prefs
+    from opensquilla.cli.tui.renderers.selection import (
+        ChatUiFallback,
+        RendererBackendUnavailableReason,
+    )
+
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(source_checkout, "resolve_tui_source_checkout_hint", lambda: None)
+    monkeypatch.setattr(
+        "opensquilla.cli.tui.opentui.prefs._store",
+        lambda _prefs: None,  # simulate a write that silently fails
+    )
+    console = FakeConsole()
+    selection = SimpleNamespace(
+        fallback=ChatUiFallback(
+            code=RendererBackendUnavailableReason.MISSING,
+            detail="no companion",
+        )
+    )
+
+    for _ in range(2):
+        launch_bridge._print_tui_fallback_after_clear(
+            selection, implicit_ui=True, output_console=console
+        )
+
+    # Fail open: with no durable record the notice repeats — degrading loud,
+    # never silent.
+    assert len(console.prints) == 2
+    assert prefs.fallback_notice_due("x", "missing") is True

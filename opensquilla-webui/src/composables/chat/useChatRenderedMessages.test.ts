@@ -432,9 +432,230 @@ describe('useChatRenderedMessages router visual mode', () => {
       'glm-5.2',
     ])
   })
+
+  it('keeps one router render key when a live strip becomes a settled trace', () => {
+    const messages = ref<ChatMessage[]>([
+      {
+        role: 'user',
+        text: 'compare candidates',
+        ts: 1,
+        clientId: 'local-user-turn',
+        messageId: 'server-user-turn',
+      },
+      {
+        role: 'router',
+        text: '',
+        ts: 2,
+        messageId: 'router-live-event',
+        provenanceKind: 'router_decision',
+        routerDecision: {
+          tier: 'c1',
+          model: 'qwen/qwen3.7-plus',
+          source: 'llm_ensemble',
+        },
+      },
+    ])
+    const isStreaming = ref(true)
+    const api = useChatRenderedMessages({
+      messages,
+      sessionKey: ref('router-stable-key-test'),
+      routerSlots: ref([]),
+      routerModels: ref({}),
+      routerTierConfigs: ref({}),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+      modelRoutingMode: ref('llm_ensemble'),
+      isStreaming,
+    })
+
+    const liveKey = api.renderedMessages.value.find(message => message.isRouterStrip)?.routerTurnKey
+
+    messages.value.push({
+      role: 'assistant',
+      text: 'Settled answer.',
+      ts: 3,
+      messageId: 'assistant-settled',
+      usage: {
+        model_usage_breakdown: [
+          { role: 'proposer', provider: 'openrouter', model: 'qwen/qwen3.7-plus' },
+          { role: 'aggregator', provider: 'openrouter', model: 'z-ai/glm-5.2' },
+        ],
+        ensemble_trace: {
+          profile: 'default',
+          total_candidates: 1,
+          llm_request_count: 2,
+        },
+      },
+    })
+    isStreaming.value = false
+
+    const settledKey = api.renderedMessages.value.find(message => message.isRouterStrip)?.routerTurnKey
+    expect(liveKey).toBe('router-turn:local-user-turn')
+    expect(settledKey).toBe(liveKey)
+  })
 })
 
 describe('useChatRenderedMessages per-turn usage', () => {
+  it('marks partial assistant output when a following error terminates the turn', () => {
+    const api = renderedMessagesFor([
+      {
+        role: 'user',
+        text: 'run the task',
+        ts: 1,
+        messageId: 'user-1',
+      },
+      {
+        role: 'assistant',
+        text: 'Partial result',
+        ts: 2,
+        messageId: 'assistant-partial',
+        tool_calls: [{
+          id: 'read-1',
+          name: 'read_file',
+          input: { path: '/repo/file.ts' },
+          result: 'content',
+        }],
+      },
+      {
+        role: 'error',
+        text: 'Provider failed',
+        ts: 3,
+        messageId: 'error-1',
+      },
+    ])
+
+    const assistant = api.renderedMessages.value.find(
+      message => message.displayRole === 'assistant',
+    )
+    expect(assistant?.terminalFailure).toBe(true)
+    expect(assistant?.text).toBe('Partial result')
+  })
+
+  it('marks partial assistant output failed after a durable terminal system row is restored', () => {
+    const api = renderedMessagesFor([
+      {
+        role: 'user',
+        text: 'run the task',
+        ts: 1,
+        messageId: 'user-1',
+        restoredFromHistory: true,
+      },
+      {
+        role: 'assistant',
+        text: 'Partial result',
+        ts: 2,
+        messageId: 'assistant-partial',
+        restoredFromHistory: true,
+        turnId: 'turn-1',
+      },
+      {
+        role: 'system',
+        text: 'localized durable terminal detail',
+        ts: 3,
+        messageId: 'system-terminal-1',
+        restoredFromHistory: true,
+        turnId: 'turn-1',
+      },
+    ])
+
+    const assistant = api.renderedMessages.value.find(
+      message => message.displayRole === 'assistant',
+    )
+    expect(assistant?.terminalFailure).toBe(true)
+  })
+
+  it('does not treat ordinary local or provenance-tagged system rows as terminal failures', () => {
+    const local = renderedMessagesFor([
+      {
+        role: 'user',
+        text: 'run the task',
+        ts: 1,
+        messageId: 'user-1',
+      },
+      {
+        role: 'assistant',
+        text: 'Completed result',
+        ts: 2,
+        messageId: 'assistant-complete',
+      },
+      {
+        role: 'system',
+        text: 'ordinary local notice',
+        ts: 3,
+      },
+    ])
+    const durableCron = renderedMessagesFor([
+      {
+        role: 'user',
+        text: 'run the task',
+        ts: 1,
+        messageId: 'user-2',
+        restoredFromHistory: true,
+      },
+      {
+        role: 'assistant',
+        text: 'Completed result',
+        ts: 2,
+        messageId: 'assistant-complete-2',
+        restoredFromHistory: true,
+      },
+      {
+        role: 'system',
+        text: 'ordinary durable notice',
+        ts: 3,
+        messageId: 'system-cron-1',
+        restoredFromHistory: true,
+        provenanceKind: 'cron',
+      },
+    ])
+
+    const localAssistant = local.renderedMessages.value.find(
+      message => message.displayRole === 'assistant',
+    )
+    const cronAssistant = durableCron.renderedMessages.value.find(
+      message => message.displayRole === 'assistant',
+    )
+    expect(localAssistant?.terminalFailure).toBeUndefined()
+    expect(cronAssistant?.terminalFailure).toBeUndefined()
+  })
+
+  it('does not treat an unprovenanced durable system row without matching turn identity as terminal', () => {
+    const api = renderedMessagesFor([
+      {
+        role: 'user',
+        text: 'run the task',
+        ts: 1,
+        messageId: 'user-3',
+        restoredFromHistory: true,
+        turnId: 'turn-3',
+      },
+      {
+        role: 'assistant',
+        text: 'Completed result',
+        ts: 2,
+        messageId: 'assistant-complete-3',
+        restoredFromHistory: true,
+        turnId: 'turn-3',
+      },
+      {
+        role: 'system',
+        text: 'ordinary injected durable notice',
+        ts: 3,
+        messageId: 'system-injected-1',
+        restoredFromHistory: true,
+      },
+    ])
+
+    const assistant = api.renderedMessages.value.find(
+      message => message.displayRole === 'assistant',
+    )
+    expect(assistant?.terminalFailure).toBeUndefined()
+  })
+
   it('keeps each assistant message token counts independent', () => {
     const api = renderedMessagesFor([
       {
@@ -690,6 +911,100 @@ describe('useChatRenderedMessages ensemble metadata', () => {
     ])
   })
 
+  it('preserves candidate terminal status from the ensemble trace after settlement', () => {
+    const api = renderedMessagesFor([
+      {
+        role: 'assistant',
+        text: 'fused answer',
+        ts: 0,
+        usage: {
+          model_usage_breakdown: [
+            {
+              role: 'proposer',
+              label: 'proposer_1',
+              provider: 'openrouter',
+              model: 'deepseek/deepseek-v4-pro',
+              sample_index: 0,
+              input_tokens: 10,
+              output_tokens: 2,
+              elapsed_ms: 5_700,
+            },
+            {
+              role: 'aggregator',
+              label: 'aggregator',
+              provider: 'openrouter',
+              model: 'z-ai/glm-5.2',
+              input_tokens: 20,
+              output_tokens: 8,
+              elapsed_ms: 12_000,
+            },
+          ],
+          ensemble_trace: {
+            profile: 'default',
+            total_candidates: 3,
+            candidates: [
+              {
+                label: 'proposer_1',
+                provider: 'openrouter',
+                model: 'deepseek/deepseek-v4-pro',
+                sample_index: 0,
+                ok: true,
+                elapsed_ms: 5_700,
+              },
+              {
+                label: 'proposer_2',
+                provider: 'openrouter',
+                model: 'z-ai/glm-5.2',
+                sample_index: 0,
+                ok: false,
+                elapsed_ms: 21_000,
+                error: 'proposer cancelled after 5s ensemble quorum grace',
+                error_code: 'quorum_cancelled',
+              },
+              {
+                label: 'proposer_3',
+                provider: 'openrouter',
+                model: 'moonshotai/kimi-k2.7',
+                sample_index: 0,
+                ok: false,
+                elapsed_ms: 7_000,
+                error: 'provider timed out',
+                error_code: 'timeout',
+              },
+            ],
+          },
+        },
+      },
+    ])
+
+    const models = api.renderedMessages.value[0].meta?.ensemble?.models
+    expect(models).toHaveLength(4)
+    expect(models?.[0]).toMatchObject({
+      model: 'deepseek/deepseek-v4-pro',
+      input: 10,
+      output: 2,
+      status: 'done',
+    })
+    expect(models?.[1]).toMatchObject({
+      model: 'z-ai/glm-5.2',
+      status: 'skipped',
+      errorCode: 'quorum_cancelled',
+      elapsedMs: 21_000,
+    })
+    expect(models?.[2]).toMatchObject({
+      model: 'moonshotai/kimi-k2.7',
+      status: 'failed',
+      errorCode: 'timeout',
+    })
+    expect(models?.[3]).toMatchObject({
+      role: 'aggregator',
+      model: 'z-ai/glm-5.2',
+      input: 20,
+      output: 8,
+    })
+    expect(models?.[3]?.status).toBeUndefined()
+  })
+
   it('does not undercount requests when a turn has multiple ensemble breakdown rows', () => {
     const api = renderedMessagesFor([
       {
@@ -712,5 +1027,84 @@ describe('useChatRenderedMessages ensemble metadata', () => {
     ])
 
     expect(api.renderedMessages.value[0].meta?.ensemble?.requestCount).toBe(4)
+  })
+
+  it('does not count an unavailable trace candidate as a physical request', () => {
+    const api = renderedMessagesFor([
+      {
+        role: 'assistant',
+        text: 'fused answer',
+        ts: 0,
+        usage: {
+          model_usage_breakdown: [
+            {
+              role: 'proposer',
+              label: 'proposer_1',
+              provider: 'openrouter',
+              model: 'p1',
+            },
+            {
+              role: 'proposer',
+              label: 'proposer_2',
+              provider: 'openrouter',
+              model: 'p2',
+            },
+            {
+              role: 'proposer',
+              label: 'proposer_3',
+              provider: 'openrouter',
+              model: 'p3',
+            },
+            {
+              role: 'aggregator',
+              label: 'aggregator',
+              provider: 'openrouter',
+              model: 'agg',
+            },
+          ],
+          ensemble_trace: {
+            profile: 'default',
+            total_candidates: 4,
+            llm_request_count: 4,
+            candidates: [
+              {
+                label: 'proposer_1',
+                provider: 'openrouter',
+                model: 'p1',
+                request_started: true,
+                ok: true,
+              },
+              {
+                label: 'proposer_2',
+                provider: 'openrouter',
+                model: 'p2',
+                request_started: true,
+                ok: true,
+              },
+              {
+                label: 'proposer_3',
+                provider: 'openrouter',
+                model: 'p3',
+                request_started: true,
+                ok: true,
+              },
+              {
+                label: 'proposer_4',
+                provider: 'openrouter',
+                model: 'unavailable',
+                request_started: false,
+                ok: false,
+                error: 'proposer deployment is not ready',
+                error_code: 'deployment_unavailable',
+              },
+            ],
+          },
+        },
+      },
+    ])
+
+    const ensemble = api.renderedMessages.value[0].meta?.ensemble
+    expect(ensemble?.models).toHaveLength(5)
+    expect(ensemble?.requestCount).toBe(4)
   })
 })

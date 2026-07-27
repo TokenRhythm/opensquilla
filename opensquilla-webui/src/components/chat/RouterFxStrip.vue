@@ -42,22 +42,24 @@
         <div class="router-fx-inspector__rows">
           <div
             v-for="model in ensembleModels"
-            :key="`${model.role}:${model.provider}:${model.model}`"
+            :key="`${model.role}:${model.provider}:${model.model}:${model.sampleIndex || 0}`"
             class="router-fx-inspector__row"
             :class="{
               'router-fx-inspector__row--running': model.status === 'running',
               'router-fx-inspector__row--failed': model.status === 'failed',
+              'router-fx-inspector__row--skipped': model.status === 'skipped',
             }"
             :data-status="model.status || undefined"
           >
             <span class="router-fx-inspector__role">{{ model.role }}</span>
             <span class="router-fx-inspector__model" :title="model.model">{{ model.modelShort }}</span>
-            <span class="router-fx-inspector__usage" :title="model.error || undefined">
+            <span class="router-fx-inspector__usage" :title="ensembleModelTitle(model)">
               <span
                 v-if="model.status === 'running'"
                 class="router-fx-inspector__spin"
                 aria-hidden="true"
               ></span>
+              <template v-else-if="model.status === 'skipped'">{{ ensembleModelSkipped(model) }}</template>
               <template v-else-if="model.status === 'failed'">{{ ensembleModelFailure(model) }}</template>
               <template v-else>{{ ensembleModelUsage(model) }}</template>
             </span>
@@ -188,7 +190,7 @@ const hasAggregator = computed(() =>
 )
 const allMembersTerminal = computed(() =>
   hasEnsembleModels.value && ensembleModels.value.every(
-    member => member.status === 'done' || member.status === 'failed',
+    member => member.status === 'done' || member.status === 'failed' || member.status === 'skipped',
   ),
 )
 const isEnsembleDone = computed(
@@ -422,6 +424,19 @@ function ensembleModelFailure(model: ChatEnsembleMetaModel): string {
   const failed = t('chat.routerFx.ensembleFailed')
   const elapsed = ensembleModelElapsed(model)
   return elapsed ? `${failed} · ${elapsed}` : failed
+}
+
+function ensembleModelSkipped(model: ChatEnsembleMetaModel): string {
+  const skipped = t('chat.routerFx.ensembleQuorumSkipped')
+  const elapsed = ensembleModelElapsed(model)
+  return elapsed ? `${skipped} · ${elapsed}` : skipped
+}
+
+function ensembleModelTitle(model: ChatEnsembleMetaModel): string | undefined {
+  if (model.status === 'skipped' && model.errorCode === 'quorum_cancelled') {
+    return t('chat.routerFx.ensembleQuorumSkippedDetail')
+  }
+  return model.error || undefined
 }
 
 function ensembleModelElapsed(model: ChatEnsembleMetaModel): string {
@@ -705,7 +720,7 @@ function ensembleModelElapsed(model: ChatEnsembleMetaModel): string {
 
 .router-fx-inspector__row {
   display: grid;
-  grid-template-columns: 74px minmax(0, 1fr) 64px;
+  grid-template-columns: 74px minmax(0, 1fr) minmax(64px, max-content);
   align-items: center;
   gap: 7px;
   min-height: 24px;
@@ -757,6 +772,11 @@ function ensembleModelElapsed(model: ChatEnsembleMetaModel): string {
 .router-fx-inspector__row--failed .router-fx-inspector__model,
 .router-fx-inspector__row--failed .router-fx-inspector__usage {
   color: var(--danger);
+}
+
+.router-fx-inspector__row--skipped .router-fx-inspector__model,
+.router-fx-inspector__row--skipped .router-fx-inspector__usage {
+  color: var(--router-muted);
 }
 
 .router-fx-inspector__spin {
