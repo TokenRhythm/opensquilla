@@ -57,6 +57,7 @@
               @keydown.enter.prevent="browse(locationDraft)"
             />
             <button
+              v-if="systemPickerAvailable"
               type="button"
               class="btn btn--ghost project-picker__action project-picker__browse"
               :disabled="systemPickerBusy"
@@ -195,6 +196,7 @@ const error = ref('')
 const creatingDirectory = ref(false)
 const creatingDirectoryBusy = ref(false)
 const systemPickerBusy = ref(false)
+const systemPickerAvailable = ref(false)
 const newDirectoryName = ref('')
 let openEpoch = 0
 let browseSequence = 0
@@ -254,6 +256,7 @@ async function browse(target?: string, epoch = openEpoch) {
     locationDraft.value = resolved
     selectedDirectory.value = resolved
     parentDirectory.value = response.parentPath ?? null
+    systemPickerAvailable.value = response.systemPickerAvailable === true
     entries.value = Array.isArray(response.entries) ? response.entries : []
     phase.value = 'web-ready'
   } catch (cause) {
@@ -409,6 +412,7 @@ watch(
     creatingDirectory.value = false
     creatingDirectoryBusy.value = false
     systemPickerBusy.value = false
+    systemPickerAvailable.value = false
     newDirectoryName.value = ''
     if (!open) {
       phase.value = 'closed'

@@ -62,6 +62,7 @@ function pathResult(
     kind?: 'directory' | 'file'
     selectable?: boolean
   }>,
+  systemPickerAvailable = true,
 ): SandboxPathListResponse {
   const parent = currentPath === '/'
     ? null
@@ -70,6 +71,7 @@ function pathResult(
     currentPath,
     path: currentPath,
     parentPath: parent,
+    systemPickerAvailable,
     entries: children.map(child => {
       const item = typeof child === 'string' ? { path: child } : child
       const segments = item.path.split(/[\\/]/)
@@ -413,6 +415,17 @@ describe('ProjectWorkspacePickerDialog', () => {
     pending.resolve(pathResult('/repos', []))
     await flushPromises()
     expect(button('Choose selected directory').disabled).toBe(false)
+  })
+
+  it('hides the gateway system picker when the host reports it unavailable', async () => {
+    mocks.rpcCall.mockResolvedValue(pathResult('/repos', [], false))
+
+    await mountPicker()
+    await flushPromises()
+
+    const browseAction = [...document.querySelectorAll<HTMLButtonElement>('button')]
+      .find(candidate => candidate.textContent?.trim() === 'Browse')
+    expect(browseAction).toBeUndefined()
   })
 
   it('opens the gateway system picker and immediately chooses its directory', async () => {

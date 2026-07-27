@@ -992,6 +992,7 @@ async def _handle_sandbox_path_list(params: dict | None, ctx: RpcContext) -> dic
         "path": current_path,
         "parentPath": parent_path,
         "entries": entries,
+        "systemPickerAvailable": sys.platform != "linux",
     }
 
 

@@ -145,6 +145,7 @@ export interface SandboxPathListResponse {
   currentPath: string
   path: string
   parentPath: string | null
+  systemPickerAvailable: boolean
   entries: SandboxPathEntry[]
 }
 

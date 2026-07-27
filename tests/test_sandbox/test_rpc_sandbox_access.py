@@ -2010,6 +2010,38 @@ async def test_path_list_omitted_path_uses_agent_workspace_not_process_cwd(
     assert result["path"] == result["currentPath"]
 
 
+@pytest.mark.parametrize(
+    ("platform", "expected"),
+    [
+        ("linux", False),
+        ("darwin", True),
+        ("win32", True),
+    ],
+)
+@pytest.mark.asyncio
+async def test_path_list_reports_system_picker_availability_for_gateway_host(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    platform: str,
+    expected: bool,
+) -> None:
+    import opensquilla.gateway.rpc_sandbox as rpc_sandbox
+
+    manager = _SessionManager()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    ctx = _ctx(manager)
+    ctx.config.workspace_dir = str(workspace)
+    monkeypatch.setattr(rpc_sandbox.sys, "platform", platform)
+
+    result = await rpc_sandbox._handle_sandbox_path_list(
+        {"sessionKey": manager.node.session_key, "kind": "workspace"},
+        ctx,
+    )
+
+    assert result["systemPickerAvailable"] is expected
+
+
 @pytest.mark.asyncio
 async def test_path_list_omitted_path_uses_validated_project_session(
     project_sandbox_ctx: tuple[RpcContext, SessionNode, ProjectWorkspace],
