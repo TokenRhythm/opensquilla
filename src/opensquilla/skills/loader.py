@@ -41,8 +41,8 @@ MAX_SKILLS_PER_SOURCE = 200  # per layer cap
 
 # Bump when on-disk snapshot fields change so stale caches are invalidated
 # instead of silently losing new fields. v12 uses nanosecond mtimes and stores
-# the versioned catalog metadata used by hot reload.
-_SNAPSHOT_SCHEMA_VERSION = 12
+# the versioned catalog metadata used by hot reload. v13 adds description_zh.
+_SNAPSHOT_SCHEMA_VERSION = 13
 _COMPAT_PROBE_INTERVAL_SECONDS = 0.250
 
 Manifest = dict[str, dict[str, int]]
@@ -461,6 +461,7 @@ class SkillLoader:
                 {
                     "name": s.name,
                     "description": s.description,
+                    "description_zh": s.description_zh,
                     "layer": s.layer.value,
                     "always": s.always,
                     "triggers": s.triggers,
@@ -635,6 +636,7 @@ class SkillLoader:
                 SkillSpec(
                     name=name,
                     description=s.get("description", ""),
+                    description_zh=s.get("description_zh", "") or "",
                     layer=SkillLayer(s.get("layer", "bundled")),
                     always=s.get("always", False),
                     triggers=s.get("triggers", []),
@@ -1160,6 +1162,7 @@ class SkillLoader:
 
             name = _validated_skill_name(frontmatter["name"])
             description = frontmatter.get("description", "")
+            description_zh = frontmatter.get("description_zh", "") or ""
 
             # Simple fields
             always_raw = frontmatter.get("always", False)
@@ -1239,6 +1242,7 @@ class SkillLoader:
             return SkillSpec(
                 name=name,
                 description=description,
+                description_zh=str(description_zh),
                 layer=layer,
                 always=always,
                 triggers=triggers,

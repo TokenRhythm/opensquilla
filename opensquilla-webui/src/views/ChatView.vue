@@ -85,6 +85,7 @@
             <EmptyStateChips
               :key="landingAgentId"
               :agent-id="landingAgentId"
+              :meta-skills="metaSkillChoices"
               :suppressed="landingPrefilled"
               @pick="applyLandingSuggestion"
             />
@@ -385,7 +386,7 @@
         @click="selectSlashCmd(cmd)"
       >
         <span class="chat-slash-cmd">{{ cmd.cmd }}</span>
-        <span class="chat-slash-desc">{{ cmd.desc }}</span>
+        <span class="chat-slash-desc" :title="cmd.desc">{{ cmd.desc }}</span>
       </div>
     </div>
 
@@ -1196,6 +1197,7 @@ const chatSlashCommands = useChatSlashCommands({
 const {
   slashOpen,
   slashIdx,
+  metaSkillChoices,
   filteredSlashCmds,
   loadSlashCommands,
   handleSlashInput,

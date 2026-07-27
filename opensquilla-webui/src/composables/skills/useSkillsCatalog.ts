@@ -266,6 +266,19 @@ export function isMetaSkill(skill: Skill): boolean {
   return skill.kind === 'meta' || skill.kind === 'meta_sop'
 }
 
+// Pick the description matching the active UI locale, falling back to the
+// English `description` when no localized variant exists. Only Simplified
+// Chinese has a dedicated field today (`description_zh`); other locales and
+// remote/community skills (no `description_zh`) get the English description.
+export function localizedSkillDescription(
+  skill: Pick<Skill, 'description' | 'description_zh'>,
+  localeStr: string,
+): string {
+  const zh = skill.description_zh || ''
+  if (zh && localeStr.startsWith('zh')) return zh
+  return skill.description || ''
+}
+
 export function skillReadyRank(skill: Skill): number {
   if (skill.status === 'ready') return 0
   if (skill.status === 'not_declared') return 1

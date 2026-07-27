@@ -1965,7 +1965,33 @@
       "next12h": "Next 12 hours",
       "upcomingRun": "upcoming run",
       "nowTick": "now",
-      "deleteFailed": "Delete failed: {error}"
+      "deleteFailed": "Delete failed: {error}",
+      "bulkManage": "Bulk manage",
+      "exitBulk": "Exit bulk mode",
+      "overview": "Run overview",
+      "addFromTemplate": "Add from template",
+      "addAutomation": "Add automation",
+      "heroTitle": "Start your first automation",
+      "heroHint": "Let OpenSquilla automatically handle reminders, organization, checks, and agent tasks at the scheduled time.",
+      "overviewDesc": "Review automation status and recent execution activity.",
+      "templateDesc": "Choose a scenario to prefill its schedule and task instructions.",
+      "selectedCount": "{count} selected",
+      "selectVisible": "Select visible",
+      "clearSelection": "Clear",
+      "overviewEyebrow": "AUTOMATION OVERVIEW",
+      "galleryEyebrow": "AUTOMATION GALLERY",
+      "bulkDeleteConfirm": "Delete {count} selected automation jobs? This cannot be undone.",
+      "templates": {
+        "ai-daily": { "title": "Daily AI news briefing", "description": "Summarize important AI news from the last 24 hours with verified source links.", "category": "News & intelligence", "schedule": "Daily at 08:00" },
+        "weekly-report": { "title": "Weekly work review", "description": "Summarize progress, risks, deliverables, and next week’s priorities.", "category": "Productivity", "schedule": "Friday at 17:30" },
+        "english-five": { "title": "Five English words a day", "description": "Create a lightweight vocabulary lesson with examples and a short quiz.", "category": "Learning", "schedule": "Daily at 09:00" },
+        "project-risk": { "title": "Project risk check", "description": "Review delays, errors, and open issues and report risk levels with recommendations.", "category": "Projects", "schedule": "Weekdays at 10:00" },
+        "knowledge-review": { "title": "Weekly knowledge review", "description": "Organize new notes and meeting records and produce a follow-up reading list.", "category": "Knowledge", "schedule": "Sunday at 18:00" },
+        "daily-idea": { "title": "Daily idea and fun fact", "description": "Share one reliable fact and one small, actionable idea.", "category": "Lifestyle", "schedule": "Daily at 12:00" },
+        "bedtime-story": { "title": "Daily bedtime story", "description": "Write a warm, imaginative short story suitable for reading with children.", "category": "Family", "schedule": "Daily at 20:30" },
+        "classic-movie": { "title": "Classic movie recommendation", "description": "Recommend one acclaimed classic film with a spoiler-free introduction.", "category": "Entertainment", "schedule": "Saturday at 19:00" },
+        "today-in-history": { "title": "Today in history", "description": "Select one reliable historical event from science, culture, or society.", "category": "Daily knowledge", "schedule": "Daily at 08:30" }
+      }
     },
     "deleteDialog": {
       "title": "Delete schedule",
@@ -2008,7 +2034,8 @@
       "colSchedule": "Schedule",
       "colStatus": "Status",
       "colLastRun": "Last Run",
-      "colNextRun": "Next Run"
+      "colNextRun": "Next Run",
+      "selectJob": "Select {name}"
     },
     "runHistory": {
       "eyebrow": "Run history",
@@ -2079,6 +2106,32 @@
       "fdWebhook": "A webhook",
       "enabled": "Enabled",
       "saveSchedule": "Save schedule"
+      ,"friendlyNamePlaceholder": "For example: Organize customer feedback every day"
+      ,"friendlyTypeCron": "Repeat at a scheduled time"
+      ,"friendlyTypeEvery": "Repeat at a fixed interval"
+      ,"friendlyTypeAt": "Run once at a specified time"
+      ,"executionFrequency": "Frequency"
+      ,"daily": "Daily"
+      ,"weekdays": "Weekdays"
+      ,"weekly": "Weekly"
+      ,"monthly": "Monthly"
+      ,"customAdvancedTime": "Custom advanced schedule"
+      ,"weekday": "Day of week"
+      ,"date": "Date"
+      ,"monthlyDay": "Day {day} of each month"
+      ,"specificTime": "Time"
+      ,"customTimeHint": "Use a more flexible schedule rule."
+      ,"openAdvancedTime": "Open advanced schedule"
+      ,"everyHowOften": "Repeat every"
+      ,"timeUnit": "Time unit"
+      ,"minutes": "Minutes"
+      ,"hours": "Hours"
+      ,"days": "Days"
+      ,"dateAndTime": "Date and time"
+      ,"friendlyMessagePlaceholder": "For example: Summarize today's customer feedback and suggest next steps"
+      ,"moreRuntimeSettings": "More runtime settings (optional)"
+      ,"advancedTimeHint": "Use this only when the schedule picker above is not flexible enough."
+      ,"timezoneSimpleHint": "Usually you do not need to change this."
     },
     "form": {
       "cronPreviewPlaceholder": "Enter a 5-field cron expression to preview",
@@ -2204,6 +2257,8 @@
       "reloadNoChanges": "Skill catalog is already current (generation {generation}).",
       "reloadPartial": "Skill catalog reloaded at generation {generation} with {errors} error(s). {summary}",
       "reloadFailed": "Skill catalog reload failed: {error}",
+      "overviewTitle": "Skills overview",
+      "overviewDesc": "Review installation and configuration status. Select a category to filter skills.",
       "reloadListFailed": "The catalog reloaded, but the refreshed Skill list could not be loaded.",
       "reloadUnknownError": "The Gateway kept the previous catalog.",
       "tabsLabel": "Skill source",
@@ -2281,6 +2336,10 @@
       "unknown": "unknown",
       "noAudit": "No auto-enable decision recorded.",
       "gates": "Gates"
+    },
+    "tile": {
+      "installed": "Installed",
+      "add": "Add"
     },
     "skillCard": {
       "subSkillsTitle": "Sub-skills used by this meta-skill",
@@ -2932,6 +2991,21 @@
       "planWeek": "Draft a plan for my week",
       "searchAiNews": "Search today's AI news",
       "generateImage": "Generate an image of a tiny squid mascot"
+    },
+    "metaQuick": {
+      "webpage": "Create a multimedia webpage",
+      "shortDrama": "Create an AI short drama",
+      "paperWriting": "Write an academic paper",
+      "webpageDesc": "Build a polished, ready-to-use website",
+      "shortDramaDesc": "Create scripts, shots, and a final video",
+      "paperWritingDesc": "Research, draft, and compile a paper"
+    },
+    "metaDescriptions": {
+      "webpage": "Build a complete multimedia website from a topic.",
+      "kidsProject": "Plan a safe, age-appropriate creative project for children.",
+      "shortDrama": "Create an AI short drama from script to final video.",
+      "skillCreator": "Combine existing skills into a reusable workflow.",
+      "paperWriting": "Research, draft, and compile an academic paper."
     },
     "toast": {
       "downloadFailedHttp": "Download failed — HTTP {status}",

@@ -1,6 +1,7 @@
 ---
 name: pptx
 description: "Read, edit, or create PowerPoint .pptx files. Trigger this skill whenever the user mentions a deck, slides, slide deck, presentation, or a `.pptx` filename — whether the goal is to extract text, modify an existing deck, build one from scratch, or prepare slides for review. Three execution paths are supported: text extraction (always available), template editing (unzip → patch slide XML → repack), and creation from scratch (python-pptx for Python or PptxGenJS for Node)."
+description_zh: "读取、编辑或创建PowerPoint .pptx 文件。当用户提到演示文稿、幻灯片、slide deck、presentation 或 .pptx 文件名时触发——无论目标是提取文本、修改现有演示、从零构建还是准备评审幻灯片。支持三种执行路径：文本提取（始终可用）、模板编辑（解压→修补幻灯片XML→重新打包）以及从零创建（Python用python-pptx，Node用PptxGenJS）。"
 homepage: https://python-pptx.readthedocs.io/
 provenance:
   origin: clawhub-mit0

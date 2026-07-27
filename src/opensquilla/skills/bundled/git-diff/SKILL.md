@@ -1,6 +1,7 @@
 ---
 name: git-diff
 description: "Capture the current git diff (staged, working-tree, or staged file list) as text. Direct shell call for workflows that need repository diffs without an LLM agent loop."
+description_zh: "将当前git diff（暂存区、工作树或暂存文件列表）捕获为文本。为无需LLM代理循环即可获取仓库diff的工作流提供直接的shell调用。"
 provenance:
   origin: opensquilla-original
   license: Apache-2.0

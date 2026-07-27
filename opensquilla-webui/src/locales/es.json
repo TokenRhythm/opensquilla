@@ -1965,7 +1965,33 @@
       "next12h": "Próximas 12 horas",
       "upcomingRun": "ejecución próxima",
       "nowTick": "ahora",
-      "deleteFailed": "Error al eliminar: {error}"
+      "deleteFailed": "Error al eliminar: {error}",
+      "bulkManage": "Gestión por lotes",
+      "exitBulk": "Salir del modo por lotes",
+      "overview": "Resumen de ejecuciones",
+      "addFromTemplate": "Añadir desde plantilla",
+      "addAutomation": "Añadir automatización",
+      "heroTitle": "Inicia tu primera automatización",
+      "heroHint": "Deja que OpenSquilla gestione automáticamente recordatorios, organización, comprobaciones y tareas de agentes a la hora programada.",
+      "overviewDesc": "Consulta el estado de las automatizaciones y la actividad reciente.",
+      "templateDesc": "Elige un escenario para completar el horario y las instrucciones de la tarea.",
+      "selectedCount": "{count} seleccionados",
+      "selectVisible": "Seleccionar visibles",
+      "clearSelection": "Limpiar",
+      "overviewEyebrow": "RESUMEN DE AUTOMATIZACIONES",
+      "galleryEyebrow": "PLANTILLAS DE AUTOMATIZACIÓN",
+      "bulkDeleteConfirm": "¿Eliminar las {count} automatizaciones seleccionadas? Esta acción no se puede deshacer.",
+      "templates": {
+        "ai-daily": { "title": "Resumen diario de noticias de IA", "description": "Resume las noticias importantes de IA de las últimas 24 horas con fuentes verificadas.", "category": "Noticias", "schedule": "Cada día a las 08:00" },
+        "weekly-report": { "title": "Revisión semanal del trabajo", "description": "Resume avances, riesgos, entregas y prioridades de la próxima semana.", "category": "Productividad", "schedule": "Viernes a las 17:30" },
+        "english-five": { "title": "Cinco palabras en inglés al día", "description": "Crea una lección breve de vocabulario con ejemplos y un cuestionario.", "category": "Aprendizaje", "schedule": "Cada día a las 09:00" },
+        "project-risk": { "title": "Revisión de riesgos del proyecto", "description": "Revisa retrasos, errores y asuntos abiertos y propone acciones.", "category": "Proyectos", "schedule": "Laborables a las 10:00" },
+        "knowledge-review": { "title": "Revisión semanal de conocimientos", "description": "Organiza notas y reuniones nuevas y prepara una lista de seguimiento.", "category": "Conocimiento", "schedule": "Domingo a las 18:00" },
+        "daily-idea": { "title": "Idea y curiosidad del día", "description": "Comparte un dato fiable y una pequeña idea práctica.", "category": "Estilo de vida", "schedule": "Cada día a las 12:00" },
+        "bedtime-story": { "title": "Cuento diario para dormir", "description": "Escribe un cuento corto, cálido e imaginativo para leer en familia.", "category": "Familia", "schedule": "Cada día a las 20:30" },
+        "classic-movie": { "title": "Recomendación de cine clásico", "description": "Recomienda una película clásica reconocida con introducción sin spoilers.", "category": "Entretenimiento", "schedule": "Sábado a las 19:00" },
+        "today-in-history": { "title": "Tal día como hoy", "description": "Presenta un acontecimiento histórico fiable de ciencia, cultura o sociedad.", "category": "Conocimiento diario", "schedule": "Cada día a las 08:30" }
+      }
     },
     "deleteDialog": {
       "title": "Eliminar programación",
@@ -2008,7 +2034,8 @@
       "colSchedule": "Programación",
       "colStatus": "Estado",
       "colLastRun": "Última ejecución",
-      "colNextRun": "Próxima ejecución"
+      "colNextRun": "Próxima ejecución",
+      "selectJob": "Seleccionar {name}"
     },
     "runHistory": {
       "eyebrow": "Historial de ejecuciones",
@@ -2079,6 +2106,32 @@
       "fdWebhook": "Un webhook",
       "enabled": "Activada",
       "saveSchedule": "Guardar programación"
+      ,"friendlyNamePlaceholder": "Ejemplo: Organizar los comentarios de clientes cada día"
+      ,"friendlyTypeCron": "Repetir a una hora programada"
+      ,"friendlyTypeEvery": "Repetir a intervalo fijo"
+      ,"friendlyTypeAt": "Ejecutar una vez a una hora específica"
+      ,"executionFrequency": "Frecuencia"
+      ,"daily": "Cada día"
+      ,"weekdays": "Días laborables"
+      ,"weekly": "Cada semana"
+      ,"monthly": "Cada mes"
+      ,"customAdvancedTime": "Programación avanzada"
+      ,"weekday": "Día de la semana"
+      ,"date": "Fecha"
+      ,"monthlyDay": "Día {day} de cada mes"
+      ,"specificTime": "Hora"
+      ,"customTimeHint": "Usa una regla horaria más flexible."
+      ,"openAdvancedTime": "Abrir programación avanzada"
+      ,"everyHowOften": "Repetir cada"
+      ,"timeUnit": "Unidad de tiempo"
+      ,"minutes": "Minutos"
+      ,"hours": "Horas"
+      ,"days": "Días"
+      ,"dateAndTime": "Fecha y hora"
+      ,"friendlyMessagePlaceholder": "Ejemplo: Resumir los comentarios de clientes de hoy y sugerir próximos pasos"
+      ,"moreRuntimeSettings": "Más ajustes de ejecución (opcional)"
+      ,"advancedTimeHint": "Úsalo solo si el selector de hora anterior no es suficiente."
+      ,"timezoneSimpleHint": "Normalmente no es necesario cambiarlo."
     },
     "form": {
       "cronPreviewPlaceholder": "Introduce una expresión cron de 5 campos para previsualizar",
@@ -2204,6 +2257,8 @@
       "reloadNoChanges": "El catálogo de habilidades ya está actualizado (generación {generation}).",
       "reloadPartial": "El catálogo de habilidades se recargó en la generación {generation} con {errors} error(es). {summary}",
       "reloadFailed": "No se pudo recargar el catálogo de habilidades: {error}",
+      "overviewTitle": "Resumen de habilidades",
+      "overviewDesc": "Consulta el estado de instalación y configuración y filtra las habilidades por categoría.",
       "reloadListFailed": "El catálogo se recargó, pero no se pudo cargar la lista de habilidades actualizada.",
       "reloadUnknownError": "El Gateway conservó el catálogo anterior.",
       "tabsLabel": "Origen de la habilidad",
@@ -2281,6 +2336,10 @@
       "unknown": "desconocido",
       "noAudit": "No se registró ninguna decisión de activación automática.",
       "gates": "Compuertas"
+    },
+    "tile": {
+      "installed": "Instalado",
+      "add": "Añadir"
     },
     "skillCard": {
       "subSkillsTitle": "Subhabilidades que usa esta metahabilidad",
@@ -2932,6 +2991,21 @@
       "planWeek": "Esboza un plan para mi semana",
       "searchAiNews": "Busca las noticias de IA de hoy",
       "generateImage": "Genera una imagen de una mascota de calamar diminuto"
+    },
+    "metaQuick": {
+      "webpage": "Crear una web multimedia",
+      "shortDrama": "Crear un corto con IA",
+      "paperWriting": "Redactar un artículo académico",
+      "webpageDesc": "Crear un sitio completo y listo para usar",
+      "shortDramaDesc": "Crear guion, planos y vídeo final",
+      "paperWritingDesc": "Investigar, redactar y compilar un artículo"
+    },
+    "metaDescriptions": {
+      "webpage": "Crear un sitio multimedia completo a partir de un tema.",
+      "kidsProject": "Planificar un proyecto creativo seguro y adecuado para niños.",
+      "shortDrama": "Crear un corto con IA, del guion al vídeo final.",
+      "skillCreator": "Combinar habilidades en un flujo de trabajo reutilizable.",
+      "paperWriting": "Investigar, redactar y compilar un artículo académico."
     },
     "toast": {
       "downloadFailedHttp": "Error al descargar — HTTP {status}",

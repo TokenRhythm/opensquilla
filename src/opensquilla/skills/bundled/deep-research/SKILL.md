@@ -1,6 +1,7 @@
 ---
 name: deep-research
 description: "Multi-round research with explicit methodology, evidence tracking, and citation-tagged synthesis. Trigger on 'deep dive', 'research report', 'literature review', 'investigate X across sources', 'multi-round investigation'. Distinct from the `summarize` skill, which is a single-pass condensation; this skill maintains a state file across iterations, tracks coverage, and produces a long-form report with per-claim citations. Three execution stages: plan (scope into sub-questions), iterate (record evidence per round), compile (synthesize report). The skill itself does not fetch the web — it tells the host agent which fetches to perform via OpenSquilla's existing web tools, and records what comes back."
+description_zh: "具有明确方法论、证据追踪和带引用标注综合的多轮研究。触发词如'深入研究'、'研究报告'、'文献综述'、'跨来源调查X'、'多轮调查'。区别于单轮浓缩的 summarize 技能：本技能跨迭代维护状态文件、追踪覆盖度，并生成带逐条引用的长篇报告，分为规划、迭代、汇编三个阶段。技能本身不抓取网页，而是通过OpenSquilla现有的网页工具告知主机代理执行抓取并记录结果。"
 homepage: ""
 provenance:
   origin: clawhub-mit0

@@ -311,6 +311,7 @@ def _skill_to_dict(
     d: dict[str, Any] = {
         "name": spec.name,
         "description": spec.description,
+        "description_zh": getattr(spec, "description_zh", "") or "",
         "layer": str(spec.layer),
         "always": spec.always,
         "triggers": spec.triggers,

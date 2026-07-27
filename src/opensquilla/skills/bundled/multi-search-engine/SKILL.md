@@ -1,6 +1,7 @@
 ---
 name: multi-search-engine
 description: "Query the web through multiple search engines (Brave, Tavily, SerpAPI, DuckDuckGo, Bing, Baidu, Sogou, 360) with a single CLI surface. Trigger when the user asks for a research search, fact lookup, source discovery, or wants to compare engines for coverage. The skill aggregates per-engine result lists and normalizes them into a uniform JSON shape for downstream skills (deep-research is the primary consumer). API-key engines gate themselves on the relevant environment variable; engines requiring no key always run."
+description_zh: "通过多个搜索引擎（Brave、Tavily、SerpAPI、DuckDuckGo、Bing、Baidu、Sogou、360）以统一的CLI接口查询网络。当用户需要研究搜索、事实查找、来源发现或比较各引擎覆盖度时触发。技能会聚合各引擎结果并归一化为统一JSON结构供下游技能使用（deep-research为主要消费者）。需密钥的引擎依赖相应环境变量启用，无需密钥的引擎始终运行。"
 homepage: ""
 provenance:
   origin: clawhub-mit0

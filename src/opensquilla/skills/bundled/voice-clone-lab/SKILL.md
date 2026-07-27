@@ -1,6 +1,7 @@
 ---
 name: voice-clone-lab
 description: "Create and register cloned voices for later TTS only when the speaker has explicit consent. Use when the user asks for voice clone, clone voice, 克隆音色, 复刻声音, or wants a reusable voice_id."
+description_zh: "仅在说话者明确同意的情况下创建并注册克隆音色以供后续TTS使用。当用户需要语音克隆、克隆音色、复刻声音，或想要可复用的voice_id时使用。"
 triggers:
   - "voice clone"
   - "clone voice"

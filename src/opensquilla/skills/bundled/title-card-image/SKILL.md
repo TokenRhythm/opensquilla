@@ -1,6 +1,7 @@
 ---
 name: title-card-image
 description: "Render a static title / ending card PNG with Pillow. Centered headline + optional subtitle on a solid-colour background. CJK-friendly font fallback (Microsoft YaHei → SimHei → Songti → Noto CJK → bitmap). Pure deterministic, no LLM, no network. Used by meta-short-drama for opening and closing cards."
+description_zh: "用Pillow渲染静态片头/片尾卡PNG。纯色背景上居中的标题及可选副标题。对CJK友好的字体回退（Microsoft YaHei → SimHei → Songti → Noto CJK → 位图）。纯确定性，无LLM、无网络。由meta-short-drama用于片头和片尾卡。"
 provenance:
   origin: opensquilla-original
   license: Apache-2.0

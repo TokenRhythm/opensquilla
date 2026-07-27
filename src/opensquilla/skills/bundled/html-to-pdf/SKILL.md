@@ -1,6 +1,7 @@
 ---
 name: html-to-pdf
 description: "Render HTML (with CSS) to a PDF file. Trigger when the user wants to export a styled report, invoice, label, or any HTML/Jinja-rendered page to PDF. Uses WeasyPrint, which supports a meaningful subset of CSS Paged Media (page size, margins, headers/footers, page-break-before/after). Optional dependency — install via `pip install opensquilla[document-extras]` or `uv add weasyprint` because WeasyPrint pulls in native libraries (Pango, Cairo, fontconfig) that need OS-level packages."
+description_zh: "将HTML（含CSS）渲染为PDF文件。当用户想把带样式的报告、发票、标签或任何HTML/Jinja渲染页面导出为PDF时触发。使用WeasyPrint，支持CSS分页媒体的常用子集（页面尺寸、页边距、页眉页脚、分页控制）。可选依赖，需通过 pip install opensquilla[document-extras] 或 uv add weasyprint 安装，因其依赖Pango、Cairo、fontconfig等原生库。"
 homepage: https://weasyprint.org/
 provenance:
   origin: clawhub-mit0
