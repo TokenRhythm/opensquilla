@@ -236,3 +236,89 @@ describe('approval reconnect recovery', () => {
     }
   })
 })
+
+describe('timed approval updates', () => {
+  it('applies a post-request deadline without reconnecting or losing it to a late zero', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      const future = Date.now() / 1000 + 120
+      const payload = {
+        approval_id: 'timed',
+        namespace: 'exec',
+        session_key: 'agent:main:web',
+        tool_name: 'shell',
+        args: null,
+        warning: '',
+      }
+      runtime.handlers.get('exec.approval.requested')?.({
+        ...payload,
+        deadline: 0,
+      })
+      runtime.handlers.get('exec.approval.updated')?.({
+        ...payload,
+        deadline: future,
+      })
+      runtime.handlers.get('exec.approval.requested')?.({
+        ...payload,
+        deadline: 0,
+      })
+
+      expect(runtime.appendInterruptFrame).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          approvalId: 'timed',
+          data: expect.objectContaining({ deadline: future }),
+        }),
+      )
+      expect(runtime.handlers.has('plugin.approval.updated')).toBe(true)
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('updates rollback approval entries and ignores updates after resolution', async () => {
+    installSnapshot([{
+      id: 'timed-snapshot',
+      namespace: 'exec',
+      sessionKey: 'agent:main:web',
+      toolName: 'shell',
+      deadline: 0,
+    }])
+    const runtime = await harness()
+    try {
+      const future = Date.now() / 1000 + 120
+      const payload = {
+        approval_id: 'timed-snapshot',
+        namespace: 'exec',
+        session_key: 'agent:main:web',
+        tool_name: 'shell',
+        args: null,
+        warning: '',
+        deadline: future,
+      }
+      runtime.handlers.get('exec.approval.updated')?.(payload)
+      expect(
+        runtime.approvals.approvalEntries.value[0]?.approval.deadline,
+      ).toBe(future)
+
+      runtime.handlers.get('exec.approval.resolved')?.({
+        approval_id: 'timed-snapshot',
+        approved: false,
+        resolution: 'expired',
+      })
+      const appendCount = runtime.appendInterruptFrame.mock.calls.length
+      runtime.handlers.get('exec.approval.updated')?.({
+        ...payload,
+        deadline: future + 300,
+      })
+      expect(runtime.appendInterruptFrame).toHaveBeenCalledTimes(appendCount)
+      expect(
+        runtime.approvals.approvalEntries.value[0]?.approval.deadline,
+      ).toBe(future)
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+})

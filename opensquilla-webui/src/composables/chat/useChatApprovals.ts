@@ -570,6 +570,24 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     approvalBusyIds.value = next
   }
 
+  function applyApprovalDeadline(id: string, value: unknown) {
+    const deadline = Number(value)
+    if (!id || !Number.isFinite(deadline) || deadline <= 0) return
+    if (interruptState.value.get(id)?.resolution) return
+    const known = interruptApprovals.get(id)
+    if (known) appendApprovalInterrupt({ ...known, deadline })
+    approvalEntries.value = approvalEntries.value.map(entry => {
+      if (entry.approval.id !== id || entry.resolution !== null) return entry
+      return {
+        ...entry,
+        approval: {
+          ...entry.approval,
+          deadline,
+        },
+      }
+    })
+  }
+
   function statusResolution(payload: ApprovalStatusPayload): ChatApprovalResolution | null {
     if (payload.found === false) return 'unavailable'
     if (payload.resolved !== true) return null
@@ -603,10 +621,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     if (entry && entry.resolution === null && resolution) entry.resolution = resolution
     const keepBusy = !resolution && payload.resolutionInProgress === true
     setApprovalBusy(id, keepBusy)
-    if (payload.deadline && interruptApprovals.has(id)) {
-      const known = interruptApprovals.get(id)!
-      appendApprovalInterrupt({ ...known, deadline: Number(payload.deadline) || known.deadline })
-    }
+    applyApprovalDeadline(id, payload.deadline)
   }
 
   async function fetchApprovalStatus(
@@ -718,10 +733,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
         { id, seconds },
       )
       const deadline = Number(result?.deadline) || 0
-      const known = interruptApprovals.get(id)
-      if (deadline > 0 && known) {
-        appendApprovalInterrupt({ ...known, deadline })
-      }
+      applyApprovalDeadline(id, deadline)
       setInterruptState(id, { busy: false })
     } catch (err) {
       setInterruptState(id, {
@@ -816,6 +828,17 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     }
   }
 
+  function handleApprovalUpdated(payload: ApprovalPushPayload) {
+    const id = String(payload.approval_id || payload.approvalId || '').trim()
+    if (!id || interruptState.value.get(id)?.resolution) return
+    const data = pushPayloadToInterruptData(payload)
+    if (data) {
+      if (sessionKey.value && data.sessionKey !== sessionKey.value) return
+      appendApprovalInterrupt(data)
+    }
+    applyApprovalDeadline(id, payload.deadline)
+  }
+
   /**
    * `*.approval.resolved` push: stamp `interruptState` from `payload.approved` so
    * a decision landing elsewhere (another client) collapses
@@ -850,8 +873,10 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     const unsubs = [
       rpc.on('session.event.tool_result', handleToolResult as RpcEventHandler),
       rpc.on('exec.approval.requested', handleApprovalRequested as RpcEventHandler),
+      rpc.on('exec.approval.updated', handleApprovalUpdated as RpcEventHandler),
       rpc.on('exec.approval.resolved', handleApprovalResolved as RpcEventHandler),
       rpc.on('plugin.approval.requested', handleApprovalRequested as RpcEventHandler),
+      rpc.on('plugin.approval.updated', handleApprovalUpdated as RpcEventHandler),
       rpc.on('plugin.approval.resolved', handleApprovalResolved as RpcEventHandler),
       rpc.on('_state', handleConnectionState as RpcEventHandler),
     ]

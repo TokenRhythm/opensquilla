@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -134,6 +135,44 @@ async def test_exec_approval_resolution_mirrors_resolved_event() -> None:
         # Idempotent re-resolution must not emit a second resolved event.
         queue.resolve(approval_id, True)
         assert scheduled == []
+    finally:
+        remove()
+        queue.close()
+
+
+@pytest.mark.asyncio
+async def test_deadline_rearm_and_extend_push_updated_events() -> None:
+    approvals_conn = _FakeConn("c-approvals", frozenset({"operator.approvals"}))
+    queue, scheduled, remove = _build_bridge([approvals_conn])
+    try:
+        approval_id = queue.request(
+            namespace="exec",
+            params={
+                "toolName": "exec_command",
+                "command": "echo hi",
+                "sessionKey": "agent:main:webchat:demo",
+            },
+        )
+        await scheduled.pop()
+
+        waiter = asyncio.create_task(queue.wait(approval_id, timeout=30))
+        await asyncio.sleep(0)
+        assert len(scheduled) == 1
+        await scheduled.pop()
+        event_name, payload = approvals_conn.events[-1]
+        assert event_name == "exec.approval.updated"
+        assert payload["deadline"] > 0
+
+        extended = queue.extend(approval_id, 60)
+        assert len(scheduled) == 1
+        await scheduled.pop()
+        event_name, payload = approvals_conn.events[-1]
+        assert event_name == "exec.approval.updated"
+        assert payload["deadline"] == extended
+
+        queue.resolve(approval_id, False)
+        await scheduled.pop()
+        assert await waiter is False
     finally:
         remove()
         queue.close()

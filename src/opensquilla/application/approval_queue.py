@@ -338,9 +338,10 @@ class ApprovalQueue:
         """Register a lifecycle listener; returns a remove callable.
 
         Listeners fire synchronously on ``requested`` (an approval was
-        created — the moment a run blocks) and ``resolved`` (a decision
-        landed, including deny-on-timeout). Listener errors are swallowed:
-        notification is best-effort and must never break queue state.
+        created — the moment a run blocks), ``updated`` (its deadline changed),
+        and ``resolved`` (a decision landed, including deny-on-timeout).
+        Listener errors are swallowed: notification is best-effort and must
+        never break queue state.
         """
         self._event_listeners.append(listener)
 
@@ -480,7 +481,7 @@ class ApprovalQueue:
         self._release_stale_claims()
         self._conn.execute("BEGIN IMMEDIATE")
         try:
-            self._conn.execute(
+            cursor = self._conn.execute(
                 "UPDATE approval_queue SET deadline = ? "
                 "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
                 (deadline, approval_id),
@@ -489,9 +490,11 @@ class ApprovalQueue:
         except Exception:
             self._conn.rollback()
             raise
-        cached = self._pending.get(approval_id)
-        if cached is not None and not cached.resolved and cached.claim_token is None:
-            cached.deadline = deadline
+        if cursor.rowcount != 1:
+            return
+        entry = self.get(approval_id)
+        self._pending[approval_id] = entry
+        self._notify_event("updated", entry)
 
     def extend(self, approval_id: str, seconds: float) -> float:
         """Push a pending request's deadline out by ``seconds`` and return it."""
@@ -520,6 +523,7 @@ class ApprovalQueue:
         )
         self._conn.commit()
         entry = self.get(approval_id)
+        self._notify_event("updated", entry)
         return entry.deadline
 
     def _expire_if_unresolved(

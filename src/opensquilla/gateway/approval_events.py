@@ -2,10 +2,10 @@
 
 When a run blocks on an exec/plugin approval, the queue records the request;
 this module turns those transitions into ``<namespace>.approval.requested`` /
-``<namespace>.approval.resolved`` events pushed to every connection holding
-the approvals scope, so UIs can react without polling. Additive only: no
-existing event is renamed or reshaped, and clients that ignore these events
-keep working unchanged.
+``<namespace>.approval.updated`` / ``<namespace>.approval.resolved`` events
+pushed to every connection holding the approvals scope, so UIs can react
+without polling. Additive only: no existing event is renamed or reshaped, and
+clients that ignore these events keep working unchanged.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from typing import Any, cast
 from opensquilla.gateway.scopes import APPROVALS_SCOPE
 from opensquilla.safety.secret_redaction import redact_secret_value
 
-_EVENT_SUFFIXES = frozenset({"requested", "resolved"})
+_EVENT_SUFFIXES = frozenset({"requested", "updated", "resolved"})
 _REDACTED = "[REDACTED]"
 _CAMEL_CASE_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 _DISPLAY_KEY_SEPARATOR_RE = re.compile(r"[^a-z0-9]+")

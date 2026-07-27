@@ -57,6 +57,25 @@
     </div>
 
     <footer class="approval-card__footer">
+      <div
+        v-if="showCountdown"
+        class="approval-card__timer"
+        :class="{ 'approval-card__timer--warn': timeIsLow }"
+      >
+        <span
+          class="approval-card__timer-text"
+          :aria-live="timeIsLow ? 'assertive' : 'polite'"
+        >{{ countdownText }}</span>
+        <button
+          v-if="timeIsLow"
+          class="btn btn--ghost approval-card__extend"
+          type="button"
+          :disabled="busy"
+          @click="$emit('extend')"
+        >
+          {{ t('chat.approval.extend') }}
+        </button>
+      </div>
       <input
         v-model="denyNote"
         class="approval-card__note"
@@ -93,10 +112,13 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import type { ChatApprovalItem, ChatApprovalResolution } from '@/composables/chat/useChatApprovals'
+import { formatCountdown } from '@/composables/chat/useChatApprovals'
+
+const WARN_THRESHOLD_SECONDS = 60
 
 const { t } = useI18n()
 
@@ -116,6 +138,66 @@ const emit = defineEmits<{
 }>()
 
 const denyNote = ref('')
+const now = ref(Date.now())
+let mounted = false
+let tick: ReturnType<typeof setInterval> | null = null
+
+const deadline = computed(() => {
+  const value = Number(props.approval.deadline)
+  return Number.isFinite(value) && value > 0 ? value : null
+})
+const remainingSeconds = computed(() =>
+  deadline.value === null
+    ? null
+    : Math.max(0, Math.round(deadline.value - now.value / 1000)))
+const showCountdown = computed(() =>
+  !props.resolution && remainingSeconds.value !== null)
+const timeIsLow = computed(() =>
+  remainingSeconds.value !== null
+  && remainingSeconds.value <= WARN_THRESHOLD_SECONDS)
+const countdownText = computed(() =>
+  remainingSeconds.value === null
+    ? ''
+    : t('chat.approval.expiresIn', {
+        time: formatCountdown(remainingSeconds.value),
+      }))
+
+function stopTick() {
+  if (tick) clearInterval(tick)
+  tick = null
+}
+
+function syncTick() {
+  now.value = Date.now()
+  if (!mounted || !showCountdown.value) {
+    stopTick()
+    return
+  }
+  if (!tick) {
+    tick = setInterval(() => {
+      if (!document.hidden) now.value = Date.now()
+    }, 1000)
+  }
+}
+
+function onVisibilityChange() {
+  if (!document.hidden) now.value = Date.now()
+}
+
+watch(
+  () => [props.approval.deadline, props.resolution],
+  syncTick,
+)
+onMounted(() => {
+  mounted = true
+  document.addEventListener('visibilitychange', onVisibilityChange)
+  syncTick()
+})
+onBeforeUnmount(() => {
+  mounted = false
+  stopTick()
+  document.removeEventListener('visibilitychange', onVisibilityChange)
+})
 
 const isSandboxApproval = computed(() =>
   String(props.approval.approvalKind || props.approval.args?.approvalKind || '').startsWith('sandbox_'))
@@ -328,6 +410,37 @@ function emitDeny() {
   flex-direction: column;
   gap: var(--sp-2);
   padding: var(--sp-3) var(--sp-4);
+}
+
+.approval-card__timer {
+  align-items: center;
+  color: var(--text-muted);
+  display: flex;
+  font-size: var(--fs-xs);
+  gap: var(--sp-2);
+  justify-content: space-between;
+}
+
+.approval-card__timer--warn {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+.approval-card__timer-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.approval-card__extend {
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
+  color: var(--warn);
+  flex-shrink: 0;
+}
+
+.approval-card__extend:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--warn) 10%, var(--bg-surface));
 }
 
 .approval-card__note {

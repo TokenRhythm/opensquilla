@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick } from 'vue'
 import i18n from '@/i18n'
 import ApprovalCard from './ApprovalCard.vue'
@@ -25,10 +25,16 @@ async function mountCard(
   item: ChatApprovalItem,
   resolution: ChatApprovalResolution | null = null,
   timeline = false,
+  onExtend = vi.fn(),
 ) {
   const root = document.createElement('div')
   document.body.appendChild(root)
-  const app = createApp(ApprovalCard, { approval: item, resolution, timeline })
+  const app = createApp(ApprovalCard, {
+    approval: item,
+    resolution,
+    timeline,
+    onExtend,
+  })
   app.use(i18n)
   app.mount(root)
   await nextTick()
@@ -66,12 +72,22 @@ describe('ApprovalCard safe context', () => {
     app.unmount()
   })
 
-  it('never shows an expiry countdown for a human approval', async () => {
-    const { app, root } = await mountCard(approval({
-      deadline: Date.now() / 1000 + 30,
-    }))
+  it('keeps untimed human approvals free of countdown controls', async () => {
+    const { app, root } = await mountCard(approval({ deadline: 0 }))
     expect(root.querySelector('.approval-card__timer')).toBeNull()
     expect(root.textContent).not.toContain('Expires in')
+    app.unmount()
+  })
+
+  it('shows and extends an explicitly timed human approval', async () => {
+    const extend = vi.fn()
+    const { app, root } = await mountCard(approval({
+      deadline: Date.now() / 1000 + 30,
+    }), null, false, extend)
+    expect(root.querySelector('.approval-card__timer')).not.toBeNull()
+    expect(root.textContent).toContain('Expires in')
+    root.querySelector<HTMLButtonElement>('.approval-card__extend')?.click()
+    expect(extend).toHaveBeenCalledOnce()
     app.unmount()
   })
 
