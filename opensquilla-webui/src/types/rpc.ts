@@ -126,6 +126,7 @@ export interface ProjectWorkspaceItem {
   taskCount: number
   pinned: boolean
   available: boolean
+  availabilityReason?: string
 }
 
 export interface ProjectWorkspacesResponse {
@@ -314,12 +315,23 @@ export interface SessionMessagesSubscribeParams {
   [key: string]: unknown
 }
 
+export interface SessionProjectWorkspaceSnapshot {
+  id: string
+  name: string
+  path: string
+  available: boolean
+  removed: boolean
+  availabilityReason?: string
+}
+
 export interface SessionMessagesSubscribeResponse extends SessionEventPayload {
   subscribed?: boolean
   replay_complete?: boolean
   current_stream_seq?: number
   active_task_group_ids?: string[]
   activeTaskGroupIds?: string[]
+  workspaceId?: string
+  projectWorkspace?: SessionProjectWorkspaceSnapshot | null
 }
 
 export interface ChatSendAttachmentPayload {

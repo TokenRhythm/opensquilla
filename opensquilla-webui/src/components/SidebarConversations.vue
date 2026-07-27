@@ -642,9 +642,16 @@ function onSelectRow(row: SidebarConversationItem) {
                   type="button"
                   class="sidebar-project-action"
                   data-testid="project-workspace-new-task"
-                  :aria-label="t('workspaces.newTask')"
-                  :title="t('workspaces.newTask')"
-                  @click.stop="row.workspaceId && emit('new-project-task', row.workspaceId)"
+                  :aria-label="row.workspaceAvailable === false
+                    ? t('workspaces.unavailableProjectCannotStartTask')
+                    : t('workspaces.newTask')"
+                  :title="row.workspaceAvailable === false
+                    ? t('workspaces.unavailableProjectCannotStartTask')
+                    : t('workspaces.newTask')"
+                  :disabled="row.workspaceAvailable === false"
+                  @click.stop="row.workspaceAvailable !== false
+                    && row.workspaceId
+                    && emit('new-project-task', row.workspaceId)"
                 >
                   <Icon name="pencil" :size="13" />
                 </button>

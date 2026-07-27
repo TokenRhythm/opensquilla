@@ -48,7 +48,7 @@ describe('ChatComposer image-send guard', () => {
     app.mount(el)
     await nextTick()
 
-    const status = el.querySelector<HTMLElement>('#chat-composer-image-send-status')
+    const status = el.querySelector<HTMLElement>('#chat-composer-send-status')
     const textarea = el.querySelector<HTMLTextAreaElement>('.chat-textarea')
     const send = el.querySelector<HTMLButtonElement>('.chat-send-btn')
 
@@ -76,7 +76,7 @@ describe('ChatComposer image-send guard', () => {
     await nextTick()
 
     const send = el.querySelector<HTMLButtonElement>('.chat-send-btn')
-    expect(el.querySelector('#chat-composer-image-send-status')).toBeNull()
+    expect(el.querySelector('#chat-composer-send-status')).toBeNull()
     expect(send?.disabled).toBe(false)
     send?.click()
     expect(onSend).toHaveBeenCalledOnce()

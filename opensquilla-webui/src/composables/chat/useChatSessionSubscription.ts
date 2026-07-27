@@ -4,6 +4,7 @@ import type {
   ChatRunStatusSource,
 } from '@/types/chat'
 import type {
+  SessionProjectWorkspaceSnapshot,
   SessionMessagesSubscribeParams,
   SessionMessagesSubscribeResponse,
 } from '@/types/rpc'
@@ -28,6 +29,16 @@ export interface UseChatSessionSubscriptionOptions {
   resetStreamIdleTimer: () => void
   resetStreamLiveTurnState: () => void
   onAuthoritativeIdle?: () => void
+  beginSessionMetadataResolution?: (key: string) => number
+  onSessionMetadata?: (
+    key: string,
+    generation: number,
+    metadata: {
+      workspaceId?: string
+      projectWorkspace?: SessionProjectWorkspaceSnapshot | null
+    },
+  ) => void
+  onSessionMetadataError?: (key: string, generation: number) => void
 }
 
 const LIVE_RUN_STATES = ['queued', 'running', 'approval_pending']
@@ -76,6 +87,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     token: symbol,
   ): Promise<SessionSubscriptionOutcome> {
     const attempt = ++subscriptionAttempt
+    const metadataGeneration = options.beginSessionMetadataResolution?.(key)
     if (sinceStreamSeq === 0) isHydrating.value = true
     try {
       await options.rpc.waitForConnection()
@@ -88,6 +100,12 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         return UNAVAILABLE_SUBSCRIPTION
       }
       if (res && res.subscribed === false) throw new Error('No subscription manager available')
+      if (metadataGeneration !== undefined) {
+        options.onSessionMetadata?.(key, metadataGeneration, {
+          workspaceId: res.workspaceId,
+          projectWorkspace: res.projectWorkspace,
+        })
+      }
       applySessionRunState(res)
       // A pending inline interrupt is newer, stronger evidence than an idle
       // subscription snapshot that raced with the approval request.
@@ -145,6 +163,13 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       return outcome
     } catch (err: unknown) {
       console.warn('Session stream subscription failed:', err instanceof Error ? err.message : err)
+      if (
+        metadataGeneration !== undefined
+        && attempt === subscriptionAttempt
+        && key === options.sessionKey.value
+      ) {
+        options.onSessionMetadataError?.(key, metadataGeneration)
+      }
       return UNAVAILABLE_SUBSCRIPTION
     } finally {
       if (attempt === subscriptionAttempt) isHydrating.value = false

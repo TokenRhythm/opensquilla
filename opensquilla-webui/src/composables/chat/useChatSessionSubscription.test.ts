@@ -345,4 +345,99 @@ describe('useChatSessionSubscription', () => {
     expect(onAuthoritativeIdle).toHaveBeenCalledOnce()
     warn.mockRestore()
   })
+
+  it('forwards authoritative project metadata with its own resolution generation', async () => {
+    const beginSessionMetadataResolution = vi.fn(() => 41)
+    const onSessionMetadata = vi.fn()
+    const rpc = {
+      waitForConnection: vi.fn(async () => {}),
+      call: vi.fn().mockResolvedValue({
+        subscribed: true,
+        run_status: 'idle',
+        workspaceId: 'project-a',
+        projectWorkspace: {
+          id: 'project-a',
+          name: 'Project A',
+          path: '/repos/a',
+          available: true,
+          removed: false,
+        },
+      }),
+    }
+    const subscription = useChatSessionSubscription({
+      rpc,
+      sessionKey: ref('agent:main:webchat:project-a'),
+      lastStreamSeq: ref(0),
+      runStatus: ref<ChatRunStatus>({ status: 'idle', label: '', task: null }),
+      isStreaming: ref(false),
+      hasActiveInterrupt: ref(false),
+      activeStreamTaskId: ref(''),
+      activeTaskGroups: ref(new Set<string>()),
+      sessionRunStatus: () => ({ status: 'idle', label: '', task: null }),
+      startStreaming: vi.fn(),
+      loadHistory: vi.fn(),
+      resetStreamIdleTimer: vi.fn(),
+      resetStreamLiveTurnState: vi.fn(),
+      beginSessionMetadataResolution,
+      onSessionMetadata,
+    })
+
+    await subscription.subscribeSession()
+
+    expect(beginSessionMetadataResolution).toHaveBeenCalledWith(
+      'agent:main:webchat:project-a',
+    )
+    expect(onSessionMetadata).toHaveBeenCalledWith(
+      'agent:main:webchat:project-a',
+      41,
+      expect.objectContaining({ workspaceId: 'project-a' }),
+    )
+  })
+
+  it('reports only the current subscription metadata failure', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const sessionKey = ref('agent:main:webchat:first')
+    const pending: Array<(reason: unknown) => void> = []
+    let generation = 0
+    const onSessionMetadataError = vi.fn()
+    const rpc = {
+      waitForConnection: vi.fn(async () => {}),
+      call: <T = unknown>() => new Promise<T>((_resolve, reject) => {
+        pending.push(reject)
+      }),
+    }
+    const subscription = useChatSessionSubscription({
+      rpc,
+      sessionKey,
+      lastStreamSeq: ref(0),
+      runStatus: ref<ChatRunStatus>({ status: 'idle', label: '', task: null }),
+      isStreaming: ref(false),
+      hasActiveInterrupt: ref(false),
+      activeStreamTaskId: ref(''),
+      activeTaskGroups: ref(new Set<string>()),
+      sessionRunStatus: () => ({ status: 'idle', label: '', task: null }),
+      startStreaming: vi.fn(),
+      loadHistory: vi.fn(),
+      resetStreamIdleTimer: vi.fn(),
+      resetStreamLiveTurnState: vi.fn(),
+      beginSessionMetadataResolution: () => ++generation,
+      onSessionMetadataError,
+    })
+
+    const stale = subscription.subscribeSession()
+    await vi.waitFor(() => expect(pending).toHaveLength(1))
+    sessionKey.value = 'agent:main:webchat:second'
+    const current = subscription.subscribeSession()
+    await vi.waitFor(() => expect(pending).toHaveLength(2))
+    pending[0]?.(new Error('stale failure'))
+    pending[1]?.(new Error('current failure'))
+    await Promise.all([stale, current])
+
+    expect(onSessionMetadataError).toHaveBeenCalledOnce()
+    expect(onSessionMetadataError).toHaveBeenCalledWith(
+      'agent:main:webchat:second',
+      2,
+    )
+    warn.mockRestore()
+  })
 })

@@ -28,6 +28,9 @@ function normalizeWorkspace(value: unknown): ProjectWorkspaceItem | null {
     taskCount: Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0,
     pinned: row.pinned === true,
     available: row.available !== false,
+    ...(typeof row.availabilityReason === 'string' && row.availabilityReason
+      ? { availabilityReason: row.availabilityReason }
+      : {}),
   }
 }
 
@@ -102,6 +105,26 @@ export function useProjectWorkspaces() {
     }
   }
 
+  async function removeWorkspace(workspaceId: string): Promise<void> {
+    error.value = null
+    try {
+      await rpc.call('workspaces.remove', { workspaceId })
+    } catch (cause) {
+      error.value = cause instanceof Error ? cause.message : String(cause)
+      throw cause
+    }
+    // Removal is authoritative once the destructive RPC succeeds. Publish it
+    // locally before the best-effort canonical refresh so active tasks fail
+    // closed even if the follow-up list request is temporarily unavailable.
+    workspaces.value = workspaces.value.filter(item => item.id !== workspaceId)
+    try {
+      await loadWorkspaces()
+    } catch {
+      // loadWorkspaces records its own error for retry/status UI.
+    }
+    workspaces.value = workspaces.value.filter(item => item.id !== workspaceId)
+  }
+
   const byId = computed(() => new Map(workspaces.value.map(item => [item.id, item])))
 
   return {
@@ -116,8 +139,7 @@ export function useProjectWorkspaces() {
       mutate('workspaces.update', { workspaceId, name }),
     setPinned: (workspaceId: string, pinned: boolean) =>
       mutate('workspaces.pin', { workspaceId, pinned }),
-    removeWorkspace: (workspaceId: string) =>
-      mutate('workspaces.remove', { workspaceId }),
+    removeWorkspace,
     deleteWorkspaceHistory,
   }
 }

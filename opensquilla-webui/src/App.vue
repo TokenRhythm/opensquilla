@@ -954,6 +954,13 @@ async function onProjectRemove(workspaceId: string) {
   try {
     await projectWorkspaces.removeWorkspace(workspaceId)
     if (editingProjectId.value === workspaceId) editingProjectId.value = ''
+    if (
+      $route.path === '/chat/new'
+      && String($route.query.project || '') === workspaceId
+    ) {
+      freshTaskDraft.requestFreshTask('main')
+      await router.replace({ path: '/chat/new', query: { agent: 'main' } })
+    }
   } catch (err) {
     pushToast(t('workspaces.removeFailed', { error: errorMessage(err) }), { tone: 'danger' })
   }

@@ -1,11 +1,20 @@
 <template>
   <div ref="composerEl" class="chat-composer" :class="{ 'chat-composer--new-landing': isNewLanding }">
     <div class="chat-composer-inner">
-      <div v-if="projectWorkspace" class="chat-project-chip" :title="projectWorkspace.path">
+      <div
+        v-if="projectWorkspace"
+        class="chat-project-chip"
+        :data-status="projectWorkspaceStatus || 'ready'"
+        :title="projectWorkspace.path"
+      >
         <Icon name="info" :size="14" />
         <span class="chat-project-chip__name">{{ projectWorkspace.name }}</span>
         <span class="chat-project-chip__path">{{ projectWorkspace.path }}</span>
+        <span v-if="projectStatusMessage" class="chat-project-chip__status">
+          {{ projectStatusMessage }}
+        </span>
         <button
+          v-if="canCloseProject"
           type="button"
           :aria-label="t('workspaces.closeProjectDraft')"
           :title="t('workspaces.closeProjectDraft')"
@@ -15,7 +24,7 @@
         </button>
       </div>
       <button
-        v-else-if="isNewLanding"
+        v-else-if="isNewLanding && (!projectWorkspaceStatus || projectWorkspaceStatus === 'none')"
         type="button"
         class="chat-project-choose"
         @click="emit('chooseProject')"
@@ -58,7 +67,7 @@
             :placeholder="placeholder"
             maxlength="100000"
             :aria-label="t('chat.messageToSend')"
-            :aria-describedby="sendBlockedMessage ? 'chat-composer-image-send-status' : undefined"
+            :aria-describedby="sendBlockedMessage ? 'chat-composer-send-status' : undefined"
             @beforeinput="emit('beforeinput', $event)"
             @input="emit('input', $event)"
             @keydown="emit('keydown', $event)"
@@ -179,7 +188,7 @@
               :class="{ 'is-ready': hasSendContent && !sendBlockedMessage }"
               :title="sendBlockedMessage || sendButtonTitle"
               :aria-label="t('chat.send')"
-              :aria-describedby="sendBlockedMessage ? 'chat-composer-image-send-status' : undefined"
+              :aria-describedby="sendBlockedMessage ? 'chat-composer-send-status' : undefined"
               :disabled="Boolean(sendBlockedMessage)"
               @click="emit('send')"
             >
@@ -195,7 +204,7 @@
       </div>
       <p
         v-if="sendBlockedMessage"
-        id="chat-composer-image-send-status"
+        id="chat-composer-send-status"
         class="chat-composer-send-status"
         role="status"
         aria-live="polite"
@@ -254,6 +263,9 @@ defineProps<{
   voiceRecording: boolean
   voiceReady: boolean
   projectWorkspace?: { id: string; name: string; path: string } | null
+  projectWorkspaceStatus?: 'none' | 'resolving' | 'ready' | 'unavailable' | 'removed' | 'unknown' | 'error'
+  projectStatusMessage?: string
+  canCloseProject?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -474,6 +486,11 @@ defineExpose<ChatComposerExpose>({
 }
 .chat-project-chip__name { flex-shrink: 0; font-weight: 650; }
 .chat-project-chip__path { color: var(--text-muted); font-family: var(--font-mono); }
+.chat-project-chip__status {
+  flex-shrink: 0;
+  color: var(--warning, var(--text-muted));
+  font-size: var(--fs-xs);
+}
 .chat-project-chip button {
   display: inline-flex;
   padding: 2px;

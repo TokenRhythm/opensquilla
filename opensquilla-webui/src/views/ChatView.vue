@@ -400,7 +400,7 @@
       :is-new-landing="isNewChatLanding"
       :placeholder="composerPlaceholder"
       :send-button-title="sendButtonTitle"
-      :send-blocked-message="modelImageSendBlockedMessage"
+      :send-blocked-message="composerSendBlockedMessage"
       :run-mode="runMode"
       :allowed-run-modes="allowedRunModes"
       :model-routing-mode="modelRoutingMode"
@@ -411,7 +411,10 @@
       :voice-busy="voiceBusy"
       :voice-recording="voiceRecording"
       :voice-ready="voiceReady"
-      :project-workspace="pendingWorkspace"
+      :project-workspace="activeWorkspace"
+      :project-workspace-status="activeWorkspaceStatus"
+      :project-status-message="activeProjectStatusMessage"
+      :can-close-project="isDraftRoute() && pendingWorkspaceId !== null"
       @composition-change="composing = $event"
       @beforeinput="onTextareaBeforeInput"
       @file-change="onFileInputChange"
@@ -435,7 +438,7 @@
     <ProjectWorkspacePickerDialog
       :open="projectPickerOpen"
       :session-key="sessionKey"
-      :initial-path="pendingWorkspace?.path"
+      :initial-path="activeWorkspace?.path"
       @close="projectPickerOpen = false"
       @choose="chooseProjectPath"
     />
@@ -556,7 +559,15 @@ import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { hasOpenDialogLayer } from '@/composables/useDialogA11y'
 import { useToasts } from '@/composables/useToasts'
 import { useConfirm } from '@/composables/useConfirm'
-import { useProjectWorkspaces } from '@/composables/useProjectWorkspaces'
+import {
+  useProjectWorkspaces,
+  type ProjectWorkspaceItem,
+} from '@/composables/useProjectWorkspaces'
+import {
+  createDraftProjectHydrationGuard,
+  useActiveProjectWorkspace,
+  type ActiveProjectWorkspaceSnapshot,
+} from '@/composables/useActiveProjectWorkspace'
 import { useFreshTaskDraft } from '@/composables/useFreshTaskDraft'
 import type {
   ChatMessage,
@@ -641,6 +652,15 @@ const { t } = useI18n()
 const { pushToast } = useToasts()
 const { confirm } = useConfirm()
 const projectWorkspaces = useProjectWorkspaces()
+const activeProjectWorkspace = useActiveProjectWorkspace()
+const draftProjectHydration = createDraftProjectHydrationGuard()
+const {
+  pendingWorkspaceId,
+  boundWorkspaceId,
+  activeWorkspace,
+  status: activeWorkspaceStatus,
+  sendBlockedReason: activeWorkspaceSendBlockedReason,
+} = activeProjectWorkspace
 const projectPickerOpen = ref(false)
 const isCompactViewport = useMediaQuery('(max-width: 480px)')
 const isDesktopViewport = useMediaQuery('(min-width: 769px)')
@@ -744,12 +764,20 @@ let bindActiveStreamTask = (taskId: string) => { activeStreamTaskId.value = task
 // Pending session intent
 const pendingSessionIntent = ref<string | null>(null)
 const pendingForkBeforeMessageId = ref<string | null>(null)
-const pendingWorkspaceId = ref<string | null>(null)
 const freshTaskDraft = useFreshTaskDraft()
-const pendingWorkspace = computed(() => {
-  const workspaceId = pendingWorkspaceId.value
-  return workspaceId ? projectWorkspaces.byId.value.get(workspaceId) || null : null
-})
+
+function activeSnapshot(workspace: ProjectWorkspaceItem): ActiveProjectWorkspaceSnapshot {
+  return {
+    id: workspace.id,
+    name: workspace.name,
+    path: workspace.path,
+    available: workspace.available,
+    removed: false,
+    ...(workspace.availabilityReason
+      ? { availabilityReason: workspace.availabilityReason }
+      : {}),
+  }
+}
 let applySessionRunState: (source: ChatRunStatusSource | null | undefined) => void = () => {}
 let resetComposerInputHistory: () => void = () => {}
 
@@ -1155,6 +1183,18 @@ const chatSessionSubscription = useChatSessionSubscription({
       schedulePendingDrainAfterTerminal()
     }
   },
+  beginSessionMetadataResolution: key =>
+    pendingSessionIntent.value === 'new_chat'
+      ? -1
+      : activeProjectWorkspace.beginSessionResolution(key),
+  onSessionMetadata: (key, generation, metadata) => {
+    if (generation < 0) return
+    activeProjectWorkspace.applySessionSnapshot(key, generation, metadata)
+  },
+  onSessionMetadataError: (key, generation) => {
+    if (generation < 0) return
+    activeProjectWorkspace.failSessionResolution(key, generation)
+  },
 })
 const {
   isHydrating: isSessionHydrating,
@@ -1212,7 +1252,9 @@ const {
 } = chatSessionRuntime
 
 function switchToSession(nextSessionKey: string) {
-  pendingWorkspaceId.value = null
+  if (nextSessionKey !== sessionKey.value) {
+    activeProjectWorkspace.beginSessionResolution(nextSessionKey)
+  }
   return switchRuntimeToSession(nextSessionKey)
 }
 
@@ -1281,6 +1323,9 @@ const chatSend = useChatSend({
   pendingAttachments,
   pendingSessionIntent,
   pendingWorkspaceId,
+  sendBlockedReason: activeWorkspaceSendBlockedReason,
+  validateActiveProjectBeforeSend,
+  acceptPendingWorkspaceBinding: activeProjectWorkspace.acceptPendingBinding,
   pendingForkBeforeMessageId,
   materializeDraftSession: key => {
     if (!isDraftRoute()) return
@@ -1548,8 +1593,28 @@ const modelImageSendBlockedMessage = computed(() => {
     : ''
 })
 
+const activeProjectStatusMessage = computed(() => {
+  switch (activeWorkspaceStatus.value) {
+    case 'resolving':
+      return t('workspaces.activeProjectResolving')
+    case 'unavailable':
+      return t('workspaces.activeProjectUnavailable')
+    case 'removed':
+      return t('workspaces.activeProjectRemoved')
+    case 'unknown':
+    case 'error':
+      return t('workspaces.activeProjectBlocksSending')
+    default:
+      return ''
+  }
+})
+
+const composerSendBlockedMessage = computed(() =>
+  modelImageSendBlockedMessage.value || activeProjectStatusMessage.value,
+)
+
 const sendButtonTitle = computed(() => {
-  if (modelImageSendBlockedMessage.value) return modelImageSendBlockedMessage.value
+  if (composerSendBlockedMessage.value) return composerSendBlockedMessage.value
   if (isCompactInFlightForCurrentSession()) return t('chat.sendQueuesUntilCompaction')
   if (isStreaming.value) {
     return busySendMode.value === 'steer'
@@ -2191,6 +2256,7 @@ async function chooseProjectPath(path: string) {
 }
 
 function closeProjectDraft() {
+  activeProjectWorkspace.clearDraft()
   freshTaskDraft.requestFreshTask(draftAgentId())
   goToDraft({
     agentId: draftAgentId(),
@@ -2199,16 +2265,64 @@ function closeProjectDraft() {
   })
 }
 
-async function syncDraftProjectFromRoute() {
+async function validateActiveProjectBeforeSend(): Promise<string | null> {
+  const workspaceId = boundWorkspaceId.value
+  if (!workspaceId) return activeWorkspaceSendBlockedReason.value
+  try {
+    const workspaces = await projectWorkspaces.loadWorkspaces()
+    if (boundWorkspaceId.value !== workspaceId) {
+      return activeWorkspaceSendBlockedReason.value || 'resolving'
+    }
+    const workspace = workspaces.find(item => item.id === workspaceId) || null
+    activeProjectWorkspace.applyWorkspaceRefresh(
+      workspace ? activeSnapshot(workspace) : null,
+    )
+  } catch {
+    if (boundWorkspaceId.value === workspaceId) {
+      activeProjectWorkspace.failWorkspaceRefresh()
+    }
+  }
+  return activeWorkspaceSendBlockedReason.value
+}
+
+function draftProjectHydrationIsCurrent(
+  generation: number,
+  workspaceId: string | null,
+): boolean {
+  return draftProjectHydration.isCurrent(generation)
+    && isDraftRoute()
+    && readProjectFromUrl() === workspaceId
+}
+
+async function syncDraftProjectFromRoute(generation: number): Promise<boolean> {
   const workspaceId = readProjectFromUrl()
-  pendingWorkspaceId.value = workspaceId || null
-  if (!workspaceId || projectWorkspaces.byId.value.has(workspaceId)) return
+  if (!draftProjectHydrationIsCurrent(generation, workspaceId)) return false
+  if (!workspaceId) {
+    activeProjectWorkspace.clearDraft()
+    return true
+  }
+  const cached = projectWorkspaces.byId.value.get(workspaceId)
+  if (cached) {
+    activeProjectWorkspace.beginProjectDraft(activeSnapshot(cached))
+    return true
+  }
+  activeProjectWorkspace.beginUnknownProjectDraft(workspaceId)
   try {
     await projectWorkspaces.loadWorkspaces()
+    if (!draftProjectHydrationIsCurrent(generation, workspaceId)) return false
+    const workspace = projectWorkspaces.byId.value.get(workspaceId)
+    if (workspace) {
+      activeProjectWorkspace.beginProjectDraft(activeSnapshot(workspace))
+    } else {
+      activeProjectWorkspace.beginUnknownProjectDraft(workspaceId)
+    }
   } catch (cause) {
+    if (!draftProjectHydrationIsCurrent(generation, workspaceId)) return false
+    activeProjectWorkspace.failWorkspaceRefresh()
     const detail = cause instanceof Error ? cause.message : String(cause)
     pushToast(t('workspaces.loadFailed', { error: detail }), { tone: 'warn' })
   }
+  return true
 }
 
 // Reset to a clean draft for the agent requested by the draft route. The
@@ -2232,10 +2346,14 @@ onMounted(async () => {
   sessionKey.value = initialSession.sessionKey
   if (initialSession.draft) {
     pendingSessionIntent.value = 'new_chat'
-    await syncDraftProjectFromRoute()
-    if (!isDraftRoute() || hasLegacyNewChatQuery()) goToDraft({ replace: true })
-    consumeDraftPrefill()
+    const generation = draftProjectHydration.begin()
+    const synced = await syncDraftProjectFromRoute(generation)
+    if (synced) {
+      if (!isDraftRoute() || hasLegacyNewChatQuery()) goToDraft({ replace: true })
+      consumeDraftPrefill()
+    }
   } else {
+    activeProjectWorkspace.beginSessionResolution(initialSession.sessionKey)
     persistSession(sessionKey.value, { updateRoute: false, source: 'chatView.initialSession' })
   }
 
@@ -2320,8 +2438,9 @@ watch(() => route.query.session, (newSession) => {
 
 // Entering the draft route resets to a clean draft for the requested agent.
 watch(() => [route.path, route.query.agent, route.query.project], async () => {
+  const generation = draftProjectHydration.begin()
   if (!isDraftRoute()) return
-  await syncDraftProjectFromRoute()
+  if (!await syncDraftProjectFromRoute(generation)) return
   enterDraft()
 })
 
@@ -2329,10 +2448,29 @@ watch(() => [route.path, route.query.agent, route.query.project], async () => {
 // draft URL already on screen (for example, clicking the same project pencil).
 watch(freshTaskDraft.request, request => {
   if (!request) return
+  draftProjectHydration.invalidate()
   landingPrefilled.value = false
-  pendingWorkspaceId.value = request.workspaceId
+  if (request.workspaceId) {
+    const workspace = projectWorkspaces.byId.value.get(request.workspaceId)
+    if (workspace) {
+      activeProjectWorkspace.beginProjectDraft(activeSnapshot(workspace))
+    } else {
+      activeProjectWorkspace.beginUnknownProjectDraft(request.workspaceId)
+    }
+  } else {
+    activeProjectWorkspace.clearDraft()
+  }
   startDraftSession(request.agentId)
   if (isDesktopViewport.value) composerRef.value?.focusTextarea()
+})
+
+watch(projectWorkspaces.workspaces, workspaces => {
+  const workspaceId = boundWorkspaceId.value
+  if (!workspaceId) return
+  const workspace = workspaces.find(item => item.id === workspaceId) || null
+  activeProjectWorkspace.applyWorkspaceRefresh(
+    workspace ? activeSnapshot(workspace) : null,
+  )
 })
 
 // Legacy ?newChat=1 / ?new=1 links land on the draft route, then the params disappear.

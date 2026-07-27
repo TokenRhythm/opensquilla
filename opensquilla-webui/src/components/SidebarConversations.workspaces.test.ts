@@ -78,6 +78,7 @@ function i18n() {
           projectInfo: '{path}; {count} tasks',
           taskCount: '{count} tasks',
           newTask: 'New project task',
+          unavailableProjectCannotStartTask: 'This project directory is unavailable',
           moreActions: 'Project actions',
           pin: 'Pin project',
           unpin: 'Unpin project',
@@ -166,6 +167,21 @@ describe('SidebarConversations project workspaces', () => {
 
     expect(events.newProjectTask).toHaveBeenCalledWith('project-a')
     expect(events.select).not.toHaveBeenCalled()
+  })
+
+  it('disables the new-task action for an unavailable project', async () => {
+    const { host, events } = await mountSidebar([
+      projectRow({ workspaceAvailable: false }),
+      taskRow(),
+    ])
+    const pencil = host.querySelector<HTMLButtonElement>('[data-testid="project-workspace-new-task"]')
+
+    expect(pencil?.disabled).toBe(true)
+    expect(pencil?.getAttribute('title')).toBe('This project directory is unavailable')
+    pencil?.click()
+    await nextTick()
+
+    expect(events.newProjectTask).not.toHaveBeenCalled()
   })
 
   it('exposes pin, edit, delete-history, and remove through the project menu', async () => {

@@ -212,6 +212,9 @@ export interface UseChatSendOptions {
   pendingSessionIntent: Ref<string | null>
   pendingForkBeforeMessageId: Ref<string | null>
   pendingWorkspaceId?: Ref<string | null>
+  sendBlockedReason?: Readonly<Ref<string | null>>
+  validateActiveProjectBeforeSend?: () => Promise<string | null>
+  acceptPendingWorkspaceBinding?: (workspaceId: string | null) => void
   materializeDraftSession?: (sessionKey: string) => void
   aborted: Ref<boolean>
   // Task id rendered by the live stream; a fresh turn binds it from the
@@ -253,6 +256,7 @@ export function useChatSend(options: UseChatSendOptions) {
   const { pushToast } = useToasts()
   let activeFreshSendToken: FreshSendToken | null = null
   let activeResponseHandoff: ResponseHandoffGate | null = null
+  let activeProjectPreflightToken: symbol | null = null
   let recoveredAttempt: SendAttempt | null = null
 
   function pendingWorkspaceForIntent(intent: string | null): string | null {
@@ -265,6 +269,31 @@ export function useChatSend(options: UseChatSendOptions) {
     if (!hasSendableModelInputImageAttachment(attachments)) return false
     return options.modelRoutingSettingsBusy.value
       || options.modelRoutingMode.value === 'llm_ensemble'
+  }
+
+  async function refreshedActiveProjectBlocksSend(): Promise<boolean> {
+    if (activeProjectPreflightToken) return true
+    const token = Symbol('active-project-preflight')
+    activeProjectPreflightToken = token
+    const requestSessionKey = options.sessionKey.value
+    try {
+      const reason = await options.validateActiveProjectBeforeSend?.()
+      if (options.sessionKey.value !== requestSessionKey) return true
+      return Boolean(reason)
+    } catch {
+      return true
+    } finally {
+      if (activeProjectPreflightToken === token) {
+        activeProjectPreflightToken = null
+      }
+    }
+  }
+
+  function acceptPendingWorkspaceBinding(workspaceId: string | null) {
+    options.acceptPendingWorkspaceBinding?.(workspaceId)
+    if (options.pendingWorkspaceId?.value === workspaceId) {
+      options.pendingWorkspaceId.value = null
+    }
   }
 
   function beginFreshStream(requestSessionKey: string): FreshSendToken {
@@ -525,6 +554,14 @@ export function useChatSend(options: UseChatSendOptions) {
       hasPayload = text || sendableAttachments.length > 0
     }
 
+    if (hasPayload) {
+      if (options.validateActiveProjectBeforeSend) {
+        if (await refreshedActiveProjectBlocksSend()) return
+      } else if (options.sendBlockedReason?.value) {
+        return
+      }
+    }
+
     // Retry an ambiguous prior send with its exact original queue semantics,
     // even if the ambient stream state changed while the error was visible.
     // Deriving steer/followup again here would create a new fingerprint and
@@ -724,7 +761,7 @@ export function useChatSend(options: UseChatSendOptions) {
         && options.sessionKey.value === requestSessionKey
         && options.pendingWorkspaceId.value === attempt.workspaceId
       ) {
-        options.pendingWorkspaceId.value = null
+        acceptPendingWorkspaceBinding(attempt.workspaceId)
       }
       const taskId = acceptedTaskId(res)
       const terminalStatus = terminalResponseStatus(res)
@@ -829,7 +866,7 @@ export function useChatSend(options: UseChatSendOptions) {
           && options.sessionKey.value === requestSessionKey
           && options.pendingWorkspaceId.value === attempt.workspaceId
         ) {
-          options.pendingWorkspaceId.value = null
+          acceptPendingWorkspaceBinding(attempt.workspaceId)
         }
       }
       const acceptedSessionKey = acceptedError?.sessionKey || requestSessionKey
@@ -972,6 +1009,11 @@ export function useChatSend(options: UseChatSendOptions) {
   async function dispatchHiddenSend(providerText: string, displayText: string) {
     const requestSessionKey = options.sessionKey.value
     if (!requestSessionKey || !providerText) return
+    if (options.validateActiveProjectBeforeSend) {
+      if (await refreshedActiveProjectBlocksSend()) return
+    } else if (options.sendBlockedReason?.value) {
+      return
+    }
     const compactInFlight = options.isCompactInFlightForCurrentSession()
     const handoffInFlight = responseHandoffBlocksCurrentSession()
     if (options.stream.isStreaming.value || compactInFlight || handoffInFlight) {

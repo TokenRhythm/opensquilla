@@ -80,6 +80,76 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
 }
 
 describe('useChatSend attachment payloads', () => {
+  it.each(['resolving', 'unavailable', 'removed', 'unknown', 'error'])(
+    'does not mutate or call chat.send when project preflight returns %s',
+    async reason => {
+      const validateActiveProjectBeforeSend = vi.fn(async () => reason)
+      const { api, options, rpc } = makeOptions({
+        validateActiveProjectBeforeSend,
+      })
+
+      await api.onSend()
+
+      expect(validateActiveProjectBeforeSend).toHaveBeenCalledOnce()
+      expect(rpc.call).not.toHaveBeenCalledWith('chat.send', expect.anything())
+      expect(options.inputText.value).toBe('hello')
+      expect(options.messages.value).toEqual([])
+    },
+  )
+
+  it('sends only after project preflight confirms ready', async () => {
+    const validateActiveProjectBeforeSend = vi.fn(async () => null)
+    const { api, rpc } = makeOptions({
+      validateActiveProjectBeforeSend,
+    })
+
+    await api.onSend()
+
+    expect(validateActiveProjectBeforeSend).toHaveBeenCalledOnce()
+    expect(rpc.call).toHaveBeenCalledWith(
+      'chat.send',
+      expect.objectContaining({ message: 'hello' }),
+    )
+  })
+
+  it('blocks hidden control sends when the active project preflight fails', async () => {
+    const validateActiveProjectBeforeSend = vi.fn(async () => 'removed')
+    const { api, options, rpc } = makeOptions({
+      validateActiveProjectBeforeSend,
+    })
+
+    await api.dispatchHiddenSend('provider confirmation', 'Confirmed')
+
+    expect(validateActiveProjectBeforeSend).toHaveBeenCalledOnce()
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.messages.value).toEqual([])
+  })
+
+  it('admits only one send while an active-project preflight is pending', async () => {
+    let finishPreflight!: () => void
+    const validateActiveProjectBeforeSend = vi.fn(() => new Promise<string | null>(
+      resolve => {
+        finishPreflight = () => resolve(null)
+      },
+    ))
+    const { api, rpc } = makeOptions({
+      validateActiveProjectBeforeSend,
+    })
+
+    const first = api.onSend()
+    const second = api.onSend()
+    expect(validateActiveProjectBeforeSend).toHaveBeenCalledOnce()
+
+    finishPreflight()
+    await Promise.all([first, second])
+
+    expect(rpc.call).toHaveBeenCalledTimes(1)
+    expect(rpc.call).toHaveBeenCalledWith(
+      'chat.send',
+      expect.objectContaining({ message: 'hello' }),
+    )
+  })
+
   it('binds a new project task to its workspace and preserves that binding on retry', async () => {
     const pendingSessionIntent = ref<string | null>('new_chat')
     const pendingWorkspaceId = ref<string | null>('project-a')
