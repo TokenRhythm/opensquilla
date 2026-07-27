@@ -112,7 +112,12 @@ def _reset() -> None:
 async def test_sandbox_backend_denial_requests_exact_broader_retry(tmp_path: Path) -> None:
     queue = _ApproveQueue(approve=True)
     configure_runtime(
-        SandboxSettings(sandbox=True, backend="noop", security_grading=False),
+        SandboxSettings(
+            sandbox=True,
+            backend="noop",
+            security_grading=False,
+            run_mode="standard",
+        ),
         approval_queue=queue,
         workspace=tmp_path,
     )
@@ -225,7 +230,12 @@ async def test_current_tool_context_full_host_access_skips_backend_host_once(
 @pytest.mark.asyncio
 async def test_escalate_returns_pending_retry_review(tmp_path: Path) -> None:
     configure_runtime(
-        SandboxSettings(sandbox=True, backend="noop", security_grading=False),
+        SandboxSettings(
+            sandbox=True,
+            backend="noop",
+            security_grading=False,
+            run_mode="standard",
+        ),
         approval_queue=_ApproveQueue(approve=True),
         workspace=tmp_path,
     )
@@ -241,7 +251,12 @@ async def test_escalate_returns_pending_retry_review(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_escalate_never_waits_inside_tool_handler(tmp_path: Path) -> None:
     configure_runtime(
-        SandboxSettings(sandbox=True, backend="noop", security_grading=False),
+        SandboxSettings(
+            sandbox=True,
+            backend="noop",
+            security_grading=False,
+            run_mode="standard",
+        ),
         approval_queue=_ApproveQueue(approve=False),
         workspace=tmp_path,
     )
@@ -264,6 +279,7 @@ async def test_backend_retry_request_reuses_one_pending_review(
             backend="noop",
             security_grading=False,
             denial_threshold=3,
+            run_mode="standard",
         ),
         approval_queue=_ApproveQueue(approve=False),
         workspace=tmp_path,
@@ -299,7 +315,12 @@ async def test_approved_backend_retry_consumes_same_request_once(tmp_path: Path)
     queue = ApprovalQueue(db_path=str(tmp_path / "approvals.sqlite"))
     try:
         runtime = configure_runtime(
-            SandboxSettings(sandbox=True, backend="noop", security_grading=False),
+            SandboxSettings(
+                sandbox=True,
+                backend="noop",
+                security_grading=False,
+                run_mode="standard",
+            ),
             approval_queue=queue,
             workspace=tmp_path,
         )
@@ -339,6 +360,7 @@ async def test_standard_rejects_legacy_auto_approved_backend_retry(
                 backend="noop",
                 security_grading=False,
                 approvals_reviewer="auto_review",
+                run_mode="standard",
             ),
             approval_queue=queue,
             workspace=tmp_path,
@@ -385,7 +407,12 @@ async def test_backend_retry_rejects_changed_request_without_consuming(tmp_path:
     queue = ApprovalQueue(db_path=str(tmp_path / "approvals.sqlite"))
     try:
         runtime = configure_runtime(
-            SandboxSettings(sandbox=True, backend="noop", security_grading=False),
+            SandboxSettings(
+                sandbox=True,
+                backend="noop",
+                security_grading=False,
+                run_mode="standard",
+            ),
             approval_queue=queue,
             workspace=tmp_path,
         )
