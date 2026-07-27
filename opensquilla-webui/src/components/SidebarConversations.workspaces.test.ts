@@ -96,7 +96,10 @@ function i18n() {
   })
 }
 
-async function mountSidebar(rows: SidebarSectionRow[]) {
+async function mountSidebar(
+  rows: SidebarSectionRow[],
+  canManageProjects = true,
+) {
   const sections: SidebarSection[] = [{ family: 'chats', label: 'Tasks', rows }]
   const events = {
     select: vi.fn(),
@@ -115,6 +118,7 @@ async function mountSidebar(rows: SidebarSectionRow[]) {
     currentKey: '',
     contractDebugEnabled: false,
     searchHint: 'Ctrl+K',
+    canManageProjects,
     onSelect: events.select,
     onNewProjectTask: events.newProjectTask,
     onProjectPin: events.projectPin,
@@ -216,6 +220,23 @@ describe('SidebarConversations project workspaces', () => {
     await nextTick()
     document.body.querySelector<HTMLButtonElement>('[data-project-action="remove"]')?.click()
     expect(events.projectRemove).toHaveBeenCalledWith('project-a')
+  })
+
+  it('keeps project navigation but hides management actions for non-owners', async () => {
+    const { host, events } = await mountSidebar(
+      [projectRow(), taskRow()],
+      false,
+    )
+
+    expect(host.querySelector('[data-testid="project-workspace-disclosure"]')).toBeTruthy()
+    expect(host.querySelector('[data-testid="project-workspace-new-task"]')).toBeNull()
+    expect(host.querySelector('[data-testid="project-workspace-more"]')).toBeNull()
+
+    host.querySelector<HTMLButtonElement>(
+      '[data-session-key="agent:main:webchat:task-a"] .sidebar-history-item',
+    )?.click()
+    await nextTick()
+    expect(events.select).toHaveBeenCalledWith('agent:main:webchat:task-a')
   })
 
 })

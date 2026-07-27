@@ -368,6 +368,50 @@ async def test_workspace_id_rejected_for_continue_and_non_owner(
 
 
 @pytest.mark.asyncio
+async def test_non_owner_can_continue_an_existing_project_session(
+    tmp_path: Path,
+) -> None:
+    async with open_stack(tmp_path / "sessions.db") as stack:
+        project = await add_project(stack, tmp_path / "project")
+        assert project is not None
+        key = "agent:main:webchat:remote-existing-project"
+        await stack.storage.upsert_session(
+            SessionNode(session_key=key, workspace_id=project.workspace_id)
+        )
+        captured: dict[str, Any] = {}
+        ran = asyncio.Event()
+
+        class Runner:
+            async def run(self, message: str, session_key: str, **kwargs: Any):
+                captured.update(kwargs)
+                ran.set()
+                yield DoneEvent()
+
+        remote_ctx = RpcContext(
+            conn_id="remote-existing-project",
+            principal=REMOTE,
+            config=stack.context.config,
+            session_manager=stack.manager,
+            turn_runner=Runner(),
+        )
+        response = await get_dispatcher().dispatch(
+            "remote-existing-project-send",
+            "sessions.send",
+            {
+                "key": key,
+                "message": "continue",
+                "intent": "continue",
+            },
+            remote_ctx,
+        )
+        await asyncio.wait_for(ran.wait(), timeout=2.0)
+
+        assert response.ok is True
+        assert captured["tool_context"].workspace_dir == project.path
+        assert captured["tool_context"].is_owner is False
+
+
+@pytest.mark.asyncio
 async def test_removed_or_missing_project_rejects_without_creating_session(
     tmp_path: Path,
 ) -> None:

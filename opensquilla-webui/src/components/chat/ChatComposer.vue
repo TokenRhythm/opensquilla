@@ -72,7 +72,12 @@
               <Icon name="plus" :size="18" />
             </button>
             <button
-              v-if="isNewLanding && !projectWorkspace && (!projectWorkspaceStatus || projectWorkspaceStatus === 'none')"
+              v-if="
+                canChooseProject
+                && isNewLanding
+                && !projectWorkspace
+                && (!projectWorkspaceStatus || projectWorkspaceStatus === 'none')
+              "
               type="button"
               class="chat-project-choose"
               @click="emit('chooseProject')"
@@ -281,7 +286,7 @@ interface ChatComposerExpose {
   resizeTextarea: () => void
 }
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   attachments: Attachment[]
   busySendMode: 'queue' | 'steer'
   hasSendContent: boolean
@@ -307,7 +312,10 @@ const props = defineProps<{
   projectWorkspaceStatus?: 'none' | 'resolving' | 'ready' | 'unavailable' | 'removed' | 'unknown' | 'error'
   projectStatusMessage?: string
   canCloseProject?: boolean
-}>()
+  canChooseProject?: boolean
+}>(), {
+  canChooseProject: true,
+})
 
 const emit = defineEmits<{
   beforeinput: [event: InputEvent]

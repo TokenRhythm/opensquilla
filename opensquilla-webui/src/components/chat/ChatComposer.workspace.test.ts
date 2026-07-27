@@ -62,6 +62,22 @@ describe('ChatComposer project draft', () => {
     app.unmount()
   })
 
+  it('hides the project chooser when the principal cannot create projects', async () => {
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const app = createApp(ChatComposer, composerProps({
+      projectWorkspace: null,
+      canChooseProject: false,
+    }))
+    app.use(i18n)
+    app.mount(host)
+    await nextTick()
+
+    expect(host.querySelector('.chat-project-choose')).toBeNull()
+
+    app.unmount()
+  })
+
   it('shows both the project name and path and lets a blank draft close it', async () => {
     const closeProject = vi.fn()
     const host = document.createElement('div')

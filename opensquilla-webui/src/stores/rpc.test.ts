@@ -146,4 +146,31 @@ describe('rpc link-token bootstrap', () => {
     clients[0].emit('_hello', {})
     expect(store.methods).toEqual([])
   })
+
+  it('derives project capabilities from the current Hello owner and methods', () => {
+    const store = useRpcStore()
+    store.init()
+
+    clients[0].emit('_hello', {
+      auth: { principal: { isOwner: true } },
+      features: { methods: ['workspaces.list', 'workspaces.open'] },
+    })
+    expect(store.isLocalOwner).toBe(true)
+    expect(store.canManageProjectWorkspaces).toBe(true)
+    expect(store.canChooseProject).toBe(true)
+
+    clients[0].emit('_state', 'connecting')
+    expect(store.auth).toBeNull()
+    expect(store.methods).toEqual([])
+    expect(store.canManageProjectWorkspaces).toBe(false)
+
+    clients[0].emit('_state', 'connected')
+    clients[0].emit('_hello', {
+      auth: { principal: { isOwner: false } },
+      features: { methods: ['workspaces.list', 'workspaces.open'] },
+    })
+    expect(store.isLocalOwner).toBe(false)
+    expect(store.canManageProjectWorkspaces).toBe(false)
+    expect(store.canChooseProject).toBe(false)
+  })
 })

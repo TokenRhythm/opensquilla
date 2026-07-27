@@ -1,4 +1,4 @@
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useRpcStore } from '@/stores/rpc'
 import type {
   ProjectWorkspaceHistoryDeleteResponse,
@@ -37,7 +37,24 @@ function normalizeWorkspace(value: unknown): ProjectWorkspaceItem | null {
 export function useProjectWorkspaces() {
   const rpc = useRpcStore()
 
+  function resetWorkspaces() {
+    workspaces.value = []
+    isLoading.value = false
+    error.value = null
+    hasLoaded.value = false
+  }
+
+  function requireOwnerMethod(method: string) {
+    if (!rpc.isLocalOwner || !rpc.supportsMethod(method)) {
+      throw new Error('Project workspaces require a local owner.')
+    }
+  }
+
   async function loadWorkspaces(): Promise<ProjectWorkspaceItem[]> {
+    if (!rpc.canManageProjectWorkspaces) {
+      resetWorkspaces()
+      return []
+    }
     isLoading.value = true
     error.value = null
     try {
@@ -56,6 +73,7 @@ export function useProjectWorkspaces() {
   }
 
   async function mutate(method: string, params: Record<string, unknown>): Promise<void> {
+    requireOwnerMethod(method)
     error.value = null
     try {
       await rpc.call(method, params)
@@ -67,6 +85,7 @@ export function useProjectWorkspaces() {
   }
 
   async function openWorkspace(path: string): Promise<ProjectWorkspaceItem | null> {
+    requireOwnerMethod('workspaces.open')
     const response = await rpc.call<{ workspace?: unknown }>('workspaces.open', {
       path,
       trusted: true,
@@ -78,6 +97,7 @@ export function useProjectWorkspaces() {
   async function deleteWorkspaceHistory(
     workspaceId: string,
   ): Promise<Required<ProjectWorkspaceHistoryDeleteResponse>> {
+    requireOwnerMethod('workspaces.history.delete')
     error.value = null
     let response: ProjectWorkspaceHistoryDeleteResponse
     try {
@@ -106,6 +126,7 @@ export function useProjectWorkspaces() {
   }
 
   async function removeWorkspace(workspaceId: string): Promise<void> {
+    requireOwnerMethod('workspaces.remove')
     error.value = null
     try {
       await rpc.call('workspaces.remove', { workspaceId })
@@ -127,12 +148,21 @@ export function useProjectWorkspaces() {
 
   const byId = computed(() => new Map(workspaces.value.map(item => [item.id, item])))
 
+  watch(
+    () => rpc.canManageProjectWorkspaces,
+    allowed => {
+      if (!allowed) resetWorkspaces()
+    },
+    { immediate: true },
+  )
+
   return {
     workspaces,
     byId,
     isLoading,
     error,
     hasLoaded,
+    resetWorkspaces,
     loadWorkspaces,
     openWorkspace,
     renameWorkspace: (workspaceId: string, name: string) =>

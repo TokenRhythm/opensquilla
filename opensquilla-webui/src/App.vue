@@ -60,6 +60,7 @@
         <kbd v-if="newChatHint" class="sidebar-kbd" aria-hidden="true">{{ newChatHint }}</kbd>
       </button>
       <button
+        v-if="rpcStore.canChooseProject"
         type="button"
         class="sidebar-fn-item"
         :title="t('workspaces.chooseProject')"
@@ -94,6 +95,7 @@
       :current-key="currentSessionKey"
       :contract-debug-enabled="contractDebugEnabled"
       :search-hint="commandPaletteHint"
+      :can-manage-projects="rpcStore.canManageProjectWorkspaces"
       @select="switchToSession"
       @refresh="loadSidebarData"
       @rename="onRenameSession"
@@ -352,13 +354,16 @@
   <ConfirmModal />
 
   <ProjectWorkspacePickerDialog
+    v-if="rpcStore.canChooseProject"
     :open="projectPickerOpen"
+    :enabled="rpcStore.canChooseProject"
     :session-key="currentSessionKey || 'agent:main:webchat:workspace-picker'"
     @close="projectPickerOpen = false"
     @choose="onProjectPathChosen"
   />
 
   <ProjectWorkspaceEditDialog
+    v-if="rpcStore.canManageProjectWorkspaces"
     :open="Boolean(editingProject)"
     :initial-name="editingProject?.name || ''"
     :path="editingProject?.path || ''"
@@ -492,6 +497,17 @@ const editingProject = computed(() =>
   editingProjectId.value
     ? projectWorkspaces.byId.value.get(editingProjectId.value) || null
     : null,
+)
+watch(
+  () => rpcStore.canManageProjectWorkspaces,
+  allowed => {
+    if (allowed) {
+      void projectWorkspaces.loadWorkspaces().catch(() => undefined)
+      return
+    }
+    projectPickerOpen.value = false
+    editingProjectId.value = ''
+  },
 )
 // Feature-gated topbar music control; the singleton `enabled` ref is written by
 // Settings → Appearance and the command palette.
@@ -701,7 +717,7 @@ const sidebarSections = computed((): SidebarSection[] => {
   const byKey = new Map(sidebarSessionItems.value.map(item => [item.key, item]))
   return arrangeSidebarSections(
     sidebarSessionItems.value,
-    projectWorkspaces.hasLoaded.value
+    rpcStore.canManageProjectWorkspaces && projectWorkspaces.hasLoaded.value
       ? projectWorkspaces.workspaces.value
       : undefined,
   ).map(section => ({
@@ -846,12 +862,13 @@ function startNewChatInstant() {
 }
 
 function openProjectPicker() {
+  if (!rpcStore.canChooseProject) return
   handleNavClick()
   projectPickerOpen.value = true
 }
 
 function startProjectTask(workspaceId: string) {
-  if (!workspaceId) return
+  if (!workspaceId || !rpcStore.canManageProjectWorkspaces) return
   handleNavClick()
   freshTaskDraft.requestFreshTask('main', workspaceId)
   void router.push({
@@ -862,6 +879,7 @@ function startProjectTask(workspaceId: string) {
 
 async function onProjectPathChosen(path: string) {
   projectPickerOpen.value = false
+  if (!rpcStore.canChooseProject) return
   const trusted = await confirm({
     title: t('workspaces.trustTitle'),
     body: t('workspaces.trustBody', { path }),
@@ -878,6 +896,7 @@ async function onProjectPathChosen(path: string) {
 }
 
 async function onProjectPin(payload: { workspaceId: string; pinned: boolean }) {
+  if (!rpcStore.canManageProjectWorkspaces) return
   try {
     await projectWorkspaces.setPinned(payload.workspaceId, payload.pinned)
   } catch (err) {
@@ -886,10 +905,12 @@ async function onProjectPin(payload: { workspaceId: string; pinned: boolean }) {
 }
 
 function openProjectEditor(workspaceId: string) {
+  if (!rpcStore.canManageProjectWorkspaces) return
   editingProjectId.value = workspaceId
 }
 
 async function onProjectRename(name: string) {
+  if (!rpcStore.canManageProjectWorkspaces) return
   const workspaceId = editingProjectId.value
   if (!workspaceId) return
   try {
@@ -901,6 +922,7 @@ async function onProjectRename(name: string) {
 }
 
 async function onProjectDeleteHistory(workspaceId: string) {
+  if (!rpcStore.canManageProjectWorkspaces) return
   try {
     const result = await projectWorkspaces.deleteWorkspaceHistory(workspaceId)
     const leaveDeletedTask = activeTaskWasDeletedWithProjectHistory({
@@ -918,6 +940,7 @@ async function onProjectDeleteHistory(workspaceId: string) {
 }
 
 async function onProjectRemove(workspaceId: string) {
+  if (!rpcStore.canManageProjectWorkspaces) return
   const project = projectWorkspaces.byId.value.get(workspaceId)
   if (!project) return
   const approved = await confirm({
@@ -1117,10 +1140,11 @@ function scheduleSessionRefresh() {
 }
 
 async function loadSidebarData() {
-  await Promise.allSettled([
-    loadSessions(),
-    projectWorkspaces.loadWorkspaces(),
-  ])
+  const requests: Promise<unknown>[] = [loadSessions()]
+  if (rpcStore.canManageProjectWorkspaces) {
+    requests.push(projectWorkspaces.loadWorkspaces())
+  }
+  await Promise.allSettled(requests)
 }
 
 const sessionListSubscription = useSessionListSubscription({

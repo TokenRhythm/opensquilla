@@ -46,7 +46,7 @@ import { useConfirm } from '@/composables/useConfirm'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { shouldShowAgentFilterBadge } from '@/utils/sidebarConversations'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   sections: SidebarSection[]
   error: boolean
   loading: boolean
@@ -54,7 +54,10 @@ const props = defineProps<{
   contractDebugEnabled: boolean
   /** Command-palette chord, shown in the search button's tooltip. */
   searchHint: string
-}>()
+  canManageProjects?: boolean
+}>(), {
+  canManageProjects: true,
+})
 
 const emit = defineEmits<{
   (e: 'select', key: string): void
@@ -651,7 +654,10 @@ function onSelectRow(row: SidebarConversationItem) {
                 <Icon class="sidebar-project-chevron" name="chevronRight" :size="12" />
                 <span class="sidebar-workspace-label">{{ row.title }}</span>
               </button>
-              <div v-if="!selectionMode" class="sidebar-project-actions">
+              <div
+                v-if="!selectionMode && props.canManageProjects && row.workspaceId"
+                class="sidebar-project-actions"
+              >
                 <button
                   type="button"
                   class="sidebar-project-action"
@@ -746,7 +752,11 @@ function onSelectRow(row: SidebarConversationItem) {
             <!-- Chat-only ⋯ menu: rename + delete -->
             <Teleport to="body">
               <div
-                v-if="row.rowKind === 'workspace' && openMenuKey === row.key"
+                v-if="
+                  props.canManageProjects
+                  && row.rowKind === 'workspace'
+                  && openMenuKey === row.key
+                "
                 :ref="setOpenMenu"
                 class="sidebar-row-menu sidebar-project-menu"
                 :style="menuStyle"

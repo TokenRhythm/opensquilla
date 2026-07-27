@@ -465,6 +465,7 @@
       :project-workspace-status="activeWorkspaceStatus"
       :project-status-message="activeProjectStatusMessage"
       :can-close-project="isDraftRoute() && pendingWorkspaceId !== null"
+      :can-choose-project="rpc.canChooseProject"
       @composition-change="composing = $event"
       @beforeinput="onTextareaBeforeInput"
       @file-change="onFileInputChange"
@@ -482,11 +483,13 @@
       @export-markdown="exportMarkdown"
       @send="onSend"
       @stop="onStop"
-      @choose-project="projectPickerOpen = true"
+      @choose-project="openProjectPicker"
       @close-project="closeProjectDraft"
     />
     <ProjectWorkspacePickerDialog
+      v-if="rpc.canChooseProject"
       :open="projectPickerOpen"
+      :enabled="rpc.canChooseProject"
       :session-key="sessionKey"
       :initial-path="activeWorkspace?.path"
       @close="projectPickerOpen = false"
@@ -2524,6 +2527,7 @@ function consumeDraftPrefill() {
 
 async function chooseProjectPath(path: string) {
   projectPickerOpen.value = false
+  if (!rpc.canChooseProject) return
   const trusted = await confirm({
     title: t('workspaces.trustTitle'),
     body: t('workspaces.trustBody', { path }),
@@ -2546,6 +2550,11 @@ async function chooseProjectPath(path: string) {
   }
 }
 
+function openProjectPicker() {
+  if (!rpc.canChooseProject) return
+  projectPickerOpen.value = true
+}
+
 function closeProjectDraft() {
   activeProjectWorkspace.clearDraft()
   freshTaskDraft.requestFreshTask(draftAgentId())
@@ -2559,6 +2568,9 @@ function closeProjectDraft() {
 async function validateActiveProjectBeforeSend(): Promise<string | null> {
   const workspaceId = boundWorkspaceId.value
   if (!workspaceId) return activeWorkspaceSendBlockedReason.value
+  if (!rpc.canManageProjectWorkspaces) {
+    return activeWorkspaceSendBlockedReason.value
+  }
   try {
     const workspaces = await projectWorkspaces.loadWorkspaces()
     if (boundWorkspaceId.value !== workspaceId) {
@@ -2590,6 +2602,16 @@ async function syncDraftProjectFromRoute(generation: number): Promise<boolean> {
   if (!draftProjectHydrationIsCurrent(generation, workspaceId)) return false
   if (!workspaceId) {
     activeProjectWorkspace.clearDraft()
+    return true
+  }
+  if (!rpc.canChooseProject) {
+    activeProjectWorkspace.clearDraft()
+    freshTaskDraft.requestFreshTask(draftAgentId())
+    goToDraft({
+      agentId: draftAgentId(),
+      projectId: null,
+      replace: true,
+    })
     return true
   }
   const cached = projectWorkspaces.byId.value.get(workspaceId)
@@ -2763,7 +2785,7 @@ watch(freshTaskDraft.request, request => {
   if (!request) return
   draftProjectHydration.invalidate()
   landingPrefilled.value = false
-  if (request.workspaceId) {
+  if (request.workspaceId && rpc.canChooseProject) {
     const workspace = projectWorkspaces.byId.value.get(request.workspaceId)
     if (workspace) {
       activeProjectWorkspace.beginProjectDraft(activeSnapshot(workspace))
@@ -2778,6 +2800,7 @@ watch(freshTaskDraft.request, request => {
 })
 
 watch(projectWorkspaces.workspaces, workspaces => {
+  if (!rpc.canManageProjectWorkspaces) return
   const workspaceId = boundWorkspaceId.value
   if (!workspaceId) return
   const workspace = workspaces.find(item => item.id === workspaceId) || null
@@ -2785,6 +2808,22 @@ watch(projectWorkspaces.workspaces, workspaces => {
     workspace ? activeSnapshot(workspace) : null,
   )
 })
+
+watch(
+  () => rpc.canChooseProject,
+  allowed => {
+    if (allowed) return
+    projectPickerOpen.value = false
+    if (!isDraftRoute() || !readProjectFromUrl()) return
+    activeProjectWorkspace.clearDraft()
+    freshTaskDraft.requestFreshTask(draftAgentId())
+    goToDraft({
+      agentId: draftAgentId(),
+      projectId: null,
+      replace: true,
+    })
+  },
+)
 
 // Legacy ?newChat=1 / ?new=1 links land on the draft route, then the params disappear.
 watch(() => [route.query.newChat, route.query.new], () => {

@@ -6,15 +6,14 @@ async function openControl(page: Page) {
   await page.goto(CONTROL_URL)
   await page.waitForSelector('.conn-pill', { timeout: 10000 })
   await page.waitForSelector('.conn-pill.connected', { timeout: 10000 }).catch(() => {})
-  await expect(
-    page.locator('.sidebar-history-list, .sidebar-history-empty, .sidebar-onboarding').first(),
-  ).toBeVisible()
+  await expect(page.getByRole('navigation', { name: 'Primary' })).toBeVisible()
 }
 
 type RpcParams = Record<string, unknown>
 
 interface ProjectLifecycleState {
   sessionKey: string
+  requestMethods: string[]
   pathListRequests: RpcParams[]
   workspaceListRequests: number
   sends: RpcParams[]
@@ -29,10 +28,11 @@ interface ProjectLifecycleState {
 
 async function installProjectLifecycleRpc(
   page: Page,
-  options: { connectDelayMs?: number } = {},
+  options: { connectDelayMs?: number; owner?: boolean } = {},
 ): Promise<ProjectLifecycleState> {
   const state: ProjectLifecycleState = {
     sessionKey: 'agent:main:webchat:project-demo-task',
+    requestMethods: [],
     pathListRequests: [],
     workspaceListRequests: 0,
     sends: [],
@@ -93,6 +93,7 @@ async function installProjectLifecycleRpc(
         return
       }
       if (frame.type !== 'req' || frame.id === undefined) return
+      state.requestMethods.push(String(frame.method || ''))
       const params = frame.params || {}
       switch (frame.method) {
         case 'connect':
@@ -100,6 +101,20 @@ async function installProjectLifecycleRpc(
             ws.send(JSON.stringify({
               protocol: 3,
               policy: { tick_interval_ms: 30_000 },
+              auth: { principal: { isOwner: options.owner !== false } },
+              features: {
+                methods: [
+                  'workspaces.list',
+                  'workspaces.open',
+                  'workspaces.update',
+                  'workspaces.pin',
+                  'workspaces.remove',
+                  'workspaces.history.delete',
+                  'sandbox.path.list',
+                  'sandbox.path.pick',
+                  'sandbox.path.create-directory',
+                ],
+              },
             }))
           }, options.connectDelayMs || 0)
           return
@@ -230,6 +245,28 @@ async function installProjectLifecycleRpc(
 }
 
 test.describe('Project workspaces', () => {
+  test('non-owner can continue an existing project task without management RPCs', async ({ page }) => {
+    const state = await installProjectLifecycleRpc(page, { owner: false })
+    state.projectPresent = true
+    state.sent = true
+
+    await page.goto(`/control/chat?session=${encodeURIComponent(state.sessionKey)}`)
+    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect(page.locator('.chat-project-chip')).toContainText('/repos/demo')
+    await expect(page.getByRole('button', { name: 'Choose project' })).toHaveCount(0)
+
+    await page.getByRole('textbox', { name: 'Message to send' }).fill('continue')
+    await page.getByRole('button', { name: 'Send' }).click()
+    await expect.poll(
+      () => state.sends.length,
+      { message: `RPC requests: ${state.requestMethods.join(', ')}` },
+    ).toBe(1)
+
+    expect(state.sends[0]).not.toHaveProperty('workspaceId')
+    expect(state.workspaceListRequests).toBe(0)
+    expect(state.pathListRequests).toEqual([])
+  })
+
   test('waits for the connection before restoring a project draft', async ({ page }) => {
     const state = await installProjectLifecycleRpc(page, { connectDelayMs: 800 })
     state.projectPresent = true
@@ -248,7 +285,7 @@ test.describe('Project workspaces', () => {
     await openControl(page)
 
     await page
-      .locator('.sidebar-actions')
+      .getByRole('navigation', { name: 'Control navigation' })
       .getByRole('button', { name: 'Choose project' })
       .click()
 
@@ -269,10 +306,13 @@ test.describe('Project workspaces', () => {
   })
 
   test('offers project selection from both the sidebar and an ordinary draft', async ({ page }) => {
+    await installProjectLifecycleRpc(page)
     await openControl(page)
 
     await expect(
-      page.locator('.sidebar-actions').getByRole('button', { name: 'Choose project' }),
+      page
+        .getByRole('navigation', { name: 'Control navigation' })
+        .getByRole('button', { name: 'Choose project' }),
     ).toBeVisible()
     await page.locator('.sidebar-new-session').click()
     await expect(page).toHaveURL(/\/chat\/new\?agent=main$/)
@@ -280,9 +320,11 @@ test.describe('Project workspaces', () => {
   })
 
   test('project names only disclose tasks while the pencil opens a project draft', async ({ page }) => {
+    const state = await installProjectLifecycleRpc(page)
+    state.projectPresent = true
+    state.sent = true
     await openControl(page)
     const project = page.locator('.sidebar-history-row--workspace').first()
-    test.skip(await project.count() === 0, 'No persisted project on this gateway')
 
     const disclosure = project.getByTestId('project-workspace-disclosure')
     const info = project.getByTestId('project-workspace-info')
@@ -305,7 +347,7 @@ test.describe('Project workspaces', () => {
     await openControl(page)
 
     await page
-      .locator('.sidebar-actions')
+      .getByRole('navigation', { name: 'Control navigation' })
       .getByRole('button', { name: 'Choose project' })
       .click()
     await expect.poll(() => state.pathListRequests.length).toBe(1)
@@ -319,11 +361,16 @@ test.describe('Project workspaces', () => {
     await picker.getByRole('button', { name: 'Choose selected directory' }).click()
     await page.getByRole('button', { name: 'Trust and open' }).click()
     await expect(page).toHaveURL(/\/chat\/new\?agent=main&project=project-demo$/)
-    await expect(page.locator('.chat-project-chip')).toContainText('/repos/demo')
+    const projectChip = page.locator('.chat-project-chip')
+    await expect(projectChip).toContainText('/repos/demo')
+    await expect(projectChip).toHaveAttribute('data-status', 'ready')
 
     await page.getByRole('textbox', { name: 'Message to send' }).fill('pwd')
     await page.getByRole('button', { name: 'Send' }).click()
-    await expect.poll(() => state.sends.length).toBe(1)
+    await expect.poll(
+      () => state.sends.length,
+      { message: `RPC requests: ${state.requestMethods.join(', ')}` },
+    ).toBe(1)
     expect(state.sends[0]).toMatchObject({
       message: 'pwd',
       workspaceId: 'project-demo',
@@ -346,7 +393,7 @@ test.describe('Project workspaces', () => {
     expect(state.sends).toHaveLength(1)
 
     await page
-      .locator('.sidebar-actions')
+      .getByRole('navigation', { name: 'Control navigation' })
       .getByRole('button', { name: 'Choose project' })
       .click()
     const reopenedPicker = page.getByRole('dialog', { name: 'Choose project' })

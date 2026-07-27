@@ -1,7 +1,7 @@
 <template>
   <Teleport to="body">
     <div
-      v-if="open && phase !== 'closed' && phase !== 'native-picking'"
+      v-if="open && enabled && phase !== 'closed' && phase !== 'native-picking'"
       class="modal-overlay"
       @click="closeDialog"
     >
@@ -172,11 +172,14 @@ type PickerPhase =
   | 'web-ready'
   | 'web-error'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   open: boolean
   sessionKey: string
   initialPath?: string
-}>()
+  enabled?: boolean
+}>(), {
+  enabled: true,
+})
 const emit = defineEmits<{
   close: []
   choose: [path: string]
@@ -224,11 +227,14 @@ function isAbsoluteLocation(path: string): boolean {
 }
 
 function ownsRequest(epoch: number, sequence: number): boolean {
-  return props.open && epoch === openEpoch && sequence === browseSequence
+  return props.open
+    && props.enabled
+    && epoch === openEpoch
+    && sequence === browseSequence
 }
 
 async function browse(target?: string, epoch = openEpoch) {
-  if (!props.open || epoch !== openEpoch) return
+  if (!props.open || !props.enabled || epoch !== openEpoch) return
   const sequence = ++browseSequence
   const normalized = target?.trim() || ''
   const params: Record<string, string> = {
@@ -284,6 +290,7 @@ function cancelCreateDirectory() {
 }
 
 async function createDirectory() {
+  if (!props.enabled) return
   const name = newDirectoryName.value.trim()
   if (!name || !currentDirectory.value || creatingDirectoryBusy.value) return
   const epoch = openEpoch
@@ -327,14 +334,14 @@ function closeDialog() {
 }
 
 function choose() {
-  if (!canChoose.value) return
+  if (!props.enabled || !canChoose.value) return
   const selected = selectedDirectory.value.trim()
   invalidateAndClose()
   emit('choose', selected)
 }
 
 async function openSystemPicker() {
-  if (!props.open || systemPickerBusy.value) return
+  if (!props.open || !props.enabled || systemPickerBusy.value) return
   const epoch = openEpoch
   systemPickerBusy.value = true
   error.value = ''
@@ -364,6 +371,7 @@ async function openSystemPicker() {
 }
 
 async function runNativePicker(epoch: number) {
+  if (!props.enabled) return
   const nativePicker = getPlatform().files.chooseProjectDirectory
   if (typeof nativePicker !== 'function') {
     await nextTick()
@@ -418,16 +426,30 @@ watch(
       phase.value = 'closed'
       return
     }
+    if (!props.enabled) {
+      phase.value = 'closed'
+      return
+    }
     const epoch = openEpoch
     await runNativePicker(epoch)
   },
   { immediate: true },
 )
 
+watch(
+  () => props.enabled,
+  enabled => {
+    if (enabled || !props.open) return
+    invalidateAndClose()
+    emit('close')
+  },
+)
+
 useDialogA11y(
   dialogRef,
   computed(
     () => props.open
+      && props.enabled
       && phase.value !== 'closed'
       && phase.value !== 'native-picking',
   ),

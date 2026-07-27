@@ -100,15 +100,17 @@ async function flushPromises() {
   await nextTick()
 }
 
-async function mountPicker(options: { initialPath?: string } = {}) {
+async function mountPicker(options: { initialPath?: string; enabled?: boolean } = {}) {
   const events = { close: vi.fn(), choose: vi.fn() }
   const open = ref(true)
+  const enabled = ref(options.enabled ?? true)
   const host = document.createElement('div')
   document.body.appendChild(host)
   const Root = defineComponent(() => () => h(ProjectWorkspacePickerDialog, {
     open: open.value,
     sessionKey: PICKER_KEY,
     initialPath: options.initialPath,
+    enabled: enabled.value,
     onClose: events.close,
     onChoose: events.choose,
   }))
@@ -121,6 +123,10 @@ async function mountPicker(options: { initialPath?: string } = {}) {
     events,
     async setOpen(value: boolean) {
       open.value = value
+      await nextTick()
+    },
+    async setEnabled(value: boolean) {
+      enabled.value = value
       await nextTick()
     },
   }
@@ -170,6 +176,18 @@ afterEach(() => {
 })
 
 describe('ProjectWorkspacePickerDialog', () => {
+  it('does not invoke native or RPC pickers while project selection is disabled', async () => {
+    const nativePicker = vi.fn()
+    mocks.platform.files.chooseProjectDirectory = nativePicker
+
+    await mountPicker({ enabled: false })
+    await flushPromises()
+
+    expect(nativePicker).not.toHaveBeenCalled()
+    expect(mocks.rpcCall).not.toHaveBeenCalled()
+    expect(document.querySelector('.project-picker')).toBeNull()
+  })
+
   it('omits the initial web path and exposes only selectable directories', async () => {
     mocks.rpcCall.mockResolvedValue(pathResult('/repos', [
       '/repos/project-a',
