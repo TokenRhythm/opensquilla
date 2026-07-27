@@ -1,0 +1,927 @@
+/*
+ * Modern shell refinement.
+ *
+ * The product keeps its orange brand accent and semantic status colors, while
+ * the everyday chrome follows a quieter macOS-like hierarchy: system type,
+ * open canvas, soft grouped surfaces, generous spacing, and fewer strokes.
+ */
+
+:root {
+  --modern-page-max: 1480px;
+  --modern-press-scale: 0.975;
+}
+
+html,
+body {
+  letter-spacing: -0.006em;
+  line-height: 1.55;
+}
+
+body::before {
+  display: none;
+}
+
+/* Controls: filled surfaces carry hierarchy; outlines are reserved for focus. */
+input:not([type="radio"]):not([type="checkbox"]),
+textarea,
+select,
+.control-input {
+  background: var(--bg-surface-2);
+  border-color: transparent;
+  border-radius: var(--radius-control);
+  min-height: 38px;
+  padding: 9px 13px;
+}
+
+input:not([type="radio"]):not([type="checkbox"]):focus,
+textarea:focus,
+select:focus,
+.control-input:focus {
+  background: var(--bg-surface);
+  border-color: transparent;
+  box-shadow: var(--focus-ring);
+}
+
+.btn {
+  border: 0;
+  border-radius: var(--radius-control);
+  font-weight: 560;
+  min-height: 36px;
+  padding: 8px 14px;
+}
+
+.btn:not(.btn--primary):not(.btn--danger) {
+  background: var(--bg-surface-2);
+}
+
+.btn--ghost {
+  background: transparent !important;
+}
+
+.btn--ghost:not(:disabled):hover,
+.btn--icon:not(:disabled):hover {
+  background: var(--bg-hover) !important;
+}
+
+.btn--primary {
+  box-shadow: 0 5px 16px -9px color-mix(in srgb, var(--accent) 70%, transparent);
+}
+
+/* One tactile vocabulary: controls compress a fraction on press, then return
+   with the shared spring. The short scale is perceptible without feeling toy-like. */
+.btn,
+.theme-menu__item,
+.sidebar-new-session,
+.sidebar-cmd-btn,
+.sidebar-fn-item,
+.sidebar-history-item,
+.sidebar-row-menu__item,
+.control-segmented__btn,
+.route-hub__tab,
+#app .settings-modal .settings-rail__item {
+  transform-origin: center;
+  transition:
+    background var(--dur-fast) var(--ease-standard),
+    border-color var(--dur-fast) var(--ease-standard),
+    box-shadow var(--dur-fast) var(--ease-standard),
+    color var(--dur-fast) var(--ease-standard),
+    opacity var(--dur-fast) var(--ease-standard),
+    transform var(--dur-fast) var(--ease-spring);
+}
+
+.btn:not(:disabled):active,
+.theme-menu__item:not(:disabled):active,
+.sidebar-new-session:not(:disabled):active,
+.sidebar-cmd-btn:not(:disabled):active,
+.sidebar-fn-item:not(:disabled):active,
+.sidebar-history-item:not(:disabled):active,
+.sidebar-row-menu__item:not(:disabled):active,
+.control-segmented__btn:not(:disabled):active,
+.route-hub__tab:not(:disabled):active,
+#app .settings-modal .settings-rail__item:not(:disabled):active {
+  transform: scale(var(--modern-press-scale));
+}
+
+.theme-menu,
+.sidebar-more-popover {
+  border: 0;
+  border-radius: var(--radius-card);
+  box-shadow: var(--elev-3);
+  padding: var(--sp-2);
+}
+
+.theme-menu__item {
+  border-radius: var(--radius-control);
+  min-height: 38px;
+  padding: 9px 11px;
+}
+
+/* Shell: the canvas is open, not framed inside another card. */
+.main {
+  background: var(--bg);
+}
+
+.content:not(.content--chat) {
+  background: var(--bg);
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  margin: 0;
+  padding: clamp(42px, 4.2vw, 68px) clamp(28px, 4.5vw, 76px);
+}
+
+.content:not(.content--chat) > * {
+  margin-inline: auto;
+  max-width: var(--modern-page-max);
+  width: 100%;
+}
+
+.topbar:not(.topbar--chat) {
+  inset: 14px 20px auto 20px;
+}
+
+.topbar--chat {
+  background: color-mix(in srgb, var(--bg-surface) 88%, transparent);
+  border: 0;
+  border-radius: var(--radius-panel) 0 0 0;
+  margin-top: var(--sp-2);
+}
+
+/* Sidebar: calm pill selection, roomier rows, no instrument-like accent rail. */
+.sidebar {
+  padding: 12px 8px 14px;
+}
+
+.sidebar-brand {
+  padding: 6px 10px 14px;
+}
+
+.sidebar-brand-mark {
+  height: 25px;
+  width: 25px;
+}
+
+.sidebar-brand-text {
+  font-family: var(--font-sans);
+  font-size: 0.9375rem;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+
+.sidebar-actions {
+  gap: var(--sp-2);
+  padding: 2px 4px 12px;
+}
+
+.sidebar-new-session,
+.sidebar-cmd-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-control);
+  box-shadow: none;
+  min-height: 40px;
+  transition:
+    background var(--dur-fast),
+    border-color var(--dur-fast),
+    color var(--dur-fast);
+}
+
+.sidebar-new-session:hover,
+.sidebar-cmd-btn:hover,
+.sidebar-cmd-btn.is-active {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.sidebar-new-session:focus-visible,
+.sidebar-cmd-btn:focus-visible {
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 32%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 12%, transparent);
+  outline: 0;
+}
+
+.sidebar-new-session {
+  font-weight: 560;
+  padding: 9px 12px;
+}
+
+.sidebar-cmd-btn {
+  height: 32px;
+  min-height: 32px;
+  width: 32px;
+}
+
+.sidebar-core {
+  background: none;
+  gap: 3px;
+  padding: 0 2px 14px;
+}
+
+.sidebar-core .sidebar-fn-item,
+.sidebar-foot .sidebar-fn-item {
+  border-radius: var(--radius-control);
+  font-weight: 520;
+  min-height: 40px;
+  padding: 9px 11px;
+}
+
+.sidebar-core .sidebar-fn-item,
+.sidebar-core .sidebar-new-session {
+  border: 0;
+  min-height: 42px;
+  padding: 10px 11px;
+  transition:
+    background var(--dur-fast) var(--ease-standard),
+    border-color var(--dur-fast) var(--ease-standard),
+    box-shadow var(--dur-fast) var(--ease-standard),
+    color var(--dur-fast) var(--ease-standard),
+    opacity var(--dur-fast) var(--ease-standard),
+    transform var(--dur-fast) var(--ease-spring);
+}
+
+/* Core destinations and recent tasks share one quiet hover surface. New task
+   no longer introduces a separate accent-tinted state; the accent stays
+   reserved for the selected destination/current task. */
+.sidebar-core .sidebar-new-session:hover,
+.sidebar-core .sidebar-fn-item:hover {
+  background: var(--sidebar-item-hover);
+  color: var(--sidebar-text-strong);
+}
+
+.sidebar-core .sidebar-fn-item.is-active {
+  box-shadow: none;
+  font-weight: 620;
+}
+
+.sidebar-core .sidebar-fn-item.is-active:hover {
+  background: var(--sidebar-item-active);
+}
+
+.sidebar-recents-header {
+  align-items: center;
+  gap: var(--sp-1);
+  min-height: 40px;
+  padding: 4px 10px;
+}
+
+.sidebar-recents-eyebrow {
+  font-size: var(--fs-sm);
+  font-weight: 400;
+  line-height: 20px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.sidebar-recents-count {
+  align-self: center;
+  color: var(--sidebar-text-soft);
+  font-size: var(--fs-xs);
+  font-weight: 400;
+  line-height: 20px;
+  padding: 0 var(--sp-1);
+}
+
+.sidebar-recents-header .sidebar-cmd-btn,
+.sidebar-recents-header .sidebar-bulk-mode-btn {
+  align-items: center;
+  display: inline-flex;
+  height: 32px;
+  justify-content: center;
+  min-height: 32px;
+  padding: 0;
+  width: 32px;
+}
+
+.sidebar-task-search-btn {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: var(--sidebar-text-soft);
+  cursor: pointer;
+  display: inline-flex;
+  flex: 0 0 auto;
+  height: 24px;
+  justify-content: center;
+  padding: 0;
+  width: 24px;
+}
+
+.sidebar-task-search-btn:hover,
+.sidebar-task-search-btn.is-active {
+  background: var(--sidebar-item-hover);
+  color: var(--sidebar-text-strong);
+}
+
+.sidebar-task-search-btn:focus-visible {
+  box-shadow: var(--focus-ring);
+  outline: 0;
+}
+
+.sidebar-task-filters {
+  display: grid;
+  flex: 0 0 auto;
+  gap: var(--sp-2);
+  padding: 4px 10px 10px;
+}
+
+.sidebar-task-search {
+  align-items: center;
+  background: var(--sidebar-control-bg);
+  border-radius: var(--radius-control);
+  color: var(--sidebar-text-soft);
+  display: flex;
+  gap: 6px;
+  min-height: 34px;
+  padding: 0 9px;
+}
+
+.sidebar-task-search:focus-within {
+  box-shadow: var(--focus-ring);
+}
+
+.sidebar-task-search input {
+  background: transparent;
+  border: 0;
+  color: var(--sidebar-text-strong);
+  flex: 1;
+  font: inherit;
+  font-size: var(--fs-xs);
+  min-width: 0;
+  outline: 0;
+  padding: 0;
+}
+
+.sidebar-task-search input::placeholder {
+  color: var(--sidebar-text-soft);
+}
+
+.sidebar-task-search input::-webkit-search-cancel-button {
+  display: none;
+}
+
+.sidebar-task-search > button {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-xs);
+  color: var(--sidebar-text-soft);
+  cursor: pointer;
+  display: inline-flex;
+  height: 20px;
+  justify-content: center;
+  padding: 0;
+  width: 20px;
+}
+
+.sidebar-task-statuses {
+  background: var(--sidebar-item-hover);
+  border-radius: var(--radius-control);
+  display: grid;
+  gap: 2px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  padding: 3px;
+}
+
+.sidebar-task-statuses button {
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: var(--sidebar-text-soft);
+  cursor: pointer;
+  font: inherit;
+  font-size: 10px;
+  min-width: 0;
+  padding: 6px 2px;
+  white-space: nowrap;
+}
+
+.sidebar-task-statuses button.is-active {
+  background: var(--sidebar-control-bg);
+  box-shadow: var(--shadow-xs);
+  color: var(--sidebar-text-strong);
+  font-weight: 620;
+}
+
+.sidebar-task-statuses button:focus-visible {
+  box-shadow: var(--focus-ring);
+  outline: 0;
+}
+
+.sidebar-history-item {
+  border-radius: var(--radius-control);
+  min-height: 42px;
+  overflow: hidden;
+  padding: 10px 11px;
+  position: relative;
+}
+
+.sidebar-history-item.is-current {
+  background:
+    linear-gradient(
+      90deg,
+      color-mix(in srgb, var(--accent) 9%, var(--sidebar-item-active)),
+      var(--sidebar-item-active) 42%
+    );
+  font-weight: 560;
+}
+
+.sidebar-history-item.is-current::before {
+  background: var(--accent);
+  border-radius: var(--radius-pill);
+  box-shadow: 0 0 12px color-mix(in srgb, var(--accent) 44%, transparent);
+  content: '';
+  height: 18px;
+  left: 3px;
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3px;
+}
+
+.sidebar-history-row {
+  transition:
+    opacity var(--dur-base) var(--ease-out),
+    transform var(--dur-base) var(--ease-out);
+}
+
+.sidebar-group__body {
+  position: relative;
+}
+
+.sidebar-row-enter-from,
+.sidebar-row-leave-to {
+  opacity: 0;
+  transform: translateY(-4px);
+}
+
+.sidebar-row-leave-active {
+  position: absolute;
+  width: 100%;
+}
+
+.sidebar-row-move {
+  transition: transform var(--dur-base) var(--ease-out);
+}
+
+.sidebar-history-dot.status--running {
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.sidebar-foot {
+  border-top: 0;
+  padding: 10px 2px 0;
+}
+
+/* Shared page hierarchy. */
+.control-stage {
+  gap: var(--sp-8);
+}
+
+.control-stage--spacious {
+  gap: calc(var(--sp-8) + var(--sp-1));
+}
+
+.control-stage__header {
+  align-items: flex-start;
+  padding-top: 20px;
+}
+
+.control-stage__title {
+  font-family: var(--font-display);
+  font-size: clamp(2rem, 1.75rem + 0.65vw, 2.625rem);
+  font-weight: 680;
+  letter-spacing: -0.045em;
+  line-height: 1.08;
+}
+
+.control-stage__subtitle {
+  color: var(--text-dim);
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  margin-top: 10px;
+  max-width: 50ch;
+}
+
+.control-stage__actions {
+  gap: var(--sp-2);
+}
+
+.control-card-grid,
+.control-stat-grid {
+  gap: var(--sp-4);
+}
+
+.main .content .control-card,
+.main .content .control-stat,
+.main .content .control-panel {
+  background: var(--bg-surface);
+  border-color: transparent;
+  border-radius: var(--radius-card);
+  box-shadow: var(--elev-1);
+  padding: var(--sp-5);
+}
+
+.main .content .control-card--interactive:hover,
+.main .content .control-stat--clickable:hover {
+  border-color: transparent;
+  box-shadow: var(--elev-1-hover);
+  transform: translateY(-1px);
+}
+
+.control-stat__label {
+  font-weight: 550;
+  letter-spacing: 0;
+  margin-bottom: var(--sp-2);
+}
+
+.control-stat__value {
+  font-size: 1.9rem;
+  font-weight: 650;
+  letter-spacing: -0.035em;
+}
+
+.control-panel {
+  gap: var(--sp-4);
+}
+
+.control-row {
+  border-bottom-color: var(--hairline);
+  gap: var(--sp-5);
+  padding: var(--sp-4) 0;
+}
+
+.control-row__label {
+  font-weight: 560;
+}
+
+.control-row__desc {
+  line-height: 1.45;
+  margin-top: 3px;
+}
+
+.control-section + .control-section {
+  margin-top: var(--sp-8);
+}
+
+/* Segmented controls behave like macOS pickers instead of orange tab bars. */
+.control-segmented,
+.route-hub__tabs {
+  background: var(--bg-surface-2);
+  border: 0;
+  border-radius: var(--radius-control);
+  gap: 2px;
+  padding: 3px;
+}
+
+.control-segmented__btn,
+.route-hub__tab {
+  border-radius: var(--radius-sm);
+  font-weight: 540;
+  min-height: 32px;
+  padding: 7px 13px;
+}
+
+.control-segmented__btn.is-active,
+.route-hub__tab.is-active {
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-xs);
+  color: var(--text);
+}
+
+.route-hub {
+  gap: var(--sp-6);
+  padding-top: 20px;
+}
+
+/* Sessions: grouped cards and whitespace replace the ledger frame. */
+.content .hub .hub-task {
+  background: var(--bg-surface);
+  border-color: transparent;
+  border-radius: var(--radius-panel);
+  box-shadow: var(--elev-1);
+  gap: var(--sp-3);
+  padding: var(--sp-5);
+}
+
+.content .hub .hub-task:focus-within {
+  border-color: transparent;
+  box-shadow: var(--focus-ring), var(--elev-1);
+}
+
+.content .hub .hub-task__input {
+  font-size: 1.0625rem;
+  line-height: 1.6;
+  min-height: 64px;
+}
+
+.content .hub .hub-attention-clear {
+  color: var(--text-dim);
+  padding: 0 4px;
+}
+
+.content .hub .hub-attention-clear__text {
+  font-weight: 560;
+}
+
+.content .hub .hub-list {
+  gap: var(--sp-4);
+}
+
+.content .hub .hub-list__head {
+  gap: var(--sp-4);
+}
+
+.content .hub .hub-search {
+  background: var(--bg-surface-2);
+  border-color: transparent;
+  border-radius: var(--radius-control);
+  min-height: 38px;
+}
+
+.content .hub .hub-ledger {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  overflow: visible;
+}
+
+.content .hub .hub-row {
+  background: var(--bg-surface);
+  border: 0;
+  border-radius: var(--radius-card);
+  box-shadow: var(--elev-1);
+  overflow: hidden;
+}
+
+.content .hub .hub-row__main {
+  gap: var(--sp-4);
+  min-height: 68px;
+  padding: var(--sp-4) var(--sp-3) var(--sp-4) var(--sp-5);
+}
+
+.content .hub .hub-row__main:hover {
+  background: var(--bg-surface-2);
+}
+
+.content .hub .hub-row__agent,
+.content .hub .hub-row__status {
+  background: var(--bg-surface-2);
+  border-color: transparent;
+}
+
+.content .hub .hub-row__delete {
+  margin-right: var(--sp-3);
+  opacity: 0;
+}
+
+.content .hub .hub-row:hover .hub-row__delete,
+.content .hub .hub-row__delete:focus-visible {
+  opacity: 1;
+}
+
+/* Usage keeps blue/orange as data ink, not as page decoration. */
+.content .usage-stage {
+  background: none;
+  border-radius: 0;
+  padding: 0;
+}
+
+.content .usage-stage__header {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  padding: 20px 0 0;
+}
+
+.content .usage-stage__header::after {
+  left: 0;
+  right: auto;
+  width: 44px;
+}
+
+.content .usage-stage__title {
+  background: none;
+  color: var(--text);
+}
+
+.content .usage-stage .control-stat {
+  background: var(--bg-surface);
+  border-color: transparent;
+  min-height: 126px;
+}
+
+.content .usage-stage .control-stat::after {
+  display: none;
+}
+
+.content .usage-chart,
+.content .usage-table-wrap {
+  background: var(--bg-surface);
+  border-color: transparent;
+  box-shadow: var(--elev-1);
+  padding: var(--sp-5);
+}
+
+.content .usage-model-card {
+  background: var(--bg-surface);
+  border-color: transparent;
+}
+
+/* Chat keeps the same interaction model with softer containers. */
+.chat {
+  --thread-col: 860px;
+  --composer-col: 860px;
+}
+
+.chat-composer {
+  filter: drop-shadow(0 16px 28px color-mix(in srgb, var(--shadow) 15%, transparent));
+}
+
+.chat-slash,
+.chat-session-popover {
+  border-color: transparent;
+  border-radius: var(--radius-panel);
+  box-shadow: var(--elev-3);
+}
+
+/* Settings reads like a macOS preference window: one floating sheet, a quiet
+   navigation rail, and content grouped by whitespace instead of rules. */
+#app .settings-overlay {
+  backdrop-filter: blur(18px) saturate(0.9);
+  -webkit-backdrop-filter: blur(18px) saturate(0.9);
+}
+
+#app .settings-overlay .settings-modal {
+  border-color: transparent;
+  box-shadow: var(--shadow-xl);
+}
+
+#app .settings-modal .settings-modal__head {
+  border-bottom: 0;
+  min-height: 60px;
+  padding: var(--sp-3) var(--sp-5);
+}
+
+#app .settings-modal .settings-modal__title {
+  font-size: 1.25rem;
+  font-weight: 680;
+  letter-spacing: -0.025em;
+}
+
+#app .settings-modal .settings-body {
+  background: var(--bg-surface-2);
+}
+
+#app .settings-modal .settings-rail {
+  background: var(--bg-surface-2);
+  border-right: 0;
+  gap: 4px;
+  padding: var(--sp-4) var(--sp-3);
+  width: 220px;
+}
+
+#app .settings-modal .settings-rail__group {
+  letter-spacing: 0.02em;
+  margin-top: var(--sp-4);
+  text-transform: none;
+}
+
+#app .settings-modal .settings-rail__item {
+  border-radius: var(--radius-control);
+  min-height: 38px;
+  padding: 9px var(--sp-3);
+  position: relative;
+}
+
+#app .settings-modal .settings-rail__item.is-active {
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-xs);
+  color: var(--text);
+}
+
+#app .settings-modal .settings-rail__item.is-active::before {
+  background: var(--accent);
+  border-radius: var(--radius-pill);
+  box-shadow: 0 0 12px color-mix(in srgb, var(--accent) 38%, transparent);
+  content: '';
+  height: 16px;
+  left: 3px;
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3px;
+}
+
+#app .settings-modal .settings-panel {
+  background: var(--bg-surface);
+  padding: var(--sp-5) var(--sp-6) var(--sp-8);
+}
+
+#app .settings-modal .settings-foot {
+  background: var(--bg-surface-2);
+  border-top: 0;
+  min-height: 42px;
+  padding-inline: var(--sp-5);
+}
+
+#app .settings-modal .setup-provider-overview,
+#app .settings-modal .setup-provider-editor-head {
+  border: 0;
+}
+
+#app .settings-modal .setup-provider-card {
+  background: var(--bg-surface-2);
+  border: 0;
+  border-radius: var(--radius-card);
+  min-height: 64px;
+  padding: var(--sp-3) var(--sp-4);
+}
+
+#app .settings-modal .setup-provider-card.is-selected {
+  background: color-mix(in srgb, var(--accent) 6%, var(--bg-surface-2));
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+#app .settings-modal .setup-provider-routing,
+#app .settings-modal .setup-provider-model__routing-owner,
+#app .settings-modal .setup-provider-empty {
+  background: var(--bg-surface-2);
+  border-color: transparent;
+  border-radius: var(--radius-card);
+}
+
+@media (max-width: 768px) {
+  .content:not(.content--chat) {
+    padding: calc(54px + env(safe-area-inset-top, 0px)) var(--sp-4)
+      calc(var(--mobile-tabbar-h) + var(--sp-6) + env(safe-area-inset-bottom, 0px));
+  }
+
+  .control-stage {
+    gap: var(--sp-6);
+  }
+
+  .control-stage__header,
+  .content .usage-stage__header {
+    padding-top: 0;
+  }
+
+  .content .hub .hub-row__main {
+    gap: var(--sp-3);
+    min-height: 62px;
+    padding: var(--sp-3);
+  }
+
+  .content .hub .hub-row__delete {
+    opacity: 1;
+  }
+
+  #app .settings-modal .settings-rail {
+    background: var(--bg-surface);
+    width: auto;
+  }
+
+  #app .settings-modal .settings-panel {
+    padding: var(--sp-4);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .btn,
+  .theme-menu__item,
+  .sidebar-new-session,
+  .sidebar-cmd-btn,
+  .sidebar-fn-item,
+  .sidebar-history-item,
+  .sidebar-history-row,
+  .sidebar-row-menu__item,
+  .control-segmented__btn,
+  .route-hub__tab,
+  #app .settings-modal .settings-rail__item {
+    transition: none;
+  }
+
+  .btn:not(:disabled):active,
+  .theme-menu__item:not(:disabled):active,
+  .sidebar-new-session:not(:disabled):active,
+  .sidebar-cmd-btn:not(:disabled):active,
+  .sidebar-fn-item:not(:disabled):active,
+  .sidebar-history-item:not(:disabled):active,
+  .sidebar-row-menu__item:not(:disabled):active,
+  .control-segmented__btn:not(:disabled):active,
+  .route-hub__tab:not(:disabled):active,
+  #app .settings-modal .settings-rail__item:not(:disabled):active {
+    transform: none;
+  }
+
+  .main .content .control-card,
+  .main .content .control-stat,
+  .main .content .control-panel {
+    animation: none;
+  }
+}

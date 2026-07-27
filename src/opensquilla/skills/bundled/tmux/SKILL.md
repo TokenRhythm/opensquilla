@@ -1,6 +1,7 @@
 ---
 name: tmux
 description: "Remote-control tmux sessions for interactive CLIs by sending keystrokes and scraping pane output. Use when: (1) monitoring Claude/Codex sessions running in tmux, (2) sending input to interactive terminal applications, (3) scraping output from long-running processes inside tmux, (4) navigating tmux panes/windows programmatically, or (5) checking on background work in existing sessions. NOT for: one-off shell commands (use exec_command), starting new background processes (use background_process), or non-tmux interactive processes."
+description_zh: "通过发送按键并抓取窗格输出来远程控制tmux会话中的交互式CLI。适用于：监控运行在tmux中的Claude/Codex会话、向交互式终端应用发送输入、抓取tmux内长时间运行进程的输出、以编程方式导航tmux窗格/窗口，或查看现有会话中的后台工作。不适用于：一次性shell命令、启动新的后台进程，或非tmux的交互式进程。"
 provenance:
   origin: openclaw-derived
   license: MIT

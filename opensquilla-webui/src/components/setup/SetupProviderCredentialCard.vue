@@ -32,6 +32,8 @@ interface ProviderCredentialPanelContract {
 
 const props = defineProps<{
   panel: ProviderCredentialPanelContract
+  compact?: boolean
+  showVerification?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -104,6 +106,7 @@ const showPublicHint = computed(() => (
 const showCredentialControls = computed(() => props.panel.providerSelected && props.panel.acceptsApiKey)
 const hasRemovableCredential = computed(() => (
   showCredentialControls.value
+  && !props.compact
   && props.panel.removable
 ))
 const removeCredentialLabel = computed(() => t(
@@ -245,9 +248,10 @@ const verdictModelsText = computed(() => {
 <template>
   <section
     class="setup-provider-credential"
+    :class="{ 'setup-provider-credential--compact': compact }"
     :aria-busy="panel.removing ? 'true' : undefined"
   >
-    <div class="setup-provider-credential__head">
+    <div v-if="!compact" class="setup-provider-credential__head">
       <div>
         <h4 class="setup-provider-credential__title">{{ title }}</h4>
         <p class="setup-provider-credential__source">{{ sourceText }}</p>
@@ -353,10 +357,34 @@ const verdictModelsText = computed(() => {
           </div>
         </label>
       </template>
-      <p v-if="showPublicHint" class="control-row__desc">{{ t('setup.provider.credentialPublicHint') }}</p>
+      <p v-if="showPublicHint && !compact" class="control-row__desc">{{ t('setup.provider.credentialPublicHint') }}</p>
     </div>
 
-    <div class="setup-provider-credential__footer">
+    <div v-if="compact && showVerification" class="setup-provider-credential__compact-verification">
+      <button
+        type="button"
+        class="btn"
+        :disabled="!panel.providerSelected || !panel.probeReady || probing"
+        :title="!panel.probeReady ? panel.probeDisabledReason : undefined"
+        :aria-busy="probing ? 'true' : undefined"
+        @click="emit('testConnection')"
+      >
+        <span v-if="probing" class="setup-connection__spinner" aria-hidden="true"></span>
+        {{ probing ? t('setup.provider.testing') : t('setup.provider.verifyAndConnect') }}
+      </button>
+      <span
+        v-if="connectionPill && panel.connection.phase !== 'unverified'"
+        class="setup-provider-credential__compact-result"
+        :class="{
+          'is-success': panel.connection.phase === 'verified',
+          'is-error': panel.connection.phase === 'key_invalid' || panel.connection.phase === 'unreachable',
+        }"
+        role="status"
+        aria-live="polite"
+      >{{ connectionPill.text }}</span>
+    </div>
+
+    <div v-else-if="!compact" class="setup-provider-credential__footer">
       <div class="control-row__label-block">
         <span class="control-row__label">{{ t('setup.provider.connectionLabel') }}</span>
         <span class="control-row__desc">{{ t('setup.provider.connectionDesc') }}</span>
@@ -403,7 +431,7 @@ const verdictModelsText = computed(() => {
       </div>
     </div>
 
-    <details v-if="showCredentialControls" class="setup-provider-credential__details" :open="detailsOpen">
+    <details v-if="showCredentialControls && !compact" class="setup-provider-credential__details" :open="detailsOpen">
       <summary class="setup-provider-credential__summary" @click.prevent="detailsOpen = !detailsOpen">{{ t('setup.provider.credentialSourceOptions') }}</summary>
       <label v-if="detailsOpen" class="control-row control-row--stack">
         <div class="control-row__label-block">
@@ -429,6 +457,12 @@ const verdictModelsText = computed(() => {
   padding: var(--sp-2) 0;
   border-block: 1px solid var(--border);
   background: transparent;
+}
+
+.setup-provider-credential--compact {
+  border: 0;
+  margin: 0;
+  padding: 0;
 }
 
 .setup-provider-credential__head {
@@ -462,6 +496,33 @@ const verdictModelsText = computed(() => {
 .setup-provider-credential__footer {
   display: grid;
   gap: var(--sp-1);
+}
+
+.setup-provider-credential__compact-verification {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
+}
+
+.setup-provider-credential__compact-verification .btn {
+  align-items: center;
+  display: inline-flex;
+  gap: var(--sp-2);
+}
+
+.setup-provider-credential__compact-result {
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+}
+
+.setup-provider-credential__compact-result.is-success {
+  color: var(--ok);
+}
+
+.setup-provider-credential__compact-result.is-error {
+  color: var(--danger);
 }
 
 .setup-provider-credential__footer {

@@ -40,13 +40,12 @@
           <Icon name="chat" :size="14" />
           <span>{{ t('sessions.overview.diagnoseWithAgent') }}</span>
         </button>
+        <!-- "Open chat" retired: the sidebar's New task row and the default
+             landing route both already go there, and it put a second brand
+             button on a status line. Diagnose stays the row's one action. -->
         <button class="btn btn--ghost" :title="t('sessions.refresh')" :disabled="refreshing" @click="refresh">
           <Icon name="refresh" :size="16" />
           <span>{{ refreshing ? t('sessions.refreshing') : t('sessions.refresh') }}</span>
-        </button>
-        <button class="btn btn--primary" :title="t('sessions.overview.openChat')" @click="router.push('/chat')">
-          <Icon name="chat" :size="16" />
-          <span>{{ t('sessions.overview.openChat') }}</span>
         </button>
       </div>
     </section>
@@ -54,28 +53,24 @@
     <!-- Three real KPIs — quiet Settings-style cards, display numerals. -->
     <section class="ov-kpis" :aria-label="t('sessions.overview.title')">
       <button class="control-stat control-stat--clickable" type="button" @click="router.push('/usage')">
-        <div class="control-stat__icon"><Icon name="usage" :size="18" /></div>
         <div class="control-stat__label">{{ t('sessions.overview.totalTokens') }}</div>
         <div class="control-stat__value">{{ tokensDisplay }}</div>
         <div class="control-stat__hint">{{ costLine }}</div>
       </button>
 
       <button class="control-stat control-stat--clickable" type="button" :title="t('sessions.overview.totalSessionsTitle')" @click="router.push('/sessions')">
-        <div class="control-stat__icon"><Icon name="sessions" :size="18" /></div>
         <div class="control-stat__label">{{ t('sessions.overview.totalSessions') }}</div>
         <div class="control-stat__value">{{ sessionsCount }}</div>
         <div class="control-stat__hint">{{ t('sessions.overview.viewAll') }}</div>
       </button>
 
       <button v-if="channelStats.total > 0" class="control-stat control-stat--clickable" type="button" @click="router.push('/channels')">
-        <div class="control-stat__icon"><Icon name="channels" :size="18" /></div>
         <div class="control-stat__label">{{ t('console.overview.channelsChip') }}</div>
         <div class="control-stat__value">{{ channelStats.total }}</div>
         <div class="control-stat__hint">{{ channelChipHint }}</div>
       </button>
 
       <div class="control-stat control-stat--static">
-        <div class="control-stat__icon"><Icon name="cron" :size="18" /></div>
         <div class="control-stat__label">{{ t('sessions.overview.uptime') }}</div>
         <div class="control-stat__value control-stat__value--mono">{{ uptime }}</div>
         <div class="control-stat__hint">{{ versionLine }}</div>
@@ -161,16 +156,27 @@
                 {{ finding.title || finding.id || t('sessions.overview.findingFallback', { n: fIdx + 1 }) }}
               </div>
               <div v-if="finding.detail" class="health-finding__detail">{{ finding.detail }}</div>
-              <div v-if="visibleEvidenceEntries(finding.evidence).length" class="health-evidence" aria-label="Finding evidence">
-                <span v-for="([key, value], eIdx) in visibleEvidenceEntries(finding.evidence).slice(0, 6)" :key="eIdx">
-                  <b>{{ evidenceLabel(key) }}</b>{{ evidenceValue(value) }}
-                </span>
-              </div>
-              <AdvancedCliSteps
-                v-if="normalizedFixSteps(finding).length"
-                :steps="normalizedFixSteps(finding)"
-                :heading="stepsHeading(findingGroupKind(finding))"
-              />
+              <!-- Evidence dump + CLI recipe behind one disclosure. Optional and
+                   ready findings collapse it (reference material you rarely
+                   open); anything blocking or degrading starts expanded, so
+                   nothing actionable is hidden. The summary is the only label —
+                   AdvancedCliSteps' own heading would repeat it. -->
+              <details
+                v-if="hasFindingExtras(finding)"
+                class="health-finding__more"
+                :open="!isMinorFinding(finding)"
+              >
+                <summary>{{ t('sessions.overview.findingDetails') }}</summary>
+                <div v-if="visibleEvidenceEntries(finding.evidence).length" class="health-evidence" aria-label="Finding evidence">
+                  <span v-for="([key, value], eIdx) in visibleEvidenceEntries(finding.evidence).slice(0, 6)" :key="eIdx">
+                    <b>{{ evidenceLabel(key) }}</b>{{ evidenceValue(value) }}
+                  </span>
+                </div>
+                <AdvancedCliSteps
+                  v-if="normalizedFixSteps(finding).length"
+                  :steps="normalizedFixSteps(finding)"
+                />
+              </details>
             </div>
           </article>
         </section>
@@ -818,10 +824,15 @@ function visibleEvidenceEntries(evidence: Record<string, unknown> | undefined): 
     .filter(([key, value]) => value !== undefined && value !== null && !HIDDEN_EVIDENCE_KEYS.has(key))
 }
 
-function stepsHeading(kind: 'action' | 'degraded' | 'optional' | 'ready'): string {
-  if (kind === 'optional') return t('sessions.overview.steps.optional')
-  if (kind === 'ready') return t('sessions.overview.steps.reference')
-  return t('sessions.overview.steps.recovery')
+// Optional / already-ready findings are reference reading: their evidence and
+// CLI recipe stay folded. Anything blocking or degrading opens expanded.
+function isMinorFinding(finding: Finding): boolean {
+  return ['optional', 'none'].includes(impactValue(finding))
+}
+
+function hasFindingExtras(finding: Finding): boolean {
+  return visibleEvidenceEntries(finding.evidence).length > 0
+    || normalizedFixSteps(finding).length > 0
 }
 
 function shellArg(value: string | undefined | null): string {
@@ -1073,42 +1084,41 @@ function gatewayContextUrl(): string {
 .ov-kpis > .control-stat:nth-child(3) { animation-delay: 80ms; }
 
 /* Environment footer readout: quiet, copyable env detail (not hero content) */
+/* Environment readout is reference material, not content: it sits directly on
+   the canvas with no card shell, and each value is quiet text rather than a
+   filled chip. Six pills in a bordered strip read as six things to attend to;
+   this reads as one footnote. */
 .ov-readout {
   align-items: center;
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-card);
-  box-shadow: var(--elev-1);
   color: var(--text-dim);
   column-gap: var(--sp-5);
   display: flex;
   flex-wrap: wrap;
   font-size: var(--fs-xs);
-  padding: 11px var(--sp-4);
+  padding: 2px var(--sp-1);
   row-gap: 6px;
 }
-.ov-readout__kv { align-items: center; display: flex; gap: 7px; min-width: 0; }
-.ov-readout__kv b { color: var(--text-muted); font-weight: 600; }
+.ov-readout__kv { align-items: center; display: flex; gap: 6px; min-width: 0; }
+.ov-readout__kv b { color: var(--text-dim); font-weight: var(--fw-eyebrow); }
 .ov-readout__kv code {
-  background: var(--bg-surface-2);
-  border-radius: var(--radius-sm);
   color: var(--text-muted);
   font-family: var(--font-mono);
   font-size: 12px;
-  padding: 2px 8px;
   white-space: nowrap;
 }
+/* Bare glyph until hovered — a bordered box per copyable value was most of the
+   strip's visual noise. */
 .ov-readout__copy {
   align-items: center;
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
+  background: transparent;
+  border: 1px solid transparent;
   border-radius: var(--radius-sm);
   color: var(--text-dim);
   cursor: pointer;
   display: inline-flex;
-  height: 22px;
+  height: 20px;
   justify-content: center;
-  width: 22px;
+  width: 20px;
 }
 .ov-readout__copy:hover { background: var(--bg-hover); color: var(--text); }
 .ov-readout__copy--ok { color: var(--ok); }
@@ -1301,19 +1311,42 @@ function gatewayContextUrl(): string {
   overflow-wrap: anywhere;
 }
 
-.health-evidence {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
+/* Details disclosure: one text trigger, no box. Holds the evidence readings and
+   the CLI recipe that used to sit open beneath every finding. */
+.health-finding__more {
   margin-top: var(--sp-3);
   min-width: 0;
+}
+.health-finding__more > summary {
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: var(--fs-xs);
+  list-style: none;
+  width: fit-content;
+}
+.health-finding__more > summary::-webkit-details-marker { display: none; }
+.health-finding__more > summary::before {
+  content: "\25B8";
+  display: inline-block;
+  margin-right: 5px;
+  transition: transform var(--dur-fast);
+}
+.health-finding__more[open] > summary::before { transform: rotate(90deg); }
+.health-finding__more > summary:hover { color: var(--text-muted); }
+
+.health-evidence {
+  column-gap: var(--sp-4);
+  display: flex;
+  flex-wrap: wrap;
+  margin-top: var(--sp-2);
+  min-width: 0;
   overflow-wrap: anywhere;
+  row-gap: 4px;
 }
 
+/* Quiet text, not chips: inside the details disclosure these are readings, and
+   a boxed pill per key/value was the densest thing on the page. */
 .health-evidence span {
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
   color: var(--text-muted);
   display: inline-flex;
   font-family: var(--font-mono);
@@ -1323,7 +1356,7 @@ function gatewayContextUrl(): string {
   max-width: 100%;
   min-width: 0;
   overflow-wrap: anywhere;
-  padding: 3px 7px;
+  padding: 0;
 }
 
 .health-evidence span b {

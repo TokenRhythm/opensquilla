@@ -1,6 +1,7 @@
 ---
 name: awesome-webpage-research
 description: "Single-pass mini research for AwesomeWebpageMetaSkill: produce a short cited topic brief from one bounded web-search round. Not a general deep-research replacement."
+description_zh: "为AwesomeWebpageMetaSkill提供单轮迷你调研：通过一轮有限的网页搜索生成带引用的简短主题简报。并非通用的深度研究替代方案。"
 homepage: ""
 user-invocable: false
 disable-model-invocation: true

@@ -15,8 +15,9 @@ export function defaultRootRedirect(): string {
   if (detectPlatformId() === 'desktop') return '/chat'
   const saved = readLastRoute()
   if (saved) return saved
-  const isMobile = window.matchMedia('(max-width: 768px)').matches
-  return isMobile ? '/chat' : '/sessions'
+  // Chat on every form factor: Sessions is no longer a navigation destination,
+  // so landing there would open on a page the sidebar cannot get back to.
+  return '/chat'
 }
 
 export const sharedRoutes: RouteRecordRaw[] = [
@@ -32,11 +33,14 @@ export const sharedRoutes: RouteRecordRaw[] = [
   { path: '/chat',      name: 'chat',      component: ChatView,      meta: { title: 'Chat', group: 'Work', icon: 'chat', nav: 'primary', navOrder: 10, platforms: ['web', 'desktop'] } },
   // Draft state: a clean composer with no session key until the first send.
   { path: '/chat/new',  name: 'chat-new',  component: ChatView,      meta: { title: 'Chat', group: 'Work', icon: 'chat', platforms: ['web', 'desktop'] } },
-  { path: '/sessions',  name: 'sessions',  component: SessionsView,  meta: { title: 'Sessions', group: 'Work', icon: 'sessions', nav: 'primary', navOrder: 20, platforms: ['web', 'desktop'], keepAlive: true } },
+  // Task ledger: still routed (deep links, the Not Found fallback, /approvals)
+  // but off the nav — "New task" owns the top of the sidebar and the recents
+  // list below it covers day-to-day session access.
+  { path: '/sessions',  name: 'sessions',  component: SessionsView,  meta: { title: 'Sessions', group: 'Work', icon: 'sessions', platforms: ['web', 'desktop'], keepAlive: true } },
   // Status and Usage share the Overview destination. Runtime logs remain a
   // kept-alive diagnostic deep link rather than a peer navigation tab.
-  { path: '/overview',  name: 'overview',  component: OverviewHubView, meta: { title: 'Status', titleKey: 'nav.status', group: 'Work', icon: 'home', nav: 'primary', navOrder: 30, navLabelKey: 'nav.overview', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'overview-hub' } },
-  { path: '/usage',     name: 'usage',     component: OverviewHubView, meta: { title: 'Usage', icon: 'usage', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'overview-hub' } },
+  { path: '/overview',  name: 'overview',  component: OverviewHubView, meta: { title: 'Status', titleKey: 'nav.status', icon: 'home', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'overview-hub' } },
+  { path: '/usage',     name: 'usage',     component: OverviewHubView, meta: { title: 'Usage', group: 'Work', icon: 'usage', nav: 'primary', navOrder: 60, navLabelKey: 'nav.viewUsage', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'overview-hub' } },
   { path: '/logs',      name: 'logs',      component: LogsView, meta: { title: 'Logs', icon: 'logs', platforms: ['web', 'desktop'], keepAlive: true } },
   // Approvals retired as a front-end destination: the pending queue resolves
   // inline in the chat transcript (ApprovalCard) and via the topbar interrupt

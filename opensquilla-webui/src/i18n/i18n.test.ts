@@ -355,7 +355,6 @@ describe('catalog parity', () => {
     expect(en.setup.provider.recommendation).toEqual({
       title: 'Recommended: TokenRhythm',
       value: 'TokenRhythm API calls are free for a limited time.',
-      registration: 'During the promotion, register and get an API key to call DeepSeek, GLM, MiniMax, Kimi, and other leading models for free.',
       cta: 'Register and get an API key',
       externalLabel: 'Register and get an API key — TokenRhythm (opens in a new tab)',
       stepsLabel: 'How to connect TokenRhythm',
@@ -368,7 +367,6 @@ describe('catalog parity', () => {
     expect(zhHans.setup.provider.recommendation).toEqual({
       title: '推荐使用 TokenRhythm',
       value: 'TokenRhythm API 调用限时免费。',
-      registration: '活动期间，注册并获取 API Key，即可免费调用 DeepSeek、GLM、MiniMax、Kimi 等主流模型。',
       cta: '注册并获取 API Key',
       externalLabel: '注册并获取 API Key — TokenRhythm（在新标签页中打开）',
       stepsLabel: '如何接入 TokenRhythm',
@@ -382,10 +380,6 @@ describe('catalog parity', () => {
     for (const messages of [en, zhHans, ja, fr, de, es]) {
       const copy = messages.setup.provider.recommendation
       expect(copy.title).toContain('TokenRhythm')
-      expect(copy.registration).toContain('DeepSeek')
-      expect(copy.registration).toContain('GLM')
-      expect(copy.registration).toContain('MiniMax')
-      expect(copy.registration).toContain('Kimi')
       expect(copy.cta).toBeTruthy()
       expect(copy.externalLabel).toBeTruthy()
       expect(copy.externalLabel).toContain(copy.cta)

@@ -54,7 +54,7 @@ test.describe('Sessions Hub', () => {
 
     // The sidebar has its own filter chips; scope to the hub's group.
     const chips = page.locator('.hub-filters')
-    const chatsChip = chips.getByRole('button', { name: 'Chats', exact: true })
+    const chatsChip = chips.getByRole('button', { name: 'Tasks', exact: true })
     await chatsChip.click()
     await expect(chatsChip).toHaveAttribute('aria-pressed', 'true')
 

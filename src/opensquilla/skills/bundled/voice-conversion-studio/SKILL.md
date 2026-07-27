@@ -1,6 +1,7 @@
 ---
 name: voice-conversion-studio
 description: "Convert a local source recording into an authorized target voice. Use when the user asks for voice conversion, voice changer, 换声, 变声, 音色转换, or converting existing narration to another approved voice."
+description_zh: "将本地源录音转换为已授权的目标音色。当用户需要语音转换、变声器、换声、变声、音色转换，或将现有旁白转为另一个已批准音色时使用。"
 triggers:
   - "voice conversion"
   - "voice convert"

@@ -52,6 +52,8 @@ const props = defineProps<{
   loading: boolean
   currentKey: string
   contractDebugEnabled: boolean
+  /** Command-palette chord, shown in the search button's tooltip. */
+  searchHint: string
 }>()
 
 const emit = defineEmits<{
@@ -66,6 +68,7 @@ const emit = defineEmits<{
   (e: 'project-edit', workspaceId: string): void
   (e: 'project-delete-history', workspaceId: string): void
   (e: 'project-remove', workspaceId: string): void
+  (e: 'search'): void
 }>()
 
 const { confirm } = useConfirm()
@@ -257,6 +260,13 @@ function toggleSelectionMode() {
   selectionMode.value = !selectionMode.value
   if (!selectionMode.value) clearSelection()
 }
+
+useDocumentEvent('keydown', (event) => {
+  if (event.key !== 'Escape' || !selectionMode.value) return
+  event.preventDefault()
+  selectionMode.value = false
+  clearSelection()
+})
 
 async function requestBulkDelete() {
   closeMenu()
@@ -459,6 +469,7 @@ function onSelectRow(row: SidebarConversationItem) {
 
 <template>
   <div
+    v-if="error || totalRows > 0"
     class="sidebar-section sidebar-history"
     :class="{ 'is-selecting': selectionMode }"
     :aria-label="t('shared.sidebar.recentConversations')"
@@ -479,6 +490,20 @@ function onSelectRow(row: SidebarConversationItem) {
         v-if="!selectionMode && visibleSections.length === 1 && totalRows > 0"
         class="sidebar-recents-count"
       >{{ totalRows }}</span>
+      <!-- Conversation search lives on the recents header, beside the selection
+           and refresh controls, because the palette's hits are these rows.
+           Hidden while selecting: that mode owns the header's spare width. -->
+      <button
+        v-if="!selectionMode"
+        type="button"
+        class="sidebar-cmd-btn"
+        :aria-label="`${t('chrome.searchChats')} (${props.searchHint})`"
+        :title="`${t('chrome.searchChats')} (${props.searchHint})`"
+        aria-haspopup="dialog"
+        @click="emit('search')"
+      >
+        <Icon name="search" :size="13" />
+      </button>
       <button
         v-if="selectionMode"
         type="button"
@@ -491,9 +516,10 @@ function onSelectRow(row: SidebarConversationItem) {
         {{ allVisibleSelected ? t('shared.sidebar.clearAllShort') : t('shared.sidebar.selectAllShort') }}
       </button>
       <button
-        v-if="selectionMode && selectedCount > 0"
+        v-if="selectionMode"
         type="button"
         class="sidebar-bulk-delete-btn"
+        :disabled="selectedCount === 0"
         :aria-label="t('shared.sidebar.deleteSelectedAria', { count: selectedCount })"
         :title="t('shared.sidebar.deleteSelectedAria', { count: selectedCount })"
         @click="requestBulkDelete"
@@ -501,25 +527,14 @@ function onSelectRow(row: SidebarConversationItem) {
         <Icon name="trash" :size="12" />
       </button>
       <button
-        v-if="totalRows > 0"
+        v-if="totalRows > 0 && !selectionMode"
         type="button"
         class="sidebar-bulk-mode-btn"
-        :class="{ 'is-active': selectionMode }"
-        :aria-pressed="selectionMode"
-        :aria-label="selectionMode ? t('shared.sidebar.exitSelectionMode') : t('shared.sidebar.enterSelectionMode')"
-        :title="selectionMode ? t('shared.sidebar.exitSelectionMode') : t('shared.sidebar.enterSelectionMode')"
+        :aria-label="t('shared.sidebar.enterSelectionMode')"
+        :title="t('shared.sidebar.enterSelectionMode')"
         @click="toggleSelectionMode"
       >
-        <Icon :name="selectionMode ? 'x' : 'listChecks'" :size="13" />
-      </button>
-      <button
-        class="sidebar-refresh-btn"
-        :title="t('shared.sidebar.refresh')"
-        :aria-label="t('shared.sidebar.refresh')"
-        :class="{ spinning: loading }"
-        @click="emit('refresh')"
-      >
-        <Icon name="refresh" :size="12" />
+        <Icon name="listChecks" :size="13" />
       </button>
     </div>
 
@@ -534,26 +549,23 @@ function onSelectRow(row: SidebarConversationItem) {
       </button>
     </div>
 
+    <!-- The header no longer carries a standing refresh control, so the retry
+         lives here — the one moment it is actually needed. -->
     <div v-if="error" class="sidebar-history-empty">
-      {{ t('shared.sidebar.loadError') }}
+      <p>{{ t('shared.sidebar.loadError') }}</p>
+      <button
+        type="button"
+        class="sidebar-history-retry"
+        :disabled="loading"
+        @click="emit('refresh')"
+      >
+        {{ t('shared.sidebar.refresh') }}
+      </button>
     </div>
 
     <!-- Filtered to nothing within the Chats agent filter -->
     <div v-else-if="agentFilter && !hasFilterMatches" class="sidebar-history-empty">
       {{ t('shared.sidebar.noMatches') }}
-    </div>
-
-    <!-- First-run onboarding: no sessions exist yet -->
-    <div v-else-if="totalRows === 0" class="sidebar-onboarding">
-      <p class="sidebar-onboarding__lead">{{ t('shared.sidebar.noConversations') }}</p>
-      <button type="button" class="sidebar-onboarding__cta" @click="emit('new-chat')">
-        <Icon name="plus" :size="14" />
-        <span>{{ t('shared.sidebar.startChat') }}</span>
-      </button>
-      <div class="sidebar-onboarding__links">
-        <router-link to="/sessions" class="sidebar-onboarding__link">{{ t('shared.sidebar.linkSessions') }}</router-link>
-        <router-link to="/overview" class="sidebar-onboarding__link">{{ t('shared.sidebar.linkOverview') }}</router-link>
-      </div>
     </div>
 
     <div v-else class="sidebar-history-list">
@@ -580,9 +592,11 @@ function onSelectRow(row: SidebarConversationItem) {
           <span class="sidebar-group__count">{{ section.rows.length }}</span>
         </button>
 
-        <div
+        <TransitionGroup
           v-show="visibleSections.length === 1 || !isCollapsed(section.family)"
           :id="`sidebar-group-${section.family}`"
+          name="sidebar-row"
+          tag="div"
           class="sidebar-group__body"
         >
           <div
@@ -844,7 +858,7 @@ function onSelectRow(row: SidebarConversationItem) {
               {{ agentInitial(row.agentName) }}
             </button>
           </div>
-        </div>
+        </TransitionGroup>
       </div>
     </div>
   </div>

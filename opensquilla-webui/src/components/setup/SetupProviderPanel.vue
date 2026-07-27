@@ -74,6 +74,8 @@ interface ProviderPanelContract {
   editingPrimary: boolean
   selectedStoredProfile: boolean
   editingNew: boolean
+  profileSaveSupported: boolean
+  primaryProviderRemovalSupported: boolean
   routingEnabled: boolean
   routerEnabled: boolean
   routerBinding: 'follow_primary' | 'custom' | 'legacy'
@@ -108,6 +110,8 @@ const props = defineProps<{
   // Optional routing-preset card contract (absent on older gateways whose
   // catalog carries no presets — the card simply doesn't render).
   preset?: PresetCardContract | null
+  dirty?: boolean
+  saving?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -117,6 +121,8 @@ const emit = defineEmits<{
   updateLlmTimeout: [value: number]
   updateContextWindow: [value: string]
   probeConnection: []
+  saveProvider: []
+  cancelProviderEdit: []
   applyPreset: []
   copy: [command: string]
   goToSection: [value: string]
@@ -128,11 +134,14 @@ const emit = defineEmits<{
 }>()
 
 const addOpen = ref(false)
+const editorOpen = ref(false)
 const listExpanded = ref(false)
 const addButtonRef = ref<HTMLButtonElement | null>(null)
 const editorHeadingRef = ref<HTMLElement | null>(null)
+const editorDialogRef = ref<HTMLElement | null>(null)
 const sectionRef = ref<HTMLElement | null>(null)
 const pendingRemoval = ref<{ providerId: string; index: number } | null>(null)
+const dialogInvoker = ref<HTMLElement | null>(null)
 
 const selectedProviderLabel = computed(() => (
   props.panel.credentialPanel?.providerLabel || props.panel.providerSelected
@@ -194,21 +203,63 @@ function chooseAddProvider(providerId: string) {
 }
 
 function closeAddPicker(restoreFocus = true) {
-  if (!addOpen.value) return
+  if (!addOpen.value && !editorOpen.value) return
   addOpen.value = false
-  if (restoreFocus) void nextTick(() => addButtonRef.value?.focus())
+  editorOpen.value = false
+  if (restoreFocus) {
+    const target = dialogInvoker.value ?? addButtonRef.value
+    void nextTick(() => target?.focus())
+  }
+  dialogInvoker.value = null
+}
+
+function cancelAndClose(restoreFocus = true) {
+  if (!addOpen.value) {
+    emit('cancelProviderEdit')
+  }
+  closeAddPicker(restoreFocus)
 }
 
 function toggleAddPicker() {
-  if (addOpen.value) {
+  if (editorOpen.value) {
     closeAddPicker()
     return
   }
+  dialogInvoker.value = addButtonRef.value
   addOpen.value = true
+  editorOpen.value = true
 }
 
 function selectConfigured(providerId: string) {
+  dialogInvoker.value = document.activeElement instanceof HTMLElement
+    ? document.activeElement
+    : null
+  editorOpen.value = true
+  addOpen.value = false
   emit('selectConfiguredProvider', providerId)
+}
+
+function onEditorDialogKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    event.stopPropagation()
+    cancelAndClose()
+    return
+  }
+  if (event.key !== 'Tab') return
+  const focusable = Array.from(editorDialogRef.value?.querySelectorAll<HTMLElement>(
+    'button:not([disabled]), input:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+  ) || []).filter(element => !element.hasAttribute('hidden'))
+  if (focusable.length === 0) return
+  const first = focusable[0]!
+  const last = focusable[focusable.length - 1]!
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault()
+    last.focus()
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault()
+    first.focus()
+  }
 }
 
 function testConfigured(providerId: string) {
@@ -229,6 +280,12 @@ function removeConfigured(providerId: string) {
 
 const selectedConfiguredProvider = computed(() => props.panel.configuredProviders.find(
   provider => isEditingProvider(provider.providerId),
+))
+const panelIsStoredProvider = computed(() => (
+  Boolean(selectedConfiguredProvider.value)
+))
+const replacesCurrentProvider = computed(() => (
+  !props.panel.editingPrimary && !props.panel.profileSaveSupported
 ))
 
 const modelUsageModeKey = computed(() => {
@@ -278,14 +335,21 @@ watch(() => props.panel.providerSelected, (value, previous) => {
   if (!value || value === previous) return
   const selectedFromPicker = addOpen.value
   addOpen.value = false
+  if (selectedFromPicker) editorOpen.value = true
   void nextTick(() => {
     const credentialInput = selectedFromPicker
-      ? sectionRef.value?.querySelector<HTMLInputElement>('input[name="setup_provider_api_key"]:not([disabled])')
+      ? editorDialogRef.value?.querySelector<HTMLInputElement>('input[name="setup_provider_api_key"]:not([disabled])')
       : null
-    const target = credentialInput ?? editorHeadingRef.value
+    const target = credentialInput
+      ?? editorDialogRef.value?.querySelector<HTMLElement>('button, input, [tabindex]:not([tabindex="-1"])')
     target?.scrollIntoView({ block: 'nearest' })
     target?.focus({ preventScroll: true })
   })
+})
+
+watch(() => props.saving, (saving, wasSaving) => {
+  if (!wasSaving || saving || props.dirty) return
+  closeAddPicker()
 })
 
 watch(() => props.panel.configuredProviders, rows => {
@@ -293,6 +357,7 @@ watch(() => props.panel.configuredProviders, rows => {
   const pending = pendingRemoval.value
   if (pending && !rows.some(row => row.providerId === pending.providerId)) {
     pendingRemoval.value = null
+    closeAddPicker(false)
     void nextTick(() => {
       const next = rows[Math.min(pending.index, Math.max(0, rows.length - 1))]
       const nextRow = next
@@ -463,12 +528,19 @@ function probeToneClass(providerId: string): string {
   return 'is-warn'
 }
 
+function showConfiguredProbeStatus(providerId: string): boolean {
+  const state = probeFor(providerId)
+  return state.phase !== 'unverified' || Boolean(configuredRowFor(providerId)?.lastProbe)
+}
+
 function providerIdentityLabel(
   provider: ProviderPanelContract['configuredProviders'][number],
 ): string {
   const parts = [t('setup.provider.editProvider', { provider: provider.label })]
   if (provider.active) parts.push(t('setup.provider.activeBadge'))
-  if (isEditingProvider(provider.providerId)) parts.push(t('setup.provider.editingBadge'))
+  if (editorOpen.value && isEditingProvider(provider.providerId)) {
+    parts.push(t('setup.provider.editingBadge'))
+  }
   parts.push(configuredStatus(provider))
   const probe = probeStatus(provider.providerId)
   if (probe) parts.push(probe)
@@ -564,9 +636,13 @@ const showContextWindowWarning = computed(() => (
 ))
 
 const showTokenRhythmRecommendation = computed(() => {
-  return props.panel.runtimeProviders.some(
+  const hasTokenRhythm = props.panel.runtimeProviders.some(
     provider => provider.providerId.trim().toLowerCase() === 'tokenrhythm',
   )
+  if (!hasTokenRhythm) return false
+  // Acquisition aid only: once any provider is credential-ready, the promo
+  // retires so the page stays about the user's own providers.
+  return !props.panel.configuredProviders.some(provider => provider.ready)
 })
 
 const tokenRhythmSelected = computed(() => (
@@ -583,8 +659,22 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 <template>
   <section ref="sectionRef" class="control-section setup-provider-page">
     <div class="control-section__head setup-provider-page__head">
-      <h3 class="control-section__title">{{ t('setup.provider.pageTitle') }}</h3>
-      <p class="control-section__desc">{{ t('setup.provider.pageDesc') }}</p>
+      <div class="setup-provider-page__intro">
+        <h3 class="control-section__title">{{ t('setup.provider.pageTitle') }}</h3>
+        <p class="control-section__desc">{{ t('setup.provider.pageDesc') }}</p>
+      </div>
+      <button
+        ref="addButtonRef"
+        type="button"
+        class="btn btn--primary setup-provider-page__add"
+        data-provider-picker-trigger
+        aria-controls="setup-provider-editor-dialog"
+        :aria-expanded="editorOpen ? 'true' : 'false'"
+        @click="toggleAddPicker"
+      >
+        <Icon name="plus" :size="15" aria-hidden="true" />
+        {{ t('setup.provider.addProvider') }}
+      </button>
     </div>
 
     <fieldset
@@ -593,11 +683,11 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
       :aria-busy="providerBusy ? 'true' : undefined"
     >
 
+    <section class="setup-provider-primary-block setup-provider-configured-block">
     <div class="setup-provider-overview">
       <div class="setup-provider-overview__copy">
         <div class="setup-provider-overview__title-row">
           <h4>{{ t('setup.provider.configuredTitle') }}</h4>
-          <span class="control-pill">{{ t('setup.provider.configuredCount', { count: panel.configuredProviders.length }) }}</span>
         </div>
         <p
           v-if="panel.configuredProviders.length > 0"
@@ -607,30 +697,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
           ready: readyProviderCount,
         }) }}</p>
       </div>
-      <div class="setup-provider-add">
-        <button
-          v-if="!addOpen"
-          ref="addButtonRef"
-          type="button"
-          class="btn btn--primary"
-          data-provider-picker-trigger
-          aria-controls="setup-provider-catalog-picker"
-          :aria-expanded="addOpen ? 'true' : 'false'"
-          @click="toggleAddPicker"
-        >
-          <Icon name="plus" :size="15" aria-hidden="true" />
-          {{ t('setup.provider.addProvider') }}
-        </button>
-      </div>
     </div>
-
-    <SetupProviderCatalogDialog
-      :open="addOpen"
-      :providers="panel.runtimeProviders"
-      :configured-ids="Array.from(configuredIds)"
-      @close="closeAddPicker"
-      @select="chooseAddProvider"
-    />
 
     <div
       v-if="panel.configuredProviders.length === 0 && !panel.providerSelected"
@@ -656,30 +723,21 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
         v-for="provider in visibleConfiguredProviders"
         :key="provider.providerId"
         class="setup-provider-card"
-        :class="{ 'is-selected': isEditingProvider(provider.providerId) }"
+        :class="{ 'is-selected': editorOpen && isEditingProvider(provider.providerId) }"
         :data-provider-id="provider.providerId"
       >
         <button
           type="button"
           class="setup-provider-card__identity setup-provider-card__select"
           :aria-label="providerIdentityLabel(provider)"
-          :aria-current="isEditingProvider(provider.providerId) ? 'true' : undefined"
+          :aria-current="editorOpen && isEditingProvider(provider.providerId) ? 'true' : undefined"
           @click="selectConfigured(provider.providerId)"
         >
           <span class="setup-provider-card__name-row">
             <span class="setup-provider-card__name">{{ provider.label }}</span>
-            <span v-if="provider.active" class="control-pill control-pill--ok">{{ t('setup.provider.activeBadge') }}</span>
-            <span v-if="isEditingProvider(provider.providerId)" class="control-pill setup-provider-card__editing">
-              {{ t('setup.provider.editingBadge') }}
-            </span>
           </span>
           <span
-            class="setup-provider-card__status"
-            :class="provider.ready ? 'is-ready' : 'is-warn'"
-            :title="provider.reason || undefined"
-          >{{ configuredStatus(provider) }}</span>
-          <span
-            v-if="probeStatus(provider.providerId)"
+            v-if="showConfiguredProbeStatus(provider.providerId)"
             class="setup-provider-card__probe"
             :class="probeToneClass(provider.providerId)"
             aria-live="polite"
@@ -706,23 +764,27 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
             @click="testConfigured(provider.providerId)"
           >{{ configuredTestLabel(provider) }}</button>
           <button
-            v-if="!provider.active"
             type="button"
-            class="btn btn--ghost setup-provider-card__activate"
-            :disabled="Boolean(activationDisabledReason(provider)) || activationInProgress(provider.providerId)"
-            :title="activationDisabledReason(provider) || undefined"
-            :aria-label="activationActionLabel(provider)"
-            @click="activateConfigured(provider.providerId)"
-          >{{ activationInProgress(provider.providerId)
-            ? t('setup.provider.activating')
-            : t('setup.provider.makeActive') }}</button>
+            class="btn btn--ghost setup-provider-card__action"
+            :aria-label="t('setup.provider.editProvider', { provider: provider.label })"
+            @click="selectConfigured(provider.providerId)"
+          >
+            <Icon name="edit" :size="14" aria-hidden="true" />
+            {{ t('common.edit') }}
+          </button>
           <button
-            v-if="!provider.active"
+            v-if="
+              panel.profileSaveSupported
+              && (!provider.active || panel.primaryProviderRemovalSupported)
+            "
             type="button"
-            class="btn btn--ghost setup-provider-card__delete"
-            :aria-label="`${t('common.delete')} — ${provider.label}`"
+            class="btn btn--ghost setup-provider-card__action setup-provider-card__delete"
+            :aria-label="`${t('setup.provider.removeConfirmPrimary')} — ${provider.label}`"
             @click="removeConfigured(provider.providerId)"
-          >{{ t('common.delete') }}</button>
+          >
+            <Icon name="trash" :size="14" aria-hidden="true" />
+            {{ t('common.delete') }}
+          </button>
         </div>
       </li>
     </ul>
@@ -733,7 +795,9 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
       :aria-expanded="listExpanded ? 'true' : 'false'"
       @click="listExpanded = !listExpanded"
     >{{ listExpanded ? t('setup.provider.showFewerProviders') : t('setup.provider.viewAllProviders', { count: panel.configuredProviders.length }) }}</button>
+    </section>
 
+    <div hidden>
     <SetupProviderRecommendation
       v-if="showTokenRhythmRecommendation"
       :token-rhythm-selected="tokenRhythmSelected"
@@ -962,8 +1026,152 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
         <Icon name="chevronRight" :size="15" aria-hidden="true" />
       </button>
     </div>
+    </div>
 
     </fieldset>
+
+    <Teleport to="body">
+      <Transition name="provider-dialog">
+        <div
+          v-if="editorOpen"
+          class="setup-provider-modal-overlay"
+          @mousedown.self="cancelAndClose()"
+        >
+          <section
+            id="setup-provider-editor-dialog"
+            ref="editorDialogRef"
+            class="setup-provider-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="setup-provider-modal-title"
+            @keydown="onEditorDialogKeydown"
+          >
+            <header class="setup-provider-modal__head">
+              <div class="setup-provider-modal__heading">
+                <span class="setup-provider-modal__mark" aria-hidden="true">
+                  <Icon :name="addOpen ? 'plus' : 'cloud'" :size="18" />
+                </span>
+                <div>
+                  <h4 id="setup-provider-modal-title">
+                    {{ addOpen
+                      ? t('setup.provider.catalogTitle')
+                      : t('setup.provider.editingTitle', { provider: selectedProviderLabel }) }}
+                  </h4>
+                  <p>{{ addOpen ? t('setup.provider.catalogDesc') : t('setup.provider.pageDesc') }}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                class="btn btn--icon btn--ghost"
+                :aria-label="t('common.close')"
+                @click="cancelAndClose()"
+              >
+                <Icon name="x" :size="17" />
+              </button>
+            </header>
+
+            <div class="setup-provider-modal__body">
+              <SetupProviderCatalogDialog
+                v-if="addOpen"
+                :open="addOpen"
+                :providers="panel.runtimeProviders"
+                :configured-ids="Array.from(configuredIds)"
+                embedded
+                @close="closeAddPicker"
+                @select="chooseAddProvider"
+              />
+
+              <div
+                v-if="!addOpen && panel.providerSelected && replacesCurrentProvider"
+                class="setup-warning setup-provider-modal__compat-warning"
+                role="status"
+              >
+                {{ t('setup.provider.profileSaveUnsupported') }}
+              </div>
+
+              <fieldset
+                v-if="!addOpen && panel.providerSelected"
+                class="setup-provider-modal__form"
+                :disabled="providerBusy || saving"
+              >
+                <label class="setup-provider-modal__provider-name">
+                  <span>{{ t('setup.provider.title') }}</span>
+                  <strong>{{ selectedProviderLabel }}</strong>
+                </label>
+
+                <SetupProviderCredentialCard
+                  v-if="panel.credentialPanel"
+                  compact
+                  show-verification
+                  :panel="panel.credentialPanel"
+                  @reveal="panel.credentialPanel.onReveal?.()"
+                  @hide-reveal="panel.credentialPanel.onHideReveal?.()"
+                  @replace="panel.credentialPanel.onReplace?.()"
+                  @cancel-replace="panel.credentialPanel.onCancelReplace?.()"
+                  @remove-credential="panel.credentialPanel.onRemoveCredential?.()"
+                  @test-connection="emit('probeConnection')"
+                  @update-field="(name, value) => emit('updateProviderField', name, value)"
+                />
+
+                <section v-if="modelFields.length" class="setup-provider-modal__model">
+                  <template v-for="field in modelFields" :key="field.name">
+                    <SetupModelCombobox
+                      v-if="useCombobox(field)"
+                      :field="displayField(field)"
+                      :value="panel.providerFieldValue(field)"
+                      :models="panel.connection.models"
+                      :model-source="panel.connection.modelSource"
+                      @update="(val) => emit('updateProviderField', 'model', val)"
+                    />
+                    <SetupField
+                      v-else
+                      :field="displayField(field)"
+                      :value="panel.providerFieldValue(field)"
+                      scope="provider"
+                      @update="(name, val) => emit('updateProviderField', name, val)"
+                    />
+                  </template>
+                </section>
+              </fieldset>
+            </div>
+
+            <footer v-if="!addOpen && panel.providerSelected" class="setup-provider-modal__footer">
+              <button
+                v-if="panel.profileSaveSupported && panelIsStoredProvider && selectedConfiguredProvider"
+                type="button"
+                class="btn btn--ghost setup-provider-modal__delete"
+                :disabled="providerBusy || saving"
+                @click="removeConfigured(selectedConfiguredProvider.providerId)"
+              >
+                <Icon name="trash" :size="15" aria-hidden="true" />
+                {{ t('setup.provider.removeConfirmPrimary') }}
+              </button>
+              <span class="setup-provider-modal__footer-spacer"></span>
+              <button
+                type="button"
+                class="btn btn--ghost"
+                :disabled="providerBusy || saving"
+                @click="cancelAndClose()"
+              >{{ t('common.cancel') }}</button>
+              <button
+                type="button"
+                class="btn btn--primary"
+                :disabled="providerBusy || saving || !dirty || (replacesCurrentProvider && panel.connection.phase !== 'verified')"
+                :title="replacesCurrentProvider && panel.connection.phase !== 'verified'
+                  ? t('setup.provider.currentSettingsNotTested')
+                  : undefined"
+                :aria-busy="saving ? 'true' : undefined"
+                @click="emit('saveProvider')"
+              >
+                <span v-if="saving" class="setup-connection__spinner" aria-hidden="true"></span>
+                {{ t('setup.provider.saveChanges') }}
+              </button>
+            </footer>
+
+          </section>
+        </div>
+      </Transition>
+    </Teleport>
 
   </section>
 </template>
@@ -974,37 +1182,61 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 }
 
 .setup-provider-page__head {
-  align-items: flex-start;
-  flex-direction: column;
-  gap: var(--sp-1);
+  align-items: center;
+  display: flex;
+  gap: var(--sp-4);
+  justify-content: space-between;
+  padding-bottom: var(--sp-5);
 }
 
-.setup-provider-page__head .control-section__desc {
-  flex: none;
+.setup-provider-page__intro {
+  display: grid;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+
+.setup-provider-page__add {
+  align-items: center;
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: var(--sp-1);
 }
 
 .setup-provider-interactions {
   border: 0;
+  display: grid;
+  gap: 0;
   margin: 0;
   min-inline-size: 0;
   padding: 0;
 }
 
+.setup-provider-primary-block {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  padding: 0;
+}
+
+.setup-provider-configured-block {
+  min-height: 160px;
+}
+
 .setup-provider-list {
   display: grid;
-  gap: var(--sp-2);
+  gap: 0;
   list-style: none;
-  margin-block: var(--sp-3);
+  margin: var(--sp-3) 0 0;
   padding: 0;
 }
 
 .setup-provider-overview {
   align-items: center;
-  border-bottom: 1px solid var(--border);
   display: flex;
   gap: var(--sp-3);
   justify-content: space-between;
-  padding-bottom: var(--sp-3);
+  padding-bottom: 0;
 }
 
 .setup-provider-overview__title-row {
@@ -1026,14 +1258,16 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 }
 
 .setup-provider-empty {
-  align-items: flex-start;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
+  align-items: center;
+  background: color-mix(in srgb, var(--bg-surface-2) 62%, transparent);
   border-radius: var(--radius-md);
-  display: flex;
+  border: 1px dashed var(--border);
+  display: grid;
   gap: var(--sp-3);
-  margin-block: var(--sp-3);
-  padding: var(--sp-4);
+  margin: var(--sp-3) 0 0;
+  justify-items: center;
+  padding: var(--sp-7) var(--sp-4);
+  text-align: center;
 }
 
 .setup-provider-empty__icon,
@@ -1062,19 +1296,27 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 
 .setup-provider-card {
   align-items: center;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
+  background: transparent;
+  border-radius: 0;
+  border: 0;
+  border-top: 1px solid var(--border);
+  box-shadow: none;
   display: flex;
   gap: var(--sp-3);
   justify-content: space-between;
-  min-height: 54px;
-  padding: var(--sp-2) var(--sp-3);
+  min-height: 60px;
+  padding: var(--sp-3) var(--sp-2);
+  transition: background var(--dur-base) var(--ease-out);
+}
+
+.setup-provider-card:hover {
+  background: color-mix(in srgb, var(--accent) 4%, transparent);
+  box-shadow: none;
 }
 
 .setup-provider-card.is-selected {
-  border-color: var(--accent);
-  box-shadow: inset 3px 0 0 var(--accent);
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  box-shadow: inset 2px 0 0 var(--accent);
 }
 
 .setup-provider-card__identity {
@@ -1106,12 +1348,24 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
   justify-content: flex-end;
 }
 
+.setup-provider-card__action {
+  min-height: 32px;
+  padding: var(--sp-1) var(--sp-2);
+}
+
 .setup-provider-card__activate {
   color: var(--accent);
 }
 
 .setup-provider-card__delete {
   color: var(--danger);
+  opacity: 0.72;
+}
+
+.setup-provider-card__delete:hover,
+.setup-provider-card__delete:focus-visible {
+  background: color-mix(in srgb, var(--danger) 9%, transparent);
+  opacity: 1;
 }
 
 .setup-provider-card__name {
@@ -1126,12 +1380,8 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
   outline-offset: 3px;
 }
 
-.setup-provider-card__status {
-  color: var(--text-muted);
-  font-size: var(--fs-xs);
-}
-
 .setup-provider-card__probe {
+  color: var(--text-muted);
   font-size: var(--fs-xs);
 }
 
@@ -1150,14 +1400,6 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 
 .setup-provider-list__toggle {
   margin-top: calc(var(--sp-2) * -1);
-}
-
-.setup-provider-card__status.is-ready {
-  color: var(--ok);
-}
-
-.setup-provider-card__status.is-warn {
-  color: var(--warn);
 }
 
 .setup-provider-list__empty {
@@ -1179,8 +1421,8 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 
 .setup-provider-routing {
   align-items: center;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
+  background: var(--bg-surface-2);
+  border-radius: var(--radius-card);
   display: flex;
   gap: var(--sp-3);
   justify-content: space-between;
@@ -1200,11 +1442,6 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
   display: inline-flex;
   flex: 0 0 auto;
   gap: var(--sp-1);
-}
-
-.setup-provider-routing {
-  background: transparent;
-  border-color: var(--border);
 }
 
 .setup-provider-routing p {
@@ -1420,7 +1657,190 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
   text-align: right;
 }
 
+.setup-provider-modal-overlay {
+  align-items: center;
+  background: color-mix(in srgb, var(--scrim) 88%, transparent);
+  display: flex;
+  inset: 0;
+  justify-content: center;
+  padding: var(--sp-6);
+  position: fixed;
+  z-index: 420;
+}
+
+.setup-provider-modal {
+  background: var(--bg-surface);
+  border: 1px solid color-mix(in srgb, var(--accent) 20%, var(--border));
+  border-radius: var(--radius-modal);
+  box-shadow: var(--shadow-xl);
+  display: flex;
+  flex-direction: column;
+  max-height: min(720px, calc(100dvh - 48px));
+  overflow: hidden;
+  position: relative;
+  width: min(640px, 100%);
+}
+
+.setup-provider-modal::before {
+  background: var(--accent);
+  content: '';
+  height: 3px;
+  inset: 0 0 auto;
+  position: absolute;
+}
+
+.setup-provider-modal__head {
+  align-items: flex-start;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  gap: var(--sp-4);
+  justify-content: space-between;
+  padding: var(--sp-5);
+}
+
+.setup-provider-modal__heading {
+  align-items: flex-start;
+  display: flex;
+  gap: var(--sp-3);
+  min-width: 0;
+}
+
+.setup-provider-modal__mark {
+  align-items: center;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border-radius: var(--radius-md);
+  color: var(--accent);
+  display: inline-flex;
+  flex: 0 0 auto;
+  height: 36px;
+  justify-content: center;
+  width: 36px;
+}
+
+.setup-provider-modal__head h4,
+.setup-provider-modal__head p {
+  margin: 0;
+}
+
+.setup-provider-modal__head h4 {
+  font-size: var(--fs-lg);
+  line-height: 1.35;
+}
+
+.setup-provider-modal__head p {
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+  margin-top: var(--sp-1);
+}
+
+.setup-provider-modal__body {
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--sp-5);
+}
+
+.setup-provider-modal__compat-warning {
+  margin: 0;
+}
+
+.setup-provider-modal__footer {
+  align-items: center;
+  border-top: 1px solid var(--border);
+  display: flex;
+  gap: var(--sp-2);
+  padding: var(--sp-4) var(--sp-5);
+}
+
+.setup-provider-modal__footer-spacer {
+  flex: 1 1 auto;
+}
+
+.setup-provider-modal__delete {
+  color: var(--danger);
+}
+
+.setup-provider-modal__delete:not(:disabled):hover {
+  background: color-mix(in srgb, var(--danger) 9%, transparent);
+  color: var(--danger);
+}
+
+.setup-provider-modal__form {
+  border: 0;
+  display: grid;
+  gap: var(--sp-5);
+  margin: 0;
+  min-inline-size: 0;
+  padding: 0;
+}
+
+.setup-provider-modal__provider-name {
+  align-items: baseline;
+  display: flex;
+  gap: var(--sp-2);
+  padding-bottom: var(--sp-1);
+}
+
+.setup-provider-modal__provider-name span {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+}
+
+.setup-provider-modal__provider-name strong {
+  color: var(--text);
+  font-size: var(--fs-md);
+}
+
+.setup-provider-modal__model {
+  border-top: 1px solid var(--border);
+  padding-top: var(--sp-4);
+}
+
+.provider-dialog-enter-active,
+.provider-dialog-leave-active {
+  transition: opacity var(--dur-fast) var(--ease-out);
+}
+
+.provider-dialog-enter-active .setup-provider-modal,
+.provider-dialog-leave-active .setup-provider-modal {
+  transition: opacity var(--dur-base) var(--ease-out),
+              transform var(--dur-base) var(--ease-out);
+}
+
+.provider-dialog-enter-from,
+.provider-dialog-leave-to,
+.provider-dialog-enter-from .setup-provider-modal,
+.provider-dialog-leave-to .setup-provider-modal {
+  opacity: 0;
+}
+
+.provider-dialog-enter-from .setup-provider-modal {
+  transform: translateY(8px) scale(0.99);
+}
+
+.provider-dialog-leave-to .setup-provider-modal {
+  transform: translateY(4px) scale(0.995);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .provider-dialog-enter-active,
+  .provider-dialog-leave-active,
+  .provider-dialog-enter-active .setup-provider-modal,
+  .provider-dialog-leave-active .setup-provider-modal {
+    transition: none;
+  }
+}
+
 @container provider-panel (max-width: 720px) {
+  .setup-provider-page__head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .setup-provider-page__add {
+    align-self: flex-start;
+  }
+
   .setup-provider-overview {
     align-items: flex-start;
     flex-direction: column;
@@ -1468,6 +1888,29 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 
   .setup-provider-card__actions .btn {
     flex: 1 1 auto;
+  }
+
+  .setup-provider-card__actions .setup-provider-card__delete {
+    flex: 0 0 auto;
+  }
+
+}
+
+@media (max-width: 640px) {
+  .setup-provider-modal-overlay {
+    align-items: flex-end;
+    padding: 0;
+  }
+
+  .setup-provider-modal {
+    border-radius: var(--radius-modal) var(--radius-modal) 0 0;
+    max-height: min(86dvh, 720px);
+    width: 100%;
+  }
+
+  .setup-provider-modal__head,
+  .setup-provider-modal__body {
+    padding: var(--sp-4);
   }
 
 }

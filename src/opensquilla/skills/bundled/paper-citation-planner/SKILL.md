@@ -1,6 +1,7 @@
 ---
 name: paper-citation-planner
 description: "Map paper claims to available BibTeX citation keys before section drafting."
+description_zh: "在撰写章节前，将论文论点映射到可用的BibTeX引用键。"
 provenance:
   origin: opensquilla-original
   license: Apache-2.0

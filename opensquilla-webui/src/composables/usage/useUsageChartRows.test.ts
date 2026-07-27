@@ -36,6 +36,7 @@ describe('usage ledger day chart', () => {
       rowVal: (row, ...keys) => keys.map(key => row[key]).find(value => value != null),
       fmtCost: value => `$${Number(value || 0).toFixed(2)}`,
       fmtNum: value => String(value || 0),
+      taskName: row => String(row.title || 'Untitled task'),
     })
 
     expect(chartCaption.value).toBe('Daily usage')
@@ -74,8 +75,31 @@ describe('usage ledger day chart', () => {
         options?.source as Record<string, unknown> | undefined,
       ),
       fmtNum: value => String(value || 0),
+      taskName: row => String(row.title || 'Untitled task'),
     })
 
     expect(chartRows.value[0].valueLabel).toBe('¥6.9750')
+  })
+
+  it('uses the shared task name without shortening it in data', () => {
+    const chartMode = ref<'tokens' | 'cost'>('tokens')
+    const title = 'A task name long enough to require visual truncation in the chart label'
+    const { chartRows } = useUsageChartRows({
+      visibleSessions: computed(() => [{
+        sessionKey: 'agent:main:webchat:private-id',
+        title,
+        inputTokens: 10,
+        outputTokens: 2,
+      }]),
+      serverDays: computed(() => null),
+      chartMode,
+      rowVal: (row, ...keys) => keys.map(key => row[key]).find(value => value != null),
+      fmtCost: value => `$${Number(value || 0).toFixed(2)}`,
+      fmtNum: value => String(value || 0),
+      taskName: row => String(row.title || 'Untitled task'),
+    })
+
+    expect(chartRows.value[0].label).toBe(title)
+    expect(chartRows.value[0].sessionKey).toBe('agent:main:webchat:private-id')
   })
 })

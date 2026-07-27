@@ -569,14 +569,40 @@
 }
 
 .chat-slash-cmd {
+  flex: 0 0 210px;
   font-family: var(--font-mono);
   font-weight: 600;
   color: var(--accent);
+  white-space: nowrap;
 }
 
 .chat-slash-desc {
   color: var(--text-muted);
+  flex: 1;
   font-size: 0.8125rem;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 600px) {
+  .chat-slash-item {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .chat-slash-cmd {
+    flex: none;
+    max-width: 100%;
+    white-space: normal;
+    word-break: break-word;
+  }
+
+  .chat-slash-desc {
+    max-width: 100%;
+  }
 }
 
 /* Composer (component root; inner composer styles live in ChatComposer.vue) */

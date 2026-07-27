@@ -120,8 +120,8 @@
     "dismiss": "忽略"
   },
   "nav": {
-    "chat": "对话",
-    "chat-new": "新建对话",
+    "chat": "任务",
+    "chat-new": "新建任务",
     "sessions": "会话",
     "agents": "智能体",
     "channels": "渠道",
@@ -131,6 +131,7 @@
     "overview": "概览",
     "status": "状态",
     "usage": "用量",
+    "viewUsage": "查看用量",
     "logs": "日志",
     "settings": "设置",
     "groupBuild": "构建",
@@ -149,6 +150,9 @@
     "theme": "主题",
     "language": "语言",
     "newChat": "新建任务",
+    "newTask": "新建任务",
+    "newTaskTitle": "新建任务",
+    "searchChats": "搜索任务",
     "more": "更多",
     "moreDestinations": "更多去处",
     "expandSidebar": "展开侧边栏",
@@ -285,7 +289,7 @@
       "applyLiveNote": "大多数更改即时生效；部分需要重启网关",
       "discardTitle": "放弃未保存的修改？",
       "discardBody": "有尚未保存的编辑，现在关闭将丢失它们。",
-      "discardPrimary": "放弃"
+      "discardConfirmPrimary": "放弃修改"
     },
     "rail": {
       "connection": "连接",
@@ -385,10 +389,10 @@
     "provider": {
       "title": "服务商",
       "pageTitle": "模型服务",
-      "pageDesc": "连接模型服务商并管理凭证、端点和直连/回退模型。模型如何被使用，请在“模型路由”中设置。",
+      "pageDesc": "连接模型供应商,管理凭证与模型。",
       "configuredTitle": "已配置的服务商",
       "configuredCount": "{count} 个",
-      "configuredSummary": "{ready}/{count} 个凭证可用。验证会发送一次小型模型请求，服务商可能会计费。",
+      "configuredSummary": "{ready} / {count} 就绪。测试会发送一次小请求。",
       "configuredDesc": "已保存的服务商会一直可用于路由，直到你手动删除。配置验证会使用已保存设置发送一次小型模型请求，服务商可能会计费。",
       "activeBadge": "当前使用",
       "editingBadge": "正在编辑",
@@ -400,11 +404,15 @@
       "emptyRoutingHint": "完成连接后，可继续设置智能路由；单个服务商也可以在多个模型之间路由。",
       "addProvider": "添加服务商",
       "catalogTitle": "添加服务商",
-      "catalogDesc": "选择服务商后，配置项会直接在下方展开。",
+      "catalogDesc": "选择服务商，在一个窗口内完成 API Key 与模型设置。",
       "featuredProviders": "推荐服务商",
       "allProviders": "全部服务商",
       "providerResultCount": "可选 {count} 个",
       "recommendedBadge": "推荐",
+      "recommendedProviders": "推荐",
+      "otherProviders": "其他服务商",
+      "limitedFreeBadge": "限时免费获取",
+      "alreadyConfigured": "已添加",
       "browseAllProviders": "浏览全部服务商（{count}）",
       "providerResults": "服务商结果",
       "viewAllProviders": "查看全部（{count}）",
@@ -479,7 +487,8 @@
       "modelPlaceholder": "输入模型 ID",
       "activating": "正在切换…",
       "modelDiscoveryFailed": "无法发现模型，请手动输入模型 ID。",
-      "upgradeGatewayHint": "请更新并重启网关后再使用服务商激活功能。",
+      "upgradeGatewayHint": "请更新并重启网关后再使用服务商管理功能。",
+      "profileSaveUnsupported": "当前网关只保存一个服务商。验证成功后，点击“保存更改”会直接替换当前服务商。",
       "connectedLatency": "配置验证成功 · 完整探测 {latency} 毫秒",
       "connectionKeyRejected": "密钥被拒绝",
       "connectionUnavailable": "连接不可用",
@@ -498,7 +507,10 @@
       "profileModelHint": "保存后，如果将该服务商设为当前使用，此模型会作为直连/回退模型；路由模型仍在“模型路由”中单独配置。",
       "removeConfirmTitle": "删除服务商？",
       "removeConfirmBody": "要从已配置服务商中删除 {provider} 吗？仍被路由引用的服务商无法删除。",
+      "removeActiveConfirmBody": "要删除 {provider} 并将当前服务商切换为 {replacement} 吗？仍被路由引用的服务商无法删除。",
       "removeConfirmPrimary": "删除服务商",
+      "saveChanges": "保存更改",
+      "verifyAndConnect": "验证并尝试连接",
       "needs": "服务商所需",
       "choose": "选择一个服务商",
       "chooseProviderShort": "请选择服务商",
@@ -510,7 +522,6 @@
       "recommendation": {
         "title": "推荐使用 TokenRhythm",
         "value": "TokenRhythm API 调用限时免费。",
-        "registration": "活动期间，注册并获取 API Key，即可免费调用 DeepSeek、GLM、MiniMax、Kimi 等主流模型。",
         "cta": "注册并获取 API Key",
         "externalLabel": "注册并获取 API Key — TokenRhythm（在新标签页中打开）",
         "stepsLabel": "如何接入 TokenRhythm",
@@ -657,42 +668,40 @@
     },
     "modelStrategy": {
       "title": "模型路由",
-      "desc": "选择 Squilla 如何为新请求选择和使用已配置的模型。",
+      "desc": "选择每次请求如何挑选模型。",
       "modeTitle": "选择模型使用方式",
-      "modeDesc": "按目标选择：智能模型路由兼顾 Token 用量与模型能力；固定模型稳定可控；多模型协作面向复杂任务，通常使用更多 Token。",
       "providerFirstTitle": "先添加模型服务商",
-      "providerFirst": "模型路由至少需要一个已保存的服务商。即使只有一个服务商，也可以在其多个模型之间路由。",
+      "providerFirst": "模型路由需要至少一个已保存的供应商。",
       "providerAction": "前往模型服务",
-      "configuredProvidersOnly": "可用的服务商和模型来自模型服务。",
+      "configuredProvidersOnly": "模型来自「模型服务」。",
       "manageProviders": "管理模型服务",
       "routerTitle": "智能模型路由",
       "fallbackTierLabel": "路由无法确定时",
-      "fallbackTierDesc": "当路由无法有把握地判断请求层级时，使用这个默认层级。",
+      "fallbackTierDesc": "当路由无法判断请求档位时使用。",
       "modelRolesTitle": "模型角色",
-      "modelRolesDesc": "按请求复杂度，指定每个层级负责的模型。",
-      "advancedTitle": "显示选项",
-      "advancedDesc": "调整聊天中路由信息的显示方式，不影响模型选择。",
+      "advancedTitle": "高级选项",
+      "advancedDesc": "兜底档位与聊天中的路由展示。",
       "visualModeLabel": "路由决策面板样式",
-      "visualModeDesc": "选择路由决策面板在聊天回复中的显示方式，不会改变路由行为。",
+      "visualModeDesc": "路由决策在聊天回复中的展示样式。",
       "crossProviderNotice": "跨服务商路由已启用。保存前请检查每个分层。",
       "cards": {
         "router": {
           "title": "智能模型路由",
           "badge": "按需省 Token",
-          "desc": "按请求复杂度选择模型，让简单任务避免不必要的高能力模型调用。"
+          "desc": "每个请求交给合适的模型，简单任务不浪费。"
         },
         "ensemble": {
           "title": "多模型协作",
           "badge": "能力优先",
-          "desc": "多个模型并行处理并合并结果，为复杂任务提供更充分的分析；通常使用更多 Token。"
+          "desc": "多模型协作攻克复杂任务。"
         },
         "single": {
           "title": "固定模型",
           "badge": "稳定可控",
-          "desc": "始终使用你指定的模型，模型选择和用量更容易预估。"
+          "desc": "所有请求用同一个模型，简单可预期。"
         }
       },
-      "routerDependency": "按请求复杂度为各层级配置模型；一个服务商也可以覆盖所有层级。",
+      "routerDependency": "为每个请求档位选一个模型,一个供应商即可覆盖全部档位。",
       "ensembleTitle": "多模型协作",
       "ensembleDependency": "使用 {provider} 凭据；服务商默认模型为 {model}。",
       "ensembleMinimum": "再添加至少一个候选模型，才能获得聚合路由收益。",
@@ -720,7 +729,7 @@
       "removeCandidateAria": "移除 {model}",
       "ensembleEmpty": "暂无候选模型。请保存模型服务设置以生成模型分层，或手动添加候选模型。",
       "ensemblePipeline": "工作方式：提案模型并行起草，聚合模型汇总草稿并产出最终回答；只有聚合模型可以调用工具。",
-      "ensembleFlowDesc": "多个模型并行起草，再由聚合模型合并为一个最终回答；这会增加模型调用，成本可能更高。",
+      "ensembleFlowDesc": "多个模型并行起草,聚合模型合成最终回答;调用次数更多。",
       "legacyDynamicNotice": "当前配置使用已下线的自动聚合模式,转换为自定义阵容后可在此继续编辑。",
       "legacyDynamicMigrate": "转换为自定义阵容",
       "schemeLabel": "聚合方案",
@@ -1190,6 +1199,7 @@
       "providerSaved": "服务商已保存。",
       "providerSavedRestart": "服务商已保存。需要重启。",
       "providerProfileSaved": "已保存 {provider}，可用于路由。",
+      "providerActiveRemoveNeedsReplacement": "请先添加并验证另一个服务商，再删除当前服务商。",
       "providerProfileRemoved": "已删除 {provider}。",
       "providerCredentialRemoved": "已删除 {provider} 的凭据。",
       "providerCredentialExternalStillActive": "已清除 OpenSquilla 中保存的 {provider} 凭据引用，但系统环境变量 {envKey} 仍在提供凭据。",
@@ -1600,7 +1610,6 @@
     "overview": {
       "title": "状态",
       "subtitle": "就绪情况、用量与运行健康状态。",
-      "openChat": "打开聊天",
       "totalTokens": "总 token 数",
       "totalSessions": "会话总数",
       "totalSessionsTitle": "所有状态的会话总数",
@@ -1626,6 +1635,7 @@
       "noFindings": "未返回任何发现项。",
       "recoveryRestart": "恢复需要重启",
       "openSettings": "打开设置",
+      "findingDetails": "详情",
       "findingFallback": "发现项 {n}",
       "copyCommand": "复制命令",
       "step": "步骤",
@@ -1644,11 +1654,6 @@
         "actionRequired": "需要处理",
         "degraded": "降级",
         "unavailable": "不可用"
-      },
-      "steps": {
-        "optional": "可选设置步骤",
-        "reference": "参考步骤",
-        "recovery": "恢复步骤"
       },
       "badge": {
         "diagnostic": "诊断未完成",
@@ -2034,7 +2039,33 @@
       "next12h": "未来 12 小时",
       "upcomingRun": "即将运行",
       "nowTick": "现在",
-      "deleteFailed": "删除失败：{error}"
+      "deleteFailed": "删除失败：{error}",
+      "bulkManage": "批量管理",
+      "exitBulk": "退出批量",
+      "overview": "运行概览",
+      "addFromTemplate": "从模板添加",
+      "addAutomation": "添加自动化",
+      "heroTitle": "开启你的第一个自动化任务吧",
+      "heroHint": "让 OpenSquilla 在指定时间自动完成提醒、整理、巡检和智能体任务。",
+      "overviewDesc": "查看自动化任务的启用状态和近期执行情况。",
+      "templateDesc": "选择场景后会自动填入执行时间和任务提示词。",
+      "selectedCount": "已选择 {count} 项",
+      "selectVisible": "全选当前",
+      "clearSelection": "清空",
+      "overviewEyebrow": "自动化概览",
+      "galleryEyebrow": "自动化模板库",
+      "bulkDeleteConfirm": "确定删除选中的 {count} 个自动化任务吗？此操作无法撤销。",
+      "templates": {
+        "ai-daily": { "title": "每日 AI 资讯简报", "description": "检索过去 24 小时的重要 AI 新闻，去重并生成带来源链接的简报。", "category": "资讯与情报", "schedule": "每天 08:00" },
+        "weekly-report": { "title": "每周工作复盘", "description": "汇总本周任务与交付，提炼进展、风险和下周优先事项。", "category": "效率办公", "schedule": "每周五 17:30" },
+        "english-five": { "title": "每天 5 个英语单词", "description": "结合例句与小测验，生成轻量、可坚持的英语学习卡片。", "category": "学习成长", "schedule": "每天 09:00" },
+        "project-risk": { "title": "项目风险巡检", "description": "检查延期事项、异常日志与待处理问题，输出风险等级和建议。", "category": "项目研发", "schedule": "工作日 10:00" },
+        "knowledge-review": { "title": "知识库周回顾", "description": "整理本周新增笔记与会议纪要，补充标签并生成待消化清单。", "category": "知识管理", "schedule": "每周日 18:00" },
+        "daily-idea": { "title": "每日灵感与冷知识", "description": "每天送上一条可靠、有出处的知识和一个可行动的小灵感。", "category": "轻松生活", "schedule": "每天 12:00" },
+        "bedtime-story": { "title": "每日儿童睡前故事", "description": "生成一篇温暖、有启发、适合亲子共读的短篇故事。", "category": "亲子陪伴", "schedule": "每天 20:30" },
+        "classic-movie": { "title": "经典电影推荐", "description": "每周推荐一部高质量经典电影，并附无剧透导读。", "category": "休闲娱乐", "schedule": "每周六 19:00" },
+        "today-in-history": { "title": "历史上的今天", "description": "从科技、文化与社会领域挑选一件可靠的历史事件。", "category": "每日知识", "schedule": "每天 08:30" }
+      }
     },
     "deleteDialog": {
       "title": "删除定时任务",
@@ -2077,7 +2108,8 @@
       "colSchedule": "计划",
       "colStatus": "状态",
       "colLastRun": "上次运行",
-      "colNextRun": "下次运行"
+      "colNextRun": "下次运行",
+      "selectJob": "选择 {name}"
     },
     "runHistory": {
       "eyebrow": "运行历史",
@@ -2148,6 +2180,32 @@
       "fdWebhook": "一个 webhook",
       "enabled": "已启用",
       "saveSchedule": "保存定时任务"
+      ,"friendlyNamePlaceholder": "例如：每天整理客户反馈"
+      ,"friendlyTypeCron": "按固定时间重复"
+      ,"friendlyTypeEvery": "每隔一段时间执行"
+      ,"friendlyTypeAt": "只在指定时间执行一次"
+      ,"executionFrequency": "执行频率"
+      ,"daily": "每天"
+      ,"weekdays": "每个工作日"
+      ,"weekly": "每周"
+      ,"monthly": "每月"
+      ,"customAdvancedTime": "自定义高级时间"
+      ,"weekday": "星期"
+      ,"date": "日期"
+      ,"monthlyDay": "每月 {day} 日"
+      ,"specificTime": "具体时间"
+      ,"customTimeHint": "可输入更灵活的时间规则。"
+      ,"openAdvancedTime": "打开高级时间设置"
+      ,"everyHowOften": "每隔多久执行"
+      ,"timeUnit": "时间单位"
+      ,"minutes": "分钟"
+      ,"hours": "小时"
+      ,"days": "天"
+      ,"dateAndTime": "执行日期和时间"
+      ,"friendlyMessagePlaceholder": "例如：整理今天收到的客户反馈，归纳主要问题并给出处理建议"
+      ,"moreRuntimeSettings": "更多运行设置（可选）"
+      ,"advancedTimeHint": "仅在上面的时间选择无法满足需求时使用。"
+      ,"timezoneSimpleHint": "通常无需修改。"
     },
     "form": {
       "cronPreviewPlaceholder": "输入 5 字段的 cron 表达式以预览",
@@ -2273,6 +2331,8 @@
       "reloadNoChanges": "技能目录已是最新版本（第 {generation} 代）。",
       "reloadPartial": "技能目录已重新加载为第 {generation} 代，但有 {errors} 个错误。{summary}",
       "reloadFailed": "技能目录重新加载失败：{error}",
+      "overviewTitle": "技能概览",
+      "overviewDesc": "查看技能的安装与配置状态，点击分类可筛选技能。",
       "reloadListFailed": "目录已重新加载，但无法获取刷新后的技能列表。",
       "reloadUnknownError": "Gateway 已保留上一个可用目录。",
       "tabsLabel": "技能来源",
@@ -2350,6 +2410,10 @@
       "unknown": "未知",
       "noAudit": "未记录自动启用决定。",
       "gates": "门控"
+    },
+    "tile": {
+      "installed": "已安装",
+      "add": "下载"
     },
     "skillCard": {
       "subSkillsTitle": "此元技能使用的子技能",
@@ -2492,9 +2556,13 @@
     "bundleReady": "支持包已下载"
   },
   "usageLogs": {
+    "tasks": {
+      "unnamed": "未命名任务"
+    },
     "usage": {
       "title": "用量",
-      "subtitle": "所有会话的 Token、成本与各模型花费。",
+      "subtitle": "各任务的 Token、成本与模型用量。",
+      "actions": "用量操作",
       "currency": "货币",
       "usDollar": "美元",
       "chineseYuan": "人民币",
@@ -2506,9 +2574,9 @@
     "summary": {
       "totalTokens": "Token 总数",
       "totalCost": "总成本",
-      "sessions": "会话",
+      "sessions": "任务",
       "acrossAllModels": "跨所有模型",
-      "avgCostPerSession": "每会话平均成本",
+      "avgCostPerSession": "每任务平均成本",
       "runningAverage": "滚动平均"
     },
     "tokenParts": {
@@ -2521,10 +2589,10 @@
     "nativeCostHintTitle": "原始服务商账单为人民币；美元金额按收据所载固定归一化汇率折算。",
     "nativeMixedCostHintTitle": "混合币种或待结算账单继续使用规范化美元汇总，并单独展示已确认的原生币种收据。",
     "nativeBillingSubtotals": "原始账单小计：{amounts}",
-    "rangeHiddenHint": "已隐藏 {count} 个无日期的旧会话",
+    "rangeHiddenHint": "已隐藏 {count} 条无日期的历史任务记录",
     "coverage": {
-      "approximate": "当前连接的是旧版网关；日期范围按会话累计值近似统计。",
-      "partial": "用量账本仍在迁移中；当前显示全部已知用量。",
+      "approximate": "部分历史用量按任务累计值估算。",
+      "partial": "当前显示已记录的全部用量。",
       "timezoneFallback": "时区 {requested} 无效；日期当前按 {effective} 分组。",
       "legacyIncluded": "账本启用前的用量已计入总数，但无法归入具体日期。",
       "estimated": "包含 {count} 次估算调用。",
@@ -2542,10 +2610,10 @@
       "input": "输入",
       "output": "输出",
       "emptyWindow": "所选时间窗内无数据。",
-      "openSession": "打开 {session}",
+      "openTask": "打开任务“{task}”",
       "daily": "每日用量",
-      "topByCost": "按成本排名靠前的会话",
-      "topByTokens": "按 Token 总数排名靠前的会话",
+      "topByCost": "按成本排名靠前的任务",
+      "topByTokens": "按 Token 总数排名靠前的任务",
       "showingOf": "显示 {total} 中的 {shown}"
     },
     "models": {
@@ -2560,19 +2628,19 @@
       "output": "输出",
       "cacheRead": "缓存读",
       "cacheWrite": "缓存写",
-      "sessions": "会话",
+      "sessions": "任务",
       "cost": "成本"
     },
     "sessions": {
-      "title": "会话",
-      "count": "{count} 个会话",
+      "title": "按任务",
+      "count": "{count} 个任务",
       "emptyTitle": "暂无用量数据",
-      "emptyText": "运行一个会话后，Token 花费会自动显示在这里。",
-      "openChat": "打开 {session} 的对话",
+      "emptyText": "运行任务后，Token 用量会自动显示在这里。",
+      "openChat": "打开任务“{task}”",
       "autoModels": "自动 · {count} 个模型"
     },
     "columns": {
-      "session": "会话",
+      "session": "任务",
       "modified": "修改时间",
       "input": "输入",
       "output": "输出",
@@ -2715,6 +2783,14 @@
     "historyTurnLoadedCount": "已加载记录中的第 {number} 条，共 {total} 条",
     "historyAttachmentOnly": "仅包含附件的消息",
     "historyAttachmentCount": "附件：{count}",
+    "loadingSession": "正在加载会话…",
+    "loadingSessionDescription": "正在恢复最近消息和会话状态…",
+    "loadSessionFailed": "暂时无法加载会话",
+    "loadSessionDescription": "连接可能中断，或历史服务暂时不可用。请重新加载。",
+    "reloadSession": "重新加载",
+    "retryingSession": "正在重新加载",
+    "retryingSessionDescription": "正在恢复会话历史…",
+    "retryingSessionAction": "重新加载中…",
     "noMessagesYet": "暂无消息。",
     "newChat": "新建任务",
     "chatWithSuffix": "聊天 {suffix}",
@@ -3055,6 +3131,21 @@
       "searchAiNews": "搜索今天的 AI 新闻",
       "generateImage": "生成一个小鱿鱼吉祥物的图片"
     },
+    "metaQuick": {
+      "webpage": "制作多媒体网页",
+      "shortDrama": "生成 AI 短剧",
+      "paperWriting": "撰写学术论文",
+      "webpageDesc": "生成可直接使用的完整网站",
+      "shortDramaDesc": "完成脚本、分镜与成片",
+      "paperWritingDesc": "完成研究、起草与论文编译"
+    },
+    "metaDescriptions": {
+      "webpage": "根据主题制作完整的多媒体网站。",
+      "kidsProject": "为儿童规划安全、适龄的创意项目。",
+      "shortDrama": "从脚本到成片生成 AI 短剧。",
+      "skillCreator": "将现有技能组合成可复用的工作流。",
+      "paperWriting": "完成学术论文的研究、起草与编译。"
+    },
     "toast": {
       "downloadFailedHttp": "下载失败 — HTTP {status}",
       "downloadFailed": "下载失败",
@@ -3133,15 +3224,17 @@
     "cmdp": {
       "dialogLabel": "搜索并跳转",
       "resultsLabel": "结果",
-      "placeholder": "搜索页面、操作和会话…",
+      "placeholder": "搜索任务",
+      "groupRecents": "最近任务",
+      "recentsEmpty": "还没有任务",
       "noMatches": "无匹配项",
-      "searching": "正在搜索会话…",
-      "untitledChat": "未命名会话",
+      "searching": "正在搜索任务…",
+      "untitledChat": "未命名任务",
       "groupWork": "工作",
       "groupManage": "管理",
       "groupMonitor": "概览",
       "groupActions": "操作",
-      "groupConversations": "会话",
+      "groupConversations": "任务",
       "groupMessages": "消息",
       "actionNewChat": "新建任务",
       "actionOpenSettings": "打开设置",
@@ -3153,21 +3246,21 @@
       "dismiss": "关闭通知"
     },
     "confirm": {
-      "defaultPrimary": "确认"
+      "defaultPrimary": "确定"
     },
     "errorState": {
       "retry": "重试"
     },
     "sidebar": {
       "recentConversations": "最近任务",
-      "recents": "任务",
-      "refresh": "刷新任务",
+      "recents": "最近",
+      "refresh": "重新加载任务",
       "clearAgentFilter": "清除智能体筛选：{name}",
       "loadError": "无法加载任务",
       "noMatches": "无匹配项",
       "noConversations": "暂无任务。",
       "startChat": "开始任务",
-      "linkSessions": "任务",
+      "linkSessions": "会话",
       "currentTask": "当前任务",
       "untitledTask": "未命名任务",
       "linkOverview": "概览",

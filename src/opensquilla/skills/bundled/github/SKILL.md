@@ -1,6 +1,7 @@
 ---
 name: github
 description: "GitHub operations via `gh` CLI: issues, PRs, CI runs, code review, API queries. Use when: (1) checking PR status or CI, (2) creating/commenting on issues, (3) listing/filtering PRs or issues, (4) viewing run logs. NOT for: complex web UI interactions requiring manual browser flows (use browser tooling when available), bulk operations across many repos (script with gh api), or when gh auth is not configured."
+description_zh: "通过 gh CLI 进行GitHub操作：issue、PR、CI运行、代码审查、API查询。适用于查看PR状态或CI、创建/评论issue、列出/筛选PR或issue、查看运行日志。不适用于需手动浏览器流程的复杂Web UI操作、跨多仓库的批量操作，或未配置gh认证的情况。"
 provenance:
   origin: openclaw-derived
   license: MIT

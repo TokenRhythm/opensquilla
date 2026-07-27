@@ -2,6 +2,14 @@ export interface SessionRow {
   session?: string
   sessionKey?: string
   key?: string
+  taskName?: string
+  task_name?: string
+  title?: string
+  displayName?: string
+  display_name?: string
+  subject?: string
+  derivedTitle?: string
+  derived_title?: string
   updated_at?: number | string
   updatedAt?: number | string
   endedAt?: number | string

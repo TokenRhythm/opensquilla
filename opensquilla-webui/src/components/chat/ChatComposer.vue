@@ -81,26 +81,6 @@
               <span>{{ t('workspaces.chooseProject') }}</span>
               <Icon class="chat-project-choose__chevron" name="chevronDown" :size="12" />
             </button>
-            <div ref="settingsAnchorEl" class="chat-settings-anchor">
-              <button
-                class="btn btn--icon btn--ghost"
-                :title="t('chat.composerSettings')"
-                :aria-label="t('chat.composerSettings')"
-                :aria-expanded="settingsOpen ? 'true' : 'false'"
-                @click="toggleSettings"
-              >
-                <Icon name="settings" :size="17" />
-              </button>
-              <ChatComposerSettings
-                v-if="settingsOpen"
-                :visual-effects-enabled="routerVisualEffectsEnabled"
-                :coding-mode-enabled="codingModeEnabled"
-                :coding-mode-settings-busy="codingModeSettingsBusy"
-                @close="settingsOpen = false"
-                @set-visual-effects-enabled="emit('setVisualEffectsEnabled', $event)"
-                @set-coding-mode-enabled="emit('setCodingModeEnabled', $event)"
-              />
-            </div>
             <div ref="modelRoutingAnchorEl" class="chat-settings-anchor">
               <button
                 class="btn btn--icon btn--ghost chat-model-routing-btn"
@@ -159,19 +139,65 @@
                 @set-run-mode="emit('setRunMode', $event)"
               />
             </div>
-            <button
-              class="btn btn--icon btn--ghost"
-              :class="{ 'is-active': voiceRecording, 'chat-mic--needs-setup': !voiceReady }"
-              :title="voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint')"
-              :aria-label="voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint')"
-              :disabled="voiceBusy"
-              @click="voiceReady ? emit('voiceInput') : emit('voiceSetup')"
-            >
-              <Icon name="microphone" :size="17" />
-            </button>
-            <button class="btn btn--icon btn--ghost" :title="t('chat.exportMarkdown')" :aria-label="t('chat.exportMarkdown')" @click="emit('exportMarkdown')">
-              <Icon name="download" :size="17" />
-            </button>
+            <div ref="moreActionsAnchorEl" class="chat-settings-anchor">
+              <button
+                class="btn btn--icon btn--ghost chat-more-actions-btn"
+                :class="{ 'is-active': moreActionsOpen || settingsOpen }"
+                :title="t('chrome.more')"
+                :aria-label="t('chrome.more')"
+                aria-haspopup="menu"
+                :aria-expanded="moreActionsOpen ? 'true' : 'false'"
+                @click="toggleMoreActions"
+              >
+                <Icon name="moreHorizontal" :size="18" />
+              </button>
+              <div
+                v-if="moreActionsOpen"
+                class="chat-more-actions-menu"
+                role="menu"
+                :aria-label="t('chrome.more')"
+              >
+                <button
+                  type="button"
+                  role="menuitem"
+                  :aria-label="t('chat.composerSettings')"
+                  @click="openSettings"
+                >
+                  <Icon name="settings" :size="16" />
+                  <span>{{ t('chat.composerSettings') }}</span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  :class="{ 'is-active': voiceRecording, 'chat-mic--needs-setup': !voiceReady }"
+                  :title="voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint')"
+                  :aria-label="voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint')"
+                  :disabled="voiceBusy"
+                  @click="triggerVoice"
+                >
+                  <Icon name="microphone" :size="16" />
+                  <span>{{ voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint') }}</span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  :aria-label="t('chat.exportMarkdown')"
+                  @click="exportConversation"
+                >
+                  <Icon name="download" :size="16" />
+                  <span>{{ t('chat.exportMarkdown') }}</span>
+                </button>
+              </div>
+              <ChatComposerSettings
+                v-if="settingsOpen"
+                :visual-effects-enabled="routerVisualEffectsEnabled"
+                :coding-mode-enabled="codingModeEnabled"
+                :coding-mode-settings-busy="codingModeSettingsBusy"
+                @close="settingsOpen = false"
+                @set-visual-effects-enabled="emit('setVisualEffectsEnabled', $event)"
+                @set-coding-mode-enabled="emit('setCodingModeEnabled', $event)"
+              />
+            </div>
           </div>
           <div class="chat-input-actions chat-input-actions--right">
             <Transition name="composer-ctl">
@@ -313,6 +339,7 @@ const textareaEl = ref<HTMLTextAreaElement | null>(null)
 const fileInputEl = ref<HTMLInputElement | null>(null)
 const settingsOpen = ref(false)
 const modelRoutingOpen = ref(false)
+const moreActionsOpen = ref(false)
 
 // "NEW" badge on the routing control — the single-model AI router is now the
 // default, so flag it until the user first opens the control, then never again.
@@ -330,11 +357,13 @@ function dismissRouterNewBadge() {
   } catch { /* localStorage unavailable */ }
 }
 const runModeOpen = ref(false)
-const settingsAnchorEl = ref<HTMLElement | null>(null)
 const modelRoutingAnchorEl = ref<HTMLElement | null>(null)
 const runModeAnchorEl = ref<HTMLElement | null>(null)
+const moreActionsAnchorEl = ref<HTMLElement | null>(null)
 
-const anyPopoverOpen = computed(() => settingsOpen.value || modelRoutingOpen.value || runModeOpen.value)
+const anyPopoverOpen = computed(
+  () => settingsOpen.value || modelRoutingOpen.value || runModeOpen.value || moreActionsOpen.value,
+)
 
 function eventInsideRoot(event: PointerEvent, root: HTMLElement | null): boolean {
   if (!root) return false
@@ -344,8 +373,12 @@ function eventInsideRoot(event: PointerEvent, root: HTMLElement | null): boolean
 }
 
 function closeOpenPopoversFromOutside(event: PointerEvent) {
-  if (settingsOpen.value && !eventInsideRoot(event, settingsAnchorEl.value)) {
+  if (
+    (settingsOpen.value || moreActionsOpen.value) &&
+    !eventInsideRoot(event, moreActionsAnchorEl.value)
+  ) {
     settingsOpen.value = false
+    moreActionsOpen.value = false
   }
   if (modelRoutingOpen.value && !eventInsideRoot(event, modelRoutingAnchorEl.value)) {
     modelRoutingOpen.value = false
@@ -367,20 +400,13 @@ onBeforeUnmount(() => {
   document.removeEventListener('pointerdown', closeOpenPopoversFromOutside, true)
 })
 
-function toggleSettings() {
-  settingsOpen.value = !settingsOpen.value
-  if (settingsOpen.value) {
-    modelRoutingOpen.value = false
-    runModeOpen.value = false
-  }
-}
-
 function toggleModelRouting() {
   modelRoutingOpen.value = !modelRoutingOpen.value
   if (modelRoutingOpen.value) {
     dismissRouterNewBadge()
     settingsOpen.value = false
     runModeOpen.value = false
+    moreActionsOpen.value = false
   }
 }
 
@@ -390,12 +416,47 @@ function toggleRunMode() {
   if (runModeOpen.value) {
     settingsOpen.value = false
     modelRoutingOpen.value = false
+    moreActionsOpen.value = false
   }
 }
 
 watch(() => props.runModeLocked, (locked) => {
   if (locked) runModeOpen.value = false
 })
+
+function toggleMoreActions() {
+  if (settingsOpen.value) {
+    settingsOpen.value = false
+    moreActionsOpen.value = true
+  } else {
+    moreActionsOpen.value = !moreActionsOpen.value
+  }
+  if (moreActionsOpen.value) {
+    modelRoutingOpen.value = false
+    runModeOpen.value = false
+  }
+}
+
+function openSettings() {
+  moreActionsOpen.value = false
+  settingsOpen.value = true
+  modelRoutingOpen.value = false
+  runModeOpen.value = false
+}
+
+function triggerVoice() {
+  moreActionsOpen.value = false
+  if (props.voiceReady) {
+    emit('voiceInput')
+  } else {
+    emit('voiceSetup')
+  }
+}
+
+function exportConversation() {
+  moreActionsOpen.value = false
+  emit('exportMarkdown')
+}
 
 function attachmentIcon(att: Attachment): IconName {
   return isImageDisplayAttachment(att) ? 'image' : 'fileText'
@@ -711,6 +772,51 @@ defineExpose<ChatComposerExpose>({
 .chat-settings-anchor {
   position: relative;
   display: inline-flex;
+}
+
+.chat-more-actions-menu {
+  position: absolute;
+  z-index: 20;
+  bottom: calc(100% + 0.5rem);
+  left: 0;
+  width: max-content;
+  min-width: 210px;
+  padding: 0.375rem;
+  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--bg-surface) 96%, transparent);
+  box-shadow: var(--shadow-lg);
+  backdrop-filter: blur(16px);
+}
+
+.chat-more-actions-menu button {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 36px;
+  gap: 0.625rem;
+  padding: 0.5rem 0.625rem;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--fs-sm);
+  text-align: left;
+  cursor: pointer;
+}
+
+.chat-more-actions-menu button:hover,
+.chat-more-actions-menu button:focus-visible,
+.chat-more-actions-menu button.is-active {
+  outline: 0;
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.chat-more-actions-menu button:disabled {
+  cursor: default;
+  opacity: var(--state-disabled-opacity);
 }
 
 .chat-input-actions--right {

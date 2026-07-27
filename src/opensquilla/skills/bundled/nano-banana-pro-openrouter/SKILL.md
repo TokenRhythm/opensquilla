@@ -1,6 +1,7 @@
 ---
 name: nano-banana-pro-openrouter
 description: "Deterministic OpenRouter image generation adapter for Nano Banana Pro / Gemini image models. Use as skill_exec when a meta-skill needs local image files and structured IMAGE_READY records without spawning an LLM agent."
+description_zh: "针对Nano Banana Pro / Gemini图像模型的确定性OpenRouter图像生成适配器。当元技能需要本地图片文件和结构化的IMAGE_READY记录且不想启动LLM代理时，作为skill_exec使用。"
 user-invocable: false
 disable-model-invocation: true
 homepage: https://clawhub.ai/skills/nano-banana-pro-openrouter

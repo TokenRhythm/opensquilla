@@ -1,6 +1,7 @@
 ---
 name: docx
 description: "Read, edit, or create Microsoft Word `.docx` files. Trigger this skill whenever the user mentions a Word document, .docx file, contract, report, brief, memo, or asks to extract text, modify an existing doc, generate one from a brief, or audit tracked changes. Three execution paths: text-and-structure extraction, in-place edit-by-run (preserves styles), and create-from-scratch with python-docx. Falls back to OOXML unzip-and-patch for layout work python-docx cannot reach."
+description_zh: "读取、编辑或创建Microsoft Word .docx 文件。当用户提到Word文档、.docx文件、合同、报告、简报、备忘录，或要求提取文本、修改现有文档、根据简报生成文档或审查修订记录时触发。支持三种执行路径：文本与结构提取、按run就地编辑（保留样式）、用python-docx从零创建；处理python-docx无法完成的排版时回退到OOXML解压补丁。"
 homepage: https://python-docx.readthedocs.io/
 provenance:
   origin: clawhub-mit0

@@ -1,6 +1,7 @@
 ---
 name: skill-creator-smoke-test
 description: "Internal tool (not user-invocable). Called by meta-skill-creator as a DAG step (kind: agent) to run G3 (positive smoke) and G4 (negative smoke) gates against a candidate meta-skill SKILL.md. Cross-vendor: fixture-generation LLM != classifier LLM. Returns JSON."
+description_zh: "内部工具（不可由用户直接调用）。由meta-skill-creator作为DAG步骤（kind: agent）调用，针对候选元技能SKILL.md运行G3（正向冒烟）和G4（负向冒烟）闸门。跨厂商：fixture生成LLM≠分类器LLM。返回JSON。"
 user-invocable: false
 disable-model-invocation: true
 provenance:

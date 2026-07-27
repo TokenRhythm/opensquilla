@@ -120,8 +120,8 @@
     "dismiss": "Ignorer"
   },
   "nav": {
-    "chat": "Chat",
-    "chat-new": "Nouveau chat",
+    "chat": "Tâche",
+    "chat-new": "Nouvelle tâche",
     "sessions": "Sessions",
     "agents": "Agents",
     "channels": "Canaux",
@@ -131,6 +131,7 @@
     "overview": "Vue d'ensemble",
     "status": "État",
     "usage": "Utilisation",
+    "viewUsage": "Voir l’utilisation",
     "logs": "Journaux",
     "settings": "Paramètres",
     "groupBuild": "Construire",
@@ -149,6 +150,9 @@
     "theme": "Thème",
     "language": "Langue",
     "newChat": "Nouvelle tâche",
+    "newTask": "Nouvelle tâche",
+    "newTaskTitle": "Démarrer une nouvelle tâche",
+    "searchChats": "Rechercher des tâches",
     "more": "Plus",
     "moreDestinations": "Plus de destinations",
     "expandSidebar": "Déplier la barre latérale",
@@ -285,7 +289,7 @@
       "applyLiveNote": "La plupart des changements s'appliquent à chaud ; certains nécessitent un redémarrage de la passerelle",
       "discardTitle": "Abandonner les modifications non enregistrées ?",
       "discardBody": "Vous avez des modifications non enregistrées. Fermer maintenant les perdra.",
-      "discardPrimary": "Abandonner"
+      "discardConfirmPrimary": "Abandonner les modifications"
     },
     "rail": {
       "connection": "Connexion",
@@ -385,10 +389,10 @@
     "provider": {
       "title": "Fournisseur",
       "pageTitle": "Service de modèles",
-      "pageDesc": "Connectez des fournisseurs de modèles et gérez les identifiants, les points de terminaison et le modèle direct/de secours. Choisissez comment les modèles sont utilisés dans Routage des modèles.",
+      "pageDesc": "Connectez des fournisseurs et gérez leurs identifiants et modèles.",
       "configuredTitle": "Fournisseurs configurés",
       "configuredCount": "{count}",
-      "configuredSummary": "{ready} identifiants prêts sur {count}. La vérification envoie une petite requête et peut entraîner des frais.",
+      "configuredSummary": "{ready} sur {count} prêts. Le test envoie une petite requête.",
       "configuredDesc": "Les fournisseurs enregistrés restent disponibles pour le routage jusqu’à leur suppression. La vérification de la configuration envoie une petite requête au modèle avec les réglages enregistrés ; des frais du fournisseur peuvent s’appliquer.",
       "activeBadge": "Actif",
       "editingBadge": "En cours d’édition",
@@ -405,6 +409,10 @@
       "allProviders": "Tous les fournisseurs",
       "providerResultCount": "{count} disponibles",
       "recommendedBadge": "Recommandé",
+      "recommendedProviders": "Recommandés",
+      "otherProviders": "Autres fournisseurs",
+      "limitedFreeBadge": "Accès gratuit limité",
+      "alreadyConfigured": "Déjà ajouté",
       "browseAllProviders": "Parcourir tous les fournisseurs ({count})",
       "providerResults": "Résultats des fournisseurs",
       "viewAllProviders": "Tout afficher ({count})",
@@ -479,7 +487,8 @@
       "modelPlaceholder": "Saisir un identifiant de modèle",
       "activating": "Activation…",
       "modelDiscoveryFailed": "Impossible de découvrir les modèles. Saisissez un identifiant manuellement.",
-      "upgradeGatewayHint": "Mettez à jour et redémarrez la passerelle pour activer les fournisseurs.",
+      "upgradeGatewayHint": "Mettez à jour et redémarrez la passerelle pour gérer les fournisseurs.",
+      "profileSaveUnsupported": "Cette passerelle enregistre un fournisseur actif. Après vérification, « Enregistrer les modifications » remplace le fournisseur actuel.",
       "connectedLatency": "Configuration vérifiée · Vérification complète {latency} ms",
       "connectionKeyRejected": "Clé refusée",
       "connectionUnavailable": "Connexion indisponible",
@@ -498,7 +507,10 @@
       "profileModelHint": "Le modèle enregistré devient le modèle direct/de repli si ce fournisseur est activé. Les modèles routés restent séparés.",
       "removeConfirmTitle": "Supprimer le fournisseur ?",
       "removeConfirmBody": "Supprimer {provider} des fournisseurs configurés ? Un fournisseur utilisé ne peut pas être supprimé.",
+      "removeActiveConfirmBody": "Supprimer {provider} et définir {replacement} comme fournisseur actif ? Un fournisseur utilisé ne peut pas être supprimé.",
       "removeConfirmPrimary": "Supprimer le fournisseur",
+      "saveChanges": "Enregistrer les modifications",
+      "verifyAndConnect": "Vérifier et se connecter",
       "needs": "Le fournisseur a besoin de",
       "choose": "Choisir un fournisseur",
       "chooseProviderShort": "choisir un fournisseur",
@@ -510,7 +522,6 @@
       "recommendation": {
         "title": "Recommandé : TokenRhythm",
         "value": "Les appels à l’API TokenRhythm sont gratuits pendant une durée limitée.",
-        "registration": "Pendant l’offre, inscrivez-vous et obtenez une clé API pour appeler gratuitement DeepSeek, GLM, MiniMax, Kimi et d’autres modèles majeurs.",
         "cta": "S’inscrire et obtenir une clé API",
         "externalLabel": "S’inscrire et obtenir une clé API — TokenRhythm (s’ouvre dans un nouvel onglet)",
         "stepsLabel": "Comment connecter TokenRhythm",
@@ -657,42 +668,40 @@
     },
     "modelStrategy": {
       "title": "Routage des modèles",
-      "desc": "Choisissez comment Squilla sélectionne et utilise les modèles configurés pour les nouvelles requêtes.",
+      "desc": "Choisissez comment le modèle est sélectionné pour chaque requête.",
       "modeTitle": "Choisir l’utilisation des modèles",
-      "modeDesc": "Choisissez selon l’objectif : le routage intelligent équilibre l’usage des tokens et les capacités ; un modèle fixe garde une sélection prévisible ; la collaboration multimodèle privilégie les capacités pour les tâches complexes et utilise généralement plus de tokens.",
       "providerFirstTitle": "Ajouter d’abord un service de modèles",
-      "providerFirst": "Le routage des modèles nécessite au moins un fournisseur enregistré. Un seul fournisseur suffit pour router entre ses modèles configurés.",
+      "providerFirst": "Le routage de modèles nécessite au moins un fournisseur enregistré.",
       "providerAction": "Accéder au service de modèles",
-      "configuredProvidersOnly": "Les fournisseurs et modèles disponibles proviennent du service de modèles.",
+      "configuredProvidersOnly": "Les modèles proviennent du Service de modèles.",
       "manageProviders": "Gérer le service de modèles",
       "routerTitle": "Routage intelligent des modèles",
       "fallbackTierLabel": "Quand le routage est incertain",
-      "fallbackTierDesc": "Utilisez ce niveau par défaut lorsque le routage ne peut pas déterminer avec certitude le niveau de la requête.",
+      "fallbackTierDesc": "Utilisé quand le routage ne peut pas déterminer le niveau.",
       "modelRolesTitle": "Rôles des modèles",
-      "modelRolesDesc": "Définissez le modèle chargé de chaque niveau de complexité des requêtes.",
-      "advancedTitle": "Options d’affichage",
-      "advancedDesc": "Modifiez l’affichage des informations de routage dans le chat sans affecter la sélection des modèles.",
+      "advancedTitle": "Options avancées",
+      "advancedDesc": "Niveau de repli et affichage du routage dans le chat.",
       "visualModeLabel": "Style du panneau de décision de routage",
-      "visualModeDesc": "Choisissez l’apparence du panneau de décision de routage dans les réponses du chat. Cela ne modifie pas le comportement du routage.",
+      "visualModeDesc": "Affichage de la décision de routage dans les réponses.",
       "crossProviderNotice": "Le routage inter-fournisseurs est actif. Vérifie chaque niveau avant d’enregistrer.",
       "cards": {
         "router": {
           "title": "Routage intelligent des modèles",
           "badge": "Économe en tokens",
-          "desc": "Associe chaque requête à un modèle adapté afin d’éviter d’utiliser inutilement les modèles les plus puissants pour les tâches simples."
+          "desc": "Chaque requête va au modèle adapté ; les tâches simples restent économes."
         },
         "ensemble": {
           "title": "Collaboration multimodèle",
           "badge": "Capacités prioritaires",
-          "desc": "Exécute plusieurs modèles en parallèle et combine leurs résultats pour les tâches complexes ; cela utilise généralement plus de tokens."
+          "desc": "Plusieurs modèles collaborent sur les tâches complexes. Consomme plus de tokens."
         },
         "single": {
           "title": "Modèle fixe",
           "badge": "Prévisible",
-          "desc": "Utilise toujours le modèle choisi, ce qui rend la sélection et l’usage plus faciles à prévoir."
+          "desc": "Un seul modèle pour tout. Prévisible et simple."
         }
       },
-      "routerDependency": "Choisissez les modèles pour chaque niveau de requête. Un fournisseur peut couvrir tous les niveaux.",
+      "routerDependency": "Choisissez un modèle par niveau de requête. Un seul fournisseur peut tous les couvrir.",
       "ensembleTitle": "Collaboration multimodèle",
       "ensembleDependency": "Utilise les identifiants {provider} ; le modèle par défaut du fournisseur est {model}.",
       "ensembleMinimum": "Ajoutez au moins un autre candidat pour bénéficier du routage agrégé.",
@@ -720,7 +729,7 @@
       "removeCandidateAria": "Retirer {model}",
       "ensembleEmpty": "Aucun modèle candidat pour le moment. Enregistrez les paramètres du service de modèles pour générer les niveaux de routage, ou ajoutez des candidats manuellement.",
       "ensemblePipeline": "Fonctionnement : les modèles proposants rédigent en parallèle, puis l'agrégateur fusionne les brouillons en réponse finale. Seul l'agrégateur peut appeler des outils.",
-      "ensembleFlowDesc": "Plusieurs modèles rédigent en parallèle, puis un agrégateur combine leur travail en une réponse finale. Cela utilise plus d’appels de modèles et peut coûter plus cher.",
+      "ensembleFlowDesc": "Plusieurs modèles rédigent en parallèle ; un agrégateur les fusionne en une réponse. Plus d'appels.",
       "legacyDynamicNotice": "Cette configuration utilise l'ancien mode d'ensemble automatique retiré. Convertissez-la en composition personnalisée pour continuer à l'éditer.",
       "legacyDynamicMigrate": "Convertir en composition personnalisée",
       "schemeLabel": "Schéma d'ensemble",
@@ -1190,6 +1199,7 @@
       "providerSaved": "Fournisseur enregistré.",
       "providerSavedRestart": "Fournisseur enregistré. Redémarrage requis.",
       "providerProfileSaved": "{provider} a été enregistré pour le routage.",
+      "providerActiveRemoveNeedsReplacement": "Ajoutez et vérifiez un autre fournisseur avant de supprimer le fournisseur actif.",
       "providerProfileRemoved": "{provider} a été supprimé.",
       "providerCredentialRemoved": "Les identifiants de {provider} ont été supprimés.",
       "providerCredentialExternalStillActive": "La référence aux identifiants de {provider} enregistrée dans OpenSquilla a été supprimée, mais la variable d’environnement système {envKey} fournit toujours des identifiants.",
@@ -1600,7 +1610,6 @@
     "overview": {
       "title": "État",
       "subtitle": "Préparation, utilisation et santé d'exécution.",
-      "openChat": "Ouvrir le chat",
       "totalTokens": "Total des jetons",
       "totalSessions": "Total des sessions",
       "totalSessionsTitle": "Total des sessions tous statuts confondus",
@@ -1626,6 +1635,7 @@
       "noFindings": "Aucun constat retourné.",
       "recoveryRestart": "La récupération nécessite un redémarrage",
       "openSettings": "Ouvrir les paramètres",
+      "findingDetails": "Détails",
       "findingFallback": "Constat {n}",
       "copyCommand": "Copier la commande",
       "step": "Étape",
@@ -1644,11 +1654,6 @@
         "actionRequired": "Action requise",
         "degraded": "Dégradé",
         "unavailable": "Indisponible"
-      },
-      "steps": {
-        "optional": "Étapes de configuration facultatives",
-        "reference": "Étapes de référence",
-        "recovery": "Étapes de récupération"
       },
       "badge": {
         "diagnostic": "Diagnostics incomplets",
@@ -2034,7 +2039,33 @@
       "next12h": "12 prochaines heures",
       "upcomingRun": "exécution à venir",
       "nowTick": "maintenant",
-      "deleteFailed": "Échec de la suppression : {error}"
+      "deleteFailed": "Échec de la suppression : {error}",
+      "bulkManage": "Gestion groupée",
+      "exitBulk": "Quitter le mode groupé",
+      "overview": "Aperçu des exécutions",
+      "addFromTemplate": "Ajouter depuis un modèle",
+      "addAutomation": "Ajouter une automatisation",
+      "heroTitle": "Lancez votre première automatisation",
+      "heroHint": "Laissez OpenSquilla gérer automatiquement les rappels, l’organisation, les contrôles et les tâches d’agent à l’heure prévue.",
+      "overviewDesc": "Consultez l’état des automatisations et les exécutions récentes.",
+      "templateDesc": "Choisissez un scénario pour préremplir l’horaire et les instructions.",
+      "selectedCount": "{count} sélectionné(s)",
+      "selectVisible": "Tout sélectionner",
+      "clearSelection": "Effacer",
+      "overviewEyebrow": "APERÇU DES AUTOMATISATIONS",
+      "galleryEyebrow": "MODÈLES D’AUTOMATISATION",
+      "bulkDeleteConfirm": "Supprimer les {count} automatisations sélectionnées ? Cette action est irréversible.",
+      "templates": {
+        "ai-daily": { "title": "Brief quotidien sur l’IA", "description": "Résume les actualités IA importantes des dernières 24 heures avec des sources vérifiées.", "category": "Actualités", "schedule": "Chaque jour à 08:00" },
+        "weekly-report": { "title": "Bilan de travail hebdomadaire", "description": "Résume les progrès, risques, livrables et priorités de la semaine suivante.", "category": "Productivité", "schedule": "Vendredi à 17:30" },
+        "english-five": { "title": "Cinq mots anglais par jour", "description": "Crée une leçon de vocabulaire légère avec exemples et petit quiz.", "category": "Apprentissage", "schedule": "Chaque jour à 09:00" },
+        "project-risk": { "title": "Contrôle des risques projet", "description": "Examine les retards, erreurs et problèmes ouverts, puis propose des actions.", "category": "Projets", "schedule": "En semaine à 10:00" },
+        "knowledge-review": { "title": "Revue hebdomadaire des connaissances", "description": "Organise les nouvelles notes et réunions et prépare une liste de suivi.", "category": "Connaissances", "schedule": "Dimanche à 18:00" },
+        "daily-idea": { "title": "Idée et anecdote du jour", "description": "Partage un fait fiable et une petite idée concrète.", "category": "Mode de vie", "schedule": "Chaque jour à 12:00" },
+        "bedtime-story": { "title": "Histoire du soir quotidienne", "description": "Écrit une histoire courte, chaleureuse et imaginative à lire en famille.", "category": "Famille", "schedule": "Chaque jour à 20:30" },
+        "classic-movie": { "title": "Recommandation de film classique", "description": "Recommande un grand classique avec une introduction sans divulgâcher.", "category": "Divertissement", "schedule": "Samedi à 19:00" },
+        "today-in-history": { "title": "Aujourd’hui dans l’histoire", "description": "Présente un événement historique fiable lié aux sciences, à la culture ou à la société.", "category": "Culture quotidienne", "schedule": "Chaque jour à 08:30" }
+      }
     },
     "deleteDialog": {
       "title": "Supprimer la planification",
@@ -2077,7 +2108,8 @@
       "colSchedule": "Planification",
       "colStatus": "État",
       "colLastRun": "Dernière exécution",
-      "colNextRun": "Prochaine exécution"
+      "colNextRun": "Prochaine exécution",
+      "selectJob": "Sélectionner {name}"
     },
     "runHistory": {
       "eyebrow": "Historique des exécutions",
@@ -2148,6 +2180,32 @@
       "fdWebhook": "Un webhook",
       "enabled": "Activé",
       "saveSchedule": "Enregistrer la planification"
+      ,"friendlyNamePlaceholder": "Exemple : Organiser les retours clients chaque jour"
+      ,"friendlyTypeCron": "Répéter à une heure définie"
+      ,"friendlyTypeEvery": "Répéter à intervalle fixe"
+      ,"friendlyTypeAt": "Exécuter une seule fois"
+      ,"executionFrequency": "Fréquence"
+      ,"daily": "Chaque jour"
+      ,"weekdays": "Jours ouvrés"
+      ,"weekly": "Chaque semaine"
+      ,"monthly": "Chaque mois"
+      ,"customAdvancedTime": "Planification avancée"
+      ,"weekday": "Jour de la semaine"
+      ,"date": "Date"
+      ,"monthlyDay": "Le {day} de chaque mois"
+      ,"specificTime": "Heure"
+      ,"customTimeHint": "Utilisez une règle horaire plus flexible."
+      ,"openAdvancedTime": "Ouvrir la planification avancée"
+      ,"everyHowOften": "Répéter toutes les"
+      ,"timeUnit": "Unité de temps"
+      ,"minutes": "Minutes"
+      ,"hours": "Heures"
+      ,"days": "Jours"
+      ,"dateAndTime": "Date et heure"
+      ,"friendlyMessagePlaceholder": "Exemple : Résumer les retours clients du jour et proposer les prochaines étapes"
+      ,"moreRuntimeSettings": "Autres paramètres d’exécution (facultatif)"
+      ,"advancedTimeHint": "À utiliser uniquement si le sélecteur ci-dessus ne suffit pas."
+      ,"timezoneSimpleHint": "Il n’est généralement pas nécessaire de modifier ce réglage."
     },
     "form": {
       "cronPreviewPlaceholder": "Saisissez une expression cron à 5 champs pour la prévisualiser",
@@ -2273,6 +2331,8 @@
       "reloadNoChanges": "Le catalogue de compétences est déjà à jour (génération {generation}).",
       "reloadPartial": "Le catalogue de compétences a été rechargé à la génération {generation} avec {errors} erreur(s). {summary}",
       "reloadFailed": "Échec du rechargement du catalogue de compétences : {error}",
+      "overviewTitle": "Aperçu des compétences",
+      "overviewDesc": "Consultez l’état de l’installation et de la configuration, puis filtrez par catégorie.",
       "reloadListFailed": "Le catalogue a été rechargé, mais la liste actualisée des compétences n’a pas pu être chargée.",
       "reloadUnknownError": "La Gateway a conservé le catalogue précédent.",
       "tabsLabel": "Source des compétences",
@@ -2350,6 +2410,10 @@
       "unknown": "inconnu",
       "noAudit": "Aucune décision d'activation automatique enregistrée.",
       "gates": "Barrières"
+    },
+    "tile": {
+      "installed": "Installé",
+      "add": "Ajouter"
     },
     "skillCard": {
       "subSkillsTitle": "Sous-compétences utilisées par cette méta-compétence",
@@ -2492,9 +2556,13 @@
     "bundleReady": "Paquet d’assistance téléchargé"
   },
   "usageLogs": {
+    "tasks": {
+      "unnamed": "Tâche sans titre"
+    },
     "usage": {
       "title": "Utilisation",
-      "subtitle": "Jetons, coût et dépense par modèle sur l'ensemble des sessions.",
+      "subtitle": "Jetons, coût et utilisation des modèles par tâche.",
+      "actions": "Actions d’utilisation",
       "currency": "Devise",
       "usDollar": "Dollar américain",
       "chineseYuan": "Yuan chinois",
@@ -2506,9 +2574,9 @@
     "summary": {
       "totalTokens": "Total des jetons",
       "totalCost": "Coût total",
-      "sessions": "Sessions",
+      "sessions": "Tâches",
       "acrossAllModels": "sur tous les modèles",
-      "avgCostPerSession": "Coût moyen / session",
+      "avgCostPerSession": "Coût moyen / tâche",
       "runningAverage": "moyenne glissante"
     },
     "tokenParts": {
@@ -2521,10 +2589,10 @@
     "nativeCostHintTitle": "La facture d’origine du fournisseur est en CNY ; la valeur USD utilise le taux fixe enregistré sur le reçu.",
     "nativeMixedCostHintTitle": "La facturation multidevise ou en attente reste en USD canonique ; les reçus d’origine confirmés sont affichés séparément.",
     "nativeBillingSubtotals": "Reçus d’origine : {amounts}",
-    "rangeHiddenHint": "{count} sessions héritées sans date masquées",
+    "rangeHiddenHint": "{count} tâches historiques sans date masquées",
     "coverage": {
-      "approximate": "Ancienne Gateway : les plages de dates sont estimées à partir des totaux de session.",
-      "partial": "La migration du registre d’usage continue ; tout l’usage connu est affiché.",
+      "approximate": "Une partie de l’usage historique est estimée à partir des totaux par tâche.",
+      "partial": "Tout l’usage actuellement enregistré est affiché.",
       "timezoneFallback": "Le fuseau {requested} est invalide ; les dates sont regroupées selon {effective}.",
       "legacyIncluded": "L’usage antérieur au registre est inclus dans le total, sans pouvoir être attribué à une date.",
       "estimated": "Inclut {count} appels estimés.",
@@ -2542,10 +2610,10 @@
       "input": "Entrée",
       "output": "Sortie",
       "emptyWindow": "Aucune donnée dans la fenêtre sélectionnée.",
-      "openSession": "Ouvrir {session}",
+      "openTask": "Ouvrir la tâche « {task} »",
       "daily": "Utilisation quotidienne",
-      "topByCost": "Principales sessions par coût",
-      "topByTokens": "Principales sessions par total de jetons",
+      "topByCost": "Principales tâches par coût",
+      "topByTokens": "Principales tâches par total de jetons",
       "showingOf": "affichage de {shown} sur {total}"
     },
     "models": {
@@ -2560,19 +2628,19 @@
       "output": "Sortie",
       "cacheRead": "Lecture cache",
       "cacheWrite": "Écriture cache",
-      "sessions": "Sessions",
+      "sessions": "Tâches",
       "cost": "Coût"
     },
     "sessions": {
-      "title": "Sessions",
-      "count": "{count} sessions",
+      "title": "Par tâche",
+      "count": "{count} tâches",
       "emptyTitle": "Aucune donnée d'utilisation pour l'instant",
-      "emptyText": "Exécutez une session et la dépense de jetons apparaîtra ici automatiquement.",
-      "openChat": "Ouvrir le chat pour {session}",
+      "emptyText": "Exécutez une tâche et son utilisation de jetons apparaîtra ici automatiquement.",
+      "openChat": "Ouvrir la tâche « {task} »",
       "autoModels": "auto · {count} modèles"
     },
     "columns": {
-      "session": "Session",
+      "session": "Tâche",
       "modified": "Modifié",
       "input": "Entrée",
       "output": "Sortie",
@@ -2715,6 +2783,14 @@
     "historyTurnLoadedCount": "Message chargé {number} sur {total}",
     "historyAttachmentOnly": "Message contenant uniquement des pièces jointes",
     "historyAttachmentCount": "Pièces jointes : {count}",
+    "loadingSession": "Chargement de la conversation…",
+    "loadingSessionDescription": "Restauration des messages récents et de l’état de la session…",
+    "loadSessionFailed": "Conversation temporairement indisponible",
+    "loadSessionDescription": "La connexion a peut-être été interrompue ou le service d’historique est temporairement indisponible. Rechargez pour réessayer.",
+    "reloadSession": "Recharger",
+    "retryingSession": "Rechargement de la conversation",
+    "retryingSessionDescription": "Restauration de l’historique de la conversation…",
+    "retryingSessionAction": "Rechargement…",
     "noMessagesYet": "Aucun message pour l'instant.",
     "newChat": "Nouvelle tâche",
     "chatWithSuffix": "Chat {suffix}",
@@ -3055,6 +3131,21 @@
       "searchAiNews": "Recherche les actualités IA du jour",
       "generateImage": "Génère une image d'une petite mascotte calmar"
     },
+    "metaQuick": {
+      "webpage": "Créer une page web multimédia",
+      "shortDrama": "Créer un court-métrage IA",
+      "paperWriting": "Rédiger un article scientifique",
+      "webpageDesc": "Créer un site soigné et prêt à l’emploi",
+      "shortDramaDesc": "Créer le script, les plans et la vidéo finale",
+      "paperWritingDesc": "Rechercher, rédiger et compiler un article"
+    },
+    "metaDescriptions": {
+      "webpage": "Créer un site multimédia complet à partir d’un sujet.",
+      "kidsProject": "Planifier un projet créatif sûr et adapté aux enfants.",
+      "shortDrama": "Créer un court-métrage IA, du scénario à la vidéo finale.",
+      "skillCreator": "Combiner des compétences dans un workflow réutilisable.",
+      "paperWriting": "Rechercher, rédiger et compiler un article scientifique."
+    },
     "toast": {
       "downloadFailedHttp": "Échec du téléchargement — HTTP {status}",
       "downloadFailed": "Échec du téléchargement",
@@ -3133,15 +3224,17 @@
     "cmdp": {
       "dialogLabel": "Rechercher et aller à",
       "resultsLabel": "Résultats",
-      "placeholder": "Rechercher des pages, des actions et des conversations…",
+      "placeholder": "Rechercher des tâches",
+      "groupRecents": "Tâches récentes",
+      "recentsEmpty": "Aucune tâche pour l'instant",
       "noMatches": "Aucune correspondance",
-      "searching": "Recherche dans les conversations…",
-      "untitledChat": "Chat sans titre",
+      "searching": "Recherche de tâches…",
+      "untitledChat": "Tâche sans titre",
       "groupWork": "Travail",
       "groupManage": "Gérer",
       "groupMonitor": "Vue d'ensemble",
       "groupActions": "Actions",
-      "groupConversations": "Conversations",
+      "groupConversations": "Tâches",
       "groupMessages": "Messages",
       "actionNewChat": "Nouvelle tâche",
       "actionOpenSettings": "Ouvrir les Paramètres",
@@ -3160,14 +3253,14 @@
     },
     "sidebar": {
       "recentConversations": "Tâches récentes",
-      "recents": "Tâches",
-      "refresh": "Actualiser les tâches",
+      "recents": "Récentes",
+      "refresh": "Recharger les tâches",
       "clearAgentFilter": "Effacer le filtre d'agent : {name}",
-      "loadError": "Impossible de charger les sessions",
+      "loadError": "Impossible de charger les tâches",
       "noMatches": "Aucune correspondance",
       "noConversations": "Aucune tâche pour l'instant.",
       "startChat": "Démarrer une tâche",
-      "linkSessions": "Tâches",
+      "linkSessions": "Sessions",
       "currentTask": "Tâche actuelle",
       "untitledTask": "Tâche sans titre",
       "linkOverview": "Vue d'ensemble",

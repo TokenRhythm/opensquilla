@@ -221,11 +221,15 @@ describe('useSetupEnsembleForm — scheme switching', () => {
     expect(f.isDirty.value).toBe(false)
   })
 
-  it('activateForProvider lands on the preset for preset providers', () => {
+  it('activateForProvider seeds preset providers into the custom editing path', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig({})
     f.activateForProvider('tokenrhythm')
-    expect(f.selectionMode.value).toBe('static_tokenrhythm_b5')
+    expect(f.selectionMode.value).toBe(CUSTOM_B5_SELECTION_MODE)
+    expect(f.candidates.value.filter(c => c.role !== 'aggregator').map(c => c.model))
+      .toEqual([...TOKENRHYTHM_FIXED_ENSEMBLE_PROPOSERS])
+    expect(f.candidates.value.find(c => c.role === 'aggregator')?.model)
+      .toBe(TOKENRHYTHM_FIXED_ENSEMBLE_AGGREGATOR)
   })
 
   it('activateForProvider gives other providers an explicit custom lineup seeded from tiers', () => {

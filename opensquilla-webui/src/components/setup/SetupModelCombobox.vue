@@ -17,6 +17,7 @@ interface FieldSpec {
   required?: boolean
   placeholder?: string
   description?: string
+  descriptionPresentation?: 'inline' | 'info'
   [key: string]: unknown
 }
 
@@ -64,6 +65,7 @@ const typedSinceOpen = ref(false)
 const fieldId = computed(() => `setup-provider-${String(props.field.name || 'model')}`)
 const fieldName = computed(() => `setup_provider_${String(props.field.name || 'model')}`)
 const fieldDescriptionId = computed(() => `${fieldId.value}-description`)
+const fieldTooltipId = computed(() => `${fieldId.value}-info-tooltip`)
 
 const query = computed(() => String(props.value || '').trim().toLowerCase())
 const catalogAvailable = computed(() => (
@@ -294,11 +296,35 @@ function onKeydown(event: KeyboardEvent) {
 <template>
   <div :class="cell ? 'setup-model-combobox--cellwrap' : 'control-row control-row--stack'" :data-name="cell ? undefined : field.name" :data-scope="cell ? undefined : 'provider'">
     <div v-if="!cell" class="control-row__label-block">
-      <label class="control-row__label" :for="fieldId">{{ field.label }}{{ field.required ? ' *' : '' }}</label>
+      <label
+        class="control-row__label"
+        :class="{ 'setup-model-combobox__label--with-info': field.description && field.descriptionPresentation === 'info' }"
+        :for="fieldId"
+      >
+        {{ field.label }}{{ field.required ? ' *' : '' }}
+        <span
+          v-if="field.description && field.descriptionPresentation === 'info'"
+          class="setup-model-combobox__info"
+          :aria-label="field.description"
+          :aria-describedby="fieldTooltipId"
+          tabindex="0"
+        >
+          <Icon name="info" :size="14" aria-hidden="true" />
+          <span
+            :id="fieldTooltipId"
+            class="setup-model-combobox__info-tooltip"
+            role="tooltip"
+          >
+            {{ field.description }}
+          </span>
+        </span>
+      </label>
       <span
         v-if="field.description"
         :id="fieldDescriptionId"
-        class="control-row__desc"
+        :class="field.descriptionPresentation === 'info'
+          ? 'setup-model-combobox__sr-only'
+          : 'control-row__desc'"
       >{{ field.description }}</span>
     </div>
     <div
@@ -450,6 +476,69 @@ function onKeydown(event: KeyboardEvent) {
   padding-right: 36px;
 }
 
+.setup-model-combobox__label--with-info {
+  align-items: center;
+  display: inline-flex;
+  gap: 5px;
+}
+
+.setup-model-combobox__info {
+  align-items: center;
+  color: var(--text-dim);
+  display: inline-flex;
+  justify-content: center;
+  position: relative;
+}
+
+.setup-model-combobox__info:hover {
+  color: var(--text);
+}
+
+.setup-model-combobox__info-tooltip {
+  background: var(--text);
+  border-radius: var(--radius-sm);
+  bottom: calc(100% + 9px);
+  box-shadow: var(--shadow-md);
+  color: var(--bg-elevated);
+  font-size: var(--fs-xs);
+  font-weight: 400;
+  left: 50%;
+  line-height: 1.45;
+  max-width: min(300px, 70vw);
+  opacity: 0;
+  padding: 7px 9px;
+  pointer-events: none;
+  position: absolute;
+  text-align: left;
+  transform: translateX(-50%);
+  visibility: hidden;
+  white-space: normal;
+  width: max-content;
+  z-index: 40;
+}
+
+.setup-model-combobox__info-tooltip::after {
+  border: 5px solid transparent;
+  border-top-color: var(--text);
+  content: '';
+  left: 50%;
+  position: absolute;
+  top: 100%;
+  transform: translateX(-50%);
+}
+
+.setup-model-combobox__info:hover .setup-model-combobox__info-tooltip,
+.setup-model-combobox__info:focus-visible .setup-model-combobox__info-tooltip {
+  opacity: 1;
+  visibility: visible;
+}
+
+.setup-model-combobox__info:focus-visible {
+  border-radius: var(--radius-full);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .setup-model-combobox__trigger {
   align-items: center;
   background: transparent;
@@ -504,10 +593,11 @@ function onKeydown(event: KeyboardEvent) {
   flex-direction: column;
   overflow: hidden;
   /* Teleported to <body>; left/top/bottom/width/max-height come from the
-     inline style computed off the input's viewport rect. Sits above the
-     settings dialog (z-index 300). */
+     inline style computed off the input's viewport rect. Keep this above both
+     the settings dialog (300) and its nested provider modal overlay (420), so
+     the list remains interactive and is never visually clipped by the modal. */
   position: fixed;
-  z-index: 400;
+  z-index: 440;
 }
 
 .setup-model-combobox__list {

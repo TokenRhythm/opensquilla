@@ -3199,6 +3199,7 @@ class _CustomB5Candidate:
     provider: str
     model: str
     role: str
+    thinking: str | None = None
 
 
 def _custom_b5_candidates(config: Any) -> list[_CustomB5Candidate]:
@@ -3220,7 +3221,17 @@ def _custom_b5_candidates(config: Any) -> list[_CustomB5Candidate]:
             if identity in seen:
                 continue
             seen.add(identity)
-        rows.append(_CustomB5Candidate(provider=provider, model=model, role=role))
+        thinking_level = str(
+            getattr(entry, "thinking_level", "") or ""
+        ).strip() or None
+        rows.append(
+            _CustomB5Candidate(
+                provider=provider,
+                model=model,
+                role=role,
+                thinking=thinking_level,
+            )
+        )
     return rows
 
 
@@ -3246,7 +3257,7 @@ def _build_custom_b5_members(
         raise ValueError("llm_ensemble custom_b5 lineup has no enabled proposers")
     proposers = [
         _member_from_ref(
-            _DynamicModelRef(provider=row.provider, model=row.model, thinking=None),
+            _DynamicModelRef(provider=row.provider, model=row.model, thinking=row.thinking),
             config=config,
             inherited=inherited_provider_config,
             label=row.role or f"proposer_{index + 1}",
@@ -3269,7 +3280,7 @@ def _build_custom_b5_members(
         _DynamicModelRef(
             provider=aggregator_row.provider,
             model=aggregator_row.model,
-            thinking=None,
+            thinking=aggregator_row.thinking,
         ),
         config=config,
         inherited=inherited_provider_config,

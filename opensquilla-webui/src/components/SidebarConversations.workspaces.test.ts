@@ -61,6 +61,7 @@ function i18n() {
     locale: 'en',
     messages: {
       en: {
+        chrome: { searchChats: 'Search tasks' },
         sessions: { filter: { chats: 'Tasks' } },
         shared: {
           sidebar: {
@@ -113,6 +114,7 @@ async function mountSidebar(rows: SidebarSectionRow[]) {
     loading: false,
     currentKey: '',
     contractDebugEnabled: false,
+    searchHint: 'Ctrl+K',
     onSelect: events.select,
     onNewProjectTask: events.newProjectTask,
     onProjectPin: events.projectPin,
@@ -149,6 +151,10 @@ describe('SidebarConversations project workspaces', () => {
     expect(host.textContent).toContain('2 tasks')
 
     disclosure?.click()
+    await nextTick()
+    await new Promise<void>(resolve => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+    })
     await nextTick()
 
     expect(events.select).not.toHaveBeenCalled()

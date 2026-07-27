@@ -35,12 +35,13 @@
           </template>
           <template v-for="row in sortedRows" :key="rowKey(row.raw)">
             <tr>
-              <td data-label="Session">
+              <td :data-label="t('usageLogs.columns.session')">
                 <a
                   v-if="row.sessionKey"
                   href="#"
                   class="usage-sess-link"
-                  :title="t('usageLogs.sessions.openChat', { session: row.sessionKey })"
+                  :title="t('usageLogs.sessions.openChat', { task: row.sessionLabel })"
+                  :aria-label="t('usageLogs.sessions.openChat', { task: row.sessionLabel })"
                   @click.prevent="emit('openSession', row.sessionKey)"
                 >{{ row.sessionLabel }}</a>
                 <span v-else>{{ row.sessionLabel }}</span>

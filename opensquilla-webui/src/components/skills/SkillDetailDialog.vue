@@ -21,7 +21,7 @@
         </button>
       </header>
       <section class="sk-detail__body">
-        <p class="sk-detail__desc">{{ skill.description || '' }}</p>
+        <p class="sk-detail__desc">{{ localizedSkillDescription(skill, String(locale)) }}</p>
 
         <div v-if="isMetaSkill(skill) && skill.triggers && skill.triggers.length" class="sk-detail__section">
           <div class="sk-detail__section-title">{{ t('cronSkills.skillDetail.triggers') }}</div>
@@ -186,6 +186,7 @@ import type { Proposal, Skill } from '@/types/skills'
 import {
   isMetaSkill,
   installActionsForCurrentDependencies,
+  localizedSkillDescription,
   skillDependencyCounts,
   skillDependencySummary,
   skillLayerHelp,
@@ -194,7 +195,7 @@ import {
   skillStatusChipText,
 } from '@/composables/skills/useSkillsCatalog'
 
-const { t } = useI18n()
+const { t, locale } = useI18n()
 
 const props = defineProps<{
   skill: Skill | null

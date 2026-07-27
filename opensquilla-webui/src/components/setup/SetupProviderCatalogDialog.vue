@@ -9,6 +9,7 @@ const props = defineProps<{
   open: boolean
   providers: ProviderOption[]
   configuredIds: string[]
+  embedded?: boolean
 }>()
 const emit = defineEmits<{
   close: [restoreFocus?: boolean]
@@ -21,9 +22,15 @@ const query = ref('')
 const activeIndex = ref(0)
 const FEATURED = ['tokenrhythm', 'openrouter', 'deepseek', 'gemini']
 
+const configured = computed(() => new Set(
+  props.configuredIds.map(id => id.trim().toLowerCase()),
+))
+
 const available = computed(() => {
-  const configured = new Set(props.configuredIds.map(id => id.trim().toLowerCase()))
-  return props.providers.filter(provider => !configured.has(provider.providerId.trim().toLowerCase()))
+  return props.providers.filter(provider => {
+    const providerId = provider.providerId.trim().toLowerCase()
+    return providerId === 'tokenrhythm' || !configured.value.has(providerId)
+  })
 })
 
 function sortProviders(rows: ProviderOption[]): ProviderOption[] {
@@ -47,25 +54,48 @@ const filtered = computed(() => {
     : available.value)
 })
 
+const recommendedProviders = computed(() => filtered.value
+  .map((provider, index) => ({ provider, index }))
+  .filter(({ provider }) => provider.providerId.trim().toLowerCase() === 'tokenrhythm'))
+const otherProviders = computed(() => filtered.value
+  .map((provider, index) => ({ provider, index }))
+  .filter(({ provider }) => provider.providerId.trim().toLowerCase() !== 'tokenrhythm'))
+
 const activeId = computed(() => filtered.value[activeIndex.value]
   ? `setup-provider-catalog-option-${activeIndex.value}`
   : undefined)
 
 function close(restoreFocus = true) { emit('close', restoreFocus) }
-function choose(providerId: string) { emit('select', providerId) }
-function move(index: number) {
+function isConfigured(providerId: string) {
+  return configured.value.has(providerId.trim().toLowerCase())
+}
+function choose(providerId: string) {
+  if (isConfigured(providerId)) return
+  emit('select', providerId)
+}
+function move(index: number, direction = 1) {
   const length = filtered.value.length
-  activeIndex.value = length ? (index + length) % length : 0
+  if (!length) {
+    activeIndex.value = 0
+    return
+  }
+  let candidate = (index + length) % length
+  for (let visited = 0; visited < length; visited += 1) {
+    const provider = filtered.value[candidate]
+    if (provider && !isConfigured(provider.providerId)) break
+    candidate = (candidate + direction + length) % length
+  }
+  activeIndex.value = candidate
   void nextTick(() => document.getElementById(activeId.value || '')?.scrollIntoView({ block: 'nearest' }))
 }
 function onInputFocus() {
-  activeIndex.value = 0
+  move(0)
 }
 function onInputKeydown(event: KeyboardEvent) {
-  if (event.key === 'ArrowDown') { event.preventDefault(); move(activeIndex.value + 1) }
-  else if (event.key === 'ArrowUp') { event.preventDefault(); move(activeIndex.value - 1) }
+  if (event.key === 'ArrowDown') { event.preventDefault(); move(activeIndex.value + 1, 1) }
+  else if (event.key === 'ArrowUp') { event.preventDefault(); move(activeIndex.value - 1, -1) }
   else if (event.key === 'Home') { event.preventDefault(); move(0) }
-  else if (event.key === 'End') { event.preventDefault(); move(filtered.value.length - 1) }
+  else if (event.key === 'End') { event.preventDefault(); move(filtered.value.length - 1, -1) }
   else if (event.key === 'Enter' && filtered.value[activeIndex.value]) {
     event.preventDefault(); choose(filtered.value[activeIndex.value]!.providerId)
   }
@@ -78,23 +108,34 @@ function onPickerKeydown(event: KeyboardEvent) {
 }
 
 function onDocumentPointerDown(event: PointerEvent) {
-  if (!props.open || pickerRef.value?.contains(event.target as Node)) return
+  if (props.embedded || !props.open || pickerRef.value?.contains(event.target as Node)) return
   const target = event.target as HTMLElement | null
   if (target?.closest('[data-provider-picker-trigger]')) return
   close(false)
 }
 
-onMounted(() => document.addEventListener('pointerdown', onDocumentPointerDown))
+function focusPicker() {
+  query.value = ''
+  void nextTick(() => {
+    move(0)
+    inputRef.value?.focus()
+  })
+}
+
+onMounted(() => {
+  document.addEventListener('pointerdown', onDocumentPointerDown)
+  if (props.open) focusPicker()
+})
 onBeforeUnmount(() => document.removeEventListener('pointerdown', onDocumentPointerDown))
 
 watch(filtered, rows => {
   activeIndex.value = Math.min(activeIndex.value, Math.max(0, rows.length - 1))
+  const activeProvider = rows[activeIndex.value]
+  if (activeProvider && isConfigured(activeProvider.providerId)) move(activeIndex.value)
 })
 watch(() => props.open, open => {
   if (!open) return
-  query.value = ''
-  activeIndex.value = 0
-  void nextTick(() => inputRef.value?.focus())
+  focusPicker()
 })
 </script>
 
@@ -109,7 +150,7 @@ watch(() => props.open, open => {
     data-testid="provider-catalog-picker"
     @keydown.capture="onPickerKeydown"
   >
-    <header class="provider-picker__head">
+    <header v-if="!embedded" class="provider-picker__head">
       <div>
         <h4 id="setup-provider-catalog-title">{{ t('setup.provider.catalogTitle') }}</h4>
         <p>{{ t('setup.provider.catalogDesc') }}</p>
@@ -120,22 +161,25 @@ watch(() => props.open, open => {
     </header>
     <label class="provider-picker__search">
       <span>{{ t('setup.provider.searchProviders') }}</span>
-      <input
-        ref="inputRef"
-        v-model="query"
-        class="control-input"
-        name="setup_provider_search"
-        type="search"
-        role="combobox"
-        aria-autocomplete="list"
-        aria-expanded="true"
-        aria-controls="setup-provider-catalog-list"
-        :aria-activedescendant="activeId"
-        :placeholder="t('setup.provider.searchProvidersPlaceholder')"
-        autocomplete="off"
-        @focus="onInputFocus"
-        @keydown="onInputKeydown"
-      >
+      <span class="provider-picker__search-control">
+        <Icon name="search" :size="16" aria-hidden="true" />
+        <input
+          ref="inputRef"
+          v-model="query"
+          class="provider-picker__search-input"
+          name="setup_provider_search"
+          type="search"
+          role="combobox"
+          aria-autocomplete="list"
+          aria-expanded="true"
+          aria-controls="setup-provider-catalog-list"
+          :aria-activedescendant="activeId"
+          :placeholder="t('setup.provider.searchProvidersPlaceholder')"
+          autocomplete="off"
+          @focus="onInputFocus"
+          @keydown="onInputKeydown"
+        >
+      </span>
     </label>
     <div class="provider-picker__results-head">
       <p class="provider-picker__section-label">
@@ -151,25 +195,53 @@ watch(() => props.open, open => {
       role="listbox"
       :aria-label="t('setup.provider.providerResults')"
     >
-      <button
-        v-for="(provider, index) in filtered"
-        :id="`setup-provider-catalog-option-${index}`"
-        :key="provider.providerId"
-        type="button"
-        class="provider-picker__option"
-        :class="{ 'is-active': index === activeIndex }"
-        role="option"
-        tabindex="-1"
-        :aria-selected="index === activeIndex ? 'true' : 'false'"
-        @mousemove="activeIndex = index"
-        @click="choose(provider.providerId)"
-      >
-        <strong>{{ provider.label }}</strong>
-        <span v-if="provider.providerId.trim().toLowerCase() === 'tokenrhythm'" class="control-pill">
-          {{ t('setup.provider.recommendedBadge') }}
-        </span>
-        <code v-else>{{ provider.providerId }}</code>
-      </button>
+      <section v-if="recommendedProviders.length" class="provider-picker__group" role="presentation">
+        <p class="provider-picker__group-label">{{ t('setup.provider.recommendedProviders') }}</p>
+        <button
+          v-for="{ provider, index } in recommendedProviders"
+          :id="`setup-provider-catalog-option-${index}`"
+          :key="provider.providerId"
+          type="button"
+          class="provider-picker__option"
+          :class="{ 'is-active': index === activeIndex }"
+          role="option"
+          tabindex="-1"
+          :disabled="isConfigured(provider.providerId)"
+          :aria-selected="index === activeIndex ? 'true' : 'false'"
+          :title="isConfigured(provider.providerId) ? t('setup.provider.alreadyConfigured') : undefined"
+          @mousemove="activeIndex = index"
+          @click="choose(provider.providerId)"
+        >
+          <span class="provider-picker__option-copy">
+            <strong>{{ provider.label }}</strong>
+            <code>{{ provider.providerId }}</code>
+          </span>
+          <span class="control-pill provider-picker__offer">
+            {{ t('setup.provider.limitedFreeBadge') }}
+          </span>
+        </button>
+      </section>
+      <section v-if="otherProviders.length" class="provider-picker__group" role="presentation">
+        <p class="provider-picker__group-label">{{ t('setup.provider.otherProviders') }}</p>
+        <button
+          v-for="{ provider, index } in otherProviders"
+          :id="`setup-provider-catalog-option-${index}`"
+          :key="provider.providerId"
+          type="button"
+          class="provider-picker__option"
+          :class="{ 'is-active': index === activeIndex }"
+          role="option"
+          tabindex="-1"
+          :aria-selected="index === activeIndex ? 'true' : 'false'"
+          @mousemove="activeIndex = index"
+          @click="choose(provider.providerId)"
+        >
+          <span class="provider-picker__option-copy">
+            <strong>{{ provider.label }}</strong>
+            <code>{{ provider.providerId }}</code>
+          </span>
+        </button>
+      </section>
       <p v-if="filtered.length === 0" class="provider-picker__empty">{{ t('setup.provider.noProviderMatches') }}</p>
     </div>
   </section>
@@ -177,12 +249,12 @@ watch(() => props.open, open => {
 
 <style scoped>
 .provider-picker {
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
+  background: transparent;
+  border: 0;
   border-radius: var(--radius-md);
   display: grid;
-  gap: var(--sp-2);
-  padding: var(--sp-3);
+  gap: var(--sp-3);
+  padding: 0;
   width: 100%;
 }
 .provider-picker__head {
@@ -201,10 +273,51 @@ watch(() => props.open, open => {
 .provider-picker__search {
   display: grid;
   font-size: var(--fs-sm);
-  gap: 2px;
+  font-weight: 600;
+  gap: var(--sp-2);
 }
-.provider-picker__search .control-input {
+
+.provider-picker__search-control {
+  align-items: center;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  color: var(--text-muted);
+  display: flex;
+  gap: var(--sp-2);
+  min-height: 44px;
+  padding: 0 var(--sp-3);
+  transition: border-color var(--dur-fast) var(--ease-out),
+              box-shadow var(--dur-fast) var(--ease-out),
+              background var(--dur-fast) var(--ease-out);
+}
+
+.provider-picker__search-control:hover {
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--border-strong));
+}
+
+.provider-picker__search-control:focus-within {
+  background: var(--bg-elevated);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+}
+
+.provider-picker__search-control > input.provider-picker__search-input,
+.provider-picker__search-control > input.provider-picker__search-input:focus {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  color: var(--text);
+  flex: 1 1 auto;
+  font: inherit;
+  font-weight: 400;
   max-width: none;
+  min-height: 42px;
+  outline: none;
+  padding: 0;
   width: 100%;
 }
 .provider-picker__results-head {
@@ -225,13 +338,24 @@ watch(() => props.open, open => {
 }
 .provider-picker__list {
   display: grid;
-  gap: var(--sp-1);
+  gap: var(--sp-3);
   max-height: min(320px, 42dvh);
   min-height: 0;
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
+}
+.provider-picker__group {
+  display: grid;
+  gap: var(--sp-1);
+}
+.provider-picker__group-label {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  margin: 0;
+  padding: 0 var(--sp-2);
 }
 .provider-picker__option {
   align-items: center;
@@ -247,17 +371,38 @@ watch(() => props.open, open => {
   padding: var(--sp-2) var(--sp-3);
   text-align: left;
 }
+.provider-picker__option-copy {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
 .provider-picker__option code {
   color: var(--text-muted);
   font-size: var(--fs-xs);
   overflow-wrap: anywhere;
 }
+.provider-picker__offer {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 25%, transparent);
+  color: var(--accent-deep);
+  flex: 0 0 auto;
+}
 .provider-picker__option:hover,
 .provider-picker__option.is-active,
 .provider-picker__option:focus-visible {
-  background: var(--bg-hover);
-  border-color: var(--border);
+  background: color-mix(in srgb, var(--accent) 7%, var(--bg-hover));
+  border-color: color-mix(in srgb, var(--accent) 24%, var(--border));
+  color: var(--accent-deep);
   outline: none;
+}
+.provider-picker__option:disabled {
+  cursor: default;
+  opacity: 0.66;
+}
+.provider-picker__option:disabled:hover {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text);
 }
 .provider-picker__empty {
   color: var(--text-muted);
@@ -266,7 +411,7 @@ watch(() => props.open, open => {
   text-align: center;
 }
 @container provider-panel (max-width: 560px) {
-  .provider-picker__option { align-items: flex-start; flex-direction: column; gap: var(--sp-1); }
+  .provider-picker__option { align-items: center; gap: var(--sp-2); }
   .provider-picker__results-head { align-items: flex-start; flex-direction: column; gap: var(--sp-1); }
 }
 </style>

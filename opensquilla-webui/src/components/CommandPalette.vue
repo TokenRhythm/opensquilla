@@ -14,23 +14,35 @@
       :aria-label="t('shared.cmdp.dialogLabel')"
     >
       <div class="cmdp-search">
-        <Icon name="search" :size="16" class="cmdp-search__icon" />
-        <input
-          ref="inputRef"
-          v-model="query"
-          type="text"
-          class="cmdp-search__input"
-          :placeholder="t('shared.cmdp.placeholder')"
-          role="combobox"
-          aria-expanded="true"
-          aria-controls="cmdp-listbox"
-          aria-autocomplete="list"
-          :aria-activedescendant="activeId"
-          autocomplete="off"
-          spellcheck="false"
-          @keydown="onInputKeydown"
-        />
-        <kbd v-if="hint" class="cmdp-search__kbd" aria-hidden="true">{{ hint }}</kbd>
+        <!-- The magnifier sits inside the field so the input reads as the search
+             box itself; dismissal stays outside it. -->
+        <div class="cmdp-search__field">
+          <Icon name="search" :size="16" class="cmdp-search__icon" />
+          <input
+            ref="inputRef"
+            v-model="query"
+            type="text"
+            class="cmdp-search__input"
+            :placeholder="t('shared.cmdp.placeholder')"
+            role="combobox"
+            aria-expanded="true"
+            aria-controls="cmdp-listbox"
+            aria-autocomplete="list"
+            :aria-activedescendant="activeId"
+            autocomplete="off"
+            spellcheck="false"
+            @keydown="onInputKeydown"
+          />
+        </div>
+        <button
+          type="button"
+          class="cmdp-search__close"
+          :aria-label="t('common.close')"
+          :title="t('common.close')"
+          @click="close()"
+        >
+          <Icon name="x" :size="15" />
+        </button>
       </div>
 
       <div
@@ -40,7 +52,9 @@
         role="listbox"
         :aria-label="t('shared.cmdp.resultsLabel')"
       >
-        <p v-if="flatItems.length === 0 && !searching" class="cmdp-empty">{{ t('shared.cmdp.noMatches') }}</p>
+        <p v-if="flatItems.length === 0 && !searching" class="cmdp-empty">
+          {{ query.trim() ? t('shared.cmdp.noMatches') : t('shared.cmdp.recentsEmpty') }}
+        </p>
         <template v-for="group in groups" :key="group.label">
           <template v-if="group.items.length > 0">
             <p class="cmdp-group-label" aria-hidden="true">{{ groupLabel(group.label) }}</p>
@@ -56,14 +70,13 @@
               @click="runItem(item)"
               @mousemove="activeIndex = item.index"
             >
-              <Icon :name="item.icon" :size="16" class="cmdp-option__icon" />
+              <Icon v-if="item.icon" :name="item.icon" :size="16" class="cmdp-option__icon" />
               <span class="cmdp-option__body">
                 <span class="cmdp-option__label">{{ item.title }}</span>
                 <span v-if="item.subtitle" class="cmdp-option__sub">{{ item.subtitle }}</span>
                 <!-- eslint-disable-next-line vue/no-v-html — snippet is HTML-escaped in renderSnippet; only <mark> is injected -->
                 <span v-if="item.snippetHtml" class="cmdp-option__snippet" v-html="item.snippetHtml"></span>
               </span>
-              <span v-if="item.hint" class="cmdp-option__hint">{{ item.hint }}</span>
             </button>
           </template>
         </template>
@@ -84,10 +97,21 @@ import { useBgm } from '@/composables/useBgm'
 import { getWorkNavigationSection } from '@/router/nav'
 import { useRpcStore } from '@/stores/rpc'
 import { highlightFtsSnippet } from '@/utils/searchSnippet'
+import type { SidebarSection } from '@/composables/useSessions'
 import type { IconName } from '@/utils/icons'
 import type { MessageSearchHit, SessionSearchHit, SessionsSearchResponse } from '@/types/rpc'
 
-const props = defineProps<{ open: boolean; hint?: string }>()
+const props = defineProps<{
+  open: boolean
+  /**
+   * Already-loaded sidebar sections. The empty-query state lists these as
+   * "Recent tasks" so opening the palette answers "which task?" immediately,
+   * with no extra round trip. Destinations and actions stay reachable, but only
+   * once the query matches one — an untyped palette full of nav rows is not what
+   * a button labelled "search tasks" promises.
+   */
+  recents: SidebarSection[]
+}>()
 const emit = defineEmits<{
   (e: 'update:open', value: boolean): void
   (e: 'new-chat'): void
@@ -121,10 +145,10 @@ type Run = () => void
 interface Command {
   id: string
   title: string
-  icon: IconName
+  /** Omitted for task rows: a column of identical chat glyphs is not a signal. */
+  icon?: IconName
   keywords: string
   group: string
-  hint?: string
   /** Secondary line (e.g. a conversation's source surface). */
   subtitle?: string
   /** Pre-sanitized highlight HTML for a transcript snippet (escaped upstream). */
@@ -134,11 +158,12 @@ interface Command {
 
 // Stable group order for the rendered palette. Conversation groups sort below
 // the static nav/action groups so "go to page" stays the top, instant result.
-const GROUP_ORDER = ['Work', 'Observe', 'Actions', 'Conversations', 'Messages'] as const
+const GROUP_ORDER = ['Recents', 'Work', 'Observe', 'Actions', 'Conversations', 'Messages'] as const
 
 // Display label for a group id. Nav bands resolve through the same nav.* keys
 // the sidebar uses, so the palette and the rail always agree per locale.
 const GROUP_LABEL_KEYS: Record<string, string> = {
+  Recents: 'shared.cmdp.groupRecents',
   Work: 'shared.cmdp.groupWork',
   Observe: 'nav.groupMonitor',
   Actions: 'shared.cmdp.groupActions',
@@ -165,11 +190,12 @@ const allCommands = computed<Command[]>(() => {
   // palette tracks the route taxonomy instead of a hardcoded path list (which
   // silently dropped promoted routes and double-listed demoted ones).
   for (const item of getWorkNavigationSection()) {
+    const searchAliases = item.path === '/usage' ? ' usage 用量' : ''
     out.push({
       id: `nav:${item.path}`,
       title: item.title,
       icon: item.icon,
-      keywords: `${item.title} ${item.path}`.toLowerCase(),
+      keywords: `${item.title} ${item.path}${searchAliases}`.toLowerCase(),
       group: 'Work',
       run: navTo(item.path),
     })
@@ -189,10 +215,9 @@ const allCommands = computed<Command[]>(() => {
     }
   }
 
-  // Usage and diagnostic Logs remain directly reachable without promoting
-  // either back into the rail; the Overview command already opens Status.
+  // Diagnostic Logs remains directly reachable without promoting it back into
+  // the rail; the Overview command already opens Status.
   const demoted: Array<{ path: string; name: string; icon: IconName; group: string }> = [
-    { path: '/usage', name: 'usage', icon: 'usage', group: 'Observe' },
     { path: '/logs', name: 'logs', icon: 'logs', group: 'Observe' },
   ]
   for (const item of demoted) {
@@ -261,11 +286,12 @@ const allCommands = computed<Command[]>(() => {
   return out
 })
 
-// Case-insensitive substring filter on title + keywords. Empty query shows the
-// full grouped list so mouse users see every destination immediately.
+// Case-insensitive substring filter on title + keywords. Only consulted for a
+// non-empty query: the untyped palette lists recent tasks instead (see
+// visibleCommands), so destinations surface by name rather than by default.
 const filtered = computed<Command[]>(() => {
   const q = query.value.trim().toLowerCase()
-  if (!q) return allCommands.value
+  if (!q) return []
   return allCommands.value.filter(
     (cmd) => cmd.title.toLowerCase().includes(q) || cmd.keywords.includes(q),
   )
@@ -333,7 +359,6 @@ const conversationCommands = computed<Command[]>(() => {
     out.push({
       id: `session:${hit.key}`,
       title: hit.title || t('shared.cmdp.untitledChat'),
-      icon: 'chat',
       keywords: '',
       group: 'Conversations',
       subtitle: hit.surface && hit.surface !== 'webchat' ? hit.surface : undefined,
@@ -344,7 +369,6 @@ const conversationCommands = computed<Command[]>(() => {
     out.push({
       id: `message:${hit.key}:${hit.createdAt ?? i}:${i}`,
       title: hit.title || t('shared.cmdp.untitledChat'),
-      icon: 'search',
       keywords: '',
       group: 'Messages',
       snippetHtml: highlightFtsSnippet(hit.snippet || ''),
@@ -354,8 +378,39 @@ const conversationCommands = computed<Command[]>(() => {
   return out
 })
 
-// Nav/action matches (instant) followed by conversation matches (async).
-const visibleCommands = computed<Command[]>(() => [...filtered.value, ...conversationCommands.value])
+// Recent tasks, flattened from the sidebar sections the app already loaded.
+// Capped so the untyped palette stays a short "pick up where you left off" list
+// rather than a scroll of the whole ledger; subagent rows (depth > 0) are folded
+// under their parent in the sidebar and would read as duplicates here.
+const RECENTS_LIMIT = 8
+const recentCommands = computed<Command[]>(() => {
+  const out: Command[] = []
+  const seen = new Set<string>()
+  for (const section of props.recents) {
+    for (const row of section.rows) {
+      if (out.length >= RECENTS_LIMIT) return out
+      if (row.rowKind !== 'session' || row.depth > 0 || seen.has(row.key)) continue
+      seen.add(row.key)
+      out.push({
+        id: `recent:${row.key}`,
+        title: row.title || t('shared.cmdp.untitledChat'),
+        keywords: '',
+        group: 'Recents',
+        run: () => emit('select-session', row.key),
+      })
+    }
+  }
+  return out
+})
+
+// Untyped: recent tasks only. Typed: nav/action matches (instant, synchronous)
+// followed by conversation matches (async), so nothing is orphaned but the
+// resting state stays about tasks.
+const visibleCommands = computed<Command[]>(() => (
+  query.value.trim()
+    ? [...filtered.value, ...conversationCommands.value]
+    : recentCommands.value
+))
 
 interface FlatItem extends Command {
   index: number
@@ -472,8 +527,10 @@ function onBackdrop(e: MouseEvent) {
 }
 
 .cmdp-dialog {
+  /* Give task titles and message snippets enough horizontal room without
+     turning the palette into a full-page surface. */
   width: min(560px, calc(100vw - 32px));
-  max-height: min(560px, calc(100vh - 18vh));
+  max-height: min(600px, calc(100vh - 18vh));
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -503,7 +560,30 @@ function onBackdrop(e: MouseEvent) {
   align-items: center;
   gap: var(--sp-2);
   padding: 12px 14px;
-  border-bottom: 1px solid var(--border);
+}
+
+/* Barely-there fill so the field reads as a field without becoming a slab: a
+   hairline border does the work, the tint only hints at depth. The magnifier
+   lives inside it rather than floating in the dialog's padding. */
+.cmdp-search__field {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex: 1;
+  min-width: 0;
+  min-height: 44px;
+  padding: 0 12px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  transition: border-color var(--dur-fast), background var(--dur-fast);
+}
+.cmdp-search__field:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 70%, var(--border));
+}
+
+.cmdp-search__field:focus-within .cmdp-search__icon {
+  color: var(--accent);
 }
 
 .cmdp-search__icon {
@@ -511,32 +591,54 @@ function onBackdrop(e: MouseEvent) {
   flex-shrink: 0;
 }
 
-.cmdp-search__input {
-  flex: 1;
-  min-width: 0;
-  border: 0;
-  outline: none;
+.cmdp-search__field > input.cmdp-search__input,
+.cmdp-search__field > input.cmdp-search__input:focus {
+  appearance: none;
   background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
   color: var(--text);
+  flex: 1;
   font-family: var(--font-sans);
-  font-size: var(--fs-md);
-  line-height: 1.4;
+  font-size: var(--fs-sm);
+  font-weight: 400;
+  line-height: 20px;
+  min-height: 42px;
+  min-width: 0;
+  outline: none;
+  padding: 0;
 }
 
 .cmdp-search__input::placeholder {
   color: var(--text-muted);
 }
 
-.cmdp-search__kbd {
+/* Explicit dismiss outside the field: the palette is a task picker people open
+   and abandon, and Escape alone is not a visible way out. */
+.cmdp-search__close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
   flex-shrink: 0;
-  padding: 2px 6px;
-  border: 1px solid var(--border);
+  padding: 0;
+  background: transparent;
+  border: 0;
   border-radius: var(--radius-sm);
   color: var(--text-muted);
-  font-family: var(--font-mono);
-  font-size: 0.6875rem;
-  font-weight: 500;
-  line-height: 1.4;
+  cursor: pointer;
+  transition: background var(--dur-fast), color var(--dur-fast);
+}
+.cmdp-search__close:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+.cmdp-search__close:focus-visible {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent);
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
 }
 
 .cmdp-list {
@@ -557,10 +659,9 @@ function onBackdrop(e: MouseEvent) {
 .cmdp-group-label {
   margin: var(--sp-2) 0 2px;
   padding: 0 var(--sp-2);
-  font-size: 10px;
-  font-weight: var(--fw-eyebrow);
-  text-transform: uppercase;
-  letter-spacing: var(--eyebrow-track);
+  font-size: var(--fs-xs);
+  font-weight: 400;
+  line-height: 18px;
   color: var(--text-muted);
 }
 .cmdp-group-label:first-child {
@@ -572,15 +673,20 @@ function onBackdrop(e: MouseEvent) {
   align-items: center;
   gap: var(--sp-2);
   width: 100%;
-  min-height: 38px;
-  padding: var(--sp-2) var(--sp-2);
+  /* Roomier rows now that each one is a single line of title: the list is a
+     "pick one" surface, so touchable spacing beats packing more in. */
+  min-height: 42px;
+  padding: var(--sp-2) var(--sp-3);
   border: 1px solid transparent;
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text);
   font-family: var(--font-sans);
   font-size: var(--fs-sm);
-  font-weight: 600;
+  line-height: 20px;
+  /* Regular weight: the active row is marked by its tint, not by getting
+     bolder, so a list of task titles stays quiet to read down. */
+  font-weight: 400;
   text-align: left;
   cursor: pointer;
 }
@@ -630,19 +736,16 @@ function onBackdrop(e: MouseEvent) {
   font-size: var(--fs-sm);
 }
 
-.cmdp-option__hint {
-  margin-left: auto;
-  color: var(--text-muted);
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
-}
 
+/* Lark marks the highlighted row with a plain neutral fill — no leading bar, no
+   tinted border, no recoloured text. The row is being pointed at, not flagged;
+   brand colour stays on the action you press, not on where the cursor is. */
 .cmdp-option.is-active {
-  background: color-mix(in srgb, var(--accent) 12%, var(--bg-surface));
-  border-color: color-mix(in srgb, var(--accent) 32%, var(--border));
+  background: var(--bg-hover);
+  border-color: transparent;
 }
 .cmdp-option.is-active .cmdp-option__icon {
-  color: var(--accent);
+  color: var(--text-muted);
 }
 
 @media (max-width: 768px) {

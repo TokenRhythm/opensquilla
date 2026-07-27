@@ -6,7 +6,11 @@
         <p class="usage-stage__subtitle control-stage__subtitle">{{ t('usageLogs.usage.subtitle') }}</p>
         <small class="usage-range-notice" aria-live="polite">{{ rangeHiddenHint }}</small>
       </div>
-      <div class="usage-stage__actions control-stage__actions mobile-action-strip">
+      <div
+        class="usage-stage__actions control-stage__actions mobile-action-strip"
+        role="group"
+        :aria-label="t('usageLogs.usage.actions')"
+      >
         <div class="control-segmented mobile-action-strip__item" role="group" :aria-label="t('usageLogs.usage.currency')">
           <button
             class="control-segmented__btn"
@@ -21,6 +25,7 @@
             @click="setCurrency('CNY')"
           >¥ CNY</button>
         </div>
+        <span class="usage-stage__action-divider" aria-hidden="true" />
         <button class="btn btn--ghost mobile-action-strip__button" :title="t('usageLogs.usage.downloadCsv')" @click="exportCsv">
           <Icon name="download" :size="16" /><span class="mobile-action-strip__label">{{ t('usageLogs.usage.export') }}</span>
         </button>
@@ -177,6 +182,26 @@ async function refresh() {
   font-size: var(--fs-xs);
   margin-top: 4px;
   min-height: 1.2em;
+}
+
+.usage-stage__actions {
+  flex-wrap: nowrap;
+  gap: 4px;
+}
+.usage-stage__actions .control-segmented,
+.usage-stage__actions .btn {
+  height: 36px;
+  min-height: 36px;
+}
+.usage-stage__actions .btn {
+  padding-inline: 10px;
+}
+.usage-stage__action-divider {
+  align-self: center;
+  background: var(--border);
+  height: 18px;
+  margin-inline: 2px;
+  width: 1px;
 }
 
 /* Chart */
@@ -346,26 +371,26 @@ async function refresh() {
   color: var(--text-muted);
   font-size: var(--fs-sm);
 }
+.usage-model-grid {
+  grid-auto-rows: 1fr;
+}
 .usage-model-card {
+  display: flex;
+  flex-direction: column;
   gap: var(--sp-2);
+  min-width: 0;
 }
 .usage-model-card__head {
-  display: flex;
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: var(--sp-2);
 }
 .usage-model-card__id {
-  display: flex;
-  align-items: center;
-  gap: 2px;
   min-width: 0;
 }
-.usage-model-card__provider {
-  font-size: var(--fs-xs);
-  color: var(--text-dim);
-}
 .usage-model-card__name {
+  display: block;
   font-weight: 600;
   font-size: var(--fs-sm);
   overflow: hidden;
@@ -394,7 +419,9 @@ async function refresh() {
 .usage-model-card__rows {
   display: grid;
   grid-template-columns: 1fr 1fr;
+  grid-template-rows: repeat(3, minmax(20px, auto)) auto;
   gap: 4px 12px;
+  flex: 1;
   margin: 0;
   font-size: var(--fs-xs);
 }
@@ -407,14 +434,34 @@ async function refresh() {
 .usage-model-card__rows dt {
   color: var(--text-dim);
   font-weight: 500;
+  white-space: nowrap;
 }
 .usage-model-card__rows dd {
   margin: 0;
   color: var(--text);
   font-variant-numeric: tabular-nums;
 }
+.usage-model-card__total {
+  grid-column: 1 / -1;
+}
+.usage-model-card__rows > .usage-model-card__total {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  justify-content: stretch;
+}
+.usage-model-card__metric {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.usage-model-card__metric:nth-child(2) {
+  justify-content: space-between;
+}
 .usage-model-card__cost-row {
   grid-column: 1 / -1;
+  margin-top: auto;
   border-top: 1px solid var(--border);
   padding-top: 4px;
   margin-top: 2px;
@@ -435,10 +482,10 @@ async function refresh() {
 .usage-table th {
   text-align: left;
   padding: 10px 12px;
-  font-size: 10.5px;
-  font-weight: 700;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
+  font-size: inherit;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
   color: var(--text-dim);
   border-bottom: 1px solid var(--border);
   white-space: nowrap;
@@ -468,11 +515,18 @@ async function refresh() {
   padding: var(--sp-6);
 }
 .usage-sess-link {
-  color: var(--accent);
+  display: block;
+  max-width: min(32vw, 360px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-size: inherit;
+  font-weight: inherit;
   text-decoration: none;
-  font-weight: 500;
 }
 .usage-sess-link:hover {
+  color: var(--text);
   text-decoration: underline;
 }
 .usage-mono {
@@ -690,6 +744,7 @@ async function refresh() {
   }
   .usage-stage__actions {
     width: 100%;
+    overflow-x: auto;
   }
   .usage-bar-row {
     grid-template-columns: minmax(0, 100px) 1fr auto;

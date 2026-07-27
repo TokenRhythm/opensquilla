@@ -80,11 +80,11 @@
      vapor, …), and custom properties inherit — a nested [data-theme="light"]
      island (e.g. the share-export stage) can only undo that remap by
      re-declaring the token, which light/dark tokens.css do from these. */
-  --font-sans-default: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans", "Microsoft YaHei", "Yu Gothic", sans-serif;
-  --font-display-default: "Space Grotesk", "IBM Plex Sans", system-ui, "PingFang SC", "Hiragino Sans", "Microsoft YaHei", "Yu Gothic", sans-serif;
+  --font-sans-default: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Helvetica Neue", "Segoe UI", "PingFang SC", "Hiragino Sans", "Microsoft YaHei", "Yu Gothic", sans-serif;
+  --font-display-default: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", "Segoe UI", "PingFang SC", "Hiragino Sans", "Microsoft YaHei", "Yu Gothic", sans-serif;
   --font-sans: var(--font-sans-default);
   --font-display: var(--font-display-default);
-  --font-mono: "IBM Plex Mono", ui-monospace, "JetBrains Mono", Menlo, "PingFang SC", "Hiragino Sans", "Microsoft YaHei", "Yu Gothic", monospace;
+  --font-mono: "SFMono-Regular", ui-monospace, "Cascadia Code", "IBM Plex Mono", Menlo, "PingFang SC", "Hiragino Sans", "Microsoft YaHei", "Yu Gothic", monospace;
   --fs-xs: 0.8125rem;   /* 13px (was 12) */
   --fs-sm: 0.875rem;    /* 14px (was 13) */
   --fs-md: 1rem;        /* 16px (was 15) */
@@ -111,7 +111,10 @@
   --track-tabular: 0.01em;
   /* One unified eyebrow idiom (control-panel / control-section / sidebar nav
      groups all read these), and one "quiet" weight for demoted metric labels. */
-  --eyebrow-track: 0.12em;
+  --eyebrow-track: 0.02em;
+  /* Eyebrow labels are already set apart by size, tracking, and a muted colour;
+     a semibold on top of that reads heavy at 10-13px. 500 keeps them legible
+     without shouting. */
   --fw-eyebrow: 600;
   --fw-quiet: 500;
 
@@ -119,12 +122,12 @@
      maps to a role so a corner encodes rank; components should prefer the
      semantic aliases below over the raw steps. (Direction: "Instrument".) */
   --radius-none: 0;
-  --radius-xs: 2px;
-  --radius-sm: 4px;
-  --radius-md: 8px;
-  --radius-lg: 12px;
-  --radius-xl: 16px;
-  --radius-2xl: 20px;
+  --radius-xs: 4px;
+  --radius-sm: 8px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 18px;
+  --radius-2xl: 24px;
   --radius-full: 999px;
   --radius-control: var(--radius-md);   /* buttons, inputs, menus, segmented */
   --radius-card: var(--radius-lg);      /* cards, stats, standing panels */
@@ -136,10 +139,10 @@
   --sp-1: 4px;
   --sp-2: 8px;
   --sp-3: 12px;
-  --sp-4: 16px;
-  --sp-5: 20px;
-  --sp-6: 24px;
-  --sp-8: 32px;
+  --sp-4: 18px;
+  --sp-5: 24px;
+  --sp-6: 30px;
+  --sp-8: 40px;
 
   /* Mobile shell */
   --mobile-tabbar-h: 56px;
@@ -171,8 +174,8 @@
   /* Structural-label idiom (borrowed from the "Terminal" study): uppercase,
      tracked mono for pane titles, column headers and eyebrows — the instrument
      texture. Prose and field labels stay --font-sans. */
-  --label-font: var(--font-mono);
-  --label-track: 0.12em;
+  --label-font: var(--font-sans);
+  --label-track: -0.01em;
 
   /* One canonical focus ring + one disabled opacity, replacing the ad-hoc
      per-component variants. --focus-ring reads the active-theme --accent.

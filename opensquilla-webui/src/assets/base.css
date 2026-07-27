@@ -86,7 +86,6 @@ input::placeholder, textarea::placeholder { color: var(--text-dim); }
   box-shadow: var(--focus-ring);
 }
 .sidebar-fn-item:focus-visible,
-.sidebar-brand-link:focus-visible,
 .nav-item:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
@@ -159,7 +158,12 @@ pre {
   color: var(--bg);
   border-color: var(--danger);
 }
-.btn--danger:not(:disabled):hover { opacity: 0.9; }
+.btn--danger:not(:disabled):hover {
+  background: var(--danger-fill);
+  border-color: var(--danger-fill);
+  color: var(--bg);
+  opacity: 1;
+}
 
 .btn--ghost {
   background: transparent;
@@ -388,7 +392,7 @@ pre {
   padding: 6px 12px 8px;
 }
 
-.sidebar-brand-link {
+.sidebar-brand-lockup {
   display: flex;
   align-items: center;
   gap: var(--sp-2);
@@ -398,10 +402,6 @@ pre {
   padding: 2px 6px;
   border-radius: var(--radius-sm);
   text-decoration: none;
-}
-
-.sidebar-brand-link:hover {
-  background: var(--sidebar-item-hover);
 }
 
 .sidebar-brand-mark {
@@ -418,32 +418,35 @@ pre {
   letter-spacing: var(--track-display);
 }
 
-.sidebar-actions {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-2);
-  padding: 4px 10px 6px;
-}
-
+/* Leads the nav index. Shares .sidebar-fn-item's row geometry so the sidebar
+   reads as one list; the weight and the plus glyph carry the emphasis instead
+   of a border, and the row keeps its own class for the New-task selectors. */
 .sidebar-new-session {
-  flex: 1;
   display: flex;
   align-items: center;
   gap: var(--sp-2);
+  min-width: 0;
   min-height: 36px;
-  padding: 8px 12px;
-  background: var(--sidebar-control-bg);
-  border: 1px solid var(--sidebar-border);
+  padding: var(--sp-2) var(--sp-3);
+  margin: 0 var(--sp-2);
+  background: transparent;
+  border: none;
   border-radius: var(--radius-md);
   color: var(--sidebar-text-strong);
   font-size: var(--fs-sm);
-  font-weight: 600;
+  font-weight: 500;
   cursor: pointer;
-  transition: background var(--dur-fast), border-color var(--dur-fast);
+  transition: background var(--dur-fast), border-color var(--dur-fast), color var(--dur-fast);
 }
 .sidebar-new-session:hover {
-  background: var(--sidebar-control-hover);
-  border-color: var(--sidebar-border);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+.sidebar-new-session:focus-visible {
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 32%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 12%, transparent);
+  outline: 0;
 }
 
 .sidebar-section {
@@ -506,45 +509,35 @@ pre {
   white-space: nowrap;
 }
 
-/* Pending-approvals count on the conditional Approvals row */
-.sidebar-count-badge {
-  margin-left: auto;
-  min-width: 18px;
-  padding: 1px 6px;
-  border-radius: 999px;
-  background: var(--accent);
-  color: var(--accent-foreground);
-  font-size: var(--fs-xs);
-  font-weight: 700;
-  font-variant-numeric: tabular-nums;
-  text-align: center;
-}
-
-/* Brand-area command-palette affordance (replaces the rail Search row). A square
-   icon button beside the New-chat button, so the action row reads as one tidy
-   control cluster; the shortcut lives in the tooltip + aria-label rather than
-   a chip that would compete with the New-chat chord. */
+/* Command-palette affordance on the recents header, sized to match its
+   neighbours (selection mode, refresh). The shortcut lives in the tooltip +
+   aria-label — the header has no room for a chord chip. */
 .sidebar-cmd-btn {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   justify-content: center;
   width: 32px;
-  min-height: 36px;
+  height: 32px;
+  padding: 0;
   flex-shrink: 0;
-  background: var(--sidebar-control-bg);
-  border: 1px solid var(--sidebar-border);
-  border-radius: var(--radius-md);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
   color: var(--sidebar-text-soft);
   cursor: pointer;
   transition: background var(--dur-fast), border-color var(--dur-fast), color var(--dur-fast);
 }
+
 .sidebar-cmd-btn:hover {
-  background: var(--sidebar-control-hover);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 16%, transparent);
   color: var(--sidebar-text-strong);
 }
 .sidebar-cmd-btn:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 32%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 12%, transparent);
+  outline: 0;
 }
 
 /* "More" trigger: the chevron sits right; the open state mirrors an active row. */
@@ -584,25 +577,23 @@ pre {
   box-shadow: inset 2px 0 0 var(--accent);
 }
 
-.sidebar-refresh-btn {
-  width: 20px;
-  height: 20px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+/* Retry inside the load-error state. A plain text button: the header carries no
+   standing refresh control, so this is the only place it appears. */
+.sidebar-history-retry {
+  margin-top: var(--sp-2);
+  padding: 0;
   background: transparent;
   border: none;
-  color: var(--sidebar-text-soft);
-  cursor: pointer;
-  border-radius: var(--radius-sm);
-  transition: color var(--dur-fast), background var(--dur-fast);
-}
-.sidebar-refresh-btn:hover {
   color: var(--sidebar-text-strong);
-  background: var(--sidebar-item-hover);
+  font-family: inherit;
+  font-size: inherit;
+  text-decoration: underline;
+  cursor: pointer;
 }
-.sidebar-refresh-btn.spinning {
-  animation: spin 1s linear infinite;
+.sidebar-history-retry:disabled {
+  cursor: default;
+  opacity: 0.55;
+  text-decoration: none;
 }
 
 @keyframes spin {
@@ -624,7 +615,7 @@ pre {
   color: var(--sidebar-text-strong);
   font-family: var(--font-sans);
   font-size: var(--fs-sm);
-  font-weight: 600;
+  font-weight: 500;
   position: relative;
   text-align: left;
   text-decoration: none;
@@ -632,7 +623,10 @@ pre {
   cursor: pointer;
 }
 
-.sidebar-core .sidebar-fn-item {
+/* New task shares this geometry exactly: inside the index it is a row like any
+   other, with no inset or extra height setting it apart. */
+.sidebar-core .sidebar-fn-item,
+.sidebar-core .sidebar-new-session {
   min-height: 32px;
   margin: 0;
   padding: 5px var(--sp-2);
@@ -653,9 +647,11 @@ pre {
   background: var(--sidebar-item-active);
   color: var(--sidebar-text-strong);
 }
-/* Active destination in the nav index: accent left-bar is the signal. */
+/* Active destination in the nav index: the brand orange left-bar is the signal,
+   matching the palette's active row so "where I am" reads the same warm mark on
+   both surfaces. Weight is no longer part of it. */
 .sidebar-core .sidebar-fn-item.is-active {
-  box-shadow: inset 2px 0 0 var(--accent);
+  box-shadow: inset 2px 0 0 var(--accent-secondary);
 }
 
 /* Recents: the only scrollable sidebar region */
@@ -676,19 +672,19 @@ pre {
 .sidebar-recents-header {
   display: flex;
   align-items: center;
-  gap: var(--sp-2);
-  min-height: 28px;
-  padding: 4px 14px 2px;
+  gap: var(--sp-1);
+  min-height: 40px;
+  padding: 4px 10px;
   flex-shrink: 0;
 }
 
+/* Sits tight against its count — the two read as one "Tasks 24" label. The
+   controls after them take the spare width (see .sidebar-recents-count). */
 .sidebar-recents-eyebrow {
-  flex: 1;
   min-width: 0;
-  font-size: var(--fs-xs);
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
+  font-size: var(--fs-sm);
+  font-weight: 400;
+  line-height: 20px;
   color: var(--sidebar-text-soft);
   white-space: nowrap;
   overflow: hidden;
@@ -698,17 +694,18 @@ pre {
 /* Total count beside the single-family eyebrow (the per-family header row is
    skipped when there is only one family, so the count moves up here). */
 .sidebar-recents-count {
-  flex-shrink: 0;
+  /* Absorbs the header's spare width so the controls that follow are pushed to
+     the trailing edge while the count stays beside the label. */
+  flex: 1;
   min-width: 18px;
-  padding: 0 6px;
-  border-radius: 999px;
-  background: var(--sidebar-item-hover);
+  align-self: center;
+  padding: 0 var(--sp-1);
   color: var(--sidebar-text-soft);
-  font-size: 11px;
-  font-weight: 600;
+  font-size: var(--fs-xs);
+  font-weight: 400;
   font-variant-numeric: tabular-nums;
-  text-align: center;
-  line-height: 17px;
+  text-align: left;
+  line-height: 20px;
 }
 
 .sidebar-history.is-selecting .sidebar-recents-eyebrow {
@@ -718,59 +715,74 @@ pre {
 }
 
 .sidebar-bulk-delete-btn {
-  width: 22px;
-  height: 22px;
+  width: 28px;
+  height: 28px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   padding: 0;
-  border: 1px solid color-mix(in srgb, var(--danger) 26%, var(--sidebar-border));
+  border: 0;
   border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--danger) 7%, transparent);
+  background: transparent;
   color: var(--danger);
-  font-size: 0.6875rem;
-  font-weight: 700;
   cursor: pointer;
-  transition: background var(--dur-fast), border-color var(--dur-fast), color var(--dur-fast);
+  transition: background var(--dur-fast), color var(--dur-fast), opacity var(--dur-fast);
 }
 
-.sidebar-bulk-delete-btn:hover {
-  border-color: color-mix(in srgb, var(--danger) 62%, var(--sidebar-border));
+.sidebar-bulk-delete-btn:not(:disabled):hover {
   background: color-mix(in srgb, var(--danger) 12%, transparent);
 }
 
+.sidebar-bulk-delete-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger) 38%, transparent);
+}
+
+.sidebar-bulk-delete-btn:disabled {
+  background: transparent;
+  color: var(--sidebar-text-soft);
+  cursor: default;
+  opacity: 0.45;
+}
+
 .sidebar-select-all-btn {
-  min-width: 34px;
-  height: 22px;
+  min-width: 0;
+  height: 28px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  padding: 0 7px;
-  border: 1px solid var(--sidebar-border);
+  padding: 0 5px;
+  border: 0;
   border-radius: var(--radius-sm);
-  background: var(--sidebar-control-bg);
-  color: var(--sidebar-text);
+  background: transparent;
+  color: var(--sidebar-text-soft);
   font-family: var(--font-sans);
-  font-size: 0.6875rem;
-  font-weight: 700;
+  font-size: var(--fs-xs);
+  font-weight: 500;
   line-height: 1;
   cursor: pointer;
-  transition: background var(--dur-fast), border-color var(--dur-fast), color var(--dur-fast);
+  transition: background var(--dur-fast), color var(--dur-fast);
 }
 
 .sidebar-select-all-btn:hover {
-  background: var(--sidebar-control-hover);
+  background: var(--sidebar-item-hover);
   color: var(--sidebar-text-strong);
 }
 
+.sidebar-select-all-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 38%, transparent);
+}
+
 .sidebar-select-all-btn:disabled {
+  background: transparent;
   cursor: default;
   opacity: 0.45;
 }
 
 .sidebar-bulk-mode-btn {
-  width: 22px;
-  height: 22px;
+  width: 32px;
+  height: 32px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -794,12 +806,6 @@ pre {
 
 .sidebar-bulk-mode-btn:focus-visible {
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 42%, transparent);
-}
-
-.sidebar-bulk-mode-btn.is-active {
-  border-color: var(--sidebar-border);
-  background: var(--sidebar-control-bg);
-  color: var(--sidebar-text-strong);
 }
 
 .sidebar-history-list {
@@ -1406,7 +1412,7 @@ pre {
 .sidebar--drawer .sidebar-dock-toggle,
 .sidebar--drawer .sidebar-core .sidebar-fn-item,
 .sidebar--drawer .sidebar-foot .sidebar-fn-item,
-.sidebar--drawer .sidebar-cmd-btn,
+.sidebar--drawer .sidebar-new-session,
 .sidebar--drawer .sidebar-history-item {
   min-height: 44px;
 }
@@ -1697,7 +1703,7 @@ pre {
 
   .sidebar-core .sidebar-fn-item,
   .sidebar-foot .sidebar-fn-item,
-  .sidebar-cmd-btn,
+  .sidebar-new-session,
   .sidebar-history-item {
     min-height: 44px;
   }
@@ -1823,11 +1829,6 @@ pre {
 
   .sidebar-brand {
     padding-bottom: 5px;
-  }
-
-  .sidebar-actions {
-    padding-top: 2px;
-    padding-bottom: 4px;
   }
 
   .sidebar-new-session {

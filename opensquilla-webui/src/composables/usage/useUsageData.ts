@@ -10,8 +10,17 @@ import { useUsageTotals } from '@/composables/usage/useUsageTotals'
 import { useUsageChartRows } from '@/composables/usage/useUsageChartRows'
 import { useUsageModelCards } from '@/composables/usage/useUsageModelCards'
 import { useUsageSessionRows } from '@/composables/usage/useUsageSessionRows'
+import {
+  isUsableTaskName,
+  usageTaskDisplayName,
+} from '@/composables/usage/taskDisplayName'
 import { formatUsageCost, effectiveCnyPerUsd } from '@/composables/usage/nativeBilling'
 import { buildUsageCsv } from '@/composables/usage/usageCsv'
+import {
+  SESSION_LIST_VIEW,
+  itemKey,
+  normalizeSessionItem,
+} from '@/composables/useSessions'
 import { useRpcStore } from '@/stores/rpc'
 import { downloadText } from '@/utils/browser'
 import i18n from '@/i18n'
@@ -25,6 +34,7 @@ import type {
   UsageSnapshot,
   UsageStatusData,
 } from '@/types/usage'
+import type { RawSessionListEntry, SessionsListResponse } from '@/types/rpc'
 
 const t = i18n.global.t
 
@@ -81,6 +91,7 @@ const chartMode = ref<'tokens' | 'cost'>('tokens')
 const expandedSessions = ref<Set<string>>(new Set())
 
 const usageSnapshot = ref<UsageSnapshot | null>(null)
+const taskTitles = ref<Map<string, string>>(new Map())
 const usageLoading = ref(false)
 const usageError = ref<string | null>(null)
 const sessions = computed<SessionRow[]>(() => usageSnapshot.value?.sessions || [])
@@ -130,7 +141,7 @@ const rangeHiddenHint = computed(() => {
       effective: snapshot.timezoneFallback.effectiveTimezone,
     }))
   }
-  if (snapshot.mode === 'session_approximation') {
+  if (snapshot.mode === 'session_approximation' && range.value !== 'all') {
     notices.push(t('usageLogs.coverage.approximate'))
   } else if (snapshot.mode === 'ledger_partial') {
     notices.push(t('usageLogs.coverage.partial'))
@@ -164,6 +175,11 @@ const serverModels = computed(() =>
   usageSnapshot.value?.source === 'usage_ledger' ? usageSnapshot.value.models : null)
 const serverDays = computed(() =>
   usageSnapshot.value?.source === 'usage_ledger' ? usageSnapshot.value.days : null)
+const taskName = (row: SessionRow) => usageTaskDisplayName(
+  row,
+  taskTitles.value,
+  t('usageLogs.tasks.unnamed'),
+)
 
 const {
   usageTotals,
@@ -191,6 +207,7 @@ const { chartCaption, chartRows } = useUsageChartRows({
   rowVal,
   fmtCost,
   fmtNum,
+  taskName,
 })
 
 const { modelCards, modelsMeta } = useUsageModelCards({
@@ -209,6 +226,7 @@ const { sortedRows, sessionsMeta } = useUsageSessionRows({
   sessionTimestamp,
   relTime,
   sortVal,
+  taskName,
 })
 
 // ---------------------------------------------------------------------------
@@ -284,13 +302,17 @@ async function requestLoad(): Promise<LoadOutcome> {
   usageLoading.value = true
   usageError.value = null
   try {
-    const snapshot = await requestUsageSnapshot(
-      rpc,
-      range.value as UsageRangeSelection,
-      { cachedSnapshot: usageSnapshot.value },
-    )
+    const [snapshot, nextTaskTitles] = await Promise.all([
+      requestUsageSnapshot(
+        rpc,
+        range.value as UsageRangeSelection,
+        { cachedSnapshot: usageSnapshot.value },
+      ),
+      requestTaskTitles(),
+    ])
     if (generation !== loadGeneration) return 'superseded'
     usageSnapshot.value = snapshot
+    taskTitles.value = nextTaskTitles
     return 'loaded'
   } catch (error) {
     if (generation !== loadGeneration) return 'superseded'
@@ -392,7 +414,7 @@ function sessionTimestamp(row: SessionRow): number | null {
 function sortVal(row: SessionRow, key: string): string | number {
   switch (key) {
     case 'session':
-      return (rowVal(row, 'session', 'sessionKey', 'key') || '') as string
+      return taskName(row)
     case 'updated_at':
       return sessionTimestamp(row) || 0
     case 'input_tokens':
@@ -407,6 +429,29 @@ function sortVal(row: SessionRow, key: string): string | number {
       return Number(rowVal(row, 'cost_usd', 'costUsd') || 0)
     default:
       return (rowVal(row, key) || '') as string
+  }
+}
+
+async function requestTaskTitles(): Promise<Map<string, string>> {
+  if (typeof rpc.call !== 'function') return taskTitles.value
+  try {
+    if (typeof rpc.waitForConnection === 'function') await rpc.waitForConnection()
+    const data = await rpc.call<SessionsListResponse>(
+      'sessions.list',
+      { limit: 200, view: SESSION_LIST_VIEW },
+    )
+    const rawItems: RawSessionListEntry[] = data?.sessions || data?.keys || []
+    const titles = new Map<string, string>()
+    rawItems.forEach(raw => {
+      const key = itemKey(raw)
+      const item = normalizeSessionItem(raw)
+      if (key && item && isUsableTaskName(item.title, key)) titles.set(key, item.title)
+    })
+    return titles
+  } catch {
+    // Task names enrich the presentation only. Usage data remains available
+    // when an older gateway cannot provide the task directory.
+    return taskTitles.value
   }
 }
 

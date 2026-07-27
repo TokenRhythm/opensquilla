@@ -1,6 +1,7 @@
 ---
 name: cron
 description: "Use when the user asks to schedule recurring tasks, one-off reminders, timers, or cron-style jobs through the OpenSquilla cron tool."
+description_zh: "当用户需要通过OpenSquilla cron工具安排周期性任务、一次性提醒、计时器或cron风格的作业时使用。"
 always: false
 triggers:
   - schedule

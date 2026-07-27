@@ -71,6 +71,25 @@ describe('useSetupModelStrategyForm', () => {
     expect(strategy.fixedModelDirty.value).toBe(false)
   })
 
+  it('tracks a fixed provider draft and leaves provider changes to profile activation', () => {
+    const { strategy } = makeForm('openai')
+
+    expect(strategy.fixedProvider.value).toBe('openai')
+    expect(strategy.fixedProviderDirty.value).toBe(false)
+
+    strategy.setFixedProvider('DeepSeek')
+    strategy.setFixedModel('deepseek-chat')
+
+    expect(strategy.fixedProvider.value).toBe('deepseek')
+    expect(strategy.fixedProviderDirty.value).toBe(true)
+    expect(strategy.isDirty.value).toBe(true)
+    expect(strategy.fixedModelPatches()).toEqual({})
+
+    strategy.initFixedModel('deepseek-chat', 'deepseek')
+    expect(strategy.fixedProviderDirty.value).toBe(false)
+    expect(strategy.fixedModelDirty.value).toBe(false)
+  })
+
   it('selecting single model disables ensemble and router', () => {
     const { router, ensemble, strategy } = makeForm()
     ensemble.setEnabled(true)
@@ -165,24 +184,26 @@ describe('useSetupModelStrategyForm', () => {
     expect(ensemble.candidates.value.map(c => c.model)).toEqual(['gpt-5.5', 'gpt-5.4-mini'])
   })
 
-  it('selecting model ensemble uses the fixed OpenRouter profile for OpenRouter providers', () => {
+  it('selecting model ensemble seeds the OpenRouter profile as a custom lineup', () => {
     const { router, ensemble, strategy } = makeForm('openrouter')
 
     strategy.setStrategy('ensemble')
 
     expect(router.mode.value).toBe('disabled')
     expect(ensemble.enabled.value).toBe(true)
-    expect(ensemble.selectionMode.value).toBe('static_openrouter_b5')
+    expect(ensemble.selectionMode.value).toBe('custom_b5')
+    expect(ensemble.candidates.value.length).toBe(5)
   })
 
-  it('selecting model ensemble uses the fixed TokenRhythm profile for TokenRhythm providers', () => {
+  it('selecting model ensemble seeds the TokenRhythm profile as a custom lineup', () => {
     const { router, ensemble, strategy } = makeForm('tokenrhythm')
 
     strategy.setStrategy('ensemble')
 
     expect(router.mode.value).toBe('disabled')
     expect(ensemble.enabled.value).toBe(true)
-    expect(ensemble.selectionMode.value).toBe('static_tokenrhythm_b5')
+    expect(ensemble.selectionMode.value).toBe('custom_b5')
+    expect(ensemble.candidates.value.length).toBe(5)
   })
 
   it('builds the routing choices in progressive order with guidance badges', () => {
@@ -208,11 +229,11 @@ describe('useSetupModelStrategyForm', () => {
       fixedModelCatalog: computed(() => ({ models: [], source: 'none' as const })),
     })
 
-    expect(panel.value.cards.map(card => card.id)).toEqual(['router', 'single', 'ensemble'])
+    expect(panel.value.cards.map(card => card.id)).toEqual(['ensemble', 'router', 'single'])
     expect(panel.value.cards.map(card => card.badgeKey || '')).toEqual([
+      'setup.modelStrategy.cards.ensemble.badge',
       'setup.modelStrategy.cards.router.badge',
       'setup.modelStrategy.cards.single.badge',
-      'setup.modelStrategy.cards.ensemble.badge',
     ])
   })
 })
