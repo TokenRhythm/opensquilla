@@ -2,6 +2,7 @@ import type {
   ChatRenderedMessage,
   ChatStreamSegment,
   ChatStreamTimelineItem,
+  ChatTimelineSegment,
   ChatToolCall,
   ChatToolCallGroup,
 } from '@/types/chat'
@@ -40,6 +41,7 @@ export interface FoldedTurn {
   // Accepted activity-phase transitions, in arrival order, for the finished
   // turn's activity timeline. Empty when no status frames were appended.
   statusHistory: StatusPart[]
+  timelineSegments: ChatTimelineSegment[]
 }
 
 // Live ownerKey: the legacy `streamTimelineItems` computed groups with the
@@ -90,7 +92,7 @@ export function reconcileTextSnapshot(
     return { rawText: snapshot, segments: next, changed: true }
   }
 
-  const next = segments.filter(segment => segment.type === 'tool-group')
+  const next = segments.filter(segment => segment.type !== 'text')
   if (snapshot) next.push({ type: 'text', raw: snapshot, html: '', dirty: true })
   return { rawText: snapshot, segments: next, changed: true }
 }
@@ -272,6 +274,7 @@ export function foldTurn(
         if (i === undefined) {
           interruptIndex.set(frame.approvalId, interrupts.length)
           interrupts.push({ kind: frame.interruptKind, approvalId: frame.approvalId, data: frame.data })
+          segments.push({ type: 'interrupt', approvalId: frame.approvalId })
         } else {
           // A later requested-frame for the same id (re-broadcast / hydration
           // backfill) merges richer data without reordering.
@@ -308,7 +311,48 @@ export function foldTurn(
     }
   }
 
-  const timelineItems = segmentsToTimelineItems(segments, toolCalls, ownerKey)
+  const interruptParts = new Map<
+    string,
+    Extract<ChatPart, { type: 'interrupt' }>
+  >()
+  for (const interrupt of interrupts) {
+    const state = interruptState.get(interrupt.approvalId)
+    interruptParts.set(interrupt.approvalId, {
+      type: 'interrupt',
+      interruptKind: interrupt.kind,
+      approval: interrupt.kind === 'approval'
+        ? interrupt.data as InterruptApprovalData
+        : undefined,
+      clarify: interrupt.kind === 'clarify'
+        ? interrupt.data as InterruptClarifyData
+        : undefined,
+      resolution: state?.resolution ?? null,
+      busy: state?.busy ?? false,
+      error: state?.error ?? '',
+      key: `${ownerKey}:interrupt:${interrupt.approvalId}`,
+    })
+  }
+  const timelineItems = segmentsToTimelineItems(
+    segments,
+    toolCalls,
+    ownerKey,
+    interruptParts,
+  )
+  const timelineSegments = segments.flatMap((segment): ChatTimelineSegment[] => {
+    if (segment.type === 'text') {
+      const raw = String(segment.raw || '')
+      return raw ? [{ type: 'text', raw }] : []
+    }
+    if (segment.type === 'interrupt') {
+      const approvalId = String(segment.approvalId || '')
+      return approvalId ? [{ type: 'interrupt', approvalId }] : []
+    }
+    return [{
+      type: 'tool-group',
+      groupId: segment.groupId,
+      operationKey: segment.operationKey,
+    }]
+  })
   const base = { timelineItems, toolCalls, artifacts, rawText }
   const rendered = asRenderedMessage(base)
 
@@ -317,6 +361,7 @@ export function foldTurn(
     thinkingText,
     toolTimes,
     statusHistory,
+    timelineSegments,
     parts: toParts(rendered, renderMarkdown, toolCallGroups, ownerKey, interrupts, interruptState),
     sources: toSources(rendered),
   }

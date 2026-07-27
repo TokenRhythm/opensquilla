@@ -199,7 +199,7 @@
 
               <AssistantActivityTimeline
                 v-if="
-                  liveActivityProjection.activityClusters.length
+                  liveActivityTimelineItems.length
                   || liveActivityProjection.statusSteps.length
                 "
                 variant="checklist"
@@ -215,7 +215,18 @@
                 @toggle-group="toggleToolGroup"
                 @toggle-item="toggleToolItem"
                 @show-result="showToolResultModal"
-              />
+              >
+                <template #interrupt="{ part }">
+                  <InterruptPart
+                    :part="part"
+                    timeline
+                    @resolve="resolveInterrupt"
+                    @extend="extendInterrupt"
+                    @clarify-submit="(fields, request) => submitClarify(fields, request)"
+                    @clarify-dismiss="dismissClarify"
+                  />
+                </template>
+              </AssistantActivityTimeline>
             </ActivityDisclosure>
 
             <!-- Provisional answer candidate: the left rule + draft tag mark
@@ -235,19 +246,6 @@
               v-if="liveAnswerPart && !streamActivityStale"
               class="stream-caret"
               aria-hidden="true"
-            />
-
-            <!-- Live inline interrupts (fold-driven): approval / clarify cards
-                 that block the in-flight turn, rendered after the activity body
-                 and before the deliverables. -->
-            <InterruptPart
-              v-for="part in liveInterruptParts"
-              :key="part.key"
-              :part="part"
-              @resolve="resolveInterrupt"
-              @extend="extendInterrupt"
-              @clarify-submit="(fields, request) => submitClarify(fields, request)"
-              @clarify-dismiss="dismissClarify"
             />
 
             <ChatArtifactList
@@ -417,6 +415,8 @@
       :send-blocked-message="composerSendBlockedMessage"
       :run-mode="runMode"
       :allowed-run-modes="allowedRunModes"
+      :run-mode-locked="runModeLocked"
+      :run-mode-lock-message="t('chat.composer.runModeLocked')"
       :model-routing-mode="modelRoutingMode"
       :model-routing-settings-busy="modelRoutingSettingsBusy"
       :router-visual-effects-enabled="routerVisualEffectsEnabled"
@@ -572,7 +572,6 @@ import { useMetaRuns } from '@/composables/chat/useMetaRuns'
 import { runStatusLabelText as sessionRunStatusLabelText } from '@/composables/useSessions'
 import { useChatSessionRoute } from '@/composables/chat/useChatSessionRoute'
 import {
-  persistMaterializedSessionRunMode,
   useChatRunModePreference,
   type RunModePolicy,
 } from '@/composables/chat/useChatRunModePreference'
@@ -613,7 +612,7 @@ import type {
   SessionEventPayload,
 } from '@/types/rpc'
 import type { ModelRoutingMode } from '@/types/modelRouting'
-import type { SandboxRunMode } from '@/types/sandbox'
+import { isSandboxRunMode, type SandboxRunMode } from '@/types/sandbox'
 import type { ChatPart, InterruptViewState } from '@/types/parts'
 import { artifactDownloadUrl } from '@/utils/chat/artifacts'
 import { fetchDisplayAttachmentBlob } from '@/utils/chat/attachmentAccess'
@@ -761,15 +760,22 @@ const {
 } = chatElevatedMode
 
 const {
-  runMode,
+  runMode: globalRunMode,
   allowedRunModes,
-  setRunMode: setPersistedRunMode,
+  hydrateRunModePreference,
+  setGlobalRunMode,
+  applyRunModePreferenceChanged,
 } = useChatRunModePreference({
+  rpc,
   runModePolicy: () => {
     const auth = rpc.auth as RpcAuthPayload | null
     return auth?.runModePolicy
   },
 })
+const activeRunModeLock = ref<SandboxRunMode | null>(null)
+const runMode = computed<SandboxRunMode>(
+  () => activeRunModeLock.value ?? globalRunMode.value,
+)
 
 const sandboxSetupRecovery = useSandboxSetupRecovery({
   rpc,
@@ -1203,6 +1209,9 @@ const chatSessionSubscription = useChatSessionSubscription({
   resetStreamIdleTimer,
   resetStreamLiveTurnState,
   onAuthoritativeIdle: () => {
+    if (pendingQueueOwnerContext.value?.sessionKey !== sessionKey.value) {
+      activeRunModeLock.value = null
+    }
     const taskId = activeStreamTaskId.value
     if (
       taskId
@@ -1210,6 +1219,14 @@ const chatSessionSubscription = useChatSessionSubscription({
       && taskId !== STOPPED_STREAM_TASK_ID
     ) {
       schedulePendingDrainAfterTerminal()
+    }
+  },
+  onRunModeLock: lock => {
+    if (lock.locked === false) return
+    if (isSandboxRunMode(lock.runMode)) {
+      activeRunModeLock.value = lock.runMode
+    } else if (activeRunModeLock.value === null) {
+      activeRunModeLock.value = globalRunMode.value
     }
   },
   beginSessionMetadataResolution: key =>
@@ -1231,12 +1248,30 @@ const {
   unsubscribeSession,
 } = chatSessionSubscription
 applySessionRunState = chatSessionSubscription.applySessionRunState
-const canStop = computed(() => !isSessionHydrating.value && (
+const sessionHasActiveWork = computed(() => (
   isStreaming.value
   || activeTaskGroups.value.size > 0
   || ['queued', 'running', 'approval_pending'].includes(runStatus.value.status)
   || pendingQueueOwnerContext.value?.sessionKey === sessionKey.value
 ))
+const canStop = computed(() => !isSessionHydrating.value && sessionHasActiveWork.value)
+const runModeLocked = computed(
+  () => isSessionHydrating.value
+    || sessionHasActiveWork.value
+    || activeRunModeLock.value !== null,
+)
+
+watch(sessionHasActiveWork, active => {
+  if (active && activeRunModeLock.value === null) {
+    activeRunModeLock.value = globalRunMode.value
+  } else if (!active && !isSessionHydrating.value) {
+    activeRunModeLock.value = null
+  }
+}, { flush: 'sync' })
+
+watch(sessionKey, () => {
+  activeRunModeLock.value = null
+})
 
 const chatSessionRuntime = useChatSessionRuntime({
   sessionKey,
@@ -1774,14 +1809,9 @@ function readAuthToken(): string {
 }
 
 async function setComposerRunMode(mode: SandboxRunMode) {
-  const selectedMode = setPersistedRunMode(mode)
+  if (runModeLocked.value) return
   try {
-    await persistMaterializedSessionRunMode({
-      rpc,
-      sessionKey: sessionKey.value,
-      isDraft: isDraftRoute(),
-      runMode: selectedMode,
-    })
+    await setGlobalRunMode(mode)
   } catch (cause) {
     const detail = cause instanceof Error ? cause.message : String(cause)
     console.warn('Failed to persist sandbox run mode:', detail)
@@ -2490,6 +2520,25 @@ onMounted(async () => {
 
   // Load elevated mode
   loadElevatedMode()
+
+  const refreshRunModePreference = async () => {
+    try {
+      await hydrateRunModePreference()
+    } catch (cause) {
+      console.warn(
+        'Failed to hydrate global sandbox run mode:',
+        cause instanceof Error ? cause.message : String(cause),
+      )
+    }
+  }
+  unsubs.push(rpc.on(
+    'sandbox.run_mode.preference.changed',
+    payload => applyRunModePreferenceChanged(payload),
+  ))
+  unsubs.push(rpc.on('_state', state => {
+    if (state === 'connected') void refreshRunModePreference()
+  }))
+  void refreshRunModePreference()
 
   // Load feature toggles
   await loadFeatureToggles()

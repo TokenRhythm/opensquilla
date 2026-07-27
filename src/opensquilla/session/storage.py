@@ -241,7 +241,8 @@ def _serialized_read[**P, R](
 # Version 10 added the durable provider usage ledger and content-free daily usage
 # telemetry aggregates. Version 11 added per-item provider-native billing receipts.
 # Version 12 added persistent project workspaces and optional session bindings.
-SCHEMA_VERSION = 12
+# Version 13 added backend-owned runtime preferences.
+SCHEMA_VERSION = 13
 
 # Session rows at or above this semantic version were created by fork logic
 # that records enough existing metadata for canonical coverage to be checked
@@ -340,6 +341,14 @@ CREATE INDEX IF NOT EXISTS idx_sessions_workspace_id ON sessions(workspace_id)
 _CREATE_IDX_SESSIONS_UPDATED = (
     "CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at)"
 )
+
+_CREATE_RUNTIME_PREFERENCES = """
+CREATE TABLE IF NOT EXISTS runtime_preferences (
+    preference_key TEXT PRIMARY KEY,
+    preference_value TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+)
+"""
 
 _CREATE_TRANSCRIPT = """
 CREATE TABLE IF NOT EXISTS transcript_entries (
@@ -1046,6 +1055,20 @@ class SessionStorage:
         self._sleep = asyncio.sleep
         self._monotonic = time.monotonic
         self._random = random.random
+        self._restart_abandoned_session_keys: tuple[str, ...] = ()
+
+    @property
+    def restart_abandoned_session_keys(self) -> tuple[str, ...]:
+        """Sessions whose in-flight tasks were orphaned by process restart."""
+
+        return self._restart_abandoned_session_keys
+
+    def take_restart_abandoned_session_keys(self) -> tuple[str, ...]:
+        """Return and clear the one-shot restart recovery signal."""
+
+        session_keys = self._restart_abandoned_session_keys
+        self._restart_abandoned_session_keys = ()
+        return session_keys
 
     async def connect(self) -> None:
         self._conn = await aiosqlite.connect(self._db_path, isolation_level=None)
@@ -1262,6 +1285,7 @@ class SessionStorage:
         await self._conn.execute(_CREATE_SESSIONS)
         await self._conn.execute(_CREATE_PROJECT_WORKSPACES)
         await self._conn.execute(_CREATE_IDX_PROJECT_WORKSPACES_ORDER)
+        await self._conn.execute(_CREATE_RUNTIME_PREFERENCES)
         await self._conn.execute(_CREATE_TRANSCRIPT)
         await self._conn.execute(_CREATE_IDX_TRANSCRIPT_SESSION)
         await self._conn.execute(_CREATE_IDX_TRANSCRIPT_KEY)
@@ -3446,6 +3470,49 @@ class SessionStorage:
             row = await cur.fetchone()
         return int(row[0]) if row is not None else 0
 
+    # ── Backend-owned runtime preferences ──────────────────────────────────
+
+    @_serialized_read
+    async def get_runtime_preference(self, key: str) -> str | None:
+        """Return one persisted runtime preference, if configured."""
+        normalized_key = key.strip() if isinstance(key, str) else ""
+        if not normalized_key:
+            raise ValueError("runtime preference key must not be empty")
+        async with self.conn.execute(
+            """
+            SELECT preference_value
+            FROM runtime_preferences
+            WHERE preference_key = ?
+            """,
+            (normalized_key,),
+        ) as cur:
+            row = await cur.fetchone()
+        return str(row[0]) if row is not None else None
+
+    async def set_runtime_preference(self, key: str, value: str) -> str:
+        """Persist one runtime preference and return its confirmed value."""
+        normalized_key = key.strip() if isinstance(key, str) else ""
+        normalized_value = value.strip() if isinstance(value, str) else ""
+        if not normalized_key:
+            raise ValueError("runtime preference key must not be empty")
+        if not normalized_value:
+            raise ValueError("runtime preference value must not be empty")
+        async with self._write_transaction("set_runtime_preference") as conn:
+            await conn.execute(
+                """
+                INSERT INTO runtime_preferences (
+                    preference_key,
+                    preference_value,
+                    updated_at
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(preference_key) DO UPDATE SET
+                    preference_value = excluded.preference_value,
+                    updated_at = excluded.updated_at
+                """,
+                (normalized_key, normalized_value, _now_ms()),
+            )
+        return normalized_value
+
     # ── AgentTask ledger CRUD ───────────────────────────────────────────────
 
     @staticmethod
@@ -3897,6 +3964,25 @@ class SessionStorage:
             SessionStatus.TIMEOUT,
         )
         async with self._write_transaction("mark_abandoned_agent_tasks") as conn:
+            async with conn.execute(
+                """
+                SELECT DISTINCT session_key
+                FROM agent_tasks
+                WHERE status IN (?, ?)
+                   OR (status = ? AND terminal_reason = ?)
+                ORDER BY session_key ASC
+                """,
+                (
+                    AgentTaskStatus.QUEUED,
+                    AgentTaskStatus.RUNNING,
+                    AgentTaskStatus.ABANDONED,
+                    "process_restart",
+                ),
+            ) as restart_cur:
+                self._restart_abandoned_session_keys = tuple(
+                    str(row[0]) for row in await restart_cur.fetchall()
+                )
+
             async with conn.execute(
                 """
                 SELECT DISTINCT agent_tasks.session_key
@@ -4396,6 +4482,7 @@ class SessionStorage:
             "last_account_id",
             "last_thread_id",
             "delivery_context",
+            "origin",
         }
         session_updates = dict(session_updates or {})
         unknown_session_updates = sorted(set(session_updates) - allowed_session_updates)

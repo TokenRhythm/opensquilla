@@ -175,6 +175,97 @@ async def test_accept_turn_commits_message_session_task_and_receipt_together(tmp
 
 
 @pytest.mark.asyncio
+async def test_accept_turn_updates_session_origin_in_same_transaction(tmp_path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        session = _session()
+        session.origin = {
+            "surface": "webchat",
+            "sandbox_run_context": {
+                "run_mode": "trusted",
+                "run_mode_source": "operator_default",
+            },
+        }
+        await storage.upsert_session(session)
+        selected_origin = {
+            "surface": "webchat",
+            "sandbox_run_context": {
+                "run_mode": "standard",
+                "run_mode_source": "user",
+            },
+        }
+
+        await storage.accept_turn(
+            _entry("message-mode"),
+            expected_epoch=0,
+            updated_at=200,
+            task_record=_task("task-mode"),
+            source_scope="webui",
+            request_session_key=SESSION_KEY,
+            client_request_id="request-mode",
+            request_fingerprint="sha256:request-mode",
+            session_updates={"origin": selected_origin},
+        )
+
+        persisted = await storage.get_session(SESSION_KEY)
+        assert persisted is not None
+        assert persisted.origin == selected_origin
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_accept_turn_rolls_back_session_origin_with_failed_task_insert(tmp_path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        original_origin = {
+            "sandbox_run_context": {
+                "run_mode": "trusted",
+                "run_mode_source": "operator_default",
+            }
+        }
+        session = _session()
+        session.origin = original_origin
+        await storage.upsert_session(session)
+        await storage.conn.execute(
+            """
+            CREATE TRIGGER fail_mode_task_insert
+            BEFORE INSERT ON agent_tasks
+            BEGIN
+                SELECT RAISE(ABORT, 'injected mode acceptance failure');
+            END
+            """
+        )
+
+        with pytest.raises(sqlite3.IntegrityError, match="injected mode acceptance failure"):
+            await storage.accept_turn(
+                _entry("message-mode-failed"),
+                expected_epoch=0,
+                updated_at=200,
+                task_record=_task("task-mode-failed"),
+                source_scope="webui",
+                request_session_key=SESSION_KEY,
+                client_request_id="request-mode-failed",
+                request_fingerprint="sha256:request-mode-failed",
+                session_updates={
+                    "origin": {
+                        "sandbox_run_context": {
+                            "run_mode": "full",
+                            "run_mode_source": "user",
+                        }
+                    }
+                },
+            )
+
+        persisted = await storage.get_session(SESSION_KEY)
+        assert persisted is not None
+        assert persisted.origin == original_origin
+        assert await storage.count_transcript_entries(SESSION_ID) == 0
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failing_table", ["agent_tasks", "turn_ingress_receipts"])
 async def test_accept_turn_rolls_back_every_write_when_an_insert_fails(
     tmp_path,

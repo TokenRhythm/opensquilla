@@ -2985,6 +2985,7 @@
       "runModeFull": "Full Access",
       "runModeFullDesc": "Allows direct access to files, the network, and the system without asking each time.",
       "runModeFullUnavailable": "Full Access is only available to the session owner.",
+      "runModeLocked": "Run mode cannot be changed while this session has active work.",
       "badgeNew": "NEW"
     },
     "pending": {

@@ -2985,6 +2985,7 @@
       "runModeFull": "フルアクセス",
       "runModeFullDesc": "ファイル、ネットワーク、システムへ毎回確認せず直接アクセスできます。",
       "runModeFullUnavailable": "フルアクセスはセッションの所有者のみ利用できます。",
+      "runModeLocked": "このセッションでタスクが実行中のため、実行モードは変更できません。",
       "badgeNew": "NEW"
     },
     "pending": {

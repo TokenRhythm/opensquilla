@@ -71,6 +71,10 @@ function pushTimelineItem(parts: ChatPart[], item: ChatStreamTimelineItem) {
     }
     return
   }
+  if (item.type === 'interrupt') {
+    parts.push(item.part)
+    return
+  }
   return assertNever(item)
 }
 
@@ -136,7 +140,16 @@ export function toParts(
   // (2c) interrupts — after the body, before artifacts: an approval blocks the
   // run mid-stream, so it belongs after the text/tools that preceded it and
   // before the turn's final deliverables. One part per id, in arrival order.
+  const timelineInterruptIds = new Set(
+    msg.timelineItems
+      ?.filter(
+        (item): item is Extract<ChatStreamTimelineItem, { type: 'interrupt' }> =>
+          item.type === 'interrupt',
+      )
+      .map(item => item.approvalId) ?? [],
+  )
   for (const it of interrupts) {
+    if (timelineInterruptIds.has(it.approvalId)) continue
     const state = interruptState.get(it.approvalId)
     parts.push({
       type: 'interrupt',

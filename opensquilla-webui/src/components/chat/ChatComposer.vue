@@ -128,17 +128,29 @@
                 @set-model-routing-mode="emit('setModelRoutingMode', $event)"
               />
             </div>
-            <div ref="runModeAnchorEl" class="chat-settings-anchor">
+            <div ref="runModeAnchorEl" class="chat-settings-anchor chat-run-mode-anchor">
               <button
                 class="btn btn--icon btn--ghost chat-run-mode-btn"
-                :class="[`chat-run-mode-btn--${runMode}`, { 'is-active': runModeOpen }]"
-                :title="t('chat.composer.runMode')"
+                :class="[`chat-run-mode-btn--${runMode}`, {
+                  'is-active': runModeOpen,
+                  'is-locked': runModeLocked,
+                }]"
+                :title="runModeLocked ? undefined : t('chat.composer.runMode')"
                 :aria-label="t('chat.composer.runMode')"
                 :aria-expanded="runModeOpen ? 'true' : 'false'"
+                :aria-disabled="runModeLocked ? 'true' : 'false'"
+                :aria-describedby="runModeLocked ? 'chat-run-mode-lock-tip' : undefined"
+                :disabled="runModeLocked"
                 @click="toggleRunMode"
               >
                 <Icon name="shield" :size="17" />
               </button>
+              <span
+                v-if="runModeLocked"
+                id="chat-run-mode-lock-tip"
+                class="chat-run-mode-lock-tip"
+                role="tooltip"
+              >{{ runModeLockMessage }}</span>
               <ChatComposerRunMode
                 v-if="runModeOpen"
                 :run-mode="runMode"
@@ -243,7 +255,7 @@ interface ChatComposerExpose {
   resizeTextarea: () => void
 }
 
-defineProps<{
+const props = defineProps<{
   attachments: Attachment[]
   busySendMode: 'queue' | 'steer'
   hasSendContent: boolean
@@ -255,6 +267,8 @@ defineProps<{
   sendBlockedMessage?: string
   runMode: SandboxRunMode
   allowedRunModes: SandboxRunMode[]
+  runModeLocked: boolean
+  runModeLockMessage: string
   modelRoutingMode: ModelRoutingMode
   modelRoutingSettingsBusy: boolean
   routerVisualEffectsEnabled: boolean
@@ -371,12 +385,17 @@ function toggleModelRouting() {
 }
 
 function toggleRunMode() {
+  if (props.runModeLocked) return
   runModeOpen.value = !runModeOpen.value
   if (runModeOpen.value) {
     settingsOpen.value = false
     modelRoutingOpen.value = false
   }
 }
+
+watch(() => props.runModeLocked, (locked) => {
+  if (locked) runModeOpen.value = false
+})
 
 function attachmentIcon(att: Attachment): IconName {
   return isImageDisplayAttachment(att) ? 'image' : 'fileText'
@@ -922,6 +941,60 @@ defineExpose<ChatComposerExpose>({
   color: var(--run-mode-tone);
 }
 
+.chat-run-mode-btn.is-locked {
+  opacity: 0.46;
+  filter: grayscale(0.6);
+  cursor: default;
+}
+
+.chat-run-mode-lock-tip {
+  position: absolute;
+  bottom: calc(100% + 10px);
+  left: 50%;
+  z-index: 220;
+  width: max-content;
+  max-width: min(240px, calc(100vw - 24px));
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  color: var(--text);
+  box-shadow: var(--shadow-md);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  line-height: 1.35;
+  white-space: nowrap;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translate(-50%, 3px) scale(0.98);
+  transform-origin: bottom center;
+  transition:
+    opacity var(--dur-fast) var(--ease-out),
+    transform var(--dur-fast) var(--ease-out),
+    visibility 0s linear var(--dur-fast);
+}
+
+.chat-run-mode-lock-tip::after {
+  content: "";
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  width: 7px;
+  height: 7px;
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elevated);
+  transform: translate(-50%, -4px) rotate(45deg);
+}
+
+.chat-run-mode-anchor:hover > .chat-run-mode-lock-tip {
+  opacity: 1;
+  visibility: visible;
+  transform: translate(-50%, 0) scale(1);
+  transition-delay: var(--dur-base), var(--dur-base), 0s;
+}
+
 .chat-send-btn.btn--primary {
   background: var(--bg-hover);
   color: var(--text-dim);
@@ -962,9 +1035,19 @@ defineExpose<ChatComposerExpose>({
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .chat-run-mode-lock-tip {
+    transition: none;
+  }
+
   .composer-ctl-enter-active,
   .composer-ctl-leave-active {
     transition: none;
+  }
+}
+
+@media (hover: none) {
+  .chat-run-mode-lock-tip {
+    display: none;
   }
 }
 </style>

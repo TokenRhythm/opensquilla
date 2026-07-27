@@ -2985,6 +2985,7 @@
       "runModeFull": "Vollzugriff",
       "runModeFullDesc": "Greift ohne einzelne Rückfragen direkt auf Dateien, Netzwerk und System zu.",
       "runModeFullUnavailable": "Vollzugriff ist nur für den Eigentümer der Sitzung verfügbar.",
+      "runModeLocked": "Der Ausführungsmodus kann nicht geändert werden, solange diese Sitzung aktiv ist.",
       "badgeNew": "NEW"
     },
     "pending": {

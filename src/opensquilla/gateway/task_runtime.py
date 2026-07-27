@@ -103,6 +103,17 @@ def _task_identity_payload(
     return payload
 
 
+def _accepted_run_mode_payload(override: Any) -> dict[str, str] | None:
+    from opensquilla.gateway.project_workspace_runtime import AcceptedRunModeOverride
+
+    if not isinstance(override, AcceptedRunModeOverride):
+        return None
+    payload = {"run_mode": override.run_mode.value}
+    if isinstance(override.run_mode_source, str) and override.run_mode_source:
+        payload["run_mode_source"] = override.run_mode_source
+    return payload
+
+
 def _reusable_route_envelope(envelope: RouteEnvelope) -> RouteEnvelope:
     """Detach one route for reuse without execution-scoped freshness."""
 
@@ -1011,6 +1022,11 @@ class TaskRuntime:
                 user_message_id=persisted_user_message_id,
             ),
         }
+        accepted_run_mode_payload = _accepted_run_mode_payload(
+            accepted_run_mode_override,
+        )
+        if accepted_run_mode_payload is not None:
+            record.details["accepted_run_mode"] = accepted_run_mode_payload
         runtime_task = _RuntimeTask(
             task_id=record.task_id,
             envelope=envelope,
@@ -1530,8 +1546,9 @@ class TaskRuntime:
         message: str,
         provenance: dict[str, Any] | None = None,
         stream_event_sink: TaskStreamEventSink | None = None,
+        accepted_run_mode_override: Any | None = None,
     ) -> TaskHandle:
-        """Send a follow-up while preserving an authoritative routing context."""
+        """Send a follow-up while preserving authoritative routing and mode context."""
         if not isinstance(envelope, RouteEnvelope):
             raise TypeError("envelope must be a RouteEnvelope")
         canonical_session_key = canonicalize_session_key(envelope.session_key)
@@ -1546,6 +1563,7 @@ class TaskRuntime:
             message,
             mode="followup",
             stream_event_sink=stream_event_sink,
+            accepted_run_mode_override=accepted_run_mode_override,
             update_envelope_cache=False,
         )
 

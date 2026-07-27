@@ -673,7 +673,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     const explicitTimeline = Array.isArray(msg.timeline) ? msg.timeline : []
     if (explicitTimeline.length) {
       const calls = normalizeToolCalls(msg.tool_calls)
-      return timelineFromSegments(explicitTimeline, calls, ownerKey)
+      return timelineFromSegments(explicitTimeline, calls, ownerKey, msg.interrupts)
     }
     const rawSegments = Array.isArray(msg.tool_calls) ? msg.tool_calls : []
     const hasPersistedTimeline = rawSegments.some(seg => ['text', 'tool_use', 'tool_result'].includes(String(seg?.type || '')))
@@ -681,8 +681,24 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     return timelineFromPersistedSegments(rawSegments, ownerKey)
   }
 
-  function timelineFromSegments(segments: ChatTimelineSegment[], calls: ChatToolCall[], ownerKey: string): ChatStreamTimelineItem[] {
+  function timelineFromSegments(
+    segments: ChatTimelineSegment[],
+    calls: ChatToolCall[],
+    ownerKey: string,
+    interrupts: ChatMessage['interrupts'] = [],
+  ): ChatStreamTimelineItem[] {
     const groupsById = new Map(toolCallGroups(calls, ownerKey).map(group => [group.groupId, group]))
+    const interruptsById = new Map(
+      (interrupts ?? []).flatMap(part => {
+        const directId = part.approval?.approvalId
+        if (directId) return [[directId, part] as const]
+        const marker = ':interrupt:'
+        const markerIndex = part.key.indexOf(marker)
+        return markerIndex >= 0
+          ? [[part.key.slice(markerIndex + marker.length), part] as const]
+          : []
+      }),
+    )
     return segments.flatMap((seg, idx): ChatStreamTimelineItem[] => {
       if (seg?.type === 'text') {
         const raw = String(seg.raw ?? seg.text ?? '')
@@ -692,6 +708,18 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         const groupId = String(seg.groupId || seg.group_id || '')
         const group = groupId ? groupsById.get(groupId) : null
         return group ? [{ type: 'tool-group', key: groupId, group }] : []
+      }
+      if (seg?.type === 'interrupt') {
+        const approvalId = String(seg.approvalId || seg.approval_id || '')
+        const part = approvalId ? interruptsById.get(approvalId) : null
+        return part
+          ? [{
+              type: 'interrupt',
+              key: part.key || `${ownerKey}:interrupt:${approvalId}`,
+              approvalId,
+              part,
+            }]
+          : []
       }
       return []
     })

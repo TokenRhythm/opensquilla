@@ -38,6 +38,40 @@ def test_approval_queue_request_persists_across_queue_restart(tmp_path) -> None:
     reloaded.close()
 
 
+def test_expire_pending_for_session_only_terminalizes_matching_approvals(tmp_path) -> None:
+    queue = ApprovalQueue(db_path=str(tmp_path / "approval_queue.sqlite"))
+    restarted_key = "agent:main:webchat:restart"
+    matching_ids = [
+        queue.request("exec", {"sessionKey": restarted_key, "toolName": "shell"}),
+        queue.request("plugin", {"session_key": restarted_key, "pluginId": "example"}),
+    ]
+    claimed_id = queue.request(
+        "exec",
+        {"sessionKey": restarted_key, "toolName": "claimed-shell"},
+    )
+    queue.claim_resolution(claimed_id)
+    matching_ids.append(claimed_id)
+    other_id = queue.request(
+        "exec",
+        {"sessionKey": "agent:main:webchat:other", "toolName": "shell"},
+    )
+    unscoped_id = queue.request("plugin", {"pluginId": "unscoped"})
+
+    try:
+        assert queue.expire_pending_for_session(restarted_key) == 3
+        assert queue.expire_pending_for_session(restarted_key) == 0
+
+        for approval_id in matching_ids:
+            entry = queue.get(approval_id)
+            assert entry.resolved is True
+            assert entry.approved is False
+            assert entry.resolution == "expired"
+        assert queue.get(other_id).resolved is False
+        assert queue.get(unscoped_id).resolved is False
+    finally:
+        queue.close()
+
+
 def test_channel_approval_code_binding_persists_across_queue_restart(tmp_path) -> None:
     db_path = tmp_path / "approval_queue.sqlite"
     queue = ApprovalQueue(db_path=str(db_path))

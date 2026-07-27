@@ -1865,7 +1865,7 @@ class TestSessionsSend:
         assert runtime.enqueue_calls[0]["fresh_user_session"] is False
 
     @pytest.mark.asyncio
-    async def test_send_uses_source_run_mode_without_persisting_to_session(self, dispatcher):
+    async def test_send_persists_source_run_mode_to_session(self, dispatcher):
         class RecordingTaskRuntime:
             def __init__(self) -> None:
                 self.enqueue_calls: list[dict[str, Any]] = []
@@ -1925,8 +1925,15 @@ class TestSessionsSend:
         assert envelope.metadata["run_mode"] == "full"
         assert envelope.metadata["sandbox_run_context"]["run_mode"] == "full"
         assert envelope.metadata["elevated"] == "full"
-        assert session.origin["sandbox_run_context"]["run_mode"] == "standard"
-        assert manager.updates == []
+        assert session.origin["sandbox_run_context"]["run_mode"] == "full"
+        assert session.origin["sandbox_run_context"]["run_mode_source"] == "user"
+        assert session.origin["sandbox_run_context"]["workspace"] == "/workspace"
+        assert manager.updates == [
+            (
+                session.session_key,
+                {"origin": session.origin},
+            )
+        ]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -5064,6 +5071,92 @@ class TestSessionsMessagesSubscribe:
         assert isinstance(res.payload["current_stream_seq"], int)
         assert res.payload["replay_complete"] is True
         assert res.payload["replayed_count"] == 0
+        assert res.payload["run_mode_lock"] == {"locked": False}
+
+    @pytest.mark.asyncio
+    async def test_messages_subscribe_projects_active_task_run_mode_lock(
+        self, dispatcher
+    ):
+        key = "agent:main:webchat:active-mode"
+        session = FakeSession(session_key=key)
+        manager = FakeSessionManager([session])
+        manager._storage._agent_tasks[key] = [
+            SimpleNamespace(
+                task_id="task-active-mode",
+                status="running",
+                queue_mode="followup",
+                run_kind="web_turn",
+                source_kind="webui",
+                created_at=100,
+                started_at=110,
+                finished_at=None,
+                terminal_reason=None,
+                details={
+                    "accepted_run_mode": {
+                        "run_mode": "standard",
+                        "run_mode_source": "user",
+                    }
+                },
+            )
+        ]
+        ctx = make_ctx(session_manager=manager)
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.messages.subscribe",
+            {"key": key},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert res.payload["run_mode_lock"] == {
+            "locked": True,
+            "runMode": "standard",
+            "source": "task",
+        }
+
+    @pytest.mark.asyncio
+    async def test_messages_subscribe_projects_background_run_mode_lock(
+        self, dispatcher, ctx_with_sessions, session, monkeypatch
+    ):
+        from opensquilla.gateway.project_workspace_runtime import (
+            AcceptedRunModeOverride,
+        )
+        from opensquilla.sandbox.run_mode import RunMode
+
+        async def _active_group_ids(_key: str) -> list[str]:
+            return ["group-live"]
+
+        async def _active_override(_key: str) -> AcceptedRunModeOverride:
+            return AcceptedRunModeOverride(
+                run_mode=RunMode.TRUSTED,
+                run_mode_source="user",
+                source="request",
+            )
+
+        monkeypatch.setattr(
+            "opensquilla.gateway.subagent_announce.active_background_completion_group_ids",
+            _active_group_ids,
+        )
+        monkeypatch.setattr(
+            "opensquilla.gateway.subagent_announce."
+            "active_background_completion_run_mode_override",
+            _active_override,
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.messages.subscribe",
+            {"key": session.session_key},
+            ctx_with_sessions,
+        )
+
+        assert res.ok is True
+        assert res.payload["run_mode_lock"] == {
+            "locked": True,
+            "runMode": "trusted",
+            "source": "background",
+        }
 
     @pytest.mark.asyncio
     async def test_messages_subscribe_reports_authoritative_active_task_groups(

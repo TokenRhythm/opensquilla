@@ -85,6 +85,7 @@ class BackgroundCompletionManager:
         self._delivery_attempted: set[str] = set()
         self._delivery_targets: dict[str, _DeliveryTarget] = {}
         self._parent_envelopes: dict[str, Any] = {}
+        self._parent_run_mode_overrides: dict[str, Any] = {}
         self._cancelled_groups: set[str] = set()
         self._group_parents: dict[str, str] = {}
         self._watch_tasks: set[asyncio.Task[None]] = set()
@@ -137,6 +138,10 @@ class BackgroundCompletionManager:
             return
         try:
             parent_envelope = _parent_envelope_from_task_runtime(task_runtime, parent_task_id)
+            parent_run_mode_override = _parent_run_mode_override_from_task_runtime(
+                task_runtime,
+                parent_task_id,
+            )
             delivery_target = await _capture_delivery_target(
                 session_manager=self._session_manager,
                 task_runtime=task_runtime,
@@ -157,6 +162,11 @@ class BackgroundCompletionManager:
                 self._group_parents[group_id] = parent_session_key
                 if parent_envelope is not None:
                     self._parent_envelopes.setdefault(group_id, parent_envelope)
+                if parent_run_mode_override is not None:
+                    self._parent_run_mode_overrides.setdefault(
+                        group_id,
+                        parent_run_mode_override,
+                    )
                 if delivery_target is not None:
                     self._delivery_targets.setdefault(group_id, delivery_target)
         finally:
@@ -222,6 +232,21 @@ class BackgroundCompletionManager:
                 and group_id not in self._cancelled_groups
             )
 
+    async def active_run_mode_override(self, parent_session_key: str) -> Any | None:
+        """Return the captured mode for one active parent completion group."""
+        async with self._state_lock:
+            active_group_ids = sorted(
+                group_id
+                for group_id in self._waiting_groups | self._wake_groups
+                if self._group_parents.get(group_id) == parent_session_key
+                and group_id not in self._cancelled_groups
+            )
+            for group_id in active_group_ids:
+                override = self._parent_run_mode_overrides.get(group_id)
+                if override is not None:
+                    return override
+        return None
+
     async def send_parent_wake(
         self,
         *,
@@ -238,6 +263,10 @@ class BackgroundCompletionManager:
             return
         try:
             parent_envelope = _parent_envelope_from_task_runtime(task_runtime, parent_task_id)
+            parent_run_mode_override = _parent_run_mode_override_from_task_runtime(
+                task_runtime,
+                parent_task_id,
+            )
             delivery_target = await _capture_delivery_target(
                 session_manager=self._session_manager,
                 task_runtime=task_runtime,
@@ -261,6 +290,12 @@ class BackgroundCompletionManager:
                 parent_envelope = self._parent_envelopes.get(group_id) or parent_envelope
                 if parent_envelope is not None:
                     self._parent_envelopes[group_id] = parent_envelope
+                parent_run_mode_override = self._parent_run_mode_overrides.get(
+                    group_id,
+                    parent_run_mode_override,
+                )
+                if parent_run_mode_override is not None:
+                    self._parent_run_mode_overrides[group_id] = parent_run_mode_override
                 delivery_target = self._delivery_targets.get(group_id) or delivery_target
                 if delivery_target is not None:
                     self._delivery_targets[group_id] = delivery_target
@@ -273,6 +308,7 @@ class BackgroundCompletionManager:
                         message=message,
                         provenance=provenance,
                         parent_envelope=parent_envelope,
+                        parent_run_mode_override=parent_run_mode_override,
                         delivery_target=delivery_target,
                     )
                 )
@@ -324,6 +360,7 @@ class BackgroundCompletionManager:
             self._delivery_attempted.clear()
             self._delivery_targets.clear()
             self._parent_envelopes.clear()
+            self._parent_run_mode_overrides.clear()
             self._cancelled_groups.clear()
             self._group_parents.clear()
             self._watch_tasks.clear()
@@ -448,6 +485,7 @@ class BackgroundCompletionManager:
             *self._wake_groups,
             *self._delivery_targets,
             *self._parent_envelopes,
+            *self._parent_run_mode_overrides,
         }
         group_ids = {
             group_id for group_id in candidates if self._group_parents.get(group_id) in key_set
@@ -472,6 +510,7 @@ class BackgroundCompletionManager:
         self._delivery_attempted.discard(group_id)
         self._delivery_targets.pop(group_id, None)
         self._parent_envelopes.pop(group_id, None)
+        self._parent_run_mode_overrides.pop(group_id, None)
 
     def _base_payload(
         self,
@@ -497,6 +536,7 @@ class BackgroundCompletionManager:
         message: str,
         provenance: dict[str, Any],
         parent_envelope: Any | None,
+        parent_run_mode_override: Any | None,
         delivery_target: _DeliveryTarget | None,
     ) -> None:
         group_id = self.group_id(parent_session_key, parent_task_id)
@@ -509,6 +549,7 @@ class BackgroundCompletionManager:
                 message=message,
                 provenance=provenance,
                 parent_envelope=parent_envelope,
+                parent_run_mode_override=parent_run_mode_override,
                 delivery_target=delivery_target,
             )
         finally:
@@ -524,6 +565,7 @@ class BackgroundCompletionManager:
         message: str,
         provenance: dict[str, Any],
         parent_envelope: Any | None,
+        parent_run_mode_override: Any | None,
         delivery_target: _DeliveryTarget | None,
     ) -> None:
         group_id = self.group_id(parent_session_key, parent_task_id)
@@ -540,6 +582,7 @@ class BackgroundCompletionManager:
                     message,
                     provenance=provenance,
                     stream_event_sink=stream_collector,
+                    accepted_run_mode_override=parent_run_mode_override,
                 )
             else:
                 handle = await task_runtime.send(
@@ -796,6 +839,7 @@ class BackgroundCompletionManager:
             self._delivery_attempted.discard(group_id)
             self._delivery_targets.pop(group_id, None)
             self._parent_envelopes.pop(group_id, None)
+            self._parent_run_mode_overrides.pop(group_id, None)
             if group_id not in self._cancelled_groups:
                 self._group_parents.pop(group_id, None)
 
@@ -814,6 +858,15 @@ def _parent_envelope_from_task_runtime(task_runtime: Any, parent_task_id: str) -
     tasks = getattr(task_runtime, "_tasks", None)
     runtime_task = tasks.get(parent_task_id) if isinstance(tasks, dict) else None
     return getattr(runtime_task, "envelope", None)
+
+
+def _parent_run_mode_override_from_task_runtime(
+    task_runtime: Any,
+    parent_task_id: str,
+) -> Any | None:
+    tasks = getattr(task_runtime, "_tasks", None)
+    runtime_task = tasks.get(parent_task_id) if isinstance(tasks, dict) else None
+    return getattr(runtime_task, "accepted_run_mode_override", None)
 
 
 async def _capture_delivery_target(

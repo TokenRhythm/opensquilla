@@ -59,6 +59,9 @@ async def test_agent_task_ledger_marks_active_tasks_abandoned_after_restart(tmp_
     restarted = SessionStorage(str(db_path))
     await restarted.connect()
     try:
+        assert restarted.restart_abandoned_session_keys == (key,)
+        assert restarted.take_restart_abandoned_session_keys() == (key,)
+        assert restarted.take_restart_abandoned_session_keys() == ()
         rows = await restarted.list_agent_tasks(session_key=key)
     finally:
         await restarted.close()
@@ -72,6 +75,13 @@ async def test_agent_task_ledger_marks_active_tasks_abandoned_after_restart(tmp_
     assert by_id["running-task"].finished_at is not None
     assert by_id["done-task"].status == AgentTaskStatus.SUCCEEDED
     assert by_id["done-task"].terminal_reason is None
+
+    retried = SessionStorage(str(db_path))
+    await retried.connect()
+    try:
+        assert retried.restart_abandoned_session_keys == (key,)
+    finally:
+        await retried.close()
 
 
 @pytest.mark.asyncio

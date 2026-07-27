@@ -29,6 +29,9 @@ export interface UseChatSessionSubscriptionOptions {
   resetStreamIdleTimer: () => void
   resetStreamLiveTurnState: () => void
   onAuthoritativeIdle?: () => void
+  onRunModeLock?: (
+    lock: NonNullable<SessionMessagesSubscribeResponse['run_mode_lock']>,
+  ) => void
   beginSessionMetadataResolution?: (key: string) => number
   onSessionMetadata?: (
     key: string,
@@ -105,6 +108,10 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
           workspaceId: res.workspaceId,
           projectWorkspace: res.projectWorkspace,
         })
+      }
+      const runModeLock = res.run_mode_lock || res.runModeLock
+      if (runModeLock && typeof runModeLock === 'object') {
+        options.onRunModeLock?.(runModeLock)
       }
       applySessionRunState(res)
       // A pending inline interrupt is newer, stronger evidence than an idle

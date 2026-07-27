@@ -51,6 +51,7 @@ from opensquilla.sandbox.run_context_service import (
 )
 from opensquilla.sandbox.run_mode import (
     RunMode,
+    config_run_mode,
     display_name,
     execution_target,
     normalize_run_mode,
@@ -71,6 +72,8 @@ from opensquilla.sandbox.status import status_payload
 from opensquilla.session.keys import parse_agent_id
 
 _d = get_dispatcher()
+_RUN_MODE_PREFERENCE_KEY = "sandbox.run_mode"
+_RUN_MODE_PREFERENCE_CHANGED_EVENT = "sandbox.run_mode.preference.changed"
 
 
 def _require_params(params: dict | None) -> dict[str, Any]:
@@ -181,6 +184,19 @@ def _require_session_manager(ctx: RpcContext) -> Any:
 def _require_owner(ctx: RpcContext, method: str) -> None:
     if not getattr(ctx.principal, "is_owner", False):
         raise RpcHandlerError("UNAUTHORIZED", f"{method} requires owner principal.")
+
+
+def _run_mode_preference_registry() -> Any:
+    from opensquilla.gateway.websocket import get_registry
+
+    return get_registry()
+
+
+def _runtime_preference_storage(ctx: RpcContext) -> Any:
+    storage = get_session_storage(getattr(ctx, "session_manager", None))
+    if storage is None:
+        raise RpcUnavailableError("Session storage is not configured")
+    return storage
 
 
 def _context_for_principal(context: RunContext, principal: Any) -> RunContext:
@@ -537,6 +553,43 @@ async def _require_sandbox_setup_ready_for_mode(ctx: RpcContext, run_mode: Any) 
             "Sandbox setup must be completed before enabling sandbox run modes.",
             details=status.to_payload(),
         )
+
+
+@_d.method("sandbox.run_mode.preference.get", scope="operator.read")
+async def _handle_run_mode_preference_get(
+    params: dict | None,
+    ctx: RpcContext,
+) -> dict[str, str]:
+    if params is not None and not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    storage = _runtime_preference_storage(ctx)
+    stored = await storage.get_runtime_preference(_RUN_MODE_PREFERENCE_KEY)
+    source = "preference" if stored is not None else "config"
+    mode = normalize_run_mode(stored, default=config_run_mode(ctx.config))
+    mode = coerce_run_mode_for_principal(mode, ctx.principal)
+    return {"runMode": mode.value, "source": source}
+
+
+@_d.method("sandbox.run_mode.preference.set", scope="operator.write")
+async def _handle_run_mode_preference_set(
+    params: dict | None,
+    ctx: RpcContext,
+) -> dict[str, str]:
+    _require_owner(ctx, "sandbox.run_mode.preference.set")
+    params = _require_params(params)
+    mode = normalize_run_mode(params.get("runMode"))
+    await _require_sandbox_setup_ready_for_mode(ctx, mode)
+    storage = _runtime_preference_storage(ctx)
+    confirmed = await storage.set_runtime_preference(
+        _RUN_MODE_PREFERENCE_KEY,
+        mode.value,
+    )
+    payload = {"runMode": confirmed, "source": "preference"}
+    await _run_mode_preference_registry().broadcast(
+        _RUN_MODE_PREFERENCE_CHANGED_EVENT,
+        payload,
+    )
+    return payload
 
 
 @_d.method("sandbox.run_context.get", scope="operator.read")

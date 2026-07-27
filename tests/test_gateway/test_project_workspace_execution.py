@@ -186,6 +186,43 @@ async def test_new_owner_project_uses_full_with_operator_default_provenance(
         assert saved_context["run_mode_source"] == "operator_default"
 
 
+@pytest.mark.parametrize("selected_mode", ["standard", "trusted", "full"])
+@pytest.mark.asyncio
+async def test_new_project_persists_selected_web_run_mode(
+    tmp_path: Path,
+    selected_mode: str,
+) -> None:
+    async with open_stack(tmp_path / f"selected-{selected_mode}.db") as stack:
+        project = await add_project(stack, tmp_path / f"selected-{selected_mode}-project")
+        assert project is not None
+        key = f"agent:main:webchat:selected-{selected_mode}"
+
+        response = await get_dispatcher().dispatch(
+            f"selected-{selected_mode}",
+            "sessions.send",
+            {
+                "key": key,
+                "message": "pwd",
+                "intent": "new_chat",
+                "workspaceId": project.workspace_id,
+                "_source": {
+                    "caller_kind": "web",
+                    "channel_kind": "webchat",
+                    "runMode": selected_mode,
+                },
+            },
+            stack.context,
+        )
+        await asyncio.wait_for(stack.started.wait(), timeout=2.0)
+
+        assert response.ok is True
+        session = await stack.storage.get_session(key)
+        assert session is not None and session.origin is not None
+        saved_context = session.origin[RUN_CONTEXT_ORIGIN_KEY]
+        assert saved_context["run_mode"] == selected_mode
+        assert saved_context["run_mode_source"] == "user"
+
+
 @pytest.mark.asyncio
 async def test_explicit_full_project_uses_operator_default_provenance(
     tmp_path: Path,
@@ -923,6 +960,14 @@ async def test_direct_web_project_turn_preserves_authorized_request_mode_at_exec
         assert tool_context.workspace_dir == project.path
         assert tool_context.sandbox_run_context.run_mode_source == "user"
         assert [grant.domain for grant in tool_context.sandbox_run_context.domains] == [
+            "example.com"
+        ]
+        persisted_session = await stack.storage.get_session(key)
+        assert persisted_session is not None and persisted_session.origin is not None
+        persisted_context = persisted_session.origin[RUN_CONTEXT_ORIGIN_KEY]
+        assert persisted_context["run_mode"] == requested_mode
+        assert persisted_context["run_mode_source"] == "user"
+        assert [grant["domain"] for grant in persisted_context["domains"]] == [
             "example.com"
         ]
 

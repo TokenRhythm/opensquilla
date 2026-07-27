@@ -6,6 +6,7 @@ import {
   useChatStream,
 } from './useChatStream'
 import type { ChatMessage } from '@/types/chat'
+import type { InterruptViewState } from '@/types/parts'
 
 // Focused coverage for the streaming render coalescer: stream deltas are
 // batched onto the frame clock (requestAnimationFrame) and the live reveal
@@ -14,6 +15,7 @@ import type { ChatMessage } from '@/types/chat'
 function makeStream(
   renderMarkdown = vi.fn((t: string, _o?: { highlight?: boolean }) => `<p>${t}</p>`),
   rpcPolicy?: () => Record<string, unknown> | undefined,
+  interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map()),
 ) {
   const scrollToBottom = vi.fn()
   const messages = ref<ChatMessage[]>([])
@@ -28,6 +30,7 @@ function makeStream(
     stripGeneratedArtifactMarkers: (t: string) => t,
     scrollToBottom,
     rpcPolicy,
+    interruptState,
   })
   return { api, messages, scrollToBottom, renderMarkdown }
 }
@@ -160,6 +163,48 @@ describe('useChatStream render coalescing', () => {
     api.endStreaming()
 
     expect(messages.value[0]?.text).toBe('prefixsuffix')
+    api.cleanup()
+  })
+
+  it('commits resolved approvals into the finished assistant timeline', () => {
+    const interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map([
+      ['approval-1', { resolution: null, busy: false, error: '' }],
+    ]))
+    const { api, messages } = makeStream(undefined, undefined, interruptState)
+
+    api.startStreaming()
+    api.appendDelta('before')
+    api.appendInterruptFrame({
+      interruptKind: 'approval',
+      approvalId: 'approval-1',
+      data: {
+        approvalId: 'approval-1',
+        namespace: 'exec',
+        toolName: 'sandbox elevation',
+        command: 'python -c pass',
+        approvalKind: 'sandbox_elevation',
+        args: null,
+        warning: '',
+        agent: 'main',
+        sessionKey: 'agent:main:web',
+        deadline: 0,
+      },
+      at: 1000,
+    })
+    interruptState.value = new Map([
+      ['approval-1', { resolution: 'approved', busy: false, error: '' }],
+    ])
+    api.appendDelta('after')
+    api.endStreaming()
+
+    expect(messages.value[0]?.timeline?.map(segment => segment.type)).toEqual([
+      'text',
+      'interrupt',
+      'text',
+    ])
+    expect((messages.value[0] as any)?.interrupts).toMatchObject([
+      { interruptKind: 'approval', resolution: 'approved' },
+    ])
     api.cleanup()
   })
 

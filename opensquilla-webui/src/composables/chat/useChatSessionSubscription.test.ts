@@ -38,6 +38,54 @@ function createSubscription(hasActiveInterrupt = false) {
 }
 
 describe('useChatSessionSubscription', () => {
+  it('hydrates the authoritative run-mode lock from the subscription snapshot', async () => {
+    const onRunModeLock = vi.fn()
+    const rpc = {
+      waitForConnection: vi.fn(async () => {}),
+      call: async <T = unknown>() => ({
+        subscribed: true,
+        run_status: 'running',
+        active_task: { task_id: 'task-mode', status: 'running' },
+        active_task_group_ids: [],
+        run_mode_lock: {
+          locked: true,
+          runMode: 'standard',
+          source: 'task',
+        },
+        current_stream_seq: 1,
+        replay_complete: true,
+      }) as T,
+    }
+    const subscription = useChatSessionSubscription({
+      rpc,
+      sessionKey: ref('agent:main:webchat:mode-lock'),
+      lastStreamSeq: ref(0),
+      runStatus: ref<ChatRunStatus>({ status: 'idle', label: '', task: null }),
+      isStreaming: ref(false),
+      hasActiveInterrupt: ref(false),
+      activeStreamTaskId: ref(''),
+      activeTaskGroups: ref(new Set<string>()),
+      sessionRunStatus: source => ({
+        status: String(source?.run_status || 'idle') as ChatRunStatusState,
+        label: '',
+        task: source?.active_task || null,
+      }),
+      startStreaming: vi.fn(),
+      loadHistory: vi.fn(),
+      resetStreamIdleTimer: vi.fn(),
+      resetStreamLiveTurnState: vi.fn(),
+      onRunModeLock,
+    })
+
+    await subscription.subscribeSession()
+
+    expect(onRunModeLock).toHaveBeenCalledWith({
+      locked: true,
+      runMode: 'standard',
+      source: 'task',
+    })
+  })
+
   it('preserves an interrupt bubble when a late idle subscription snapshot arrives', async () => {
     const { api, resetStreamLiveTurnState, runStatus } = createSubscription(true)
 

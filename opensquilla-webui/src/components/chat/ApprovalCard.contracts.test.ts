@@ -21,10 +21,14 @@ function approval(overrides: Partial<ChatApprovalItem> = {}): ChatApprovalItem {
   }
 }
 
-async function mountCard(item: ChatApprovalItem, resolution: ChatApprovalResolution | null = null) {
+async function mountCard(
+  item: ChatApprovalItem,
+  resolution: ChatApprovalResolution | null = null,
+  timeline = false,
+) {
   const root = document.createElement('div')
   document.body.appendChild(root)
-  const app = createApp(ApprovalCard, { approval: item, resolution })
+  const app = createApp(ApprovalCard, { approval: item, resolution, timeline })
   app.use(i18n)
   app.mount(root)
   await nextTick()
@@ -64,6 +68,12 @@ describe('ApprovalCard safe context', () => {
     expect(root.querySelector('.approval-outcome--unavailable')).not.toBeNull()
     expect(root.querySelector('.approval-outcome')?.textContent).toContain('Approval no longer available')
     expect(root.querySelector('.approval-card')).toBeNull()
+    app.unmount()
+  })
+
+  it('uses the compact in-flow treatment inside the work timeline', async () => {
+    const { app, root } = await mountCard(approval(), 'approved', true)
+    expect(root.querySelector('.approval-outcome--timeline')).not.toBeNull()
     app.unmount()
   })
 })

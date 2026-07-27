@@ -8,7 +8,7 @@ function pointerDown(target: EventTarget) {
   target.dispatchEvent(new Event('pointerdown', { bubbles: true, composed: true }))
 }
 
-async function mountComposer() {
+async function mountComposer(overrides: Record<string, unknown> = {}) {
   const el = document.createElement('div')
   document.body.appendChild(el)
   const app = createApp(ChatComposer, {
@@ -31,6 +31,9 @@ async function mountComposer() {
     voiceBusy: false,
     voiceRecording: false,
     voiceReady: true,
+    runModeLocked: false,
+    runModeLockMessage: '',
+    ...overrides,
   })
   app.use(i18n)
   app.mount(el)
@@ -95,6 +98,30 @@ describe('ChatComposer popovers', () => {
     await clickButton(el, 'Execution mode')
     expectPopover(el, '.composer-model-routing', false)
     expectPopover(el, '.composer-run-mode', true)
+
+    app.unmount()
+  })
+
+  it('shows a custom lock tooltip without the native title while the session is active', async () => {
+    const lockMessage = 'Run mode cannot be changed while a task is running.'
+    const { app, el } = await mountComposer({
+      runModeLocked: true,
+      runModeLockMessage: lockMessage,
+    })
+    const button = el.querySelector<HTMLButtonElement>(
+      'button[aria-label="Execution mode"]',
+    )
+    const tooltip = el.querySelector<HTMLElement>('[role="tooltip"]')
+
+    expect(button?.disabled).toBe(true)
+    expect(button?.hasAttribute('title')).toBe(false)
+    expect(button?.classList.contains('is-locked')).toBe(true)
+    expect(tooltip?.classList.contains('chat-run-mode-lock-tip')).toBe(true)
+    expect(tooltip?.textContent?.trim()).toBe(lockMessage)
+    expect(button?.getAttribute('aria-describedby')).toBe(tooltip?.id)
+    button?.click()
+    await nextTick()
+    expectPopover(el, '.composer-run-mode', false)
 
     app.unmount()
   })

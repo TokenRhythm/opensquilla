@@ -10,12 +10,23 @@ import {
   type RunModePolicy,
 } from './useChatRunModePreference'
 
-function runInScope(policy: ReturnType<typeof ref<RunModePolicy | null>>) {
+function createRpc() {
+  return {
+    waitForConnection: vi.fn().mockResolvedValue(undefined),
+    call: vi.fn().mockResolvedValue({ runMode: 'full', source: 'preference' }),
+  }
+}
+
+function runInScope(
+  policy: ReturnType<typeof ref<RunModePolicy | null>>,
+  rpc = createRpc(),
+) {
   const scope = effectScope()
   const api = scope.run(() => useChatRunModePreference({
     runModePolicy: () => policy.value,
+    rpc,
   }))!
-  return { api, scope }
+  return { api, scope, rpc }
 }
 
 afterEach(() => {
@@ -51,20 +62,72 @@ describe('useChatRunModePreference', () => {
     scope.stop()
   })
 
-  it('persists manual selections so the next mount keeps them', () => {
+  it('hydrates from the backend and replaces a stale browser cache', async () => {
+    localStorage.setItem(RUN_MODE_STORAGE_KEY, 'standard')
     const policy = ref<RunModePolicy | null>({
       defaultRunMode: 'full',
       allowedRunModes: ['standard', 'trusted', 'full'],
     })
-    const first = runInScope(policy)
+    const rpc = createRpc()
+    rpc.call.mockResolvedValueOnce({ runMode: 'trusted', source: 'preference' })
+    const { api, scope } = runInScope(policy, rpc)
 
-    first.api.setRunMode('standard')
-    first.scope.stop()
+    await api.hydrateRunModePreference()
 
-    const second = runInScope(policy)
-    expect(second.api.runMode.value).toBe('standard')
+    expect(rpc.call).toHaveBeenCalledWith('sandbox.run_mode.preference.get')
+    expect(api.runMode.value).toBe('trusted')
+    expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBe('trusted')
+    scope.stop()
+  })
+
+  it('persists manual selections through the backend before updating cache', async () => {
+    const policy = ref<RunModePolicy | null>({
+      defaultRunMode: 'full',
+      allowedRunModes: ['standard', 'trusted', 'full'],
+    })
+    const rpc = createRpc()
+    rpc.call.mockResolvedValueOnce({ runMode: 'standard', source: 'preference' })
+    const { api, scope } = runInScope(policy, rpc)
+
+    const selected = await api.setGlobalRunMode('standard')
+
+    expect(selected).toBe('standard')
+    expect(rpc.call).toHaveBeenCalledWith('sandbox.run_mode.preference.set', {
+      runMode: 'standard',
+    })
+    expect(api.runMode.value).toBe('standard')
     expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBe('standard')
-    second.scope.stop()
+    scope.stop()
+  })
+
+  it('keeps the confirmed preference when a backend write fails', async () => {
+    const policy = ref<RunModePolicy | null>({
+      defaultRunMode: 'full',
+      allowedRunModes: ['standard', 'trusted', 'full'],
+    })
+    const rpc = createRpc()
+    rpc.call.mockRejectedValueOnce(new Error('write failed'))
+    const { api, scope } = runInScope(policy, rpc)
+
+    await expect(api.setGlobalRunMode('standard')).rejects.toThrow('write failed')
+
+    expect(api.runMode.value).toBe('full')
+    expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBeNull()
+    scope.stop()
+  })
+
+  it('applies a backend broadcast and coerces it to the principal policy', () => {
+    const policy = ref<RunModePolicy | null>({
+      defaultRunMode: 'trusted',
+      allowedRunModes: ['standard', 'trusted'],
+    })
+    const { api, scope } = runInScope(policy)
+
+    api.applyRunModePreferenceChanged({ runMode: 'full' })
+
+    expect(api.runMode.value).toBe('trusted')
+    expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBe('trusted')
+    scope.stop()
   })
 
   it('falls back when a saved preference is no longer allowed', () => {

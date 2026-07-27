@@ -14,7 +14,11 @@
     @toggle-group="$emit('toggleGroup', $event)"
     @toggle-item="$emit('toggleItem', $event)"
     @show-result="(content, title, context) => $emit('showResult', content, title, context)"
-  />
+  >
+    <template #interrupt="{ part }">
+      <slot name="interrupt" :part="part" />
+    </template>
+  </RunTrace>
 </template>
 
 <script setup lang="ts">
@@ -43,5 +47,11 @@ defineEmits<{
   toggleGroup: [groupId: string]
   toggleItem: [renderKey: string]
   showResult: [content: string, title: string, context?: ToolResultContext]
+}>()
+
+defineSlots<{
+  interrupt?: (props: {
+    part: Extract<import('@/types/parts').ChatPart, { type: 'interrupt' }>
+  }) => unknown
 }>()
 </script>

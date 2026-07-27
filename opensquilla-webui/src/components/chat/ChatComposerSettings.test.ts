@@ -4,6 +4,7 @@ import runModeSource from './ChatComposerRunMode.vue?raw'
 import modelRoutingSource from './ChatComposerModelRouting.vue?raw'
 import composerSource from './ChatComposer.vue?raw'
 import viewSource from '../../views/ChatView.vue?raw'
+import zhHans from '../../locales/zh-Hans.json'
 
 function controlSwitchBlock(label: string) {
   const labelIndex = source.indexOf(`label="${label}"`)
@@ -36,9 +37,16 @@ describe('ChatComposerSettings coding mode contract', () => {
     expect(viewSource).toContain(':allowed-run-modes="allowedRunModes"')
     expect(viewSource).toContain('@set-run-mode="setComposerRunMode"')
     expect(viewSource).toContain('useChatRunModePreference')
-    expect(viewSource).toContain('setRunMode: setPersistedRunMode')
-    expect(viewSource).toContain('function setComposerRunMode(mode: SandboxRunMode)')
-    expect(viewSource).toContain('setPersistedRunMode(mode)')
+    expect(viewSource).toContain('setGlobalRunMode')
+    expect(viewSource).toContain('async function setComposerRunMode(mode: SandboxRunMode)')
+    expect(viewSource).toContain('await setGlobalRunMode(mode)')
+    expect(viewSource).toContain(':run-mode-locked="runModeLocked"')
+    expect(viewSource).toContain('|| activeRunModeLock.value !== null')
+    expect(composerSource).toContain(':disabled="runModeLocked"')
+    expect(composerSource).toContain('chat-run-mode-lock-tip')
+    expect(composerSource).not.toContain('cursor: not-allowed')
+    expect(composerSource).toContain('cursor: default')
+    expect(zhHans.chat.composer.runModeLocked).toBe('运行中，当前会话无法修改')
   })
 
   it('offers exactly the three sandbox run modes from the shield popover', () => {

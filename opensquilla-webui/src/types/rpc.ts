@@ -330,6 +330,16 @@ export interface SessionMessagesSubscribeResponse extends SessionEventPayload {
   current_stream_seq?: number
   active_task_group_ids?: string[]
   activeTaskGroupIds?: string[]
+  run_mode_lock?: {
+    locked?: boolean
+    runMode?: 'standard' | 'trusted' | 'full'
+    source?: string
+  }
+  runModeLock?: {
+    locked?: boolean
+    runMode?: 'standard' | 'trusted' | 'full'
+    source?: string
+  }
   workspaceId?: string
   projectWorkspace?: SessionProjectWorkspaceSnapshot | null
 }

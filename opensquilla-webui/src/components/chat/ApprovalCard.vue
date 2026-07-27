@@ -3,7 +3,7 @@
   <div
     v-if="resolution"
     class="approval-outcome"
-    :class="outcomeClass"
+    :class="[outcomeClass, { 'approval-outcome--timeline': timeline }]"
     data-testid="approval-outcome"
     role="status"
   >
@@ -16,6 +16,7 @@
   <article
     v-else
     class="approval-card"
+    :class="{ 'approval-card--timeline': timeline }"
     data-testid="approval-card"
     role="group"
     :aria-label="t('chat.approval.requiredFor', { tool: approval.toolName })"
@@ -126,6 +127,7 @@ const props = defineProps<{
   resolution: ChatApprovalResolution | null
   busy?: boolean
   error?: string
+  timeline?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -489,6 +491,20 @@ function emitDeny() {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.approval-outcome--timeline {
+  width: 100%;
+  margin: 0;
+  padding: 7px 8px;
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, currentColor 5%, transparent);
+}
+
+.approval-card--timeline {
+  width: 100%;
+  margin: var(--sp-2) 0;
+  box-shadow: none;
 }
 
 @keyframes card-enter {

@@ -514,7 +514,12 @@ class ApprovalQueue:
         entry = self.get(approval_id)
         return entry.deadline
 
-    def _expire_if_unresolved(self, approval_id: str) -> bool | None:
+    def _expire_if_unresolved(
+        self,
+        approval_id: str,
+        *,
+        force: bool = False,
+    ) -> bool | None:
         """Resolve a lapsed request as expired, unless it was extended."""
         self._release_stale_claims()
         self._conn.execute("BEGIN IMMEDIATE")
@@ -523,7 +528,7 @@ class ApprovalQueue:
             self._conn.rollback()
             raise KeyError(f"Approval not found: {approval_id}")
         entry = self._row_to_entry(row)
-        if entry.claim_token:
+        if entry.claim_token and not force:
             self._conn.rollback()
             self._pending[approval_id] = entry
             raise ValueError(f"Approval resolution in progress: {approval_id}")
@@ -532,14 +537,16 @@ class ApprovalQueue:
             self._pending[approval_id] = entry
             entry._event.set()
             return entry.approved
-        if entry.deadline > time.time():
+        if not force and entry.deadline > time.time():
             self._conn.rollback()
             self._pending[approval_id] = entry
             return None
+        claim_guard = "" if force else " AND claim_token IS NULL"
         self._conn.execute(
             "UPDATE approval_queue "
-            "SET resolved = 1, approved = 0, resolution = ? "
-            "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
+            "SET resolved = 1, approved = 0, resolution = ?, "
+            "claim_token = NULL, claim_started_at = NULL "
+            f"WHERE approval_id = ? AND resolved = 0{claim_guard}",
             (RESOLUTION_EXPIRED, approval_id),
         )
         self._conn.commit()
@@ -548,6 +555,30 @@ class ApprovalQueue:
         self._pending[approval_id] = entry
         self._notify_event("resolved", entry)
         return entry.approved
+
+    def expire_pending_for_session(self, session_key: str) -> int:
+        """Expire unresolved approvals whose continuation died with a session task."""
+
+        key = session_key.strip()
+        if not key:
+            return 0
+        count = 0
+        rows = self._conn.execute(
+            "SELECT approval_id, params FROM approval_queue WHERE resolved = 0"
+        ).fetchall()
+        for row in rows:
+            params = self._deserialize_params(row["params"])
+            owner_key = str(
+                params.get("sessionKey") or params.get("session_key") or ""
+            ).strip()
+            if owner_key != key:
+                continue
+            if self._expire_if_unresolved(
+                str(row["approval_id"]),
+                force=True,
+            ) is not None:
+                count += 1
+        return count
 
     def resolve(
         self,

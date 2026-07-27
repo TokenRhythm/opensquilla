@@ -34,6 +34,16 @@ export function mergeLiveOnlyFields(prev: ChatMessage, server: ChatMessage): Cha
     merged.interrupted = prev.interrupted
   }
 
+  // Approval/clarify interrupts are live event metadata. Canonical transcript
+  // rows currently persist the surrounding text/tools but not these decisions,
+  // so carry the in-flow timeline snapshot across the immediate history sync.
+  if ((prev.interrupts?.length ?? 0) > 0 && (server.interrupts?.length ?? 0) === 0) {
+    merged.interrupts = prev.interrupts
+    if (prev.timeline?.some(segment => segment.type === 'interrupt')) {
+      merged.timeline = prev.timeline
+    }
+  }
+
   return merged
 }
 
@@ -48,11 +58,29 @@ export function reconcileHistoryMessages(prev: ChatMessage[], incoming: ChatMess
   for (const msg of prev) {
     if (msg.messageId) prevById.set(msg.messageId, msg)
   }
-  if (prevById.size === 0) return incoming
+  const liveInterruptCandidates = prev.filter(message =>
+    !message.messageId
+    && (message.interrupts?.length ?? 0) > 0,
+  )
+  const incomingSignatureCounts = new Map<string, number>()
+  for (const message of incoming) {
+    const signature = `${message.role}\u0000${message.text}`
+    incomingSignatureCounts.set(signature, (incomingSignatureCounts.get(signature) ?? 0) + 1)
+  }
   return incoming.map(server => {
-    if (!server.messageId) return server
-    const prior = prevById.get(server.messageId)
-    return prior ? mergeLiveOnlyFields(prior, server) : server
+    const prior = server.messageId ? prevById.get(server.messageId) : undefined
+    if (prior) return mergeLiveOnlyFields(prior, server)
+
+    // The terminal stream row is optimistic and does not yet know the durable
+    // message id. Graft only on a unique exact role/text match, which avoids
+    // attaching one turn's approvals to repeated assistant content.
+    const signature = `${server.role}\u0000${server.text}`
+    if (incomingSignatureCounts.get(signature) !== 1) return server
+    const candidates = liveInterruptCandidates.filter(candidate =>
+      candidate.role === server.role && candidate.text === server.text)
+    return candidates.length === 1
+      ? mergeLiveOnlyFields(candidates[0], server)
+      : server
   })
 }
 

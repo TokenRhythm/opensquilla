@@ -40,7 +40,7 @@
           <ReasoningPart v-if="reasoningPart" :part="reasoningPart" embedded />
           <AssistantActivityTimeline
             v-if="
-              activityProjection.activityClusters.length
+              activityProjection.activityItems.length
               || activityProjection.statusSteps.length
             "
             :projection="activityProjection"
@@ -54,7 +54,18 @@
             @toggle-group="$emit('toggleToolGroup', $event)"
             @toggle-item="$emit('toggleToolItem', $event)"
             @show-result="(content, title, context) => $emit('showToolResult', content, title, context)"
-          />
+          >
+            <template #interrupt="{ part }">
+              <InterruptPart
+                :part="part"
+                timeline
+                @resolve="(id, decision, note) => $emit('resolveInterrupt', id, decision, note)"
+                @extend="id => $emit('extendInterrupt', id)"
+                @clarify-submit="(fields, request) => $emit('clarifySubmit', fields, request)"
+                @clarify-dismiss="$emit('clarifyDismiss')"
+              />
+            </template>
+          </AssistantActivityTimeline>
         </ActivityDisclosure>
         <TextPart
           v-if="activityProjection.answerPart"
@@ -80,7 +91,18 @@
           @toggle-group="$emit('toggleToolGroup', $event)"
           @toggle-item="$emit('toggleToolItem', $event)"
           @show-result="(content, title, context) => $emit('showToolResult', content, title, context)"
-        />
+        >
+          <template #interrupt="{ part }">
+            <InterruptPart
+              :part="part"
+              timeline
+              @resolve="(id, decision, note) => $emit('resolveInterrupt', id, decision, note)"
+              @extend="id => $emit('extendInterrupt', id)"
+              @clarify-submit="(fields, request) => $emit('clarifySubmit', fields, request)"
+              @clarify-dismiss="$emit('clarifyDismiss')"
+            />
+          </template>
+        </ToolCallTimeline>
         <StatusHistoryPart
           v-if="statusHistory.length"
           :entries="statusHistory"
@@ -90,7 +112,7 @@
       <!-- Inline interrupts: approval / clarify requests that blocked the run,
            rendered after the body and before the ending deliverables. -->
       <InterruptPart
-        v-for="part in interruptParts"
+        v-for="part in standaloneInterruptParts"
         :key="part.key"
         :part="part"
         @resolve="(id, decision, note) => $emit('resolveInterrupt', id, decision, note)"
@@ -380,6 +402,17 @@ const interruptParts = computed(
     props.message.parts?.filter(
       (part): part is Extract<ChatPart, { type: 'interrupt' }> => part.type === 'interrupt',
     ) ?? [],
+)
+const timelineInterruptKeys = computed(() => new Set(
+  props.message.timelineItems
+    ?.filter(
+      (item): item is Extract<import('@/types/chat').ChatStreamTimelineItem, { type: 'interrupt' }> =>
+        item.type === 'interrupt',
+    )
+    .map(item => item.part.key) ?? [],
+))
+const standaloneInterruptParts = computed(() =>
+  interruptParts.value.filter(part => !timelineInterruptKeys.value.has(part.key)),
 )
 // The persisted activity timeline for this finished turn. Empty (fold hidden)
 // for OFF-mode turns and reloaded threads, which carry no snapshot.

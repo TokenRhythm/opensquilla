@@ -8,8 +8,10 @@ from dataclasses import dataclass
 import pytest
 import structlog.testing
 
+from opensquilla.gateway.project_workspace_runtime import AcceptedRunModeOverride
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.task_runtime import TaskRuntime
+from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus
 
 
@@ -312,3 +314,66 @@ async def test_send_passes_stream_event_sink_to_parent_wake_task() -> None:
     await rt.wait(h1.task_id, timeout=1.0)
 
     assert seen_sinks == [None, sink]
+
+
+@pytest.mark.asyncio
+async def test_send_with_envelope_preserves_accepted_run_mode_override() -> None:
+    storage = _StubStorage.fresh()
+    seen_overrides = []
+
+    async def handler(run):
+        seen_overrides.append(run.accepted_run_mode_override)
+
+    rt = TaskRuntime(
+        storage=storage,
+        turn_handler=handler,
+        max_concurrency=2,
+        subagent_reserved_slots=1,
+    )
+    accepted_override = AcceptedRunModeOverride(
+        run_mode=RunMode.STANDARD,
+        run_mode_source="user",
+        source="request",
+    )
+
+    handle = await rt.send_with_envelope(
+        _envelope("agent:s:mode-snapshot"),
+        "wake",
+        accepted_run_mode_override=accepted_override,
+    )
+    await rt.wait(handle.task_id, timeout=1.0)
+
+    assert seen_overrides == [accepted_override]
+
+
+@pytest.mark.asyncio
+async def test_reserve_serializes_accepted_run_mode_into_task_details() -> None:
+    storage = _StubStorage.fresh()
+
+    async def handler(_run):
+        return None
+
+    rt = TaskRuntime(
+        storage=storage,
+        turn_handler=handler,
+        max_concurrency=1,
+    )
+    accepted_override = AcceptedRunModeOverride(
+        run_mode=RunMode.TRUSTED,
+        run_mode_source="user",
+        source="request",
+    )
+
+    reservation = await rt.reserve(
+        _envelope("agent:s:durable-mode-snapshot"),
+        "queued",
+        accepted_run_mode_override=accepted_override,
+    )
+    try:
+        assert reservation.task_record.details["accepted_run_mode"] == {
+            "run_mode": "trusted",
+            "run_mode_source": "user",
+        }
+        assert reservation.runtime_task.accepted_run_mode_override is accepted_override
+    finally:
+        await rt.abort_reservation(reservation)

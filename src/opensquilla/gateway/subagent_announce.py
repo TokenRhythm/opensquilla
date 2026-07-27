@@ -122,6 +122,20 @@ async def active_background_completion_group_ids(parent_session_key: str) -> lis
     return list(await active_group_ids(parent_session_key))
 
 
+async def active_background_completion_run_mode_override(
+    parent_session_key: str,
+) -> Any | None:
+    """Return the accepted mode retained by an active background group."""
+    active_override = getattr(
+        _background_completion_manager,
+        "active_run_mode_override",
+        None,
+    )
+    if not callable(active_override):
+        return None
+    return await active_override(parent_session_key)
+
+
 async def announce_subagent_completion(
     event: SubagentCompletionEvent,
     *,

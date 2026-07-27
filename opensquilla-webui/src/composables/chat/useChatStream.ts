@@ -331,7 +331,14 @@ export function useChatStream(options: UseChatStreamOptions) {
       const sentinelOnly = !wasAborted && ['NO_REPLY', 'HEARTBEAT_OK'].includes(cleanedText)
       // After Stop, partial streamed output (text, tool rows, artifacts) is
       // kept; only a bubble with nothing visible at all is dropped.
-      const emptyStream = !cleanedText && streamArtifacts.value.length === 0 && streamToolCalls.value.length === 0
+      const foldedInterrupts = foldedTurn.value.parts.filter(
+        (part): part is Extract<import('@/types/parts').ChatPart, { type: 'interrupt' }> =>
+          part.type === 'interrupt',
+      )
+      const emptyStream = !cleanedText
+        && streamArtifacts.value.length === 0
+        && streamToolCalls.value.length === 0
+        && foldedInterrupts.length === 0
       if (sentinelOnly || emptyStream) {
         streamBubble.value = false
         isStreaming.value = false
@@ -345,7 +352,10 @@ export function useChatStream(options: UseChatStreamOptions) {
         ts: new Date().toISOString(),
         artifacts: streamArtifacts.value.slice(),
         tool_calls: streamToolCalls.value.map(streamToolCallToHistoryCall),
-        timeline: streamTimelineSnapshot(cleanedText),
+        timeline: useReducer.value
+          ? foldedTurn.value.timelineSegments.slice()
+          : streamTimelineSnapshot(cleanedText),
+        interrupts: foldedInterrupts.map(part => ({ ...part })),
         // Detach the fold's activity history from the about-to-be-reset log. In
         // OFF mode this is [], so the field is harmless. The empty/sentinel drop
         // path above returns before this push, so a status-only ghost turn never

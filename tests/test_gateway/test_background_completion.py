@@ -12,7 +12,9 @@ from opensquilla.gateway.background_completion import (
     _SynthesisStreamCollector,
 )
 from opensquilla.gateway.boot import GatewayServer
+from opensquilla.gateway.project_workspace_runtime import AcceptedRunModeOverride
 from opensquilla.gateway.routing import ReplyTarget, RouteEnvelope, SourceKind
+from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.session.models import AgentTaskStatus
 
 PARENT = "agent:main:channel:parent"
@@ -84,6 +86,7 @@ class _TaskRuntime:
         self.synthesis_status = AgentTaskStatus.SUCCEEDED
         self.sent: list[tuple[str, str, dict[str, Any] | None]] = []
         self.sent_envelopes: list[Any] = []
+        self.sent_run_mode_overrides: list[Any] = []
         self.stream_event_sink = None
         self._tasks: dict[str, Any] = {}
 
@@ -104,8 +107,10 @@ class _TaskRuntime:
         message: str,
         provenance: dict[str, Any] | None = None,
         stream_event_sink=None,
+        accepted_run_mode_override: Any | None = None,
     ):
         self.sent_envelopes.append(envelope)
+        self.sent_run_mode_overrides.append(accepted_run_mode_override)
         return await self.send(
             envelope.session_key,
             message,
@@ -246,6 +251,11 @@ async def test_parent_wake_waits_out_of_band_and_delivers_final_channel_text() -
 @pytest.mark.asyncio
 async def test_parent_wake_preserves_captured_full_host_envelope_after_parent_finishes() -> None:
     runtime = _TaskRuntime()
+    accepted_override = AcceptedRunModeOverride(
+        run_mode=RunMode.FULL,
+        run_mode_source="user",
+        source="request",
+    )
     envelope = RouteEnvelope(
         source_kind=SourceKind.WEB,
         source_name="webchat",
@@ -258,7 +268,10 @@ async def test_parent_wake_preserves_captured_full_host_envelope_after_parent_fi
             "sandbox_run_context": {"run_mode": "full"},
         },
     )
-    runtime._tasks[PARENT_TASK] = SimpleNamespace(envelope=envelope)
+    runtime._tasks[PARENT_TASK] = SimpleNamespace(
+        envelope=envelope,
+        accepted_run_mode_override=accepted_override,
+    )
     manager = BackgroundCompletionManager(
         session_manager=_SessionManager(parent=SimpleNamespace(last_channel=None, last_to=None)),
     )
@@ -282,9 +295,48 @@ async def test_parent_wake_preserves_captured_full_host_envelope_after_parent_fi
 
     assert runtime.sent_envelopes == [envelope]
     assert runtime.sent_envelopes[0].metadata["run_mode"] == "full"
+    assert runtime.sent_run_mode_overrides == [accepted_override]
 
     runtime.synthesis_released.set()
     await manager.drain(timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_active_run_mode_override_tracks_background_group_lifecycle() -> None:
+    runtime = _TaskRuntime()
+    accepted_override = AcceptedRunModeOverride(
+        run_mode=RunMode.STANDARD,
+        run_mode_source="user",
+        source="request",
+    )
+    runtime._tasks[PARENT_TASK] = SimpleNamespace(
+        envelope=RouteEnvelope(
+            source_kind=SourceKind.WEB,
+            source_name="webchat",
+            agent_id="main",
+            session_key=PARENT,
+        ),
+        accepted_run_mode_override=accepted_override,
+    )
+    manager = BackgroundCompletionManager(
+        session_manager=_SessionManager(parent=SimpleNamespace(last_channel=None)),
+    )
+
+    await manager.capture_delivery_target(
+        parent_session_key=PARENT,
+        parent_task_id=PARENT_TASK,
+        task_runtime=runtime,
+    )
+    await manager.emit_waiting(
+        parent_session_key=PARENT,
+        parent_task_id=PARENT_TASK,
+        pending_count=1,
+    )
+
+    assert await manager.active_run_mode_override(PARENT) is accepted_override
+
+    await manager.cancel_session(PARENT)
+    assert await manager.active_run_mode_override(PARENT) is None
 
 
 @pytest.mark.asyncio

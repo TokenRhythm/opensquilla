@@ -1044,6 +1044,70 @@ def _task_state_summary(rows: list[Any]) -> dict[str, Any]:
     }
 
 
+def _active_task_run_mode(rows: list[Any]) -> str | None:
+    active = [
+        row
+        for row in rows
+        if _enum_value(getattr(row, "status", None)) in _ACTIVE_TASK_STATUSES
+    ]
+    running = [
+        row
+        for row in active
+        if _enum_value(getattr(row, "status", None)) == "running"
+    ]
+    candidates = _sorted_task_rows(running or active)
+    for row in candidates:
+        details = getattr(row, "details", None)
+        accepted = details.get("accepted_run_mode") if isinstance(details, dict) else None
+        mode = accepted.get("run_mode") if isinstance(accepted, dict) else None
+        if isinstance(mode, str) and mode:
+            return mode
+    return None
+
+
+def _session_origin_run_mode(session: Any | None) -> str | None:
+    origin = getattr(session, "origin", None)
+    run_context = origin.get(RUN_CONTEXT_ORIGIN_KEY) if isinstance(origin, dict) else None
+    mode = run_context.get("run_mode") if isinstance(run_context, dict) else None
+    return mode if isinstance(mode, str) and mode else None
+
+
+def _run_mode_lock_payload(
+    *,
+    task_rows: list[Any],
+    active_task_group_ids: list[str],
+    background_override: Any | None,
+    session: Any | None,
+    principal: Any,
+) -> dict[str, Any]:
+    has_active_task = any(
+        _enum_value(getattr(row, "status", None)) in _ACTIVE_TASK_STATUSES
+        for row in task_rows
+    )
+    has_background_group = bool(active_task_group_ids)
+    if not has_active_task and not has_background_group:
+        return {"locked": False}
+
+    mode = _active_task_run_mode(task_rows)
+    source = "task"
+    if mode is None and has_background_group:
+        accepted_mode = getattr(background_override, "run_mode", None)
+        mode = getattr(accepted_mode, "value", accepted_mode)
+        source = "background"
+    if not isinstance(mode, str) or not mode:
+        mode = _session_origin_run_mode(session)
+        source = "session"
+    if not isinstance(mode, str) or not mode:
+        return {"locked": True}
+
+    coerced = coerce_run_mode_for_principal(mode, principal)
+    return {
+        "locked": True,
+        "runMode": coerced.value,
+        "source": source,
+    }
+
+
 async def _list_task_rows(ctx: RpcContext, storage: Any | None, session_key: str) -> list[Any]:
     task_runtime = getattr(ctx, "task_runtime", None)
     if task_runtime is not None:
@@ -2128,6 +2192,7 @@ async def _handle_sessions_send(
         run_mode=coerce_run_mode_for_principal(run_context.run_mode, ctx.principal),
     )
     accepted_run_mode_override = None
+    accepted_run_mode_origin: dict[str, Any] | None = None
     if run_mode_hint is not None:
         accepted_run_mode_override = AcceptedRunModeOverride(
             run_mode=run_mode_hint,
@@ -2138,6 +2203,18 @@ async def _handle_sessions_send(
             run_context,
             accepted_run_mode_override,
         )
+        current_origin = getattr(session, "origin", None)
+        accepted_run_mode_origin = {
+            **(current_origin if isinstance(current_origin, dict) else {}),
+            RUN_CONTEXT_ORIGIN_KEY: run_context.to_origin_payload(),
+        }
+        if atomic_intent_plan is None:
+            update_session = getattr(ctx.session_manager, "update", None)
+            if callable(update_session):
+                session = await update_session(
+                    key,
+                    origin=accepted_run_mode_origin,
+                )
     workspace_dir = run_context.workspace or workspace_dir
     if source_hint.get("caller_kind") == "cli" or source_hint.get("channel_kind") == "cli":
         route_envelope = build_cli_route_envelope(
@@ -2561,6 +2638,11 @@ async def _handle_sessions_send(
                     if atomic_intent_plan.action == "fork"
                     else ()
                 ),
+                session_updates=(
+                    {"origin": accepted_run_mode_origin}
+                    if accepted_run_mode_origin is not None
+                    else None
+                ),
                 merge_into_task=merge_into_task,
                 workspace_guard=workspace_guard,
             )
@@ -2876,6 +2958,11 @@ async def _handle_sessions_send(
                     atomic_intent_plan.initial_transcript_entries
                     if atomic_intent_plan.action == "fork"
                     else ()
+                ),
+                session_updates=(
+                    {"origin": accepted_run_mode_origin}
+                    if accepted_run_mode_origin is not None
+                    else None
                 ),
                 workspace_guard=workspace_guard,
             )
@@ -4854,9 +4941,15 @@ async def _handle_sessions_messages_subscribe(params: dict | None, ctx: RpcConte
     task_state = _task_state_summary(task_rows)
     from opensquilla.gateway.subagent_announce import (
         active_background_completion_group_ids,
+        active_background_completion_run_mode_override,
     )
 
     active_task_group_ids = await active_background_completion_group_ids(key)
+    background_run_mode_override = (
+        await active_background_completion_run_mode_override(key)
+        if active_task_group_ids
+        else None
+    )
     session = await storage.get_session(key) if storage is not None else None
     workspace_id = session.workspace_id if session is not None else None
     project_snapshot = (
@@ -4875,6 +4968,13 @@ async def _handle_sessions_messages_subscribe(params: dict | None, ctx: RpcConte
         "replay_gap_reason": replay.gap_reason,
         "replayed_count": replayed_count,
         "active_task_group_ids": active_task_group_ids,
+        "run_mode_lock": _run_mode_lock_payload(
+            task_rows=task_rows,
+            active_task_group_ids=active_task_group_ids,
+            background_override=background_run_mode_override,
+            session=session,
+            principal=ctx.principal,
+        ),
         **task_state,
     }
 

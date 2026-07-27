@@ -100,6 +100,44 @@ describe('reconcileHistoryMessages', () => {
     expect(out[0].routerSettled).toBe(true)
   })
 
+  it('keeps the live approval timeline when the canonical assistant row arrives', () => {
+    const approvalTimeline = [{
+      type: 'interrupt',
+      approvalId: 'approval-1',
+    }]
+    const interrupts = [{
+      type: 'interrupt',
+      key: 'stream:interrupt:approval-1',
+      interruptKind: 'approval',
+      resolution: 'approved',
+      busy: false,
+      error: '',
+    }]
+    const prev = [
+      msg({ role: 'user', text: 'run it', messageId: 'u1', restoredFromHistory: true }),
+      msg({
+        role: 'assistant',
+        text: 'done',
+        timeline: approvalTimeline,
+        interrupts,
+      } as any),
+    ]
+    const incoming = [
+      msg({ role: 'user', text: 'run it', messageId: 'u1', restoredFromHistory: true }),
+      msg({
+        role: 'assistant',
+        text: 'done',
+        messageId: 'a1',
+        restoredFromHistory: true,
+      }),
+    ]
+
+    const out = reconcileHistoryMessages(prev, incoming)
+
+    expect(out[1].timeline).toEqual(approvalTimeline)
+    expect((out[1] as any).interrupts).toEqual(interrupts)
+  })
+
   it('takes server rows verbatim when they carry no messageId', () => {
     const prev = [msg({ messageId: 'm1', reasoning: reasoning(9) })]
     const out = reconcileHistoryMessages(prev, [msg({ messageId: undefined, reasoning: undefined })])

@@ -2985,6 +2985,7 @@
       "runModeFull": "完全访问",
       "runModeFullDesc": "允许直接访问文件、网络和系统，不再逐次询问。",
       "runModeFullUnavailable": "完全访问仅供会话所有者使用。",
+      "runModeLocked": "运行中，当前会话无法修改",
       "badgeNew": "新"
     },
     "pending": {
