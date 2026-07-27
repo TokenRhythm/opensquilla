@@ -1780,6 +1780,45 @@ function normalizeDesktopCredential(parsed: Partial<DesktopConnection>): Desktop
   }
 }
 
+const DESKTOP_CREDENTIAL_CONFIGURATION_FIELDS = [
+  'provider',
+  'model',
+  'baseUrl',
+  'apiKeyEnv',
+  'encryptedApiKey',
+  'modelRoutingMode',
+  'routerMode',
+  'routerDefaultTier',
+  'routerTiers',
+  'searchProvider',
+  'searchApiKeyEnv',
+  'encryptedSearchApiKey',
+  'disableNetworkObservability',
+  'configAuthority',
+  'importTransactionId',
+] as const
+
+function desktopCredentialHasUserConfiguration(raw: string): boolean {
+  try {
+    const parsed = recoveryRecord(JSON.parse(raw))
+    if (!parsed) return true
+    return DESKTOP_CREDENTIAL_CONFIGURATION_FIELDS.some((field) => {
+      if (!Object.prototype.hasOwnProperty.call(parsed, field)) return false
+      const value = parsed[field]
+      if (typeof value === 'string') return Boolean(value.trim())
+      if (typeof value === 'boolean') return true
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        return Object.keys(value).length > 0
+      }
+      // Preserve malformed-but-present configuration fields instead of
+      // overwriting bytes that may contain the user's only setup.
+      return value !== null && value !== undefined
+    })
+  } catch {
+    return true
+  }
+}
+
 // Write via a temp file + atomic rename so a crash, power loss, or full disk
 // mid-write cannot leave a truncated credential (silent re-onboarding + lost
 // key) or a truncated config.toml (which, since it is only reseeded when
@@ -6294,7 +6333,10 @@ async function adoptConsolidatedDesktopCredential(
     const primary = primaryDesktopProfile()
     const currentCredential = await readOptionalDesktopText(primary.credentialPath)
     let disposition: 'adopted' | 'primary_exists' | 'source_unusable' | null = null
-    if (currentCredential !== null) {
+    if (
+      currentCredential !== null
+      && desktopCredentialHasUserConfiguration(currentCredential)
+    ) {
       // A primary credential that appeared while consolidation ran is
       // authoritative; path validation above still runs before we acknowledge
       // the historical source.
@@ -6392,7 +6434,7 @@ async function adoptConsolidatedDesktopCredential(
             primary,
             credential,
             JSON.stringify(credential, null, 2),
-            null,
+            currentCredential,
             true,
           )
         } else {
@@ -6414,7 +6456,7 @@ async function adoptConsolidatedDesktopCredential(
             JSON.stringify({
               expected_config: expectedConfig,
               config: expectedConfig,
-              expected_credential: null,
+              expected_credential: currentCredential,
               credential: JSON.stringify(credential, null, 2),
             }),
             true,

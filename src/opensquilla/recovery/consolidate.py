@@ -52,6 +52,25 @@ _RECOVERY_ID_RE = re.compile(
 _CONFIG_NAMES = ("config.toml", ".env")
 _CONTEXT_NAME = "desktop-profile-context.json"
 _CREDENTIAL_NAME = "desktop-credential.json"
+_CREDENTIAL_CONFIGURATION_FIELDS = frozenset(
+    {
+        "provider",
+        "model",
+        "baseUrl",
+        "apiKeyEnv",
+        "encryptedApiKey",
+        "modelRoutingMode",
+        "routerMode",
+        "routerDefaultTier",
+        "routerTiers",
+        "searchProvider",
+        "searchApiKeyEnv",
+        "encryptedSearchApiKey",
+        "disableNetworkObservability",
+        "configAuthority",
+        "importTransactionId",
+    }
+)
 _JOURNAL_NAME = ".opensquilla-profile-consolidation.json"
 #: Records that startup was allowed to continue while a specific transaction was
 #: still outstanding. Kept beside the journal rather than inside it so the journal
@@ -466,7 +485,10 @@ def _configuration_source(
         (primary_config and _primary_config_has_user_configuration(primary_config_path))
         or (primary_dotenv and _dotenv_has_user_configuration(primary_dotenv_path))
         or (primary_legacy_dotenv and _dotenv_has_user_configuration(primary_legacy_dotenv_path))
-        or primary_credential
+        or (
+            primary_credential
+            and _primary_credential_has_user_configuration(user_data / _CREDENTIAL_NAME)
+        )
     ):
         return None
 
@@ -492,6 +514,40 @@ def _configuration_source(
         key=lambda profile: (*_configuration_recency(profile), profile.recovery_id),
         default=None,
     )
+
+
+def _primary_credential_has_user_configuration(path: Path) -> bool:
+    """Whether a primary credential contains more than generated empty scaffolding.
+
+    Invalid or unreadable bytes remain authoritative because they may contain the
+    user's only secret. Valid empty objects and timestamp/encryption-only shells
+    do not suppress a usable recovery configuration.
+    """
+
+    try:
+        payload = json.loads(_read_text_native(path))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return True
+    if not isinstance(payload, dict):
+        return True
+    for field in _CREDENTIAL_CONFIGURATION_FIELDS:
+        if field not in payload:
+            continue
+        value = payload[field]
+        if isinstance(value, str):
+            if value.strip():
+                return True
+            continue
+        if isinstance(value, dict):
+            if value:
+                return True
+            continue
+        if isinstance(value, bool):
+            return True
+        if value is not None:
+            # Preserve authority for malformed-but-present configuration fields.
+            return True
+    return False
 
 
 def _credential_updated_ns(path: Path) -> int:
@@ -1683,7 +1739,7 @@ def _merge_workspace_tree(
         return
     if (
         merge_memory
-        and relative.name == "MEMORY.md"
+        and _mergeable_memory_markdown(relative)
         and stat.S_ISREG(source_stat.st_mode)
         and stat.S_ISREG(destination_stat.st_mode)
     ):
@@ -1701,6 +1757,19 @@ def _merge_workspace_tree(
         relative,
         scope=scope,
     )
+
+
+def _mergeable_memory_markdown(relative: Path) -> bool:
+    if relative.suffix.lower() != ".md":
+        return False
+    parts = tuple(part.lower() for part in relative.parts)
+    if relative.name.lower() == "memory.md":
+        return True
+    try:
+        memory_index = parts.index("memory")
+    except ValueError:
+        return False
+    return not any(part.startswith(".") for part in parts[memory_index + 1 : -1])
 
 
 def _clone_primary(primary_home: Path, staging: Path) -> None:
@@ -2022,6 +2091,7 @@ def _merge_filtered_tree(
     relative: Path,
     scope: str,
     skip_operational_state: bool,
+    merge_memory: bool = False,
     durable: bool = False,
     transaction_id: str = "",
 ) -> None:
@@ -2050,6 +2120,7 @@ def _merge_filtered_tree(
                 relative=child_relative,
                 scope=scope,
                 skip_operational_state=skip_operational_state,
+                merge_memory=merge_memory,
                 durable=durable,
                 transaction_id=transaction_id,
             )
@@ -2061,7 +2132,7 @@ def _merge_filtered_tree(
         recovery_id=recovery_id,
         relative=relative,
         scope=scope,
-        merge_memory=False,
+        merge_memory=merge_memory,
         durable=durable,
         transaction_id=transaction_id,
     )
@@ -2142,9 +2213,259 @@ def _merge_profile_files(
                         relative=relative,
                         scope="profile",
                         skip_operational_state=True,
+                        merge_memory=True,
                         durable=state_external,
                         transaction_id=transaction_id,
                     )
+
+
+def _plain_metadata_files(root: Path) -> tuple[Path, ...]:
+    pending = [root]
+    found: list[Path] = []
+    while pending:
+        current = pending.pop()
+        with os.scandir(_native_io_path(current)) as entries:
+            for entry in sorted(entries, key=lambda item: item.name, reverse=True):
+                path = current / entry.name
+                value = os.lstat(_native_io_path(path))
+                if _is_link_or_reparse(value):
+                    continue
+                if stat.S_ISDIR(value.st_mode):
+                    pending.append(path)
+                elif stat.S_ISREG(value.st_mode) and entry.name == "meta.json":
+                    found.append(path)
+    return tuple(sorted(found))
+
+
+def _artifact_session_token(session_id: str, *, chars: int) -> str:
+    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:chars]
+
+
+def _artifact_legacy_session_token(session_id: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", session_id.strip())
+    return cleaned[:180] or "session"
+
+
+def _tool_result_session_token(session_id: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", session_id.strip()).strip(".-")
+    return cleaned[:80] or "session"
+
+
+def _remapped_artifact_record(
+    store: Path,
+    meta_path: Path,
+    payload: dict[str, Any],
+    *,
+    source_session_id: str,
+    target_session_id: str,
+) -> Path | None:
+    relative = meta_path.relative_to(store)
+    parts = relative.parts
+    artifact_id = payload.get("id")
+    if not isinstance(artifact_id, str) or not artifact_id:
+        return None
+    if len(parts) == 4 and parts[0] == "s" and parts[-1] == "meta.json":
+        token_chars = len(parts[1])
+        if token_chars not in {12, 16}:
+            return None
+        if parts[1] != _artifact_session_token(source_session_id, chars=token_chars):
+            return None
+        if parts[2] != hashlib.sha256(artifact_id.encode("utf-8")).hexdigest()[:token_chars]:
+            return None
+        return (
+            store
+            / "s"
+            / _artifact_session_token(target_session_id, chars=token_chars)
+            / parts[2]
+        )
+    if len(parts) == 3 and parts[-1] == "meta.json":
+        if parts[0] != _artifact_legacy_session_token(source_session_id):
+            return None
+        if parts[1] != artifact_id:
+            return None
+        return store / _artifact_legacy_session_token(target_session_id) / artifact_id
+    return None
+
+
+def _remapped_tool_result_record(
+    store: Path,
+    meta_path: Path,
+    payload: dict[str, Any],
+    *,
+    source_session_id: str,
+    target_session_id: str,
+) -> Path | None:
+    relative = meta_path.relative_to(store)
+    parts = relative.parts
+    handle = payload.get("handle")
+    if (
+        len(parts) != 5
+        or parts[0] != "s"
+        or parts[-1] != "meta.json"
+        or not isinstance(handle, str)
+        or parts[3] != handle
+        or not handle.startswith("tr-")
+        or len(handle) != 35
+        or any(character not in "0123456789abcdef" for character in handle[3:])
+        or parts[2] != handle[3:5]
+        or parts[1] != _tool_result_session_token(source_session_id)
+    ):
+        return None
+    return (
+        store
+        / "s"
+        / _tool_result_session_token(target_session_id)
+        / parts[2]
+        / handle
+    )
+
+
+def _relocate_remapped_media_record(
+    source: Path,
+    destination: Path,
+    *,
+    staging: Path,
+    recovery_id: str,
+    relative: Path,
+) -> None:
+    if _normalized_path(source) == _normalized_path(destination):
+        return
+    _makedirs_native(destination.parent, mode=0o700)
+    try:
+        native_move_no_replace(source, destination)
+        return
+    except DestinationExistsError:
+        pass
+    _merge_workspace_tree(
+        source,
+        destination,
+        staging=staging,
+        recovery_id=recovery_id,
+        relative=relative,
+        scope="profile",
+        merge_memory=False,
+    )
+    _rmtree_native(source)
+
+
+def _rewrite_session_scoped_media(
+    store: Path,
+    store_name: str,
+    session_result: SessionMergeResult,
+    *,
+    staging: Path,
+    recovery_id: str,
+) -> None:
+    for meta_path in _plain_metadata_files(store):
+        try:
+            payload = json.loads(_read_text_native(meta_path))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        source_session_id = payload.get("session_id")
+        if not isinstance(source_session_id, str) or not source_session_id:
+            continue
+        target_session_id = session_result.remapped_session_ids.get(
+            source_session_id,
+            source_session_id,
+        )
+        source_session_key = payload.get("session_key")
+        target_session_key = (
+            session_result.remapped_session_keys.get(
+                source_session_key,
+                source_session_key,
+            )
+            if isinstance(source_session_key, str)
+            else source_session_key
+        )
+        if (
+            target_session_id == source_session_id
+            and target_session_key == source_session_key
+        ):
+            continue
+        target_record: Path | None = meta_path.parent
+        if target_session_id != source_session_id:
+            if store_name == "artifacts":
+                target_record = _remapped_artifact_record(
+                    store,
+                    meta_path,
+                    payload,
+                    source_session_id=source_session_id,
+                    target_session_id=target_session_id,
+                )
+            else:
+                target_record = _remapped_tool_result_record(
+                    store,
+                    meta_path,
+                    payload,
+                    source_session_id=source_session_id,
+                    target_session_id=target_session_id,
+                )
+            if target_record is None:
+                continue
+        assert target_record is not None
+        payload["session_id"] = target_session_id
+        if isinstance(source_session_key, str):
+            payload["session_key"] = target_session_key
+        _write_json_atomic(meta_path, payload)
+        _relocate_remapped_media_record(
+            meta_path.parent,
+            target_record,
+            staging=staging,
+            recovery_id=recovery_id,
+            relative=Path("media") / store_name / target_record.relative_to(store),
+        )
+
+
+def _merge_session_scoped_media_store(
+    source: Path,
+    destination: Path,
+    *,
+    store_name: str,
+    staging: Path,
+    profile: _RecoveryProfile,
+    session_result: SessionMergeResult,
+    durable: bool,
+    transaction_id: str,
+) -> None:
+    scratch_parent = (
+        staging
+        / ".opensquilla-session-media"
+        / profile.recovery_id
+    )
+    scratch = scratch_parent / store_name
+    if _lexists(scratch_parent):
+        raise UnsafePathError(f"session media scratch path already exists: {scratch_parent}")
+    _copy_leaf(source, scratch)
+    try:
+        _rewrite_session_scoped_media(
+            scratch,
+            store_name,
+            session_result,
+            staging=staging,
+            recovery_id=profile.recovery_id,
+        )
+        _merge_filtered_tree(
+            scratch,
+            destination,
+            staging=staging,
+            recovery_id=profile.recovery_id,
+            relative=Path("media") / store_name,
+            scope="profile",
+            skip_operational_state=False,
+            durable=durable,
+            transaction_id=transaction_id,
+        )
+    finally:
+        if _lexists(scratch_parent):
+            _rmtree_native(scratch_parent)
+        scratch_root = scratch_parent.parent
+        if _lexists(scratch_root):
+            try:
+                os.rmdir(_native_io_path(scratch_root))
+            except OSError:
+                pass
 
 
 def _merge_profile_media(
@@ -2166,6 +2487,27 @@ def _merge_profile_media(
         for entry in sorted(entries, key=lambda item: item.name):
             source = source_media / entry.name
             source_stat = os.lstat(_native_io_path(source))
+            if (
+                entry.name in {"artifacts", "tool-results"}
+                and session_result is not None
+                and (
+                    session_result.remapped_session_ids
+                    or session_result.remapped_session_keys
+                )
+                and not _is_link_or_reparse(source_stat)
+                and stat.S_ISDIR(source_stat.st_mode)
+            ):
+                _merge_session_scoped_media_store(
+                    source,
+                    destination_media / entry.name,
+                    store_name=entry.name,
+                    staging=staging,
+                    profile=profile,
+                    session_result=session_result,
+                    durable=media_external,
+                    transaction_id=transaction_id,
+                )
+                continue
             if (
                 entry.name != "transcripts"
                 or _is_link_or_reparse(source_stat)

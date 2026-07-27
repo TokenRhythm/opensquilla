@@ -467,6 +467,48 @@ def test_consolidates_all_recoveries_into_primary_and_archives_sources(
         assert connection.execute("SELECT COUNT(*) FROM sessions").fetchone() == (3,)
 
 
+def test_colliding_daily_memory_notes_merge_into_active_memory(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
+    user_data = tmp_path / "user-data"
+    primary = user_data / "opensquilla"
+    daily_note = Path("memory") / "2026-07-27.md"
+    primary_note = primary / "workspace" / daily_note
+    primary_note.parent.mkdir(parents=True)
+    primary_note.write_text("primary memory\n", encoding="utf-8")
+    (primary / "config.toml").write_text("primary = true\n", encoding="utf-8")
+    recovery_id = str(uuid.uuid4())
+    recovery = _recovery(
+        user_data,
+        recovery_id,
+        config="recovery = true\n",
+        credential="{}\n",
+        memory="root memory\n",
+        conflict="recovery",
+        extra_name="recovery.txt",
+        session_key="agent:main:daily-memory",
+    )
+    recovery_note = recovery / "opensquilla" / "workspace" / daily_note
+    recovery_note.parent.mkdir(parents=True)
+    recovery_note.write_text("recovery memory\n", encoding="utf-8")
+
+    result = consolidate_recovery_profiles(user_data, primary)
+
+    assert result.outcome == "consolidated", result
+    merged = primary_note.read_text(encoding="utf-8")
+    assert "primary memory" in merged
+    assert "recovery memory" in merged
+    assert not (
+        primary
+        / "recovered-data"
+        / recovery_id
+        / "workspace"
+        / daily_note
+    ).exists()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows extended-length path contract")
 def test_consolidates_extended_length_recovery_leaf(
     tmp_path: Path,
@@ -638,6 +680,41 @@ def test_empty_primary_uses_newest_recovery_configuration_bundle(
     assert repeated.configuration_source_recovery_id == newer_id
     assert repeated.configuration_source_credential_path == expected_credential
     assert repeated.credential_adoption_status == "pending"
+
+
+def test_empty_primary_credential_does_not_override_recovery_configuration(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
+    user_data = tmp_path / "user-data"
+    primary = user_data / "opensquilla"
+    (primary / "workspace").mkdir(parents=True)
+    (user_data / "desktop-credential.json").write_text("{}\n", encoding="utf-8")
+    recovery_id = str(uuid.uuid4())
+    _recovery(
+        user_data,
+        recovery_id,
+        config="selected = 'recovery'\n",
+        credential=(
+            '{"provider":"openai","model":"gpt-4.1",'
+            '"baseUrl":"https://api.openai.com/v1",'
+            '"encryptedApiKey":"c2VjcmV0","encryption":"plain"}\n'
+        ),
+        memory="recovery memory\n",
+        conflict="recovery",
+        extra_name="recovery.txt",
+        session_key="agent:main:empty-primary-credential",
+    )
+
+    result = consolidate_recovery_profiles(user_data, primary)
+
+    assert result.outcome == "consolidated", result
+    assert result.configuration_source_recovery_id == recovery_id
+    assert result.credential_adoption_status == "pending"
+    assert (primary / "config.toml").read_text(encoding="utf-8") == (
+        "selected = 'recovery'\n"
+    )
 
 
 def test_recovery_root_mtime_breaks_configuration_recency_tie(
@@ -1997,22 +2074,40 @@ def test_legacy_prepared_journal_restart_remains_fail_closed(
         assert (old_backup / "unexpected").read_text(encoding="utf-8") == "preserve"
 
 
+@pytest.mark.parametrize("use_external_media", [False, True])
 def test_session_id_remap_moves_transcript_attachment_material(
     tmp_path: Path,
     monkeypatch,
+    use_external_media: bool,
 ) -> None:
+    from opensquilla.artifacts import ArtifactStore
+    from opensquilla.engine.tool_result_store import ToolResultStore
+
     monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
     user_data = tmp_path / "user-data"
     primary = user_data / "opensquilla"
     (primary / "config.toml").parent.mkdir(parents=True)
-    (primary / "config.toml").write_text("primary = true\n", encoding="utf-8")
+    primary_media = (
+        tmp_path / "external-media"
+        if use_external_media
+        else primary / "media"
+    )
+    if use_external_media:
+        primary_media.mkdir()
+    primary_config = "primary = true\n"
+    if use_external_media:
+        primary_config += (
+            "[attachments]\n"
+            f"media_root = {json.dumps(str(primary_media))}\n"
+        )
+    (primary / "config.toml").write_text(primary_config, encoding="utf-8")
     _session_database(
         primary / "state" / "sessions.db",
         "agent:main:attachment-primary",
         "shared-session-id",
         "primary",
     )
-    primary_material = primary / "media" / "transcripts" / "shared-session-id"
+    primary_material = primary_media / "transcripts" / "shared-session-id"
     primary_material.mkdir(parents=True)
     (primary_material / "primary-sha").write_bytes(b"primary attachment")
 
@@ -2034,6 +2129,23 @@ def test_session_id_remap_moves_transcript_attachment_material(
     recovery_material = recovery / "opensquilla" / "media" / "transcripts" / "shared-session-id"
     recovery_material.mkdir(parents=True)
     (recovery_material / "recovery-sha").write_bytes(b"recovery attachment")
+    recovery_media = recovery / "opensquilla" / "media"
+    artifact = ArtifactStore(recovery_media).publish_bytes(
+        b"recovery artifact",
+        session_id="shared-session-id",
+        session_key="agent:main:attachment-recovery",
+        name="artifact.txt",
+        mime="text/plain",
+        source="test",
+    )
+    tool_result = ToolResultStore(recovery_media / "tool-results").write(
+        "full recovery tool result",
+        tool_use_id="call-recovery",
+        tool_name="test",
+        session_id="shared-session-id",
+        session_key="agent:main:attachment-recovery",
+        agent_id="main",
+    )
 
     result = consolidate_recovery_profiles(user_data, primary)
 
@@ -2045,12 +2157,26 @@ def test_session_id_remap_moves_transcript_attachment_material(
         ).fetchone()[0]
     assert remapped_session_id != "shared-session-id"
     assert (
-        primary / "media" / "transcripts" / remapped_session_id / "recovery-sha"
+        primary_media / "transcripts" / remapped_session_id / "recovery-sha"
     ).read_bytes() == b"recovery attachment"
     assert (
-        primary / "media" / "transcripts" / "shared-session-id" / "primary-sha"
+        primary_media / "transcripts" / "shared-session-id" / "primary-sha"
     ).read_bytes() == b"primary attachment"
-    assert not (primary / "media" / "transcripts" / "shared-session-id" / "recovery-sha").exists()
+    assert not (
+        primary_media / "transcripts" / "shared-session-id" / "recovery-sha"
+    ).exists()
+    artifact_ref, artifact_path = ArtifactStore(primary_media).resolve_for_download(
+        artifact.id,
+        session_id=remapped_session_id,
+    )
+    assert artifact_path.read_bytes() == b"recovery artifact"
+    assert artifact_ref.session_id == remapped_session_id
+    merged_tool_result = ToolResultStore(primary_media / "tool-results").read(
+        tool_result.handle,
+        session_id=remapped_session_id,
+    )
+    assert merged_tool_result.content == "full recovery tool result"
+    assert merged_tool_result.session_id == remapped_session_id
 
 
 def test_copying_workspace_symlink_never_follows_it_for_directory_hint(
@@ -3803,6 +3929,7 @@ def test_key_collision_keeps_session_id_so_artifacts_stay_downloadable(
     """
 
     from opensquilla.artifacts import ArtifactNotFoundError, ArtifactStore
+    from opensquilla.engine.tool_result_store import ToolResultStore
 
     monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
     user_data = tmp_path / "user-data"
@@ -3841,6 +3968,14 @@ def test_key_collision_keeps_session_id_so_artifacts_stay_downloadable(
         mime="application/octet-stream",
         source="code_exec",
     )
+    stored_tool_result = ToolResultStore(recovery_home / "media" / "tool-results").write(
+        "full generated chart tool output",
+        tool_use_id="call-generated-chart",
+        tool_name="code_exec",
+        session_id=recovered_session_id,
+        session_key="agent:main:main",
+        agent_id="main",
+    )
     # The file must be reachable in the source profile before consolidation.
     source_store.resolve_for_download(published.id, session_id=recovered_session_id)
 
@@ -3863,6 +3998,13 @@ def test_key_collision_keeps_session_id_so_artifacts_stay_downloadable(
     )
     assert material.read_bytes() == b"generated chart bytes"
     assert ref.session_id == recovered_session_id
+    assert ref.session_key == recovered_key
+    merged_tool_result = ToolResultStore(primary / "media" / "tool-results").read(
+        stored_tool_result.handle,
+        session_id=recovered_session_id,
+    )
+    assert merged_tool_result.content == "full generated chart tool output"
+    assert merged_tool_result.session_key == recovered_key
 
     # A different session must not be able to reach it.
     with pytest.raises(ArtifactNotFoundError):

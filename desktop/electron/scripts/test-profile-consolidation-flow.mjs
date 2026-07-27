@@ -318,6 +318,10 @@ try {
     }, null, 2),
     'utf8',
   )
+  // A failed/partial first-run can leave only an empty credential shell. It is
+  // not primary configuration authority and must be atomically replaced by
+  // the selected recovery credential after consolidation.
+  await writeFile(primaryCredential, '{}\n', 'utf8')
 
   // Simulate Electron stopping after the offline consolidation CLI returned
   // but before safeStorage credential adoption. The durable receipt must let
@@ -344,7 +348,8 @@ try {
     prelaunchConsolidation.configuration_source_credential_sha256,
     createHash('sha256').update(archivedCredentialBytes).digest('hex'),
   )
-  assert.equal(await pathExists(primaryCredential), false)
+  assert.equal(await pathExists(primaryCredential), true)
+  assert.equal(await readFile(primaryCredential, 'utf8'), '{}\n')
   assert.equal(await pathExists(recoveryProfiles), false)
   const consolidationReceiptPath = prelaunchConsolidation.receipt_path
   assert.equal(typeof consolidationReceiptPath, 'string')

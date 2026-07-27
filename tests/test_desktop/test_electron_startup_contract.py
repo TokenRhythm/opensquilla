@@ -558,6 +558,10 @@ def test_legacy_profiles_are_consolidated_before_primary_inspection_and_gateway_
     assert "raw.length !== expectedSize" in credential_reader
     assert "sourceIntegrityMatches" in credential_acknowledgement
     assert "disposition = 'source_unusable'" in credential_adoption
+    assert "desktopCredentialHasUserConfiguration(currentCredential)" in (
+        credential_adoption
+    )
+    assert "expected_credential: currentCredential" in credential_adoption
     assert "if (expectedConfig === null)" in credential_adoption
     assert "configAuthority: 'generated'" in credential_adoption
     assert "importTransactionId: ''" in credential_adoption
@@ -2981,6 +2985,8 @@ def test_consolidation_e2e_covers_receipt_replay_and_inactive_state_archival() -
     source = _read("desktop/electron/scripts/test-profile-consolidation-flow.mjs")
 
     assert "runProfileConsolidationCli(" in source
+    assert "await writeFile(primaryCredential, '{}\\n', 'utf8')" in source
+    assert "assert.equal(await readFile(primaryCredential, 'utf8'), '{}\\n')" in source
     assert "prelaunchConsolidation.credential_adoption_status, 'pending'" in source
     assert "pendingReceiptRecoveredAfterCrash: true" in source
     assert "completedReceiptDidNotResurrectCredential: true" in source
