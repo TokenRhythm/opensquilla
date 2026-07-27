@@ -735,6 +735,35 @@ def _cost_source_for_usage(
     return "unavailable"
 
 
+_ESTIMATE_COST_SOURCES = frozenset(
+    {"opensquilla_estimate", "opensquilla_static_estimate"}
+)
+
+
+def _merge_turn_cost_sources(parent_source: str, child_source: str) -> str:
+    """Combine the turn's own cost source with one rolled-up subagent run.
+
+    A child with no reportable cost never degrades the parent label, and a
+    turn mixing billed and estimated components reports ``mixed`` — the same
+    vocabulary `_cost_source_for_usage` emits.
+    """
+    parent = str(parent_source or "").strip().lower()
+    child = str(child_source or "").strip().lower()
+    if parent == "openrouter_usage":
+        parent = "provider_billed"
+    if child == "openrouter_usage":
+        child = "provider_billed"
+    if child in {"", "none", "unavailable"}:
+        return parent
+    if parent in {"", "none", "unavailable"}:
+        return child
+    if parent == child:
+        return parent
+    if parent in _ESTIMATE_COST_SOURCES and child in _ESTIMATE_COST_SOURCES:
+        return parent
+    return "mixed"
+
+
 def _usage_int(value: Any) -> int:
     try:
         return max(0, int(value or 0))
@@ -10620,10 +10649,33 @@ class Agent:
                 # "unavailable": no estimated dollars in the reported cost.
                 estimate_basis = None
 
+        # Roll completed subagent runs into this turn's reported usage so the
+        # displayed turn cost covers delegated spend (parent + every child
+        # run). Draining marks each handle consumed, so a child settling in a
+        # later turn rolls into that turn exactly once. This is
+        # reporting-side only: child provider calls were already recorded at
+        # call time by the durable usage ledger (run_kind="subagent"), and
+        # the child usage is deliberately NOT re-added to the session
+        # UsageTracker, whose snapshot/delta remain the parent-only view.
+        done_reasoning_tokens = total_reasoning_tokens
+        for child_usage in self.subagent_manager.drain_completed_usage():
+            done_input_tokens += child_usage.input_tokens
+            done_output_tokens += child_usage.output_tokens
+            done_reasoning_tokens += child_usage.reasoning_tokens
+            done_cached_tokens += child_usage.cached_tokens
+            done_cache_write_tokens += child_usage.cache_write_tokens
+            done_cost += child_usage.cost_usd
+            done_billed_cost += child_usage.billed_cost
+            cost_source = _merge_turn_cost_sources(cost_source, child_usage.cost_source)
+            if estimate_basis is None and child_usage.cost_usd > child_usage.billed_cost:
+                # The rolled-up total now carries an estimated component from
+                # the child; disclose its estimator basis.
+                estimate_basis = child_usage.estimate_basis
+
         has_usage = bool(
             done_input_tokens
             or done_output_tokens
-            or total_reasoning_tokens
+            or done_reasoning_tokens
             or done_cached_tokens
             or done_cache_write_tokens
             or done_billed_cost
@@ -10693,7 +10745,7 @@ class Agent:
                 text="".join(final_text_parts),
                 input_tokens=done_input_tokens,
                 output_tokens=done_output_tokens,
-                reasoning_tokens=total_reasoning_tokens,
+                reasoning_tokens=done_reasoning_tokens,
                 cached_tokens=done_cached_tokens,
                 cache_write_tokens=done_cache_write_tokens,
                 iterations=iterations,

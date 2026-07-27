@@ -33,6 +33,75 @@ class SubagentSpec:
     extra_context: dict[str, Any] = field(default_factory=dict)
 
 
+def _usage_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _usage_float(value: Any) -> float:
+    try:
+        return max(0.0, float(value or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+@dataclass(frozen=True)
+class SubagentUsage:
+    """Terminal usage snapshot of one child run, taken from its DoneEvent.
+
+    Captured when the child's terminal event arrives so the parent turn can
+    roll delegated spend into its own reported usage. This is a
+    reporting-side copy only: the child's provider calls were already
+    accounted at call time by the durable usage ledger
+    (``run_kind="subagent"``), so the rollup must never re-emit ledger
+    events for these numbers.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+    cached_tokens: int = 0
+    cache_write_tokens: int = 0
+    cost_usd: float = 0.0
+    billed_cost: float = 0.0
+    cost_source: str = "none"
+    estimate_basis: str | None = None
+    model: str = ""
+    provider: str = ""
+
+    @classmethod
+    def from_done_event(cls, event: Any) -> SubagentUsage:
+        """Build a snapshot from an engine DoneEvent (defensively coerced)."""
+        estimate_basis = getattr(event, "estimate_basis", None)
+        return cls(
+            input_tokens=_usage_int(getattr(event, "input_tokens", 0)),
+            output_tokens=_usage_int(getattr(event, "output_tokens", 0)),
+            reasoning_tokens=_usage_int(getattr(event, "reasoning_tokens", 0)),
+            cached_tokens=_usage_int(getattr(event, "cached_tokens", 0)),
+            cache_write_tokens=_usage_int(getattr(event, "cache_write_tokens", 0)),
+            cost_usd=_usage_float(getattr(event, "cost_usd", 0.0)),
+            billed_cost=_usage_float(getattr(event, "billed_cost", 0.0)),
+            cost_source=str(getattr(event, "cost_source", "") or "none"),
+            estimate_basis=str(estimate_basis) if estimate_basis else None,
+            model=str(getattr(event, "model", "") or ""),
+            provider=str(getattr(event, "provider", "") or ""),
+        )
+
+    @property
+    def has_usage(self) -> bool:
+        return bool(
+            self.input_tokens
+            or self.output_tokens
+            or self.reasoning_tokens
+            or self.cached_tokens
+            or self.cache_write_tokens
+            or self.cost_usd
+            or self.billed_cost
+        )
+
+
 @dataclass
 class SubagentHandle:
     """Reference to a running subagent."""
@@ -46,6 +115,15 @@ class SubagentHandle:
     parent_task_id: int | None = None  # id() of parent asyncio.Task for orphan tracking
     spawned_at: float = field(default_factory=time.monotonic)
     completed_at: float | None = None
+    # Terminal usage snapshot from the child's DoneEvent. None until the
+    # child yields a terminal event (an aborted child that never reached
+    # its DoneEvent keeps None — its partial spend has no snapshot to
+    # report, though the durable ledger still holds its provider calls).
+    usage: SubagentUsage | None = None
+    # Set once the parent turn has folded this handle's usage into its
+    # reported totals, so a handle surviving into later turns is not
+    # double-counted.
+    usage_rolled_up: bool = False
 
 
 class SubagentRegistry:
@@ -96,6 +174,22 @@ class SubagentRegistry:
 
     def get_by_status(self, status: str) -> list[SubagentHandle]:
         return [h for h in self._runs.values() if h.status == status]
+
+    def drain_usage(self) -> list[SubagentUsage]:
+        """Return captured child usage not yet rolled into a parent turn.
+
+        Marks each returned handle consumed so every child run is reported
+        by exactly one parent turn. Archived handles are included: archiving
+        moves a handle out of the active map without settling its usage.
+        """
+        drained: list[SubagentUsage] = []
+        for handle in list(self._runs.values()) + list(self._archived.values()):
+            if handle.usage is None or handle.usage_rolled_up:
+                continue
+            handle.usage_rolled_up = True
+            if handle.usage.has_usage:
+                drained.append(handle.usage)
+        return drained
 
     def summary(self) -> dict[str, int]:
         counts: dict[str, int] = {}
@@ -217,6 +311,11 @@ class SubagentManager:
         else:
             child_agent = agent_factory(spec, depth, run_id)
 
+        # Captured outside _run so the terminal usage survives the coroutine
+        # boundary even when the task is later cancelled or times out after
+        # the child's DoneEvent already arrived.
+        terminal_usage: list[SubagentUsage] = []
+
         async def _run() -> str:
             collected: list[str] = []
             terminal_text_present = False
@@ -225,6 +324,7 @@ class SubagentManager:
                 if hasattr(event, "text") and event.kind == "text_delta":  # type: ignore[union-attr]
                     collected.append(event.text)  # type: ignore[union-attr]
                 elif event.kind == "done":  # type: ignore[union-attr]
+                    terminal_usage.append(SubagentUsage.from_done_event(event))
                     terminal_text_present, terminal_text = done_text_snapshot(event)
                     break
             return terminal_text if terminal_text_present else "".join(collected)
@@ -249,6 +349,8 @@ class SubagentManager:
 
         def _on_done(t: asyncio.Task[str]) -> None:
             handle.completed_at = time.monotonic()
+            if terminal_usage:
+                handle.usage = terminal_usage[-1]
             exc = t.exception() if not t.cancelled() else None
             if t.cancelled():
                 if handle.status not in ("aborted",):
@@ -263,6 +365,10 @@ class SubagentManager:
         task.add_done_callback(_on_done)
         self.registry.register(handle)
         return handle
+
+    def drain_completed_usage(self) -> list[SubagentUsage]:
+        """Return child usage snapshots not yet rolled into a parent turn."""
+        return self.registry.drain_usage()
 
     async def wait_all(self, timeout: float | None = None) -> None:
         """Wait for all running subagents to finish.
