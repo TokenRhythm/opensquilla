@@ -63,12 +63,151 @@ describe('useChatHistory canonical pagination', () => {
   it('requests canonical messages without compaction summaries', async () => {
     const { api, rpc } = makeHistory()
 
+    expect(api.historyState.value.initialLoadStatus).toBe('pending')
     await api.loadHistory()
 
     expect(rpc.call).toHaveBeenCalledWith('chat.history', expect.objectContaining({
       includeCanonical: true,
       includeSummaries: false,
     }))
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+    })
+  })
+
+  it('enters the initial loading state before the first RPC settles', async () => {
+    let resolveHistory!: (value: ChatHistoryResponse) => void
+    const pendingHistory = new Promise<ChatHistoryResponse>(resolve => {
+      resolveHistory = resolve
+    })
+    const { api, rpc } = makeHistory()
+    rpc.call.mockReturnValueOnce(pendingHistory)
+
+    const load = api.loadHistory()
+    expect(api.historyState.value.initialLoadStatus).toBe('loading')
+
+    resolveHistory({
+      messages: [],
+      has_more: false,
+      oldest_cursor: null,
+    })
+    await load
+    expect(api.historyState.value.initialLoadStatus).toBe('ready')
+  })
+
+  it('does not restore the full-screen loader for a settled empty-session refresh', async () => {
+    let resolveRefresh!: (value: ChatHistoryResponse) => void
+    const refreshResponse = new Promise<ChatHistoryResponse>(resolve => {
+      resolveRefresh = resolve
+    })
+    const { api, rpc } = makeHistory(false, {
+      response: {
+        messages: [],
+        has_more: false,
+        oldest_cursor: null,
+      },
+    })
+
+    await api.loadHistory()
+    rpc.call.mockReturnValueOnce(refreshResponse)
+    const refresh = api.loadHistory()
+
+    expect(api.historyState.value.loading).toBe(true)
+    expect(api.historyState.value.initialLoadStatus).toBe('ready')
+
+    resolveRefresh({
+      messages: [],
+      has_more: false,
+      oldest_cursor: null,
+    })
+    await refresh
+    expect(api.historyState.value.initialLoadStatus).toBe('ready')
+  })
+
+  it('keeps a settled empty-session refresh failure retryable without restoring the loader', async () => {
+    const { api, rpc } = makeHistory(false, {
+      response: {
+        messages: [],
+        has_more: false,
+        oldest_cursor: null,
+      },
+    })
+
+    await api.loadHistory()
+    rpc.call.mockRejectedValueOnce(new Error('offline'))
+    await api.loadHistory()
+
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+      loadEarlierError: true,
+    })
+
+    let resolveRetry!: (value: ChatHistoryResponse) => void
+    rpc.call.mockReturnValueOnce(new Promise<ChatHistoryResponse>(resolve => {
+      resolveRetry = resolve
+    }))
+    const retry = api.retryHistory()
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+      loading: true,
+      retrying: true,
+      loadEarlierError: false,
+    })
+    resolveRetry({
+      messages: [],
+      has_more: false,
+      oldest_cursor: null,
+    })
+    await retry
+    expect(rpc.call).toHaveBeenCalledTimes(3)
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+      retrying: false,
+      loadEarlierError: false,
+    })
+  })
+
+  it('keeps an unavailable canonical reader retryable after an empty session has settled', async () => {
+    const { api, rpc } = makeHistory(false, {
+      response: {
+        messages: [],
+        has_more: false,
+        oldest_cursor: null,
+      },
+    })
+
+    await api.loadHistory()
+    rpc.call
+      .mockResolvedValueOnce({
+        messages: [],
+        has_more: false,
+        oldest_cursor: null,
+        canonical_available: false,
+        canonical_complete: false,
+      })
+      .mockResolvedValueOnce({
+        messages: [],
+        has_more: false,
+        oldest_cursor: null,
+        canonical_available: true,
+        canonical_complete: true,
+      })
+    await api.loadHistory()
+
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+      canonicalAvailable: false,
+      canonicalComplete: false,
+      loadEarlierError: false,
+    })
+
+    await api.retryHistory()
+    expect(rpc.call).toHaveBeenCalledTimes(3)
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+      canonicalAvailable: true,
+      canonicalComplete: true,
+    })
   })
 
   it('restores the durable causal turn identity from canonical history', async () => {
@@ -614,11 +753,45 @@ describe('useChatHistory canonical pagination', () => {
       })
 
     await api.loadHistory()
-    expect(api.historyState.value.loadEarlierError).toBe(true)
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'error',
+      loadEarlierError: false,
+    })
 
-    await api.retryHistory()
-    expect(api.historyState.value.loadEarlierError).toBe(false)
+    const retry = api.retryHistory()
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'loading',
+    })
+    await retry
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+      loadEarlierError: false,
+    })
     expect(messages.value.map(message => message.messageId)).toEqual(['m1'])
+  })
+
+  it('keeps an initial failure retryable when a live row arrives first', async () => {
+    const { api, rpc, messages } = makeHistory(false)
+    let rejectHistory!: (reason: Error) => void
+    rpc.call.mockReturnValueOnce(new Promise<ChatHistoryResponse>((_resolve, reject) => {
+      rejectHistory = reject
+    }))
+
+    const load = api.loadHistory()
+    messages.value.push({
+      role: 'assistant',
+      text: 'live row',
+      ts: 'live',
+      messageId: 'live-row',
+    })
+    rejectHistory(new Error('offline'))
+    await load
+
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'error',
+      loadEarlierError: false,
+    })
+    expect(messages.value.map(message => message.messageId)).toEqual(['live-row'])
   })
 
   it('retries the current canonical window when the canonical reader was unavailable', async () => {
@@ -642,11 +815,92 @@ describe('useChatHistory canonical pagination', () => {
     await api.loadHistory()
     expect(api.historyState.value.canonicalAvailable).toBe(false)
     expect(api.historyState.value.loadingEarlier).toBe(false)
+    expect(api.historyState.value.initialLoadStatus).toBe('ready')
     expect(messages.value.map(message => message.messageId)).toEqual(['fallback'])
 
     await api.retryHistory()
     expect(api.historyState.value.canonicalAvailable).toBe(true)
     expect(rpc.call).toHaveBeenCalledTimes(2)
+  })
+
+  it('marks an empty unavailable canonical reader as an initial retriable failure', async () => {
+    const { api } = makeHistory(false, {
+      response: {
+        messages: [],
+        has_more: false,
+        oldest_cursor: null,
+        canonical_available: false,
+        canonical_complete: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'error',
+      canonicalAvailable: false,
+      canonicalComplete: false,
+      loadEarlierError: false,
+    })
+  })
+
+  it('settles a confirmed empty session without reporting an initial failure', async () => {
+    const { api } = makeHistory(false, {
+      response: {
+        messages: [],
+        has_more: false,
+        oldest_cursor: null,
+        canonical_available: false,
+        canonical_complete: true,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+      canonicalAvailable: false,
+      canonicalComplete: true,
+    })
+  })
+
+  it('keeps an old-gateway empty success without canonical fields compatible', async () => {
+    const { api } = makeHistory(false, {
+      response: {
+        messages: [],
+        has_more: false,
+        oldest_cursor: null,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+      canonicalAvailable: null,
+      canonicalComplete: null,
+      loadEarlierError: false,
+    })
+  })
+
+  it('keeps a pre-canonical-complete unavailable empty response compatible', async () => {
+    const { api } = makeHistory(false, {
+      response: {
+        messages: [],
+        has_more: false,
+        oldest_cursor: null,
+        canonical_available: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+      canonicalAvailable: false,
+      canonicalComplete: null,
+      loadEarlierError: false,
+    })
   })
 
   it('discards a stale response after switching sessions', async () => {
@@ -685,6 +939,50 @@ describe('useChatHistory canonical pagination', () => {
 
     expect(messages.value.map(message => message.messageId)).toEqual(['new-message'])
     expect(api.historyState.value.loading).toBe(false)
+    expect(api.historyState.value.initialLoadStatus).toBe('ready')
+  })
+
+  it('keeps the new session loading when a stale request fails first', async () => {
+    const sessionKey = ref('agent:main:webchat:old')
+    let rejectOld!: (reason: Error) => void
+    let resolveNew!: (value: ChatHistoryResponse) => void
+    const oldResponse = new Promise<ChatHistoryResponse>((_resolve, reject) => {
+      rejectOld = reject
+    })
+    const newResponse = new Promise<ChatHistoryResponse>(resolve => {
+      resolveNew = resolve
+    })
+    const { api, rpc, messages } = makeHistory(false, { sessionKey })
+    rpc.call
+      .mockImplementationOnce(() => oldResponse)
+      .mockImplementationOnce(() => newResponse)
+
+    const oldLoad = api.loadHistory()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledTimes(1))
+    sessionKey.value = 'agent:main:webchat:new'
+    const newLoad = api.loadHistory()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledTimes(2))
+
+    rejectOld(new Error('stale offline response'))
+    await oldLoad
+    expect(messages.value).toEqual([])
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'loading',
+      loading: true,
+      loadEarlierError: false,
+    })
+
+    resolveNew({
+      messages: [historyMessage('new-message')],
+      has_more: false,
+      oldest_cursor: null,
+    })
+    await newLoad
+    expect(messages.value.map(message => message.messageId)).toEqual(['new-message'])
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+      loading: false,
+    })
   })
 })
 
