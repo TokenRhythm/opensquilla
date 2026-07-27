@@ -182,51 +182,54 @@ async def adopt_legacy_project_workspaces(
 ) -> None:
     """Bind pre-feature sessions whose persisted workspace is non-default."""
 
-    clock = int(time.time() * 1000) if now_ms is None else int(now_ms)
-    offset = 0
-    page_size = 500
-    while True:
-        sessions = await storage.list_sessions(limit=page_size, offset=offset)
-        if not sessions:
-            return
-        for session in sessions:
-            if getattr(session, "workspace_id", None):
-                continue
-            origin = getattr(session, "origin", None)
-            if not isinstance(origin, dict):
-                continue
-            run_context = origin.get(RUN_CONTEXT_ORIGIN_KEY)
-            if not isinstance(run_context, dict):
-                continue
-            raw_workspace = run_context.get("workspace")
-            if not isinstance(raw_workspace, str) or not raw_workspace.strip():
-                continue
-            resolved = _legacy_project_path(raw_workspace)
-            if resolved is None:
-                continue
-            default_key = project_path_key(
-                resolve_agent_workspace_dir(
-                    str(getattr(session, "agent_id", "main") or "main"),
-                    config,
-                ),
-                strict=False,
+    async def _adopt() -> None:
+        clock = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        after_rowid = 0
+        page_size = 500
+        while True:
+            candidates = await storage.list_legacy_project_workspace_candidates(
+                after_rowid=after_rowid,
+                limit=page_size,
             )
-            if resolved.path_key == default_key:
-                continue
-            workspace = await storage.create_or_restore_project_workspace(
-                path=resolved.path,
-                path_key=resolved.path_key,
-                display_name=resolved.name,
-                trusted_at=clock,
-                now_ms=clock,
-            )
-            await storage.bind_session_workspace(
-                str(session.session_key),
-                workspace.workspace_id,
-            )
-        if len(sessions) < page_size:
-            return
-        offset += page_size
+            if not candidates:
+                return
+            for rowid, session_key, agent_id, origin in candidates:
+                after_rowid = rowid
+                if not isinstance(origin, dict):
+                    continue
+                run_context = origin.get(RUN_CONTEXT_ORIGIN_KEY)
+                if not isinstance(run_context, dict):
+                    continue
+                raw_workspace = run_context.get("workspace")
+                if not isinstance(raw_workspace, str) or not raw_workspace.strip():
+                    continue
+                resolved = _legacy_project_path(raw_workspace)
+                if resolved is None:
+                    continue
+                default_key = project_path_key(
+                    resolve_agent_workspace_dir(agent_id, config),
+                    strict=False,
+                )
+                if resolved.path_key == default_key:
+                    continue
+                await storage.adopt_legacy_session_workspace(
+                    session_key,
+                    expected_agent_id=agent_id,
+                    expected_origin=origin,
+                    path=resolved.path,
+                    path_key=resolved.path_key,
+                    display_name=resolved.name,
+                    trusted_at=clock,
+                    now_ms=clock,
+                )
+            if len(candidates) < page_size:
+                return
+
+    run_once = getattr(storage, "run_legacy_project_adoption_once", None)
+    if callable(run_once):
+        await run_once(_adopt)
+    else:
+        await _adopt()
 
 
 __all__ = [

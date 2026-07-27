@@ -1050,6 +1050,9 @@ class SessionStorage:
         self._operation_lock = asyncio.Lock()
         self._usage_backfill_index_lock = asyncio.Lock()
         self._usage_backfill_indexes_ready = False
+        self._legacy_project_adoption_lock = asyncio.Lock()
+        self._legacy_project_adoption_generation = 0
+        self._legacy_project_adoption_completed_generation = -1
         self._poisoned = False
         self._busy_budget_seconds = _INTERACTIVE_BUSY_BUDGET_SECONDS
         self._sleep = asyncio.sleep
@@ -1069,6 +1072,32 @@ class SessionStorage:
         session_keys = self._restart_abandoned_session_keys
         self._restart_abandoned_session_keys = ()
         return session_keys
+
+    async def run_legacy_project_adoption_once(
+        self,
+        adoption: Callable[[], Awaitable[None]],
+    ) -> None:
+        """Single-flight legacy project adoption for this storage connection."""
+
+        if (
+            self._legacy_project_adoption_completed_generation
+            == self._legacy_project_adoption_generation
+        ):
+            return
+        async with self._legacy_project_adoption_lock:
+            while (
+                self._legacy_project_adoption_completed_generation
+                != self._legacy_project_adoption_generation
+            ):
+                generation = self._legacy_project_adoption_generation
+                await adoption()
+                if generation == self._legacy_project_adoption_generation:
+                    self._legacy_project_adoption_completed_generation = generation
+
+    def invalidate_legacy_project_adoption(self) -> None:
+        """Require the next workspace listing to re-check legacy session origins."""
+
+        self._legacy_project_adoption_generation += 1
 
     async def connect(self) -> None:
         self._conn = await aiosqlite.connect(self._db_path, isolation_level=None)
@@ -2832,71 +2861,90 @@ class SessionStorage:
     ) -> ProjectWorkspace:
         now = _now_ms() if now_ms is None else int(now_ms)
         async with self._write_transaction("create_or_restore_project_workspace") as conn:
-            async with conn.execute(
-                "SELECT * FROM project_workspaces WHERE path_key = ?",
-                (path_key,),
-            ) as cur:
-                row = await cur.fetchone()
-            if row is None:
-                position_at = await _next_project_workspace_order_value(
-                    conn,
-                    column="position_at",
-                    now_ms=now,
-                )
-                workspace = ProjectWorkspace(
-                    path=path,
-                    path_key=path_key,
-                    display_name=display_name,
-                    created_at=now,
-                    updated_at=now,
-                    position_at=position_at,
-                    trusted_at=trusted_at,
-                )
-                data = workspace.model_dump()
-                columns = list(data)
-                await conn.execute(
-                    f"INSERT INTO project_workspaces ({', '.join(columns)}) "  # noqa: S608
-                    f"VALUES ({', '.join('?' for _ in columns)})",
-                    [_serialize(data[column]) for column in columns],
-                )
-                return workspace
+            return await self._create_or_restore_project_workspace_on_conn(
+                conn,
+                path=path,
+                path_key=path_key,
+                display_name=display_name,
+                trusted_at=trusted_at,
+                now_ms=now,
+            )
 
-            workspace = ProjectWorkspace(**dict(row))
-            if workspace.removed_at is None:
-                if workspace.trusted_at is None and trusted_at is not None:
-                    await conn.execute(
-                        """
-                        UPDATE project_workspaces
-                        SET trusted_at = ?, updated_at = ?, path = ?
-                        WHERE workspace_id = ?
-                        """,
-                        (trusted_at, now, path, workspace.workspace_id),
-                    )
-                    workspace.trusted_at = trusted_at
-                    workspace.updated_at = now
-                    workspace.path = path
-                return workspace
-
+    async def _create_or_restore_project_workspace_on_conn(
+        self,
+        conn: Any,
+        *,
+        path: str,
+        path_key: str,
+        display_name: str,
+        trusted_at: int | None,
+        now_ms: int,
+    ) -> ProjectWorkspace:
+        async with conn.execute(
+            "SELECT * FROM project_workspaces WHERE path_key = ?",
+            (path_key,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
             position_at = await _next_project_workspace_order_value(
                 conn,
                 column="position_at",
-                now_ms=now,
+                now_ms=now_ms,
             )
+            workspace = ProjectWorkspace(
+                path=path,
+                path_key=path_key,
+                display_name=display_name,
+                created_at=now_ms,
+                updated_at=now_ms,
+                position_at=position_at,
+                trusted_at=trusted_at,
+            )
+            data = workspace.model_dump()
+            columns = list(data)
             await conn.execute(
-                """
-                UPDATE project_workspaces
-                SET removed_at = NULL, position_at = ?, updated_at = ?,
-                    trusted_at = COALESCE(?, trusted_at), path = ?
-                WHERE workspace_id = ?
-                """,
-                (position_at, now, trusted_at, path, workspace.workspace_id),
+                f"INSERT INTO project_workspaces ({', '.join(columns)}) "  # noqa: S608
+                f"VALUES ({', '.join('?' for _ in columns)})",
+                [_serialize(data[column]) for column in columns],
             )
-            workspace.removed_at = None
-            workspace.position_at = position_at
-            workspace.updated_at = now
-            workspace.trusted_at = trusted_at or workspace.trusted_at
-            workspace.path = path
             return workspace
+
+        workspace = ProjectWorkspace(**dict(row))
+        if workspace.removed_at is None:
+            if workspace.trusted_at is None and trusted_at is not None:
+                await conn.execute(
+                    """
+                    UPDATE project_workspaces
+                    SET trusted_at = ?, updated_at = ?, path = ?
+                    WHERE workspace_id = ?
+                    """,
+                    (trusted_at, now_ms, path, workspace.workspace_id),
+                )
+                workspace.trusted_at = trusted_at
+                workspace.updated_at = now_ms
+                workspace.path = path
+            return workspace
+
+        position_at = await _next_project_workspace_order_value(
+            conn,
+            column="position_at",
+            now_ms=now_ms,
+        )
+        await conn.execute(
+            """
+            UPDATE project_workspaces
+            SET removed_at = NULL, position_at = ?, updated_at = ?,
+                trusted_at = COALESCE(?, trusted_at), path = ?
+            WHERE workspace_id = ?
+            """,
+            (position_at, now_ms, trusted_at, path, workspace.workspace_id),
+        )
+        workspace.removed_at = None
+        workspace.position_at = position_at
+        workspace.updated_at = now_ms
+        workspace.trusted_at = trusted_at or workspace.trusted_at
+        workspace.path = path
+        return workspace
 
     @_serialized_read
     async def get_project_workspace(self, workspace_id: str) -> ProjectWorkspace | None:
@@ -3047,6 +3095,101 @@ class SessionStorage:
             )
             if int(cursor.rowcount or 0) == 0:
                 raise KeyError(f"Session not found: {session_key}")
+
+    @_serialized_read
+    async def list_legacy_project_workspace_candidates(
+        self,
+        *,
+        after_rowid: int = 0,
+        limit: int = 500,
+    ) -> list[tuple[int, str, str, dict[str, Any] | None]]:
+        """Return one lightweight keyset page for legacy project adoption."""
+
+        if limit <= 0:
+            return []
+        async with self.conn.execute(
+            """
+            SELECT rowid, session_key, agent_id, origin
+            FROM sessions
+            WHERE workspace_id IS NULL
+              AND origin IS NOT NULL
+              AND rowid > ?
+            ORDER BY rowid
+            LIMIT ?
+            """,
+            (max(0, int(after_rowid)), int(limit)),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [
+            (
+                int(row["rowid"]),
+                str(row["session_key"]),
+                str(row["agent_id"] or "main"),
+                _json_object_or_none(row["origin"]),
+            )
+            for row in rows
+        ]
+
+    async def adopt_legacy_session_workspace(
+        self,
+        session_key: str,
+        *,
+        expected_agent_id: str,
+        expected_origin: dict[str, Any],
+        path: str,
+        path_key: str,
+        display_name: str,
+        trusted_at: int | None,
+        now_ms: int,
+    ) -> ProjectWorkspace | None:
+        """Atomically create and bind a still-current legacy session candidate."""
+
+        session_key = canonicalize_session_key(session_key)
+        async with self._write_transaction("adopt_legacy_session_workspace") as conn:
+            async with conn.execute(
+                """
+                SELECT 1
+                FROM sessions
+                WHERE session_key = ?
+                  AND workspace_id IS NULL
+                  AND agent_id = ?
+                  AND origin IS ?
+                """,
+                (
+                    session_key,
+                    normalize_agent_id(expected_agent_id),
+                    _serialize(expected_origin),
+                ),
+            ) as cursor:
+                if await cursor.fetchone() is None:
+                    return None
+            workspace = await self._create_or_restore_project_workspace_on_conn(
+                conn,
+                path=path,
+                path_key=path_key,
+                display_name=display_name,
+                trusted_at=trusted_at,
+                now_ms=now_ms,
+            )
+            cursor = await conn.execute(
+                """
+                UPDATE sessions
+                SET workspace_id = ?
+                WHERE session_key = ?
+                  AND workspace_id IS NULL
+                  AND agent_id = ?
+                  AND origin IS ?
+                """,
+                (
+                    workspace.workspace_id,
+                    session_key,
+                    normalize_agent_id(expected_agent_id),
+                    _serialize(expected_origin),
+                ),
+            )
+            if int(cursor.rowcount or 0) != 1:
+                raise RuntimeError("legacy project candidate changed during transaction")
+            return workspace
 
     @_serialized_read
     async def count_project_workspace_tasks(self, workspace_id: str) -> int:

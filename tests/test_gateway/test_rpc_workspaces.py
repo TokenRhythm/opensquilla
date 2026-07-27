@@ -1467,11 +1467,23 @@ async def test_history_delete_real_quiescers_leave_no_late_rows_after_cancellati
 
 @pytest.mark.asyncio
 async def test_list_adopts_legacy_non_default_workspace(
-    workspace_ctx, tmp_path
+    workspace_ctx, tmp_path, monkeypatch
 ) -> None:
     from opensquilla.gateway import rpc_workspaces
 
     ctx, storage = workspace_ctx
+    candidate_scan = AsyncMock(
+        wraps=storage.list_legacy_project_workspace_candidates
+    )
+    forbidden_generic_list = AsyncMock(
+        side_effect=AssertionError("legacy adoption must not call list_sessions")
+    )
+    monkeypatch.setattr(
+        storage,
+        "list_legacy_project_workspace_candidates",
+        candidate_scan,
+    )
+    monkeypatch.setattr(storage, "list_sessions", forbidden_generic_list)
     legacy = tmp_path / "legacy"
     legacy.mkdir()
     await storage.upsert_session(
@@ -1495,6 +1507,102 @@ async def test_list_adopts_legacy_non_default_workspace(
     assert first["workspaces"][0]["taskCount"] == 1
     assert session is not None
     assert session.workspace_id == first["workspaces"][0]["id"]
+    assert candidate_scan.await_count == 1
+    forbidden_generic_list.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_workspace_lists_share_one_legacy_adoption_scan(
+    workspace_ctx, tmp_path, monkeypatch
+) -> None:
+    from opensquilla.gateway import rpc_workspaces
+
+    ctx, storage = workspace_ctx
+    legacy = tmp_path / "legacy-concurrent"
+    legacy.mkdir()
+    await storage.upsert_session(
+        SessionNode(
+            session_key="agent:main:webchat:legacy-concurrent",
+            origin={
+                "sandbox_run_context": {
+                    "run_mode": "standard",
+                    "workspace": str(legacy),
+                }
+            },
+        )
+    )
+
+    original_scan = storage.list_legacy_project_workspace_candidates
+    scan_started = asyncio.Event()
+    release_scan = asyncio.Event()
+    scan_count = 0
+
+    async def controlled_scan(*, after_rowid: int = 0, limit: int = 500):
+        nonlocal scan_count
+        scan_count += 1
+        scan_started.set()
+        await release_scan.wait()
+        return await original_scan(after_rowid=after_rowid, limit=limit)
+
+    monkeypatch.setattr(
+        storage,
+        "list_legacy_project_workspace_candidates",
+        controlled_scan,
+    )
+    first_task = asyncio.create_task(rpc_workspaces._handle_workspaces_list(None, ctx))
+    await scan_started.wait()
+    second_task = asyncio.create_task(rpc_workspaces._handle_workspaces_list(None, ctx))
+    await asyncio.sleep(0)
+    release_scan.set()
+    first, second = await asyncio.gather(first_task, second_task)
+
+    assert first == second
+    assert scan_count == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_legacy_adoption_is_retried(
+    workspace_ctx, tmp_path, monkeypatch
+) -> None:
+    from opensquilla.gateway import rpc_workspaces
+
+    ctx, storage = workspace_ctx
+    legacy = tmp_path / "legacy-retry"
+    legacy.mkdir()
+    await storage.upsert_session(
+        SessionNode(
+            session_key="agent:main:webchat:legacy-retry",
+            origin={
+                "sandbox_run_context": {
+                    "run_mode": "standard",
+                    "workspace": str(legacy),
+                }
+            },
+        )
+    )
+
+    original_scan = storage.list_legacy_project_workspace_candidates
+    attempts = 0
+
+    async def flaky_scan(*, after_rowid: int = 0, limit: int = 500):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("synthetic adoption failure")
+        return await original_scan(after_rowid=after_rowid, limit=limit)
+
+    monkeypatch.setattr(
+        storage,
+        "list_legacy_project_workspace_candidates",
+        flaky_scan,
+    )
+    with pytest.raises(RuntimeError, match="synthetic adoption failure"):
+        await rpc_workspaces._handle_workspaces_list(None, ctx)
+
+    listed = await rpc_workspaces._handle_workspaces_list(None, ctx)
+
+    assert len(listed["workspaces"]) == 1
+    assert attempts == 2
 
 
 @pytest.mark.asyncio

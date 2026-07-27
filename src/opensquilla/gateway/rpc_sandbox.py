@@ -1113,4 +1113,8 @@ async def _handle_sandbox_workspace_set(params: dict | None, ctx: RpcContext) ->
         workspace=context.workspace,
         context=context,
     )
+    storage = get_session_storage(manager)
+    invalidate_adoption = getattr(storage, "invalidate_legacy_project_adoption", None)
+    if callable(invalidate_adoption):
+        invalidate_adoption()
     return _payload(context)

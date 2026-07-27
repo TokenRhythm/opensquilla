@@ -41,6 +41,50 @@ async def _count_rows_for_session_key(
     return int(row[0])
 
 
+@pytest.mark.asyncio
+async def test_legacy_project_adoption_cas_does_not_create_or_bind_stale_candidate(
+    tmp_path: Path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        original_origin = {
+            "sandbox_run_context": {
+                "run_mode": "standard",
+                "workspace": str(tmp_path / "legacy"),
+            }
+        }
+        session = SessionNode(
+            session_key="agent:main:webchat:stale-adoption",
+            origin=original_origin,
+        )
+        await storage.upsert_session(session)
+        session.origin = {
+            "sandbox_run_context": {
+                "run_mode": "standard",
+                "workspace": str(tmp_path / "changed"),
+            }
+        }
+        await storage.upsert_session(session)
+
+        adopted = await storage.adopt_legacy_session_workspace(
+            session.session_key,
+            expected_agent_id="main",
+            expected_origin=original_origin,
+            path=str(tmp_path / "legacy"),
+            path_key=str(tmp_path / "legacy"),
+            display_name="legacy",
+            trusted_at=100,
+            now_ms=100,
+        )
+
+        persisted = await storage.get_session(session.session_key)
+        assert adopted is None
+        assert persisted is not None and persisted.workspace_id is None
+        assert await storage.list_project_workspaces() == []
+    finally:
+        await storage.close()
+
+
 async def _seed_session_history(
     storage: SessionStorage,
     session: SessionNode,
