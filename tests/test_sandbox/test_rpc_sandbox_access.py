@@ -1361,9 +1361,7 @@ async def test_rpc_once_rw_mount_preserves_durable_ro_through_expiry(
     try:
         active = current_tool_run_context()
         assert active is not None
-        assert [(grant.access, grant.scope) for grant in active.mounts] == [
-            ("rw", "once")
-        ]
+        assert [(grant.access, grant.scope) for grant in active.mounts] == [("rw", "once")]
         allowed_target = mounted / "rpc-allowed-once.txt"
         allowed = await filesystem.write_file(
             str(allowed_target),
@@ -1380,9 +1378,7 @@ async def test_rpc_once_rw_mount_preserves_durable_ro_through_expiry(
         str(workspace),
     )
     assert overlay is not None
-    assert [(grant.access, grant.scope) for grant in overlay.mounts] == [
-        ("ro", "chat")
-    ]
+    assert [(grant.access, grant.scope) for grant in overlay.mounts] == [("ro", "chat")]
 
     reset_resolved_run_context_overlays()
     restored = await get_run_context(
@@ -1391,9 +1387,7 @@ async def test_rpc_once_rw_mount_preserves_durable_ro_through_expiry(
         config=ctx.config,
         workspace=str(workspace),
     )
-    assert [(grant.access, grant.scope) for grant in restored.mounts] == [
-        ("ro", "chat")
-    ]
+    assert [(grant.access, grant.scope) for grant in restored.mounts] == [("ro", "chat")]
     expired_context = ToolContext(
         is_owner=True,
         session_key=manager.node.session_key,
@@ -1867,56 +1861,435 @@ async def test_rpc_sandbox_path_pick_returns_valid_mount_selection(
 
 
 @pytest.mark.asyncio
-async def test_rpc_sandbox_path_list_returns_parent_directory_entries(
-    tmp_path,
+async def test_path_list_omitted_path_uses_agent_workspace_not_process_cwd(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.gateway.rpc_sandbox import _handle_sandbox_path_list
+
+    manager = _SessionManager()
+    agent_workspace = tmp_path / "agent-workspace"
+    unrelated_cwd = tmp_path / "gateway-cwd"
+    agent_workspace.mkdir()
+    unrelated_cwd.mkdir()
+    monkeypatch.chdir(unrelated_cwd)
+    ctx = _ctx(manager)
+    ctx.config.workspace_dir = str(agent_workspace)
+
+    result = await _handle_sandbox_path_list(
+        {"sessionKey": manager.node.session_key, "kind": "workspace"},
+        ctx,
+    )
+
+    assert result["currentPath"] == str(agent_workspace.resolve())
+    assert result["path"] == result["currentPath"]
+
+
+@pytest.mark.asyncio
+async def test_path_list_omitted_path_uses_validated_project_session(
+    project_sandbox_ctx: tuple[RpcContext, SessionNode, ProjectWorkspace],
+) -> None:
+    from opensquilla.gateway.rpc_sandbox import _handle_sandbox_path_list
+
+    ctx, project_session, project = project_sandbox_ctx
+    agent_workspace = Path(ctx.config.workspace_dir or "")
+    agent_workspace.mkdir()
+    assert agent_workspace.resolve(strict=True) != Path(project.path).resolve(strict=True)
+
+    result = await _handle_sandbox_path_list(
+        {"sessionKey": project_session.session_key, "kind": "workspace"},
+        ctx,
+    )
+
+    assert result["currentPath"] == str(Path(project.path).resolve(strict=True))
+    assert result["path"] == result["currentPath"]
+
+
+@pytest.mark.asyncio
+async def test_path_list_invalid_bound_project_does_not_fall_back(
+    project_sandbox_ctx: tuple[RpcContext, SessionNode, ProjectWorkspace],
+) -> None:
+    from opensquilla.gateway.rpc_sandbox import _handle_sandbox_path_list
+
+    ctx, project_session, project = project_sandbox_ctx
+    Path(project.path).rmdir()
+    agent_workspace = Path(ctx.config.workspace_dir or "")
+    agent_workspace.mkdir()
+
+    with pytest.raises(RpcHandlerError) as raised:
+        await _handle_sandbox_path_list(
+            {"sessionKey": project_session.session_key, "kind": "workspace"},
+            ctx,
+        )
+
+    assert raised.value.code == "WORKSPACE_UNAVAILABLE"
+    assert raised.value.details == {"reason": "unavailable"}
+
+
+@pytest.mark.asyncio
+async def test_path_list_explicit_path_precedes_invalid_bound_project(
+    project_sandbox_ctx: tuple[RpcContext, SessionNode, ProjectWorkspace],
+    tmp_path: Path,
+) -> None:
+    from opensquilla.gateway.rpc_sandbox import _handle_sandbox_path_list
+
+    ctx, project_session, project = project_sandbox_ctx
+    Path(project.path).rmdir()
+    explicit = tmp_path / "explicit"
+    explicit.mkdir()
+
+    result = await _handle_sandbox_path_list(
+        {
+            "sessionKey": project_session.session_key,
+            "path": str(explicit),
+            "kind": "workspace",
+        },
+        ctx,
+    )
+
+    assert result["currentPath"] == str(explicit.resolve(strict=True))
+
+
+@pytest.mark.asyncio
+async def test_path_list_falls_back_to_home_when_agent_workspace_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     import opensquilla.gateway.rpc_sandbox as rpc_sandbox
 
     manager = _SessionManager()
-    parent = tmp_path / "parent"
-    child = parent / "child"
-    sibling = parent / "sibling"
-    file_entry = parent / "notes.txt"
-    child.mkdir(parents=True)
-    sibling.mkdir()
-    file_entry.write_text("not a directory", encoding="utf-8")
-    handler = getattr(rpc_sandbox, "_handle_sandbox_path_list", None)
+    home = tmp_path / "home"
+    home.mkdir()
+    missing_workspace = tmp_path / "missing-agent-workspace"
+    ctx = _ctx(manager)
+    ctx.config.workspace_dir = str(missing_workspace)
+    monkeypatch.setattr(
+        rpc_sandbox.Path,
+        "home",
+        classmethod(lambda cls: home),
+    )
 
-    assert callable(handler)
+    result = await rpc_sandbox._handle_sandbox_path_list(
+        {"sessionKey": manager.node.session_key, "kind": "workspace"},
+        ctx,
+    )
 
-    result = await handler(
+    assert result["currentPath"] == str(home.resolve(strict=True))
+    assert result["path"] == result["currentPath"]
+
+
+@pytest.mark.asyncio
+async def test_path_list_falls_back_to_home_when_agent_workspace_symlink_loops(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import opensquilla.gateway.rpc_sandbox as rpc_sandbox
+
+    manager = _SessionManager()
+    home = tmp_path / "home"
+    home.mkdir()
+    looping_workspace = tmp_path / "looping-agent-workspace"
+    looping_workspace.symlink_to(looping_workspace, target_is_directory=True)
+    ctx = _ctx(manager)
+    ctx.config.workspace_dir = str(looping_workspace)
+    monkeypatch.setattr(
+        rpc_sandbox.Path,
+        "home",
+        classmethod(lambda cls: home),
+    )
+
+    result = await rpc_sandbox._handle_sandbox_path_list(
+        {"sessionKey": manager.node.session_key, "kind": "workspace"},
+        ctx,
+    )
+
+    assert result["currentPath"] == str(home.resolve(strict=True))
+
+
+@pytest.mark.asyncio
+async def test_path_list_explicit_symlink_loop_remains_strict(tmp_path: Path) -> None:
+    from opensquilla.gateway.rpc_sandbox import _handle_sandbox_path_list
+
+    manager = _SessionManager()
+    looping_path = tmp_path / "looping-explicit-path"
+    looping_path.symlink_to(looping_path, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="Symlink loop"):
+        await _handle_sandbox_path_list(
+            {
+                "sessionKey": manager.node.session_key,
+                "path": str(looping_path),
+                "kind": "workspace",
+            },
+            _ctx(manager),
+        )
+
+
+@pytest.mark.asyncio
+async def test_path_list_falls_back_to_home_when_agent_workspace_is_not_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import opensquilla.gateway.rpc_sandbox as rpc_sandbox
+
+    manager = _SessionManager()
+    home = tmp_path / "home"
+    home.mkdir()
+    workspace_file = tmp_path / "agent-workspace-file"
+    workspace_file.write_text("not a directory", encoding="utf-8")
+    ctx = _ctx(manager)
+    ctx.config.workspace_dir = str(workspace_file)
+    monkeypatch.setattr(
+        rpc_sandbox.Path,
+        "home",
+        classmethod(lambda cls: home),
+    )
+
+    result = await rpc_sandbox._handle_sandbox_path_list(
+        {"sessionKey": manager.node.session_key, "path": None, "kind": "workspace"},
+        ctx,
+    )
+
+    assert result["currentPath"] == str(home.resolve(strict=True))
+
+
+@pytest.mark.asyncio
+async def test_path_list_parent_and_selectability_contract(
+    tmp_path: Path,
+) -> None:
+    from opensquilla.gateway.rpc_sandbox import _handle_sandbox_path_list
+
+    manager = _SessionManager()
+    root = tmp_path / "root"
+    child = root / "child"
+    nested = child / "nested"
+    file_entry = child / "notes.txt"
+    nested.mkdir(parents=True)
+    file_entry.write_text("notes", encoding="utf-8")
+
+    result = await _handle_sandbox_path_list(
         {
             "sessionKey": manager.node.session_key,
             "path": str(child),
+            "kind": "workspace",
         },
         _ctx(manager),
     )
 
-    assert result["path"] == str(child)
-    assert result["parentPath"] == str(parent)
-    entries_by_path = {entry["path"]: entry for entry in result["entries"]}
-    entries_by_name = {entry["name"]: entry for entry in result["entries"]}
-    assert entries_by_name[".."] == {
-        "name": "..",
-        "path": str(parent),
-        "kind": "directory",
-        "selectable": True,
-    }
-    assert {
-        str(child),
-        str(sibling),
-        str(file_entry),
-    }.issubset(entries_by_path)
+    assert result["currentPath"] == str(child.resolve())
+    assert result["path"] == result["currentPath"]
+    assert result["parentPath"] == str(root.resolve())
+    assert all(row["name"] != ".." for row in result["entries"])
+    file_row = next(row for row in result["entries"] if row["kind"] == "file")
+    assert file_row["path"] == str(file_entry.resolve())
+    assert file_row["selectable"] is False
+    directory_row = next(row for row in result["entries"] if row["kind"] == "directory")
+    assert directory_row["path"] == str(nested.resolve())
+    assert directory_row["selectable"] is True
 
-    assert entries_by_path[str(child)]["name"] == "child"
-    assert entries_by_path[str(child)]["kind"] == "directory"
-    assert entries_by_path[str(child)]["selectable"] is True
-    assert entries_by_path[str(sibling)]["name"] == "sibling"
-    assert entries_by_path[str(sibling)]["kind"] == "directory"
-    assert entries_by_path[str(sibling)]["selectable"] is True
-    assert entries_by_path[str(file_entry)]["name"] == "notes.txt"
-    assert entries_by_path[str(file_entry)]["kind"] == "file"
-    assert entries_by_path[str(file_entry)]["selectable"] is True
+
+@pytest.mark.asyncio
+async def test_path_list_mount_files_are_selectable(tmp_path: Path) -> None:
+    from opensquilla.gateway.rpc_sandbox import _handle_sandbox_path_list
+
+    manager = _SessionManager()
+    target = tmp_path / "mount"
+    target.mkdir()
+    file_entry = target / "notes.txt"
+    file_entry.write_text("notes", encoding="utf-8")
+
+    result = await _handle_sandbox_path_list(
+        {
+            "sessionKey": manager.node.session_key,
+            "path": str(target),
+            "kind": "mount",
+        },
+        _ctx(manager),
+    )
+
+    file_row = next(row for row in result["entries"] if row["kind"] == "file")
+    assert file_row["path"] == str(file_entry.resolve())
+    assert file_row["selectable"] is True
+
+
+@pytest.mark.asyncio
+async def test_path_list_root_has_null_parent(tmp_path: Path) -> None:
+    from opensquilla.gateway.rpc_sandbox import _handle_sandbox_path_list
+
+    manager = _SessionManager()
+    root = Path(tmp_path.anchor)
+
+    result = await _handle_sandbox_path_list(
+        {
+            "sessionKey": manager.node.session_key,
+            "path": str(root),
+            "kind": "workspace",
+        },
+        _ctx(manager),
+    )
+
+    assert result["currentPath"] == str(root.resolve(strict=True))
+    assert result["path"] == result["currentPath"]
+    assert result["parentPath"] is None
+    assert all(row["name"] != ".." for row in result["entries"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("base_path", [None, "", "relative/base", 42])
+async def test_path_list_relative_path_requires_absolute_base(
+    tmp_path: Path,
+    base_path: object,
+) -> None:
+    from opensquilla.gateway.rpc_sandbox import _handle_sandbox_path_list
+
+    manager = _SessionManager()
+    (tmp_path / "child").mkdir()
+    params: dict[str, object] = {
+        "sessionKey": manager.node.session_key,
+        "path": "child",
+        "kind": "workspace",
+    }
+    if base_path is not None:
+        params["basePath"] = base_path
+
+    with pytest.raises(
+        ValueError,
+        match="relative path requires absolute basePath",
+    ):
+        await _handle_sandbox_path_list(params, _ctx(manager))
+
+
+@pytest.mark.asyncio
+async def test_path_list_relative_path_resolves_against_base(tmp_path: Path) -> None:
+    from opensquilla.gateway.rpc_sandbox import _handle_sandbox_path_list
+
+    manager = _SessionManager()
+    target = tmp_path / "child"
+    target.mkdir()
+
+    result = await _handle_sandbox_path_list(
+        {
+            "sessionKey": manager.node.session_key,
+            "path": "child",
+            "basePath": str(tmp_path),
+            "kind": "workspace",
+        },
+        _ctx(manager),
+    )
+
+    assert result["currentPath"] == str(target.resolve(strict=True))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("base_kind", ["missing", "file"])
+async def test_path_list_relative_path_requires_existing_directory_base(
+    tmp_path: Path,
+    base_kind: str,
+) -> None:
+    from opensquilla.gateway.rpc_sandbox import _handle_sandbox_path_list
+
+    manager = _SessionManager()
+    base = tmp_path / "base"
+    if base_kind == "file":
+        base.write_text("not a directory", encoding="utf-8")
+
+    expected_error = FileNotFoundError if base_kind == "missing" else NotADirectoryError
+    with pytest.raises(expected_error):
+        await _handle_sandbox_path_list(
+            {
+                "sessionKey": manager.node.session_key,
+                "path": "child",
+                "basePath": str(base),
+                "kind": "workspace",
+            },
+            _ctx(manager),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["", "   ", 42, [], {}])
+async def test_path_list_rejects_invalid_explicit_path(path: object) -> None:
+    from opensquilla.gateway.rpc_sandbox import _handle_sandbox_path_list
+
+    manager = _SessionManager()
+
+    with pytest.raises(ValueError, match="params.path"):
+        await _handle_sandbox_path_list(
+            {
+                "sessionKey": manager.node.session_key,
+                "path": path,
+                "kind": "workspace",
+            },
+            _ctx(manager),
+        )
+
+
+@pytest.mark.asyncio
+async def test_path_list_missing_or_inaccessible_directory_is_an_error(
+    tmp_path: Path,
+) -> None:
+    from opensquilla.gateway.rpc_sandbox import _handle_sandbox_path_list
+
+    manager = _SessionManager()
+
+    with pytest.raises(FileNotFoundError):
+        await _handle_sandbox_path_list(
+            {
+                "sessionKey": manager.node.session_key,
+                "path": str(tmp_path / "missing"),
+                "kind": "workspace",
+            },
+            _ctx(manager),
+        )
+
+
+@pytest.mark.asyncio
+async def test_path_list_file_target_is_an_error(tmp_path: Path) -> None:
+    from opensquilla.gateway.rpc_sandbox import _handle_sandbox_path_list
+
+    manager = _SessionManager()
+    file_target = tmp_path / "notes.txt"
+    file_target.write_text("notes", encoding="utf-8")
+
+    with pytest.raises(NotADirectoryError):
+        await _handle_sandbox_path_list(
+            {
+                "sessionKey": manager.node.session_key,
+                "path": str(file_target),
+                "kind": "workspace",
+            },
+            _ctx(manager),
+        )
+
+
+@pytest.mark.asyncio
+async def test_path_list_does_not_swallow_directory_access_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.gateway.rpc_sandbox import _handle_sandbox_path_list
+
+    manager = _SessionManager()
+    target = tmp_path / "blocked"
+    target.mkdir()
+    original_iterdir = Path.iterdir
+
+    def denied_iterdir(path: Path):
+        if path == target:
+            raise PermissionError("denied by test")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", denied_iterdir)
+
+    with pytest.raises(PermissionError, match="denied by test"):
+        await _handle_sandbox_path_list(
+            {
+                "sessionKey": manager.node.session_key,
+                "path": str(target),
+                "kind": "workspace",
+            },
+            _ctx(manager),
+        )
 
 
 @pytest.mark.asyncio
@@ -1939,7 +2312,7 @@ async def test_rpc_sandbox_path_list_requires_owner(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_rpc_sandbox_path_list_supports_parent_row_and_child_drilldown(
+async def test_rpc_sandbox_path_list_ignores_legacy_browse_children(
     tmp_path,
 ) -> None:
     from opensquilla.gateway.rpc_sandbox import _handle_sandbox_path_list
@@ -1962,21 +2335,17 @@ async def test_rpc_sandbox_path_list_supports_parent_row_and_child_drilldown(
         _ctx(manager),
     )
 
-    assert result["path"] == str(child)
-    assert result["parentPath"] == str(child)
+    assert result["currentPath"] == str(child.resolve())
+    assert result["path"] == result["currentPath"]
+    assert result["parentPath"] == str(parent.resolve())
     entries_by_name = {entry["name"]: entry for entry in result["entries"]}
-    assert entries_by_name[".."] == {
-        "name": "..",
-        "path": str(parent),
-        "kind": "directory",
-        "selectable": True,
-    }
+    assert ".." not in entries_by_name
     assert entries_by_name["grandchild"]["path"] == str(grandchild)
     assert entries_by_name["grandchild"]["kind"] == "directory"
     assert entries_by_name["grandchild"]["selectable"] is True
     assert entries_by_name["inside.txt"]["path"] == str(child_file)
     assert entries_by_name["inside.txt"]["kind"] == "file"
-    assert entries_by_name["inside.txt"]["selectable"] is True
+    assert entries_by_name["inside.txt"]["selectable"] is False
 
 
 @pytest.mark.asyncio

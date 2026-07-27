@@ -132,6 +132,21 @@ export interface ProjectWorkspacesResponse {
   workspaces?: ProjectWorkspaceItem[]
 }
 
+export interface SandboxPathEntry {
+  name: string
+  path: string
+  kind: 'directory' | 'file'
+  selectable: boolean
+  hidden?: boolean
+}
+
+export interface SandboxPathListResponse {
+  currentPath: string
+  path: string
+  parentPath: string | null
+  entries: SandboxPathEntry[]
+}
+
 export interface ProjectWorkspaceHistoryDeleteResponse {
   workspaceId?: string
   deletedTaskCount?: number

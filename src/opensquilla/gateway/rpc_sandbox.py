@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import copy
+import stat
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 from opensquilla.agents.scope import resolve_agent_workspace_dir
 from opensquilla.gateway.project_workspace_runtime import (
     authoritative_project_run_context,
     map_project_workspace_error,
+    resolve_session_project_workspace,
 )
 from opensquilla.gateway.rpc import (
     RpcContext,
@@ -127,26 +130,18 @@ def _validate_workspace_param(workspace: str) -> str:
     return normalize_workspace_path(workspace)
 
 
-def _path_entry_payload(path: Any) -> dict[str, Any]:
+def _path_entry_payload(path: Path, *, selection_kind: str) -> dict[str, Any]:
     name = str(path.name or str(path))
+    entry_kind = "directory" if path.is_dir() else "file"
     payload = {
         "name": name,
         "path": str(path),
-        "kind": "directory" if path.is_dir() else "file",
-        "selectable": True,
+        "kind": entry_kind,
+        "selectable": entry_kind == "directory" or selection_kind == "mount",
     }
     if name.startswith("."):
         payload["hidden"] = True
     return payload
-
-
-def _parent_entry_payload(path: Any) -> dict[str, Any]:
-    return {
-        "name": "..",
-        "path": str(path),
-        "kind": "directory",
-        "selectable": True,
-    }
 
 
 def _pick_directory_path(initial_dir: str | None = None) -> str:
@@ -236,6 +231,59 @@ def _default_workspace_for_session(
         agent_id = session_agent_id
     workspace = resolve_agent_workspace_dir(agent_id, config)
     return str(workspace) if workspace is not None else None
+
+
+async def _path_list_start(
+    params: dict[str, Any],
+    ctx: RpcContext,
+    session_key: str,
+) -> Path:
+    raw_path = params.get("path")
+    if raw_path is not None:
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raise ValueError("params.path must be a non-empty string")
+        candidate = Path(raw_path).expanduser()
+        if not candidate.is_absolute():
+            base_raw = params.get("basePath")
+            if (
+                not isinstance(base_raw, str)
+                or not base_raw.strip()
+                or not Path(base_raw).expanduser().is_absolute()
+            ):
+                raise ValueError("relative path requires absolute basePath")
+            base = Path(base_raw).expanduser().resolve(strict=True)
+            if not stat.S_ISDIR(base.stat().st_mode):
+                raise NotADirectoryError(str(base))
+            candidate = base / candidate
+        return candidate.resolve(strict=True)
+
+    manager = _require_session_manager(ctx)
+    session = await _session_for_key(manager, session_key)
+    if session is not None and getattr(session, "workspace_id", None):
+        storage = get_session_storage(manager)
+        if storage is None:
+            raise RpcUnavailableError("Session storage is not configured")
+        try:
+            validated = await resolve_session_project_workspace(storage, session)
+        except ProjectWorkspaceStateError as exc:
+            raise map_project_workspace_error(
+                exc,
+                owner=ctx.principal.is_owner,
+            ) from exc
+        assert validated is not None
+        return Path(validated.canonical_path)
+
+    workspace = _default_workspace_for_session(session, session_key, ctx.config)
+    if workspace is not None:
+        try:
+            candidate = Path(workspace).expanduser().resolve(strict=True)
+            workspace_mode = candidate.stat().st_mode
+        except (FileNotFoundError, NotADirectoryError, RuntimeError):
+            pass
+        else:
+            if stat.S_ISDIR(workspace_mode):
+                return candidate
+    return Path.home().resolve(strict=True)
 
 
 async def _context_for_session(
@@ -770,39 +818,29 @@ async def _handle_sandbox_bundle_disable(params: dict | None, ctx: RpcContext) -
 @_d.method("sandbox.path.list", scope="operator.read")
 async def _handle_sandbox_path_list(params: dict | None, ctx: RpcContext) -> dict:
     params = _require_params(params)
-    _require_session_key(params)
+    session_key = _require_session_key(params)
     _require_owner(ctx, "sandbox.path.list")
-    path = _require_string_param(params, "path", "params.path is required")
     kind = str(params.get("kind") or "workspace").strip().lower()
     if kind not in {"workspace", "mount"}:
         raise ValueError("params.kind must be workspace or mount")
 
-    normalized = normalize_path(path)
-    browse_children = params.get("browseChildren") is True
-    listing_dir = (
-        normalized
-        if browse_children and normalized.is_dir()
-        else normalized.parent
-        if normalized.parent != normalized
-        else normalized
-    )
-    parent_target = normalized.parent if normalized.parent != normalized else normalized
-    entries = []
-    try:
-        entries = [_parent_entry_payload(parent_target)]
-        entries.extend(
-            _path_entry_payload(entry)
-            for entry in sorted(
-                listing_dir.iterdir(),
-                key=lambda item: (not item.is_dir(), item.name.casefold()),
-            )
+    listing_dir = await _path_list_start(params, ctx, session_key)
+    if not stat.S_ISDIR(listing_dir.stat().st_mode):
+        raise NotADirectoryError(str(listing_dir))
+    entries = [
+        _path_entry_payload(entry, selection_kind=kind)
+        for entry in sorted(
+            listing_dir.iterdir(),
+            key=lambda item: (not item.is_dir(), item.name.casefold()),
         )
-    except (OSError, RuntimeError):
-        entries = []
+    ]
+    current_path = str(listing_dir)
+    parent_path = str(listing_dir.parent) if listing_dir.parent != listing_dir else None
 
     return {
-        "path": str(normalized),
-        "parentPath": str(listing_dir),
+        "currentPath": current_path,
+        "path": current_path,
+        "parentPath": parent_path,
         "entries": entries,
     }
 
