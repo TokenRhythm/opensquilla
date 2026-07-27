@@ -1,6 +1,7 @@
 ---
 name: xlsx
 description: "Read, edit, or create Microsoft Excel `.xlsx` workbooks. Trigger this skill whenever the user mentions a spreadsheet, .xlsx file, workbook, sheet, formula, pivot table, or asks to extract tabular data, modify a sheet, or build a workbook from rows. Three execution paths: structured inspection, in-place cell edits, and create-from-scratch via openpyxl. Values starting with `=` are written as formulas; everything else is a literal value with type preserved (int / float / str / datetime)."
+description_zh: "读取、编辑或创建Microsoft Excel .xlsx 工作簿。当用户提到电子表格、.xlsx文件、工作簿、工作表、公式、数据透视表，或要求提取表格数据、修改工作表或从行数据构建工作簿时触发。支持三种执行路径：结构化检查、就地单元格编辑，以及用openpyxl从零创建。以 = 开头的值写为公式，其余为保留类型的字面值（int/float/str/datetime）。"
 homepage: https://openpyxl.readthedocs.io/
 provenance:
   origin: clawhub-mit0

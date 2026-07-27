@@ -1,6 +1,7 @@
 ---
 name: latex-compile
 description: "Compile a LaTeX project (xelatex × bibtex × xelatex × xelatex) and report the log tail. Demo-only."
+description_zh: "编译LaTeX项目（xelatex × bibtex × xelatex × xelatex）并报告日志末尾。仅供演示。"
 provenance:
   origin: opensquilla-original
   license: Apache-2.0

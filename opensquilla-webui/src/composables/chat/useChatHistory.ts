@@ -19,6 +19,7 @@ import {
   restoreMessageAnchor,
   stabilizeMessageAnchor,
 } from '@/utils/chat/scrollAnchor'
+import type { InitialHistoryLoadStatus } from '@/utils/chat/sessionLoadState'
 
 type RpcClient = {
   waitForConnection: () => Promise<void>
@@ -64,6 +65,8 @@ export interface ChatHistoryState {
   canonicalComplete: boolean | null
   loading: boolean
   loadingEarlier: boolean
+  retrying: boolean
+  initialLoadStatus: InitialHistoryLoadStatus
   loadEarlierError: boolean
 }
 
@@ -71,6 +74,7 @@ interface HistoryLoadParams {
   before?: string | number | null
   prepend?: boolean
   bridgeRetry?: boolean
+  retry?: boolean
 }
 
 type FailedHistoryRequest =
@@ -107,6 +111,8 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     canonicalComplete: null,
     loading: false,
     loadingEarlier: false,
+    retrying: false,
+    initialLoadStatus: 'pending',
     loadEarlierError: false,
   })
 
@@ -186,7 +192,11 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     return typeof value === 'boolean' ? value : historyState.value.canonicalAvailable
   }
 
-  function updateHistoryState(data: ChatHistoryResponse, prepend: boolean) {
+  function updateHistoryState(
+    data: ChatHistoryResponse,
+    prepend: boolean,
+    initialLoadError = false,
+  ) {
     const nextOldestCursor = data.oldest_cursor ?? data.oldestCursor ?? null
     const requestedCursor = prepend ? historyState.value.oldestCursor : null
     const cursorAdvanced = !prepend || nextOldestCursor !== requestedCursor
@@ -204,6 +214,10 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       canonicalComplete: responseCanonicalComplete(data),
       loading: false,
       loadingEarlier: false,
+      retrying: false,
+      initialLoadStatus: prepend
+        ? historyState.value.initialLoadStatus
+        : initialLoadError ? 'error' : 'ready',
       loadEarlierError: false,
     }
   }
@@ -226,6 +240,8 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       canonicalComplete: null,
       loading: false,
       loadingEarlier: false,
+      retrying: false,
+      initialLoadStatus: 'pending',
       loadEarlierError: false,
     }
     return crossedSession
@@ -246,11 +262,18 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     cancelAnchorStabilization()
     const requestSeq = ++historyRequestSeq
     let bridgeAttempted = Boolean(params.bridgeRetry)
+    const isInitialLoad = !params.prepend
+      && (
+        historyState.value.initialLoadStatus === 'pending'
+        || historyState.value.initialLoadStatus === 'error'
+      )
     loadingHistoryKey = key
     historyState.value = {
       ...historyState.value,
       loading: true,
       loadingEarlier: Boolean(params.prepend || params.bridgeRetry),
+      retrying: Boolean(params.retry),
+      initialLoadStatus: isInitialLoad ? 'loading' : historyState.value.initialLoadStatus,
       loadEarlierError: false,
     }
     const isCurrentRequest = () => key === options.sessionKey.value && requestSeq === historyRequestSeq
@@ -259,7 +282,12 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       if (!isCurrentRequest()) {
         if (requestSeq === historyRequestSeq) {
           loadingHistoryKey = ''
-          historyState.value = { ...historyState.value, loading: false, loadingEarlier: false }
+          historyState.value = {
+            ...historyState.value,
+            loading: false,
+            loadingEarlier: false,
+            retrying: false,
+          }
           flushPendingHistorySync()
         }
         return
@@ -294,6 +322,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
             canonicalComplete: responseCanonicalComplete(data),
             loading: false,
             loadingEarlier: false,
+            retrying: false,
             loadEarlierError: false,
           }
           flushPendingHistorySync()
@@ -360,6 +389,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
               canonicalComplete: responseCanonicalComplete(bridgeData),
               loading: false,
               loadingEarlier: false,
+              retrying: false,
               loadEarlierError: false,
             }
             flushPendingHistorySync()
@@ -417,7 +447,20 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       }
 
       if (canonicalAvailable !== false) failedHistoryRequest = null
-      updateHistoryState(historyData, Boolean(params.prepend))
+      // Gate the full-session error on explicit coverage metadata. Older
+      // Gateways used canonical_available=false for a legitimate empty WebChat
+      // session but did not yet publish canonical_complete.
+      const initialCanonicalLoadFailed = isInitialLoad
+        && !params.prepend
+        && !hasLoadedEarlier
+        && mapped.length === 0
+        && canonicalAvailable === false
+        && (data.canonical_complete ?? data.canonicalComplete) === false
+      updateHistoryState(
+        historyData,
+        Boolean(params.prepend),
+        initialCanonicalLoadFailed,
+      )
       loadingHistoryKey = ''
       if (params.prepend && params.before != null) {
         hasLoadedEarlier = true
@@ -493,6 +536,11 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     } catch {
       // History endpoint may not exist yet.
       if (isCurrentRequest()) {
+        const initialLoadFailed = isInitialLoad && !bridgeAttempted
+        const emptyRefreshFailed = !isInitialLoad
+          && !params.prepend
+          && !bridgeAttempted
+          && options.messages.value.length === 0
         failedHistoryRequest = bridgeAttempted
           ? { kind: 'bridge', key }
           : {
@@ -506,9 +554,11 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           ...historyState.value,
           loading: false,
           loadingEarlier: false,
-          loadEarlierError: Boolean(
-            params.prepend || bridgeAttempted || options.messages.value.length === 0
-          ),
+          retrying: false,
+          initialLoadStatus: initialLoadFailed
+            ? 'error'
+            : historyState.value.initialLoadStatus,
+          loadEarlierError: Boolean(params.prepend || bridgeAttempted || emptyRefreshFailed),
         }
         flushPendingHistorySync()
       }
@@ -529,10 +579,14 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   function retryHistory() {
     const failed = failedHistoryRequest
     if (failed?.key === options.sessionKey.value) {
-      if (failed.kind === 'bridge') return loadHistory({ bridgeRetry: true })
-      return loadHistory({ before: failed.before, prepend: failed.prepend })
+      if (failed.kind === 'bridge') return loadHistory({ bridgeRetry: true, retry: true })
+      return loadHistory({
+        before: failed.before,
+        prepend: failed.prepend,
+        retry: true,
+      })
     }
-    if (historyState.value.canonicalAvailable === false) return loadHistory()
+    if (historyState.value.canonicalAvailable === false) return loadHistory({ retry: true })
     return loadEarlierHistory()
   }
 

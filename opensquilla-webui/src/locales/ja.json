@@ -1988,7 +1988,33 @@
       "next12h": "今後 12 時間",
       "upcomingRun": "予定された実行",
       "nowTick": "現在",
-      "deleteFailed": "削除に失敗しました: {error}"
+      "deleteFailed": "削除に失敗しました: {error}",
+      "bulkManage": "一括管理",
+      "exitBulk": "一括モードを終了",
+      "overview": "実行概要",
+      "addFromTemplate": "テンプレートから追加",
+      "addAutomation": "自動化を追加",
+      "heroTitle": "最初の自動化を始めましょう",
+      "heroHint": "指定した時間に、リマインダー、整理、チェック、エージェントタスクを OpenSquilla が自動で実行します。",
+      "overviewDesc": "自動化の状態と最近の実行状況を確認します。",
+      "templateDesc": "シナリオを選ぶと、実行時間とタスク内容が自動入力されます。",
+      "selectedCount": "{count} 件選択",
+      "selectVisible": "表示中をすべて選択",
+      "clearSelection": "クリア",
+      "overviewEyebrow": "自動化の概要",
+      "galleryEyebrow": "自動化テンプレート",
+      "bulkDeleteConfirm": "選択した {count} 件の自動化を削除しますか？この操作は取り消せません。",
+      "templates": {
+        "ai-daily": { "title": "毎日のAIニュース要約", "description": "過去24時間の重要なAIニュースを信頼できるリンク付きでまとめます。", "category": "ニュース", "schedule": "毎日 08:00" },
+        "weekly-report": { "title": "週間業務レビュー", "description": "進捗、リスク、成果物、翌週の優先事項を整理します。", "category": "生産性", "schedule": "金曜日 17:30" },
+        "english-five": { "title": "毎日5つの英単語", "description": "例文と短いクイズ付きの軽量な語彙レッスンを作成します。", "category": "学習", "schedule": "毎日 09:00" },
+        "project-risk": { "title": "プロジェクトリスク確認", "description": "遅延、エラー、未解決事項を確認し、リスクと提案を報告します。", "category": "プロジェクト", "schedule": "平日 10:00" },
+        "knowledge-review": { "title": "週間ナレッジレビュー", "description": "新しいメモや会議記録を整理し、次に読む項目をまとめます。", "category": "ナレッジ", "schedule": "日曜日 18:00" },
+        "daily-idea": { "title": "今日のアイデアと豆知識", "description": "信頼できる豆知識と実行しやすい小さなアイデアを届けます。", "category": "ライフスタイル", "schedule": "毎日 12:00" },
+        "bedtime-story": { "title": "毎日の読み聞かせ物語", "description": "親子で読める温かく想像力豊かな短編物語を作ります。", "category": "家族", "schedule": "毎日 20:30" },
+        "classic-movie": { "title": "名作映画のおすすめ", "description": "高評価の名作映画をネタバレなしで紹介します。", "category": "エンタメ", "schedule": "土曜日 19:00" },
+        "today-in-history": { "title": "歴史上の今日", "description": "科学、文化、社会から信頼できる歴史的出来事を紹介します。", "category": "毎日の知識", "schedule": "毎日 08:30" }
+      }
     },
     "deleteDialog": {
       "title": "スケジュールを削除",
@@ -2031,7 +2057,8 @@
       "colSchedule": "スケジュール",
       "colStatus": "状態",
       "colLastRun": "前回実行",
-      "colNextRun": "次回実行"
+      "colNextRun": "次回実行",
+      "selectJob": "{name} を選択"
     },
     "runHistory": {
       "eyebrow": "実行履歴",
@@ -2102,6 +2129,32 @@
       "fdWebhook": "Webhook",
       "enabled": "有効",
       "saveSchedule": "スケジュールを保存"
+      ,"friendlyNamePlaceholder": "例：毎日顧客フィードバックを整理"
+      ,"friendlyTypeCron": "指定時刻に繰り返す"
+      ,"friendlyTypeEvery": "一定間隔で繰り返す"
+      ,"friendlyTypeAt": "指定時刻に一度だけ実行"
+      ,"executionFrequency": "実行頻度"
+      ,"daily": "毎日"
+      ,"weekdays": "平日"
+      ,"weekly": "毎週"
+      ,"monthly": "毎月"
+      ,"customAdvancedTime": "高度なスケジュール"
+      ,"weekday": "曜日"
+      ,"date": "日付"
+      ,"monthlyDay": "毎月 {day} 日"
+      ,"specificTime": "時刻"
+      ,"customTimeHint": "より柔軟な時間ルールを使用できます。"
+      ,"openAdvancedTime": "高度な時間設定を開く"
+      ,"everyHowOften": "実行間隔"
+      ,"timeUnit": "時間単位"
+      ,"minutes": "分"
+      ,"hours": "時間"
+      ,"days": "日"
+      ,"dateAndTime": "実行日時"
+      ,"friendlyMessagePlaceholder": "例：今日の顧客フィードバックを整理し、次の対応を提案"
+      ,"moreRuntimeSettings": "その他の実行設定（任意）"
+      ,"advancedTimeHint": "上の時間選択で対応できない場合にのみ使用します。"
+      ,"timezoneSimpleHint": "通常は変更不要です。"
     },
     "form": {
       "cronPreviewPlaceholder": "プレビューするには 5 フィールドの cron 式を入力してください",
@@ -2227,6 +2280,8 @@
       "reloadNoChanges": "スキルカタログは最新です（世代 {generation}）。",
       "reloadPartial": "スキルカタログを世代 {generation} として再読み込みしましたが、{errors} 件のエラーがあります。{summary}",
       "reloadFailed": "スキルカタログの再読み込みに失敗しました: {error}",
+      "overviewTitle": "スキル概要",
+      "overviewDesc": "インストールと設定の状態を確認し、カテゴリを選択してスキルを絞り込みます。",
       "reloadListFailed": "カタログは再読み込みされましたが、更新後のスキル一覧を取得できませんでした。",
       "reloadUnknownError": "Gateway は以前のカタログを維持しました。",
       "tabsLabel": "スキルのソース",
@@ -2304,6 +2359,10 @@
       "unknown": "不明",
       "noAudit": "自動有効化の判断は記録されていません。",
       "gates": "ゲート"
+    },
+    "tile": {
+      "installed": "インストール済み",
+      "add": "追加"
     },
     "skillCard": {
       "subSkillsTitle": "このメタスキルが使用するサブスキル",
@@ -2673,6 +2732,14 @@
     "historyTurnLoadedCount": "読み込み済み {total} 件中 {number} 件目",
     "historyAttachmentOnly": "添付ファイルのみのメッセージ",
     "historyAttachmentCount": "添付ファイル：{count}",
+    "loadingSession": "会話を読み込んでいます…",
+    "loadingSessionDescription": "最近のメッセージと会話の状態を復元しています…",
+    "loadSessionFailed": "会話を一時的に読み込めません",
+    "loadSessionDescription": "接続が中断されたか、履歴サービスが一時的に利用できない可能性があります。再読み込みしてください。",
+    "reloadSession": "再読み込み",
+    "retryingSession": "会話を再読み込みしています",
+    "retryingSessionDescription": "会話履歴を復元しています…",
+    "retryingSessionAction": "再読み込み中…",
     "noMessagesYet": "メッセージはまだありません。",
     "newChat": "新規タスク",
     "chatWithSuffix": "チャット {suffix}",
@@ -3011,6 +3078,21 @@
       "planWeek": "今週の計画を立てて",
       "searchAiNews": "今日の AI ニュースを検索して",
       "generateImage": "小さなイカのマスコットの画像を生成して"
+    },
+    "metaQuick": {
+      "webpage": "マルチメディアWebページを作成",
+      "shortDrama": "AIショートドラマを作成",
+      "paperWriting": "学術論文を執筆",
+      "webpageDesc": "すぐに使える完成度の高いサイトを制作",
+      "shortDramaDesc": "脚本・絵コンテ・完成動画を制作",
+      "paperWritingDesc": "調査・執筆・論文コンパイルまで対応"
+    },
+    "metaDescriptions": {
+      "webpage": "テーマから完全なマルチメディアサイトを制作します。",
+      "kidsProject": "子ども向けの安全で年齢に適した創作企画を立てます。",
+      "shortDrama": "脚本から完成動画まで AI ショートドラマを制作します。",
+      "skillCreator": "既存スキルを再利用可能なワークフローにまとめます。",
+      "paperWriting": "学術論文の調査・執筆・コンパイルを行います。"
     },
     "toast": {
       "downloadFailedHttp": "ダウンロードに失敗しました — HTTP {status}",

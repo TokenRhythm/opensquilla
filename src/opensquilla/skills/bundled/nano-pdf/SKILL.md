@@ -1,6 +1,7 @@
 ---
 name: nano-pdf
 description: Edit PDFs with natural-language instructions using the nano-pdf CLI.
+description_zh: "使用nano-pdf CLI以自然语言指令编辑PDF。"
 homepage: https://pypi.org/project/nano-pdf/
 provenance:
   origin: openclaw-derived

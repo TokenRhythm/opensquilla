@@ -417,18 +417,18 @@ def test_publish_writes_snapshot_without_reentering_loader(
     assert [skill.name for skill in loader.snapshot().skills] == ["alpha"]
 
 
-def test_snapshot_v11_is_invalid_and_v12_round_trips_atomically(tmp_path: Path) -> None:
+def test_snapshot_v12_is_invalid_and_v13_round_trips_atomically(tmp_path: Path) -> None:
     root = tmp_path / "skills"
     _write_skill(root, "alpha")
     snapshot_path = tmp_path / "snapshot.json"
-    snapshot_path.write_text(json.dumps({"version": 11}), encoding="utf-8")
+    snapshot_path.write_text(json.dumps({"version": 12}), encoding="utf-8")
     loader = SkillLoader(workspace_dir=root, snapshot_path=snapshot_path)
     assert loader.load_snapshot() is None
 
     loader.load_all()
     loader.save_snapshot()
     data = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    assert data["version"] == 12
+    assert data["version"] == 13
     assert all("mtime_ns" in entry for entry in data["manifest"].values())
     assert not list(tmp_path.glob(".snapshot.json.*.tmp"))
 
@@ -436,7 +436,28 @@ def test_snapshot_v11_is_invalid_and_v12_round_trips_atomically(tmp_path: Path) 
     assert [skill.name for skill in restored.load_snapshot() or []] == ["alpha"]
 
 
-def test_malformed_v12_snapshot_falls_back_to_full_scan(tmp_path: Path) -> None:
+def test_description_zh_is_parsed_and_survives_snapshot_round_trip(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    skill_file = root / "alpha" / "SKILL.md"
+    skill_file.parent.mkdir(parents=True, exist_ok=True)
+    skill_file.write_text(
+        '---\nname: alpha\ndescription: English summary\n'
+        'description_zh: "中文摘要"\ntriggers: [alpha]\n---\nbody',
+        encoding="utf-8",
+    )
+    snapshot_path = tmp_path / "snapshot.json"
+
+    loader = SkillLoader(workspace_dir=root, snapshot_path=snapshot_path)
+    loaded = loader.load_all()
+    assert [s.description_zh for s in loaded] == ["中文摘要"]
+
+    loader.save_snapshot()
+    restored = SkillLoader(workspace_dir=root, snapshot_path=snapshot_path)
+    from_snapshot = restored.load_snapshot() or []
+    assert [s.description_zh for s in from_snapshot] == ["中文摘要"]
+
+
+def test_malformed_v13_snapshot_falls_back_to_full_scan(tmp_path: Path) -> None:
     root = tmp_path / "skills"
     _write_skill(root, "alpha")
     snapshot_path = tmp_path / "snapshot.json"
@@ -444,7 +465,7 @@ def test_malformed_v12_snapshot_falls_back_to_full_scan(tmp_path: Path) -> None:
     snapshot_path.write_text(
         json.dumps(
             {
-                "version": 12,
+                "version": 13,
                 "generation": "not-an-integer",
                 "manifest": probe._build_manifest(),
                 "source_digests": {},
@@ -460,7 +481,7 @@ def test_malformed_v12_snapshot_falls_back_to_full_scan(tmp_path: Path) -> None:
     assert [skill.name for skill in loader.load_all()] == ["alpha"]
 
 
-def test_v12_snapshot_with_unhashable_skill_name_falls_back_to_scan(tmp_path: Path) -> None:
+def test_v13_snapshot_with_unhashable_skill_name_falls_back_to_scan(tmp_path: Path) -> None:
     root = tmp_path / "skills"
     _write_skill(root, "alpha")
     snapshot_path = tmp_path / "snapshot.json"
@@ -468,7 +489,7 @@ def test_v12_snapshot_with_unhashable_skill_name_falls_back_to_scan(tmp_path: Pa
     snapshot_path.write_text(
         json.dumps(
             {
-                "version": 12,
+                "version": 13,
                 "generation": 4,
                 "manifest": probe._build_manifest(),
                 "source_digests": {},

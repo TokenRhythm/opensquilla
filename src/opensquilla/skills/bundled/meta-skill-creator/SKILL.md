@@ -1,6 +1,7 @@
 ---
 name: meta-skill-creator
 description: "Use this meta-skill instead of answering directly only when the current user explicitly asks to create, compose, synthesize, or propose a new meta-skill that orchestrates multiple existing skills. It uses multi-skill orchestration for intent clarification, optional history mining, trigger-collision checks, linting, smoke/runtime gates, preview, and optional proposal persistence. Do not use it for creating a normal standalone skill, asking how meta-skills work, analyzing pasted skill lists, or discussing existing meta-skills."
+description_zh: "仅当用户明确要求创建、组合、合成或提出一个编排多个现有技能的新元技能时，使用此元技能而非直接回答。它通过多技能编排完成意图澄清、可选的历史挖掘、触发词冲突检查、linting、冒烟/运行时闸门、预览和可选的提案持久化。不用于创建普通独立技能、询问元技能原理、分析粘贴的技能列表或讨论现有元技能。"
 kind: meta
 meta_priority: 90
 always: false

@@ -1,6 +1,7 @@
 ---
 name: paper-source-curator
 description: "Curate search results and BibTeX entries into a reliable source pack for a long research paper."
+description_zh: "将搜索结果和BibTeX条目整理为可靠的来源包，供长篇研究论文使用。"
 provenance:
   origin: opensquilla-original
   license: Apache-2.0
