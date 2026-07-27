@@ -23,6 +23,8 @@ const props = defineProps<{
   installed?: boolean
   busy?: boolean
   meta?: boolean
+  source?: string
+  trustLevel?: string
   statusDotClass?: string
   statusDotTitle?: string
 }>()
@@ -66,6 +68,17 @@ const fallbackIcon = computed<IconName>(() => assignedFallbackIcon(props.name ||
     <span class="sk-tile__body">
       <span class="sk-tile__name" :title="name">{{ name }}</span>
       <span class="sk-tile__desc">{{ desc }}</span>
+      <span
+        v-if="variant === 'registry' && (source || trustLevel)"
+        class="sk-tile__registry-meta"
+      >
+        <span v-if="source" class="sk-tile__source">{{ source }}</span>
+        <span
+          v-if="trustLevel"
+          class="sk-tile__trust"
+          :class="{ 'is-trusted': trustLevel === 'trusted' || trustLevel === 'builtin' }"
+        >{{ trustLevel }}</span>
+      </span>
     </span>
 
     <span class="sk-tile__action">
@@ -175,6 +188,31 @@ const fallbackIcon = computed<IconName>(() => assignedFallbackIcon(props.name ||
 }
 
 .sk-tile__body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.sk-tile__registry-meta {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+.sk-tile__source,
+.sk-tile__trust {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 18px;
+  padding: 0 6px;
+}
+.sk-tile__trust {
+  border-color: color-mix(in srgb, var(--warn) 40%, var(--border));
+  color: var(--warn);
+}
+.sk-tile__trust.is-trusted {
+  border-color: color-mix(in srgb, var(--ok) 40%, var(--border));
+  color: var(--ok);
+}
 .sk-tile__name {
   color: var(--text);
   font-size: var(--fs-sm);

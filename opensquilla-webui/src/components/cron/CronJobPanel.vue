@@ -166,11 +166,15 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, ref, toRef } from 'vue'
+import { computed, nextTick, ref, toRef, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import ControlSwitch from '@/components/ControlSwitch.vue'
 import type { CronJob, CronJobFormModel } from '@/types/cron'
+import {
+  atScheduleValueFromLocalInput,
+  localDateTimeInputValue,
+} from '@/utils/cron/atSchedule'
 import { useDialogA11y } from '@/composables/useDialogA11y'
 
 const { t } = useI18n()
@@ -194,7 +198,12 @@ const form = defineModel<CronJobFormModel>('form', { required: true })
 const friendlyEveryUnit = ref<'minutes' | 'hours' | 'days'>('minutes')
 const everyUnitSeconds = computed(() => friendlyEveryUnit.value === 'days' ? 86400 : friendlyEveryUnit.value === 'hours' ? 3600 : 60)
 const friendlyEveryAmount = computed({ get: () => Math.max(1, Math.round((Number(form.value.every) || 60) / everyUnitSeconds.value)), set: value => { form.value.every = String(Math.max(1, Number(value) || 1) * everyUnitSeconds.value) } })
-const friendlyAt = computed({ get: () => (form.value.at || '').slice(0, 16), set: value => { form.value.at = value ? `${value}:00` : '' } })
+const friendlyAt = computed({
+  get: () => localDateTimeInputValue(form.value.at),
+  set: value => {
+    form.value.at = atScheduleValueFromLocalInput(value, form.value.at)
+  },
+})
 function cronParts(): string[] { const parts = (form.value.cron || '').trim().split(/\s+/); return parts.length === 5 ? parts : ['0', '9', '*', '*', '*'] }
 function setFriendlyCron(kind: string, time = friendlyTime.value, weekday = friendlyWeekday.value, monthDay = friendlyMonthDay.value) { if (kind === 'custom') return; const [hourText, minuteText] = (time || '09:00').split(':'); const hour = String(Number(hourText) || 0); const minute = String(Number(minuteText) || 0); if (kind === 'weekdays') form.value.cron = `${minute} ${hour} * * 1-5`; else if (kind === 'weekly') form.value.cron = `${minute} ${hour} * * ${weekday}`; else if (kind === 'monthly') form.value.cron = `${minute} ${hour} ${monthDay} * *`; else form.value.cron = `${minute} ${hour} * * *`; emit('cronInput') }
 const customScheduleSelected = ref(false)
@@ -237,5 +246,8 @@ const emit = defineEmits<{
 
 const drawerRef = ref<HTMLElement | null>(null)
 const openRef = toRef(props, 'open')
+watch(openRef, open => {
+  if (open) customScheduleSelected.value = false
+})
 useDialogA11y(drawerRef, openRef, () => emit('close'))
 </script>

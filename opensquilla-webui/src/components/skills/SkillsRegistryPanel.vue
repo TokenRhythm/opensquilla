@@ -58,6 +58,8 @@
             variant="registry"
             :name="row.name"
             :description="row.description"
+            :source="row.source"
+            :trust-level="row.trustLevel"
             :installed="row.installed"
             :busy="installingId === row.installId"
             @install="emit('install', String(row.installId), String(row.installSource))"
@@ -97,6 +99,8 @@ const resultRows = computed(() =>
   props.results.map(r => ({
     name: r.name,
     description: (r.description || '').slice(0, 120),
+    source: r.source || '',
+    trustLevel: r.trust_level || 'community',
     installed: !!r.installed,
     installId: r.identifier || r.name,
     installSource: r.source || 'clawhub',

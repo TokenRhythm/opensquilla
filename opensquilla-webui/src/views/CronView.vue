@@ -214,7 +214,7 @@ import { useToasts } from '@/composables/useToasts'
 import type { CronJob, CronPanelTemplate } from '@/types/cron'
 import type { IconName } from '@/utils/icons'
 import { humanCountdown } from '@/utils/cron/time'
-import { localizedCronJobName } from '@/utils/cron/templateNames'
+import { localizedCronJobName, localizedCronTemplate } from '@/utils/cron/templateNames'
 
 const router = useRouter()
 const { t } = useI18n()
@@ -373,20 +373,9 @@ const automationTemplates: AutomationTemplate[] = [
   },
 ]
 
-const localizedAutomationTemplates = computed(() => automationTemplates.map(template => {
-  const key = `cronSkills.view.templates.${template.id}`
-  const title = t(`${key}.title`)
-  const description = t(`${key}.description`)
-  return {
-    ...template,
-    title,
-    description,
-    category: t(`${key}.category`),
-    scheduleLabel: t(`${key}.schedule`),
-    name: title,
-    message: `${title}. ${description}`,
-  }
-}))
+const localizedAutomationTemplates = computed(() =>
+  automationTemplates.map(template => localizedCronTemplate(template, t)),
+)
 
 function useAutomationTemplate(template: AutomationTemplate) {
   templateGalleryOpen.value = false

@@ -10,6 +10,32 @@ const TEMPLATE_NAME_KEYS: Record<string, string> = {
   '历史上的今天': 'today-in-history',
 }
 
+interface LocalizableCronTemplate {
+  id: string
+  title: string
+  description: string
+  category: string
+  scheduleLabel: string
+  name?: string
+  message?: string
+}
+
+export function localizedCronTemplate<T extends LocalizableCronTemplate>(
+  template: T,
+  translate: (key: string) => string,
+): T {
+  const key = `cronSkills.view.templates.${template.id}`
+  const title = translate(`${key}.title`)
+  return {
+    ...template,
+    title,
+    description: translate(`${key}.description`),
+    category: translate(`${key}.category`),
+    scheduleLabel: translate(`${key}.schedule`),
+    name: title,
+  }
+}
+
 export function localizedCronJobName(
   name: string | undefined,
   id: string,
