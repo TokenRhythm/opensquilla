@@ -1817,10 +1817,14 @@ async def test_rpc_sandbox_path_pick_uses_permission_based_workspace_selection(
     import opensquilla.gateway.rpc_sandbox as rpc_sandbox
 
     manager = _SessionManager()
+
+    async def pick_directory(initial_dir=None):
+        return "/etc/shadow"
+
     monkeypatch.setattr(
         rpc_sandbox,
-        "_pick_directory_path",
-        lambda initial_dir=None: "/etc/shadow",
+        "_pick_directory_path_async",
+        pick_directory,
     )
 
     result = await rpc_sandbox._handle_sandbox_path_pick(
@@ -1831,10 +1835,7 @@ async def test_rpc_sandbox_path_pick_uses_permission_based_workspace_selection(
         _ctx(manager),
     )
 
-    assert result == {
-        "path": str(Path("/etc/shadow").resolve(strict=False)),
-        "kind": "workspace",
-    }
+    assert result == {"path": "/etc/shadow", "kind": "workspace"}
 
 
 @pytest.mark.asyncio
@@ -1847,10 +1848,14 @@ async def test_rpc_sandbox_path_pick_returns_valid_mount_selection(
     manager = _SessionManager()
     selected = tmp_path / "external"
     selected.mkdir()
+
+    async def pick_directory(initial_dir=None):
+        return str(selected)
+
     monkeypatch.setattr(
         rpc_sandbox,
-        "_pick_directory_path",
-        lambda initial_dir=None: str(selected),
+        "_pick_directory_path_async",
+        pick_directory,
     )
 
     result = await rpc_sandbox._handle_sandbox_path_pick(
@@ -1872,10 +1877,14 @@ async def test_rpc_sandbox_path_pick_returns_null_when_selection_is_cancelled(
     import opensquilla.gateway.rpc_sandbox as rpc_sandbox
 
     manager = _SessionManager()
+
+    async def pick_directory(initial_dir=None):
+        return None
+
     monkeypatch.setattr(
         rpc_sandbox,
-        "_pick_directory_path",
-        lambda initial_dir=None: None,
+        "_pick_directory_path_async",
+        pick_directory,
     )
 
     result = await rpc_sandbox._handle_sandbox_path_pick(

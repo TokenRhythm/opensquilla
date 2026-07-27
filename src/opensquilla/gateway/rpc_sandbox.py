@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
+import json
 import stat
 import subprocess
 import sys
@@ -76,6 +78,7 @@ from opensquilla.session.keys import parse_agent_id
 _d = get_dispatcher()
 _RUN_MODE_PREFERENCE_KEY = "sandbox.run_mode"
 _RUN_MODE_PREFERENCE_CHANGED_EVENT = "sandbox.run_mode.preference.changed"
+_WINDOWS_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def _require_params(params: dict | None) -> dict[str, Any]:
@@ -219,6 +222,56 @@ def _pick_directory_path(initial_dir: str | None = None) -> str | None:
             root.destroy()
 
     return selected or None
+
+
+async def _pick_directory_path_windows(initial_dir: str | None = None) -> str | None:
+    command = [
+        sys.executable,
+        "-m",
+        "opensquilla.gateway.windows_directory_picker",
+    ]
+    if initial_dir:
+        command.append(initial_dir)
+
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        creationflags=_WINDOWS_CREATE_NO_WINDOW,
+    )
+    try:
+        stdout, stderr = await process.communicate()
+    except asyncio.CancelledError:
+        if process.returncode is None:
+            process.terminate()
+            await process.wait()
+        raise
+
+    if process.returncode != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip()
+        message = "Directory picker is not available on this host."
+        if detail:
+            message = f"{message} {detail}"
+        raise RpcUnavailableError(message)
+
+    try:
+        payload = json.loads(stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RpcUnavailableError(
+            "Directory picker returned an invalid response."
+        ) from exc
+    selected = payload.get("path")
+    if selected is None:
+        return None
+    if not isinstance(selected, str):
+        raise RpcUnavailableError("Directory picker returned an invalid response.")
+    return selected
+
+
+async def _pick_directory_path_async(initial_dir: str | None = None) -> str | None:
+    if sys.platform == "win32":
+        return await _pick_directory_path_windows(initial_dir)
+    return await asyncio.to_thread(_pick_directory_path, initial_dir)
 
 
 def _require_session_manager(ctx: RpcContext) -> Any:
@@ -997,7 +1050,7 @@ async def _handle_sandbox_path_pick(params: dict | None, ctx: RpcContext) -> dic
 
     manager = _require_session_manager(ctx)
     initial_dir = params.get("initialPath")
-    selected = _pick_directory_path(
+    selected = await _pick_directory_path_async(
         str(initial_dir) if isinstance(initial_dir, str) and initial_dir.strip() else None
     )
     if selected is None:
