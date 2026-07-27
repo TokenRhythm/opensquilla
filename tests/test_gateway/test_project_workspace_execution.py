@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -13,6 +15,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from opensquilla.application.approval_queue import ApprovalQueue
 from opensquilla.engine.types import DoneEvent
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
 from opensquilla.gateway.auth import Principal
@@ -22,14 +25,23 @@ from opensquilla.gateway.routing import build_cli_route_envelope
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.task_runtime import TaskRuntime
 from opensquilla.project_workspaces import ProjectWorkspaceStateError
+from opensquilla.sandbox.backend.bubblewrap import BubblewrapBackend
+from opensquilla.sandbox.backend.seatbelt import SeatbeltBackend
+from opensquilla.sandbox.backend.unavailable import UnavailableBackend
+from opensquilla.sandbox.config import SandboxSettings
+from opensquilla.sandbox.integration import configure_runtime, reset_runtime
 from opensquilla.sandbox.run_context import (
     RUN_CONTEXT_ORIGIN_KEY,
     run_context_from_origin_payload,
 )
 from opensquilla.sandbox.run_mode import RunMode
+from opensquilla.sandbox.types import SandboxBackendError
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import SessionNode
 from opensquilla.session.storage import SessionStorage
+from opensquilla.tools.builtin import filesystem as fs
+from opensquilla.tools.run_mode import full_host_access_for_context
+from opensquilla.tools.types import current_tool_context
 
 OWNER = Principal(
     role="operator",
@@ -1221,9 +1233,7 @@ async def test_collect_reserves_separate_tasks_for_different_accepted_modes(
     pending_mode: str,
     later_mode: str,
 ) -> None:
-    async with open_stack(
-        tmp_path / f"collect-{pending_mode}-to-{later_mode}.db"
-    ) as stack:
+    async with open_stack(tmp_path / f"collect-{pending_mode}-to-{later_mode}.db") as stack:
         project = await add_project(
             stack,
             tmp_path / f"collect-{pending_mode}-project",
@@ -1286,9 +1296,10 @@ async def test_collect_reserves_separate_tasks_for_different_accepted_modes(
         pending = stack.runtime._pending_by_session[key]
         assert len(pending) == 2
         assert [task.message for task in pending] == ["first", "second"]
-        assert [
-            task.accepted_run_mode_override.run_mode.value for task in pending
-        ] == [pending_mode, later_mode]
+        assert [task.accepted_run_mode_override.run_mode.value for task in pending] == [
+            pending_mode,
+            later_mode,
+        ]
         assert blocker.task_id in stack.runtime._tasks
 
 
@@ -1828,9 +1839,7 @@ async def test_queued_turn_revalidates_windows_junction_before_tool_context(
         try:
             result = create_windows_junction(project_path, replacement)
             if result.returncode != 0:
-                pytest.skip(
-                    f"could not create junction: {result.stderr or result.stdout}"
-                )
+                pytest.skip(f"could not create junction: {result.stderr or result.stdout}")
             junction_created = True
 
             class RecordingTurnRunner:
@@ -1962,9 +1971,7 @@ async def test_direct_web_turn_revalidates_windows_junction_after_acceptance(
                 project_path.rename(original)
                 result = create_windows_junction(project_path, replacement)
                 if result.returncode != 0:
-                    pytest.skip(
-                        f"could not create junction: {result.stderr or result.stdout}"
-                    )
+                    pytest.skip(f"could not create junction: {result.stderr or result.stdout}")
                 junction_created = True
                 retargeted = True
             return acceptance
@@ -2374,3 +2381,255 @@ async def test_chat_fork_stays_in_project_workspace_and_sidebar_group(
         child_row = next(row for row in listed.payload["sessions"] if row["key"] == child_key)
         assert child_row["workspaceId"] == project.workspace_id
         assert child_row["workspace"] == project.path
+
+
+@pytest.mark.asyncio
+async def test_default_project_drives_real_standard_filesystem_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if sys.platform.startswith("linux"):
+        probe = BubblewrapBackend()
+    elif sys.platform == "darwin":
+        probe = SeatbeltBackend()
+    else:
+        pytest.skip("native project sandbox proof is POSIX-only")
+    if not probe.available():
+        pytest.skip(f"{probe.name} is unavailable")
+
+    queue = ApprovalQueue(db_path=str(tmp_path / "approvals.sqlite"))
+    try:
+        async with open_stack(tmp_path / "sessions.db") as stack:
+            project_path = tmp_path / "project"
+            sibling = tmp_path / "sibling"
+            sibling.mkdir()
+            project = await add_project(stack, project_path)
+            assert project is not None
+            inside = project_path / "inside.txt"
+            outside = sibling / "outside.txt"
+            outcomes: dict[str, Any] = {}
+            completed = asyncio.Event()
+
+            runtime = configure_runtime(
+                SandboxSettings(
+                    run_mode="standard",
+                    backend=probe.name,
+                    network_default="none",
+                    exclude_slash_tmp=True,
+                    exclude_tmpdir_env_var=True,
+                ),
+                approval_queue=queue,
+                workspace=project_path,
+                default_run_mode=RunMode.FULL,
+            )
+            assert runtime.backend.name == probe.name
+            native_operations: list[Any] = []
+            native_run_operation = runtime.backend.run_operation
+
+            async def counted_native_operation(operation: Any) -> Any:
+                native_operations.append(operation)
+                return await native_run_operation(operation)
+
+            monkeypatch.setattr(
+                runtime.backend,
+                "run_operation",
+                counted_native_operation,
+            )
+
+            class Runner:
+                async def run(
+                    self,
+                    message: str,
+                    session_key: str,
+                    **kwargs: Any,
+                ):
+                    project_ctx = kwargs["tool_context"]
+                    outcomes["tool_context"] = project_ctx
+                    token = current_tool_context.set(project_ctx)
+                    try:
+                        outcomes["inside"] = await fs.write_file(
+                            str(inside),
+                            "inside",
+                        )
+                        outcomes["outside"] = json.loads(
+                            await fs.write_file(str(outside), "outside")
+                        )
+                        outcomes["outside_after_standard"] = outside.exists()
+                    except BaseException as exc:  # surfaced to the test task
+                        outcomes["error"] = exc
+                    else:
+                        yield DoneEvent()
+                    finally:
+                        current_tool_context.reset(token)
+                        completed.set()
+
+            stack.context.task_runtime = None
+            stack.context.turn_runner = Runner()
+            response = await get_dispatcher().dispatch(
+                "project-standard-proof",
+                "sessions.send",
+                {
+                    "key": "agent:main:webchat:project-standard-proof",
+                    "message": "write",
+                    "intent": "new_chat",
+                    "workspaceId": project.workspace_id,
+                    "clientRequestId": "project-standard-proof-1",
+                },
+                stack.context,
+            )
+            await asyncio.wait_for(completed.wait(), timeout=10.0)
+            if "error" in outcomes:
+                raise outcomes["error"]
+
+            assert response.ok is True
+            tool_ctx = outcomes["tool_context"]
+            assert tool_ctx.run_mode == "standard"
+            assert tool_ctx.workspace_dir == str(project_path.resolve())
+            assert full_host_access_for_context(tool_ctx) is False
+            assert inside.read_text(encoding="utf-8") == "inside"
+            outside_result = outcomes["outside"]
+            assert outside_result["status"] == "elevation_required"
+            assert outside_result["reason"] == "mount_requires_write_access"
+            assert outside_result["path"] == str(outside.resolve())
+            assert outside_result["access"] == "rw"
+            assert outcomes["outside_after_standard"] is False
+            assert [operation.kind for operation in native_operations] == ["write_text"]
+
+            full_completed = asyncio.Event()
+
+            class FullRunner:
+                async def run(
+                    self,
+                    message: str,
+                    session_key: str,
+                    **kwargs: Any,
+                ):
+                    full_ctx = kwargs["tool_context"]
+                    outcomes["full_tool_context"] = full_ctx
+                    token = current_tool_context.set(full_ctx)
+                    try:
+                        await fs.write_file(str(outside), "full-host")
+                    except BaseException as exc:
+                        outcomes["full_error"] = exc
+                    else:
+                        yield DoneEvent()
+                    finally:
+                        current_tool_context.reset(token)
+                        full_completed.set()
+
+            stack.context.turn_runner = FullRunner()
+            full_response = await get_dispatcher().dispatch(
+                "ordinary-full-proof",
+                "sessions.send",
+                {
+                    "key": "agent:main:webchat:ordinary-full-proof",
+                    "message": "write",
+                    "intent": "new_chat",
+                    "clientRequestId": "ordinary-full-proof-1",
+                },
+                stack.context,
+            )
+            await asyncio.wait_for(full_completed.wait(), timeout=10.0)
+            if "full_error" in outcomes:
+                raise outcomes["full_error"]
+
+            assert full_response.ok is True
+            assert outcomes["full_tool_context"].run_mode == "full"
+            assert full_host_access_for_context(outcomes["full_tool_context"]) is True
+            assert outside.read_text(encoding="utf-8") == "full-host"
+            assert len(native_operations) == 1
+    finally:
+        reset_runtime()
+        queue.close()
+
+
+@pytest.mark.asyncio
+async def test_project_standard_fails_closed_when_native_backend_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    queue = ApprovalQueue(db_path=str(tmp_path / "approvals.sqlite"))
+    active_token = None
+    try:
+        async with open_stack(tmp_path / "sessions.db") as stack:
+            project_path = tmp_path / "project"
+            sibling = tmp_path / "sibling"
+            sibling.mkdir()
+            project = await add_project(stack, project_path)
+            assert project is not None
+            inside = project_path / "inside.txt"
+            outside = sibling / "outside.txt"
+            outcomes: dict[str, Any] = {}
+            completed = asyncio.Event()
+
+            runtime = configure_runtime(
+                SandboxSettings(
+                    run_mode="standard",
+                    backend="noop",
+                    allow_legacy_mode=True,
+                ),
+                approval_queue=queue,
+                workspace=project_path,
+                default_run_mode=RunMode.FULL,
+            )
+            runtime.backend = UnavailableBackend("test unavailable")
+
+            class Runner:
+                async def run(
+                    self,
+                    message: str,
+                    session_key: str,
+                    **kwargs: Any,
+                ):
+                    outcomes["tool_context"] = kwargs["tool_context"]
+                    completed.set()
+                    yield DoneEvent()
+
+            stack.context.task_runtime = None
+            stack.context.turn_runner = Runner()
+            response = await get_dispatcher().dispatch(
+                "project-unavailable-proof",
+                "sessions.send",
+                {
+                    "key": "agent:main:webchat:project-unavailable-proof",
+                    "message": "write",
+                    "intent": "new_chat",
+                    "workspaceId": project.workspace_id,
+                    "clientRequestId": "project-unavailable-proof-1",
+                },
+                stack.context,
+            )
+            await asyncio.wait_for(completed.wait(), timeout=2.0)
+
+            assert response.ok is True
+            project_ctx = outcomes["tool_context"]
+            assert project_ctx.run_mode == "standard"
+            assert project_ctx.workspace_dir == str(project_path.resolve())
+            assert full_host_access_for_context(project_ctx) is False
+
+            active_token = current_tool_context.set(project_ctx)
+            try:
+                with pytest.raises(
+                    SandboxBackendError,
+                    match="must sandbox filesystem operations",
+                ):
+                    await fs.write_file(str(inside), "blocked")
+            finally:
+                current_tool_context.reset(active_token)
+                active_token = None
+            assert inside.exists() is False
+
+            full_ctx = replace(project_ctx, run_mode="full")
+            assert full_host_access_for_context(full_ctx) is True
+            active_token = current_tool_context.set(full_ctx)
+            try:
+                await fs.write_file(str(outside), "full-host")
+            finally:
+                current_tool_context.reset(active_token)
+                active_token = None
+
+            assert outside.read_text(encoding="utf-8") == "full-host"
+    finally:
+        if active_token is not None:
+            current_tool_context.reset(active_token)
+        reset_runtime()
+        queue.close()
