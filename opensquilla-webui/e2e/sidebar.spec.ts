@@ -460,10 +460,27 @@ test.describe('Sidebar', () => {
   })
 
   test('footer pins Settings; connection state shows in the topbar', async ({ page }) => {
-    await openControl(page)
+    await page.goto(CONTROL_URL)
+    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.conn-pill.connected', { timeout: 10000 }).catch(() => {})
+    await page.waitForTimeout(800)
 
     const foot = page.locator('.sidebar-foot')
     await expect(foot.getByText('Settings', { exact: true })).toBeVisible()
+    // Empty profiles omit SidebarConversations entirely. Simulate that state
+    // after the shared fixture settles and verify the footer owns its bottom
+    // anchor instead of relying on the optional Recents region's flex growth.
+    await page.evaluate(() => document.querySelector('.sidebar-history')?.remove())
+    const footerGeometry = await page.evaluate(() => {
+      const sidebarElement = document.querySelector<HTMLElement>('.sidebar')!
+      const sidebar = sidebarElement.getBoundingClientRect()
+      const footer = document.querySelector('.sidebar-foot')!.getBoundingClientRect()
+      return {
+        bottomGap: sidebar.bottom - footer.bottom,
+        paddingBottom: Number.parseFloat(getComputedStyle(sidebarElement).paddingBottom),
+      }
+    })
+    expect(Math.abs(footerGeometry.bottomGap - footerGeometry.paddingBottom)).toBeLessThanOrEqual(1)
     // Connection state is shown once, in the global topbar pill — not duplicated
     // in the sidebar footer.
     await expect(foot.locator('.sidebar-conn')).toHaveCount(0)

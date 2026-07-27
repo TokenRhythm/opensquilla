@@ -1224,6 +1224,10 @@ pre {
 
 /* Fixed footer: settings row + connection state */
 .sidebar-foot {
+  /* Own the bottom anchor instead of relying on the optional Recents region to
+     consume the sidebar's remaining space. Empty profiles do not render that
+     region, but Settings must stay in the footer position. */
+  margin-top: auto;
   padding: 8px 8px 0;
   border-top: 1px solid var(--sidebar-border);
   flex-shrink: 0;
