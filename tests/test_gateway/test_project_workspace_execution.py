@@ -154,7 +154,7 @@ def create_windows_junction(link: Path, target: Path) -> subprocess.CompletedPro
 
 
 @pytest.mark.asyncio
-async def test_new_project_uses_standard_with_project_default_provenance(
+async def test_new_owner_project_uses_full_with_operator_default_provenance(
     tmp_path: Path,
 ) -> None:
     async with open_stack(tmp_path / "sessions.db") as stack:
@@ -182,8 +182,8 @@ async def test_new_project_uses_standard_with_project_default_provenance(
         assert session.origin is not None
         saved_context = session.origin[RUN_CONTEXT_ORIGIN_KEY]
         assert saved_context["workspace"] == project.path
-        assert saved_context["run_mode"] == "standard"
-        assert saved_context["run_mode_source"] == "project_default"
+        assert saved_context["run_mode"] == "full"
+        assert saved_context["run_mode_source"] == "operator_default"
 
 
 @pytest.mark.asyncio
@@ -772,7 +772,7 @@ async def test_origin_workspace_tamper_cannot_change_project_tool_context(
 
 
 @pytest.mark.asyncio
-async def test_legacy_implicit_full_project_context_executes_as_standard(
+async def test_legacy_implicit_full_project_context_remains_full(
     tmp_path: Path,
 ) -> None:
     async with open_stack(tmp_path / "sessions.db") as stack:
@@ -811,8 +811,8 @@ async def test_legacy_implicit_full_project_context_executes_as_standard(
         await asyncio.wait_for(ran.wait(), timeout=2.0)
 
         assert response.ok is True
-        assert captured["tool_context"].run_mode == "standard"
-        assert captured["tool_context"].sandbox_run_context.run_mode_source == "project_default"
+        assert captured["tool_context"].run_mode == "full"
+        assert captured["tool_context"].sandbox_run_context.run_mode_source is None
 
 
 @pytest.mark.asyncio
@@ -2384,7 +2384,7 @@ async def test_chat_fork_stays_in_project_workspace_and_sidebar_group(
 
 
 @pytest.mark.asyncio
-async def test_default_project_drives_real_standard_filesystem_runtime(
+async def test_explicit_standard_project_drives_real_sandbox_filesystem_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2474,6 +2474,11 @@ async def test_default_project_drives_real_standard_filesystem_runtime(
                     "intent": "new_chat",
                     "workspaceId": project.workspace_id,
                     "clientRequestId": "project-standard-proof-1",
+                    "_source": {
+                        "caller_kind": "web",
+                        "channel_kind": "webchat",
+                        "runMode": "standard",
+                    },
                 },
                 stack.context,
             )
@@ -2544,6 +2549,83 @@ async def test_default_project_drives_real_standard_filesystem_runtime(
 
 
 @pytest.mark.asyncio
+async def test_default_full_project_bypasses_unavailable_sandbox_backend(
+    tmp_path: Path,
+) -> None:
+    queue = ApprovalQueue(db_path=str(tmp_path / "approvals.sqlite"))
+    try:
+        async with open_stack(tmp_path / "sessions.db") as stack:
+            project_path = tmp_path / "project"
+            sibling = tmp_path / "sibling"
+            sibling.mkdir()
+            project = await add_project(stack, project_path)
+            assert project is not None
+            outside = sibling / "outside.txt"
+            outcomes: dict[str, Any] = {}
+            completed = asyncio.Event()
+
+            runtime = configure_runtime(
+                SandboxSettings(
+                    run_mode="standard",
+                    backend="noop",
+                    allow_legacy_mode=True,
+                ),
+                approval_queue=queue,
+                workspace=project_path,
+                default_run_mode=RunMode.FULL,
+            )
+            runtime.backend = UnavailableBackend("test unavailable")
+
+            class Runner:
+                async def run(
+                    self,
+                    message: str,
+                    session_key: str,
+                    **kwargs: Any,
+                ):
+                    project_ctx = kwargs["tool_context"]
+                    outcomes["tool_context"] = project_ctx
+                    token = current_tool_context.set(project_ctx)
+                    try:
+                        await fs.write_file(str(outside), "full-host")
+                    except BaseException as exc:
+                        outcomes["error"] = exc
+                    else:
+                        yield DoneEvent()
+                    finally:
+                        current_tool_context.reset(token)
+                        completed.set()
+
+            stack.context.task_runtime = None
+            stack.context.turn_runner = Runner()
+            response = await get_dispatcher().dispatch(
+                "project-full-proof",
+                "sessions.send",
+                {
+                    "key": "agent:main:webchat:project-full-proof",
+                    "message": "write",
+                    "intent": "new_chat",
+                    "workspaceId": project.workspace_id,
+                    "clientRequestId": "project-full-proof-1",
+                },
+                stack.context,
+            )
+            await asyncio.wait_for(completed.wait(), timeout=2.0)
+            if "error" in outcomes:
+                raise outcomes["error"]
+
+            assert response.ok is True
+            project_ctx = outcomes["tool_context"]
+            assert project_ctx.run_mode == "full"
+            assert project_ctx.workspace_dir == str(project_path.resolve())
+            assert full_host_access_for_context(project_ctx) is True
+            assert outside.read_text(encoding="utf-8") == "full-host"
+    finally:
+        reset_runtime()
+        queue.close()
+
+
+@pytest.mark.asyncio
 async def test_project_standard_fails_closed_when_native_backend_is_unavailable(
     tmp_path: Path,
 ) -> None:
@@ -2595,6 +2677,11 @@ async def test_project_standard_fails_closed_when_native_backend_is_unavailable(
                     "intent": "new_chat",
                     "workspaceId": project.workspace_id,
                     "clientRequestId": "project-unavailable-proof-1",
+                    "_source": {
+                        "caller_kind": "web",
+                        "channel_kind": "webchat",
+                        "runMode": "standard",
+                    },
                 },
                 stack.context,
             )
