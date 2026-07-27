@@ -2165,7 +2165,7 @@ async def test_task_runtime_turn_uses_workspace_from_saved_run_context(
 
 
 @pytest.mark.asyncio
-async def test_task_runtime_turn_overwrites_forged_envelope_with_bound_project(
+async def test_task_runtime_turn_restores_bound_project_and_owner_full_default(
     tmp_path: Path,
 ) -> None:
     storage = await SessionStorage.open(str(tmp_path / "queued-project.db"))
@@ -2242,7 +2242,7 @@ async def test_task_runtime_turn_overwrites_forged_envelope_with_bound_project(
 
     tool_context = runner.calls[0]["tool_context"]
     assert tool_context.workspace_dir == project.path
-    assert tool_context.run_mode == "standard"
+    assert tool_context.run_mode == "full"
     assert envelope.metadata["sandbox_run_context"]["workspace"] == project.path
 
 
