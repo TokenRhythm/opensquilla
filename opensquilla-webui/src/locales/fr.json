@@ -2951,6 +2951,8 @@
       "steerHint": "Mode réorientation : les nouveaux envois interrompent la réponse maintenant ; ces messages en file s'envoient quand même automatiquement après le tour",
       "queueHint": "Mode file d'attente : ces messages s'envoient automatiquement dans l'ordre à la fin de la réponse actuelle",
       "clearAll": "Tout effacer",
+      "editMessage": "Modifier le message",
+      "clearQueue": "Vider la file",
       "removeMessage": "Supprimer le message en attente {index}"
     },
     "metaRuns": {
@@ -3147,6 +3149,7 @@
       "selectedCountLabel": "{count} sélectionnées",
       "enterSelectionMode": "Gérer les sessions",
       "exitSelectionMode": "Quitter la sélection",
+      "selectionDone": "Terminé",
       "selectSession": "Sélectionner {title}",
       "deleteSelectedAria": "Supprimer {count} sélectionnées",
       "bulkDeleteTitle": "Supprimer les sessions sélectionnées",

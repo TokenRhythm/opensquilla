@@ -61,6 +61,42 @@ beforeEach(() => {
 })
 
 describe('ChatComposer popovers', () => {
+  it('keeps busy delivery controls on queued messages instead of the composer footer', async () => {
+    const { app, el } = await mountComposer()
+    await app.unmount()
+
+    const streamingEl = document.createElement('div')
+    document.body.appendChild(streamingEl)
+    const streamingApp = createApp(ChatComposer, {
+      modelValue: '',
+      'onUpdate:modelValue': () => {},
+      attachments: [],
+      busySendMode: 'queue',
+      hasSendContent: false,
+      isStreaming: true,
+      isNewLanding: false,
+      placeholder: 'Send a message',
+      sendButtonTitle: 'Send',
+      runMode: 'trusted',
+      allowedRunModes: ['standard', 'trusted', 'full'],
+      modelRoutingMode: 'off',
+      modelRoutingSettingsBusy: false,
+      routerVisualEffectsEnabled: true,
+      codingModeEnabled: false,
+      codingModeSettingsBusy: false,
+      voiceBusy: false,
+      voiceRecording: false,
+      voiceReady: true,
+    })
+    streamingApp.use(i18n)
+    streamingApp.mount(streamingEl)
+    await nextTick()
+
+    expect(el.querySelector('.chat-busy-mode')).toBeNull()
+    expect(streamingEl.querySelector('.chat-busy-mode')).toBeNull()
+    streamingApp.unmount()
+  })
+
   it('closes the more-actions menu on outside pointerdown', async () => {
     const { app, el } = await mountComposer()
 

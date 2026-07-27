@@ -2951,6 +2951,8 @@
       "steerHint": "誘導モード: 新しい送信は応答を今すぐ中断します。これらのキュー済みメッセージはターン後に自動送信されます",
       "queueHint": "キューモード: これらのメッセージは現在の応答が完了すると順番に自動送信されます",
       "clearAll": "すべてクリア",
+      "editMessage": "メッセージを編集",
+      "clearQueue": "キューをクリア",
       "removeMessage": "保留中のメッセージ {index} を削除"
     },
     "metaRuns": {
@@ -3147,6 +3149,7 @@
       "selectedCountLabel": "{count} 件選択中",
       "enterSelectionMode": "セッションを管理",
       "exitSelectionMode": "選択を終了",
+      "selectionDone": "完了",
       "selectSession": "{title} を選択",
       "deleteSelectedAria": "選択した {count} 件を削除",
       "bulkDeleteTitle": "選択したセッションを削除",

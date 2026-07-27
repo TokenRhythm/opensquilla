@@ -1,160 +1,277 @@
 <template>
-  <div v-if="items.length > 0" class="chat-pending">
-    <div class="chat-pending-header">
-      <span
-        class="chat-pending-label"
-        :title="t('chat.pending.hint')"
-      >
-        {{ t('chat.pending.label', { count: items.length, max: maxPending }) }}
+  <section
+    v-if="items.length > 0"
+    class="chat-pending"
+    :aria-label="t('chat.pending.label', { count: items.length, max: maxPending })"
+  >
+    <article
+      v-for="(item, index) in items"
+      :key="index"
+      class="chat-pending-card"
+    >
+      <p class="chat-pending-text" :title="displayText(item)">
+        {{ displayText(item) }}
+      </p>
+      <span v-if="item.attachments?.length" class="chat-pending-attachments">
+        {{ item.attachments.length }} · 📎
       </span>
-      <span
-        v-if="mode"
-        class="chat-pending-mode"
-        :class="{ 'chat-pending-mode--steer': mode === 'steer' }"
-        :title="mode === 'steer'
-          ? t('chat.pending.steerHint')
-          : t('chat.pending.queueHint')"
-      >
-        {{ mode === 'steer' ? t('chat.steerMode') : t('chat.queueMode') }}
-      </span>
-      <button
-        v-if="items.length >= 2"
-        class="chat-pending-clear"
-        :aria-label="t('chat.pending.clearAll')"
-        @click="$emit('clear')"
-      >
-        {{ t('chat.pending.clearAll') }}
-      </button>
-    </div>
-    <div class="chat-pending-chips">
-      <span
-        v-for="(item, index) in items"
-        :key="index"
-        class="chat-pending-chip"
-        :title="item.text"
-      >
-        <span class="chat-pending-text">{{ item.text.slice(0, 30) }}{{ item.text.length > 30 ? '...' : '' }}</span>
-        <span v-if="item.attachments?.length" class="chat-pending-attch">&#128206;{{ item.attachments.length }}</span>
+      <div v-if="!item.hiddenControl" class="chat-pending-actions">
         <button
-          class="chat-pending-chip-remove"
+          type="button"
+          class="chat-pending-action chat-pending-action--steer"
+          :title="t('chat.pending.steerHint')"
+          @click="emit('steer', index)"
+        >
+          <span aria-hidden="true">↪</span>
+          <span>{{ t('chat.steerMode') }}</span>
+        </button>
+        <button
+          type="button"
+          class="chat-pending-action chat-pending-action--icon"
           :aria-label="t('chat.pending.removeMessage', { index: index + 1 })"
           :title="t('chat.remove')"
-          @click="$emit('remove', index)"
+          @click="emit('remove', index)"
         >
-          &times;
+          <Icon name="trash" :size="14" />
         </button>
-      </span>
-    </div>
-  </div>
+        <div class="chat-pending-more-wrap">
+          <button
+            type="button"
+            class="chat-pending-action chat-pending-action--icon"
+            :class="{ 'is-active': openMenuIndex === index }"
+            :aria-label="t('chrome.more')"
+            :title="t('chrome.more')"
+            aria-haspopup="menu"
+            :aria-expanded="openMenuIndex === index ? 'true' : 'false'"
+            @click.stop="toggleMenu(index)"
+          >
+            <Icon name="moreHorizontal" :size="16" />
+          </button>
+          <div
+            v-if="openMenuIndex === index"
+            class="chat-pending-menu"
+            role="menu"
+            :aria-label="t('chrome.more')"
+          >
+            <button type="button" role="menuitem" @click="chooseEdit(index)">
+              <Icon name="pencil" :size="15" />
+              <span>{{ t('chat.pending.editMessage') }}</span>
+            </button>
+            <button type="button" role="menuitem" @click="chooseClear">
+              <Icon name="trash" :size="15" />
+              <span>{{ t('chat.pending.clearQueue') }}</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </article>
+  </section>
 </template>
 
 <script setup lang="ts">
+import { ref } from 'vue'
 import { useI18n } from 'vue-i18n'
+import Icon from '@/components/Icon.vue'
+import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import type { Attachment } from '@/types/chat'
 
 const { t } = useI18n()
 
 interface PendingQueueItem {
   text: string
+  displayTextOverride?: string
+  hiddenControl?: boolean
   attachments?: Attachment[]
 }
 
 defineProps<{
   items: PendingQueueItem[]
   maxPending: number
-  mode?: 'queue' | 'steer' | null
 }>()
 
-defineEmits<{
+const emit = defineEmits<{
   clear: []
+  edit: [index: number]
   remove: [index: number]
+  steer: [index: number]
 }>()
+
+const openMenuIndex = ref<number | null>(null)
+
+function displayText(item: PendingQueueItem): string {
+  return item.displayTextOverride || item.text
+}
+
+function toggleMenu(index: number) {
+  openMenuIndex.value = openMenuIndex.value === index ? null : index
+}
+
+function chooseEdit(index: number) {
+  openMenuIndex.value = null
+  emit('edit', index)
+}
+
+function chooseClear() {
+  openMenuIndex.value = null
+  emit('clear')
+}
+
+useDocumentEvent('pointerdown', (event) => {
+  const target = event.target
+  if (target instanceof Element && target.closest('.chat-pending-more-wrap')) return
+  openMenuIndex.value = null
+})
+
+useDocumentEvent('keydown', (event) => {
+  if (event.key !== 'Escape' || openMenuIndex.value === null) return
+  event.preventDefault()
+  openMenuIndex.value = null
+})
 </script>
 
 <style scoped>
 .chat-pending {
-  padding: 0.5rem 1rem;
-  border-top: 1px solid var(--border);
-  background: var(--bg-elevated);
-  flex-shrink: 0;
+  position: relative;
+  z-index: 1;
+  display: grid;
+  gap: 6px;
+  width: min(calc(100% - 3rem), var(--composer-col, 820px));
+  margin: 0 auto -10px;
+  padding: 0;
 }
 
-.chat-pending-header {
+.chat-pending-card {
+  position: relative;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  margin-bottom: 0.375rem;
+  min-height: 48px;
+  gap: 8px;
+  padding: 8px 12px 13px;
+  border: 1px solid color-mix(in srgb, var(--text) 9%, transparent);
+  border-radius: var(--radius-lg) var(--radius-lg) var(--radius-md) var(--radius-md);
+  background: color-mix(in srgb, var(--bg-surface) 98%, var(--bg-surface-2));
+  box-shadow:
+    inset 0 1px 0 var(--elev-highlight),
+    0 10px 26px -22px color-mix(in srgb, var(--text) 34%, transparent);
 }
 
-.chat-pending-mode {
-  margin-right: auto;
-  margin-left: 0.5rem;
-  padding: 0.0625rem 0.4375rem;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-full);
-  font-size: 0.6875rem;
-  font-weight: 600;
+.chat-pending-text {
+  min-width: 0;
+  flex: 1;
+  margin: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: var(--fs-sm);
+  line-height: 1.45;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-pending-attachments {
+  flex: 0 0 auto;
+  margin-top: 1px;
   color: var(--text-muted);
-  cursor: default;
+  font-size: var(--fs-xs);
 }
 
-.chat-pending-mode--steer {
-  border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
-  color: var(--warn);
-}
-
-.chat-pending-label {
-  font-size: 0.8125rem;
-  font-weight: 600;
-  color: var(--text-muted);
-}
-
-.chat-pending-clear {
-  font-size: 0.8125rem;
-  color: var(--accent);
-  background: none;
-  border: none;
-  cursor: pointer;
-}
-
-.chat-pending-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.375rem;
-}
-
-.chat-pending-chip {
+.chat-pending-actions {
   display: inline-flex;
   align-items: center;
-  gap: 0.25rem;
-  padding: 0.25rem 0.5rem;
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  font-size: 0.8125rem;
-  cursor: default;
+  flex: 0 0 auto;
+  gap: 2px;
 }
 
-.chat-pending-chip-remove {
+.chat-pending-action {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  padding: 0;
-  width: 16px;
-  height: 16px;
-  background: none;
-  border: none;
-  cursor: pointer;
+  min-height: 26px;
+  gap: 4px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
   color: var(--text-muted);
-  font-size: 0.875rem;
-  line-height: 1;
+  font: inherit;
+  font-size: var(--fs-sm);
+  cursor: pointer;
+  transition:
+    background var(--dur-fast) var(--ease-standard),
+    color var(--dur-fast) var(--ease-standard);
 }
 
-.chat-pending-chip-remove:hover {
-  color: var(--danger);
+.chat-pending-action--icon {
+  width: 26px;
+  padding: 0;
 }
 
-.chat-pending-attch {
-  font-size: 0.8125rem;
+.chat-pending-action--steer {
+  gap: 3px;
+  font-size: var(--fs-xs);
+}
+
+.chat-pending-action:hover,
+.chat-pending-action:focus-visible,
+.chat-pending-action.is-active {
+  outline: 0;
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  color: var(--text);
+}
+
+.chat-pending-action:focus-visible {
+  box-shadow: var(--focus-ring);
+}
+
+.chat-pending-more-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+.chat-pending-menu {
+  position: absolute;
+  z-index: 10;
+  right: 0;
+  bottom: calc(100% + 6px);
+  width: max-content;
+  min-width: 172px;
+  padding: 5px;
+  border: 1px solid color-mix(in srgb, var(--text) 10%, transparent);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--bg-surface) 96%, transparent);
+  box-shadow: var(--shadow-lg);
+  backdrop-filter: blur(18px);
+}
+
+.chat-pending-menu button {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 36px;
+  gap: 9px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-sm);
+  text-align: left;
+  cursor: pointer;
+}
+
+.chat-pending-menu button:hover,
+.chat-pending-menu button:focus-visible {
+  outline: 0;
+  background: var(--bg-hover);
+}
+
+@media (max-width: 640px) {
+  .chat-pending {
+    width: calc(100% - 2rem);
+  }
+
+  .chat-pending-card {
+    padding-inline: 10px;
+  }
 }
 </style>

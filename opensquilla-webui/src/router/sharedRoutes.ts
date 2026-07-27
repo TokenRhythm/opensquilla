@@ -36,7 +36,7 @@ export const sharedRoutes: RouteRecordRaw[] = [
   // Task ledger: still routed (deep links, the Not Found fallback, /approvals)
   // but off the nav — "New task" owns the top of the sidebar and the recents
   // list below it covers day-to-day session access.
-  { path: '/sessions',  name: 'sessions',  component: SessionsView,  meta: { title: 'Sessions', group: 'Work', icon: 'sessions', platforms: ['web', 'desktop'], keepAlive: true } },
+  { path: '/sessions',  name: 'sessions',  component: SessionsView,  meta: { title: 'Sessions', titleKey: 'sessions.title', group: 'Work', icon: 'sessions', platforms: ['web', 'desktop'], keepAlive: true } },
   // Status and Usage share the Overview destination. Runtime logs remain a
   // kept-alive diagnostic deep link rather than a peer navigation tab.
   { path: '/overview',  name: 'overview',  component: OverviewHubView, meta: { title: 'Status', titleKey: 'nav.status', icon: 'home', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'overview-hub' } },

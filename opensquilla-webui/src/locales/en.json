@@ -2951,6 +2951,8 @@
       "steerHint": "Steer mode: new sends interrupt the response now; these queued messages still auto-send after the turn",
       "queueHint": "Queue mode: these messages auto-send in order when the current response finishes",
       "clearAll": "Clear all",
+      "editMessage": "Edit message",
+      "clearQueue": "Clear queue",
       "removeMessage": "Remove pending message {index}"
     },
     "metaRuns": {
@@ -3147,6 +3149,7 @@
       "selectedCountLabel": "{count} selected",
       "enterSelectionMode": "Manage sessions",
       "exitSelectionMode": "Exit selection",
+      "selectionDone": "Done",
       "selectSession": "Select {title}",
       "deleteSelectedAria": "Delete {count} selected",
       "bulkDeleteTitle": "Delete selected sessions",

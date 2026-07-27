@@ -156,28 +156,6 @@
             </div>
           </div>
           <div class="chat-input-actions chat-input-actions--right">
-            <Transition name="composer-ctl">
-              <div v-if="isStreaming" class="chat-busy-mode" role="group" :aria-label="t('chat.deliveryModeLabel')">
-                <button
-                  class="chat-busy-mode__btn"
-                  :class="{ 'is-active': busySendMode === 'queue' }"
-                  :aria-pressed="busySendMode === 'queue' ? 'true' : 'false'"
-                  :title="t('chat.queueModeHint')"
-                  @click="emit('setBusySendMode', 'queue')"
-                >
-                  {{ t('chat.queueMode') }}
-                </button>
-                <button
-                  class="chat-busy-mode__btn"
-                  :class="{ 'is-active': busySendMode === 'steer' }"
-                  :aria-pressed="busySendMode === 'steer' ? 'true' : 'false'"
-                  :title="t('chat.steerModeHint')"
-                  @click="emit('setBusySendMode', 'steer')"
-                >
-                  {{ t('chat.steerMode') }}
-                </button>
-              </div>
-            </Transition>
             <button
               class="btn btn--icon btn--primary chat-send-btn"
               :class="{ 'is-ready': hasSendContent && !sendBlockedMessage }"
@@ -694,38 +672,6 @@ defineExpose<ChatComposerExpose>({
 
 .chat-input-actions--right {
   flex-shrink: 0;
-}
-
-.chat-busy-mode {
-  display: inline-flex;
-  align-items: center;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-full);
-  padding: 2px;
-  gap: 2px;
-  margin-right: var(--sp-1);
-}
-
-.chat-busy-mode__btn {
-  border: 0;
-  background: none;
-  border-radius: var(--radius-full);
-  padding: 0.125rem 0.5rem;
-  font-size: var(--fs-xs);
-  font-weight: 600;
-  line-height: 1.4;
-  color: var(--text-muted);
-  cursor: pointer;
-  transition: var(--transition);
-}
-
-.chat-busy-mode__btn:hover {
-  color: var(--text);
-}
-
-.chat-busy-mode__btn.is-active {
-  background: color-mix(in srgb, var(--accent) 14%, var(--bg-surface));
-  color: var(--accent);
 }
 
 .chat-input-wrap {

@@ -2951,6 +2951,8 @@
       "steerHint": "Lenkmodus: Neue Sendungen unterbrechen die Antwort jetzt; diese in der Warteschlange befindlichen Nachrichten werden nach dem Durchlauf trotzdem automatisch gesendet",
       "queueHint": "Warteschlangenmodus: Diese Nachrichten werden der Reihe nach automatisch gesendet, wenn die aktuelle Antwort abgeschlossen ist",
       "clearAll": "Alle löschen",
+      "editMessage": "Nachricht bearbeiten",
+      "clearQueue": "Warteschlange leeren",
       "removeMessage": "Ausstehende Nachricht {index} entfernen"
     },
     "metaRuns": {
@@ -3147,6 +3149,7 @@
       "selectedCountLabel": "{count} ausgewählt",
       "enterSelectionMode": "Sitzungen verwalten",
       "exitSelectionMode": "Auswahl verlassen",
+      "selectionDone": "Fertig",
       "selectSession": "{title} auswählen",
       "deleteSelectedAria": "{count} ausgewählte löschen",
       "bulkDeleteTitle": "Ausgewählte Sitzungen löschen",

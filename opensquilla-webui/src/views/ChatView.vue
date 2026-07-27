@@ -327,14 +327,6 @@
       </div>
     </div>
 
-    <PendingQueue
-      :items="pendingQueue"
-      :max-pending="maxPending"
-      :mode="isStreaming ? busySendMode : null"
-      @clear="clearPendingQueue"
-      @remove="removePendingChip"
-    />
-
     <!-- Compaction maintenance card -->
     <div v-if="compactStatus.visible" class="chat-compact-status" :class="`chat-compact-status--${compactStatus.tone}`" role="status" aria-live="polite">
       <div class="chat-compact-status__head">
@@ -402,6 +394,15 @@
         <span class="chat-slash-desc">{{ cmd.desc }}</span>
       </div>
     </div>
+
+    <PendingQueue
+      :items="pendingQueue"
+      :max-pending="maxPending"
+      @clear="clearPendingQueue"
+      @edit="editPendingMessage"
+      @remove="removePendingChip"
+      @steer="steerPendingMessage"
+    />
 
     <ChatComposer
       ref="composerRef"
@@ -1296,6 +1297,53 @@ sendCurrentInput = onSend
 dispatchHiddenForMeta = dispatchHiddenSend
 dispatchHiddenControl = dispatchHiddenSend
 
+function takeVisiblePendingItem(index: number) {
+  const item = pendingQueue.value[index]
+  if (!item || item.hiddenControl) return null
+  pendingQueue.value.splice(index, 1)
+  return item
+}
+
+function editPendingMessage(index: number) {
+  const item = takeVisiblePendingItem(index)
+  if (!item) return
+  inputText.value = [item.text, inputText.value].filter(text => text.trim()).join('\n')
+  pendingAttachments.value = [...(item.attachments || []), ...pendingAttachments.value]
+  pendingSessionIntent.value = item.intent || pendingSessionIntent.value
+  autoResizeTextarea()
+  nextTick(() => composerRef.value?.focusTextarea())
+}
+
+async function steerPendingMessage(index: number) {
+  const item = takeVisiblePendingItem(index)
+  if (!item) return
+
+  const draft = {
+    text: inputText.value,
+    attachments: [...pendingAttachments.value],
+    intent: pendingSessionIntent.value,
+  }
+  inputText.value = item.text
+  pendingAttachments.value = item.attachments || []
+  pendingSessionIntent.value = item.intent || null
+  busySendMode.value = 'steer'
+  autoResizeTextarea()
+
+  await nextTick()
+  try {
+    await onSend()
+  } finally {
+    busySendMode.value = 'queue'
+    const composerIsEmpty = !inputText.value.trim() && pendingAttachments.value.length === 0
+    if (composerIsEmpty && (draft.text.trim() || draft.attachments.length > 0)) {
+      inputText.value = draft.text
+      pendingAttachments.value = draft.attachments
+      pendingSessionIntent.value = draft.intent
+      autoResizeTextarea()
+    }
+  }
+}
+
 // Deny notes ride the normal send path: queued while the turn is streaming,
 // sent immediately otherwise.
 function queueDenyFeedback(note: string) {
@@ -1679,12 +1727,11 @@ async function setComposerCodingModeEnabled(enabled: boolean) {
   await setCodingModeEnabled(enabled)
 }
 
-// A landing suggestion chip replaces the draft composer text; the user still
-// reviews and sends it themselves.
+// A suggestion chip is an explicit task choice. Route it through the same
+// composer-backed send path as every other message so routing, attachments,
+// optimistic state, and recovery behavior stay identical.
 function applyLandingSuggestion(text: string) {
-  inputText.value = text
-  autoResizeTextarea()
-  composerRef.value?.focusTextarea()
+  sendComposerText(text)
 }
 
 function appendComposerText(text: string) {

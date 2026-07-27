@@ -2951,6 +2951,8 @@
       "steerHint": "Modo redirigir: los nuevos envíos interrumpen la respuesta ahora; estos mensajes en cola se siguen enviando automáticamente tras el turno",
       "queueHint": "Modo cola: estos mensajes se envían automáticamente en orden cuando termina la respuesta actual",
       "clearAll": "Borrar todo",
+      "editMessage": "Editar mensaje",
+      "clearQueue": "Vaciar cola",
       "removeMessage": "Quitar el mensaje pendiente {index}"
     },
     "metaRuns": {
@@ -3147,6 +3149,7 @@
       "selectedCountLabel": "{count} seleccionadas",
       "enterSelectionMode": "Gestionar sesiones",
       "exitSelectionMode": "Salir de selección",
+      "selectionDone": "Listo",
       "selectSession": "Seleccionar {title}",
       "deleteSelectedAria": "Eliminar {count} seleccionadas",
       "bulkDeleteTitle": "Eliminar sesiones seleccionadas",
