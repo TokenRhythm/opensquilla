@@ -2909,11 +2909,11 @@
       "runMode": "実行モード",
       "runModeStandard": "毎回確認",
       "runModeStandardDesc": "プロジェクト外のファイル、ネットワーク、システム変更の前に毎回確認します。",
-      "runModeTrusted": "管理実行",
-      "runModeTrustedDesc": "既定ではサンドボックスを使い、明示的にホストへ影響する操作はポリシーが許可した場合にホストで実行できます。",
-      "runModeFull": "完全なホストアクセス",
-      "runModeFullDesc": "サンドボックス分離なしで実行します。",
-      "runModeFullUnavailable": "完全なホストアクセスには owner セッションが必要です。",
+      "runModeTrusted": "おまかせ実行",
+      "runModeTrustedDesc": "操作のリスクを自動で判断するため、通常は毎回の確認が不要です。",
+      "runModeFull": "フルアクセス",
+      "runModeFullDesc": "ファイル、ネットワーク、システムへ毎回確認せず直接アクセスできます。",
+      "runModeFullUnavailable": "フルアクセスはセッションの所有者のみ利用できます。",
       "badgeNew": "NEW"
     },
     "pending": {

@@ -2909,11 +2909,11 @@
       "runMode": "执行模式",
       "runModeStandard": "每次询问",
       "runModeStandardDesc": "涉及项目外文件、网络或系统更改时，每次都会询问你。",
-      "runModeTrusted": "托管执行",
-      "runModeTrustedDesc": "默认使用沙箱；明确需要主机的操作会在策略允许时自动放行。",
-      "runModeFull": "完全主机访问",
-      "runModeFullDesc": "不使用沙箱隔离运行。",
-      "runModeFullUnavailable": "完全主机访问需要 owner 会话。",
+      "runModeTrusted": "托管运行",
+      "runModeTrustedDesc": "自动判断操作风险，通常无需你逐次确认。",
+      "runModeFull": "完全访问",
+      "runModeFullDesc": "允许直接访问文件、网络和系统，不再逐次询问。",
+      "runModeFullUnavailable": "完全访问仅供会话所有者使用。",
       "badgeNew": "新"
     },
     "pending": {

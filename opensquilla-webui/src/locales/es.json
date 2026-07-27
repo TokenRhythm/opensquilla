@@ -2910,10 +2910,10 @@
       "runModeStandard": "Preguntar siempre",
       "runModeStandardDesc": "Pregunta antes de acceder a archivos fuera del proyecto, la red o ajustes del sistema.",
       "runModeTrusted": "Ejecución gestionada",
-      "runModeTrustedDesc": "Usa la sandbox por defecto; las acciones explícitas sobre el host pueden ejecutarse en el host si la política lo permite.",
-      "runModeFull": "Acceso completo al host",
-      "runModeFullDesc": "Ejecuta sin aislamiento de sandbox.",
-      "runModeFullUnavailable": "El acceso completo al host requiere una sesión owner.",
+      "runModeTrustedDesc": "Evalúa el riesgo automáticamente, por lo que normalmente no necesitas confirmar cada acción.",
+      "runModeFull": "Acceso completo",
+      "runModeFullDesc": "Accede directamente a archivos, la red y el sistema sin preguntar cada vez.",
+      "runModeFullUnavailable": "El acceso completo solo está disponible para el propietario de la sesión.",
       "badgeNew": "NEW"
     },
     "pending": {

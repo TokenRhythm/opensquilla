@@ -2910,10 +2910,10 @@
       "runModeStandard": "Toujours demander",
       "runModeStandardDesc": "Demande avant d'accéder aux fichiers hors projet, au réseau ou aux réglages système.",
       "runModeTrusted": "Exécution gérée",
-      "runModeTrustedDesc": "Utilise le bac à sable par défaut ; les actions explicites sur l'hôte peuvent s'exécuter sur l'hôte si la politique l'autorise.",
-      "runModeFull": "Accès hôte complet",
-      "runModeFullDesc": "Exécute sans isolation sandbox.",
-      "runModeFullUnavailable": "L'accès hôte complet nécessite une session owner.",
+      "runModeTrustedDesc": "Évalue automatiquement les risques ; vous n'avez généralement pas à confirmer chaque action.",
+      "runModeFull": "Accès complet",
+      "runModeFullDesc": "Accède directement aux fichiers, au réseau et au système sans demander à chaque fois.",
+      "runModeFullUnavailable": "L'accès complet est réservé au propriétaire de la session.",
       "badgeNew": "NEW"
     },
     "pending": {
