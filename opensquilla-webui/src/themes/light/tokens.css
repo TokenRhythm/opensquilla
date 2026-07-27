@@ -11,28 +11,28 @@
   /* Lark neutrals: #F5F6F7 field, pure-white cards, #EFF0F1 for the recessed
      step (hover fills, inset wells). Separation is border + soft --elev, never
      tint stacking. */
-  --bg: #F5F6F7;
+  --bg: #F7F7F8;
   --bg-surface: #FFFFFF;
-  --bg-surface-2: #EFF0F1;
+  --bg-surface-2: #F0F0F2;
   --bg-elevated: #FFFFFF;
-  --bg-hover: #EFF0F1;
+  --bg-hover: #EAEAED;
   /* Four-level text ramp, straight from Lark. --text-dim is #868C95 rather than
      Lark's #8F959E: the published tertiary lands at 2.79:1 on this field, under
      the 3:1 floor check-webui-colors.mjs enforces, so it is darkened by the
      smallest step that clears it (3.13:1). */
-  --text: #1F2329;
-  --text-muted: #646A73;
-  --text-dim: #868C95;
+  --text: #1D1D1F;
+  --text-muted: #5F6066;
+  --text-dim: #85868D;
   /* Card border / control border / disabled, per Lark. */
-  --border: #DEE0E3;
-  --border-strong: #D0D3D6;
+  --border: #E6E6E9;
+  --border-strong: #D5D5DA;
   /* Emphasis border for hover/focus rings. Deliberately NEUTRAL: this token is
      also the hover border on stat cards, the composer, and approval/clarify
      cards, so tying it to the brand turned every hover orange. Brand colour is
      applied explicitly where it belongs, not through this. */
-  --border-focus: #8F959E;
+  --border-focus: #B9BAC1;
   --card: #FFFFFF;
-  --hairline: #EFF0F1;
+  --hairline: #EFEFF1;
 
   /* Brand orange — the canonical strike accent (the family
      check-cross-surface-tokens.mjs pins for desktop boot). Following Lark's
@@ -48,10 +48,10 @@
   /* Mist elevation — thin hairline ring + soft, wide, low-opacity shadows
      (floating paper, no glare). */
   --elev-highlight: rgba(255,255,255,0.9);
-  --elev-1: 0 0 0 1px var(--hairline), 0 1px 2px rgba(28,30,36,0.04), 0 6px 16px -6px rgba(28,30,36,0.06);
-  --elev-1-hover: 0 0 0 1px var(--border), 0 2px 6px rgba(28,30,36,0.05), 0 12px 28px -8px rgba(28,30,36,0.10);
-  --elev-2: 0 0 0 1px var(--border), 0 10px 30px -8px rgba(28,30,36,0.12);
-  --elev-3: 0 0 0 1px var(--border), 0 18px 48px -12px rgba(28,30,36,0.16);
+  --elev-1: 0 1px 2px rgba(16,20,26,0.035), 0 8px 24px -16px rgba(16,20,26,0.14);
+  --elev-1-hover: 0 2px 5px rgba(16,20,26,0.055), 0 14px 34px -18px rgba(16,20,26,0.20);
+  --elev-2: 0 8px 30px -16px rgba(16,20,26,0.22);
+  --elev-3: 0 20px 55px -22px rgba(16,20,26,0.30);
 
   /* Functional hues — AA ink versions (text on bg/surface); brighter siblings
      live in the -fill roles for small non-text marks (dots, bars, chips). */
@@ -76,10 +76,10 @@
   --syntax-title: #1E55C7;
   --syntax-attr: #0E7490;
 
-  --shadow: rgba(28,30,36,0.08);
-  --shadow-color: rgba(28,30,36,0.08);
-  --scrim: rgba(23, 24, 28, 0.40);
-  --grain-opacity: 0.02;
+  --shadow: rgba(0,0,0,0.10);
+  --shadow-color: rgba(0,0,0,0.10);
+  --scrim: rgba(0, 0, 0, 0.40);
+  --grain-opacity: 0;
 
   /* Dawn atmosphere — sky-blue melting into warm peach, the "morning" in
      Morning Mist. Reserved for ceremony moments only (empty-state greeting,
@@ -89,15 +89,15 @@
   /* Sidebar is the lightest Lark ground (#F8F9FA) with no separate plate; rows
      step to #EFF0F1 on hover and active. Text reuses the four-level ramp so the
      rail and the content area share one hierarchy. */
-  --sidebar-bg: #F8F9FA;
+  --sidebar-bg: #F3F3F5;
   --sidebar-control-bg: #FFFFFF;
-  --sidebar-control-hover: #EFF0F1;
-  --sidebar-item-hover: #EFF0F1;
-  --sidebar-item-active: #E9EBED;
-  --sidebar-text-strong: #1F2329;
-  --sidebar-text: #646A73;
-  --sidebar-text-soft: #868C95;
-  --sidebar-border: #EFF0F1;
+  --sidebar-control-hover: #F8F8F9;
+  --sidebar-item-hover: #EAEAED;
+  --sidebar-item-active: #E4E4E8;
+  --sidebar-text-strong: #18181A;
+  --sidebar-text: #56565A;
+  --sidebar-text-soft: #6C6C70;
+  --sidebar-border: #EBEBEE;
 }
 
 /* Structural identity — light explicitly re-asserts the foundation type + radius
@@ -112,8 +112,8 @@
      dialogs, rather than a 8/12/16/20 ladder that made panels and modals read
      as soft pillows. */
   --radius-control: var(--radius-md);
-  --radius-card: var(--radius-md);
-  --radius-panel: var(--radius-md);
-  --radius-modal: var(--radius-md);
+  --radius-card: var(--radius-lg);
+  --radius-panel: var(--radius-xl);
+  --radius-modal: var(--radius-2xl);
   --radius-pill: var(--radius-full);
 }

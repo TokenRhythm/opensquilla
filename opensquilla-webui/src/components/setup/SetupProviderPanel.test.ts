@@ -48,6 +48,7 @@ function panel(overrides: Record<string, unknown> = {}) {
     editingPrimary: true,
     selectedStoredProfile: false,
     editingNew: false,
+    profileSaveSupported: true,
     routingEnabled: false,
     routerEnabled: false,
     routerBinding: 'legacy',
@@ -322,7 +323,7 @@ describe('SetupProviderPanel — configured provider management', () => {
     },
   ]
 
-  it('keeps Active and Editing as separate provider-list concepts', async () => {
+  it('keeps provider state accessible while the visible list stays quiet', async () => {
     const { app, el } = await mountPanel({
       configuredProviders: configured,
       providerSelected: 'deepseek',
@@ -336,12 +337,21 @@ describe('SetupProviderPanel — configured provider management', () => {
 
     const active = el.querySelector<HTMLElement>('[data-provider-id="openai"]')!
     const editing = el.querySelector<HTMLElement>('[data-provider-id="deepseek"]')!
-    expect(active.textContent).toContain('Active')
-    expect(active.textContent).not.toContain('Editing')
+    const activeIdentity = active.querySelector<HTMLButtonElement>('.setup-provider-card__select')!
+    const editingIdentity = editing.querySelector<HTMLButtonElement>('.setup-provider-card__select')!
+    expect(active.textContent).not.toContain('Active')
+    expect(activeIdentity.getAttribute('aria-label')).toContain('Active')
     expect(active.querySelector('.setup-provider-card__select')?.getAttribute('aria-current')).toBeNull()
     expect(editing.textContent).not.toContain('Active')
-    expect(editing.textContent).toContain('Editing')
-    expect(editing.querySelector('.setup-provider-card__select')?.getAttribute('aria-current')).toBe('true')
+    expect(editing.textContent).not.toContain('Editing')
+    expect(editingIdentity.getAttribute('aria-current')).toBeNull()
+
+    editingIdentity.click()
+    await nextTick()
+
+    expect(editingIdentity.getAttribute('aria-current')).toBe('true')
+    expect(editingIdentity.getAttribute('aria-label')).toContain('Editing')
+    expect(document.body.querySelector('[role="dialog"]')).toBeTruthy()
     expect(editing.querySelector('.setup-provider-card__name')?.getAttribute('aria-current')).toBeNull()
     expect(editing.getAttribute('aria-current')).toBeNull()
 
@@ -376,15 +386,18 @@ describe('SetupProviderPanel — configured provider management', () => {
     app.unmount()
   })
 
-  it('separates credential readiness from an untested saved connection', async () => {
+  it('keeps credential readiness and verification state in the accessible row label', async () => {
     const { app, el } = await mountPanel({
       configuredProviders: [configured[0]],
     })
     const row = el.querySelector<HTMLElement>('[data-provider-id="openai"]')!
     const test = row.querySelector<HTMLButtonElement>('.setup-provider-card__test')
 
-    expect(row.textContent).toContain('Credentials ready')
-    expect(row.textContent).toContain('Not verified')
+    const identityLabel = row.querySelector('.setup-provider-card__identity')?.getAttribute('aria-label')
+    expect(row.textContent).not.toContain('Credentials ready')
+    expect(row.textContent).not.toContain('Not verified')
+    expect(identityLabel).toContain('Credentials ready')
+    expect(identityLabel).toContain('Not verified')
     expect(row.textContent).not.toContain('Configuration verified')
     expect(test?.textContent?.trim()).toBe('Verify saved configuration')
     expect(test?.getAttribute('aria-describedby')).toBe('setup-provider-configured-desc')
@@ -492,21 +505,18 @@ describe('SetupProviderPanel — configured provider management', () => {
     expect(el.querySelector('select[name="setup_provider"]')).toBeNull()
     expect(el.querySelector('[data-testid="configured-provider-list"]')?.textContent).toContain('OpenAI')
     expect(el.querySelector('[data-testid="configured-provider-list"]')?.textContent).toContain('DeepSeek')
-    expect(el.querySelector('[data-testid="provider-catalog-picker"]')).toBeNull()
-    const addArea = el.querySelector<HTMLElement>('.setup-provider-add')!
-    const editor = el.querySelector<HTMLElement>('[data-testid="provider-editor-scope"]')!
-    expect(addArea.compareDocumentPosition(editor) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(document.body.querySelector('[data-testid="provider-catalog-picker"]')).toBeNull()
 
     const add = Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
       .find(button => button.textContent?.trim() === 'Add provider')
     add?.click()
     await nextTick()
 
-    expect(el.querySelector('[data-provider-picker-trigger]')).toBeNull()
-    expect(el.querySelector('[role="dialog"]')).toBeNull()
-    expect(el.querySelector('[data-testid="provider-catalog-picker"]')).toBeTruthy()
-    expect(el.querySelector('input[name="setup_provider_search"]')).toBeTruthy()
-    const options = Array.from(el.querySelectorAll<HTMLButtonElement>('.provider-picker__option'))
+    expect(el.querySelector('[data-provider-picker-trigger]')?.getAttribute('aria-expanded')).toBe('true')
+    expect(document.body.querySelector('[role="dialog"]')).toBeTruthy()
+    expect(document.body.querySelector('[data-testid="provider-catalog-picker"]')).toBeTruthy()
+    expect(document.body.querySelector('input[name="setup_provider_search"]')).toBeTruthy()
+    const options = Array.from(document.body.querySelectorAll<HTMLButtonElement>('.provider-picker__option'))
     expect(options.map(option => option.textContent)).toEqual([expect.stringContaining('Google Gemini')])
 
     options[0]?.click()
@@ -526,20 +536,22 @@ describe('SetupProviderPanel — configured provider management', () => {
     add.click()
     await nextTick()
     await nextTick()
-    const search = el.querySelector<HTMLInputElement>('input[name="setup_provider_search"]')!
+    const search = document.body.querySelector<HTMLInputElement>('input[name="setup_provider_search"]')!
     expect(document.activeElement).toBe(search)
 
     search.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))
     await nextTick()
 
-    expect(el.querySelector('[data-testid="provider-catalog-picker"]')).toBeNull()
+    await vi.waitFor(() => {
+      expect(document.body.querySelector('[data-testid="provider-catalog-picker"]')).toBeNull()
+    })
     const restoredAdd = el.querySelector<HTMLButtonElement>('[data-provider-picker-trigger]')!
     expect(restoredAdd.getAttribute('aria-expanded')).toBe('false')
     expect(document.activeElement).toBe(restoredAdd)
     app.unmount()
   })
 
-  it('does not steal focus when an outside pointer closes the inline picker', async () => {
+  it('closes from the modal backdrop and restores focus to Add provider', async () => {
     const { app, el } = await mountPanel({
       runtimeProviders: [
         { providerId: 'openai', label: 'OpenAI' },
@@ -550,14 +562,13 @@ describe('SetupProviderPanel — configured provider management', () => {
       .find(button => button.textContent?.trim() === 'Add provider')?.click()
     await nextTick()
     await nextTick()
-    const outside = document.createElement('button')
-    document.body.appendChild(outside)
-    outside.focus()
-    outside.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }))
-    await nextTick()
+    const backdrop = document.body.querySelector<HTMLElement>('.setup-provider-modal-overlay')!
+    backdrop.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }))
 
-    expect(el.querySelector('[data-testid="provider-catalog-picker"]')).toBeNull()
-    expect(document.activeElement).toBe(outside)
+    await vi.waitFor(() => {
+      expect(document.body.querySelector('[data-testid="provider-catalog-picker"]')).toBeNull()
+    })
+    expect(document.activeElement).toBe(el.querySelector('[data-provider-picker-trigger]'))
     app.unmount()
   })
 
@@ -612,20 +623,126 @@ describe('SetupProviderPanel — configured provider management', () => {
       .find(button => button.textContent?.trim() === 'Add provider')?.click()
     await nextTick()
     await nextTick()
-    Array.from(el.querySelectorAll<HTMLButtonElement>('.provider-picker__option'))
+    Array.from(document.body.querySelectorAll<HTMLButtonElement>('.provider-picker__option'))
       .find(option => option.textContent?.includes('DeepSeek'))?.click()
     await nextTick()
     await nextTick()
 
-    expect(el.querySelector('[data-testid="provider-catalog-picker"]')).toBeNull()
-    const addArea = el.querySelector<HTMLElement>('.setup-provider-add')!
-    const editor = el.querySelector<HTMLElement>('[data-testid="provider-editor-scope"]')!
-    expect(addArea.compareDocumentPosition(editor) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-    expect(document.activeElement).toBe(el.querySelector('input[name="setup_provider_api_key"]'))
+    expect(document.body.querySelector('[data-testid="provider-catalog-picker"]')).toBeNull()
+    expect(document.body.querySelector('.setup-provider-modal__form')).toBeTruthy()
+    expect(document.activeElement)
+      .toBe(document.body.querySelector(
+        '.setup-provider-modal__form input[name="setup_provider_api_key"]',
+      ))
     app.unmount()
   })
 
-  it('tests saved config without switching the editor and keeps activate/delete visible', async () => {
+  it('shows an explicit Save changes action for a new provider draft', async () => {
+    const el = document.createElement('div')
+    document.body.appendChild(el)
+    const panelState = reactive(panel({
+      providerSelected: '',
+      configuredProviders: [],
+      runtimeProviders: [OPENROUTER_PROVIDER],
+    }))
+    const mutablePanelState = panelState as unknown as Record<string, unknown>
+    const onSaveProvider = vi.fn()
+    const app = createApp(SetupProviderPanel, {
+      panel: panelState,
+      dirty: true,
+      onSaveProvider,
+      onAddProvider: (providerId: string) => {
+        panelState.providerSelected = providerId
+        panelState.editingNew = true
+        mutablePanelState.credentialPanel = {
+          ...(panelState.credentialPanel as Record<string, unknown>),
+          providerLabel: 'OpenRouter',
+          providerSelected: true,
+        }
+      },
+    })
+    app.use(i18n)
+    app.mount(el)
+    await nextTick()
+
+    Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === 'Add provider')?.click()
+    await nextTick()
+    Array.from(document.body.querySelectorAll<HTMLButtonElement>('.provider-picker__option'))
+      .find(option => option.textContent?.includes('OpenRouter'))?.click()
+    await nextTick()
+    await nextTick()
+
+    const save = Array.from(
+      document.body.querySelectorAll<HTMLButtonElement>('.setup-provider-modal__footer button'),
+    ).find(button => button.textContent?.trim() === 'Save changes')
+    expect(save?.disabled).toBe(false)
+    save?.click()
+    expect(onSaveProvider).toHaveBeenCalledOnce()
+
+    app.unmount()
+  })
+
+  it('offers a verified replace-current flow on a single-provider Gateway', async () => {
+    const el = document.createElement('div')
+    document.body.appendChild(el)
+    const panelState = reactive(panel({
+      providerSelected: '',
+      configuredProviders: [],
+      runtimeProviders: [OPENROUTER_PROVIDER],
+      profileSaveSupported: false,
+      connection: connection({ phase: 'verified' }),
+    }))
+    const mutablePanelState = panelState as unknown as Record<string, unknown>
+    const onSaveProvider = vi.fn()
+    const app = createApp(SetupProviderPanel, {
+      panel: panelState,
+      dirty: true,
+      onSaveProvider,
+      onAddProvider: (providerId: string) => {
+        panelState.providerSelected = providerId
+        panelState.editingPrimary = false
+        panelState.editingNew = true
+        mutablePanelState.credentialPanel = {
+          ...(panelState.credentialPanel as Record<string, unknown>),
+          providerLabel: 'OpenRouter',
+          providerSelected: true,
+        }
+      },
+    })
+    app.use(i18n)
+    app.mount(el)
+    await nextTick()
+
+    Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === 'Add provider')?.click()
+    await nextTick()
+    Array.from(document.body.querySelectorAll<HTMLButtonElement>('.provider-picker__option'))
+      .find(option => option.textContent?.includes('OpenRouter'))?.click()
+    await nextTick()
+    await nextTick()
+
+    expect(document.body.querySelector('.setup-provider-modal__compat-warning')?.textContent)
+      .toContain('replaces the current provider')
+    const save = Array.from(
+      document.body.querySelectorAll<HTMLButtonElement>('.setup-provider-modal__footer button'),
+    ).find(button => button.textContent?.trim() === 'Save changes')
+    expect(save?.disabled).toBe(false)
+    save?.click()
+    expect(onSaveProvider).toHaveBeenCalledOnce()
+
+    app.unmount()
+  })
+
+  it('hides delete when the Gateway cannot store a replacement profile', async () => {
+    const { app, el } = await mountPanel({ profileSaveSupported: false })
+
+    expect(el.querySelector('.setup-provider-card__delete')).toBeNull()
+
+    app.unmount()
+  })
+
+  it('tests saved config without switching the editor and keeps edit/delete visible', async () => {
     const onSelectConfiguredProvider = vi.fn()
     const onProbeConfiguredProvider = vi.fn()
     const onRemoveProviderProfile = vi.fn()
@@ -643,13 +760,14 @@ describe('SetupProviderPanel — configured provider management', () => {
     expect(onProbeConfiguredProvider).toHaveBeenCalledWith('deepseek')
 
     expect(onSelectConfiguredProvider).not.toHaveBeenCalled()
-    expect(buttons.find(button => button.textContent?.trim() === 'Set active')).toBeTruthy()
+    expect(buttons.find(button => button.textContent?.trim() === 'Edit')).toBeTruthy()
+    expect(buttons.find(button => button.textContent?.trim() === 'Set active')).toBeUndefined()
     buttons.find(button => button.textContent?.trim() === 'Delete')?.click()
     await nextTick()
     expect(onRemoveProviderProfile).toHaveBeenCalledWith('deepseek')
     expect(onSelectConfiguredProvider).not.toHaveBeenCalled()
     expect(Array.from(el.querySelectorAll<HTMLButtonElement>('[data-provider-id="openai"] button'))
-      .some(button => button.textContent?.trim() === 'Delete')).toBe(false)
+      .some(button => button.textContent?.trim() === 'Delete')).toBe(true)
     app.unmount()
   })
 
@@ -741,14 +859,17 @@ describe('SetupProviderPanel — configured provider management', () => {
     app.unmount()
   })
 
-  it('keeps the plain not-verified fallback for rows with no probe history', async () => {
+  it('keeps the plain not-verified fallback in the accessible label until a probe runs', async () => {
     const { app, el } = await mountPanel({ configuredProviders: configured })
 
     const probe = el.querySelector<HTMLElement>(
       '[data-provider-id="openai"] .setup-provider-card__probe',
-    )!
-    expect(probe.textContent).toContain('Not verified')
-    expect(probe.classList.contains('is-warn')).toBe(true)
+    )
+    const identity = el.querySelector<HTMLElement>(
+      '[data-provider-id="openai"] .setup-provider-card__identity',
+    )
+    expect(probe).toBeNull()
+    expect(identity?.getAttribute('aria-label')).toContain('Not verified')
 
     app.unmount()
   })
@@ -840,7 +961,7 @@ describe('SetupProviderPanel — configured provider management', () => {
     app.unmount()
   })
 
-  it('exposes activation and delete as native buttons without an overflow menu', async () => {
+  it('exposes verify, edit, and delete as native buttons without an overflow menu', async () => {
     const ready = configured.map(row => row.providerId === 'deepseek'
       ? { ...row, ready: true, primaryEligible: true, probeModelAvailable: true }
       : row)
@@ -849,15 +970,15 @@ describe('SetupProviderPanel — configured provider management', () => {
     const labels = Array.from(row.querySelectorAll<HTMLButtonElement>('button'))
       .map(button => button.textContent?.trim())
 
-    expect(labels).toContain('Set active')
+    expect(labels).toContain('Verify saved configuration')
+    expect(labels).toContain('Edit')
     expect(labels).toContain('Delete')
+    expect(labels).not.toContain('Set active')
     expect(row.querySelector('[aria-haspopup="menu"]')).toBeNull()
     expect(row.querySelector('.setup-provider-card__identity')?.getAttribute('aria-label'))
       .toBe('Edit DeepSeek — Credentials ready — Not verified')
-    expect(row.querySelector('.setup-provider-card__activate')?.getAttribute('aria-label'))
-      .toBe('Set active — DeepSeek')
     expect(row.querySelector('.setup-provider-card__delete')?.getAttribute('aria-label'))
-      .toBe('Delete — DeepSeek')
+      .toBe('Remove provider — DeepSeek')
 
     app.unmount()
   })
@@ -880,8 +1001,8 @@ describe('SetupProviderPanel — configured provider management', () => {
     const interactions = el.querySelector<HTMLFieldSetElement>('.setup-provider-interactions')
     expect(interactions?.disabled).toBe(true)
     expect(interactions?.getAttribute('aria-busy')).toBe('true')
-    expect(el.querySelector('[data-provider-id="deepseek"] .setup-provider-card__activate')
-      ?.getAttribute('aria-label')).toBe('Activating… — DeepSeek')
+    expect(el.querySelector('[data-provider-id="deepseek"] .setup-provider-card__activate'))
+      .toBeNull()
 
     app.unmount()
   })
@@ -922,7 +1043,7 @@ describe('SetupProviderPanel — configured provider management', () => {
     app.unmount()
   })
 
-  it('activates a provider directly without opening a dialog', async () => {
+  it('opens a provider editor from the list without activating it', async () => {
     const ready = configured.map(row => row.providerId === 'deepseek'
       ? { ...row, ready: true, primaryEligible: true, probeModelAvailable: true }
       : row)
@@ -931,23 +1052,23 @@ describe('SetupProviderPanel — configured provider management', () => {
       configuredProviders: ready,
     }, { onActivateProvider })
     const row = el.querySelector<HTMLElement>('[data-provider-id="deepseek"]')!
-    const trigger = row.querySelector<HTMLButtonElement>('.setup-provider-card__activate')!
+    const trigger = row.querySelector<HTMLButtonElement>('.setup-provider-card__select')!
     trigger.click()
     await nextTick()
 
-    expect(onActivateProvider).toHaveBeenCalledWith('deepseek')
-    expect(el.querySelector('[role="dialog"]')).toBeNull()
+    expect(onActivateProvider).not.toHaveBeenCalled()
+    expect(document.body.querySelector('[role="dialog"]')).toBeTruthy()
     app.unmount()
   })
 
-  it('never offers activation or deletion on the active provider row', async () => {
+  it('keeps activation out of the list while allowing deletion of the active provider', async () => {
     const { app, el } = await mountPanel({ configuredProviders: configured })
     const row = el.querySelector<HTMLElement>('[data-provider-id="openai"]')!
     const labels = Array.from(row.querySelectorAll<HTMLButtonElement>('button'))
       .map(button => button.textContent?.trim())
 
     expect(labels).not.toContain('Set active')
-    expect(labels).not.toContain('Delete')
+    expect(labels).toContain('Delete')
     app.unmount()
   })
 
@@ -968,7 +1089,7 @@ describe('SetupProviderPanel — configured provider management', () => {
       .find(button => button.textContent?.trim() === 'Add provider')?.click()
     await nextTick()
 
-    const initial = Array.from(el.querySelectorAll<HTMLElement>('.provider-picker__option'))
+    const initial = Array.from(document.body.querySelectorAll<HTMLElement>('.provider-picker__option'))
       .map(option => option.textContent)
     expect(initial).toEqual([
       expect.stringContaining('TokenRhythm'),
@@ -978,16 +1099,17 @@ describe('SetupProviderPanel — configured provider management', () => {
       expect.stringContaining('Custom endpoint'),
     ])
     expect(initial.join(' ')).not.toContain('OpenAI')
-    expect(el.querySelector('.provider-picker__list')).toBeTruthy()
-    expect(Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
+    expect(document.body.querySelector('.provider-picker__list')).toBeTruthy()
+    expect(Array.from(document.body.querySelectorAll<HTMLButtonElement>('button'))
       .some(button => button.textContent?.includes('Browse all providers'))).toBe(false)
-    expect(el.querySelector('.provider-picker__option .control-pill')?.textContent).toContain('Recommended')
+    expect(document.body.querySelector('.provider-picker__option .control-pill')?.textContent)
+      .toContain('Limited-time free access')
 
-    const search = el.querySelector<HTMLInputElement>('input[name="setup_provider_search"]')!
+    const search = document.body.querySelector<HTMLInputElement>('input[name="setup_provider_search"]')!
     search.value = 'custom'
     search.dispatchEvent(new Event('input', { bubbles: true }))
     await nextTick()
-    const result = el.querySelector<HTMLButtonElement>('.provider-picker__option')!
+    const result = document.body.querySelector<HTMLButtonElement>('.provider-picker__option')!
     expect(result.textContent).toContain('Custom endpoint')
     result.click()
     expect(onAddProvider).toHaveBeenCalledWith('custom')
@@ -1012,10 +1134,10 @@ describe('SetupProviderPanel — configured provider management', () => {
     await nextTick()
     await nextTick()
 
-    const options = Array.from(el.querySelectorAll<HTMLButtonElement>('.provider-picker__option'))
+    const options = Array.from(document.body.querySelectorAll<HTMLButtonElement>('.provider-picker__option'))
     expect(options).toHaveLength(3)
     expect(options.every(option => option.tabIndex === -1)).toBe(true)
-    const search = el.querySelector<HTMLInputElement>('input[name="setup_provider_search"]')!
+    const search = document.body.querySelector<HTMLInputElement>('input[name="setup_provider_search"]')!
     // Wait for the catalog's scheduled focus before driving ArrowDown. Under a
     // loaded full-suite worker, dispatching first lets the delayed focus handler
     // reset activeIndex back to zero after the key event.
@@ -1031,7 +1153,7 @@ describe('SetupProviderPanel — configured provider management', () => {
     app.unmount()
   })
 
-  it('keeps activation direct even when the Router reports a provider conflict', async () => {
+  it('keeps Router conflicts out of the provider-list editing flow', async () => {
     const onActivateProvider = vi.fn()
     const ready = configured.map(row => row.providerId === 'deepseek'
       ? { ...row, ready: true, primaryEligible: true, probeModelAvailable: true }
@@ -1043,16 +1165,16 @@ describe('SetupProviderPanel — configured provider management', () => {
       activationRouterConflict: true,
     }, { onActivateProvider })
     const row = el.querySelector<HTMLElement>('[data-provider-id="deepseek"]')!
-    row.querySelector<HTMLButtonElement>('.setup-provider-card__activate')?.click()
+    row.querySelector<HTMLButtonElement>('.setup-provider-card__select')?.click()
     await nextTick()
 
-    expect(onActivateProvider).toHaveBeenCalledWith('deepseek')
+    expect(onActivateProvider).not.toHaveBeenCalled()
     expect(el.textContent).not.toContain('Resolve Model Routing')
-    expect(el.querySelector('[role="dialog"]')).toBeNull()
+    expect(document.body.querySelector('[role="dialog"]')).toBeTruthy()
     app.unmount()
   })
 
-  it('lets backend eligibility decide activation without frontend model metadata', async () => {
+  it('keeps backend activation eligibility out of the quiet provider list', async () => {
     const onActivateProvider = vi.fn()
     const ready = configured.map(row => row.providerId === 'deepseek'
       ? {
@@ -1065,13 +1187,14 @@ describe('SetupProviderPanel — configured provider management', () => {
     const { app, el } = await mountPanel({ configuredProviders: ready }, { onActivateProvider })
 
     const row = el.querySelector<HTMLElement>('[data-provider-id="deepseek"]')!
-    const activate = row.querySelector<HTMLButtonElement>('.setup-provider-card__activate')!
+    const edit = row.querySelector<HTMLButtonElement>('.setup-provider-card__select')!
 
-    expect(activate.disabled).toBe(false)
-    activate.click()
-    expect(onActivateProvider).toHaveBeenCalledWith('deepseek')
+    expect(row.querySelector('.setup-provider-card__activate')).toBeNull()
+    edit.click()
+    await nextTick()
+    expect(onActivateProvider).not.toHaveBeenCalled()
     expect(row.textContent).not.toContain('Choose and save a model below')
-    expect(el.querySelector('[role="dialog"]')).toBeNull()
+    expect(document.body.querySelector('[role="dialog"]')).toBeTruthy()
     app.unmount()
   })
 
@@ -1089,12 +1212,12 @@ describe('SetupProviderPanel — configured provider management', () => {
     const { app, el } = await mountPanel({ configuredProviders: rows }, { onActivateProvider })
 
     const row = el.querySelector<HTMLElement>('[data-provider-id="deepseek"]')!
-    const activate = row.querySelector<HTMLButtonElement>('.setup-provider-card__activate')!
-    expect(activate.disabled).toBe(true)
-    expect(activate.title).toContain('Choose a direct/fallback model')
+    const edit = row.querySelector<HTMLButtonElement>('.setup-provider-card__select')!
+    expect(row.querySelector('.setup-provider-card__activate')).toBeNull()
     expect(row.textContent).not.toContain('Choose and save a model below')
-    expect(el.querySelector('[role="dialog"]')).toBeNull()
-    activate.click()
+    edit.click()
+    await nextTick()
+    expect(document.body.querySelector('[role="dialog"]')).toBeTruthy()
     expect(onActivateProvider).not.toHaveBeenCalled()
     app.unmount()
   })
@@ -1264,7 +1387,7 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
     }
   }
 
-  it('keeps OpenRouter selected while showing exactly one TokenRhythm recommendation', async () => {
+  it('keeps OpenRouter selected while the optional recommendation stays out of the primary page', async () => {
     const onUpdateProviderSelected = vi.fn()
     const onProviderChange = vi.fn()
     const onUpdateProviderField = vi.fn()
@@ -1299,12 +1422,7 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
     expect(el.querySelector('[data-provider-id="openrouter"]')).toBeTruthy()
     expect(recommendations).toHaveLength(1)
     const recommendationCard = recommendation(el)!
-    const addArea = el.querySelector<HTMLElement>('.setup-provider-add')!
-    const editor = el.querySelector<HTMLElement>('[data-testid="provider-editor-scope"]')!
-    expect(addArea.compareDocumentPosition(recommendationCard) & Node.DOCUMENT_POSITION_FOLLOWING)
-      .toBeTruthy()
-    expect(recommendationCard.compareDocumentPosition(editor) & Node.DOCUMENT_POSITION_FOLLOWING)
-      .toBeTruthy()
+    expect(recommendationCard.closest('[hidden]')).toBeTruthy()
     expect(recommendationCard.querySelector('.setup-provider-recommendation__scope')?.textContent)
       .toContain('OpenSquilla recommendation · Optional')
     expect(el.querySelector('.setup-provider-global-block__eyebrow')).toBeNull()

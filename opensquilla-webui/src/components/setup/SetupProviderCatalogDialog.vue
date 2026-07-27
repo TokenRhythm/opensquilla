@@ -114,7 +114,18 @@ function onDocumentPointerDown(event: PointerEvent) {
   close(false)
 }
 
-onMounted(() => document.addEventListener('pointerdown', onDocumentPointerDown))
+function focusPicker() {
+  query.value = ''
+  void nextTick(() => {
+    move(0)
+    inputRef.value?.focus()
+  })
+}
+
+onMounted(() => {
+  document.addEventListener('pointerdown', onDocumentPointerDown)
+  if (props.open) focusPicker()
+})
 onBeforeUnmount(() => document.removeEventListener('pointerdown', onDocumentPointerDown))
 
 watch(filtered, rows => {
@@ -124,11 +135,7 @@ watch(filtered, rows => {
 })
 watch(() => props.open, open => {
   if (!open) return
-  query.value = ''
-  void nextTick(() => {
-    move(0)
-    inputRef.value?.focus()
-  })
+  focusPicker()
 })
 </script>
 

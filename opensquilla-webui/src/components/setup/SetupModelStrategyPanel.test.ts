@@ -169,6 +169,11 @@ describe('SetupModelStrategyPanel', () => {
     expect(strategyRowsText).toContain('Token-efficient')
     expect(strategyRowsText).toContain('Predictable')
     expect(strategyRowsText).toContain('Capability-first')
+    const strategyBadges = Array.from(el.querySelectorAll<HTMLElement>('.setup-model-strategy__card .control-pill'))
+    expect(strategyBadges).toHaveLength(3)
+    expect(strategyBadges.every(badge => badge.classList.contains('control-pill--info'))).toBe(true)
+    expect(strategyBadges.some(badge => badge.classList.contains('control-pill--ok'))).toBe(false)
+    expect(strategyBadges.some(badge => badge.classList.contains('control-pill--queued'))).toBe(false)
     expect(strategyRowsText).not.toContain('Recommended')
     expect(strategyRowsText).not.toContain('Advanced')
     expect(strategyRowsText).not.toContain('Default')
@@ -191,6 +196,23 @@ describe('SetupModelStrategyPanel', () => {
     await nextTick()
 
     expect(onUpdateStrategy).toHaveBeenCalledWith('ensemble')
+    app.unmount()
+  })
+
+  it('places model service management beside the page description', async () => {
+    const onGoToSection = vi.fn()
+    const { app, el } = await mountPanel({}, { onGoToSection })
+    const pageMeta = el.querySelector('.setup-model-strategy__page-meta')
+    const manageButton = pageMeta?.querySelector<HTMLButtonElement>('button')
+
+    expect(pageMeta?.textContent).toContain('Choose how models are picked for each request.')
+    expect(manageButton?.textContent).toContain('Manage Model Service')
+    expect(el.textContent).not.toContain('Models come from Model Service.')
+
+    manageButton?.click()
+    await nextTick()
+
+    expect(onGoToSection).toHaveBeenCalledWith('provider')
     app.unmount()
   })
 
@@ -386,6 +408,7 @@ describe('SetupModelStrategyPanel', () => {
   })
 
   it('edits the current provider model in fixed mode without calling it a routing default', async () => {
+    const onUpdateFixedProvider = vi.fn()
     const onUpdateFixedModel = vi.fn()
     const discoveredModel = {
       id: 'deepseek/deepseek-v4-flash',
@@ -403,14 +426,25 @@ describe('SetupModelStrategyPanel', () => {
         models: [discoveredModel],
         modelSource: 'live',
       },
-    }, { onUpdateFixedModel })
+    }, { onUpdateFixedProvider, onUpdateFixedModel })
 
     const detail = el.querySelector('.setup-model-strategy__detail')?.textContent || ''
+    const provider = el.querySelector<HTMLSelectElement>('select[name="setup_model_strategy_fixed_provider"]')
     const input = el.querySelector<HTMLInputElement>('input[name="setup_provider_model_strategy_fixed_model"]')
     expect(detail).toContain('Current model provider')
     expect(detail).toContain('OpenRouter')
+    expect(provider?.value).toBe('openrouter')
+    expect(Array.from(provider?.options || []).map(option => option.value))
+      .toEqual(['openrouter', 'deepseek', 'tokenrhythm'])
     expect(input?.value).toBe(discoveredModel.id)
     expect(detail).not.toContain('default tier')
+
+    if (provider) {
+      provider.value = 'deepseek'
+      provider.dispatchEvent(new Event('change', { bubbles: true }))
+      await nextTick()
+    }
+    expect(onUpdateFixedProvider).toHaveBeenCalledWith('deepseek')
 
     if (input) {
       input.value = 'deepseek/deepseek-v4-pro'
@@ -909,7 +943,7 @@ describe('SetupModelStrategyPanel', () => {
     app.unmount()
   })
 
-  it('keeps the preset lineup read-only while allowing a switch to custom', async () => {
+  it('migrates a saved preset directly into the single custom editing path', async () => {
     const onUpdateEnsembleScheme = vi.fn()
     const { app, el } = await mountPanel({
       activeStrategy: 'ensemble',
@@ -935,6 +969,8 @@ describe('SetupModelStrategyPanel', () => {
     expect(el.textContent).toContain('deepseek/deepseek-v4-pro')
     expect(el.textContent).toContain('moonshotai/kimi-k2.7-code')
     expect(el.textContent).toContain('Aggregator')
+    expect(el.querySelector('.setup-model-strategy__ensemble > .control-section__head')).toBeNull()
+    expect(el.textContent).not.toContain('Models draft in parallel')
     expect(el.querySelector('[data-testid="ensemble-preset-provider-mismatch"]')).toBeNull()
     const preset = el.querySelector<HTMLElement>('[data-testid="ensemble-preset-lineup"]')!
     const steps = preset.querySelectorAll<HTMLElement>('.setup-model-strategy__step')
@@ -946,10 +982,11 @@ describe('SetupModelStrategyPanel', () => {
     expect(preset.querySelector('[data-testid="setup-model-strategy-add-candidate-trigger"]')).toBeNull()
     expect(preset.querySelector('[data-testid="ensemble-replace-aggregator"]')).toBeNull()
     expect(el.querySelector('[data-testid="ensemble-effective-summary"]')?.textContent).toContain('5 model calls')
-    expect(el.querySelector('[data-testid="ensemble-scheme-preset"]')?.getAttribute('aria-checked')).toBe('true')
-    el.querySelector<HTMLButtonElement>('[data-testid="ensemble-scheme-custom"]')?.click()
-    await nextTick()
+    expect(el.querySelector('[data-testid="ensemble-scheme-preset"]')).toBeNull()
+    expect(el.querySelector('[data-testid="ensemble-scheme-custom"]')).toBeNull()
     expect(onUpdateEnsembleScheme).toHaveBeenCalledWith('custom')
+    expect(preset.querySelector('.setup-model-strategy__step-role')).toBeNull()
+    expect(steps[1]?.querySelector('.setup-model-strategy__step-role')).toBeNull()
     expect(el.textContent).not.toContain('legacy OpenRouter candidate template')
     expect(el.querySelector('.setup-model-strategy__candidate-provider')).toBeNull()
 
@@ -1124,6 +1161,8 @@ describe('SetupModelStrategyPanel', () => {
         'input[name="setup_provider_model_strategy_fixed_model"]',
       )
       expect(fixedModelInput?.value).toBe('deepseek/deepseek-v4-pro')
+      expect(el.querySelector('[data-testid="setup-model-strategy-fixed-model"]')
+        ?.classList.contains('setup-model-strategy__fixed-model-row')).toBe(true)
       const fixedSection = el.querySelector<HTMLElement>(
         '[data-testid="setup-model-strategy-fixed-section"]',
       )!
@@ -1131,6 +1170,15 @@ describe('SetupModelStrategyPanel', () => {
         '#setup-provider-model_strategy_fixed_model-description',
       )
       expect(fixedFieldDescription?.textContent)
+        .toContain('as the fallback when routing or collaboration cannot complete')
+      expect(fixedFieldDescription?.classList.contains('setup-model-combobox__sr-only')).toBe(true)
+      const fixedModelInfo = fixedSection.querySelector<HTMLElement>(
+        '.setup-model-combobox__info',
+      )
+      expect(fixedModelInfo?.getAttribute('title')).toBeNull()
+      expect(fixedModelInfo?.getAttribute('aria-describedby'))
+        .toBe('setup-provider-model_strategy_fixed_model-info-tooltip')
+      expect(fixedModelInfo?.querySelector('[role="tooltip"]')?.textContent)
         .toContain('as the fallback when routing or collaboration cannot complete')
       expect(fixedModelInput?.getAttribute('aria-describedby'))
         .toBe('setup-provider-model_strategy_fixed_model-description')
@@ -1141,11 +1189,8 @@ describe('SetupModelStrategyPanel', () => {
         expect(fixedSection.textContent)
           .toContain('without automatic routing or multi-model collaboration')
       } else {
-        expect(fixedSection.querySelector('h4')?.textContent)
-          .toContain('Fixed and fallback model')
-        expect(fixedSection.textContent)
-          .toContain('as the fallback when routing or collaboration cannot complete')
-        expect(fixedSection.querySelector('.control-section__head .control-section__desc')).toBeNull()
+        expect(fixedSection.querySelector('.control-section__head')).toBeNull()
+        expect(fixedSection.querySelector('.control-row__desc')).toBeNull()
         expect(fixedSection.textContent).not.toContain('Choose the model used for every request.')
         expect(fixedSection.textContent)
           .not.toContain('without automatic routing or multi-model collaboration')
@@ -1163,8 +1208,9 @@ describe('SetupModelStrategyPanel', () => {
     expect(Array.from(el.querySelectorAll('h4')).map(node => node.textContent?.trim()))
       .toEqual(expect.arrayContaining([
         'Intelligent model routing',
-        'Fixed and fallback model',
       ]))
+    expect(Array.from(el.querySelectorAll('h4')).map(node => node.textContent?.trim()))
+      .not.toContain('Fixed and fallback model')
     // The redundant "Choose how models are used" section heading was removed;
     // the mode radiogroup is labelled for AT via aria-label instead.
     expect(el.textContent).not.toContain('Choose how models are used')

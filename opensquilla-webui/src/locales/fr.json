@@ -435,7 +435,8 @@
       "modelPlaceholder": "Saisir un identifiant de modèle",
       "activating": "Activation…",
       "modelDiscoveryFailed": "Impossible de découvrir les modèles. Saisissez un identifiant manuellement.",
-      "upgradeGatewayHint": "Mettez à jour et redémarrez la passerelle pour activer les fournisseurs.",
+      "upgradeGatewayHint": "Mettez à jour et redémarrez la passerelle pour gérer les fournisseurs.",
+      "profileSaveUnsupported": "Cette passerelle enregistre un fournisseur actif. Après vérification, « Enregistrer les modifications » remplace le fournisseur actuel.",
       "connectedLatency": "Configuration vérifiée · Vérification complète {latency} ms",
       "connectionKeyRejected": "Clé refusée",
       "connectionUnavailable": "Connexion indisponible",
@@ -2426,9 +2427,13 @@
     "bundleReady": "Paquet d’assistance téléchargé"
   },
   "usageLogs": {
+    "tasks": {
+      "unnamed": "Tâche sans titre"
+    },
     "usage": {
       "title": "Utilisation",
-      "subtitle": "Jetons, coût et dépense par modèle sur l'ensemble des sessions.",
+      "subtitle": "Jetons, coût et utilisation des modèles par tâche.",
+      "actions": "Actions d’utilisation",
       "currency": "Devise",
       "usDollar": "Dollar américain",
       "chineseYuan": "Yuan chinois",
@@ -2440,9 +2445,9 @@
     "summary": {
       "totalTokens": "Total des jetons",
       "totalCost": "Coût total",
-      "sessions": "Sessions",
+      "sessions": "Tâches",
       "acrossAllModels": "sur tous les modèles",
-      "avgCostPerSession": "Coût moyen / session",
+      "avgCostPerSession": "Coût moyen / tâche",
       "runningAverage": "moyenne glissante"
     },
     "tokenParts": {
@@ -2455,10 +2460,10 @@
     "nativeCostHintTitle": "La facture d’origine du fournisseur est en CNY ; la valeur USD utilise le taux fixe enregistré sur le reçu.",
     "nativeMixedCostHintTitle": "La facturation multidevise ou en attente reste en USD canonique ; les reçus d’origine confirmés sont affichés séparément.",
     "nativeBillingSubtotals": "Reçus d’origine : {amounts}",
-    "rangeHiddenHint": "{count} sessions héritées sans date masquées",
+    "rangeHiddenHint": "{count} tâches historiques sans date masquées",
     "coverage": {
-      "approximate": "Ancienne Gateway : les plages de dates sont estimées à partir des totaux de session.",
-      "partial": "La migration du registre d’usage continue ; tout l’usage connu est affiché.",
+      "approximate": "Une partie de l’usage historique est estimée à partir des totaux par tâche.",
+      "partial": "Tout l’usage actuellement enregistré est affiché.",
       "timezoneFallback": "Le fuseau {requested} est invalide ; les dates sont regroupées selon {effective}.",
       "legacyIncluded": "L’usage antérieur au registre est inclus dans le total, sans pouvoir être attribué à une date.",
       "estimated": "Inclut {count} appels estimés.",
@@ -2476,10 +2481,10 @@
       "input": "Entrée",
       "output": "Sortie",
       "emptyWindow": "Aucune donnée dans la fenêtre sélectionnée.",
-      "openSession": "Ouvrir {session}",
+      "openTask": "Ouvrir la tâche « {task} »",
       "daily": "Utilisation quotidienne",
-      "topByCost": "Principales sessions par coût",
-      "topByTokens": "Principales sessions par total de jetons",
+      "topByCost": "Principales tâches par coût",
+      "topByTokens": "Principales tâches par total de jetons",
       "showingOf": "affichage de {shown} sur {total}"
     },
     "models": {
@@ -2494,19 +2499,19 @@
       "output": "Sortie",
       "cacheRead": "Lecture cache",
       "cacheWrite": "Écriture cache",
-      "sessions": "Sessions",
+      "sessions": "Tâches",
       "cost": "Coût"
     },
     "sessions": {
-      "title": "Sessions",
-      "count": "{count} sessions",
+      "title": "Par tâche",
+      "count": "{count} tâches",
       "emptyTitle": "Aucune donnée d'utilisation pour l'instant",
-      "emptyText": "Exécutez une session et la dépense de jetons apparaîtra ici automatiquement.",
-      "openChat": "Ouvrir le chat pour {session}",
+      "emptyText": "Exécutez une tâche et son utilisation de jetons apparaîtra ici automatiquement.",
+      "openChat": "Ouvrir la tâche « {task} »",
       "autoModels": "auto · {count} modèles"
     },
     "columns": {
-      "session": "Session",
+      "session": "Tâche",
       "modified": "Modifié",
       "input": "Entrée",
       "output": "Sortie",

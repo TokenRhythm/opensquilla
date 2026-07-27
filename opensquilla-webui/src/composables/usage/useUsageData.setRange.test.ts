@@ -107,6 +107,21 @@ afterEach(() => {
 })
 
 describe('useUsageData range selection under concurrent refreshes', () => {
+  it('does not describe complete all-time task totals as a date-range approximation', async () => {
+    localStorage.setItem(RANGE_KEY, 'all')
+    const snapshot = snapshotFor('all')
+    snapshot.source = 'usage_status'
+    snapshot.mode = 'session_approximation'
+    vi.mocked(requestUsageSnapshot).mockResolvedValueOnce(snapshot)
+
+    const { api, scope } = mountUsageData()
+    scopes.push(scope)
+    await api.loadData()
+
+    expect(api.range.value).toBe('all')
+    expect(api.rangeHiddenHint.value).toBe('')
+  })
+
   it('keeps the new range when a concurrent refresh supersedes the range-change load', async () => {
     const rangeLoad = deferred<UsageSnapshot>()
     const refreshLoad = deferred<UsageSnapshot>()

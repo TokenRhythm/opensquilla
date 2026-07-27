@@ -435,7 +435,8 @@
       "modelPlaceholder": "Enter a model id",
       "activating": "Activating…",
       "modelDiscoveryFailed": "Couldn't discover models. Enter a model id manually.",
-      "upgradeGatewayHint": "Update and restart the Gateway to use provider activation.",
+      "upgradeGatewayHint": "Update and restart the Gateway to use provider management.",
+      "profileSaveUnsupported": "This Gateway stores one active provider. After verification, Save changes replaces the current provider.",
       "connectedLatency": "Configuration verified · Complete probe {latency} ms",
       "connectionKeyRejected": "Key rejected",
       "connectionUnavailable": "Connection unavailable",
@@ -2426,9 +2427,13 @@
     "bundleReady": "Support bundle downloaded"
   },
   "usageLogs": {
+    "tasks": {
+      "unnamed": "Untitled task"
+    },
     "usage": {
       "title": "Usage",
-      "subtitle": "Tokens, cost, and per-model spend across every session.",
+      "subtitle": "Tokens, cost, and model usage across tasks.",
+      "actions": "Usage actions",
       "currency": "Currency",
       "usDollar": "US Dollar",
       "chineseYuan": "Chinese Yuan",
@@ -2440,9 +2445,9 @@
     "summary": {
       "totalTokens": "Total tokens",
       "totalCost": "Total cost",
-      "sessions": "Sessions",
+      "sessions": "Tasks",
       "acrossAllModels": "across all models",
-      "avgCostPerSession": "Avg cost / session",
+      "avgCostPerSession": "Avg cost / task",
       "runningAverage": "running average"
     },
     "tokenParts": {
@@ -2455,10 +2460,10 @@
     "nativeCostHintTitle": "The original provider bill is in CNY; USD uses the fixed normalization rate recorded on the receipt.",
     "nativeMixedCostHintTitle": "Mixed-currency or pending billing stays in canonical USD; original confirmed receipts are shown separately.",
     "nativeBillingSubtotals": "Original receipts: {amounts}",
-    "rangeHiddenHint": "{count} undated legacy sessions hidden",
+    "rangeHiddenHint": "{count} undated historical tasks hidden",
     "coverage": {
-      "approximate": "Older Gateway: date ranges use approximate session-lifetime totals.",
-      "partial": "Usage-ledger migration is still completing; all known usage is shown.",
+      "approximate": "Some historical usage is estimated from task totals.",
+      "partial": "All currently recorded usage is shown.",
       "timezoneFallback": "Timezone {requested} is invalid; dates are grouped in {effective}.",
       "legacyIncluded": "Pre-ledger usage is included in the total but cannot be assigned to a date.",
       "estimated": "Includes {count} estimated calls.",
@@ -2476,10 +2481,10 @@
       "input": "Input",
       "output": "Output",
       "emptyWindow": "No data in the selected window.",
-      "openSession": "Open {session}",
+      "openTask": "Open task “{task}”",
       "daily": "Daily usage",
-      "topByCost": "Top sessions by cost",
-      "topByTokens": "Top sessions by total tokens",
+      "topByCost": "Top tasks by cost",
+      "topByTokens": "Top tasks by total tokens",
       "showingOf": "showing {shown} of {total}"
     },
     "models": {
@@ -2494,19 +2499,19 @@
       "output": "Output",
       "cacheRead": "Cache R",
       "cacheWrite": "Cache W",
-      "sessions": "Sessions",
+      "sessions": "Tasks",
       "cost": "Cost"
     },
     "sessions": {
-      "title": "Sessions",
-      "count": "{count} sessions",
+      "title": "By task",
+      "count": "{count} tasks",
       "emptyTitle": "No usage data yet",
-      "emptyText": "Run a session and token spend will appear here automatically.",
-      "openChat": "Open chat for {session}",
+      "emptyText": "Run a task and its token usage will appear here automatically.",
+      "openChat": "Open task “{task}”",
       "autoModels": "auto · {count} models"
     },
     "columns": {
-      "session": "Session",
+      "session": "Task",
       "modified": "Modified",
       "input": "Input",
       "output": "Output",

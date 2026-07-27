@@ -1,5 +1,11 @@
 <template>
-  <div class="toast-host" aria-live="polite" data-testid="toast-host">
+  <TransitionGroup
+    name="toast-stack"
+    tag="div"
+    class="toast-host"
+    aria-live="polite"
+    data-testid="toast-host"
+  >
     <div
       v-for="toast in toasts"
       :key="toast.id"
@@ -17,7 +23,7 @@
         <Icon name="x" :size="14" />
       </button>
     </div>
-  </div>
+  </TransitionGroup>
 </template>
 
 <script setup lang="ts">
@@ -43,19 +49,31 @@ const { toasts, dismissToast } = useToasts()
 }
 
 .toast {
+  position: relative;
   display: flex;
   align-items: center;
   gap: var(--sp-2);
   max-width: 360px;
-  padding: var(--sp-2) var(--sp-3);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-md);
-  background: var(--bg-elevated);
+  padding: 11px 12px 11px 14px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--border-strong) 72%, transparent);
+  border-radius: var(--radius-card);
+  background: color-mix(in srgb, var(--bg-elevated) 92%, transparent);
   color: var(--text);
   font-size: var(--fs-sm);
-  box-shadow: var(--shadow-md);
+  box-shadow: var(--elev-3);
+  backdrop-filter: blur(18px) saturate(1.1);
+  -webkit-backdrop-filter: blur(18px) saturate(1.1);
   pointer-events: auto;
-  animation: toast-in var(--dur-fast) var(--ease-out);
+}
+
+.toast::before {
+  align-self: stretch;
+  width: 3px;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+  content: '';
+  flex: 0 0 auto;
 }
 
 .toast--ok {
@@ -63,14 +81,26 @@ const { toasts, dismissToast } = useToasts()
   background: color-mix(in srgb, var(--ok) 10%, var(--bg-elevated));
 }
 
+.toast--ok::before {
+  background: var(--ok);
+}
+
 .toast--warn {
   border-color: color-mix(in srgb, var(--warn) 45%, var(--border-strong));
   background: color-mix(in srgb, var(--warn) 10%, var(--bg-elevated));
 }
 
+.toast--warn::before {
+  background: var(--warn);
+}
+
 .toast--danger {
   border-color: color-mix(in srgb, var(--danger) 45%, var(--border-strong));
   background: color-mix(in srgb, var(--danger) 10%, var(--bg-elevated));
+}
+
+.toast--danger::before {
+  background: var(--danger);
 }
 
 .toast__message {
@@ -102,20 +132,39 @@ const { toasts, dismissToast } = useToasts()
   box-shadow: var(--focus-ring);
 }
 
-@keyframes toast-in {
-  from {
-    opacity: 0;
-    transform: translateY(4px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+.toast-stack-enter-active {
+  transition:
+    opacity var(--dur-base) var(--ease-out),
+    transform var(--dur-base) var(--ease-spring);
+}
+
+.toast-stack-leave-active {
+  position: absolute;
+  right: 0;
+  transition:
+    opacity var(--dur-fast) var(--ease-in),
+    transform var(--dur-fast) var(--ease-in);
+}
+
+.toast-stack-move {
+  transition: transform var(--dur-base) var(--ease-out);
+}
+
+.toast-stack-enter-from {
+  opacity: 0;
+  transform: translateY(8px) scale(0.97);
+}
+
+.toast-stack-leave-to {
+  opacity: 0;
+  transform: translateX(12px) scale(0.98);
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .toast {
-    animation: none;
+  .toast-stack-enter-active,
+  .toast-stack-leave-active,
+  .toast-stack-move {
+    transition: none;
   }
 }
 

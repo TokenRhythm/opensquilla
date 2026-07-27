@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick, reactive, ref, type App } from 'vue'
-import i18n from '@/i18n'
+import i18n, { loadLocaleMessages } from '@/i18n'
 import SettingsDialog from './SettingsDialog.vue'
 
 let catalogApi: Record<string, any>
@@ -140,11 +140,15 @@ describe('SettingsDialog save-all pending state', () => {
     const el = await mountDialog()
 
     const body = el.querySelector<HTMLElement>('.settings-body')
+    const main = el.querySelector<HTMLElement>('.settings-main')
+    const heading = el.querySelector<HTMLElement>('.settings-modal__head')
     const fieldset = el.querySelector<HTMLFieldSetElement>('.settings-panel__interactions')
     const close = el.querySelector<HTMLButtonElement>('.settings-modal__head button')
     const dirtyButtons = el.querySelectorAll<HTMLButtonElement>('.settings-dirtybar button')
 
     expect(body?.hasAttribute('inert')).toBe(true)
+    expect(heading?.parentElement).toBe(main)
+    expect(main?.firstElementChild).toBe(heading)
     expect(body?.getAttribute('aria-busy')).toBe('true')
     expect(fieldset?.disabled).toBe(true)
     expect(fieldset?.getAttribute('aria-busy')).toBe('true')
@@ -168,5 +172,21 @@ describe('SettingsDialog save-all pending state', () => {
     expect(Array.from(dirtyButtons).every(button => !button.disabled)).toBe(true)
     dirtyButtons[1]?.click()
     expect(controls.saveDirtySections).toHaveBeenCalledOnce()
+  })
+
+  it('localizes the dirty section name instead of exposing its internal English label', async () => {
+    const controls = mockCatalog()
+    controls.saveAllPending.value = false
+    catalogApi.dirtySections.value = [{ id: 'modelStrategy', label: 'Model Routing' }]
+    await loadLocaleMessages('zh-Hans')
+    i18n.global.locale.value = 'zh-Hans'
+
+    const el = await mountDialog()
+    const dirtyBar = el.querySelector('.settings-dirtybar')
+
+    expect(dirtyBar?.textContent).toContain('模型路由中有未保存的更改')
+    expect(dirtyBar?.textContent).toContain('放弃路由更改')
+    expect(dirtyBar?.textContent).toContain('保存路由更改')
+    expect(dirtyBar?.textContent).not.toContain('Model Routing')
   })
 })

@@ -222,6 +222,13 @@ function toggleSelectionMode() {
   if (!selectionMode.value) clearSelection()
 }
 
+useDocumentEvent('keydown', (event) => {
+  if (event.key !== 'Escape' || !selectionMode.value) return
+  event.preventDefault()
+  selectionMode.value = false
+  clearSelection()
+})
+
 async function requestBulkDelete() {
   closeMenu()
   const keys = [...selectedKeys.value].filter(key => visibleSelectableKeySet.value.has(key))
@@ -434,9 +441,10 @@ function onSelectRow(row: SidebarConversationItem) {
         {{ allVisibleSelected ? t('shared.sidebar.clearAllShort') : t('shared.sidebar.selectAllShort') }}
       </button>
       <button
-        v-if="selectionMode && selectedCount > 0"
+        v-if="selectionMode"
         type="button"
         class="sidebar-bulk-delete-btn"
+        :disabled="selectedCount === 0"
         :aria-label="t('shared.sidebar.deleteSelectedAria', { count: selectedCount })"
         :title="t('shared.sidebar.deleteSelectedAria', { count: selectedCount })"
         @click="requestBulkDelete"
@@ -444,16 +452,14 @@ function onSelectRow(row: SidebarConversationItem) {
         <Icon name="trash" :size="12" />
       </button>
       <button
-        v-if="totalRows > 0"
+        v-if="totalRows > 0 && !selectionMode"
         type="button"
         class="sidebar-bulk-mode-btn"
-        :class="{ 'is-active': selectionMode }"
-        :aria-pressed="selectionMode"
-        :aria-label="selectionMode ? t('shared.sidebar.exitSelectionMode') : t('shared.sidebar.enterSelectionMode')"
-        :title="selectionMode ? t('shared.sidebar.exitSelectionMode') : t('shared.sidebar.enterSelectionMode')"
+        :aria-label="t('shared.sidebar.enterSelectionMode')"
+        :title="t('shared.sidebar.enterSelectionMode')"
         @click="toggleSelectionMode"
       >
-        <Icon :name="selectionMode ? 'x' : 'listChecks'" :size="13" />
+        <Icon name="listChecks" :size="13" />
       </button>
     </div>
 
@@ -524,9 +530,11 @@ function onSelectRow(row: SidebarConversationItem) {
           <span class="sidebar-group__count">{{ section.rows.length }}</span>
         </button>
 
-        <div
+        <TransitionGroup
           v-show="visibleSections.length === 1 || !isCollapsed(section.family)"
           :id="`sidebar-group-${section.family}`"
+          name="sidebar-row"
+          tag="div"
           class="sidebar-group__body"
         >
           <div
@@ -663,7 +671,7 @@ function onSelectRow(row: SidebarConversationItem) {
               {{ agentInitial(row.agentName) }}
             </button>
           </div>
-        </div>
+        </TransitionGroup>
       </div>
     </div>
   </div>

@@ -9,21 +9,6 @@
       aria-modal="true"
       aria-labelledby="settings-modal-title"
     >
-      <header class="settings-modal__head">
-        <h2 id="settings-modal-title" class="settings-modal__title">{{ t('settings.dialog.title') }}</h2>
-        <button
-          ref="closeBtn"
-          type="button"
-          class="btn btn--icon btn--ghost"
-          :disabled="saveAllPending"
-          :aria-label="t('common.close')"
-          :title="t('common.close')"
-          @click="requestClose()"
-        >
-          <Icon name="x" :size="16" />
-        </button>
-      </header>
-
       <div
         class="settings-body"
         :inert="saveAllPending ? true : undefined"
@@ -59,6 +44,22 @@
             </button>
           </template>
         </nav>
+
+        <div class="settings-main">
+          <header class="settings-modal__head">
+            <h2 id="settings-modal-title" class="settings-modal__title">{{ t('settings.dialog.title') }}</h2>
+            <button
+              ref="closeBtn"
+              type="button"
+              class="btn btn--icon btn--ghost settings-modal__close"
+              :disabled="saveAllPending"
+              :aria-label="t('common.close')"
+              :title="t('common.close')"
+              @click="requestClose()"
+            >
+              <Icon name="x" :size="16" />
+            </button>
+          </header>
 
         <div
           :id="'settings-section-' + section"
@@ -129,6 +130,7 @@
               v-else-if="section === 'modelStrategy'"
               :panel="modelStrategyPanel"
               @update-strategy="setModelStrategy"
+              @update-fixed-provider="setFixedProvider"
               @update-fixed-model="setFixedModel"
               @update-router-default-tier="setRouterDefaultTier"
               @update-router-visual-mode="setRouterVisualMode"
@@ -167,6 +169,7 @@
             />
           </template>
           </fieldset>
+        </div>
         </div>
       </div>
 
@@ -273,6 +276,7 @@ const {
   setAutoSessionTitles,
   setDisableNetworkObservability,
   setModelStrategy,
+  setFixedProvider,
   setFixedModel,
   setRouterDefaultTier,
   setRouterVisualMode,
@@ -348,7 +352,9 @@ const isMobile = ref(window.matchMedia('(max-width: 768px)').matches)
 let userNavigated = false
 
 const railOrientation = computed(() => (isMobile.value ? 'horizontal' : 'vertical'))
-const dirtySectionNames = computed(() => dirtySections.value.map(s => s.label).join(' · '))
+const dirtySectionNames = computed(() => (
+  dirtySections.value.map(s => t(`settings.rail.${s.id}`)).join(' · ')
+))
 const dirtyProviderLabel = computed(() => (
   providerPanel.value.credentialPanel?.providerLabel
   || providerPanel.value.providerSelected
@@ -737,11 +743,10 @@ onUnmounted(() => {
 
 .settings-modal__head {
   align-items: center;
-  border-bottom: 1px solid var(--border);
   display: flex;
   flex-shrink: 0;
   gap: var(--sp-3);
-  padding: var(--sp-3) var(--sp-4);
+  padding: var(--sp-4) var(--sp-4) 0;
 }
 
 .settings-modal__title {
@@ -749,6 +754,15 @@ onUnmounted(() => {
   font-size: var(--fs-lg);
   font-weight: 700;
   margin: 0;
+}
+
+.settings-modal__close {
+  border: 0;
+  box-shadow: none;
+}
+
+.settings-modal__close:focus-visible {
+  box-shadow: 0 0 0 1px var(--border-strong);
 }
 
 .settings-loading {
@@ -764,6 +778,15 @@ onUnmounted(() => {
   flex: 1;
   min-height: 0;
   overflow: hidden;
+}
+
+.settings-main {
+  background: var(--bg-surface);
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
 }
 
 .settings-rail {
@@ -958,6 +981,10 @@ onUnmounted(() => {
 
   .settings-body {
     flex-direction: column;
+  }
+
+  .settings-main {
+    width: 100%;
   }
 
   .settings-rail {

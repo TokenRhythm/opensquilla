@@ -159,7 +159,12 @@ pre {
   color: var(--bg);
   border-color: var(--danger);
 }
-.btn--danger:not(:disabled):hover { opacity: 0.9; }
+.btn--danger:not(:disabled):hover {
+  background: var(--danger-fill);
+  border-color: var(--danger-fill);
+  color: var(--bg);
+  opacity: 1;
+}
 
 .btn--ghost {
   background: transparent;
@@ -715,52 +720,67 @@ pre {
 }
 
 .sidebar-bulk-delete-btn {
-  width: 22px;
-  height: 22px;
+  width: 28px;
+  height: 28px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   padding: 0;
-  border: 1px solid color-mix(in srgb, var(--danger) 26%, var(--sidebar-border));
+  border: 0;
   border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--danger) 7%, transparent);
+  background: transparent;
   color: var(--danger);
-  font-size: 0.6875rem;
-  font-weight: 700;
   cursor: pointer;
-  transition: background var(--dur-fast), border-color var(--dur-fast), color var(--dur-fast);
+  transition: background var(--dur-fast), color var(--dur-fast), opacity var(--dur-fast);
 }
 
-.sidebar-bulk-delete-btn:hover {
-  border-color: color-mix(in srgb, var(--danger) 62%, var(--sidebar-border));
+.sidebar-bulk-delete-btn:not(:disabled):hover {
   background: color-mix(in srgb, var(--danger) 12%, transparent);
 }
 
+.sidebar-bulk-delete-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger) 38%, transparent);
+}
+
+.sidebar-bulk-delete-btn:disabled {
+  background: transparent;
+  color: var(--sidebar-text-soft);
+  cursor: default;
+  opacity: 0.45;
+}
+
 .sidebar-select-all-btn {
-  min-width: 34px;
-  height: 22px;
+  min-width: 0;
+  height: 28px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  padding: 0 7px;
-  border: 1px solid var(--sidebar-border);
+  padding: 0 5px;
+  border: 0;
   border-radius: var(--radius-sm);
-  background: var(--sidebar-control-bg);
-  color: var(--sidebar-text);
+  background: transparent;
+  color: var(--sidebar-text-soft);
   font-family: var(--font-sans);
-  font-size: 0.6875rem;
-  font-weight: 700;
+  font-size: var(--fs-xs);
+  font-weight: 500;
   line-height: 1;
   cursor: pointer;
-  transition: background var(--dur-fast), border-color var(--dur-fast), color var(--dur-fast);
+  transition: background var(--dur-fast), color var(--dur-fast);
 }
 
 .sidebar-select-all-btn:hover {
-  background: var(--sidebar-control-hover);
+  background: var(--sidebar-item-hover);
   color: var(--sidebar-text-strong);
 }
 
+.sidebar-select-all-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 38%, transparent);
+}
+
 .sidebar-select-all-btn:disabled {
+  background: transparent;
   cursor: default;
   opacity: 0.45;
 }
@@ -791,12 +811,6 @@ pre {
 
 .sidebar-bulk-mode-btn:focus-visible {
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 42%, transparent);
-}
-
-.sidebar-bulk-mode-btn.is-active {
-  border-color: var(--sidebar-border);
-  background: var(--sidebar-control-bg);
-  color: var(--sidebar-text-strong);
 }
 
 .sidebar-history-list {

@@ -435,7 +435,8 @@
       "modelPlaceholder": "Introduce un ID de modelo",
       "activating": "Activando…",
       "modelDiscoveryFailed": "No se pudieron descubrir modelos. Introduce un ID manualmente.",
-      "upgradeGatewayHint": "Actualiza y reinicia la puerta de enlace para activar proveedores.",
+      "upgradeGatewayHint": "Actualiza y reinicia la puerta de enlace para gestionar proveedores.",
+      "profileSaveUnsupported": "Esta puerta de enlace guarda un proveedor activo. Después de verificarlo, «Guardar cambios» sustituye al proveedor actual.",
       "connectedLatency": "Configuración verificada · Prueba completa {latency} ms",
       "connectionKeyRejected": "Clave rechazada",
       "connectionUnavailable": "Conexión no disponible",
@@ -2426,9 +2427,13 @@
     "bundleReady": "Paquete de soporte descargado"
   },
   "usageLogs": {
+    "tasks": {
+      "unnamed": "Tarea sin título"
+    },
     "usage": {
       "title": "Uso",
-      "subtitle": "Tokens, coste y gasto por modelo en todas las sesiones.",
+      "subtitle": "Tokens, coste y uso de modelos por tarea.",
+      "actions": "Acciones de uso",
       "currency": "Moneda",
       "usDollar": "Dólar estadounidense",
       "chineseYuan": "Yuan chino",
@@ -2440,9 +2445,9 @@
     "summary": {
       "totalTokens": "Total de tokens",
       "totalCost": "Coste total",
-      "sessions": "Sesiones",
+      "sessions": "Tareas",
       "acrossAllModels": "en todos los modelos",
-      "avgCostPerSession": "Coste medio / sesión",
+      "avgCostPerSession": "Coste medio / tarea",
       "runningAverage": "media móvil"
     },
     "tokenParts": {
@@ -2455,10 +2460,10 @@
     "nativeCostHintTitle": "La factura original del proveedor está en CNY; el valor USD usa la tasa fija registrada en el recibo.",
     "nativeMixedCostHintTitle": "La facturación en monedas mixtas o pendiente permanece en USD canónicos; los recibos originales confirmados se muestran por separado.",
     "nativeBillingSubtotals": "Recibos originales: {amounts}",
-    "rangeHiddenHint": "{count} sesiones heredadas sin fecha ocultas",
+    "rangeHiddenHint": "{count} tareas históricas sin fecha ocultas",
     "coverage": {
-      "approximate": "Gateway antiguo: los rangos de fechas son aproximaciones de totales por sesión.",
-      "partial": "La migración del libro de uso sigue en curso; se muestra todo el uso conocido.",
+      "approximate": "Parte del uso histórico se estima a partir de los totales por tarea.",
+      "partial": "Se muestra todo el uso registrado actualmente.",
       "timezoneFallback": "La zona horaria {requested} no es válida; las fechas se agrupan según {effective}.",
       "legacyIncluded": "El uso anterior al libro se incluye en el total, pero no puede asignarse a una fecha.",
       "estimated": "Incluye {count} llamadas estimadas.",
@@ -2476,10 +2481,10 @@
       "input": "Entrada",
       "output": "Salida",
       "emptyWindow": "No hay datos en la ventana seleccionada.",
-      "openSession": "Abrir {session}",
+      "openTask": "Abrir la tarea «{task}»",
       "daily": "Uso diario",
-      "topByCost": "Sesiones principales por coste",
-      "topByTokens": "Sesiones principales por total de tokens",
+      "topByCost": "Tareas principales por coste",
+      "topByTokens": "Tareas principales por total de tokens",
       "showingOf": "mostrando {shown} de {total}"
     },
     "models": {
@@ -2494,19 +2499,19 @@
       "output": "Salida",
       "cacheRead": "Lectura de caché",
       "cacheWrite": "Escritura de caché",
-      "sessions": "Sesiones",
+      "sessions": "Tareas",
       "cost": "Coste"
     },
     "sessions": {
-      "title": "Sesiones",
-      "count": "{count} sesiones",
+      "title": "Por tarea",
+      "count": "{count} tareas",
       "emptyTitle": "Aún no hay datos de uso",
-      "emptyText": "Ejecuta una sesión y el gasto de tokens aparecerá aquí automáticamente.",
-      "openChat": "Abrir chat de {session}",
+      "emptyText": "Ejecuta una tarea y su uso de tokens aparecerá aquí automáticamente.",
+      "openChat": "Abrir la tarea «{task}»",
       "autoModels": "auto · {count} modelos"
     },
     "columns": {
-      "session": "Sesión",
+      "session": "Tarea",
       "modified": "Modificado",
       "input": "Entrada",
       "output": "Salida",

@@ -435,7 +435,8 @@
       "modelPlaceholder": "モデル ID を入力",
       "activating": "切り替え中…",
       "modelDiscoveryFailed": "モデルを検出できませんでした。モデル ID を手動で入力してください。",
-      "upgradeGatewayHint": "プロバイダーを有効化するにはゲートウェイを更新して再起動してください。",
+      "upgradeGatewayHint": "プロバイダー管理を使用するにはゲートウェイを更新して再起動してください。",
+      "profileSaveUnsupported": "このゲートウェイは有効なプロバイダーを1つ保存します。検証後に「変更を保存」を押すと、現在のプロバイダーが置き換わります。",
       "connectedLatency": "構成を検証済み · 完全な検証 {latency} ms",
       "connectionKeyRejected": "キーが拒否されました",
       "connectionUnavailable": "接続できません",
@@ -2426,9 +2427,13 @@
     "bundleReady": "サポートバンドルをダウンロードしました"
   },
   "usageLogs": {
+    "tasks": {
+      "unnamed": "名称未設定のタスク"
+    },
     "usage": {
       "title": "使用量",
-      "subtitle": "すべてのセッションにわたるトークン、コスト、モデルごとの支出です。",
+      "subtitle": "タスクごとのトークン、コスト、モデル使用量です。",
+      "actions": "使用量の操作",
       "currency": "通貨",
       "usDollar": "米ドル",
       "chineseYuan": "中国元",
@@ -2440,9 +2445,9 @@
     "summary": {
       "totalTokens": "合計トークン数",
       "totalCost": "合計コスト",
-      "sessions": "セッション",
+      "sessions": "タスク",
       "acrossAllModels": "すべてのモデル全体",
-      "avgCostPerSession": "セッションあたりの平均コスト",
+      "avgCostPerSession": "タスクあたりの平均コスト",
       "runningAverage": "移動平均"
     },
     "tokenParts": {
@@ -2455,10 +2460,10 @@
     "nativeCostHintTitle": "プロバイダーの原請求は CNY です。USD は領収書に記録された固定換算レートを使用します。",
     "nativeMixedCostHintTitle": "複数通貨または精算待ちの請求は標準 USD で集計し、確認済みの原通貨領収情報を別に表示します。",
     "nativeBillingSubtotals": "原通貨の領収情報: {amounts}",
-    "rangeHiddenHint": "日付なしのレガシーセッション {count} 件を非表示",
+    "rangeHiddenHint": "日付のない過去のタスク {count} 件を非表示",
     "coverage": {
-      "approximate": "旧 Gateway では、日付範囲をセッション累計から概算します。",
-      "partial": "利用量台帳を移行中です。既知の利用量はすべて表示しています。",
+      "approximate": "一部の過去の使用量はタスク合計から推定しています。",
+      "partial": "現在記録されている使用量をすべて表示しています。",
       "timezoneFallback": "タイムゾーン {requested} は無効です。日付は {effective} で集計されています。",
       "legacyIncluded": "台帳開始前の利用量は合計に含まれますが、日付には割り当てられません。",
       "estimated": "{count} 件の推定呼び出しを含みます。",
@@ -2476,10 +2481,10 @@
       "input": "入力",
       "output": "出力",
       "emptyWindow": "選択した期間にデータはありません。",
-      "openSession": "{session} を開く",
+      "openTask": "タスク「{task}」を開く",
       "daily": "日別利用量",
-      "topByCost": "コスト上位のセッション",
-      "topByTokens": "合計トークン数上位のセッション",
+      "topByCost": "コスト上位のタスク",
+      "topByTokens": "合計トークン数上位のタスク",
       "showingOf": "{total} 件中 {shown} 件を表示"
     },
     "models": {
@@ -2494,19 +2499,19 @@
       "output": "出力",
       "cacheRead": "キャッシュ読み取り",
       "cacheWrite": "キャッシュ書き込み",
-      "sessions": "セッション",
+      "sessions": "タスク",
       "cost": "コスト"
     },
     "sessions": {
-      "title": "セッション",
-      "count": "{count} セッション",
+      "title": "タスク別",
+      "count": "{count} タスク",
       "emptyTitle": "使用量データはまだありません",
-      "emptyText": "セッションを実行すると、トークンの支出がここに自動的に表示されます。",
-      "openChat": "{session} のチャットを開く",
+      "emptyText": "タスクを実行すると、トークン使用量がここに自動的に表示されます。",
+      "openChat": "タスク「{task}」を開く",
       "autoModels": "自動 · {count} モデル"
     },
     "columns": {
-      "session": "セッション",
+      "session": "タスク",
       "modified": "更新日時",
       "input": "入力",
       "output": "出力",

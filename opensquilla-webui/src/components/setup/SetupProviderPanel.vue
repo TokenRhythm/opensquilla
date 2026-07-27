@@ -74,6 +74,7 @@ interface ProviderPanelContract {
   editingPrimary: boolean
   selectedStoredProfile: boolean
   editingNew: boolean
+  profileSaveSupported: boolean
   routingEnabled: boolean
   routerEnabled: boolean
   routerBinding: 'follow_primary' | 'custom' | 'legacy'
@@ -212,7 +213,7 @@ function closeAddPicker(restoreFocus = true) {
 }
 
 function cancelAndClose(restoreFocus = true) {
-  if (!addOpen.value && panelIsStoredProvider.value) {
+  if (!addOpen.value) {
     emit('cancelProviderEdit')
   }
   closeAddPicker(restoreFocus)
@@ -223,9 +224,7 @@ function toggleAddPicker() {
     closeAddPicker()
     return
   }
-  dialogInvoker.value = document.activeElement instanceof HTMLElement
-    ? document.activeElement
-    : addButtonRef.value
+  dialogInvoker.value = addButtonRef.value
   addOpen.value = true
   editorOpen.value = true
 }
@@ -284,6 +283,9 @@ const selectedConfiguredProvider = computed(() => props.panel.configuredProvider
 const panelIsStoredProvider = computed(() => (
   Boolean(selectedConfiguredProvider.value)
 ))
+const replacesCurrentProvider = computed(() => (
+  !props.panel.editingPrimary && !props.panel.profileSaveSupported
+))
 
 const modelUsageModeKey = computed(() => {
   if (props.panel.ensembleEnabled) return 'setup.provider.modelUsageEnsemble'
@@ -335,9 +337,10 @@ watch(() => props.panel.providerSelected, (value, previous) => {
   if (selectedFromPicker) editorOpen.value = true
   void nextTick(() => {
     const credentialInput = selectedFromPicker
-      ? sectionRef.value?.querySelector<HTMLInputElement>('input[name="setup_provider_api_key"]:not([disabled])')
+      ? editorDialogRef.value?.querySelector<HTMLInputElement>('input[name="setup_provider_api_key"]:not([disabled])')
       : null
-    const target = credentialInput ?? editorHeadingRef.value
+    const target = credentialInput
+      ?? editorDialogRef.value?.querySelector<HTMLElement>('button, input, [tabindex]:not([tabindex="-1"])')
     target?.scrollIntoView({ block: 'nearest' })
     target?.focus({ preventScroll: true })
   })
@@ -769,6 +772,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
             {{ t('common.edit') }}
           </button>
           <button
+            v-if="panel.profileSaveSupported"
             type="button"
             class="btn btn--ghost setup-provider-card__action setup-provider-card__delete"
             :aria-label="`${t('setup.provider.removeConfirmPrimary')} — ${provider.label}`"
@@ -1073,8 +1077,16 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
                 @select="chooseAddProvider"
               />
 
+              <div
+                v-if="!addOpen && panel.providerSelected && replacesCurrentProvider"
+                class="setup-warning setup-provider-modal__compat-warning"
+                role="status"
+              >
+                {{ t('setup.provider.profileSaveUnsupported') }}
+              </div>
+
               <fieldset
-                v-else-if="panel.providerSelected"
+                v-if="!addOpen && panel.providerSelected"
                 class="setup-provider-modal__form"
                 :disabled="providerBusy || saving"
               >
@@ -1121,7 +1133,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 
             <footer v-if="!addOpen && panel.providerSelected" class="setup-provider-modal__footer">
               <button
-                v-if="panelIsStoredProvider && selectedConfiguredProvider"
+                v-if="panel.profileSaveSupported && panelIsStoredProvider && selectedConfiguredProvider"
                 type="button"
                 class="btn btn--ghost setup-provider-modal__delete"
                 :disabled="providerBusy || saving"
@@ -1138,10 +1150,12 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
                 @click="cancelAndClose()"
               >{{ t('common.cancel') }}</button>
               <button
-                v-if="panelIsStoredProvider"
                 type="button"
                 class="btn btn--primary"
-                :disabled="providerBusy || saving || !dirty"
+                :disabled="providerBusy || saving || !dirty || (replacesCurrentProvider && panel.connection.phase !== 'verified')"
+                :title="replacesCurrentProvider && panel.connection.phase !== 'verified'
+                  ? t('setup.provider.currentSettingsNotTested')
+                  : undefined"
                 :aria-busy="saving ? 'true' : undefined"
                 @click="emit('saveProvider')"
               >
@@ -1719,6 +1733,10 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
   min-height: 0;
   overflow-y: auto;
   padding: var(--sp-5);
+}
+
+.setup-provider-modal__compat-warning {
+  margin: 0;
 }
 
 .setup-provider-modal__footer {

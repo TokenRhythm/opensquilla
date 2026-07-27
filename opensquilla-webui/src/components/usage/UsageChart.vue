@@ -48,7 +48,8 @@
         class="usage-bar-row"
         :class="{ 'is-static': !row.sessionKey }"
         :type="row.sessionKey ? 'button' : undefined"
-        :title="row.sessionKey ? t('usageLogs.chart.openSession', { session: row.sessionKey }) : row.label"
+        :title="row.sessionKey ? t('usageLogs.chart.openTask', { task: row.label }) : row.label"
+        :aria-label="row.sessionKey ? t('usageLogs.chart.openTask', { task: row.label }) : undefined"
         :style="`--i:${i}`"
         @click="row.sessionKey && emit('openSession', row.sessionKey)"
       >

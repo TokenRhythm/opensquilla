@@ -5,6 +5,12 @@ import i18n from '@/i18n'
 import OverviewHubView from './OverviewHubView.vue'
 import SkillsChannelsHubView from './SkillsChannelsHubView.vue'
 
+const routerState = vi.hoisted(() => ({ path: '/overview' }))
+
+vi.mock('vue-router', () => ({
+  useRoute: () => routerState,
+}))
+
 vi.mock('@/components/RouteHubShell.vue', async () => {
   const { defineComponent, h } = await import('vue')
   return {
@@ -46,6 +52,7 @@ const apps: Array<ReturnType<typeof createApp>> = []
 afterEach(() => {
   apps.splice(0).forEach(app => app.unmount())
   document.body.innerHTML = ''
+  routerState.path = '/overview'
 })
 
 function mount(component: typeof OverviewHubView) {
@@ -68,6 +75,13 @@ describe('route hub views', () => {
     expect(probe?.getAttribute('data-aria-label-key')).toBe('nav.viewUsage')
     expect(probe?.getAttribute('data-mobile-equal')).toBe('false')
     expect(host.querySelector('[data-testid="support-diagnostics"]')).not.toBeNull()
+  })
+
+  it('hides diagnostics on the Usage tab', () => {
+    routerState.path = '/usage'
+    const host = mount(OverviewHubView)
+
+    expect(host.querySelector('[data-testid="support-diagnostics"]')).toBeNull()
   })
 
   it('configures the two-tab Skills and Channels hub without monitor actions', () => {

@@ -40,7 +40,13 @@ async function mount(overrides: Record<string, unknown> = {}) {
 // The mic button carries the recordVoice aria-label when ready and the
 // "unavailable" hint when gated — resolve both from i18n so the test never
 // hard-codes English copy.
-function micButton(el: HTMLElement): HTMLButtonElement | null {
+async function micButton(el: HTMLElement): Promise<HTMLButtonElement | null> {
+  const more = el.querySelector<HTMLButtonElement>(
+    `button[aria-label="${i18n.global.t('chrome.more')}"]`,
+  )
+  expect(more).toBeTruthy()
+  more?.click()
+  await nextTick()
   const ready = i18n.global.t('chat.recordVoice')
   const gated = i18n.global.t('chat.voiceUnavailableHint')
   return (
@@ -73,7 +79,7 @@ describe('ChatComposer voice-input gate', () => {
     const onVoiceInput = vi.fn()
     const onVoiceSetup = vi.fn()
     const { app, el } = await mount({ voiceReady: true, onVoiceInput, onVoiceSetup })
-    const btn = micButton(el)
+    const btn = await micButton(el)
     expect(btn).toBeTruthy()
     expect(btn?.disabled).toBe(false)
     expect(btn?.getAttribute('aria-label')).toBe(i18n.global.t('chat.recordVoice'))
@@ -88,7 +94,7 @@ describe('ChatComposer voice-input gate', () => {
     const onVoiceInput = vi.fn()
     const onVoiceSetup = vi.fn()
     const { app, el } = await mount({ voiceReady: false, onVoiceInput, onVoiceSetup })
-    const btn = micButton(el)
+    const btn = await micButton(el)
     expect(btn).toBeTruthy()
     // Not hard-disabled — the user can click it to be guided to configuration.
     expect(btn?.disabled).toBe(false)
@@ -104,7 +110,7 @@ describe('ChatComposer voice-input gate', () => {
 
   it('disables the mic button while a transcription is in flight', async () => {
     const { app, el } = await mount({ voiceReady: true, voiceBusy: true })
-    expect(micButton(el)?.disabled).toBe(true)
+    expect((await micButton(el))?.disabled).toBe(true)
     app.unmount()
   })
 })

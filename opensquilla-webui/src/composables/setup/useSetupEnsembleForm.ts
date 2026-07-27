@@ -754,20 +754,20 @@ export function useSetupEnsembleForm() {
     }
   }
 
-  // Default activation when the ensemble strategy is switched on: providers
-  // with an official preset land on it; every other provider gets an explicit
-  // custom lineup seeded from the router tiers (the models the user already
-  // configured), never the hidden legacy dynamic mode.
+  // Default activation when the ensemble strategy is switched on: every
+  // provider lands on the single editable custom path. Providers with a
+  // curated static profile use that profile only as the initial seed; other
+  // providers seed from the router tiers the user already configured.
   function activateForProvider(provider: unknown, tierCandidates: readonly EnsembleTierCandidate[] = []) {
     const presetMode = staticB5ModeForProvider(provider)
-    if (presetMode) {
-      selectionMode.value = presetMode
+    selectionMode.value = CUSTOM_B5_SELECTION_MODE
+    if (candidates.value.some(candidate => candidate.enabled !== false)) return
+    const profile = presetMode ? STATIC_B5_PROFILES[presetMode] : null
+    if (profile) {
+      candidates.value = customSeedFromProfile(profile)
       return
     }
-    selectionMode.value = CUSTOM_B5_SELECTION_MODE
-    if (!candidates.value.some(candidate => candidate.enabled !== false)) {
-      importTierCandidates(tierCandidates)
-    }
+    importTierCandidates(tierCandidates)
   }
 
   // One-click migration off the hidden legacy router_dynamic mode: fold the

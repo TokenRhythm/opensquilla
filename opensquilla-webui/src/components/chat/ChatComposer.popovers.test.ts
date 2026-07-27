@@ -45,6 +45,12 @@ async function clickButton(el: HTMLElement, label: string) {
   await nextTick()
 }
 
+async function clickMoreAction(el: HTMLElement, label: string) {
+  await clickButton(el, 'More')
+  expectPopover(el, '.chat-more-actions-menu', true)
+  await clickButton(el, label)
+}
+
 function expectPopover(el: HTMLElement, selector: string, visible: boolean) {
   expect(Boolean(el.querySelector(selector))).toBe(visible)
 }
@@ -55,6 +61,18 @@ beforeEach(() => {
 })
 
 describe('ChatComposer popovers', () => {
+  it('closes the more-actions menu on outside pointerdown', async () => {
+    const { app, el } = await mountComposer()
+
+    await clickButton(el, 'More')
+    expectPopover(el, '.chat-more-actions-menu', true)
+    pointerDown(document.body)
+    await nextTick()
+    expectPopover(el, '.chat-more-actions-menu', false)
+
+    app.unmount()
+  })
+
   it.each([
     ['Composer settings', '.composer-settings'],
     ['Model routing', '.composer-model-routing'],
@@ -62,7 +80,11 @@ describe('ChatComposer popovers', () => {
   ])('closes %s on outside pointerdown', async (label, selector) => {
     const { app, el } = await mountComposer()
 
-    await clickButton(el, label)
+    if (label === 'Composer settings') {
+      await clickMoreAction(el, label)
+    } else {
+      await clickButton(el, label)
+    }
     expectPopover(el, selector, true)
     pointerDown(document.body)
     await nextTick()
@@ -74,7 +96,7 @@ describe('ChatComposer popovers', () => {
   it('keeps the active popover open when clicking inside it', async () => {
     const { app, el } = await mountComposer()
 
-    await clickButton(el, 'Composer settings')
+    await clickMoreAction(el, 'Composer settings')
     const popover = el.querySelector<HTMLElement>('.composer-settings')
     expect(popover).toBeTruthy()
     if (popover) pointerDown(popover)
@@ -87,7 +109,7 @@ describe('ChatComposer popovers', () => {
   it('keeps only one composer popover open at a time', async () => {
     const { app, el } = await mountComposer()
 
-    await clickButton(el, 'Composer settings')
+    await clickMoreAction(el, 'Composer settings')
     expectPopover(el, '.composer-settings', true)
     await clickButton(el, 'Model routing')
     expectPopover(el, '.composer-settings', false)
@@ -95,6 +117,43 @@ describe('ChatComposer popovers', () => {
     await clickButton(el, 'Execution mode')
     expectPopover(el, '.composer-model-routing', false)
     expectPopover(el, '.composer-run-mode', true)
+
+    app.unmount()
+  })
+
+  it('exports from the more-actions menu and closes the menu', async () => {
+    let exports = 0
+    const el = document.createElement('div')
+    document.body.appendChild(el)
+    const app = createApp(ChatComposer, {
+      modelValue: '',
+      'onUpdate:modelValue': () => {},
+      attachments: [],
+      busySendMode: 'queue',
+      hasSendContent: false,
+      isStreaming: false,
+      isNewLanding: false,
+      placeholder: 'Send a message',
+      sendButtonTitle: 'Send',
+      runMode: 'trusted',
+      allowedRunModes: ['standard', 'trusted', 'full'],
+      modelRoutingMode: 'off',
+      modelRoutingSettingsBusy: false,
+      routerVisualEffectsEnabled: true,
+      codingModeEnabled: false,
+      codingModeSettingsBusy: false,
+      voiceBusy: false,
+      voiceRecording: false,
+      voiceReady: true,
+      onExportMarkdown: () => { exports += 1 },
+    })
+    app.use(i18n)
+    app.mount(el)
+    await nextTick()
+
+    await clickMoreAction(el, 'Export as Markdown')
+    expect(exports).toBe(1)
+    expectPopover(el, '.chat-more-actions-menu', false)
 
     app.unmount()
   })

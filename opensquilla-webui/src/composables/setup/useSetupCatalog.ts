@@ -1312,6 +1312,10 @@ const providerFormPanel = providerForm.createPanel({
   configuredProviderProbes,
   activation: providerActivation,
 })
+const profileSaveSupported = computed(() => (
+  typeof rpc.supportsMethod !== 'function'
+  || rpc.supportsMethod('onboarding.llmProfile.upsert')
+))
 const providerPanel = computed(() => {
   const panel = providerFormPanel.value
   return {
@@ -1323,10 +1327,15 @@ const providerPanel = computed(() => {
       editingPrimaryProvider.value
       && hasConfiguredPrimaryProvider.value
       && field.name === 'model'
-        ? modelStrategyForm.fixedModel.value
+        ? (
+            normalizeProviderId(modelStrategyForm.fixedProvider.value) === normalizeProviderId(currentProvider.value)
+              ? modelStrategyForm.fixedModel.value
+              : currentModel.value
+          )
         : panel.providerFieldValue(field)
     ),
     credentialRemovalPending: providerCredentialRemovalPending.value,
+    profileSaveSupported: profileSaveSupported.value,
   }
 })
 
@@ -1475,7 +1484,9 @@ const ensemblePanel = ensembleForm.createPanel({
 
 const emptyFixedModelCatalog: DiscoveredModelCatalog = { models: [], source: 'none' }
 const fixedModelCatalog = computed<DiscoveredModelCatalog>(() => {
-  const provider = normalizeProviderId(currentProvider.value)
+  const provider = normalizeProviderId(
+    modelStrategyForm.fixedProvider.value || currentProvider.value,
+  )
   if (!provider) return emptyFixedModelCatalog
   if (provider === normalizeProviderId(providerForm.selectedProvider.value)) {
     return {
@@ -1749,6 +1760,7 @@ const privacySectionDirty = computed(() => privacyDirty.value)
 const modelStrategyDirty = computed(() => (
   routerForm.isDirty.value
   || ensembleForm.isDirty.value
+  || modelStrategyForm.fixedProviderDirty.value
   || (modelStrategyForm.fixedModelDirty.value && !providerOwnsFixedModelDraft.value)
 ))
 const capabilitiesDirty = computed(() => (
@@ -1761,7 +1773,7 @@ const capabilitiesDirty = computed(() => (
 
 function sectionDirty(sectionId: string): boolean {
   // Provider drafts are intentionally absent from the global settings dirty
-  // state. They are persisted only by a successful connection verification.
+  // state. Their editor owns an explicit Save changes action.
   if (sectionId === 'provider') return false
   if (sectionId === 'behavior') return behaviorDirty.value
   if (sectionId === 'privacy') return privacySectionDirty.value
@@ -1795,7 +1807,10 @@ async function saveDirtySections() {
 
     // A configured primary provider and Model Routing share llm.model. Validate
     // the canonical draft before any earlier section performs a remote write.
-    if (modelStrategyForm.fixedModelDirty.value && !modelStrategyForm.fixedModel.value.trim()) {
+    if (
+      (modelStrategyForm.fixedProviderDirty.value || modelStrategyForm.fixedModelDirty.value)
+      && !modelStrategyForm.fixedModel.value.trim()
+    ) {
       pushToast(t('setup.toast.chooseFixedModel'), { tone: 'danger' })
       return
     }
@@ -2128,7 +2143,11 @@ function onProviderChange() {
 // config → spec default), trimmed. Drives the per-model context-window override.
 function currentFormModelValue(): string {
   if (editingPrimaryProvider.value && hasConfiguredPrimaryProvider.value) {
-    return modelStrategyForm.fixedModel.value.trim()
+    return (
+      normalizeProviderId(modelStrategyForm.fixedProvider.value) === normalizeProviderId(currentProvider.value)
+        ? modelStrategyForm.fixedModel.value
+        : currentModel.value
+    ).trim()
   }
   const modelField = providerFields.value.find(f => f.name === 'model') || { name: 'model', label: 'model' }
   return String(providerForm.fieldValue(modelField, providerEditorConfig.value) || '').trim()
@@ -2139,9 +2158,27 @@ function setFixedModel(value: string) {
   updateFixedModel(value)
 }
 
+function setFixedProvider(value: string) {
+  const provider = normalizeProviderId(value)
+  if (!provider || !configuredProviderIds.value.has(provider)) return
+  if (provider === modelStrategyForm.fixedProvider.value) return
+  providerOwnsFixedModelDraft.value = false
+  modelStrategyForm.setFixedProvider(provider)
+  modelStrategyForm.setFixedModel(
+    provider === normalizeProviderId(currentProvider.value)
+      ? String(currentModel.value || representativeProviderModel(provider))
+      : representativeProviderModel(provider),
+  )
+  void discoverTierProviderModels(provider)
+}
+
 function updateFixedModel(value: string) {
   modelStrategyForm.setFixedModel(value)
   if (!editingPrimaryProvider.value || !hasConfiguredPrimaryProvider.value) return
+  if (
+    normalizeProviderId(modelStrategyForm.fixedProvider.value)
+    !== normalizeProviderId(currentProvider.value)
+  ) return
   const model = String(value ?? '').trim()
   promotedForm.reseedContextWindow(config.value, providerForm.selectedProvider.value, model)
   // The configured-primary editor and Model Routing share this canonical
@@ -2153,6 +2190,7 @@ function updateProviderField(name: string, value: unknown) {
   if (providerInteractionLocked()) return
   if (name === 'model' && editingPrimaryProvider.value && hasConfiguredPrimaryProvider.value) {
     providerOwnsFixedModelDraft.value = true
+    modelStrategyForm.setFixedProvider(currentProvider.value)
     updateFixedModel(String(value ?? ''))
     return
   }
@@ -2248,15 +2286,9 @@ async function probeProviderConnection() {
       : undefined,
     draftProfile: selectedStoredProfile.value,
   })
-  // A verdict is bound to the exact current draft; useSetupProviderForm
-  // invalidates it if any credential, endpoint, or model changes while the
-  // request is in flight. Only a still-verified draft may be persisted.
-  const selectedProviderId = normalizeProviderId(providerForm.selectedProvider.value)
-  if (
-    providerForm.connection.value.phase !== 'verified'
-    || configuredProviderIds.value.has(selectedProviderId)
-  ) return
-  await saveProvider({ includeProviderModelDraft: providerOwnsFixedModelDraft.value })
+  // Verification is deliberately non-mutating. The editor keeps the verified
+  // draft visible so the user can review the discovered model and then commit
+  // it with the explicit Save changes action.
 }
 
 async function removeProviderProfile(providerId: string) {
@@ -2638,16 +2670,39 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
     pushToast(t('setup.toast.chooseProvider'), { tone: 'danger' })
     return false
   }
+  const replacesPrimaryOnLegacyGateway = (
+    !editingPrimaryProvider.value
+    && Boolean(currentProvider.value)
+    && !profileSaveSupported.value
+  )
+  if (
+    replacesPrimaryOnLegacyGateway
+    && providerForm.connection.value.phase !== 'verified'
+  ) {
+    pushToast(t('setup.provider.currentSettingsNotTested'), { tone: 'danger' })
+    return false
+  }
+  const fixedProviderDraft = modelStrategyForm.fixedProvider.value
   const fixedModelDraft = modelStrategyForm.fixedModel.value
-  const preserveFixedModelDraft = modelStrategyForm.fixedModelDirty.value
+  const preserveFixedModelDraft = (
+    modelStrategyForm.fixedProviderDirty.value
+    || modelStrategyForm.fixedModelDirty.value
+  )
   const reloadProviderData = async () => {
     await loadData()
-    if (preserveFixedModelDraft) setFixedModel(fixedModelDraft)
+    if (preserveFixedModelDraft) {
+      modelStrategyForm.setFixedProvider(fixedProviderDraft)
+      modelStrategyForm.setFixedModel(fixedModelDraft)
+    }
   }
   providerSavePending.value = true
   try {
     const selectedProviderId = normalizeProviderId(providerForm.selectedProvider.value)
-    if (!editingPrimaryProvider.value && currentProvider.value) {
+    if (
+      !editingPrimaryProvider.value
+      && currentProvider.value
+      && profileSaveSupported.value
+    ) {
       const payload = providerForm.payload()
       // Model is a persisted part of each profile. Preserve an explicit clear
       // so the backend can remove a custom override and fall back to the
@@ -2672,6 +2727,10 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
       }))
       return true
     }
+    // Older gateways expose only one active provider and do not implement
+    // llmProfile.upsert. On those versions, adding another provider is a
+    // replace-primary flow: the legacy configure RPC atomically swaps the
+    // provider, credential, endpoint, and default model after verification.
     const payload = providerConfigurePayload(options.includeProviderModelDraft === true)
     await rpc.call('onboarding.provider.configure', payload)
     const restart = await patchConfig(promotedForm.providerPatches())
@@ -2692,7 +2751,7 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
     pushToast(restart ? t('setup.toast.providerSavedRestart') : t('setup.toast.providerSaved'))
     return true
   } catch (err) {
-    pushToast(saveFailedMessage(err), { tone: 'danger' })
+    pushToast(providerRpcErrorMessage(err), { tone: 'danger' })
     return false
   } finally {
     providerSavePending.value = false
@@ -2779,9 +2838,10 @@ async function saveModelStrategy(options: SaveOptions & {
   const routerRoutingPayload = routerForm.routingDirty.value ? routerForm.payload() : null
   const routerVisualPatches = routerForm.visualModePatches()
   const fixedModelPatches = modelStrategyForm.fixedModelPatches()
+  const fixedProviderChanged = modelStrategyForm.fixedProviderDirty.value
   const ensemblePayload = ensembleForm.payload()
   const hasRouterWork = Boolean(routerRoutingPayload) || Object.keys(routerVisualPatches).length > 0
-  const hasFixedModelWork = Object.keys(fixedModelPatches).length > 0
+  const hasFixedModelWork = fixedProviderChanged || Object.keys(fixedModelPatches).length > 0
   const hasEnsembleWork = Object.keys(ensemblePayload).length > 0
   if (!hasRouterWork && !hasFixedModelWork && !hasEnsembleWork) return true
   if (hasFixedModelWork && !modelStrategyForm.fixedModel.value.trim()) {
@@ -2811,8 +2871,30 @@ async function saveModelStrategy(options: SaveOptions & {
     }
 
     if (hasFixedModelWork) {
-      const restart = await patchConfig(fixedModelPatches)
-      if (!hasRouterWork) {
+      let restart = false
+      if (fixedProviderChanged) {
+        const providerId = normalizeProviderId(modelStrategyForm.fixedProvider.value)
+        if (!providerId || !configuredProviderIds.value.has(providerId)) {
+          pushToast(t('setup.toast.chooseProvider'), { tone: 'danger' })
+          return false
+        }
+        const response = await rpc.call<{ restartRequired?: boolean }>(
+          'onboarding.llmProfile.activate',
+          {
+            providerId,
+            model: modelStrategyForm.fixedModel.value.trim(),
+          },
+        )
+        restart = response?.restartRequired === true
+        if (!hasRouterWork) {
+          pushToast(t('setup.toast.providerActivated', {
+            provider: providerCatalogLabel(providerId),
+          }))
+        }
+      } else {
+        restart = await patchConfig(fixedModelPatches)
+      }
+      if (!hasRouterWork && !fixedProviderChanged) {
         pushToast(restart ? t('setup.toast.routerSavedRestart') : t('setup.toast.routerSaved'))
       }
       savedAny = true
@@ -3015,6 +3097,7 @@ async function copyConfigPath() {
     setAutoSessionTitles,
     setDisableNetworkObservability,
     setModelStrategy: modelStrategyForm.setStrategy,
+    setFixedProvider,
     setFixedModel,
     setRouterMode,
     setRouterDefaultTier,
