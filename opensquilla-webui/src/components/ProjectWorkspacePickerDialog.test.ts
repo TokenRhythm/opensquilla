@@ -182,6 +182,27 @@ describe('ProjectWorkspacePickerDialog', () => {
     expect(button('Choose selected directory').disabled).toBe(false)
   })
 
+  it('renders directory actions as recognizable icon buttons', async () => {
+    mocks.rpcCall.mockResolvedValue(pathResult('/repos', []))
+
+    await mountPicker()
+    await flushPromises()
+
+    const parentAction = button('Parent directory')
+    const goAction = button('Go to path')
+    const createAction = button('New folder')
+    const chooseAction = button('Choose selected directory')
+
+    expect(parentAction.classList.contains('project-picker__action')).toBe(true)
+    expect(goAction.classList.contains('project-picker__action')).toBe(true)
+    expect(createAction.classList.contains('project-picker__action')).toBe(true)
+    expect(chooseAction.classList.contains('project-picker__choose')).toBe(true)
+    expect(parentAction.querySelector('svg')).toBeTruthy()
+    expect(goAction.querySelector('svg')).toBeTruthy()
+    expect(createAction.querySelector('svg')).toBeTruthy()
+    expect(chooseAction.querySelector('svg')).toBeTruthy()
+  })
+
   it('selects on click and browses only on double click', async () => {
     mocks.rpcCall
       .mockResolvedValueOnce(pathResult('/repos', ['/repos/a']))

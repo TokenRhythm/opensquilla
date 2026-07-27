@@ -54,7 +54,8 @@ describe('ChatComposer project draft', () => {
 
     const chooser = host.querySelector<HTMLButtonElement>('.chat-project-choose')
     expect(chooser?.innerHTML).toContain('M3 6.5')
-    expect(chooser?.querySelector('.chat-project-choose__icon')).toBeTruthy()
+    expect(chooser?.closest('.chat-input-footer')).toBeTruthy()
+    expect(chooser?.closest('.chat-input-panel')).toBeTruthy()
     chooser?.click()
     expect(chooseProject).toHaveBeenCalledOnce()
 
@@ -75,6 +76,7 @@ describe('ChatComposer project draft', () => {
 
     expect(host.querySelector('.chat-project-chip__name')?.textContent).toBe('Project A')
     expect(host.querySelector('.chat-project-chip__path')?.textContent).toBe('D:\\repos\\project-a')
+    expect(host.querySelector('.chat-project-chip')?.closest('.chat-input-panel')).toBeTruthy()
     host.querySelector<HTMLButtonElement>('.chat-project-chip button')?.click()
     expect(closeProject).toHaveBeenCalledOnce()
 

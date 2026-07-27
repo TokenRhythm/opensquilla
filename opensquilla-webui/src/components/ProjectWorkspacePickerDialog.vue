@@ -40,10 +40,12 @@
           <p class="project-picker__scope">{{ t('workspaces.webPickerScope') }}</p>
           <div class="project-picker__path">
             <button
-              class="btn btn--ghost"
+              type="button"
+              class="btn btn--ghost project-picker__action project-picker__parent"
               :disabled="!parentDirectory"
               @click="browse(parentDirectory || undefined)"
             >
+              <Icon name="arrowUp" :size="14" />
               {{ t('workspaces.parentDirectory') }}
             </button>
             <input
@@ -55,9 +57,11 @@
               @keydown.enter.prevent="browse(locationDraft)"
             />
             <button
-              class="btn btn--ghost"
+              type="button"
+              class="btn btn--ghost project-picker__action project-picker__go"
               @click="browse(locationDraft)"
             >
+              <Icon name="chevronRight" :size="14" />
               {{ t('workspaces.goToPath') }}
             </button>
           </div>
@@ -66,7 +70,7 @@
             <button
               v-if="!creatingDirectory"
               type="button"
-              class="btn btn--ghost project-picker__create-trigger"
+              class="btn btn--ghost project-picker__action project-picker__create-trigger"
               :disabled="webLoading"
               @click="beginCreateDirectory"
             >
@@ -131,10 +135,11 @@
               {{ t('common.cancel') }}
             </button>
             <button
-              class="btn btn--primary"
+              class="btn btn--primary project-picker__choose"
               :disabled="!canChoose"
               @click="choose"
             >
+              <Icon name="check" :size="15" />
               {{ t('workspaces.chooseSelectedDirectory') }}
             </button>
           </footer>
@@ -411,7 +416,6 @@ useDialogA11y(
   background: var(--bg-surface);
 }
 .project-picker__header,
-.project-picker__path,
 .project-picker__footer {
   display: flex;
   align-items: center;
@@ -419,7 +423,37 @@ useDialogA11y(
 }
 .project-picker__header h3 { flex: 1; margin: 0; }
 .project-picker__scope { margin: 0; color: var(--text-muted); font-size: var(--fs-sm); }
-.project-picker__path input { flex: 1; min-width: 0; }
+.project-picker__path {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--sp-2);
+}
+.project-picker__path input {
+  width: 100%;
+  min-width: 0;
+  min-height: 38px;
+}
+.project-picker__action.btn--ghost {
+  min-height: 38px;
+  padding: 7px 11px;
+  border-color: color-mix(in srgb, var(--border) 88%, transparent);
+  background: var(--bg-elevated);
+  color: var(--text);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent);
+}
+.project-picker__action.btn--ghost:not(:disabled):hover {
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--border));
+  background: var(--bg-hover);
+}
+.project-picker__action.btn--ghost:not(:disabled):active,
+.project-picker__choose.btn--primary:not(:disabled):active {
+  transform: scale(0.98);
+}
+.project-picker__action :deep(svg),
+.project-picker__choose :deep(svg) {
+  flex: 0 0 auto;
+}
 .project-picker__entries {
   min-height: 180px;
   overflow: auto;
@@ -436,6 +470,11 @@ useDialogA11y(
   gap: var(--sp-1);
   color: var(--accent);
   font-weight: 600;
+}
+.project-picker__create-trigger.btn--ghost {
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--border));
+  background: color-mix(in srgb, var(--accent) 7%, var(--bg-surface));
+  color: var(--accent);
 }
 .project-picker__create-form {
   width: 100%;
@@ -463,4 +502,19 @@ useDialogA11y(
 .project-picker__entry.is-selected { background: var(--bg-hover); }
 .project-picker__error { margin: 0; color: var(--danger); font-size: var(--fs-sm); }
 .project-picker__footer { justify-content: flex-end; }
+.project-picker__choose {
+  min-height: 38px;
+  padding-inline: var(--sp-4);
+  box-shadow: 0 3px 10px color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+@media (max-width: 560px) {
+  .project-picker__path {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .project-picker__parent {
+    grid-column: 1 / -1;
+    justify-self: start;
+  }
+}
 </style>
