@@ -87,7 +87,7 @@ def test_run_context_rejects_unhashable_mode_source() -> None:
     assert restored.run_mode_source is None
 
 
-def test_effective_legacy_project_full_becomes_implicit_project_standard() -> None:
+def test_effective_legacy_project_full_remains_full() -> None:
     from opensquilla.gateway.config import GatewayConfig
     from opensquilla.sandbox.run_context import RunContext, effective_project_run_mode
 
@@ -96,8 +96,8 @@ def test_effective_legacy_project_full_becomes_implicit_project_standard() -> No
         GatewayConfig(),
     )
 
-    assert resolved.run_mode is RunMode.STANDARD
-    assert resolved.run_mode_source == "project_default"
+    assert resolved.run_mode is RunMode.FULL
+    assert resolved.run_mode_source is None
 
 
 def test_effective_legacy_project_preserves_explicit_full() -> None:

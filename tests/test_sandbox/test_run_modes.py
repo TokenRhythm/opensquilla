@@ -178,14 +178,14 @@ def test_normalize_run_mode_accepts_user_facing_spellings() -> None:
     assert normalize_run_mode("full-host-access") == RunMode.FULL
 
 
-def test_bare_config_keeps_ordinary_full_but_project_is_standard() -> None:
+def test_bare_config_keeps_full_for_ordinary_and_project_execution() -> None:
     config = types.SimpleNamespace(
         sandbox=SandboxSettings(),
         permissions=PermissionsConfig(),
     )
 
     assert config_run_mode(config) is RunMode.FULL
-    assert project_default_run_mode(config) is RunMode.STANDARD
+    assert project_default_run_mode(config) is RunMode.FULL
     assert sandbox_runtime_capability_mode(config) is RunMode.STANDARD
 
 
@@ -245,7 +245,7 @@ def test_status_payload_distinguishes_default_policy_from_runtime_capability(
     ) == expected
 
 
-def test_bare_config_status_reports_full_ordinary_default_and_standard_capability() -> None:
+def test_bare_config_status_reports_full_project_default_and_standard_capability() -> None:
     config = types.SimpleNamespace(
         sandbox=SandboxSettings(),
         permissions=PermissionsConfig(),
@@ -255,6 +255,6 @@ def test_bare_config_status_reports_full_ordinary_default_and_standard_capabilit
 
     assert payload["run_mode"] == "full"
     assert payload["execution_target"] == "host"
-    assert payload["project_default_run_mode"] == "standard"
+    assert payload["project_default_run_mode"] == "full"
     assert payload["runtime_capability_run_mode"] == "standard"
     assert payload["runtime_sandbox_required"] is True

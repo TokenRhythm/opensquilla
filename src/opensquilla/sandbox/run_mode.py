@@ -151,10 +151,7 @@ def _full_mode_is_explicit(config: Any) -> bool:
 
 
 def project_default_run_mode(config: Any) -> RunMode:
-    configured = config_run_mode(config)
-    if configured is not RunMode.FULL or _full_mode_is_explicit(config):
-        return configured
-    return RunMode.STANDARD
+    return config_run_mode(config)
 
 
 def sandbox_runtime_capability_mode(config: Any) -> RunMode:
