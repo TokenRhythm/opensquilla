@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -115,6 +116,13 @@ def _access_rule(profile: str, action: str, root: Path) -> str:
     ]
     assert rules, f"missing {action} rule for {root}"
     return rules[0]
+
+
+def _directory_symlink(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
 
 
 def test_available_false_on_non_macos(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -281,9 +289,7 @@ def test_profile_default_write_does_not_reopen_exact_restricted_root(
 
     root_write = _access_rule(rendered, "file-write*", Path("/"))
     guards = '(require-not (literal "/")) (require-not (subpath "/"))'
-    assert root_write.startswith(
-        f'(allow file-write* (require-all (literal "/") {guards} '
-    )
+    assert root_write.startswith(f'(allow file-write* (require-all (literal "/") {guards} ')
     assert f'(require-all (subpath "/") {guards} ' in root_write
 
 
@@ -324,6 +330,184 @@ def test_profile_workspace_write_excludes_metadata_and_profile_carveouts(
     assert f'(require-not (subpath "{secret}"))' in workspace_write
     for name in (".git", ".agents", ".codex"):
         assert name.replace(".", "\\.") in workspace_write
+
+
+@pytest.mark.parametrize("access", (FileSystemAccess.READ, FileSystemAccess.DENY))
+def test_profile_expands_logical_and_canonical_carveout_variants(
+    access: FileSystemAccess,
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    target = workspace / "restricted-target"
+    logical = workspace / "restricted"
+    workspace.mkdir()
+    target.mkdir()
+    _directory_symlink(logical, target)
+    profile = FileSystemPermissionProfile(
+        entries=(
+            FileSystemPermissionEntry(workspace, FileSystemAccess.WRITE),
+            FileSystemPermissionEntry(
+                target,
+                access,
+                logical_path=logical,
+            ),
+        )
+    )
+    policy = replace(_policy(workspace), file_system=profile)
+
+    rendered = render_seatbelt_profile(_request(policy, workspace))
+
+    workspace_write = _access_rule(rendered, "file-write*", workspace)
+    for variant in (logical, target):
+        assert f'(require-not (literal "{variant}"))' in workspace_write
+        assert f'(require-not (subpath "{variant}"))' in workspace_write
+
+
+@pytest.mark.parametrize(
+    "restricted_access",
+    (FileSystemAccess.READ, FileSystemAccess.DENY),
+)
+def test_profile_exact_conflicting_alias_write_uses_restrictive_rule(
+    tmp_path: Path,
+    restricted_access: FileSystemAccess,
+) -> None:
+    target = tmp_path / "shared-target"
+    writable_alias = tmp_path / "writable-alias"
+    restricted_alias = tmp_path / "restricted-alias"
+    target.mkdir()
+    _directory_symlink(writable_alias, target)
+    _directory_symlink(restricted_alias, target)
+    profile = FileSystemPermissionProfile(
+        entries=(
+            FileSystemPermissionEntry(
+                target,
+                FileSystemAccess.WRITE,
+                logical_path=writable_alias,
+            ),
+            FileSystemPermissionEntry(
+                target,
+                restricted_access,
+                logical_path=restricted_alias,
+            ),
+        )
+    )
+    policy = replace(_policy(tmp_path), file_system=profile)
+
+    rendered = render_seatbelt_profile(_request(policy, tmp_path))
+
+    assert profile.resolve(target) is restricted_access
+    target_write = _access_rule(rendered, "file-write*", target)
+    assert f'(require-not (literal "{target}"))' in target_write
+    assert f'(require-not (subpath "{target}"))' in target_write
+
+
+@pytest.mark.parametrize("mutation", ("create", "retarget"))
+def test_profile_tracks_current_metadata_symlink_target_after_profile_freeze(
+    mutation: str,
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    original_target = workspace / "original-target"
+    current_target = workspace / "current-target"
+    metadata = workspace / ".git"
+    workspace.mkdir()
+    original_target.mkdir()
+    current_target.mkdir()
+    if mutation == "retarget":
+        _directory_symlink(metadata, original_target)
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        host_root_readonly=False,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+    )
+    if metadata.is_symlink():
+        metadata.unlink()
+    _directory_symlink(metadata, current_target)
+    policy = replace(_policy(workspace), file_system=profile)
+
+    rendered = render_seatbelt_profile(_request(policy, workspace))
+
+    workspace_write = _access_rule(rendered, "file-write*", workspace)
+    expected = (
+        (metadata, current_target)
+        if mutation == "create"
+        else (metadata, original_target, current_target)
+    )
+    for variant in expected:
+        assert f'(require-not (literal "{variant}"))' in workspace_write
+        assert f'(require-not (subpath "{variant}"))' in workspace_write
+    assert r"\.git" in workspace_write
+
+
+def test_profile_write_roots_do_not_follow_retargeted_alias(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    frozen_target = tmp_path / "frozen-target"
+    current_target = tmp_path / "current-target"
+    alias = tmp_path / "writable-alias"
+    workspace.mkdir()
+    frozen_target.mkdir()
+    current_target.mkdir()
+    _directory_symlink(alias, frozen_target)
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        writable_roots=(alias,),
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+        protect_metadata=False,
+    )
+    alias.unlink()
+    _directory_symlink(alias, current_target)
+    policy = replace(_policy(workspace), file_system=profile)
+
+    rendered = render_seatbelt_profile(_request(policy, workspace))
+
+    assert f'(literal "{frozen_target}")' in rendered
+    assert f'(literal "{current_target}")' not in rendered
+
+
+def test_profile_validates_logical_entry_path(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    profile = FileSystemPermissionProfile(
+        entries=(
+            FileSystemPermissionEntry(
+                workspace / "canonical",
+                FileSystemAccess.READ,
+                logical_path=workspace / "logical\x01path",
+            ),
+        )
+    )
+    policy = replace(_policy(workspace), file_system=profile)
+
+    with pytest.raises(SandboxBackendError, match="control character"):
+        render_seatbelt_profile(_request(policy, workspace))
+
+
+def test_profile_rejects_retargeted_writable_root(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    writable_root = tmp_path / "writable-root"
+    current_target = tmp_path / "current-target"
+    workspace.mkdir()
+    writable_root.mkdir()
+    current_target.mkdir()
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        writable_roots=(writable_root,),
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+    )
+    writable_root.rmdir()
+    _directory_symlink(writable_root, current_target)
+    policy = replace(_policy(workspace), file_system=profile)
+
+    with pytest.raises(
+        SandboxBackendError,
+        match="retargeted writable filesystem root",
+    ):
+        render_seatbelt_profile(_request(policy, workspace))
 
 
 def test_profile_more_specific_read_reopens_denied_parent(tmp_path: Path) -> None:
@@ -393,9 +577,7 @@ def test_profile_missing_readonly_path_blocks_creation_but_writable_child_reopen
     child_write = _access_rule(rendered, "file-write*", writable_child)
     assert f'(require-not (literal "{readonly}"))' in workspace_write
     assert f'(require-not (subpath "{readonly}"))' in workspace_write
-    assert child_write.startswith(
-        f'(allow file-write* (require-all (literal "{writable_child}") '
-    )
+    assert child_write.startswith(f'(allow file-write* (require-all (literal "{writable_child}") ')
     assert f'(require-all (subpath "{writable_child}")' in child_write
 
 
@@ -651,9 +833,7 @@ def test_profile_rejects_non_loopback_proxy_endpoint(tmp_path: Path) -> None:
 
 
 def test_profile_keeps_workspace_ro_when_policy_ro(tmp_path: Path) -> None:
-    profile = render_seatbelt_profile(
-        _request(_policy(tmp_path, workspace_rw=False), tmp_path)
-    )
+    profile = render_seatbelt_profile(_request(_policy(tmp_path, workspace_rw=False), tmp_path))
 
     assert _access_rule(profile, "file-read*", Path("/"))
     assert not any(
@@ -1212,6 +1392,81 @@ print("ok")
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "darwin", reason="native Seatbelt required")
+async def test_real_seatbelt_blocks_retargeted_metadata_symlink_mutations(
+    tmp_path: Path,
+) -> None:
+    backend = SeatbeltBackend()
+    if not backend.available():
+        pytest.skip("requires macOS sandbox-exec")
+    workspace = tmp_path / "workspace"
+    original_target = workspace / "original-target"
+    current_target = workspace / "current-target"
+    metadata = workspace / ".git"
+    replacement = workspace / "replacement"
+    ordinary = workspace / "ordinary.txt"
+    workspace.mkdir()
+    original_target.mkdir()
+    current_target.mkdir()
+    replacement.write_text("replacement", encoding="utf-8")
+    _directory_symlink(metadata, original_target)
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+    )
+    metadata.unlink()
+    _directory_symlink(metadata, current_target)
+    policy = replace(_policy(workspace), file_system=profile)
+    script = """
+import os
+import sys
+from pathlib import Path
+
+workspace, metadata, replacement = map(Path, sys.argv[1:])
+(workspace / "ordinary.txt").write_text("ok", encoding="utf-8")
+actions = (
+    lambda: (metadata / "config").write_text("blocked", encoding="utf-8"),
+    metadata.unlink,
+    lambda: metadata.rename(workspace / ".git-renamed"),
+    lambda: os.replace(replacement, metadata),
+)
+for action in actions:
+    try:
+        action()
+    except PermissionError:
+        pass
+    else:
+        raise SystemExit("Seatbelt unexpectedly allowed protected metadata mutation")
+print("ok")
+"""
+    request = SandboxRequest(
+        argv=(
+            sys.executable,
+            "-c",
+            script,
+            str(workspace),
+            str(metadata),
+            str(replacement),
+        ),
+        cwd=workspace,
+        action_kind="code.exec",
+        policy=policy,
+        env={"PATH": "/bin:/usr/bin"},
+    )
+
+    result = await backend.run(request)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "ok\n"
+    assert metadata.is_symlink()
+    assert metadata.resolve() == current_target
+    assert not (current_target / "config").exists()
+    assert replacement.read_text(encoding="utf-8") == "replacement"
+    assert ordinary.read_text(encoding="utf-8") == "ok"
+
+
+@pytest.mark.asyncio
 async def test_real_seatbelt_shell_can_write_slash_tmp_when_available(
     tmp_path: Path,
 ) -> None:
@@ -1436,8 +1691,7 @@ def test_classify_denial_unrelated_stderr_returns_empty() -> None:
 
 def test_classify_denial_deduplicates_same_path() -> None:
     stderr = (
-        "/etc/ssl/cert.pem: Operation not permitted\n"
-        "/etc/ssl/cert.pem: Operation not permitted\n"
+        "/etc/ssl/cert.pem: Operation not permitted\n/etc/ssl/cert.pem: Operation not permitted\n"
     )
     notes = _classify_denial(("python",), stderr)
     assert len(notes) == 1
@@ -1606,15 +1860,11 @@ async def test_run_operation_delegates_filesystem_to_seatbelt_worker(
         "opensquilla.sandbox.filesystem_worker",
         "-",
     )
-    assert request.stdin == json.dumps(
-        operation.to_payload(), ensure_ascii=False
-    ).encode("utf-8")
+    assert request.stdin == json.dumps(operation.to_payload(), ensure_ascii=False).encode("utf-8")
     assert request.policy.network == NetworkMode.NONE
     assert request.policy.tmp_writable is False
     assert request.policy.file_system is profile
-    assert {"HOME", "TMP", "TEMP", "TMPDIR"}.isdisjoint(
-        request.policy.env_allowlist
-    )
+    assert {"HOME", "TMP", "TEMP", "TMPDIR"}.isdisjoint(request.policy.env_allowlist)
     assert target not in {mount.host_path for mount in request.policy.mounts}
     runtime_roots = set(seatbelt_mod._runtime_readonly_roots())
     assert {
@@ -1829,9 +2079,7 @@ async def test_run_operation_does_not_touch_inserted_cache_symlink(
     request = captured["request"]
     assert isinstance(request, SandboxRequest)
     assert request.argv[-1] == "-"
-    assert request.stdin == json.dumps(
-        operation.to_payload(), ensure_ascii=False
-    ).encode("utf-8")
+    assert request.stdin == json.dumps(operation.to_payload(), ensure_ascii=False).encode("utf-8")
     assert getattr(captured["private_transport"], "write_roots") == ()
     assert cache_link.is_symlink()
     assert list(replacement.iterdir()) == []
@@ -2004,6 +2252,173 @@ def test_filesystem_operation_rejects_control_characters_in_targets_before_side_
     with pytest.raises(SandboxBackendError, match="control character"):
         seatbelt_mod._filesystem_operation_request(operation)
     assert not worker_root.exists()
+
+
+def test_filesystem_operation_preflights_logical_target_before_canonicalization(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    original_target = workspace / "original-target"
+    current_target = workspace / "current-target"
+    metadata = workspace / ".git"
+    workspace.mkdir()
+    original_target.mkdir()
+    current_target.mkdir()
+    _directory_symlink(metadata, original_target)
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        host_root_readonly=False,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+    )
+    metadata.unlink()
+    _directory_symlink(metadata, current_target)
+    logical_target = metadata / "config"
+    operation = SandboxOperation.filesystem(
+        kind="write_text",
+        workspace=workspace,
+        run_mode="trusted",
+        path=logical_target,
+        content="blocked",
+        file_system_profile=profile,
+    )
+    real_canonicalize = seatbelt_mod._canonical_filesystem_target
+
+    def reject_target_canonicalization(path: Path, *, kind: str) -> Path:
+        if kind == "filesystem target":
+            raise AssertionError("canonicalized before logical profile preflight")
+        return real_canonicalize(path, kind=kind)
+
+    monkeypatch.setattr(
+        seatbelt_mod,
+        "_canonical_filesystem_target",
+        reject_target_canonicalization,
+    )
+
+    with pytest.raises(
+        SandboxBackendError,
+        match=rf"requires write access.*{re.escape(str(logical_target))}",
+    ):
+        seatbelt_mod._filesystem_operation_request(operation)
+
+
+def test_filesystem_operation_relative_target_uses_workspace_for_logical_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    outside_cwd = tmp_path / "outside-cwd"
+    metadata_target = workspace / "metadata-target"
+    metadata = workspace / ".git"
+    workspace.mkdir()
+    outside_cwd.mkdir()
+    metadata_target.mkdir()
+    _directory_symlink(metadata, metadata_target)
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        host_root_readonly=False,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+    )
+    monkeypatch.chdir(outside_cwd)
+    operation = SandboxOperation.filesystem(
+        kind="write_text",
+        workspace=workspace,
+        run_mode="trusted",
+        path=Path(".git/config"),
+        content="blocked",
+        file_system_profile=profile,
+    )
+
+    with pytest.raises(
+        SandboxBackendError,
+        match=rf"requires write access.*{re.escape(str(metadata / 'config'))}",
+    ):
+        seatbelt_mod._filesystem_operation_request(operation)
+
+
+def test_apply_patch_preflights_each_logical_path_before_resolving_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.tools.builtin import patch as patch_tool
+
+    workspace = tmp_path / "workspace"
+    original_target = workspace / "original-target"
+    current_target = workspace / "current-target"
+    metadata = workspace / ".git"
+    workspace.mkdir()
+    original_target.mkdir()
+    current_target.mkdir()
+    _directory_symlink(metadata, original_target)
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        host_root_readonly=False,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+    )
+    metadata.unlink()
+    _directory_symlink(metadata, current_target)
+    patch = """*** Begin Patch
+*** Add File: ordinary.txt
++ordinary
+*** Add File: .git/config
++blocked
+*** End Patch"""
+    declared = (workspace / "ordinary.txt", current_target / "config")
+    operation = SandboxOperation.filesystem(
+        kind="apply_patch",
+        workspace=workspace,
+        run_mode="trusted",
+        paths=declared,
+        patch=patch,
+        root=workspace,
+        file_system_profile=profile,
+    )
+    real_validate_path = patch_tool._validate_path
+    validated: list[str] = []
+
+    def record_validate_path(path: str, root: Path) -> Path:
+        validated.append(path)
+        return real_validate_path(path, root)
+
+    monkeypatch.setattr(patch_tool, "_validate_path", record_validate_path)
+
+    with pytest.raises(
+        SandboxBackendError,
+        match=rf"requires write access.*{re.escape(str(metadata / 'config'))}",
+    ):
+        seatbelt_mod._filesystem_operation_request(operation)
+    assert validated == ["ordinary.txt"]
+
+
+def test_seatbelt_source_target_maps_execution_workspace_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "new.py"
+    operation = SandboxOperation.filesystem(
+        kind="create_source",
+        workspace=workspace,
+        run_mode="trusted",
+        path=target,
+        logical_path=Path("/workspace/new.py"),
+        paths=(target,),
+        content="value = 1\n",
+        file_system_profile=FileSystemPermissionProfile.workspace(workspace=workspace),
+    )
+    checked: list[tuple[Path, ...]] = []
+    monkeypatch.setattr(
+        seatbelt_mod,
+        "_validate_filesystem_operation_profile_targets",
+        lambda _operation, targets: checked.append(targets),
+    )
+
+    assert seatbelt_mod._filesystem_operation_targets(operation, operation.request) == (target,)
+    assert checked == [(target,)]
 
 
 @pytest.mark.asyncio

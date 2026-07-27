@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import re
 import stat
@@ -12,10 +13,12 @@ from pathlib import Path, PurePath
 from typing import Any
 
 from opensquilla.sandbox.directory_listing import format_directory_entry
+from opensquilla.sandbox.path_aliases import resolve_workspace_alias
 from opensquilla.sandbox.permissions import (
     FileSystemAccess,
     FileSystemPermissionEntry,
     FileSystemPermissionProfile,
+    logical_absolute_path,
 )
 
 
@@ -43,9 +46,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
 def _load_payload(source: str | Path) -> dict[str, Any]:
     raw_payload = (
-        sys.stdin.read()
-        if str(source) == "-"
-        else Path(source).read_text(encoding="utf-8")
+        sys.stdin.read() if str(source) == "-" else Path(source).read_text(encoding="utf-8")
     )
     try:
         payload = json.loads(raw_payload)
@@ -70,6 +71,10 @@ def _run(payload: dict[str, Any]) -> dict[str, object]:
         return _write_text(payload)
     if kind == "edit_text":
         return _edit_text(payload)
+    if kind == "create_source":
+        return _create_source(payload)
+    if kind == "edit_source":
+        return _edit_source(payload)
     if kind == "apply_patch":
         return _apply_patch(payload)
     raise ValueError(f"unsupported filesystem operation: {kind!r}")
@@ -96,6 +101,13 @@ def _required_paths(payload: dict[str, Any], key: str) -> tuple[Path, ...]:
     if not all(isinstance(value, str) and value for value in values):
         raise ValueError(f"filesystem operation {key} must contain paths")
     return tuple(Path(value).resolve(strict=False) for value in values)
+
+
+def _required_edits(payload: dict[str, Any]) -> list[dict[str, object]]:
+    edits = payload.get("edits")
+    if not isinstance(edits, list) or not all(isinstance(edit, dict) for edit in edits):
+        raise ValueError("filesystem operation edits must be an array of objects")
+    return edits
 
 
 def _optional_positive_int(payload: dict[str, Any], key: str) -> int | None:
@@ -142,10 +154,23 @@ def _filesystem_profile(payload: dict[str, Any]) -> FileSystemPermissionProfile 
         access = item.get("access")
         if not isinstance(path, str) or not isinstance(access, str):
             raise ValueError("filesystem worker profile entry is invalid")
+        raw_logical_path = item.get("logicalPath")
+        logical_path: Path | None = None
+        if raw_logical_path is not None:
+            if not isinstance(raw_logical_path, str) or not raw_logical_path:
+                raise ValueError(
+                    "filesystem worker profile logicalPath must be a non-empty absolute path"
+                )
+            logical_path = Path(raw_logical_path)
+            if not logical_path.is_absolute():
+                raise ValueError(
+                    "filesystem worker profile logicalPath must be a non-empty absolute path"
+                )
         entries.append(
             FileSystemPermissionEntry(
                 Path(path),
                 FileSystemAccess(access),
+                logical_path=logical_path,
             )
         )
     profile = FileSystemPermissionProfile(
@@ -204,6 +229,10 @@ def _enforce_candidate_access(
     token plus ACLs, bwrap, or Seatbelt).  This check mirrors that policy for
     useful errors and prunes workspace-strict session data before access.
     """
+    logical = Path(logical_absolute_path(candidate))
+    profile = _filesystem_profile(payload)
+    if profile is not None:
+        _enforce_profile_access(profile, logical, write=write)
     try:
         resolved = candidate.expanduser().resolve(strict=False)
         profile_candidate: PurePath = resolved
@@ -219,13 +248,8 @@ def _enforce_candidate_access(
         # lexical name so an unresolvable target cannot fail the whole list.
         resolved = lexical
         profile_candidate = PurePath(str(lexical))
-    profile = _filesystem_profile(payload)
     if profile is not None:
-        access = profile.resolve(profile_candidate)
-        if access is FileSystemAccess.DENY or (
-            write and access is not FileSystemAccess.WRITE
-        ):
-            raise PermissionError(f"filesystem profile denies access to {resolved}")
+        _enforce_profile_access(profile, profile_candidate, write=write)
     boundary = _filesystem_boundary(payload)
     if not boundary.get("workspaceStrict"):
         return resolved
@@ -278,6 +302,17 @@ def _enforce_candidate_access(
                     f"filesystem worker blocks another session's transcript: {resolved}"
                 )
     return resolved
+
+
+def _enforce_profile_access(
+    profile: FileSystemPermissionProfile,
+    candidate: PurePath,
+    *,
+    write: bool,
+) -> None:
+    access = profile.resolve(candidate)
+    if access is FileSystemAccess.DENY or (write and access is not FileSystemAccess.WRITE):
+        raise PermissionError(f"filesystem profile denies access to {candidate}")
 
 
 def _safe_descendants(
@@ -506,16 +541,121 @@ def _edit_text(payload: dict[str, Any]) -> dict[str, object]:
     }
 
 
+def _authorized_source_target(payload: dict[str, Any]) -> Path:
+    authorized = Path(logical_absolute_path(_required_path(payload, "path")))
+    raw_logical = Path(logical_absolute_path(_required_path(payload, "logicalPath")))
+    workspace = _required_path(payload, "workspace")
+    logical = resolve_workspace_alias(raw_logical, workspace) or raw_logical
+    current = _enforce_candidate_access(payload, logical, write=True)
+    authorized_current = _enforce_candidate_access(payload, authorized, write=True)
+    if current != authorized or authorized_current != authorized:
+        raise PermissionError(
+            f"authorized filesystem target changed before source write: {raw_logical}"
+        )
+    return authorized
+
+
+def _source_revision(data: bytes) -> str:
+    return f"file_{hashlib.sha256(data).hexdigest()[:16]}"
+
+
+def _source_fingerprint(data: bytes | None) -> dict[str, object]:
+    if data is None:
+        return {"exists": False, "size": 0, "sha256": None}
+    return {
+        "exists": True,
+        "size": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+
+
+def _create_source(payload: dict[str, Any]) -> dict[str, object]:
+    path = _authorized_source_target(payload)
+    content = _required_string(payload, "content")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("x", encoding="utf-8") as handle:
+        handle.write(content)
+    return {
+        "message": f"Created source file {path}",
+        "created": True,
+        "status": "created",
+        "afterRevision": _source_revision(content.encode("utf-8")),
+        "beforeFingerprint": _source_fingerprint(None),
+        "afterFingerprint": _source_fingerprint(content.encode("utf-8")),
+    }
+
+
+def _edit_source(payload: dict[str, Any]) -> dict[str, object]:
+    from opensquilla.tools.source_edit_contract import (
+        SourceEditContractError,
+        apply_line_edits,
+    )
+
+    path = _authorized_source_target(payload)
+    expected_revision = _required_string(payload, "expectedRevision")
+    edits = _required_edits(payload)
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+    if not path.is_file():
+        raise IsADirectoryError(f"Path is a directory: {path}")
+
+    with path.open("r+b") as handle:
+        original_bytes = handle.read()
+        try:
+            original = original_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"source file is not valid UTF-8: {path}") from exc
+        before_revision = _source_revision(original_bytes)
+        if before_revision != expected_revision:
+            return {
+                "message": "revision conflict",
+                "status": "revision_conflict",
+                "beforeRevision": before_revision,
+            }
+        try:
+            updated = apply_line_edits(original, edits)
+        except SourceEditContractError as exc:
+            return {
+                "message": str(exc),
+                "status": "contract_error",
+            }
+        updated_bytes = updated.encode("utf-8")
+        if updated_bytes != original_bytes:
+            handle.seek(0)
+            handle.write(updated_bytes)
+            handle.truncate()
+            handle.flush()
+        return {
+            "message": f"Edited source file {path}",
+            "created": False,
+            "status": "applied",
+            "original": original,
+            "updated": updated,
+            "beforeRevision": before_revision,
+            "afterRevision": _source_revision(updated_bytes),
+            "beforeFingerprint": _source_fingerprint(original_bytes),
+            "afterFingerprint": _source_fingerprint(updated_bytes),
+        }
+
+
 def _apply_patch(payload: dict[str, Any]) -> dict[str, object]:
     from opensquilla.tools.builtin import patch as patch_tool
 
     patch = _required_string(payload, "patch")
     root = _required_path(payload, "root")
+    ops = patch_tool._parse_patch(patch)
+    for op in ops:
+        raw_path = Path(op.path).expanduser()
+        logical_path = raw_path if raw_path.is_absolute() else root / raw_path
+        _enforce_candidate_access(
+            payload,
+            Path(logical_absolute_path(logical_path)),
+            write=True,
+        )
     authorized_paths = tuple(
         _enforce_candidate_access(payload, path, write=True)
         for path in _required_paths(payload, "paths")
     )
-    ops = patch_tool._parse_patch(patch)
     added, modified, deleted, _planned = patch_tool._apply_ops(
         ops,
         root,

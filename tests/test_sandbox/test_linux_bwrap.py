@@ -211,8 +211,7 @@ def test_compiled_workspace_profile_orders_read_baseline_write_and_protection(
     protected_bind_indices = [
         index
         for index in range(len(argv) - 2)
-        if argv[index : index + 3]
-        == ["--ro-bind", str(protected), str(protected)]
+        if argv[index : index + 3] == ["--ro-bind", str(protected), str(protected)]
     ]
 
     assert root_bind_index < workspace_bind_index < max(protected_bind_indices)
@@ -479,6 +478,45 @@ def test_bwrap_argv_rejects_symlinked_protected_metadata_paths(tmp_path: Path) -
         )
 
 
+def test_compiled_profile_fails_closed_for_symlinked_protected_metadata(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    target = tmp_path / "git-target"
+    workspace.mkdir()
+    target.mkdir()
+    protected = workspace / ".git"
+    protected.symlink_to(target, target_is_directory=True)
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+    )
+    policy = SandboxPolicy(
+        level=SecurityLevel.STANDARD,
+        network=NetworkMode.NONE,
+        mounts=(),
+        workspace_rw=False,
+        tmp_writable=False,
+        limits=ResourceLimits(wall_timeout_s=30),
+        env_allowlist=("PATH",),
+        require_approval=False,
+        file_system=profile,
+    )
+
+    permissions = compile_linux_permissions(policy)
+
+    assert protected in permissions.protected_subpaths
+    assert target in permissions.protected_subpaths
+    with pytest.raises(SandboxBackendError, match="cannot enforce sandbox read-only path"):
+        build_bwrap_plan(
+            command=["/bin/true"],
+            command_cwd=workspace,
+            permissions=permissions,
+            options=BwrapOptions(bwrap_path="bwrap", mount_proc=True),
+        )
+
+
 def test_bwrap_plan_leaves_missing_child_git_for_parent_repo_discovery(
     tmp_path: Path,
 ) -> None:
@@ -508,8 +546,7 @@ def test_bwrap_plan_leaves_missing_child_git_for_parent_repo_discovery(
 
     protected_target = str(protected)
     assert ["--perms", "555", "--tmpfs", protected_target] not in [
-        plan.argv[index : index + 4]
-        for index in range(len(plan.argv) - 3)
+        plan.argv[index : index + 4] for index in range(len(plan.argv) - 3)
     ]
     assert plan.protected_create_targets == (protected,)
 
@@ -571,9 +608,7 @@ def test_bwrap_argv_masks_denied_roots(tmp_path: Path) -> None:
     assert denied_target in argv
     denied_index = argv.index(denied_target)
     assert argv[denied_index - 1] == "--tmpfs"
-    assert ["--perms", "000", "--tmpfs", denied_target] == argv[
-        denied_index - 3 : denied_index + 1
-    ]
+    assert ["--perms", "000", "--tmpfs", denied_target] == argv[denied_index - 3 : denied_index + 1]
 
 
 def test_bwrap_plan_masks_missing_denied_root_with_empty_file_bind(
@@ -640,8 +675,7 @@ def test_bwrap_plan_expands_denied_globs_to_file_masks(tmp_path: Path) -> None:
     secret_target = str(secret)
     assert plan.preserved_files
     assert any(
-        window[0] == "--ro-bind"
-        and window[2] == secret_target
+        window[0] == "--ro-bind" and window[2] == secret_target
         for window in (plan.argv[index : index + 3] for index in range(len(plan.argv) - 2))
     )
 
@@ -717,8 +751,7 @@ def test_compiled_profile_reopens_read_grant_below_denied_parent(
     child_bind_indices = [
         index
         for index in range(len(argv) - 2)
-        if argv[index : index + 3]
-        == ["--ro-bind", str(readable_child), str(readable_child)]
+        if argv[index : index + 3] == ["--ro-bind", str(readable_child), str(readable_child)]
     ]
     grandchild_mask_indices = [
         index
@@ -789,8 +822,7 @@ def test_compiled_profile_reopens_read_carveout_inside_write_root(
     child_bind_index = max(
         index
         for index in range(len(argv) - 2)
-        if argv[index : index + 3]
-        == ["--ro-bind", str(readable_child), str(readable_child)]
+        if argv[index : index + 3] == ["--ro-bind", str(readable_child), str(readable_child)]
     )
     grandchild_mask_index = max(
         index
@@ -798,12 +830,7 @@ def test_compiled_profile_reopens_read_carveout_inside_write_root(
         if argv[index : index + 2] == ["--tmpfs", str(denied_grandchild)]
     )
 
-    assert (
-        workspace_bind_index
-        < parent_mask_index
-        < child_bind_index
-        < grandchild_mask_index
-    )
+    assert workspace_bind_index < parent_mask_index < child_bind_index < grandchild_mask_index
 
 
 def test_bwrap_argv_binds_symlinked_writable_root_real_target_and_remaps_denied_child(
@@ -844,6 +871,116 @@ def test_bwrap_argv_binds_symlinked_writable_root_real_target_and_remaps_denied_
     assert ["--perms", "000", "--tmpfs", str(blocked)] in [
         argv[index : index + 4] for index in range(len(argv) - 3)
     ]
+
+
+def test_bwrap_plan_does_not_follow_rw_mount_retargeted_after_compile(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    frozen_target = tmp_path / "frozen-target"
+    current_target = tmp_path / "current-target"
+    logical = tmp_path / "writable-alias"
+    workspace.mkdir()
+    frozen_target.mkdir()
+    current_target.mkdir()
+    logical.symlink_to(frozen_target, target_is_directory=True)
+    policy = build_policy(
+        SecurityLevel.STANDARD,
+        "shell.exec",
+        workspace,
+        SandboxSettings(
+            host_root_readonly=False,
+            network_default="none",
+            extra_rw_mounts=[str(logical)],
+            exclude_slash_tmp=True,
+            exclude_tmpdir_env_var=True,
+        ),
+    )
+    permissions = compile_linux_permissions(policy)
+    logical.unlink()
+    logical.symlink_to(current_target, target_is_directory=True)
+
+    plan = build_bwrap_plan(
+        command=["/bin/true"],
+        command_cwd=workspace,
+        permissions=permissions,
+        options=BwrapOptions(bwrap_path="bwrap", mount_proc=True),
+    )
+
+    bind_args = [
+        plan.argv[index : index + 3]
+        for index in range(len(plan.argv) - 2)
+        if plan.argv[index] == "--bind"
+    ]
+    assert ["--bind", str(frozen_target), str(logical)] in bind_args
+    assert str(current_target) not in plan.argv
+
+
+def test_bwrap_plan_rejects_frozen_write_root_retargeted_after_compile(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    frozen_root = tmp_path / "frozen-write-root"
+    current_target = tmp_path / "current-target"
+    workspace.mkdir()
+    frozen_root.mkdir()
+    current_target.mkdir()
+    policy = build_policy(
+        SecurityLevel.STANDARD,
+        "shell.exec",
+        workspace,
+        SandboxSettings(
+            host_root_readonly=False,
+            network_default="none",
+            extra_rw_mounts=[str(frozen_root)],
+            exclude_slash_tmp=True,
+            exclude_tmpdir_env_var=True,
+        ),
+    )
+    permissions = compile_linux_permissions(policy)
+    frozen_root.rmdir()
+    frozen_root.symlink_to(current_target, target_is_directory=True)
+
+    with pytest.raises(SandboxBackendError, match="retargeted writable filesystem root"):
+        build_bwrap_plan(
+            command=["/bin/true"],
+            command_cwd=workspace,
+            permissions=permissions,
+            options=BwrapOptions(bwrap_path="bwrap", mount_proc=True),
+        )
+
+
+def test_bwrap_plan_keeps_stable_frozen_write_root_usable(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    frozen_root = tmp_path / "frozen-write-root"
+    unrelated = tmp_path / "unrelated"
+    workspace.mkdir()
+    frozen_root.mkdir()
+    unrelated.mkdir()
+    policy = build_policy(
+        SecurityLevel.STANDARD,
+        "shell.exec",
+        workspace,
+        SandboxSettings(
+            host_root_readonly=False,
+            network_default="none",
+            extra_rw_mounts=[str(frozen_root)],
+            exclude_slash_tmp=True,
+            exclude_tmpdir_env_var=True,
+        ),
+    )
+
+    plan = build_bwrap_plan(
+        command=["/bin/true"],
+        command_cwd=workspace,
+        permissions=compile_linux_permissions(policy),
+        options=BwrapOptions(bwrap_path="bwrap", mount_proc=True),
+    )
+
+    assert ["--bind", str(frozen_root), str(frozen_root)] in [
+        plan.argv[index : index + 3] for index in range(len(plan.argv) - 2)
+    ]
+    assert str(unrelated) not in plan.argv
 
 
 def test_bwrap_argv_reopens_writable_directory_under_denied_parent(

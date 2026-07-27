@@ -20,6 +20,7 @@ from opensquilla.sandbox.operation_runtime import (
     SandboxOperation,
     SandboxToolDescriptor,
 )
+from opensquilla.sandbox.path_validation import logical_tool_path
 from opensquilla.tools.mutation_receipts import (
     fingerprint_path,
     record_semantic_mutation_receipt,
@@ -267,9 +268,7 @@ def _patch_file_read_roots(root: Path) -> list[Path]:
 def _read_patch_text_from_file(path: str, root: Path) -> str:
     raw = Path(path).expanduser()
     resolved = (
-        (root / raw).resolve(strict=False)
-        if not raw.is_absolute()
-        else raw.resolve(strict=False)
+        (root / raw).resolve(strict=False) if not raw.is_absolute() else raw.resolve(strict=False)
     )
     allowed_roots = _patch_file_read_roots(root)
     if not full_host_access_active() and not any(
@@ -417,9 +416,7 @@ def _workspace_write_note_summary(
     *,
     allow_outside_root: bool = False,
 ) -> str:
-    paths = [
-        _validate_path(op.path, root, allow_outside_root=allow_outside_root) for op in ops
-    ]
+    paths = [_validate_path(op.path, root, allow_outside_root=allow_outside_root) for op in ops]
     return summarize_workspace_write_notes(paths)
 
 
@@ -444,7 +441,7 @@ def _gate_patch_ops(
 
     elevated_full = full_host_access_active()
     workspace = filesystem._workspace_root()
-    boundary_targets: list[tuple[Path, PatchOp]] = []
+    boundary_targets: list[tuple[Path, PatchOp, str]] = []
 
     if elevated_full:
         for op in ops:
@@ -462,6 +459,7 @@ def _gate_patch_ops(
 
     for op in ops:
         resolved = _resolve_path(op.path, root)
+        logical = logical_tool_path(op.path, base=root)
         if not elevated_full and not filesystem._sandbox_path_access_enabled():
             sensitive = sensitive_path_marker(str(resolved), workspace=workspace)
             if sensitive is not None:
@@ -495,11 +493,12 @@ def _gate_patch_ops(
                 mounts=filesystem._active_sandbox_mounts(),
                 write=True,
                 profile=active_file_system_profile(workspace),
+                logical_path=logical,
             )
             if decision.status == "blocked":
                 return filesystem._path_access_blocked_envelope(decision), False
             if decision.status == "request":
-                boundary_targets.append((resolved, op))
+                boundary_targets.append((resolved, op, decision.reason))
             continue
 
         if filesystem._is_outside_workspace(resolved):
@@ -521,11 +520,15 @@ def _gate_patch_ops(
     if not boundary_targets:
         return None, False
     if sandbox_permissions == "use_default":
+        reasons = {reason for _path, _op, reason in boundary_targets}
+        reason = (
+            "protected_metadata" if reasons == {"protected_metadata"} else "outside_writable_roots"
+        )
         return (
             {
                 "status": "elevation_required",
-                "reason": "outside_writable_roots",
-                "paths": [str(path) for path, _op in boundary_targets],
+                "reason": reason,
+                "paths": [str(path) for path, _op, _reason in boundary_targets],
                 "message": (
                     "This patch writes outside the sandbox's writable roots. Retry "
                     "the exact patch only if the user's request warrants it, using "
@@ -1125,8 +1128,4 @@ async def apply_patch(
     if deleted:
         parts.append(f"{deleted} file(s) deleted")
     summary = ", ".join(parts) if parts else "no changes"
-    return (
-        f"Applied patch: {summary}"
-        f"{write_note_summary}"
-        f"{write_progress_note}"
-    )
+    return f"Applied patch: {summary}{write_note_summary}{write_progress_note}"

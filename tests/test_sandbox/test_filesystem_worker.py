@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from opensquilla.sandbox import directory_listing, filesystem_worker
+from opensquilla.sandbox.permissions import FileSystemAccess
 
 
 def _make_symlink(link: Path, target: Path) -> None:
@@ -64,13 +65,129 @@ def test_load_payload_retains_path_compatibility(tmp_path: Path) -> None:
     assert filesystem_worker._load_payload(payload_path) == expected
 
 
+def test_filesystem_profile_parses_optional_logical_path(tmp_path: Path) -> None:
+    target = tmp_path / "metadata-target"
+    logical = tmp_path / "workspace" / ".git"
+    payload = {
+        "permissions": {
+            "filesystem": {
+                "profile": {
+                    "entries": [
+                        {
+                            "path": str(target),
+                            "access": "read",
+                            "logicalPath": str(logical),
+                        }
+                    ],
+                    "deniedReadGlobs": [],
+                    "defaultAccess": "deny",
+                }
+            }
+        }
+    }
+
+    profile = filesystem_worker._filesystem_profile(payload)
+
+    assert profile is not None
+    assert profile.entries[0].path == target
+    assert profile.entries[0].logical_path == logical
+
+
+@pytest.mark.parametrize(
+    "entry",
+    (
+        {"path": "/metadata-target", "access": "read"},
+        {"path": "/metadata-target", "access": "read", "logicalPath": None},
+    ),
+)
+def test_filesystem_profile_accepts_legacy_missing_or_null_logical_path(
+    entry: dict[str, object],
+) -> None:
+    payload = {
+        "permissions": {
+            "filesystem": {
+                "profile": {
+                    "entries": [entry],
+                    "deniedReadGlobs": [],
+                    "defaultAccess": "deny",
+                }
+            }
+        }
+    }
+
+    profile = filesystem_worker._filesystem_profile(payload)
+
+    assert profile is not None
+    assert profile.entries[0].logical_path is None
+
+
+@pytest.mark.parametrize("logical_path", ("", "relative/.git", 17))
+def test_filesystem_profile_rejects_invalid_present_logical_path(
+    logical_path: object,
+) -> None:
+    payload = {
+        "permissions": {
+            "filesystem": {
+                "profile": {
+                    "entries": [
+                        {
+                            "path": "/metadata-target",
+                            "access": "read",
+                            "logicalPath": logical_path,
+                        }
+                    ],
+                    "deniedReadGlobs": [],
+                    "defaultAccess": "deny",
+                }
+            }
+        }
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="logicalPath must be a non-empty absolute path",
+    ):
+        filesystem_worker._filesystem_profile(payload)
+
+
+def test_enforce_candidate_access_checks_logical_before_canonical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    target = tmp_path / "target"
+    workspace.mkdir()
+    target.mkdir()
+    alias = workspace / "alias"
+    _make_symlink(alias, target)
+    logical = alias / "note.txt"
+    canonical = target / "note.txt"
+    canonical.write_text("before", encoding="utf-8")
+    checked: list[Path] = []
+
+    class _AllowingProfile:
+        def resolve(self, path: Path) -> FileSystemAccess:
+            checked.append(Path(path))
+            return FileSystemAccess.WRITE
+
+    profile = _AllowingProfile()
+    monkeypatch.setattr(filesystem_worker, "_filesystem_profile", lambda _payload: profile)
+
+    resolved = filesystem_worker._enforce_candidate_access(
+        {},
+        logical,
+        write=True,
+    )
+
+    assert resolved == canonical
+    assert checked == [logical, canonical]
+
+
 def test_list_dir_keeps_siblings_when_symlink_target_is_missing(tmp_path: Path) -> None:
     (tmp_path / "ok.txt").write_text("hello", encoding="utf-8")
     _make_symlink(tmp_path / "dangling", tmp_path / "missing-target")
 
-    result = filesystem_worker._list_dir(
-        {"path": str(tmp_path), "displayPath": str(tmp_path)}
-    )
+    result = filesystem_worker._list_dir({"path": str(tmp_path), "displayPath": str(tmp_path)})
 
     assert "[file] ok.txt (5 bytes)" in result["message"]
     assert "[link] dangling (broken symlink)" in result["message"]
@@ -109,9 +226,7 @@ def test_list_dir_keeps_siblings_when_symlink_target_loops(
     monkeypatch.setattr(Path, "lstat", selective_lstat)
     monkeypatch.setattr(Path, "stat", selective_stat)
 
-    result = filesystem_worker._list_dir(
-        {"path": str(tmp_path), "displayPath": str(tmp_path)}
-    )
+    result = filesystem_worker._list_dir({"path": str(tmp_path), "displayPath": str(tmp_path)})
 
     assert "[file] ok.txt (5 bytes)" in result["message"]
     assert "[link] loop (target metadata unavailable)" in result["message"]
@@ -136,9 +251,7 @@ def test_read_file_uses_verified_target_after_symlink_is_retargeted(
         verified_target,
     )
 
-    result = filesystem_worker._read_file(
-        {"path": str(link), "displayPath": str(link)}
-    )
+    result = filesystem_worker._read_file({"path": str(link), "displayPath": str(link)})
 
     assert "allowed" in result["message"]
     assert "secret" not in result["message"]
@@ -167,9 +280,7 @@ def test_glob_keeps_logical_link_name_when_verified_target_is_outside_base(
         verified_target,
     )
 
-    result = filesystem_worker._glob_search(
-        {"path": str(base), "pattern": "link.txt"}
-    )
+    result = filesystem_worker._glob_search({"path": str(base), "pattern": "link.txt"})
 
     assert result["message"] == str(logical)
 
@@ -473,6 +584,53 @@ def test_apply_patch_accepts_explicit_target_outside_patch_root(tmp_path: Path) 
     )
 
     assert result == {"message": "Applied patch: 1 file(s) modified", "created": False}
+    assert target.read_text(encoding="utf-8") == "after\n"
+
+
+def test_apply_patch_gates_original_logical_path_before_authorized_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    target_root = tmp_path / "target"
+    workspace.mkdir()
+    target_root.mkdir()
+    alias = workspace / "alias"
+    _make_symlink(alias, target_root)
+    target = target_root / "note.txt"
+    target.write_text("before\n", encoding="utf-8")
+    checked: list[Path] = []
+
+    def record_access(
+        _payload: dict[str, object],
+        candidate: Path,
+        **_kwargs: object,
+    ) -> Path:
+        checked.append(Path(candidate))
+        return Path(candidate).resolve(strict=False)
+
+    monkeypatch.setattr(
+        filesystem_worker,
+        "_enforce_candidate_access",
+        record_access,
+    )
+
+    result = filesystem_worker._run(
+        {
+            "kind": "apply_patch",
+            "root": str(workspace),
+            "paths": [str(target)],
+            "patch": """*** Begin Patch
+*** Update File: alias/note.txt
+@@ -1,1 +1,1 @@
+-before
++after
+*** End Patch""",
+        }
+    )
+
+    assert result == {"message": "Applied patch: 1 file(s) modified", "created": False}
+    assert checked == [alias / "note.txt", target]
     assert target.read_text(encoding="utf-8") == "after\n"
 
 

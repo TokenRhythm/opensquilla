@@ -39,6 +39,7 @@ from opensquilla.sandbox.operation_runtime import (
 from opensquilla.sandbox.path_validation import (
     MountDecision,
     decide_path_access,
+    logical_tool_path,
     trusted_write_auto_grant_allowed,
 )
 from opensquilla.sandbox.permissions import FileSystemAccess
@@ -343,7 +344,8 @@ def _resolve_path(path: str) -> Path:
     reject_foreign_host_path(str(path), platform=os.name, workspace=root)
     alias = resolve_workspace_alias(raw, root)
     if alias is not None:
-        return alias
+        assert isinstance(alias, Path)
+        return alias.resolve(strict=False)
     if root is not None and not raw.is_absolute():
         return (root / raw).resolve(strict=False)
     return raw.resolve(strict=False) if raw.is_absolute() else raw
@@ -735,11 +737,7 @@ async def _run_sandbox_operation_if_required(
             operation = replace(operation, file_system_profile=profile)
     runtime = get_runtime()
     ctx = current_tool_context.get()
-    if (
-        operation.domain == "filesystem"
-        and ctx is not None
-        and ctx.workspace_strict
-    ):
+    if operation.domain == "filesystem" and ctx is not None and ctx.workspace_strict:
         filesystem_permissions = dict(operation.permissions.filesystem)
         filesystem_permissions["workspaceStrict"] = True
         workspace = operation.workspace
@@ -747,9 +745,7 @@ async def _run_sandbox_operation_if_required(
             from opensquilla.attachment_workspace import _safe_path_segment
 
             attachment_base = (
-                workspace.expanduser().resolve(strict=False)
-                / ".opensquilla"
-                / "attachments"
+                workspace.expanduser().resolve(strict=False) / ".opensquilla" / "attachments"
             )
             attachment_segment = _safe_path_segment(
                 ctx.artifact_session_id,
@@ -758,17 +754,13 @@ async def _run_sandbox_operation_if_required(
             filesystem_permissions.update(
                 {
                     "attachmentBase": str(attachment_base),
-                    "attachmentSessionRoot": str(
-                        attachment_base / attachment_segment
-                    ),
+                    "attachmentSessionRoot": str(attachment_base / attachment_segment),
                 }
             )
         if ctx.artifact_media_root and ctx.artifact_session_id:
             from opensquilla.attachment_refs import transcript_material_dir
 
-            media_root = Path(ctx.artifact_media_root).expanduser().resolve(
-                strict=False
-            )
+            media_root = Path(ctx.artifact_media_root).expanduser().resolve(strict=False)
             filesystem_permissions.update(
                 {
                     "transcriptBase": str(media_root / "transcripts"),
@@ -793,6 +785,7 @@ async def _run_sandbox_operation_if_required(
         and ctx.is_owner
         and runtime is not None
         and isinstance(runtime.backend, UnavailableBackend)
+        and operation.kind not in {"create_source", "edit_source"}
     ):
         return None
     return await SandboxOperationRuntime(
@@ -1008,9 +1001,9 @@ def _cross_session_transcript_material_block(
         or not ctx.artifact_session_id
     ):
         return None
-    transcript_root = (
-        Path(ctx.artifact_media_root).expanduser() / "transcripts"
-    ).resolve(strict=False)
+    transcript_root = (Path(ctx.artifact_media_root).expanduser() / "transcripts").resolve(
+        strict=False
+    )
     try:
         candidate.relative_to(transcript_root)
     except ValueError:
@@ -1276,6 +1269,7 @@ async def _gate_out_of_workspace_write(
             mounts=_active_sandbox_mounts(),
             write=True,
             profile=active_file_system_profile(_workspace_root()),
+            logical_path=original_path,
         )
         if decision.status == "blocked":
             return _path_access_blocked_envelope(decision), False
@@ -1301,9 +1295,7 @@ async def _gate_out_of_workspace_write(
                     {
                         "status": "elevation_required",
                         "reason": "justification_required",
-                        "message": (
-                            "A precise justification is required for elevated execution."
-                        ),
+                        "message": ("A precise justification is required for elevated execution."),
                     },
                     False,
                 )
@@ -1889,9 +1881,7 @@ def _resolve_scratch_write_path(path: str) -> tuple[Path, str]:
     scratch = Path(ctx.scratch_dir).expanduser().resolve(strict=False)
     raw = Path(path).expanduser()
     resolved = (
-        raw.resolve(strict=False)
-        if raw.is_absolute()
-        else (scratch / raw).resolve(strict=False)
+        raw.resolve(strict=False) if raw.is_absolute() else (scratch / raw).resolve(strict=False)
     )
     try:
         relative_path = resolved.relative_to(scratch).as_posix()
@@ -1998,28 +1988,101 @@ async def create_source(path: str, content: str, approval_id: str | None = None)
     blocked = _sensitive_access_block("create_source", p, path)
     if blocked is not None:
         return json.dumps(blocked)
+    if not full_host_access_active():
+        profile = active_file_system_profile(_workspace_root())
+        decision = (
+            decide_path_access(
+                p,
+                workspace=_workspace_root(),
+                mounts=_active_sandbox_mounts(),
+                write=True,
+                profile=profile,
+                logical_path=path,
+            )
+            if profile is not None
+            else None
+        )
+        if decision is not None and decision.status != "allowed":
+            blocked_envelope = _path_access_blocked_envelope(decision)
+            blocked_envelope["message"] = (
+                "create_source cannot write a non-writable workspace carveout. "
+                "Use Full Host Access only when the user explicitly requests "
+                "that exact protected change."
+            )
+            return json.dumps(blocked_envelope)
     _gate_workspace_lockdown_write("create_source", p, path)
     workspace = _workspace_root()
     if workspace is None:
         raise ToolError("create_source requires an active workspace_dir.")
     if _is_outside_workspace(p):
-        raise WorkspaceAccessError(
-            f"create_source only writes inside the active workspace: {path}"
-        )
+        raise WorkspaceAccessError(f"create_source only writes inside the active workspace: {path}")
     if _is_under_configured_scratch_dir(p):
         raise ToolError("create_source refused a scratch path; use write_scratch instead.")
+    sandbox_result = await _run_sandbox_operation_if_required(
+        SandboxOperation.filesystem(
+            kind="create_source",
+            workspace=workspace,
+            run_mode=_active_filesystem_run_mode(),
+            path=p,
+            logical_path=Path(logical_tool_path(path, base=workspace)),
+            paths=(p,),
+            content=content,
+        )
+    )
+    if sandbox_result is not None:
+        metadata = getattr(sandbox_result, "metadata", {})
+        after_revision = metadata.get("afterRevision")
+        before_fingerprint = metadata.get("beforeFingerprint")
+        after_fingerprint = metadata.get("afterFingerprint")
+        if (
+            not isinstance(after_revision, str)
+            or not isinstance(before_fingerprint, dict)
+            or not isinstance(after_fingerprint, dict)
+        ):
+            raise ToolError("create_source worker returned an invalid revision receipt.")
+        display_path = _workspace_display_path(p, path)
+        receipt = record_semantic_mutation_receipt(
+            tool_name="create_source",
+            path=p,
+            operation="create_source",
+            before=before_fingerprint,
+            after=after_fingerprint,
+            partial=False,
+            metadata={
+                "after_revision": after_revision,
+                "created": True,
+                "contract": "source_create_v1",
+            },
+        )
+        workspace_epoch = receipt["workspace_epoch"] if receipt is not None else None
+        record_workspace_file_write(p, operation="create_source", created=True)
+        refresh_workspace_file_read_state(p, operation="create_source")
+        _notify_memory_source_write(p)
+        _notify_bootstrap_source_write(p)
+        return json.dumps(
+            {
+                "status": "created",
+                "path": display_path,
+                "changed": True,
+                "after_revision": after_revision,
+                "workspace_epoch": workspace_epoch,
+                "diff_summary": build_diff_summary("", content, path=display_path),
+            },
+            ensure_ascii=False,
+        )
+
     if p.exists():
         raise RetryableToolInputError(
             f"create_source refused because the file already exists: {path}. "
             "Use read_source/edit_source for existing files."
         )
-
     loop = asyncio.get_event_loop()
     before_fingerprint = fingerprint_path(p)
 
     def _write() -> None:
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding="utf-8")
+        with p.open("x", encoding="utf-8") as handle:
+            handle.write(content)
 
     await loop.run_in_executor(None, _write)
     after_fingerprint = fingerprint_path(p)
@@ -2124,11 +2187,7 @@ def _tool_visible_in_current_context(name: str) -> bool:
 
 
 def _existing_file_edit_alternatives() -> list[str]:
-    return [
-        name
-        for name in ("edit_file", "apply_patch")
-        if _tool_visible_in_current_context(name)
-    ]
+    return [name for name in ("edit_file", "apply_patch") if _tool_visible_in_current_context(name)]
 
 
 def _edit_file_retry_guidance(*, duplicate_match: bool = False) -> str:
@@ -2256,10 +2315,7 @@ async def edit_file(
 
     edit_digest = hashlib.sha256(
         json.dumps(
-            [
-                {"old_text": item.old_text, "new_text": item.new_text}
-                for item in replacements
-            ],
+            [{"old_text": item.old_text, "new_text": item.new_text} for item in replacements],
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -2446,7 +2502,7 @@ async def edit_source(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
-    approval, _elevated = await _gate_out_of_workspace_write(
+    approval, elevated = await _gate_out_of_workspace_write(
         "edit_source",
         p,
         path,
@@ -2458,6 +2514,88 @@ async def edit_source(
     )
     if approval is not None:
         return json.dumps(approval)
+    display_path = _workspace_display_path(p, path)
+    workspace = _filesystem_operation_workspace()
+    if workspace is not None:
+        sandbox_result = await _run_sandbox_operation_if_required(
+            SandboxOperation.filesystem(
+                kind="edit_source",
+                workspace=workspace,
+                run_mode=_active_filesystem_run_mode(),
+                path=p,
+                logical_path=Path(logical_tool_path(path, base=workspace)),
+                paths=(p,),
+                expected_revision=expected_revision,
+                edits=tuple(edits),
+            ),
+            host_execution_active=elevated,
+        )
+        if sandbox_result is not None:
+            metadata = getattr(sandbox_result, "metadata", {})
+            status = metadata.get("status")
+            if status == "revision_conflict":
+                current_revision = metadata.get("beforeRevision")
+                raise RetryableToolInputError(
+                    "revision_conflict: edit_source expected "
+                    f"{expected_revision}, but current revision is {current_revision}. "
+                    "Call read_source for the current file range and retry with the new revision."
+                )
+            if status == "contract_error":
+                raise RetryableToolInputError(str(getattr(sandbox_result, "message", "")))
+            original_result = metadata.get("original")
+            updated_result = metadata.get("updated")
+            before_revision_result = metadata.get("beforeRevision")
+            after_revision_result = metadata.get("afterRevision")
+            before_fingerprint = metadata.get("beforeFingerprint")
+            after_fingerprint = metadata.get("afterFingerprint")
+            if (
+                status != "applied"
+                or not isinstance(original_result, str)
+                or not isinstance(updated_result, str)
+                or not isinstance(before_revision_result, str)
+                or not isinstance(after_revision_result, str)
+                or not isinstance(before_fingerprint, dict)
+                or not isinstance(after_fingerprint, dict)
+            ):
+                raise ToolError("edit_source worker returned an invalid revision receipt.")
+            original = original_result
+            updated = updated_result
+            before_revision = before_revision_result
+            after_revision = after_revision_result
+            receipt = record_semantic_mutation_receipt(
+                tool_name="edit_source",
+                path=p,
+                operation="edit_source",
+                before=before_fingerprint,
+                after=after_fingerprint,
+                partial=False,
+                metadata={
+                    "before_revision": before_revision,
+                    "after_revision": after_revision,
+                    "edit_count": len(edits),
+                    "contract": "source_revision_line_edit_v1",
+                },
+            )
+            workspace_epoch = receipt["workspace_epoch"] if receipt is not None else None
+            if updated != original:
+                record_workspace_file_write(p, operation="edit_source", created=False)
+                refresh_workspace_file_read_state(p, operation="edit_source")
+                record_scratch_file_write(p)
+                _notify_memory_source_write(p)
+                _notify_bootstrap_source_write(p)
+            return json.dumps(
+                {
+                    "status": "applied",
+                    "path": display_path,
+                    "changed": updated != original,
+                    "before_revision": before_revision,
+                    "after_revision": after_revision,
+                    "workspace_epoch": workspace_epoch,
+                    "diff_summary": build_diff_summary(original, updated, path=display_path),
+                },
+                ensure_ascii=False,
+            )
+
     if not p.exists():
         raise FileNotFoundError(f"File not found: {path}")
     if not p.is_file():
@@ -2483,7 +2621,6 @@ async def edit_source(
         raise RetryableToolInputError(str(exc)) from exc
 
     before_fingerprint = fingerprint_path(p)
-    display_path = _workspace_display_path(p, path)
     if updated != original:
 
         def _write() -> None:

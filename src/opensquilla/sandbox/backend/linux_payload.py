@@ -183,14 +183,18 @@ def build_filesystem_helper_payload(
 ) -> HelperPayload:
     if not isinstance(operation.request, FilesystemOperationRequest):
         raise ValueError("filesystem operation request is required")
+    if operation.workspace is None:
+        raise ValueError("filesystem operation workspace is required")
+    workspace = operation.workspace.expanduser().resolve(strict=False)
     worker_payload = operation.request.to_payload()
     worker_payload["kind"] = operation.kind
+    worker_payload["workspace"] = str(workspace)
     return HelperPayload(
         operation_type="filesystem",
         action_kind=f"fs.worker.{operation.kind}",
         run_mode=operation.run_mode,
         session_id=session_id,
-        cwd=str(worker_payload_path.parent),
+        cwd=str(workspace),
         env={},
         policy=_policy_payload(policy),
         process=None,
@@ -221,7 +225,15 @@ def _policy_payload(policy: SandboxPolicy) -> dict[str, Any]:
         "fileSystem": (
             {
                 "entries": [
-                    {"path": str(entry.path), "access": entry.access.value}
+                    {
+                        "path": str(entry.path),
+                        "access": entry.access.value,
+                        **(
+                            {"logicalPath": str(entry.logical_path)}
+                            if entry.logical_path is not None
+                            else {}
+                        ),
+                    }
                     for entry in policy.file_system.entries
                 ],
                 "deniedReadGlobs": list(policy.file_system.denied_read_globs),

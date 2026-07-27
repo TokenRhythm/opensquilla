@@ -187,7 +187,15 @@ class SandboxPolicy:
             "file_system": (
                 {
                     "entries": [
-                        {"path": str(entry.path), "access": entry.access.value}
+                        {
+                            "path": str(entry.path),
+                            "access": entry.access.value,
+                            **(
+                                {"logicalPath": str(entry.logical_path)}
+                                if entry.logical_path is not None
+                                else {}
+                            ),
+                        }
                         for entry in self.file_system.entries
                     ],
                     "denied_read_globs": list(self.file_system.denied_read_globs),
