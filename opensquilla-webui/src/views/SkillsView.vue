@@ -18,7 +18,7 @@
             autocomplete="off"
           />
         </div>
-        <button class="btn btn--ghost" type="button" @click="skillsOverviewOpen = true">
+        <button class="btn btn--ghost" data-testid="skills-overview" type="button" @click="skillsOverviewOpen = true">
           <Icon name="skills" :size="16" />
           <span>{{ t('cronSkills.skillsView.overviewTitle') }}</span>
         </button>

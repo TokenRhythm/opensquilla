@@ -54,11 +54,14 @@ interface AgentIdentityPayload {
   name?: string | null
 }
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   agentId: string
   metaSkills?: Array<{ value: string; description: string }>
   suppressed?: boolean
-}>()
+}>(), {
+  metaSkills: () => [],
+  suppressed: false,
+})
 
 const emit = defineEmits<{
   pick: [text: string]
