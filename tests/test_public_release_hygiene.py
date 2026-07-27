@@ -54,6 +54,7 @@ PATH_POLICY_FIXTURE_FILES = {
     "tests/test_migration/fixtures/homes/desktop-0.5rc/config.toml",
     "tests/test_provider_image_generation.py",
     "tests/test_sandbox/test_operation_profile.py",
+    "tests/test_sandbox/test_path_access.py",
     "tests/test_sandbox/test_permission_profiles.py",
     "tests/test_sandbox/test_platform_permissions.py",
     "tests/test_sandbox/test_windows_default_cache.py",
