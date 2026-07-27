@@ -12,7 +12,7 @@ from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from opensquilla.engine.steps.inject_time_prefix import stamp as _stamp_time_prefix
@@ -43,6 +43,9 @@ from opensquilla.session.storage import (
     SessionStorage,
 )
 from opensquilla.session.tokenizer import estimate_tokens
+
+if TYPE_CHECKING:
+    from opensquilla.provider.types import ProviderRequestCorrelation
 
 _SANDBOX_RUN_CONTEXT_ORIGIN_KEY = "sandbox_run_context"
 
@@ -1525,18 +1528,25 @@ class SessionManager:
         custom_instructions: str | None = None,
         *,
         mutation_context: Callable[[], contextlib.AbstractAsyncContextManager[None]] | None = None,
+        provider_request_correlation: ProviderRequestCorrelation | None = None,
     ) -> str:
         """
         Compact the session transcript when context is filling up.
         Summarizes older entries, keeps recent ones, stores summary out-of-band.
         Returns the summary string.
         """
+        correlation_kwargs: dict[str, Any] = {}
+        if provider_request_correlation is not None:
+            correlation_kwargs["provider_request_correlation"] = (
+                provider_request_correlation
+            )
         result = await self.compact_with_result(
             session_key,
             context_window_tokens,
             config,
             custom_instructions,
             mutation_context=mutation_context,
+            **correlation_kwargs,
         )
         return result.summary if result.removed_count else ""
 
@@ -1551,6 +1561,7 @@ class SessionManager:
         trigger_reason: str | None = None,
         flush_receipt_status: str | None = None,
         mutation_context: Callable[[], contextlib.AbstractAsyncContextManager[None]] | None = None,
+        provider_request_correlation: ProviderRequestCorrelation | None = None,
     ) -> CompactionResult:
         """Compact the session transcript and return full compaction metadata."""
 
@@ -1571,6 +1582,7 @@ class SessionManager:
                 context_window_tokens=context_window_tokens,
                 config=config or CompactionConfig(),
                 custom_instructions=custom_instructions,
+                provider_request_correlation=provider_request_correlation,
             )
         )
 

@@ -17,6 +17,7 @@ from opensquilla.gateway.context_overflow import (
     apply_context_overflow_policy,
 )
 from opensquilla.gateway.rpc_chat import _enforce_context_overflow, _handle_chat_send
+from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.session.compaction import CompactionConfig
 from opensquilla.session.compaction_state import (
     StructuredCompactionSummary,
@@ -444,6 +445,57 @@ async def test_auto_summarize_invokes_compaction_and_retries_once() -> None:
     assert outcome.tokens_after is not None
     assert outcome.remaining_budget_tokens is not None
     assert outcome.tokens_after <= outcome.budget_tokens
+
+
+@pytest.mark.asyncio
+async def test_auto_summarize_preserves_root_and_splits_auxiliary_executions() -> None:
+    cfg = _cfg(ContextOverflowPolicy.AUTO_SUMMARIZE, budget=10, flush_enabled=True)
+    sm = _ResultCompactionSessionManager(_history(6, 40))
+    flush_service = SimpleNamespace(
+        execute=AsyncMock(
+            return_value=SimpleNamespace(
+                mode="llm",
+                integrity_ok=True,
+                output_coverage_status="ok",
+                invalid_candidate_count=0,
+                candidate_missing_ids=[],
+                obligation_status="ok",
+                obligation_missing_ids=[],
+            )
+        )
+    )
+    compaction_correlation = ProviderRequestCorrelation(
+        session_id="durable-session-1",
+        turn_id="overflow-turn-1",
+        execution_id="compaction-execution-1",
+        call_kind="auxiliary.compaction",
+    )
+
+    outcome = await apply_context_overflow_policy(
+        config=cfg,
+        message="m",
+        transcript=sm._transcript,
+        session_key="agent:main:s-correlation",
+        session_manager=sm,
+        flush_service=flush_service,
+        provider_request_correlation=compaction_correlation,
+        root_operation_id=compaction_correlation.turn_id,
+    )
+    await asyncio.sleep(0)
+
+    assert outcome.summarized is True
+    assert (
+        sm.compact_kwargs[0]["provider_request_correlation"]
+        is compaction_correlation
+    )
+    assert sm.compact_kwargs[0]["compaction_id"] == compaction_correlation.turn_id
+    flush_correlation = flush_service.execute.await_args.kwargs[
+        "provider_request_correlation"
+    ]
+    assert flush_correlation.session_id == compaction_correlation.session_id
+    assert flush_correlation.turn_id == compaction_correlation.turn_id
+    assert flush_correlation.execution_id != compaction_correlation.execution_id
+    assert flush_correlation.call_kind == "auxiliary.session_flush"
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,7 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
+from opensquilla.tools import write_policy
 from opensquilla.tools.types import RetryableToolInputError, current_tool_context
 
 _GENERATED_OR_DERIVED_PATH_PATTERNS = (
@@ -67,6 +68,13 @@ _GENERATED_CONTENT_MARKERS = (
 )
 _SCRATCH_ONLY_NUDGE_COUNTS = frozenset({3, 6, 10})
 _WORKSPACE_WRITE_PROGRESS_COUNTS = frozenset({1, 3, 6, 10})
+
+
+def _normalize_relative_path(path: str) -> str:
+    normalized = path.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.lstrip("/")
 
 
 def record_workspace_file_write(
@@ -190,8 +198,209 @@ def diff_workspace_mutations(
     return paths
 
 
+def enforce_workspace_write_deny_effects(
+    *,
+    tool_name: str,
+    before: dict[str, str],
+    output: str,
+) -> str:
+    """Post-execution effect check for the workspace write deny policy.
+
+    Pre-execution screens can only match paths named in tool arguments; a
+    command can still mutate a protected path indirectly (for example via a
+    helper program it wrote and ran). This check compares git status before
+    and after the command; in revert mode it restores protected paths to
+    their last committed content and prepends a deny notice to the tool
+    output, in warn mode it prepends the notice only. Active when
+    OPENSQUILLA_WORKSPACE_WRITE_DENY_EFFECT is warn or revert.
+    """
+
+    mode = write_policy.workspace_write_deny_effect_mode()
+    if mode == "off":
+        return output
+    ctx = current_tool_context.get()
+    if ctx is None or not ctx.workspace_dir:
+        return output
+    if not getattr(ctx, "workspace_write_deny_globs", None):
+        return output
+    workspace = Path(ctx.workspace_dir).expanduser().resolve()
+    after = snapshot_workspace_mutations(workspace)
+    tracked_only = write_policy.workspace_write_deny_tracked_only()
+    violations: list[dict[str, str]] = []
+    for entry in diff_workspace_mutations(before, after):
+        status = entry["status"]
+        if status == "deleted":
+            # The path left git status entirely, i.e. it matches HEAD again
+            # (or an untracked file is gone) — nothing left to enforce.
+            continue
+        if tracked_only and status.startswith("??"):
+            continue
+        relative_path = entry["relative_path"]
+        match = write_policy.match_workspace_write_deny(
+            workspace / relative_path,
+            original_path=relative_path,
+            workspace=workspace,
+            ctx=ctx,
+        )
+        if match is None:
+            continue
+        if tracked_only and not _workspace_path_present_at_head(workspace, relative_path):
+            # Tracked-only scopes enforcement to the committed suite. A file
+            # the agent created has no HEAD version to protect, and staging it
+            # (`git add`) must not turn the creation into a violation: the
+            # index is not HEAD, and a revert here would delete the agent's
+            # own new file.
+            continue
+        violations.append({**entry, "pattern": match.pattern})
+    if not violations:
+        return output
+    reverted: list[str] = []
+    failures: list[str] = []
+    if mode == "revert":
+        for violation in violations:
+            relative_path = violation["relative_path"]
+            if _revert_workspace_path(workspace, relative_path, violation["status"]):
+                reverted.append(relative_path)
+            else:
+                failures.append(relative_path)
+    message = _effect_enforcement_message(
+        tool_name=tool_name,
+        mode=mode,
+        violations=violations,
+        failures=failures,
+        guidance=write_policy._deny_retry_guidance(ctx),
+    )
+    record: dict[str, Any] = {
+        "tool": tool_name,
+        "tool_name": tool_name,
+        "operation": "effect_enforcement",
+        "mode": mode,
+        "paths": violations,
+        "path_count": len(violations),
+        "reverted_paths": reverted,
+        "revert_failures": failures,
+    }
+    ctx.workspace_mutation_records.append(dict(record))
+    callback = getattr(ctx, "on_runtime_event", None)
+    if callback is not None:
+        event: dict[str, Any] = {
+            "feature": "workspace_write_deny",
+            "name": "effect_enforcement",
+            **record,
+            "injected_to_model": True,
+            "hint_text_sha256": mutation_ledger_text_hash(message),
+            "agent_id": getattr(ctx, "agent_id", None),
+            "session_key": getattr(ctx, "session_key", None),
+        }
+        try:
+            callback(event)
+        except Exception:
+            pass
+    return f"{message}\n\n{output}"
+
+
+def _effect_enforcement_message(
+    *,
+    tool_name: str,
+    mode: str,
+    violations: list[dict[str, str]],
+    failures: list[str],
+    guidance: str,
+) -> str:
+    described = ", ".join(
+        f"{violation['relative_path']} (matches {violation['pattern']})"
+        for violation in violations
+    )
+    if mode != "revert":
+        return (
+            f"[workspace write deny] {tool_name} modified write-protected file(s): "
+            f"{described}. These changes violate the workspace write deny policy; "
+            f"revert them before finishing.{guidance}"
+        )
+    if failures:
+        revert_note = (
+            " The file(s) have been restored to their last committed content, "
+            f"except: {', '.join(failures)} (automatic restore failed; revert "
+            "those changes yourself)."
+        )
+    else:
+        revert_note = " The file(s) have been restored to their last committed content."
+    return (
+        f"[workspace write deny] {tool_name} modified write-protected file(s): "
+        f"{described}.{revert_note}{guidance} Output below that reports a "
+        "successful update to those file(s) is stale; do not rely on it."
+    )
+
+
+def _workspace_path_present_at_head(workspace: Path, relative_path: str) -> bool:
+    """Return True when the path has a committed version at HEAD.
+
+    Errors resolve to False: with no HEAD version to restore, enforcement
+    (and any revert) is skipped rather than risking deletion of a file the
+    agent created.
+    """
+
+    try:
+        completed = subprocess.run(
+            ["git", "ls-tree", "--name-only", "HEAD", "--", relative_path],
+            cwd=workspace,
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0 and bool(completed.stdout.strip())
+
+
+def _revert_workspace_path(workspace: Path, relative_path: str, status: str) -> bool:
+    target = workspace / relative_path
+    if status.startswith("??"):
+        try:
+            target.unlink(missing_ok=True)
+            return True
+        except OSError:
+            return False
+    try:
+        completed = subprocess.run(
+            ["git", "checkout", "HEAD", "--", relative_path],
+            cwd=workspace,
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if completed.returncode == 0:
+        return True
+    # Staged-new paths (e.g. added via `git add`) have no HEAD version to
+    # restore; unstage and remove instead. Restricted to paths absent from
+    # HEAD so a failed checkout of a HEAD-tracked file is never destructive.
+    try:
+        ls_tree = subprocess.run(
+            ["git", "ls-tree", "--name-only", "HEAD", "--", relative_path],
+            cwd=workspace,
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if ls_tree.returncode != 0 or ls_tree.stdout.strip():
+        return False
+    subprocess.run(
+        ["git", "rm", "--cached", "-f", "--", relative_path],
+        cwd=workspace,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    try:
+        target.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
 def classify_workspace_path(relative_path: str) -> str:
-    normalized = relative_path.replace("\\", "/").lstrip("./")
+    normalized = _normalize_relative_path(relative_path)
     if _path_is_inside_scratch(normalized):
         return "scratch"
     path = Path(normalized)
@@ -463,7 +672,7 @@ def workspace_write_note(path: Path) -> str:
     if relative_path is None:
         return ""
 
-    normalized = relative_path.replace("\\", "/").lstrip("./")
+    normalized = _normalize_relative_path(relative_path)
     notes: list[str] = []
     if _looks_generated_or_derived(path, normalized):
         notes.append(
@@ -492,7 +701,7 @@ def summarize_workspace_write_notes(paths: list[Path]) -> str:
         relative_path = _workspace_relative_path(path)
         if relative_path is None:
             continue
-        normalized = relative_path.replace("\\", "/").lstrip("./")
+        normalized = _normalize_relative_path(relative_path)
         saw_generated = saw_generated or _looks_generated_or_derived(path, normalized)
         saw_docs = saw_docs or _matches_any(normalized, _DOCUMENTATION_PATH_PATTERNS)
         saw_tests = saw_tests or _looks_test_file(normalized)
@@ -525,7 +734,7 @@ def summarize_patch_hygiene_warning(paths: list[Path]) -> str:
         relative_path = _workspace_relative_path(path)
         if relative_path is None:
             continue
-        normalized = relative_path.replace("\\", "/").lstrip("./")
+        normalized = _normalize_relative_path(relative_path)
         saw_generated = saw_generated or _looks_generated_or_derived(path, normalized)
         saw_docs = saw_docs or _matches_any(normalized, _DOCUMENTATION_PATH_PATTERNS)
         saw_tests = saw_tests or _looks_test_file(normalized)

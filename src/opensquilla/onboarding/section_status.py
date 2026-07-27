@@ -24,6 +24,7 @@ from collections.abc import Callable, Collection
 from enum import StrEnum
 from typing import Any, cast
 
+from opensquilla.endpoint_identity import credential_env_for_endpoint
 from opensquilla.gateway.config import GatewayConfig, ImageGenerationConfig
 from opensquilla.onboarding.audio_specs import get_audio_provider_setup_spec
 from opensquilla.onboarding.image_generation_specs import (
@@ -32,6 +33,13 @@ from opensquilla.onboarding.image_generation_specs import (
 )
 from opensquilla.onboarding.provider_specs import get_provider_setup_spec
 from opensquilla.onboarding.search_specs import get_search_provider_setup_spec
+from opensquilla.provider.image_generation_policy import (
+    conflicting_image_generation_endpoint_provider,
+    image_generation_llm_endpoint_allows_credential_reuse,
+    is_valid_image_generation_base_url,
+    parse_image_generation_model_ref,
+    resolve_image_generation_base_url,
+)
 
 FIRST_RUN_REQUIRED_SECTIONS = frozenset({"llm"})
 
@@ -173,8 +181,25 @@ def image_generation_section_status(cfg: GatewayConfig) -> SectionStatus:
     image_cfg = getattr(cfg, "image_generation", None)
     if image_cfg is None or not bool(getattr(image_cfg, "enabled", False)):
         return SectionStatus.OPTIONAL
+    if _image_generation_has_invalid_model_reference(cfg):
+        return SectionStatus.UNKNOWN
+    provider_ids = _configured_image_generation_provider_ids(cfg)
+    # A fallback can keep generation available after a local primary failure,
+    # but it must not conceal a persisted provider/official-endpoint mismatch.
+    # The operator still needs to repair the primary routing before the section
+    # can honestly report a healthy configuration.
+    if any(
+        _image_generation_endpoint_conflict_provider(cfg, provider_id) is not None
+        for provider_id in provider_ids
+    ):
+        return SectionStatus.DEGRADED
+    if any(
+        _image_generation_endpoint_is_valid(cfg, provider_id) is False
+        for provider_id in provider_ids
+    ):
+        return SectionStatus.DEGRADED
     aggregate = SectionStatus.MISSING
-    for provider_id in _configured_image_generation_provider_ids(cfg):
+    for provider_id in provider_ids:
         credential = _image_generation_credential_state(cfg, provider_id)
         if credential is SectionStatus.OK:
             return SectionStatus.OK
@@ -257,20 +282,14 @@ def _image_generation_credential_state(
       2. operator-explicit env_key resolved in ``os.environ`` -> ``OK``
       3. operator-explicit env_key declared but absent -> ``DEGRADED``
       4. spec default env_key resolved in ``os.environ`` -> ``OK``
-      5. matching LLM provider with an explicit ``api_key`` (image-gen reuses it) -> ``OK``
-      6. otherwise -> ``MISSING``
+      5. matching LLM provider with an explicit ``api_key`` on the same endpoint -> ``OK``
+      6. matching LLM provider/key on another endpoint -> ``DEGRADED``
+      7. otherwise -> ``MISSING``
 
-    Known tradeoff: the config schema does not record whether the operator
-    explicitly picked the *default* env var name (e.g. ``OPENAI_API_KEY``)
-    or whether the value arrived from a Pydantic field default. The
-    ``cfg_env_key == spec_env_key`` test below treats matching values as
-    spec-default so a fresh ``GatewayConfig()`` does not flap to
-    ``DEGRADED`` whenever the spec env var happens to be unset. The cost:
-    an operator who deliberately picked the spec-default env var and later
-    loses that variable from the environment will see ``MISSING`` rather
-    than ``DEGRADED``. Recording an explicit credential source on the
-    provider config would close this gap and is left for a config schema
-    change.
+    The configured env provenance mirrors the runtime resolver: the registry
+    default env var follows only the registry endpoint, while any operator
+    authored reference (including an explicit default-name reference) may be
+    used for a custom compatible endpoint.
     """
     try:
         spec = get_image_generation_provider_setup_spec(provider_id)
@@ -284,34 +303,132 @@ def _image_generation_credential_state(
     if provider_cfg_any is not None and provider_cfg_any.api_key:
         return SectionStatus.OK
 
-    # An ``api_key_env`` value that matches the spec default arrives from
-    # field defaults rather than an operator decision, so it should not
-    # short-circuit to ``DEGRADED``. Only treat the reference as explicit
-    # when the operator overrode the spec default.
-    spec_env_key = (getattr(spec, "env_key", "") or "").strip()
-    cfg_env_key = ""
-    if provider_cfg is not None:
-        cfg_env_key = (getattr(provider_cfg, "api_key_env", "") or "").strip()
-    explicit_env_key = cfg_env_key if cfg_env_key and cfg_env_key != spec_env_key else ""
+    resolved_env_key, env_is_explicit = _image_generation_effective_env_key(
+        cfg,
+        provider_id,
+        spec,
+    )
+    if resolved_env_key:
+        if os.environ.get(resolved_env_key):
+            return SectionStatus.OK
+        if env_is_explicit:
+            return SectionStatus.DEGRADED
 
-    if explicit_env_key:
-        return (
-            SectionStatus.OK
-            if os.environ.get(explicit_env_key)
-            else SectionStatus.DEGRADED
-        )
-    if spec_env_key and os.environ.get(spec_env_key):
+    llm_key_reusable = _image_generation_llm_key_reusable(cfg, provider_id)
+    if llm_key_reusable is True:
         return SectionStatus.OK
-
-    llm = getattr(cfg, "llm", None)
-    if (
-        getattr(llm, "provider", "").strip().lower() == provider_id
-        and getattr(llm, "api_key", "")
-    ):
-        return SectionStatus.OK
+    if llm_key_reusable is False:
+        return SectionStatus.DEGRADED
 
     # Nothing produced an OK; classify how the operator left the provider.
     return SectionStatus.MISSING
+
+
+def _image_generation_effective_env_key(
+    cfg: GatewayConfig,
+    provider_id: str,
+    spec: Any,
+) -> tuple[str, bool]:
+    """Resolve the env source using the same endpoint provenance as runtime."""
+
+    providers = getattr(getattr(cfg, "image_generation", None), "providers", None)
+    provider_cfg = getattr(providers, provider_id, None) if providers is not None else None
+    cfg_env_key = (
+        str(getattr(provider_cfg, "api_key_env", "") or "").strip()
+        if provider_cfg is not None
+        else ""
+    )
+    fields_set = getattr(provider_cfg, "model_fields_set", None)
+    env_was_explicitly_configured = (
+        isinstance(fields_set, set) and "api_key_env" in fields_set
+    )
+    endpoint = _image_generation_effective_endpoint(cfg, provider_id)
+    if endpoint is None:
+        return "", False
+    default_base_url, effective_base_url = endpoint
+    spec_env_key = str(getattr(spec, "env_key", "") or "").strip()
+    resolved_env_key = credential_env_for_endpoint(
+        configured_env=cfg_env_key,
+        configured_explicitly=env_was_explicitly_configured,
+        default_env=spec_env_key,
+        default_base_url=default_base_url,
+        effective_base_url=effective_base_url,
+    )
+    env_is_explicit = bool(
+        resolved_env_key
+        and cfg_env_key
+        and (cfg_env_key != spec_env_key or env_was_explicitly_configured)
+    )
+    return resolved_env_key, env_is_explicit
+
+
+def _image_generation_endpoint_conflict_provider(
+    cfg: GatewayConfig,
+    provider_id: str,
+) -> str | None:
+    """Return the official provider that conflicts with this image endpoint."""
+
+    endpoint = _image_generation_effective_endpoint(cfg, provider_id)
+    if endpoint is None:
+        return None
+    _default_base_url, base_url = endpoint
+    return conflicting_image_generation_endpoint_provider(
+        provider_id,
+        base_url,
+    )
+
+
+def _image_generation_endpoint_is_valid(
+    cfg: GatewayConfig,
+    provider_id: str,
+) -> bool | None:
+    endpoint = _image_generation_effective_endpoint(cfg, provider_id)
+    if endpoint is None:
+        return None
+    return is_valid_image_generation_base_url(endpoint[1])
+
+
+def _image_generation_llm_key_reusable(
+    cfg: GatewayConfig,
+    provider_id: str,
+) -> bool | None:
+    llm = getattr(cfg, "llm", None)
+    if (
+        getattr(llm, "provider", "").strip().lower() != provider_id
+        or not getattr(llm, "api_key", "")
+    ):
+        return None
+    endpoint = _image_generation_effective_endpoint(cfg, provider_id)
+    if endpoint is None:
+        return None
+    default_base_url, effective_base_url = endpoint
+    return image_generation_llm_endpoint_allows_credential_reuse(
+        provider_id=provider_id,
+        llm_config=llm,
+        default_base_url=default_base_url,
+        effective_base_url=effective_base_url,
+    )
+
+
+def _image_generation_effective_endpoint(
+    cfg: GatewayConfig,
+    provider_id: str,
+) -> tuple[str, str] | None:
+    try:
+        spec = get_image_generation_provider_setup_spec(provider_id)
+    except KeyError:
+        return None
+    providers = getattr(getattr(cfg, "image_generation", None), "providers", None)
+    provider_cfg = getattr(providers, provider_id, None) if providers is not None else None
+    return (
+        spec.default_base_url,
+        resolve_image_generation_base_url(
+            provider_id=provider_id,
+            provider_config=provider_cfg,
+            llm_config=getattr(cfg, "llm", None),
+            default_base_url=spec.default_base_url,
+        ),
+    )
 
 
 def _image_generation_provider_has_operator_credential(
@@ -399,9 +516,28 @@ def _configured_image_generation_provider_ids(cfg: GatewayConfig) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
     for ref in refs:
-        provider_id, sep, _model = ref.partition("/")
-        provider_id = provider_id.strip()
-        if sep and provider_id and provider_id not in seen:
+        try:
+            provider_id, _model = parse_image_generation_model_ref(ref)
+        except ValueError:
+            continue
+        if provider_id not in seen:
             seen.add(provider_id)
             result.append(provider_id)
     return result
+
+
+def _image_generation_has_invalid_model_reference(cfg: GatewayConfig) -> bool:
+    image_cfg = cfg.image_generation
+    primary = str(getattr(image_cfg, "primary", "") or "")
+    fallbacks = list(getattr(image_cfg, "fallbacks", []) or [])
+    explicit_routing = bool(fallbacks) or bool(
+        primary and primary != DEFAULT_IMAGE_GENERATION_PRIMARY
+    )
+    if not explicit_routing:
+        return False
+    for ref in [primary, *fallbacks]:
+        try:
+            parse_image_generation_model_ref(ref)
+        except ValueError:
+            return True
+    return False

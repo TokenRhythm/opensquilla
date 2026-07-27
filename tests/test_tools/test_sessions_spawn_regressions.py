@@ -125,14 +125,30 @@ class _StubTaskRuntime:
     def __init__(self) -> None:
         self.enqueued: list[dict] = []
 
-    async def enqueue(self, envelope, message, mode="followup", run_kind="default"):
-        self.enqueued.append({"envelope": envelope, "run_kind": run_kind})
+    async def enqueue(
+        self,
+        envelope,
+        message,
+        mode="followup",
+        run_kind="default",
+        *,
+        task_id=None,
+        provider_request_correlation=None,
+    ):
+        self.enqueued.append(
+            {
+                "envelope": envelope,
+                "run_kind": run_kind,
+                "task_id": task_id,
+                "provider_request_correlation": provider_request_correlation,
+            }
+        )
 
         @dataclass
         class _Handle:
-            task_id: str = "task-stub"
+            task_id: str
 
-        return _Handle()
+        return _Handle(task_id or "task-stub")
 
 
 def _ctx() -> ToolContext:

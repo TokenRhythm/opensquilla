@@ -508,7 +508,15 @@ def test_image_generation_unknown_provider_reference_is_unknown(cfg, monkeypatch
     cfg.image_generation.enabled = True
     cfg.image_generation.primary = "no-such-provider/no-such-model"
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    status = get_onboarding_status(cfg)
+
     assert image_generation_section_status(cfg) is SectionStatus.UNKNOWN
+    assert status.image_generation_configured is False
+    assert status.image_generation_provider == "no-such-provider"
+    assert status.section_details["image_generation"]["detail"] == (
+        "no-such-provider (unknown image provider)"
+    )
 
 
 def test_image_generation_env_key_reference_missing_is_degraded(cfg, monkeypatch):
@@ -554,6 +562,138 @@ def test_image_generation_custom_default_primary_is_not_masked_by_other_provider
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
     assert image_generation_section_status(cfg) is SectionStatus.DEGRADED
+
+
+def test_image_generation_official_endpoint_provider_mismatch_is_degraded(cfg):
+    cfg.image_generation.enabled = True
+    cfg.image_generation.primary = "openrouter/google/gemini-3.1-flash-image-preview"
+    openrouter_provider = cfg.image_generation.providers.openrouter
+    openrouter_provider.api_key = "sk-synthetic-image"
+    openrouter_provider.base_url = "https://api.openai.com/v1"
+
+    status = get_onboarding_status(cfg)
+
+    assert image_generation_section_status(cfg) is SectionStatus.DEGRADED
+    assert status.image_generation_configured is False
+    assert status.image_generation_provider == "openrouter"
+    assert status.image_generation_source == "explicit"
+    detail = status.section_details["image_generation"]
+    assert detail["status"] == "degraded"
+    assert detail["actionRequired"] is True
+    assert detail["blocking"] is False
+    assert detail["detail"] == (
+        "openrouter (endpoint/provider mismatch: configured openai official endpoint)"
+    )
+
+
+def test_image_generation_custom_compatible_endpoint_remains_ok(cfg):
+    cfg.image_generation.enabled = True
+    cfg.image_generation.primary = "openrouter/google/gemini-3.1-flash-image-preview"
+    openrouter_provider = cfg.image_generation.providers.openrouter
+    openrouter_provider.api_key = "sk-synthetic-image"
+    openrouter_provider.base_url = "https://images.example.test/v1"
+
+    assert image_generation_section_status(cfg) is SectionStatus.OK
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "not-a-url",
+        " https://openrouter.ai/api/v1 ",
+        "https://openrouter.ai:invalid/v1",
+        "https://openrouter.ai:99999/v1",
+        "https://openrouter.ai/api/v1?tenant=test",
+        "https://openrouter.ai/api/v1#fragment",
+        "https://user:secret@openrouter.ai/api/v1",
+    ],
+)
+def test_image_generation_invalid_endpoint_is_degraded(cfg, base_url):
+    cfg.image_generation.enabled = True
+    cfg.image_generation.primary = "openrouter/google/gemini-3.1-flash-image-preview"
+    openrouter_provider = cfg.image_generation.providers.openrouter
+    openrouter_provider.api_key = "sk-synthetic-image"
+    openrouter_provider.base_url = base_url
+
+    status = get_onboarding_status(cfg)
+
+    assert image_generation_section_status(cfg) is SectionStatus.DEGRADED
+    assert status.image_generation_configured is False
+    assert status.section_details["image_generation"]["detail"] == (
+        "openrouter (invalid image endpoint; use an absolute http:// or https:// URL)"
+    )
+
+
+def test_image_generation_malformed_legacy_model_ref_is_unknown(cfg):
+    cfg.image_generation.enabled = True
+    cfg.image_generation.primary = "openrouter/"
+    cfg.image_generation.providers.openrouter.api_key = "sk-synthetic-image"
+
+    status = get_onboarding_status(cfg)
+
+    assert image_generation_section_status(cfg) is SectionStatus.UNKNOWN
+    assert status.image_generation_configured is False
+    assert status.section_details["image_generation"]["detail"] == (
+        "invalid image provider/model reference"
+    )
+
+
+def test_image_generation_mismatch_is_not_hidden_by_a_healthy_fallback(cfg):
+    cfg.image_generation.enabled = True
+    cfg.image_generation.primary = "openrouter/google/gemini-3.1-flash-image-preview"
+    cfg.image_generation.fallbacks = ["openai/gpt-image-1"]
+    cfg.image_generation.providers.openrouter.api_key = "sk-synthetic-openrouter"
+    cfg.image_generation.providers.openrouter.base_url = "https://api.openai.com/v1"
+    cfg.image_generation.providers.openai.api_key = "sk-synthetic-openai"
+
+    assert image_generation_section_status(cfg) is SectionStatus.DEGRADED
+
+
+def test_image_generation_default_env_does_not_apply_to_custom_endpoint(cfg, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-default-origin-key")
+    cfg.image_generation.enabled = True
+    cfg.image_generation.primary = "openrouter/google/gemini-3.1-flash-image-preview"
+    cfg.image_generation.providers.openrouter.base_url = "https://images.example.test/v1"
+    cfg.llm = LlmProviderConfig(provider="openai", model="m", api_key="")
+
+    assert image_generation_section_status(cfg) is SectionStatus.MISSING
+
+
+def test_image_generation_inherited_llm_endpoint_mismatch_is_degraded(cfg):
+    cfg.image_generation.enabled = True
+    cfg.image_generation.primary = "openrouter/google/gemini-3.1-flash-image-preview"
+    cfg.image_generation.providers.openrouter.api_key = "sk-synthetic-image"
+    cfg.llm = LlmProviderConfig(
+        provider="openrouter",
+        model="m",
+        api_key="sk-synthetic-llm",
+        base_url="https://api.openai.com/v1",
+    )
+
+    assert image_generation_section_status(cfg) is SectionStatus.DEGRADED
+
+
+def test_image_generation_cross_origin_llm_key_is_degraded(cfg, monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    cfg.image_generation.enabled = True
+    cfg.image_generation.primary = "openrouter/google/gemini-3.1-flash-image-preview"
+    cfg.image_generation.providers.openrouter.base_url = "https://images.example.test/v1"
+    cfg.llm = LlmProviderConfig(
+        provider="openrouter",
+        model="m",
+        api_key="sk-synthetic-llm",
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    status = get_onboarding_status(cfg)
+
+    assert image_generation_section_status(cfg) is SectionStatus.DEGRADED
+    assert status.image_generation_configured is False
+    assert status.image_generation_source == "none"
+    assert status.image_generation_provider == "openrouter"
+    assert status.section_details["image_generation"]["detail"] == (
+        "openrouter (LLM key cannot be reused across image endpoint origins)"
+    )
 
 
 # ── memory embedding ────────────────────────────────────────────────────────

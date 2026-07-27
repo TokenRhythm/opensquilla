@@ -1,10 +1,23 @@
 from __future__ import annotations
 
+import os
 import re
 from typing import Any
 
 from .formatters import count_pattern, dedupe_adjacent, head_tail, strip_ansi, trim_empty_edges
 from .types import Rule
+
+# Opt-in failure-window lever (off by default). When enabled, error output
+# keeps at least the success summarize window, so a rule whose failure window
+# is smaller than its summarize window never truncates failures harder than
+# successes.
+_FAILURE_PRESERVE_ENV = "OPENSQUILLA_TOOLCOMP_FAILURE_PRESERVE"
+_TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on", "enabled"})
+
+
+def _failure_preserve_enabled() -> bool:
+    raw = os.environ.get(_FAILURE_PRESERVE_ENV, "").strip().lower()
+    return raw in _TRUE_ENV_VALUES
 
 
 def _compile_flags(flags: str = "") -> int:
@@ -46,7 +59,12 @@ def _apply_output_matches(rule: Rule, text: str) -> str | None:
 
 def _summarize_window(rule: Rule, *, exit_code: int) -> tuple[int, int]:
     if exit_code != 0 and rule.failure.get("preserveOnFailure"):
-        return int(rule.failure.get("head") or 12), int(rule.failure.get("tail") or 12)
+        head = int(rule.failure.get("head") or 12)
+        tail = int(rule.failure.get("tail") or 12)
+        if _failure_preserve_enabled():
+            head = max(head, int(rule.summarize.get("head") or 8))
+            tail = max(tail, int(rule.summarize.get("tail") or 8))
+        return head, tail
     return int(rule.summarize.get("head") or 8), int(rule.summarize.get("tail") or 8)
 
 

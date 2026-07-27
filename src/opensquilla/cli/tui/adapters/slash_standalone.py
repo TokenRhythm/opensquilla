@@ -36,12 +36,20 @@ from opensquilla.cli.tui.adapters.slash_common import (
 from opensquilla.cli.tui.backend.contracts import TuiOutputHandle
 from opensquilla.cli.ui import ACCENT, console, error_panel
 from opensquilla.engine.commands import Surface
+from opensquilla.observability.network_policy import (
+    provider_request_correlation_disabled,
+)
+from opensquilla.provider.types import (
+    ProviderRequestCorrelation,
+    derive_provider_request_correlation,
+)
 from opensquilla.session.compaction import (
     build_compaction_config_from_provider,
     call_compact_with_optional_config,
 )
 from opensquilla.session.compaction_lifecycle import (
     flush_receipt_is_successful_flush,
+    new_compaction_id,
 )
 
 if TYPE_CHECKING:
@@ -112,6 +120,10 @@ class StandaloneReadTranscript(Protocol):
     def __call__(self, session_key: str) -> Awaitable[Any] | Any: ...
 
 
+class StandaloneGetSession(Protocol):
+    def __call__(self, session_key: str) -> Awaitable[Any] | Any: ...
+
+
 class StandaloneTruncateSession(Protocol):
     def __call__(self, session_key: str, *, max_messages: int = 0) -> Awaitable[None]: ...
 
@@ -137,6 +149,7 @@ class StandaloneFlushTranscript(Protocol):
 @dataclass
 class StandaloneSlashServices:
     create_session: StandaloneCreateSession | None = None
+    get_session: StandaloneGetSession | None = None
     read_transcript: StandaloneReadTranscript | None = None
     truncate_session: StandaloneTruncateSession | None = None
     compact_session: StandaloneCompactSession | None = None
@@ -306,6 +319,7 @@ async def _flush_before_standalone_rewrite(
     session_key: str,
     *,
     operation: str,
+    provider_request_correlation: ProviderRequestCorrelation | None = None,
 ) -> bool:
     """Fail closed before reset; compact can continue on flush degradation."""
     compaction_operation = operation.strip().lower() == "compact"
@@ -342,13 +356,21 @@ async def _flush_before_standalone_rewrite(
         return False
 
     try:
+        flush_kwargs: dict[str, Any] = {
+            "agent_id": "main",
+            "timeout": 30.0,
+            "message_window": 0,
+            "segment_mode": "auto",
+        }
+        if provider_request_correlation is not None:
+            flush_kwargs["provider_request_correlation"] = (
+                provider_request_correlation
+            )
+            flush_kwargs["turn_id"] = provider_request_correlation.turn_id
         receipt = await flush_transcript(
             transcript,
             session_key,
-            agent_id="main",
-            timeout=30.0,
-            message_window=0,
-            segment_mode="auto",
+            **flush_kwargs,
         )
     except Exception as exc:  # noqa: BLE001
         if compaction_operation:
@@ -372,6 +394,35 @@ async def _flush_before_standalone_rewrite(
         console.print(f"[yellow]{operation} aborted: flush failed ({error}).[/yellow]")
         return False
     return True
+
+
+async def _standalone_maintenance_correlation(
+    slash_services: StandaloneSlashServices,
+    session_key: str,
+    *,
+    call_kind: str,
+    turn_id: str | None = None,
+) -> ProviderRequestCorrelation | None:
+    get_session = slash_services.get_session
+    if get_session is None or provider_request_correlation_disabled(
+        config=slash_services.config,
+    ):
+        return None
+    try:
+        session = get_session(session_key)
+        if inspect.isawaitable(session):
+            session = await session
+    except Exception:  # noqa: BLE001 - observability must not block maintenance
+        return None
+    session_id = getattr(session, "session_id", None)
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    return ProviderRequestCorrelation(
+        session_id=session_id,
+        turn_id=turn_id or f"maintenance_{uuid4().hex}",
+        execution_id=uuid4().hex,
+        call_kind=call_kind,
+    )
 
 
 def _save_state_transcript_command(cmd: str, state: ChatSessionState) -> None:
@@ -456,10 +507,22 @@ async def _compact_standalone_context(context: StandaloneSlashContext) -> None:
         console.print("[yellow]No session manager available.[/yellow]")
         return
 
+    compaction_id = new_compaction_id()
+    compaction_correlation = await _standalone_maintenance_correlation(
+        slash_services,
+        context.session_key,
+        call_kind="auxiliary.compaction",
+        turn_id=compaction_id,
+    )
     safe_to_compact = await _flush_before_standalone_rewrite(
         slash_services,
         context.session_key,
         operation="Compact",
+        provider_request_correlation=derive_provider_request_correlation(
+            compaction_correlation,
+            execution_id=uuid4().hex,
+            call_kind="auxiliary.session_flush",
+        ),
     )
     if not safe_to_compact:
         return
@@ -479,10 +542,39 @@ async def _compact_standalone_context(context: StandaloneSlashContext) -> None:
     )
     try:
         if compact_with_result is not None:
+            compact_kwargs: dict[str, Any] = {}
+            try:
+                parameters = tuple(
+                    inspect.signature(compact_with_result).parameters.values()
+                )
+            except (TypeError, ValueError):
+                parameters = ()
+            if compaction_correlation is not None:
+                if any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    or parameter.name == "provider_request_correlation"
+                    for parameter in parameters
+                ):
+                    compact_kwargs["provider_request_correlation"] = (
+                        compaction_correlation
+                    )
+            if any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                or parameter.name == "compaction_id"
+                for parameter in parameters
+            ):
+                compact_kwargs["compaction_id"] = compaction_id
+            if any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                or parameter.name == "trigger_reason"
+                for parameter in parameters
+            ):
+                compact_kwargs["trigger_reason"] = "manual"
             result = await compact_with_result(
                 context.session_key,
                 context_window,
                 compaction_config,
+                **compact_kwargs,
             )
             summary = getattr(result, "summary", "") or ""
             token_stats = compact_token_stats(
@@ -500,6 +592,7 @@ async def _compact_standalone_context(context: StandaloneSlashContext) -> None:
                 context.session_key,
                 context_window,
                 compaction_config,
+                provider_request_correlation=compaction_correlation,
             )
             token_stats = compact_summary_stats(len(summary))
     except Exception as exc:  # noqa: BLE001 - keep chat command recoverable.
@@ -599,10 +692,16 @@ async def handle_standalone_slash_command(
     if cmd in {"/clear", "/reset"}:
         truncate_session = context.slash_services.truncate_session
         if truncate_session is not None:
+            flush_correlation = await _standalone_maintenance_correlation(
+                context.slash_services,
+                context.session_key,
+                call_kind="auxiliary.session_flush",
+            )
             safe_to_reset = await _flush_before_standalone_rewrite(
                 context.slash_services,
                 context.session_key,
                 operation="Reset",
+                provider_request_correlation=flush_correlation,
             )
             if not safe_to_reset:
                 return True

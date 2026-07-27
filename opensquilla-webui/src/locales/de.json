@@ -66,7 +66,8 @@
     "discard": "Verwerfen",
     "cancel": "Abbrechen",
     "edit": "Bearbeiten",
-    "delete": "Löschen"
+    "delete": "Löschen",
+    "dismiss": "Ausblenden"
   },
   "nav": {
     "chat": "Chat",
@@ -144,7 +145,8 @@
       "themeLabel": "Design",
       "themeDesc": "Dem System folgen oder hell bzw. dunkel erzwingen. Der Schalter in der Seitenleiste ist eine Verknüpfung zu dieser Einstellung.",
       "languageLabel": "Sprache",
-      "languageDesc": "Anzeigesprache der Oberfläche. Wird sofort in diesem Browser übernommen.",
+      "languageDesc": "Anzeigesprache der Oberfläche und der Systemhinweise in Kanälen. Sie gilt hier sofort und speichert die Hinweis-Sprache gatewayweit.",
+      "channelNoticeLocaleSyncPending": "Die Oberflächensprache wurde geändert, aber die Sprache der Kanal-Systemhinweise ist noch nicht gespeichert. Beim erneuten Verbinden mit dem Gateway wird es erneut versucht.",
       "toolDetailsLabel": "Werkzeugdetails standardmäßig anzeigen",
       "toolDetailsDesc": "Automatisch folgt dem Werkzeugtyp; Kompakt klappt normale Werkzeuge ein; Ausgeklappt öffnet sie. Fehler werden standardmäßig automatisch geöffnet und können manuell eingeklappt werden.",
       "toolDetailsAuto": "Automatisch",
@@ -476,7 +478,7 @@
       "endpointDesc": "Diese Einstellungen gelten nur für Aufrufe an {provider}.",
       "defaultModelTitle": "Standardmodell für {provider}",
       "defaultModelGroupDesc": "Wird bei deaktiviertem Routing oder beim Fallback auf den aktiven Anbieter verwendet.",
-      "defaultModelLabel": "Standardmodell für direkte {provider}-Anfragen",
+      "defaultModelLabel": "Direkt-/Fallback-Modell",
       "configuredModelTitle": "Modell für {provider}",
       "configuredModelCurrentLabel": "Aktuelles Modell",
       "configuredModelFallbackLabel": "Fallback-Modell",
@@ -811,7 +813,7 @@
         "credentials_link": "Zugangsdaten-Seite öffnen (App id / App secret)",
         "quick_apply_link": "Antrag für alle benötigten Berechtigungen vorausfüllen",
         "needAppId": "zuerst App id eintragen",
-        "ws_order_note": "Verbunden — ein Schritt fehlt noch in der Feishu-Konsole: 事件与回调 öffnen und den Ereignisempfang auf 使用长连接接收事件 umstellen. Die Konsole speichert diese Wahl nur bei aktiver Verbindung, deshalb folgt der Schritt nach dem Speichern. Dieser Hinweis verschwindet mit dem ersten empfangenen Ereignis."
+        "ws_order_note": "Prüfen Sie das Ereignisabonnement in der Feishu-Konsole: Öffnen Sie 事件与回调 und bestätigen Sie, dass der Ereignisempfang auf 使用长连接接收事件 eingestellt ist. Dieser Hinweis erscheint bei bestehender WebSocket-Verbindung, solange kein eingehendes Ereignis erfasst wurde; er bedeutet nicht automatisch, dass die Konsole falsch konfiguriert ist. Nach dem ersten Ereignis verschwindet er."
       }
     },
     "search": {
@@ -870,6 +872,15 @@
       "outputFormat": "Ausgabeformat",
       "fallbacks": "Fallback-Modelle",
       "fallbacksHint": "Durch Kommas getrennte Anbieter/Modell-IDs, die der Reihe nach versucht werden, wenn das primäre Modell fehlschlägt."
+    },
+    "capabilities": {
+      "imageStatus": {
+        "missingEnv": "Umgebungsvariable {name} fehlt. Fügen Sie unten einen Schlüssel ein oder setzen Sie die Variable und starten Sie das Gateway neu."
+      },
+      "imageKeyConfigured": "Schlüssel konfiguriert",
+      "imageKeyMissing": "Noch nicht konfiguriert",
+      "imageKeyPlaceholderKeep": "Leer lassen, um den gespeicherten Schlüssel zu behalten",
+      "imageKeyPlaceholderNew": "API-Schlüssel einfügen"
     },
     "audio": {
       "title": "Audio",
@@ -931,6 +942,17 @@
       "revealFailed": "Protokoll konnte nicht angezeigt werden: {error}",
       "restarting": "Lokale Laufzeit wird neu gestartet…",
       "restartFailed": "Neustart fehlgeschlagen: {error}",
+      "closeBehaviorLabel": "Beim Schließen des Hauptfensters",
+      "closeBehaviorDesc": "Wählen Sie, wie sich OpenSquilla beim Schließen des Hauptfensters verhalten soll.",
+      "closeBehaviorBackground": "Im Hintergrund weiterlaufen",
+      "closeBehaviorQuit": "OpenSquilla beenden",
+      "closeBehaviorAsk": "Jedes Mal nachfragen",
+      "closeBehaviorSaving": "Wird gespeichert…",
+      "closeBehaviorReadFailed": "Verhalten beim Schließen konnte nicht gelesen werden: {error}",
+      "closeBehaviorSaveFailed": "Verhalten beim Schließen konnte nicht gespeichert werden: {error}",
+      "closeBehaviorBackgroundUnavailable": "Hintergrundbetrieb ist auf dieser Plattform nicht verfügbar.",
+      "closeBehaviorFallbackQuit": "Hintergrundbetrieb ist auf dieser Plattform nicht verfügbar. Beim Schließen des Fensters wird die App stattdessen beendet.",
+      "closeBehaviorRetry": "Erneut versuchen",
       "resetConfirmTitle": "Gespeicherte Einrichtung zurücksetzen?",
       "resetConfirmBody": "Dies löscht die gespeicherten Desktop-Zugangsdaten und die generierte Konfiguration. Beim nächsten Start wird die Ersteinrichtung erneut ausgeführt.",
       "resetConfirmPrimary": "Zurücksetzen",
@@ -1107,11 +1129,11 @@
     },
     "privacy": {
       "title": "Datenschutz",
-      "statusEnabled": "Netzwerkbeobachtbarkeit ist aktiviert.",
-      "statusDisabled": "Netzwerkbeobachtbarkeit ist deaktiviert.",
-      "statusDisabledByEnv": "Netzwerkbeobachtbarkeit ist durch die Umgebung deaktiviert.",
-      "disableNetworkObservabilityLabel": "Netzwerkbeobachtbarkeit deaktivieren",
-      "disableNetworkObservabilityDesc": "Stoppt Netzwerkbeobachtbarkeitsaufrufe des Gateways, wie Installationstelemetrie und Updateprüfungen.",
+      "statusEnabled": "Netzwerkberichte sind eingeschaltet.",
+      "statusDisabled": "Netzwerkberichte sind ausgeschaltet.",
+      "statusDisabledByEnv": "Netzwerkberichte sind ausgeschaltet, weil eine Umgebungsvariable sie deaktiviert.",
+      "disableNetworkObservabilityLabel": "Netzwerkberichte ausschalten",
+      "disableNetworkObservabilityDesc": "Stoppt Installationstelemetrie, Updateprüfungen im Hintergrund und die anonymen Kennungen, die Anfragen einer Sitzung miteinander verknüpfen — diese Kennungen gehen ausschließlich an die offizielle TokenRhythm-API. Ihre eigenen Modellanfragen funktionieren weiterhin.",
       "save": "Datenschutz speichern"
     },
     "toast": {
@@ -1932,7 +1954,7 @@
         "capabilityReference": "Funktionsreferenz",
         "copyBotId": "Bot-ID kopieren: {id}",
         "botIdCopied": "Bot-ID kopiert",
-        "finalStepTitle": "Letzter Schritt in der Feishu-Konsole"
+        "eventSubscriptionTitle": "Feishu-Ereignisabonnement prüfen"
       }
     },
     "overview": {
@@ -2710,6 +2732,7 @@
     "latest": "Neueste",
     "thinking": "Denkt nach",
     "thoughtProcess": "Denkprozess",
+    "thinkingForSeconds": "Denkt nach · {seconds}s",
     "thoughtForSeconds": "{seconds}s nachgedacht",
     "thoughtForMinutes": "{minutes}min {seconds}s nachgedacht",
     "toolResult": "Werkzeugergebnis",
@@ -2774,7 +2797,58 @@
       "ensembleDetailUnavailable": "{count} Kandidaten · Details nicht verfügbar"
     },
     "sources": "Quellen",
+    "activityLabel": "Aktivität",
     "activitySteps": "Aktivität · {count} Schritt | Aktivität · {count} Schritte",
+    "activityItems": "Aktivität · {count} Eintrag | Aktivität · {count} Einträge",
+    "activityCompletedItems": "Abgeschlossen · {count} Eintrag | Abgeschlossen · {count} Einträge",
+    "activityFailures": "{count} fehlgeschlagen",
+    "activityFailuresRecovered": "{count} Fehler behoben | {count} Fehler behoben",
+    "activityWorking": "In Arbeit",
+    "workedForSeconds": "{seconds} Sek. gearbeitet",
+    "workedForMinutes": "{minutes} Min. {seconds} Sek. gearbeitet",
+    "activity": {
+      "lifecycle": {
+        "working": "In Arbeit",
+        "answering": "Antwort wird verfasst",
+        "settled": "Abgeschlossen",
+        "interrupted": "Unterbrochen",
+        "failed": "Fehlgeschlagen"
+      },
+      "purpose": {
+        "discover": "Links gefunden",
+        "search": "Web durchsucht",
+        "read": "Webseiten gelesen",
+        "inspect": "Dateien geprüft",
+        "change": "Dateien bearbeitet",
+        "run": "Befehle ausgeführt",
+        "create": "Artefakte erstellt",
+        "recall": "Speicher durchsucht",
+        "use": "Werkzeuge verwendet"
+      },
+      "purposeRunning": {
+        "discover": "Links werden entdeckt",
+        "search": "Web wird durchsucht",
+        "read": "Webseiten werden gelesen",
+        "inspect": "Dateien werden geprüft",
+        "change": "Dateien werden bearbeitet",
+        "run": "Befehle werden ausgeführt",
+        "create": "Artefakte werden erstellt",
+        "recall": "Speicher wird durchsucht",
+        "use": "Werkzeuge werden verwendet"
+      },
+      "footprint": {
+        "web": "{count} Web-Aktion | {count} Web-Aktionen",
+        "files": "{count} Datei | {count} Dateien",
+        "fileOperations": "{count} Dateioperation | {count} Dateioperationen",
+        "commands": "{count} Befehl | {count} Befehle",
+        "artifacts": "{count} Artefakt | {count} Artefakte",
+        "memory": "{count} Speicherabfrage | {count} Speicherabfragen",
+        "tools": "{count} Werkzeugaufruf | {count} Werkzeugaufrufe"
+      },
+      "more": "{count} weitere",
+      "stale": "Arbeitet weiter — kein aktuelles Signal",
+      "liveStep": "Schritt {n}"
+    },
     "suggestedTasks": "Vorgeschlagene Aufgaben",
     "greetingMorning": "Guten Morgen.",
     "greetingAfternoon": "Guten Tag.",
@@ -2938,7 +3012,8 @@
       "downloadFailed": "Download fehlgeschlagen",
       "forkFailed": "Verzweigen fehlgeschlagen",
       "copyFailed": "Kopieren fehlgeschlagen",
-      "shareExportFailed": "Teilen-Export fehlgeschlagen",
+      "shareSaveFailed": "Bild konnte nicht gespeichert werden. Versuchen Sie es erneut.",
+      "sharePreviewUpdateFailed": "Vorschau konnte nicht aktualisiert werden. Versuchen Sie es erneut.",
       "saved": "{filename} gespeichert",
       "copiedToClipboard": "In die Zwischenablage kopiert",
       "copyNotSupported": "Kopieren nicht unterstützt — stattdessen herunterladen",
@@ -2953,6 +3028,11 @@
       "voiceUnavailable": "Spracheingabe ist nicht verfügbar. Aktivieren Sie sie in den Einstellungen.",
       "voiceTranscribeFailed": "Aufnahme konnte nicht transkribiert werden. Bitte erneut versuchen.",
       "voiceSetupNeeded": "Spracheingabe benötigt einen ElevenLabs-API-Schlüssel – Einstellungen werden geöffnet…",
+      "voiceCancelledHidden": "Die Aufnahme wurde beendet, als das Fenster ausgeblendet wurde. Starten Sie erneut, um zu diktieren.",
+      "voiceMicDenied": "Der Mikrofonzugriff wurde verweigert. Erlauben Sie ihn in den Browsereinstellungen.",
+      "voiceMicDeniedDesktop": "Der Mikrofonzugriff ist blockiert. Erlauben Sie ihn in den Systemeinstellungen und versuchen Sie es dann erneut.",
+      "voiceMicMissing": "Es wurde kein Mikrofon gefunden.",
+      "voiceRecordFailed": "Aufnahme konnte nicht gestartet werden. Bitte erneut versuchen.",
       "waitAttachments": "Warten Sie, bis die Verarbeitung der Dateianhänge abgeschlossen ist",
       "waitCompactionBeforeCommand": "Warten Sie auf die Kontextverdichtung, bevor Sie {command} ausführen.",
       "waitResponseBeforeCommand": "Warten Sie auf die aktuelle Antwort, bevor Sie {command} ausführen.",
@@ -2968,8 +3048,7 @@
       "preparingOutput": "Ausgabe wird vorbereitet",
       "generatingCandidates": "Kandidaten werden generiert",
       "synthesizingCandidates": "Kandidaten werden zusammengeführt",
-      "stillWaiting": "Warte weiterhin auf Modell",
-      "stillWorking": "Noch in Arbeit — letztes Signal vor {seconds} s"
+      "stillWaiting": "Warte weiterhin auf Modell"
     },
     "stall": {
       "title": "Die Antwort dauert länger als erwartet",
@@ -3113,7 +3192,12 @@
       "sectionDiagnostics": "Diagnose",
       "sectionResult": "Ergebnis",
       "sectionError": "Fehler",
-      "viewFull": "vollständig anzeigen"
+      "viewFull": "vollständig anzeigen",
+      "activityViewDetails": "Details anzeigen",
+      "activityDetailsTitle": "Details",
+      "activityBytesWritten": "{size} geschrieben",
+      "activityContentSize": "{lines} Zeilen · {characters} Zeichen",
+      "activityPublished": "Veröffentlicht"
     }
   },
   "channelStatus": {

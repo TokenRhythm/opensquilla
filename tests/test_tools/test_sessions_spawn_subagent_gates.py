@@ -16,6 +16,8 @@ from pathlib import Path
 import pytest
 
 from opensquilla.gateway.routing import tool_context_from_envelope
+from opensquilla.provider.correlation_context import bind_provider_request_correlation
+from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.sandbox.run_context import (
     DomainGrant,
     MountGrant,
@@ -108,16 +110,32 @@ class _StubTaskRuntime:
     def __init__(self) -> None:
         self.enqueued: list[dict] = []
 
-    async def enqueue(self, envelope, message, mode="followup", run_kind="default"):
+    async def enqueue(
+        self,
+        envelope,
+        message,
+        mode="followup",
+        run_kind="default",
+        *,
+        task_id=None,
+        provider_request_correlation=None,
+    ):
         self.enqueued.append(
-            {"envelope": envelope, "message": message, "mode": mode, "run_kind": run_kind}
+            {
+                "envelope": envelope,
+                "message": message,
+                "mode": mode,
+                "run_kind": run_kind,
+                "task_id": task_id,
+                "provider_request_correlation": provider_request_correlation,
+            }
         )
 
         @dataclass
         class _Handle:
-            task_id: str = "task-stub"
+            task_id: str
 
-        return _Handle()
+        return _Handle(task_id or "task-stub")
 
 
 @dataclass
@@ -463,6 +481,46 @@ async def test_max_children_permits_below_cap() -> None:
     finally:
         current_tool_context.reset(token)
     assert len(rt.enqueued) == 1
+
+
+@pytest.mark.asyncio
+async def test_sessions_spawn_reuses_run_id_as_task_and_provider_execution() -> None:
+    mgr = _StubSessionManager(
+        {
+            "caller": {"id": "caller", "enabled": True},
+            "worker": {"id": "worker", "enabled": True},
+        }
+    )
+    rt = _StubTaskRuntime()
+    sessions_tool.set_session_manager(mgr)
+    sessions_tool.set_task_runtime(rt)
+    root = ProviderRequestCorrelation(
+        session_id="parent-durable-session",
+        turn_id="parent-root-turn",
+        execution_id="parent-execution",
+        call_kind="agent.chat",
+    )
+
+    token = current_tool_context.set(_ctx())
+    try:
+        with bind_provider_request_correlation(root):
+            result = json.loads(
+                await sessions_tool.sessions_spawn(agent_id="worker", task="hi")
+            )
+    finally:
+        current_tool_context.reset(token)
+
+    queued = rt.enqueued[0]
+    run_id = queued["task_id"]
+    correlation = queued["provider_request_correlation"]
+    assert isinstance(correlation, ProviderRequestCorrelation)
+    assert result["task_id"] == run_id
+    assert queued["envelope"].metadata["run_id"] == run_id
+    assert queued["envelope"].input_provenance["run_id"] == run_id
+    assert correlation.session_id == root.session_id
+    assert correlation.turn_id == root.turn_id
+    assert correlation.execution_id == run_id
+    assert correlation.call_kind == "subagent.chat"
 
 
 # ── model fallback chain ────────────────────────────────────────────────

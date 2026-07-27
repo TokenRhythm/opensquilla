@@ -28,6 +28,7 @@ import pytest
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.types import ErrorEvent
 from opensquilla.observability.prompt_report import PromptReport
+from opensquilla.provider.types import ProviderRequestCorrelation
 
 # ---------------------------------------------------------------------------
 # Shared stubs
@@ -206,7 +207,12 @@ def _patch_run_pipeline(runner, turn_factory, provider, raises=None):
         flags_text_override=None,
         tool_context=None,
         normalization_metadata=None,
+        usage_execution_context=None,
+        provider_request_correlation=None,
     ):  # noqa: ARG001
+        runner._captured_provider_request_correlation = (
+            provider_request_correlation
+        )
         if raises is not None:
             raise raises("equivalence pipeline boom")
         return turn_factory(), provider
@@ -385,7 +391,14 @@ _CORPUS: list[tuple[str, dict[str, Any]]] = [
 # ---------------------------------------------------------------------------
 
 
-async def _drive(runner, case):
+async def _drive(
+    runner,
+    case,
+    *,
+    run_kind: str = "default",
+    root_turn_id: str = "root-turn-1",
+    provider_request_correlation: ProviderRequestCorrelation | None = None,
+):
     captured = None
     raised = None
     yielded: list[Any] = []
@@ -401,6 +414,9 @@ async def _drive(runner, case):
         input_provenance=None,
         history_has_persisted_user=True,
         semantic_message=None,
+        run_kind=run_kind,
+        root_turn_id=root_turn_id,
+        provider_request_correlation=provider_request_correlation,
     )
     try:
         async for event in gen:
@@ -455,8 +471,12 @@ def _setup_runner(case: dict[str, Any]) -> TurnRunner:
 @pytest.mark.parametrize("case_id,case", _CORPUS, ids=[c[0] for c in _CORPUS])
 @pytest.mark.asyncio
 async def test_prompt_assembler_stage_snapshot(
-    case_id, case,
+    case_id, case, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv(
+        "OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY",
+        raising=False,
+    )
     runner = _setup_runner(case)
     captured, yielded, raised = await _drive(runner, case)
 
@@ -513,3 +533,93 @@ async def test_prompt_assembler_stage_snapshot(
         f"case={case_id}: snapshot diverged.\n"
         f"  expected={expected_snapshot}\n  actual  ={captured}"
     )
+    correlation = getattr(runner, "_captured_provider_request_correlation", None)
+    if case["session_id"] is None:
+        assert correlation is None
+    else:
+        assert correlation.session_id == case["session_id"]
+        assert correlation.turn_id == "root-turn-1"
+        assert correlation.execution_id != correlation.turn_id
+        assert correlation.call_kind == "agent.chat"
+        assert runner._usage_event_sink is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disable_source", ["config", "env"])
+async def test_root_provider_correlation_respects_dedicated_privacy_switch(
+    disable_source: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(
+        "OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY",
+        raising=False,
+    )
+    case = dict(_CASE_BASE)
+    runner = _setup_runner(case)
+    if disable_source == "config":
+        runner._config = SimpleNamespace(
+            privacy=SimpleNamespace(disable_network_observability=True),
+        )
+    else:
+        monkeypatch.setenv(
+            "OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY",
+            "true",
+        )
+
+    captured, yielded, raised = await _drive(runner, case)
+
+    assert captured is not None
+    assert yielded == []
+    assert raised is None
+    assert runner._captured_provider_request_correlation is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_subagent_reuses_explicit_parent_root_and_run_execution() -> None:
+    case = dict(_CASE_BASE)
+    case["session_id"] = "child-durable-session"
+    runner = _setup_runner(case)
+    correlation = ProviderRequestCorrelation(
+        session_id="parent-durable-session",
+        turn_id="parent-root-turn",
+        execution_id="subagent-run-id",
+        call_kind="subagent.chat",
+    )
+
+    captured, yielded, raised = await _drive(
+        runner,
+        case,
+        run_kind="subagent",
+        provider_request_correlation=correlation,
+    )
+
+    assert captured is not None
+    assert yielded == []
+    assert raised is None
+    assert runner._captured_provider_request_correlation == correlation
+
+
+@pytest.mark.asyncio
+async def test_runtime_same_session_assigns_distinct_turn_and_execution_ids() -> None:
+    case = dict(_CASE_BASE)
+    case["session_id"] = "durable-session-shared"
+    correlations: list[ProviderRequestCorrelation] = []
+
+    for root_turn_id in ("root-turn-a", "root-turn-b"):
+        runner = _setup_runner(case)
+        captured, yielded, raised = await _drive(
+            runner,
+            case,
+            root_turn_id=root_turn_id,
+        )
+
+        assert captured is not None
+        assert yielded == []
+        assert raised is None
+        correlation = runner._captured_provider_request_correlation
+        assert isinstance(correlation, ProviderRequestCorrelation)
+        correlations.append(correlation)
+
+    assert correlations[0].session_id == correlations[1].session_id
+    assert correlations[0].turn_id != correlations[1].turn_id
+    assert correlations[0].execution_id != correlations[1].execution_id

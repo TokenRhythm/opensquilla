@@ -43,6 +43,7 @@ from .types import (
     ProviderHeartbeatEvent,
     ProviderMessageCountProjection,
     ProviderMessageLimitProof,
+    ProviderRequestCorrelation,
     ReasoningDeltaEvent,
     StreamEvent,
     TextDeltaEvent,
@@ -50,6 +51,7 @@ from .types import (
     ToolUseDeltaEvent,
     ToolUseEndEvent,
     ToolUseStartEvent,
+    derive_provider_request_correlation,
 )
 
 TRACE_CONTENT_MAX_CHARS = 8_000
@@ -482,6 +484,60 @@ def _member_budget_key(member: EnsembleMemberConfig) -> tuple[str, str, str]:
     )
 
 
+_ENSEMBLE_CORRELATION_PHASES = frozenset(
+    {
+        "proposer",
+        "aggregator",
+        "fallback_single",
+    }
+)
+
+
+def _ensemble_call_kind(call_kind: str, phase: str) -> str:
+    """Replace a leaf chat kind with one ensemble phase, preserving failover."""
+
+    provider_fallback = call_kind.endswith(".provider_fallback")
+    base_kind = (
+        call_kind.removesuffix(".provider_fallback")
+        if provider_fallback
+        else call_kind
+    )
+    if base_kind not in {"agent.chat", "subagent.chat"}:
+        return call_kind
+    base_kind = base_kind.removesuffix(".chat")
+    derived = f"{base_kind}.ensemble.{phase}"
+    if provider_fallback:
+        derived += ".provider_fallback"
+    return derived
+
+
+def _derive_ensemble_correlation(
+    correlation: ProviderRequestCorrelation | None,
+    phase: str,
+) -> ProviderRequestCorrelation | None:
+    if correlation is None:
+        return None
+    return derive_provider_request_correlation(
+        correlation,
+        call_kind=_ensemble_call_kind(correlation.call_kind, phase),
+    )
+
+
+def _derive_ensemble_chat_config(
+    config: ChatConfig | None,
+    phase: str,
+) -> ChatConfig | None:
+    if config is None or phase not in _ENSEMBLE_CORRELATION_PHASES:
+        return config
+    correlation = _derive_ensemble_correlation(
+        config.provider_request_correlation,
+        phase,
+    )
+    if correlation is config.provider_request_correlation:
+        return config
+    return config.model_copy(update={"provider_request_correlation": correlation})
+
+
 def _effective_request_cap_source(
     binding: _MemberRequestBudgetBinding | None,
     chat_config: ChatConfig | None,
@@ -559,7 +615,8 @@ def _member_chat_config(
                     request_budget_binding.context_window_source
                 ),
             )
-    return effective
+    derived = _derive_ensemble_chat_config(effective, role)
+    return derived if derived is not None else effective
 
 
 def _build_provider(cfg: ProviderConfig) -> LLMProvider:
@@ -889,6 +946,7 @@ class EnsembleProvider:
             member_config = _member_chat_config(
                 config,
                 member,
+                role="proposer",
             ).model_copy(update=proposer_updates)
             _require_projection(
                 _build_provider(member.provider_config),
@@ -900,6 +958,7 @@ class EnsembleProvider:
             aggregator_config = _member_chat_config(
                 config,
                 self.aggregator,
+                role="aggregator",
             ).model_copy(update={"candidate_output_mode": "normal"})
             _require_projection(
                 _build_provider(self.aggregator.provider_config),
@@ -913,6 +972,10 @@ class EnsembleProvider:
                 if config is not None
                 and config.candidate_output_mode != "normal"
                 else config
+            )
+            fallback_config = _derive_ensemble_chat_config(
+                fallback_config,
+                "fallback_single",
             )
             _require_projection(
                 self.fallback_provider,
@@ -1819,6 +1882,10 @@ class EnsembleProvider:
             if config is not None
             and config.candidate_output_mode != "normal"
             else config
+        )
+        fallback_config = _derive_ensemble_chat_config(
+            fallback_config,
+            "fallback_single",
         )
         fallback_timeout_seconds = float(
             getattr(fallback_config, "timeout", ChatConfig().timeout)

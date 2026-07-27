@@ -34,6 +34,11 @@ Known live-vs-replay divergences:
   as ``should_challenge: false`` with ``suppressed_reason:
   no_finalize_attempt_at_transcript_end`` (raw triggers stay in the report
   for diagnostics).
+
+Every report line carries BOTH modes: the base-gate fields plus
+``strict_triggers`` / ``strict_should_challenge`` / ``strict_primary_reason``
+from a strict tracker fed the identical event stream, so strict-mode
+calibration compares trigger sets on the same traces in one pass.
 """
 
 from __future__ import annotations
@@ -127,7 +132,10 @@ def replay_run(run_dir: Path) -> dict[str, Any]:
         git_patch.read_text(errors="replace").strip()
     )
 
+    # Feed the identical event stream to a base tracker and a strict one so
+    # each report line carries both trigger sets for side-by-side calibration.
     tracker = FinalizeEvidenceTracker()
+    strict_tracker = FinalizeEvidenceTracker(strict=True)
     pending_calls: dict[str, tuple[str, dict[str, Any] | None]] = {}
     iteration = 0
     parse_errors = 0
@@ -175,12 +183,14 @@ def replay_run(run_dir: Path) -> dict[str, Any]:
             _, arguments = pending_calls.get(call_id, (tool_name, None))
             is_error = bool(message.get("isError"))
             if tool_name in WRITE_TOOL_NAMES:
-                tracker.observe_write(
-                    _string_arg(arguments, "path", "file_path"),
-                    is_error=is_error,
-                    iteration=iteration,
-                    scratch=(tool_name == "write_scratch"),
-                )
+                write_path = _string_arg(arguments, "path", "file_path")
+                for observer in (tracker, strict_tracker):
+                    observer.observe_write(
+                        write_path,
+                        is_error=is_error,
+                        iteration=iteration,
+                        scratch=(tool_name == "write_scratch"),
+                    )
             elif tool_name in EXECUTION_TOOL_NAMES:
                 command = _command_for_tool_call(tool_name, arguments)
                 if command is None:
@@ -195,17 +205,21 @@ def replay_run(run_dir: Path) -> dict[str, Any]:
                     ),
                     is_error=is_error,
                 )
-                tracker.observe_execution(
-                    command,
-                    red=red,
-                    exit_code=exit_code,
-                    timed_out=timed_out,
-                    status_reason=status_reason,
-                    failure_anchors=_failure_anchor_lines(content_text) if red else (),
-                    iteration=iteration,
-                )
+                for observer in (tracker, strict_tracker):
+                    observer.observe_execution(
+                        command,
+                        red=red,
+                        exit_code=exit_code,
+                        timed_out=timed_out,
+                        status_reason=status_reason,
+                        failure_anchors=_failure_anchor_lines(content_text) if red else (),
+                        iteration=iteration,
+                    )
 
     observation = tracker.build_observation(has_workspace_diff=has_workspace_diff)
+    strict_observation = strict_tracker.build_observation(
+        has_workspace_diff=has_workspace_diff
+    )
     # Live parity: the gate only runs on a zero-tool-call assistant message.
     # A transcript that ends mid-loop (iteration cap, abort) never reached it.
     finalize_attempt_at_end = last_assistant_had_tool_calls is False
@@ -218,9 +232,16 @@ def replay_run(run_dir: Path) -> dict[str, Any]:
         "has_workspace_diff_source": "git.patch",
         "finalize_attempt_at_end": finalize_attempt_at_end,
         **observation.to_event_details(),
+        "strict_triggers": strict_observation.triggers,
+        "strict_should_challenge": strict_observation.should_challenge,
+        "strict_primary_reason": strict_observation.primary_reason,
+        "strict_red_first_satisfied": strict_observation.red_first_satisfied,
+        "strict_red_first_candidate_count": strict_observation.red_first_candidate_count,
+        "strict_verification_command_count": strict_observation.verification_command_count,
     }
     if not finalize_attempt_at_end:
         report["should_challenge"] = False
+        report["strict_should_challenge"] = False
         report["suppressed_reason"] = "no_finalize_attempt_at_transcript_end"
     return report
 
@@ -239,6 +260,8 @@ def _run_sets(sets_path: Path) -> int:
         quiet: list[str] = []
         errored: list[str] = []
         trigger_counts: dict[str, int] = {}
+        strict_fired: list[str] = []
+        strict_trigger_counts: dict[str, int] = {}
         for entry in entries:
             label, run_dir = entry[0], Path(entry[1])
             report = replay_run(run_dir)
@@ -254,6 +277,12 @@ def _run_sets(sets_path: Path) -> int:
                     trigger_counts[trigger] = trigger_counts.get(trigger, 0) + 1
             else:
                 quiet.append(label)
+            if report.get("strict_should_challenge"):
+                strict_fired.append(label)
+                for trigger in report.get("strict_triggers") or []:
+                    strict_trigger_counts[trigger] = (
+                        strict_trigger_counts.get(trigger, 0) + 1
+                    )
         summary[set_name] = {
             "expected_fire": expected_fire,
             "total": len(entries),
@@ -262,6 +291,8 @@ def _run_sets(sets_path: Path) -> int:
             "errored": len(errored),
             "fired_labels": fired if expected_fire else fired,
             "trigger_counts": trigger_counts,
+            "strict_fired": len(strict_fired),
+            "strict_trigger_counts": strict_trigger_counts,
         }
     print("\n=== finalize-evidence-gate replay summary ===", file=sys.stderr)
     for set_name, stats in summary.items():
@@ -269,6 +300,11 @@ def _run_sets(sets_path: Path) -> int:
         print(
             f"{set_name}: fired {stats['fired']}/{stats['total']} ({rate:.0%})"
             f" errored={stats['errored']} triggers={stats['trigger_counts']}",
+            file=sys.stderr,
+        )
+        print(
+            f"  strict: fired {stats['strict_fired']}/{stats['total']}"
+            f" triggers={stats['strict_trigger_counts']}",
             file=sys.stderr,
         )
         if stats["expected_fire"] and stats["fired"] != stats["total"]:

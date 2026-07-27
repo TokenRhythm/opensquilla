@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { createServer } from 'node:net'
 import { mkdtemp, mkdir, readdir, rm, writeFile } from 'node:fs/promises'
 import { statSync } from 'node:fs'
@@ -17,6 +17,19 @@ const deadlineMs = Number.parseInt(process.env.OPENSQUILLA_GATEWAY_SMOKE_TIMEOUT
 const pollIntervalMs = 250
 const killGraceMs = 3_000
 const maxTailLines = 80
+const caProbeSuccessPattern = /\bopensquilla-desktop-ca-store-ok x509_ca=(\d+)\b/
+const strippedTlsEnvironmentKeys = new Set([
+  'ALL_PROXY',
+  'CURL_CA_BUNDLE',
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'NODE_EXTRA_CA_CERTS',
+  'NODE_TLS_REJECT_UNAUTHORIZED',
+  'NO_PROXY',
+  'REQUESTS_CA_BUNDLE',
+  'SSL_CERT_DIR',
+  'SSL_CERT_FILE',
+])
 
 function appendTail(tail, chunk) {
   const lines = chunk
@@ -116,6 +129,7 @@ function smokeEnv(tempHome, config) {
   const env = {}
   for (const [key, value] of Object.entries(process.env)) {
     if (key.startsWith('OPENSQUILLA_')) continue
+    if (strippedTlsEnvironmentKeys.has(key.toUpperCase())) continue
     env[key] = value
   }
 
@@ -132,6 +146,27 @@ function smokeEnv(tempHome, config) {
     PYTHONUNBUFFERED: '1',
     PYTHONUTF8: '1',
     PYTHONIOENCODING: 'utf-8:replace',
+  }
+}
+
+function verifyGatewayCaStore(gatewayBinary, env) {
+  const result = spawnSync(gatewayBinary, ['--_desktop-ca-probe'], {
+    cwd: dirname(gatewayBinary),
+    env,
+    encoding: 'utf8',
+    windowsHide: true,
+  })
+  if (result.error) throw result.error
+  const match = result.stdout.match(caProbeSuccessPattern)
+  const caCertificateCount = match ? Number.parseInt(match[1], 10) : 0
+  if (result.status !== 0 || caCertificateCount <= 0) {
+    throw new Error(
+      `Packaged gateway TLS trust probe failed with exit ${result.status ?? 'null'}.` +
+        formatTail(
+          result.stdout ? result.stdout.trim().split(/\r?\n/) : [],
+          result.stderr ? result.stderr.trim().split(/\r?\n/) : [],
+        )
+    )
   }
 }
 
@@ -360,10 +395,13 @@ async function main() {
       'utf8'
     )
 
+    const env = smokeEnv(tempHome, config)
+    verifyGatewayCaStore(gatewayBinary, env)
+
     const port = await findFreePort()
     child = spawn(gatewayBinary, ['gateway', 'run', '--port', String(port), '--bind', '127.0.0.1', '--config', config], {
       cwd: dirname(gatewayBinary),
-      env: smokeEnv(tempHome, config),
+      env,
       windowsHide: true,
     })
 

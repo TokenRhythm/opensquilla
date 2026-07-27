@@ -189,6 +189,9 @@ from opensquilla.observability.decision_log import (
     compute_hashes,
     write_decision_entry,
 )
+from opensquilla.observability.network_policy import (
+    provider_request_correlation_disabled,
+)
 from opensquilla.observability.prompt_report import PromptReport, build_prompt_report
 from opensquilla.observability.trace import TraceContext, TraceEvent, write_trace_event
 from opensquilla.observability.turn_call_log import TurnCallLogger, is_turn_call_log_enabled
@@ -206,6 +209,10 @@ from opensquilla.provider.model_catalog import resolve_effective_context_window
 from opensquilla.provider.protocol import validate_provider_chat_request
 from opensquilla.provider.types import (
     EnsembleProgressEvent as ProviderEnsembleProgressEvent,
+)
+from opensquilla.provider.types import (
+    ProviderRequestCorrelation,
+    derive_provider_request_correlation,
 )
 from opensquilla.router_control import (
     RouterControlHoldStore,
@@ -251,6 +258,7 @@ from opensquilla.session.terminal_reply import (
     build_terminal_reply,
     sanitize_agent_error,
 )
+from opensquilla.tools.description_overrides import resolve_tool_description_overrides
 from opensquilla.tools.types import CallerKind, InteractionMode, ToolContext
 
 if TYPE_CHECKING:
@@ -1472,6 +1480,7 @@ class _SelectorFallbackProvider:
         # the default everywhere today — makes every ledger hook below a
         # no-op, keeping the default fallback path byte-identical.
         self._health_ledger = health_ledger
+        self._used_fallback = False
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._provider, name)
@@ -1545,6 +1554,7 @@ class _SelectorFallbackProvider:
         (engine/steps/router_decision_record.py) so persisted rows report
         how many hops away from the routed model the executed one is.
         """
+        self._used_fallback = True
         metadata = self._turn_metadata
         if metadata is None:
             return
@@ -1562,6 +1572,28 @@ class _SelectorFallbackProvider:
         current_config = getattr(self._selector, "current_config", None)
         model = str(getattr(current_config, "model", "") or "")
         return provider_id, model
+
+    def _config_for_active_leg(self, config: Any) -> Any:
+        """Mark selector fallback legs without changing their logical identity."""
+
+        if not self._used_fallback:
+            return config
+        correlation = getattr(config, "provider_request_correlation", None)
+        if not isinstance(
+            correlation,
+            ProviderRequestCorrelation,
+        ) or correlation.call_kind.endswith(".provider_fallback"):
+            return config
+        fallback_correlation = derive_provider_request_correlation(
+            correlation,
+            call_kind=f"{correlation.call_kind}.provider_fallback",
+        )
+        model_copy = getattr(config, "model_copy", None)
+        if not callable(model_copy):
+            return config
+        return model_copy(
+            update={"provider_request_correlation": fallback_correlation},
+        )
 
     def _record_health_failure(self, event: ProviderErrorEvent) -> None:
         """Feed one pre-content provider error into the opt-in health ledger."""
@@ -1667,8 +1699,9 @@ class _SelectorFallbackProvider:
 
         active_provider = self._provider
         active_provider_id, active_model = self._active_deployment()
+        active_config = self._config_for_active_leg(config)
         primary_stream = account_provider_stream(
-            lambda: active_provider.chat(messages, tools=tools, config=config),
+            lambda: active_provider.chat(messages, tools=tools, config=active_config),
             provider=active_provider_id,
             model=active_model,
         )
@@ -1713,11 +1746,12 @@ class _SelectorFallbackProvider:
                     await primary_stream.aclose()
                     fallback_provider = self._provider
                     fallback_provider_id, fallback_model = self._active_deployment()
+                    fallback_config = self._config_for_active_leg(config)
                     fallback_stream = account_provider_stream(
                         lambda: fallback_provider.chat(
                             messages,
                             tools=tools,
-                            config=config,
+                            config=fallback_config,
                         ),
                         provider=fallback_provider_id,
                         model=fallback_model,
@@ -2468,6 +2502,39 @@ def _resolve_legacy_prompt_style(config: object) -> bool:
     return bool(getattr(prompt_cfg, "legacy_prompt_style", False))
 
 
+_SUBMIT_REVIEW_ENV = "OPENSQUILLA_SUBMIT_REVIEW"
+_SUBMIT_REVIEW_ON = {"on", "1", "true", "yes"}
+_SUBMIT_REVIEW_OFF = {"off", "0", "false", "no"}
+
+
+def _resolve_submit_review(config: object) -> bool:
+    """Resolve the opt-in review-on-submit checkpoint flag at surface time.
+
+    ``OPENSQUILLA_SUBMIT_REVIEW`` ("on"/"off") overrides
+    ``config.submit_review_enabled``; default is off. The env read mirrors
+    ``engine.turn_runner.agent_bootstrap_stage._submit_review_from_env`` so the
+    tool-surfacing decision here agrees with the loop-side gate: the loop config
+    (``AgentConfig`` built in agent_bootstrap_stage) and the TurnRunner
+    ``self._config`` are distinct objects, so reading the config field alone
+    surfaces ``submit`` only when the two happen to share provenance. Reading the
+    same env var directly keeps surfacing and loop behaviour in lockstep.
+    Unrecognized env values raise instead of being silently ignored so an
+    experiment manifest cannot record a lever the run did not actually apply.
+    """
+    env_value = os.environ.get(_SUBMIT_REVIEW_ENV, "").strip().lower()
+    if env_value:
+        if env_value in _SUBMIT_REVIEW_ON:
+            return True
+        if env_value in _SUBMIT_REVIEW_OFF:
+            return False
+        raise ValueError(
+            f"{_SUBMIT_REVIEW_ENV} must be one of: "
+            + ", ".join(sorted(_SUBMIT_REVIEW_ON | _SUBMIT_REVIEW_OFF))
+        )
+
+    return bool(getattr(config, "submit_review_enabled", False))
+
+
 class TurnRunner:
     """Orchestrates a complete agent turn: provider → tools → prompt → pipeline → Agent.
 
@@ -2990,6 +3057,8 @@ class TurnRunner:
         pending_input_provider: PendingInputProvider | None = None,
         bound_user_message_id: str | None = None,
         assistant_message_sink: Callable[[str | None, str], None] | None = None,
+        root_turn_id: str | None = None,
+        provider_request_correlation: ProviderRequestCorrelation | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run one agent turn with full orchestration.
 
@@ -3006,6 +3075,9 @@ class TurnRunner:
         agent_id = normalize_agent_id(agent_id)
         normalized_input_provenance = self._normalize_input_provenance(input_provenance)
         lock = self.get_session_lock(session_key)
+        # Resolved once per turn; ValueError propagates so a run manifest
+        # cannot record an override the run did not actually apply.
+        resolved_description_overrides = resolve_tool_description_overrides(self._config)
         effective_tool_context = replace(
             tool_context,
             session_key=session_key,
@@ -3014,6 +3086,16 @@ class TurnRunner:
             router_control_hold_store=self._router_control_hold_store,
             router_control_replay_depth=router_control_replay_depth,
             router_control_turn_hold_applied=False,
+            tool_description_overrides=(
+                resolved_description_overrides[0]
+                if resolved_description_overrides
+                else None
+            ),
+            tool_description_overrides_source=(
+                resolved_description_overrides[1]
+                if resolved_description_overrides
+                else None
+            ),
         )
         # Re-entry detection: check whether this call chain already serializes
         # the turn lifecycle. On the gateway path TaskRuntime marks ownership
@@ -3056,6 +3138,8 @@ class TurnRunner:
                     router_control_replay_depth=router_control_replay_depth,
                     bound_user_message_id=bound_user_message_id,
                     assistant_message_sink=assistant_message_sink,
+                    root_turn_id=root_turn_id,
+                    provider_request_correlation=provider_request_correlation,
                 ):
                     yield event
             finally:
@@ -3099,6 +3183,8 @@ class TurnRunner:
                         router_control_replay_depth=router_control_replay_depth,
                         bound_user_message_id=bound_user_message_id,
                         assistant_message_sink=assistant_message_sink,
+                        root_turn_id=root_turn_id,
+                        provider_request_correlation=provider_request_correlation,
                     ):
                         yield event
                 finally:
@@ -3137,11 +3223,27 @@ class TurnRunner:
         pending_input_provider: PendingInputProvider | None = None,
         bound_user_message_id: str | None = None,
         assistant_message_sink: Callable[[str | None, str], None] | None = None,
+        root_turn_id: str | None = None,
+        provider_request_correlation: ProviderRequestCorrelation | None = None,
     ) -> AsyncIterator[AgentEvent]:
         # Observability: bracket turn setup + stream loop with monotonic clock
         # so latency_ms reflects the full turn.
         turn_started_at = time.monotonic()
-        turn_id = uuid.uuid4().hex
+        turn_id = (
+            root_turn_id.strip()
+            if isinstance(root_turn_id, str) and root_turn_id.strip()
+            else uuid.uuid4().hex
+        )
+        correlation_seed = provider_request_correlation
+        is_subagent_run = str(run_kind or "").strip().lower() == "subagent"
+        root_call_kind = "subagent.chat" if is_subagent_run else "agent.chat"
+        root_execution_id = (
+            correlation_seed.execution_id
+            if isinstance(correlation_seed, ProviderRequestCorrelation)
+            else turn_id
+            if is_subagent_run
+            else uuid.uuid4().hex
+        )
         resolved_model = ""
         final_prompt_str = ""
         turn_obj: Any | None = None
@@ -3182,6 +3284,29 @@ class TurnRunner:
             },
         )
         try:
+            # Resolve the durable identity before any pipeline stage can make
+            # an auxiliary provider call. This lookup is independent from the
+            # optional usage sink and never falls back to the external
+            # session_key, which may contain channel or user information.
+            pipeline_session_id = await self._resolve_session_id_for_log(session_key)
+            if provider_request_correlation_disabled(config=self._turn_config()):
+                provider_request_correlation = None
+            elif isinstance(correlation_seed, ProviderRequestCorrelation):
+                provider_request_correlation = derive_provider_request_correlation(
+                    correlation_seed,
+                    execution_id=root_execution_id,
+                    call_kind=root_call_kind,
+                )
+            elif pipeline_session_id is not None:
+                provider_request_correlation = ProviderRequestCorrelation(
+                    session_id=pipeline_session_id,
+                    turn_id=turn_id,
+                    execution_id=root_execution_id,
+                    call_kind=root_call_kind,
+                )
+            else:
+                provider_request_correlation = None
+
             input_out = await self._input_stage.run(
                 InputStageInput(
                     message=message,
@@ -3244,7 +3369,6 @@ class TurnRunner:
             pipeline_usage_context: UsageExecutionContext | None = None
             turn_usage_scope: UsageAccountingScope | None = None
             if self._usage_event_sink is not None:
-                pipeline_session_id = await self._resolve_session_id_for_log(session_key)
                 pipeline_usage_context = UsageExecutionContext(
                     execution_id=turn_id,
                     agent_run_id=turn_id,
@@ -3291,6 +3415,7 @@ class TurnRunner:
                         input_provenance=input_provenance,
                         skill_catalog=skill_catalog,
                         usage_execution_context=pipeline_usage_context,
+                        provider_request_correlation=provider_request_correlation,
                     )
                 )
             pa_out = pa_outcome.require_output()
@@ -3398,6 +3523,7 @@ class TurnRunner:
                     turn_id=turn_id,
                     run_kind=run_kind,
                     session_epoch=self._usage_session_epoch_by_key.get(session_key, 0),
+                    provider_request_correlation=provider_request_correlation,
                 )
             )
             ab_out = ab_outcome.require_output()
@@ -3444,6 +3570,11 @@ class TurnRunner:
                     )
                     compaction_context_window_tokens = window
             with bind_usage_accounting_scope(turn_usage_scope):
+                compaction_correlation = derive_provider_request_correlation(
+                    provider_request_correlation,
+                    execution_id=uuid.uuid4().hex,
+                    call_kind="auxiliary.compaction",
+                )
                 ch_outcome = await self._compaction_and_history_stage.run(
                     CompactionAndHistoryStageInput(
                         agent=agent,
@@ -3458,6 +3589,7 @@ class TurnRunner:
                         agent_id=agent_id,
                         history_has_persisted_user=history_has_persisted_user,
                         bound_user_message_id=bound_user_message_id,
+                        provider_request_correlation=compaction_correlation,
                     )
                 )
             ch_out = ch_outcome.require_output()
@@ -3563,6 +3695,8 @@ class TurnRunner:
                     ingress_pipeline_steps=ingress_pipeline_steps,
                     router_control_replay_depth=router_control_replay_depth + 1,
                     assistant_message_sink=assistant_message_sink,
+                    root_turn_id=turn_id,
+                    provider_request_correlation=provider_request_correlation,
                 ):
                     yield replayed_event
                 return
@@ -4708,6 +4842,7 @@ class TurnRunner:
             and not getattr(skill, "disable_model_invocation", False)
             for skill in loaded_skills
         )
+        submit_review_enabled = _resolve_submit_review(self._config)
         if ctx is not None:
             if meta_skill_enabled and meta_auto_trigger and has_invokable_meta_skill:
                 if ctx.surfaced_tools is None:
@@ -4715,6 +4850,10 @@ class TurnRunner:
                 ctx.surfaced_tools.add("meta_invoke")
             else:
                 ctx.denied_tools.add("meta_invoke")
+            if submit_review_enabled:
+                if ctx.surfaced_tools is None:
+                    ctx.surfaced_tools = set()
+                ctx.surfaced_tools.add("submit")
         if metadata is not None:
             metadata["meta_skill_enabled"] = meta_skill_enabled
             if skill_catalog is not None:
@@ -4739,6 +4878,15 @@ class TurnRunner:
                     hard_denied=None,
                 )
             ctx = self._apply_runtime_capability_denies(ctx)
+            # Surfacing (surfaced_tools) lifts the exposed_by_default gate but,
+            # by design, does NOT relax the allowed_tools allowlist (see
+            # ToolContext.surfaced_tools). When submit-review is enabled the
+            # active profile allowlist (e.g. repo_coding_scaffold_edit) omits
+            # "submit", so surfacing alone left it filtered as not_allowed and
+            # the tool never reached the provider schema. Add it to the
+            # allowlist here so the surfaced tool is actually exposed.
+            if submit_review_enabled and ctx.allowed_tools is not None:
+                ctx.allowed_tools = set(ctx.allowed_tools) | {"submit"}
             from opensquilla.tools.policy_config import coding_mode_denied_tools
 
             skills_cfg = getattr(self._config, "skills", None)
@@ -5286,6 +5434,7 @@ class TurnRunner:
         provider: Any,
         session_key: str,
         usage_execution_context: UsageExecutionContext | None = None,
+        provider_request_correlation: ProviderRequestCorrelation | None = None,
     ) -> Any:
         """Construct the (system_prompt, user_message) -> str callable that
         meta_resolution's awaiting branch invokes for ``nl_extract: true``.
@@ -5304,6 +5453,11 @@ class TurnRunner:
         # ``metadata`` off base_config (via getattr). ``self._config`` is
         # the GatewayConfig (different shape — no .model_id), so build a
         # minimal AgentConfig() rather than passing the wrong type.
+        meta_correlation = derive_provider_request_correlation(
+            provider_request_correlation,
+            execution_id=uuid.uuid4().hex,
+            call_kind="auxiliary.meta",
+        )
         return make_llm_chat_from_provider(
             provider=provider,
             base_config=AgentConfig(),
@@ -5311,6 +5465,7 @@ class TurnRunner:
             session_key=session_key,
             usage_event_sink=self._usage_event_sink,
             usage_execution_context=usage_execution_context,
+            provider_request_correlation=meta_correlation,
         )
 
     def _resolve_vision_followup_gate_model(self) -> str | None:
@@ -5361,7 +5516,16 @@ class TurnRunner:
         ) -> AsyncIterator[Any]:
             scope: UsageAccountingScope | None = None
             if self._usage_event_sink is not None:
-                execution_id = uuid.uuid4().hex
+                request_correlation = getattr(
+                    config,
+                    "provider_request_correlation",
+                    None,
+                )
+                execution_id = (
+                    request_correlation.execution_id
+                    if isinstance(request_correlation, ProviderRequestCorrelation)
+                    else uuid.uuid4().hex
+                )
                 parent = usage_execution_context
                 scope = UsageAccountingScope(
                     sink=self._usage_event_sink,
@@ -5441,6 +5605,7 @@ class TurnRunner:
         input_provenance: dict[str, Any] | None = None,
         skill_catalog: Any | None = None,
         usage_execution_context: UsageExecutionContext | None = None,
+        provider_request_correlation: ProviderRequestCorrelation | None = None,
     ) -> tuple[Any, Any]:
         """Run the pre-turn pipeline and re-resolve provider if model changed.
 
@@ -5537,6 +5702,7 @@ class TurnRunner:
                 provider,
                 session_key,
                 usage_execution_context,
+                provider_request_correlation,
             ),
             "router_control_hold_store": self._router_control_hold_store,
             # Surface the resolved per-agent workspace so the meta_invoke
@@ -5667,6 +5833,7 @@ class TurnRunner:
             metadata=initial_metadata,
             raw_message=semantic_message,
             skill_catalog=skill_catalog,
+            provider_request_correlation=provider_request_correlation,
         )
         turn = await run_pipeline(
             turn,
@@ -6426,6 +6593,7 @@ class TurnRunner:
         *,
         compaction_provider: Any | None = None,
         compaction_model: str | None = None,
+        provider_request_correlation: ProviderRequestCorrelation | None = None,
     ) -> str:
         """Flush memory and compact transcript when the router upgrades into t3.
 
@@ -6577,6 +6745,7 @@ class TurnRunner:
                 wait_for_receipt=requires_safe_receipt,
                 turn_id=compaction_id,
                 checkpoint_exists=checkpoint_saved,
+                provider_request_correlation=provider_request_correlation,
             )
             flush_receipt_status = flush_receipt_status_for_compaction(
                 flush_receipt,
@@ -6635,6 +6804,13 @@ class TurnRunner:
                     compact_kwargs["mutation_context"] = self._session_write_context_factory(
                         session_key
                     )
+                if provider_request_correlation is not None and _accepts_keyword_arg(
+                    compact_method,
+                    "provider_request_correlation",
+                ):
+                    compact_kwargs["provider_request_correlation"] = (
+                        provider_request_correlation
+                    )
                 compaction_result = await self._session_manager.compact_with_result(
                     session_key,
                     context_window_tokens,
@@ -6643,11 +6819,17 @@ class TurnRunner:
                 )
                 result = getattr(compaction_result, "summary", "") or ""
             else:
+                compact_call_kwargs: dict[str, Any] = {}
+                if provider_request_correlation is not None:
+                    compact_call_kwargs["provider_request_correlation"] = (
+                        provider_request_correlation
+                    )
                 result = await call_compact_with_optional_config(
                     self._session_manager.compact,
                     session_key,
                     context_window_tokens,
                     compaction_config,
+                    **compact_call_kwargs,
                 )
             if (
                 compaction_result is not None
@@ -6769,6 +6951,7 @@ class TurnRunner:
         *,
         compaction_provider: Any | None = None,
         compaction_model: str | None = None,
+        provider_request_correlation: ProviderRequestCorrelation | None = None,
     ) -> None:
         """Compact proactively if session history exceeds token budget.
 
@@ -6857,6 +7040,7 @@ class TurnRunner:
                 wait_for_receipt=requires_safe_receipt,
                 turn_id=compaction_id,
                 checkpoint_exists=checkpoint_saved,
+                provider_request_correlation=provider_request_correlation,
             )
             flush_receipt_status = flush_receipt_status_for_compaction(
                 flush_receipt,
@@ -6930,6 +7114,13 @@ class TurnRunner:
                     compact_kwargs["mutation_context"] = self._session_write_context_factory(
                         session_key
                     )
+                if provider_request_correlation is not None and _accepts_keyword_arg(
+                    compact_method,
+                    "provider_request_correlation",
+                ):
+                    compact_kwargs["provider_request_correlation"] = (
+                        provider_request_correlation
+                    )
                 compaction_result = await self._session_manager.compact_with_result(
                     session_key,
                     context_window_tokens,
@@ -6938,11 +7129,17 @@ class TurnRunner:
                 )
                 result = getattr(compaction_result, "summary", "") or ""
             else:
+                compact_call_kwargs: dict[str, Any] = {}
+                if provider_request_correlation is not None:
+                    compact_call_kwargs["provider_request_correlation"] = (
+                        provider_request_correlation
+                    )
                 result = await call_compact_with_optional_config(
                     self._session_manager.compact,
                     session_key,
                     context_window_tokens,
                     compaction_config,
+                    **compact_call_kwargs,
                 )
             if (
                 compaction_result is not None
@@ -7114,6 +7311,7 @@ class TurnRunner:
         wait_for_receipt: bool | None = None,
         turn_id: str | None = None,
         checkpoint_exists: bool | None = None,
+        provider_request_correlation: ProviderRequestCorrelation | None = None,
     ) -> Any | None:
         if self._session_flush_service is None:
             log.warning(
@@ -7158,6 +7356,14 @@ class TurnRunner:
         else:
             from opensquilla.session.keys import parse_agent_id
 
+            flush_correlation = derive_provider_request_correlation(
+                provider_request_correlation,
+                execution_id=uuid.uuid4().hex,
+                call_kind="auxiliary.session_flush",
+            )
+            flush_kwargs: dict[str, Any] = {}
+            if flush_correlation is not None:
+                flush_kwargs["provider_request_correlation"] = flush_correlation
             task = asyncio.create_task(
                 self._session_flush_service.execute(
                     transcript,
@@ -7169,6 +7375,7 @@ class TurnRunner:
                     raw_capture_policy="required",
                     turn_id=turn_id,
                     checkpoint_exists=checkpoint_exists,
+                    **flush_kwargs,
                 )
             )
             self._active_pre_compaction_flush_tasks[session_key] = task

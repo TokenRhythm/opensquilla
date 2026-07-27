@@ -66,7 +66,8 @@
     "discard": "Descartar",
     "cancel": "Cancelar",
     "edit": "Editar",
-    "delete": "Eliminar"
+    "delete": "Eliminar",
+    "dismiss": "Descartar"
   },
   "nav": {
     "chat": "Chat",
@@ -144,7 +145,8 @@
       "themeLabel": "Tema",
       "themeDesc": "Sigue tu sistema o fuerza el modo claro u oscuro. El conmutador de la barra lateral es un atajo a este mismo ajuste.",
       "languageLabel": "Idioma",
-      "languageDesc": "Idioma de visualización de la interfaz. Se aplica al instante a este navegador.",
+      "languageDesc": "Idioma de visualización de la interfaz y de los mensajes del sistema de los canales. Se aplica aquí al instante y guarda el idioma de los mensajes para toda la puerta de enlace.",
+      "channelNoticeLocaleSyncPending": "El idioma de la interfaz cambió, pero el idioma de los mensajes del sistema de los canales aún no se ha guardado. Se volverá a intentar cuando se reconecte la puerta de enlace.",
       "toolDetailsLabel": "Detalles de herramientas de forma predeterminada",
       "toolDetailsDesc": "Automático sigue el tipo de herramienta; Compacto contrae las herramientas normales; Expandido las abre. Los errores se abren automáticamente de forma predeterminada y se pueden contraer manualmente.",
       "toolDetailsAuto": "Automático",
@@ -476,7 +478,7 @@
       "endpointDesc": "Estos ajustes solo se aplican cuando OpenSquilla llama a {provider}.",
       "defaultModelTitle": "Modelo predeterminado de {provider}",
       "defaultModelGroupDesc": "Se usa cuando el enrutamiento está desactivado o vuelve al proveedor activo.",
-      "defaultModelLabel": "Modelo directo predeterminado de {provider}",
+      "defaultModelLabel": "Modelo directo / de reserva",
       "configuredModelTitle": "Modelo de {provider}",
       "configuredModelCurrentLabel": "Modelo actual",
       "configuredModelFallbackLabel": "Modelo de reserva",
@@ -811,7 +813,7 @@
         "credentials_link": "Abrir la página de credenciales (App id / App secret)",
         "quick_apply_link": "Prerrellenar la solicitud de todos los permisos necesarios",
         "needAppId": "primero introduce el App id",
-        "ws_order_note": "Conectado — queda un paso en la consola de Feishu: abre 事件与回调 y cambia la entrega de eventos a 使用长连接接收事件. La consola solo guarda esa opción mientras hay un cliente conectado, por eso este paso va después de guardar. Este aviso desaparece al llegar el primer evento."
+        "ws_order_note": "Comprueba la suscripción de eventos en la consola de Feishu: abre 事件与回调 y confirma que la entrega de eventos esté configurada como 使用长连接接收事件. Este aviso aparece mientras WebSocket está conectado y no se ha registrado ningún evento entrante; por sí solo no significa que la consola esté mal configurada. Desaparece después del primer evento."
       }
     },
     "search": {
@@ -870,6 +872,15 @@
       "outputFormat": "Formato de salida",
       "fallbacks": "Modelos de reserva",
       "fallbacksHint": "Identificadores proveedor/modelo separados por comas, probados en orden si el principal falla."
+    },
+    "capabilities": {
+      "imageStatus": {
+        "missingEnv": "Falta la variable de entorno {name}. Pega una clave abajo, o define esa variable y reinicia la puerta de enlace."
+      },
+      "imageKeyConfigured": "Clave configurada",
+      "imageKeyMissing": "Aún sin configurar",
+      "imageKeyPlaceholderKeep": "Déjalo en blanco para conservar la clave guardada",
+      "imageKeyPlaceholderNew": "Pega tu clave de API"
     },
     "audio": {
       "title": "Audio",
@@ -931,6 +942,17 @@
       "revealFailed": "No se pudo mostrar el registro: {error}",
       "restarting": "Reiniciando el tiempo de ejecución local…",
       "restartFailed": "Error al reiniciar: {error}",
+      "closeBehaviorLabel": "Al cerrar la ventana principal",
+      "closeBehaviorDesc": "Elige qué debe hacer OpenSquilla al cerrar la ventana principal.",
+      "closeBehaviorBackground": "Seguir ejecutándose en segundo plano",
+      "closeBehaviorQuit": "Salir de OpenSquilla",
+      "closeBehaviorAsk": "Preguntar siempre",
+      "closeBehaviorSaving": "Guardando…",
+      "closeBehaviorReadFailed": "No se pudo leer el comportamiento al cerrar: {error}",
+      "closeBehaviorSaveFailed": "No se pudo guardar el comportamiento al cerrar: {error}",
+      "closeBehaviorBackgroundUnavailable": "La ejecución en segundo plano no está disponible en esta plataforma.",
+      "closeBehaviorFallbackQuit": "La ejecución en segundo plano no está disponible en esta plataforma, así que al cerrar la ventana la aplicación se cerrará.",
+      "closeBehaviorRetry": "Reintentar",
       "resetConfirmTitle": "¿Restablecer la configuración guardada?",
       "resetConfirmBody": "Esto borra la credencial de escritorio guardada y la configuración generada. El próximo inicio vuelve a ejecutar la configuración inicial.",
       "resetConfirmPrimary": "Restablecer",
@@ -1107,11 +1129,11 @@
     },
     "privacy": {
       "title": "Privacidad",
-      "statusEnabled": "La observabilidad de red está activada.",
-      "statusDisabled": "La observabilidad de red está desactivada.",
-      "statusDisabledByEnv": "La observabilidad de red está desactivada por el entorno.",
-      "disableNetworkObservabilityLabel": "Desactivar observabilidad de red",
-      "disableNetworkObservabilityDesc": "Detiene las llamadas de observabilidad de red de la puerta de enlace, como la telemetría de instalación y las comprobaciones de actualización.",
+      "statusEnabled": "Los informes de red están activados.",
+      "statusDisabled": "Los informes de red están desactivados.",
+      "statusDisabledByEnv": "Los informes de red están desactivados por una variable de entorno.",
+      "disableNetworkObservabilityLabel": "Desactivar los informes de red",
+      "disableNetworkObservabilityDesc": "Detiene la telemetría de instalación, las comprobaciones de actualizaciones en segundo plano y los identificadores anónimos que vinculan las solicitudes de una misma sesión — esos identificadores solo se envían a la API oficial de TokenRhythm. Tus propias solicitudes de modelo siguen funcionando.",
       "save": "Guardar privacidad"
     },
     "toast": {
@@ -1932,7 +1954,7 @@
         "capabilityReference": "Referencia de capacidades",
         "copyBotId": "Copiar ID del bot: {id}",
         "botIdCopied": "ID del bot copiado",
-        "finalStepTitle": "Último paso en la consola de Feishu"
+        "eventSubscriptionTitle": "Comprobar la suscripción de eventos de Feishu"
       }
     },
     "overview": {
@@ -2710,6 +2732,7 @@
     "latest": "Más reciente",
     "thinking": "Razonando",
     "thoughtProcess": "Proceso de razonamiento",
+    "thinkingForSeconds": "Razonando · {seconds} s",
     "thoughtForSeconds": "Razonó durante {seconds} s",
     "thoughtForMinutes": "Razonó durante {minutes} min {seconds} s",
     "toolResult": "Resultado de la herramienta",
@@ -2774,7 +2797,58 @@
       "ensembleDetailUnavailable": "{count} candidatos · detalle no disponible"
     },
     "sources": "Fuentes",
+    "activityLabel": "Actividad",
     "activitySteps": "Actividad · {count} paso | Actividad · {count} pasos",
+    "activityItems": "Actividad · {count} elemento | Actividad · {count} elementos",
+    "activityCompletedItems": "Completado · {count} elemento | Completado · {count} elementos",
+    "activityFailures": "{count} con error",
+    "activityFailuresRecovered": "{count} fallo recuperado | {count} fallos recuperados",
+    "activityWorking": "Trabajando",
+    "workedForSeconds": "Trabajó durante {seconds} s",
+    "workedForMinutes": "Trabajó durante {minutes} min {seconds} s",
+    "activity": {
+      "lifecycle": {
+        "working": "En curso",
+        "answering": "Redactando la respuesta",
+        "settled": "Completado",
+        "interrupted": "Interrumpido",
+        "failed": "Fallido"
+      },
+      "purpose": {
+        "discover": "Enlaces descubiertos",
+        "search": "Búsqueda en la web",
+        "read": "Páginas web leídas",
+        "inspect": "Archivos inspeccionados",
+        "change": "Archivos editados",
+        "run": "Comandos ejecutados",
+        "create": "Artefactos creados",
+        "recall": "Memoria consultada",
+        "use": "Herramientas usadas"
+      },
+      "purposeRunning": {
+        "discover": "Descubriendo enlaces",
+        "search": "Buscando en la web",
+        "read": "Leyendo páginas web",
+        "inspect": "Inspeccionando archivos",
+        "change": "Editando archivos",
+        "run": "Ejecutando comandos",
+        "create": "Creando artefactos",
+        "recall": "Consultando la memoria",
+        "use": "Usando herramientas"
+      },
+      "footprint": {
+        "web": "{count} acción web | {count} acciones web",
+        "files": "{count} archivo | {count} archivos",
+        "fileOperations": "{count} operación de archivo | {count} operaciones de archivos",
+        "commands": "{count} comando | {count} comandos",
+        "artifacts": "{count} artefacto | {count} artefactos",
+        "memory": "{count} consulta de memoria | {count} consultas de memoria",
+        "tools": "{count} llamada a herramienta | {count} llamadas a herramientas"
+      },
+      "more": "{count} más",
+      "stale": "Sigue trabajando — sin señal reciente",
+      "liveStep": "paso {n}"
+    },
     "suggestedTasks": "Tareas sugeridas",
     "greetingMorning": "Buenos días.",
     "greetingAfternoon": "Buenas tardes.",
@@ -2938,7 +3012,8 @@
       "downloadFailed": "Error al descargar",
       "forkFailed": "Error al bifurcar",
       "copyFailed": "Error al copiar",
-      "shareExportFailed": "Error al exportar para compartir",
+      "shareSaveFailed": "No se pudo guardar la imagen. Inténtalo de nuevo.",
+      "sharePreviewUpdateFailed": "No se pudo actualizar la vista previa. Inténtalo de nuevo.",
       "saved": "{filename} guardado",
       "copiedToClipboard": "Copiado al portapapeles",
       "copyNotSupported": "Copiar no es compatible — descárgalo en su lugar",
@@ -2953,6 +3028,11 @@
       "voiceUnavailable": "La entrada de voz no está disponible. Actívala en Ajustes.",
       "voiceTranscribeFailed": "No se pudo transcribir tu grabación. Inténtalo de nuevo.",
       "voiceSetupNeeded": "La entrada de voz necesita una clave de API de ElevenLabs: abriendo Ajustes…",
+      "voiceCancelledHidden": "La grabación se detuvo al ocultarse la ventana. Empieza de nuevo para dictar.",
+      "voiceMicDenied": "Se denegó el acceso al micrófono. Permítelo en los ajustes del navegador.",
+      "voiceMicDeniedDesktop": "El acceso al micrófono está bloqueado. Permítelo en los ajustes del sistema e inténtalo de nuevo.",
+      "voiceMicMissing": "No se encontró ningún micrófono.",
+      "voiceRecordFailed": "No se pudo iniciar la grabación. Inténtalo de nuevo.",
       "waitAttachments": "Espera a que termine el procesamiento de los archivos adjuntos",
       "waitCompactionBeforeCommand": "Espera a que termine la compactación del contexto antes de ejecutar {command}.",
       "waitResponseBeforeCommand": "Espera a la respuesta actual antes de ejecutar {command}.",
@@ -2968,8 +3048,7 @@
       "preparingOutput": "Preparando la salida",
       "generatingCandidates": "Generando candidatos",
       "synthesizingCandidates": "Sintetizando candidatos",
-      "stillWaiting": "Aún esperando al modelo",
-      "stillWorking": "Aún trabajando — última señal hace {seconds} s"
+      "stillWaiting": "Aún esperando al modelo"
     },
     "stall": {
       "title": "La respuesta tarda más de lo esperado",
@@ -3113,7 +3192,12 @@
       "sectionDiagnostics": "diagnósticos",
       "sectionResult": "resultado",
       "sectionError": "error",
-      "viewFull": "ver completo"
+      "viewFull": "ver completo",
+      "activityViewDetails": "ver detalles",
+      "activityDetailsTitle": "detalles",
+      "activityBytesWritten": "{size} escritos",
+      "activityContentSize": "{lines} líneas · {characters} caracteres",
+      "activityPublished": "Publicado"
     }
   },
   "channelStatus": {

@@ -66,7 +66,8 @@
     "discard": "Abandonner",
     "cancel": "Annuler",
     "edit": "Modifier",
-    "delete": "Supprimer"
+    "delete": "Supprimer",
+    "dismiss": "Ignorer"
   },
   "nav": {
     "chat": "Chat",
@@ -144,7 +145,8 @@
       "themeLabel": "Thème",
       "themeDesc": "Suivez votre système, ou forcez le mode clair ou sombre. Le bouton de la barre latérale est un raccourci vers ce même paramètre.",
       "languageLabel": "Langue",
-      "languageDesc": "Langue d'affichage de l'interface. S'applique immédiatement à ce navigateur.",
+      "languageDesc": "Langue d'affichage de l'interface et des messages système des canaux. Elle s'applique ici immédiatement et enregistre la langue des messages pour toute la passerelle.",
+      "channelNoticeLocaleSyncPending": "La langue de l'interface a changé, mais la langue des messages système des canaux n'est pas encore enregistrée. Une nouvelle tentative aura lieu à la reconnexion de la passerelle.",
       "toolDetailsLabel": "Affichage par défaut des détails d'outil",
       "toolDetailsDesc": "Automatique suit le type d'outil ; Compact réduit les outils ordinaires ; Développé les ouvre. Les erreurs s'ouvrent automatiquement par défaut et peuvent être repliées manuellement.",
       "toolDetailsAuto": "Automatique",
@@ -476,7 +478,7 @@
       "endpointDesc": "Ces paramètres s’appliquent uniquement lorsque OpenSquilla appelle {provider}.",
       "defaultModelTitle": "Modèle par défaut de {provider}",
       "defaultModelGroupDesc": "Utilisé lorsque le routage est désactivé ou lorsque l’exécution revient au fournisseur actif.",
-      "defaultModelLabel": "Modèle direct par défaut de {provider}",
+      "defaultModelLabel": "Modèle direct / de secours",
       "configuredModelTitle": "Modèle de {provider}",
       "configuredModelCurrentLabel": "Modèle actuel",
       "configuredModelFallbackLabel": "Modèle de repli",
@@ -811,7 +813,7 @@
         "credentials_link": "Ouvrir la page des identifiants (App id / App secret)",
         "quick_apply_link": "Pré-remplir la demande de toutes les permissions requises",
         "needAppId": "renseignez d'abord l'App id",
-        "ws_order_note": "Connexion établie — il reste une étape dans la console Feishu : ouvrez 事件与回调 et basculez la réception des événements sur 使用长连接接收事件. La console n'enregistre ce choix que pendant qu'un client est connecté, d'où cette étape après l'enregistrement. Cet avis disparaît au premier événement reçu."
+        "ws_order_note": "Vérifiez l'abonnement aux événements dans la console Feishu : ouvrez 事件与回调 et confirmez que la réception des événements est réglée sur 使用长连接接收事件. Cet avis apparaît tant que WebSocket est connecté et qu'aucun événement entrant n'a été enregistré ; il ne signifie pas à lui seul que la console est mal configurée. Il disparaît après le premier événement."
       }
     },
     "search": {
@@ -870,6 +872,15 @@
       "outputFormat": "Format de sortie",
       "fallbacks": "Modèles de secours",
       "fallbacksHint": "Identifiants fournisseur/modèle séparés par des virgules, essayés dans l'ordre si le modèle principal échoue."
+    },
+    "capabilities": {
+      "imageStatus": {
+        "missingEnv": "Variable d'environnement {name} manquante. Collez une clé ci-dessous, ou définissez cette variable puis redémarrez la passerelle."
+      },
+      "imageKeyConfigured": "Clé configurée",
+      "imageKeyMissing": "Pas encore configurée",
+      "imageKeyPlaceholderKeep": "Laissez vide pour conserver la clé enregistrée",
+      "imageKeyPlaceholderNew": "Collez votre clé API"
     },
     "audio": {
       "title": "Audio",
@@ -931,6 +942,17 @@
       "revealFailed": "Impossible d'afficher le journal : {error}",
       "restarting": "Redémarrage de l'environnement d'exécution local…",
       "restartFailed": "Échec du redémarrage : {error}",
+      "closeBehaviorLabel": "À la fermeture de la fenêtre principale",
+      "closeBehaviorDesc": "Choisissez le comportement d’OpenSquilla lorsque vous fermez la fenêtre principale.",
+      "closeBehaviorBackground": "Continuer en arrière-plan",
+      "closeBehaviorQuit": "Quitter OpenSquilla",
+      "closeBehaviorAsk": "Toujours demander",
+      "closeBehaviorSaving": "Enregistrement…",
+      "closeBehaviorReadFailed": "Impossible de lire le comportement de fermeture : {error}",
+      "closeBehaviorSaveFailed": "Impossible d’enregistrer le comportement de fermeture : {error}",
+      "closeBehaviorBackgroundUnavailable": "L’exécution en arrière-plan n’est pas disponible sur cette plateforme.",
+      "closeBehaviorFallbackQuit": "L’exécution en arrière-plan n’est pas disponible sur cette plateforme ; fermer la fenêtre quittera donc l’application.",
+      "closeBehaviorRetry": "Réessayer",
       "resetConfirmTitle": "Réinitialiser la configuration enregistrée ?",
       "resetConfirmBody": "Ceci efface l'identifiant de bureau enregistré et la configuration générée. Le prochain lancement relancera la configuration initiale.",
       "resetConfirmPrimary": "Réinitialiser",
@@ -1107,11 +1129,11 @@
     },
     "privacy": {
       "title": "Confidentialité",
-      "statusEnabled": "L'observabilité réseau est activée.",
-      "statusDisabled": "L'observabilité réseau est désactivée.",
-      "statusDisabledByEnv": "L'observabilité réseau est désactivée par l'environnement.",
-      "disableNetworkObservabilityLabel": "Désactiver l'observabilité réseau",
-      "disableNetworkObservabilityDesc": "Arrête les appels d'observabilité réseau de la passerelle, comme la télémétrie d'installation et les vérifications de mise à jour.",
+      "statusEnabled": "Les rapports réseau sont activés.",
+      "statusDisabled": "Les rapports réseau sont désactivés.",
+      "statusDisabledByEnv": "Les rapports réseau sont désactivés par une variable d'environnement.",
+      "disableNetworkObservabilityLabel": "Désactiver les rapports réseau",
+      "disableNetworkObservabilityDesc": "Arrête la télémétrie d'installation, les vérifications de mise à jour en arrière-plan et les identifiants anonymes qui relient les requêtes d'une même session — ces identifiants ne sont envoyés qu'à l'API officielle TokenRhythm. Vos propres requêtes de modèle continuent de fonctionner.",
       "save": "Enregistrer la confidentialité"
     },
     "toast": {
@@ -1932,7 +1954,7 @@
         "capabilityReference": "Référence des capacités",
         "copyBotId": "Copier l'ID du bot : {id}",
         "botIdCopied": "ID du bot copié",
-        "finalStepTitle": "Dernière étape dans la console Feishu"
+        "eventSubscriptionTitle": "Vérifier l'abonnement aux événements Feishu"
       }
     },
     "overview": {
@@ -2710,6 +2732,7 @@
     "latest": "Le plus récent",
     "thinking": "Réflexion",
     "thoughtProcess": "Processus de réflexion",
+    "thinkingForSeconds": "Réflexion · {seconds} s",
     "thoughtForSeconds": "A réfléchi pendant {seconds} s",
     "thoughtForMinutes": "A réfléchi pendant {minutes} min {seconds} s",
     "toolResult": "Résultat de l'outil",
@@ -2774,7 +2797,58 @@
       "ensembleDetailUnavailable": "{count} candidats · détail indisponible"
     },
     "sources": "Sources",
+    "activityLabel": "Activité",
     "activitySteps": "Activité · {count} étape | Activité · {count} étapes",
+    "activityItems": "Activité · {count} élément | Activité · {count} éléments",
+    "activityCompletedItems": "Terminé · {count} élément | Terminé · {count} éléments",
+    "activityFailures": "{count} en échec",
+    "activityFailuresRecovered": "{count} échec récupéré | {count} échecs récupérés",
+    "activityWorking": "Travail en cours",
+    "workedForSeconds": "Travail effectué pendant {seconds} s",
+    "workedForMinutes": "Travail effectué pendant {minutes} min {seconds} s",
+    "activity": {
+      "lifecycle": {
+        "working": "En cours",
+        "answering": "Rédaction de la réponse",
+        "settled": "Terminé",
+        "interrupted": "Interrompu",
+        "failed": "Échec"
+      },
+      "purpose": {
+        "discover": "Liens découverts",
+        "search": "Recherche sur le Web",
+        "read": "Pages Web consultées",
+        "inspect": "Fichiers inspectés",
+        "change": "Fichiers modifiés",
+        "run": "Commandes exécutées",
+        "create": "Artefacts créés",
+        "recall": "Mémoire consultée",
+        "use": "Outils utilisés"
+      },
+      "purposeRunning": {
+        "discover": "Découverte de liens",
+        "search": "Recherche sur le Web",
+        "read": "Lecture de pages Web",
+        "inspect": "Inspection des fichiers",
+        "change": "Modification des fichiers",
+        "run": "Exécution de commandes",
+        "create": "Création d’artefacts",
+        "recall": "Consultation de la mémoire",
+        "use": "Utilisation d’outils"
+      },
+      "footprint": {
+        "web": "{count} action Web | {count} actions Web",
+        "files": "{count} fichier | {count} fichiers",
+        "fileOperations": "{count} opération sur un fichier | {count} opérations sur des fichiers",
+        "commands": "{count} commande | {count} commandes",
+        "artifacts": "{count} artefact | {count} artefacts",
+        "memory": "{count} consultation de la mémoire | {count} consultations de la mémoire",
+        "tools": "{count} appel d’outil | {count} appels d’outil"
+      },
+      "more": "{count} de plus",
+      "stale": "Toujours en cours — aucun signal récent",
+      "liveStep": "étape {n}"
+    },
     "suggestedTasks": "Tâches suggérées",
     "greetingMorning": "Bonjour.",
     "greetingAfternoon": "Bon après-midi.",
@@ -2938,7 +3012,8 @@
       "downloadFailed": "Échec du téléchargement",
       "forkFailed": "Échec de la bifurcation",
       "copyFailed": "Échec de la copie",
-      "shareExportFailed": "Échec de l'exportation du partage",
+      "shareSaveFailed": "Impossible d'enregistrer l'image. Réessayez.",
+      "sharePreviewUpdateFailed": "Impossible de mettre à jour l'aperçu. Réessayez.",
       "saved": "{filename} enregistré",
       "copiedToClipboard": "Copié dans le presse-papiers",
       "copyNotSupported": "Copie non prise en charge — téléchargez à la place",
@@ -2953,6 +3028,11 @@
       "voiceUnavailable": "L'entrée vocale n'est pas disponible. Activez-la dans les Paramètres.",
       "voiceTranscribeFailed": "Impossible de transcrire votre enregistrement. Veuillez réessayer.",
       "voiceSetupNeeded": "L'entrée vocale nécessite une clé API ElevenLabs — ouverture des Paramètres…",
+      "voiceCancelledHidden": "L'enregistrement s'est arrêté lorsque la fenêtre a été masquée. Recommencez pour dicter.",
+      "voiceMicDenied": "L'accès au micro a été refusé. Autorisez-le dans les paramètres du navigateur.",
+      "voiceMicDeniedDesktop": "L'accès au micro est bloqué. Autorisez-le dans les paramètres système, puis réessayez.",
+      "voiceMicMissing": "Aucun micro n'a été détecté.",
+      "voiceRecordFailed": "Impossible de démarrer l'enregistrement. Veuillez réessayer.",
       "waitAttachments": "Attendez la fin du traitement des pièces jointes",
       "waitCompactionBeforeCommand": "Attendez le compactage du contexte avant d'exécuter {command}.",
       "waitResponseBeforeCommand": "Attendez la réponse actuelle avant d'exécuter {command}.",
@@ -2968,8 +3048,7 @@
       "preparingOutput": "Préparation de la sortie",
       "generatingCandidates": "Génération des candidats",
       "synthesizingCandidates": "Synthèse des candidats",
-      "stillWaiting": "Toujours en attente du modèle",
-      "stillWorking": "Toujours en cours — dernier signal il y a {seconds} s"
+      "stillWaiting": "Toujours en attente du modèle"
     },
     "stall": {
       "title": "La réponse prend plus de temps que prévu",
@@ -3113,7 +3192,12 @@
       "sectionDiagnostics": "diagnostics",
       "sectionResult": "résultat",
       "sectionError": "erreur",
-      "viewFull": "voir en entier"
+      "viewFull": "voir en entier",
+      "activityViewDetails": "voir les détails",
+      "activityDetailsTitle": "détails",
+      "activityBytesWritten": "{size} écrits",
+      "activityContentSize": "{lines} lignes · {characters} caractères",
+      "activityPublished": "Publié"
     }
   },
   "channelStatus": {

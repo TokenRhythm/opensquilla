@@ -7,11 +7,19 @@ readiness. It skips unless credentials are explicitly present.
 from __future__ import annotations
 
 import os
+import uuid
 
 import pytest
 
 from opensquilla.provider.openai import OpenAIProvider
-from opensquilla.provider.types import ChatConfig, DoneEvent, ErrorEvent, Message, TextDeltaEvent
+from opensquilla.provider.types import (
+    ChatConfig,
+    DoneEvent,
+    ErrorEvent,
+    Message,
+    ProviderRequestCorrelation,
+    TextDeltaEvent,
+)
 
 pytestmark = [pytest.mark.llm, pytest.mark.llm_smoke]
 
@@ -60,22 +68,40 @@ async def test_tokenrhythm_live_smoke_returns_expected_token() -> None:
         base_url=os.environ.get("TOKENRHYTHM_BASE_URL", "https://tokenrhythm.studio/v1"),
         provider_kind="tokenrhythm",
     )
-    text_parts: list[str] = []
-    done = False
+    root = uuid.uuid4().hex
+    configs = (
+        ChatConfig(max_tokens=1024, temperature=0.0, timeout=90.0),
+        ChatConfig(
+            max_tokens=1024,
+            temperature=0.0,
+            timeout=90.0,
+            provider_request_correlation=ProviderRequestCorrelation(
+                session_id=f"live-session-{root}",
+                turn_id=f"live-turn-{root}",
+                execution_id=f"live-execution-{root}",
+                call_kind="agent.chat",
+            ),
+        ),
+    )
 
-    async for event in provider.chat(
-        [Message(role="user", content=f"Reply with exactly {_EXPECTED_TOKEN}.")],
-        # Every TokenRhythm model spends reasoning_content tokens out of
-        # max_tokens before any text; a small budget returns empty content
-        # with finish_reason "length".
-        config=ChatConfig(max_tokens=1024, temperature=0.0, timeout=90.0),
-    ):
-        if isinstance(event, ErrorEvent):
-            pytest.fail(f"live LLM smoke failed: {event.code} {event.message}")
-        if isinstance(event, TextDeltaEvent):
-            text_parts.append(event.text)
-        if isinstance(event, DoneEvent):
-            done = True
+    for config in configs:
+        text_parts: list[str] = []
+        done_event: DoneEvent | None = None
+        async for event in provider.chat(
+            [Message(role="user", content=f"Reply with exactly {_EXPECTED_TOKEN}.")],
+            # Every TokenRhythm model spends reasoning_content tokens out of
+            # max_tokens before any text; a small budget returns empty content
+            # with finish_reason "length".
+            config=config,
+        ):
+            if isinstance(event, ErrorEvent):
+                pytest.fail(f"live LLM smoke failed: {event.code} {event.message}")
+            if isinstance(event, TextDeltaEvent):
+                text_parts.append(event.text)
+            if isinstance(event, DoneEvent):
+                done_event = event
 
-    assert done is True
-    assert _EXPECTED_TOKEN in "".join(text_parts).strip().lower()
+        assert done_event is not None
+        assert done_event.input_tokens >= 0
+        assert done_event.output_tokens > 0
+        assert _EXPECTED_TOKEN in "".join(text_parts).strip().lower()

@@ -27,6 +27,9 @@ from opensquilla.memory.types import (
     normalize_memory_search_min_score,
     normalize_memory_source_filter,
 )
+from opensquilla.observability.network_policy import (
+    provider_request_correlation_disabled,
+)
 from opensquilla.session.keys import normalize_agent_id
 from opensquilla.tools.builtin.memory_tools import _is_memory_source_path
 
@@ -758,5 +761,8 @@ async def _handle_memory_repair_run(
         limit=limit,
         params=params,
         scan_limit=_REPAIR_SCAN_LIMIT,
+        provider_request_correlation_enabled=(
+            not provider_request_correlation_disabled(config=ctx.config)
+        ),
     )
     return {"agentId": agent_id, "count": len(results), "results": results}

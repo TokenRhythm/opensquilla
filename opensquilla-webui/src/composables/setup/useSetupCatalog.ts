@@ -58,6 +58,43 @@ function readinessLabel(status: string): string {
   return key ? i18n.global.t(key) : ''
 }
 
+// The gateway's image_generation section detail is a backend-built English
+// sentence (onboarding/status.py, onboarding/next_steps.py) rendered verbatim
+// in an otherwise fully localized panel. Until the backend ships a structured
+// reason code, recognise only the missing-environment-variable shapes — the
+// one actionable state a first-run user routinely hits — and localize them.
+// Detection is deliberately narrow: anything unrecognised passes through the
+// `generic` key verbatim so no operator-facing information is ever dropped.
+const MISSING_ENV_DETAIL_PATTERNS: RegExp[] = [
+  // onboarding/status.py `_source_detail`: "env key not visible: NAME",
+  // optionally wrapped by `_with_provider` as
+  // "provider (env key not visible: NAME)".
+  /env key not visible:\s*([A-Z][A-Z0-9_]*)/,
+  // onboarding/next_steps.py `_missing_env_warning`:
+  // "Image generation provider: $NAME is not set in this shell. …".
+  /\$([A-Z][A-Z0-9_]*) is not set in this shell/,
+  // Defensive spelling of the same condition, in case a backend variant
+  // states it directly. The name capture stays strictly uppercase so prose
+  // that merely mentions environment variables cannot match.
+  /[Mm]issing environment variable\s+([A-Z][A-Z0-9_]*)/,
+]
+
+export function localizeImageActionableDetail(detail: string): string {
+  for (const pattern of MISSING_ENV_DETAIL_PATTERNS) {
+    const name = detail.match(pattern)?.[1]
+    if (name) {
+      return i18n.global.t('setup.capabilities.imageStatus.missingEnv', { name })
+    }
+  }
+  // Unrecognised backend prose passes through verbatim. Wrapping it in a
+  // catalog entry whose value is nothing but "{detail}" would not localize
+  // anything — it would only hide untranslated text behind a translation key
+  // and force the i18n leakage guard to make an exception for it. Losing the
+  // detail would be worse than showing it in English, so show it as-is until
+  // the backend hands us a structured reason code.
+  return detail
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -280,7 +317,10 @@ interface ConfigData {
     }
   }
   image_generation?: {
-    providers?: Record<string, { api_key_env?: string; base_url?: string }>
+    size?: string
+    output_format?: string
+    fallbacks?: string[]
+    providers?: Record<string, { api_key?: string; api_key_env?: string; base_url?: string }>
   }
   audio?: {
     enabled?: boolean
@@ -2355,8 +2395,10 @@ function onMemoryProviderChange() {
   capabilitiesForm.onMemoryProviderChange(memorySpec.value, memoryApiKeyEnabled.value)
 }
 
-function onImageProviderChange() {
-  capabilitiesForm.onImageProviderChange(imageSpec.value)
+function onImageProviderChange(providerId: string) {
+  capabilitiesForm.onImageProviderChange(
+    imageProviders.value.find(provider => provider.providerId === providerId),
+  )
 }
 
 function updateCapabilityField(
@@ -2417,6 +2459,11 @@ function searchStatusText(): string {
 function _imageGenerationStatusText(): string {
   if (status.value.imageGenerationEnabled === false) {
     return t('setup.image.statusDisabled')
+  }
+  const detail = (status.value.sectionDetails || {}).image_generation || {}
+  const actionableDetail = String(detail.detail || '').trim()
+  if ((detail.blocking || detail.actionRequired || detail.status === 'unknown') && actionableDetail) {
+    return localizeImageActionableDetail(actionableDetail)
   }
   if (status.value.imageGenerationConfigured === true) {
     if (status.value.imageGenerationSource === 'llm_fallback') {

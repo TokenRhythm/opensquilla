@@ -68,58 +68,61 @@ function setChecked(value: boolean): void {
 </script>
 
 <template>
-  <div v-if="pendingPairing" class="chal chal--pending" role="status" @click.stop>
-    <span class="chal__text">
-      {{ t('console.channels.home.pendingRequest', {
-        sender: pendingPairing.senderName || pendingPairing.senderId,
-        code: pendingPairing.pairingCode || '—',
-      }) }}
-      <template v-if="pendingOverflow"> · +{{ pendingOverflow }}</template>
-    </span>
-    <span class="chal__actions">
-      <label class="chal__asadmin" :title="t('console.channels.pairings.asAdminHint')">
-        <input
-          type="checkbox"
-          :checked="isChecked()"
-          :aria-label="t('console.channels.pairings.asAdminCheckboxLabel', { sender: pendingPairing.senderName || pendingPairing.senderId })"
-          @change="setChecked(($event.target as HTMLInputElement).checked)"
-        />
-        <span>{{ t(defaultAsAdmin ? 'console.channels.pairings.asAdminBootstrap' : 'console.channels.pairings.asAdmin') }}</span>
-      </label>
-      <button
-        type="button"
-        class="btn btn--primary chal__btn"
-        :disabled="busy"
-        :aria-label="t('console.channels.pairings.approveLabel', { sender: pendingPairing.senderName || pendingPairing.senderId })"
-        @click.stop="emit('approve', isChecked())"
-      >{{ t('console.channels.pairings.approve') }}</button>
-      <button
-        type="button"
-        class="btn btn--ghost chal__btn"
-        :disabled="busy"
-        :aria-label="t('console.channels.home.rejectLabel', { sender: pendingPairing.senderName || pendingPairing.senderId })"
-        @click.stop="emit('reject')"
-      >{{ t('console.channels.home.reject') }}</button>
-    </span>
-  </div>
+  <div v-if="pendingPairing || errorText" class="chal-stack">
+    <div v-if="pendingPairing" class="chal chal--pending" role="status" @click.stop>
+      <span class="chal__text">
+        {{ t('console.channels.home.pendingRequest', {
+          sender: pendingPairing.senderName || pendingPairing.senderId,
+          code: pendingPairing.pairingCode || '—',
+        }) }}
+        <template v-if="pendingOverflow"> · +{{ pendingOverflow }}</template>
+      </span>
+      <span class="chal__actions">
+        <label class="chal__asadmin" :title="t('console.channels.pairings.asAdminHint')">
+          <input
+            type="checkbox"
+            :checked="isChecked()"
+            :aria-label="t('console.channels.pairings.asAdminCheckboxLabel', { sender: pendingPairing.senderName || pendingPairing.senderId })"
+            @change="setChecked(($event.target as HTMLInputElement).checked)"
+          />
+          <span>{{ t(defaultAsAdmin ? 'console.channels.pairings.asAdminBootstrap' : 'console.channels.pairings.asAdmin') }}</span>
+        </label>
+        <button
+          type="button"
+          class="btn btn--primary chal__btn"
+          :disabled="busy"
+          :aria-label="t('console.channels.pairings.approveLabel', { sender: pendingPairing.senderName || pendingPairing.senderId })"
+          @click.stop="emit('approve', isChecked())"
+        >{{ t('console.channels.pairings.approve') }}</button>
+        <button
+          type="button"
+          class="btn btn--ghost chal__btn"
+          :disabled="busy"
+          :aria-label="t('console.channels.home.rejectLabel', { sender: pendingPairing.senderName || pendingPairing.senderId })"
+          @click.stop="emit('reject')"
+        >{{ t('console.channels.home.reject') }}</button>
+      </span>
+    </div>
 
-  <div v-if="errorText" class="chal chal--error" role="alert" @click.stop>
-    <span class="chal__text">{{ errorText }}</span>
-    <span class="chal__actions">
-      <button type="button" class="btn btn--ghost chal__btn" :disabled="busy" @click.stop="emit('restart')">
-        {{ t('console.channels.restart') }}
-      </button>
-      <button
-        v-if="showFixCredentials"
-        type="button"
-        class="btn btn--primary chal__btn"
-        @click.stop="emit('fixCredentials')"
-      >{{ t('console.channels.home.fixCredentials') }}</button>
-    </span>
+    <div v-if="errorText" class="chal chal--error" role="alert" @click.stop>
+      <span class="chal__text">{{ errorText }}</span>
+      <span class="chal__actions">
+        <button type="button" class="btn btn--ghost chal__btn" :disabled="busy" @click.stop="emit('restart')">
+          {{ t('console.channels.restart') }}
+        </button>
+        <button
+          v-if="showFixCredentials"
+          type="button"
+          class="btn btn--primary chal__btn"
+          @click.stop="emit('fixCredentials')"
+        >{{ t('console.channels.home.fixCredentials') }}</button>
+      </span>
+    </div>
   </div>
 </template>
 
 <style scoped>
+.chal-stack { display: grid; gap: var(--sp-2); min-width: 0; }
 .chal {
   align-items: center;
   border: 1px solid var(--border);

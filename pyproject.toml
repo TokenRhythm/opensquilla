@@ -38,6 +38,7 @@ dependencies = [
     "readability-lxml>=0.8",
     "beautifulsoup4>=4.12",
     "cachetools>=5.3",
+    "certifi>=2024.7.4",
     "pdfplumber>=0.11",
     "pillow>=10.0",
     "croniter>=2.0",

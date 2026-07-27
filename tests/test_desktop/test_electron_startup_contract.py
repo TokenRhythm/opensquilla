@@ -60,25 +60,114 @@ def test_desktop_gateway_completion_uses_current_live_window() -> None:
     assert "if (mainWindow === window) mainWindow = null" in main_ts
 
 
-def test_desktop_activation_and_second_instance_share_resume_helper() -> None:
+def test_desktop_activation_and_second_instance_share_safe_reveal_helper() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
 
     assert "if (process.platform !== 'darwin') app.quit()" in main_ts
-    assert "app.on('activate', () => {\n  void openOrResumeDesktopApp()" in main_ts
-    # second-instance resumes the app via the shared helper (a diagnostic log
+    assert "app.on('activate', () => {\n  revealDesktopApp()" in main_ts
+    assert "function revealDesktopApp(): void" in main_ts
+    assert "if (!canRevealDesktopApp(appExitPhase)) return" in main_ts
+    assert "focusMainWindow()" in _section(
+        main_ts,
+        "function revealDesktopApp(): void",
+        "async function promptForMainWindowClose",
+    )
+    # second-instance reveals the app via the shared helper (a diagnostic log
     # line precedes the resume call — see the #446 relaunch-retry contract).
     second_instance = _section(
         main_ts,
         "app.on('second-instance', () => {",
         "void app.whenReady().then",
     )
-    assert "void openOrResumeDesktopApp()" in second_instance
+    assert "revealDesktopApp()" in second_instance
     assert "void app.whenReady().then" in main_ts
     assert "void openOrResumeDesktopApp()" in _section(
         main_ts,
         "void app.whenReady().then",
         "})\n}",
     )
+
+
+def test_desktop_window_close_has_a_visible_background_recovery_surface() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    preload = _read("desktop/electron/src/preload.cts")
+    lifecycle = _read("desktop/electron/src/desktop-window-lifecycle.ts")
+    package = json.loads(_read("desktop/electron/package.json"))
+    ci = _read(".github/workflows/ci.yml")
+
+    close_handler = _section(
+        main_ts,
+        "function handleMainWindowClose",
+        "function installEditingContextMenu",
+    )
+    tray = _section(main_ts, "function createWindowsTray", "function hideMainWindow")
+    hide = _section(main_ts, "function hideMainWindow", "function revealDesktopApp")
+    ready = _section(main_ts, "void app.whenReady().then", "})\n}")
+
+    assert "window.on('close', (event) => handleMainWindowClose(window, event))" in main_ts
+    session_end = _section(
+        main_ts,
+        "window.on('session-end', () => {",
+        "window.once('ready-to-show'",
+    )
+    query_session_end = _section(
+        main_ts,
+        "window.on('query-session-end', () => {",
+        "window.on('session-end', () => {",
+    )
+    assert "windowsSessionEndPreviousPhase = appExitPhase" in main_ts
+    assert "windowsSessionEndResetTimer = setTimeout" in query_session_end
+    assert "systemSessionEnding = false" in query_session_end
+    assert "setAppExitPhase(previousPhase" in query_session_end
+    assert "windowsSessionEndResetTimer.unref()" in query_session_end
+    assert "if (isQuitting" not in query_session_end
+    assert "clearTimeout(windowsSessionEndResetTimer)" in session_end
+    assert "isQuitting = true" in session_end
+    assert "destroyWindowsTray()" in session_end
+    assert "stopGateway()" in session_end
+    assert "mainWindowCloseAction({" in close_handler
+    assert "windowsTrayReady: windowsTray !== null" in close_handler
+    assert "event.preventDefault()" in close_handler
+    assert "hideMainWindow(window)" in close_handler
+    assert "app.quit()" in close_handler
+
+    assert "const tray = new Tray(appIconPath())" in tray
+    assert "tray.on('click', () => revealDesktopApp())" in tray
+    assert "label: desktopT('tray.quit')" in main_ts
+    assert "click: () => app.quit()" in main_ts
+    assert ready.index("createWindowsTray()") < ready.index("openOrResumeDesktopApp()")
+
+    assert "window.webContents.send('desktop:window:hidden')" in hide
+    assert hide.index("desktop:window:hidden") < hide.index("window.hide()")
+    assert "onWindowHidden: (callback: () => void)" in preload
+    assert "ipcRenderer.on('desktop:window:hidden', listener)" in preload
+
+    assert "platform === 'darwin' || platform === 'win32' ? 'background' : 'quit'" in lifecycle
+    assert "platform === 'win32' && context.windowsTrayReady" in lifecycle
+    assert "if (!backgroundSupported) return 'quit'" in lifecycle
+    assert package["scripts"]["test:window-lifecycle"].endswith(
+        "scripts/test-desktop-window-lifecycle.mjs"
+    )
+    assert "node scripts/test-desktop-window-lifecycle.mjs" in ci
+
+
+def test_desktop_explicit_exit_cannot_be_converted_back_to_window_hiding() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    lifecycle = _read("desktop/electron/src/desktop-window-lifecycle.ts")
+    before_quit = _section(main_ts, "app.on('before-quit'", "function shutdownFromSignal")
+
+    assert "context.systemSessionEnding || context.exitPhase === 'committed'" in lifecycle
+    assert "if (context.exitPhase !== 'running') return 'hide'" in lifecycle
+    assert "return phase === 'running'" in lifecycle
+    assert "setAppExitPhase('deferred'" in before_quit
+    assert "setAppExitPhase('draining'" in before_quit
+    assert "setAppExitPhase('committed'" in before_quit
+    assert "setAppExitPhase('running', 'Gateway quit drain failed safely')" in before_quit
+    assert "if (systemSessionEnding)" in before_quit
+    system_exit = _section(before_quit, "if (systemSessionEnding)", "// An updater drain")
+    assert "event.preventDefault()" not in system_exit
+    assert "destroyWindowsTray()" in system_exit
+    assert "stopGateway()" in system_exit
 
 
 def test_desktop_retry_waits_for_all_owned_gateways_and_fails_closed() -> None:
@@ -363,6 +452,12 @@ def test_reset_desktop_settings_forces_onboarding_before_gateway_reuse() -> None
     assert "report.mode === 'reset-current-settings'" in cleanup_apply
     assert "forceOnboardingOnNextStartup = true" in cleanup_apply
     assert "clearReusableGatewayState()" in cleanup_apply
+    post_delete_exit = _section(cleanup_apply, "if (shouldQuit) {", "} else {")
+    assert "appExitPhase = 'committed'" in post_delete_exit
+    assert "destroyWindowsTray()" in post_delete_exit
+    assert "app.exit(0)" in post_delete_exit
+    assert "setAppExitPhase(" not in post_delete_exit
+    assert "desktopLog(" not in post_delete_exit
 
 
 def test_desktop_gateway_port_selection_is_bind_aware_and_bounded() -> None:
@@ -1172,11 +1267,15 @@ def test_apply_downloaded_update_handoff_error_restores_retry_state() -> None:
     assert "updateApplying = false" in restore
     assert "isQuitting = false" in restore
     assert "desktopWriters.reopen(writerAdmissionToken)" in restore
+    assert "setAppExitPhase('running', 'update handoff did not commit')" in restore
+    assert "createWindowsTray()" in restore
     assert "createApplicationMenu()" in restore
-    assert (
-        "try {\n    updateInstallHandoffReady = true\n"
-        "    autoUpdater.quitAndInstall(false, true)\n  } catch (err)"
-    ) in apply_update
+    handoff_ready = apply_update.index("updateInstallHandoffReady = true")
+    handoff_committed = apply_update.index(
+        "setAppExitPhase('committed', 'handing off to desktop updater')"
+    )
+    handoff = apply_update.index("autoUpdater.quitAndInstall(false, true)")
+    assert handoff_ready < handoff_committed < handoff
     handoff_error = _section(
         apply_update,
         "} catch (err)",
@@ -1310,6 +1409,52 @@ def test_desktop_config_writer_does_not_emit_new_privacy_section_by_default() ->
         "credential.disableNetworkObservability || "
         "readDesktopConfigNetworkObservabilitySetting() !== null" in main_ts
     )
+
+
+def test_desktop_config_regeneration_preserves_control_ui_locale_and_seeds_new_config() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    credential_save = _section(
+        main_ts,
+        "async function saveDesktopCredential",
+        "function buildImportedDesktopCredential",
+    )
+    locale_reader = _section(
+        main_ts,
+        "function persistedControlUiDefaultLocale",
+        "async function readOptionalDesktopText",
+    )
+    config_renderer = _section(
+        main_ts,
+        "function renderDesktopConfigAfterPreflight",
+        "async function applyDesktopSettingsPair",
+    )
+
+    # A regenerated config must retain the effective Gateway locale from its
+    # own [control_ui] section, including legacy BCP-47 spellings. An absent
+    # field falls back to the current Desktop locale when a new config is
+    # seeded. TOML permits a comment after the table header, which must not
+    # cause the locale reader to miss the section during regeneration.
+    assert "if (raw === null) return null" in locale_reader
+    assert r"match(/^\[\s*([^\]]+?)\s*\](?:\s*#.*)?$/)" in locale_reader
+    assert "inControlUi = header[1] === 'control_ui'" in locale_reader
+    assert 'default_locale\\s*=\\s*["\']([^"\']*)["\']' in locale_reader
+    assert "return normalizeGatewayLocale(match[1])" in locale_reader
+    assert locale_reader.rstrip().endswith("return null\n}")
+
+    preserved_locale = (
+        "const preservedControlUiLocale = persistedControlUiDefaultLocale(existingRaw)"
+    )
+    rendered_locale = "`default_locale = ${tomlString(preservedControlUiLocale ?? defaultLocale)}`"
+    assert preserved_locale in config_renderer
+    assert rendered_locale in config_renderer
+    assert config_renderer.index(preserved_locale) < config_renderer.index(rendered_locale)
+    assert config_renderer.count("default_locale") == 1
+    assert "defaultLocale: DesktopLocale" in config_renderer
+    assert (
+        "const configLocale = desktopLocaleChoice(payload.locale) ?? desktopLocale"
+        in credential_save
+    )
+    assert "writerReserved,\n      configLocale," in credential_save
 
 
 def test_desktop_network_observability_disable_gates_native_update_and_gateway_env() -> None:
@@ -1453,7 +1598,9 @@ def test_desktop_gateway_build_and_verifier_cover_runtime_capabilities() -> None
     assert "function smokeEnv(tempHome, config)" in gateway_smoke
     assert "OPENSQUILLA_STATE_DIR: tempHome" in gateway_smoke
     assert "OPENSQUILLA_STATE_DIR: stateDir" not in gateway_smoke
-    assert "env: smokeEnv(tempHome, config)" in gateway_smoke
+    assert "const env = smokeEnv(tempHome, config)" in gateway_smoke
+    assert "verifyGatewayCaStore(gatewayBinary, env)" in gateway_smoke
+    assert re.search(r"spawn\(gatewayBinary,.*?\{.*?\benv,", gateway_smoke, re.DOTALL)
     assert "const workspaceDir = join(tempHome, 'workspace')" in gateway_smoke
     assert "await mkdir(workspaceDir, { recursive: true })" in gateway_smoke
     assert "writeFile(join(workspaceDir, 'SOUL.md')" in gateway_smoke
@@ -1710,7 +1857,14 @@ def test_desktop_update_drain_defers_user_quit_until_safe_handoff_or_retry() -> 
     )
 
     assert "if (updateApplying)" in before_quit
-    assert "if (updateInstallHandoffReady) return" in before_quit
+    updater_handoff = _section(
+        before_quit,
+        "if (updateInstallHandoffReady) {",
+        "event.preventDefault()",
+    )
+    assert "setAppExitPhase('committed', 'desktop updater owns exit')" in updater_handoff
+    assert "destroyWindowsTray()" in updater_handoff
+    assert "return" in updater_handoff
     assert "quitRequestedDuringUpdateDrain = true" in before_quit
     assert apply_update.index("updateInstallHandoffReady = true") < apply_update.index(
         "autoUpdater.quitAndInstall(false, true)"

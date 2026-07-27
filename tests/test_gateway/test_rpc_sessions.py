@@ -31,6 +31,7 @@ from opensquilla.gateway.rpc_sessions import _normalize_terminal_event_payload
 from opensquilla.gateway.session_streams import get_session_streams
 from opensquilla.gateway.uploads import set_upload_store
 from opensquilla.gateway.websocket import SubscriptionManager, get_registry
+from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
 from opensquilla.session.compaction import CompactionConfig
 from opensquilla.session.models import TranscriptEntry
@@ -3631,6 +3632,7 @@ class TestSessionsReset:
     async def test_reset_allows_checkpoint_receipt_when_flush_receipt_is_degraded(
         self, dispatcher, session
     ):
+        previous_session_id = session.session_id
         manager = FakeSessionManager([session])
         manager.transcript = [SimpleNamespace(id=1, content="message to preserve")]
         manager._storage.memory_durable_receipts.append(
@@ -3670,6 +3672,12 @@ class TestSessionsReset:
         assert res.ok is True
         assert res.payload["flush_receipt"]["result_status"] == "parse_failed_archived"
         assert manager.applied_intents == [(session.session_key, "reset_same_key")]
+        flush_kwargs = flush_service.execute.await_args.kwargs
+        correlation = flush_kwargs["provider_request_correlation"]
+        assert correlation.session_id == previous_session_id
+        assert correlation.turn_id == flush_kwargs["turn_id"]
+        assert correlation.execution_id != correlation.turn_id
+        assert correlation.call_kind == "auxiliary.session_flush"
 
     @pytest.mark.asyncio
     async def test_reset_refuses_stale_checkpoint_receipt_for_later_transcript(
@@ -3966,6 +3974,7 @@ class TestSessionsTruncate:
     async def test_truncate_allows_checkpoint_receipt_when_flush_receipt_is_degraded(
         self, dispatcher, session
     ):
+        previous_session_id = session.session_id
         manager = FakeSessionManager([session])
         manager.transcript = [
             SimpleNamespace(id=1, content="message to remove"),
@@ -4017,6 +4026,12 @@ class TestSessionsTruncate:
         assert res.ok is True
         assert res.payload["flush_receipt"]["result_status"] == "parse_failed_archived"
         assert manager.truncate_calls == [(session.session_key, 1)]
+        flush_kwargs = flush_service.execute.await_args.kwargs
+        correlation = flush_kwargs["provider_request_correlation"]
+        assert correlation.session_id == previous_session_id
+        assert correlation.turn_id == flush_kwargs["turn_id"]
+        assert correlation.execution_id != correlation.turn_id
+        assert correlation.call_kind == "auxiliary.session_flush"
 
     @pytest.mark.asyncio
     async def test_truncate_refuses_stale_checkpoint_for_later_removed_messages(
@@ -4215,6 +4230,13 @@ class TestSessionsContextCompact:
         assert res.payload["remaining_budget_tokens"] == 834
         assert res.payload["removed_count"] == 1
         assert res.payload["kept_count"] == 0
+        correlation = ctx_with_sessions.session_manager.compact_kwargs[0][
+            "provider_request_correlation"
+        ]
+        assert correlation.session_id == session.session_id
+        assert correlation.turn_id.startswith("cmp_")
+        assert correlation.execution_id
+        assert correlation.call_kind == "auxiliary.compaction"
 
     @pytest.mark.asyncio
     async def test_context_compact_emits_started_and_completed_events(
@@ -4502,6 +4524,19 @@ class TestSessionsContextCompact:
         assert manager.compact_calls[0][:2] == (session.session_key, 100000)
         assert manager.compact_kwargs[0]["flush_receipt_status"] == "degraded_forensic"
         assert res.payload["flush_receipt_status"] == "degraded_forensic"
+        flush_correlation = flush_service.execute.await_args.kwargs[
+            "provider_request_correlation"
+        ]
+        compact_correlation = manager.compact_kwargs[0][
+            "provider_request_correlation"
+        ]
+        assert isinstance(flush_correlation, ProviderRequestCorrelation)
+        assert isinstance(compact_correlation, ProviderRequestCorrelation)
+        assert flush_correlation.session_id == compact_correlation.session_id
+        assert flush_correlation.turn_id == compact_correlation.turn_id
+        assert flush_correlation.execution_id != compact_correlation.execution_id
+        assert flush_correlation.call_kind == "auxiliary.session_flush"
+        assert compact_correlation.call_kind == "auxiliary.compaction"
 
     @pytest.mark.asyncio
     async def test_context_compact_block_mode_allows_checkpoint_receipt(self, dispatcher, session):

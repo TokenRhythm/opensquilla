@@ -36,10 +36,12 @@ async def test_turnrunner_run_threads_pending_input_provider_to_run_turn() -> No
         session_key="agent:main:pending-thread-test",
         tool_context=ToolContext(session_key="agent:main:pending-thread-test"),
         pending_input_provider=pending,
+        root_turn_id="gateway-turn-1",
     ):
         pass
 
     assert seen_kwargs[0]["pending_input_provider"] is pending
+    assert seen_kwargs[0]["root_turn_id"] == "gateway-turn-1"
 
 
 @pytest.mark.asyncio

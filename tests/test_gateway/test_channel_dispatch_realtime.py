@@ -11,7 +11,14 @@ import pytest
 from opensquilla.artifacts import ArtifactStore
 from opensquilla.channels.contract import ChannelCapabilityProfile
 from opensquilla.channels.stream_policy import resolve_channel_stream_policy
-from opensquilla.channels.types import Attachment, IncomingMessage, OutgoingMessage
+from opensquilla.channels.types import (
+    Attachment,
+    AuthenticatedPrincipal,
+    IncomingMessage,
+    IngressProvenance,
+    IngressVerification,
+    OutgoingMessage,
+)
 from opensquilla.engine.types import (
     ArtifactEvent,
     DoneEvent,
@@ -86,6 +93,18 @@ class _RunContextSessionManager:
 
 def _message() -> IncomingMessage:
     return IncomingMessage(sender_id="u1", channel_id="c1", content="hello")
+
+
+def _authenticated_message() -> IncomingMessage:
+    return _message().model_copy(
+        update={
+            "provenance": IngressProvenance(
+                provider="feishu",
+                verification=IngressVerification.SDK_SESSION,
+                principal=AuthenticatedPrincipal(subject_id="u1"),
+            )
+        }
+    )
 
 
 def _tool_ctx(agent_id: str = "main") -> SimpleNamespace:
@@ -1198,7 +1217,7 @@ async def test_channel_admin_sender_gets_owner_tool_context_for_agent_turn(tmp_p
             yield TextDeltaEvent(text="ok")
             yield DoneEvent()
 
-    msg = _message()
+    msg = _authenticated_message()
     envelope = build_channel_route_envelope(
         msg,
         session_key="agent:main:feishu:u1",
@@ -1224,6 +1243,7 @@ async def test_channel_admin_sender_gets_owner_tool_context_for_agent_turn(tmp_p
 
     tool_context = captured["tool_context"]
     assert tool_context.is_owner is True
+    assert tool_context.channel_admin_verified is True
     assert tool_context.caller_kind is CallerKind.CHANNEL
     assert tool_context.channel_kind == "feishu"
     assert tool_context.sender_id == "u1"
@@ -1240,7 +1260,7 @@ async def test_channel_admin_sender_gets_owner_tool_context_for_agent_turn(tmp_p
 async def test_saved_channel_run_context_is_applied_to_route_envelope(tmp_path) -> None:
     from opensquilla.gateway.channel_dispatch import _apply_saved_channel_run_context
 
-    msg = _message()
+    msg = _authenticated_message()
     envelope = build_channel_route_envelope(
         msg,
         session_key="agent:main:feishu:u1",
@@ -1319,7 +1339,7 @@ async def test_unlisted_channel_sender_keeps_restricted_tool_context_for_agent_t
             yield TextDeltaEvent(text="ok")
             yield DoneEvent()
 
-    msg = _message()
+    msg = _authenticated_message()
     envelope = build_channel_route_envelope(
         msg,
         session_key="agent:main:feishu:u1",
@@ -1345,6 +1365,7 @@ async def test_unlisted_channel_sender_keeps_restricted_tool_context_for_agent_t
 
     tool_context = captured["tool_context"]
     assert tool_context.is_owner is False
+    assert tool_context.channel_admin_verified is False
     assert tool_context.caller_kind is CallerKind.CHANNEL
     assert tool_context.channel_kind == "feishu"
     assert tool_context.sender_id == "u1"
@@ -2342,8 +2363,10 @@ async def test_debounce_channel_turn_honors_attachment_persistence_config(tmp_pa
     class FakeTaskRuntime:
         def __init__(self) -> None:
             self.enqueue_calls: list[dict] = []
+            self.envelopes: list[object] = []
 
         async def enqueue(self, envelope, message: str, **kwargs):
+            self.envelopes.append(envelope)
             self.enqueue_calls.append({"message": message, **kwargs})
             return SimpleNamespace(task_id="t1")
 
@@ -2359,10 +2382,16 @@ async def test_debounce_channel_turn_honors_attachment_persistence_config(tmp_pa
         channel_id="c1",
         content="read this",
         attachments=[Attachment(name="doc.pdf", mime_type="application/pdf", url="mxc://doc")],
+        provenance=IngressProvenance(
+            provider="matrix",
+            verification=IngressVerification.SDK_SESSION,
+            principal=AuthenticatedPrincipal(subject_id="u1"),
+        ),
     )
     runtime = FakeTaskRuntime()
     session_manager = FakeSessionManager()
     config = SimpleNamespace(
+        channel_admin_senders={"matrix": ["u1"]},
         attachments=SimpleNamespace(
             persist_transcripts=False,
             media_root=str(tmp_path),
@@ -2391,6 +2420,7 @@ async def test_debounce_channel_turn_honors_attachment_persistence_config(tmp_pa
     assert "sha256_ref" not in persisted["attachments"][0]
     assert not (tmp_path / "transcripts").exists()
     assert runtime.enqueue_calls[0]["attachments"][0]["_was_staged"] is True
+    assert runtime.envelopes[0].metadata["principal_is_owner"] is True
 
 
 @pytest.mark.asyncio

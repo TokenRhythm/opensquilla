@@ -1308,17 +1308,25 @@ async def _image_generation_configure(params: Any, ctx: RpcContext) -> dict[str,
     cfg = _active_config(ctx)
     fallbacks = params.get("fallbacks") if isinstance(params, dict) else None
     with _validation_error("onboarding.imageGeneration.invalid"):
+        if fallbacks is not None and not isinstance(fallbacks, list):
+            raise ValueError("fallbacks must be a list of provider/model references")
         res = upsert_image_generation_provider(
             cfg,
             provider_id=provider_id,
             primary=params.get("primary", "") if isinstance(params, dict) else "",
             api_key=params.get("apiKey", "") if isinstance(params, dict) else "",
             api_key_env=params.get("apiKeyEnv", "") if isinstance(params, dict) else "",
-            base_url=params.get("baseUrl", "") if isinstance(params, dict) else "",
+            base_url=params.get("baseUrl") if isinstance(params, dict) else None,
             enabled=params.get("enabled", True) if isinstance(params, dict) else True,
             size=params.get("size", "") if isinstance(params, dict) else "",
             output_format=params.get("outputFormat", "") if isinstance(params, dict) else "",
-            fallbacks=list(fallbacks) if isinstance(fallbacks, list) else None,
+            fallbacks=list(fallbacks) if fallbacks is not None else None,
+            clear_fallbacks=(
+                params.get("clearFallbacks", False) if isinstance(params, dict) else False
+            ),
+            credential_mode=(
+                params.get("credentialMode") if isinstance(params, dict) else None
+            ),
         )
     # Persist first: if the write fails, the live config is untouched and
     # memory/disk stay consistent. Tool syncs run only on applied state.

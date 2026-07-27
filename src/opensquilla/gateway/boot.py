@@ -1088,8 +1088,11 @@ def _task_runtime_turn_hard_deadline_s(config: GatewayConfig) -> float | None:
 
 def _task_runtime_envelope_owner(envelope: Any) -> bool:
     """Resolve owner privileges from authenticated route metadata."""
+    from opensquilla.channels.admission import has_verified_channel_admin_stamp
     from opensquilla.gateway.routing import SourceKind
 
+    if getattr(envelope, "source_kind", None) == SourceKind.CHANNEL:
+        return has_verified_channel_admin_stamp(envelope)
     principal_is_owner = getattr(envelope, "metadata", {}).get("principal_is_owner")
     if isinstance(principal_is_owner, bool):
         return principal_is_owner
@@ -1288,6 +1291,7 @@ def build_task_runtime_run_kwargs(
         "fresh_user_session": bool(getattr(run, "fresh_user_session", False)),
         "ingress_pipeline_steps": ingress_steps,
         "pending_input_provider": getattr(run, "pending_input_provider", None),
+        "root_turn_id": getattr(run, "task_id", None),
     }
     if run.semantic_message is not None:
         # Prefetch query shape: channels carry the raw user text
@@ -1295,6 +1299,13 @@ def build_task_runtime_run_kwargs(
         # Only forward when set so web/CLI legacy paths keep
         # ``TurnRunner.run`` falling back to ``message`` as semantic input.
         kwargs["semantic_message"] = run.semantic_message
+    provider_request_correlation = getattr(
+        run,
+        "provider_request_correlation",
+        None,
+    )
+    if provider_request_correlation is not None:
+        kwargs["provider_request_correlation"] = provider_request_correlation
     bound_user_message_id = getattr(run, "persisted_user_message_id", None)
     if bound_user_message_id:
         # Bind history to the exact persisted user message this turn answers so
@@ -2743,6 +2754,7 @@ async def build_services(
                 interval_seconds=float(getattr(config.memory, "repair_interval_seconds", 60.0)),
                 max_items_per_tick=int(getattr(config.memory, "repair_max_items_per_tick", 5)),
                 usage_event_sink=usage_event_sink,
+                config=config,
             )
             log.info("build_services.memory_repair_service_ready")
         except Exception as e:
@@ -3283,6 +3295,7 @@ async def start_gateway_server(
         session_manager=svc.session_manager,
         channel_manager_ref=lambda: _cm_holder[0],
         schedule=create_background_task,
+        config=config,
     )
 
     background_completion_manager = BackgroundCompletionManager(

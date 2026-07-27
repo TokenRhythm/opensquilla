@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Closing the Desktop main window now preserves the live Control UI on macOS
+  and keeps Windows reachable from a system tray icon. Explicit **Quit
+  OpenSquilla** still drains and stops the local Gateway, and the close behavior
+  can be changed in Runtime settings.
+
 ## [0.5.0] - 2026-07-23
 
 OpenSquilla 0.5.0 is the first stable release of the 0.5 line, collecting the

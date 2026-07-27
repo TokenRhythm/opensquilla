@@ -41,7 +41,14 @@ from opensquilla.gateway.turn_ingress import (
     complete_durable_ingress,
     request_identity,
 )
+from opensquilla.observability.network_policy import (
+    provider_request_correlation_disabled,
+)
 from opensquilla.paths import media_root_from_config
+from opensquilla.provider.types import (
+    ProviderRequestCorrelation,
+    derive_provider_request_correlation,
+)
 from opensquilla.sandbox.run_context import (
     RUN_CONTEXT_ORIGIN_KEY,
     get_run_context,
@@ -117,6 +124,30 @@ def _accepts_keyword_arg(func: Any, name: str) -> bool:
         return True
     return name in params or any(
         param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
+    )
+
+
+def _build_session_flush_correlation(
+    ctx: RpcContext,
+    session_id: object,
+) -> tuple[str, ProviderRequestCorrelation | None]:
+    """Create one root operation and execution for a session-bound maintenance flush."""
+
+    turn_id = uuid.uuid4().hex
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or provider_request_correlation_disabled(config=ctx.config)
+    ):
+        return turn_id, None
+    return (
+        turn_id,
+        ProviderRequestCorrelation(
+            session_id=session_id,
+            turn_id=turn_id,
+            execution_id=uuid.uuid4().hex,
+            call_kind="auxiliary.session_flush",
+        ),
     )
 
 
@@ -277,9 +308,8 @@ def _apply_run_context_route_metadata(
         preserve_materialized_user_grants=True,
     )
     route_envelope.metadata["run_mode"] = run_context.run_mode.value
-    # A persisted (non-default) run context reflects a genuine per-session
-    # /sandbox choice; routing uses this to avoid upgrading an explicit
-    # Managed-Execution selection to channel-admin Full Host Access.
+    # Preserve whether this is the default or an explicit per-session choice
+    # for route consumers that need to display or audit its origin.
     route_envelope.metadata["run_mode_explicit"] = run_context.source != "default"
     route_envelope.metadata["sandbox_mounts"] = (
         filtered_run_context.to_origin_payload()["mounts"]
@@ -1567,11 +1597,32 @@ def _schedule_auto_title(
     first_message: str,
     *,
     enabled: bool,
+    session_id: str | None = None,
+    root_turn_id: str | None = None,
 ) -> None:
     if not enabled:
         return
+    provider_request_correlation = (
+        ProviderRequestCorrelation(
+            session_id=session_id,
+            turn_id=root_turn_id,
+            execution_id=uuid.uuid4().hex,
+            call_kind="auxiliary.naming",
+        )
+        if isinstance(session_id, str)
+        and session_id
+        and isinstance(root_turn_id, str)
+        and root_turn_id
+        and not provider_request_correlation_disabled(config=ctx.config)
+        else None
+    )
     asyncio.create_task(
-        generate_session_title(ctx, key, first_message),
+        generate_session_title(
+            ctx,
+            key,
+            first_message,
+            provider_request_correlation=provider_request_correlation,
+        ),
         name=f"session-title:{key}",
     )
 
@@ -2425,6 +2476,8 @@ async def _handle_sessions_send(
                     key,
                     semantic_message_text or message_text,
                     enabled=generate_title,
+                    session_id=session_id,
+                    root_turn_id=acceptance.receipt.task_id,
                 )
             except Exception:  # noqa: BLE001 - turn is already accepted.
                 log.exception(
@@ -2627,6 +2680,8 @@ async def _handle_sessions_send(
             key,
             semantic_message_text or message_text,
             enabled=generate_title,
+            session_id=session_id,
+            root_turn_id=turn_id,
         )
         await _emit_to_subscribers(
             ctx,
@@ -2740,6 +2795,7 @@ async def _handle_sessions_send(
                 no_memory_capture=capture_controls["no_memory_capture"],
                 semantic_message=semantic_message_text,
                 fresh_user_session=fresh_user_session,
+                root_turn_id=turn_id,
             )
             raw_stream_idle_timeout = effective_agent_stream_idle_timeout_seconds(ctx.config)
             stream_idle_timeout: float | None = (
@@ -2860,6 +2916,8 @@ async def _handle_sessions_send(
         key,
         semantic_message_text or message_text,
         enabled=generate_title,
+        session_id=session_id,
+        root_turn_id=turn_id,
     )
     return {
         "status": "accepted",
@@ -3535,14 +3593,31 @@ async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[s
             )
 
         try:
+            flush_turn_id, flush_correlation = _build_session_flush_correlation(
+                ctx,
+                previous_session_id,
+            )
+            flush_kwargs: dict[str, Any] = {
+                "agent_id": agent_id,
+                "timeout": 30.0,
+                "message_window": 0,
+                "segment_mode": "auto",
+                "raw_capture_policy": "required",
+            }
+            if _accepts_keyword_arg(ctx.flush_service.execute, "turn_id"):
+                flush_kwargs["turn_id"] = flush_turn_id
+            if (
+                flush_correlation is not None
+                and _accepts_keyword_arg(
+                    ctx.flush_service.execute,
+                    "provider_request_correlation",
+                )
+            ):
+                flush_kwargs["provider_request_correlation"] = flush_correlation
             receipt = await ctx.flush_service.execute(
                 transcript,
                 key,
-                agent_id=agent_id,
-                timeout=30.0,
-                message_window=0,
-                segment_mode="auto",
-                raw_capture_policy="required",
+                **flush_kwargs,
             )
         except Exception as exc:  # noqa: BLE001 — both LLM and raw-dump failed
             receipt = FlushReceipt(
@@ -3829,6 +3904,28 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                         "state_kind": "text",
                     }
                 raise KeyError(f"Session not found: {key}")
+        elif hasattr(ctx.session_manager, "get_session"):
+            session = await ctx.session_manager.get_session(key)
+            if session is None:
+                raise KeyError(f"Session not found: {key}")
+        durable_session_id = getattr(session, "session_id", None)
+        compaction_correlation = (
+            ProviderRequestCorrelation(
+                session_id=durable_session_id,
+                turn_id=compaction_id,
+                execution_id=uuid.uuid4().hex,
+                call_kind="auxiliary.compaction",
+            )
+            if isinstance(durable_session_id, str)
+            and durable_session_id
+            and not provider_request_correlation_disabled(config=ctx.config)
+            else None
+        )
+        flush_correlation = derive_provider_request_correlation(
+            compaction_correlation,
+            execution_id=uuid.uuid4().hex,
+            call_kind="auxiliary.session_flush",
+        )
         await _publish_manual_compaction_event(
             status="started",
             **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
@@ -3872,14 +3969,28 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                     except (TypeError, ValueError):
                         flush_timeout = 120.0
                     try:
+                        flush_kwargs: dict[str, Any] = {
+                            "agent_id": agent_id,
+                            "timeout": flush_timeout,
+                            "message_window": 0,
+                            "segment_mode": "auto",
+                            "raw_capture_policy": "required",
+                            "turn_id": compaction_id,
+                        }
+                        if (
+                            flush_correlation is not None
+                            and _accepts_keyword_arg(
+                                ctx.flush_service.execute,
+                                "provider_request_correlation",
+                            )
+                        ):
+                            flush_kwargs["provider_request_correlation"] = (
+                                flush_correlation
+                            )
                         receipt = await ctx.flush_service.execute(
                             transcript,
                             key,
-                            agent_id=agent_id,
-                            timeout=flush_timeout,
-                            message_window=0,
-                            segment_mode="auto",
-                            raw_capture_policy="required",
+                            **flush_kwargs,
                         )
                     except Exception as exc:  # noqa: BLE001
                         log.warning(
@@ -3967,10 +4078,24 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                 compact_kwargs: dict[str, Any] = {
                     "custom_instructions": custom_instructions,
                 }
+                if _accepts_keyword_arg(compact_with_result, "compaction_id"):
+                    compact_kwargs["compaction_id"] = compaction_id
+                if _accepts_keyword_arg(compact_with_result, "trigger_reason"):
+                    compact_kwargs["trigger_reason"] = "manual"
                 if flush_receipt_status is not None and _accepts_keyword_arg(
                     compact_with_result, "flush_receipt_status"
                 ):
                     compact_kwargs["flush_receipt_status"] = flush_receipt_status
+                if (
+                    compaction_correlation is not None
+                    and _accepts_keyword_arg(
+                        compact_with_result,
+                        "provider_request_correlation",
+                    )
+                ):
+                    compact_kwargs["provider_request_correlation"] = (
+                        compaction_correlation
+                    )
                 result = await compact_with_result(
                     key,
                     context_window_tokens,
@@ -4011,6 +4136,7 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                     key,
                     context_window_tokens,
                     compaction_config,
+                    provider_request_correlation=compaction_correlation,
                 )
                 removed_count = 1 if summary else 0
                 summary_source = "unknown"
@@ -4184,14 +4310,31 @@ async def _handle_sessions_truncate(params: dict | None, ctx: RpcContext) -> dic
             transcript = await ctx.session_manager.get_transcript(key)
             if transcript:
                 try:
+                    flush_turn_id, flush_correlation = _build_session_flush_correlation(
+                        ctx,
+                        previous_session_id,
+                    )
+                    flush_kwargs: dict[str, Any] = {
+                        "agent_id": agent_id,
+                        "timeout": 30.0,
+                        "message_window": 0,
+                        "segment_mode": "auto",
+                        "raw_capture_policy": "required",
+                    }
+                    if _accepts_keyword_arg(ctx.flush_service.execute, "turn_id"):
+                        flush_kwargs["turn_id"] = flush_turn_id
+                    if (
+                        flush_correlation is not None
+                        and _accepts_keyword_arg(
+                            ctx.flush_service.execute,
+                            "provider_request_correlation",
+                        )
+                    ):
+                        flush_kwargs["provider_request_correlation"] = flush_correlation
                     receipt = await ctx.flush_service.execute(
                         transcript,
                         key,
-                        agent_id=agent_id,
-                        timeout=30.0,
-                        message_window=0,
-                        segment_mode="auto",
-                        raw_capture_policy="required",
+                        **flush_kwargs,
                     )
                 except Exception as exc:  # noqa: BLE001 — both LLM and raw-dump failed
                     receipt = FlushReceipt(

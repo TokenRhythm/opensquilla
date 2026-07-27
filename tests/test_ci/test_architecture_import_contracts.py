@@ -35,6 +35,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("cli", "observability"),
     ("cli", "onboarding"),
     ("cli", "persistence"),
+    # CLI maintenance commands attach the same typed provider-correlation
+    # envelope as the shared turn loop; provider remains a lower-level leaf.
+    ("cli", "provider"),
     # The root CLI exposes the offline recovery adapter and writer entrypoints
     # acquire recovery locks; recovery never imports the CLI back.
     ("cli", "recovery"),

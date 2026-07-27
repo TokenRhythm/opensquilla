@@ -26,6 +26,8 @@
     "test:desktop-locale": "npm run build && node scripts/test-desktop-locale.mjs",
     "test:gateway-ownership": "npm run build && node scripts/test-desktop-gateway-ownership.mjs",
     "test:gateway-lifecycle": "npm run build && node scripts/test-desktop-gateway-lifecycle.mjs",
+    "test:window-lifecycle": "npm run build && node scripts/test-desktop-window-lifecycle.mjs",
+    "test:window-background-flow": "npm run build && node scripts/test-desktop-window-background-flow.mjs",
     "test:gateway-orphan-recovery-flow": "npm run build && node scripts/test-desktop-gateway-orphan-recovery-flow.mjs",
     "test:profile-substrate": "npm run build && node scripts/test-desktop-profile-substrate.mjs && node scripts/test-desktop-profile-context.mjs",
     "test:profile-recovery-flow": "npm run build && node scripts/test-profile-recovery-flow.mjs",

@@ -264,13 +264,13 @@ class PermissionMatrixPolicy:
     def evaluate(self, d: DispatchInput) -> PolicyDecision:
         ctx = d.ctx
         if ctx and ctx.caller_kind is CallerKind.CHANNEL:
-            # Defense-in-depth: CHANNEL callers must never reach operator role
-            # regardless of is_owner. Owner promotion happens upstream in the
-            # owner-resolver, not here, so an is_owner=True leak from a future
-            # ctx constructor must not silently widen channel permissions.
+            # Only the authenticated channel ingress boundary can set
+            # ``channel_admin_verified``. A generic ``is_owner`` context is
+            # insufficient so accidental owner propagation cannot widen an
+            # untrusted channel caller.
             principal = Principal(
-                role="user",
-                channel_id=ctx.session_key,
+                role="operator" if ctx.channel_admin_verified else "user",
+                channel_id=ctx.channel_id or ctx.session_key,
             )
             channel_kind = (
                 CHANNEL_WEBUI

@@ -1101,6 +1101,12 @@ def test_windows_smoke_does_not_install_bun_by_default() -> None:
     assert any(step.get("uses") == "oven-sh/setup-bun@v2" for step in tui_steps)
     assert any("bun run test:bun" in step.get("run", "") for step in tui_steps)
 
+    bun_test = next(step for step in tui_steps if step.get("name") == "Run OpenTUI Bun tests")
+    bun_run = bun_test["run"]
+    assert "for attempt in 1 2" in bun_run
+    assert 'status" -ne 132' in bun_run
+    assert "retrying once" in bun_run
+
 
 def test_windows_high_risk_job_runs_parallel_reported_shards() -> None:
     data = _workflow("ci.yml")

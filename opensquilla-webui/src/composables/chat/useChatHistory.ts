@@ -36,6 +36,12 @@ function usagePayload(value: unknown): ChatUsagePayload | undefined {
   return value as ChatUsagePayload
 }
 
+function historyTurnId(value: unknown): string | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const turnId = (value as Record<string, unknown>).turn_id
+  return typeof turnId === 'string' && turnId ? turnId : undefined
+}
+
 export interface UseChatHistoryOptions {
   rpc: RpcClient
   sessionKey: Ref<string>
@@ -152,6 +158,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       provenanceKind: msg.provenance_kind || '',
       provenanceSourceSessionKey: msg.provenance_source_session_key || '',
       provenanceSourceTool: msg.provenance_source_tool || '',
+      turnId: historyTurnId(msg.turn_context),
       usage: usagePayload(msg.usage) || usagePayload(msg.turn_usage),
       model: msg.model || undefined,
       input: msg.input || msg.input_tokens || undefined,

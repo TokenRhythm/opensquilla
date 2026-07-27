@@ -15,6 +15,8 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
   getDesktopSettings: () => ipcRenderer.invoke('desktop:settings:get'),
   saveDesktopSettings: (payload: unknown) => ipcRenderer.invoke('desktop:settings:save', payload),
   resetDesktopSettings: () => ipcRenderer.invoke('desktop:settings:reset'),
+  getDesktopPreferences: () => ipcRenderer.invoke('desktop:preferences:get'),
+  saveDesktopPreferences: (payload: unknown) => ipcRenderer.invoke('desktop:preferences:save', payload),
   setNativeTheme: (payload: unknown) => ipcRenderer.invoke('desktop:theme:set', payload),
   openArtifact: (payload: unknown) => ipcRenderer.invoke('desktop:artifact:open', payload),
   getOnboardingDefaults: () => ipcRenderer.invoke('desktop:onboarding:defaults'),
@@ -75,5 +77,10 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
     const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => callback(payload)
     ipcRenderer.on('desktop:migration:progress', listener)
     return () => ipcRenderer.removeListener('desktop:migration:progress', listener)
+  },
+  onWindowHidden: (callback: () => void) => {
+    const listener = () => callback()
+    ipcRenderer.on('desktop:window:hidden', listener)
+    return () => ipcRenderer.removeListener('desktop:window:hidden', listener)
   },
 })

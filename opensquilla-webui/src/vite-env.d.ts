@@ -3,6 +3,8 @@
 import type {
   ArtifactNativeOpenResult,
   ArtifactOpenRequest,
+  DesktopMainWindowCloseBehavior,
+  DesktopPreferences,
   DesktopRetryStartupResult,
   DesktopUpdateState,
   DesktopSettings,
@@ -39,6 +41,11 @@ declare global {
     getDesktopSettings: () => Promise<DesktopSettings>
     saveDesktopSettings: (payload: DesktopSettingsPayload) => Promise<DesktopSettings>
     resetDesktopSettings: () => Promise<{ ok: boolean }>
+    getDesktopPreferences?: () => Promise<DesktopPreferences>
+    saveDesktopPreferences?: (
+      payload: { mainWindowCloseBehavior: DesktopMainWindowCloseBehavior },
+    ) => Promise<DesktopPreferences>
+    onWindowHidden?: (callback: () => void) => () => void
     inspectDesktopCleanup?: (payload: { mode: DesktopCleanupMode }) => Promise<{
       ok: boolean
       previewId: string | null

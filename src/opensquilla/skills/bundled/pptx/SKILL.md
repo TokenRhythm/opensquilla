@@ -262,8 +262,10 @@ Plain bullets on white look generated. Apply each item before declaring done:
 - Pick a content-specific palette (one dominant color ~60% of weight, one
   support, one accent). Avoid generic blue.
 - Title slides and section dividers in dark; content slides in light.
-- Every slide carries one visual element: an icon, a stat callout, a chart,
-  or an image. No slide is title + bullets only.
+- Every slide carries one meaningful visual element: a topic-specific image,
+  chart, diagram, data graphic, or recognizable icon. Emoji, colored boxes,
+  and decorative lines do not satisfy this requirement. No slide is title +
+  bullets only.
 - Use varied layouts across slides — two-column, half-bleed image, stat
   grid, quote slide. Repeating one layout for ten pages is the strongest
   "AI-generated" tell.
@@ -274,14 +276,23 @@ Plain bullets on white look generated. Apply each item before declaring done:
 
 ---
 
-## Visual QA (required for paths B and C)
+## Visual QA (when render tools are available)
 
-A first render is rarely correct. Render to images and inspect.
+For paths B and C, when both `soffice` (LibreOffice) and `pdftoppm` (poppler)
+are available and the renderer runs, render the entire deck to images and
+inspect every page before `publish_artifact`.
 
 ```bash
 bash {baseDir}/scripts/render_thumbs.sh out.pptx
 # emits out-01.jpg, out-02.jpg, ... in cwd, plus out.pdf
 ```
+
+Do not pass `--range` for final QA. Count the emitted `out-*.jpg` files and
+inspect each one. A timeout, conversion error, missing thumbnail, or a review
+of only a subset of the pages means visual QA is incomplete. If inspection
+finds a defect, fix it, render the entire deck again, and re-inspect every
+page. If the full inspection finds no defect, publish without inventing an
+unnecessary edit just to force a rerender.
 
 The script needs `soffice` (LibreOffice) and `pdftoppm` (poppler) on PATH. If
 either is missing, the script tells you what to install for the host OS.
@@ -299,9 +310,15 @@ For each slide list:
   - Inconsistent spacing across analogous slides
   - Leftover placeholder text ("Lorem", "TODO", "{{...}}", "xxxx")
   - Misaligned columns or icons
-Report all findings. Do not declare clean unless one fix-and-reverify cycle
-has passed.
+Report all findings. When you found a defect, do not declare clean until its
+fix-and-reverify cycle has passed across every rendered page.
 ```
+
+If either render tool is unavailable, visual QA is unavailable. A B1 text-only
+edit may still be published after the file saves and the intended text is
+verified; state that visual QA was unavailable. For B2 or C work without a
+renderer, complete the available structural checks but do not claim that visual
+QA passed.
 
 ---
 
@@ -334,8 +351,16 @@ has passed.
   Debian/Ubuntu `sudo apt-get install -y poppler-utils`; Windows ships it
   inside the LibreOffice install or via `pdftoppm` from poppler-windows
   releases.
-- **PptxGenJS path fails with `MODULE_NOT_FOUND`**: `npm install -g pptxgenjs`
-  or run inside a Node project where it is a local dependency.
+- **PptxGenJS path fails with `MODULE_NOT_FOUND`**: do not use a global npm
+  install; Node does not resolve global packages from `require()`. Prefer the
+  Python path. If the JS path is necessary, create a disposable local project
+  outside the user's repository. Create a fresh per-run OS temporary directory
+  with `tempfile.mkdtemp(prefix="opensquilla-pptxgenjs-")`, use it as the
+  working directory for `npm install --ignore-scripts --no-save pptxgenjs` and
+  `node build_deck.js`, and keep the authoring script beside its
+  `node_modules` directory. Write the final `.pptx` into the active workspace
+  and remove the disposable directory after publishing it. Do not use a fixed
+  path or a shell-specific directory-creation command.
 
 ---
 

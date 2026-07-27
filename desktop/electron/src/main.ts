@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, safeStorage, shell } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, safeStorage, shell, Tray } from 'electron'
 import electronUpdater from 'electron-updater'
 import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
@@ -8,7 +8,12 @@ import net from 'node:net'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { DESKTOP_LOCALES, resolveLocaleFromTags, type DesktopLocale } from './desktop-locale.js'
+import {
+  DESKTOP_LOCALES,
+  normalizeGatewayLocale,
+  resolveLocaleFromTags,
+  type DesktopLocale,
+} from './desktop-locale.js'
 import {
   allProfileContexts as enumerateDesktopProfileContexts,
   contextForProfile,
@@ -73,6 +78,16 @@ import {
   streamResponseToVerifiedFile,
 } from './update-verification.js'
 import { isUpdateCheckAllowed, UpdateCheckScheduler } from './update-check-scheduler.js'
+import {
+  canRevealDesktopApp,
+  defaultDesktopPreferences,
+  mainWindowCloseAction,
+  normalizeDesktopPreferences,
+  serializeDesktopPreferences,
+  type DesktopExitPhase,
+  type DesktopMainWindowCloseBehavior,
+  type DesktopPreferencesFile,
+} from './desktop-window-lifecycle.js'
 
 interface GatewayState {
   url: string
@@ -178,6 +193,16 @@ interface DesktopSettingsSnapshot {
   gateway: GatewayState
 }
 
+interface DesktopPreferencesPayload {
+  mainWindowCloseBehavior?: unknown
+}
+
+interface DesktopPreferencesSnapshot {
+  mainWindowCloseBehavior: DesktopMainWindowCloseBehavior
+  canRunInBackground: boolean
+  platform: 'darwin' | 'win32' | 'linux' | 'other'
+}
+
 interface RuntimeLaunch {
   command: string
   args: string[]
@@ -252,6 +277,17 @@ const shouldUseNativeApplicationMenu = process.platform === 'darwin'
 
 let mainWindow: BrowserWindow | null = null
 let onboardingWindow: BrowserWindow | null = null
+let windowsTray: Tray | null = null
+let appExitPhase: DesktopExitPhase = 'running'
+let systemSessionEnding = false
+let windowsSessionEndPreviousPhase: DesktopExitPhase | null = null
+let windowsSessionEndResetTimer: NodeJS.Timeout | null = null
+let mainWindowClosePrompt: Promise<void> | null = null
+let desktopPreferencesCache: {
+  value: DesktopPreferencesFile
+  writable: boolean
+} | null = null
+let desktopPreferencesWritePromise: Promise<void> = Promise.resolve()
 
 type DesktopNativeThemeSource = 'light' | 'dark' | 'system'
 
@@ -1797,6 +1833,116 @@ async function atomicWriteFile(filePath: string, data: string, mode: number): Pr
   }
 }
 
+function desktopPreferencesPath(): string {
+  return join(app.getPath('userData'), 'desktop-preferences.json')
+}
+
+function desktopPlatformName(): DesktopPreferencesSnapshot['platform'] {
+  if (process.platform === 'darwin' || process.platform === 'win32' || process.platform === 'linux') {
+    return process.platform
+  }
+  return 'other'
+}
+
+function canRunDesktopInBackground(): boolean {
+  return process.platform === 'darwin' || (process.platform === 'win32' && windowsTray !== null)
+}
+
+function loadDesktopPreferencesRecord(): {
+  value: DesktopPreferencesFile
+  writable: boolean
+} {
+  if (desktopPreferencesCache) return desktopPreferencesCache
+  try {
+    const parsed = JSON.parse(readFileSync(desktopPreferencesPath(), 'utf8')) as unknown
+    desktopPreferencesCache = normalizeDesktopPreferences(parsed, process.platform)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      desktopLog('desktop_preferences_load_failed', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+    desktopPreferencesCache = {
+      value: defaultDesktopPreferences(process.platform),
+      writable: true,
+    }
+  }
+  return desktopPreferencesCache
+}
+
+function desktopPreferencesSnapshot(): DesktopPreferencesSnapshot {
+  const preferences = loadDesktopPreferencesRecord().value
+  return {
+    mainWindowCloseBehavior: preferences.main_window_close_behavior,
+    canRunInBackground: canRunDesktopInBackground(),
+    platform: desktopPlatformName(),
+  }
+}
+
+function enqueueDesktopPreferencesUpdate(
+  update: (current: DesktopPreferencesFile) => DesktopPreferencesFile,
+): Promise<DesktopPreferencesSnapshot> {
+  const operation = desktopPreferencesWritePromise.then(async () => {
+    const loaded = loadDesktopPreferencesRecord()
+    if (!loaded.writable) {
+      throw new Error(
+        'Desktop preferences were written by a newer OpenSquilla version and were not changed.',
+      )
+    }
+    const previous = loaded.value
+    const next = update(previous)
+    try {
+      await atomicWriteFile(
+        desktopPreferencesPath(),
+        serializeDesktopPreferences(next),
+        0o600,
+      )
+      desktopPreferencesCache = { value: next, writable: true }
+    } catch (error) {
+      desktopPreferencesCache = { value: previous, writable: true }
+      throw error
+    }
+    return desktopPreferencesSnapshot()
+  })
+  desktopPreferencesWritePromise = operation.then(() => undefined, () => undefined)
+  return operation
+}
+
+async function saveDesktopPreferences(
+  payload: DesktopPreferencesPayload,
+): Promise<DesktopPreferencesSnapshot> {
+  const behavior = payload?.mainWindowCloseBehavior
+  if (behavior !== 'background' && behavior !== 'quit' && behavior !== 'ask') {
+    throw new Error('Choose a supported main-window close behavior.')
+  }
+  if (behavior !== 'quit' && !canRunDesktopInBackground()) {
+    throw new Error('Background window mode is unavailable because no restore surface is active.')
+  }
+  return await enqueueDesktopPreferencesUpdate((current) => ({
+    ...current,
+    main_window_close_behavior: behavior,
+  }))
+}
+
+function markBackgroundCloseNoticeShown(): void {
+  const loaded = loadDesktopPreferencesRecord()
+  if (!loaded.writable || loaded.value.background_close_notice_shown) return
+  // Update the in-memory snapshot immediately so repeated close events in the
+  // same session cannot emit duplicate balloons while the atomic write queues.
+  desktopPreferencesCache = {
+    value: { ...loaded.value, background_close_notice_shown: true },
+    writable: true,
+  }
+  void enqueueDesktopPreferencesUpdate((current) => ({
+    ...current,
+    background_close_notice_shown: true,
+  })).catch((error) => {
+    desktopLog('background_close_notice_persist_failed', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+  })
+}
+
 async function loadDesktopCredential(): Promise<DesktopConnection | null> {
   try {
     const raw = await readFile(credentialPath(), 'utf8')
@@ -1860,6 +2006,7 @@ async function saveDesktopCredential(
   const disableNetworkObservability = Object.prototype.hasOwnProperty.call(payload, 'disableNetworkObservability')
     ? normalizeBooleanSetting(payload.disableNetworkObservability, existing?.disableNetworkObservability ?? false)
     : configDisableNetworkObservability ?? existing?.disableNetworkObservability ?? false
+  const configLocale = desktopLocaleChoice(payload.locale) ?? desktopLocale
 
   if (defaults.requiresApiKey && !encryptedApiKey) throw new Error('API key is required.')
   if (modelRoutingMode === 'llm_ensemble' && !modelRoutingModeAllowed(modelRoutingMode, provider)) {
@@ -1903,6 +2050,7 @@ async function saveDesktopCredential(
       JSON.stringify(credential, null, 2),
       expectedCredential,
       writerReserved,
+      configLocale,
     )
     return credential
   } finally {
@@ -2049,6 +2197,27 @@ function foreignConfigPreambleLines(raw: string): string[] {
   return out
 }
 
+// The Desktop owns the control-ui section's boot fields, while the Gateway
+// owns the operator's persisted notice locale. Preserve only that scalar
+// instead of retaining a whole section whose other settings Desktop
+// must regenerate deterministically.
+function persistedControlUiDefaultLocale(raw: string | null): DesktopLocale | null {
+  if (raw === null) return null
+  let inControlUi = false
+  for (const rawLine of raw.split(/\r?\n/)) {
+    const header = rawLine.trim().match(/^\[\s*([^\]]+?)\s*\](?:\s*#.*)?$/)
+    if (header) {
+      inControlUi = header[1] === 'control_ui'
+      continue
+    }
+    if (!inControlUi) continue
+    const match = rawLine.match(/^\s*default_locale\s*=\s*["']([^"']*)["']\s*(?:#.*)?$/)
+    if (!match) continue
+    return normalizeGatewayLocale(match[1])
+  }
+  return null
+}
+
 async function readOptionalDesktopText(path: string): Promise<string | null> {
   try {
     return await readFile(path, 'utf8')
@@ -2079,9 +2248,11 @@ function renderDesktopConfigAfterPreflight(
   credential: DesktopConnection,
   inspection: RecoveryProtocolResult,
   existingRaw: string | null,
+  defaultLocale: DesktopLocale,
 ): string {
   let preservedForeignSections: string[] = []
   let preservedForeignPreamble: string[] = []
+  const preservedControlUiLocale = persistedControlUiDefaultLocale(existingRaw)
   if (existingRaw !== null) {
     preservedForeignSections = foreignConfigSectionLines(existingRaw)
     preservedForeignPreamble = foreignConfigPreambleLines(existingRaw)
@@ -2111,6 +2282,7 @@ function renderDesktopConfigAfterPreflight(
     '[control_ui]',
     'enabled = true',
     'base_path = "/control"',
+    `default_locale = ${tomlString(preservedControlUiLocale ?? defaultLocale)}`,
     '',
     ...(preservedForeignSections.length ? [...preservedForeignSections, ''] : []),
   ].join('\n')
@@ -2122,6 +2294,7 @@ async function applyDesktopSettingsPair(
   candidateCredential: string,
   expectedCredential: string | null,
   writerReserved = false,
+  defaultLocale = desktopLocale,
 ): Promise<RecoveryProtocolResult> {
   const targetProfileKey = desktopProfileKey(profile)
   if (desktopProfileKey() !== targetProfileKey) {
@@ -2148,6 +2321,7 @@ async function applyDesktopSettingsPair(
       credential,
       inspection,
       expectedConfig,
+      defaultLocale,
     )
     const result = await runRecoveryCli(
       profile,
@@ -2542,10 +2716,17 @@ function desktopLocalePath(): string {
 function loadPersistedDesktopLocale(): DesktopLocale | null {
   try {
     const raw = readFileSync(desktopLocalePath(), 'utf8').trim()
-    return DESKTOP_LOCALES.includes(raw as DesktopLocale) ? (raw as DesktopLocale) : null
+    return desktopLocaleChoice(raw)
   } catch {
     return null
   }
+}
+
+function desktopLocaleChoice(raw: unknown): DesktopLocale | null {
+  const requested = String(raw ?? '')
+  return DESKTOP_LOCALES.includes(requested as DesktopLocale)
+    ? requested as DesktopLocale
+    : null
 }
 
 function persistDesktopLocale(locale: DesktopLocale): void {
@@ -2558,11 +2739,12 @@ function persistDesktopLocale(locale: DesktopLocale): void {
 }
 
 function applyDesktopLocaleChoice(raw: unknown): void {
-  const requested = String(raw ?? '')
-  if (!DESKTOP_LOCALES.includes(requested as DesktopLocale)) return
+  const requested = desktopLocaleChoice(raw)
+  if (requested === null) return
   if (requested !== desktopLocale) {
-    desktopLocale = requested as DesktopLocale
+    desktopLocale = requested
     createApplicationMenu()
+    rebuildWindowsTrayMenu()
   }
   persistDesktopLocale(desktopLocale)
 }
@@ -2579,6 +2761,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'menu.showProfile': 'Show Active Profile',
     'menu.switchRecovery': 'Switch to Recovery Profile',
     'menu.returnPrimary': 'Return to Primary Profile',
+    'tray.open': 'Open OpenSquilla',
+    'tray.running': 'OpenSquilla is running in the background',
+    'tray.quit': 'Quit OpenSquilla',
+    'tray.backgroundTitle': 'OpenSquilla is still running',
+    'tray.backgroundDetail': 'Tasks, schedules, and connected channels continue in the background. Open or quit OpenSquilla from the system tray.',
+    'closePrompt.title': 'Close OpenSquilla?',
+    'closePrompt.message': 'What should happen when the main window closes?',
+    'closePrompt.detail': 'Background mode keeps tasks, schedules, and connected channels running. Explicit Quit safely stops the local runtime.',
+    'closePrompt.background': 'Keep running in background',
+    'closePrompt.quit': 'Quit OpenSquilla',
+    'closePrompt.cancel': 'Cancel',
+    'closePrompt.remember': 'Remember my choice',
     'update.newVersionTitle': 'A new version is available',
     'update.newVersionDetail': 'OpenSquilla {version} is available. Download it now?',
     'update.download': 'Download',
@@ -2707,6 +2901,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'menu.showProfile': '显示当前配置',
     'menu.switchRecovery': '切换到恢复配置',
     'menu.returnPrimary': '返回主配置',
+    'tray.open': '打开 OpenSquilla',
+    'tray.running': 'OpenSquilla 正在后台运行',
+    'tray.quit': '退出 OpenSquilla',
+    'tray.backgroundTitle': 'OpenSquilla 仍在运行',
+    'tray.backgroundDetail': '任务、定时任务和已连接渠道会继续在后台运行。可从系统托盘打开或退出 OpenSquilla。',
+    'closePrompt.title': '关闭 OpenSquilla？',
+    'closePrompt.message': '关闭主窗口时要执行什么操作？',
+    'closePrompt.detail': '后台模式会继续运行任务、定时任务和已连接渠道；显式退出会安全停止本地运行时。',
+    'closePrompt.background': '继续在后台运行',
+    'closePrompt.quit': '退出 OpenSquilla',
+    'closePrompt.cancel': '取消',
+    'closePrompt.remember': '记住我的选择',
     'update.newVersionTitle': '有新版本可用',
     'update.newVersionDetail': 'OpenSquilla {version} 已发布，现在下载吗？',
     'update.download': '下载',
@@ -2835,6 +3041,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'menu.showProfile': '使用中のプロファイルを表示',
     'menu.switchRecovery': '復旧プロファイルに切り替え',
     'menu.returnPrimary': 'プライマリプロファイルに戻る',
+    'tray.open': 'OpenSquilla を開く',
+    'tray.running': 'OpenSquilla はバックグラウンドで実行中です',
+    'tray.quit': 'OpenSquilla を終了',
+    'tray.backgroundTitle': 'OpenSquilla は引き続き実行中です',
+    'tray.backgroundDetail': 'タスク、スケジュール、接続済みチャンネルはバックグラウンドで続行します。システムトレイから開くか終了できます。',
+    'closePrompt.title': 'OpenSquilla を閉じますか？',
+    'closePrompt.message': 'メインウィンドウを閉じるときの動作を選択してください。',
+    'closePrompt.detail': 'バックグラウンドモードではタスク、スケジュール、接続済みチャンネルが継続します。明示的に終了するとローカルランタイムを安全に停止します。',
+    'closePrompt.background': 'バックグラウンドで続行',
+    'closePrompt.quit': 'OpenSquilla を終了',
+    'closePrompt.cancel': 'キャンセル',
+    'closePrompt.remember': 'この選択を記憶する',
     'update.newVersionTitle': '新しいバージョンが利用可能です',
     'update.newVersionDetail': 'OpenSquilla {version} が利用可能です。今すぐダウンロードしますか？',
     'update.download': 'ダウンロード',
@@ -2961,6 +3179,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'menu.showProfile': 'Afficher le profil actif',
     'menu.switchRecovery': 'Basculer vers un profil de récupération',
     'menu.returnPrimary': 'Revenir au profil principal',
+    'tray.open': 'Ouvrir OpenSquilla',
+    'tray.running': 'OpenSquilla fonctionne en arrière-plan',
+    'tray.quit': 'Quitter OpenSquilla',
+    'tray.backgroundTitle': 'OpenSquilla fonctionne toujours',
+    'tray.backgroundDetail': 'Les tâches, planifications et canaux connectés continuent en arrière-plan. Ouvrez ou quittez OpenSquilla depuis la zone de notification.',
+    'closePrompt.title': 'Fermer OpenSquilla ?',
+    'closePrompt.message': 'Que doit-il se passer à la fermeture de la fenêtre principale ?',
+    'closePrompt.detail': 'Le mode arrière-plan maintient les tâches, planifications et canaux connectés. Quitter explicitement arrête le runtime local en toute sécurité.',
+    'closePrompt.background': 'Continuer en arrière-plan',
+    'closePrompt.quit': 'Quitter OpenSquilla',
+    'closePrompt.cancel': 'Annuler',
+    'closePrompt.remember': 'Mémoriser mon choix',
     'update.newVersionTitle': 'Une nouvelle version est disponible',
     'update.newVersionDetail': 'OpenSquilla {version} est disponible. Télécharger maintenant ?',
     'update.download': 'Télécharger',
@@ -3087,6 +3317,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'menu.showProfile': 'Aktives Profil anzeigen',
     'menu.switchRecovery': 'Zum Wiederherstellungsprofil wechseln',
     'menu.returnPrimary': 'Zum Hauptprofil zurückkehren',
+    'tray.open': 'OpenSquilla öffnen',
+    'tray.running': 'OpenSquilla wird im Hintergrund ausgeführt',
+    'tray.quit': 'OpenSquilla beenden',
+    'tray.backgroundTitle': 'OpenSquilla wird weiter ausgeführt',
+    'tray.backgroundDetail': 'Aufgaben, Zeitpläne und verbundene Kanäle laufen im Hintergrund weiter. Öffnen oder beenden Sie OpenSquilla über den Infobereich.',
+    'closePrompt.title': 'OpenSquilla schließen?',
+    'closePrompt.message': 'Was soll beim Schließen des Hauptfensters geschehen?',
+    'closePrompt.detail': 'Im Hintergrundmodus laufen Aufgaben, Zeitpläne und verbundene Kanäle weiter. Beim expliziten Beenden wird die lokale Laufzeit sicher gestoppt.',
+    'closePrompt.background': 'Im Hintergrund weiter ausführen',
+    'closePrompt.quit': 'OpenSquilla beenden',
+    'closePrompt.cancel': 'Abbrechen',
+    'closePrompt.remember': 'Auswahl merken',
     'update.newVersionTitle': 'Eine neue Version ist verfügbar',
     'update.newVersionDetail': 'OpenSquilla {version} ist verfügbar. Jetzt herunterladen?',
     'update.download': 'Herunterladen',
@@ -3213,6 +3455,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'menu.showProfile': 'Mostrar perfil activo',
     'menu.switchRecovery': 'Cambiar al perfil de recuperación',
     'menu.returnPrimary': 'Volver al perfil principal',
+    'tray.open': 'Abrir OpenSquilla',
+    'tray.running': 'OpenSquilla se ejecuta en segundo plano',
+    'tray.quit': 'Salir de OpenSquilla',
+    'tray.backgroundTitle': 'OpenSquilla sigue en ejecución',
+    'tray.backgroundDetail': 'Las tareas, programaciones y canales conectados continúan en segundo plano. Abre o cierra OpenSquilla desde la bandeja del sistema.',
+    'closePrompt.title': '¿Cerrar OpenSquilla?',
+    'closePrompt.message': '¿Qué debe ocurrir al cerrar la ventana principal?',
+    'closePrompt.detail': 'El modo en segundo plano mantiene las tareas, programaciones y canales conectados. Salir explícitamente detiene el entorno local de forma segura.',
+    'closePrompt.background': 'Seguir ejecutando en segundo plano',
+    'closePrompt.quit': 'Salir de OpenSquilla',
+    'closePrompt.cancel': 'Cancelar',
+    'closePrompt.remember': 'Recordar mi elección',
     'update.newVersionTitle': 'Hay una nueva versión disponible',
     'update.newVersionDetail': 'OpenSquilla {version} está disponible. ¿Descargar ahora?',
     'update.download': 'Descargar',
@@ -3688,6 +3942,176 @@ function focusMainWindow(): boolean {
   mainWindow.show()
   mainWindow.focus()
   return true
+}
+
+function setAppExitPhase(next: DesktopExitPhase, reason: string): void {
+  if (appExitPhase === next) return
+  desktopLog('desktop_exit_phase', { from: appExitPhase, to: next, reason })
+  appExitPhase = next
+  rebuildWindowsTrayMenu()
+}
+
+function destroyWindowsTray(): void {
+  if (!windowsTray) return
+  windowsTray.destroy()
+  windowsTray = null
+}
+
+function rebuildWindowsTrayMenu(): void {
+  if (!windowsTray) return
+  windowsTray.setContextMenu(Menu.buildFromTemplate([
+    {
+      label: desktopT('tray.open'),
+      enabled: canRevealDesktopApp(appExitPhase),
+      click: () => revealDesktopApp(),
+    },
+    {
+      label: desktopT('tray.running'),
+      enabled: false,
+    },
+    { type: 'separator' },
+    {
+      label: desktopT('tray.quit'),
+      click: () => app.quit(),
+    },
+  ]))
+}
+
+function createWindowsTray(): boolean {
+  if (process.platform !== 'win32') return false
+  if (windowsTray) return true
+  try {
+    const tray = new Tray(appIconPath())
+    windowsTray = tray
+    tray.setToolTip('OpenSquilla')
+    tray.on('click', () => revealDesktopApp())
+    tray.on('balloon-click', () => revealDesktopApp())
+    rebuildWindowsTrayMenu()
+    desktopLog('windows_tray_ready')
+    return true
+  } catch (error) {
+    windowsTray = null
+    desktopLog('windows_tray_failed', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return false
+  }
+}
+
+function showWindowsBackgroundCloseNotice(): void {
+  if (process.platform !== 'win32' || !windowsTray) return
+  const preferences = loadDesktopPreferencesRecord()
+  if (preferences.value.background_close_notice_shown) return
+  try {
+    windowsTray.displayBalloon({
+      title: desktopT('tray.backgroundTitle'),
+      content: desktopT('tray.backgroundDetail'),
+      iconType: 'info',
+      noSound: true,
+      respectQuietTime: true,
+    })
+    markBackgroundCloseNoticeShown()
+  } catch (error) {
+    desktopLog('windows_tray_notice_failed', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }
+}
+
+function hideMainWindow(window: BrowserWindow): void {
+  if (!window.webContents.isDestroyed()) {
+    window.webContents.send('desktop:window:hidden')
+  }
+  window.hide()
+  desktopLog('main_window_hidden', { platform: process.platform })
+  showWindowsBackgroundCloseNotice()
+}
+
+function revealDesktopApp(): void {
+  if (!canRevealDesktopApp(appExitPhase)) return
+  focusMainWindow()
+  // Profile migration and cleanup reuse isQuitting as a spawn gate. The hidden
+  // renderer is still safe to reveal during those operations, but opening a
+  // missing window or starting another Gateway is not.
+  if (isQuitting) return
+  void openOrResumeDesktopApp()
+}
+
+async function promptForMainWindowClose(window: BrowserWindow): Promise<void> {
+  if (mainWindowClosePrompt) return await mainWindowClosePrompt
+  mainWindowClosePrompt = (async () => {
+    const result = await dialog.showMessageBox(window, {
+      type: 'question',
+      title: desktopT('closePrompt.title'),
+      message: desktopT('closePrompt.message'),
+      detail: desktopT('closePrompt.detail'),
+      buttons: [
+        desktopT('closePrompt.background'),
+        desktopT('closePrompt.quit'),
+        desktopT('closePrompt.cancel'),
+      ],
+      defaultId: 0,
+      cancelId: 2,
+      checkboxLabel: desktopT('closePrompt.remember'),
+      checkboxChecked: false,
+      noLink: true,
+    })
+    if (window.isDestroyed() || appExitPhase !== 'running') return
+    if (result.response === 0) {
+      if (result.checkboxChecked) {
+        await saveDesktopPreferences({
+          mainWindowCloseBehavior: 'background',
+        }).catch((error) => {
+          desktopLog('desktop_preferences_save_failed', {
+            error: error instanceof Error ? error.message : String(error),
+          })
+        })
+      }
+      hideMainWindow(window)
+      return
+    }
+    if (result.response === 1) {
+      if (result.checkboxChecked) {
+        await saveDesktopPreferences({
+          mainWindowCloseBehavior: 'quit',
+        }).catch((error) => {
+          desktopLog('desktop_preferences_save_failed', {
+            error: error instanceof Error ? error.message : String(error),
+          })
+        })
+      }
+      app.quit()
+    }
+  })().finally(() => {
+    mainWindowClosePrompt = null
+  })
+  return await mainWindowClosePrompt
+}
+
+function handleMainWindowClose(window: BrowserWindow, event: Electron.Event): void {
+  const action = mainWindowCloseAction({
+    platform: process.platform,
+    exitPhase: appExitPhase,
+    systemSessionEnding,
+    onboardingOpen: currentOnboardingWindow() !== null,
+    behavior: loadDesktopPreferencesRecord().value.main_window_close_behavior,
+    windowsTrayReady: windowsTray !== null,
+  })
+  if (action === 'allow') return
+  event.preventDefault()
+  if (action === 'focus-onboarding') {
+    focusOnboardingWindow()
+    return
+  }
+  if (action === 'hide') {
+    hideMainWindow(window)
+    return
+  }
+  if (action === 'quit') {
+    app.quit()
+    return
+  }
+  void promptForMainWindowClose(window)
 }
 
 function installEditingContextMenu(window: BrowserWindow): void {
@@ -6242,6 +6666,45 @@ async function createMainWindow(): Promise<BrowserWindow> {
   window.webContents.on('will-navigate', guardMainWindowNavigation)
   window.webContents.on('will-redirect', guardMainWindowNavigation)
 
+  window.on('close', (event) => handleMainWindowClose(window, event))
+  if (process.platform === 'win32') {
+    const commitSystemSessionEnd = () => {
+      if (!systemSessionEnding) windowsSessionEndPreviousPhase = appExitPhase
+      systemSessionEnding = true
+      setAppExitPhase('committed', 'windows session ending')
+    }
+    window.on('query-session-end', () => {
+      commitSystemSessionEnd()
+      if (windowsSessionEndResetTimer) clearTimeout(windowsSessionEndResetTimer)
+      // Windows can abandon a shutdown/logout because another application
+      // vetoed it, but Electron exposes no matching cancellation event. Do not
+      // leave this instance permanently committed and unrevealable.
+      windowsSessionEndResetTimer = setTimeout(() => {
+        windowsSessionEndResetTimer = null
+        if (!systemSessionEnding) return
+        const previousPhase = windowsSessionEndPreviousPhase ?? 'running'
+        windowsSessionEndPreviousPhase = null
+        systemSessionEnding = false
+        if (appExitPhase === 'committed') {
+          setAppExitPhase(previousPhase, 'Windows session end was not committed')
+        }
+      }, 15_000)
+      windowsSessionEndResetTimer.unref()
+    })
+    window.on('session-end', () => {
+      if (windowsSessionEndResetTimer) clearTimeout(windowsSessionEndResetTimer)
+      windowsSessionEndResetTimer = null
+      windowsSessionEndPreviousPhase = null
+      commitSystemSessionEnd()
+      // Electron does not emit app.before-quit for Windows shutdown, restart,
+      // or logout. Release the tray and exact owned child from this
+      // BrowserWindow event, which is guaranteed for that lifecycle.
+      isQuitting = true
+      destroyWindowsTray()
+      stopGateway()
+    })
+  }
+
   window.once('ready-to-show', () => {
     if (!window.isDestroyed()) window.show()
   })
@@ -8026,6 +8489,8 @@ function restoreDownloadedUpdateRetryState(
   updateApplying = false
   updateInstallHandoffReady = false
   isQuitting = false
+  setAppExitPhase('running', 'update handoff did not commit')
+  createWindowsTray()
   createApplicationMenu()
   setDesktopUpdateState({
     status: pendingVersion ? 'downloaded' : 'error',
@@ -8083,6 +8548,7 @@ async function applyDownloadedUpdate(): Promise<void> {
   }
   const pendingVersion = downloadedUpdateVersion
   updateApplying = true
+  setAppExitPhase('deferred', 'preparing downloaded update')
   // Never interrupt a reconcile/workspace/settings transaction after it has
   // been admitted. Close new writers and wait for existing operations to
   // finish naturally before the installer handoff.
@@ -8097,6 +8563,7 @@ async function applyDownloadedUpdate(): Promise<void> {
     error: null,
   })
   isQuitting = true
+  setAppExitPhase('draining', 'stopping Gateway for downloaded update')
   const exited = await stopAndJoinAllLifecycleOwnedGateways((child) => {
     updateGatewayShutdownProcess = child
     // We stay alive and await the exit below, so let the gateway take its
@@ -8132,6 +8599,7 @@ async function applyDownloadedUpdate(): Promise<void> {
   // isForceRunAfter=true (relaunch after install).
   try {
     updateInstallHandoffReady = true
+    setAppExitPhase('committed', 'handing off to desktop updater')
     autoUpdater.quitAndInstall(false, true)
   } catch (err) {
     const quitResumed = restoreDownloadedUpdateRetryState(
@@ -8209,6 +8677,14 @@ ipcMain.handle('desktop:settings:save', async (_event, payload: DesktopSettingsP
 ipcMain.handle('desktop:settings:reset', async (event) => {
   if (!trustedRecoveryIpc(event)) throw new Error('Untrusted Desktop reset request.')
   return await resetDesktopSettingsThroughCleanup()
+})
+ipcMain.handle('desktop:preferences:get', (event) => {
+  if (!trustedMainWindowControlIpc(event)) throw new Error('Untrusted Desktop preferences request.')
+  return desktopPreferencesSnapshot()
+})
+ipcMain.handle('desktop:preferences:save', async (event, payload: DesktopPreferencesPayload) => {
+  if (!trustedMainWindowControlIpc(event)) throw new Error('Untrusted Desktop preferences request.')
+  return await saveDesktopPreferences(payload)
 })
 ipcMain.handle('desktop:artifact:open', async (_event, payload: ArtifactOpenRequest) => openArtifactWithDefaultApp(payload))
 
@@ -8585,6 +9061,10 @@ async function applyApprovedDesktopCleanup(
     // deleted, Electron must not reopen writer admission or recreate any path
     // inside the confirmed scope. Only a failed/cancelled operation may reopen.
     if (shouldQuit) {
+      // Do not call setAppExitPhase here: its durable lifecycle log would
+      // recreate userData/logs after an approved delete operation removed it.
+      appExitPhase = 'committed'
+      destroyWindowsTray()
       app.exit(0)
     } else {
       desktopWriters.reopen(exclusive.admissionToken)
@@ -9909,9 +10389,9 @@ function trustedRecoveryIpc(event: Electron.IpcMainInvokeEvent): boolean {
   }
 }
 
-function trustedControlUiIpc(event: Electron.IpcMainInvokeEvent): boolean {
+function trustedMainWindowControlIpc(event: Electron.IpcMainInvokeEvent): boolean {
   const window = currentMainWindow()
-  if (!window || event.sender !== window.webContents || !gatewayState.owned || !gatewayState.url) {
+  if (!window || event.sender !== window.webContents || !gatewayState.url) {
     return false
   }
   try {
@@ -9922,6 +10402,10 @@ function trustedControlUiIpc(event: Electron.IpcMainInvokeEvent): boolean {
   } catch {
     return false
   }
+}
+
+function trustedControlUiIpc(event: Electron.IpcMainInvokeEvent): boolean {
+  return gatewayState.owned && trustedMainWindowControlIpc(event)
 }
 
 function trustedOnboardingIpc(event: Electron.IpcMainInvokeEvent): boolean {
@@ -10506,23 +10990,40 @@ async function drainOwnedGatewayForQuit(
 
 app.on('before-quit', (event) => {
   desktopUpdateCheckScheduler.stop()
+  // Windows session shutdown cannot wait on our normal asynchronous quit
+  // drain. Let the OS-owned close proceed and synchronously signal the current
+  // child so the window can never be converted back into background mode.
+  if (systemSessionEnding) {
+    isQuitting = true
+    setAppExitPhase('committed', 'Windows session ending')
+    destroyWindowsTray()
+    stopGateway()
+    return
+  }
   // An updater drain owns the lifecycle until every writer and gateway has
   // exited. A user Quit or repeated signal during this phase is remembered and
   // resumed if the update cannot hand off. Only quitAndInstall's synchronous
   // handoff is allowed through this guard.
   if (updateApplying) {
-    if (updateInstallHandoffReady) return
+    if (updateInstallHandoffReady) {
+      setAppExitPhase('committed', 'desktop updater owns exit')
+      destroyWindowsTray()
+      return
+    }
     event.preventDefault()
+    setAppExitPhase('deferred', 'waiting for desktop update handoff')
     quitRequestedDuringUpdateDrain = true
     desktopLog('quit_deferred_for_update_drain')
     return
   }
   if (quitGatewayDrainPromise) {
     event.preventDefault()
+    setAppExitPhase('draining', 'Gateway quit drain already in progress')
     return
   }
   if (desktopWriters.activeCount > 0 || quitDeferredForDesktopWriters) {
     event.preventDefault()
+    setAppExitPhase('deferred', 'waiting for desktop writers')
     if (!quitDeferredForDesktopWriters) {
       quitDeferredForDesktopWriters = true
       quitWriterAdmission ??= desktopWriters.close('quit')
@@ -10553,6 +11054,7 @@ app.on('before-quit', (event) => {
   const children = liveLifecycleOwnedGatewayProcesses()
   if (children.length > 0) {
     event.preventDefault()
+    setAppExitPhase('draining', 'stopping lifecycle-owned Gateway')
     const drain = Promise.all(children.map((child) => drainOwnedGatewayForQuit(
       child,
       currentChild === child ? gatewayState.url || '' : '',
@@ -10568,6 +11070,8 @@ app.on('before-quit', (event) => {
     quitGatewayDrainPromise = drain
     void drain.then((exited) => {
       if (exited) {
+        setAppExitPhase('committed', 'all lifecycle-owned Gateways exited')
+        destroyWindowsTray()
         app.exit(0)
         return
       }
@@ -10576,6 +11080,7 @@ app.on('before-quit', (event) => {
       // file, occupied port, or health response.
       quitGatewayDrainPromise = null
       isQuitting = false
+      setAppExitPhase('running', 'Gateway quit drain failed safely')
       if (quitWriterAdmission) {
         desktopWriters.reopen(quitWriterAdmission)
         quitWriterAdmission = null
@@ -10590,6 +11095,8 @@ app.on('before-quit', (event) => {
     })
     return
   }
+  setAppExitPhase('committed', 'no lifecycle-owned Gateway remains')
+  destroyWindowsTray()
   stopGateway()
 })
 
@@ -10611,8 +11118,10 @@ app.on('window-all-closed', () => {
 })
 
 app.on('activate', () => {
-  void openOrResumeDesktopApp()
+  revealDesktopApp()
 })
+
+app.on('will-quit', destroyWindowsTray)
 
 configureChromiumKeychainPolicy()
 
@@ -10669,13 +11178,14 @@ if (!gotSingleInstanceLock) {
 } else {
   app.on('second-instance', () => {
     desktopLog('second_instance')
-    void openOrResumeDesktopApp()
+    revealDesktopApp()
   })
 
   void app.whenReady().then(async () => {
     app.name = 'OpenSquilla'
     desktopLocale = loadPersistedDesktopLocale() ?? resolveDesktopLocale()
     createApplicationMenu()
+    createWindowsTray()
     void openOrResumeDesktopApp()
     initAutoUpdater()
     if (mockUpdateVersion() !== null) {

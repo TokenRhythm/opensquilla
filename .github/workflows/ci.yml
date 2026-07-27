@@ -240,7 +240,20 @@ jobs:
 
       - name: Run OpenTUI Bun tests
         working-directory: src/opensquilla/cli/tui/opentui/package
-        run: bun run test:bun
+        shell: bash
+        run: |
+          set +e
+          for attempt in 1 2; do
+            bun run test:bun
+            status=$?
+            if [ "$status" -eq 0 ]; then
+              exit 0
+            fi
+            if [ "$status" -ne 132 ] || [ "$attempt" -eq 2 ]; then
+              exit "$status"
+            fi
+            echo "::warning::Bun exited with SIGILL (132); retrying once."
+          done
 
   desktop-check:
     name: Desktop Electron unit tests
@@ -283,6 +296,7 @@ jobs:
           node scripts/test-desktop-profile-context.mjs
           node scripts/test-desktop-gateway-ownership.mjs
           node scripts/test-desktop-gateway-lifecycle.mjs
+          node scripts/test-desktop-window-lifecycle.mjs
           node scripts/test-desktop-cleanup-contract.mjs
 
   ubuntu-quality:
@@ -902,6 +916,7 @@ jobs:
             'profile-recovery-accessibility:scripts/test-profile-recovery-accessibility.mjs' \
             'profile-import-flow:scripts/test-profile-import-flow.mjs' \
             'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs' \
+            'window-background-flow:scripts/test-desktop-window-background-flow.mjs' \
             'unsafe-profile-no-write:scripts/test-unsafe-profile-no-write.mjs'
           do
             name="${entry%%:*}"

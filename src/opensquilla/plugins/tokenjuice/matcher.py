@@ -1,10 +1,57 @@
 from __future__ import annotations
 
+import os
 import re
 import shlex
 from typing import Any
 
 from .types import Rule
+
+# Opt-in classification levers (both off by default). Strict matching
+# enforces the gitSubcommands / argvIncludesAny rule criteria that the
+# permissive matcher treats as always-true; cd unwrapping strips leading
+# `cd <dir> &&` prefixes so the effective command drives rule selection.
+_MATCHER_STRICT_ENV = "OPENSQUILLA_TOOLCOMP_MATCHER_STRICT"
+_CD_UNWRAP_ENV = "OPENSQUILLA_TOOLCOMP_CD_UNWRAP"
+_TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on", "enabled"})
+
+# Git global options that consume the next argv entry; subcommand extraction
+# must skip them (and their inline `--opt=value` forms) to find the verb.
+_GIT_GLOBAL_OPTIONS_WITH_VALUE = frozenset(
+    {
+        "-C",
+        "-c",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--exec-path",
+        "--super-prefix",
+        "--config-env",
+    }
+)
+_GIT_GLOBAL_OPTION_INLINE_PREFIXES = (
+    "--git-dir=",
+    "--work-tree=",
+    "--namespace=",
+    "--exec-path=",
+    "--super-prefix=",
+    "--config-env=",
+)
+
+# Only horizontal whitespace may separate the keyword from its argument: a
+# real shell terminates a bare `cd` statement at an unquoted newline.
+_LEADING_CD_PATTERN = re.compile(r"^\s*(?:cd|pushd)[ \t]+")
+_CD_ARG_STOP_CHARS = frozenset({"&", "|", ";", "<", ">", "\n"})
+
+
+def _matcher_strict_enabled() -> bool:
+    raw = os.environ.get(_MATCHER_STRICT_ENV, "").strip().lower()
+    return raw in _TRUE_ENV_VALUES
+
+
+def _cd_unwrap_enabled() -> bool:
+    raw = os.environ.get(_CD_UNWRAP_ENV, "").strip().lower()
+    return raw in _TRUE_ENV_VALUES
 
 
 def command_argv(command: str | None, argv: list[str] | None = None) -> list[str]:
@@ -43,6 +90,91 @@ def _contains_command_text(command: str, needles: list[str]) -> bool:
     return all(needle.lower() in lowered for needle in needles)
 
 
+def _command_name(argv: list[str]) -> str | None:
+    first = argv[0] if argv else None
+    if not first:
+        return None
+    if first[:1] in {"'", '"'}:
+        first = first[1:]
+    if first[-1:] in {"'", '"'}:
+        first = first[:-1]
+    return os.path.basename(first)
+
+
+def _git_subcommand(argv: list[str]) -> str | None:
+    if _command_name(argv) != "git":
+        return None
+    index = 1
+    while index < len(argv):
+        arg = argv[index]
+        if not arg:
+            index += 1
+            continue
+        if arg in _GIT_GLOBAL_OPTIONS_WITH_VALUE:
+            index += 2
+            continue
+        if arg.startswith(_GIT_GLOBAL_OPTION_INLINE_PREFIXES):
+            index += 1
+            continue
+        if arg.startswith("-"):
+            index += 1
+            continue
+        return arg
+    return None
+
+
+def strip_leading_cd_prefix(command: str) -> str:
+    current = command.strip()
+    for _ in range(8):
+        unwrapped = _match_leading_cd_chain(current)
+        if unwrapped is None:
+            return current
+        current = unwrapped
+    return current
+
+
+def _match_leading_cd_chain(command: str) -> str | None:
+    keyword = _LEADING_CD_PATTERN.match(command)
+    if keyword is None:
+        return None
+
+    # The cd argument must be a single shell token: quoting and escapes are
+    # honoured, but an unquoted operator or redirection makes the prefix
+    # unsafe to strip, so the command is left untouched.
+    index = keyword.end()
+    quote: str | None = None
+    escaping = False
+    saw_arg = False
+    while index < len(command):
+        char = command[index]
+        if escaping:
+            escaping = False
+        elif char == "\\":
+            escaping = True
+        elif quote:
+            if char == quote:
+                quote = None
+        elif char in {"'", '"'}:
+            quote = char
+        elif char in _CD_ARG_STOP_CHARS:
+            return None
+        elif char.isspace():
+            break
+        saw_arg = True
+        index += 1
+
+    if not saw_arg:
+        return None
+
+    while index < len(command) and command[index] in " \t":
+        index += 1
+
+    if command[index : index + 2] != "&&":
+        return None
+    tail = command[index + 2 :].strip()
+    return tail or None
+
+
 def rule_matches(
     rule: Rule,
     *,
@@ -66,8 +198,24 @@ def rule_matches(
     if argv0 and (not tokens or tokens[0] not in argv0):
         return False
 
+    git_subcommands = _list_of_strings(match.get("gitSubcommands"))
+    if (
+        git_subcommands
+        and _matcher_strict_enabled()
+        and (_git_subcommand(tokens) or "") not in git_subcommands
+    ):
+        return False
+
     argv_includes = _list_of_string_lists(match.get("argvIncludes"))
     if argv_includes and not any(_contains_all(tokens, entry) for entry in argv_includes):
+        return False
+
+    argv_includes_any = _list_of_string_lists(match.get("argvIncludesAny"))
+    if (
+        argv_includes_any
+        and _matcher_strict_enabled()
+        and not any(_contains_all(tokens, entry) for entry in argv_includes_any)
+    ):
         return False
 
     command_text = command or " ".join(tokens)
@@ -105,6 +253,11 @@ def select_rule(
     content: str,
     exit_code: int,
 ) -> Rule | None:
+    if command and _cd_unwrap_enabled():
+        unwrapped = strip_leading_cd_prefix(command)
+        if unwrapped != command.strip():
+            command = unwrapped
+            argv = command_argv(unwrapped, None)
     for rule in rules:
         if rule_matches(
             rule,

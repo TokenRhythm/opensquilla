@@ -8,8 +8,18 @@ from opensquilla.channels.command_registry import (
     DEFAULT_COMMAND_REGISTRY,
     build_channel_rpc_context,
 )
-from opensquilla.channels.types import IncomingMessage
+from opensquilla.channels.system_messages import _MESSAGES, render_channel_message
+from opensquilla.channels.types import (
+    AuthenticatedPrincipal,
+    IncomingMessage,
+    IngressProvenance,
+    IngressVerification,
+)
 from opensquilla.engine.commands import DEFAULT_REGISTRY, Surface
+from opensquilla.gateway.channel_dispatch import (
+    _dispatch_channel_slash_command,
+    _stamp_channel_admin_principal,
+)
 from opensquilla.gateway.protocol import make_error_res, make_ok_res
 from opensquilla.gateway.routing import build_channel_route_envelope
 
@@ -62,8 +72,89 @@ async def test_channel_sandbox_command_sets_run_mode_from_argument() -> None:
     assert reply.metadata["command"] == "sandbox"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("locale", sorted(_MESSAGES))
+async def test_channel_command_replies_follow_gateway_locale(locale: str) -> None:
+    config = SimpleNamespace(control_ui=SimpleNamespace(default_locale=locale))
+    msg = IncomingMessage(sender_id="u1", channel_id="c1", content="/sandbox full")
+    envelope = build_channel_route_envelope(
+        msg,
+        session_key="agent:main:feishu:u1",
+        session_prefix="feishu",
+        agent_id="main",
+    )
+
+    class FakeDispatcher:
+        async def dispatch(self, req_id, method, params, ctx):
+            return make_ok_res(req_id, {"runMode": "full"})
+
+    reply = await DEFAULT_COMMAND_REGISTRY.dispatch(
+        envelope=envelope,
+        message_content=msg.content,
+        rpc_dispatcher=FakeDispatcher(),
+        context_factory=lambda _envelope: object(),
+        config=config,
+    )
+
+    assert reply is not None
+    assert reply.content == render_channel_message(
+        "command_sandbox_updated",
+        config=config,
+        mode=render_channel_message("command_sandbox_full", config=config),
+    )
+
+    unsupported_msg = msg.model_copy(update={"content": "/unavailable"})
+    unsupported_reply = await _dispatch_channel_slash_command(
+        route_envelope=envelope,
+        msg=unsupported_msg,
+        session_manager=None,
+        session_key=envelope.session_key,
+        session_prefix="feishu",
+        rpc_dispatcher=FakeDispatcher(),
+        context_factory=lambda _envelope: object(),
+        config=config,
+    )
+
+    assert unsupported_reply is not None
+    assert unsupported_reply.content == render_channel_message(
+        "command_unsupported", config=config, command="/unavailable"
+    )
+
+
 def test_channel_admin_rpc_context_is_owner_for_sandbox_full_switch() -> None:
-    msg = IncomingMessage(sender_id="admin-1", channel_id="c1", content="/sandbox full")
+    msg = IncomingMessage(
+        sender_id="admin-1",
+        channel_id="c1",
+        content="/sandbox full",
+        provenance=IngressProvenance(
+            provider="feishu",
+            verification=IngressVerification.SDK_SESSION,
+            principal=AuthenticatedPrincipal(subject_id="admin-1"),
+        ),
+    )
+    envelope = build_channel_route_envelope(
+        msg,
+        session_key="agent:main:feishu:admin-1",
+        session_prefix="feishu",
+        agent_id="main",
+    )
+    config = SimpleNamespace(channel_admin_senders={"feishu": ["admin-1"]})
+    assert _stamp_channel_admin_principal(config, envelope, msg) is True
+
+    admin_ctx = build_channel_rpc_context(envelope, gateway_config=config)
+
+    assert admin_ctx.principal.role == "operator"
+    assert "operator.write" in admin_ctx.principal.scopes
+    assert admin_ctx.principal.is_owner is True
+
+
+def test_channel_command_context_rejects_raw_admin_marker_spoof() -> None:
+    msg = IncomingMessage(
+        sender_id="admin-1",
+        channel_id="c1",
+        content="/sandbox full",
+        metadata={"principal_is_owner": True, "channel_admin_verified": True},
+    )
     envelope = build_channel_route_envelope(
         msg,
         session_key="agent:main:feishu:admin-1",
@@ -72,11 +163,14 @@ def test_channel_admin_rpc_context_is_owner_for_sandbox_full_switch() -> None:
     )
     config = SimpleNamespace(channel_admin_senders={"feishu": ["admin-1"]})
 
-    admin_ctx = build_channel_rpc_context(envelope, gateway_config=config)
+    assert "principal_is_owner" not in envelope.metadata
+    assert "channel_admin_verified" not in envelope.metadata
+    assert _stamp_channel_admin_principal(config, envelope, msg) is False
 
-    assert admin_ctx.principal.role == "operator"
-    assert "operator.write" in admin_ctx.principal.scopes
-    assert admin_ctx.principal.is_owner is True
+    ctx = build_channel_rpc_context(envelope, gateway_config=config)
+
+    assert ctx.principal.role == "viewer"
+    assert ctx.principal.is_owner is False
 
 
 def test_channel_non_admin_rpc_context_is_not_owner_for_sandbox_full_switch() -> None:

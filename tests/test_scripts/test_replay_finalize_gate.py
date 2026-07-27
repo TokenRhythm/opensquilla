@@ -110,6 +110,81 @@ def test_replay_fires_on_finalize_attempt_with_red_evidence(tmp_path) -> None:
     assert report["should_challenge"] is True
     assert report["triggers"] == ["red_execution_after_final_edit"]
     assert report["has_workspace_diff_source"] == "git.patch"
+    # Both-modes reporting: strict fields ride the same line. The base
+    # trigger set is a prefix of the strict one (strict only appends);
+    # red-first state is reported but never a trigger, so with one
+    # verification command strict adds nothing here.
+    assert report["strict_should_challenge"] is True
+    assert report["strict_triggers"] == [
+        "red_execution_after_final_edit",
+    ]
+    assert report["strict_primary_reason"] == "red_execution_after_final_edit"
+    assert report["strict_red_first_satisfied"] is False
+    assert report["strict_verification_command_count"] == 1
+
+
+def test_replay_strict_quiet_on_red_then_green_trace(tmp_path) -> None:
+    # A demonstrated red-then-green pair on the same command satisfies
+    # red-first: both base and strict trackers stay quiet at finalize.
+    module = _load_script()
+    green_result = _tool_result(
+        "x2",
+        "exec_command",
+        "exit_code=0\nok",
+        execution_status={
+            "version": 1,
+            "status": "success",
+            "exit_code": 0,
+            "timed_out": False,
+            "reason": None,
+        },
+    )
+    entries = [
+        *_RED_EXEC_ENTRIES,
+        _assistant_tool_call("x2", "exec_command", {"command": "python repro.py"}),
+        green_result,
+        _FINAL_TEXT_ENTRY,
+    ]
+    run_dir = _write_run_dir(tmp_path, entries)
+
+    report = module.replay_run(run_dir)
+
+    assert report["should_challenge"] is False
+    assert report["strict_should_challenge"] is False
+    assert report["strict_triggers"] == []
+    assert report["strict_red_first_satisfied"] is True
+
+
+def test_replay_strict_fires_on_zero_execution_trace(tmp_path) -> None:
+    module = _load_script()
+    entries = [
+        _assistant_tool_call("w1", "edit_file", {"path": "src/main.py"}),
+        _tool_result("w1", "edit_file", "edited"),
+        _FINAL_TEXT_ENTRY,
+    ]
+    run_dir = _write_run_dir(tmp_path, entries)
+
+    report = module.replay_run(run_dir)
+
+    # Base gate already fires no_execution_after_final_edit; strict adds its
+    # whole-run triggers on the same line.
+    assert report["triggers"] == ["no_execution_after_final_edit"]
+    assert report["strict_triggers"] == [
+        "no_execution_after_final_edit",
+        "zero_verification",
+    ]
+    assert report["strict_verification_command_count"] == 0
+
+
+def test_replay_strict_suppressed_mid_loop(tmp_path) -> None:
+    module = _load_script()
+    run_dir = _write_run_dir(tmp_path, list(_RED_EXEC_ENTRIES))
+
+    report = module.replay_run(run_dir)
+
+    assert report["should_challenge"] is False
+    assert report["strict_should_challenge"] is False
+    assert report["suppressed_reason"] == "no_finalize_attempt_at_transcript_end"
 
 
 def test_replay_suppresses_transcript_ending_mid_loop(tmp_path) -> None:
