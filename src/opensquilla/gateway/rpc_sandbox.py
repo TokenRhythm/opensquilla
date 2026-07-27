@@ -845,6 +845,50 @@ async def _handle_sandbox_path_list(params: dict | None, ctx: RpcContext) -> dic
     }
 
 
+@_d.method("sandbox.path.create-directory", scope="operator.write")
+async def _handle_sandbox_path_create_directory(
+    params: dict | None,
+    ctx: RpcContext,
+) -> dict:
+    params = _require_params(params)
+    _require_session_key(params)
+    _require_owner(ctx, "sandbox.path.create-directory")
+    kind = str(params.get("kind") or "workspace").strip().lower()
+    if kind not in {"workspace", "mount"}:
+        raise ValueError("params.kind must be workspace or mount")
+
+    raw_parent = params.get("parentPath")
+    if not isinstance(raw_parent, str) or not raw_parent.strip():
+        raise ValueError("params.parentPath must be a non-empty absolute path")
+    parent = Path(raw_parent).expanduser()
+    if not parent.is_absolute():
+        raise ValueError("params.parentPath must be a non-empty absolute path")
+    parent = parent.resolve(strict=True)
+    if not stat.S_ISDIR(parent.stat().st_mode):
+        raise NotADirectoryError(str(parent))
+
+    raw_name = params.get("name")
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        raise ValueError("params.name must be a non-empty directory name")
+    name = raw_name.strip()
+    if (
+        name in {".", ".."}
+        or Path(name).is_absolute()
+        or "/" in name
+        or "\\" in name
+        or "\x00" in name
+    ):
+        raise ValueError("params.name must be a single directory name")
+
+    created = parent / name
+    created.mkdir()
+    return {
+        "path": str(created.resolve(strict=True)),
+        "name": name,
+        "kind": "directory",
+    }
+
+
 @_d.method("sandbox.path.pick", scope="operator.write")
 async def _handle_sandbox_path_pick(params: dict | None, ctx: RpcContext) -> dict:
     params = _require_params(params)

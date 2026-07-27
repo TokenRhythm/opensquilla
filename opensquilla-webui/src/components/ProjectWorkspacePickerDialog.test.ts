@@ -45,6 +45,10 @@ function i18n() {
           retryDirectoryPicker: 'Retry',
           directoryPickerFailed: 'Directory picker failed: {error}',
           chooseSelectedDirectory: 'Choose selected directory',
+          newDirectory: 'New folder',
+          newDirectoryName: 'Folder name',
+          createDirectory: 'Create',
+          createDirectoryFailed: 'Could not create the folder: {error}',
         },
       },
     },
@@ -241,6 +245,65 @@ describe('ProjectWorkspacePickerDialog', () => {
       basePath: '/repos',
       kind: 'workspace',
     })
+  })
+
+  it('creates a folder in the current directory and opens it', async () => {
+    mocks.rpcCall
+      .mockResolvedValueOnce(pathResult('/repos', []))
+      .mockResolvedValueOnce({ path: '/repos/new-project' })
+      .mockResolvedValueOnce(pathResult('/repos/new-project', []))
+    await mountPicker()
+    await flushPromises()
+
+    button('New folder').click()
+    await nextTick()
+    const nameInput = document.querySelector<HTMLInputElement>('[aria-label="Folder name"]')
+    expect(nameInput).toBeTruthy()
+    nameInput!.value = 'new-project'
+    nameInput!.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+    button('Create').click()
+    await flushPromises()
+
+    expect(mocks.rpcCall).toHaveBeenNthCalledWith(2, 'sandbox.path.create-directory', {
+      sessionKey: PICKER_KEY,
+      parentPath: '/repos',
+      name: 'new-project',
+      kind: 'workspace',
+    })
+    expect(mocks.rpcCall).toHaveBeenNthCalledWith(3, 'sandbox.path.list', {
+      sessionKey: PICKER_KEY,
+      path: '/repos/new-project',
+      kind: 'workspace',
+    })
+    expect(locationInput().value).toBe('/repos/new-project')
+  })
+
+  it('ignores a create-folder response after close and reopen', async () => {
+    const staleCreate = deferred<{ path: string }>()
+    mocks.rpcCall
+      .mockResolvedValueOnce(pathResult('/repos', []))
+      .mockReturnValueOnce(staleCreate.promise)
+      .mockResolvedValueOnce(pathResult('/fresh', []))
+    const picker = await mountPicker()
+    await flushPromises()
+
+    button('New folder').click()
+    await nextTick()
+    const nameInput = document.querySelector<HTMLInputElement>('[aria-label="Folder name"]')!
+    nameInput.value = 'stale'
+    nameInput.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+    button('Create').click()
+    await nextTick()
+
+    await picker.setOpen(false)
+    await picker.setOpen(true)
+    staleCreate.resolve({ path: '/repos/stale' })
+    await flushPromises()
+
+    expect(locationInput().value).toBe('/fresh')
+    expect(mocks.rpcCall).toHaveBeenCalledTimes(3)
   })
 
   it('browses the real parent returned by the gateway', async () => {

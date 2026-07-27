@@ -144,6 +144,7 @@ describe('SidebarConversations project workspaces', () => {
     expect(disclosure).toBeTruthy()
     expect(disclosure?.getAttribute('aria-expanded')).toBe('true')
     expect(info).toBeTruthy()
+    expect(info?.innerHTML).toContain('M3 6.5')
     expect(host.textContent).toContain('D:\\repos\\project-a')
     expect(host.textContent).toContain('2 tasks')
 

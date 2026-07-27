@@ -7,7 +7,7 @@
         :data-status="projectWorkspaceStatus || 'ready'"
         :title="projectWorkspace.path"
       >
-        <Icon name="info" :size="14" />
+        <Icon name="folder" :size="14" />
         <span class="chat-project-chip__name">{{ projectWorkspace.name }}</span>
         <span class="chat-project-chip__path">{{ projectWorkspace.path }}</span>
         <span v-if="projectStatusMessage" class="chat-project-chip__status">
@@ -29,8 +29,11 @@
         class="chat-project-choose"
         @click="emit('chooseProject')"
       >
-        <Icon name="sessions" :size="14" />
+        <span class="chat-project-choose__icon" aria-hidden="true">
+          <Icon name="folder" :size="15" />
+        </span>
         <span>{{ t('workspaces.chooseProject') }}</span>
+        <Icon class="chat-project-choose__chevron" name="chevronRight" :size="13" />
       </button>
       <div v-if="attachments.length > 0" class="chat-attachments">
         <div
@@ -462,8 +465,7 @@ defineExpose<ChatComposerExpose>({
   margin: 0 auto;
 }
 
-.chat-project-chip,
-.chat-project-choose {
+.chat-project-chip {
   width: fit-content;
   max-width: 100%;
   display: inline-flex;
@@ -498,8 +500,52 @@ defineExpose<ChatComposerExpose>({
   background: transparent;
   color: inherit;
 }
-.chat-project-choose { cursor: pointer; }
-.chat-project-choose:hover { color: var(--text); background: var(--bg-hover); }
+.chat-project-choose {
+  width: fit-content;
+  max-width: 100%;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0 0 var(--sp-2) 2px;
+  padding: 3px 5px 3px 3px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    color var(--dur-fast),
+    background var(--dur-fast),
+    transform var(--dur-fast);
+}
+.chat-project-choose__icon {
+  width: 27px;
+  height: 27px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 9%, var(--bg-surface));
+  color: var(--accent);
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--text) 9%, transparent);
+}
+.chat-project-choose__chevron {
+  opacity: 0.55;
+  transition: transform var(--dur-fast), opacity var(--dur-fast);
+}
+.chat-project-choose:hover,
+.chat-project-choose:focus-visible {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+}
+.chat-project-choose:hover .chat-project-choose__chevron,
+.chat-project-choose:focus-visible .chat-project-choose__chevron {
+  opacity: 0.9;
+  transform: translateX(2px);
+}
 
 .chat-composer--new-landing .chat-composer-inner {
   width: 100%;

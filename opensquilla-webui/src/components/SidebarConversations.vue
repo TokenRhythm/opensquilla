@@ -614,7 +614,7 @@ function onSelectRow(row: SidebarConversationItem) {
                     count: row.workspaceTaskCount ?? 0,
                   })"
                 >
-                  <Icon name="info" :size="13" />
+                  <Icon name="folder" :size="15" />
                 </button>
                 <div class="sidebar-project-info-popover" role="tooltip">
                   <span class="sidebar-project-info-path">

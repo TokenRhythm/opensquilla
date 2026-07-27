@@ -944,10 +944,10 @@ pre {
   align-items: center;
   gap: 2px;
   padding: 3px 4px 2px;
-  color: var(--sidebar-text-soft);
-  font-size: 0.6875rem;
-  font-weight: 700;
-  line-height: 1.25;
+  color: var(--sidebar-text-strong);
+  font-size: 0.875rem;
+  font-weight: 680;
+  line-height: 1.3;
 }
 
 .sidebar-project-info-wrap {
@@ -968,6 +968,10 @@ pre {
   background: transparent;
   color: var(--sidebar-text-soft);
   cursor: pointer;
+}
+
+.sidebar-project-info {
+  color: color-mix(in srgb, var(--accent) 74%, var(--sidebar-text-soft));
 }
 
 .sidebar-project-info:hover,

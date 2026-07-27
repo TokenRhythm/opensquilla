@@ -2312,6 +2312,69 @@ async def test_rpc_sandbox_path_list_requires_owner(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_path_create_directory_creates_single_child(tmp_path: Path) -> None:
+    from opensquilla.gateway.rpc_sandbox import _handle_sandbox_path_create_directory
+
+    manager = _SessionManager()
+    parent = tmp_path / "parent"
+    parent.mkdir()
+
+    result = await _handle_sandbox_path_create_directory(
+        {
+            "sessionKey": manager.node.session_key,
+            "parentPath": str(parent),
+            "name": "new-project",
+            "kind": "workspace",
+        },
+        _ctx(manager),
+    )
+
+    created = parent / "new-project"
+    assert created.is_dir()
+    assert result == {
+        "path": str(created.resolve(strict=True)),
+        "name": "new-project",
+        "kind": "directory",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["", "   ", ".", "..", "../escape", "a/b", "a\\b", "/tmp/x"])
+async def test_path_create_directory_rejects_invalid_name(
+    tmp_path: Path,
+    name: str,
+) -> None:
+    from opensquilla.gateway.rpc_sandbox import _handle_sandbox_path_create_directory
+
+    manager = _SessionManager()
+    with pytest.raises(ValueError, match="params.name"):
+        await _handle_sandbox_path_create_directory(
+            {
+                "sessionKey": manager.node.session_key,
+                "parentPath": str(tmp_path),
+                "name": name,
+            },
+            _ctx(manager),
+        )
+
+
+@pytest.mark.asyncio
+async def test_path_create_directory_requires_owner(tmp_path: Path) -> None:
+    from opensquilla.gateway.rpc_sandbox import _handle_sandbox_path_create_directory
+
+    manager = _SessionManager()
+    with pytest.raises(RpcHandlerError, match="requires owner principal"):
+        await _handle_sandbox_path_create_directory(
+            {
+                "sessionKey": manager.node.session_key,
+                "parentPath": str(tmp_path),
+                "name": "blocked",
+            },
+            _ctx(manager, is_owner=False),
+        )
+
+
+@pytest.mark.asyncio
 async def test_rpc_sandbox_path_list_ignores_legacy_browse_children(
     tmp_path,
 ) -> None:

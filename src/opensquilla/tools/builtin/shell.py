@@ -3058,7 +3058,7 @@ def _contains_unmodelled_workdir_change(tokens: tuple[str, ...], start: int = 0)
             and tokens[index + 1] in _SHELL_REDIRECTION_OPERATORS
         ):
             continue
-        command = token.casefold()
+        command = token.casefold() if token in {".", "!"} else Path(token).name.casefold()
         if command == "cd" or command in _UNMODELLED_WORKDIR_COMMANDS:
             return True
         if command in _INLINE_SHELL_COMMANDS:
@@ -3077,7 +3077,36 @@ def _contains_unmodelled_workdir_change(tokens: tuple[str, ...], start: int = 0)
     return False
 
 
-def _leading_cd_prefix(command: str) -> _LeadingCdPrefix:
+def _inline_shell_script(tokens: tuple[str, ...]) -> str | None:
+    """Return a directly nested ``sh -c`` script when its wrapper is simple."""
+
+    if not tokens or Path(tokens[0]).name.casefold() not in _INLINE_SHELL_COMMANDS:
+        return None
+    command_index: int | None = None
+    for index, token in enumerate(tokens[1:], start=1):
+        if _shell_control_token(token) or token in _SHELL_REDIRECTION_OPERATORS:
+            return None
+        if token == "--":
+            continue
+        if token.startswith("-"):
+            if "c" in token[1:]:
+                command_index = index + 1
+                break
+            continue
+        return None
+    if command_index is None or command_index >= len(tokens):
+        return None
+    if _shell_control_token(tokens[command_index]):
+        return None
+    if any(
+        _shell_control_token(token) or token in _SHELL_REDIRECTION_OPERATORS
+        for token in tokens[command_index + 1 :]
+    ):
+        return None
+    return tokens[command_index]
+
+
+def _leading_cd_prefix(command: str, *, _depth: int = 0) -> _LeadingCdPrefix:
     """Parse the deliberately small leading-``cd`` grammar used for path gates."""
 
     lexer = shlex.shlex(
@@ -3094,6 +3123,11 @@ def _leading_cd_prefix(command: str) -> _LeadingCdPrefix:
         return _LeadingCdPrefix(unsafe_reason="untrusted_workdir")
     if not tokens:
         return _LeadingCdPrefix()
+    if Path(tokens[0]).name.casefold() in _INLINE_SHELL_COMMANDS:
+        nested = _inline_shell_script(tokens)
+        if nested is None or _depth >= 4:
+            return _LeadingCdPrefix(unsafe_reason="untrusted_workdir")
+        return _leading_cd_prefix(nested, _depth=_depth + 1)
     if tokens[0] != "cd":
         if _contains_unmodelled_workdir_change(tokens):
             return _LeadingCdPrefix(unsafe_reason="untrusted_workdir")

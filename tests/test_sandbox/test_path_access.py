@@ -1868,8 +1868,6 @@ def test_shell_redirection_workdir_parses_supported_leading_cd_forms(
         ("cd safe; . script; printf blocked > config", "untrusted_workdir"),
         ("cd safe; pushd ../.git; printf blocked > config", "untrusted_workdir"),
         ("cd safe; popd; printf blocked > config", "untrusted_workdir"),
-        ("sh -c 'cd .git; printf blocked > config'", "untrusted_workdir"),
-        ("bash -lc 'cd .git; printf blocked > config'", "untrusted_workdir"),
         ("Set-Location .git; printf blocked > config", "untrusted_workdir"),
         ("Push-Location .git; printf blocked > config", "untrusted_workdir"),
         ("Pop-Location; printf blocked > config", "untrusted_workdir"),
@@ -1893,6 +1891,8 @@ def test_shell_unmodelled_workdir_changes_are_marked_unsafe(
         "cd safe\ncd ../.git\nprintf blocked > config",
         "cd safe && cd ../.git && printf blocked > config",
         "cd safe || exit; cd ../.git || exit; printf blocked > config",
+        "sh -c 'cd .git; printf blocked > config'",
+        "bash -lc 'cd .git; printf blocked > config'",
     ],
 )
 async def test_shell_leading_cd_uses_redirected_workdir_for_metadata_gate(
@@ -1971,6 +1971,48 @@ async def test_shell_guarded_leading_cd_safe_path_reaches_backend(
 
 
 @pytest.mark.asyncio
+async def test_managed_shell_nested_sh_workspace_write_reaches_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace-shell-nested-sh"
+    workspace.mkdir()
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        host_root_readonly=False,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+    )
+    backend_calls: list[SandboxRequest] = []
+
+    async def fake_backend(request: SandboxRequest, *, runtime: object = None) -> object:
+        backend_calls.append(request)
+        return SimpleNamespace(
+            stdout="shell-workspace-ok\n",
+            stderr="",
+            returncode=0,
+            backend_notes=[],
+        )
+
+    monkeypatch.setattr(shell, "run_under_backend", fake_backend)
+    monkeypatch.setattr(
+        shell,
+        "check_safe_bin",
+        lambda command: SimpleNamespace(allowed=True, needs_approval=False, reason=""),
+    )
+
+    with tool_context(workspace, run_mode="trusted") as ctx:
+        ctx.sandbox_file_system_profile = profile
+        result = await shell.exec_command(
+            "sh -lc 'printf shell-workspace-ok > sandbox_probe_shell.txt "
+            "&& cat sandbox_probe_shell.txt && rm sandbox_probe_shell.txt'"
+        )
+
+    assert result == "exit_code=0\nshell-workspace-ok\n"
+    assert len(backend_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_shell_transport_workspace_cd_maps_to_host_workspace_before_gate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2036,8 +2078,6 @@ async def test_shell_transport_workspace_cd_maps_to_host_workspace_before_gate(
         ("cd safe; . script; printf blocked > config", "untrusted_workdir"),
         ("cd safe; pushd ../.git; printf blocked > config", "untrusted_workdir"),
         ("cd safe; popd; printf blocked > config", "untrusted_workdir"),
-        ("sh -c 'cd .git; printf blocked > config'", "untrusted_workdir"),
-        ("bash -lc 'cd .git; printf blocked > config'", "untrusted_workdir"),
         ("Set-Location .git; printf blocked > config", "untrusted_workdir"),
         ("Push-Location .git; printf blocked > config", "untrusted_workdir"),
         ("Pop-Location; printf blocked > config", "untrusted_workdir"),

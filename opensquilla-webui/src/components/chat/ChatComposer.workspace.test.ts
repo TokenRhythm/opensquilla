@@ -40,6 +40,27 @@ describe('ChatComposer project draft', () => {
     }
   }
 
+  it('uses a folder-styled project chooser', async () => {
+    const chooseProject = vi.fn()
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const app = createApp(ChatComposer, composerProps({
+      projectWorkspace: null,
+      onChooseProject: chooseProject,
+    }))
+    app.use(i18n)
+    app.mount(host)
+    await nextTick()
+
+    const chooser = host.querySelector<HTMLButtonElement>('.chat-project-choose')
+    expect(chooser?.innerHTML).toContain('M3 6.5')
+    expect(chooser?.querySelector('.chat-project-choose__icon')).toBeTruthy()
+    chooser?.click()
+    expect(chooseProject).toHaveBeenCalledOnce()
+
+    app.unmount()
+  })
+
   it('shows both the project name and path and lets a blank draft close it', async () => {
     const closeProject = vi.fn()
     const host = document.createElement('div')

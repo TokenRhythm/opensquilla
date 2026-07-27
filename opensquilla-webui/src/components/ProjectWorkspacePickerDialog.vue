@@ -62,6 +62,48 @@
             </button>
           </div>
           <p v-if="error" class="project-picker__error" role="alert">{{ error }}</p>
+          <div class="project-picker__create">
+            <button
+              v-if="!creatingDirectory"
+              type="button"
+              class="btn btn--ghost project-picker__create-trigger"
+              :disabled="webLoading"
+              @click="beginCreateDirectory"
+            >
+              <Icon name="plus" :size="14" />
+              {{ t('workspaces.newDirectory') }}
+            </button>
+            <form
+              v-else
+              class="project-picker__create-form"
+              @submit.prevent="createDirectory"
+            >
+              <input
+                ref="newDirectoryInputRef"
+                v-model="newDirectoryName"
+                type="text"
+                :aria-label="t('workspaces.newDirectoryName')"
+                :placeholder="t('workspaces.newDirectoryName')"
+                autocomplete="off"
+                @keydown.esc.prevent="cancelCreateDirectory"
+              />
+              <button
+                type="submit"
+                class="btn btn--primary"
+                :disabled="creatingDirectoryBusy || !newDirectoryName.trim()"
+              >
+                {{ t('workspaces.createDirectory') }}
+              </button>
+              <button
+                type="button"
+                class="btn btn--ghost"
+                :disabled="creatingDirectoryBusy"
+                @click="cancelCreateDirectory"
+              >
+                {{ t('common.cancel') }}
+              </button>
+            </form>
+          </div>
           <div
             class="project-picker__entries"
             role="listbox"
@@ -80,7 +122,7 @@
               @keydown.enter.prevent.stop="browse(entry.path)"
               @keydown.space.prevent.stop="selectDirectory(entry.path)"
             >
-              <Icon name="sessions" :size="14" />
+              <Icon name="folder" :size="15" />
               <span>{{ entry.name }}</span>
             </button>
           </div>
@@ -132,6 +174,7 @@ const { t } = useI18n()
 const rpc = useRpcStore()
 const dialogRef = ref<HTMLElement | null>(null)
 const pathInputRef = ref<HTMLInputElement | null>(null)
+const newDirectoryInputRef = ref<HTMLInputElement | null>(null)
 const phase = ref<PickerPhase>('closed')
 const currentDirectory = ref('')
 const selectedDirectory = ref('')
@@ -139,6 +182,9 @@ const locationDraft = ref('')
 const parentDirectory = ref<string | null>(null)
 const entries = ref<SandboxPathEntry[]>([])
 const error = ref('')
+const creatingDirectory = ref(false)
+const creatingDirectoryBusy = ref(false)
+const newDirectoryName = ref('')
 let openEpoch = 0
 let browseSequence = 0
 
@@ -210,6 +256,51 @@ function selectDirectory(path: string) {
   selectedDirectory.value = path
 }
 
+async function beginCreateDirectory() {
+  creatingDirectory.value = true
+  newDirectoryName.value = ''
+  await nextTick()
+  newDirectoryInputRef.value?.focus()
+}
+
+function cancelCreateDirectory() {
+  if (creatingDirectoryBusy.value) return
+  creatingDirectory.value = false
+  newDirectoryName.value = ''
+}
+
+async function createDirectory() {
+  const name = newDirectoryName.value.trim()
+  if (!name || !currentDirectory.value || creatingDirectoryBusy.value) return
+  const epoch = openEpoch
+  creatingDirectoryBusy.value = true
+  error.value = ''
+  try {
+    const response = await rpc.call<{ path: string }>(
+      'sandbox.path.create-directory',
+      {
+        sessionKey: props.sessionKey,
+        parentPath: currentDirectory.value,
+        name,
+        kind: 'workspace',
+      },
+    )
+    if (!props.open || epoch !== openEpoch) return
+    const createdPath = String(response.path || '').trim()
+    if (!createdPath) throw new Error('Gateway returned an empty directory path.')
+    creatingDirectory.value = false
+    newDirectoryName.value = ''
+    await browse(createdPath)
+  } catch (cause) {
+    if (!props.open || epoch !== openEpoch) return
+    error.value = t('workspaces.createDirectoryFailed', {
+      error: errorMessage(cause),
+    })
+  } finally {
+    if (epoch === openEpoch) creatingDirectoryBusy.value = false
+  }
+}
+
 function invalidateAndClose() {
   openEpoch += 1
   browseSequence += 1
@@ -274,6 +365,9 @@ watch(
     parentDirectory.value = null
     entries.value = []
     error.value = ''
+    creatingDirectory.value = false
+    creatingDirectoryBusy.value = false
+    newDirectoryName.value = ''
     if (!open) {
       phase.value = 'closed'
       return
@@ -332,6 +426,26 @@ useDialogA11y(
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   padding: var(--sp-1);
+}
+.project-picker__create {
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+}
+.project-picker__create-trigger {
+  gap: var(--sp-1);
+  color: var(--accent);
+  font-weight: 600;
+}
+.project-picker__create-form {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+.project-picker__create-form input {
+  flex: 1;
+  min-width: 0;
 }
 .project-picker__entry {
   width: 100%;
