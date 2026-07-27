@@ -362,11 +362,22 @@ class _AllowSentinel:
 
 ALLOW: _AllowSentinel = _AllowSentinel()
 
-ApprovalDecision = _AllowSentinel | DenialResult
+
+@dataclass(frozen=True)
+class ApprovedHostExecution:
+    """One consumed L3 approval authorizing the waiting call to run on host."""
+
+    approval_id: str
+    action_fingerprint: str
+    level: SecurityLevel
+
+
+ApprovalDecision = _AllowSentinel | ApprovedHostExecution | DenialResult
 
 
 __all__ = [
     "ALLOW",
+    "ApprovedHostExecution",
     "ApprovalDecision",
     "DenialReason",
     "DenialResult",

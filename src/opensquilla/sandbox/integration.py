@@ -139,6 +139,8 @@ class _ApprovalQueueLike(Protocol):
 
     def resolve(self, approval_id: str, approved: bool) -> None: ...
 
+    def consume(self, approval_id: str) -> None: ...
+
 
 # ─── Runtime state ────────────────────────────────────────────────────────
 

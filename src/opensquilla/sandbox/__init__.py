@@ -62,6 +62,7 @@ from opensquilla.sandbox.stale_output_cache import (
 from opensquilla.sandbox.types import (
     ALLOW,
     ApprovalDecision,
+    ApprovedHostExecution,
     DenialReason,
     DenialResult,
     FollowupTag,
@@ -80,6 +81,7 @@ from opensquilla.sandbox.types import (
 
 __all__ = [
     "ALLOW",
+    "ApprovedHostExecution",
     "ApprovalDecision",
     "ApprovalGate",
     "ArtifactOperationRequest",

@@ -96,6 +96,7 @@ from opensquilla.sandbox.path_validation import (
 )
 from opensquilla.sandbox.policy import LevelHints
 from opensquilla.sandbox.types import (
+    ApprovedHostExecution,
     DenialResult,
     MountMode,
     MountSpec,
@@ -5149,106 +5150,110 @@ async def exec_command(
         )
         if isinstance(decision, DenialResult):
             return finish(json.dumps(decision.to_dict()))
-        retry_gate = consume_backend_denial_retry(
-            approval_id,
-            request,
-            policy,
-            runtime=runtime,
-        )
-        if retry_gate is not None:
-            if not retry_gate.allowed:
-                return finish(json.dumps(retry_gate.to_envelope(), ensure_ascii=False))
+        if isinstance(decision, ApprovedHostExecution):
             host_execution = True
             backend_retry_granted = True
         else:
-            backend_cwd = _sandbox_shell_backend_cwd(cwd, request)
-            backend_policy = request.policy
-            backend_policy = _policy_with_active_tool_mounts(backend_policy)
-            backend_policy = _policy_with_windows_shell_runtime_mounts(backend_policy, runtime)
-            backend_policy = _policy_with_wall_timeout(backend_policy, effective_timeout)
-            backend_policy = _trusted_managed_network_policy(backend_policy, runtime)
-            backend_request = SandboxRequest(
-                argv=_sandbox_shell_backend_argv(command, runtime, cwd=backend_cwd),
-                cwd=backend_cwd,
-                action_kind=request.action_kind,
-                policy=backend_policy,
-                stdin=stdin_bytes,
-                env=dict(merged_env),
-                reason=getattr(request, "reason", ""),
-                session_id=getattr(request, "session_id", ""),
-                run_mode=getattr(request, "run_mode", ""),
+            retry_gate = consume_backend_denial_retry(
+                approval_id,
+                request,
+                policy,
+                runtime=runtime,
             )
-            preflight = await preflight_subprocess_managed_network(backend_request, runtime)
-            if isinstance(preflight, DenialResult):
-                return finish(json.dumps(preflight.to_dict()))
-            if isinstance(preflight, dict):
-                return finish(json.dumps(preflight))
-            try:
-                sandbox_result = await _run_backend_with_managed_network(
-                    backend_request,
-                    runtime=runtime,
+            if retry_gate is not None:
+                if not retry_gate.allowed:
+                    return finish(json.dumps(retry_gate.to_envelope(), ensure_ascii=False))
+                host_execution = True
+                backend_retry_granted = True
+            else:
+                backend_cwd = _sandbox_shell_backend_cwd(cwd, request)
+                backend_policy = request.policy
+                backend_policy = _policy_with_active_tool_mounts(backend_policy)
+                backend_policy = _policy_with_windows_shell_runtime_mounts(backend_policy, runtime)
+                backend_policy = _policy_with_wall_timeout(backend_policy, effective_timeout)
+                backend_policy = _trusted_managed_network_policy(backend_policy, runtime)
+                backend_request = SandboxRequest(
+                    argv=_sandbox_shell_backend_argv(command, runtime, cwd=backend_cwd),
+                    cwd=backend_cwd,
+                    action_kind=request.action_kind,
+                    policy=backend_policy,
+                    stdin=stdin_bytes,
+                    env=dict(merged_env),
+                    reason=getattr(request, "reason", ""),
+                    session_id=getattr(request, "session_id", ""),
+                    run_mode=getattr(request, "run_mode", ""),
                 )
-            except SandboxBackendError as exc:
-                review_action = _shell_elevation_action(
-                    tool_name="exec_command",
-                    action_kind="shell.exec",
-                    command=command,
-                    cwd=cwd,
-                    profile=profile,
-                    justification=(
-                        "Sandbox backend unavailable; retry this exact command on host."
-                    ),
-                    env=env,
-                    stdin=stdin,
-                    prefix_rule=prefix_rule,
-                )
-                escalation = await escalate_unavailable_backend_in_managed_mode(
-                    exc,
-                    request,
-                    policy,
-                    runtime=runtime,
-                    review_action=review_action,
-                )
-                if escalation is not None:
+                preflight = await preflight_subprocess_managed_network(backend_request, runtime)
+                if isinstance(preflight, DenialResult):
+                    return finish(json.dumps(preflight.to_dict()))
+                if isinstance(preflight, dict):
+                    return finish(json.dumps(preflight))
+                try:
+                    sandbox_result = await _run_backend_with_managed_network(
+                        backend_request,
+                        runtime=runtime,
+                    )
+                except SandboxBackendError as exc:
+                    review_action = _shell_elevation_action(
+                        tool_name="exec_command",
+                        action_kind="shell.exec",
+                        command=command,
+                        cwd=cwd,
+                        profile=profile,
+                        justification=(
+                            "Sandbox backend unavailable; retry this exact command on host."
+                        ),
+                        env=env,
+                        stdin=stdin,
+                        prefix_rule=prefix_rule,
+                    )
+                    escalation = await escalate_unavailable_backend_in_managed_mode(
+                        exc,
+                        request,
+                        policy,
+                        runtime=runtime,
+                        review_action=review_action,
+                    )
+                    if escalation is not None:
+                        if isinstance(escalation, DenialResult):
+                            return finish(json.dumps(escalation.to_dict(), ensure_ascii=False))
+                        return finish(json.dumps(escalation.to_envelope(), ensure_ascii=False))
+                    raise
+                except Exception as exc:
+                    raise ToolError(f"Sandboxed shell execution failed: {exc}") from exc
+                if is_likely_sandbox_denied(sandbox_result):
+                    review_action = _shell_elevation_action(
+                        tool_name="exec_command",
+                        action_kind="shell.exec",
+                        command=command,
+                        cwd=cwd,
+                        profile=profile,
+                        justification=("Sandbox denied this exact command; retry it on host."),
+                        env=env,
+                        stdin=stdin,
+                        prefix_rule=prefix_rule,
+                    )
+                    escalation = await escalate_backend_denial(
+                        sandbox_result,
+                        request,
+                        policy,
+                        runtime=runtime,
+                        review_action=review_action,
+                    )
                     if isinstance(escalation, DenialResult):
-                        return finish(json.dumps(escalation.to_dict(), ensure_ascii=False))
+                        return finish(json.dumps(escalation.to_dict()))
                     return finish(json.dumps(escalation.to_envelope(), ensure_ascii=False))
-                raise
-            except Exception as exc:
-                raise ToolError(f"Sandboxed shell execution failed: {exc}") from exc
-            if is_likely_sandbox_denied(sandbox_result):
-                review_action = _shell_elevation_action(
-                    tool_name="exec_command",
-                    action_kind="shell.exec",
-                    command=command,
-                    cwd=cwd,
-                    profile=profile,
-                    justification="Sandbox denied this exact command; retry it on host.",
-                    env=env,
-                    stdin=stdin,
-                    prefix_rule=prefix_rule,
+                output = sandbox_result.stdout
+                if sandbox_result.stderr:
+                    output += sandbox_result.stderr
+                output = _append_sandbox_network_hint(output)
+                output = _append_patch_hygiene_warning(command, cwd, output)
+                output = _append_masked_pipeline_failure_warning(
+                    command,
+                    sandbox_result.returncode,
+                    output,
                 )
-                escalation = await escalate_backend_denial(
-                    sandbox_result,
-                    request,
-                    policy,
-                    runtime=runtime,
-                    review_action=review_action,
-                )
-                if isinstance(escalation, DenialResult):
-                    return finish(json.dumps(escalation.to_dict()))
-                return finish(json.dumps(escalation.to_envelope(), ensure_ascii=False))
-            output = sandbox_result.stdout
-            if sandbox_result.stderr:
-                output += sandbox_result.stderr
-            output = _append_sandbox_network_hint(output)
-            output = _append_patch_hygiene_warning(command, cwd, output)
-            output = _append_masked_pipeline_failure_warning(
-                command,
-                sandbox_result.returncode,
-                output,
-            )
-            return finish(f"exit_code={sandbox_result.returncode}\n{output}")
+                return finish(f"exit_code={sandbox_result.returncode}\n{output}")
 
     if host_execution:
         log.info(
@@ -5287,11 +5292,14 @@ async def _start_host_background_process(
     cwd: str | None,
     effective_timeout: float,
     runtime: object | None,
+    env: dict[str, str] | None = None,
 ) -> str:
     """Start a host background process without sandbox policy or safety preflight."""
 
     session_id = str(uuid.uuid4())[:8]
-    host_env = apply_utf8_child_env(_host_shell_env(os.environ.copy()))
+    host_env = apply_utf8_child_env(
+        _host_shell_env(dict(env) if env is not None else os.environ.copy())
+    )
     _append_windows_app_alias_path(host_env, runtime=runtime)
     host_env = _dedupe_windows_env_keys(host_env)
 
@@ -5551,6 +5559,21 @@ async def background_process(
         )
         if isinstance(decision, DenialResult):
             return json.dumps(decision.to_dict())
+        if isinstance(decision, ApprovedHostExecution):
+            log.info(
+                "background_process_host",
+                command=_audit_command(command),
+                run_mode=_context_run_mode(),
+                elevation_grant=True,
+                host_effect=profile.host_effect,
+            )
+            return await _start_host_background_process(
+                command,
+                cwd=cwd,
+                effective_timeout=effective_timeout,
+                runtime=runtime,
+                env=merged_env,
+            )
         retry_gate = consume_backend_denial_retry(
             approval_id,
             request,
