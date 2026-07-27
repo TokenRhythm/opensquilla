@@ -894,57 +894,6 @@ summary.control-row--divider:focus-visible {
   color: var(--danger);
 }
 
-/* ── Sidebar: first-run onboarding empty-state ─────────────────────── */
-
-.sidebar-onboarding {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: var(--sp-2);
-  padding: var(--sp-4) var(--sp-3);
-  text-align: center;
-}
-
-.sidebar-onboarding__lead {
-  margin: 0;
-  font-size: var(--fs-xs);
-  color: var(--sidebar-text-soft);
-}
-
-.sidebar-onboarding__cta {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--sp-1);
-  padding: 6px 14px;
-  border: 1px solid color-mix(in srgb, var(--accent) 36%, var(--sidebar-border));
-  border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--accent) 14%, transparent);
-  color: var(--sidebar-text-strong);
-  font-size: var(--fs-sm);
-  font-weight: 600;
-  cursor: pointer;
-  transition: background var(--dur-fast), border-color var(--dur-fast);
-}
-.sidebar-onboarding__cta:hover {
-  background: color-mix(in srgb, var(--accent) 22%, transparent);
-}
-
-.sidebar-onboarding__links {
-  display: flex;
-  gap: var(--sp-3);
-}
-
-.sidebar-onboarding__link {
-  font-size: var(--fs-xs);
-  font-weight: 600;
-  color: var(--sidebar-text-soft);
-  text-decoration: none;
-  transition: color var(--dur-fast);
-}
-.sidebar-onboarding__link:hover {
-  color: var(--sidebar-text-strong);
-}
-
 /* Canonical toggle switch.
    A native <input type="checkbox"> styled as a switch: it keeps real form
    semantics (name, :checked), native keyboard support (Space), and stays a

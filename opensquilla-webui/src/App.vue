@@ -14,15 +14,10 @@
   >
     <!-- Brand -->
     <div class="sidebar-brand">
-      <router-link
-        to="/overview"
-        class="sidebar-brand-link"
-        :aria-label="t('chrome.brandHome')"
-        @click="handleNavClick"
-      >
+      <div class="sidebar-brand-lockup">
         <img class="sidebar-brand-mark" :src="brandMarkUrl" alt="" aria-hidden="true" />
         <span class="sidebar-brand-text">OpenSquilla</span>
-      </router-link>
+      </div>
       <button
         ref="sidebarDockToggleRef"
         class="sidebar-dock-toggle"
@@ -95,7 +90,6 @@
       @rename="onRenameSession"
       @delete="onDeleteSession"
       @bulk-delete="onBulkDeleteSessions"
-      @new-chat="startNewChatInstant"
       @search="openCommandPalette"
     />
 

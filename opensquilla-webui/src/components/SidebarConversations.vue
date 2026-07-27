@@ -62,7 +62,6 @@ const emit = defineEmits<{
   (e: 'rename', payload: { key: string; title: string }): void
   (e: 'delete', key: string): void
   (e: 'bulk-delete', keys: string[]): void
-  (e: 'new-chat'): void
   (e: 'search'): void
 }>()
 
@@ -395,6 +394,7 @@ function onSelectRow(row: SidebarConversationItem) {
 
 <template>
   <div
+    v-if="error || totalRows > 0"
     class="sidebar-section sidebar-history"
     :class="{ 'is-selecting': selectionMode }"
     :aria-label="t('shared.sidebar.recentConversations')"
@@ -491,19 +491,6 @@ function onSelectRow(row: SidebarConversationItem) {
     <!-- Filtered to nothing within the Chats agent filter -->
     <div v-else-if="agentFilter && !hasFilterMatches" class="sidebar-history-empty">
       {{ t('shared.sidebar.noMatches') }}
-    </div>
-
-    <!-- First-run onboarding: no sessions exist yet -->
-    <div v-else-if="totalRows === 0" class="sidebar-onboarding">
-      <p class="sidebar-onboarding__lead">{{ t('shared.sidebar.noConversations') }}</p>
-      <button type="button" class="sidebar-onboarding__cta" @click="emit('new-chat')">
-        <Icon name="plus" :size="14" />
-        <span>{{ t('shared.sidebar.startChat') }}</span>
-      </button>
-      <div class="sidebar-onboarding__links">
-        <router-link to="/sessions" class="sidebar-onboarding__link">{{ t('shared.sidebar.linkSessions') }}</router-link>
-        <router-link to="/overview" class="sidebar-onboarding__link">{{ t('shared.sidebar.linkOverview') }}</router-link>
-      </div>
     </div>
 
     <div v-else class="sidebar-history-list">
