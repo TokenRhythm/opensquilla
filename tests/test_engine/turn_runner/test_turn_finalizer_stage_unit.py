@@ -249,6 +249,40 @@ async def test_simple_text_no_done_event_appends_and_captures() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tool_boundary_text_is_persisted_as_readable_paragraphs() -> None:
+    stage, recs = _make_stage()
+    outcome = await stage.run(
+        _make_input(
+            final_text_parts=["Starting check.", "Check complete.", "Final answer."],
+            turn_segments=[
+                {"type": "text", "text": "Starting check."},
+                {"type": "tool_use", "name": "exec_command", "tool_use_id": "call-1"},
+                {
+                    "type": "tool_result",
+                    "name": "exec_command",
+                    "tool_use_id": "call-1",
+                    "result": "ok",
+                },
+                {"type": "text", "text": "Check complete."},
+                {"type": "tool_use", "name": "read_file", "tool_use_id": "call-2"},
+                {
+                    "type": "tool_result",
+                    "name": "read_file",
+                    "tool_use_id": "call-2",
+                    "result": "ok",
+                },
+                {"type": "text", "text": "Final answer."},
+            ],
+        )
+    )
+
+    expected = "Starting check.\n\nCheck complete.\n\nFinal answer."
+    assert outcome.output.final_text == expected
+    assert outcome.output.assistant_message_content == expected
+    assert recs["transcript_append"].calls[0]["content"] == expected
+
+
+@pytest.mark.asyncio
 async def test_legacy_boolean_transcript_port_remains_compatible() -> None:
     stage, _ = _make_stage(
         transcript_append=_RecordingTranscriptAppend(return_value=True),

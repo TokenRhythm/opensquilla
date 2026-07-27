@@ -5058,6 +5058,50 @@ class TestSessionsSubscribe:
 
 class TestSessionsMessagesSubscribe:
     @pytest.mark.asyncio
+    async def test_messages_snapshot_returns_compact_live_turn_and_cursor(
+        self,
+        dispatcher,
+        ctx_with_sessions,
+    ):
+        key = "agent:main:live-snapshot-rpc"
+        stream_registry = get_session_streams()
+        stream_registry.record(
+            key,
+            "session.event.thinking",
+            {"task_id": "task-live-snapshot", "text": "Inspect"},
+        )
+        stream_registry.record(
+            key,
+            "session.event.thinking",
+            {"task_id": "task-live-snapshot", "text": "ing"},
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.messages.snapshot",
+            {"key": key},
+            ctx_with_sessions,
+        )
+
+        assert res.ok is True
+        assert res.payload == {
+            "key": key,
+            "task_id": "task-live-snapshot",
+            "current_stream_seq": 2,
+            "events": [
+                {
+                    "event": "session.event.thinking",
+                    "payload": {
+                        "task_id": "task-live-snapshot",
+                        "text": "Inspecting",
+                        "session_key": key,
+                        "stream_seq": 1,
+                    },
+                }
+            ],
+        }
+
+    @pytest.mark.asyncio
     async def test_messages_subscribe(self, dispatcher, ctx_with_sessions, session):
         res = await dispatcher.dispatch(
             "r1",

@@ -24,6 +24,7 @@ from opensquilla.sandbox.escalation import (
     consume_temporary_network_grant,
     context_with_temporary_network_grants,
     current_tool_run_context,
+    discard_approval_run_context_authority,
     request_sandbox_approval,
 )
 from opensquilla.sandbox.governance import action_fingerprint
@@ -183,13 +184,24 @@ class NetworkApprovalService:
 
         if params.get("reviewer") == "auto_review":
             await self._run_auto_review(payload, approval_id)
-        approved = await get_approval_queue().wait(
-            approval_id,
-            timeout=self.approval_timeout_seconds,
-        )
+        queue = get_approval_queue()
+        try:
+            approved = await queue.wait(
+                approval_id,
+                timeout=self.approval_timeout_seconds,
+            )
+        except asyncio.CancelledError:
+            # The originating client/proxy request is gone, so there is no
+            # continuation left for this card to resume.
+            try:
+                queue.expire_pending(approval_id)
+            except (KeyError, ValueError):
+                pass
+            discard_approval_run_context_authority(approval_id)
+            raise
         if not approved:
             try:
-                entry = get_approval_queue().get(approval_id)
+                entry = queue.get(approval_id)
                 rationale = str(entry.params.get("reviewRationale") or "").strip()
             except KeyError:
                 rationale = ""

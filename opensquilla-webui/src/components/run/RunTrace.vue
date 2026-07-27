@@ -1821,7 +1821,7 @@ function fmtTok(n?: number | null): string {
 }
 
 .tool-timeline--activity .msg-ai-text + .msg-ai-text {
-  margin-top: -0.125rem;
+  margin-top: 0.5rem;
 }
 
 /* Completed, non-open rows soften and tuck in — kept for traceability, not

@@ -148,6 +148,44 @@ def _database(path: Path) -> sqlite3.Connection:
     return connection
 
 
+def _add_workspace_schema(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        ALTER TABLE sessions ADD COLUMN workspace_id TEXT;
+        CREATE TABLE project_workspaces (
+            workspace_id TEXT PRIMARY KEY,
+            path TEXT NOT NULL,
+            path_key TEXT NOT NULL UNIQUE,
+            display_name TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            position_at INTEGER NOT NULL,
+            pinned_at INTEGER,
+            removed_at INTEGER,
+            trusted_at INTEGER
+        );
+        """
+    )
+
+
+def _add_workspace(
+    connection: sqlite3.Connection,
+    *,
+    workspace_id: str,
+    path: str,
+    trusted_at: int | None,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO project_workspaces(
+            workspace_id, path, path_key, display_name, created_at,
+            updated_at, position_at, trusted_at
+        ) VALUES (?, ?, ?, 'Recovered project', 1, 1, 1, ?)
+        """,
+        (workspace_id, path, path.casefold(), trusted_at),
+    )
+
+
 def _add_session(
     connection: sqlite3.Connection,
     *,
@@ -675,6 +713,96 @@ def test_merge_session_database_snapshots_wal_when_target_is_missing(
         assert merged.execute("PRAGMA quick_check").fetchone() == ("ok",)
         assert merged.execute("SELECT label FROM sessions").fetchone() == ("from wal",)
     source.close()
+
+
+def test_merge_existing_imports_bound_workspace_without_replaying_trust(
+    tmp_path: Path,
+) -> None:
+    target_path = tmp_path / "target.db"
+    source_path = tmp_path / "source.db"
+    target = _database(target_path)
+    source = _database(source_path)
+    _add_workspace_schema(target)
+    _add_workspace_schema(source)
+    _add_session(
+        source,
+        key="agent:main:workspace",
+        session_id="workspace-session",
+        content="workspace conversation",
+        suffix="workspace",
+    )
+    _add_workspace(
+        source,
+        workspace_id="source-workspace",
+        path="/source-machine/project",
+        trusted_at=1234,
+    )
+    source.execute(
+        "UPDATE sessions SET workspace_id='source-workspace' "
+        "WHERE session_key='agent:main:workspace'"
+    )
+    source.commit()
+    target.close()
+    source.close()
+
+    merge_session_database(
+        target_path,
+        source_path,
+        source_id="55555555-5555-4555-8555-555555555555",
+    )
+
+    with sqlite3.connect(target_path) as merged:
+        assert merged.execute(
+            "SELECT workspace_id FROM sessions WHERE session_key='agent:main:workspace'"
+        ).fetchone() == ("source-workspace",)
+        assert merged.execute(
+            "SELECT path, trusted_at FROM project_workspaces "
+            "WHERE workspace_id='source-workspace'"
+        ).fetchone() == ("/source-machine/project", None)
+
+
+def test_missing_target_snapshot_clears_imported_workspace_trust(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "source.db"
+    target_path = tmp_path / "target.db"
+    source = _database(source_path)
+    _add_workspace_schema(source)
+    _add_session(
+        source,
+        key="agent:main:workspace-snapshot",
+        session_id="workspace-snapshot-session",
+        content="workspace snapshot",
+        suffix="workspace-snapshot",
+    )
+    _add_workspace(
+        source,
+        workspace_id="snapshot-workspace",
+        path="/other-host/project",
+        trusted_at=5678,
+    )
+    source.execute(
+        "UPDATE sessions SET workspace_id='snapshot-workspace' "
+        "WHERE session_key='agent:main:workspace-snapshot'"
+    )
+    source.commit()
+    source.close()
+
+    merge_session_database(
+        target_path,
+        source_path,
+        source_id="66666666-6666-4666-8666-666666666666",
+    )
+
+    with sqlite3.connect(target_path) as merged:
+        assert merged.execute(
+            "SELECT workspace_id FROM sessions "
+            "WHERE session_key='agent:main:workspace-snapshot'"
+        ).fetchone() == ("snapshot-workspace",)
+        assert merged.execute(
+            "SELECT trusted_at FROM project_workspaces "
+            "WHERE workspace_id='snapshot-workspace'"
+        ).fetchone() == (None,)
 
 
 @pytest.mark.parametrize("operation", ["snapshot", "merge-existing"])

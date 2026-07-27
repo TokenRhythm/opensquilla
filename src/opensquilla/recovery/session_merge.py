@@ -433,6 +433,7 @@ def _copy_core_rows(
     *,
     key_map: Mapping[str, str],
     id_map: Mapping[str, str],
+    workspace_map: Mapping[str, str | None],
     counts: dict[str, int],
 ) -> dict[tuple[str, int], int]:
     transcript_ids: dict[tuple[str, int], int] = {}
@@ -443,6 +444,9 @@ def _copy_core_rows(
         row = _replace_session_references(session_rows[0], key_map=key_map, id_map=id_map)
         row["session_key"] = item.target_key
         row["session_id"] = item.target_id
+        source_workspace_id = row.get("workspace_id")
+        if source_workspace_id is not None:
+            row["workspace_id"] = workspace_map.get(str(source_workspace_id))
         _insert(target, "sessions", row)
         _increment(counts, "sessions")
 
@@ -495,6 +499,73 @@ def _copy_core_rows(
                 _insert(target, table, row, omit=frozenset({"id"}))
                 _increment(counts, table)
     return transcript_ids
+
+
+def _copy_referenced_workspaces(
+    target: sqlite3.Connection,
+    source: sqlite3.Connection,
+    imports: list[_SessionImport],
+    *,
+    source_id: str,
+    counts: dict[str, int],
+) -> dict[str, str | None]:
+    """Import session-bound path bookmarks without importing host trust."""
+
+    if "workspace_id" not in _columns(source, "sessions"):
+        return {}
+    source_workspace_ids = {
+        str(row["workspace_id"])
+        for item in imports
+        for row in _rows(source, "sessions", "session_key = ?", (item.source_key,))
+        if row.get("workspace_id") is not None
+    }
+    if not source_workspace_ids:
+        return {}
+    if not (
+        _table_exists(source, "project_workspaces")
+        and _table_exists(target, "project_workspaces")
+        and "workspace_id" in _columns(target, "sessions")
+    ):
+        return {workspace_id: None for workspace_id in source_workspace_ids}
+
+    workspace_map: dict[str, str | None] = {}
+    for source_workspace_id in sorted(source_workspace_ids):
+        rows = _rows(
+            source,
+            "project_workspaces",
+            "workspace_id = ?",
+            (source_workspace_id,),
+        )
+        if len(rows) != 1:
+            workspace_map[source_workspace_id] = None
+            continue
+        row = dict(rows[0])
+        path_key = str(row.get("path_key") or "")
+        existing_by_path = (
+            target.execute(
+                "SELECT workspace_id FROM project_workspaces WHERE path_key=?",
+                (path_key,),
+            ).fetchone()
+            if path_key
+            else None
+        )
+        if existing_by_path is not None:
+            workspace_map[source_workspace_id] = str(existing_by_path[0])
+            continue
+        target_workspace_id = _unique_text_key(
+            target,
+            table="project_workspaces",
+            column="workspace_id",
+            original=source_workspace_id,
+            source_id=source_id,
+        )
+        row["workspace_id"] = target_workspace_id
+        if "trusted_at" in row:
+            row["trusted_at"] = None
+        _insert(target, "project_workspaces", row)
+        _increment(counts, "project_workspaces")
+        workspace_map[source_workspace_id] = target_workspace_id
+    return workspace_map
 
 
 def _copy_usage_rows(
@@ -629,6 +700,11 @@ def _clear_excluded_operational_rows(path: Path) -> tuple[str, ...]:
                     WHERE COALESCE(portable, 0) != 1
                     """
                 )
+            if (
+                _table_exists(connection, "project_workspaces")
+                and "trusted_at" in _columns(connection, "project_workspaces")
+            ):
+                connection.execute("UPDATE project_workspaces SET trusted_at=NULL")
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -851,12 +927,20 @@ def _merge_session_database_from_private(
             target_connection.execute("PRAGMA foreign_keys=OFF")
             target_connection.execute("BEGIN IMMEDIATE")
             try:
+                workspace_map = _copy_referenced_workspaces(
+                    target_connection,
+                    source_connection,
+                    imports,
+                    source_id=source_id,
+                    counts=imported_rows,
+                )
                 _copy_core_rows(
                     target_connection,
                     source_connection,
                     imports,
                     key_map=key_map,
                     id_map=id_map,
+                    workspace_map=workspace_map,
                     counts=imported_rows,
                 )
                 _copy_usage_rows(

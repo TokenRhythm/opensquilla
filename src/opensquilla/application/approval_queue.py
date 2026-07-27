@@ -588,6 +588,12 @@ class ApprovalQueue:
                 count += 1
         return count
 
+    def expire_pending(self, approval_id: str) -> bool:
+        """Expire one unresolved approval whose live continuation no longer exists."""
+
+        outcome = self._expire_if_unresolved(approval_id, force=True)
+        return outcome is not None
+
     def expire_all_pending(self) -> int:
         """Expire every unresolved approval left by an earlier process."""
 
@@ -602,6 +608,39 @@ class ApprovalQueue:
             ) is not None:
                 count += 1
         return count
+
+    def expire_claimed_resolution(
+        self,
+        approval_id: str,
+        claim_token: str,
+    ) -> None:
+        """Fail-close an approved claim whose side effect could not be applied."""
+
+        self._conn.execute("BEGIN IMMEDIATE")
+        row = self._get_row(approval_id)
+        if row is None:
+            self._conn.rollback()
+            raise KeyError(f"Approval not found: {approval_id}")
+        entry = self._row_to_entry(row)
+        if entry.claim_token != claim_token:
+            self._conn.rollback()
+            self._pending[approval_id] = entry
+            raise ValueError(f"Approval resolution claim mismatch: {approval_id}")
+        cursor = self._conn.execute(
+            "UPDATE approval_queue "
+            "SET resolved = 1, approved = 0, consumed = 0, resolution = ?, "
+            "claim_token = NULL, claim_started_at = NULL "
+            "WHERE approval_id = ? AND claim_token = ?",
+            (RESOLUTION_EXPIRED, approval_id, claim_token),
+        )
+        if cursor.rowcount != 1:
+            self._conn.rollback()
+            raise ValueError(f"Approval could not be expired: {approval_id}")
+        self._conn.commit()
+        expired = self.get(approval_id)
+        expired._event.set()
+        self._pending[approval_id] = expired
+        self._notify_event("resolved", expired)
 
     def resolve(
         self,

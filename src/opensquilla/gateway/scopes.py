@@ -101,6 +101,7 @@ METHOD_SCOPES: dict[str, str] = {
     "sessions.subscribe": READ_SCOPE,
     "sessions.unsubscribe": READ_SCOPE,
     "workspaces.list": READ_SCOPE,  # OpenSquilla-only; owner-guarded local paths.
+    "sessions.messages.snapshot": READ_SCOPE,
     "sessions.messages.subscribe": READ_SCOPE,
     "sessions.messages.unsubscribe": READ_SCOPE,
     "gateway.identity.get": READ_SCOPE,

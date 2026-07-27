@@ -2779,6 +2779,22 @@ class TaskRuntime:
                 status=status,
                 terminal_reason=terminal_reason,
             )
+        # The per-session execution lock makes this task the only possible live
+        # continuation for approvals owned by its session. At terminal state,
+        # any remaining request is orphaned and must fail closed.
+        try:
+            from opensquilla.application.approval_queue import get_approval_queue
+
+            get_approval_queue().expire_pending_for_session(
+                task.envelope.session_key,
+            )
+        except Exception as exc:  # noqa: BLE001 - terminalization must continue.
+            log.warning(
+                "task_runtime.approval_cleanup_failed",
+                task_id=task.task_id,
+                session_key=task.envelope.session_key,
+                error=str(exc),
+            )
         for collected_input in collected_terminal_inputs:
             await self._record_collected_primary_input_disposition(
                 task,

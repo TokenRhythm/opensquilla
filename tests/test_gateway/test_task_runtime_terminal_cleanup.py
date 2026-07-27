@@ -123,6 +123,24 @@ async def test_terminal_clears_all_dicts() -> None:
 
 
 @pytest.mark.asyncio
+async def test_terminal_expires_pending_approvals_for_owning_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = MagicMock()
+    monkeypatch.setattr(
+        "opensquilla.application.approval_queue.get_approval_queue",
+        lambda: queue,
+    )
+    rt = _make_runtime()
+    env = _make_envelope("agent-1::approval-owner")
+
+    handle = await rt.enqueue(env, "hello")
+    await rt.wait(handle.task_id, timeout=2.0)
+
+    queue.expire_pending_for_session.assert_called_once_with(env.session_key)
+
+
+@pytest.mark.asyncio
 async def test_preallocated_turn_identity_is_propagated_to_handler() -> None:
     observed: list[dict[str, Any] | None] = []
 

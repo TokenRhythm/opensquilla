@@ -339,7 +339,7 @@ async def test_raw_queue_approval_id_without_generation_fails_closed(
 
 
 @pytest.mark.asyncio
-async def test_generation_reset_reopens_real_rpc_approval(tmp_path: Path) -> None:
+async def test_generation_reset_expires_real_rpc_approval(tmp_path: Path) -> None:
     from opensquilla.gateway.approval_queue import get_approval_queue
     from opensquilla.gateway.auth import Principal
     from opensquilla.gateway.rpc import RpcContext
@@ -390,20 +390,21 @@ async def test_generation_reset_reopens_real_rpc_approval(tmp_path: Path) -> Non
     )
 
     try:
-        with pytest.raises(ProjectWorkspaceStateError, match="unavailable"):
-            await _handle_exec_approval_resolve(
-                {
-                    "id": approval_id,
-                    "approved": True,
-                    "choice": "allow_same_type",
-                },
-                rpc_context,
-            )
+        payload = await _handle_exec_approval_resolve(
+            {
+                "id": approval_id,
+                "approved": True,
+                "choice": "allow_same_type",
+            },
+            rpc_context,
+        )
 
-        reopened = get_approval_queue().get(approval_id)
-        assert reopened.resolved is False
-        assert reopened.approved is False
-        assert reopened.claim_token is None
+        expired = get_approval_queue().get(approval_id)
+        assert expired.resolved is True
+        assert expired.approved is False
+        assert expired.resolution == "expired"
+        assert expired.claim_token is None
+        assert payload["resolution"] == "expired"
         assert (await _durable_context(manager, node.session_key)).domains == ()
     finally:
         await storage.close()
@@ -487,21 +488,24 @@ async def test_turn_cleanup_first_prevents_real_rpc_same_type_cas(
         )
         await cleanup_task
 
-        with pytest.raises(ProjectWorkspaceStateError, match="unavailable"):
-            await _handle_exec_approval_resolve(
-                {
-                    "id": approval_id,
-                    "approved": True,
-                    "choice": "allow_same_type",
-                },
-                rpc_context,
-            )
+        payload = await _handle_exec_approval_resolve(
+            {
+                "id": approval_id,
+                "approved": True,
+                "choice": "allow_same_type",
+            },
+            rpc_context,
+        )
 
         assert not cas_entered.is_set()
-        reopened = get_approval_queue().get(approval_id)
-        assert reopened.resolved is False
-        assert reopened.approved is False
-        assert reopened.claim_token is None
+        expired = get_approval_queue().get(approval_id)
+        assert expired.resolved is True
+        assert expired.approved is False
+        assert expired.resolution == "expired"
+        assert expired.claim_token is None
+        assert payload["resolved"] is True
+        assert payload["approved"] is False
+        assert payload["resolution"] == "expired"
         assert (await _durable_context(manager, node.session_key)).domains == ()
     finally:
         await storage.close()
@@ -667,7 +671,7 @@ async def test_real_rpc_same_type_apply_first_blocks_cancelled_turn_cleanup(
 
 
 @pytest.mark.asyncio
-async def test_repeated_turn_cancel_revokes_generation_after_rpc_reopens(
+async def test_repeated_turn_cancel_revokes_generation_and_expires_rpc_approval(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -789,39 +793,35 @@ async def test_repeated_turn_cancel_revokes_generation_after_rpc_reopens(
         await asyncio.sleep(0)
 
         release_first_cas.set()
-        with pytest.raises(ProjectWorkspaceStateError, match="unavailable"):
-            await asyncio.wait_for(rpc_task, timeout=1.0)
+        payload = await asyncio.wait_for(rpc_task, timeout=1.0)
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(turn_task, timeout=1.0)
 
-        reopened = get_approval_queue().get(approval_id)
-        assert reopened.resolved is False
-        assert reopened.approved is False
-        assert reopened.claim_token is None
+        expired = get_approval_queue().get(approval_id)
+        assert expired.resolved is True
+        assert expired.approved is False
+        assert expired.resolution == "expired"
+        assert expired.claim_token is None
+        assert payload["resolution"] == "expired"
 
-        retry_error: ProjectWorkspaceStateError | None = None
-        try:
-            await _handle_exec_approval_resolve(
-                {
-                    "id": approval_id,
-                    "approved": True,
-                    "choice": "allow_same_type",
-                },
-                rpc_context,
-            )
-        except ProjectWorkspaceStateError as exc:
-            retry_error = exc
+        retry_payload = await _handle_exec_approval_resolve(
+            {
+                "id": approval_id,
+                "approved": True,
+                "choice": "allow_same_type",
+            },
+            rpc_context,
+        )
 
         assert (await _durable_context(manager, node.session_key)).domains == ()
-        assert retry_error is not None
-        assert str(retry_error) == "unavailable"
+        assert retry_payload["resolution"] == "expired"
         assert cas_attempts == 1
         assert approval_id not in escalation_module._APPROVAL_RUN_CONTEXT_GENERATIONS
         assert approval_id not in escalation_module._APPROVAL_RUN_CONTEXT_DELTAS
-        reopened = get_approval_queue().get(approval_id)
-        assert reopened.resolved is False
-        assert reopened.approved is False
-        assert reopened.claim_token is None
+        expired = get_approval_queue().get(approval_id)
+        assert expired.resolved is True
+        assert expired.approved is False
+        assert expired.claim_token is None
     finally:
         release_first_cas.set()
         for task in (rpc_task, turn_task):

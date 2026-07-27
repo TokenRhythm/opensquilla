@@ -523,6 +523,34 @@ class TurnFinalizerStageOutput:
     # Did the memory capture fire?
     memory_captured: bool
 
+
+def _readable_tool_boundary_text(
+    final_text: str,
+    turn_segments: list[dict],
+) -> str:
+    """Preserve paragraph boundaries between separate assistant narrations."""
+
+    text_segments = [
+        str(segment.get("text") or "")
+        for segment in turn_segments
+        if isinstance(segment, dict)
+        and segment.get("type") == "text"
+        and str(segment.get("text") or "")
+    ]
+    if len(text_segments) < 2:
+        return final_text
+    compact = "".join(text_segments)
+    if not final_text.startswith(compact):
+        return final_text
+    readable = text_segments[0]
+    for segment in text_segments[1:]:
+        if readable[-1:].isspace() or segment[:1].isspace():
+            readable += segment
+        else:
+            readable += f"\n\n{segment}"
+    return readable + final_text[len(compact) :]
+
+
 # ---------------------------------------------------------------------------
 # Outer stage class
 # ---------------------------------------------------------------------------
@@ -589,7 +617,10 @@ class TurnFinalizerStage:
         from opensquilla.engine.turn_runner.outcome import StageOutcome
 
         # 1. Heartbeat-normalize.
-        final_text = "".join(inp.final_text_parts)
+        final_text = _readable_tool_boundary_text(
+            "".join(inp.final_text_parts),
+            inp.turn_segments,
+        )
         original_final_text = final_text
         final_text = _normalize_heartbeat_text(
             final_text,

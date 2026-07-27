@@ -10,6 +10,8 @@ function createHarness(options: {
 } = {}) {
   const messages = ref<ChatMessage[]>(options.messages ?? [])
   const activeTaskGroups = ref(new Set<string>())
+  const activeStreamTaskId = ref('')
+  const lastStreamSeq = ref(0)
   const applySessionRunState = vi.fn()
   const stream: ChatRpcStreamApi = {
     isStreaming: ref(true),
@@ -24,6 +26,7 @@ function createHarness(options: {
     appendToolResult: vi.fn(),
     appendArtifact: vi.fn(),
     reconcileFinalText: vi.fn(),
+    resetLiveTurnState: vi.fn(),
     resetStreamIdleTimer: vi.fn(),
     clearStreamIdleTimer: vi.fn(),
     setStreamActivity: vi.fn(),
@@ -40,9 +43,9 @@ function createHarness(options: {
   const api = scope.run(() => useChatRpcEventHandlers({
     sessionKey: ref('agent:main:test'),
     currentEpoch: ref(0),
-    lastStreamSeq: ref(0),
+    lastStreamSeq,
     activeTaskGroups,
-    activeStreamTaskId: ref(''),
+    activeStreamTaskId,
     aborted: ref(false),
     messages,
     pendingQueue: ref([]),
@@ -81,6 +84,8 @@ function createHarness(options: {
     messages,
     stream,
     activeTaskGroups,
+    activeStreamTaskId,
+    lastStreamSeq,
     applySessionRunState,
     markEnsembleHandoff,
     schedulePendingDrainAfterTerminal,
@@ -89,6 +94,67 @@ function createHarness(options: {
     stop: () => scope.stop(),
   }
 }
+
+describe('useChatRpcEventHandlers live snapshot restoration', () => {
+  it('rebuilds the unfinished turn while advancing to the authoritative cursor', () => {
+    const {
+      api,
+      stream,
+      activeStreamTaskId,
+      lastStreamSeq,
+      stop,
+    } = createHarness()
+    try {
+      lastStreamSeq.value = 900
+      api.restoreLiveTurnSnapshot({
+        key: 'agent:main:test',
+        task_id: 'task-live',
+        current_stream_seq: 2400,
+        events: [
+          {
+            event: 'session.event.thinking',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              text: 'Recovered reasoning',
+              stream_seq: 10,
+            },
+          },
+          {
+            event: 'session.event.tool_use_start',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              id: 'tool-1',
+              name: 'exec',
+              stream_seq: 11,
+            },
+          },
+          {
+            event: 'session.event.text_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              text: 'Recovered answer',
+              stream_seq: 12,
+            },
+          },
+        ],
+      })
+
+      expect(stream.resetLiveTurnState).toHaveBeenCalledOnce()
+      expect(api.streamThinkingText.value).toBe('Recovered reasoning')
+      expect(stream.appendToolCall).toHaveBeenCalledWith(expect.objectContaining({
+        id: 'tool-1',
+      }))
+      expect(stream.appendDelta).toHaveBeenCalledWith('Recovered answer')
+      expect(activeStreamTaskId.value).toBe('task-live')
+      expect(lastStreamSeq.value).toBe(2400)
+    } finally {
+      stop()
+    }
+  })
+})
 
 describe('useChatRpcEventHandlers durable out-of-band messages', () => {
   it('shows cron results immediately, preserves provenance, and deduplicates replay by id', () => {

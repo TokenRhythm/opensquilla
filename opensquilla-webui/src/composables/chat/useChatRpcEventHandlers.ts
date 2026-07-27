@@ -13,6 +13,7 @@ import type {
   EnsembleProgressPayload,
   RouterDecisionPayload,
   SessionEventPayload,
+  SessionMessagesSnapshotResponse,
   StreamEventEnvelope,
   SubagentCompletionPayload,
   TextDeltaPayload,
@@ -66,6 +67,7 @@ export interface ChatRpcStreamApi {
   appendToolResult: (payload: ToolResultPayload) => void
   appendArtifact: (payload: ArtifactPayload) => void
   reconcileFinalText: (finalText: string | null | undefined) => void
+  resetLiveTurnState?: () => void
   resetStreamIdleTimer: () => void
   clearStreamIdleTimer: () => void
   setStreamActivity: (label: string) => void
@@ -298,6 +300,38 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       handleRpcRouterControlReplay(payload)
     } else if (event === 'session.event.thinking') {
       handleRpcAny(event, payload)
+    }
+  }
+
+  function restoreLiveTurnSnapshot(snapshot: SessionMessagesSnapshotResponse) {
+    if (!snapshot || snapshot.key !== sessionKey.value) return
+
+    stream.resetLiveTurnState?.()
+    clearLiveThinking()
+    pendingTerminalEvents.clear()
+    pendingStreamEvents.clear()
+    settledTaskIds.clear()
+    options.clearPendingRouterDecision()
+    activeStreamTaskId.value = typeof snapshot.task_id === 'string'
+      ? snapshot.task_id
+      : ''
+
+    for (const entry of snapshot.events || []) {
+      if (!entry || typeof entry.event !== 'string') continue
+      const payload = { ...(entry.payload || {}) }
+      // Snapshot events retain their original sequence for diagnostics, but
+      // they form an authoritative base rather than fresh deltas. Replaying
+      // them through the normal render handlers without the old sequence
+      // rebuilds the bubble even when this client already had a newer cursor.
+      delete payload.stream_seq
+      replayPendingStreamEvent({ event: entry.event, payload })
+    }
+
+    if (
+      typeof snapshot.current_stream_seq === 'number'
+      && Number.isFinite(snapshot.current_stream_seq)
+    ) {
+      lastStreamSeq.value = Math.max(0, snapshot.current_stream_seq)
     }
   }
 
@@ -1054,6 +1088,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   return {
     handlers,
     bindActiveStreamTask,
+    restoreLiveTurnSnapshot,
     streamThinkingText,
     streamThinkingElapsedText,
     attachTurnReasoning,

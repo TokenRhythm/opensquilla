@@ -4509,6 +4509,16 @@ async def test_real_session_transcript_workspace_and_media_survive_import(
     try:
         manager = SessionManager(storage, inject_time_prefix=False, media_root=source / "media")
         session = await manager.create("agent:main:direct:migration-e2e")
+        project = await storage.create_or_restore_project_workspace(
+            path="/source-host/projects/migration-e2e",
+            path_key="/source-host/projects/migration-e2e",
+            display_name="Migration E2E",
+            trusted_at=123456,
+        )
+        await storage.bind_session_workspace(
+            session.session_key,
+            project.workspace_id,
+        )
         for role, content in (("user", "synthetic user prompt"), ("assistant", "synthetic reply")):
             await storage.append_transcript_entry(
                 TranscriptEntry(
@@ -4521,6 +4531,40 @@ async def test_real_session_transcript_workspace_and_media_survive_import(
             )
     finally:
         await storage.close()
+
+    grants_db = source / "state" / "sandbox_user_grants.sqlite"
+    grants_connection = sqlite3.connect(grants_db)
+    try:
+        grants_connection.execute(
+            "CREATE TABLE sandbox_user_grants ("
+            "kind TEXT NOT NULL, grant_key TEXT NOT NULL, payload TEXT NOT NULL, "
+            "updated_at REAL NOT NULL, PRIMARY KEY(kind, grant_key))"
+        )
+        grants_connection.executemany(
+            "INSERT INTO sandbox_user_grants VALUES (?, ?, ?, ?)",
+            (
+                (
+                    "mounts",
+                    "/source-host/private",
+                    '{"path":"/source-host/private","access":"rw"}',
+                    1.0,
+                ),
+                ("domains", "example.com", '{"domain":"example.com"}', 1.0),
+            ),
+        )
+        grants_connection.commit()
+    finally:
+        grants_connection.close()
+    legacy_grants = source / "state" / "sandbox_user_grants.json"
+    legacy_grants.write_text(
+        json.dumps(
+            {
+                "mounts": [{"path": "/source-host/legacy-private", "access": "rw"}],
+                "domains": [{"domain": "legacy.example.com"}],
+            }
+        ),
+        encoding="utf-8",
+    )
 
     (source / "workspace").mkdir()
     (source / "workspace" / "important.txt").write_text(
@@ -4551,6 +4595,11 @@ async def test_real_session_transcript_workspace_and_media_survive_import(
     try:
         restored = await reopened.get_session(session.session_key)
         assert restored is not None
+        assert restored.workspace_id == project.workspace_id
+        restored_project = await reopened.get_project_workspace(project.workspace_id)
+        assert restored_project is not None
+        assert restored_project.path == "/source-host/projects/migration-e2e"
+        assert restored_project.trusted_at is None
         transcript = await reopened.get_transcript(session.session_id)
         assert [(entry.role, entry.content) for entry in transcript] == [
             ("user", "synthetic user prompt"),
@@ -4558,6 +4607,18 @@ async def test_real_session_transcript_workspace_and_media_survive_import(
         ]
     finally:
         await reopened.close()
+    imported_grants = sqlite3.connect(target / "state" / "sandbox_user_grants.sqlite")
+    try:
+        assert imported_grants.execute(
+            "SELECT kind, grant_key FROM sandbox_user_grants ORDER BY kind, grant_key"
+        ).fetchall() == [("domains", "example.com")]
+    finally:
+        imported_grants.close()
+    imported_legacy_grants = json.loads(
+        (target / "state" / "sandbox_user_grants.json").read_text(encoding="utf-8")
+    )
+    assert imported_legacy_grants["mounts"] == []
+    assert imported_legacy_grants["domains"] == [{"domain": "legacy.example.com"}]
 
     assert (target / "workspace" / "important.txt").read_text(
         encoding="utf-8"

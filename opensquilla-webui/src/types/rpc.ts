@@ -315,6 +315,18 @@ export interface SessionMessagesSubscribeParams {
   [key: string]: unknown
 }
 
+export interface SessionLiveSnapshotEvent {
+  event: string
+  payload: SessionEventPayload
+}
+
+export interface SessionMessagesSnapshotResponse {
+  key: string
+  task_id?: string | null
+  current_stream_seq?: number
+  events?: SessionLiveSnapshotEvent[]
+}
+
 export interface SessionProjectWorkspaceSnapshot {
   id: string
   name: string

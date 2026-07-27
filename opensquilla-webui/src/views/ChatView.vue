@@ -624,6 +624,7 @@ import type {
 import type {
   ArtifactPayload,
   SessionEventPayload,
+  SessionMessagesSnapshotResponse,
 } from '@/types/rpc'
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import { isSandboxRunMode, type SandboxRunMode } from '@/types/sandbox'
@@ -818,6 +819,7 @@ const activeTaskGroups = ref<Set<string>>(new Set())
 const activeStreamTaskId = ref<string>('')
 const activeStreamSessionKey = ref<string>('')
 let bindActiveStreamTask = (taskId: string) => { activeStreamTaskId.value = taskId }
+let restoreLiveTurnSnapshot = (_snapshot: SessionMessagesSnapshotResponse) => {}
 
 // Pending session intent
 const pendingSessionIntent = ref<string | null>(null)
@@ -1222,6 +1224,7 @@ const chatSessionSubscription = useChatSessionSubscription({
   loadHistory,
   resetStreamIdleTimer,
   resetStreamLiveTurnState,
+  onLiveSnapshot: snapshot => restoreLiveTurnSnapshot(snapshot),
   onAuthoritativeIdle: () => {
     if (pendingQueueOwnerContext.value?.sessionKey !== sessionKey.value) {
       activeRunModeLock.value = null
@@ -1508,6 +1511,7 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   loadCurrentSessionUsage,
 })
 bindActiveStreamTask = rpcEventHandlers.bindActiveStreamTask
+restoreLiveTurnSnapshot = rpcEventHandlers.restoreLiveTurnSnapshot
 const {
   streamThinkingText,
   streamThinkingElapsedText,

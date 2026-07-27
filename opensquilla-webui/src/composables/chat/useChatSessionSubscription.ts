@@ -5,6 +5,7 @@ import type {
 } from '@/types/chat'
 import type {
   SessionProjectWorkspaceSnapshot,
+  SessionMessagesSnapshotResponse,
   SessionMessagesSubscribeParams,
   SessionMessagesSubscribeResponse,
 } from '@/types/rpc'
@@ -28,6 +29,7 @@ export interface UseChatSessionSubscriptionOptions {
   loadHistory: () => void | Promise<void>
   resetStreamIdleTimer: () => void
   resetStreamLiveTurnState: () => void
+  onLiveSnapshot?: (snapshot: SessionMessagesSnapshotResponse) => void
   onAuthoritativeIdle?: () => void
   onRunModeLock?: (
     lock: NonNullable<SessionMessagesSubscribeResponse['run_mode_lock']>,
@@ -97,7 +99,31 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       if (attempt !== subscriptionAttempt || key !== options.sessionKey.value) {
         return UNAVAILABLE_SUBSCRIPTION
       }
-      const params: SessionMessagesSubscribeParams = { key, since_stream_seq: sinceStreamSeq }
+      let subscribeFrom = sinceStreamSeq
+      if (options.onLiveSnapshot) {
+        try {
+          const snapshot = await options.rpc.call<SessionMessagesSnapshotResponse>(
+            'sessions.messages.snapshot',
+            { key },
+          )
+          if (attempt !== subscriptionAttempt || key !== options.sessionKey.value) {
+            return UNAVAILABLE_SUBSCRIPTION
+          }
+          if (
+            snapshot?.key === key
+            && Array.isArray(snapshot.events)
+            && typeof snapshot.current_stream_seq === 'number'
+          ) {
+            options.onLiveSnapshot(snapshot)
+            subscribeFrom = Math.max(0, snapshot.current_stream_seq)
+            options.lastStreamSeq.value = subscribeFrom
+          }
+        } catch {
+          // Older gateways do not expose the snapshot RPC. Continue with the
+          // bounded replay protocol so mixed-version client updates still work.
+        }
+      }
+      const params: SessionMessagesSubscribeParams = { key, since_stream_seq: subscribeFrom }
       const res = await options.rpc.call<SessionMessagesSubscribeResponse>('sessions.messages.subscribe', params)
       if (attempt !== subscriptionAttempt || key !== options.sessionKey.value) {
         return UNAVAILABLE_SUBSCRIPTION

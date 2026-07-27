@@ -4979,6 +4979,26 @@ async def _handle_sessions_messages_subscribe(params: dict | None, ctx: RpcConte
     }
 
 
+@_d.method("sessions.messages.snapshot", scope="operator.read")
+async def _handle_sessions_messages_snapshot(params: dict | None, ctx: RpcContext) -> dict:
+    """Return a compact active-turn base before a client subscribes for deltas."""
+
+    key = _require_key(params)
+    snapshot = get_session_streams().live_snapshot(key)
+    return {
+        "key": key,
+        "task_id": snapshot.task_id,
+        "current_stream_seq": snapshot.current_stream_seq,
+        "events": [
+            {
+                "event": event.event_name,
+                "payload": dict(event.payload),
+            }
+            for event in snapshot.events
+        ],
+    }
+
+
 @_d.method("sessions.messages.unsubscribe", scope="operator.read")
 async def _handle_sessions_messages_unsubscribe(params: dict | None, ctx: RpcContext) -> None:
     key = _require_key(params)

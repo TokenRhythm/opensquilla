@@ -66,6 +66,51 @@ async def _wait_for_pending_network_approval() -> dict:
     raise AssertionError("network approval was not queued")
 
 
+@pytest.mark.asyncio
+async def test_cancelled_network_wait_expires_its_orphaned_approval(
+    tmp_path: Path,
+) -> None:
+    reset_approval_queue()
+    request = SandboxRequest(
+        argv=("exec_command", "curl", "https://cancelled.example"),
+        cwd=tmp_path,
+        action_kind="shell.exec",
+        policy=_proxy_policy(),
+        session_id="cancelled-network",
+        run_mode="standard",
+    )
+    context = RunContext(
+        run_mode=RunMode.STANDARD,
+        workspace=str(tmp_path),
+    )
+    service = NetworkApprovalService(
+        context=context,
+        request=request,
+        runtime=SimpleNamespace(workspace=tmp_path),
+    )
+
+    decision_task = asyncio.create_task(
+        service.decide(
+            NetworkPolicyRequest(
+                protocol=NetworkProtocol.HTTPS_CONNECT,
+                host="cancelled.example",
+                port=443,
+                method="CONNECT",
+            )
+        )
+    )
+    pending = await _wait_for_pending_network_approval()
+    decision_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await decision_task
+
+    entry = get_approval_queue().get(str(pending["id"]))
+    assert entry.resolved is True
+    assert entry.approved is False
+    assert entry.resolution == "expired"
+    assert get_approval_queue().list_pending("exec") == []
+
+
 async def test_proxy_runtime_approval_waits_and_forwards_after_allow(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
