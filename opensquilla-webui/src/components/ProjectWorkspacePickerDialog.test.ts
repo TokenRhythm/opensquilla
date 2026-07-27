@@ -201,6 +201,7 @@ describe('ProjectWorkspacePickerDialog', () => {
     expect(goAction.querySelector('svg')).toBeTruthy()
     expect(createAction.querySelector('svg')).toBeTruthy()
     expect(chooseAction.querySelector('svg')).toBeTruthy()
+    expect(createAction.closest('.project-picker__browser-toolbar')).toBeTruthy()
   })
 
   it('selects on click and browses only on double click', async () => {

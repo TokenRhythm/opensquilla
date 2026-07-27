@@ -66,69 +66,73 @@
             </button>
           </div>
           <p v-if="error" class="project-picker__error" role="alert">{{ error }}</p>
-          <div class="project-picker__create">
-            <button
-              v-if="!creatingDirectory"
-              type="button"
-              class="btn btn--ghost project-picker__action project-picker__create-trigger"
-              :disabled="webLoading"
-              @click="beginCreateDirectory"
+          <div class="project-picker__browser">
+            <div class="project-picker__browser-toolbar">
+              <div class="project-picker__create">
+                <button
+                  v-if="!creatingDirectory"
+                  type="button"
+                  class="btn btn--ghost project-picker__action project-picker__create-trigger"
+                  :disabled="webLoading"
+                  @click="beginCreateDirectory"
+                >
+                  <Icon name="plus" :size="14" />
+                  {{ t('workspaces.newDirectory') }}
+                </button>
+                <form
+                  v-else
+                  class="project-picker__create-form"
+                  @submit.prevent="createDirectory"
+                >
+                  <input
+                    ref="newDirectoryInputRef"
+                    v-model="newDirectoryName"
+                    type="text"
+                    :aria-label="t('workspaces.newDirectoryName')"
+                    :placeholder="t('workspaces.newDirectoryName')"
+                    autocomplete="off"
+                    @keydown.esc.prevent="cancelCreateDirectory"
+                  />
+                  <button
+                    type="submit"
+                    class="btn btn--primary"
+                    :disabled="creatingDirectoryBusy || !newDirectoryName.trim()"
+                  >
+                    {{ t('workspaces.createDirectory') }}
+                  </button>
+                  <button
+                    type="button"
+                    class="btn btn--ghost"
+                    :disabled="creatingDirectoryBusy"
+                    @click="cancelCreateDirectory"
+                  >
+                    {{ t('common.cancel') }}
+                  </button>
+                </form>
+              </div>
+            </div>
+            <div
+              class="project-picker__entries"
+              role="listbox"
+              :aria-busy="webLoading"
             >
-              <Icon name="plus" :size="14" />
-              {{ t('workspaces.newDirectory') }}
-            </button>
-            <form
-              v-else
-              class="project-picker__create-form"
-              @submit.prevent="createDirectory"
-            >
-              <input
-                ref="newDirectoryInputRef"
-                v-model="newDirectoryName"
-                type="text"
-                :aria-label="t('workspaces.newDirectoryName')"
-                :placeholder="t('workspaces.newDirectoryName')"
-                autocomplete="off"
-                @keydown.esc.prevent="cancelCreateDirectory"
-              />
               <button
-                type="submit"
-                class="btn btn--primary"
-                :disabled="creatingDirectoryBusy || !newDirectoryName.trim()"
-              >
-                {{ t('workspaces.createDirectory') }}
-              </button>
-              <button
+                v-for="entry in directories"
+                :key="entry.path"
                 type="button"
-                class="btn btn--ghost"
-                :disabled="creatingDirectoryBusy"
-                @click="cancelCreateDirectory"
+                role="option"
+                :aria-selected="selectedDirectory === entry.path"
+                class="project-picker__entry"
+                :class="{ 'is-selected': selectedDirectory === entry.path }"
+                @click="selectDirectory(entry.path)"
+                @dblclick="browse(entry.path)"
+                @keydown.enter.prevent.stop="browse(entry.path)"
+                @keydown.space.prevent.stop="selectDirectory(entry.path)"
               >
-                {{ t('common.cancel') }}
+                <Icon name="folder" :size="15" />
+                <span>{{ entry.name }}</span>
               </button>
-            </form>
-          </div>
-          <div
-            class="project-picker__entries"
-            role="listbox"
-            :aria-busy="webLoading"
-          >
-            <button
-              v-for="entry in directories"
-              :key="entry.path"
-              type="button"
-              role="option"
-              :aria-selected="selectedDirectory === entry.path"
-              class="project-picker__entry"
-              :class="{ 'is-selected': selectedDirectory === entry.path }"
-              @click="selectDirectory(entry.path)"
-              @dblclick="browse(entry.path)"
-              @keydown.enter.prevent.stop="browse(entry.path)"
-              @keydown.space.prevent.stop="selectDirectory(entry.path)"
-            >
-              <Icon name="folder" :size="15" />
-              <span>{{ entry.name }}</span>
-            </button>
+            </div>
           </div>
           <footer class="project-picker__footer">
             <button class="btn btn--ghost" @click="closeDialog">
@@ -454,27 +458,43 @@ useDialogA11y(
 .project-picker__choose :deep(svg) {
   flex: 0 0 auto;
 }
+.project-picker__browser {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  background: var(--bg-surface);
+}
+.project-picker__browser-toolbar {
+  min-height: 43px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 5px var(--sp-2);
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 76%, transparent);
+  background: color-mix(in srgb, var(--bg-elevated) 60%, var(--bg-surface));
+}
 .project-picker__entries {
   min-height: 180px;
   overflow: auto;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
   padding: var(--sp-1);
 }
 .project-picker__create {
-  min-height: 34px;
+  width: 100%;
+  min-height: 32px;
   display: flex;
   align-items: center;
+  justify-content: flex-end;
 }
 .project-picker__create-trigger {
   gap: var(--sp-1);
-  color: var(--accent);
   font-weight: 600;
 }
-.project-picker__create-trigger.btn--ghost {
-  border-color: color-mix(in srgb, var(--accent) 28%, var(--border));
-  background: color-mix(in srgb, var(--accent) 7%, var(--bg-surface));
-  color: var(--accent);
+.project-picker__create-trigger.project-picker__action {
+  min-height: 32px;
+  padding: 4px 9px;
+  background: var(--bg-surface);
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
 }
 .project-picker__create-form {
   width: 100%;
