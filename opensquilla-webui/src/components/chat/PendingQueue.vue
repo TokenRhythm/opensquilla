@@ -8,28 +8,42 @@
       v-for="(item, index) in items"
       :key="index"
       class="chat-pending-card"
+      :aria-busy="isSteering(item) ? 'true' : undefined"
+      :aria-describedby="attachmentBlockMessage(item) ? attachmentStatusId(index) : undefined"
     >
       <p class="chat-pending-text" :title="displayText(item)">
         {{ displayText(item) }}
       </p>
       <span v-if="item.attachments?.length" class="chat-pending-attachments">
         {{ item.attachments.length }} · 📎
+        <span
+          v-if="attachmentBlockMessage(item)"
+          :id="attachmentStatusId(index)"
+          class="chat-pending-attachment-status"
+          :title="attachmentBlockMessage(item)"
+        >
+          {{ t('chat.pending.attachmentNeedsAttention') }}:
+          {{ attachmentBlockMessage(item) }}
+        </span>
       </span>
       <div v-if="!item.hiddenControl" class="chat-pending-actions">
         <button
           type="button"
           class="chat-pending-action chat-pending-action--steer"
-          :title="t('chat.pending.steerHint')"
+          :title="steerTitle(item)"
+          :disabled="isSteerDisabled(item)"
+          :aria-describedby="attachmentBlockMessage(item) ? attachmentStatusId(index) : undefined"
           @click="emit('steer', index)"
         >
           <span aria-hidden="true">↪</span>
-          <span>{{ t('chat.steerMode') }}</span>
+          <span>{{ item.deliveryState === 'retryable' ? t('chat.retry') : t('chat.steerMode') }}</span>
         </button>
         <button
           type="button"
           class="chat-pending-action chat-pending-action--icon"
           :aria-label="t('chat.pending.removeMessage', { index: index + 1 })"
           :title="t('chat.remove')"
+          :disabled="isSteering(item)"
           @click="emit('remove', index)"
         >
           <Icon name="trash" :size="14" />
@@ -42,18 +56,24 @@
             :aria-label="t('chrome.more')"
             :title="t('chrome.more')"
             aria-haspopup="menu"
-            :aria-expanded="openMenuIndex === index ? 'true' : 'false'"
+            :aria-expanded="openMenuIndex === index && !isSteering(item) ? 'true' : 'false'"
+            :disabled="isSteering(item)"
             @click.stop="toggleMenu(index)"
           >
             <Icon name="moreHorizontal" :size="16" />
           </button>
           <div
-            v-if="openMenuIndex === index"
+            v-if="openMenuIndex === index && !isSteering(item)"
             class="chat-pending-menu"
             role="menu"
             :aria-label="t('chrome.more')"
           >
-            <button type="button" role="menuitem" @click="chooseEdit(index)">
+            <button
+              type="button"
+              role="menuitem"
+              :disabled="!!item.deliveryState"
+              @click="chooseEdit(index)"
+            >
               <Icon name="pencil" :size="15" />
               <span>{{ t('chat.pending.editMessage') }}</span>
             </button>
@@ -74,6 +94,10 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import type { Attachment } from '@/types/chat'
+import {
+  hasSendableModelInputImageAttachment,
+  isSendableAttachment,
+} from '@/utils/chat/attachments'
 
 const { t } = useI18n()
 
@@ -82,11 +106,13 @@ interface PendingQueueItem {
   displayTextOverride?: string
   hiddenControl?: boolean
   attachments?: Attachment[]
+  deliveryState?: 'steering' | 'retryable'
 }
 
-defineProps<{
+const props = defineProps<{
   items: PendingQueueItem[]
   maxPending: number
+  imageBlockedMessage?: string
 }>()
 
 const emit = defineEmits<{
@@ -102,12 +128,55 @@ function displayText(item: PendingQueueItem): string {
   return item.displayTextOverride || item.text
 }
 
+function isSteering(item: PendingQueueItem): boolean {
+  return item.deliveryState === 'steering'
+}
+
+function hasUnsendableAttachment(item: PendingQueueItem): boolean {
+  return item.attachments?.some(attachment => !isSendableAttachment(attachment)) === true
+}
+
+function attachmentBlockMessage(item: PendingQueueItem): string {
+  if (hasUnsendableAttachment(item)) {
+    return t('chat.pending.fixAttachmentBeforeSteer')
+  }
+  if (
+    props.imageBlockedMessage
+    && hasSendableModelInputImageAttachment(item.attachments || [])
+  ) {
+    return props.imageBlockedMessage
+  }
+  return ''
+}
+
+function isSteerDisabled(item: PendingQueueItem): boolean {
+  if (attachmentBlockMessage(item)) return true
+  return props.items.some(
+    candidate => candidate !== item && Boolean(candidate.deliveryState),
+  ) || isSteering(item)
+}
+
+function steerTitle(item: PendingQueueItem): string {
+  return attachmentBlockMessage(item)
+    || (
+      item.deliveryState === 'retryable'
+        ? t('chat.retry')
+        : t('chat.pending.steerHint')
+    )
+}
+
+function attachmentStatusId(index: number): string {
+  return `chat-pending-attachment-status-${index}`
+}
+
 function toggleMenu(index: number) {
+  if (props.items[index]?.deliveryState === 'steering') return
   openMenuIndex.value = openMenuIndex.value === index ? null : index
 }
 
 function chooseEdit(index: number) {
   openMenuIndex.value = null
+  if (props.items[index]?.deliveryState) return
   emit('edit', index)
 }
 
@@ -168,10 +237,19 @@ useDocumentEvent('keydown', (event) => {
 }
 
 .chat-pending-attachments {
+  min-width: 0;
+  max-width: min(45%, 360px);
   flex: 0 0 auto;
   margin-top: 1px;
   color: var(--text-muted);
   font-size: var(--fs-xs);
+}
+
+.chat-pending-attachment-status {
+  display: block;
+  margin-top: 2px;
+  line-height: 1.35;
+  white-space: normal;
 }
 
 .chat-pending-actions {
@@ -216,6 +294,11 @@ useDocumentEvent('keydown', (event) => {
   outline: 0;
   background: color-mix(in srgb, var(--text) 6%, transparent);
   color: var(--text);
+}
+
+.chat-pending-action:disabled {
+  cursor: default;
+  opacity: 0.55;
 }
 
 .chat-pending-action:focus-visible {
@@ -263,6 +346,11 @@ useDocumentEvent('keydown', (event) => {
 .chat-pending-menu button:focus-visible {
   outline: 0;
   background: var(--bg-hover);
+}
+
+.chat-pending-menu button:disabled {
+  cursor: default;
+  opacity: 0.5;
 }
 
 @media (max-width: 640px) {

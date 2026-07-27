@@ -3019,6 +3019,8 @@
       "queueHint": "Warteschlangenmodus: Diese Nachrichten werden der Reihe nach automatisch gesendet, wenn die aktuelle Antwort abgeschlossen ist",
       "clearAll": "Alle löschen",
       "editMessage": "Nachricht bearbeiten",
+      "attachmentNeedsAttention": "Anhang prüfen",
+      "fixAttachmentBeforeSteer": "Bearbeite diese Nachricht und wiederhole den Anhang oder entferne ihn, bevor du steuerst",
       "clearQueue": "Warteschlange leeren",
       "removeMessage": "Ausstehende Nachricht {index} entfernen"
     },

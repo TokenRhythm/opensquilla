@@ -3019,6 +3019,8 @@
       "queueHint": "Modo cola: estos mensajes se envían automáticamente en orden cuando termina la respuesta actual",
       "clearAll": "Borrar todo",
       "editMessage": "Editar mensaje",
+      "attachmentNeedsAttention": "Revisar adjunto",
+      "fixAttachmentBeforeSteer": "Edita este mensaje y vuelve a intentar o elimina el adjunto fallido antes de redirigir",
       "clearQueue": "Vaciar cola",
       "removeMessage": "Quitar el mensaje pendiente {index}"
     },

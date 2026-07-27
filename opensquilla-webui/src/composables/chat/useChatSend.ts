@@ -2,7 +2,7 @@ import type { Ref } from 'vue'
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
 import type { RpcClientError } from '@/lib/rpc'
-import type { Attachment, ChatMessage } from '@/types/chat'
+import type { Attachment, ChatMessage, ChatPendingItem } from '@/types/chat'
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { SandboxRunMode } from '@/types/sandbox'
 import { normalizeSandboxRunMode } from '@/types/sandbox'
@@ -48,6 +48,23 @@ interface SendAttempt {
   intent: string | null
   forkBeforeMessageId: string | null
   params: ChatSendParams
+}
+
+export type ChatSendOutcome = 'accepted' | 'deferred' | 'not_sent' | 'retryable_failure'
+
+interface ExplicitSendPayload {
+  attachments: Attachment[]
+  intent: string | null
+  forkBeforeMessageId: string | null
+}
+
+interface DispatchSendOptions {
+  composerText?: string
+  queueMode?: 'steer'
+  payload?: ExplicitSendPayload
+  preserveComposer?: boolean
+  retryAttempt?: SendAttempt | null
+  rememberRetryableAttempt?: (attempt: SendAttempt) => void
 }
 
 interface ResponseHandoffGate {
@@ -231,7 +248,10 @@ export interface UseChatSendOptions {
   bindActiveStreamTask?: (taskId: string) => void
   isCompactInFlightForCurrentSession: () => boolean
   hasPendingAttachmentWork: () => boolean
-  prepareAttachmentsForSend?: (options?: { isCurrent?: () => boolean }) => Promise<boolean>
+  prepareAttachmentsForSend?: (options?: {
+    isCurrent?: () => boolean
+    attachments?: Attachment[]
+  }) => Promise<boolean>
   enqueuePendingInput: (text: string, owner?: PendingQueueOwner) => boolean
   enqueueHiddenControl?: (
     item: { text: string; displayText: string },
@@ -249,6 +269,7 @@ export function useChatSend(options: UseChatSendOptions) {
   let activeFreshSendToken: FreshSendToken | null = null
   let activeResponseHandoff: ResponseHandoffGate | null = null
   let recoveredAttempt: SendAttempt | null = null
+  const recoveredQueuedAttempts = new WeakMap<ChatPendingItem, SendAttempt>()
 
   function modelImageSendBlocked(attachments: readonly Attachment[]): boolean {
     if (!hasSendableModelInputImageAttachment(attachments)) return false
@@ -576,25 +597,114 @@ export function useChatSend(options: UseChatSendOptions) {
     await dispatchSend(text, { composerText: options.inputText.value })
   }
 
+  /**
+   * Send one queued item without staging it in the visible composer.
+   *
+   * The queued snapshot owns its attachment refresh and retry identity. This
+   * lets an operator keep typing while the steer RPC is in flight, and a lost
+   * response can be retried with the same idempotency key without replacing
+   * that unrelated draft.
+   */
+  async function sendQueuedItem(
+    item: ChatPendingItem,
+    delivery: 'followup' | 'steer',
+  ): Promise<ChatSendOutcome> {
+    const text = item.text.trim()
+    const retryAttempt = recoveredQueuedAttempts.get(item) ?? null
+    const preserveRetryState = (outcome: ChatSendOutcome): ChatSendOutcome => (
+      retryAttempt && (outcome === 'deferred' || outcome === 'not_sent')
+        ? 'retryable_failure'
+        : outcome
+    )
+    if (options.hasPendingAttachmentWork()) {
+      if (delivery === 'steer') {
+        pushToast(i18n.global.t('chat.toast.waitAttachments'), { tone: 'info' })
+      }
+      return preserveRetryState(delivery === 'followup' ? 'deferred' : 'not_sent')
+    }
+    if (item.attachments.some(attachment => !isSendableAttachment(attachment))) {
+      return preserveRetryState('not_sent')
+    }
+    if (hasSendableModelInputImageAttachment(item.attachments)) {
+      if (options.modelRoutingSettingsBusy.value) {
+        return preserveRetryState(delivery === 'followup' ? 'deferred' : 'not_sent')
+      }
+      if (options.modelRoutingMode.value === 'llm_ensemble') {
+        return preserveRetryState('not_sent')
+      }
+    }
+    if (
+      options.isCompactInFlightForCurrentSession()
+      || responseHandoffBlocksCurrentSession()
+      || (delivery === 'followup' && options.stream.isStreaming.value)
+    ) {
+      return preserveRetryState(delivery === 'followup' ? 'deferred' : 'not_sent')
+    }
+
+    const queueMode = retryAttempt
+      ? retryAttempt.queueMode
+      : (
+          delivery === 'steer' && options.stream.isStreaming.value
+            ? 'steer'
+            : undefined
+        )
+    const outcome = await dispatchSend(text, {
+      composerText: item.text,
+      ...(queueMode ? { queueMode } : {}),
+      payload: {
+        attachments: item.attachments,
+        intent: item.intent,
+        // A queued follow-up has no fork target. In particular, never inherit
+        // the fork target of the unrelated draft currently in the composer.
+        forkBeforeMessageId: null,
+      },
+      preserveComposer: true,
+      retryAttempt,
+      rememberRetryableAttempt: attempt => {
+        recoveredQueuedAttempts.set(item, attempt)
+      },
+    })
+    if (outcome === 'accepted') {
+      recoveredQueuedAttempts.delete(item)
+    }
+    return preserveRetryState(outcome)
+  }
+
+  function sendQueuedSteer(item: ChatPendingItem): Promise<ChatSendOutcome> {
+    return sendQueuedItem(item, 'steer')
+  }
+
+  function sendQueuedFollowup(item: ChatPendingItem): Promise<ChatSendOutcome> {
+    return sendQueuedItem(item, 'followup')
+  }
+
   async function dispatchSend(
     text: string,
-    sendOpts?: { composerText?: string; queueMode?: 'steer' },
-  ) {
+    sendOpts: DispatchSendOptions = {},
+  ): Promise<ChatSendOutcome> {
     const requestSessionKey = options.sessionKey.value
-    if (!requestSessionKey) return
-    const initialSendableAttachments = options.pendingAttachments.value.filter(isSendableAttachment)
+    if (!requestSessionKey) return 'not_sent'
+    const preserveComposer = sendOpts.preserveComposer === true
+    const sourceAttachments = sendOpts.payload?.attachments ?? options.pendingAttachments.value
+    const intent = sendOpts.payload
+      ? sendOpts.payload.intent
+      : options.pendingSessionIntent.value
+    const forkBeforeMessageId = sendOpts.payload
+      ? sendOpts.payload.forkBeforeMessageId
+      : options.pendingForkBeforeMessageId.value
+    const initialSendableAttachments = sourceAttachments.filter(isSendableAttachment)
     // This is deliberately before optimistic rendering, composer clearing,
     // stream state, and chat.send. A blocked draft remains exactly editable.
-    if (modelImageSendBlocked(initialSendableAttachments)) return
-    const retryCandidate = recoveredAttempt
+    if (modelImageSendBlocked(initialSendableAttachments)) return 'not_sent'
+    const retryCandidate = sendOpts.retryAttempt ?? (preserveComposer ? null : recoveredAttempt)
     const isRecoveredRetry = Boolean(
       retryCandidate &&
       matchesRecoveredDraft(retryCandidate, {
         requestSessionKey,
         text,
         attachments: initialSendableAttachments,
-        intent: options.pendingSessionIntent.value,
-        forkBeforeMessageId: options.pendingForkBeforeMessageId.value,
+        intent,
+        forkBeforeMessageId,
       }) &&
       retryCandidate.queueMode === sendOpts?.queueMode,
     )
@@ -608,27 +718,40 @@ export function useChatSend(options: UseChatSendOptions) {
     if (!retryAttempt && options.prepareAttachmentsForSend) {
       const ready = await options.prepareAttachmentsForSend({
         isCurrent: () => options.sessionKey.value === requestSessionKey,
+        ...(sendOpts.payload ? { attachments: sourceAttachments } : {}),
       })
-      if (!ready) return
-      if (options.sessionKey.value !== requestSessionKey) return
+      if (!ready) return 'not_sent'
+      if (options.sessionKey.value !== requestSessionKey) return 'not_sent'
     }
-    const attachmentsToSend = retryAttempt?.attachments || options.pendingAttachments.value.filter((a): a is SendableAttachment => sendAttachmentIds.has(a.local_id) && isSendableAttachment(a))
+    const currentSourceAttachments = sendOpts.payload?.attachments
+      ?? options.pendingAttachments.value
+    if (
+      preserveComposer
+      && sendOpts.payload
+      && currentSourceAttachments.some(attachment => !isSendableAttachment(attachment))
+    ) {
+      return 'not_sent'
+    }
+    const attachmentsToSend = retryAttempt?.attachments || currentSourceAttachments.filter(
+      (attachment): attachment is SendableAttachment =>
+        sendAttachmentIds.has(attachment.local_id) && isSendableAttachment(attachment),
+    )
     // Routing can change while an expiring staged upload is refreshed. Recheck
     // the authoritative live state before any visible or RPC mutation.
-    if (modelImageSendBlocked(attachmentsToSend)) return
-    const attachmentsToKeep = options.pendingAttachments.value.filter(a => !sendAttachmentIds.has(a.local_id) || !isSendableAttachment(a))
-    if (!text && attachmentsToSend.length === 0) return
+    if (modelImageSendBlocked(attachmentsToSend)) return 'not_sent'
+    const attachmentsToKeep = currentSourceAttachments.filter(
+      attachment => !sendAttachmentIds.has(attachment.local_id) || !isSendableAttachment(attachment),
+    )
+    if (!text && attachmentsToSend.length === 0) return 'not_sent'
 
     options.aborted.value = false
-    options.closeSlashMenu()
+    if (!preserveComposer) options.closeSlashMenu()
     recordSessionNavigationDiag('send.start', {
       requestSession: requestSessionKey,
       current: requestSessionKey,
     })
 
     const userText = text
-    const intent = options.pendingSessionIntent.value
-    const forkBeforeMessageId = options.pendingForkBeforeMessageId.value
     let attempt = retryAttempt
     if (!attempt) {
       const clientMessageId = createClientMessageId()
@@ -670,14 +793,15 @@ export function useChatSend(options: UseChatSendOptions) {
       options.autoScroll.value = true
       options.scrollToBottom()
     }
-    recoveredAttempt = null
-
-    options.inputText.value = ''
-    options.autoResizeTextarea()
-    options.pendingAttachments.value = attachmentsToKeep
-    if (options.pendingSessionIntent.value === intent) options.pendingSessionIntent.value = null
-    if (options.pendingForkBeforeMessageId.value === forkBeforeMessageId) {
-      options.pendingForkBeforeMessageId.value = null
+    if (!preserveComposer) {
+      recoveredAttempt = null
+      options.inputText.value = ''
+      options.autoResizeTextarea()
+      options.pendingAttachments.value = attachmentsToKeep
+      if (options.pendingSessionIntent.value === intent) options.pendingSessionIntent.value = null
+      if (options.pendingForkBeforeMessageId.value === forkBeforeMessageId) {
+        options.pendingForkBeforeMessageId.value = null
+      }
     }
 
     // A steer send rides an already-active stream; restarting it would wipe
@@ -730,7 +854,7 @@ export function useChatSend(options: UseChatSendOptions) {
           responseHandoff.terminalResponse = Boolean(terminalStatus)
           await handoffResponseSession(acceptedSessionKey, responseHandoff)
         }
-        return
+        return 'accepted'
       }
       if ((res?.sessionKey || requestSessionKey) === requestSessionKey) {
         bindAcceptedUserMessage(attempt.clientMessageId, res)
@@ -782,9 +906,18 @@ export function useChatSend(options: UseChatSendOptions) {
         // may have no future live event. Fresh turns close their spinner;
         // steer responses only surface the result without ending the older run.
       }
+      return 'accepted'
     } catch (err: unknown) {
       const acceptedError = acceptedErrorInfo(err)
       const acceptedSessionKey = acceptedError?.sessionKey || requestSessionKey
+      const rememberRetryableAttempt = (restoreComposer: boolean) => {
+        if (!shouldRestoreSendAttempt(err)) return
+        if (preserveComposer) {
+          sendOpts.rememberRetryableAttempt?.(attempt)
+        } else if (restoreComposer) {
+          restoreSendAttempt(attempt)
+        }
+      }
       const stoppedByUser = freshSendToken?.stoppedByUser === true
         || responseHandoff?.stoppedByUser === true
       if (
@@ -824,22 +957,24 @@ export function useChatSend(options: UseChatSendOptions) {
           errorCode: errorCode(err),
           ts: new Date().toISOString(),
         })
-        return
+        return 'accepted'
       }
       if (acceptedError && options.sessionKey.value === requestSessionKey) {
         bindUserMessageId(attempt.clientMessageId, acceptedError.messageId)
         options.scheduleHistorySync()
       }
       if (options.sessionKey.value !== requestSessionKey) {
+        rememberRetryableAttempt(false)
         recordSessionNavigationDiag('send.error.stale', {
           requestSession: requestSessionKey,
           current: options.sessionKey.value,
           reason: errorMessage(err),
         })
-        return
+        return acceptedError ? 'accepted' : 'retryable_failure'
       }
       if (!wasStreaming && !freshSendStillOwnsStream(freshSendToken, requestSessionKey)) {
-        return
+        rememberRetryableAttempt(false)
+        return acceptedError ? 'accepted' : 'retryable_failure'
       }
       if (!wasStreaming) {
         if (activeFreshSendToken === freshSendToken) {
@@ -849,13 +984,14 @@ export function useChatSend(options: UseChatSendOptions) {
         options.activeStreamSessionKey.value = ''
         options.stream.endStreaming()
       }
-      if (shouldRestoreSendAttempt(err)) restoreSendAttempt(attempt)
+      rememberRetryableAttempt(true)
       options.messages.value.push({
         role: 'error',
         text: sendFailureMessage(err),
         errorCode: errorCode(err),
         ts: new Date().toISOString(),
       })
+      return acceptedError ? 'accepted' : 'retryable_failure'
     } finally {
       finishResponseHandoff(responseHandoff)
     }
@@ -1140,6 +1276,8 @@ export function useChatSend(options: UseChatSendOptions) {
   return {
     onSend,
     onStop,
+    sendQueuedSteer,
+    sendQueuedFollowup,
     dispatchHiddenSend,
     sendHiddenMetaPreflightConfirmation,
   }

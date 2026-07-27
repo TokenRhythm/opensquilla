@@ -86,7 +86,7 @@
               :key="landingAgentId"
               :agent-id="landingAgentId"
               :meta-skills="metaSkillChoices"
-              :suppressed="landingPrefilled"
+              :suppressed="landingSuggestionsSuppressed"
               @pick="applyLandingSuggestion"
             />
           </div>
@@ -420,6 +420,7 @@
     <PendingQueue
       :items="pendingQueue"
       :max-pending="maxPending"
+      :image-blocked-message="queuedImageSendBlockedMessage"
       @clear="clearPendingQueue"
       @edit="editPendingMessage"
       @remove="removePendingChip"
@@ -575,7 +576,7 @@ import { useChatRouterDecisionRuntime } from '@/composables/chat/useChatRouterDe
 import { useChatAnswerReveal } from '@/composables/chat/useChatAnswerReveal'
 import { useChatRpcEventHandlers } from '@/composables/chat/useChatRpcEventHandlers'
 import { useChatRpcSubscriptions } from '@/composables/chat/useChatRpcSubscriptions'
-import { useChatSend } from '@/composables/chat/useChatSend'
+import { useChatSend, type ChatSendOutcome } from '@/composables/chat/useChatSend'
 import { useSandboxSetupRecovery } from '@/composables/chat/useSandboxSetupRecovery'
 import { useChatStallWatchdog } from '@/composables/chat/useChatStallWatchdog'
 import { useMetaRuns } from '@/composables/chat/useMetaRuns'
@@ -594,6 +595,7 @@ import { hasOpenDialogLayer } from '@/composables/useDialogA11y'
 import { useToasts } from '@/composables/useToasts'
 import type {
   ChatMessage,
+  ChatPendingItem,
   ChatRenderedMessage,
   ChatRunStatus,
   ChatRunStatusSource,
@@ -635,6 +637,7 @@ import {
 } from '@/utils/chat/attachments'
 import { isShareableChatMessage } from '@/utils/chat/messageIdentity'
 import { agentIdFromSessionKey } from '@/utils/chat/sessionKeys'
+import { shouldSuppressLandingSuggestions } from '@/utils/chat/landingSuggestions'
 import { clearAssistantActivityExpansionState } from '@/utils/chat/activityDisclosureState'
 import {
   resolveChatSessionLoadState,
@@ -853,6 +856,7 @@ const {
 const chatAttachments = useChatAttachments()
 const {
   pendingAttachments,
+  attachmentWorkBusy,
   onFileInputChange,
   addAttachments,
   removeAttachment,
@@ -866,7 +870,9 @@ let sendCurrentInput: () => void = () => {}
 // slash handler (useChatSlashCommands, created earlier) needs it at call time.
 let dispatchHiddenForMeta: (providerText: string, displayText: string) => void = () => {}
 let isCompactInFlightForCurrentSession: () => boolean = () => false
+let isQueuedDeliveryBlocked: () => boolean = () => false
 let dispatchHiddenControl: (providerText: string, displayText: string) => void = () => {}
+let dispatchQueuedItem: (item: ChatPendingItem) => Promise<ChatSendOutcome> = async () => 'not_sent'
 const pendingQueueOwnerContext = ref<PendingQueueOwnerContext | null>(null)
 const chatPendingQueue = useChatPendingQueue({
   sessionKey,
@@ -877,6 +883,8 @@ const chatPendingQueue = useChatPendingQueue({
   isStreaming,
   isBlocked: () => (
     isCompactInFlightForCurrentSession()
+    || isQueuedDeliveryBlocked()
+    || hasPendingAttachmentWork()
     || pendingQueueOwnerContext.value?.sessionKey === sessionKey.value
   ),
   autoResizeTextarea,
@@ -884,6 +892,7 @@ const chatPendingQueue = useChatPendingQueue({
   resetInputHistory: () => resetComposerInputHistory(),
   hasComposer: () => Boolean(composerRef.value),
   dispatchHiddenControl: (providerText, displayText) => dispatchHiddenControl(providerText, displayText),
+  dispatchPendingItem: item => dispatchQueuedItem(item),
 })
 const {
   pendingQueue,
@@ -893,6 +902,8 @@ const {
   enqueuePendingInput,
   enqueueHiddenControl,
   removePendingChip,
+  beginPendingDelivery,
+  settlePendingDelivery,
   clearPendingQueue,
   switchPendingQueue,
   adoptPendingQueue,
@@ -902,6 +913,9 @@ const {
   flushDeferredPendingDrain,
   cleanup: cleanupPendingQueue,
 } = chatPendingQueue
+watch(attachmentWorkBusy, (busy) => {
+  if (!busy) flushDeferredPendingDrain()
+})
 
 const chatCompaction = useChatCompaction({
   sessionKey,
@@ -960,6 +974,22 @@ const {
   setRouterVisualEffectsEnabled,
   bindFeatureRefresh,
 } = chatFeatureToggles
+isQueuedDeliveryBlocked = () => (
+  modelRoutingSettingsBusy.value
+  && hasSendableModelInputImageAttachment(pendingQueue.value[0]?.attachments || [])
+)
+watch(
+  [modelRoutingMode, modelRoutingSettingsBusy],
+  ([mode, busy], [previousMode, wasBusy]) => {
+    const routingUnblocked = (
+      (previousMode === 'llm_ensemble' && mode !== 'llm_ensemble')
+      || (wasBusy && !busy)
+    )
+    if (!routingUnblocked || pendingQueue.value.length === 0) return
+    schedulePendingDrainAfterTerminal()
+    flushDeferredPendingDrain()
+  },
+)
 
 const chatRouterDecisionRuntime = useChatRouterDecisionRuntime({
   messages,
@@ -1321,14 +1351,22 @@ const chatSend = useChatSend({
   autoResizeTextarea,
   scrollToBottom,
 })
-const { onSend, onStop, dispatchHiddenSend, sendHiddenMetaPreflightConfirmation } = chatSend
+const {
+  onSend,
+  onStop,
+  sendQueuedSteer,
+  sendQueuedFollowup,
+  dispatchHiddenSend,
+  sendHiddenMetaPreflightConfirmation,
+} = chatSend
 sendCurrentInput = onSend
 dispatchHiddenForMeta = dispatchHiddenSend
 dispatchHiddenControl = dispatchHiddenSend
+dispatchQueuedItem = sendQueuedFollowup
 
 function takeVisiblePendingItem(index: number) {
   const item = pendingQueue.value[index]
-  if (!item || item.hiddenControl) return null
+  if (!item || item.hiddenControl || item.deliveryState) return null
   pendingQueue.value.splice(index, 1)
   return item
 }
@@ -1344,32 +1382,14 @@ function editPendingMessage(index: number) {
 }
 
 async function steerPendingMessage(index: number) {
-  const item = takeVisiblePendingItem(index)
+  const item = beginPendingDelivery(index)
   if (!item) return
 
-  const draft = {
-    text: inputText.value,
-    attachments: [...pendingAttachments.value],
-    intent: pendingSessionIntent.value,
-  }
-  inputText.value = item.text
-  pendingAttachments.value = item.attachments || []
-  pendingSessionIntent.value = item.intent || null
-  busySendMode.value = 'steer'
-  autoResizeTextarea()
-
-  await nextTick()
+  let outcome: ChatSendOutcome = 'retryable_failure'
   try {
-    await onSend()
+    outcome = await sendQueuedSteer(item)
   } finally {
-    busySendMode.value = 'queue'
-    const composerIsEmpty = !inputText.value.trim() && pendingAttachments.value.length === 0
-    if (composerIsEmpty && (draft.text.trim() || draft.attachments.length > 0)) {
-      inputText.value = draft.text
-      pendingAttachments.value = draft.attachments
-      pendingSessionIntent.value = draft.intent
-      autoResizeTextarea()
-    }
+    settlePendingDelivery(item, outcome)
   }
 }
 
@@ -1730,13 +1750,24 @@ const hasSendContent = computed(() => {
   return inputText.value.trim().length > 0 || pendingAttachments.value.some(isSendableAttachment)
 })
 
-const modelImageSendBlockedMessage = computed(() => {
-  if (!hasSendableModelInputImageAttachment(pendingAttachments.value)) return ''
+const landingSuggestionsSuppressed = computed(() => shouldSuppressLandingSuggestions({
+  landingPrefilled: landingPrefilled.value,
+  composerText: inputText.value,
+  attachmentCount: pendingAttachments.value.length,
+}))
+
+const queuedImageSendBlockedMessage = computed(() => {
   if (modelRoutingSettingsBusy.value) {
     return t('chat.composer.routingUpdateImageBlocked')
   }
   return modelRoutingMode.value === 'llm_ensemble'
     ? t('chat.composer.ensembleImageUnsupported')
+    : ''
+})
+
+const modelImageSendBlockedMessage = computed(() => {
+  return hasSendableModelInputImageAttachment(pendingAttachments.value)
+    ? queuedImageSendBlockedMessage.value
     : ''
 })
 
@@ -1803,6 +1834,7 @@ async function setComposerCodingModeEnabled(enabled: boolean) {
 // composer-backed send path as every other message so routing, attachments,
 // optimistic state, and recovery behavior stay identical.
 function applyLandingSuggestion(text: string) {
+  if (landingSuggestionsSuppressed.value) return
   sendComposerText(text)
 }
 

@@ -3019,6 +3019,8 @@
       "queueHint": "Queue mode: these messages auto-send in order when the current response finishes",
       "clearAll": "Clear all",
       "editMessage": "Edit message",
+      "attachmentNeedsAttention": "Needs attention",
+      "fixAttachmentBeforeSteer": "Edit this message and retry or remove the failed attachment before steering",
       "clearQueue": "Clear queue",
       "removeMessage": "Remove pending message {index}"
     },

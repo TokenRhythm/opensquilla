@@ -4,7 +4,12 @@ import { nextTick, ref } from 'vue'
 import { useChatSend, type UseChatSendOptions } from './useChatSend'
 import { useChatMessageActions } from './useChatMessageActions'
 import type { FoldLiveTurnMode } from './useChatTurnLog'
-import type { Attachment, ChatMessage, ChatRenderedMessage } from '@/types/chat'
+import type {
+  Attachment,
+  ChatMessage,
+  ChatPendingItem,
+  ChatRenderedMessage,
+} from '@/types/chat'
 import {
   useChatPendingQueue,
   type BusySendMode,
@@ -574,6 +579,289 @@ describe('useChatSend attachment payloads', () => {
 
     expect(rpc.call.mock.calls[1]?.[1]).toEqual(firstParams)
     expect(options.messages.value.filter(message => message.role === 'user')).toHaveLength(1)
+  })
+
+  it('sends a queued steer without reading or mutating the live composer', async () => {
+    const draftAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 20,
+      name: 'draft.pdf',
+      mime: 'application/pdf',
+      file_uuid: 'file-draft',
+    }
+    const queuedAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 21,
+      name: 'queued.pdf',
+      mime: 'application/pdf',
+      file_uuid: 'file-queued',
+    }
+    const laterDraftAttachment: Attachment = {
+      kind: 'inline',
+      local_id: 22,
+      name: 'later.txt',
+      mime: 'text/plain',
+      data: 'bGF0ZXI=',
+    }
+    const inputText = ref('keep this draft')
+    const pendingAttachments = ref<Attachment[]>([draftAttachment])
+    const pendingSessionIntent = ref<string | null>('DRAFT')
+    const pendingForkBeforeMessageId = ref<string | null>('msg-draft-parent')
+    let resolveSend!: (value: unknown) => void
+    const rpc = {
+      call: vi.fn().mockImplementation(() => new Promise(resolve => {
+        resolveSend = resolve
+      })),
+    }
+    const { api, options, stream } = makeOptions({
+      rpc,
+      inputText,
+      pendingAttachments,
+      pendingSessionIntent,
+      pendingForkBeforeMessageId,
+    })
+    stream.isStreaming.value = true
+    const queued: ChatPendingItem = {
+      text: 'steer with the queued snapshot',
+      attachments: [queuedAttachment],
+      intent: 'QUEUED',
+    }
+
+    const send = api.sendQueuedSteer(queued)
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledOnce())
+
+    expect(inputText.value).toBe('keep this draft')
+    expect(pendingAttachments.value).toEqual([draftAttachment])
+    expect(pendingSessionIntent.value).toBe('DRAFT')
+    expect(pendingForkBeforeMessageId.value).toBe('msg-draft-parent')
+
+    // Edits made after dispatch belong to the live composer and must survive
+    // the queued RPC settling as well.
+    inputText.value = 'typed while steering'
+    pendingAttachments.value = [draftAttachment, laterDraftAttachment]
+    pendingSessionIntent.value = 'LATER'
+    pendingForkBeforeMessageId.value = 'msg-later-parent'
+    resolveSend({ sessionKey: 'agent:main:webchat:test', task_id: 'task-steer' })
+
+    await expect(send).resolves.toBe('accepted')
+    expect(inputText.value).toBe('typed while steering')
+    expect(pendingAttachments.value).toEqual([draftAttachment, laterDraftAttachment])
+    expect(pendingSessionIntent.value).toBe('LATER')
+    expect(pendingForkBeforeMessageId.value).toBe('msg-later-parent')
+    expect(options.closeSlashMenu).not.toHaveBeenCalled()
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      message: 'steer with the queued snapshot',
+      queueMode: 'steer',
+      intent: 'QUEUED',
+      attachments: [expect.objectContaining({ file_uuid: 'file-queued' })],
+    }))
+    expect(rpc.call.mock.calls[0]?.[1]).not.toHaveProperty('forkBeforeMessageId')
+    expect(options.messages.value.filter(message => message.role === 'user')).toHaveLength(1)
+  })
+
+  it('defers an automatic queued follow-up if another run became active', async () => {
+    const inputText = ref('new live draft')
+    const { api, rpc, stream } = makeOptions({ inputText })
+    const queued: ChatPendingItem = {
+      text: 'wait for the active run',
+      attachments: [],
+      intent: null,
+    }
+    stream.isStreaming.value = true
+
+    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('deferred')
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(inputText.value).toBe('new live draft')
+
+    stream.isStreaming.value = false
+    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('accepted')
+    expect(rpc.call.mock.calls[0]?.[1]).not.toHaveProperty('queueMode')
+    expect(inputText.value).toBe('new live draft')
+  })
+
+  it('does not start a queued delivery while the composer is refreshing attachments', async () => {
+    let resolvePreparation!: (ready: boolean) => void
+    let preparing = false
+    const prepareAttachmentsForSend = vi.fn(() => {
+      preparing = true
+      return new Promise<boolean>(resolve => {
+        resolvePreparation = resolve
+      })
+    })
+    const { api, rpc } = makeOptions({
+      prepareAttachmentsForSend,
+      hasPendingAttachmentWork: () => preparing,
+    })
+    const queued: ChatPendingItem = {
+      text: 'wait for composer preparation',
+      attachments: [],
+      intent: null,
+    }
+
+    const composerSend = api.onSend()
+    await vi.waitFor(() => expect(prepareAttachmentsForSend).toHaveBeenCalledOnce())
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('not_sent')
+    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('deferred')
+    expect(rpc.call).not.toHaveBeenCalled()
+
+    preparing = false
+    resolvePreparation(false)
+    await composerSend
+    expect(rpc.call).not.toHaveBeenCalled()
+  })
+
+  it('retries an ambiguous queued steer with the same request identity', async () => {
+    let compactInFlight = false
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(Object.assign(new Error('response lost'), {
+          accepted: false,
+          retryable: true,
+        }))
+        .mockResolvedValueOnce({
+          sessionKey: 'agent:main:webchat:test',
+          task_id: 'task-steer',
+        }),
+    }
+    const inputText = ref('unrelated draft')
+    const { api, options, stream } = makeOptions({
+      rpc,
+      inputText,
+      isCompactInFlightForCurrentSession: () => compactInFlight,
+    })
+    stream.isStreaming.value = true
+    const queued: ChatPendingItem = {
+      text: 'retry this queued steer',
+      attachments: [],
+      intent: null,
+    }
+
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('retryable_failure')
+    const firstParams = rpc.call.mock.calls[0]?.[1]
+    expect(firstParams).toMatchObject({
+      queueMode: 'steer',
+      clientRequestId: expect.any(String),
+      clientMessageId: expect.any(String),
+    })
+    expect(inputText.value).toBe('unrelated draft')
+
+    compactInFlight = true
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('retryable_failure')
+    expect(rpc.call).toHaveBeenCalledOnce()
+
+    // The active run may have ended while the response was lost. The retry
+    // still carries the original steer semantics and idempotency fingerprint.
+    compactInFlight = false
+    stream.isStreaming.value = false
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('accepted')
+
+    expect(rpc.call.mock.calls[1]?.[1]).toEqual(firstParams)
+    expect(options.messages.value.filter(message => message.role === 'user')).toHaveLength(1)
+    expect(inputText.value).toBe('unrelated draft')
+  })
+
+  it('keeps an idle queued-send retry in its original mode if a run starts later', async () => {
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(Object.assign(new Error('response lost'), {
+          accepted: false,
+          retryable: true,
+        }))
+        .mockResolvedValueOnce({
+          sessionKey: 'agent:main:webchat:test',
+          task_id: 'task-follow-up',
+        }),
+    }
+    const { api, options, stream } = makeOptions({ rpc })
+    const queued: ChatPendingItem = {
+      text: 'send after the prior turn',
+      attachments: [],
+      intent: null,
+    }
+
+    stream.isStreaming.value = false
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('retryable_failure')
+    const firstParams = rpc.call.mock.calls[0]?.[1]
+    expect(firstParams).not.toHaveProperty('queueMode')
+
+    stream.isStreaming.value = true
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('accepted')
+
+    expect(rpc.call.mock.calls[1]?.[1]).toEqual(firstParams)
+    expect(options.messages.value.filter(message => message.role === 'user')).toHaveLength(1)
+  })
+
+  it('does not consume a queued item that still contains an unsendable attachment', async () => {
+    const failed: Attachment = {
+      kind: 'failed',
+      local_id: 31,
+      name: 'failed.pdf',
+      mime: 'application/pdf',
+      error: 'upload failed',
+    }
+    const queued: ChatPendingItem = {
+      text: 'keep the failed attachment recoverable',
+      attachments: [failed],
+      intent: null,
+    }
+    const { api, rpc } = makeOptions()
+
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('not_sent')
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(queued.attachments).toEqual([failed])
+  })
+
+  it('keeps a queued image intact while Ensemble routing cannot send it', async () => {
+    const image: Attachment = {
+      kind: 'staged',
+      local_id: 32,
+      name: 'queued.png',
+      mime: 'image/png',
+      file_uuid: 'queued-image',
+    }
+    const inputText = ref('unrelated live draft')
+    const queued: ChatPendingItem = {
+      text: 'inspect the queued image',
+      attachments: [image],
+      intent: null,
+    }
+    const { api, rpc } = makeOptions({
+      inputText,
+      modelRoutingMode: ref<'llm_ensemble'>('llm_ensemble'),
+    })
+
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('not_sent')
+    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('not_sent')
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(queued.attachments).toEqual([image])
+    expect(inputText.value).toBe('unrelated live draft')
+  })
+
+  it('defers an automatic queued image while routing settings are changing', async () => {
+    const image: Attachment = {
+      kind: 'staged',
+      local_id: 33,
+      name: 'queued.webp',
+      mime: 'image/webp',
+      file_uuid: 'queued-image-busy',
+    }
+    const queued: ChatPendingItem = {
+      text: 'wait for the routing update',
+      attachments: [image],
+      intent: null,
+    }
+    const { api, rpc } = makeOptions({
+      modelRoutingMode: ref<'off'>('off'),
+      modelRoutingSettingsBusy: ref(true),
+    })
+
+    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('deferred')
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(queued.attachments).toEqual([image])
   })
 
   it('keeps a recovered fork gated while its canonical child response is pending', async () => {

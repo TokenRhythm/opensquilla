@@ -3019,6 +3019,8 @@
       "queueHint": "キューモード: これらのメッセージは現在の応答が完了すると順番に自動送信されます",
       "clearAll": "すべてクリア",
       "editMessage": "メッセージを編集",
+      "attachmentNeedsAttention": "添付を確認",
+      "fixAttachmentBeforeSteer": "先にこのメッセージを編集し、失敗した添付を再試行または削除してから割り込み送信してください",
       "clearQueue": "キューをクリア",
       "removeMessage": "保留中のメッセージ {index} を削除"
     },

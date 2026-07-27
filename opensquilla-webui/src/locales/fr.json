@@ -3019,6 +3019,8 @@
       "queueHint": "Mode file d'attente : ces messages s'envoient automatiquement dans l'ordre à la fin de la réponse actuelle",
       "clearAll": "Tout effacer",
       "editMessage": "Modifier le message",
+      "attachmentNeedsAttention": "Pièce jointe à vérifier",
+      "fixAttachmentBeforeSteer": "Modifiez ce message, puis réessayez ou supprimez la pièce jointe en échec avant de rediriger",
       "clearQueue": "Vider la file",
       "removeMessage": "Supprimer le message en attente {index}"
     },
