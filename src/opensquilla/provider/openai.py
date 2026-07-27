@@ -2879,6 +2879,16 @@ class OpenAIProvider:
                     payload["thinking_budget"] = env_thinking_budget
                 elif not cfg.thinking_budget_explicit:
                     payload.pop("thinking_budget", None)
+        elif (
+            self._compat.thinking_required_model_prefixes
+            and self._model.strip().lower().startswith(
+                self._compat.thinking_required_model_prefixes
+            )
+        ):
+            # Forced-thinking endpoints reject enable_thinking=False; omit the
+            # off-payload so the request still succeeds. The model will still
+            # think — that is the only mode the endpoint supports.
+            pass
         elif thinking_toggle_model:
             # Toggle models need an explicit off payload even without a
             # capability profile (policy gating, independent of dialect).

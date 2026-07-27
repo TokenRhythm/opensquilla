@@ -366,7 +366,18 @@ class LlmProviderConfig(BaseSettings):
     top_p: float | None = None
     # Optional global thinking level: off|minimal|low|medium|high|xhigh|adaptive.
     # When unset, squilla_router may suggest thinking for selected tiers.
-    thinking: str | None = None
+    # Accepts both "thinking" and "thinking_level" spellings in TOML and env
+    # (OPENSQUILLA_LLM_THINKING / OPENSQUILLA_LLM_THINKING_LEVEL) for parity
+    # with squilla_router.tiers field names. model_dump emits only "thinking".
+    thinking: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "thinking",
+            "thinking_level",
+            "OPENSQUILLA_LLM_THINKING",
+            "OPENSQUILLA_LLM_THINKING_LEVEL",
+        ),
+    )
     # Explicit provider-request proof budget in characters. 0 = derive from the
     # context-budget ladder (window minus output+thinking reserve, times the
     # overflow threshold). A positive value bypasses that derivation and feeds
@@ -443,6 +454,10 @@ class LlmEnsembleCandidateConfig(BaseModel):
     # failing validation so a hand-edited config never blocks gateway boot.
     # Strict role/lineup checks live on the RPC save path (upsert mutation).
     role: str = ""
+    # Per-candidate thinking level override: off|minimal|low|medium|high|xhigh.
+    # Coerced to "" (inherit from turn config) on invalid input so a hand-edited
+    # config never blocks gateway boot, matching the role field policy above.
+    thinking_level: str = ""
 
     @field_validator("provider", "model", mode="before")
     @classmethod
@@ -454,6 +469,15 @@ class LlmEnsembleCandidateConfig(BaseModel):
     def _normalize_role(cls, value: object) -> str:
         normalized = str(value or "").strip().lower()
         return normalized if normalized in LLM_ENSEMBLE_CANDIDATE_ROLES else ""
+
+    @field_validator("thinking_level", mode="before")
+    @classmethod
+    def _normalize_thinking_level(cls, value: object) -> str:
+        normalized = str(value or "").strip().lower()
+        if not normalized:
+            return ""
+        valid = {"off", "minimal", "low", "medium", "high", "xhigh", "adaptive"}
+        return normalized if normalized in valid else ""
 
     @model_validator(mode="after")
     def _validate_candidate(self) -> LlmEnsembleCandidateConfig:

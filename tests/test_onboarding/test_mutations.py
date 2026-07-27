@@ -588,6 +588,7 @@ def test_upsert_llm_ensemble_accepts_structured_candidates_partial_merge():
             "source": "custom",
             "enabled": True,
             "role": "",
+            "thinking_level": "",
         }
     ]
     assert res.public_payload["candidates"] == [
@@ -597,6 +598,7 @@ def test_upsert_llm_ensemble_accepts_structured_candidates_partial_merge():
             "source": "custom",
             "enabled": True,
             "role": "",
+            "thinking_level": "",
         }
     ]
 

@@ -1123,11 +1123,36 @@ def upsert_llm_ensemble(
     if candidates is not None:
         if not isinstance(candidates, (list, tuple)):
             raise ValueError("candidates must be a list of candidate objects")
+        # Merge incoming candidate payloads with stored rows keyed by
+        # (provider, model).  Clients (console UI, desktop) may only send a
+        # subset of fields; keys absent from the payload are preserved from
+        # the stored row so server-side-only fields (e.g. thinking_level)
+        # survive a UI save.  Candidates not present in the payload are
+        # treated as deleted (the UI always sends the full visible list).
+        stored_by_key: dict[tuple[str, str], dict[str, object]] = {}
+        for stored in merged.get("candidates", []) or []:
+            if isinstance(stored, dict):
+                key = (
+                    str(stored.get("provider", "") or "").strip().lower(),
+                    str(stored.get("model", "") or "").strip(),
+                )
+                stored_by_key[key] = dict(stored)
         candidate_payloads: list[dict[str, object]] = []
         for entry in candidates:
             if not isinstance(entry, dict):
                 raise ValueError("candidates must be a list of candidate objects")
-            candidate_payloads.append(dict(entry))
+            incoming = dict(entry)
+            key = (
+                str(incoming.get("provider", "") or "").strip().lower(),
+                str(incoming.get("model", "") or "").strip(),
+            )
+            stored_row = stored_by_key.get(key)
+            if stored_row is not None:
+                # Stored fields fill gaps; incoming fields take precedence.
+                merged_row = {**stored_row, **incoming}
+            else:
+                merged_row = incoming
+            candidate_payloads.append(merged_row)
         merged["candidates"] = candidate_payloads
     if min_successful_proposers is not None:
         merged["min_successful_proposers"] = _positive_int(
