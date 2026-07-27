@@ -1,6 +1,7 @@
 ---
 name: memory
 description: "Use when the user asks to remember, recall, forget, update, search, or inspect durable OpenSquilla memory, including profile facts in USER.md and long-term notes in MEMORY.md or memory/**/*.md."
+description_zh: "当用户要求记住、回忆、忘记、更新、搜索或查看OpenSquilla的持久记忆时使用，包括USER.md中的档案事实以及MEMORY.md或memory/**/*.md中的长期笔记。"
 always: false
 triggers:
   - remember

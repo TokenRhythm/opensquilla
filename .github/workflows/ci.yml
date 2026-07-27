@@ -293,7 +293,7 @@ jobs:
           node scripts/test-update-check-scheduler.mjs
           node scripts/test-desktop-locale.mjs
           node scripts/test-desktop-profile-substrate.mjs
-          node scripts/test-desktop-profile-context.mjs
+          node scripts/test-desktop-profile-consolidation.mjs
           node scripts/test-desktop-gateway-ownership.mjs
           node scripts/test-desktop-gateway-lifecycle.mjs
           node scripts/test-desktop-window-lifecycle.mjs
@@ -896,7 +896,7 @@ jobs:
         working-directory: desktop/electron
         shell: bash
         env:
-          OPENSQUILLA_DESKTOP_RECOVERY_SCREENSHOT: ${{ runner.temp }}/desktop-recovery-e2e/recovery-page.png
+          OPENSQUILLA_DESKTOP_CONSOLIDATION_SCREENSHOT: ${{ runner.temp }}/desktop-recovery-e2e/consolidated-primary.png
           OPENSQUILLA_DESKTOP_IMPORT_SCREENSHOT_DIR: ${{ runner.temp }}/desktop-recovery-e2e/profile-import-screenshots
         run: |
           set -euo pipefail
@@ -912,12 +912,13 @@ jobs:
           }
 
           for entry in \
-            'profile-recovery-flow:scripts/test-profile-recovery-flow.mjs' \
-            'profile-recovery-accessibility:scripts/test-profile-recovery-accessibility.mjs' \
+            'profile-consolidation-flow:scripts/test-profile-consolidation-flow.mjs' \
+            'primary-repair-accessibility:scripts/test-primary-repair-accessibility.mjs' \
             'profile-import-flow:scripts/test-profile-import-flow.mjs' \
+            'desktop-cleanup-flow:scripts/test-desktop-cleanup-flow.mjs' \
             'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs' \
             'window-background-flow:scripts/test-desktop-window-background-flow.mjs' \
-            'unsafe-profile-no-write:scripts/test-unsafe-profile-no-write.mjs'
+            'unsafe-legacy-recovery-no-write:scripts/test-unsafe-legacy-recovery-no-write.mjs'
           do
             name="${entry%%:*}"
             script="${entry#*:}"

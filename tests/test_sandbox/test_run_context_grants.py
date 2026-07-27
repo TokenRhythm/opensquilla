@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -187,6 +189,61 @@ async def test_workspace_public_network_grant_does_not_write_user_store_when_ses
         )
 
     assert load_user_grants_payload()["public_network"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length path contract")
+async def test_get_run_context_migrates_user_grants_from_long_state_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    from opensquilla.paths import native_io_path, state_dir
+    from opensquilla.sandbox.run_context import get_run_context
+
+    long_root = tmp_path / "long-user-grants"
+    home = long_root
+    index = 0
+    while len(str(home / "state" / "sandbox_user_grants.sqlite")) <= 280:
+        home /= f"segment-{index:02d}-" + ("g" * 40)
+        index += 1
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(home))
+
+    def cleanup() -> None:
+        native_root = native_io_path(long_root)
+        if native_root.exists():
+            shutil.rmtree(native_root)
+
+    request.addfinalizer(cleanup)
+    legacy_path = state_dir("sandbox_user_grants.json")
+    native_legacy_path = native_io_path(legacy_path)
+    native_legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    native_legacy_path.write_text(
+        json.dumps(
+            {
+                "domains": [
+                    {
+                        "domain": "example.com",
+                        "scope": "workspace",
+                        "source": "manual",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manager = _SessionManager()
+    context = await get_run_context(
+        manager,
+        manager.node.session_key,
+        config=_config(),
+        workspace=str(tmp_path / "workspace"),
+    )
+
+    assert [grant.domain for grant in context.domains] == ["example.com"]
+    assert native_io_path(state_dir("sandbox_user_grants.sqlite")).is_file()
+    assert not native_legacy_path.exists()
 
 
 def test_user_grants_store_round_trips_payloads(tmp_path):

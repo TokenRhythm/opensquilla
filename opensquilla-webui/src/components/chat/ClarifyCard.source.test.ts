@@ -31,4 +31,9 @@ describe('ClarifyCard submit feedback', () => {
     expect(source).toContain("values[field.name] = field.defaultValue || ''")
     expect(source).toContain(":placeholder=\"field.defaultValue ? `default: ${field.defaultValue}` : ''\"")
   })
+
+  it('preserves entered values when the same clarify request is re-rendered', () => {
+    expect(source).toContain("() => `${props.request.runId}\\u0000${props.request.step}`")
+    expect(source).not.toContain('watch(() => props.request, request =>')
+  })
 })

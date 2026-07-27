@@ -3639,6 +3639,109 @@ class SessionStorage:
             task_status=task_status,
         )
 
+    @staticmethod
+    async def _delete_reset_history(conn: Any, session_id: str) -> None:
+        """Delete reset-owned history on an existing write transaction."""
+
+        for table in (
+            "transcript_entries",
+            "compacted_transcript_entries",
+            "session_summaries",
+        ):
+            await conn.execute(
+                f"DELETE FROM {table} WHERE session_id = ?",  # noqa: S608
+                (session_id,),
+            )
+
+    async def reset_session(
+        self,
+        node: SessionNode,
+        *,
+        expected_session_id: str,
+        expected_epoch: int,
+        archive_writer: Callable[[ResetArchiveSnapshot], Awaitable[None]],
+    ) -> None:
+        """Archive and rotate one session identity in a single transaction."""
+
+        node.session_key = canonicalize_session_key(node.session_key)
+        node.agent_id = normalize_agent_id(node.agent_id)
+        if not expected_session_id:
+            raise ValueError("expected_session_id is required")
+        if node.session_id == expected_session_id:
+            raise ValueError("reset session id must change")
+        if int(node.epoch or 0) != expected_epoch + 1:
+            raise ValueError("reset epoch must advance exactly once")
+
+        session_data = node.model_dump()
+        async with self._write_transaction("reset_session") as conn:
+            async with conn.execute(
+                """
+                SELECT *
+                FROM sessions
+                WHERE session_key = ? AND session_id = ? AND epoch = ?
+                """,
+                (node.session_key, expected_session_id, expected_epoch),
+            ) as cur:
+                previous_row = await cur.fetchone()
+            if previous_row is None:
+                await self._raise_stale_epoch(
+                    conn,
+                    session_key=node.session_key,
+                    expected_epoch=expected_epoch,
+                )
+            assert previous_row is not None
+            previous_node = SessionNode(**_deserialize_row(dict(previous_row)))
+            snapshot = ResetArchiveSnapshot(
+                node=previous_node,
+                entries=tuple(
+                    await self._select_canonical_transcript(
+                        conn,
+                        expected_session_id,
+                    )
+                ),
+                summaries=tuple(
+                    await self._select_all_summaries(
+                        conn,
+                        expected_session_id,
+                    )
+                ),
+            )
+            await archive_writer(snapshot)
+
+            assignments = [f"{column} = ?" for column in session_data if column != "session_key"]
+            values = [
+                _serialize(value)
+                for column, value in session_data.items()
+                if column != "session_key"
+            ]
+            async with conn.execute(
+                f"UPDATE sessions SET {', '.join(assignments)} "
+                "WHERE session_key = ? AND session_id = ? AND epoch = ?",
+                [
+                    *values,
+                    node.session_key,
+                    expected_session_id,
+                    expected_epoch,
+                ],
+            ) as cur:
+                rotated = cur.rowcount or 0
+            if rotated == 0:
+                await self._raise_stale_epoch(
+                    conn,
+                    session_key=node.session_key,
+                    expected_epoch=expected_epoch,
+                )
+
+            await self._delete_reset_history(conn, expected_session_id)
+            await conn.execute(
+                """
+                UPDATE session_context_states
+                SET valid = 0, invalid_reason = 'session_reset'
+                WHERE session_key = ? AND valid = 1
+                """,
+                (node.session_key,),
+            )
+
     async def accept_turn(
         self,
         entry: TranscriptEntry,
@@ -3652,6 +3755,7 @@ class SessionStorage:
         request_fingerprint: str,
         session_node: SessionNode | None = None,
         reset_from_session_id: str | None = None,
+        reset_archive_writer: Callable[[ResetArchiveSnapshot], Awaitable[None]] | None = None,
         initial_transcript_entries: tuple[TranscriptEntry, ...] = (),
         session_updates: dict[str, Any] | None = None,
         merge_into_task: bool = False,
@@ -3688,6 +3792,8 @@ class SessionStorage:
             raise ValueError("reset_from_session_id requires session_node")
         if initial_transcript_entries and session_node is None:
             raise ValueError("initial transcript entries require session_node")
+        if reset_archive_writer is not None and reset_from_session_id is None:
+            raise ValueError("reset_archive_writer requires reset_from_session_id")
         if merge_into_task and session_node is not None:
             raise ValueError("task collection cannot create, reset, or fork a session")
         allowed_session_updates = {
@@ -3776,6 +3882,9 @@ class SessionStorage:
                             )
                         ),
                     )
+                    if reset_archive_writer is not None:
+                        await reset_archive_writer(reset_archive_snapshot)
+                        reset_archive_snapshot = None
                     assignments = [
                         f"{column} = ?"
                         for column in session_data
@@ -3803,15 +3912,7 @@ class SessionStorage:
                             session_key=session_node.session_key,
                             expected_epoch=previous_epoch,
                         )
-                    for table in (
-                        "transcript_entries",
-                        "compacted_transcript_entries",
-                        "session_summaries",
-                    ):
-                        await conn.execute(
-                            f"DELETE FROM {table} WHERE session_id = ?",  # noqa: S608
-                            (reset_from_session_id,),
-                        )
+                    await self._delete_reset_history(conn, reset_from_session_id)
                     await conn.execute(
                         """
                         UPDATE session_context_states

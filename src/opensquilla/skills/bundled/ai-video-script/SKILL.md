@@ -1,6 +1,7 @@
 ---
 name: ai-video-script
 description: "Generate a structured short-video shooting script from a topic. Emits a strict, machine-parseable shot list (3 shots by default) with image prompt + video prompt + voiceover + on-screen text per shot. Trigger when the user asks for a video script, 分镜, 短视频文案, AI视频, 短剧脚本, or wants visual prompts ready for image/video generation."
+description_zh: "根据主题生成结构化的短视频拍摄脚本，输出严格且可机器解析的分镜清单（默认3个镜头），每个镜头含图像提示词、视频提示词、旁白和屏幕文字。当用户需要视频脚本、分镜、短视频文案、AI视频、短剧脚本，或需要可用于图像/视频生成的视觉提示词时触发。"
 provenance:
   origin: clawhub-mit0
   license: MIT-0

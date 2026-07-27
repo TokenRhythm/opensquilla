@@ -185,7 +185,6 @@
       "compatibilityTitle": "旧版 Agent 数据位置",
       "compatibilityDesc": "OpenSquilla 正在使用兼容的旧版 Agent 数据位置。更改后会切换身份和记忆来源，不会移动、合并或删除数据。",
       "chooseLegacyAgentData": "选择 Agent 数据位置",
-      "recoveryTitle": "恢复 Profile 中不能导入数据",
       "loadFailed": "OpenSquilla 无法检查可导入的数据来源。",
       "emptyTitle": "未发现其他 OpenSquilla 数据",
       "emptyDesc": "以后可以重新扫描；桌面端还可以手动选择数据文件夹。",
@@ -972,12 +971,12 @@
         },
         "delete-current-profile": {
           "title": "删除当前配置",
-          "warning": "会删除列出的当前配置、凭据和日志；其他恢复配置和备份都会保留。",
+          "warning": "会删除列出的主配置、凭据和日志；已记录的备份会保留。",
           "apply": "删除配置"
         },
         "delete-all-user-data": {
           "title": "删除全部 OpenSquilla 用户数据",
-          "warning": "OpenSquilla 完全退出后，会删除主配置、所有恢复配置、凭据、日志和已记录的备份。",
+          "warning": "OpenSquilla 完全退出后，会删除主配置、凭据、日志和已记录的备份。",
           "apply": "删除全部数据并退出"
         },
         "inspectFailed": "无法检查清理位置：{detail}",
@@ -985,7 +984,6 @@
         "inventoryCount": "列出的 {total} 个位置中，当前有 {existing} 个存在。",
         "inventoryLabel": "清理清单",
         "primaryProfile": "主配置",
-        "recoveryProfile": "恢复配置",
         "present": "存在",
         "missing": "不存在",
         "blocked": "清理已阻止",
@@ -999,7 +997,7 @@
         "working": "正在停止本地运行时并执行已确认的清理…",
         "resetConfirmTitle": "重置当前设置？",
         "resetConfirmBody": "当前配置将返回提供商引导，同时保留工作区身份、记忆和聊天。",
-        "partial": "清理在中途停止（{detail}）。OpenSquilla 已保留剩余数据并打开恢复选项。",
+        "partial": "清理在中途停止（{detail}）。OpenSquilla 已保留剩余数据并打开修复选项。",
         "applyFailed": "清理未能开始：{detail}",
         "deleteAllScheduled": "OpenSquilla 即将退出；只有应用完全退出后才会开始删除。",
         "resetDone": "当前设置已重置，将重新打开提供商引导。",
@@ -1021,7 +1019,6 @@
       "migrationLabel": "数据转移",
       "migrationDesc": "使用另一套 OpenSquilla 安装中的数据。继续前会先核对；如果当前桌面端已有数据，会完整备份后再替换。",
       "migrationButton": "从其他安装转移数据",
-      "migrationRecoveryProfile": "恢复配置中不能转移数据。请返回主配置后继续。",
       "migrationNone": "未发现其他 OpenSquilla 数据。",
       "migrationSummaryFailed": "无法核对所选数据：{detail}",
       "migrationSummaryTitle": "核对数据转移",
@@ -1987,7 +1984,33 @@
       "next12h": "未来 12 小时",
       "upcomingRun": "即将运行",
       "nowTick": "现在",
-      "deleteFailed": "删除失败：{error}"
+      "deleteFailed": "删除失败：{error}",
+      "bulkManage": "批量管理",
+      "exitBulk": "退出批量",
+      "overview": "运行概览",
+      "addFromTemplate": "从模板添加",
+      "addAutomation": "添加自动化",
+      "heroTitle": "开启你的第一个自动化任务吧",
+      "heroHint": "让 OpenSquilla 在指定时间自动完成提醒、整理、巡检和智能体任务。",
+      "overviewDesc": "查看自动化任务的启用状态和近期执行情况。",
+      "templateDesc": "选择场景后会自动填入执行时间和任务提示词。",
+      "selectedCount": "已选择 {count} 项",
+      "selectVisible": "全选当前",
+      "clearSelection": "清空",
+      "overviewEyebrow": "自动化概览",
+      "galleryEyebrow": "自动化模板库",
+      "bulkDeleteConfirm": "确定删除选中的 {count} 个自动化任务吗？此操作无法撤销。",
+      "templates": {
+        "ai-daily": { "title": "每日 AI 资讯简报", "description": "检索过去 24 小时的重要 AI 新闻，去重并生成带来源链接的简报。", "category": "资讯与情报", "schedule": "每天 08:00" },
+        "weekly-report": { "title": "每周工作复盘", "description": "汇总本周任务与交付，提炼进展、风险和下周优先事项。", "category": "效率办公", "schedule": "每周五 17:30" },
+        "english-five": { "title": "每天 5 个英语单词", "description": "结合例句与小测验，生成轻量、可坚持的英语学习卡片。", "category": "学习成长", "schedule": "每天 09:00" },
+        "project-risk": { "title": "项目风险巡检", "description": "检查延期事项、异常日志与待处理问题，输出风险等级和建议。", "category": "项目研发", "schedule": "工作日 10:00" },
+        "knowledge-review": { "title": "知识库周回顾", "description": "整理本周新增笔记与会议纪要，补充标签并生成待消化清单。", "category": "知识管理", "schedule": "每周日 18:00" },
+        "daily-idea": { "title": "每日灵感与冷知识", "description": "每天送上一条可靠、有出处的知识和一个可行动的小灵感。", "category": "轻松生活", "schedule": "每天 12:00" },
+        "bedtime-story": { "title": "每日儿童睡前故事", "description": "生成一篇温暖、有启发、适合亲子共读的短篇故事。", "category": "亲子陪伴", "schedule": "每天 20:30" },
+        "classic-movie": { "title": "经典电影推荐", "description": "每周推荐一部高质量经典电影，并附无剧透导读。", "category": "休闲娱乐", "schedule": "每周六 19:00" },
+        "today-in-history": { "title": "历史上的今天", "description": "从科技、文化与社会领域挑选一件可靠的历史事件。", "category": "每日知识", "schedule": "每天 08:30" }
+      }
     },
     "deleteDialog": {
       "title": "删除定时任务",
@@ -2030,7 +2053,8 @@
       "colSchedule": "计划",
       "colStatus": "状态",
       "colLastRun": "上次运行",
-      "colNextRun": "下次运行"
+      "colNextRun": "下次运行",
+      "selectJob": "选择 {name}"
     },
     "runHistory": {
       "eyebrow": "运行历史",
@@ -2101,6 +2125,32 @@
       "fdWebhook": "一个 webhook",
       "enabled": "已启用",
       "saveSchedule": "保存定时任务"
+      ,"friendlyNamePlaceholder": "例如：每天整理客户反馈"
+      ,"friendlyTypeCron": "按固定时间重复"
+      ,"friendlyTypeEvery": "每隔一段时间执行"
+      ,"friendlyTypeAt": "只在指定时间执行一次"
+      ,"executionFrequency": "执行频率"
+      ,"daily": "每天"
+      ,"weekdays": "每个工作日"
+      ,"weekly": "每周"
+      ,"monthly": "每月"
+      ,"customAdvancedTime": "自定义高级时间"
+      ,"weekday": "星期"
+      ,"date": "日期"
+      ,"monthlyDay": "每月 {day} 日"
+      ,"specificTime": "具体时间"
+      ,"customTimeHint": "可输入更灵活的时间规则。"
+      ,"openAdvancedTime": "打开高级时间设置"
+      ,"everyHowOften": "每隔多久执行"
+      ,"timeUnit": "时间单位"
+      ,"minutes": "分钟"
+      ,"hours": "小时"
+      ,"days": "天"
+      ,"dateAndTime": "执行日期和时间"
+      ,"friendlyMessagePlaceholder": "例如：整理今天收到的客户反馈，归纳主要问题并给出处理建议"
+      ,"moreRuntimeSettings": "更多运行设置（可选）"
+      ,"advancedTimeHint": "仅在上面的时间选择无法满足需求时使用。"
+      ,"timezoneSimpleHint": "通常无需修改。"
     },
     "form": {
       "cronPreviewPlaceholder": "输入 5 字段的 cron 表达式以预览",
@@ -2226,6 +2276,8 @@
       "reloadNoChanges": "技能目录已是最新版本（第 {generation} 代）。",
       "reloadPartial": "技能目录已重新加载为第 {generation} 代，但有 {errors} 个错误。{summary}",
       "reloadFailed": "技能目录重新加载失败：{error}",
+      "overviewTitle": "技能概览",
+      "overviewDesc": "查看技能的安装与配置状态，点击分类可筛选技能。",
       "reloadListFailed": "目录已重新加载，但无法获取刷新后的技能列表。",
       "reloadUnknownError": "Gateway 已保留上一个可用目录。",
       "tabsLabel": "技能来源",
@@ -2303,6 +2355,10 @@
       "unknown": "未知",
       "noAudit": "未记录自动启用决定。",
       "gates": "门控"
+    },
+    "tile": {
+      "installed": "已安装",
+      "add": "下载"
     },
     "skillCard": {
       "subSkillsTitle": "此元技能使用的子技能",
@@ -2668,6 +2724,14 @@
     "historyTurnLoadedCount": "已加载记录中的第 {number} 条，共 {total} 条",
     "historyAttachmentOnly": "仅包含附件的消息",
     "historyAttachmentCount": "附件：{count}",
+    "loadingSession": "正在加载会话…",
+    "loadingSessionDescription": "正在恢复最近消息和会话状态…",
+    "loadSessionFailed": "暂时无法加载会话",
+    "loadSessionDescription": "连接可能中断，或历史服务暂时不可用。请重新加载。",
+    "reloadSession": "重新加载",
+    "retryingSession": "正在重新加载",
+    "retryingSessionDescription": "正在恢复会话历史…",
+    "retryingSessionAction": "重新加载中…",
     "noMessagesYet": "暂无消息。",
     "newChat": "新建聊天",
     "chatWithSuffix": "聊天 {suffix}",
@@ -3006,6 +3070,21 @@
       "planWeek": "为我这一周拟定计划",
       "searchAiNews": "搜索今天的 AI 新闻",
       "generateImage": "生成一个小鱿鱼吉祥物的图片"
+    },
+    "metaQuick": {
+      "webpage": "制作多媒体网页",
+      "shortDrama": "生成 AI 短剧",
+      "paperWriting": "撰写学术论文",
+      "webpageDesc": "生成可直接使用的完整网站",
+      "shortDramaDesc": "完成脚本、分镜与成片",
+      "paperWritingDesc": "完成研究、起草与论文编译"
+    },
+    "metaDescriptions": {
+      "webpage": "根据主题制作完整的多媒体网站。",
+      "kidsProject": "为儿童规划安全、适龄的创意项目。",
+      "shortDrama": "从脚本到成片生成 AI 短剧。",
+      "skillCreator": "将现有技能组合成可复用的工作流。",
+      "paperWriting": "完成学术论文的研究、起草与编译。"
     },
     "toast": {
       "downloadFailedHttp": "下载失败 — HTTP {status}",

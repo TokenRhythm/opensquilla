@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import ntpath
+import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib.resources import files
@@ -39,6 +41,19 @@ class AgentWorkspaceBootstrapResult:
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _native_io_path(path: Path) -> Path:
+    """Return an internal OS spelling without changing the logical workspace path."""
+
+    if os.name != "nt":
+        return path
+    value = ntpath.abspath(str(path))
+    if value.startswith("\\\\?\\"):
+        return Path(value)
+    if value.startswith("\\\\"):
+        return Path(f"\\\\?\\UNC\\{value[2:]}")
+    return Path(f"\\\\?\\{value}")
 
 
 def _state_path(workspace_dir: Path) -> Path:
@@ -107,7 +122,8 @@ def ensure_agent_workspace(
     """
 
     workspace = Path(workspace_dir).expanduser()
-    workspace.mkdir(parents=True, exist_ok=True)
+    native_workspace = _native_io_path(workspace)
+    native_workspace.mkdir(parents=True, exist_ok=True)
     state_path = _state_path(workspace)
     bootstrap_path = workspace / ONE_SHOT_BOOTSTRAP_FILENAME
 
@@ -121,24 +137,26 @@ def ensure_agent_workspace(
             bootstrap_completed=False,
         )
 
-    had_user_indicators = _has_workspace_user_indicators(workspace)
+    native_state_path = _state_path(native_workspace)
+    native_bootstrap_path = native_workspace / ONE_SHOT_BOOTSTRAP_FILENAME
+    had_user_indicators = _has_workspace_user_indicators(native_workspace)
     created: list[str] = []
     for filename in CORE_BOOTSTRAP_TEMPLATE_FILENAMES:
-        if _write_template_if_missing(workspace, filename):
+        if _write_template_if_missing(native_workspace, filename):
             created.append(filename)
 
-    memory_dir = workspace / "memory"
+    memory_dir = native_workspace / "memory"
     if not memory_dir.exists():
         memory_dir.mkdir(parents=True)
         created.append("memory/")
 
-    state = _read_state(state_path)
+    state = _read_state(native_state_path)
     state["workspace_dir"] = str(workspace)
-    dirty = not state_path.is_file()
+    dirty = not native_state_path.is_file()
 
     seeded_at = state.get("bootstrap_seeded_at")
     completed_at = state.get("bootstrap_completed_at")
-    bootstrap_exists = bootstrap_path.exists()
+    bootstrap_exists = native_bootstrap_path.exists()
 
     if isinstance(seeded_at, str) and not bootstrap_exists and not isinstance(completed_at, str):
         state["bootstrap_completed_at"] = _now_iso()
@@ -155,7 +173,7 @@ def ensure_agent_workspace(
         if had_user_indicators:
             state["bootstrap_completed_at"] = _now_iso()
             dirty = True
-        elif _write_template_if_missing(workspace, ONE_SHOT_BOOTSTRAP_FILENAME):
+        elif _write_template_if_missing(native_workspace, ONE_SHOT_BOOTSTRAP_FILENAME):
             created.append(ONE_SHOT_BOOTSTRAP_FILENAME)
             state["bootstrap_seeded_at"] = _now_iso()
             dirty = True
@@ -164,7 +182,7 @@ def ensure_agent_workspace(
         dirty = True
 
     if dirty:
-        _write_state(state_path, state)
+        _write_state(native_state_path, state)
 
     return AgentWorkspaceBootstrapResult(
         workspace_dir=workspace,

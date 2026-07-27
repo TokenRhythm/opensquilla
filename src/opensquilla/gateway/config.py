@@ -30,7 +30,7 @@ from opensquilla.gateway.config_migration import (
     backup_and_write_migrated_config,
     migrate_config_payload,
 )
-from opensquilla.paths import default_opensquilla_home
+from opensquilla.paths import default_opensquilla_home, native_io_path
 from opensquilla.provider.preset_registry import get_preset, legacy_profile_ids
 from opensquilla.router_tiers import (
     DEFAULT_TEXT_TIER,
@@ -2834,7 +2834,7 @@ class GatewayConfig(BaseSettings):
         import tomllib
 
         target = Path(path)
-        with open(target, "rb") as f:
+        with open(native_io_path(target), "rb") as f:
             data = tomllib.load(f)
         migration = migrate_config_payload(data)
         cfg = cls(**migration.payload)
@@ -2871,8 +2871,9 @@ class GatewayConfig(BaseSettings):
             candidates.append((default_opensquilla_home() / "config.toml").expanduser())
 
         for path in candidates:
-            if path.is_file():
-                with open(path, "rb") as f:
+            native_path = native_io_path(path)
+            if native_path.is_file():
+                with open(native_path, "rb") as f:
                     data = tomllib.load(f)
                 migration = migrate_config_payload(data, emit_diagnostics=not read_only)
                 cfg = cls(**migration.payload)

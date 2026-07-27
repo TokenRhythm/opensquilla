@@ -1,6 +1,7 @@
 ---
 name: summarize
 description: Summarize, condense, or digest content
+description_zh: "对内容进行总结、浓缩或摘要。"
 always: false
 triggers:
   - summarize

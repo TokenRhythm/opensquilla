@@ -11,13 +11,35 @@
         @click="emit('pick', chip)"
       >{{ chip }}</button>
     </div>
+    <div
+      v-if="!suppressed && metaSkills.length"
+      class="empty-state__meta"
+      role="group"
+      :aria-label="t('cronSkills.skillsView.metaSkillsTitle')"
+    >
+      <button
+        v-for="skill in metaSkills"
+        :key="skill.value"
+        type="button"
+        class="empty-state__meta-chip"
+        :title="skill.description"
+        @click="emit('pick', `/meta ${skill.value}`)"
+      >
+        <span class="empty-state__meta-icon" aria-hidden="true">
+          <Icon :name="metaSkillIcon(skill.value)" :size="16" />
+        </span>
+        <span class="empty-state__meta-label">{{ metaSkillLabel(skill.value) }}</span>
+      </button>
+    </div>
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
+import Icon from '@/components/Icon.vue'
 import { useRpcCall } from '@/composables/useRpc'
+import type { IconName } from '@/utils/icons'
 
 const { t } = useI18n()
 
@@ -32,10 +54,14 @@ interface AgentIdentityPayload {
   name?: string | null
 }
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   agentId: string
+  metaSkills?: Array<{ value: string; description: string }>
   suppressed?: boolean
-}>()
+}>(), {
+  metaSkills: () => [],
+  suppressed: false,
+})
 
 const emit = defineEmits<{
   pick: [text: string]
@@ -77,6 +103,21 @@ const chips = computed(() => {
   if (derived.length < 3) derived.push(t('chat.chips.planWeek'))
   return derived.slice(0, 4)
 })
+
+function metaSkillLabel(name: string): string {
+  const labels: Record<string, string> = {
+    AwesomeWebpageMetaSkill: t('chat.metaQuick.webpage'),
+    'meta-short-drama': t('chat.metaQuick.shortDrama'),
+    'meta-paper-write': t('chat.metaQuick.paperWriting'),
+  }
+  return labels[name] || name
+}
+
+function metaSkillIcon(name: string): IconName {
+  if (name === 'AwesomeWebpageMetaSkill') return 'fileCode'
+  if (name === 'meta-short-drama') return 'play'
+  return 'fileText'
+}
 </script>
 
 <style scoped>
@@ -142,6 +183,57 @@ const chips = computed(() => {
   box-shadow: var(--focus-ring);
 }
 
+.empty-state__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  justify-content: center;
+  margin-top: var(--sp-1);
+  max-width: 100%;
+}
+
+.empty-state__meta-chip {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  cursor: pointer;
+  display: inline-flex;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  gap: 6px;
+  min-height: 32px;
+  padding: 5px 9px;
+  white-space: nowrap;
+  transition: background var(--transition), border-color var(--transition), color var(--transition);
+}
+
+.empty-state__meta-chip:hover {
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+  color: var(--text);
+}
+
+.empty-state__meta-chip:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.empty-state__meta-icon {
+  align-items: center;
+  color: var(--text-muted);
+  display: inline-flex;
+  flex: 0 0 16px;
+  height: 16px;
+  justify-content: center;
+  width: 16px;
+}
+
+.empty-state__meta-label {
+  line-height: 20px;
+}
+
 @media (max-width: 768px) {
   .empty-state__chip {
     min-height: 2.75rem;
@@ -150,10 +242,22 @@ const chips = computed(() => {
   .empty-state__chips {
     min-height: 2.75rem;
   }
+
+  .empty-state__meta-chip {
+    min-height: 40px;
+  }
+
+  .empty-state__meta {
+    max-width: calc(100vw - 32px);
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .empty-state__chip {
+    transition: none;
+  }
+
+  .empty-state__meta-chip {
     transition: none;
   }
 }

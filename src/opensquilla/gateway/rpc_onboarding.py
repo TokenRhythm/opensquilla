@@ -1370,27 +1370,46 @@ async def _memory_embedding_configure(params: Any, ctx: RpcContext) -> dict[str,
     }
 
 
-@_d.method("onboarding.audio.configure", scope="operator.admin")
-async def _audio_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
+def apply_audio_provider_configuration(
+    config_holder: Any,
+    *,
+    provider_id: str,
+    api_key: str = "",
+    api_key_env: str = "",
+    base_url: str = "",
+    enabled: bool = True,
+    tts_voice: str = "",
+    tts_model: str = "",
+    language_code: str = "",
+) -> dict[str, Any]:
+    """Validate, persist, and hot-apply one audio provider configuration.
+
+    The single safe write path for audio config, shared by the
+    ``onboarding.audio.configure`` RPC and the agent-facing ``audio_config``
+    builtin tool. ``config_holder`` only needs a ``config`` attribute carrying
+    the live ``GatewayConfig`` (an ``RpcContext``, or a shim for tools).
+
+    The returned mapping is secret-safe: ``entry`` is the mutation's redacted
+    public payload and never carries the API key.
+    """
     from opensquilla.onboarding.mutations import upsert_audio_provider
 
-    provider_id = _require(params, "providerId")
-    cfg = _active_config(ctx)
+    cfg = _active_config(config_holder)
     res = upsert_audio_provider(
         cfg,
         provider_id=provider_id,
-        api_key=params.get("apiKey", "") if isinstance(params, dict) else "",
-        api_key_env=params.get("apiKeyEnv", "") if isinstance(params, dict) else "",
-        base_url=params.get("baseUrl", "") if isinstance(params, dict) else "",
-        enabled=params.get("enabled", True) if isinstance(params, dict) else True,
-        tts_voice=params.get("ttsVoice", "") if isinstance(params, dict) else "",
-        tts_model=params.get("ttsModel", "") if isinstance(params, dict) else "",
-        language_code=params.get("languageCode", "") if isinstance(params, dict) else "",
+        api_key=api_key,
+        api_key_env=api_key_env,
+        base_url=base_url,
+        enabled=enabled,
+        tts_voice=tts_voice,
+        tts_model=tts_model,
+        language_code=language_code,
     )
     # Persist first: if the write fails, the live config is untouched and
     # memory/disk stay consistent. Tool syncs run only on applied state.
-    config_path = _persist(ctx, res.config, restart_required=res.restart_required)
-    _apply_inplace(ctx, res.config)
+    config_path = _persist(config_holder, res.config, restart_required=res.restart_required)
+    _apply_inplace(config_holder, res.config)
     _sync_image_generation(res.config)
     return {
         "changed": res.changed,
@@ -1399,6 +1418,62 @@ async def _audio_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
         "entry": res.public_payload,
         "warnings": res.warnings,
     }
+
+
+def apply_agent_audio_provider_configuration(
+    config_holder: Any,
+    *,
+    provider_id: str,
+    api_key: str = "",
+    api_key_env: str = "",
+    enabled: bool = True,
+    tts_voice: str = "",
+    tts_model: str = "",
+    language_code: str = "",
+) -> dict[str, Any]:
+    """Apply the constrained audio configuration exposed to agents.
+
+    Operator-facing RPCs may configure compatible endpoints and custom
+    credential environment variables. The agent tool is deliberately pinned
+    to the provider registry so it cannot redirect an unrelated environment
+    credential to a model-selected endpoint.
+    """
+    from opensquilla.onboarding.audio_specs import get_audio_provider_setup_spec
+
+    spec = get_audio_provider_setup_spec(provider_id)
+    if api_key_env and api_key_env != spec.env_key:
+        raise ValueError(
+            f"audio provider {provider_id!r} only accepts api_key_env={spec.env_key!r} "
+            "through this tool"
+        )
+    return apply_audio_provider_configuration(
+        config_holder,
+        provider_id=provider_id,
+        api_key=api_key,
+        api_key_env=api_key_env,
+        base_url=spec.default_base_url,
+        enabled=enabled,
+        tts_voice=tts_voice,
+        tts_model=tts_model,
+        language_code=language_code,
+    )
+
+
+@_d.method("onboarding.audio.configure", scope="operator.admin")
+async def _audio_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
+    provider_id = _require(params, "providerId")
+    p = params if isinstance(params, dict) else {}
+    return apply_audio_provider_configuration(
+        ctx,
+        provider_id=provider_id,
+        api_key=p.get("apiKey", ""),
+        api_key_env=p.get("apiKeyEnv", ""),
+        base_url=p.get("baseUrl", ""),
+        enabled=p.get("enabled", True),
+        tts_voice=p.get("ttsVoice", ""),
+        tts_model=p.get("ttsModel", ""),
+        language_code=p.get("languageCode", ""),
+    )
 
 
 async def _reconcile_channels_live() -> dict[str, str] | None:

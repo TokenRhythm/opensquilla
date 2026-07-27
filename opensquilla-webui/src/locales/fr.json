@@ -185,7 +185,6 @@
       "compatibilityTitle": "Emplacement des anciennes données Agent",
       "compatibilityDesc": "OpenSquilla utilise un emplacement compatible pour les anciennes données Agent. Le changer modifie la source d’identité et de mémoire sans déplacer, fusionner ni supprimer les données.",
       "chooseLegacyAgentData": "Choisir l’emplacement des données Agent",
-      "recoveryTitle": "L’import est indisponible dans un profil de récupération",
       "loadFailed": "OpenSquilla n’a pas pu vérifier les sources d’import.",
       "emptyTitle": "Aucune autre donnée OpenSquilla trouvée",
       "emptyDesc": "Vous pourrez relancer la recherche plus tard. Desktop permet aussi de choisir manuellement un dossier.",
@@ -972,12 +971,12 @@
         },
         "delete-current-profile": {
           "title": "Supprimer le profil actuel",
-          "warning": "Le profil actuel, son identifiant et ses journaux listés sont supprimés. Les autres profils de récupération et sauvegardes sont conservés.",
+          "warning": "Le profil principal listé, ses identifiants et ses journaux sont supprimés. Les sauvegardes enregistrées sont conservées.",
           "apply": "Supprimer le profil"
         },
         "delete-all-user-data": {
           "title": "Supprimer toutes les données utilisateur OpenSquilla",
-          "warning": "Après l’arrêt complet d’OpenSquilla, le profil principal, tous les profils de récupération, identifiants, journaux et sauvegardes sont supprimés.",
+          "warning": "Le profil principal, les identifiants, les journaux et les sauvegardes enregistrées sont supprimés après la fermeture complète d’OpenSquilla.",
           "apply": "Tout supprimer et quitter"
         },
         "inspectFailed": "Impossible d’inspecter les emplacements : {detail}",
@@ -985,7 +984,6 @@
         "inventoryCount": "{existing} des {total} emplacements listés existent actuellement.",
         "inventoryLabel": "Inventaire de nettoyage",
         "primaryProfile": "Profil principal",
-        "recoveryProfile": "Profil de récupération",
         "present": "présent",
         "missing": "absent",
         "blocked": "Le nettoyage est bloqué",
@@ -999,7 +997,7 @@
         "working": "Arrêt de l’environnement local et application du nettoyage confirmé…",
         "resetConfirmTitle": "Réinitialiser les réglages actuels ?",
         "resetConfirmBody": "Le profil actuel revient à la configuration fournisseur tout en conservant l’identité, la mémoire et les discussions.",
-        "partial": "Le nettoyage s’est arrêté en cours de route ({detail}). Les données restantes sont conservées et les options de récupération sont ouvertes.",
+        "partial": "Le nettoyage s’est interrompu ({detail}). OpenSquilla a conservé les données restantes et ouvert les options de réparation.",
         "applyFailed": "Le nettoyage n’a pas démarré : {detail}",
         "deleteAllScheduled": "OpenSquilla va se fermer ; la suppression commencera seulement après l’arrêt complet de l’application.",
         "resetDone": "Les réglages actuels ont été réinitialisés. La configuration fournisseur va se rouvrir.",
@@ -1021,7 +1019,6 @@
       "migrationLabel": "Transfert de données",
       "migrationDesc": "Utiliser les données d’une autre installation OpenSquilla. Vous les vérifierez d’abord ; si Desktop contient déjà des données, elles seront entièrement sauvegardées avant le remplacement.",
       "migrationButton": "Transférer les données d’une autre installation",
-      "migrationRecoveryProfile": "Le transfert de données est indisponible dans un profil de récupération. Revenez au profil principal pour continuer.",
       "migrationNone": "Aucune autre donnée OpenSquilla trouvée.",
       "migrationSummaryFailed": "Impossible de vérifier les données sélectionnées : {detail}",
       "migrationSummaryTitle": "Vérifier le transfert de données",
@@ -1987,7 +1984,33 @@
       "next12h": "12 prochaines heures",
       "upcomingRun": "exécution à venir",
       "nowTick": "maintenant",
-      "deleteFailed": "Échec de la suppression : {error}"
+      "deleteFailed": "Échec de la suppression : {error}",
+      "bulkManage": "Gestion groupée",
+      "exitBulk": "Quitter le mode groupé",
+      "overview": "Aperçu des exécutions",
+      "addFromTemplate": "Ajouter depuis un modèle",
+      "addAutomation": "Ajouter une automatisation",
+      "heroTitle": "Lancez votre première automatisation",
+      "heroHint": "Laissez OpenSquilla gérer automatiquement les rappels, l’organisation, les contrôles et les tâches d’agent à l’heure prévue.",
+      "overviewDesc": "Consultez l’état des automatisations et les exécutions récentes.",
+      "templateDesc": "Choisissez un scénario pour préremplir l’horaire et les instructions.",
+      "selectedCount": "{count} sélectionné(s)",
+      "selectVisible": "Tout sélectionner",
+      "clearSelection": "Effacer",
+      "overviewEyebrow": "APERÇU DES AUTOMATISATIONS",
+      "galleryEyebrow": "MODÈLES D’AUTOMATISATION",
+      "bulkDeleteConfirm": "Supprimer les {count} automatisations sélectionnées ? Cette action est irréversible.",
+      "templates": {
+        "ai-daily": { "title": "Brief quotidien sur l’IA", "description": "Résume les actualités IA importantes des dernières 24 heures avec des sources vérifiées.", "category": "Actualités", "schedule": "Chaque jour à 08:00" },
+        "weekly-report": { "title": "Bilan de travail hebdomadaire", "description": "Résume les progrès, risques, livrables et priorités de la semaine suivante.", "category": "Productivité", "schedule": "Vendredi à 17:30" },
+        "english-five": { "title": "Cinq mots anglais par jour", "description": "Crée une leçon de vocabulaire légère avec exemples et petit quiz.", "category": "Apprentissage", "schedule": "Chaque jour à 09:00" },
+        "project-risk": { "title": "Contrôle des risques projet", "description": "Examine les retards, erreurs et problèmes ouverts, puis propose des actions.", "category": "Projets", "schedule": "En semaine à 10:00" },
+        "knowledge-review": { "title": "Revue hebdomadaire des connaissances", "description": "Organise les nouvelles notes et réunions et prépare une liste de suivi.", "category": "Connaissances", "schedule": "Dimanche à 18:00" },
+        "daily-idea": { "title": "Idée et anecdote du jour", "description": "Partage un fait fiable et une petite idée concrète.", "category": "Mode de vie", "schedule": "Chaque jour à 12:00" },
+        "bedtime-story": { "title": "Histoire du soir quotidienne", "description": "Écrit une histoire courte, chaleureuse et imaginative à lire en famille.", "category": "Famille", "schedule": "Chaque jour à 20:30" },
+        "classic-movie": { "title": "Recommandation de film classique", "description": "Recommande un grand classique avec une introduction sans divulgâcher.", "category": "Divertissement", "schedule": "Samedi à 19:00" },
+        "today-in-history": { "title": "Aujourd’hui dans l’histoire", "description": "Présente un événement historique fiable lié aux sciences, à la culture ou à la société.", "category": "Culture quotidienne", "schedule": "Chaque jour à 08:30" }
+      }
     },
     "deleteDialog": {
       "title": "Supprimer la planification",
@@ -2030,7 +2053,8 @@
       "colSchedule": "Planification",
       "colStatus": "État",
       "colLastRun": "Dernière exécution",
-      "colNextRun": "Prochaine exécution"
+      "colNextRun": "Prochaine exécution",
+      "selectJob": "Sélectionner {name}"
     },
     "runHistory": {
       "eyebrow": "Historique des exécutions",
@@ -2101,6 +2125,32 @@
       "fdWebhook": "Un webhook",
       "enabled": "Activé",
       "saveSchedule": "Enregistrer la planification"
+      ,"friendlyNamePlaceholder": "Exemple : Organiser les retours clients chaque jour"
+      ,"friendlyTypeCron": "Répéter à une heure définie"
+      ,"friendlyTypeEvery": "Répéter à intervalle fixe"
+      ,"friendlyTypeAt": "Exécuter une seule fois"
+      ,"executionFrequency": "Fréquence"
+      ,"daily": "Chaque jour"
+      ,"weekdays": "Jours ouvrés"
+      ,"weekly": "Chaque semaine"
+      ,"monthly": "Chaque mois"
+      ,"customAdvancedTime": "Planification avancée"
+      ,"weekday": "Jour de la semaine"
+      ,"date": "Date"
+      ,"monthlyDay": "Le {day} de chaque mois"
+      ,"specificTime": "Heure"
+      ,"customTimeHint": "Utilisez une règle horaire plus flexible."
+      ,"openAdvancedTime": "Ouvrir la planification avancée"
+      ,"everyHowOften": "Répéter toutes les"
+      ,"timeUnit": "Unité de temps"
+      ,"minutes": "Minutes"
+      ,"hours": "Heures"
+      ,"days": "Jours"
+      ,"dateAndTime": "Date et heure"
+      ,"friendlyMessagePlaceholder": "Exemple : Résumer les retours clients du jour et proposer les prochaines étapes"
+      ,"moreRuntimeSettings": "Autres paramètres d’exécution (facultatif)"
+      ,"advancedTimeHint": "À utiliser uniquement si le sélecteur ci-dessus ne suffit pas."
+      ,"timezoneSimpleHint": "Il n’est généralement pas nécessaire de modifier ce réglage."
     },
     "form": {
       "cronPreviewPlaceholder": "Saisissez une expression cron à 5 champs pour la prévisualiser",
@@ -2226,6 +2276,8 @@
       "reloadNoChanges": "Le catalogue de compétences est déjà à jour (génération {generation}).",
       "reloadPartial": "Le catalogue de compétences a été rechargé à la génération {generation} avec {errors} erreur(s). {summary}",
       "reloadFailed": "Échec du rechargement du catalogue de compétences : {error}",
+      "overviewTitle": "Aperçu des compétences",
+      "overviewDesc": "Consultez l’état de l’installation et de la configuration, puis filtrez par catégorie.",
       "reloadListFailed": "Le catalogue a été rechargé, mais la liste actualisée des compétences n’a pas pu être chargée.",
       "reloadUnknownError": "La Gateway a conservé le catalogue précédent.",
       "tabsLabel": "Source des compétences",
@@ -2303,6 +2355,10 @@
       "unknown": "inconnu",
       "noAudit": "Aucune décision d'activation automatique enregistrée.",
       "gates": "Barrières"
+    },
+    "tile": {
+      "installed": "Installé",
+      "add": "Ajouter"
     },
     "skillCard": {
       "subSkillsTitle": "Sous-compétences utilisées par cette méta-compétence",
@@ -2668,6 +2724,14 @@
     "historyTurnLoadedCount": "Message chargé {number} sur {total}",
     "historyAttachmentOnly": "Message contenant uniquement des pièces jointes",
     "historyAttachmentCount": "Pièces jointes : {count}",
+    "loadingSession": "Chargement de la conversation…",
+    "loadingSessionDescription": "Restauration des messages récents et de l’état de la session…",
+    "loadSessionFailed": "Conversation temporairement indisponible",
+    "loadSessionDescription": "La connexion a peut-être été interrompue ou le service d’historique est temporairement indisponible. Rechargez pour réessayer.",
+    "reloadSession": "Recharger",
+    "retryingSession": "Rechargement de la conversation",
+    "retryingSessionDescription": "Restauration de l’historique de la conversation…",
+    "retryingSessionAction": "Rechargement…",
     "noMessagesYet": "Aucun message pour l'instant.",
     "newChat": "Nouveau chat",
     "chatWithSuffix": "Chat {suffix}",
@@ -3006,6 +3070,21 @@
       "planWeek": "Ébauche un plan pour ma semaine",
       "searchAiNews": "Recherche les actualités IA du jour",
       "generateImage": "Génère une image d'une petite mascotte calmar"
+    },
+    "metaQuick": {
+      "webpage": "Créer une page web multimédia",
+      "shortDrama": "Créer un court-métrage IA",
+      "paperWriting": "Rédiger un article scientifique",
+      "webpageDesc": "Créer un site soigné et prêt à l’emploi",
+      "shortDramaDesc": "Créer le script, les plans et la vidéo finale",
+      "paperWritingDesc": "Rechercher, rédiger et compiler un article"
+    },
+    "metaDescriptions": {
+      "webpage": "Créer un site multimédia complet à partir d’un sujet.",
+      "kidsProject": "Planifier un projet créatif sûr et adapté aux enfants.",
+      "shortDrama": "Créer un court-métrage IA, du scénario à la vidéo finale.",
+      "skillCreator": "Combiner des compétences dans un workflow réutilisable.",
+      "paperWriting": "Rechercher, rédiger et compiler un article scientifique."
     },
     "toast": {
       "downloadFailedHttp": "Échec du téléchargement — HTTP {status}",

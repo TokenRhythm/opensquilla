@@ -2189,6 +2189,23 @@ async def _handle_sessions_send(
             *,
             merge_into_task: bool = False,
         ) -> TurnAcceptanceResult:
+            reset_archive_writer = None
+            if atomic_intent_plan.action == "reset":
+                write_session_archive = getattr(
+                    ctx.session_manager,
+                    "write_session_archive",
+                    None,
+                )
+                if not callable(write_session_archive):
+                    raise RuntimeError("Reset requires durable session archive support")
+
+                async def reset_archive_writer(snapshot: Any) -> None:
+                    await write_session_archive(
+                        snapshot.node,
+                        list(snapshot.entries),
+                        list(snapshot.summaries),
+                    )
+
             return await storage.accept_turn(
                 persisted_entry,
                 expected_epoch=expected_epoch,
@@ -2208,6 +2225,7 @@ async def _handle_sessions_send(
                     if atomic_intent_plan.action == "reset"
                     else None
                 ),
+                reset_archive_writer=reset_archive_writer,
                 initial_transcript_entries=(
                     atomic_intent_plan.initial_transcript_entries
                     if atomic_intent_plan.action == "fork"

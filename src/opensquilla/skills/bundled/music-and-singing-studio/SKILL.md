@@ -1,6 +1,7 @@
 ---
 name: music-and-singing-studio
 description: "Generate instrumental music, background beds, jingles, or sung songs with lyrics through OpenSquilla audio tools. Use when the user asks for BGM, music generation, 唱歌, 生成歌曲, lyrics to song, or a playable music audio artifact."
+description_zh: "通过OpenSquilla音频工具生成器乐、背景音乐、广告曲或带歌词的演唱歌曲。当用户需要BGM、音乐生成、唱歌、生成歌曲、歌词谱曲或可播放的音乐音频时使用。"
 triggers:
   - "generate music"
   - "music generation"

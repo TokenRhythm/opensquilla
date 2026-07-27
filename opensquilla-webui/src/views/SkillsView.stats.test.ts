@@ -224,6 +224,8 @@ describe('SkillsView stats navigation', () => {
     expect(installedPanel?.style.display).toBe('none')
     expect(registryPanel?.style.display).not.toBe('none')
 
+    el.querySelector<HTMLButtonElement>('[data-testid="skills-overview"]')?.click()
+    await nextTick()
     el.querySelector<HTMLButtonElement>('[data-testid="stat-needs-setup"]')?.click()
     await nextTick()
 
@@ -242,6 +244,8 @@ describe('SkillsView stats navigation', () => {
     el.querySelector<HTMLButtonElement>('#sk-tab-registry')?.click()
     await nextTick()
 
+    el.querySelector<HTMLButtonElement>('[data-testid="skills-overview"]')?.click()
+    await nextTick()
     el.querySelector<HTMLButtonElement>('[data-testid="stat-proposals"]')?.click()
     await nextTick()
     await nextTick()
@@ -265,6 +269,8 @@ describe('SkillsView catalog reload', () => {
     const { app, el, loadData, rpcCall, pushToast } = await mountSkillsView()
     loadData.mockClear()
 
+    el.querySelector<HTMLButtonElement>('[data-testid="skills-overview"]')?.click()
+    await vi.waitFor(() => expect(el.querySelector('[data-testid="skills-reload"]')).not.toBeNull())
     el.querySelector<HTMLButtonElement>('[data-testid="skills-reload"]')?.click()
     await vi.waitFor(() => expect(loadData).toHaveBeenCalledTimes(1))
 
@@ -290,6 +296,8 @@ describe('SkillsView catalog reload', () => {
       errors: [{ message: 'invalid frontmatter', kept_previous: true }],
     })
 
+    el.querySelector<HTMLButtonElement>('[data-testid="skills-overview"]')?.click()
+    await vi.waitFor(() => expect(el.querySelector('[data-testid="skills-reload"]')).not.toBeNull())
     el.querySelector<HTMLButtonElement>('[data-testid="skills-reload"]')?.click()
     await vi.waitFor(() => expect(pushToast).toHaveBeenCalled())
 
@@ -311,6 +319,8 @@ describe('SkillsView catalog reload', () => {
       errors: [],
     }, false)
 
+    el.querySelector<HTMLButtonElement>('[data-testid="skills-overview"]')?.click()
+    await vi.waitFor(() => expect(el.querySelector('[data-testid="skills-reload"]')).not.toBeNull())
     el.querySelector<HTMLButtonElement>('[data-testid="skills-reload"]')?.click()
     await vi.waitFor(() => expect(pushToast).toHaveBeenCalled())
 

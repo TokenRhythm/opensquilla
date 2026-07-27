@@ -18,28 +18,27 @@
             autocomplete="off"
           />
         </div>
-        <button
-          class="btn btn--ghost"
-          data-testid="skills-reload"
-          type="button"
-          :disabled="reloading"
-          :aria-busy="reloading"
-          :title="t('cronSkills.skillsView.reload')"
-          @click="manualReload"
-        >
-          <Icon name="refresh" :size="16" />
-          <span>{{ reloading ? t('cronSkills.skillsView.refreshing') : t('cronSkills.skillsView.reload') }}</span>
+        <button class="btn btn--ghost" data-testid="skills-overview" type="button" @click="skillsOverviewOpen = true">
+          <Icon name="skills" :size="16" />
+          <span>{{ t('cronSkills.skillsView.overviewTitle') }}</span>
         </button>
       </div>
     </header>
 
-    <SkillsStats
-      :tiles="statTiles"
-      :active-key="statusFilter"
-      :proposal-count="proposals.length"
-      @select="selectStatusFilter"
-      @show-proposals="showProposalsFromStats"
-    />
+    <Transition name="modal">
+      <div v-if="skillsOverviewOpen" class="sk-overview-modal" role="dialog" aria-modal="true" aria-labelledby="skills-overview-title" @click.self="skillsOverviewOpen = false">
+        <section class="sk-overview-modal__panel">
+          <header class="sk-overview-modal__head">
+            <div><span class="sk-overview-modal__eyebrow">SKILLS OVERVIEW</span><h2 id="skills-overview-title">{{ t('cronSkills.skillsView.overviewTitle') }}</h2><p>{{ t('cronSkills.skillsView.overviewDesc') }}</p></div>
+            <div class="sk-overview-modal__actions">
+              <button class="btn btn--ghost" data-testid="skills-reload" type="button" :disabled="reloading" :aria-busy="reloading" @click="manualReload"><Icon name="refresh" :size="16" /><span>{{ reloading ? t('cronSkills.skillsView.refreshing') : t('cronSkills.skillsView.reload') }}</span></button>
+              <button class="btn btn--ghost sk-overview-modal__close" type="button" :aria-label="t('common.close')" @click="skillsOverviewOpen = false"><Icon name="x" :size="18" /></button>
+            </div>
+          </header>
+          <SkillsStats :tiles="statTiles" :active-key="statusFilter" :proposal-count="proposals.length" @select="selectStatusFromOverview" @show-proposals="showProposalsFromOverview" />
+        </section>
+      </div>
+    </Transition>
 
     <div class="sk-tabs" role="tablist" :aria-label="t('cronSkills.skillsView.tabsLabel')">
       <button
@@ -236,6 +235,7 @@ interface SkillReloadResult {
 }
 
 const { t } = useI18n()
+const skillsOverviewOpen = ref(false)
 const { pushToast } = useToasts()
 const rpc = useRpcStore()
 const activeTab = ref('installed')
@@ -382,6 +382,15 @@ function scrollToProposals() {
   proposalsPanelRef.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
 
+function selectStatusFromOverview(key: string) {
+  skillsOverviewOpen.value = false
+  selectStatusFilter(key)
+}
+
+async function showProposalsFromOverview() {
+  skillsOverviewOpen.value = false
+  await showProposalsFromStats()
+}
 function selectStatusFilter(key: string) {
   activeTab.value = 'installed'
   setStatusFilter(key)
@@ -421,6 +430,68 @@ async function uninstallSkillAndClose(name: string) {
 </script>
 
 <style>
+/* Compact skills overview */
+.sk-overview-modal {
+  align-items: center;
+  background: var(--scrim);
+  display: flex;
+  inset: 0;
+  justify-content: center;
+  padding: 24px;
+  position: fixed;
+  z-index: 1100;
+}
+
+.sk-overview-modal__panel {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--elev-3);
+  max-width: 960px;
+  padding: 22px;
+  width: 100%;
+}
+
+.sk-overview-modal__head {
+  align-items: flex-start;
+  display: flex;
+  gap: 20px;
+  justify-content: space-between;
+  margin-bottom: 18px;
+}
+
+.sk-overview-modal__eyebrow {
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: .13em;
+}
+
+.sk-overview-modal__head h2 {
+  font-size: 1.125rem;
+  margin: 4px 0 0;
+}
+
+.sk-overview-modal__head p {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  margin: 5px 0 0;
+}
+
+.sk-overview-modal__actions {
+  align-items: center;
+  display: flex;
+  gap: 6px;
+}
+.sk-overview-modal__close {
+  padding: 6px;
+}
+
+@media (max-width: 700px) {
+  .sk-overview-modal { align-items: flex-end; padding: 0; }
+  .sk-overview-modal__panel { border-bottom-left-radius: 0; border-bottom-right-radius: 0; max-height: 88vh; overflow: auto; padding: 18px; }
+}
+
 /* Search */
 .sk-search-wrap {
   position: relative;
@@ -846,6 +917,9 @@ async function uninstallSkillAndClose(name: string) {
 .sk-detail {
   display: flex;
   flex-direction: column;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 20px;
   max-height: 85vh;
 }
 .sk-detail__header {
@@ -868,8 +942,10 @@ async function uninstallSkillAndClose(name: string) {
   line-height: 1;
 }
 .sk-detail__name {
-  font-size: var(--fs-lg);
+  font-family: inherit;
+  font-size: 16px;
   font-weight: 600;
+  line-height: 22px;
 }
 .sk-detail__chips {
   display: flex;
@@ -885,7 +961,9 @@ async function uninstallSkillAndClose(name: string) {
 .sk-detail__desc {
   margin: 0;
   color: var(--text-muted);
-  font-size: var(--fs-sm);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 22px;
 }
 .sk-detail__section {
   display: flex;
@@ -893,10 +971,11 @@ async function uninstallSkillAndClose(name: string) {
   gap: var(--sp-2);
 }
 .sk-detail__section-title {
-  font-size: 10.5px;
+  font-family: inherit;
+  font-size: 13px;
   font-weight: 700;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  line-height: 20px;
   color: var(--text-dim);
 }
 .sk-detail__sub-list {
@@ -907,11 +986,18 @@ async function uninstallSkillAndClose(name: string) {
 .sk-detail__missing {
   margin: 0;
   padding-left: var(--sp-4);
-  font-size: var(--fs-sm);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 22px;
   color: var(--text-muted);
 }
 .sk-detail__missing li {
-  margin-bottom: 4px;
+  margin-bottom: 6px;
+}
+.sk-detail__missing code {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 22px;
 }
 .sk-detail__declared {
   margin-top: 0;
@@ -935,11 +1021,14 @@ async function uninstallSkillAndClose(name: string) {
 .sk-detail__dependency-stat strong {
   color: var(--text);
   font-family: var(--font-mono);
-  font-size: var(--fs-sm);
+  font-size: 13px;
+  line-height: 20px;
 }
 .sk-detail__dependency-stat span {
   color: var(--text-dim);
-  font-size: 10px;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 18px;
 }
 .sk-detail__dependency-stat.is-missing {
   border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
@@ -949,7 +1038,9 @@ async function uninstallSkillAndClose(name: string) {
 }
 .sk-detail__advisory-note {
   color: var(--text-muted);
-  font-size: var(--fs-xs);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 22px;
   margin: 0;
 }
 .sk-detail__install-row {
@@ -961,12 +1052,16 @@ async function uninstallSkillAndClose(name: string) {
   background: var(--bg-elevated);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  font-size: var(--fs-sm);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 20px;
 }
 .sk-detail__link {
   color: var(--accent);
   text-decoration: none;
-  font-size: var(--fs-sm);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 20px;
 }
 .sk-detail__link:hover {
   text-decoration: underline;
@@ -977,7 +1072,9 @@ async function uninstallSkillAndClose(name: string) {
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   color: var(--text-muted);
-  font-size: var(--fs-sm);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 20px;
 }
 .sk-detail__content-state--error {
   color: var(--danger);
@@ -998,7 +1095,8 @@ async function uninstallSkillAndClose(name: string) {
 }
 .sk-detail__path {
   font-family: var(--font-mono);
-  font-size: var(--fs-xs);
+  font-size: 12px;
+  line-height: 18px;
 }
 
 .sk-iconbtn {
@@ -1025,8 +1123,10 @@ async function uninstallSkillAndClose(name: string) {
   align-items: center;
   padding: 2px 8px;
   border-radius: var(--radius-sm);
-  font-size: 10.5px;
+  font-family: inherit;
+  font-size: 12px;
   font-weight: 600;
+  line-height: 18px;
   border: 1px solid var(--border);
   background: var(--bg-elevated);
   color: var(--text-muted);
@@ -1050,7 +1150,7 @@ async function uninstallSkillAndClose(name: string) {
 }
 .sk-chip--trigger {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   background: var(--bg);
 }
 
@@ -1094,6 +1194,7 @@ async function uninstallSkillAndClose(name: string) {
   padding: var(--sp-3);
   font-family: var(--font-mono);
   font-size: 12px;
+  line-height: 20px;
   overflow-x: auto;
   white-space: pre-wrap;
   word-break: break-word;
@@ -1163,5 +1264,166 @@ async function uninstallSkillAndClose(name: string) {
     flex-direction: column;
     align-items: flex-start;
   }
+}
+
+/* Skill catalog groups read as open sections, not cards inside cards. */
+.sk-group--skills {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  overflow: visible;
+}
+.sk-group--skills.sk-group--meta {
+  border: 0;
+}
+.sk-group--skills > .sk-group__head {
+  border-bottom: 0;
+  padding: 14px 2px 12px;
+}
+.sk-group--skills > .sk-grid {
+  padding: 0 0 18px;
+}
+
+/* Skills page typography and alignment contract. */
+.sk-stage {
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.sk-stage button,
+.sk-stage input,
+.sk-stage select {
+  font-family: inherit;
+}
+.sk-stage__header,
+.sk-stage__actions,
+.sk-search-wrap,
+.sk-tab,
+.sk-group__head {
+  align-items: center;
+}
+.sk-stage__title {
+  font-family: var(--font-display);
+  font-size: 24px;
+  font-weight: 700;
+  line-height: 1.25;
+}
+.sk-stage__subtitle {
+  font-size: 13px;
+  line-height: 1.6;
+}
+.sk-stage__actions .btn,
+.sk-tab,
+.sk-search-input {
+  font-size: 13px;
+  line-height: 20px;
+}
+.sk-stage__actions .btn,
+.sk-tab {
+  align-items: center;
+  display: inline-flex;
+  gap: 7px;
+}
+.sk-stage__actions .btn > .icon,
+.sk-tab > .icon,
+.sk-search-icon > .icon {
+  align-items: center;
+  display: inline-flex;
+  height: 18px;
+  justify-content: center;
+  line-height: 0;
+  width: 18px;
+}
+.sk-stage__actions .btn > .icon svg,
+.sk-tab > .icon svg,
+.sk-search-icon > .icon svg {
+  display: block;
+}
+.sk-search-input {
+  height: 38px;
+}
+.sk-search-icon {
+  height: 18px;
+  justify-content: center;
+  line-height: 0;
+  width: 18px;
+}
+.sk-group--skills > .sk-group__head {
+  min-height: 52px;
+}
+.sk-group__label {
+  font-size: 14px;
+  font-weight: 650;
+  line-height: 20px;
+}
+.sk-group__count {
+  align-items: center;
+  display: inline-flex;
+  font-size: 11px;
+  height: 22px;
+  justify-content: center;
+  line-height: 1;
+  min-width: 24px;
+  padding: 0 7px;
+}
+.sk-group__meta {
+  font-size: 12px;
+  line-height: 20px;
+}
+
+/* Shared typography contract for every skill-card surface. */
+.sk-card,
+.sk-tile,
+.sk-stat,
+.sk-proposal-row,
+.sk-registry__results {
+  font-family: var(--font-sans);
+}
+.sk-card__name,
+.sk-registry__name {
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 20px;
+}
+.sk-card__desc,
+.sk-registry__desc {
+  font-size: 13px;
+  line-height: 22px;
+}
+.sk-card__desc {
+  min-height: 44px;
+}
+.sk-card__dep,
+.sk-card__sub-label,
+.sk-card__sub-chip,
+.sk-prop-chip,
+.sk-prop-hash {
+  font-size: 11px;
+  line-height: 18px;
+}
+.sk-proposal-row__id {
+  font-size: 12px;
+  line-height: 18px;
+}
+.sk-stat__label,
+.sk-stat__hint {
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 18px;
+}
+.sk-detail h3 {
+  font-family: inherit;
+  font-size: 16px;
+  line-height: 22px;
+  margin: 0;
+}
+.sk-detail h4 {
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  line-height: 20px;
+  margin: 0;
 }
 </style>

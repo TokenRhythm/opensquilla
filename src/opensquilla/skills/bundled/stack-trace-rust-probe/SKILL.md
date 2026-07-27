@@ -1,6 +1,7 @@
 ---
 name: stack-trace-rust-probe
 description: "Internal helper for meta-stack-trace-investigator. Use when a Rust panic or backtrace needs Rust-specific Result/Option checks, cargo test guidance, and patch targets."
+description_zh: "meta-stack-trace-investigator的内部辅助工具。当Rust panic或回溯需要Rust特定的Result/Option检查、cargo test指引和补丁目标时使用。"
 user-invocable: false
 disable-model-invocation: true
 provenance:

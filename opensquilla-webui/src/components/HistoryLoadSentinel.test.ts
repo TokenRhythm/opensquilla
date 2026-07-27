@@ -118,6 +118,45 @@ describe('HistoryLoadSentinel', () => {
     expect(document.activeElement).toBe(root)
   })
 
+  it('shows retry progress while a canonical history request is already running', async () => {
+    const onLoadEarlier = vi.fn()
+    const { host } = await mountSentinel({
+      blocked: true,
+      canonicalAvailable: false,
+      canonicalComplete: false,
+    }, onLoadEarlier)
+
+    expect(host.textContent).toContain('Loading earlier messages…')
+    expect(host.querySelector('.history-load-sentinel__feedback--loading')).toBeTruthy()
+    expect(host.querySelector('[data-testid="history-load-retry"]')).toBeNull()
+    expect(onLoadEarlier).not.toHaveBeenCalled()
+  })
+
+  it('emits one retry for repeated activation before the parent state updates', async () => {
+    const onLoadEarlier = vi.fn()
+    const { host } = await mountSentinel({ error: true }, onLoadEarlier)
+    const retry = host.querySelector('[data-testid="history-load-retry"]') as HTMLButtonElement
+
+    retry.click()
+    retry.click()
+    await nextTick()
+    expect(onLoadEarlier).toHaveBeenCalledOnce()
+  })
+
+  it('allows another retry after the in-flight request settles', async () => {
+    const onLoadEarlier = vi.fn()
+    const { host, state } = await mountSentinel({ error: true }, onLoadEarlier)
+
+    ;(host.querySelector('[data-testid="history-load-retry"]') as HTMLButtonElement).click()
+    state.blocked = true
+    await nextTick()
+    state.blocked = false
+    await nextTick()
+    ;(host.querySelector('[data-testid="history-load-retry"]') as HTMLButtonElement).click()
+
+    expect(onLoadEarlier).toHaveBeenCalledTimes(2)
+  })
+
   it('shows a truthful legacy notice without a summary or load button', async () => {
     const { host } = await mountSentinel({ canonicalAvailable: true, canonicalComplete: false })
 

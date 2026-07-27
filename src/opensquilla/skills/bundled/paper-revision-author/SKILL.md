@@ -1,6 +1,7 @@
 ---
 name: paper-revision-author
 description: "Revise independently drafted paper sections into one coherent LaTeX body before the abstract is written."
+description_zh: "在撰写摘要前，将各自独立起草的论文章节修订为一体连贯的LaTeX正文。"
 provenance:
   origin: opensquilla-original
   license: Apache-2.0
