@@ -58,11 +58,12 @@
             />
             <button
               type="button"
-              class="btn btn--ghost project-picker__action project-picker__go"
-              @click="browse(locationDraft)"
+              class="btn btn--ghost project-picker__action project-picker__browse"
+              :disabled="systemPickerBusy"
+              @click="openSystemPicker"
             >
-              <Icon name="chevronRight" :size="14" />
-              {{ t('workspaces.goToPath') }}
+              <Icon name="folder" :size="14" />
+              {{ t('workspaces.browse') }}
             </button>
           </div>
           <p v-if="error" class="project-picker__error" role="alert">{{ error }}</p>
@@ -193,6 +194,7 @@ const entries = ref<SandboxPathEntry[]>([])
 const error = ref('')
 const creatingDirectory = ref(false)
 const creatingDirectoryBusy = ref(false)
+const systemPickerBusy = ref(false)
 const newDirectoryName = ref('')
 let openEpoch = 0
 let browseSequence = 0
@@ -328,6 +330,36 @@ function choose() {
   emit('choose', selected)
 }
 
+async function openSystemPicker() {
+  if (!props.open || systemPickerBusy.value) return
+  const epoch = openEpoch
+  systemPickerBusy.value = true
+  error.value = ''
+  const params: Record<string, string> = {
+    sessionKey: props.sessionKey,
+    kind: 'workspace',
+  }
+  if (currentDirectory.value) params.initialPath = currentDirectory.value
+  try {
+    const choice = await rpc.call<{ path: string | null }>(
+      'sandbox.path.pick',
+      params,
+    )
+    if (epoch !== openEpoch || !props.open) return
+    const selected = String(choice?.path || '').trim()
+    if (!selected) return
+    invalidateAndClose()
+    emit('choose', selected)
+  } catch (cause) {
+    if (epoch !== openEpoch || !props.open) return
+    error.value = t('workspaces.directoryPickerFailed', {
+      error: errorMessage(cause),
+    })
+  } finally {
+    if (epoch === openEpoch) systemPickerBusy.value = false
+  }
+}
+
 async function runNativePicker(epoch: number) {
   const nativePicker = getPlatform().files.chooseProjectDirectory
   if (typeof nativePicker !== 'function') {
@@ -376,6 +408,7 @@ watch(
     error.value = ''
     creatingDirectory.value = false
     creatingDirectoryBusy.value = false
+    systemPickerBusy.value = false
     newDirectoryName.value = ''
     if (!open) {
       phase.value = 'closed'

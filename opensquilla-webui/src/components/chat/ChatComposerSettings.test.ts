@@ -55,6 +55,8 @@ describe('ChatComposerSettings coding mode contract', () => {
     expect(runModeSource).toContain("value: 'full'")
     expect(runModeSource).not.toContain("value: 'on'")
     expect(runModeSource).not.toContain("value: 'bypass'")
+    expect(zhHans.chat.composer.runModeStandardDesc)
+      .toBe('访问项目外文件、网络或更改系统时会询问你。')
   })
 
   it('places Coding mode after Visual effects', () => {

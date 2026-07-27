@@ -136,6 +136,13 @@ function setLocation(value: string) {
   input.dispatchEvent(new Event('input', { bubbles: true }))
 }
 
+function submitLocation() {
+  locationInput().dispatchEvent(new KeyboardEvent('keydown', {
+    key: 'Enter',
+    bubbles: true,
+  }))
+}
+
 function button(label: string): HTMLButtonElement {
   const match = [...document.querySelectorAll<HTMLButtonElement>('button')]
     .find(candidate => candidate.textContent?.trim() === label)
@@ -189,16 +196,16 @@ describe('ProjectWorkspacePickerDialog', () => {
     await flushPromises()
 
     const parentAction = button('Parent directory')
-    const goAction = button('Go to path')
+    const browseAction = button('Browse')
     const createAction = button('New folder')
     const chooseAction = button('Choose selected directory')
 
     expect(parentAction.classList.contains('project-picker__action')).toBe(true)
-    expect(goAction.classList.contains('project-picker__action')).toBe(true)
+    expect(browseAction.classList.contains('project-picker__action')).toBe(true)
     expect(createAction.classList.contains('project-picker__action')).toBe(true)
     expect(chooseAction.classList.contains('project-picker__choose')).toBe(true)
     expect(parentAction.querySelector('svg')).toBeTruthy()
-    expect(goAction.querySelector('svg')).toBeTruthy()
+    expect(browseAction.querySelector('svg')).toBeTruthy()
     expect(createAction.querySelector('svg')).toBeTruthy()
     expect(chooseAction.querySelector('svg')).toBeTruthy()
     expect(createAction.closest('.project-picker__browser-toolbar')).toBeTruthy()
@@ -239,10 +246,10 @@ describe('ProjectWorkspacePickerDialog', () => {
     mocks.rpcCall.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise)
 
     setLocation('/repos/a')
-    button('Go to path').click()
+    submitLocation()
     await nextTick()
     setLocation('/repos/b')
-    button('Go to path').click()
+    submitLocation()
     second.resolve(pathResult('/repos/b', []))
     first.resolve(pathResult('/repos/a', []))
     await flushPromises()
@@ -258,7 +265,7 @@ describe('ProjectWorkspacePickerDialog', () => {
     await flushPromises()
 
     setLocation('child')
-    button('Go to path').click()
+    submitLocation()
     await flushPromises()
 
     expect(mocks.rpcCall).toHaveBeenLastCalledWith('sandbox.path.list', {
@@ -355,7 +362,7 @@ describe('ProjectWorkspacePickerDialog', () => {
     await nextTick()
 
     setLocation('/missing')
-    button('Go to path').click()
+    submitLocation()
     await flushPromises()
 
     expect(document.body.textContent).toContain('not readable')
@@ -406,6 +413,41 @@ describe('ProjectWorkspacePickerDialog', () => {
     pending.resolve(pathResult('/repos', []))
     await flushPromises()
     expect(button('Choose selected directory').disabled).toBe(false)
+  })
+
+  it('opens the gateway system picker and immediately chooses its directory', async () => {
+    mocks.rpcCall
+      .mockResolvedValueOnce(pathResult('/repos', []))
+      .mockResolvedValueOnce({ path: '/Users/test/project' })
+    const { events } = await mountPicker()
+    await flushPromises()
+
+    button('Browse').click()
+    await flushPromises()
+
+    expect(mocks.rpcCall).toHaveBeenNthCalledWith(2, 'sandbox.path.pick', {
+      sessionKey: PICKER_KEY,
+      kind: 'workspace',
+      initialPath: '/repos',
+    })
+    expect(events.choose).toHaveBeenCalledOnce()
+    expect(events.choose).toHaveBeenCalledWith('/Users/test/project')
+  })
+
+  it('keeps the web directory browser open when the system picker is cancelled', async () => {
+    mocks.rpcCall
+      .mockResolvedValueOnce(pathResult('/repos', ['/repos/a']))
+      .mockResolvedValueOnce({ path: null })
+    const { events } = await mountPicker()
+    await flushPromises()
+
+    button('Browse').click()
+    await flushPromises()
+
+    expect(events.choose).not.toHaveBeenCalled()
+    expect(events.close).not.toHaveBeenCalled()
+    expect(button('Browse')).toBeTruthy()
+    expect(document.body.textContent).toContain('a')
   })
 
   it('uses the native desktop picker and closes on cancellation', async () => {

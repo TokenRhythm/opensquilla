@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import copy
 import stat
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -147,7 +149,54 @@ def _path_entry_payload(path: Path, *, selection_kind: str) -> dict[str, Any]:
     return payload
 
 
-def _pick_directory_path(initial_dir: str | None = None) -> str:
+_MACOS_DIRECTORY_PICKER_SCRIPT = """
+on run argv
+    set dialogPrompt to item 1 of argv
+    if (count of argv) > 1 then
+        set initialFolder to POSIX file (item 2 of argv)
+        set selectedFolder to choose folder with prompt dialogPrompt default location initialFolder
+    else
+        set selectedFolder to choose folder with prompt dialogPrompt
+    end if
+    return POSIX path of selectedFolder
+end run
+"""
+
+
+def _pick_directory_path_macos(initial_dir: str | None = None) -> str | None:
+    command = [
+        "osascript",
+        "-e",
+        _MACOS_DIRECTORY_PICKER_SCRIPT,
+        "Choose a project folder",
+    ]
+    if initial_dir:
+        command.append(initial_dir)
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+    except OSError as exc:  # pragma: no cover - host environment dependent
+        raise RpcUnavailableError("Directory picker is not available on this host.") from exc
+
+    if result.returncode == 0:
+        return result.stdout.strip() or None
+    if "(-128)" in result.stderr:
+        return None
+    detail = result.stderr.strip()
+    message = "Directory picker is not available on this host."
+    if detail:
+        message = f"{message} {detail}"
+    raise RpcUnavailableError(message)
+
+
+def _pick_directory_path(initial_dir: str | None = None) -> str | None:
+    if sys.platform == "darwin":
+        return _pick_directory_path_macos(initial_dir)
+
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -169,9 +218,7 @@ def _pick_directory_path(initial_dir: str | None = None) -> str:
         if root is not None:
             root.destroy()
 
-    if not selected:
-        raise RpcUnavailableError("Directory selection was cancelled.")
-    return selected
+    return selected or None
 
 
 def _require_session_manager(ctx: RpcContext) -> Any:
@@ -953,6 +1000,8 @@ async def _handle_sandbox_path_pick(params: dict | None, ctx: RpcContext) -> dic
     selected = _pick_directory_path(
         str(initial_dir) if isinstance(initial_dir, str) and initial_dir.strip() else None
     )
+    if selected is None:
+        return {"path": None, "kind": kind}
 
     if kind == "workspace":
         return {"path": _validate_workspace_param(selected), "kind": kind}

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
+import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -1829,7 +1831,10 @@ async def test_rpc_sandbox_path_pick_uses_permission_based_workspace_selection(
         _ctx(manager),
     )
 
-    assert result == {"path": "/etc/shadow", "kind": "workspace"}
+    assert result == {
+        "path": str(Path("/etc/shadow").resolve(strict=False)),
+        "kind": "workspace",
+    }
 
 
 @pytest.mark.asyncio
@@ -1858,6 +1863,117 @@ async def test_rpc_sandbox_path_pick_returns_valid_mount_selection(
     )
 
     assert result == {"path": str(selected), "kind": "mount"}
+
+
+@pytest.mark.asyncio
+async def test_rpc_sandbox_path_pick_returns_null_when_selection_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.gateway.rpc_sandbox as rpc_sandbox
+
+    manager = _SessionManager()
+    monkeypatch.setattr(
+        rpc_sandbox,
+        "_pick_directory_path",
+        lambda initial_dir=None: None,
+    )
+
+    result = await rpc_sandbox._handle_sandbox_path_pick(
+        {
+            "sessionKey": manager.node.session_key,
+            "kind": "workspace",
+        },
+        _ctx(manager),
+    )
+
+    assert result == {"path": None, "kind": "workspace"}
+
+
+def test_pick_directory_path_uses_native_macos_picker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.gateway.rpc_sandbox as rpc_sandbox
+
+    native_picker = SimpleNamespace(calls=[])
+
+    def pick_native(initial_dir=None):
+        native_picker.calls.append(initial_dir)
+        return "/Users/test/project"
+
+    class FakeRoot:
+        def withdraw(self) -> None:
+            pass
+
+        def destroy(self) -> None:
+            pass
+
+    fake_tkinter = SimpleNamespace(
+        Tk=FakeRoot,
+        filedialog=SimpleNamespace(askdirectory=lambda **_kwargs: "/tk/fallback"),
+    )
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(
+        rpc_sandbox,
+        "_pick_directory_path_macos",
+        pick_native,
+        raising=False,
+    )
+    monkeypatch.setitem(sys.modules, "tkinter", fake_tkinter)
+
+    result = rpc_sandbox._pick_directory_path("/Users/test")
+
+    assert result == "/Users/test/project"
+    assert native_picker.calls == ["/Users/test"]
+
+
+def test_native_macos_picker_returns_path_and_passes_initial_directory_as_argument(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.gateway.rpc_sandbox as rpc_sandbox
+
+    run_calls = []
+
+    def fake_run(command, **kwargs):
+        run_calls.append((command, kwargs))
+        return subprocess.CompletedProcess(
+            command,
+            returncode=0,
+            stdout="/Users/test/My Project/\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = rpc_sandbox._pick_directory_path_macos("/Users/test")
+
+    assert result == "/Users/test/My Project/"
+    command, kwargs = run_calls[0]
+    assert command[:2] == ["osascript", "-e"]
+    assert command[-1] == "/Users/test"
+    assert kwargs == {
+        "capture_output": True,
+        "check": False,
+        "text": True,
+    }
+
+
+def test_native_macos_picker_treats_user_cancellation_as_no_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.gateway.rpc_sandbox as rpc_sandbox
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command,
+            returncode=1,
+            stdout="",
+            stderr="execution error: User canceled. (-128)\n",
+        ),
+    )
+
+    assert rpc_sandbox._pick_directory_path_macos(None) is None
 
 
 @pytest.mark.asyncio
