@@ -7,6 +7,7 @@ import contextlib
 import json
 import os
 import re
+import tempfile
 import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, replace
@@ -16,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from opensquilla.engine.steps.inject_time_prefix import stamp as _stamp_time_prefix
-from opensquilla.paths import default_opensquilla_home
+from opensquilla.paths import default_opensquilla_home, native_io_path
 from opensquilla.session.compaction import (
     CompactionConfig,
     CompactionRequest,
@@ -40,6 +41,7 @@ from opensquilla.session.models import (
 )
 from opensquilla.session.storage import (
     CANONICAL_FORK_PROOF_SCHEMA_VERSION,
+    ResetArchiveSnapshot,
     SessionStorage,
 )
 from opensquilla.session.tokenizer import estimate_tokens
@@ -150,8 +152,22 @@ def _archive_dir() -> Path:
     )
 
 
+def _fsync_directory(path: Path) -> None:
+    """Make an atomically published POSIX directory entry durable."""
+
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _safe_archive_part(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-") or "session"
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-") or "session"
+    return safe[:64]
 
 
 def _stable_json(value: Any) -> str:
@@ -612,52 +628,31 @@ class SessionManager:
 
     async def _rotate_session_id(self, node: SessionNode) -> SessionNode:
         old_session_id = node.session_id
-        # Bump the epoch FIRST (before archive/delete/rotate) so the
-        # StaleEpochError guard in append_transcript_entry fences every
-        # in-flight append that read the pre-reset node: once the epoch
-        # advances, such an append's expected_epoch check fails and its blind
-        # whole-node upsert can no longer roll the rotation back. Doing it here
-        # covers all reset call sites (RPC and non-RPC), not just the ones that
-        # separately call _increment_and_emit_epoch.
-        try:
-            new_epoch = await self._storage.increment_epoch(node.session_key)
-            node.epoch = new_epoch
-            self.set_cached_epoch(node.session_key, new_epoch)
-        except Exception:  # noqa: BLE001 - reset must not fail on epoch bump
-            pass
-        await self._archive_session_identity(node)
-        await self._storage.delete_transcript(old_session_id)
-        await self._storage.delete_summaries(old_session_id)
-        await self._storage.invalidate_context_states(
-            node.session_key,
-            reason="session_reset",
-        )
-        node.session_id = str(uuid.uuid4())
-        node.updated_at = _now_ms()
-        node.input_tokens = 0
-        node.output_tokens = 0
-        node.total_tokens = 0
-        node.total_tokens_fresh = False
-        node.estimated_cost_usd = 0.0
-        node.total_cost_usd = 0.0
-        node.billed_cost_usd = 0.0
-        node.estimated_cost_component_usd = 0.0
-        node.cost_source = "none"
-        node.missing_cost_entries = 0
-        node.cache_read = 0
-        node.cache_write = 0
-        node.context_tokens = None
-        node.compaction_count = 0
-        if node.forked_from_parent:
-            node.schema_version = max(
-                node.schema_version,
-                CANONICAL_FORK_PROOF_SCHEMA_VERSION,
+        old_epoch = int(node.epoch or 0)
+        reset = self._build_reset_node(node)
+
+        async def archive_writer(snapshot: ResetArchiveSnapshot) -> None:
+            await self.write_session_archive(
+                snapshot.node,
+                list(snapshot.entries),
+                list(snapshot.summaries),
             )
-        await self._storage.upsert_session(node)
-        return node
+
+        # The storage transaction takes the write lock before re-reading the
+        # old identity and transcript. Appends committed before the lock are
+        # archived; stale appends waiting behind it are fenced by the committed
+        # epoch change. Cache and caller-visible state change only after commit.
+        await self._storage.reset_session(
+            reset,
+            expected_session_id=old_session_id,
+            expected_epoch=old_epoch,
+            archive_writer=archive_writer,
+        )
+        self.set_cached_epoch(reset.session_key, int(reset.epoch or 0))
+        return reset
 
     async def _archive_session_identity(self, node: SessionNode) -> None:
-        """Best-effort raw archive before a same-key transcript reset."""
+        """Persist the raw archive before a same-key transcript reset."""
 
         entries, summaries = await self.capture_session_archive(node)
         await self.write_session_archive(node, entries, summaries)
@@ -673,7 +668,7 @@ class SessionManager:
             summaries = await self._storage.get_all_summaries(node.session_id)
             return entries, summaries
         except Exception:
-            return [], []
+            raise
 
     async def write_session_archive(
         self,
@@ -681,44 +676,59 @@ class SessionManager:
         entries: list[TranscriptEntry],
         summaries: list[SessionSummary],
     ) -> None:
-        """Write a previously captured reset archive after acceptance commits."""
+        """Write a reset archive before destructive state changes commit."""
 
         if not entries and not summaries:
             return
+        archive_dir = _archive_dir()
+        native_archive_dir = native_io_path(archive_dir)
+        new_dir = not native_archive_dir.exists()
+        native_archive_dir.mkdir(parents=True, exist_ok=True)
+        # Harden only the directory this boot creates (mirrors the DB
+        # migrator policy): the archive holds the full raw transcript, so it
+        # must not inherit the umask default of 0755/0644.
+        if new_dir and os.name != "nt":
+            with contextlib.suppress(OSError):
+                os.chmod(native_archive_dir, 0o700)
+        safe_key = _safe_archive_part(node.session_key)
+        safe_id = _safe_archive_part(node.session_id)
+        path = archive_dir / (f"{_now_ms()}-{safe_key}-{safe_id}-{uuid.uuid4().hex}.json")
+        native_path = native_io_path(path)
+        payload = {
+            "schema_version": 1,
+            "archived_at": _now_iso(),
+            "reason": "reset_same_key",
+            "session_key": node.session_key,
+            "session_id": node.session_id,
+            "session": node.model_dump(mode="json"),
+            "transcript_entries": [entry.model_dump(mode="json") for entry in entries],
+            "summaries": [summary.model_dump(mode="json") for summary in summaries],
+        }
+        data = json.dumps(payload, ensure_ascii=False, indent=2)
+
+        # Publish only a complete, flushed owner-only file. A failure leaves the
+        # SQLite reset transaction untouched and the temporary file is removed.
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=os.fspath(native_archive_dir),
+        )
+        temporary_path = Path(temporary_name)
         try:
-            archive_dir = _archive_dir()
-            new_dir = not archive_dir.exists()
-            archive_dir.mkdir(parents=True, exist_ok=True)
-            # Harden only the directory this boot creates (mirrors the DB
-            # migrator policy): the archive holds the full raw transcript, so it
-            # must not inherit the umask default of 0755/0644.
-            if new_dir and os.name != "nt":
+            handle = os.fdopen(fd, "w", encoding="utf-8")
+            fd = -1
+            with handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, native_path)
+            _fsync_directory(native_archive_dir)
+        finally:
+            if fd >= 0:
                 with contextlib.suppress(OSError):
-                    os.chmod(archive_dir, 0o700)
-            safe_key = _safe_archive_part(node.session_key)
-            safe_id = _safe_archive_part(node.session_id)
-            path = archive_dir / f"{_now_ms()}-{safe_key}-{safe_id}.json"
-            payload = {
-                "schema_version": 1,
-                "archived_at": _now_iso(),
-                "reason": "reset_same_key",
-                "session_key": node.session_key,
-                "session_id": node.session_id,
-                "session": node.model_dump(mode="json"),
-                "transcript_entries": [entry.model_dump(mode="json") for entry in entries],
-                "summaries": [summary.model_dump(mode="json") for summary in summaries],
-            }
-            data = json.dumps(payload, ensure_ascii=False, indent=2)
-            # Create the file owner-only (0600) so the raw transcript is never
-            # group/other-readable, matching the sessions.db hardening.
-            if os.name == "nt":
-                path.write_text(data, encoding="utf-8")
-            else:
-                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                    handle.write(data)
-        except Exception:
-            return
+                    os.close(fd)
+            with contextlib.suppress(OSError):
+                os.unlink(temporary_path)
 
     async def resume(self, session_key: str) -> SessionNode:
         """Load an existing session; touch updated_at."""

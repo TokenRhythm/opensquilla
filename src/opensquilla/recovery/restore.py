@@ -357,8 +357,8 @@ def _require_existing_backup_lock_authority(
     ):
         raise RestoreValidationError(
             "recorded backup requires a pre-existing legacy gateway lock authority; "
-            "the backup was not changed—continue with a recovery profile or use the "
-            "complete profile importer to copy this backup into the stopped primary profile",
+            "the backup was not changed—repair and retry the stopped primary profile, "
+            "or use the complete profile importer to copy this backup into it",
             stable_code="restore_backup_lock_authority_missing",
         )
 

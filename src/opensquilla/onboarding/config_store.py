@@ -42,7 +42,7 @@ from opensquilla.gateway.config_migration import (
     make_config_backup,
     migrate_config_payload,
 )
-from opensquilla.paths import default_opensquilla_home
+from opensquilla.paths import default_opensquilla_home, native_io_path
 
 log = structlog.get_logger(__name__)
 
@@ -102,7 +102,7 @@ def resolve_config_path(path: str | Path | None = None) -> tuple[Path, str]:
     if explicit:
         return Path(explicit).expanduser(), "env"
     cwd_candidate = Path.cwd() / "opensquilla.toml"
-    if cwd_candidate.is_file():
+    if native_io_path(cwd_candidate).is_file():
         return cwd_candidate, "cwd"
     return default_opensquilla_home() / "config.toml", "home"
 
@@ -192,13 +192,14 @@ def load_config(
     persist_migrations: bool = True,
 ) -> GatewayConfig:
     target = _resolve_path(path)
-    if not target.exists():
+    target_io = native_io_path(target)
+    if not target_io.exists():
         cfg = GatewayConfig()
         _mark_env_absorbed_runtime_secrets(cfg, None)
         cfg.config_path = str(target)
         _remember_load_baseline(cfg)
         return cfg
-    with target.open("rb") as fh:
+    with target_io.open("rb") as fh:
         data = tomllib.load(fh)
     migration = migrate_config_payload(data)
     cfg = GatewayConfig.model_validate(migration.payload)
@@ -243,6 +244,18 @@ def _config_to_toml_dict(cfg: GatewayConfig) -> dict[str, Any]:
     coerced = _toml_safe(_model_toml_payload(cfg))
     assert isinstance(coerced, dict)
     return coerced
+
+
+def _logical_path_from_io(path: str | Path) -> Path:
+    """Strip an internal Windows extended-length prefix from a public path."""
+
+    value = os.fspath(path)
+    if os.name == "nt":
+        if value.startswith("\\\\?\\UNC\\"):
+            value = "\\\\" + value[len("\\\\?\\UNC\\") :]
+        elif value.startswith("\\\\?\\"):
+            value = value[len("\\\\?\\") :]
+    return Path(value)
 
 
 def _redact_backup_credentials(
@@ -302,7 +315,9 @@ def _atomic_write_toml(target: Path, payload: dict[str, Any]) -> None:
     """Replace one TOML file atomically with owner-only permissions."""
 
     fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=os.fspath(native_io_path(target.parent)),
     )
     try:
         with os.fdopen(fd, "wb") as fh:
@@ -310,7 +325,7 @@ def _atomic_write_toml(target: Path, payload: dict[str, Any]) -> None:
             fh.flush()
             os.fsync(fh.fileno())
         os.chmod(tmp_name, 0o600)
-        os.replace(tmp_name, target)
+        os.replace(tmp_name, native_io_path(target))
     except Exception:
         try:
             os.unlink(tmp_name)
@@ -327,13 +342,16 @@ def _sanitize_managed_config_backups(
 
     prefix = f"{target.name}.backup."
     backup_paths = sorted(
-        path for path in target.parent.iterdir() if path.name.startswith(prefix)
+        target.parent / candidate.name
+        for candidate in native_io_path(target.parent).iterdir()
+        if candidate.name.startswith(prefix)
     )
     for backup_path in backup_paths:
-        if backup_path.is_symlink() or not backup_path.is_file():
+        backup_io = native_io_path(backup_path)
+        if backup_io.is_symlink() or not backup_io.is_file():
             raise OSError(f"Refusing to rewrite non-regular config backup: {backup_path}")
         try:
-            with backup_path.open("rb") as fh:
+            with backup_io.open("rb") as fh:
                 payload = tomllib.load(fh)
         except (tomllib.TOMLDecodeError, ValueError) as exc:
             # An unparseable backup is useless as a restore source, yet its
@@ -347,7 +365,7 @@ def _sanitize_managed_config_backups(
                 error=str(exc),
                 action="deleting corrupt managed backup so the credential clear proceeds",
             )
-            backup_path.unlink(missing_ok=True)
+            backup_io.unlink(missing_ok=True)
             continue
         if _redact_backup_credentials(payload, redaction):
             _atomic_write_toml(backup_path, payload)
@@ -403,7 +421,7 @@ def _unlock_config_file(fh: BinaryIO) -> None:
 def _config_write_lock(target: Path) -> Iterator[None]:
     """Serialize read/merge/replace against every shared persister process."""
     lock_path = target.with_name(f".{target.name}.lock")
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fd = os.open(native_io_path(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
     if os.fstat(fd).st_size == 0:
         os.write(fd, b"\0")
     with os.fdopen(fd, "r+b", buffering=0) as fh:
@@ -590,11 +608,17 @@ def _persist_plan(
     )
     raw: dict[str, Any] | None = None
     disk_usable = True
-    if target.is_file():
+    target_io = native_io_path(target)
+    if target_io.is_file():
         try:
-            with target.open("rb") as fh:
+            with target_io.open("rb") as fh:
                 raw = tomllib.load(fh)
-        except (tomllib.TOMLDecodeError, ValueError) as exc:
+        # UnicodeDecodeError is a ValueError subclass, but list it explicitly:
+        # a config corrupted with non-UTF-8 bytes (seen when an agent edited
+        # the file through a shell with a legacy codepage) must take this
+        # recovery branch — back up the corrupt bytes, then rewrite valid
+        # UTF-8 from the in-memory config — and never propagate as a crash.
+        except (tomllib.TOMLDecodeError, UnicodeDecodeError, ValueError) as exc:
             disk_usable = False
             log.warning(
                 "onboarding.config_persist_unreadable_toml",
@@ -657,12 +681,14 @@ def persist_config(
     establish_path = not bool(config.config_path)
     same_path = establish_path or config.config_path == str(resolved)
     target = resolved
-    if target.is_symlink():
+    target_io = native_io_path(target)
+    if target_io.is_symlink():
         # Write through the symlink: update the real file in place so the
         # link (and anything else resolving through it) survives the swap.
-        target = target.resolve()
+        target = _logical_path_from_io(target_io.resolve())
+        target_io = native_io_path(target)
 
-    target.parent.mkdir(parents=True, exist_ok=True)
+    target_io.parent.mkdir(parents=True, exist_ok=True)
     with _config_write_lock(target):
         baseline_dump, merged = _persist_plan(
             target, config, use_instance_baseline=same_path
@@ -700,11 +726,13 @@ def persist_config(
             backup = False
 
         backup_path: Path | None = None
-        if backup and target.exists():
+        if backup and target_io.exists():
             backup_path = make_config_backup(target)
 
         fd, tmp_name = tempfile.mkstemp(
-            prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            dir=os.fspath(native_io_path(target.parent)),
         )
         try:
             with os.fdopen(fd, "wb") as fh:
@@ -718,7 +746,7 @@ def persist_config(
             # is the commit point; no fallible chmod follows it and turns a
             # successful disk commit into an apparent rollback.
             os.chmod(tmp_name, 0o600)
-            os.replace(tmp_name, target)
+            os.replace(tmp_name, native_io_path(target))
         except Exception:
             try:
                 os.unlink(tmp_name)

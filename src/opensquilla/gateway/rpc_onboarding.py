@@ -1420,6 +1420,45 @@ def apply_audio_provider_configuration(
     }
 
 
+def apply_agent_audio_provider_configuration(
+    config_holder: Any,
+    *,
+    provider_id: str,
+    api_key: str = "",
+    api_key_env: str = "",
+    enabled: bool = True,
+    tts_voice: str = "",
+    tts_model: str = "",
+    language_code: str = "",
+) -> dict[str, Any]:
+    """Apply the constrained audio configuration exposed to agents.
+
+    Operator-facing RPCs may configure compatible endpoints and custom
+    credential environment variables. The agent tool is deliberately pinned
+    to the provider registry so it cannot redirect an unrelated environment
+    credential to a model-selected endpoint.
+    """
+    from opensquilla.onboarding.audio_specs import get_audio_provider_setup_spec
+
+    spec = get_audio_provider_setup_spec(provider_id)
+    if api_key_env and api_key_env != spec.env_key:
+        raise ValueError(
+            f"audio provider {provider_id!r} only accepts api_key_env={spec.env_key!r} "
+            "through this tool"
+        )
+    return apply_audio_provider_configuration(
+        config_holder,
+        provider_id=provider_id,
+        api_key=api_key,
+        api_key_env=api_key_env,
+        base_url=spec.default_base_url,
+        enabled=enabled,
+        tts_voice=tts_voice,
+        tts_model=tts_model,
+        language_code=language_code,
+    )
+
+
 @_d.method("onboarding.audio.configure", scope="operator.admin")
 async def _audio_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
     provider_id = _require(params, "providerId")

@@ -185,7 +185,6 @@
       "compatibilityTitle": "従来の Agent データ保存先",
       "compatibilityDesc": "互換性のある従来の Agent データ保存先を使用しています。変更すると ID とメモリーの参照元が切り替わりますが、データの移動、統合、削除は行いません。",
       "chooseLegacyAgentData": "Agent データ保存先を選択",
-      "recoveryTitle": "リカバリープロファイルではインポートできません",
       "loadFailed": "インポート元を確認できませんでした。",
       "emptyTitle": "他の OpenSquilla データは見つかりませんでした",
       "emptyDesc": "後でもう一度スキャンできます。Desktop ではデータフォルダーを手動選択できます。",
@@ -972,12 +971,12 @@
         },
         "delete-current-profile": {
           "title": "現在のプロファイルを削除",
-          "warning": "一覧の現在のプロファイル、認証情報、ログを削除します。他の復旧プロファイルとバックアップは保持されます。",
+          "warning": "一覧のプライマリプロファイル、認証情報、ログを削除します。記録済みのバックアップは保持されます。",
           "apply": "プロファイルを削除"
         },
         "delete-all-user-data": {
           "title": "OpenSquilla のすべてのユーザーデータを削除",
-          "warning": "OpenSquilla の完全終了後、プライマリ、すべての復旧プロファイル、認証情報、ログ、記録済みバックアップを削除します。",
+          "warning": "OpenSquilla の完全終了後、プライマリプロファイル、認証情報、ログ、記録済みバックアップを削除します。",
           "apply": "すべて削除して終了"
         },
         "inspectFailed": "クリーンアップ場所を確認できませんでした: {detail}",
@@ -985,7 +984,6 @@
         "inventoryCount": "一覧の {total} か所のうち {existing} か所が存在します。",
         "inventoryLabel": "クリーンアップ対象一覧",
         "primaryProfile": "プライマリプロファイル",
-        "recoveryProfile": "復旧プロファイル",
         "present": "存在",
         "missing": "なし",
         "blocked": "クリーンアップは停止されています",
@@ -999,7 +997,7 @@
         "working": "ローカルランタイムを停止し、確認済みのクリーンアップを実行しています…",
         "resetConfirmTitle": "現在の設定をリセットしますか？",
         "resetConfirmBody": "ワークスペースの ID、メモリ、チャットを保持したまま、現在のプロファイルをプロバイダー設定に戻します。",
-        "partial": "クリーンアップが途中で停止しました（{detail}）。残りのデータを保持して復旧オプションを開きました。",
+        "partial": "クリーンアップが途中で停止しました（{detail}）。OpenSquilla は残りのデータを保持し、修復オプションを開きました。",
         "applyFailed": "クリーンアップを開始できませんでした: {detail}",
         "deleteAllScheduled": "OpenSquilla を終了します。アプリの完全終了後にのみ削除を開始します。",
         "resetDone": "現在の設定をリセットしました。プロバイダー設定を再度開きます。",
@@ -1021,7 +1019,6 @@
       "migrationLabel": "データ転送",
       "migrationDesc": "別の OpenSquilla インストールのデータを使用します。事前に内容を確認し、現在の Desktop にデータがある場合は、完全にバックアップしてから置き換えます。",
       "migrationButton": "別のインストールからデータを転送",
-      "migrationRecoveryProfile": "リカバリープロファイルではデータを転送できません。続行するにはメインプロファイルに戻ってください。",
       "migrationNone": "他の OpenSquilla データは見つかりませんでした。",
       "migrationSummaryFailed": "選択したデータを確認できませんでした：{detail}",
       "migrationSummaryTitle": "データ転送を確認",

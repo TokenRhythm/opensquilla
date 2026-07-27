@@ -50,7 +50,7 @@ declare global {
       ok: boolean
       previewId: string | null
       report: DesktopCleanupReport
-      profile: { kind: 'primary' | 'recovery'; recoveryId: string | null }
+      profile: { kind: 'primary'; recoveryId: null }
     }>
     discardDesktopCleanup?: (payload: { previewId: string }) => Promise<boolean>
     applyDesktopCleanup?: (payload: {
@@ -64,7 +64,7 @@ declare global {
       partial?: boolean
       previewId?: string | null
       report?: DesktopCleanupReport
-      profile?: { kind: 'primary' | 'recovery'; recoveryId: string | null }
+      profile?: { kind: 'primary'; recoveryId: null }
       detail?: string
     }>
     revealDesktopUserData?: () => Promise<boolean>
@@ -77,7 +77,6 @@ declare global {
     getBootState: () => Promise<unknown>
     getRecoveryState?: () => Promise<unknown>
     chooseLegacyAgentDataLocation?: (payload?: Record<string, never>) => Promise<unknown>
-    getDesktopProfileKind?: () => Promise<'primary' | 'recovery' | null>
     retryStartup: () => Promise<DesktopRetryStartupResult>
     quitApp: () => Promise<unknown>
     migrationSummary?: (payload?: { source?: string }) => Promise<unknown>
@@ -87,7 +86,7 @@ declare global {
     migrationPeekLastResult?: () => Promise<unknown>
     migrationDismissLastResult?: () => Promise<unknown>
     revealRecoveryPath?: (payload: {
-      target: 'primary' | 'active' | 'backups'
+      target: 'primary' | 'backups'
     }) => Promise<boolean>
     onBootStatus: (callback: (payload: unknown) => void) => () => void
     onBootError: (callback: (payload: unknown) => void) => () => void

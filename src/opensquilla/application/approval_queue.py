@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import ntpath
 import os
 import sqlite3
 import time
@@ -19,6 +20,20 @@ from opensquilla.paths import state_dir
 VALID_APPROVAL_MODES = frozenset({"auto-approve", "auto-deny", "prompt"})
 VALID_ELEVATED_MODES = frozenset({"on", "bypass", "full"})
 VALID_RUN_MODES = frozenset({"standard", "trusted", "full"})
+
+
+def _native_db_path(path: str | Path) -> str:
+    """Return an internal SQLite spelling without changing the public path."""
+
+    value = os.fspath(path)
+    if value == ":memory:" or os.name != "nt":
+        return value
+    absolute = ntpath.abspath(value)
+    if absolute.startswith("\\\\?\\"):
+        return absolute
+    if absolute.startswith("\\\\"):
+        return f"\\\\?\\UNC\\{absolute[2:]}"
+    return f"\\\\?\\{absolute}"
 
 
 @dataclass
@@ -100,9 +115,10 @@ class ApprovalQueue:
         self._event_listeners: list[ApprovalEventListener] = []
 
         self._db_path = Path(db_path or os.fspath(_DEFAULT_APPROVAL_QUEUE_PATH))
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        native_db_path = _native_db_path(self._db_path)
+        os.makedirs(os.path.dirname(native_db_path) or os.curdir, exist_ok=True)
         self._conn = sqlite3.connect(
-            self._db_path,
+            native_db_path,
             timeout=30.0,
             check_same_thread=False,
         )
@@ -976,7 +992,9 @@ def reset_approval_queue() -> None:
         _queue = None
     else:
         path = _DEFAULT_APPROVAL_QUEUE_PATH
+    if os.fspath(path) == ":memory:":
+        return
     try:
-        path.unlink()
+        os.unlink(_native_db_path(path))
     except FileNotFoundError:
         pass

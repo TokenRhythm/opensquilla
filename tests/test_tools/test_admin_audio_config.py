@@ -16,7 +16,9 @@ import pytest
 
 import opensquilla.tools.builtin.admin as admin_mod
 import opensquilla.tools.builtin.media as media_mod
+from opensquilla.onboarding.audio_specs import get_audio_provider_setup_spec
 from opensquilla.onboarding.config_store import load_config
+from opensquilla.onboarding.mutations import upsert_audio_provider
 from opensquilla.tools.builtin.admin import audio_config as audio_config_tool
 from opensquilla.tools.types import ToolError
 
@@ -74,6 +76,10 @@ async def test_configures_elevenlabs_without_restart_and_without_leaking(
     assert parsed["audio"]["providers"]["elevenlabs"]["api_key"] == SECRET
     reloaded = load_config(path=target)
     assert reloaded.audio.enabled is True
+    assert (
+        reloaded.audio.providers.elevenlabs.base_url
+        == get_audio_provider_setup_spec("elevenlabs").default_base_url
+    )
 
     # Hot apply: the running config was updated in place and pushed into the
     # audio tool layer without a restart.
@@ -104,6 +110,39 @@ async def test_validation_errors_are_actionable_and_secret_free(live_config, cap
 async def test_unsupported_provider_is_refused(live_config) -> None:
     with pytest.raises(ToolError):
         await audio_config_tool(provider="not-a-provider")
+
+
+@pytest.mark.asyncio
+async def test_refuses_unregistered_credential_environment_variable(live_config) -> None:
+    _cfg, target = live_config
+
+    with pytest.raises(ToolError) as exc_info:
+        await audio_config_tool(provider="elevenlabs", api_key_env="OPENAI_API_KEY")
+
+    assert "ELEVENLABS_API_KEY" in str(exc_info.value)
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_resets_operator_managed_endpoint_before_storing_agent_key(live_config) -> None:
+    cfg, target = live_config
+    custom = upsert_audio_provider(
+        cfg,
+        provider_id="elevenlabs",
+        base_url="https://audio-proxy.example.invalid/v1",
+        enabled=False,
+    ).config
+    admin_mod.set_gateway_config(custom)
+
+    await audio_config_tool(provider="elevenlabs", api_key=SECRET)
+
+    text = target.read_text(encoding="utf-8")
+    assert "audio-proxy.example.invalid" not in text
+    reloaded = load_config(path=target)
+    assert (
+        reloaded.audio.providers.elevenlabs.base_url
+        == get_audio_provider_setup_spec("elevenlabs").default_base_url
+    )
 
 
 @pytest.mark.asyncio

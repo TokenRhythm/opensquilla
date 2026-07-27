@@ -10,21 +10,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - New agent tool `audio_config`: configures the audio (TTS) provider through
   the same validated path as onboarding — atomic UTF-8 persistence with
-  backup, live hot-apply, `restartRequired: false` — replacing the shell
-  fallbacks (editing `config.toml`, subprocess-only `$env:` exports) that
-  previously corrupted configs. The API key is stored but never echoed in
-  tool results, logs, or errors.
+  backup, live hot-apply, and `restartRequired: false`. Agent-driven setup is
+  restricted to the registered ElevenLabs endpoint and credential environment
+  variable; advanced endpoint settings remain operator-managed. API keys are
+  stored but omitted from tool results and validation errors.
 
 ### Fixed
 
 - The `gateway` tool no longer advertises capabilities it cannot deliver:
-  `restart` and `config_set` (which always failed, driving agents to
-  destructive shell fallbacks) now return guidance pointing to the desktop
-  supervisor and the `audio_config` tool; `config_get` redacts
-  credential-bearing values instead of echoing raw API keys.
+  `restart` and `config_set` now report their actual availability, audio
+  settings point to `audio_config`, and `config_get` uses the canonical
+  public-config redactor instead of echoing credentials.
+- Shell commands that would terminate the gateway's own process
+  (`Stop-Process -Id <gateway pid>`, `taskkill /PID`, `kill`, and
+  name-targeted variants) are structurally refused in every host mode,
+  before any configurable policy layer; other processes stay manageable.
+- Config persistence explicitly routes non-UTF-8 (e.g. GBK-corrupted)
+  config files into the backup-then-rewrite recovery path, with regression
+  coverage for corrupt-file recovery, CJK round-trips, and mid-write
+  failures leaving the original bytes untouched.
 
 ### Changed
 
+- Desktop now consolidates data from legacy recovery profiles into the single
+  primary profile before startup. Existing primary settings remain
+  authoritative; when the primary profile has no settings, the newest legacy
+  recovery settings are adopted automatically. Desktop no longer creates or
+  asks users to confirm isolated recovery profiles.
 - Closing the Desktop main window now preserves the live Control UI on macOS
   and keeps Windows reachable from a system tray icon. Explicit **Quit
   OpenSquilla** still drains and stops the local Gateway, and the close behavior

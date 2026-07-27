@@ -309,13 +309,13 @@ def test_readme_contract_check_uses_the_pinned_node_version() -> None:
     assert check["run"] == "node scripts/check-readme-locales.mjs"
 
 
-def test_desktop_ci_runs_profile_substrate_unit_tests() -> None:
+def test_desktop_ci_runs_primary_profile_substrate_unit_tests() -> None:
     data = _workflow("ci.yml")
     desktop_steps = data["jobs"]["desktop-check"]["steps"]
     unit_step = next(step for step in desktop_steps if step.get("name") == "Run desktop unit tests")
 
     assert "node scripts/test-desktop-profile-substrate.mjs" in unit_step["run"]
-    assert "node scripts/test-desktop-profile-context.mjs" in unit_step["run"]
+    assert "node scripts/test-desktop-profile-consolidation.mjs" in unit_step["run"]
 
 
 def test_pr_target_validator_allows_main_pull_requests(tmp_path: Path) -> None:
@@ -1079,10 +1079,11 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     )
     assert build["run"] == "npm run build"
     assert "xvfb-run -a node" in run["run"]
-    assert "test-profile-recovery-flow.mjs" in run["run"]
-    assert "test-profile-recovery-accessibility.mjs" in run["run"]
+    assert "test-profile-consolidation-flow.mjs" in run["run"]
+    assert "test-primary-repair-accessibility.mjs" in run["run"]
     assert "test-profile-import-flow.mjs" in run["run"]
-    assert "test-unsafe-profile-no-write.mjs" in run["run"]
+    assert "test-desktop-cleanup-flow.mjs" in run["run"]
+    assert "test-unsafe-legacy-recovery-no-write.mjs" in run["run"]
     assert "exit 1" in run["run"]
     assert upload["if"] == "${{ always() }}"
     assert "github.run_attempt" in upload["with"]["name"]
@@ -1498,3 +1499,37 @@ def test_wheelhouse_release_hydrates_current_router_bundle() -> None:
     assert 'root / "router.runtime.yaml"' in text
     assert "intent_head.joblib" not in text
     assert "router_model.onnx" not in text
+
+
+def test_linux_desktop_recovery_e2e_scripts_preserve_x11_authority() -> None:
+    """The xvfb display needs ``DISPLAY`` and ``XAUTHORITY`` to survive scrubbing.
+
+    These harnesses strip credential-shaped variables from the Electron child
+    environment, and ``XAUTHORITY`` matches that pattern.  Dropping it makes the
+    ubuntu Desktop recovery E2E job fail with ``Missing X server or $DISPLAY``,
+    so every harness that scrubs must exempt the X11 variables.
+    """
+
+    data = _workflow("ci.yml")
+    steps = data["jobs"]["desktop-recovery-e2e"]["steps"]
+    step = next(
+        item for item in steps if item.get("name") == "Run compiled Desktop recovery flows"
+    )
+    run = step["run"]
+    assert "xvfb-run" in run, "the Linux branch must provide a virtual display"
+
+    scripts = re.findall(r"'[a-z0-9-]+:(scripts/[A-Za-z0-9_./-]+\.mjs)'", run)
+    assert scripts, "no Desktop recovery E2E scripts were found in ci.yml"
+
+    exemption = "name === 'DISPLAY' || name === 'XAUTHORITY'"
+    for relative in scripts:
+        path = Path("desktop/electron") / relative
+        assert path.is_file(), f"missing Desktop recovery E2E script: {path}"
+        source = path.read_text(encoding="utf-8")
+        if "CREDENTIAL|AUTH" not in source:
+            continue
+        assert exemption in source, (
+            f"{path} scrubs credential-shaped environment variables without exempting "
+            "DISPLAY/XAUTHORITY, so the ubuntu Desktop recovery E2E job will fail with "
+            "'Missing X server or $DISPLAY'"
+        )

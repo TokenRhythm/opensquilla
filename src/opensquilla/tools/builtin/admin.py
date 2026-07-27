@@ -33,45 +33,21 @@ _VALID_CRON_ACTIONS = ("list", "add", "remove", "run")
 
 _VALID_GATEWAY_ACTIONS = ("config_get",)
 
-# Actions the tool USED to advertise. They were never functional (restart
+# Actions the tool used to advertise. They were never functional (restart
 # always raised; config_set depended on a GatewayConfig.patch() that does not
-# exist), but agents that saw the old contract still try them — and, worse,
-# fall back to editing config.toml or killing the gateway through shell
-# commands when they fail. Keep them recognized so the error can steer the
-# agent to the safe path instead of a generic "invalid action".
+# exist). Keep them recognized so callers receive the accurate replacement
+# contract instead of a generic "invalid action".
 _RETIRED_GATEWAY_ACTIONS = {
     "restart": (
-        "Gateway restart is not available to agents: the desktop supervisor "
-        "(or the operator's service manager) owns the gateway lifecycle. "
-        "Audio configuration via the audio_config tool applies immediately "
-        "and does NOT need a restart. Never terminate the gateway process "
-        "via shell commands."
+        "Gateway restart is not available through this tool. Audio configuration "
+        "via audio_config applies immediately and does not require a restart."
     ),
     "config_set": (
-        "Direct config writes are not available to agents. For audio (TTS) "
-        "providers use the audio_config tool — it validates, persists "
-        "atomically, and hot-applies without a restart. Other settings "
-        "belong to the operator's Settings UI. Never edit config.toml or "
-        "export environment variables via shell commands: a subprocess "
-        "environment does not reach the running gateway, and hand-written "
-        "config edits have corrupted UTF-8 configs before."
+        "Configuration writes are not available through this tool. For audio "
+        "(TTS) providers use audio_config, which validates, persists atomically, "
+        "and hot-applies without a restart."
     ),
 }
-
-# Dot-path segments whose values must never be echoed back to an agent.
-_SECRET_KEY_FRAGMENTS = ("api_key", "token", "secret", "password", "credential")
-
-
-def _redact_config_secrets(value: object, key_hint: str = "") -> object:
-    """Recursively mask values whose key names look credential-bearing."""
-    lowered = key_hint.lower()
-    if isinstance(value, dict):
-        return {k: _redact_config_secrets(v, str(k)) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_redact_config_secrets(v, key_hint) for v in value]
-    if any(fragment in lowered for fragment in _SECRET_KEY_FRAGMENTS):
-        return "[redacted]" if value else value
-    return value
 
 
 class _SchedulerProtocol(Protocol):
@@ -612,8 +588,7 @@ async def cron(
         "Read gateway configuration values (action: config_get). "
         "Credential-bearing values are redacted. Configuration writes and "
         "restarts are not available here: audio providers are configured "
-        "through the audio_config tool (applies immediately, no restart), "
-        "and the gateway lifecycle belongs to the desktop supervisor."
+        "through audio_config and apply immediately without a restart."
     ),
     params={
         "action": {
@@ -663,9 +638,17 @@ async def gateway(
             break
     if val is None:
         raise ToolError(f"Config key not found: {key}")
-    # Agents never need raw credentials back; mask by key name, both for the
-    # terminal path segment and for any nested mapping fields.
-    redacted = _redact_config_secrets(val, parts[-1])
+    # Reuse the public config contract so this tool cannot drift behind newly
+    # added credential fields such as channel encryption keys. Scalar leaf
+    # reads need their dot-path segment checked explicitly because the shared
+    # recursive redactor only sees mapping keys.
+    from opensquilla.gateway.config import is_sensitive_config_key, redact_public_config
+
+    redacted = (
+        "[redacted]"
+        if is_sensitive_config_key(parts[-1]) and val
+        else redact_public_config(val)
+    )
     return json.dumps({"action": "config_get", "key": key, "value": redacted})
 
 
@@ -679,10 +662,9 @@ async def gateway(
     description=(
         "Configure the audio (TTS) provider safely. Validates the settings, "
         "persists config.toml atomically (UTF-8, backup kept), and "
-        "hot-applies to the running gateway — no restart needed. Use this "
-        "instead of editing config.toml or exporting environment variables "
-        "via shell commands: a subprocess environment never reaches the "
-        "running gateway. The API key is stored but never echoed back."
+        "hot-applies to the running gateway without a restart. Agent-driven "
+        "configuration uses the provider's registered endpoint and credential "
+        "environment variable. The API key is stored but never echoed back."
     ),
     params={
         "provider": {
@@ -703,7 +685,6 @@ async def gateway(
         },
         "tts_voice": {"type": "string", "description": "TTS voice id"},
         "tts_model": {"type": "string", "description": "TTS model id"},
-        "base_url": {"type": "string", "description": "Override the provider API base URL"},
         "language_code": {"type": "string", "description": "Language code hint for TTS"},
     },
     required=["provider"],
@@ -716,7 +697,6 @@ async def audio_config(
     enabled: bool = True,
     tts_voice: str = "",
     tts_model: str = "",
-    base_url: str = "",
     language_code: str = "",
 ) -> str:
     if _gateway_config is None:
@@ -724,16 +704,15 @@ async def audio_config(
 
     from types import SimpleNamespace
 
-    from opensquilla.gateway.rpc_onboarding import apply_audio_provider_configuration
+    from opensquilla.gateway.rpc_onboarding import apply_agent_audio_provider_configuration
 
     holder = SimpleNamespace(config=_gateway_config)
     try:
-        result = apply_audio_provider_configuration(
+        result = apply_agent_audio_provider_configuration(
             holder,
             provider_id=provider,
             api_key=api_key,
             api_key_env=api_key_env,
-            base_url=base_url,
             enabled=enabled,
             tts_voice=tts_voice,
             tts_model=tts_model,

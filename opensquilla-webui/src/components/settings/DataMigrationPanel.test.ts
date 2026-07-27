@@ -126,7 +126,6 @@ function cleanupReport(
 
 function desktopMaintenanceApi(overrides: Record<string, unknown> = {}) {
   return {
-    getDesktopProfileKind: async () => 'primary',
     getRecoveryState: async () => ({ inspection: { outcome: 'ready', stable_code: 'ready' } }),
     migrationSummary: vi.fn(async () => ({ ok: true, candidates: [], candidate: null, report: null })),
     migrationRun: vi.fn(),
@@ -144,7 +143,6 @@ describe('DataMigrationPanel desktop provider', () => {
     const { el } = await mountPanel({
       desktopApi: {
         getOsLocale: async () => 'en',
-        getDesktopProfileKind: async () => 'primary',
         getRecoveryState: async () => ({ inspection: { outcome: 'ready', stable_code: 'ready' } }),
         migrationSummary,
         migrationRun: vi.fn(),
@@ -185,7 +183,6 @@ describe('DataMigrationPanel desktop provider', () => {
     const { el } = await mountPanel({
       desktopApi: {
         getOsLocale: async () => 'en',
-        getDesktopProfileKind: async () => 'primary',
         getRecoveryState: async () => ({
           inspection: { outcome: 'attention', stable_code: 'workspace_conflict' },
         }),
@@ -221,7 +218,6 @@ describe('DataMigrationPanel desktop provider', () => {
       confirm,
       desktopApi: {
         getOsLocale: async () => 'en',
-        getDesktopProfileKind: async () => 'primary',
         migrationSummary,
         migrationRun,
       },
@@ -254,7 +250,6 @@ describe('DataMigrationPanel desktop provider', () => {
       confirm,
       desktopApi: {
         getOsLocale: async () => 'en',
-        getDesktopProfileKind: async () => 'primary',
         migrationSummary,
         migrationRun,
       },
@@ -287,7 +282,6 @@ describe('DataMigrationPanel desktop provider', () => {
     const { el } = await mountPanel({
       desktopApi: {
         getOsLocale: async () => 'en',
-        getDesktopProfileKind: async () => 'primary',
         migrationSummary: vi.fn(async () => ({ ok: true, candidates: [], candidate: null, report: null })),
         migrationRun: vi.fn(),
         migrationPeekLastResult,
@@ -316,7 +310,6 @@ describe('DataMigrationPanel desktop provider', () => {
     const { el } = await mountPanel({
       desktopApi: {
         getOsLocale: async () => 'en',
-        getDesktopProfileKind: async () => 'primary',
         retryStartup,
         migrationPeekLastResult: async () => ({
           ok: false,
@@ -350,7 +343,6 @@ describe('DataMigrationPanel desktop provider', () => {
     const { el } = await mountPanel({
       desktopApi: {
         getOsLocale: async () => 'en',
-        getDesktopProfileKind: async () => 'primary',
         getGatewayStatus,
         retryStartup,
         migrationPeekLastResult: async () => ({
@@ -444,7 +436,7 @@ describe('DataMigrationPanel desktop cleanup', () => {
           ok: false,
           previewId: null,
           report,
-          profile: { kind: 'recovery' as const, recoveryId: '01234567-89ab-4cde-8fab-0123456789ab' },
+          profile: { kind: 'primary' as const, recoveryId: null },
         })),
         discardDesktopCleanup: vi.fn(async () => true),
         applyDesktopCleanup: vi.fn(),
@@ -458,7 +450,7 @@ describe('DataMigrationPanel desktop cleanup', () => {
     const summary = el.querySelector('[data-testid="data-migration-cleanup-summary"]')
     expect(summary?.getAttribute('aria-labelledby')).toBe('cleanup-summary-title')
     expect(summary?.textContent).toContain('cleanup_history_invalid')
-    expect(summary?.textContent).toContain('Recovery profile')
+    expect(summary?.textContent).toContain('Primary profile')
     expect(el.querySelector('[data-testid="data-migration-cleanup-apply"]')).toBeNull()
     expect(summary?.querySelector('input[type="checkbox"]')).toBeNull()
     expect(summary?.querySelector('input[type="text"]')).toBeNull()

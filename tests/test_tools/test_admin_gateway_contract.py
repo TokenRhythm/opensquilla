@@ -36,13 +36,13 @@ def wired_config(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_restart_returns_supervisor_guidance(wired_config) -> None:
+async def test_restart_reports_unavailable_without_supervisor_guidance(wired_config) -> None:
     with pytest.raises(ToolError) as exc_info:
         await gateway_tool(action="restart")
     message = str(exc_info.value)
-    assert "supervisor" in message
+    assert "not available" in message
     assert "audio_config" in message
-    assert "shell" in message.lower()
+    assert "supervisor" not in message
 
 
 @pytest.mark.asyncio
@@ -51,9 +51,7 @@ async def test_config_set_returns_safe_path_guidance(wired_config) -> None:
         await gateway_tool(action="config_set", key="audio.enabled", value="true")
     message = str(exc_info.value)
     assert "audio_config" in message
-    assert "config.toml" in message
-    # The old dead-end phrasings are gone.
-    assert "not supported" not in message.lower()
+    assert "supervisor" not in message
 
 
 @pytest.mark.asyncio
@@ -81,6 +79,30 @@ async def test_config_get_redacts_credentials_inside_sections(wired_config) -> N
     payload = json.loads(raw)
     providers = payload["value"]["providers"]["elevenlabs"]
     assert providers["api_key"] == "[redacted]"
+
+
+@pytest.mark.asyncio
+async def test_config_get_uses_canonical_channel_crypto_redaction(wired_config) -> None:
+    class ConfigWithChannelCrypto:
+        @staticmethod
+        def to_toml_dict():
+            return {
+                "channels": {
+                    "feishu": {"encrypt_key": "feishu-encryption-key"},
+                    "wecom": {"encoding_aes_key": "wecom-encryption-key"},
+                }
+            }
+
+    admin_mod.set_gateway_config(ConfigWithChannelCrypto())
+
+    section = json.loads(await gateway_tool(action="config_get", key="channels"))["value"]
+    assert section["feishu"]["encrypt_key"] == "[redacted]"
+    assert section["wecom"]["encoding_aes_key"] == "[redacted]"
+
+    leaf = json.loads(
+        await gateway_tool(action="config_get", key="channels.feishu.encrypt_key")
+    )["value"]
+    assert leaf == "[redacted]"
 
 
 @pytest.mark.asyncio

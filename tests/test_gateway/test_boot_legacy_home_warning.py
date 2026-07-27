@@ -11,6 +11,8 @@ technique as the workspace/state mismatch test in ``test_router_boot.py``.
 
 from __future__ import annotations
 
+import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -85,6 +87,45 @@ def test_established_home_is_silent_and_skips_detection(
 
     assert warnings == []
     assert calls == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length path contract")
+def test_extended_length_established_home_skips_legacy_detection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.persistence.migrator import _native_sqlite_path
+
+    warnings = _capture_warnings(monkeypatch)
+    long_root = tmp_path / "long-home"
+    state_dir = long_root
+    index = 0
+    while len(str(state_dir / "sessions.db")) < 280:
+        state_dir /= f"state-segment-{index:02d}-0123456789"
+        index += 1
+    native_state = _native_sqlite_path(state_dir)
+    os.makedirs(native_state)
+    with open(_native_sqlite_path(state_dir / "sessions.db"), "wb") as handle:
+        handle.write(b"")
+    calls: list[Path | None] = []
+    monkeypatch.setattr(
+        legacy_detect,
+        "detect_legacy_home",
+        lambda target=None: calls.append(target),
+    )
+    config = GatewayConfig(
+        state_dir=str(state_dir),
+        config_path=str(tmp_path / "home" / "config.toml"),
+    )
+    try:
+        _warn_legacy_home_detected(config)
+
+        assert warnings == []
+        assert calls == []
+    finally:
+        native_root = _native_sqlite_path(long_root)
+        if os.path.exists(native_root):
+            shutil.rmtree(native_root)
 
 
 def test_fresh_home_without_candidate_is_silent(

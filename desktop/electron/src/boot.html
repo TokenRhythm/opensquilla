@@ -8,40 +8,59 @@
   <style>
     :root {
       color-scheme: light dark;
-      --bg: #f8f7f3;
-      --surface: #fffefa;
-      --ink: #1d1f1d;
-      --muted: #686e66;
-      --dim: #8b9088;
-      --line: rgba(34, 31, 27, 0.12);
-      --accent: #F26A1B;
-      --danger: #a23a22;
+      --bg: #F4F5F7;
+      --surface: #FFFFFF;
+      --panel: rgba(255, 255, 255, 0.78);
+      --panel-solid: #FFFFFF;
+      --ink: #1D1D1F;
+      --muted: #5F6066;
+      --dim: #85868D;
+      --line: rgba(29, 29, 31, 0.09);
+      --line-strong: rgba(29, 29, 31, 0.15);
+      --accent: #BA4D0F;
+      --accent-soft: rgba(186, 77, 15, 0.11);
+      --glow: rgba(186, 77, 15, 0.08);
+      --danger: #C2382E;
+      --danger-soft: rgba(194, 56, 46, 0.08);
+      --shadow: 0 28px 80px rgba(16, 20, 26, 0.12), 0 2px 8px rgba(16, 20, 26, 0.05);
     }
 
-    /* The app theme defaults to "system", so match the OS here — a dark-OS user
-       gets a dark splash that hands off to the dark app with no luminance flash.
-       These mirror the app's canonical "Instrument" dark tokens. */
+    /* The app theme defaults to "system", so match the OS here and keep the
+       full-window canvas aligned with the Control UI through the handoff. */
     @media (prefers-color-scheme: dark) {
       :root {
         --bg: #0E0F11;
-        --surface: #161719;
-        --ink: #e8e8ea;
-        --muted: #9a9aa0;
-        --dim: #6b6b72;
-        --line: rgba(255, 255, 255, 0.12);
+        --surface: #28282B;
+        --panel: rgba(32, 32, 34, 0.78);
+        --panel-solid: #202022;
+        --ink: #F5F5F7;
+        --muted: #B0B0B6;
+        --dim: #87878E;
+        --line: rgba(255, 255, 255, 0.08);
+        --line-strong: rgba(255, 255, 255, 0.14);
         --accent: #F26A1B;
+        --accent-soft: rgba(242, 106, 27, 0.14);
+        --glow: rgba(242, 106, 27, 0.09);
+        --danger: #FF6B6B;
+        --danger-soft: rgba(255, 107, 107, 0.09);
+        --shadow: 0 34px 90px rgba(0, 0, 0, 0.34), 0 2px 10px rgba(0, 0, 0, 0.18);
       }
     }
 
     * { box-sizing: border-box; }
 
+    html { background: var(--bg); }
+
     body {
       margin: 0;
       min-height: 100vh;
       overflow: hidden;
-      background: var(--bg);
+      background:
+        radial-gradient(circle at 50% 43%, var(--glow) 0, transparent 34%),
+        var(--bg);
       color: var(--ink);
       font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      -webkit-font-smoothing: antialiased;
     }
 
     .shell {
@@ -52,86 +71,132 @@
     }
 
     .boot {
-      width: min(520px, calc(100vw - 48px));
+      position: relative;
+      width: min(476px, calc(100vw - 48px));
       display: grid;
-      gap: 34px;
-      padding: 4px;
+      gap: 30px;
+      padding: 46px 44px 40px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 30px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(28px) saturate(1.15);
+      -webkit-backdrop-filter: blur(28px) saturate(1.15);
+    }
+
+    .boot::before {
+      content: "";
+      position: absolute;
+      inset: 0 18% auto;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.72), transparent);
+      pointer-events: none;
     }
 
     .brand {
       display: grid;
-      gap: 12px;
+      justify-items: center;
+      gap: 10px;
+      text-align: center;
     }
 
     .mark-row {
       align-items: center;
-      display: flex;
-      gap: 11px;
+      display: grid;
+      justify-items: center;
+      gap: 18px;
     }
 
-    .mark {
-      width: 22px;
-      height: 22px;
-      border: 2px solid var(--ink);
+    .loader {
       position: relative;
+      width: 58px;
+      height: 58px;
+      display: grid;
+      place-items: center;
     }
 
-    .mark::after {
+    .loader::before {
       content: "";
-      position: absolute;
-      bottom: -2px;
-      right: -7px;
       width: 9px;
-      height: 2px;
-      background: var(--accent);
+      height: 9px;
+      border-radius: 50%;
+      background: var(--accent-soft);
+      box-shadow: 0 0 18px var(--accent-soft);
+      animation: loader-core 1.1s ease-in-out infinite;
+    }
+
+    .loader span {
+      position: absolute;
+      left: 27px;
+      top: 3px;
+      width: 4px;
+      height: 13px;
+      border-radius: 999px;
+      background: var(--muted);
+      opacity: 0.15;
+      transform: rotate(calc(var(--i) * 45deg));
+      transform-origin: 2px 26px;
+      animation: loader-segment 1.1s linear infinite;
+      animation-delay: calc(var(--i) * -0.1375s);
     }
 
     h1 {
       margin: 0;
-      font-size: 28px;
-      font-weight: 760;
-      letter-spacing: 0;
+      font-size: 27px;
+      font-weight: 680;
+      letter-spacing: -0.045em;
       line-height: 1;
     }
 
     .subtitle {
       color: var(--muted);
-      font-size: 14px;
-      line-height: 1.5;
+      font-size: 13px;
+      line-height: 1.45;
       margin: 0;
       max-width: 42ch;
     }
 
     .status {
       display: grid;
-      gap: 13px;
-      padding-top: 2px;
+      gap: 14px;
+      padding: 18px 18px 16px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: color-mix(in srgb, var(--surface) 62%, transparent);
     }
 
     .status-line {
-      height: 2px;
+      height: 5px;
       overflow: hidden;
-      background: rgba(29, 31, 29, 0.1);
+      border-radius: 999px;
+      background: var(--line);
     }
 
     .status-line::before {
-      animation: progress 1.6s ease-in-out infinite;
-      background: var(--accent);
+      animation: progress 1.8s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+      background: linear-gradient(90deg, transparent, var(--accent) 28%, var(--accent) 72%, transparent);
       content: "";
       display: block;
       height: 100%;
-      width: 38%;
+      width: 46%;
+      border-radius: inherit;
     }
 
-    /* On a startup failure the splash is paused, not working — freeze the
-       indeterminate sweep so it doesn't contradict the "Startup paused" state. */
+    /* On a startup failure the splash is paused, not working — freeze every
+       indeterminate animation so it doesn't contradict the paused state. */
     body.errored .status-line::before {
       animation: none;
       opacity: 0.2;
     }
 
+    body.errored .loader::before,
+    body.errored .loader span {
+      animation-play-state: paused;
+    }
+
     .status-copy {
-      align-items: baseline;
+      align-items: center;
       display: flex;
       justify-content: space-between;
       gap: 18px;
@@ -139,52 +204,68 @@
 
     .phase {
       color: var(--ink);
-      font-size: 14px;
-      font-weight: 680;
+      font-size: 13px;
+      font-weight: 590;
       min-width: 0;
     }
 
     .timer {
       color: var(--dim);
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 12px;
+      font-size: 11px;
       font-variant-numeric: tabular-nums;
+      letter-spacing: -0.02em;
       white-space: nowrap;
     }
 
     .steps {
       display: grid;
-      gap: 8px;
+      gap: 6px;
       grid-template-columns: repeat(3, 1fr);
     }
 
     .step {
-      border-top: 1px solid var(--line);
+      position: relative;
       color: var(--dim);
-      font-size: 11px;
-      font-weight: 720;
-      letter-spacing: 0.06em;
-      padding-top: 10px;
-      text-transform: uppercase;
-      transition: color 160ms ease, border-color 160ms ease;
+      font-size: 10px;
+      font-weight: 620;
+      letter-spacing: 0.01em;
+      padding-top: 11px;
+      transition: color 180ms ease;
+    }
+
+    .step::before {
+      content: "";
+      position: absolute;
+      inset: 0 0 auto;
+      height: 2px;
+      border-radius: 999px;
+      background: var(--line-strong);
+      transition: background 180ms ease, box-shadow 180ms ease;
     }
 
     .step.active {
-      border-color: var(--accent);
       color: var(--ink);
     }
 
+    .step.active::before {
+      background: var(--accent);
+      box-shadow: 0 0 10px var(--accent-soft);
+    }
+
     .step.done {
-      border-color: rgba(29, 31, 29, 0.32);
       color: var(--muted);
     }
+
+    .step.done::before { background: var(--muted); }
 
     .error {
       display: none;
       gap: 13px;
-      padding: 16px;
-      border: 1px solid rgba(162, 58, 34, 0.28);
-      background: #fff8f5;
+      padding: 18px;
+      border: 1px solid color-mix(in srgb, var(--danger) 24%, transparent);
+      border-radius: 18px;
+      background: var(--danger-soft);
       color: var(--danger);
     }
 
@@ -194,7 +275,8 @@
       display: none;
       gap: 18px;
       padding: 20px;
-      border: 1px solid rgba(242, 106, 27, 0.28);
+      border: 1px solid var(--line);
+      border-radius: 20px;
       background: var(--surface);
     }
 
@@ -202,6 +284,13 @@
 
     body.recovering .status,
     body.recovering .error { display: none; }
+
+    body.recovering { overflow: auto; }
+
+    body.recovering .boot {
+      width: min(760px, calc(100vw - 48px));
+      margin-block: 32px;
+    }
 
     .recovery h2 {
       margin: 0;
@@ -266,6 +355,7 @@
       font: inherit;
       font-size: 12px;
       padding: 0 9px;
+      border-radius: 9px;
     }
 
     .check-row {
@@ -301,7 +391,7 @@
     }
 
     .error p {
-      color: #75584f;
+      color: var(--muted);
       font-size: 13px;
       line-height: 1.45;
       margin: 0;
@@ -323,31 +413,67 @@
       cursor: pointer;
       font: inherit;
       font-size: 12px;
-      font-weight: 720;
+      font-weight: 620;
       padding: 0 12px;
+      border-radius: 9px;
+      transition: filter 160ms ease, transform 160ms ease, background 160ms ease;
+    }
+
+    button:not(:disabled):hover {
+      filter: brightness(0.97);
+    }
+
+    button:not(:disabled):active {
+      transform: scale(0.98);
     }
 
     button.primary {
       border-color: var(--accent);
       background: var(--accent);
       color: #fff;
+      box-shadow: 0 6px 18px -10px var(--accent);
     }
 
     @keyframes progress {
-      0% { transform: translateX(-110%); opacity: 0.35; }
-      24% { opacity: 1; }
-      100% { transform: translateX(270%); opacity: 0.45; }
+      0% { transform: translateX(-115%); opacity: 0.35; }
+      28%, 68% { opacity: 1; }
+      100% { transform: translateX(250%); opacity: 0.35; }
+    }
+
+    @keyframes loader-segment {
+      0%, 12.5% {
+        background: var(--accent);
+        opacity: 1;
+        box-shadow: 0 0 8px var(--accent-soft);
+      }
+      37.5% { opacity: 0.34; }
+      100% {
+        background: var(--muted);
+        opacity: 0.12;
+        box-shadow: none;
+      }
+    }
+
+    @keyframes loader-core {
+      0%, 100% { transform: scale(0.82); opacity: 0.5; }
+      50% { transform: scale(1); opacity: 1; }
     }
 
     @media (max-width: 560px) {
-      .shell { padding: 28px; }
+      .shell { padding: 16px; }
+      .boot {
+        width: min(100%, 476px);
+        padding: 36px 22px 24px;
+        border-radius: 24px;
+      }
       .status-copy {
         align-items: flex-start;
         flex-direction: column;
         gap: 6px;
       }
-      .steps {
-        grid-template-columns: 1fr;
+      body.recovering .boot {
+        width: calc(100vw - 24px);
+        margin-block: 12px;
       }
     }
 
@@ -365,7 +491,16 @@
     <main class="boot" aria-label="OpenSquilla startup" data-i18n-aria="bootAria">
       <section class="brand">
         <div class="mark-row">
-          <span class="mark" aria-hidden="true"></span>
+          <span class="loader" aria-hidden="true">
+            <span style="--i: 0"></span>
+            <span style="--i: 1"></span>
+            <span style="--i: 2"></span>
+            <span style="--i: 3"></span>
+            <span style="--i: 4"></span>
+            <span style="--i: 5"></span>
+            <span style="--i: 6"></span>
+            <span style="--i: 7"></span>
+          </span>
           <h1>OpenSquilla</h1>
         </div>
         <p class="subtitle" data-i18n="subtitle">Starting the desktop control surface.</p>
@@ -398,7 +533,7 @@
       <section class="recovery" id="recoveryPanel" role="region" aria-labelledby="recoveryTitle">
         <div>
           <h2 id="recoveryTitle" tabindex="-1" data-i18n="recoveryTitle">Your primary profile needs recovery</h2>
-          <p id="recoveryIntro" data-i18n="recoveryIntro">OpenSquilla paused the primary gateway because it could not prove that writing is safe. Your data has not been merged or deleted.</p>
+          <p id="recoveryIntro" data-i18n="recoveryIntro">OpenSquilla paused the primary gateway because it could not prove that writing is safe. Primary data and any completed consolidation backups remain preserved.</p>
         </div>
         <div class="recovery-code" id="recoveryCode"></div>
 
@@ -411,29 +546,6 @@
           </div>
         </div>
 
-        <div class="recovery-group" id="existingRecoveryGroup">
-          <label for="recoveryProfiles" data-i18n="existingRecoveryLabel">Existing recovery profile</label>
-          <div class="recovery-row">
-            <select id="recoveryProfiles"></select>
-            <button id="continueRecovery" type="button" data-i18n="continueRecovery">Continue recovery profile</button>
-          </div>
-        </div>
-
-        <div class="recovery-group">
-          <fieldset>
-            <legend data-i18n="newRecoveryLabel">New recovery profile</legend>
-            <label class="check-row" for="copyCredential">
-              <input id="copyCredential" type="checkbox">
-              <span data-i18n="copyCredential">Copy the decryptable provider credential from the primary profile</span>
-            </label>
-          </fieldset>
-          <div class="recovery-row">
-            <button id="createRecovery" class="primary" type="button" data-i18n="createRecovery">Create recovery profile</button>
-            <button id="retryPrimary" type="button" data-i18n="retryPrimary">Retry primary profile</button>
-            <button id="returnPrimary" type="button" data-i18n="returnPrimary">Return to primary profile</button>
-          </div>
-        </div>
-
         <div class="recovery-group" id="transactionRecoveryGroup" hidden>
           <div class="recovery-row">
             <button id="recoverTransaction" class="primary" type="button" data-i18n="recoverTransaction">Safely recover interrupted operation</button>
@@ -441,7 +553,7 @@
         </div>
 
         <div class="recovery-group" id="cleanupAbandonGroup" hidden>
-          <p data-i18n="abandonCleanupHelp">A cleanup stopped partway through. Preserve every remaining file and leave the interrupted transaction before choosing what to use next.</p>
+          <p data-i18n="abandonCleanupHelp">A cleanup stopped partway through. Preserve every remaining file, leave the interrupted transaction, and retry primary startup.</p>
           <div class="recovery-row">
             <button id="abandonCleanup" class="primary" type="button" data-i18n="abandonCleanup">Preserve remaining data and continue</button>
           </div>
@@ -453,6 +565,7 @@
           <button id="revealBackups" type="button" data-i18n="revealBackups">Show backup location</button>
           <button id="copyDiagnostics" type="button" data-i18n="copyDiagnostics">Copy diagnostics</button>
           <button id="recoveryQuit" type="button" data-i18n="quit">Quit</button>
+          <button id="recoveryRetry" class="primary" type="button" data-i18n="retry">Retry</button>
         </div>
       </section>
     </main>
@@ -479,17 +592,11 @@
         resetProgress: 'Clearing saved setup and restarting onboarding.',
         resetFailed: 'Reset failed',
         recoveryTitle: 'Your primary profile needs recovery',
-        recoveryIntro: 'OpenSquilla paused the primary gateway because it could not prove that writing is safe. Your data has not been merged or deleted.',
-        recoveryConfirmationTitle: 'Confirm recovery profile',
-        recoveryConfirmationIntro: 'OpenSquilla is waiting for you to confirm the selected isolated recovery profile before it starts. This does not mean your primary profile is unsafe.',
-        recoveryProfileUnsafeTitle: 'Recovery profile needs attention',
-        recoveryProfileUnsafeIntro: 'OpenSquilla could not prove that the selected recovery profile is safe to write. The primary profile has not been selected or changed.',
+        recoveryIntro: 'OpenSquilla paused the primary gateway because it could not prove that writing is safe. Primary data and any completed consolidation backups remain preserved.',
         cleanupRecoveryTitle: 'A data cleanup stopped partway through',
         cleanupRecoveryIntro: 'Some confirmed items may already have been deleted. OpenSquilla stopped before touching anything it could not verify and preserved every remaining file.',
         workspaceLabel: 'Choose a verified workspace', chooseWorkspace: 'Use selected workspace', browseWorkspace: 'Browse…',
-        existingRecoveryLabel: 'Existing recovery profile', continueRecovery: 'Continue recovery profile', noRecoveryProfiles: 'No recovery profiles yet',
-        newRecoveryLabel: 'New recovery profile', copyCredential: 'Copy the decryptable provider credential from the primary profile', createRecovery: 'Create recovery profile',
-        retryPrimary: 'Retry primary profile', returnPrimary: 'Return to primary profile', recoverTransaction: 'Safely recover interrupted operation', abandonCleanup: 'Preserve remaining data and continue', abandonCleanupHelp: 'A cleanup stopped partway through. Preserve every remaining file and leave the interrupted transaction before choosing what to use next.', revealProfile: 'Show profile location', revealBackups: 'Show backup location',
+        recoverTransaction: 'Safely recover interrupted operation', abandonCleanup: 'Preserve remaining data and continue', abandonCleanupHelp: 'A cleanup stopped partway through. Preserve every remaining file, leave the interrupted transaction, and retry primary startup.', revealProfile: 'Show profile location', revealBackups: 'Show backup location',
         copyDiagnostics: 'Copy diagnostics', diagnosticsCopied: 'Sanitized diagnostics copied.', recoveryWorking: 'Working…', noWorkspaceCandidates: 'No verified candidates; browse for a workspace.',
       },
       'zh-Hans': {
@@ -507,17 +614,11 @@
         resetProgress: '正在清除已保存的设置并重新启动引导。',
         resetFailed: '重置失败',
         recoveryTitle: '主配置需要恢复',
-        recoveryIntro: 'OpenSquilla 无法证明写入安全，因此已暂停主网关。你的数据没有被合并或删除。',
-        recoveryConfirmationTitle: '确认继续恢复配置',
-        recoveryConfirmationIntro: 'OpenSquilla 正在等待你确认启动已选中的独立恢复配置。这不表示主配置不安全。',
-        recoveryProfileUnsafeTitle: '恢复配置需要处理',
-        recoveryProfileUnsafeIntro: 'OpenSquilla 无法证明已选恢复配置可以安全写入。主配置未被选中或修改。',
+        recoveryIntro: 'OpenSquilla 无法确认主配置可安全写入，因此已暂停主网关。主配置数据及已完成的聚合备份均会保留。',
         cleanupRecoveryTitle: '数据清理在中途停止',
         cleanupRecoveryIntro: '部分已确认条目可能已经删除。OpenSquilla 在遇到无法验证的内容前已停止，并保留了所有剩余文件。',
         workspaceLabel: '选择已验证的工作区', chooseWorkspace: '使用所选工作区', browseWorkspace: '浏览…',
-        existingRecoveryLabel: '现有恢复配置', continueRecovery: '继续恢复配置', noRecoveryProfiles: '尚无恢复配置',
-        newRecoveryLabel: '新建恢复配置', copyCredential: '从主配置复制可解密的提供商凭据', createRecovery: '创建恢复配置',
-        retryPrimary: '重试主配置', returnPrimary: '返回主配置', recoverTransaction: '安全恢复中断的操作', abandonCleanup: '保留剩余数据并继续', abandonCleanupHelp: '清理在中途停止。请先保留所有剩余文件并结束中断的事务，再选择接下来要使用的配置。', revealProfile: '显示配置位置', revealBackups: '显示备份位置',
+        recoverTransaction: '安全恢复中断的操作', abandonCleanup: '保留剩余数据并继续', abandonCleanupHelp: '清理在中途停止。请保留所有剩余文件并结束中断的事务，然后重试主配置启动。', revealProfile: '显示配置位置', revealBackups: '显示备份位置',
         copyDiagnostics: '复制诊断信息', diagnosticsCopied: '已复制脱敏诊断信息。', recoveryWorking: '正在处理…', noWorkspaceCandidates: '没有已验证候选；请浏览选择工作区。',
       },
       ja: {
@@ -535,17 +636,11 @@
         resetProgress: '保存済み設定を消去し、オンボーディングを再開しています。',
         resetFailed: 'リセットに失敗しました',
         recoveryTitle: 'プライマリプロファイルの復旧が必要です',
-        recoveryIntro: '安全な書き込みを確認できないため、プライマリゲートウェイを一時停止しました。データの結合や削除は行っていません。',
-        recoveryConfirmationTitle: '復旧プロファイルを確認',
-        recoveryConfirmationIntro: '選択済みの独立した復旧プロファイルを起動する前に確認が必要です。プライマリプロファイルが危険という意味ではありません。',
-        recoveryProfileUnsafeTitle: '復旧プロファイルの確認が必要です',
-        recoveryProfileUnsafeIntro: '選択済みの復旧プロファイルに安全に書き込めることを確認できません。プライマリプロファイルは選択も変更もされていません。',
+        recoveryIntro: '安全な書き込みを確認できないため、プライマリゲートウェイを一時停止しました。プライマリデータと完了済みの統合バックアップは保持されています。',
         cleanupRecoveryTitle: 'データのクリーンアップが途中で停止しました',
         cleanupRecoveryIntro: '確認済みの項目の一部は削除済みの可能性があります。検証できない項目に触れる前に停止し、残りのファイルをすべて保持しました。',
         workspaceLabel: '検証済みワークスペースを選択', chooseWorkspace: '選択したワークスペースを使用', browseWorkspace: '参照…',
-        existingRecoveryLabel: '既存の復旧プロファイル', continueRecovery: '復旧プロファイルを続行', noRecoveryProfiles: '復旧プロファイルはまだありません',
-        newRecoveryLabel: '新しい復旧プロファイル', copyCredential: 'プライマリから復号可能なプロバイダー認証情報をコピー', createRecovery: '復旧プロファイルを作成',
-        retryPrimary: 'プライマリを再試行', returnPrimary: 'プライマリに戻る', recoverTransaction: '中断した操作を安全に復旧', abandonCleanup: '残りのデータを保持して続行', abandonCleanupHelp: 'クリーンアップが途中で停止しました。残っているすべてのファイルを保持し、中断したトランザクションを終了してから次に使うプロファイルを選択してください。', revealProfile: 'プロファイルの場所を表示', revealBackups: 'バックアップの場所を表示',
+        recoverTransaction: '中断した操作を安全に復旧', abandonCleanup: '残りのデータを保持して続行', abandonCleanupHelp: 'クリーンアップが途中で停止しました。残っているすべてのファイルを保持して中断したトランザクションを終了し、プライマリの起動を再試行してください。', revealProfile: 'プロファイルの場所を表示', revealBackups: 'バックアップの場所を表示',
         copyDiagnostics: '診断情報をコピー', diagnosticsCopied: 'サニタイズ済み診断情報をコピーしました。', recoveryWorking: '処理中…', noWorkspaceCandidates: '検証済み候補がありません。ワークスペースを参照してください。',
       },
       fr: {
@@ -563,17 +658,11 @@
         resetProgress: 'Suppression de la configuration enregistrée et relance de l’onboarding.',
         resetFailed: 'Échec de la réinitialisation',
         recoveryTitle: 'Le profil principal doit être récupéré',
-        recoveryIntro: 'OpenSquilla a suspendu la passerelle principale car une écriture sûre ne pouvait pas être garantie. Vos données n’ont été ni fusionnées ni supprimées.',
-        recoveryConfirmationTitle: 'Confirmer le profil de récupération',
-        recoveryConfirmationIntro: 'OpenSquilla attend votre confirmation avant de démarrer le profil de récupération isolé sélectionné. Cela ne signifie pas que le profil principal est dangereux.',
-        recoveryProfileUnsafeTitle: 'Le profil de récupération nécessite votre attention',
-        recoveryProfileUnsafeIntro: 'OpenSquilla ne peut pas garantir une écriture sûre dans le profil de récupération sélectionné. Le profil principal n’a été ni sélectionné ni modifié.',
+        recoveryIntro: 'OpenSquilla a suspendu la passerelle principale car une écriture sûre ne pouvait pas être garantie. Les données principales et les sauvegardes de consolidation terminées restent préservées.',
         cleanupRecoveryTitle: 'Un nettoyage des données s’est arrêté en cours de route',
         cleanupRecoveryIntro: 'Certains éléments confirmés peuvent déjà avoir été supprimés. OpenSquilla s’est arrêté avant tout élément non vérifiable et a conservé tous les fichiers restants.',
         workspaceLabel: 'Choisir un espace de travail vérifié', chooseWorkspace: 'Utiliser l’espace sélectionné', browseWorkspace: 'Parcourir…',
-        existingRecoveryLabel: 'Profil de récupération existant', continueRecovery: 'Continuer ce profil', noRecoveryProfiles: 'Aucun profil de récupération',
-        newRecoveryLabel: 'Nouveau profil de récupération', copyCredential: 'Copier l’identifiant fournisseur déchiffrable du profil principal', createRecovery: 'Créer un profil de récupération',
-        retryPrimary: 'Réessayer le profil principal', returnPrimary: 'Revenir au profil principal', recoverTransaction: 'Récupérer l’opération interrompue en toute sécurité', abandonCleanup: 'Conserver les données restantes et continuer', abandonCleanupHelp: 'Un nettoyage s’est arrêté en cours de route. Conservez tous les fichiers restants et quittez la transaction interrompue avant de choisir le profil à utiliser.', revealProfile: 'Afficher l’emplacement du profil', revealBackups: 'Afficher les sauvegardes',
+        recoverTransaction: 'Récupérer l’opération interrompue en toute sécurité', abandonCleanup: 'Conserver les données restantes et continuer', abandonCleanupHelp: 'Un nettoyage s’est arrêté en cours de route. Conservez tous les fichiers restants, quittez la transaction interrompue, puis relancez le démarrage du profil principal.', revealProfile: 'Afficher l’emplacement du profil', revealBackups: 'Afficher les sauvegardes',
         copyDiagnostics: 'Copier le diagnostic', diagnosticsCopied: 'Diagnostic expurgé copié.', recoveryWorking: 'Traitement…', noWorkspaceCandidates: 'Aucun candidat vérifié ; parcourez les dossiers.',
       },
       de: {
@@ -591,17 +680,11 @@
         resetProgress: 'Gespeicherte Einrichtung wird gelöscht und Onboarding neu gestartet.',
         resetFailed: 'Zurücksetzen fehlgeschlagen',
         recoveryTitle: 'Das Hauptprofil muss wiederhergestellt werden',
-        recoveryIntro: 'OpenSquilla hat das Haupt-Gateway angehalten, weil sicheres Schreiben nicht bestätigt werden konnte. Daten wurden weder zusammengeführt noch gelöscht.',
-        recoveryConfirmationTitle: 'Wiederherstellungsprofil bestätigen',
-        recoveryConfirmationIntro: 'OpenSquilla wartet auf Ihre Bestätigung, bevor das ausgewählte isolierte Wiederherstellungsprofil gestartet wird. Dies bedeutet nicht, dass das Hauptprofil unsicher ist.',
-        recoveryProfileUnsafeTitle: 'Wiederherstellungsprofil erfordert Aufmerksamkeit',
-        recoveryProfileUnsafeIntro: 'OpenSquilla konnte sicheres Schreiben im ausgewählten Wiederherstellungsprofil nicht bestätigen. Das Hauptprofil wurde weder ausgewählt noch geändert.',
+        recoveryIntro: 'OpenSquilla hat das Haupt-Gateway angehalten, weil sicheres Schreiben nicht bestätigt werden konnte. Hauptdaten und abgeschlossene Konsolidierungssicherungen bleiben erhalten.',
         cleanupRecoveryTitle: 'Eine Datenbereinigung wurde unterbrochen',
         cleanupRecoveryIntro: 'Einige bestätigte Elemente wurden möglicherweise bereits gelöscht. OpenSquilla stoppte vor nicht überprüfbaren Elementen und behielt alle verbleibenden Dateien.',
         workspaceLabel: 'Geprüften Arbeitsbereich wählen', chooseWorkspace: 'Auswahl verwenden', browseWorkspace: 'Durchsuchen…',
-        existingRecoveryLabel: 'Vorhandenes Wiederherstellungsprofil', continueRecovery: 'Profil fortsetzen', noRecoveryProfiles: 'Noch keine Wiederherstellungsprofile',
-        newRecoveryLabel: 'Neues Wiederherstellungsprofil', copyCredential: 'Entschlüsselbare Anbieter-Anmeldedaten aus dem Hauptprofil kopieren', createRecovery: 'Wiederherstellungsprofil erstellen',
-        retryPrimary: 'Hauptprofil erneut prüfen', returnPrimary: 'Zum Hauptprofil zurückkehren', recoverTransaction: 'Unterbrochenen Vorgang sicher wiederherstellen', abandonCleanup: 'Verbleibende Daten behalten und fortfahren', abandonCleanupHelp: 'Eine Bereinigung wurde unterbrochen. Behalten Sie alle verbliebenen Dateien und verlassen Sie die unterbrochene Transaktion, bevor Sie das nächste Profil auswählen.', revealProfile: 'Profilordner anzeigen', revealBackups: 'Sicherungsordner anzeigen',
+        recoverTransaction: 'Unterbrochenen Vorgang sicher wiederherstellen', abandonCleanup: 'Verbleibende Daten behalten und fortfahren', abandonCleanupHelp: 'Eine Bereinigung wurde unterbrochen. Behalten Sie alle verbliebenen Dateien, beenden Sie die unterbrochene Transaktion und starten Sie anschließend das Hauptprofil erneut.', revealProfile: 'Profilordner anzeigen', revealBackups: 'Sicherungsordner anzeigen',
         copyDiagnostics: 'Diagnose kopieren', diagnosticsCopied: 'Bereinigte Diagnose kopiert.', recoveryWorking: 'Wird ausgeführt…', noWorkspaceCandidates: 'Keine geprüften Kandidaten; bitte Arbeitsbereich auswählen.',
       },
       es: {
@@ -619,17 +702,11 @@
         resetProgress: 'Borrando la configuración guardada y reiniciando la incorporación.',
         resetFailed: 'Error al restablecer',
         recoveryTitle: 'El perfil principal necesita recuperación',
-        recoveryIntro: 'OpenSquilla pausó la pasarela principal porque no pudo demostrar que fuera seguro escribir. No se combinaron ni eliminaron datos.',
-        recoveryConfirmationTitle: 'Confirmar perfil de recuperación',
-        recoveryConfirmationIntro: 'OpenSquilla espera tu confirmación antes de iniciar el perfil de recuperación aislado seleccionado. Esto no significa que el perfil principal sea inseguro.',
-        recoveryProfileUnsafeTitle: 'El perfil de recuperación necesita atención',
-        recoveryProfileUnsafeIntro: 'OpenSquilla no pudo demostrar que fuera seguro escribir en el perfil de recuperación seleccionado. El perfil principal no se seleccionó ni modificó.',
+        recoveryIntro: 'OpenSquilla pausó la pasarela principal porque no pudo demostrar que fuera seguro escribir. Los datos principales y las copias de consolidación completadas permanecen conservados.',
         cleanupRecoveryTitle: 'Una limpieza de datos se detuvo a mitad de camino',
         cleanupRecoveryIntro: 'Es posible que algunos elementos confirmados ya se hayan eliminado. OpenSquilla se detuvo antes de tocar algo no verificable y conservó todos los archivos restantes.',
         workspaceLabel: 'Elegir un espacio verificado', chooseWorkspace: 'Usar el espacio seleccionado', browseWorkspace: 'Examinar…',
-        existingRecoveryLabel: 'Perfil de recuperación existente', continueRecovery: 'Continuar perfil de recuperación', noRecoveryProfiles: 'Aún no hay perfiles de recuperación',
-        newRecoveryLabel: 'Nuevo perfil de recuperación', copyCredential: 'Copiar la credencial descifrable del proveedor desde el perfil principal', createRecovery: 'Crear perfil de recuperación',
-        retryPrimary: 'Reintentar perfil principal', returnPrimary: 'Volver al perfil principal', recoverTransaction: 'Recuperar de forma segura la operación interrumpida', abandonCleanup: 'Conservar los datos restantes y continuar', abandonCleanupHelp: 'Una limpieza se detuvo a mitad de camino. Conserva todos los archivos restantes y sal de la transacción interrumpida antes de elegir qué perfil usar.', revealProfile: 'Mostrar ubicación del perfil', revealBackups: 'Mostrar copias de seguridad',
+        recoverTransaction: 'Recuperar de forma segura la operación interrumpida', abandonCleanup: 'Conservar los datos restantes y continuar', abandonCleanupHelp: 'Una limpieza se detuvo a mitad de camino. Conserva todos los archivos restantes, finaliza la transacción interrumpida y vuelve a iniciar el perfil principal.', revealProfile: 'Mostrar ubicación del perfil', revealBackups: 'Mostrar copias de seguridad',
         copyDiagnostics: 'Copiar diagnóstico', diagnosticsCopied: 'Diagnóstico depurado copiado.', recoveryWorking: 'Procesando…', noWorkspaceCandidates: 'No hay candidatos verificados; busca un espacio de trabajo.',
       },
     };
@@ -646,7 +723,6 @@
     const recoveryCode = document.getElementById('recoveryCode');
     const recoveryStatus = document.getElementById('recoveryStatus');
     const workspaceCandidates = document.getElementById('workspaceCandidates');
-    const recoveryProfiles = document.getElementById('recoveryProfiles');
     let currentRecoveryState = null;
     const steps = {
       profile: document.querySelector('[data-step="profile"]'),
@@ -741,23 +817,13 @@
       recoveryPanel.classList.add('visible');
       if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
       recoveryCode.textContent = String(inspection.stable_code || 'recovery_required');
-      const confirmationRequired = (
-        inspection.stable_code === 'desktop_recovery_profile_confirmation_required'
-      );
       const cleanupInterrupted = inspection.stable_code === 'cleanup_transaction_incomplete';
-      const recoveryProfileUnsafe = (
-        !confirmationRequired && !cleanupInterrupted && state.activeProfile?.kind === 'recovery'
-      );
       recoveryTitle.textContent = cleanupInterrupted
         ? msg.cleanupRecoveryTitle
-        : confirmationRequired
-        ? msg.recoveryConfirmationTitle
-        : (recoveryProfileUnsafe ? msg.recoveryProfileUnsafeTitle : msg.recoveryTitle);
+        : msg.recoveryTitle;
       recoveryIntro.textContent = cleanupInterrupted
         ? msg.cleanupRecoveryIntro
-        : confirmationRequired
-        ? msg.recoveryConfirmationIntro
-        : (recoveryProfileUnsafe ? msg.recoveryProfileUnsafeIntro : msg.recoveryIntro);
+        : msg.recoveryIntro;
 
       const candidates = Array.isArray(inspection.candidates)
         ? inspection.candidates.filter((item) => (
@@ -786,29 +852,7 @@
         workspaceCandidates.appendChild(option);
       }
 
-      const profiles = Array.isArray(state.recoveryProfiles) ? state.recoveryProfiles : [];
-      recoveryProfiles.replaceChildren();
-      if (profiles.length) {
-        for (const profile of profiles) {
-          const option = document.createElement('option');
-          option.value = String(profile.id || '');
-          option.textContent = String(profile.home || profile.id || '');
-          recoveryProfiles.appendChild(option);
-        }
-      } else {
-        const option = document.createElement('option');
-        option.value = '';
-        option.textContent = msg.noRecoveryProfiles;
-        recoveryProfiles.appendChild(option);
-      }
-
       document.getElementById('workspaceGroup').hidden = !mayChooseWorkspace;
-      document.getElementById('existingRecoveryGroup').hidden = (
-        profiles.length === 0 || !allowedActions.has('continue-recovery-profile')
-      );
-      document.getElementById('returnPrimary').hidden = state.activeProfile?.kind !== 'recovery';
-      document.getElementById('createRecovery').hidden = !allowedActions.has('create-recovery-profile');
-      document.getElementById('retryPrimary').hidden = !allowedActions.has('retry-primary-profile');
       document.getElementById('transactionRecoveryGroup').hidden = !allowedActions.has('recover-transaction');
       const mayAbandonCleanup = allowedActions.has('abandon-cleanup')
         && typeof api?.abandonCleanupTransaction === 'function';
@@ -821,11 +865,6 @@
         Boolean(state.busy) || !mayChooseWorkspace || candidates.length === 0
       );
       document.getElementById('browseWorkspace').disabled = Boolean(state.busy) || !mayChooseWorkspace;
-      document.getElementById('continueRecovery').disabled = (
-        Boolean(state.busy)
-        || !allowedActions.has('continue-recovery-profile')
-        || profiles.length === 0
-      );
       document.getElementById('recoverTransaction').disabled = (
         Boolean(state.busy) || !allowedActions.has('recover-transaction')
       );
@@ -874,8 +913,10 @@
     async function retryStartup() {
       if (!api || typeof api.retryStartup !== 'function' || retryStartupInFlight) return null;
       const retryButton = document.getElementById('retry');
+      const recoveryRetryButton = document.getElementById('recoveryRetry');
       retryStartupInFlight = true;
       retryButton.disabled = true;
+      recoveryRetryButton.disabled = true;
       try {
         const result = await api.retryStartup();
         if (result && result.ok === false) {
@@ -888,6 +929,7 @@
       } finally {
         retryStartupInFlight = false;
         retryButton.disabled = false;
+        recoveryRetryButton.disabled = false;
       }
     }
 
@@ -912,6 +954,7 @@
         else applyStatus(state && state.status ? state.status : null);
       }).catch(() => applyStatus(null));
       document.getElementById('retry').addEventListener('click', () => retryStartup());
+      document.getElementById('recoveryRetry').addEventListener('click', () => retryStartup());
       document.getElementById('revealLog').addEventListener('click', () => api.revealGatewayLog());
       document.getElementById('quit').addEventListener('click', () => api.quitApp());
       const resetButton = document.getElementById('resetSetup');
@@ -926,26 +969,11 @@
       document.getElementById('browseWorkspace').addEventListener('click', () => runRecoveryAction(() => (
         api.chooseRecoveryWorkspace({})
       )));
-      document.getElementById('continueRecovery').addEventListener('click', () => runRecoveryAction(() => (
-        api.launchSafeProfile({ mode: 'continue', recoveryId: recoveryProfiles.value })
-      )));
-      document.getElementById('createRecovery').addEventListener('click', () => runRecoveryAction(() => (
-        api.launchSafeProfile({
-          mode: 'create',
-          copyPrimaryCredential: document.getElementById('copyCredential').checked,
-        })
-      )));
-      document.getElementById('retryPrimary').addEventListener('click', () => runRecoveryAction(() => (
-        api.retryPrimaryProfile()
-      )));
       document.getElementById('recoverTransaction').addEventListener('click', () => runRecoveryAction(() => (
         api.recoverProfileTransaction()
       )));
       document.getElementById('abandonCleanup').addEventListener('click', () => runRecoveryAction(() => (
         api.abandonCleanupTransaction()
-      )));
-      document.getElementById('returnPrimary').addEventListener('click', () => runRecoveryAction(() => (
-        api.returnPrimaryProfile()
       )));
       document.getElementById('revealProfile').addEventListener('click', () => (
         api.revealRecoveryPath({ target: 'primary' })
