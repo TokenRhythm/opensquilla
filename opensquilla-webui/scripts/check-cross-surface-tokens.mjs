@@ -35,6 +35,22 @@ const CANONICAL = new Set([
   '182,80,28', //  #B6501C  accent-secondary (light)
 ])
 
+// The onboarding provider promotion intentionally uses a quieter orange-brown
+// family so it does not compete with the primary setup action. Keep this list
+// exact: it preserves that established treatment while still rejecting new,
+// unreviewed orange accents across the desktop launch sequence.
+const ONBOARDING_PROMOTION = new Set([
+  '169,87,40', // #A95728
+  '145,72,31', // #91481F
+  '123,75,44', // #7B4B2C
+  '130,80,55', // #825037
+  '111,63,35', // #6F3F23
+  '142,75,37', // #8E4B25
+  '84,47,26', //  #542F1A
+])
+
+const ALLOWED_DESKTOP_ACCENTS = new Set([...CANONICAL, ...ONBOARDING_PROMOTION])
+
 // Files that make up the desktop launch sequence.
 const targets = [
   'desktop/electron/src/boot.html',
@@ -79,9 +95,9 @@ for (const rel of targets) {
     for (const m of line.matchAll(rgbRe)) found.push({ raw: m[0], rgb: [+m[1], +m[2], +m[3]] })
     for (const { raw, rgb } of found) {
       if (!isBrandOrange(rgb)) continue
-      if (CANONICAL.has(rgb.join(','))) continue
+      if (ALLOWED_DESKTOP_ACCENTS.has(rgb.join(','))) continue
       failures.push(
-        `${rel}:${i + 1}: off-canonical brand orange ${raw} (rgb ${rgb.join(',')}); use the strike accent (#F26A1B family).`,
+        `${rel}:${i + 1}: unapproved brand orange ${raw} (rgb ${rgb.join(',')}); use an approved desktop accent family.`,
       )
     }
   })
@@ -89,7 +105,7 @@ for (const rel of targets) {
 
 if (failures.length > 0) {
   console.error(
-    `Cross-surface accent guard: ${failures.length} off-canonical brand orange(s) — the desktop launch sequence must use the strike accent:\n` +
+    `Cross-surface accent guard: ${failures.length} unapproved brand orange(s) in the desktop launch sequence:\n` +
       failures.join('\n'),
   )
   process.exit(1)
