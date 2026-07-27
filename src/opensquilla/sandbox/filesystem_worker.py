@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import fnmatch
 import hashlib
 import json
@@ -304,6 +305,21 @@ def _enforce_candidate_access(
     return resolved
 
 
+def _is_symlink_loop_resolution_error(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, RuntimeError) and str(current).startswith(
+            "Symlink loop from "
+        ):
+            return True
+        if isinstance(current, OSError) and current.errno == errno.ELOOP:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def _enforce_profile_access(
     profile: FileSystemPermissionProfile,
     candidate: PurePath,
@@ -412,9 +428,11 @@ def _list_dir(payload: dict[str, Any]) -> dict[str, object]:
     files: list[str] = []
     for entry in sorted(path.iterdir(), key=lambda item: item.name):
         follow_target = True
+        symlink_target_is_broken = False
         try:
             _enforce_candidate_access(payload, entry)
-        except PermissionError:
+        except PermissionError as exc:
+            symlink_target_is_broken = _is_symlink_loop_resolution_error(exc)
             try:
                 _enforce_candidate_access(payload, entry, metadata_only=True)
             except PermissionError:
@@ -423,6 +441,7 @@ def _list_dir(payload: dict[str, Any]) -> dict[str, object]:
         is_directory, line = format_directory_entry(
             entry,
             follow_target=follow_target,
+            symlink_target_is_broken=symlink_target_is_broken,
         )
         (dirs if is_directory else files).append(line)
     entries = dirs + files

@@ -24,6 +24,7 @@ from opensquilla.gateway.channel_dispatch import (
 )
 from opensquilla.gateway.routing import RouteEnvelope, build_channel_route_envelope
 from opensquilla.gateway.task_runtime import TaskRuntime
+from opensquilla.project_workspaces import project_path_key
 from opensquilla.session.manager import SessionIntent, SessionManager
 from opensquilla.session.models import AgentTaskStatus
 from opensquilla.session.storage import (
@@ -157,7 +158,7 @@ async def _bind_project_session(
     project_path.mkdir()
     project = await stack.storage.create_or_restore_project_workspace(
         path=str(project_path.resolve()),
-        path_key=str(project_path.resolve()),
+        path_key=project_path_key(project_path, strict=True),
         display_name=project_path.name,
         trusted_at=1,
     )

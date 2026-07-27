@@ -3056,7 +3056,7 @@
       "runMode": "执行模式",
       "runModeStandard": "每次询问",
       "runModeStandardDesc": "访问项目外文件、网络或更改系统时会询问你。",
-      "runModeTrusted": "托管运行",
+      "runModeTrusted": "托管执行",
       "runModeTrustedDesc": "自动判断操作风险，通常无需你逐次确认。",
       "runModeFull": "完全访问",
       "runModeFullDesc": "允许直接访问文件、网络和系统，不再逐次询问。",

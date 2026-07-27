@@ -15,8 +15,9 @@ import pytest
 from opensquilla.gateway.approval_queue import get_approval_queue, reset_approval_queue
 from opensquilla.sandbox.elevation import ElevationAction, gate_elevated_action
 from opensquilla.sandbox.escalation import request_sandbox_approval
-from opensquilla.sandbox.governance import ALLOW, ApprovalGate
+from opensquilla.sandbox.governance import ApprovalGate
 from opensquilla.sandbox.types import (
+    ApprovedHostExecution,
     DenialReason,
     DenialResult,
     MountSpec,
@@ -234,6 +235,7 @@ async def test_standard_channel_admin_governance_approval_is_routed_to_sender() 
     class _ApprovedQueue:
         def __init__(self) -> None:
             self.requests: list[dict[str, object]] = []
+            self.consumed: list[str] = []
 
         def request(self, namespace: str = "exec", params: dict | None = None) -> str:
             assert namespace == "exec"
@@ -243,6 +245,9 @@ async def test_standard_channel_admin_governance_approval_is_routed_to_sender() 
         async def wait(self, approval_id: str, timeout: float | None = None) -> bool:
             assert approval_id == "approval-1"
             return True
+
+        def consume(self, approval_id: str) -> None:
+            self.consumed.append(approval_id)
 
         def resolve(self, approval_id: str, approved: bool) -> None:  # pragma: no cover
             raise AssertionError("not used")
@@ -261,7 +266,8 @@ async def test_standard_channel_admin_governance_approval_is_routed_to_sender() 
     finally:
         current_tool_context.reset(token)
 
-    assert decision is ALLOW
+    assert isinstance(decision, ApprovedHostExecution)
+    assert queue.consumed == ["approval-1"]
     assert len(queue.requests) == 1
     params = queue.requests[0]
     assert params["action_kind"] == "shell.exec"

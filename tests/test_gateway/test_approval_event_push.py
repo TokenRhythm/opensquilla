@@ -92,7 +92,7 @@ async def test_exec_approval_request_pushes_event_to_approvals_scoped_client() -
         assert payload["command"] == "rm -rf ./scratch dir"
         assert payload["agent"] == "main"
         assert payload["created_at"] > 0
-        assert payload["deadline"] > 0
+        assert payload["deadline"] == 0.0
         assert payload["args"] == {"command": "rm -rf ./scratch dir", "workdir": None}
         assert payload["warning"] == ""
         assert "approved" not in payload

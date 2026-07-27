@@ -4951,7 +4951,7 @@ async def _handle_sessions_messages_subscribe(params: dict | None, ctx: RpcConte
         else None
     )
     session = await storage.get_session(key) if storage is not None else None
-    workspace_id = session.workspace_id if session is not None else None
+    workspace_id = getattr(session, "workspace_id", None)
     project_snapshot = (
         await project_workspace_snapshot(storage, session)
         if storage is not None and session is not None

@@ -41,10 +41,15 @@ def full_host_access_for_context(ctx: object | None) -> bool:
         runtime = get_runtime()
     except Exception:
         pass
+    sandbox_disabled_without_fallback = bool(
+        runtime is not None
+        and not runtime.effective.sandbox_enabled
+        and not sandbox_disabled_full_host_fallback()
+    )
     if (
         runtime is not None
         and not runtime.effective.sandbox_enabled
-        and sandbox_disabled_full_host_fallback()
+        and not sandbox_disabled_without_fallback
     ):
         return True
 
@@ -59,6 +64,8 @@ def full_host_access_for_context(ctx: object | None) -> bool:
             return bool(run_context_mode_value == "full")
         if getattr(ctx, "elevated", None) == "full":
             return True
+    if sandbox_disabled_without_fallback:
+        return False
     return bool(
         runtime is not None and getattr(runtime, "default_run_mode", None) == "full"
     )

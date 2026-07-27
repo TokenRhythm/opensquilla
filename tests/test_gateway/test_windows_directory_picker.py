@@ -126,7 +126,7 @@ async def test_gateway_windows_picker_waits_in_child_process_without_blocking(
     assert kwargs == {
         "stdout": asyncio.subprocess.PIPE,
         "stderr": asyncio.subprocess.PIPE,
-        "creationflags": subprocess.CREATE_NO_WINDOW,
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
     }
 
 

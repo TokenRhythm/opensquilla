@@ -3056,7 +3056,7 @@
       "runMode": "Execution mode",
       "runModeStandard": "Ask Every Time",
       "runModeStandardDesc": "Ask before accessing files outside the project, the network, or system settings.",
-      "runModeTrusted": "Managed Run",
+      "runModeTrusted": "Managed Execution",
       "runModeTrustedDesc": "Automatically assesses risk, so you usually do not need to confirm each action.",
       "runModeFull": "Full Access",
       "runModeFullDesc": "Allows direct access to files, the network, and the system without asking each time.",
