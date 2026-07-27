@@ -50,6 +50,7 @@ class ErrorShape(BaseModel):
     details: Any | None = None
     retryable: bool | None = None
     retry_after_ms: int | None = None
+    accepted: bool | None = None
 
 
 class ResFrame(BaseModel):
@@ -178,11 +179,20 @@ def make_error_res(
     message: str,
     retryable: bool = False,
     details: Any | None = None,
+    retry_after_ms: int | None = None,
+    accepted: bool | None = None,
 ) -> ResFrame:
     return ResFrame(
         id=req_id,
         ok=False,
-        error=ErrorShape(code=code, message=message, retryable=retryable, details=details),
+        error=ErrorShape(
+            code=code,
+            message=message,
+            retryable=retryable,
+            retry_after_ms=retry_after_ms,
+            accepted=accepted,
+            details=details,
+        ),
     )
 
 

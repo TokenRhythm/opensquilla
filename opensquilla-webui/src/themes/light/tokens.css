@@ -1,49 +1,72 @@
-/* Theme: light (value) — L1 token block. Split out of base.css (P0).
-   Values unchanged. See src/themes/light/manifest.ts. */
-/* Light theme — neutral paper: white cards on a faintly-grey off-white field
-   (achromatic, the daylight analogue of the graphite dark). Spectrum darkened
-   for contrast on the light surface. */
+/* Theme: light (value) — L1 token block. See src/themes/light/manifest.ts. */
+/* Light theme — Feishu/Lark structural logic with a warm-orange brand.
+   Neutrals, text hierarchy, and borders follow Lark's published design language
+   (open.feishu.cn/document/design-specification/design-language/color): a
+   near-white field, four levels of grey text carrying the hierarchy, and
+   borders so light they read as separation rather than as frames. Colour is
+   reserved for call-to-action, selected state, and status — never as area.
+   The brand hue is the strike orange shared with the desktop launch sequence,
+   so both surfaces resolve to one family instead of drifting apart. */
 [data-theme="light"] {
-  /* Instrument light — a cool neutral off-white (faint graphite cast, not cream).
-     Cards are the brightest plane; separation comes from the --elev shadow +
-     the graduated border, not tint. */
-  --bg: #F4F5F7;
+  /* Lark neutrals: #F5F6F7 field, pure-white cards, #EFF0F1 for the recessed
+     step (hover fills, inset wells). Separation is border + soft --elev, never
+     tint stacking. */
+  --bg: #F7F7F8;
   --bg-surface: #FFFFFF;
-  --bg-surface-2: #EDEFF2;
+  --bg-surface-2: #F0F0F2;
   --bg-elevated: #FFFFFF;
-  --bg-hover: #E2E6EB;
-  --text: #15181C;
-  --text-muted: #565D66;
-  --text-dim: #6C737C;
-  --border: #D5D9DE;
-  --border-strong: #B9BFC7;
-  --border-focus: #9AA1AA;
+  --bg-hover: #EAEAED;
+  /* Four-level text ramp, straight from Lark. --text-dim is #868C95 rather than
+     Lark's #8F959E: the published tertiary lands at 2.79:1 on this field, under
+     the 3:1 floor check-webui-colors.mjs enforces, so it is darkened by the
+     smallest step that clears it (3.13:1). */
+  --text: #1D1D1F;
+  --text-muted: #5F6066;
+  --text-dim: #85868D;
+  /* Card border / control border / disabled, per Lark. */
+  --border: #E6E6E9;
+  --border-strong: #D5D5DA;
+  /* Emphasis border for hover/focus rings. Deliberately NEUTRAL: this token is
+     also the hover border on stat cards, the composer, and approval/clarify
+     cards, so tying it to the brand turned every hover orange. Brand colour is
+     applied explicitly where it belongs, not through this. */
+  --border-focus: #B9BAC1;
   --card: #FFFFFF;
-  --hairline: #E4E7EB;
+  --hairline: #EFEFF1;
 
-  /* Strike darkened for AA (4.5:1) as text on the light canvas — accent is used
-     as `color:` for links/nav/inline status in 100+ sites, not only as a fill. */
+  /* Brand orange — the canonical strike accent (the family
+     check-cross-surface-tokens.mjs pins for desktop boot). Following Lark's
+     logic the brand carries the primary call-to-action, so the former ink-black
+     pill is now orange; every AA floor still clears (accent 4.67:1 on the
+     field, white-on-accent 5.05:1). */
   --accent: #BA4D0F;
   --accent-hover: #A5440C;
   --accent-deep: #8E3A0A;
   --accent-secondary: #B6501C;
   --accent-foreground: #FFFFFF;
 
-  /* Machined elevation (light) — soft neutral shadows + a graduated border do
-     the lifting; drop the inner white highlight (it reads as glare on paper). */
+  /* Mist elevation — thin hairline ring + soft, wide, low-opacity shadows
+     (floating paper, no glare). */
   --elev-highlight: rgba(255,255,255,0.9);
-  --elev-1: 0 0 0 1px var(--border), 0 1px 2px rgba(16,20,26,0.05), 0 4px 12px -4px rgba(16,20,26,0.10);
-  --elev-1-hover: 0 0 0 1px var(--border-strong), 0 2px 4px rgba(16,20,26,0.08), 0 10px 22px -6px rgba(16,20,26,0.14);
-  --elev-2: 0 0 0 1px var(--border-strong), 0 8px 24px -6px rgba(16,20,26,0.16);
-  --elev-3: 0 0 0 1px var(--border-strong), 0 16px 40px -10px rgba(16,20,26,0.22);
-  --ok: #0E7A52;
+  --elev-1: 0 1px 2px rgba(16,20,26,0.035), 0 8px 24px -16px rgba(16,20,26,0.14);
+  --elev-1-hover: 0 2px 5px rgba(16,20,26,0.055), 0 14px 34px -18px rgba(16,20,26,0.20);
+  --elev-2: 0 8px 30px -16px rgba(16,20,26,0.22);
+  --elev-3: 0 20px 55px -22px rgba(16,20,26,0.30);
+
+  /* Functional hues — AA ink versions (text on bg/surface); brighter siblings
+     live in the -fill roles for small non-text marks (dots, bars, chips). */
+  --ok: #257552;
+  --ok-fill: #2E8A5F;
   --warn: #8A6410;
   /* Light fills: a true amber that reads as "warn" at small sizes, where the
      text-AA-tuned dark --warn looks like olive/brown. */
   --warn-fill: #B2820B;
   --danger: #C2382E;
-  --info: #1E6E8C;
-  --queued: #5A48C0;
+  --danger-fill: #E0564A;
+  --info: #4353B8;
+  --info-fill: #6478D9;
+  --queued: #6B51C6;
+  --queued-fill: #8B6FE0;
 
   /* Syntax highlighting (chat code blocks) */
   --syntax-comment: #5F6B7A;
@@ -56,17 +79,25 @@
   --shadow: rgba(0,0,0,0.10);
   --shadow-color: rgba(0,0,0,0.10);
   --scrim: rgba(0, 0, 0, 0.40);
-  --grain-opacity: 0.03;
+  --grain-opacity: 0;
 
-  --sidebar-bg: #F2F2F3;
+  /* Dawn atmosphere — sky-blue melting into warm peach, the "morning" in
+     Morning Mist. Reserved for ceremony moments only (empty-state greeting,
+     onboarding, completion) — never behind operational UI. */
+  --atmosphere-dawn: linear-gradient(180deg, #D9E5F6 0%, #EEF0F5 48%, #F8E9D8 100%);
+
+  /* Sidebar is the lightest Lark ground (#F8F9FA) with no separate plate; rows
+     step to #EFF0F1 on hover and active. Text reuses the four-level ramp so the
+     rail and the content area share one hierarchy. */
+  --sidebar-bg: #F3F3F5;
   --sidebar-control-bg: #FFFFFF;
-  --sidebar-control-hover: #F0F0F2;
-  --sidebar-item-hover: #ECECEE;
-  --sidebar-item-active: #E7E7EA;
+  --sidebar-control-hover: #F8F8F9;
+  --sidebar-item-hover: #EAEAED;
+  --sidebar-item-active: #E4E4E8;
   --sidebar-text-strong: #18181A;
   --sidebar-text: #56565A;
   --sidebar-text-soft: #6C6C70;
-  --sidebar-border: #E4E4E7;
+  --sidebar-border: #EBEBEE;
 }
 
 /* Structural identity — light explicitly re-asserts the foundation type + radius
@@ -77,6 +108,9 @@
 [data-theme="light"] {
   --font-sans: var(--font-sans-default);
   --font-display: var(--font-display-default);
+  /* Lark keeps corners flat and uniform — one 8px radius from controls up to
+     dialogs, rather than a 8/12/16/20 ladder that made panels and modals read
+     as soft pillows. */
   --radius-control: var(--radius-md);
   --radius-card: var(--radius-lg);
   --radius-panel: var(--radius-xl);

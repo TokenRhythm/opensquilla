@@ -58,9 +58,17 @@ def _assert_live_backend_enabled(backend: str) -> None:
     )
 
 
-def main() -> None:
-    args = _parser().parse_args()
-    _assert_live_backend_enabled(args.backend)
+def _select_driver(
+    requested_driver: str,
+    *,
+    scenario_requires_tmux: bool,
+) -> str:
+    if scenario_requires_tmux:
+        return "tmux"
+    return requested_driver
+
+
+def _run_lab_scenario(args: argparse.Namespace) -> str:
     scenario = scenario_by_id(args.scenario)
     evidence = EvidenceBundle.create(
         Path(args.artifact_root),
@@ -93,7 +101,10 @@ def main() -> None:
         run_id=build_run_id(scenario.scenario_id),
         size=target.initial_size,
         artifact_dir=evidence.run_dir,
-        driver="tmux" if scenario.requires_tmux else args.driver,
+        driver=_select_driver(
+            args.driver,
+            scenario_requires_tmux=scenario.requires_tmux,
+        ),
     )
     result = run_scenario(
         scenario=scenario,
@@ -101,7 +112,13 @@ def main() -> None:
         evidence=evidence,
         backend_id=target.backend_id,
     )
-    print(f"{result.status}: {result.run_dir}")
+    return f"{result.status}: {result.run_dir}"
+
+
+def main() -> None:
+    args = _parser().parse_args()
+    _assert_live_backend_enabled(args.backend)
+    print(_run_lab_scenario(args))
 
 
 if __name__ == "__main__":

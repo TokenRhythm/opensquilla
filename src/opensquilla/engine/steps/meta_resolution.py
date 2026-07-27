@@ -1245,15 +1245,18 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
         return ctx
 
     # ── Original trigger-matching path (with sticky continuation) ──
-    loader = ctx.metadata.get("skill_loader")
-    if loader is None:
-        return ctx
-
-    try:
-        all_skills = loader.load_all()
-    except Exception as exc:  # noqa: BLE001 — fail-open by design
-        log.warning("meta_resolution.load_failed", error=str(exc))
-        return ctx
+    catalog = getattr(ctx, "skill_catalog", None)
+    if catalog is not None:
+        all_skills = list(getattr(catalog, "skills", ()))
+    else:
+        loader = ctx.metadata.get("skill_loader")
+        if loader is None:
+            return ctx
+        try:
+            all_skills = loader.load_all()
+        except Exception as exc:  # noqa: BLE001 — fail-open by design
+            log.warning("meta_resolution.load_failed", error=str(exc))
+            return ctx
 
     # Use the normalized current user intent for semantic trigger work.
     # Raw/page-dump material can still live in ``ctx.message`` on some direct

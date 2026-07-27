@@ -9,6 +9,11 @@ from pathlib import Path
 from typing import Any
 
 from opensquilla.sandbox.domain_validation import domain_matches
+from opensquilla.sandbox.elevation import (
+    ApprovalReviewerName,
+    ElevationAction,
+    channel_admin_approval_identity,
+)
 from opensquilla.sandbox.network_guard import NetworkDecision
 from opensquilla.sandbox.package_bundles import expand_package_bundle
 from opensquilla.sandbox.path_validation import MountDecision
@@ -68,6 +73,7 @@ def build_network_approval_params(
     session_key: str | None,
     workspace: str | None,
     fingerprint: str,
+    reviewer: ApprovalReviewerName = "user",
 ) -> dict[str, object] | None:
     if decision.status != "ask" or decision.reason != "unknown_domain":
         return None
@@ -75,12 +81,18 @@ def build_network_approval_params(
         "approvalKind": "sandbox_network",
         "host": decision.normalized_host,
         "fingerprint": fingerprint,
-        "choices": _standard_approval_choices(),
     }
     if session_key:
         params["sessionKey"] = session_key
     if workspace:
         params["workspace"] = workspace
+    _add_network_reviewer_params(
+        params,
+        reviewer=reviewer,
+        network_target=decision.normalized_host,
+        fingerprint=fingerprint,
+        workspace=workspace,
+    )
     return params
 
 
@@ -90,6 +102,7 @@ def build_package_bundle_approval_params(
     session_key: str | None,
     workspace: str | None,
     fingerprint: str,
+    reviewer: ApprovalReviewerName = "user",
 ) -> dict[str, object]:
     normalized_bundle_id = str(bundle_id or "").strip()
     if not expand_package_bundle(normalized_bundle_id):
@@ -98,13 +111,106 @@ def build_package_bundle_approval_params(
         "approvalKind": "sandbox_network",
         "bundle_id": normalized_bundle_id,
         "fingerprint": fingerprint,
-        "choices": _standard_approval_choices(),
     }
     if session_key:
         params["sessionKey"] = session_key
     if workspace:
         params["workspace"] = workspace
+    _add_network_reviewer_params(
+        params,
+        reviewer=reviewer,
+        network_target=f"bundle:{normalized_bundle_id}",
+        fingerprint=fingerprint,
+        workspace=workspace,
+    )
     return params
+
+
+def _add_network_reviewer_params(
+    params: dict[str, object],
+    *,
+    reviewer: ApprovalReviewerName,
+    network_target: str,
+    fingerprint: str,
+    workspace: str | None,
+) -> None:
+    if reviewer == "user":
+        params["choices"] = _standard_approval_choices()
+        return
+    action = ElevationAction(
+        tool_name="sandbox_network",
+        action_kind="network.access",
+        argv=("sandbox_network", network_target),
+        cwd=str(workspace or ""),
+        sandbox_permissions="require_escalated",
+        justification="Allow one exact managed-network target for the current action.",
+        network_targets=(network_target,),
+        content_digest=fingerprint,
+        risk_markers=("managed_network_access",),
+    )
+    params.update(
+        {
+            "reviewer": "auto_review",
+            "humanActionable": False,
+            "reviewFingerprint": action.fingerprint(),
+            "action": action.canonical_payload(),
+        }
+    )
+
+
+def grant_auto_review_network_once(params: dict[str, Any]) -> bool:
+    """Install one in-memory, fingerprint-bound grant after rule approval."""
+
+    if (
+        params.get("approvalKind") != "sandbox_network"
+        or params.get("reviewer") != "auto_review"
+        or params.get("humanActionable") is not False
+    ):
+        return False
+    session_key = str(params.get("sessionKey") or "").strip()
+    fingerprint = str(params.get("fingerprint") or "").strip()
+    bundle_id = str(params.get("bundle_id") or params.get("bundleId") or "").strip()
+    host = str(params.get("host") or "").strip()
+    value = bundle_id or host
+    if not session_key or not fingerprint or not value:
+        return False
+    workspace = _workspace_param(params)
+    context = resolved_run_context_overlay(session_key, workspace)
+    if context is None:
+        context = current_tool_run_context()
+    if context is None:
+        context = RunContext(
+            run_mode=RunMode.STANDARD,
+            workspace=workspace,
+            source="resolved_overlay",
+        )
+    grant = TemporaryGrant(
+        kind="bundle" if bundle_id else "domain",
+        value=value,
+        fingerprint=fingerprint,
+    )
+    if grant not in context.temporary_grants:
+        context = replace(
+            context,
+            temporary_grants=context.temporary_grants + (grant,),
+            source="resolved_overlay",
+        )
+    remember_resolved_run_context(session_key, workspace, context)
+
+    try:
+        from opensquilla.tools.types import current_tool_context
+
+        ctx = current_tool_context.get()
+    except Exception:  # pragma: no cover - defensive
+        ctx = None
+    if (
+        ctx is not None
+        and str(getattr(ctx, "session_key", None) or "").strip() == session_key
+        and _normalize_workspace(getattr(ctx, "workspace_dir", None))
+        == _normalize_workspace(workspace)
+    ):
+        ctx.sandbox_run_context = context
+    return True
 
 
 def build_path_approval_params(
@@ -138,19 +244,33 @@ def request_sandbox_approval(
     approval_id: str | None = None,
     message: str,
     denied_message: str | None = None,
-) -> dict[str, object]:
+) -> dict[str, object] | None:
+    from opensquilla.tools.run_mode import full_host_access_active
+
+    if full_host_access_active():
+        return None
+
     from opensquilla.gateway.approval_queue import get_approval_queue
 
     if not isinstance(params, dict):
         raise ValueError("sandbox_approval_params_required")
 
     if _current_tool_context_is_channel():
-        return _approval_payload(
-            "approval_denied",
-            "",
-            params,
-            message=_channel_sandbox_approval_disabled_message(),
-        )
+        admin_identity = channel_admin_approval_identity()
+        if admin_identity is None:
+            return _approval_payload(
+                "approval_denied",
+                "",
+                params,
+                message=_channel_sandbox_approval_disabled_message(),
+            )
+        # A channel-admin turn may ask for approval: stamping senderId routes
+        # the prompt back into the originating chat (card / ``/approve <code>``)
+        # where only that sender can resolve it. Non-admin channel callers keep
+        # the hard deny above — pairing alone never unlocks host-side asks.
+        sender_id, session_key = admin_identity
+        params["senderId"] = sender_id
+        params["sessionKey"] = session_key
 
     queue = get_approval_queue()
     if approval_id is None:
@@ -914,7 +1034,15 @@ def _pending_sandbox_approval_key(params: dict[str, Any] | None) -> str | None:
         fields["access"] = str(params.get("access") or "").strip()
     elif approval_kind == "sandbox_network":
         bundle_id = str(params.get("bundle_id") or params.get("bundleId") or "").strip()
-        fields["network"] = f"bundle:{bundle_id}" if bundle_id else "public"
+        if params.get("reviewer") == "auto_review":
+            fields["network"] = (
+                f"bundle:{bundle_id}"
+                if bundle_id
+                else str(params.get("host") or "").strip().casefold()
+            )
+            fields["fingerprint"] = str(params.get("fingerprint") or "").strip()
+        else:
+            fields["network"] = f"bundle:{bundle_id}" if bundle_id else "public"
     return json.dumps(fields, ensure_ascii=False, sort_keys=True)
 
 
@@ -987,6 +1115,7 @@ __all__ = [
     "context_with_temporary_network_grants",
     "current_tool_mounts",
     "current_tool_run_context",
+    "grant_auto_review_network_once",
     "grant_temporary_mount_for_current_tool",
     "has_temporary_network_grant",
     "merge_run_context_overlay",

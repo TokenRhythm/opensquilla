@@ -26,6 +26,7 @@ def _enable(monkeypatch: pytest.MonkeyPatch) -> None:
         network_policy.NETWORK_OBSERVABILITY_DISABLED_ENV,
         update_check.UPDATE_CHECK_DISABLED_ENV,
         update_check.TELEMETRY_DISABLED_ENV,
+        update_check.UPDATE_CHECK_ENDPOINT_ENV,
         "GITHUB_ACTIONS",
         "PYTEST_CURRENT_TEST",
         update_check.TELEMETRY_TESTING_ENV,
@@ -50,6 +51,58 @@ def _fake_fetch(
 
     fetch.calls = calls  # type: ignore[attr-defined]
     return fetch
+
+
+def _manifest(
+    *,
+    tag: str = "v0.5.0rc5",
+    version: str = "0.5.0-rc5",
+    base: str = "0.5.0",
+    prerelease: object = True,
+    release_url: str | None = None,
+) -> dict[str, object]:
+    return {
+        "schemaVersion": 1,
+        "tag": tag,
+        "version": version,
+        "baseVersion": base,
+        "prerelease": prerelease,
+        "publishedAt": "2026-07-15T00:00:00Z",
+        "releaseUrl": release_url
+        or f"https://github.com/opensquilla/opensquilla/releases/tag/{tag}",
+        # Python intentionally does not consume platform assets, but including
+        # them keeps fixtures representative of the shared desktop manifest.
+        "sha256sums": "SHA256SUMS",
+        "platforms": {},
+    }
+
+
+def _install_httpx_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: object,
+    *,
+    expected_endpoint: str,
+    status_code: int = 200,
+) -> None:
+    import httpx
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            assert kwargs["follow_redirects"] is True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get(self, endpoint: str, *, headers: dict[str, str]):
+            assert endpoint == expected_endpoint
+            assert headers["Accept"] == "application/json"
+            assert headers["User-Agent"].startswith("opensquilla/")
+            return SimpleNamespace(status_code=status_code, json=lambda: payload)
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
 
 
 @pytest.mark.parametrize(
@@ -316,13 +369,9 @@ def test_fetch_failure_keeps_prior_cache(tmp_path: Path, monkeypatch) -> None:
     update_check.refresh_update_check(state_path=state_path, version="0.4.1")
 
     # A later check fails (offline); the previously-known latest must survive.
-    monkeypatch.setattr(
-        update_check, "_fetch_latest_release", _fake_fetch(None, None, "offline")
-    )
+    monkeypatch.setattr(update_check, "_fetch_latest_release", _fake_fetch(None, None, "offline"))
     monkeypatch.setattr(update_check, "_CACHED_INFO", None)
-    info = update_check.refresh_update_check(
-        state_path=state_path, version="0.4.1", force=True
-    )
+    info = update_check.refresh_update_check(state_path=state_path, version="0.4.1", force=True)
 
     assert info.latest_version == "0.5.0"
     assert info.update_available is True
@@ -360,125 +409,192 @@ def test_rc_channel_comparison_is_numeric_and_same_base(
     assert update_check._is_newer_for_channel(latest, current, channel) is expected
 
 
-def test_rc_release_selection_is_order_independent_and_final_wins() -> None:
-    channel = update_check._channel_for("0.5.0rc4")
-    releases = [
-        {
-            "tag_name": "v0.6.0rc9",
-            "html_url": "https://example.test/cross-base",
-            "prerelease": True,
-        },
-        {
-            "tag_name": "v0.5.0rc99",
-            "html_url": "https://example.test/draft",
-            "draft": True,
-        },
-        {
-            "tag_name": "vv0.5.0rc999",
-            "html_url": "https://example.test/double-v",
-            "prerelease": True,
-        },
-        {
-            "tag_name": "v0.5.0rc10",
-            "html_url": "https://example.test/rc10",
-            "prerelease": True,
-        },
-        {
-            "tag_name": "v0.5.0rc9",
-            "html_url": "https://example.test/rc9",
-            "prerelease": True,
-        },
-        {
-            "tag_name": "v0.5.0",
-            "html_url": "https://example.test/final",
-        },
-    ]
+def test_channel_endpoints_are_static_and_rc_scoped(monkeypatch) -> None:
+    stable = update_check._channel_for("0.4.1")
+    preview = update_check._channel_for("0.5.0rc4")
 
-    assert update_check._select_rc_release(releases, channel) == (
-        "0.5.0",
-        "https://example.test/final",
+    assert stable.endpoint == (
+        "https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/channels/stable.json"
+    )
+    assert preview.endpoint == (
+        "https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/"
+        "releases/channels/preview/0.5.0.json"
     )
 
-    without_final = releases[:-1]
-    assert update_check._select_rc_release(without_final, channel) == (
-        "0.5.0rc10",
-        "https://example.test/rc10",
+    monkeypatch.setenv(
+        update_check.UPDATE_CHECK_ENDPOINT_ENV,
+        " https://updates.example.test/custom.json ",
     )
+    assert update_check._endpoint(stable) == "https://updates.example.test/custom.json"
+    assert update_check._endpoint(preview) == "https://updates.example.test/custom.json"
 
 
-def test_rc_release_selection_rejects_double_v_and_malformed_tags() -> None:
-    channel = update_check._channel_for("0.5.0rc4")
+@pytest.mark.parametrize(
+    ("current", "payload", "expected"),
+    [
+        (
+            "0.4.1",
+            _manifest(
+                tag="v0.5.0",
+                version="0.5.0",
+                base="0.5.0",
+                prerelease=False,
+            ),
+            (
+                "0.5.0",
+                "https://github.com/opensquilla/opensquilla/releases/tag/v0.5.0",
+                None,
+            ),
+        ),
+        (
+            "0.5.0rc4",
+            _manifest(),
+            (
+                "0.5.0-rc5",
+                "https://github.com/opensquilla/opensquilla/releases/tag/v0.5.0rc5",
+                None,
+            ),
+        ),
+        (
+            "0.5.0rc10",
+            _manifest(
+                tag="v0.5.0",
+                version="0.5.0",
+                base="0.5.0",
+                prerelease=False,
+            ),
+            (
+                "0.5.0",
+                "https://github.com/opensquilla/opensquilla/releases/tag/v0.5.0",
+                None,
+            ),
+        ),
+    ],
+)
+def test_fetch_accepts_valid_static_channel_manifest(
+    current: str,
+    payload: object,
+    expected: tuple[str | None, str | None, str | None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    endpoint = update_check._channel_for(current).endpoint
+    _install_httpx_payload(monkeypatch, payload, expected_endpoint=endpoint)
 
     assert (
-        update_check._select_rc_release(
-            [
-                {"tag_name": "vv0.5.0rc5"},
-                {"tag_name": "release-0.5.0rc6"},
-                {"tag_name": "0.5.0rc"},
-                {"tag_name": "0.5.0.rc7"},
-                {"tag_name": "0.5.0rc-8"},
-                {"tag_name": "0.5.0-rc-9"},
-            ],
-            channel,
+        update_check._fetch_latest_release(
+            endpoint,
+            current,
+            timeout=1.0,
         )
-        is None
+        == expected
     )
 
 
-def test_stable_release_selection_requires_a_strict_three_part_final_tag() -> None:
-    releases = [
-        {"tag_name": "vv9.9.9", "html_url": "https://example.test/double-v"},
-        {"tag_name": "9.9", "html_url": "https://example.test/two-part"},
-        {"tag_name": "v9.8", "html_url": "https://example.test/two-part-v"},
-        {"tag_name": "v0.5.0rc9", "html_url": "https://example.test/rc"},
-        {"tag_name": "v0.5.0", "html_url": "https://example.test/stable"},
-    ]
-
-    assert update_check._select_stable_release(releases) == (
-        "0.5.0",
-        "https://example.test/stable",
-    )
-    assert update_check._select_stable_release(releases[:-1]) is None
-
-
-def test_rc_fetch_accepts_github_release_list(monkeypatch) -> None:
-    import httpx
-
-    payload = [
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {**_manifest(), "schemaVersion": True},
+        {**_manifest(), "schemaVersion": 2},
+        {**_manifest(), "tag": "vv0.5.0rc5"},
         {
-            "tag_name": "v0.5.0rc5",
-            "html_url": "https://example.test/rc5",
-            "prerelease": True,
-        }
-    ]
-
-    class FakeClient:
-        def __init__(self, **_kwargs):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return None
-
-        def get(self, endpoint: str, *, headers: dict[str, str]):
-            assert endpoint == update_check.DEFAULT_RC_UPDATE_CHECK_ENDPOINT
-            assert headers["User-Agent"] == "opensquilla/0.5.0rc4"
-            return SimpleNamespace(status_code=200, json=lambda: payload)
-
-    monkeypatch.setattr(httpx, "Client", FakeClient)
+            **_manifest(tag="V0.5.0RC5"),
+            "releaseUrl": ("https://github.com/opensquilla/opensquilla/releases/tag/V0.5.0RC5"),
+        },
+        {**_manifest(), "version": "0.5.0rc5"},
+        {**_manifest(), "version": "0.5.0-RC5"},
+        {**_manifest(), "version": "0.5.0-rc6"},
+        {**_manifest(), "baseVersion": "0.6.0"},
+        {**_manifest(), "prerelease": 1},
+        {**_manifest(), "prerelease": False},
+        {
+            **_manifest(),
+            "releaseUrl": "https://example.test/opensquilla/v0.5.0rc5",
+        },
+        _manifest(
+            tag="v0.6.0rc1",
+            version="0.6.0-rc1",
+            base="0.6.0",
+            prerelease=True,
+        ),
+    ],
+)
+def test_rc_fetch_rejects_invalid_or_cross_base_manifest(
+    payload: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current = "0.5.0rc4"
+    endpoint = update_check._channel_for(current).endpoint
+    _install_httpx_payload(monkeypatch, payload, expected_endpoint=endpoint)
 
     assert update_check._fetch_latest_release(
-        update_check.DEFAULT_RC_UPDATE_CHECK_ENDPOINT,
-        "0.5.0rc4",
+        endpoint,
+        current,
         timeout=1.0,
-    ) == ("0.5.0rc5", "https://example.test/rc5", None)
+    ) == (None, None, "manifest_invalid")
 
 
-def test_legacy_stable_cache_without_scope_remains_compatible(
-    tmp_path: Path, monkeypatch
+def test_stable_fetch_rejects_prerelease_manifest(monkeypatch) -> None:
+    current = "0.4.1"
+    endpoint = update_check._channel_for(current).endpoint
+    _install_httpx_payload(monkeypatch, _manifest(), expected_endpoint=endpoint)
+
+    assert update_check._fetch_latest_release(
+        endpoint,
+        current,
+        timeout=1.0,
+    ) == (None, None, "manifest_invalid")
+
+
+def test_channel_manifest_http_failure_is_not_a_successful_empty_result(
+    monkeypatch,
 ) -> None:
+    current = "0.5.0rc4"
+    endpoint = update_check._channel_for(current).endpoint
+    _install_httpx_payload(
+        monkeypatch,
+        _manifest(),
+        expected_endpoint=endpoint,
+        status_code=503,
+    )
+
+    assert update_check._fetch_latest_release(
+        endpoint,
+        current,
+        timeout=1.0,
+    ) == (None, None, "http_status_503")
+
+
+def test_manifest_failure_keeps_prior_same_scope_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch)
+    state_path = tmp_path / "update_check_rc.json"
+    real_fetch = update_check._fetch_latest_release
+    monkeypatch.setattr(
+        update_check,
+        "_fetch_latest_release",
+        _fake_fetch("0.5.0-rc5", "https://example.test/rc5"),
+    )
+    update_check.refresh_update_check(state_path=state_path, version="0.5.0rc4")
+
+    endpoint = update_check._channel_for("0.5.0rc4").endpoint
+    _install_httpx_payload(monkeypatch, [], expected_endpoint=endpoint)
+    monkeypatch.setattr(update_check, "_fetch_latest_release", real_fetch)
+    monkeypatch.setattr(update_check, "_CACHED_INFO", {})
+    info = update_check.refresh_update_check(
+        state_path=state_path,
+        version="0.5.0rc4",
+        force=True,
+    )
+
+    assert info.latest_version == "0.5.0-rc5"
+    assert info.update_available is True
+    assert info.error == "manifest_invalid"
+
+
+def test_legacy_stable_cache_without_scope_remains_compatible(tmp_path: Path, monkeypatch) -> None:
     _enable(monkeypatch)
     state_path = tmp_path / "update_check.json"
     state_path.write_text(
@@ -499,9 +615,7 @@ def test_legacy_stable_cache_without_scope_remains_compatible(
 
     monkeypatch.setattr(update_check, "_fetch_latest_release", fail_fetch)
 
-    info = update_check.refresh_update_check(
-        state_path=state_path, version="0.4.1"
-    )
+    info = update_check.refresh_update_check(state_path=state_path, version="0.4.1")
 
     assert info.from_cache is True
     assert info.update_available is True
@@ -531,7 +645,7 @@ def test_rc_refresh_uses_separate_scoped_state_file(tmp_path: Path, monkeypatch)
     rc_state = _load(tmp_path / "update_check_rc.json")
     assert rc_state["cache_scope"] == "rc:0.5.0"
     assert rc_state["latest_version"] == "0.5.0rc5"
-    assert fetch.calls == [update_check.DEFAULT_RC_UPDATE_CHECK_ENDPOINT]
+    assert fetch.calls == [update_check._channel_for("0.5.0rc4").endpoint]
 
 
 def test_rc_cached_candidate_recomputes_for_upgrade_and_downgrade(
@@ -546,12 +660,8 @@ def test_rc_cached_candidate_recomputes_for_upgrade_and_downgrade(
     )
     update_check.refresh_update_check(state_path=state_path, version="0.5.0rc4")
 
-    current = update_check.get_cached_update_info(
-        state_path=state_path, version="0.5.0rc5"
-    )
-    downgraded = update_check.get_cached_update_info(
-        state_path=state_path, version="0.5.0rc4"
-    )
+    current = update_check.get_cached_update_info(state_path=state_path, version="0.5.0rc5")
+    downgraded = update_check.get_cached_update_info(state_path=state_path, version="0.5.0rc4")
 
     assert current is not None and current.update_available is False
     assert downgraded is not None and downgraded.update_available is True
@@ -577,9 +687,7 @@ def test_rc_scope_mismatch_never_falls_back_on_failure(tmp_path: Path, monkeypat
     fetch = _fake_fetch(None, None, "offline")
     monkeypatch.setattr(update_check, "_fetch_latest_release", fetch)
 
-    info = update_check.refresh_update_check(
-        state_path=state_path, version="0.6.0rc1"
-    )
+    info = update_check.refresh_update_check(state_path=state_path, version="0.6.0rc1")
 
     assert info.latest_version is None
     assert info.update_available is False
@@ -595,9 +703,7 @@ def test_successful_empty_rc_result_is_cached_and_clears_candidate(
 ) -> None:
     _enable(monkeypatch)
     state_path = tmp_path / "update_check_rc.json"
-    monkeypatch.setattr(
-        update_check, "_fetch_latest_release", _fake_fetch("0.5.0rc5")
-    )
+    monkeypatch.setattr(update_check, "_fetch_latest_release", _fake_fetch("0.5.0rc5"))
     update_check.refresh_update_check(state_path=state_path, version="0.5.0rc4")
 
     empty_fetch = _fake_fetch(None, None, None)
@@ -608,9 +714,7 @@ def test_successful_empty_rc_result_is_cached_and_clears_candidate(
         force=True,
     )
     monkeypatch.setattr(update_check, "_CACHED_INFO", {})
-    cached = update_check.refresh_update_check(
-        state_path=state_path, version="0.5.0rc4"
-    )
+    cached = update_check.refresh_update_check(state_path=state_path, version="0.5.0rc4")
 
     assert emptied.latest_version is None
     assert cached.latest_version is None
@@ -628,13 +732,9 @@ def test_failed_attempt_is_throttled_across_memory_reset(tmp_path: Path, monkeyp
     fetch = _fake_fetch(None, None, "offline")
     monkeypatch.setattr(update_check, "_fetch_latest_release", fetch)
 
-    first = update_check.refresh_update_check(
-        state_path=state_path, version="0.5.0rc4"
-    )
+    first = update_check.refresh_update_check(state_path=state_path, version="0.5.0rc4")
     monkeypatch.setattr(update_check, "_CACHED_INFO", {})
-    second = update_check.refresh_update_check(
-        state_path=state_path, version="0.5.0rc4"
-    )
+    second = update_check.refresh_update_check(state_path=state_path, version="0.5.0rc4")
 
     assert first.error == "offline"
     assert second.error == "offline"
@@ -660,14 +760,10 @@ def test_background_update_check_is_single_flight(tmp_path: Path, monkeypatch) -
     monkeypatch.setattr(update_check, "_fetch_latest_release", fetch)
     state_path = tmp_path / "update_check_rc.json"
 
-    first = update_check.start_background_update_check(
-        state_path=state_path, version="0.5.0rc4"
-    )
+    first = update_check.start_background_update_check(state_path=state_path, version="0.5.0rc4")
     assert first is not None
     assert entered.wait(timeout=5)
-    second = update_check.start_background_update_check(
-        state_path=state_path, version="0.5.0rc4"
-    )
+    second = update_check.start_background_update_check(state_path=state_path, version="0.5.0rc4")
 
     assert second is first
     release.set()
@@ -692,9 +788,7 @@ def test_background_update_check_does_not_spawn_for_fresh_state(
     monkeypatch.setattr(update_check.threading, "Thread", UnexpectedThread)
 
     assert (
-        update_check.start_background_update_check(
-            state_path=state_path, version="0.5.0rc4"
-        )
+        update_check.start_background_update_check(state_path=state_path, version="0.5.0rc4")
         is None
     )
     assert len(fetch.calls) == 1

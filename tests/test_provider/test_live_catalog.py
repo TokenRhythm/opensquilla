@@ -64,6 +64,106 @@ def test_parse_tokenrhythm_models_maps_published_fields() -> None:
     assert "reasoning_format" not in fields
 
 
+def test_tokenrhythm_prices_use_per_bucket_effective_discount_and_standard_fallbacks() -> None:
+    row = _tokenrhythm_row(
+        hasDiscount=True,
+        effectiveInputPrice="3",
+        discountInputPrice="6",
+        inputPrice="12",
+        effectiveOutputPrice="invalid",
+        discountOutputPrice="8",
+        outputPrice="24",
+        effectiveCacheReadPrice=True,
+        discountCacheReadPrice="0",
+        cacheReadPrice="1",
+    )
+
+    fields = parse_tokenrhythm_models({"data": [row]})["deepseek-v4-pro"]
+
+    assert fields["input_cost_per_mtok"] == pytest.approx(
+        3 / _TOKENRHYTHM_CNY_PER_USD, rel=1e-12
+    )
+    assert fields["output_cost_per_mtok"] == pytest.approx(
+        8 / _TOKENRHYTHM_CNY_PER_USD, rel=1e-12
+    )
+    # A legitimate free cache bucket must not fall through to the list price.
+    assert fields["cache_read_cost_per_mtok"] == 0.0
+
+
+def test_tokenrhythm_zero_effective_price_remains_authoritative_after_catalog_merge() -> None:
+    parsed = parse_tokenrhythm_models(
+        {
+            "data": [
+                _tokenrhythm_row(
+                    effectiveInputPrice="0",
+                    inputPrice="7",
+                )
+            ]
+        }
+    )
+    catalog = ModelCatalog()
+    catalog.set_live_provider_entries("tokenrhythm", parsed)
+
+    resolved = catalog.resolve_entry("deepseek-v4-pro", provider="tokenrhythm")
+
+    assert resolved.source == "live"
+    assert resolved.input_cost_per_mtok == 0.0
+
+
+def test_tokenrhythm_discount_prices_are_ignored_without_exact_discount_flag() -> None:
+    fields = parse_tokenrhythm_models(
+        {
+            "data": [
+                _tokenrhythm_row(
+                    hasDiscount="true",
+                    discountInputPrice="2",
+                    effectiveInputPrice="bad",
+                    inputPrice="5",
+                )
+            ]
+        }
+    )["deepseek-v4-pro"]
+
+    assert fields["input_cost_per_mtok"] == pytest.approx(
+        5 / _TOKENRHYTHM_CNY_PER_USD, rel=1e-12
+    )
+
+
+@pytest.mark.parametrize("billing_unit", [None, 0, -1, True, "bad", "NaN", "Infinity"])
+def test_tokenrhythm_invalid_billing_unit_drops_only_prices(billing_unit: object) -> None:
+    fields = parse_tokenrhythm_models(
+        {"data": [_tokenrhythm_row(billingUnit=billing_unit)]}
+    )["deepseek-v4-pro"]
+
+    assert fields["context_window"] == 900_000
+    assert not any(field.endswith("_cost_per_mtok") for field in fields)
+
+
+def test_tokenrhythm_non_million_billing_unit_preserves_full_precision() -> None:
+    fields = parse_tokenrhythm_models(
+        {"data": [_tokenrhythm_row(billingUnit=1000, inputPrice="0.00123456789")]}
+    )["deepseek-v4-pro"]
+
+    assert fields["input_cost_per_mtok"] == pytest.approx(
+        (0.00123456789 * 1000) / _TOKENRHYTHM_CNY_PER_USD,
+        rel=1e-12,
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [True, -1, "-1", "NaN", "Infinity", "1e999999", float("nan")],
+)
+def test_tokenrhythm_invalid_effective_price_falls_back_to_standard(invalid: object) -> None:
+    fields = parse_tokenrhythm_models(
+        {"data": [_tokenrhythm_row(effectiveInputPrice=invalid, inputPrice="7")]}
+    )["deepseek-v4-pro"]
+
+    assert fields["input_cost_per_mtok"] == pytest.approx(
+        7 / _TOKENRHYTHM_CNY_PER_USD, rel=1e-12
+    )
+
+
 def test_parse_tokenrhythm_models_skips_offline_and_malformed_rows() -> None:
     payload = {
         "code": 0,
@@ -95,6 +195,29 @@ def test_parse_tokenrhythm_models_coerces_string_and_float_budget_fields() -> No
     fields = entries["deepseek-v4-pro"]
     assert fields["context_window"] == 1_000_000
     assert fields["max_output_tokens"] == 384_000
+
+
+def test_parse_tokenrhythm_qwen_max_output_is_exact_128_kib_tokens() -> None:
+    entries = parse_tokenrhythm_models(
+        {
+            "code": 0,
+            "data": [
+                _tokenrhythm_row(
+                    id="qwen3.7-max",
+                    name="Qwen3.7 Max",
+                    contextWindow=1_000_000,
+                    maxOutputTokens=131_072,
+                )
+            ],
+        }
+    )
+
+    catalog = ModelCatalog()
+    catalog.set_live_provider_entries("tokenrhythm", entries)
+
+    assert entries["qwen3.7-max"]["max_output_tokens"] == 131_072
+    assert catalog.resolve_entry("qwen3.7-max", provider="tokenrhythm").source == "live"
+    assert catalog.resolve_max_tokens("qwen3.7-max", provider="tokenrhythm") == 131_072
 
 
 def test_parse_tokenrhythm_models_halves_near_window_output_caps() -> None:
@@ -135,6 +258,23 @@ def test_refreshed_corrections_rows_do_not_trip_the_near_window_clamp() -> None:
         ("mimo-v2.5-pro", 128_000),
     ):
         assert catalog.resolve_max_tokens(model, provider="tokenrhythm") == expected
+
+
+def test_tokenrhythm_offline_corrections_use_effective_prices() -> None:
+    catalog = ModelCatalog()
+
+    pro = catalog.resolve_entry("deepseek-v4-pro", provider="tokenrhythm")
+    qwen = catalog.resolve_entry("qwen3.7-max", provider="tokenrhythm")
+    kimi_code = catalog.resolve_entry("kimi-k2.7-code", provider="tokenrhythm")
+
+    assert pro.input_cost_per_mtok == pytest.approx(3 / _TOKENRHYTHM_CNY_PER_USD)
+    assert pro.output_cost_per_mtok == pytest.approx(6 / _TOKENRHYTHM_CNY_PER_USD)
+    assert pro.cache_read_cost_per_mtok == pytest.approx(0.025 / _TOKENRHYTHM_CNY_PER_USD)
+    assert qwen.input_cost_per_mtok == pytest.approx(6 / _TOKENRHYTHM_CNY_PER_USD)
+    assert qwen.output_cost_per_mtok == pytest.approx(18 / _TOKENRHYTHM_CNY_PER_USD)
+    assert kimi_code.cache_read_cost_per_mtok == pytest.approx(
+        1.3 / _TOKENRHYTHM_CNY_PER_USD
+    )
 
 
 def test_parse_tokenrhythm_models_unknown_currency_emits_no_costs() -> None:

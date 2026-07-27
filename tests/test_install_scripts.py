@@ -1,13 +1,18 @@
+import json
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 RELEASE_PS1 = ROOT / "install.ps1"
 RELEASE_SH = ROOT / "install.sh"
 SOURCE_PS1 = ROOT / "scripts" / "install_source.ps1"
 SOURCE_SH = ROOT / "scripts" / "install_source.sh"
-CURRENT_RELEASE_TAG = "v0.5.0rc4"
+CURRENT_RELEASE_TAG = "v0.5.0"
 
 
 def test_source_install_scripts_force_refresh_local_uv_tool_package() -> None:
@@ -73,14 +78,15 @@ def test_release_installer_rejects_non_release_selectors() -> None:
 def test_windows_installer_stops_when_native_install_command_fails() -> None:
     ps1 = SOURCE_PS1.read_text(encoding="utf-8")
 
-    assert 'if ($LASTEXITCODE -ne 0) {' in ps1
-    assert "install_source.ps1: install command failed with exit code $LASTEXITCODE." in ps1
+    assert "$installExitCode = $LASTEXITCODE" in ps1
+    assert 'if ($installExitCode -ne 0) {' in ps1
+    assert "install_source.ps1: install command failed with exit code $installExitCode." in ps1
     assert (
         "Close any running OpenSquilla gateway or shell using the existing "
         "tool environment, then retry."
         in ps1
     )
-    assert "exit $LASTEXITCODE" in ps1
+    assert "exit $installExitCode" in ps1
 
 
 def test_install_script_banners_are_ascii_for_windows_terminals() -> None:
@@ -145,6 +151,251 @@ def test_source_install_pins_python_312_and_refuses_below() -> None:
     # Windows pip fallback also gated; self-check targets code-task, not just --version
     assert "sys.version_info >= (3, 12)" in ps1
     assert "code-task --help" in sh
+
+
+def test_source_installers_build_webui_and_keep_dry_run_non_mutating() -> None:
+    sh = SOURCE_SH.read_text(encoding="utf-8")
+    ps1 = SOURCE_PS1.read_text(encoding="utf-8")
+    required_node = (ROOT / "opensquilla-webui" / ".node-version").read_text(
+        encoding="utf-8"
+    ).strip()
+    package = json.loads(
+        (ROOT / "opensquilla-webui" / "package.json").read_text(encoding="utf-8")
+    )
+    assert package["engines"]["node"] == f">={required_node}"
+
+    for script in (sh, ps1):
+        assert ".node-version" in script
+        assert required_node not in script
+        assert "npm ci" in script
+        assert "npm run build" in script
+        assert "official wheel/Desktop installer" in script
+
+    assert sh.index('if [[ "${dry_run}" = "1" ]]') < sh.index("build_webui\n")
+    assert ps1.index("if ($dryRun) {") < ps1.index("Build-WebUI\n")
+    assert "would run in ${webui_dir}: npm ci" in sh
+    assert 'would run in ${webuiDir}: npm ci' in ps1
+
+
+def test_source_installers_fail_closed_when_frontend_build_fails() -> None:
+    sh = SOURCE_SH.read_text(encoding="utf-8")
+    ps1 = SOURCE_PS1.read_text(encoding="utf-8")
+
+    assert "set -euo pipefail" in sh
+    assert "npm ci\n        npm run build" in sh
+    assert "npm ci failed with exit code" in ps1
+    assert "npm run build failed with exit code" in ps1
+    assert "PSNativeCommandUseErrorActionPreference" in ps1
+    assert ps1.index("PSNativeCommandUseErrorActionPreference") < ps1.index(
+        "function Build-WebUI"
+    )
+    assert "[Console]::Error.WriteLine" in ps1
+    assert "exit $npmExitCode" in ps1
+    assert ps1.index("Build-WebUI\n") < ps1.index(
+        'Write-Host "install_source.ps1: installing via $installer'
+    )
+
+
+def test_source_shell_dry_run_does_not_execute_node_npm_or_installer(
+    tmp_path: Path,
+) -> None:
+    if sys.platform.startswith("win"):
+        return
+
+    fake_bin = tmp_path / "bin"
+    markers = tmp_path / "markers"
+    fake_bin.mkdir()
+    markers.mkdir()
+    for command in ("node", "npm", "uv"):
+        executable = fake_bin / command
+        executable.write_text(
+            f'#!/bin/sh\n: > "$FAKE_MARKER_DIR/{command}"\nexit 99\n',
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "FAKE_MARKER_DIR": str(markers),
+            "OPENSQUILLA_INSTALL_DRY_RUN": "1",
+            "OPENSQUILLA_INSTALL_PROFILE": "core",
+            "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(SOURCE_SH)],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "would run in" in result.stdout
+    assert list(markers.iterdir()) == []
+
+
+def test_source_shell_npm_failure_prevents_python_install(tmp_path: Path) -> None:
+    if sys.platform.startswith("win"):
+        return
+
+    fake_bin = tmp_path / "bin"
+    markers = tmp_path / "markers"
+    fake_bin.mkdir()
+    markers.mkdir()
+    node = fake_bin / "node"
+    node.write_text(
+        '#!/bin/sh\nif [ "$1" = "--version" ]; then echo v22.12.0; fi\nexit 0\n',
+        encoding="utf-8",
+    )
+    node.chmod(0o755)
+    npm = fake_bin / "npm"
+    npm.write_text(
+        '#!/bin/sh\n: > "$FAKE_MARKER_DIR/npm"\nexit 17\n',
+        encoding="utf-8",
+    )
+    npm.chmod(0o755)
+    uv = fake_bin / "uv"
+    uv.write_text(
+        '#!/bin/sh\n: > "$FAKE_MARKER_DIR/uv"\nexit 0\n',
+        encoding="utf-8",
+    )
+    uv.chmod(0o755)
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "FAKE_MARKER_DIR": str(markers),
+            "OPENSQUILLA_INSTALL_PROFILE": "core",
+            "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(SOURCE_SH)],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert result.returncode == 17
+    assert (markers / "npm").is_file()
+    assert not (markers / "uv").exists()
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("win"),
+    reason="PowerShell native exit-code propagation is a Windows installer contract.",
+)
+@pytest.mark.parametrize(
+    ("npm_exit", "uv_exit", "expected_exit", "expected_error"),
+    (
+        (17, 0, 17, "npm ci failed with exit code 17"),
+        (0, 23, 23, "install command failed with exit code 23"),
+    ),
+)
+def test_source_powershell_preserves_native_failure_exit_codes(
+    tmp_path: Path,
+    npm_exit: int,
+    uv_exit: int,
+    expected_exit: int,
+    expected_error: str,
+) -> None:
+    powershell = shutil.which("pwsh") or shutil.which("powershell")
+    assert powershell is not None, "Windows CI must provide a PowerShell host"
+
+    fake_bin = tmp_path / "bin"
+    markers = tmp_path / "markers"
+    fake_bin.mkdir()
+    markers.mkdir()
+    (fake_bin / "node.cmd").write_text(
+        "@echo off\r\n"
+        'if "%~1"=="--version" echo v22.12.0\r\n'
+        "exit /b 0\r\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "npm.cmd").write_text(
+        "@echo off\r\n"
+        'type nul > "%FAKE_MARKER_DIR%\\npm"\r\n'
+        "exit /b %FAKE_NPM_EXIT%\r\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "uv.cmd").write_text(
+        "@echo off\r\n"
+        'type nul > "%FAKE_MARKER_DIR%\\uv"\r\n'
+        "exit /b %FAKE_UV_EXIT%\r\n",
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "FAKE_MARKER_DIR": str(markers),
+            "FAKE_NPM_EXIT": str(npm_exit),
+            "FAKE_UV_EXIT": str(uv_exit),
+            "OPENSQUILLA_INSTALL_PROFILE": "core",
+            "OPENSQUILLA_PREFIX": str(tmp_path / "prefix"),
+            "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
+        }
+    )
+    result = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(SOURCE_PS1),
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == expected_exit, result.stdout + result.stderr
+    assert expected_error in result.stderr
+    assert (markers / "npm").is_file()
+    assert (markers / "uv").is_file() is (npm_exit == 0)
+
+
+def test_source_shell_node_version_comparator_covers_stable_boundaries() -> None:
+    node = shutil.which("node")
+    if node is None:
+        return
+
+    sh = SOURCE_SH.read_text(encoding="utf-8")
+    start = "    if ! node -e '\n"
+    end = "\n    ' \"${minimum_node_version}\"; then"
+    comparator = sh.split(start, 1)[1].split(end, 1)[0]
+
+    cases = (
+        ("22.11.99", "22.12.0", 1),
+        ("22.12.0", "22.12.0", 0),
+        ("22.12.1", "22.12.0", 0),
+        ("23.0.0", "22.12.0", 0),
+        ("21.99.99", "22.0.0", 1),
+    )
+    for installed, required, expected in cases:
+        override = (
+            "Object.defineProperty(process.versions, 'node', "
+            f"{{ value: '{installed}' }});\n"
+        )
+        result = subprocess.run(
+            [node, "-e", f"{override}{comparator}", required],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        assert result.returncode == expected, (
+            f"installed={installed}, required={required}: "
+            f"stdout={result.stdout!r}, stderr={result.stderr!r}"
+        )
 
 
 def test_windows_installer_verifies_entry_point_is_on_path() -> None:

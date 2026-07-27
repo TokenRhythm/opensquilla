@@ -6,7 +6,9 @@ import asyncio
 import ipaddress
 import json
 import uuid
-from collections.abc import AsyncIterator
+from collections import deque
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import Any, cast
 from urllib.parse import urlparse
 
@@ -35,6 +37,142 @@ class GatewayRPCError(Exception):
         return f"{self.method} failed: {code}{self.message}"
 
 
+def _history_message_identity(message: dict[str, Any]) -> tuple[str, str] | None:
+    """Return the stable identity shared by paginated history responses."""
+
+    message_id = message.get("message_id") or message.get("id")
+    if message_id not in (None, ""):
+        return ("message", str(message_id))
+    transcript_id = message.get("transcript_id")
+    if transcript_id not in (None, ""):
+        return ("transcript", str(transcript_id))
+    return None
+
+
+def _history_cursor_key(value: object) -> tuple[int, int] | None:
+    """Parse the stable numeric key returned by canonical history pages."""
+
+    raw = str(value or "").strip()
+    if not raw or "|" not in raw:
+        return None
+    created_at, transcript_id = raw.split("|", 1)
+    try:
+        return int(created_at), int(transcript_id)
+    except ValueError:
+        return None
+
+
+async def session_history_all(
+    session_history: Callable[..., Awaitable[dict[str, Any]]],
+    session_key: str,
+    *,
+    page_size: int = 200,
+) -> dict[str, Any]:
+    """Read every canonical history page without silently exporting a partial session.
+
+    ``chat.history`` returns the newest page first. Older pages are addressed by
+    the response's exclusive ``oldest_cursor``. Anonymous legacy messages are
+    retained; only messages with a stable gateway identity are deduplicated.
+    """
+
+    limit = max(1, min(int(page_size), 200))
+    before: str | None = None
+    seen_cursors: set[str] = set()
+    pages: list[list[dict[str, Any]]] = []
+    newest_response: dict[str, Any] | None = None
+    oldest_response: dict[str, Any] | None = None
+
+    while True:
+        response = await session_history(
+            session_key,
+            limit=limit,
+            before=before,
+            include_canonical=True,
+            include_summaries=False,
+        )
+        if not isinstance(response, dict):
+            raise GatewayRPCError(
+                "chat.history",
+                code="INVALID_HISTORY_PAGE",
+                message="gateway returned a non-object history page",
+            )
+        if response.get("canonical_available") is False:
+            raise GatewayRPCError(
+                "chat.history",
+                code="CANONICAL_HISTORY_UNAVAILABLE",
+                message=(
+                    "complete canonical history is temporarily unavailable; "
+                    "export was cancelled"
+                ),
+            )
+        if response.get("canonical_complete") is False:
+            raise GatewayRPCError(
+                "chat.history",
+                code="CANONICAL_HISTORY_INCOMPLETE",
+                message="older original messages were not preserved; export was cancelled",
+            )
+        raw_messages = response.get("messages")
+        if not isinstance(raw_messages, list):
+            raise GatewayRPCError(
+                "chat.history",
+                code="INVALID_HISTORY_PAGE",
+                message="gateway history page did not contain a messages list",
+            )
+        has_more = bool(response.get("has_more"))
+        next_before: str | None = None
+        if has_more:
+            raw_cursor = response.get("oldest_cursor")
+            next_before = str(raw_cursor).strip() if raw_cursor is not None else ""
+            if not next_before or next_before == before or next_before in seen_cursors:
+                raise GatewayRPCError(
+                    "chat.history",
+                    code="HISTORY_PAGINATION_STALLED",
+                    message="gateway history cursor did not advance; export was cancelled",
+                )
+        if before is not None:
+            requested_key = _history_cursor_key(before)
+            newest_key = _history_cursor_key(response.get("newest_cursor"))
+            if requested_key is None or newest_key is None or newest_key >= requested_key:
+                raise GatewayRPCError(
+                    "chat.history",
+                    code="HISTORY_CURSOR_INVALIDATED",
+                    message=(
+                        "gateway history no longer precedes the requested cursor; "
+                        "the session may have changed and export was cancelled"
+                    ),
+                )
+        pages.append([message for message in raw_messages if isinstance(message, dict)])
+        newest_response = newest_response or response
+        oldest_response = response
+
+        if not has_more:
+            break
+
+        assert next_before is not None
+        seen_cursors.add(next_before)
+        before = next_before
+
+    merged: list[dict[str, Any]] = []
+    seen_messages: set[tuple[str, str]] = set()
+    for page in reversed(pages):
+        for message in page:
+            identity = _history_message_identity(message)
+            if identity is not None:
+                if identity in seen_messages:
+                    continue
+                seen_messages.add(identity)
+            merged.append(message)
+
+    result = dict(oldest_response or newest_response or {})
+    result["messages"] = merged
+    result["has_more"] = False
+    result["loaded_count"] = len(merged)
+    result["page_size"] = limit
+    if newest_response is not None:
+        result["newest_cursor"] = newest_response.get("newest_cursor")
+    return result
+
+
 def gateway_base_is_local(base_url: str | None) -> bool:
     """Return True for loopback/same-machine gateway origins.
 
@@ -57,6 +195,150 @@ def gateway_base_is_local(base_url: str | None) -> bool:
         return False
 
 
+_SUBSCRIPTION_CLOSED = object()
+
+
+@dataclass
+class GatewayEventSubscription:
+    """Independent filtered view over the client's single WebSocket reader."""
+
+    _client: GatewayClient
+    subscription_id: int
+    session_key: str | None = None
+    event_names: frozenset[str] = frozenset()
+    turn_id: str | None = None
+    client_message_id: str | None = None
+    replay: dict[str, Any] = field(default_factory=dict)
+    _queue: asyncio.Queue[dict[str, Any] | BaseException | object] = field(
+        default_factory=asyncio.Queue
+    )
+    _closed: bool = False
+    _active: bool = True
+    _pending_live: list[dict[str, Any]] = field(default_factory=list)
+    _seen_stream_seqs: set[int] = field(default_factory=set)
+    _seen_stream_seq_order: deque[int] = field(default_factory=deque)
+
+    @property
+    def gap_reason(self) -> str | None:
+        """Explain why replay could not cover the requested cursor."""
+
+        value = (
+            self.replay.get("replay_gap_reason")
+            or self.replay.get("replayGapReason")
+            or self.replay.get("gap_reason")
+        )
+        return value if isinstance(value, str) and value else None
+
+    @property
+    def needs_resync(self) -> bool:
+        """Return whether canonical bootstrap is required before live use."""
+
+        replay_complete = self.replay.get("replay_complete", self.replay.get("replayComplete"))
+        return replay_complete is False or self.gap_reason is not None
+
+    def bind_turn(
+        self,
+        *,
+        turn_id: str | None,
+        client_message_id: str | None,
+    ) -> None:
+        """Narrow a session stream once sessions.send returns its identity."""
+
+        self.turn_id = turn_id
+        self.client_message_id = client_message_id
+
+    def matches(self, frame: dict[str, Any]) -> bool:
+        event_name = str(frame.get("event") or "")
+        if self.event_names and event_name not in self.event_names:
+            return False
+        if (
+            self.session_key is not None
+            and not self.event_names
+            and not (event_name.startswith("session.event.") or event_name.startswith("task."))
+        ):
+            return False
+        payload = frame.get("payload")
+        event = payload if isinstance(payload, dict) else {}
+        if self.session_key is not None:
+            event_session = event.get("session_key") or event.get("key")
+            if event_session != self.session_key:
+                return False
+        for field_name, expected in (
+            ("turn_id", self.turn_id),
+            ("client_message_id", self.client_message_id),
+        ):
+            actual = event.get(field_name)
+            # Current gateways stamp both identities. Missing fields remain
+            # tolerated for old terminal/task events; a conflicting identity
+            # is always foreign and must stay out of this local turn.
+            if expected is not None and actual is not None and actual != expected:
+                return False
+        return True
+
+    async def get(self) -> dict[str, Any]:
+        item = await self._queue.get()
+        if item is _SUBSCRIPTION_CLOSED:
+            raise StopAsyncIteration
+        if isinstance(item, BaseException):
+            raise item
+        assert isinstance(item, dict)
+        return item
+
+    def __aiter__(self) -> GatewayEventSubscription:
+        return self
+
+    async def __anext__(self) -> dict[str, Any]:
+        try:
+            return await self.get()
+        except StopAsyncIteration:
+            raise StopAsyncIteration from None
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        await self._client._remove_event_subscription(self)
+        self._queue.put_nowait(_SUBSCRIPTION_CLOSED)
+
+    def _deliver(self, frame: dict[str, Any]) -> None:
+        if self._closed:
+            return
+        if not self._active:
+            self._pending_live.append(frame)
+            return
+        self._enqueue(frame)
+
+    def _activate(self, replay_frames: list[dict[str, Any]] | None = None) -> None:
+        frames = [*(replay_frames or ()), *self._pending_live]
+        self._pending_live.clear()
+        self._active = True
+        indexed = list(enumerate(frames))
+        indexed.sort(key=lambda item: (_frame_stream_seq(item[1]) or 2**63, item[0]))
+        for _index, frame in indexed:
+            self._enqueue(frame)
+
+    def _enqueue(self, frame: dict[str, Any]) -> None:
+        stream_seq = _frame_stream_seq(frame)
+        if stream_seq is not None:
+            if stream_seq in self._seen_stream_seqs:
+                return
+            self._seen_stream_seqs.add(stream_seq)
+            self._seen_stream_seq_order.append(stream_seq)
+            while len(self._seen_stream_seq_order) > 1024:
+                self._seen_stream_seqs.discard(self._seen_stream_seq_order.popleft())
+        self._queue.put_nowait(frame)
+
+    def _fail(self, error: BaseException) -> None:
+        if not self._closed:
+            self._queue.put_nowait(error)
+
+    def _close_from_client(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._queue.put_nowait(_SUBSCRIPTION_CLOSED)
+
+
 class GatewayClient:
     """WebSocket client for connecting to OpenSquilla gateway daemon."""
 
@@ -71,6 +353,12 @@ class GatewayClient:
         self._closing = False
         self._http_base: str | None = None
         self._auth_token: str | None = None
+        self.surface_id = f"tui:{uuid.uuid4().hex}"
+        self._event_subscriptions: dict[int, GatewayEventSubscription] = {}
+        self._next_subscription_id = 1
+        self._server_session_subscriptions: set[str] = set()
+        self._subscription_lock = asyncio.Lock()
+        self._session_event_backlog: dict[str, deque[dict[str, Any]]] = {}
 
     async def connect(
         self,
@@ -116,9 +404,19 @@ class GatewayClient:
         self._http_base = base.rstrip("/")
         self._auth_token = token
 
-        # Wait for connect.challenge
+        # Wait for connect.challenge. A malformed frame from the server or
+        # an intercepting proxy should not abort the connection with a
+        # bare ``JSONDecodeError``; surface a clean shutdown instead.
         raw = await self._ws.recv()
-        challenge = json.loads(raw)
+        try:
+            challenge = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(
+                f"Malformed handshake frame from gateway: {exc.msg} "
+                f"(line {exc.lineno} col {exc.colno})"
+            ) from exc
+        if not isinstance(challenge, dict):
+            raise SystemExit(f"Unexpected handshake frame: {challenge!r}")
         if challenge.get("type") != "event" or challenge.get("event") != "connect.challenge":
             raise SystemExit(f"Unexpected handshake frame: {challenge}")
 
@@ -145,10 +443,19 @@ class GatewayClient:
 
         # Wait for hello-ok
         raw = await self._ws.recv()
-        hello = json.loads(raw)
+        try:
+            hello = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(
+                f"Malformed hello frame from gateway: {exc.msg} "
+                f"(line {exc.lineno} col {exc.colno})"
+            ) from exc
+        if not isinstance(hello, dict):
+            raise SystemExit(f"Handshake failed: {hello!r}")
         if hello.get("type") != "hello-ok":
             raise SystemExit(f"Handshake failed: {hello}")
-        policy = hello.get("policy") if isinstance(hello.get("policy"), dict) else {}
+        policy_value = hello.get("policy")
+        policy = cast(dict[str, Any], policy_value) if isinstance(policy_value, dict) else {}
         self._heartbeat_interval = _heartbeat_interval_from_policy(policy)
 
         # Start background listener and application-level keepalive.
@@ -184,9 +491,7 @@ class GatewayClient:
         """
 
         if self._http_base is None:
-            raise ConnectionError(
-                "GatewayClient has no HTTP base URL — call connect() first"
-            )
+            raise ConnectionError("GatewayClient has no HTTP base URL — call connect() first")
         try:
             import httpx
         except ImportError as exc:  # pragma: no cover
@@ -208,8 +513,7 @@ class GatewayClient:
 
         if response.status_code != 200:
             raise ConnectionError(
-                f"upload {url} failed: HTTP {response.status_code} "
-                f"{response.text[:200]}"
+                f"upload {url} failed: HTTP {response.status_code} {response.text[:200]}"
             )
         body = response.json()
         if not isinstance(body, dict) or "file_uuid" not in body:
@@ -220,14 +524,52 @@ class GatewayClient:
         """Read frames and route to pending futures or the event queue."""
         try:
             async for raw in self._ws:
-                frame = json.loads(raw)
+                # Malformed protocol frames cannot be matched safely to
+                # pending requests. Fail the connection explicitly so no
+                # caller remains blocked on a future that cannot resolve.
+                try:
+                    frame = json.loads(raw)
+                except json.JSONDecodeError:
+                    self._mark_connection_failed(
+                        ConnectionError(
+                            "Gateway sent a malformed frame; closing connection"
+                        )
+                    )
+                    return
+                if not isinstance(frame, dict):
+                    self._mark_connection_failed(
+                        ConnectionError(
+                            "Gateway sent a non-object frame; closing connection"
+                        )
+                    )
+                    return
                 frame_type = frame.get("type")
                 if frame_type == "res":
-                    fut = self._pending.pop(frame["id"], None)
+                    frame_id = frame.get("id")
+                    if not isinstance(frame_id, str):
+                        # A response frame whose id is missing or not a
+                        # string can never be matched to its pending
+                        # request. Treat it as a protocol error and fail
+                        # in-flight RPCs so callers get a clean
+                        # connection error instead of hanging forever on
+                        # a future that nothing will ever resolve.
+                        self._mark_connection_failed(
+                            ConnectionError(
+                                "Gateway sent a response frame with a "
+                                "missing or invalid id; closing connection"
+                            )
+                        )
+                        return
+                    fut = self._pending.pop(frame_id, None)
                     if fut and not fut.done():
                         fut.set_result(frame)
                 elif frame_type == "event":
-                    await self._recv_queue.put(frame)
+                    delivered = self._publish_event(frame)
+                    # Preserve the legacy raw-event API for unclaimed events and
+                    # functional probes. Active consumers receive independent
+                    # copies, so one turn can never steal another's frames.
+                    if not delivered:
+                        await self._recv_queue.put(frame)
                 elif frame_type == "pong":
                     continue
             if not self._closing:
@@ -284,11 +626,14 @@ class GatewayClient:
         res = await fut
         if not res.get("ok"):
             err = res.get("error", {})
+            raw_details = err.get("data")
+            if not isinstance(raw_details, dict):
+                raw_details = err.get("details")
             raise GatewayRPCError(
                 method,
                 code=err.get("code"),
                 message=err.get("message") or "RPC failed",
-                data=err.get("data") if isinstance(err.get("data"), dict) else None,
+                data=raw_details if isinstance(raw_details, dict) else None,
             )
         payload = res.get("payload")
         return {} if payload is None else payload
@@ -329,6 +674,55 @@ class GatewayClient:
     async def resolve_session(self, key: str) -> dict[str, Any]:
         return cast(dict[str, Any], await self._call("sessions.resolve", {"key": key}))
 
+    async def bootstrap_session(
+        self,
+        key: str,
+        *,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        """Return a session startup snapshot, including an rc4-daemon fallback.
+
+        ``sessions.bootstrap`` is additive.  A user can upgrade the CLI while
+        an older Gateway process is still serving the same profile, so a
+        method-missing response must not break either the plain rescue renderer
+        or the TUI before the user has a chance to restart that daemon.  The
+        legacy composition deliberately stays read-only and uses only RPCs
+        already present in Preview 4.
+        """
+
+        try:
+            return cast(
+                dict[str, Any],
+                await self._call("sessions.bootstrap", {"key": key, "limit": limit}),
+            )
+        except GatewayRPCError as exc:
+            if str(exc.code or "").upper() != "METHOD_NOT_FOUND":
+                raise
+
+        resolved = await self.resolve_session(key)
+        session_key = str(
+            resolved.get("session_key")
+            or resolved.get("sessionKey")
+            or resolved.get("key")
+            or key
+        )
+        history = await self.session_history(session_key, limit=limit)
+        session = dict(resolved)
+        session["session_key"] = session_key
+        return {
+            "session": session,
+            "history": history,
+            "queue": {
+                "mode": session.get("queue_mode") or "followup",
+                "queued_count": 0,
+                "running_count": 0,
+            },
+            "runtime": {},
+            "epoch": 0,
+            "stream_cursor": None,
+            "compatibility": {"bootstrap": "legacy_gateway"},
+        }
+
     async def reset_session(self, key: str) -> dict[str, Any]:
         return cast(dict[str, Any], await self._call("sessions.reset", {"key": key}))
 
@@ -338,14 +732,60 @@ class GatewayClient:
     async def delete_sessions(self, keys: list[str]) -> dict[str, Any]:
         return cast(dict[str, Any], await self._call("sessions.delete", {"keys": keys}))
 
-    async def session_history(self, session_key: str, limit: int = 1000) -> dict[str, Any]:
+    async def session_history(
+        self,
+        session_key: str,
+        limit: int = 1000,
+        *,
+        before: str | None = None,
+        after: str | None = None,
+        include_canonical: bool | None = None,
+        include_summaries: bool | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"sessionKey": session_key, "limit": limit}
+        if before is not None:
+            params["before"] = before
+        if after is not None:
+            params["after"] = after
+        if include_canonical is not None:
+            params["includeCanonical"] = include_canonical
+        if include_summaries is not None:
+            params["includeSummaries"] = include_summaries
         return cast(
             dict[str, Any],
-            await self._call("chat.history", {"sessionKey": session_key, "limit": limit}),
+            await self._call("chat.history", params),
         )
 
     async def abort_session(self, key: str) -> dict[str, Any]:
         return cast(dict[str, Any], await self._call("sessions.abort", {"key": key}))
+
+    async def steer_session(self, key: str, message: str) -> dict[str, Any]:
+        from opensquilla.cli.tui.backend.input_identity import (
+            current_tui_client_message_id,
+        )
+
+        client_message_id = current_tui_client_message_id() or uuid.uuid4().hex
+        return cast(
+            dict[str, Any],
+            await self._call(
+                "sessions.steer",
+                {
+                    "key": key,
+                    "message": message,
+                    "client_message_id": client_message_id,
+                    "surface_id": self.surface_id,
+                    "_source": {
+                        "caller_kind": "cli",
+                        "channel_kind": "cli",
+                        "channel_id": "cli:chat",
+                        "source_kind": "cli",
+                        "source_name": "chat",
+                        "client_message_id": client_message_id,
+                        "surface_id": self.surface_id,
+                    },
+                },
+            ),
+        )
 
     async def patch_session(self, key: str, **fields: Any) -> dict[str, Any]:
         params: dict[str, Any] = {"key": key, **fields}
@@ -363,6 +803,14 @@ class GatewayClient:
         if isinstance(result, list):
             return cast(list[dict[str, Any]], result)
         return cast(list[dict[str, Any]], list(result.get("models", [])))
+
+    async def get_model_routing(self) -> dict[str, Any]:
+        result = await self._call("models.routing.get", {})
+        return result if isinstance(result, dict) else {}
+
+    async def set_model_routing(self, mode: str) -> dict[str, Any]:
+        result = await self._call("models.routing.set", {"mode": mode})
+        return result if isinstance(result, dict) else {}
 
     async def usage_status(self) -> dict[str, Any]:
         return cast(dict[str, Any], await self._call("usage.status", {}))
@@ -428,6 +876,146 @@ class GatewayClient:
             ),
         )
 
+    async def subscribe_session_events(
+        self,
+        session_key: str,
+        *,
+        since_stream_seq: int | None = None,
+        event_names: set[str] | frozenset[str] | None = None,
+    ) -> GatewayEventSubscription:
+        """Subscribe to one session with replay before returning to the caller."""
+
+        subscription = self._new_event_subscription(
+            session_key=session_key,
+            event_names=event_names,
+            active=False,
+        )
+        async with self._subscription_lock:
+            if session_key in self._server_session_subscriptions:
+                backlog = self._session_event_backlog.get(session_key, ())
+                replay_frames: list[dict[str, Any]] = []
+                if since_stream_seq is not None:
+                    replay_frames = [
+                        frame
+                        for frame in backlog
+                        if (_frame_stream_seq(frame) or 0) > since_stream_seq
+                    ]
+                backlog_seqs = [
+                    seq for frame in backlog if (seq := _frame_stream_seq(frame)) is not None
+                ]
+                local_gap = bool(
+                    since_stream_seq is not None
+                    and backlog_seqs
+                    and since_stream_seq < backlog_seqs[0] - 1
+                )
+                subscription.replay = {
+                    "subscribed": True,
+                    "key": session_key,
+                    "replay_complete": not local_gap,
+                    "current_stream_seq": (backlog_seqs[-1] if backlog_seqs else since_stream_seq),
+                }
+                if local_gap:
+                    subscription.replay["replay_gap_reason"] = "client_backlog_window_missed"
+                subscription._activate(replay_frames)
+                return subscription
+            params: dict[str, Any] = {"key": session_key}
+            if since_stream_seq is not None:
+                params["since_stream_seq"] = since_stream_seq
+            try:
+                replay = await self._call("sessions.messages.subscribe", params)
+            except BaseException:
+                self._event_subscriptions.pop(subscription.subscription_id, None)
+                subscription._close_from_client()
+                raise
+            self._server_session_subscriptions.add(session_key)
+            subscription.replay = replay if isinstance(replay, dict) else {}
+            subscription._activate()
+            return subscription
+
+    def subscribe_global_events(
+        self,
+        event_names: set[str] | frozenset[str],
+    ) -> GatewayEventSubscription:
+        """Return an independent subscription for gateway-wide push events."""
+
+        return self._new_event_subscription(event_names=event_names)
+
+    def _new_event_subscription(
+        self,
+        *,
+        session_key: str | None = None,
+        event_names: set[str] | frozenset[str] | None = None,
+        active: bool = True,
+    ) -> GatewayEventSubscription:
+        subscription_id = self._next_subscription_id
+        self._next_subscription_id += 1
+        subscription = GatewayEventSubscription(
+            _client=self,
+            subscription_id=subscription_id,
+            session_key=session_key,
+            event_names=frozenset(event_names or ()),
+            _active=active,
+        )
+        self._event_subscriptions[subscription_id] = subscription
+        return subscription
+
+    def _publish_event(self, frame: dict[str, Any]) -> bool:
+        payload = frame.get("payload")
+        event = payload if isinstance(payload, dict) else {}
+        session_key = event.get("session_key")
+        stream_seq = event.get("stream_seq")
+        if isinstance(session_key, str) and isinstance(stream_seq, int):
+            backlog = self._session_event_backlog.setdefault(session_key, deque(maxlen=512))
+            backlog.append(frame)
+            while len(self._session_event_backlog) > 32:
+                self._session_event_backlog.pop(next(iter(self._session_event_backlog)))
+            # The cursor lives in each subscription's replay metadata so a
+            # caller switching sessions can resume without sharing a consumer.
+            for subscription in self._event_subscriptions.values():
+                if subscription.session_key == session_key:
+                    subscription.replay["current_stream_seq"] = stream_seq
+        delivered = False
+        for subscription in tuple(self._event_subscriptions.values()):
+            if subscription.matches(frame):
+                subscription._deliver(frame)
+                delivered = True
+        return delivered
+
+    async def _remove_event_subscription(
+        self,
+        subscription: GatewayEventSubscription,
+    ) -> None:
+        self._event_subscriptions.pop(subscription.subscription_id, None)
+        session_key = subscription.session_key
+        if session_key is None:
+            return
+        if any(item.session_key == session_key for item in self._event_subscriptions.values()):
+            return
+        async with self._subscription_lock:
+            if session_key not in self._server_session_subscriptions:
+                return
+            self._server_session_subscriptions.discard(session_key)
+            if self._closing or self._connection_error is not None or self._ws is None:
+                return
+            try:
+                await self._call("sessions.messages.unsubscribe", {"key": session_key})
+            except (ConnectionError, GatewayRPCError):
+                return
+
+    def _preserve_foreign_event(
+        self,
+        owner: GatewayEventSubscription,
+        frame: dict[str, Any],
+    ) -> None:
+        """Keep a pre-acceptance foreign frame reachable by another consumer."""
+
+        if any(
+            subscription is not owner and subscription.matches(frame)
+            for subscription in self._event_subscriptions.values()
+        ):
+            return
+        self._recv_queue.put_nowait(frame)
+
     async def send_message(
         self,
         session_key: str,
@@ -441,66 +1029,96 @@ class GatewayClient:
         clears the override, ``on``/``bypass`` map to Managed Execution, and
         ``full`` maps to Full Host Access.
         """
-        # Subscribe to message events for this session
-        await self._call("sessions.messages.subscribe", {"key": session_key})
+        # Register the local queue before send. Replay/live frames are broadcast
+        # to every matching subscriber; this iterator can no longer consume an
+        # approval or another session's turn from one shared queue.
+        subscription = await self.subscribe_session_events(session_key)
+        # OpenTUI allocates this identity when the composer value is accepted,
+        # before the optimistic prompt is drawn.  Preserve it across the RPC so
+        # the Gateway can bind that exact card to its durable turn.  Plain/Web
+        # callers have no TUI identity scope and retain the historical UUID
+        # allocation here.
+        from opensquilla.cli.tui.backend.input_identity import (
+            current_tui_client_message_id,
+        )
+
+        client_message_id = current_tui_client_message_id() or uuid.uuid4().hex
 
         params: dict[str, Any] = {
             "key": session_key,
             "message": message,
             "attachments": attachments or [],
+            "client_message_id": client_message_id,
+            "surface_id": self.surface_id,
             "_source": {
                 "caller_kind": "cli",
                 "channel_kind": "cli",
                 "channel_id": "cli:chat",
                 "source_kind": "cli",
                 "source_name": "chat",
+                "client_message_id": client_message_id,
+                "surface_id": self.surface_id,
             },
         }
         if elevated in ("on", "bypass", "full"):
             params["_source"]["elevated"] = elevated
 
         # Send the message (accepted immediately; agent runs async)
-        await self._call("sessions.send", params)
+        try:
+            accepted = await self._call("sessions.send", params)
+        except BaseException:
+            await subscription.close()
+            raise
+        accepted_payload = accepted if isinstance(accepted, dict) else {}
+        subscription.bind_turn(
+            turn_id=_optional_identity(accepted_payload, "turn_id", "task_id"),
+            client_message_id=_optional_identity(accepted_payload, "client_message_id")
+            or client_message_id,
+        )
+        accepted_turn_id = _optional_identity(accepted_payload, "turn_id", "task_id")
+        accepted_client_message_id = (
+            _optional_identity(accepted_payload, "client_message_id")
+            or client_message_id
+        )
+        if accepted_turn_id is not None:
+            from opensquilla.cli.tui.backend.input_identity import (
+                notify_tui_turn_identity,
+            )
+
+            await notify_tui_turn_identity(
+                accepted_turn_id,
+                accepted_client_message_id,
+            )
 
         active_task_groups: set[str] = set()
+        legacy_event_source = self._listener_task is None and not self._recv_queue.empty()
 
         # Yield events until session completion, extending the stream while a
         # background subagent group is still waiting for parent synthesis.
-        while True:
-            frame = await self._recv_queue.get()
-            event_name: str = frame.get("event", "")
-            payload: dict = frame.get("payload") or {}
-            if event_name == "session.event.error":
-                payload = _normalize_session_error_payload(payload)
-            if task_terminal := _task_terminal_as_session_event(event_name, payload):
-                yield task_terminal
-                if active_task_groups:
+        try:
+            while True:
+                legacy_frame = legacy_event_source
+                if legacy_frame:
+                    frame = await self._recv_queue.get()
+                else:
+                    frame = await subscription.get()
+                if not legacy_frame and not subscription.matches(frame):
+                    # Legacy test/probe frames can enter through _recv_queue;
+                    # preserve the same identity guard as live multiplexing.
+                    self._preserve_foreign_event(subscription, frame)
                     continue
-                break
-            group_id = payload.get("group_id")
-            if event_name in (
-                "session.event.task_group.waiting",
-                "session.event.task_group.synthesizing",
-            ) and isinstance(group_id, str) and group_id:
-                active_task_groups.add(group_id)
-            elif event_name in (
-                "session.event.task_group.done",
-                "session.event.task_group.failed",
-            ) and isinstance(group_id, str) and group_id:
-                was_active_group = group_id in active_task_groups
-                active_task_groups.discard(group_id)
-            else:
-                was_active_group = False
-            yield {"event": event_name, **payload}
-            if event_name in (
-                "session.event.task_group.done",
-                "session.event.task_group.failed",
-            ) and was_active_group and not active_task_groups:
-                break
-            if event_name in ("session.event.done", "session.event.error"):
-                if active_task_groups:
-                    continue
-                break
+                event_name: str = frame.get("event", "")
+                payload: dict = frame.get("payload") or {}
+                event, terminal = _advance_gateway_turn_event(
+                    event_name,
+                    payload,
+                    active_task_groups,
+                )
+                yield event
+                if terminal:
+                    break
+        finally:
+            await subscription.close()
 
     async def close(self) -> None:
         """Close the WebSocket connection."""
@@ -518,6 +1136,11 @@ class GatewayClient:
         self._ws = None
         self._heartbeat_task = None
         self._listener_task = None
+        self._server_session_subscriptions.clear()
+        self._session_event_backlog.clear()
+        for subscription in tuple(self._event_subscriptions.values()):
+            subscription._close_from_client()
+        self._event_subscriptions.clear()
 
     def _mark_connection_failed(self, exc: BaseException) -> ConnectionError:
         if isinstance(exc, ConnectionError) and str(exc).startswith("Gateway connection lost"):
@@ -536,6 +1159,8 @@ class GatewayClient:
             if not fut.done():
                 fut.set_exception(err)
         self._pending.clear()
+        for subscription in tuple(self._event_subscriptions.values()):
+            subscription._fail(err)
         current_task = asyncio.current_task()
         for task in (self._heartbeat_task, self._listener_task):
             if task is not None and task is not current_task and not task.done():
@@ -574,6 +1199,45 @@ def _task_terminal_as_session_event(event_name: str, payload: dict) -> dict[str,
     }
 
 
+def _advance_gateway_turn_event(
+    event_name: str,
+    payload: dict[str, Any],
+    active_task_groups: set[str],
+) -> tuple[dict[str, Any], bool]:
+    """Normalize one frame, mutate active groups, and report turn completion."""
+
+    if event_name == "session.event.error":
+        payload = _normalize_session_error_payload(payload)
+    if task_terminal := _task_terminal_as_session_event(event_name, payload):
+        return task_terminal, not active_task_groups
+
+    group_id = payload.get("group_id")
+    active_group_event = event_name in {
+        "session.event.task_group.waiting",
+        "session.event.task_group.synthesizing",
+    }
+    terminal_group_event = event_name in {
+        "session.event.task_group.done",
+        "session.event.task_group.failed",
+    }
+    was_active_group = False
+    if active_group_event and isinstance(group_id, str) and group_id:
+        active_task_groups.add(group_id)
+    elif terminal_group_event and isinstance(group_id, str) and group_id:
+        was_active_group = group_id in active_task_groups
+        active_task_groups.discard(group_id)
+
+    event = {"event": event_name, **payload}
+    terminal = bool(
+        (terminal_group_event and was_active_group and not active_task_groups)
+        or (
+            event_name in {"session.event.done", "session.event.error"}
+            and not active_task_groups
+        )
+    )
+    return event, terminal
+
+
 def _normalize_session_error_payload(payload: dict) -> dict[str, Any]:
     message = payload.get("message")
     error_message = payload.get("error_message")
@@ -584,8 +1248,7 @@ def _normalize_session_error_payload(payload: dict) -> dict[str, Any]:
     is_timeout = "timeout" in code_text or "stream idle" in raw_text.lower()
     terminal_payload = {
         "status": "timeout" if is_timeout else "failed",
-        "terminal_reason": payload.get("terminal_reason")
-        or ("timeout" if is_timeout else "error"),
+        "terminal_reason": payload.get("terminal_reason") or ("timeout" if is_timeout else "error"),
         "error_class": code,
         "error_message": raw_text,
         **payload,
@@ -616,3 +1279,19 @@ def _heartbeat_interval_from_policy(policy: dict[str, Any]) -> float:
         keepalive_s = 120.0
     minimum = 15.0 if keepalive_s > 15.0 else 0.05
     return max(minimum, keepalive_s * 0.4)
+
+
+def _frame_stream_seq(frame: dict[str, Any]) -> int | None:
+    payload = frame.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("stream_seq")
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _optional_identity(payload: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None

@@ -56,6 +56,39 @@ def test_preflight_blocks_on_missing_key(monkeypatch):
     assert "deepseek" in reason and "opensquilla onboard" in reason
 
 
+def test_preflight_does_not_use_generic_key_when_explicit_env_is_missing(monkeypatch):
+    monkeypatch.delenv("NEW_ENDPOINT_KEY", raising=False)
+    monkeypatch.setenv("OPENSQUILLA_LLM_API_KEY", "synthetic-generic-key")
+    calls = []
+    _probe(
+        monkeypatch,
+        ProviderProbeResult(
+            ok=False,
+            provider_id="openrouter",
+            model="openai/gpt-test",
+            failure_kind=ProviderFailureKind.AUTH_INVALID.value,
+            message="No API key available (checked $NEW_ENDPOINT_KEY).",
+        ),
+        calls=calls,
+    )
+    bundle = _bundle(
+        {
+            "llm": {
+                "provider": "openrouter",
+                "model": "openai/gpt-test",
+                "api_key_env": "NEW_ENDPOINT_KEY",
+                "base_url": "https://openrouter.ai/api/v1",
+            }
+        }
+    )
+
+    ok, reason = provider_preflight(bundle)
+
+    assert ok is False
+    assert "openrouter" in reason and "opensquilla onboard" in reason
+    assert calls[0]["api_key"] == ""
+
+
 def test_preflight_blocks_on_insufficient_credits(monkeypatch):
     _probe(
         monkeypatch,

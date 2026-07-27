@@ -40,7 +40,7 @@ OpenSquilla es un agente de IA con microkernel y eficiente en el uso de tokens. 
 
 Cada punto de entrada —Web UI, CLI y canales de chat— se ejecuta a través de ese mismo bucle, de modo que el envío de herramientas, los reintentos y el registro de decisiones se comportan de forma idéntica en todas partes. Una capa de proveedores conectable se comunica con TokenRhythm, OpenRouter, OpenAI, Anthropic, Ollama, DeepSeek, Gemini, Qwen/DashScope y más de 20 proveedores de LLM adicionales, sin ningún cambio en tu código ni en el esquema de configuración.
 
-OpenSquilla 0.5.0 Preview 4 es la versión preliminar actual.
+OpenSquilla 0.5.0 es la versión estable actual.
 
 Para documentación de producto orientada a tareas, comienza por la [Guía de producto de OpenSquilla](README.product.md) o el [índice de documentación](docs/README.md).
 
@@ -50,11 +50,11 @@ Para documentación de producto orientada a tareas, comienza por la [Guía de pr
 
 OpenSquilla funciona en Windows, macOS y Linux. Elige la ruta que se ajuste a tu caso de uso.
 
-Los instaladores de escritorio y la instalación rápida desde terminal te ofrecen una **versión** precompilada, sin necesidad de Git. Las otras dos —instalar desde el código fuente y desarrollar desde el código fuente— se compilan **a partir de un checkout de Git** (`git clone` + Git LFS).
+Los instaladores de escritorio y la instalación rápida desde terminal te ofrecen una **versión** precompilada, sin necesidad de Git. Las otras dos —instalar desde el código fuente y desarrollar desde el código fuente— compilan también la consola Vue **a partir de un checkout de Git** (`git clone` + Git LFS). Los wheels publicados y los instaladores de escritorio ya incluyen la consola; sus usuarios no necesitan Node.js ni npm.
 
 Los comandos de instalación de versiones usan los recursos de release publicados en GitHub. Las instalaciones del wheel de Python usan nombres de archivo de wheel con versión, porque los instaladores validan la versión incrustada en el nombre del archivo del wheel.
 
-Para el uso de escritorio de 0.5.0 Preview 4, opta por los instaladores de escritorio empaquetados de la Release de GitHub: `OpenSquilla-0.5.0-rc4-mac-arm64.dmg` en macOS y `OpenSquilla-0.5.0-rc4-win-x64.exe` en Windows.
+Para el uso de escritorio de 0.5.0, opta por los instaladores de escritorio empaquetados de la Release de GitHub: `OpenSquilla-0.5.0-mac-arm64.dmg` en macOS y `OpenSquilla-0.5.0-win-x64.exe` en Windows.
 
 | Ruta | Público | Cuándo usarla |
 | --- | --- | --- |
@@ -69,6 +69,7 @@ Para el uso de escritorio de 0.5.0 Preview 4, opta por los instaladores de escri
 | --- | :---: | :---: | :---: |
 | Python 3.12+ | mediante `uv` | mediante `uv` o el sistema | mediante `uv` |
 | Git + Git LFS | — | requerido | requerido |
+| Node.js 22.12+ + npm | — | requerido para compilar la Web UI | requerido para la Web UI y los wheels |
 | `uv` | se instala si falta | recomendado | requerido |
 
 El perfil predeterminado `recommended` instala **SquillaRouter** —el enrutador de modelos en el dispositivo de OpenSquilla— y sus recursos de modelo; `OPENSQUILLA_INSTALL_PROFILE=core` omite esas dependencias. El indicador de onboarding independiente `--router disabled` mantiene las dependencias instaladas, pero apaga el enrutador en tiempo de ejecución.
@@ -79,22 +80,23 @@ En las instalaciones desde terminal de macOS, el runtime LightGBM de SquillaRout
 
 Enlaces de instalación: [Git](https://git-scm.com/downloads) ·
 [Git LFS](https://git-lfs.com/) ·
+[Node.js](https://nodejs.org/en/download) ·
 [uv](https://docs.astral.sh/uv/getting-started/installation/).
 
 <a id="desktop-installers"></a>
 
 ### Instaladores de escritorio
 
-Los instaladores de escritorio de 0.5.0 Preview 4 empaquetan la consola de control de Vue y el runtime del gateway en una carcasa de Electron.
+Los instaladores de escritorio de 0.5.0 empaquetan la consola de control de Vue y el runtime del gateway en una carcasa de Electron.
 
-- macOS Apple Silicon: <https://github.com/opensquilla/opensquilla/releases/download/v0.5.0rc4/OpenSquilla-0.5.0-rc4-mac-arm64.dmg>
-- Windows x64: <https://github.com/opensquilla/opensquilla/releases/download/v0.5.0rc4/OpenSquilla-0.5.0-rc4-win-x64.exe>
+- macOS Apple Silicon: <https://github.com/opensquilla/opensquilla/releases/download/v0.5.0/OpenSquilla-0.5.0-mac-arm64.dmg>
+- Windows x64: <https://github.com/opensquilla/opensquilla/releases/download/v0.5.0/OpenSquilla-0.5.0-win-x64.exe>
 
 Para descargas más rápidas desde China continental, usa los alias de descarga directa de OSS:
 - macOS Apple Silicon: <https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/latest/OpenSquilla-mac-arm64.dmg>
 - Windows x64: <https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/latest/OpenSquilla-win-x64.exe>
 
-Estos enlaces fijos se actualizan tras cada réplica de release correcta. Usa los enlaces versionados de GitHub Release indicados arriba si necesitas una versión concreta.
+Estos enlaces fijos solo avanzan cuando una release elegible más reciente supera la verificación de la réplica. Usa los enlaces versionados de GitHub Release indicados arriba si necesitas una versión concreta.
 
 Cierra cualquier aplicación de escritorio de OpenSquilla en ejecución antes de actualizar. Se reutiliza el perfil Desktop existente en el directorio de datos de aplicaciones de la plataforma. El `~/.opensquilla` de la instalación de terminal es un perfil distinto; transfiérelo explícitamente desde Ajustes si es necesario.
 
@@ -130,7 +132,7 @@ $env:Path = "$env:USERPROFILE\.local\bin;" + $env:Path
 **2. Instala OpenSquilla**: el mismo comando en todas las plataformas.
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.0rc4/opensquilla-0.5.0rc4-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.0/opensquilla-0.5.0-py3-none-any.whl"
 ```
 
 Esto instala el wheel de OpenSquilla desde la URL de la release y luego deja que `uv` descargue las dependencias declaradas por los extras seleccionados. El extra predeterminado `recommended` incluye dependencias del runtime de SquillaRouter como ONNX Runtime, LightGBM, NumPy y tokenizers, así que una primera instalación necesita acceso a la red salvo que esos wheels ya estén en caché. `uv` no instala runtimes nativos del sistema como `libomp` de macOS o el Visual C++ Redistributable de Windows; consulta [Solución de problemas](#troubleshooting) si el runtime del enrutador informa de un error de carga de biblioteca nativa.
@@ -146,7 +148,7 @@ opensquilla gateway run
 > Si no se encuentra `opensquilla` justo después de una instalación nueva con `uv`, abre una terminal nueva o vuelve a ejecutar la línea de PATH del paso 1.
 
 Para una instalación totalmente fijada, usa la URL del wheel con versión:
-`https://github.com/opensquilla/opensquilla/releases/download/v0.5.0rc4/opensquilla-0.5.0rc4-py3-none-any.whl`.
+`https://github.com/opensquilla/opensquilla/releases/download/v0.5.0/opensquilla-0.5.0-py3-none-any.whl`.
 
 <a id="install-from-source"></a>
 
@@ -177,7 +179,13 @@ Usa esta ruta para ejecutar OpenSquilla desde un checkout sin editarlo. El clon 
    powershell -ExecutionPolicy Bypass -File ./scripts/install_source.ps1
    ```
 
-   El script instala `.[recommended]` (SquillaRouter + memoria + modelos locales) en un entorno de usuario dedicado mediante `uv tool install`, recurriendo a `python -m pip install --user` cuando `uv` no está disponible. Abre una terminal nueva si `opensquilla` no está en el `PATH` tras la instalación.
+   El script ejecuta primero `npm ci` y `npm run build` en `opensquilla-webui`, y después instala `.[recommended]` (SquillaRouter + memoria + modelos locales) en un entorno de usuario dedicado mediante `uv tool install`, recurriendo a `python -m pip install --user` cuando `uv` no está disponible. Cada reinstalación desde el código fuente recrea `node_modules` y recompila la consola. La primera ejecución suele descargar más; la caché de npm reduce después el tráfico de red, pero no elimina todo el tiempo de compilación ni las escrituras de disco. Abre una terminal nueva si `opensquilla` no está en el `PATH` tras la instalación.
+
+   `pip install .`, `uv tool install .` y las instalaciones mediante una URL VCS
+   son rutas de compilación de bajo nivel, no sustitutos de este script. Un
+   checkout local necesita primero una Web UI compilada; un checkout creado por
+   una URL VCS no contiene el artefacto generado y se rechaza deliberadamente.
+   Usa el instalador desde el código fuente o un wheel oficial de la release.
 
 3. **(opcional) Instala extras avanzados.** La mayoría de los canales —Feishu, Telegram, DingTalk, QQ, WeCom, Slack y Discord— funcionan desde la instalación base. Los extras opcionales son:
 
@@ -198,13 +206,14 @@ Usa esta ruta para ejecutar OpenSquilla desde un checkout sin editarlo. El clon 
 <details>
 <summary>Instalar desde el código fuente: requisitos previos de terminal y opciones del instalador</summary>
 
-**Instalar los requisitos previos (Git, Git LFS, uv) desde una terminal**
+**Instalar los requisitos previos (Git, Git LFS, Node.js 22.12+ con npm, uv) desde una terminal**
 
 Windows PowerShell:
 
 ```powershell
 winget install --id Git.Git -e
 winget install --id GitHub.GitLFS -e
+winget install --id OpenJS.NodeJS.LTS -e
 powershell -ExecutionPolicy Bypass -c "irm https://astral.sh/uv/install.ps1 | iex"
 git lfs install
 ```
@@ -212,19 +221,21 @@ git lfs install
 macOS (Homebrew):
 
 ```sh
-brew install git git-lfs uv
+brew install git git-lfs node uv
 git lfs install
 ```
 
 Debian / Ubuntu:
 
 ```sh
-sudo apt update && sudo apt install -y git git-lfs
+sudo apt update && sudo apt install -y git git-lfs curl
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt install -y nodejs
 curl -LsSf https://astral.sh/uv/install.sh | sh
 git lfs install
 ```
 
-En Fedora usa `sudo dnf install -y git git-lfs`; en Arch usa `sudo pacman -S --needed git git-lfs`; luego instala `uv` con el comando `curl` anterior. Los cambios de PATH de estos instaladores se aplican a las nuevas sesiones de terminal.
+En Fedora usa `sudo dnf install -y git git-lfs`; en Arch usa `sudo pacman -S --needed git git-lfs`; instala también Node.js 22.12+ y npm desde la distribución o nodejs.org, y luego instala `uv` con el comando `curl` anterior. Los cambios de PATH de estos instaladores se aplican a las nuevas sesiones de terminal.
 
 **Variables de entorno del instalador y comprobaciones de PATH**
 
@@ -244,9 +255,17 @@ Verifica qué `opensquilla` ejecuta tu shell con `command -v opensquilla` (macOS
 Usa esta ruta cuando estés trabajando en el código fuente de OpenSquilla: haciendo cambios, ejecutando pruebas o depurando el comportamiento contra este checkout. No es la ruta de instalación habitual. A diferencia de [Instalar desde el código fuente](#install-from-source), esta ruta requiere `uv`: `uv sync` crea un `.venv` local del repositorio y `uv run` ejecuta los comandos contra los archivos de este checkout.
 
 ```sh
+cd opensquilla-webui
+npm ci
+npm run build
+cd ..
 uv sync --extra recommended --extra dev
 uv run opensquilla --help
 ```
+
+Vuelve a ejecutar `npm run build` después de cambiar la Web UI. Una compilación
+estándar del wheel falla si la consola falta o está obsoleta; `uv sync` editable
+sigue disponible para el trabajo exclusivo de backend.
 
 El extra `recommended` también incluye SquillaRouter para el desarrollo; el extra `dev` instala las herramientas de prueba, lint y comprobación de tipos. Instala extras adicionales en el mismo entorno que ejecutas:
 
@@ -280,30 +299,67 @@ Primero se vacía y detiene el gateway en ejecución, la eliminación se mantien
 
 ## Privacidad de la instalación
 
-OpenSquilla utiliza telemetría de instalación anónima para estimar el número de instalaciones, la adopción de versiones y la compatibilidad en tiempo de ejecución. Los datos se envían en el primer arranque del gateway y una vez por cada versión de OpenSquilla. Las cargas usan un tiempo de espera corto y nunca bloquean el arranque.
+OpenSquilla utiliza telemetría de instalación anónima para estimar el número de
+instalaciones, la adopción de versiones y la compatibilidad en tiempo de ejecución. Los
+datos se envían únicamente cuando el gateway se inicia por primera vez y solo una vez
+por cada versión de OpenSquilla. También agrega localmente, por fecha UTC, el número de
+turnos de conversación de nivel superior completados y el uso de tokens. Al arrancar y
+después cada hora, OpenSquilla intenta enviar al mismo servicio de telemetría las
+instantáneas acumuladas pendientes del día UTC. OpenSquilla también puede realizar
+comprobaciones pasivas de actualizaciones, incluidas las realizadas al iniciar la
+aplicación de escritorio y, como máximo, una vez al día mientras la aplicación continúa
+en ejecución. Las cargas usan un tiempo de espera corto y nunca bloquean el arranque.
 
 Lo que se envía:
 
 - versión del esquema
 - resumen (digest) `install_id` estable generado localmente
 - versión de OpenSquilla
-- tipo de evento (`install` o `version_seen`)
+- tipo de evento (`install`, `version_seen` o `daily_usage`)
 - método de instalación (`pip`, `source`, `docker`, `desktop` o `unknown`)
 - sistema operativo, versión del SO, arquitectura de CPU y versión mayor/menor de Python
 - marcas de tiempo de primera detección y de envío
 - marcador de entorno de CI/pruebas (`ci_environment`)
+- en los eventos de uso diario: fecha UTC, número de turnos completados y totales de
+  tokens de entrada, salida, caché y escritura en caché
 
 El `install_id` es un resumen SHA-256 local y unidireccional derivado de direcciones MAC utilizables, luego de direcciones IP locales cuando no hay ninguna MAC disponible, con un valor aleatorio persistente de reserva. Los valores MAC/IP en bruto no se cargan.
 
 Lo que no se envía: nombres de usuario, nombres de host, rutas, claves de API, configuración de proveedores, contenido de chat/sesión/memoria/agente, nombres de archivo ni contenido de archivos. La IP de origen puede ser visible para los servidores HTTP en la capa de transporte, pero no forma parte de la carga útil.
 
-Para optar por no participar:
+Para desactivar antes del arranque toda observabilidad de red no iniciada por el
+usuario:
+
+```sh
+OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY=true
+```
+
+O en la configuración:
+
+```toml
+[privacy]
+disable_network_observability = true
+```
+
+Este interruptor unificado abarca la telemetría automática de instalación, la
+telemetría de uso diario agregada, las comprobaciones pasivas de actualizaciones y las
+comprobaciones automáticas realizadas al iniciar la aplicación de escritorio y mientras
+continúa en ejecución. Mientras siga activado el interruptor unificado o uno de los
+interruptores de desactivación compatibles, ni siquiera una comprobación de
+actualizaciones iniciada explícitamente por el usuario podrá omitirlo. Otras acciones
+iniciadas por el usuario todavía pueden acceder a servicios de red después de expresar
+una intención clara, por ejemplo, abrir la página de versiones, descargar archivos de
+una versión o utilizar proveedores, búsquedas o canales configurados.
+
+Las variables de entorno anteriores siguen siendo compatibles:
 
 ```sh
 OPENSQUILLA_TELEMETRY_DISABLED=true
+OPENSQUILLA_UPDATE_CHECK_DISABLED=true
 ```
 
-Las implementaciones avanzadas pueden usar su propio endpoint:
+Las implementaciones avanzadas pueden usar su propio endpoint de telemetría de
+instalación:
 
 ```sh
 OPENSQUILLA_TELEMETRY_ENDPOINT=https://example.com/v1/install

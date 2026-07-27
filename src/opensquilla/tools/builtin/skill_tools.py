@@ -11,7 +11,7 @@ import json
 import re
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import structlog
 
@@ -20,9 +20,9 @@ from opensquilla.skills.hub.defaults import (
     get_default_skill_router,
     installed_skill_names,
 )
-from opensquilla.skills.types import SkillInstallSpec, SkillLayer
+from opensquilla.skills.types import SkillInstallSpec, SkillLayer, SkillSpec
 from opensquilla.tools.registry import tool
-from opensquilla.tools.types import ToolError
+from opensquilla.tools.types import ToolError, current_tool_context
 
 if TYPE_CHECKING:
     from opensquilla.skills.loader import SkillLoader
@@ -35,6 +35,14 @@ _loader: SkillLoader | None = None
 _MUTABLE_LAYERS = frozenset({SkillLayer.WORKSPACE})
 
 
+class _NoCatalogMutationError(Exception):
+    """Leave a mutation guard without dirtying after a rejected install."""
+
+    def __init__(self, result: Any) -> None:
+        super().__init__()
+        self.result = result
+
+
 def _skill_available(name: str) -> bool:
     """Whether ``name`` may be surfaced/invoked under the live operator config.
 
@@ -45,6 +53,36 @@ def _skill_available(name: str) -> bool:
     from opensquilla.skills.eligibility import is_skill_available_live
 
     return is_skill_available_live(name)
+
+
+def _active_catalog() -> Any | None:
+    """Return the catalog pinned to the current agent turn, if any."""
+    ctx = current_tool_context.get()
+    return getattr(ctx, "skill_catalog", None) if ctx is not None else None
+
+
+def _active_skills() -> list[Any]:
+    """Read the pinned generation, or refresh at a standalone tool boundary."""
+    catalog = _active_catalog()
+    if catalog is not None:
+        return list(getattr(catalog, "skills", ()))
+    if _loader is None:
+        return []
+    _loader.refresh_if_changed(reason="tool.skill_catalog")
+    return list(_loader.snapshot().skills)
+
+
+def _active_skill(name: str) -> Any | None:
+    catalog = _active_catalog()
+    if catalog is not None:
+        get_by_name = getattr(catalog, "get_by_name", None)
+        if callable(get_by_name):
+            return get_by_name(name)
+        return next(
+            (skill for skill in getattr(catalog, "skills", ()) if skill.name == name),
+            None,
+        )
+    return _loader.get_by_name(name) if _loader is not None else None
 
 
 # Valid skill name pattern: lowercase alphanumeric + hyphens
@@ -152,7 +190,7 @@ def _find_install_spec(skill_name: str, install_id: str) -> SkillInstallSpec:
     if _loader is None:
         raise ToolError("Skill loader not available")
 
-    skill = _loader.get_by_name(skill_name)
+    skill = cast(SkillSpec | None, _active_skill(skill_name))
     if skill is None or not _skill_available(skill_name):
         # Coding-mode-gated skills are reported as not-found so deps cannot be
         # previewed or installed via install_skill_deps while OFF (codex review).
@@ -226,7 +264,7 @@ def create_skill_tools(
     async def skill_list() -> str:
         if _loader is None:
             return "No skill loader available."
-        skills = _loader.load_all()
+        skills = _active_skills()
         if not skills:
             return "No skills installed."
 
@@ -292,7 +330,7 @@ def create_skill_tools(
             logger.info("skill_view.blocked_by_operator_config", skill=name)
             skill = None
         else:
-            skill = _loader.get_by_name(name)
+            skill = _active_skill(name)
         if skill is None:
             return (
                 f"Skill not found: {name}. This skill is not available in the "
@@ -417,9 +455,17 @@ def create_skill_tools(
         source_id = str(source or "clawhub").strip() or "clawhub"
 
         installer = build_default_skill_installer(managed_dir=_loader.managed_dir)
-        result = await installer.install(clean_identifier, source_id, force=bool(force))
-        if result.success:
-            _loader.invalidate_cache()
+        try:
+            with _loader.mutation_guard(reason="tool.skill_install_community"):
+                result = await installer.install(
+                    clean_identifier,
+                    source_id,
+                    force=bool(force),
+                )
+                if not result.success:
+                    raise _NoCatalogMutationError(result)
+        except _NoCatalogMutationError as exc:
+            result = exc.result
 
         payload: dict[str, Any] = {
             "status": "installed" if result.success else "failed",
@@ -483,6 +529,12 @@ def create_skill_tools(
             )
 
         exit_code, stdout, stderr, timed_out = await _run_install_argv(argv)
+        if exit_code == 0 and not timed_out:
+            from opensquilla.engine.steps.skills_filter import (
+                invalidate_skill_eligibility_cache,
+            )
+
+            invalidate_skill_eligibility_cache()
         return json.dumps(
             {
                 "status": "timeout" if timed_out else "executed",
@@ -549,6 +601,7 @@ def create_skill_tools(
             raise ToolError("Content must not be empty")
 
         # Check for name collision
+        _loader.refresh_if_changed(reason="tool.skill_create.validate")
         existing = _loader.get_by_name(name)
         if existing is not None:
             raise ToolError(
@@ -562,14 +615,13 @@ def create_skill_tools(
             raise ToolError("No workspace skill directory configured")
 
         skill_dir = workspace_dir / name
-        skill_dir.mkdir(parents=True, exist_ok=True)
         skill_file = skill_dir / "SKILL.md"
-
-        skill_md = _render_skill_md(name, description, content, triggers)
-        skill_file.write_text(skill_md, encoding="utf-8")
-
-        # Invalidate loader cache so new skill is discoverable
-        _loader.invalidate_cache()
+        with _loader.mutation_guard(reason="tool.skill_create"):
+            if skill_file.exists():
+                raise ToolError(f"Skill '{name}' already exists at {skill_file}")
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            skill_md = _render_skill_md(name, description, content, triggers)
+            skill_file.write_text(skill_md, encoding="utf-8")
 
         logger.info("skill_create.success", name=name)
         return f"Skill '{name}' created at {skill_file}"
@@ -610,6 +662,7 @@ def create_skill_tools(
         if _loader is None:
             raise ToolError("Skill loader not available")
 
+        _loader.refresh_if_changed(reason="tool.skill_edit.validate")
         existing = _loader.get_by_name(name)
         if existing is None:
             raise ToolError(f"Skill not found: {name}")
@@ -633,10 +686,9 @@ def create_skill_tools(
         if not skill_file.exists():
             raise ToolError(f"Skill file missing: {skill_file}")
 
-        skill_md = _render_skill_md(name, new_description, new_content, new_triggers or None)
-        skill_file.write_text(skill_md, encoding="utf-8")
-
-        _loader.invalidate_cache()
+        with _loader.mutation_guard(reason="tool.skill_edit"):
+            skill_md = _render_skill_md(name, new_description, new_content, new_triggers or None)
+            skill_file.write_text(skill_md, encoding="utf-8")
 
         logger.info("skill_edit.success", name=name)
         return f"Skill '{name}' updated"
@@ -660,6 +712,7 @@ def create_skill_tools(
         if _loader is None:
             raise ToolError("Skill loader not available")
 
+        _loader.refresh_if_changed(reason="tool.skill_delete.validate")
         existing = _loader.get_by_name(name)
         if existing is None:
             raise ToolError(f"Skill not found: {name}")
@@ -674,8 +727,8 @@ def create_skill_tools(
         if not skill_dir.exists():
             raise ToolError(f"Skill directory missing: {skill_dir}")
 
-        shutil.rmtree(skill_dir)
-        _loader.invalidate_cache()
+        with _loader.mutation_guard(reason="tool.skill_delete"):
+            shutil.rmtree(skill_dir)
 
         logger.info("skill_delete.success", name=name)
         return f"Skill '{name}' deleted from workspace layer"

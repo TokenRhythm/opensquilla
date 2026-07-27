@@ -98,6 +98,14 @@ describe('useCliInvocation', () => {
     expect(format('opensquilla doctor --json')).toBe('opensquilla doctor --json')
   })
 
+  it('treats an invalid persisted gateway URL as non-owned', async () => {
+    window.localStorage.setItem('opensquilla.wsUrl', 'not a gateway URL')
+    platformMock.gateway.getCliInvocation = async () => ({ mode: 'bundled', prefix: PREFIX })
+    const { format } = useCliInvocation()
+    await flushLoad()
+    expect(format('opensquilla doctor --json')).toBe('opensquilla doctor --json')
+  })
+
   it('rewrites when the connection URL host matches the owned gateway origin', async () => {
     window.localStorage.setItem('opensquilla.wsUrl', `ws://${window.location.host}/ws`)
     platformMock.gateway.getCliInvocation = async () => ({ mode: 'bundled', prefix: PREFIX })

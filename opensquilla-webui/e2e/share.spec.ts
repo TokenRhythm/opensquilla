@@ -388,9 +388,10 @@ test.describe('Share mode interaction shell', () => {
     await openSeededSession(page, SESSION_KEY, true)
     await expect(page.locator('.msg-ai-main').last()).toBeVisible({ timeout: 10000 })
 
-    const entry = page.locator('.chat-header').getByRole('button', { name: 'Share' })
+    const entry = page.getByTestId('chat-header-primary-action')
     await expect(entry).toBeVisible()
-    await expect(entry.locator('.chat-share-btn__label')).toBeHidden()
+    await expect(entry).toHaveAttribute('data-action', 'share')
+    await expect(entry).toHaveAccessibleName('Share')
 
     const iconBox = await entry.locator('svg').boundingBox()
     expect(iconBox).not.toBeNull()
@@ -403,45 +404,31 @@ test.describe('Share mode interaction shell', () => {
     expect(entryBox!.height).toBeGreaterThanOrEqual(43)
   })
 
-  test('at 375px the entry stays clear of the floating topbar cluster and opens share mode', async ({ page }) => {
+  test('at 375px the responsive session action opens share mode without occlusion', async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 812 })
     await openSeededSession(page, SESSION_KEY, true)
     await expect(page.locator('.msg-ai-main').last()).toBeVisible({ timeout: 10000 })
 
-    const entry = page.locator('.chat-header').getByRole('button', { name: 'Share' })
-    await expect(entry).toBeVisible()
+    const header = page.locator('.chat-header')
+    const layout = await header.getAttribute('data-layout')
+    expect(layout).toMatch(/^(compact|tight)$/)
 
-    // Reproduce the occlusion probe: a tap at the button center must land on
-    // the button, not on the floating conn pill that overlays the header band.
-    const probe = await page.evaluate(() => {
-      const btn = document.querySelector<HTMLElement>('.chat-header .chat-share-btn[aria-label="Share"]')
-      const pill = document.querySelector<HTMLElement>('.conn-pill')
-      if (!btn || !pill) return null
+    let entry = page.getByTestId('chat-header-primary-action')
+    if (layout === 'tight') {
+      await page.getByTestId('chat-session-actions-trigger').click()
+      entry = page.getByTestId('chat-session-action-share')
+    }
+    await expect(entry).toBeVisible()
+    await expect(entry).toHaveAccessibleName('Share')
+
+    // A tap at the action center must land on that action, not another piece
+    // of app chrome. This holds whether Share is primary or menu-contained.
+    const hitIsEntry = await entry.evaluate((btn) => {
       const r = btn.getBoundingClientRect()
       const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2)
-      // Worst-case cluster intrusion: the fixed chrome right of the pill plus
-      // the pill rendered with its longest state label. The pill text varies
-      // (CONNECTED/CONNECTING/DISCONNECTED), so asserting against the current
-      // state alone would under-test.
-      const cs = getComputedStyle(pill)
-      const ctx = document.createElement('canvas').getContext('2d')!
-      ctx.font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`
-      const text = 'DISCONNECTED'
-      const letterSpacing = parseFloat(cs.letterSpacing) || 0
-      const chrome = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight)
-        + parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth)
-      const worstPill = ctx.measureText(text).width + letterSpacing * text.length + chrome
-      const worstIntrusion = (window.innerWidth - pill.getBoundingClientRect().right) + worstPill
-      return {
-        hitIsButton: hit === btn || btn.contains(hit),
-        btnRight: r.right,
-        clearance: window.innerWidth - worstIntrusion - r.right,
-      }
+      return hit === btn || btn.contains(hit)
     })
-    expect(probe).not.toBeNull()
-    expect(probe!.hitIsButton).toBe(true)
-    // Clear of the cluster even in its widest (disconnected) state.
-    expect(probe!.clearance).toBeGreaterThanOrEqual(0)
+    expect(hitIsEntry).toBe(true)
 
     await entry.click()
     await expect(page.getByTestId('share-banner')).toBeVisible()

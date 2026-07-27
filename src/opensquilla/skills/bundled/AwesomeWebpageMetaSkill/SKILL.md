@@ -1,6 +1,7 @@
 ---
 name: AwesomeWebpageMetaSkill
 description: "Build a local multimedia webpage project from a user topic, audience, language, style, and media preferences by framing requirements, researching, planning, acquiring media, generating files, packaging, validating, repairing, and delivering usage guidance."
+description_zh: "根据用户给定的主题、受众、语言、风格和媒体偏好，通过梳理需求、调研、规划、获取媒体、生成文件、打包、校验、修复并交付使用指引，构建一个本地多媒体网页项目。"
 kind: meta
 meta_priority: 65
 always: false

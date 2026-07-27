@@ -9,6 +9,11 @@ export interface GatewayStatus {
   error?: string
 }
 
+export interface DesktopRetryStartupResult {
+  ok: boolean
+  error?: string
+}
+
 export type DesktopUpdateStatus =
   | 'idle'
   | 'checking'
@@ -19,6 +24,16 @@ export type DesktopUpdateStatus =
   | 'error'
   | 'applying'
 
+export type DesktopUpdateInstallMode = 'native' | 'manual' | 'unsupported'
+export type DesktopUpdateSource = 'oss' | 'github'
+export type DesktopUpdateErrorCode =
+  | 'source_unreachable'
+  | 'manifest_invalid'
+  | 'checksum_unavailable'
+  | 'integrity_failed'
+  | 'download_failed'
+  | 'install_failed'
+
 export interface DesktopUpdateState {
   status: DesktopUpdateStatus
   currentVersion: string
@@ -26,9 +41,14 @@ export interface DesktopUpdateState {
   progress: number | null
   checkedAt: string | null
   error: string | null
+  errorCode: DesktopUpdateErrorCode | null
   snoozedUntil: string | null
+  canCheck: boolean
   canNativeInstall: boolean
+  installMode: DesktopUpdateInstallMode
   releaseUrl: string | null
+  source: DesktopUpdateSource | null
+  fallbackUsed: boolean
 }
 
 export interface DesktopSettings {
@@ -73,6 +93,14 @@ export interface DesktopSettingsPayload {
   disableNetworkObservability?: boolean
 }
 
+export type DesktopMainWindowCloseBehavior = 'background' | 'quit' | 'ask'
+
+export interface DesktopPreferences {
+  mainWindowCloseBehavior: DesktopMainWindowCloseBehavior
+  canRunInBackground: boolean
+  platform: 'darwin' | 'win32' | 'linux' | 'other'
+}
+
 export interface PlatformCapabilities {
   isDesktop: boolean
   ownsGateway: boolean
@@ -94,6 +122,8 @@ export interface PlatformCapabilities {
    * in-browser blob-popup path can never succeed.
    */
   canOpenArtifactsNatively: boolean
+  /** The shell can host isolated native Workbench WebContents surfaces. */
+  hasNativeWorkbenchSurfaces: boolean
 }
 
 export interface ArtifactOpenRequest {
@@ -115,6 +145,74 @@ export interface PlatformFilesApi {
   openArtifact?: (payload: ArtifactOpenRequest) => Promise<ArtifactNativeOpenResult>
 }
 
+export interface NativeWorkbenchCreateSurfaceRequest {
+  version: 1
+  surfaceId: string
+  kind: 'artifact-html'
+  payload: {
+    /** HTML bytes fetched through the renderer's authenticated Artifact client. */
+    data: ArrayBuffer
+    name: string
+    mime: string
+    scopeId: string
+    /** Explicit, per-surface user choice. Defaults to false in the UI. */
+    allowRemoteResources: boolean
+  }
+}
+
+export interface NativeWorkbenchSurfaceRectRequest {
+  surfaceId: string
+  x: number
+  y: number
+  width: number
+  height: number
+  visible: boolean
+}
+
+export interface NativeWorkbenchSurfaceResult {
+  ok: boolean
+  message?: string
+}
+
+export type NativeWorkbenchSurfaceEventType =
+  | 'loading'
+  | 'ready'
+  | 'missing-resource'
+  | 'error'
+  | 'crashed'
+  | 'escape'
+
+export interface NativeWorkbenchSurfaceEvent {
+  version: 1
+  surfaceId: string
+  type: NativeWorkbenchSurfaceEventType
+  detail?: {
+    message?: string
+    path?: string
+    reason?: string
+  }
+}
+
+export interface NativeWorkbenchApi {
+  createSurface(
+    request: NativeWorkbenchCreateSurfaceRequest,
+  ): Promise<NativeWorkbenchSurfaceResult>
+  setSurfaceRect(
+    request: NativeWorkbenchSurfaceRectRequest,
+  ): Promise<NativeWorkbenchSurfaceResult>
+  activateSurface(surfaceId: string): Promise<NativeWorkbenchSurfaceResult>
+  destroySurface(surfaceId: string): Promise<NativeWorkbenchSurfaceResult>
+  onSurfaceEvent(callback: (event: NativeWorkbenchSurfaceEvent) => void): () => void
+}
+
+export interface PlatformWorkbenchApi {
+  /**
+   * Undefined on web and on older desktop shells. Callers must keep a DOM
+   * sandbox fallback for HTML Artifact preview.
+   */
+  native?: NativeWorkbenchApi
+}
+
 export interface CliInvocation {
   mode: 'bundled' | 'dev'
   /** Paste-ready replacement for the leading `opensquilla` CLI token. */
@@ -124,7 +222,7 @@ export interface CliInvocation {
 export interface PlatformGatewayApi {
   getStatus(): Promise<GatewayStatus>
   revealLog?: () => Promise<boolean>
-  retryStartup?: () => Promise<unknown>
+  retryStartup?: () => Promise<DesktopRetryStartupResult>
   /** null when the shell predates the bridge or the lookup fails; callers
    *  fall back to the raw command. */
   getCliInvocation?: () => Promise<CliInvocation | null>
@@ -134,6 +232,10 @@ export interface PlatformSettingsApi {
   getDesktopSettings?: () => Promise<DesktopSettings>
   saveDesktopSettings?: (payload: DesktopSettingsPayload) => Promise<DesktopSettings>
   resetDesktopSettings?: () => Promise<{ ok: boolean }>
+  getDesktopPreferences?: () => Promise<DesktopPreferences>
+  saveDesktopPreferences?: (
+    payload: { mainWindowCloseBehavior: DesktopMainWindowCloseBehavior },
+  ) => Promise<DesktopPreferences>
 }
 
 export interface PlatformOnboardingApi {
@@ -158,6 +260,7 @@ export interface Platform {
   settings: PlatformSettingsApi
   onboarding: PlatformOnboardingApi
   files: PlatformFilesApi
+  workbench: PlatformWorkbenchApi
   updates: PlatformUpdatesApi
   /**
    * The host OS locale (BCP-47), used only to seed the initial UI language on
@@ -170,9 +273,16 @@ export interface Platform {
    * Whether THIS host applies updates natively (electron-updater). Web always
    * returns false; desktop returns the shell's live native-update capability,
    * including runtime guards such as macOS requiring /Applications.
-   * The passive "newer version available" banner suppresses itself only when
-   * this is true, so surfaces without native auto-update (the browser, and
-   * desktop platforms not yet covered — e.g. unsigned Windows) keep the notice.
+   * Presentation ownership is intentionally reported separately by
+   * desktopUpdateManaged(), since unsigned Windows can discover an update and
+   * open a manual installer without applying it natively.
    */
   nativeAutoUpdateEnabled: () => Promise<boolean>
+  /**
+   * Whether the desktop shell owns update discovery and presentation, including
+   * manual versioned installers on unsigned Windows builds. This is deliberately
+   * separate from nativeAutoUpdateEnabled so the passive gateway banner does not
+   * duplicate the shell-managed Windows notice.
+   */
+  desktopUpdateManaged: () => Promise<boolean>
 }

@@ -686,6 +686,8 @@ gateway_app = typer.Typer(
 )
 app.add_typer(gateway_app, name="gateway")
 
+GATEWAY_PROFILE_IN_USE_MARKER = "OPENSQUILLA_PROFILE_IN_USE"
+
 
 @gateway_app.command("run")
 def gateway_run(
@@ -716,18 +718,46 @@ def gateway_run(
     opt-in only — the gateway's default auth assumes loopback scope.
     """
     from opensquilla.cli.gateway_cmd import run_gateway
-    from opensquilla.recovery import guarded_desktop_profile
+    from opensquilla.gateway.desktop_ownership import (
+        release_active_desktop_gateway_ownership,
+    )
+    from opensquilla.recovery import (
+        LegacyGatewayRunningError,
+        ProfileLockBusyError,
+        guarded_desktop_profile,
+    )
 
     # The child that owns the gateway retains both the RC4 profile lock and
     # the legacy gateway lease for its complete write-capable lifetime.
-    with guarded_desktop_profile():
-        run_gateway(
-            port=port,
-            bind=bind,
-            listen=listen,
-            debug=debug,
-            config_path=config_path,
-        )
+    try:
+        try:
+            with guarded_desktop_profile():
+                run_gateway(
+                    port=port,
+                    bind=bind,
+                    listen=listen,
+                    debug=debug,
+                    config_path=config_path,
+                )
+        except (ProfileLockBusyError, LegacyGatewayRunningError):
+            # This marker is consumed by the Desktop launcher. Keep both lines
+            # independent of the profile path carried by the lock exception: paths
+            # may contain user names, and an actionable startup failure does not
+            # need to expose them or a traceback.
+            typer.echo(GATEWAY_PROFILE_IN_USE_MARKER)
+            typer.echo(
+                "Gateway could not start: Another OpenSquilla process is still using "
+                "this profile. Quit every OpenSquilla app or terminal using it, then "
+                "try again; if no process will exit, restart the computer. Do not "
+                "delete profile lock files."
+            )
+            raise typer.Exit(code=1) from None
+    finally:
+        # The record remains available throughout shutdown and disappears only
+        # after guarded_desktop_profile has released the profile writer lease.
+        # A permanent sidecar lock serializes exact-record comparison/removal
+        # with a successor's atomic replacement in the handoff window.
+        release_active_desktop_gateway_ownership()
 
 
 @gateway_app.command("start")
@@ -1066,6 +1096,11 @@ def agent(
 def chat(
     model: str = typer.Option("", "--model", "-m", help="Model override"),
     session_id: str = typer.Option("", "--session", "-s", help="Resume session"),
+    ui: str | None = typer.Option(
+        None,
+        "--ui",
+        help="Chat UI: auto, tui, or plain (default: auto)",
+    ),
     standalone: bool = typer.Option(False, "--standalone", help="Direct Agent without gateway"),
     workspace: str = typer.Option("", "--workspace", help="Workspace root for standalone tools"),
     workspace_strict: bool | None = typer.Option(
@@ -1087,6 +1122,7 @@ def chat(
             run_chat(
                 model=model,
                 session_id=session_id,
+                ui=ui,
                 standalone=True,
                 workspace=workspace,
                 workspace_strict=workspace_strict,
@@ -1099,6 +1135,7 @@ def chat(
     run_chat(
         model=model,
         session_id=session_id,
+        ui=ui,
         standalone=False,
         workspace=workspace,
         workspace_strict=workspace_strict,

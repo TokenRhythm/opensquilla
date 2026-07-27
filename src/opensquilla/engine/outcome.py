@@ -53,6 +53,7 @@ _BLOCKED_CODES = frozenset(
         "approval_required",
         "external_dependency",
         "provider_unavailable",
+        "usage_accounting_unavailable",
         "sandbox_threshold_exceeded",
         "tool_policy_denied",
         "compaction_refused_flush_timeout",

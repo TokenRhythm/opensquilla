@@ -113,7 +113,7 @@ def test_detected_desktop_kind_reaches_opensquilla_migrator(
     monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(target))
     monkeypatch.setattr(
         "opensquilla.migration.opensquilla_home.detect_desktop_home",
-        lambda: desktop,
+        lambda _target=None: desktop,
     )
 
     detected = orchestrator.detect_default_sources()

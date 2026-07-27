@@ -25,14 +25,17 @@ export function isGatewayLifecycleCommand(command: string): boolean {
 // one that served this page. A desktop operator who repoints the connection at
 // a remote gateway must see the raw command, not one rewritten for the local
 // bundle.
-function isOwnedGatewayConnection(): boolean {
+export function isOwnedGatewayConnection(): boolean {
   if (typeof window === 'undefined') return true
   try {
     const raw = window.localStorage.getItem(WS_URL_KEY)
     if (!raw) return true
     return new URL(raw).host === window.location.host
   } catch {
-    return true
+    // An invalid persisted URL cannot prove ownership. Fail closed so Desktop
+    // neither rewrites commands nor opens local Runtime controls for an
+    // ambiguous connection.
+    return false
   }
 }
 

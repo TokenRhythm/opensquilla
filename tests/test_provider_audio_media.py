@@ -33,6 +33,37 @@ def _tool_context(tmp_path: Path) -> ToolContext:
     )
 
 
+def test_audio_default_env_does_not_cross_endpoint_origin(monkeypatch) -> None:
+    from opensquilla.tools.builtin import media
+
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "sk-default-origin-key")
+    config = AudioConfig(enabled=True)
+    provider_config = config.providers.elevenlabs
+    provider_config.base_url = "https://other.example.test/v1"
+    provider_config.api_key_env = ""
+
+    assert not media._audio_configured(config)
+    provider = media._elevenlabs_provider(config)
+    assert provider._api_key_env == ""
+    assert provider._resolve_api_key() == ""
+
+
+def test_audio_explicit_env_is_allowed_for_custom_origin(monkeypatch) -> None:
+    from opensquilla.tools.builtin import media
+
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "sk-default-origin-key")
+    monkeypatch.setenv("CUSTOM_AUDIO_KEY", "sk-custom-origin-key")
+    config = AudioConfig(enabled=True)
+    provider_config = config.providers.elevenlabs
+    provider_config.base_url = "https://other.example.test/v1"
+    provider_config.api_key_env = "CUSTOM_AUDIO_KEY"
+
+    assert media._audio_configured(config)
+    provider = media._elevenlabs_provider(config)
+    assert provider._api_key_env == "CUSTOM_AUDIO_KEY"
+    assert provider._resolve_api_key() == "sk-custom-origin-key"
+
+
 @pytest.mark.anyio
 async def test_tts_uses_elevenlabs_and_writes_audio(monkeypatch, tmp_path: Path) -> None:
     from opensquilla.tools.builtin import media

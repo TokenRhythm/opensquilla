@@ -25,6 +25,10 @@ export interface DisplayAttachment {
   size?: number
   data?: string
   dataUrl?: string
+  /** Base64 bytes retained in memory for downloads; never rendered into the DOM. */
+  downloadData?: string
+  /** Original optimistic upload retained in memory so a sent file stays downloadable. */
+  localFile?: File
   download_url?: string
   sha256_ref?: string
 }
@@ -33,6 +37,12 @@ export interface ChatPendingItem {
   text: string
   attachments: Attachment[]
   intent: string | null
+  /** Delivery state for an explicit steer attempt that still owns this queue item. */
+  deliveryState?: 'steering' | 'retryable'
+  /** Session that owned this item when it entered the in-memory queue. */
+  ownerSessionKey?: string
+  /** chat.send request whose canonical response may carry this item to a child. */
+  ownerRequestId?: string
   // Hidden control sends (e.g. meta-preflight confirmation) carry the provider
   // text in `text`, the visible bubble in `displayTextOverride`, and skip the
   // normal user-bubble push / composer consumption on drain.
@@ -131,6 +141,8 @@ export interface ChatRunTask {
   finishedAt?: number | string
   terminal_reason?: string
   terminalReason?: string
+  task_group_count?: number
+  taskGroupCount?: number
 }
 
 export interface ChatRunStatus {
@@ -232,6 +244,10 @@ export interface ChatEnsembleUsageRow {
   costSource?: string
   elapsed_ms?: number
   elapsedMs?: number
+  ok?: boolean
+  error?: string
+  error_code?: string
+  errorCode?: string
   [key: string]: unknown
 }
 
@@ -257,10 +273,12 @@ export interface ChatEnsembleMetaModel {
   input: number
   output: number
   costUsd: number
-  // Live per-member lifecycle during streaming. Absent for settled/history rows.
-  status?: 'running' | 'done' | 'failed'
+  sampleIndex?: number
+  // Per-member lifecycle from live progress or a settled ensemble trace.
+  status?: 'running' | 'done' | 'failed' | 'skipped'
   elapsedMs?: number
   error?: string
+  errorCode?: string
 }
 
 export interface ChatEnsembleMeta {
@@ -297,6 +315,8 @@ export interface ChatMessage {
   provenanceKind?: string
   provenanceSourceSessionKey?: string
   provenanceSourceTool?: string
+  /** Durable causal turn identity restored from transcript turn_context. */
+  turnId?: string
   interrupted?: boolean
   routerState?: string
   routerSettled?: boolean
@@ -314,6 +334,8 @@ export interface ChatMessage {
   restoredFromHistory?: boolean
   statusHistory?: import('./parts').StatusPart[]
   stopNotice?: boolean
+  /** Client terminal error retained until history contains a durable error row. */
+  terminalNotice?: boolean
   /** Typed terminal error code (e.g. 'sandbox_threshold_exceeded') carried on
    *  role:'error' messages so the renderer can offer a recovery action. */
   errorCode?: string
@@ -351,6 +373,8 @@ export interface ChatRenderedMessage {
   showHeader: boolean
   isStreaming?: boolean
   messageId?: string
+  /** Stable identity of the owning user turn for client-only UI continuity. */
+  turnKey?: string
   hasAttachments?: boolean
   attachments?: DisplayAttachment[]
   toolCalls?: ChatToolCall[]
@@ -359,10 +383,17 @@ export interface ChatRenderedMessage {
   meta?: ChatMessageMeta
   reasoning?: ChatReasoning
   interrupted?: boolean
+  /** The turn ended with a terminal error after this partial assistant output. */
+  terminalFailure?: boolean
   provenanceKind?: string
+  provenanceSourceSessionKey?: string
+  provenanceSourceTool?: string
   daySeparator?: boolean
   dayLabel?: string
   isRouterStrip?: boolean
+  /** Stable per-turn render identity. Unlike the router event message id, this
+   *  does not change when a live strip is replaced by its settled trace. */
+  routerTurnKey?: string
   routerState?: string
   routerSource?: string
   routerObserve?: boolean

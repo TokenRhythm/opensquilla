@@ -4,7 +4,7 @@ import sys
 
 from opensquilla.search.providers.exa import ExaSearchProvider
 from opensquilla.search.runtime_config import SearchRuntimeConfig, resolve_search_runtime
-from opensquilla.search.types import SearchOptions
+from opensquilla.search.types import SearchOptions, SearchProviderError
 
 
 def _clear_search_env(monkeypatch) -> None:
@@ -177,6 +177,209 @@ def test_resolver_all_key_mode_tie_breakers_with_iqs(monkeypatch) -> None:
     assert runtime.provider_order(
         SearchOptions(query="q", include_domains=("python.org",))
     ) == ("tavily", "iqs", "exa")
+
+
+def test_execution_plan_bounds_auto_network_without_truncating_provider_order(
+    monkeypatch,
+) -> None:
+    _clear_search_env(monkeypatch)
+    monkeypatch.setenv("BOCHA_SEARCH_API_KEY", "bocha-key")
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "brave-key")
+    monkeypatch.setenv("IQS_SEARCH_API_KEY", "iqs-key")
+    monkeypatch.setenv("TAVILY_API_KEY", "tavily-key")
+    monkeypatch.setenv("EXA_API_KEY", "exa-key")
+    runtime = resolve_search_runtime(
+        SearchRuntimeConfig(provider="duckduckgo", fallback_policy="network")
+    )
+    options = SearchOptions(query="q")
+
+    assert runtime.provider_order(options) == (
+        "bocha",
+        "tavily",
+        "iqs",
+        "brave",
+        "exa",
+        "duckduckgo",
+    )
+    plan = runtime.execution_plan(options)
+    assert plan.provider_names == ("bocha", "tavily")
+    assert plan.planned_provider_ids == ("bocha", "tavily")
+    assert plan.primary_provider == "bocha"
+    assert plan.fallback_provider == "tavily"
+    assert plan.selection_mode == "automatic"
+    assert plan.fallback_mode == "network"
+
+
+def test_execution_plan_auto_network_uses_next_capability_matched_provider(
+    monkeypatch,
+) -> None:
+    _clear_search_env(monkeypatch)
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "brave-key")
+    monkeypatch.setenv("IQS_SEARCH_API_KEY", "iqs-key")
+    monkeypatch.setenv("TAVILY_API_KEY", "tavily-key")
+    monkeypatch.setenv("EXA_API_KEY", "exa-key")
+    runtime = resolve_search_runtime(
+        SearchRuntimeConfig(provider="duckduckgo", fallback_policy="network")
+    )
+    options = SearchOptions(query="q", include_domains=("python.org",))
+
+    assert runtime.provider_order(options) == ("tavily", "iqs", "exa")
+    assert runtime.execution_plan(options).provider_names == ("tavily", "iqs")
+
+
+def test_execution_plan_auto_network_uses_duckduckgo_when_no_keyed_candidate(
+    monkeypatch,
+) -> None:
+    _clear_search_env(monkeypatch)
+    runtime = resolve_search_runtime(
+        SearchRuntimeConfig(provider="duckduckgo", fallback_policy="network")
+    )
+
+    assert runtime.execution_plan(SearchOptions(query="q")).provider_names == (
+        "duckduckgo",
+    )
+
+
+def test_execution_plan_auto_network_uses_duckduckgo_when_no_keyed_backup(
+    monkeypatch,
+) -> None:
+    _clear_search_env(monkeypatch)
+    monkeypatch.setenv("TAVILY_API_KEY", "tavily-key")
+    runtime = resolve_search_runtime(
+        SearchRuntimeConfig(provider="duckduckgo", fallback_policy="network")
+    )
+    options = SearchOptions(query="q", include_domains=("python.org",))
+
+    assert runtime.provider_order(options) == ("tavily",)
+    assert runtime.execution_plan(options).provider_names == (
+        "tavily",
+        "duckduckgo",
+    )
+
+
+def test_execution_plan_explicit_network_preserves_duckduckgo_fallback(monkeypatch) -> None:
+    _clear_search_env(monkeypatch)
+    runtime = resolve_search_runtime(
+        SearchRuntimeConfig(
+            provider="tavily",
+            api_key="tavily-key",
+            fallback_policy="network",
+        )
+    )
+
+    plan = runtime.execution_plan(SearchOptions(query="q", provider="tavily"))
+    assert plan.provider_names == ("tavily", "duckduckgo")
+    assert plan.selection_mode == "explicit"
+    assert plan.fallback_mode == "network"
+
+
+def test_execution_plan_off_preselects_only_one_auto_auth_skip(monkeypatch) -> None:
+    _clear_search_env(monkeypatch)
+    monkeypatch.setenv("BOCHA_SEARCH_API_KEY", "bocha-key")
+    monkeypatch.setenv("TAVILY_API_KEY", "tavily-key")
+    runtime = resolve_search_runtime(
+        SearchRuntimeConfig(provider="duckduckgo", fallback_policy="off")
+    )
+    options = SearchOptions(query="q")
+
+    assert runtime.provider_order(options) == ("bocha", "tavily", "duckduckgo")
+    plan = runtime.execution_plan(options)
+    assert plan.provider_names == ("bocha", "tavily")
+    assert plan.fallback_mode == "auth_missing"
+
+
+def test_off_policy_only_allows_auto_dynamic_auth_missing_skip(monkeypatch) -> None:
+    _clear_search_env(monkeypatch)
+    runtime = resolve_search_runtime(
+        SearchRuntimeConfig(provider="duckduckgo", fallback_policy="off")
+    )
+    error = SearchProviderError(
+        provider="bocha",
+        kind="auth",
+        message="Bocha API key not set",
+        retryable=False,
+    )
+
+    assert runtime.should_fallback(error, explicit_provider=False) is True
+    assert runtime.should_fallback(error, explicit_provider=True) is False
+
+
+def test_network_policy_requires_transient_classification_and_provider_permission(
+    monkeypatch,
+) -> None:
+    _clear_search_env(monkeypatch)
+    runtime = resolve_search_runtime(
+        SearchRuntimeConfig(provider="duckduckgo", fallback_policy="network")
+    )
+
+    for error in (
+        SearchProviderError("bocha", "blocked", "terminal", retryable=True),
+        SearchProviderError("bocha", "parse", "terminal", retryable=True),
+        SearchProviderError("bocha", "unknown", "terminal", retryable=True),
+    ):
+        assert runtime.should_fallback(
+            error,
+            explicit_provider=False,
+        ) is False
+    assert runtime.should_fallback(
+        SearchProviderError(
+            provider="bocha",
+            kind="blocked",
+            message="challenge surfaced as server error",
+            retryable=True,
+            status_code=500,
+        ),
+        explicit_provider=False,
+    ) is False
+    assert runtime.should_fallback(
+        SearchProviderError(
+            provider="bocha",
+            kind="http",
+            message="bad request",
+            retryable=True,
+            status_code=400,
+        ),
+        explicit_provider=False,
+    ) is False
+    assert runtime.should_fallback(
+        SearchProviderError(
+            provider="bocha",
+            kind="rate_limit",
+            message="rate limited without HTTP status",
+            retryable=True,
+        ),
+        explicit_provider=False,
+    ) is False
+    assert runtime.should_fallback(
+        SearchProviderError(
+            provider="bocha",
+            kind="rate_limit",
+            message="rate limited",
+            retryable=True,
+            status_code=429,
+        ),
+        explicit_provider=False,
+    ) is True
+    assert runtime.should_fallback(
+        SearchProviderError(
+            provider="bocha",
+            kind="http",
+            message="server error",
+            retryable=False,
+            status_code=500,
+        ),
+        explicit_provider=False,
+    ) is False
+    assert runtime.should_fallback(
+        SearchProviderError(
+            provider="bocha",
+            kind="http",
+            message="server error",
+            retryable=True,
+            status_code=500,
+        ),
+        explicit_provider=False,
+    ) is True
 
 
 def test_resolver_domain_constrained_auto_prefers_domain_filter_providers(

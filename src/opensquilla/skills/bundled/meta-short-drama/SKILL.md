@@ -1,6 +1,7 @@
 ---
 name: meta-short-drama
 description: "Use this meta-skill instead of answering directly when the current user asks to generate an AI short-drama or 短剧 from a topic. The workflow infers render style, character identity, and shot count (1-10, default 5) from the request (filling in conservative defaults when missing), drafts a strict shot-by-shot shooting script, pauses for one free-form review (the user can approve, adjust render style / character / shot count / shot details, or cancel in plain language), optionally re-drafts the script with the user's adjustments, generates one universal full-cast identity-reference image plus per-shot composition images, then per-shot video clips (each video anchored to BOTH the universal reference image and its own composition image so the character identity AND scene layout stay consistent), bookends them with a title card and an ending card, burns subtitles in the user's language, and saves the script alongside the final MP4. Do not use it for slide decks, document-decision analysis, single-image generation, isolated script writing, or pasted historical short-drama examples."
+description_zh: "当用户要求根据主题生成AI短剧或短剧时，使用此元技能而非直接回答。工作流从请求中推断渲染风格、角色身份和镜头数（1-10，默认5），起草严格的逐镜头拍摄脚本，暂停一次供用户自由评审（可批准、调整渲染风格/角色/镜头数/镜头细节或取消），可选地按用户调整重新起草脚本，生成一张通用全员身份参考图和各镜头构图图，再生成逐镜视频（每段视频同时锚定通用参考图和自身构图图以保持角色身份与场景布局一致），加上片头片尾卡，按用户语言烧录字幕，并将脚本与最终MP4一并保存。不用于幻灯片、文档决策分析、单图生成、独立脚本写作或粘贴的历史短剧示例。"
 kind: meta
 meta_priority: 75
 always: false

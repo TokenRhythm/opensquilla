@@ -5,7 +5,12 @@ from __future__ import annotations
 import numpy as np
 import structlog
 
-from opensquilla.skills.retrieval.lexical import Hit, _skill_id, _stringify
+from opensquilla.skills.retrieval.lexical import (
+    Hit,
+    _skill_cache_fingerprint,
+    _skill_id,
+    _stringify,
+)
 from opensquilla.skills.types import SkillSpec
 
 log = structlog.get_logger(__name__)
@@ -32,10 +37,10 @@ class SemanticIndex:
         self._fingerprint: tuple[str, ...] | None = None
 
     def _fp(self, skills: list[SkillSpec]) -> tuple[str, ...]:
-        return tuple(_skill_id(s) for s in skills)
+        return tuple(_skill_cache_fingerprint(s) for s in skills)
 
     def build(self, skills: list[SkillSpec]) -> None:
-        """Encode the skill set. Idempotent on the id-tuple fingerprint.
+        """Encode the skill set. Idempotent on the retrieval-content fingerprint.
 
         ALL embedder exceptions propagate. HybridRetriever decides
         whether to permanently disable the semantic path
@@ -66,7 +71,7 @@ class SemanticIndex:
         norms = np.linalg.norm(mat, axis=1, keepdims=True)
         norms[norms == 0] = 1.0
         self._matrix = (mat / norms).astype(np.float32)
-        self._ids = list(fp)
+        self._ids = [_skill_id(skill) for skill in skills]
         self._fingerprint = fp
 
     def rank(self, query: str, top_n: int = 20) -> list[Hit]:

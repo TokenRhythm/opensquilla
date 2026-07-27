@@ -78,9 +78,8 @@ def resolve_skill_layer_dirs(
     """Resolve every skill-layer dir from config-derived inputs.
 
     Callers (gateway boot and the ``opensquilla skills`` CLI) pass the same config
-    values so both end up with the same inventory. Most directories that do not
-    exist on disk collapse to ``None``; the default managed directory is kept so
-    a running gateway can observe skills installed after boot.
+    values so both end up with the same inventory. Candidate directories are
+    preserved before they exist so a running gateway can observe later writes.
 
     Args:
         allow_bundled: Honor the BUNDLED layer (config.skills.allow_bundled).
@@ -96,26 +95,23 @@ def resolve_skill_layer_dirs(
         bundled_candidate if allow_bundled and bundled_candidate.is_dir() else None
     )
 
-    # Explicit override wins and is preserved as-is — a user-configured
-    # path may not exist yet (skill_create mkdirs it on demand). The
-    # is_dir() collapse only applies to the implicit defaults.
+    # Preserve every writable candidate even when it does not exist yet;
+    # skill_create and external writers may create it after gateway boot.
     if workspace_override is not None:
         workspace_dir: Path | None = workspace_override
     elif workspace_root is not None:
-        candidate = workspace_root / "skills"
-        workspace_dir = candidate if candidate.is_dir() else None
+        workspace_dir = workspace_root / "skills"
     else:
-        candidate = Path.cwd() / "skills"
-        workspace_dir = candidate if candidate.is_dir() else None
+        workspace_dir = Path.cwd() / "skills"
 
     managed_dir = resolve_managed_skills_dir(managed_override)
 
     personal_agents = Path.home() / ".agents" / "skills"
-    personal_agents_dir = personal_agents if personal_agents.is_dir() else None
+    personal_agents_dir = personal_agents
 
     project_root = workspace_root if workspace_root is not None else Path.cwd()
     project_agents = project_root / ".agents" / "skills"
-    project_agents_dir = project_agents if project_agents.is_dir() else None
+    project_agents_dir = project_agents
 
     return SkillLayerDirs(
         bundled_dir=bundled_dir,

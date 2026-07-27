@@ -24,6 +24,8 @@ from enum import IntEnum, StrEnum
 from pathlib import Path, PurePath, PurePosixPath
 from typing import Literal
 
+from opensquilla.sandbox.permissions import FileSystemPermissionProfile
+
 
 class SecurityLevel(IntEnum):
     """Security grading levels ordered by strictness.
@@ -154,6 +156,7 @@ class SandboxPolicy:
     description: str = ""
     network_proxy: NetworkProxySpec | None = None
     unreadable_globs: tuple[str, ...] = ()
+    file_system: FileSystemPermissionProfile | None = None
 
     def summary(self) -> dict[str, object]:
         """Flat structured summary used in log lines and debug output."""
@@ -181,6 +184,17 @@ class SandboxPolicy:
             "wall_timeout_s": self.limits.wall_timeout_s,
             "require_approval": self.require_approval,
             "unreadable_globs": list(self.unreadable_globs),
+            "file_system": (
+                {
+                    "entries": [
+                        {"path": str(entry.path), "access": entry.access.value}
+                        for entry in self.file_system.entries
+                    ],
+                    "denied_read_globs": list(self.file_system.denied_read_globs),
+                }
+                if self.file_system is not None
+                else None
+            ),
         }
 
 

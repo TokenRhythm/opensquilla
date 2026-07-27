@@ -185,3 +185,74 @@ async def test_selector_fallback_control_events_remain_live_and_do_not_block_fal
         event.kind == "text_delta" and event.text == "synthesized answer"
         for event in events
     )
+
+
+@pytest.mark.asyncio
+async def test_selector_fallback_restores_single_provider_retry_safety() -> None:
+    from opensquilla.engine.runtime import _SelectorFallbackProvider
+
+    class _Composite:
+        provider_name = "ensemble"
+        retry_failed_call_safe = False
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat(self, messages: Any, tools: Any = None, config: Any = None) -> Any:
+            self.calls += 1
+            yield ProviderErrorEvent(message="rate limited", code="429")
+
+    class _Fallback:
+        provider_name = "openrouter"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat(self, messages: Any, tools: Any = None, config: Any = None) -> Any:
+            self.calls += 1
+            if self.calls == 1:
+                yield ProviderErrorEvent(message="Request timed out: ", code="timeout")
+                return
+            yield ProviderText(text="fallback recovered")
+            yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
+
+    composite = _Composite()
+    fallback = _Fallback()
+
+    class _Selector:
+        current_config = type("Config", (), {"model": "ensemble/model"})()
+
+        def next_fallback_after_failure(self, exc: Exception) -> Any:
+            del exc
+            self.current_config = type("Config", (), {"model": "fallback/model"})()
+            return fallback
+
+    wrapper = _SelectorFallbackProvider(composite, _Selector())
+    agent = Agent(
+        provider=wrapper,
+        config=AgentConfig(
+            max_iterations=2,
+            max_provider_retries=1,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+        tool_definitions=[
+            ToolDefinition(
+                name="echo",
+                description="Echo.",
+                input_schema=ToolInputSchema(properties={}, required=[]),
+            )
+        ],
+        tool_handler=_tool_handler,
+    )
+
+    events = [event async for event in agent.run_turn("hi")]
+
+    assert composite.calls == 1
+    assert fallback.calls == 2
+    assert wrapper.retry_failed_call_safe is True
+    assert not any(event.kind == "error" for event in events)
+    assert any(
+        event.kind == "text_delta" and event.text == "fallback recovered"
+        for event in events
+    )

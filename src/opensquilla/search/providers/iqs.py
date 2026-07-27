@@ -8,6 +8,7 @@ from typing import Any
 import httpx
 
 from opensquilla.search.registry import register_provider
+from opensquilla.search.retry_policy import is_retryable_http_status
 from opensquilla.search.types import (
     Recency,
     SearchErrorKind,
@@ -176,11 +177,8 @@ def _classify_status(status_code: int) -> SearchErrorKind:
 
 
 def _is_retryable_status(status_code: int, kind: SearchErrorKind) -> bool:
-    if status_code == 429:
-        return True
-    if kind == "http":
-        return True
-    return False
+    del kind
+    return is_retryable_http_status(status_code)
 
 
 def _error_detail(response: httpx.Response) -> str:

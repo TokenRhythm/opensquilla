@@ -10,6 +10,7 @@ from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.sandbox.integration import run_in_process_network_action
 from opensquilla.sandbox.types import DenialResult
 from opensquilla.tools.builtin.web import (
+    _search_plan_argv_token,
     get_active_provider,
     search_runtime_status,
 )
@@ -306,7 +307,15 @@ async def _handle_search_query(params: dict | None, ctx: RpcContext) -> dict[str
 
     payload_or_denial = await run_in_process_network_action(
         action_kind="web.fetch",
-        argv=("web_search", query, str(limit or "")),
+        argv=(
+            "web_search",
+            query,
+            str(limit or ""),
+            _search_plan_argv_token(
+                {"query": query, "provider": provider_name},
+                tool_name="web_discover",
+            ),
+        ),
         callback=_run_search,
     )
     if isinstance(payload_or_denial, DenialResult):
@@ -316,6 +325,7 @@ async def _handle_search_query(params: dict | None, ctx: RpcContext) -> dict[str
             "query": query,
             "provider": provider_name or get_active_provider(),
             "results": [],
+            "retry_allowed": False,
             "error": {
                 "kind": denial.reason.value,
                 "class": "SandboxDenied",
@@ -350,6 +360,7 @@ async def _handle_search_query(params: dict | None, ctx: RpcContext) -> dict[str
         "query": payload.get("query", query),
         "provider": payload.get("provider", provider_name or get_active_provider()),
         "results": payload.get("results", []),
+        "retry_allowed": False,
         "error": error,
     }
     if payload.get("attempts") is not None:

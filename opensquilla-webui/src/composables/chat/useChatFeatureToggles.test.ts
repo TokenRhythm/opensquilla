@@ -15,10 +15,13 @@ function deferred<T>() {
 
 function createHarness(options: {
   configGetResults?: RpcResult[]
+  routingGetResults?: RpcResult[]
   patchResults?: RpcResult[]
 } = {}) {
   const configGetResults = [...(options.configGetResults ?? [{}])]
+  const routingGetResults = [...(options.routingGetResults ?? [])]
   const patchResults = [...(options.patchResults ?? [])]
+  const eventHandlers = new Map<string, (payload: unknown) => void>()
   const waitForConnection = vi.fn(async () => {})
   const setGlobalElevatedMode = vi.fn()
   const loadCurrentSessionUsage = vi.fn()
@@ -28,7 +31,13 @@ function createHarness(options: {
       if (result instanceof Error) throw result
       return await Promise.resolve(result)
     }
-    if (method === 'config.patch.safe') {
+    if (method === 'models.routing.get') {
+      const result = routingGetResults.shift()
+      if (result === undefined) throw new Error('canonical routing unavailable')
+      if (result instanceof Error) throw result
+      return await Promise.resolve(result)
+    }
+    if (method === 'config.patch.safe' || method === 'models.routing.set') {
       const result = patchResults.shift()
       if (result instanceof Error) throw result
       await Promise.resolve(result)
@@ -39,21 +48,36 @@ function createHarness(options: {
   const rpc = {
     waitForConnection,
     call: call as <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>,
+    on: vi.fn((event: string, handler: (payload: unknown) => void) => {
+      eventHandlers.set(event, handler)
+      return () => eventHandlers.delete(event)
+    }),
   }
   const api = useChatFeatureToggles({
     rpc,
     setGlobalElevatedMode,
     loadCurrentSessionUsage,
   })
-  return { api, rpc: { waitForConnection, call }, setGlobalElevatedMode, loadCurrentSessionUsage }
+  return {
+    api,
+    rpc: { waitForConnection, call, on: rpc.on },
+    emit: (event: string, payload: unknown) => eventHandlers.get(event)?.(payload),
+    setGlobalElevatedMode,
+    loadCurrentSessionUsage,
+  }
 }
 
 function patchCalls(rpc: ReturnType<typeof createHarness>['rpc']) {
   return rpc.call.mock.calls.filter(([method]) => method === 'config.patch.safe')
 }
 
+function routingCalls(rpc: ReturnType<typeof createHarness>['rpc']) {
+  return rpc.call.mock.calls.filter(([method]) => method === 'models.routing.set')
+}
+
 afterEach(() => {
   vi.restoreAllMocks()
+  vi.unstubAllGlobals()
 })
 
 describe('useChatFeatureToggles coding mode', () => {
@@ -217,7 +241,61 @@ describe('useChatFeatureToggles coding mode', () => {
   })
 })
 
+describe('useChatFeatureToggles router visual effects', () => {
+  it('persists router visual effects without a legacy browser global', () => {
+    const setItem = vi.fn()
+    vi.stubGlobal('localStorage', {
+      getItem: vi.fn(() => null),
+      setItem,
+    })
+    const { api } = createHarness()
+
+    api.setRouterVisualEffectsEnabled(false)
+
+    expect(api.routerVisualEffectsEnabled.value).toBe(false)
+    expect(setItem).toHaveBeenCalledWith('opensquilla.routerFx', JSON.stringify({
+      enabled: false,
+      variant: 'default',
+    }))
+    expect(source).not.toContain('SavingsFX')
+  })
+})
+
 describe('useChatFeatureToggles model routing mode', () => {
+  it('uses the canonical routing snapshot over legacy config inference', async () => {
+    const { api } = createHarness({
+      configGetResults: [{ squilla_router: { enabled: true, rollout_phase: 'full' } }],
+      routingGetResults: [{ mode: 'direct' }],
+    })
+
+    await api.loadFeatureToggles()
+
+    expect(api.modelRoutingMode.value).toBe('off')
+  })
+
+  it('applies Gateway routing changes live and unsubscribes on cleanup', async () => {
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    vi.stubGlobal('window', {
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    const { api, rpc, emit } = createHarness()
+    const cleanup = api.bindFeatureRefresh()
+
+    emit('models.routing.changed', { mode: 'ensemble', selection_mode: 'router_dynamic' })
+    expect(api.modelRoutingMode.value).toBe('llm_ensemble')
+    expect(api.llmEnsembleSelectionMode.value).toBe('router_dynamic')
+
+    cleanup()
+    expect(rpc.on).toHaveBeenCalledWith('models.routing.changed', expect.any(Function))
+    emit('models.routing.changed', { mode: 'direct' })
+    expect(api.modelRoutingMode.value).toBe('llm_ensemble')
+  })
+
   it.each([
     [{}, 'off', false, false],
     [{ squilla_router: { enabled: true, rollout_phase: 'observe' } }, 'off', false, false],
@@ -236,138 +314,19 @@ describe('useChatFeatureToggles model routing mode', () => {
     expect(api.llmEnsembleEnabled.value).toBe(ensembleActive)
   })
 
-  const writeCases: Array<[
-    ModelRoutingMode,
-    Record<string, unknown>,
-    Record<string, unknown>,
-  ]> = [
-    ['off', {}, {
-      'llm_ensemble.enabled': false,
-      'squilla_router.enabled': false,
-      'squilla_router.rollout_phase': 'observe',
-    }],
-    ['squilla_router', {}, {
-      'llm_ensemble.enabled': false,
-      'squilla_router.enabled': true,
-      'squilla_router.rollout_phase': 'full',
-    }],
-    // Static/custom ensemble persists router-disabled — the same
-    // exclusive-strategy encoding the Settings "Model strategy" card writes.
-    ['llm_ensemble', {
-      llm_ensemble: { selection_mode: 'static_openrouter_b5' },
-    }, {
-      'llm_ensemble.enabled': true,
-      'squilla_router.enabled': false,
-      'squilla_router.rollout_phase': 'full',
-    }],
-  ]
-
-  it.each(writeCases)('writes %s through one safe backend patch', async (mode, config, patches) => {
+  it.each<[ModelRoutingMode, string]>([
+    ['off', 'direct'],
+    ['squilla_router', 'router'],
+    ['llm_ensemble', 'ensemble'],
+  ])('writes %s through the canonical Gateway state machine', async (mode, gatewayMode) => {
     const { api, rpc } = createHarness({
-      configGetResults: [config, config],
+      configGetResults: [{}, {}],
     })
 
     await api.loadFeatureToggles()
     await api.setModelRoutingMode(mode)
 
-    expect(rpc.call).toHaveBeenCalledWith('config.patch.safe', { patches })
-  })
-
-  it.each([
-    'static_openrouter_b5',
-    'static_tokenrhythm_b5',
-    'custom_b5',
-  ])('disables the router for known independent ensemble mode %s', async (selectionMode) => {
-    const config = {
-      squilla_router: { enabled: true, rollout_phase: 'full' },
-      llm_ensemble: { enabled: false, selection_mode: selectionMode },
-    }
-    const { api, rpc } = createHarness({
-      configGetResults: [config, config],
-    })
-
-    await api.loadFeatureToggles()
-    await api.setModelRoutingMode('llm_ensemble')
-
-    expect(rpc.call).toHaveBeenCalledWith('config.patch.safe', {
-      patches: {
-        'llm_ensemble.enabled': true,
-        'squilla_router.enabled': false,
-        'squilla_router.rollout_phase': 'full',
-      },
-    })
-  })
-
-  it('keeps the router enabled for a legacy router_dynamic ensemble', async () => {
-    const dynamicConfig = {
-      squilla_router: { enabled: true, rollout_phase: 'full' },
-      llm_ensemble: { enabled: false, selection_mode: 'router_dynamic' },
-    }
-    const { api, rpc } = createHarness({
-      configGetResults: [
-        dynamicConfig,
-        {
-          ...dynamicConfig,
-          llm_ensemble: { enabled: true, selection_mode: 'router_dynamic' },
-        },
-      ],
-    })
-
-    await api.loadFeatureToggles()
-    await api.setModelRoutingMode('llm_ensemble')
-
-    expect(rpc.call).toHaveBeenCalledWith('config.patch.safe', {
-      patches: {
-        'llm_ensemble.enabled': true,
-        'squilla_router.enabled': true,
-        'squilla_router.rollout_phase': 'full',
-      },
-    })
-    expect(api.modelRoutingMode.value).toBe('llm_ensemble')
-  })
-
-  it.each([
-    ['a missing selection mode', undefined],
-    ['an unknown selection mode', 'future_ensemble_mode'],
-  ])('keeps the router enabled for %s', async (_label, selectionMode) => {
-    const llmEnsemble = selectionMode
-      ? { enabled: false, selection_mode: selectionMode }
-      : { enabled: false }
-    const config = {
-      squilla_router: { enabled: true, rollout_phase: 'full' },
-      llm_ensemble: llmEnsemble,
-    }
-    const { api, rpc } = createHarness({
-      configGetResults: [config, config],
-    })
-
-    await api.loadFeatureToggles()
-    await api.setModelRoutingMode('llm_ensemble')
-
-    expect(rpc.call).toHaveBeenCalledWith('config.patch.safe', {
-      patches: {
-        'llm_ensemble.enabled': true,
-        'squilla_router.enabled': true,
-        'squilla_router.rollout_phase': 'full',
-      },
-    })
-  })
-
-  it('keeps the three modes mutually exclusive when switching to Squilla Router', async () => {
-    const { api, rpc } = createHarness({
-      configGetResults: [{ squilla_router: { enabled: true, rollout_phase: 'full' } }],
-    })
-
-    await api.setModelRoutingMode('squilla_router')
-
-    expect(rpc.call).toHaveBeenCalledWith('config.patch.safe', {
-      patches: {
-        'llm_ensemble.enabled': false,
-        'squilla_router.enabled': true,
-        'squilla_router.rollout_phase': 'full',
-      },
-    })
-    expect(api.modelRoutingMode.value).toBe('squilla_router')
+    expect(rpc.call).toHaveBeenCalledWith('models.routing.set', { mode: gatewayMode })
   })
 
   it('optimistically reflects the selected routing mode while a write is pending', async () => {
@@ -425,14 +384,8 @@ describe('useChatFeatureToggles model routing mode', () => {
     await api.setModelRoutingMode('off')
     await Promise.resolve()
 
-    expect(patchCalls(rpc)).toHaveLength(1)
-    expect(rpc.call).toHaveBeenCalledWith('config.patch.safe', {
-      patches: {
-        'llm_ensemble.enabled': true,
-        'squilla_router.enabled': true,
-        'squilla_router.rollout_phase': 'full',
-      },
-    })
+    expect(routingCalls(rpc)).toHaveLength(1)
+    expect(rpc.call).toHaveBeenCalledWith('models.routing.set', { mode: 'ensemble' })
 
     pendingPatch.resolve(undefined)
     await firstWrite
@@ -443,8 +396,8 @@ describe('useChatFeatureToggles model routing mode', () => {
     const setterEnd = source.indexOf('function bindFeatureRefresh', setterStart)
     const setterSource = source.slice(setterStart, setterEnd)
 
-    expect(setterSource).toContain('llm_ensemble.enabled')
-    expect(setterSource).toContain('squilla_router.enabled')
+    expect(setterSource).toContain("options.rpc.call('models.routing.set'")
+    expect(setterSource).not.toContain("options.rpc.call('config.patch.safe'")
     expect(setterSource).not.toMatch(/localStorage|sessionStorage/)
   })
 })

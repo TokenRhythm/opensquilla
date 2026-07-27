@@ -8,6 +8,11 @@ from typing import Any
 from opensquilla.session.models import AgentTaskStatus
 
 CONTEXT_PAYLOAD_TOO_LARGE_CODE = "provider_request_too_large"
+ENSEMBLE_MULTIMODAL_UNSUPPORTED_CODE = "ensemble_multimodal_unsupported"
+ENSEMBLE_MULTIMODAL_UNSUPPORTED_MESSAGE = (
+    "Ensemble does not support image input yet. "
+    "Switch to a single-model routing mode and try again."
+)
 
 # Non-context budget-exhaustion codes. Context-window exhaustion has its own,
 # more specific message via ``is_context_payload_too_large`` and is intentionally
@@ -80,6 +85,11 @@ def build_terminal_reply(
     # Per-code phrasing for the non-provider terminal codes the agent loop emits,
     # so each surfaces a specific, actionable cause instead of the generic
     # "failed" sentence below.
+    if (
+        error_class == ENSEMBLE_MULTIMODAL_UNSUPPORTED_CODE
+        or reason == ENSEMBLE_MULTIMODAL_UNSUPPORTED_CODE
+    ):
+        return ENSEMBLE_MULTIMODAL_UNSUPPORTED_MESSAGE
     if error_class == "sandbox_threshold_exceeded" or reason == "sandbox_threshold_exceeded":
         return (
             "Automatic execution paused after repeated sandbox denials. Approve the "

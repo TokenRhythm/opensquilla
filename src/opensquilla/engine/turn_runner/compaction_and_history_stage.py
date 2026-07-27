@@ -42,13 +42,14 @@ cache-friendly system-prompt-rebuild contract.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from opensquilla.engine.agent import Agent
     from opensquilla.engine.hooks.types import CompactionHook
     from opensquilla.engine.turn_runner.outcome import StageOutcome
+    from opensquilla.provider.types import ProviderRequestCorrelation
 
 # Internal sentinels mirroring the runtime.py module-level constants. The
 # stage body branches on ``t3_status`` to decide whether to fall through
@@ -91,6 +92,7 @@ class T3UpgradeCompactionPort(Protocol):
         context_window_tokens: int,
         compaction_provider: Any | None,
         compaction_model: str | None,
+        provider_request_correlation: ProviderRequestCorrelation | None = None,
     ) -> str: ...
 
 @runtime_checkable
@@ -115,6 +117,7 @@ class PreflightCompactionPort(Protocol):
         context_window_tokens: int,
         compaction_provider: Any | None,
         compaction_model: str | None,
+        provider_request_correlation: ProviderRequestCorrelation | None = None,
     ) -> None: ...
 
 @runtime_checkable
@@ -196,6 +199,10 @@ class CompactionAndHistoryStageInput:
     compaction_provider: Any | None = None
     compaction_model: str | None = None
     bound_user_message_id: str | None = None
+    provider_request_correlation: ProviderRequestCorrelation | None = field(
+        default=None,
+        repr=False,
+    )
 
 @dataclass(frozen=True)
 class CompactionAndHistoryStageOutput:
@@ -302,6 +309,7 @@ class CompactionAndHistoryStage:
             context_window_tokens=compaction_context_window_tokens,
             compaction_provider=compaction_provider,
             compaction_model=compaction_model,
+            provider_request_correlation=inp.provider_request_correlation,
         )
         await self._fire_after_compact(t3_state, {"status": t3_status})
 
@@ -322,6 +330,7 @@ class CompactionAndHistoryStage:
                 context_window_tokens=compaction_context_window_tokens,
                 compaction_provider=compaction_provider,
                 compaction_model=compaction_model,
+                provider_request_correlation=inp.provider_request_correlation,
             )
             await self._fire_after_compact(preflight_state, {"status": "ran"})
 

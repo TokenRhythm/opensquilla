@@ -12,6 +12,9 @@ export interface SessionItem {
   title: string
   subtitle: string
   groupLabel: string
+  workspace?: string
+  workspaceLabel?: string
+  workspaceDisplayPath?: string
   effectiveAgentId: string
   sessionKind: string
   surface: string
@@ -275,6 +278,9 @@ export function normalizeSessionItem(item: unknown): SessionItem | null {
   const conversationKind = deriveConversationKind(raw, key)
   const surface = deriveSurface(raw, key, sessionKind)
   const groupLabel = deriveGroupLabel(raw, key, sessionKind, derivedAgentId)
+  const workspace = textValue(raw.workspace)
+  const workspaceLabel = textValue(raw.workspaceLabel)
+  const workspaceDisplayPath = textValue(raw.workspaceDisplayPath)
   let title = normalizeRequiredString(raw, 'title', fallbackSessionTitle(raw, key, sessionKind), gaps)
   if (sessionKind === 'task' && /^you are a subagent\b/i.test(title)) title = i18n.global.t('sessions.fallbackTitle.task')
   const subtitle = hasOwn(raw, 'subtitle') ? textValue(raw.subtitle) : ''
@@ -297,6 +303,9 @@ export function normalizeSessionItem(item: unknown): SessionItem | null {
     title,
     subtitle,
     groupLabel,
+    workspace: workspace || undefined,
+    workspaceLabel: workspaceLabel || undefined,
+    workspaceDisplayPath: workspaceDisplayPath || undefined,
     effectiveAgentId,
     sessionKind,
     surface,
@@ -388,6 +397,7 @@ export type SidebarSectionFamily = 'chats' | 'channels' | 'automations'
 
 /** A single rendered sidebar row, flattened with its indent depth. */
 export interface SidebarSectionRow {
+  rowKind: 'session' | 'workspace'
   key: string
   title: string
   effectiveAgentId: string
@@ -400,6 +410,9 @@ export interface SidebarSectionRow {
   runLabel: string
   updatedAt: number
   hasContractGaps: boolean
+  workspace?: string
+  workspaceLabel?: string
+  workspaceDisplayPath?: string
 }
 
 /** One collapsible family section with its recency-ordered rows. */
@@ -459,6 +472,7 @@ export function arrangeSidebarSections(items: SessionItem[]): SidebarSection[] {
 
   const byRecency = (a: SessionItem, b: SessionItem) => (b.updatedAt || 0) - (a.updatedAt || 0)
   const toRow = (item: SessionItem, depth: number): SidebarSectionRow => ({
+    rowKind: 'session',
     key: item.key,
     title: item.title,
     effectiveAgentId: item.effectiveAgentId,
@@ -469,7 +483,79 @@ export function arrangeSidebarSections(items: SessionItem[]): SidebarSection[] {
     runLabel: item.runLabel,
     updatedAt: item.updatedAt || 0,
     hasContractGaps: item.contractGaps.length > 0,
+    workspace: item.workspace,
+    workspaceLabel: item.workspaceLabel,
+    workspaceDisplayPath: item.workspaceDisplayPath,
   })
+
+  type WorkspaceBucket = {
+    title: string
+    displayPath?: string
+    rows: SidebarSectionRow[]
+    updatedAt: number
+  }
+  type WorkspaceTopLevel =
+    | { kind: 'workspace'; workspace: string; index: number }
+    | { kind: 'row'; row: SidebarSectionRow; index: number }
+
+  const arrangeWorkspaceRows = (entries: SessionLedgerEntry[]): SidebarSectionRow[] => {
+    const buckets = new Map<string, WorkspaceBucket>()
+    const topLevel: WorkspaceTopLevel[] = []
+    let index = 0
+
+    for (const entry of entries) {
+      const row = toRow(entry.item, entry.depth)
+      const workspace = entry.item.workspace
+      if (!workspace) {
+        topLevel.push({ kind: 'row', row, index: index++ })
+        continue
+      }
+
+      let bucket = buckets.get(workspace)
+      if (!bucket) {
+        bucket = {
+          title: entry.item.workspaceLabel || workspace,
+          displayPath: entry.item.workspaceDisplayPath || workspace,
+          rows: [],
+          updatedAt: 0,
+        }
+        buckets.set(workspace, bucket)
+        topLevel.push({ kind: 'workspace', workspace, index: index++ })
+      }
+      bucket.rows.push({ ...row, depth: Math.min(row.depth + 1, 4) })
+      bucket.updatedAt = Math.max(bucket.updatedAt, row.updatedAt || 0)
+    }
+
+    const topLevelUpdatedAt = (entry: WorkspaceTopLevel): number => {
+      if (entry.kind === 'row') return entry.row.updatedAt || 0
+      return buckets.get(entry.workspace)?.updatedAt || 0
+    }
+
+    return [...topLevel]
+      .sort((a, b) => topLevelUpdatedAt(b) - topLevelUpdatedAt(a) || a.index - b.index)
+      .flatMap(entry => {
+        if (entry.kind === 'row') return [entry.row]
+        const bucket = buckets.get(entry.workspace)
+        if (!bucket) return []
+        const header: SidebarSectionRow = {
+          rowKind: 'workspace',
+          key: `workspace:${entry.workspace}`,
+          title: bucket.title,
+          effectiveAgentId: '',
+          agentName: '',
+          sessionKind: 'workspace',
+          depth: 0,
+          runStatus: 'idle',
+          runLabel: '',
+          updatedAt: bucket.updatedAt,
+          hasContractGaps: false,
+          workspace: entry.workspace,
+          workspaceLabel: bucket.title,
+          workspaceDisplayPath: bucket.displayPath || entry.workspace,
+        }
+        return [header, ...bucket.rows]
+      })
+  }
 
   return SIDEBAR_SECTION_ORDER.map(family => {
     const bucket = buckets[family]
@@ -478,7 +564,7 @@ export function arrangeSidebarSections(items: SessionItem[]): SidebarSection[] {
       // Recency-sort first so the ledger's root ordering follows recency, then
       // flatten parent → child so subagents indent directly beneath their chat.
       const ledger = arrangeSessionLedger([...bucket].sort(byRecency))
-      rows = ledger.map(entry => toRow(entry.item, entry.depth))
+      rows = arrangeWorkspaceRows(ledger)
     } else {
       rows = [...bucket].sort(byRecency).map(item => toRow(item, 0))
     }

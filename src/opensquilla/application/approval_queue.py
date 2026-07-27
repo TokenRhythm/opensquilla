@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import ntpath
 import os
 import sqlite3
 import time
@@ -19,6 +20,20 @@ from opensquilla.paths import state_dir
 VALID_APPROVAL_MODES = frozenset({"auto-approve", "auto-deny", "prompt"})
 VALID_ELEVATED_MODES = frozenset({"on", "bypass", "full"})
 VALID_RUN_MODES = frozenset({"standard", "trusted", "full"})
+
+
+def _native_db_path(path: str | Path) -> str:
+    """Return an internal SQLite spelling without changing the public path."""
+
+    value = os.fspath(path)
+    if value == ":memory:" or os.name != "nt":
+        return value
+    absolute = ntpath.abspath(value)
+    if absolute.startswith("\\\\?\\"):
+        return absolute
+    if absolute.startswith("\\\\"):
+        return f"\\\\?\\UNC\\{absolute[2:]}"
+    return f"\\\\?\\{absolute}"
 
 
 @dataclass
@@ -100,9 +115,10 @@ class ApprovalQueue:
         self._event_listeners: list[ApprovalEventListener] = []
 
         self._db_path = Path(db_path or os.fspath(_DEFAULT_APPROVAL_QUEUE_PATH))
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        native_db_path = _native_db_path(self._db_path)
+        os.makedirs(os.path.dirname(native_db_path) or os.curdir, exist_ok=True)
         self._conn = sqlite3.connect(
-            self._db_path,
+            native_db_path,
             timeout=30.0,
             check_same_thread=False,
         )
@@ -130,11 +146,25 @@ class ApprovalQueue:
             );
             CREATE INDEX IF NOT EXISTS idx_approval_namespace_status
             ON approval_queue(namespace, resolved);
+
+            CREATE TABLE IF NOT EXISTS channel_approval_codes (
+                code                TEXT PRIMARY KEY,
+                approval_id         TEXT NOT NULL UNIQUE,
+                namespace           TEXT NOT NULL,
+                session_key         TEXT NOT NULL,
+                owner_sender_id     TEXT NOT NULL,
+                origin_channel_name TEXT NOT NULL DEFAULT '',
+                origin_channel_id   TEXT NOT NULL DEFAULT '',
+                origin_thread_id    TEXT NOT NULL DEFAULT '',
+                approver_policy     TEXT NOT NULL DEFAULT 'requester_only',
+                created_at          REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_channel_approval_code_approval
+            ON channel_approval_codes(approval_id);
             """
         )
         existing = {
-            str(row["name"])
-            for row in self._conn.execute("PRAGMA table_info(approval_queue)")
+            str(row["name"]) for row in self._conn.execute("PRAGMA table_info(approval_queue)")
         }
         if "deadline" not in existing:
             self._conn.execute(
@@ -158,6 +188,79 @@ class ApprovalQueue:
             self._conn.execute("ALTER TABLE approval_queue ADD COLUMN claim_token TEXT")
         if "claim_started_at" not in existing:
             self._conn.execute("ALTER TABLE approval_queue ADD COLUMN claim_started_at REAL")
+        self._conn.commit()
+
+    def channel_code_for_approval(self, approval_id: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT code FROM channel_approval_codes WHERE approval_id = ?",
+            (approval_id,),
+        ).fetchone()
+        return str(row["code"]) if row is not None else None
+
+    def bind_channel_code(
+        self,
+        code: str,
+        *,
+        approval_id: str,
+        namespace: str,
+        session_key: str,
+        owner_sender_id: str,
+        origin_channel_name: str = "",
+        origin_channel_id: str = "",
+        origin_thread_id: str = "",
+        approver_policy: str = "requester_only",
+    ) -> bool:
+        """Persist one short-code binding; return False on a code collision."""
+        existing = self.channel_code_for_approval(approval_id)
+        if existing is not None:
+            return existing == code
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute(
+                "INSERT INTO channel_approval_codes "
+                "(code, approval_id, namespace, session_key, owner_sender_id, "
+                "origin_channel_name, origin_channel_id, origin_thread_id, "
+                "approver_policy, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    code,
+                    approval_id,
+                    namespace,
+                    session_key,
+                    owner_sender_id,
+                    origin_channel_name,
+                    origin_channel_id,
+                    origin_thread_id,
+                    approver_policy,
+                    time.time(),
+                ),
+            )
+            self._conn.commit()
+        except sqlite3.IntegrityError:
+            self._conn.rollback()
+            return False
+        return True
+
+    def resolve_channel_code(self, code: str) -> dict[str, str] | None:
+        row = self._conn.execute(
+            "SELECT code, approval_id, namespace, session_key, owner_sender_id, "
+            "origin_channel_name, origin_channel_id, origin_thread_id, "
+            "approver_policy FROM channel_approval_codes WHERE code = ?",
+            (code,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {key: str(row[key] or "") for key in row.keys()}
+
+    def release_channel_code(self, approval_id: str) -> None:
+        self._conn.execute(
+            "DELETE FROM channel_approval_codes WHERE approval_id = ?",
+            (approval_id,),
+        )
+        self._conn.commit()
+
+    def clear_channel_codes(self) -> None:
+        self._conn.execute("DELETE FROM channel_approval_codes")
         self._conn.commit()
 
     def _release_stale_claims(self) -> None:
@@ -200,9 +303,7 @@ class ApprovalQueue:
             resolution=str(row["resolution"] or ""),
             claim_token=str(row["claim_token"] or "") or None,
             claim_started_at=(
-                float(row["claim_started_at"])
-                if row["claim_started_at"] is not None
-                else None
+                float(row["claim_started_at"]) if row["claim_started_at"] is not None else None
             ),
             _event=existing._event if existing is not None else asyncio.Event(),
         )
@@ -306,6 +407,38 @@ class ApprovalQueue:
         entry = self._row_to_entry(row)
         self._pending[approval_id] = entry
         return entry
+
+    def update_params(self, approval_id: str, params: dict) -> None:
+        """Replace review metadata while an approval is still unresolved."""
+
+        payload = self._serialize_params(params)
+        self._release_stale_claims()
+        self._conn.execute("BEGIN IMMEDIATE")
+        row = self._get_row(approval_id)
+        if row is None:
+            self._conn.rollback()
+            raise KeyError(f"Approval not found: {approval_id}")
+        entry = self._row_to_entry(row)
+        if entry.resolved or entry.claim_token:
+            self._conn.rollback()
+            raise ValueError(f"Approval is not pending: {approval_id}")
+        became_human_actionable = (
+            entry.params.get("humanActionable") is False
+            and params.get("humanActionable") is True
+        )
+        cursor = self._conn.execute(
+            "UPDATE approval_queue SET params = ? "
+            "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
+            (payload, approval_id),
+        )
+        if cursor.rowcount != 1:
+            self._conn.rollback()
+            raise ValueError(f"Approval params could not be updated: {approval_id}")
+        self._conn.commit()
+        updated_entry = self.get(approval_id)
+        self._pending[approval_id] = updated_entry
+        if became_human_actionable:
+            self._notify_event("requested", updated_entry)
 
     async def wait(self, approval_id: str, timeout: float | None = None) -> bool:
         entry = self.get(approval_id)
@@ -859,7 +992,9 @@ def reset_approval_queue() -> None:
         _queue = None
     else:
         path = _DEFAULT_APPROVAL_QUEUE_PATH
+    if os.fspath(path) == ":memory:":
+        return
     try:
-        path.unlink()
+        os.unlink(_native_db_path(path))
     except FileNotFoundError:
         pass

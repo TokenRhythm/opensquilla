@@ -7,6 +7,7 @@ one source rather than being hardcoded per-surface. Read-only.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from opensquilla.engine.commands import DEFAULT_REGISTRY, CommandDef, Surface, parse_surface
@@ -26,25 +27,38 @@ def _serialize(cmd: CommandDef, surface: Surface) -> dict[str, Any]:
         raise ValueError(f"{cmd.name} is not visible on {surface.value}")
     out: dict[str, Any] = {
         "name": cmd.name,
-        "usage": cmd.usage,
-        "description": cmd.description,
+        "usage": cmd.usage_for(surface),
+        "description": cmd.description_for(surface),
         "aliases": list(cmd.aliases),
         "argument_choices": [
             {"value": choice.value, "description": choice.description}
-            for choice in cmd.argument_choices
+            for choice in cmd.argument_choices_for(surface)
         ],
         "execution": {
             "kind": execution.kind.value,
             "action": execution.action,
         },
     }
+    # Scheduling and presentation metadata belongs to the terminal runtime.
+    # WebUI and channel clients keep their historic command-list contract;
+    # projecting TUI metadata there would mislabel e.g. channel /model as a
+    # picker and channel /meta as model-turn input.
+    if surface in {Surface.CLI_GATEWAY, Surface.CLI_STANDALONE}:
+        out.update(
+            category=cmd.category.value,
+            busy_policy=cmd.busy_policy.value,
+            presentation=cmd.presentation.value,
+            order=cmd.order,
+            visible_by_default=cmd.visible_by_default,
+            deprecated=cmd.deprecated,
+        )
     if execution.rpc_method is not None:
         out["execution"]["rpc_method"] = execution.rpc_method
         out["rpc_method"] = execution.rpc_method
     return out
 
 
-def _meta_skill_argument_choices(ctx: RpcContext) -> list[dict[str, str]]:
+async def _meta_skill_argument_choices(ctx: RpcContext) -> list[dict[str, str]]:
     """Live meta-skill names as ``/meta`` argument candidates (value + description).
 
     Mirrors the ``meta.list`` filter: invokable ``kind="meta"`` skills only, and
@@ -56,7 +70,16 @@ def _meta_skill_argument_choices(ctx: RpcContext) -> list[dict[str, str]]:
     if loader is None or not is_meta_skill_enabled(getattr(ctx, "config", None)):
         return []
     try:
-        specs = loader.load_all()
+        refresh = getattr(loader, "refresh_if_changed", None)
+        snapshot = getattr(loader, "snapshot", None)
+        if callable(refresh) and callable(snapshot):
+            await asyncio.to_thread(
+                refresh,
+                reason="rpc:commands.list_for_surface",
+            )
+            specs = snapshot().skills
+        else:
+            specs = await asyncio.to_thread(loader.load_all)
     except Exception:  # noqa: BLE001 — fail-open to an empty candidate list
         return []
     choices = [
@@ -84,7 +107,7 @@ async def _handle_commands_list_for_surface(
     commands = [_serialize(cmd, surface) for cmd in DEFAULT_REGISTRY.for_surface(surface)]
     # Populate /meta's argument candidates from the live meta-skills so the
     # slash menu can offer them as Tab-completable choices (SPA + TUI).
-    meta_choices = _meta_skill_argument_choices(ctx)
+    meta_choices = await _meta_skill_argument_choices(ctx)
     if meta_choices:
         for entry in commands:
             if entry.get("name") == "/meta":

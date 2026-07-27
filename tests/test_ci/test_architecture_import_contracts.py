@@ -12,6 +12,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("agents", "identity"),
     ("agents", "onboarding"),
     ("agents", "session"),
+    # Format-specific delivery validation reuses canonical attachment MIME and
+    # container signatures; contracts remains implementation-free.
+    ("artifact_validation.py", "contracts"),
     ("channels", "engine"),
     ("channels", "contracts"),
     ("channels", "gateway"),
@@ -32,6 +35,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("cli", "observability"),
     ("cli", "onboarding"),
     ("cli", "persistence"),
+    # CLI maintenance commands attach the same typed provider-correlation
+    # envelope as the shared turn loop; provider remains a lower-level leaf.
+    ("cli", "provider"),
     # The root CLI exposes the offline recovery adapter and writer entrypoints
     # acquire recovery locks; recovery never imports the CLI back.
     ("cli", "recovery"),
@@ -95,6 +101,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("gateway", "persistence"),
     ("gateway", "provider"),
     ("gateway", "sandbox"),
+    # Browser-facing approval projections reuse the canonical secret redactor;
+    # safety is a lower-level leaf and does not import gateway back.
+    ("gateway", "safety"),
     ("gateway", "scheduler"),
     ("gateway", "search"),
     ("gateway", "session"),
@@ -138,6 +147,10 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     # Provider argument repair reuses the tool alias/schema helpers (lazy import).
     ("provider", "tools"),
     ("result_budget.py", "search"),
+    # Trusted web-tool failure parsing reuses the canonical search query
+    # normalizer; the helper stays top-level so execution_status remains
+    # independent of package import side effects.
+    ("search_tool_outcome.py", "search"),
     ("router_control.py", "engine"),
     ("sandbox", "application"),
     ("sandbox", "gateway"),

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import stat
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,7 @@ from opensquilla.identity.bootstrap import (
     ONE_SHOT_BOOTSTRAP_FILENAME,
     ensure_agent_workspace,
 )
+from opensquilla.identity.parser import parse_identity
 from opensquilla.session.keys import normalize_agent_id
 
 _WORKSPACE_AGENT_FILE_NAMES = (
@@ -131,6 +133,25 @@ class AgentRegistry:
         safe_name, path = self._resolve_workspace_agent_file(root, name)
         content = self._read_workspace_agent_file(path)
         return {"name": safe_name, "content": content}
+
+    async def get_identity(self, agent_id: str) -> dict[str, Any]:
+        """Return parsed public identity fields without mutating the workspace.
+
+        Unlike the general agent-file APIs, this read path deliberately does
+        not call :func:`ensure_agent_workspace`: identity decoration is used by
+        read-scoped RPCs and must not seed files as a side effect.  The shared
+        hardened reader still rejects escaping paths, symlinks, non-regular
+        files, and hardlinks.
+        """
+
+        normalized = normalize_agent_id(agent_id)
+        root = self.get_agent_workspace(normalized)
+        _safe_name, path = self._resolve_workspace_agent_file(root, "IDENTITY.md")
+        try:
+            content = self._read_workspace_agent_file(path)
+        except FileNotFoundError:
+            content = ""
+        return {"agent_id": normalized, **asdict(parse_identity(content))}
 
     async def set_agent_file(self, agent_id: str, name: str, content: Any) -> dict[str, Any]:
         ext = "." + name.rsplit(".", 1)[-1] if "." in name else ""
@@ -318,6 +339,9 @@ class AgentRegistry:
             raise ValueError("workspace agent file must not be a symlink")
         self._validate_safe_file_stat(file_stat)
         try:
+            # O_NOFOLLOW on the WRONLY branch mirrors the read-side hardening:
+            # an attacker who races the lstat()/open() pair cannot redirect the
+            # write to a symlinked target.
             return os.open(path, os.O_WRONLY | nofollow)
         except OSError as exc:
             raise ValueError("workspace agent file must not be a symlink") from exc

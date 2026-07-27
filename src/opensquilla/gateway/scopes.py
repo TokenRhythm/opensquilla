@@ -42,8 +42,12 @@ OPERATOR_SCOPE_NAMESPACE = "operator."
 # transport. Mirrors what the desktop CLI declares on connect.
 CLI_DEFAULT_OPERATOR_SCOPES: frozenset[str] = frozenset(
     {
-        ADMIN_SCOPE, READ_SCOPE, WRITE_SCOPE,
-        APPROVALS_SCOPE, PROPOSALS_SCOPE, PAIRING_SCOPE,
+        ADMIN_SCOPE,
+        READ_SCOPE,
+        WRITE_SCOPE,
+        APPROVALS_SCOPE,
+        PROPOSALS_SCOPE,
+        PAIRING_SCOPE,
     }
 )
 
@@ -52,9 +56,7 @@ CLI_DEFAULT_OPERATOR_SCOPES: frozenset[str] = frozenset(
 # not get destructive privileges. Pairing and proposals are also excluded:
 # proposal mutation promotes generated SKILL.md files into the managed skill
 # layer, so remote callers need an authenticated/admin path for that surface.
-REMOTE_OPERATOR_SCOPES: frozenset[str] = frozenset(
-    {READ_SCOPE, WRITE_SCOPE, APPROVALS_SCOPE}
-)
+REMOTE_OPERATOR_SCOPES: frozenset[str] = frozenset({READ_SCOPE, WRITE_SCOPE, APPROVALS_SCOPE})
 
 # Default scopes for the node role (separate scope namespace).
 NODE_DEFAULT_SCOPES: frozenset[str] = frozenset({NODE_SCOPE})
@@ -95,6 +97,7 @@ METHOD_SCOPES: dict[str, str] = {
     "sessions.search": READ_SCOPE,
     "sessions.preview": READ_SCOPE,
     "sessions.resolve": READ_SCOPE,
+    "sessions.bootstrap": READ_SCOPE,
     "sessions.subscribe": READ_SCOPE,
     "sessions.unsubscribe": READ_SCOPE,
     "sessions.messages.subscribe": READ_SCOPE,
@@ -109,6 +112,7 @@ METHOD_SCOPES: dict[str, str] = {
     "logs.tail": READ_SCOPE,
     "logs.trace": READ_SCOPE,
     "models.list": READ_SCOPE,
+    "models.routing.get": READ_SCOPE,
     "providers.status": READ_SCOPE,
     # OpenSquilla-only; non-consuming peek at a session's router-control hold
     # plus the valid target menu (see rpc_routing.py).
@@ -143,6 +147,7 @@ METHOD_SCOPES: dict[str, str] = {
     "cron.unsubscribe": READ_SCOPE,  # OpenSquilla-only; classified read.
     "usage.status": READ_SCOPE,
     "usage.cost": READ_SCOPE,
+    "usage.query": READ_SCOPE,
     "meta.list": READ_SCOPE,  # OpenSquilla-only; invokable meta-skill catalog.
     "meta.runs.list": READ_SCOPE,
     "meta.runs.failures": READ_SCOPE,
@@ -171,11 +176,13 @@ METHOD_SCOPES: dict[str, str] = {
     "sessions.create": WRITE_SCOPE,
     "sessions.fork": WRITE_SCOPE,
     "sessions.send": WRITE_SCOPE,
+    "sessions.steer": WRITE_SCOPE,
     "sessions.abort": WRITE_SCOPE,
     "sessions.reset": WRITE_SCOPE,
     "sessions.contextCompact": WRITE_SCOPE,
     "sessions.compact": WRITE_SCOPE,
     "sessions.truncate": WRITE_SCOPE,
+    "models.routing.set": WRITE_SCOPE,
     # Deleting a session is a routine, per-user write op like reset/truncate above,
     # so it is write-scoped rather than admin-gated. Admin-gating it broke deletion
     # for every no-auth operator on a non-loopback bind — notably the default Docker
@@ -206,12 +213,14 @@ METHOD_SCOPES: dict[str, str] = {
     "exec.approvals.set": APPROVALS_SCOPE,
     "exec.approval.request": APPROVALS_SCOPE,
     "exec.approval.waitDecision": APPROVALS_SCOPE,
+    "exec.approval.status": APPROVALS_SCOPE,
     "exec.approval.snapshot": APPROVALS_SCOPE,
     "exec.approval.forget": APPROVALS_SCOPE,
     "exec.approval.resolve": APPROVALS_SCOPE,
     "exec.approval.extend": APPROVALS_SCOPE,
     "plugin.approval.request": APPROVALS_SCOPE,
     "plugin.approval.waitDecision": APPROVALS_SCOPE,
+    "plugin.approval.status": APPROVALS_SCOPE,
     "plugin.approval.resolve": APPROVALS_SCOPE,
     "plugin.approval.extend": APPROVALS_SCOPE,
     # ----- proposals (auto-propose UI: list/show) -----
@@ -221,6 +230,15 @@ METHOD_SCOPES: dict[str, str] = {
     "exec.proposals.list": PROPOSALS_SCOPE,
     "exec.proposals.show": PROPOSALS_SCOPE,
     "exec.proposals.settings.get": PROPOSALS_SCOPE,
+    # Channel identity pairing is a dedicated operator capability. Admin
+    # implies this scope, while remote no-auth operators do not receive it.
+    "channels.pairings": PAIRING_SCOPE,
+    "channels.pairing.approve": PAIRING_SCOPE,
+    "channels.pairing.revoke": PAIRING_SCOPE,
+    # Grant/revoke a sender's channel-admin standing. Same narrow scope as
+    # pairing: an operator managing a channel's members may promote or demote
+    # its senders, but this is not an arbitrary config write.
+    "channels.admin.set": PAIRING_SCOPE,
     "exec.proposals.auto_enabled.list": PROPOSALS_SCOPE,
     # ----- admin -----
     # OpenSquilla-only; re-reads the on-disk TOML and swaps the ENTIRE runtime
@@ -239,6 +257,7 @@ METHOD_SCOPES: dict[str, str] = {
     "skills.install": ADMIN_SCOPE,
     "skills.update": ADMIN_SCOPE,
     "skills.uninstall": ADMIN_SCOPE,
+    "skills.reload": ADMIN_SCOPE,
     "skills.deps.install": ADMIN_SCOPE,
     "meta.runs.show": ADMIN_SCOPE,
     "meta.runs.draft": ADMIN_SCOPE,
@@ -261,8 +280,11 @@ METHOD_SCOPES: dict[str, str] = {
     "exec.proposals.auto_enabled.disable": ADMIN_SCOPE,
     "channels.logout": ADMIN_SCOPE,
     "channels.restart": ADMIN_SCOPE,  # OpenSquilla-only.
+    "channels.get": ADMIN_SCOPE,  # Redacted editable config still exposes secret presence.
+    "channels.probe": ADMIN_SCOPE,  # Live credential/network probe.
     "diagnostics.set": ADMIN_SCOPE,
     "onboarding.provider.credential.reveal": ADMIN_SCOPE,
+    "onboarding.provider.credential.clear": ADMIN_SCOPE,
     "cron.add": ADMIN_SCOPE,
     "cron.create": ADMIN_SCOPE,  # OpenSquilla-only alias for cron.add.
     "cron.update": ADMIN_SCOPE,
@@ -281,10 +303,23 @@ METHOD_SCOPES: dict[str, str] = {
     "memory.repair.list": ADMIN_SCOPE,
     "memory.repair.run": ADMIN_SCOPE,
     "memory.repair.show": ADMIN_SCOPE,
+    # Settings-only profile import discovery. These methods expose no paths
+    # and never apply an import, but host-level inventory remains admin-only.
+    "migration.sources.list": ADMIN_SCOPE,
+    "migration.sources.preview": ADMIN_SCOPE,
     # OpenSquilla-only — onboarding mutations require admin scope.
     "onboarding.provider.configure": ADMIN_SCOPE,
     # The probe persists nothing but carries candidate credentials.
     "onboarding.provider.probe": ADMIN_SCOPE,
+    "onboarding.llmProfile.upsert": ADMIN_SCOPE,
+    "onboarding.llmProfile.credential.clear": ADMIN_SCOPE,
+    "onboarding.llmProfile.remove": ADMIN_SCOPE,
+    "onboarding.llmProfile.active.remove": ADMIN_SCOPE,
+    "onboarding.llmProfile.activate": ADMIN_SCOPE,
+    "onboarding.llmProfile.probe": ADMIN_SCOPE,
+    "onboarding.llmProfile.models.discover": ADMIN_SCOPE,
+    "onboarding.llmProfile.draft.probe": ADMIN_SCOPE,
+    "onboarding.llmProfile.draft.models.discover": ADMIN_SCOPE,
     # Model discovery is read-shaped but admin-scoped for the same reason as
     # the probe: its params accept candidate credentials (apiKey/apiKeyEnv),
     # which must never be acceptable from a read/write-tier caller.

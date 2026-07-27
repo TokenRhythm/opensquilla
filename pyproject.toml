@@ -1,6 +1,6 @@
 [project]
 name = "opensquilla"
-version = "0.5.0rc4"
+version = "0.5.0"
 description = "OpenSquilla — microkernel Python agent runtime with MCP-native tools and multi-channel messaging"
 license = "Apache-2.0"
 readme = "README.md"
@@ -38,6 +38,7 @@ dependencies = [
     "readability-lxml>=0.8",
     "beautifulsoup4>=4.12",
     "cachetools>=5.3",
+    "certifi>=2024.7.4",
     "pdfplumber>=0.11",
     "pillow>=10.0",
     "croniter>=2.0",
@@ -100,11 +101,18 @@ opensquilla = "opensquilla.cli.main:app"
 gateway = "opensquilla.cli.main:gateway_app"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.31,<2"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.hooks.custom]
+# Standard wheel/sdist builds fail closed unless the generated WebUI matches
+# the current frontend source. Editable installs intentionally skip this hook.
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/opensquilla"]
+# Hatch normally honors .gitignore. This explicit artifact rule lets a
+# verified, generated WebUI bundle enter wheels without tracking it in Git.
+artifacts = ["src/opensquilla/gateway/static/dist/**"]
 exclude = [
     "src/opensquilla/scheduler/templates/*.md",
     "src/opensquilla/skills/bundled/**/THIRD_PARTY_NOTICES.md",
@@ -114,6 +122,13 @@ exclude = [
     "src/opensquilla/skills/bundled/**/references/*.md",
     "src/opensquilla/skills/exp/**",
     "src/opensquilla/skills/meta/META_SKILL_AUTHORING.md",
+    # The core distribution may carry the OpenTUI JavaScript sources for
+    # explicit source-development mode, but never local dependency installs or
+    # compiled platform artifacts. Those belong to opensquilla-tui-host.
+    "src/opensquilla/cli/tui/opentui/package/node_modules/**",
+    "src/opensquilla/cli/tui/opentui/package/bin/**",
+    "src/opensquilla/cli/tui/opentui/package/build/**",
+    "src/opensquilla/cli/tui/opentui/package/dist/**",
 ]
 
 [tool.hatch.build.targets.wheel.force-include]
@@ -127,6 +142,14 @@ exclude = [
 "src/opensquilla/skills/bundled/html-coder/references/standards.md" = "opensquilla/skills/bundled/html-coder/references/standards.md"
 "src/opensquilla/skills/bundled/pptx/references/pptxgenjs.md" = "opensquilla/skills/bundled/pptx/references/pptxgenjs.md"
 "src/opensquilla/skills/bundled/pptx/references/python_pptx.md" = "opensquilla/skills/bundled/pptx/references/python_pptx.md"
+
+[tool.hatch.build.targets.sdist]
+# Published sdists remain self-contained: downstream wheel builds do not need
+# Node.js because release CI embeds the already-verified WebUI artifact here.
+# Standard sdists deliberately reject ignored personal BGM so an ordinary
+# source-archive build cannot leak private or copyrighted audio. Developers who
+# need a private customized artifact can build a direct local wheel instead.
+artifacts = ["src/opensquilla/gateway/static/dist/**"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -185,6 +208,8 @@ select = ["E", "F", "I", "N", "W", "UP"]
 
 [tool.mypy]
 python_version = "3.12"
+# Match the canonical full-tree type-check target used by CI on every host.
+platform = "linux"
 warn_return_any = true
 warn_unused_configs = true
 exclude = [

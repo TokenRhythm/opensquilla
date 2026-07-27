@@ -54,6 +54,27 @@ http://127.0.0.1:18791/control/
 
 For a focused gateway guide, see [`gateway.md`](gateway.md).
 
+## Control UI Assets Are Unavailable
+
+This diagnostic means a source checkout is missing the generated Vue artifact,
+or the artifact no longer matches the current Web UI sources. Official release
+wheels, Desktop installers, and container images already include a verified
+artifact and do not require Node.js or npm on the user's machine.
+
+From a repository checkout, rebuild the artifact before starting the gateway or
+building a wheel:
+
+```sh
+cd opensquilla-webui
+npm ci
+npm run build
+```
+
+Direct VCS URL installs such as `pip install git+https://...` cannot do this
+because generated assets are intentionally not tracked. Install an official
+release wheel instead, or clone the repository and run the source installer as
+described in the [source installation guide](quickstart.md#install-from-source).
+
 ## Desktop Gateway Startup Reports a Migration Lock
 
 During first run, the desktop app starts a local gateway and applies pending

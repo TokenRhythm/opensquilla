@@ -6,11 +6,15 @@
     "desktop": {
       "indicatorAvailable": "更新 {version}",
       "indicatorDownloaded": "更新已就绪",
+      "indicatorInstallerReady": "安装包已验证",
       "indicatorDownloading": "正在下载",
       "indicatorDownloadingProgress": "正在下载 {progress}%",
       "indicatorError": "更新异常",
       "availableTitle": "OpenSquilla {version} 已发布",
       "availableDesc": "你准备好时再下载。OpenSquilla 只会在你重新启动后安装更新。",
+      "manualAvailableDesc": "下载此版本对应的 Windows 安装程序。Windows 将提示你完成安装。",
+      "manualDownloadedTitle": "已验证的安装包已就绪",
+      "manualDownloadedDesc": "OpenSquilla {version} 已通过 GitHub 官方校验和验证，并已在文件夹中显示。准备好后请手动运行安装程序。",
       "downloadedTitle": "可以安装了",
       "downloadedDesc": "重新启动 OpenSquilla 以完成更新到 {version}。",
       "downloadingTitle": "正在下载更新",
@@ -19,13 +23,22 @@
       "applyingDesc": "OpenSquilla 正在准备重新启动并安装更新。",
       "errorTitle": "检查更新失败",
       "errorFallback": "请在设置中重新检查。",
+      "errorSourceUnreachable": "更新源暂时都无法访问，请稍后重试。",
+      "errorManifestInvalid": "版本通道数据无效，OpenSquilla 暂时无法安全确认更新。",
+      "errorChecksumUnavailable": "无法获取 GitHub 官方校验和，因此不能验证安装包；未打开任何安装包。",
+      "errorIntegrityFailed": "下载的安装包未通过完整性校验，已将其删除。",
+      "errorDownloadFailed": "OpenSquilla 无法下载更新。请检查网络后重试。",
+      "errorInstallFailed": "OpenSquilla 无法准备或打开安装程序。请重试或使用发布页面。",
       "idleDesc": "检查新的桌面版本。",
+      "manualIdleDesc": "检查新的桌面版本。Windows 更新会打开版本固定的安装程序供你手动安装。",
       "upToDateDesc": "版本 {version} 已是最新。",
       "settingsTitle": "桌面更新",
       "currentVersion": "当前版本",
       "latestVersion": "最新版本",
       "unknownVersion": "未知",
       "availableStatus": "可下载",
+      "manualAvailableStatus": "手动安装",
+      "manualDownloadedStatus": "已验证",
       "downloadedStatus": "可以安装",
       "downloadingStatus": "下载中",
       "checkingStatus": "检查中",
@@ -35,8 +48,14 @@
       "idleStatus": "空闲",
       "unavailableStatus": "不可用",
       "unsupported": "此平台暂不支持原生桌面更新。新版本发布时请使用发布链接更新。",
+      "source": "来源",
+      "sourceOss": "阿里云 OSS 镜像",
+      "sourceGithub": "GitHub 发布页",
+      "fallbackUsed": "已切换到备用源",
       "check": "检查",
       "download": "下载",
+      "downloadInstaller": "下载安装程序",
+      "showInstaller": "显示安装程序",
       "relaunch": "重新启动",
       "later": "稍后"
     }
@@ -45,28 +64,82 @@
     "close": "关闭",
     "save": "保存",
     "discard": "放弃",
-    "cancel": "取消"
+    "cancel": "取消",
+    "edit": "编辑",
+    "delete": "删除",
+    "dismiss": "忽略"
+  },
+  "workbench": {
+    "title": "工作区",
+    "expand": "展开工作区",
+    "collapse": "收起工作区",
+    "close": "关闭工作区",
+    "closeItem": "关闭标签",
+    "refresh": "刷新",
+    "openExternal": "在外部打开",
+    "openItems": "已打开的工作区项目",
+    "resize": "调整工作区宽度",
+    "pixels": "像素",
+    "empty": "此项目没有可用的预览。",
+    "artifactPreview": {
+      "refresh": "刷新预览",
+      "openExternal": "在外部打开",
+      "missingResources": "此 HTML 引用了未随产物发布的本地资源，预览可能不完整。",
+      "missingShort": "缺少本地资源",
+      "suspended": "预览已暂停",
+      "nativePreview": "原生 HTML 预览",
+      "allowRemoteResources": "允许加载在线图片、样式和媒体",
+      "blockRemoteResources": "禁止加载在线图片、样式和媒体",
+      "remoteResourcesConfirmTitle": "加载在线资源？",
+      "remoteResourcesConfirmBody": "此 HTML 可以连接外部网站以加载图片、样式、字体或媒体。对方网站将获知你的 IP 地址，也可能收到产物编码在 URL 中的信息。远程脚本和数据请求仍会被拦截。",
+      "remoteResourcesConfirmAction": "仅本次允许",
+      "offline": "当前似乎处于离线状态",
+      "offlineDetail": "恢复连接后重试预览，或下载文件。",
+      "crashed": "预览已停止",
+      "crashedDetail": "重新加载隔离预览后即可继续。",
+      "tooLarge": "无法预览",
+      "tooLargeDetail": "文件过大，无法在应用内安全预览。请改为下载。",
+      "unsupported": "无法预览",
+      "unsupportedDetail": "应用内预览暂不支持这种文件类型。",
+      "integrityError": "产物完整性校验失败",
+      "integrityErrorDetail": "已保存的产物已损坏或与记录的校验值不一致，请重新发布或下载核查。",
+      "invalidContent": "下载的内容与产物类型不一致。",
+      "failedDetail": "请重试预览，或下载文件。"
+    }
   },
   "nav": {
-    "chat": "对话",
-    "chat-new": "新建对话",
+    "chat": "任务",
+    "chat-new": "新建任务",
     "sessions": "会话",
     "agents": "智能体",
-    "channels": "频道",
+    "channels": "渠道",
     "cron": "定时任务",
     "skills": "技能",
+    "skillsChannels": "技能·渠道",
     "overview": "概览",
+    "status": "状态",
     "usage": "用量",
+    "viewUsage": "查看用量",
     "logs": "日志",
     "settings": "设置",
     "groupBuild": "构建",
-    "groupMonitor": "监控"
+    "groupMonitor": "概览",
+    "channelSetup": "渠道设置",
+    "not-found": "未找到"
+  },
+  "notFound": {
+    "title": "页面未找到",
+    "body": "此地址不对应任何 OpenSquilla 页面。",
+    "goToChat": "前往对话",
+    "sessions": "会话"
   },
   "chrome": {
     "settings": "设置",
     "theme": "主题",
     "language": "语言",
-    "newChat": "新建对话",
+    "newTask": "新建任务",
+    "newTaskTitle": "新建任务",
+    "searchChats": "搜索任务",
     "more": "更多",
     "moreDestinations": "更多去处",
     "expandSidebar": "展开侧边栏",
@@ -113,7 +186,13 @@
       "themeLabel": "主题",
       "themeDesc": "跟随系统，或强制使用浅色或深色。侧边栏的切换按钮是此设置的快捷方式。",
       "languageLabel": "语言",
-      "languageDesc": "界面的显示语言。即时应用于此浏览器。",
+      "languageDesc": "界面和渠道系统提示的显示语言。此处立即生效，并保存网关范围内的提示语言。",
+      "channelNoticeLocaleSyncPending": "界面语言已切换，但渠道系统提示语言尚未保存。网关重新连接后会自动重试。",
+      "toolDetailsLabel": "工具详情默认显示",
+      "toolDetailsDesc": "自动模式按工具类型显示；紧凑模式折叠普通工具；展开模式打开全部工具。错误默认自动展开，仍可手动折叠。",
+      "toolDetailsAuto": "自动",
+      "toolDetailsCompact": "紧凑",
+      "toolDetailsExpanded": "展开",
       "bgmLabel": "背景音乐",
       "bgmDesc": "在顶栏显示背景音乐控件。默认关闭；也可通过命令面板切换。",
       "sidebarWidthLabel": "侧边栏宽度",
@@ -136,6 +215,41 @@
       "sidebarWidthCompactStatus": "紧凑布局使用 {current}px。已保留桌面端偏好 {saved}px。",
       "sidebarWidthDrawerStatus": "抽屉布局使用 {current}px。已保留桌面端偏好 {saved}px。"
     },
+    "dataMigration": {
+      "title": "数据与备份",
+      "desc": "查找并核对其他 OpenSquilla 安装中的数据。只有打开此页面才会扫描，未经确认不会修改任何数据。",
+      "refresh": "重新扫描",
+      "scanning": "正在查找可导入的 OpenSquilla 数据…",
+      "unsupportedTitle": "更新 OpenSquilla 后即可预览导入",
+      "unsupportedDesc": "当前网关或桌面外壳尚不支持隐私安全的预览接口。请更新主机端后返回此页面。",
+      "invalidResponse": "网关返回了不受支持的迁移预览。",
+      "compatibilityTitle": "旧版 Agent 数据位置",
+      "compatibilityDesc": "OpenSquilla 正在使用兼容的旧版 Agent 数据位置。更改后会切换身份和记忆来源，不会移动、合并或删除数据。",
+      "chooseLegacyAgentData": "选择 Agent 数据位置",
+      "loadFailed": "OpenSquilla 无法检查可导入的数据来源。",
+      "emptyTitle": "未发现其他 OpenSquilla 数据",
+      "emptyDesc": "以后可以重新扫描；桌面端还可以手动选择数据文件夹。",
+      "chooseSourceDesc": "导入前先核对来源。来源数据保持不变，且不会与当前数据合并。",
+      "previewSource": "核对{source}数据",
+      "webReadOnly": "当前 Web 连接只能预览；请在桌面端或网关主机上完成导入。",
+      "hostCliHint": "如需通过终端完成导入，请在网关主机上运行迁移工具。浏览器不会暴露服务器路径。",
+      "blockers": {
+        "source_in_use": "来源数据正在使用中。",
+        "source_schema_newer": "来源数据由更新版本的 OpenSquilla 创建。",
+        "source_database_invalid": "无法验证来源数据库。",
+        "source_config_invalid": "无法验证来源配置。",
+        "source_unreadable": "无法安全读取来源数据。",
+        "insufficient_disk": "可用磁盘空间不足。",
+        "target_recovery_required": "导入前需要先恢复当前数据。",
+        "target_not_replaceable": "无法安全替换当前数据。",
+        "preview_unavailable": "此来源暂时无法生成安全预览。"
+      },
+      "notices": {
+        "whole_profile_replacement": "当前 Profile 将完整备份后整体替换，不会合并数据。",
+        "previously_imported": "此来源以前导入过，仍可再次核对。",
+        "scheduled_jobs_will_be_paused": "导入的定时任务会保持暂停，等待你核对。"
+      }
+    },
     "dialog": {
       "title": "设置",
       "actionNeeded": "需要处理（{count}）",
@@ -148,9 +262,21 @@
       "openSection": "{label} — 打开{section}",
       "unsavedSuffix": "，有未保存的更改",
       "unsavedIn": "{sections}中有未保存的更改",
+      "unsavedProvider": "{provider} 有未保存的更改",
+      "unsavedCount": "有 {count} 个设置区域尚未保存",
+      "saveProvider": "保存 {provider}",
+      "saveRouting": "保存路由更改",
+      "saveAll": "全部保存（{count}）",
+      "savingChanges": "正在保存更改…",
+      "discardProvider": "放弃 {provider} 的更改",
+      "discardRouting": "放弃路由更改",
+      "discardAll": "全部放弃（{count}）",
       "moreOptionsIn": "更多选项位于",
       "copyConfigPath": "复制配置路径",
-      "applyLiveNote": "大多数更改即时生效；部分需要重启网关"
+      "applyLiveNote": "大多数更改即时生效；部分需要重启网关",
+      "discardTitle": "放弃未保存的修改？",
+      "discardBody": "有尚未保存的编辑，现在关闭将丢失它们。",
+      "discardConfirmPrimary": "放弃修改"
     },
     "rail": {
       "connection": "连接",
@@ -161,7 +287,6 @@
       "privacy": "隐私",
       "router": "路由",
       "ensemble": "模型聚合",
-      "channels": "频道",
       "capabilities": "能力",
       "appearance": "外观",
       "keyboard": "键盘",
@@ -169,7 +294,6 @@
       "groups": {
         "gateway": "网关",
         "ai": "AI 配置",
-        "delivery": "分发",
         "preferences": "偏好设置",
         "capabilities": "能力"
       }
@@ -187,8 +311,8 @@
       "provider": "无法保存服务商 — 请检查模型与凭据",
       "router": "无法保存路由 — 请检查模式与分级",
       "search": "无法保存搜索服务商 — 请检查设置",
-      "channel": "无法保存频道 — 请检查字段",
-      "channelNotFound": "该频道已不存在",
+      "channel": "无法保存渠道 — 请检查字段",
+      "channelNotFound": "该渠道已不存在",
       "image": "无法保存图像生成——请检查模型、尺寸和格式"
     }
   },
@@ -229,7 +353,7 @@
       "model": "模型",
       "proxy": "代理",
       "router": "路由",
-      "channels": "频道"
+      "channels": "渠道"
     },
     "action": {
       "connectProvider": "连接模型服务商",
@@ -245,12 +369,135 @@
       "providerOptions": "服务商选项",
       "routerTiers": "路由模板",
       "searchOptions": "搜索选项",
-      "channelOptions": "频道选项",
+      "channelOptions": "渠道选项",
       "imageOptions": "图像选项",
       "memoryOptions": "记忆选项"
     },
     "provider": {
       "title": "服务商",
+      "pageTitle": "模型服务",
+      "pageDesc": "连接模型供应商,管理凭证与模型。",
+      "configuredTitle": "已配置的服务商",
+      "configuredCount": "{count} 个",
+      "configuredSummary": "{ready} / {count} 就绪。测试会发送一次小请求。",
+      "configuredDesc": "已保存的服务商会一直可用于路由，直到你手动删除。配置验证会使用已保存设置发送一次小型模型请求，服务商可能会计费。",
+      "activeBadge": "当前使用",
+      "editingBadge": "正在编辑",
+      "profileReady": "凭证就绪",
+      "profileNeedsCredentials": "需要凭证",
+      "profileStatusUnavailable": "状态不可用",
+      "emptyTitle": "添加第一个模型服务商",
+      "configuredEmpty": "连接服务商后，即可验证凭证并选择可用模型。",
+      "emptyRoutingHint": "完成连接后，可继续设置智能路由；单个服务商也可以在多个模型之间路由。",
+      "addProvider": "添加服务商",
+      "catalogTitle": "添加服务商",
+      "catalogDesc": "选择服务商，在一个窗口内完成 API Key 与模型设置。",
+      "featuredProviders": "推荐服务商",
+      "allProviders": "全部服务商",
+      "providerResultCount": "可选 {count} 个",
+      "recommendedBadge": "推荐",
+      "recommendedProviders": "推荐",
+      "otherProviders": "其他服务商",
+      "limitedFreeBadge": "限时免费获取",
+      "alreadyConfigured": "已添加",
+      "browseAllProviders": "浏览全部服务商（{count}）",
+      "providerResults": "服务商结果",
+      "viewAllProviders": "查看全部（{count}）",
+      "showFewerProviders": "收起",
+      "searchProviders": "搜索服务商",
+      "searchProvidersPlaceholder": "按服务商名称搜索",
+      "noProviderMatches": "没有匹配的服务商。",
+      "multiProviderRouting": "多服务商路由",
+      "modelRoutingStatus": "多服务商功能",
+      "routerStatus": "模型路由",
+      "routerStateOff": "已关闭",
+      "routerStateFollowPrimary": "推荐路由 · 跟随当前服务商",
+      "routerStateCustom": "自定义路由 · 切换当前服务商时保留",
+      "routerStateLegacy": "现有路由 · 切换当前服务商时保留",
+      "routingStatusDesc": "已保存 {count} 个服务商 · {ready} 个凭证可用。添加服务商不会自动开启路由或模型集成。",
+      "routingStatusDescOne": "已保存 1 个服务商 · {ready} 个凭证可用。添加服务商不会自动开启路由或模型集成。",
+      "crossProviderRouting": "跨服务商路由",
+      "ensembleStatus": "模型集成",
+      "routingOn": "已开启",
+      "routingOff": "已关闭",
+      "routingOnDesc": "模型路由可以使用已配置的服务商。",
+      "routingOffDesc": "关闭路由不会删除服务商；需要跨模型路由时再开启。",
+      "manageRouting": "管理路由",
+      "openModelRouting": "打开模型路由 →",
+      "modelUsageTitle": "模型使用方式",
+      "modelUsageRouter": "智能模型路由",
+      "modelUsageEnsemble": "多模型协作",
+      "modelUsageFixed": "固定模型",
+      "modelUsageRouterDesc": "每轮从已配置模型中选择一个合适模型。",
+      "modelUsageEnsembleDesc": "多个模型并行生成，再由一个模型整合结果。",
+      "modelUsageFixedDesc": "所有请求使用当前选定的直连模型。",
+      "crossProviderActive": "包含跨服务商路由",
+      "configureModelRouting": "设置模型路由",
+      "enableRouting": "开启路由",
+      "editProvider": "编辑 {provider}",
+      "moreActionsFor": "{provider} 的更多操作",
+      "actionsFor": "{provider} 的操作",
+      "testProviderConnection": "验证 {provider} 配置",
+      "testSavedConnection": "验证已保存配置",
+      "addKeyToTest": "添加密钥后验证",
+      "addKeyToTestHint": "请先添加 API Key。尚未保存但已粘贴的 Key 也可以直接验证。",
+      "addModelToTest": "添加模型后验证",
+      "addModelToTestHint": "请先为此服务商选择一个验证模型。",
+      "statusUnavailableTestHint": "当前无法获取服务商状态，暂时不能验证已保存的配置。",
+      "makeActive": "设为当前使用",
+      "activationModelRequired": "请先在下方选择并保存模型，再将该服务商设为当前使用。",
+      "activationModelRequiredHint": "请先在该服务商编辑器中选择直连/回退模型并保存。",
+      "activationPoolUnsupported": "该服务商使用密钥池，不能设为当前使用；仍可用于模型路由和集成。",
+      "activationStatusUnavailable": "暂时无法判断是否可设为当前使用，请更新并重启网关。",
+      "activationUnavailable": "该服务商的已保存配置暂时不能设为当前使用。",
+      "activateTitle": "将 {provider} 设为当前使用",
+      "activateDesc": "选择直连/回退模型，并在切换前确认模型路由和模型集成的变化。",
+      "activateDirectModelLabel": "直连/回退模型",
+      "activateDirectModelDesc": "用于普通直连请求，以及执行回退到当前服务商时的请求。",
+      "activateRouterConflictTitle": "处理模型路由冲突",
+      "activateRouterConflictDesc": "自定义层级仍引用其他服务商，但跨服务商路由处于关闭状态。请选择处理方式。",
+      "activateUseRecommendedRoute": "改用新服务商的推荐路由",
+      "activateUseRecommendedRouteDesc": "用 {provider} 的系统管理预设替换当前自定义层级。",
+      "activateKeepCustomRoute": "保留自定义路由",
+      "activateKeepCustomRouteDesc": "保留现有层级，并明确开启跨服务商路由。",
+      "activateDisableRouter": "关闭模型路由",
+      "activateDisableRouterDesc": "保留已保存层级，但在重新开启路由前不再使用。",
+      "activateImpactTitle": "切换后的状态",
+      "activateRouterOff": "保持关闭。",
+      "activateRouterNeedsChoice": "请先选择上方的冲突处理方式。",
+      "activateRouterFollowsPrimary": "系统管理的路由将切换为 {provider} 的预设。",
+      "activateRouterCustomPreserved": "自定义路由保持不变。",
+      "activateRouterLegacyPreserved": "为兼容旧配置，现有路由保持不变。",
+      "activateEnsembleOnPreserved": "保持开启；成员与聚合模型不变。",
+      "activateEnsembleOffPreserved": "保持关闭。",
+      "discoveringModels": "正在发现模型…",
+      "modelPlaceholder": "输入模型 ID",
+      "activating": "正在切换…",
+      "modelDiscoveryFailed": "无法发现模型，请手动输入模型 ID。",
+      "upgradeGatewayHint": "请更新并重启网关后再使用服务商管理功能。",
+      "profileSaveUnsupported": "当前网关只保存一个服务商。验证成功后，点击“保存更改”会直接替换当前服务商。",
+      "connectedLatency": "配置验证成功 · 完整探测 {latency} 毫秒",
+      "connectionKeyRejected": "密钥被拒绝",
+      "connectionUnavailable": "连接不可用",
+      "discardDraftTitle": "放弃服务商编辑？",
+      "discardDraftBody": "切换服务商会丢弃当前表单中尚未保存的编辑。",
+      "discardDraftPrimary": "放弃并继续",
+      "editingTitle": "编辑 {provider}",
+      "editingRolePrimary": "当前服务商",
+      "editingRoleNewPrimary": "新的当前服务商",
+      "editingRoleProfile": "路由配置",
+      "editingRoleNew": "尚未保存",
+      "editingPrimary": "用于直连请求，并作为主回退服务商。",
+      "editingNewPrimary": "保存后将成为当前服务商，用于直连请求和主回退。",
+      "editingProfile": "可供路由和模型集成使用；在这里选择不会将它设为当前服务商。",
+      "editingNew": "保存后可供路由和模型集成使用，但不会自动成为当前服务商。",
+      "profileModelHint": "保存后，如果将该服务商设为当前使用，此模型会作为直连/回退模型；路由模型仍在“模型路由”中单独配置。",
+      "removeConfirmTitle": "删除服务商？",
+      "removeConfirmBody": "要从已配置服务商中删除 {provider} 吗？仍被路由引用的服务商无法删除。",
+      "removeActiveConfirmBody": "要删除 {provider} 并将当前服务商切换为 {replacement} 吗？仍被路由引用的服务商无法删除。",
+      "removeConfirmPrimary": "删除服务商",
+      "saveChanges": "保存更改",
+      "verifyAndConnect": "验证并尝试连接",
       "needs": "服务商所需",
       "choose": "选择一个服务商",
       "chooseProviderShort": "请选择服务商",
@@ -262,21 +509,45 @@
       "recommendation": {
         "title": "推荐使用 TokenRhythm",
         "value": "TokenRhythm API 调用限时免费。",
-        "registration": "活动期间，注册并获取 API Key，即可免费调用 DeepSeek、GLM、MiniMax、Kimi 等主流模型。",
         "cta": "注册并获取 API Key",
         "externalLabel": "注册并获取 API Key — TokenRhythm（在新标签页中打开）",
         "stepsLabel": "如何接入 TokenRhythm",
         "stepRegister": "注册 TokenRhythm 账户",
         "stepCopy": "复制你的 API Key",
         "stepPaste": "粘贴到下方 API key 输入框",
-        "stepSelectAndPaste": "先在上方选择 TokenRhythm，再粘贴 API Key",
+        "stepSelectAndPaste": "点击“添加服务商”，选择 TokenRhythm，然后粘贴 API Key",
         "stepReplaceAndPaste": "先点击下方「更换密钥」，再粘贴 API Key"
       },
+      "recommendationScope": "OpenSquilla 推荐 · 可选",
       "advanced": "高级服务商选项",
+      "providerOptions": "{provider} 端点与高级选项",
+      "endpointTitle": "{provider} 端点",
+      "endpointDesc": "这些设置只在 OpenSquilla 调用 {provider} 时生效。",
+      "defaultModelTitle": "{provider} 直连与回退模型",
+      "defaultModelGroupDesc": "路由关闭或执行回退到当前服务商时使用。",
+      "defaultModelLabel": "直连/回退模型",
+      "configuredModelTitle": "{provider} 模型",
+      "configuredModelCurrentLabel": "当前模型",
+      "configuredModelFallbackLabel": "回退模型",
+      "configuredModelDescFixed": "当前为固定模型模式：所有请求都使用下方选定的模型。",
+      "configuredModelDescRouter": "当前为智能模型路由模式：每轮请求路由到合适的模型，路由不可用时回退到下方模型。",
+      "configuredModelDescEnsemble": "当前为多模型协作模式：多个模型协作生成，无法完成时回退到下方模型。",
+      "defaultModelDesc": "用于直连请求和主回退；路由模型请在“模型路由”中配置。",
+      "defaultModelSemantics": "有推荐模型时会自动预填。你可以选择或输入其他模型；正式使用前请先验证该模型。",
+      "profileModelTitle": "{provider} 直连与回退模型",
+      "profileModelGroupDesc": "随该服务商保存，同时用于配置验证。",
+      "profileModelLabel": "直连/回退模型",
+      "profileModelDesc": "该服务商成为当前使用项时采用；路由模型仍在“模型路由”中单独配置。",
+      "runtimeDefaultsTitle": "运行默认值 · 所有服务商",
+      "runtimeDefaultsDesc": "所有常规模型请求共享的网关级行为。",
       "timeoutLabel": "请求超时（秒）",
       "timeoutDesc": "等待单次模型响应的超时时长——对于较慢的本地模型（Ollama、vLLM、LM Studio）可调高此值。",
+      "timeoutGlobalDesc": "所有服务商常规模型请求共享的网关超时；配置验证使用独立的 30 秒超时。",
       "contextWindowLabel": "上下文窗口覆盖（token 数）",
       "contextWindowDesc": "为该模型设置提示组装预算上限。留空则使用自动检测的窗口。",
+      "contextWindowIdentityLabel": "上下文窗口 · {provider} / {model}",
+      "contextWindowIdentityDesc": "这个精确的服务商/模型组合在直连、路由和模型集成中运行时都会使用该设置。",
+      "contextWindowNoModel": "请选择模型",
       "contextWindowAuto": "自动",
       "contextWindowUnknown": "未知",
       "contextWindowNone": "无",
@@ -287,31 +558,59 @@
       "copyKeyCommand": "复制设置服务商密钥的命令",
       "save": "保存服务商",
       "configureRouter": "打开模型路由 →",
-      "credentialTitle": "{provider} 密钥",
-      "credentialConnected": "已连接",
+      "credentialTitle": "{provider} 身份验证",
+      "credentialReady": "密钥可用",
+      "credentialDraftReady": "已输入密钥 · 尚未保存",
+      "credentialEnvDraftReady": "已输入环境变量 · 尚未保存",
+      "credentialOptional": "API key 可选",
+      "credentialNotRequired": "无需密钥",
       "credentialNeedsKey": "需要密钥",
       "credentialSourceExplicit": "当前来源：已保存 API key",
       "credentialSourceEnv": "当前来源：环境变量 {envKey}",
       "credentialSourceMissingEnv": "当前来源：环境变量 {envKey} 不可见",
+      "credentialSourceOptional": "当前来源：未配置 API key（可选）",
       "credentialSourceNotRequired": "当前来源：无需密钥",
       "credentialSourceNone": "当前来源：尚未保存 API key",
+      "credentialSourceDraft": "当前来源：尚未保存的 API key",
+      "credentialSourceEnvDraft": "当前来源：尚未保存的环境变量 {envKey}",
       "credentialHiddenPlaceholder": "尚未保存 API key",
       "credentialPublicHint": "当前会话可以替换此凭据，但不能查看其中的密钥。",
       "viewCredential": "查看",
       "replaceCredential": "更换密钥",
+      "removeCredential": "删除已保存的密钥",
+      "removingCredential": "正在删除已保存的密钥…",
+      "removeCredentialConfirmTitle": "删除已保存的凭据？",
+      "removeCredentialConfirmBody": "要删除此设备和配置中为 {provider} 保存的凭据吗？服务商、模型和路由设置会保留。若凭据来自环境变量，系统中的环境变量本身不会被删除。",
+      "removeCredentialConfirmPrimary": "删除凭据",
       "credentialReplacePlaceholder": "粘贴新的 API key",
       "credentialEnterPlaceholder": "粘贴你的 API key",
+      "credentialWriteOnlyPlaceholder": "已保留保存的密钥；粘贴新值可替换",
+      "optionalApiKeyLabel": "API key（可选）",
+      "optionalApiKeyHelper": "仅当端点要求身份验证时填写；否则留空。",
       "showApiKey": "显示 API key",
       "hideApiKey": "隐藏 API key",
       "credentialAdvanced": "高级",
+      "credentialSourceOptions": "凭证来源",
       "credentialRevealUnavailable": "无法显示已保存的 API key。",
-      "connectionLabel": "连接",
-      "connectionDesc": "可选：保存前先检查密钥和端点是否可用。",
-      "testConnection": "测试连接",
-      "testing": "正在测试连接…",
-      "connected": "✓ 已连接",
+      "connectionLabel": "当前配置",
+      "connectionDesc": "使用当前密钥、端点和验证模型发送一次小型模型请求，并确认流式响应完整结束。服务商可能会计费。",
+      "testConnection": "验证配置",
+      "testCurrentSettings": "验证当前配置",
+      "testing": "正在验证配置…",
+      "connectionNotTested": "未验证",
+      "lastVerifiedAgo": "已验证 · {ago}",
+      "verifiedConfigChanged": "配置已变更，建议重新验证",
+      "lastVerifyFailedAgo": "上次验证失败 · {ago}",
+      "currentSettingsNotTested": "当前配置尚未验证",
+      "endpointVerified": "配置验证成功",
+      "probeMissingRequired": "请先填写必填项：{fields}。",
+      "requiredFieldJoiner": "、",
+      "connected": "✓ 配置验证成功",
+      "firstModelResponse": "首次模型响应 · {duration} 毫秒",
+      "completeProbeDuration": "完整探测 · {duration} 毫秒",
       "keyRejected": "✗ 密钥被拒绝 — {reason}",
       "notReachable": "✗ 无法连接 — {reason}",
+      "streamIncompatible": "✗ 流式响应不兼容 — 服务商已接受凭证和模型请求，但返回的流格式不受支持。",
       "discoverFailed": "无法列出模型 — 请直接输入模型 ID。",
       "verdictModels": "{count} 个模型 · 例如 {samples}",
       "verdictSampleJoiner": "、",
@@ -322,11 +621,16 @@
       "failureModelNotFound": "服务商不认识这个模型 ID。",
       "failureUnreachable": "无法访问该端点。",
       "failureBadRequest": "服务商拒绝了该请求。",
-      "failureGeneric": "连接测试失败。",
+      "failureGeneric": "配置验证失败。",
       "modelListLabel": "已发现的模型",
       "modelOptionsToggle": "模型目录 · {count}",
       "modelListReadout": "可用 · {count}",
       "modelLiveSource": "实时",
+      "modelMaxOutput": "最大输出 {tokens}",
+      "effectiveMaxTokens": "生效输出上限：{tokens} tokens · 来源：{source}",
+      "effectiveSourceConfig": "用户配置",
+      "effectiveSourceCatalog": "模型目录",
+      "effectiveSourceDefault": "内置默认值",
       "modelSearchOrCustom": "搜索模型或输入自定义 ID",
       "modelSelected": "已选",
       "modelUseTyped": "使用 \"{value}\"",
@@ -351,39 +655,55 @@
     },
     "modelStrategy": {
       "title": "模型路由",
-      "desc": "选择 Squilla 每轮如何使用当前模型。",
-      "providerFirst": "请先配置模型服务，然后选择路由方式。",
-      "providerAction": "前往模型服务 →",
-      "routerTitle": "AI 智能单模型路由",
-      "visualModeLabel": "路由面板样式",
-      "visualModeDesc": "聊天回复中路由决策面板的呈现方式。",
+      "desc": "选择每次请求如何挑选模型。",
+      "modeTitle": "选择模型使用方式",
+      "providerFirstTitle": "先添加模型服务商",
+      "providerFirst": "模型路由需要至少一个已保存的供应商。",
+      "providerAction": "前往模型服务",
+      "configuredProvidersOnly": "模型来自「模型服务」。",
+      "manageProviders": "管理模型服务",
+      "routerTitle": "智能模型路由",
+      "fallbackTierLabel": "路由无法确定时",
+      "fallbackTierDesc": "当路由无法判断请求档位时使用。",
+      "modelRolesTitle": "模型角色",
+      "advancedTitle": "高级选项",
+      "advancedDesc": "兜底档位与聊天中的路由展示。",
+      "visualModeLabel": "路由决策面板样式",
+      "visualModeDesc": "路由决策在聊天回复中的展示样式。",
       "crossProviderNotice": "跨服务商路由已启用。保存前请检查每个分层。",
       "cards": {
         "router": {
-          "title": "AI 智能单模型路由",
-          "desc": "由 AI 为每轮智能选择一个合适模型，优先降低成本。"
+          "title": "智能模型路由",
+          "badge": "按需省 Token",
+          "desc": "每个请求交给合适的模型，简单任务不浪费。"
         },
         "ensemble": {
-          "title": "AI 智能聚合路由",
-          "desc": "由 AI 协调多个模型协同生成，优先提升复杂任务能力。"
+          "title": "多模型协作",
+          "badge": "能力优先",
+          "desc": "多模型协作攻克复杂任务。"
         },
         "single": {
-          "title": "关",
-          "desc": "每轮都发送到当前选定模型。"
+          "title": "固定模型",
+          "badge": "稳定可控",
+          "desc": "所有请求用同一个模型，简单可预期。"
         }
       },
-      "routerDependency": "使用 {provider} 凭据；服务商默认模型为 {model}。",
-      "ensembleTitle": "AI 智能聚合路由",
+      "routerDependency": "为每个请求档位选一个模型,一个供应商即可覆盖全部档位。",
+      "ensembleTitle": "多模型协作",
       "ensembleDependency": "使用 {provider} 凭据；服务商默认模型为 {model}。",
       "ensembleMinimum": "再添加至少一个候选模型，才能获得聚合路由收益。",
-      "ensembleFailure": "无法完成融合时,回退到当前模型:{provider} · {model}。",
-      "singleTitle": "关",
-      "singleDependency": "每轮都发送到当前选定模型：{provider} · {model}。",
-      "singleDesc": "新请求不会启用 AI 智能路由或聚合路由。",
+      "ensembleFailure": "无法完成聚合时，回退到当前模型：{provider} · {model}。",
+      "singleTitle": "固定模型",
+      "singleDependency": "选择每个请求都使用的模型。",
+      "singleProviderLabel": "当前模型服务商",
+      "singleModelLabel": "固定与回退模型",
+      "singleModelDesc": "固定模型模式下用于每个请求；智能路由或多模型协作无法完成时也会回退到它。",
+      "singleModelPlaceholder": "输入模型 ID",
+      "singleDesc": "始终使用一个可预期的模型，不进行自动路由或多模型协作。",
       "openrouterFixedTitle": "{provider} 固定聚合",
-      "openrouterFixedDesc": "当模型服务使用 {provider} 时，聚合路由固定使用四个候选生成模型和一个综合模型。",
+      "openrouterFixedDesc": "当模型服务使用 {provider} 时，聚合路由固定使用四个候选生成模型和一个聚合模型。",
       "openrouterFixedProposer": "候选生成模型",
-      "openrouterFixedAggregator": "综合模型",
+      "openrouterFixedAggregator": "聚合模型",
       "credentialReady": "已连接",
       "credentialNeeded": "需要 {provider} 凭据",
       "credentialMissingEnv": "需要 {envKey}",
@@ -395,28 +715,34 @@
       "addCandidate": "添加候选",
       "removeCandidateAria": "移除 {model}",
       "ensembleEmpty": "暂无候选模型。请保存模型服务设置以生成模型分层，或手动添加候选模型。",
-      "ensemblePipeline": "工作方式:候选生成模型并行起草,综合模型融合草稿产出最终回答;只有综合模型可以调用工具。",
+      "ensemblePipeline": "工作方式：提案模型并行起草，聚合模型汇总草稿并产出最终回答；只有聚合模型可以调用工具。",
+      "ensembleFlowDesc": "多个模型并行起草,聚合模型合成最终回答;调用次数更多。",
       "legacyDynamicNotice": "当前配置使用已下线的自动聚合模式,转换为自定义阵容后可在此继续编辑。",
       "legacyDynamicMigrate": "转换为自定义阵容",
       "schemeLabel": "聚合方案",
-      "schemePresetTitle": "预设聚合",
+      "schemePresetTitle": "预设",
       "schemePresetBadge": "推荐",
-      "schemePresetDesc": "服务商官方调优阵容:四个候选生成模型加一个综合模型,开箱即用。",
-      "schemeCustomTitle": "自定义聚合",
+      "schemePresetDesc": "服务商官方调优阵容:四个候选生成模型加一个聚合模型,开箱即用。",
+      "schemeCustomTitle": "自定义",
       "schemeCustomBadge": "进阶",
-      "schemeCustomDesc": "按角色自行搭建阵容,可跨服务商混编。",
+      "schemeCustomDesc": "从当前服务商的模型中按角色搭建阵容。",
       "presetNoteDeepseek": "推理主力——复杂任务的基准草稿",
       "presetNoteGlm": "长文与结构化输出——与 DeepSeek 家族形成对照",
       "presetNoteKimi": "代码与工具意图——覆盖编程类请求",
       "presetNoteQwen": "知识面与多语言覆盖",
       "presetNoteGeneric": "候选草稿",
-      "aggregatorNote": "融合全部草稿并产出最终回答;唯一可调用工具的成员",
-      "aggregatorSectionLabel": "综合模型",
-      "aggregatorSectionDesc": "有且只有一个综合模型产出最终回答,建议选阵容中最强的模型。",
-      "aggregatorInheritedNote": "未指定综合模型——由当前聊天模型融合草稿",
-      "proposerSectionLabel": "候选生成模型",
+      "aggregatorNote": "汇总全部草稿并产出最终回答；唯一可调用工具的成员",
+      "aggregatorSectionLabel": "聚合模型",
+      "aggregatorSectionDesc": "有且只有一个聚合模型产出最终回答,建议选阵容中最强的模型。",
+      "aggregatorInheritedNote": "未指定聚合模型——由当前聊天模型汇总草稿",
+      "proposerSectionLabel": "候选模型",
+      "proposerRoleLabel": "提案者",
+      "aggregatorRoleLabel": "聚合者",
       "proposerSectionDesc": "候选并行起草,整体耗时取决于最慢的一个。",
       "proposerCount": "{count} / 上限 {max} · 推荐 {recommendedMin}–{recommendedMax}",
+      "proposerCountCompact": "{count} / {max}",
+      "presetReadOnlyHint": "预设阵容由服务商维护，切换到“自定义”后可调整。",
+      "presetProviderMismatchNotice": "当前回合仍运行已保存的 {presetProvider} 预设，而非 {activeProvider} 的预设 — 重新选择“预设”即可切换到 {activeProvider}。",
       "importTierCandidates": "从模型分层导入",
       "roleSelectAria": "{model} 的角色",
       "roleUnassigned": "未指定角色",
@@ -424,13 +750,33 @@
       "role_contrast": "异构对照",
       "role_fast_check": "快速校验",
       "role_critic": "深度评审",
-      "role_aggregator": "综合模型",
+      "role_aggregator": "聚合模型",
       "addCandidateRoleLabel": "候选角色",
-      "capacityWarn": "每轮 {calls} 次模型调用——费用线性增长,超过 4 个候选后融合收益明显递减。",
-      "capacityFull": "已达上限 {max} 个候选——更多草稿不会带来更好的融合,请先移除一个再添加。",
-      "diversityHint": "多个候选来自同一模型家族——添加不同厂商的模型通常能提升融合收益。",
-      "effectiveFacts": "每轮 {calls} 次模型调用 · {quorum}/{proposers} 个候选成功即融合 · 候选超时 {proposerTimeout} 秒 · 综合超时 {aggregatorTimeout} 秒 · 凑够后宽限 {grace} 秒",
-      "quorumFailureLabel": "成功候选不足 {quorum} 个时"
+      "candidateActionsAria": "{model} 的更多操作",
+      "replaceModel": "替换模型",
+      "promoteAggregator": "同时用作聚合模型",
+      "replaceCandidateTitle": "替换 {model}",
+      "replaceCandidateConfirm": "替换",
+      "candidateDuplicate": "该模型已在提案模型列表中。",
+      "addProposer": "添加提案模型",
+      "chooseAggregator": "选择聚合模型",
+      "aggregatorPickerTitle": "选择聚合模型",
+      "aggregatorFromProposers": "从现有提案模型中选择",
+      "aggregatorOtherModel": "或选择其他模型",
+      "capacityWarn": "每轮 {calls} 次模型调用——费用线性增长，超过 4 个提案模型后聚合收益明显递减。",
+      "capacityFull": "已达上限 {max} 个提案模型——更多草稿不会带来更好的聚合结果，请先移除一个再添加。",
+      "diversityHint": "多个提案来自同一模型家族——添加不同厂商的模型通常能提升聚合质量。",
+      "effectiveFacts": "每轮 {calls} 次模型调用 · {quorum}/{proposers} 个候选正常返回即可聚合 · 候选超时 {proposerTimeout} 秒 · 聚合超时 {aggregatorTimeout} 秒 · 达标后宽限 {grace} 秒",
+      "effectiveSummary": "{proposers} 个提案模型并行 + 1 个聚合模型 · 预计每轮 {calls} 次调用",
+      "runtimeStrategyTitle": "运行策略",
+      "runtimeStrategyDesc": "正常返回阈值、失败处理与时限",
+      "successThresholdLabel": "聚合所需正常提案",
+      "successThresholdAuto": "自动 · 至少 {quorum}/{proposers} 正常返回（允许 1 个失败）",
+      "successThresholdExact": "至少 {quorum}/{proposers} 正常返回",
+      "failurePolicyLabel": "无法完成聚合时",
+      "runtimeLimitsLabel": "运行时限",
+      "runtimeLimits": "每个提案最长 {proposerTimeout} 秒 · 达到阈值后再等待最多 {grace} 秒 · 聚合最长 {aggregatorTimeout} 秒",
+      "quorumFailureLabel": "正常返回的提案不足 {quorum} 个时"
     },
     "behavior": {
       "title": "会话行为",
@@ -488,23 +834,32 @@
       "allFailedError": "停止并报告错误"
     },
     "channels": {
-      "title": "频道",
-      "configuredCount": "已配置 {count} 个",
-      "channelType": "频道类型",
-      "needs": "频道所需",
-      "save": "保存频道",
-      "runtimeStatus": "运行状态",
-      "connected": "已连接",
-      "actionNeeded": "需要处理",
-      "connecting": "连接中",
-      "none": "尚未配置任何频道。",
-      "disabled": "已禁用",
-      "enable": "启用",
-      "disable": "禁用",
+      "title": "渠道",
+      "save": "保存渠道",
       "remove": "移除",
-      "removeConfirmTitle": "移除此频道？",
+      "removeConfirmTitle": "移除此渠道？",
       "removeConfirmBody": "{name} 将从配置中移除。需要重启后才能生效。",
-      "removeConfirmPrimary": "移除"
+      "removeConfirmPrimary": "移除",
+      "testConnection": "测试连接",
+      "testing": "测试中…",
+      "nameLocked": "不支持重命名——请使用「另存为新渠道」",
+      "saveChanges": "保存修改",
+      "secretReplace": "替换",
+      "secretReplacePlaceholder": "粘贴新值",
+      "secretKeepStored": "保留已存值",
+      "advancedGroup": "高级",
+      "fieldRequired": "此字段必填",
+      "fixRequired": "请先填写高亮的必填字段",
+      "aids": {
+        "title": "飞书控制台快捷方式",
+        "scopes_json": "权限清单 JSON——粘贴到 权限管理 → 批量导入",
+        "copy": "复制 JSON",
+        "copied": "已复制 ✓",
+        "credentials_link": "打开凭证页(App id / App secret)",
+        "quick_apply_link": "一键预填全部所需权限的申请",
+        "needAppId": "先填写 App id",
+        "ws_order_note": "检查飞书事件订阅：打开「事件与回调」，确认事件订阅方式为「使用长连接接收事件」。当前长连接已建立，但尚未记录到入站事件；这本身并不代表控制台配置有误。收到第一条事件后本提示自动消失。"
+      }
     },
     "search": {
       "title": "网页搜索",
@@ -562,6 +917,15 @@
       "outputFormat": "输出格式",
       "fallbacks": "回退模型",
       "fallbacksHint": "以逗号分隔的“服务商/模型”标识；当主模型失败时按顺序尝试。"
+    },
+    "capabilities": {
+      "imageStatus": {
+        "missingEnv": "缺少环境变量 {name}。在下方填入密钥，或设置该环境变量后重启网关。"
+      },
+      "imageKeyConfigured": "已配置密钥",
+      "imageKeyMissing": "尚未配置",
+      "imageKeyPlaceholderKeep": "留空则保持已保存的密钥",
+      "imageKeyPlaceholderNew": "粘贴 API 密钥"
     },
     "audio": {
       "title": "音频",
@@ -623,6 +987,17 @@
       "revealFailed": "无法显示日志：{error}",
       "restarting": "正在重启本地运行时…",
       "restartFailed": "重启失败：{error}",
+      "closeBehaviorLabel": "关闭主窗口时",
+      "closeBehaviorDesc": "选择点击窗口关闭按钮时 OpenSquilla 的行为。",
+      "closeBehaviorBackground": "在后台继续运行",
+      "closeBehaviorQuit": "退出 OpenSquilla",
+      "closeBehaviorAsk": "每次询问",
+      "closeBehaviorSaving": "正在保存…",
+      "closeBehaviorReadFailed": "无法读取窗口关闭设置：{error}",
+      "closeBehaviorSaveFailed": "无法保存窗口关闭设置：{error}",
+      "closeBehaviorBackgroundUnavailable": "此平台不支持后台运行。",
+      "closeBehaviorFallbackQuit": "此平台不支持后台运行，关闭窗口时将直接退出应用。",
+      "closeBehaviorRetry": "重试",
       "resetConfirmTitle": "重置已保存的设置？",
       "resetConfirmBody": "这将清除已保存的桌面凭据和生成的配置。下次启动将重新运行首次设置。",
       "resetConfirmPrimary": "重置",
@@ -642,12 +1017,12 @@
         },
         "delete-current-profile": {
           "title": "删除当前配置",
-          "warning": "会删除列出的当前配置、凭据和日志；其他恢复配置和备份都会保留。",
+          "warning": "会删除列出的主配置、凭据和日志；已记录的备份会保留。",
           "apply": "删除配置"
         },
         "delete-all-user-data": {
           "title": "删除全部 OpenSquilla 用户数据",
-          "warning": "OpenSquilla 完全退出后，会删除主配置、所有恢复配置、凭据、日志和已记录的备份。",
+          "warning": "OpenSquilla 完全退出后，会删除主配置、凭据、日志和已记录的备份。",
           "apply": "删除全部数据并退出"
         },
         "inspectFailed": "无法检查清理位置：{detail}",
@@ -655,7 +1030,6 @@
         "inventoryCount": "列出的 {total} 个位置中，当前有 {existing} 个存在。",
         "inventoryLabel": "清理清单",
         "primaryProfile": "主配置",
-        "recoveryProfile": "恢复配置",
         "present": "存在",
         "missing": "不存在",
         "blocked": "清理已阻止",
@@ -669,7 +1043,7 @@
         "working": "正在停止本地运行时并执行已确认的清理…",
         "resetConfirmTitle": "重置当前设置？",
         "resetConfirmBody": "当前配置将返回提供商引导，同时保留工作区身份、记忆和聊天。",
-        "partial": "清理在中途停止（{detail}）。OpenSquilla 已保留剩余数据并打开恢复选项。",
+        "partial": "清理在中途停止（{detail}）。OpenSquilla 已保留剩余数据并打开修复选项。",
         "applyFailed": "清理未能开始：{detail}",
         "deleteAllScheduled": "OpenSquilla 即将退出；只有应用完全退出后才会开始删除。",
         "resetDone": "当前设置已重置，将重新打开提供商引导。",
@@ -691,7 +1065,6 @@
       "migrationLabel": "数据转移",
       "migrationDesc": "使用另一套 OpenSquilla 安装中的数据。继续前会先核对；如果当前桌面端已有数据，会完整备份后再替换。",
       "migrationButton": "从其他安装转移数据",
-      "migrationRecoveryProfile": "恢复配置中不能转移数据。请返回主配置后继续。",
       "migrationNone": "未发现其他 OpenSquilla 数据。",
       "migrationSummaryFailed": "无法核对所选数据：{detail}",
       "migrationSummaryTitle": "核对数据转移",
@@ -772,9 +1145,9 @@
       "desc": "此浏览器的实验性客户端偏好。它们会立即生效——无需保存。标记为",
       "reload": "重新加载",
       "descReloadSuffix": "的项目会在刷新页面后生效。",
-      "foldLabel": "实时回合折叠",
-      "foldDesc": "使用新的折叠引擎渲染流式工作卡片（关闭则使用旧渲染方式）。",
-      "foldAria": "实时回合折叠（重新加载后生效）",
+      "foldLabel": "新版实时回合渲染",
+      "foldDesc": "根据有序事件日志渲染流式工作卡片；仅在需要临时回退兼容渲染时关闭。",
+      "foldAria": "新版实时回合渲染（重新加载后生效）",
       "revealLabel": "答案显示窗口（毫秒）",
       "revealDesc": "将实时答案的显示保持在 [最小值, 最大值] 窗口内，以便路由先行决策。最小值 ≤ 最大值。",
       "revealMinAria": "答案显示最小毫秒数",
@@ -786,17 +1159,24 @@
       "experimental": "实验性",
       "historyMergeDesc": "在历史同步时，按消息 ID 合并并保留仅实时存在的字段（默认关闭，正在逐步启用）。",
       "historyMergeAria": "按 ID 协调合并历史（重新加载后生效）",
+      "agentConfigLabel": "智能体配置（高级）",
+      "agentConfigDesc": "管理现有智能体配置。该区域将在后续多智能体改造中调整。",
+      "agentConfigAction": "打开",
+      "dataMaintenanceLabel": "数据维护",
+      "dataMaintenanceDesc": "管理数据导入与备份；桌面端还可重置或删除本机档案数据。",
+      "dataMaintenanceAction": "管理",
+      "dataMaintenanceAria": "打开数据维护",
       "runTraceLabel": "日志中的运行追踪抽屉",
       "runTraceDesc": "使日志行可交互，并在日志视图中为每行打开节点步骤详情抽屉。",
       "runTraceAria": "日志中的运行追踪抽屉（重新加载后生效）"
     },
     "privacy": {
       "title": "隐私",
-      "statusEnabled": "网络可观测性已启用。",
-      "statusDisabled": "网络可观测性已禁用。",
-      "statusDisabledByEnv": "网络可观测性已被环境变量禁用。",
-      "disableNetworkObservabilityLabel": "禁用网络可观测性",
-      "disableNetworkObservabilityDesc": "停止网关网络可观测性调用，例如安装遥测和更新检查。",
+      "statusEnabled": "网络上报已开启。",
+      "statusDisabled": "网络上报已关闭。",
+      "statusDisabledByEnv": "网络上报已被环境变量设置关闭。",
+      "disableNetworkObservabilityLabel": "关闭网络上报",
+      "disableNetworkObservabilityDesc": "停止安装遥测、后台更新检查，以及用于串联同一次会话请求的匿名标识——这些标识只会发送给官方 TokenRhythm API。你主动发起的模型请求不受影响。",
       "save": "保存隐私设置"
     },
     "toast": {
@@ -805,17 +1185,27 @@
       "envNotVisibleGateway": "此网关进程无法读取 {envKey}。",
       "providerSaved": "服务商已保存。",
       "providerSavedRestart": "服务商已保存。需要重启。",
+      "providerProfileSaved": "已保存 {provider}，可用于路由。",
+      "providerActiveRemoveNeedsReplacement": "请先添加并验证另一个服务商，再删除当前服务商。",
+      "providerProfileRemoved": "已删除 {provider}。",
+      "providerCredentialRemoved": "已删除 {provider} 的凭据。",
+      "providerCredentialExternalStillActive": "已清除 OpenSquilla 中保存的 {provider} 凭据引用，但系统环境变量 {envKey} 仍在提供凭据。",
+      "providerActivated": "已将 {provider} 设为当前使用。",
+      "providerActivatedRouterDisabled": "已将 {provider} 设为当前使用。由于已保存的路由层级使用其他服务商，模型路由已关闭。",
       "behaviorSaved": "行为已保存。",
       "behaviorSavedRestart": "行为已保存。需要重启。",
       "privacySaved": "隐私设置已保存。",
       "privacySavedRestart": "隐私设置已保存。需要重启。",
       "chooseProviderRouter": "保存模型分层前请先选择服务商。",
+      "chooseFixedModel": "保存前请选择固定模型。",
       "routerSaved": "路由已保存。",
       "routerSavedRestart": "路由已保存。需要重启。",
       "ensembleSaved": "模型聚合已保存。",
       "presetApplied": "路由预设已应用。",
       "presetAppliedRestart": "路由预设已应用。需要重启。",
-      "channelSaved": "频道已保存。需要重启。",
+      "channelSaved": "渠道已保存——本地校验通过；可点「测试连接」验证凭证",
+      "channelSavedLive": "渠道已保存并生效——正以新配置运行",
+      "channelStartFailed": "渠道已保存,但启动失败——请在状态中查看错误,然后用「重启」重试",
       "searchSaved": "搜索已保存。",
       "memorySurface": "记忆嵌入",
       "memorySaved": "记忆已保存。",
@@ -829,9 +1219,12 @@
       "copyFailed": "复制失败：{error}",
       "copiedCommand": "已复制命令",
       "copiedPath": "已复制路径",
-      "channelRemoved": "频道已移除。需要重启。",
-      "channelEnabled": "频道已启用。需要重启。",
-      "channelDisabled": "频道已禁用。需要重启。"
+      "channelRemoved": "渠道已移除。需要重启。",
+      "channelRemovedLive": "渠道已移除并停止。",
+      "channelEnabled": "渠道已启用。需要重启。",
+      "channelEnabledLive": "渠道已启用并启动。",
+      "channelDisabled": "渠道已禁用。需要重启。",
+      "channelDisabledLive": "渠道已禁用并停止。"
     },
     "needs": {
       "noApiKey": "无需 API 密钥。",
@@ -876,42 +1269,236 @@
         "insufficient_class_diversity": "未训练——纠错样本覆盖的路由档位过少"
       },
       "detachedNote": "模型路由基础权重已升级。基于旧权重的学习成果已归档;纠错样本不受影响,将基于新权重自动重新学习。无需任何操作。"
+    },
+    "field": {
+      "keepCurrentPlaceholder": "留空即保留当前值",
+      "secretComposePlaceholder": "粘贴 token 或密钥"
+    },
+    "channelCatalog": {
+      "fields": {
+        "group_session_scope": {
+          "label": "群聊会话范围",
+          "choices": {
+            "per_sender": "按成员隔离",
+            "shared_room": "全群共享"
+          }
+        },
+        "busy_input_mode": {
+          "label": "忙碌时的输入处理"
+        },
+        "dm_access": {
+          "label": "私聊访问"
+        },
+        "pairing_approved_notice": {
+          "label": "批准后通知发送者"
+        },
+        "allowed_senders": {
+          "label": "允许的发送者 ID"
+        },
+        "status_reactions_enabled": {
+          "label": "消息状态表情回应"
+        },
+        "api_base": {
+          "label": "API 基础地址"
+        },
+        "name": {
+          "label": "渠道名称",
+          "description": "此渠道条目的唯一标识。"
+        },
+        "agent_id": {
+          "label": "智能体 ID"
+        },
+        "enabled": {
+          "label": "启用"
+        },
+        "default_chat_id": {
+          "label": "默认会话 ID"
+        },
+        "connection_mode": {
+          "label": "连接方式",
+          "choices": {
+            "webhook": "Webhook（回调）",
+            "websocket": "长连接（WebSocket）"
+          }
+        },
+        "app_id": {
+          "label": "应用 ID（App ID）"
+        },
+        "app_secret": {
+          "label": "应用密钥（App Secret）"
+        },
+        "signing_secret": {
+          "label": "签名密钥（Signing secret）"
+        },
+        "client_id": {
+          "label": "客户端 ID（Client ID）"
+        },
+        "client_secret": {
+          "label": "客户端密钥（Client Secret）"
+        },
+        "bot_id": {
+          "label": "机器人 ID（Bot ID）"
+        },
+        "bot_secret": {
+          "label": "机器人密钥（Bot Secret）"
+        },
+        "corp_secret": {
+          "label": "企业应用密钥（Corp Secret）"
+        },
+        "homeserver_url": {
+          "label": "服务器地址（Homeserver URL）"
+        },
+        "user_id": {
+          "label": "用户 ID（{'@'}user:server）"
+        },
+        "debounce_window_s": {
+          "label": "去抖窗口（秒）"
+        },
+        "transport_name": {
+          "choices": {
+            "polling": "轮询",
+            "webhook": "Webhook（回调）"
+          }
+        }
+      },
+      "groups": {
+        "basic": "基本",
+        "credentials": "凭证",
+        "webhook": "Webhook 回调",
+        "behavior": "行为",
+        "access": "访问控制",
+        "polling": "轮询"
+      },
+      "dingtalk": {
+        "label": "钉钉",
+        "description": "钉钉企业机器人，基于 stream 长连接。",
+        "needs": [
+          "Client id。",
+          "Client secret。"
+        ]
+      },
+      "discord": {
+        "fields": {
+          "token": {
+            "label": "机器人令牌（Bot token）"
+          }
+        },
+        "description": "Discord 机器人，使用 gateway websocket。",
+        "needs": [
+          "Bot token。"
+        ]
+      },
+      "feishu": {
+        "label": "飞书（Lark）",
+        "fields": {
+          "domain": {
+            "label": "地区",
+            "description": "选择签发此 App ID 的开放平台。",
+            "choices": {
+              "feishu": "飞书（中国）",
+              "lark": "Lark（国际）"
+            }
+          }
+        },
+        "description": "飞书（或 Lark）机器人——webhook 或 websocket 连接。",
+        "needs": [
+          "App id。",
+          "App secret。"
+        ]
+      },
+      "matrix": {
+        "description": "Matrix homeserver 客户端（sync 长轮询）。",
+        "needs": [
+          "Homeserver URL。",
+          "用户 id（@user:server）。",
+          "安装 matrix 可选扩展。"
+        ]
+      },
+      "qq": {
+        "label": "QQ 机器人",
+        "description": "腾讯 QQ 机器人，基于 websocket。",
+        "needs": [
+          "App id。",
+          "App secret。"
+        ]
+      },
+      "slack": {
+        "fields": {
+          "token": {
+            "label": "机器人令牌（Bot token）"
+          },
+          "connection_mode": {
+            "choices": {
+              "socket": "Socket 模式",
+              "webhook": "Webhook（回调）"
+            }
+          }
+        },
+        "description": "Slack 工作区机器人——Socket 模式（websocket）或 Events API webhook。",
+        "needs": [
+          "Bot token（xoxb-…）。",
+          "Signing secret。"
+        ]
+      },
+      "telegram": {
+        "fields": {
+          "token": {
+            "label": "机器人令牌（Bot token）"
+          }
+        },
+        "description": "Telegram Bot API——轮询或 webhook 传输。",
+        "needs": [
+          "Bot token。"
+        ]
+      },
+      "wecom": {
+        "label": "企业微信",
+        "description": "企业微信 AI 机器人，基于 websocket，或企业应用 webhook 回调。",
+        "needs": [
+          "Corp id。",
+          "Corp secret。",
+          "Agent id（整数）。",
+          "Token。",
+          "Encoding AES key。"
+        ]
+      }
     }
   },
   "sessions": {
-    "title": "会话",
+    "title": "任务",
     "subtitle": "开始一项任务、解除运行阻塞，或继续之前的工作。",
     "refresh": "刷新",
     "refreshing": "正在刷新…",
-    "loading": "正在加载会话…",
+    "loading": "正在加载任务…",
     "unknownAgent": "未知智能体",
+    "deletedAgent": "已删除的智能体 · {id}",
     "msgCount": "{count} 条消息",
     "error": {
-      "load": "无法加载会话。"
+      "load": "无法加载任务。"
     },
     "empty": {
-      "title": "暂无会话。",
-      "body": "在上方开始你的第一个任务——智能体接手工作后会话会显示在这里。"
+      "title": "暂无任务",
+      "body": "在上方开始第一项任务，智能体接手后会显示在这里。"
     },
     "noMatches": {
       "title": "无匹配结果",
-      "body": "没有会话符合当前筛选条件。",
+      "body": "没有任务符合当前筛选条件。",
       "clear": "清除筛选"
     },
     "filter": {
-      "ariaLabel": "筛选会话",
+      "ariaLabel": "筛选任务",
       "all": "全部",
-      "chats": "聊天",
+      "chats": "任务",
       "automations": "自动化",
-      "channels": "频道"
+      "channels": "渠道"
     },
     "search": {
-      "placeholder": "搜索会话…",
-      "ariaLabel": "搜索会话"
+      "placeholder": "搜索任务…",
+      "ariaLabel": "搜索任务"
     },
     "delete": {
-      "title": "删除会话",
-      "body": "删除会话“{title}”？此操作无法撤销。\n\n记录不会写入磁盘；如需备份请先使用 /reset。",
+      "title": "删除任务",
+      "body": "删除任务“{title}”？此操作无法撤销。\n\n记录不会写入磁盘；如需备份请先使用 /reset。",
       "confirm": "删除"
     },
     "status": {
@@ -935,17 +1522,17 @@
     },
     "kindLabel": {
       "cron": "定时任务",
-      "channel": "频道"
+      "channel": "渠道"
     },
     "fallbackTitle": {
       "chat": "新聊天",
       "cron": "自动化运行",
-      "channel": "频道对话",
+      "channel": "渠道对话",
       "task": "子智能体任务",
-      "untitled": "未命名会话"
+      "untitled": "未命名任务"
     },
     "group": {
-      "operational": "运维会话",
+      "operational": "运维任务",
       "contractGaps": "后端契约缺失"
     },
     "taskInput": {
@@ -958,8 +1545,10 @@
       "ariaLabel": "需要关注",
       "allClear": "一切正常",
       "costToday": "今日 {amount}",
+      "costTodayLabel": "今日成本",
+      "costTotal": "累计 {amount}",
       "needsApproval": "需要审批",
-      "openBlocked": "打开被阻塞的会话 →",
+      "openBlocked": "打开被阻塞的任务 →",
       "nothingWaiting": "没有需要你处理的事项",
       "active": "活跃",
       "runningQueued": "{running} 个运行中 · {queued} 个排队中",
@@ -1006,9 +1595,8 @@
       "abortFailed": "中止失败。"
     },
     "overview": {
-      "title": "概览",
-      "subtitle": "实时状态、近期会话与事件流。",
-      "openChat": "打开聊天",
+      "title": "状态",
+      "subtitle": "就绪情况、用量与运行健康状态。",
       "totalTokens": "总 token 数",
       "totalSessions": "会话总数",
       "totalSessionsTitle": "所有状态的会话总数",
@@ -1034,28 +1622,13 @@
       "noFindings": "未返回任何发现项。",
       "recoveryRestart": "恢复需要重启",
       "openSettings": "打开设置",
+      "findingDetails": "详情",
       "findingFallback": "发现项 {n}",
       "copyCommand": "复制命令",
       "step": "步骤",
-      "recentActivity": "近期活动",
-      "viewAllArrow": "查看全部 →",
-      "noSessions": "暂无会话——打开聊天开始你的第一个会话。",
-      "connection": "连接",
-      "gateway": "网关",
-      "connHint": "网关 WebSocket URL 和令牌现在位于设置中。",
-      "manageConnection": "在设置中管理连接 →",
-      "live": "实时",
-      "eventStream": "事件流",
-      "eventCount": "{count} 个事件",
-      "listening": "正在监听事件…",
       "checking": "检查中",
       "waitingDoctor": "等待 doctor.status",
       "healthUnavailable": "网关健康报告不可用",
-      "conn": {
-        "connecting": "连接中",
-        "connected": "已连接",
-        "disconnected": "已断开"
-      },
       "impact": {
         "blocksReady": "阻塞就绪",
         "degrades": "降级",
@@ -1068,11 +1641,6 @@
         "actionRequired": "需要处理",
         "degraded": "降级",
         "unavailable": "不可用"
-      },
-      "steps": {
-        "optional": "可选设置步骤",
-        "reference": "参考步骤",
-        "recovery": "恢复步骤"
       },
       "badge": {
         "diagnostic": "诊断未完成",
@@ -1126,7 +1694,7 @@
       "copyDiagnostics": "复制诊断 JSON",
       "copiedDiagnostics": "诊断 JSON 已复制",
       "diagnoseWithAgent": "让 Agent 排查",
-      "diagnosePrompt": "请根据下方的 doctor 报告排查此 OpenSquilla 配置：给出根本原因和最小修复步骤；不要执行破坏性命令。",
+      "diagnosePrompt": "请根据下方的客户端上下文和 doctor 报告排查此 OpenSquilla 配置。优先使用适用的 App 内设置；hasTerminalWorkflow 为 false 时，不得建议裸 opensquilla 命令，Desktop 自有 gateway 由 App 管理。数据转移是先备份再整体替换，绝不合并。可选迁移项不代表故障，转移后也可能继续显示。只解释和引导：不得迁移数据、重启 gateway、写入设置或声称已经执行了更改。",
       "environment": "环境",
       "latency": "延迟"
     }
@@ -1136,7 +1704,9 @@
       "refresh": "刷新",
       "edit": "编辑",
       "delete": "删除",
-      "confirm": "确认"
+      "confirm": "确认",
+      "refreshing": "刷新中…",
+      "retry": "重试"
     },
     "agents": {
       "title": "智能体",
@@ -1205,36 +1775,232 @@
       "toastDeleteFailed": "删除智能体失败：{msg}"
     },
     "channels": {
-      "title": "频道",
-      "subtitle": "已配置频道的运行状态。在设置或 CLI 中添加或更改频道配置。",
-      "settingsHint": "频道配置在设置中管理",
-      "openSettings": "打开设置",
-      "totalChannels": "频道总数",
-      "typeCount": "{n} 种类型",
-      "connected": "已连接",
-      "live": "运行中",
-      "unhealthy": "{n} 个异常",
-      "allIdle": "全部空闲",
-      "inactive": "未激活",
-      "needAttention": "{n} 个需要关注",
-      "restartAttempts": "重启次数",
-      "sinceGatewayStart": "自网关启动以来",
-      "configuredChannels": "已配置的频道",
+      "title": "渠道",
+      "subtitle": "已配置渠道的运行状态。在这里直接添加、编辑和配对渠道，也可以使用 CLI。",
+      "configuredChannels": "已配置的渠道",
       "unknown": "未知",
-      "adapterConfig": "适配器配置",
-      "emptyTitle": "尚无已配置的频道。",
-      "emptyMsg": "频道的配置在设置和 CLI 中进行，以便凭据、依赖扩展、Webhook URL 和重启要求都保持明确。",
-      "openSettingsBtn": "打开设置",
-      "loadFailed": "加载频道失败",
-      "noInactive": "没有未激活的频道",
-      "disabledCount": "{n} 个已禁用",
-      "configuredButIdle": "已配置但空闲",
-      "hintDisabled": "已在配置中禁用——重新启用后需重启网关。运行 `opensquilla onboard configure channels` 进行更改。",
-      "hintDead": "适配器已停止。请检查网关日志，然后执行 `{cmd}`。",
-      "hintRunning": "适配器在当前网关进程中正常运行。",
-      "hintRestarting": "适配器在调度错误后正在重启。",
-      "hintExhausted": "适配器已耗尽重试预算。请尝试 `{cmd}`。",
-      "hintConfiguredInactive": "已在磁盘上配置，但在当前网关进程中未激活——请重启网关以加载它。"
+      "emptyTitle": "尚无已配置的渠道。",
+      "emptyMsg": "还没有渠道。接入 Slack、Telegram、Discord 等，让你的 agent 在团队聊天的地方工作。",
+      "loadFailed": "加载渠道失败",
+      "addChannel": "添加渠道",
+      "addFirstChannel": "添加第一个渠道",
+      "detailLabel": "{name} 的渠道详情",
+      "detailSections": "渠道详情分区",
+      "testConnection": "测试",
+      "testing": "测试中…",
+      "restart": "重启",
+      "edit": "编辑",
+      "enable": "启用",
+      "disable": "禁用",
+      "notReported": "未报告",
+      "tabs": {
+        "overview": "概览",
+        "pairings": "成员",
+        "capabilities": "功能",
+        "diagnostics": "诊断",
+        "configuration": "配置"
+      },
+      "editor": {
+        "editConfiguration": "编辑配置",
+        "edited": "已修改",
+        "unsavedAria": "有未保存的更改",
+        "unsavedSummary": "未保存 — {fields}",
+        "moreFields": "等 {count} 项",
+        "discardQuestion": "丢弃未保存的更改？",
+        "keepEditing": "继续编辑",
+        "discard": "丢弃",
+        "saving": "保存中…",
+        "saveAnyway": "仍要保存",
+        "saveFailed": "保存失败：{error}",
+        "probeValid": "配置校验通过",
+        "probeRunning": "正在检查草稿…",
+        "probeLatency": "{ms} 毫秒",
+        "storedSecret": "已存储 ······",
+        "otherSettings": "其他设置",
+        "unknownType": "该渠道类型（{type}）没有可用的编辑表单；请在配置文件中修改此条目。",
+        "entryMissing": "配置中找不到渠道 {name}。",
+        "editIntro": "更改在保存后生效。密钥留空则保留已存储的值。",
+        "boolOn": "开启",
+        "boolOff": "关闭"
+      },
+      "compose": {
+        "back": "渠道",
+        "galleryLabel": "选择平台",
+        "change": "更换",
+        "discardQuestion": "丢弃 {platform} 草稿？",
+        "catalogFailed": "无法加载平台目录：{error}",
+        "addPlatform": "添加 {platform}"
+      },
+      "probeVerified": "连接已验证",
+      "probeUnsupported": "无法进行在线探测",
+      "probeLatency": "提供商验证耗时 {ms} 毫秒。",
+      "probeNoDetail": "提供商未返回其他详情。",
+      "implemented": "已实现",
+      "declaredOnly": "仅声明",
+      "methodEvidence": "支撑方法：{methods}",
+      "liveVerified": "已通过真实提供商证据验证",
+      "declarationEvidence": "适配器已声明；等待真实环境验证",
+      "noCapabilityEvidence": "该适配器尚未发布功能证据。",
+      "lastError": "最近错误",
+      "acceptedIngress": "已接收入站",
+      "processingIngress": "正在处理的入站",
+      "confirmedOutbound": "已确认出站",
+      "savedConfiguration": "已保存的配置",
+      "secretRedactionHint": "已存储的密钥不会显示。点击“编辑”后使用“替换”输入新值。",
+      "toastProbePassed": "已在 {ms} 毫秒内验证 {name}",
+      "toastProbeUnsupported": "{name} 不支持安全的在线探测",
+      "toastProbeFailed": "无法测试 {name}：{error}",
+      "toastRestarted": "已重启 {name}",
+      "toastRestartFailed": "无法重启 {name}：{error}",
+      "toastEnabled": "已启用 {name}；请重启网关以应用更改",
+      "toastDisabled": "已禁用 {name}；请重启网关以应用更改",
+      "toastToggleFailed": "无法更新 {name}：{error}",
+      "pairings": {
+        "title": "成员",
+        "description": "审核谁可以通过此渠道发起对话。批准仅适用于当前渠道。",
+        "refresh": "刷新",
+        "summaryLabel": "成员摘要",
+        "pending": "待审核",
+        "approved": "已批准",
+        "loading": "正在加载成员…",
+        "tryAgain": "重试",
+        "emptyTitle": "还没有成员",
+        "emptyDescription": "新的申请和已批准的发送者将显示在这里。",
+        "pendingRequests": "待审核申请",
+        "approvedAccess": "已批准访问",
+        "requestCode": "申请编号 {code}",
+        "requestedAt": "申请于 {time}",
+        "approvedAt": "批准于 {time}",
+        "approve": "批准",
+        "approving": "正在批准…",
+        "revoke": "撤销",
+        "revoking": "正在撤销…",
+        "approveLabel": "批准 {sender} 的访问权限",
+        "revokeLabel": "撤销 {sender} 的访问权限",
+        "approveConfirmTitle": "批准配对申请？",
+        "approveConfirmBody": "授予 {sender} 访问 {channel} 的权限？机器人会通知对方可以开始对话了。",
+        "revokeConfirmTitle": "撤销配对访问权限？",
+        "revokeConfirmBody": "移除 {sender} 对 {channel} 的访问权限吗？对方再次发起对话前需要重新获得批准。",
+        "loadFailed": "无法加载配对访问权限：{error}",
+        "approveSuccess": "已批准 {sender} 的配对访问权限",
+        "revokeSuccess": "已撤销 {sender} 的配对访问权限",
+        "approveFailed": "无法批准 {sender}：{error}",
+        "revokeFailed": "无法撤销 {sender}：{error}",
+        "revoked": "已撤销",
+        "revokedAccess": "已撤销的访问",
+        "reapprove": "重新批准",
+        "reapproveLabel": "重新批准 {sender} 的访问",
+        "pendingBadge": "{count} 个待审批配对请求",
+        "searchLabel": "搜索配对",
+        "searchPlaceholder": "按名字或配对码搜索",
+        "adminPill": "管理员",
+        "setAsAdmin": "设为管理员",
+        "removeAdmin": "取消管理员",
+        "updatingAdmin": "更新中…",
+        "setAsAdminLabel": "将 {sender} 设为渠道管理员",
+        "removeAdminLabel": "取消 {sender} 的管理员身份",
+        "asAdmin": "设为管理员",
+        "asAdminHint": "以完整工具权限批准，而不仅是成员访问权限。",
+        "asAdminCheckboxLabel": "将 {sender} 批准为渠道管理员",
+        "adminsSubtitle": "管理员",
+        "adminOnlyHint": "直接添加的管理员",
+        "membersHint": "成员可以聊天并使用安全工具。管理员可使用完整工具集，执行特权操作时需逐条确认。",
+        "approveAdminSuccess": "已将 {sender} 批准为渠道管理员",
+        "adminGrantFailedAfterApprove": "已批准 {sender}，但管理员授权失败——请在成员列表中重试。",
+        "approveAdminConfirmBody": "授予 {sender} 对 {channel} 的管理员权限？他们将获得完整工具权限，机器人会通知他们可以开始聊天。",
+        "setAsAdminConfirmTitle": "将该成员设为管理员？",
+        "setAsAdminConfirmBody": "授予 {sender} 在 {channel} 上的完整工具权限？特权操作仍会逐条确认。",
+        "removeAdminConfirmTitle": "取消管理员权限？",
+        "removeAdminConfirmBody": "将 {sender} 恢复为 {channel} 的成员权限？他们仍可聊天并使用安全工具。",
+        "adminGrantedSuccess": "已将 {sender} 设为渠道管理员",
+        "adminRemovedSuccess": "已取消 {sender} 的管理员身份",
+        "adminUpdateFailed": "无法更新 {sender} 的管理员权限：{error}",
+        "asAdminBootstrap": "这是我本人 — 设为渠道管理员"
+      },
+      "probeFailed": "连接测试失败",
+      "editCredentials": "编辑凭证",
+      "toastProbeFailedResult": "{name} 连接测试失败：{detail}",
+      "restartNotLoaded": "该渠道尚未加载——请重启网关以启动它",
+      "removeChannel": "移除",
+      "queryNotFound": "未找到渠道 {name}——它可能已被移除。",
+      "queryNotFoundDismiss": "关闭",
+      "needsReview": "需确认",
+      "worksHint": "该渠道类型支持、需配置或无法完成的平台能力。",
+      "maturityHint": "该适配器相对平台完整 API 的完成度",
+      "supported": "支持",
+      "notSupported": "不支持",
+      "needsConfig": "需配置",
+      "messageDelivery": "消息投递",
+      "connectionOwner": "账号连接归属",
+      "owner": "归属",
+      "ownerHere": "本网关持有连接",
+      "ownerNone": "当前没有网关持有连接",
+      "lastTest": "最近测试",
+      "category": {
+        "chat": "聊天",
+        "files": "文件",
+        "media": "媒体",
+        "attachments": "附件",
+        "threads": "话题串",
+        "cards": "卡片",
+        "docs": "文档",
+        "drive": "云盘",
+        "wiki": "知识库",
+        "permissions": "权限",
+        "scopes": "授权范围"
+      },
+      "staleData": "状态可能已过期——最后更新于 {time}。",
+      "unconfiguredTitle": "运行中但不在配置里",
+      "unconfiguredHint": "这些渠道正在本网关进程中运行，但不在已保存的配置里。",
+      "maturityValue": {
+        "experimental": "实验性",
+        "stable": "稳定",
+        "shipping": "已发布",
+        "unrated": "未评级"
+      },
+      "opsActionsLabel": "运维动作",
+      "configActionHint": "写入配置——网关重启后生效",
+      "home": {
+        "connectedFor": "在线时长",
+        "membersFact": "成员",
+        "adminsFact": "管理员",
+        "pendingCount": "待批 {count}",
+        "details": "详情",
+        "pendingRequest": "{sender} 请求配对 · 配对码 {code}",
+        "reject": "拒绝",
+        "rejectLabel": "拒绝 {sender} 的配对请求",
+        "rejectSuccess": "已拒绝 {sender} 的配对请求",
+        "rejectFailed": "无法拒绝 {sender}：{error}",
+        "fixCredentials": "修复凭证",
+        "galleryLead": "选择一个平台开始",
+        "awaitingFact": "待处理",
+        "folio": {
+          "allConnected": "全部已连接",
+          "connectedRatio": "{ratio} 已连接",
+          "down": "{count} 个故障",
+          "updated": "更新于 {time}",
+          "rosterLabel": "已接入平台:{names}"
+        },
+        "enroll": {
+          "title": "接入一个平台",
+          "chip": "添加 {platform}"
+        }
+      },
+      "detail": {
+        "bot": "机器人 {id}",
+        "connectedFor": "在线时长 {duration}",
+        "restarts": "重启 {count} 次",
+        "capabilityReference": "能力参考",
+        "copyBotId": "复制 Bot ID：{id}",
+        "botIdCopied": "Bot ID 已复制",
+        "eventSubscriptionTitle": "检查飞书事件订阅"
+      }
+    },
+    "overview": {
+      "channelsChip": "渠道",
+      "channelsChipConnected": "{connected} 已连接",
+      "channelsChipFailed": "{failed} 失败",
+      "channelsChipPending": "{pending} 人待审批"
     }
   },
   "cronSkills": {
@@ -1260,7 +2026,33 @@
       "next12h": "未来 12 小时",
       "upcomingRun": "即将运行",
       "nowTick": "现在",
-      "deleteFailed": "删除失败：{error}"
+      "deleteFailed": "删除失败：{error}",
+      "bulkManage": "批量管理",
+      "exitBulk": "退出批量",
+      "overview": "运行概览",
+      "addFromTemplate": "从模板添加",
+      "addAutomation": "添加自动化",
+      "heroTitle": "开启你的第一个自动化任务吧",
+      "heroHint": "让 OpenSquilla 在指定时间自动完成提醒、整理、巡检和智能体任务。",
+      "overviewDesc": "查看自动化任务的启用状态和近期执行情况。",
+      "templateDesc": "选择场景后会自动填入执行时间和任务提示词。",
+      "selectedCount": "已选择 {count} 项",
+      "selectVisible": "全选当前",
+      "clearSelection": "清空",
+      "overviewEyebrow": "自动化概览",
+      "galleryEyebrow": "自动化模板库",
+      "bulkDeleteConfirm": "确定删除选中的 {count} 个自动化任务吗？此操作无法撤销。",
+      "templates": {
+        "ai-daily": { "title": "每日 AI 资讯简报", "description": "检索过去 24 小时的重要 AI 新闻，去重并生成带来源链接的简报。", "category": "资讯与情报", "schedule": "每天 08:00" },
+        "weekly-report": { "title": "每周工作复盘", "description": "汇总本周任务与交付，提炼进展、风险和下周优先事项。", "category": "效率办公", "schedule": "每周五 17:30" },
+        "english-five": { "title": "每天 5 个英语单词", "description": "结合例句与小测验，生成轻量、可坚持的英语学习卡片。", "category": "学习成长", "schedule": "每天 09:00" },
+        "project-risk": { "title": "项目风险巡检", "description": "检查延期事项、异常日志与待处理问题，输出风险等级和建议。", "category": "项目研发", "schedule": "工作日 10:00" },
+        "knowledge-review": { "title": "知识库周回顾", "description": "整理本周新增笔记与会议纪要，补充标签并生成待消化清单。", "category": "知识管理", "schedule": "每周日 18:00" },
+        "daily-idea": { "title": "每日灵感与冷知识", "description": "每天送上一条可靠、有出处的知识和一个可行动的小灵感。", "category": "轻松生活", "schedule": "每天 12:00" },
+        "bedtime-story": { "title": "每日儿童睡前故事", "description": "生成一篇温暖、有启发、适合亲子共读的短篇故事。", "category": "亲子陪伴", "schedule": "每天 20:30" },
+        "classic-movie": { "title": "经典电影推荐", "description": "每周推荐一部高质量经典电影，并附无剧透导读。", "category": "休闲娱乐", "schedule": "每周六 19:00" },
+        "today-in-history": { "title": "历史上的今天", "description": "从科技、文化与社会领域挑选一件可靠的历史事件。", "category": "每日知识", "schedule": "每天 08:30" }
+      }
     },
     "deleteDialog": {
       "title": "删除定时任务",
@@ -1303,7 +2095,8 @@
       "colSchedule": "计划",
       "colStatus": "状态",
       "colLastRun": "上次运行",
-      "colNextRun": "下次运行"
+      "colNextRun": "下次运行",
+      "selectJob": "选择 {name}"
     },
     "runHistory": {
       "eyebrow": "运行历史",
@@ -1358,9 +2151,9 @@
       "deliveryMode": "投递模式",
       "deliveryDefault": "默认（根据会话推断）",
       "deliveryNone": "无（静默运行）",
-      "deliveryAnnounce": "公告到频道",
+      "deliveryAnnounce": "公告到渠道",
       "deliveryWebhook": "发送到 webhook",
-      "channel": "频道",
+      "channel": "渠道",
       "recipient": "收件人",
       "accountId": "账户 id",
       "webhookUrl": "Webhook 地址",
@@ -1370,10 +2163,36 @@
       "failureDestination": "失败目标",
       "routeFailuresTo": "将失败路由至",
       "fdDisabled": "禁用（无单独的失败告警）",
-      "fdChannel": "一个频道",
+      "fdChannel": "一个渠道",
       "fdWebhook": "一个 webhook",
       "enabled": "已启用",
       "saveSchedule": "保存定时任务"
+      ,"friendlyNamePlaceholder": "例如：每天整理客户反馈"
+      ,"friendlyTypeCron": "按固定时间重复"
+      ,"friendlyTypeEvery": "每隔一段时间执行"
+      ,"friendlyTypeAt": "只在指定时间执行一次"
+      ,"executionFrequency": "执行频率"
+      ,"daily": "每天"
+      ,"weekdays": "每个工作日"
+      ,"weekly": "每周"
+      ,"monthly": "每月"
+      ,"customAdvancedTime": "自定义高级时间"
+      ,"weekday": "星期"
+      ,"date": "日期"
+      ,"monthlyDay": "每月 {day} 日"
+      ,"specificTime": "具体时间"
+      ,"customTimeHint": "可输入更灵活的时间规则。"
+      ,"openAdvancedTime": "打开高级时间设置"
+      ,"everyHowOften": "每隔多久执行"
+      ,"timeUnit": "时间单位"
+      ,"minutes": "分钟"
+      ,"hours": "小时"
+      ,"days": "天"
+      ,"dateAndTime": "执行日期和时间"
+      ,"friendlyMessagePlaceholder": "例如：整理今天收到的客户反馈，归纳主要问题并给出处理建议"
+      ,"moreRuntimeSettings": "更多运行设置（可选）"
+      ,"advancedTimeHint": "仅在上面的时间选择无法满足需求时使用。"
+      ,"timezoneSimpleHint": "通常无需修改。"
     },
     "form": {
       "cronPreviewPlaceholder": "输入 5 字段的 cron 表达式以预览",
@@ -1433,7 +2252,7 @@
     "delivery": {
       "errWebhookUrlRequired": "webhook 投递需要 Webhook URL",
       "errFdWebhookUrlRequired": "失败目标的 webhook URL 为必填项",
-      "errFdChannelNeedsTarget": "失败目标频道需要一个频道或收件人"
+      "errFdChannelNeedsTarget": "失败目标渠道需要一个渠道或收件人"
     },
     "explain": {
       "everyMinute": "每分钟",
@@ -1492,6 +2311,17 @@
       "subtitle": "可组合的智能体能力：内置的 OpenSquilla 技能，以及本地的托管、个人、项目和工作区技能包。",
       "filterPlaceholder": "筛选技能...",
       "refresh": "刷新",
+      "reload": "重新加载目录",
+      "refreshing": "正在重新加载目录…",
+      "reloadSummary": "新增 {added} 个，移除 {removed} 个，修改 {modified} 个。",
+      "reloadSuccess": "技能目录已重新加载为第 {generation} 代。{summary}",
+      "reloadNoChanges": "技能目录已是最新版本（第 {generation} 代）。",
+      "reloadPartial": "技能目录已重新加载为第 {generation} 代，但有 {errors} 个错误。{summary}",
+      "reloadFailed": "技能目录重新加载失败：{error}",
+      "overviewTitle": "技能概览",
+      "overviewDesc": "查看技能的安装与配置状态，点击分类可筛选技能。",
+      "reloadListFailed": "目录已重新加载，但无法获取刷新后的技能列表。",
+      "reloadUnknownError": "Gateway 已保留上一个可用目录。",
       "tabsLabel": "技能来源",
       "tabInstalled": "已安装",
       "tabCommunity": "社区",
@@ -1568,9 +2398,19 @@
       "noAudit": "未记录自动启用决定。",
       "gates": "门控"
     },
+    "tile": {
+      "installed": "已安装",
+      "add": "下载"
+    },
     "skillCard": {
       "subSkillsTitle": "此元技能使用的子技能",
-      "uses": "使用"
+      "uses": "使用",
+      "dependencies": "已声明依赖",
+      "pythonCount": "Python 包：{count}",
+      "binaryCount": "二进制依赖：{count}",
+      "envCount": "环境变量：{count}",
+      "missingCount": "缺失依赖：{count}",
+      "advisoryCount": "提示项：{count}"
     },
     "skillDetail": {
       "triggers": "触发条件",
@@ -1585,7 +2425,26 @@
       "loadingContent": "正在加载 SKILL.md...",
       "emptyContent": "没有可用的 SKILL.md 内容。",
       "removing": "移除中...",
-      "remove": "移除"
+      "remove": "移除",
+      "declaredDependencies": "已声明依赖",
+      "pythonPackages": "Python 包",
+      "binaries": "二进制依赖",
+      "environment": "环境变量",
+      "pythonPackage": "Python 包",
+      "binaryAny": "任一二进制依赖",
+      "envAny": "任一环境变量",
+      "noDeclaredDependencies": "未声明依赖。",
+      "advisories": "提示项",
+      "notReadiness": "推断项仅供参考，不参与就绪状态判断。",
+      "inferredPython": "根据 {source} 推断",
+      "inferredEnv": "推断的环境变量",
+      "scanAdvisory": "依赖扫描提示",
+      "subSkillRollup": "元技能依赖汇总",
+      "subSkillStatus": "缺失 {missing} 项 · 提示 {advisory} 项",
+      "missingSubSkill": "引用的子技能不可用",
+      "installUnavailable": "没有与当前缺失依赖匹配的安装方式。",
+      "installIncomplete": "仍有 {count} 项依赖需要处理。",
+      "installComplete": "依赖已就绪。"
     },
     "registry": {
       "searchPlaceholder": "搜索社区技能...",
@@ -1653,10 +2512,44 @@
       "awaitingReview": "等待审阅"
     }
   },
+  "monitorSupport": {
+    "title": "支持与诊断",
+    "menuLabel": "支持与诊断操作",
+    "viewLogs": "查看运行日志",
+    "viewLogsDescription": "查看近期网关输出与错误",
+    "copyReport": "复制当前就绪报告",
+    "copyReportDescription": "用于快速排查当前连接、配置与运行状态",
+    "copySuccess": "当前就绪报告已复制",
+    "copyFailed": "复制就绪报告失败：{error}",
+    "downloadBundle": "下载脱敏支持包",
+    "downloadBundleDescription": "包含日志、配置摘要与诊断结果，可提交给支持人员",
+    "privacySummary": "默认不包含会话正文，已知凭据字段会脱敏",
+    "bundleTitle": "下载脱敏支持包",
+    "bundleSubtitle": "创建可与 OpenSquilla 支持人员分享的 ZIP 文件。",
+    "bundleDefaultIncludes": "默认包含",
+    "bundleReadiness": "就绪与诊断快照",
+    "bundleConfig": "脱敏后的配置摘要",
+    "bundleLogs": "错误、日志与 trace 信息",
+    "bundlePlatform": "版本与平台信息",
+    "bundleScopeTitle": "近期诊断记录（最多 1 天）",
+    "bundleScopeBody": "错误与追踪记录最多包含 1 天；运行日志按本地轮转收集，实际覆盖时间可能不同。",
+    "bundleIncludeContentTitle": "包含会话正文",
+    "bundleIncludeContentBody": "仅在支持人员明确要求时开启；可能含有敏感业务信息。",
+    "bundleCredentialsTitle": "已知凭据字段会脱敏",
+    "bundleCredentialsBody": "API 密钥、令牌和其他已识别的密钥值会在打包前脱敏。",
+    "bundleConfirm": "生成并下载",
+    "bundleCancel": "取消",
+    "bundleFailed": "支持包下载失败",
+    "bundleReady": "支持包已下载"
+  },
   "usageLogs": {
+    "tasks": {
+      "unnamed": "未命名任务"
+    },
     "usage": {
       "title": "用量",
-      "subtitle": "所有会话的 Token、成本与各模型花费。",
+      "subtitle": "各任务的 Token、成本与模型用量。",
+      "actions": "用量操作",
       "currency": "货币",
       "usDollar": "美元",
       "chineseYuan": "人民币",
@@ -1668,9 +2561,9 @@
     "summary": {
       "totalTokens": "Token 总数",
       "totalCost": "总成本",
-      "sessions": "会话",
+      "sessions": "任务",
       "acrossAllModels": "跨所有模型",
-      "avgCostPerSession": "每会话平均成本",
+      "avgCostPerSession": "每任务平均成本",
       "runningAverage": "滚动平均"
     },
     "tokenParts": {
@@ -1680,7 +2573,20 @@
       "cacheWrite": "缓存写"
     },
     "costHintTitle": "人民币金额使用内置汇率 {rate}。用于记账时请核对当前汇率。",
-    "rangeHiddenHint": "已隐藏 {count} 个无日期的旧会话",
+    "nativeCostHintTitle": "原始服务商账单为人民币；美元金额按收据所载固定归一化汇率折算。",
+    "nativeMixedCostHintTitle": "混合币种或待结算账单继续使用规范化美元汇总，并单独展示已确认的原生币种收据。",
+    "nativeBillingSubtotals": "原始账单小计：{amounts}",
+    "rangeHiddenHint": "已隐藏 {count} 条无日期的历史任务记录",
+    "coverage": {
+      "approximate": "部分历史用量按任务累计值估算。",
+      "partial": "当前显示已记录的全部用量。",
+      "timezoneFallback": "时区 {requested} 无效；日期当前按 {effective} 分组。",
+      "legacyIncluded": "账本启用前的用量已计入总数，但无法归入具体日期。",
+      "estimated": "包含 {count} 次估算调用。",
+      "unpriced": "当前显示已知成本；另有 {count} 次调用缺少价格，成本不完整。",
+      "pendingBilling": "{count} 张服务商账单收据仍待结算。",
+      "nativeBillingMissing": "{count} 次已计费调用缺少原生币种收据。"
+    },
     "chart": {
       "metric": "图表指标",
       "dateRange": "日期范围",
@@ -1691,9 +2597,10 @@
       "input": "输入",
       "output": "输出",
       "emptyWindow": "所选时间窗内无数据。",
-      "openSession": "打开 {session}",
-      "topByCost": "按成本排名靠前的会话",
-      "topByTokens": "按 Token 总数排名靠前的会话",
+      "openTask": "打开任务“{task}”",
+      "daily": "每日用量",
+      "topByCost": "按成本排名靠前的任务",
+      "topByTokens": "按 Token 总数排名靠前的任务",
       "showingOf": "显示 {total} 中的 {shown}"
     },
     "models": {
@@ -1708,19 +2615,19 @@
       "output": "输出",
       "cacheRead": "缓存读",
       "cacheWrite": "缓存写",
-      "sessions": "会话",
+      "sessions": "任务",
       "cost": "成本"
     },
     "sessions": {
-      "title": "会话",
-      "count": "{count} 个会话",
+      "title": "按任务",
+      "count": "{count} 个任务",
       "emptyTitle": "暂无用量数据",
-      "emptyText": "运行一个会话后，Token 花费会自动显示在这里。",
-      "openChat": "打开 {session} 的对话",
+      "emptyText": "运行任务后，Token 用量会自动显示在这里。",
+      "openChat": "打开任务“{task}”",
       "autoModels": "自动 · {count} 个模型"
     },
     "columns": {
-      "session": "会话",
+      "session": "任务",
       "modified": "修改时间",
       "input": "输入",
       "output": "输出",
@@ -1780,7 +2687,7 @@
       "loadFailed": "加载用量失败"
     },
     "logs": {
-      "eyebrow": "控制 · 日志",
+      "breadcrumbLabel": "页面路径",
       "title": "日志",
       "subtitle": "实时网关日志流 — 过滤并跟随。",
       "statusUnavailable": "日志状态不可用",
@@ -1817,6 +2724,9 @@
       "filterPlaceholder": "过滤消息…",
       "autoFollow": "自动跟随",
       "loading": "正在加载日志…",
+      "empty": "暂无运行日志。",
+      "loadFailed": "运行日志加载失败。",
+      "retry": "重试",
       "noMatch": "没有符合当前过滤条件的日志行。",
       "lineDetail": "日志行详情",
       "ofLoadedFoot": "当前显示 {visible} 条 · 已缓冲 {total} 条"
@@ -1833,6 +2743,8 @@
     "placeholder": "发送消息……",
     "placeholderCompact": "消息……",
     "placeholderLanding": "分配任务或提出任何问题",
+    "aiDisclaimer": "内容由 AI 生成，仅供参考，请核实重要信息。",
+    "aiGeneratedLabel": "内容由 AI 生成，仅供参考。",
     "removeAttachment": "移除附件",
     "remove": "移除",
     "attachFiles": "添加文件",
@@ -1858,12 +2770,21 @@
     "historyTurnLoadedCount": "已加载记录中的第 {number} 条，共 {total} 条",
     "historyAttachmentOnly": "仅包含附件的消息",
     "historyAttachmentCount": "附件：{count}",
+    "loadingSession": "正在加载会话…",
+    "loadingSessionDescription": "正在恢复最近消息和会话状态…",
+    "loadSessionFailed": "暂时无法加载会话",
+    "loadSessionDescription": "连接可能中断，或历史服务暂时不可用。请重新加载。",
+    "reloadSession": "重新加载",
+    "retryingSession": "正在重新加载",
+    "retryingSessionDescription": "正在恢复会话历史…",
+    "retryingSessionAction": "重新加载中…",
     "noMessagesYet": "暂无消息。",
-    "newChat": "新建聊天",
+    "newChat": "新建任务",
     "chatWithSuffix": "聊天 {suffix}",
     "copied": "已复制",
     "copy": "复制",
     "copySessionKey": "复制会话密钥",
+    "sessionActions": "会话操作",
     "share": "分享",
     "shareSendFirst": "先发送一条消息才能分享",
     "shareSelectHint": "选择气泡以保存为分享图片",
@@ -1894,6 +2815,12 @@
     "open": "打开",
     "downloadTitle": "下载 {title}",
     "download": "下载",
+    "playAudio": "播放音频",
+    "audioLoadFailed": "无法加载音频。",
+    "audioUnsupported": "此浏览器无法播放这种音频格式，请改为下载文件。",
+    "playVideo": "播放视频",
+    "videoLoadFailed": "无法加载视频。",
+    "videoUnsupported": "此浏览器无法播放这种视频格式，请改为下载文件。",
     "previewOf": "预览：{title}",
     "closePreview": "关闭预览",
     "previousImage": "上一张图片",
@@ -1918,6 +2845,7 @@
     "latest": "最新",
     "thinking": "思考中",
     "thoughtProcess": "思考过程",
+    "thinkingForSeconds": "思考中 · {seconds} 秒",
     "thoughtForSeconds": "思考了 {seconds} 秒",
     "thoughtForMinutes": "思考了 {minutes} 分 {seconds} 秒",
     "toolResult": "工具结果",
@@ -1927,6 +2855,27 @@
     "sandboxPausedResume": "恢复执行",
     "sandboxResumed": "已恢复自动执行。请重新发送你的请求以继续。",
     "sandboxResumeFailed": "无法恢复执行:{error}",
+    "warning": {
+      "default": "智能体报告了一条警告。"
+    },
+    "provenance": {
+      "cron": "定时",
+      "scheduled": "定时任务",
+      "cronSource": "由 {tool} 定时触发"
+    },
+    "sandboxSetup": {
+      "settingUp": "正在设置…",
+      "settingUpTitle": "正在设置 Windows 沙盒",
+      "failedTitle": "Windows 沙盒设置失败",
+      "unavailableTitle": "沙盒设置不可用",
+      "requiredTitle": "需要设置 Windows 沙盒",
+      "settingUpBody": "OpenSquilla 正在准备隔离环境，请稍候。",
+      "failedBody": "无法准备隔离环境，请重试。",
+      "unavailableBody": "当前系统无法设置沙盒，执行模式未发生变化。",
+      "requiredBody": "使用此执行模式前，请先设置 Windows 沙盒。",
+      "retry": "重试",
+      "setup": "设置"
+    },
     "usageDetails": "用量详情",
     "regenerate": "重新生成",
     "forkConversation": "复刻对话",
@@ -1936,14 +2885,15 @@
     "aiModelRouter": "AI 模型路由",
     "aiModelEnsembleRouter": "AI 模型聚合路由",
     "routerFx": {
+      "selectedModel": "路由已选择 {model}",
       "ensembleSelecting": "AI 模型聚合路由 · 正在选择候选",
       "ensembleHandedOff": "AI 模型聚合路由 · 已交给 Agent",
       "ensembleRunning": "AI 模型聚合路由 · {count} 个候选正在合成",
       "ensembleDone": "{count} 个候选已合成",
       "ensembleMode": "聚合",
-      "ensembleViewTrace": "查看 trace",
-      "ensembleToggleTrace": "查看聚合路由 trace",
-      "ensembleTraceTitle": "候选 trace",
+      "ensembleViewTrace": "查看",
+      "ensembleToggleTrace": "查看聚合路由详情",
+      "ensembleTraceTitle": "候选详情",
       "ensemblePlanMeta": "聚合档案 · 候选池 {count}",
       "ensembleTelemetryPendingMeta": "聚合档案 · telemetry 待更新",
       "ensembleFallbackNone": "未使用降级",
@@ -1953,12 +2903,65 @@
       "ensembleTokens": "{count} 令牌",
       "ensembleUsed": "已使用",
       "ensembleFailed": "失败",
-      "ensembleTracePending": "trace 待更新",
-      "ensembleTraceUnavailable": "运行完成后可查看 trace",
+      "ensembleQuorumSkipped": "阈值已满足 · 已跳过",
+      "ensembleQuorumSkippedDetail": "候选阈值已满足，因此取消等待该候选。",
+      "ensembleTracePending": "详情待更新",
+      "ensembleTraceUnavailable": "运行完成后可查看详情",
       "ensembleDetailUnavailable": "{count} 个候选 · 明细不可用"
     },
     "sources": "来源",
+    "activityLabel": "活动",
     "activitySteps": "活动 · {count} 步",
+    "activityItems": "活动 · {count} 项",
+    "activityCompletedItems": "已完成 · {count} 项",
+    "activityFailures": "{count} 项失败",
+    "activityFailuresRecovered": "{count} 项失败已恢复",
+    "activityWorking": "正在工作",
+    "workedForSeconds": "工作了 {seconds} 秒",
+    "workedForMinutes": "工作了 {minutes} 分 {seconds} 秒",
+    "activity": {
+      "lifecycle": {
+        "working": "正在工作",
+        "answering": "正在组织回答",
+        "settled": "已完成",
+        "interrupted": "已中断",
+        "failed": "已失败"
+      },
+      "purpose": {
+        "discover": "发现链接",
+        "search": "搜索网页",
+        "read": "读取网页",
+        "inspect": "检查文件",
+        "change": "编辑文件",
+        "run": "运行命令",
+        "create": "创建产物",
+        "recall": "检索记忆",
+        "use": "使用工具"
+      },
+      "purposeRunning": {
+        "discover": "正在发现链接",
+        "search": "正在搜索网页",
+        "read": "正在读取网页",
+        "inspect": "正在检查文件",
+        "change": "正在编辑文件",
+        "run": "正在运行命令",
+        "create": "正在创建产物",
+        "recall": "正在检索记忆",
+        "use": "正在使用工具"
+      },
+      "footprint": {
+        "web": "{count} 次网页操作",
+        "files": "{count} 个文件",
+        "fileOperations": "{count} 次文件操作",
+        "commands": "{count} 条命令",
+        "artifacts": "{count} 个产物",
+        "memory": "{count} 次记忆检索",
+        "tools": "{count} 次工具调用"
+      },
+      "more": "另有 {count} 项",
+      "stale": "仍在工作 —— 暂无新信号",
+      "liveStep": "第 {n} 步"
+    },
     "suggestedTasks": "推荐任务",
     "greetingMorning": "早上好。",
     "greetingAfternoon": "下午好。",
@@ -1966,6 +2969,9 @@
     "identityReady": "{label} · 就绪",
     "loadEarlier": "加载更早的消息",
     "loadingEllipsis": "加载中……",
+    "loadingEarlier": "正在加载更早的消息…",
+    "loadEarlierFailedRetry": "更早的消息加载失败 · 重试",
+    "legacyHistoryUnavailable": "更早的原始消息未被旧版本保存",
     "scopeCompacted": "较早的内容已用会话摘要表示。",
     "scopeLatestWindow": "正在显示最新的消息窗口。",
     "status": {
@@ -2000,7 +3006,11 @@
       "expiresIn": "{time} 后过期",
       "outcomeExpired": "已过期 — 未运行",
       "outcomeDenied": "已拒绝",
-      "outcomeApproved": "已批准 · 已恢复运行"
+      "outcomeApproved": "已批准 · 已恢复运行",
+      "target": "目标",
+      "access": "访问权限",
+      "workspace": "工作区",
+      "outcomeUnavailable": "该审批已不可用"
     },
     "clarify": {
       "needsInput": "智能体需要输入",
@@ -2025,6 +3035,8 @@
       "routerAnimationOn": "路由动画已开启",
       "routerAnimationOff": "路由动画已关闭",
       "modelRouting": "模型路由",
+      "ensembleImageUnsupported": "Ensemble 暂不支持图片输入，请切换到单模型路由后重试。",
+      "routingUpdateImageBlocked": "模型路由正在更新，请稍候再发送图片。",
       "modelRoutingOff": "关",
       "modelRoutingOffDesc": "每轮都发送到当前选定模型。",
       "modelRoutingSquillaRouter": "AI 智能单模型路由",
@@ -2047,6 +3059,10 @@
       "steerHint": "引导模式：新发送会立即打断回复；这些排队消息仍会在本轮结束后自动发送",
       "queueHint": "排队模式：这些消息会在当前回复结束后按顺序自动发送",
       "clearAll": "全部清除",
+      "editMessage": "编辑消息",
+      "attachmentNeedsAttention": "附件需处理",
+      "fixAttachmentBeforeSteer": "请先编辑这条消息，重试或移除失败的附件，再执行插队",
+      "clearQueue": "清空队列",
       "removeMessage": "移除待发送消息 {index}"
     },
     "metaRuns": {
@@ -2097,7 +3113,9 @@
       "results": "{count} 条结果",
       "countRunning": "{count} 项运行中",
       "countDone": "{count} 项完成",
-      "countFailed": "{count} 项失败"
+      "countFailed": "{count} 项失败",
+      "collapseAll": "全部折叠",
+      "expandAll": "全部展开"
     },
     "chips": {
       "whatCanYouDo": "你能做什么？",
@@ -2106,27 +3124,52 @@
       "searchAiNews": "搜索今天的 AI 新闻",
       "generateImage": "生成一个小鱿鱼吉祥物的图片"
     },
+    "metaQuick": {
+      "webpage": "制作多媒体网页",
+      "shortDrama": "生成 AI 短剧",
+      "paperWriting": "撰写学术论文",
+      "webpageDesc": "生成可直接使用的完整网站",
+      "shortDramaDesc": "完成脚本、分镜与成片",
+      "paperWritingDesc": "完成研究、起草与论文编译"
+    },
+    "metaDescriptions": {
+      "webpage": "根据主题制作完整的多媒体网站。",
+      "kidsProject": "为儿童规划安全、适龄的创意项目。",
+      "shortDrama": "从脚本到成片生成 AI 短剧。",
+      "skillCreator": "将现有技能组合成可复用的工作流。",
+      "paperWriting": "完成学术论文的研究、起草与编译。"
+    },
     "toast": {
       "downloadFailedHttp": "下载失败 — HTTP {status}",
       "downloadFailed": "下载失败",
       "forkFailed": "复刻失败",
       "copyFailed": "复制失败",
-      "shareExportFailed": "分享导出失败",
+      "shareSaveFailed": "无法保存图片，请重试。",
+      "sharePreviewUpdateFailed": "无法更新预览，请重试。",
       "saved": "已保存 {filename}",
       "copiedToClipboard": "已复制到剪贴板",
       "copyNotSupported": "不支持复制 — 请改为下载",
       "unsupportedFile": "不支持的文件：{name}（{mime}）",
-      "fileTooLarge": "文件过大：{name}",
+      "fileTooLarge": "文件过大：{name}（上限 {cap}）",
+      "emptyFile": "空文件：{name}",
+      "tooManyAttachments": "附件过多：最多 {max} 个",
+      "attachmentsTotalTooLarge": "附件总量过大：加入 {name} 将超过 {max} 上限",
       "couldNotReadFile": "无法读取文件：{name}",
       "uploadFailed": "{name} 上传失败",
       "voiceUnsupported": "此浏览器不支持语音输入",
       "voiceUnavailable": "语音输入不可用，请在设置中启用。",
       "voiceTranscribeFailed": "无法转写你的录音，请重试。",
       "voiceSetupNeeded": "语音识别需要配置 ElevenLabs API key —— 正在打开设置……",
+      "voiceCancelledHidden": "窗口隐藏时已停止录音。重新开始即可继续口述。",
+      "voiceMicDenied": "麦克风访问被拒绝，请在浏览器设置中允许。",
+      "voiceMicDeniedDesktop": "麦克风访问被拒绝。请在系统设置中允许后重试。",
+      "voiceMicMissing": "未找到麦克风。",
+      "voiceRecordFailed": "无法开始录音，请重试。",
       "waitAttachments": "请等待文件附件处理完成",
       "waitCompactionBeforeCommand": "请等待上下文压缩完成后再运行 {command}。",
       "waitResponseBeforeCommand": "请等待当前回复结束后再运行 {command}。",
       "queueFull": "队列已满 — 请等待当前回复结束。",
+      "messageStillSaving": "这条消息尚未保存完成 — 请稍后再试。",
       "artifactOpenFailed": "产物打开失败。请改为下载。"
     },
     "stream": {
@@ -2137,8 +3180,7 @@
       "preparingOutput": "准备输出",
       "generatingCandidates": "正在生成候选",
       "synthesizingCandidates": "正在聚合候选",
-      "stillWaiting": "仍在等待模型",
-      "stillWorking": "仍在处理 — 上次信号 {seconds} 秒前"
+      "stillWaiting": "仍在等待模型"
     },
     "stall": {
       "title": "回复耗时超出预期",
@@ -2175,17 +3217,19 @@
     "cmdp": {
       "dialogLabel": "搜索并跳转",
       "resultsLabel": "结果",
-      "placeholder": "搜索页面、操作和会话…",
+      "placeholder": "搜索任务",
+      "groupRecents": "最近任务",
+      "recentsEmpty": "还没有任务",
       "noMatches": "无匹配项",
-      "searching": "正在搜索会话…",
-      "untitledChat": "未命名会话",
+      "searching": "正在搜索任务…",
+      "untitledChat": "未命名任务",
       "groupWork": "工作",
       "groupManage": "管理",
-      "groupMonitor": "监控",
+      "groupMonitor": "概览",
       "groupActions": "操作",
-      "groupConversations": "会话",
+      "groupConversations": "任务",
       "groupMessages": "消息",
-      "actionNewChat": "新建会话",
+      "actionNewChat": "新建任务",
       "actionOpenSettings": "打开设置",
       "actionToggleTheme": "切换主题",
       "actionBgmEnable": "开启背景音乐",
@@ -2195,20 +3239,20 @@
       "dismiss": "关闭通知"
     },
     "confirm": {
-      "defaultPrimary": "确认"
+      "defaultPrimary": "确定"
     },
     "errorState": {
       "retry": "重试"
     },
     "sidebar": {
-      "recentConversations": "最近会话",
+      "recentConversations": "最近任务",
       "recents": "最近",
-      "refresh": "刷新会话",
+      "refresh": "重新加载任务",
       "clearAgentFilter": "清除智能体筛选：{name}",
-      "loadError": "无法加载会话",
+      "loadError": "无法加载任务",
       "noMatches": "无匹配项",
-      "noConversations": "暂无会话。",
-      "startChat": "开始会话",
+      "noConversations": "暂无任务。",
+      "startChat": "开始任务",
       "linkSessions": "会话",
       "linkOverview": "概览",
       "renameLabel": "重命名 {title}",
@@ -2230,6 +3274,7 @@
       "selectedCountLabel": "已选择 {count} 个",
       "enterSelectionMode": "批量管理会话",
       "exitSelectionMode": "退出选择",
+      "selectionDone": "完成",
       "selectSession": "选择 {title}",
       "deleteSelectedAria": "删除已选 {count} 个会话",
       "bulkDeleteTitle": "删除已选会话",
@@ -2247,14 +3292,6 @@
       "hint": "网关尚未就绪，无法运行。",
       "finishSetup": "完成设置",
       "viewReadiness": "查看就绪状态"
-    },
-    "legacyDataBanner": {
-      "ariaLabel": "发现另一套 OpenSquilla 数据",
-      "title": "发现另一套 OpenSquilla 数据",
-      "dismiss": "暂不处理",
-      "dismissNotice": "关闭数据转移提示",
-      "hintWeb": "当前数据已在正常使用，无需处理。只有要用另一套安装替换当前数据时，才停止网关并运行：",
-      "copyCommand": "复制数据转移命令"
     },
     "shortcuts": {
       "toggleSidebar": {
@@ -2290,7 +3327,49 @@
       "sectionDiagnostics": "诊断",
       "sectionResult": "结果",
       "sectionError": "错误",
-      "viewFull": "查看完整内容"
+      "viewFull": "查看完整内容",
+      "activityViewDetails": "查看详情",
+      "activityDetailsTitle": "详情",
+      "activityBytesWritten": "已写入 {size}",
+      "activityContentSize": "{lines} 行 · {characters} 个字符",
+      "activityExitCode": "退出码 {code}",
+      "activityNotCompleted": "未通过",
+      "activityPublished": "已发布"
+    }
+  },
+  "channelStatus": {
+    "connected": "已连接",
+    "pendingRestart": "待重启",
+    "notRunning": "未运行",
+    "disabled": "已停用",
+    "restarting": "重启中",
+    "failed": "失败",
+    "exhausted": "重试耗尽",
+    "unknown": "未知（{raw}）",
+    "hint": {
+      "pendingRestart": "网关重启后生效",
+      "notRunning": "网关重启后启动",
+      "restarting": "正在自动重连",
+      "failed": "自动重启已耗尽——请重启或编辑此渠道",
+      "exhausted": "投递重试次数已用完——请检查最近错误后重启"
+    },
+    "cause": {
+      "auth_invalid": "凭证被拒",
+      "payload_rejected": "消息被平台拒绝",
+      "target_missing": "目标会话或频道不存在",
+      "contract_violation": "适配器契约违规",
+      "transport_transient": "网络问题——自动重试中",
+      "rate_limited": "被平台限流",
+      "channel_degraded": "渠道已降级",
+      "startup_failed": "启动失败——请检查凭证与配置"
+    },
+    "banner": {
+      "label": "等待网关重启",
+      "message": "{count} 项已保存的渠道变更将在网关重启后生效",
+      "dismiss": "清除 {name} 的待重启标记",
+      "copied": "命令已复制",
+      "copyFailed": "无法复制命令",
+      "copyLabel": "复制网关重启命令"
     }
   }
 }

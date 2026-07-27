@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import io
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from pptx import Presentation
 
 from opensquilla.artifacts import ArtifactStore
 
@@ -105,6 +108,67 @@ def test_artifact_download_serves_file_response_headers_and_ranges(tmp_path: Pat
     assert "report%20final.txt" in response.headers["content-disposition"]
     assert ranged.status_code == 206
     assert ranged.content == b"hello"
+
+
+def test_artifact_download_preserves_valid_pptx_bytes(tmp_path: Path) -> None:
+    pytest.importorskip("starlette.testclient")
+    from starlette.testclient import TestClient
+
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[5])
+    assert slide.shapes.title is not None
+    slide.shapes.title.text = "下载后仍可读取"
+    output = io.BytesIO()
+    presentation.save(output)
+    payload = output.getvalue()
+    ref = _publish(
+        tmp_path,
+        payload=payload,
+        name="课程总结.pptx",
+        mime=(
+            "application/vnd.openxmlformats-officedocument."
+            "presentationml.presentation"
+        ),
+    )
+
+    with TestClient(_app(tmp_path)) as client:
+        response = client.get(
+            f"/api/v1/artifacts/{ref.id}?sessionKey=agent:main:webchat:ok",
+            headers={"Authorization": "Bearer secret"},
+        )
+
+    assert response.status_code == 200
+    assert response.content == payload
+    assert ref.sha256 == hashlib.sha256(response.content).hexdigest()
+    assert response.headers["content-type"].startswith(ref.mime)
+    assert "%E8%AF%BE%E7%A8%8B%E6%80%BB%E7%BB%93.pptx" in response.headers[
+        "content-disposition"
+    ]
+    downloaded = Presentation(io.BytesIO(response.content))
+    assert downloaded.slides[0].shapes.title is not None
+    assert downloaded.slides[0].shapes.title.text == "下载后仍可读取"
+
+
+def test_artifact_download_keeps_historical_invalid_pptx_available(tmp_path: Path) -> None:
+    pytest.importorskip("starlette.testclient")
+    from starlette.testclient import TestClient
+
+    legacy_payload = b"historically stored bytes that are not OOXML"
+    ref = _publish(
+        tmp_path,
+        payload=legacy_payload,
+        name="legacy.pptx",
+        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    )
+
+    with TestClient(_app(tmp_path)) as client:
+        response = client.get(
+            f"/api/v1/artifacts/{ref.id}?sessionKey=agent:main:webchat:ok",
+            headers={"Authorization": "Bearer secret"},
+        )
+
+    assert response.status_code == 200
+    assert response.content == legacy_payload
 
 
 def test_artifact_download_reports_not_found_and_integrity_errors(tmp_path: Path) -> None:

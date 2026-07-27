@@ -1,4 +1,4 @@
-// Renderer-level regressions for transient reasoning and intermediate rails.
+// Renderer-level regressions for retained reasoning and intermediate rails.
 //
 // Must run under bun: @opentui/core/testing needs bun FFI.
 import { test, expect } from "bun:test";
@@ -46,7 +46,7 @@ function visibleLines(text) {
   return text.split("\n").filter((line) => line.trim());
 }
 
-test("reasoning marker is transient and disappears when the block ends", async () => {
+test("the active reasoning marker settles into a completed Thought record", async () => {
   const { renderer, renderOnce, captureSpans, turn } = await createTurnHarness();
   try {
     turn.begin("r1", "reasoning", {});
@@ -64,6 +64,7 @@ test("reasoning marker is transient and disappears when the block ends", async (
 
     const text = flatText(captureSpans());
     expect(text).not.toContain("Thinking");
+    expect(text).toContain("Thought for");
     expect(text).toContain("web_search");
   } finally {
     renderer.destroy?.();
@@ -102,7 +103,7 @@ test("intermediate narration keeps the timeline rail on every rendered line", as
   }
 });
 
-async function mountThinking({ width, height = 14 }) {
+async function mountThinking({ width, height = 14, contentWidth } = {}) {
   const setup = await createTestRenderer({ width, height });
   const { renderer } = setup;
   const box = new BoxRenderable(renderer, {
@@ -115,7 +116,7 @@ async function mountThinking({ width, height = 14 }) {
     flexDirection: "column",
   });
   renderer.root.add(box);
-  const block = createThinkingBlock({ renderer, TextRenderable, box, idPrefix: "blk" });
+  const block = createThinkingBlock({ renderer, TextRenderable, box, idPrefix: "blk", contentWidth });
   return { ...setup, block };
 }
 
@@ -138,6 +139,99 @@ test("long narration soft-wraps into continuation rows with no content loss", as
     for (const row of rows.slice(1)) {
       expect(row.startsWith("   ")).toBe(true);
     }
+  } finally {
+    renderer.destroy?.();
+  }
+});
+
+test("narration wraps to the transcript content width instead of rendering beneath a side rail", async () => {
+  const { renderer, renderOnce, captureSpans, block } = await mountThinking({
+    width: 100,
+    contentWidth: () => 38,
+  });
+  try {
+    block.append("alpha bravo charlie delta echo foxtrot golf hotel india juliett");
+    await renderOnce();
+    // This fits on one 100-column terminal row, but not in the 38-column
+    // transcript remaining beside the wide context rail.
+    expect(visibleLines(flatText(captureSpans())).length).toBeGreaterThan(1);
+  } finally {
+    renderer.destroy?.();
+  }
+});
+
+test("completed long narration keeps a preview and deterministically expands every late delta", async () => {
+  const { renderer, renderOnce, captureSpans, block } = await mountThinking({
+    width: 70,
+    height: 24,
+  });
+  const initial = Array.from({ length: 10 }, (_, i) => `narration line ${i + 1}`).join("\n");
+  try {
+    block.append(initial);
+    block.end();
+    await renderOnce();
+    const collapsed = flatText(captureSpans());
+    expect(collapsed).toContain("narration line 1");
+    expect(collapsed).toContain("4 more lines");
+    expect(collapsed).not.toContain("narration line 10");
+    expect(block.rawText).toBe(initial);
+    expect(block.hiddenLineCount).toBe(4);
+
+    expect(block.toggleExpanded()).toBe(true);
+    await renderOnce();
+    expect(flatText(captureSpans())).toContain("narration line 10");
+
+    block.append("\nlate narration line 11");
+    await renderOnce();
+    expect(block.rawText).toBe(`${initial}\nlate narration line 11`);
+    expect(flatText(captureSpans())).toContain("late narration line 11");
+
+    block.toggleExpanded(false);
+    await renderOnce();
+    expect(flatText(captureSpans())).toContain("5 more lines");
+  } finally {
+    renderer.destroy?.();
+  }
+});
+
+test("a terminal snapshot replaces completed narration and can withdraw it without stale rows", async () => {
+  const { renderer, renderOnce, captureSpans, block } = await mountThinking({
+    width: 70,
+    height: 24,
+  });
+  const stale = Array.from({ length: 10 }, (_, i) => `stale narration ${i + 1}`).join("\n");
+  try {
+    block.append(stale);
+    block.end();
+    await renderOnce();
+    expect(flatText(captureSpans())).toContain("4 more lines");
+
+    block.update({
+      text: "canonical narration line 1\ncanonical narration line 2",
+      expanded: true,
+    });
+    await renderOnce();
+    const replaced = flatText(captureSpans());
+    expect(replaced).toContain("canonical narration line 1");
+    expect(replaced).toContain("canonical narration line 2");
+    expect(replaced).not.toContain("stale narration");
+    expect(replaced).not.toContain("more lines");
+    expect(block.rawText).toBe("canonical narration line 1\ncanonical narration line 2");
+    expect(block.isExpanded).toBe(true);
+
+    block.update({ text: "" });
+    await renderOnce();
+    const cleared = flatText(captureSpans());
+    expect(cleared).not.toContain("canonical narration");
+    expect(cleared).not.toContain("stale narration");
+    expect(cleared).not.toContain("more lines");
+    expect(block.rawText).toBe("");
+    expect(block.hiddenLineCount).toBe(0);
+
+    block.relayout();
+    block.toggleExpanded(false);
+    await renderOnce();
+    expect(visibleLines(flatText(captureSpans()))).toEqual([]);
   } finally {
     renderer.destroy?.();
   }

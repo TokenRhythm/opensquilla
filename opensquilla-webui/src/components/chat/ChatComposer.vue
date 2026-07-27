@@ -36,6 +36,7 @@
             :placeholder="placeholder"
             maxlength="100000"
             :aria-label="t('chat.messageToSend')"
+            :aria-describedby="sendBlockedMessage ? 'chat-composer-image-send-status' : undefined"
             @beforeinput="emit('beforeinput', $event)"
             @input="emit('input', $event)"
             @keydown="emit('keydown', $event)"
@@ -48,26 +49,6 @@
             <button class="btn btn--icon btn--ghost chat-plus-btn" :title="t('chat.attachFilesTitle')" :aria-label="t('chat.attachFiles')" @click="fileInputEl?.click()">
               <Icon name="plus" :size="18" />
             </button>
-            <div ref="settingsAnchorEl" class="chat-settings-anchor">
-              <button
-                class="btn btn--icon btn--ghost"
-                :title="t('chat.composerSettings')"
-                :aria-label="t('chat.composerSettings')"
-                :aria-expanded="settingsOpen ? 'true' : 'false'"
-                @click="toggleSettings"
-              >
-                <Icon name="settings" :size="17" />
-              </button>
-              <ChatComposerSettings
-                v-if="settingsOpen"
-                :visual-effects-enabled="routerVisualEffectsEnabled"
-                :coding-mode-enabled="codingModeEnabled"
-                :coding-mode-settings-busy="codingModeSettingsBusy"
-                @close="settingsOpen = false"
-                @set-visual-effects-enabled="emit('setVisualEffectsEnabled', $event)"
-                @set-coding-mode-enabled="emit('setCodingModeEnabled', $event)"
-              />
-            </div>
             <div ref="modelRoutingAnchorEl" class="chat-settings-anchor">
               <button
                 class="btn btn--icon btn--ghost chat-model-routing-btn"
@@ -114,54 +95,95 @@
                 @set-run-mode="emit('setRunMode', $event)"
               />
             </div>
-            <button
-              class="btn btn--icon btn--ghost"
-              :class="{ 'is-active': voiceRecording, 'chat-mic--needs-setup': !voiceReady }"
-              :title="voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint')"
-              :aria-label="voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint')"
-              :disabled="voiceBusy"
-              @click="voiceReady ? emit('voiceInput') : emit('voiceSetup')"
-            >
-              <Icon name="microphone" :size="17" />
-            </button>
-            <button class="btn btn--icon btn--ghost" :title="t('chat.exportMarkdown')" :aria-label="t('chat.exportMarkdown')" @click="emit('exportMarkdown')">
-              <Icon name="download" :size="17" />
-            </button>
-          </div>
-          <div class="chat-input-actions chat-input-actions--right">
-            <Transition name="composer-ctl">
-              <div v-if="isStreaming" class="chat-busy-mode" role="group" :aria-label="t('chat.deliveryModeLabel')">
+            <div ref="moreActionsAnchorEl" class="chat-settings-anchor">
+              <button
+                class="btn btn--icon btn--ghost chat-more-actions-btn"
+                :class="{ 'is-active': moreActionsOpen || settingsOpen }"
+                :title="t('chrome.more')"
+                :aria-label="t('chrome.more')"
+                aria-haspopup="menu"
+                :aria-expanded="moreActionsOpen ? 'true' : 'false'"
+                @click="toggleMoreActions"
+              >
+                <Icon name="moreHorizontal" :size="18" />
+              </button>
+              <div
+                v-if="moreActionsOpen"
+                class="chat-more-actions-menu"
+                role="menu"
+                :aria-label="t('chrome.more')"
+              >
                 <button
-                  class="chat-busy-mode__btn"
-                  :class="{ 'is-active': busySendMode === 'queue' }"
-                  :aria-pressed="busySendMode === 'queue' ? 'true' : 'false'"
-                  :title="t('chat.queueModeHint')"
-                  @click="emit('setBusySendMode', 'queue')"
+                  type="button"
+                  role="menuitem"
+                  :aria-label="t('chat.composerSettings')"
+                  @click="openSettings"
                 >
-                  {{ t('chat.queueMode') }}
+                  <Icon name="settings" :size="16" />
+                  <span>{{ t('chat.composerSettings') }}</span>
                 </button>
                 <button
-                  class="chat-busy-mode__btn"
-                  :class="{ 'is-active': busySendMode === 'steer' }"
-                  :aria-pressed="busySendMode === 'steer' ? 'true' : 'false'"
-                  :title="t('chat.steerModeHint')"
-                  @click="emit('setBusySendMode', 'steer')"
+                  type="button"
+                  role="menuitem"
+                  :class="{ 'is-active': voiceRecording, 'chat-mic--needs-setup': !voiceReady }"
+                  :title="voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint')"
+                  :aria-label="voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint')"
+                  :disabled="voiceBusy"
+                  @click="triggerVoice"
                 >
-                  {{ t('chat.steerMode') }}
+                  <Icon name="microphone" :size="16" />
+                  <span>{{ voiceReady ? t('chat.recordVoice') : t('chat.voiceUnavailableHint') }}</span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  :aria-label="t('chat.exportMarkdown')"
+                  @click="exportConversation"
+                >
+                  <Icon name="download" :size="16" />
+                  <span>{{ t('chat.exportMarkdown') }}</span>
                 </button>
               </div>
-            </Transition>
-            <button class="btn btn--icon btn--primary chat-send-btn" :class="{ 'is-ready': hasSendContent }" :title="sendButtonTitle" :aria-label="t('chat.send')" @click="emit('send')">
+              <ChatComposerSettings
+                v-if="settingsOpen"
+                :visual-effects-enabled="routerVisualEffectsEnabled"
+                :coding-mode-enabled="codingModeEnabled"
+                :coding-mode-settings-busy="codingModeSettingsBusy"
+                @close="settingsOpen = false"
+                @set-visual-effects-enabled="emit('setVisualEffectsEnabled', $event)"
+                @set-coding-mode-enabled="emit('setCodingModeEnabled', $event)"
+              />
+            </div>
+          </div>
+          <div class="chat-input-actions chat-input-actions--right">
+            <button
+              class="btn btn--icon btn--primary chat-send-btn"
+              :class="{ 'is-ready': hasSendContent && !sendBlockedMessage }"
+              :title="sendBlockedMessage || sendButtonTitle"
+              :aria-label="t('chat.send')"
+              :aria-describedby="sendBlockedMessage ? 'chat-composer-image-send-status' : undefined"
+              :disabled="Boolean(sendBlockedMessage)"
+              @click="emit('send')"
+            >
               <Icon name="arrowUp" :size="17" />
             </button>
             <Transition name="composer-ctl">
-              <button v-if="isStreaming" class="btn btn--icon btn--danger chat-send-btn" :title="t('chat.stopResponseEsc')" :aria-label="t('chat.stopResponse')" @click="emit('stop')">
+              <button v-if="canStop" class="btn btn--icon btn--danger chat-send-btn" :title="t('chat.stopResponseEsc')" :aria-label="t('chat.stopResponse')" @click="emit('stop')">
                 <Icon name="stop" :size="16" />
               </button>
             </Transition>
           </div>
         </div>
       </div>
+      <p
+        v-if="sendBlockedMessage"
+        id="chat-composer-image-send-status"
+        class="chat-composer-send-status"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+      >{{ sendBlockedMessage }}</p>
+      <p class="chat-ai-disclaimer" role="note">{{ t('chat.aiDisclaimer') }}</p>
     </div>
     <input
       ref="fileInputEl"
@@ -193,14 +215,16 @@ interface ChatComposerExpose {
   resizeTextarea: () => void
 }
 
-defineProps<{
+const props = defineProps<{
   attachments: Attachment[]
   busySendMode: 'queue' | 'steer'
   hasSendContent: boolean
   isStreaming: boolean
+  canStop: boolean
   isNewLanding: boolean
   placeholder: string
   sendButtonTitle: string
+  sendBlockedMessage?: string
   runMode: SandboxRunMode
   allowedRunModes: SandboxRunMode[]
   modelRoutingMode: ModelRoutingMode
@@ -241,6 +265,7 @@ const textareaEl = ref<HTMLTextAreaElement | null>(null)
 const fileInputEl = ref<HTMLInputElement | null>(null)
 const settingsOpen = ref(false)
 const modelRoutingOpen = ref(false)
+const moreActionsOpen = ref(false)
 
 // "NEW" badge on the routing control — the single-model AI router is now the
 // default, so flag it until the user first opens the control, then never again.
@@ -258,11 +283,13 @@ function dismissRouterNewBadge() {
   } catch { /* localStorage unavailable */ }
 }
 const runModeOpen = ref(false)
-const settingsAnchorEl = ref<HTMLElement | null>(null)
 const modelRoutingAnchorEl = ref<HTMLElement | null>(null)
 const runModeAnchorEl = ref<HTMLElement | null>(null)
+const moreActionsAnchorEl = ref<HTMLElement | null>(null)
 
-const anyPopoverOpen = computed(() => settingsOpen.value || modelRoutingOpen.value || runModeOpen.value)
+const anyPopoverOpen = computed(
+  () => settingsOpen.value || modelRoutingOpen.value || runModeOpen.value || moreActionsOpen.value,
+)
 
 function eventInsideRoot(event: PointerEvent, root: HTMLElement | null): boolean {
   if (!root) return false
@@ -272,8 +299,12 @@ function eventInsideRoot(event: PointerEvent, root: HTMLElement | null): boolean
 }
 
 function closeOpenPopoversFromOutside(event: PointerEvent) {
-  if (settingsOpen.value && !eventInsideRoot(event, settingsAnchorEl.value)) {
+  if (
+    (settingsOpen.value || moreActionsOpen.value) &&
+    !eventInsideRoot(event, moreActionsAnchorEl.value)
+  ) {
     settingsOpen.value = false
+    moreActionsOpen.value = false
   }
   if (modelRoutingOpen.value && !eventInsideRoot(event, modelRoutingAnchorEl.value)) {
     modelRoutingOpen.value = false
@@ -295,20 +326,13 @@ onBeforeUnmount(() => {
   document.removeEventListener('pointerdown', closeOpenPopoversFromOutside, true)
 })
 
-function toggleSettings() {
-  settingsOpen.value = !settingsOpen.value
-  if (settingsOpen.value) {
-    modelRoutingOpen.value = false
-    runModeOpen.value = false
-  }
-}
-
 function toggleModelRouting() {
   modelRoutingOpen.value = !modelRoutingOpen.value
   if (modelRoutingOpen.value) {
     dismissRouterNewBadge()
     settingsOpen.value = false
     runModeOpen.value = false
+    moreActionsOpen.value = false
   }
 }
 
@@ -317,7 +341,42 @@ function toggleRunMode() {
   if (runModeOpen.value) {
     settingsOpen.value = false
     modelRoutingOpen.value = false
+    moreActionsOpen.value = false
   }
+}
+
+function toggleMoreActions() {
+  if (settingsOpen.value) {
+    settingsOpen.value = false
+    moreActionsOpen.value = true
+  } else {
+    moreActionsOpen.value = !moreActionsOpen.value
+  }
+  if (moreActionsOpen.value) {
+    modelRoutingOpen.value = false
+    runModeOpen.value = false
+  }
+}
+
+function openSettings() {
+  moreActionsOpen.value = false
+  settingsOpen.value = true
+  modelRoutingOpen.value = false
+  runModeOpen.value = false
+}
+
+function triggerVoice() {
+  moreActionsOpen.value = false
+  if (props.voiceReady) {
+    emit('voiceInput')
+  } else {
+    emit('voiceSetup')
+  }
+}
+
+function exportConversation() {
+  moreActionsOpen.value = false
+  emit('exportMarkdown')
 }
 
 function attachmentIcon(att: Attachment): IconName {
@@ -407,6 +466,22 @@ defineExpose<ChatComposerExpose>({
 
 .chat-composer--new-landing .chat-composer-inner {
   width: 100%;
+}
+
+.chat-ai-disclaimer {
+  margin: 0.5rem 0 0;
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  text-align: center;
+}
+
+.chat-composer-send-status {
+  margin: 0.5rem 0 0;
+  color: var(--warning, var(--text-muted));
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  text-align: center;
 }
 
 .chat-attachments {
@@ -550,40 +625,53 @@ defineExpose<ChatComposerExpose>({
   display: inline-flex;
 }
 
-.chat-input-actions--right {
-  flex-shrink: 0;
+.chat-more-actions-menu {
+  position: absolute;
+  z-index: 20;
+  bottom: calc(100% + 0.5rem);
+  left: 0;
+  width: max-content;
+  min-width: 210px;
+  padding: 0.375rem;
+  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--bg-surface) 96%, transparent);
+  box-shadow: var(--shadow-lg);
+  backdrop-filter: blur(16px);
 }
 
-.chat-busy-mode {
-  display: inline-flex;
+.chat-more-actions-menu button {
+  display: flex;
   align-items: center;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-full);
-  padding: 2px;
-  gap: 2px;
-  margin-right: var(--sp-1);
-}
-
-.chat-busy-mode__btn {
+  width: 100%;
+  min-height: 36px;
+  gap: 0.625rem;
+  padding: 0.5rem 0.625rem;
   border: 0;
-  background: none;
-  border-radius: var(--radius-full);
-  padding: 0.125rem 0.5rem;
-  font-size: var(--fs-xs);
-  font-weight: 600;
-  line-height: 1.4;
+  border-radius: var(--radius-control);
+  background: transparent;
   color: var(--text-muted);
+  font: inherit;
+  font-size: var(--fs-sm);
+  text-align: left;
   cursor: pointer;
-  transition: var(--transition);
 }
 
-.chat-busy-mode__btn:hover {
+.chat-more-actions-menu button:hover,
+.chat-more-actions-menu button:focus-visible,
+.chat-more-actions-menu button.is-active {
+  outline: 0;
+  background: var(--bg-hover);
   color: var(--text);
 }
 
-.chat-busy-mode__btn.is-active {
-  background: color-mix(in srgb, var(--accent) 14%, var(--bg-surface));
-  color: var(--accent);
+.chat-more-actions-menu button:disabled {
+  cursor: default;
+  opacity: var(--state-disabled-opacity);
+}
+
+.chat-input-actions--right {
+  flex-shrink: 0;
 }
 
 .chat-input-wrap {

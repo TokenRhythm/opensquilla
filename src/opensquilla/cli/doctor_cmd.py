@@ -17,7 +17,12 @@ from rich.table import Table
 from opensquilla.cli.gateway_rpc import default_gateway_url, gateway_url_from_config
 from opensquilla.cli.output import print_json
 from opensquilla.cli.url_utils import normalize_gateway_url
-from opensquilla.health.model import FixStep, HealthFinding, build_report
+from opensquilla.health.model import (
+    FixStep,
+    HealthFinding,
+    build_report,
+    summarize_impact_counts,
+)
 from opensquilla.health.recovery_commands import command_with_config as _command_with_config
 
 _LOCAL_GATEWAY_HOSTS = {"127.0.0.1", "::1", "localhost", "0.0.0.0"}
@@ -352,6 +357,93 @@ def _local_config_findings(config_path: str | Path | None = None) -> list[Health
     return _local_onboarding_findings(config, config_path=config_path)
 
 
+def _local_tui_findings() -> list[HealthFinding]:
+    """Explain which chat surface `--ui auto` selects on THIS terminal.
+
+    The gateway report cannot cover this: renderer availability (companion,
+    bun, terminal capabilities) is a property of the CLI process's machine, so
+    the finding is appended locally to both the online and offline reports. A
+    healthy full-screen selection reports nothing.
+    """
+    from opensquilla.cli.tui.backend.render_summary import sanitize_terminal_text
+    from opensquilla.cli.tui.renderers.selection import select_chat_ui_backend
+
+    try:
+        selection = select_chat_ui_backend("auto")
+    except Exception as exc:  # noqa: BLE001 - a UI probe must never crash doctor.
+        # Exception text can wrap host/subprocess output: same trust level and
+        # scrubbing as the fallback detail below.
+        crash_detail = (
+            sanitize_terminal_text(f"{type(exc).__name__}: {exc}")
+            .replace("\r", " ")
+            .replace("\n", " ")
+        )
+        return [
+            HealthFinding(
+                id="tui.selection_failed",
+                severity="warn",
+                readiness_impact="optional",
+                surface="cli",
+                title="Terminal UI selection failed",
+                detail=crash_detail,
+            )
+        ]
+    fallback = selection.fallback
+    if fallback is None:
+        return []
+    fix_steps: list[FixStep] = []
+    from opensquilla.cli.tui.source_checkout import resolve_tui_source_checkout_hint
+
+    hint = resolve_tui_source_checkout_hint()
+    if hint is not None:
+        fix_steps = [
+            FixStep(label="Install the TUI host dependencies", command=hint.install_command),
+            FixStep(label="Launch the full-screen TUI", command=hint.launch_command),
+        ]
+    detail = sanitize_terminal_text(fallback.detail).replace("\r", " ").replace("\n", " ")
+    return [
+        HealthFinding(
+            id="tui.opentui_unavailable",
+            severity="info",
+            readiness_impact="optional",
+            surface="cli",
+            title="Full-screen terminal UI not active — chat uses plain mode",
+            detail=detail,
+            evidence={
+                "reasonCode": fallback.code.value,
+                "selectedBackend": selection.backend.backend_id,
+            },
+            fix_steps=fix_steps,
+        )
+    ]
+
+
+def _append_local_tui_findings(report: dict[str, Any]) -> None:
+    """Merge the CLI-local terminal-UI findings into a finished report.
+
+    The whole report is re-derived through ``_refresh_report_readiness`` so
+    counts, impact counts, ordering, and the summary stay mutually consistent.
+    An offline report keeps its "unavailable" sentinel status/ready/summary —
+    those describe the failed gateway probe, which an optional UI capability
+    note must not rewrite.
+    """
+    findings = _local_tui_findings()
+    if not findings:
+        return
+    report_findings = report.setdefault("findings", [])
+    if not isinstance(report_findings, list):
+        return
+    report_findings.extend(finding.to_dict() for finding in findings)
+    offline_sentinel = (
+        (report.get("status"), report.get("ready"), report.get("summary"))
+        if report.get("status") == "unavailable"
+        else None
+    )
+    _refresh_report_readiness(report)
+    if offline_sentinel is not None:
+        report["status"], report["ready"], report["summary"] = offline_sentinel
+
+
 def _offline_report(
     error: BaseException,
     *,
@@ -429,25 +521,6 @@ def _impact_text(finding: dict[str, Any]) -> str:
     return labels[_impact_value(finding)]
 
 
-def _summary_from_impact_counts(impact_counts: dict[str, int]) -> str:
-    parts: list[str] = []
-    if impact_counts["blocks_ready"]:
-        label = "action" if impact_counts["blocks_ready"] == 1 else "actions"
-        parts.append(f"{impact_counts['blocks_ready']} {label} required")
-    if impact_counts["degrades"]:
-        label = "check" if impact_counts["degrades"] == 1 else "checks"
-        if not impact_counts["blocks_ready"]:
-            parts.append(f"Ready, {impact_counts['degrades']} degraded {label}")
-        else:
-            parts.append(f"{impact_counts['degrades']} degraded {label}")
-    if parts:
-        return ", ".join(parts)
-    if impact_counts["optional"]:
-        label = "item" if impact_counts["optional"] == 1 else "items"
-        return f"Ready, {impact_counts['optional']} optional setup {label}"
-    return "Ready"
-
-
 def _same_config_path(left: str, right: str) -> bool:
     try:
         return Path(left).expanduser().resolve() == Path(right).expanduser().resolve()
@@ -458,6 +531,7 @@ def _same_config_path(left: str, right: str) -> bool:
 def _refresh_report_readiness(report: dict[str, Any]) -> None:
     counts = {"error": 0, "warn": 0, "info": 0, "ok": 0}
     impact_counts = {"blocks_ready": 0, "degrades": 0, "optional": 0, "none": 0}
+    attention_count = 0
     findings = list(report.get("findings") or [])
     for finding in findings:
         severity = str(finding.get("severity") or "info")
@@ -465,6 +539,8 @@ def _refresh_report_readiness(report: dict[str, Any]) -> None:
             severity = "info"
         counts[severity] += 1
         impact_counts[_impact_value(finding)] += 1
+        if severity == "warn" and _impact_value(finding) == "optional":
+            attention_count += 1
     severity_rank = {"error": 0, "warn": 1, "info": 2, "ok": 3}
     impact_rank = {"blocks_ready": 0, "degrades": 1, "optional": 2, "none": 3}
     ordered_findings = sorted(
@@ -482,7 +558,7 @@ def _refresh_report_readiness(report: dict[str, Any]) -> None:
         "degraded" if impact_counts["degrades"] else "ready"
     )
     report["ready"] = impact_counts["blocks_ready"] == 0
-    report["summary"] = _summary_from_impact_counts(impact_counts)
+    report["summary"] = summarize_impact_counts(impact_counts, attention_count=attention_count)
 
 
 def _apply_requested_config_context(
@@ -704,6 +780,7 @@ def doctor_command(
             config_owns_target=config_owns_gateway_target,
         )
     report = copy.deepcopy(report)
+    _append_local_tui_findings(report)
     report.setdefault("gatewayUrl", target_url)
     report.setdefault("agentId", agent_id)
     if requested_config_path:

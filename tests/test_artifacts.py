@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from pptx import Presentation
 
 from opensquilla.artifacts import (
     DEFAULT_ARTIFACT_DISK_BUDGET_BYTES,
@@ -20,8 +21,30 @@ from opensquilla.artifacts import (
     artifact_payload,
     strip_artifact_markers_from_text,
 )
+from opensquilla.engine.types import ToolCall
 from opensquilla.tools.builtin.artifacts import publish_artifact
-from opensquilla.tools.types import CallerKind, ToolContext, ToolError, current_tool_context
+from opensquilla.tools.dispatch import build_tool_handler
+from opensquilla.tools.registry import ToolRegistry
+from opensquilla.tools.types import (
+    CallerKind,
+    RetryableToolInputError,
+    ToolContext,
+    ToolError,
+    ToolSpec,
+    current_tool_context,
+)
+
+PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+
+
+def _valid_pptx_bytes(title: str = "Validated deliverable") -> bytes:
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[5])
+    assert slide.shapes.title is not None
+    slide.shapes.title.text = title
+    output = io.BytesIO()
+    presentation.save(output)
+    return output.getvalue()
 
 
 def test_artifact_store_round_trips_metadata_and_bytes(tmp_path: Path) -> None:
@@ -484,6 +507,347 @@ async def test_publish_artifact_tool_keeps_download_name_mime_when_source_is_gen
     assert payload["artifact"]["mime"] == "image/png"
 
 
+@pytest.mark.parametrize(
+    ("source_name", "artifact_name", "mime"),
+    [
+        ("broken.PPTX", "download.bin", "application/octet-stream"),
+        ("broken.bin", "download.PPTX", "application/octet-stream"),
+        ("broken.bin", "download.bin", PPTX_MIME),
+    ],
+)
+@pytest.mark.asyncio
+async def test_publish_artifact_tool_rejects_invalid_pptx_from_any_format_signal(
+    tmp_path: Path,
+    source_name: str,
+    artifact_name: str,
+    mime: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output = workspace / source_name
+    output.write_bytes(b"not a zip package")
+    media_root = tmp_path / "media"
+    ctx = ToolContext(
+        workspace_dir=str(workspace),
+        artifact_media_root=str(media_root),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        with pytest.raises(RetryableToolInputError) as exc_info:
+            await publish_artifact(path=source_name, name=artifact_name, mime=mime)
+    finally:
+        current_tool_context.reset(token)
+
+    assert exc_info.value.user_message
+    assert str(output.resolve()) not in exc_info.value.user_message
+    assert not ctx.published_artifacts
+    assert not list(media_root.rglob("meta.json"))
+
+
+@pytest.mark.asyncio
+async def test_publish_artifact_invalid_pptx_dispatch_is_safe_and_retryable(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output = workspace / "brief.pptx"
+    output.write_bytes(b"not a zip package")
+    media_root = tmp_path / "media"
+    ctx = ToolContext(
+        workspace_dir=str(workspace),
+        artifact_media_root=str(media_root),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+    )
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="publish_artifact",
+            description="Publish a generated artifact.",
+            parameters={
+                "path": {"type": "string"},
+                "name": {"type": "string"},
+                "mime": {"type": "string"},
+            },
+            required=["path"],
+        ),
+        publish_artifact,
+    )
+    handler = build_tool_handler(registry, ctx)
+
+    result = await handler(
+        ToolCall(
+            tool_use_id="tc-invalid-pptx",
+            tool_name="publish_artifact",
+            arguments={"path": output.name, "mime": PPTX_MIME},
+        )
+    )
+
+    envelope = json.loads(result.content)
+    assert result.is_error is True
+    assert set(envelope) == {
+        "status",
+        "tool",
+        "error_class",
+        "user_message",
+        "retry_allowed",
+    }
+    assert envelope["status"] == "error"
+    assert envelope["tool"] == "publish_artifact"
+    assert envelope["error_class"] == "RetryableToolInputError"
+    assert envelope["retry_allowed"] is True
+    assert envelope["user_message"]
+    assert "regenerate" in envelope["user_message"].lower()
+    assert "not a zip package" not in envelope["user_message"]
+    assert str(output.resolve()) not in envelope["user_message"]
+    assert result.artifacts == []
+    assert not ctx.published_artifacts
+    assert not list(media_root.rglob("meta.json"))
+
+
+@pytest.mark.asyncio
+async def test_publish_artifact_preflights_pptx_budget_before_read_or_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.tools.builtin.artifacts as artifacts_module
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output = workspace / "brief.pptx"
+    output.write_bytes(_valid_pptx_bytes("Validated before budget"))
+    media_root = tmp_path / "media"
+    ctx = ToolContext(
+        workspace_dir=str(workspace),
+        artifact_media_root=str(media_root),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        artifact_max_bytes=4,
+    )
+
+    validation_calls = 0
+    def unexpected_validation(*args: object, **kwargs: object) -> None:
+        nonlocal validation_calls
+        validation_calls += 1
+
+    def unexpected_read(*args: object, **kwargs: object) -> None:
+        pytest.fail("oversized PPTX must be rejected before read_bytes")
+
+    monkeypatch.setattr(
+        artifacts_module,
+        "validate_artifact_for_delivery",
+        unexpected_validation,
+    )
+    monkeypatch.setattr(artifacts_module.Path, "read_bytes", unexpected_read)
+    token = current_tool_context.set(ctx)
+    try:
+        with pytest.raises(ToolError, match="artifact exceeds per-file budget"):
+            await publish_artifact(path=output.name, mime=PPTX_MIME)
+    finally:
+        current_tool_context.reset(token)
+
+    assert validation_calls == 0
+    assert not ctx.published_artifacts
+    assert not list(media_root.rglob("meta.json"))
+
+
+@pytest.mark.asyncio
+async def test_publish_artifact_rejects_oversized_pptx_before_historical_dedupe(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    payload = _valid_pptx_bytes("Historical valid deck")
+    output = workspace / "brief.pptx"
+    output.write_bytes(payload)
+    media_root = tmp_path / "media"
+    store = ArtifactStore(media_root)
+    store.publish_bytes(
+        payload,
+        session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        name=output.name,
+        mime=PPTX_MIME,
+        source="legacy",
+        max_bytes=None,
+    )
+    ctx = ToolContext(
+        workspace_dir=str(workspace),
+        artifact_media_root=str(media_root),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        artifact_max_bytes=4,
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        with pytest.raises(ToolError, match="artifact exceeds per-file budget"):
+            await publish_artifact(path=output.name, mime=PPTX_MIME)
+    finally:
+        current_tool_context.reset(token)
+
+    assert ctx.published_artifacts == []
+
+
+@pytest.mark.asyncio
+async def test_publish_artifact_validates_pptx_before_current_turn_dedupe(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    invalid_payload = b"not a zip package"
+    output = workspace / "brief.pptx"
+    output.write_bytes(invalid_payload)
+    previous = {
+        "id": "art-existing",
+        "sha256": hashlib.sha256(invalid_payload).hexdigest(),
+        "name": "brief.pptx",
+        "mime": PPTX_MIME,
+    }
+    media_root = tmp_path / "media"
+    ctx = ToolContext(
+        workspace_dir=str(workspace),
+        artifact_media_root=str(media_root),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        published_artifacts=[previous],
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        with pytest.raises(RetryableToolInputError):
+            await publish_artifact(path=output.name, name=output.name, mime=PPTX_MIME)
+    finally:
+        current_tool_context.reset(token)
+
+    assert ctx.published_artifacts == [previous]
+    assert not list(media_root.rglob("meta.json"))
+
+
+@pytest.mark.asyncio
+async def test_publish_artifact_validates_pptx_before_persisted_dedupe(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    invalid_payload = b"not a zip package"
+    output = workspace / "brief.pptx"
+    output.write_bytes(invalid_payload)
+    media_root = tmp_path / "media"
+    store = ArtifactStore(media_root)
+    historical = store.publish_bytes(
+        invalid_payload,
+        session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        name=output.name,
+        mime=PPTX_MIME,
+        source="legacy_publish_artifact",
+    )
+    ctx = ToolContext(
+        workspace_dir=str(workspace),
+        artifact_media_root=str(media_root),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        with pytest.raises(RetryableToolInputError):
+            await publish_artifact(path=output.name, name=output.name, mime=PPTX_MIME)
+    finally:
+        current_tool_context.reset(token)
+
+    assert not ctx.published_artifacts
+    assert [path.parent for path in media_root.rglob("meta.json")] == [
+        store.path_for(historical).parent
+    ]
+
+
+@pytest.mark.asyncio
+async def test_publish_artifact_allows_valid_retry_after_invalid_pptx_is_replaced(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output = workspace / "brief.pptx"
+    output.write_bytes(b"not a zip package")
+    media_root = tmp_path / "media"
+    ctx = ToolContext(
+        workspace_dir=str(workspace),
+        artifact_media_root=str(media_root),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        with pytest.raises(RetryableToolInputError):
+            await publish_artifact(path=output.name, mime=PPTX_MIME)
+        valid_payload = _valid_pptx_bytes("Retry succeeded")
+        output.write_bytes(valid_payload)
+        result = json.loads(await publish_artifact(path=output.name, mime=PPTX_MIME))
+    finally:
+        current_tool_context.reset(token)
+
+    assert result["status"] == "published"
+    assert len(ctx.published_artifacts) == 1
+    _, material_path = ArtifactStore(media_root).resolve_for_download(
+        result["artifact"]["id"],
+        session_id="session-1",
+    )
+    assert material_path.read_bytes() == valid_payload
+
+
+@pytest.mark.asyncio
+async def test_publish_artifact_stores_the_exact_pptx_bytes_that_were_validated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.tools.builtin.artifacts as artifacts_module
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    validated_payload = _valid_pptx_bytes("Validated version")
+    replacement_payload = _valid_pptx_bytes("Replacement version")
+    output = workspace / "brief.pptx"
+    output.write_bytes(validated_payload)
+    media_root = tmp_path / "media"
+    ctx = ToolContext(
+        workspace_dir=str(workspace),
+        artifact_media_root=str(media_root),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+    )
+    validate = artifacts_module.validate_artifact_for_delivery
+
+    def validate_then_replace(*args: object, **kwargs: object) -> object:
+        report = validate(*args, **kwargs)
+        output.write_bytes(replacement_payload)
+        return report
+
+    monkeypatch.setattr(
+        artifacts_module,
+        "validate_artifact_for_delivery",
+        validate_then_replace,
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        result = json.loads(await publish_artifact(path=output.name, mime=PPTX_MIME))
+    finally:
+        current_tool_context.reset(token)
+
+    _, material_path = ArtifactStore(media_root).resolve_for_download(
+        result["artifact"]["id"],
+        session_id="session-1",
+    )
+    assert output.read_bytes() == replacement_payload
+    assert material_path.read_bytes() == validated_payload
+
+
 @pytest.mark.asyncio
 async def test_publish_artifact_tool_hides_local_path_from_non_owner_channel(
     tmp_path: Path,
@@ -595,7 +959,7 @@ async def test_publish_artifact_tool_reuses_existing_session_deliverable_across_
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     output = workspace / "brief.pptx"
-    output.write_bytes(b"pptx bytes")
+    output.write_bytes(_valid_pptx_bytes())
     media_root = tmp_path / "media"
 
     ctx1 = ToolContext(
@@ -610,7 +974,7 @@ async def test_publish_artifact_tool_reuses_existing_session_deliverable_across_
             await publish_artifact(
                 path="brief.pptx",
                 name="brief.pptx",
-                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                mime=PPTX_MIME,
             )
         )
     finally:
@@ -628,7 +992,7 @@ async def test_publish_artifact_tool_reuses_existing_session_deliverable_across_
             await publish_artifact(
                 path="brief.pptx",
                 name="brief.pptx",
-                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                mime=PPTX_MIME,
             )
         )
     finally:
@@ -640,6 +1004,50 @@ async def test_publish_artifact_tool_reuses_existing_session_deliverable_across_
     assert len(ctx1.published_artifacts) == 1
     assert len(ctx2.published_artifacts) == 1
     assert ctx2.published_artifacts[0]["id"] == first["artifact"]["id"]
+
+
+@pytest.mark.asyncio
+async def test_publish_artifact_runs_pptx_read_and_validation_off_the_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    import opensquilla.tools.builtin.artifacts as artifacts_module
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output = workspace / "brief.pptx"
+    output.write_bytes(_valid_pptx_bytes("Loop-friendly deck"))
+    ctx = ToolContext(
+        workspace_dir=str(workspace),
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+    )
+
+    validation_threads: list[threading.Thread] = []
+    real_validate = artifacts_module.validate_artifact_for_delivery
+
+    def recording_validate(*args: object, **kwargs: object) -> None:
+        validation_threads.append(threading.current_thread())
+        real_validate(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        artifacts_module,
+        "validate_artifact_for_delivery",
+        recording_validate,
+    )
+    loop_thread = threading.current_thread()
+    token = current_tool_context.set(ctx)
+    try:
+        result = json.loads(await publish_artifact(path=output.name, mime=PPTX_MIME))
+    finally:
+        current_tool_context.reset(token)
+
+    assert result["status"] == "published"
+    assert validation_threads
+    assert all(thread is not loop_thread for thread in validation_threads)
 
 
 @pytest.mark.asyncio

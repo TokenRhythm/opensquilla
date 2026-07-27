@@ -220,3 +220,29 @@ test("a trailing unterminated escape prefix is flushed on end", async () => {
     renderer.destroy?.();
   }
 });
+
+test("a terminal snapshot update replaces or clears an ended answer in place", async () => {
+  applyTheme("opensquilla-dark");
+  const { renderer, renderOnce, captureSpans, block } = await mountAnswer();
+  try {
+    block.append("stale preview");
+    block.end();
+    block.update({ text: "canonical answer" });
+
+    const corrected = await waitForSpan(
+      renderOnce,
+      captureSpans,
+      (s) => s.text.includes("canonical answer"),
+    );
+    expect(corrected).not.toBeNull();
+    expect(flatText(captureSpans())).not.toContain("stale preview");
+    expect(block.text).toBe("canonical answer");
+
+    block.update({ text: "" });
+    await renderOnce();
+    expect(flatText(captureSpans())).not.toContain("canonical answer");
+    expect(block.text).toBe("");
+  } finally {
+    renderer.destroy?.();
+  }
+});

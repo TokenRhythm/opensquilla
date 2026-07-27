@@ -52,6 +52,8 @@ const props = defineProps<{
   loading: boolean
   currentKey: string
   contractDebugEnabled: boolean
+  /** Command-palette chord, shown in the search button's tooltip. */
+  searchHint: string
 }>()
 
 const emit = defineEmits<{
@@ -60,7 +62,7 @@ const emit = defineEmits<{
   (e: 'rename', payload: { key: string; title: string }): void
   (e: 'delete', key: string): void
   (e: 'bulk-delete', keys: string[]): void
-  (e: 'new-chat'): void
+  (e: 'search'): void
 }>()
 
 const { confirm } = useConfirm()
@@ -91,6 +93,38 @@ function agentInitial(name: string): string {
   return name.trim().charAt(0).toUpperCase() || '?'
 }
 
+function isWorkspaceRow(row: SidebarConversationItem): boolean {
+  return row.rowKind === 'workspace'
+}
+
+function filterChatRowsByAgent(rows: SidebarConversationItem[], agentId: string): SidebarConversationItem[] {
+  const result: SidebarConversationItem[] = []
+  let pendingWorkspace: SidebarConversationItem | null = null
+  let pendingWorkspaceHasMatch = false
+
+  const flushPendingWorkspace = () => {
+    if (pendingWorkspace && pendingWorkspaceHasMatch) result.push(pendingWorkspace)
+    pendingWorkspace = null
+    pendingWorkspaceHasMatch = false
+  }
+
+  for (const row of rows) {
+    if (isWorkspaceRow(row)) {
+      flushPendingWorkspace()
+      pendingWorkspace = row
+      continue
+    }
+    if (row.effectiveAgentId !== agentId) continue
+    if (pendingWorkspace && !pendingWorkspaceHasMatch) {
+      result.push(pendingWorkspace)
+      pendingWorkspaceHasMatch = true
+    }
+    result.push(row)
+  }
+  flushPendingWorkspace()
+  return result
+}
+
 /* ── Collapsible sections ──────────────────────────────────────────── */
 
 // Persisted collapse state, keyed by family. A family is open unless an
@@ -113,20 +147,20 @@ const visibleSections = computed(() => {
     .map(section => ({
       ...section,
       rows: section.family === 'chats' && agentFilter.value
-        ? section.rows.filter(row => row.effectiveAgentId === agentFilter.value)
+        ? filterChatRowsByAgent(section.rows, agentFilter.value)
         : section.rows,
     }))
-    .filter(section => section.rows.length > 0)
+    .filter(section => section.rows.some(row => !isWorkspaceRow(row)))
 })
 
 // Total rendered rows: drives the onboarding empty-state and the filter's
 // "No matches" message separately from a true first-run empty list.
 const totalRows = computed(() =>
-  props.sections.reduce((sum, section) => sum + section.rows.length, 0),
+  props.sections.reduce((sum, section) => sum + section.rows.filter(row => !isWorkspaceRow(row)).length, 0),
 )
 
 const hasFilterMatches = computed(() =>
-  visibleSections.value.some(section => section.rows.length > 0),
+  visibleSections.value.some(section => section.rows.some(row => !isWorkspaceRow(row))),
 )
 
 /* ── Bulk selection ───────────────────────────────────────────────── */
@@ -135,7 +169,9 @@ const selectedKeys = ref<Set<string>>(new Set())
 const selectionMode = ref(false)
 
 const visibleSelectableRows = computed(() =>
-  visibleSections.value.flatMap(section => isCollapsed(section.family) ? [] : section.rows),
+  visibleSections.value.flatMap(section =>
+    isCollapsed(section.family) ? [] : section.rows.filter(row => !isWorkspaceRow(row)),
+  ),
 )
 
 const visibleSelectableKeySet = computed(() =>
@@ -180,10 +216,24 @@ function clearSelection() {
   selectedKeys.value = new Set()
 }
 
-function toggleSelectionMode() {
-  selectionMode.value = !selectionMode.value
-  if (!selectionMode.value) clearSelection()
+function exitSelectionMode() {
+  selectionMode.value = false
+  clearSelection()
 }
+
+function toggleSelectionMode() {
+  if (selectionMode.value) {
+    exitSelectionMode()
+    return
+  }
+  selectionMode.value = true
+}
+
+useDocumentEvent('keydown', (event) => {
+  if (event.key !== 'Escape' || !selectionMode.value) return
+  event.preventDefault()
+  exitSelectionMode()
+})
 
 async function requestBulkDelete() {
   closeMenu()
@@ -351,6 +401,7 @@ function onSelectRow(row: SidebarConversationItem) {
 
 <template>
   <div
+    v-if="error || totalRows > 0"
     class="sidebar-section sidebar-history"
     :class="{ 'is-selecting': selectionMode }"
     :aria-label="t('shared.sidebar.recentConversations')"
@@ -371,6 +422,20 @@ function onSelectRow(row: SidebarConversationItem) {
         v-if="!selectionMode && visibleSections.length === 1 && totalRows > 0"
         class="sidebar-recents-count"
       >{{ totalRows }}</span>
+      <!-- Conversation search lives on the recents header, beside the selection
+           and refresh controls, because the palette's hits are these rows.
+           Hidden while selecting: that mode owns the header's spare width. -->
+      <button
+        v-if="!selectionMode"
+        type="button"
+        class="sidebar-cmd-btn"
+        :aria-label="`${t('chrome.searchChats')} (${props.searchHint})`"
+        :title="`${t('chrome.searchChats')} (${props.searchHint})`"
+        aria-haspopup="dialog"
+        @click="emit('search')"
+      >
+        <Icon name="search" :size="13" />
+      </button>
       <button
         v-if="selectionMode"
         type="button"
@@ -383,9 +448,10 @@ function onSelectRow(row: SidebarConversationItem) {
         {{ allVisibleSelected ? t('shared.sidebar.clearAllShort') : t('shared.sidebar.selectAllShort') }}
       </button>
       <button
-        v-if="selectionMode && selectedCount > 0"
+        v-if="selectionMode"
         type="button"
         class="sidebar-bulk-delete-btn"
+        :disabled="selectedCount === 0"
         :aria-label="t('shared.sidebar.deleteSelectedAria', { count: selectedCount })"
         :title="t('shared.sidebar.deleteSelectedAria', { count: selectedCount })"
         @click="requestBulkDelete"
@@ -393,25 +459,24 @@ function onSelectRow(row: SidebarConversationItem) {
         <Icon name="trash" :size="12" />
       </button>
       <button
-        v-if="totalRows > 0"
+        v-if="selectionMode"
         type="button"
-        class="sidebar-bulk-mode-btn"
-        :class="{ 'is-active': selectionMode }"
-        :aria-pressed="selectionMode"
-        :aria-label="selectionMode ? t('shared.sidebar.exitSelectionMode') : t('shared.sidebar.enterSelectionMode')"
-        :title="selectionMode ? t('shared.sidebar.exitSelectionMode') : t('shared.sidebar.enterSelectionMode')"
-        @click="toggleSelectionMode"
+        class="sidebar-selection-done-btn"
+        :aria-label="t('shared.sidebar.exitSelectionMode')"
+        :title="t('shared.sidebar.exitSelectionMode')"
+        @click="exitSelectionMode"
       >
-        <Icon :name="selectionMode ? 'x' : 'listChecks'" :size="13" />
+        {{ t('shared.sidebar.selectionDone') }}
       </button>
       <button
-        class="sidebar-refresh-btn"
-        :title="t('shared.sidebar.refresh')"
-        :aria-label="t('shared.sidebar.refresh')"
-        :class="{ spinning: loading }"
-        @click="emit('refresh')"
+        v-if="totalRows > 0 && !selectionMode"
+        type="button"
+        class="sidebar-bulk-mode-btn"
+        :aria-label="t('shared.sidebar.enterSelectionMode')"
+        :title="t('shared.sidebar.enterSelectionMode')"
+        @click="toggleSelectionMode"
       >
-        <Icon name="refresh" :size="12" />
+        <Icon name="listChecks" :size="13" />
       </button>
     </div>
 
@@ -426,26 +491,23 @@ function onSelectRow(row: SidebarConversationItem) {
       </button>
     </div>
 
+    <!-- The header no longer carries a standing refresh control, so the retry
+         lives here — the one moment it is actually needed. -->
     <div v-if="error" class="sidebar-history-empty">
-      {{ t('shared.sidebar.loadError') }}
+      <p>{{ t('shared.sidebar.loadError') }}</p>
+      <button
+        type="button"
+        class="sidebar-history-retry"
+        :disabled="loading"
+        @click="emit('refresh')"
+      >
+        {{ t('shared.sidebar.refresh') }}
+      </button>
     </div>
 
     <!-- Filtered to nothing within the Chats agent filter -->
     <div v-else-if="agentFilter && !hasFilterMatches" class="sidebar-history-empty">
       {{ t('shared.sidebar.noMatches') }}
-    </div>
-
-    <!-- First-run onboarding: no sessions exist yet -->
-    <div v-else-if="totalRows === 0" class="sidebar-onboarding">
-      <p class="sidebar-onboarding__lead">{{ t('shared.sidebar.noConversations') }}</p>
-      <button type="button" class="sidebar-onboarding__cta" @click="emit('new-chat')">
-        <Icon name="plus" :size="14" />
-        <span>{{ t('shared.sidebar.startChat') }}</span>
-      </button>
-      <div class="sidebar-onboarding__links">
-        <router-link to="/sessions" class="sidebar-onboarding__link">{{ t('shared.sidebar.linkSessions') }}</router-link>
-        <router-link to="/overview" class="sidebar-onboarding__link">{{ t('shared.sidebar.linkOverview') }}</router-link>
-      </div>
     </div>
 
     <div v-else class="sidebar-history-list">
@@ -472,25 +534,42 @@ function onSelectRow(row: SidebarConversationItem) {
           <span class="sidebar-group__count">{{ section.rows.length }}</span>
         </button>
 
-        <div
+        <TransitionGroup
           v-show="visibleSections.length === 1 || !isCollapsed(section.family)"
           :id="`sidebar-group-${section.family}`"
+          name="sidebar-row"
+          tag="div"
           class="sidebar-group__body"
         >
           <div
             v-for="row in section.rows"
             :key="row.key"
             class="sidebar-history-row"
-            :class="{ 'is-selected': isRowSelected(row.key) }"
+            :class="{
+              'is-selected': row.rowKind !== 'workspace' && isRowSelected(row.key),
+              'sidebar-history-row--workspace': row.rowKind === 'workspace',
+            }"
             :data-family="section.family"
             :data-depth="row.depth"
             :style="{ '--row-depth': row.depth }"
           >
-            <span v-if="row.depth > 0" class="sidebar-history-rail" aria-hidden="true" />
+            <div
+              v-if="row.rowKind === 'workspace'"
+              class="sidebar-workspace-header"
+              :title="row.workspaceDisplayPath || row.title"
+            >
+              <span class="sidebar-workspace-label">{{ row.title }}</span>
+            </div>
+
+            <span
+              v-if="row.depth > 0 && row.rowKind !== 'workspace'"
+              class="sidebar-history-rail"
+              aria-hidden="true"
+            />
 
             <!-- Inline rename input replaces the row button while editing -->
             <input
-              v-if="renamingKey === row.key"
+              v-if="row.rowKind !== 'workspace' && renamingKey === row.key"
               :ref="setRenameInput"
               v-model="renameDraft"
               class="sidebar-history-rename"
@@ -502,7 +581,7 @@ function onSelectRow(row: SidebarConversationItem) {
             />
 
             <button
-              v-else
+              v-else-if="row.rowKind !== 'workspace'"
               class="sidebar-history-item"
               :class="{ 'is-current': row.key === currentKey }"
               :title="row.title"
@@ -536,7 +615,7 @@ function onSelectRow(row: SidebarConversationItem) {
 
             <!-- Chat-only ⋯ menu: rename + delete -->
             <div
-              v-if="row.sessionKind === 'chat' && renamingKey !== row.key && !selectionMode"
+              v-if="row.rowKind !== 'workspace' && row.sessionKind === 'chat' && renamingKey !== row.key && !selectionMode"
               class="sidebar-row-menu-wrap"
             >
               <button
@@ -584,7 +663,7 @@ function onSelectRow(row: SidebarConversationItem) {
 
             <!-- Agent-initial badge: indicator + click-to-filter (Chats only) -->
             <button
-              v-else-if="shouldShowAgentFilterBadge(section.family, row) && renamingKey !== row.key && !selectionMode"
+              v-else-if="row.rowKind !== 'workspace' && shouldShowAgentFilterBadge(section.family, row) && renamingKey !== row.key && !selectionMode"
               type="button"
               class="sidebar-agent-badge"
               :class="{ 'is-active': agentFilter === row.effectiveAgentId }"
@@ -596,7 +675,7 @@ function onSelectRow(row: SidebarConversationItem) {
               {{ agentInitial(row.agentName) }}
             </button>
           </div>
-        </div>
+        </TransitionGroup>
       </div>
     </div>
   </div>

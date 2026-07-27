@@ -8,10 +8,22 @@ import type { ChatMessage } from '@/types/chat'
 export function mergeLiveOnlyFields(prev: ChatMessage, server: ChatMessage): ChatMessage {
   const merged: ChatMessage = { ...server }
 
+  // Keep the optimistic row identity after the backend assigns a durable
+  // message id. Per-turn render keys use it to avoid remounting live surfaces
+  // during the first authoritative history replacement.
+  if (!server.clientId && prev.clientId) merged.clientId = prev.clientId
+
   // reasoning: server wins if it measured seconds; else keep the live seconds.
   const serverSeconds = prev.role === 'assistant' ? server.reasoning?.seconds ?? 0 : 0
   if (serverSeconds <= 0 && (prev.reasoning?.seconds ?? 0) > 0) {
     merged.reasoning = prev.reasoning
+  }
+
+  // The fold's phase snapshot supplies an exact same-session activity start.
+  // History does not persist it, so retain the local snapshot across the first
+  // authoritative refresh; a cold reload still correctly falls back to counts.
+  if (!(server.statusHistory?.length) && (prev.statusHistory?.length ?? 0) > 0) {
+    merged.statusHistory = prev.statusHistory
   }
 
   // routerSettled is sticky: once a strip has settled it stays settled.
@@ -42,6 +54,116 @@ export function reconcileHistoryMessages(prev: ChatMessage[], incoming: ChatMess
     const prior = prevById.get(server.messageId)
     return prior ? mergeLiveOnlyFields(prior, server) : server
   })
+}
+
+function turnEndIndex(messages: ChatMessage[], userIndex: number): number {
+  let index = userIndex + 1
+  while (index < messages.length && messages[index]?.role !== 'user') index++
+  return index
+}
+
+function assistantIndexesForTurn(messages: ChatMessage[], userIndex: number): number[] {
+  const end = turnEndIndex(messages, userIndex)
+  const indexes: number[] = []
+  for (let index = userIndex + 1; index < end; index++) {
+    if (messages[index]?.role === 'assistant') indexes.push(index)
+  }
+  return indexes
+}
+
+// A freshly completed assistant row has no durable id yet, so an id-only merge
+// cannot preserve its live activity snapshot. Associate it only through the
+// exact persisted user id that owns both turn slices, and only when each slice
+// has one unambiguous assistant. This keeps the server authoritative while
+// avoiding text/timestamp guesses across unrelated turns.
+function reconcileOptimisticTurnFields(
+  prev: ChatMessage[],
+  incoming: ChatMessage[],
+): ChatMessage[] {
+  const reconciled = reconcileHistoryMessages(prev, incoming)
+  const merged = reconciled === incoming ? incoming.slice() : reconciled
+  const previousUserIndexById = new Map<string, number>()
+
+  prev.forEach((message, index) => {
+    if (message.role === 'user' && message.messageId) {
+      previousUserIndexById.set(message.messageId, index)
+    }
+  })
+
+  incoming.forEach((message, incomingUserIndex) => {
+    if (message.role !== 'user' || !message.messageId) return
+    const previousUserIndex = previousUserIndexById.get(message.messageId)
+    if (previousUserIndex === undefined) return
+
+    const previousAssistants = assistantIndexesForTurn(prev, previousUserIndex)
+      .filter(index => {
+        const assistant = prev[index]
+        return assistant?.restoredFromHistory !== true && !assistant?.messageId
+      })
+    const incomingAssistants = assistantIndexesForTurn(incoming, incomingUserIndex)
+      .filter(index => {
+        const assistant = incoming[index]
+        return assistant?.restoredFromHistory === true && Boolean(assistant?.messageId)
+      })
+    if (previousAssistants.length !== 1 || incomingAssistants.length !== 1) return
+
+    const previousAssistant = prev[previousAssistants[0]]
+    const incomingAssistantIndex = incomingAssistants[0]
+    const serverAssistant = merged[incomingAssistantIndex]
+    merged[incomingAssistantIndex] = mergeLiveOnlyFields(previousAssistant, serverAssistant)
+  })
+
+  return merged
+}
+
+// A background history sync returns only the newest server window. Keep any
+// canonical pages the reader already loaded before that window, then replace
+// the overlapping suffix with the fresh server rows. This keeps a 200-message
+// sync from collapsing a longer transcript back to 200 rows while retaining
+// the server-authoritative behavior inside the refreshed window.
+export function historyWindowsOverlap(prev: ChatMessage[], incoming: ChatMessage[]): boolean {
+  const previousIds = new Set(
+    prev
+      .filter(message => message.restoredFromHistory === true)
+      .map(message => message.messageId)
+      .filter(Boolean),
+  )
+  return incoming.some(message => Boolean(message.messageId && previousIds.has(message.messageId)))
+}
+
+export function reconcileHistoryWindow(prev: ChatMessage[], incoming: ChatMessage[]): ChatMessage[] {
+  if (prev.length === 0) return incoming
+  if (incoming.length === 0) return prev.filter(message => message.restoredFromHistory === true)
+
+  const previousIndexById = new Map<string, number>()
+  prev.forEach((message, index) => {
+    if (message.restoredFromHistory === true && message.messageId) {
+      previousIndexById.set(message.messageId, index)
+    }
+  })
+
+  let overlapIndex = -1
+  for (const message of incoming) {
+    if (!message.messageId) continue
+    const index = previousIndexById.get(message.messageId)
+    if (index !== undefined) {
+      overlapIndex = index
+      break
+    }
+  }
+
+  if (overlapIndex >= 0) {
+    return [
+      ...prev.slice(0, overlapIndex),
+      ...reconcileOptimisticTurnFields(prev.slice(overlapIndex), incoming),
+    ]
+  }
+
+  // With no shared message id there is no proof that these windows are
+  // adjacent. Reset to the authoritative latest window instead of silently
+  // rendering an omitted middle range as one continuous transcript. Callers
+  // can page backwards again from the latest window's oldest cursor.
+  return reconcileOptimisticTurnFields(prev, incoming)
 }
 
 function fallbackMessageKey(msg: ChatMessage): string {
@@ -98,7 +220,7 @@ function findUserByOrdinal(messages: ChatMessage[], ordinal: number): number {
   return -1
 }
 
-function findIncomingUserForPreviousStopNotice(
+function findIncomingUserForPreviousNotice(
   previousMessages: ChatMessage[],
   incomingMessages: ChatMessage[],
   previousUserIndex: number,
@@ -163,11 +285,48 @@ export function reconcileClientStopNotices(prev: ChatMessage[], incoming: ChatMe
       return -1
     })()
     if (priorUserIndex < 0) continue
-    const userIndex = findIncomingUserForPreviousStopNotice(prev, merged, priorUserIndex)
+    const userIndex = findIncomingUserForPreviousNotice(prev, merged, priorUserIndex)
     if (userIndex < 0) continue
     if (turnHasServerOutputAfterUser(merged, userIndex)) continue
 
     merged.splice(stopNoticeInsertionIndex(merged, userIndex), 0, notice)
+  }
+
+  return merged
+}
+
+// A terminal replay has no future stream event to re-materialize its failure.
+// Keep the client error beside its user turn until server history contains an
+// error row for that turn; otherwise the required post-replay history sync
+// would erase the only actionable explanation after ~50ms.
+export function reconcileClientTerminalNotices(
+  prev: ChatMessage[],
+  incoming: ChatMessage[],
+): ChatMessage[] {
+  if (!prev.some(msg => msg.terminalNotice)) return incoming
+  const merged = incoming.slice()
+
+  for (let i = 0; i < prev.length; i++) {
+    const notice = prev[i]
+    if (!notice?.terminalNotice || notice.role !== 'error') continue
+
+    const priorUserIndex = (() => {
+      for (let j = i - 1; j >= 0; j--) {
+        if (prev[j]?.role === 'user') return j
+      }
+      return -1
+    })()
+    if (priorUserIndex < 0) continue
+    const userIndex = findIncomingUserForPreviousNotice(prev, merged, priorUserIndex)
+    if (userIndex < 0) continue
+
+    let turnEnd = userIndex + 1
+    while (turnEnd < merged.length && merged[turnEnd]?.role !== 'user') turnEnd++
+    const durableErrorExists = merged
+      .slice(userIndex + 1, turnEnd)
+      .some(message => message.role === 'error')
+    if (durableErrorExists) continue
+    merged.splice(turnEnd, 0, notice)
   }
 
   return merged

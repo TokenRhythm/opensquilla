@@ -12,6 +12,8 @@ from dataclasses import asdict, replace
 from typing import Any, cast
 from urllib.parse import urlsplit, urlunsplit
 
+import httpx
+
 from opensquilla.search.normalize import (
     canonicalize_query_key,
     canonicalize_url,
@@ -24,6 +26,7 @@ from opensquilla.search.runtime_config import (
 )
 from opensquilla.search.types import (
     SearchDiagnostics,
+    SearchExecutionPlan,
     SearchHit,
     SearchOptions,
     SearchProvider,
@@ -67,17 +70,20 @@ async def run_canonical_web_search(
             diagnostics,
             error_kind="invalid_request",
             error="Search query must not be empty.",
+            provider_retryable=False,
+            error_class="ValueError",
         )
 
     resolved_runtime = runtime or get_resolved_search_runtime()
-    provider_names = resolved_runtime.provider_order(options)
+    execution_plan = resolved_runtime.execution_plan(options)
+    provider_names = execution_plan.provider_names
 
     cache_enabled = (
         runtime is None and provider_factory is None
         if use_cache is None
         else use_cache
     )
-    cache_key = _cache_key(options, provider_names)
+    cache_key = _cache_key(options, execution_plan)
     if cache_enabled:
         diagnostics.cache_status = "miss"
         cached_payload = _get_cached_payload(cache_key)
@@ -89,10 +95,9 @@ async def run_canonical_web_search(
     factory = provider_factory or resolved_runtime.build_provider
     selected_provider = ""
     raw_results: list[SearchResult] = []
-    terminal_error: Exception | None = None
     explicit_provider = options.provider is not None
 
-    for provider_name in provider_names:
+    for attempt_index, provider_name in enumerate(provider_names):
         try:
             provider = factory(provider_name)
             search_options, recency_supported, recency_degraded = (
@@ -103,13 +108,13 @@ async def run_canonical_web_search(
             )
             raw_results = await _search_provider(provider, search_options)
         except Exception as exc:  # noqa: BLE001 - orchestrator converts provider failures to payloads
-            terminal_error = exc
             search_error = _coerce_search_error(provider_name, exc)
             diagnostics.provider_attempts.append(
                 _provider_error_attempt(provider_name, search_error)
             )
 
-            if resolved_runtime.should_fallback(
+            has_next_provider = attempt_index + 1 < len(provider_names)
+            if has_next_provider and resolved_runtime.should_fallback(
                 search_error,
                 explicit_provider=explicit_provider,
             ):
@@ -120,6 +125,8 @@ async def run_canonical_web_search(
                 diagnostics,
                 error_kind=search_error.kind,
                 error=_public_error_message(provider_name, search_error.kind),
+                provider_retryable=search_error.retryable,
+                error_class=type(exc).__name__,
             )
 
         selected_provider = provider_name
@@ -130,14 +137,16 @@ async def run_canonical_web_search(
 
     if not selected_provider:
         search_error = _coerce_search_error(
-            provider_names[-1] if provider_names else "unknown",
-            terminal_error or RuntimeError("No search provider succeeded."),
+            "unknown",
+            RuntimeError("No search provider is available."),
         )
         return _failure_payload(
             options,
             diagnostics,
             error_kind=search_error.kind,
             error=_public_error_message(search_error.provider, search_error.kind),
+            provider_retryable=False,
+            error_class="RuntimeError",
         )
 
     diagnostics.selected_provider = selected_provider
@@ -262,13 +271,18 @@ async def _default_fetcher(url: str, max_chars: int) -> dict[str, Any]:
     )
 
 
-def _cache_key(options: SearchOptions, provider_names: tuple[str, ...]) -> tuple[Any, ...]:
+def _cache_key(
+    options: SearchOptions,
+    execution_plan: SearchExecutionPlan,
+) -> tuple[Any, ...]:
     return (
         canonicalize_query_key(options.query),
         options.provider or "auto",
         options.mode,
         options.recency or "",
-        provider_names,
+        execution_plan.provider_names,
+        execution_plan.selection_mode,
+        execution_plan.fallback_mode,
         options.max_results,
         options.fetch_top_k,
         options.max_chars_per_source,
@@ -302,6 +316,20 @@ def _provider_order(options: SearchOptions) -> tuple[str, ...]:
 def _coerce_search_error(provider_name: str, exc: Exception) -> SearchProviderError:
     if isinstance(exc, SearchProviderError):
         return exc
+    if isinstance(exc, httpx.TimeoutException):
+        return SearchProviderError(
+            provider=provider_name,
+            kind="timeout",
+            message=str(exc) or "Search request timed out.",
+            retryable=True,
+        )
+    if isinstance(exc, httpx.NetworkError):
+        return SearchProviderError(
+            provider=provider_name,
+            kind="network",
+            message=str(exc) or "Search network request failed.",
+            retryable=True,
+        )
     return SearchProviderError(
         provider=provider_name,
         kind="unknown",
@@ -541,6 +569,8 @@ def _failure_payload(
     *,
     error_kind: str,
     error: str,
+    provider_retryable: bool,
+    error_class: str,
 ) -> dict[str, Any]:
     diagnostics.returned_chars = 0
     return {
@@ -552,7 +582,10 @@ def _failure_payload(
         "sources": [],
         "results": [],
         "error_kind": error_kind,
+        "error_class": error_class,
         "error": error,
+        "provider_retryable": provider_retryable,
+        "retry_allowed": False,
     }
 
 

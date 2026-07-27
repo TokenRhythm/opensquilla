@@ -8,6 +8,7 @@ import re
 import time
 from pathlib import Path, PurePosixPath
 
+import structlog
 from starlette.requests import Request
 from starlette.responses import HTMLResponse
 from starlette.routing import Mount, Route
@@ -15,6 +16,8 @@ from starlette.staticfiles import StaticFiles
 
 from opensquilla import __version__
 from opensquilla.gateway.config import GatewayConfig
+
+log = structlog.get_logger(__name__)
 
 # Conservative max-age for static assets. 30 days is long enough that hot
 # clients save roundtrips but short enough that any deploy without a version
@@ -242,7 +245,9 @@ def _read_vite_assets(base_path: str) -> tuple[str, list[str]]:
     """
     dist_index = _DIST_DIR / "index.html"
     if not dist_index.exists():
-        # Fallback: return empty assets; template serves a degraded experience.
+        # The template turns this into an actionable diagnostic instead of a
+        # blank Vue mount point. Standard distributions cannot reach this state
+        # because the Hatch build hook validates the artifact fail-closed.
         return ("", [])
 
     html = dist_index.read_text(encoding="utf-8")
@@ -265,21 +270,36 @@ def create_control_ui_routes(config: GatewayConfig) -> list[Route | Mount]:
     if not config.control_ui.enabled:
         return []
 
+    if not (_DIST_DIR / "index.html").exists():
+        # The served page already shows an actionable notice, but headless
+        # operators only watch logs — surface the same guidance at startup.
+        log.warning(
+            "control_ui.webui_assets_missing",
+            detail=(
+                "The built Vue console was not found, so the Control UI will "
+                "serve an 'assets are unavailable' notice instead of the "
+                "console. From a source checkout, build it with "
+                "`cd opensquilla-webui && npm ci && npm run build` "
+                "(Node.js 22.12+ with npm) and restart or reload the page. "
+                "Release-wheel and Desktop installs should reinstall an "
+                "official package."
+            ),
+            dist_dir=str(_DIST_DIR),
+        )
+
     base = config.control_ui.base_path
-    frontend = config.control_ui.frontend
-    template_name = "legacy_index.html" if frontend == "legacy" else "index.html"
-    template = _get_jinja_env().get_template(template_name)
+    template = _get_jinja_env().get_template("index.html")
 
     async def serve_index(request: Request) -> HTMLResponse:
         ctx = _build_bootstrap_context(config, request)
-        if frontend == "vue":
-            # Re-read latest Vite assets on every request so rebuilds are picked up
-            # without restarting the gateway.
-            live_js, live_css_urls = _read_vite_assets(base)
-            ctx["vite_js_url"] = live_js
-            ctx["vite_css_urls"] = live_css_urls
-            # Back-compat single URL (first) for any consumer expecting one.
-            ctx["vite_css_url"] = live_css_urls[0] if live_css_urls else ""
+        # Re-read latest Vite assets on every request so rebuilds are picked up
+        # without restarting the gateway.
+        live_js, live_css_urls = _read_vite_assets(base)
+        ctx["vite_js_url"] = live_js
+        ctx["vite_css_urls"] = live_css_urls
+        ctx["webui_artifact_missing"] = not live_js
+        # Back-compat single URL (first) for any consumer expecting one.
+        ctx["vite_css_url"] = live_css_urls[0] if live_css_urls else ""
         html = template.render(**ctx)
         response = HTMLResponse(html)
         response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"

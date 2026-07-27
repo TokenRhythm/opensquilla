@@ -20,13 +20,14 @@ future AgentConfig-validation early-yield branch.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 from opensquilla.engine.runtime_recovery import (
     normalize_reasoning_prefill_recovery_mode,
     normalize_runtime_recovery_mode,
 )
+from opensquilla.tools.write_policy import validate_workspace_write_deny_env
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -36,7 +37,7 @@ if TYPE_CHECKING:
     from opensquilla.engine.types import AgentConfig, ThinkingLevel
     from opensquilla.observability.turn_call_log import TurnCallLogger
     from opensquilla.provider.protocol import LLMProvider
-    from opensquilla.provider.types import ModelCapabilities
+    from opensquilla.provider.types import ModelCapabilities, ProviderRequestCorrelation
     from opensquilla.tools.types import ToolContext
 
 _PROGRESS_WATCHDOG_MODES = frozenset({"off", "log", "warn_model", "block"})
@@ -178,6 +179,132 @@ def _finalize_evidence_gate_from_env(config_value: bool = False) -> bool:
     )
 
 
+_FINALIZE_EVIDENCE_STRICT_ENV = "OPENSQUILLA_FINALIZE_EVIDENCE_STRICT"
+
+
+def _finalize_evidence_strict_from_env(config_value: bool = False) -> bool:
+    """Resolve the opt-in strict mode of the finalize-time evidence gate.
+
+    Default off. A non-blank ``OPENSQUILLA_FINALIZE_EVIDENCE_STRICT``
+    overrides ``config_value``. Strict implies the gate itself (the loop
+    activates the tracker when either flag is on). Unrecognized env values
+    raise instead of being silently ignored so a run manifest cannot record
+    an override the run did not actually apply.
+    """
+    raw = os.environ.get(_FINALIZE_EVIDENCE_STRICT_ENV, "").strip().lower()
+    if not raw:
+        return bool(config_value)
+    if raw in _FINALIZE_EVIDENCE_GATE_ON:
+        return True
+    if raw in _FINALIZE_EVIDENCE_GATE_OFF:
+        return False
+    raise ValueError(
+        f"{_FINALIZE_EVIDENCE_STRICT_ENV} must be one of: "
+        + ", ".join(sorted(_FINALIZE_EVIDENCE_GATE_ON | _FINALIZE_EVIDENCE_GATE_OFF))
+    )
+
+
+_SCRATCH_VERIFY_MIRROR_ENV = "OPENSQUILLA_SCRATCH_VERIFY_MIRROR"
+
+
+def _scratch_verify_mirror_from_env(config_value: bool = False) -> bool:
+    """Resolve the opt-in scratch verify-mirror flag.
+
+    Default off. A non-blank ``OPENSQUILLA_SCRATCH_VERIFY_MIRROR`` overrides
+    ``config_value``. Unrecognized env values raise instead of being silently
+    ignored so a run manifest cannot record an override the run did not
+    actually apply.
+    """
+    raw = os.environ.get(_SCRATCH_VERIFY_MIRROR_ENV, "").strip().lower()
+    if not raw:
+        return bool(config_value)
+    if raw in _FINALIZE_EVIDENCE_GATE_ON:
+        return True
+    if raw in _FINALIZE_EVIDENCE_GATE_OFF:
+        return False
+    raise ValueError(
+        f"{_SCRATCH_VERIFY_MIRROR_ENV} must be one of: "
+        + ", ".join(sorted(_FINALIZE_EVIDENCE_GATE_ON | _FINALIZE_EVIDENCE_GATE_OFF))
+    )
+
+
+_FINALIZE_VARIANT_CHALLENGE_ENV = "OPENSQUILLA_FINALIZE_VARIANT_CHALLENGE"
+
+
+def _finalize_variant_challenge_from_env(config_value: bool = False) -> bool:
+    """Resolve the opt-in finalize-time variant-sweep challenge flag.
+
+    Default off. A non-blank ``OPENSQUILLA_FINALIZE_VARIANT_CHALLENGE``
+    overrides ``config_value``. Unrecognized env values raise instead of
+    being silently ignored so a run manifest cannot record an override the
+    run did not actually apply.
+    """
+    raw = os.environ.get(_FINALIZE_VARIANT_CHALLENGE_ENV, "").strip().lower()
+    if not raw:
+        return bool(config_value)
+    if raw in _FINALIZE_EVIDENCE_GATE_ON:
+        return True
+    if raw in _FINALIZE_EVIDENCE_GATE_OFF:
+        return False
+    raise ValueError(
+        f"{_FINALIZE_VARIANT_CHALLENGE_ENV} must be one of: "
+        + ", ".join(sorted(_FINALIZE_EVIDENCE_GATE_ON | _FINALIZE_EVIDENCE_GATE_OFF))
+    )
+
+
+_SUBMIT_REVIEW_ENV = "OPENSQUILLA_SUBMIT_REVIEW"
+_SUBMIT_REVIEW_ON = frozenset({"on", "1", "true", "yes"})
+_SUBMIT_REVIEW_OFF = frozenset({"off", "0", "false", "no"})
+
+
+def _submit_review_from_env(config_value: bool = False) -> bool:
+    """Resolve the opt-in review-on-submit checkpoint flag.
+
+    Default off. A non-blank ``OPENSQUILLA_SUBMIT_REVIEW`` overrides
+    ``config_value``. Unlike the finalize-evidence gate there is no gateway aux
+    mirror: the review has no system-prompt section that could disagree with the
+    loop behaviour. Unrecognized env values raise instead of being silently
+    ignored so an experiment manifest cannot record a lever the run did not
+    actually apply.
+    """
+    raw = os.environ.get(_SUBMIT_REVIEW_ENV, "").strip().lower()
+    if not raw:
+        return bool(config_value)
+    if raw in _SUBMIT_REVIEW_ON:
+        return True
+    if raw in _SUBMIT_REVIEW_OFF:
+        return False
+    raise ValueError(
+        f"{_SUBMIT_REVIEW_ENV} must be one of: "
+        + ", ".join(sorted(_SUBMIT_REVIEW_ON | _SUBMIT_REVIEW_OFF))
+    )
+
+
+_PATCH_HYGIENE_BLOCK_ENV = "OPENSQUILLA_PATCH_HYGIENE_BLOCK"
+_PATCH_HYGIENE_BLOCK_MODES = ("off", "test_paths", "protected_paths")
+
+
+def _patch_hygiene_block_from_env(
+    config_value: Literal["off", "test_paths", "protected_paths"] = "off",
+) -> Literal["off", "test_paths", "protected_paths"]:
+    """Resolve the finalize-time patch hygiene hard-block mode.
+
+    Default off. A non-blank ``OPENSQUILLA_PATCH_HYGIENE_BLOCK`` overrides
+    ``config_value``. Unrecognized env values raise instead of being silently
+    ignored so a run manifest cannot record an override the run did not
+    actually apply.
+    """
+    raw = os.environ.get(_PATCH_HYGIENE_BLOCK_ENV, "").strip().lower()
+    if not raw:
+        return config_value
+    if raw in _PATCH_HYGIENE_BLOCK_MODES:
+        return raw  # type: ignore[return-value]
+    raise ValueError(
+        f"{_PATCH_HYGIENE_BLOCK_ENV} must be one of: "
+        + ", ".join(_PATCH_HYGIENE_BLOCK_MODES)
+    )
+
+
 def _positive_int_from_env(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None:
@@ -208,6 +335,20 @@ def _bool_from_env(name: str, default: bool = False) -> bool:
 def _name_tuple_from_env(name: str) -> tuple[str, ...]:
     raw = os.environ.get(name, "")
     return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+
+def _projection_signal_hints_from_env() -> bool:
+    """Parse OPENSQUILLA_PROJECTION_SIGNAL_HINTS through the runtime gate.
+
+    Delegating keeps bootstrap and per-request resolution on one on/off
+    vocabulary: an unrecognized value raises here, at bootstrap, instead of
+    surviving as False and then raising mid-turn when the agent re-reads the
+    env. Local import; the engine.agent module is import-cycle-safe from
+    this stage only at call time.
+    """
+    from opensquilla.engine.agent import _projection_signal_hints_enabled
+
+    return _projection_signal_hints_enabled(False)
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +579,12 @@ class AgentFactoryPort(Protocol):
         turn_call_logger: TurnCallLogger | None,
         memory_sync_manager: Any | None,
         tool_context: ToolContext | None,
+        turn_id: str = "",
+        session_id: str | None = None,
+        session_epoch: int = 0,
+        agent_id: str = "",
+        run_kind: str = "agent",
+        provider_request_correlation: ProviderRequestCorrelation | None = None,
     ) -> Agent: ...
 
 
@@ -483,6 +630,13 @@ class AgentBootstrapStageInput:
     max_provider_retries: int | None
     length_capped_continuations: int | None
     active_provider_id: str = ""
+    turn_id: str = ""
+    run_kind: str = "agent"
+    session_epoch: int = 0
+    provider_request_correlation: ProviderRequestCorrelation | None = field(
+        default=None,
+        repr=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -607,6 +761,12 @@ class AgentBootstrapStage:
 
         # 4. Construct AgentConfig (declarative, single call site)
         #
+        # Validation-only gate: the workspace write deny env levers are read
+        # at dispatch time in the tools layer (no AgentConfig fields), but a
+        # typo there must stop the run at startup, not silently disable
+        # enforcement mid-run.
+        validate_workspace_write_deny_env()
+        #
         # ``workspace_dir`` is sourced from the per-turn metadata key
         # ``bootstrap_workspace_dir`` (written by ``_run_pipeline`` from
         # the call-site's ToolContext/agent-resolved value — see
@@ -721,6 +881,23 @@ class AgentBootstrapStage:
             finalize_evidence_gate_enabled=_finalize_evidence_gate_from_env(
                 aux.finalize_evidence_gate
             ),
+            finalize_evidence_strict=_finalize_evidence_strict_from_env(
+                AgentConfig().finalize_evidence_strict
+            ),
+            submit_review_enabled=_submit_review_from_env(),
+            submit_review_diff_max_chars=_positive_int_from_env(
+                "OPENSQUILLA_SUBMIT_REVIEW_DIFF_MAX_CHARS",
+                AgentConfig().submit_review_diff_max_chars,
+            ),
+            patch_hygiene_block_mode=_patch_hygiene_block_from_env(
+                AgentConfig().patch_hygiene_block_mode
+            ),
+            scratch_verify_mirror=_scratch_verify_mirror_from_env(
+                AgentConfig().scratch_verify_mirror
+            ),
+            finalize_variant_challenge=_finalize_variant_challenge_from_env(
+                AgentConfig().finalize_variant_challenge
+            ),
             provider_context_block_feedback=_bool_from_env(
                 "OPENSQUILLA_PROVIDER_CONTEXT_BLOCK_FEEDBACK",
                 AgentConfig().provider_context_block_feedback,
@@ -757,6 +934,34 @@ class AgentBootstrapStage:
                 "OPENSQUILLA_ENDGAME_GIT_FREEZE_MARGIN_SECONDS",
                 AgentConfig().endgame_git_freeze_margin_seconds,
             ),
+            max_iterations_deadline_extend_seconds=_nonnegative_int_from_env(
+                "OPENSQUILLA_MAX_ITERATIONS_DEADLINE_EXTEND_SECONDS",
+                AgentConfig().max_iterations_deadline_extend_seconds,
+            ),
+            final_diff_salvage_veto=_bool_from_env(
+                "OPENSQUILLA_FINAL_DIFF_SALVAGE_VETO",
+                AgentConfig().final_diff_salvage_veto,
+            ),
+            endgame_git_freeze_instrumentation_exempt=_bool_from_env(
+                "OPENSQUILLA_ENDGAME_GIT_FREEZE_INSTRUMENTATION_EXEMPT",
+                AgentConfig().endgame_git_freeze_instrumentation_exempt,
+            ),
+            deadline_wrapup_sticky_thinking_off=_bool_from_env(
+                "OPENSQUILLA_DEADLINE_WRAPUP_STICKY_THINKING_OFF",
+                AgentConfig().deadline_wrapup_sticky_thinking_off,
+            ),
+            endgame_fix_directive_margin_seconds=_nonnegative_int_from_env(
+                "OPENSQUILLA_ENDGAME_FIX_DIRECTIVE_MARGIN_SECONDS",
+                AgentConfig().endgame_fix_directive_margin_seconds,
+            ),
+            reasoning_only_act_now=_bool_from_env(
+                "OPENSQUILLA_REASONING_ONLY_ACT_NOW",
+                AgentConfig().reasoning_only_act_now,
+            ),
+            plan_only_act_now_threshold=_nonnegative_int_from_env(
+                "OPENSQUILLA_PLAN_ONLY_ACT_NOW_THRESHOLD",
+                AgentConfig().plan_only_act_now_threshold,
+            ),
             mid_budget_no_diff_nudge=_bool_from_env(
                 "OPENSQUILLA_MID_BUDGET_NO_DIFF_NUDGE",
                 AgentConfig().mid_budget_no_diff_nudge,
@@ -776,6 +981,7 @@ class AgentBootstrapStage:
                 "OPENSQUILLA_PROVIDER_HISTORY_DEDUP_MIN_REPEATS",
                 AgentConfig().provider_history_dedup_min_repeats,
             ),
+            projection_signal_hints=_projection_signal_hints_from_env(),
             tool_loop_observer_mode=_tool_loop_observer_mode_from_env(),
             runtime_recovery_mode=_runtime_recovery_mode_from_env(),
             runtime_recovery_source_loop_max_nudges=_positive_int_from_env(
@@ -818,6 +1024,12 @@ class AgentBootstrapStage:
             turn_call_logger=inp.turn_call_logger,
             memory_sync_manager=memory.sync_manager,
             tool_context=inp.tool_context,
+            turn_id=inp.turn_id,
+            session_id=inp.session_id_for_log,
+            session_epoch=inp.session_epoch,
+            agent_id=inp.agent_id,
+            run_kind=inp.run_kind,
+            provider_request_correlation=inp.provider_request_correlation,
         )
 
         return StageOutcome.success(

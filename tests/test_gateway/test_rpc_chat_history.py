@@ -1,3 +1,4 @@
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -5,7 +6,9 @@ import pytest
 
 from opensquilla.gateway.rpc import RpcContext
 from opensquilla.gateway.rpc_chat import _handle_chat_history
+from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import SessionSummary, TranscriptEntry
+from opensquilla.session.storage import SessionStorage
 
 
 class _FakeSessionManager:
@@ -42,6 +45,20 @@ class _FakeSessionManager:
         return self._summaries
 
 
+class _FakePagedSessionManager(_FakeSessionManager):
+    def __init__(self, entries, *, page=None, page_exception=None):
+        super().__init__(entries, canonical_entries=[_entry(99)])
+        self._page = page
+        self._page_exception = page_exception
+        self.page_calls = []
+
+    async def get_canonical_transcript_page(self, session_key, **kwargs):
+        self.page_calls.append((session_key, kwargs))
+        if self._page_exception is not None:
+            raise self._page_exception
+        return self._page
+
+
 def _entry(idx: int, role: str = "user") -> TranscriptEntry:
     return TranscriptEntry(
         id=idx,
@@ -75,6 +92,7 @@ async def test_chat_history_returns_pagination_metadata_with_legacy_messages() -
     assert result["loaded_count"] == 2
     assert result["page_size"] == 2
     assert result["canonical_available"] is True
+    assert result["canonical_complete"] is True
 
 
 @pytest.mark.asyncio
@@ -118,6 +136,164 @@ async def test_chat_history_uses_canonical_transcript_when_available() -> None:
         "message 3",
     ]
     assert result["canonical_available"] is True
+    assert result["canonical_complete"] is True
+
+
+@pytest.mark.asyncio
+async def test_chat_history_prefers_bounded_canonical_page_when_available() -> None:
+    mgr = _FakePagedSessionManager(
+        [_entry(4)],
+        page=SimpleNamespace(
+            entries=[_entry(2), _entry(3)],
+            has_more=True,
+            canonical_complete=False,
+        ),
+    )
+
+    result = await _handle_chat_history(
+        {
+            "sessionKey": "agent:main:webchat:test",
+            "limit": 2,
+            "before": "4|4",
+            "includeSummaries": False,
+        },
+        RpcContext(
+            conn_id="test",
+            principal=SimpleNamespace(role="operator"),
+            session_manager=mgr,
+        ),
+    )
+
+    assert [msg["text"] for msg in result["messages"]] == ["message 2", "message 3"]
+    assert result["has_more"] is True
+    assert result["canonical_available"] is True
+    assert result["canonical_complete"] is False
+    assert result["compaction_summaries"] == []
+    assert mgr.page_calls == [
+        (
+            "agent:main:webchat:test",
+            {"limit": 2, "before": (4, 4), "after": None},
+        )
+    ]
+    assert mgr.used_canonical is False
+
+
+@pytest.mark.asyncio
+async def test_chat_history_waits_for_same_connection_compaction_rewrite(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = SessionStorage(str(tmp_path / "history-compaction-race.db"))
+    await storage.connect()
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:compaction-race"
+    await manager.create(session_key)
+    persisted = [
+        await manager.append_message(session_key, "user", f"message {index}")
+        for index in range(4)
+    ]
+
+    mutation_lock = asyncio.Lock()
+    archive_written = asyncio.Event()
+    allow_rewrite = asyncio.Event()
+    history_requested_lock = asyncio.Event()
+    original_archive = storage._archive_transcript_entries
+
+    async def _pause_after_archive(**kwargs):
+        await original_archive(**kwargs)
+        archive_written.set()
+        await allow_rewrite.wait()
+
+    monkeypatch.setattr(storage, "_archive_transcript_entries", _pause_after_archive)
+
+    class _LockingTurnRunner:
+        def get_session_lock(self, key: str) -> asyncio.Lock:
+            assert key == session_key
+            history_requested_lock.set()
+            return mutation_lock
+
+    async def _compact() -> None:
+        async with mutation_lock:
+            await manager.persist_compaction_result(
+                session_key,
+                "summary",
+                [{"role": "user", "content": "message 3"}],
+                compaction_id="cmp-history-race",
+            )
+
+    compaction_task = asyncio.create_task(_compact())
+    history_task = None
+    try:
+        await asyncio.wait_for(archive_written.wait(), timeout=2)
+        history_task = asyncio.create_task(
+            _handle_chat_history(
+                {
+                    "sessionKey": session_key,
+                    "limit": 10,
+                    "includeSummaries": False,
+                },
+                RpcContext(
+                    conn_id="test",
+                    principal=SimpleNamespace(role="operator"),
+                    session_manager=manager,
+                    turn_runner=_LockingTurnRunner(),
+                ),
+            )
+        )
+        await asyncio.wait_for(history_requested_lock.wait(), timeout=2)
+        assert not history_task.done()
+
+        allow_rewrite.set()
+        await asyncio.wait_for(compaction_task, timeout=2)
+        result = await asyncio.wait_for(history_task, timeout=2)
+    finally:
+        allow_rewrite.set()
+        pending = [
+            task
+            for task in (compaction_task, history_task)
+            if task is not None and not task.done()
+        ]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        await storage.close()
+
+    assert [message["message_id"] for message in result["messages"]] == [
+        entry.message_id for entry in persisted
+    ]
+    assert len({message["message_id"] for message in result["messages"]}) == 4
+    assert result["canonical_complete"] is True
+
+
+@pytest.mark.asyncio
+async def test_chat_history_keeps_explicit_active_transcript_view_compatible() -> None:
+    mgr = _FakePagedSessionManager(
+        [_entry(3), _entry(4)],
+        page=SimpleNamespace(
+            entries=[_entry(1), _entry(2)],
+            has_more=True,
+            canonical_complete=True,
+        ),
+    )
+
+    result = await _handle_chat_history(
+        {
+            "sessionKey": "agent:main:webchat:test",
+            "limit": 10,
+            "includeCanonical": False,
+        },
+        RpcContext(
+            conn_id="test",
+            principal=SimpleNamespace(role="operator"),
+            session_manager=mgr,
+        ),
+    )
+
+    assert [msg["text"] for msg in result["messages"]] == ["message 3", "message 4"]
+    assert result["canonical_available"] is False
+    assert result["canonical_complete"] is False
+    assert mgr.page_calls == []
 
 
 @pytest.mark.asyncio
@@ -137,6 +313,29 @@ async def test_chat_history_falls_back_when_canonical_unavailable() -> None:
     assert mgr.used_canonical is True
     assert [msg["text"] for msg in result["messages"]] == ["message 1"]
     assert result["canonical_available"] is False
+    assert result["canonical_complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_chat_history_falls_back_to_active_when_paged_canonical_read_fails() -> None:
+    mgr = _FakePagedSessionManager(
+        [_entry(1)],
+        page_exception=OSError("temporary database read failure"),
+    )
+
+    result = await _handle_chat_history(
+        {"sessionKey": "agent:main:webchat:test", "limit": 10},
+        RpcContext(
+            conn_id="test",
+            principal=SimpleNamespace(role="operator"),
+            session_manager=mgr,
+        ),
+    )
+
+    assert [msg["text"] for msg in result["messages"]] == ["message 1"]
+    assert result["canonical_available"] is False
+    assert result["canonical_complete"] is False
+    assert mgr.used_canonical is False
 
 
 @pytest.mark.asyncio
@@ -196,6 +395,7 @@ async def test_chat_history_returns_empty_for_missing_webchat_session(
         "loaded_count": 0,
         "page_size": 2,
         "canonical_available": False,
+        "canonical_complete": True,
         "compaction_summaries": [],
     }
 

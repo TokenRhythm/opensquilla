@@ -32,6 +32,7 @@ import {
   truncateToolPreview,
 } from '@/utils/chat/toolDisplay'
 import { segmentsToTimelineItems } from '@/utils/chat/segmentsToTimelineItems'
+import { reconcileTextSnapshot } from '@/utils/chat/foldTurn'
 import { useChatTurnLog } from '@/composables/chat/useChatTurnLog'
 
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 630_000
@@ -87,7 +88,6 @@ export interface UseChatStreamOptions {
   renderMarkdown: (text: string, opts?: { highlight?: boolean }) => string
   stripDirectiveTags: (text: string) => string
   stripGeneratedArtifactMarkers: (text: string) => string
-  stripProtocolTextLeak: (text: string) => string
   scrollToBottom: () => void
   /** Resolution view-state keyed by approval id; threaded into the fold so each
    *  interrupt part is stamped with its resolution/busy/error. The approvals
@@ -139,14 +139,16 @@ export function useChatStream(options: UseChatStreamOptions) {
     return lastSignalAt.value > 0 && Date.now() - lastSignalAt.value > STALE_SIGNAL_MS
   })
 
-  // Phase narration on its own, used by the work-card head where elapsed and
+  // Phase narration on its own, used by the activity head where elapsed and
   // the step chip render as separate elements rather than one packed string.
   const streamPhaseLabel = computed(() => {
     streamActivityTick.value
     const now = Date.now()
     if (lastSignalAt.value > 0 && now - lastSignalAt.value > STALE_SIGNAL_MS) {
-      const silent = Math.floor((now - lastSignalAt.value) / 1000)
-      return i18n.global.t('chat.stream.stillWorking', { seconds: silent })
+      // Static on purpose: this feeds a polite live region, so a ticking
+      // seconds value here would be re-announced every second for the whole
+      // stall. The aria-hidden elapsed chip carries the seconds instead.
+      return i18n.global.t('chat.activity.stale')
     }
     const startedAt = streamActivity.value.startedAt || now
     const seconds = Math.max(0, Math.floor((now - startedAt) / 1000))
@@ -159,7 +161,11 @@ export function useChatStream(options: UseChatStreamOptions) {
   const streamPhaseElapsed = computed(() => {
     streamActivityTick.value
     const now = Date.now()
-    if (lastSignalAt.value > 0 && now - lastSignalAt.value > STALE_SIGNAL_MS) return ''
+    if (lastSignalAt.value > 0 && now - lastSignalAt.value > STALE_SIGNAL_MS) {
+      // During a stall the phase label is static for screen readers, so the
+      // silence duration ticks here, out of the announced sentence.
+      return `${Math.floor((now - lastSignalAt.value) / 1000)}s`
+    }
     const startedAt = streamActivity.value.startedAt || now
     const seconds = Math.max(0, Math.floor((now - startedAt) / 1000))
     return `${seconds}s`
@@ -172,10 +178,10 @@ export function useChatStream(options: UseChatStreamOptions) {
     return segmentsToTimelineItems(streamSegments.value, streamToolCalls.value, 'stream')
   })
 
-  // append-only turn log. In OFF mode (prod default) nothing below ever
-  // appends, so the live turn is byte-identical to legacy; in SHADOW (DEV) the
-  // mutators also append frames and the fold is parity-checked against the
-  // legacy refs. The fold never drives render in this PR (still 100% legacy).
+  // Append-only turn log. ON is the production default and drives the live
+  // activity surface; SHADOW is the development default and parity-checks the fold
+  // while legacy refs render; only the explicit OFF kill switch skips frames
+  // and restores the legacy render path.
   const turnLog = useChatTurnLog({
     renderMarkdown: options.renderMarkdown,
     toolCallGroups,
@@ -315,8 +321,11 @@ export function useChatStream(options: UseChatStreamOptions) {
     streamIdlePausedForApproval.value = false
 
     if (streamBubble.value) {
-      const cleanedText = options.stripProtocolTextLeak(
-        options.stripDirectiveTags(options.stripGeneratedArtifactMarkers(streamRaw.value)),
+      // `streamRaw` is the canonical backend answer. Do not guess that visible
+      // Markdown/XML is a leaked tool protocol: doing so mutates local history,
+      // copy/export/share, and can disagree with the durable server transcript.
+      const cleanedText = options.stripDirectiveTags(
+        options.stripGeneratedArtifactMarkers(streamRaw.value),
       ).trim()
 
       const sentinelOnly = !wasAborted && ['NO_REPLY', 'HEARTBEAT_OK'].includes(cleanedText)
@@ -768,7 +777,7 @@ export function useChatStream(options: UseChatStreamOptions) {
   // approval). This is deliberately lighter than startStreaming(): it does NOT
   // reset the log or the activity refs, so an interrupt frame appended right
   // after it survives. The turn stays open because an unresolved approval pauses
-  // the idle timer, so the fold-driven work-card keeps rendering the part.
+  // the idle timer, so the fold-driven activity surface keeps rendering the part.
   function ensureInterruptBubble() {
     if (streamBubble.value) return
     streamBubble.value = true
@@ -776,15 +785,23 @@ export function useChatStream(options: UseChatStreamOptions) {
     isStreaming.value = true
   }
 
-  function reconcileFinalText(finalText: string) {
-    if (finalText && finalText !== streamRaw.value) {
-      streamRaw.value = finalText
+  function reconcileFinalText(finalText: string | null | undefined) {
+    // null/undefined means the terminal event carried no authoritative text
+    // snapshot, so streamed deltas remain canonical. Empty string is distinct:
+    // it intentionally clears stale text while preserving tool history.
+    if (finalText == null) return
+
+    const reconciled = reconcileTextSnapshot(
+      streamSegments.value,
+      streamRaw.value,
+      finalText,
+    )
+    if (reconciled.changed) {
+      streamRaw.value = reconciled.rawText
+      streamSegments.value = reconciled.segments
+      scheduleRender()
     }
-    // Mirror the reconcile to the fold even when legacy was a no-op: the fold
-    // re-applies the same "override only when present and non-equal" rule
-    // against its own accumulated text, and overrides rawText without
-    // re-segmenting.
-    if (useReducer.value && finalText) appendFrame({ kind: 'final-text', text: finalText })
+    if (useReducer.value) appendFrame({ kind: 'final-text', text: finalText })
   }
 
   function isToolGroupOpen(groupId: string): boolean {

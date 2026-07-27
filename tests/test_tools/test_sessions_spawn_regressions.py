@@ -14,10 +14,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 
 import pytest
 
+from opensquilla.sandbox.run_context import RunContext
+from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.tools.builtin import sessions as sessions_tool
 from opensquilla.tools.types import CallerKind, ToolContext, current_tool_context
 
@@ -122,14 +125,30 @@ class _StubTaskRuntime:
     def __init__(self) -> None:
         self.enqueued: list[dict] = []
 
-    async def enqueue(self, envelope, message, mode="followup", run_kind="default"):
-        self.enqueued.append({"envelope": envelope, "run_kind": run_kind})
+    async def enqueue(
+        self,
+        envelope,
+        message,
+        mode="followup",
+        run_kind="default",
+        *,
+        task_id=None,
+        provider_request_correlation=None,
+    ):
+        self.enqueued.append(
+            {
+                "envelope": envelope,
+                "run_kind": run_kind,
+                "task_id": task_id,
+                "provider_request_correlation": provider_request_correlation,
+            }
+        )
 
         @dataclass
         class _Handle:
-            task_id: str = "task-stub"
+            task_id: str
 
-        return _Handle()
+        return _Handle(task_id or "task-stub")
 
 
 def _ctx() -> ToolContext:
@@ -141,6 +160,14 @@ def _ctx() -> ToolContext:
         session_key="agent:caller:main",
         task_id="task-parent",
     )
+
+
+def _full_host_ctx() -> ToolContext:
+    ctx = _ctx()
+    ctx.run_mode = "full"
+    ctx.elevated = "full"
+    ctx.sandbox_run_context = RunContext(run_mode=RunMode.FULL, source="request")
+    return ctx
 
 
 @pytest.fixture(autouse=True)
@@ -282,3 +309,52 @@ async def test_spawn_with_registry_raises_for_missing_agent() -> None:
             await sessions_tool.sessions_spawn(agent_id="ghost", task="hi")
     finally:
         current_tool_context.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_sessions_spawn_inherits_parent_full_host_run_mode() -> None:
+    mgr = _PaginatingSessionManager(
+        agents={"caller": {"id": "caller", "enabled": True}},
+        children_for_parent={},
+    )
+    rt = _StubTaskRuntime()
+    sessions_tool.set_session_manager(mgr)
+    sessions_tool.set_task_runtime(rt)
+
+    token = current_tool_context.set(_full_host_ctx())
+    try:
+        await sessions_tool.sessions_spawn(task="probe host write")
+    finally:
+        current_tool_context.reset(token)
+
+    assert len(rt.enqueued) == 1
+    envelope = rt.enqueued[0]["envelope"]
+    assert envelope.metadata["run_mode"] == "full"
+    assert envelope.metadata["elevated"] == "full"
+    assert envelope.metadata["sandbox_run_context"]["run_mode"] == "full"
+
+
+@pytest.mark.asyncio
+async def test_session_status_uses_current_tool_context_session_key() -> None:
+    expected = _StubRow(spawned_by=None)
+    expected.session_key = "agent:caller:main"
+    expected.session_id = "session-1"
+    expected.model = "test-model"
+
+    class _Manager:
+        async def get_session(self, session_key: str):
+            assert session_key == expected.session_key
+            return expected
+
+    sessions_tool.set_session_manager(_Manager())
+    token = current_tool_context.set(_full_host_ctx())
+    try:
+        payload = json.loads(await sessions_tool.session_status())
+    finally:
+        current_tool_context.reset(token)
+
+    assert payload["session_key"] == expected.session_key
+    assert payload["session_id"] == expected.session_id
+    assert payload["model"] == expected.model
+    assert payload["run_mode"] == "full"
+    assert payload["sandbox_enabled"] is False

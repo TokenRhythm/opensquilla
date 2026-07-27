@@ -49,6 +49,10 @@ def record_semantic_mutation_receipt(
     metadata: dict[str, Any] | None = None,
     ctx: ToolContext | None = None,
 ) -> dict[str, Any] | None:
+    from opensquilla.tools.run_mode import full_host_access_active
+
+    if full_host_access_active():
+        return None
     active = ctx if ctx is not None else current_tool_context.get()
     if active is None or not active.workspace_dir:
         return None

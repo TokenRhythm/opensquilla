@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -21,6 +22,19 @@ def _init_git_workspace(path: Path) -> None:
         check=True,
     )
     subprocess.run(["git", "config", "user.name", "Test User"], cwd=path, check=True)
+
+
+def _write_source_with_shell_redirection_command() -> str:
+    if os.name == "nt":
+        return "New-Item -ItemType Directory -Force -Path src | Out-Null; 'print(1)' > src/app.py"
+    return "mkdir -p src && printf 'print(1)\\n' > src/app.py"
+
+
+def _write_utf8_repro_command() -> str:
+    return (
+        'python -c "from pathlib import Path; '
+        "Path('debug_case.php').write_text('temporary repro\\n', encoding='utf-8')\""
+    )
 
 
 @pytest.fixture
@@ -62,7 +76,7 @@ async def test_exec_command_observes_workspace_mutation_without_model_visible_wr
 ) -> None:
     workspace, _scratch, ctx, events = mutation_context
     result = await exec_command(
-        "mkdir -p src && printf 'print(1)\\n' > src/app.py",
+        _write_source_with_shell_redirection_command(),
         workdir=str(workspace),
     )
 
@@ -115,7 +129,7 @@ async def test_exec_command_observes_suspected_shell_source_mutation(
         "exec_command",
     }
     result = await exec_command(
-        "mkdir -p src && printf 'print(1)\\n' > src/app.py",
+        _write_source_with_shell_redirection_command(),
         workdir=str(workspace),
     )
 
@@ -203,18 +217,22 @@ async def test_execute_code_observes_workspace_mutation_classification(
 
 
 @pytest.mark.asyncio
-async def test_exec_command_blocks_root_repro_files_as_scratch_artifacts(
+async def test_full_host_exec_command_allows_and_observes_root_repro_files(
     mutation_context,
 ) -> None:
     workspace, _scratch, ctx, events = mutation_context
     result = await exec_command(
-        "printf 'temporary repro\\n' > debug_case.php",
+        _write_utf8_repro_command(),
         workdir=str(workspace),
     )
-    payload = json.loads(result)
 
-    assert payload["status"] == "blocked"
-    assert payload["reason"] == "workspace_scratch_artifact"
-    assert payload["path"] == "debug_case.php"
-    assert ctx.workspace_mutation_records == []
-    assert not [event for event in events if event.get("name") == "workspace_mutation_observed"]
+    assert result.startswith("exit_code=0")
+    assert (workspace / "debug_case.php").read_text(encoding="utf-8") == "temporary repro\n"
+    assert ctx.workspace_mutation_records[0]["paths"] == [
+        {
+            "relative_path": "debug_case.php",
+            "status": "??",
+            "classification": "scratch",
+        }
+    ]
+    assert [event for event in events if event.get("name") == "workspace_mutation_observed"]

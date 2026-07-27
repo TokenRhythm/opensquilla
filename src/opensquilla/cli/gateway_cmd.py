@@ -237,7 +237,13 @@ def run_gateway(
         # Windows, where SIGTERM maps to an immediate TerminateProcess.
         app = getattr(server, "app", None)
         if app is not None and hasattr(app, "state"):
-            app.state.request_shutdown = _request_shutdown
+            install_shutdown_handler = getattr(
+                app.state, "install_shutdown_handler", None
+            )
+            if callable(install_shutdown_handler):
+                install_shutdown_handler(_request_shutdown)
+            else:
+                app.state.request_shutdown = _request_shutdown
         server_task = server._task
         waiter = asyncio.ensure_future(shutdown.wait())
         try:

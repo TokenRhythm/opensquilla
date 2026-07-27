@@ -26,7 +26,7 @@ the tool-build failure contract changes.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
@@ -50,6 +50,13 @@ class ProviderResolverPort(Protocol):
     """
 
     def resolve_provider(self) -> tuple[Any | None, Any | None]: ...
+
+
+@runtime_checkable
+class SkillCatalogResolverPort(Protocol):
+    """Resolve the immutable skill catalog pinned to one turn."""
+
+    async def resolve_skill_catalog(self) -> Any | None: ...
 
 @runtime_checkable
 class ToolBuilderPort(Protocol):
@@ -133,6 +140,7 @@ class ProviderAndToolsStageOutput:
     tool_handler: ToolHandler | None
     effective_tool_context: ToolContext | None
     tool_metadata: dict[str, Any] = field(default_factory=dict)
+    skill_catalog: Any | None = None
 
 # ---------------------------------------------------------------------------
 # Stage
@@ -165,9 +173,11 @@ class ProviderAndToolsStage:
         *,
         provider_resolver: ProviderResolverPort,
         tool_builder: ToolBuilderPort,
+        skill_catalog_resolver: SkillCatalogResolverPort | None = None,
     ) -> None:
         self._provider_resolver = provider_resolver
         self._tool_builder = tool_builder
+        self._skill_catalog_resolver = skill_catalog_resolver
 
     async def run(
         self,
@@ -177,7 +187,14 @@ class ProviderAndToolsStage:
         from opensquilla.engine.turn_runner.outcome import StageOutcome
         from opensquilla.engine.types import ErrorEvent
 
-        # 1. Resolve provider (clone to avoid shared state race)
+        # 1. Resolve the immutable skill snapshot first. Tool exposure and
+        # downstream skill selection must observe this exact generation for
+        # the whole turn, even if another request publishes a newer catalog.
+        skill_catalog = None
+        if self._skill_catalog_resolver is not None:
+            skill_catalog = await self._skill_catalog_resolver.resolve_skill_catalog()
+
+        # 2. Resolve provider (clone to avoid shared state race)
         provider, cloned_selector = self._provider_resolver.resolve_provider()
         if provider is None:
             # Construct the same ErrorEvent shape the original inline body
@@ -190,7 +207,7 @@ class ProviderAndToolsStage:
                 )
             )
 
-        # 2. Build tools (filtered by tool_context)
+        # 3. Build tools (filtered by tool_context)
         effective_ctx = inp.tool_context
         if effective_ctx is not None:
             effective_ctx = await self._tool_builder.with_artifact_context(
@@ -199,11 +216,22 @@ class ProviderAndToolsStage:
             effective_ctx = self._tool_builder.with_runtime_write_callbacks(
                 effective_ctx, inp.agent_id
             )
+            effective_ctx = replace(effective_ctx, skill_catalog=skill_catalog)
 
         tool_metadata: dict[str, Any] = {}
-        tool_defs, tool_handler = self._tool_builder.build_tools(
-            effective_ctx, metadata=tool_metadata
-        )
+        build_for_catalog = getattr(self._tool_builder, "build_tools_for_catalog", None)
+        if callable(build_for_catalog):
+            tool_defs, tool_handler = build_for_catalog(
+                effective_ctx,
+                skill_catalog=skill_catalog,
+                metadata=tool_metadata,
+            )
+        else:
+            # Compatibility for existing external/test ToolBuilderPort
+            # implementations that predate catalog snapshots.
+            tool_defs, tool_handler = self._tool_builder.build_tools(
+                effective_ctx, metadata=tool_metadata
+            )
 
         return StageOutcome.success(
             ProviderAndToolsStageOutput(
@@ -213,5 +241,6 @@ class ProviderAndToolsStage:
                 tool_handler=tool_handler,
                 effective_tool_context=effective_ctx,
                 tool_metadata=tool_metadata,
+                skill_catalog=skill_catalog,
             )
         )

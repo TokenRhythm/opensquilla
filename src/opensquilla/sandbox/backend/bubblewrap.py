@@ -46,6 +46,9 @@ from pathlib import Path
 from typing import Any, cast
 
 from opensquilla.sandbox.backend.base import Backend
+from opensquilla.sandbox.backend.filesystem_worker_policy import (
+    build_filesystem_worker_policy,
+)
 from opensquilla.sandbox.backend.linux_bwrap import (
     BwrapOptions,
     BwrapPlan,
@@ -72,7 +75,6 @@ from opensquilla.sandbox.backend.linux_proxy_bridge import (
 from opensquilla.sandbox.backend.linux_proxy_routing import proxy_env_for_inner_port
 from opensquilla.sandbox.backend.linux_readiness import probe_bwrap
 from opensquilla.sandbox.operation_runtime import (
-    SANDBOX_FILESYSTEM_WRITE_KINDS,
     FilesystemOperationRequest,
     SandboxOperation,
     SandboxOperationDomain,
@@ -81,12 +83,10 @@ from opensquilla.sandbox.operation_runtime import (
 from opensquilla.sandbox.types import (
     MountSpec,
     NetworkMode,
-    ResourceLimits,
     SandboxBackendError,
     SandboxPolicy,
     SandboxRequest,
     SandboxResult,
-    SecurityLevel,
 )
 
 log = logging.getLogger(__name__)
@@ -312,7 +312,13 @@ class BubblewrapBackend(Backend):
         worker_root = operation.workspace / ".opensquilla-cache" / "fs-worker"
         worker_root.mkdir(parents=True, exist_ok=True)
         payload_path = worker_root / f"{time.monotonic_ns()}.json"
-        policy = _filesystem_operation_policy(operation, payload_path)
+        policy = build_filesystem_worker_policy(
+            operation,
+            private_rw_roots=(payload_path.parent,),
+            private_ro_roots=(),
+            env_allowlist=("PATH", "PYTHONPATH", "HOME", "TMP", "TEMP"),
+            description=f"Linux filesystem worker policy for {operation.kind}",
+        )
         helper_payload = build_filesystem_helper_payload(
             operation,
             policy=policy,
@@ -481,49 +487,6 @@ def _with_linux_proxy_bridge(
         "port": bridge.upstream_port,
     }
     return replace(payload, policy=policy)
-
-
-def _filesystem_operation_policy(
-    operation: SandboxOperation,
-    payload_path: Path,
-) -> SandboxPolicy:
-    request = operation.request
-    if not isinstance(request, FilesystemOperationRequest):
-        raise SandboxBackendError("filesystem operation is missing filesystem request")
-    roots = []
-    for path in request.paths:
-        root = path.parent if operation.kind in SANDBOX_FILESYSTEM_WRITE_KINDS else path
-        while not root.exists() and root.parent != root:
-            root = root.parent
-        roots.append(root)
-    mounts = [
-        MountSpec(
-            host_path=root,
-            sandbox_path=root,
-            mode="rw" if operation.kind in SANDBOX_FILESYSTEM_WRITE_KINDS else "ro",
-            required=True,
-        )
-        for root in tuple(dict.fromkeys(roots))
-    ]
-    mounts.append(
-        MountSpec(
-            host_path=payload_path.parent,
-            sandbox_path=payload_path.parent,
-            mode="rw",
-            required=True,
-        )
-    )
-    return SandboxPolicy(
-        level=SecurityLevel.STANDARD,
-        network=NetworkMode.NONE,
-        mounts=tuple(mounts),
-        workspace_rw=False,
-        tmp_writable=True,
-        limits=ResourceLimits(cpu_seconds=30, memory_mb=1024, pids=64, wall_timeout_s=30),
-        env_allowlist=("PATH", "PYTHONPATH", "HOME", "TMP", "TEMP"),
-        require_approval=False,
-        description=f"Linux filesystem worker policy for {operation.kind}",
-    )
 
 
 __all__ = [

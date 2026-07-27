@@ -34,4 +34,35 @@ describe('ConfirmModal accessibility', () => {
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
     await expect(result).resolves.toBe(false)
   })
+
+  it('keeps cancellation and confirmation as distinct working actions', async () => {
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    app = createApp(ConfirmModal)
+    app.use(i18n)
+    app.mount(root)
+
+    const cancelled = useConfirm().confirm({
+      title: 'Discard changes?',
+      body: 'Unsaved edits will be lost.',
+      primaryLabel: 'Discard changes',
+    })
+    await nextTick()
+    await nextTick()
+    const cancel = document.querySelector<HTMLButtonElement>('.modal__footer .btn--ghost')
+    cancel?.click()
+    await expect(cancelled).resolves.toBe(false)
+
+    const confirmed = useConfirm().confirm({
+      title: 'Discard changes?',
+      body: 'Unsaved edits will be lost.',
+      primaryLabel: 'Discard changes',
+    })
+    await nextTick()
+    await nextTick()
+    const primary = document.querySelector<HTMLButtonElement>('.modal__footer .modal__primary')
+    expect(primary?.disabled).toBe(false)
+    primary?.click()
+    await expect(confirmed).resolves.toBe(true)
+  })
 })

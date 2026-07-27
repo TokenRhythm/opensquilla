@@ -47,6 +47,7 @@ from opensquilla.contracts.attachments import (
 )
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.origin_guard import forbidden_origin_response, request_origin_allowed
+from opensquilla.paths import native_io_path
 
 log = logging.getLogger(__name__)
 
@@ -132,7 +133,7 @@ class UploadStore:
         )
         self._lock_for_locks = asyncio.Lock()
         if self.marker_dir is not None:
-            self.marker_dir.mkdir(parents=True, exist_ok=True)
+            native_io_path(self.marker_dir).mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------ helpers
 
@@ -151,10 +152,11 @@ class UploadStore:
 
     def _read_marker(self, file_uuid: str) -> dict[str, Any] | None:
         path = self._marker_path(file_uuid)
-        if path is None or not path.exists():
+        if path is None:
             return None
+        native_path = native_io_path(path)
         try:
-            return cast(dict[str, Any], json.loads(path.read_text(encoding="utf-8")))
+            return cast(dict[str, Any], json.loads(native_path.read_text(encoding="utf-8")))
         except (OSError, json.JSONDecodeError):
             return None
 
@@ -172,7 +174,7 @@ class UploadStore:
         if path is None:
             return
         try:
-            path.write_text(json.dumps(meta), encoding="utf-8")
+            native_io_path(path).write_text(json.dumps(meta), encoding="utf-8")
         except OSError as exc:  # pragma: no cover - filesystem failure path
             log.warning("uploads.marker_write_failed uuid=%s err=%s", file_uuid, exc)
 
@@ -181,7 +183,7 @@ class UploadStore:
         if path is None:
             return
         try:
-            path.unlink(missing_ok=True)
+            native_io_path(path).unlink(missing_ok=True)
         except OSError:  # pragma: no cover
             pass
 

@@ -40,6 +40,28 @@ export function relativeTime(
   return `${Math.floor(diff / 86400)}d ago`
 }
 
+// Locale-aware coarse relative label for status readouts ("5 minutes ago",
+// "5 分钟前"). Chat rendering keeps the compact English `relativeTime` above.
+export function localizedRelativeTime(
+  ts: string | number | null | undefined,
+  locale: string,
+  now: number = Date.now(),
+): string {
+  const date = messageDate(ts)
+  if (!date) return ''
+  const diff = Math.max(0, (now - date.getTime()) / 1000)
+  let formatter: Intl.RelativeTimeFormat
+  try {
+    formatter = new Intl.RelativeTimeFormat(locale, { numeric: 'always' })
+  } catch {
+    formatter = new Intl.RelativeTimeFormat('en', { numeric: 'always' })
+  }
+  if (diff < 60) return formatter.format(-Math.max(1, Math.floor(diff)), 'second')
+  if (diff < 3600) return formatter.format(-Math.floor(diff / 60), 'minute')
+  if (diff < 86400) return formatter.format(-Math.floor(diff / 3600), 'hour')
+  return formatter.format(-Math.floor(diff / 86400), 'day')
+}
+
 // Compact absolute local time: time-only for today, "Mon DD, HH:MM" within the
 // current year, and a full date otherwise. Always in the browser locale + tz.
 export function absoluteTime(ts: string | number | null | undefined): string {

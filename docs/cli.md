@@ -63,18 +63,16 @@ opensquilla chat --session <session-key>
 opensquilla chat --standalone --workspace /path/to/project
 ```
 
-Terminal chat uses the stable Python-native terminal backend by default.
-OpenTUI is a preview backend selected explicitly with
-`OPENSQUILLA_TUI_BACKEND=opentui` when evaluating that backend. Normal terminal
-chat does not require Bun or OpenTUI node modules. The OpenTUI preview is for
-source checkouts with local Bun dependencies installed:
+Release installs use the stable Python-native terminal backend. The full-screen
+OpenTUI host is development-only and is not published as a release asset. It
+can be evaluated from a source checkout with pinned Bun dependencies installed:
 
 ```sh
 bun install --frozen-lockfile --cwd=src/opensquilla/cli/tui/opentui/package
-OPENSQUILLA_TUI_BACKEND=opentui uv run opensquilla chat
+OPENSQUILLA_TUI_DEV_SOURCE_HOST=1 uv run opensquilla chat --ui tui
 ```
 
-Legacy backend values are rejected before launch. Read [`tui.md`](tui.md) for
+Use `--ui plain` to select the rescue renderer explicitly. Read [`tui.md`](tui.md) for
 terminal chat usage and [`features/tui-frontend.md`](features/tui-frontend.md)
 for backend architecture, plugin slots, Router HUD, and replay benchmark
 workflow.
@@ -149,7 +147,7 @@ combined with `--repo`.
 install path. It requires Docker plus the `swebench` extra.
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended,swebench] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.0rc4/opensquilla-0.5.0rc4-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended,swebench] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.0/opensquilla-0.5.0-py3-none-any.whl"
 opensquilla swebench pull django__django-16429 --dataset verified
 opensquilla swebench solve django__django-16429 --dataset verified --json
 opensquilla swebench eval predictions.jsonl --dataset verified

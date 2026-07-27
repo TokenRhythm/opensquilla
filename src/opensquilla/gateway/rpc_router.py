@@ -17,6 +17,7 @@ per-session gating. These handlers observe routing; they never change it.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 from collections.abc import Mapping
@@ -51,8 +52,13 @@ _WIRE_KEYS: tuple[tuple[str, str], ...] = (
     ("probs", "probs"),
     ("flags", "flags"),
     ("final_tier", "finalTier"),
+    ("requested_provider", "requestedProvider"),
+    ("requested_model", "requestedModel"),
     ("provider", "provider"),
     ("model", "model"),
+    ("executed_provider", "executedProvider"),
+    ("executed_model", "executedModel"),
+    ("fallback_reason", "fallbackReason"),
     ("thinking_level", "thinkingLevel"),
     ("source", "source"),
     ("trail", "trail"),
@@ -103,7 +109,8 @@ async def _handle_router_decisions_list(params: Any, ctx: RpcContext) -> dict[st
         return {"decisions": []}
     p = params if isinstance(params, dict) else {}
     session_key = p.get("sessionKey") or p.get("session_key")
-    rows = writer.list_decisions(
+    rows = await asyncio.to_thread(
+        writer.list_decisions,
         session_key=str(session_key) if session_key else None,
         limit=_bounded_limit(p.get("limit")),
         before_ts_ms=_optional_int_param(p.get("beforeTs") or p.get("before_ts_ms")),

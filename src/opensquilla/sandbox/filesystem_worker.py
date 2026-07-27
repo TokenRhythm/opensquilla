@@ -10,13 +10,15 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from opensquilla.sandbox.directory_listing import format_directory_entry
+
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = list(sys.argv[1:] if argv is None else argv)
     try:
         if len(args) != 1:
-            raise ValueError("filesystem worker expects one payload path")
-        payload = _load_payload(Path(args[0]))
+            raise ValueError("filesystem worker expects one payload source")
+        payload = _load_payload(args[0])
         result = _run(payload)
         print(json.dumps(result, ensure_ascii=False))
     except Exception as exc:
@@ -33,8 +35,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit(1) from None
 
 
-def _load_payload(path: Path) -> dict[str, Any]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
+def _load_payload(source: str | Path) -> dict[str, Any]:
+    raw_payload = (
+        sys.stdin.read()
+        if str(source) == "-"
+        else Path(source).read_text(encoding="utf-8")
+    )
+    try:
+        payload = json.loads(raw_payload)
+    except json.JSONDecodeError as exc:
+        raise ValueError("filesystem worker payload must be valid JSON") from exc
     if not isinstance(payload, dict):
         raise ValueError("filesystem worker payload must be an object")
     return payload
@@ -71,6 +81,15 @@ def _required_string(payload: dict[str, Any], key: str) -> str:
     if not isinstance(value, str):
         raise ValueError(f"filesystem operation missing {key}")
     return value
+
+
+def _required_paths(payload: dict[str, Any], key: str) -> tuple[Path, ...]:
+    values = payload.get(key)
+    if not isinstance(values, list) or not values:
+        raise ValueError(f"filesystem operation missing {key}")
+    if not all(isinstance(value, str) and value for value in values):
+        raise ValueError(f"filesystem operation {key} must contain paths")
+    return tuple(Path(value).resolve(strict=False) for value in values)
 
 
 def _optional_positive_int(payload: dict[str, Any], key: str) -> int | None:
@@ -123,10 +142,8 @@ def _list_dir(payload: dict[str, Any]) -> dict[str, object]:
     dirs: list[str] = []
     files: list[str] = []
     for entry in sorted(path.iterdir(), key=lambda item: item.name):
-        if entry.is_dir():
-            dirs.append(f"[dir]  {entry.name}/")
-        else:
-            files.append(f"[file] {entry.name} ({entry.stat().st_size} bytes)")
+        is_directory, line = format_directory_entry(entry)
+        (dirs if is_directory else files).append(line)
     entries = dirs + files
     return {"message": "\n".join(entries) if entries else f"{display_path}: (empty directory)"}
 
@@ -222,8 +239,13 @@ def _apply_patch(payload: dict[str, Any]) -> dict[str, object]:
 
     patch = _required_string(payload, "patch")
     root = _required_path(payload, "root")
+    authorized_paths = _required_paths(payload, "paths")
     ops = patch_tool._parse_patch(patch)
-    added, modified, deleted, _planned = patch_tool._apply_ops(ops, root)
+    added, modified, deleted, _planned = patch_tool._apply_ops(
+        ops,
+        root,
+        authorized_paths=authorized_paths,
+    )
     return {
         "message": _patch_summary(added=added, modified=modified, deleted=deleted),
         "created": added > 0,

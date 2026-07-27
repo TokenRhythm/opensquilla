@@ -12,7 +12,7 @@ UI, CLI, channels, and gateway control console.
 Install OpenSquilla with the MCP extra when you need this bridge:
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended,mcp] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.0rc4/opensquilla-0.5.0rc4-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended,mcp] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.0/opensquilla-0.5.0-py3-none-any.whl"
 ```
 
 Start the OpenSquilla gateway:

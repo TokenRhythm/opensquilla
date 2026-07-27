@@ -23,8 +23,97 @@ env:
   RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
 
 jobs:
+  build-control-ui:
+    name: Build verified Web UI artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ env.RELEASE_TAG != '' && env.RELEASE_TAG || github.ref }}
+
+      - name: Detect Web UI artifact contract
+        id: webui-contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f opensquilla-webui/.node-version \
+             && -f opensquilla-webui/package-lock.json \
+             && -f opensquilla-webui/scripts/verify-dist.mjs ]]; then
+            echo "mode=source-built" >> "${GITHUB_OUTPUT}"
+          elif [[ -f src/opensquilla/gateway/static/dist/index.html ]]; then
+            # Tags created before generated artifacts were removed from Git
+            # remain repairable through the documented existing-tag input.
+            echo "mode=legacy-committed" >> "${GITHUB_OUTPUT}"
+          else
+            echo "No source-build contract or legacy committed Web UI artifact found" >&2
+            exit 1
+          fi
+
+      - name: Set up Node.js
+        if: steps.webui-contract.outputs.mode == 'source-built'
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+          cache: npm
+          cache-dependency-path: opensquilla-webui/package-lock.json
+
+      - name: Install Web UI dependencies
+        if: steps.webui-contract.outputs.mode == 'source-built'
+        working-directory: opensquilla-webui
+        run: npm ci
+
+      - name: Build and verify Web UI
+        if: steps.webui-contract.outputs.mode == 'source-built'
+        working-directory: opensquilla-webui
+        run: |
+          npm run build
+          npm run verify:release-dist
+
+      - name: Validate legacy committed Web UI
+        if: steps.webui-contract.outputs.mode == 'legacy-committed'
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path("src/opensquilla/gateway/static/dist")
+          assert (root / "index.html").is_file(), "legacy Web UI entrypoint is missing"
+          allowed_music = {"music/README.md", "music/playlist.json"}
+          personal_music = sorted(
+              path.relative_to(root).as_posix()
+              for path in (root / "music").rglob("*")
+              if path.is_file() and path.relative_to(root).as_posix() not in allowed_music
+          ) if (root / "music").is_dir() else []
+          assert not personal_music, (
+              f"personal BGM is forbidden in legacy release artifacts: {personal_music}"
+          )
+          playlist = root / "music/playlist.json"
+          if playlist.is_file():
+              data = json.loads(playlist.read_text(encoding="utf-8"))
+              assert isinstance(data, dict) and data.get("tracks") == [], (
+                  "legacy official music/playlist.json must keep tracks empty"
+              )
+          print("Validated legacy committed Web UI artifact")
+          PY
+
+      - name: Upload Web UI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # Keep the name stable when only failed consumer jobs are rerun.
+          name: opensquilla-release-webui-dist
+          path: src/opensquilla/gateway/static/dist/
+          if-no-files-found: error
+          # Keep this through GitHub's 30-day workflow rerun window.
+          retention-days: 31
+          overwrite: true
+
   build-release-assets:
     name: Build Python release assets
+    needs: build-control-ui
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
@@ -42,6 +131,12 @@ jobs:
           lfs: true
           persist-credentials: false
           ref: ${{ env.RELEASE_TAG != '' && env.RELEASE_TAG || github.ref }}
+
+      - name: Download verified Web UI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: opensquilla-release-webui-dist
+          path: src/opensquilla/gateway/static/dist/
 
       - name: Hydrate router assets
         shell: bash
@@ -107,6 +202,43 @@ jobs:
           rm -rf dist build/wheelhouse-zip
           uv build --wheel --out-dir dist
 
+      - name: Verify wheel contains the exact Web UI artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheels=(dist/opensquilla-*.whl)
+          if [[ "${#wheels[@]}" -ne 1 || ! -f "${wheels[0]}" ]]; then
+            echo "Expected exactly one versioned wheel" >&2
+            exit 1
+          fi
+          if [[ -f scripts/verify_webui_artifact.py ]]; then
+            python scripts/verify_webui_artifact.py \
+              --forbid-personal-bgm \
+              --wheel "${wheels[0]}"
+          else
+            WHEEL_PATH="${wheels[0]}" python - <<'PY'
+          import os
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          root = Path("src/opensquilla/gateway/static/dist")
+          prefix = "opensquilla/gateway/static/dist/"
+          expected = {
+              path.relative_to(root).as_posix(): path.read_bytes()
+              for path in root.rglob("*")
+              if path.is_file()
+          }
+          with ZipFile(os.environ["WHEEL_PATH"]) as archive:
+              packaged = {
+                  name.removeprefix(prefix): archive.read(name)
+                  for name in archive.namelist()
+                  if name.startswith(prefix) and not name.endswith("/")
+              }
+          assert packaged == expected, "legacy wheel Web UI differs from committed artifact"
+          print(f"Verified legacy wheel Web UI ({len(expected)} files)")
+          PY
+          fi
+
       - name: Smoke versioned release artifacts
         shell: bash
         run: |
@@ -126,6 +258,14 @@ jobs:
           )
 
           with ZipFile(wheels[0]) as archive:
+              names = set(archive.namelist())
+              assert "opensquilla/gateway/static/dist/index.html" in names, (
+                  "release wheel is missing the Web UI entrypoint"
+              )
+              if Path("scripts/verify_webui_artifact.py").is_file():
+                  assert "opensquilla/gateway/static/dist/webui-artifact-manifest.json" in names, (
+                      "release wheel is missing the verified Web UI manifest"
+                  )
               for info in archive.infolist():
                   if not info.filename.endswith((".bin", ".onnx", ".pkl", ".joblib")):
                       continue
@@ -166,9 +306,11 @@ jobs:
           path: |
             dist/*.whl
             dist/SHA256SUMS
+          overwrite: true
 
   build-desktop-macos:
     name: Build macOS Electron installer
+    needs: build-control-ui
     runs-on: macos-latest
     timeout-minutes: 150
     steps:
@@ -178,6 +320,12 @@ jobs:
           lfs: true
           persist-credentials: false
           ref: ${{ env.RELEASE_TAG != '' && env.RELEASE_TAG || github.ref }}
+
+      - name: Download verified Web UI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: opensquilla-release-webui-dist
+          path: src/opensquilla/gateway/static/dist/
 
       - name: Hydrate router assets
         run: git lfs pull --include="src/opensquilla/squilla_router/models/**"
@@ -197,13 +345,7 @@ jobs:
         with:
           node-version: "22.12.0"
           cache: npm
-          cache-dependency-path: |
-            opensquilla-webui/package-lock.json
-            desktop/electron/package-lock.json
-
-      - name: Install Web UI dependencies
-        working-directory: opensquilla-webui
-        run: npm ci
+          cache-dependency-path: desktop/electron/package-lock.json
 
       - name: Install Electron dependencies
         working-directory: desktop/electron
@@ -218,7 +360,6 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          npm run build:web
           npm run build:gateway
           npm run build
           npx electron-builder --mac --publish never
@@ -260,9 +401,11 @@ jobs:
             dist/desktop-electron/*.zip
             dist/desktop-electron/*.blockmap
             dist/desktop-electron/latest-mac.yml
+          overwrite: true
 
   build-desktop-windows:
     name: Build unsigned Windows Electron installer
+    needs: build-control-ui
     runs-on: windows-latest
     timeout-minutes: 150
     steps:
@@ -272,6 +415,12 @@ jobs:
           lfs: true
           persist-credentials: false
           ref: ${{ env.RELEASE_TAG != '' && env.RELEASE_TAG || github.ref }}
+
+      - name: Download verified Web UI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: opensquilla-release-webui-dist
+          path: src/opensquilla/gateway/static/dist/
 
       - name: Hydrate router assets
         shell: bash
@@ -292,13 +441,7 @@ jobs:
         with:
           node-version: "22.12.0"
           cache: npm
-          cache-dependency-path: |
-            opensquilla-webui/package-lock.json
-            desktop/electron/package-lock.json
-
-      - name: Install Web UI dependencies
-        working-directory: opensquilla-webui
-        run: npm ci
+          cache-dependency-path: desktop/electron/package-lock.json
 
       - name: Install Electron dependencies
         working-directory: desktop/electron
@@ -311,7 +454,6 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: |
           set -euo pipefail
-          npm run build:web
           npm run build:gateway
           npm run build
           npx electron-builder --win --publish never
@@ -353,6 +495,7 @@ jobs:
             dist/desktop-electron/*.exe
             dist/desktop-electron/*.blockmap
             dist/desktop-electron/latest.yml
+          overwrite: true
 
   publish-release:
     name: Publish release assets
@@ -480,6 +623,7 @@ jobs:
         with:
           name: opensquilla-release-assets-${{ env.RELEASE_PROFILE }}
           path: dist/*
+          overwrite: true
 
       - name: Upload to GitHub Release
         if: ${{ github.event_name == 'push' || github.event.inputs.tag != '' }}

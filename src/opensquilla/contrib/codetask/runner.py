@@ -27,6 +27,8 @@ from opensquilla.contrib.codetask.inputs import InputError, TaskSpec, render_tas
 from opensquilla.contrib.codetask.preflight import provider_block_reason, provider_preflight
 from opensquilla.contrib.codetask.types import TaskResult, TaskState
 from opensquilla.contrib.codetask.verification import verify
+from opensquilla.paths import default_opensquilla_home
+from opensquilla.profile_operation_lock import ProfileOperationLock
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +182,7 @@ def _render_retry_prompt(
     )
 
 
-def solve(
+def _solve_unlocked(
     *,
     repo: str = "",
     issue: int | None = None,
@@ -628,6 +630,47 @@ def solve(
 
     _persist(result)
     return result
+
+
+def solve(
+    *,
+    repo: str = "",
+    issue: int | None = None,
+    task: str | None = None,
+    task_file: str | None = None,
+    base_ref: str | None = None,
+    shallow: bool = False,
+    model: str = "",
+    thinking: str = "",
+    timeout: int = config.DEFAULT_AGENT_TIMEOUT,
+    verification_mode: str = "red-green",
+    run_id: str | None = None,
+    max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
+) -> TaskResult:
+    """Run one code-task while excluding concurrent profile lifecycle mutations."""
+
+    with ProfileOperationLock(default_opensquilla_home()):
+        try:
+            return _solve_unlocked(
+                repo=repo,
+                issue=issue,
+                task=task,
+                task_file=task_file,
+                base_ref=base_ref,
+                shallow=shallow,
+                model=model,
+                thinking=thinking,
+                timeout=timeout,
+                verification_mode=verification_mode,
+                run_id=run_id,
+                max_attempts=max_attempts,
+            )
+        except (InputError, workspace.WorkspaceError):
+            raise
+        except Exception as exc:
+            if run_id:
+                _write_status(run_id, "crashed", error=str(exc)[:500])
+            raise
 
 
 def _archive_manifest(scratch: Path, run_id: str) -> None:

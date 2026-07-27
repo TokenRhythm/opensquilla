@@ -4,6 +4,8 @@
 # Installer contract:
 #   - installs into a user-owned prefix (never /usr/local, /opt, or admin paths)
 #   - prefers uv tool install; falls back to pip --user; errors clearly if neither exists
+#   - requires the Node.js version pinned by opensquilla-webui/.node-version,
+#     runs npm ci + npm run build, and packages that exact Web UI
 #   - defaults to the "recommended" runtime profile (memory + bundled v4 router)
 #     and allows `OPENSQUILLA_INSTALL_PROFILE=core` to opt back down
 #   - prints a post-install banner documenting the default bind
@@ -68,6 +70,17 @@ fi
 
 dry_run="${OPENSQUILLA_INSTALL_DRY_RUN:-0}"
 profile="${cli_profile:-${OPENSQUILLA_INSTALL_PROFILE:-recommended}}"
+webui_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/opensquilla-webui"
+node_version_file="${webui_dir}/.node-version"
+if [[ ! -f "${node_version_file}" ]]; then
+    echo "install_source.sh: required Node.js version file is missing: ${node_version_file}" >&2
+    exit 1
+fi
+minimum_node_version="$(tr -d '[:space:]' < "${node_version_file}")"
+if [[ -z "${minimum_node_version}" ]]; then
+    echo "install_source.sh: required Node.js version file is empty: ${node_version_file}" >&2
+    exit 1
+fi
 
 valid_extras=" matrix matrix-e2e document-extras "
 extras_csv="${OPENSQUILLA_INSTALL_EXTRAS:-}"
@@ -176,6 +189,44 @@ check_squilla_router_assets() {
     fi
 }
 
+build_webui() {
+    if ! command -v node >/dev/null 2>&1; then
+        echo "install_source.sh: Node.js >= ${minimum_node_version} is required to build the Web UI from source." >&2
+        echo "install_source.sh: install Node.js, or use an official wheel/Desktop installer (no Node.js required)." >&2
+        exit 1
+    fi
+    if ! node -e '
+        const installed = process.versions.node.split(".").map(Number);
+        const required = process.argv[1].replace(/^v/, "").split(".").map(Number);
+        let comparison = 0;
+        for (const index of [0, 1, 2]) {
+          comparison = (installed[index] ?? 0) - (required[index] ?? 0);
+          if (comparison !== 0) break;
+        }
+        process.exit(comparison >= 0 ? 0 : 1);
+    ' "${minimum_node_version}"; then
+        echo "install_source.sh: Node.js >= ${minimum_node_version} is required; found $(node --version 2>/dev/null || echo unknown)." >&2
+        echo "install_source.sh: upgrade Node.js, or use an official wheel/Desktop installer (no Node.js required)." >&2
+        exit 1
+    fi
+    if ! command -v npm >/dev/null 2>&1; then
+        echo "install_source.sh: npm is required to build the Web UI from source." >&2
+        echo "install_source.sh: install npm, or use an official wheel/Desktop installer (no npm required)." >&2
+        exit 1
+    fi
+    if [[ ! -f "${webui_dir}/package-lock.json" ]]; then
+        echo "install_source.sh: Web UI package lock is missing: ${webui_dir}/package-lock.json" >&2
+        exit 1
+    fi
+
+    echo "install_source.sh: installing locked Web UI dependencies (npm ci)"
+    (
+        cd "${webui_dir}"
+        npm ci
+        npm run build
+    )
+}
+
 # --- installer selection ----------------------------------------------------
 
 installer=""
@@ -259,10 +310,13 @@ verify_install() {
         echo "install_source.sh: run 'uv tool update-shell' (or open a new shell), then: opensquilla code-task --help" >&2
     fi
     command -v git  >/dev/null 2>&1 || echo "install_source.sh: WARNING - 'git' not found; code-task cannot clone repositories without it." >&2
-    command -v node >/dev/null 2>&1 || echo "install_source.sh: note - 'node' not found (only needed for code-task build-mode apps)." >&2
+    command -v node >/dev/null 2>&1 || echo "install_source.sh: WARNING - 'node' is no longer available; future source installs, Web UI rebuilds, and code-task build-mode apps require it." >&2
 }
 
 if [[ "${dry_run}" = "1" ]]; then
+    echo "install_source.sh: dry-run — would require Node.js >= ${minimum_node_version} and npm"
+    echo "install_source.sh: dry-run — would run in ${webui_dir}: npm ci"
+    echo "install_source.sh: dry-run — would run in ${webui_dir}: npm run build"
     echo "install_source.sh: dry-run — would run: ${install_cmd}"
     echo "install_source.sh: dry-run — prefix: ${prefix}"
     check_squilla_router_assets warn
@@ -276,6 +330,7 @@ fi
 # --- execute ---------------------------------------------------------------
 
 check_squilla_router_assets
+build_webui
 
 echo "install_source.sh: installing via ${installer} into prefix ${prefix}"
 echo "install_source.sh: running: ${install_cmd}"

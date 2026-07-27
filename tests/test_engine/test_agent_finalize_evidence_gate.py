@@ -585,3 +585,166 @@ async def test_gate_quiet_when_trailing_execution_was_denied(tmp_path) -> None:
     assert "finalize_evidence_gate_detections" not in agent.config.metadata
     done_events = [event for event in events if isinstance(event, DoneEvent)]
     assert done_events[-1].text == "final attempt 4"
+
+
+# ---------------------------------------------------------------------------
+# Strict mode (OPENSQUILLA_FINALIZE_EVIDENCE_STRICT)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_strict_gate_accepts_green_only_run(tmp_path) -> None:
+    """A green-only run (edit, suite passes, finalize) must sail through
+    strict mode unchallenged: red-first state is report-only because
+    never-red is a routine signature of legitimately solved runs."""
+
+    _init_git_workspace(tmp_path)
+    runtime_events_path = tmp_path / "runtime_events.jsonl"
+    provider = _ScriptedProvider(
+        [
+            ("edit", "src.py"),
+            ("exec", "pytest tests/test_src.py"),
+            ("final",),
+        ]
+    )
+    tool_context = ToolContext(workspace_dir=str(tmp_path))
+    agent = Agent(
+        provider=provider,
+        config=_gate_config(
+            tmp_path,
+            finalize_evidence_strict=True,
+            runtime_events_path=str(runtime_events_path),
+        ),
+        tool_handler=_make_tool_handler(tmp_path, tool_context),
+        tool_context=tool_context,
+    )
+
+    events = [event async for event in agent.run_turn("Fix the bug")]
+
+    assert len(provider.calls) == 3
+    assert _gate_warnings(events) == []
+    assert "finalize_evidence_gate_detections" not in agent.config.metadata
+    done_events = [event for event in events if isinstance(event, DoneEvent)]
+    assert done_events[-1].text == "final attempt 3"
+
+    if runtime_events_path.exists():
+        logged = [
+            json.loads(line) for line in runtime_events_path.read_text().splitlines()
+        ]
+        assert not [
+            event
+            for event in logged
+            if event.get("name") == "finalize_evidence_gate.challenge"
+        ]
+
+
+@pytest.mark.asyncio
+async def test_strict_gate_zero_verification_challenge_never_blocks(tmp_path) -> None:
+    _init_git_workspace(tmp_path)
+    runtime_events_path = tmp_path / "runtime_events.jsonl"
+    provider = _ScriptedProvider(
+        [
+            ("edit", "src.py"),
+            ("final",),
+            # The model finalizes again without running anything: same
+            # observation key, so the gate stays quiet and the run finishes.
+            ("final",),
+        ]
+    )
+    tool_context = ToolContext(workspace_dir=str(tmp_path))
+    agent = Agent(
+        provider=provider,
+        config=_gate_config(
+            tmp_path,
+            finalize_evidence_strict=True,
+            runtime_events_path=str(runtime_events_path),
+        ),
+        tool_handler=_make_tool_handler(tmp_path, tool_context),
+        tool_context=tool_context,
+    )
+
+    events = [event async for event in agent.run_turn("Fix the bug")]
+
+    assert len(provider.calls) == 3
+    challenge_messages = [
+        message.content
+        for message in provider.calls[2]
+        if isinstance(message.content, str)
+        and message.content.startswith("[Finalize evidence check]")
+    ]
+    assert len(challenge_messages) == 1
+    assert "no execution-level command ran at any point" in challenge_messages[0]
+    assert len(_gate_warnings(events)) == 1
+    done_events = [event for event in events if isinstance(event, DoneEvent)]
+    assert done_events[-1].text == "final attempt 3"
+
+    logged = [
+        json.loads(line) for line in runtime_events_path.read_text().splitlines()
+    ]
+    challenges = [
+        event for event in logged if event.get("name") == "finalize_evidence_gate.challenge"
+    ]
+    assert [event["injected_to_model"] for event in challenges] == [True, False]
+    assert "zero_verification" in challenges[0]["details"]["triggers"]
+
+
+@pytest.mark.asyncio
+async def test_strict_flag_activates_tracker_without_base_gate(tmp_path) -> None:
+    # zero_verification is the only strict trigger; an edit-then-finalize run
+    # with no execution at all must draw the challenge even when the base
+    # gate flag is off.
+    _init_git_workspace(tmp_path)
+    provider = _ScriptedProvider(
+        [
+            ("edit", "src.py"),
+            ("final",),
+            ("final",),
+        ]
+    )
+    tool_context = ToolContext(workspace_dir=str(tmp_path))
+    agent = Agent(
+        provider=provider,
+        config=_gate_config(tmp_path, enabled=False, finalize_evidence_strict=True),
+        tool_handler=_make_tool_handler(tmp_path, tool_context),
+        tool_context=tool_context,
+    )
+
+    events = [event async for event in agent.run_turn("Fix the bug")]
+
+    assert len(provider.calls) == 3
+    assert len(_gate_warnings(events)) == 1
+    assert agent.config.metadata["finalize_evidence_gate_detections"] == 2
+    done_events = [event for event in events if isinstance(event, DoneEvent)]
+    assert done_events[-1].text == "final attempt 3"
+
+
+@pytest.mark.asyncio
+async def test_base_gate_without_strict_accepts_never_red_run(tmp_path) -> None:
+    """Default-off safety: the strict triggers must not fire when only the
+    base gate is enabled, even on a green-only (never-red) run."""
+
+    _init_git_workspace(tmp_path)
+    provider = _ScriptedProvider(
+        [
+            ("edit", "src.py"),
+            ("exec", "pytest tests/test_src.py"),
+            ("final",),
+        ]
+    )
+    tool_context = ToolContext(workspace_dir=str(tmp_path))
+    config = _gate_config(tmp_path)
+    assert config.finalize_evidence_strict is False
+    agent = Agent(
+        provider=provider,
+        config=config,
+        tool_handler=_make_tool_handler(tmp_path, tool_context),
+        tool_context=tool_context,
+    )
+
+    events = [event async for event in agent.run_turn("Fix the bug")]
+
+    assert len(provider.calls) == 3
+    assert _gate_warnings(events) == []
+    assert "finalize_evidence_gate_detections" not in agent.config.metadata
+    done_events = [event for event in events if isinstance(event, DoneEvent)]
+    assert done_events[-1].text == "final attempt 3"

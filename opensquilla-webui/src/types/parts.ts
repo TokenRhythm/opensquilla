@@ -56,6 +56,7 @@ export type InterruptResolution =
   | 'approved'
   | 'denied'    // approval outcomes (explicit human deny)
   | 'expired'   // approval lapsed without a response
+  | 'unavailable' // approval no longer exists on the authoritative Gateway
   | 'replied'   // clarify submitted
 
 /**

@@ -1,4 +1,4 @@
-import { ref, type Ref } from 'vue'
+import { computed, ref, type Ref } from 'vue'
 import i18n from '@/i18n'
 
 type RpcClient = {
@@ -94,11 +94,23 @@ function makeArgCandidate(parent: ChatSlashCommand, choice: ArgumentChoice): Cha
     name: full,
     cmd: full,
     label: full,
-    desc: choice.description,
+    desc: localizedMetaDescription(choice),
     aliases: [],
     execution: parent.execution,
     argValue: choice.value,
   }
+}
+
+function localizedMetaDescription(choice: ArgumentChoice): string {
+  const keys: Record<string, string> = {
+    AwesomeWebpageMetaSkill: 'chat.metaDescriptions.webpage',
+    'meta-kid-project-planner': 'chat.metaDescriptions.kidsProject',
+    'meta-short-drama': 'chat.metaDescriptions.shortDrama',
+    'meta-skill-creator': 'chat.metaDescriptions.skillCreator',
+    'meta-paper-write': 'chat.metaDescriptions.paperWriting',
+  }
+  const key = keys[choice.value]
+  return key ? i18n.global.t(key) : choice.description
 }
 
 export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
@@ -107,6 +119,18 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
   const slashCmds = ref<ChatSlashCommand[]>([])
   const filteredSlashCmds = ref<ChatSlashCommand[]>([])
   const slashCatalogLoaded = ref(false)
+  const metaSkillChoices = computed(() => {
+    const command = slashCmds.value.find(c => slashCommandKey(c.name) === '/meta')
+    const choices = command?.argumentChoices || []
+    const preferred = [
+      'AwesomeWebpageMetaSkill',
+      'meta-short-drama',
+      'meta-paper-write',
+    ]
+    return preferred
+      .map(name => choices.find(choice => choice.value === name))
+      .filter((choice): choice is ArgumentChoice => Boolean(choice))
+  })
 
   async function loadSlashCommands() {
     try {
@@ -236,19 +260,29 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
         // run path, with a skill name supplied (e.g. Enter on "/meta <skill>").
         const skillName = String(args || '').trim()
         if (!skillName) break
-        // Stamp the launch, then trigger a turn so the pipeline seeds the
-        // marker and the orchestrator runs the skill.
-        options.rpc.call<{ ok?: boolean; error?: string }>('meta.run', { name: skillName, sessionKey: options.sessionKey.value })
-          .then((result) => {
-            if (result?.ok) {
-              options.dispatchHidden('/meta ' + skillName, '/meta ' + skillName)
-            } else {
-              options.notify(result?.error || i18n.global.t('chat.metaRuns.couldNotRunSkill', { skill: skillName }))
-            }
-          })
-          .catch((err: unknown) => options.notify(i18n.global.t('chat.metaRuns.couldNotRunSkillError', { error: err instanceof Error ? err.message : String(err) })))
+        void runMetaSkill(skillName)
         break
       }
+    }
+  }
+
+  async function runMetaSkill(skillName: string): Promise<void> {
+    const name = String(skillName || '').trim()
+    if (!name) return
+    try {
+      const result = await options.rpc.call<{ ok?: boolean; error?: string }>('meta.run', {
+        name,
+        sessionKey: options.sessionKey.value,
+      })
+      if (result?.ok) {
+        options.dispatchHidden('/meta ' + name, '/meta ' + name)
+      } else {
+        options.notify(result?.error || i18n.global.t('chat.metaRuns.couldNotRunSkill', { skill: name }))
+      }
+    } catch (err: unknown) {
+      options.notify(i18n.global.t('chat.metaRuns.couldNotRunSkillError', {
+        error: err instanceof Error ? err.message : String(err),
+      }))
     }
   }
 
@@ -268,11 +302,13 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
   return {
     slashOpen,
     slashIdx,
+    metaSkillChoices,
     filteredSlashCmds,
     loadSlashCommands,
     handleSlashInput,
     closeSlashMenu,
     selectSlashCmd,
     executeSlashCommand,
+    runMetaSkill,
   }
 }

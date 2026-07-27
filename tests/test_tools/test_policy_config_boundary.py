@@ -93,7 +93,6 @@ def test_policy_config_expands_current_groups_patterns_and_profiles() -> None:
     available = frozenset(
         {
             "create_pptx",
-            "feishu_perm_grant_member",
             "http_request",
             "image_generate",
             "install_skill_deps",
@@ -119,7 +118,6 @@ def test_policy_config_expands_current_groups_patterns_and_profiles() -> None:
         available,
     ) == {
         "create_pptx",
-        "feishu_perm_grant_member",
         "http_request",
         "image_generate",
         "install_skill_deps",
@@ -319,7 +317,16 @@ def test_gateway_tools_config_preserves_workspace_write_deny_globs() -> None:
     assert set(ctx.workspace_write_deny_globs) == {"tests/**", "*.spec.*"}
 
 
-def test_policy_helpers_apply_runtime_policy_through_config_boundary() -> None:
+def test_policy_helpers_apply_runtime_policy_through_config_boundary(
+    monkeypatch,
+) -> None:
+    # The sender-scoped group mechanism has no built-in members since the
+    # vendor tool strip; exercise it with a synthetic dangerous tool so the
+    # machinery keeps regression coverage.
+    from opensquilla.tools import policy_config as pc
+
+    monkeypatch.setitem(pc._TOOL_GROUPS, "channel:perm", frozenset({"danger_grant"}))
+    monkeypatch.setattr(pc, "_SENDER_SCOPED_TOOL_NAMES", frozenset({"danger_grant"}))
     config = {
         "channels": {
             "feishu": {
@@ -337,7 +344,7 @@ def test_policy_helpers_apply_runtime_policy_through_config_boundary() -> None:
             }
         }
     }
-    available = ["session_status", "feishu_perm_grant_member"]
+    available = ["session_status", "danger_grant"]
 
     default_ctx = apply_tool_policy_from_config(
         ToolContext(
@@ -363,7 +370,7 @@ def test_policy_helpers_apply_runtime_policy_through_config_boundary() -> None:
     )
 
     assert default_ctx.allowed_tools == {"session_status"}
-    assert sender_ctx.allowed_tools == {"session_status", "feishu_perm_grant_member"}
+    assert sender_ctx.allowed_tools == {"session_status", "danger_grant"}
     assert policy_helpers.private_memory_read_tool_denied(
         ToolContext(caller_kind=CallerKind.SUBAGENT), "memory_get"
     )

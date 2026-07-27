@@ -1,6 +1,7 @@
 ---
 name: nano-banana-pro
 description: "Generate or edit a single image via OpenRouter (google/gemini-3.1-flash-image-preview by default). Accepts a text prompt and optional --input-image for image-to-image editing. Trigger when the user asks for an AI image, illustration, concept art, product render, or wants to modify an existing image."
+description_zh: "通过OpenRouter（默认 google/gemini-3.1-flash-image-preview）生成或编辑单张图片。接受文本提示词及可选的 --input-image 进行图生图编辑。当用户需要AI图像、插画、概念图、产品渲染或修改现有图片时触发。"
 provenance:
   origin: clawhub-mit0
   license: MIT-0

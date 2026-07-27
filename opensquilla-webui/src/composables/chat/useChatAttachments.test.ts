@@ -123,6 +123,68 @@ describe('useChatAttachments', () => {
     expect(pushToast).toHaveBeenCalledWith('Too many attachments: max 10', { tone: 'danger' })
   })
 
+  it('emits a single count-cap toast for a batch far over the limit', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(successfulUploadResponse('file-count'))
+    vi.stubGlobal('fetch', fetchMock)
+    const attachments = useChatAttachments()
+
+    const files = Array.from({ length: 15 }, (_, index) => stagedPdf(`paper-${index}.pdf`))
+    await attachments.addAttachments(files)
+    await flushUpload()
+
+    expect(attachments.pendingAttachments.value).toHaveLength(10)
+    expect(pushToast).toHaveBeenCalledTimes(1)
+    expect(pushToast).toHaveBeenCalledWith('Too many attachments: max 10', { tone: 'danger' })
+  })
+
+  it('names the per-type cap when rejecting an oversized file', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const attachments = useChatAttachments()
+    const hugePdf = new File([new Uint8Array(30 * 1024 * 1024 + 1)], 'huge.pdf', { type: 'application/pdf' })
+
+    await attachments.addAttachments([hugePdf])
+
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(attachments.pendingAttachments.value).toHaveLength(0)
+    expect(pushToast).toHaveBeenCalledWith('File too large: huge.pdf (max 30 MiB)', { tone: 'danger' })
+  })
+
+  it('never states a rounded-up cap the rejected file already satisfies', async () => {
+    vi.stubGlobal('fetch', vi.fn())
+    const attachments = useChatAttachments()
+    const bigEmail = new File([new Uint8Array(2_000_001)], 'mail.eml', { type: 'message/rfc822' })
+
+    await attachments.addAttachments([bigEmail])
+
+    expect(attachments.pendingAttachments.value).toHaveLength(0)
+    expect(pushToast).toHaveBeenCalledWith('File too large: mail.eml (max 1.9 MiB)', { tone: 'danger' })
+  })
+
+  it('emits a single total-size toast for a batch that overflows the aggregate cap', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const attachments = useChatAttachments()
+    attachments.pendingAttachments.value = Array.from({ length: 4 }, (_, index) => ({
+      kind: 'staged',
+      local_id: index + 1,
+      name: `existing-${index}.pdf`,
+      mime: 'application/pdf',
+      size: 15 * 1024 * 1024,
+      file_uuid: `existing-${index}`,
+    }))
+
+    await attachments.addAttachments([stagedPdf('a.pdf'), stagedPdf('b.pdf'), stagedPdf('c.pdf')])
+
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(attachments.pendingAttachments.value).toHaveLength(4)
+    expect(pushToast).toHaveBeenCalledTimes(1)
+    expect(pushToast).toHaveBeenCalledWith(
+      'Attachments too large: a.pdf would exceed 60 MiB total',
+      { tone: 'danger' },
+    )
+  })
+
   it('enforces the frontend aggregate attachment size before upload work starts', async () => {
     const fetchMock = vi.fn()
     vi.stubGlobal('fetch', fetchMock)
@@ -273,6 +335,48 @@ describe('useChatAttachments', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(attachments.pendingAttachments.value).toMatchObject([
       { kind: 'staged', name: 'near-expiry.pdf', file_uuid: 'file-fresh' },
+    ])
+  })
+
+  it('refreshes a queued attachment collection without touching the composer', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        file_uuid: 'file-queued-fresh',
+        expires_at: Date.now() / 1000 + 600,
+        ttl_seconds: 600,
+      }),
+      text: async () => '',
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const attachments = useChatAttachments()
+    const composerAttachment: Attachment = {
+      kind: 'inline',
+      local_id: 1,
+      name: 'draft.txt',
+      mime: 'text/plain',
+      data: 'ZHJhZnQ=',
+    }
+    const queuedAttachments: Attachment[] = [{
+      kind: 'staged',
+      local_id: 2,
+      name: 'queued.pdf',
+      mime: 'application/pdf',
+      file_uuid: 'file-queued-expired',
+      expires_at: Date.now() / 1000 - 1,
+      file: stagedPdf('queued.pdf'),
+    }]
+    attachments.pendingAttachments.value = [composerAttachment]
+
+    const ready = await attachments.prepareAttachmentsForSend({
+      attachments: queuedAttachments,
+    })
+
+    expect(ready).toBe(true)
+    expect(attachments.pendingAttachments.value).toEqual([composerAttachment])
+    expect(queuedAttachments).toMatchObject([
+      { kind: 'staged', name: 'queued.pdf', file_uuid: 'file-queued-fresh' },
     ])
   })
 

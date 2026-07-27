@@ -1,6 +1,7 @@
 ---
 name: subtitle-burner
 description: "Burn an SRT subtitle file into an MP4 via ffmpeg's subtitles filter (libass). Single-pass re-encode of video; audio copied as-is. CJK-friendly font fallback chain (Microsoft YaHei → SimHei → Arial Unicode MS → Arial). Used by meta-short-drama as the final subtitling step after merge."
+description_zh: "通过ffmpeg的subtitles滤镜（libass）将SRT字幕烧录进MP4。单遍重编码视频，音频原样复制。对CJK友好的字体回退链（Microsoft YaHei → SimHei → Arial Unicode MS → Arial）。由meta-short-drama在合并后作为最终字幕步骤使用。"
 provenance:
   origin: opensquilla-original
   license: Apache-2.0

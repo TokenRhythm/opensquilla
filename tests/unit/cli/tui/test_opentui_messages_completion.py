@@ -68,4 +68,12 @@ def test_completion_candidate_serializes_as_json_payload() -> None:
         "description": "Compact older context.",
         "insert_text": "/compact ",
         "category": "command",
+        "usage": "",
+        "aliases": [],
+        "argument_choices": [],
+        "visible_by_default": True,
+        "deprecated": False,
+        "submit_behavior": "submit",
+        "busy_policy": "immediate",
+        "presentation": "notice",
     }

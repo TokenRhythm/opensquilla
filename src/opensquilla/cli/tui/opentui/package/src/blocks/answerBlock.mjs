@@ -75,7 +75,14 @@ export function createAnswerBlock(ctx) {
       if (md) md.content = stripped;
       renderer.requestRender?.();
     },
-    update() {},
+    update(patch) {
+      if (!Object.prototype.hasOwnProperty.call(patch ?? {}, "text")) return;
+      text = String(patch.text ?? "");
+      carry = "";
+      stripped = stripTerminalControls(text);
+      if (md) md.content = stripped;
+      renderer.requestRender?.();
+    },
     end() {
       // Flush the carry: whatever never terminated is still control-stripped
       // (a lone ESC drops, its visible tail renders) — same as a full re-strip.

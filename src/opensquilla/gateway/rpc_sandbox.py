@@ -46,11 +46,13 @@ from opensquilla.sandbox.run_mode_policy import (
     coerce_run_mode_for_principal,
     run_mode_allowed_for_principal,
 )
-from opensquilla.sandbox.setup_runtime import current_sandbox_setup_runtime_status
+from opensquilla.sandbox.setup_runtime import (
+    current_sandbox_setup_runtime_status,
+    ensure_sandbox_setup_auto,
+)
 from opensquilla.sandbox.setup_state import (
     SandboxSetupState,
     current_sandbox_setup_status,
-    ensure_sandbox_setup,
 )
 from opensquilla.sandbox.status import status_payload
 from opensquilla.session.keys import parse_agent_id
@@ -329,7 +331,7 @@ async def _handle_sandbox_setup_status(params: dict | None, ctx: RpcContext) -> 
 @_d.method("sandbox.setup.ensure", scope="operator.write")
 async def _handle_sandbox_setup_ensure(params: dict | None, ctx: RpcContext) -> dict:
     _require_owner(ctx, "sandbox.setup.ensure")
-    result = await ensure_sandbox_setup(ctx.config)
+    result = await ensure_sandbox_setup_auto(ctx.config)
     return result.to_payload()
 
 

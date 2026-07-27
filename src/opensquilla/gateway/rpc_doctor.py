@@ -21,7 +21,6 @@ from opensquilla.gateway.rpc_tools import _handle_providers_status, _handle_sear
 from opensquilla.health.evaluator import (
     evaluate_channels,
     evaluate_image_generation,
-    evaluate_legacy_home,
     evaluate_llm_ensemble,
     evaluate_logs,
     evaluate_memory,
@@ -54,7 +53,6 @@ _COLLECTION_INSPECT_COMMANDS = {
     "search": "opensquilla search status --json",
     "image_generation": "opensquilla onboard status --json",
     "llm_ensemble": "opensquilla diagnostics status",
-    "migration": "opensquilla migrate opensquilla",
 }
 _READINESS_CRITICAL_COLLECTIONS = {"provider"}
 _UNKNOWN_SEARCH_PROVIDER_RE = re.compile(
@@ -357,42 +355,6 @@ def _llm_ensemble_payload(ctx: RpcContext) -> dict[str, Any]:
     return payload
 
 
-def _legacy_home_payload(ctx: RpcContext) -> dict[str, Any]:
-    """Read-only legacy-home detection for the migration advisory surface.
-
-    Detection is a pure path scan and safe under a running gateway; the
-    import itself stays at the CLI layer (``opensquilla migrate
-    opensquilla``), which requires a quiesced gateway. ``targetFresh``
-    mirrors the boot warning's freshness signal (no ``sessions.db`` yet) so
-    the finding can say whether this install already holds session data.
-    """
-    import importlib
-
-    from opensquilla.paths import default_opensquilla_home
-
-    legacy_detect = importlib.import_module("opensquilla.migration.legacy_detect")
-
-    config = getattr(ctx, "config", None)
-    if config is not None:
-        from opensquilla.gateway.boot import _gateway_home, _state_path
-
-        target = _gateway_home(config)
-        sessions_db = _state_path(config, "sessions.db")
-    else:
-        target = default_opensquilla_home()
-        sessions_db = target / "state" / "sessions.db"
-    candidate = legacy_detect.detect_legacy_home(target)
-    payload: dict[str, Any] = {
-        "detected": candidate is not None,
-        "targetFresh": not sessions_db.exists(),
-    }
-    if candidate is not None:
-        payload["path"] = str(candidate.path)
-        payload["kind"] = candidate.kind
-        payload["command"] = legacy_detect.suggested_migrate_command(candidate)
-    return payload
-
-
 def _memory_embedding_payload(ctx: RpcContext) -> dict[str, Any]:
     config = getattr(ctx, "config", None)
     memory_config = getattr(config, "memory", None) if config is not None else None
@@ -501,11 +463,6 @@ async def _handle_doctor_status(params: dict | None, ctx: RpcContext) -> dict[st
             "llm_ensemble",
             lambda: _llm_ensemble_payload(ctx),
             evaluate_llm_ensemble,
-        ),
-        (
-            "migration",
-            lambda: _legacy_home_payload(ctx),
-            evaluate_legacy_home,
         ),
     ]
 

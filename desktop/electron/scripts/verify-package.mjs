@@ -221,10 +221,22 @@ function verifyMainProcess(source, label) {
     fail(`${label} main process does not create the desktop window before gateway startup`)
   }
 
-  if (!/app\.on\(['"]activate['"][\s\S]{0,240}openOrResumeDesktopApp/.test(source)) {
+  const revealRoutesToDesktopOpen =
+    /function revealDesktopApp\([^)]*\)[^{]*\{[^}]{0,600}openOrResumeDesktopApp\(\)/.test(source)
+  const handlerRoutesToDesktopOpen = (handlerPattern) => {
+    const directRoute = new RegExp(
+      `${handlerPattern}[\\s\\S]{0,240}openOrResumeDesktopApp`,
+    ).test(source)
+    const revealRoute = new RegExp(
+      `${handlerPattern}[\\s\\S]{0,240}revealDesktopApp`,
+    ).test(source)
+    return directRoute || (revealRoute && revealRoutesToDesktopOpen)
+  }
+
+  if (!handlerRoutesToDesktopOpen(String.raw`app\.on\(['"]activate['"]`)) {
     fail(`${label} main process activate handler does not route through openOrResumeDesktopApp`)
   }
-  if (!/second-instance[\s\S]{0,240}openOrResumeDesktopApp/.test(source)) {
+  if (!handlerRoutesToDesktopOpen('second-instance')) {
     fail(`${label} main process second-instance handler does not route through openOrResumeDesktopApp`)
   }
 

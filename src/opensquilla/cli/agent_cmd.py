@@ -151,7 +151,13 @@ async def run_agent_once(
     """Run a single agent turn through build_services() and TurnRunner.run()."""
     from opensquilla.agents.scope import resolve_agent_workspace_dir
     from opensquilla.artifacts import artifact_payload
-    from opensquilla.engine.types import ArtifactEvent, DoneEvent, ErrorEvent, TextDeltaEvent
+    from opensquilla.engine.types import (
+        ArtifactEvent,
+        DoneEvent,
+        ErrorEvent,
+        TextDeltaEvent,
+        done_text_snapshot,
+    )
     from opensquilla.gateway import attachment_ingest as _attachment_ingest
     from opensquilla.gateway import build_services, build_turn_runner_from_services
     from opensquilla.gateway.config import GatewayConfig
@@ -357,11 +363,14 @@ async def run_agent_once(
     if usage_path:
         _write_json(usage_path, usage)
 
+    done_text_present, done_text = (
+        done_text_snapshot(done) if done is not None else (False, "")
+    )
     return AgentRunResult(
         status="error" if errors else "ok",
         agent_id=agent_id,
         session_key=session_key,
-        text=done.text if done and done.text else "".join(text_parts),
+        text=done_text if done_text_present else "".join(text_parts),
         usage=usage,
         errors=errors,
         workspace=tool_workspace_dir,

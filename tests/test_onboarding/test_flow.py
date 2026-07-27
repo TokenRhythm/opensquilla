@@ -376,7 +376,9 @@ def test_interactive_onboard_prompts_router_defaults_before_persist(tmp_path, mo
     assert saved.llm.api_key == ""
     assert saved.llm.api_key_env == "OPENROUTER_API_KEY"
     assert saved.squilla_router.default_tier == "c2"
-    assert saved.llm.model == "z-ai/glm-5.2"
+    # The Router's default tier is independent from the provider's direct /
+    # fail-closed fallback model.
+    assert saved.llm.model == "deepseek/deepseek-v4-pro"
 
 
 def test_interactive_onboard_migration_defaults_to_all_sources_and_keeps_imported_provider(
@@ -755,7 +757,9 @@ def test_interactive_onboard_imported_provider_finalize_error_continues_setup(
     data = tomllib.loads(target.read_text())
     assert data["llm"]["provider"] == "openrouter"
     assert data["llm"]["api_key_env"] == "OPENROUTER_API_KEY"
-    assert data["llm"]["model"] == "deepseek/deepseek-v4-pro"
+    # Falling back to normal provider setup must preserve the imported direct
+    # model because it is an existing explicit provider choice.
+    assert data["llm"]["model"] == "anthropic/claude-sonnet-4.5"
 
 
 def test_onboard_migration_selection_summary_lists_checked_sources(tmp_path, monkeypatch):
@@ -1483,17 +1487,24 @@ def test_interactive_feishu_websocket_prompts_only_core_fields(tmp_path, monkeyp
     assert "Portable zip:" in out
     assert "latest recommended portable package" in out
     assert "OPENSQUILLA_INSTALL_EXTRAS" not in normalized_out
-    assert "https://opensquilla.ai/install.ps1" in normalized_out
-    assert "https://opensquilla.ai/install.sh" in normalized_out
-    assert "bash -s --" in normalized_out
+    assert "uv tool install --python 3.12 --force" in normalized_out
+    assert "opensquilla[recommended]" in normalized_out
+    assert "https://github.com/opensquilla/opensquilla/releases/download/" in out
+    assert "v0.5.0" in out
+    assert "opensquilla.ai/install." not in normalized_out
     assert "uv sync --extra recommended" in normalized_out
     assert "--extra feishu" not in normalized_out
     assert "Restarting alone will not install Python packages." in out
-    assert calls == ["Channel type", "Channel name", "App id", "App secret", "Connection mode"]
+    # connection_mode folded into Advanced: the wizard no longer prompts for
+    # it — the websocket default seeds silently, so an interactive add is
+    # type → name → the two credentials, nothing else.
+    assert calls == ["Channel type", "Channel name", "App id", "App secret"]
     data = target.read_text()
     assert 'type = "feishu"' in data
     assert 'app_id = "cli_test"' in data
     assert 'connection_mode = "websocket"' in data
+    saved = flow.load_config(target)
+    assert saved.channels.channels[0].dm_access == "pairing"
 
 
 def test_interactive_channel_add_uses_explicit_config_path(tmp_path, monkeypatch):
@@ -2613,3 +2624,52 @@ def test_declared_questionary_floor_supports_use_search_filter():
         "questionary 2.0.x lacks use_search_filter; the floor must be >=2.1"
     )
     assert requirement.specifier.contains("2.1.0")
+
+
+def test_installed_reinstall_command_pins_the_running_release_wheel(monkeypatch):
+    from opensquilla.onboarding import flow
+
+    monkeypatch.setattr("opensquilla.__version__", "0.6.0")
+
+    lines = flow._installed_reinstall_command_lines()
+
+    assert (
+        "https://github.com/opensquilla/opensquilla/releases/download/"
+        "v0.6.0/opensquilla-0.6.0-py3-none-any.whl" in lines
+    )
+    assert "opensquilla[recommended]" in lines
+    assert "0.5.0rc4" not in lines
+
+
+def test_installed_reinstall_command_supports_prerelease_versions(monkeypatch):
+    from opensquilla.onboarding import flow
+
+    monkeypatch.setattr("opensquilla.__version__", "1.2.3rc1")
+
+    lines = flow._installed_reinstall_command_lines()
+
+    assert "v1.2.3rc1/opensquilla-1.2.3rc1-py3-none-any.whl" in lines
+
+
+def test_installed_reinstall_command_never_guesses_a_wheel_for_dev_builds(monkeypatch):
+    from opensquilla.onboarding import flow
+
+    monkeypatch.setattr("opensquilla.__version__", "0.0.0+unknown")
+
+    lines = flow._installed_reinstall_command_lines()
+
+    assert "releases/download" not in lines
+    assert "releases/latest" in lines
+
+
+def test_channel_dependency_warning_has_no_hardcoded_release_tag():
+    """The wizard's upgrade hint must be derived from the running version, so
+    a stale pinned wheel can never instruct users to downgrade after a newer
+    release ships."""
+    import inspect
+
+    from opensquilla.onboarding import flow
+
+    source = inspect.getsource(flow._warn_channel_dependency_gaps)
+    assert "releases/download" not in source
+    assert "_installed_reinstall_command_lines" in source

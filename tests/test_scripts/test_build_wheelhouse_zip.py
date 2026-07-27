@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 from zipfile import ZipFile
 
 import pytest
@@ -73,6 +74,100 @@ def test_build_subprocess_env_keeps_uv_cache_outside_repo_root(tmp_path: Path) -
     assert not pip_cache.is_relative_to(repo_root.resolve())
     assert uv_cache.name == "uv-cache"
     assert pip_cache.name == "pip-cache"
+
+
+def test_build_webui_checks_node_then_installs_and_builds(monkeypatch, tmp_path: Path) -> None:
+    module = load_script()
+    repo_root = tmp_path / "repo"
+    webui_dir = repo_root / "opensquilla-webui"
+    webui_dir.mkdir(parents=True)
+    (webui_dir / ".node-version").write_text("22.12.0\n", encoding="utf-8")
+    calls = []
+
+    monkeypatch.setattr(
+        module.shutil,
+        "which",
+        lambda executable, *, path=None: f"/tools/{executable}",
+    )
+
+    def fake_subprocess_run(args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(stdout="v22.12.0\n")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_subprocess_run)
+
+    module.build_webui(repo_root, {"PATH": "/tools"})
+
+    assert [call[0] for call in calls] == [
+        ["/tools/node", "--version"],
+        ["/tools/npm", "ci"],
+        ["/tools/npm", "run", "build"],
+        ["/tools/npm", "run", "verify:release-dist"],
+    ]
+    assert calls[1][1]["cwd"] == webui_dir
+    assert calls[2][1]["cwd"] == webui_dir
+    assert calls[3][1]["cwd"] == webui_dir
+
+
+def test_build_webui_rejects_node_older_than_pinned_minimum(
+    monkeypatch, tmp_path: Path
+) -> None:
+    module = load_script()
+    repo_root = tmp_path / "repo"
+    webui_dir = repo_root / "opensquilla-webui"
+    webui_dir.mkdir(parents=True)
+    (webui_dir / ".node-version").write_text("22.12.0\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        module.shutil,
+        "which",
+        lambda executable, *, path=None: f"/tools/{executable}",
+    )
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(stdout="v20.19.0\n"),
+    )
+
+    with pytest.raises(SystemExit, match=r"requires Node\.js >= 22\.12\.0"):
+        module.build_webui(repo_root, {"PATH": "/tools"})
+
+
+def test_portable_python_preflight_rejects_before_webui_build(monkeypatch) -> None:
+    module = load_script()
+    webui_calls = []
+
+    class Python313:
+        major = 3
+        minor = 13
+
+        def __getitem__(self, key):
+            return (3, 13, 0)[key]
+
+    monkeypatch.setattr(
+        module,
+        "sys",
+        SimpleNamespace(version_info=Python313()),
+    )
+    monkeypatch.setattr(module, "read_project_version", lambda repo_root: "0.1.0")
+    monkeypatch.setattr(module, "build_subprocess_env", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        module,
+        "build_webui",
+        lambda *args, **kwargs: webui_calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(SystemExit, match="require Python 3.12"):
+        module.main(
+            [
+                "--profile",
+                "core",
+                "--skip-wheelhouse",
+                "--bundle-python-runtime",
+            ]
+        )
+
+    assert webui_calls == []
 
 
 def test_release_name_records_platform_python_profile() -> None:

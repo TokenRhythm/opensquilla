@@ -26,4 +26,6 @@ def test_channel_session_key_uses_group_room_and_thread_when_marked_group() -> N
 
     key = ChannelManager._build_session_key("slack", message, agent_id="ops")
 
-    assert key == "agent:ops:slack:group:C-general:thread:171234.000"
+    assert key == (
+        "agent:ops:slack:group:C-general:sender:user-1:thread:171234.000"
+    )

@@ -11,9 +11,10 @@ import pytest
 
 from opensquilla.attachment_refs import write_transcript_material
 from opensquilla.engine.types import ToolCall
-from opensquilla.sandbox import sensitive_paths
+from opensquilla.sandbox import filesystem_worker, sensitive_paths
 from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.sandbox.integration import configure_runtime, reset_runtime
+from opensquilla.sandbox.permissions import FileSystemPermissionProfile
 from opensquilla.tools.builtin import filesystem as fs
 from opensquilla.tools.dispatch import build_tool_handler
 from opensquilla.tools.registry import get_default_registry
@@ -87,6 +88,144 @@ async def test_read_file_invalid_utf8_before_selected_window_errors(tmp_path: Pa
     target.write_bytes(b"ok\n\xff\nlater\n")
     with pytest.raises(ToolError, match="not valid UTF-8"):
         await fs.read_file(str(target), offset=3, limit=1)
+
+
+@pytest.mark.asyncio
+async def test_filesystem_sandbox_boundary_attaches_runtime_profile_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = FileSystemPermissionProfile.read_only(readable_roots=(tmp_path,))
+    operation = fs.SandboxOperation.filesystem(
+        kind="list_dir",
+        workspace=tmp_path,
+        run_mode="trusted",
+        path=Path("/etc"),
+    )
+    runtime = object()
+    result_sentinel = object()
+    profile_lookups: list[Path | None] = []
+    seen_operations: list[fs.SandboxOperation] = []
+    seen_runtime_args: list[tuple[object, bool]] = []
+    active_profile = fs.active_file_system_profile
+
+    def lookup_profile(workspace: Path | None) -> FileSystemPermissionProfile | None:
+        profile_lookups.append(workspace)
+        return active_profile(workspace)
+
+    class _RecordingRuntime:
+        def __init__(
+            self,
+            actual_runtime: object,
+            *,
+            host_execution_active: bool,
+        ) -> None:
+            seen_runtime_args.append((actual_runtime, host_execution_active))
+
+        async def run(self, actual_operation: fs.SandboxOperation) -> object:
+            seen_operations.append(actual_operation)
+            return result_sentinel
+
+    monkeypatch.setattr(fs, "active_file_system_profile", lookup_profile)
+    monkeypatch.setattr(fs, "get_runtime", lambda: runtime)
+    monkeypatch.setattr(fs, "full_host_access_active", lambda: False)
+    monkeypatch.setattr(fs, "SandboxOperationRuntime", _RecordingRuntime)
+
+    with tool_context(tmp_path):
+        context = current_tool_context.get()
+        assert context is not None
+        context.sandbox_file_system_profile = profile
+        result = await fs._run_sandbox_operation_if_required(operation)
+
+    assert result is result_sentinel
+    assert profile_lookups == [tmp_path]
+    assert operation.file_system_profile is None
+    assert len(seen_operations) == 1
+    assert seen_operations[0] is not operation
+    assert seen_operations[0].file_system_profile is profile
+    assert seen_runtime_args == [(runtime, False)]
+
+
+@pytest.mark.asyncio
+async def test_filesystem_sandbox_boundary_preserves_existing_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = FileSystemPermissionProfile.workspace(workspace=tmp_path)
+    operation = fs.SandboxOperation.filesystem(
+        kind="list_dir",
+        workspace=tmp_path,
+        run_mode="trusted",
+        path=tmp_path,
+        file_system_profile=profile,
+    )
+    seen_operations: list[fs.SandboxOperation] = []
+
+    class _RecordingRuntime:
+        def __init__(self, _runtime: object, *, host_execution_active: bool) -> None:
+            assert host_execution_active is False
+
+        async def run(self, actual_operation: fs.SandboxOperation) -> None:
+            seen_operations.append(actual_operation)
+
+    def unexpected_lookup(_workspace: Path | None) -> FileSystemPermissionProfile | None:
+        raise AssertionError("existing filesystem profile must not be replaced")
+
+    monkeypatch.setattr(fs, "active_file_system_profile", unexpected_lookup)
+    monkeypatch.setattr(fs, "get_runtime", object)
+    monkeypatch.setattr(fs, "full_host_access_active", lambda: False)
+    monkeypatch.setattr(fs, "SandboxOperationRuntime", _RecordingRuntime)
+
+    await fs._run_sandbox_operation_if_required(operation)
+
+    assert seen_operations == [operation]
+    assert seen_operations[0] is operation
+    assert seen_operations[0].file_system_profile is profile
+
+
+@pytest.mark.parametrize(
+    ("full_host_access", "explicit_host_execution", "expected"),
+    (
+        (False, False, False),
+        (False, True, True),
+        (True, False, True),
+    ),
+)
+@pytest.mark.asyncio
+async def test_filesystem_sandbox_boundary_preserves_host_execution_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    full_host_access: bool,
+    explicit_host_execution: bool,
+    expected: bool,
+) -> None:
+    profile = FileSystemPermissionProfile.workspace(workspace=tmp_path)
+    operation = fs.SandboxOperation.filesystem(
+        kind="list_dir",
+        workspace=tmp_path,
+        run_mode="trusted",
+        path=tmp_path,
+        file_system_profile=profile,
+    )
+    seen_flags: list[bool] = []
+
+    class _RecordingRuntime:
+        def __init__(self, _runtime: object, *, host_execution_active: bool) -> None:
+            seen_flags.append(host_execution_active)
+
+        async def run(self, _operation: fs.SandboxOperation) -> None:
+            return None
+
+    monkeypatch.setattr(fs, "get_runtime", object)
+    monkeypatch.setattr(fs, "full_host_access_active", lambda: full_host_access)
+    monkeypatch.setattr(fs, "SandboxOperationRuntime", _RecordingRuntime)
+
+    await fs._run_sandbox_operation_if_required(
+        operation,
+        host_execution_active=explicit_host_execution,
+    )
+
+    assert seen_flags == [expected]
 
 
 @pytest.mark.asyncio
@@ -270,7 +409,7 @@ async def test_workspace_inside_sensitive_parent_allows_normal_files(
     target.write_text("hello\n", encoding="utf-8")
 
     with tool_context(workspace):
-        write_gate = await fs._gate_out_of_workspace_write(
+        write_gate, elevated = await fs._gate_out_of_workspace_write(
             "write_file",
             target.resolve(),
             "notes/plan.md",
@@ -282,6 +421,7 @@ async def test_workspace_inside_sensitive_parent_allows_normal_files(
         grepped = await fs.grep_search("hello", path="notes")
 
     assert write_gate is None
+    assert elevated is False
     assert "1\thello" in read_result
     assert "plan.md" in listed
     assert "plan.md" in globbed
@@ -303,7 +443,7 @@ async def test_workspace_inside_sensitive_parent_keeps_leaf_secret_blocks(
     )
 
     with tool_context(workspace):
-        payload = await fs._gate_out_of_workspace_write(
+        payload, elevated = await fs._gate_out_of_workspace_write(
             "write_file",
             (workspace / ".env").resolve(),
             ".env",
@@ -311,6 +451,7 @@ async def test_workspace_inside_sensitive_parent_keeps_leaf_secret_blocks(
         )
 
     assert payload is not None
+    assert elevated is False
     assert payload["status"] == "blocked"
     assert payload["reason"] == "sensitive_path"
     assert not (workspace / ".env").exists()
@@ -415,7 +556,12 @@ async def test_workspace_write_deny_block_is_actionable_in_tool_failure_envelope
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     configure_runtime(
-        SandboxSettings(sandbox=False, security_grading=False, allow_legacy_mode=True),
+        SandboxSettings(
+            sandbox=True,
+            security_grading=True,
+            backend="noop",
+            allow_legacy_mode=True,
+        ),
         workspace=workspace,
     )
     handler = build_tool_handler(get_default_registry())
@@ -454,6 +600,38 @@ async def test_workspace_write_deny_block_is_actionable_in_tool_failure_envelope
     assert "internal error" not in envelope["user_message"]
     assert envelope["retry_allowed"] is False
     assert not (workspace / "test_bug.py").exists()
+
+
+@pytest.mark.asyncio
+async def test_sandbox_disabled_write_ignores_stale_restricted_tool_context(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside" / "probe.txt"
+    configure_runtime(
+        SandboxSettings(sandbox=False, security_grading=False),
+        workspace=workspace,
+    )
+    token = current_tool_context.set(
+        ToolContext(
+            is_owner=True,
+            caller_kind=CallerKind.CLI,
+            workspace_dir=str(workspace),
+            workspace_strict=True,
+            workspace_lockdown=True,
+            workspace_write_deny_globs=["**"],
+            run_mode="standard",
+            session_key="full-write",
+        )
+    )
+    try:
+        await fs.write_file(str(outside), "ok\n")
+    finally:
+        current_tool_context.reset(token)
+        reset_runtime()
+
+    assert outside.read_text(encoding="utf-8") == "ok\n"
 
 
 @pytest.mark.asyncio
@@ -528,14 +706,180 @@ async def test_workspace_strict_surfaces_list_dir_symlink_escape(tmp_path: Path)
 
 @pytest.mark.asyncio
 async def test_list_dir_survives_broken_symlink(tmp_path: Path) -> None:
-    (tmp_path / "ok.txt").write_text("hello\n", encoding="utf-8")
+    ordinary = tmp_path / "ok.txt"
+    ordinary.write_text("hello\n", encoding="utf-8")
     _make_symlink(tmp_path / "dangling", tmp_path / "missing-target")
 
     with tool_context(tmp_path):
         output = await fs.list_dir(str(tmp_path))
 
-    assert "ok.txt" in output
-    assert "dangling" in output
+    assert f"[file] ok.txt ({ordinary.stat().st_size} bytes)" in output
+    assert "[link] dangling (broken symlink)" in output
+
+
+@pytest.mark.asyncio
+async def test_list_dir_host_fallback_marks_child_lstat_error_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "ok.txt").write_text("hello", encoding="utf-8")
+    blocked = tmp_path / "blocked.txt"
+    blocked.write_text("secret", encoding="utf-8")
+    original_lstat = Path.lstat
+
+    def selective_lstat(path: Path):
+        if path == blocked:
+            raise PermissionError("child denied for test")
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", selective_lstat)
+
+    with tool_context(tmp_path):
+        output = await fs.list_dir(str(tmp_path))
+
+    assert "[file] ok.txt (5 bytes)" in output
+    assert "[file] blocked.txt (metadata unavailable)" in output
+
+
+@pytest.mark.asyncio
+async def test_list_dir_host_fallback_does_not_follow_symlink_after_policy_resolve_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "ok.txt").write_text("hello", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+    escape = workspace / "escape"
+    _make_symlink(escape, outside)
+    original_resolve = Path.resolve
+    original_stat = Path.stat
+
+    def selective_resolve(path: Path, strict: bool = False) -> Path:
+        if path == escape:
+            raise PermissionError("policy resolution denied for test")
+        return original_resolve(path, strict=strict)
+
+    def reject_target_stat(path: Path, *args: object, **kwargs: object):
+        if path == escape and kwargs.get("follow_symlinks", True):
+            raise AssertionError("failed policy resolution must not follow target")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", selective_resolve)
+    monkeypatch.setattr(Path, "stat", reject_target_stat)
+
+    with tool_context(workspace):
+        output = await fs.list_dir(str(workspace))
+
+    assert "[file] ok.txt (5 bytes)" in output
+    assert "[link] escape (target metadata unavailable)" in output
+    assert "[link] escape (6 bytes target)" not in output
+
+
+@pytest.mark.asyncio
+async def test_list_dir_host_fallback_propagates_policy_runtime_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "child.txt").write_text("hello", encoding="utf-8")
+
+    def fail_policy(*_args: object, **_kwargs: object) -> str | None:
+        raise RuntimeError("policy bug for test")
+
+    monkeypatch.setattr(fs, "_workspace_strict_candidate_marker", fail_policy)
+
+    with tool_context(tmp_path):
+        with pytest.raises(RuntimeError, match="policy bug for test"):
+            await fs.list_dir(str(tmp_path))
+
+
+@pytest.mark.asyncio
+async def test_list_dir_host_fallback_preserves_directory_iterdir_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_iterdir = Path.iterdir
+
+    def selective_iterdir(path: Path):
+        if path == tmp_path:
+            raise PermissionError("directory denied for test")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", selective_iterdir)
+
+    with tool_context(tmp_path):
+        with pytest.raises(PermissionError, match="directory denied for test"):
+            await fs.list_dir(str(tmp_path))
+
+
+@pytest.mark.asyncio
+async def test_list_dir_valid_symlink_matches_worker_output(tmp_path: Path) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("target", encoding="utf-8")
+    link = tmp_path / "valid-link"
+    _make_symlink(link, target)
+
+    worker_result = filesystem_worker._list_dir({"path": str(tmp_path)})
+    with tool_context(tmp_path):
+        host_output = await fs.list_dir(str(tmp_path))
+
+    expected = "[link] valid-link (6 bytes target)"
+    assert expected in worker_result["message"]
+    assert expected in host_output
+
+
+@pytest.mark.asyncio
+async def test_list_dir_symlink_loop_matches_worker_output(tmp_path: Path) -> None:
+    loop = tmp_path / "loop"
+    _make_symlink(loop, loop)
+
+    worker_result = filesystem_worker._list_dir({"path": str(tmp_path)})
+    with tool_context(tmp_path):
+        host_output = await fs.list_dir(str(tmp_path))
+
+    expected = "[link] loop (broken symlink)"
+    assert expected in worker_result["message"]
+    assert expected in host_output
+
+
+@pytest.mark.asyncio
+async def test_list_dir_host_fallback_distinguishes_unreadable_symlink_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("secret", encoding="utf-8")
+    link = tmp_path / "protected-link"
+    _make_symlink(link, target)
+    original_stat = Path.stat
+
+    def selective_stat(path: Path, *args: object, **kwargs: object):
+        if path == link and kwargs.get("follow_symlinks", True):
+            raise PermissionError("target blocked for test")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", selective_stat)
+
+    with tool_context(tmp_path):
+        output = await fs.list_dir(str(tmp_path))
+
+    assert "[link] protected-link (target metadata unavailable)" in output
+    assert "[link] protected-link (broken symlink)" not in output
+
+
+@pytest.mark.asyncio
+async def test_list_dir_full_host_tolerates_broken_symlink(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    listing = tmp_path / "listing"
+    listing.mkdir()
+    _make_symlink(listing / ".VolumeIcon.icns", listing / "missing.icns")
+
+    with tool_context(workspace, run_mode="full"):
+        output = await fs.list_dir(str(listing))
+
+    assert "[link] .VolumeIcon.icns (broken symlink)" in output
 
 
 @pytest.mark.asyncio

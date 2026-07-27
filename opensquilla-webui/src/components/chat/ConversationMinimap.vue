@@ -14,19 +14,6 @@
         @pointermove="onListPointerMove"
         @pointerleave="closeHoverPreview"
       >
-        <li v-if="historyHasMore" class="conversation-minimap__item conversation-minimap__item--load">
-          <button
-            ref="loadEarlierRef"
-            type="button"
-            class="conversation-minimap__load"
-            :aria-disabled="historyLoading ? 'true' : undefined"
-            :aria-label="historyLoading ? t('chat.loadingEllipsis') : t('chat.loadEarlier')"
-            data-testid="conversation-minimap-load-earlier"
-            @click="requestEarlierHistory"
-          >
-            <Icon name="arrowUp" :size="12" aria-hidden="true" />
-          </button>
-        </li>
         <li v-for="(turn, index) in turns" :key="turn.key" class="conversation-minimap__item">
           <button
             :ref="el => setMarkerRef(el, index)"
@@ -93,7 +80,6 @@ import {
   type ComponentPublicInstance,
 } from 'vue'
 import { useI18n } from 'vue-i18n'
-import Icon from '@/components/Icon.vue'
 import type { ChatRenderedMessage } from '@/types/chat'
 import { chatMessageKey } from '@/utils/chat/messageIdentity'
 
@@ -104,8 +90,13 @@ const EXIT_SCROLL_RANGE_RATIO = 1
 // not mount/unmount the rail on every sub-pixel wobble around one boundary.
 // A fresh rail must reach the enter threshold; once visible it is allowed to
 // remain until the conversation pane crosses the lower exit threshold.
-const ENTER_INLINE_SIZE = 1104
-const EXIT_INLINE_SIZE = 1056
+// The rail's 30px lens starts 14px from the shell edge; its focus ring reaches
+// another 4px. At the 1104px floor, the shared 980px conversation column still
+// leaves a stable gap after accounting for the thread's scrollbar gutter.
+// Enter a little later than that floor so live sidebar resizing cannot flicker
+// the rail at the exact collision boundary.
+const ENTER_INLINE_SIZE = 1120
+const EXIT_INLINE_SIZE = 1104
 const ARRIVAL_HIGHLIGHT_MS = 650
 const ARRIVAL_TOLERANCE_PX = 4
 const MAX_PREVIEW_LENGTH = 220
@@ -132,18 +123,15 @@ const props = defineProps<{
   stripTimePrefix: (text: string) => string
   sessionKey?: string
   historyHasMore?: boolean
-  historyLoading?: boolean
 }>()
 const emit = defineEmits<{
   navigate: [index: number]
   navigateEnd: []
-  loadEarlier: []
 }>()
 
 const { t } = useI18n()
 const rootRef = ref<HTMLElement | null>(null)
 const listRef = ref<HTMLElement | null>(null)
-const loadEarlierRef = ref<HTMLButtonElement | null>(null)
 const tooltipRef = ref<HTMLElement | null>(null)
 const markerRefs = ref<HTMLButtonElement[]>([])
 const activeIndex = ref(0)
@@ -666,11 +654,6 @@ function onListPointerMove(event: PointerEvent) {
   })
 }
 
-function requestEarlierHistory() {
-  if (props.historyLoading) return
-  emit('loadEarlier')
-}
-
 function showFocusPreview(index: number, target: EventTarget | null) {
   focusedIndex.value = index
   positionPreview(target)
@@ -727,13 +710,6 @@ watch(() => props.sessionKey, () => {
   pointerLensIndex.value = null
   markerRefs.value = []
   if (observersActive) void nextTick(scheduleMeasure)
-})
-watch(() => props.historyHasMore, (hasMore, hadMore) => {
-  if (!hadMore || hasMore) return
-  // Only preserve focus when it is still parked on the disappearing control.
-  // If the reader moved elsewhere during the async load, respect that choice.
-  const shouldRestore = document.activeElement === loadEarlierRef.value
-  if (shouldRestore) void nextTick(() => markerRefs.value[0]?.focus())
 })
 watch(turns, (nextTurns, previousTurns) => {
   if (nextTurns.length < MIN_TURNS) hasLongHistory.value = false
@@ -813,10 +789,6 @@ onBeforeUnmount(() => {
   padding: 0;
 }
 
-.conversation-minimap__item--load {
-  margin-bottom: 0.25rem;
-}
-
 .conversation-minimap__marker {
   display: flex;
   align-items: center;
@@ -829,38 +801,6 @@ onBeforeUnmount(() => {
   color: var(--text-dim);
   cursor: pointer;
   transition: color var(--dur-base) var(--ease-standard);
-}
-
-.conversation-minimap__load {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 1.5rem;
-  height: 1.5rem;
-  margin: 0;
-  padding: 0;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-full);
-  background: var(--bg-elevated);
-  color: var(--text-muted);
-  box-shadow: var(--shadow-sm);
-  cursor: pointer;
-}
-
-.conversation-minimap__load:hover,
-.conversation-minimap__load:focus-visible {
-  border-color: var(--accent);
-  color: var(--accent);
-}
-
-.conversation-minimap__load:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-ring);
-}
-
-.conversation-minimap__load[aria-disabled='true'] {
-  cursor: wait;
-  opacity: 0.6;
 }
 
 .conversation-minimap__line {
@@ -988,9 +928,9 @@ onBeforeUnmount(() => {
   font-size: var(--fs-xs);
 }
 
-/* This is the hard safety floor only. JavaScript owns the 1104px enter / 1056px
+/* This is the hard safety floor only. JavaScript owns the 1120px enter / 1104px
    exit hysteresis; using the enter value here would defeat that hysteresis. */
-@container chat-thread-shell (max-width: 1056px) {
+@container chat-thread-shell (max-width: 1104px) {
   .conversation-minimap {
     display: none;
   }

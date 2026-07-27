@@ -1,6 +1,7 @@
 ---
 name: swe-bench
 description: "Run SWE-bench instances with an OpenSquilla agent inside the official Docker images. Trigger when the user wants to run/solve/evaluate a SWE-bench instance (e.g. 'run django__django-16429', 'test OpenSquilla on SWE-bench', '跑一道 SWE-bench 题'), benchmark the agent on SWE-bench_Verified or SWE-bench_Multilingual, or check whether a generated patch resolves an instance. Optional dependency — install via `pip install opensquilla[swebench]`; also needs the docker CLI and an OPENROUTER_API_KEY."
+description_zh: "在官方Docker镜像中用OpenSquilla代理运行SWE-bench实例。当用户想运行/求解/评测SWE-bench实例（如'run django__django-16429'、'在SWE-bench上测试OpenSquilla'、'跑一道 SWE-bench 题'）、在SWE-bench_Verified或SWE-bench_Multilingual上做基准测试，或检查生成的补丁是否解决某实例时触发。可选依赖，需通过 pip install opensquilla[swebench] 安装，还需docker CLI和OPENROUTER_API_KEY。"
 triggers:
   - "swe-bench"
   - "swebench"

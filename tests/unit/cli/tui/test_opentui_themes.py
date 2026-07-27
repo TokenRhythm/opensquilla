@@ -22,6 +22,13 @@ _MAIN_MJS = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolated_state_dir(tmp_path_factory: pytest.TempPathFactory, monkeypatch) -> None:
+    # handle_theme_command persists valid /theme choices; isolate the state
+    # root so these tests never write into the shared pytest-session state.
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path_factory.mktemp("state")))
+
+
 def _js_palette_names() -> list[str]:
     text = _THEME_MJS.read_text(encoding="utf-8")
     block = text.split("PALETTES = Object.freeze({", 1)[1].split("});", 1)[0]

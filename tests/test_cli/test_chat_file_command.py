@@ -48,6 +48,7 @@ def _write(tmp_path: Path, name: str, payload: bytes) -> Path:
 # Test 1 — small CSV inlines as base64.
 # ---------------------------------------------------------------------------
 
+
 def test_file_command_inline_for_small_csv(tmp_path: Path) -> None:
     csv_bytes = b"col_a,col_b\n1,2\n3,4\n"
     path = _write(tmp_path, "data.csv", csv_bytes)
@@ -96,7 +97,7 @@ def test_image_command_parses_quoted_path_with_spaces(tmp_path: Path) -> None:
     assert base64.b64decode(attachments[0]["data"]) == png_bytes
 
 
-def test_image_command_reports_attachment_size(
+def test_image_command_reports_sanitized_attachment_label(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -112,12 +113,13 @@ def test_image_command_reports_attachment_size(
 
     chat_cmd._image_prompt_and_attachments(f'/image "{path}" describe it')
 
-    assert prints == ["[dim]Sending image: screen shot.png (0KB base64)[/dim]"]
+    assert prints == ["[dim]Preparing image: screen shot.png[/dim]"]
 
 
 # ---------------------------------------------------------------------------
 # Test 2 — large PDF goes through the bridge upload callable.
 # ---------------------------------------------------------------------------
+
 
 def test_file_command_uses_bridge_for_large_pdf(tmp_path: Path) -> None:
     big_pdf = b"%PDF-1.4\n" + b"a" * (3 * 1024 * 1024)  # 3 MB > 2 MB threshold
@@ -131,9 +133,7 @@ def test_file_command_uses_bridge_for_large_pdf(tmp_path: Path) -> None:
         captured["name"] = name
         return "u-fake-uuid-1234"
 
-    prompt, attachments = _file_prompt_and_attachments(
-        f"/file {path}", upload_callable=fake_upload
-    )
+    prompt, attachments = _file_prompt_and_attachments(f"/file {path}", upload_callable=fake_upload)
     assert prompt  # default prompt assigned by the helper
     assert len(attachments) == 1
     att = attachments[0]
@@ -148,6 +148,7 @@ def test_file_command_uses_bridge_for_large_pdf(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Test 3 — bridge unreachable AND file > inline cap → hard-fail.
 # ---------------------------------------------------------------------------
+
 
 def test_file_command_hard_fails_when_bridge_unreachable_and_file_too_large(
     tmp_path: Path,
@@ -186,9 +187,7 @@ def test_file_command_accepts_unknown_binary_as_opaque(tmp_path: Path) -> None:
     # Unknown extension + binary content attaches as an opaque item: the bytes
     # land in the agent workspace, never in the provider prompt.
     path = _write(tmp_path, "x.bin", b"\x00\x01\x02\x03 binary blob")
-    prompt, attachments = _file_prompt_and_attachments(
-        f"/file {path}", upload_callable=None
-    )
+    prompt, attachments = _file_prompt_and_attachments(f"/file {path}", upload_callable=None)
     assert prompt == "Read this file"
     att = attachments[0]
     assert att["type"] == "application/octet-stream"

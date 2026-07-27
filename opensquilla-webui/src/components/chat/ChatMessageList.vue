@@ -17,6 +17,7 @@
       :share-message-id="chatMessageKey(message, index)"
       :strip-time-prefix="stripTimePrefix"
       :copy-message="copyMessage"
+      :download-attachment="downloadAttachment"
       @edit="$emit('editMessage', $event)"
       @toggle-share="$emit('toggleShareMessage', $event)"
     />
@@ -37,6 +38,7 @@
       :tool-secondary-text="toolSecondaryText"
       :session-key="sessionKey"
       :auth-token="authToken"
+      :workbench-enabled="workbenchEnabled"
       :artifact-navigation-items="artifactNavigationItems"
       :copy-message="copyMessage"
       :is-tip="index === lastAssistantIndex"
@@ -45,6 +47,7 @@
       @regenerate="$emit('regenerateMessage', $event)"
       @toggle-share="$emit('toggleShareMessage', $event)"
       @download-artifact="$emit('downloadArtifact', $event)"
+      @open-artifact="$emit('openArtifact', $event)"
       @toggle-tool-group="$emit('toggleToolGroup', $event)"
       @toggle-tool-item="$emit('toggleToolItem', $event)"
       @show-tool-result="(content, title, context) => $emit('showToolResult', content, title, context)"
@@ -94,9 +97,11 @@ const props = defineProps<{
   toolStatusText: (call: ChatToolCallRenderItem) => string
   toolSecondaryText: (call: ChatToolCallRenderItem) => string
   copyMessage: (message: ChatRenderedMessage) => Promise<boolean>
+  downloadAttachment: (attachment: import('@/types/chat').DisplayAttachment) => Promise<boolean>
   artifactNavigationItems?: ArtifactPayload[]
   sessionKey?: string
   authToken?: string
+  workbenchEnabled?: boolean
   forkBusy?: boolean
 }>()
 
@@ -105,6 +110,7 @@ defineEmits<{
   regenerateMessage: [message: ChatRenderedMessage]
   toggleShareMessage: [messageId: string]
   downloadArtifact: [artifact: ArtifactPayload]
+  openArtifact: [artifact: ArtifactPayload]
   toggleToolGroup: [groupId: string]
   toggleToolItem: [renderKey: string]
   showToolResult: [content: string, title: string, context?: ToolResultContext]

@@ -30,18 +30,19 @@ const stepKeys = computed(() => [
     class="setup-provider-recommendation control-card control-card--compact control-card--accent"
     data-testid="tokenrhythm-recommendation"
   >
-    <p
-      class="setup-provider-recommendation__title"
-      data-testid="tokenrhythm-recommendation-title"
-    >{{ t('setup.provider.recommendation.title') }}</p>
+    <div class="setup-provider-recommendation__head">
+      <p
+        class="setup-provider-recommendation__title"
+        data-testid="tokenrhythm-recommendation-title"
+      >{{ t('setup.provider.recommendation.title') }}</p>
+      <span class="setup-provider-recommendation__scope">
+        {{ t('setup.provider.recommendationScope') }}
+      </span>
+    </div>
     <p
       class="setup-provider-recommendation__copy"
       data-testid="tokenrhythm-recommendation-value"
     >{{ t('setup.provider.recommendation.value') }}</p>
-    <p
-      class="setup-provider-recommendation__copy"
-      data-testid="tokenrhythm-recommendation-registration"
-    >{{ t('setup.provider.recommendation.registration') }}</p>
     <ol
       class="setup-provider-recommendation__steps"
       :aria-label="t('setup.provider.recommendation.stepsLabel')"
@@ -68,7 +69,10 @@ const stepKeys = computed(() => [
 
 <style scoped>
 .setup-provider-recommendation {
-  margin: 0;
+  background: var(--bg-elevated);
+  border-radius: var(--radius-card);
+  box-shadow: var(--elev-1);
+  margin: var(--sp-4) 0;
 }
 
 .setup-provider-recommendation__title,
@@ -79,6 +83,24 @@ const stepKeys = computed(() => [
 .setup-provider-recommendation__title {
   font-size: var(--fs-sm);
   font-weight: 700;
+}
+
+.setup-provider-recommendation__head {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  justify-content: space-between;
+}
+
+.setup-provider-recommendation__scope {
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
+  border-radius: var(--radius-full);
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  font-weight: 650;
+  padding: 2px 8px;
 }
 
 .setup-provider-recommendation__copy {

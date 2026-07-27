@@ -12,6 +12,8 @@ from opensquilla.gateway.routing import (
     build_web_route_envelope,
     tool_context_from_envelope,
 )
+from opensquilla.sandbox.run_context import RunContext
+from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.scheduler.handlers import _build_cron_tool_context
 from opensquilla.scheduler.types import CronJob, SessionTarget
 from opensquilla.tools.policy import ToolSurfaceCapabilities, resolve_runtime_tool_surface
@@ -162,6 +164,33 @@ def test_non_owner_full_run_mode_metadata_coerces_to_trusted() -> None:
 
     assert ctx.run_mode == "trusted"
     assert ctx.elevated is None
+
+
+def test_owner_subagent_route_preserves_full_host_run_context() -> None:
+    run_context = RunContext(
+        run_mode=RunMode.FULL,
+        workspace="/tmp/opensquilla-workspace",
+    )
+
+    envelope = build_subagent_route_envelope(
+        session_key="agent:main:subagent:child",
+        parent_session_key="agent:main:webchat:parent",
+        run_mode="full",
+        sandbox_run_context=run_context,
+        principal_is_owner=True,
+    )
+    ctx = tool_context_from_envelope(envelope, is_owner=True)
+
+    assert envelope.metadata["principal_is_owner"] is True
+    assert envelope.metadata["run_mode"] == "full"
+    assert envelope.metadata["elevated"] == "full"
+    assert envelope.metadata["sandbox_run_context"]["run_mode"] == "full"
+    assert envelope.sandbox_run_context_fresh is True
+    assert ctx.caller_kind is CallerKind.SUBAGENT
+    assert ctx.run_mode == "full"
+    assert ctx.elevated == "full"
+    assert ctx.sandbox_run_context is not None
+    assert ctx.sandbox_run_context.run_mode is RunMode.FULL
 
 
 def test_owner_cron_route_carries_owner_principal_for_task_runtime() -> None:

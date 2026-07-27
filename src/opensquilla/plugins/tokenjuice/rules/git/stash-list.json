@@ -4,6 +4,7 @@
   "description": "Compact git stash list output while preserving stash entries.",
   "match": {
     "argv0": ["git"],
+    "gitSubcommands": ["stash"],
     "argvIncludes": [["stash"], ["list"]]
   },
   "transforms": {

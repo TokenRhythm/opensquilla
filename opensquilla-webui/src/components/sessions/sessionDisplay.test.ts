@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { sessionStatusBadge } from './sessionDisplay'
+import { sessionAgentIdentity, sessionStatusBadge } from './sessionDisplay'
 import type { SessionItem } from '@/composables/useSessions'
 
 function sessionItem(overrides: Partial<SessionItem>): SessionItem {
@@ -42,5 +42,27 @@ describe('sessionStatusBadge', () => {
     }))
 
     expect(badge?.label).toBe('Output interrupted')
+  })
+})
+
+describe('sessionAgentIdentity', () => {
+  const agents = new Map([['main', 'Main agent']])
+
+  it('does not report deletion while agents.list has not succeeded', () => {
+    expect(sessionAgentIdentity('retired', agents, false)).toEqual({
+      kind: 'raw',
+      value: 'retired',
+    })
+  })
+
+  it('reports a missing effective agent only after the catalog loaded', () => {
+    expect(sessionAgentIdentity('retired', agents, true)).toEqual({
+      kind: 'deleted',
+      value: 'retired',
+    })
+    expect(sessionAgentIdentity('main', agents, true)).toEqual({
+      kind: 'known',
+      value: 'Main agent',
+    })
   })
 })

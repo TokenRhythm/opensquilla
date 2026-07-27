@@ -94,6 +94,8 @@ async def run_dry_run_benchmark(
         baseline_injector=baseline_injector,
         ensemble_model_hint=DRY_RUN_ENSEMBLE_MODEL,
         baseline_model_hint=DRY_RUN_BASELINE_MODEL,
+        ensemble_provider_hint="",
+        baseline_provider_hint="",
     )
 
 
@@ -152,4 +154,6 @@ async def run_config_benchmark(
         price_lookup=pricing_price_lookup if cost else None,
         ensemble_model_hint=model,
         baseline_model_hint=model,
+        ensemble_provider_hint=provider_id,
+        baseline_provider_hint=provider_id,
     )

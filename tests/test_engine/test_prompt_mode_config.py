@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from opensquilla.engine.runtime import (
@@ -7,9 +9,11 @@ from opensquilla.engine.runtime import (
     _resolve_identity_prompt_mode,
     _resolve_legacy_prompt_style,
     _resolve_patch_evidence_protocol,
+    _resolve_submit_review,
 )
 from opensquilla.engine.turn_runner.agent_bootstrap_stage import (
     _finalize_evidence_gate_from_env,
+    _finalize_evidence_strict_from_env,
 )
 from opensquilla.gateway.config import GatewayConfig
 
@@ -186,6 +190,62 @@ def test_bootstrap_finalize_evidence_gate_env_off_overrides_config_on(monkeypatc
     assert _finalize_evidence_gate_from_env(True) is False
 
 
+def test_bootstrap_finalize_evidence_strict_env_defaults_off(monkeypatch) -> None:
+    monkeypatch.delenv("OPENSQUILLA_FINALIZE_EVIDENCE_STRICT", raising=False)
+
+    assert _finalize_evidence_strict_from_env() is False
+
+
+@pytest.mark.parametrize("value", ["on", "1", "true", "YES"])
+def test_bootstrap_finalize_evidence_strict_env_on(monkeypatch, value: str) -> None:
+    monkeypatch.setenv("OPENSQUILLA_FINALIZE_EVIDENCE_STRICT", value)
+
+    assert _finalize_evidence_strict_from_env() is True
+
+
+@pytest.mark.parametrize("value", ["off", "0", "false", "NO", "  "])
+def test_bootstrap_finalize_evidence_strict_env_off_or_blank(
+    monkeypatch, value: str
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_FINALIZE_EVIDENCE_STRICT", value)
+
+    assert _finalize_evidence_strict_from_env() is False
+
+
+def test_bootstrap_finalize_evidence_strict_env_rejects_unrecognized_value(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_FINALIZE_EVIDENCE_STRICT", "enabled")
+
+    with pytest.raises(ValueError, match="OPENSQUILLA_FINALIZE_EVIDENCE_STRICT"):
+        _finalize_evidence_strict_from_env()
+
+
+def test_bootstrap_finalize_evidence_strict_uses_config_value_when_env_absent(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("OPENSQUILLA_FINALIZE_EVIDENCE_STRICT", raising=False)
+
+    assert _finalize_evidence_strict_from_env(True) is True
+    assert _finalize_evidence_strict_from_env(False) is False
+
+
+def test_bootstrap_finalize_evidence_strict_env_blank_falls_through_to_config(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_FINALIZE_EVIDENCE_STRICT", "  ")
+
+    assert _finalize_evidence_strict_from_env(True) is True
+
+
+def test_bootstrap_finalize_evidence_strict_env_off_overrides_config_on(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_FINALIZE_EVIDENCE_STRICT", "off")
+
+    assert _finalize_evidence_strict_from_env(True) is False
+
+
 def test_legacy_prompt_style_defaults_off(monkeypatch) -> None:
     monkeypatch.delenv("OPENSQUILLA_LEGACY_PROMPT_STYLE", raising=False)
 
@@ -224,3 +284,54 @@ def test_legacy_prompt_style_env_rejects_unrecognized_value(monkeypatch) -> None
 
     with pytest.raises(ValueError, match="OPENSQUILLA_LEGACY_PROMPT_STYLE"):
         _resolve_legacy_prompt_style(GatewayConfig())
+
+
+# ---------------------------------------------------------------------------
+# _resolve_submit_review — tool-surfacing decision (runtime side)
+#
+# Regression guard: the ``submit`` tool surfaces from the TurnRunner config
+# (``self._config``), which is a GatewayConfig that carries no
+# ``submit_review_enabled`` field. The loop-side flag lives on the separate
+# AgentConfig built by agent_bootstrap_stage, so reading the config field alone
+# left the tool unsurfaced even with OPENSQUILLA_SUBMIT_REVIEW=on. The resolver
+# must read the env var directly so surfacing tracks the loop-side gate.
+# ---------------------------------------------------------------------------
+
+
+def test_submit_review_defaults_off(monkeypatch) -> None:
+    monkeypatch.delenv("OPENSQUILLA_SUBMIT_REVIEW", raising=False)
+
+    assert _resolve_submit_review(GatewayConfig()) is False
+
+
+def test_submit_review_env_on_surfaces_despite_missing_config_field(monkeypatch) -> None:
+    # GatewayConfig has no submit_review_enabled attribute; env must still win.
+    monkeypatch.setenv("OPENSQUILLA_SUBMIT_REVIEW", "on")
+
+    assert not hasattr(GatewayConfig(), "submit_review_enabled")
+    assert _resolve_submit_review(GatewayConfig()) is True
+
+
+def test_submit_review_config_opt_in_when_env_blank(monkeypatch) -> None:
+    monkeypatch.delenv("OPENSQUILLA_SUBMIT_REVIEW", raising=False)
+
+    assert _resolve_submit_review(SimpleNamespace(submit_review_enabled=True)) is True
+
+
+def test_submit_review_env_off_overrides_config_on(monkeypatch) -> None:
+    monkeypatch.setenv("OPENSQUILLA_SUBMIT_REVIEW", "off")
+
+    assert _resolve_submit_review(SimpleNamespace(submit_review_enabled=True)) is False
+
+
+def test_submit_review_env_blank_falls_through_to_config(monkeypatch) -> None:
+    monkeypatch.setenv("OPENSQUILLA_SUBMIT_REVIEW", "  ")
+
+    assert _resolve_submit_review(SimpleNamespace(submit_review_enabled=True)) is True
+
+
+def test_submit_review_env_rejects_unrecognized_value(monkeypatch) -> None:
+    monkeypatch.setenv("OPENSQUILLA_SUBMIT_REVIEW", "enabled")
+
+    with pytest.raises(ValueError, match="OPENSQUILLA_SUBMIT_REVIEW"):
+        _resolve_submit_review(GatewayConfig())

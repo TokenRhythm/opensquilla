@@ -15,7 +15,8 @@ const PAIRS = [
   { fg: "text", bg: "appBg", min: 4.5, role: "answer body" },
   { fg: "muted", bg: "appBg", min: 4.5, role: "secondary text" },
   { fg: "detailText", bg: "appBg", min: 4.5, role: "metadata / fallback block" },
-  { fg: "promptAccent", bg: "appBg", min: 4.5, role: "prompt card text" },
+  { fg: "promptAccent", bg: "promptSurface", min: 4.5, role: "prompt role label" },
+  { fg: "promptText", bg: "promptSurface", min: 4.5, role: "prompt text" },
   { fg: "thinkingAccent", bg: "appBg", min: 4.5, role: "reasoning text" },
   { fg: "routeText", bg: "appBg", min: 4.5, role: "info notice / link" },
   { fg: "success", bg: "appBg", min: 4.5, role: "success notice" },
@@ -31,10 +32,7 @@ const PAIRS = [
   { fg: "warning", bg: "footerBg", min: 4.5, role: "router context" },
   { fg: "error", bg: "footerBg", min: 4.5, role: "router error" },
   { fg: "brandAccent", bg: "footerBg", min: 3.0, role: "composer border" },
-  // The composer's bottomTitle status label is TEXT drawn in the box's border
-  // color, so the border tokens must clear the 4.5 text floor on footerBg too.
-  { fg: "brandAccent", bg: "footerBg", min: 4.5, role: "composer status pill" },
-  { fg: "composerDisabledBorder", bg: "footerBg", min: 4.5, role: "composer disabled border + status pill" },
+  { fg: "composerDisabledBorder", bg: "footerBg", min: 3.0, role: "disabled composer border" },
   { fg: "text", bg: "overlayBg", min: 4.5, role: "picker active row" },
   { fg: "muted", bg: "overlayBg", min: 4.5, role: "picker rows" },
   { fg: "detailText", bg: "overlayBg", min: 4.5, role: "picker hint" },

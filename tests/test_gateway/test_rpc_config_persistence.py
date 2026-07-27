@@ -161,15 +161,31 @@ async def test_routing_mode_toggle_persists_only_its_paths(cfg_path) -> None:
     }
     data = tomllib.loads(cfg_path.read_text())
     assert data["llm_ensemble"]["enabled"] is True
-    # Values equal to the model default (router enabled/full) may be omitted
-    # by the sparse diff; the round-trip contract is what matters.
+    # The default static_openrouter_b5 ensemble is independent, so the
+    # canonical three-state reconciliation overrides the legacy conflicting
+    # router=true field while preserving the explicit full rollout marker.
     reloaded = GatewayConfig.load(str(cfg_path))
     assert reloaded.llm_ensemble.enabled is True
-    assert reloaded.squilla_router.enabled is True
+    assert reloaded.squilla_router.enabled is False
     assert reloaded.squilla_router.rollout_phase == "full"
     # No default-bake: sections the toggle never touched stay absent.
     assert "memory" not in data
     assert "auth" not in data
+
+
+async def test_safe_patch_persists_the_gateway_channel_notice_locale(cfg_path) -> None:
+    _write_small_config(cfg_path)
+    cfg = GatewayConfig.load(str(cfg_path))
+
+    result = await _handle_config_patch_safe(
+        {"patches": {"control_ui.default_locale": "zh-Hans"}},
+        _ctx(cfg),
+    )
+
+    assert result["restartRequired"] is False
+    assert cfg.control_ui.default_locale == "zh-Hans"
+    data = tomllib.loads(cfg_path.read_text())
+    assert data["control_ui"]["default_locale"] == "zh-Hans"
 
 
 # --- set-heartbeats (third _persist_config caller) -----------------------------

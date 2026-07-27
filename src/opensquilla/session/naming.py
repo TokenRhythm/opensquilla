@@ -6,9 +6,13 @@ runs a single one-shot LLM call (mirroring the compaction summarizer's direct
 
 Model selection deliberately does NOT reuse the session model. It resolves, in
 order: ``naming.model`` (explicit) → ``naming.tier`` model → the router's
-``default_tier`` model → the session/provider model as a last resort. Connection
-credentials (api_key / base_url) come from the same provider the compaction path
-resolves, so an OpenRouter-backed gateway stays self-consistent.
+``default_tier`` model → the session/provider model as a last resort. A tier
+model is only eligible when the tier targets the active provider — matched on
+the configured provider id, with the wire kind accepted as an alias — or names
+no provider at all: tier model ids are spelled per provider catalog and are
+not portable across connections. Connection credentials (api_key / base_url)
+come from the same provider the compaction path resolves, so an
+OpenRouter-backed gateway stays self-consistent.
 
 The title is written to ``derived_title`` (not ``display_name``) so it sits below
 a user's manual rename in the precedence (see ``session_view._title``) and can
@@ -18,22 +22,36 @@ the existing truncation fallback (``derive_transcript_title``) remains in effect
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import structlog
 
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.provider.app_attribution import provider_app_headers
-from opensquilla.provider.protocol import provider_connection_config
+from opensquilla.provider.protocol import (
+    configured_provider_id,
+    provider_connection_config,
+)
+from opensquilla.provider.tokenrhythm_correlation import (
+    tokenrhythm_correlation_headers,
+)
 from opensquilla.router_tiers import DEFAULT_TEXT_TIER, normalize_text_tier
+
+if TYPE_CHECKING:
+    from opensquilla.provider.types import ProviderRequestCorrelation
 
 log = structlog.get_logger(__name__)
 
 _DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 _MAX_INPUT_CHARS = 4000  # cap the untrusted first message fed to the namer
-_TITLE_MAX_TOKENS = 96
+# Reasoning-by-default models (e.g. DeepSeek V4 family) spend completion
+# tokens on thinking before the title, and some hosts offer no way to turn
+# that off — the budget must cover thinking plus the title or the response
+# ends at length with empty content.
+_TITLE_MAX_TOKENS = 512
 _OPENROUTER_REASONING_DEFAULT_MODELS = frozenset(
     {
         "deepseek/deepseek-v4",
@@ -79,6 +97,7 @@ class NamingTarget:
     api_key: str
     base_url: str
     timeout: float
+    provider: str = ""
 
 
 def _display_name_is_generic(value: str | None) -> bool:
@@ -116,7 +135,12 @@ def is_naming_eligible(naming_cfg: Any, surface: str, session_kind: str) -> bool
     return False
 
 
-def _tier_model(router_cfg: Any | None, tier_name: str | None) -> str | None:
+def _tier_model(
+    router_cfg: Any | None,
+    tier_name: str | None,
+    *,
+    provider_identities: frozenset[str] = frozenset(),
+) -> str | None:
     tiers = getattr(router_cfg, "tiers", None)
     if not isinstance(tiers, dict) or not tier_name:
         return None
@@ -125,10 +149,26 @@ def _tier_model(router_cfg: Any | None, tier_name: str | None) -> str | None:
         normalized = normalize_text_tier(tier_name)
         if normalized:
             cfg = tiers.get(normalized)
-    if isinstance(cfg, dict):
-        model = cfg.get("model")
-        return str(model).strip() or None if model else None
-    return None
+    if not isinstance(cfg, dict):
+        return None
+    # Tier model ids are spelled for the tier's own provider catalog. Naming
+    # can only send through the active provider's connection, so a tier that
+    # names a different provider is unusable here (its id would be rejected
+    # by the host, e.g. a vendor-prefixed id posted to a strict catalog).
+    # Tier tables spell ``provider`` as the configured registry id (the same
+    # vocabulary the routing mismatch policy compares); the wire kind stays
+    # accepted as an alias for hand-written tables.
+    tier_provider = str(cfg.get("provider") or "").strip().lower()
+    if tier_provider and provider_identities and tier_provider not in provider_identities:
+        log.debug(
+            "session_naming.tier_model_skipped_provider_mismatch",
+            tier=tier_name,
+            tier_provider=tier_provider,
+            provider_identities=sorted(provider_identities),
+        )
+        return None
+    model = cfg.get("model")
+    return str(model).strip() or None if model else None
 
 
 def resolve_naming_target(
@@ -144,13 +184,18 @@ def resolve_naming_target(
     """
 
     conn = provider_connection_config(provider)
+    provider_identities = frozenset(
+        identity.strip().lower()
+        for identity in (configured_provider_id(provider), conn.provider_kind)
+        if identity and identity.strip()
+    )
 
     tier_name = getattr(naming_cfg, "tier", None) or getattr(
         router_cfg, "default_tier", DEFAULT_TEXT_TIER
     )
     model = (
         getattr(naming_cfg, "model", None)
-        or _tier_model(router_cfg, tier_name)
+        or _tier_model(router_cfg, tier_name, provider_identities=provider_identities)
         or conn.model
         or fallback_model
     )
@@ -165,7 +210,13 @@ def resolve_naming_target(
     except (TypeError, ValueError):
         timeout = 30.0
 
-    return NamingTarget(model=model, api_key=api_key, base_url=base_url, timeout=timeout)
+    return NamingTarget(
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        timeout=timeout,
+        provider=conn.provider_kind,
+    )
 
 
 def _sanitize_title(raw: str | None, max_chars: int) -> str | None:
@@ -226,6 +277,8 @@ async def call_naming_llm(
     timeout: float = 30.0,
     max_chars: int = 48,
     language: str = "auto",
+    provider: str = "",
+    provider_request_correlation: ProviderRequestCorrelation | None = None,
 ) -> str | None:
     """Summarize ``first_message`` into a short title. Returns ``None`` on failure."""
 
@@ -257,14 +310,44 @@ async def call_naming_llm(
         "Content-Type": "application/json",
     }
     headers.update(provider_app_headers(url))
+    headers.update(
+        tokenrhythm_correlation_headers(
+            provider,
+            url,
+            provider_request_correlation,
+        )
+    )
+
+    # Keep this import local: engine types import session lifecycle helpers
+    # while the session package initializes this module.
+    from opensquilla.engine.usage_http import reserve_direct_usage_call
+
+    usage = await reserve_direct_usage_call(
+        provider=provider
+        or ("openrouter" if "openrouter.ai" in url.lower() else "openai_compat"),
+        model=model,
+        base_url=url,
+    )
 
     try:
-        async with httpx.AsyncClient(timeout=timeout, trust_env=_trust_env()) as client:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            trust_env=_trust_env(),
+            follow_redirects=False,
+        ) as client:
             resp = await client.post(url, json=payload, headers=headers)
             resp.raise_for_status()
             data = resp.json()
+            await usage.finalize_openai_response(
+                data,
+                raw_json=str(getattr(resp, "text", "") or ""),
+            )
             raw = data["choices"][0]["message"]["content"]
+    except asyncio.CancelledError:
+        await usage.mark_unknown("cancelled")
+        raise
     except Exception as exc:  # noqa: BLE001 - naming is best-effort
+        await usage.mark_unknown("direct_request_failed")
         log.warning("session_naming.llm_call_failed", model=model, error=str(exc))
         return None
 
@@ -275,6 +358,8 @@ async def generate_session_title(
     ctx: Any,
     session_key: str,
     first_message: str,
+    *,
+    provider_request_correlation: ProviderRequestCorrelation | None = None,
 ) -> None:
     """Background entry point: generate + persist a title, then refresh the UI.
 
@@ -317,15 +402,32 @@ async def generate_session_title(
         if target is None:
             return
 
-        title = await call_naming_llm(
-            first_message,
-            model=target.model,
-            api_key=target.api_key,
-            base_url=target.base_url,
-            timeout=target.timeout,
-            max_chars=int(getattr(naming_cfg, "max_chars", 48)),
-            language=str(getattr(naming_cfg, "language", "auto")),
+        from opensquilla.engine.usage_accounting import bind_usage_accounting_scope
+        from opensquilla.gateway.usage_ledger_runtime import build_session_usage_scope
+
+        usage_scope = await build_session_usage_scope(
+            getattr(ctx, "usage_event_sink", None),
+            getattr(ctx, "session_manager", None),
+            session_key,
+            run_kind="session_naming",
         )
+        with bind_usage_accounting_scope(usage_scope):
+            correlation_kwargs: dict[str, Any] = {}
+            if provider_request_correlation is not None:
+                correlation_kwargs["provider_request_correlation"] = (
+                    provider_request_correlation
+                )
+            title = await call_naming_llm(
+                first_message,
+                model=target.model,
+                api_key=target.api_key,
+                base_url=target.base_url,
+                timeout=target.timeout,
+                max_chars=int(getattr(naming_cfg, "max_chars", 48)),
+                language=str(getattr(naming_cfg, "language", "auto")),
+                provider=target.provider,
+                **correlation_kwargs,
+            )
         if not title:
             return
 

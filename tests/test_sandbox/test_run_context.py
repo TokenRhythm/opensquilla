@@ -113,7 +113,7 @@ async def test_set_run_mode_persists_first_workspace_and_preserves_origin_keys()
 
 
 @pytest.mark.asyncio
-async def test_saved_context_wins_over_later_global_default() -> None:
+async def test_globally_disabled_sandbox_overrides_saved_restricted_mode() -> None:
     from opensquilla.sandbox.run_context import get_run_context, normalize_workspace_path
 
     manager = _SessionManager()
@@ -131,9 +131,9 @@ async def test_saved_context_wins_over_later_global_default() -> None:
         workspace="/tmp/new",
     )
 
-    assert ctx.run_mode == RunMode.STANDARD
+    assert ctx.run_mode == RunMode.FULL
     assert ctx.workspace == expected_workspace
-    assert ctx.source == "saved"
+    assert ctx.source == "global_full"
 
 
 @pytest.mark.asyncio

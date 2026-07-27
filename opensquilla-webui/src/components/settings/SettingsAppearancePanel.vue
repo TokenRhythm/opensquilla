@@ -9,6 +9,11 @@ import ControlSwitch from '@/components/ControlSwitch.vue'
 import { useBgm } from '@/composables/useBgm'
 import { useSidebarLayout } from '@/composables/useSidebarLayout'
 import {
+  TOOL_DETAIL_DISPLAY_MODES,
+  type ToolDetailDisplayMode,
+  useToolDetailPreference,
+} from '@/composables/useToolDetailPreference'
+import {
   SIDEBAR_MAX_WIDTH,
   SIDEBAR_MIN_WIDTH,
   SIDEBAR_WIDTH_PRESETS,
@@ -39,6 +44,10 @@ const LOCALE_LABELS: Record<LocaleCode, string> = {
   es: 'Español',
 }
 const localeOptions = SUPPORTED_LOCALES.map((code) => ({ code, label: LOCALE_LABELS[code] }))
+const toolDetailOptions = TOOL_DETAIL_DISPLAY_MODES.map(mode => ({
+  mode,
+  labelKey: `settings.appearance.toolDetails${mode[0].toUpperCase()}${mode.slice(1)}`,
+}))
 
 function pickTheme(mode: ThemeMode) {
   appStore.setTheme(mode)
@@ -46,6 +55,15 @@ function pickTheme(mode: ThemeMode) {
 
 function pickLocale(code: LocaleCode) {
   void appStore.setLocale(code)
+}
+
+const {
+  mode: toolDetailDisplayMode,
+  setMode: setToolDetailDisplayMode,
+} = useToolDetailPreference()
+
+function pickToolDetailDisplay(mode: ToolDetailDisplayMode) {
+  setToolDetailDisplayMode(mode)
 }
 
 // Background-music feature gate (off by default). Same singleton the topbar
@@ -271,6 +289,39 @@ onBeforeUnmount(stopCustomStepRepeat)
               @change="pickLocale(opt.code)"
             >
             <span>{{ opt.label }}</span>
+          </label>
+        </div>
+      </div>
+    </div>
+
+    <div class="control-row control-row--stack">
+      <div class="control-row__label-block">
+        <span class="control-row__label">{{ t('settings.appearance.toolDetailsLabel') }}</span>
+        <span class="control-row__desc">{{ t('settings.appearance.toolDetailsDesc') }}</span>
+      </div>
+      <div class="control-row__control">
+        <div
+          class="appearance-theme"
+          role="radiogroup"
+          :aria-label="t('settings.appearance.toolDetailsLabel')"
+          data-testid="settings-tool-details-group"
+        >
+          <label
+            v-for="option in toolDetailOptions"
+            :key="option.mode"
+            class="appearance-theme__opt"
+            :class="{ 'is-active': toolDetailDisplayMode === option.mode }"
+          >
+            <input
+              class="appearance-theme__radio"
+              type="radio"
+              name="appearance-tool-details"
+              :value="option.mode"
+              :checked="toolDetailDisplayMode === option.mode"
+              :data-testid="`settings-tool-details-${option.mode}`"
+              @change="pickToolDetailDisplay(option.mode)"
+            >
+            <span>{{ t(option.labelKey) }}</span>
           </label>
         </div>
       </div>

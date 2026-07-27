@@ -1,13 +1,16 @@
 import type {
   ArtifactPayload,
   CompactionPayload,
+  CronResultPayload,
   EnsembleProgressPayload,
   RouterDecisionPayload,
   SessionEventPayload,
+  SubagentCompletionPayload,
   TextDeltaPayload,
   ToolDeltaPayload,
   ToolResultPayload,
   ToolUsePayload,
+  WarningPayload,
 } from '@/types/rpc'
 import type { RpcEventHandler } from '@/lib/rpc'
 
@@ -24,7 +27,9 @@ export type ChatRpcSubscriptionHandlers = {
   onStateChange: (payload: SessionEventPayload) => void
   onRunHeartbeat: (payload: SessionEventPayload) => void
   onCompaction: (payload: CompactionPayload, meta: unknown) => void
-  onWarning: (payload: SessionEventPayload) => void
+  onWarning: (payload: WarningPayload) => void
+  onCronResult: (payload: CronResultPayload) => void
+  onSubagentCompletion: (payload: SubagentCompletionPayload) => void
   onEpochChanged: (payload: SessionEventPayload) => void
   onSessionsChanged: (payload: SessionEventPayload) => void
   onTaskQueued: (payload: SessionEventPayload) => void
@@ -58,6 +63,8 @@ export function useChatRpcSubscriptions(
       rpc.on('session.event.run_heartbeat', handlers.onRunHeartbeat),
       rpc.on('session.event.compaction', handlers.onCompaction),
       rpc.on('session.event.warning', handlers.onWarning),
+      rpc.on('session.event.cron_result', handlers.onCronResult),
+      rpc.on('session.event.subagent_completion', handlers.onSubagentCompletion),
       rpc.on('session.epoch_changed', handlers.onEpochChanged),
       rpc.on('sessions.changed', handlers.onSessionsChanged),
       rpc.on('task.queued', handlers.onTaskQueued),

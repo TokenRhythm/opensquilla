@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-default_version="v0.5.0rc4"
+default_version="v0.5.0"
 repo_slug="${OPENSQUILLA_REPOSITORY:-opensquilla/opensquilla}"
 python_version="${OPENSQUILLA_PYTHON_VERSION:-3.12}"
 original_path="${PATH:-}"
@@ -18,10 +18,10 @@ cli_extras=""
 
 usage() {
     cat <<HELP
-Usage: bash install.sh [--version v0.5.0rc4|latest] [--profile recommended|core] [--extras name[,name]]
+Usage: bash install.sh [--version v0.5.0|latest] [--profile recommended|core] [--extras name[,name]]
 
 Environment equivalents:
-  OPENSQUILLA_VERSION=v0.5.0rc4
+  OPENSQUILLA_VERSION=v0.5.0
   OPENSQUILLA_INSTALL_PROFILE=recommended|core
   OPENSQUILLA_INSTALL_EXTRAS=matrix
   OPENSQUILLA_INSTALL_DRY_RUN=1
@@ -133,7 +133,7 @@ fi
 
 if [[ "${release_selector}" != "latest" && "${release_selector}" != "stable" ]] && ! is_release_version "${release_selector}"; then
     echo "install.sh: unsupported OPENSQUILLA_VERSION='${release_selector}'." >&2
-    echo "install.sh: the release installer only supports latest, stable, or release versions like v0.5.0rc4." >&2
+    echo "install.sh: the release installer only supports latest, stable, or release versions like v0.5.0." >&2
     echo "install.sh: use git clone plus scripts/install_source.sh for main, dev, branch, or source installs." >&2
     exit 1
 fi

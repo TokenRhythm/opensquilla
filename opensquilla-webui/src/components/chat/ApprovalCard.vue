@@ -40,7 +40,13 @@
         <div class="approval-card__label">{{ t('chat.approval.command') }}</div>
         <pre class="approval-card__pre approval-card__pre--cmd">{{ approval.command }}</pre>
       </template>
-      <template v-else-if="formattedArgs">
+      <dl v-if="sandboxContextRows.length" class="approval-card__context">
+        <div v-for="row in sandboxContextRows" :key="row.key" class="approval-card__context-row">
+          <dt>{{ t(row.labelKey) }}</dt>
+          <dd>{{ row.value }}</dd>
+        </div>
+      </dl>
+      <template v-else-if="!approval.command && formattedArgs">
         <div class="approval-card__label">{{ t('chat.approval.arguments') }}</div>
         <pre class="approval-card__pre">{{ formattedArgs }}</pre>
       </template>
@@ -171,6 +177,23 @@ const countdownText = computed(() =>
 const isSandboxApproval = computed(() =>
   String(props.approval.approvalKind || props.approval.args?.approvalKind || '').startsWith('sandbox_'))
 
+const sandboxContextRows = computed(() => {
+  const args = props.approval.args
+  const kind = String(props.approval.approvalKind || args?.approvalKind || '')
+  if (!args || !kind.startsWith('sandbox_')) return []
+  const target = kind === 'sandbox_network'
+    ? [args.host, args.bundle_id]
+        .filter(value => value != null && ['string', 'number', 'boolean'].includes(typeof value))
+        .join(' · ')
+    : args.path
+  return [
+    { key: 'target', labelKey: 'chat.approval.target', value: target },
+    { key: 'access', labelKey: 'chat.approval.access', value: args.access },
+    { key: 'workspace', labelKey: 'chat.approval.workspace', value: args.workspace },
+  ].filter((row): row is { key: string; labelKey: string; value: string | number | boolean } =>
+    row.value != null && ['string', 'number', 'boolean'].includes(typeof row.value))
+})
+
 const formattedArgs = computed(() => {
   if (!props.approval.args) return ''
   try {
@@ -181,18 +204,21 @@ const formattedArgs = computed(() => {
 })
 
 const outcomeText = computed(() => {
+  if (props.resolution === 'unavailable') return t('chat.approval.outcomeUnavailable')
   if (props.resolution === 'expired') return t('chat.approval.outcomeExpired')
   if (props.resolution === 'denied') return t('chat.approval.outcomeDenied')
   return t('chat.approval.outcomeApproved')
 })
 
 const outcomeClass = computed(() => {
+  if (props.resolution === 'unavailable') return 'approval-outcome--unavailable'
   if (props.resolution === 'expired') return 'approval-outcome--expired'
   if (props.resolution === 'denied') return 'approval-outcome--denied'
   return 'approval-outcome--approved'
 })
 
 const outcomeIcon = computed(() => {
+  if (props.resolution === 'unavailable') return 'info'
   if (props.resolution === 'expired') return 'clock'
   if (props.resolution === 'denied') return 'x'
   return 'check'
@@ -318,6 +344,32 @@ function emitDeny() {
   margin: 0;
 }
 
+.approval-card__context {
+  display: grid;
+  gap: var(--sp-2);
+  margin: 0;
+}
+
+.approval-card__context-row {
+  display: grid;
+  grid-template-columns: minmax(88px, auto) 1fr;
+  gap: var(--sp-3);
+}
+
+.approval-card__context-row dt {
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+}
+
+.approval-card__context-row dd {
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
 /* Sticky action bar: the body above scrolls, this footer stays visible. */
 .approval-card__footer {
   position: sticky;
@@ -418,6 +470,10 @@ function emitDeny() {
 }
 
 .approval-outcome--expired {
+  color: var(--text-muted);
+}
+
+.approval-outcome--unavailable {
   color: var(--text-muted);
 }
 

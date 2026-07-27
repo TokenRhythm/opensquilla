@@ -115,7 +115,30 @@ describe('SetupModelCombobox', () => {
     expect(input?.placeholder).toBe('Search models or enter a custom ID')
   })
 
-  it('opens on focus and lists models with compact context window and capability hints', async () => {
+  it('associates field help and live catalog context with the input', async () => {
+    const { el } = await mountCombobox({
+      field: { ...FIELD, description: 'Used for direct requests and fallback.' },
+    })
+    const input = el.querySelector<HTMLInputElement>('input[name="setup_provider_model"]')
+    const description = el.querySelector<HTMLElement>('#setup-provider-model-description')
+
+    expect(description?.textContent).toBe('Used for direct requests and fallback.')
+    expect(input?.getAttribute('aria-describedby'))
+      .toBe('setup-provider-model-description setup-provider-model-catalog-count')
+  })
+
+  it('keeps field help associated when no live catalog is available', async () => {
+    const { el } = await mountCombobox({
+      field: { ...FIELD, description: 'Enter a provider model ID.' },
+      models: [],
+      modelSource: 'none',
+    })
+    const input = el.querySelector<HTMLInputElement>('input[name="setup_provider_model"]')
+
+    expect(input?.getAttribute('aria-describedby')).toBe('setup-provider-model-description')
+  })
+
+  it('lists compact context, maximum output, and capability hints', async () => {
     const { el } = await mountCombobox()
     await openList(el)
 
@@ -124,21 +147,23 @@ describe('SetupModelCombobox', () => {
     expect(rows[0].textContent).toContain('test-vendor/alpha')
     expect(rows[0].textContent).toContain('Alpha')
     expect(rows[0].textContent).toContain('262k')
+    expect(rows[0].textContent).toContain('Max output 16k')
     expect(rows[0].textContent).toContain('tools')
     expect(rows[0].textContent).not.toContain('chat') // baseline capability is noise
     expect(rows[1].textContent).toContain('128k')
+    expect(rows[1].textContent).not.toContain('Max output')
     expect(rows[1].textContent).toContain('vision')
   })
 
-  it('shows the discovered-model count on the trigger and in the live catalog readout', async () => {
+  it('keeps the model count in the catalog header instead of the input chrome', async () => {
     const { el } = await mountCombobox()
     const trigger = el.querySelector<HTMLButtonElement>('[data-testid="setup-model-options-toggle"]')
 
-    expect(trigger?.textContent).toContain('2')
+    expect(trigger?.textContent?.trim()).toBe('')
+    expect(trigger?.querySelector('.setup-model-combobox__count')).toBeNull()
     expect(trigger?.getAttribute('aria-label')).toBe('Model catalog · 2')
 
-    trigger!.click()
-    await nextTick()
+    await openList(el)
 
     const readout = document.querySelector('.setup-model-combobox__readout')?.textContent
     expect(readout).toContain('Available · 2')

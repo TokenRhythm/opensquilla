@@ -78,3 +78,18 @@ def test_channel_reply_carries_ref() -> None:
         event.error_id or None,
     )
     assert reply == "The task failed before it could finish. (ref: abcd1234)"
+
+
+def test_channel_reply_surfaces_actionable_ensemble_image_rejection() -> None:
+    from opensquilla.gateway.channel_dispatch import _terminal_payload_from_error_event
+    from opensquilla.session.terminal_reply import build_terminal_reply
+
+    event = ErrorEvent(
+        message=(
+            "Ensemble does not support image input yet. "
+            "Switch to a single-model routing mode and try again."
+        ),
+        code="ensemble_multimodal_unsupported",
+    )
+
+    assert build_terminal_reply(_terminal_payload_from_error_event(event)) == event.message

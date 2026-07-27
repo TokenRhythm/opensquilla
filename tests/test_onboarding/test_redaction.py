@@ -36,10 +36,16 @@ def test_telegram_secrets_are_redacted():
     assert out["name"] == "tg"
 
 
-def test_unknown_channel_type_redacts_nothing():
-    payload = {"name": "x", "token": "y"}
+def test_unknown_channel_type_redacts_secret_shaped_keys():
+    # No setup spec (entry-point plugin adapter): fail closed by masking
+    # anything secret-shaped instead of returning credentials verbatim.
+    payload = {"name": "x", "token": "y", "api_key": "z", "appToken": "t", "port": 8080}
     out = redact_channel_entry("not-a-type", payload)
-    assert out == payload
+    assert out["token"] == REDACTED_PLACEHOLDER
+    assert out["api_key"] == REDACTED_PLACEHOLDER
+    assert out["appToken"] == REDACTED_PLACEHOLDER
+    assert out["name"] == "x"
+    assert out["port"] == 8080
 
 
 def test_input_dict_is_not_mutated():

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import uuid
 from typing import Any
 
 from opensquilla.engine.pipeline import TurnContext
@@ -15,6 +16,7 @@ from opensquilla.provider.types import (
     ErrorEvent,
     Message,
     TextDeltaEvent,
+    derive_provider_request_correlation,
 )
 
 _VALID_DECISIONS = {"needs_image", "text_only", "unknown"}
@@ -137,6 +139,11 @@ async def _call_gate_provider(ctx: TurnContext) -> str:
         temperature=0,
         timeout=timeout,
         system=_gate_system_prompt(),
+        provider_request_correlation=derive_provider_request_correlation(
+            ctx.provider_request_correlation,
+            execution_id=uuid.uuid4().hex,
+            call_kind="auxiliary.vision_gate",
+        ),
     )
     messages = [
         Message(

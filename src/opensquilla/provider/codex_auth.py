@@ -135,17 +135,37 @@ def _persist_refreshed_tokens(auth_path: Path, refreshed: dict[str, Any]) -> Non
     payload["last_refresh"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
     auth_path.parent.mkdir(parents=True, exist_ok=True)
+    # ``mkstemp`` creates the temporary file securely and returns an open
+    # descriptor. Keep writing through that descriptor so no path-based
+    # close-and-reopen race is introduced. On POSIX, ``fchmod`` reasserts
+    # the intended mode on the open file before any token bytes are written;
+    # platforms without ``fchmod`` retain ``mkstemp``'s native protection.
     fd, tmp_name = tempfile.mkstemp(dir=str(auth_path.parent), prefix=".auth-")
+    fd_owned = False
+    should_unlink = True
     try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd_owned = True
             json.dump(payload, handle, indent=2)
-        os.chmod(tmp_name, 0o600)
         os.replace(tmp_name, auth_path)
-    except OSError:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
+        # Ownership transferred to ``auth_path``; don't unlink on
+        # subsequent error.
+        should_unlink = False
+    except Exception:
+        # If ``fdopen`` never took ownership of the descriptor, close
+        # it ourselves so a pre-write failure doesn't leak the fd.
+        if not fd_owned:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if should_unlink:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
         raise
 
 

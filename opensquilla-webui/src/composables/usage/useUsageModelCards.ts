@@ -6,9 +6,11 @@ const t = i18n.global.t
 
 export function useUsageModelCards(options: {
   visibleSessions: ComputedRef<SessionRow[]>
+  serverModels?: ComputedRef<ModelCard[] | null>
   rowVal: (row: Record<string, unknown>, ...keys: string[]) => unknown
 }) {
   const modelCards = computed((): ModelCard[] => {
+    if (options.serverModels?.value) return options.serverModels.value
     const map: Record<string, ModelCard> = {}
     // Aggregation-only bookkeeping (not part of the ModelCard shape): the set
     // of distinct cost sources contributing to a model, and whether any

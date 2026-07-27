@@ -337,6 +337,136 @@ async def test_discover_rpc_reuses_stored_credentials_when_blank(
     assert seen[0].headers["authorization"] == "Bearer sk-stored"
 
 
+async def test_discover_rpc_reuses_stored_key_for_same_origin_path_change(
+    tmp_path, monkeypatch: Any
+) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    seen = _patch_response(monkeypatch, _models_response)
+    cfg = GatewayConfig(
+        config_path=str(tmp_path / "opensquilla.toml"),
+        llm=LlmProviderConfig(
+            provider="openrouter",
+            model="m",
+            api_key="sk-origin-a",
+            base_url="https://openrouter.ai/api/v1",
+        ),
+    )
+    ctx = RpcContext(conn_id="t", config=cfg)
+
+    payload = await rpc_onboarding._models_discover(
+        {
+            "providerId": "openrouter",
+            "baseUrl": "https://OPENROUTER.ai:443/alternate/v2",
+        },
+        ctx,
+    )
+
+    assert payload["ok"] is True
+    assert seen[0].url.host == "openrouter.ai"
+    assert seen[0].headers["authorization"] == "Bearer sk-origin-a"
+
+
+async def test_discover_rpc_never_reuses_key_for_cross_origin_endpoint(
+    tmp_path, monkeypatch: Any
+) -> None:
+    # The official subdomain remains selectable, so this exercises the
+    # credential boundary rather than the catalog host allowlist.
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-default-origin-a")
+    seen = _patch_response(monkeypatch, _models_response)
+    cfg = GatewayConfig(
+        config_path=str(tmp_path / "opensquilla.toml"),
+        llm=LlmProviderConfig(
+            provider="openrouter",
+            model="m",
+            api_key="sk-explicit-origin-a",
+            base_url="https://openrouter.ai/api/v1",
+        ),
+    )
+    ctx = RpcContext(conn_id="t", config=cfg)
+
+    payload = await rpc_onboarding._models_discover(
+        {
+            "providerId": "openrouter",
+            "baseUrl": "https://api.openrouter.ai/v1",
+        },
+        ctx,
+    )
+
+    assert payload["ok"] is False
+    assert payload["failureKind"] == ProviderFailureKind.AUTH_INVALID.value
+    assert seen == []
+
+
+async def test_discover_rpc_never_reuses_stored_env_for_cross_origin_endpoint(
+    tmp_path, monkeypatch: Any
+) -> None:
+    monkeypatch.setenv("OPENROUTER_ORIGIN_A_KEY", "sk-env-origin-a")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    seen = _patch_response(monkeypatch, _models_response)
+    cfg = GatewayConfig(
+        config_path=str(tmp_path / "opensquilla.toml"),
+        llm=LlmProviderConfig(
+            provider="openrouter",
+            model="m",
+            api_key="",
+            api_key_env="OPENROUTER_ORIGIN_A_KEY",
+            base_url="https://openrouter.ai/api/v1",
+        ),
+    )
+    ctx = RpcContext(conn_id="t", config=cfg)
+
+    payload = await rpc_onboarding._models_discover(
+        {
+            "providerId": "openrouter",
+            "baseUrl": "https://api.openrouter.ai/v1",
+        },
+        ctx,
+    )
+
+    assert payload["ok"] is False
+    assert payload["failureKind"] == ProviderFailureKind.AUTH_INVALID.value
+    assert seen == []
+
+
+async def test_discover_rpc_custom_cross_origin_never_passes_stored_key(
+    tmp_path, monkeypatch: Any
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_discover(**kwargs: Any) -> ProviderModelsDiscoverResult:
+        captured.update(kwargs)
+        return ProviderModelsDiscoverResult(ok=True, provider_id="custom")
+
+    monkeypatch.setattr(
+        "opensquilla.onboarding.probe.discover_selectable_provider_models",
+        fake_discover,
+    )
+    cfg = GatewayConfig(
+        config_path=str(tmp_path / "opensquilla.toml"),
+        llm=LlmProviderConfig(
+            provider="custom",
+            model="m",
+            api_key="sk-origin-a",
+            base_url="https://a.example.test/v1",
+        ),
+    )
+    ctx = RpcContext(conn_id="t", config=cfg)
+
+    payload = await rpc_onboarding._models_discover(
+        {
+            "providerId": "custom",
+            "baseUrl": "https://b.example.test/v1",
+        },
+        ctx,
+    )
+
+    assert payload["ok"] is True
+    assert captured["api_key"] == ""
+    assert captured["api_key_env"] == ""
+    assert captured["base_url"] == "https://b.example.test/v1"
+    assert captured["allow_default_api_key_env"] is False
+
+
 async def test_discover_rpc_does_not_leak_stored_credentials_across_providers(
     tmp_path, monkeypatch: Any
 ) -> None:

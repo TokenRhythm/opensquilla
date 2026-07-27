@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
 from difflib import SequenceMatcher
 from pathlib import Path
 
+from opensquilla.artifact_validation import (
+    ArtifactValidationError,
+    is_pptx_candidate,
+    validate_artifact_for_delivery,
+)
 from opensquilla.artifacts import (
     DEFAULT_ARTIFACT_DISK_BUDGET_BYTES,
     DEFAULT_ARTIFACT_MAX_BYTES,
@@ -21,7 +27,13 @@ from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
 from opensquilla.tools.path_aliases import resolve_workspace_alias
 from opensquilla.tools.path_policy import reject_foreign_host_path
 from opensquilla.tools.registry import tool
-from opensquilla.tools.types import CallerKind, ToolContext, ToolError, current_tool_context
+from opensquilla.tools.types import (
+    CallerKind,
+    RetryableToolInputError,
+    ToolContext,
+    ToolError,
+    current_tool_context,
+)
 
 _MAX_MISSING_FILE_CANDIDATES = 5
 _MAX_MISSING_FILE_SCAN = 2000
@@ -211,7 +223,52 @@ async def publish_artifact(
     if not target.is_file():
         raise ToolError(f"artifact path is not a file: {path}")
 
-    target_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
+    artifact_name, artifact_mime = _publish_artifact_metadata(
+        target=target,
+        name=name,
+        mime=mime,
+    )
+    target_is_pptx = is_pptx_candidate(
+        source_name=target.name,
+        name=artifact_name,
+        mime=artifact_mime,
+    )
+    configured_max_bytes = (
+        ctx.artifact_max_bytes
+        if ctx.artifact_max_bytes is not None
+        else DEFAULT_ARTIFACT_MAX_BYTES
+    )
+    max_bytes = artifact_publish_max_bytes_for_name(
+        artifact_name,
+        configured_max_bytes,
+    )
+    target_payload: bytes | None = None
+    if target_is_pptx:
+        target_size = target.stat().st_size
+        if max_bytes is not None and target_size > max_bytes:
+            budget_error = ArtifactBudgetError(
+                "artifact exceeds per-file budget "
+                f"({target_size} > {max_bytes})"
+            )
+            raise ToolError(str(budget_error)) from budget_error
+        # Inflation plus full-deck parsing is CPU-bound; keep it off the
+        # gateway event loop so concurrent sessions stay responsive.
+        target_payload = await asyncio.to_thread(target.read_bytes)
+        try:
+            await asyncio.to_thread(
+                validate_artifact_for_delivery,
+                target_payload,
+                source_name=target.name,
+                name=artifact_name,
+                mime=artifact_mime,
+                source="publish_artifact",
+            )
+        except ArtifactValidationError as exc:
+            raise RetryableToolInputError(exc.user_message) from exc
+
+    target_sha256 = hashlib.sha256(
+        target_payload if target_payload is not None else target.read_bytes()
+    ).hexdigest()
     for published in reversed(ctx.published_artifacts):
         if published.get("sha256") != target_sha256:
             continue
@@ -229,12 +286,6 @@ async def publish_artifact(
             },
             ensure_ascii=False,
         )
-
-    artifact_name, artifact_mime = _publish_artifact_metadata(
-        target=target,
-        name=name,
-        mime=mime,
-    )
 
     store = ArtifactStore(ctx.artifact_media_root)
     existing = store.find_existing_ref(
@@ -262,27 +313,35 @@ async def publish_artifact(
             },
             ensure_ascii=False,
         )
-    configured_max_bytes = (
-        ctx.artifact_max_bytes
-        if ctx.artifact_max_bytes is not None
-        else DEFAULT_ARTIFACT_MAX_BYTES
+    disk_budget_bytes = (
+        ctx.artifact_disk_budget_bytes
+        if ctx.artifact_disk_budget_bytes is not None
+        else DEFAULT_ARTIFACT_DISK_BUDGET_BYTES
     )
     try:
-        ref = store.publish_file(
-            target,
-            session_id=ctx.artifact_session_id,
-            session_key=ctx.session_key,
-            name=artifact_name,
-            mime=artifact_mime,
-            source="publish_artifact",
-            max_bytes=artifact_publish_max_bytes_for_name(
-                artifact_name,
-                configured_max_bytes,
-            ),
-            disk_budget_bytes=ctx.artifact_disk_budget_bytes
-            if ctx.artifact_disk_budget_bytes is not None
-            else DEFAULT_ARTIFACT_DISK_BUDGET_BYTES,
-        )
+        if target_is_pptx:
+            assert target_payload is not None
+            ref = store.publish_bytes(
+                target_payload,
+                session_id=ctx.artifact_session_id,
+                session_key=ctx.session_key,
+                name=artifact_name,
+                mime=artifact_mime,
+                source="publish_artifact",
+                max_bytes=max_bytes,
+                disk_budget_bytes=disk_budget_bytes,
+            )
+        else:
+            ref = store.publish_file(
+                target,
+                session_id=ctx.artifact_session_id,
+                session_key=ctx.session_key,
+                name=artifact_name,
+                mime=artifact_mime,
+                source="publish_artifact",
+                max_bytes=max_bytes,
+                disk_budget_bytes=disk_budget_bytes,
+            )
     except ArtifactBudgetError as exc:
         raise ToolError(str(exc)) from exc
     except FileNotFoundError as exc:

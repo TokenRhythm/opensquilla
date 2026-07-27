@@ -26,9 +26,14 @@ export function captureContentScroll(from: RouteLocationNormalized): void {
  */
 export function contentScrollBehavior(
   to: RouteLocationNormalized,
-  _from: RouteLocationNormalized,
+  from: RouteLocationNormalized,
   savedPosition: { left: number; top: number } | null,
 ): false {
+  // Same-path navigations without a saved offset are query-only state syncs
+  // (drill-in tabs, editor mode, compose) — the view manages its own section
+  // scrolling there, and a scheduled scroll-to-top would cancel an in-flight
+  // scrollIntoView and yank the page. Do nothing at all.
+  if (!savedPosition && to.path === from.path) return false
   const target = savedPosition ? (offsets.get(to.fullPath) ?? 0) : 0
   const apply = () => {
     const el = contentEl()

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from opensquilla.execution_status import ExecutionStatus
@@ -70,6 +70,24 @@ class ToolUseEndEvent:
     synthetic_from_text: bool = False
 
 
+@dataclass(frozen=True)
+class ProviderBillingReceipt:
+    """Provider-native billing receipt attached to one physical request.
+
+    Amounts use integer nanos so adapters can preserve an upstream bill without
+    routing it through binary floating-point arithmetic. ``billed_cost`` on the
+    enclosing :class:`DoneEvent` remains the canonical USD-compatible value for
+    existing callers.
+    """
+
+    currency: str
+    status: Literal["confirmed", "pending"]
+    amount_nanos: int | None
+    usd_equivalent_nanos: int | None
+    fx_native_per_usd_nanos: int
+    schema_version: int = 1
+
+
 @dataclass
 class DoneEvent:
     """Stream finished successfully."""
@@ -90,6 +108,16 @@ class DoneEvent:
     cost_source: str = "none"
     model_usage_breakdown: list[dict[str, Any]] = field(default_factory=list)
     ensemble_trace: dict[str, Any] | None = None
+    # Number of physical ensemble legs that ended without a usage receipt.
+    # Appended for source compatibility with positional constructors.
+    usage_missing_count: int = 0
+    # Configured registry identity serving this response.  Appended for
+    # positional-construction compatibility; generic adapters default it to
+    # their family identity when constructed outside a selector.
+    provider: str = ""
+    # Provider-native receipt for this physical request. Ensemble envelopes do
+    # not carry a synthetic receipt; their physical breakdown rows do.
+    billing_receipt: ProviderBillingReceipt | None = None
 
     @property
     def upstream_cost_usd(self) -> float:
@@ -148,6 +176,11 @@ class ErrorEvent:
     # source-compatible.  Only populated when an adapter has exact structured
     # evidence for a provider request limit.
     message_limit_proof: ProviderMessageLimitProof | None = None
+    # Ensemble wrappers may have consumed billable legs before the terminal
+    # failure.  Carry their known receipts so outer accounting can finalize a
+    # partial envelope instead of discarding it as wholly unknown.
+    model_usage_breakdown: list[dict[str, Any]] = field(default_factory=list)
+    usage_missing_count: int = 0
 
 
 @dataclass
@@ -284,6 +317,34 @@ class ModelInfo(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
+class ProviderRequestCorrelation:
+    """Opaque request identities exposed only to trusted provider transports."""
+
+    session_id: str
+    turn_id: str
+    execution_id: str
+    call_kind: str
+
+
+def derive_provider_request_correlation(
+    correlation: ProviderRequestCorrelation | None,
+    *,
+    execution_id: str | None = None,
+    call_kind: str | None = None,
+) -> ProviderRequestCorrelation | None:
+    """Derive one physical-call identity without changing its session or root turn."""
+
+    if correlation is None:
+        return None
+    updates: dict[str, str] = {}
+    if execution_id is not None:
+        updates["execution_id"] = execution_id
+    if call_kind is not None:
+        updates["call_kind"] = call_kind
+    return replace(correlation, **updates) if updates else correlation
+
+
 class ChatConfig(BaseModel):
     """Runtime options for a single chat call."""
 
@@ -299,10 +360,22 @@ class ChatConfig(BaseModel):
     # Prompt caching: when set, system prompt is split into cached/dynamic blocks
     cache_breakpoints: list[dict[str, str]] | None = None
     cache_mode: Literal["off", "auto", "on"] = "off"
+    output_json_schema: dict[str, Any] | None = None
+    output_json_schema_strict: bool = True
     model_capabilities: ModelCapabilities | None = None
     thinking_level: Any | None = None
     provider_request_max_chars: int = 0
     tool_choice: Any | None = None
+    candidate_output_mode: Literal["normal", "inert_artifact"] = Field(
+        default="normal",
+        exclude=True,
+        repr=False,
+    )
+    provider_request_correlation: ProviderRequestCorrelation | None = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+    )
 
     def model_post_init(self, __context: Any) -> None:
         if self.thinking_budget_explicit is None:

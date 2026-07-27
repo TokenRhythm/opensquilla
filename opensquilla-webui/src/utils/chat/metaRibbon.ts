@@ -1,7 +1,6 @@
 // MetaSkill run-progress ribbon: pure transforms, helpers, and derived
-// selectors. Ported 1:1 from the vanilla static/js/views/chat/meta-ribbon.js
-// render logic. No DOM, no escaping (Vue interpolation auto-escapes) — the
-// SFC consumes these for its computed()/template.
+// selectors. The helpers are DOM-free; the SFC consumes them from its
+// computed state and Vue interpolation performs output escaping.
 
 import type {
   MetaRunAnnouncedPayload,
@@ -247,7 +246,7 @@ export function shouldShowActions(state: MetaRibbonState): boolean {
   return state.runOutcome === 'failed' && state.steps.some((s) => s.state === 'failed')
 }
 
-/* ── Derived selectors (ported from renderRibbon) ─────────────────────── */
+/* ── Derived selectors for ribbon presentation ───────────────────────── */
 
 export function completedCount(state: MetaRibbonState): number {
   return state.steps.filter(

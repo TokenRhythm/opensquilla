@@ -68,7 +68,16 @@
             <p style="margin:0;color:#555">OpenSquilla Control needs JavaScript to render the chat, sessions, and configuration views. Please enable it in your browser to continue.</p>
         </div>
     </noscript>
+    {% if webui_artifact_missing %}
+    <main role="alert" data-webui-artifact-missing
+          style="padding:2rem;font-family:system-ui,-apple-system,sans-serif;color:#222;background:#fff;max-width:720px;margin:3rem auto;border:1px solid #d8d8d8;border-radius:8px;line-height:1.5">
+        <h1 style="font-size:1.25rem;margin:0 0 .75rem">Control UI assets are unavailable</h1>
+        <p>This installation does not contain a usable Vue build. Release-wheel and Desktop users should reinstall an official package.</p>
+        <p style="margin-bottom:0">When running from a source checkout, build it with <code>cd opensquilla-webui &amp;&amp; npm ci &amp;&amp; npm run build</code>, then reload this page.</p>
+    </main>
+    {% else %}
     <div id="app"></div>
+    {% endif %}
 
     <!-- Bootstrap data injected by Jinja2 -->
     <div id="opensquilla-data"
@@ -81,9 +90,5 @@
          data-update="{{ update | tojson | forceescape }}"
          style="display:none"></div>
 
-    <!-- Prism syntax highlighting (used by ChatView for code blocks) -->
-    <script src="{{ base_path }}/static/vendor/prism-core.min.js"></script>
-    <script src="{{ base_path }}/static/vendor/prism-autoloader.min.js"></script>
-    <script>if(window.Prism&&Prism.plugins.autoloader){Prism.plugins.autoloader.languages_path='{{ base_path }}/static/vendor/prism-langs/';}</script>
 </body>
 </html>

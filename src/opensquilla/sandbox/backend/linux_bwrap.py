@@ -63,7 +63,7 @@ def build_bwrap_plan(
 ) -> BwrapPlan:
     _validate_path(command_cwd, kind="command cwd")
     command_cwd = _normalize_command_cwd(command_cwd)
-    read_all = permissions.read_all or _has_root_read_mount(permissions.read_roots)
+    read_all = permissions.read_all
     argv = [
         options.bwrap_path,
         "--new-session",
@@ -86,7 +86,11 @@ def build_bwrap_plan(
     if options.mount_proc:
         argv.extend(["--proc", "/proc"])
     argv.extend(["--dev", "/dev"])
-    if permissions.tmp_writable:
+    host_tmp_writable = any(
+        root.host_path == Path("/tmp") and root.sandbox_path == Path("/tmp")
+        for root in permissions.write_roots
+    )
+    if permissions.tmp_writable and not host_tmp_writable:
         argv.extend(["--tmpfs", "/tmp"])
     for key, value in (options.env or {}).items():
         argv.extend(["--setenv", key, value])
@@ -103,28 +107,89 @@ def build_bwrap_plan(
             for path in (mount.root.host_path, mount.source)
         )
     )
-
-    for root in permissions.read_roots:
-        _validate_root(root)
-        if read_all and root.host_path == Path("/") and root.sandbox_path == Path("/"):
-            continue
-        if not root.host_path.exists() and not root.required:
-            continue
-        read_root = _read_mount_root(root, write_mounts)
-        argv.extend(_mount_target_parent_args(read_root))
-        argv.extend(_mount_args(read_root, writable=False))
+    special_overlay_roots = [Path("/dev")]
+    if permissions.tmp_writable and not host_tmp_writable:
+        special_overlay_roots.append(Path("/tmp"))
+    if options.mount_proc:
+        special_overlay_roots.append(Path("/proc"))
 
     preserved_files: list[BinaryIO] = []
     synthetic_mount_targets: list[SyntheticMountCleanupTarget] = []
     protected_create_targets: list[Path] = []
     denied_paths = tuple(
         dict.fromkeys(
-            _remap_path_for_write_mounts(path, write_mounts)
+            _remap_path_for_write_mounts(
+                _canonical_target_if_symlinked_path(path) or path,
+                write_mounts,
+            )
             for path in [
                 *permissions.denied_roots,
                 *_expand_denied_globs(permissions.denied_globs, cwd=command_cwd),
             ]
         )
+    )
+    protected_paths_under_writes = tuple(
+        dict.fromkeys(
+            _remap_path_for_write_mounts(protected, (mount,))
+            for mount in write_mounts
+            for protected in permissions.protected_subpaths
+            if _is_relative_to(protected, mount.root.host_path)
+        )
+    )
+    read_mounts: list[LinuxRoot] = []
+    for root in permissions.read_roots:
+        _validate_root(root)
+        if not read_all and root.host_path == Path("/"):
+            continue
+        if read_all and root.host_path == Path("/") and root.sandbox_path == Path("/"):
+            continue
+        # A read-only host root already exposes every identity-mapped path.
+        # Rebinding one of those paths is redundant and can fail for absolute
+        # symlink aliases (for example uv's versioned Python directory),
+        # because bwrap resolves the source through /oldroot while the target
+        # resolves through the new root. Keep non-identity mappings, which may
+        # intentionally add an alias at a different sandbox path.
+        hidden_by_special_mount = any(
+            _is_relative_to(root.sandbox_path, special_root)
+            for special_root in special_overlay_roots
+        )
+        if not root.host_path.exists() and not root.required:
+            continue
+        read_root = _read_mount_root(root, write_mounts)
+        # READ entries below a WRITE root are compiled as protected subpaths.
+        # Applying them here would be undone by the later writable bind, so
+        # defer them to that bind's ordered carveout events.
+        if read_root.sandbox_path in protected_paths_under_writes:
+            continue
+        denied_ancestor = _deepest_path_containing(read_root.sandbox_path, denied_paths)
+        if (
+            read_all
+            and root.host_path == root.sandbox_path
+            and root.host_path.exists()
+            and not hidden_by_special_mount
+            and denied_ancestor is None
+        ):
+            continue
+        read_mounts.append(read_root)
+
+    reopened_read_mounts = tuple(
+        sorted(
+            (
+                root
+                for root in read_mounts
+                if _deepest_path_containing(root.sandbox_path, denied_paths) is not None
+            ),
+            key=lambda item: _path_depth(item.sandbox_path),
+        )
+    )
+    for read_root in read_mounts:
+        if read_root in reopened_read_mounts:
+            continue
+        argv.extend(_mount_target_parent_args(read_root))
+        argv.extend(_mount_args(read_root, writable=False))
+
+    reopened_read_paths = tuple(
+        dict.fromkeys(root.sandbox_path for root in reopened_read_mounts)
     )
     denied_ancestors_of_writes = tuple(
         sorted(
@@ -137,7 +202,37 @@ def build_bwrap_plan(
             key=_path_depth,
         )
     )
-    for denied in denied_ancestors_of_writes:
+    denied_ancestors_of_reads = tuple(
+        sorted(
+            (
+                denied
+                for denied in denied_paths
+                if any(
+                    denied != read_path and _is_relative_to(read_path, denied)
+                    for read_path in reopened_read_paths
+                )
+            ),
+            key=_path_depth,
+        )
+    )
+    overlay_descendant_paths = tuple(
+        dict.fromkeys(
+            (
+                *allowed_write_paths,
+                *reopened_read_paths,
+                *protected_paths_under_writes,
+            )
+        )
+    )
+    early_denied_paths = tuple(
+        sorted(
+            dict.fromkeys(
+                (*denied_ancestors_of_writes, *denied_ancestors_of_reads)
+            ),
+            key=_path_depth,
+        )
+    )
+    for denied in early_denied_paths:
         _validate_path(denied, kind="denied path")
         _append_denied_path_args(
             argv,
@@ -145,43 +240,29 @@ def build_bwrap_plan(
             preserved_files,
             allowed_write_paths,
             synthetic_mount_targets,
+            overlay_descendant_paths=overlay_descendant_paths,
         )
 
-    for mount in sorted(write_mounts, key=lambda item: _path_depth(item.source)):
-        root = mount.root
-        _validate_root(root)
-        if not root.host_path.exists() and not root.required:
-            continue
-        if masking_root := _deepest_path_containing(mount.source, denied_paths):
-            argv.extend(_mount_target_parent_args_for_path(mount.source, masking_root))
-        argv.extend(_mount_target_parent_args(mount.as_root()))
-        argv.extend(_mount_args(mount.as_root(), writable=True))
-
-        nested_protected = sorted(
-            (
-                _remap_path_for_write_mounts(protected, (mount,))
-                for protected in permissions.protected_subpaths
-                if _is_relative_to(protected, root.host_path)
-            ),
-            key=_path_depth,
-        )
-        for protected in nested_protected:
-            _append_protected_path_args(
-                argv,
-                protected,
-                preserved_files,
-                allowed_write_paths,
-                protected_create_targets,
-                synthetic_mount_targets,
+    for read_root in reopened_read_mounts:
+        if masking_root := _deepest_path_containing(
+            read_root.sandbox_path,
+            denied_paths,
+        ):
+            argv.extend(
+                _mount_target_parent_args_for_path(
+                    read_root.sandbox_path,
+                    masking_root,
+                )
             )
+        argv.extend(_mount_target_parent_args(read_root))
+        argv.extend(_mount_args(read_root, writable=False))
 
         nested_denied = tuple(
             sorted(
                 (
                     denied
                     for denied in denied_paths
-                    if denied not in denied_ancestors_of_writes
-                    and _is_relative_to(denied, mount.source)
+                    if _is_relative_to(denied, read_root.sandbox_path)
                 ),
                 key=_path_depth,
             )
@@ -194,6 +275,63 @@ def build_bwrap_plan(
                 preserved_files,
                 allowed_write_paths,
                 synthetic_mount_targets,
+                overlay_descendant_paths=overlay_descendant_paths,
+            )
+
+    for mount in sorted(write_mounts, key=lambda item: _path_depth(item.source)):
+        root = mount.root
+        _validate_root(root)
+        if not root.host_path.exists() and not root.required:
+            continue
+        if masking_root := _deepest_path_containing(mount.source, denied_paths):
+            argv.extend(_mount_target_parent_args_for_path(mount.source, masking_root))
+        argv.extend(_mount_target_parent_args(mount.as_root()))
+        argv.extend(_mount_args(mount.as_root(), writable=True))
+
+        nested_denied = tuple(
+            sorted(
+                (
+                    denied
+                    for denied in denied_paths
+                    if denied not in denied_ancestors_of_writes
+                    and _is_relative_to(denied, mount.source)
+                ),
+                key=_path_depth,
+            )
+        )
+        nested_protected = tuple(
+            dict.fromkeys(
+                _remap_path_for_write_mounts(protected, (mount,))
+                for protected in permissions.protected_subpaths
+                if _is_relative_to(protected, root.host_path)
+            )
+        )
+        carveout_events = sorted(
+            (
+                *((path, "read") for path in nested_protected),
+                *((path, "deny") for path in nested_denied),
+            ),
+            key=lambda event: _path_depth(event[0]),
+        )
+        for path, access in carveout_events:
+            if access == "read":
+                _append_protected_path_args(
+                    argv,
+                    path,
+                    preserved_files,
+                    allowed_write_paths,
+                    protected_create_targets,
+                    synthetic_mount_targets,
+                )
+                continue
+            _validate_path(path, kind="denied path")
+            _append_denied_path_args(
+                argv,
+                path,
+                preserved_files,
+                allowed_write_paths,
+                synthetic_mount_targets,
+                overlay_descendant_paths=overlay_descendant_paths,
             )
 
     mounted_protected = {
@@ -216,6 +354,13 @@ def build_bwrap_plan(
         )
     for denied in sorted(denied_paths, key=_path_depth):
         if denied in denied_ancestors_of_writes:
+            continue
+        if denied in denied_ancestors_of_reads:
+            continue
+        if any(
+            _is_relative_to(denied, read_root.sandbox_path)
+            for read_root in reopened_read_mounts
+        ):
             continue
         if any(_is_relative_to(denied, mount.source) for mount in write_mounts):
             continue
@@ -365,6 +510,8 @@ def _append_denied_path_args(
     preserved_files: list[BinaryIO],
     allowed_write_paths: tuple[Path, ...],
     synthetic_mount_targets: list[SyntheticMountCleanupTarget],
+    *,
+    overlay_descendant_paths: tuple[Path, ...] | None = None,
 ) -> None:
     if symlink := _first_writable_symlink_component(path, allowed_write_paths):
         raise SandboxBackendError(
@@ -394,17 +541,22 @@ def _append_denied_path_args(
             ]
         )
         return
-    writable_descendants = sorted(
+    descendant_paths = (
+        allowed_write_paths
+        if overlay_descendant_paths is None
+        else overlay_descendant_paths
+    )
+    overlay_descendants = sorted(
         (
             root
-            for root in allowed_write_paths
+            for root in descendant_paths
             if root != path and _is_relative_to(root, path)
         ),
         key=_path_depth,
     )
-    perms = "111" if path.is_dir() and writable_descendants else "000"
+    perms = "111" if path.is_dir() and overlay_descendants else "000"
     argv.extend(["--perms", perms, "--tmpfs", str(path)])
-    for descendant in writable_descendants:
+    for descendant in overlay_descendants:
         argv.extend(_mount_target_parent_args_for_path(descendant, path))
     argv.extend(["--remount-ro", str(path)])
 
@@ -569,13 +721,6 @@ def _ancestor_has_git_metadata(ancestor: Path) -> bool:
         except OSError:
             return False
     return False
-
-
-def _has_root_read_mount(read_roots: tuple[LinuxRoot, ...]) -> bool:
-    return any(
-        root.host_path == Path("/") and root.sandbox_path == Path("/")
-        for root in read_roots
-    )
 
 
 def _expand_denied_globs(patterns: tuple[str, ...], *, cwd: Path) -> tuple[Path, ...]:

@@ -7,13 +7,40 @@ from typing import Any
 import pytest
 
 from opensquilla.engine.types import DoneEvent, TextDeltaEvent
-from opensquilla.gateway.background_completion import BackgroundCompletionManager
+from opensquilla.gateway.background_completion import (
+    BackgroundCompletionManager,
+    _SynthesisStreamCollector,
+)
 from opensquilla.gateway.boot import GatewayServer
 from opensquilla.gateway.routing import ReplyTarget, RouteEnvelope, SourceKind
 from opensquilla.session.models import AgentTaskStatus
 
 PARENT = "agent:main:channel:parent"
 PARENT_TASK = "task-parent"
+
+
+@pytest.mark.asyncio
+async def test_synthesis_collector_prefers_present_terminal_snapshot() -> None:
+    collector = _SynthesisStreamCollector()
+
+    await collector(TextDeltaEvent(text="stale"))
+    await collector(DoneEvent(text="canonical", text_snapshot="canonical"))
+
+    assert collector.text() == "canonical"
+
+
+@pytest.mark.asyncio
+async def test_synthesis_collector_distinguishes_empty_snapshot_from_legacy_fallback() -> None:
+    explicit_empty = _SynthesisStreamCollector()
+    await explicit_empty(TextDeltaEvent(text="stale"))
+    await explicit_empty(DoneEvent(text="", text_snapshot=""))
+
+    legacy_partial = _SynthesisStreamCollector()
+    await legacy_partial(TextDeltaEvent(text="partial"))
+    await legacy_partial(DoneEvent())
+
+    assert explicit_empty.text() == ""
+    assert legacy_partial.text() == "partial"
 
 
 class _SessionManager:
@@ -55,6 +82,7 @@ class _TaskRuntime:
         self.synthesis_released = asyncio.Event()
         self.synthesis_status = AgentTaskStatus.SUCCEEDED
         self.sent: list[tuple[str, str, dict[str, Any] | None]] = []
+        self.sent_envelopes: list[Any] = []
         self.stream_event_sink = None
         self._tasks: dict[str, Any] = {}
 
@@ -68,6 +96,21 @@ class _TaskRuntime:
         self.sent.append((session_key, message, provenance))
         self.stream_event_sink = stream_event_sink
         return SimpleNamespace(task_id="task-synthesis")
+
+    async def send_with_envelope(
+        self,
+        envelope: Any,
+        message: str,
+        provenance: dict[str, Any] | None = None,
+        stream_event_sink=None,
+    ):
+        self.sent_envelopes.append(envelope)
+        return await self.send(
+            envelope.session_key,
+            message,
+            provenance=provenance,
+            stream_event_sink=stream_event_sink,
+        )
 
     async def wait(self, task_id: str):
         if task_id == PARENT_TASK:
@@ -139,6 +182,82 @@ async def test_parent_wake_waits_out_of_band_and_delivers_final_channel_text() -
     assert done["parent_task_id"] == PARENT_TASK
     assert done["synthesis_task_id"] == "task-synthesis"
     assert done["delivery_status"] == "sent"
+
+
+@pytest.mark.asyncio
+async def test_parent_wake_preserves_captured_full_host_envelope_after_parent_finishes() -> None:
+    runtime = _TaskRuntime()
+    envelope = RouteEnvelope(
+        source_kind=SourceKind.WEB,
+        source_name="webchat",
+        agent_id="main",
+        session_key=PARENT,
+        metadata={
+            "principal_is_owner": True,
+            "run_mode": "full",
+            "elevated": "full",
+            "sandbox_run_context": {"run_mode": "full"},
+        },
+    )
+    runtime._tasks[PARENT_TASK] = SimpleNamespace(envelope=envelope)
+    manager = BackgroundCompletionManager(
+        session_manager=_SessionManager(parent=SimpleNamespace(last_channel=None, last_to=None)),
+    )
+
+    await manager.capture_delivery_target(
+        parent_session_key=PARENT,
+        parent_task_id=PARENT_TASK,
+        task_runtime=runtime,
+    )
+    runtime._tasks.clear()
+    await manager.send_parent_wake(
+        parent_session_key=PARENT,
+        parent_task_id=PARENT_TASK,
+        payloads=[{"child_session_key": "child"}],
+        task_runtime=runtime,
+        message="wake",
+        provenance={"kind": "internal_system"},
+    )
+    runtime.parent_released.set()
+    await _wait_until(lambda: len(runtime.sent) == 1)
+
+    assert runtime.sent_envelopes == [envelope]
+    assert runtime.sent_envelopes[0].metadata["run_mode"] == "full"
+
+    runtime.synthesis_released.set()
+    await manager.drain(timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_cancel_session_blocks_late_subagent_parent_wake() -> None:
+    runtime = _TaskRuntime()
+    manager = BackgroundCompletionManager(
+        session_manager=_SessionManager(parent=SimpleNamespace(last_channel=None, last_to=None)),
+    )
+
+    await manager.emit_waiting(
+        parent_session_key=PARENT,
+        parent_task_id=PARENT_TASK,
+        pending_count=1,
+    )
+    assert await manager.active_group_ids(PARENT) == [
+        f"subagent:{PARENT}:{PARENT_TASK}"
+    ]
+    cancelled = await manager.cancel_session(PARENT)
+    await manager.send_parent_wake(
+        parent_session_key=PARENT,
+        parent_task_id=PARENT_TASK,
+        payloads=[{"child_session_key": "child"}],
+        task_runtime=runtime,
+        message="wake",
+        provenance={"kind": "internal_system"},
+    )
+    runtime.parent_released.set()
+    await asyncio.sleep(0)
+
+    assert cancelled == 1
+    assert await manager.active_group_ids(PARENT) == []
+    assert runtime.sent == []
 
 
 @pytest.mark.asyncio

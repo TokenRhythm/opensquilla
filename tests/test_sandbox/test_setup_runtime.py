@@ -80,6 +80,64 @@ async def test_auto_setup_failure_remains_visible_after_setup_finishes(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_windows_auto_setup_promotes_runtime_backend_after_setup(monkeypatch) -> None:
+    from opensquilla.sandbox import integration, setup_runtime
+
+    config = SimpleNamespace()
+    promotions = []
+
+    async def ready_setup(_config):
+        return SetupResult(
+            state=SandboxSetupState.READY,
+            platform="win32",
+            message="Windows default sandbox is ready.",
+            requires_admin=False,
+        )
+
+    monkeypatch.setattr(setup_runtime, "ensure_sandbox_setup", ready_setup)
+    monkeypatch.setattr(
+        integration,
+        "refresh_runtime_backend_after_setup",
+        lambda: promotions.append("promoted"),
+        raising=False,
+    )
+
+    result = await setup_runtime.ensure_sandbox_setup_auto(config)
+
+    assert result.state is SandboxSetupState.READY
+    assert promotions == ["promoted"]
+
+
+@pytest.mark.asyncio
+async def test_windows_auto_setup_reports_failed_when_runtime_cannot_be_promoted(
+    monkeypatch,
+) -> None:
+    from opensquilla.sandbox import integration, setup_runtime
+
+    async def ready_setup(_config):
+        return SetupResult(
+            state=SandboxSetupState.READY,
+            platform="win32",
+            message="Windows default sandbox is ready.",
+            requires_admin=False,
+        )
+
+    monkeypatch.setattr(setup_runtime, "ensure_sandbox_setup", ready_setup)
+    monkeypatch.setattr(
+        integration,
+        "refresh_runtime_backend_after_setup",
+        lambda: (_ for _ in ()).throw(RuntimeError("backend still unavailable")),
+        raising=False,
+    )
+
+    result = await setup_runtime.ensure_sandbox_setup_auto(SimpleNamespace())
+
+    assert result.state is SandboxSetupState.FAILED
+    assert result.platform == "win32"
+    assert result.detail == "backend still unavailable"
+
+
+@pytest.mark.asyncio
 async def test_reset_setup_runtime_state_delegates_to_current_probe_again(monkeypatch) -> None:
     from opensquilla.sandbox import setup_runtime
 

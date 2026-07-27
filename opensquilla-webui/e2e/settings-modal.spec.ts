@@ -4,7 +4,7 @@ const CONTROL_URL = '/control/'
 // Backend-config sections carry a readiness/status dot; Connection is the first
 // entry (live socket state). Appearance, Keyboard, and Advanced are client-only.
 // (Runtime exists too, but it is desktop-only so the web rail hides it.)
-const SECTIONS = ['Connection', 'Model Service', 'Model Routing', 'Capabilities', 'Channels', 'Behavior', 'Privacy']
+const SECTIONS = ['Connection', 'Model Service', 'Model Routing', 'Capabilities', 'Behavior', 'Privacy']
 const CLIENT_SECTIONS = ['Appearance', 'Keyboard', 'Advanced']
 
 const settingsRow = (page: import('@playwright/test').Page) =>
@@ -89,7 +89,7 @@ test.describe('Settings modal', () => {
     await railTab(page, 'Model Routing').click()
     await expect(railTab(page, 'Model Routing')).toHaveAttribute('aria-selected', 'true')
     await expect(page).toHaveURL(/\/settings\/modelStrategy$/)
-    await expect(dialog(page).getByRole('heading', { name: 'Model routing', exact: true })).toBeVisible()
+    await expect(dialog(page).getByRole('radiogroup', { name: 'Model routing', exact: true })).toBeVisible()
 
     // Section navigation uses replace, so a single Back exits Settings rather
     // than walking section history.
@@ -366,7 +366,7 @@ test.describe('Settings modal', () => {
     // Accepting the discard lets the same Back proceed and close the overlay.
     await page.goBack()
     await expect(confirm).toBeVisible()
-    await confirm.getByRole('button', { name: 'Discard' }).click()
+    await confirm.getByRole('button', { name: 'Confirm' }).click()
     await expect(dialog(page)).toBeHidden()
     await expect(page).not.toHaveURL(/\/settings/)
     await expect(settingsRow(page)).toBeFocused()
@@ -516,6 +516,29 @@ test.describe('Settings modal', () => {
     await expect(dialog(page).locator('.settings-dirtybar')).toBeHidden()
   })
 
+  test('Appearance persists the tool-detail default without a save step', async ({ page }) => {
+    await openFromSidebar(page)
+    await dialog(page).getByRole('tab', { name: 'Appearance' }).click()
+
+    const auto = dialog(page).getByRole('radio', { name: 'Auto', exact: true })
+    const compact = dialog(page).getByRole('radio', { name: 'Compact', exact: true })
+    await expect(auto).toBeChecked()
+
+    await compact.click()
+    await expect(compact).toBeChecked()
+    await expect(dialog(page).locator('.settings-dirtybar')).toBeHidden()
+    expect(await page.evaluate(() => (
+      localStorage.getItem('opensquilla.appearance.toolDetails.v1')
+    ))).toBe('compact')
+
+    await page.reload()
+    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await expect(dialog(page)).toBeVisible()
+    await expect(dialog(page).getByRole('radio', { name: 'Compact', exact: true })).toBeChecked()
+
+    await dialog(page).getByRole('radio', { name: 'Auto', exact: true }).click()
+  })
+
   test('Advanced section surfaces homeless flags, applies instantly without a dirty bar', async ({ page }) => {
     await openFromSidebar(page)
     const advTab = dialog(page).getByRole('tab', { name: 'Advanced' })
@@ -541,5 +564,13 @@ test.describe('Settings modal', () => {
 
     // Client-only: none of this raises the settings dirty bar.
     await expect(dialog(page).locator('.settings-dirtybar')).toBeHidden()
+
+    // Long-lived Agent management is available only from this advanced escape
+    // hatch; routing through Vue preserves the /control base path.
+    await dialog(page).getByRole('button', { name: 'Open: Agent configuration (advanced)' }).click()
+    await expect(page).toHaveURL(/\/agents$/)
+    await expect(dialog(page)).toHaveCount(0)
+    await expect(page.locator('.agents-view, .agents-page, .ag-stage').first()).toBeVisible()
+    await expect(page.getByRole('heading', { name: 'Agents', level: 1 })).toBeFocused()
   })
 })

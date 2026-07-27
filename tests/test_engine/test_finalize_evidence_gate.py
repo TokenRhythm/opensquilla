@@ -7,6 +7,8 @@ so these tests pin the exact detector semantics that both callers rely on.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from opensquilla.engine.finalize_evidence_gate import (
@@ -19,6 +21,7 @@ from opensquilla.engine.finalize_evidence_gate import (
     finalize_evidence_challenge_message,
     finalize_evidence_gate_key,
     green_profiles_deselect_red,
+    green_profiles_recover_red,
     has_stash_reversal,
     is_detector_findings_exit,
     looks_repro_artifact_path,
@@ -38,6 +41,7 @@ from opensquilla.engine.finalize_evidence_gate import (
         ("debug_overlap.java", True),
         ("verify_fix.sh", True),
         ("/tmp/squilla-scratch/test_fix.py", True),
+        ("/tmp/squilla-scratch/repro_case.tcl", True),
         ("/tmp/anything.js", True),
         ("/tmp/notes.txt", False),
         ("src/main.py", False),
@@ -430,7 +434,7 @@ def test_source_edit_resets_post_edit_window() -> None:
 def test_scratch_write_does_not_reset_window() -> None:
     tracker = _tracker_with_source_edit()
     tracker.observe_execution("pytest tests/", red=False, exit_code=0, iteration=2)
-    tracker.observe_write("/tmp/squilla-scratch/inspect_state.py", iteration=3, scratch=True)
+    tracker.observe_write("/data/custom-scratch/inspect_state.py", iteration=3, scratch=True)
     observation = tracker.build_observation(has_workspace_diff=True)
     assert observation.triggers == []
     assert observation.post_edit_execution_count == 1
@@ -836,6 +840,42 @@ def test_gate_key_stable_for_same_state_and_distinct_for_new_red() -> None:
     assert finalize_evidence_gate_key(first) != finalize_evidence_gate_key(third)
 
 
+def test_gate_key_ignores_volatile_post_edit_execution_count() -> None:
+    # Regression: the dedup key must be derived from the red *evidence* only, not
+    # from progress counters. If it hashed ``post_edit_execution_count`` the
+    # caller's ``keys.add(key)`` guard would mint a fresh key on every execution
+    # and re-fire the one-shot challenge indefinitely for the same failing state.
+    base = _observation_with_red("pytest tests/test_a.py")
+    later = replace(base, post_edit_execution_count=base.post_edit_execution_count + 5)
+    assert later.post_edit_execution_count != base.post_edit_execution_count
+    assert finalize_evidence_gate_key(base) == finalize_evidence_gate_key(later)
+
+
+def test_challenge_messages_include_one_shot_notice() -> None:
+    # Every challenge variant tells the model the check is one-shot for this
+    # exact failing state, so a recurring challenge is not read as pressure to
+    # keep re-finalizing.
+    red = _observation_with_red("pytest tests/test_a.py")
+
+    deleted_tracker = _tracker_with_source_edit()
+    deleted_tracker.observe_write("/tmp/squilla-scratch/repro.py", iteration=2)
+    deleted_tracker.observe_execution(
+        "python /tmp/squilla-scratch/repro.py", red=True, exit_code=1, iteration=3
+    )
+    deleted_tracker.observe_execution(
+        "rm /tmp/squilla-scratch/repro.py", red=False, iteration=4
+    )
+    deleted_tracker.observe_execution("pytest tests/", red=False, exit_code=0, iteration=5)
+    deleted = deleted_tracker.build_observation(has_workspace_diff=True)
+
+    no_execution = _tracker_with_source_edit().build_observation(has_workspace_diff=True)
+
+    for observation in (red, deleted, no_execution):
+        message = finalize_evidence_challenge_message(observation)
+        assert "one-shot for this exact failing state" in message
+        assert "it will not repeat for the same evidence" in message
+
+
 def test_challenge_message_red_execution_polarity() -> None:
     observation = _observation_with_red("pytest tests/test_a.py")
     message = finalize_evidence_challenge_message(observation)
@@ -882,10 +922,17 @@ def test_challenge_messages_never_use_protocol_polarity() -> None:
     tracker.observe_execution(
         "python /tmp/squilla-scratch/repro.py", red=True, exit_code=1, iteration=3
     )
+    strict_red_first = _strict_tracker_with_source_edit()
+    strict_red_first.observe_execution(
+        "pytest tests/test_a.py", red=False, exit_code=0, iteration=2
+    )
     observations = [
         tracker.build_observation(has_workspace_diff=True),
         _observation_with_red("pytest tests/test_a.py"),
         _tracker_with_source_edit().build_observation(has_workspace_diff=True),
+        # Strict shapes: red-first-missing and zero-verification.
+        strict_red_first.build_observation(has_workspace_diff=True),
+        _strict_tracker_with_source_edit().build_observation(has_workspace_diff=True),
     ]
     for observation in observations:
         message = finalize_evidence_challenge_message(observation).lower()
@@ -896,3 +943,229 @@ def test_challenge_messages_never_use_protocol_polarity() -> None:
 
 def test_challenge_limit_constant() -> None:
     assert FINALIZE_EVIDENCE_GATE_CHALLENGE_LIMIT == 2
+
+
+# ---------------------------------------------------------------------------
+# Strict mode: zero_verification trigger; red-first tracked but report-only
+# ---------------------------------------------------------------------------
+
+
+def _strict_tracker_with_source_edit() -> FinalizeEvidenceTracker:
+    tracker = FinalizeEvidenceTracker(strict=True)
+    tracker.observe_write("src/main.py", iteration=1)
+    return tracker
+
+
+def test_strict_triggers_never_fire_without_strict() -> None:
+    tracker = _tracker_with_source_edit()
+    observation = tracker.build_observation(has_workspace_diff=True)
+    assert "red_first_missing" not in observation.triggers
+    assert "zero_verification" not in observation.triggers
+    assert observation.strict is False
+    # Evidence fields are still populated for offline comparison.
+    assert observation.verification_command_count == 0
+    assert observation.red_first_satisfied is False
+
+
+def test_strict_zero_verification_fires_on_zero_execution_run() -> None:
+    observation = _strict_tracker_with_source_edit().build_observation(
+        has_workspace_diff=True
+    )
+    assert observation.triggers == [
+        "no_execution_after_final_edit",
+        "zero_verification",
+    ]
+    assert observation.primary_reason == "no_execution_after_final_edit"
+    assert observation.verification_command_count == 0
+
+
+def test_strict_zero_verification_ignores_inspection_and_denied_commands() -> None:
+    tracker = _strict_tracker_with_source_edit()
+    tracker.observe_execution("grep -r foo src/", red=False, exit_code=0, iteration=2)
+    tracker.observe_execution(
+        "pytest tests/", red=True, exit_code=1, status_reason="denied", iteration=3
+    )
+    tracker.observe_execution("./missing.sh", red=True, exit_code=127, iteration=4)
+    observation = tracker.build_observation(has_workspace_diff=True)
+    assert "zero_verification" in observation.triggers
+    assert observation.verification_command_count == 0
+
+
+def test_strict_green_only_run_does_not_challenge() -> None:
+    # Green-only runs are routinely legitimate (direct fix + existing suite
+    # green), so red-first state is reported for diagnostics but never gates.
+    # Replay over real runs measured 41% of stable solved traces as
+    # never-red; a trigger here would challenge correct finishes constantly.
+    tracker = _strict_tracker_with_source_edit()
+    tracker.observe_execution("pytest tests/test_a.py", red=False, exit_code=0, iteration=2)
+    observation = tracker.build_observation(has_workspace_diff=True)
+    assert observation.triggers == []
+    assert observation.should_challenge is False
+    assert observation.verification_command_count == 1
+    assert observation.red_first_satisfied is False
+    assert observation.red_first_candidate_count == 0
+
+
+def test_strict_red_first_satisfied_by_pre_edit_red_then_green() -> None:
+    tracker = FinalizeEvidenceTracker(strict=True)
+    tracker.observe_execution("pytest tests/test_a.py", red=True, exit_code=1, iteration=1)
+    tracker.observe_write("src/main.py", iteration=2)
+    tracker.observe_execution("pytest tests/test_a.py", red=False, exit_code=0, iteration=3)
+    observation = tracker.build_observation(has_workspace_diff=True)
+    assert observation.triggers == []
+    assert observation.red_first_satisfied is True
+    assert observation.red_first_candidate_count == 1
+
+
+def test_strict_red_first_satisfied_by_post_edit_red_then_green() -> None:
+    # Legitimate edit-then-reproduce flow: the red arrives after the first
+    # source edit and later goes green.
+    tracker = _strict_tracker_with_source_edit()
+    tracker.observe_execution("pytest tests/test_a.py", red=True, exit_code=1, iteration=2)
+    tracker.observe_execution("pytest tests/test_a.py", red=False, exit_code=0, iteration=3)
+    observation = tracker.build_observation(has_workspace_diff=True)
+    assert observation.triggers == []
+    assert observation.red_first_satisfied is True
+
+
+def test_strict_red_first_satisfied_by_stash_reverted_red() -> None:
+    # ``git stash && pytest`` red demonstrates the failure without the patch;
+    # the green re-run after ``git stash pop`` completes red-first.
+    tracker = _strict_tracker_with_source_edit()
+    tracker.observe_execution(
+        "git stash && pytest tests/test_a.py", red=True, exit_code=1, iteration=2
+    )
+    tracker.observe_execution(
+        "git stash pop && pytest tests/test_a.py", red=False, exit_code=0, iteration=3
+    )
+    observation = tracker.build_observation(has_workspace_diff=True)
+    assert observation.triggers == []
+    assert observation.red_first_satisfied is True
+    assert observation.red_first_candidate_count == 1
+
+
+def test_strict_red_first_not_satisfied_by_deselecting_green() -> None:
+    tracker = _strict_tracker_with_source_edit()
+    tracker.observe_execution("pytest tests/test_a.py", red=True, exit_code=1, iteration=2)
+    tracker.observe_execution(
+        "pytest tests/test_a.py -k 'not test_bad'", red=False, exit_code=0, iteration=3
+    )
+    observation = tracker.build_observation(has_workspace_diff=True)
+    assert observation.red_first_satisfied is False
+    # The base deselection trigger still fires and stays primary; red-first
+    # state itself adds nothing.
+    assert observation.primary_reason == "red_evidence_deselected_after_final_edit"
+
+
+def test_strict_red_first_satisfied_by_artifact_green_rerun() -> None:
+    tracker = _strict_tracker_with_source_edit()
+    tracker.observe_write("/tmp/squilla-scratch/repro.py", iteration=2)
+    tracker.observe_execution(
+        "python /tmp/squilla-scratch/repro.py", red=True, exit_code=1, iteration=3
+    )
+    tracker.observe_execution(
+        "python /tmp/squilla-scratch/repro.py", red=False, exit_code=0, iteration=4
+    )
+    observation = tracker.build_observation(has_workspace_diff=True)
+    assert observation.triggers == []
+    assert observation.red_first_satisfied is True
+
+
+def test_strict_red_first_matches_focused_red_to_wider_green() -> None:
+    tracker = FinalizeEvidenceTracker(strict=True)
+    tracker.observe_execution(
+        "pytest tests/test_a.py::test_bad", red=True, exit_code=1, iteration=1
+    )
+    tracker.observe_write("src/main.py", iteration=2)
+    tracker.observe_execution("pytest tests/", red=False, exit_code=0, iteration=3)
+    observation = tracker.build_observation(has_workspace_diff=True)
+    assert observation.triggers == []
+    assert observation.red_first_satisfied is True
+
+
+def test_strict_red_first_unmatched_green_does_not_satisfy() -> None:
+    tracker = FinalizeEvidenceTracker(strict=True)
+    tracker.observe_execution("pytest tests/test_a.py", red=True, exit_code=1, iteration=1)
+    tracker.observe_write("src/main.py", iteration=2)
+    tracker.observe_execution("make build", red=False, exit_code=0, iteration=3)
+    observation = tracker.build_observation(has_workspace_diff=True)
+    assert observation.red_first_satisfied is False
+    assert observation.triggers == []
+
+
+def test_strict_triggers_suppressed_without_diff_or_source_edit() -> None:
+    no_diff = _strict_tracker_with_source_edit().build_observation(
+        has_workspace_diff=False
+    )
+    assert no_diff.triggers == []
+    no_edit = FinalizeEvidenceTracker(strict=True).build_observation(
+        has_workspace_diff=True
+    )
+    assert no_edit.triggers == []
+
+
+def test_strict_and_base_observations_identical_apart_from_strict_fields() -> None:
+    # Default-off safety: for the same event stream the strict tracker only
+    # ever APPENDS triggers; every base field matches the base tracker.
+    def feed(tracker: FinalizeEvidenceTracker) -> None:
+        tracker.observe_write("src/main.py", iteration=1)
+        tracker.observe_execution(
+            "pytest tests/test_a.py", red=True, exit_code=1, iteration=2
+        )
+
+    base = FinalizeEvidenceTracker()
+    strict = FinalizeEvidenceTracker(strict=True)
+    feed(base)
+    feed(strict)
+    base_details = base.build_observation(has_workspace_diff=True).to_event_details()
+    strict_details = strict.build_observation(has_workspace_diff=True).to_event_details()
+    assert strict_details["triggers"][: len(base_details["triggers"])] == (
+        base_details["triggers"]
+    )
+    for key, value in base_details.items():
+        if key in {"triggers", "strict", "should_challenge", "primary_reason"}:
+            continue
+        assert strict_details[key] == value, key
+
+
+def test_green_profiles_recover_red_requires_same_runner() -> None:
+    red = command_execution_profiles("pytest tests/test_a.py")
+    green = command_execution_profiles("tox")
+    assert green_profiles_recover_red(green, red) is False
+
+
+def test_green_profiles_recover_red_rejects_added_deselection() -> None:
+    red = command_execution_profiles("pytest tests/test_a.py")
+    green = command_execution_profiles("pytest tests/test_a.py -k 'not test_bad'")
+    assert green_profiles_recover_red(green, red) is False
+
+
+def test_green_profiles_recover_red_matches_module_and_direct_launch() -> None:
+    red = command_execution_profiles("python -m pytest tests/test_a.py")
+    green = command_execution_profiles("pytest tests/test_a.py")
+    assert green_profiles_recover_red(green, red) is True
+
+
+def test_green_profiles_recover_red_covers_directory_prefix() -> None:
+    red = command_execution_profiles("pytest tests/test_a.py::test_bad")
+    green = command_execution_profiles("pytest tests")
+    assert green_profiles_recover_red(green, red) is True
+
+
+def test_strict_challenge_message_zero_verification() -> None:
+    observation = _strict_tracker_with_source_edit().build_observation(
+        has_workspace_diff=True
+    )
+    assert "zero_verification" in observation.triggers
+    message = finalize_evidence_challenge_message(observation)
+    assert message.startswith("[Finalize evidence check]")
+    assert "no execution-level command ran at any point" in message
+    assert "binding evidence" in message
+
+
+def test_strict_gate_key_differs_between_strict_and_base_state() -> None:
+    base = _tracker_with_source_edit().build_observation(has_workspace_diff=True)
+    strict = _strict_tracker_with_source_edit().build_observation(
+        has_workspace_diff=True
+    )
+    assert finalize_evidence_gate_key(base) != finalize_evidence_gate_key(strict)

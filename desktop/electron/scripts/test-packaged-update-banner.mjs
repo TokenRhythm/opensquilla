@@ -140,25 +140,38 @@ const currentRc = Number(versionMatch[2])
 const nextRc = currentRc + 1
 const currentTag = `v${baseVersion}rc${currentRc}`
 const nextTag = `v${baseVersion}rc${nextRc}`
-const nextVersion = `${baseVersion}rc${nextRc}`
+const currentVersion = `${baseVersion}-rc${currentRc}`
+const nextVersion = `${baseVersion}-rc${nextRc}`
 const releaseUrl = `https://github.com/opensquilla/opensquilla/releases/tag/${nextTag}`
 
 let requestCount = 0
 let releasePublished = false
-const payload = () => JSON.stringify([
-  ...(releasePublished ? [{
-    tag_name: nextTag,
-    draft: false,
-    prerelease: true,
-    html_url: releaseUrl,
-  }] : []),
-  {
-    tag_name: currentTag,
-    draft: false,
-    prerelease: true,
-    html_url: `https://github.com/opensquilla/opensquilla/releases/tag/${currentTag}`,
+const channelManifest = (tag, version) => ({
+  schemaVersion: 1,
+  tag,
+  version,
+  baseVersion,
+  prerelease: true,
+  publishedAt: '2026-07-15T00:00:00Z',
+  releaseUrl: `https://github.com/opensquilla/opensquilla/releases/tag/${tag}`,
+  sha256sums: 'SHA256SUMS',
+  platforms: {
+    'darwin-arm64': {
+      feed: 'latest-mac.yml',
+      archive: `OpenSquilla-${version}-mac-arm64.zip`,
+      installer: `OpenSquilla-${version}-mac-arm64.dmg`,
+    },
+    'win32-x64': {
+      feed: 'latest.yml',
+      installer: `OpenSquilla-${version}-win-x64.exe`,
+    },
   },
-])
+})
+const payload = () => JSON.stringify(
+  releasePublished
+    ? channelManifest(nextTag, nextVersion)
+    : channelManifest(currentTag, currentVersion),
+)
 
 const server = createServer((request, response) => {
   if (request.url !== '/releases') {
@@ -212,7 +225,7 @@ try {
   await banner.waitFor({ state: 'visible', timeout: 30_000 })
   assert.match(await banner.textContent(), new RegExp(nextVersion.replaceAll('.', '\\.')))
   assert.equal(await banner.locator('a').getAttribute('href'), releaseUrl)
-  assert.equal(requestCount, 1, 'gateway cache/single-flight must prevent duplicate GitHub requests')
+  assert.equal(requestCount, 1, 'gateway cache/single-flight must prevent duplicate channel requests')
 
   await app.close()
   app = null

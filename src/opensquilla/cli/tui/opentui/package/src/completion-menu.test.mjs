@@ -7,6 +7,7 @@ import {
   lineEndIndex,
   lineStartIndex,
   menuKeyAction,
+  slashArgumentContext,
   shouldDropResponse,
   shouldTriggerMenu,
   spliceOut,
@@ -85,6 +86,63 @@ test("filterCatalog prefers command-name prefixes over later path segments", () 
     filterCatalog(catalog, "co").map((item) => item.label).slice(0, 2),
     ["/cost", "/compact"],
   );
+});
+
+test("default palette preserves curated order and hides compatibility rows", () => {
+  const catalog = [
+    { label: "/model", visible_by_default: true },
+    { label: "/strategy", visible_by_default: true },
+    { label: "/models", visible_by_default: false, deprecated: true },
+    { label: "/forget", visible_by_default: false },
+  ];
+
+  assert.deepEqual(
+    filterCatalog(catalog, "").map((item) => item.label),
+    ["/model", "/strategy"],
+  );
+  assert.deepEqual(
+    filterCatalog(catalog, "models").map((item) => item.label),
+    ["/models"],
+  );
+});
+
+test("aliases remain searchable without rendering duplicate alias rows", () => {
+  const catalog = [
+    {
+      label: "/reset",
+      aliases: ["/clear"],
+      description: "Clear context.",
+      insert_text: "/reset ",
+    },
+  ];
+
+  const matches = filterCatalog(catalog, "clear");
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].label, "/reset");
+  assert.equal(matches[0].insert_text, "/reset ");
+});
+
+test("slashArgumentContext offers structured choices after command plus space", () => {
+  const catalog = [
+    {
+      label: "/router",
+      aliases: [],
+      argument_choices: [
+        { value: "on", description: "Enable Router." },
+        { value: "off", description: "Use direct mode." },
+        { value: "status", description: "Show current strategy." },
+      ],
+    },
+  ];
+
+  const empty = slashArgumentContext("/router ", 8, catalog);
+  assert.equal(empty.tokenStart, 8);
+  assert.deepEqual(empty.items.map((item) => item.label), ["on", "off", "status"]);
+
+  const partial = slashArgumentContext("/router st", 10, catalog);
+  assert.equal(partial.query, "st");
+  assert.equal(filterCatalog(partial.items, partial.query)[0].label, "status");
+  assert.equal(slashArgumentContext("/unknown ", 9, catalog), null);
 });
 
 test("acceptCompletionText replaces the active token with insert text", () => {
@@ -208,6 +266,21 @@ test("Enter still runs command and setting entries in one keystroke", () => {
   };
   assert.equal(menuKeyAction(command, "return").action, "accept_submit");
   assert.equal(menuKeyAction(setting, "return").action, "accept_submit");
+});
+
+test("Enter completes a required-argument command without a bare picker", () => {
+  const menu = {
+    active: true,
+    kind: "slash",
+    selected: 0,
+    filtered: [{
+      label: "/delete",
+      insert_text: "/delete ",
+      category: "session",
+      submit_behavior: "complete",
+    }],
+  };
+  assert.equal(menuKeyAction(menu, "return").action, "accept");
 });
 
 test("ipc dispatcher routes completion responses", () => {

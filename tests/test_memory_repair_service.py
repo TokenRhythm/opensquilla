@@ -305,6 +305,49 @@ async def test_memory_repair_service_run_once_repairs_preimage_and_raw_fallback(
     assert session_manager.status_updates == [(17, "repaired")]
     assert flush_service.calls[0][1] == "agent:main:repair-service"
     assert flush_service.calls[1][0][0].content == "raw service marker"
+    preimage_kwargs = flush_service.calls[0][2]
+    correlation = preimage_kwargs["provider_request_correlation"]
+    assert correlation.session_id == "session-17"
+    assert correlation.turn_id == preimage_kwargs["turn_id"]
+    assert correlation.execution_id != correlation.turn_id
+    assert correlation.call_kind == "auxiliary.session_flush"
+    assert "provider_request_correlation" not in flush_service.calls[1][2]
+
+
+@pytest.mark.asyncio
+async def test_memory_repair_service_rechecks_privacy_config_each_run(
+    monkeypatch,
+) -> None:
+    from opensquilla.gateway.memory_repair_service import MemoryRepairService
+
+    monkeypatch.delenv(
+        "OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY",
+        raising=False,
+    )
+    config = SimpleNamespace(
+        privacy=SimpleNamespace(disable_network_observability=False)
+    )
+    session_manager = _RepairSessionManager()
+    flush_service = _FlushService()
+    service = MemoryRepairService(
+        session_manager=session_manager,
+        flush_service=flush_service,
+        memory_roots={},
+        agent_ids=("main",),
+        config=config,
+    )
+
+    await service.run_once()
+    assert (
+        flush_service.calls[0][2]["provider_request_correlation"].session_id
+        == "session-17"
+    )
+
+    session_manager.status_updates.clear()
+    config.privacy.disable_network_observability = True
+    await service.run_once()
+
+    assert flush_service.calls[1][2].get("provider_request_correlation") is None
 
 
 @pytest.mark.asyncio
@@ -383,6 +426,7 @@ async def test_memory_repair_run_imports_legacy_raw_fallback_to_ledger(tmp_path)
         assert rows[0].status == "repair_done"
         assert raw_path.exists()
         assert flush_service.calls[0][0][0].content == "legacy raw marker"
+        assert "provider_request_correlation" not in flush_service.calls[0][2]
     finally:
         await storage.close()
 
@@ -594,6 +638,11 @@ async def test_memory_repair_run_uses_target_path_for_task7_flush_receipt(tmp_pa
         assert rows[0].target_path == "memory/.raw_fallbacks/raw.md"
         assert rows[0].status == "repair_done"
         assert flush_service.calls[0][0][0].content == "task7 marker"
+        repair_kwargs = flush_service.calls[0][2]
+        correlation = repair_kwargs["provider_request_correlation"]
+        assert correlation.session_id == "session-1"
+        assert correlation.turn_id == repair_kwargs["turn_id"]
+        assert correlation.call_kind == "auxiliary.session_flush"
     finally:
         await storage.close()
 

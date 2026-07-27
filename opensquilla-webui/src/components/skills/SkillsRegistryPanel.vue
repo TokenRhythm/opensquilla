@@ -51,31 +51,20 @@
         </div>
       </template>
       <template v-else>
-        <DataTable class="sk-registry-table" :columns="resultColumns" :rows="resultRows">
-          <template #name="{ row }">
-            <span class="sk-registry__name">{{ row.name }}</span>
-          </template>
-          <template #description="{ row }">
-            <span class="sk-registry__desc">{{ row.description }}</span>
-          </template>
-          <template #source="{ row }">
-            <span class="sk-mono sk-dim">{{ row.source }}</span>
-          </template>
-          <template #trust="{ row }">
-            <span class="sk-chip" :class="row.trusted ? 'sk-chip--ok' : 'sk-chip--warn'">{{ row.trustLabel }}</span>
-          </template>
-          <template #_install="{ row }">
-            <button v-if="row.installed" class="btn btn--sm" disabled>{{ t('cronSkills.registry.installedBtn') }}</button>
-            <button
-              v-else
-              class="btn btn--primary btn--sm"
-              :disabled="installingId === row.installId"
-              @click="emit('install', String(row.installId), String(row.installSource))"
-            >
-              {{ installingId === row.installId ? t('cronSkills.registry.installing') : t('cronSkills.registry.install') }}
-            </button>
-          </template>
-        </DataTable>
+        <div class="sk-grid sk-tile-grid">
+          <SkillTile
+            v-for="row in resultRows"
+            :key="row.installId"
+            variant="registry"
+            :name="row.name"
+            :description="row.description"
+            :source="row.source"
+            :trust-level="row.trustLevel"
+            :installed="row.installed"
+            :busy="installingId === row.installId"
+            @install="emit('install', String(row.installId), String(row.installSource))"
+          />
+        </div>
       </template>
     </div>
   </div>
@@ -84,8 +73,8 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
-import DataTable from '@/components/DataTable.vue'
 import Icon from '@/components/Icon.vue'
+import SkillTile from '@/components/skills/SkillTile.vue'
 import type { RegistryResult } from '@/types/skills'
 
 const { t } = useI18n()
@@ -106,24 +95,26 @@ const emit = defineEmits<{
   install: [identifier: string, source: string]
 }>()
 
-const resultColumns = computed(() => [
-  { key: 'name', label: t('cronSkills.registry.colName') },
-  { key: 'description', label: t('cronSkills.registry.colDescription') },
-  { key: 'source', label: t('cronSkills.registry.colSource') },
-  { key: 'trust', label: t('cronSkills.registry.colTrust') },
-  { key: '_install', label: '' },
-])
-
 const resultRows = computed(() =>
   props.results.map(r => ({
     name: r.name,
-    description: (r.description || '').slice(0, 80),
+    description: (r.description || '').slice(0, 120),
     source: r.source || '',
-    trusted: r.trust_level === 'trusted',
-    trustLabel: r.trust_level || t('cronSkills.registry.community'),
+    trustLevel: r.trust_level || 'community',
     installed: !!r.installed,
     installId: r.identifier || r.name,
     installSource: r.source || 'clawhub',
   })),
 )
 </script>
+
+<style scoped>
+.sk-tile-grid {
+  display: grid;
+  gap: var(--sp-2);
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+}
+@media (max-width: 480px) {
+  .sk-tile-grid { grid-template-columns: 1fr; }
+}
+</style>

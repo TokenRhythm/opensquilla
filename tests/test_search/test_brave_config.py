@@ -109,6 +109,92 @@ async def test_brave_provider_passes_recency_as_freshness() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "kind", "retryable"),
+    [
+        (400, "http", False),
+        (401, "auth", False),
+        (403, "auth", False),
+        (408, "http", True),
+        (429, "rate_limit", True),
+        (500, "http", True),
+    ],
+)
+async def test_brave_http_errors_are_classified_once(
+    status_code: int,
+    kind: str,
+    retryable: bool,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(status_code, json={"error": "nope"})
+
+    provider = BraveSearchProvider(
+        api_key="brave-test-key",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(SearchProviderError) as exc_info:
+        await provider.search("brave")
+
+    assert exc_info.value.kind == kind
+    assert exc_info.value.retryable is retryable
+    assert exc_info.value.status_code == status_code
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_type", "kind"),
+    [(httpx.ReadTimeout, "timeout"), (httpx.ConnectError, "network")],
+)
+async def test_brave_transport_errors_are_retryable_once(
+    error_type: type[httpx.HTTPError],
+    kind: str,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        raise error_type("transient failure", request=request)
+
+    provider = BraveSearchProvider(
+        api_key="brave-test-key",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(SearchProviderError) as exc_info:
+        await provider.search("brave")
+
+    assert exc_info.value.kind == kind
+    assert exc_info.value.retryable is True
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_brave_malformed_json_is_terminal_parse_error() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, text="not json")
+
+    provider = BraveSearchProvider(
+        api_key="brave-test-key",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(SearchProviderError) as exc_info:
+        await provider.search("brave")
+
+    assert exc_info.value.kind == "parse"
+    assert exc_info.value.retryable is False
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
 async def test_duckduckgo_provider_maps_provider_and_source() -> None:
     html = """
     <html>
@@ -144,7 +230,10 @@ async def test_duckduckgo_provider_treats_anomaly_challenge_as_blocked() -> None
     </html>
     """
 
+    requests: list[httpx.Request] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
         return httpx.Response(202, text=html)
 
     provider = DuckDuckGoProvider(transport=httpx.MockTransport(handler))
@@ -154,7 +243,8 @@ async def test_duckduckgo_provider_treats_anomaly_challenge_as_blocked() -> None
 
     assert exc_info.value.provider == "duckduckgo"
     assert exc_info.value.kind == "blocked"
-    assert exc_info.value.retryable is True
+    assert exc_info.value.retryable is False
+    assert len(requests) == 1
 
 
 @pytest.mark.asyncio
@@ -167,19 +257,25 @@ async def test_duckduckgo_provider_allows_real_no_results() -> None:
     </html>
     """
 
+    requests: list[httpx.Request] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
         return httpx.Response(200, text=html)
 
     provider = DuckDuckGoProvider(transport=httpx.MockTransport(handler))
 
     assert await provider.search("improbable query") == []
+    assert len(requests) == 1
 
 
 @pytest.mark.asyncio
 async def test_duckduckgo_provider_treats_unparseable_empty_page_as_parse_error() -> None:
     html = "<html><body><main>DuckDuckGo</main></body></html>"
+    requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
         return httpx.Response(200, text=html)
 
     provider = DuckDuckGoProvider(transport=httpx.MockTransport(handler))
@@ -189,13 +285,24 @@ async def test_duckduckgo_provider_treats_unparseable_empty_page_as_parse_error(
 
     assert exc_info.value.provider == "duckduckgo"
     assert exc_info.value.kind == "parse"
-    assert exc_info.value.retryable is True
+    assert exc_info.value.retryable is False
+    assert len(requests) == 1
 
 
 @pytest.mark.asyncio
-async def test_duckduckgo_provider_surfaces_network_failures() -> None:
+@pytest.mark.parametrize(
+    ("status_code", "retryable"),
+    [(400, False), (401, False), (403, False), (408, True), (429, True), (500, True)],
+)
+async def test_duckduckgo_http_errors_are_classified_once(
+    status_code: int,
+    retryable: bool,
+) -> None:
+    requests: list[httpx.Request] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("network down", request=request)
+        requests.append(request)
+        return httpx.Response(status_code, text="upstream error")
 
     provider = DuckDuckGoProvider(transport=httpx.MockTransport(handler))
 
@@ -203,8 +310,36 @@ async def test_duckduckgo_provider_surfaces_network_failures() -> None:
         await provider.search("duck")
 
     assert exc_info.value.provider == "duckduckgo"
-    assert exc_info.value.kind == "network"
+    assert exc_info.value.kind == "http"
+    assert exc_info.value.retryable is retryable
+    assert exc_info.value.status_code == status_code
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_type", "kind"),
+    [(httpx.ReadTimeout, "timeout"), (httpx.ConnectError, "network")],
+)
+async def test_duckduckgo_transport_errors_are_retryable_once(
+    error_type: type[httpx.HTTPError],
+    kind: str,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        raise error_type("transient failure", request=request)
+
+    provider = DuckDuckGoProvider(transport=httpx.MockTransport(handler))
+
+    with pytest.raises(SearchProviderError) as exc_info:
+        await provider.search("duck")
+
+    assert exc_info.value.provider == "duckduckgo"
+    assert exc_info.value.kind == kind
     assert exc_info.value.retryable is True
+    assert len(requests) == 1
 
 
 def test_search_payload_keeps_lightweight_metadata() -> None:

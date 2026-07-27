@@ -23,6 +23,7 @@ from opensquilla.gateway.boot import (
 )
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
+from opensquilla.gateway.task_runtime import _task_identity_payload
 
 SESSION = "agent:main:webchat:issue344"
 
@@ -36,6 +37,24 @@ def _make_envelope(session_key: str = SESSION) -> RouteEnvelope:
         input_provenance={"kind": "test"},
         metadata={},
     )
+
+
+def test_task_identity_keeps_client_and_durable_message_ids_distinct() -> None:
+    envelope = _make_envelope()
+    envelope.metadata.update({"client_message_id": "client-message-A", "surface_id": "web:browser"})
+
+    payload = _task_identity_payload(
+        envelope,
+        "turn-A",
+        user_message_id="durable-message-A",
+    )
+
+    assert payload == {
+        "turn_id": "turn-A",
+        "client_message_id": "client-message-A",
+        "user_message_id": "durable-message-A",
+        "surface_id": "web:browser",
+    }
 
 
 @pytest.mark.asyncio
@@ -63,6 +82,39 @@ async def test_emit_stamps_task_id_on_every_stream_event() -> None:
         "session.event.text_delta",
     ]
     assert all(payload.get("task_id") == "task-A" for _, _, payload in emitted)
+
+
+@pytest.mark.asyncio
+async def test_emit_stamps_cross_surface_turn_identity_on_every_stream_event() -> None:
+    emitted: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _stream():
+        yield TextDeltaEvent(text="partial output")
+
+    async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        emitted.append((session_key, event_name, payload))
+
+    await _emit_task_runtime_stream_events(
+        _stream(),
+        SESSION,
+        _emitter,
+        idle_timeout=5.0,
+        heartbeat_interval=0.0,
+        task_id="task-A",
+        session_id="session-A",
+        client_message_id="client-message-A",
+        user_message_id="durable-message-A",
+        surface_id="tui:process-A",
+    )
+
+    payload = emitted[0][2]
+    assert payload["text"] == "partial output"
+    assert payload["task_id"] == "task-A"
+    assert payload["turn_id"] == "task-A"
+    assert payload["session_id"] == "session-A"
+    assert payload["client_message_id"] == "client-message-A"
+    assert payload["user_message_id"] == "durable-message-A"
+    assert payload["surface_id"] == "tui:process-A"
 
 
 @pytest.mark.asyncio

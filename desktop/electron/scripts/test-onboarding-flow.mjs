@@ -219,6 +219,17 @@ try {
   const openAiHint = await page.locator('#providerHint').innerText()
   assert.match(openAiHint, /OpenAI-only tier profile/)
   assert.doesNotMatch(openAiHint, /OPENAI_API_KEY/)
+
+  await page.locator('#providerGrid [data-provider="bailian_coding_cn"]').click()
+  assert.equal(await page.locator('#provider').inputValue(), 'bailian_coding_cn')
+  assert.equal(
+    await page.locator('#baseUrl').inputValue(),
+    'https://coding.dashscope.aliyuncs.com/v1',
+  )
+  assert.equal(await page.locator('#model').inputValue(), 'qwen3.7-plus')
+  assert.match(await page.locator('#providerHint').innerText(), /dedicated sk-sp- API key/)
+
+  await page.locator('#providerGrid [data-provider="openai"]').click()
   await page.locator('#apiKey').fill('test-openai-key')
   await page.locator('[data-screen="1"].active .next-button').click()
   await page.locator('[data-screen="2"].active').waitFor({ state: 'visible', timeout: 10_000 })

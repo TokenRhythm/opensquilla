@@ -5,7 +5,7 @@
       <span class="usage-expand__eyebrow">{{ t('usageLogs.breakdown.title') }}</span>
       <span class="usage-expand__count">{{ t('usageLogs.breakdown.modelCount', { count: rows.length }) }}</span>
       <span class="usage-expand__spacer" />
-      <span class="usage-expand__total">{{ t('usageLogs.breakdown.total', { tokens: totalTokens.toLocaleString(), cost: fmtCost(totalCost) }) }}</span>
+      <span class="usage-expand__total">{{ t('usageLogs.breakdown.total', { tokens: totalTokens.toLocaleString(), cost: fmtCost(totalCost, { source: nativeSource }) }) }}</span>
     </div>
     <div v-if="anyProrated" class="usage-expand__notice" role="note">
       {{ t('usageLogs.breakdown.proratedNotice') }}
@@ -28,7 +28,7 @@
           <span class="usage-expand__share-pct">{{ m.share.toFixed(1) }}%</span>
         </div>
         <div class="usage-expand__tokens" role="cell">{{ m.tokens.toLocaleString() }}</div>
-        <div class="usage-expand__cost" role="cell">{{ fmtCost(m.cost) }}</div>
+        <div class="usage-expand__cost" role="cell">{{ fmtCost(m.cost, { source: m }) }}</div>
         <div class="usage-expand__source" role="cell">
           <span
             class="usage-source"
@@ -51,8 +51,12 @@ defineProps<{
   rows: BreakdownRow[]
   totalTokens: number
   totalCost: number
+  nativeSource: object
   anyProrated: boolean
-  fmtCost: (cost: number | null | undefined, opts?: { decimals?: number }) => string
+  fmtCost: (
+    cost: number | null | undefined,
+    opts?: { decimals?: number; source?: object },
+  ) => string
   costSourceClasses: (row: BreakdownRow) => Record<string, boolean>
   costSourceLabel: (row: BreakdownRow) => string
   costSourceTooltip: (row: BreakdownRow) => string

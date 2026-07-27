@@ -78,10 +78,9 @@ async def test_static_b5_wrap_skipped_without_openrouter_credential(
         [],
     )
 
-    # The model-override step may re-resolve a fresh single-model provider from
-    # the selector; the guard's contract is that no ensemble wrap happens.
+    # A keyless static profile can never run a member; the turn must keep the
+    # plain single-model provider without ensemble labels or fallback budgets.
     assert not isinstance(provider, EnsembleProvider)
-    assert isinstance(provider, _Provider)
     assert turn.metadata["ensemble_wrap_skipped_reason"] == (
         "static_openrouter_b5_no_credential"
     )
@@ -228,7 +227,7 @@ def _custom_b5_guard_config(candidates: list[dict[str, Any]]) -> GatewayConfig:
     )
 
 
-async def test_custom_b5_wrap_skipped_when_a_member_credential_is_missing(
+async def test_custom_b5_tracks_missing_member_and_preserves_quorum(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
@@ -251,11 +250,15 @@ async def test_custom_b5_wrap_skipped_when_a_member_credential_is_missing(
         [],
     )
 
-    assert not isinstance(provider, EnsembleProvider)
-    assert turn.metadata["ensemble_wrap_skipped_reason"] == (
-        "custom_b5_not_ready:missing_credential:openrouter"
-    )
-    assert "ensemble_enabled" not in turn.metadata
+    assert isinstance(provider, EnsembleProvider)
+    by_provider = {
+        member.provider_config.provider: member for member in provider.proposers
+    }
+    assert by_provider["groq"].ready is True
+    assert by_provider["openrouter"].ready is False
+    assert by_provider["openrouter"].unavailable_reason == "missing_credential"
+    assert turn.metadata["ensemble_enabled"] is True
+    assert "ensemble_wrap_skipped_reason" not in turn.metadata
 
 
 async def test_custom_b5_wraps_when_every_member_resolves_a_key(

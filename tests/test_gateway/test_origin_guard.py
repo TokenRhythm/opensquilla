@@ -42,6 +42,16 @@ _PROTECTED_ENDPOINTS = [
     pytest.param("/api/chat", {"sessionKey": "s", "message": "hi"}, id="chat"),
     pytest.param("/api/system/shutdown", None, id="shutdown"),
     pytest.param("/api/channels/logout", {"channel": "nope"}, id="channels-logout"),
+    pytest.param(
+        "/api/channels/pairings/approve",
+        {"channelName": "nope", "pairingId": "missing"},
+        id="channel-pairing-approve",
+    ),
+    pytest.param(
+        "/api/channels/pairings/revoke",
+        {"channelName": "nope", "pairingId": "missing"},
+        id="channel-pairing-revoke",
+    ),
     pytest.param("/api/approvals/settings", {"mode": "prompt"}, id="approvals-settings"),
     pytest.param(
         "/api/approvals/resolve", {"id": "missing", "approved": False}, id="approvals-resolve"

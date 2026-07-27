@@ -125,8 +125,10 @@ async def test_exa_missing_api_key_raises_auth_error(monkeypatch: pytest.MonkeyP
 @pytest.mark.parametrize(
     ("status_code", "kind", "retryable"),
     [
+        (400, "http", False),
         (401, "auth", False),
         (403, "auth", False),
+        (408, "http", True),
         (429, "rate_limit", True),
         (500, "http", True),
     ],
@@ -138,7 +140,10 @@ async def test_exa_http_errors_are_classified(
 ) -> None:
     from opensquilla.search.providers.exa import ExaSearchProvider
 
+    requests: list[httpx.Request] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
         return httpx.Response(status_code, json={"error": "nope"})
 
     provider = ExaSearchProvider(
@@ -153,6 +158,60 @@ async def test_exa_http_errors_are_classified(
     assert exc_info.value.kind == kind
     assert exc_info.value.retryable is retryable
     assert exc_info.value.status_code == status_code
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_type", "kind"),
+    [(httpx.ReadTimeout, "timeout"), (httpx.ConnectError, "network")],
+)
+async def test_exa_transport_errors_are_retryable_once(
+    error_type: type[httpx.HTTPError],
+    kind: str,
+) -> None:
+    from opensquilla.search.providers.exa import ExaSearchProvider
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        raise error_type("transient failure", request=request)
+
+    provider = ExaSearchProvider(
+        api_key="dummy-exa-key",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(SearchProviderError) as exc_info:
+        await provider.search("python")
+
+    assert exc_info.value.kind == kind
+    assert exc_info.value.retryable is True
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_exa_malformed_json_is_terminal_parse_error() -> None:
+    from opensquilla.search.providers.exa import ExaSearchProvider
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, text="not json")
+
+    provider = ExaSearchProvider(
+        api_key="dummy-exa-key",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(SearchProviderError) as exc_info:
+        await provider.search("python")
+
+    assert exc_info.value.kind == "parse"
+    assert exc_info.value.retryable is False
+    assert len(requests) == 1
 
 
 def test_exa_provider_spec_is_runtime_supported_after_import() -> None:

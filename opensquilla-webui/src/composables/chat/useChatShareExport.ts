@@ -1,4 +1,5 @@
 import type { Ref } from 'vue'
+import i18n from '@/i18n'
 import { downloadBlob } from '@/utils/browser'
 
 export type ShareExportTheme = 'light' | 'dark'
@@ -8,6 +9,8 @@ interface ChatShareExportOptions {
   /** Raw conversation title. The composable does all slugging and filename
       composition (CJK-safe) — callers must NOT pre-sanitize or pre-compose. */
   title: () => string
+  /** Localized provenance label preserved in every generated share image. */
+  aiGeneratedLabel: () => string
 }
 
 export interface ShareImageResult {
@@ -79,13 +82,18 @@ export function useChatShareExport(options: ChatShareExportOptions) {
     }
 
     await document.fonts?.ready
-    const stage = buildShareDom(sourceElements, theme)
+    const aiGeneratedLabel = options.aiGeneratedLabel()
+    const stage = buildShareDom(sourceElements, theme, aiGeneratedLabel)
 
     try {
       document.body.appendChild(stage)
       await waitForStablePaint()
       const contentCanvas = await captureStageWithDom(stage)
-      const { blob, width, height } = await composeShareTemplate(contentCanvas, stage)
+      const { blob, width, height } = await composeShareTemplate(
+        contentCanvas,
+        stage,
+        aiGeneratedLabel,
+      )
       const filename = shareExportFilename(options.title())
       return { blob, filename, width, height }
     } finally {
@@ -157,7 +165,11 @@ function selectedShareElements(thread: HTMLElement | null, selectedIds: Set<stri
   return elements.filter(element => selectedIds.has(element.dataset.shareMessageId || ''))
 }
 
-export function buildShareDom(sourceElements: HTMLElement[], theme: ShareExportTheme = 'light'): HTMLElement {
+export function buildShareDom(
+  sourceElements: HTMLElement[],
+  theme: ShareExportTheme = 'light',
+  aiGeneratedLabel = '',
+): HTMLElement {
   const stageWidth = EXPORT_WIDTH
   const stage = document.createElement('section')
   stage.id = SHARE_STAGE_ID
@@ -168,7 +180,7 @@ export function buildShareDom(sourceElements: HTMLElement[], theme: ShareExportT
   stage.dataset.theme = theme
   stage.setAttribute('aria-hidden', 'true')
   stage.className = 'chat-share-export-stage'
-  stage.dataset.shareTemplateMetrics = JSON.stringify(shareTemplateMetrics())
+  stage.dataset.shareTemplateMetrics = JSON.stringify(shareTemplateMetrics(aiGeneratedLabel))
   const tokens = shareThemeTokens(stage)
   stage.style.cssText = [
     'position:fixed',
@@ -234,7 +246,7 @@ function inlineBlobBackedImages(original: HTMLElement, clone: HTMLElement): void
   })
 }
 
-function shareTemplateMetrics() {
+function shareTemplateMetrics(aiGeneratedLabel: string) {
   return {
     width: SHARE_TEMPLATE_WIDTH,
     contentWidth: EXPORT_WIDTH,
@@ -247,6 +259,7 @@ function shareTemplateMetrics() {
     footerHeight: SHARE_TEMPLATE_FOOTER_HEIGHT,
     qrSize: SHARE_TEMPLATE_QR_SIZE,
     caption: SHARE_FOOTER_CAPTION,
+    disclaimer: aiGeneratedLabel,
   }
 }
 
@@ -275,6 +288,55 @@ function cleanupShareClone(clone: HTMLElement): HTMLElement {
   )
   clone.removeAttribute('data-share-selected')
 
+  // Activity follows the existing reasoning-share contract: collapsed process
+  // is omitted, while process the user explicitly expanded is included as
+  // static content. The data attributes are the stable renderer/export
+  // boundary; the class + <details open> fallback keeps exports from older
+  // activity DOM compatible while the chat renderer migrates.
+  clone.querySelectorAll<HTMLElement>('[data-share-activity], .assistant-activity')
+    .forEach((activity) => {
+      const usesShareContract = activity.hasAttribute('data-share-activity')
+      const expanded = usesShareContract
+        ? activity.dataset.shareExpanded === 'true'
+        : activity.hasAttribute('open')
+      const summary = activity.querySelector<HTMLElement>(
+        '[data-share-activity-label], .assistant-activity__summary',
+      )
+      const declaredBody = activity.querySelector<HTMLElement>(
+        '[data-share-activity-body], .assistant-activity__body',
+      )
+
+      if (!expanded) {
+        activity.remove()
+        return
+      }
+
+      // A renderer may keep the activity rows directly under the activity root
+      // instead of wrapping them in the legacy body element. Move those rows
+      // into the static body as well, excluding the interactive summary chrome.
+      const body = declaredBody || document.createElement('div')
+      if (!declaredBody) {
+        Array.from(activity.childNodes).forEach((node) => {
+          if (node !== summary) body.appendChild(node)
+        })
+      }
+      if (!body.childNodes.length) {
+        activity.remove()
+        return
+      }
+
+      const block = document.createElement('div')
+      block.className = 'chat-share-export-activity'
+      const label = document.createElement('div')
+      label.className = 'chat-share-export-activity__label'
+      label.textContent = summary?.textContent?.replace(/\s+/g, ' ').trim()
+        || i18n.global.t('chat.activityLabel')
+      body.className = 'chat-share-export-activity__body'
+      body.removeAttribute('data-share-activity-body')
+      block.append(label, body)
+      activity.replaceWith(block)
+    })
+
   // Thinking fold: an expanded fold means the user deliberately opened the
   // reasoning and is sharing it — keep the text, but swap the interactive
   // <details> chrome for a quiet static label. A collapsed fold is just a
@@ -290,7 +352,7 @@ function cleanupShareClone(clone: HTMLElement): HTMLElement {
     block.className = 'chat-share-export-thinking'
     const label = document.createElement('div')
     label.className = 'chat-share-export-thinking__label'
-    label.textContent = 'Thinking'
+    label.textContent = i18n.global.t('chat.thinking')
     const bodyText = document.createElement('div')
     bodyText.className = 'chat-share-export-thinking__body'
     bodyText.textContent = text
@@ -365,6 +427,34 @@ function shareExportCss(): string {
       line-height: 1.55;
       opacity: 0.75;
       white-space: pre-wrap;
+    }
+
+    #${SHARE_STAGE_ID} .chat-share-export-activity {
+      margin: 0 0 10px;
+      padding: 6px 0;
+      border: 0;
+      background: transparent;
+    }
+
+    #${SHARE_STAGE_ID} .chat-share-export-activity__label {
+      font-size: 11px;
+      letter-spacing: 0.02em;
+      opacity: 0.6;
+      margin-bottom: 5px;
+    }
+
+    #${SHARE_STAGE_ID} .chat-share-export-activity__body {
+      display: grid;
+      gap: 6px;
+      min-width: 0;
+    }
+
+    /* The live reasoning body is a capped scroll container; a static image has
+       no scrollbar, so the cap would silently truncate long reasoning. Let the
+       export lay out the full text instead. */
+    #${SHARE_STAGE_ID} .thinking-block__body {
+      max-height: none !important;
+      overflow-y: visible !important;
     }
 
     /* The live meta line is hover-dimmed; the static image has no hover. */
@@ -472,6 +562,7 @@ async function captureStageWithDom(stage: HTMLElement): Promise<HTMLCanvasElemen
 async function composeShareTemplate(
   contentCanvas: HTMLCanvasElement,
   stage: HTMLElement,
+  aiGeneratedLabel: string,
 ): Promise<{ blob: Blob; width: number; height: number }> {
   const tokens = shareThemeTokens(stage)
   const contentHeight = Math.ceil((contentCanvas.height * EXPORT_WIDTH) / contentCanvas.width)
@@ -515,7 +606,7 @@ async function composeShareTemplate(
   context.strokeStyle = tokens.border
   context.stroke()
 
-  await drawTemplateFooter(context, cardY + contentHeight, tokens)
+  await drawTemplateFooter(context, cardY + contentHeight, tokens, aiGeneratedLabel)
 
   const blob = await blobFromCanvas(canvas)
   return { blob, width: SHARE_TEMPLATE_WIDTH, height }
@@ -553,15 +644,20 @@ async function drawTemplateFooter(
   context: CanvasRenderingContext2D,
   startY: number,
   tokens: ReturnType<typeof shareThemeTokens>,
+  aiGeneratedLabel: string,
 ) {
   const qr = await loadOptionalImage(staticAssetUrl('img/QRcode.png'))
 
-  // One cohesive, centered footer band: [QR][gap][caption], the whole group
-  // centered on the template width rather than pinned to opposite corners.
+  // One cohesive, centered footer band: [QR][gap][site + provenance], the
+  // whole group centered on the template width rather than pinned to opposite
+  // corners. The provenance survives when the image leaves the chat UI.
   const captionGap = 12
   context.font = `500 12px ${tokens.fontSans}`
   const captionWidth = context.measureText(SHARE_FOOTER_CAPTION).width
-  const groupWidth = (qr ? SHARE_TEMPLATE_QR_SIZE + captionGap : 0) + captionWidth
+  context.font = `400 11px ${tokens.fontSans}`
+  const disclaimerWidth = context.measureText(aiGeneratedLabel).width
+  const textWidth = Math.max(captionWidth, disclaimerWidth)
+  const groupWidth = (qr ? SHARE_TEMPLATE_QR_SIZE + captionGap : 0) + textWidth
   const groupX = Math.round((SHARE_TEMPLATE_WIDTH - groupWidth) / 2)
   const qrY = startY + 16
   const centerY = qrY + SHARE_TEMPLATE_QR_SIZE / 2
@@ -580,7 +676,10 @@ async function drawTemplateFooter(
   context.fillStyle = tokens.muted
   context.textAlign = 'left'
   context.textBaseline = 'middle'
-  context.fillText(SHARE_FOOTER_CAPTION, captionX, centerY)
+  context.font = `500 12px ${tokens.fontSans}`
+  context.fillText(SHARE_FOOTER_CAPTION, captionX, centerY - 9)
+  context.font = `400 11px ${tokens.fontSans}`
+  context.fillText(aiGeneratedLabel, captionX, centerY + 10)
   context.textBaseline = 'alphabetic'
 }
 

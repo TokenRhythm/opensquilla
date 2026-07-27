@@ -48,6 +48,10 @@ PROVIDER_ENTRY_KEYS = frozenset(
         "verification",
         "envKey",
         "defaultBaseUrl",
+        # Deliberate additive credential-capability metadata: unlike
+        # requiresApiKey, this distinguishes optional API-key support from
+        # OAuth providers that do not accept an API key at all.
+        "acceptsApiKey",
         "requiresApiKey",
         "requiresBaseUrl",
         "routerSupported",

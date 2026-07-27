@@ -1,101 +1,149 @@
 import { THEME } from "../theme.mjs";
-import { TOOL_INDENT, cellWidth, clipToCells, stripTerminalControls, timelineAvailCells } from "../primitives.mjs";
+import { TOOL_INDENT, clipToCells, stripTerminalControls, timelineAvailCells, wrapToCells } from "../primitives.mjs";
+import { destroyRenderable } from "../renderableLifecycle.mjs";
 
-// Greedy soft-wrap a logical line into rows of at most `cells` columns,
-// breaking after the last space that fits so words stay whole; a single
-// overwide word hard-breaks at the budget so wrapping always makes progress.
-function wrapToCells(line, cells) {
-  const budget = Math.max(1, cells);
-  const rows = [];
-  let rest = Array.from(line);
-  while (rest.length) {
-    let used = 0;
-    let cut = 0;
-    let lastSpace = -1;
-    while (cut < rest.length) {
-      const w = cellWidth(rest[cut]);
-      if (used + w > budget) break;
-      used += w;
-      cut += 1;
-      if (rest[cut - 1] === " ") lastSpace = cut;
-    }
-    if (cut >= rest.length) {
-      rows.push(rest.join(""));
-      break;
-    }
-    const breakAt = lastSpace > 0 ? lastSpace : Math.max(1, cut);
-    rows.push(rest.slice(0, breakAt).join("").trimEnd());
-    rest = rest.slice(breakAt);
-    while (rest.length && rest[0] === " ") rest.shift();
-  }
-  return rows.length ? rows : [""];
-}
+// Intermediate assistant narration is useful context, but it should not turn a
+// completed turn into an unbounded wall of process prose. Keep a readable
+// preview after completion and retain every source byte behind an explicit,
+// deterministic expansion API. While the block is live, all narration remains
+// visible so the UI never appears to swallow an in-flight update.
+const COMPLETED_PREVIEW_ROWS = 6;
 
-// Thinking renders incrementally as reasoning streams in. Each append re-lays
-// the visible lines in place (purple ✻, no card) so the model's thinking
-// scrolls live rather than appearing all at once when the block closes.
 export function createThinkingBlock(ctx) {
   const { renderer, TextRenderable, box, idPrefix } = ctx;
-  let text = "";
-  const nodes = new Map(); // id -> row node, for in-place update/recolor (no reordering)
+  const contentWidth = typeof ctx.contentWidth === "function"
+    ? ctx.contentWidth
+    : () => renderer.terminalWidth;
+  let rawText = "";
+  let done = false;
+  let expanded = false;
+  const rowNodes = [];
+  let summaryNode = null;
+  let hiddenLineCount = 0;
 
-  function render() {
-    const trimmed = stripTerminalControls(text).replace(/^\n+/, "");
-    if (!trimmed) return;
-    // The turn card's left border supplies the gutter; the first visual row
-    // carries the ✻ marker and every other row — a wrapped continuation or a
-    // later logical line — indents to align under it. Long lines soft-wrap
-    // into continuation rows so no narration is lost to the viewport edge
-    // (both prefixes are 3 cells, so one budget serves every row).
+  function allRows() {
+    // Strip only for display. rawText deliberately remains byte-for-byte equal
+    // to the concatenated protocol deltas, including controls split across
+    // delta boundaries, so expansion and diagnostics can never lose payload.
+    const safe = stripTerminalControls(rawText).replace(/^\n+/, "");
+    if (!safe) return [];
     const firstPrefix = `${TOOL_INDENT}✻ `;
-    const contPrefix = `${TOOL_INDENT}  `;
-    const avail = timelineAvailCells(firstPrefix, renderer.terminalWidth);
+    const avail = timelineAvailCells(firstPrefix, contentWidth());
     const rows = [];
-    for (const line of trimmed.split("\n")) {
+    for (const line of safe.split("\n")) {
       for (const row of wrapToCells(line, avail)) rows.push(row);
     }
-    rows.forEach((row, i) => {
-      // clipToCells is a no-op after the wrap; it guards a row against any
-      // width drift between wrap-time and render-time cell accounting.
-      const content = `${i === 0 ? firstPrefix : contPrefix}${clipToCells(row, avail)}`;
-      const id = `${idPrefix}-l${i}`;
-      const existing = nodes.get(id);
-      if (existing) {
-        // Update the node IN PLACE. box.remove()+box.add() would re-append the
-        // row after any later blocks in the shared card body — reordering the
-        // transcript — and would churn one renderable per row per delta.
-        existing.content = content;
-      } else {
-        const n = new TextRenderable(renderer, { id, content, fg: THEME.thinkingAccent });
-        // Insert directly AFTER the previous row node. The card body is shared
-        // by every in-card block, so once later blocks (tool rows, the answer)
-        // exist, a plain append would mount rows that only appear at a
-        // narrower relayout — a resize-shrink re-wrap grows the row count —
-        // BELOW those blocks, splitting the narration around them.
-        const prev = i > 0 ? nodes.get(`${idPrefix}-l${i - 1}`) : null;
-        const prevIndex = prev ? box.getChildren().indexOf(prev) : -1;
-        box.add(n, prevIndex >= 0 ? prevIndex + 1 : undefined);
-        nodes.set(id, n);
-      }
+    return rows;
+  }
+
+  function insertAfter(node, previous) {
+    const children = box.getChildren?.() ?? [];
+    const index = previous ? children.indexOf(previous) : -1;
+    box.add(node, index >= 0 ? index + 1 : undefined);
+  }
+
+  function reconcileRows(rows) {
+    const firstPrefix = `${TOOL_INDENT}✻ `;
+    const contPrefix = `${TOOL_INDENT}  `;
+    const avail = timelineAvailCells(firstPrefix, contentWidth());
+    while (rowNodes.length > rows.length) {
+      const node = rowNodes.pop();
+      destroyRenderable(box, node);
+    }
+    while (rowNodes.length < rows.length) {
+      const index = rowNodes.length;
+      const node = new TextRenderable(renderer, {
+        id: `${idPrefix}-l${index}`,
+        content: "",
+        fg: done ? THEME.detailText : THEME.thinkingAccent,
+      });
+      insertAfter(node, rowNodes[index - 1] ?? null);
+      rowNodes.push(node);
+    }
+    rows.forEach((row, index) => {
+      rowNodes[index].content = `${index === 0 ? firstPrefix : contPrefix}${clipToCells(row, avail)}`;
+      rowNodes[index].fg = done ? THEME.detailText : THEME.thinkingAccent;
     });
-    // A re-wrap at a wider terminal can shrink the row count; drop the orphans.
-    for (let i = rows.length; nodes.has(`${idPrefix}-l${i}`); i += 1) {
-      box.remove?.(`${idPrefix}-l${i}`);
-      nodes.delete(`${idPrefix}-l${i}`);
+  }
+
+  function render() {
+    const rows = allRows();
+    const collapse = done && !expanded && rows.length > COMPLETED_PREVIEW_ROWS;
+    const visible = collapse ? rows.slice(0, COMPLETED_PREVIEW_ROWS) : rows;
+    hiddenLineCount = collapse ? rows.length - visible.length : 0;
+    reconcileRows(visible);
+
+    if (hiddenLineCount > 0) {
+      const suffix = hiddenLineCount === 1 ? "line" : "lines";
+      const content = `${TOOL_INDENT}  ▸ ${hiddenLineCount} more ${suffix} · expand details`;
+      if (!summaryNode) {
+        summaryNode = new TextRenderable(renderer, {
+          id: `${idPrefix}-summary`,
+          content,
+          fg: THEME.muted,
+        });
+        insertAfter(summaryNode, rowNodes.at(-1) ?? null);
+      } else {
+        summaryNode.content = content;
+        summaryNode.fg = THEME.muted;
+      }
+    } else if (summaryNode) {
+      destroyRenderable(box, summaryNode);
+      summaryNode = null;
     }
     renderer.requestRender?.();
   }
 
+  function toggleExpanded(force) {
+    const next = typeof force === "boolean" ? force : !expanded;
+    if (next === expanded) return expanded;
+    expanded = next;
+    render();
+    return expanded;
+  }
+
   return {
-    begin() {},
-    append(delta) { text += String(delta); render(); },
-    update() {},
-    end() {},
+    get rawText() { return rawText; },
+    get isExpanded() { return expanded; },
+    get hiddenLineCount() { return hiddenLineCount; },
+    begin(meta = {}) {
+      const seed = meta?.text;
+      if (seed !== undefined && seed !== null) rawText += String(seed);
+      render();
+    },
+    append(delta) {
+      rawText += String(delta ?? "");
+      render();
+    },
+    update(patch = {}) {
+      let changed = false;
+      if (Object.prototype.hasOwnProperty.call(patch ?? {}, "text")) {
+        // A terminal snapshot is authoritative, including an explicit empty
+        // string used to withdraw a stale streamed preview.
+        rawText = String(patch.text ?? "");
+        changed = true;
+      }
+      if (typeof patch.expanded === "boolean" && patch.expanded !== expanded) {
+        expanded = patch.expanded;
+        changed = true;
+      }
+      // Text and disclosure state can arrive in one protocol patch. Reconcile
+      // them in a single render transaction so row destruction/creation never
+      // exposes an intermediate stale frame.
+      if (changed) render();
+    },
+    end() {
+      done = true;
+      render();
+    },
+    toggleExpanded,
     // Re-wrap every row from the raw text at the current terminal width, so a
     // resize re-flows narration instead of leaving rows wrapped or clipped to
     // the old width.
     relayout() { render(); },
-    // Live /theme switch: re-point the existing row nodes at the updated accent.
-    recolor() { for (const n of nodes.values()) n.fg = THEME.thinkingAccent; },
+    recolor() {
+      for (const node of rowNodes) node.fg = done ? THEME.detailText : THEME.thinkingAccent;
+      if (summaryNode) summaryNode.fg = THEME.muted;
+    },
   };
 }

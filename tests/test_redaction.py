@@ -74,6 +74,16 @@ def test_short_runs_are_not_masked() -> None:
     assert redact_error_text(text) == text
 
 
+def test_exact_known_secret_is_masked_without_relying_on_its_shape() -> None:
+    secret = "AIza"
+    out = redact_error_text(
+        f"upstream echoed opaque credential {secret}",
+        known_secrets=(secret,),
+    )
+    assert secret not in out
+    assert out == "upstream echoed opaque credential ***"
+
+
 def test_truncates_to_max_len() -> None:
     out = redact_error_text("x " * 400)
     assert len(out) <= 200

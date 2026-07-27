@@ -22,6 +22,12 @@ from opensquilla.tools.types import (
 )
 
 
+def _original_async(fn):
+    while hasattr(fn, "__wrapped__"):
+        fn = fn.__wrapped__  # type: ignore[attr-defined]
+    return fn
+
+
 @pytest.fixture(autouse=True)
 def reset_approval_state():
     reset_approval_queue()
@@ -43,6 +49,41 @@ def test_audit_command_preserves_long_commands_until_cap() -> None:
     audited = shell._audit_command(huge)
     assert len(audited) > 80
     assert audited.endswith("...[truncated]")
+
+
+@pytest.mark.parametrize(
+    ("interpreter", "script_name"),
+    (("bash", "job.sh"), ("python3", "job.py")),
+)
+def test_shell_approval_fingerprint_changes_when_script_content_changes(
+    tmp_path: Path,
+    interpreter: str,
+    script_name: str,
+) -> None:
+    script = tmp_path / script_name
+    script.write_text("print('before')\n", encoding="utf-8")
+    command = f"{interpreter} {script_name}"
+    profile = shell._profile_shell_command(command, workdir=str(tmp_path))
+
+    before = shell._shell_elevation_action(
+        tool_name="exec_command",
+        action_kind="shell.exec",
+        command=command,
+        cwd=str(tmp_path),
+        profile=profile,
+        justification="Run the requested script.",
+    )
+    script.write_text("print('after')\n", encoding="utf-8")
+    after = shell._shell_elevation_action(
+        tool_name="exec_command",
+        action_kind="shell.exec",
+        command=command,
+        cwd=str(tmp_path),
+        profile=profile,
+        justification="Run the requested script.",
+    )
+
+    assert before.fingerprint() != after.fingerprint()
 
 
 @pytest.mark.asyncio
@@ -104,7 +145,7 @@ async def test_exec_approval_deny_pattern_does_not_depend_on_warnlist(
 
 
 @pytest.mark.asyncio
-async def test_full_host_access_warnlisted_exec_skips_approval_and_uses_host(
+async def test_full_host_access_warnlisted_exec_skips_approval_and_records_mutations(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -119,21 +160,63 @@ async def test_full_host_access_warnlisted_exec_skips_approval_and_uses_host(
         return "exit_code=0\nhost\n"
 
     monkeypatch.setattr(shell, "_run_host_shell_command", fake_host_execution)
+    def fail_preflight(*args: object, **kwargs: object) -> object:
+        raise AssertionError("Full Host Access must skip shell safety preflight")
+
+    monkeypatch.setattr(shell, "_runtime_readonly_shell_block", fail_preflight)
+    monkeypatch.setattr(shell, "_profile_shell_command", fail_preflight)
+    monkeypatch.setattr(shell, "check_safe_bin", fail_preflight)
+    monkeypatch.setattr(shell, "_approval_policy_denial", fail_preflight)
+    monkeypatch.setattr(shell, "snapshot_current_workspace_mutations", lambda: {})
+    mutation_records: list[dict[str, object]] = []
     monkeypatch.setattr(
         shell,
-        "check_safe_bin",
-        lambda command: PolicyResult(
-            allowed=True,
-            reason=f"command requires approval: {command}",
-            needs_approval=True,
-        ),
+        "record_observed_workspace_mutations",
+        lambda **kwargs: mutation_records.append(kwargs),
     )
 
     result = await shell.exec_command("pip install requests", workdir=str(tmp_path))
 
     assert result == "exit_code=0\nhost\n"
     assert calls == ["host"]
+    assert mutation_records == [
+        {
+            "tool_name": "exec_command",
+            "before": {},
+            "metadata": {"command_hash": shell.mutation_ledger_text_hash("pip install requests")},
+        }
+    ]
     assert get_approval_queue().list_pending("exec") == []
+
+
+@pytest.mark.asyncio
+async def test_full_host_write_file_skips_safety_guards(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = current_tool_context.get()
+    assert ctx is not None
+    ctx.run_mode = "full"
+    ctx.workspace_dir = str(tmp_path / "workspace")
+    ctx.file_edit_requires_fresh_read = True
+    ctx.workspace_write_deny_globs = ["**"]
+    target = tmp_path / "outside" / "large.txt"
+    target.parent.mkdir()
+    target.write_text("old" * 4096, encoding="utf-8")
+
+    def fail_safety_tracking(*args: object, **kwargs: object) -> object:
+        raise AssertionError("Full Host Access must skip file safety guards")
+
+    monkeypatch.setattr(filesystem, "_gate_out_of_workspace_write", fail_safety_tracking)
+    monkeypatch.setattr(filesystem, "require_fresh_workspace_file_read", fail_safety_tracking)
+    monkeypatch.setattr(filesystem, "_gate_write_file_destructive_overwrite", fail_safety_tracking)
+    monkeypatch.setattr(filesystem, "fingerprint_path", fail_safety_tracking)
+    monkeypatch.setattr(filesystem, "record_semantic_mutation_receipt", fail_safety_tracking)
+
+    result = await _original_async(filesystem.write_file)(str(target), "new")
+
+    assert result == f"Written 3 bytes to {target}"
+    assert target.read_text(encoding="utf-8") == "new"
 
 
 @pytest.mark.asyncio
@@ -488,7 +571,7 @@ async def test_outside_workspace_write_blocks_without_sandbox_path_approval(
     ctx.interaction_mode = InteractionMode.UNATTENDED
     ctx.workspace_dir = str(workspace)
 
-    write_file = filesystem.write_file.__wrapped__.__wrapped__  # type: ignore[attr-defined]
+    write_file = _original_async(filesystem.write_file)
     payload = json.loads(await write_file(str(outside), "ok"))
 
     assert payload["status"] == "blocked"
@@ -511,7 +594,7 @@ async def test_workspace_lockdown_blocks_outside_workspace_write_even_with_bypas
     ctx.workspace_dir = str(workspace)
     ctx.workspace_lockdown = True  # type: ignore[attr-defined]
 
-    write_file = filesystem.write_file.__wrapped__.__wrapped__  # type: ignore[attr-defined]
+    write_file = _original_async(filesystem.write_file)
     with pytest.raises(ToolError, match="workspace lockdown"):
         await write_file(str(outside), "ok")
 
@@ -536,7 +619,7 @@ async def test_workspace_lockdown_allows_configured_scratch_dir_write(
     ctx.scratch_dir = str(scratch)  # type: ignore[attr-defined]
     ctx.workspace_lockdown = True  # type: ignore[attr-defined]
 
-    result = await filesystem._gate_out_of_workspace_write(
+    result, elevated = await filesystem._gate_out_of_workspace_write(
         "write_file",
         target.resolve(strict=False),
         str(target),
@@ -544,6 +627,7 @@ async def test_workspace_lockdown_allows_configured_scratch_dir_write(
     )
 
     assert result is None
+    assert elevated is False
     assert not target.exists()
     assert get_approval_queue().list_pending("exec") == []
 
@@ -560,7 +644,7 @@ async def test_workspace_write_deny_globs_block_file_write(tmp_path: Path) -> No
     ctx.workspace_dir = str(workspace)
     ctx.workspace_write_deny_globs = ["blocked/**"]  # type: ignore[attr-defined]
 
-    write_file = filesystem.write_file.__wrapped__.__wrapped__  # type: ignore[attr-defined]
+    write_file = _original_async(filesystem.write_file)
     with pytest.raises(ToolError, match="workspace write deny policy"):
         await write_file(str(target), "nope")
 
@@ -583,7 +667,7 @@ async def test_workspace_write_deny_globs_block_nested_test_file_write(
     ctx.workspace_dir = str(workspace)
     ctx.workspace_write_deny_globs = ["**/test/**", "**/*Test.java"]  # type: ignore[attr-defined]
 
-    write_file = filesystem.write_file.__wrapped__.__wrapped__  # type: ignore[attr-defined]
+    write_file = _original_async(filesystem.write_file)
     with pytest.raises(ToolError, match="workspace write deny policy"):
         await write_file(str(target), "nope")
 
@@ -608,7 +692,7 @@ async def test_workspace_write_deny_globs_allow_configured_scratch_write_file(
     ctx.workspace_lockdown = True  # type: ignore[attr-defined]
     ctx.workspace_write_deny_globs = ["**/test_*.py"]  # type: ignore[attr-defined]
 
-    write_file = filesystem.write_file.__wrapped__.__wrapped__  # type: ignore[attr-defined]
+    write_file = _original_async(filesystem.write_file)
     result = await write_file(str(target), "print('scratch')\n")
 
     assert result.startswith("Written 17 bytes to ")
@@ -633,7 +717,7 @@ async def test_configured_scratch_dir_blocks_root_debug_workspace_write_file(
     ctx.scratch_dir = str(scratch)  # type: ignore[attr-defined]
     ctx.workspace_lockdown = True  # type: ignore[attr-defined]
 
-    write_file = filesystem.write_file.__wrapped__.__wrapped__  # type: ignore[attr-defined]
+    write_file = _original_async(filesystem.write_file)
     with pytest.raises(ToolError, match="configured scratch directory"):
         await write_file(str(target), "<?php echo 'debug';\n")
 
@@ -657,7 +741,7 @@ async def test_configured_scratch_dir_allows_plain_root_test_source_name(
     ctx.scratch_dir = str(scratch)  # type: ignore[attr-defined]
     ctx.workspace_lockdown = True  # type: ignore[attr-defined]
 
-    write_file = filesystem.write_file.__wrapped__.__wrapped__  # type: ignore[attr-defined]
+    write_file = _original_async(filesystem.write_file)
     result = await write_file(str(target), "def test_api():\n    assert True\n")
 
     assert "Written 32 bytes" in result
@@ -681,7 +765,7 @@ async def test_write_file_blocks_large_workspace_file_fragment_overwrite(
     ctx.workspace_dir = str(workspace)
 
     await filesystem.read_file(str(target))
-    write_file = filesystem.write_file.__wrapped__.__wrapped__  # type: ignore[attr-defined]
+    write_file = _original_async(filesystem.write_file)
     with pytest.raises(ToolError, match="write_file refused to overwrite"):
         await write_file(str(target), "int replacement_fragment;\n")
 
@@ -703,7 +787,7 @@ async def test_write_file_allows_scratch_file_fragment_overwrite(tmp_path: Path)
     ctx.workspace_dir = str(workspace)
     ctx.scratch_dir = str(scratch)  # type: ignore[attr-defined]
 
-    write_file = filesystem.write_file.__wrapped__.__wrapped__  # type: ignore[attr-defined]
+    write_file = _original_async(filesystem.write_file)
     result = await write_file(str(target), "int replacement_fragment;\n")
 
     assert result.startswith("Written 26 bytes to ")
@@ -723,7 +807,7 @@ async def test_write_file_allows_small_workspace_file_overwrite(tmp_path: Path) 
     ctx.workspace_dir = str(workspace)
 
     await filesystem.read_file(str(target))
-    write_file = filesystem.write_file.__wrapped__.__wrapped__  # type: ignore[attr-defined]
+    write_file = _original_async(filesystem.write_file)
     result = await write_file(str(target), "new\n")
 
     assert result.startswith("Written 4 bytes to ")

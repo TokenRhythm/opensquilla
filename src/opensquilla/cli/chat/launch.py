@@ -17,6 +17,7 @@ class ChatCommandRequest:
     workspace: str
     workspace_strict: bool | None
     timeout: float | None
+    ui: str | None = None
 
 
 @dataclass(frozen=True)

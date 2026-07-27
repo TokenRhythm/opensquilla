@@ -1,5 +1,5 @@
 <template>
-  <div class="hub control-stage">
+  <div class="hub control-stage sessions-stage">
     <header class="control-stage__header">
       <div class="control-stage__title-block">
         <h1 class="control-stage__title">{{ t('sessions.title') }}</h1>
@@ -8,9 +8,14 @@
         </p>
       </div>
       <div class="control-stage__actions">
-        <button class="btn btn--ghost" :title="t('sessions.refresh')" :disabled="refreshing" @click="refresh">
+        <button
+          class="btn btn--icon btn--ghost sessions-refresh"
+          :title="refreshing ? t('sessions.refreshing') : t('sessions.refresh')"
+          :aria-label="refreshing ? t('sessions.refreshing') : t('sessions.refresh')"
+          :disabled="refreshing"
+          @click="refresh"
+        >
           <Icon name="refresh" :size="16" />
-          <span>{{ refreshing ? t('sessions.refreshing') : t('sessions.refresh') }}</span>
         </button>
       </div>
     </header>
@@ -22,6 +27,7 @@
       :running-count="runningCount"
       :queued-count="queuedCount"
       :cost-usd="costUsd"
+      :cost-period="costPeriod"
       @open-approvals="openBlockedSession"
       @open-usage="router.push('/usage')"
     />
@@ -67,10 +73,12 @@
         <p class="control-empty__hint">{{ t('sessions.loading') }}</p>
       </div>
 
-      <div v-else-if="allSessions.length === 0" class="hub-state control-empty">
-        <Icon name="sessions" :size="32" class="control-empty__icon" aria-hidden="true" />
-        <div class="control-empty__title">{{ t('sessions.empty.title') }}</div>
-        <p class="control-empty__hint">{{ t('sessions.empty.body') }}</p>
+      <div v-else-if="allSessions.length === 0" class="hub-state hub-state--empty control-empty">
+        <Icon name="sessions" :size="22" class="control-empty__icon" aria-hidden="true" />
+        <div class="hub-state__copy">
+          <div class="control-empty__title">{{ t('sessions.empty.title') }}</div>
+          <p class="control-empty__hint">{{ t('sessions.empty.body') }}</p>
+        </div>
       </div>
 
       <div v-else-if="ledgerEntries.length === 0" class="hub-state control-empty">
@@ -84,6 +92,7 @@
         v-else
         :entries="ledgerEntries"
         :agent-names="agentNames"
+        :agents-loaded="agentsLoaded"
         :needs-input-keys="needsInputKeys"
         @open="openSession"
         @remove="removeSession"
@@ -112,6 +121,8 @@ import Icon from '@/components/Icon.vue'
 import ErrorState from '@/components/ErrorState.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import { useConfirm } from '@/composables/useConfirm'
+import { requestUsageSnapshot } from '@/composables/usage/useUsageQuery'
+import type { UsageSnapshot } from '@/types/usage'
 import SessionsTaskInput from '@/components/sessions/SessionsTaskInput.vue'
 import SessionsAttentionStrip from '@/components/sessions/SessionsAttentionStrip.vue'
 import SessionsLedger from '@/components/sessions/SessionsLedger.vue'
@@ -129,15 +140,12 @@ import {
   localSessionsDeletedDetail,
   LOCAL_SESSIONS_DELETED_EVENT,
 } from '@/utils/sessionSync'
+import { sessionAgentIdentity } from '@/components/sessions/sessionDisplay'
 
 type FilterId = 'all' | 'chats' | 'automations' | 'channels'
 
 interface AgentsListResponse {
   agents?: Array<{ id?: string; name?: string }>
-}
-
-interface UsageStatusResponse {
-  totalCostUsd?: number
 }
 
 interface DeleteResponse {
@@ -171,12 +179,16 @@ const { sessionsList, allSessions, isLoading, sessionListError, loadSessions } =
 const filter = ref<FilterId>('all')
 const search = ref('')
 const agentNames = ref<Map<string, string>>(new Map())
+const agentsLoaded = ref(false)
+let agentsRequestGeneration = 0
 const pendingApprovals = ref<string[]>([])
 const costUsd = ref<number | null>(null)
+const costPeriod = ref<'today' | 'total'>('total')
 
 let refreshTimer: ReturnType<typeof setTimeout> | null = null
 let pollTimer: ReturnType<typeof setInterval> | null = null
 let unsubs: Array<() => void> = []
+let lastCostSnapshot: UsageSnapshot | null = null
 
 // ---------------------------------------------------------------------------
 // Derivations
@@ -225,9 +237,14 @@ const inspectParent = computed(() => {
 })
 
 const inspectAgentName = computed(() => {
-  const id = inspectItem.value?.effectiveAgentId
-  if (!id || id === 'unknown') return t('sessions.unknownAgent')
-  return agentNames.value.get(id) || id
+  const identity = sessionAgentIdentity(
+    inspectItem.value?.effectiveAgentId,
+    agentNames.value,
+    agentsLoaded.value,
+  )
+  if (identity.kind === 'unknown') return t('sessions.unknownAgent')
+  if (identity.kind === 'deleted') return t('sessions.deletedAgent', { id: identity.value })
+  return identity.value
 })
 
 // ---------------------------------------------------------------------------
@@ -235,14 +252,21 @@ const inspectAgentName = computed(() => {
 // ---------------------------------------------------------------------------
 
 async function loadAgents() {
+  const generation = ++agentsRequestGeneration
   try {
     const data = await rpc.call<AgentsListResponse>('agents.list')
+    if (generation !== agentsRequestGeneration) return
     agentNames.value = new Map(
       (data?.agents || [])
         .filter(agent => agent.id)
         .map(agent => [String(agent.id), String(agent.name || agent.id)]))
+    agentsLoaded.value = true
   } catch {
-    // Ledger falls back to agent ids.
+    if (generation === agentsRequestGeneration) {
+      // A stale directory must not produce false “Deleted agent” labels after
+      // the current authoritative lookup failed.
+      agentsLoaded.value = false
+    }
   }
 }
 
@@ -270,10 +294,21 @@ async function refreshApprovals() {
 
 async function refreshCost() {
   try {
-    const data = await rpc.call<UsageStatusResponse>('usage.status')
-    costUsd.value = data?.totalCostUsd != null ? Number(data.totalCostUsd) : null
+    const snapshot = await requestUsageSnapshot(rpc, 'today', {
+      days: false,
+      models: false,
+      sessions: false,
+      // Old gateways only expose lifetime totals. Showing that value is safe
+      // as long as the label says total rather than incorrectly claiming today.
+      fallbackRange: 'all',
+      cachedSnapshot: lastCostSnapshot,
+    })
+    lastCostSnapshot = snapshot
+    costUsd.value = snapshot.totals.cost
+    costPeriod.value = snapshot.source === 'usage_ledger' ? 'today' : 'total'
   } catch {
     costUsd.value = null
+    costPeriod.value = 'total'
   }
 }
 
@@ -435,6 +470,40 @@ onUnmounted(teardownLive)
 </script>
 
 <style scoped>
+.sessions-stage {
+  margin-inline: auto;
+  max-width: 1280px;
+  padding-bottom: var(--sp-8);
+  width: 100%;
+}
+
+.sessions-stage .control-stage__header {
+  align-items: flex-start;
+}
+
+.sessions-stage .control-stage__title {
+  font-size: clamp(1.75rem, 1.6rem + 0.35vw, 2rem);
+  letter-spacing: -0.035em;
+  line-height: 1.1;
+}
+
+.sessions-stage .control-stage__subtitle {
+  margin-top: 7px;
+}
+
+.sessions-refresh {
+  border-radius: var(--radius-control);
+  color: var(--text-muted);
+  height: 36px;
+  padding: 0;
+  width: 36px;
+}
+
+.sessions-refresh:hover:not(:disabled) {
+  background: var(--bg-surface-2);
+  color: var(--text);
+}
+
 .hub-list {
   display: flex;
   flex-direction: column;
@@ -442,7 +511,32 @@ onUnmounted(teardownLive)
 }
 
 .hub-state {
-  min-height: 40vh;
+  min-height: 240px;
+}
+
+.hub-state--empty {
+  align-items: flex-start;
+  display: grid;
+  gap: var(--sp-3);
+  grid-template-columns: 24px minmax(0, 1fr);
+  justify-content: stretch;
+  min-height: 0;
+  padding: 40px 4px 32px;
+  text-align: left;
+}
+
+.hub-state--empty .control-empty__icon {
+  margin: 1px 0 0;
+}
+
+.hub-state__copy {
+  display: grid;
+  gap: 5px;
+}
+
+.hub-state--empty .control-empty__hint {
+  margin: 0;
+  max-width: 52ch;
 }
 
 .hub-list__head {
@@ -491,9 +585,17 @@ onUnmounted(teardownLive)
 
 
 @media (max-width: 760px) {
+  .sessions-stage {
+    padding-bottom: var(--sp-6);
+  }
+
   .hub-list__head {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .hub-state--empty {
+    padding-block: var(--sp-6);
   }
 }
 </style>

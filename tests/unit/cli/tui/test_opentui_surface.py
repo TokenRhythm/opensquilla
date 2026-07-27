@@ -8,6 +8,8 @@ import pytest
 
 from opensquilla.cli.tui.opentui.messages import (
     CompletionContext,
+    HistoryMessage,
+    HistoryReplace,
     HostApprovalResponse,
     HostCompletionRequest,
     HostError,
@@ -36,9 +38,7 @@ class FakeOpenTuiBridge:
         if payload is None:
             self.sent.append((message_type, None))
             return
-        self.sent.append(
-            (message_type, payload if isinstance(payload, dict) else asdict(payload))
-        )
+        self.sent.append((message_type, payload if isinstance(payload, dict) else asdict(payload)))
 
     async def next_message(self) -> object | None:
         return await self.messages.get()
@@ -60,6 +60,32 @@ async def test_opentui_surface_returns_submitted_lines_and_eof() -> None:
 
     bridge.messages.put_nowait(HostInputEof())
     assert await surface.next_line() is None
+
+
+@pytest.mark.asyncio
+async def test_open_surface_hydrates_history_before_enabling_input() -> None:
+    bridge = FakeOpenTuiBridge()
+    history = HistoryReplace(
+        session_key="agent:main:session-1",
+        history_scope="complete",
+        loaded_count=1,
+        messages=(HistoryMessage(id="m1", role="user", text="persisted"),),
+    )
+
+    async with open_opentui_surface(
+        surface=Surface.CLI_GATEWAY,
+        bridge=bridge,
+        history_replace=history,
+        print_ready_marker=False,
+    ):
+        pass
+
+    message_types = [message_type for message_type, _payload in bridge.sent]
+    assert message_types[:3] == ["composer.set", "history.replace", "composer.set"]
+    assert bridge.sent[0][1]["disabled"] is True
+    assert bridge.sent[1][1]["session_key"] == "agent:main:session-1"
+    assert bridge.sent[1][1]["messages"][0]["id"] == "m1"
+    assert bridge.sent[2][1]["disabled"] is False
 
 
 @pytest.mark.asyncio
@@ -168,6 +194,189 @@ async def test_approval_response_resolves_waiter_and_next_line_keeps_pumping() -
 
 
 @pytest.mark.asyncio
+async def test_gateway_approval_resolution_reuses_and_dismisses_pushed_overlay() -> None:
+    bridge = FakeOpenTuiBridge()
+    output = OpenTuiOutputHandle(bridge, approval_surface=Surface.CLI_GATEWAY)
+    request = {
+        "id": "appr-shared",
+        "tool": "shell",
+        "summary": "echo hello",
+        "choices": [],
+    }
+
+    assert await output.present_gateway_approval(request) is True
+    waiter = asyncio.create_task(output.request_approval(request))
+    await asyncio.sleep(0)
+    assert [kind for kind, _payload in bridge.sent].count("approval.request") == 1
+
+    matched = await output.resolve_gateway_approval(
+        "appr-shared",
+        approved=True,
+        resolution="approved",
+    )
+    response = await waiter
+
+    assert matched is True
+    assert response is not None
+    assert response.approved is True
+    assert response.resolved_externally is True
+    assert bridge.sent[-1][0] == "approval.dismiss"
+
+
+@pytest.mark.asyncio
+async def test_canonical_approval_refreshes_push_first_overlay_choices() -> None:
+    bridge = FakeOpenTuiBridge()
+    output = OpenTuiOutputHandle(bridge, approval_surface=Surface.CLI_GATEWAY)
+    preview = {
+        "id": "appr-richer",
+        "tool": "shell",
+        "summary": "echo hello",
+        "choices": [],
+    }
+    canonical = {
+        **preview,
+        "choices": ["allow_once", "allow_same_type"],
+    }
+
+    assert await output.present_gateway_approval(preview) is True
+    waiter = asyncio.create_task(output.request_approval(canonical))
+    await asyncio.sleep(0)
+
+    requests = [payload for kind, payload in bridge.sent if kind == "approval.request"]
+    assert requests == [preview, canonical]
+
+    await output.resolve_gateway_approval(
+        "appr-richer",
+        approved=True,
+        resolution="allow_same_type",
+    )
+    response = await waiter
+    assert response is not None
+    assert response.approved is True
+    assert response.resolution == "allow_same_type"
+
+
+@pytest.mark.asyncio
+async def test_late_push_preview_does_not_downgrade_canonical_approval() -> None:
+    bridge = FakeOpenTuiBridge()
+    output = OpenTuiOutputHandle(bridge, approval_surface=Surface.CLI_GATEWAY)
+    canonical = {
+        "id": "appr-canonical-first",
+        "tool": "shell",
+        "summary": "echo hello",
+        "choices": ["allow_once", "allow_same_type"],
+    }
+    preview = {**canonical, "choices": []}
+
+    waiter = asyncio.create_task(output.request_approval(canonical))
+    await asyncio.sleep(0)
+    assert await output.present_gateway_approval(preview) is True
+
+    requests = [payload for kind, payload in bridge.sent if kind == "approval.request"]
+    assert requests == [canonical]
+
+    await output.resolve_gateway_approval(
+        "appr-canonical-first",
+        approved=False,
+        resolution="denied",
+    )
+    response = await waiter
+    assert response is not None
+    assert response.approved is False
+
+
+@pytest.mark.asyncio
+async def test_gateway_resolution_wins_race_with_uncommitted_local_keypress() -> None:
+    bridge = FakeOpenTuiBridge()
+    output = OpenTuiOutputHandle(bridge, approval_surface=Surface.CLI_GATEWAY)
+    request = {"id": "appr-race", "tool": "shell", "summary": "", "choices": []}
+    waiter = asyncio.create_task(output.request_approval(request))
+    await asyncio.sleep(0)
+
+    output.deliver_approval_response(
+        HostApprovalResponse(id="appr-race", approved=False, choice=None)
+    )
+    await output.resolve_gateway_approval(
+        "appr-race",
+        approved=True,
+        resolution="approved",
+    )
+
+    response = await waiter
+    assert response is not None
+    assert response.approved is True
+    assert response.resolved_externally is True
+
+
+@pytest.mark.asyncio
+async def test_late_preview_cannot_reopen_locally_resolved_overlay() -> None:
+    bridge = FakeOpenTuiBridge()
+    output = OpenTuiOutputHandle(bridge, approval_surface=Surface.CLI_GATEWAY)
+    canonical = {
+        "id": "appr-local-race",
+        "tool": "shell",
+        "summary": "echo hello",
+        "choices": ["allow_once", "deny"],
+    }
+    preview = {**canonical, "choices": []}
+    waiter = asyncio.create_task(output.request_approval(canonical))
+    await asyncio.sleep(0)
+
+    assert output.deliver_approval_response(
+        HostApprovalResponse(id="appr-local-race", approved=True, choice="allow_once")
+    )
+    # Reproduce the exact interleaving: the local future is complete, but its
+    # coroutine has not resumed when a delayed pushed preview arrives.
+    assert await output.present_gateway_approval(preview) is True
+
+    response = await waiter
+    assert response is not None
+    assert response.approved is True
+    requests = [payload for kind, payload in bridge.sent if kind == "approval.request"]
+    assert requests == [canonical]
+    assert output._approval_waiters == {}
+    assert output._approval_requests == {}
+
+
+@pytest.mark.asyncio
+async def test_gateway_disconnect_fails_pending_approval_closed_and_dismisses() -> None:
+    bridge = FakeOpenTuiBridge()
+    output = OpenTuiOutputHandle(bridge, approval_surface=Surface.CLI_GATEWAY)
+    waiter = asyncio.create_task(
+        output.request_approval(
+            {"id": "appr-disconnect", "tool": "shell", "summary": "", "choices": []}
+        )
+    )
+    await asyncio.sleep(0)
+
+    await output.fail_pending_gateway_approvals()
+
+    assert await waiter is None
+    assert bridge.sent[-1] == ("approval.dismiss", {"id": "appr-disconnect"})
+
+
+@pytest.mark.asyncio
+async def test_plugin_output_wrapper_forwards_gateway_approval_lifecycle() -> None:
+    from opensquilla.cli.tui.adapters.runtime_helpers import TuiPluginOutputHandle
+
+    bridge = FakeOpenTuiBridge()
+    inner = OpenTuiOutputHandle(bridge, approval_surface=Surface.CLI_GATEWAY)
+    output = TuiPluginOutputHandle(inner, plugin_manager=object())
+    request = {"id": "appr-wrapper", "tool": "shell", "summary": "", "choices": []}
+
+    assert await output.present_gateway_approval(request) is True
+    assert (
+        await output.resolve_gateway_approval("appr-wrapper", approved=False, resolution="denied")
+        is True
+    )
+
+    assert [kind for kind, _payload in bridge.sent] == [
+        "approval.request",
+        "approval.dismiss",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_approval_waiter_survives_next_line_task_recreation() -> None:
     """The waiter registry lives on the surface's output handle, so a pending
     approval resolves even when the runtime cancels and re-creates its input
@@ -187,9 +396,7 @@ async def test_approval_waiter_survives_next_line_task_recreation() -> None:
     with pytest.raises(asyncio.CancelledError):
         await first_reader
 
-    bridge.messages.put_nowait(
-        HostApprovalResponse(id="appr-2", approved=False, choice="deny")
-    )
+    bridge.messages.put_nowait(HostApprovalResponse(id="appr-2", approved=False, choice="deny"))
     bridge.messages.put_nowait(HostInputSubmit(text="after recreation"))
 
     assert await surface.next_line() == "after recreation"
@@ -208,6 +415,84 @@ async def test_request_approval_times_out_to_none() -> None:
     )
 
     assert response is None
+
+
+@pytest.mark.asyncio
+async def test_attachment_output_api_tracks_sanitized_state_and_clears_ready() -> None:
+    bridge = FakeOpenTuiBridge()
+    output = OpenTuiOutputHandle(bridge, approval_surface=Surface.CLI_GATEWAY)
+
+    attachment_id = await output.add_attachment(
+        kind="file",
+        label="/private/tmp/redaction-fixture/brief.pdf",
+    )
+    assert await output.update_attachment(attachment_id, status="uploading") is True
+    assert await output.update_attachment(attachment_id, status="ready") is True
+    assert await output.clear_attachments(status="ready") == 1
+
+    assert [message_type for message_type, _payload in bridge.sent] == [
+        "attachment.add",
+        "attachment.update",
+        "attachment.update",
+        "attachment.clear",
+    ]
+    assert bridge.sent[0][1] == {
+        "id": attachment_id,
+        "kind": "file",
+        "label": "brief.pdf",
+        "status": "reading",
+        "message": "",
+    }
+    assert "/private/tmp/redaction-fixture" not in str(bridge.sent)
+
+
+@pytest.mark.asyncio
+async def test_attachment_failure_remains_visible_and_redacts_diagnostics() -> None:
+    bridge = FakeOpenTuiBridge()
+    output = OpenTuiOutputHandle(bridge, approval_surface=Surface.CLI_GATEWAY)
+
+    attachment_id = await output.add_attachment(
+        kind="image",
+        label=r"C:\private\secret.png",
+    )
+    await output.update_attachment(
+        attachment_id,
+        status="failed",
+        message=r"Could not read C:\private\secret.png (12345 bytes)",
+    )
+
+    assert await output.clear_attachments(status="ready") == 0
+    failure = bridge.sent[-1][1]
+    assert failure["status"] == "failed"
+    assert failure["message"] == "Could not read <path> (<size>)"
+    assert "private" not in str(bridge.sent)
+    assert "12345" not in str(bridge.sent)
+
+
+@pytest.mark.asyncio
+async def test_pending_duplicate_attachment_reuses_one_chip() -> None:
+    bridge = FakeOpenTuiBridge()
+    output = OpenTuiOutputHandle(bridge, approval_surface=Surface.CLI_GATEWAY)
+
+    first = await output.add_attachment(kind="file", label="brief.pdf")
+    second = await output.add_attachment(kind="file", label="brief.pdf")
+
+    assert first == second
+    assert [kind for kind, _payload in bridge.sent] == ["attachment.add"]
+
+
+@pytest.mark.asyncio
+async def test_attachment_remove_api_is_idempotent() -> None:
+    bridge = FakeOpenTuiBridge()
+    output = OpenTuiOutputHandle(bridge, approval_surface=Surface.CLI_GATEWAY)
+    attachment_id = await output.add_attachment(kind="path", label="report.md")
+
+    assert await output.remove_attachment(attachment_id) is True
+    assert await output.remove_attachment(attachment_id) is False
+    assert [kind for kind, _payload in bridge.sent] == [
+        "attachment.add",
+        "attachment.remove",
+    ]
 
 
 @pytest.mark.asyncio
@@ -333,6 +618,35 @@ async def test_open_opentui_surface_sends_completion_context_on_startup() -> Non
             },
         ),
         (
+            "router.update",
+            {
+                "model": "default",
+                "route": "gateway",
+                "saving": "-",
+                "context": "ready",
+                "style": "dim",
+                "baseline_model": "",
+                "source": "new session",
+                "routing_applied": False,
+                "rollout_phase": "observe",
+                "io": "",
+            },
+        ),
+        (
+            "context.update",
+            {
+                "agent": {"id": "main", "name": "main", "emoji": None},
+                "task": "New session",
+                "surface": "Web + TUI",
+                "gateway": "connected",
+                "model": "default",
+                "permission": "normal",
+                "workspace": "",
+                "queue": "idle",
+                "context": "",
+            },
+        ),
+        (
             "completion.context",
             {
                 "catalog": (),
@@ -357,6 +671,8 @@ async def test_open_opentui_surface_marks_ready_after_completion_context() -> No
 
     assert [message_type for message_type, _payload in bridge.sent] == [
         "composer.set",
+        "router.update",
+        "context.update",
         "completion.context",
         "scrollback.write",
     ]
@@ -384,6 +700,8 @@ async def test_open_opentui_surface_omits_ready_marker_by_default(
 
     assert [message_type for message_type, _payload in bridge.sent] == [
         "composer.set",
+        "router.update",
+        "context.update",
         "completion.context",
     ]
 
@@ -406,6 +724,32 @@ async def test_open_opentui_surface_env_var_opts_into_ready_marker(
         "scrollback.write",
         asdict(ScrollbackWrite(text="HARNESS_READY\n")),
     )
+
+
+@pytest.mark.asyncio
+async def test_open_opentui_surface_seeds_real_model_session_and_mode() -> None:
+    bridge = FakeOpenTuiBridge()
+
+    async with open_opentui_surface(
+        surface=Surface.CLI_GATEWAY,
+        model="openai/gpt-test",
+        session_id="agent:main:existing",
+        bridge=bridge,
+        completion_context=CompletionContext(catalog=(), files=()),
+    ):
+        pass
+
+    router_message = next(payload for kind, payload in bridge.sent if kind == "router.update")
+    assert router_message["model"] == "openai/gpt-test"
+    assert router_message["route"] == "gateway"
+    assert router_message["source"] == "agent:main:existing"
+    assert router_message["context"] == "ready"
+    context_message = next(payload for kind, payload in bridge.sent if kind == "context.update")
+    assert context_message["model"] == "openai/gpt-test"
+    assert context_message["task"] == "Session"
+    assert context_message["surface"] == "Web + TUI"
+    assert context_message["gateway"] == "connected"
+    assert "agent:main:existing" not in repr(context_message)
 
 
 @pytest.mark.asyncio
@@ -433,9 +777,7 @@ async def test_opentui_surface_answers_file_completion_without_returning_input(
         workspace_dir=tmp_path,
     )
 
-    bridge.messages.put_nowait(
-        HostCompletionRequest(kind="file", query="foo", request_id=7)
-    )
+    bridge.messages.put_nowait(HostCompletionRequest(kind="file", query="foo", request_id=7))
     bridge.messages.put_nowait(HostInputSubmit(text="hello"))
 
     # Completion is served off the input loop so a queued submit is never
@@ -526,8 +868,7 @@ async def test_newer_completion_request_supersedes_older_one(
     await completion_task
 
     responses = [
-        payload for message_type, payload in bridge.sent
-        if message_type == "completion.response"
+        payload for message_type, payload in bridge.sent if message_type == "completion.response"
     ]
     assert [response["request_id"] for response in responses] == [2]
 
@@ -607,6 +948,11 @@ async def test_open_opentui_surface_uses_explicit_workspace_for_completion_conte
             "filters_sensitive_paths": True,
         },
     )
+    context_message = next(payload for kind, payload in bridge.sent if kind == "context.update")
+    assert context_message["workspace"] == tmp_path.name
+    assert str(tmp_path.parent) not in repr(context_message)
+    assert context_message["surface"] == "TUI"
+    assert context_message["gateway"] == "isolated"
 
 
 def test_opentui_output_toolbar_invalidates_router_plugin() -> None:
@@ -830,3 +1176,37 @@ async def test_stream_output_surfaces_write_failure_at_context_exit() -> None:
     with pytest.raises(RuntimeError, match="pipe down"):
         async with output.stream_output() as write:
             write("only")
+
+
+@pytest.mark.asyncio
+async def test_approval_payloads_are_sanitized_on_both_send_sites() -> None:
+    # The choke point must hold for the canonical request AND the gateway-push
+    # preview: reverting either call site to dict(request) must fail here.
+    hostile = {
+        "id": "appr-hostile",
+        "tool": "sh\x1b[31mell",
+        "summary": "echo\x1b]0;pwn\x07 ok",
+        "message": "why\x1b[2Jnot",
+        "choices": ["allow_once"],
+    }
+
+    bridge = FakeOpenTuiBridge()
+    output = OpenTuiOutputHandle(bridge, approval_surface=Surface.CLI_GATEWAY)
+    await output.request_approval(dict(hostile), timeout=0.01)
+    # The timeout appends an approval.dismiss; the request frame is first.
+    sent_type, sent_payload = bridge.sent[0]
+    assert sent_type == "approval.request"
+    assert sent_payload["tool"] == "shell"
+    assert sent_payload["summary"] == "echo ok"
+    assert sent_payload["message"] == "whynot"
+    # The raw id list is protocol data (round-trips in approval.response) and
+    # is display-stripped host-side instead.
+    assert sent_payload["choices"] == ["allow_once"]
+
+    preview_bridge = FakeOpenTuiBridge()
+    preview_output = OpenTuiOutputHandle(preview_bridge, approval_surface=Surface.CLI_GATEWAY)
+    assert await preview_output.present_gateway_approval(dict(hostile)) is True
+    preview_type, preview_payload = preview_bridge.sent[-1]
+    assert preview_type == "approval.request"
+    assert preview_payload["summary"] == "echo ok"
+    assert preview_payload["tool"] == "shell"

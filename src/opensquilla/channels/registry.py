@@ -19,7 +19,18 @@ if TYPE_CHECKING:
 
 log = structlog.get_logger(__name__)
 
-_COMMON_ENTRY_FIELDS = frozenset({"name", "type", "enabled", "agent_id"})
+_COMMON_ENTRY_FIELDS = frozenset(
+    {
+        "name",
+        "type",
+        "enabled",
+        "agent_id",
+        "group_session_scope",
+        "busy_input_mode",
+        "dm_access",
+        "allowed_senders",
+    }
+)
 _INTERNAL = frozenset({"manager", "registry", "transports", "types"})
 # Adapters that exist on disk but are intentionally hidden from
 # auto-discovery. The implementation is kept for future first-class

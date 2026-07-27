@@ -13,6 +13,7 @@ from typing import Any
 import structlog
 
 from opensquilla.engine.stream_wrappers import wrap_stream
+from opensquilla.engine.types import done_text_snapshot
 from opensquilla.scheduler.delivery import (
     DeliveryChain,
     build_reply_rendezvous_envelope,
@@ -266,6 +267,8 @@ def make_agent_run_handler(
 
         # Agent execution
         collected_text: list[str] = []
+        done_text_present = False
+        done_text = ""
         success = True
         error_message: str | None = None
         result_text = ""
@@ -357,13 +360,18 @@ def make_agent_run_handler(
                                     "error_message": error_message,
                                 }
                             )
+                    elif event_kind == "done":
+                        snapshot_present, snapshot_text = done_text_snapshot(event)
+                        if snapshot_present:
+                            done_text_present = True
+                            done_text = snapshot_text
                     elif (
                         event_kind not in {"done", "state_change", "tool_use_start", "tool_result"}
                         and hasattr(event, "text")
                         and event.text
                     ):
                         collected_text.append(event.text)
-                result_text = "".join(collected_text)
+                result_text = done_text if done_text_present else "".join(collected_text)
                 if not success and not result_text:
                     result_text = error_message or ""
                 summary = result_text[:500] if result_text else error_message

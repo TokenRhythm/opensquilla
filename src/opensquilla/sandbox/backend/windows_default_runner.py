@@ -6,14 +6,14 @@
 from __future__ import annotations
 
 import base64
-import contextlib
 import json
 import os
 import re
 import subprocess
 import sys
-import uuid
-from collections.abc import Sequence
+import threading
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path, PureWindowsPath
 from typing import Any
@@ -24,14 +24,34 @@ LUA_TOKEN = 0x04
 WRITE_RESTRICTED = 0x08
 RESTRICTED_TOKEN_FLAGS = DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED
 GENERIC_ALL = 0x10000000
+GENERIC_READ = 0x80000000
 GENERIC_WRITE = 0x40000000
 DELETE = 0x00010000
 FILE_DELETE_CHILD = 0x00000040
 FILE_APPEND_DATA = 0x00000004
+FILE_GENERIC_READ = 0x00120089
 FILE_GENERIC_WRITE = 0x00120116
+FILE_GENERIC_EXECUTE = 0x001200A0
 FILE_WRITE_ATTRIBUTES = 0x00000100
 FILE_WRITE_DATA = 0x00000002
 FILE_WRITE_EA = 0x00000010
+INHERIT_ONLY_ACE_FLAG = 0x08
+INHERITED_ACE_FLAG = 0x10
+FILE_MUTATION_DENY_MASK = (
+    FILE_WRITE_DATA
+    | FILE_APPEND_DATA
+    | FILE_WRITE_EA
+    | FILE_WRITE_ATTRIBUTES
+    | DELETE
+    | FILE_DELETE_CHILD
+)
+FILE_WRITE_DENY_MASK = FILE_MUTATION_DENY_MASK | FILE_GENERIC_WRITE | GENERIC_WRITE
+FILE_READ_DENY_MASK = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | GENERIC_READ
+MANAGED_DENY_MASK = FILE_WRITE_DENY_MASK | FILE_READ_DENY_MASK
+WRITE_DAC = 0x00040000
+MANAGED_ALLOW_MASK = (
+    FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE | WRITE_DAC
+)
 TOKEN_ASSIGN_PRIMARY = 0x0001
 TOKEN_DUPLICATE = 0x0002
 TOKEN_QUERY = 0x0008
@@ -48,7 +68,7 @@ SEM_FAILCRITICALERRORS = 0x0001
 SEM_NOGPFAULTERRORBOX = 0x0002
 SEM_NOOPENFILEERRORBOX = 0x8000
 OFFLINE_PAYLOAD_ENV = "OPENSQUILLA_WINDOWS_DEFAULT_PAYLOAD"
-OFFLINE_PAYLOAD_FILE_ARG = "--payload-file"
+OFFLINE_PAYLOAD_STDIN_ARG = "--payload-stdin"
 _ICMP_TOOL_NAMES = frozenset(
     {
         "ping",
@@ -104,6 +124,13 @@ class HelperPayload:
     offline_child: bool = False
 
 
+@dataclass(frozen=True)
+class OfflineLaunchCredentials:
+    sid: str
+    username: str
+    password: str
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     args = list(sys.argv[1:] if argv is None else argv)
     try:
@@ -125,11 +152,11 @@ def _parse_payload(args: Sequence[str]) -> HelperPayload:
         if not env_payload:
             raise SystemExit("windows_default runner payload env is missing")
         raw_payload = env_payload
-    elif len(args) == 2 and args[0] == OFFLINE_PAYLOAD_FILE_ARG:
+    elif list(args) == [OFFLINE_PAYLOAD_STDIN_ARG]:
         try:
-            raw_payload = Path(args[1]).read_text(encoding="utf-8")
-        except OSError as exc:
-            raise SystemExit(f"windows_default runner payload file is unreadable: {exc}") from exc
+            raw_payload = sys.stdin.buffer.read().decode("utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise SystemExit(f"windows_default runner payload stdin is unreadable: {exc}") from exc
     elif len(args) == 1:
         raw_payload = args[0]
     else:
@@ -179,13 +206,9 @@ def _parse_payload(args: Sequence[str]) -> HelperPayload:
         try:
             stdin = base64.b64decode(stdin_raw.encode("ascii"), validate=True)
         except (ValueError, UnicodeEncodeError) as exc:
-            raise SystemExit(
-                "invalid windows_default payload: stdinBase64 is invalid"
-            ) from exc
+            raise SystemExit("invalid windows_default payload: stdinBase64 is invalid") from exc
     else:
-        raise SystemExit(
-            "invalid windows_default payload: stdinBase64 must be a string or null"
-        )
+        raise SystemExit("invalid windows_default payload: stdinBase64 must be a string or null")
     offline_child = raw.get("offlineChild", False)
     if not isinstance(offline_child, bool):
         raise SystemExit("invalid windows_default payload: offlineChild must be boolean")
@@ -215,19 +238,13 @@ def _validate_network_proxy(policy: dict[str, Any]) -> None:
     if proxy is None:
         proxy = policy.get("networkProxy")
     if not isinstance(proxy, dict):
-        raise SystemExit(
-            "windows_default PROXY_ALLOWLIST requires network_proxy endpoint"
-        )
+        raise SystemExit("windows_default PROXY_ALLOWLIST requires network_proxy endpoint")
     host = proxy.get("host")
     port = proxy.get("port")
     if host not in {"127.0.0.1", "localhost", "::1"}:
-        raise SystemExit(
-            "windows_default PROXY_ALLOWLIST requires a local network_proxy host"
-        )
+        raise SystemExit("windows_default PROXY_ALLOWLIST requires a local network_proxy host")
     if not isinstance(port, int) or not (1 <= port <= 65535):
-        raise SystemExit(
-            "windows_default PROXY_ALLOWLIST requires a valid network_proxy port"
-        )
+        raise SystemExit("windows_default PROXY_ALLOWLIST requires a valid network_proxy port")
     _validate_windows_network_boundary(policy)
 
 
@@ -256,10 +273,39 @@ def _validate_windows_network_boundary(policy: dict[str, Any]) -> None:
 def _run_windows_default(payload: HelperPayload) -> int:
     _reject_proxy_allowlist_icmp_commands(payload)
     acl_plan = _windows_acl_plan(payload.policy)
+    if payload.offline_child:
+        boundary = _network_boundary(payload.policy)
+        if boundary is None:
+            raise OSError("windowsNetworkBoundary missing for offline identity launch")
+        from opensquilla.sandbox.backend.windows_default_identity import (
+            offline_identity_from_boundary,
+        )
+
+        offline_identity_from_boundary(boundary)
+        return _run_windows_default_with_acl_lease(payload, acl_plan, credentials=None)
+    credentials = _resolve_offline_launch_credentials(payload)
+    with _windows_acl_execution_lease():
+        return _run_windows_default_with_acl_lease(
+            payload,
+            acl_plan,
+            credentials=credentials,
+        )
+
+
+def _run_windows_default_with_acl_lease(
+    payload: HelperPayload,
+    acl_plan: dict[str, Any],
+    *,
+    credentials: OfflineLaunchCredentials | None,
+) -> int:
     capability_sids = _capability_sids(acl_plan)
     if _should_reexec_as_offline_identity(payload):
-        _apply_acl_refresh(acl_plan, apply_deny_write=False)
-        return _run_payload_as_offline_identity(payload)
+        if credentials is None:
+            raise SystemExit("windows_default offline identity credentials are missing")
+        _prepare_deny_acl_targets(acl_plan)
+        _apply_acl_refresh(acl_plan)
+        return _run_payload_as_offline_identity(payload, credentials=credentials)
+    _prepare_deny_acl_targets(acl_plan)
     if not payload.offline_child:
         _apply_acl_refresh(acl_plan)
     return _run_restricted_process_native(payload, capability_sids)
@@ -325,6 +371,23 @@ def _windows_acl_plan(policy: dict[str, Any]) -> dict[str, Any]:
     auto_grants = plan.get("autoGrants")
     if not isinstance(auto_grants, list):
         raise SystemExit("invalid windows_default policy: autoGrants must be a list")
+    for grant in auto_grants:
+        if not isinstance(grant, dict):
+            raise SystemExit("invalid windows_default ACL grant: grant must be an object")
+        path = grant.get("path")
+        access = grant.get("access")
+        sid = grant.get("capabilitySid")
+        kind = grant.get("kind", "required")
+        if (
+            not isinstance(path, str)
+            or not path
+            or not Path(path).is_absolute()
+            or access not in {"RX", "RWX"}
+            or not isinstance(sid, str)
+            or not sid
+            or kind not in {"required", "policy", "expansion"}
+        ):
+            raise SystemExit("invalid windows_default ACL grant shape")
     capability_sids = plan.get("capabilitySids")
     if not isinstance(capability_sids, list) or not all(
         isinstance(sid, str) for sid in capability_sids
@@ -332,17 +395,50 @@ def _windows_acl_plan(policy: dict[str, Any]) -> dict[str, Any]:
         raise SystemExit("invalid windows_default policy: capabilitySids must be a string list")
     deny_write_paths = plan.get("denyWritePaths", [])
     if not isinstance(deny_write_paths, list) or not all(
-        isinstance(path, str) for path in deny_write_paths
+        isinstance(path, str) and path and Path(path).is_absolute() for path in deny_write_paths
     ):
         raise SystemExit("invalid windows_default policy: denyWritePaths must be a string list")
+    deny_read_paths = plan.get("denyReadPaths", [])
+    if not isinstance(deny_read_paths, list) or not all(
+        isinstance(path, str) and path and Path(path).is_absolute() for path in deny_read_paths
+    ):
+        raise SystemExit("invalid windows_default policy: denyReadPaths must be a string list")
     grant_current_user_access = plan.get("grantCurrentUserAccess", False)
     if not isinstance(grant_current_user_access, bool):
         raise SystemExit("invalid windows_default policy: grantCurrentUserAccess must be boolean")
+    state_path = _trusted_deny_acl_state_path(plan)
     return {
         **plan,
         "denyWritePaths": deny_write_paths,
+        "denyReadPaths": deny_read_paths,
+        "denyAclStatePath": str(state_path),
         "grantCurrentUserAccess": grant_current_user_access,
     }
+
+
+def _default_deny_acl_state_path() -> Path:
+    from opensquilla.sandbox.backend.windows_default_setup import (
+        default_setup_marker_path,
+    )
+
+    return default_setup_marker_path().with_name("deny_acl_state.json")
+
+
+def _default_allow_acl_state_path() -> Path:
+    return _default_deny_acl_state_path().with_name("allow_acl_state.json")
+
+
+def _trusted_deny_acl_state_path(plan: dict[str, Any]) -> Path:
+    expected = _default_deny_acl_state_path().expanduser().resolve(strict=False)
+    raw = plan.get("denyAclStatePath")
+    if raw is None:
+        return expected
+    if not isinstance(raw, str) or not raw:
+        raise SystemExit("invalid windows_default policy: denyAclStatePath must be a string")
+    supplied = Path(raw).expanduser().resolve(strict=False)
+    if _acl_path_key(supplied) != _acl_path_key(expected):
+        raise SystemExit("invalid windows_default policy: denyAclStatePath is not trusted")
+    return expected
 
 
 def _capability_sids(plan: dict[str, Any]) -> tuple[str, ...]:
@@ -350,6 +446,8 @@ def _capability_sids(plan: dict[str, Any]) -> tuple[str, ...]:
 
 
 def _apply_acl_refresh(plan: dict[str, Any], *, apply_deny_write: bool = True) -> None:
+    if apply_deny_write:
+        _prepare_deny_acl_targets(plan, include_read=False)
     normal_access_sid = (
         _current_token_user_sid_string() if plan.get("grantCurrentUserAccess") else None
     )
@@ -372,23 +470,55 @@ def _apply_acl_refresh(plan: dict[str, Any], *, apply_deny_write: bool = True) -
                 continue
             normal_access_seen.add(key)
             _grant_path_to_sid(grant_path, "HOST_RWX", normal_access_sid)
-    deny_write_paths = plan.get("denyWritePaths", []) if apply_deny_write else []
-    if deny_write_paths and not plan.get("capabilitySids"):
-        raise SystemExit("invalid windows_default ACL plan: denyWritePaths require capabilitySids")
-    seen: set[tuple[str, str]] = set()
-    for raw_path in deny_write_paths:
-        if not isinstance(raw_path, str):
-            raise SystemExit("invalid windows_default ACL deny-write path")
-        deny_path = Path(raw_path)
-        if not deny_path.exists():
-            raise SystemExit(f"windows_default ACL deny-write target does not exist: {deny_path}")
-        path_key = str(deny_path.resolve(strict=False)).casefold()
-        for sid in _deny_write_capability_sids_for_path(plan, deny_path):
-            key = (path_key, sid)
-            if key in seen:
-                continue
-            seen.add(key)
-            _deny_write_path_to_sid(deny_path, sid)
+    if apply_deny_write and "denyAclStatePath" in plan:
+        state_path = Path(str(plan["denyAclStatePath"]))
+        for sid in _capability_sids(plan):
+            _sync_deny_acl_state(
+                state_path,
+                sid,
+                _capability_write_deny_entries(plan, sid),
+            )
+
+
+def _prepare_deny_acl_targets(
+    plan: dict[str, Any],
+    *,
+    include_read: bool = True,
+) -> tuple[Path, ...]:
+    keys = ["denyWritePaths"]
+    if include_read:
+        keys.append("denyReadPaths")
+    paths: list[Path] = []
+    for key in keys:
+        raw_paths = plan.get(key, [])
+        if not isinstance(raw_paths, list) or not all(
+            isinstance(raw, str) and raw for raw in raw_paths
+        ):
+            raise SystemExit(f"invalid windows_default ACL {key} shape")
+        paths.extend(Path(raw).expanduser().absolute() for raw in raw_paths)
+    unique = _dedupe_acl_paths(paths)
+    for path in unique:
+        if path.exists():
+            continue
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise SystemExit(
+                f"windows_default ACL deny target could not be materialized: {path}: {exc}"
+            ) from exc
+    return unique
+
+
+def _capability_write_deny_entries(
+    plan: dict[str, Any],
+    sid: str,
+) -> dict[Path, int]:
+    desired: dict[Path, int] = {}
+    for raw_path in plan.get("denyWritePaths", []):
+        deny_path = Path(str(raw_path)).expanduser().absolute()
+        if sid in _deny_write_capability_sids_for_path(plan, deny_path):
+            desired[deny_path] = FILE_WRITE_DENY_MASK
+    return desired
 
 
 def _deny_write_capability_sids_for_path(plan: dict[str, Any], deny_path: Path) -> tuple[str, ...]:
@@ -403,22 +533,51 @@ def _deny_write_capability_sids_for_path(plan: dict[str, Any], deny_path: Path) 
     matching = [
         sid
         for root, sid in write_grants
-        if _paths_overlap_casefold(root.resolve(strict=False), deny_path.resolve(strict=False))
+        if _path_contains_casefold(root.resolve(strict=False), deny_path.resolve(strict=False))
     ]
-    selected = matching or [sid for _root, sid in write_grants]
-    if not selected:
-        selected = [str(sid) for sid in plan.get("capabilitySids", [])[:1]]
-    return tuple(dict.fromkeys(selected))
-
-
-def _paths_overlap_casefold(left: Path, right: Path) -> bool:
-    return _path_contains_casefold(left, right) or _path_contains_casefold(right, left)
+    return tuple(dict.fromkeys(matching))
 
 
 def _path_contains_casefold(root: Path, candidate: Path) -> bool:
-    root_text = str(root).replace("\\", "/").rstrip("/").casefold()
-    candidate_text = str(candidate).replace("\\", "/").rstrip("/").casefold()
+    root_text = _acl_path_key(root)
+    candidate_text = _acl_path_key(candidate)
     return candidate_text == root_text or candidate_text.startswith(root_text + "/")
+
+
+def _acl_path_key(path: Path) -> str:
+    return str(path).replace("\\", "/").rstrip("/").casefold()
+
+
+def _dedupe_acl_paths(paths: Sequence[Path]) -> tuple[Path, ...]:
+    result: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = _acl_path_key(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(path)
+    return tuple(result)
+
+
+def _ace_mask_covers(existing_mask: int, required_mask: int) -> bool:
+    return existing_mask & required_mask == required_mask
+
+
+def _explicit_allow_ace_status(
+    *,
+    ace_mask: int,
+    ace_flags: int,
+    required_mask: int,
+    cleanup_legacy_delete_child: bool,
+) -> tuple[bool, bool]:
+    if ace_flags & (INHERIT_ONLY_ACE_FLAG | INHERITED_ACE_FLAG):
+        return False, False
+    unsafe_managed_legacy = cleanup_legacy_delete_child and bool(ace_mask & FILE_DELETE_CHILD)
+    return (
+        not unsafe_managed_legacy and _ace_mask_covers(ace_mask, required_mask),
+        unsafe_managed_legacy,
+    )
 
 
 def _network_boundary(policy: dict[str, Any]) -> dict[str, object] | None:
@@ -434,7 +593,9 @@ def _should_reexec_as_offline_identity(payload: HelperPayload) -> bool:
     )
 
 
-def _run_payload_as_offline_identity(payload: HelperPayload) -> int:
+def _resolve_offline_launch_credentials(
+    payload: HelperPayload,
+) -> OfflineLaunchCredentials:
     boundary = _network_boundary(payload.policy)
     if boundary is None:
         raise OSError("windowsNetworkBoundary missing for offline identity launch")
@@ -444,16 +605,36 @@ def _run_payload_as_offline_identity(payload: HelperPayload) -> int:
     )
 
     identity = offline_identity_from_boundary(boundary)
-    acl_plan = _windows_acl_plan(payload.policy)
-    _cleanup_offline_identity_launch_acl(identity.sid, acl_plan)
-    _grant_offline_helper_runtime_access(identity.sid)
-    _grant_acl_plan_to_sid(acl_plan, identity.sid)
-    _apply_offline_identity_runtime_write_denies(identity.sid, acl_plan)
     password = unprotect_password(identity.protected_password)
-    return _run_payload_as_offline_identity_native(
-        replace(payload, offline_child=True),
+    return OfflineLaunchCredentials(
+        sid=identity.sid,
         username=identity.username,
         password=password,
+    )
+
+
+def _run_payload_as_offline_identity(
+    payload: HelperPayload,
+    *,
+    credentials: OfflineLaunchCredentials | None = None,
+) -> int:
+    launch = credentials or _resolve_offline_launch_credentials(payload)
+    acl_plan = _windows_acl_plan(payload.policy)
+    _prepare_deny_acl_targets(acl_plan)
+    _sync_deny_acl_state(
+        Path(str(acl_plan["denyAclStatePath"])),
+        launch.sid,
+        _offline_identity_deny_entries(acl_plan),
+    )
+    _sync_allow_acl_state(
+        _default_allow_acl_state_path(),
+        launch.sid,
+        _offline_identity_allow_entries(acl_plan),
+    )
+    return _run_payload_as_offline_identity_native(
+        replace(payload, offline_child=True),
+        username=launch.username,
+        password=launch.password,
     )
 
 
@@ -572,9 +753,7 @@ def _grant_path_to_sid(path: Path, access: str, sid: str) -> None:
     try:
         _grant_path_to_sid_native(path, access, sid)
     except OSError as exc:
-        raise SystemExit(
-            f"windows_default ACL grant failed for {path}: {exc}"
-        ) from exc
+        raise SystemExit(f"windows_default ACL grant failed for {path}: {exc}") from exc
 
 
 def _grant_path_to_sid_native(path: Path, access: str, sid: str) -> None:
@@ -659,6 +838,8 @@ def _grant_path_to_sid_native(path: Path, access: str, sid: str) -> None:
     advapi32.GetAclInformation.restype = wintypes.BOOL
     advapi32.GetAce.argtypes = [LPVOID, DWORD, ctypes.POINTER(LPVOID)]
     advapi32.GetAce.restype = wintypes.BOOL
+    advapi32.DeleteAce.argtypes = [LPVOID, DWORD]
+    advapi32.DeleteAce.restype = wintypes.BOOL
     advapi32.EqualSid.argtypes = [LPVOID, LPVOID]
     advapi32.EqualSid.restype = wintypes.BOOL
     kernel32.LocalFree.argtypes = [LPVOID]
@@ -672,14 +853,12 @@ def _grant_path_to_sid_native(path: Path, access: str, sid: str) -> None:
     TRUSTEE_IS_SID = 0
     TRUSTEE_IS_UNKNOWN = 0
     ACCESS_ALLOWED_ACE_TYPE = 0
-    INHERIT_ONLY_ACE = 0x08
     NO_INHERITANCE = 0
     OBJECT_INHERIT_ACE = 0x1
     CONTAINER_INHERIT_ACE = 0x2
 
     DELETE = 0x00010000
     WRITE_DAC = 0x00040000
-    FILE_DELETE_CHILD = 0x00000040
     FILE_GENERIC_READ = 0x00120089
     FILE_GENERIC_WRITE = 0x00120116
     FILE_GENERIC_EXECUTE = 0x001200A0
@@ -688,9 +867,11 @@ def _grant_path_to_sid_native(path: Path, access: str, sid: str) -> None:
         error_code = ctypes.get_last_error() if code is None else code
         return OSError(error_code, f"{label} failed: {ctypes.FormatError(error_code)}")
 
-    def dacl_allows_mask_for_sid(dacl: object, sid_to_check: object, mask: int) -> bool:
+    def explicit_allow_status(
+        dacl: object, sid_to_check: object, mask: int
+    ) -> tuple[bool, tuple[int, ...]]:
         if not dacl:
-            return False
+            return False, ()
         info = ACL_SIZE_INFORMATION()
         if not advapi32.GetAclInformation(
             dacl,
@@ -698,7 +879,9 @@ def _grant_path_to_sid_native(path: Path, access: str, sid: str) -> None:
             ctypes.sizeof(info),
             ACL_SIZE_INFORMATION_CLASS,
         ):
-            return False
+            return False, ()
+        covers = False
+        unsafe_indices: list[int] = []
         for index in range(int(info.AceCount)):
             ace_ptr = LPVOID()
             if not advapi32.GetAce(dacl, index, ctypes.byref(ace_ptr)) or not ace_ptr:
@@ -706,25 +889,27 @@ def _grant_path_to_sid_native(path: Path, access: str, sid: str) -> None:
             header = ctypes.cast(ace_ptr, ctypes.POINTER(ACE_HEADER)).contents
             if header.AceType != ACCESS_ALLOWED_ACE_TYPE:
                 continue
-            if header.AceFlags & INHERIT_ONLY_ACE:
-                continue
             ace = ctypes.cast(ace_ptr, ctypes.POINTER(ACCESS_ALLOWED_ACE)).contents
             sid_ptr_value = int(ace_ptr.value) + ctypes.sizeof(ACE_HEADER) + ctypes.sizeof(DWORD)
             ace_sid = LPVOID(sid_ptr_value)
-            if advapi32.EqualSid(ace_sid, sid_to_check) and (ace.Mask & mask) == mask:
-                return True
-        return False
+            if not advapi32.EqualSid(ace_sid, sid_to_check):
+                continue
+            ace_covers, unsafe_legacy = _explicit_allow_ace_status(
+                ace_mask=int(ace.Mask),
+                ace_flags=int(header.AceFlags),
+                required_mask=mask,
+                cleanup_legacy_delete_child=access != "HOST_RWX",
+            )
+            if unsafe_legacy:
+                unsafe_indices.append(index)
+            elif ace_covers:
+                covers = True
+        return covers, tuple(unsafe_indices)
 
     if access == "RX":
         allow_mask = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE
     elif access in {"RWX", "HOST_RWX"}:
-        allow_mask = (
-            FILE_GENERIC_READ
-            | FILE_GENERIC_WRITE
-            | FILE_GENERIC_EXECUTE
-            | DELETE
-            | FILE_DELETE_CHILD
-        )
+        allow_mask = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE
         if access == "HOST_RWX":
             allow_mask |= WRITE_DAC
     else:
@@ -735,9 +920,7 @@ def _grant_path_to_sid_native(path: Path, access: str, sid: str) -> None:
     old_dacl = LPVOID()
     new_dacl = LPVOID()
     path_buffer = ctypes.create_unicode_buffer(str(path))
-    inheritance = (
-        OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE if path.is_dir() else NO_INHERITANCE
-    )
+    inheritance = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE if path.is_dir() else NO_INHERITANCE
 
     try:
         if not advapi32.ConvertStringSidToSidW(sid, ctypes.byref(sid_ptr)):
@@ -754,7 +937,11 @@ def _grant_path_to_sid_native(path: Path, access: str, sid: str) -> None:
         )
         if code != ERROR_SUCCESS:
             raise win32_error("GetNamedSecurityInfoW", code)
-        if dacl_allows_mask_for_sid(old_dacl, sid_ptr, allow_mask):
+        covers, unsafe_indices = explicit_allow_status(old_dacl, sid_ptr, allow_mask)
+        for index in reversed(unsafe_indices):
+            if not advapi32.DeleteAce(old_dacl, index):
+                raise win32_error("DeleteAce(unsafe FILE_DELETE_CHILD allow)")
+        if covers and not unsafe_indices:
             return
 
         explicit = EXPLICIT_ACCESS_W()
@@ -802,12 +989,34 @@ def _revoke_path_for_sid(path: Path, sid: str) -> None:
             return
         raise
     except OSError as exc:
-        raise SystemExit(
-            f"windows_default ACL revoke failed for {path}: {exc}"
-        ) from exc
+        raise SystemExit(f"windows_default ACL revoke failed for {path}: {exc}") from exc
 
 
-def _revoke_path_for_sid_native(path: Path, sid: str) -> None:
+def _revoke_allow_path_for_sid(path: Path, sid: str) -> None:
+    if not path.exists():
+        return
+    try:
+        _revoke_path_for_sid_native(
+            path,
+            sid,
+            ace_type=0,
+            blocking_mask=MANAGED_ALLOW_MASK,
+        )
+    except AttributeError:
+        if os.name != "nt":
+            return
+        raise
+    except OSError as exc:
+        raise SystemExit(f"windows_default ACL allow revoke failed for {path}: {exc}") from exc
+
+
+def _revoke_path_for_sid_native(
+    path: Path,
+    sid: str,
+    *,
+    ace_type: int = 1,
+    blocking_mask: int = MANAGED_DENY_MASK,
+) -> None:
     import ctypes
     from ctypes import wintypes
 
@@ -876,8 +1085,7 @@ def _revoke_path_for_sid_native(path: Path, sid: str) -> None:
     SE_FILE_OBJECT = 1
     DACL_SECURITY_INFORMATION = 0x00000004
     ACL_SIZE_INFORMATION_CLASS = 2
-    ACCESS_DENIED_ACE_TYPE = 1
-    blocking_deny_mask = FILE_GENERIC_WRITE | GENERIC_WRITE
+    INHERITED_ACE = 0x10
 
     def win32_error(label: str, code: int | None = None) -> OSError:
         error_code = ctypes.get_last_error() if code is None else code
@@ -919,14 +1127,12 @@ def _revoke_path_for_sid_native(path: Path, sid: str) -> None:
             if not advapi32.GetAce(old_dacl, index, ctypes.byref(ace_ptr)) or not ace_ptr:
                 continue
             header = ctypes.cast(ace_ptr, ctypes.POINTER(ACE_HEADER)).contents
-            if header.AceType != ACCESS_DENIED_ACE_TYPE:
+            if header.AceType != ace_type or header.AceFlags & INHERITED_ACE:
                 continue
             ace = ctypes.cast(ace_ptr, ctypes.POINTER(ACCESS_DENIED_ACE)).contents
             sid_ptr_value = int(ace_ptr.value) + ctypes.sizeof(ACE_HEADER) + ctypes.sizeof(DWORD)
             ace_sid = LPVOID(sid_ptr_value)
-            if not (
-                advapi32.EqualSid(ace_sid, sid_ptr) and (ace.Mask & blocking_deny_mask)
-            ):
+            if not (advapi32.EqualSid(ace_sid, sid_ptr) and (ace.Mask & blocking_mask)):
                 continue
             if not advapi32.DeleteAce(old_dacl, index):
                 raise win32_error("DeleteAce")
@@ -950,27 +1156,40 @@ def _revoke_path_for_sid_native(path: Path, sid: str) -> None:
                 kernel32.LocalFree(pointer)
 
 
+def _deny_read_path_to_sid(path: Path, sid: str) -> None:
+    _deny_path_to_sid(
+        path,
+        sid,
+        mask=FILE_READ_DENY_MASK,
+        label="deny-read",
+    )
+
+
 def _deny_write_path_to_sid(
     path: Path,
     sid: str,
     *,
     include_read_control: bool = True,
 ) -> None:
+    _deny_path_to_sid(
+        path,
+        sid,
+        mask=(FILE_WRITE_DENY_MASK if include_read_control else FILE_MUTATION_DENY_MASK),
+        label="deny-write",
+    )
+
+
+def _deny_path_to_sid(path: Path, sid: str, *, mask: int, label: str) -> None:
     if not path.exists():
-        raise SystemExit(f"windows_default ACL deny-write target does not exist: {path}")
+        raise SystemExit(f"windows_default ACL {label} target does not exist: {path}")
     try:
-        if include_read_control:
-            _deny_write_path_to_sid_native(path, sid)
-        else:
-            _deny_write_path_to_sid_native(path, sid, include_read_control=False)
+        _deny_path_to_sid_native(path, sid, mask=mask)
     except AttributeError:
         if os.name != "nt":
             return
         raise
     except OSError as exc:
-        raise SystemExit(
-            f"windows_default ACL deny-write failed for {path}: {exc}"
-        ) from exc
+        raise SystemExit(f"windows_default ACL {label} failed for {path}: {exc}") from exc
 
 
 def _deny_file_mutation_path_to_sid(path: Path, sid: str) -> None:
@@ -979,11 +1198,11 @@ def _deny_file_mutation_path_to_sid(path: Path, sid: str) -> None:
     _deny_write_path_to_sid(path, sid, include_read_control=False)
 
 
-def _deny_write_path_to_sid_native(
+def _deny_path_to_sid_native(
     path: Path,
     sid: str,
     *,
-    include_read_control: bool = True,
+    mask: int,
 ) -> None:
     import ctypes
     from ctypes import wintypes
@@ -1082,22 +1301,12 @@ def _deny_write_path_to_sid_native(
     INHERIT_ONLY_ACE = 0x08
     OBJECT_INHERIT_ACE = 0x1
     CONTAINER_INHERIT_ACE = 0x2
-    deny_mask = (
-        FILE_WRITE_DATA
-        | FILE_APPEND_DATA
-        | FILE_WRITE_EA
-        | FILE_WRITE_ATTRIBUTES
-        | DELETE
-        | FILE_DELETE_CHILD
-    )
-    if include_read_control:
-        deny_mask |= FILE_GENERIC_WRITE | GENERIC_WRITE
 
     def win32_error(label: str, code: int | None = None) -> OSError:
         error_code = ctypes.get_last_error() if code is None else code
         return OSError(error_code, f"{label} failed: {ctypes.FormatError(error_code)}")
 
-    def dacl_has_write_deny_for_sid(dacl: object, sid_to_check: object) -> bool:
+    def dacl_has_deny_for_sid(dacl: object, sid_to_check: object) -> bool:
         if not dacl:
             return False
         info = ACL_SIZE_INFORMATION()
@@ -1120,7 +1329,7 @@ def _deny_write_path_to_sid_native(
             ace = ctypes.cast(ace_ptr, ctypes.POINTER(ACCESS_DENIED_ACE)).contents
             sid_ptr_value = int(ace_ptr.value) + ctypes.sizeof(ACE_HEADER) + ctypes.sizeof(DWORD)
             ace_sid = LPVOID(sid_ptr_value)
-            if advapi32.EqualSid(ace_sid, sid_to_check) and (ace.Mask & deny_mask):
+            if advapi32.EqualSid(ace_sid, sid_to_check) and _ace_mask_covers(int(ace.Mask), mask):
                 return True
         return False
 
@@ -1145,11 +1354,11 @@ def _deny_write_path_to_sid_native(
         )
         if code != ERROR_SUCCESS:
             raise win32_error("GetNamedSecurityInfoW", code)
-        if dacl_has_write_deny_for_sid(old_dacl, sid_ptr):
+        if dacl_has_deny_for_sid(old_dacl, sid_ptr):
             return
 
         explicit = EXPLICIT_ACCESS_W()
-        explicit.grfAccessPermissions = deny_mask
+        explicit.grfAccessPermissions = mask
         explicit.grfAccessMode = DENY_ACCESS
         explicit.grfInheritance = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
         explicit.Trustee.pMultipleTrustee = None
@@ -1190,8 +1399,7 @@ def _environment_block(env: dict[str, str]) -> str:
         if value and key not in merged:
             merged[key] = value
     items = [
-        f"{key}={value}"
-        for key, value in sorted(merged.items(), key=lambda item: item[0].upper())
+        f"{key}={value}" for key, value in sorted(merged.items(), key=lambda item: item[0].upper())
     ]
     return "\0".join(items) + "\0\0"
 
@@ -1206,9 +1414,7 @@ def _payload_to_json(payload: HelperPayload) -> str:
         "runMode": payload.run_mode,
         "timeout": payload.timeout,
         "stdinBase64": (
-            base64.b64encode(payload.stdin).decode("ascii")
-            if payload.stdin is not None
-            else None
+            base64.b64encode(payload.stdin).decode("ascii") if payload.stdin is not None else None
         ),
         "offlineChild": payload.offline_child,
     }
@@ -1229,9 +1435,7 @@ def _helper_child_env() -> dict[str, str]:
     env.pop(OFFLINE_PAYLOAD_ENV, None)
     import_root = str(_helper_import_root())
     existing = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = (
-        import_root if not existing else f"{import_root}{os.pathsep}{existing}"
-    )
+    env["PYTHONPATH"] = import_root if not existing else f"{import_root}{os.pathsep}{existing}"
     return env
 
 
@@ -1270,51 +1474,482 @@ def _offline_helper_runtime_roots() -> tuple[Path, ...]:
     return tuple(unique)
 
 
-def _write_offline_payload_file(payload: HelperPayload) -> Path:
-    payload_dir = payload.cwd / ".opensquilla-cache" / "offline-helper"
-    payload_dir.mkdir(parents=True, exist_ok=True)
-    payload_path = payload_dir / f"payload-{os.getpid()}-{uuid.uuid4().hex}.json"
-    payload_path.write_text(_payload_to_json(payload), encoding="utf-8")
-    return payload_path
-
-
 def _grant_offline_helper_runtime_access(sid: str) -> None:
     for root in _offline_helper_runtime_roots():
         _grant_path_to_sid(root, "RX", sid)
 
 
-def _cleanup_offline_identity_launch_acl(sid: str, plan: dict[str, Any]) -> None:
-    paths: list[Path] = []
-    for root in _offline_helper_runtime_roots():
-        paths.extend(_path_and_parents(root))
-    for raw_path in plan.get("denyWritePaths", []):
-        if isinstance(raw_path, str):
-            paths.extend(_path_and_parents(Path(raw_path)))
+def _offline_identity_allow_entries(plan: dict[str, Any]) -> dict[Path, str]:
+    desired: dict[Path, str] = {
+        root.expanduser().absolute(): "RX" for root in _offline_helper_runtime_roots()
+    }
+    for grant in plan["autoGrants"]:
+        path = Path(str(grant["path"])).expanduser().absolute()
+        access = str(grant["access"])
+        if access == "RWX" or path not in desired:
+            desired[path] = access
+    return desired
 
-    seen: set[str] = set()
+
+def _sync_allow_acl_state(
+    state_path: Path,
+    sid: str,
+    desired: dict[Path, str],
+) -> None:
+    with _deny_acl_state_lock(state_path):
+        normalized = {
+            path.expanduser().absolute(): access
+            for path, access in desired.items()
+            if access in {"RX", "RWX"}
+        }
+        state = _read_allow_acl_state(state_path)
+        _recover_allow_acl_taint(state_path, state)
+        principals = state["principals"]
+        previous = {
+            Path(item["path"]).expanduser().absolute(): item["access"]
+            for item in principals.get(sid, [])
+        }
+        _mark_acl_state_tainted(
+            state_path,
+            kind="allow",
+            sid=sid,
+            paths=(*previous, *normalized),
+        )
+        try:
+            previous_by_key = {
+                _acl_path_key(path): (path, access) for path, access in previous.items()
+            }
+            desired_by_key = {
+                _acl_path_key(path): (path, access) for path, access in normalized.items()
+            }
+            for key, (path, access) in desired_by_key.items():
+                old = previous_by_key.get(key)
+                if old is not None and old[1] != access:
+                    _revoke_allow_path_for_sid(old[0], sid)
+                _grant_path_to_sid(path, access, sid)
+            for key, (path, _access) in previous_by_key.items():
+                if key not in desired_by_key:
+                    _revoke_allow_path_for_sid(path, sid)
+            updated = dict(principals)
+            updated[sid] = [
+                {"access": access, "path": str(path)} for path, access in normalized.items()
+            ]
+            _write_deny_acl_state(state_path, {"version": 1, "principals": updated})
+            _clear_acl_state_taint(state_path)
+        except (Exception, SystemExit) as exc:
+            restore_errors = _rollback_allow_acl_principal(
+                sid, previous=previous, desired=normalized
+            )
+            if not restore_errors:
+                _clear_acl_state_taint(state_path)
+            raise SystemExit(
+                f"windows_default ACL allow desired-state sync failed for {sid}: {exc}; "
+                f"rollback_errors={restore_errors!r}"
+            ) from exc
+
+
+def _read_allow_acl_state(state_path: Path) -> dict[str, Any]:
+    if not state_path.exists():
+        return {"version": 1, "principals": {}}
+    raw = json.loads(state_path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict) or raw.get("version") != 1:
+        raise SystemExit("invalid windows_default ACL allow desired-state format")
+    principals = raw.get("principals")
+    if not isinstance(principals, dict):
+        raise SystemExit("invalid windows_default ACL allow desired-state principals")
+    for sid, entries in principals.items():
+        if not isinstance(sid, str) or not isinstance(entries, list):
+            raise SystemExit("invalid windows_default ACL allow desired-state principals")
+        for item in entries:
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("path"), str)
+                or not Path(item["path"]).is_absolute()
+                or item.get("access") not in {"RX", "RWX"}
+            ):
+                raise SystemExit("invalid windows_default ACL allow desired-state entry")
+    return {"version": 1, "principals": principals}
+
+
+def _rollback_allow_acl_principal(
+    sid: str,
+    *,
+    previous: dict[Path, str],
+    desired: dict[Path, str],
+) -> tuple[str, ...]:
+    errors: list[str] = []
+    for path in (*desired, *previous):
+        try:
+            _revoke_allow_path_for_sid(path, sid)
+        except BaseException as exc:
+            errors.append(str(exc))
+    for path, access in previous.items():
+        try:
+            _grant_path_to_sid(path, access, sid)
+        except BaseException as exc:
+            errors.append(str(exc))
+    return tuple(errors)
+
+
+def _offline_identity_deny_entries(plan: dict[str, Any]) -> dict[Path, int]:
+    desired: dict[Path, int] = {}
+    for raw_path in plan.get("denyWritePaths", []):
+        path = Path(str(raw_path)).expanduser().absolute()
+        desired[path] = desired.get(path, 0) | FILE_MUTATION_DENY_MASK
+    for raw_path in plan.get("denyReadPaths", []):
+        path = Path(str(raw_path)).expanduser().absolute()
+        desired[path] = desired.get(path, 0) | FILE_READ_DENY_MASK
+    return desired
+
+
+def _sync_deny_acl_state(
+    state_path: Path,
+    sid: str,
+    desired: dict[Path, int],
+) -> None:
+    try:
+        with _deny_acl_state_lock(state_path):
+            _sync_deny_acl_state_locked(state_path, sid, desired)
+    except (OSError, TimeoutError) as exc:
+        raise SystemExit(
+            f"windows_default ACL desired-state lock failed: {state_path}: {exc}"
+        ) from exc
+
+
+def _sync_deny_acl_state_locked(
+    state_path: Path,
+    sid: str,
+    desired: dict[Path, int],
+) -> None:
+    if not sid:
+        raise SystemExit("windows_default ACL state sync requires a principal SID")
+    normalized_desired = _normalize_deny_acl_entries(desired)
+    state = _read_deny_acl_state(state_path)
+    _recover_deny_acl_taint(state_path, state)
+    _materialize_deny_paths(tuple(normalized_desired))
+    principals = state["principals"]
+    previous = _principal_deny_acl_entries(principals.get(sid, []), sid=sid)
+    previous_by_key = {_acl_path_key(path): (path, mask) for path, mask in previous.items()}
+    desired_by_key = {
+        _acl_path_key(path): (path, mask) for path, mask in normalized_desired.items()
+    }
+
+    _mark_acl_state_tainted(
+        state_path,
+        kind="deny",
+        sid=sid,
+        paths=(*previous, *normalized_desired),
+    )
+    try:
+        for key, (path, mask) in desired_by_key.items():
+            old = previous_by_key.get(key)
+            if old is not None and old[1] != mask:
+                _revoke_path_for_sid(old[0], sid)
+            _deny_path_to_sid(path, sid, mask=mask, label="desired-state")
+        for key, (path, _mask) in previous_by_key.items():
+            if key not in desired_by_key:
+                _revoke_path_for_sid(path, sid)
+
+        updated_principals = dict(principals)
+        if normalized_desired:
+            updated_principals[sid] = [
+                {"mask": mask, "path": str(path)} for path, mask in normalized_desired.items()
+            ]
+        else:
+            updated_principals.pop(sid, None)
+        _write_deny_acl_state(
+            state_path,
+            {"version": 1, "principals": updated_principals},
+        )
+        _clear_acl_state_taint(state_path)
+    except (Exception, SystemExit) as exc:
+        restore_errors = _rollback_deny_acl_principal(
+            sid,
+            previous=previous,
+            desired=normalized_desired,
+        )
+        if not restore_errors:
+            _clear_acl_state_taint(state_path)
+        raise SystemExit(
+            f"windows_default ACL desired-state sync failed for {sid}: {exc}; "
+            f"rollback_errors={restore_errors!r}"
+        ) from exc
+
+
+@contextmanager
+def _deny_acl_state_lock(state_path: Path) -> Iterator[None]:
+    lock_path = state_path.with_name(f".{state_path.name}.lock")
+    with _cross_process_file_lock(lock_path):
+        yield
+
+
+def _default_execution_lease_path() -> Path:
+    return _default_deny_acl_state_path().with_name("execution.lock")
+
+
+@contextmanager
+def _windows_acl_execution_lease() -> Iterator[None]:
+    with _cross_process_file_lock(_default_execution_lease_path()):
+        yield
+
+
+@contextmanager
+def _cross_process_file_lock(lock_path: Path) -> Iterator[None]:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as stream:
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
+            stream.write(b"\0")
+            stream.flush()
+        stream.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def _normalize_deny_acl_entries(desired: dict[Path, int]) -> dict[Path, int]:
+    normalized: dict[str, tuple[Path, int]] = {}
+    for raw_path, mask in desired.items():
+        if (
+            not isinstance(raw_path, Path)
+            or not isinstance(mask, int)
+            or mask <= 0
+            or mask & ~MANAGED_DENY_MASK
+        ):
+            raise SystemExit("invalid windows_default ACL desired-state entry")
+        path = raw_path.expanduser().absolute()
+        key = _acl_path_key(path)
+        previous = normalized.get(key)
+        normalized[key] = (path, mask | (previous[1] if previous else 0))
+    return {path: mask for path, mask in normalized.values()}
+
+
+def _materialize_deny_paths(paths: Sequence[Path]) -> None:
     for path in paths:
-        if not path.exists():
+        if path.exists():
             continue
-        key = str(path.resolve(strict=False)).casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        _revoke_path_for_sid(path, sid)
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise SystemExit(
+                f"windows_default ACL deny target could not be materialized: {path}: {exc}"
+            ) from exc
 
 
-def _apply_offline_identity_runtime_write_denies(sid: str, plan: dict[str, Any]) -> None:
-    seen: set[str] = set()
-    for raw_path in plan.get("denyWritePaths", []):
-        if not isinstance(raw_path, str):
-            continue
-        path = Path(raw_path)
-        if not path.exists():
-            continue
-        key = str(path.resolve(strict=False)).casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        _deny_file_mutation_path_to_sid(path, sid)
+def _read_deny_acl_state(state_path: Path) -> dict[str, Any]:
+    if not state_path.exists():
+        return {"version": 1, "principals": {}}
+    try:
+        raw = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(
+            f"windows_default ACL desired-state is unreadable: {state_path}: {exc}"
+        ) from exc
+    if not isinstance(raw, dict) or raw.get("version") != 1:
+        raise SystemExit("invalid windows_default ACL desired-state format")
+    principals = raw.get("principals")
+    if not isinstance(principals, dict) or not all(
+        isinstance(key, str) and isinstance(value, list) for key, value in principals.items()
+    ):
+        raise SystemExit("invalid windows_default ACL desired-state principals")
+    for principal, entries in principals.items():
+        _principal_deny_acl_entries(entries, sid=principal)
+    return {"version": 1, "principals": principals}
+
+
+def _principal_deny_acl_entries(
+    raw_entries: object,
+    *,
+    sid: str,
+) -> dict[Path, int]:
+    if not isinstance(raw_entries, list):
+        raise SystemExit(f"invalid windows_default ACL desired-state entries for {sid}")
+    result: dict[Path, int] = {}
+    for entry in raw_entries:
+        if not isinstance(entry, dict):
+            raise SystemExit(f"invalid windows_default ACL desired-state entry for {sid}")
+        raw_path = entry.get("path")
+        mask = entry.get("mask")
+        if (
+            not isinstance(raw_path, str)
+            or not raw_path
+            or not Path(raw_path).is_absolute()
+            or not isinstance(mask, int)
+        ):
+            raise SystemExit(f"invalid windows_default ACL desired-state entry for {sid}")
+        result[Path(raw_path).expanduser().absolute()] = mask
+    return _normalize_deny_acl_entries(result)
+
+
+def _write_deny_acl_state(state_path: Path, state: dict[str, Any]) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = state_path.with_name(f".{state_path.name}.tmp")
+    try:
+        with temp_path.open("w", encoding="utf-8") as stream:
+            stream.write(json.dumps(state, indent=2, sort_keys=True) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, state_path)
+        _fsync_parent_directory(state_path)
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _acl_state_taint_path(state_path: Path) -> Path:
+    return state_path.with_name(f"{state_path.name}.tainted")
+
+
+def _mark_acl_state_tainted(
+    state_path: Path,
+    *,
+    kind: str,
+    sid: str,
+    paths: Sequence[Path],
+) -> None:
+    if kind not in {"allow", "deny"} or not sid:
+        raise SystemExit("invalid windows_default ACL taint intent")
+    unique_paths = _dedupe_acl_paths(tuple(path.expanduser().absolute() for path in paths))
+    taint_path = _acl_state_taint_path(state_path)
+    _write_deny_acl_state(
+        taint_path,
+        {
+            "version": 1,
+            "kind": kind,
+            "sid": sid,
+            "paths": [str(path) for path in unique_paths],
+        },
+    )
+
+
+def _clear_acl_state_taint(state_path: Path) -> None:
+    _acl_state_taint_path(state_path).unlink(missing_ok=True)
+    _fsync_parent_directory(state_path)
+
+
+def _read_acl_taint_intent(state_path: Path) -> dict[str, Any] | None:
+    path = _acl_state_taint_path(state_path)
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(
+            f"windows_default ACL taint intent is unreadable and remains fail-closed: {path}"
+        ) from exc
+    if (
+        not isinstance(raw, dict)
+        or raw.get("version") != 1
+        or raw.get("kind") not in {"allow", "deny"}
+        or not isinstance(raw.get("sid"), str)
+        or not raw["sid"]
+        or not isinstance(raw.get("paths"), list)
+        or not all(
+            isinstance(item, str) and item and Path(item).is_absolute() for item in raw["paths"]
+        )
+    ):
+        raise SystemExit(
+            f"windows_default ACL taint intent is invalid and remains fail-closed: {path}"
+        )
+    return raw
+
+
+def _recover_allow_acl_taint(state_path: Path, state: dict[str, Any]) -> None:
+    intent = _read_acl_taint_intent(state_path)
+    if intent is None:
+        return
+    if intent["kind"] != "allow":
+        raise SystemExit("windows_default ACL taint kind does not match allow state")
+    sid = str(intent["sid"])
+    persisted = {
+        Path(item["path"]).expanduser().absolute(): str(item["access"])
+        for item in state["principals"].get(sid, [])
+    }
+    paths = _dedupe_acl_paths(
+        tuple(Path(item).expanduser().absolute() for item in intent["paths"]) + tuple(persisted)
+    )
+    try:
+        for path in paths:
+            _revoke_allow_path_for_sid(path, sid)
+        for path, access in persisted.items():
+            _grant_path_to_sid(path, access, sid)
+    except BaseException as exc:
+        raise SystemExit(
+            f"windows_default ACL allow taint repair failed and remains fail-closed: {exc}"
+        ) from exc
+    _clear_acl_state_taint(state_path)
+
+
+def _recover_deny_acl_taint(state_path: Path, state: dict[str, Any]) -> None:
+    intent = _read_acl_taint_intent(state_path)
+    if intent is None:
+        return
+    if intent["kind"] != "deny":
+        raise SystemExit("windows_default ACL taint kind does not match deny state")
+    sid = str(intent["sid"])
+    persisted = _principal_deny_acl_entries(state["principals"].get(sid, []), sid=sid)
+    paths = _dedupe_acl_paths(
+        tuple(Path(item).expanduser().absolute() for item in intent["paths"]) + tuple(persisted)
+    )
+    try:
+        for path in paths:
+            _revoke_path_for_sid(path, sid)
+        for path, mask in persisted.items():
+            _deny_path_to_sid(path, sid, mask=mask, label="taint-repair")
+    except BaseException as exc:
+        raise SystemExit(
+            f"windows_default ACL deny taint repair failed and remains fail-closed: {exc}"
+        ) from exc
+    _clear_acl_state_taint(state_path)
+
+
+def _fsync_parent_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    try:
+        descriptor = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _rollback_deny_acl_principal(
+    sid: str,
+    *,
+    previous: dict[Path, int],
+    desired: dict[Path, int],
+) -> tuple[str, ...]:
+    errors: list[str] = []
+    for path in (*desired, *previous):
+        try:
+            _revoke_path_for_sid(path, sid)
+        except BaseException as exc:
+            errors.append(str(exc))
+    for path, mask in previous.items():
+        try:
+            _deny_path_to_sid(path, sid, mask=mask, label="rollback")
+        except BaseException as exc:
+            errors.append(str(exc))
+    return tuple(errors)
 
 
 def _path_and_parents(path: Path) -> tuple[Path, ...]:
@@ -1370,11 +2005,109 @@ def _restricted_process_application_name(argv: Sequence[str]) -> str | None:
 
 
 def _offline_helper_creation_flags() -> int:
-    return CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW
+    return CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW
 
 
 def _restricted_process_startup_flags() -> int:
     return STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW
+
+
+def _clear_handle_inheritance(kernel32: object, handle: object, label: str) -> None:
+    if not kernel32.SetHandleInformation(handle, 0x00000001, 0):
+        raise OSError(f"SetHandleInformation({label}) failed")
+
+
+def _require_reader_threads_stopped(
+    threads: Sequence[threading.Thread],
+    *,
+    label: str,
+) -> None:
+    if any(thread.is_alive() for thread in threads):
+        raise OSError(f"{label} pipe reader did not terminate")
+
+
+def _start_child_stdin_writer(
+    kernel32: object,
+    stdin_write: object,
+    stdin: bytes | None,
+    *,
+    on_error: Callable[[], None],
+) -> tuple[threading.Thread, list[BaseException], Callable[[], None]]:
+    errors: list[BaseException] = []
+    close_lock = threading.Lock()
+    closed = False
+
+    def close_once() -> None:
+        nonlocal closed
+        with close_lock:
+            if not closed:
+                closed = True
+                kernel32.CloseHandle(stdin_write)
+
+    def write() -> None:
+        try:
+            _write_child_stdin(kernel32, stdin_write, stdin, close_handle=False)
+        except BaseException as exc:
+            errors.append(exc)
+            on_error()
+        finally:
+            close_once()
+
+    thread = threading.Thread(target=write, daemon=True)
+    thread.start()
+    return thread, errors, close_once
+
+
+def _finish_child_io(
+    *,
+    writer_thread: threading.Thread,
+    reader_threads: Sequence[threading.Thread],
+    writer_errors: Sequence[BaseException],
+    close_writer: Callable[[], None],
+    label: str,
+    terminate: Callable[[], None],
+    cancel_io: Callable[[], None] | None = None,
+    force_cancel: bool = False,
+    ignore_writer_errors: bool = False,
+) -> None:
+    cancelled = False
+
+    def cancel_and_close() -> None:
+        nonlocal cancelled
+        terminate()
+        if cancel_io is not None:
+            cancel_io()
+        close_writer()
+        cancelled = True
+
+    if force_cancel:
+        cancel_and_close()
+    writer_thread.join(timeout=5)
+    if writer_errors and not cancelled:
+        cancel_and_close()
+    for thread in reader_threads:
+        thread.join(timeout=5)
+    if writer_thread.is_alive() or any(thread.is_alive() for thread in reader_threads):
+        cancel_and_close()
+        writer_thread.join(timeout=1)
+        for thread in reader_threads:
+            thread.join(timeout=1)
+    if writer_thread.is_alive() or any(thread.is_alive() for thread in reader_threads):
+        raise OSError(f"{label} pipe I/O thread did not terminate")
+    if writer_errors and not ignore_writer_errors:
+        if not cancelled:
+            cancel_and_close()
+        raise OSError(f"{label} stdin writer failed: {writer_errors[0]}") from writer_errors[0]
+
+
+def _cancel_child_pipe_io(kernel32: object, handles: Sequence[object]) -> None:
+    cancel = getattr(kernel32, "CancelIoEx", None)
+    if cancel is None:
+        return
+    for handle in handles:
+        raw_handle = getattr(handle, "value", handle)
+        if raw_handle:
+            cancel(handle, None)
 
 
 def _run_payload_as_offline_identity_native(
@@ -1436,6 +2169,42 @@ def _run_payload_as_offline_identity_native(
             ("dwThreadId", DWORD),
         ]
 
+    class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", DWORD),
+            ("SchedulingClass", DWORD),
+        ]
+
+    class IO_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            (name, ctypes.c_uint64)
+            for name in (
+                "ReadOperationCount",
+                "WriteOperationCount",
+                "OtherOperationCount",
+                "ReadTransferCount",
+                "WriteTransferCount",
+                "OtherTransferCount",
+            )
+        ]
+
+    class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo", IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
     advapi32.CreateProcessWithLogonW.argtypes = [
         wintypes.LPCWSTR,
         wintypes.LPCWSTR,
@@ -1467,13 +2236,28 @@ def _run_payload_as_offline_identity_native(
     kernel32.TerminateProcess.restype = BOOL
     kernel32.GetExitCodeProcess.argtypes = [HANDLE, ctypes.POINTER(DWORD)]
     kernel32.GetExitCodeProcess.restype = BOOL
+    kernel32.CreateJobObjectW.argtypes = [LPVOID, wintypes.LPCWSTR]
+    kernel32.CreateJobObjectW.restype = HANDLE
+    kernel32.SetInformationJobObject.argtypes = [HANDLE, ctypes.c_int, LPVOID, DWORD]
+    kernel32.SetInformationJobObject.restype = BOOL
+    kernel32.AssignProcessToJobObject.argtypes = [HANDLE, HANDLE]
+    kernel32.AssignProcessToJobObject.restype = BOOL
+    kernel32.ResumeThread.argtypes = [HANDLE]
+    kernel32.ResumeThread.restype = DWORD
+    kernel32.CancelIoEx.argtypes = [HANDLE, LPVOID]
+    kernel32.CancelIoEx.restype = BOOL
+    kernel32.TerminateJobObject.argtypes = [HANDLE, DWORD]
+    kernel32.TerminateJobObject.restype = BOOL
+    kernel32.WriteFile.argtypes = [HANDLE, LPVOID, DWORD, ctypes.POINTER(DWORD), LPVOID]
+    kernel32.WriteFile.restype = BOOL
     kernel32.SetErrorMode.argtypes = [DWORD]
     kernel32.SetErrorMode.restype = DWORD
 
-    HANDLE_FLAG_INHERIT = 0x00000001
     LOGON_WITHOUT_PROFILE = 0
     WAIT_TIMEOUT = 0x00000102
     WAIT_FAILED = 0xFFFFFFFF
+    JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 
     def win_error(label: str) -> OSError:
         code = ctypes.get_last_error()
@@ -1490,10 +2274,10 @@ def _run_payload_as_offline_identity_native(
     stderr_read = HANDLE()
     stderr_write = HANDLE()
     process_info = PROCESS_INFORMATION()
+    job = HANDLE()
+    job_assigned = False
     reader_threads: list[threading.Thread] = []
     outputs: dict[str, bytes] = {"stdout": b"", "stderr": b""}
-    payload_path: Path | None = None
-
     try:
         sa = SECURITY_ATTRIBUTES()
         sa.nLength = ctypes.sizeof(SECURITY_ATTRIBUTES)
@@ -1506,7 +2290,7 @@ def _run_payload_as_offline_identity_native(
             0,
         ):
             raise win_error("CreatePipe(stdin)")
-        kernel32.SetHandleInformation(stdin_write, HANDLE_FLAG_INHERIT, 0)
+        _clear_handle_inheritance(kernel32, stdin_write, "stdin")
         if not kernel32.CreatePipe(
             ctypes.byref(stdout_read),
             ctypes.byref(stdout_write),
@@ -1521,8 +2305,8 @@ def _run_payload_as_offline_identity_native(
             0,
         ):
             raise win_error("CreatePipe(stderr)")
-        kernel32.SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0)
-        kernel32.SetHandleInformation(stderr_read, HANDLE_FLAG_INHERIT, 0)
+        _clear_handle_inheritance(kernel32, stdout_read, "stdout")
+        _clear_handle_inheritance(kernel32, stderr_read, "stderr")
 
         startup = STARTUPINFO()
         startup.cb = ctypes.sizeof(STARTUPINFO)
@@ -1532,15 +2316,26 @@ def _run_payload_as_offline_identity_native(
         startup.hStdOutput = stdout_write
         startup.hStdError = stderr_write
 
-        payload_path = _write_offline_payload_file(payload)
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            raise win_error("CreateJobObjectW")
+        limit_info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        limit_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(
+            job,
+            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(limit_info),
+            ctypes.sizeof(limit_info),
+        ):
+            raise win_error("SetInformationJobObject")
+
         command_line = ctypes.create_unicode_buffer(
             subprocess.list2cmdline(
                 [
                     sys.executable,
                     "-m",
                     HELPER_MODULE,
-                    OFFLINE_PAYLOAD_FILE_ARG,
-                    str(payload_path),
+                    OFFLINE_PAYLOAD_STDIN_ARG,
                 ]
             )
         )
@@ -1565,11 +2360,16 @@ def _run_payload_as_offline_identity_native(
             kernel32.SetErrorMode(previous_error_mode)
         if not created:
             raise win_error("CreateProcessWithLogonW")
+        if not kernel32.AssignProcessToJobObject(job, process_info.hProcess):
+            raise win_error("AssignProcessToJobObject")
+        job_assigned = True
+        if kernel32.ResumeThread(process_info.hThread) == WAIT_FAILED:
+            raise win_error("ResumeThread")
+
+        pipe_io_handles = (stdin_write, stdout_read, stderr_read)
 
         close(stdin_read)
         stdin_read = HANDLE()
-        close(stdin_write)
-        stdin_write = HANDLE()
         close(stdout_write)
         stdout_write = HANDLE()
         close(stderr_write)
@@ -1588,26 +2388,54 @@ def _run_payload_as_offline_identity_native(
         stdout_read = HANDLE()
         stderr_read = HANDLE()
 
+        writer_thread, writer_errors, close_writer = _start_child_stdin_writer(
+            kernel32,
+            stdin_write,
+            _payload_to_json(payload).encode("utf-8"),
+            on_error=lambda: kernel32.TerminateJobObject(job, 125),
+        )
+        stdin_write = HANDLE()
+
         wait_ms = max(1, int(payload.timeout * 1000))
         wait_result = kernel32.WaitForSingleObject(process_info.hProcess, wait_ms)
+        wait_error: OSError | None = None
         if wait_result == WAIT_TIMEOUT:
-            kernel32.TerminateProcess(process_info.hProcess, 124)
+            kernel32.TerminateJobObject(job, 124)
             kernel32.WaitForSingleObject(process_info.hProcess, 5000)
             exit_code = 124
         elif wait_result == WAIT_FAILED:
-            raise win_error("WaitForSingleObject")
+            wait_error = win_error("WaitForSingleObject")
+            kernel32.TerminateJobObject(job, 125)
+            exit_code = 125
         else:
             code = DWORD()
             if not kernel32.GetExitCodeProcess(process_info.hProcess, ctypes.byref(code)):
-                raise win_error("GetExitCodeProcess")
-            exit_code = int(code.value)
+                wait_error = win_error("GetExitCodeProcess")
+                kernel32.TerminateJobObject(job, 125)
+                exit_code = 125
+            else:
+                exit_code = int(code.value)
 
-        for thread in reader_threads:
-            thread.join(timeout=5)
+        _finish_child_io(
+            writer_thread=writer_thread,
+            reader_threads=reader_threads,
+            writer_errors=writer_errors,
+            close_writer=close_writer,
+            label="offline helper",
+            terminate=lambda: kernel32.TerminateJobObject(job, 125),
+            cancel_io=lambda: _cancel_child_pipe_io(kernel32, pipe_io_handles),
+            force_cancel=wait_result in {WAIT_TIMEOUT, WAIT_FAILED} or wait_error is not None,
+            ignore_writer_errors=wait_result in {WAIT_TIMEOUT, WAIT_FAILED}
+            or wait_error is not None,
+        )
+        if wait_error is not None:
+            raise wait_error
         sys.stdout.buffer.write(outputs["stdout"])
         sys.stderr.buffer.write(outputs["stderr"])
         return exit_code
     finally:
+        if process_info.hProcess and not job_assigned:
+            kernel32.TerminateProcess(process_info.hProcess, 125)
         close(stdin_write)
         close(stdin_read)
         close(stdout_write)
@@ -1616,9 +2444,7 @@ def _run_payload_as_offline_identity_native(
         close(stderr_read)
         close(process_info.hThread)
         close(process_info.hProcess)
-        if payload_path is not None:
-            with contextlib.suppress(OSError):
-                payload_path.unlink()
+        close(job)
 
 
 def _effective_child_env(payload: HelperPayload) -> dict[str, str]:
@@ -1771,8 +2597,7 @@ def _set_token_default_dacl_native(token: int, dacl_sids: Sequence[object]) -> N
             error_code = ctypes.get_last_error()
             raise OSError(
                 error_code,
-                f"SetTokenInformation(TokenDefaultDacl) failed: "
-                f"{ctypes.FormatError(error_code)}",
+                f"SetTokenInformation(TokenDefaultDacl) failed: {ctypes.FormatError(error_code)}",
             )
     finally:
         if new_dacl:
@@ -1840,7 +2665,13 @@ def _enable_token_privilege_native(token: int, name: str) -> None:
         )
 
 
-def _write_child_stdin(kernel32: object, stdin_write: object, stdin: bytes | None) -> None:
+def _write_child_stdin(
+    kernel32: object,
+    stdin_write: object,
+    stdin: bytes | None,
+    *,
+    close_handle: bool = True,
+) -> None:
     import ctypes
     from ctypes import wintypes
 
@@ -1863,7 +2694,8 @@ def _write_child_stdin(kernel32: object, stdin_write: object, stdin: bytes | Non
                     raise OSError(0, "WriteFile(stdin) wrote zero bytes")
                 offset += written.value
     finally:
-        kernel32.CloseHandle(stdin_write)
+        if close_handle:
+            kernel32.CloseHandle(stdin_write)
 
 
 def _run_restricted_process_native_impl(
@@ -2024,6 +2856,8 @@ def _run_restricted_process_native_impl(
     kernel32.AssignProcessToJobObject.restype = BOOL
     kernel32.ResumeThread.argtypes = [HANDLE]
     kernel32.ResumeThread.restype = DWORD
+    kernel32.CancelIoEx.argtypes = [HANDLE, LPVOID]
+    kernel32.CancelIoEx.restype = BOOL
     kernel32.WaitForSingleObject.argtypes = [HANDLE, DWORD]
     kernel32.WaitForSingleObject.restype = DWORD
     kernel32.TerminateJobObject.argtypes = [HANDLE, DWORD]
@@ -2037,7 +2871,6 @@ def _run_restricted_process_native_impl(
 
     TOKEN_GROUPS_CLASS = 2
     SE_GROUP_LOGON_ID = 0xC0000000
-    HANDLE_FLAG_INHERIT = 0x00000001
     JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
     WAIT_TIMEOUT = 0x00000102
@@ -2100,6 +2933,7 @@ def _run_restricted_process_native_impl(
     process_info = PROCESS_INFORMATION()
     reader_threads: list[threading.Thread] = []
     outputs: dict[str, bytes] = {"stdout": b"", "stderr": b""}
+    job_assigned = False
 
     try:
         source_token = HANDLE(_open_source_token_for_payload(payload))
@@ -2157,7 +2991,7 @@ def _run_restricted_process_native_impl(
             0,
         ):
             raise win_error("CreatePipe(stdin)")
-        kernel32.SetHandleInformation(stdin_write, HANDLE_FLAG_INHERIT, 0)
+        _clear_handle_inheritance(kernel32, stdin_write, "stdin")
         if not kernel32.CreatePipe(
             ctypes.byref(stdout_read),
             ctypes.byref(stdout_write),
@@ -2172,8 +3006,8 @@ def _run_restricted_process_native_impl(
             0,
         ):
             raise win_error("CreatePipe(stderr)")
-        kernel32.SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0)
-        kernel32.SetHandleInformation(stderr_read, HANDLE_FLAG_INHERIT, 0)
+        _clear_handle_inheritance(kernel32, stdout_read, "stdout")
+        _clear_handle_inheritance(kernel32, stderr_read, "stderr")
 
         job = kernel32.CreateJobObjectW(None, None)
         if not job:
@@ -2264,8 +3098,6 @@ def _run_restricted_process_native_impl(
 
         close(stdin_read)
         stdin_read = HANDLE()
-        _write_child_stdin(kernel32, stdin_write, payload.stdin)
-        stdin_write = HANDLE()
         close(stdout_write)
         stdout_write = HANDLE()
         close(stderr_write)
@@ -2273,8 +3105,11 @@ def _run_restricted_process_native_impl(
 
         if not kernel32.AssignProcessToJobObject(job, process_info.hProcess):
             raise win_error("AssignProcessToJobObject")
+        job_assigned = True
         if kernel32.ResumeThread(process_info.hThread) == WAIT_FAILED:
             raise win_error("ResumeThread")
+
+        pipe_io_handles = (stdin_write, stdout_read, stderr_read)
 
         def read_pipe(name: str, handle: object) -> None:
             raw_handle = getattr(handle, "value", handle)
@@ -2289,26 +3124,54 @@ def _run_restricted_process_native_impl(
         stdout_read = HANDLE()
         stderr_read = HANDLE()
 
+        writer_thread, writer_errors, close_writer = _start_child_stdin_writer(
+            kernel32,
+            stdin_write,
+            payload.stdin,
+            on_error=lambda: kernel32.TerminateJobObject(job, 125),
+        )
+        stdin_write = HANDLE()
+
         wait_ms = max(1, int(payload.timeout * 1000))
         wait_result = kernel32.WaitForSingleObject(process_info.hProcess, wait_ms)
+        wait_error: OSError | None = None
         if wait_result == WAIT_TIMEOUT:
             kernel32.TerminateJobObject(job, 124)
             kernel32.WaitForSingleObject(process_info.hProcess, 5000)
             exit_code = 124
         elif wait_result == WAIT_FAILED:
-            raise win_error("WaitForSingleObject")
+            wait_error = win_error("WaitForSingleObject")
+            kernel32.TerminateJobObject(job, 125)
+            exit_code = 125
         else:
             code = DWORD()
             if not kernel32.GetExitCodeProcess(process_info.hProcess, ctypes.byref(code)):
-                raise win_error("GetExitCodeProcess")
-            exit_code = int(code.value)
+                wait_error = win_error("GetExitCodeProcess")
+                kernel32.TerminateJobObject(job, 125)
+                exit_code = 125
+            else:
+                exit_code = int(code.value)
 
-        for thread in reader_threads:
-            thread.join(timeout=5)
+        _finish_child_io(
+            writer_thread=writer_thread,
+            reader_threads=reader_threads,
+            writer_errors=writer_errors,
+            close_writer=close_writer,
+            label="restricted process",
+            terminate=lambda: kernel32.TerminateJobObject(job, 125),
+            cancel_io=lambda: _cancel_child_pipe_io(kernel32, pipe_io_handles),
+            force_cancel=wait_result in {WAIT_TIMEOUT, WAIT_FAILED} or wait_error is not None,
+            ignore_writer_errors=wait_result in {WAIT_TIMEOUT, WAIT_FAILED}
+            or wait_error is not None,
+        )
+        if wait_error is not None:
+            raise wait_error
         sys.stdout.buffer.write(outputs["stdout"])
         sys.stderr.buffer.write(outputs["stderr"])
         return exit_code
     finally:
+        if process_info.hProcess and not job_assigned:
+            kernel32.TerminateProcess(process_info.hProcess, 125)
         close(stdin_read)
         close(stdin_write)
         close(stdout_write)

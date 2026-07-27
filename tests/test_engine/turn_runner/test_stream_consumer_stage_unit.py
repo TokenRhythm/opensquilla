@@ -11,8 +11,11 @@ runtime wrapper.
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -45,6 +48,7 @@ from opensquilla.engine.types import (
     WarningEvent,
 )
 from opensquilla.provider.types import EnsembleProgressEvent as ProviderEnsembleProgressEvent
+from opensquilla.tools.types import ToolContext
 
 # ---------------------------------------------------------------------------
 # Recording fakes
@@ -204,6 +208,7 @@ def _make_input(
     sync_manager: Any | None = None,
     input_provenance: dict[str, Any] | None = None,
     pending_input_provider: Any | None = None,
+    tool_context: Any | None = None,
 ) -> StreamConsumerStageInput:
     return StreamConsumerStageInput(
         agent=SimpleNamespace(),
@@ -225,6 +230,7 @@ def _make_input(
         session_manager_present=session_manager_present,
         state=state if state is not None else _make_state(),
         pending_input_provider=pending_input_provider,
+        tool_context=tool_context,
     )
 
 
@@ -337,7 +343,7 @@ def test_text_delta_handler_appends_to_both_buffers() -> None:
     assert state.current_text_parts == ["hi"]
 
 
-def test_text_delta_handler_suppresses_malformed_tool_protocol_html() -> None:
+def test_text_delta_handler_preserves_protocol_like_html_as_canonical_text() -> None:
     state = _make_state()
     handler = _TextDeltaHandler()
     payload = (
@@ -350,34 +356,26 @@ def test_text_delta_handler_suppresses_malformed_tool_protocol_html() -> None:
 
     out = handler.handle(TextDeltaEvent(text=payload), state)
 
-    assert out.text == "Let me write the dashboard now."
-    assert state.final_text_parts == ["Let me write the dashboard now."]
-    assert state.current_text_parts == ["Let me write the dashboard now."]
-    assert "<!DOCTYPE html>" not in "".join(state.final_text_parts)
+    assert out.text == payload
+    assert state.final_text_parts == [payload]
+    assert state.current_text_parts == [payload]
 
 
-def test_text_delta_handler_holds_split_malformed_tool_protocol_html() -> None:
+def test_text_delta_handler_preserves_split_protocol_like_html() -> None:
     state = _make_state()
     handler = _TextDeltaHandler()
 
-    first = handler.handle(
-        TextDeltaEvent(text="Let me write the dashboard now.\n\n<tvoe"),
-        state,
+    first_chunk = "Let me write the dashboard now.\n\n<tvoe"
+    second_chunk = (
+        '_calls><invoke name="write_file">'
+        '<parameter name="content"><!DOCTYPE html><html></html>'
     )
-    second = handler.handle(
-        TextDeltaEvent(
-            text=(
-                '_calls><invoke name="write_file">'
-                '<parameter name="content"><!DOCTYPE html><html></html>'
-            )
-        ),
-        state,
-    )
+    first = handler.handle(TextDeltaEvent(text=first_chunk), state)
+    second = handler.handle(TextDeltaEvent(text=second_chunk), state)
 
-    assert first.text == "Let me write the dashboard now."
-    assert second.text == ""
-    assert state.final_text_parts == ["Let me write the dashboard now."]
-    assert "<tvoe" not in "".join(state.final_text_parts)
+    assert first.text == first_chunk
+    assert second.text == second_chunk
+    assert "".join(state.final_text_parts) == first_chunk + second_chunk
 
 
 def test_text_delta_handler_strips_cumulative_post_tool_snapshot() -> None:
@@ -452,7 +450,7 @@ def test_text_delta_handler_drops_duplicate_post_tool_snapshot() -> None:
     assert state.current_text_parts == []
 
 
-def test_tool_use_start_handler_drops_tool_scaffold_text_segment() -> None:
+def test_tool_use_start_handler_preserves_canonical_details_text_segment() -> None:
     state = _make_state()
     text_handler = _TextDeltaHandler()
     tool_handler = _ToolUseStartHandler()
@@ -484,14 +482,18 @@ def test_tool_use_start_handler_drops_tool_scaffold_text_segment() -> None:
         state,
     )
 
-    assert first.text == "Let me read the specific problematic areas to fix them."
-    assert second.text == ""
+    expected = (
+        "Let me read the specific problematic areas to fix them.\n\n"
+        "<details><summary>View areas around line 10393, 14751, and nearby"
+        "</summary>"
+    )
+    assert first.text == expected[: expected.index("<summary>")]
+    assert second.text == expected[expected.index("<summary>") :]
     assert state.turn_segments[0] == {
         "type": "text",
-        "text": "Let me read the specific problematic areas to fix them.",
+        "text": expected,
     }
-    assert "<details>" not in "".join(state.final_text_parts)
-    assert "<summary>" not in "".join(state.final_text_parts)
+    assert "".join(state.final_text_parts) == expected
 
 
 def test_tool_use_start_handler_flushes_text_and_appends_segment() -> None:
@@ -579,6 +581,303 @@ def test_tool_result_handler_keeps_small_write_file_arguments() -> None:
     )
 
     assert state.turn_segments[0]["input"] is arguments
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        ("publish_artifact", {"path": "deck.pptx"}),
+        ("create_pptx", {"name": "deck.pptx", "slides": [{"title": "Deck"}]}),
+    ],
+)
+def test_tool_result_handler_clears_delivery_failure_after_same_target_succeeds(
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> None:
+    state = _make_state()
+    handler = _ToolResultHandler()
+    handler.handle(
+        ToolResultEvent(
+            tool_use_id="failed",
+            tool_name=tool_name,
+            result=(
+                '{"status":"error","error_class":"RetryableToolInputError",'
+                '"user_message":"regenerate","retry_allowed":true}'
+            ),
+            is_error=True,
+            arguments=arguments,
+        ),
+        state,
+    )
+    handler.handle(
+        ToolResultEvent(
+            tool_use_id="succeeded",
+            tool_name=tool_name,
+            result='{"status":"published"}',
+            arguments=arguments,
+        ),
+        state,
+    )
+
+    assert state.artifact_delivery_failures == []
+    assert state.artifact_delivery_failures_by_target == {}
+
+
+def test_tool_result_handler_keeps_unrelated_delivery_failure_after_retry() -> None:
+    state = _make_state()
+    handler = _ToolResultHandler()
+    for target in ("first.pptx", "second.pptx"):
+        handler.handle(
+            ToolResultEvent(
+                tool_use_id=f"failed-{target}",
+                tool_name="publish_artifact",
+                result='{"status":"error","user_message":"regenerate"}',
+                is_error=True,
+                arguments={"path": target},
+            ),
+            state,
+        )
+    handler.handle(
+        ToolResultEvent(
+            tool_use_id="succeeded-first",
+            tool_name="publish_artifact",
+            result='{"status":"published"}',
+            arguments={"path": "first.pptx"},
+        ),
+        state,
+    )
+
+    assert state.artifact_delivery_failures == ["regenerate"]
+    assert set(state.artifact_delivery_failures_by_target) == {"path:second.pptx"}
+
+
+@pytest.mark.parametrize(
+    "failed_path",
+    [
+        "/workspace/reports/deck.pptx",
+        r"C:\workspace\reports\deck.pptx",
+        "reports/deck.pptx",
+    ],
+)
+def test_tool_result_handler_matches_publish_target_across_workspace_path_forms(
+    tmp_path,
+    failed_path: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    ctx = SimpleNamespace(workspace_dir=str(workspace))
+    canonical_path = workspace / "reports" / "deck.pptx"
+    state = _make_state()
+    handler = _ToolResultHandler()
+
+    handler.handle(
+        ToolResultEvent(
+            tool_use_id="failed",
+            tool_name="publish_artifact",
+            result='{"status":"error","user_message":"regenerate"}',
+            is_error=True,
+            arguments={"path": failed_path},
+        ),
+        state,
+        tool_context=ctx,
+    )
+    handler.handle(
+        ToolResultEvent(
+            tool_use_id="succeeded",
+            tool_name="publish_artifact",
+            result='{"status":"published"}',
+            arguments={"path": str(canonical_path)},
+        ),
+        state,
+        tool_context=ctx,
+    )
+
+    assert state.artifact_delivery_failures == []
+    assert state.artifact_delivery_failures_by_target == {}
+
+
+def test_tool_result_handler_uses_create_pptx_effective_basename_and_suffix() -> None:
+    state = _make_state()
+    handler = _ToolResultHandler()
+
+    handler.handle(
+        ToolResultEvent(
+            tool_use_id="failed",
+            tool_name="create_pptx",
+            result='{"status":"error","user_message":"regenerate"}',
+            is_error=True,
+            arguments={"name": "reports/deck"},
+        ),
+        state,
+    )
+    handler.handle(
+        ToolResultEvent(
+            tool_use_id="succeeded",
+            tool_name="create_pptx",
+            result='{"status":"published"}',
+            arguments={"name": "deck.pptx"},
+        ),
+        state,
+    )
+
+    assert state.artifact_delivery_failures == []
+    assert state.artifact_delivery_failures_by_target == {}
+
+
+def test_publish_success_clears_create_name_failure_but_not_other_path_failure(
+    tmp_path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    ctx = SimpleNamespace(workspace_dir=str(workspace))
+    state = _make_state()
+    handler = _ToolResultHandler()
+
+    handler.handle(
+        ToolResultEvent(
+            tool_use_id="create-failed",
+            tool_name="create_pptx",
+            result='{"status":"error","user_message":"create failed"}',
+            is_error=True,
+            arguments={"name": "deck.pptx"},
+        ),
+        state,
+        tool_context=ctx,
+    )
+    handler.handle(
+        ToolResultEvent(
+            tool_use_id="root-publish-failed",
+            tool_name="publish_artifact",
+            result='{"status":"error","user_message":"root path failed"}',
+            is_error=True,
+            arguments={"path": "deck.pptx"},
+        ),
+        state,
+        tool_context=ctx,
+    )
+    handler.handle(
+        ToolResultEvent(
+            tool_use_id="nested-publish-succeeded",
+            tool_name="publish_artifact",
+            result='{"status":"published","artifact":{"name":"deck.pptx"}}',
+            arguments={"path": "reports/deck.pptx"},
+        ),
+        state,
+        tool_context=ctx,
+    )
+
+    assert state.artifact_delivery_failures == ["root path failed"]
+    assert len(state.artifact_delivery_failures_by_target) == 1
+    assert next(iter(state.artifact_delivery_failures_by_target)).startswith("path:")
+
+
+@pytest.mark.parametrize(
+    ("failed_path_factory", "cleared"),
+    [
+        (lambda workspace: "deck.pptx", True),
+        (lambda workspace: str(workspace / "deck.pptx"), True),
+        (lambda workspace: "/workspace/deck.pptx", True),
+        (lambda workspace: "reports/deck.pptx", False),
+    ],
+)
+def test_create_pptx_success_only_clears_matching_root_publish_failure(
+    tmp_path,
+    failed_path_factory,
+    cleared: bool,
+) -> None:
+    workspace = tmp_path / "workspace"
+    ctx = SimpleNamespace(workspace_dir=str(workspace))
+    state = _make_state()
+    handler = _ToolResultHandler()
+    failed_path = failed_path_factory(workspace)
+
+    handler.handle(
+        ToolResultEvent(
+            tool_use_id="publish-failed",
+            tool_name="publish_artifact",
+            result='{"status":"error","user_message":"regenerate"}',
+            is_error=True,
+            arguments={"path": failed_path},
+        ),
+        state,
+        tool_context=ctx,
+    )
+    handler.handle(
+        ToolResultEvent(
+            tool_use_id="create-succeeded",
+            tool_name="create_pptx",
+            result='{"status":"published","artifact":{"name":"deck.pptx"}}',
+            arguments={"name": "deck.pptx", "slides": [{"title": "Deck"}]},
+        ),
+        state,
+        tool_context=ctx,
+    )
+
+    if cleared:
+        assert state.artifact_delivery_failures == []
+        assert state.artifact_delivery_failures_by_target == {}
+    else:
+        assert state.artifact_delivery_failures == ["regenerate"]
+        assert len(state.artifact_delivery_failures_by_target) == 1
+
+
+@pytest.mark.parametrize(
+    ("source_path", "explicit_name", "created_name", "cleared"),
+    [
+        ("reports/source.bin", "deck.pptx", "deck.pptx", True),
+        ("reports/source.pptx", "deck", "deck.pptx", True),
+        ("reports/source.bin", "deck", "deck.pptx", False),
+        ("reports/source.pptx", "  deck  ", "deck.pptx", True),
+        ("reports/deck.pptx", "", "deck.pptx", True),
+        ("reports/source.pptx", "de:ck", "de_ck.pptx", True),
+    ],
+)
+def test_explicit_publish_name_is_the_single_logical_failure_identity(
+    tmp_path,
+    source_path: str,
+    explicit_name: str,
+    created_name: str,
+    cleared: bool,
+) -> None:
+    workspace = tmp_path / "workspace"
+    ctx = SimpleNamespace(workspace_dir=str(workspace))
+    state = _make_state()
+    handler = _ToolResultHandler()
+
+    handler.handle(
+        ToolResultEvent(
+            tool_use_id="publish-failed",
+            tool_name="publish_artifact",
+            result='{"status":"error","user_message":"regenerate"}',
+            is_error=True,
+            arguments={"path": source_path, "name": explicit_name},
+        ),
+        state,
+        tool_context=ctx,
+    )
+
+    assert len(state.artifact_delivery_failures_by_target) == 1
+    assert next(iter(state.artifact_delivery_failures_by_target)).startswith("name:")
+
+    handler.handle(
+        ToolResultEvent(
+            tool_use_id="create-succeeded",
+            tool_name="create_pptx",
+            result=(
+                '{"status":"published","artifact":{"name":"'
+                + created_name
+                + '"}}'
+            ),
+            arguments={"name": created_name, "slides": [{"title": "Deck"}]},
+        ),
+        state,
+        tool_context=ctx,
+    )
+
+    if cleared:
+        assert state.artifact_delivery_failures == []
+        assert state.artifact_delivery_failures_by_target == {}
+    else:
+        assert state.artifact_delivery_failures == ["regenerate"]
+        assert len(state.artifact_delivery_failures_by_target) == 1
 
 
 def test_tool_result_handler_updates_tool_use_name_after_runtime_coercion() -> None:
@@ -707,6 +1006,38 @@ def test_error_handler_drops_unpaired_tool_use_on_output_truncation() -> None:
     )
     assert result is _SUPPRESS
     assert state.turn_segments == [{"type": "text", "text": "partial"}]
+
+
+def test_error_handler_drops_unpaired_tool_use_for_provider_specific_error() -> None:
+    state = _make_state()
+    state.turn_segments[:] = [
+        {"type": "tool_use", "tool_use_id": "t1", "name": "x", "input": "{"},
+    ]
+    handler = _ErrorHandler()
+    result = handler.handle(
+        ErrorEvent(message="stream ended before terminal evidence", code="incomplete_stream"),
+        state,
+    )
+    assert result is _SUPPRESS
+    assert state.turn_segments == []
+
+
+def test_error_handler_preserves_tool_use_already_paired_with_result() -> None:
+    state = _make_state()
+    state.turn_segments[:] = [
+        {"type": "tool_use", "tool_use_id": "t1", "name": "x", "input": "{}"},
+        {"type": "tool_result", "tool_use_id": "t1", "result": "ok"},
+    ]
+    handler = _ErrorHandler()
+    result = handler.handle(
+        ErrorEvent(message="later provider failure", code="provider_error"),
+        state,
+    )
+    assert result is _SUPPRESS
+    assert [segment["type"] for segment in state.turn_segments] == [
+        "tool_use",
+        "tool_result",
+    ]
 
 
 def test_warning_handler_forwards_through_transformer() -> None:
@@ -948,6 +1279,317 @@ async def test_outer_stage_yields_text_then_done_and_notifies_post_stream() -> N
     assert len(recs["memory_sync_notify"].calls) == 1
     assert recs["memory_sync_notify"].calls[0]["runtime_message"] == "hello there"
     assert recs["memory_sync_notify"].calls[0]["sync_manager_present"] is True
+
+
+@pytest.mark.asyncio
+async def test_outer_stage_runs_only_publish_off_the_event_loop() -> None:
+    """The done handler's artifact publish re-reads and fully validates
+    deliverables (PPTX inflation plus deck parse), so the stage must run
+    THAT phase in a worker thread. The state-mutating pre/post-publish
+    phases stay on the event loop so the shared, by-reference stream
+    accumulators are never mutated concurrently with a cancellation."""
+    agent_run = _RecordingAgentRun(events=[DoneEvent(text="hi world")])
+    stage, _ = _make_stage(agent_run=agent_run)
+    inp = _make_input()
+
+    pre_threads: list[threading.Thread] = []
+    publish_threads: list[threading.Thread] = []
+    post_threads: list[threading.Thread] = []
+    real_pre = stage._done_handler.pre_publish
+    real_publish = stage._done_handler.run_publish
+    real_post = stage._done_handler.post_publish
+
+    def recording_pre(event: Any, inner_inp: Any, state: Any) -> Any:
+        pre_threads.append(threading.current_thread())
+        return real_pre(event, inner_inp, state)
+
+    def recording_publish(inner_inp: Any, accumulated_text: str) -> Any:
+        publish_threads.append(threading.current_thread())
+        return real_publish(inner_inp, accumulated_text)
+
+    def recording_post(pre: Any, result: Any, inner_inp: Any, state: Any) -> Any:
+        post_threads.append(threading.current_thread())
+        return real_post(pre, result, inner_inp, state)
+
+    stage._done_handler.pre_publish = recording_pre  # type: ignore[method-assign]
+    stage._done_handler.run_publish = recording_publish  # type: ignore[method-assign]
+    stage._done_handler.post_publish = recording_post  # type: ignore[method-assign]
+    loop_thread = threading.current_thread()
+    yielded = await _drain(stage, inp)
+
+    assert [type(e).__name__ for e in yielded] == ["DoneEvent"]
+    # Blocking publish ran off the loop thread.
+    assert publish_threads
+    assert all(thread is not loop_thread for thread in publish_threads)
+    # State mutations stayed on the loop thread.
+    assert pre_threads == [loop_thread]
+    assert post_threads == [loop_thread]
+
+
+@pytest.mark.asyncio
+async def test_done_publish_cancellation_does_not_race_finalizer() -> None:
+    """Cancelling a turn while the artifact publish is in flight must not
+    tear the shared stream accumulators or leave a half-applied result.
+
+    The publish runs in a worker thread that cannot be interrupted, so the
+    stage must (a) keep every ``_StreamState`` mutation on the event loop --
+    the pre-publish mutations are applied deterministically before the
+    publish starts and the post-publish result is applied only after it
+    completes -- and (b) wait for the worker to drain before the
+    CancelledError unwinds, so a steered follow-up turn's finalizer never
+    reads the accumulators while the worker is still writing to disk.
+    """
+    from opensquilla.engine.artifact_delivery import OmittedArtifactPublishResult
+
+    publish_started = threading.Event()
+    release_publish = threading.Event()
+    publish_finished = threading.Event()
+
+    def blocking_publish(inner_inp: Any, accumulated_text: str) -> Any:
+        # Runs in a worker thread. Announce entry, then block until the test
+        # releases us, mimicking a slow ArtifactStore write.
+        publish_started.set()
+        assert release_publish.wait(timeout=5.0), "publish was never released"
+        publish_finished.set()
+        # A post-publish result that WOULD mutate shared state if applied.
+        return OmittedArtifactPublishResult(
+            failure_summaries=["would-be delivery failure"],
+        )
+
+    agent_run = _RecordingAgentRun(events=[DoneEvent(text="hi world")])
+    stage, _ = _make_stage(agent_run=agent_run)
+    stage._done_handler.run_publish = blocking_publish  # type: ignore[method-assign]
+    state = _make_state()
+    inp = _make_input(state=state)
+
+    task = asyncio.ensure_future(_drain(stage, inp))
+
+    # Handshake: wait until the worker thread has entered the publish.
+    assert await asyncio.to_thread(publish_started.wait, 5.0)
+
+    # Pre-publish ran on the loop and is fully applied before the publish;
+    # post-publish has not run, so its result is not yet in shared state.
+    assert state.done_event is not None
+    assert state.turn_artifacts == []
+    assert state.artifact_delivery_failures == []
+
+    task.cancel()
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    # The cancel is pending on the shielded wait for the worker: the stage
+    # has NOT unwound yet because the worker is still blocked. (Under the
+    # whole-handler offload this task would already be done.)
+    assert not task.done()
+    assert not publish_finished.is_set()
+
+    # Release the worker; the stage drains it, then re-raises CancelledError.
+    release_publish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The worker completed before the turn unwound -- a finalizer running
+    # after this point cannot race an in-flight store write.
+    assert publish_finished.is_set()
+    # The drained result's side effects ARE recorded (its failure summary
+    # reaches the shared state the finalizer persists from), while the
+    # notice/warning phases of post_publish stay skipped. It published no
+    # artifacts, so turn_artifacts stays empty.
+    assert state.turn_artifacts == []
+    assert state.artifact_delivery_failures == ["would-be delivery failure"]
+
+
+def _make_publish_tool_context(tmp_path: Path) -> tuple[ToolContext, Path]:
+    """Real publish fixtures: a workspace file the model created and named
+    in its final text, plus an ArtifactStore media root under tmp_path."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    report = workspace / "report.csv"
+    report.write_text("col_a,col_b\n1,2\n", encoding="utf-8")
+    ctx = ToolContext(
+        workspace_dir=str(workspace),
+        artifact_media_root=str(media_root),
+        artifact_session_id="sess-artifact-1",
+        session_key="agent:main:s1",
+        workspace_file_writes=[
+            {
+                "path": str(report),
+                "relative_path": "report.csv",
+                "name": "report.csv",
+                "suffix": ".csv",
+                "operation": "write",
+                "created": True,
+            }
+        ],
+    )
+    return ctx, media_root
+
+
+def _gate_real_publish(
+    stage: StreamConsumerStage,
+) -> tuple[threading.Event, threading.Event, threading.Event, list[threading.Thread]]:
+    """Wrap the bound ``run_publish`` with an Event handshake: signal entry,
+    block until released, then run the REAL publish (real ArtifactStore
+    writes) and signal completion."""
+    publish_started = threading.Event()
+    release_publish = threading.Event()
+    publish_finished = threading.Event()
+    worker_threads: list[threading.Thread] = []
+    real_publish = stage._done_handler.run_publish
+
+    def gated_publish(inner_inp: Any, accumulated_text: str) -> Any:
+        worker_threads.append(threading.current_thread())
+        publish_started.set()
+        assert release_publish.wait(timeout=5.0), "publish was never released"
+        result = real_publish(inner_inp, accumulated_text)
+        publish_finished.set()
+        return result
+
+    stage._done_handler.run_publish = gated_publish  # type: ignore[method-assign]
+    return publish_started, release_publish, publish_finished, worker_threads
+
+
+@pytest.mark.asyncio
+async def test_single_cancel_records_completed_publish(tmp_path: Path) -> None:
+    """A publish that COMPLETES during a cancelled turn must be recorded.
+
+    The worker's store write and ``ctx.published_artifacts`` append cannot be
+    undone, so the cancel path must still record the result into
+    ``state.turn_artifacts`` (the by-reference accumulator the cancel
+    finalizer persists the transcript from). Invariant: a completed publish
+    is never orphaned -- otherwise the file exists on disk, counts against
+    the disk budget, and is never surfaced to the user.
+    """
+    ctx, media_root = _make_publish_tool_context(tmp_path)
+    agent_run = _RecordingAgentRun(
+        events=[
+            TextDeltaEvent(text="Wrote report.csv"),
+            DoneEvent(text="Wrote report.csv"),
+        ]
+    )
+    stage, _ = _make_stage(agent_run=agent_run)
+    publish_started, release_publish, publish_finished, _ = _gate_real_publish(stage)
+    state = _make_state()
+    inp = _make_input(state=state, tool_context=ctx)
+
+    task = asyncio.ensure_future(_drain(stage, inp))
+    assert await asyncio.to_thread(publish_started.wait, 5.0)
+
+    task.cancel()
+    for _ in range(10):
+        await asyncio.sleep(0)
+    # The stage is draining the shielded worker; it has not unwound yet.
+    assert not task.done()
+
+    release_publish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert publish_finished.is_set()
+    # The real publish took effect: bytes exist under the media root and the
+    # tool context saw the published payload.
+    assert [p for p in media_root.rglob("*") if p.is_file()]
+    assert len(ctx.published_artifacts) == 1
+    assert ctx.published_artifacts[0]["name"] == "report.csv"
+    # ...so the shared turn state must carry the same payload: the cancel
+    # finalizer's transcript persists from state.turn_artifacts.
+    assert state.turn_artifacts == ctx.published_artifacts
+
+
+@pytest.mark.asyncio
+async def test_double_cancel_waits_for_worker_before_unwind(tmp_path: Path) -> None:
+    """A SECOND cancel arriving during the drain must not unwind the turn
+    while the worker thread is still writing to the ArtifactStore -- that
+    would let a finalizer run concurrently with the in-flight store write."""
+    ctx, media_root = _make_publish_tool_context(tmp_path)
+    agent_run = _RecordingAgentRun(
+        events=[
+            TextDeltaEvent(text="Wrote report.csv"),
+            DoneEvent(text="Wrote report.csv"),
+        ]
+    )
+    stage, _ = _make_stage(agent_run=agent_run)
+    publish_started, release_publish, publish_finished, worker_threads = (
+        _gate_real_publish(stage)
+    )
+    state = _make_state()
+    inp = _make_input(state=state, tool_context=ctx)
+
+    task = asyncio.ensure_future(_drain(stage, inp))
+    assert await asyncio.to_thread(publish_started.wait, 5.0)
+
+    task.cancel()
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert not task.done()
+
+    # Second cancel while the drain wait is pending.
+    task.cancel()
+    for _ in range(10):
+        await asyncio.sleep(0)
+    # The coroutine absorbs the repeated cancel: it must NOT finish while
+    # the worker is still blocked mid-publish.
+    assert not task.done()
+    assert not publish_finished.is_set()
+
+    release_publish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # By the time the cancellation unwound, the worker had already finished
+    # its store write.
+    assert publish_finished.is_set()
+
+    # Nothing mutates after the task completed: every store write and
+    # ctx.published_artifacts append happened strictly before the unwind.
+    published_snapshot = list(ctx.published_artifacts)
+    files_snapshot = sorted(str(p) for p in media_root.rglob("*") if p.is_file())
+    for thread in worker_threads:
+        await asyncio.to_thread(thread.join, 5.0)
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert list(ctx.published_artifacts) == published_snapshot
+    assert sorted(str(p) for p in media_root.rglob("*") if p.is_file()) == files_snapshot
+
+
+@pytest.mark.asyncio
+async def test_outer_stage_persists_literal_text_before_native_tool_segment() -> None:
+    literal = (
+        '<tool_call>{"name":"search","arguments":{"query":"synthetic"}}'
+        "</tool_call>"
+    )
+    agent_run = _RecordingAgentRun(
+        events=[
+            TextDeltaEvent(text=literal),
+            ToolUseStartEvent(
+                tool_use_id="native-1",
+                tool_name="search",
+                synthetic_from_text=False,
+            ),
+            ToolResultEvent(
+                tool_use_id="native-1",
+                tool_name="search",
+                result="synthetic result",
+                arguments={"query": "native"},
+            ),
+            DoneEvent(text=literal),
+        ]
+    )
+    state = _make_state()
+    stage, _ = _make_stage(agent_run=agent_run)
+
+    await _drain(stage, _make_input(state=state))
+
+    assert state.turn_segments[:2] == [
+        {"type": "text", "text": literal},
+        {
+            "type": "tool_use",
+            "tool_use_id": "native-1",
+            "name": "search",
+            "input": {"query": "native"},
+        },
+    ]
 
 
 @pytest.mark.asyncio

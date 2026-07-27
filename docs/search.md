@@ -78,9 +78,14 @@ It identifies the provider tied to `search_api_key` and
 `search_api_key_env`; automatic searches without `--provider` still rank all
 available providers by mode, recency needs, and provider capabilities. Use
 `search_api_key_env` for an environment-variable reference, or paste a one-time
-key through onboarding. `search_fallback_policy = "network"` retries through
-DuckDuckGo only after network/timeout errors, while `search_diagnostics = true`
-includes provider-attempt details in tool results.
+key through onboarding. `search_fallback_policy = "network"` permits at most one
+additional compatible provider after a transient failure. Automatic searches
+prefer the next ranked provider with configured credentials and use DuckDuckGo
+when no keyed fallback is available. Each provider is called at most once per
+search. With `off`, automatic routing may skip a locally detected missing-key
+candidate, but it still sends at most one provider network request and never
+switches after a network failure. `search_diagnostics = true` includes
+provider-attempt details in tool results.
 
 Configuration matrix:
 

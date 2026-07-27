@@ -50,6 +50,51 @@ const LIVE_OWNER_KEY = 'stream'
 /** One ordered interrupt accumulated by the fold, keyed by approvalId. */
 type FoldedInterrupt = ToPartsInterrupt
 
+export interface ReconciledTextSnapshot {
+  rawText: string
+  segments: ChatStreamSegment[]
+  changed: boolean
+}
+
+/**
+ * Apply an authoritative terminal text snapshot without losing tool history.
+ *
+ * A strict extension is still an ordinary suffix and therefore stays after the
+ * last streamed segment. A conflicting snapshot supersedes every streamed text
+ * segment, but keeps tool groups in arrival order and places the one canonical
+ * text segment after them. An empty snapshot intentionally clears text while
+ * retaining those tool groups.
+ */
+export function reconcileTextSnapshot(
+  segments: ChatStreamSegment[],
+  accumulatedText: string,
+  snapshot: string,
+): ReconciledTextSnapshot {
+  if (snapshot === accumulatedText) {
+    return { rawText: accumulatedText, segments, changed: false }
+  }
+
+  if (accumulatedText && snapshot.startsWith(accumulatedText)) {
+    const suffix = snapshot.slice(accumulatedText.length)
+    const next = segments.slice()
+    const last = next[next.length - 1]
+    if (last?.type === 'text') {
+      next[next.length - 1] = {
+        ...last,
+        raw: `${last.raw || ''}${suffix}`,
+        dirty: true,
+      }
+    } else {
+      next.push({ type: 'text', raw: suffix, html: '', dirty: true })
+    }
+    return { rawText: snapshot, segments: next, changed: true }
+  }
+
+  const next = segments.filter(segment => segment.type === 'tool-group')
+  if (snapshot) next.push({ type: 'text', raw: snapshot, html: '', dirty: true })
+  return { rawText: snapshot, segments: next, changed: true }
+}
+
 // A later requested-frame for the same approvalId (a re-broadcast or the
 // hydration backfill that carries args/warning) merges richer fields onto the
 // already-seen interrupt without reordering — last non-empty write wins per
@@ -217,8 +262,9 @@ export function foldTurn(
         break
       }
       case 'final-text': {
-        // reconcileFinalText overrides rawText but does NOT re-segment
-        if (frame.text && frame.text !== rawText) finalText = frame.text
+        // Empty is meaningful: it clears stale streamed text while retaining
+        // any tool groups. A missing snapshot emits no frame at all.
+        finalText = frame.text
         break
       }
       case 'interrupt': {
@@ -247,6 +293,12 @@ export function foldTurn(
     }
   }
 
+  if (finalText !== null) {
+    const reconciled = reconcileTextSnapshot(segments, rawText, finalText)
+    rawText = reconciled.rawText
+    if (reconciled.segments !== segments) segments.splice(0, segments.length, ...reconciled.segments)
+  }
+
   // Render text segment html with the same renderer the legacy flush uses, so
   // compared html matches after a flush (synchronous here; ).
   for (const seg of segments) {
@@ -255,8 +307,6 @@ export function foldTurn(
       seg.dirty = false
     }
   }
-
-  if (finalText !== null) rawText = finalText
 
   const timelineItems = segmentsToTimelineItems(segments, toolCalls, ownerKey)
   const base = { timelineItems, toolCalls, artifacts, rawText }

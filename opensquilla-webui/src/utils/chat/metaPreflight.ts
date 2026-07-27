@@ -1,6 +1,6 @@
 // MetaSkill preflight checkpoint: pure transforms, field logic, and copy.
-// Ported 1:1 from static/js/views/chat/meta-preflight.js. No DOM — field
-// collection becomes a pure read of the SFC's local v-model ref.
+// The helpers stay DOM-free; field collection reads the SFC's local v-model
+// state and returns the protocol payload used to confirm a run.
 
 import type {
   MetaPreflightFieldSpec,

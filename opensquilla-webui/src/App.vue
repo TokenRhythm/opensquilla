@@ -14,15 +14,10 @@
   >
     <!-- Brand -->
     <div class="sidebar-brand">
-      <router-link
-        to="/overview"
-        class="sidebar-brand-link"
-        :aria-label="t('chrome.brandHome')"
-        @click="handleNavClick"
-      >
+      <div class="sidebar-brand-lockup">
         <img class="sidebar-brand-mark" :src="brandMarkUrl" alt="" aria-hidden="true" />
         <span class="sidebar-brand-text">OpenSquilla</span>
-      </router-link>
+      </div>
       <button
         ref="sidebarDockToggleRef"
         class="sidebar-dock-toggle"
@@ -34,7 +29,7 @@
         data-testid="sidebar-toggle-expanded"
         @click="toggleDock('sidebar-button')"
       >
-        <Icon :name="appStore.sidebarOpen ? 'panel-left-close' : 'panel-left-open'" :size="16" />
+        <Icon name="sidebar-visible" :size="18" />
         <span
           id="sidebar-toggle-tip-expanded"
           class="sidebar-toggle-tip sidebar-toggle-tip--sidebar"
@@ -46,103 +41,38 @@
       </button>
     </div>
 
-    <!-- New chat opens a draft instantly against the preferred agent; the agent
-         can still be switched from the draft landing. -->
-    <div class="sidebar-actions">
+    <!-- Always-visible flat nav index. Bounded and self-scrolling under a
+         short viewport so it never squeezes Recents, which owns the elastic
+         space below; every destination stays a labelled text row. -->
+    <div class="sidebar-section sidebar-core" role="navigation" :aria-label="t('chrome.controlNav')">
+      <!-- New task leads the index: it opens a draft instantly against the
+           default agent (no picker to interrupt the flow) and reads as a row
+           rather than a boxed button so the sidebar keeps one rhythm. -->
       <button
         class="sidebar-new-session"
-        :title="newChatHint ? `Start a new chat (${newChatHint})` : 'Start a new chat'"
+        :title="newChatHint ? `${t('chrome.newTaskTitle')} (${newChatHint})` : t('chrome.newTaskTitle')"
         @click="startNewChatInstant"
       >
         <Icon name="plus" :size="16" />
-        <span class="sidebar-new-session__label">{{ t('chrome.newChat') }}</span>
+        <span class="sidebar-new-session__label">{{ t('chrome.newTask') }}</span>
         <!-- Badge tracks the configured binding and hides when the shortcut is
              disabled (Settings → Keyboard), so it never advertises a dead key. -->
         <kbd v-if="newChatHint" class="sidebar-kbd" aria-hidden="true">{{ newChatHint }}</kbd>
       </button>
-      <!-- Canonical search / go-to. Replaces the rail Search row that truncated;
-           the visible chord keeps the shortcut discoverable for mouse users. -->
-      <button
-        type="button"
-        class="sidebar-cmd-btn"
-        :title="`Search / Go to… (${commandPaletteHint})`"
-        :aria-label="`Search and go to (press ${commandPaletteHint})`"
-        aria-haspopup="dialog"
-        :aria-expanded="commandPaletteOpen"
-        @click="openCommandPalette"
-      >
-        <Icon name="search" :size="16" />
-      </button>
-    </div>
-
-    <!-- Always-visible grouped nav index. Bounded and self-scrolling under a
-         short viewport so it never squeezes Recents, which owns the elastic
-         space below; every destination stays a labelled text row. -->
-    <div class="sidebar-section sidebar-core" role="navigation" :aria-label="t('chrome.controlNav')">
-      <!-- Pinned level-1 rows (Sessions / Cron / Skills), single-sourced from the
-           Work band of the route taxonomy so promoting a route is a one-line meta
-           edit and the rail, the mobile drawer, and the palette never drift. -->
+      <!-- Overview / Skills & Channels / Cron, single-sourced from route
+           metadata so the rail, mobile drawer, and palette never drift. -->
       <router-link
         v-for="item in workNav"
         :key="item.path"
         :to="item.path"
         class="sidebar-fn-item"
-        :class="{ 'is-active': isNavActive(item.path) }"
-        :aria-current="isNavActive(item.path) ? 'page' : undefined"
+        :class="{ 'is-active': isPrimaryNavActive(item.path) }"
+        :aria-current="isPrimaryNavActive(item.path) ? 'page' : undefined"
         @click="handleNavClick"
       >
         <Icon :name="item.icon" :size="16" />
         <span class="sidebar-fn-label">{{ item.title }}</span>
-        <!-- Live pending-approvals count on the Sessions row: approvals resolve
-             inline in chat; the Sessions attention strip is the queue's home
-             and the topbar pill remains the interrupt affordance. -->
-        <span
-          v-if="item.path === '/sessions' && appStore.approvalCount > 0"
-          class="sidebar-count-badge"
-        >{{ appStore.approvalCount }}</span>
       </router-link>
-      <!-- Build / Monitor bands: labeled, collapsible, remembered. The rail
-           serves two products at once — a chat client's history and a console
-           index — so the console bands yield vertical space to Recents unless
-           the operator opens them. A band holding the active route auto-expands
-           so navigation can never hide "where am I". -->
-      <div class="sidebar-core__managed">
-        <template v-for="section in consoleSections" :key="section.group">
-          <button
-            type="button"
-            class="sidebar-nav-group-toggle"
-            :aria-expanded="!isBandCollapsed(section.group)"
-            @click="toggleBand(section.group)"
-          >
-            <span class="sidebar-nav-group-label">{{ section.label }}</span>
-            <span
-              v-if="isBandCollapsed(section.group) && bandHasActive(section)"
-              class="sidebar-band-active-dot"
-              aria-hidden="true"
-            ></span>
-            <Icon
-              name="chevronDown"
-              :size="12"
-              class="sidebar-band-chevron"
-              :class="{ 'is-collapsed': isBandCollapsed(section.group) }"
-            />
-          </button>
-          <template v-if="!isBandCollapsed(section.group)">
-            <router-link
-              v-for="route in section.items"
-              :key="route.path"
-              :to="route.path"
-              class="sidebar-fn-item"
-              :class="{ 'is-active': isNavActive(route.path) }"
-              :aria-current="isNavActive(route.path) ? 'page' : undefined"
-              @click="handleNavClick"
-            >
-              <Icon :name="route.icon" :size="16" />
-              <span class="sidebar-fn-label">{{ route.title }}</span>
-            </router-link>
-          </template>
-        </template>
-      </div>
     </div>
 
     <SidebarSetupBanner />
@@ -154,12 +84,13 @@
       :loading="isLoading"
       :current-key="currentSessionKey"
       :contract-debug-enabled="contractDebugEnabled"
+      :search-hint="commandPaletteHint"
       @select="switchToSession"
       @refresh="loadSessions"
       @rename="onRenameSession"
       @delete="onDeleteSession"
       @bulk-delete="onBulkDeleteSessions"
-      @new-chat="startNewChatInstant"
+      @search="openCommandPalette"
     />
 
     <!-- Fixed footer: settings + connection state -->
@@ -205,7 +136,7 @@
 
   <CommandPalette
     v-model:open="commandPaletteOpen"
-    :hint="commandPaletteHint"
+    :recents="sidebarSections"
     @new-chat="onPaletteNewChat"
     @open-settings="onPaletteOpenSettings"
     @toggle-theme="onPaletteToggleTheme"
@@ -214,7 +145,6 @@
 
   <!-- Main content -->
   <div
-    ref="mainRef"
     id="app-main"
     class="main"
     :inert="appStore.sidebarOpen && isSidebarDrawer"
@@ -242,14 +172,24 @@
           data-testid="sidebar-toggle-collapsed"
           @click="toggleDock('topbar-button')"
         >
-          <Icon name="panel-left-open" :size="16" />
+          <Icon name="sidebar-hidden" :size="18" />
           <span id="sidebar-toggle-tip-collapsed" class="sidebar-toggle-tip" role="tooltip">
             <span>{{ t('chrome.toggleSidebar') }}</span>
             <kbd v-if="sidebarToggleHint">{{ sidebarToggleHint }}</kbd>
           </span>
         </button>
       </div>
-      <div ref="topbarRightRef" class="topbar-right">
+      <!-- Permanent target: Chat teleports its route-owned actions into the
+           same in-flow header as the app controls without duplicating state. -->
+      <div
+        id="app-route-header"
+        class="topbar-route-header"
+        data-testid="route-header-host"
+      ></div>
+      <div
+        class="topbar-right"
+        :class="{ 'topbar-right--attention': appStore.approvalCount > 0 }"
+      >
         <button
           v-if="appStore.approvalCount > 0"
           class="approval-inline"
@@ -314,42 +254,48 @@
         </div>
       </div>
     </header>
-    <main
-      class="content"
-      :class="{ 'content--chat': isChatRoute }"
-      :data-skin="skinId || undefined"
-      :data-skin-variant="variants || undefined"
-      id="content"
-    >
-      <ErrorBoundary>
-        <router-view v-slot="{ Component, route }">
-          <!-- out-in: one view in the DOM at a time, so pages never overlap (no
-               double-exposure, and never two composers/textareas mid-swap).
-               Console views are kept-alive, so the entering page is instant —
-               out-in no longer incurs the old remount/fetch "dead gap". -->
-          <template v-if="route.meta.routeTransition === 'none'">
-            <KeepAlive v-if="route.meta.keepAlive" :max="12">
-              <component :is="Component" :key="route.meta.viewKey || route.name" />
-            </KeepAlive>
-            <component v-else :is="Component" :key="route.meta.viewKey || route.name" />
-          </template>
-          <Transition v-else name="route-fade" mode="out-in">
-            <KeepAlive v-if="route.meta.keepAlive" :max="12">
-              <component :is="Component" :key="route.meta.viewKey || route.name" />
-            </KeepAlive>
-            <component v-else :is="Component" :key="route.meta.viewKey || route.name" />
-          </Transition>
-        </router-view>
-      </ErrorBoundary>
-    </main>
+    <div class="app-workspace">
+      <main
+        class="content"
+        :class="{ 'content--chat': isChatRoute }"
+        :data-skin="skinId || undefined"
+        :data-skin-variant="variants || undefined"
+        id="content"
+      >
+        <ErrorBoundary>
+          <router-view v-slot="{ Component, route }">
+            <!-- out-in: one view in the DOM at a time, so pages never overlap (no
+                 double-exposure, and never two composers/textareas mid-swap).
+                 Console views are kept-alive, so the entering page is instant —
+                 out-in no longer incurs the old remount/fetch "dead gap". -->
+            <template v-if="route.meta.routeTransition === 'none'">
+              <KeepAlive v-if="route.meta.keepAlive" :max="12">
+                <component :is="Component" :key="route.meta.viewKey || route.name" />
+              </KeepAlive>
+              <component v-else :is="Component" :key="route.meta.viewKey || route.name" />
+            </template>
+            <Transition v-else name="route-fade" mode="out-in">
+              <KeepAlive v-if="route.meta.keepAlive" :max="12">
+                <component :is="Component" :key="route.meta.viewKey || route.name" />
+              </KeepAlive>
+              <component v-else :is="Component" :key="route.meta.viewKey || route.name" />
+            </Transition>
+          </router-view>
+        </ErrorBoundary>
+      </main>
+      <AppWorkbench
+        :enabled="appStore.features.artifactWorkbench === true"
+        :route-active="isChatRoute"
+        :session-id="currentSessionKey"
+        :modal-blocked="workbenchModalBlocked"
+      />
+      <ArtifactImageLightbox />
+    </div>
   </div>
 
-  <!-- Mobile bottom tab bar (<=768px only; hides while the keyboard is up).
-       Surfaces the primary destinations directly instead of burying them in
-       "More": Chat + Sessions (the two chat-product tabs), Overview (the Monitor
-       hub — Overview/Channels/Usage/Logs live as its tabs), Agents (the core
-       Build concept), then More for the rest (Skills / Cron / Settings) via the
-       full organized drawer. -->
+  <!-- Mobile bottom tab bar (<=768px only; hides while the keyboard is up):
+       Chat, Sessions, Overview, then More for the flat drawer containing
+       Sessions / Overview / Skills & Channels / Cron and Settings. -->
   <nav
     class="mobile-tabbar"
     :class="{ 'is-keyboard-open': mobileKeyboardOpen }"
@@ -378,25 +324,16 @@
     <router-link
       to="/overview"
       class="mobile-tab"
-      :class="{ 'is-active': isMonitorHubActive }"
+      :class="{ 'is-active': isOverviewNavActive }"
       @click="handleNavClick"
     >
       <Icon name="home" :size="20" />
       <span class="mobile-tab__label">{{ t('nav.overview') }}</span>
     </router-link>
-    <router-link
-      to="/agents"
-      class="mobile-tab"
-      :class="{ 'is-active': isNavActive('/agents') }"
-      @click="handleNavClick"
-    >
-      <Icon name="agents" :size="20" />
-      <span class="mobile-tab__label">{{ t('nav.agents') }}</span>
-    </router-link>
     <button
       type="button"
       class="mobile-tab"
-      :class="{ 'is-active': appStore.sidebarOpen }"
+      :class="{ 'is-active': isMobileMoreActive }"
       @click="openSidebarDrawer"
     >
       <Icon name="menu" :size="20" />
@@ -443,10 +380,15 @@ import SidebarResizer from './components/SidebarResizer.vue'
 import CommandPalette from './components/CommandPalette.vue'
 import LanguageSwitcher from './components/LanguageSwitcher.vue'
 import BgmControl from './components/BgmControl.vue'
+import ArtifactImageLightbox from './components/chat/ArtifactImageLightbox.vue'
+import AppWorkbench from './components/workbench/AppWorkbench.vue'
 import { useBgm } from './composables/useBgm'
 import { useSidebarLayout } from './composables/useSidebarLayout'
 import { useDocumentEvent } from './composables/useDocumentEvent'
+import { useDialogLayer } from './composables/useDialogA11y'
+import { provideArtifactImageLightbox } from './composables/chat/useArtifactImageLightbox'
 import { useAgentOptions } from './composables/useAgentOptions'
+import { useSessionListSubscription } from './composables/useSessionListSubscription'
 import { useToasts } from './composables/useToasts'
 import { useNavigation } from './app/useNavigation'
 import { useSurfaceSkin } from './themes/useSurfaceSkin'
@@ -467,6 +409,7 @@ import {
 const appStore = useAppStore()
 const rpcStore = useRpcStore()
 const shortcutsStore = useShortcutsStore()
+const artifactImageLightbox = provideArtifactImageLightbox()
 const { t } = useI18n()
 const $route = useRoute()
 const sidebarRef = ref<HTMLElement | null>(null)
@@ -512,14 +455,9 @@ const router = useRouter()
 // explicit re-localize of the tab title.
 watch(() => appStore.locale, () => {
   document.title = `${routeTitle($route)} — OpenSquilla`
-  // The language switcher prints the locale's own name, so switching locales
-  // resizes the topbar cluster; drop the memoized pill width and re-measure once
-  // the new label has laid out.
-  invalidatePillWidthCache()
-  void nextTick(syncTopbarReserve)
 })
 const { allSessions, sessionListError, isLoading, loadSessions } = useSessions()
-const { consoleSections, bottomRoutes, workNav } = useNavigation()
+const { bottomRoutes, workNav } = useNavigation()
 // Axis-B: the active expressive skin for the routed content area (meta.skin).
 const { skinId, variants } = useSurfaceSkin()
 const { pushToast } = useToasts()
@@ -530,8 +468,7 @@ const webConfigEnabled = getPlatform().capabilities.hasWebConfig
 
 installSessionNavigationDiagConsole()
 
-// Shared agents.list state + fetch (singleton): App.vue and ChatView's
-// in-draft switcher use the same list and one fetch.
+// Shared agents.list state + fetch (singleton) for sidebar session metadata.
 const { agents, loadAgents } = useAgentOptions()
 const mobileKeyboardOpen = ref(false)
 const commandPaletteOpen = ref(false)
@@ -574,95 +511,9 @@ const themeIconName = computed(() => {
 })
 
 const themeMenuOpen = ref(false)
+useDialogLayer(themeMenuOpen)
 const themeButtonRef = ref<HTMLButtonElement | null>(null)
 
-// The floating topbar's right cluster (connection pill + language switcher +
-// theme menu) is absolutely positioned and overlays the chat header band. Its
-// width is dynamic — it grows with the connection state string, the pending-
-// approval button, and (the regression source) the locale's own language label
-// ("中文" vs "Français") — so a hardcoded reservation can never stay correct.
-// Measure the band the cluster occupies (from the main panel's right edge) plus
-// a breathing gap and publish it as --topbar-right-reserve; chat-view.css
-// consumes it so header actions never slide under the pill in any locale.
-//
-// The connection pill is special: its text flips between the connected /
-// connecting / disconnected states at runtime (uppercased by CSS) WITHOUT a
-// layout pass that would re-run this measurement in time, and a flip to a wider
-// state label must not momentarily occlude the actions. So the pill is always
-// reserved at its widest state — measured across the localized labels of all
-// three states in the active locale (the e2e occlusion probe in share.spec.ts
-// runs in the default 'en' locale, where the widest is "DISCONNECTED") — while
-// the rest of the cluster is measured live.
-const mainRef = ref<HTMLElement | null>(null)
-const topbarRightRef = ref<HTMLElement | null>(null)
-let topbarReserveObserver: ResizeObserver | null = null
-let pillMeasureCanvas: HTMLCanvasElement | null = null
-
-const CONNECTION_STATES = ['connected', 'connecting', 'disconnected'] as const
-
-// The widest-pill measurement (getComputedStyle + 3× canvas measureText) is
-// invariant across a dock/resize animation — only the locale labels and the
-// rendered font change it. Memoize by that signature so the high-frequency
-// ResizeObserver path doesn't re-run text metrics every callback.
-let pillWidthCache: { key: string; value: number } | null = null
-function invalidatePillWidthCache() { pillWidthCache = null }
-
-function widestPillWidth(pill: Element): number {
-  const cs = getComputedStyle(pill)
-  const cacheKey = `${appStore.locale}|${cs.fontStyle}|${cs.fontWeight}|${cs.fontSize}|${cs.fontFamily}|${cs.letterSpacing}|${cs.paddingLeft}|${cs.paddingRight}|${cs.borderLeftWidth}|${cs.borderRightWidth}`
-  if (pillWidthCache && pillWidthCache.key === cacheKey) return pillWidthCache.value
-  const chrome =
-    parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight) +
-    parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth)
-  if (!pillMeasureCanvas) pillMeasureCanvas = document.createElement('canvas')
-  const ctx = pillMeasureCanvas.getContext('2d')
-  if (!ctx) return pill.getBoundingClientRect().width
-  ctx.font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`
-  const letterSpacing = parseFloat(cs.letterSpacing) || 0
-  let widest = 0
-  for (const state of CONNECTION_STATES) {
-    // toUpperCase mirrors the pill's text-transform so Latin labels measure at
-    // their rendered width; it is a no-op for CJK labels.
-    const text = t(`chrome.connectionState.${state}`).toUpperCase()
-    const width = ctx.measureText(text).width + letterSpacing * text.length + chrome
-    if (width > widest) widest = width
-  }
-  pillWidthCache = { key: cacheKey, value: widest }
-  return widest
-}
-
-// Coalesce bursts of reserve recalcs into one per frame. The ResizeObserver and
-// window-resize listeners can fire many times per animation frame (e.g. while a
-// panel resizes); each syncTopbarReserve() forces synchronous layout, so without
-// this they thrash the main thread. nextTick-driven one-shot callers still call
-// syncTopbarReserve() directly since they need it after a specific layout pass.
-let topbarReserveRaf = 0
-function scheduleTopbarReserve() {
-  if (sidebarResizeActive.value) return
-  if (topbarReserveRaf) return
-  topbarReserveRaf = requestAnimationFrame(() => {
-    topbarReserveRaf = 0
-    syncTopbarReserve()
-  })
-}
-
-function syncTopbarReserve() {
-  if (sidebarResizeActive.value) return
-  const main = mainRef.value
-  const cluster = topbarRightRef.value
-  if (!main || !cluster) return
-  const mainRect = main.getBoundingClientRect()
-  const gap = 16
-  const pill = cluster.querySelector('.conn-pill')
-  // Chrome to the right of the pill (language switcher + theme + topbar inset)
-  // is measured live so it tracks the locale label width; the pill itself is
-  // reserved at its widest state. Fall back to the cluster's live left edge if
-  // the pill is somehow absent.
-  const reserve = pill
-    ? mainRect.right - pill.getBoundingClientRect().right + widestPillWidth(pill) + gap
-    : mainRect.right - cluster.getBoundingClientRect().left + gap
-  main.style.setProperty('--topbar-right-reserve', `${Math.max(0, Math.round(reserve))}px`)
-}
 // The compact topbar menu deliberately lists only the basic modes (Light / Dark
 // / System). Custom value themes live in Settings → Appearance, reached via the
 // "More themes…" action below — see themePickerOptions({ scope }) in registry.ts.
@@ -704,16 +555,31 @@ const currentSessionKey = computed(() => {
 // Chat layout applies to both the session view and the draft route.
 const isChatRoute = computed(() => $route.path === '/chat' || $route.path === '/chat/new')
 
-// Entering the chat route swaps the topbar into its chat inset and mounts the
-// chat header that consumes --topbar-right-reserve; re-measure so the fresh
-// header gets an accurate reservation (a size-only observer won't fire here).
-watch(isChatRoute, () => void nextTick(syncTopbarReserve))
+watch(
+  [
+    currentSessionKey,
+    isChatRoute,
+    () => artifactImageLightbox.request.value?.sessionKey || '',
+  ],
+  ([sessionKey, chatRouteActive]) => {
+    const request = artifactImageLightbox.request.value
+    if (request && (!chatRouteActive || request.sessionKey !== sessionKey)) {
+      artifactImageLightbox.close()
+    }
+  },
+  { flush: 'sync' },
+)
 
 // The Settings overlay (route-mounted dialog) is open on these routes. It owns
 // its own Escape/focus, so App-level keyboard shortcuts defer to it. Both web
 // and desktop mount the same overlay now (webConfigEnabled is true on both).
 const settingsOverlayOpen = computed(() =>
   webConfigEnabled && ($route.name === 'settings' || $route.name === 'settings-section'))
+const workbenchModalBlocked = computed(() =>
+  commandPaletteOpen.value
+  || themeMenuOpen.value
+  || settingsOverlayOpen.value
+  || (appStore.sidebarOpen && isSidebarDrawer.value))
 
 const contractDebugEnabled = computed(() => appStore.features.contractDebug === true)
 
@@ -722,54 +588,22 @@ function isNavActive(path: string): boolean {
   return $route.path === path
 }
 
-// The Monitor hub hosts Overview/Channels/Usage/Logs as one destination, so the
-// mobile "Overview" tab stays lit on any of the hub's four sub-routes.
-const MONITOR_HUB_PATHS = new Set(['/overview', '/channels', '/usage', '/logs'])
-const isMonitorHubActive = computed(() => MONITOR_HUB_PATHS.has($route.path))
+// Overview owns the Status/Usage hub plus its diagnostic Logs route, while
+// Skills fronts the Skills/Channels hub. Keep those active families disjoint so
+// diagnostic routes never light an unrelated primary destination.
+const OVERVIEW_NAV_PATHS = new Set(['/overview', '/usage', '/logs'])
+const SKILLS_CHANNELS_HUB_PATHS = new Set(['/skills', '/channels'])
+const MOBILE_MORE_PATHS = new Set(['/skills', '/channels', '/cron'])
+const isOverviewNavActive = computed(() => OVERVIEW_NAV_PATHS.has($route.path))
+const isSkillsChannelsHubActive = computed(() => SKILLS_CHANNELS_HUB_PATHS.has($route.path))
+const isMobileMoreActive = computed(() =>
+  appStore.sidebarOpen || MOBILE_MORE_PATHS.has($route.path))
 
-// ── Collapsible console bands ────────────────────────────────────────────
-// Collapsed state per NavGroup, persisted so the rail keeps the user's chosen
-// balance between the console index and the Recents list. Chat-first default:
-// both bands start collapsed, giving the vertical budget to conversation
-// history until the operator opens a band.
-const NAV_BANDS_STORAGE_KEY = 'opensquilla-nav-bands'
-function readCollapsedBands(): Record<string, boolean> {
-  // With the console consolidated to a handful of destinations the bands fit
-  // comfortably, so they default open; collapsing is a per-user space tradeoff
-  // (more visible chat history) that persists once made.
-  const defaults: Record<string, boolean> = {}
-  try {
-    const raw = localStorage.getItem(NAV_BANDS_STORAGE_KEY)
-    if (!raw) return defaults
-    return { ...defaults, ...JSON.parse(raw) }
-  } catch {
-    return defaults
-  }
+function isPrimaryNavActive(path: string): boolean {
+  if (path === '/usage') return isOverviewNavActive.value
+  if (path === '/skills') return isSkillsChannelsHubActive.value
+  return isNavActive(path)
 }
-const collapsedBands = ref<Record<string, boolean>>(readCollapsedBands())
-
-function isBandCollapsed(group: string): boolean {
-  return collapsedBands.value[group] === true
-}
-
-function toggleBand(group: string) {
-  collapsedBands.value = { ...collapsedBands.value, [group]: !isBandCollapsed(group) }
-  try { localStorage.setItem(NAV_BANDS_STORAGE_KEY, JSON.stringify(collapsedBands.value)) } catch {}
-}
-
-function bandHasActive(section: { items: Array<{ path: string }> }): boolean {
-  return section.items.some((item) => isNavActive(item.path))
-}
-
-// A collapsed band never hides the current page: navigating into a band opens
-// it (session-only — the persisted preference is what the user last toggled).
-watch(() => $route.path, () => {
-  for (const section of consoleSections.value) {
-    if (bandHasActive(section) && isBandCollapsed(section.group)) {
-      collapsedBands.value = { ...collapsedBands.value, [section.group]: false }
-    }
-  }
-}, { immediate: true })
 
 function agentDisplayName(agentId: string): string {
   const agent = agents.value.find(a => a.id === agentId)
@@ -857,6 +691,7 @@ const sidebarSections = computed((): SidebarSection[] => {
   return arrangeSidebarSections(sidebarSessionItems.value).map(section => ({
     ...section,
     rows: section.rows.map((row): SidebarSectionRow => {
+      if (row.rowKind === 'workspace') return { ...row, agentName: '' }
       const source = byKey.get(row.key)
       const title = renameOverrides.value[row.key]
         || (source ? sidebarConversationTitle(source) : row.title)
@@ -870,7 +705,6 @@ const sidebarSections = computed((): SidebarSection[] => {
 })
 
 let sessionRefreshTimer: ReturnType<typeof setTimeout> | null = null
-let rpcUnsubSessionsChanged: (() => void) | null = null
 
 // Hide the bottom tab bar while the on-screen keyboard owns the bottom edge.
 // A visual-viewport shrink well beyond browser-chrome changes (>140px) is the
@@ -920,10 +754,6 @@ function closeSidebarDrawer() {
 
 function handleSidebarResizeStart() {
   sidebarResizeActive.value = true
-  if (topbarReserveRaf) {
-    cancelAnimationFrame(topbarReserveRaf)
-    topbarReserveRaf = 0
-  }
 }
 
 function applySidebarPreview(width: number) {
@@ -954,7 +784,6 @@ function collapseSidebarFromResize() {
 function handleSidebarResizeEnd() {
   sidebarResizeActive.value = false
   setSidebarCssWidth(sidebarEffectiveWidth.value)
-  void nextTick(syncTopbarReserve)
 }
 
 // Layout mode is a single state machine shared with Settings. Entering a drawer
@@ -978,7 +807,6 @@ watch(sidebarLayoutMode, (nextMode, previousMode) => {
   } else if (previousMode === 'resizable' && focusWasOnResizer) {
     void nextTick(() => sidebarDockToggleRef.value?.focus())
   }
-  void nextTick(syncTopbarReserve)
 }, { immediate: true })
 
 watch(sidebarDynamicMaximum, () => {
@@ -986,26 +814,18 @@ watch(sidebarDynamicMaximum, () => {
   sidebarResizerRef.value?.cancel()
   sidebarResizeActive.value = false
   setSidebarCssWidth(sidebarEffectiveWidth.value)
-  void nextTick(syncTopbarReserve)
 })
 
-function preferredAgentId(): string {
-  if (currentSessionKey.value) {
-    const current = allSessions.value.find(item => item.key === currentSessionKey.value)
-    if (current?.effectiveAgentId && current.effectiveAgentId !== 'unknown') return normalizeAgentId(current.effectiveAgentId)
-    const local = localChatSessions.value[currentSessionKey.value]
-    if (local?.effectiveAgentId) return normalizeAgentId(local.effectiveAgentId)
-  }
-  const chats = sidebarSections.value.find(section => section.family === 'chats')
-  const latest = chats?.rows.find(row => row.effectiveAgentId !== 'unknown')?.effectiveAgentId
-  return latest || 'main'
+// Primary new-chat path: ordinary tasks always start against the default Agent.
+// Explicit custom-Agent launches still receive their Agent-scoped session key
+// from advanced Agent administration.
+function openDefaultDraft() {
+  return router.push({ path: '/chat/new', query: { agent: 'main' } })
 }
 
-// Primary new-chat path: open a draft instantly against the preferred agent
-// (last-used, or main). The agent can still be switched from the draft landing.
 function startNewChatInstant() {
   handleNavClick()
-  router.push({ path: '/chat/new', query: { agent: preferredAgentId() } })
+  void openDefaultDraft()
 }
 
 // Command palette: ⌘K / Ctrl+K and the rail "Search / Go to…" row both open it.
@@ -1121,7 +941,7 @@ async function onBulkDeleteSessions(keys: string[]) {
   }
   await loadSessions()
   if (wasCurrentDeleted && deleted.has(currentKey)) {
-    router.push({ path: '/chat/new', query: { agent: preferredAgentId() } })
+    void openDefaultDraft()
   }
 }
 
@@ -1140,7 +960,7 @@ async function onDeleteSession(key: string) {
   dispatchLocalSessionsDeleted(deleted, APP_SESSION_SYNC_SOURCE)
   await loadSessions()
   if (wasCurrent) {
-    router.push({ path: '/chat/new', query: { agent: preferredAgentId() } })
+    void openDefaultDraft()
   }
 }
 
@@ -1182,6 +1002,14 @@ function scheduleSessionRefresh() {
     loadSessions()
   }, 150)
 }
+
+const sessionListSubscription = useSessionListSubscription({
+  rpc: rpcStore,
+  isConnected: () => rpcStore.isConnected,
+  refresh: loadSessions,
+  scheduleRefresh: scheduleSessionRefresh,
+  warn: (message, error) => console.warn(`[App] ${message}:`, errorMessage(error)),
+})
 
 function handleKeydown(e: KeyboardEvent) {
   // Chord bindings carry the primary modifier as Cmd on Apple platforms and Ctrl
@@ -1389,20 +1217,11 @@ useDocumentEvent('keydown', handleKeydown)
 
 onMounted(() => {
   window.visualViewport?.addEventListener('resize', syncMobileKeyboard)
-  // Re-measure the topbar reserve whenever the panel or the cluster itself
-  // changes size (window resize, sidebar dock, approval button, font swap).
-  if (typeof ResizeObserver !== 'undefined') {
-    topbarReserveObserver = new ResizeObserver(scheduleTopbarReserve)
-    if (mainRef.value) topbarReserveObserver.observe(mainRef.value)
-    if (topbarRightRef.value) topbarReserveObserver.observe(topbarRightRef.value)
-  }
-  window.addEventListener('resize', scheduleTopbarReserve)
   window.addEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
-  syncTopbarReserve()
   loadAgents()
   loadSessions()
-  rpcUnsubSessionsChanged = rpcStore.on('sessions.changed', scheduleSessionRefresh)
-  // Keep the approval badge/count live app-wide.
+  sessionListSubscription.subscribe()
+  // Keep the approval badge/count live app-wide, not just on the Approvals page.
   subscribeApprovals()
   // Seed now in case the socket is already connected (the `_state` listener
   // covers later reconnects); recovers a request pending before mount.
@@ -1410,18 +1229,9 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
-  if (topbarReserveObserver) {
-    topbarReserveObserver.disconnect()
-    topbarReserveObserver = null
-  }
-  if (topbarReserveRaf) {
-    cancelAnimationFrame(topbarReserveRaf)
-    topbarReserveRaf = 0
-  }
-  window.removeEventListener('resize', scheduleTopbarReserve)
   window.removeEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
   if (sessionRefreshTimer) clearTimeout(sessionRefreshTimer)
-  if (rpcUnsubSessionsChanged) rpcUnsubSessionsChanged()
+  sessionListSubscription.cleanup()
   unsubscribeApprovals()
   if (titleDebounce) {
     clearTimeout(titleDebounce)
@@ -1434,6 +1244,14 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+.app-workspace {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+}
+
 /* Topbar connection pill as a button (web): inherits the base .conn-pill look
    and state colors, adds button reset + an affordance that it is clickable. */
 .conn-pill--link {

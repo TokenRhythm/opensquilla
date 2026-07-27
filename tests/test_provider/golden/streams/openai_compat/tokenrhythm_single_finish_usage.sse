@@ -1,0 +1,7 @@
+data: {"id": "chatcmpl_synthetic_single_tail", "object": "chat.completion.chunk", "created": 0, "model": "deepseek-v4-flash", "choices": [{"index": 0, "delta": {"role": "assistant", "reasoning_content": "Synthetic reasoning."}}]}
+
+data: {"id": "chatcmpl_synthetic_single_tail", "object": "chat.completion.chunk", "created": 0, "model": "deepseek-v4-flash", "choices": [{"index": 0, "delta": {"content": "OK"}}]}
+
+data: {"id": "chatcmpl_synthetic_single_tail", "object": "chat.completion.chunk", "created": 0, "model": "deepseek-v4-flash", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 13, "completion_tokens": 17, "total_tokens": 30, "prompt_tokens_details": {"cached_tokens": 5}, "completion_tokens_details": {"reasoning_tokens": 8}}, "billing_pending": false, "cost_cny": 0.000034875, "trace_id": "trace_synthetic_single_tail"}
+
+data: [DONE]

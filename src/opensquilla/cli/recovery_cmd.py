@@ -11,10 +11,14 @@ from pathlib import Path
 
 import typer
 
+from opensquilla.cli.session_schema import prepare_session_schema
 from opensquilla.recovery import (
+    ConsolidationResult,
     RecoveryError,
     RecoveryReport,
+    acknowledge_profile_credential,
     choose_workspace,
+    consolidate_recovery_profiles,
     inspect_profile,
     reconcile_profile,
 )
@@ -118,6 +122,24 @@ def _cleanup_exit(report: CleanupReport, *, json_output: bool) -> None:
     if report.outcome == "partial":
         raise typer.Exit(code=1)
     if report.outcome == "blocked":
+        raise typer.Exit(code=2)
+
+
+def _emit_consolidation(
+    report: ConsolidationResult,
+    *,
+    json_output: bool,
+) -> None:
+    if json_output:
+        typer.echo(json.dumps(report.as_dict(), ensure_ascii=False, sort_keys=True))
+    else:
+        typer.echo(f"{report.outcome}: {report.stable_code}")
+        typer.echo(f"primary: {report.primary_home}")
+        typer.echo(f"backup: {report.backup_path or '-'}")
+    if report.outcome == "blocked":
+        if not json_output:
+            for error in report.errors:
+                typer.echo(error, err=True)
         raise typer.Exit(code=2)
 
 
@@ -381,6 +403,63 @@ def recovery_recover_transaction(
     )
 
 
+@recovery_app.command("consolidate-profiles")
+def recovery_consolidate_profiles(
+    user_data: Path = typer.Option(..., "--user-data", help="Electron userData root A."),
+    primary_home: Path = typer.Option(
+        ...,
+        "--primary-home",
+        help="Canonical Desktop primary profile root H.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit the fixed profile-consolidation protocol.",
+    ),
+) -> None:
+    """Merge every legacy recovery profile into the primary profile."""
+
+    _emit_consolidation(
+        consolidate_recovery_profiles(
+            user_data,
+            primary_home,
+            prepare_session_schema=prepare_session_schema,
+        ),
+        json_output=json_output,
+    )
+
+
+@recovery_app.command("acknowledge-profile-credential")
+def recovery_acknowledge_profile_credential(
+    user_data: Path = typer.Option(..., "--user-data", help="Electron userData root A."),
+    primary_home: Path = typer.Option(
+        ...,
+        "--primary-home",
+        help="Canonical Desktop primary profile root H.",
+    ),
+    transaction_id: str = typer.Option(
+        ...,
+        "--transaction-id",
+        help="Profile consolidation transaction id.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit the fixed profile-consolidation protocol.",
+    ),
+) -> None:
+    """Acknowledge terminal handling of one archived Desktop credential."""
+
+    _emit_consolidation(
+        acknowledge_profile_credential(
+            user_data,
+            primary_home,
+            transaction_id,
+        ),
+        json_output=json_output,
+    )
+
+
 @recovery_app.command("abandon-cleanup")
 def recovery_abandon_cleanup(
     user_data: Path = typer.Option(..., "--user-data", help="Electron userData root A."),
@@ -483,9 +562,7 @@ def recovery_cleanup_apply(
     """Apply a previously inspected cleanup after exact path confirmation."""
 
     if after_parent_exit:
-        if mode != "delete-all-user-data" or os.environ.get(
-            "OPENSQUILLA_RECOVERY_OFFLINE"
-        ) != "1":
+        if mode != "delete-all-user-data" or os.environ.get("OPENSQUILLA_RECOVERY_OFFLINE") != "1":
             raise typer.BadParameter(
                 "--after-parent-exit is reserved for offline Desktop delete-all"
             )

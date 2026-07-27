@@ -15,6 +15,7 @@ from rich.console import Console
 from typer.testing import CliRunner
 
 from opensquilla.cli import chat_cmd
+from opensquilla.cli.chat.turn_stream import turn_stream_error_message
 from opensquilla.cli.main import app
 from opensquilla.cli.repl import commands as repl_commands
 from opensquilla.cli.repl import slash_bridge
@@ -31,6 +32,18 @@ from opensquilla.session.compaction import CompactionConfig
 from opensquilla.tools.types import CallerKind, ToolContext
 
 runner = CliRunner()
+
+
+def test_cli_surfaces_actionable_ensemble_image_rejection() -> None:
+    event = SimpleNamespace(
+        code="ensemble_multimodal_unsupported",
+        message=(
+            "Ensemble does not support image input yet. "
+            "Switch to a single-model routing mode and try again."
+        ),
+    )
+
+    assert turn_stream_error_message(event) == event.message
 
 
 def _install_fake_inputs(monkeypatch, inputs: Iterable[str]) -> None:
@@ -250,6 +263,7 @@ class TestChatCommand:
         assert isinstance(request, chat_cmd._ChatCommandRequest)
         assert request.model == "openrouter/test"
         assert request.session_id == "agent:main:existing"
+        assert request.ui is None
         assert request.standalone is True
         assert request.workspace == "repo"
         assert request.workspace_strict is True
@@ -269,6 +283,9 @@ class TestChatCommand:
         assert result.exit_code == 0
         assert "--model" in result.output
         assert "--session" in result.output
+        assert "--ui" in result.output
+        assert "default: auto" in result.output
+        assert "RC default: plain" not in result.output
 
     def test_chat_invokes_run_chat(self) -> None:
         """Default chat calls run_chat with correct defaults."""
@@ -279,6 +296,7 @@ class TestChatCommand:
         mock_run.assert_called_once_with(
             model="",
             session_id="",
+            ui=None,
             standalone=False,
             workspace="",
             workspace_strict=None,
@@ -294,6 +312,7 @@ class TestChatCommand:
         mock_run.assert_called_once_with(
             model="ollama/llama3",
             session_id="",
+            ui=None,
             standalone=False,
             workspace="",
             workspace_strict=None,
@@ -309,18 +328,18 @@ class TestChatCommand:
         mock_run.assert_called_once_with(
             model="",
             session_id="abc123",
+            ui=None,
             standalone=False,
             workspace="",
             workspace_strict=None,
             timeout=None,
         )
 
-    def test_chat_rejects_unknown_tui_backend_before_launch(self) -> None:
+    def test_chat_rejects_unknown_public_ui_mode_before_launch(self) -> None:
         result = runner.invoke(
             app,
-            ["chat"],
+            ["chat", "--ui", "bogus"],
             env={
-                "OPENSQUILLA_TUI_BACKEND": "bogus",
                 "COLUMNS": "120",
                 "NO_COLOR": "1",
                 "TERM": "dumb",
@@ -328,9 +347,9 @@ class TestChatCommand:
         )
 
         assert result.exit_code == 2
-        assert "Unsupported TUI backend" in result.output
+        assert "Unsupported chat UI" in result.output
         assert "bogus" in result.output
-        assert "opentui" in result.output
+        assert "auto, plain, tui" in result.output
 
     def test_chat_timeout_option_forwarded(self) -> None:
         """--timeout option is forwarded to run_chat."""
@@ -341,6 +360,7 @@ class TestChatCommand:
         mock_run.assert_called_once_with(
             model="",
             session_id="",
+            ui=None,
             standalone=False,
             workspace="",
             workspace_strict=None,
@@ -358,9 +378,25 @@ class TestChatCommand:
         mock_run.assert_called_once_with(
             model="",
             session_id="",
+            ui=None,
             standalone=False,
             workspace="repo",
             workspace_strict=True,
+            timeout=None,
+        )
+
+    def test_chat_ui_option_forwarded(self) -> None:
+        mock_run = MagicMock()
+        with patch("opensquilla.cli.chat_cmd.run_chat", mock_run):
+            result = runner.invoke(app, ["chat", "--ui", "plain"])
+        assert result.exit_code == 0
+        mock_run.assert_called_once_with(
+            model="",
+            session_id="",
+            ui="plain",
+            standalone=False,
+            workspace="",
+            workspace_strict=None,
             timeout=None,
         )
 
@@ -386,6 +422,11 @@ class TestChatCommand:
         monkeypatch.setattr(
             chat_cmd._launch_bridge,
             "quiet_logs_for_interactive_chat",
+            lambda: None,
+        )
+        monkeypatch.setattr(
+            chat_cmd._launch_bridge,
+            "preflight_gateway_chat_or_exit",
             lambda: None,
         )
         monkeypatch.setattr(
@@ -1340,6 +1381,7 @@ class _FakeGatewayClient:
         self.create_calls: list[dict[str, object]] = []
         self.send_calls: list[dict[str, object]] = []
         self.resolve_calls: list[str] = []
+        self.bootstrap_calls: list[dict[str, object]] = []
         self.delete_calls: list[list[str]] = []
         self.history_calls: list[dict[str, object]] = []
         self.abort_calls: list[str] = []
@@ -1377,17 +1419,56 @@ class _FakeGatewayClient:
         self.resolve_calls.append(key)
         return self.resolved_payload
 
+    async def bootstrap_session(
+        self,
+        key: str,
+        *,
+        limit: int = 200,
+    ) -> dict[str, object]:
+        self.bootstrap_calls.append({"key": key, "limit": limit})
+        return {
+            "session": {
+                "session_key": key,
+                "model": self.resolved_payload.get("model"),
+            },
+            "history": {
+                "messages": [],
+                "history_scope": "complete",
+                "loaded_count": 0,
+                "canonical_available": True,
+            },
+        }
+
     async def delete_sessions(self, keys: list[str]) -> dict[str, object]:
         self.delete_calls.append(keys)
         return self.delete_result
 
-    async def session_history(self, session_key: str, limit: int = 1000) -> dict[str, object]:
-        self.history_calls.append({"session_key": session_key, "limit": limit})
+    async def session_history(
+        self,
+        session_key: str,
+        limit: int = 1000,
+        *,
+        before: str | None = None,
+        after: str | None = None,
+        include_canonical: bool | None = None,
+        include_summaries: bool | None = None,
+    ) -> dict[str, object]:
+        self.history_calls.append(
+            {
+                "session_key": session_key,
+                "limit": limit,
+                "before": before,
+                "after": after,
+                "include_canonical": include_canonical,
+                "include_summaries": include_summaries,
+            }
+        )
         return {
             "messages": [
                 {"role": "user", "text": "persisted hello"},
                 {"role": "assistant", "text": "persisted reply"},
-            ]
+            ],
+            "has_more": False,
         }
 
     async def list_models(self) -> list[dict[str, object]]:
@@ -1875,7 +1956,16 @@ async def test_gateway_slash_save_exports_persisted_history(monkeypatch, tmp_pat
     )
 
     assert handled is True
-    assert fake.history_calls == [{"session_key": "agent:main:abc123", "limit": 1000}]
+    assert fake.history_calls == [
+        {
+            "session_key": "agent:main:abc123",
+            "limit": 200,
+            "before": None,
+            "after": None,
+            "include_canonical": True,
+            "include_summaries": False,
+        }
+    ]
     text = output.read_text(encoding="utf-8")
     assert "## You" in text
     assert "persisted hello" in text

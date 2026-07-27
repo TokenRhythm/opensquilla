@@ -14,11 +14,23 @@ describe('settings section IA', () => {
     expect(ids.indexOf('modelStrategy')).toBeLessThan(ids.indexOf('capabilities'))
   })
 
+  it('keeps data maintenance as a nested route instead of a first-level rail section', () => {
+    expect(SETTINGS_SECTIONS.map(s => s.id)).not.toContain('dataMigration')
+    expect(sectionFromRouteParam('dataMigration')).toBe('dataMigration')
+    expect(isKnownSectionParam('dataMigration')).toBe(true)
+  })
+
   it('retires the obsolete approval-policy Safety section', () => {
     const ids = SETTINGS_SECTIONS.map(s => s.id)
     expect(ids).not.toContain('safety')
     expect(sectionFromRouteParam('safety')).toBe('provider')
     expect(isKnownSectionParam('safety')).toBe(false)
+  })
+
+  it('keeps Channels out of Settings while the router owns its legacy deep link', () => {
+    expect(SETTINGS_SECTIONS.map(s => s.id)).not.toContain('channels')
+    expect(sectionFromRouteParam('channels')).toBe('provider')
+    expect(isKnownSectionParam('channels')).toBe(false)
   })
 
   it('does not ship copy for retired approval-policy destinations', () => {

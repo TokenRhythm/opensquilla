@@ -6,14 +6,18 @@
 //   a theme-tracked color, and onThemeApplied must refresh it on a live switch.
 //
 // Run with: bun test src/light-theme-markdown.bun.test.mjs
-import { test, expect } from "bun:test";
+import { beforeEach, test, expect } from "bun:test";
 import { createTestRenderer } from "@opentui/core/testing";
 import { SyntaxStyle } from "@opentui/core";
 
 import { registerThemeStyles } from "./syntaxTheme.mjs";
-import { applyTheme, THEME, onThemeApplied } from "./theme.mjs";
+import { applyTheme, THEME, onThemeApplied, setColorMode } from "./theme.mjs";
 
 const lum = (c) => 0.299 * c.r + 0.587 * c.g + 0.114 * c.b; // scale-free for comparisons
+
+beforeEach(() => {
+  setColorMode("truecolor");
+});
 
 test("a bare SyntaxStyle has no 'default' style — reproduces the faint-text bug", async () => {
   await createTestRenderer({ width: 10, height: 4 }); // initialize the native render lib

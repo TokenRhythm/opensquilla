@@ -19,8 +19,9 @@ booleans/numbers. :func:`sanitize_flags` / :func:`sanitize_trail` /
 :func:`sanitize_probs` are applied on every insert.
 
 Retention: every ``prune_every`` (default 64) inserts the writer runs one
-opportunistic ``DELETE WHERE ts_ms < now - retention_days`` so the table
-stays bounded without a background job.
+opportunistic, bounded delete of at most ``prune_batch`` (default 1000) rows
+older than ``retention_days`` so the table stays bounded without a background
+job or a long foreground write lock.
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ log = logging.getLogger(__name__)
 
 _DEFAULT_RETENTION_DAYS = 30
 _DEFAULT_PRUNE_EVERY = 64
+_DEFAULT_PRUNE_BATCH = 1_000
 _DAY_MS = 24 * 60 * 60 * 1000
 
 # Enum-like token: identifiers such as tier names ("c2"), route classes
@@ -61,8 +63,13 @@ _COLUMNS = (
     "probs",
     "flags",
     "final_tier",
+    "requested_provider",
+    "requested_model",
     "provider",
     "model",
+    "executed_provider",
+    "executed_model",
+    "fallback_reason",
     "thinking_level",
     "source",
     "trail",
@@ -77,8 +84,13 @@ _TEXT_TOKEN_COLUMNS = (
     "classifier",
     "proposed_tier",
     "final_tier",
+    "requested_provider",
+    "requested_model",
     "provider",
     "model",
+    "executed_provider",
+    "executed_model",
+    "fallback_reason",
     "thinking_level",
     "source",
     "baseline_model",
@@ -209,14 +221,34 @@ class RouterDecisionWriter:
         *,
         retention_days: int = _DEFAULT_RETENTION_DAYS,
         prune_every: int = _DEFAULT_PRUNE_EVERY,
+        prune_batch: int = _DEFAULT_PRUNE_BATCH,
         clock: Callable[[], int] = lambda: int(time.time() * 1000),
     ) -> None:
         self._conn = connection
         self._lock = threading.Lock()
         self._retention_days = max(1, int(retention_days))
         self._prune_every = max(1, int(prune_every))
+        self._prune_batch = max(1, int(prune_batch))
         self._clock = clock
         self._insert_count = 0
+        self._schema_columns: tuple[str, ...] | None = None
+
+    def _compatible_columns_unlocked(self) -> tuple[str, ...]:
+        """Return columns present in both the runtime and persisted schema.
+
+        Some standalone CLI paths open a pre-V021 decisions database without
+        running gateway migrations first.  The additive deployment telemetry
+        must not make those older databases unreadable or unwritable; missing
+        fields simply remain ``None`` until normal migration runs.
+        """
+        if self._schema_columns is not None:
+            return self._schema_columns
+        rows = self._conn.execute("PRAGMA table_info(router_decisions)").fetchall()
+        present = {str(row["name"] if isinstance(row, sqlite3.Row) else row[1]) for row in rows}
+        columns = tuple(column for column in _COLUMNS if column in present)
+        if columns:
+            self._schema_columns = columns
+        return columns
 
     def close(self) -> None:
         with self._lock:
@@ -236,14 +268,15 @@ class RouterDecisionWriter:
             return False
         if row is None:
             return False
-        placeholders = ", ".join("?" for _ in _COLUMNS)
-        sql = (
-            f"INSERT OR REPLACE INTO router_decisions ({', '.join(_COLUMNS)}) "
-            f"VALUES ({placeholders})"
-        )
         try:
             with self._lock:
-                self._conn.execute(sql, tuple(row[column] for column in _COLUMNS))
+                columns = self._compatible_columns_unlocked()
+                placeholders = ", ".join("?" for _ in columns)
+                sql = (
+                    f"INSERT OR REPLACE INTO router_decisions ({', '.join(columns)}) "
+                    f"VALUES ({placeholders})"
+                )
+                self._conn.execute(sql, tuple(row[column] for column in columns))
                 self._conn.commit()
                 self._insert_count += 1
                 should_prune = self._insert_count % self._prune_every == 0
@@ -287,8 +320,17 @@ class RouterDecisionWriter:
         try:
             with self._lock:
                 cur = self._conn.execute(
-                    "DELETE FROM router_decisions WHERE ts_ms < ?",
-                    (cutoff,),
+                    """
+                    DELETE FROM router_decisions
+                    WHERE rowid IN (
+                        SELECT rowid
+                        FROM router_decisions
+                        WHERE ts_ms < ?
+                        ORDER BY ts_ms, decision_id
+                        LIMIT ?
+                    )
+                    """,
+                    (cutoff, self._prune_batch),
                 )
                 self._conn.commit()
             if cur.rowcount:
@@ -389,20 +431,24 @@ class RouterDecisionWriter:
             clauses.append("ts_ms < ?")
             args.append(int(before_ts_ms))
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-        sql = (
-            f"SELECT {', '.join(_COLUMNS)} FROM router_decisions"
-            f"{where} ORDER BY ts_ms DESC, decision_id DESC LIMIT ?"
-        )
         args.append(bound)
         try:
             with self._lock:
+                columns = self._compatible_columns_unlocked()
+                sql = (
+                    f"SELECT {', '.join(columns)} FROM router_decisions"
+                    f"{where} ORDER BY ts_ms DESC, decision_id DESC LIMIT ?"
+                )
                 rows = self._conn.execute(sql, tuple(args)).fetchall()
         except Exception as exc:  # noqa: BLE001
             log.warning("router_decision_writer.list_failed: %s", exc)
             return []
         out: list[dict[str, Any]] = []
         for row in rows:
-            record: dict[str, Any] = {column: row[column] for column in _COLUMNS}
+            record: dict[str, Any] = {
+                column: row[column] if column in columns else None
+                for column in _COLUMNS
+            }
             for json_column in ("probs", "flags", "trail"):
                 record[json_column] = _load_json_list(record.get(json_column))
             out.append(record)
@@ -420,16 +466,23 @@ class RouterDecisionWriter:
         token = sanitize_token(decision_id)
         if token is None:
             return None
-        sql = f"SELECT {', '.join(_COLUMNS)} FROM router_decisions WHERE decision_id = ?"
         try:
             with self._lock:
+                columns = self._compatible_columns_unlocked()
+                sql = (
+                    f"SELECT {', '.join(columns)} FROM router_decisions "
+                    "WHERE decision_id = ?"
+                )
                 row = self._conn.execute(sql, (token,)).fetchone()
         except Exception as exc:  # noqa: BLE001
             log.warning("router_decision_writer.get_failed: %s", exc)
             return None
         if row is None:
             return None
-        record: dict[str, Any] = {column: row[column] for column in _COLUMNS}
+        record: dict[str, Any] = {
+            column: row[column] if column in columns else None
+            for column in _COLUMNS
+        }
         for json_column in ("probs", "flags", "trail"):
             record[json_column] = _load_json_list(record.get(json_column))
         return record

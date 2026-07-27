@@ -26,10 +26,7 @@ from tui_real_terminal.evidence import (  # noqa: E402
     EvidenceBundle,
     ScenarioResult,
 )
-from tui_real_terminal.scenarios import (  # noqa: E402
-    all_scenarios,
-    scenario_by_id,
-)
+from tui_real_terminal.scenarios import all_scenarios, scenario_by_id  # noqa: E402
 from tui_real_terminal.visual import build_visual_verdict  # noqa: E402
 
 
@@ -53,6 +50,7 @@ def test_all_abcd_scenarios_are_declared() -> None:
     assert scenarios["cjk_input_loop"].family == "launch_and_input_loop"
     assert scenarios["long_streaming"].family == "long_streaming_output"
     assert scenarios["complex_ui_state"].family == "complex_ui_state"
+    assert scenarios["complex_ui_state"].requires_tmux is True
     assert scenarios["architecture_prompt"].family == "architecture_prompt"
     assert scenarios["completion_file_menu_escape"].family == "completion_menu"
     assert scenarios["completion_menu_preserves_history"].family == "completion_menu"
@@ -86,13 +84,42 @@ def test_launch_scenario_serializes_to_json(tmp_path: Path) -> None:
 
 def test_complex_ui_state_captures_intermediate_frame_before_final_state() -> None:
     scenario = scenario_by_id("complex_ui_state")
+    reasoning_steps = [
+        step for step in scenario.steps if step.checkpoint == "during-reasoning"
+    ]
     intermediate_steps = [
         step for step in scenario.steps if step.checkpoint == "during-intermediate"
     ]
 
+    assert len(reasoning_steps) == 1
+    assert reasoning_steps[0].action == "wait_text"
+    assert reasoning_steps[0].value == "reasoning-process-streams-live"
     assert len(intermediate_steps) == 1
     assert intermediate_steps[0].action == "wait_text"
     assert intermediate_steps[0].value == "intermediate-before-tool"
+    assert reasoning_steps[0].assert_framebuffer is True
+    assert intermediate_steps[0].assert_framebuffer is True
+    assert {
+        step.checkpoint
+        for step in scenario.steps
+        if step.assert_framebuffer
+    } == {
+        "during-ensemble",
+        "during-reasoning",
+        "during-intermediate",
+        "during-tool",
+        "during-answer",
+        "after-usage",
+        "after-complex",
+    }
+    phases = ("ensemble", "reasoning", "intermediate", "tool", "answer", "usage")
+    step_ids = [step.step_id for step in scenario.steps]
+    for phase in phases:
+        wait_id = "wait-usage" if phase == "usage" else f"wait-{phase}"
+        assert step_ids.index(wait_id) < step_ids.index(f"ack-{phase}")
+        ack = next(step for step in scenario.steps if step.step_id == f"ack-{phase}")
+        assert ack.action == "ack_phase"
+        assert ack.value == phase
 
 
 def test_visible_text_assertion_includes_checkpoint() -> None:

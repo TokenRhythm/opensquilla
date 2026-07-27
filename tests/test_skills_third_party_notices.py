@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from opensquilla.skills.loader import SkillLoader
@@ -162,47 +163,65 @@ def test_frontend_static_assets_are_covered_by_third_party_notices() -> None:
     text = NOTICES.read_text(encoding="utf-8")
 
     for expected in [
-        "## Static frontend vendor assets and fonts",
+        "## Web UI dependencies and bundled fonts",
+        "Vue.js",
+        "Pinia",
+        "Vue Router",
+        "Vue I18n",
+        "html-to-image",
         "KaTeX",
-        "PrismJS",
+        "highlight.js",
         "marked",
+        "Copyright (c) 2004, John Gruber",
         "DOMPurify",
         "IBM Plex Sans",
         "IBM Plex Mono",
         "Space Grotesk",
-        "Inter",
-        "JetBrains Mono",
+        "Fraunces",
+        "Newsreader",
         "SIL OPEN FONT LICENSE Version 1.1",
         "## npm and Python dependency packaging strategy",
     ]:
         assert expected in text
 
+    package = json.loads(
+        (ROOT / "opensquilla-webui" / "package.json").read_text(encoding="utf-8")
+    )
+    bundled_direct_dependencies = {
+        name for name in package["dependencies"] if not name.startswith("@types/")
+    }
+    for dependency in bundled_direct_dependencies:
+        assert f"`{dependency}`" in text
+
+    for removed in [
+        "PrismJS",
+        "src/opensquilla/gateway/static/vendor/",
+        "src/opensquilla/gateway/static/fonts/",
+        "Inter-Variable.woff2",
+        "JetBrainsMono-Variable.woff2",
+    ]:
+        assert removed not in text
+
     for path in [
-        ROOT / "src" / "opensquilla" / "gateway" / "static" / "vendor" / "katex.min.js",
-        ROOT / "src" / "opensquilla" / "gateway" / "static" / "vendor" / "katex.min.css",
-        ROOT / "src" / "opensquilla" / "gateway" / "static" / "vendor" / "marked.min.js",
-        ROOT / "src" / "opensquilla" / "gateway" / "static" / "vendor" / "purify.min.js",
-        ROOT / "src" / "opensquilla" / "gateway" / "static" / "vendor" / "prism-core.min.js",
-        ROOT / "src" / "opensquilla" / "gateway" / "static" / "fonts" / "Inter-Variable.woff2",
-        ROOT
-        / "src"
-        / "opensquilla"
-        / "gateway"
-        / "static"
-        / "fonts"
-        / "JetBrainsMono-Variable.woff2",
+        ROOT / "opensquilla-webui" / "package.json",
+        ROOT / "opensquilla-webui" / "package-lock.json",
+        ROOT / "opensquilla-webui" / "src" / "composables" / "chat" / "useChatTextRendering.ts",
+        ROOT / "opensquilla-webui" / "src" / "assets" / "fonts" / "ibm-plex-sans-400.woff2",
+        ROOT / "opensquilla-webui" / "src" / "assets" / "fonts" / "space-grotesk-400.woff2",
         ROOT
         / "opensquilla-webui"
         / "src"
-        / "assets"
+        / "themes"
+        / "out-of-register"
         / "fonts"
-        / "ibm-plex-sans-400.woff2",
+        / "fraunces-400.woff2",
         ROOT
         / "opensquilla-webui"
         / "src"
-        / "assets"
+        / "themes"
+        / "out-of-register"
         / "fonts"
-        / "space-grotesk-400.woff2",
+        / "newsreader-400.woff2",
     ]:
         assert path.is_file(), path
 
