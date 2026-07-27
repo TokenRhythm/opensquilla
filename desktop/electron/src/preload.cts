@@ -33,6 +33,7 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
     ipcRenderer.invoke('desktop:workbench:surface:destroy', surfaceId)
   ),
   getOnboardingDefaults: () => ipcRenderer.invoke('desktop:onboarding:defaults'),
+  probeOnboarding: (payload: unknown) => ipcRenderer.invoke('desktop:onboarding:probe', payload),
   saveOnboarding: (payload: unknown) => ipcRenderer.invoke('desktop:onboarding:save', payload),
   cancelOnboarding: () => ipcRenderer.invoke('desktop:onboarding:cancel'),
   getBootState: () => ipcRenderer.invoke('desktop:boot:state'),

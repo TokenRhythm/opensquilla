@@ -187,6 +187,20 @@ interface OnboardingPayload {
   locale?: unknown
 }
 
+interface OnboardingProbePayload {
+  provider?: unknown
+  model?: unknown
+  baseUrl?: unknown
+  apiKey?: unknown
+}
+
+interface OnboardingProbeResult {
+  ok: boolean
+  failureKind: string
+  message: string
+  latencyMs: number
+}
+
 interface DesktopSettingsPayload extends OnboardingPayload {}
 
 interface DesktopSettingsSnapshot {
@@ -2884,18 +2898,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.quit': 'Quit',
     'onboarding.step1.continue': 'Continue',
     'onboarding.step2.badge': 'Required',
-    'onboarding.step2.heading': 'Connect a provider',
-    'onboarding.step2.subtitle': 'Choose the provider account the local runtime uses for model calls.',
-    'onboarding.step2.tokenrhythmTitle': 'Recommended: TokenRhythm',
+    'onboarding.step2.heading': 'Model service setup',
+    'onboarding.step2.subtitle': 'Enter an API key to get started.',
+    'onboarding.step2.tokenrhythmTitle': 'TokenRhythm limited-time offer',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm API calls are free for a limited time.',
-    'onboarding.step2.tokenrhythmRegistration': 'During the promotion, register and get an API key to call DeepSeek, GLM, MiniMax, Kimi, and other leading models for free.',
-    'onboarding.step2.tokenrhythmCta': 'Register and get an API key',
-    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Register and get an API key — TokenRhythm (opens in external browser)',
+    'onboarding.step2.tokenrhythmRegistration': 'Register to claim ¥68 in free tokens.',
+    'onboarding.step2.tokenrhythmCta': 'Claim for free',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Claim for free (opens in external browser)',
     'onboarding.step2.otherProviders': 'Other providers',
     'onboarding.step2.apiKey': 'API key',
     'onboarding.step2.endpointSummary': 'Endpoint and direct model',
     'onboarding.step2.baseUrl': 'Base URL',
-    'onboarding.step2.directModel': 'Direct model',
+    'onboarding.step2.directModel': 'Model name',
     'onboarding.step2.back': 'Back',
     'onboarding.step2.next': 'Next',
     'onboarding.step3.badge': 'Advanced',
@@ -3020,18 +3034,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.quit': '退出',
     'onboarding.step1.continue': '继续',
     'onboarding.step2.badge': '必填',
-    'onboarding.step2.heading': '连接提供商',
-    'onboarding.step2.subtitle': '选择本地运行时用于模型调用的提供商账户。',
-    'onboarding.step2.tokenrhythmTitle': '推荐使用 TokenRhythm',
+    'onboarding.step2.heading': '模型服务配置',
+    'onboarding.step2.subtitle': '输入 API 密钥即可开始使用',
+    'onboarding.step2.tokenrhythmTitle': 'TokenRhythm 限时福利',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm API 调用限时免费。',
-    'onboarding.step2.tokenrhythmRegistration': '活动期间，注册并获取 API Key，即可免费调用 DeepSeek、GLM、MiniMax、Kimi 等主流模型。',
-    'onboarding.step2.tokenrhythmCta': '注册并获取 API Key',
-    'onboarding.step2.tokenrhythmCtaExternalLabel': '注册并获取 API Key — TokenRhythm（在外部浏览器中打开）',
+    'onboarding.step2.tokenrhythmRegistration': '注册即领价值 68 元 Token',
+    'onboarding.step2.tokenrhythmCta': '免费领取',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': '免费领取价值 68 元 TokenRhythm Token（在外部浏览器中打开）',
     'onboarding.step2.otherProviders': '其他提供商',
     'onboarding.step2.apiKey': 'API 密钥',
     'onboarding.step2.endpointSummary': '端点和直连模型',
     'onboarding.step2.baseUrl': 'Base URL',
-    'onboarding.step2.directModel': '直连模型',
+    'onboarding.step2.directModel': '模型名称',
     'onboarding.step2.back': '返回',
     'onboarding.step2.next': '下一步',
     'onboarding.step3.badge': '高级',
@@ -3151,18 +3165,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.quit': '終了',
     'onboarding.step1.continue': '続行',
     'onboarding.step2.badge': '必須',
-    'onboarding.step2.heading': 'プロバイダーを接続',
-    'onboarding.step2.subtitle': 'ローカルランタイムがモデル呼び出しに使用するプロバイダーアカウントを選択します。',
-    'onboarding.step2.tokenrhythmTitle': '推奨：TokenRhythm',
+    'onboarding.step2.heading': 'モデルサービス設定',
+    'onboarding.step2.subtitle': 'API キーを入力して利用を開始します。',
+    'onboarding.step2.tokenrhythmTitle': 'TokenRhythm 期間限定特典',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm API は期間限定で無料です。',
-    'onboarding.step2.tokenrhythmRegistration': 'キャンペーン期間中に登録して API キーを取得すると、DeepSeek、GLM、MiniMax、Kimi などの主要モデルを無料で利用できます。',
-    'onboarding.step2.tokenrhythmCta': '登録して API キーを取得',
-    'onboarding.step2.tokenrhythmCtaExternalLabel': '登録して API キーを取得 — TokenRhythm（外部ブラウザーで開きます）',
+    'onboarding.step2.tokenrhythmRegistration': '登録で68元相当のTokenを無料進呈',
+    'onboarding.step2.tokenrhythmCta': '無料で受け取る',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': '無料で受け取る（外部ブラウザーで開きます）',
     'onboarding.step2.otherProviders': 'その他のプロバイダー',
     'onboarding.step2.apiKey': 'API キー',
     'onboarding.step2.endpointSummary': 'エンドポイントと直接モデル',
     'onboarding.step2.baseUrl': 'Base URL',
-    'onboarding.step2.directModel': '直接モデル',
+    'onboarding.step2.directModel': 'モデル名',
     'onboarding.step2.back': '戻る',
     'onboarding.step2.next': '次へ',
     'onboarding.nav.routing.title': 'ルーティング',
@@ -3285,18 +3299,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.quit': 'Quitter',
     'onboarding.step1.continue': 'Continuer',
     'onboarding.step2.badge': 'Requis',
-    'onboarding.step2.heading': 'Connecter un fournisseur',
-    'onboarding.step2.subtitle': 'Choisissez le compte fournisseur utilisé par le runtime local pour les appels de modèle.',
-    'onboarding.step2.tokenrhythmTitle': 'Recommandé : TokenRhythm',
+    'onboarding.step2.heading': 'Configuration du service de modèles',
+    'onboarding.step2.subtitle': 'Saisissez une clé API pour commencer.',
+    'onboarding.step2.tokenrhythmTitle': 'Offre limitée TokenRhythm',
     'onboarding.step2.tokenrhythmValue': 'Les appels à l’API TokenRhythm sont gratuits pendant une durée limitée.',
-    'onboarding.step2.tokenrhythmRegistration': 'Pendant l’offre, inscrivez-vous et obtenez une clé API pour appeler gratuitement DeepSeek, GLM, MiniMax, Kimi et d’autres modèles majeurs.',
-    'onboarding.step2.tokenrhythmCta': 'S’inscrire et obtenir une clé API',
-    'onboarding.step2.tokenrhythmCtaExternalLabel': 'S’inscrire et obtenir une clé API — TokenRhythm (s’ouvre dans le navigateur externe)',
+    'onboarding.step2.tokenrhythmRegistration': 'Inscrivez-vous pour recevoir 68 ¥ de tokens gratuits.',
+    'onboarding.step2.tokenrhythmCta': 'Obtenir gratuitement',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Obtenir gratuitement (s’ouvre dans le navigateur externe)',
     'onboarding.step2.otherProviders': 'Autres fournisseurs',
     'onboarding.step2.apiKey': 'Clé API',
     'onboarding.step2.endpointSummary': 'Point de terminaison et modèle direct',
     'onboarding.step2.baseUrl': 'Base URL',
-    'onboarding.step2.directModel': 'Modèle direct',
+    'onboarding.step2.directModel': 'Nom du modèle',
     'onboarding.step2.back': 'Retour',
     'onboarding.step2.next': 'Suivant',
     'onboarding.nav.routing.title': 'Routage',
@@ -3419,18 +3433,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.quit': 'Beenden',
     'onboarding.step1.continue': 'Weiter',
     'onboarding.step2.badge': 'Erforderlich',
-    'onboarding.step2.heading': 'Anbieter verbinden',
-    'onboarding.step2.subtitle': 'Wählen Sie das Anbieterkonto, das die lokale Laufzeitumgebung für Modellaufrufe verwendet.',
-    'onboarding.step2.tokenrhythmTitle': 'Empfohlen: TokenRhythm',
+    'onboarding.step2.heading': 'Modellservice konfigurieren',
+    'onboarding.step2.subtitle': 'Geben Sie einen API-Schlüssel ein, um zu beginnen.',
+    'onboarding.step2.tokenrhythmTitle': 'TokenRhythm-Aktion',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm-API-Aufrufe sind für kurze Zeit kostenlos.',
-    'onboarding.step2.tokenrhythmRegistration': 'Während der Aktion registrieren, API-Schlüssel erhalten und DeepSeek, GLM, MiniMax, Kimi und weitere führende Modelle kostenlos aufrufen.',
-    'onboarding.step2.tokenrhythmCta': 'Registrieren und API-Schlüssel erhalten',
-    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Registrieren und API-Schlüssel erhalten — TokenRhythm (wird im externen Browser geöffnet)',
+    'onboarding.step2.tokenrhythmRegistration': 'Registrieren und 68 ¥ Gratis-Token erhalten.',
+    'onboarding.step2.tokenrhythmCta': 'Kostenlos erhalten',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Kostenlos erhalten (wird im externen Browser geöffnet)',
     'onboarding.step2.otherProviders': 'Weitere Anbieter',
     'onboarding.step2.apiKey': 'API-Schlüssel',
     'onboarding.step2.endpointSummary': 'Endpunkt und direktes Modell',
     'onboarding.step2.baseUrl': 'Base URL',
-    'onboarding.step2.directModel': 'Direktes Modell',
+    'onboarding.step2.directModel': 'Modellname',
     'onboarding.step2.back': 'Zurück',
     'onboarding.step2.next': 'Weiter',
     'onboarding.nav.routing.title': 'Routing',
@@ -3553,18 +3567,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.quit': 'Salir',
     'onboarding.step1.continue': 'Continuar',
     'onboarding.step2.badge': 'Obligatorio',
-    'onboarding.step2.heading': 'Conectar un proveedor',
-    'onboarding.step2.subtitle': 'Elige la cuenta de proveedor que usa el runtime local para las llamadas a modelos.',
-    'onboarding.step2.tokenrhythmTitle': 'Recomendado: TokenRhythm',
+    'onboarding.step2.heading': 'Configuración del servicio de modelos',
+    'onboarding.step2.subtitle': 'Introduce una clave API para empezar.',
+    'onboarding.step2.tokenrhythmTitle': 'Oferta limitada de TokenRhythm',
     'onboarding.step2.tokenrhythmValue': 'Las llamadas a la API de TokenRhythm son gratis por tiempo limitado.',
-    'onboarding.step2.tokenrhythmRegistration': 'Durante la promoción, regístrate y obtén una clave API para usar gratis DeepSeek, GLM, MiniMax, Kimi y otros modelos líderes.',
-    'onboarding.step2.tokenrhythmCta': 'Registrarse y obtener una clave API',
-    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Registrarse y obtener una clave API — TokenRhythm (se abre en el navegador externo)',
+    'onboarding.step2.tokenrhythmRegistration': 'Regístrate y recibe 68 ¥ en tokens gratis.',
+    'onboarding.step2.tokenrhythmCta': 'Obtener gratis',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Obtener gratis (se abre en el navegador externo)',
     'onboarding.step2.otherProviders': 'Otros proveedores',
     'onboarding.step2.apiKey': 'Clave API',
     'onboarding.step2.endpointSummary': 'Endpoint y modelo directo',
     'onboarding.step2.baseUrl': 'Base URL',
-    'onboarding.step2.directModel': 'Modelo directo',
+    'onboarding.step2.directModel': 'Nombre del modelo',
     'onboarding.step2.back': 'Atrás',
     'onboarding.step2.next': 'Siguiente',
     'onboarding.nav.routing.title': 'Enrutamiento',
@@ -3613,13 +3627,30 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelNote: 'Smart Router is off. Every request uses this model directly.',
     defaultPill: 'default',
     providerField: 'Provider',
+    selectProviderPlaceholder: 'Choose a provider',
+    providerGroupRecommended: 'Recommended',
+    providerGroupCloud: 'Cloud services',
+    providerGroupLocal: 'Local services',
+    limitedFreeBadge: 'Limited-time free',
+    recommendedModel: 'Recommended model',
+    editModel: 'Edit',
+    doneEditingModel: 'Done',
     modelField: 'Model',
     customizeTiers: 'Customize tier models',
     requiresApiKey: 'Requires an API key.',
     noKeyRequired: 'No key required.',
     searchAvailable: '{label} will be available to browser-capable agents.',
     searchHintDefault: 'DuckDuckGo is enough to start.',
+    billingFree: 'Free',
+    billingPaid: 'Paid',
+    searchFreeGroup: 'Free search',
+    searchPaidGroup: 'Paid search services',
     apiKeyRequired: '{label} API key is required.',
+    verifyConfiguration: 'Verify configuration',
+    verifyingConfiguration: 'Verifying…',
+    configurationVerified: 'Configuration verified',
+    configurationVerifiedWithLatency: 'Verified · {ms} ms',
+    configurationVerificationFailed: 'Verification failed: {detail}',
     directModelRequiredDisabled: 'Direct model is required when Smart Router is disabled.',
     directModelRequiredDirect: 'Direct model is required for Direct single model mode.',
     defaultTierRequiresModel: 'Default router tier requires a model.',
@@ -3642,13 +3673,30 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelNote: 'Smart Router 已关闭。每个请求都直接使用此模型。',
     defaultPill: '默认',
     providerField: '提供商',
+    selectProviderPlaceholder: '选择提供商',
+    providerGroupRecommended: '推荐',
+    providerGroupCloud: '云端服务',
+    providerGroupLocal: '本地服务',
+    limitedFreeBadge: '限时免费',
+    recommendedModel: '推荐模型',
+    editModel: '修改',
+    doneEditingModel: '完成',
     modelField: '模型',
     customizeTiers: '自定义层级模型',
     requiresApiKey: '需要 API 密钥。',
     noKeyRequired: '无需密钥。',
     searchAvailable: '{label} 将可供具备浏览能力的 agent 使用。',
     searchHintDefault: 'DuckDuckGo 足以开始使用。',
+    billingFree: '免费',
+    billingPaid: '付费',
+    searchFreeGroup: '免费搜索',
+    searchPaidGroup: '付费搜索服务',
     apiKeyRequired: '需要 {label} API 密钥。',
+    verifyConfiguration: '验证配置',
+    verifyingConfiguration: '正在验证…',
+    configurationVerified: '配置验证成功',
+    configurationVerifiedWithLatency: '验证成功 · {ms} ms',
+    configurationVerificationFailed: '验证失败：{detail}',
     directModelRequiredDisabled: '禁用 Smart Router 时需要直连模型。',
     directModelRequiredDirect: '直连单模型模式需要直连模型。',
     defaultTierRequiresModel: '默认路由层级需要一个模型。',
@@ -3672,13 +3720,30 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelNote: 'Smart Router はオフです。すべてのリクエストでこのモデルを直接使用します。',
     defaultPill: 'デフォルト',
     providerField: 'プロバイダー',
+    selectProviderPlaceholder: 'プロバイダーを選択',
+    providerGroupRecommended: 'おすすめ',
+    providerGroupCloud: 'クラウドサービス',
+    providerGroupLocal: 'ローカルサービス',
+    limitedFreeBadge: '期間限定無料',
+    recommendedModel: '推奨モデル',
+    editModel: '編集',
+    doneEditingModel: '完了',
     modelField: 'モデル',
     customizeTiers: 'ティアモデルをカスタマイズ',
     requiresApiKey: 'API キーが必要です。',
     noKeyRequired: 'キーは不要です。',
     searchAvailable: '{label} はブラウザ対応のエージェントで利用できるようになります。',
     searchHintDefault: 'DuckDuckGo で始めるには十分です。',
+    billingFree: '無料',
+    billingPaid: '有料',
+    searchFreeGroup: '無料検索',
+    searchPaidGroup: '有料検索サービス',
     apiKeyRequired: '{label} の API キーが必要です。',
+    verifyConfiguration: '構成を検証',
+    verifyingConfiguration: '検証中…',
+    configurationVerified: '構成を検証しました',
+    configurationVerifiedWithLatency: '検証済み · {ms} ms',
+    configurationVerificationFailed: '検証に失敗しました：{detail}',
     directModelRequiredDisabled: 'Smart Router を無効にする場合は直接モデルが必要です。',
     defaultTierRequiresModel: 'デフォルトのルーターティアにはモデルが必要です。',
     searchApiKeyRequired: '{label} の検索 API キーが必要です。',
@@ -3701,13 +3766,30 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelNote: 'Smart Router est désactivé. Chaque requête utilise directement ce modèle.',
     defaultPill: 'par défaut',
     providerField: 'Fournisseur',
+    selectProviderPlaceholder: 'Choisir un fournisseur',
+    providerGroupRecommended: 'Recommandé',
+    providerGroupCloud: 'Services cloud',
+    providerGroupLocal: 'Services locaux',
+    limitedFreeBadge: 'Gratuit temporairement',
+    recommendedModel: 'Modèle recommandé',
+    editModel: 'Modifier',
+    doneEditingModel: 'Terminé',
     modelField: 'Modèle',
     customizeTiers: 'Personnaliser les modèles de niveau',
     requiresApiKey: 'Nécessite une clé API.',
     noKeyRequired: 'Aucune clé requise.',
     searchAvailable: '{label} sera disponible pour les agents capables de naviguer.',
     searchHintDefault: 'DuckDuckGo suffit pour démarrer.',
+    billingFree: 'Gratuit',
+    billingPaid: 'Payant',
+    searchFreeGroup: 'Recherche gratuite',
+    searchPaidGroup: 'Services de recherche payants',
     apiKeyRequired: 'La clé API {label} est requise.',
+    verifyConfiguration: 'Vérifier la configuration',
+    verifyingConfiguration: 'Vérification…',
+    configurationVerified: 'Configuration vérifiée',
+    configurationVerifiedWithLatency: 'Vérifiée · {ms} ms',
+    configurationVerificationFailed: 'Échec de la vérification : {detail}',
     directModelRequiredDisabled: 'Un modèle direct est requis lorsque Smart Router est désactivé.',
     defaultTierRequiresModel: 'Le niveau de routeur par défaut nécessite un modèle.',
     searchApiKeyRequired: 'La clé API de recherche {label} est requise.',
@@ -3730,13 +3812,30 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelNote: 'Smart Router ist aus. Jede Anfrage verwendet dieses Modell direkt.',
     defaultPill: 'Standard',
     providerField: 'Anbieter',
+    selectProviderPlaceholder: 'Anbieter auswählen',
+    providerGroupRecommended: 'Empfohlen',
+    providerGroupCloud: 'Cloud-Dienste',
+    providerGroupLocal: 'Lokale Dienste',
+    limitedFreeBadge: 'Zeitlich kostenlos',
+    recommendedModel: 'Empfohlenes Modell',
+    editModel: 'Ändern',
+    doneEditingModel: 'Fertig',
     modelField: 'Modell',
     customizeTiers: 'Stufenmodelle anpassen',
     requiresApiKey: 'Erfordert einen API-Schlüssel.',
     noKeyRequired: 'Kein Schlüssel erforderlich.',
     searchAvailable: '{label} wird für browserfähige Agenten verfügbar sein.',
     searchHintDefault: 'DuckDuckGo reicht für den Start.',
+    billingFree: 'Kostenlos',
+    billingPaid: 'Kostenpflichtig',
+    searchFreeGroup: 'Kostenlose Suche',
+    searchPaidGroup: 'Kostenpflichtige Suchdienste',
     apiKeyRequired: 'Der API-Schlüssel für {label} ist erforderlich.',
+    verifyConfiguration: 'Konfiguration überprüfen',
+    verifyingConfiguration: 'Wird überprüft…',
+    configurationVerified: 'Konfiguration überprüft',
+    configurationVerifiedWithLatency: 'Überprüft · {ms} ms',
+    configurationVerificationFailed: 'Überprüfung fehlgeschlagen: {detail}',
     directModelRequiredDisabled: 'Ein direktes Modell ist erforderlich, wenn Smart Router deaktiviert ist.',
     defaultTierRequiresModel: 'Die Standard-Routerstufe erfordert ein Modell.',
     searchApiKeyRequired: 'Der Such-API-Schlüssel für {label} ist erforderlich.',
@@ -3759,13 +3858,30 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelNote: 'Smart Router está desactivado. Cada solicitud usa este modelo directamente.',
     defaultPill: 'predeterminado',
     providerField: 'Proveedor',
+    selectProviderPlaceholder: 'Elegir un proveedor',
+    providerGroupRecommended: 'Recomendado',
+    providerGroupCloud: 'Servicios en la nube',
+    providerGroupLocal: 'Servicios locales',
+    limitedFreeBadge: 'Gratis por tiempo limitado',
+    recommendedModel: 'Modelo recomendado',
+    editModel: 'Editar',
+    doneEditingModel: 'Listo',
     modelField: 'Modelo',
     customizeTiers: 'Personalizar modelos de nivel',
     requiresApiKey: 'Requiere una clave API.',
     noKeyRequired: 'No se requiere clave.',
     searchAvailable: '{label} estará disponible para los agentes con capacidad de navegación.',
     searchHintDefault: 'DuckDuckGo es suficiente para empezar.',
+    billingFree: 'Gratis',
+    billingPaid: 'De pago',
+    searchFreeGroup: 'Búsqueda gratuita',
+    searchPaidGroup: 'Servicios de búsqueda de pago',
     apiKeyRequired: 'Se requiere la clave API de {label}.',
+    verifyConfiguration: 'Verificar configuración',
+    verifyingConfiguration: 'Verificando…',
+    configurationVerified: 'Configuración verificada',
+    configurationVerifiedWithLatency: 'Verificada · {ms} ms',
+    configurationVerificationFailed: 'Error de verificación: {detail}',
     directModelRequiredDisabled: 'Se requiere un modelo directo cuando Smart Router está desactivado.',
     defaultTierRequiresModel: 'El nivel de enrutador predeterminado requiere un modelo.',
     searchApiKeyRequired: 'Se requiere la clave API de búsqueda de {label}.',
@@ -4099,16 +4215,18 @@ function onboardingHtml(
     :root {
       color-scheme: light;
       font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
-      --bg: #f5f2eb;
-      --paper: rgba(255, 254, 249, 0.96);
-      --ink: #20231f;
-      --muted: #646961;
-      --dim: #8c9189;
-      --line: rgba(32, 35, 31, 0.12);
-      --accent: #F26A1B;
-      --accent-dark: #D95A11;
-      --accent-soft: rgba(242, 106, 27, 0.08);
-      --green: #25633a;
+      --bg: #F4F5F7;
+      --paper: #FFFFFF;
+      --surface-subtle: #F8F9FA;
+      --ink: #15181C;
+      --muted: #565D66;
+      --dim: #7A818A;
+      --line: #E1E4E8;
+      --line-strong: #C9CED5;
+      --accent: #BA4D0F;
+      --accent-soft: rgba(186, 77, 15, 0.035);
+      --primary: #343A40;
+      --primary-hover: #272C31;
       color: var(--ink);
     }
     * { box-sizing: border-box; }
@@ -4116,125 +4234,71 @@ function onboardingHtml(
       margin: 0;
       min-height: 100vh;
       overflow: hidden;
-      background: linear-gradient(135deg, #fbfaf6 0%, var(--bg) 52%, #ece8de 100%);
+      background: var(--bg);
     }
     main {
       min-height: 100vh;
       display: grid;
-      grid-template-columns: 250px minmax(0, 1fr);
-      padding: 24px;
-      gap: 20px;
+      grid-template-rows: auto minmax(0, 1fr);
+      padding: 20px 28px 28px;
+      gap: 16px;
     }
-    .rail {
-      display: grid;
-      grid-template-rows: auto 1fr auto;
-      border-radius: 8px;
-      background: rgba(255, 252, 246, 0.5);
-      border: 1px solid rgba(30,34,30,0.09);
-      padding: 20px;
-    }
-    .rail h1 {
-      margin: 0 0 8px;
-      font-size: 23px;
-      font-weight: 650;
-      line-height: 1.08;
-      letter-spacing: 0;
-    }
-    .rail p {
-      margin: 0;
-      color: var(--muted);
-      font-size: 13px;
-      line-height: 1.48;
-    }
-    .progress {
-      align-self: center;
+    .topbar {
+      width: min(700px, 100%);
+      min-height: 36px;
+      margin: 0 auto;
       display: flex;
-      flex-direction: column;
-      gap: 10px;
-    }
-    .step {
-      appearance: none;
-      display: grid;
-      grid-template-columns: 26px 1fr;
-      gap: 10px;
+      justify-content: space-between;
       align-items: center;
-      border: 0;
-      border-radius: 8px;
-      background: transparent;
-      color: var(--dim);
-      cursor: pointer;
-      min-height: 48px;
-      padding: 5px;
-      text-align: left;
+      gap: 18px;
     }
-    .step:hover {
-      background: rgba(255,255,255,0.5);
-    }
-    .step-index {
-      width: 26px;
-      height: 26px;
-      display: grid;
-      place-items: center;
-      border: 1px solid var(--line);
-      border-radius: 7px;
-      background: rgba(255,255,255,0.58);
-      color: inherit;
-      font-size: 11px;
-      font-weight: 650;
-    }
-    .step strong {
-      display: block;
-      color: inherit;
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      color: var(--ink);
       font-size: 13px;
-      font-weight: 650;
+      font-weight: 620;
+      letter-spacing: -0.01em;
     }
-    .step span:last-child {
-      display: block;
-      margin-top: 1px;
-      font-size: 11px;
-      font-weight: 600;
-    }
-    .step.active, .step.done { color: var(--ink); }
-    .step.simple-hidden {
-      display: none;
-    }
-    .step.active .step-index {
-      border-color: var(--accent);
+    .brand-mark {
+      width: 7px;
+      height: 7px;
+      border-radius: 2px;
       background: var(--accent);
-      color: #fff;
-      box-shadow: 0 9px 18px rgba(242, 106, 27, 0.2);
-    }
-    .step.done .step-index {
-      border-color: rgba(35,106,58,0.32);
-      background: rgba(35,106,58,0.1);
-      color: var(--green);
-    }
-    .rail-foot {
-      color: var(--dim);
-      font-size: 11px;
-      font-weight: 600;
-      line-height: 1.4;
-    }
-    .rail-bottom {
-      display: grid;
-      gap: 14px;
     }
     .language-picker {
-      display: grid;
-      gap: 7px;
-      color: #565c54;
-      font-size: 11px;
-      font-weight: 700;
+      display: inline-flex;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 520;
     }
     .language-picker select {
-      min-height: 34px;
-      border-radius: 8px;
+      width: auto;
+      min-width: 112px;
+      min-height: 32px;
+      border-color: var(--line);
+      border-radius: 7px;
+      background: var(--paper);
       font-size: 12px;
-      font-weight: 650;
-      padding: 0 10px;
+      font-weight: 520;
+      padding: 0 28px 0 10px;
+    }
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
     }
     .deck {
       position: relative;
+      width: min(700px, 100%);
+      margin: 0 auto;
       min-width: 0;
       min-height: 0;
       display: grid;
@@ -4242,9 +4306,9 @@ function onboardingHtml(
     }
     .deck > .error {
       position: absolute;
-      left: 30px;
-      right: 30px;
-      bottom: 18px;
+      left: 32px;
+      right: 32px;
+      bottom: 20px;
       z-index: 3;
     }
     [hidden] {
@@ -4254,88 +4318,128 @@ function onboardingHtml(
       position: absolute;
       top: 50%;
       left: 50%;
-      width: min(780px, calc(100% - 34px));
-      height: min(760px, calc(100vh - 48px));
+      width: 100%;
+      height: min(700px, 100%);
       display: grid;
       grid-template-rows: auto 1fr auto;
-      gap: 18px;
-      border: 1px solid rgba(30,34,30,0.1);
-      border-radius: 8px;
-      background:
-        linear-gradient(180deg, rgba(255,255,255,0.9), rgba(255,254,249,0.96)),
-        var(--paper);
-      box-shadow: 0 24px 70px rgba(35, 32, 26, 0.13), inset 0 1px 0 rgba(255,255,255,0.8);
+      gap: 22px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--paper);
+      box-shadow: 0 18px 48px rgba(16, 20, 26, 0.06);
       opacity: 0;
       pointer-events: none;
-      transform: translate(calc(-50% + 18px), -50%) scale(0.985);
-      transition: opacity 180ms ease, transform 220ms cubic-bezier(.2,.8,.2,1);
-      padding: 28px 28px 26px;
+      transform: translate(-50%, calc(-50% + 8px));
+      transition: opacity 160ms ease, transform 180ms cubic-bezier(.2,.8,.2,1);
+      padding: 32px;
     }
     .setup-card.active {
       opacity: 1;
       pointer-events: auto;
-      transform: translate(-50%, -50%) scale(1);
+      transform: translate(-50%, -50%);
     }
     .setup-card.leaving {
       opacity: 0;
       pointer-events: none;
-      transform: translate(calc(-50% - 18px), -50%) scale(0.985);
+      transform: translate(-50%, calc(-50% - 4px));
     }
     .card-head {
-      display: flex;
-      justify-content: space-between;
-      gap: 20px;
+      display: block;
     }
-    .eyebrow {
-      margin: 0 0 9px;
-      color: var(--accent);
-      font-size: 10px;
+    .context-label {
+      margin: 0 0 8px;
+      color: var(--dim);
+      font-size: 11px;
       font-weight: 650;
-      letter-spacing: 0.14em;
-      text-transform: uppercase;
+      letter-spacing: 0.04em;
     }
     h2 {
       margin: 0;
-      max-width: 460px;
-      font-size: 30px;
-      font-weight: 650;
-      line-height: 1.08;
-      letter-spacing: 0;
+      max-width: 540px;
+      font-size: 26px;
+      font-weight: 610;
+      line-height: 1.2;
+      letter-spacing: -0.02em;
     }
     p {
       color: var(--muted);
-      font-size: 14px;
+      font-size: 13px;
       line-height: 1.55;
-      margin: 10px 0 0;
-    }
-    .card-badge {
-      align-self: start;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      background: rgba(255,255,255,0.68);
-      color: var(--muted);
-      font-size: 10px;
-      font-weight: 650;
-      letter-spacing: 0.08em;
-      padding: 7px 10px;
-      text-transform: uppercase;
+      margin: 8px 0 0;
     }
     .card-body {
       display: grid;
-      gap: 14px;
+      gap: 16px;
       align-content: start;
       min-height: 0;
       overflow-x: hidden;
       overflow-y: auto;
-      padding-right: 2px;
+      padding-right: 4px;
+      scrollbar-width: thin;
+      scrollbar-color: var(--line-strong) transparent;
     }
-    .setup-card[data-screen="0"] .card-body {
-      overflow: visible;
+    .provider-promo-copy {
+      min-width: 0;
+      display: flex;
+      align-items: baseline;
+      justify-self: start;
+      gap: 8px;
+      overflow: hidden;
+      white-space: nowrap;
+    }
+    .provider-promo-copy strong {
+      color: #A95728;
+      font-size: 10.5px;
+      font-weight: 560;
+      line-height: 1.35;
+    }
+    .provider-promo-copy span {
+      color: #A95728;
+      font-size: 10.5px;
+      font-weight: 420;
+      line-height: 1.4;
+    }
+    .provider-promo-cta {
+      display: inline-flex;
+      min-height: 30px;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      border: 0;
+      border-radius: 7px;
+      background: #A95728;
+      box-shadow: 0 3px 10px rgba(169, 87, 40, 0.14);
+      color: #FFFFFF;
+      font-size: 10.5px;
+      font-weight: 600;
+      padding: 0 13px;
+      text-decoration: none;
+      white-space: nowrap;
+      transition: background 150ms ease, box-shadow 150ms ease, transform 150ms ease;
+    }
+    .provider-promo-cta::after {
+      content: "↗";
+      font-size: 11px;
+      line-height: 1;
+    }
+    .provider-promo-cta:hover {
+      background: #91481F;
+      box-shadow: 0 5px 14px rgba(145, 72, 31, 0.18);
+      color: #FFFFFF;
+      transform: translateY(-1px);
+    }
+    .provider-promo-cta:focus-visible {
+      outline: 2px solid rgba(186, 77, 15, 0.42);
+      outline-offset: 2px;
     }
     .provider-grid {
       display: grid;
-      gap: 10px;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 0;
+      grid-template-columns: 1fr;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--paper);
     }
     .provider-feature {
       position: relative;
@@ -4343,27 +4447,17 @@ function onboardingHtml(
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
       align-items: center;
-      gap: 18px;
+      gap: 20px;
       border: 1px solid var(--line);
-      border-radius: 8px;
-      background: rgba(255,255,255,0.62);
-      padding: 17px 18px;
-      transition: border-color 160ms ease, box-shadow 160ms ease, background 160ms ease;
+      border-radius: 10px;
+      background: var(--paper);
+      padding: 18px 20px;
+      transition: border-color 150ms ease, background 150ms ease, box-shadow 150ms ease;
     }
     .provider-feature.active {
-      border-color: var(--accent);
-      background: #fffaf4;
-      box-shadow: 0 12px 26px rgba(54, 42, 28, 0.065);
-    }
-    .provider-feature.active::after {
-      content: "";
-      position: absolute;
-      top: 11px;
-      right: 11px;
-      width: 7px;
-      height: 7px;
-      border-radius: 999px;
-      background: var(--accent);
+      border-color: var(--line);
+      background: var(--paper);
+      box-shadow: inset 2px 0 0 var(--accent);
     }
     .provider-feature-select {
       appearance: none;
@@ -4378,21 +4472,21 @@ function onboardingHtml(
       text-align: left;
     }
     .provider-feature-select strong {
-      padding-right: 12px;
-      font-size: 17px;
-      font-weight: 700;
-      line-height: 1.25;
+      padding-right: 8px;
+      font-size: 15px;
+      font-weight: 600;
+      line-height: 1.3;
     }
     .provider-feature-value {
       color: var(--ink);
-      font-size: 13px;
-      font-weight: 550;
+      font-size: 11.5px;
+      font-weight: 500;
       line-height: 1.45;
     }
     .provider-feature-registration {
       color: var(--muted);
-      font-size: 11px;
-      font-weight: 500;
+      font-size: 10.5px;
+      font-weight: 400;
       line-height: 1.4;
     }
     .provider-feature-cta {
@@ -4400,21 +4494,34 @@ function onboardingHtml(
       min-height: 38px;
       align-items: center;
       justify-content: center;
+      gap: 8px;
+      border: 1px solid var(--line-strong);
       border-radius: 8px;
-      background: var(--accent-dark);
-      color: #fff;
-      font-size: 12px;
-      font-weight: 700;
+      background: var(--paper);
+      color: #39414A;
+      box-shadow: none;
+      font-size: 11.5px;
+      font-weight: 560;
       padding: 0 14px;
       text-decoration: none;
       white-space: nowrap;
+      transition: background 150ms ease, border-color 150ms ease, box-shadow 150ms ease, transform 150ms ease;
+    }
+    .provider-feature-cta::after {
+      content: "↗";
+      font-size: 13px;
+      font-weight: 500;
+      line-height: 1;
     }
     .provider-feature-cta:hover {
-      background: var(--accent);
+      border-color: #AEB4BB;
+      background: var(--surface-subtle);
+      box-shadow: 0 4px 12px rgba(16, 20, 24, 0.06);
+      transform: translateY(-1px);
     }
     .provider-disclosure {
       display: grid;
-      gap: 10px;
+      gap: 8px;
     }
     .provider-disclosure-toggle {
       appearance: none;
@@ -4423,16 +4530,33 @@ function onboardingHtml(
       display: flex;
       align-items: center;
       gap: 9px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: rgba(255,255,255,0.46);
-      color: #565c54;
+      border: 0;
+      border-radius: 7px;
+      background: transparent;
+      color: var(--muted);
       cursor: pointer;
       font: inherit;
-      font-size: 12px;
-      font-weight: 650;
-      padding: 0 13px;
+      font-size: 11.5px;
+      font-weight: 520;
+      padding: 0 4px;
       text-align: left;
+    }
+    .provider-disclosure-toggle:hover {
+      color: var(--ink);
+    }
+    .provider-disclosure-selection {
+      min-width: 0;
+      overflow: hidden;
+      color: var(--ink);
+      font-weight: 560;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .provider-disclosure-selection::before {
+      content: "·";
+      margin-right: 7px;
+      color: var(--dim);
+      font-weight: 450;
     }
     .provider-disclosure-toggle::before {
       content: "";
@@ -4444,158 +4568,636 @@ function onboardingHtml(
       transition: transform 180ms ease, border-color 180ms ease;
     }
     .provider-disclosure-toggle[aria-expanded="true"]::before {
-      border-color: var(--accent-dark);
+      border-color: var(--ink);
       transform: rotate(45deg);
+    }
+    .provider-select-field {
+      display: grid;
+      gap: 0;
+    }
+    .provider-field-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      color: var(--muted);
+      font-size: 11.5px;
+      font-weight: 540;
+    }
+    .provider-inline-cta {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      color: #7B4B2C;
+      font-size: 10.5px;
+      font-weight: 520;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+    .provider-inline-cta::after {
+      content: "↗";
+      font-size: 11px;
+      line-height: 1;
+    }
+    .provider-inline-cta:hover {
+      color: var(--ink);
+    }
+    .provider-combobox {
+      position: relative;
+      z-index: 4;
+    }
+    .provider-combobox-toggle {
+      appearance: none;
+      width: 100%;
+      min-height: 42px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      border: 0;
+      border-radius: 8px;
+      background: #F7F8F7;
+      color: var(--ink);
+      cursor: pointer;
+      font: inherit;
+      padding: 8px 11px;
+      text-align: left;
+      transition: background 150ms ease, box-shadow 150ms ease;
+    }
+    .provider-combobox-toggle:hover {
+      background: #F2F3F2;
+    }
+    .provider-combobox-toggle[aria-expanded="true"] {
+      background: #F2F3F2;
+      box-shadow: 0 0 0 2px rgba(86, 93, 102, 0.12);
+    }
+    .provider-combobox-label {
+      flex: 0 0 auto;
+      color: var(--dim);
+      font-size: 11.5px;
+      font-weight: 500;
+    }
+    .provider-combobox-value {
+      min-width: 0;
+      flex: 1;
+      overflow: hidden;
+      color: #343A40;
+      font-size: 11.5px;
+      font-weight: 540;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .provider-selected-badges,
+    .provider-option-badges {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      flex: 0 0 auto;
+    }
+    .provider-badge {
+      display: inline-flex;
+      min-height: 18px;
+      align-items: center;
+      border-radius: 999px;
+      padding: 1px 7px;
+      font-size: 9.5px;
+      font-weight: 560;
+      line-height: 1.4;
+      white-space: nowrap;
+    }
+    .provider-badge.free {
+      border: 1px solid #E8D8CE;
+      background: #F8F1EC;
+      color: #825037;
+    }
+    .provider-combobox-chevron {
+      position: relative;
+      width: 14px;
+      height: 14px;
+      flex: 0 0 auto;
+      transition: transform 160ms ease;
+    }
+    .provider-combobox-chevron::before {
+      content: "";
+      position: absolute;
+      top: 2px;
+      left: 3px;
+      width: 6px;
+      height: 6px;
+      border-right: 1.5px solid #6E756F;
+      border-bottom: 1.5px solid #6E756F;
+      transform: rotate(45deg);
+    }
+    .provider-combobox-toggle[aria-expanded="true"] .provider-combobox-chevron {
+      transform: rotate(180deg);
+    }
+    .provider-select-panel {
+      position: absolute;
+      z-index: 30;
+      top: calc(100% + 6px);
+      left: 0;
+      width: 100%;
+      max-height: min(330px, 46vh);
+      overflow: hidden;
+      border: 1px solid #D6D9DC;
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.98);
+      box-shadow: 0 18px 44px rgba(22, 27, 31, 0.13), 0 3px 10px rgba(22, 27, 31, 0.05);
+    }
+    .provider-options {
+      max-height: min(330px, 46vh);
+      overflow-y: auto;
+      padding: 5px;
+      scrollbar-width: thin;
+      scrollbar-color: #C9CDD1 transparent;
+    }
+    .provider-option-group + .provider-option-group {
+      margin-top: 5px;
+      padding-top: 5px;
+      border-top: 1px solid #F0F1F2;
+    }
+    .provider-option-group-label {
+      padding: 5px 8px 4px;
+      color: #858B91;
+      font-size: 9.5px;
+      font-weight: 560;
+      letter-spacing: 0.04em;
+    }
+    .provider-option {
+      appearance: none;
+      width: 100%;
+      min-height: 36px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      border: 0;
+      border-radius: 6px;
+      background: transparent;
+      color: #252A2F;
+      cursor: pointer;
+      font: inherit;
+      font-size: 11.5px;
+      font-weight: 450;
+      padding: 6px 8px;
+      text-align: left;
+    }
+    .provider-option:hover,
+    .provider-option:focus-visible {
+      background: #F5F6F6;
+      outline: none;
+    }
+    .provider-option[aria-selected="true"] {
+      background: #F8F3EF;
+      color: #6F3F23;
+    }
+    .provider-option-label {
+      min-width: 0;
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .provider-option-check {
+      width: 16px;
+      flex: 0 0 16px;
+      color: #8E4B25;
+      font-size: 13px;
+      text-align: center;
+    }
+    .provider-options-empty {
+      padding: 24px 12px;
+      color: var(--muted);
+      font-size: 11px;
+      text-align: center;
+    }
+    .provider-combobox-toggle:focus-visible {
+      outline: 2px solid rgba(86, 93, 102, 0.36);
+      outline-offset: 2px;
     }
     .provider:focus-visible,
     .provider-feature-select:focus-visible,
     .provider-feature-cta:focus-visible,
     .provider-disclosure-toggle:focus-visible {
-      outline: 3px solid rgba(242, 106, 27, 0.35);
+      outline: 2px solid rgba(186, 77, 15, 0.48);
       outline-offset: 2px;
     }
     .provider-picker {
       min-height: 0;
-      max-height: min(310px, 42vh);
+      max-height: min(228px, 31vh);
       overflow-x: hidden;
       overflow-y: auto;
-      padding-right: 3px;
+      scrollbar-width: thin;
+      scrollbar-color: var(--line-strong) transparent;
     }
     .provider-picker .provider-grid {
-      padding-bottom: 2px;
+      margin-right: 3px;
     }
     .provider-grid.single-provider {
       grid-template-columns: 1fr;
     }
-    .setup-mode-grid {
-      display: grid;
-      gap: 12px;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-    .setup-mode-grid .choice {
-      min-height: 152px;
-      padding: 18px;
-      align-content: start;
-    }
-    .setup-mode-grid .choice strong {
-      font-size: 18px;
-      line-height: 1.15;
-    }
-    .setup-mode-grid .choice small {
-      max-width: 250px;
-      font-size: 12px;
-      line-height: 1.45;
-    }
-    .provider, .choice, .tier-button {
+    .provider, .choice {
       appearance: none;
       position: relative;
       display: grid;
       gap: 4px;
-      min-height: 82px;
+      min-height: 64px;
       border: 1px solid var(--line);
-      border-radius: 8px;
-      background: rgba(255,255,255,0.62);
+      border-radius: 9px;
+      background: var(--paper);
       color: var(--ink);
       cursor: pointer;
-      padding: 13px 12px;
+      padding: 12px 14px;
       text-align: left;
-      transition: border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease, background 160ms ease;
+      transition: border-color 150ms ease, background 150ms ease, box-shadow 150ms ease;
     }
     .provider {
-      min-height: 68px;
-      padding: 11px 13px;
+      min-height: 54px;
+      grid-template-columns: minmax(180px, 0.7fr) minmax(0, 1.3fr);
+      align-items: center;
+      gap: 16px;
+      border: 0;
+      border-bottom: 1px solid var(--line);
+      border-radius: 0;
+      padding: 10px 13px;
     }
-    .provider:hover, .choice:hover, .tier-button:hover {
-      border-color: rgba(242,106,27,0.3);
-      transform: translateY(-1px);
+    .provider:last-child { border-bottom: 0; }
+    .provider:hover, .choice:hover {
+      border-color: var(--line-strong);
+      background: var(--surface-subtle);
     }
-    .provider.active, .choice.active, .tier-button.active {
-      border-color: var(--accent);
-      background: #fffaf4;
-      box-shadow: 0 12px 26px rgba(54, 42, 28, 0.065);
-    }
-    .provider.active::after, .choice.active::after, .tier-button.active::after {
-      content: "";
-      position: absolute;
-      top: 10px;
-      right: 10px;
-      width: 7px;
-      height: 7px;
-      border-radius: 999px;
-      background: var(--accent);
+    .provider.active, .choice.active {
+      border-color: var(--line-strong);
+      background: var(--accent-soft);
+      box-shadow: inset 3px 0 0 var(--accent);
     }
     .provider:disabled, .choice:disabled {
       opacity: 0.48;
       cursor: not-allowed;
       transform: none;
     }
-    .provider strong, .choice strong, .tier-button strong {
+    .provider strong, .choice strong {
       display: block;
-      padding-right: 12px;
-      font-size: 14px;
-      font-weight: 650;
+      padding-right: 8px;
+      font-size: 13px;
+      font-weight: 580;
     }
-    .provider small, .choice small, .tier-button small {
+    .choice {
+      padding-right: 72px;
+    }
+    .search-provider-billing {
+      position: absolute;
+      top: 12px;
+      right: 14px;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      color: var(--dim);
+      font-size: 10px;
+      font-weight: 520;
+      line-height: 1;
+    }
+    .search-provider-billing::before {
+      content: "";
+      width: 4px;
+      height: 4px;
+      border-radius: 50%;
+      background: currentColor;
+      opacity: 0.72;
+    }
+    .search-provider-billing.free {
+      color: #4F7865;
+    }
+    .search-provider-billing.paid {
+      color: #7A6657;
+    }
+    .provider small, .choice small {
       color: var(--muted);
       display: block;
-      padding-right: 5px;
-      font-size: 11px;
+      padding-right: 4px;
+      font-size: 10.5px;
       font-weight: 450;
       line-height: 1.38;
     }
-    .provider-tag {
-      width: fit-content;
-      border: 1px solid rgba(242,106,27,0.14);
-      border-radius: 999px;
-      background: rgba(242,106,27,0.06);
-      color: var(--accent-dark);
-      font-size: 9px;
-      font-weight: 750;
-      letter-spacing: 0.06em;
-      padding: 3px 6px;
-      text-transform: uppercase;
+    .choice-row {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: 1fr;
     }
-    .choice-row, .tier-defaults {
+    .search-provider-list {
+      display: grid;
+      gap: 8px;
+    }
+    .inline-search-section {
       display: grid;
       gap: 10px;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      border-top: 1px solid var(--line);
+      margin-top: 8px;
+      padding-top: 20px;
     }
-    .tier-defaults {
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+    .inline-search-toggle {
+      appearance: none;
+      width: 100%;
+      min-height: 32px;
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      border: 0;
+      border-radius: 7px;
+      background: transparent;
+      cursor: pointer;
+      font: inherit;
+      padding: 0;
+      text-align: left;
     }
-    .tier-button {
-      min-height: 62px;
-      min-width: 0;
-      overflow: hidden;
+    .inline-search-title {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      color: #343A40;
+      font-size: 12.5px;
+      font-weight: 580;
+      line-height: 1.4;
     }
-    .tier-button small {
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
+    .inline-search-title::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-right: 1.5px solid #737A82;
+      border-bottom: 1.5px solid #737A82;
+      transform: rotate(-45deg);
+      transition: transform 160ms ease, border-color 160ms ease;
+    }
+    .inline-search-toggle[aria-expanded="true"] .inline-search-title::before {
+      border-color: var(--ink);
+      transform: rotate(45deg);
+    }
+    .inline-search-toggle:hover .inline-search-title {
+      color: var(--ink);
+    }
+    .inline-search-toggle:focus-visible {
+      outline: 2px solid rgba(186, 77, 15, 0.36);
+      outline-offset: 3px;
+    }
+    .inline-search-optional {
+      color: var(--dim);
+      font-size: 9.5px;
+      font-weight: 500;
+    }
+    .inline-search-panel {
+      display: grid;
+      gap: 8px;
+      padding-top: 2px;
+    }
+    .inline-search-section .choice {
+      min-height: 52px;
+      padding: 9px 64px 9px 12px;
+    }
+    .inline-search-section .choice.active {
+      border-color: #D9DCDE;
+      background: #F7F8F7;
+      box-shadow: none;
+    }
+    .inline-search-section .search-provider-billing {
+      top: 11px;
+      right: 12px;
+    }
+    .inline-search-section .search-provider-billing.free {
+      color: #825037;
+    }
+    .inline-search-section .search-paid-toggle {
+      min-height: 32px;
+    }
+    .search-provider-group-label {
+      margin: 0 4px -2px;
+      color: var(--dim);
+      font-size: 10.5px;
+      font-weight: 520;
+      line-height: 1.4;
+    }
+    .search-paid-disclosure {
+      display: grid;
+      gap: 8px;
+    }
+    .search-paid-toggle {
+      appearance: none;
+      width: 100%;
+      min-height: 38px;
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      font: inherit;
+      font-size: 11.5px;
+      font-weight: 520;
+      padding: 0 4px;
+      text-align: left;
+    }
+    .search-paid-toggle::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-right: 2px solid #7A818A;
+      border-bottom: 2px solid #7A818A;
+      transform: rotate(-45deg);
+      transition: transform 180ms ease, border-color 180ms ease;
+    }
+    .search-paid-toggle[aria-expanded="true"]::before {
+      border-color: var(--ink);
+      transform: rotate(45deg);
+    }
+    .search-paid-toggle:hover {
+      color: var(--ink);
+    }
+    .search-paid-count {
+      color: var(--dim);
+      font-size: 10px;
+      font-weight: 450;
+    }
+    .search-paid-panel {
+      display: grid;
+      gap: 8px;
+    }
+    .search-provider-option {
+      display: grid;
+      gap: 8px;
+    }
+    .search-provider-option .choice {
+      width: 100%;
+    }
+    .search-key-field {
+      padding: 0 4px 4px;
     }
     label {
       display: grid;
-      gap: 8px;
-      color: #565c54;
+      gap: 7px;
+      color: var(--muted);
+      font-size: 11.5px;
+      font-weight: 540;
+    }
+    .field-label-text {
+      display: inline-flex;
+      align-items: baseline;
+      gap: 3px;
+      width: fit-content;
+    }
+    .required-marker {
+      color: #C2382E;
       font-size: 12px;
-      font-weight: 600;
+      font-weight: 620;
+      line-height: 1;
     }
     input, select {
       width: 100%;
-      min-height: 42px;
-      border: 1px solid #d8d1c3;
+      min-height: 40px;
+      border: 1px solid #D9DCDE;
       border-radius: 8px;
-      background: rgba(255,255,255,0.74);
-      color: #1f231f;
+      background: #FCFCFB;
+      color: var(--ink);
       font: inherit;
-      font-size: 14px;
+      font-size: 13px;
       font-weight: 450;
-      padding: 0 13px;
+      padding: 0 12px;
       outline: none;
     }
     input:focus, select:focus {
-      border-color: var(--accent);
-      box-shadow: 0 0 0 3px rgba(242, 106, 27, 0.12);
+      border-color: #B8A69A;
+      box-shadow: 0 0 0 3px rgba(186, 77, 15, 0.07);
+    }
+    input[aria-invalid="true"] {
+      border-color: #C2382E;
+      box-shadow: 0 0 0 3px rgba(194, 56, 46, 0.08);
+    }
+    .api-key-field {
+      display: grid;
+      gap: 7px;
+    }
+    .api-key-head {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 14px;
+      padding-left: 11px;
+    }
+    .api-key-label {
+      display: inline-flex;
+      align-items: baseline;
+      color: var(--muted);
+      font-size: 11.5px;
+      font-weight: 540;
+    }
+    .field-error {
+      min-height: 16px;
+      margin-top: -1px;
+      color: #B42318;
+      font-size: 11px;
+      font-weight: 560;
+      line-height: 1.4;
+    }
+    .field-error:empty {
+      display: none;
+    }
+    .model-config {
+      display: grid;
+    }
+    .model-summary {
+      min-height: 42px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      border-radius: 8px;
+      background: #F7F8F7;
+      padding: 8px 11px;
+    }
+    .model-summary-copy {
+      min-width: 0;
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+    }
+    .model-summary-label {
+      flex: 0 0 auto;
+      color: var(--dim);
+      font-size: 11.5px;
+      font-weight: 500;
+    }
+    .model-summary-value {
+      min-width: 0;
+      overflow: hidden;
+      color: #343A40;
+      font-size: 11.5px;
+      font-weight: 540;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .model-summary-edit,
+    .model-editor-done {
+      appearance: none;
+      min-height: 28px;
+      flex: 0 0 auto;
+      border: 0;
+      border-radius: 6px;
+      background: transparent;
+      color: #6D5547;
+      cursor: pointer;
+      font: inherit;
+      font-size: 10.5px;
+      font-weight: 520;
+      padding: 0 7px;
+      transition: background 150ms ease, color 150ms ease;
+    }
+    .model-summary-edit:hover,
+    .model-editor-done:hover:not(:disabled) {
+      background: rgba(186, 77, 15, 0.06);
+      color: #542F1A;
+    }
+    .model-summary-edit:focus-visible,
+    .model-editor-done:focus-visible {
+      outline: 2px solid rgba(186, 77, 15, 0.36);
+      outline-offset: 1px;
+    }
+    .model-summary-edit {
+      width: 28px;
+      height: 28px;
+      color: #7A818A;
+      padding: 0;
+    }
+    .model-summary-edit:hover {
+      background: #ECEEEE;
+      color: #50575F;
+    }
+    .model-summary-edit:focus-visible {
+      outline-color: rgba(86, 93, 102, 0.36);
+    }
+    .model-summary-edit svg {
+      width: 14px;
+      height: 14px;
+      display: block;
+      margin: auto;
+      fill: none;
+      stroke: currentColor;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      stroke-width: 1.7;
+    }
+    .model-editor {
+      display: grid;
+      gap: 7px;
+    }
+    .model-editor-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .model-editor-head label {
+      display: inline-flex;
+    }
+    .model-editor-done:disabled {
+      cursor: not-allowed;
+      opacity: 0.4;
     }
 	    details {
 	      border: 1px solid #e2e0da;
@@ -4610,16 +5212,14 @@ function onboardingHtml(
 	      font-weight: 600;
 	    }
 	    .endpoint-panel {
-	      border: 1px solid #e2e0da;
-	      border-radius: 8px;
-	      background: rgba(255,255,255,0.46);
+	      border: 0;
+	      border-radius: 7px;
+	      background: transparent;
 	      overflow: hidden;
-	      transition: border-color 180ms ease, background 180ms ease, box-shadow 180ms ease;
 	    }
 	    .endpoint-panel.open {
-	      border-color: rgba(242,106,27,0.22);
-	      background: rgba(255,255,255,0.68);
-	      box-shadow: 0 10px 24px rgba(44,38,28,0.05);
+	      background: transparent;
+	      box-shadow: none;
 	    }
 	    .endpoint-summary {
 	      appearance: none;
@@ -4630,12 +5230,12 @@ function onboardingHtml(
 	      gap: 9px;
 	      border: 0;
 	      background: transparent;
-	      color: #656b64;
+	      color: var(--muted);
 	      cursor: pointer;
 	      font: inherit;
-	      font-size: 12px;
-	      font-weight: 650;
-	      padding: 0 13px;
+	      font-size: 11.5px;
+	      font-weight: 520;
+	      padding: 0 4px;
 	      text-align: left;
 	    }
 	    .endpoint-summary::before {
@@ -4648,12 +5248,12 @@ function onboardingHtml(
 	      transition: transform 180ms ease, border-color 180ms ease;
 	    }
 	    .endpoint-panel.open .endpoint-summary::before {
-	      border-color: var(--accent-dark);
+	      border-color: var(--ink);
 	      transform: rotate(45deg);
 	    }
 	    .endpoint-summary:focus-visible {
 	      outline: none;
-	      box-shadow: inset 0 0 0 3px rgba(242, 106, 27, 0.12);
+	      box-shadow: inset 0 0 0 3px rgba(186, 77, 15, 0.12);
 	    }
 	    .endpoint-content {
 	      display: grid;
@@ -4672,87 +5272,40 @@ function onboardingHtml(
 	      overflow: hidden;
 	    }
 	    .endpoint-fields {
-	      padding: 2px 13px 13px;
+	      padding: 4px 4px 4px 20px;
 	    }
 	    .field-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
-    .tier-list { display: grid; gap: 8px; }
-    .tier-item {
-      display: grid;
-      grid-template-columns: 88px minmax(0, 1fr) auto;
-      gap: 12px;
-      align-items: center;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: rgba(255,255,255,0.55);
-      padding: 11px 12px;
-    }
-    .tier-name { color: var(--accent-dark); font-size: 13px; font-weight: 750; }
-    #tierBody { min-width: 0; }
-    .tier-model { min-width: 0; }
-    .tier-model strong {
-      display: block;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      font-size: 13px;
-      font-weight: 650;
-    }
-    .tier-model small { color: var(--muted); font-size: 11px; }
-    .pill {
-      border: 1px solid rgba(37,99,58,0.2);
-      border-radius: 999px;
-      background: rgba(37,99,58,0.08);
-      color: var(--green);
-      font-size: 10px;
-      font-weight: 700;
-      padding: 5px 8px;
-      text-transform: uppercase;
-    }
-    .editor-grid { display: grid; gap: 12px; margin-top: 12px; }
-    .editor-row {
-      border-top: 1px solid rgba(32,35,31,0.08);
-      padding-top: 11px;
-    }
-    .muted-line { color: var(--dim); font-size: 12px; }
-    .note {
-      border: 1px solid rgba(242,106,27,0.13);
-      border-radius: 8px;
-      background: rgba(242,106,27,0.055);
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 500;
-      line-height: 1.45;
-      padding: 10px 12px;
-    }
     .actions {
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 10px;
-      min-height: 42px;
+      min-height: 40px;
+      border-top: 1px solid var(--line);
+      padding-top: 16px;
     }
     button {
-      min-height: 40px;
+      min-height: 36px;
       border: 1px solid transparent;
       cursor: pointer;
-      font-size: 14px;
-      font-weight: 650;
-      padding: 0 17px;
+      font-size: 13px;
+      font-weight: 570;
+      padding: 0 15px;
     }
     .secondary {
       background: transparent;
-      color: #656b64;
+      color: var(--muted);
     }
     .secondary:hover { color: var(--ink); }
     .primary {
-      background: linear-gradient(135deg, var(--accent), var(--accent-dark));
+      background: var(--primary);
       border-radius: 8px;
       color: #fff;
-      box-shadow: 0 13px 28px rgba(242, 106, 27, 0.22);
-      min-width: 150px;
+      box-shadow: none;
+      min-width: 112px;
     }
     .primary:hover {
-      transform: translateY(-1px);
+      background: var(--primary-hover);
     }
     .primary:disabled { opacity: 0.55; cursor: not-allowed; }
     .error {
@@ -4761,16 +5314,35 @@ function onboardingHtml(
       font-size: 12px;
       font-weight: 750;
     }
+    .error:empty {
+      display: none;
+    }
     @media (max-width: 680px) {
       main {
-        grid-template-columns: 1fr;
+        padding: 14px;
         overflow: auto;
       }
-      .rail { display: none; }
-      .setup-card { position: relative; min-height: 620px; height: auto; }
-      .provider-grid, .setup-mode-grid, .choice-row, .tier-defaults, .field-pair { grid-template-columns: 1fr; }
+      .topbar { width: 100%; }
+      .deck { width: 100%; }
+      .setup-card { position: relative; min-height: 620px; height: auto; padding: 24px 20px; }
+      .provider, .field-pair { grid-template-columns: 1fr; gap: 4px; }
       .provider-feature { grid-template-columns: 1fr; }
       .provider-feature-cta { width: 100%; }
+      .provider-promo-copy {
+        grid-column: 1 / -1;
+        grid-row: 2;
+        flex-wrap: wrap;
+        white-space: normal;
+      }
+      .api-key-head {
+        grid-template-columns: auto minmax(0, 1fr);
+        row-gap: 7px;
+      }
+      .provider-promo-cta {
+        grid-column: 2;
+        grid-row: 1;
+        justify-self: end;
+      }
     }
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after {
@@ -4784,194 +5356,92 @@ function onboardingHtml(
 </head>
 <body>
   <main>
-    <aside class="rail">
-      <section>
-        <h1 data-i18n="onboarding.rail.title">${ot('onboarding.rail.title')}</h1>
-        <p data-i18n="onboarding.rail.subtitle">${ot('onboarding.rail.subtitle')}</p>
-      </section>
-      <nav class="progress" aria-label="${ot('onboarding.aria.setupSteps')}" data-i18n-aria="onboarding.aria.setupSteps">
-        <button class="step active" type="button" data-step-label="0">
-          <span class="step-index">1</span>
-          <span><strong data-i18n="onboarding.nav.mode.title">${ot('onboarding.nav.mode.title')}</strong><span data-i18n="onboarding.nav.mode.sub">${ot('onboarding.nav.mode.sub')}</span></span>
-        </button>
-        <button class="step" type="button" data-step-label="1">
-          <span class="step-index">2</span>
-          <span><strong data-i18n="onboarding.nav.provider.title">${ot('onboarding.nav.provider.title')}</strong><span data-i18n="onboarding.nav.provider.sub">${ot('onboarding.nav.provider.sub')}</span></span>
-        </button>
-        <button class="step" type="button" data-step-label="2" data-advanced-step>
-          <span class="step-index">3</span>
-          <span><strong data-i18n="onboarding.nav.routing.title">${ot('onboarding.nav.routing.title')}</strong><span data-i18n="onboarding.nav.routing.sub">${ot('onboarding.nav.routing.sub')}</span></span>
-        </button>
-        <button class="step" type="button" data-step-label="3" data-advanced-step>
-          <span class="step-index">4</span>
-          <span><strong data-i18n="onboarding.nav.tiers.title">${ot('onboarding.nav.tiers.title')}</strong><span data-i18n="onboarding.nav.tiers.sub">${ot('onboarding.nav.tiers.sub')}</span></span>
-        </button>
-        <button class="step" type="button" data-step-label="4">
-          <span class="step-index">4</span>
-          <span><strong data-i18n="onboarding.nav.search.title">${ot('onboarding.nav.search.title')}</strong><span data-i18n="onboarding.nav.search.sub">${ot('onboarding.nav.search.sub')}</span></span>
-        </button>
-      </nav>
-      <div class="rail-bottom">
-        <label class="language-picker" for="onboardingLocale">
-          <span data-i18n="onboarding.language.label">${ot('onboarding.language.label')}</span>
-          <select id="onboardingLocale" aria-label="${ot('onboarding.aria.language')}" data-i18n-aria="onboarding.aria.language">
-            ${localeOptionsHtml()}
-          </select>
-        </label>
-        <div class="rail-foot" data-i18n="onboarding.rail.foot">${ot('onboarding.rail.foot')}</div>
-      </div>
-    </aside>
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark" aria-hidden="true"></span><span>OpenSquilla</span></div>
+      <label class="language-picker" for="onboardingLocale">
+        <span class="sr-only" data-i18n="onboarding.language.label">${ot('onboarding.language.label')}</span>
+        <select id="onboardingLocale" aria-label="${ot('onboarding.aria.language')}" data-i18n-aria="onboarding.aria.language">
+          ${localeOptionsHtml()}
+        </select>
+      </label>
+    </header>
     <form id="setup-form" class="deck">
-      <section class="setup-card active" data-screen="0">
+      <section class="setup-card active" data-screen="1">
         <header class="card-head">
-          <div>
-            <p class="eyebrow">Step 01</p>
-            <h2 data-i18n="onboarding.step1.heading">${ot('onboarding.step1.heading')}</h2>
-            <p data-i18n="onboarding.step1.subtitle">${ot('onboarding.step1.subtitle')}</p>
-          </div>
-          <span class="card-badge" data-i18n="onboarding.step1.badge">${ot('onboarding.step1.badge')}</span>
+          <h2 data-i18n="onboarding.step2.heading">${ot('onboarding.step2.heading')}</h2>
+          <p data-i18n="onboarding.step2.subtitle">${ot('onboarding.step2.subtitle')}</p>
         </header>
         <div class="card-body">
-          <div class="setup-mode-grid" role="radiogroup" aria-label="${ot('onboarding.aria.setupDepth')}" data-i18n-aria="onboarding.aria.setupDepth">
-            <button class="choice active" type="button" data-setup-mode="simple">
-              <strong data-i18n="onboarding.step1.simpleTitle">${ot('onboarding.step1.simpleTitle')}</strong>
-              <small data-i18n="onboarding.step1.simpleDesc">${ot('onboarding.step1.simpleDesc')}</small>
+        <input id="provider" type="hidden" value="tokenrhythm" />
+        <input id="routerMode" type="hidden" value="disabled" />
+        <input id="modelRoutingMode" type="hidden" value="direct" />
+        <div class="provider-select-field">
+          <div class="provider-combobox" id="providerCombobox">
+            <button class="provider-combobox-toggle" id="providerSelectToggle" type="button" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-controls="providerSelectPanel" aria-labelledby="providerSelectLabel providerSelectValue">
+              <span class="provider-combobox-label" id="providerSelectLabel" data-i18n="onboarding.nav.provider.title">${ot('onboarding.nav.provider.title')}</span>
+              <span class="provider-combobox-value" id="providerSelectValue"></span>
+              <span class="provider-selected-badges" id="providerSelectedBadges"></span>
+              <span class="provider-combobox-chevron" aria-hidden="true"></span>
             </button>
-            <button class="choice" type="button" data-setup-mode="advanced">
-              <strong data-i18n="onboarding.step1.advancedTitle">${ot('onboarding.step1.advancedTitle')}</strong>
-              <small data-i18n="onboarding.step1.advancedDesc">${ot('onboarding.step1.advancedDesc')}</small>
-            </button>
+            <div class="provider-select-panel" id="providerSelectPanel" hidden>
+              <div class="provider-options" id="providerOptions" role="listbox" aria-labelledby="providerSelectLabel"></div>
+            </div>
           </div>
-          <input id="setupMode" type="hidden" value="simple" />
-          <div class="note" data-i18n="onboarding.step1.note">${ot('onboarding.step1.note')}</div>
+        </div>
+        <div class="api-key-field">
+          <div class="api-key-head">
+            <label class="api-key-label" for="apiKey">
+              <span class="field-label-text"><span data-i18n="onboarding.step2.apiKey">${ot('onboarding.step2.apiKey')}</span><span class="required-marker" id="apiKeyRequiredMarker" aria-hidden="true">*</span></span>
+            </label>
+            <div class="provider-promo-copy">
+              <strong data-i18n="onboarding.step2.tokenrhythmTitle">${ot('onboarding.step2.tokenrhythmTitle')}</strong>
+              <span data-i18n="onboarding.step2.tokenrhythmRegistration">${ot('onboarding.step2.tokenrhythmRegistration')}</span>
+            </div>
+            <a class="provider-promo-cta" id="tokenrhythmRegister" href="${TOKENRHYTHM_REGISTER_URL}" target="_blank" rel="noopener noreferrer" data-i18n="onboarding.step2.tokenrhythmCta" data-i18n-aria="onboarding.step2.tokenrhythmCtaExternalLabel" aria-label="${ot('onboarding.step2.tokenrhythmCtaExternalLabel')}">${ot('onboarding.step2.tokenrhythmCta')}</a>
+          </div>
+          <input id="apiKey" name="apiKey" type="password" autocomplete="off" placeholder="sk-..." aria-describedby="apiKeyError" />
+          <span class="field-error" id="apiKeyError" role="alert" aria-live="polite"></span>
+        </div>
+        <input id="baseUrl" name="baseUrl" type="hidden" />
+        <div class="model-config" id="modelConfig">
+          <div class="model-summary" id="modelSummary">
+            <div class="model-summary-copy">
+              <span class="model-summary-label" id="modelSummaryLabel"></span>
+              <strong class="model-summary-value" id="modelSummaryValue"></strong>
+            </div>
+            <button class="model-summary-edit" id="modelEditToggle" type="button"></button>
+          </div>
+          <div class="model-editor" id="modelEditor" hidden>
+            <div class="model-editor-head">
+              <label for="model">
+                <span class="field-label-text"><span data-i18n="onboarding.step2.directModel">${ot('onboarding.step2.directModel')}</span><span class="required-marker" id="modelRequiredMarker" aria-hidden="true" hidden>*</span></span>
+              </label>
+              <button class="model-editor-done" id="modelEditDone" type="button"></button>
+            </div>
+            <input id="model" name="model" autocomplete="off" placeholder="Auto" aria-describedby="modelError" />
+            <span class="field-error" id="modelError" role="alert" aria-live="polite"></span>
+          </div>
+        </div>
+        <section class="inline-search-section" aria-labelledby="inlineSearchHeading">
+          <button class="inline-search-toggle" id="inlineSearchToggle" type="button" aria-expanded="false" aria-controls="inlineSearchPanel">
+            <span class="inline-search-title" id="inlineSearchHeading" data-i18n="onboarding.step5.heading">${ot('onboarding.step5.heading')}</span>
+            <span class="inline-search-optional" data-i18n="onboarding.step5.badge">${ot('onboarding.step5.badge')}</span>
+          </button>
+          <div class="inline-search-panel" id="inlineSearchPanel" hidden>
+            <div class="search-provider-list" id="searchProviderGrid" role="radiogroup" aria-label="${ot('onboarding.aria.searchProvider')}" data-i18n-aria="onboarding.aria.searchProvider"></div>
+            <input id="searchProvider" type="hidden" value="duckduckgo" />
+            <div id="searchKeyParking" hidden>
+              <label class="search-key-field" id="searchKeyLabel" for="searchApiKey" hidden>
+                <span class="field-label-text"><span data-i18n="onboarding.step5.searchKey">${ot('onboarding.step5.searchKey')}</span><span class="required-marker" aria-hidden="true">*</span></span>
+                <input id="searchApiKey" name="searchApiKey" type="password" autocomplete="off" placeholder="SEARCH_API_KEY" aria-describedby="searchApiKeyError" aria-required="true" />
+                <span class="field-error" id="searchApiKeyError" role="alert" aria-live="polite"></span>
+              </label>
+            </div>
+          </div>
+        </section>
         </div>
         <footer class="actions">
           <button class="secondary" type="button" id="cancel" data-i18n="onboarding.step1.quit">${ot('onboarding.step1.quit')}</button>
-          <button class="primary next-button" type="button" data-i18n="onboarding.step1.continue">${ot('onboarding.step1.continue')}</button>
-        </footer>
-      </section>
-      <section class="setup-card" data-screen="1">
-        <header class="card-head">
-          <div>
-            <p class="eyebrow">Step 02</p>
-            <h2 data-i18n="onboarding.step2.heading">${ot('onboarding.step2.heading')}</h2>
-            <p data-i18n="onboarding.step2.subtitle">${ot('onboarding.step2.subtitle')}</p>
-          </div>
-          <span class="card-badge" data-i18n="onboarding.step2.badge">${ot('onboarding.step2.badge')}</span>
-        </header>
-        <div class="card-body">
-        <div class="provider-feature active" data-provider-feature="tokenrhythm">
-          <button class="provider-feature-select" type="button" data-provider="tokenrhythm" aria-pressed="true">
-            <strong data-i18n="onboarding.step2.tokenrhythmTitle" data-tokenrhythm-title>${ot('onboarding.step2.tokenrhythmTitle')}</strong>
-            <span class="provider-feature-value" data-i18n="onboarding.step2.tokenrhythmValue" data-tokenrhythm-value>${ot('onboarding.step2.tokenrhythmValue')}</span>
-            <span class="provider-feature-registration" data-i18n="onboarding.step2.tokenrhythmRegistration" data-tokenrhythm-registration>${ot('onboarding.step2.tokenrhythmRegistration')}</span>
-          </button>
-          <a class="provider-feature-cta" id="tokenrhythmRegister" href="${TOKENRHYTHM_REGISTER_URL}" target="_blank" rel="noopener noreferrer" data-i18n="onboarding.step2.tokenrhythmCta" data-i18n-aria="onboarding.step2.tokenrhythmCtaExternalLabel" aria-label="${ot('onboarding.step2.tokenrhythmCtaExternalLabel')}">${ot('onboarding.step2.tokenrhythmCta')}</a>
-        </div>
-        <div class="provider-disclosure">
-          <button class="provider-disclosure-toggle" id="providerMoreToggle" type="button" aria-expanded="false" aria-controls="providerMorePanel">
-            <span data-i18n="onboarding.step2.otherProviders">${ot('onboarding.step2.otherProviders')}</span>
-          </button>
-          <div id="providerMorePanel" hidden>
-            <div class="provider-picker">
-              <div class="provider-grid" id="providerGrid"></div>
-            </div>
-          </div>
-        </div>
-        <input id="provider" type="hidden" value="tokenrhythm" />
-        <input id="routerMode" type="hidden" value="disabled" />
-        <label>
-          <span data-i18n="onboarding.step2.apiKey">${ot('onboarding.step2.apiKey')}</span>
-          <input id="apiKey" name="apiKey" type="password" autocomplete="off" placeholder="sk-..." />
-        </label>
-        <div class="endpoint-panel" id="endpointPanel">
-          <button class="endpoint-summary" id="endpointToggle" type="button" aria-expanded="false" aria-controls="endpointContent">
-            <span data-i18n="onboarding.step2.endpointSummary">${ot('onboarding.step2.endpointSummary')}</span>
-          </button>
-          <div class="endpoint-content" id="endpointContent" aria-hidden="true">
-            <div class="endpoint-content-clip">
-              <div class="field-pair endpoint-fields">
-                <label>
-                  <span data-i18n="onboarding.step2.baseUrl">${ot('onboarding.step2.baseUrl')}</span>
-                  <input id="baseUrl" name="baseUrl" autocomplete="off" />
-                </label>
-                <label>
-                  <span data-i18n="onboarding.step2.directModel">${ot('onboarding.step2.directModel')}</span>
-                  <input id="model" name="model" autocomplete="off" />
-                </label>
-              </div>
-            </div>
-          </div>
-        </div>
-        <div class="note" id="providerHint"></div>
-        </div>
-        <footer class="actions">
-          <button class="secondary back-button" type="button" data-i18n="onboarding.step2.back">${ot('onboarding.step2.back')}</button>
-          <button class="primary next-button" type="button" data-i18n="onboarding.step2.next">${ot('onboarding.step2.next')}</button>
-        </footer>
-      </section>
-      <section class="setup-card" data-screen="2">
-        <header class="card-head">
-          <div>
-            <p class="eyebrow">Step 03</p>
-            <h2 data-i18n="onboarding.step3.heading">${ot('onboarding.step3.heading')}</h2>
-            <p data-i18n="onboarding.step3.subtitle">${ot('onboarding.step3.subtitle')}</p>
-          </div>
-          <span class="card-badge" data-i18n="onboarding.step3.badge">${ot('onboarding.step3.badge')}</span>
-        </header>
-        <div class="card-body">
-          <div class="choice-row" id="modelRoutingModeGrid" role="radiogroup" aria-label="${ot('onboarding.aria.modelRoutingMode')}" data-i18n-aria="onboarding.aria.modelRoutingMode"></div>
-          <input id="modelRoutingMode" type="hidden" value="direct" />
-          <div id="directModelPanel" hidden>
-            <label>
-              <span data-i18n="onboarding.step3.directModel">${ot('onboarding.step3.directModel')}</span>
-              <input id="directModelRoute" autocomplete="off" />
-            </label>
-            <div class="note" id="directModelHint"></div>
-          </div>
-        </div>
-        <footer class="actions">
-          <button class="secondary back-button" type="button" data-i18n="onboarding.step3.back">${ot('onboarding.step3.back')}</button>
-          <button class="primary next-button" type="button" data-i18n="onboarding.step3.next">${ot('onboarding.step3.next')}</button>
-        </footer>
-      </section>
-      <section class="setup-card" data-screen="3">
-        <header class="card-head">
-          <div>
-            <p class="eyebrow">Step 03</p>
-            <h2 data-i18n="onboarding.step4.heading">${ot('onboarding.step4.heading')}</h2>
-            <p data-i18n="onboarding.step4.subtitle">${ot('onboarding.step4.subtitle')}</p>
-          </div>
-          <span class="card-badge" data-i18n="onboarding.step4.badge">${ot('onboarding.step4.badge')}</span>
-        </header>
-        <div class="card-body">
-          <div id="tierBody"></div>
-        </div>
-        <footer class="actions">
-          <button class="secondary back-button" type="button" data-i18n="onboarding.step4.back">${ot('onboarding.step4.back')}</button>
-          <button class="primary next-button" type="button" data-i18n="onboarding.step4.next">${ot('onboarding.step4.next')}</button>
-        </footer>
-      </section>
-      <section class="setup-card" data-screen="4">
-        <header class="card-head">
-          <div>
-            <p class="eyebrow">Step 04</p>
-            <h2 data-i18n="onboarding.step5.heading">${ot('onboarding.step5.heading')}</h2>
-            <p data-i18n="onboarding.step5.subtitle">${ot('onboarding.step5.subtitle')}</p>
-          </div>
-          <span class="card-badge" data-i18n="onboarding.step5.badge">${ot('onboarding.step5.badge')}</span>
-        </header>
-        <div class="card-body">
-        <div class="choice-row" id="searchProviderGrid" role="radiogroup" aria-label="${ot('onboarding.aria.searchProvider')}" data-i18n-aria="onboarding.aria.searchProvider"></div>
-        <input id="searchProvider" type="hidden" value="duckduckgo" />
-        <label id="searchKeyLabel" hidden>
-          <span data-i18n="onboarding.step5.searchKey">${ot('onboarding.step5.searchKey')}</span>
-          <input id="searchApiKey" name="searchApiKey" type="password" autocomplete="off" placeholder="SEARCH_API_KEY" />
-        </label>
-        <div class="note" id="searchHint" data-i18n="onboarding.step5.searchHintDefault">${ot('onboarding.step5.searchHintDefault')}</div>
-        </div>
-        <footer class="actions">
-          <button class="secondary back-button" type="button" data-i18n="onboarding.step5.back">${ot('onboarding.step5.back')}</button>
           <button class="primary" type="button" id="finish" data-i18n="onboarding.step5.finish">${ot('onboarding.step5.finish')}</button>
         </footer>
       </section>
@@ -4981,7 +5451,6 @@ function onboardingHtml(
   <script>
     const desktopMessages = ${inlineScriptJson(DESKTOP_MESSAGES)};
     const onboardingMessageCatalog = ${inlineScriptJson(ONBOARDING_SCRIPT_MESSAGES)};
-    const providerNoteCatalog = ${inlineScriptJson(PROVIDER_NOTE_MESSAGES)};
     const searchNoteCatalog = ${inlineScriptJson(SEARCH_PROVIDER_NOTE_MESSAGES)};
     let activeLocale = ${inlineScriptJson(desktopLocale)};
     let t = messagesFor(activeLocale);
@@ -4999,54 +5468,49 @@ function onboardingHtml(
     const providers = ${inlineScriptJson(PROVIDER_CATALOG)};
     const searchProviders = ${inlineScriptJson(SEARCH_PROVIDER_CATALOG)};
     const routerProfiles = ${inlineScriptJson(ROUTER_PROFILES)};
-    const textTiers = ${inlineScriptJson(TEXT_ROUTER_TIERS)};
     const initialProviderPrefill = ${inlineScriptJson(pendingProviderSetup)};
-    let step = 0;
+    let searchPaidOpen = false;
+    let searchSectionOpen = false;
     let routerTiers = clone(routerProfiles.openrouter);
-    const setupMode = document.getElementById('setupMode');
+    let modelEditorOpen = false;
     const provider = document.getElementById('provider');
     const baseUrl = document.getElementById('baseUrl');
     const model = document.getElementById('model');
-    const providerHint = document.getElementById('providerHint');
     const modelRoutingMode = document.getElementById('modelRoutingMode');
-    const modelRoutingModeGrid = document.getElementById('modelRoutingModeGrid');
-    const directModelPanel = document.getElementById('directModelPanel');
-    const directModelRoute = document.getElementById('directModelRoute');
-    const directModelHint = document.getElementById('directModelHint');
     const routerMode = document.getElementById('routerMode');
-    const tierBody = document.getElementById('tierBody');
-    const searchHint = document.getElementById('searchHint');
     const errorBox = document.getElementById('error');
+    const apiKey = document.getElementById('apiKey');
+    const apiKeyError = document.getElementById('apiKeyError');
+    const apiKeyRequiredMarker = document.getElementById('apiKeyRequiredMarker');
+    const modelError = document.getElementById('modelError');
+    const modelRequiredMarker = document.getElementById('modelRequiredMarker');
+    const modelSummary = document.getElementById('modelSummary');
+    const modelSummaryLabel = document.getElementById('modelSummaryLabel');
+    const modelSummaryValue = document.getElementById('modelSummaryValue');
+    const modelEditToggle = document.getElementById('modelEditToggle');
+    const modelEditor = document.getElementById('modelEditor');
+    const modelEditDone = document.getElementById('modelEditDone');
+    const searchApiKey = document.getElementById('searchApiKey');
+    const searchApiKeyError = document.getElementById('searchApiKeyError');
     const finish = document.getElementById('finish');
     const searchProvider = document.getElementById('searchProvider');
 	    const searchProviderGrid = document.getElementById('searchProviderGrid');
 	    const searchKeyLabel = document.getElementById('searchKeyLabel');
+	    const searchKeyParking = document.getElementById('searchKeyParking');
+      const inlineSearchToggle = document.getElementById('inlineSearchToggle');
+      const inlineSearchPanel = document.getElementById('inlineSearchPanel');
 	    const onboardingLocale = document.getElementById('onboardingLocale');
-	    const endpointPanel = document.getElementById('endpointPanel');
-	    const endpointToggle = document.getElementById('endpointToggle');
-	    const endpointContent = document.getElementById('endpointContent');
-    const tokenRhythmFeature = document.querySelector('[data-provider-feature="tokenrhythm"]');
-    const tokenRhythmProviderButton = tokenRhythmFeature.querySelector('[data-provider="tokenrhythm"]');
-    const providerMoreToggle = document.getElementById('providerMoreToggle');
-    const providerMorePanel = document.getElementById('providerMorePanel');
+    const providerCombobox = document.getElementById('providerCombobox');
+    const providerSelectToggle = document.getElementById('providerSelectToggle');
+    const providerSelectValue = document.getElementById('providerSelectValue');
+    const providerSelectedBadges = document.getElementById('providerSelectedBadges');
+    const providerSelectPanel = document.getElementById('providerSelectPanel');
+    const providerOptions = document.getElementById('providerOptions');
     function clone(value) {
       return JSON.parse(JSON.stringify(value || {}));
     }
     function currentProvider() {
       return providers.find((item) => item.id === provider.value) || providers[0];
-    }
-    function providerNote(item) {
-      return (providerNoteCatalog[activeLocale] && providerNoteCatalog[activeLocale][item.id])
-        || (providerNoteCatalog.en && providerNoteCatalog.en[item.id])
-        || item.note
-        || '';
-    }
-    function modelRoutingCapabilities(selected) {
-      return {
-        squilla_router: Boolean(selected.routerSupported),
-        direct: true,
-        llm_ensemble: Boolean(selected.ensembleSelectionMode),
-      };
     }
     function defaultModelRoutingModeFor(selected) {
       return selected.routerSupported ? 'squilla_router' : 'direct';
@@ -5054,145 +5518,124 @@ function onboardingHtml(
     function syncRouterModeFromModelRouting() {
       routerMode.value = modelRoutingMode.value === 'direct' ? 'disabled' : 'recommended';
     }
+    function renderModelField() {
+      const value = model.value.trim();
+      const showEditor = modelEditorOpen || !value;
+      modelSummary.hidden = showEditor;
+      modelEditor.hidden = !showEditor;
+      modelSummaryLabel.textContent = t.recommendedModel;
+      modelSummaryValue.textContent = value || t.noModel;
+      modelEditToggle.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L18.5 9.5a2.12 2.12 0 0 0-3-3L5 17v3Z"></path><path d="m13.5 6.5 3 3"></path></svg>';
+      modelEditToggle.setAttribute('aria-label', t.editModel);
+      modelEditToggle.setAttribute('title', t.editModel);
+      modelEditDone.textContent = t.doneEditingModel;
+      modelEditDone.disabled = !value;
+    }
 	    function profileKeyForMode() {
 	      return provider.value;
 	    }
-	    function setEndpointPanelOpen(open) {
-	      endpointPanel.classList.toggle('open', open);
-	      endpointToggle.setAttribute('aria-expanded', String(open));
-	      endpointContent.setAttribute('aria-hidden', String(!open));
-	    }
-	    function setProviderDisclosureOpen(open) {
-	      providerMoreToggle.setAttribute('aria-expanded', String(open));
-	      providerMorePanel.hidden = !open;
-	    }
 	    function syncProviderDefaults(resetRouter) {
 	      const selected = currentProvider();
+	      apiKeyRequiredMarker.hidden = !selected.requiresApiKey;
+	      apiKey.setAttribute('aria-required', String(selected.requiresApiKey));
+	      apiKey.disabled = !selected.requiresApiKey;
+	      apiKey.placeholder = selected.requiresApiKey ? 'sk-...' : t.noKeyRequired;
 	      if (resetRouter) {
 	        baseUrl.value = selected.baseUrl || '';
 	        model.value = selected.model || '';
+          modelEditorOpen = !model.value.trim();
 	      } else {
 	        if (!baseUrl.value && selected.baseUrl) baseUrl.value = selected.baseUrl;
 	        if (!model.value && selected.model) model.value = selected.model;
 	      }
-	      providerHint.textContent = providerNote(selected);
 	      if (resetRouter) {
 	        modelRoutingMode.value = defaultModelRoutingModeFor(selected);
 	        syncRouterModeFromModelRouting();
 	        routerTiers = clone(routerProfiles[profileKeyForMode()]);
-	        setEndpointPanelOpen(routerMode.value === 'disabled' && !model.value.trim());
 	      }
-	      renderModelRoutingModeGrid();
-	      renderTiers();
-	    }
+	      const modelRequired = modelRoutingMode.value === 'direct';
+      modelRequiredMarker.hidden = !modelRequired;
+      model.setAttribute('aria-required', String(modelRequired));
+      renderModelField();
+    }
     function selectProvider(nextProvider) {
       const next = nextProvider || 'tokenrhythm';
-      // Re-clicking the already-active provider must not reset base URL, model,
-      // routing mode, and customized tiers back to catalog defaults.
+      // Re-clicking the active provider must preserve any endpoint overrides.
       if (next === provider.value) return;
       provider.value = next;
-      errorBox.textContent = '';
+      apiKey.value = '';
+      clearValidationErrors();
       syncProviderDefaults(true);
       renderProviderGrid();
       render();
     }
     function renderProviderGrid() {
-      const grid = document.getElementById('providerGrid');
-      const otherProviders = providers.filter((item) => item.id !== 'tokenrhythm');
-      const tokenRhythmSelected = provider.value === 'tokenrhythm';
-      tokenRhythmFeature.classList.toggle('active', tokenRhythmSelected);
-      tokenRhythmProviderButton.setAttribute('aria-pressed', String(tokenRhythmSelected));
-      tokenRhythmProviderButton.onclick = () => selectProvider('tokenrhythm');
-      grid.classList.toggle('single-provider', otherProviders.length === 1);
-      grid.innerHTML = otherProviders.map((item) => (
-        '<button class="provider' + (item.id === provider.value ? ' active' : '') + '" type="button" data-provider="' + escapeAttr(item.id) + '" aria-pressed="' + String(item.id === provider.value) + '">' +
-        '<span class="provider-tag">' + escapeHtml(t.providerField) + '</span><strong>' + escapeHtml(item.label) + '</strong><small>' + escapeHtml(providerNote(item)) + '</small></button>'
-      )).join('');
-      const bindProviderButton = (button) => {
-        button.addEventListener('click', () => selectProvider(button.dataset.provider || 'tokenrhythm'));
-      };
-      grid.querySelectorAll('.provider').forEach(bindProviderButton);
-    }
-    function renderModelRoutingModeGrid() {
       const selected = currentProvider();
-      const capabilities = modelRoutingCapabilities(selected);
-      if (!capabilities[modelRoutingMode.value]) {
-        modelRoutingMode.value = defaultModelRoutingModeFor(selected);
-      }
-      syncRouterModeFromModelRouting();
-      const modes = [
-        { id: 'squilla_router', title: t.modeSmartRouterTitle, desc: t.modeSmartRouterDesc, disabledReason: t.modeSmartRouterUnavailable },
-        { id: 'direct', title: t.modeDirectTitle, desc: t.modeDirectDesc, disabledReason: '' },
-        { id: 'llm_ensemble', title: t.modeEnsembleTitle, desc: t.modeEnsembleDesc, disabledReason: t.modeEnsembleUnavailable },
-      ];
-      modelRoutingModeGrid.innerHTML = modes.map((mode) => {
-        const enabled = Boolean(capabilities[mode.id]);
-        const active = mode.id === modelRoutingMode.value;
-        const desc = enabled ? mode.desc : mode.disabledReason;
-        return '<button class="choice' + (active ? ' active' : '') + '" type="button" data-model-routing-mode="' + escapeAttr(mode.id) + '"' + (enabled ? '' : ' disabled') + '>' +
-          '<strong>' + escapeHtml(mode.title) + '</strong><small>' + escapeHtml(desc) + '</small></button>';
-      }).join('');
-      modelRoutingModeGrid.querySelectorAll('[data-model-routing-mode]').forEach((button) => {
-        button.addEventListener('click', () => {
-          if (button.disabled) return;
-          modelRoutingMode.value = button.dataset.modelRoutingMode || 'squilla_router';
-          syncRouterModeFromModelRouting();
-          if (modelRoutingMode.value === 'direct') setEndpointPanelOpen(true);
-          errorBox.textContent = '';
-          renderModelRoutingModeGrid();
-          render();
-        });
-      });
-      directModelPanel.hidden = modelRoutingMode.value !== 'direct';
-      directModelRoute.value = model.value;
-      directModelHint.textContent = t.directModelPrompt;
+      providerSelectValue.textContent = selected.label;
+      providerSelectedBadges.innerHTML = '';
+      renderProviderOptions();
     }
-    function renderTiers() {
-      if (routerMode.value === 'disabled') {
-        tierBody.innerHTML =
-          '<label>' + escapeHtml(t.directModelLabel) + '<input id="directModelActive" autocomplete="off" value="' + escapeAttr(model.value) + '" /></label>' +
-          '<div class="note">' + escapeHtml(t.directModelNote) + '</div>';
-        document.getElementById('directModelActive').addEventListener('input', (event) => {
-          model.value = event.target.value;
+    function providerBadgesHtml(item) {
+      if (!item || item.id !== 'tokenrhythm') return '';
+      return '<span class="provider-badge free">' + escapeHtml(t.limitedFreeBadge) + '</span>';
+    }
+    function providerGroupFor(item) {
+      if (item.id === 'tokenrhythm') return 'recommended';
+      return item.deployment === 'local' ? 'local' : 'cloud';
+    }
+    function renderProviderOptions() {
+      const groups = [
+        { id: 'recommended', label: t.providerGroupRecommended },
+        { id: 'cloud', label: t.providerGroupCloud },
+        { id: 'local', label: t.providerGroupLocal },
+      ];
+      const html = groups.map((group) => {
+        const items = providers.filter((item) => providerGroupFor(item) === group.id);
+        if (!items.length) return '';
+        return '<div class="provider-option-group" data-provider-group="' + group.id + '">'
+          + '<div class="provider-option-group-label">' + escapeHtml(group.label) + '</div>'
+          + items.map((item) => {
+            const isSelected = item.id === provider.value;
+            return '<button class="provider-option" type="button" role="option" data-provider-option="' + escapeAttr(item.id) + '" aria-selected="' + String(isSelected) + '">'
+              + '<span class="provider-option-label">' + escapeHtml(item.label) + '</span>'
+              + '<span class="provider-option-badges">' + providerBadgesHtml(item) + '</span>'
+              + '<span class="provider-option-check" aria-hidden="true">' + (isSelected ? '✓' : '') + '</span>'
+              + '</button>';
+          }).join('')
+          + '</div>';
+      }).join('');
+      providerOptions.innerHTML = html;
+      providerOptions.querySelectorAll('[data-provider-option]').forEach((option) => {
+        option.addEventListener('click', () => {
+          selectProvider(option.dataset.providerOption);
+          setProviderPickerOpen(false);
+          providerSelectToggle.focus();
         });
-        return;
+        option.addEventListener('keydown', (event) => {
+          const options = Array.from(providerOptions.querySelectorAll('[data-provider-option]'));
+          const index = options.indexOf(option);
+          if (event.key === 'ArrowDown' && options[index + 1]) {
+            event.preventDefault();
+            options[index + 1].focus();
+          } else if (event.key === 'ArrowUp') {
+            event.preventDefault();
+            (options[index - 1] || providerSelectToggle).focus();
+          } else if (event.key === 'Escape') {
+            event.preventDefault();
+            setProviderPickerOpen(false);
+            providerSelectToggle.focus();
+          }
+        });
+      });
+    }
+    function setProviderPickerOpen(open) {
+      providerSelectToggle.setAttribute('aria-expanded', String(open));
+      providerSelectPanel.hidden = !open;
+      if (open) {
+        renderProviderOptions();
+        const selectedOption = providerOptions.querySelector('[aria-selected="true"]');
+        (selectedOption || providerOptions.querySelector('[data-provider-option]'))?.focus();
       }
-      const defaultTier = document.getElementById('routerDefaultTier')?.value || 'c1';
-      const tierButtons = textTiers.map((tier) => (
-        '<button class="tier-button' + (tier === defaultTier ? ' active' : '') + '" type="button" data-default-tier="' + tier + '">' +
-        '<strong>' + tier.toUpperCase() + '</strong><small title="' + escapeAttr(routerTiers[tier]?.model || t.noModel) + '">' + escapeHtml(shortModel(routerTiers[tier]?.model || t.noModel)) + '</small></button>'
-      )).join('');
-      const names = Object.keys(routerTiers).filter((name) => textTiers.includes(name) || name === 'image_model');
-      const tierList = names.map((name) => {
-        const tier = routerTiers[name] || {};
-        return '<div class="tier-item"><div class="tier-name">' + name + '</div><div class="tier-model"><strong>' + escapeHtml(tier.model || '') + '</strong><small>' + escapeHtml(tier.provider || '') + '</small></div>' +
-          (name === defaultTier ? '<span class="pill">' + escapeHtml(t.defaultPill) + '</span>' : '<span></span>') + '</div>';
-      }).join('');
-      const editor = names.map((name) => {
-        const tier = routerTiers[name] || {};
-        return '<div class="editor-row"><div class="muted-line">' + name + '</div><div class="field-pair">' +
-          '<label>' + escapeHtml(t.providerField) + '<input data-tier-provider="' + name + '" value="' + escapeAttr(tier.provider || '') + '" /></label>' +
-          '<label>' + escapeHtml(t.modelField) + '<input data-tier-model="' + name + '" value="' + escapeAttr(tier.model || '') + '" /></label></div></div>';
-      }).join('');
-      tierBody.innerHTML =
-        '<input id="routerDefaultTier" type="hidden" value="' + defaultTier + '" />' +
-        '<div class="tier-defaults">' + tierButtons + '</div>' +
-        '<div class="tier-list">' + tierList + '</div>' +
-        '<details><summary>' + escapeHtml(t.customizeTiers) + '</summary><div class="editor-grid">' + editor + '</div></details>';
-      tierBody.querySelectorAll('[data-default-tier]').forEach((button) => {
-        button.addEventListener('click', () => {
-          document.getElementById('routerDefaultTier').value = button.dataset.defaultTier || 'c1';
-          renderTiers();
-        });
-      });
-      tierBody.querySelectorAll('[data-tier-provider], [data-tier-model]').forEach((input) => {
-        input.addEventListener('input', () => {
-          const tierName = input.dataset.tierProvider || input.dataset.tierModel;
-          routerTiers[tierName] = routerTiers[tierName] || {};
-          if (input.dataset.tierProvider) routerTiers[tierName].provider = input.value.trim();
-          if (input.dataset.tierModel) routerTiers[tierName].model = input.value.trim();
-        });
-      });
     }
     function escapeHtml(value) {
       return String(value).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
@@ -5212,15 +5655,12 @@ function onboardingHtml(
       document.querySelectorAll('[data-i18n-aria]').forEach((element) => {
         element.setAttribute('aria-label', desktopMessage(locale, element.dataset.i18nAria));
       });
+      clearValidationErrors();
       renderProviderGrid();
       renderSearchProviderGrid();
       syncProviderDefaults(false);
+      renderModelField();
       render();
-    }
-    function shortModel(value) {
-      const text = String(value || '');
-      const parts = text.split('/');
-      return parts[parts.length - 1] || text;
     }
     function currentSearchProvider() {
       return searchProviders.find((item) => item.providerId === searchProvider.value) || searchProviders[0];
@@ -5232,13 +5672,38 @@ function onboardingHtml(
         || (item.requiresApiKey ? t.requiresApiKey : t.noKeyRequired);
     }
     function renderSearchProviderGrid() {
-      searchProviderGrid.innerHTML = searchProviders.map((item) => (
-        '<button class="choice' + (item.providerId === searchProvider.value ? ' active' : '') + '" type="button" data-search-provider="' + escapeAttr(item.providerId) + '">' +
-        '<strong>' + escapeHtml(item.label) + '</strong><small>' + escapeHtml(searchProviderNote(item)) + '</small></button>'
-      )).join('');
+      searchKeyParking.appendChild(searchKeyLabel);
+      searchKeyLabel.hidden = true;
+      const renderSearchChoice = (item) => (
+        '<div class="search-provider-option" data-search-provider-option="' + escapeAttr(item.providerId) + '">' +
+        '<button class="choice' + (item.providerId === searchProvider.value ? ' active' : '') + '" type="button" data-search-provider="' + escapeAttr(item.providerId) + '" aria-pressed="' + String(item.providerId === searchProvider.value) + '">' +
+        '<strong>' + escapeHtml(item.label) + '</strong><small>' + escapeHtml(searchProviderNote(item)) + '</small>' +
+        '<span class="search-provider-billing ' + (item.requiresApiKey ? 'paid' : 'free') + '">' + escapeHtml(item.requiresApiKey ? t.billingPaid : t.billingFree) + '</span>' +
+        '</button></div>'
+      );
+      const freeProviders = searchProviders.filter((item) => !item.requiresApiKey);
+      const paidProviders = searchProviders.filter((item) => item.requiresApiKey);
+      searchProviderGrid.innerHTML =
+        '<div class="search-provider-group-label">' + escapeHtml(t.searchFreeGroup) + '</div>' +
+        freeProviders.map(renderSearchChoice).join('') +
+        '<div class="search-paid-disclosure">' +
+          '<button class="search-paid-toggle" id="searchPaidToggle" type="button" aria-expanded="' + String(searchPaidOpen) + '" aria-controls="searchPaidPanel">' +
+            '<span>' + escapeHtml(t.searchPaidGroup) + '</span><span class="search-paid-count">' + paidProviders.length + '</span>' +
+          '</button>' +
+          '<div class="search-paid-panel" id="searchPaidPanel"' + (searchPaidOpen ? '' : ' hidden') + '>' +
+            paidProviders.map(renderSearchChoice).join('') +
+          '</div>' +
+        '</div>';
+      document.getElementById('searchPaidToggle').addEventListener('click', () => {
+        searchPaidOpen = !searchPaidOpen;
+        renderSearchProviderGrid();
+        render();
+      });
       searchProviderGrid.querySelectorAll('[data-search-provider]').forEach((button) => {
         button.addEventListener('click', () => {
           searchProvider.value = button.dataset.searchProvider || 'duckduckgo';
+          if (currentSearchProvider().requiresApiKey) searchPaidOpen = true;
+          clearFieldError(searchApiKey, searchApiKeyError);
           renderSearchProviderGrid();
           render();
         });
@@ -5246,182 +5711,120 @@ function onboardingHtml(
     }
     function syncSearchProviderControls() {
       const selected = currentSearchProvider();
-      searchKeyLabel.hidden = !selected.requiresApiKey;
+      const selectedButton = searchProviderGrid.querySelector('[data-search-provider="' + selected.providerId + '"]');
+      const selectedOption = selectedButton && selectedButton.closest('.search-provider-option');
+      if (selected.requiresApiKey && selectedOption) {
+        selectedOption.appendChild(searchKeyLabel);
+        searchKeyLabel.hidden = false;
+      } else {
+        searchKeyParking.appendChild(searchKeyLabel);
+        searchKeyLabel.hidden = true;
+      }
       const input = document.getElementById('searchApiKey');
       if (input) input.placeholder = selected.keyPlaceholder || selected.envKey || 'SEARCH_API_KEY';
-      searchHint.textContent = searchProviderNote(selected);
     }
-    function isSimpleSetup() {
-      return setupMode.value === 'simple';
-    }
-    function routeSteps() {
-      return isSimpleSetup()
-        ? [0, 1, 4]
-        : modelRoutingMode.value === 'squilla_router'
-          ? [0, 1, 2, 3, 4]
-          : [0, 1, 2, 4];
-    }
-    function routePosition(targetStep) {
-      return routeSteps().indexOf(targetStep);
-    }
-    function nextRouteStep(currentStep) {
-      const route = routeSteps();
-      const index = Math.max(0, route.indexOf(currentStep));
-      return route[Math.min(route.length - 1, index + 1)];
-    }
-    function previousRouteStep(currentStep) {
-      const route = routeSteps();
-      const index = Math.max(0, route.indexOf(currentStep));
-      return route[Math.max(0, index - 1)];
-    }
-    function focusStepHeading(screen) {
-      if (!screen) return;
-      window.requestAnimationFrame(() => {
-        const heading = screen.querySelector('h2');
-        if (!heading) return;
-        heading.setAttribute('tabindex', '-1');
-        heading.focus({ preventScroll: true });
-      });
-    }
-    function setStep(nextStep) {
-      const current = document.querySelector('.setup-card.active');
-      const route = routeSteps();
-      step = route.includes(nextStep) ? nextStep : route[0];
-      document.querySelectorAll('.setup-card').forEach((screen) => {
-        screen.classList.remove('active', 'leaving');
-      });
-      if (current) current.classList.add('leaving');
-      const nextScreen = document.querySelector('[data-screen="' + step + '"]');
-      nextScreen.classList.add('active');
-      render();
-      focusStepHeading(nextScreen);
+    function setSearchSectionOpen(open) {
+      searchSectionOpen = Boolean(open);
+      inlineSearchToggle.setAttribute('aria-expanded', String(searchSectionOpen));
+      inlineSearchPanel.hidden = !searchSectionOpen;
     }
     function render() {
-      const route = routeSteps();
-      const currentRouteIndex = route.indexOf(step);
-      document.querySelectorAll('[data-advanced-step]').forEach((item) => {
-        item.classList.toggle('simple-hidden', isSimpleSetup());
-      });
-	      document.querySelectorAll('.step').forEach((item) => {
-	        const labelStep = Number(item.dataset.stepLabel || 0);
-	        const itemRouteIndex = route.indexOf(labelStep);
-	        const index = item.querySelector('.step-index');
-	        item.hidden = itemRouteIndex < 0;
-	        if (index && itemRouteIndex >= 0) index.textContent = String(itemRouteIndex + 1);
-	        item.classList.toggle('active', labelStep === step);
-	        item.classList.toggle('done', itemRouteIndex >= 0 && itemRouteIndex < currentRouteIndex);
-	      });
-      document.querySelectorAll('.setup-card').forEach((screen) => {
-        const screenStep = Number(screen.dataset.screen || 0);
-        const screenRouteIndex = route.indexOf(screenStep);
-        const eyebrow = screen.querySelector('.eyebrow');
-        if (eyebrow && screenRouteIndex >= 0) {
-          eyebrow.textContent = fmt('stepLabel', { n: String(screenRouteIndex + 1).padStart(2, '0') });
-        }
-      });
-      if (step === 1) {
-        syncProviderDefaults(false);
-      }
-      renderModelRoutingModeGrid();
-      if (step === 3) renderTiers();
+      syncProviderDefaults(false);
       syncSearchProviderControls();
     }
-    document.querySelectorAll('.step').forEach((button) => {
-      button.addEventListener('click', () => {
-        const target = Number(button.dataset.stepLabel || 0);
-        const currentPosition = routePosition(step);
-        const targetPosition = routePosition(target);
-        if (targetPosition < 0) return;
-        if (targetPosition > currentPosition) {
-          const message = validateStep();
-          if (message) {
-            errorBox.textContent = message;
-            return;
-          }
-        }
-        errorBox.textContent = '';
-        setStep(target);
-      });
-    });
-    document.querySelectorAll('[data-setup-mode]').forEach((button) => {
-      button.addEventListener('click', () => {
-        setupMode.value = button.dataset.setupMode || 'simple';
-        document.querySelectorAll('[data-setup-mode]').forEach((item) => item.classList.toggle('active', item === button));
-        errorBox.textContent = '';
-        render();
-      });
-    });
 	    onboardingLocale.addEventListener('change', () => {
-	      errorBox.textContent = '';
 	      applyLocale(onboardingLocale.value);
 	    });
-	    providerMoreToggle.addEventListener('click', () => {
-	      setProviderDisclosureOpen(providerMoreToggle.getAttribute('aria-expanded') !== 'true');
-	    });
-	    endpointToggle.addEventListener('click', () => {
-	      setEndpointPanelOpen(!endpointPanel.classList.contains('open'));
-	    });
-	    directModelRoute.addEventListener('input', () => {
-	      model.value = directModelRoute.value;
-	    });
+      providerSelectToggle.addEventListener('click', () => {
+        setProviderPickerOpen(providerSelectToggle.getAttribute('aria-expanded') !== 'true');
+      });
+      providerSelectToggle.addEventListener('keydown', (event) => {
+        if (event.key === 'ArrowDown') {
+          event.preventDefault();
+          setProviderPickerOpen(true);
+        }
+      });
+      inlineSearchToggle.addEventListener('click', () => {
+        setSearchSectionOpen(!searchSectionOpen);
+      });
+      document.addEventListener('pointerdown', (event) => {
+        if (!providerCombobox.contains(event.target)) setProviderPickerOpen(false);
+      });
+      function clearFieldError(input, output) {
+        output.textContent = '';
+        input.removeAttribute('aria-invalid');
+      }
+      function clearValidationErrors() {
+        errorBox.textContent = '';
+        clearFieldError(apiKey, apiKeyError);
+        clearFieldError(model, modelError);
+        clearFieldError(searchApiKey, searchApiKeyError);
+      }
+      function presentValidationIssue(issue) {
+        issue.output.textContent = issue.message;
+        issue.input.setAttribute('aria-invalid', 'true');
+        if (issue.input === model) {
+          modelEditorOpen = true;
+          renderModelField();
+        }
+        if (issue.input === searchApiKey) {
+          setSearchSectionOpen(true);
+        }
+        issue.input.focus({ preventScroll: false });
+      }
 	    function validateStep() {
       const selected = currentProvider();
       const selectedSearch = currentSearchProvider();
-      if (step === 1 && selected.requiresApiKey && !document.getElementById('apiKey').value.trim()) return fmt('apiKeyRequired', { label: selected.label });
-      // Direct mode needs a model. In Simple setup the routing screen (step 2) is
-      // not in the route, so the model is entered on the provider screen (step 1);
-      // validate on whichever step is actually reachable, or the check silently
-      // never runs and the save fails late with a raw main-process error.
+      if (selected.requiresApiKey && !apiKey.value.trim()) {
+        return { input: apiKey, output: apiKeyError, message: fmt('apiKeyRequired', { label: selected.label }) };
+      }
       if (modelRoutingMode.value === 'direct' && !model.value.trim()) {
-        if (isSimpleSetup() && step === 1) return t.directModelRequiredDirect;
-        if (!isSimpleSetup() && step === 2) return t.directModelRequiredDirect;
+        return { input: model, output: modelError, message: t.directModelRequiredDirect };
       }
-      if (step === 3 && modelRoutingMode.value === 'squilla_router') {
-        const defaultTier = document.getElementById('routerDefaultTier')?.value || 'c1';
-        if (!routerTiers[defaultTier] || !routerTiers[defaultTier].model) return t.defaultTierRequiresModel;
+      if (selectedSearch.requiresApiKey && !searchApiKey.value.trim()) {
+        return { input: searchApiKey, output: searchApiKeyError, message: fmt('searchApiKeyRequired', { label: selectedSearch.label }) };
       }
-      if (step === 4 && selectedSearch.requiresApiKey && !document.getElementById('searchApiKey').value.trim()) return fmt('searchApiKeyRequired', { label: selectedSearch.label });
-      return '';
+      return null;
     }
+    [[apiKey, apiKeyError], [model, modelError], [searchApiKey, searchApiKeyError]].forEach(([input, output]) => {
+      input.addEventListener('input', () => {
+        clearFieldError(input, output);
+        if (input === model) renderModelField();
+      });
+    });
+    modelEditToggle.addEventListener('click', () => {
+      modelEditorOpen = true;
+      renderModelField();
+      model.focus({ preventScroll: true });
+    });
+    modelEditDone.addEventListener('click', () => {
+      if (!model.value.trim()) return;
+      modelEditorOpen = false;
+      renderModelField();
+      modelEditToggle.focus({ preventScroll: true });
+    });
     document.getElementById('cancel').addEventListener('click', () => {
       window.opensquillaDesktop.cancelOnboarding();
     });
-    document.querySelectorAll('.back-button').forEach((button) => button.addEventListener('click', () => {
-      errorBox.textContent = '';
-      setStep(previousRouteStep(step));
-    }));
-    document.querySelectorAll('.next-button').forEach((button) => button.addEventListener('click', () => {
-      errorBox.textContent = '';
-      const message = validateStep();
-      if (message) {
-        errorBox.textContent = message;
-        return;
-      }
-      setStep(nextRouteStep(step));
-    }));
     finish.addEventListener('click', async () => {
-      errorBox.textContent = '';
-      for (const index of routeSteps()) {
-        step = index;
-        const message = validateStep();
-        if (message) {
-          setStep(index);
-          errorBox.textContent = message;
-          return;
-        }
+      clearValidationErrors();
+      const issue = validateStep();
+      if (issue) {
+        presentValidationIssue(issue);
+        return;
       }
       try {
         await window.opensquillaDesktop.saveOnboarding({
           provider: provider.value,
-          apiKey: document.getElementById('apiKey').value,
+          apiKey: apiKey.value,
           baseUrl: baseUrl.value,
           model: model.value,
           modelRoutingMode: modelRoutingMode.value,
           routerMode: routerMode.value,
-          routerDefaultTier: document.getElementById('routerDefaultTier')?.value || 'c1',
+          routerDefaultTier: 'c1',
           routerTiers,
           searchProvider: searchProvider.value,
-          searchApiKey: document.getElementById('searchApiKey').value,
+          searchApiKey: searchApiKey.value,
           locale: activeLocale,
         });
       } catch (error) {
@@ -5435,20 +5838,21 @@ function onboardingHtml(
         provider.value = nextProvider;
         syncProviderDefaults(true);
       }
-      if (nextProvider && nextProvider !== 'tokenrhythm') setProviderDisclosureOpen(true);
       if (prefill.baseUrl) baseUrl.value = String(prefill.baseUrl);
       if (prefill.model) model.value = String(prefill.model);
       if (prefill.apiKey) document.getElementById('apiKey').value = String(prefill.apiKey);
       syncProviderDefaults(false);
+      modelEditorOpen = !model.value.trim();
+      renderModelField();
       renderProviderGrid();
       render();
     }
     renderProviderGrid();
     renderSearchProviderGrid();
+    setSearchSectionOpen(false);
     syncProviderDefaults(true);
     applyMigrationPrefill(initialProviderPrefill);
     render();
-    focusStepHeading(document.querySelector('.setup-card.active'));
   </script>
 </body>
 </html>`
@@ -5660,6 +6064,117 @@ async function resolveGatewayRuntime(): Promise<RuntimeLaunch> {
     cwd: repoRoot,
     mode: 'dev',
   }
+}
+
+const ONBOARDING_PROBE_STDOUT_LIMIT = 256 * 1024
+const ONBOARDING_PROBE_TIMEOUT_MS = 40_000
+
+function onboardingProbeString(value: unknown, maxLength: number): string {
+  return typeof value === 'string' ? value.trim().slice(0, maxLength) : ''
+}
+
+async function probeOnboardingProvider(
+  payload: OnboardingProbePayload,
+): Promise<OnboardingProbeResult> {
+  const providerId = onboardingProbeString(payload?.provider, 120).toLowerCase()
+  const selected = PROVIDER_CATALOG.find((entry) => entry.id === providerId)
+  if (!selected) {
+    return {
+      ok: false,
+      failureKind: 'invalid_config',
+      message: 'Choose a supported provider.',
+      latencyMs: 0,
+    }
+  }
+  const model = onboardingProbeString(payload?.model, 500)
+  if (!model) {
+    return {
+      ok: false,
+      failureKind: 'invalid_config',
+      message: 'Enter a model before verifying the configuration.',
+      latencyMs: 0,
+    }
+  }
+  const apiKey = onboardingProbeString(payload?.apiKey, 64 * 1024)
+  if (selected.requiresApiKey && !apiKey) {
+    return {
+      ok: false,
+      failureKind: 'auth_invalid',
+      message: `Enter the ${selected.label} API key before verifying the configuration.`,
+      latencyMs: 0,
+    }
+  }
+
+  const runtime = await resolveGatewayRuntime()
+  const prefix = runtime.args.slice(0, -2)
+  const input = JSON.stringify({
+    providerId,
+    model,
+    apiKey,
+    baseUrl: onboardingProbeString(payload?.baseUrl, 2_048) || selected.baseUrl,
+    timeout: 30,
+  })
+  const activeProfile = activeDesktopProfile()
+
+  return await new Promise<OnboardingProbeResult>((resolveResult, rejectResult) => {
+    const child = spawn(runtime.command, [...prefix, 'models', 'probe-draft'], {
+      cwd: runtime.cwd,
+      windowsHide: true,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: desktopChildEnvironment(activeProfile, {
+        PYTHONUNBUFFERED: '1',
+        PYTHONUTF8: '1',
+        PYTHONIOENCODING: 'utf-8:replace',
+      }),
+    })
+    let stdout = ''
+    let settled = false
+    const timeout = setTimeout(() => {
+      child.kill()
+      finish(new Error('Configuration verification timed out.'))
+    }, ONBOARDING_PROBE_TIMEOUT_MS)
+    timeout.unref()
+
+    const finish = (error?: Error, result?: OnboardingProbeResult) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      if (error) rejectResult(error)
+      else resolveResult(result as OnboardingProbeResult)
+    }
+
+    child.once('error', (error) => finish(error))
+    child.stdin.once('error', () => {})
+    child.stdin.end(input)
+    child.stdout.on('data', (chunk) => {
+      if (stdout.length > ONBOARDING_PROBE_STDOUT_LIMIT) return
+      stdout += String(chunk)
+      if (stdout.length > ONBOARDING_PROBE_STDOUT_LIMIT) {
+        child.kill()
+        finish(new Error('Configuration verification returned too much data.'))
+      }
+    })
+    // Provider and runtime diagnostics may contain local details. The renderer
+    // receives only the parsed, redacted JSON protocol from stdout.
+    child.stderr.resume()
+    child.once('close', () => {
+      if (settled) return
+      try {
+        const parsed = JSON.parse(stdout) as Record<string, unknown>
+        const ok = parsed.ok === true
+        finish(undefined, {
+          ok,
+          failureKind: ok ? '' : onboardingProbeString(parsed.kind, 120) || 'probe_failed',
+          message: ok ? '' : onboardingProbeString(parsed.detail, 2_000) || 'Configuration verification failed.',
+          latencyMs: Number.isFinite(Number(parsed.latency_ms))
+            ? Math.max(0, Math.round(Number(parsed.latency_ms)))
+            : 0,
+        })
+      } catch {
+        finish(new Error('Configuration verification did not return a valid result.'))
+      }
+    })
+  })
 }
 
 const RECOVERY_PROTOCOL_SCHEMA_VERSION = 1
@@ -11457,6 +11972,26 @@ ipcMain.handle('desktop:onboarding:defaults', () => ({
     profiles: ROUTER_PROFILES,
   },
 }))
+ipcMain.handle('desktop:onboarding:probe', async (event, payload: OnboardingProbePayload) => {
+  if (!resolveOnboarding || !trustedOnboardingIpc(event)) {
+    return {
+      ok: false,
+      failureKind: 'unavailable',
+      message: 'No trusted onboarding is in progress.',
+      latencyMs: 0,
+    } satisfies OnboardingProbeResult
+  }
+  try {
+    return await probeOnboardingProvider(payload || {})
+  } catch (error) {
+    return {
+      ok: false,
+      failureKind: 'unavailable',
+      message: error instanceof Error ? error.message : 'Configuration verification failed.',
+      latencyMs: 0,
+    } satisfies OnboardingProbeResult
+  }
+})
 ipcMain.handle('desktop:onboarding:save', async (event, payload: OnboardingPayload) => {
   // Only honor this while an onboarding flow is actually awaiting a result. The
   // same preload bridge is attached to the Control UI window, so without this
