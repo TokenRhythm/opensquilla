@@ -724,7 +724,6 @@ const {
 
 const {
   runMode,
-  runModeUserSelected,
   allowedRunModes,
   setRunMode: setPersistedRunMode,
 } = useChatRunModePreference({
@@ -1321,7 +1320,6 @@ const chatSend = useChatSend({
   modelRoutingSettingsBusy,
   elevatedMode,
   runMode,
-  runModeUserSelected,
   pendingAttachments,
   pendingSessionIntent,
   pendingWorkspaceId,

@@ -193,9 +193,7 @@ function chatSourceMetadata(options: UseChatSendOptions): ChatSendParams['_sourc
   const elevated = options.normalizeElevatedMode(options.elevatedMode.value)
   return {
     ...(elevated ? { elevated } : {}),
-    ...(options.runModeUserSelected?.value === false
-      ? {}
-      : { runMode: normalizeSandboxRunMode(options.runMode.value) }),
+    runMode: normalizeSandboxRunMode(options.runMode.value),
   }
 }
 
@@ -210,7 +208,6 @@ export interface UseChatSendOptions {
   modelRoutingSettingsBusy: Readonly<Ref<boolean>>
   elevatedMode: Ref<string>
   runMode: Ref<SandboxRunMode>
-  runModeUserSelected?: Readonly<Ref<boolean>>
   pendingAttachments: Ref<Attachment[]>
   pendingSessionIntent: Ref<string | null>
   pendingForkBeforeMessageId: Ref<string | null>

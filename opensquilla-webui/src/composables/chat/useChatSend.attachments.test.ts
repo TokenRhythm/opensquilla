@@ -328,10 +328,9 @@ describe('useChatSend attachment payloads', () => {
     }))
   })
 
-  it('omits the policy-default Full hint when the user did not select it', async () => {
+  it('sends the policy-default Full hint for a project task', async () => {
     const { api, rpc } = makeOptions({
       runMode: ref('full'),
-      runModeUserSelected: ref(false),
       pendingSessionIntent: ref('new_chat'),
       pendingWorkspaceId: ref('project-a'),
     })
@@ -341,15 +340,13 @@ describe('useChatSend attachment payloads', () => {
     const params = rpc.call.mock.calls[0]?.[1]
     expect(params).toMatchObject({
       workspaceId: 'project-a',
-      _source: {},
+      _source: { runMode: 'full' },
     })
-    expect(params?._source).not.toHaveProperty('runMode')
   })
 
   it('sends an explicitly selected Full hint for a project task', async () => {
     const { api, rpc } = makeOptions({
       runMode: ref('full'),
-      runModeUserSelected: ref(true),
       pendingSessionIntent: ref('new_chat'),
       pendingWorkspaceId: ref('project-a'),
     })

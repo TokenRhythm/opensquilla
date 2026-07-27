@@ -276,7 +276,7 @@ test.describe('Project workspaces', () => {
       message: 'pwd',
       workspaceId: 'project-demo',
     })
-    expect(state.sends[0]._source).not.toHaveProperty('runMode')
+    expect(state.sends[0]._source).toMatchObject({ runMode: 'full' })
     await expect(page).toHaveURL(/\/chat\?session=/)
     await expect(page.locator('.chat-project-chip')).toContainText('/repos/demo')
 
