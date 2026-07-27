@@ -635,6 +635,7 @@ async def test_workspace_strict_block_is_actionable_in_tool_failure_envelope(
 @pytest.mark.asyncio
 async def test_workspace_write_deny_block_is_actionable_in_tool_failure_envelope(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -647,6 +648,14 @@ async def test_workspace_write_deny_block_is_actionable_in_tool_failure_envelope
         ),
         workspace=workspace,
     )
+    # This test isolates the handler's policy-error envelope. An explicit
+    # legacy noop runtime is Full Host Access by contract, so pin the policy
+    # helper to managed-mode semantics instead of reviving stale sandbox state.
+    monkeypatch.setattr(
+        "opensquilla.tools.run_mode.full_host_access_active",
+        lambda: False,
+    )
+    monkeypatch.setattr(fs, "full_host_access_active", lambda: False)
     handler = build_tool_handler(get_default_registry())
     token = current_tool_context.set(
         ToolContext(

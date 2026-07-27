@@ -182,7 +182,7 @@ describe('ProjectWorkspacePickerDialog', () => {
     mocks.rpcCall
       .mockResolvedValueOnce(pathResult('/repos', ['/repos/a']))
       .mockResolvedValueOnce(pathResult('/repos/a', []))
-    await mountPicker()
+    const { events } = await mountPicker()
     await flushPromises()
 
     const entry = option('a')
@@ -199,6 +199,9 @@ describe('ProjectWorkspacePickerDialog', () => {
       kind: 'workspace',
     })
     expect(locationInput().value).toBe('/repos/a')
+    expect(button('Choose selected directory').disabled).toBe(false)
+    button('Choose selected directory').click()
+    expect(events.choose).toHaveBeenCalledWith('/repos/a')
   })
 
   it('ignores an older browse response that resolves last', async () => {
@@ -329,6 +332,26 @@ describe('ProjectWorkspacePickerDialog', () => {
     expect(events.choose).not.toHaveBeenCalled()
     expect(events.close).toHaveBeenCalledOnce()
     expect(mocks.rpcCall).not.toHaveBeenCalled()
+  })
+
+  it('ignores a stale native result after close and reopen', async () => {
+    const stale = deferred<{ path: string } | null>()
+    const fresh = deferred<{ path: string } | null>()
+    mocks.platform.files.chooseProjectDirectory = vi.fn()
+      .mockReturnValueOnce(stale.promise)
+      .mockReturnValueOnce(fresh.promise)
+    const picker = await mountPicker()
+
+    await picker.setOpen(false)
+    await picker.setOpen(true)
+    fresh.resolve({ path: '/repos/fresh' })
+    await flushPromises()
+    stale.resolve({ path: '/repos/stale' })
+    await flushPromises()
+
+    expect(mocks.platform.files.chooseProjectDirectory).toHaveBeenCalledTimes(2)
+    expect(picker.events.choose).toHaveBeenCalledOnce()
+    expect(picker.events.choose).toHaveBeenCalledWith('/repos/fresh')
   })
 
   it('shows native rejection and retries natively without web fallback', async () => {

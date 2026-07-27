@@ -328,6 +328,43 @@ describe('useChatSend attachment payloads', () => {
     }))
   })
 
+  it('omits the policy-default Full hint when the user did not select it', async () => {
+    const { api, rpc } = makeOptions({
+      runMode: ref('full'),
+      runModeUserSelected: ref(false),
+      pendingSessionIntent: ref('new_chat'),
+      pendingWorkspaceId: ref('project-a'),
+    })
+
+    await api.onSend()
+
+    const params = rpc.call.mock.calls[0]?.[1]
+    expect(params).toMatchObject({
+      workspaceId: 'project-a',
+      _source: {},
+    })
+    expect(params?._source).not.toHaveProperty('runMode')
+  })
+
+  it('sends an explicitly selected Full hint for a project task', async () => {
+    const { api, rpc } = makeOptions({
+      runMode: ref('full'),
+      runModeUserSelected: ref(true),
+      pendingSessionIntent: ref('new_chat'),
+      pendingWorkspaceId: ref('project-a'),
+    })
+
+    await api.onSend()
+
+    expect(rpc.call).toHaveBeenCalledWith(
+      'chat.send',
+      expect.objectContaining({
+        workspaceId: 'project-a',
+        _source: { runMode: 'full' },
+      }),
+    )
+  })
+
   it('serializes only sendable attachments and leaves failed attachments in the composer', async () => {
     const failed: Attachment = {
       kind: 'failed',
