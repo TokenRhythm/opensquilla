@@ -28,30 +28,31 @@ The approval must remain bound to:
 
 - approval ID;
 - session key;
-- tool-use ID;
-- tool name;
-- original arguments;
 - action fingerprint;
 - working directory;
-- command, code, and environment digests already carried by the tool action.
+- action kind;
+- original command or code arguments;
+- the critical environment digest carried by the sandbox request.
 
-The approval is consumed before the side effect starts and cannot be reused.
-Changed calls, changed sessions, missing approvals, rejected approvals, and
-already-consumed approvals fail closed.
+The legacy L3 approval gate holds the original tool coroutine while the user
+decides, so the authority is returned only to that in-flight call and is never
+serialized into model-visible arguments. The approval is consumed before the
+side effect starts and cannot be reused. Changed calls, changed sessions,
+missing approvals, rejected approvals, and already-consumed approvals fail
+closed.
 
 ## Execution Flow
 
 1. The original L3 call reaches the existing approval gate.
-2. The engine suspends the original tool request and shows the existing
-   approval card.
+2. The gate records the request and holds the original tool coroutine while the
+   existing approval card is shown.
 3. Rejection returns an approval-denied result without executing the call.
-4. Approval attaches the internal continuation to the original call.
-5. The dispatcher validates that the continuation belongs to the same tool-use
-   ID and session.
-6. The tool consumes the approval as one-shot writable execution authority.
-7. The exact original shell command or Python code executes once through the
+4. Approval returns a process-local grant containing the approval ID, request
+   fingerprint, and L3 level to the waiting call.
+5. The gate atomically consumes the approval before returning the grant.
+6. The exact original shell command or Python code executes once through the
    existing host-execution path.
-8. The result is delivered under the original tool call, without a second
+7. The result is delivered under the original tool call, without a second
    approval card.
 
 ## User Experience
@@ -72,7 +73,7 @@ Tests must be written before production changes and cover:
 - an approved Standard-mode L3 shell delete executes once;
 - an approved Standard-mode L3 Python delete executes once;
 - rejection produces no side effect;
-- changed tool arguments, tool-use ID, or session cannot reuse the approval;
+- a changed request fingerprint or session cannot reuse the approval;
 - the approval cannot execute twice;
 - the resumed result replaces the pending result under the same tool call;
 - only one WebUI approval card is emitted;
