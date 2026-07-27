@@ -16,6 +16,7 @@ type RpcParams = Record<string, unknown>
 interface ProjectLifecycleState {
   sessionKey: string
   pathListRequests: RpcParams[]
+  workspaceListRequests: number
   sends: RpcParams[]
   historyDeleteRequests: RpcParams[]
   postDeleteWorkspaceLists: number
@@ -28,10 +29,12 @@ interface ProjectLifecycleState {
 
 async function installProjectLifecycleRpc(
   page: Page,
+  options: { connectDelayMs?: number } = {},
 ): Promise<ProjectLifecycleState> {
   const state: ProjectLifecycleState = {
     sessionKey: 'agent:main:webchat:project-demo-task',
     pathListRequests: [],
+    workspaceListRequests: 0,
     sends: [],
     historyDeleteRequests: [],
     postDeleteWorkspaceLists: 0,
@@ -93,10 +96,12 @@ async function installProjectLifecycleRpc(
       const params = frame.params || {}
       switch (frame.method) {
         case 'connect':
-          ws.send(JSON.stringify({
-            protocol: 3,
-            policy: { tick_interval_ms: 30_000 },
-          }))
+          setTimeout(() => {
+            ws.send(JSON.stringify({
+              protocol: 3,
+              policy: { tick_interval_ms: 30_000 },
+            }))
+          }, options.connectDelayMs || 0)
           return
         case 'sandbox.path.list':
           state.pathListRequests.push(params)
@@ -127,6 +132,7 @@ async function installProjectLifecycleRpc(
           respond(frame.id, { workspace: workspace() })
           return
         case 'workspaces.list':
+          state.workspaceListRequests += 1
           if (state.historyDeleted) state.postDeleteWorkspaceLists += 1
           respond(frame.id, {
             workspaces: state.projectPresent ? [workspace()] : [],
@@ -224,6 +230,19 @@ async function installProjectLifecycleRpc(
 }
 
 test.describe('Project workspaces', () => {
+  test('waits for the connection before restoring a project draft', async ({ page }) => {
+    const state = await installProjectLifecycleRpc(page, { connectDelayMs: 800 })
+    state.projectPresent = true
+
+    await page.goto('/control/chat/new?agent=main&project=project-demo')
+    await expect(page.locator('.conn-pill.connecting')).toBeVisible()
+    await page.waitForTimeout(100)
+    expect(await page.getByTestId('toast').count()).toBe(0)
+    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect.poll(() => state.workspaceListRequests).toBeGreaterThan(0)
+    expect(await page.getByTestId('toast').count()).toBe(0)
+  })
+
   test('keeps a long project directory list scrollable', async ({ page }) => {
     await installProjectLifecycleRpc(page)
     await openControl(page)

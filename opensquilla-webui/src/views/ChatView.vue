@@ -547,7 +547,11 @@ import { useChatStallWatchdog } from '@/composables/chat/useChatStallWatchdog'
 import { useMetaRuns } from '@/composables/chat/useMetaRuns'
 import { runStatusLabelText as sessionRunStatusLabelText } from '@/composables/useSessions'
 import { useChatSessionRoute } from '@/composables/chat/useChatSessionRoute'
-import { useChatRunModePreference, type RunModePolicy } from '@/composables/chat/useChatRunModePreference'
+import {
+  persistMaterializedSessionRunMode,
+  useChatRunModePreference,
+  type RunModePolicy,
+} from '@/composables/chat/useChatRunModePreference'
 import { useChatSessionRuntime } from '@/composables/chat/useChatSessionRuntime'
 import { useChatSessionSubscription } from '@/composables/chat/useChatSessionSubscription'
 import { useChatSlashCommands } from '@/composables/chat/useChatSlashCommands'
@@ -1654,8 +1658,20 @@ function readAuthToken(): string {
   }
 }
 
-function setComposerRunMode(mode: SandboxRunMode) {
-  setPersistedRunMode(mode)
+async function setComposerRunMode(mode: SandboxRunMode) {
+  const selectedMode = setPersistedRunMode(mode)
+  try {
+    await persistMaterializedSessionRunMode({
+      rpc,
+      sessionKey: sessionKey.value,
+      isDraft: isDraftRoute(),
+      runMode: selectedMode,
+    })
+  } catch (cause) {
+    const detail = cause instanceof Error ? cause.message : String(cause)
+    console.warn('Failed to persist sandbox run mode:', detail)
+    pushToast(detail, { tone: 'danger' })
+  }
 }
 
 async function setComposerModelRoutingMode(mode: ModelRoutingMode) {
@@ -2308,6 +2324,8 @@ async function syncDraftProjectFromRoute(generation: number): Promise<boolean> {
   }
   activeProjectWorkspace.beginUnknownProjectDraft(workspaceId)
   try {
+    await rpc.waitForConnection()
+    if (!draftProjectHydrationIsCurrent(generation, workspaceId)) return false
     await projectWorkspaces.loadWorkspaces()
     if (!draftProjectHydrationIsCurrent(generation, workspaceId)) return false
     const workspace = projectWorkspaces.byId.value.get(workspaceId)
