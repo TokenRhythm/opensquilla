@@ -10,6 +10,7 @@ import pytest
 import structlog.testing
 
 from opensquilla.engine.types import ThinkingLevel
+from opensquilla.provider.compat_policy import compat_policy_for_kind
 from opensquilla.provider.openai import (
     OpenAIProvider,
     _build_openai_tool,
@@ -26,6 +27,7 @@ from opensquilla.provider.types import (
     Message,
     ModelCapabilities,
     ProviderHeartbeatEvent,
+    ProviderRequestCorrelation,
     ToolDefinition,
     ToolInputSchema,
     ToolUseEndEvent,
@@ -361,6 +363,71 @@ def test_openrouter_stream_timeout_emits_heartbeat_before_non_stream_fallback(
     )
 
 
+def test_stream_timeout_fallback_preserves_tokenrhythm_correlation_headers(
+    monkeypatch: Any,
+) -> None:
+    stream_headers: dict[str, str] = {}
+    fallback_headers: dict[str, str] = {}
+
+    class TimeoutStream:
+        async def __aenter__(self) -> Any:
+            raise httpx.ReadTimeout("stream idle")
+
+        async def __aexit__(self, *_exc: Any) -> None:
+            return None
+
+    class TimeoutClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> TimeoutClient:
+            return self
+
+        async def __aexit__(self, *_exc: Any) -> None:
+            return None
+
+        def stream(self, *args: Any, **kwargs: Any) -> TimeoutStream:
+            stream_headers.update(kwargs["headers"])
+            return TimeoutStream()
+
+    class CapturingFallbackProvider(OpenAIProvider):
+        async def _complete_non_stream(self, **kwargs: Any):
+            fallback_headers.update(kwargs["headers"])
+            yield DoneEvent(model="deepseek-v4-flash")
+
+    monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", TimeoutClient)
+    provider = CapturingFallbackProvider(
+        api_key="test",
+        model="deepseek-v4-flash",
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+        compat=compat_policy_for_kind("openrouter"),
+    )
+    correlation = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="execution-1",
+        call_kind="agent.chat",
+    )
+
+    _collect(
+        provider,
+        ChatConfig(
+            timeout=1.0,
+            provider_request_correlation=correlation,
+        ),
+    )
+
+    expected = {
+        "X-OpenSquilla-Session-Id": "session-1",
+        "X-OpenSquilla-Turn-Id": "turn-1",
+        "X-OpenSquilla-Execution-Id": "execution-1",
+        "X-OpenSquilla-Call-Kind": "agent.chat",
+    }
+    assert {name: stream_headers[name] for name in expected} == expected
+    assert {name: fallback_headers[name] for name in expected} == expected
+
+
 def test_dashscope_stream_timeout_emits_heartbeat_before_non_stream_fallback(
     monkeypatch: Any,
 ) -> None:
@@ -429,6 +496,145 @@ def test_tokenrhythm_chat_adds_app_attribution_headers(monkeypatch: Any) -> None
     assert captured["url"] == "https://tokenrhythm.studio/v1/chat/completions"
     assert captured["headers"].get("HTTP-Referer") == "https://opensquilla.ai"
     assert captured["headers"].get("X-Title") == "OpenSquilla"
+
+
+def test_tokenrhythm_chat_adds_session_correlation_headers_only(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek-v4-flash",
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+    )
+
+    _collect(
+        provider,
+        ChatConfig(
+            provider_request_correlation=ProviderRequestCorrelation(
+                session_id="session-1",
+                turn_id="turn-1",
+                execution_id="execution-1",
+                call_kind="agent.chat",
+            )
+        ),
+    )
+
+    assert captured["headers"].get("X-OpenSquilla-Session-Id") == "session-1"
+    assert captured["headers"].get("X-OpenSquilla-Turn-Id") == "turn-1"
+    assert captured["headers"].get("X-OpenSquilla-Execution-Id") == "execution-1"
+    assert captured["headers"].get("X-OpenSquilla-Call-Kind") == "agent.chat"
+    serialized_payload = json.dumps(captured["payload"], sort_keys=True)
+    assert "session-1" not in serialized_payload
+    assert "turn-1" not in serialized_payload
+    assert "execution-1" not in serialized_payload
+    assert "agent.chat" not in serialized_payload
+
+
+def test_tokenrhythm_chat_never_forwards_correlation_across_redirects(
+    monkeypatch: Any,
+) -> None:
+    requests: list[httpx.Request] = []
+    client_options: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.host == "tokenrhythm.studio":
+            return httpx.Response(
+                307,
+                headers={"location": "https://untrusted.example/v1/chat/completions"},
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse_body(),
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        client_options["follow_redirects"] = kwargs.get("follow_redirects")
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.httpx.AsyncClient",
+        patched_async_client,
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek-v4-flash",
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+    )
+
+    config = ChatConfig(
+        provider_request_correlation=ProviderRequestCorrelation(
+            session_id="session-1",
+            turn_id="turn-1",
+            execution_id="execution-1",
+            call_kind="agent.chat",
+        )
+    )
+
+    async def collect_events() -> list[Any]:
+        return [
+            event
+            async for event in provider.chat(
+                [Message(role="user", content="hi")],
+                config=config,
+            )
+        ]
+
+    events = asyncio.run(collect_events())
+
+    assert client_options["follow_redirects"] is False
+    assert len(requests) == 1
+    assert requests[0].url.host == "tokenrhythm.studio"
+    assert requests[0].headers["X-OpenSquilla-Session-Id"] == "session-1"
+    assert any(isinstance(event, ErrorEvent) for event in events)
+
+
+@pytest.mark.parametrize(
+    ("provider_kind", "base_url"),
+    [
+        ("openrouter", "https://openrouter.ai/api/v1"),
+        ("tokenrhythm", "https://proxy.example.com/v1"),
+    ],
+)
+def test_session_correlation_is_not_sent_to_other_or_custom_provider_origins(
+    monkeypatch: Any,
+    provider_kind: str,
+    base_url: str,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="test-model",
+        base_url=base_url,
+        provider_kind=provider_kind,
+    )
+
+    _collect(
+        provider,
+        ChatConfig(
+            provider_request_correlation=ProviderRequestCorrelation(
+                session_id="session-1",
+                turn_id="turn-1",
+                execution_id="execution-1",
+                call_kind="agent.chat",
+            )
+        ),
+    )
+
+    assert "X-OpenSquilla-Session-Id" not in captured["headers"]
+    assert "X-OpenSquilla-Turn-Id" not in captured["headers"]
+    assert "X-OpenSquilla-Execution-Id" not in captured["headers"]
+    assert "X-OpenSquilla-Call-Kind" not in captured["headers"]
 
 
 def test_tokenrhythm_list_models_adds_app_attribution_headers(

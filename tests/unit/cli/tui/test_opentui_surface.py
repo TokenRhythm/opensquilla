@@ -1176,3 +1176,37 @@ async def test_stream_output_surfaces_write_failure_at_context_exit() -> None:
     with pytest.raises(RuntimeError, match="pipe down"):
         async with output.stream_output() as write:
             write("only")
+
+
+@pytest.mark.asyncio
+async def test_approval_payloads_are_sanitized_on_both_send_sites() -> None:
+    # The choke point must hold for the canonical request AND the gateway-push
+    # preview: reverting either call site to dict(request) must fail here.
+    hostile = {
+        "id": "appr-hostile",
+        "tool": "sh\x1b[31mell",
+        "summary": "echo\x1b]0;pwn\x07 ok",
+        "message": "why\x1b[2Jnot",
+        "choices": ["allow_once"],
+    }
+
+    bridge = FakeOpenTuiBridge()
+    output = OpenTuiOutputHandle(bridge, approval_surface=Surface.CLI_GATEWAY)
+    await output.request_approval(dict(hostile), timeout=0.01)
+    # The timeout appends an approval.dismiss; the request frame is first.
+    sent_type, sent_payload = bridge.sent[0]
+    assert sent_type == "approval.request"
+    assert sent_payload["tool"] == "shell"
+    assert sent_payload["summary"] == "echo ok"
+    assert sent_payload["message"] == "whynot"
+    # The raw id list is protocol data (round-trips in approval.response) and
+    # is display-stripped host-side instead.
+    assert sent_payload["choices"] == ["allow_once"]
+
+    preview_bridge = FakeOpenTuiBridge()
+    preview_output = OpenTuiOutputHandle(preview_bridge, approval_surface=Surface.CLI_GATEWAY)
+    assert await preview_output.present_gateway_approval(dict(hostile)) is True
+    preview_type, preview_payload = preview_bridge.sent[-1]
+    assert preview_type == "approval.request"
+    assert preview_payload["summary"] == "echo ok"
+    assert preview_payload["tool"] == "shell"

@@ -63,8 +63,19 @@ async def handle_theme_command(cmd: str, tui_output: object | None) -> None:
     if len(parts) >= 2:
         name = parts[1].strip().lower()
         if name in THEME_NAMES:
+            import asyncio  # noqa: PLC0415
+
+            from opensquilla.cli.tui.opentui.prefs import (  # noqa: PLC0415
+                save_theme_preference,
+            )
+
             await send_message("theme.set", {"name": name})
+            # Off the loop: the save takes a file lock and does disk IO, and
+            # this handler runs on the chat event loop.
+            await asyncio.to_thread(save_theme_preference, name)
             return
 
     # No name, or an unknown one: open the interactive picker in the host.
+    # The picker's confirmed choice comes back as a ``theme.selected`` frame
+    # and is persisted by the surface loop.
     await send_message("theme.pick", {})

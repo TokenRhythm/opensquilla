@@ -10,6 +10,10 @@ import structlog
 
 from opensquilla.agents.limits import MAX_SPAWN_DEPTH
 from opensquilla.gateway.routing import build_subagent_route_envelope
+from opensquilla.provider.correlation_context import (
+    current_provider_request_correlation,
+)
+from opensquilla.provider.types import derive_provider_request_correlation
 from opensquilla.session.keys import build_subagent_session_key, parse_agent_id
 from opensquilla.tools.registry import tool
 from opensquilla.tools.run_mode import current_run_mode
@@ -422,6 +426,12 @@ async def sessions_spawn(
 
         runtime = _get_task_runtime()
         spawn_depth = current_depth + 1
+        subagent_run_id = str(uuid.uuid4())
+        provider_request_correlation = derive_provider_request_correlation(
+            current_provider_request_correlation(),
+            execution_id=subagent_run_id,
+            call_kind="subagent.chat",
+        )
         session_key = build_subagent_session_key(resolved_agent_id, uuid.uuid4().hex[:8])
         grounded_task = (
             _SUBAGENT_SYSTEM_PROMPT + "\n\n" + _normalize_subagent_task_for_execution(task)
@@ -469,6 +479,7 @@ async def sessions_spawn(
             session_key=session_key,
             parent_session_key=parent_session_key,
             agent_id=resolved_agent_id,
+            run_id=subagent_run_id,
             parent_task_id=parent_task_id,
             spawn_depth=spawn_depth,
             principal_is_owner=getattr(ctx, "is_owner", None) if ctx is not None else None,
@@ -484,6 +495,8 @@ async def sessions_spawn(
             grounded_task,
             mode="followup",
             run_kind="subagent",
+            task_id=subagent_run_id,
+            provider_request_correlation=provider_request_correlation,
         )
         return json.dumps(
             {

@@ -42,6 +42,7 @@ from opensquilla.tools.registry import tool
 from opensquilla.tools.run_mode import full_host_access_active, trusted_sandbox_active
 from opensquilla.tools.types import ToolError, current_tool_context
 from opensquilla.tools.write_tracking import (
+    enforce_workspace_write_deny_effects,
     mutation_ledger_text_hash,
     record_observed_workspace_mutations,
     snapshot_current_workspace_mutations,
@@ -1058,7 +1059,13 @@ async def execute_code(
             before=mutation_before,
             metadata={"code_hash": mutation_ledger_text_hash(code)},
         )
-        return output
+        # Effect enforcement runs after the ledger so the raw escape stays
+        # honestly recorded before any revert rewrites the workspace.
+        return enforce_workspace_write_deny_effects(
+            tool_name="execute_code",
+            before=mutation_before,
+            output=output,
+        )
 
     if not full_host and (
         runtime is None or (runtime.effective.sandbox_enabled and not host_execution)

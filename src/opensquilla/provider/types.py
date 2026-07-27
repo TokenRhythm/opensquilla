@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from opensquilla.execution_status import ExecutionStatus
@@ -317,6 +317,34 @@ class ModelInfo(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
+class ProviderRequestCorrelation:
+    """Opaque request identities exposed only to trusted provider transports."""
+
+    session_id: str
+    turn_id: str
+    execution_id: str
+    call_kind: str
+
+
+def derive_provider_request_correlation(
+    correlation: ProviderRequestCorrelation | None,
+    *,
+    execution_id: str | None = None,
+    call_kind: str | None = None,
+) -> ProviderRequestCorrelation | None:
+    """Derive one physical-call identity without changing its session or root turn."""
+
+    if correlation is None:
+        return None
+    updates: dict[str, str] = {}
+    if execution_id is not None:
+        updates["execution_id"] = execution_id
+    if call_kind is not None:
+        updates["call_kind"] = call_kind
+    return replace(correlation, **updates) if updates else correlation
+
+
 class ChatConfig(BaseModel):
     """Runtime options for a single chat call."""
 
@@ -340,6 +368,11 @@ class ChatConfig(BaseModel):
     tool_choice: Any | None = None
     candidate_output_mode: Literal["normal", "inert_artifact"] = Field(
         default="normal",
+        exclude=True,
+        repr=False,
+    )
+    provider_request_correlation: ProviderRequestCorrelation | None = Field(
+        default=None,
         exclude=True,
         repr=False,
     )

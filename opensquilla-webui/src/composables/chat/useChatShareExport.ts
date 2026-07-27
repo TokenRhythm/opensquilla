@@ -1,4 +1,5 @@
 import type { Ref } from 'vue'
+import i18n from '@/i18n'
 import { downloadBlob } from '@/utils/browser'
 
 export type ShareExportTheme = 'light' | 'dark'
@@ -287,6 +288,55 @@ function cleanupShareClone(clone: HTMLElement): HTMLElement {
   )
   clone.removeAttribute('data-share-selected')
 
+  // Activity follows the existing reasoning-share contract: collapsed process
+  // is omitted, while process the user explicitly expanded is included as
+  // static content. The data attributes are the stable renderer/export
+  // boundary; the class + <details open> fallback keeps exports from older
+  // activity DOM compatible while the chat renderer migrates.
+  clone.querySelectorAll<HTMLElement>('[data-share-activity], .assistant-activity')
+    .forEach((activity) => {
+      const usesShareContract = activity.hasAttribute('data-share-activity')
+      const expanded = usesShareContract
+        ? activity.dataset.shareExpanded === 'true'
+        : activity.hasAttribute('open')
+      const summary = activity.querySelector<HTMLElement>(
+        '[data-share-activity-label], .assistant-activity__summary',
+      )
+      const declaredBody = activity.querySelector<HTMLElement>(
+        '[data-share-activity-body], .assistant-activity__body',
+      )
+
+      if (!expanded) {
+        activity.remove()
+        return
+      }
+
+      // A renderer may keep the activity rows directly under the activity root
+      // instead of wrapping them in the legacy body element. Move those rows
+      // into the static body as well, excluding the interactive summary chrome.
+      const body = declaredBody || document.createElement('div')
+      if (!declaredBody) {
+        Array.from(activity.childNodes).forEach((node) => {
+          if (node !== summary) body.appendChild(node)
+        })
+      }
+      if (!body.childNodes.length) {
+        activity.remove()
+        return
+      }
+
+      const block = document.createElement('div')
+      block.className = 'chat-share-export-activity'
+      const label = document.createElement('div')
+      label.className = 'chat-share-export-activity__label'
+      label.textContent = summary?.textContent?.replace(/\s+/g, ' ').trim()
+        || i18n.global.t('chat.activityLabel')
+      body.className = 'chat-share-export-activity__body'
+      body.removeAttribute('data-share-activity-body')
+      block.append(label, body)
+      activity.replaceWith(block)
+    })
+
   // Thinking fold: an expanded fold means the user deliberately opened the
   // reasoning and is sharing it — keep the text, but swap the interactive
   // <details> chrome for a quiet static label. A collapsed fold is just a
@@ -302,7 +352,7 @@ function cleanupShareClone(clone: HTMLElement): HTMLElement {
     block.className = 'chat-share-export-thinking'
     const label = document.createElement('div')
     label.className = 'chat-share-export-thinking__label'
-    label.textContent = 'Thinking'
+    label.textContent = i18n.global.t('chat.thinking')
     const bodyText = document.createElement('div')
     bodyText.className = 'chat-share-export-thinking__body'
     bodyText.textContent = text
@@ -377,6 +427,34 @@ function shareExportCss(): string {
       line-height: 1.55;
       opacity: 0.75;
       white-space: pre-wrap;
+    }
+
+    #${SHARE_STAGE_ID} .chat-share-export-activity {
+      margin: 0 0 10px;
+      padding: 6px 0;
+      border: 0;
+      background: transparent;
+    }
+
+    #${SHARE_STAGE_ID} .chat-share-export-activity__label {
+      font-size: 11px;
+      letter-spacing: 0.02em;
+      opacity: 0.6;
+      margin-bottom: 5px;
+    }
+
+    #${SHARE_STAGE_ID} .chat-share-export-activity__body {
+      display: grid;
+      gap: 6px;
+      min-width: 0;
+    }
+
+    /* The live reasoning body is a capped scroll container; a static image has
+       no scrollbar, so the cap would silently truncate long reasoning. Let the
+       export lay out the full text instead. */
+    #${SHARE_STAGE_ID} .thinking-block__body {
+      max-height: none !important;
+      overflow-y: visible !important;
     }
 
     /* The live meta line is hover-dimmed; the static image has no hover. */

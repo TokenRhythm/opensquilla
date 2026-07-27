@@ -71,6 +71,29 @@ describe('useChatHistory canonical pagination', () => {
     }))
   })
 
+  it('restores the durable causal turn identity from canonical history', async () => {
+    const { api, messages } = makeHistory(false, {
+      response: {
+        messages: [{
+          id: 'assistant-1',
+          message_id: 'assistant-1',
+          role: 'assistant',
+          text: 'partial answer',
+          timestamp: '2026-07-06T00:00:00Z',
+          turn_context: {
+            turn_id: 'turn-1',
+            intent: 'send',
+          },
+        }],
+        has_more: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value[0]?.turnId).toBe('turn-1')
+  })
+
   it('prepends one page per cursor and preserves the reader scroll anchor', async () => {
     const thread = document.createElement('div')
     let height = 400

@@ -680,8 +680,17 @@ def test_feishu_profile_and_inbound_group_metadata() -> None:
     assert not channel.capability_profile.supports(ChannelCapabilities.THREAD_MESSAGES)
     assert channel.capability_profile.supports(ChannelCapabilities.THREAD_REPLY)
     assert channel.capability_profile.supports(ChannelCapabilities.SCOPE_DIAGNOSTICS)
-    assert channel.capability_profile.supports(ChannelCapabilities.INTERACTIVE_CARDS)
+    assert not channel.capability_profile.supports(ChannelCapabilities.INTERACTIVE_CARDS)
     assert not channel.capability_profile.supports(ChannelCapabilities.CARD_ACTIONS)
+
+    webhook_channel = FeishuChannel(
+        FeishuChannelConfig(
+            app_id="app",
+            app_secret="secret",
+            connection_mode="webhook",
+        )
+    )
+    assert webhook_channel.capability_profile.supports(ChannelCapabilities.INTERACTIVE_CARDS)
 
     group_msg = channel.parse_event(
         {

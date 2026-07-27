@@ -671,3 +671,115 @@ async def test_build_tool_handler_unknown_tool_envelope_matches_preflight() -> N
     assert standalone.content == via_handler.content
     assert standalone.tool_name == via_handler.tool_name
     assert standalone.tool_use_id == via_handler.tool_use_id
+
+
+@pytest.mark.asyncio
+async def test_preflight_schema_failure_appends_example_shape_for_edit_file() -> None:
+    """Fix #3: the schema-validation path now carries the per-tool example shape.
+
+    The missing-required path already appended ``_invalid_argument_guidance``;
+    the schema path did not. A wrong-typed ``edit_file`` argument now gets the
+    same worked example (not just the terse ``expected string, got integer``).
+    """
+    registry = ToolRegistry()
+    events = []
+
+    async def _edit_file(path: str, old_text: str, new_text: str) -> str:
+        return f"{path}:{old_text}->{new_text}"
+
+    registry.register(
+        ToolSpec(
+            name="edit_file",
+            description="edit file",
+            parameters={
+                "path": {"type": "string"},
+                "old_text": {"type": "string"},
+                "new_text": {"type": "string"},
+            },
+            required=["path", "old_text", "new_text"],
+        ),
+        _edit_file,
+    )
+    ctx = ToolContext(on_runtime_event=events.append)
+
+    result = await preflight_tool_call(
+        registry=registry,
+        ctx=ctx,
+        tool_call=ToolCall(
+            tool_use_id="u1",
+            tool_name="edit_file",
+            # all keys present (not missing-required) but new_text has wrong type
+            arguments={"path": "src/a.py", "old_text": "a", "new_text": 123},
+        ),
+    )
+
+    payload = _assert_invalid_attempt_result(
+        result,
+        tool="edit_file",
+        reason_code="schema_validation_failed",
+        received_keys=["new_text", "old_text", "path"],
+    )
+    # the schema echo is still present ...
+    assert "new_text" in payload["user_message"]
+    # ... plus the reused per-tool worked example
+    assert "Valid edit_file shapes" in payload["user_message"]
+
+    matching = [
+        event
+        for event in events
+        if event.get("name") == "dispatch.invalid_tool_arguments"
+    ]
+    assert len(matching) == 1
+    assert matching[0]["reason"] == "schema_validation_failed"
+    assert matching[0]["example_guidance_emitted"] is True
+
+
+@pytest.mark.asyncio
+async def test_preflight_schema_failure_no_example_for_tool_without_shape() -> None:
+    """A tool with no hardcoded example keeps the terse schema message.
+
+    ``example_guidance_emitted`` is recorded as ``False`` so the mechanism is
+    observable in telemetry without changing behaviour for un-exampled tools.
+    """
+    registry = ToolRegistry()
+    events = []
+
+    async def _echo(value: str) -> str:
+        return value
+
+    registry.register(
+        ToolSpec(
+            name="typed_echo",
+            description="typed echo",
+            parameters={"value": {"type": "string"}},
+            required=["value"],
+        ),
+        _echo,
+    )
+    ctx = ToolContext(on_runtime_event=events.append)
+
+    result = await preflight_tool_call(
+        registry=registry,
+        ctx=ctx,
+        tool_call=ToolCall(
+            tool_use_id="u1",
+            tool_name="typed_echo",
+            arguments={"value": 123},
+        ),
+    )
+
+    payload = _assert_invalid_attempt_result(
+        result,
+        tool="typed_echo",
+        reason_code="schema_validation_failed",
+        received_keys=["value"],
+    )
+    assert "Valid" not in payload["user_message"]
+
+    matching = [
+        event
+        for event in events
+        if event.get("name") == "dispatch.invalid_tool_arguments"
+    ]
+    assert len(matching) == 1
+    assert matching[0]["example_guidance_emitted"] is False

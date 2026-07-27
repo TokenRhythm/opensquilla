@@ -249,6 +249,41 @@ async def test_coding_mode_on_surfaces_code_task(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("missing_tool", ["background_process", "exec_command", "process"])
+async def test_coding_mode_hides_code_task_without_required_launch_tool(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    missing_tool: str,
+) -> None:
+    monkeypatch.setattr(
+        skills_filter_step,
+        "_elig_ctx",
+        EligibilityContext(
+            os_name="linux",
+            has_bin_cache={"git": True},
+            env_cache={},
+        ),
+    )
+    loader = SkillLoader(bundled_dir=BUNDLED, snapshot_path=tmp_path / "snapshot.json")
+    tools = {"background_process", "exec_command", "process"}
+    tools.remove(missing_tool)
+    ctx = _ctx(
+        loader,
+        tools=tools,
+        skills_config=SimpleNamespace(
+            filter_enabled=False,
+            max_skills_prompt_chars=100_000,
+            injection_mode="system",
+            coding_mode=True,
+        ),
+    )
+
+    ctx = await filter_skills(ctx)
+
+    assert "<name>code-task</name>" not in ctx.system_prompt[1]
+
+
+@pytest.mark.asyncio
 async def test_pinned_catalog_avoids_reloading_during_skill_injection() -> None:
     spec = SkillSpec(
         name="catalog-pinned",

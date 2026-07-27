@@ -77,10 +77,17 @@ async def test_tenant_access_token_error_raises_auth_error() -> None:
     )
 
     try:
-        with pytest.raises(FeishuAuthError, match="invalid app credentials"):
+        with pytest.raises(FeishuAuthError, match="invalid app credentials") as caught:
             await channel._get_token()
     finally:
         await channel.stop()
+
+    assert caught.value.diagnostic == {
+        "error_class": "auth_invalid",
+        "provider_code": "999",
+        "message": "invalid app credentials",
+        "retryable": False,
+    }
 
 
 @pytest.mark.anyio

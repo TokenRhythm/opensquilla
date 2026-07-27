@@ -217,6 +217,9 @@ def test_host_message_rejects_malformed_control_payloads() -> None:
     with pytest.raises(HostToPythonMessageError, match="resize.width"):
         host_message_from_json('{"type":"resize","height":36}')
 
+    with pytest.raises(HostToPythonMessageError, match="theme.selected.name"):
+        host_message_from_json('{"type":"theme.selected"}')
+
     with pytest.raises(HostToPythonMessageError, match="Unknown OpenTUI host"):
         host_message_from_json('{"type":"surprise"}')
 
@@ -368,6 +371,7 @@ def test_host_to_python_registry_round_trips_canonical_frames() -> None:
         "approval.response": (
             '{"type":"approval.response","id":"appr-1","approved":true,"choice":"allow_once"}'
         ),
+        "theme.selected": '{"type":"theme.selected","name":"nord"}',
     }
     assert set(samples) == set(HOST_TO_PYTHON_TYPES)
     for wire_type, raw in samples.items():

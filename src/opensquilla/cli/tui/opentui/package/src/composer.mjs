@@ -1,5 +1,5 @@
 import { THEME, THEME_NAMES, applyTheme, activeThemeName } from "./theme.mjs";
-import { cellWidth, clampFooterHeight, clipToCells, stripTerminalControls, textWidth } from "./primitives.mjs";
+import { cellWidth, clampFooterHeight, clipToCells, stripTerminalControls, textWidth, wrapToCells } from "./primitives.mjs";
 import {
   compactContextItems,
   emptyContextState,
@@ -44,6 +44,34 @@ export function routingPickerKeyAction(picker, keyName) {
   if (keyName === "return" || keyName === "tab") return { handled: true, action: "confirm", selected: sel };
   if (keyName === "escape") return { handled: true, action: "cancel", selected: sel };
   return { handled: true, action: "none", selected: sel };
+}
+
+// A long command or rationale wraps instead of clipping — the user is being
+// asked to authorize exactly this text, so hiding it is a trust problem. But
+// a modal must stay a modal: each section is capped so a multi-kilobyte
+// summary cannot grow without bound.
+export const APPROVAL_SUMMARY_MAX_ROWS = 6;
+export const APPROVAL_MESSAGE_MAX_ROWS = 4;
+
+// Row allocation for the approval overlay, in priority order: the tool line
+// and every choice are immovable; then ONE summary row — the user is
+// authorizing exactly that text, so it must never be fully invisible while
+// any flexible row remains; then the key hint (y/n/esc still work without
+// it); then the rest of the summary; then the rationale message. Needs are
+// the ACTUAL wrapped row counts, so a one-line summary never reserves rows
+// the message could have used.
+export function approvalRowPlan(maxRows, choicesCount, summaryNeed, messageNeed) {
+  let budget = Math.max(0, maxRows - 2 - 1 - choicesCount);
+  const summaryTarget = Math.min(Math.max(0, summaryNeed), APPROVAL_SUMMARY_MAX_ROWS);
+  const messageTarget = Math.min(Math.max(0, messageNeed), APPROVAL_MESSAGE_MAX_ROWS);
+  const summaryMin = summaryTarget > 0 && budget > 0 ? 1 : 0;
+  budget -= summaryMin;
+  const hint = budget > 0;
+  if (hint) budget -= 1;
+  const summaryExtra = Math.max(0, Math.min(summaryTarget - summaryMin, budget));
+  budget -= summaryExtra;
+  const messageRows = Math.max(0, Math.min(messageTarget, budget));
+  return { summaryRows: summaryMin + summaryExtra, messageRows, hint };
 }
 
 // Pure key handling for the tool-approval overlay. Modal like the theme picker
@@ -1024,7 +1052,12 @@ export function createComposer(deps) {
       themePicker.selected = result.selected;
       applyHostTheme(themePicker.names[result.selected]);
     } else if (result.action === "confirm") {
+      const confirmed = themePicker.names[themePicker.selected];
       closeThemePicker();
+      // Report the kept theme so the Python side can persist it — the /theme
+      // command path knows the name it sent, but a picker choice is made
+      // entirely in the host.
+      sendHostMessage({ type: "theme.selected", name: confirmed });
       renderer.requestRender?.();
     } else if (result.action === "cancel") {
       const original = themePicker.original;
@@ -1467,11 +1500,27 @@ export function createComposer(deps) {
   // The decision is sent back as one approval.response frame; the Python side
   // treats silence (timeout, teardown) as a deny, so the overlay never has to
   // guarantee delivery.
-  const APPROVAL_OVERLAY_WIDTH = 48;
+  const APPROVAL_OVERLAY_WIDTH = 72;
   let approvalOverlay = null;
 
   function approvalChoiceLabel(choice) {
-    return String(choice ?? "").replaceAll("_", " ");
+    // Ids are tool/model-derived and skip the Python display sanitizer (the
+    // raw id must round-trip in approval.response), so strip control bytes
+    // at the one place the id becomes visible text.
+    return stripTerminalControls(String(choice ?? "")).replaceAll("_", " ");
+  }
+
+  function approvalWrappedRows(text, cells) {
+    return String(text ?? "")
+      .split("\n")
+      .flatMap((line) => wrapToCells(line, cells));
+  }
+
+  function approvalTruncatedRows(rows, cells, maxRows) {
+    if (rows.length <= maxRows) return rows;
+    const kept = rows.slice(0, maxRows);
+    kept[maxRows - 1] = clipToCells(`${kept[maxRows - 1]} … +${rows.length - maxRows} rows`, cells);
+    return kept;
   }
 
   function renderApprovalOverlay() {
@@ -1480,7 +1529,29 @@ export function createComposer(deps) {
     const choices = approvalOverlay.choices;
     const geometry = overlayPanelGeometry(APPROVAL_OVERLAY_WIDTH);
     const maxRows = Math.max(1, viewportHeight() - effFooterHeight() - 1);
-    const bodyRows = 2 + choices.length + (approvalOverlay.summary ? 1 : 0);
+    const wrappedSummary = approvalOverlay.summary
+      ? approvalWrappedRows(approvalOverlay.summary, geometry.inner)
+      : [];
+    const wrappedMessage = approvalOverlay.message
+      ? approvalWrappedRows(approvalOverlay.message, geometry.inner)
+      : [];
+    const plan = approvalRowPlan(
+      maxRows,
+      choices.length,
+      wrappedSummary.length,
+      wrappedMessage.length,
+    );
+    const summaryRows = plan.summaryRows > 0
+      ? approvalTruncatedRows(wrappedSummary, geometry.inner, plan.summaryRows)
+      : [];
+    const messageRows = plan.messageRows > 0
+      ? approvalTruncatedRows(wrappedMessage, geometry.inner, plan.messageRows)
+      : [];
+    // On a terminal so small that not even one summary row fits, approving
+    // unseen text must at least be signposted.
+    const summaryHidden = wrappedSummary.length > 0 && summaryRows.length === 0;
+    const bodyRows =
+      1 + choices.length + summaryRows.length + messageRows.length + (plan.hint ? 1 : 0);
     const node = new BoxRenderable(renderer, {
       id: "approval-overlay",
       position: "absolute",
@@ -1491,7 +1562,7 @@ export function createComposer(deps) {
       borderStyle: "rounded",
       borderColor: THEME.warning,
       backgroundColor: THEME.overlayBg,
-      title: " approval ",
+      title: summaryHidden ? " approval · summary hidden " : " approval ",
       titleAlignment: "left",
       flexDirection: "column",
       paddingLeft: 1,
@@ -1502,13 +1573,22 @@ export function createComposer(deps) {
       content: clipToCells(approvalOverlay.tool, geometry.inner),
       fg: THEME.text,
     }));
-    if (approvalOverlay.summary) {
+    summaryRows.forEach((row, index) => {
       node.add(new TextRenderable(renderer, {
-        id: "approval-overlay-summary",
-        content: clipToCells(approvalOverlay.summary, geometry.inner),
+        id: index === 0 ? "approval-overlay-summary" : `approval-overlay-summary-${index}`,
+        content: row,
         fg: THEME.muted,
       }));
-    }
+    });
+    // The Python side's rationale line (why this needs approval) — the same
+    // text the plain-console prompt prints; the overlay must never show less.
+    messageRows.forEach((row, index) => {
+      node.add(new TextRenderable(renderer, {
+        id: index === 0 ? "approval-overlay-message" : `approval-overlay-message-${index}`,
+        content: row,
+        fg: THEME.detailText,
+      }));
+    });
     choices.forEach((choice, index) => {
       const active = index === approvalOverlay.selected;
       node.add(new TextRenderable(renderer, {
@@ -1520,16 +1600,18 @@ export function createComposer(deps) {
         fg: active ? THEME.brandAccentSoft : THEME.muted,
       }));
     });
-    node.add(new TextRenderable(renderer, {
-      id: "approval-overlay-hint",
-      content: clipToCells(
-        choices.length > 0
-          ? "↑↓ choose · enter confirm · y/n · esc deny"
-          : "y/enter approve · n/esc deny",
-        geometry.inner,
-      ),
-      fg: THEME.detailText,
-    }));
+    if (plan.hint) {
+      node.add(new TextRenderable(renderer, {
+        id: "approval-overlay-hint",
+        content: clipToCells(
+          choices.length > 0
+            ? "↑↓ choose · enter confirm · y/n · esc deny"
+            : "y/enter approve · n/esc deny",
+          geometry.inner,
+        ),
+        fg: THEME.detailText,
+      }));
+    }
     overlayLayer.add(node);
     overlayLayer.visible = true;
   }
@@ -1549,6 +1631,7 @@ export function createComposer(deps) {
       id,
       tool: String(message?.tool ?? "tool"),
       summary: String(message?.summary ?? ""),
+      message: String(message?.message ?? ""),
       choices: Array.isArray(message?.choices) ? message.choices.map(String) : [],
       selected: 0,
     };

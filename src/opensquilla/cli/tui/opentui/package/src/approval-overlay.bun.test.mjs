@@ -8,7 +8,7 @@
 // Run with: bun test src/approval-overlay.bun.test.mjs
 import { test, expect } from "bun:test";
 
-import { createComposer, approvalKeyAction } from "./composer.mjs";
+import { approvalKeyAction, approvalRowPlan, createComposer } from "./composer.mjs";
 import { THEME, applyTheme } from "./theme.mjs";
 
 // Minimal fake renderable mirroring the add/remove/getChildren contract the
@@ -334,4 +334,154 @@ test("approval.dismiss with no overlay open is a safe no-op", () => {
   const { composer, overlayLayer } = makeHarness();
   composer.dismissApprovalOverlay("appr-1");
   expect(findDeep(overlayLayer, "approval-overlay")).toBeNull();
+});
+
+test("overlay renders the rationale message the console prompt prints", () => {
+  const { composer, overlayLayer } = makeHarness();
+  composer.openApprovalOverlay(request({ message: "Sandbox denied a write outside the workspace." }));
+
+  const overlay = findDeep(overlayLayer, "approval-overlay");
+  expect(findDeep(overlay, "approval-overlay-message").options.content)
+    .toContain("Sandbox denied a write");
+});
+
+test("a long summary wraps into rows instead of clipping to one line", () => {
+  const { composer, overlayLayer } = makeHarness();
+  const command = "uv run pytest tests/unit/cli/tui --maxfail 1 --durations 10 -k approval_overlay_and_more_selectors";
+  composer.openApprovalOverlay(request({ summary: command }));
+
+  const overlay = findDeep(overlayLayer, "approval-overlay");
+  const first = findDeep(overlay, "approval-overlay-summary").options.content;
+  const second = findDeep(overlay, "approval-overlay-summary-1")?.options.content ?? "";
+  // The full command must survive across the wrapped rows — the user is
+  // authorizing exactly this text.
+  expect(`${first} ${second}`.replace(/\s+/gu, " ")).toContain("approval_overlay_and_more_selectors");
+  expect(first.endsWith("…")).toBe(false);
+});
+
+test("a pathological summary is capped with an explicit tail marker", () => {
+  const { composer, overlayLayer } = makeHarness();
+  const huge = Array.from({ length: 40 }, (_, i) => `arg-number-${i}-padding-padding`).join(" ");
+  composer.openApprovalOverlay(request({ summary: huge }));
+
+  const overlay = findDeep(overlayLayer, "approval-overlay");
+  // Capped at six rows: row index 5 exists, row index 6 must not.
+  const last = findDeep(overlay, "approval-overlay-summary-5");
+  expect(last).not.toBeNull();
+  expect(findDeep(overlay, "approval-overlay-summary-6")).toBeNull();
+  expect(last.options.content).toContain("…");
+  // Choices and the key hint stay visible below the capped summary.
+  expect(findDeep(overlay, "approval-overlay-hint")).not.toBeNull();
+});
+
+test("a short terminal keeps the choices AND at least one summary row", () => {
+  // At height 14 (footer 6) the row budget is 7: borders + tool + 3 choices
+  // leave exactly one flexible row. That row must go to the summary — the
+  // user is authorizing that text — while the key hint (redundant with the
+  // y/n/esc keys themselves) is what gets dropped.
+  const { composer, overlayLayer } = makeHarness({ terminalHeight: 14 });
+  const huge = Array.from({ length: 40 }, (_, i) => `arg-number-${i}-padding-padding`).join(" ");
+  composer.openApprovalOverlay(request({
+    summary: huge,
+    message: "This tool call was gated by the standard policy tier.",
+    choices: CHOICES,
+  }));
+
+  const overlay = findDeep(overlayLayer, "approval-overlay");
+  CHOICES.forEach((_, index) => {
+    expect(findDeep(overlay, `approval-overlay-choice-${index}`)).not.toBeNull();
+  });
+  const summary = findDeep(overlay, "approval-overlay-summary");
+  expect(summary).not.toBeNull();
+  expect(summary.options.content).toContain("arg-number-0");
+  expect(summary.options.content).toContain("…"); // truncation is explicit
+  expect(findDeep(overlay, "approval-overlay-summary-1")).toBeNull(); // capped to the one row
+  expect(findDeep(overlay, "approval-overlay-hint")).toBeNull(); // hint is what gives way
+});
+
+test("one more row restores the hint before growing the summary", () => {
+  const { composer, overlayLayer } = makeHarness({ terminalHeight: 15 });
+  const huge = Array.from({ length: 40 }, (_, i) => `arg-number-${i}-padding-padding`).join(" ");
+  composer.openApprovalOverlay(request({ summary: huge, choices: CHOICES }));
+
+  const overlay = findDeep(overlayLayer, "approval-overlay");
+  expect(findDeep(overlay, "approval-overlay-summary")).not.toBeNull();
+  expect(findDeep(overlay, "approval-overlay-hint")).not.toBeNull();
+  expect(findDeep(overlay, "approval-overlay-summary-1")).toBeNull();
+});
+
+test("approvalRowPlan never zeroes the summary while rows remain", () => {
+  // Sweep realistic geometries: for every budget that can hold the immovable
+  // rows plus one more, the plan must include at least one summary row.
+  for (let maxRows = 4; maxRows <= 30; maxRows += 1) {
+    for (const choices of [0, 2, 3]) {
+      const plan = approvalRowPlan(maxRows, choices, 99, 99);
+      const immovable = 2 + 1 + choices;
+      if (maxRows > immovable) {
+        expect(plan.summaryRows).toBeGreaterThanOrEqual(1);
+      }
+      // The plan must always fit the budget it was given.
+      const used = immovable + plan.summaryRows + plan.messageRows + (plan.hint ? 1 : 0);
+      expect(used).toBeLessThanOrEqual(Math.max(maxRows, immovable));
+    }
+  }
+});
+
+test("a short summary rebates its unused reservation to the message", () => {
+  // maxRows 13 with 3 choices leaves a budget of 7. A one-row summary must
+  // not reserve the worst-case six rows and starve the rationale message.
+  const plan = approvalRowPlan(13, 3, 1, 3);
+  expect(plan.summaryRows).toBe(1);
+  expect(plan.hint).toBe(true);
+  expect(plan.messageRows).toBe(3);
+});
+
+test("the rationale message renders alongside a short summary on a 20-row terminal", () => {
+  const { composer, overlayLayer } = makeHarness({ terminalHeight: 20 });
+  composer.openApprovalOverlay(request({
+    summary: "touch demo.txt",
+    message: "This tool call was gated by the standard policy tier.",
+    choices: CHOICES,
+  }));
+
+  const overlay = findDeep(overlayLayer, "approval-overlay");
+  expect(findDeep(overlay, "approval-overlay-summary")).not.toBeNull();
+  expect(findDeep(overlay, "approval-overlay-message").options.content)
+    .toContain("standard policy tier");
+  expect(findDeep(overlay, "approval-overlay-hint")).not.toBeNull();
+});
+
+test("choice ids are stripped of control bytes for display only", () => {
+  const { composer, press, overlayLayer, sent } = makeHarness();
+  const hostile = "\u001b]0;pwn\u0007allow_once";
+  composer.openApprovalOverlay(request({ choices: [hostile, "deny"] }));
+
+  const overlay = findDeep(overlayLayer, "approval-overlay");
+  const label = findDeep(overlay, "approval-overlay-choice-0").options.content;
+  expect(label).not.toContain("\u001b");
+  expect(label).not.toContain("\u0007");
+  expect(label).toContain("allow once");
+
+  // The RAW id still round-trips in the response — display stripping must
+  // never desynchronize the decision protocol.
+  press({ name: "return" });
+  const response = sent.find((m) => m.type === "approval.response");
+  expect(response.choice).toBe(hostile);
+});
+
+test("a terminal too small for any summary row signposts the hidden text", () => {
+  // Height 13 (footer 6) leaves maxRows 6 = exactly the immovable rows for a
+  // 3-choice envelope: zero summary rows fit, so the title must say so.
+  const { composer, overlayLayer } = makeHarness({ terminalHeight: 13 });
+  composer.openApprovalOverlay(request({
+    summary: "rm -rf /tmp/demo",
+    choices: CHOICES,
+  }));
+
+  const overlay = findDeep(overlayLayer, "approval-overlay");
+  expect(findDeep(overlay, "approval-overlay-summary")).toBeNull();
+  expect(overlay.options.title).toContain("summary hidden");
+  CHOICES.forEach((_, index) => {
+    expect(findDeep(overlay, `approval-overlay-choice-${index}`)).not.toBeNull();
+  });
 });

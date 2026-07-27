@@ -1,7 +1,7 @@
 import { test, expect, type Page } from '@playwright/test'
 
 // fold-authoritative live render proof. The fold is now the default live
-// render source (the work-card timeline/artifacts/live-thinking project from the
+// render source (the activity timeline/artifacts/live-thinking project from the
 // folded event log); only `opensquilla.chat.foldLiveTurn=0` forces the legacy
 // refs back. This spec pins the flag to '1' (any non-'0' value is ON) so it stays
 // a deterministic ON-path proof regardless of the default, drives the same real
@@ -62,7 +62,7 @@ test.describe('Fold-authoritative live turn', () => {
     await context.close()
   })
 
-  test('fold drives the work-card timeline and tool rows for a live search run', async ({ page }) => {
+  test('fold drives the flat activity timeline and tool rows for a live search run', async ({ page }) => {
     test.skip(!LIVE, 'Live gateway test; set OPENSQUILLA_E2E_LIVE=1 to run.')
     test.setTimeout(240000)
 
@@ -78,26 +78,30 @@ test.describe('Fold-authoritative live turn', () => {
     await textarea.fill('Use your web search tool to find one recent headline about space exploration, then answer in one sentence.')
     await page.locator('.chat-send-btn[aria-label="Send"]').click()
 
-    // The fold-driven work card renders the same checklist body the legacy path
-    // does: a visible card with the step chip and at least one checklist row.
-    const workCard = page.locator('.work-card')
-    await expect(workCard).toBeVisible({ timeout: 30000 })
-    await expect(workCard.locator('.work-card__step')).toHaveText(/^Step \d+$/)
+    const liveActivity = page.locator('.assistant-activity--live')
+    await expect(liveActivity).toBeVisible({ timeout: 30000 })
+    await expect(page.locator('.work-card')).toHaveCount(0)
 
     const sawChecklistRow = await page.evaluate(async () => {
       const t0 = Date.now()
       while (Date.now() - t0 < 180000) {
-        const rows = document.querySelectorAll('.work-card .tool-timeline--checklist .tool-row').length
+        const rows = document.querySelectorAll('.assistant-activity--live .tool-timeline--checklist .tool-row').length
         if (rows > 0) return true
-        if (document.querySelector('.work-card') === null) return false
+        if (document.querySelector('.assistant-activity--live') === null) return false
         await new Promise(resolve => setTimeout(resolve, 150))
       }
       return false
     })
     expect(sawChecklistRow).toBe(true)
 
-    // Run completes: the work card collapses, the transcript keeps the rows.
-    await expect(workCard).toHaveCount(0, { timeout: 180000 })
+    // Run completes: live activity collapses, the transcript keeps the rows.
+    await expect(liveActivity).toHaveCount(0, { timeout: 180000 })
+    const activity = page.locator('.msg-ai .assistant-activity').first()
+    await expect(activity).toBeVisible()
+    const summary = activity.locator('.assistant-activity__summary')
+    await expect(summary).toHaveAttribute('aria-expanded', 'false')
+    await summary.press('Enter')
+    await expect(summary).toHaveAttribute('aria-expanded', 'true')
     const searchRow = page.locator('.msg-ai .tool-row[data-op="web.search"]').first()
     await expect(searchRow).toBeVisible()
     await expect(searchRow).toHaveAttribute('aria-expanded', 'false')

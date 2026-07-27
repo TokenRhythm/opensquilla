@@ -1,23 +1,23 @@
-import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, safeStorage, shell } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, safeStorage, shell, Tray } from 'electron'
 import electronUpdater from 'electron-updater'
 import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { appendFileSync, createWriteStream, existsSync, lstatSync, mkdirSync, opendirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync, type Stats } from 'node:fs'
-import { access, constants, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
+import { access, constants, open, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import net from 'node:net'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { DESKTOP_LOCALES, resolveLocaleFromTags, type DesktopLocale } from './desktop-locale.js'
 import {
-  allProfileContexts as enumerateDesktopProfileContexts,
-  contextForProfile,
-  desktopProfileContextPath,
+  DESKTOP_LOCALES,
+  normalizeGatewayLocale,
+  resolveLocaleFromTags,
+  type DesktopLocale,
+} from './desktop-locale.js'
+import {
+  allProfileContexts as enumerateLegacyDesktopProfiles,
   isRecoveryProfileId,
-  loadDesktopProfileContext,
-  profileKindEnvironment,
-  updateDesktopProfileContextFile,
-  type DesktopProfileContext,
+  primaryProfilePaths,
   type DesktopProfilePaths,
 } from './desktop-profile-context.js'
 import { DesktopWriterAdmission } from './desktop-writer-admission.js'
@@ -73,6 +73,16 @@ import {
   streamResponseToVerifiedFile,
 } from './update-verification.js'
 import { isUpdateCheckAllowed, UpdateCheckScheduler } from './update-check-scheduler.js'
+import {
+  canRevealDesktopApp,
+  defaultDesktopPreferences,
+  mainWindowCloseAction,
+  normalizeDesktopPreferences,
+  serializeDesktopPreferences,
+  type DesktopExitPhase,
+  type DesktopMainWindowCloseBehavior,
+  type DesktopPreferencesFile,
+} from './desktop-window-lifecycle.js'
 
 interface GatewayState {
   url: string
@@ -178,6 +188,16 @@ interface DesktopSettingsSnapshot {
   gateway: GatewayState
 }
 
+interface DesktopPreferencesPayload {
+  mainWindowCloseBehavior?: unknown
+}
+
+interface DesktopPreferencesSnapshot {
+  mainWindowCloseBehavior: DesktopMainWindowCloseBehavior
+  canRunInBackground: boolean
+  platform: 'darwin' | 'win32' | 'linux' | 'other'
+}
+
 interface RuntimeLaunch {
   command: string
   args: string[]
@@ -185,7 +205,7 @@ interface RuntimeLaunch {
   mode: 'bundled' | 'dev'
 }
 
-type RecoveryOutcome = 'ready' | 'attention' | 'recovery_required' | 'recovery_profile'
+type RecoveryOutcome = 'ready' | 'attention' | 'recovery_required'
 
 interface RecoveryCandidate {
   kind: string
@@ -209,14 +229,32 @@ interface RecoveryProtocolResult {
   revision: number
 }
 
+type DesktopProfileConsolidationOutcome = 'noop' | 'consolidated' | 'blocked'
+type DesktopCredentialAdoptionStatus = 'pending' | 'complete' | 'not_required'
+
+interface DesktopProfileConsolidationResult {
+  schema_version: 1
+  outcome: DesktopProfileConsolidationOutcome
+  stable_code: string
+  primary_home: string
+  configuration_source_recovery_id: string | null
+  configuration_source_credential_path: string | null
+  configuration_source_credential_sha256: string | null
+  configuration_source_credential_size: number | null
+  consumed_recovery_ids: string[]
+  backup_path: string | null
+  receipt_path: string | null
+  credential_adoption_status: DesktopCredentialAdoptionStatus
+  revision: number
+  errors: string[]
+  // Only meaningful when `outcome` is 'blocked': the canonical primary profile is
+  // physically usable, so startup may continue against it and retry the fan-in on
+  // a later launch instead of stranding the user.
+  primary_home_intact: boolean
+}
+
 interface DesktopRecoveryViewState {
   inspection: RecoveryProtocolResult | null
-  activeProfile: {
-    kind: 'primary' | 'recovery'
-    recoveryId: string | null
-    home: string
-  }
-  recoveryProfiles: { id: string; home: string }[]
   blocked: boolean
   busy: boolean
   error: string | null
@@ -252,8 +290,28 @@ const shouldUseNativeApplicationMenu = process.platform === 'darwin'
 
 let mainWindow: BrowserWindow | null = null
 let onboardingWindow: BrowserWindow | null = null
+let windowsTray: Tray | null = null
+let appExitPhase: DesktopExitPhase = 'running'
+let systemSessionEnding = false
+let windowsSessionEndPreviousPhase: DesktopExitPhase | null = null
+let windowsSessionEndResetTimer: NodeJS.Timeout | null = null
+let mainWindowClosePrompt: Promise<void> | null = null
+let desktopPreferencesCache: {
+  value: DesktopPreferencesFile
+  writable: boolean
+} | null = null
+let desktopPreferencesWritePromise: Promise<void> = Promise.resolve()
 
 type DesktopNativeThemeSource = 'light' | 'dark' | 'system'
+
+const DESKTOP_LIGHT_BACKGROUND_COLOR = '#F4F5F7'
+const DESKTOP_DARK_BACKGROUND_COLOR = '#0E0F11'
+
+function desktopWindowBackgroundColor(): string {
+  return nativeTheme.shouldUseDarkColors
+    ? DESKTOP_DARK_BACKGROUND_COLOR
+    : DESKTOP_LIGHT_BACKGROUND_COLOR
+}
 
 function normalizeDesktopNativeThemeSource(payload: unknown): DesktopNativeThemeSource {
   const source = typeof payload === 'string'
@@ -266,7 +324,7 @@ function normalizeDesktopNativeThemeSource(payload: unknown): DesktopNativeTheme
 
 function applyDesktopNativeTheme(source: DesktopNativeThemeSource): { source: DesktopNativeThemeSource; shouldUseDarkColors: boolean } {
   nativeTheme.themeSource = source
-  const backgroundColor = nativeTheme.shouldUseDarkColors ? '#08080A' : '#F7F6F3'
+  const backgroundColor = desktopWindowBackgroundColor()
   for (const window of [mainWindow, onboardingWindow]) {
     if (window && !window.isDestroyed()) window.setBackgroundColor(backgroundColor)
   }
@@ -355,59 +413,18 @@ const gatewayState: GatewayState = {
   logPath: '',
 }
 
-let desktopProfileContextCache: DesktopProfileContext | null = null
-// A persisted recovery choice is offered after restart, but a fresh Electron
-// process must not start that writer until the user explicitly confirms it.
-let activeRecoveryProfileConfirmedThisProcess = false
-
-function desktopProfileContext(): DesktopProfileContext {
-  if (!desktopProfileContextCache) {
-    desktopProfileContextCache = loadDesktopProfileContext(app.getPath('userData'))
-  }
-  return desktopProfileContextCache
-}
-
 function activeDesktopProfile(): DesktopProfilePaths {
-  return desktopProfileContext().active
+  return primaryProfilePaths(app.getPath('userData'))
 }
 
 function primaryDesktopProfile(): DesktopProfilePaths {
-  return desktopProfileContext().primary
+  return primaryProfilePaths(app.getPath('userData'))
 }
 
-function allProfileContexts(): DesktopProfilePaths[] {
-  return enumerateDesktopProfileContexts(app.getPath('userData'))
-}
-
-async function updateDesktopProfileContext(
-  updater: (current: DesktopProfileContext) => DesktopProfileContext,
-): Promise<DesktopProfileContext> {
-  const finishWriter = recoveryOperationBusy
-    ? () => {}
-    : beginDesktopWriterOperation('update Desktop profile context')
-  try {
-    const context = await updateDesktopProfileContextFile(app.getPath('userData'), updater)
-    desktopProfileContextCache = context
-    return context
-  } finally {
-    finishWriter()
-  }
-}
-
-async function selectDesktopProfile(
-  kind: 'primary' | 'recovery',
-  recoveryId: string | null = null,
-): Promise<void> {
-  invalidateDesktopOpenFlow()
-  await updateDesktopProfileContext((current) => contextForProfile(
-    app.getPath('userData'),
-    kind,
-    recoveryId,
-    new Date().toISOString(),
-    current.persisted.attention_acknowledgement,
-  ))
-  activeRecoveryProfileConfirmedThisProcess = kind === 'recovery'
-  createApplicationMenu()
+function legacyRecoveryProfiles(): DesktopProfilePaths[] {
+  return enumerateLegacyDesktopProfiles(app.getPath('userData')).filter(
+    (profile) => profile.kind === 'recovery',
+  )
 }
 
 function desktopHome(): string {
@@ -447,39 +464,20 @@ function desktopLogsDir(): string {
 }
 
 function desktopProfileKey(profile = activeDesktopProfile()): string {
-  return profile.kind === 'primary' ? 'primary' : `recovery:${profile.recoveryId}`
+  return profile.kind
 }
-
-const PROFILE_SCOPED_DATA_ENV = [
-  'OPENSQUILLA_HOME',
-  'OPENSQUILLA_GATEWAY_STATE_DIR',
-  'OPENSQUILLA_GATEWAY_WORKSPACE_DIR',
-  'OPENSQUILLA_WORKSPACE_DIR',
-  'OPENSQUILLA_MEMORY_DIR',
-  'OPENSQUILLA_SESSION_ARCHIVE_DIR',
-  'OPENSQUILLA_LOG_DIR',
-  'OPENSQUILLA_TURN_CALL_LOG_DIR',
-  'OPENSQUILLA_LLM_TRACE_PATH',
-  'OPENSQUILLA_RUNTIME_EVENTS_PATH',
-  'OPENSQUILLA_PATCH_EVIDENCE_LEDGER_PATH',
-] as const
 
 function desktopChildEnvironment(
   profile: DesktopProfilePaths,
   additions: NodeJS.ProcessEnv = {},
 ): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = { ...process.env }
-  if (profile.kind === 'recovery') {
-    // Recovery profiles are isolated homes and must not inherit primary or
-    // external live data roots from the Desktop process environment.
-    for (const name of PROFILE_SCOPED_DATA_ENV) delete environment[name]
-  }
   return {
     ...environment,
     ...additions,
     OPENSQUILLA_DESKTOP: '1',
     OPENSQUILLA_INSTALL_METHOD: 'desktop',
-    OPENSQUILLA_PROFILE_KIND: profileKindEnvironment(profile.kind),
+    OPENSQUILLA_PROFILE_KIND: 'desktop-primary',
     OPENSQUILLA_GATEWAY_CONFIG_PATH: join(profile.home, 'config.toml'),
     // Historical name retained for compatibility: this is H, never H/state.
     OPENSQUILLA_STATE_DIR: profile.home,
@@ -1797,6 +1795,116 @@ async function atomicWriteFile(filePath: string, data: string, mode: number): Pr
   }
 }
 
+function desktopPreferencesPath(): string {
+  return join(app.getPath('userData'), 'desktop-preferences.json')
+}
+
+function desktopPlatformName(): DesktopPreferencesSnapshot['platform'] {
+  if (process.platform === 'darwin' || process.platform === 'win32' || process.platform === 'linux') {
+    return process.platform
+  }
+  return 'other'
+}
+
+function canRunDesktopInBackground(): boolean {
+  return process.platform === 'darwin' || (process.platform === 'win32' && windowsTray !== null)
+}
+
+function loadDesktopPreferencesRecord(): {
+  value: DesktopPreferencesFile
+  writable: boolean
+} {
+  if (desktopPreferencesCache) return desktopPreferencesCache
+  try {
+    const parsed = JSON.parse(readFileSync(desktopPreferencesPath(), 'utf8')) as unknown
+    desktopPreferencesCache = normalizeDesktopPreferences(parsed, process.platform)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      desktopLog('desktop_preferences_load_failed', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+    desktopPreferencesCache = {
+      value: defaultDesktopPreferences(process.platform),
+      writable: true,
+    }
+  }
+  return desktopPreferencesCache
+}
+
+function desktopPreferencesSnapshot(): DesktopPreferencesSnapshot {
+  const preferences = loadDesktopPreferencesRecord().value
+  return {
+    mainWindowCloseBehavior: preferences.main_window_close_behavior,
+    canRunInBackground: canRunDesktopInBackground(),
+    platform: desktopPlatformName(),
+  }
+}
+
+function enqueueDesktopPreferencesUpdate(
+  update: (current: DesktopPreferencesFile) => DesktopPreferencesFile,
+): Promise<DesktopPreferencesSnapshot> {
+  const operation = desktopPreferencesWritePromise.then(async () => {
+    const loaded = loadDesktopPreferencesRecord()
+    if (!loaded.writable) {
+      throw new Error(
+        'Desktop preferences were written by a newer OpenSquilla version and were not changed.',
+      )
+    }
+    const previous = loaded.value
+    const next = update(previous)
+    try {
+      await atomicWriteFile(
+        desktopPreferencesPath(),
+        serializeDesktopPreferences(next),
+        0o600,
+      )
+      desktopPreferencesCache = { value: next, writable: true }
+    } catch (error) {
+      desktopPreferencesCache = { value: previous, writable: true }
+      throw error
+    }
+    return desktopPreferencesSnapshot()
+  })
+  desktopPreferencesWritePromise = operation.then(() => undefined, () => undefined)
+  return operation
+}
+
+async function saveDesktopPreferences(
+  payload: DesktopPreferencesPayload,
+): Promise<DesktopPreferencesSnapshot> {
+  const behavior = payload?.mainWindowCloseBehavior
+  if (behavior !== 'background' && behavior !== 'quit' && behavior !== 'ask') {
+    throw new Error('Choose a supported main-window close behavior.')
+  }
+  if (behavior !== 'quit' && !canRunDesktopInBackground()) {
+    throw new Error('Background window mode is unavailable because no restore surface is active.')
+  }
+  return await enqueueDesktopPreferencesUpdate((current) => ({
+    ...current,
+    main_window_close_behavior: behavior,
+  }))
+}
+
+function markBackgroundCloseNoticeShown(): void {
+  const loaded = loadDesktopPreferencesRecord()
+  if (!loaded.writable || loaded.value.background_close_notice_shown) return
+  // Update the in-memory snapshot immediately so repeated close events in the
+  // same session cannot emit duplicate balloons while the atomic write queues.
+  desktopPreferencesCache = {
+    value: { ...loaded.value, background_close_notice_shown: true },
+    writable: true,
+  }
+  void enqueueDesktopPreferencesUpdate((current) => ({
+    ...current,
+    background_close_notice_shown: true,
+  })).catch((error) => {
+    desktopLog('background_close_notice_persist_failed', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+  })
+}
+
 async function loadDesktopCredential(): Promise<DesktopConnection | null> {
   try {
     const raw = await readFile(credentialPath(), 'utf8')
@@ -1860,6 +1968,7 @@ async function saveDesktopCredential(
   const disableNetworkObservability = Object.prototype.hasOwnProperty.call(payload, 'disableNetworkObservability')
     ? normalizeBooleanSetting(payload.disableNetworkObservability, existing?.disableNetworkObservability ?? false)
     : configDisableNetworkObservability ?? existing?.disableNetworkObservability ?? false
+  const configLocale = desktopLocaleChoice(payload.locale) ?? desktopLocale
 
   if (defaults.requiresApiKey && !encryptedApiKey) throw new Error('API key is required.')
   if (modelRoutingMode === 'llm_ensemble' && !modelRoutingModeAllowed(modelRoutingMode, provider)) {
@@ -1903,6 +2012,7 @@ async function saveDesktopCredential(
       JSON.stringify(credential, null, 2),
       expectedCredential,
       writerReserved,
+      configLocale,
     )
     return credential
   } finally {
@@ -1946,9 +2056,6 @@ async function saveImportedDesktopCredential(
   writerReserved = false,
 ): Promise<DesktopConnection> {
   const profile = primaryDesktopProfile()
-  if (activeDesktopProfile().kind !== 'primary') {
-    throw new Error('Imported credentials can be adopted only into the primary profile.')
-  }
   const expectedCredential = await readOptionalDesktopText(profile.credentialPath)
   const importedConfig = await readOptionalDesktopText(join(profile.home, 'config.toml'))
   if (importedConfig === null) {
@@ -2049,6 +2156,27 @@ function foreignConfigPreambleLines(raw: string): string[] {
   return out
 }
 
+// The Desktop owns the control-ui section's boot fields, while the Gateway
+// owns the operator's persisted notice locale. Preserve only that scalar
+// instead of retaining a whole section whose other settings Desktop
+// must regenerate deterministically.
+function persistedControlUiDefaultLocale(raw: string | null): DesktopLocale | null {
+  if (raw === null) return null
+  let inControlUi = false
+  for (const rawLine of raw.split(/\r?\n/)) {
+    const header = rawLine.trim().match(/^\[\s*([^\]]+?)\s*\](?:\s*#.*)?$/)
+    if (header) {
+      inControlUi = header[1] === 'control_ui'
+      continue
+    }
+    if (!inControlUi) continue
+    const match = rawLine.match(/^\s*default_locale\s*=\s*["']([^"']*)["']\s*(?:#.*)?$/)
+    if (!match) continue
+    return normalizeGatewayLocale(match[1])
+  }
+  return null
+}
+
 async function readOptionalDesktopText(path: string): Promise<string | null> {
   try {
     return await readFile(path, 'utf8')
@@ -2079,9 +2207,11 @@ function renderDesktopConfigAfterPreflight(
   credential: DesktopConnection,
   inspection: RecoveryProtocolResult,
   existingRaw: string | null,
+  defaultLocale: DesktopLocale,
 ): string {
   let preservedForeignSections: string[] = []
   let preservedForeignPreamble: string[] = []
+  const preservedControlUiLocale = persistedControlUiDefaultLocale(existingRaw)
   if (existingRaw !== null) {
     preservedForeignSections = foreignConfigSectionLines(existingRaw)
     preservedForeignPreamble = foreignConfigPreambleLines(existingRaw)
@@ -2111,6 +2241,7 @@ function renderDesktopConfigAfterPreflight(
     '[control_ui]',
     'enabled = true',
     'base_path = "/control"',
+    `default_locale = ${tomlString(preservedControlUiLocale ?? defaultLocale)}`,
     '',
     ...(preservedForeignSections.length ? [...preservedForeignSections, ''] : []),
   ].join('\n')
@@ -2122,6 +2253,7 @@ async function applyDesktopSettingsPair(
   candidateCredential: string,
   expectedCredential: string | null,
   writerReserved = false,
+  defaultLocale = desktopLocale,
 ): Promise<RecoveryProtocolResult> {
   const targetProfileKey = desktopProfileKey(profile)
   if (desktopProfileKey() !== targetProfileKey) {
@@ -2148,6 +2280,7 @@ async function applyDesktopSettingsPair(
       credential,
       inspection,
       expectedConfig,
+      defaultLocale,
     )
     const result = await runRecoveryCli(
       profile,
@@ -2167,7 +2300,7 @@ async function applyDesktopSettingsPair(
       writerReserved,
     )
     recoveryInspection = result
-    if (profile.kind === 'primary') primaryRecoveryInspection = result
+    primaryRecoveryInspection = result
     restartSafe = result.outcome !== 'recovery_required'
     publishRecoveryState()
     if (!restartSafe) {
@@ -2179,7 +2312,7 @@ async function applyDesktopSettingsPair(
       if (!restartSafe) {
         const after = await inspectDesktopProfile(profile)
         recoveryInspection = after
-        if (profile.kind === 'primary') primaryRecoveryInspection = after
+        primaryRecoveryInspection = after
         restartSafe = after.outcome !== 'recovery_required'
       }
       if (restartSafe) {
@@ -2542,10 +2675,17 @@ function desktopLocalePath(): string {
 function loadPersistedDesktopLocale(): DesktopLocale | null {
   try {
     const raw = readFileSync(desktopLocalePath(), 'utf8').trim()
-    return DESKTOP_LOCALES.includes(raw as DesktopLocale) ? (raw as DesktopLocale) : null
+    return desktopLocaleChoice(raw)
   } catch {
     return null
   }
+}
+
+function desktopLocaleChoice(raw: unknown): DesktopLocale | null {
+  const requested = String(raw ?? '')
+  return DESKTOP_LOCALES.includes(requested as DesktopLocale)
+    ? requested as DesktopLocale
+    : null
 }
 
 function persistDesktopLocale(locale: DesktopLocale): void {
@@ -2558,11 +2698,12 @@ function persistDesktopLocale(locale: DesktopLocale): void {
 }
 
 function applyDesktopLocaleChoice(raw: unknown): void {
-  const requested = String(raw ?? '')
-  if (!DESKTOP_LOCALES.includes(requested as DesktopLocale)) return
+  const requested = desktopLocaleChoice(raw)
+  if (requested === null) return
   if (requested !== desktopLocale) {
-    desktopLocale = requested as DesktopLocale
+    desktopLocale = requested
     createApplicationMenu()
+    rebuildWindowsTrayMenu()
   }
   persistDesktopLocale(desktopLocale)
 }
@@ -2575,10 +2716,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'menu.checkForUpdates': 'Check for Updates…',
     'menu.relaunchToUpdate': 'Relaunch to Update',
     'menu.downloadDiagnostics': 'Download Diagnostics…',
-    'menu.profile': 'Profile',
-    'menu.showProfile': 'Show Active Profile',
-    'menu.switchRecovery': 'Switch to Recovery Profile',
-    'menu.returnPrimary': 'Return to Primary Profile',
+    'tray.open': 'Open OpenSquilla',
+    'tray.running': 'OpenSquilla is running in the background',
+    'tray.quit': 'Quit OpenSquilla',
+    'tray.backgroundTitle': 'OpenSquilla is still running',
+    'tray.backgroundDetail': 'Tasks, schedules, and connected channels continue in the background. Open or quit OpenSquilla from the system tray.',
+    'closePrompt.title': 'Close OpenSquilla?',
+    'closePrompt.message': 'What should happen when the main window closes?',
+    'closePrompt.detail': 'Background mode keeps tasks, schedules, and connected channels running. Explicit Quit safely stops the local runtime.',
+    'closePrompt.background': 'Keep running in background',
+    'closePrompt.quit': 'Quit OpenSquilla',
+    'closePrompt.cancel': 'Cancel',
+    'closePrompt.remember': 'Remember my choice',
     'update.newVersionTitle': 'A new version is available',
     'update.newVersionDetail': 'OpenSquilla {version} is available. Download it now?',
     'update.download': 'Download',
@@ -2608,7 +2757,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.cancel': 'Cancel',
     'cleanup.deleteProfileConfirm': 'Delete profile',
     'cleanup.deleteProfileTitle': 'Delete the current profile?',
-    'cleanup.deleteProfileMessage': 'This permanently deletes the listed current profile data, credential, and logs. Other recovery profiles and backups are kept.',
+    'cleanup.deleteProfileMessage': 'This permanently deletes the listed primary profile data, credential, and logs. Backups are kept.',
     'cleanup.deleteAllConfirm': 'Delete all data',
     'cleanup.deleteAllTitle': 'Delete all OpenSquilla user data?',
     'cleanup.deleteAllMessage': 'OpenSquilla will close first. The deletion starts only after the app and local runtime have fully exited.',
@@ -2703,10 +2852,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'menu.checkForUpdates': '检查更新…',
     'menu.relaunchToUpdate': '重启以更新',
     'menu.downloadDiagnostics': '下载诊断信息…',
-    'menu.profile': '配置',
-    'menu.showProfile': '显示当前配置',
-    'menu.switchRecovery': '切换到恢复配置',
-    'menu.returnPrimary': '返回主配置',
+    'tray.open': '打开 OpenSquilla',
+    'tray.running': 'OpenSquilla 正在后台运行',
+    'tray.quit': '退出 OpenSquilla',
+    'tray.backgroundTitle': 'OpenSquilla 仍在运行',
+    'tray.backgroundDetail': '任务、定时任务和已连接渠道会继续在后台运行。可从系统托盘打开或退出 OpenSquilla。',
+    'closePrompt.title': '关闭 OpenSquilla？',
+    'closePrompt.message': '关闭主窗口时要执行什么操作？',
+    'closePrompt.detail': '后台模式会继续运行任务、定时任务和已连接渠道；显式退出会安全停止本地运行时。',
+    'closePrompt.background': '继续在后台运行',
+    'closePrompt.quit': '退出 OpenSquilla',
+    'closePrompt.cancel': '取消',
+    'closePrompt.remember': '记住我的选择',
     'update.newVersionTitle': '有新版本可用',
     'update.newVersionDetail': 'OpenSquilla {version} 已发布，现在下载吗？',
     'update.download': '下载',
@@ -2736,7 +2893,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.cancel': '取消',
     'cleanup.deleteProfileConfirm': '删除配置文件',
     'cleanup.deleteProfileTitle': '删除当前配置文件？',
-    'cleanup.deleteProfileMessage': '这会永久删除列出的当前配置文件数据、凭据和日志。其他恢复配置文件和备份会保留。',
+    'cleanup.deleteProfileMessage': '这会永久删除列出的主配置数据、凭据和日志。备份会保留。',
     'cleanup.deleteAllConfirm': '删除全部数据',
     'cleanup.deleteAllTitle': '删除全部 OpenSquilla 用户数据？',
     'cleanup.deleteAllMessage': 'OpenSquilla 会先退出。只有应用和本地运行时完全退出后，删除才会开始。',
@@ -2831,10 +2988,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'menu.checkForUpdates': 'アップデートを確認…',
     'menu.relaunchToUpdate': '再起動してアップデート',
     'menu.downloadDiagnostics': '診断情報をダウンロード…',
-    'menu.profile': 'プロファイル',
-    'menu.showProfile': '使用中のプロファイルを表示',
-    'menu.switchRecovery': '復旧プロファイルに切り替え',
-    'menu.returnPrimary': 'プライマリプロファイルに戻る',
+    'tray.open': 'OpenSquilla を開く',
+    'tray.running': 'OpenSquilla はバックグラウンドで実行中です',
+    'tray.quit': 'OpenSquilla を終了',
+    'tray.backgroundTitle': 'OpenSquilla は引き続き実行中です',
+    'tray.backgroundDetail': 'タスク、スケジュール、接続済みチャンネルはバックグラウンドで続行します。システムトレイから開くか終了できます。',
+    'closePrompt.title': 'OpenSquilla を閉じますか？',
+    'closePrompt.message': 'メインウィンドウを閉じるときの動作を選択してください。',
+    'closePrompt.detail': 'バックグラウンドモードではタスク、スケジュール、接続済みチャンネルが継続します。明示的に終了するとローカルランタイムを安全に停止します。',
+    'closePrompt.background': 'バックグラウンドで続行',
+    'closePrompt.quit': 'OpenSquilla を終了',
+    'closePrompt.cancel': 'キャンセル',
+    'closePrompt.remember': 'この選択を記憶する',
     'update.newVersionTitle': '新しいバージョンが利用可能です',
     'update.newVersionDetail': 'OpenSquilla {version} が利用可能です。今すぐダウンロードしますか？',
     'update.download': 'ダウンロード',
@@ -2862,7 +3027,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.cancel': 'キャンセル',
     'cleanup.deleteProfileConfirm': 'プロファイルを削除',
     'cleanup.deleteProfileTitle': '現在のプロファイルを削除しますか？',
-    'cleanup.deleteProfileMessage': '一覧の現在のプロファイルデータ、認証情報、ログを完全に削除します。他のリカバリープロファイルとバックアップは保持されます。',
+    'cleanup.deleteProfileMessage': '一覧のプライマリプロファイルデータ、認証情報、ログを完全に削除します。バックアップは保持されます。',
     'cleanup.deleteAllConfirm': 'すべてのデータを削除',
     'cleanup.deleteAllTitle': 'OpenSquilla のすべてのユーザーデータを削除しますか？',
     'cleanup.deleteAllMessage': 'OpenSquilla を先に終了します。アプリとローカルランタイムが完全に終了した後にのみ削除を開始します。',
@@ -2957,10 +3122,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'menu.checkForUpdates': 'Rechercher les mises à jour…',
     'menu.relaunchToUpdate': 'Relancer pour mettre à jour',
     'menu.downloadDiagnostics': 'Télécharger le diagnostic…',
-    'menu.profile': 'Profil',
-    'menu.showProfile': 'Afficher le profil actif',
-    'menu.switchRecovery': 'Basculer vers un profil de récupération',
-    'menu.returnPrimary': 'Revenir au profil principal',
+    'tray.open': 'Ouvrir OpenSquilla',
+    'tray.running': 'OpenSquilla fonctionne en arrière-plan',
+    'tray.quit': 'Quitter OpenSquilla',
+    'tray.backgroundTitle': 'OpenSquilla fonctionne toujours',
+    'tray.backgroundDetail': 'Les tâches, planifications et canaux connectés continuent en arrière-plan. Ouvrez ou quittez OpenSquilla depuis la zone de notification.',
+    'closePrompt.title': 'Fermer OpenSquilla ?',
+    'closePrompt.message': 'Que doit-il se passer à la fermeture de la fenêtre principale ?',
+    'closePrompt.detail': 'Le mode arrière-plan maintient les tâches, planifications et canaux connectés. Quitter explicitement arrête le runtime local en toute sécurité.',
+    'closePrompt.background': 'Continuer en arrière-plan',
+    'closePrompt.quit': 'Quitter OpenSquilla',
+    'closePrompt.cancel': 'Annuler',
+    'closePrompt.remember': 'Mémoriser mon choix',
     'update.newVersionTitle': 'Une nouvelle version est disponible',
     'update.newVersionDetail': 'OpenSquilla {version} est disponible. Télécharger maintenant ?',
     'update.download': 'Télécharger',
@@ -2988,7 +3161,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.cancel': 'Annuler',
     'cleanup.deleteProfileConfirm': 'Supprimer le profil',
     'cleanup.deleteProfileTitle': 'Supprimer le profil actuel ?',
-    'cleanup.deleteProfileMessage': 'Cette action supprime définitivement les données, l’identifiant et les journaux listés du profil actuel. Les autres profils de récupération et sauvegardes sont conservés.',
+    'cleanup.deleteProfileMessage': 'Cette action supprime définitivement les données, l’identifiant et les journaux listés du profil principal. Les sauvegardes sont conservées.',
     'cleanup.deleteAllConfirm': 'Supprimer toutes les données',
     'cleanup.deleteAllTitle': 'Supprimer toutes les données utilisateur OpenSquilla ?',
     'cleanup.deleteAllMessage': 'OpenSquilla va d’abord se fermer. La suppression ne commence qu’après l’arrêt complet de l’application et de l’environnement local.',
@@ -3083,10 +3256,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'menu.checkForUpdates': 'Nach Updates suchen…',
     'menu.relaunchToUpdate': 'Zum Aktualisieren neu starten',
     'menu.downloadDiagnostics': 'Diagnose herunterladen…',
-    'menu.profile': 'Profil',
-    'menu.showProfile': 'Aktives Profil anzeigen',
-    'menu.switchRecovery': 'Zum Wiederherstellungsprofil wechseln',
-    'menu.returnPrimary': 'Zum Hauptprofil zurückkehren',
+    'tray.open': 'OpenSquilla öffnen',
+    'tray.running': 'OpenSquilla wird im Hintergrund ausgeführt',
+    'tray.quit': 'OpenSquilla beenden',
+    'tray.backgroundTitle': 'OpenSquilla wird weiter ausgeführt',
+    'tray.backgroundDetail': 'Aufgaben, Zeitpläne und verbundene Kanäle laufen im Hintergrund weiter. Öffnen oder beenden Sie OpenSquilla über den Infobereich.',
+    'closePrompt.title': 'OpenSquilla schließen?',
+    'closePrompt.message': 'Was soll beim Schließen des Hauptfensters geschehen?',
+    'closePrompt.detail': 'Im Hintergrundmodus laufen Aufgaben, Zeitpläne und verbundene Kanäle weiter. Beim expliziten Beenden wird die lokale Laufzeit sicher gestoppt.',
+    'closePrompt.background': 'Im Hintergrund weiter ausführen',
+    'closePrompt.quit': 'OpenSquilla beenden',
+    'closePrompt.cancel': 'Abbrechen',
+    'closePrompt.remember': 'Auswahl merken',
     'update.newVersionTitle': 'Eine neue Version ist verfügbar',
     'update.newVersionDetail': 'OpenSquilla {version} ist verfügbar. Jetzt herunterladen?',
     'update.download': 'Herunterladen',
@@ -3114,7 +3295,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.cancel': 'Abbrechen',
     'cleanup.deleteProfileConfirm': 'Profil löschen',
     'cleanup.deleteProfileTitle': 'Aktuelles Profil löschen?',
-    'cleanup.deleteProfileMessage': 'Die aufgeführten Daten, Zugangsdaten und Protokolle des aktuellen Profils werden dauerhaft gelöscht. Andere Wiederherstellungsprofile und Sicherungen bleiben erhalten.',
+    'cleanup.deleteProfileMessage': 'Die aufgeführten Daten, Zugangsdaten und Protokolle des Hauptprofils werden dauerhaft gelöscht. Sicherungen bleiben erhalten.',
     'cleanup.deleteAllConfirm': 'Alle Daten löschen',
     'cleanup.deleteAllTitle': 'Alle OpenSquilla-Benutzerdaten löschen?',
     'cleanup.deleteAllMessage': 'OpenSquilla wird zuerst beendet. Die Löschung beginnt erst, wenn App und lokale Laufzeit vollständig beendet sind.',
@@ -3209,10 +3390,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'menu.checkForUpdates': 'Buscar actualizaciones…',
     'menu.relaunchToUpdate': 'Reiniciar para actualizar',
     'menu.downloadDiagnostics': 'Descargar diagnóstico…',
-    'menu.profile': 'Perfil',
-    'menu.showProfile': 'Mostrar perfil activo',
-    'menu.switchRecovery': 'Cambiar al perfil de recuperación',
-    'menu.returnPrimary': 'Volver al perfil principal',
+    'tray.open': 'Abrir OpenSquilla',
+    'tray.running': 'OpenSquilla se ejecuta en segundo plano',
+    'tray.quit': 'Salir de OpenSquilla',
+    'tray.backgroundTitle': 'OpenSquilla sigue en ejecución',
+    'tray.backgroundDetail': 'Las tareas, programaciones y canales conectados continúan en segundo plano. Abre o cierra OpenSquilla desde la bandeja del sistema.',
+    'closePrompt.title': '¿Cerrar OpenSquilla?',
+    'closePrompt.message': '¿Qué debe ocurrir al cerrar la ventana principal?',
+    'closePrompt.detail': 'El modo en segundo plano mantiene las tareas, programaciones y canales conectados. Salir explícitamente detiene el entorno local de forma segura.',
+    'closePrompt.background': 'Seguir ejecutando en segundo plano',
+    'closePrompt.quit': 'Salir de OpenSquilla',
+    'closePrompt.cancel': 'Cancelar',
+    'closePrompt.remember': 'Recordar mi elección',
     'update.newVersionTitle': 'Hay una nueva versión disponible',
     'update.newVersionDetail': 'OpenSquilla {version} está disponible. ¿Descargar ahora?',
     'update.download': 'Descargar',
@@ -3240,7 +3429,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.cancel': 'Cancelar',
     'cleanup.deleteProfileConfirm': 'Eliminar perfil',
     'cleanup.deleteProfileTitle': '¿Eliminar el perfil actual?',
-    'cleanup.deleteProfileMessage': 'Esto elimina permanentemente los datos, la credencial y los registros enumerados del perfil actual. Se conservan otros perfiles de recuperación y copias de seguridad.',
+    'cleanup.deleteProfileMessage': 'Esto elimina permanentemente los datos, la credencial y los registros enumerados del perfil principal. Se conservan las copias de seguridad.',
     'cleanup.deleteAllConfirm': 'Eliminar todos los datos',
     'cleanup.deleteAllTitle': '¿Eliminar todos los datos de usuario de OpenSquilla?',
     'cleanup.deleteAllMessage': 'OpenSquilla se cerrará primero. La eliminación solo comienza cuando la app y el entorno local hayan terminado por completo.',
@@ -3517,13 +3706,7 @@ function desktopT(key: string): string {
 }
 
 function createApplicationMenu(): void {
-  const recoveryProfileActive = activeDesktopProfile().kind === 'recovery'
-  const availableRecoveryProfiles = allProfileContexts().filter((profile) => (
-    profile.kind === 'recovery' && profile.recoveryId
-  ))
-  const profileMenuActive = recoveryProfileActive
-    || availableRecoveryProfiles.length > 0
-  if (!shouldUseNativeApplicationMenu && !profileMenuActive) {
+  if (!shouldUseNativeApplicationMenu) {
     Menu.setApplicationMenu(null)
     return
   }
@@ -3559,73 +3742,11 @@ function createApplicationMenu(): void {
   )
   appSubmenu.push({ type: 'separator' }, { role: 'quit' })
 
-  const profileSubmenu: Electron.MenuItemConstructorOptions[] = [
-    {
-      label: desktopT('menu.showProfile'),
-      click: () => {
-        const home = activeDesktopProfile().home
-        if (existsSync(home)) void shell.showItemInFolder(home)
-        else void shell.openPath(dirname(home)).catch(() => null)
-      },
-    },
-  ]
-  if (availableRecoveryProfiles.length > 0) {
-    profileSubmenu.push(
-      { type: 'separator' },
-      {
-        label: desktopT('menu.switchRecovery'),
-        submenu: availableRecoveryProfiles.map((profile) => ({
-          label: `Recovery ${profile.recoveryId?.slice(0, 8)}`,
-          enabled: profile.recoveryId !== activeDesktopProfile().recoveryId,
-          click: () => {
-            void withRecoveryOperation(() => launchRecoveryProfile({
-              mode: 'continue',
-              recoveryId: profile.recoveryId,
-              copyPrimaryCredential: false,
-            })).then((result) => {
-              if (result.ok) return
-              void dialog.showMessageBox({
-                type: 'warning',
-                buttons: ['OK'],
-                message: desktopT('menu.switchRecovery'),
-                detail: result.error,
-              })
-            })
-          },
-        })),
-      },
-    )
-  }
-  if (recoveryProfileActive) {
-    profileSubmenu.push(
-      { type: 'separator' },
-      {
-        label: desktopT('menu.returnPrimary'),
-        click: () => {
-          void withRecoveryOperation(retryOrReturnPrimaryProfile).then((result) => {
-            if (!result.ok || result.value.outcome !== 'recovery_required') return
-            void dialog.showMessageBox({
-              type: 'warning',
-              buttons: ['OK'],
-              message: desktopT('menu.returnPrimary'),
-              detail: result.value.stable_code,
-            })
-          })
-        },
-      },
-    )
-  }
-
   const template: Electron.MenuItemConstructorOptions[] = [
     {
       label: app.name,
       submenu: appSubmenu,
     },
-    ...(profileMenuActive ? [{
-      label: desktopT('menu.profile'),
-      submenu: profileSubmenu,
-      enabled: currentOnboardingWindow() === null,
-    }] : []),
     {
       label: desktopT('menu.edit'),
       submenu: [
@@ -3688,6 +3809,176 @@ function focusMainWindow(): boolean {
   mainWindow.show()
   mainWindow.focus()
   return true
+}
+
+function setAppExitPhase(next: DesktopExitPhase, reason: string): void {
+  if (appExitPhase === next) return
+  desktopLog('desktop_exit_phase', { from: appExitPhase, to: next, reason })
+  appExitPhase = next
+  rebuildWindowsTrayMenu()
+}
+
+function destroyWindowsTray(): void {
+  if (!windowsTray) return
+  windowsTray.destroy()
+  windowsTray = null
+}
+
+function rebuildWindowsTrayMenu(): void {
+  if (!windowsTray) return
+  windowsTray.setContextMenu(Menu.buildFromTemplate([
+    {
+      label: desktopT('tray.open'),
+      enabled: canRevealDesktopApp(appExitPhase),
+      click: () => revealDesktopApp(),
+    },
+    {
+      label: desktopT('tray.running'),
+      enabled: false,
+    },
+    { type: 'separator' },
+    {
+      label: desktopT('tray.quit'),
+      click: () => app.quit(),
+    },
+  ]))
+}
+
+function createWindowsTray(): boolean {
+  if (process.platform !== 'win32') return false
+  if (windowsTray) return true
+  try {
+    const tray = new Tray(appIconPath())
+    windowsTray = tray
+    tray.setToolTip('OpenSquilla')
+    tray.on('click', () => revealDesktopApp())
+    tray.on('balloon-click', () => revealDesktopApp())
+    rebuildWindowsTrayMenu()
+    desktopLog('windows_tray_ready')
+    return true
+  } catch (error) {
+    windowsTray = null
+    desktopLog('windows_tray_failed', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return false
+  }
+}
+
+function showWindowsBackgroundCloseNotice(): void {
+  if (process.platform !== 'win32' || !windowsTray) return
+  const preferences = loadDesktopPreferencesRecord()
+  if (preferences.value.background_close_notice_shown) return
+  try {
+    windowsTray.displayBalloon({
+      title: desktopT('tray.backgroundTitle'),
+      content: desktopT('tray.backgroundDetail'),
+      iconType: 'info',
+      noSound: true,
+      respectQuietTime: true,
+    })
+    markBackgroundCloseNoticeShown()
+  } catch (error) {
+    desktopLog('windows_tray_notice_failed', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }
+}
+
+function hideMainWindow(window: BrowserWindow): void {
+  if (!window.webContents.isDestroyed()) {
+    window.webContents.send('desktop:window:hidden')
+  }
+  window.hide()
+  desktopLog('main_window_hidden', { platform: process.platform })
+  showWindowsBackgroundCloseNotice()
+}
+
+function revealDesktopApp(): void {
+  if (!canRevealDesktopApp(appExitPhase)) return
+  focusMainWindow()
+  // Profile migration and cleanup reuse isQuitting as a spawn gate. The hidden
+  // renderer is still safe to reveal during those operations, but opening a
+  // missing window or starting another Gateway is not.
+  if (isQuitting) return
+  void openOrResumeDesktopApp()
+}
+
+async function promptForMainWindowClose(window: BrowserWindow): Promise<void> {
+  if (mainWindowClosePrompt) return await mainWindowClosePrompt
+  mainWindowClosePrompt = (async () => {
+    const result = await dialog.showMessageBox(window, {
+      type: 'question',
+      title: desktopT('closePrompt.title'),
+      message: desktopT('closePrompt.message'),
+      detail: desktopT('closePrompt.detail'),
+      buttons: [
+        desktopT('closePrompt.background'),
+        desktopT('closePrompt.quit'),
+        desktopT('closePrompt.cancel'),
+      ],
+      defaultId: 0,
+      cancelId: 2,
+      checkboxLabel: desktopT('closePrompt.remember'),
+      checkboxChecked: false,
+      noLink: true,
+    })
+    if (window.isDestroyed() || appExitPhase !== 'running') return
+    if (result.response === 0) {
+      if (result.checkboxChecked) {
+        await saveDesktopPreferences({
+          mainWindowCloseBehavior: 'background',
+        }).catch((error) => {
+          desktopLog('desktop_preferences_save_failed', {
+            error: error instanceof Error ? error.message : String(error),
+          })
+        })
+      }
+      hideMainWindow(window)
+      return
+    }
+    if (result.response === 1) {
+      if (result.checkboxChecked) {
+        await saveDesktopPreferences({
+          mainWindowCloseBehavior: 'quit',
+        }).catch((error) => {
+          desktopLog('desktop_preferences_save_failed', {
+            error: error instanceof Error ? error.message : String(error),
+          })
+        })
+      }
+      app.quit()
+    }
+  })().finally(() => {
+    mainWindowClosePrompt = null
+  })
+  return await mainWindowClosePrompt
+}
+
+function handleMainWindowClose(window: BrowserWindow, event: Electron.Event): void {
+  const action = mainWindowCloseAction({
+    platform: process.platform,
+    exitPhase: appExitPhase,
+    systemSessionEnding,
+    onboardingOpen: currentOnboardingWindow() !== null,
+    behavior: loadDesktopPreferencesRecord().value.main_window_close_behavior,
+    windowsTrayReady: windowsTray !== null,
+  })
+  if (action === 'allow') return
+  event.preventDefault()
+  if (action === 'focus-onboarding') {
+    focusOnboardingWindow()
+    return
+  }
+  if (action === 'hide') {
+    hideMainWindow(window)
+    return
+  }
+  if (action === 'quit') {
+    app.quit()
+    return
+  }
+  void promptForMainWindowClose(window)
 }
 
 function installEditingContextMenu(window: BrowserWindow): void {
@@ -5092,9 +5383,7 @@ function onboardingHtml(
 }
 
 async function runOnboarding(): Promise<DesktopConnection> {
-  const pendingProviderSetup = activeDesktopProfile().kind === 'primary'
-    ? await loadPendingMigrationProviderSetup()
-    : null
+  const pendingProviderSetup = await loadPendingMigrationProviderSetup()
   const existing = await loadDesktopCredential()
   // A saved credential encrypted with the OS keychain that this session cannot
   // read (keychain locked or unavailable) must not be treated as "no credential":
@@ -5308,7 +5597,6 @@ const RECOVERY_OUTCOMES = new Set<RecoveryOutcome>([
   'ready',
   'attention',
   'recovery_required',
-  'recovery_profile',
 ])
 
 function recoveryRecord(value: unknown): Record<string, unknown> | null {
@@ -5386,6 +5674,399 @@ function parseRecoveryProtocol(value: unknown): RecoveryProtocolResult {
   }
 }
 
+const DESKTOP_PROFILE_CONSOLIDATION_OUTCOMES = new Set<DesktopProfileConsolidationOutcome>([
+  'noop',
+  'consolidated',
+  'blocked',
+])
+const DESKTOP_CREDENTIAL_ADOPTION_STATUSES = new Set<DesktopCredentialAdoptionStatus>([
+  'pending',
+  'complete',
+  'not_required',
+])
+
+function parseDesktopProfileConsolidationProtocol(
+  value: unknown,
+): DesktopProfileConsolidationResult {
+  const record = recoveryRecord(value)
+  if (!record || record.schema_version !== 1) {
+    throw new Error('Desktop profile consolidation returned an unsupported protocol schema.')
+  }
+  const outcome = String(record.outcome || '') as DesktopProfileConsolidationOutcome
+  if (!DESKTOP_PROFILE_CONSOLIDATION_OUTCOMES.has(outcome)) {
+    throw new Error('Desktop profile consolidation returned an invalid outcome.')
+  }
+  if (typeof record.stable_code !== 'string' || !record.stable_code) {
+    throw new Error('Desktop profile consolidation omitted its stable code.')
+  }
+  if (typeof record.primary_home !== 'string' || !record.primary_home) {
+    throw new Error('Desktop profile consolidation omitted the primary home.')
+  }
+  const credentialAdoptionStatus = String(
+    record.credential_adoption_status || '',
+  ) as DesktopCredentialAdoptionStatus
+  if (!DESKTOP_CREDENTIAL_ADOPTION_STATUSES.has(credentialAdoptionStatus)) {
+    throw new Error('Desktop profile consolidation returned an invalid credential adoption status.')
+  }
+  const nullableStringFields = [
+    'configuration_source_recovery_id',
+    'configuration_source_credential_path',
+    'configuration_source_credential_sha256',
+    'backup_path',
+    'receipt_path',
+  ] as const
+  for (const field of nullableStringFields) {
+    if (record[field] !== null && typeof record[field] !== 'string') {
+      throw new Error(`Desktop profile consolidation returned an invalid ${field}.`)
+    }
+  }
+  const sourceRecoveryId = record.configuration_source_recovery_id as string | null
+  const sourceCredentialPath = record.configuration_source_credential_path as string | null
+  const sourceCredentialSha256 = record.configuration_source_credential_sha256 as string | null
+  const sourceCredentialSize = record.configuration_source_credential_size
+  if (
+    (sourceRecoveryId !== null && !isRecoveryProfileId(sourceRecoveryId))
+    || (sourceCredentialPath !== null && sourceRecoveryId === null)
+    || (
+      sourceCredentialSha256 !== null
+      && !/^[0-9a-f]{64}$/.test(sourceCredentialSha256)
+    )
+    || (
+      sourceCredentialSize !== null
+      && (
+        !Number.isSafeInteger(sourceCredentialSize)
+        || Number(sourceCredentialSize) < 0
+      )
+    )
+  ) {
+    throw new Error('Desktop profile consolidation returned an invalid credential source.')
+  }
+  if (!Array.isArray(record.consumed_recovery_ids)) {
+    throw new Error('Desktop profile consolidation returned invalid consumed profile ids.')
+  }
+  const consumedRecoveryIds = record.consumed_recovery_ids.map((item) => {
+    if (!isRecoveryProfileId(item)) {
+      throw new Error('Desktop profile consolidation returned an invalid consumed profile id.')
+    }
+    return item
+  })
+  if (new Set(consumedRecoveryIds).size !== consumedRecoveryIds.length) {
+    throw new Error('Desktop profile consolidation returned duplicate consumed profile ids.')
+  }
+  if (
+    sourceRecoveryId !== null
+    && !consumedRecoveryIds.some((item) => (
+      item.toLowerCase() === sourceRecoveryId.toLowerCase()
+    ))
+  ) {
+    throw new Error('Desktop profile consolidation returned an unconsumed configuration source.')
+  }
+  if (!Number.isSafeInteger(record.revision) || Number(record.revision) < 0) {
+    throw new Error('Desktop profile consolidation returned an invalid revision.')
+  }
+  if (
+    !Array.isArray(record.errors)
+    || record.errors.some((item) => typeof item !== 'string')
+  ) {
+    throw new Error('Desktop profile consolidation returned invalid errors.')
+  }
+  const backupPath = record.backup_path as string | null
+  const receiptPath = record.receipt_path as string | null
+  if (
+    (backupPath === null) !== (receiptPath === null)
+    || (sourceCredentialPath !== null && backupPath === null)
+    || (
+      sourceCredentialPath === null
+      && (sourceCredentialSha256 !== null || sourceCredentialSize !== null)
+    )
+    || (
+      sourceCredentialPath !== null
+      && (sourceCredentialSha256 === null || sourceCredentialSize === null)
+    )
+    || (
+      credentialAdoptionStatus === 'pending'
+      && (sourceCredentialPath === null || backupPath === null)
+    )
+    || (
+      credentialAdoptionStatus === 'not_required'
+      && sourceCredentialPath !== null
+    )
+    || (
+      outcome === 'consolidated'
+      && (
+        backupPath === null
+        || consumedRecoveryIds.length === 0
+        || (
+          sourceCredentialPath === null
+            ? credentialAdoptionStatus !== 'not_required'
+            : credentialAdoptionStatus !== 'pending'
+        )
+      )
+    )
+    || (
+      outcome === 'blocked'
+      && (
+        sourceRecoveryId !== null
+        || sourceCredentialPath !== null
+        || consumedRecoveryIds.length > 0
+        || backupPath !== null
+        || credentialAdoptionStatus !== 'not_required'
+      )
+    )
+  ) {
+    throw new Error('Desktop profile consolidation returned inconsistent outcome metadata.')
+  }
+  return {
+    schema_version: 1,
+    outcome,
+    stable_code: record.stable_code,
+    primary_home: record.primary_home,
+    configuration_source_recovery_id: sourceRecoveryId,
+    configuration_source_credential_path: sourceCredentialPath,
+    configuration_source_credential_sha256: sourceCredentialSha256,
+    configuration_source_credential_size: (
+      sourceCredentialSize === null ? null : Number(sourceCredentialSize)
+    ),
+    consumed_recovery_ids: consumedRecoveryIds,
+    backup_path: backupPath,
+    receipt_path: receiptPath,
+    credential_adoption_status: credentialAdoptionStatus,
+    revision: Number(record.revision),
+    errors: record.errors as string[],
+    // Optional so an older runtime that predates the field still parses; absent
+    // means "assume not intact", which keeps the stricter blocking behavior.
+    primary_home_intact: record.primary_home_intact === true,
+  }
+}
+
+// A boolean second opinion on the consolidation protocol's own verdict that the
+// primary profile survived a failed fan-in. Intentionally shallow: the protocol
+// owns the journal contract, and duplicating that here would create a second copy
+// to drift out of sync.
+function isPlainDesktopDirectory(path: string): boolean {
+  try {
+    const info = lstatSync(path)
+    return info.isDirectory() && !info.isSymbolicLink()
+  } catch {
+    return false
+  }
+}
+
+function requirePlainConsolidationDirectory(path: string, label: string): string {
+  try {
+    const info = lstatSync(path)
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('unsafe directory')
+    return realpathSync(path)
+  } catch {
+    throw new Error(`Desktop profile consolidation returned an unsafe ${label}.`)
+  }
+}
+
+function requirePlainConsolidationFile(path: string, label: string): string {
+  try {
+    const info = lstatSync(path)
+    if (!info.isFile() || info.isSymbolicLink()) throw new Error('unsafe file')
+    return realpathSync(path)
+  } catch {
+    throw new Error(`Desktop profile consolidation returned an unsafe ${label}.`)
+  }
+}
+
+function validateDesktopProfileConsolidationPaths(
+  result: DesktopProfileConsolidationResult,
+  primary: DesktopProfilePaths,
+): void {
+  if (!resolvedPathsEqual(result.primary_home, primary.home)) {
+    throw new Error('Desktop profile consolidation returned a different primary home.')
+  }
+  // Historical receipt metadata is informational once credential adoption is
+  // acknowledged. In particular, a user may delete an archived credential or
+  // backup after the primary has become authoritative; startup must not depend
+  // on that archive forever. A pending noop is different: it is the durable
+  // retry record for a crash between consolidation and credential adoption, so
+  // its archive must pass the same boundary checks as a fresh consolidation.
+  if (
+    result.outcome !== 'consolidated'
+    && result.credential_adoption_status !== 'pending'
+  ) return
+  if (result.backup_path === null) return
+  if (result.receipt_path === null) {
+    throw new Error('Desktop profile consolidation omitted its receipt path.')
+  }
+
+  const userData = app.getPath('userData')
+  const backups = join(userData, 'backups')
+  const consolidationRoot = join(backups, 'profile-consolidation')
+  const transactionId = basename(result.backup_path)
+  if (
+    !isRecoveryProfileId(transactionId)
+    || !resolvedPathsEqual(dirname(result.backup_path), consolidationRoot)
+    || !resolvedPathsEqual(result.receipt_path, join(result.backup_path, 'receipt.json'))
+  ) {
+    throw new Error('Desktop profile consolidation returned an unexpected backup path.')
+  }
+
+  const userDataReal = requirePlainConsolidationDirectory(userData, 'userData root')
+  const backupsReal = requirePlainConsolidationDirectory(backups, 'backup root')
+  const consolidationRootReal = requirePlainConsolidationDirectory(
+    consolidationRoot,
+    'profile consolidation root',
+  )
+  const backupReal = requirePlainConsolidationDirectory(
+    result.backup_path,
+    'profile consolidation backup',
+  )
+  const receiptReal = requirePlainConsolidationFile(
+    result.receipt_path,
+    'profile consolidation receipt',
+  )
+  if (
+    !resolvedPathsEqual(dirname(backupsReal), userDataReal)
+    || !resolvedPathsEqual(dirname(consolidationRootReal), backupsReal)
+    || !resolvedPathsEqual(dirname(backupReal), consolidationRootReal)
+    || !resolvedPathsEqual(dirname(receiptReal), backupReal)
+  ) {
+    throw new Error('Desktop profile consolidation backup escaped its trusted root.')
+  }
+}
+
+async function runDesktopProfileConsolidationCli(
+  profile: DesktopProfilePaths,
+  commandArgs: string[] = [
+    'consolidate-profiles',
+    '--user-data', app.getPath('userData'),
+    '--primary-home', profile.home,
+    '--json',
+  ],
+): Promise<DesktopProfileConsolidationResult> {
+  const runtime = await resolveGatewayRuntime()
+  const prefix = runtime.args.slice(0, -2)
+  return await new Promise((resolveResult, rejectResult) => {
+    const child = spawn(runtime.command, [
+      ...prefix,
+      'recovery',
+      ...commandArgs,
+    ], {
+      cwd: runtime.cwd,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: desktopChildEnvironment(profile, {
+        OPENSQUILLA_RECOVERY_OFFLINE: '1',
+        PYTHONUNBUFFERED: '1',
+        PYTHONUTF8: '1',
+        PYTHONIOENCODING: 'utf-8:replace',
+      }),
+    })
+    let stdout = ''
+    let oversized = false
+    let settled = false
+    const finish = (
+      error?: Error,
+      result?: DesktopProfileConsolidationResult,
+    ) => {
+      if (settled) return
+      settled = true
+      if (error) rejectResult(error)
+      else resolveResult(result as DesktopProfileConsolidationResult)
+    }
+    child.stdout.on('data', (chunk) => {
+      if (oversized) return
+      stdout += String(chunk)
+      if (stdout.length > RECOVERY_STDOUT_LIMIT) oversized = true
+    })
+    // The protocol result is the only trusted diagnostic surface. stderr can
+    // contain local profile paths and is deliberately drained without exposure.
+    child.stderr.resume()
+    child.once('error', (error) => finish(
+      error instanceof Error ? error : new Error(String(error)),
+    ))
+    child.once('close', (code) => {
+      if (oversized) {
+        return finish(new Error('Desktop profile consolidation output exceeded its limit.'))
+      }
+      let result: DesktopProfileConsolidationResult
+      try {
+        result = parseDesktopProfileConsolidationProtocol(JSON.parse(stdout))
+      } catch (error) {
+        if (code !== 0) {
+          return finish(new Error(
+            `Desktop profile consolidation failed with exit code ${code ?? 'unknown'}.`,
+          ))
+        }
+        return finish(error instanceof Error ? error : new Error(String(error)))
+      }
+      const expectedExitCode = result.outcome === 'blocked' ? 2 : 0
+      if (code !== expectedExitCode) {
+        return finish(new Error(
+          `Desktop profile consolidation returned ${result.outcome} with exit code ${code ?? 'unknown'}.`,
+        ))
+      }
+      return finish(undefined, result)
+    })
+  })
+}
+
+async function acknowledgeConsolidatedDesktopCredential(
+  consolidation: DesktopProfileConsolidationResult,
+): Promise<void> {
+  if (
+    consolidation.credential_adoption_status !== 'pending'
+    || consolidation.backup_path === null
+    || consolidation.receipt_path === null
+  ) {
+    throw new Error('Desktop credential adoption acknowledgement was not pending.')
+  }
+  const primary = primaryDesktopProfile()
+  const transactionId = basename(consolidation.backup_path)
+  const acknowledged = await runDesktopProfileConsolidationCli(primary, [
+    'acknowledge-profile-credential',
+    '--user-data', app.getPath('userData'),
+    '--primary-home', primary.home,
+    '--transaction-id', transactionId,
+    '--json',
+  ])
+  validateDesktopProfileConsolidationPaths(acknowledged, primary)
+  const sourceIdsMatch = (
+    acknowledged.configuration_source_recovery_id?.toLowerCase()
+    === consolidation.configuration_source_recovery_id?.toLowerCase()
+  )
+  const sourcePathsMatch = (
+    acknowledged.configuration_source_credential_path !== null
+    && consolidation.configuration_source_credential_path !== null
+    && resolvedPathsEqual(
+      acknowledged.configuration_source_credential_path,
+      consolidation.configuration_source_credential_path,
+    )
+  )
+  const sourceIntegrityMatches = (
+    acknowledged.configuration_source_credential_sha256
+      === consolidation.configuration_source_credential_sha256
+    && acknowledged.configuration_source_credential_size
+      === consolidation.configuration_source_credential_size
+  )
+  const consumedIdsMatch = (
+    acknowledged.consumed_recovery_ids.length === consolidation.consumed_recovery_ids.length
+    && acknowledged.consumed_recovery_ids.every((item, index) => (
+      item.toLowerCase() === consolidation.consumed_recovery_ids[index]?.toLowerCase()
+    ))
+  )
+  if (
+    acknowledged.outcome !== 'noop'
+    || acknowledged.credential_adoption_status !== 'complete'
+    || acknowledged.backup_path === null
+    || acknowledged.receipt_path === null
+    || !resolvedPathsEqual(acknowledged.backup_path, consolidation.backup_path)
+    || !resolvedPathsEqual(acknowledged.receipt_path, consolidation.receipt_path)
+    || !sourceIdsMatch
+    || !sourcePathsMatch
+    || !sourceIntegrityMatches
+    || !consumedIdsMatch
+    || acknowledged.revision !== consolidation.revision
+  ) {
+    throw new Error('Desktop credential adoption acknowledgement changed its receipt metadata.')
+  }
+}
+
 function recoveryFailureResult(home: string, stableCode: string): RecoveryProtocolResult {
   return {
     schema_version: RECOVERY_PROTOCOL_SCHEMA_VERSION,
@@ -5395,9 +6076,6 @@ function recoveryFailureResult(home: string, stableCode: string): RecoveryProtoc
     effective_workspace: null,
     candidates: [],
     allowed_actions: [
-      'continue-recovery-profile',
-      'create-recovery-profile',
-      'retry-primary-profile',
       'show-backups',
       'copy-diagnostics',
     ],
@@ -5416,7 +6094,7 @@ async function runRecoveryCli(
   const kindAwareCommands = new Set(['inspect', 'reconcile', 'choose-workspace'])
   const effectiveArgs = kindAwareCommands.has(commandArgs[0] || '')
     && !commandArgs.includes('--profile-kind')
-    ? [...commandArgs, '--profile-kind', profileKindEnvironment(profile.kind)]
+    ? [...commandArgs, '--profile-kind', 'desktop-primary']
     : commandArgs
   const finishWriter = mutating && !recoveryOperationBusy && !writerReserved
     ? beginDesktopWriterOperation(`recovery ${commandArgs[0] || 'operation'}`)
@@ -5496,24 +6174,385 @@ async function inspectDesktopProfile(profile: DesktopProfilePaths): Promise<Reco
       error: error instanceof Error ? error.message : 'unknown error',
     })
     return recoveryFailureResult(
-      profile.kind === 'primary' ? profile.home : primaryDesktopProfile().home,
+      profile.home,
       'desktop_recovery_inspect_failed',
     )
   }
 }
 
+async function readVerifiedConsolidatedCredential(
+  path: string,
+  expectedRealPath: string,
+  expectedSha256: string,
+  expectedSize: number,
+): Promise<string> {
+  const handle = await open(path, 'r')
+  let raw: Buffer
+  try {
+    const before = await handle.stat()
+    if (!before.isFile() || before.size !== expectedSize) {
+      throw new Error('The archived Desktop credential no longer matches its receipt.')
+    }
+    raw = await handle.readFile()
+    const after = await handle.stat()
+    if (
+      before.dev !== after.dev
+      || before.ino !== after.ino
+      || before.mode !== after.mode
+      || before.size !== after.size
+      || before.mtimeMs !== after.mtimeMs
+    ) {
+      throw new Error('The archived Desktop credential changed while it was being read.')
+    }
+  } finally {
+    await handle.close()
+  }
+  const currentRealPath = requirePlainConsolidationFile(
+    path,
+    'archived Desktop credential',
+  )
+  const digest = createHash('sha256').update(raw).digest('hex')
+  if (
+    !resolvedPathsEqual(currentRealPath, expectedRealPath)
+    || raw.length !== expectedSize
+    || digest !== expectedSha256
+  ) {
+    throw new Error('The archived Desktop credential no longer matches its receipt.')
+  }
+  return raw.toString('utf8')
+}
+
+async function adoptConsolidatedDesktopCredential(
+  consolidation: DesktopProfileConsolidationResult,
+): Promise<void> {
+  // A fresh consolidation and a noop returned from an explicitly pending
+  // receipt are both eligible. Completed/no-op receipts are never replayed, so
+  // deleting a primary credential later cannot resurrect an archived secret.
+  if (consolidation.credential_adoption_status !== 'pending') return
+  const sourceRecoveryId = consolidation.configuration_source_recovery_id
+  const sourceCredentialPath = consolidation.configuration_source_credential_path
+  const sourceCredentialSha256 = consolidation.configuration_source_credential_sha256
+  const sourceCredentialSize = consolidation.configuration_source_credential_size
+  if (
+    sourceRecoveryId === null
+    || sourceCredentialPath === null
+    || sourceCredentialSha256 === null
+    || sourceCredentialSize === null
+    || consolidation.backup_path === null
+  ) {
+    throw new Error('Desktop profile consolidation returned an incomplete credential source.')
+  }
+
+  const expectedSourcePath = join(
+    consolidation.backup_path,
+    'recovery-profiles',
+    sourceRecoveryId,
+    'desktop-credential.json',
+  )
+  if (!resolvedPathsEqual(sourceCredentialPath, expectedSourcePath)) {
+    throw new Error('Desktop profile consolidation returned an unexpected credential path.')
+  }
+  const recoveryContainer = join(consolidation.backup_path, 'recovery-profiles')
+  const recoveryRoot = join(recoveryContainer, sourceRecoveryId)
+  const backupReal = requirePlainConsolidationDirectory(
+    consolidation.backup_path,
+    'profile consolidation backup',
+  )
+  const recoveryContainerReal = requirePlainConsolidationDirectory(
+    recoveryContainer,
+    'archived recovery container',
+  )
+  const recoveryRootReal = requirePlainConsolidationDirectory(
+    recoveryRoot,
+    'archived recovery profile',
+  )
+  const sourceReal = requirePlainConsolidationFile(
+    sourceCredentialPath,
+    'archived Desktop credential',
+  )
+  if (
+    !resolvedPathsEqual(dirname(recoveryContainerReal), backupReal)
+    || !resolvedPathsEqual(dirname(recoveryRootReal), recoveryContainerReal)
+    || !resolvedPathsEqual(dirname(sourceReal), recoveryRootReal)
+    || !resolvedPathsEqual(sourceReal, expectedSourcePath)
+  ) {
+    throw new Error('The consolidated Desktop credential changed before it could be adopted.')
+  }
+  // Bind credential adoption to the exact bytes recorded by the offline
+  // consolidation receipt. Parsing/decryption errors in those verified bytes
+  // can fall back to onboarding; an integrity mismatch must remain pending and
+  // block adoption instead of silently acknowledging a different secret.
+  const sourceCredential = await readVerifiedConsolidatedCredential(
+    sourceCredentialPath,
+    sourceReal,
+    sourceCredentialSha256,
+    sourceCredentialSize,
+  )
+
+  const finishWriter = beginDesktopWriterOperation('adopt consolidated Desktop credential')
+  try {
+    const primary = primaryDesktopProfile()
+    const currentCredential = await readOptionalDesktopText(primary.credentialPath)
+    let disposition: 'adopted' | 'primary_exists' | 'source_unusable' | null = null
+    if (currentCredential !== null) {
+      // A primary credential that appeared while consolidation ran is
+      // authoritative; path validation above still runs before we acknowledge
+      // the historical source.
+      disposition = 'primary_exists'
+    } else {
+      let credential: DesktopConnection | null = null
+      let credentialPhase: 'parse' | 'decrypt' = 'parse'
+      try {
+        const raw = sourceCredential
+        const parsed = recoveryRecord(JSON.parse(raw))
+        if (!parsed) throw new Error('credential is not an object')
+        const stringFields = [
+          'provider',
+          'model',
+          'baseUrl',
+          'apiKeyEnv',
+          'encryptedApiKey',
+          'modelRoutingMode',
+          'routerMode',
+          'routerDefaultTier',
+          'searchProvider',
+          'searchApiKeyEnv',
+          'encryptedSearchApiKey',
+          'encryption',
+          'configAuthority',
+          'importTransactionId',
+          'createdAt',
+          'updatedAt',
+        ] as const
+        if (stringFields.some((field) => (
+          Object.prototype.hasOwnProperty.call(parsed, field)
+          && typeof parsed[field] !== 'string'
+        ))) {
+          throw new Error('credential contains an invalid string field')
+        }
+        if (
+          Object.prototype.hasOwnProperty.call(parsed, 'disableNetworkObservability')
+          && typeof parsed.disableNetworkObservability !== 'boolean'
+        ) {
+          throw new Error('credential contains an invalid boolean field')
+        }
+        if (
+          Object.prototype.hasOwnProperty.call(parsed, 'routerTiers')
+          && !recoveryRecord(parsed.routerTiers)
+        ) {
+          throw new Error('credential contains invalid router tiers')
+        }
+        const candidateCredential = normalizeDesktopCredential(
+          parsed as Partial<DesktopConnection>,
+        )
+        credentialPhase = 'decrypt'
+        // Validate OS-keychain ciphertext before publishing it at the primary path.
+        // Unusable historical secrets are skipped so normal onboarding can collect
+        // a fresh credential instead of permanently blocking every startup.
+        if (
+          candidateCredential.encryptedApiKey
+          && !decryptApiKey(candidateCredential)
+        ) {
+          throw new Error('provider credential decrypted to an empty value')
+        }
+        if (
+          candidateCredential.encryptedSearchApiKey
+          && !decryptSearchApiKey(candidateCredential)
+        ) {
+          throw new Error('search credential decrypted to an empty value')
+        }
+        // Publish eligibility is assigned only after both safeStorage/plaintext
+        // validations complete. A decryption exception must leave this null so
+        // the historical source is skipped rather than copied into primary.
+        credential = candidateCredential
+      } catch {
+        const stableCode = credentialPhase === 'parse'
+          ? 'archived_credential_invalid'
+          : 'archived_credential_decryption_failed'
+        desktopLog('desktop_profile_consolidation_credential_skipped', {
+          sourceRecoveryId,
+          stableCode,
+        })
+        disposition = 'source_unusable'
+      }
+
+      if (credential !== null) {
+        const expectedConfig = await readOptionalDesktopText(join(primary.home, 'config.toml'))
+        if (expectedConfig === null) {
+          // A credential-only legacy recovery has no profile config authority
+          // to preserve. Generate the canonical primary config and publish it
+          // with the credential through the existing paired settings
+          // transaction, so a crash cannot expose only one half.
+          credential = normalizeDesktopCredential({
+            ...credential,
+            configAuthority: 'generated',
+            importTransactionId: '',
+          })
+          await applyDesktopSettingsPair(
+            primary,
+            credential,
+            JSON.stringify(credential, null, 2),
+            null,
+            true,
+          )
+        } else {
+          const inspection = await inspectDesktopProfile(primary)
+          if (inspection.outcome === 'recovery_required' || !inspection.transaction_id) {
+            throw new Error(
+              `The consolidated primary config is not ready for credential adoption (${inspection.stable_code}).`,
+            )
+          }
+          const result = await runRecoveryCli(
+            primary,
+            [
+              'apply-settings',
+              '--home', primary.home,
+              '--transaction-id', inspection.transaction_id,
+              '--expected-revision', String(inspection.revision),
+              '--json',
+            ],
+            JSON.stringify({
+              expected_config: expectedConfig,
+              config: expectedConfig,
+              expected_credential: null,
+              credential: JSON.stringify(credential, null, 2),
+            }),
+            true,
+          )
+          if (result.outcome === 'recovery_required') {
+            throw new Error(
+              `The consolidated Desktop credential was not adopted (${result.stable_code}).`,
+            )
+          }
+        }
+        // Force the normal loader to validate the bytes at their final primary path.
+        if (!await loadDesktopCredential()) {
+          throw new Error('The consolidated Desktop credential was not published.')
+        }
+        desktopLog('desktop_profile_consolidation_credential_adopted', {
+          sourceRecoveryId,
+        })
+        disposition = 'adopted'
+      }
+    }
+
+    if (disposition === null) {
+      throw new Error('Desktop credential adoption did not reach a terminal disposition.')
+    }
+    await acknowledgeConsolidatedDesktopCredential(consolidation)
+    desktopLog('desktop_profile_consolidation_credential_acknowledged', {
+      sourceRecoveryId,
+      disposition,
+    })
+  } finally {
+    finishWriter()
+  }
+}
+
+let desktopProfilesConsolidatedThisProcess = false
+let desktopProfileConsolidationPromise: Promise<RecoveryProtocolResult | null> | null = null
+let pendingDesktopCredentialConsolidation: DesktopProfileConsolidationResult | null = null
+
+// Operator escape hatch. Consolidation gates startup, and its own retry path
+// re-runs the same work, so a profile layout it cannot process leaves the user
+// with no in-app way forward. Opting out skips the fan-in entirely: the primary
+// profile starts untouched, every legacy recovery profile stays byte-for-byte on
+// disk, and a later launch without the opt-out retries.
+//
+// This remains useful alongside the automatic deferral below, which only applies
+// when the fan-in reports the primary profile as physically usable. The opt-out
+// skips the fan-in outright, so it also covers a primary the protocol refuses to
+// judge — and it lets support and CI take the same path deliberately.
+function profileConsolidationOptOut(): boolean {
+  const raw = (process.env.OPENSQUILLA_DESKTOP_SKIP_PROFILE_CONSOLIDATION || '').trim()
+  return ['1', 'true', 'yes', 'on'].includes(raw.toLowerCase())
+}
+
+// Set when a blocked fan-in was allowed to defer. Deliberately separate from
+// `desktopProfilesConsolidatedThisProcess`, which must stay false so a blocked
+// attempt is never recorded as a completed consolidation; this one only stops a
+// window-reopen loop from re-spawning the same failing CLI within one process.
+let desktopProfileConsolidationDeferredThisProcess = false
+
+async function consolidateLegacyRecoveryProfilesBeforeStartup(
+): Promise<RecoveryProtocolResult | null> {
+  if (desktopProfileConsolidationDeferredThisProcess) return null
+  if (profileConsolidationOptOut()) {
+    // Logged every launch, never once: a silently skipped consolidation would
+    // leave sessions split across profiles with no trace of why.
+    desktopLog('desktop_profile_consolidation_skipped', {
+      reason: 'operator_opt_out',
+      variable: 'OPENSQUILLA_DESKTOP_SKIP_PROFILE_CONSOLIDATION',
+      legacyRecoveryProfileCount: legacyRecoveryProfiles().length,
+    })
+    return null
+  }
+  if (desktopProfilesConsolidatedThisProcess) return null
+  if (desktopProfileConsolidationPromise) return await desktopProfileConsolidationPromise
+
+  desktopProfileConsolidationPromise = (async () => {
+    const exclusive = desktopWriters.tryBeginExclusive('consolidate legacy Desktop profiles')
+    if (!exclusive) {
+      throw new Error('OpenSquilla is finishing another profile operation. Try startup again.')
+    }
+    try {
+      await waitForDesktopWriterOperations(1)
+      const primary = primaryDesktopProfile()
+      const recoveryProfiles = legacyRecoveryProfiles()
+      // An Electron crash can leave a verified Gateway serving any historical
+      // profile. Stop only instances proven by the owner record + HMAC challenge
+      // before the offline fan-in takes source and target locks.
+      for (const profile of [...recoveryProfiles, primary]) {
+        await recoverVerifiedOrphanGatewayBeforeSpawn(profile)
+      }
+      const result = await runDesktopProfileConsolidationCli(primary)
+      validateDesktopProfileConsolidationPaths(result, primary)
+      desktopLog('desktop_profile_consolidation_completed', {
+        outcome: result.outcome,
+        stableCode: result.stable_code,
+        recoveryProfileCount: recoveryProfiles.length,
+        consumedRecoveryProfileCount: result.consumed_recovery_ids.length,
+      })
+      if (result.outcome === 'blocked') {
+        if (result.primary_home_intact && isPlainDesktopDirectory(primary.home)) {
+          // The legacy fan-in failed but the primary profile itself is usable, so
+          // reaching the product matters more than completing the merge right
+          // now. Nothing was moved: every recovery profile is still on disk and a
+          // later launch retries. The local directory check is a second opinion
+          // on the protocol's own verdict, deliberately narrow so this does not
+          // grow a duplicate of the journal contract.
+          desktopProfileConsolidationDeferredThisProcess = true
+          desktopLog('desktop_profile_consolidation_deferred', {
+            stableCode: result.stable_code,
+            recoveryProfileCount: recoveryProfiles.length,
+          })
+          return null
+        }
+        // A protocol-level block is a primary-profile repair state, not an
+        // unexpected Electron boot failure. Keep the operation retryable and
+        // expose only the stable diagnostic plus the safe repair actions.
+        return recoveryFailureResult(primary.home, result.stable_code)
+      }
+      pendingDesktopCredentialConsolidation = (
+        result.credential_adoption_status === 'pending'
+      )
+        ? result
+        : null
+      desktopProfilesConsolidatedThisProcess = true
+      return null
+    } finally {
+      exclusive.finish()
+      desktopWriters.reopen(exclusive.admissionToken)
+    }
+  })().finally(() => {
+    desktopProfileConsolidationPromise = null
+  })
+  return await desktopProfileConsolidationPromise
+}
+
 function recoveryStateSnapshot(): DesktopRecoveryViewState {
-  const active = activeDesktopProfile()
   return {
     inspection: recoveryInspection,
-    activeProfile: {
-      kind: active.kind,
-      recoveryId: active.recoveryId,
-      home: active.home,
-    },
-    recoveryProfiles: allProfileContexts()
-      .filter((profile) => profile.kind === 'recovery' && profile.recoveryId)
-      .map((profile) => ({ id: profile.recoveryId as string, home: profile.home })),
     blocked: recoveryInspection?.outcome === 'recovery_required',
     busy: recoveryOperationBusy,
     error: recoveryOperationError,
@@ -5542,7 +6581,7 @@ function sanitizedRecoveryDiagnostics(): string {
     schema_version: RECOVERY_PROTOCOL_SCHEMA_VERSION,
     app_version: app.getVersion(),
     platform: process.platform,
-    profile_kind: activeDesktopProfile().kind,
+    profile_kind: 'primary',
     outcome: report?.outcome ?? 'recovery_required',
     stable_code: report?.stable_code ?? 'desktop_recovery_state_unavailable',
     primary_home: redactPath(report?.primary_home ?? primaryDesktopProfile().home),
@@ -5910,11 +6949,7 @@ async function startGateway(): Promise<GatewayState> {
   }
 
   const activeProfile = activeDesktopProfile()
-  // A recovery profile must always launch its own isolated Desktop gateway; a
-  // developer override may point at a primary/CLI runtime with different data.
-  const overrideUrl = activeProfile.kind === 'primary'
-    ? process.env.OPENSQUILLA_DESKTOP_GATEWAY_URL
-    : undefined
+  const overrideUrl = process.env.OPENSQUILLA_DESKTOP_GATEWAY_URL
   if (overrideUrl) {
     sendBootStatus('gateway-health')
     gatewayState.url = overrideUrl.replace(/\/$/, '')
@@ -6203,8 +7238,8 @@ async function createMainWindow(): Promise<BrowserWindow> {
     show: false,
     // Paint the window in the app's base color from the first frame so launch
     // never flashes white before the splash/app paints. The app theme defaults
-    // to 'system', so match the OS; these are the base.css --bg tokens.
-    backgroundColor: nativeTheme.shouldUseDarkColors ? '#08080A' : '#F7F6F3',
+    // to 'system', so match the Control UI's canonical light/dark canvas.
+    backgroundColor: desktopWindowBackgroundColor(),
     webPreferences: {
       preload: join(__dirname, 'preload.cjs'),
       contextIsolation: true,
@@ -6241,6 +7276,45 @@ async function createMainWindow(): Promise<BrowserWindow> {
   }
   window.webContents.on('will-navigate', guardMainWindowNavigation)
   window.webContents.on('will-redirect', guardMainWindowNavigation)
+
+  window.on('close', (event) => handleMainWindowClose(window, event))
+  if (process.platform === 'win32') {
+    const commitSystemSessionEnd = () => {
+      if (!systemSessionEnding) windowsSessionEndPreviousPhase = appExitPhase
+      systemSessionEnding = true
+      setAppExitPhase('committed', 'windows session ending')
+    }
+    window.on('query-session-end', () => {
+      commitSystemSessionEnd()
+      if (windowsSessionEndResetTimer) clearTimeout(windowsSessionEndResetTimer)
+      // Windows can abandon a shutdown/logout because another application
+      // vetoed it, but Electron exposes no matching cancellation event. Do not
+      // leave this instance permanently committed and unrevealable.
+      windowsSessionEndResetTimer = setTimeout(() => {
+        windowsSessionEndResetTimer = null
+        if (!systemSessionEnding) return
+        const previousPhase = windowsSessionEndPreviousPhase ?? 'running'
+        windowsSessionEndPreviousPhase = null
+        systemSessionEnding = false
+        if (appExitPhase === 'committed') {
+          setAppExitPhase(previousPhase, 'Windows session end was not committed')
+        }
+      }, 15_000)
+      windowsSessionEndResetTimer.unref()
+    })
+    window.on('session-end', () => {
+      if (windowsSessionEndResetTimer) clearTimeout(windowsSessionEndResetTimer)
+      windowsSessionEndResetTimer = null
+      windowsSessionEndPreviousPhase = null
+      commitSystemSessionEnd()
+      // Electron does not emit app.before-quit for Windows shutdown, restart,
+      // or logout. Release the tray and exact owned child from this
+      // BrowserWindow event, which is guaranteed for that lifecycle.
+      isQuitting = true
+      destroyWindowsTray()
+      stopGateway()
+    })
+  }
 
   window.once('ready-to-show', () => {
     if (!window.isDestroyed()) window.show()
@@ -6312,41 +7386,26 @@ async function stopOwnedGatewayAndWait(): Promise<void> {
 }
 
 async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
-  const context = desktopProfileContext()
-  if (context.issue) {
+  const consolidationRepair = await consolidateLegacyRecoveryProfilesBeforeStartup()
+  if (consolidationRepair) {
     recoveryOperationError = null
-    recoveryInspection = recoveryFailureResult(context.primary.home, context.issue)
+    recoveryInspection = consolidationRepair
+    primaryRecoveryInspection = consolidationRepair
+    publishRecoveryState()
+    createApplicationMenu()
     if (gatewayProcess && gatewayState.owned) await stopOwnedGatewayAndWait()
     bootError = null
     await restoreMainWindowToBootPage()
     publishRecoveryState()
-    createApplicationMenu()
     return false
   }
-
-  if (context.active.kind === 'recovery' && !activeRecoveryProfileConfirmedThisProcess) {
-    recoveryOperationError = null
-    recoveryInspection = recoveryFailureResult(
-      context.primary.home,
-      'desktop_recovery_profile_confirmation_required',
-    )
-    if (gatewayProcess && gatewayState.owned) await stopOwnedGatewayAndWait()
-    bootError = null
-    await restoreMainWindowToBootPage()
-    publishRecoveryState()
-    createApplicationMenu()
-    return false
-  }
-
   const active = activeDesktopProfile()
   // On a hard Electron crash, the Python Gateway can remain healthy and keep
   // the profile writer lease. Prove and stop that exact prior Desktop instance
   // before profile inspection; otherwise the inspector reports profile_lock_busy
   // and strands startup on the manual recovery screen before startGateway() can
   // run. Never apply this to a developer override or this process's own child.
-  const overrideUrl = active.kind === 'primary'
-    ? process.env.OPENSQUILLA_DESKTOP_GATEWAY_URL
-    : undefined
+  const overrideUrl = process.env.OPENSQUILLA_DESKTOP_GATEWAY_URL
   if (!overrideUrl && liveLifecycleOwnedGatewayProcesses().length === 0) {
     await recoverVerifiedOrphanGatewayBeforeSpawn(active)
   }
@@ -6373,10 +7432,7 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
     && inspection.allowed_actions.includes('reconcile')
   const safeLayoutFinalize = inspection.outcome === 'ready'
     && inspection.allowed_actions.includes('finalize-layout')
-  if (
-    active.kind === 'primary'
-    && (provenReconcile || safeLayoutFinalize)
-  ) {
+  if (provenReconcile || safeLayoutFinalize) {
     if (gatewayProcess && gatewayState.owned) await stopOwnedGatewayAndWait()
     try {
       inspection = await runRecoveryCli(active, [
@@ -6390,7 +7446,7 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
     }
   }
 
-  if (active.kind === 'primary' && inspection.outcome !== 'recovery_required') {
+  if (inspection.outcome !== 'recovery_required') {
     try {
       // A whole-profile transaction may have committed immediately before the
       // Electron process stopped. The narrow layout receipt is the authority
@@ -6405,18 +7461,21 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
     }
   }
 
-  if (!existsSync(desktopProfileContextPath(app.getPath('userData')))) {
-    await updateDesktopProfileContext((current) => contextForProfile(
-      app.getPath('userData'),
-      current.active.kind,
-      current.active.recoveryId,
-      new Date().toISOString(),
-      current.persisted.attention_acknowledgement,
-    ))
+  if (
+    inspection.outcome !== 'recovery_required'
+    && pendingDesktopCredentialConsolidation
+  ) {
+    const pending = pendingDesktopCredentialConsolidation
+    await adoptConsolidatedDesktopCredential(pending)
+    pendingDesktopCredentialConsolidation = null
+    // apply-settings advances the recovery revision even though it preserves
+    // config.toml bytes. Refresh the authoritative primary state before the
+    // boot page or any later repair action consumes it.
+    inspection = await inspectDesktopProfile(active)
   }
 
   recoveryInspection = inspection
-  if (active.kind === 'primary') primaryRecoveryInspection = inspection
+  primaryRecoveryInspection = inspection
   publishRecoveryState()
   createApplicationMenu()
   if (inspection.outcome !== 'recovery_required') return true
@@ -6457,7 +7516,7 @@ async function openOrResumeDesktopApp(): Promise<void> {
           gatewayState.error = error instanceof Error ? error.message : String(error)
         }
         desktopLog('desktop_open_failed', {
-          profileKind: activeDesktopProfile().kind,
+          profileKind: 'primary',
           gatewayPid: gatewayProcess?.pid,
           gatewayStatus: gatewayState.status,
           error: error instanceof Error ? error.message : String(error),
@@ -8026,6 +9085,8 @@ function restoreDownloadedUpdateRetryState(
   updateApplying = false
   updateInstallHandoffReady = false
   isQuitting = false
+  setAppExitPhase('running', 'update handoff did not commit')
+  createWindowsTray()
   createApplicationMenu()
   setDesktopUpdateState({
     status: pendingVersion ? 'downloaded' : 'error',
@@ -8083,6 +9144,7 @@ async function applyDownloadedUpdate(): Promise<void> {
   }
   const pendingVersion = downloadedUpdateVersion
   updateApplying = true
+  setAppExitPhase('deferred', 'preparing downloaded update')
   // Never interrupt a reconcile/workspace/settings transaction after it has
   // been admitted. Close new writers and wait for existing operations to
   // finish naturally before the installer handoff.
@@ -8097,6 +9159,7 @@ async function applyDownloadedUpdate(): Promise<void> {
     error: null,
   })
   isQuitting = true
+  setAppExitPhase('draining', 'stopping Gateway for downloaded update')
   const exited = await stopAndJoinAllLifecycleOwnedGateways((child) => {
     updateGatewayShutdownProcess = child
     // We stay alive and await the exit below, so let the gateway take its
@@ -8132,6 +9195,7 @@ async function applyDownloadedUpdate(): Promise<void> {
   // isForceRunAfter=true (relaunch after install).
   try {
     updateInstallHandoffReady = true
+    setAppExitPhase('committed', 'handing off to desktop updater')
     autoUpdater.quitAndInstall(false, true)
   } catch (err) {
     const quitResumed = restoreDownloadedUpdateRetryState(
@@ -8210,6 +9274,14 @@ ipcMain.handle('desktop:settings:reset', async (event) => {
   if (!trustedRecoveryIpc(event)) throw new Error('Untrusted Desktop reset request.')
   return await resetDesktopSettingsThroughCleanup()
 })
+ipcMain.handle('desktop:preferences:get', (event) => {
+  if (!trustedMainWindowControlIpc(event)) throw new Error('Untrusted Desktop preferences request.')
+  return desktopPreferencesSnapshot()
+})
+ipcMain.handle('desktop:preferences:save', async (event, payload: DesktopPreferencesPayload) => {
+  if (!trustedMainWindowControlIpc(event)) throw new Error('Untrusted Desktop preferences request.')
+  return await saveDesktopPreferences(payload)
+})
 ipcMain.handle('desktop:artifact:open', async (_event, payload: ArtifactOpenRequest) => openArtifactWithDefaultApp(payload))
 
 // ── Desktop data cleanup ───────────────────────────────────────────────────
@@ -8223,12 +9295,9 @@ const DESKTOP_CLEANUP_APPROVAL_LIMIT = 512 * 1024
 const DELETE_ALL_CONFIRMATION = 'DELETE ALL OPENSQUILLA DATA'
 
 function currentDesktopCleanupSelection(mode: DesktopCleanupMode): DesktopCleanupSelection {
-  const profile = activeDesktopProfile()
   return {
     mode,
-    profileKind: profile.kind,
-    recoveryId: profile.recoveryId,
-    profileKey: desktopProfileKey(profile),
+    profileKey: desktopProfileKey(),
   }
 }
 
@@ -8301,7 +9370,7 @@ async function inspectDesktopCleanup(mode: DesktopCleanupMode): Promise<{
   ok: boolean
   previewId: string | null
   report: DesktopCleanupReport
-  profile: { kind: 'primary' | 'recovery'; recoveryId: string | null }
+  profile: { kind: 'primary'; recoveryId: null }
 }> {
   desktopCleanupPreviews.clear()
   const profile = activeDesktopProfile()
@@ -8319,7 +9388,7 @@ async function inspectDesktopCleanup(mode: DesktopCleanupMode): Promise<{
     ok: report.outcome === 'ready',
     previewId: preview?.id ?? null,
     report,
-    profile: { kind: profile.kind, recoveryId: profile.recoveryId },
+    profile: { kind: 'primary', recoveryId: null },
   }
 }
 
@@ -8440,7 +9509,7 @@ async function restoreAfterIncompleteCleanup(
   clearReusableGatewayState()
   const inspection = await inspectDesktopProfile(profile)
   recoveryInspection = inspection
-  if (profile.kind === 'primary') primaryRecoveryInspection = inspection
+  primaryRecoveryInspection = inspection
   bootError = null
   if (!preserveControlUi || inspection.outcome === 'recovery_required') {
     await restoreMainWindowToBootPage()
@@ -8530,7 +9599,7 @@ async function applyApprovedDesktopCleanup(
         ok: false,
         previewId: replacement?.id ?? null,
         report: refreshed,
-        profile: { kind: active.kind, recoveryId: active.recoveryId },
+        profile: { kind: 'primary', recoveryId: null },
         detail: 'The cleanup locations changed while the local runtime stopped. Review them again.',
       }
     }
@@ -8585,6 +9654,10 @@ async function applyApprovedDesktopCleanup(
     // deleted, Electron must not reopen writer admission or recreate any path
     // inside the confirmed scope. Only a failed/cancelled operation may reopen.
     if (shouldQuit) {
+      // Do not call setAppExitPhase here: its durable lifecycle log would
+      // recreate userData/logs after an approved delete operation removed it.
+      appExitPhase = 'committed'
+      destroyWindowsTray()
       app.exit(0)
     } else {
       desktopWriters.reopen(exclusive.admissionToken)
@@ -9382,8 +10455,7 @@ function normalizeOwnedDesktopTargetGatewayPreview(
 ): Record<string, unknown> {
   const preflight = migrationRecord(report.preflight)
   if (
-    activeDesktopProfile().kind !== 'primary'
-    || !gatewayProcess
+    !gatewayProcess
     || !gatewayState.owned
     || hasGatewayProcessExited(gatewayProcess)
     || gatewayProfileKey !== desktopProfileKey(primaryDesktopProfile())
@@ -9516,8 +10588,8 @@ function migrationCandidateWithPreview(
 }
 
 ipcMain.handle('desktop:migration:browse-source', async (event, payload?: unknown) => {
-  if (!trustedRecoveryIpc(event) || activeDesktopProfile().kind !== 'primary') {
-    return { ok: false, error: 'Data transfer is available only in the primary profile.' }
+  if (!trustedRecoveryIpc(event)) {
+    return { ok: false, error: 'Data transfer is available only from the trusted desktop window.' }
   }
   const sourceKind = parseMigrationSourceKind(payload)
   if (!sourceKind) {
@@ -9544,14 +10616,6 @@ ipcMain.handle('desktop:migration:browse-source', async (event, payload?: unknow
 ipcMain.handle('desktop:migration:summary', async (event, payload?: { source?: unknown }) => {
   if (!trustedRecoveryIpc(event)) {
     return { ok: false, candidate: null, report: null, raw: 'Untrusted data transfer request.' }
-  }
-  if (activeDesktopProfile().kind !== 'primary') {
-    return {
-      ok: false,
-      candidate: null,
-      report: null,
-      raw: 'Return to the primary profile before transferring data.',
-    }
   }
   trustedDesktopMigrationPreview = null
   const candidates = await enrichLegacyImportCandidates(detectLegacyImportCandidates())
@@ -9603,13 +10667,6 @@ ipcMain.handle('desktop:migration:run', async (
 ) => {
   if (!trustedRecoveryIpc(event)) {
     return { ok: false, report: null, detail: 'Untrusted data transfer request.' }
-  }
-  if (activeDesktopProfile().kind !== 'primary') {
-    return {
-      ok: false,
-      report: null,
-      detail: 'Return to the primary profile before transferring data.',
-    }
   }
   const preview = trustedDesktopMigrationPreview
   if (
@@ -9909,9 +10966,9 @@ function trustedRecoveryIpc(event: Electron.IpcMainInvokeEvent): boolean {
   }
 }
 
-function trustedControlUiIpc(event: Electron.IpcMainInvokeEvent): boolean {
+function trustedMainWindowControlIpc(event: Electron.IpcMainInvokeEvent): boolean {
   const window = currentMainWindow()
-  if (!window || event.sender !== window.webContents || !gatewayState.owned || !gatewayState.url) {
+  if (!window || event.sender !== window.webContents || !gatewayState.url) {
     return false
   }
   try {
@@ -9922,6 +10979,10 @@ function trustedControlUiIpc(event: Electron.IpcMainInvokeEvent): boolean {
   } catch {
     return false
   }
+}
+
+function trustedControlUiIpc(event: Electron.IpcMainInvokeEvent): boolean {
+  return gatewayState.owned && trustedMainWindowControlIpc(event)
 }
 
 function trustedOnboardingIpc(event: Electron.IpcMainInvokeEvent): boolean {
@@ -9976,104 +11037,16 @@ async function withRecoveryOperation<T>(
   return { ...outcome, state: recoveryStateSnapshot() }
 }
 
-async function copyPrimaryCredentialToRecovery(profile: DesktopProfilePaths): Promise<void> {
-  const raw = await readFile(primaryDesktopProfile().credentialPath, 'utf8')
-  const credential = normalizeDesktopCredential(JSON.parse(raw) as Partial<DesktopConnection>)
-  if (credential.encryptedApiKey && !decryptApiKey(credential)) {
-    throw new Error('The primary provider credential cannot be decrypted on this device.')
-  }
-  if (credential.encryptedSearchApiKey && !decryptSearchApiKey(credential)) {
-    throw new Error('The primary search credential cannot be decrypted on this device.')
-  }
-  const now = new Date().toISOString()
-  const recoveryCredential: DesktopConnection = {
-    ...credential,
-    configAuthority: 'generated',
-    importTransactionId: '',
-    createdAt: now,
-    updatedAt: now,
-  }
-  await atomicWriteFile(profile.credentialPath, JSON.stringify(recoveryCredential, null, 2), 0o600)
-}
-
-async function createRecoveryProfile(copyPrimaryCredential: boolean): Promise<DesktopProfilePaths> {
-  const recoveryId = randomUUID()
-  const context = contextForProfile(app.getPath('userData'), 'recovery', recoveryId)
-  const profile = context.active
-  const recoveryRoot = join(app.getPath('userData'), 'recovery-profiles')
-  mkdirSync(recoveryRoot, { recursive: true, mode: 0o700 })
-  const rootInfo = lstatSync(recoveryRoot)
-  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) {
-    throw new Error('The recovery profile directory is not a safe local directory.')
-  }
-  const profileRoot = dirname(profile.home)
-  mkdirSync(profileRoot, { recursive: false, mode: 0o700 })
-  mkdirSync(profile.home, { recursive: false, mode: 0o700 })
-  mkdirSync(profile.logsDir, { recursive: false, mode: 0o700 })
-  if (copyPrimaryCredential) await copyPrimaryCredentialToRecovery(profile)
-  return profile
-}
-
-async function launchRecoveryProfile(
-  payload: { mode?: unknown; recoveryId?: unknown; copyPrimaryCredential?: unknown } | null,
-): Promise<DesktopProfilePaths> {
-  const mode = payload?.mode === 'continue'
-    ? 'continue'
-    : payload?.mode === 'create'
-      ? 'create'
-      : null
-  if (!mode) throw new Error('Choose whether to create or continue a recovery profile.')
-  let profile: DesktopProfilePaths
-  if (mode === 'create') {
-    profile = await createRecoveryProfile(payload?.copyPrimaryCredential === true)
-  } else {
-    const recoveryId = payload?.recoveryId
-    if (!isRecoveryProfileId(recoveryId)) throw new Error('Choose an existing recovery profile.')
-    const existing = allProfileContexts().find((item) => (
-      item.kind === 'recovery' && item.recoveryId === recoveryId
-    ))
-    if (!existing) throw new Error('The selected recovery profile is no longer available.')
-    profile = existing
-  }
-
-  await stopOwnedGatewayAndWait()
-  await selectDesktopProfile('recovery', profile.recoveryId)
-  clearReusableGatewayState()
-  recoveryInspection = null
-  bootError = null
-  await currentMainWindow()?.loadFile(bootPagePath()).catch(() => null)
-  void openOrResumeDesktopApp()
-  return profile
-}
-
-async function inspectPrimaryForReturn(): Promise<RecoveryProtocolResult> {
+async function inspectPrimaryForRepair(): Promise<RecoveryProtocolResult> {
   const inspection = await inspectDesktopProfile(primaryDesktopProfile())
   primaryRecoveryInspection = inspection
-  return inspection
-}
-
-async function retryOrReturnPrimaryProfile(): Promise<RecoveryProtocolResult> {
-  const inspection = await inspectPrimaryForReturn()
-  if (inspection.outcome === 'recovery_required') {
-    recoveryInspection = inspection
-    publishRecoveryState()
-    return inspection
-  }
-
-  await stopOwnedGatewayAndWait()
-  await selectDesktopProfile('primary')
-  clearReusableGatewayState()
-  recoveryInspection = inspection
-  bootError = null
-  await currentMainWindow()?.loadFile(bootPagePath()).catch(() => null)
-  void openOrResumeDesktopApp()
   return inspection
 }
 
 async function recoverPrimaryProfileTransaction(): Promise<RecoveryProtocolResult> {
   const primary = primaryDesktopProfile()
   let inspection = primaryRecoveryInspection
-  if (!inspection) inspection = await inspectPrimaryForReturn()
+  if (!inspection) inspection = await inspectPrimaryForRepair()
   if (
     !inspection.allowed_actions.includes('recover-transaction')
     || !inspection.transaction_id
@@ -10092,7 +11065,6 @@ async function recoverPrimaryProfileTransaction(): Promise<RecoveryProtocolResul
   primaryRecoveryInspection = result
   recoveryInspection = result
   if (result.outcome !== 'recovery_required') {
-    await selectDesktopProfile('primary')
     clearReusableGatewayState()
     bootError = null
     await currentMainWindow()?.loadFile(bootPagePath()).catch(() => null)
@@ -10137,7 +11109,7 @@ async function abandonActiveCleanupTransaction(): Promise<RecoveryProtocolResult
   // cached transaction/revision.
   inspection = await inspectDesktopProfile(profile)
   recoveryInspection = inspection
-  if (profile.kind === 'primary') primaryRecoveryInspection = inspection
+  primaryRecoveryInspection = inspection
   publishRecoveryState()
   if (
     inspection.stable_code !== 'cleanup_transaction_incomplete'
@@ -10150,24 +11122,15 @@ async function abandonActiveCleanupTransaction(): Promise<RecoveryProtocolResult
     'abandon-cleanup',
     '--user-data', app.getPath('userData'),
     '--home', profile.home,
-    '--profile-kind', profileKindEnvironment(profile.kind),
+    '--profile-kind', 'desktop-primary',
     '--transaction-id', inspection.transaction_id,
     '--expected-revision', String(inspection.revision),
     '--json',
   ])
   recoveryInspection = result
-  if (profile.kind === 'primary') primaryRecoveryInspection = result
+  primaryRecoveryInspection = result
   publishRecoveryState()
   if (result.outcome !== 'recovery_required') {
-    if (!existsSync(desktopProfileContextPath(app.getPath('userData')))) {
-      await updateDesktopProfileContext((current) => contextForProfile(
-        app.getPath('userData'),
-        profile.kind,
-        profile.recoveryId,
-        new Date().toISOString(),
-        current.persisted.attention_acknowledgement,
-      ))
-    }
     clearReusableGatewayState()
     bootError = null
     await currentMainWindow()?.loadFile(bootPagePath()).catch(() => null)
@@ -10182,7 +11145,7 @@ async function choosePrimaryWorkspace(
 ): Promise<RecoveryProtocolResult> {
   const primary = primaryDesktopProfile()
   let inspection = primaryRecoveryInspection
-  if (!inspection) inspection = await inspectPrimaryForReturn()
+  if (!inspection) inspection = await inspectPrimaryForRepair()
 
   let workspace = ''
   if (typeof requestedWorkspace === 'string' && requestedWorkspace) {
@@ -10237,7 +11200,6 @@ async function choosePrimaryWorkspace(
   primaryRecoveryInspection = result
   recoveryInspection = result
   if (result.outcome !== 'recovery_required') {
-    await selectDesktopProfile('primary')
     clearReusableGatewayState()
     bootError = null
     await currentMainWindow()?.loadFile(bootPagePath()).catch(() => null)
@@ -10264,7 +11226,6 @@ ipcMain.handle('desktop:recovery:choose-legacy-agent-data', async (
   const inspection = recoveryInspection
   if (
     !trustedControlUiIpc(event)
-    || activeDesktopProfile().kind !== 'primary'
     || inspection?.outcome !== 'attention'
     || ![
       'legacy_workspace_pinned',
@@ -10292,37 +11253,14 @@ ipcMain.handle('desktop:recovery:abandon-cleanup', async (event) => {
   }
   return withRecoveryOperation(abandonActiveCleanupTransaction)
 })
-ipcMain.handle('desktop:recovery:launch-safe', async (
-  event,
-  payload?: { mode?: unknown; recoveryId?: unknown; copyPrimaryCredential?: unknown },
-) => {
-  if (!trustedRecoveryIpc(event)) {
-    return { ok: false, error: 'Recovery actions are available only from the recovery page.' }
-  }
-  return withRecoveryOperation(() => launchRecoveryProfile(payload || null))
-})
-ipcMain.handle('desktop:recovery:retry-primary', async (event) => {
-  if (!trustedRecoveryIpc(event)) {
-    return { ok: false, error: 'Recovery actions are available only from the recovery page.' }
-  }
-  return withRecoveryOperation(retryOrReturnPrimaryProfile)
-})
-ipcMain.handle('desktop:recovery:return-primary', async (event) => {
-  if (!trustedRecoveryIpc(event)) {
-    return { ok: false, error: 'Recovery actions are available only from the recovery page.' }
-  }
-  return withRecoveryOperation(retryOrReturnPrimaryProfile)
-})
 ipcMain.handle('desktop:recovery:reveal-path', async (
   event,
   payload?: { target?: unknown },
 ) => {
   if (!trustedRecoveryIpc(event)) return false
-  const target = payload?.target === 'active'
-    ? activeDesktopProfile().home
-    : payload?.target === 'backups'
-      ? app.getPath('userData')
-      : primaryDesktopProfile().home
+  const target = payload?.target === 'backups'
+    ? app.getPath('userData')
+    : primaryDesktopProfile().home
   if (existsSync(target)) await shell.showItemInFolder(target)
   else await shell.openPath(dirname(target)).catch(() => null)
   return true
@@ -10398,10 +11336,7 @@ ipcMain.handle('desktop:onboarding:save', async (event, payload: OnboardingPaylo
   if (!resolveOnboarding || !trustedOnboardingIpc(event)) {
     return { ok: false, error: 'No trusted onboarding is in progress.' }
   }
-  if (
-    activeDesktopProfile().kind === 'primary'
-    && await refreshPrimaryRecoveryAfterImportAttempt()
-  ) {
+  if (await refreshPrimaryRecoveryAfterImportAttempt()) {
     return {
       ok: false,
       error: 'The primary profile requires recovery before setup can write to it.',
@@ -10506,23 +11441,40 @@ async function drainOwnedGatewayForQuit(
 
 app.on('before-quit', (event) => {
   desktopUpdateCheckScheduler.stop()
+  // Windows session shutdown cannot wait on our normal asynchronous quit
+  // drain. Let the OS-owned close proceed and synchronously signal the current
+  // child so the window can never be converted back into background mode.
+  if (systemSessionEnding) {
+    isQuitting = true
+    setAppExitPhase('committed', 'Windows session ending')
+    destroyWindowsTray()
+    stopGateway()
+    return
+  }
   // An updater drain owns the lifecycle until every writer and gateway has
   // exited. A user Quit or repeated signal during this phase is remembered and
   // resumed if the update cannot hand off. Only quitAndInstall's synchronous
   // handoff is allowed through this guard.
   if (updateApplying) {
-    if (updateInstallHandoffReady) return
+    if (updateInstallHandoffReady) {
+      setAppExitPhase('committed', 'desktop updater owns exit')
+      destroyWindowsTray()
+      return
+    }
     event.preventDefault()
+    setAppExitPhase('deferred', 'waiting for desktop update handoff')
     quitRequestedDuringUpdateDrain = true
     desktopLog('quit_deferred_for_update_drain')
     return
   }
   if (quitGatewayDrainPromise) {
     event.preventDefault()
+    setAppExitPhase('draining', 'Gateway quit drain already in progress')
     return
   }
   if (desktopWriters.activeCount > 0 || quitDeferredForDesktopWriters) {
     event.preventDefault()
+    setAppExitPhase('deferred', 'waiting for desktop writers')
     if (!quitDeferredForDesktopWriters) {
       quitDeferredForDesktopWriters = true
       quitWriterAdmission ??= desktopWriters.close('quit')
@@ -10553,6 +11505,7 @@ app.on('before-quit', (event) => {
   const children = liveLifecycleOwnedGatewayProcesses()
   if (children.length > 0) {
     event.preventDefault()
+    setAppExitPhase('draining', 'stopping lifecycle-owned Gateway')
     const drain = Promise.all(children.map((child) => drainOwnedGatewayForQuit(
       child,
       currentChild === child ? gatewayState.url || '' : '',
@@ -10568,6 +11521,8 @@ app.on('before-quit', (event) => {
     quitGatewayDrainPromise = drain
     void drain.then((exited) => {
       if (exited) {
+        setAppExitPhase('committed', 'all lifecycle-owned Gateways exited')
+        destroyWindowsTray()
         app.exit(0)
         return
       }
@@ -10576,6 +11531,7 @@ app.on('before-quit', (event) => {
       // file, occupied port, or health response.
       quitGatewayDrainPromise = null
       isQuitting = false
+      setAppExitPhase('running', 'Gateway quit drain failed safely')
       if (quitWriterAdmission) {
         desktopWriters.reopen(quitWriterAdmission)
         quitWriterAdmission = null
@@ -10590,6 +11546,8 @@ app.on('before-quit', (event) => {
     })
     return
   }
+  setAppExitPhase('committed', 'no lifecycle-owned Gateway remains')
+  destroyWindowsTray()
   stopGateway()
 })
 
@@ -10611,8 +11569,10 @@ app.on('window-all-closed', () => {
 })
 
 app.on('activate', () => {
-  void openOrResumeDesktopApp()
+  revealDesktopApp()
 })
+
+app.on('will-quit', destroyWindowsTray)
 
 configureChromiumKeychainPolicy()
 
@@ -10669,13 +11629,14 @@ if (!gotSingleInstanceLock) {
 } else {
   app.on('second-instance', () => {
     desktopLog('second_instance')
-    void openOrResumeDesktopApp()
+    revealDesktopApp()
   })
 
   void app.whenReady().then(async () => {
     app.name = 'OpenSquilla'
     desktopLocale = loadPersistedDesktopLocale() ?? resolveDesktopLocale()
     createApplicationMenu()
+    createWindowsTray()
     void openOrResumeDesktopApp()
     initAutoUpdater()
     if (mockUpdateVersion() !== null) {

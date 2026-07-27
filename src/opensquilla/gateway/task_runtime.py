@@ -28,7 +28,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
-from typing import Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import structlog
 
@@ -43,6 +43,9 @@ from opensquilla.session.terminal_reply import (
     is_context_payload_too_large,
     sanitize_agent_error,
 )
+
+if TYPE_CHECKING:
+    from opensquilla.provider.types import ProviderRequestCorrelation
 
 log = structlog.get_logger(__name__)
 
@@ -173,6 +176,10 @@ class TaskRun:
     # This is deliberately off RouteEnvelope.metadata so cached envelopes can
     # never leak one turn's strategy into a later proactive send.
     accepted_config: Any | None = None
+    provider_request_correlation: ProviderRequestCorrelation | None = field(
+        default=None,
+        repr=False,
+    )
     # Synchronous finalizer callback carrying the exact assistant transcript
     # row and content produced by this turn. Channel tasks persist it for
     # durable delivery after terminal commit; other run kinds leave it unset.
@@ -262,6 +269,10 @@ class _RuntimeTask:
     terminal_assistant_message_content: str | None = None
     stream_event_sink: TaskStreamEventSink | None = None
     accepted_config: Any | None = None
+    provider_request_correlation: ProviderRequestCorrelation | None = field(
+        default=None,
+        repr=False,
+    )
     accepted_config_captured: bool = False
     done: asyncio.Event = field(default_factory=asyncio.Event)
     terminal_emitted: bool = False
@@ -566,6 +577,7 @@ class TaskRuntime:
         stream_event_sink: TaskStreamEventSink | None = None,
         *,
         task_id: str | None = None,
+        provider_request_correlation: ProviderRequestCorrelation | None = None,
         update_envelope_cache: bool = True,
         overflow_policy: PendingOverflowPolicy | str | None = None,
     ) -> TaskHandle:
@@ -608,6 +620,7 @@ class TaskRuntime:
                     fresh_user_session=fresh_user_session,
                     stream_event_sink=stream_event_sink,
                     task_id=task_id,
+                    provider_request_correlation=provider_request_correlation,
                     update_envelope_cache=update_envelope_cache,
                     overflow_policy=overflow_policy,
                 )
@@ -626,6 +639,7 @@ class TaskRuntime:
             fresh_user_session=fresh_user_session,
             stream_event_sink=stream_event_sink,
             task_id=task_id,
+            provider_request_correlation=provider_request_correlation,
             update_envelope_cache=update_envelope_cache,
             overflow_policy=overflow_policy,
         )
@@ -663,6 +677,7 @@ class TaskRuntime:
         stream_event_sink: TaskStreamEventSink | None = None,
         *,
         task_id: str | None = None,
+        provider_request_correlation: ProviderRequestCorrelation | None = None,
         update_envelope_cache: bool = True,
         overflow_policy: PendingOverflowPolicy | str | None = None,
     ) -> TaskHandle:
@@ -683,6 +698,7 @@ class TaskRuntime:
             fresh_user_session=fresh_user_session,
             stream_event_sink=stream_event_sink,
             task_id=task_id,
+            provider_request_correlation=provider_request_correlation,
             update_envelope_cache=update_envelope_cache,
             overflow_policy=overflow_policy,
         )
@@ -749,6 +765,7 @@ class TaskRuntime:
         stream_event_sink: TaskStreamEventSink | None = None,
         *,
         task_id: str | None = None,
+        provider_request_correlation: ProviderRequestCorrelation | None = None,
         update_envelope_cache: bool = True,
         overflow_policy: PendingOverflowPolicy | str | None = None,
     ) -> TaskReservation:
@@ -823,6 +840,7 @@ class TaskRuntime:
             message_count=message_count,
             fresh_user_session=fresh_user_session,
             stream_event_sink=stream_event_sink,
+            provider_request_correlation=provider_request_correlation,
             primary_input_pending=bool(
                 (persisted_user_message_id or envelope.metadata.get("client_message_id"))
                 and envelope.metadata.get("turn_context_disposition", "queued") == "queued"
@@ -1873,6 +1891,9 @@ class TaskRuntime:
                         stream_event_sink=task.stream_event_sink,
                         pending_input_provider=task.pending_input_provider,
                         accepted_config=task.accepted_config,
+                        provider_request_correlation=(
+                            task.provider_request_correlation
+                        ),
                         assistant_message_sink=(
                             task.capture_terminal_assistant_message
                             if task.run_kind == "channel_turn"

@@ -35,8 +35,12 @@ from opensquilla.memory.flush import (
     validate_flush_save_arguments,
 )
 from opensquilla.memory.protocols import MemoryProviderCapability, MemoryToolHandler
+from opensquilla.provider.correlation_context import (
+    bind_provider_request_correlation,
+    current_provider_request_correlation,
+)
 from opensquilla.provider.protocol import provider_metadata
-from opensquilla.provider.types import ChatConfig, Message
+from opensquilla.provider.types import ChatConfig, Message, ProviderRequestCorrelation
 from opensquilla.tool_boundary import ToolCall
 from opensquilla.tools.types import CallerKind, InteractionMode, ToolContext, current_tool_context
 
@@ -1148,7 +1152,10 @@ async def _provider_complete(
             f"Provider {type(provider).__name__} supports neither complete() nor chat()"
     )
 
-    config = ChatConfig(max_tokens=max_tokens)
+    config = ChatConfig(
+        max_tokens=max_tokens,
+        provider_request_correlation=current_provider_request_correlation(),
+    )
     scope = current_usage_accounting_scope()
     close_stream = None
     if scope is None:
@@ -2258,6 +2265,41 @@ class SessionFlushService:
         checkpoint_exists: bool | None = None,
         turn_id: str | None = None,
         raw_capture_policy: RawCapturePolicy = "best_effort",
+        provider_request_correlation: ProviderRequestCorrelation | None = None,
+    ) -> FlushReceipt:
+        """Run one flush under the caller's explicit provider correlation scope."""
+
+        with bind_provider_request_correlation(provider_request_correlation):
+            return await self._execute(
+                transcript,
+                session_key,
+                agent_id,
+                timeout=timeout,
+                message_window=message_window,
+                flush_max_chars=flush_max_chars,
+                segment_mode=segment_mode,
+                segment_max_chars=segment_max_chars,
+                segment_overlap_messages=segment_overlap_messages,
+                checkpoint_exists=checkpoint_exists,
+                turn_id=turn_id,
+                raw_capture_policy=raw_capture_policy,
+            )
+
+    async def _execute(
+        self,
+        transcript: list[Any],
+        session_key: str,
+        agent_id: str = "main",
+        *,
+        timeout: float | None = None,
+        message_window: int | None = None,
+        flush_max_chars: int | None = None,
+        segment_mode: SegmentMode = "off",
+        segment_max_chars: int | None = None,
+        segment_overlap_messages: int = 0,
+        checkpoint_exists: bool | None = None,
+        turn_id: str | None = None,
+        raw_capture_policy: RawCapturePolicy = "best_effort",
     ) -> FlushReceipt:
         async def _done(receipt: FlushReceipt) -> FlushReceipt:
             receipt = self._with_receipt_identity(
@@ -3152,6 +3194,7 @@ class SessionFlushService:
                 self._tool_handler,
                 relative_path=plan.relative_path,
             ),
+            provider_request_correlation=current_provider_request_correlation(),
         )
 
         save_results: list[_MemorySaveResult] = []

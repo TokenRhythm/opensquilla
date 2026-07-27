@@ -2,8 +2,9 @@
   <RunTrace
     :items="items"
     :variant="variant"
+    :presentation="presentation"
     :state-scope="stateScope"
-    show-bulk-toggle
+    :show-bulk-toggle="presentation !== 'activity'"
     :is-tool-group-open="isToolGroupOpen"
     :is-tool-item-open="isToolItemOpen"
     :tool-group-status-text="toolGroupStatusText"
@@ -34,6 +35,7 @@ defineProps<{
   toolSecondaryText: (call: ChatToolCallRenderItem) => string
   toolElapsedText?: (call: ChatToolCallRenderItem) => string
   variant?: 'checklist'
+  presentation?: 'activity'
   stateScope?: string
 }>()
 

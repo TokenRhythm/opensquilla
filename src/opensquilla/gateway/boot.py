@@ -222,45 +222,16 @@ def _make_auto_propose_tool_context(
 
 
 def _resolve_migrations_dir() -> Path:
-    """Locate yoyo migrations in env override, installed package, or checkout."""
+    """Locate yoyo migrations; kept as a name callers and tests already import.
 
-    env_dir = os.environ.get("OPENSQUILLA_MIGRATIONS_DIR")
-    if env_dir:
-        candidate = Path(env_dir)
-        if any(candidate.glob("V*.py")):
-            return candidate
-        # A pinned-but-unusable override silently falling through to a
-        # different migration set is a misconfiguration operators must see.
-        log.warning(
-            "resolve_migrations_dir.env_override_ignored",
-            path=str(candidate),
-            reason=(
-                "directory does not exist"
-                if not candidate.is_dir()
-                else "no V*.py migration files found"
-            ),
-        )
+    The implementation lives in :mod:`opensquilla.persistence.migrator` so that
+    offline profile consolidation can resolve migrations without importing the
+    gateway, which would close a package import cycle.
+    """
 
-    try:
-        from importlib import resources as importlib_resources
+    from opensquilla.persistence.migrator import resolve_migrations_dir
 
-        package_dir = importlib_resources.files("opensquilla").joinpath("_migrations")
-        if package_dir.is_dir():
-            path = Path(str(package_dir))
-            if any(path.glob("V*.py")):
-                return path
-    except Exception:
-        pass
-
-    repo_dir = Path(__file__).resolve().parents[3] / "migrations"
-    if any(repo_dir.glob("V*.py")):
-        return repo_dir
-
-    raise RuntimeError(
-        "opensquilla migrations directory not found "
-        "(checked OPENSQUILLA_MIGRATIONS_DIR, opensquilla/_migrations, "
-        "and repo migrations/)"
-    )
+    return resolve_migrations_dir()
 
 
 class TaskRuntimeStreamError(RuntimeError):
@@ -958,7 +929,9 @@ def _warn_legacy_home_detected(config: GatewayConfig) -> None:
     operators still learn their old profile exists without any prompt.
     """
     try:
-        if _state_path(config, "sessions.db").exists():
+        from opensquilla.persistence.migrator import _native_sqlite_path
+
+        if os.path.isfile(_native_sqlite_path(_state_path(config, "sessions.db"))):
             return
     except OSError:  # pragma: no cover - unreadable state dir; stay silent.
         return
@@ -1088,8 +1061,11 @@ def _task_runtime_turn_hard_deadline_s(config: GatewayConfig) -> float | None:
 
 def _task_runtime_envelope_owner(envelope: Any) -> bool:
     """Resolve owner privileges from authenticated route metadata."""
+    from opensquilla.channels.admission import has_verified_channel_admin_stamp
     from opensquilla.gateway.routing import SourceKind
 
+    if getattr(envelope, "source_kind", None) == SourceKind.CHANNEL:
+        return has_verified_channel_admin_stamp(envelope)
     principal_is_owner = getattr(envelope, "metadata", {}).get("principal_is_owner")
     if isinstance(principal_is_owner, bool):
         return principal_is_owner
@@ -1288,6 +1264,7 @@ def build_task_runtime_run_kwargs(
         "fresh_user_session": bool(getattr(run, "fresh_user_session", False)),
         "ingress_pipeline_steps": ingress_steps,
         "pending_input_provider": getattr(run, "pending_input_provider", None),
+        "root_turn_id": getattr(run, "task_id", None),
     }
     if run.semantic_message is not None:
         # Prefetch query shape: channels carry the raw user text
@@ -1295,6 +1272,13 @@ def build_task_runtime_run_kwargs(
         # Only forward when set so web/CLI legacy paths keep
         # ``TurnRunner.run`` falling back to ``message`` as semantic input.
         kwargs["semantic_message"] = run.semantic_message
+    provider_request_correlation = getattr(
+        run,
+        "provider_request_correlation",
+        None,
+    )
+    if provider_request_correlation is not None:
+        kwargs["provider_request_correlation"] = provider_request_correlation
     bound_user_message_id = getattr(run, "persisted_user_message_id", None)
     if bound_user_message_id:
         # Bind history to the exact persisted user message this turn answers so
@@ -2285,17 +2269,19 @@ async def build_services(
     # Migration failures propagate: code ships behind the migration, never
     # ahead of it — silently booting on an out-of-date schema is worse than
     # failing loud.
+    storage_db_path = session_db_path
     if session_db_path != ":memory:":
-        from opensquilla.persistence.migrator import apply_pending
+        from opensquilla.persistence.migrator import _native_sqlite_path, apply_pending
 
         log.info("build_services.migrations_started")
         if "://" not in session_db_path:
             # 0o700: session transcripts are sensitive — keep a freshly created
             # state directory owner-only (umask-masked; no-op on Windows and on
             # pre-existing directories).
-            Path(session_db_path).expanduser().parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            storage_db_path = _native_sqlite_path(session_db_path)
+            os.makedirs(os.path.dirname(storage_db_path) or os.curdir, mode=0o700, exist_ok=True)
         migrations_dir = _resolve_migrations_dir()
-        applied = apply_pending(session_db_path, migrations_dir)
+        applied = apply_pending(storage_db_path, migrations_dir)
         if applied:
             log.info("build_services.migrations_applied", count=len(applied), ids=applied)
         log.info("build_services.migrations_ready", count=len(applied))
@@ -2312,8 +2298,9 @@ async def build_services(
         from opensquilla.session.storage import SessionStorage
 
         log.info("build_services.session_storage_started")
-        Path(session_db_path).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        storage = SessionStorage(session_db_path)
+        if storage_db_path != ":memory:" and "://" not in storage_db_path:
+            os.makedirs(os.path.dirname(storage_db_path) or os.curdir, mode=0o700, exist_ok=True)
+        storage = SessionStorage(storage_db_path)
         await storage.connect()
         log.info("build_services.session_storage_ready")
         session_manager = SessionManager(
@@ -2601,13 +2588,21 @@ async def build_services(
     # ── Cron scheduler (boot order 20) ──────────────────────────────
     cron_scheduler = None
     try:
+        from opensquilla.persistence.migrator import _native_sqlite_path
         from opensquilla.scheduler import JobStore, SchedulerEngine
 
         scheduler_db = Path(
             os.environ.get("OPENSQUILLA_SCHEDULER_DB", str(_state_path(config, "scheduler.db")))
         )
-        scheduler_db.parent.mkdir(parents=True, exist_ok=True)
-        job_store = JobStore(db_path=str(scheduler_db))
+        if str(scheduler_db) == ":memory:":
+            scheduler_storage = ":memory:"
+        else:
+            scheduler_storage = _native_sqlite_path(scheduler_db)
+            os.makedirs(
+                os.path.dirname(scheduler_storage) or os.curdir,
+                exist_ok=True,
+            )
+        job_store = JobStore(db_path=scheduler_storage)
         await job_store.open()
         cron_scheduler = SchedulerEngine(
             store=job_store,
@@ -2743,6 +2738,7 @@ async def build_services(
                 interval_seconds=float(getattr(config.memory, "repair_interval_seconds", 60.0)),
                 max_items_per_tick=int(getattr(config.memory, "repair_max_items_per_tick", 5)),
                 usage_event_sink=usage_event_sink,
+                config=config,
             )
             log.info("build_services.memory_repair_service_ready")
         except Exception as e:
@@ -3283,6 +3279,7 @@ async def start_gateway_server(
         session_manager=svc.session_manager,
         channel_manager_ref=lambda: _cm_holder[0],
         schedule=create_background_task,
+        config=config,
     )
 
     background_completion_manager = BackgroundCompletionManager(

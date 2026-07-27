@@ -17,7 +17,7 @@ from typing import Any
 
 import tomli_w
 
-from opensquilla.paths import default_opensquilla_home
+from opensquilla.paths import default_opensquilla_home, native_io_path
 from opensquilla.search.types import MAX_SEARCH_RESULTS
 
 # Schema version stamped into every migrated payload. Bump this together with
@@ -657,13 +657,13 @@ def backup_and_write_migrated_config(
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{target.name}.",
         suffix=".tmp",
-        dir=str(target.parent),
+        dir=os.fspath(native_io_path(target.parent)),
     )
     try:
         with os.fdopen(fd, "wb") as fh:
             tomli_w.dump(payload, fh)
         os.chmod(tmp_name, 0o600)
-        os.replace(tmp_name, target)
+        os.replace(tmp_name, native_io_path(target))
     except Exception:
         try:
             os.unlink(tmp_name)
@@ -671,7 +671,7 @@ def backup_and_write_migrated_config(
             pass
         raise
 
-    os.chmod(target, 0o600)
+    os.chmod(native_io_path(target), 0o600)
     logging.getLogger(__name__).warning(
         "OpenSquilla config migrated for 0.2.0 schema",
         extra={
@@ -689,13 +689,15 @@ def make_config_backup(target: str | Path) -> Path:
     """Create a collision-safe 0600 backup next to a config file."""
     source = Path(target)
     stamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")
-    data = source.read_bytes()
+    data = native_io_path(source).read_bytes()
 
     for attempt in range(1000):
         suffix = "" if attempt == 0 else f".{attempt}"
         backup = source.with_name(f"{source.name}.backup.{stamp}{suffix}")
         try:
-            fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            fd = os.open(
+                native_io_path(backup), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+            )
         except FileExistsError:
             continue
         try:
@@ -703,11 +705,11 @@ def make_config_backup(target: str | Path) -> Path:
                 fh.write(data)
         except Exception:
             try:
-                os.unlink(backup)
+                os.unlink(native_io_path(backup))
             except OSError:
                 pass
             raise
-        backup.chmod(0o600)
+        native_io_path(backup).chmod(0o600)
         return backup
 
     raise FileExistsError(f"Could not create unique backup for {source}")

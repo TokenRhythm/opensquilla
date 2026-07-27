@@ -104,7 +104,7 @@ def test_cli_gateway_command_metadata_has_curated_order_and_compatibility() -> N
         key=lambda cmd: cmd.order,
     )
 
-    assert [cmd.name for cmd in palette[:11]] == [
+    assert [cmd.name for cmd in palette[:12]] == [
         "/model",
         "/strategy",
         "/sessions",
@@ -115,6 +115,7 @@ def test_cli_gateway_command_metadata_has_curated_order_and_compatibility() -> N
         "/usage",
         "/theme",
         "/help",
+        "/keys",
         "/exit",
     ]
 

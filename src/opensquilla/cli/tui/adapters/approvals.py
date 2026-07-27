@@ -260,12 +260,29 @@ async def _resolve_decision(
 
 
 def _host_request_payload(envelope: ApprovalEnvelope) -> dict[str, object]:
-    return {
+    # Envelope text is tool/model-derived and untrusted. The console path
+    # escapes Rich markup; the host draws raw cells, so the risk there is
+    # control bytes — strip them before the text crosses the IPC boundary
+    # (the surface send path sanitizes again as the shared choke point).
+    from opensquilla.cli.tui.backend.render_summary import (  # noqa: PLC0415
+        sanitize_terminal_text,
+    )
+
+    summary = sanitize_terminal_text(envelope.summary)
+    message = sanitize_terminal_text(envelope.message)
+    payload: dict[str, object] = {
         "id": envelope.approval_id,
         "tool": envelope.tool,
-        "summary": envelope.summary,
+        "summary": summary,
         "choices": [choice.id for choice in envelope.choices],
     }
+    # The console prompt prints the envelope's rationale line; the overlay must
+    # carry it too. Message-only envelopes already surface it as the summary,
+    # so only send a message that adds information — compared after
+    # sanitization, the same form the host will render.
+    if message and message != summary:
+        payload["message"] = message
+    return payload
 
 
 async def _handle_via_host(

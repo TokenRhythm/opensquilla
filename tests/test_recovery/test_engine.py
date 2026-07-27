@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import tomllib
 import uuid
 from pathlib import Path
@@ -22,6 +23,11 @@ from opensquilla.recovery import (
     guard_desktop_profile,
     inspect_profile,
     reconcile_profile,
+)
+from opensquilla.recovery.atomic import _native_io_path
+from opensquilla.recovery.config_patch import (
+    state_override,
+    workspace_override,
 )
 
 
@@ -249,7 +255,9 @@ def test_recovery_profile_rejects_external_primary_data_roots(
     assert report.stable_code == stable_code
     assert report.effective_workspace is None
     assert "continue-recovery-profile" not in report.allowed_actions
-    assert "create-recovery-profile" in report.allowed_actions
+    assert "create-recovery-profile" not in report.allowed_actions
+    assert "retry-primary-profile" not in report.allowed_actions
+    assert "show-backups" in report.allowed_actions
 
 
 def test_healthy_recovery_profile_cannot_be_repointed_to_external_workspace(
@@ -693,6 +701,120 @@ def test_profile_dotenv_state_override_is_the_authoritative_chat_root(
     assert state.valid is True
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length path contract")
+def test_extended_length_external_state_is_ready_for_gateway_startup(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "opensquilla"
+    workspace = _workspace(home / "workspace")
+    external_state = tmp_path / "external-state"
+    index = 0
+    while len(str(external_state)) < 275:
+        external_state /= f"state-segment-{index:02d}-0123456789"
+        index += 1
+    os.makedirs(_native_io_path(external_state))
+    _desktop_config(home, workspace=workspace)
+    (home / "config.toml").write_text(
+        f"state_dir = {json.dumps(str(external_state))}\n"
+        f"workspace_dir = {json.dumps(str(workspace))}\n",
+        encoding="utf-8",
+    )
+    database = external_state / "sessions.db"
+    connection = sqlite3.connect(_native_io_path(database))
+    try:
+        connection.execute("CREATE TABLE user_data (id INTEGER PRIMARY KEY)")
+        connection.commit()
+    finally:
+        connection.close()
+    assert os.path.isdir(_native_io_path(external_state))
+
+    report = inspect_profile(home, profile_kind="desktop-primary")
+
+    assert report.outcome == "ready", report
+    state = next(candidate for candidate in report.candidates if candidate.kind == "state")
+    assert state.path == external_state
+    assert state.exists is True
+    assert state.valid is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length path contract")
+def test_extended_length_temp_root_does_not_invalidate_state_database(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "opensquilla"
+    workspace = _workspace(home / "workspace")
+    _desktop_config(home, workspace=workspace)
+    database = home / "state" / "sessions.db"
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("CREATE TABLE user_data (id INTEGER PRIMARY KEY)")
+        connection.commit()
+    finally:
+        connection.close()
+
+    temp_root = tmp_path / "long-temp-root"
+    index = 0
+    while len(str(temp_root)) < 275:
+        temp_root /= f"temp-segment-{index:02d}-0123456789"
+        index += 1
+    os.makedirs(_native_io_path(temp_root))
+    assert len(str(temp_root)) > 260
+    monkeypatch.setattr(tempfile, "tempdir", _native_io_path(temp_root))
+
+    try:
+        report = inspect_profile(home, profile_kind="desktop-primary")
+
+        assert report.outcome == "ready", report
+        assert report.stable_code != "state_database_invalid"
+    finally:
+        shutil.rmtree(_native_io_path(temp_root))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length path contract")
+def test_extended_length_home_dotenv_routes_remain_authoritative(
+    tmp_path: Path,
+) -> None:
+    external_workspace = _workspace(tmp_path / "external-workspace")
+    external_state = tmp_path / "external-state"
+    external_state.mkdir()
+    home = tmp_path / "long-home"
+    index = 0
+    while len(str(home)) < 275:
+        home /= f"home-segment-{index:02d}-0123456789"
+        index += 1
+    os.makedirs(_native_io_path(home))
+    dotenv = (
+        f"OPENSQUILLA_GATEWAY_WORKSPACE_DIR={external_workspace}\n"
+        f"OPENSQUILLA_GATEWAY_STATE_DIR={external_state}\n"
+    )
+    with open(_native_io_path(home / ".env"), "w", encoding="utf-8") as handle:
+        handle.write(dotenv)
+    with open(_native_io_path(home / "config.toml"), "w", encoding="utf-8") as handle:
+        handle.write(
+            f"state_dir = {json.dumps(str(external_state))}\n"
+            f"workspace_dir = {json.dumps(str(external_workspace))}\n"
+        )
+    assert os.path.lexists(_native_io_path(home / ".env"))
+
+    assert workspace_override(
+        home,
+        include_process_environment=False,
+    ) == ("OPENSQUILLA_GATEWAY_WORKSPACE_DIR", str(external_workspace))
+    assert state_override(
+        home,
+        include_process_environment=False,
+    ) == ("OPENSQUILLA_GATEWAY_STATE_DIR", str(external_state))
+
+    report = inspect_profile(home, profile_kind="desktop-primary")
+
+    assert report.outcome == "ready", report
+    assert report.effective_workspace == external_workspace
+    state = next(candidate for candidate in report.candidates if candidate.kind == "state")
+    assert state.path == external_state
+    assert state.valid is True
+
+
 @pytest.mark.parametrize(
     ("database_setup", "stable_code"),
     [
@@ -825,7 +947,12 @@ def test_database_snapshot_requests_binary_mode_for_every_crt_descriptor(
     snapshot = recovery_engine._copy_source_file_no_follow(source, destination)
     assert recovery_engine._source_snapshot_is_current(snapshot) is True
 
-    assert [path for path, _flags in opened] == [source, destination, source]
+    expected_paths = [source, destination, source]
+    assert len(opened) == len(expected_paths)
+    assert all(
+        os.path.samefile(actual, expected)
+        for (actual, _flags), expected in zip(opened, expected_paths, strict=True)
+    )
     assert all(flags & sentinel_binary for _path, flags in opened)
 
 

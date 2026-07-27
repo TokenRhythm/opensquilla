@@ -24,14 +24,30 @@ _COMPACTED_TOOL_ARGUMENT_MARKERS = frozenset(
         "_opensquilla_compacted_tool_input",
     }
 )
-# Opt-in compaction safety levers (both off by default). The tiny guard stops
+# Opt-in compaction safety levers (all off by default). The tiny guard stops
 # every marker producer from replacing a string that is shorter than the
 # marker it would emit; recent-assistant protection keeps the model's
 # just-emitted turn out of tier 2+ compaction so fresh work is never
-# destroyed in the same request cycle that produced it.
+# destroyed in the same request cycle that produced it. Recent-result,
+# error-result, and projected-result protection exempt those tool results
+# from tier-1 rewriting; stub previews attach head/tail excerpts of the
+# original value to argument stubs; never-worse abandons any replacement that
+# is not strictly smaller than the text it replaces.
 _TINY_COMPACTION_GUARD_ENV = "OPENSQUILLA_PROVIDER_COMPACTION_TINY_GUARD_CHARS"
 _PROTECT_RECENT_ASSISTANT_ENV = "OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_RECENT_ASSISTANT"
+_PROTECT_RECENT_RESULTS_ENV = "OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_RECENT_RESULTS"
+_PROTECT_ERROR_RESULTS_ENV = "OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_ERROR_RESULTS"
+_SKIP_PROJECTED_ENV = "OPENSQUILLA_PROVIDER_COMPACTION_SKIP_PROJECTED"
+_STUB_PREVIEW_CHARS_ENV = "OPENSQUILLA_PROVIDER_COMPACTION_STUB_PREVIEW_CHARS"
+_NEVER_WORSE_ENV = "OPENSQUILLA_PROVIDER_COMPACTION_NEVER_WORSE"
 _TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on", "enabled"})
+# Prefixes stamped on tool-result content by the delivery-time boundary
+# projection layer; must stay in sync with the agent-side exemption predicate.
+_BOUNDARY_PROJECTED_RESULT_PREFIXES = (
+    "[tool_result_projection]\n",
+    "[aggregate_tool_result_compacted]\n",
+    "[duplicate_tool_result_elided]\n",
+)
 
 
 def _tiny_compaction_guard_chars() -> int:
@@ -57,6 +73,49 @@ def _protected_recent_assistant_index(messages: Any) -> int | None:
         if isinstance(message, dict) and message.get("role") == "assistant":
             return index
     return None
+
+
+def _protect_recent_results_count() -> int:
+    raw = os.environ.get(_PROTECT_RECENT_RESULTS_ENV, "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def _protect_error_results_enabled() -> bool:
+    raw = os.environ.get(_PROTECT_ERROR_RESULTS_ENV, "").strip().lower()
+    return raw in _TRUE_ENV_VALUES
+
+
+def _skip_projected_results_enabled() -> bool:
+    raw = os.environ.get(_SKIP_PROJECTED_ENV, "").strip().lower()
+    return raw in _TRUE_ENV_VALUES
+
+
+def _stub_preview_chars() -> int:
+    raw = os.environ.get(_STUB_PREVIEW_CHARS_ENV, "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def _never_worse_enabled() -> bool:
+    raw = os.environ.get(_NEVER_WORSE_ENV, "").strip().lower()
+    return raw in _TRUE_ENV_VALUES
+
+
+def _keep_original_for_never_worse(original: Any, replacement: Any) -> bool:
+    return _never_worse_enabled() and _payload_chars(replacement) >= _payload_chars(original)
+
+
+def _tool_result_content_is_provider_projection(content: str) -> bool:
+    return content.startswith(_BOUNDARY_PROJECTED_RESULT_PREFIXES)
 
 
 class ProviderRequestBudgetExceededError(RuntimeError):
@@ -165,7 +224,10 @@ def _compact_string(value: str) -> str:
     head = value[:900]
     tail = value[-200:]
     omitted = len(value) - len(head) - len(tail)
-    return f"{head}\n\n[provider_request_compacted: omitted {omitted} chars]\n\n{tail}"
+    compacted = f"{head}\n\n[provider_request_compacted: omitted {omitted} chars]\n\n{tail}"
+    if _keep_original_for_never_worse(value, compacted):
+        return value
+    return compacted
 
 
 def _compact_tail_string(value: str, *, label: str) -> str:
@@ -177,12 +239,15 @@ def _compact_tail_string(value: str, *, label: str) -> str:
     tail = value[-120:]
     omitted = len(value) - len(head) - len(tail)
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
-    return (
+    compacted = (
         f"{head}\n\n"
         f"[provider_request_{label}_compacted: omitted {omitted} chars; "
         f"original_chars={len(value)}; sha256={digest}]\n\n"
         f"{tail}"
     )
+    if _keep_original_for_never_worse(value, compacted):
+        return value
+    return compacted
 
 
 def _emergency_compact_string(value: str, *, label: str) -> str:
@@ -194,12 +259,15 @@ def _emergency_compact_string(value: str, *, label: str) -> str:
     tail = value[-40:]
     omitted = len(value) - len(head) - len(tail)
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
-    return (
+    compacted = (
         f"{head}\n\n"
         f"[provider_request_{label}_emergency_compacted: omitted {omitted} chars; "
         f"original_chars={len(value)}; sha256={digest}]\n\n"
         f"{tail}"
     )
+    if _keep_original_for_never_worse(value, compacted):
+        return value
+    return compacted
 
 
 def _hard_compact_string(value: str, *, label: str) -> str:
@@ -208,7 +276,10 @@ def _hard_compact_string(value: str, *, label: str) -> str:
     if len(value) <= _tiny_compaction_guard_chars():
         return value
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
-    return f"[opensquilla_compacted:{label}:{len(value)}:{digest}]"
+    compacted = f"[opensquilla_compacted:{label}:{len(value)}:{digest}]"
+    if _keep_original_for_never_worse(value, compacted):
+        return value
+    return compacted
 
 
 def _compact_argument_string(value: str, *, preview: bool = True) -> str:
@@ -217,10 +288,20 @@ def _compact_argument_string(value: str, *, preview: bool = True) -> str:
     if len(value) <= _tiny_compaction_guard_chars():
         return value
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
-    return (
+    compacted = (
         "[provider_request_tool_input_compacted: "
         f"original_chars={len(value)}; sha256={digest}]"
     )
+    preview_chars = _stub_preview_chars()
+    if preview_chars and len(value) > preview_chars * 2:
+        with_previews = f"{value[:preview_chars]}\n\n{compacted}\n\n{value[-preview_chars:]}"
+        # Previews may never turn compaction into growth: attach them only
+        # while the preview-carrying stub stays smaller than the original.
+        if _payload_chars(with_previews) < _payload_chars(value):
+            compacted = with_previews
+    if _keep_original_for_never_worse(value, compacted):
+        return value
+    return compacted
 
 
 def _compact_tool_arguments(value: str, *, preview: bool = True) -> str:
@@ -245,20 +326,37 @@ def _compact_tool_arguments(value: str, *, preview: bool = True) -> str:
                     changed = changed or next_item != item
                 else:
                     compacted[key] = item
+            # Never-worse prefers the intact original over the note stub
+            # when per-item rewriting produced no smaller replacement.
+            if preview and not changed and _never_worse_enabled():
+                return value
             if changed or not preview:
-                return json.dumps(compacted, ensure_ascii=False, separators=(",", ":"))
+                compacted_json = json.dumps(
+                    compacted, ensure_ascii=False, separators=(",", ":")
+                )
+                if _keep_original_for_never_worse(value, compacted_json):
+                    return value
+                return compacted_json
     if len(value) <= _tiny_compaction_guard_chars():
         return value
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
-    return json.dumps(
-        {
-            "note": "historical tool arguments omitted for provider context budget",
-            "original_chars": len(value),
-            "sha256": digest,
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
+    stub: dict[str, Any] = {
+        "note": "historical tool arguments omitted for provider context budget",
+        "original_chars": len(value),
+        "sha256": digest,
+    }
+    stub_json = json.dumps(stub, ensure_ascii=False, separators=(",", ":"))
+    preview_chars = _stub_preview_chars()
+    if preview_chars and len(value) > preview_chars * 2:
+        stub["preview_head"] = value[:preview_chars]
+        stub["preview_tail"] = value[-preview_chars:]
+        with_previews_json = json.dumps(stub, ensure_ascii=False, separators=(",", ":"))
+        # Previews may never turn compaction into growth.
+        if _payload_chars(with_previews_json) < _payload_chars(value):
+            stub_json = with_previews_json
+    if _keep_original_for_never_worse(value, stub_json):
+        return value
+    return stub_json
 
 
 def _first_cache_control(content: Any) -> dict[str, Any] | None:
@@ -492,13 +590,27 @@ def _compact_tool_input(value: Any) -> Any:
             changed = True
     if changed:
         return compacted
-    return {
+    stub: dict[str, Any] = {
         "_opensquilla_compacted_tool_input": True,
         "original_chars": len(raw),
         "sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
         "head": raw[:_COMPACTED_ARGUMENT_PREVIEW_CHARS],
         "tail": raw[-_COMPACTED_ARGUMENT_TAIL_CHARS:],
     }
+    preview_chars = _stub_preview_chars()
+    if preview_chars > _COMPACTED_ARGUMENT_TAIL_CHARS:
+        # The stub's head/tail fields already carry fixed-size previews;
+        # separate preview keys would duplicate those bytes, so the lever
+        # extends the fields in place — and only while the stub stays
+        # smaller than the original.
+        extended = dict(stub)
+        extended["head"] = raw[: max(preview_chars, _COMPACTED_ARGUMENT_PREVIEW_CHARS)]
+        extended["tail"] = raw[-preview_chars:]
+        if _payload_chars(extended) < _payload_chars(value):
+            stub = extended
+    if _keep_original_for_never_worse(value, stub):
+        return value
+    return stub
 
 
 def _tool_arguments_contain_projection(arguments: str) -> bool:
@@ -679,6 +791,38 @@ def _tool_content_is_critical(content: Any) -> bool:
     return False
 
 
+def _tool_result_entry_is_error(entry: dict[str, Any]) -> bool:
+    if entry.get("is_error") is True:
+        return True
+    return _tool_result_content_is_error(entry.get("content"))
+
+
+def _tool_result_content_is_error(content: Any) -> bool:
+    # Stricter than _tool_content_is_critical on purpose: the substring
+    # fallback would exempt results that merely quote error fragments
+    # (grep/read output) from tier 1, forcing escalation to harsher tiers.
+    # Only structurally-parsed error envelopes qualify for the exemption.
+    if isinstance(content, str):
+        with contextlib.suppress(json.JSONDecodeError):
+            parsed = json.loads(content)
+            if isinstance(parsed, dict):
+                if _execution_status_is_failure(parsed.get("execution_status")):
+                    return True
+                if parsed.get("is_error") is True:
+                    return True
+        return False
+    if not isinstance(content, list):
+        return False
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("is_error") is True:
+            return True
+        if _tool_result_content_is_error(block.get("content")):
+            return True
+    return False
+
+
 def _critical_tool_content_for_provider(content: Any) -> Any:
     if isinstance(content, str):
         return _emergency_compact_string(content, label="tool_result")
@@ -700,34 +844,67 @@ def _critical_tool_content_for_provider(content: Any) -> Any:
 
 
 def _compact_tool_arguments_for_final_cap(arguments: str) -> str:
-    return json.dumps(
-        {_INVALID_PROVIDER_CONTEXT_ARGUMENTS_KEY: True},
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
+    stub: dict[str, Any] = {_INVALID_PROVIDER_CONTEXT_ARGUMENTS_KEY: True}
+    stub_json = json.dumps(stub, ensure_ascii=False, separators=(",", ":"))
+    preview_chars = _stub_preview_chars()
+    if preview_chars and len(arguments) > preview_chars * 2:
+        # Never preview argument text the projection scrubber would redact.
+        sanitized = _provider_context_arguments_json(
+            arguments,
+            include_compacted_markers=True,
+        )
+        if sanitized is None:
+            stub["preview_head"] = arguments[:preview_chars]
+            stub["preview_tail"] = arguments[-preview_chars:]
+            with_previews_json = json.dumps(stub, ensure_ascii=False, separators=(",", ":"))
+            # Previews may never turn compaction into growth.
+            if _payload_chars(with_previews_json) < _payload_chars(arguments):
+                stub_json = with_previews_json
+    if _keep_original_for_never_worse(arguments, stub_json):
+        return arguments
+    return stub_json
 
 
 def _compact_tool_payload_once(payload: dict[str, Any]) -> dict[str, Any]:
     compacted = deepcopy(payload)
+    entries: list[dict[str, Any]] = []
     for message in compacted.get("messages", []):
         if not isinstance(message, dict):
             continue
         content = message.get("content")
         if message.get("role") == "tool" and isinstance(content, str):
-            message["content"] = _compact_string(content)
+            entries.append(message)
             continue
         if not isinstance(content, list):
             continue
         for block in content:
-            if not isinstance(block, dict) or block.get("type") != "tool_result":
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                entries.append(block)
+    protect_recent = _protect_recent_results_count()
+    protect_errors = _protect_error_results_enabled()
+    skip_projected = _skip_projected_results_enabled()
+    first_protected = len(entries) - protect_recent
+    for index, entry in enumerate(entries):
+        if protect_recent and index >= first_protected:
+            continue
+        if protect_errors and _tool_result_entry_is_error(entry):
+            continue
+        content = entry.get("content")
+        if isinstance(content, str):
+            if skip_projected and _tool_result_content_is_provider_projection(content):
                 continue
-            block_content = block.get("content")
-            if isinstance(block_content, str):
-                block["content"] = _compact_string(block_content)
-            elif isinstance(block_content, list):
-                for item in block_content:
-                    if isinstance(item, dict) and isinstance(item.get("text"), str):
-                        item["text"] = _compact_string(item["text"])
+            entry["content"] = _compact_string(content)
+        elif isinstance(content, list):
+            # Projection is skipped per item so one projected item never
+            # shields unprojected siblings from the rewrite.
+            for item in content:
+                if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+                    continue
+                if skip_projected and _tool_result_content_is_provider_projection(
+                    item["text"]
+                ):
+                    continue
+                item["text"] = _compact_string(item["text"])
     return compacted
 
 
@@ -1087,6 +1264,19 @@ def prove_provider_payload(
         "retry_count": 0,
         **_payload_component_chars(budget_payload, effective_budget),
     }
+    # Stamped only when enabled so default-off proofs stay byte-identical.
+    protect_recent_results = _protect_recent_results_count()
+    if protect_recent_results:
+        proof["compaction_protect_recent_results"] = protect_recent_results
+    if _protect_error_results_enabled():
+        proof["compaction_protect_error_results"] = True
+    if _skip_projected_results_enabled():
+        proof["compaction_skip_projected"] = True
+    stub_preview_chars = _stub_preview_chars()
+    if stub_preview_chars:
+        proof["compaction_stub_preview_chars"] = stub_preview_chars
+    if _never_worse_enabled():
+        proof["compaction_never_worse"] = True
     if media_blocks:
         proof["media_chars_excluded"] = media_chars
         proof["media_blocks_excluded"] = media_blocks

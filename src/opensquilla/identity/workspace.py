@@ -7,7 +7,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from opensquilla.bootstrap_types import BootstrapFileReport
-from opensquilla.paths import state_dir
+from opensquilla.paths import native_io_path, state_dir
 from opensquilla.safety.injection_guard import InjectionFinding, scan_for_injection
 from opensquilla.session.keys import is_subagent_key
 
@@ -39,8 +39,8 @@ _SHARED_BOOTSTRAP_ALLOWLIST = frozenset({"AGENTS.md", "SOUL.md", "TOOLS.md"})
 def _is_within_root(root: Path, target: Path) -> bool:
     """Return True if target resolves within root (boundary guard)."""
     try:
-        resolved_root = root.resolve()
-        resolved_target = target.resolve()
+        resolved_root = native_io_path(root).resolve()
+        resolved_target = native_io_path(target).resolve()
         resolved_target.relative_to(resolved_root)
         return True
     except ValueError:
@@ -49,12 +49,13 @@ def _is_within_root(root: Path, target: Path) -> bool:
 
 def _read_file_sync(path: Path) -> str | None:
     """Read a single bootstrap file, enforcing size limit."""
-    if not path.is_file():
+    native_path = native_io_path(path)
+    if not native_path.is_file():
         return None
-    size = path.stat().st_size
+    size = native_path.stat().st_size
     if size > _MAX_FILE_BYTES:
         return None
-    return path.read_text(encoding="utf-8", errors="replace")
+    return native_path.read_text(encoding="utf-8", errors="replace")
 
 
 def _bootstrap_allowlist_for_session(session_key: str | None) -> frozenset[str] | None:
@@ -160,8 +161,9 @@ def _write_injection_findings(
     if not findings:
         return
     path = Path(safety_log_path) if safety_log_path is not None else state_dir("safety_log.jsonl")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as fh:
+    native_path = native_io_path(path)
+    native_path.parent.mkdir(parents=True, exist_ok=True)
+    with native_path.open("a", encoding="utf-8") as fh:
         for finding in findings:
             fh.write(json.dumps(finding.asdict(), ensure_ascii=False, sort_keys=True) + "\n")
 
@@ -257,7 +259,8 @@ def load_daily_notes(
 
     root = Path(workspace_dir).expanduser()
     memory_dir = root / "memory"
-    if not memory_dir.is_dir():
+    native_memory_dir = native_io_path(memory_dir)
+    if not native_memory_dir.is_dir():
         return {}
     per_note_limit = (
         int(per_note_max_chars)
@@ -280,7 +283,10 @@ def load_daily_notes(
         # Canonical file first, then slugged variants (alphabetical).
         canonical_name = f"{prefix}.md"
         matches = sorted(
-            memory_dir.glob(f"{prefix}*.md"),
+            (
+                memory_dir / candidate.name
+                for candidate in native_memory_dir.glob(f"{prefix}*.md")
+            ),
             key=lambda path: (path.name != canonical_name, path.name),
         )
         for candidate in matches:

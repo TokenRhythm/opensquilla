@@ -16,10 +16,12 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from opensquilla.recovery.atomic import (
     PathIdentity,
     _chmod_open_file,
+    _native_io_path,
     native_move_no_replace,
 )
 from opensquilla.recovery.config_patch import (
@@ -162,17 +164,12 @@ _ATTENTION_ACTIONS = (
     "browse-workspace",
 )
 _RECOVERY_ACTIONS = (
-    "continue-recovery-profile",
-    "create-recovery-profile",
-    "retry-primary-profile",
     "show-backups",
     "copy-diagnostics",
 )
 _CLEANUP_RECOVERY_ACTIONS = ("abandon-cleanup", *_RECOVERY_ACTIONS)
 _WORKSPACE_RECOVERY_ACTIONS = ("choose-workspace", *_RECOVERY_ACTIONS)
 _UNSAFE_RECOVERY_PROFILE_ACTIONS = (
-    "create-recovery-profile",
-    "retry-primary-profile",
     "show-backups",
     "copy-diagnostics",
 )
@@ -215,6 +212,30 @@ def _same_path(left: str | Path, right: str | Path) -> bool:
     return _path_key(left) == _path_key(right)
 
 
+def _lexists(path: str | Path) -> bool:
+    return os.path.lexists(_native_io_path(path))
+
+
+def _native_lstat(path: str | Path) -> os.stat_result:
+    return os.lstat(_native_io_path(path))
+
+
+def _native_stat(path: str | Path) -> os.stat_result:
+    return os.stat(_native_io_path(path))
+
+
+def _native_access(path: str | Path, mode: int) -> bool:
+    return os.access(_native_io_path(path), mode)
+
+
+def _native_is_file(path: str | Path) -> bool:
+    return os.path.isfile(_native_io_path(path))
+
+
+def _native_is_dir(path: str | Path) -> bool:
+    return os.path.isdir(_native_io_path(path))
+
+
 def _read_config(home: Path) -> _ConfigView:
     config_path = home / "config.toml"
     try:
@@ -222,7 +243,7 @@ def _read_config(home: Path) -> _ConfigView:
     except WorkspaceOverrideError as exc:
         return _ConfigView(
             path=config_path,
-            exists=os.path.lexists(config_path),
+            exists=_lexists(config_path),
             payload=None,
             workspace=None,
             workspace_explicit=False,
@@ -235,7 +256,7 @@ def _read_config(home: Path) -> _ConfigView:
     except RecoveryError as exc:
         return _ConfigView(
             path=config_path,
-            exists=os.path.lexists(config_path),
+            exists=_lexists(config_path),
             payload=None,
             workspace=None,
             workspace_explicit=False,
@@ -408,7 +429,7 @@ def _read_config(home: Path) -> _ConfigView:
 
 def _workspace_status(path: Path, *, explicitly_configured: bool) -> WorkspaceCandidate:
     try:
-        own_stat = path.lstat()
+        own_stat = _native_lstat(path)
     except (FileNotFoundError, NotADirectoryError):
         return WorkspaceCandidate(
             kind="configured" if explicitly_configured else "workspace",
@@ -429,8 +450,8 @@ def _workspace_status(path: Path, *, explicitly_configured: bool) -> WorkspaceCa
     attributes = int(getattr(own_stat, "st_file_attributes", 0))
     is_link = stat.S_ISLNK(own_stat.st_mode) or bool(attributes & 0x400)
     try:
-        target_stat = path.stat() if is_link and explicitly_configured else own_stat
-        valid = stat.S_ISDIR(target_stat.st_mode) and os.access(path, os.R_OK | os.X_OK)
+        target_stat = _native_stat(path) if is_link and explicitly_configured else own_stat
+        valid = stat.S_ISDIR(target_stat.st_mode) and _native_access(path, os.R_OK | os.X_OK)
     except OSError:
         target_stat = own_stat
         valid = False
@@ -502,7 +523,7 @@ def _candidate_set(home: Path, config: _ConfigView) -> tuple[WorkspaceCandidate,
                 path=state.path,
                 exists=state.exists,
                 valid=state.valid
-                and os.access(state.path, os.R_OK | os.W_OK | os.X_OK),
+                and _native_access(state.path, os.R_OK | os.W_OK | os.X_OK),
                 configured=True,
                 identity=state.identity,
                 modified_at_ns=state.modified_at_ns,
@@ -554,7 +575,7 @@ class _DatabaseSourceChangedError(Exception):
 
 def _regular_source_stat(path: Path) -> os.stat_result | None:
     try:
-        value = path.lstat()
+        value = os.lstat(_native_io_path(path))
     except FileNotFoundError:
         return None
     except OSError as exc:
@@ -604,7 +625,7 @@ def _copy_source_file_no_follow(source: Path, destination: Path) -> _DatabaseSou
         | getattr(os, "O_NOFOLLOW", 0)
     )
     try:
-        source_fd = os.open(source, source_flags)
+        source_fd = os.open(_native_io_path(source), source_flags)
     except FileNotFoundError as exc:
         raise _DatabaseSourceChangedError from exc
     except OSError as exc:
@@ -620,7 +641,7 @@ def _copy_source_file_no_follow(source: Path, destination: Path) -> _DatabaseSou
         ):
             raise _DatabaseSourceChangedError
         try:
-            destination_fd = os.open(destination, destination_flags, 0o600)
+            destination_fd = os.open(_native_io_path(destination), destination_flags, 0o600)
         except OSError as exc:
             raise RecoveryError(
                 "private database validation snapshot cannot be created",
@@ -674,7 +695,7 @@ def _source_snapshot_is_current(snapshot: _DatabaseSourceSnapshot) -> bool:
         | getattr(os, "O_NOFOLLOW", 0)
     )
     try:
-        fd = os.open(snapshot.path, flags)
+        fd = os.open(_native_io_path(snapshot.path), flags)
     except OSError:
         return False
     digest = hashlib.sha256()
@@ -725,13 +746,15 @@ def _database_safety_code(path: Path) -> str | None:
                         _copy_source_file_no_follow(entry, snapshot_root / entry.name)
                     )
             snapshot_path = snapshot_root / path.name
+            if os.name == "nt":
+                encoded_path = quote(_native_io_path(snapshot_path), safe="/:")
+                snapshot_uri = f"file:{encoded_path}?mode=rw"
+            else:
+                snapshot_uri = f"{snapshot_path.as_uri()}?mode=rw"
             try:
                 # mode=rw forbids accidental creation. Any WAL recovery, SHM
                 # creation, or checkpointing is confined to this disposable copy.
-                connection = sqlite3.connect(
-                    f"{snapshot_path.as_uri()}?mode=rw",
-                    uri=True,
-                )
+                connection = sqlite3.connect(snapshot_uri, uri=True)
                 try:
                     check = connection.execute("PRAGMA quick_check").fetchone()
                     if not check or str(check[0]).lower() != "ok":
@@ -785,7 +808,7 @@ def _database_safety_code(path: Path) -> str | None:
 
 def _state_safety_code(state_dir: Path) -> str | None:
     try:
-        state_before = PathIdentity.from_stat(state_dir.stat())
+        state_before = PathIdentity.from_stat(_native_stat(state_dir))
     except OSError:
         return "effective_state_unreadable"
     for database_name in ("sessions.db", "scheduler.db"):
@@ -793,7 +816,7 @@ def _state_safety_code(state_dir: Path) -> str | None:
         if code is not None:
             return code
     try:
-        state_after = PathIdentity.from_stat(state_dir.stat())
+        state_after = PathIdentity.from_stat(_native_stat(state_dir))
     except OSError:
         return "state_database_changed"
     if state_before.metadata_tuple() != state_after.metadata_tuple():
@@ -803,7 +826,7 @@ def _state_safety_code(state_dir: Path) -> str | None:
 
 def _profile_has_evidence(home: Path) -> bool:
     try:
-        return any(os.path.lexists(home / name) for name in _PROFILE_EVIDENCE_NAMES)
+        return any(_lexists(home / name) for name in _PROFILE_EVIDENCE_NAMES)
     except OSError:
         return True
 
@@ -819,7 +842,7 @@ def _profile_top_level_entries(home: Path) -> tuple[str, ...] | None:
     """
 
     try:
-        before = home.lstat()
+        before = _native_lstat(home)
     except FileNotFoundError:
         return ()
     except OSError:
@@ -828,8 +851,8 @@ def _profile_top_level_entries(home: Path) -> tuple[str, ...] | None:
     if stat.S_ISLNK(before.st_mode) or attributes & 0x400 or not stat.S_ISDIR(before.st_mode):
         return None
     try:
-        entries = tuple(sorted(entry.name for entry in os.scandir(home)))
-        after = home.lstat()
+        entries = tuple(sorted(entry.name for entry in os.scandir(_native_io_path(home))))
+        after = _native_lstat(home)
     except OSError:
         return None
     if PathIdentity.from_stat(before).metadata_tuple() != PathIdentity.from_stat(
@@ -841,7 +864,7 @@ def _profile_top_level_entries(home: Path) -> tuple[str, ...] | None:
 
 def _home_is_unsafe(path: Path) -> bool:
     try:
-        value = path.lstat()
+        value = _native_lstat(path)
     except FileNotFoundError:
         return False
     except OSError:
@@ -869,7 +892,7 @@ def _legacy_layout_is_proven(home: Path, config: _ConfigView) -> bool:
     if not candidate.valid:
         return False
     try:
-        return any((legacy / name).is_file() for name in _WORKSPACE_IDENTITY_FILES)
+        return any(_native_is_file(legacy / name) for name in _WORKSPACE_IDENTITY_FILES)
     except OSError:
         return False
 
@@ -884,7 +907,7 @@ def _base_legacy_layout_is_proven(home: Path, config: _ConfigView) -> bool:
 
 def _plain_role_source(path: Path, expected_type: str) -> bool:
     try:
-        value = path.lstat()
+        value = _native_lstat(path)
     except OSError:
         return False
     attributes = int(getattr(value, "st_file_attributes", 0))
@@ -912,10 +935,10 @@ def _legacy_roles(
     for name, expected_type, entry_name in _LEGACY_HOME_ROLES:
         source = home / "state" / entry_name
         destination = home / entry_name
-        source_exists = os.path.lexists(source)
+        source_exists = _lexists(source)
         if not source_exists:
             continue
-        destination_exists = os.path.lexists(destination)
+        destination_exists = _lexists(destination)
         if destination_exists:
             disposition = "conflict"
         elif name == "workspace" and config.workspace_explicit and config.workspace is not None:
@@ -935,12 +958,12 @@ def _legacy_roles(
         roles.append(_LegacyRole(name, source, destination, disposition))
 
     nested = home / "state" / "state"
-    if os.path.lexists(nested):
+    if _lexists(nested):
         if not _plain_role_source(nested, "directory"):
             roles.append(_LegacyRole("state/*", nested, home / "state", "unsafe"))
         else:
             try:
-                entries = sorted(os.scandir(nested), key=lambda item: item.name)
+                entries = sorted(os.scandir(_native_io_path(nested)), key=lambda item: item.name)
             except OSError:
                 roles.append(_LegacyRole("state/*", nested, home / "state", "unsafe"))
             else:
@@ -952,9 +975,9 @@ def _legacy_roles(
                     roles.append(_LegacyRole("state/*", nested, home / "state", "unsafe"))
                     return tuple(roles)
                 for entry in entries:
-                    source = Path(entry.path)
+                    source = nested / entry.name
                     destination = home / "state" / entry.name
-                    if os.path.lexists(destination):
+                    if _lexists(destination):
                         disposition = "conflict"
                     elif _plain_role_source(source, "directory") or _plain_role_source(
                         source, "file"
@@ -1023,7 +1046,7 @@ def _finalize_compatibility_marker(
         return report
 
     marker = home / "desktop-layout-v2.json"
-    if os.path.lexists(marker):
+    if _lexists(marker):
         if _marker_is_valid(marker):
             return report
         return replace(
@@ -1048,7 +1071,7 @@ def _finalize_compatibility_marker(
     )
     flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(marker, flags, 0o600)
+        fd = os.open(_native_io_path(marker), flags, 0o600)
     except FileExistsError:
         if _marker_is_valid(marker):
             return report
@@ -1101,7 +1124,7 @@ def _with_marker_inspection_status(
     if profile_kind != "desktop-primary" or report.outcome == "recovery_required":
         return report
     marker = home / "desktop-layout-v2.json"
-    if not os.path.lexists(marker):
+    if not _lexists(marker):
         actions = tuple(dict.fromkeys(("finalize-layout", *report.allowed_actions)))
         return replace(report, allowed_actions=actions)
     if _marker_is_valid(marker):
@@ -1213,7 +1236,7 @@ def _unfinished_cleanup_transaction(home: Path, *, profile_kind: str) -> bool:
     if context is None:
         return False
     user_data, journal, selected_recovery_id = context
-    if not os.path.lexists(journal):
+    if not _lexists(journal):
         return False
     try:
         snapshot = ConfigSnapshot.capture(journal)
@@ -1277,7 +1300,7 @@ def _identity_payload_matches(path: Path, expected: object) -> bool:
     if not isinstance(expected, dict):
         return False
     try:
-        value = path.lstat()
+        value = _native_lstat(path)
     except OSError:
         return False
     current = {
@@ -1298,7 +1321,7 @@ def _object_identity_payload_matches(path: Path, expected: object) -> bool:
         return False
     assert isinstance(expected, dict)
     try:
-        value = path.lstat()
+        value = _native_lstat(path)
     except OSError:
         return False
     current = {
@@ -1510,7 +1533,7 @@ def _valid_import_journal_schema(home: Path, journal: dict[str, Any]) -> bool:
             _valid_identity_payload(identities.get(key))
             for key in ("source", "staging", "candidate")
         )
-        or os.path.lexists(staging)
+        or _lexists(staging)
         or not _object_identity_payload_matches(home, identities.get("candidate"))
     ):
         return False
@@ -1527,7 +1550,7 @@ def _valid_import_journal_schema(home: Path, journal: dict[str, Any]) -> bool:
     elif (
         original_target is not None
         or backup_identity is not None
-        or os.path.lexists(backup)
+        or _lexists(backup)
     ):
         return False
     receipt = _load_json_file_no_follow(
@@ -1583,7 +1606,7 @@ def _valid_restore_journal_schema(home: Path, journal: dict[str, Any]) -> bool:
         or _normalized_receipt_path(source) != source
         or _normalized_receipt_path(Path(source).parent) != _normalized_receipt_path(home.parent)
         or not Path(source).name.startswith(f"{home.name}.backup.")
-        or os.path.lexists(source)
+        or _lexists(source)
         or not isinstance(target, str)
         or target != _normalized_receipt_path(home)
         or not isinstance(backup, str)
@@ -1612,7 +1635,7 @@ def _valid_restore_journal_schema(home: Path, journal: dict[str, Any]) -> bool:
     elif (
         original_target is not None
         or backup_identity is not None
-        or os.path.lexists(backup)
+        or _lexists(backup)
     ):
         return False
     history = _load_strict_replacement_history(home)
@@ -1674,7 +1697,7 @@ def _profile_kind(profile_kind: str | None, *, home: Path | None = None) -> str:
 
 def _plain_canonical_directory(path: Path) -> bool:
     try:
-        value = path.lstat()
+        value = _native_lstat(path)
     except FileNotFoundError:
         return True
     except OSError:
@@ -1733,7 +1756,7 @@ def _revision(
     parts = [str(home), stable_code, config.error_code or ""]
     if _home_is_unsafe(home):
         try:
-            value = home.lstat()
+            value = _native_lstat(home)
         except OSError:
             parts.append("home:unreadable")
         else:
@@ -1744,7 +1767,7 @@ def _revision(
         digest = hashlib.sha256("\n".join(parts).encode("utf-8", "surrogatepass")).digest()
         return int.from_bytes(digest[:8], "big") & ((1 << 53) - 1)
     try:
-        value = config.path.lstat()
+        value = _native_lstat(config.path)
         parts.append(
             f"config:{value.st_dev}:{value.st_ino}:{value.st_size}:{value.st_mtime_ns}:{value.st_mode}"
         )
@@ -1792,13 +1815,15 @@ def _revision(
     nested = home / "state" / "state"
     role_paths.append(nested)
     try:
-        if nested.is_dir() and not nested.is_symlink():
-            role_paths.extend(Path(entry.path) for entry in os.scandir(nested))
+        if _plain_role_source(nested, "directory"):
+            role_paths.extend(
+                nested / entry.name for entry in os.scandir(_native_io_path(nested))
+            )
     except OSError:
         parts.append("nested-state:unreadable")
     for path in role_paths:
         try:
-            value = path.lstat()
+            value = _native_lstat(path)
         except OSError:
             continue
         parts.append(
@@ -2000,7 +2025,7 @@ def inspect_profile(
                 "fresh_recovery_profile" if outcome == "recovery_profile" else "fresh_profile"
             ),
             effective_workspace=effective,
-            allowed_actions=("retry-primary-profile",) if outcome == "recovery_profile" else (),
+            allowed_actions=(),
         )
 
     # An otherwise implicit profile with only unrecognized top-level content is
@@ -2184,12 +2209,12 @@ def inspect_profile(
         code = "configured_workspace"
     safe_actions: tuple[str, ...]
     if config.workspace_from_env:
-        safe_actions = ("retry-primary-profile",) if outcome == "recovery_profile" else ()
+        safe_actions = ()
     elif outcome == "recovery_profile":
-        # A recovery profile is the durable safe fallback.  Its workspace is
-        # intentionally fixed to H/workspace so a choice made for the primary
-        # profile can never turn the fallback into another unsafe profile.
-        safe_actions = ("retry-primary-profile",)
+        # Legacy recovery identities remain inspectable for read-only
+        # diagnostics and cleanup compatibility, but are never offered as a
+        # runtime target after primary-only consolidation.
+        safe_actions = ()
     else:
         safe_actions = ("choose-workspace",)
     return _with_marker_inspection_status(

@@ -17,6 +17,14 @@ _TOOL_ARGUMENT_ALIASES: dict[str, dict[str, str]] = {
         "newString": "new_text",
         "newText": "new_text",
     },
+    "read_file": {
+        "file_path": "path",
+        "filePath": "path",
+    },
+    "write_file": {
+        "file_path": "path",
+        "filePath": "path",
+    },
 }
 
 

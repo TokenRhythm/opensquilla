@@ -6,6 +6,7 @@ import contextvars
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
@@ -113,6 +114,46 @@ class ToolContext:
     # historical positional constructor contract for embedded callers.
     sandbox_file_system_profile: Any | None = None
     on_sandbox_auto_review: Callable[[dict[str, object]], Awaitable[Any]] | None = None
+    # Resolved per turn by the engine (see tools.description_overrides).
+    # Keys name a tool or a "tool.param" parameter; values replace the
+    # matching model-facing description verbatim. None = mechanism off.
+    tool_description_overrides: dict[str, str] | None = None
+    tool_description_overrides_source: str | None = None  # "config" | "env_file"
+    # Set by the engine alongside the freeze margin reset: when True, a frozen
+    # git revert whose targeted diff is instrumentation-only (added print/log
+    # lines, nothing removed) is allowed through — cleaning up diagnostic
+    # output is exactly what the wrap-up window is for.
+    endgame_git_freeze_instrumentation_exempt: bool = False
+    # Armed by the engine (mutated in place, pattern above) when the scratch
+    # verify-mirror lever is on: workspace write-deny messages then append
+    # guidance pointing at <scratch_dir>/verify-mirror/<workspace-relative-path>.
+    scratch_verify_mirror_active: bool = False
+
+    # Set only by the authenticated channel ingress boundary. Keeping this
+    # separate from ``is_owner`` prevents a generic owner-context leak from
+    # promoting a channel caller through the admin-only tool matrix.
+    channel_admin_verified: bool = False
+
+    def __post_init__(self) -> None:
+        self.validate_path_roots()
+
+    def validate_path_roots(self) -> None:
+        """Reject scratch roots that equal or contain the active workspace."""
+
+        if not self.workspace_dir or not self.scratch_dir:
+            return
+        try:
+            workspace = Path(self.workspace_dir).expanduser().resolve(strict=False)
+            scratch = Path(self.scratch_dir).expanduser().resolve(strict=False)
+            workspace.relative_to(scratch)
+        except ValueError:
+            return
+        except (OSError, RuntimeError) as exc:
+            raise ValueError("workspace_dir and scratch_dir must resolve safely") from exc
+        raise ValueError(
+            "scratch_dir must not equal or contain workspace_dir; use a disjoint "
+            "scratch root or a dedicated scratch subdirectory inside the workspace"
+        )
 
 
 # Request-scoped context — set by build_tool_handler before each dispatch.
@@ -221,6 +262,10 @@ class SafeToolUserMessage:
 
 class SafeToolError(SafeToolUserMessage, ToolError):
     """ToolError variant that may expose a sanitized user-actionable message."""
+
+    # Set True by policy gates before raising; read by the failure envelope
+    # to select the policy-deny user_message cap.
+    policy_gate_denial: bool = False
 
     def __init__(self, user_message: str | None = None, *raw_details: object) -> None:
         super().__init__(*(raw_details or (user_message or self.user_message,)))

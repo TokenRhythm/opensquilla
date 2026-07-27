@@ -30,6 +30,11 @@ from opensquilla.onboarding.section_status import (
     FIRST_RUN_REQUIRED_SECTIONS,
     SectionStatus,
     _configured_image_generation_provider_ids,
+    _image_generation_effective_env_key,
+    _image_generation_endpoint_conflict_provider,
+    _image_generation_endpoint_is_valid,
+    _image_generation_has_invalid_model_reference,
+    _image_generation_llm_key_reusable,
     audio_section_status,
     channels_section_status,
     ensemble_section_status,
@@ -814,26 +819,22 @@ def _image_generation_provider_source(
     if explicit_key:
         return "explicit", spec.env_key
 
-    spec_env_key = (getattr(spec, "env_key", "") or "").strip()
-    cfg_env_key = (
-        (getattr(provider_cfg, "api_key_env", "") or "").strip()
-        if provider_cfg
-        else ""
+    env_key, env_is_explicit = _image_generation_effective_env_key(
+        cfg,
+        provider_id,
+        spec,
     )
-    explicit_env_key = cfg_env_key if cfg_env_key and cfg_env_key != spec_env_key else ""
-    if explicit_env_key:
+    if env_key and os.environ.get(env_key):
+        return "env", env_key
+    if env_key and env_is_explicit:
         return (
-            ("env", explicit_env_key)
-            if os.environ.get(explicit_env_key)
-            else ("missing_env", explicit_env_key)
+            "missing_env",
+            env_key,
         )
-    if spec_env_key and os.environ.get(spec_env_key):
-        return "env", spec_env_key
 
-    llm = getattr(cfg, "llm", None)
-    if getattr(llm, "provider", "").strip().lower() == provider_id and getattr(llm, "api_key", ""):
+    if _image_generation_llm_key_reusable(cfg, provider_id) is True:
         return "llm_fallback", spec.env_key
-    return "", spec_env_key
+    return "", env_key or str(getattr(spec, "env_key", "") or "").strip()
 
 
 def _image_generation_annotations(
@@ -848,7 +849,59 @@ def _image_generation_annotations(
         source, env_key = _image_generation_provider_source(cfg, provider_id)
         if source:
             return source, provider_id, primary, env_key
+        try:
+            get_image_generation_provider_setup_spec(provider_id)
+        except KeyError:
+            return "none", provider_id, primary, ""
+        if _image_generation_llm_key_reusable(cfg, provider_id) is False:
+            return "none", provider_id, primary, env_key
     return "none", "", primary, ""
+
+
+def _image_generation_detail(
+    cfg: GatewayConfig,
+    status: SectionStatus,
+    source: str,
+    provider: str,
+    env_key: str,
+) -> str:
+    if status is SectionStatus.UNKNOWN and _image_generation_has_invalid_model_reference(cfg):
+        return "invalid image provider/model reference"
+    if status is SectionStatus.UNKNOWN and provider:
+        try:
+            get_image_generation_provider_setup_spec(provider)
+        except KeyError:
+            return _with_provider(provider, "unknown image provider")
+    if status is SectionStatus.DEGRADED:
+        for candidate_provider in _configured_image_generation_provider_ids(cfg):
+            if _image_generation_endpoint_is_valid(cfg, candidate_provider) is False:
+                return _with_provider(
+                    candidate_provider,
+                    "invalid image endpoint; use an absolute http:// or https:// URL",
+                )
+            conflicting_provider = _image_generation_endpoint_conflict_provider(
+                cfg,
+                candidate_provider,
+            )
+            if conflicting_provider is not None:
+                return _with_provider(
+                    candidate_provider,
+                    "endpoint/provider mismatch: "
+                    f"configured {conflicting_provider} official endpoint",
+                )
+            if _image_generation_llm_key_reusable(cfg, candidate_provider) is False:
+                return _with_provider(
+                    candidate_provider,
+                    "LLM key cannot be reused across image endpoint origins",
+                )
+    return _with_provider(
+        provider,
+        (
+            "same provider key"
+            if source == "llm_fallback"
+            else _source_detail(source, env_key)
+        ),
+    )
 
 
 def _memory_embedding_annotations(
@@ -958,13 +1011,12 @@ def get_onboarding_status(
         "router": _router_detail(config, llm_source),
         "ensemble": _ensemble_detail(config),
         "search": _source_detail(search_source, search_env_key),
-        "image_generation": _with_provider(
+        "image_generation": _image_generation_detail(
+            config,
+            image_status,
+            image_source,
             image_provider,
-            (
-                "same provider key"
-                if image_source == "llm_fallback"
-                else _source_detail(image_source, image_env_key)
-            ),
+            image_env_key,
         ),
         "audio": _with_provider(
             audio_provider,
