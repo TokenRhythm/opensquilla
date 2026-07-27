@@ -75,6 +75,7 @@ interface ProviderPanelContract {
   selectedStoredProfile: boolean
   editingNew: boolean
   profileSaveSupported: boolean
+  primaryProviderRemovalSupported: boolean
   routingEnabled: boolean
   routerEnabled: boolean
   routerBinding: 'follow_primary' | 'custom' | 'legacy'
@@ -772,7 +773,10 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
             {{ t('common.edit') }}
           </button>
           <button
-            v-if="panel.profileSaveSupported"
+            v-if="
+              panel.profileSaveSupported
+              && (!provider.active || panel.primaryProviderRemovalSupported)
+            "
             type="button"
             class="btn btn--ghost setup-provider-card__action setup-provider-card__delete"
             :aria-label="`${t('setup.provider.removeConfirmPrimary')} — ${provider.label}`"

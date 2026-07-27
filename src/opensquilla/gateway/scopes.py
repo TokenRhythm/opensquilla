@@ -314,6 +314,7 @@ METHOD_SCOPES: dict[str, str] = {
     "onboarding.llmProfile.upsert": ADMIN_SCOPE,
     "onboarding.llmProfile.credential.clear": ADMIN_SCOPE,
     "onboarding.llmProfile.remove": ADMIN_SCOPE,
+    "onboarding.llmProfile.active.remove": ADMIN_SCOPE,
     "onboarding.llmProfile.activate": ADMIN_SCOPE,
     "onboarding.llmProfile.probe": ADMIN_SCOPE,
     "onboarding.llmProfile.models.discover": ADMIN_SCOPE,

@@ -109,6 +109,21 @@ class LlmProfileActivationError(ValueError):
         super().__init__(message or reason)
 
 
+class LlmProfileRemovalError(ValueError):
+    """Stable, secret-free validation failure for atomic active-profile removal."""
+
+    def __init__(
+        self,
+        reason: str,
+        message: str | None = None,
+        *,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        self.reason = reason
+        self.details = dict(details or {})
+        super().__init__(message or reason)
+
+
 def _clone(cfg: GatewayConfig) -> GatewayConfig:
     new_cfg = cfg.model_copy(deep=True)
     inherit_runtime_secrets(cfg, new_cfg)
@@ -2451,6 +2466,66 @@ def activate_llm_profile(
             "previousProvider": previous_provider,
             "active": True,
             "routerBinding": new_cfg.squilla_router.preset_binding or "legacy",
+        },
+    )
+
+
+def remove_active_llm_profile(
+    config: GatewayConfig,
+    *,
+    provider_id: str,
+    replacement_provider_id: str,
+    replacement_model: str | None = None,
+    router_action: str | None = None,
+) -> MutationResult:
+    """Atomically promote a replacement and remove the previous primary.
+
+    Both component mutations are pure.  The caller receives a final candidate
+    only when activation and removal both succeed, so the RPC layer can persist
+    the whole operation once and leave disk/runtime state untouched on failure.
+    """
+
+    provider = str(provider_id or "").strip().lower()
+    active = str(config.llm.provider or "").strip().lower()
+    if not provider or provider != active:
+        raise LlmProfileRemovalError(
+            "active_mismatch",
+            f"provider {provider!r} is not the active LLM provider",
+            details={"activeProvider": active},
+        )
+
+    replacement = str(replacement_provider_id or "").strip().lower()
+    if not replacement or replacement == provider:
+        raise LlmProfileRemovalError(
+            "invalid_replacement",
+            "replacement provider must differ from the active provider",
+        )
+
+    activated = activate_llm_profile(
+        config,
+        provider_id=replacement,
+        model=replacement_model,
+        router_action=router_action,
+    )
+    references = _profile_reference_labels(activated.config, provider)
+    if references:
+        raise LlmProfileRemovalError(
+            "profile_referenced",
+            f"LLM profile {provider!r} is still referenced by: {', '.join(references)}",
+            details={"references": references},
+        )
+
+    removed = remove_llm_profile(activated.config, provider_id=provider)
+    return MutationResult(
+        config=removed.config,
+        changed=activated.changed or removed.changed,
+        restart_required=activated.restart_required or removed.restart_required,
+        warnings=[*activated.warnings, *removed.warnings],
+        public_payload={
+            "removedProvider": provider,
+            "removed": True,
+            "activeProvider": replacement,
+            "activeModel": removed.config.llm.model,
         },
     )
 

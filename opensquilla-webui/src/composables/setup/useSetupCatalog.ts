@@ -1356,6 +1356,10 @@ const profileSaveSupported = computed(() => (
   typeof rpc.supportsMethod !== 'function'
   || rpc.supportsMethod('onboarding.llmProfile.upsert')
 ))
+const primaryProviderRemovalSupported = computed(() => (
+  typeof rpc.supportsMethod !== 'function'
+  || rpc.supportsMethod('onboarding.llmProfile.active.remove')
+))
 const providerPanel = computed(() => {
   const panel = providerFormPanel.value
   return {
@@ -1376,6 +1380,7 @@ const providerPanel = computed(() => {
     ),
     credentialRemovalPending: providerCredentialRemovalPending.value,
     profileSaveSupported: profileSaveSupported.value,
+    primaryProviderRemovalSupported: primaryProviderRemovalSupported.value,
   }
 })
 
@@ -2341,6 +2346,7 @@ async function removeProviderProfile(providerId: string) {
   // Router/Ensemble deployment status is not proof that an llm_profile exists,
   // so never show a confirmation or issue a destructive RPC for it.
   if (!row.active && !storedProfileIds.value.has(provider)) return
+  if (row.active && !primaryProviderRemovalSupported.value) return
   const replacement = row.active
     ? configuredProviders.value.find(item => (
         normalizeProviderId(item.providerId) !== provider
@@ -2366,15 +2372,23 @@ async function removeProviderProfile(providerId: string) {
   if (!ok) return
   try {
     if (row.active && replacement) {
-      await rpc.call('onboarding.llmProfile.activate', {
-        providerId: replacement.providerId,
+      await rpc.call('onboarding.llmProfile.active.remove', {
+        providerId: provider,
+        replacementProviderId: replacement.providerId,
       })
+    } else {
+      await rpc.call('onboarding.llmProfile.remove', { providerId: provider })
     }
-    await rpc.call('onboarding.llmProfile.remove', { providerId: provider })
     pushToast(t('setup.toast.providerProfileRemoved', { provider: providerCatalogLabel(provider) }))
     await loadData()
   } catch (err) {
     pushToast(saveFailedMessage(err), { tone: 'danger' })
+    // A transport failure can arrive after the gateway committed the atomic
+    // mutation but before its response reached this tab. Reconcile the saved
+    // provider list without discarding unrelated settings drafts.
+    if (row.active) {
+      await loadData({ preserveFormDrafts: true })
+    }
   }
 }
 

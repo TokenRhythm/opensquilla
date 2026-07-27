@@ -52,7 +52,7 @@
               ref="closeBtn"
               type="button"
               class="btn btn--icon btn--ghost settings-modal__close"
-              :disabled="saveAllPending"
+              :disabled="hasPendingSettingsWrite"
               :aria-label="t('common.close')"
               :title="t('common.close')"
               @click="requestClose()"
@@ -393,6 +393,36 @@ const dirtyDiscardLabel = computed(() => {
   return t('common.discard')
 })
 const displayConfigPath = computed(() => configPath.value || '~/.opensquilla/config.toml')
+// Provider drafts deliberately stay out of the settings-wide dirty bar because
+// their editor owns Save/Cancel. They still participate in every path that
+// unmounts Settings so browser navigation cannot silently discard credentials.
+const hasSettingsExitDraft = computed(() => (
+  hasUnsavedChanges.value || providerDraftDirty.value
+))
+const hasPendingSettingsWrite = computed(() => (
+  saveAllPending.value || providerSavePending.value
+))
+const shouldGuardBrowserUnload = computed(() => (
+  hasSettingsExitDraft.value || hasPendingSettingsWrite.value
+))
+
+function onBeforeUnload(event: BeforeUnloadEvent) {
+  if (!shouldGuardBrowserUnload.value) return
+  event.preventDefault()
+  event.returnValue = ''
+}
+
+let beforeUnloadAttached = false
+function setBeforeUnloadAttached(attached: boolean) {
+  if (attached === beforeUnloadAttached) return
+  beforeUnloadAttached = attached
+  if (attached) {
+    window.addEventListener('beforeunload', onBeforeUnload)
+  } else {
+    window.removeEventListener('beforeunload', onBeforeUnload)
+  }
+}
+watch(shouldGuardBrowserUnload, setBeforeUnloadAttached, { immediate: true })
 
 // Where to return when the overlay closes. Captured on open from the route the
 // user came from; null for a cold deep link (the overlay route was the entry
@@ -574,8 +604,8 @@ function confirmDiscard(): Promise<boolean> {
 
 // Closes unless a section carries unsaved edits and the user keeps them.
 async function requestClose(): Promise<boolean> {
-  if (saveAllPending.value) return false
-  if (hasUnsavedChanges.value && !(await confirmDiscard())) return false
+  if (hasPendingSettingsWrite.value) return false
+  if (hasSettingsExitDraft.value && !(await confirmDiscard())) return false
   closeOverlay()
   return true
 }
@@ -592,8 +622,8 @@ async function requestClose(): Promise<boolean> {
 const removeLeaveGuard = router.beforeEach(async (to) => {
   if (closing) return true
   if (to.path === '/settings' || to.path.startsWith('/settings/')) return true
-  if (saveAllPending.value) return false
-  if (!hasUnsavedChanges.value) return true
+  if (hasPendingSettingsWrite.value) return false
+  if (!hasSettingsExitDraft.value) return true
   // requestClose already has the prompt up — hold this navigation instead of
   // stacking a second prompt (useConfirm cancels a pending request).
   if (confirmState.value) return false
@@ -676,6 +706,7 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  setBeforeUnloadAttached(false)
   removeLeaveGuard()
   document.removeEventListener('keydown', onDocumentKeydown)
   mq?.removeEventListener('change', onViewportChange)

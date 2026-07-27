@@ -626,6 +626,83 @@ async def _llm_profile_remove(params: Any, ctx: RpcContext) -> dict[str, Any]:
     }
 
 
+@_d.method("onboarding.llmProfile.active.remove", scope="operator.admin")
+async def _llm_profile_active_remove(params: Any, ctx: RpcContext) -> dict[str, Any]:
+    """Atomically replace and remove the current primary provider."""
+    from opensquilla.onboarding.mutations import (
+        LlmProfileActivationError,
+        LlmProfileRemovalError,
+        remove_active_llm_profile,
+    )
+
+    provider_id = str(_require(params, "providerId"))
+    replacement_provider_id = str(_require(params, "replacementProviderId"))
+    replacement_model = str(_param(params, "replacementModel", "") or "")
+    router_action = str(_param(params, "routerAction", "preserve"))
+    cfg = _active_config(ctx)
+    try:
+        res = remove_active_llm_profile(
+            cfg,
+            provider_id=provider_id,
+            replacement_provider_id=replacement_provider_id,
+            replacement_model=replacement_model,
+            router_action=router_action,
+        )
+    except LlmProfileActivationError as exc:
+        code_by_reason = {
+            "primary_pool_unsupported": (
+                "onboarding.llmProfile.primary_pool_unsupported"
+            ),
+            "router_provider_conflict": (
+                "onboarding.llmProfile.router_provider_conflict"
+            ),
+        }
+        raise RpcHandlerError(
+            code_by_reason.get(exc.reason, "onboarding.llmProfile.invalid"),
+            str(exc),
+            details={
+                "reason": exc.reason,
+                "providerId": provider_id.strip().lower(),
+                "replacementProviderId": replacement_provider_id.strip().lower(),
+                **exc.details,
+            },
+        ) from exc
+    except LlmProfileRemovalError as exc:
+        code_by_reason = {
+            "active_mismatch": "onboarding.llmProfile.active_mismatch",
+            "profile_referenced": "onboarding.llmProfile.referenced",
+        }
+        raise RpcHandlerError(
+            code_by_reason.get(exc.reason, "onboarding.llmProfile.invalid"),
+            str(exc),
+            details={
+                "reason": exc.reason,
+                "providerId": provider_id.strip().lower(),
+                "replacementProviderId": replacement_provider_id.strip().lower(),
+                **exc.details,
+            },
+        ) from exc
+    except (ValueError, KeyError) as exc:
+        raise RpcHandlerError("onboarding.llmProfile.invalid", str(exc)) from exc
+
+    # This is the sole transaction boundary for the composite mutation.
+    # Activation/removal remain pure until the complete candidate is durable.
+    config_path = _persist(ctx, res.config, restart_required=res.restart_required)
+    _apply_inplace(ctx, res.config)
+    _sync_provider_selector(ctx, res.config.llm)
+    _sync_image_generation(res.config)
+    from opensquilla.gateway.model_catalog_refresh import refresh_live_model_catalog
+
+    await refresh_live_model_catalog(ctx.config if ctx.config is not None else res.config)
+    return {
+        "changed": res.changed,
+        "restartRequired": res.restart_required,
+        "configPath": config_path,
+        "entry": res.public_payload,
+        "warnings": res.warnings,
+    }
+
+
 @_d.method("onboarding.llmProfile.activate", scope="operator.admin")
 async def _llm_profile_activate(params: Any, ctx: RpcContext) -> dict[str, Any]:
     """Promote one stored profile without moving secrets through the client."""

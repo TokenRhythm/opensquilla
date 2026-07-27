@@ -49,6 +49,7 @@ function panel(overrides: Record<string, unknown> = {}) {
     selectedStoredProfile: false,
     editingNew: false,
     profileSaveSupported: true,
+    primaryProviderRemovalSupported: true,
     routingEnabled: false,
     routerEnabled: false,
     routerBinding: 'legacy',
@@ -738,6 +739,22 @@ describe('SetupProviderPanel — configured provider management', () => {
     const { app, el } = await mountPanel({ profileSaveSupported: false })
 
     expect(el.querySelector('.setup-provider-card__delete')).toBeNull()
+
+    app.unmount()
+  })
+
+  it('hides only the active delete action when atomic removal is unsupported', async () => {
+    const { app, el } = await mountPanel({
+      configuredProviders: configured,
+      primaryProviderRemovalSupported: false,
+    })
+
+    expect(
+      el.querySelector('[data-provider-id="openai"] .setup-provider-card__delete'),
+    ).toBeNull()
+    expect(
+      el.querySelector('[data-provider-id="deepseek"] .setup-provider-card__delete'),
+    ).not.toBeNull()
 
     app.unmount()
   })

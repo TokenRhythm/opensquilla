@@ -190,11 +190,12 @@ const allCommands = computed<Command[]>(() => {
   // palette tracks the route taxonomy instead of a hardcoded path list (which
   // silently dropped promoted routes and double-listed demoted ones).
   for (const item of getWorkNavigationSection()) {
+    const searchAliases = item.path === '/usage' ? ' usage 用量' : ''
     out.push({
       id: `nav:${item.path}`,
       title: item.title,
       icon: item.icon,
-      keywords: `${item.title} ${item.path}`.toLowerCase(),
+      keywords: `${item.title} ${item.path}${searchAliases}`.toLowerCase(),
       group: 'Work',
       run: navTo(item.path),
     })
@@ -214,10 +215,9 @@ const allCommands = computed<Command[]>(() => {
     }
   }
 
-  // Usage and diagnostic Logs remain directly reachable without promoting
-  // either back into the rail; the Overview command already opens Status.
+  // Diagnostic Logs remains directly reachable without promoting it back into
+  // the rail; the Overview command already opens Status.
   const demoted: Array<{ path: string; name: string; icon: IconName; group: string }> = [
-    { path: '/usage', name: 'usage', icon: 'usage', group: 'Observe' },
     { path: '/logs', name: 'logs', icon: 'logs', group: 'Observe' },
   ]
   for (const item of demoted) {
