@@ -846,7 +846,7 @@ async function uninstallSkillAndClose(name: string) {
 .sk-github-install {
   display: flex;
   align-items: center;
-  gap: var(--sp-2);
+  gap: var(--sp-2) 0;
   flex-wrap: wrap;
 }
 .sk-registry__results {
