@@ -32,11 +32,13 @@ export const sharedRoutes: RouteRecordRaw[] = [
   { path: '/chat',      name: 'chat',      component: ChatView,      meta: { title: 'Chat', group: 'Work', icon: 'chat', nav: 'primary', navOrder: 10, platforms: ['web', 'desktop'] } },
   // Draft state: a clean composer with no session key until the first send.
   { path: '/chat/new',  name: 'chat-new',  component: ChatView,      meta: { title: 'Chat', group: 'Work', icon: 'chat', platforms: ['web', 'desktop'] } },
-  { path: '/sessions',  name: 'sessions',  component: SessionsView,  meta: { title: 'Sessions', group: 'Work', icon: 'sessions', nav: 'primary', navOrder: 20, platforms: ['web', 'desktop'], keepAlive: true } },
+  // The task ledger remains available for deep links; New task plus the recent
+  // task list own the primary sidebar flow.
+  { path: '/sessions',  name: 'sessions',  component: SessionsView,  meta: { title: 'Sessions', group: 'Work', icon: 'sessions', platforms: ['web', 'desktop'], keepAlive: true } },
   // Status and Usage share the Overview destination. Runtime logs remain a
   // kept-alive diagnostic deep link rather than a peer navigation tab.
-  { path: '/overview',  name: 'overview',  component: OverviewHubView, meta: { title: 'Status', titleKey: 'nav.status', group: 'Work', icon: 'home', nav: 'primary', navOrder: 30, navLabelKey: 'nav.overview', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'overview-hub' } },
-  { path: '/usage',     name: 'usage',     component: OverviewHubView, meta: { title: 'Usage', icon: 'usage', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'overview-hub' } },
+  { path: '/overview',  name: 'overview',  component: OverviewHubView, meta: { title: 'Status', titleKey: 'nav.status', icon: 'home', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'overview-hub' } },
+  { path: '/usage',     name: 'usage',     component: OverviewHubView, meta: { title: 'Usage', group: 'Work', icon: 'usage', nav: 'primary', navOrder: 60, navLabelKey: 'nav.viewUsage', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'overview-hub' } },
   { path: '/logs',      name: 'logs',      component: LogsView, meta: { title: 'Logs', icon: 'logs', platforms: ['web', 'desktop'], keepAlive: true } },
   // Approvals retired as a front-end destination: the pending queue resolves
   // inline in the chat transcript (ApprovalCard) and via the topbar interrupt
