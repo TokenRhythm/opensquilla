@@ -1,11 +1,18 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createApp, defineComponent, h, nextTick, type App } from 'vue'
+import { createApp, defineComponent, h, nextTick, ref, type App } from 'vue'
 import { createI18n } from 'vue-i18n'
+import type { SandboxPathListResponse } from '@/types/rpc'
 import ProjectWorkspacePickerDialog from './ProjectWorkspacePickerDialog.vue'
 
+const PICKER_KEY = 'agent:main:webchat:picker'
+
 const mocks = vi.hoisted(() => ({
-  platform: { files: {} as { chooseProjectDirectory?: () => Promise<{ path: string } | null> } },
+  platform: {
+    files: {} as {
+      chooseProjectDirectory?: () => Promise<{ path: string } | null>
+    },
+  },
   rpcCall: vi.fn(),
 }))
 
@@ -33,19 +40,69 @@ function i18n() {
           projectPath: 'Project path',
           browse: 'Browse',
           choose: 'Choose',
+          goToPath: 'Go to path',
+          parentDirectory: 'Parent directory',
+          retryDirectoryPicker: 'Retry',
+          directoryPickerFailed: 'Directory picker failed: {error}',
+          chooseSelectedDirectory: 'Choose selected directory',
         },
       },
     },
   })
 }
 
-async function mountPicker() {
+function pathResult(
+  currentPath: string,
+  children: Array<string | {
+    path: string
+    kind?: 'directory' | 'file'
+    selectable?: boolean
+  }>,
+): SandboxPathListResponse {
+  const parent = currentPath === '/'
+    ? null
+    : currentPath.replace(/[\\/][^\\/]+$/, '') || '/'
+  return {
+    currentPath,
+    path: currentPath,
+    parentPath: parent,
+    entries: children.map(child => {
+      const item = typeof child === 'string' ? { path: child } : child
+      const segments = item.path.split(/[\\/]/)
+      return {
+        name: segments[segments.length - 1] || item.path,
+        path: item.path,
+        kind: item.kind ?? 'directory',
+        selectable: item.selectable ?? true,
+      }
+    }),
+  }
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((ok, fail) => {
+    resolve = ok
+    reject = fail
+  })
+  return { promise, resolve, reject }
+}
+
+async function flushPromises() {
+  await new Promise(resolve => setTimeout(resolve, 0))
+  await nextTick()
+}
+
+async function mountPicker(options: { initialPath?: string } = {}) {
   const events = { close: vi.fn(), choose: vi.fn() }
+  const open = ref(true)
   const host = document.createElement('div')
   document.body.appendChild(host)
   const Root = defineComponent(() => () => h(ProjectWorkspacePickerDialog, {
-    open: true,
-    sessionKey: 'agent:main:webchat:picker',
+    open: open.value,
+    sessionKey: PICKER_KEY,
+    initialPath: options.initialPath,
     onClose: events.close,
     onChoose: events.choose,
   }))
@@ -54,8 +111,39 @@ async function mountPicker() {
   app.mount(host)
   mountedApps.push(app)
   await nextTick()
-  await nextTick()
-  return { host, events }
+  return {
+    events,
+    async setOpen(value: boolean) {
+      open.value = value
+      await nextTick()
+    },
+  }
+}
+
+function locationInput(): HTMLInputElement {
+  const input = document.querySelector<HTMLInputElement>('[aria-label="Project path"]')
+  if (!input) throw new Error('Missing project path input')
+  return input
+}
+
+function setLocation(value: string) {
+  const input = locationInput()
+  input.value = value
+  input.dispatchEvent(new Event('input', { bubbles: true }))
+}
+
+function button(label: string): HTMLButtonElement {
+  const match = [...document.querySelectorAll<HTMLButtonElement>('button')]
+    .find(candidate => candidate.textContent?.trim() === label)
+  if (!match) throw new Error(`Missing button: ${label}`)
+  return match
+}
+
+function option(label: string): HTMLButtonElement {
+  const match = [...document.querySelectorAll<HTMLButtonElement>('[role="option"]')]
+    .find(candidate => candidate.textContent?.trim() === label)
+  if (!match) throw new Error(`Missing option: ${label}`)
+  return match
 }
 
 beforeEach(() => {
@@ -69,11 +157,173 @@ afterEach(() => {
 })
 
 describe('ProjectWorkspacePickerDialog', () => {
-  it('uses the native desktop picker and treats cancellation as a no-op', async () => {
+  it('omits the initial web path and exposes only selectable directories', async () => {
+    mocks.rpcCall.mockResolvedValue(pathResult('/repos', [
+      '/repos/project-a',
+      { path: '/repos/not-selectable', selectable: false },
+      { path: '/repos/readme.txt', kind: 'file' },
+    ]))
+
+    await mountPicker()
+    await flushPromises()
+
+    expect(mocks.rpcCall).toHaveBeenCalledWith('sandbox.path.list', {
+      sessionKey: PICKER_KEY,
+      kind: 'workspace',
+    })
+    expect(document.body.textContent).toContain('project-a')
+    expect(document.body.textContent).not.toContain('not-selectable')
+    expect(document.body.textContent).not.toContain('readme.txt')
+    expect(locationInput().value).toBe('/repos')
+    expect(button('Choose selected directory').disabled).toBe(false)
+  })
+
+  it('selects on click and browses only on double click', async () => {
+    mocks.rpcCall
+      .mockResolvedValueOnce(pathResult('/repos', ['/repos/a']))
+      .mockResolvedValueOnce(pathResult('/repos/a', []))
+    await mountPicker()
+    await flushPromises()
+
+    const entry = option('a')
+    entry.click()
+    await nextTick()
+    expect(mocks.rpcCall).toHaveBeenCalledTimes(1)
+    expect(entry.getAttribute('aria-selected')).toBe('true')
+
+    entry.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+    await flushPromises()
+    expect(mocks.rpcCall).toHaveBeenLastCalledWith('sandbox.path.list', {
+      sessionKey: PICKER_KEY,
+      path: '/repos/a',
+      kind: 'workspace',
+    })
+    expect(locationInput().value).toBe('/repos/a')
+  })
+
+  it('ignores an older browse response that resolves last', async () => {
+    const first = deferred<SandboxPathListResponse>()
+    const second = deferred<SandboxPathListResponse>()
+    mocks.rpcCall.mockResolvedValueOnce(pathResult('/repos', ['/repos/a', '/repos/b']))
+    await mountPicker()
+    await flushPromises()
+    mocks.rpcCall.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise)
+
+    setLocation('/repos/a')
+    button('Go to path').click()
+    await nextTick()
+    setLocation('/repos/b')
+    button('Go to path').click()
+    second.resolve(pathResult('/repos/b', []))
+    first.resolve(pathResult('/repos/a', []))
+    await flushPromises()
+
+    expect(locationInput().value).toBe('/repos/b')
+  })
+
+  it('uses the current directory as the base for relative locations', async () => {
+    mocks.rpcCall
+      .mockResolvedValueOnce(pathResult('/repos', []))
+      .mockResolvedValueOnce(pathResult('/repos/child', []))
+    await mountPicker()
+    await flushPromises()
+
+    setLocation('child')
+    button('Go to path').click()
+    await flushPromises()
+
+    expect(mocks.rpcCall).toHaveBeenLastCalledWith('sandbox.path.list', {
+      sessionKey: PICKER_KEY,
+      path: 'child',
+      basePath: '/repos',
+      kind: 'workspace',
+    })
+  })
+
+  it('browses the real parent returned by the gateway', async () => {
+    mocks.rpcCall
+      .mockResolvedValueOnce(pathResult('/repos/a', []))
+      .mockResolvedValueOnce(pathResult('/repos', ['/repos/a']))
+    await mountPicker({ initialPath: '/repos/a' })
+    await flushPromises()
+
+    button('Parent directory').click()
+    await flushPromises()
+
+    expect(mocks.rpcCall).toHaveBeenLastCalledWith('sandbox.path.list', {
+      sessionKey: PICKER_KEY,
+      path: '/repos',
+      kind: 'workspace',
+    })
+  })
+
+  it('keeps the prior entries and selection when the latest browse fails', async () => {
+    mocks.rpcCall
+      .mockResolvedValueOnce(pathResult('/repos', ['/repos/a']))
+      .mockRejectedValueOnce(new Error('not readable'))
+    const { events } = await mountPicker()
+    await flushPromises()
+    option('a').click()
+    await nextTick()
+
+    setLocation('/missing')
+    button('Go to path').click()
+    await flushPromises()
+
+    expect(document.body.textContent).toContain('not readable')
+    expect(option('a').getAttribute('aria-selected')).toBe('true')
+    expect(button('Choose selected directory').disabled).toBe(false)
+    button('Choose selected directory').click()
+    expect(events.choose).toHaveBeenCalledWith('/repos/a')
+  })
+
+  it('invalidates a pending response across close and reopen', async () => {
+    const stale = deferred<SandboxPathListResponse>()
+    const fresh = deferred<SandboxPathListResponse>()
+    mocks.rpcCall.mockReturnValueOnce(stale.promise).mockReturnValueOnce(fresh.promise)
+    const picker = await mountPicker()
+
+    await picker.setOpen(false)
+    await picker.setOpen(true)
+    fresh.resolve(pathResult('/fresh', []))
+    stale.resolve(pathResult('/stale', []))
+    await flushPromises()
+
+    expect(locationInput().value).toBe('/fresh')
+  })
+
+  it('browses a selected directory from the keyboard', async () => {
+    mocks.rpcCall
+      .mockResolvedValueOnce(pathResult('/repos', ['/repos/a']))
+      .mockResolvedValueOnce(pathResult('/repos/a', []))
+    await mountPicker()
+    await flushPromises()
+
+    const entry = option('a')
+    entry.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+    await flushPromises()
+
+    expect(mocks.rpcCall).toHaveBeenCalledTimes(2)
+    expect(locationInput().value).toBe('/repos/a')
+  })
+
+  it('disables choosing while a browse request is pending', async () => {
+    const pending = deferred<SandboxPathListResponse>()
+    mocks.rpcCall.mockReturnValueOnce(pending.promise)
+    await mountPicker()
+    await nextTick()
+
+    expect(button('Choose selected directory').disabled).toBe(true)
+
+    pending.resolve(pathResult('/repos', []))
+    await flushPromises()
+    expect(button('Choose selected directory').disabled).toBe(false)
+  })
+
+  it('uses the native desktop picker and closes on cancellation', async () => {
     mocks.platform.files.chooseProjectDirectory = vi.fn(async () => null)
     const { events } = await mountPicker()
-
-    await new Promise(resolve => setTimeout(resolve, 0))
+    await flushPromises()
 
     expect(mocks.platform.files.chooseProjectDirectory).toHaveBeenCalledOnce()
     expect(events.choose).not.toHaveBeenCalled()
@@ -81,24 +331,32 @@ describe('ProjectWorkspacePickerDialog', () => {
     expect(mocks.rpcCall).not.toHaveBeenCalled()
   })
 
-  it('browses gateway-host directories on web', async () => {
-    mocks.rpcCall.mockResolvedValue({
-      path: 'D:\\repos',
-      entries: [
-        { name: 'project-a', path: 'D:\\repos\\project-a', kind: 'directory', selectable: true },
-      ],
-    })
-    await mountPicker()
-    await new Promise(resolve => setTimeout(resolve, 0))
+  it('shows native rejection and retries natively without web fallback', async () => {
+    mocks.platform.files.chooseProjectDirectory = vi.fn()
+      .mockRejectedValueOnce(new Error('native unavailable'))
+      .mockResolvedValueOnce({ path: '/repos/native' })
+    const { events } = await mountPicker()
+    await flushPromises()
 
-    expect(mocks.rpcCall).toHaveBeenCalledWith('sandbox.path.list', {
-      sessionKey: 'agent:main:webchat:picker',
-      path: '.',
-      kind: 'workspace',
-      browseChildren: true,
-    })
-    expect(document.body.textContent).toContain('project-a')
-    expect(document.querySelector('input')?.getAttribute('aria-label')).toBe('Project path')
-    expect(document.querySelector('[role="option"]')?.getAttribute('aria-selected')).toBe('false')
+    expect(document.body.textContent).toContain('native unavailable')
+    expect(mocks.rpcCall).not.toHaveBeenCalled()
+    button('Retry').click()
+    await flushPromises()
+
+    expect(mocks.platform.files.chooseProjectDirectory).toHaveBeenCalledTimes(2)
+    expect(events.choose).toHaveBeenCalledWith('/repos/native')
+    expect(mocks.rpcCall).not.toHaveBeenCalled()
+  })
+
+  it('allows cancelling after a native picker rejection', async () => {
+    mocks.platform.files.chooseProjectDirectory = vi.fn()
+      .mockRejectedValue(new Error('native unavailable'))
+    const { events } = await mountPicker()
+    await flushPromises()
+
+    button('Cancel').click()
+
+    expect(events.close).toHaveBeenCalledOnce()
+    expect(mocks.rpcCall).not.toHaveBeenCalled()
   })
 })
