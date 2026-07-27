@@ -459,6 +459,10 @@ useDialogA11y(
   flex: 0 0 auto;
 }
 .project-picker__browser {
+  min-height: 180px;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   overflow: hidden;
@@ -474,8 +478,12 @@ useDialogA11y(
   background: color-mix(in srgb, var(--bg-elevated) 60%, var(--bg-surface));
 }
 .project-picker__entries {
-  min-height: 180px;
-  overflow: auto;
+  min-height: 0;
+  flex: 1;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   padding: var(--sp-1);
 }
 .project-picker__create {

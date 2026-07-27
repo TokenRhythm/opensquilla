@@ -104,12 +104,20 @@ async function installProjectLifecycleRpc(
             currentPath: '/repos',
             path: '/repos',
             parentPath: '/',
-            entries: [{
-              name: 'demo',
-              path: '/repos/demo',
-              kind: 'directory',
-              selectable: true,
-            }],
+            entries: [
+              {
+                name: 'demo',
+                path: '/repos/demo',
+                kind: 'directory',
+                selectable: true,
+              },
+              ...Array.from({ length: 40 }, (_, index) => ({
+                name: `project-${String(index + 1).padStart(2, '0')}`,
+                path: `/repos/project-${String(index + 1).padStart(2, '0')}`,
+                kind: 'directory',
+                selectable: true,
+              })),
+            ],
           })
           return
         case 'workspaces.open':
@@ -216,6 +224,31 @@ async function installProjectLifecycleRpc(
 }
 
 test.describe('Project workspaces', () => {
+  test('keeps a long project directory list scrollable', async ({ page }) => {
+    await installProjectLifecycleRpc(page)
+    await openControl(page)
+
+    await page
+      .locator('.sidebar-actions')
+      .getByRole('button', { name: 'Choose project' })
+      .click()
+
+    const picker = page.getByRole('dialog', { name: 'Choose project' })
+    const list = picker.locator('.project-picker__entries')
+    await expect(picker.getByRole('option')).toHaveCount(41)
+
+    const metrics = await list.evaluate(element => ({
+      clientHeight: element.clientHeight,
+      scrollHeight: element.scrollHeight,
+    }))
+    expect(metrics.scrollHeight).toBeGreaterThan(metrics.clientHeight)
+
+    await list.evaluate(element => {
+      element.scrollTop = element.scrollHeight
+    })
+    await expect.poll(() => list.evaluate(element => element.scrollTop)).toBeGreaterThan(0)
+  })
+
   test('offers project selection from both the sidebar and an ordinary draft', async ({ page }) => {
     await openControl(page)
 
