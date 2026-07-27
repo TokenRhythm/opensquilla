@@ -80,10 +80,8 @@ def test_failed_write_leaves_original_bytes_untouched(tmp_path, monkeypatch) -> 
 
     real_replace = os.replace
 
-    def failing_replace(src, dst, *args, **kwargs):
-        if str(dst) == str(target):
-            raise OSError("simulated mid-write failure")
-        return real_replace(src, dst, *args, **kwargs)
+    def failing_replace(*args, **kwargs):
+        raise OSError("simulated mid-write failure")
 
     monkeypatch.setattr(os, "replace", failing_replace)
     with pytest.raises(OSError):
