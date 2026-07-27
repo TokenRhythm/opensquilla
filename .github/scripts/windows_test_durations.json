@@ -1169,7 +1169,7 @@
     "tests/test_gateway/test_agent_tasks.py": 0.01,
     "tests/test_gateway/test_project_workspace_execution.py": 0.01,
     "tests/test_gateway/test_rpc_workspaces.py": 0.01,
-    "tests/test_migrations/test_v025_project_workspaces.py": 0.01,
+    "tests/test_migrations/test_v028_project_workspaces.py": 0.01,
     "tests/test_sandbox/test_stale_approval_authority.py": 0.01,
     "tests/test_session/test_project_workspace_storage.py": 0.01,
     "tests/test_gateway/test_windows_directory_picker.py": 0.01
