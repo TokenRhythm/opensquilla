@@ -1907,7 +1907,7 @@ def test_pick_directory_path_uses_native_macos_picker(
 
     def pick_native(initial_dir=None):
         native_picker.calls.append(initial_dir)
-        return "/Users/test/project"
+        return "/Volumes/workspace/project"
 
     class FakeRoot:
         def withdraw(self) -> None:
@@ -1929,10 +1929,10 @@ def test_pick_directory_path_uses_native_macos_picker(
     )
     monkeypatch.setitem(sys.modules, "tkinter", fake_tkinter)
 
-    result = rpc_sandbox._pick_directory_path("/Users/test")
+    result = rpc_sandbox._pick_directory_path("/Volumes/workspace")
 
-    assert result == "/Users/test/project"
-    assert native_picker.calls == ["/Users/test"]
+    assert result == "/Volumes/workspace/project"
+    assert native_picker.calls == ["/Volumes/workspace"]
 
 
 def test_native_macos_picker_returns_path_and_passes_initial_directory_as_argument(
@@ -1947,18 +1947,18 @@ def test_native_macos_picker_returns_path_and_passes_initial_directory_as_argume
         return subprocess.CompletedProcess(
             command,
             returncode=0,
-            stdout="/Users/test/My Project/\n",
+            stdout="/Volumes/workspace/My Project/\n",
             stderr="",
         )
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    result = rpc_sandbox._pick_directory_path_macos("/Users/test")
+    result = rpc_sandbox._pick_directory_path_macos("/Volumes/workspace")
 
-    assert result == "/Users/test/My Project/"
+    assert result == "/Volumes/workspace/My Project/"
     command, kwargs = run_calls[0]
     assert command[:2] == ["osascript", "-e"]
-    assert command[-1] == "/Users/test"
+    assert command[-1] == "/Volumes/workspace"
     assert kwargs == {
         "capture_output": True,
         "check": False,

@@ -431,7 +431,7 @@ describe('ProjectWorkspacePickerDialog', () => {
   it('opens the gateway system picker and immediately chooses its directory', async () => {
     mocks.rpcCall
       .mockResolvedValueOnce(pathResult('/repos', []))
-      .mockResolvedValueOnce({ path: '/Users/test/project' })
+      .mockResolvedValueOnce({ path: '/Volumes/workspace/project' })
     const { events } = await mountPicker()
     await flushPromises()
 
@@ -444,7 +444,7 @@ describe('ProjectWorkspacePickerDialog', () => {
       initialPath: '/repos',
     })
     expect(events.choose).toHaveBeenCalledOnce()
-    expect(events.choose).toHaveBeenCalledWith('/Users/test/project')
+    expect(events.choose).toHaveBeenCalledWith('/Volumes/workspace/project')
   })
 
   it('keeps the web directory browser open when the system picker is cancelled', async () => {
