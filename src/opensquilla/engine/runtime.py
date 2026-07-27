@@ -4923,6 +4923,25 @@ class TurnRunner:
                             sandbox_line,
                         ]
                     )
+                    if normalized_run_mode is RunMode.FULL:
+                        lines.extend(
+                            [
+                                (
+                                    "Host filesystem: all paths writable by the OS account "
+                                    "are directly writable, including paths outside the "
+                                    "workspace."
+                                ),
+                                (
+                                    "Writes outside the workspace do not require OpenSquilla "
+                                    "sandbox approval."
+                                ),
+                                (
+                                    "Do not use sandbox_permissions=require_escalated in Full "
+                                    "Host Access; only normal OS permissions such as SIP or TCC "
+                                    "can still deny access."
+                                ),
+                            ]
+                        )
                 extra["Execution Context"] = "\n".join(lines)
         if ctx.caller_kind is CallerKind.SUBAGENT:
             extra["Subagent Task Protocol"] = _SUBAGENT_TASK_PROTOCOL
