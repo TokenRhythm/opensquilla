@@ -916,18 +916,17 @@ def test_desktop_onboarding_defaults_to_tokenrhythm_with_trusted_registration_ct
     assert 'target="_blank"' in html
     assert 'rel="noopener noreferrer"' in html
     assert 'data-i18n-aria="onboarding.step2.tokenrhythmCtaExternalLabel"' in html
-    assert ".provider-feature-select:focus-visible" in html
-    assert ".provider-disclosure-toggle:focus-visible" in html
+    assert ".provider-promo-cta:focus-visible" in html
+    assert ".provider-combobox-toggle:focus-visible" in html
+    assert ".provider-option:focus-visible" in html
     assert html.rindex("syncProviderDefaults(true);") < html.rindex(
         "applyMigrationPrefill(initialProviderPrefill);"
     )
     for key in (
         "onboarding.step2.tokenrhythmTitle",
-        "onboarding.step2.tokenrhythmValue",
         "onboarding.step2.tokenrhythmRegistration",
         "onboarding.step2.tokenrhythmCta",
         "onboarding.step2.tokenrhythmCtaExternalLabel",
-        "onboarding.step2.otherProviders",
     ):
         assert main_ts.count(f"'{key}':") == 6, key
 
@@ -941,7 +940,7 @@ def test_desktop_onboarding_defaults_to_tokenrhythm_with_trusted_registration_ct
         assert visible_cta in accessible_label
 
 
-def test_desktop_tokenrhythm_onboarding_supports_all_model_routing_modes() -> None:
+def test_desktop_tokenrhythm_single_page_onboarding_defaults_to_router() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
     tokenrhythm_catalog = _section(main_ts, "id: 'tokenrhythm'", "id: 'openrouter'")
     tokenrhythm_profile = _section(main_ts, "  tokenrhythm: {", "  openrouter: {")
@@ -951,8 +950,16 @@ def test_desktop_tokenrhythm_onboarding_supports_all_model_routing_modes() -> No
     assert "ensembleSelectionMode: 'static_tokenrhythm_b5'" in tokenrhythm_catalog
     assert "const INLINE_ROUTER_PROFILE_IDS = new Set(['tokenrhythm'])" in main_ts
     assert "!INLINE_ROUTER_PROFILE_IDS.has(credential.provider)" in main_ts
-    assert "Boolean(selected.ensembleSelectionMode)" in onboarding_html
+    assert "return selected.routerSupported ? 'squilla_router' : 'direct';" in onboarding_html
+    assert (
+        "routerMode.value = modelRoutingMode.value === 'direct' ? 'disabled' : 'recommended';"
+        in onboarding_html
+    )
+    assert "routerTiers = clone(routerProfiles[profileKeyForMode()]);" in onboarding_html
     assert "return provider.value;" in onboarding_html
+    assert "routerDefaultTier: 'c1'," in onboarding_html
+    assert "routerTiers," in onboarding_html
+    assert "[data-model-routing-mode]" not in onboarding_html
     assert "selection_mode = ${tomlString(selectionMode)}" in main_ts
 
     expected_models = (
@@ -2851,14 +2858,18 @@ def test_settings_migration_confirmation_keys_exist_without_onboarding_or_attent
     assert "migrationPreviewRunning:" not in main_ts
 
 
-def test_onboarding_route_never_contains_profile_migration() -> None:
+def test_single_page_onboarding_never_contains_profile_migration() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
     html = _section(main_ts, "function onboardingHtml", "async function runOnboarding")
-    route = _section(html, "function routeSteps()", "function routePosition")
 
     assert "const initialProviderPrefill = ${inlineScriptJson(pendingProviderSetup)};" in html
-    assert "let step = 0;" in html
-    assert "return isSimpleSetup()" in route
+    assert html.count('class="setup-card active" data-screen="1"') == 1
+    assert 'data-screen="0"' not in html
+    assert 'data-screen="2"' not in html
+    assert 'data-screen="3"' not in html
+    assert 'data-screen="4"' not in html
+    assert "function routeSteps()" not in html
+    assert "let step = 0;" not in html
     assert "migrationStepEnabled" not in html
     assert "migrationCandidates" not in html
     assert "OnboardingMigration" not in html
@@ -2878,16 +2889,16 @@ def test_onboarding_inline_json_escapes_script_terminators_and_line_separators()
     for value in (
         "DESKTOP_MESSAGES",
         "ONBOARDING_SCRIPT_MESSAGES",
-        "PROVIDER_NOTE_MESSAGES",
         "SEARCH_PROVIDER_NOTE_MESSAGES",
         "desktopLocale",
         "PROVIDER_CATALOG",
         "SEARCH_PROVIDER_CATALOG",
         "ROUTER_PROFILES",
-        "TEXT_ROUTER_TIERS",
         "pendingProviderSetup",
     ):
         assert f"${{inlineScriptJson({value})}}" in html
+    assert "${inlineScriptJson(PROVIDER_NOTE_MESSAGES)}" not in html
+    assert "${inlineScriptJson(TEXT_ROUTER_TIERS)}" not in html
 
 
 def test_migration_preload_bridge_and_progress_channel() -> None:
