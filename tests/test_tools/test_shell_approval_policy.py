@@ -429,10 +429,12 @@ async def test_exec_command_real_locked_approval_deletes_once_on_host(
 
     monkeypatch.setattr(shell, "_run_backend_with_managed_network", fail_backend)
 
-    result = await shell.exec_command(
-        f"rm -f {target.name}",
-        workdir=str(tmp_path),
+    command = (
+        f'Remove-Item -Force "{target.name}"'
+        if os.name == "nt"
+        else f"rm -f {target.name}"
     )
+    result = await shell.exec_command(command, workdir=str(tmp_path))
 
     assert result.startswith("exit_code=0\n")
     assert target.exists() is False
@@ -765,13 +767,15 @@ async def test_background_process_approved_locked_action_uses_host_once(
         workspace=tmp_path,
     )
     calls: list[tuple[str, str]] = []
+    approved_paths: list[str] = []
     monkeypatch.setenv("PATH", "/approved-path")
 
     async def fake_gate_action(**kwargs: object) -> tuple[object, object, object]:
         calls.append(("gate", str(kwargs["argv"])))
         approved_env = kwargs["env"]
         assert isinstance(approved_env, dict)
-        assert approved_env["PATH"] == "/approved-path"
+        assert approved_env["PATH"].split(os.pathsep, 1)[0] == "/approved-path"
+        approved_paths.append(approved_env["PATH"])
         monkeypatch.setenv("PATH", "/changed-after-approval")
         policy = SimpleNamespace(network=None, network_proxy=None)
         request = SimpleNamespace(
@@ -796,7 +800,7 @@ async def test_background_process_approved_locked_action_uses_host_once(
         calls.append(("host", command))
         host_env = kwargs["env"]
         assert isinstance(host_env, dict)
-        assert host_env["PATH"] == "/approved-path"
+        assert host_env["PATH"] == approved_paths[0]
         return "host-background"
 
     monkeypatch.setattr(shell, "gate_action", fake_gate_action)
