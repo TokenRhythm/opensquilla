@@ -31,7 +31,7 @@ from opensquilla.gateway.origin_guard import (
 from opensquilla.gateway.origin_guard import (
     request_principal_is_owner as _request_principal_is_owner,
 )
-from opensquilla.paths import media_root_from_config
+from opensquilla.paths import media_root_from_config, native_io_path
 
 _OPENABLE_HTML_MIMES = frozenset({"text/html", "application/xhtml+xml"})
 _OPENABLE_HTML_SUFFIXES = frozenset({".html", ".htm", ".xhtml"})
@@ -127,7 +127,7 @@ def _materialize_artifact_for_open(ref: Any, source: Path) -> Path:
     name = _safe_open_filename(str(getattr(ref, "name", "") or "artifact"))
     suffix = _extension_for_open_name(name, str(getattr(ref, "mime", "") or ""))
     destination = root / f"{uuid4()}-{name}{suffix}"
-    shutil.copyfile(source, destination)
+    shutil.copyfile(native_io_path(source), destination)
     try:
         destination.chmod(0o600)
     except OSError:
@@ -187,7 +187,7 @@ def register_artifact_routes(
                 )
                 if thumbnail is not None:
                     _, thumb_path = thumbnail
-                    return FileResponse(thumb_path, media_type="image/webp")
+                    return FileResponse(native_io_path(thumb_path), media_type="image/webp")
         except ArtifactIntegrityError as exc:
             return JSONResponse({"error": str(exc), "code": "INTEGRITY_ERROR"}, status_code=409)
         except (ArtifactNotFoundError, ValueError):
@@ -196,7 +196,7 @@ def register_artifact_routes(
                 status_code=404,
             )
 
-        return FileResponse(path, media_type=ref.mime, filename=ref.name)
+        return FileResponse(native_io_path(path), media_type=ref.mime, filename=ref.name)
 
     async def open_handler(request: Request) -> JSONResponse:
         if not request_origin_allowed(request, config):

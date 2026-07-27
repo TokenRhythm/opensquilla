@@ -185,7 +185,6 @@
       "compatibilityTitle": "Emplacement des anciennes données Agent",
       "compatibilityDesc": "OpenSquilla utilise un emplacement compatible pour les anciennes données Agent. Le changer modifie la source d’identité et de mémoire sans déplacer, fusionner ni supprimer les données.",
       "chooseLegacyAgentData": "Choisir l’emplacement des données Agent",
-      "recoveryTitle": "L’import est indisponible dans un profil de récupération",
       "loadFailed": "OpenSquilla n’a pas pu vérifier les sources d’import.",
       "emptyTitle": "Aucune autre donnée OpenSquilla trouvée",
       "emptyDesc": "Vous pourrez relancer la recherche plus tard. Desktop permet aussi de choisir manuellement un dossier.",
@@ -972,12 +971,12 @@
         },
         "delete-current-profile": {
           "title": "Supprimer le profil actuel",
-          "warning": "Le profil actuel, son identifiant et ses journaux listés sont supprimés. Les autres profils de récupération et sauvegardes sont conservés.",
+          "warning": "Le profil principal listé, ses identifiants et ses journaux sont supprimés. Les sauvegardes enregistrées sont conservées.",
           "apply": "Supprimer le profil"
         },
         "delete-all-user-data": {
           "title": "Supprimer toutes les données utilisateur OpenSquilla",
-          "warning": "Après l’arrêt complet d’OpenSquilla, le profil principal, tous les profils de récupération, identifiants, journaux et sauvegardes sont supprimés.",
+          "warning": "Le profil principal, les identifiants, les journaux et les sauvegardes enregistrées sont supprimés après la fermeture complète d’OpenSquilla.",
           "apply": "Tout supprimer et quitter"
         },
         "inspectFailed": "Impossible d’inspecter les emplacements : {detail}",
@@ -985,7 +984,6 @@
         "inventoryCount": "{existing} des {total} emplacements listés existent actuellement.",
         "inventoryLabel": "Inventaire de nettoyage",
         "primaryProfile": "Profil principal",
-        "recoveryProfile": "Profil de récupération",
         "present": "présent",
         "missing": "absent",
         "blocked": "Le nettoyage est bloqué",
@@ -999,7 +997,7 @@
         "working": "Arrêt de l’environnement local et application du nettoyage confirmé…",
         "resetConfirmTitle": "Réinitialiser les réglages actuels ?",
         "resetConfirmBody": "Le profil actuel revient à la configuration fournisseur tout en conservant l’identité, la mémoire et les discussions.",
-        "partial": "Le nettoyage s’est arrêté en cours de route ({detail}). Les données restantes sont conservées et les options de récupération sont ouvertes.",
+        "partial": "Le nettoyage s’est interrompu ({detail}). OpenSquilla a conservé les données restantes et ouvert les options de réparation.",
         "applyFailed": "Le nettoyage n’a pas démarré : {detail}",
         "deleteAllScheduled": "OpenSquilla va se fermer ; la suppression commencera seulement après l’arrêt complet de l’application.",
         "resetDone": "Les réglages actuels ont été réinitialisés. La configuration fournisseur va se rouvrir.",
@@ -1021,7 +1019,6 @@
       "migrationLabel": "Transfert de données",
       "migrationDesc": "Utiliser les données d’une autre installation OpenSquilla. Vous les vérifierez d’abord ; si Desktop contient déjà des données, elles seront entièrement sauvegardées avant le remplacement.",
       "migrationButton": "Transférer les données d’une autre installation",
-      "migrationRecoveryProfile": "Le transfert de données est indisponible dans un profil de récupération. Revenez au profil principal pour continuer.",
       "migrationNone": "Aucune autre donnée OpenSquilla trouvée.",
       "migrationSummaryFailed": "Impossible de vérifier les données sélectionnées : {detail}",
       "migrationSummaryTitle": "Vérifier le transfert de données",

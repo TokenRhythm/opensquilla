@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from opensquilla.attachment_refs import _atomic_write_bytes, _link_or_copy, _validate_sha256
+from opensquilla.paths import native_io_path
 
 _log = logging.getLogger(__name__)
 
@@ -288,7 +289,8 @@ class ArtifactStore:
         )
 
         artifact_dir = self._artifact_dir(session_id, artifact_id)
-        artifact_dir.mkdir(parents=True, exist_ok=False)
+        native_artifact_dir = native_io_path(artifact_dir)
+        native_artifact_dir.mkdir(parents=True, exist_ok=False)
         try:
             _atomic_write_bytes(artifact_dir / ARTIFACT_MATERIAL_NAME, payload)
             if thumbnail_bytes is not None:
@@ -298,13 +300,13 @@ class ArtifactStore:
                 json.dumps(ref.to_dict(), ensure_ascii=False, sort_keys=True).encode("utf-8"),
             )
         except BaseException:
-            for path in sorted(artifact_dir.glob("*"), reverse=True):
+            for path in sorted(native_artifact_dir.glob("*"), reverse=True):
                 try:
                     path.unlink(missing_ok=True)
                 except OSError:
                     pass
             try:
-                artifact_dir.rmdir()
+                native_artifact_dir.rmdir()
             except OSError:
                 pass
             raise
@@ -322,7 +324,7 @@ class ArtifactStore:
         max_bytes: int | None = DEFAULT_ARTIFACT_MAX_BYTES,
         disk_budget_bytes: int | None = DEFAULT_ARTIFACT_DISK_BUDGET_BYTES,
     ) -> ArtifactRef:
-        payload = Path(path).read_bytes()
+        payload = native_io_path(path).read_bytes()
         return self.publish_bytes(
             payload,
             session_id=session_id,
@@ -342,15 +344,17 @@ class ArtifactStore:
     ) -> tuple[ArtifactRef, Path]:
         artifact_id = _validate_artifact_id(artifact_id)
         meta_path = self._resolve_meta_path(session_id, artifact_id)
-        if not meta_path.exists():
+        native_meta_path = native_io_path(meta_path)
+        if not native_meta_path.exists():
             raise ArtifactNotFoundError("artifact not found")
-        ref = ArtifactRef.from_dict(json.loads(meta_path.read_text(encoding="utf-8")))
+        ref = ArtifactRef.from_dict(json.loads(native_meta_path.read_text(encoding="utf-8")))
         if ref.session_id != session_id:
             raise ArtifactNotFoundError("artifact not found")
         path = self.path_for(ref)
-        if not path.exists():
+        native_path = native_io_path(path)
+        if not native_path.exists():
             raise ArtifactNotFoundError("artifact material not found")
-        payload = path.read_bytes()
+        payload = native_path.read_bytes()
         if hashlib.sha256(payload).hexdigest() != ref.sha256:
             raise ArtifactIntegrityError("artifact material hash mismatch")
         if len(payload) != ref.size:
@@ -374,9 +378,10 @@ class ArtifactStore:
         safe_name = _safe_filename(name)
         safe_mime = _safe_mime(mime) if mime else None
         for root in self._artifact_session_roots(session_id):
-            if not root.exists():
+            native_root = native_io_path(root)
+            if not native_root.exists():
                 continue
-            for meta_path in sorted(root.glob("*/meta.json")):
+            for meta_path in sorted(native_root.glob("*/meta.json")):
                 try:
                     ref = ArtifactRef.from_dict(json.loads(meta_path.read_text(encoding="utf-8")))
                 except (OSError, ValueError, json.JSONDecodeError):
@@ -443,9 +448,10 @@ class ArtifactStore:
         )
         seen: set[Path] = set()
         for root in roots:
-            if not root.exists():
+            native_root = native_io_path(root)
+            if not native_root.exists():
                 continue
-            for meta_path in sorted(root.glob("*/meta.json")):
+            for meta_path in sorted(native_root.glob("*/meta.json")):
                 resolved = meta_path.resolve()
                 if resolved in seen:
                     continue
@@ -460,23 +466,23 @@ class ArtifactStore:
     ) -> bool:
         """Materialize one artifact under the child session; return True when copied."""
         source_material = self.path_for(ref)
-        if not source_material.exists():
+        if not native_io_path(source_material).exists():
             return False
         target_dir = self._artifact_dir(target_session_id, ref.id)
         target_material = target_dir / ARTIFACT_MATERIAL_NAME
         target_meta = target_dir / "meta.json"
-        if target_meta.exists() and target_material.exists():
+        if native_io_path(target_meta).exists() and native_io_path(target_material).exists():
             return False
-        target_dir.mkdir(parents=True, exist_ok=True)
-        if not target_material.exists():
+        native_io_path(target_dir).mkdir(parents=True, exist_ok=True)
+        if not native_io_path(target_material).exists():
             _link_or_copy(source_material, target_material)
         has_thumbnail = False
         if ref.has_thumbnail:
             target_thumb = target_dir / ARTIFACT_THUMBNAIL_NAME
             source_thumb = self.thumbnail_path_for(ref)
-            if target_thumb.exists():
+            if native_io_path(target_thumb).exists():
                 has_thumbnail = True
-            elif source_thumb.exists():
+            elif native_io_path(source_thumb).exists():
                 _link_or_copy(source_thumb, target_thumb)
                 has_thumbnail = True
         # Only advertise a thumbnail the child actually has on disk: a source whose
@@ -512,7 +518,7 @@ class ArtifactStore:
         if not ref.has_thumbnail:
             return None
         thumb_path = self.thumbnail_path_for(ref)
-        if not thumb_path.exists():
+        if not native_io_path(thumb_path).exists():
             return None
         return ref, thumb_path
 
@@ -523,7 +529,7 @@ class ArtifactStore:
             self._legacy_short_artifact_dir(ref.session_id, ref.id),
         ):
             material_path = artifact_dir / ARTIFACT_MATERIAL_NAME
-            if material_path.exists():
+            if native_io_path(material_path).exists():
                 return material_path
         return self._legacy_artifact_dir(ref.session_id, ref.id) / ref.sha256
 
@@ -533,7 +539,7 @@ class ArtifactStore:
             self._legacy_short_artifact_dir(ref.session_id, ref.id),
         ):
             thumbnail_path = artifact_dir / ARTIFACT_THUMBNAIL_NAME
-            if thumbnail_path.exists():
+            if native_io_path(thumbnail_path).exists():
                 return thumbnail_path
         return self._artifact_dir(ref.session_id, ref.id) / ARTIFACT_THUMBNAIL_NAME
 
@@ -587,16 +593,17 @@ class ArtifactStore:
             self._legacy_artifact_dir(session_id, artifact_id),
         ):
             meta_path = artifact_dir / "meta.json"
-            if meta_path.exists():
+            if native_io_path(meta_path).exists():
                 return meta_path
         return self._artifact_dir(session_id, artifact_id) / "meta.json"
 
     def _disk_usage_bytes(self) -> int:
         root = self.media_root / ARTIFACT_STORE
-        if not root.exists():
+        native_root = native_io_path(root)
+        if not native_root.exists():
             return 0
         total = 0
-        for path in root.rglob("*"):
+        for path in native_root.rglob("*"):
             try:
                 if path.is_file() and path.name != "meta.json":
                     total += path.stat().st_size

@@ -185,7 +185,6 @@
       "compatibilityTitle": "旧版 Agent 数据位置",
       "compatibilityDesc": "OpenSquilla 正在使用兼容的旧版 Agent 数据位置。更改后会切换身份和记忆来源，不会移动、合并或删除数据。",
       "chooseLegacyAgentData": "选择 Agent 数据位置",
-      "recoveryTitle": "恢复 Profile 中不能导入数据",
       "loadFailed": "OpenSquilla 无法检查可导入的数据来源。",
       "emptyTitle": "未发现其他 OpenSquilla 数据",
       "emptyDesc": "以后可以重新扫描；桌面端还可以手动选择数据文件夹。",
@@ -972,12 +971,12 @@
         },
         "delete-current-profile": {
           "title": "删除当前配置",
-          "warning": "会删除列出的当前配置、凭据和日志；其他恢复配置和备份都会保留。",
+          "warning": "会删除列出的主配置、凭据和日志；已记录的备份会保留。",
           "apply": "删除配置"
         },
         "delete-all-user-data": {
           "title": "删除全部 OpenSquilla 用户数据",
-          "warning": "OpenSquilla 完全退出后，会删除主配置、所有恢复配置、凭据、日志和已记录的备份。",
+          "warning": "OpenSquilla 完全退出后，会删除主配置、凭据、日志和已记录的备份。",
           "apply": "删除全部数据并退出"
         },
         "inspectFailed": "无法检查清理位置：{detail}",
@@ -985,7 +984,6 @@
         "inventoryCount": "列出的 {total} 个位置中，当前有 {existing} 个存在。",
         "inventoryLabel": "清理清单",
         "primaryProfile": "主配置",
-        "recoveryProfile": "恢复配置",
         "present": "存在",
         "missing": "不存在",
         "blocked": "清理已阻止",
@@ -999,7 +997,7 @@
         "working": "正在停止本地运行时并执行已确认的清理…",
         "resetConfirmTitle": "重置当前设置？",
         "resetConfirmBody": "当前配置将返回提供商引导，同时保留工作区身份、记忆和聊天。",
-        "partial": "清理在中途停止（{detail}）。OpenSquilla 已保留剩余数据并打开恢复选项。",
+        "partial": "清理在中途停止（{detail}）。OpenSquilla 已保留剩余数据并打开修复选项。",
         "applyFailed": "清理未能开始：{detail}",
         "deleteAllScheduled": "OpenSquilla 即将退出；只有应用完全退出后才会开始删除。",
         "resetDone": "当前设置已重置，将重新打开提供商引导。",
@@ -1021,7 +1019,6 @@
       "migrationLabel": "数据转移",
       "migrationDesc": "使用另一套 OpenSquilla 安装中的数据。继续前会先核对；如果当前桌面端已有数据，会完整备份后再替换。",
       "migrationButton": "从其他安装转移数据",
-      "migrationRecoveryProfile": "恢复配置中不能转移数据。请返回主配置后继续。",
       "migrationNone": "未发现其他 OpenSquilla 数据。",
       "migrationSummaryFailed": "无法核对所选数据：{detail}",
       "migrationSummaryTitle": "核对数据转移",

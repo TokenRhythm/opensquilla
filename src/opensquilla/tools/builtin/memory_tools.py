@@ -386,6 +386,13 @@ def create_memory_tools(
         else:
             md = memory_dir
             wd = memory_dir  # fallback: use memory_dir as workspace in test/legacy mode
+        # These paths stay inside the tool closures. Keep user-facing results
+        # relative while bypassing legacy Windows MAX_PATH for every read,
+        # write, rollback, retention, and delete operation.
+        from opensquilla.memory.manager import _native_io_path
+
+        md = str(_native_io_path(md)) if md is not None else None
+        wd = str(_native_io_path(wd)) if wd is not None else None
         return ResolvedAgent(store=s, retriever=r, memory_dir=md, workspace_dir=wd)
 
     @dataclass(frozen=True)

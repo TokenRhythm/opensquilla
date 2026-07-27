@@ -185,7 +185,6 @@
       "compatibilityTitle": "Speicherort älterer Agent-Daten",
       "compatibilityDesc": "OpenSquilla verwendet einen kompatiblen älteren Agent-Datenspeicherort. Eine Änderung wechselt Identität und Gedächtnisquelle, verschiebt, vereint oder löscht aber keine Daten.",
       "chooseLegacyAgentData": "Agent-Datenspeicherort wählen",
-      "recoveryTitle": "Import ist in einem Wiederherstellungsprofil nicht verfügbar",
       "loadFailed": "OpenSquilla konnte Importquellen nicht prüfen.",
       "emptyTitle": "Keine weiteren OpenSquilla-Daten gefunden",
       "emptyDesc": "Sie können später erneut suchen. Desktop kann auch manuell einen Datenordner auswählen.",
@@ -972,12 +971,12 @@
         },
         "delete-current-profile": {
           "title": "Aktuelles Profil löschen",
-          "warning": "Das aufgeführte aktuelle Profil, seine Zugangsdaten und Protokolle werden gelöscht. Andere Wiederherstellungsprofile und Sicherungen bleiben erhalten.",
+          "warning": "Das aufgeführte Hauptprofil, seine Zugangsdaten und Protokolle werden gelöscht. Erfasste Sicherungen bleiben erhalten.",
           "apply": "Profil löschen"
         },
         "delete-all-user-data": {
           "title": "Alle OpenSquilla-Benutzerdaten löschen",
-          "warning": "Nach dem vollständigen Beenden werden Hauptprofil, alle Wiederherstellungsprofile, Zugangsdaten, Protokolle und Sicherungen gelöscht.",
+          "warning": "Nach dem vollständigen Beenden von OpenSquilla werden Hauptprofil, Zugangsdaten, Protokolle und erfasste Sicherungen gelöscht.",
           "apply": "Alle Daten löschen und beenden"
         },
         "inspectFailed": "Bereinigungsorte konnten nicht geprüft werden: {detail}",
@@ -985,7 +984,6 @@
         "inventoryCount": "{existing} von {total} aufgeführten Speicherorten sind vorhanden.",
         "inventoryLabel": "Bereinigungsinventar",
         "primaryProfile": "Hauptprofil",
-        "recoveryProfile": "Wiederherstellungsprofil",
         "present": "vorhanden",
         "missing": "fehlt",
         "blocked": "Bereinigung ist blockiert",
@@ -999,7 +997,7 @@
         "working": "Lokale Laufzeit wird beendet und die bestätigte Bereinigung ausgeführt…",
         "resetConfirmTitle": "Aktuelle Einstellungen zurücksetzen?",
         "resetConfirmBody": "Das aktuelle Profil kehrt zur Anbieter-Einrichtung zurück; Arbeitsbereichsidentität, Speicher und Chats bleiben erhalten.",
-        "partial": "Die Bereinigung wurde unterbrochen ({detail}). Verbleibende Daten wurden behalten und Wiederherstellungsoptionen geöffnet.",
+        "partial": "Die Bereinigung wurde unterbrochen ({detail}). OpenSquilla hat die verbleibenden Daten behalten und Reparaturoptionen geöffnet.",
         "applyFailed": "Bereinigung wurde nicht gestartet: {detail}",
         "deleteAllScheduled": "OpenSquilla wird beendet; die Löschung beginnt erst nach dem vollständigen Beenden der App.",
         "resetDone": "Aktuelle Einstellungen wurden zurückgesetzt. Die Anbieter-Einrichtung wird erneut geöffnet.",
@@ -1021,7 +1019,6 @@
       "migrationLabel": "Datenübertragung",
       "migrationDesc": "Daten aus einer anderen OpenSquilla-Installation verwenden. Sie prüfen sie zuerst; vorhandene Desktop-Daten werden vor dem Ersetzen vollständig gesichert.",
       "migrationButton": "Daten aus einer anderen Installation übertragen",
-      "migrationRecoveryProfile": "In einem Wiederherstellungsprofil können keine Daten übertragen werden. Kehren Sie zum Hauptprofil zurück, um fortzufahren.",
       "migrationNone": "Keine weiteren OpenSquilla-Daten gefunden.",
       "migrationSummaryFailed": "Die ausgewählten Daten konnten nicht geprüft werden: {detail}",
       "migrationSummaryTitle": "Datenübertragung prüfen",

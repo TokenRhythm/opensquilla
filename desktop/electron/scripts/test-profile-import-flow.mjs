@@ -246,17 +246,6 @@ async function captureOnboarding(app, path) {
   await writeFile(path, Buffer.from(base64, 'base64'))
 }
 
-async function recoveryPage(app) {
-  return await waitFor(async () => {
-    for (const page of app.windows()) {
-      if (page.isClosed()) continue
-      await page.waitForLoadState('domcontentloaded', { timeout: 5_000 }).catch(() => {})
-      if (await page.locator('#recoveryPanel.visible').count().catch(() => 0)) return page
-    }
-    return null
-  }, 'recovery profile confirmation page')
-}
-
 async function controlPage(app) {
   return await waitFor(async () => {
     for (const page of app.windows()) {
@@ -532,24 +521,6 @@ try {
   await app.close()
   app = null
 
-  // A selected recovery H can use the app, but it cannot import another profile.
-  const recoveryHome = join(root, 'recovery-home')
-  const recoveryUserData = join(root, 'recovery-user-data')
-  const recoveryId = '12345678-1234-4234-8234-123456789abc'
-  await mkdir(join(recoveryUserData, 'recovery-profiles', recoveryId, 'opensquilla'), { recursive: true })
-  await writeFile(join(recoveryUserData, 'desktop-profile-context.json'), JSON.stringify({
-    schema_version: 1,
-    active_profile_kind: 'recovery',
-    active_recovery_id: recoveryId,
-    attention_acknowledgement: null,
-    updated_at: new Date().toISOString(),
-  }, null, 2))
-  app = await launchDesktop(recoveryUserData, recoveryHome, 18923)
-  page = await recoveryPage(app)
-  const rejected = await page.evaluate(() => window.opensquillaDesktop.migrationSummary())
-  assert.equal(rejected.ok, false)
-  assert.match(rejected.raw, /primary profile/i)
-
   console.log(JSON.stringify({
     cliDoesNotTriggerOnboardingTransfer: true,
     windowsPortableSettingsOnlyTested: process.platform === 'win32',
@@ -559,7 +530,7 @@ try {
     settingsRequiredKeyCompleted: true,
     importedConfigPreserved: true,
     previousCredentialBackedUp: true,
-    recoveryProfileRejected: true,
+    primaryOnly: true,
   }, null, 2))
 } finally {
   if (app) await app.close().catch(() => {})

@@ -5716,7 +5716,7 @@ class OpenSquillaHomeMigrator:
         if payload is None or original_payload is None or source_bytes is None:
             raise OSError("validated source config is unavailable")
         try:
-            from opensquilla.migration.lossless_toml import patch_import_config
+            from opensquilla.lossless_toml import patch_import_config
 
             patched = patch_import_config(source_bytes, original_payload, payload)
             staged_config.write_bytes(patched)
