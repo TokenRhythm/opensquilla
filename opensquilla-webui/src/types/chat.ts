@@ -319,6 +319,7 @@ export interface ChatMessage {
   routerDecision?: import('./rpc').RouterDecisionPayload | null
   artifacts?: ArtifactPayload[]
   tool_calls?: RawToolCallPayload[]
+  planRevisions?: import('./plans').PlanRevisionSnapshot[]
   timeline?: ChatTimelineSegment[]
   attachments?: DisplayAttachment[]
   provenanceKind?: string
@@ -389,6 +390,7 @@ export interface ChatRenderedMessage {
   hasAttachments?: boolean
   attachments?: DisplayAttachment[]
   toolCalls?: ChatToolCall[]
+  planRevisions?: import('./plans').PlanRevisionSnapshot[]
   timelineItems?: ChatStreamTimelineItem[]
   artifacts?: ArtifactPayload[]
   meta?: ChatMessageMeta

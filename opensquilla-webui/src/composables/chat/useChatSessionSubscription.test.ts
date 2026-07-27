@@ -189,6 +189,40 @@ describe('useChatSessionSubscription', () => {
 })
 
 describe('useChatSessionSubscription', () => {
+  it('exposes the authoritative subscribe snapshot to feature hydrators', async () => {
+    const onSnapshot = vi.fn()
+    const snapshot = {
+      subscribed: true,
+      key: 'agent:main:webchat:test',
+      run_status: 'idle',
+      current_stream_seq: 0,
+      collaboration: { mode: 'plan', revision: 2 },
+    }
+    const subscription = useChatSessionSubscription({
+      rpc: {
+        waitForConnection: vi.fn().mockResolvedValue(undefined),
+        call: vi.fn().mockResolvedValue(snapshot),
+      },
+      sessionKey: ref('agent:main:webchat:test'),
+      lastStreamSeq: ref(0),
+      runStatus: ref<ChatRunStatus>({ status: 'idle', label: '', task: null }),
+      isStreaming: ref(false),
+      hasActiveInterrupt: ref(false),
+      activeStreamTaskId: ref(''),
+      activeTaskGroups: ref(new Set<string>()),
+      sessionRunStatus: () => ({ status: 'idle', label: '', task: null }),
+      startStreaming: vi.fn(),
+      loadHistory: vi.fn(),
+      resetStreamIdleTimer: vi.fn(),
+      resetStreamLiveTurnState: vi.fn(),
+      onSnapshot,
+    })
+
+    await subscription.subscribeSession()
+
+    expect(onSnapshot).toHaveBeenCalledWith(snapshot)
+  })
+
   it('marks an initial session subscription as hydrating until its snapshot arrives', async () => {
     let resolveSnapshot: ((value: unknown) => void) | undefined
     const snapshot = new Promise(resolve => { resolveSnapshot = resolve })

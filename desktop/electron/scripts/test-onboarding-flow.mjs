@@ -121,7 +121,7 @@ try {
   )
   assert.equal(
     await providerScreen.locator('.provider-promo-copy strong').evaluate((copy) => getComputedStyle(copy).color),
-    'rgb(169, 87, 40)',
+    'rgb(186, 77, 15)',
   )
   assert.equal(await page.locator('#endpointPanel, #endpointToggle').count(), 0, 'simple onboarding should not expose endpoint controls')
   assert.equal(await page.locator('#provider').inputValue(), 'tokenrhythm', 'TokenRhythm should be selected by default')
@@ -265,8 +265,8 @@ try {
   )
   assert.equal(
     await tokenRhythmCta.evaluate((link) => getComputedStyle(link).backgroundColor),
-    'rgb(169, 87, 40)',
-    'the registration call to action should use the muted orange button treatment',
+    'rgb(186, 77, 15)',
+    'the registration call to action should use the canonical light-theme accent',
   )
   assert.equal(await tokenRhythmCta.evaluate((link) => getComputedStyle(link).color), 'rgb(255, 255, 255)')
   assert.equal(await tokenRhythmCta.evaluate((link) => getComputedStyle(link).borderRadius), '7px')
@@ -332,8 +332,8 @@ try {
   )
   assert.equal(
     await page.locator('[data-search-provider="duckduckgo"] .search-provider-billing').evaluate((billing) => getComputedStyle(billing).color),
-    'rgb(130, 80, 55)',
-    'the free status should use the same subdued orange-brown palette as the provider promotion',
+    'rgb(142, 58, 10)',
+    'the free status should use the canonical deep light-theme accent',
   )
   if (screenshotPath) {
     await mkdir(dirname(screenshotPath), { recursive: true })

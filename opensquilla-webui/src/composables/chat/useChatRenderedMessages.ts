@@ -33,6 +33,7 @@ import {
   normalizeRouterTier,
   sortRouterTiers,
 } from '@/utils/chat/routerTiers'
+import { clarifyRequestFromValue } from '@/utils/chat/clarify'
 import type { RouterVisualMode } from '@/utils/chat/routerVisualMode'
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { InterruptViewState } from '@/types/parts'
@@ -65,6 +66,7 @@ export interface UseChatRenderedMessagesOptions {
   routerVisualMode: Ref<RouterVisualMode>
   modelRoutingMode?: Ref<ModelRoutingMode>
   isStreaming?: Ref<boolean>
+  currentPlanRevisionId?: Readonly<Ref<string>>
   renderMarkdown: (text: string) => string
   stripGeneratedArtifactMarkers: (text: string) => string
   stripTimePrefix: (text: string) => string
@@ -93,41 +95,16 @@ const ROUTER_LEGACY_DECOY_MODELS = [
   'claude-haiku-4.5',
 ]
 
-function clarifyRequestFromArgs(args: unknown): ToPartsInterrupt | null {
-  if (!args || typeof args !== 'object') return null
-  const raw = args as Record<string, unknown>
-  if (raw.kind !== 'user_input' || raw.paused !== true) return null
-  const schema = raw.clarify_schema
-  if (!schema || typeof schema !== 'object') return null
-  const schemaObj = schema as Record<string, unknown>
-  const fieldsRaw = Array.isArray(schemaObj.fields) ? schemaObj.fields : []
-  const fields = fieldsRaw.flatMap((entry) => {
-    if (!entry || typeof entry !== 'object') return []
-    const field = entry as Record<string, unknown>
-    const name = String(field.name || '').trim()
-    if (!name) return []
-    return [{
-      name,
-      prompt: String(field.prompt || ''),
-      type: String(field.type || 'string').toLowerCase(),
-      required: field.required === true,
-      defaultValue: field.default == null ? '' : String(field.default),
-      choices: Array.isArray(field.choices) ? field.choices.map(String) : [],
-    }]
-  })
-  if (!fields.length) return null
-  const runId = typeof raw.run_id === 'string' ? raw.run_id : ''
-  const step = typeof raw.step === 'string' ? raw.step : ''
-  const approvalId = `${runId}|${step}` === '|' ? 'clarify:history' : `${runId}|${step}`
+function clarifyInterruptFromValue(value: unknown): ToPartsInterrupt | null {
+  const data = clarifyRequestFromValue(value)
+  if (!data) return null
+  const approvalId = `${data.runId}|${data.step}` === '|'
+    ? 'clarify:history'
+    : `${data.runId}|${data.step}`
   return {
     kind: 'clarify',
     approvalId,
-    data: {
-      intro: String(schemaObj.intro || ''),
-      fields,
-      runId,
-      step,
-    },
+    data,
   }
 }
 
@@ -142,7 +119,7 @@ function historicalClarifyInterrupts(segments: RawToolCallPayload[] | undefined)
     const toolId = String(segment?.tool_use_id || segment?.toolId || segment?.id || '')
     if (type === 'tool_use' && toolId) {
       inputByToolId.set(toolId, segment.input)
-      const direct = clarifyRequestFromArgs(segment.input)
+      const direct = clarifyInterruptFromValue(segment.input)
       if (direct && !seen.has(direct.approvalId)) {
         seen.add(direct.approvalId)
         out.push(direct)
@@ -150,8 +127,9 @@ function historicalClarifyInterrupts(segments: RawToolCallPayload[] | undefined)
       continue
     }
     if (type !== 'tool_result') continue
-    const direct = clarifyRequestFromArgs(segment.arguments)
-    const fromMatchingInput = direct || clarifyRequestFromArgs(inputByToolId.get(toolId))
+    const direct = clarifyInterruptFromValue(segment.result)
+      || clarifyInterruptFromValue(segment.arguments)
+    const fromMatchingInput = direct || clarifyInterruptFromValue(inputByToolId.get(toolId))
     if (fromMatchingInput && !seen.has(fromMatchingInput.approvalId)) {
       seen.add(fromMatchingInput.approvalId)
       out.push(fromMatchingInput)
@@ -213,6 +191,15 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         turnRequestKind = routerRequestKindFromAttachments(msg.attachments)
         turnIdx++
         turnIdentity = msg.clientId || msg.messageId || String(msg.ts || `turn-${turnIdx}`)
+      }
+
+      // Internal control turns can intentionally carry an empty displayText
+      // while retaining their provider-facing text in the transcript. They
+      // still establish a new turn identity for the following router and
+      // assistant rows, but must not leave an empty user bubble in the UI.
+      if (msg.role === 'user' && !msg.text.trim() && !msg.attachments?.length) {
+        prevRole = ''
+        continue
       }
 
       if (lastAssistantResultIndex >= 0) {
@@ -289,6 +276,13 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       if (collapsible) prevRole = displayRole
 
       const ownerKey = msg.messageId || msg.clientId || `${msg.role}-${i}`
+      const planRevisions = (msg.planRevisions ?? []).map(plan => ({
+        ...plan,
+        current: Boolean(options.currentPlanRevisionId?.value)
+          && plan.revisionId === options.currentPlanRevisionId?.value,
+      }))
+      const isPlanMessage = msg.role === 'assistant' && planRevisions.length > 0
+      const normalizedToolCalls = normalizeToolCalls(msg.tool_calls)
       const rendered: ChatRenderedMessage = {
         id: `${msg.role}-${i}`,
         ...(msg.clientId ? { clientId: msg.clientId } : {}),
@@ -296,7 +290,11 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         role: msg.role,
         displayRole,
         roleLabel,
-        text: msg.role === 'assistant' ? options.stripGeneratedArtifactMarkers(msg.text) : msg.text,
+        text: isPlanMessage
+          ? ''
+          : msg.role === 'assistant'
+            ? options.stripGeneratedArtifactMarkers(msg.text)
+            : msg.text,
         timeStr: relativeTime(msg.ts),
         ts: msg.ts ?? null,
         showHeader: !sameGroup,
@@ -304,8 +302,12 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         turnKey: `turn:${turnIdentity === 'turn-0' ? ownerKey : turnIdentity}`,
         hasAttachments: !!msg.attachments?.length,
         attachments: msg.attachments,
-        toolCalls: normalizeToolCalls(msg.tool_calls),
-        timelineItems: normalizeMessageTimeline(msg, ownerKey),
+        // submit_plan is a transport/control detail. Once a typed immutable
+        // plan part exists, the plan card is the authoritative visible item;
+        // do not also render the same payload as an expandable tool timeline.
+        toolCalls: isPlanMessage ? [] : normalizedToolCalls,
+        timelineItems: isPlanMessage ? [] : normalizeMessageTimeline(msg, ownerKey),
+        planRevisions,
         artifacts: msg.artifacts,
         meta: messageMeta(msg),
         reasoning: msg.role === 'assistant' ? msg.reasoning : undefined,

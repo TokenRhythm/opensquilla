@@ -150,8 +150,20 @@ export interface AssistantActivityProjection extends AssistantActivityTimelinePr
   canSeparateActivity: boolean
   activityItems: ChatStreamTimelineItem[]
   answerPart: TextPart | null
+  answerSource: AssistantAnswerSource
   toolCount: number
   failureCount: number
+}
+
+export type AssistantAnswerSource =
+  | 'canonical'
+  | 'terminal-control-boundary'
+  | 'none'
+
+export interface AssistantAnswerResolution {
+  text: string
+  source: AssistantAnswerSource
+  activityItems: ChatStreamTimelineItem[]
 }
 
 interface ActivitySemantic {
@@ -206,6 +218,17 @@ const COMMAND_TOOLS = new Set([
 ])
 const ARTIFACT_TOOLS = new Set(['publish_artifact'])
 const MEMORY_TOOLS = new Set(['memory_search', 'search_memory'])
+// These tools persist execution-control state that already has a dedicated
+// Plan/Goal surface. A successful call is not user work and must not inflate
+// the generic tool count. It is also answer-transparent: a terminal summary
+// can immediately precede the control call because that call ends the turn.
+//
+// `update_plan` remains only as a history-compatibility spelling. The runtime
+// no longer registers it.
+const ANSWER_TRANSPARENT_CONTROL_TOOLS = new Set([
+  'plan_run_checkpoint',
+  'update_plan',
+])
 const FILE_TARGET_KEYS = [
   'path',
   'file_path',
@@ -314,6 +337,149 @@ function activityToolName(name: string): string {
     .replace(/-/g, '_')
   const namespaced = normalized.split(/__|[.:/]/).filter(Boolean)
   return namespaced[namespaced.length - 1] || ''
+}
+
+function isSuccessfulAnswerTransparentControlGroup(
+  item: ChatStreamTimelineItem,
+): item is Extract<ChatStreamTimelineItem, { type: 'tool-group' }> {
+  return item.type === 'tool-group'
+    && item.group.calls.length > 0
+    && item.group.calls.every(call =>
+      ANSWER_TRANSPARENT_CONTROL_TOOLS.has(activityToolName(call.name))
+      && !call.isRunning
+      && !call.isError
+      && call.status === 'success',
+    )
+}
+
+function normalizedComparableText(value: string): string {
+  // Preserve Markdown-significant interior whitespace. Only normalize the
+  // transport-level line-ending difference and outer padding.
+  return String(value || '').replace(/\r\n?/g, '\n').trim()
+}
+
+function timelineTextAggregate(
+  timeline: ChatStreamTimelineItem[],
+): string | null {
+  const textItems = timeline.filter(
+    (item): item is Extract<ChatStreamTimelineItem, { type: 'text' }> =>
+      item.type === 'text',
+  )
+  if (!textItems.length) return null
+
+  const chunks: string[] = []
+  for (const item of textItems) {
+    // HTML cannot be losslessly compared with raw Markdown. Missing rawText is
+    // therefore an unknown boundary, not permission to hide content.
+    if (typeof item.rawText !== 'string') return null
+    chunks.push(item.rawText)
+  }
+  return chunks.join('')
+}
+
+interface TerminalControlAnswerCandidate {
+  text: string
+  indexes: Set<number>
+}
+
+function terminalControlAnswerCandidate(
+  timeline: ChatStreamTimelineItem[],
+): TerminalControlAnswerCandidate | null {
+  let index = timeline.length - 1
+  let crossedControlBoundary = false
+
+  while (index >= 0) {
+    const item = timeline[index]
+    if (!item) {
+      index -= 1
+      continue
+    }
+    if (item.type === 'tool-group') {
+      if (!isSuccessfulAnswerTransparentControlGroup(item)) return null
+      crossedControlBoundary = true
+      index -= 1
+      continue
+    }
+    if (item.type !== 'text') return null
+    if (!String(item.rawText || '').trim() && !String(item.html || '').trim()) {
+      index -= 1
+      continue
+    }
+    break
+  }
+
+  if (!crossedControlBoundary || index < 0 || timeline[index]?.type !== 'text') {
+    return null
+  }
+
+  const indexes = new Set<number>()
+  const chunks: string[] = []
+  while (index >= 0) {
+    const item = timeline[index]
+    if (!item || item.type !== 'text') break
+    if (typeof item.rawText !== 'string') return null
+    indexes.add(index)
+    chunks.unshift(item.rawText)
+    index -= 1
+  }
+  const text = chunks.join('')
+  return text.trim() ? { text, indexes } : null
+}
+
+function completedAnswerLifecycle(
+  message: ChatRenderedMessage,
+  lifecycle: AssistantActivityLifecycle,
+): boolean {
+  return lifecycle === 'settled'
+    && !message.isStreaming
+    && !message.interrupted
+    && !message.terminalFailure
+}
+
+/**
+ * Resolve the user-facing answer without parsing model prose.
+ *
+ * Newer runtimes should eventually persist an explicit answer phase. For old
+ * PlanRun rows, `message.text` is the concatenation of every narration segment.
+ * We may recover the terminal answer only when all of these structural facts
+ * agree: the turn settled successfully, the canonical text exactly matches the
+ * raw timeline aggregate, and the last text run is followed only by successful
+ * answer-transparent control calls. Every uncertain case fails open to the
+ * canonical text.
+ */
+export function resolveAssistantAnswer(
+  message: ChatRenderedMessage,
+  timeline: ChatStreamTimelineItem[] = message.timelineItems ?? [],
+  lifecycle: AssistantActivityLifecycle = 'settled',
+): AssistantAnswerResolution {
+  const visibleTimeline = timeline.filter(
+    item => !isSuccessfulAnswerTransparentControlGroup(item),
+  )
+  const canonical = String(message.text || '')
+  const aggregate = timelineTextAggregate(timeline)
+  const candidate = terminalControlAnswerCandidate(timeline)
+  const canUseControlBoundary = completedAnswerLifecycle(message, lifecycle)
+    && aggregate !== null
+    && normalizedComparableText(canonical) === normalizedComparableText(aggregate)
+    && candidate !== null
+
+  if (canUseControlBoundary && candidate) {
+    return {
+      text: candidate.text,
+      source: 'terminal-control-boundary',
+      activityItems: timeline.filter(
+        (item, index) =>
+          !candidate.indexes.has(index)
+          && !isSuccessfulAnswerTransparentControlGroup(item),
+      ),
+    }
+  }
+
+  return {
+    text: canonical,
+    source: canonical.trim() ? 'canonical' : 'none',
+    activityItems: visibleTimeline,
+  }
 }
 
 function callSemantic(call: ChatToolCallRenderItem): ActivitySemantic {
@@ -634,13 +800,20 @@ export function projectAssistantActivity(
   const timeline = message.timelineItems?.length
     ? message.timelineItems
     : fallbackToolItems
+  const lifecycle = options.lifecycle ?? 'settled'
+  const answerResolution = resolveAssistantAnswer(message, timeline, lifecycle)
   const hasTimelineText = timeline.some(item => item.type === 'text')
-  const hasCanonicalAnswer = Boolean(message.text.trim())
+  const hasCanonicalAnswer = Boolean(answerResolution.text.trim())
   const canSeparateActivity = hasCanonicalAnswer || !hasTimelineText
   const activityItems = canSeparateActivity
     ? hasCanonicalAnswer
-      ? separatedActivityItems(timeline, message.text)
-      : timeline.slice()
+      ? answerResolution.source === 'terminal-control-boundary'
+        ? answerResolution.activityItems
+        : separatedActivityItems(
+            answerResolution.activityItems,
+            answerResolution.text,
+          )
+      : answerResolution.activityItems
     : []
   const timelineProjection = projectAssistantActivityTimeline(
     activityItems,
@@ -660,8 +833,8 @@ export function projectAssistantActivity(
   const answerPart: TextPart | null = canSeparateActivity && hasCanonicalAnswer
     ? {
         type: 'text',
-        html: renderMarkdown(message.text),
-        rawText: message.text,
+        html: renderMarkdown(answerResolution.text),
+        rawText: answerResolution.text,
         key: `${message.messageId || message.id || 'assistant'}:answer`,
       }
     : null
@@ -671,6 +844,7 @@ export function projectAssistantActivity(
     canSeparateActivity,
     activityItems,
     answerPart,
+    answerSource: answerResolution.source,
     toolCount,
     failureCount,
   }

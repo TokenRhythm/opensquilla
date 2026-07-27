@@ -1,15 +1,14 @@
 """Opt-in endgame levers: cap extension, act-now directives, sticky thinking-off.
 
 Covers OPENSQUILLA_MAX_ITERATIONS_DEADLINE_EXTEND_SECONDS,
-OPENSQUILLA_REASONING_ONLY_ACT_NOW, OPENSQUILLA_PLAN_ONLY_ACT_NOW_THRESHOLD,
-OPENSQUILLA_ENDGAME_FIX_DIRECTIVE_MARGIN_SECONDS and
+OPENSQUILLA_REASONING_ONLY_ACT_NOW,
+OPENSQUILLA_ENDGAME_FIX_DIRECTIVE_MARGIN_SECONDS, and
 OPENSQUILLA_DEADLINE_WRAPUP_STICKY_THINKING_OFF (all off by default).
 Motivation: runs that hit the iteration cap with wall clock to spare finalize
 early for no reason; reasoning-only responses retried verbatim usually repeat;
-consecutive plan-updates without tool work stall the task; a deadline crossed
-with only diagnostic instrumentation in the workspace needs an explicit
-commit-to-a-fix push; and a wrap-up preempt that re-enables thinking next
-iteration can spend the whole remaining margin on another reasoning stream.
+a deadline crossed with only diagnostic instrumentation in the workspace needs
+an explicit commit-to-a-fix push; and a wrap-up preempt that re-enables thinking
+next iteration can spend the whole remaining margin on another reasoning stream.
 """
 
 from __future__ import annotations
@@ -26,7 +25,6 @@ import pytest
 from opensquilla.engine import Agent, AgentConfig, ThinkingLevel, ToolResult
 from opensquilla.engine.agent import (
     _ENDGAME_FIX_DIRECTIVE_PREFIX,
-    _PLAN_ONLY_ACT_NOW_DIRECTIVE,
     _REASONING_ONLY_ACT_NOW_DIRECTIVE,
 )
 from opensquilla.provider import (
@@ -109,10 +107,6 @@ def _echo_tool_call(tool_use_id: str) -> list[Any]:
     return _tool_call(tool_use_id, "echo", {"value": "hi"})
 
 
-def _plan_tool_call(tool_use_id: str) -> list[Any]:
-    return _tool_call(tool_use_id, "update_plan", {"plan": "step"})
-
-
 def _echo_agent(
     provider: _SequenceProvider,
     config: AgentConfig,
@@ -135,14 +129,6 @@ def _echo_agent(
                 input_schema=ToolInputSchema(
                     properties={"value": {"type": "string"}},
                     required=["value"],
-                ),
-            ),
-            ToolDefinition(
-                name="update_plan",
-                description="Update the plan.",
-                input_schema=ToolInputSchema(
-                    properties={"plan": {"type": "string"}},
-                    required=["plan"],
                 ),
             ),
         ],
@@ -695,141 +681,6 @@ async def test_endgame_fix_directive_waits_for_margin(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Plan-only act-now directive
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_plan_only_act_now_fires_at_threshold(tmp_path: Path) -> None:
-    events_path = tmp_path / "events.jsonl"
-    provider = _SequenceProvider(
-        [_plan_tool_call("use-1"), _plan_tool_call("use-2"), _final_text()]
-    )
-    agent = _echo_agent(
-        provider,
-        AgentConfig(
-            plan_only_act_now_threshold=2,
-            max_iterations=10,
-            retry_base_backoff_ms=0,
-            retry_max_backoff_ms=0,
-            runtime_events_path=str(events_path),
-        ),
-    )
-
-    events = [event async for event in agent.run_turn("fix the bug")]
-
-    assert any(event.kind == "done" for event in events)
-    assert len(provider.calls) == 3
-    assert _PLAN_ONLY_ACT_NOW_DIRECTIVE not in _user_texts(
-        provider.calls[1]["messages"]
-    )
-    assert (
-        _user_texts(provider.calls[2]["messages"]).count(_PLAN_ONLY_ACT_NOW_DIRECTIVE)
-        == 1
-    )
-    recorded = _runtime_events(events_path, "plan_only_act_now")
-    assert [event["name"] for event in recorded] == ["plan_only_act_now.injected"]
-    assert recorded[0]["streak"] == 2
-    assert recorded[0]["threshold"] == 2
-
-
-@pytest.mark.asyncio
-async def test_plan_only_streak_resets_on_real_tool_call(tmp_path: Path) -> None:
-    events_path = tmp_path / "events.jsonl"
-    provider = _SequenceProvider(
-        [
-            _plan_tool_call("use-1"),
-            _echo_tool_call("use-2"),
-            _plan_tool_call("use-3"),
-            _plan_tool_call("use-4"),
-            _final_text(),
-        ]
-    )
-    agent = _echo_agent(
-        provider,
-        AgentConfig(
-            plan_only_act_now_threshold=2,
-            max_iterations=10,
-            retry_base_backoff_ms=0,
-            retry_max_backoff_ms=0,
-            runtime_events_path=str(events_path),
-        ),
-    )
-
-    events = [event async for event in agent.run_turn("fix the bug")]
-
-    assert any(event.kind == "done" for event in events)
-    assert len(provider.calls) == 5
-    # The echo at iteration 2 reset the streak: no directive until the second
-    # consecutive plan-only iteration after it.
-    for call in provider.calls[1:4]:
-        assert _PLAN_ONLY_ACT_NOW_DIRECTIVE not in _user_texts(call["messages"])
-    assert (
-        _user_texts(provider.calls[4]["messages"]).count(_PLAN_ONLY_ACT_NOW_DIRECTIVE)
-        == 1
-    )
-    assert len(_runtime_events(events_path, "plan_only_act_now")) == 1
-
-
-@pytest.mark.asyncio
-async def test_plan_only_act_now_refires_after_new_streak(tmp_path: Path) -> None:
-    # The streak resets after firing, so the directive re-fires only after
-    # another full streak — with threshold 1, that is every plan-only
-    # iteration.
-    events_path = tmp_path / "events.jsonl"
-    provider = _SequenceProvider(
-        [_plan_tool_call("use-1"), _plan_tool_call("use-2"), _final_text()]
-    )
-    agent = _echo_agent(
-        provider,
-        AgentConfig(
-            plan_only_act_now_threshold=1,
-            max_iterations=10,
-            retry_base_backoff_ms=0,
-            retry_max_backoff_ms=0,
-            runtime_events_path=str(events_path),
-        ),
-    )
-
-    events = [event async for event in agent.run_turn("fix the bug")]
-
-    assert any(event.kind == "done" for event in events)
-    assert (
-        _user_texts(provider.calls[1]["messages"]).count(_PLAN_ONLY_ACT_NOW_DIRECTIVE)
-        == 1
-    )
-    assert (
-        _user_texts(provider.calls[2]["messages"]).count(_PLAN_ONLY_ACT_NOW_DIRECTIVE)
-        == 2
-    )
-    assert len(_runtime_events(events_path, "plan_only_act_now")) == 2
-
-
-@pytest.mark.asyncio
-async def test_plan_only_act_now_default_off(tmp_path: Path) -> None:
-    events_path = tmp_path / "events.jsonl"
-    provider = _SequenceProvider(
-        [_plan_tool_call("use-1"), _plan_tool_call("use-2"), _final_text()]
-    )
-    agent = _echo_agent(
-        provider,
-        AgentConfig(
-            max_iterations=10,
-            retry_base_backoff_ms=0,
-            retry_max_backoff_ms=0,
-            runtime_events_path=str(events_path),
-        ),
-    )
-
-    events = [event async for event in agent.run_turn("fix the bug")]
-
-    assert any(event.kind == "done" for event in events)
-    for call in provider.calls:
-        assert _PLAN_ONLY_ACT_NOW_DIRECTIVE not in _user_texts(call["messages"])
-    assert _runtime_events(events_path, "plan_only_act_now") == []
-
-
-# ---------------------------------------------------------------------------
 # Env plumbing and defaults
 # ---------------------------------------------------------------------------
 
@@ -847,7 +698,6 @@ def test_env_plumbing_for_endgame_package_levers(
     int_envs = [
         "OPENSQUILLA_MAX_ITERATIONS_DEADLINE_EXTEND_SECONDS",
         "OPENSQUILLA_ENDGAME_FIX_DIRECTIVE_MARGIN_SECONDS",
-        "OPENSQUILLA_PLAN_ONLY_ACT_NOW_THRESHOLD",
     ]
     bool_envs = [
         "OPENSQUILLA_FINAL_DIFF_SALVAGE_VETO",
@@ -876,4 +726,3 @@ def test_agent_config_defaults_keep_endgame_package_off() -> None:
     assert config.deadline_wrapup_sticky_thinking_off is False
     assert config.endgame_fix_directive_margin_seconds == 0
     assert config.reasoning_only_act_now is False
-    assert config.plan_only_act_now_threshold == 0

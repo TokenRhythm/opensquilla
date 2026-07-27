@@ -140,6 +140,8 @@
           :copy-message="copyMessage"
           :download-attachment="downloadAttachment"
           :fork-busy="forkInFlight"
+          :plan-action-pending="planCardPendingAction"
+          :plan-actions-disabled="planActionsDisabled"
           @fork-conversation="forkConversation"
           @edit-message="editMessage"
           @regenerate-message="regenerateMessage"
@@ -154,11 +156,24 @@
           @clarify-submit="submitClarify"
           @clarify-dismiss="dismissClarify"
           @resume-sandbox="resumeSandbox"
+          @plan-implement-current="implementCurrentPlan"
+          @plan-implement-new="implementPlanInNewTask"
+          @plan-replan="beginPlanRevision"
         >
           <template #router-strip="{ message: msg }">
             <RouterFxStrip v-if="shouldRenderRouterStrip(msg)" :message="msg" />
           </template>
         </ChatMessageList>
+
+        <PlanCard
+          v-if="currentPlan && !currentPlanInHistory"
+          :plan="currentPlan"
+          :disabled="planActionsDisabled"
+          :pending-action="planCardPendingAction"
+          @implement-current="implementCurrentPlan"
+          @implement-new="implementPlanInNewTask"
+          @replan="beginPlanRevision"
+        />
 
         <!-- Pre-reveal router phase: shown only before the live activity owns
              the turn. Once activity is visible, execution status becomes
@@ -199,7 +214,7 @@
           <div class="msg-ai-main">
             <ActivityDisclosure
               :lifecycle="liveAnswerPart ? 'answering' : 'working'"
-              :step-count="liveActivityStepCount"
+              :step-count="executionDockRun?.status === 'running' ? 0 : liveActivityStepCount"
               :failure-count="liveActivityFailureCount"
               :phase-label="liveActivityPhaseLabel"
               :elapsed-label="streamPhaseElapsed"
@@ -404,6 +419,20 @@
          composer instead of pinning it to the bottom, so the menu must not
          anchor to the chat container's bottom edge. -->
     <div class="chat-composer-dock">
+    <!-- Durable execution progress belongs to the work surface, not to the
+         transcript. Keeping it immediately above the composer also lets a
+         future goal driver reuse this dock across multiple turns. -->
+    <Transition name="plan-run-dock">
+      <div v-if="executionDockRun" class="plan-run-dock">
+        <PlanRunRibbon
+          :run="executionDockRun"
+          :cancel-busy="planActionPending === 'cancel-run'"
+          :disabled="planModeBusy || planActionPending !== null"
+          @cancel="cancelActivePlanRun"
+          @focus-return="focusComposerAfterPlanRun"
+        />
+      </div>
+    </Transition>
     <!-- Jump-to-latest: floats above the composer once the reader has scrolled up
          off the live edge, so a long streaming answer is never lost below the fold. -->
     <Transition name="jump-latest">
@@ -448,9 +477,10 @@
       v-model="inputText"
       :attachments="pendingAttachments"
       :busy-send-mode="busySendMode"
-      :has-send-content="hasSendContent"
+      :has-send-content="composerHasSendContent"
       :is-streaming="isStreaming"
       :can-stop="canStop"
+      :stop-targets-plan-run="composerStopsPlanRun"
       :is-new-landing="isNewChatLanding"
       :placeholder="composerPlaceholder"
       :send-button-title="sendButtonTitle"
@@ -472,6 +502,12 @@
       :project-status-message="activeProjectStatusMessage"
       :can-close-project="isDraftRoute() && pendingWorkspaceId !== null"
       :can-choose-project="rpc.canChooseProject"
+      :plan-mode-available="planUiAvailable"
+      :collaboration-mode="collaboration.mode"
+      :plan-mode-busy="planModeBusy"
+      :plan-mode-disabled="planActionPending !== null"
+      :plan-mode-applies-next-turn="planModeAppliesNextTurn"
+      :replan-active="replanActive"
       @composition-change="composing = $event"
       @beforeinput="onTextareaBeforeInput"
       @file-change="onFileInputChange"
@@ -484,11 +520,13 @@
       @set-model-routing-mode="setComposerModelRoutingMode"
       @set-visual-effects-enabled="setComposerVisualEffectsEnabled"
       @set-coding-mode-enabled="setComposerCodingModeEnabled"
+      @set-collaboration-mode="setCollaborationMode"
+      @cancel-replan="cancelPlanRevision"
       @voice-input="onVoiceInput"
       @voice-setup="onVoiceSetup"
       @export-markdown="exportMarkdown"
-      @send="onSend"
-      @stop="onStop"
+      @send="onComposerSend"
+      @stop="onComposerStop"
       @choose-project="openProjectPicker"
       @close-project="closeProjectDraft"
     />
@@ -580,6 +618,8 @@ import MetaPreflightCard from '@/components/chat/MetaPreflightCard.vue'
 import MetaRibbon from '@/components/chat/MetaRibbon.vue'
 import MetaRunHistoryDrawer from '@/components/chat/MetaRunHistoryDrawer.vue'
 import PendingQueue from '@/components/chat/PendingQueue.vue'
+import PlanCard from '@/components/chat/PlanCard.vue'
+import PlanRunRibbon from '@/components/chat/PlanRunRibbon.vue'
 import RouterFxStrip from '@/components/chat/RouterFxStrip.vue'
 import SandboxSetupBanner from '@/components/chat/SandboxSetupBanner.vue'
 import SharePreviewModal from '@/components/chat/SharePreviewModal.vue'
@@ -618,6 +658,7 @@ import { useSandboxSetupRecovery } from '@/composables/chat/useSandboxSetupRecov
 import { useChatStallWatchdog } from '@/composables/chat/useChatStallWatchdog'
 import { useArtifactImageLightbox } from '@/composables/chat/useArtifactImageLightbox'
 import { useMetaRuns } from '@/composables/chat/useMetaRuns'
+import { useChatPlans } from '@/composables/chat/useChatPlans'
 import { runStatusLabelText as sessionRunStatusLabelText } from '@/composables/useSessions'
 import { useChatSessionRoute } from '@/composables/chat/useChatSessionRoute'
 import {
@@ -665,6 +706,12 @@ import type {
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import { isSandboxRunMode, type SandboxRunMode } from '@/types/sandbox'
 import type { ChatPart, InterruptViewState } from '@/types/parts'
+import type {
+  CollaborationMode,
+  PlanCardAction,
+  PlanCardActionTarget,
+  PlanRunSnapshot,
+} from '@/types/plans'
 import {
   artifactCategory,
   artifactDownloadUrl,
@@ -973,6 +1020,7 @@ let sendCurrentInput: () => void = () => {}
 // Late-bound: dispatchHiddenSend is created below (useChatSend) but the /meta
 // slash handler (useChatSlashCommands, created earlier) needs it at call time.
 let dispatchHiddenForMeta: (providerText: string, displayText: string) => void = () => {}
+let dispatchPlanComposerPrompt: (prompt: string, composerText: string) => void = () => {}
 let isCompactInFlightForCurrentSession: () => boolean = () => false
 let isQueuedDeliveryBlocked: () => boolean = () => false
 let dispatchHiddenControl: (providerText: string, displayText: string) => void = () => {}
@@ -1142,6 +1190,38 @@ const {
   resolveInitialSession,
 } = chatSessionRoute
 
+let switchToPlanSession: (key: string) => void | Promise<unknown> = () => {}
+let planMutationAccepted: () => void = () => {}
+const chatPlans = useChatPlans({
+  rpc,
+  sessionKey,
+  currentEpoch,
+  isStreaming,
+  inputText,
+  createSessionKey,
+  agentId: () => agentIdFromSessionKey(sessionKey.value),
+  switchToSession: key => switchToPlanSession(key),
+  focusComposer: () => composerRef.value?.focusTextarea(),
+  notifyError: message => pushToast(
+    t('chat.plan.actionFailed', { error: message }),
+    { tone: 'danger', duration: 8000 },
+  ),
+  onMutationAccepted: () => planMutationAccepted(),
+  isDraft: () => isDraftRoute() && pendingSessionIntent.value === 'new_chat',
+})
+const {
+  collaboration,
+  initialCollaborationMode,
+  currentPlan,
+  currentPlanRevisionId,
+  activePlanRun,
+  modeBusy: planModeBusy,
+  modeAppliesNextTurn: planModeAppliesNextTurn,
+  pendingAction: planActionPending,
+  replanTarget,
+  replanActive,
+} = chatPlans
+
 const renderSourceMessages = computed(() =>
   messagesWithStoppedOutputNotice(
     messages.value,
@@ -1160,6 +1240,7 @@ const chatRenderedMessages = useChatRenderedMessages({
   routerVisualMode,
   modelRoutingMode,
   isStreaming,
+  currentPlanRevisionId,
   renderMarkdown,
   stripGeneratedArtifactMarkers,
   stripTimePrefix,
@@ -1259,6 +1340,7 @@ const {
   cancelAnchorStabilization,
   cleanup: cleanupHistory,
 } = chatHistory
+planMutationAccepted = () => scheduleHistorySync()
 
 const voiceInput = useVoiceInput()
 const {
@@ -1295,6 +1377,7 @@ const {
   editMessage,
 } = chatMessageActions
 
+let applyPendingUserInputSnapshot: typeof chatPlans.applyBootstrap = () => {}
 const chatSessionSubscription = useChatSessionSubscription({
   rpc,
   sessionKey,
@@ -1344,6 +1427,10 @@ const chatSessionSubscription = useChatSessionSubscription({
     if (generation < 0) return
     activeProjectWorkspace.failSessionResolution(key, generation)
   },
+  onSnapshot: snapshot => {
+    chatPlans.applyBootstrap(snapshot)
+    applyPendingUserInputSnapshot(snapshot)
+  },
 })
 const {
   isHydrating: isSessionHydrating,
@@ -1355,6 +1442,8 @@ const sessionHasActiveWork = computed(() => (
   isStreaming.value
   || activeTaskGroups.value.size > 0
   || ['queued', 'running', 'approval_pending'].includes(runStatus.value.status)
+  || activePlanRun.value?.status === 'queued'
+  || activePlanRun.value?.status === 'running'
   || pendingQueueOwnerContext.value?.sessionKey === sessionKey.value
 ))
 const canStop = computed(() => !isSessionHydrating.value && sessionHasActiveWork.value)
@@ -1417,6 +1506,7 @@ const {
   switchToSession: switchRuntimeToSession,
   adoptResponseSession,
 } = chatSessionRuntime
+switchToPlanSession = switchToSession
 
 function switchToSession(nextSessionKey: string) {
   if (nextSessionKey !== sessionKey.value) {
@@ -1434,11 +1524,19 @@ const chatSlashCommands = useChatSlashCommands({
     freshTaskDraft.requestFreshTask('main')
     goToDraft({ agentId: 'main' })
   },
-  resetCurrentSession: resetCurrentSessionAfterSlash,
+  resetCurrentSession: () => {
+    resetCurrentSessionAfterSlash()
+    chatPlans.reset()
+  },
   setCompactInFlight,
   showCompactStatus,
   notify: (message: string) => pushToast(message, { duration: 6000 }),
   dispatchHidden: (providerText: string, displayText: string) => dispatchHiddenForMeta(providerText, displayText),
+  dispatchPlanPrompt: (prompt: string, composerText: string) => {
+    dispatchPlanComposerPrompt(prompt, composerText)
+  },
+  activatePlanMode: () => chatPlans.setMode('plan'),
+  planModeAvailable: () => planUiAvailable.value,
 })
 const {
   slashOpen,
@@ -1494,6 +1592,7 @@ const chatSend = useChatSend({
   sendBlockedReason: activeWorkspaceSendBlockedReason,
   validateActiveProjectBeforeSend,
   acceptPendingWorkspaceBinding: activeProjectWorkspace.acceptPendingBinding,
+  initialCollaborationMode,
   pendingForkBeforeMessageId,
   materializeDraftSession: key => {
     if (!isDraftRoute()) return
@@ -1527,11 +1626,33 @@ const {
   onStop,
   sendQueuedSteer,
   sendQueuedFollowup,
+  dispatchComposerPrompt,
   dispatchHiddenSend,
   sendHiddenMetaPreflightConfirmation,
 } = chatSend
-sendCurrentInput = onSend
+
+async function onComposerSend() {
+  // Serialize an existing-session mode mutation before accepting another
+  // composer turn, so the send cannot race the collaboration CAS update.
+  if (planModeBusy.value) return
+  const target = replanTarget.value
+  if (!target) {
+    onSend()
+    return
+  }
+  const prompt = inputText.value.trim()
+  if (!prompt) return
+  const accepted = await chatPlans.revise({ ...target, prompt })
+  if (!accepted) return
+  inputText.value = ''
+  autoResizeTextarea()
+}
+
+sendCurrentInput = onComposerSend
 dispatchHiddenForMeta = dispatchHiddenSend
+dispatchPlanComposerPrompt = (prompt, composerText) => {
+  void dispatchComposerPrompt(prompt, composerText)
+}
 dispatchHiddenControl = dispatchHiddenSend
 dispatchQueuedItem = sendQueuedFollowup
 
@@ -1601,7 +1722,9 @@ const {
   extendInterrupt,
   submitClarify,
   dismissClarify,
+  applyUserInputBootstrap,
 } = chatApprovals
+applyPendingUserInputSnapshot = applyUserInputBootstrap
 
 const rpcEventHandlers = useChatRpcEventHandlers({
   sessionKey,
@@ -1956,12 +2079,92 @@ watch(
 )
 
 const composerPlaceholder = computed(() => {
+  if (replanActive.value) return t('chat.plan.revisePromptPlaceholder')
+  if (collaboration.value.mode === 'plan') return t('chat.planMode.placeholder')
   if (isNewChatLanding.value) return t('chat.placeholderLanding')
   return isCompactViewport.value ? t('chat.placeholderCompact') : t('chat.placeholder')
 })
 
 const hasSendContent = computed(() => {
   return inputText.value.trim().length > 0 || pendingAttachments.value.some(isSendableAttachment)
+})
+const composerHasSendContent = computed(() =>
+  replanActive.value ? inputText.value.trim().length > 0 : hasSendContent.value,
+)
+
+// A mixed-version gateway may know plans.setMode but not the atomic first-send
+// contract. Hide Plan rather than claim a read-only turn that would run Default.
+const planUiAvailable = computed(() =>
+  rpc.supportsMethod('plans.setMode')
+  && rpc.supportsMethod('plans.capabilities'),
+)
+const planCardPendingAction = computed<PlanCardAction | null>(() => {
+  const action = planActionPending.value
+  if (action === 'revise') return 'replan'
+  return action === 'implement-current' || action === 'implement-new' || action === 'replan'
+    ? action
+    : null
+})
+const planActionsDisabled = computed(() =>
+  isStreaming.value
+  || planModeBusy.value
+  || planActionPending.value !== null
+  || activePlanRun.value?.status === 'queued'
+  || activePlanRun.value?.status === 'running',
+)
+const PLAN_RUN_TERMINAL_HOLD_MS = 2000
+const executionDockRun = ref<PlanRunSnapshot | null>(null)
+const composerStopsPlanRun = computed(() =>
+  executionDockRun.value?.status === 'queued'
+  || executionDockRun.value?.status === 'running',
+)
+let executionDockHideTimer: ReturnType<typeof setTimeout> | null = null
+
+function clearExecutionDockHideTimer() {
+  if (executionDockHideTimer === null) return
+  clearTimeout(executionDockHideTimer)
+  executionDockHideTimer = null
+}
+
+function syncExecutionDockRun() {
+  const run = activePlanRun.value
+  clearExecutionDockHideTimer()
+  if (!run) {
+    executionDockRun.value = null
+    return
+  }
+  if (['queued', 'running', 'paused', 'blocked'].includes(run.status)) {
+    executionDockRun.value = run
+    return
+  }
+  if (executionDockRun.value?.runId !== run.runId) {
+    executionDockRun.value = null
+    return
+  }
+  executionDockRun.value = run
+  executionDockHideTimer = setTimeout(() => {
+    if (executionDockRun.value?.runId === run.runId) {
+      executionDockRun.value = null
+    }
+    executionDockHideTimer = null
+  }, PLAN_RUN_TERMINAL_HOLD_MS)
+}
+
+watch(
+  () => [
+    activePlanRun.value?.runId,
+    activePlanRun.value?.status,
+    activePlanRun.value?.stateRevision,
+  ],
+  syncExecutionDockRun,
+  { immediate: true },
+)
+const currentPlanInHistory = computed(() => {
+  const revisionId = currentPlan.value?.revisionId
+  if (!revisionId) return false
+  return renderedMessages.value.some(message =>
+    message.planRevisions?.some(plan => plan.revisionId === revisionId),
+  )
 })
 
 const landingSuggestionsSuppressed = computed(() => shouldSuppressLandingSuggestions({
@@ -2006,6 +2209,7 @@ const composerSendBlockedMessage = computed(() =>
 )
 
 const sendButtonTitle = computed(() => {
+  if (replanActive.value) return t('chat.plan.reviseSend')
   if (composerSendBlockedMessage.value) return composerSendBlockedMessage.value
   if (isCompactInFlightForCurrentSession()) return t('chat.sendQueuesUntilCompaction')
   if (isStreaming.value) {
@@ -2015,6 +2219,47 @@ const sendButtonTitle = computed(() => {
   }
   return t('chat.send')
 })
+
+function implementCurrentPlan(target: PlanCardActionTarget) {
+  void chatPlans.implement(target, false)
+}
+
+function implementPlanInNewTask(target: PlanCardActionTarget) {
+  void chatPlans.implement(target, true)
+}
+
+function beginPlanRevision(target: PlanCardActionTarget) {
+  if (pendingAttachments.value.length > 0) {
+    pushToast(t('chat.plan.attachmentsUnavailable'), { tone: 'warn' })
+    return
+  }
+  chatPlans.beginReplan(target)
+}
+
+function cancelPlanRevision() {
+  chatPlans.cancelReplan()
+}
+
+function cancelActivePlanRun() {
+  void chatPlans.cancelRun()
+}
+
+function focusComposerAfterPlanRun() {
+  composerRef.value?.focusTextarea()
+}
+
+function onComposerStop() {
+  const run = executionDockRun.value
+  if (run && (run.status === 'queued' || run.status === 'running')) {
+    void chatPlans.cancelRun()
+    return
+  }
+  onStop()
+}
+
+function setCollaborationMode(mode: CollaborationMode) {
+  void chatPlans.setMode(mode)
+}
 
 const currentChatTitle = computed(() => {
   const firstUser = messages.value.find(msg => msg.role === 'user' && stripTimePrefix(msg.text || '').trim())
@@ -2619,6 +2864,7 @@ function dragEventHasFiles(e: DragEvent): boolean {
 function onChatDragEnter(e: DragEvent) {
   if (!dragEventHasFiles(e)) return
   e.preventDefault()
+  if (replanActive.value) return
   threadDragDepth.value += 1
   threadDragOver.value = true
 }
@@ -2626,6 +2872,10 @@ function onChatDragEnter(e: DragEvent) {
 function onChatDragOver(e: DragEvent) {
   if (!dragEventHasFiles(e)) return
   e.preventDefault()
+  if (replanActive.value) {
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'none'
+    return
+  }
   if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
   threadDragOver.value = true
 }
@@ -2643,6 +2893,10 @@ function onChatDrop(e: DragEvent) {
   threadDragDepth.value = 0
   threadDragOver.value = false
   if (!dragEventHasFiles(e)) return
+  if (replanActive.value) {
+    pushToast(t('chat.plan.attachmentsUnavailable'), { tone: 'warn' })
+    return
+  }
   const files = Array.from(e.dataTransfer?.files || [])
   if (files.length === 0) return
   void addAttachments(files)
@@ -2667,6 +2921,11 @@ function onDocumentPaste(e: ClipboardEvent) {
   })) return
   const files = collectClipboardFiles(e.clipboardData)
   if (files.length === 0) return
+  if (replanActive.value) {
+    e.preventDefault()
+    pushToast(t('chat.plan.attachmentsUnavailable'), { tone: 'warn' })
+    return
+  }
   void addAttachments(files)
   // File managers and screenshot tools put both the file and its name/path as
   // text on the clipboard; once we have attached the files, suppress the
@@ -2702,7 +2961,7 @@ function onDocumentKeydown(e: KeyboardEvent) {
 
   if (canStop.value) {
     e.preventDefault()
-    onStop()
+    onComposerStop()
     return
   }
 
@@ -2908,6 +3167,7 @@ onMounted(async () => {
   unsubs.push(chatRpcSubscriptions.subscribe())
   unsubs.push(chatApprovals.subscribe())
   unsubs.push(metaRuns.subscribe())
+  unsubs.push(chatPlans.subscribe())
   const sessionSubscription = subscribeSession()
   if (!initialSession.draft) loadHistory()
   void loadFeatureToggles().then(() => {
@@ -2943,6 +3203,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   chatViewDisposed = true
+  clearExecutionDockHideTimer()
   unsubs.forEach(fn => fn())
   unsubs = []
   cleanupPendingQueue()

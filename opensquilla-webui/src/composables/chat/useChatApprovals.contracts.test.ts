@@ -322,3 +322,125 @@ describe('timed approval updates', () => {
     }
   })
 })
+
+describe('clarify tool-result recovery', () => {
+  const clarifyResult = {
+    kind: 'user_input',
+    paused: true,
+    request_id: 'input-request-1',
+    run_id: 'plan-run-1',
+    step: 'confirm_scope',
+    clarify_schema: {
+      intro: 'Confirm the implementation scope.',
+      fields: [{
+        name: 'scope',
+        type: 'enum',
+        required: true,
+        prompt: 'Which scope?',
+        choices: ['focused', 'complete'],
+      }],
+    },
+  }
+
+  it.each([
+    ['object result', clarifyResult],
+    ['serialized JSON result', JSON.stringify(clarifyResult)],
+  ])('renders and submits a request_user_input %s', async (_label, result) => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      runtime.handlers.get('session.event.tool_result')?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result,
+      })
+
+      expect(runtime.approvals.pendingClarify.value).toEqual({
+        intro: 'Confirm the implementation scope.',
+        fields: [{
+          name: 'scope',
+          type: 'enum',
+          required: true,
+          prompt: 'Which scope?',
+          defaultValue: '',
+          choices: ['focused', 'complete'],
+        }],
+        requestId: 'input-request-1',
+        runId: 'plan-run-1',
+        step: 'confirm_scope',
+      })
+      expect(runtime.appendInterruptFrame).toHaveBeenLastCalledWith(expect.objectContaining({
+        interruptKind: 'clarify',
+        approvalId: 'input-request-1',
+      }))
+
+      await runtime.approvals.submitClarify({ scope: 'focused' })
+      expect(runtime.rpcCall).toHaveBeenLastCalledWith('chat.clarify_submit', {
+        sessionKey: 'agent:main:web',
+        fields: { scope: 'focused' },
+        request_id: 'input-request-1',
+        run_id: 'plan-run-1',
+      })
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('hydrates a pending deferred request after reconnect', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      runtime.approvals.applyUserInputBootstrap({
+        pendingUserInputs: [clarifyResult],
+      })
+
+      expect(runtime.approvals.pendingClarify.value?.requestId).toBe('input-request-1')
+      expect(runtime.appendInterruptFrame).toHaveBeenLastCalledWith(expect.objectContaining({
+        interruptKind: 'clarify',
+        approvalId: 'input-request-1',
+      }))
+      expect(runtime.interruptState.value.get('input-request-1')?.resolution).toBeNull()
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('settles the matching card when the same tool id returns answered', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      const handler = runtime.handlers.get('session.event.tool_result')
+      handler?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result: clarifyResult,
+      })
+      handler?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result: {
+          kind: 'user_input',
+          status: 'answered',
+          paused: false,
+          request_id: 'input-request-1',
+          answers: { scope: 'focused' },
+        },
+      })
+
+      expect(runtime.interruptState.value.get('input-request-1')).toEqual({
+        resolution: 'replied',
+        busy: false,
+        error: '',
+      })
+      expect(runtime.approvals.clarifySubmitted.value).toBe(true)
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+})

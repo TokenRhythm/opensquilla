@@ -163,6 +163,18 @@ export function toParts(
     })
   }
 
+  // (2d) immutable plan revisions are typed transcript parts. The rendered
+  // message suppresses their Markdown fallback body, so this card is the one
+  // visual representation while the raw text remains available to providers
+  // and older clients.
+  for (const plan of msg.planRevisions ?? []) {
+    parts.push({
+      type: 'plan',
+      plan,
+      key: `${ownerKey}:plan:${plan.revisionId}`,
+    })
+  }
+
   // (3) artifacts — one part each, in order
   for (const artifact of msg.artifacts ?? []) {
     const id = String(artifact.id || artifact.key || artifact.name || parts.length)

@@ -97,7 +97,13 @@ from opensquilla.session.compaction_lifecycle import (
     pre_compaction_flush_requires_safe_receipt,
 )
 from opensquilla.session.keys import canonicalize_session_key, normalize_agent_id, parse_agent_id
-from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus, SessionStatus
+from opensquilla.session.models import (
+    AgentTaskRecord,
+    AgentTaskStatus,
+    PlanRevisionRecord,
+    PlanRunRecord,
+    SessionStatus,
+)
 from opensquilla.session.naming import (
     generate_session_title,
     is_naming_eligible,
@@ -1829,6 +1835,11 @@ async def _handle_sessions_send(
     ctx: RpcContext,
     *,
     fingerprint_params: dict[str, Any] | None = None,
+    plan_revision_id: str | None = None,
+    plan_context_revision_id: str | None = None,
+    required_collaboration_mode: str | None = None,
+    required_collaboration_revision: int | None = None,
+    initial_collaboration_mode: str | None = None,
 ) -> dict:
     key = _require_key(params)
     if not isinstance(params, dict) or "message" not in params:
@@ -1883,6 +1894,64 @@ async def _handle_sessions_send(
                 "OWNER_REQUIRED",
                 "Project workspaces require a locally proven owner.",
             )
+    if plan_revision_id is not None:
+        plan_revision_id = plan_revision_id.strip()
+        if not plan_revision_id:
+            raise ValueError("plan_revision_id must not be empty")
+        if session_intent not in {
+            SessionIntent.CONTINUE,
+            SessionIntent.NEW_CHAT,
+        }:
+            raise ValueError(
+                "Plan implementation supports continue or new_chat intent only"
+            )
+        if fork_before_message_id is not None:
+            raise ValueError("Plan implementation cannot be combined with a transcript fork")
+    if plan_context_revision_id is not None:
+        plan_context_revision_id = plan_context_revision_id.strip()
+        if not plan_context_revision_id:
+            raise ValueError("plan_context_revision_id must not be empty")
+    if required_collaboration_mode not in {None, "default", "plan"}:
+        raise ValueError("required_collaboration_mode must be default or plan")
+    if (
+        required_collaboration_revision is not None
+        and (
+            not isinstance(required_collaboration_revision, int)
+            or isinstance(required_collaboration_revision, bool)
+            or required_collaboration_revision < 0
+        )
+    ):
+        raise ValueError("required_collaboration_revision must be a non-negative integer")
+    if (
+        initial_collaboration_mode is not None
+        and (
+            not isinstance(initial_collaboration_mode, str)
+            or initial_collaboration_mode not in {"default", "plan"}
+        )
+    ):
+        raise ValueError("initial_collaboration_mode must be default or plan")
+    if initial_collaboration_mode is not None:
+        if session_intent is not SessionIntent.NEW_CHAT:
+            raise ValueError(
+                "initial_collaboration_mode requires new_chat intent"
+            )
+        if fork_before_message_id is not None:
+            raise ValueError(
+                "initial_collaboration_mode cannot be combined with a transcript fork"
+            )
+        if plan_revision_id is not None or plan_context_revision_id is not None:
+            raise ValueError(
+                "initial_collaboration_mode cannot be combined with a plan operation"
+            )
+        if (
+            required_collaboration_mode is not None
+            and required_collaboration_mode != initial_collaboration_mode
+        ):
+            raise ValueError("Conflicting required collaboration modes")
+        required_collaboration_mode = initial_collaboration_mode
+        required_collaboration_revision = (
+            1 if initial_collaboration_mode == "plan" else 0
+        )
 
     if ctx.session_manager is None:
         raise KeyError("No session manager available")
@@ -1916,11 +1985,24 @@ async def _handle_sessions_send(
                     retryable=False,
                     accepted=False,
                 )
-            return await _accepted_turn_response(
+            replay_response = await _accepted_turn_response(
                 previous_acceptance,
                 client_request_id=ingress_identity.client_request_id,
                 storage=storage,
             )
+            if initial_collaboration_mode is not None:
+                replay_response["acceptedCollaboration"] = {
+                    "mode": initial_collaboration_mode,
+                    "revision": required_collaboration_revision or 0,
+                }
+                current_session = await storage.get_session(
+                    previous_acceptance.receipt.accepted_session_key
+                )
+                if current_session is not None:
+                    replay_response["collaboration"] = (
+                        _plan_collaboration_snapshot(current_session)
+                    )
+            return replay_response
 
     def _project_workspace_error(exc: ProjectWorkspaceStateError) -> RpcHandlerError:
         return map_project_workspace_error(
@@ -1978,6 +2060,10 @@ async def _handle_sessions_send(
         and callable(getattr(task_runtime_candidate, "activate", None))
         and callable(getattr(task_runtime_candidate, "abort_reservation", None))
     )
+    if initial_collaboration_mode is not None and not supports_task_runtime_activation:
+        raise RpcUnavailableError(
+            "Initial collaboration mode requires atomic turn acceptance"
+        )
 
     async def _prepare_or_apply_intent() -> tuple[Any, Any | None]:
         existing_session = await storage.get_session(key)
@@ -2010,6 +2096,14 @@ async def _handle_sessions_send(
     else:
         async with intent_lock:
             session, atomic_intent_plan = await _prepare_or_apply_intent()
+
+    if initial_collaboration_mode is not None and (
+        atomic_intent_plan is None
+        or getattr(atomic_intent_plan, "action", None) != "create"
+    ):
+        raise ValueError(
+            "Initial collaboration mode requires atomic session creation"
+        )
 
     if fork_before_message_id is not None:
         parent_key = key
@@ -2077,6 +2171,91 @@ async def _handle_sessions_send(
         if isinstance(canonical_session_id, str) and canonical_session_id
         else key.split(":")[-1] or key
     )
+    plan_run: PlanRunRecord | None = None
+    plan_revision_to_create: PlanRevisionRecord | None = None
+    selected_plan_revision_id = plan_revision_id
+    if plan_revision_id is not None:
+        selected_revision = await storage.get_plan_revision(plan_revision_id)
+        if selected_revision is None:
+            raise KeyError(f"Plan revision not found: {plan_revision_id}")
+        intent_action = getattr(atomic_intent_plan, "action", "continue")
+        if intent_action == "continue":
+            current_revision_id = getattr(session, "active_plan_revision_id", None)
+            if current_revision_id != plan_revision_id:
+                raise RpcHandlerError(
+                    "PLAN_REVISION_CHANGED",
+                    "The selected plan is no longer the current revision.",
+                    retryable=False,
+                    accepted=False,
+                )
+            active_run = await storage.get_active_plan_run(key)
+            if active_run is not None:
+                if active_run.status in {"queued", "running"}:
+                    raise RpcHandlerError(
+                        "PLAN_RUN_ACTIVE",
+                        "This plan already has an implementation task in progress.",
+                        details={"runId": active_run.run_id, "status": active_run.status},
+                        retryable=False,
+                        accepted=False,
+                    )
+                if active_run.driver_kind == "goal":
+                    raise RpcHandlerError(
+                        "PLAN_RUN_GOAL_OWNED",
+                        "A Goal controller owns the active plan run.",
+                        details={"runId": active_run.run_id, "status": active_run.status},
+                        retryable=False,
+                        accepted=False,
+                    )
+                if active_run.plan_revision_id == plan_revision_id:
+                    # Resume the same mutable overlay; never hide progress by
+                    # manufacturing a replacement run for the same revision.
+                    plan_run = active_run
+        elif intent_action != "create":
+            raise ValueError("A new-task plan implementation must create a fresh session")
+        else:
+            # A new task gets an independent immutable lineage. Sharing the
+            # source plan_id would make two valid replans collide on the global
+            # (plan_id, generation) invariant and would couple deletion
+            # lifecycles across sessions.
+            from opensquilla.session.plans import new_plan_revision
+
+            plan_revision_to_create = new_plan_revision(
+                source_session_key=key,
+                source_session_id=session_id,
+                source_epoch=int(getattr(session, "epoch", 0) or 0),
+                title=selected_revision.title,
+                markdown=selected_revision.markdown,
+                steps=selected_revision.steps,
+                parent=None,
+            )
+            selected_plan_revision_id = plan_revision_to_create.revision_id
+        if plan_run is None:
+            assert selected_plan_revision_id is not None
+            plan_run = PlanRunRecord(
+                run_id=str(uuid.uuid4()),
+                session_key=key,
+                session_id=session_id,
+                session_epoch=int(getattr(session, "epoch", 0) or 0),
+                plan_revision_id=selected_plan_revision_id,
+                driver_kind="manual",
+                status="queued",
+                step_states=[],
+            )
+    if plan_context_revision_id is not None:
+        context_revision = await storage.get_plan_revision(plan_context_revision_id)
+        if context_revision is None:
+            raise KeyError(f"Plan revision not found: {plan_context_revision_id}")
+        if (
+            getattr(atomic_intent_plan, "action", "continue") == "continue"
+            and getattr(session, "active_plan_revision_id", None)
+            != plan_context_revision_id
+        ):
+            raise RpcHandlerError(
+                "PLAN_REVISION_CHANGED",
+                "The selected plan is no longer the current revision.",
+                retryable=False,
+                accepted=False,
+            )
     generate_title = await _should_auto_title(ctx, storage, session, key, session_id)
     disk_budget = getattr(attachments_cfg, "transcript_disk_budget_bytes", None)
     opaque_cap = getattr(attachments_cfg, "opaque_max_bytes", None)
@@ -2281,6 +2460,37 @@ async def _handle_sessions_send(
             "surface_id": surface_id,
             "turn_context_intent": "send",
             "turn_context_revision": 1,
+            **(
+                {
+                    "plan_run_id": plan_run.run_id,
+                    "plan_revision_id": selected_plan_revision_id,
+                    "require_current_plan_revision": True,
+                }
+                if plan_run is not None
+                else {}
+            ),
+            **(
+                {
+                    "plan_revision_id": plan_context_revision_id,
+                    "require_current_plan_revision": True,
+                }
+                if plan_context_revision_id is not None
+                else {}
+            ),
+            **(
+                {"required_collaboration_mode": required_collaboration_mode}
+                if required_collaboration_mode is not None
+                else {}
+            ),
+            **(
+                {
+                    "required_collaboration_revision": (
+                        required_collaboration_revision
+                    )
+                }
+                if required_collaboration_revision is not None
+                else {}
+            ),
         },
     )
     ingress_turn_context = {
@@ -2547,6 +2757,15 @@ async def _handle_sessions_send(
     )
     persisted_entry = None
     expected_epoch = 0
+    if plan_run is not None and not atomic_runtime_acceptance:
+        raise RpcUnavailableError(
+            "Plan implementation requires atomic TaskRuntime acceptance"
+        )
+    if initial_collaboration_mode is not None and not atomic_runtime_acceptance:
+        raise RpcUnavailableError(
+            "Initial collaboration mode requires atomic TaskRuntime acceptance"
+        )
+
     if prepared_acceptance:
         persist_content = message_text
         if raw_attachments or display_text is not None:
@@ -2613,6 +2832,24 @@ async def _handle_sessions_send(
                         list(snapshot.summaries),
                     )
 
+            accepted_plan_run = (
+                plan_run.model_copy(
+                    update={"active_task_id": task_record.task_id},
+                )
+                if plan_run is not None
+                else None
+            )
+            accepted_session_updates: dict[str, Any] = {}
+            if accepted_run_mode_origin is not None:
+                accepted_session_updates["origin"] = accepted_run_mode_origin
+            if plan_run is not None:
+                accepted_session_updates["collaboration_mode"] = "default"
+                if plan_revision_to_create is None:
+                    accepted_session_updates["active_plan_revision_id"] = (
+                        selected_plan_revision_id
+                    )
+            elif initial_collaboration_mode == "plan":
+                accepted_session_updates["collaboration_mode"] = "plan"
             return await storage.accept_turn(
                 persisted_entry,
                 expected_epoch=expected_epoch,
@@ -2638,11 +2875,12 @@ async def _handle_sessions_send(
                     if atomic_intent_plan.action == "fork"
                     else ()
                 ),
-                session_updates=(
-                    {"origin": accepted_run_mode_origin}
-                    if accepted_run_mode_origin is not None
-                    else None
-                ),
+                session_updates=accepted_session_updates or None,
+                plan_revision=plan_revision_to_create,
+                # Associate the task while the run is still queued.  The UI
+                # remains gated by ``status == running``, but cancellation can
+                # now stop a queued implementation before it begins.
+                plan_run=accepted_plan_run,
                 merge_into_task=merge_into_task,
                 workspace_guard=workspace_guard,
             )
@@ -2921,12 +3159,41 @@ async def _handle_sessions_send(
                     session_key=key,
                     task_id=acceptance.receipt.task_id,
                 )
-        return await _accepted_turn_response(
+        response = await _accepted_turn_response(
             acceptance,
             client_request_id=ingress_identity.client_request_id,
             storage=storage,
             turn_context=(persisted_entry.turn_context if not acceptance.replayed else None),
         )
+        if initial_collaboration_mode is not None:
+            accepted_collaboration = {
+                "mode": initial_collaboration_mode,
+                "revision": required_collaboration_revision or 0,
+            }
+            response["acceptedCollaboration"] = accepted_collaboration
+            current_session = await storage.get_session(key)
+            if current_session is not None:
+                response["collaboration"] = _plan_collaboration_snapshot(
+                    current_session
+                )
+            if not acceptance.replayed:
+                try:
+                    await _emit_to_subscribers(
+                        ctx,
+                        key,
+                        "session.event.collaboration_mode",
+                        {
+                            "session_key": key,
+                            "collaboration": accepted_collaboration,
+                            "appliesTo": "current_turn",
+                        },
+                    )
+                except Exception:  # noqa: BLE001 - turn is already accepted.
+                    log.exception(
+                        "sessions.send.initial_collaboration_emit_failed",
+                        session_key=key,
+                    )
+        return response
 
     if prepared_acceptance:
         assert atomic_intent_plan is not None
@@ -4957,6 +5224,49 @@ async def _handle_sessions_messages_subscribe(params: dict | None, ctx: RpcConte
         if storage is not None and session is not None
         else None
     )
+    pending_user_inputs: list[dict[str, Any]] = []
+    pending_user_inputs_getter = getattr(
+        getattr(ctx, "task_runtime", None),
+        "pending_user_inputs",
+        None,
+    )
+    if callable(pending_user_inputs_getter):
+        candidate = pending_user_inputs_getter(key)
+        pending_user_inputs = (
+            await candidate if inspect.isawaitable(candidate) else candidate
+        )
+    collaboration: dict[str, Any] | None = None
+    current_plan_payload: dict[str, Any] | None = None
+    active_plan_run_payload: dict[str, Any] | None = None
+    session_epoch: int | None = None
+    if storage is not None and session is not None:
+        session_epoch = await _bootstrap_epoch(
+            ctx.session_manager,
+            storage,
+            session,
+            key,
+        )
+        collaboration = _plan_collaboration_snapshot(session)
+        get_current_plan = getattr(storage, "get_current_plan_revision", None)
+        get_active_run = getattr(storage, "get_active_plan_run", None)
+        current_plan = (
+            await get_current_plan(key) if callable(get_current_plan) else None
+        )
+        active_plan_run = (
+            await get_active_run(key) if callable(get_active_run) else None
+        )
+        from opensquilla.session.plans import (
+            plan_revision_snapshot,
+            plan_run_snapshot,
+        )
+
+        if current_plan is not None:
+            current_plan_payload = plan_revision_snapshot(
+                current_plan,
+                current=True,
+            )
+        if active_plan_run is not None:
+            active_plan_run_payload = plan_run_snapshot(active_plan_run)
 
     return {
         "subscribed": subscription_mgr is not None,
@@ -4975,6 +5285,11 @@ async def _handle_sessions_messages_subscribe(params: dict | None, ctx: RpcConte
             session=session,
             principal=ctx.principal,
         ),
+        "pendingUserInputs": pending_user_inputs,
+        "collaboration": collaboration,
+        "currentPlan": current_plan_payload,
+        "activePlanRun": active_plan_run_payload,
+        **({"epoch": session_epoch} if session_epoch is not None else {}),
         **task_state,
     }
 
@@ -5111,6 +5426,571 @@ async def _bootstrap_epoch(
     return resolved
 
 
+def _require_plan_session_key(params: dict | None) -> str:
+    key = _optional_string_param(params, "sessionKey", "session_key", "key")
+    if key is None:
+        raise ValueError("params.sessionKey is required")
+    return canonicalize_session_key(key)
+
+
+def _plan_collaboration_snapshot(
+    session: Any,
+    *,
+    applies_to: str = "next_turn",
+) -> dict[str, Any]:
+    return {
+        "mode": str(getattr(session, "collaboration_mode", "default") or "default"),
+        "revision": int(getattr(session, "collaboration_revision", 0) or 0),
+        "appliesTo": applies_to,
+    }
+
+
+@_d.method("plans.capabilities", scope="operator.read")
+async def _handle_plans_capabilities(
+    _params: dict | None,
+    _ctx: RpcContext,
+) -> dict[str, bool]:
+    """Advertise mode contracts that must fail closed across mixed versions."""
+
+    return {
+        "planMode": True,
+        "initialModeOnSend": True,
+        "atomicInitialMode": True,
+    }
+
+
+@_d.method("plans.setMode", scope="operator.write")
+async def _handle_plans_set_mode(params: dict | None, ctx: RpcContext) -> dict:
+    key = _require_plan_session_key(params)
+    mode = _optional_string_param(params, "mode")
+    if mode not in {"default", "plan"}:
+        raise ValueError("params.mode must be default or plan")
+    if ctx.session_manager is None:
+        raise RpcUnavailableError("Session manager is not configured")
+    storage = get_session_storage(ctx.session_manager)
+    if storage is None:
+        raise RpcUnavailableError("Session storage is not configured")
+    expected_raw = (params or {}).get(
+        "expectedRevision",
+        (params or {}).get("expected_revision"),
+    )
+    if expected_raw is not None and (
+        isinstance(expected_raw, bool) or not isinstance(expected_raw, int)
+    ):
+        raise ValueError("params.expectedRevision must be an integer")
+    current = await storage.get_session(key)
+    if current is None:
+        if expected_raw not in {None, 0}:
+            raise RpcHandlerError(
+                "COLLABORATION_CHANGED",
+                "The session does not exist at the expected revision.",
+                details={
+                    "collaboration": {
+                        "mode": "default",
+                        "revision": 0,
+                        "appliesTo": "next_turn",
+                    }
+                },
+                retryable=True,
+                accepted=False,
+            )
+        lock = get_session_lock(ctx.turn_runner, key)
+
+        async def _materialize_draft() -> Any:
+            existing = await storage.get_session(key)
+            if existing is not None:
+                return existing
+            try:
+                return await ctx.session_manager.create(
+                    key,
+                    agent_id=parse_agent_id(key),
+                    display_name="WebChat",
+                )
+            except ValueError:
+                raced = await storage.get_session(key)
+                if raced is None:
+                    raise
+                return raced
+
+        if lock is None:
+            current = await _materialize_draft()
+        else:
+            async with lock:
+                current = await _materialize_draft()
+        await _emit_to_subscribers(
+            ctx,
+            key,
+            "sessions.changed",
+            build_sessions_changed_payload(key, "created", run_status="idle"),
+        )
+    if expected_raw is None:
+        expected_revision = int(current.collaboration_revision or 0)
+    else:
+        expected_revision = expected_raw
+    from opensquilla.session.plans import PlanConflictError
+
+    try:
+        updated = await storage.set_collaboration_mode(
+            key,
+            mode,
+            expected_revision=expected_revision,
+        )
+    except PlanConflictError as exc:
+        latest = await storage.get_session(key)
+        raise RpcHandlerError(
+            "COLLABORATION_CHANGED",
+            str(exc),
+            details={
+                "collaboration": (
+                    _plan_collaboration_snapshot(latest)
+                    if latest is not None
+                    else None
+                )
+            },
+            retryable=True,
+            accepted=False,
+        ) from exc
+    active_task_id = None
+    active_task = getattr(ctx.task_runtime, "active_task_id", None)
+    if callable(active_task):
+        active_task_id = await active_task(key)
+    snapshot = _plan_collaboration_snapshot(updated)
+    snapshot["activeTaskId"] = active_task_id
+    await _emit_to_subscribers(
+        ctx,
+        key,
+        "session.event.collaboration_mode",
+        {"session_key": key, "collaboration": snapshot},
+    )
+    return {"sessionKey": key, "collaboration": snapshot}
+
+
+@_d.method("plans.implement", scope="operator.write")
+async def _handle_plans_implement(params: dict | None, ctx: RpcContext) -> dict:
+    key = _require_plan_session_key(params)
+    revision_id = _optional_string_param(
+        params,
+        "planRevisionId",
+        "plan_revision_id",
+    )
+    if revision_id is None:
+        raise ValueError("params.planRevisionId is required")
+    if ctx.session_manager is None:
+        raise RpcUnavailableError("Session manager is not configured")
+    storage = get_session_storage(ctx.session_manager)
+    if storage is None:
+        raise RpcUnavailableError("Session storage is not configured")
+    client_request_id = _optional_string_param(
+        params,
+        "clientRequestId",
+        "client_request_id",
+    ) or uuid.uuid4().hex
+    intent = _optional_string_param(params, "intent")
+    revision = await storage.get_plan_revision(revision_id)
+    if revision is None:
+        # A new-task implementation owns an independent copied lineage. If the
+        # source session is later deleted, an exact retry must still replay the
+        # already accepted target task/run instead of failing before ingress
+        # idempotency gets a chance to match it.
+        previous = await storage.get_turn_ingress_receipt(
+            source_scope=_turn_source_scope(
+                {
+                    "caller_kind": "web",
+                    "source_name": "plans.implement",
+                },
+                ctx,
+            ),
+            request_session_key=key,
+            client_request_id=client_request_id,
+        )
+        previous_task_id = (
+            previous.receipt.task_id if previous is not None else None
+        )
+        previous_task = (
+            await storage.get_agent_task(previous_task_id)
+            if previous_task_id
+            else None
+        )
+        previous_details = (
+            previous_task.details
+            if previous_task is not None
+            and isinstance(previous_task.details, dict)
+            else {}
+        )
+        previous_metadata = previous_details.get("metadata")
+        previous_metadata = (
+            previous_metadata if isinstance(previous_metadata, dict) else {}
+        )
+        accepted_revision_id = str(
+            previous_metadata.get("plan_revision_id") or ""
+        ).strip()
+        accepted_revision = (
+            await storage.get_plan_revision(accepted_revision_id)
+            if accepted_revision_id
+            else None
+        )
+        if accepted_revision is None:
+            raise KeyError(f"Plan revision not found: {revision_id}")
+        revision_title = accepted_revision.title
+    else:
+        revision_title = revision.title
+    explicit_message = _optional_string_param(params, "message")
+    message = explicit_message or (
+        f"Implement the approved plan “{revision_title}”. "
+        "Work through its ordered steps and record truthful checkpoints."
+    )
+    send_params = {
+        "key": key,
+        "message": message,
+        "clientRequestId": client_request_id,
+        "intent": intent or "continue",
+        "queueMode": "followup",
+        "inputProvenanceKind": "plan_implementation",
+        "noMemoryCapture": True,
+        "source": {
+            "caller_kind": "web",
+            "source_name": "plans.implement",
+        },
+    }
+    if explicit_message is None:
+        # The generated instruction is control-plane input, not user-authored
+        # conversation text. Keep it durable and provider-visible while asking
+        # display surfaces to omit it from the visible transcript.
+        send_params["displayText"] = ""
+    target_before_acceptance = await storage.get_session(key)
+    required_collaboration_revision = (
+        int(target_before_acceptance.collaboration_revision or 0) + 1
+        if target_before_acceptance is not None
+        else 1
+    )
+    result = await _handle_sessions_send(
+        send_params,
+        ctx,
+        fingerprint_params={
+            "action": "plans.implement",
+            "sessionKey": key,
+            "planRevisionId": revision_id,
+            "message": message,
+            "intent": send_params["intent"],
+        },
+        plan_revision_id=revision_id,
+        required_collaboration_mode="default",
+        required_collaboration_revision=required_collaboration_revision,
+    )
+    accepted_key = str(result.get("session_key") or key)
+    task_id = str(result.get("turn_id") or result.get("task_id") or "").strip()
+    task_record = await storage.get_agent_task(task_id) if task_id else None
+    task_details = (
+        task_record.details
+        if task_record is not None and isinstance(task_record.details, dict)
+        else {}
+    )
+    task_metadata = task_details.get("metadata")
+    task_metadata = task_metadata if isinstance(task_metadata, dict) else {}
+    accepted_run_id = str(task_metadata.get("plan_run_id") or "").strip()
+    accepted_revision_id = str(
+        task_metadata.get("plan_revision_id") or ""
+    ).strip()
+    if not accepted_run_id or not accepted_revision_id:
+        raise RuntimeError("Accepted plan implementation lost its durable binding")
+    accepted_run = await storage.get_plan_run(accepted_run_id)
+    accepted_revision = await storage.get_plan_revision(accepted_revision_id)
+    if accepted_run is None or accepted_revision is None:
+        raise RuntimeError("Accepted plan implementation binding no longer exists")
+    session = await storage.get_session(accepted_key)
+    from opensquilla.session.plans import plan_revision_snapshot, plan_run_snapshot
+
+    collaboration = (
+        _plan_collaboration_snapshot(session)
+        if session is not None
+        else {"mode": "default", "revision": 0, "appliesTo": "next_turn"}
+    )
+    run_snapshot = plan_run_snapshot(accepted_run)
+    await _emit_to_subscribers(
+        ctx,
+        accepted_key,
+        "session.event.plan_run",
+        {"session_key": accepted_key, "plan_run": run_snapshot},
+    )
+    await _emit_to_subscribers(
+        ctx,
+        accepted_key,
+        "session.event.collaboration_mode",
+        {"session_key": accepted_key, "collaboration": collaboration},
+    )
+    return {
+        **result,
+        "sessionKey": accepted_key,
+        "collaboration": collaboration,
+        "planRevision": plan_revision_snapshot(accepted_revision, current=True),
+        "planRun": run_snapshot,
+    }
+
+
+@_d.method("plans.revise", scope="operator.write")
+async def _handle_plans_revise(params: dict | None, ctx: RpcContext) -> dict:
+    key = _require_plan_session_key(params)
+    revision_id = _optional_string_param(
+        params,
+        "planRevisionId",
+        "plan_revision_id",
+    )
+    prompt = _optional_string_param(params, "prompt")
+    if revision_id is None:
+        raise ValueError("params.planRevisionId is required")
+    if prompt is None:
+        raise ValueError("params.prompt is required")
+    if ctx.session_manager is None:
+        raise RpcUnavailableError("Session manager is not configured")
+    storage = get_session_storage(ctx.session_manager)
+    if storage is None:
+        raise RpcUnavailableError("Session storage is not configured")
+    client_request_id = _optional_string_param(
+        params,
+        "clientRequestId",
+        "client_request_id",
+    ) or uuid.uuid4().hex
+    provider_message = (
+        "Create a complete replacement for the current plan revision. "
+        "Preserve still-valid context, incorporate the user's requested changes, "
+        "and submit the full revised plan rather than a patch.\n\n"
+        f"Requested changes:\n{prompt}"
+    )
+    send_params = {
+        "key": key,
+        "message": provider_message,
+        "displayText": prompt,
+        "clientRequestId": client_request_id,
+        "intent": "continue",
+        "queueMode": "followup",
+        "source": {
+            "caller_kind": "web",
+            "source_name": "plans.revise",
+        },
+    }
+    fingerprint_params = {
+        "action": "plans.revise",
+        "sessionKey": key,
+        "planRevisionId": revision_id,
+        "prompt": prompt,
+    }
+
+    # Idempotent retries must replay even after the first request has already
+    # committed a replacement and made ``revision_id`` non-current.
+    get_ingress_receipt = getattr(storage, "get_turn_ingress_receipt", None)
+    if callable(get_ingress_receipt):
+        source_hint = _normalize_session_send_source_hint(send_params)
+        identity = request_identity(
+            send_params,
+            request_session_key=key,
+            source_scope=_turn_source_scope(source_hint, ctx),
+            fingerprint_params=fingerprint_params,
+        )
+        previous = await get_ingress_receipt(
+            source_scope=identity.source_scope,
+            request_session_key=identity.request_session_key,
+            client_request_id=identity.client_request_id,
+        )
+        if previous is not None:
+            replay_session_before_send = await storage.get_session(key)
+            result = await _handle_sessions_send(
+                send_params,
+                ctx,
+                fingerprint_params=fingerprint_params,
+                plan_context_revision_id=revision_id,
+                required_collaboration_mode="plan",
+                required_collaboration_revision=(
+                    int(replay_session_before_send.collaboration_revision or 0)
+                    if replay_session_before_send is not None
+                    else None
+                ),
+            )
+            replay_session = await storage.get_session(key)
+            collaboration = (
+                _plan_collaboration_snapshot(replay_session)
+                if replay_session is not None
+                else {"mode": "plan", "revision": 0, "appliesTo": "next_turn"}
+            )
+            return {
+                **result,
+                "sessionKey": key,
+                "collaboration": collaboration,
+            }
+    session = await storage.get_session(key)
+    if session is None:
+        raise KeyError(f"Session not found: {key}")
+    if session.active_plan_revision_id != revision_id:
+        raise RpcHandlerError(
+            "PLAN_REVISION_CHANGED",
+            "The selected plan is no longer the current revision.",
+            retryable=False,
+            accepted=False,
+        )
+    if session.collaboration_mode != "plan":
+        session = await storage.set_collaboration_mode(
+            key,
+            "plan",
+            expected_revision=int(session.collaboration_revision or 0),
+        )
+    collaboration = _plan_collaboration_snapshot(session)
+    await _emit_to_subscribers(
+        ctx,
+        key,
+        "session.event.collaboration_mode",
+        {"session_key": key, "collaboration": collaboration},
+    )
+    result = await _handle_sessions_send(
+        send_params,
+        ctx,
+        fingerprint_params=fingerprint_params,
+        plan_context_revision_id=revision_id,
+        required_collaboration_mode="plan",
+        required_collaboration_revision=int(session.collaboration_revision or 0),
+    )
+    return {**result, "sessionKey": key, "collaboration": collaboration}
+
+
+@_d.method("plans.cancelRun", scope="operator.write")
+async def _handle_plans_cancel_run(params: dict | None, ctx: RpcContext) -> dict:
+    key = _require_plan_session_key(params)
+    run_id = _optional_string_param(params, "runId", "run_id")
+    if run_id is None:
+        raise ValueError("params.runId is required")
+    if ctx.session_manager is None:
+        raise RpcUnavailableError("Session manager is not configured")
+    storage = get_session_storage(ctx.session_manager)
+    if storage is None:
+        raise RpcUnavailableError("Session storage is not configured")
+    run = await storage.get_plan_run(run_id)
+    if run is None or run.session_key != key:
+        raise KeyError(f"Plan run not found: {run_id}")
+    expected_raw = (params or {}).get(
+        "expectedStateRevision",
+        (params or {}).get("expected_state_revision"),
+    )
+    if expected_raw is None:
+        expected_revision = int(run.state_revision)
+    elif isinstance(expected_raw, bool) or not isinstance(expected_raw, int):
+        raise ValueError("params.expectedStateRevision must be an integer")
+    else:
+        expected_revision = expected_raw
+    from opensquilla.session.plans import (
+        PLAN_RUN_ACTIVE_STATUSES,
+        PlanRunConflictError,
+        plan_run_snapshot,
+    )
+
+    def _changed(exc: Exception, latest: Any) -> RpcHandlerError:
+        return RpcHandlerError(
+            "PLAN_RUN_CHANGED",
+            str(exc),
+            details={
+                "planRun": plan_run_snapshot(latest) if latest is not None else None
+            },
+            retryable=True,
+            accepted=False,
+        )
+
+    if int(run.state_revision) != expected_revision:
+        raise _changed(
+            PlanRunConflictError("plan run state changed before cancellation"),
+            run,
+        )
+
+    # Cancellation is a safety action, not a cosmetic status change.  Stop the
+    # implementation task first, then CAS the durable run to ``cancelled``.
+    # The runtime's terminal cleanup may pause the run in between; retry that
+    # self-induced revision once using the freshly read state.
+    candidate = run
+    cancelled_task_ids: set[str] = set()
+    updated = None
+    for _attempt in range(3):
+        active_task_id = str(candidate.active_task_id or "").strip()
+        if candidate.status in {"queued", "running"} and not active_task_id:
+            raise RpcHandlerError(
+                "PLAN_RUN_TASK_UNKNOWN",
+                "The implementation task cannot be identified safely.",
+                retryable=True,
+                accepted=False,
+            )
+        if active_task_id and active_task_id not in cancelled_task_ids:
+            task_runtime = getattr(ctx, "task_runtime", None)
+            runtime_cancel = getattr(task_runtime, "cancel", None)
+            runtime_wait = getattr(task_runtime, "wait", None)
+            if (
+                task_runtime is None
+                or not callable(runtime_cancel)
+                or not callable(runtime_wait)
+            ):
+                raise RpcUnavailableError(
+                    "Task runtime is unavailable; the implementation was not cancelled"
+                )
+            cancelled_count = await _cancel_task_runtime(
+                task_runtime,
+                session_key=key,
+                task_id=active_task_id,
+                source="plans.cancelRun",
+                reason="cancelled_by_user",
+            )
+            try:
+                terminal_task = await runtime_wait(active_task_id, timeout=10.0)
+            except TimeoutError as exc:
+                raise RpcHandlerError(
+                    "PLAN_RUN_CANCEL_PENDING",
+                    "The implementation is still stopping; retry cancellation.",
+                    retryable=True,
+                    accepted=False,
+                ) from exc
+            terminal_status = str(getattr(terminal_task, "status", ""))
+            if terminal_status not in {
+                AgentTaskStatus.SUCCEEDED.value,
+                AgentTaskStatus.FAILED.value,
+                AgentTaskStatus.CANCELLED.value,
+                AgentTaskStatus.TIMEOUT.value,
+                AgentTaskStatus.ABANDONED.value,
+            }:
+                raise RpcHandlerError(
+                    "PLAN_RUN_CANCEL_PENDING",
+                    "The implementation task did not acknowledge cancellation.",
+                    details={
+                        "taskId": active_task_id,
+                        "cancelledCount": cancelled_count,
+                    },
+                    retryable=True,
+                    accepted=False,
+                )
+            cancelled_task_ids.add(active_task_id)
+        try:
+            updated = await storage.cancel_plan_run(
+                run_id,
+                expected_state_revision=int(candidate.state_revision),
+                reason="cancelled_by_user",
+            )
+            break
+        except PlanRunConflictError as exc:
+            latest = await storage.get_plan_run(run_id)
+            if latest is not None and latest.status == "cancelled":
+                updated = latest
+                break
+            if latest is None or latest.status not in PLAN_RUN_ACTIVE_STATUSES:
+                raise _changed(exc, latest) from exc
+            candidate = latest
+    if updated is None:
+        latest = await storage.get_plan_run(run_id)
+        raise _changed(
+            PlanRunConflictError("plan run kept changing during cancellation"),
+            latest,
+        )
+    snapshot = plan_run_snapshot(updated)
+    await _emit_to_subscribers(
+        ctx,
+        key,
+        "session.event.plan_run",
+        {"session_key": key, "plan_run": snapshot},
+    )
+    return {"sessionKey": key, "planRun": snapshot}
+
+
 @_d.method("sessions.bootstrap", scope="operator.read")
 async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> dict:
     """Return the canonical startup snapshot for an interactive session client.
@@ -5202,6 +6082,16 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
         "queue_mode": getattr(session, "queue_mode", None),
         **_derive_source_metadata(session),
     }
+    get_current_plan = getattr(storage, "get_current_plan_revision", None)
+    get_active_run = getattr(storage, "get_active_plan_run", None)
+    current_plan = (
+        await get_current_plan(session_key) if callable(get_current_plan) else None
+    )
+    active_plan_run = (
+        await get_active_run(session_key) if callable(get_active_run) else None
+    )
+    from opensquilla.session.plans import plan_revision_snapshot, plan_run_snapshot
+
     return {
         "session": metadata,
         "agent_identity": agent_identity,
@@ -5214,6 +6104,23 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
         },
         "runtime": {
             "model_routing": model_routing_snapshot(ctx.config),
+        },
+        "collaboration": _plan_collaboration_snapshot(session),
+        "currentPlan": (
+            plan_revision_snapshot(current_plan, current=True)
+            if current_plan is not None
+            else None
+        ),
+        "activePlanRun": (
+            plan_run_snapshot(active_plan_run)
+            if active_plan_run is not None
+            else None
+        ),
+        "planCapabilities": {
+            "planMode": True,
+            "implementation": ctx.task_runtime is not None,
+            "newTaskImplementation": ctx.task_runtime is not None,
+            "goalDriver": False,
         },
         "epoch": epoch,
         "stream_cursor": stream_cursor,

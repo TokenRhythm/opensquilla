@@ -9,6 +9,7 @@ from enum import StrEnum
 import structlog
 
 from opensquilla.provider.types import ToolDefinition
+from opensquilla.tools.plan_access import plan_access_allows
 from opensquilla.tools.policy_runtime import (
     ToolSurfaceCapabilities,
     resolve_runtime_tool_surface,
@@ -241,6 +242,9 @@ def effective_tool_context(
 
 
 def is_tool_visible(rt: RegisteredTool, ctx: ToolContext | None = None) -> bool:
+    if not plan_access_allows(rt.spec, ctx):
+        log.debug("tool_filtered", tool=rt.spec.name, reason="plan_mode_denied")
+        return False
     explicitly_allowed = (
         ctx is not None and ctx.allowed_tools is not None and rt.spec.name in ctx.allowed_tools
     )

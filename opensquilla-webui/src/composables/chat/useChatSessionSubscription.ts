@@ -44,6 +44,7 @@ export interface UseChatSessionSubscriptionOptions {
     },
   ) => void
   onSessionMetadataError?: (key: string, generation: number) => void
+  onSnapshot?: (snapshot: SessionMessagesSubscribeResponse) => void
 }
 
 const LIVE_RUN_STATES = ['queued', 'running', 'approval_pending']
@@ -139,6 +140,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       if (runModeLock && typeof runModeLock === 'object') {
         options.onRunModeLock?.(runModeLock)
       }
+      options.onSnapshot?.(res)
       applySessionRunState(res)
       // A pending inline interrupt is newer, stronger evidence than an idle
       // subscription snapshot that raced with the approval request.

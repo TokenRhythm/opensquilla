@@ -264,6 +264,9 @@ class StreamConsumerStageInput:
     input_provenance: dict[str, Any] | None = None
     # In-process pending submitted-line provider for mid-turn injection.
     pending_input_provider: PendingInputProvider | None = None
+    # Live delivery-ready authorization resolved on the event loop before the
+    # blocking omitted-artifact publish enters its worker thread.
+    attached_plan_run_ready: bool | None = None
 
 # ---------------------------------------------------------------------------
 # Per-event handler classes
@@ -457,7 +460,10 @@ class _WarningHandler:
         self._transformer = transformer
 
     def handle(self, event: WarningEvent, state: _StreamState) -> WarningEvent:
-        if event.code == "workspace_diff_recovery":
+        if event.code in {
+            "workspace_diff_recovery",
+            "plan_run_reconciliation",
+        }:
             self._discard_superseded_current_text(state)
         return self._transformer(event)
 
@@ -691,6 +697,7 @@ class _DoneHandler:
         return auto_publish_omitted_workspace_artifacts(
             inp.tool_context,
             final_text=accumulated_text,
+            attached_plan_run_ready=inp.attached_plan_run_ready,
         )
 
     def record_publish_result(
@@ -1261,10 +1268,20 @@ class StreamConsumerStage:
                 # the ArtifactStore -- yielding a torn transcript or an
                 # artifact persisted without a transcript record.
                 pre = self._done_handler.pre_publish(event, inp, state)
+                from opensquilla.engine.artifact_delivery import (
+                    attached_plan_run_ready_for_auto_publish,
+                )
+
+                publish_inp = replace(
+                    inp,
+                    attached_plan_run_ready=(
+                        await attached_plan_run_ready_for_auto_publish(inp.tool_context)
+                    ),
+                )
                 publish_task = asyncio.ensure_future(
                     asyncio.to_thread(
                         self._done_handler.run_publish,
-                        inp,
+                        publish_inp,
                         pre.accumulated_text,
                     )
                 )

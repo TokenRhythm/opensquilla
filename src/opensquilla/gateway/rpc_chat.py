@@ -41,6 +41,22 @@ def _canonical_webchat_session_key(value: object = None) -> str:
     return canonicalize_session_key(raw)
 
 
+def _requested_initial_collaboration_mode(params: dict[str, Any]) -> str | None:
+    mode = params.get("collaborationMode")
+    snake_mode = params.get("collaboration_mode")
+    if mode is not None and snake_mode is not None and mode != snake_mode:
+        raise ValueError("collaborationMode and collaboration_mode must match")
+    if mode is None:
+        mode = snake_mode
+    if mode is None:
+        return None
+    if not isinstance(mode, str) or mode not in {"default", "plan"}:
+        raise ValueError("collaborationMode must be default or plan")
+    if params.get("intent") != "new_chat":
+        raise ValueError("collaborationMode requires explicit new_chat intent")
+    return mode
+
+
 def _require_chat_session_manager(ctx: RpcContext):
     if ctx.session_manager is None:
         raise RpcUnavailableError("Chat session manager not available")
@@ -443,12 +459,17 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
     message = params["message"]
     session_key = _canonical_webchat_session_key(params.get("sessionKey"))
     agent_id = parse_agent_id(session_key)
+    initial_collaboration_mode = _requested_initial_collaboration_mode(params)
 
     # Fresh-WebUI / smoke path: when no session manager is wired (webui
     # simulator, dispatcher-only boot), instant-accept without kicking off a
     # turn. This matches the roundtrip the WebUI observes on first paint
     # before the sessions engine is attached.
     if ctx.session_manager is None:
+        if initial_collaboration_mode is not None:
+            raise RpcUnavailableError(
+                "Initial collaboration mode requires atomic turn acceptance"
+            )
         return {"ok": True, "sessionKey": session_key, "instant_accept": True}
 
     mgr = _require_chat_session_manager(ctx)
@@ -561,10 +582,17 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
             fingerprint_params["intent"] = requested_intent
         else:
             fingerprint_params.pop("intent", None)
+        if initial_collaboration_mode is not None:
+            # Both public spellings represent the same logical request. Keep
+            # one canonical field in the durable idempotency fingerprint.
+            fingerprint_params["initialCollaborationMode"] = (
+                initial_collaboration_mode
+            )
         result = await _handle_sessions_send(
             send_params,
             ctx,
             fingerprint_params=fingerprint_params,
+            initial_collaboration_mode=initial_collaboration_mode,
         )
         result_session_key = result.get("sessionKey") or result.get("key") or session_key
         return {"ok": True, "sessionKey": result_session_key, **result}
@@ -716,10 +744,9 @@ async def _handle_chat_clarify_submit(params: dict | None, ctx: RpcContext) -> d
                                           the awaiting branch in meta_resolution
                                           uses ``session_key`` for the CAS
 
-    The fields dict is serialised into ``key: value\\n`` text and fed
-    into the regular ``chat.send`` path so meta_resolution's awaiting
-    branch picks it up. This is purely a convenience surface — clients
-    can equivalently call ``chat.send`` with the same text.
+    A request carrying ``request_id`` resolves the exact deferred tool call and
+    continues its existing turn. Legacy Meta clarifications have no request id;
+    those remain a cross-turn protocol and are fed through ``chat.send``.
     """
     if not isinstance(params, dict):
         raise ValueError("params required: sessionKey, fields")
@@ -728,6 +755,31 @@ async def _handle_chat_clarify_submit(params: dict | None, ctx: RpcContext) -> d
         raise ValueError("params.fields must be a non-empty mapping")
 
     session_key = _canonical_webchat_session_key(params.get("sessionKey"))
+    raw_request_id = params.get("request_id", params.get("requestId"))
+    if raw_request_id is not None:
+        request_id = str(raw_request_id).strip()
+        if not request_id:
+            raise ValueError("params.request_id must be a non-empty string")
+        task_runtime = getattr(ctx, "task_runtime", None)
+        resolve_user_input = getattr(task_runtime, "resolve_user_input", None)
+        if not callable(resolve_user_input):
+            raise RpcUnavailableError(
+                "Deferred user-input resolution is not available"
+            )
+        result = await resolve_user_input(
+            session_key=session_key,
+            request_id=request_id,
+            fields=fields,
+        )
+        log.info(
+            "chat.clarify_submit.deferred",
+            session_key=session_key,
+            request_id=request_id,
+            field_count=len(fields),
+            replayed=bool(result.get("replayed")),
+        )
+        return {"sessionKey": session_key, **result}
+
     text = _clarify_fields_to_text(fields)
 
     run_id = params.get("run_id")

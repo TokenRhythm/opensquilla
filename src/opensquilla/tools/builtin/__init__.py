@@ -20,7 +20,7 @@ _NAMES = [
     "meta_tools",
     "nodes",
     "patch",
-    "planning",
+    "plan_control",
     "router_control",
     "sessions",
     "session_search",

@@ -233,6 +233,42 @@ describe('useChatHistory canonical pagination', () => {
     expect(messages.value[0]?.turnId).toBe('turn-1')
   })
 
+  it('restores immutable plan revisions from typed transcript segments', async () => {
+    const { api, messages } = makeHistory(false, {
+      response: {
+        messages: [{
+          id: 'assistant-plan',
+          message_id: 'assistant-plan',
+          role: 'assistant',
+          text: 'Legacy Markdown fallback',
+          timestamp: '2026-07-06T00:00:00Z',
+          tool_calls: [{
+            type: 'plan',
+            snapshot: {
+              revisionId: 'revision-2',
+              planId: 'plan-1',
+              title: 'Ship plan mode',
+              markdown: 'A complete plan.',
+              steps: [{ stepId: 'inspect', title: 'Inspect' }],
+              current: true,
+            },
+          }],
+        }],
+        has_more: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value[0]?.planRevisions).toEqual([
+      expect.objectContaining({
+        revisionId: 'revision-2',
+        planId: 'plan-1',
+        title: 'Ship plan mode',
+      }),
+    ])
+  })
+
   it('prepends one page per cursor and preserves the reader scroll anchor', async () => {
     const thread = document.createElement('div')
     let height = 400

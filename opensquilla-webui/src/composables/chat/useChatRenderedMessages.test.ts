@@ -53,6 +53,112 @@ function renderedMessagesFor(
   })
 }
 
+describe('useChatRenderedMessages plan revisions', () => {
+  it('renders a typed plan part once and derives currentness from the active pointer', () => {
+    const currentPlanRevisionId = ref('revision-2')
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([{
+        role: 'assistant',
+        text: 'Legacy Markdown fallback',
+        ts: 1,
+        planRevisions: [{
+          revisionId: 'revision-2',
+          planId: 'plan-1',
+          title: 'Ship plan mode',
+          markdown: 'A complete plan.',
+          steps: [{ stepId: 'inspect', title: 'Inspect' }],
+          current: false,
+        }],
+        tool_calls: [
+          {
+            type: 'tool_use',
+            tool_use_id: 'submit-1',
+            name: 'submit_plan',
+            input: { title: 'Ship plan mode' },
+          },
+          {
+            type: 'tool_result',
+            tool_use_id: 'submit-1',
+            name: 'submit_plan',
+            result: '{"status":"plan_submitted"}',
+            is_error: false,
+          },
+          {
+            type: 'plan',
+            snapshot: { revisionId: 'revision-2' },
+          },
+        ],
+      }]),
+      sessionKey: ref('agent:main:webchat:test'),
+      routerSlots: ref([]),
+      routerModels: ref({}),
+      routerTierConfigs: ref({}),
+      routerVisualEffectsEnabled: ref(false),
+      routerVisualMode: ref('real_candidates'),
+      currentPlanRevisionId,
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+
+    const message = api.renderedMessages.value[0]
+    expect(message.text).toBe('')
+    expect(message.timelineItems).toEqual([])
+    expect(message.toolCalls).toEqual([])
+    expect(message.planRevisions?.[0]?.current).toBe(true)
+    expect(message.parts).toEqual([
+      expect.objectContaining({
+        type: 'plan',
+        plan: expect.objectContaining({ revisionId: 'revision-2', current: true }),
+      }),
+    ])
+    expect(message.parts?.some(part => part.type === 'text')).toBe(false)
+
+    currentPlanRevisionId.value = 'revision-3'
+    expect(api.renderedMessages.value[0]?.planRevisions?.[0]?.current).toBe(false)
+  })
+})
+
+describe('useChatRenderedMessages internal control turns', () => {
+  it('hides a blank user projection while preserving its turn identity', () => {
+    const api = renderedMessagesFor([
+      { role: 'user', text: 'Create a plan', ts: 1, messageId: 'user-plan' },
+      { role: 'assistant', text: 'Plan ready', ts: 2, messageId: 'assistant-plan' },
+      { role: 'user', text: '', ts: 3, messageId: 'internal-implementation' },
+      { role: 'assistant', text: 'Implementing now', ts: 4, messageId: 'assistant-run' },
+    ])
+
+    expect(api.renderedMessages.value.map(message => message.text)).toEqual([
+      'Create a plan',
+      'Plan ready',
+      'Implementing now',
+    ])
+    expect(api.renderedMessages.value.filter(message => message.displayRole === 'user')).toHaveLength(1)
+    expect(api.renderedMessages.value[1]?.turnKey).toBe('turn:user-plan')
+    expect(api.renderedMessages.value[2]?.turnKey).toBe('turn:internal-implementation')
+  })
+
+  it('keeps an attachment-only user turn visible', () => {
+    const api = renderedMessagesFor([{
+      role: 'user',
+      text: '',
+      ts: 1,
+      messageId: 'attachment-turn',
+      attachments: [{
+        kind: 'file',
+        displayId: 'attachment-1',
+        renderKey: 'attachment-1',
+        name: 'requirements.md',
+        mime: 'text/markdown',
+      }],
+    }])
+
+    expect(api.renderedMessages.value).toHaveLength(1)
+    expect(api.renderedMessages.value[0]?.hasAttachments).toBe(true)
+  })
+})
+
 describe('useChatRenderedMessages router visual mode', () => {
   it('keeps real-candidates mode limited to callable router tiers', () => {
     const api = renderedMessagesForRouterVisualMode('real_candidates')
@@ -751,6 +857,60 @@ describe('useChatRenderedMessages clarify history recovery', () => {
       'age_band',
     ])
     expect(clarify?.clarify?.fields[1].choices).toEqual(['PRE_K', 'EARLY_GRADE'])
+  })
+
+  it('restores request_user_input from persisted tool_result JSON without arguments', () => {
+    const api = renderedMessagesFor([
+      {
+        role: 'assistant',
+        text: '',
+        ts: 0,
+        messageId: 'm-request-user-input',
+        tool_calls: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'request-input-2',
+            name: 'request_user_input',
+            result: JSON.stringify({
+              kind: 'user_input',
+              paused: true,
+              run_id: 'plan-run-2',
+              step: 'choose_target',
+              clarify_schema: {
+                intro: 'Choose where to implement.',
+                fields: [{
+                  name: 'target',
+                  type: 'enum',
+                  prompt: 'Implementation target',
+                  choices: ['current', 'new'],
+                }],
+              },
+            }),
+          },
+        ],
+      },
+    ])
+
+    const [message] = api.renderedMessages.value
+    const clarify = message.parts?.find((part): part is ChatPart & {
+      type: 'interrupt'
+      interruptKind: 'clarify'
+    } => part.type === 'interrupt' && part.interruptKind === 'clarify')
+
+    expect(clarify?.key).toBe('m-request-user-input:interrupt:plan-run-2|choose_target')
+    expect(clarify?.clarify).toEqual({
+      intro: 'Choose where to implement.',
+      fields: [{
+        name: 'target',
+        type: 'enum',
+        prompt: 'Implementation target',
+        required: false,
+        defaultValue: '',
+        choices: ['current', 'new'],
+      }],
+      runId: 'plan-run-2',
+      step: 'choose_target',
+    })
   })
 
   it('applies clarify submit state to recovered historical interrupt cards', () => {

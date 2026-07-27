@@ -196,4 +196,92 @@ describe('useChatMessageActions protocol-shaped copy text', () => {
 
     expect(copyTextWithFallback).toHaveBeenCalledWith('Keep my words unchanged.')
   })
+
+  it('copies the same terminal PlanRun delivery shown outside activity', async () => {
+    const { api } = makeOptions(
+      [],
+      text => text,
+      () => 'AI generated',
+    )
+
+    await api.copyMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      text: 'Working through files.\n\nImplementation complete.',
+      timelineItems: [
+        {
+          type: 'text',
+          key: 'work',
+          html: 'Working through files.',
+          rawText: 'Working through files.\n\n',
+        },
+        {
+          type: 'tool-group',
+          key: 'read',
+          group: {
+            groupId: 'read',
+            operationKey: 'file.read',
+            label: 'Read',
+            iconName: 'edit',
+            calls: [{
+              toolId: 'read',
+              renderKey: 'read',
+              name: 'read_file',
+              displayName: 'Read',
+              inputRaw: '{"path":"README.md"}',
+              inputPreview: 'README.md',
+              isRunning: false,
+              status: 'success',
+              isError: false,
+              result: 'ok',
+              resultPreview: 'ok',
+              isOpen: false,
+            }],
+            secondary: '',
+            isRunning: false,
+            isError: false,
+            status: 'success',
+          },
+        },
+        {
+          type: 'text',
+          key: 'delivery',
+          html: 'Implementation complete.',
+          rawText: 'Implementation complete.',
+        },
+        {
+          type: 'tool-group',
+          key: 'checkpoint',
+          group: {
+            groupId: 'checkpoint',
+            operationKey: 'plan_run_checkpoint',
+            label: 'Checkpoint',
+            iconName: 'check',
+            calls: [{
+              toolId: 'checkpoint',
+              renderKey: 'checkpoint',
+              name: 'plan_run_checkpoint',
+              displayName: 'Checkpoint',
+              inputRaw: '{}',
+              inputPreview: '',
+              isRunning: false,
+              status: 'success',
+              isError: false,
+              result: '{"plan_run":{"status":"completed"}}',
+              resultPreview: 'completed',
+              isOpen: false,
+            }],
+            secondary: '',
+            isRunning: false,
+            isError: false,
+            status: 'success',
+          },
+        },
+      ],
+    }))
+
+    expect(copyTextWithFallback).toHaveBeenCalledWith(
+      'Implementation complete.\n\nAI generated',
+    )
+  })
 })

@@ -61,6 +61,7 @@ from opensquilla.tools.argument_normalization import (
     format_alias_conflicts,
 )
 from opensquilla.tools.envelope import build_tool_failure_envelope
+from opensquilla.tools.plan_access import preflight_plan_access
 from opensquilla.tools.policy import DispatchInput, finalize, run_chain_with_emit
 from opensquilla.tools.projected_arguments import find_projected_tool_argument
 from opensquilla.tools.registry import ToolRegistry
@@ -111,6 +112,25 @@ _REPEATED_CALL_NOTICE_SAFE_TOOL_NAMES: frozenset[str] = frozenset(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _plan_access_preflight(
+    tool_call: ToolCall,
+    registered: Any,
+    ctx: ToolContext | None,
+) -> ToolResult | None:
+    denial = preflight_plan_access(tool_call, registered, ctx)
+    if denial is None:
+        return None
+    log.warning(
+        "dispatch.defense_in_depth_block",
+        tool=tool_call.tool_name,
+        reason="plan_mode_denied",
+        tool_use_id=tool_call.tool_use_id,
+        agent_id=ctx.agent_id if ctx else None,
+        session_key=ctx.session_key if ctx else None,
+    )
+    return denial
 
 
 def _resolve_budget_policy(ctx: ToolContext | None) -> ToolResultBudgetPolicy:
@@ -1303,6 +1323,10 @@ async def preflight_tool_call(
     if registered is None:
         return _resolve_registry_miss(tool_call, known, ctx, registry)
 
+    plan_access_denial = _plan_access_preflight(tool_call, registered, ctx)
+    if plan_access_denial is not None:
+        return plan_access_denial
+
     tool_call = _unwrap_nested_json_arguments(tool_call, registered, ctx)
     injection_envelope = _check_injection_guard(tool_call, ctx)
     if injection_envelope is not None:
@@ -1438,6 +1462,14 @@ def build_tool_handler(
         registered = registry.get(tool_call.tool_name)
         if registered is None:
             return _resolve_registry_miss(tool_call, known, effective_ctx, registry)
+
+        plan_access_denial = _plan_access_preflight(
+            tool_call,
+            registered,
+            effective_ctx,
+        )
+        if plan_access_denial is not None:
+            return plan_access_denial
 
         tool_call = _unwrap_nested_json_arguments(tool_call, registered, effective_ctx)
         injection_envelope = _check_injection_guard(tool_call, effective_ctx)

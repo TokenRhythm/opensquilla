@@ -958,10 +958,6 @@ class AgentBootstrapStage:
                 "OPENSQUILLA_REASONING_ONLY_ACT_NOW",
                 AgentConfig().reasoning_only_act_now,
             ),
-            plan_only_act_now_threshold=_nonnegative_int_from_env(
-                "OPENSQUILLA_PLAN_ONLY_ACT_NOW_THRESHOLD",
-                AgentConfig().plan_only_act_now_threshold,
-            ),
             mid_budget_no_diff_nudge=_bool_from_env(
                 "OPENSQUILLA_MID_BUDGET_NO_DIFF_NUDGE",
                 AgentConfig().mid_budget_no_diff_nudge,

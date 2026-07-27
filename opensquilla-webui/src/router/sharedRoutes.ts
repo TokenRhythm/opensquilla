@@ -30,9 +30,9 @@ export const sharedRoutes: RouteRecordRaw[] = [
       return defaultRootRedirect()
     },
   },
-  { path: '/chat',      name: 'chat',      component: ChatView,      meta: { title: 'Chat', group: 'Work', icon: 'chat', nav: 'primary', navOrder: 10, platforms: ['web', 'desktop'] } },
+  { path: '/chat',      name: 'chat',      component: ChatView,      meta: { title: 'Chat', group: 'Work', icon: 'chat', nav: 'primary', navOrder: 10, platforms: ['web', 'desktop'], viewKey: 'chat' } },
   // Draft state: a clean composer with no session key until the first send.
-  { path: '/chat/new',  name: 'chat-new',  component: ChatView,      meta: { title: 'Chat', group: 'Work', icon: 'chat', platforms: ['web', 'desktop'] } },
+  { path: '/chat/new',  name: 'chat-new',  component: ChatView,      meta: { title: 'Chat', group: 'Work', icon: 'chat', platforms: ['web', 'desktop'], viewKey: 'chat' } },
   // Task ledger: still routed (deep links, the Not Found fallback, /approvals)
   // but off the nav — "New task" owns the top of the sidebar and the recents
   // list below it covers day-to-day session access.

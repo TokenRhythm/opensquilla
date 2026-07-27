@@ -63,6 +63,7 @@ from opensquilla.tools.source_edit_contract import (
     source_revision_for_path,
 )
 from opensquilla.tools.types import (
+    PlanAccess,
     RetryableToolInputError,
     SafeToolError,
     ToolError,
@@ -1355,6 +1356,7 @@ async def _gate_out_of_workspace_write(
         "limit": {"type": "integer", "description": "Maximum number of lines to read."},
     },
     required=["path"],
+    plan_access=PlanAccess.READ_ONLY,
     sandbox=SandboxToolDescriptor.filesystem(
         kind="read_file",
         argv_factory=lambda a: ("read_file", str(a.get("path", ""))),
@@ -1456,6 +1458,7 @@ async def read_file(path: str, offset: int | None = None, limit: int | None = No
     },
     required=["path"],
     exposed_by_default=False,
+    plan_access=PlanAccess.READ_ONLY,
 )
 async def read_source(path: str, start_line: int = 1, end_line: int | None = None) -> str:
     p = _resolve_path(path)
@@ -1522,6 +1525,7 @@ async def read_source(path: str, start_line: int = 1, end_line: int | None = Non
         },
     },
     required=["path"],
+    plan_access=PlanAccess.READ_ONLY,
     sandbox=SandboxToolDescriptor.filesystem(
         kind="read_spreadsheet",
         argv_factory=lambda a: ("read_spreadsheet", str(a.get("path", ""))),
@@ -3209,6 +3213,7 @@ def _record_edit_recovery_event(
         },
     },
     required=["path"],
+    plan_access=PlanAccess.READ_ONLY,
     runtime_only_arguments=("approval_id",),
     sandbox=SandboxToolDescriptor.filesystem(
         kind="list_dir",
@@ -3303,6 +3308,7 @@ async def list_dir(path: str, approval_id: str | None = None) -> str:
         "path": {"type": "string", "description": "Base directory to search from (default: cwd)."},
     },
     required=["pattern"],
+    plan_access=PlanAccess.READ_ONLY,
     sandbox=SandboxToolDescriptor.filesystem(
         kind="glob_search",
         argv_factory=lambda a: (
@@ -3495,6 +3501,7 @@ def _source_symbol_query_matches(
     },
     required=[],
     exposed_by_default=False,
+    plan_access=PlanAccess.READ_ONLY,
 )
 async def source_symbols(
     query: str | None = None,
@@ -3610,6 +3617,7 @@ async def source_symbols(
         },
     },
     required=["pattern"],
+    plan_access=PlanAccess.READ_ONLY,
     sandbox=SandboxToolDescriptor.filesystem(
         kind="grep_search",
         argv_factory=lambda a: (

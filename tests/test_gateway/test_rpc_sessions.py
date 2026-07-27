@@ -5103,6 +5103,7 @@ class TestSessionsMessagesSubscribe:
 
     @pytest.mark.asyncio
     async def test_messages_subscribe(self, dispatcher, ctx_with_sessions, session):
+        session.epoch = 4
         res = await dispatcher.dispatch(
             "r1",
             "sessions.messages.subscribe",
@@ -5115,6 +5116,7 @@ class TestSessionsMessagesSubscribe:
         assert isinstance(res.payload["current_stream_seq"], int)
         assert res.payload["replay_complete"] is True
         assert res.payload["replayed_count"] == 0
+        assert res.payload["epoch"] == 4
         assert res.payload["run_mode_lock"] == {"locked": False}
 
     @pytest.mark.asyncio
@@ -5224,6 +5226,33 @@ class TestSessionsMessagesSubscribe:
 
         assert res.ok is True
         assert res.payload["active_task_group_ids"] == ["group-live"]
+
+    @pytest.mark.asyncio
+    async def test_messages_subscribe_hydrates_pending_user_input(
+        self, dispatcher, ctx_with_sessions, session
+    ):
+        payload = {
+            "kind": "user_input",
+            "status": "input_required",
+            "paused": True,
+            "request_id": "request-1",
+            "clarify_schema": {"fields": [{"name": "scope", "type": "string"}]},
+        }
+        ctx_with_sessions.task_runtime = SimpleNamespace(
+            pending_user_inputs=lambda key: (
+                [payload] if key == session.session_key else []
+            )
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.messages.subscribe",
+            {"key": session.session_key},
+            ctx_with_sessions,
+        )
+
+        assert res.ok is True
+        assert res.payload["pendingUserInputs"] == [payload]
 
     @pytest.mark.asyncio
     async def test_messages_subscribe_replays_buffered_events_after_cursor(self, dispatcher):

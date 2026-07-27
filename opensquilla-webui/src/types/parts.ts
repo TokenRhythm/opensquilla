@@ -1,4 +1,5 @@
 import type { ArtifactPayload } from '@/types/rpc'
+import type { PlanRevisionSnapshot } from '@/types/plans'
 
 /**
  * The four-state tool machine. Maps from today's ChatToolCall.{status,isRunning,result}:
@@ -43,11 +44,15 @@ export interface InterruptClarifyField {
   required: boolean
   defaultValue: string
   choices: string[]
+  header?: string
+  options?: Array<{ label: string; description: string }>
+  allowOther?: boolean
 }
 
 export interface InterruptClarifyData {
   intro: string
   fields: InterruptClarifyField[]
+  requestId?: string
   runId: string
   step: string
 }
@@ -116,6 +121,10 @@ export type Part =
       resolution: InterruptResolution | null
       busy: boolean
       error: string
+    }
+  | {
+      type: 'plan'
+      plan: PlanRevisionSnapshot
     }
 
 export type ChatPart = Part & { key: string }

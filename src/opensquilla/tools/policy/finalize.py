@@ -49,6 +49,42 @@ _DISPATCH_TRUNCATION_RETRIEVE_HINT = (
 )
 
 
+def _registered_terminates_turn(registered: Any) -> bool:
+    return bool(getattr(getattr(registered, "spec", None), "terminates_turn", False))
+
+
+def _plan_checkpoint_terminates_turn(tool_name: str, content: Any) -> bool:
+    """A blocked checkpoint is a hard execution boundary."""
+
+    if tool_name != "plan_run_checkpoint":
+        return False
+    try:
+        payload = json.loads(content) if isinstance(content, str) else content
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    run = payload.get("plan_run")
+    return isinstance(run, dict) and run.get("status") == "blocked"
+
+
+def _user_input_terminates_turn(tool_name: str, content: Any) -> bool:
+    """Fallback surfaces without a deferred broker stop at the request."""
+
+    if tool_name != "request_user_input":
+        return False
+    try:
+        payload = json.loads(content) if isinstance(content, str) else content
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("status") == "input_required"
+        and payload.get("kind") == "user_input"
+        and payload.get("paused") is True
+    )
+
+
 def _store_dispatch_truncated_snapshot(
     *,
     ctx: ToolContext | None,
@@ -223,6 +259,7 @@ async def finalize(
                 content=json.dumps(payload),
                 is_error=False,
                 execution_status=normalize_execution_status(status),
+                terminates_turn=False,
             )
 
         envelope = redact_secret_value(
@@ -258,6 +295,7 @@ async def finalize(
             content=json.dumps(envelope),
             is_error=True,
             execution_status=normalize_execution_status(status),
+            terminates_turn=False,
         )
 
     result = redact_secret_value(raw_result)
@@ -304,6 +342,7 @@ async def finalize(
                 content=json.dumps(envelope),
                 is_error=False,
                 execution_status=normalize_execution_status(status),
+                terminates_turn=False,
             )
 
     # ---------------- Standard branch (success or denial payload) ----------------
@@ -385,7 +424,12 @@ async def finalize(
         artifacts=artifacts,
         execution_status=execution_status,
         terminates_turn=(
-            call.tool_name == "router_control"
-            and router_control_payload_terminates_turn(content)
+            (_registered_terminates_turn(registered) and not is_error)
+            or _plan_checkpoint_terminates_turn(call.tool_name, content)
+            or _user_input_terminates_turn(call.tool_name, content)
+            or (
+                call.tool_name == "router_control"
+                and router_control_payload_terminates_turn(content)
+            )
         ),
     )

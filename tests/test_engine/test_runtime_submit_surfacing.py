@@ -104,3 +104,47 @@ def test_build_tools_env_off_overrides_config_on_under_scaffold_profile(
     names = {getattr(td, "name", "") for td in tool_defs}
 
     assert "submit" not in names
+
+
+def test_build_tools_exposes_plan_run_delivery_controls_under_scaffold_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENSQUILLA_SUBMIT_REVIEW", raising=False)
+    runner = _runner_with_scaffold_profile()
+
+    ctx = ToolContext(
+        is_owner=True,
+        workspace_dir=str(tmp_path),
+        plan_run_id="run-1",
+    )
+    tool_defs, _handler = runner._build_tools(ctx)
+    names = {getattr(td, "name", "") for td in tool_defs}
+
+    assert "plan_run_checkpoint" in names
+    assert "publish_artifact" in names
+    assert _SCAFFOLD_TOOLS <= names
+    plan_run_tools = {"plan_run_checkpoint", "publish_artifact"}
+    assert len(names & (_SCAFFOLD_TOOLS | plan_run_tools)) == 12
+    assert ctx.surfaced_tools is not None
+    assert plan_run_tools <= ctx.surfaced_tools
+
+
+def test_build_tools_plan_run_hides_submit_when_review_enabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_SUBMIT_REVIEW", "on")
+    runner = _runner_with_scaffold_profile()
+
+    ctx = ToolContext(
+        is_owner=True,
+        workspace_dir=str(tmp_path),
+        plan_run_id="run-1",
+    )
+    tool_defs, _handler = runner._build_tools(ctx)
+    names = {getattr(td, "name", "") for td in tool_defs}
+
+    assert {"plan_run_checkpoint", "publish_artifact"} <= names
+    assert "submit" not in names
+    assert "submit" in ctx.denied_tools

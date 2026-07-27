@@ -17,12 +17,14 @@ import pytest_asyncio
 from opensquilla.session.compaction import CompactionConfig
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import (
+    PlanRunRecord,
     SessionContextState,
     SessionIntent,
     SessionStatus,
     SessionSummary,
     TranscriptEntry,
 )
+from opensquilla.session.plans import new_plan_revision
 from opensquilla.session.storage import (
     CANONICAL_FORK_PROOF_SCHEMA_VERSION,
     SessionStorage,
@@ -129,6 +131,35 @@ async def test_apply_intent_reset_same_key_rotates_identity_and_clears_state(
     node.cache_read = 7
     node.cache_write = 8
     await manager._storage.upsert_session(node)
+    revision = await manager._storage.create_plan_revision(
+        new_plan_revision(
+            source_session_key=node.session_key,
+            source_session_id=node.session_id,
+            source_epoch=int(node.epoch or 0),
+            title="Old task plan",
+            markdown="## Old task plan",
+            steps=[{"step_id": "old", "title": "Old step"}],
+        ),
+        expected_parent_revision_id=None,
+    )
+    current = await manager.get_session(node.session_key)
+    assert current is not None
+    await manager._storage.set_collaboration_mode(
+        node.session_key,
+        "plan",
+        expected_revision=int(current.collaboration_revision or 0),
+    )
+    old_run = await manager._storage.start_plan_run(
+        PlanRunRecord(
+            run_id="old-task-run",
+            session_key=node.session_key,
+            session_id=node.session_id,
+            session_epoch=int(node.epoch or 0),
+            plan_revision_id=revision.revision_id,
+            driver_kind="manual",
+            status="queued",
+        )
+    )
     await manager.append_message("agent:main:main", "user", "hello")
     await manager._storage.save_summary(
         SessionSummary(
@@ -173,6 +204,13 @@ async def test_apply_intent_reset_same_key_rotates_identity_and_clears_state(
     assert applied.missing_cost_entries == 0
     assert applied.cache_read == 0
     assert applied.cache_write == 0
+    assert applied.collaboration_mode == "default"
+    assert applied.collaboration_revision == 0
+    assert applied.active_plan_revision_id is None
+    superseded = await manager._storage.get_plan_run(old_run.run_id)
+    assert superseded is not None
+    assert superseded.status == "superseded"
+    assert superseded.terminal_reason == "session_reset"
     archive_files = list((tmp_path / "archives").glob("*.json"))
     assert len(archive_files) == 1
     archived = json.loads(archive_files[0].read_text(encoding="utf-8"))
@@ -669,6 +707,135 @@ async def test_append_message(manager):
     entry = await manager.append_message("agent:main:main", "user", "Hello!")
     assert entry.role == "user"
     assert entry.content == "Hello!"
+
+
+def _submit_plan_segments(
+    *,
+    tool_use_id: str = "submit-plan-1",
+    title: str = "Implement Plan mode",
+    markdown: str = "## Plan\n\nImplement and verify the collaboration flow.",
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "tool_use",
+            "tool_use_id": tool_use_id,
+            "name": "submit_plan",
+            "input": {
+                "title": title,
+                "markdown": markdown,
+                "steps": [
+                    {"step_id": "inspect", "title": "Inspect the current flow"},
+                    {"step_id": "implement", "title": "Implement and verify"},
+                ],
+            },
+        },
+        {
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "name": "submit_plan",
+            "result": json.dumps(
+                {
+                    "status": "plan_submitted",
+                    "title": title,
+                    "step_count": 2,
+                }
+            ),
+            "is_error": False,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_successful_submit_plan_atomically_creates_typed_revision(manager):
+    await manager.create("agent:main:main")
+    await manager._storage.set_collaboration_mode(
+        "agent:main:main",
+        "plan",
+        expected_revision=0,
+    )
+
+    entry = await manager.append_message(
+        "agent:main:main",
+        "assistant",
+        "Plan ready.",
+        tool_calls=_submit_plan_segments(),
+    )
+
+    node = await manager.get_session("agent:main:main")
+    assert node is not None
+    assert node.collaboration_mode == "plan"
+    assert node.collaboration_revision == 2
+    assert node.active_plan_revision_id is not None
+    revision = await manager._storage.get_current_plan_revision("agent:main:main")
+    assert revision is not None
+    assert revision.revision_id == node.active_plan_revision_id
+    assert revision.generation == 1
+    assert [step["step_id"] for step in revision.steps] == ["inspect", "implement"]
+    assert entry.turn_context is not None
+    assert entry.turn_context["plan_revision_id"] == revision.revision_id
+    plan_segments = [
+        segment for segment in entry.tool_calls or [] if segment.get("type") == "plan"
+    ]
+    assert plan_segments == [
+        {
+            "type": "plan",
+            "snapshot": {
+                **plan_segments[0]["snapshot"],
+                "current": True,
+            },
+        }
+    ]
+    assert plan_segments[0]["snapshot"]["revisionId"] == revision.revision_id
+
+
+@pytest.mark.asyncio
+async def test_replan_is_full_immutable_replacement_with_parent_link(manager):
+    await manager.create("agent:main:main")
+    first_entry = await manager.append_message(
+        "agent:main:main",
+        "assistant",
+        "First plan.",
+        tool_calls=_submit_plan_segments(),
+    )
+    first = await manager._storage.get_current_plan_revision("agent:main:main")
+    assert first is not None
+
+    second_entry = await manager.append_message(
+        "agent:main:main",
+        "assistant",
+        "Revised plan.",
+        tool_calls=_submit_plan_segments(
+            tool_use_id="submit-plan-2",
+            title="Revised Plan mode",
+            markdown="## Revised plan\n\nUse a complete replacement.",
+        ),
+    )
+    second = await manager._storage.get_current_plan_revision("agent:main:main")
+
+    assert second is not None
+    assert second.revision_id != first.revision_id
+    assert second.plan_id == first.plan_id
+    assert second.parent_revision_id == first.revision_id
+    assert second.generation == 2
+    assert first_entry.message_id != second_entry.message_id
+    persisted_first = await manager._storage.get_plan_revision(first.revision_id)
+    assert persisted_first == first
+
+
+@pytest.mark.asyncio
+async def test_failed_submit_plan_result_does_not_create_revision(manager):
+    await manager.create("agent:main:main")
+    segments = _submit_plan_segments()
+    segments[-1]["is_error"] = True
+
+    await manager.append_message(
+        "agent:main:main",
+        "assistant",
+        "Submission failed.",
+        tool_calls=segments,
+    )
+
+    assert await manager._storage.get_current_plan_revision("agent:main:main") is None
 
 
 @pytest.mark.asyncio

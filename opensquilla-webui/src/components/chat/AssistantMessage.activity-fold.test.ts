@@ -287,6 +287,43 @@ describe('AssistantMessage activity disclosure', () => {
     expect((el.textContent?.match(/Final verified answer\./g) ?? [])).toHaveLength(1)
   })
 
+  it('collapses PlanRun narration and leaves only the terminal delivery outside', async () => {
+    const checkpoint = successfulCall('checkpoint', 'plan_run_checkpoint')
+    const el = mountMessage(baseMessage({
+      text: 'Inspecting files.\n\nImplementation complete.',
+      timelineItems: [
+        {
+          type: 'text',
+          key: 'work',
+          html: '<p>Inspecting files.</p>',
+          rawText: 'Inspecting files.\n\n',
+        },
+        timelineGroup(successfulCall('inspect', 'read_source')),
+        {
+          type: 'text',
+          key: 'delivery',
+          html: '<p>Implementation complete.</p>',
+          rawText: 'Implementation complete.',
+        },
+        timelineGroup(checkpoint),
+      ],
+      parts: [],
+      statusHistory: [],
+    }))
+    await nextTick()
+
+    const activity = el.querySelector<HTMLElement>('.assistant-activity')
+    const answer = [...el.querySelectorAll<HTMLElement>('.msg-ai-text')]
+      .find(node => !activity?.contains(node))
+
+    expect(activity?.querySelector('.assistant-activity__summary')?.getAttribute('aria-expanded'))
+      .toBe('false')
+    expect(activity?.textContent).toContain('Inspecting files.')
+    expect(activity?.textContent).not.toContain('plan_run_checkpoint')
+    expect(answer?.textContent).toBe('Implementation complete.')
+    expect(el.textContent).not.toContain('Inspecting files.Implementation complete.')
+  })
+
   it('keeps a terminal failure open at the failed tool', async () => {
     const timelineItems = failedTimeline().filter(item => item.type === 'tool-group')
     const el = mountMessage(baseMessage({

@@ -22,7 +22,11 @@ from opensquilla.session.keys import canonicalize_session_key, normalize_agent_i
 from opensquilla.session.models import (
     AgentTaskRecord,
     AgentTaskStatus,
+    CollaborationMode,
     MemoryDurableReceipt,
+    PlanRevisionRecord,
+    PlanRunRecord,
+    PlanRunStatus,
     ProjectWorkspace,
     SessionContextState,
     SessionNode,
@@ -30,6 +34,15 @@ from opensquilla.session.models import (
     SessionSummary,
     TranscriptEntry,
     TurnIngressReceipt,
+)
+from opensquilla.session.plans import (
+    PLAN_RUN_ACTIVE_STATUSES,
+    PlanConflictError,
+    PlanRunConflictError,
+    PlanValidationError,
+    checkpoint_plan_step_states,
+    prepare_plan_revision,
+    prepare_plan_run,
 )
 from opensquilla.session.usage_ledger import (
     UsageBackfillBatch,
@@ -241,8 +254,10 @@ def _serialized_read[**P, R](
 # Version 10 added the durable provider usage ledger and content-free daily usage
 # telemetry aggregates. Version 11 added per-item provider-native billing receipts.
 # Version 12 added persistent project workspaces and optional session bindings.
-# Version 13 added backend-owned runtime preferences.
-SCHEMA_VERSION = 13
+# Version 13 added backend-owned runtime preferences. Version 14 added durable
+# collaboration-mode state. Version 15 added immutable plan revisions. Version
+# 16 added mutable, compare-and-set plan runs.
+SCHEMA_VERSION = 16
 
 # Session rows at or above this semantic version were created by fork logic
 # that records enough existing metadata for canonical coverage to be checked
@@ -298,6 +313,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     reasoning_level TEXT,
     send_policy TEXT NOT NULL DEFAULT 'allow',
     queue_mode TEXT NOT NULL DEFAULT 'steer',
+    collaboration_mode TEXT NOT NULL DEFAULT 'default',
+    collaboration_revision INTEGER NOT NULL DEFAULT 0,
+    active_plan_revision_id TEXT,
     label TEXT,
     display_name TEXT,
     derived_title TEXT,
@@ -348,6 +366,104 @@ CREATE TABLE IF NOT EXISTS runtime_preferences (
     preference_value TEXT NOT NULL,
     updated_at INTEGER NOT NULL
 )
+"""
+
+_CREATE_PLAN_REVISIONS = """
+CREATE TABLE IF NOT EXISTS plan_revisions (
+    revision_id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL,
+    parent_revision_id TEXT,
+    generation INTEGER NOT NULL CHECK (generation >= 1),
+    source_session_key TEXT NOT NULL,
+    source_session_id TEXT NOT NULL,
+    source_epoch INTEGER NOT NULL DEFAULT 0 CHECK (source_epoch >= 0),
+    source_turn_id TEXT,
+    source_message_id TEXT,
+    title TEXT NOT NULL,
+    markdown TEXT NOT NULL,
+    steps TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1 CHECK (schema_version >= 1)
+)
+"""
+
+_CREATE_IDX_PLAN_REVISIONS_PLAN_GENERATION = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_revisions_plan_generation
+ON plan_revisions(plan_id, generation)
+"""
+
+_CREATE_IDX_PLAN_REVISIONS_SOURCE_SESSION = """
+CREATE INDEX IF NOT EXISTS idx_plan_revisions_source_session
+ON plan_revisions(source_session_key, created_at)
+"""
+
+_CREATE_IDX_PLAN_REVISIONS_SOURCE_MESSAGE = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_revisions_source_message
+ON plan_revisions(source_session_id, source_message_id)
+WHERE source_message_id IS NOT NULL
+"""
+
+_CREATE_PLAN_REVISIONS_IMMUTABLE_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS plan_revisions_immutable
+BEFORE UPDATE ON plan_revisions
+BEGIN
+    SELECT RAISE(ABORT, 'plan revisions are immutable');
+END
+"""
+
+_CREATE_PLAN_RUNS = """
+CREATE TABLE IF NOT EXISTS plan_runs (
+    run_id TEXT PRIMARY KEY,
+    session_key TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    session_epoch INTEGER NOT NULL DEFAULT 0 CHECK (session_epoch >= 0),
+    plan_revision_id TEXT NOT NULL,
+    supersedes_run_id TEXT,
+    driver_kind TEXT NOT NULL DEFAULT 'manual'
+        CHECK (driver_kind IN ('manual', 'goal')),
+    driver_id TEXT,
+    status TEXT NOT NULL DEFAULT 'queued'
+        CHECK (
+            status IN (
+                'queued', 'running', 'paused', 'blocked',
+                'completed', 'cancelled', 'superseded'
+            )
+        ),
+    step_states TEXT NOT NULL,
+    current_step_id TEXT,
+    state_revision INTEGER NOT NULL DEFAULT 0 CHECK (state_revision >= 0),
+    active_task_id TEXT,
+    pause_reason TEXT,
+    terminal_reason TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    started_at INTEGER,
+    finished_at INTEGER,
+    schema_version INTEGER NOT NULL DEFAULT 1 CHECK (schema_version >= 1)
+)
+"""
+
+_CREATE_IDX_PLAN_RUNS_ACTIVE_SESSION = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_runs_active_session
+ON plan_runs(session_key)
+WHERE status IN ('queued', 'running', 'paused', 'blocked')
+"""
+
+_CREATE_IDX_PLAN_RUNS_SESSION_HISTORY = """
+CREATE INDEX IF NOT EXISTS idx_plan_runs_session_history
+ON plan_runs(session_key, created_at)
+"""
+
+_CREATE_IDX_PLAN_RUNS_REVISION = """
+CREATE INDEX IF NOT EXISTS idx_plan_runs_revision
+ON plan_runs(plan_revision_id, created_at)
+"""
+
+_CREATE_IDX_PLAN_RUNS_DRIVER = """
+CREATE INDEX IF NOT EXISTS idx_plan_runs_driver
+ON plan_runs(driver_id)
+WHERE driver_id IS NOT NULL
 """
 
 _CREATE_TRANSCRIPT = """
@@ -880,6 +996,8 @@ def _deserialize_row(row: dict[str, Any]) -> dict[str, Any]:
         "missing_obligations",
         "critical_carry_forward",
         "payload",
+        "steps",
+        "step_states",
     }
     bool_fields = {
         "total_tokens_fresh",
@@ -1315,6 +1433,16 @@ class SessionStorage:
         await self._conn.execute(_CREATE_PROJECT_WORKSPACES)
         await self._conn.execute(_CREATE_IDX_PROJECT_WORKSPACES_ORDER)
         await self._conn.execute(_CREATE_RUNTIME_PREFERENCES)
+        await self._conn.execute(_CREATE_PLAN_REVISIONS)
+        await self._conn.execute(_CREATE_IDX_PLAN_REVISIONS_PLAN_GENERATION)
+        await self._conn.execute(_CREATE_IDX_PLAN_REVISIONS_SOURCE_SESSION)
+        await self._conn.execute(_CREATE_IDX_PLAN_REVISIONS_SOURCE_MESSAGE)
+        await self._conn.execute(_CREATE_PLAN_REVISIONS_IMMUTABLE_TRIGGER)
+        await self._conn.execute(_CREATE_PLAN_RUNS)
+        await self._conn.execute(_CREATE_IDX_PLAN_RUNS_ACTIVE_SESSION)
+        await self._conn.execute(_CREATE_IDX_PLAN_RUNS_SESSION_HISTORY)
+        await self._conn.execute(_CREATE_IDX_PLAN_RUNS_REVISION)
+        await self._conn.execute(_CREATE_IDX_PLAN_RUNS_DRIVER)
         await self._conn.execute(_CREATE_TRANSCRIPT)
         await self._conn.execute(_CREATE_IDX_TRANSCRIPT_SESSION)
         await self._conn.execute(_CREATE_IDX_TRANSCRIPT_KEY)
@@ -1371,6 +1499,7 @@ class SessionStorage:
         # Migrate older databases — add the epoch column if missing.
         await self._migrate_epoch_column()
         await self._migrate_workspace_id_column()
+        await self._migrate_collaboration_columns()
         await self._migrate_derived_title_column()
         await self._migrate_transcript_reasoning_content_column()
         await self._migrate_transcript_turn_usage_column()
@@ -1548,6 +1677,49 @@ class SessionStorage:
                 "ALTER TABLE sessions ADD COLUMN workspace_id TEXT"
             )
             await self._conn.commit()
+
+    async def _migrate_collaboration_columns(self) -> None:
+        """Idempotently widen legacy sessions with durable Plan mode state."""
+
+        assert self._conn is not None
+        async with self._conn.execute("PRAGMA table_info(sessions)") as cur:
+            columns = {row[1] for row in await cur.fetchall()}
+        additions = {
+            "collaboration_mode": (
+                "ALTER TABLE sessions ADD COLUMN "
+                "collaboration_mode TEXT NOT NULL DEFAULT 'default'"
+            ),
+            "collaboration_revision": (
+                "ALTER TABLE sessions ADD COLUMN "
+                "collaboration_revision INTEGER NOT NULL DEFAULT 0"
+            ),
+            "active_plan_revision_id": (
+                "ALTER TABLE sessions ADD COLUMN active_plan_revision_id TEXT"
+            ),
+        }
+        changed = False
+        for column, sql in additions.items():
+            if column not in columns:
+                await self._conn.execute(sql)
+                changed = True
+        if changed:
+            await self._conn.commit()
+        await self._conn.execute(
+            """
+            UPDATE sessions
+            SET collaboration_mode = 'default'
+            WHERE collaboration_mode NOT IN ('default', 'plan')
+               OR collaboration_mode IS NULL
+            """
+        )
+        await self._conn.execute(
+            """
+            UPDATE sessions
+            SET collaboration_revision = 0
+            WHERE collaboration_revision IS NULL OR collaboration_revision < 0
+            """
+        )
+        await self._conn.commit()
 
     async def _migrate_derived_title_column(self) -> None:
         """Idempotently add the derived_title column to an existing sessions table.
@@ -3521,6 +3693,14 @@ class SessionStorage:
             (session.session_key,),
         )
         await conn.execute(
+            "DELETE FROM plan_runs WHERE session_key = ?",
+            (session.session_key,),
+        )
+        await conn.execute(
+            "DELETE FROM plan_revisions WHERE source_session_key = ?",
+            (session.session_key,),
+        )
+        await conn.execute(
             "DELETE FROM sessions WHERE session_key = ?",
             (session.session_key,),
         )
@@ -3655,6 +3835,1087 @@ class SessionStorage:
                 (normalized_key, normalized_value, _now_ms()),
             )
         return normalized_value
+
+    # ── Collaboration plans ────────────────────────────────────────────────
+
+    async def set_collaboration_mode(
+        self,
+        session_key: str,
+        mode: str | CollaborationMode,
+        *,
+        expected_revision: int,
+    ) -> SessionNode:
+        """Compare-and-set the user-controlled collaboration mode."""
+
+        session_key = canonicalize_session_key(session_key)
+        try:
+            normalized_mode = CollaborationMode(mode).value
+        except ValueError as exc:
+            raise PlanValidationError(f"unsupported collaboration mode: {mode}") from exc
+        if expected_revision < 0:
+            raise PlanValidationError("expected_revision must be non-negative")
+
+        async with self._write_transaction("set_collaboration_mode") as conn:
+            async with conn.execute(
+                "SELECT * FROM sessions WHERE session_key = ?",
+                (session_key,),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                raise KeyError(f"Session not found: {session_key}")
+            current = SessionNode(**_deserialize_row(dict(row)))
+            if current.collaboration_revision != expected_revision:
+                raise PlanConflictError(
+                    "collaboration state changed before the mode update"
+                )
+            if current.collaboration_mode == normalized_mode:
+                return current
+            updated_at = _now_ms()
+            async with conn.execute(
+                """
+                UPDATE sessions
+                SET collaboration_mode = ?,
+                    collaboration_revision = collaboration_revision + 1,
+                    updated_at = ?
+                WHERE session_key = ? AND collaboration_revision = ?
+                """,
+                (normalized_mode, updated_at, session_key, expected_revision),
+            ) as cur:
+                changed = cur.rowcount or 0
+            if changed == 0:
+                raise PlanConflictError(
+                    "collaboration state changed before the mode update"
+                )
+            async with conn.execute(
+                "SELECT * FROM sessions WHERE session_key = ?",
+                (session_key,),
+            ) as cur:
+                updated_row = await cur.fetchone()
+            assert updated_row is not None
+            return SessionNode(**_deserialize_row(dict(updated_row)))
+
+    @staticmethod
+    async def _select_plan_revision_on_conn(
+        conn: Any,
+        revision_id: str,
+    ) -> PlanRevisionRecord | None:
+        async with conn.execute(
+            "SELECT * FROM plan_revisions WHERE revision_id = ?",
+            (revision_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return (
+            None
+            if row is None
+            else PlanRevisionRecord(**_deserialize_row(dict(row)))
+        )
+
+    @classmethod
+    async def _find_idempotent_plan_revision_on_conn(
+        cls,
+        conn: Any,
+        revision: PlanRevisionRecord,
+    ) -> PlanRevisionRecord | None:
+        existing = await cls._select_plan_revision_on_conn(
+            conn,
+            revision.revision_id,
+        )
+        if existing is None and revision.source_message_id:
+            async with conn.execute(
+                """
+                SELECT *
+                FROM plan_revisions
+                WHERE source_session_id = ? AND source_message_id = ?
+                """,
+                (revision.source_session_id, revision.source_message_id),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is not None:
+                existing = PlanRevisionRecord(**_deserialize_row(dict(row)))
+        if existing is None:
+            return None
+        if (
+            existing.content_hash != revision.content_hash
+            or existing.parent_revision_id != revision.parent_revision_id
+            or existing.source_session_key != revision.source_session_key
+            or existing.source_session_id != revision.source_session_id
+            or existing.source_epoch != revision.source_epoch
+        ):
+            raise PlanConflictError(
+                "revision identity was already used for different plan content"
+            )
+        return existing
+
+    @classmethod
+    async def _create_plan_revision_on_conn(
+        cls,
+        conn: Any,
+        revision: PlanRevisionRecord,
+        *,
+        expected_parent_revision_id: str | None,
+        transcript_entry: TranscriptEntry | None = None,
+        expected_epoch: int | None = None,
+        updated_at: int | None = None,
+        token_delta: int = 0,
+        mark_total_tokens_stale: bool = False,
+    ) -> PlanRevisionRecord:
+        existing = await cls._find_idempotent_plan_revision_on_conn(conn, revision)
+        if existing is not None:
+            return existing
+
+        async with conn.execute(
+            """
+            SELECT session_id, epoch, active_plan_revision_id
+            FROM sessions
+            WHERE session_key = ?
+            """,
+            (revision.source_session_key,),
+        ) as cur:
+            session_row = await cur.fetchone()
+        if session_row is None:
+            raise KeyError(f"Session not found: {revision.source_session_key}")
+        if (
+            str(session_row["session_id"]) != revision.source_session_id
+            or int(session_row["epoch"]) != revision.source_epoch
+        ):
+            await cls._raise_stale_epoch(
+                conn,
+                session_key=revision.source_session_key,
+                expected_epoch=revision.source_epoch,
+            )
+
+        active_parent = session_row["active_plan_revision_id"]
+        if active_parent != expected_parent_revision_id:
+            raise PlanConflictError(
+                "active plan revision changed before the revision was committed"
+            )
+        if revision.parent_revision_id != expected_parent_revision_id:
+            raise PlanValidationError(
+                "revision parent must match expected_parent_revision_id"
+            )
+        active_placeholders = ", ".join("?" for _ in PLAN_RUN_ACTIVE_STATUSES)
+        async with conn.execute(
+            f"""
+            SELECT run_id, status
+            FROM plan_runs
+            WHERE session_key = ? AND status IN ({active_placeholders})
+            LIMIT 1
+            """,  # noqa: S608 - placeholder count is from a fixed constant
+            [
+                revision.source_session_key,
+                *sorted(PLAN_RUN_ACTIVE_STATUSES),
+            ],
+        ) as cur:
+            active_run_row = await cur.fetchone()
+        if (
+            active_run_row is not None
+            and str(active_run_row["status"])
+            in {PlanRunStatus.QUEUED.value, PlanRunStatus.RUNNING.value}
+        ):
+            raise PlanRunConflictError(
+                "cannot replace a plan while its implementation task is active"
+            )
+
+        if expected_parent_revision_id is None:
+            if revision.generation != 1:
+                raise PlanValidationError("an initial plan revision must use generation 1")
+        else:
+            parent = await cls._select_plan_revision_on_conn(
+                conn,
+                expected_parent_revision_id,
+            )
+            if parent is None:
+                raise PlanConflictError("parent plan revision no longer exists")
+            if revision.plan_id != parent.plan_id:
+                raise PlanValidationError("a replan must preserve plan_id")
+            if revision.generation != parent.generation + 1:
+                raise PlanValidationError(
+                    "a replan generation must immediately follow its parent"
+                )
+
+        if transcript_entry is not None:
+            if (
+                transcript_entry.session_key != revision.source_session_key
+                or transcript_entry.session_id != revision.source_session_id
+            ):
+                raise PlanValidationError(
+                    "plan revision and transcript entry must target the same session"
+                )
+            if transcript_entry.role != "assistant":
+                raise PlanValidationError(
+                    "a durable plan revision must be attached to an assistant entry"
+                )
+            if (
+                revision.source_message_id is not None
+                and revision.source_message_id != transcript_entry.message_id
+            ):
+                raise PlanValidationError(
+                    "source_message_id must match the assistant transcript entry"
+                )
+            await cls._insert_transcript_entry(
+                conn,
+                transcript_entry,
+                expected_epoch=expected_epoch,
+            )
+
+        data = revision.model_dump()
+        columns = list(data)
+        placeholders = ", ".join("?" for _ in columns)
+        await conn.execute(
+            f"INSERT INTO plan_revisions ({', '.join(columns)}) "
+            f"VALUES ({placeholders})",
+            [_serialize(data[column]) for column in columns],
+        )
+        if expected_parent_revision_id is None:
+            parent_clause = "active_plan_revision_id IS NULL"
+            parent_params: list[Any] = []
+        else:
+            parent_clause = "active_plan_revision_id = ?"
+            parent_params = [expected_parent_revision_id]
+        async with conn.execute(
+            f"""
+            UPDATE sessions
+            SET active_plan_revision_id = ?,
+                collaboration_revision = collaboration_revision + 1,
+                updated_at = MAX(updated_at, ?),
+                total_tokens = total_tokens + ?,
+                total_tokens_fresh = CASE
+                    WHEN ? THEN 0
+                    ELSE total_tokens_fresh
+                END
+            WHERE session_key = ? AND session_id = ? AND epoch = ?
+              AND {parent_clause}
+            """,  # noqa: S608 - parent clause is selected from fixed literals above
+            [
+                revision.revision_id,
+                revision.created_at if updated_at is None else updated_at,
+                token_delta,
+                int(mark_total_tokens_stale),
+                revision.source_session_key,
+                revision.source_session_id,
+                revision.source_epoch,
+                *parent_params,
+            ],
+        ) as cur:
+            activated = cur.rowcount or 0
+        if activated == 0:
+            raise PlanConflictError(
+                "active plan revision changed before the revision was committed"
+            )
+        if active_run_row is not None:
+            timestamp = revision.created_at if updated_at is None else updated_at
+            await conn.execute(
+                """
+                UPDATE plan_runs
+                SET status = 'superseded',
+                    state_revision = state_revision + 1,
+                    active_task_id = NULL,
+                    terminal_reason = 'superseded_by_new_revision',
+                    updated_at = ?,
+                    finished_at = ?
+                WHERE run_id = ?
+                """,
+                (timestamp, timestamp, str(active_run_row["run_id"])),
+            )
+        return revision
+
+    async def create_plan_revision(
+        self,
+        revision: PlanRevisionRecord,
+        *,
+        expected_parent_revision_id: str | None,
+    ) -> PlanRevisionRecord:
+        """Persist and activate one immutable structured plan revision."""
+
+        prepared = prepare_plan_revision(revision)
+        prepared.source_session_key = canonicalize_session_key(
+            prepared.source_session_key
+        )
+        async with self._write_transaction("create_plan_revision") as conn:
+            return await self._create_plan_revision_on_conn(
+                conn,
+                prepared,
+                expected_parent_revision_id=expected_parent_revision_id,
+            )
+
+    async def append_plan_revision(
+        self,
+        entry: TranscriptEntry,
+        revision: PlanRevisionRecord,
+        *,
+        expected_epoch: int,
+        expected_parent_revision_id: str | None,
+        updated_at: int | None = None,
+        token_delta: int | None = None,
+        mark_total_tokens_stale: bool | None = None,
+    ) -> PlanRevisionRecord:
+        """Atomically append an assistant entry and activate its plan revision."""
+
+        prepared = prepare_plan_revision(revision)
+        prepared.source_session_key = canonicalize_session_key(
+            prepared.source_session_key
+        )
+        entry.session_key = canonicalize_session_key(entry.session_key)
+        effective_token_delta = (
+            (
+                entry.token_count
+                if entry.token_count is not None and entry.turn_usage is None
+                else 0
+            )
+            if token_delta is None
+            else token_delta
+        )
+        effective_mark_stale = (
+            bool(effective_token_delta)
+            if mark_total_tokens_stale is None
+            else mark_total_tokens_stale
+        )
+        async with self._write_transaction("append_plan_revision") as conn:
+            return await self._create_plan_revision_on_conn(
+                conn,
+                prepared,
+                expected_parent_revision_id=expected_parent_revision_id,
+                transcript_entry=entry,
+                expected_epoch=expected_epoch,
+                updated_at=updated_at,
+                token_delta=effective_token_delta,
+                mark_total_tokens_stale=effective_mark_stale,
+            )
+
+    @_serialized_read
+    async def get_plan_revision(
+        self,
+        revision_id: str,
+    ) -> PlanRevisionRecord | None:
+        return await self._select_plan_revision_on_conn(self.conn, revision_id)
+
+    @_serialized_read
+    async def get_current_plan_revision(
+        self,
+        session_key: str,
+    ) -> PlanRevisionRecord | None:
+        session_key = canonicalize_session_key(session_key)
+        async with self.conn.execute(
+            """
+            SELECT plan_revisions.*
+            FROM sessions
+            JOIN plan_revisions
+              ON plan_revisions.revision_id = sessions.active_plan_revision_id
+            WHERE sessions.session_key = ?
+            """,
+            (session_key,),
+        ) as cur:
+            row = await cur.fetchone()
+        return (
+            None
+            if row is None
+            else PlanRevisionRecord(**_deserialize_row(dict(row)))
+        )
+
+    @_serialized_read
+    async def list_plan_revisions(
+        self,
+        *,
+        session_key: str | None = None,
+        plan_id: str | None = None,
+        limit: int = 100,
+    ) -> list[PlanRevisionRecord]:
+        if session_key is None and plan_id is None:
+            raise ValueError("session_key or plan_id is required")
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if session_key is not None:
+            clauses.append("source_session_key = ?")
+            parameters.append(canonicalize_session_key(session_key))
+        if plan_id is not None:
+            clauses.append("plan_id = ?")
+            parameters.append(plan_id)
+        parameters.append(limit)
+        async with self.conn.execute(
+            f"""
+            SELECT *
+            FROM plan_revisions
+            WHERE {" AND ".join(clauses)}
+            ORDER BY generation DESC, created_at DESC
+            LIMIT ?
+            """,  # noqa: S608 - clauses contain fixed literals only
+            parameters,
+        ) as cur:
+            rows = await cur.fetchall()
+        return [
+            PlanRevisionRecord(**_deserialize_row(dict(row)))
+            for row in rows
+        ]
+
+    @staticmethod
+    async def _select_plan_run_on_conn(
+        conn: Any,
+        run_id: str,
+    ) -> PlanRunRecord | None:
+        async with conn.execute(
+            "SELECT * FROM plan_runs WHERE run_id = ?",
+            (run_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return None if row is None else PlanRunRecord(**_deserialize_row(dict(row)))
+
+    @classmethod
+    async def _start_plan_run_on_conn(
+        cls,
+        conn: Any,
+        run: PlanRunRecord,
+    ) -> PlanRunRecord:
+        existing = await cls._select_plan_run_on_conn(conn, run.run_id)
+        if existing is not None:
+            if (
+                existing.session_key != run.session_key
+                or existing.session_id != run.session_id
+                or existing.session_epoch != run.session_epoch
+                or existing.plan_revision_id != run.plan_revision_id
+            ):
+                raise PlanRunConflictError(
+                    "run_id was already used for a different plan run"
+                )
+            if (
+                existing.driver_kind != run.driver_kind
+                or existing.driver_id != run.driver_id
+            ):
+                raise PlanRunConflictError(
+                    "plan run is owned by a different execution driver"
+                )
+            incoming_task_id = str(run.active_task_id or "").strip()
+            if not incoming_task_id:
+                return existing
+            if existing.status in {
+                PlanRunStatus.PAUSED.value,
+                PlanRunStatus.BLOCKED.value,
+            }:
+                if run.state_revision != existing.state_revision:
+                    raise PlanRunConflictError(
+                        "the paused plan run changed before it was queued"
+                    )
+                timestamp = _now_ms()
+                async with conn.execute(
+                    """
+                    UPDATE plan_runs
+                    SET status = 'queued',
+                        state_revision = state_revision + 1,
+                        active_task_id = ?,
+                        pause_reason = NULL,
+                        terminal_reason = NULL,
+                        updated_at = ?
+                    WHERE run_id = ? AND state_revision = ?
+                    """,
+                    (
+                        incoming_task_id,
+                        timestamp,
+                        run.run_id,
+                        existing.state_revision,
+                    ),
+                ) as cur:
+                    changed = cur.rowcount or 0
+                if changed == 0:
+                    raise PlanRunConflictError(
+                        "the paused plan run changed before it was queued"
+                    )
+                resumed = await cls._select_plan_run_on_conn(conn, run.run_id)
+                assert resumed is not None
+                return resumed
+            if (
+                existing.status == PlanRunStatus.QUEUED.value
+                and existing.active_task_id == incoming_task_id
+            ):
+                return existing
+            raise PlanRunConflictError(
+                f"cannot attach a task to a {existing.status} plan run"
+            )
+
+        async with conn.execute(
+            """
+            SELECT session_id, epoch, active_plan_revision_id
+            FROM sessions
+            WHERE session_key = ?
+            """,
+            (run.session_key,),
+        ) as cur:
+            session_row = await cur.fetchone()
+        if session_row is None:
+            raise KeyError(f"Session not found: {run.session_key}")
+        if (
+            str(session_row["session_id"]) != run.session_id
+            or int(session_row["epoch"]) != run.session_epoch
+        ):
+            await cls._raise_stale_epoch(
+                conn,
+                session_key=run.session_key,
+                expected_epoch=run.session_epoch,
+            )
+        if session_row["active_plan_revision_id"] != run.plan_revision_id:
+            raise PlanConflictError("only the current plan revision can be implemented")
+
+        revision = await cls._select_plan_revision_on_conn(
+            conn,
+            run.plan_revision_id,
+        )
+        if revision is None:
+            raise PlanConflictError("plan revision no longer exists")
+        prepared = prepare_plan_run(run, revision=revision)
+
+        active_placeholders = ", ".join("?" for _ in PLAN_RUN_ACTIVE_STATUSES)
+        async with conn.execute(
+            f"""
+            SELECT *
+            FROM plan_runs
+            WHERE session_key = ? AND status IN ({active_placeholders})
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,  # noqa: S608 - placeholder count is derived from a fixed constant
+            [run.session_key, *sorted(PLAN_RUN_ACTIVE_STATUSES)],
+        ) as cur:
+            active_row = await cur.fetchone()
+        superseded_run_id = (
+            str(active_row["run_id"]) if active_row is not None else None
+        )
+        if (
+            prepared.supersedes_run_id is not None
+            and prepared.supersedes_run_id != superseded_run_id
+        ):
+            raise PlanRunConflictError("the active run changed before implementation")
+        async with conn.execute(
+            """
+            SELECT MAX(created_at) AS max_created_at
+            FROM plan_runs
+            WHERE session_key = ?
+            """,
+            (run.session_key,),
+        ) as cur:
+            newest_row = await cur.fetchone()
+        newest_created_at = (
+            int(newest_row["max_created_at"])
+            if newest_row is not None and newest_row["max_created_at"] is not None
+            else -1
+        )
+        # Distinct runs need a server-authoritative total order. Wall-clock
+        # milliseconds alone can collide, causing clients to discard a newly
+        # queued run as stale. Keep creation time monotonic per session while
+        # preserving externally supplied timestamps that are already newer.
+        timestamp = max(prepared.created_at, _now_ms(), newest_created_at + 1)
+        if active_row is not None and str(active_row["status"]) in {
+            PlanRunStatus.QUEUED.value,
+            PlanRunStatus.RUNNING.value,
+        }:
+            raise PlanRunConflictError(
+                "an implementation task is already queued or running"
+            )
+        if (
+            active_row is not None
+            and (
+                str(active_row["driver_kind"]) != prepared.driver_kind
+                or (
+                    (str(active_row["driver_id"] or "") or None)
+                    != prepared.driver_id
+                )
+            )
+        ):
+            raise PlanRunConflictError(
+                "the active plan run is owned by a different execution driver"
+            )
+        if (
+            active_row is not None
+            and str(active_row["driver_kind"]) == "goal"
+        ):
+            raise PlanRunConflictError(
+                "an active Goal plan run must be resumed by its existing run_id"
+            )
+        if superseded_run_id is not None:
+            await conn.execute(
+                """
+                UPDATE plan_runs
+                SET status = 'superseded',
+                    state_revision = state_revision + 1,
+                    active_task_id = NULL,
+                    terminal_reason = 'superseded_by_new_run',
+                    updated_at = ?,
+                    finished_at = ?
+                WHERE run_id = ?
+                """,
+                (timestamp, timestamp, superseded_run_id),
+            )
+        prepared = prepared.model_copy(
+            update={
+                "supersedes_run_id": superseded_run_id,
+                "created_at": timestamp,
+                "updated_at": timestamp,
+            }
+        )
+        data = prepared.model_dump()
+        columns = list(data)
+        placeholders = ", ".join("?" for _ in columns)
+        await conn.execute(
+            f"INSERT INTO plan_runs ({', '.join(columns)}) VALUES ({placeholders})",
+            [_serialize(data[column]) for column in columns],
+        )
+        return prepared
+
+    async def start_plan_run(self, run: PlanRunRecord) -> PlanRunRecord:
+        """Start a queued run and atomically supersede any prior active run."""
+
+        run.session_key = canonicalize_session_key(run.session_key)
+        async with self._write_transaction("start_plan_run") as conn:
+            return await self._start_plan_run_on_conn(conn, run)
+
+    @_serialized_read
+    async def get_plan_run(self, run_id: str) -> PlanRunRecord | None:
+        return await self._select_plan_run_on_conn(self.conn, run_id)
+
+    @_serialized_read
+    async def get_active_plan_run(
+        self,
+        session_key: str,
+    ) -> PlanRunRecord | None:
+        session_key = canonicalize_session_key(session_key)
+        placeholders = ", ".join("?" for _ in PLAN_RUN_ACTIVE_STATUSES)
+        async with self.conn.execute(
+            f"""
+            SELECT *
+            FROM plan_runs
+            WHERE session_key = ? AND status IN ({placeholders})
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,  # noqa: S608 - placeholder count is derived from a fixed constant
+            [session_key, *sorted(PLAN_RUN_ACTIVE_STATUSES)],
+        ) as cur:
+            row = await cur.fetchone()
+        return None if row is None else PlanRunRecord(**_deserialize_row(dict(row)))
+
+    async def supersede_active_plan_runs(
+        self,
+        session_key: str,
+        *,
+        reason: str,
+        updated_at: int | None = None,
+    ) -> int:
+        """Terminate every active execution overlay for a session boundary."""
+
+        session_key = canonicalize_session_key(session_key)
+        timestamp = _now_ms() if updated_at is None else updated_at
+        placeholders = ", ".join("?" for _ in PLAN_RUN_ACTIVE_STATUSES)
+        async with self._write_transaction("supersede_active_plan_runs") as conn:
+            async with conn.execute(
+                f"""
+                UPDATE plan_runs
+                SET status = 'superseded',
+                    state_revision = state_revision + 1,
+                    active_task_id = NULL,
+                    terminal_reason = ?,
+                    updated_at = ?,
+                    finished_at = ?
+                WHERE session_key = ? AND status IN ({placeholders})
+                """,  # noqa: S608 - placeholder count is from a fixed constant
+                [
+                    reason,
+                    timestamp,
+                    timestamp,
+                    session_key,
+                    *sorted(PLAN_RUN_ACTIVE_STATUSES),
+                ],
+            ) as cur:
+                return int(cur.rowcount or 0)
+
+    @classmethod
+    async def _load_plan_run_for_cas(
+        cls,
+        conn: Any,
+        *,
+        run_id: str,
+        expected_state_revision: int,
+    ) -> PlanRunRecord:
+        run = await cls._select_plan_run_on_conn(conn, run_id)
+        if run is None:
+            raise KeyError(f"Plan run not found: {run_id}")
+        if run.state_revision != expected_state_revision:
+            raise PlanRunConflictError("plan run state changed before the update")
+        async with conn.execute(
+            "SELECT session_id, epoch FROM sessions WHERE session_key = ?",
+            (run.session_key,),
+        ) as cur:
+            session_row = await cur.fetchone()
+        if (
+            session_row is None
+            or str(session_row["session_id"]) != run.session_id
+            or int(session_row["epoch"]) != run.session_epoch
+        ):
+            raise PlanRunConflictError("plan run belongs to a stale session epoch")
+        return run
+
+    async def mark_plan_run_running(
+        self,
+        run_id: str,
+        *,
+        expected_state_revision: int,
+        active_task_id: str,
+    ) -> PlanRunRecord:
+        """Claim an active run for a task and enter its execution phase."""
+
+        if not active_task_id:
+            raise PlanValidationError("active_task_id is required")
+        async with self._write_transaction("mark_plan_run_running") as conn:
+            run = await self._load_plan_run_for_cas(
+                conn,
+                run_id=run_id,
+                expected_state_revision=expected_state_revision,
+            )
+            async with conn.execute(
+                """
+                SELECT active_plan_revision_id
+                FROM sessions
+                WHERE session_key = ? AND session_id = ? AND epoch = ?
+                """,
+                (run.session_key, run.session_id, run.session_epoch),
+            ) as cur:
+                session_row = await cur.fetchone()
+            if (
+                session_row is None
+                or session_row["active_plan_revision_id"] != run.plan_revision_id
+            ):
+                timestamp = _now_ms()
+                await conn.execute(
+                    """
+                    UPDATE plan_runs
+                    SET status = 'superseded',
+                        state_revision = state_revision + 1,
+                        active_task_id = NULL,
+                        terminal_reason = 'stale_plan_revision',
+                        updated_at = ?,
+                        finished_at = ?
+                    WHERE run_id = ? AND state_revision = ?
+                    """,
+                    (timestamp, timestamp, run_id, expected_state_revision),
+                )
+                updated = await self._select_plan_run_on_conn(conn, run_id)
+                assert updated is not None
+                return updated
+            if run.status not in {
+                PlanRunStatus.QUEUED.value,
+                PlanRunStatus.PAUSED.value,
+                PlanRunStatus.BLOCKED.value,
+            }:
+                raise PlanRunConflictError(
+                    f"cannot mark a {run.status} plan run as running"
+                )
+            if run.active_task_id is not None and run.active_task_id != active_task_id:
+                raise PlanRunConflictError("plan run is owned by another task")
+            states = [dict(state) for state in run.step_states]
+            current_step_id = run.current_step_id
+            if current_step_id is None:
+                current_step_id = next(
+                    (
+                        str(state["step_id"])
+                        for state in states
+                        if state.get("status") not in {"completed", "skipped"}
+                    ),
+                    None,
+                )
+            delivery_ready = bool(states) and all(
+                state.get("status") in {"completed", "skipped"}
+                for state in states
+            )
+            if current_step_id is None and not delivery_ready:
+                raise PlanRunConflictError("plan run has no resumable execution step")
+            if current_step_id is not None:
+                for state in states:
+                    if state.get("step_id") == current_step_id:
+                        state["status"] = "in_progress"
+                        state.pop("reason", None)
+                        break
+            timestamp = _now_ms()
+            async with conn.execute(
+                """
+                UPDATE plan_runs
+                SET status = 'running',
+                    step_states = ?,
+                    current_step_id = ?,
+                    state_revision = state_revision + 1,
+                    active_task_id = ?,
+                    pause_reason = NULL,
+                    terminal_reason = NULL,
+                    started_at = COALESCE(started_at, ?),
+                    updated_at = ?
+                WHERE run_id = ? AND state_revision = ?
+                """,
+                (
+                    _serialize(states),
+                    current_step_id,
+                    active_task_id,
+                    timestamp,
+                    timestamp,
+                    run_id,
+                    expected_state_revision,
+                ),
+            ) as cur:
+                changed = cur.rowcount or 0
+            if changed == 0:
+                raise PlanRunConflictError("plan run state changed before the update")
+            updated = await self._select_plan_run_on_conn(conn, run_id)
+            assert updated is not None
+            return updated
+
+    async def checkpoint_plan_run(
+        self,
+        run_id: str,
+        *,
+        expected_state_revision: int,
+        step_id: str,
+        step_status: str,
+        next_step_id: str | None = None,
+        expected_active_task_id: str | None = None,
+        reason: str | None = None,
+    ) -> PlanRunRecord:
+        """Compare-and-set one step checkpoint and derive the run lifecycle."""
+
+        async with self._write_transaction("checkpoint_plan_run") as conn:
+            run = await self._load_plan_run_for_cas(
+                conn,
+                run_id=run_id,
+                expected_state_revision=expected_state_revision,
+            )
+            if run.status != PlanRunStatus.RUNNING.value:
+                raise PlanRunConflictError(
+                    f"cannot checkpoint a {run.status} plan run"
+                )
+            if (
+                expected_active_task_id is not None
+                and run.active_task_id != expected_active_task_id
+            ):
+                raise PlanRunConflictError("plan run is owned by another task")
+            if run.current_step_id != step_id:
+                raise PlanRunConflictError(
+                    "only the current plan step may be checkpointed"
+                )
+            states, current_step_id, status = checkpoint_plan_step_states(
+                run.step_states,
+                step_id=step_id,
+                step_status=step_status,
+                next_step_id=next_step_id,
+                reason=reason,
+            )
+            timestamp = _now_ms()
+            blocked = status == PlanRunStatus.BLOCKED.value
+            async with conn.execute(
+                """
+                UPDATE plan_runs
+                SET status = ?,
+                    step_states = ?,
+                    current_step_id = ?,
+                    state_revision = state_revision + 1,
+                    active_task_id = ?,
+                    pause_reason = ?,
+                    terminal_reason = ?,
+                    updated_at = ?,
+                    finished_at = ?
+                WHERE run_id = ? AND state_revision = ?
+                """,
+                (
+                    status,
+                    _serialize(states),
+                    current_step_id,
+                    None if blocked else run.active_task_id,
+                    reason if blocked else None,
+                    None,
+                    timestamp,
+                    None,
+                    run_id,
+                    expected_state_revision,
+                ),
+            ) as cur:
+                changed = cur.rowcount or 0
+            if changed == 0:
+                raise PlanRunConflictError("plan run state changed before the update")
+            updated = await self._select_plan_run_on_conn(conn, run_id)
+            assert updated is not None
+            return updated
+
+    async def complete_plan_run(
+        self,
+        run_id: str,
+        *,
+        expected_state_revision: int,
+        expected_active_task_id: str,
+    ) -> PlanRunRecord:
+        """Finalize a fully checkpointed run after its owning task succeeds."""
+
+        if not expected_active_task_id:
+            raise PlanValidationError("expected_active_task_id is required")
+        async with self._write_transaction("complete_plan_run") as conn:
+            run = await self._load_plan_run_for_cas(
+                conn,
+                run_id=run_id,
+                expected_state_revision=expected_state_revision,
+            )
+            if run.status != PlanRunStatus.RUNNING.value:
+                raise PlanRunConflictError(
+                    f"cannot complete a {run.status} plan run"
+                )
+            if run.active_task_id != expected_active_task_id:
+                raise PlanRunConflictError("plan run is owned by another task")
+            if run.current_step_id is not None:
+                raise PlanRunConflictError(
+                    "plan run cannot complete before its final checkpoint"
+                )
+            if not run.step_states or any(
+                state.get("status") not in {"completed", "skipped"}
+                for state in run.step_states
+            ):
+                raise PlanRunConflictError(
+                    "plan run cannot complete with unfinished steps"
+                )
+
+            timestamp = _now_ms()
+            async with conn.execute(
+                """
+                UPDATE plan_runs
+                SET status = 'completed',
+                    state_revision = state_revision + 1,
+                    active_task_id = NULL,
+                    pause_reason = NULL,
+                    terminal_reason = NULL,
+                    updated_at = ?,
+                    finished_at = ?
+                WHERE run_id = ?
+                  AND state_revision = ?
+                  AND status = 'running'
+                  AND current_step_id IS NULL
+                  AND active_task_id = ?
+                """,
+                (
+                    timestamp,
+                    timestamp,
+                    run_id,
+                    expected_state_revision,
+                    expected_active_task_id,
+                ),
+            ) as cur:
+                changed = cur.rowcount or 0
+            if changed == 0:
+                raise PlanRunConflictError("plan run state changed before the update")
+            updated = await self._select_plan_run_on_conn(conn, run_id)
+            assert updated is not None
+            return updated
+
+    async def pause_plan_run(
+        self,
+        run_id: str,
+        *,
+        expected_state_revision: int,
+        reason: str,
+        expected_active_task_id: str | None = None,
+        expected_driver_kind: str | None = None,
+        expected_driver_id: str | None = None,
+    ) -> PlanRunRecord:
+        """Release a manual run at a turn boundary without advancing progress."""
+
+        reason = reason.strip()
+        if not reason:
+            raise PlanValidationError("pause reason is required")
+        async with self._write_transaction("pause_plan_run") as conn:
+            run = await self._load_plan_run_for_cas(
+                conn,
+                run_id=run_id,
+                expected_state_revision=expected_state_revision,
+            )
+            if run.status not in {
+                PlanRunStatus.QUEUED.value,
+                PlanRunStatus.RUNNING.value,
+                PlanRunStatus.BLOCKED.value,
+            }:
+                raise PlanRunConflictError(f"cannot pause a {run.status} plan run")
+            if (
+                expected_active_task_id is not None
+                and run.active_task_id != expected_active_task_id
+            ):
+                raise PlanRunConflictError("plan run is owned by another task")
+            if (
+                expected_driver_kind is not None
+                and run.driver_kind != expected_driver_kind
+            ):
+                raise PlanRunConflictError(
+                    "plan run is owned by a different execution driver"
+                )
+            if (
+                expected_driver_id is not None
+                and run.driver_id != expected_driver_id
+            ):
+                raise PlanRunConflictError(
+                    "plan run is owned by a different execution driver"
+                )
+            timestamp = _now_ms()
+            async with conn.execute(
+                """
+                UPDATE plan_runs
+                SET status = 'paused',
+                    state_revision = state_revision + 1,
+                    active_task_id = NULL,
+                    pause_reason = ?,
+                    updated_at = ?
+                WHERE run_id = ? AND state_revision = ?
+                """,
+                (reason, timestamp, run_id, expected_state_revision),
+            ) as cur:
+                changed = cur.rowcount or 0
+            if changed == 0:
+                raise PlanRunConflictError("plan run state changed before the update")
+            updated = await self._select_plan_run_on_conn(conn, run_id)
+            assert updated is not None
+            return updated
+
+    async def cancel_plan_run(
+        self,
+        run_id: str,
+        *,
+        expected_state_revision: int,
+        reason: str,
+        expected_active_task_id: str | None = None,
+    ) -> PlanRunRecord:
+        """Cancel an active run with a durable terminal reason."""
+
+        reason = reason.strip()
+        if not reason:
+            raise PlanValidationError("cancel reason is required")
+        async with self._write_transaction("cancel_plan_run") as conn:
+            run = await self._load_plan_run_for_cas(
+                conn,
+                run_id=run_id,
+                expected_state_revision=expected_state_revision,
+            )
+            if run.status not in PLAN_RUN_ACTIVE_STATUSES:
+                raise PlanRunConflictError(f"cannot cancel a {run.status} plan run")
+            if (
+                expected_active_task_id is not None
+                and run.active_task_id != expected_active_task_id
+            ):
+                raise PlanRunConflictError("plan run is owned by another task")
+            timestamp = _now_ms()
+            async with conn.execute(
+                """
+                UPDATE plan_runs
+                SET status = 'cancelled',
+                    state_revision = state_revision + 1,
+                    active_task_id = NULL,
+                    terminal_reason = ?,
+                    updated_at = ?,
+                    finished_at = ?
+                WHERE run_id = ? AND state_revision = ?
+                """,
+                (reason, timestamp, timestamp, run_id, expected_state_revision),
+            ) as cur:
+                changed = cur.rowcount or 0
+            if changed == 0:
+                raise PlanRunConflictError("plan run state changed before the update")
+            updated = await self._select_plan_run_on_conn(conn, run_id)
+            assert updated is not None
+            return updated
 
     # ── AgentTask ledger CRUD ───────────────────────────────────────────────
 
@@ -4169,6 +5430,34 @@ class SessionStorage:
                 ),
             )
             count = int(cur.rowcount if cur.rowcount is not None else 0)
+            # A persisted PlanRun and its AgentTask form one ownership lease.
+            # Process restart abandons the in-memory task, so release that lease
+            # in the same recovery transaction. Preserve the run/driver and its
+            # step overlay: a later task can resume either the current step or
+            # the delivery-only phase after the final checkpoint.
+            await conn.execute(
+                """
+                UPDATE plan_runs
+                SET status = 'paused',
+                    state_revision = state_revision + 1,
+                    active_task_id = NULL,
+                    pause_reason = 'process_restart',
+                    terminal_reason = 'process_restart',
+                    updated_at = ?,
+                    finished_at = NULL
+                WHERE status IN ('queued', 'running')
+                  AND active_task_id IN (
+                      SELECT task_id
+                      FROM agent_tasks
+                      WHERE status = ?
+                        AND terminal_reason = 'process_restart'
+                  )
+                """,
+                (
+                    ts,
+                    AgentTaskStatus.ABANDONED,
+                ),
+            )
             for index in range(0, len(session_keys), _SQLITE_VARIABLE_CHUNK_SIZE):
                 chunk = session_keys[index : index + _SQLITE_VARIABLE_CHUNK_SIZE]
                 placeholders = ", ".join("?" for _ in chunk)
@@ -4560,6 +5849,28 @@ class SessionStorage:
                 """,
                 (node.session_key,),
             )
+            timestamp = _now_ms()
+            active_placeholders = ", ".join(
+                "?" for _ in PLAN_RUN_ACTIVE_STATUSES
+            )
+            await conn.execute(
+                f"""
+                UPDATE plan_runs
+                SET status = 'superseded',
+                    state_revision = state_revision + 1,
+                    active_task_id = NULL,
+                    terminal_reason = 'session_reset',
+                    updated_at = ?,
+                    finished_at = ?
+                WHERE session_key = ? AND status IN ({active_placeholders})
+                """,  # noqa: S608 - placeholder count is from a fixed constant
+                [
+                    timestamp,
+                    timestamp,
+                    node.session_key,
+                    *sorted(PLAN_RUN_ACTIVE_STATUSES),
+                ],
+            )
 
     async def accept_turn(
         self,
@@ -4577,6 +5888,8 @@ class SessionStorage:
         reset_archive_writer: Callable[[ResetArchiveSnapshot], Awaitable[None]] | None = None,
         initial_transcript_entries: tuple[TranscriptEntry, ...] = (),
         session_updates: dict[str, Any] | None = None,
+        plan_revision: PlanRevisionRecord | None = None,
+        plan_run: PlanRunRecord | None = None,
         merge_into_task: bool = False,
         workspace_guard: ProjectWorkspaceGuard | None = None,
     ) -> TurnAcceptanceResult:
@@ -4619,6 +5932,39 @@ class SessionStorage:
             raise ValueError("reset_archive_writer requires reset_from_session_id")
         if merge_into_task and session_node is not None:
             raise ValueError("task collection cannot create, reset, or fork a session")
+        if plan_run is not None:
+            if merge_into_task:
+                raise ValueError("a plan implementation turn cannot merge into a task")
+            if task_record is None:
+                raise ValueError("an accepted plan run requires a runtime task")
+            plan_run.session_key = canonicalize_session_key(plan_run.session_key)
+            if (
+                plan_run.session_key != entry.session_key
+                or plan_run.session_id != entry.session_id
+                or plan_run.session_epoch != expected_epoch
+            ):
+                raise ValueError(
+                    "plan run and transcript entry must target the same session epoch"
+                )
+            if plan_run.active_task_id != task_record.task_id:
+                raise ValueError(
+                    "accepted plan run must be bound to the accepted runtime task"
+                )
+        if plan_revision is not None:
+            if plan_run is None:
+                raise ValueError("an accepted plan revision requires a plan run")
+            plan_revision.source_session_key = canonicalize_session_key(
+                plan_revision.source_session_key
+            )
+            if (
+                plan_revision.source_session_key != entry.session_key
+                or plan_revision.source_session_id != entry.session_id
+                or plan_revision.source_epoch != expected_epoch
+                or plan_revision.revision_id != plan_run.plan_revision_id
+            ):
+                raise ValueError(
+                    "accepted plan revision must own the same session epoch and plan run"
+                )
         allowed_session_updates = {
             "last_channel",
             "last_to",
@@ -4626,6 +5972,8 @@ class SessionStorage:
             "last_thread_id",
             "delivery_context",
             "origin",
+            "collaboration_mode",
+            "active_plan_revision_id",
         }
         session_updates = dict(session_updates or {})
         unknown_session_updates = sorted(set(session_updates) - allowed_session_updates)
@@ -4633,6 +5981,30 @@ class SessionStorage:
             raise ValueError(
                 "Unsupported atomic session updates: "
                 + ", ".join(unknown_session_updates)
+            )
+        collaboration_mode_update = session_updates.pop(
+            "collaboration_mode",
+            None,
+        )
+        if collaboration_mode_update is not None:
+            try:
+                collaboration_mode_update = CollaborationMode(
+                    collaboration_mode_update
+                ).value
+            except ValueError as exc:
+                raise ValueError(
+                    f"Unsupported collaboration mode: {collaboration_mode_update}"
+                ) from exc
+        active_plan_revision_update = session_updates.pop(
+            "active_plan_revision_id",
+            None,
+        )
+        if active_plan_revision_update is not None and (
+            plan_run is None
+            or plan_run.plan_revision_id != active_plan_revision_update
+        ):
+            raise ValueError(
+                "active_plan_revision_id may only select the accepted plan run"
             )
 
         async with self._write_transaction("accept_turn") as conn:
@@ -4752,6 +6124,35 @@ class SessionStorage:
                         """,
                         (session_node.session_key,),
                     )
+                    timestamp = _now_ms()
+                    active_placeholders = ", ".join(
+                        "?" for _ in PLAN_RUN_ACTIVE_STATUSES
+                    )
+                    await conn.execute(
+                        f"""
+                        UPDATE plan_runs
+                        SET status = 'superseded',
+                            state_revision = state_revision + 1,
+                            active_task_id = NULL,
+                            terminal_reason = 'session_reset',
+                            updated_at = ?,
+                            finished_at = ?
+                        WHERE session_key = ? AND status IN ({active_placeholders})
+                        """,  # noqa: S608 - placeholder count is from a fixed constant
+                        [
+                            timestamp,
+                            timestamp,
+                            session_node.session_key,
+                            *sorted(PLAN_RUN_ACTIVE_STATUSES),
+                        ],
+                    )
+
+            if plan_revision is not None:
+                await self._create_plan_revision_on_conn(
+                    conn,
+                    prepare_plan_revision(plan_revision),
+                    expected_parent_revision_id=None,
+                )
 
             for initial_entry in initial_transcript_entries:
                 initial_entry.session_key = canonicalize_session_key(
@@ -4782,10 +6183,24 @@ class SessionStorage:
                 expected_epoch=expected_epoch,
             )
             touch_fields = {"updated_at": updated_at, **session_updates}
-            touch_assignments = ", ".join(f"{name} = ?" for name in touch_fields)
+            touch_assignments = [f"{name} = ?" for name in touch_fields]
             touch_values = [_serialize(value) for value in touch_fields.values()]
+            collaboration_changed = (
+                collaboration_mode_update is not None
+                or active_plan_revision_update is not None
+            )
+            if collaboration_mode_update is not None:
+                touch_assignments.append("collaboration_mode = ?")
+                touch_values.append(collaboration_mode_update)
+            if active_plan_revision_update is not None:
+                touch_assignments.append("active_plan_revision_id = ?")
+                touch_values.append(active_plan_revision_update)
+            if collaboration_changed:
+                touch_assignments.append(
+                    "collaboration_revision = collaboration_revision + 1"
+                )
             async with conn.execute(
-                f"UPDATE sessions SET {touch_assignments} "  # noqa: S608 - fixed allowlist
+                f"UPDATE sessions SET {', '.join(touch_assignments)} "  # noqa: S608
                 "WHERE session_key = ? AND session_id = ? AND epoch = ?",
                 [
                     *touch_values,
@@ -4801,6 +6216,9 @@ class SessionStorage:
                     session_key=entry.session_key,
                     expected_epoch=expected_epoch,
                 )
+
+            if plan_run is not None:
+                await self._start_plan_run_on_conn(conn, plan_run)
 
             if task_record is not None:
                 incoming_details = dict(task_record.details or {})

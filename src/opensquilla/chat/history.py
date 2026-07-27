@@ -12,6 +12,11 @@ from opensquilla.meta_preflight_protocol import (
     strip_preflight_confirmation_protocol_text,
 )
 
+_LEGACY_PLAN_IMPLEMENTATION_PROMPT = re.compile(
+    r'Implement the approved plan “.+”\. '
+    r"Work through its ordered steps and record truthful checkpoints\."
+)
+
 
 def _sanitize_display_protocol_payload(value: Any) -> Any:
     if isinstance(value, str):
@@ -25,6 +30,27 @@ def _sanitize_display_protocol_payload(value: Any) -> Any:
             for key, item in value.items()
         }
     return value
+
+
+def _is_legacy_generated_plan_implementation(
+    content: str,
+    turn_context: Any,
+) -> bool:
+    """Recognize the exact pre-display_text PlanRun control prompt.
+
+    Older gateways persisted the generated provider instruction as ordinary
+    user-visible text. The positive PlanRun id plus the exact server template
+    makes this a protocol compatibility check, not a guess based on user prose.
+    Explicit implementation messages do not use this template and remain
+    visible.
+    """
+
+    if not isinstance(turn_context, dict) or not turn_context.get("plan_run_id"):
+        return False
+    visible = str(content or "").strip()
+    if visible.startswith("[") and "]\n" in visible:
+        visible = visible.split("]\n", 1)[1].strip()
+    return _LEGACY_PLAN_IMPLEMENTATION_PROMPT.fullmatch(visible) is not None
 
 
 def transcript_entries_to_chat_messages(
@@ -68,6 +94,11 @@ def transcript_entries_to_chat_messages(
             display_text = display_text_from_preflight_confirmation(content)
             if display_text is not None:
                 content = display_text
+            elif _is_legacy_generated_plan_implementation(
+                content,
+                getattr(entry, "turn_context", None),
+            ):
+                content = ""
         msg: dict[str, Any] = {
             "id": getattr(entry, "message_id", None),
             "message_id": getattr(entry, "message_id", None),

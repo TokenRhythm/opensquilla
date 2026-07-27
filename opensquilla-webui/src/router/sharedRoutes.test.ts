@@ -51,6 +51,15 @@ describe('route hubs', () => {
     return route
   }
 
+  it('keeps the same Chat view instance while a draft materializes', () => {
+    const chat = routeAt('/chat')
+    const draft = routeAt('/chat/new')
+
+    expect(draft.component).toBe(chat.component)
+    expect(chat.meta?.viewKey).toBe('chat')
+    expect(draft.meta?.viewKey).toBe('chat')
+  })
+
   it('hosts Skills and Channels in one kept-alive destination', () => {
     const skills = routeAt('/skills')
     const channels = routeAt('/channels')

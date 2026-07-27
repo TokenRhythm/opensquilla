@@ -355,6 +355,13 @@ export interface SessionMessagesSubscribeResponse extends SessionEventPayload {
   }
   workspaceId?: string
   projectWorkspace?: SessionProjectWorkspaceSnapshot | null
+  collaboration?: import('./plans').CollaborationSnapshot
+  currentPlan?: import('./plans').PlanRevisionSnapshot | null
+  current_plan?: unknown
+  activePlanRun?: import('./plans').PlanRunSnapshot | null
+  active_plan_run?: unknown
+  pendingUserInputs?: unknown[]
+  pending_user_inputs?: unknown[]
 }
 
 export interface ChatSendAttachmentPayload {
@@ -375,6 +382,7 @@ export interface ChatSendParams {
   _source?: { elevated?: string; runMode?: 'standard' | 'trusted' | 'full' }
   intent?: string
   workspaceId?: string
+  collaborationMode?: import('./plans').CollaborationMode
   forkBeforeMessageId?: string
   displayText?: string
   attachments?: ChatSendAttachmentPayload[]

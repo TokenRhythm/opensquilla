@@ -20,6 +20,7 @@ import {
   stabilizeMessageAnchor,
 } from '@/utils/chat/scrollAnchor'
 import type { InitialHistoryLoadStatus } from '@/utils/chat/sessionLoadState'
+import { planRevisionsFromToolSegments } from '@/utils/chat/plans'
 
 type RpcClient = {
   waitForConnection: () => Promise<void>
@@ -159,6 +160,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       routerDecision: msg.router_decision || msg.routerDecision || null,
       artifacts: msg.artifacts || [],
       tool_calls: recordArray<RawToolCallPayload>(msg.tool_calls),
+      planRevisions: planRevisionsFromToolSegments(msg.tool_calls),
       timeline: recordArray<ChatTimelineSegment>(msg.timeline),
       attachments: normalizeDisplayAttachments(msg.attachments, { messageId }),
       provenanceKind: msg.provenance_kind || '',

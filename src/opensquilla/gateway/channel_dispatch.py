@@ -2571,12 +2571,24 @@ def _tool_result_payload(event: ToolResultEvent) -> dict[str, Any]:
 
 
 def _clarify_tool_arguments(event: ToolResultEvent) -> dict[str, Any] | None:
-    args = event.arguments
-    if not isinstance(args, dict):
-        return None
-    schema = args.get("clarify_schema")
-    if args.get("kind") == "user_input" and args.get("paused") is True and isinstance(schema, dict):
-        return args
+    candidates: list[Any] = [event.arguments]
+    if isinstance(event.result, str):
+        try:
+            candidates.append(json.loads(event.result))
+        except (json.JSONDecodeError, TypeError):
+            pass
+    else:
+        candidates.append(event.result)
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        schema = candidate.get("clarify_schema")
+        if (
+            candidate.get("kind") == "user_input"
+            and candidate.get("paused") is True
+            and isinstance(schema, dict)
+        ):
+            return candidate
     return None
 
 

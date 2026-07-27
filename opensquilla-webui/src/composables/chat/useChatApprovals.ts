@@ -7,6 +7,7 @@ import type {
   InterruptClarifyData,
   InterruptViewState,
 } from '@/types/parts'
+import { clarifyRequestFromValue, userInputOutcomeFromValue } from '@/utils/chat/clarify'
 import { isCurrentSessionPayload } from '@/utils/chat/streamEvents'
 
 const MAX_RESOLVED_OUTCOMES = 4
@@ -103,11 +104,15 @@ export interface ChatClarifyField {
   required: boolean
   defaultValue: string
   choices: string[]
+  header?: string
+  options?: Array<{ label: string; description: string }>
+  allowOther?: boolean
 }
 
 export interface ChatClarifyRequest {
   intro: string
   fields: ChatClarifyField[]
+  requestId?: string
   runId: string
   step: string
 }
@@ -383,36 +388,8 @@ export function resolutionFromResolveResponse(
 }
 
 function parseClarifyRequest(payload: ToolResultPayload): ChatClarifyRequest | null {
-  const rawArgs = (payload as Record<string, unknown>).arguments
-  if (!rawArgs || typeof rawArgs !== 'object') return null
-  const args = rawArgs as Record<string, unknown>
-  if (args.kind !== 'user_input' || args.paused !== true) return null
-  const schema = args.clarify_schema
-  if (!schema || typeof schema !== 'object') return null
-  const schemaObj = schema as Record<string, unknown>
-  const rawFields = Array.isArray(schemaObj.fields) ? schemaObj.fields : []
-  const fields: ChatClarifyField[] = []
-  for (const raw of rawFields) {
-    if (!raw || typeof raw !== 'object') continue
-    const field = raw as Record<string, unknown>
-    const name = String(field.name || '').trim()
-    if (!name) continue
-    fields.push({
-      name,
-      prompt: String(field.prompt || ''),
-      type: String(field.type || 'string').toLowerCase(),
-      required: field.required === true,
-      defaultValue: field.default == null ? '' : String(field.default),
-      choices: Array.isArray(field.choices) ? field.choices.map(String) : [],
-    })
-  }
-  if (fields.length === 0) return null
-  return {
-    intro: String(schemaObj.intro || ''),
-    fields,
-    runId: typeof args.run_id === 'string' ? args.run_id : '',
-    step: typeof args.step === 'string' ? args.step : '',
-  }
+  return clarifyRequestFromValue(payload.result)
+    ?? clarifyRequestFromValue((payload as Record<string, unknown>).arguments)
 }
 
 /**
@@ -428,9 +405,9 @@ function parseClarifyRequest(payload: ToolResultPayload): ChatClarifyRequest | n
  * cards collapse into one-line outcome rows.
  *
  * Clarify: the engine surfaces a pending clarify form as a tool_result whose
- * arguments carry `kind: "user_input", paused: true, clarify_schema`; the
- * card state is derived from that stream event and submitted back through
- * the `chat.clarify_submit` RPC.
+ * result JSON (or a legacy arguments payload) carries
+ * `kind: "user_input", paused: true, clarify_schema`; the card state is
+ * derived from that stream event and submitted through `chat.clarify_submit`.
  */
 export function useChatApprovals(options: UseChatApprovalsOptions) {
   const { rpc, sessionKey, stream, interruptState } = options
@@ -467,6 +444,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   // The clarify frame is keyed by a runId|step composite (a clarify has no
   // approval id); arg-less clarifies fall back to a stable per-session key.
   function clarifyFrameKey(request: ChatClarifyRequest): string {
+    if (request.requestId) return request.requestId
     const composite = `${request.runId}|${request.step}`
     return composite === '|' ? `clarify:${sessionKey.value}` : composite
   }
@@ -781,6 +759,20 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   function handleToolResult(payload: ToolResultPayload) {
     if (!payload || typeof payload !== 'object') return
     if (!isCurrentSessionPayload(payload, sessionKey.value)) return
+    const outcome = userInputOutcomeFromValue(payload.result)
+    if (outcome) {
+      setInterruptState(outcome.requestId, {
+        resolution: 'replied',
+        busy: false,
+        error: '',
+      })
+      if (pendingClarify.value?.requestId === outcome.requestId) {
+        clarifySubmitted.value = true
+        clarifyBusy.value = false
+        clarifyError.value = ''
+      }
+      return
+    }
     const request = parseClarifyRequest(payload)
     if (!request) return
     pendingClarify.value = request
@@ -791,6 +783,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     const clarifyData: InterruptClarifyData = {
       intro: request.intro,
       fields: request.fields,
+      ...(request.requestId ? { requestId: request.requestId } : {}),
       runId: request.runId,
       step: request.step,
     }
@@ -903,6 +896,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     clarifyError.value = ''
     setInterruptState(key, { resolution: 'replied', busy: true, error: '' })
     const params: Record<string, unknown> = { sessionKey: sessionKey.value, fields }
+    if (request.requestId) params.request_id = request.requestId
     if (request.runId) params.run_id = request.runId
     try {
       await rpc.call('chat.clarify_submit', params)
@@ -921,6 +915,29 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     pendingClarify.value = null
     clarifySubmitted.value = false
     clarifyError.value = ''
+  }
+
+  function applyUserInputBootstrap(snapshot: {
+    pendingUserInputs?: unknown[]
+    pending_user_inputs?: unknown[]
+  }) {
+    const pending = snapshot.pendingUserInputs || snapshot.pending_user_inputs || []
+    for (const value of pending) {
+      const request = clarifyRequestFromValue(value)
+      if (!request) continue
+      pendingClarify.value = request
+      clarifySubmitted.value = false
+      clarifyError.value = ''
+      const key = clarifyFrameKey(request)
+      if (!interruptState.value.has(key)) setInterruptState(key, {})
+      if (!stream.isStreaming.value) stream.ensureInterruptBubble()
+      stream.appendInterruptFrame({
+        interruptKind: 'clarify',
+        approvalId: key,
+        data: request,
+        at: Date.now(),
+      })
+    }
   }
 
   // Session switches reset all in-thread card state; a one-shot hydration
@@ -957,6 +974,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     extendInterrupt,
     submitClarify,
     dismissClarify,
+    applyUserInputBootstrap,
     subscribe,
     cleanup,
   }

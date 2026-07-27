@@ -4224,6 +4224,9 @@ function onboardingHtml(
       --line: #E1E4E8;
       --line-strong: #C9CED5;
       --accent: #BA4D0F;
+      --accent-hover: #A5440C;
+      --accent-deep: #8E3A0A;
+      --accent-secondary: #B6501C;
       --accent-soft: rgba(186, 77, 15, 0.035);
       --primary: #343A40;
       --primary-hover: #272C31;
@@ -4388,13 +4391,13 @@ function onboardingHtml(
       white-space: nowrap;
     }
     .provider-promo-copy strong {
-      color: #A95728;
+      color: var(--accent);
       font-size: 10.5px;
       font-weight: 560;
       line-height: 1.35;
     }
     .provider-promo-copy span {
-      color: #A95728;
+      color: var(--accent);
       font-size: 10.5px;
       font-weight: 420;
       line-height: 1.4;
@@ -4407,8 +4410,8 @@ function onboardingHtml(
       gap: 6px;
       border: 0;
       border-radius: 7px;
-      background: #A95728;
-      box-shadow: 0 3px 10px rgba(169, 87, 40, 0.14);
+      background: var(--accent);
+      box-shadow: 0 3px 10px rgba(186, 77, 15, 0.14);
       color: #FFFFFF;
       font-size: 10.5px;
       font-weight: 600;
@@ -4423,8 +4426,8 @@ function onboardingHtml(
       line-height: 1;
     }
     .provider-promo-cta:hover {
-      background: #91481F;
-      box-shadow: 0 5px 14px rgba(145, 72, 31, 0.18);
+      background: var(--accent-hover);
+      box-shadow: 0 5px 14px rgba(165, 68, 12, 0.18);
       color: #FFFFFF;
       transform: translateY(-1px);
     }
@@ -4588,7 +4591,7 @@ function onboardingHtml(
       display: inline-flex;
       align-items: center;
       gap: 5px;
-      color: #7B4B2C;
+      color: var(--accent-deep);
       font-size: 10.5px;
       font-weight: 520;
       text-decoration: none;
@@ -4667,7 +4670,7 @@ function onboardingHtml(
     .provider-badge.free {
       border: 1px solid #E8D8CE;
       background: #F8F1EC;
-      color: #825037;
+      color: var(--accent-deep);
     }
     .provider-combobox-chevron {
       position: relative;
@@ -4747,7 +4750,7 @@ function onboardingHtml(
     }
     .provider-option[aria-selected="true"] {
       background: #F8F3EF;
-      color: #6F3F23;
+      color: var(--accent-deep);
     }
     .provider-option-label {
       min-width: 0;
@@ -4759,7 +4762,7 @@ function onboardingHtml(
     .provider-option-check {
       width: 16px;
       flex: 0 0 16px;
-      color: #8E4B25;
+      color: var(--accent-secondary);
       font-size: 13px;
       text-align: center;
     }
@@ -4962,7 +4965,7 @@ function onboardingHtml(
       right: 12px;
     }
     .inline-search-section .search-provider-billing.free {
-      color: #825037;
+      color: var(--accent-deep);
     }
     .inline-search-section .search-paid-toggle {
       min-height: 32px;
@@ -5151,7 +5154,7 @@ function onboardingHtml(
     .model-summary-edit:hover,
     .model-editor-done:hover:not(:disabled) {
       background: rgba(186, 77, 15, 0.06);
-      color: #542F1A;
+      color: var(--accent-deep);
     }
     .model-summary-edit:focus-visible,
     .model-editor-done:focus-visible {

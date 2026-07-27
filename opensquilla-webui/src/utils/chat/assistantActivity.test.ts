@@ -182,6 +182,156 @@ describe('projectAssistantActivity', () => {
       .not.toContain('Final answer after verification.')
   })
 
+  it('separates an aggregated PlanRun answer at a successful terminal control boundary', () => {
+    const projection = projectAssistantActivity(
+      message({
+        text: 'Working through the files.\n\nSummary part one. Summary part two.',
+        timelineItems: [
+          {
+            type: 'text',
+            key: 'narration',
+            html: '<p>Working through the files.</p>',
+            rawText: 'Working through the files.\n\n',
+          },
+          toolGroup([call('read', { name: 'read_file' })], 'read'),
+          {
+            type: 'text',
+            key: 'summary-a',
+            html: '<p>Summary part one.</p>',
+            rawText: 'Summary part one. ',
+          },
+          {
+            type: 'text',
+            key: 'summary-b',
+            html: '<p>Summary part two.</p>',
+            rawText: 'Summary part two.',
+          },
+          toolGroup([
+            call('checkpoint', {
+              name: 'plans__planRunCheckpoint',
+              displayName: 'Checkpoint',
+            }),
+          ], 'checkpoint'),
+        ],
+      }),
+      text => `<p>${text}</p>`,
+    )
+
+    expect(projection.answerSource).toBe('terminal-control-boundary')
+    expect(projection.answerPart?.rawText).toBe('Summary part one. Summary part two.')
+    expect(projection.activityItems.map(item => item.key)).toEqual(['narration', 'read'])
+    expect(projection.toolCount).toBe(1)
+    expect(JSON.stringify(projection.activityItems)).not.toContain('planRunCheckpoint')
+  })
+
+  it.each([
+    {
+      name: 'failed',
+      call: call('checkpoint-failed', {
+        name: 'plan_run_checkpoint',
+        status: 'error',
+        isError: true,
+      }),
+    },
+    {
+      name: 'running',
+      call: call('checkpoint-running', {
+        name: 'plan_run_checkpoint',
+        status: '',
+        isRunning: true,
+      }),
+    },
+  ])('fails open when the terminal control is $name', ({ call: checkpoint }) => {
+    const canonical = 'Work narration.Final delivery.'
+    const projection = projectAssistantActivity(
+      message({
+        text: canonical,
+        timelineItems: [
+          {
+            type: 'text',
+            key: 'work',
+            html: '<p>Work narration.</p>',
+            rawText: 'Work narration.',
+          },
+          {
+            type: 'text',
+            key: 'delivery',
+            html: '<p>Final delivery.</p>',
+            rawText: 'Final delivery.',
+          },
+          toolGroup([checkpoint], 'checkpoint'),
+        ],
+      }),
+      text => text,
+    )
+
+    expect(projection.answerSource).toBe('canonical')
+    expect(projection.answerPart?.rawText).toBe(canonical)
+    expect(projection.activityItems.some(item => item.type === 'tool-group')).toBe(true)
+  })
+
+  it('fails open when a timeline text item has no raw Markdown', () => {
+    const canonical = 'Narration.Final delivery.'
+    const projection = projectAssistantActivity(
+      message({
+        text: canonical,
+        timelineItems: [
+          {
+            type: 'text',
+            key: 'narration',
+            html: '<p>Narration.</p>',
+          },
+          {
+            type: 'text',
+            key: 'delivery',
+            html: '<p>Final delivery.</p>',
+            rawText: 'Final delivery.',
+          },
+          toolGroup([
+            call('checkpoint', { name: 'plan_run_checkpoint' }),
+          ], 'checkpoint'),
+        ],
+      }),
+      text => text,
+    )
+
+    expect(projection.answerSource).toBe('canonical')
+    expect(projection.answerPart?.rawText).toBe(canonical)
+  })
+
+  it('does not shorten aggregated partial output for an interrupted run', () => {
+    const canonical = 'Narration.Final delivery.'
+    const projection = projectAssistantActivity(
+      message({
+        text: canonical,
+        interrupted: true,
+        timelineItems: [
+          {
+            type: 'text',
+            key: 'narration',
+            html: 'Narration.',
+            rawText: 'Narration.',
+          },
+          {
+            type: 'text',
+            key: 'delivery',
+            html: 'Final delivery.',
+            rawText: 'Final delivery.',
+          },
+          toolGroup([
+            call('checkpoint', { name: 'plan_run_checkpoint' }),
+          ], 'checkpoint'),
+        ],
+      }),
+      text => text,
+      [],
+      { lifecycle: 'interrupted' },
+    )
+
+    expect(projection.answerSource).toBe('canonical')
+    expect(projection.answerPart?.rawText).toBe(canonical)
+  })
+
   it('preserves the original timeline when old history has text but no canonical answer', () => {
     const timelineItems: ChatStreamTimelineItem[] = [
       { type: 'text', key: 'legacy-text', html: 'Legacy answer', rawText: 'Legacy answer' },

@@ -174,6 +174,47 @@ def _stable_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _successful_submit_plan_input(
+    segments: list[dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    """Return the one successfully executed submit_plan input, if present."""
+
+    if not segments:
+        return None
+    successful_ids: set[str] = set()
+    for segment in segments:
+        if (
+            not isinstance(segment, dict)
+            or segment.get("type") != "tool_result"
+            or segment.get("name") != "submit_plan"
+            or segment.get("is_error") is not False
+        ):
+            continue
+        result = segment.get("result")
+        try:
+            payload = json.loads(result) if isinstance(result, str) else result
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(payload, dict) and payload.get("status") == "plan_submitted":
+            successful_ids.add(str(segment.get("tool_use_id") or ""))
+
+    submissions: list[dict[str, Any]] = []
+    for segment in segments:
+        if (
+            not isinstance(segment, dict)
+            or segment.get("type") != "tool_use"
+            or segment.get("name") != "submit_plan"
+            or str(segment.get("tool_use_id") or "") not in successful_ids
+        ):
+            continue
+        submitted_input = segment.get("input")
+        if isinstance(submitted_input, dict):
+            submissions.append(submitted_input)
+    if len(submissions) > 1:
+        raise ValueError("A Plan turn may submit exactly one plan revision")
+    return dict(submissions[0]) if submissions else None
+
+
 def _compaction_entry_payloads(entries: list[TranscriptEntry]) -> list[dict[str, Any]]:
     return [
         {
@@ -336,6 +377,12 @@ class SessionManager:
         reset.cache_write = 0
         reset.context_tokens = None
         reset.compaction_count = 0
+        # A reset starts a new task epoch. Collaboration state and its active
+        # immutable plan belong to the archived epoch and must never leak into
+        # the fresh transcript.
+        reset.collaboration_mode = "default"
+        reset.collaboration_revision = 0
+        reset.active_plan_revision_id = None
         if reset.forked_from_parent:
             reset.schema_version = max(
                 reset.schema_version,
@@ -1270,13 +1317,80 @@ class SessionManager:
             provenance=provenance,
         )
         token_delta = token_count if token_count and turn_usage is None else 0
-        await self._storage.append_transcript_entry_and_touch(
-            entry,
-            expected_epoch=expected_epoch,
-            updated_at=_now_ms(),
-            token_delta=token_delta,
-            mark_total_tokens_stale=bool(token_delta),
+        submitted_plan = (
+            _successful_submit_plan_input(tool_calls)
+            if role == "assistant"
+            else None
         )
+        if submitted_plan is None:
+            await self._storage.append_transcript_entry_and_touch(
+                entry,
+                expected_epoch=expected_epoch,
+                updated_at=_now_ms(),
+                token_delta=token_delta,
+                mark_total_tokens_stale=bool(token_delta),
+            )
+        else:
+            node = await self._storage.get_session(session_key)
+            if node is None:
+                raise KeyError(f"Session not found: {session_key}")
+            if node.epoch != expected_epoch:
+                raise RuntimeError("Session changed before plan submission")
+            parent_revision_id = node.active_plan_revision_id
+            parent = (
+                await self._storage.get_plan_revision(parent_revision_id)
+                if parent_revision_id
+                else None
+            )
+            if parent_revision_id and parent is None:
+                raise RuntimeError("Active plan revision no longer exists")
+            from opensquilla.session.plans import new_plan_revision
+
+            submitted_title = submitted_plan.get("title")
+            submitted_markdown = submitted_plan.get("markdown")
+            submitted_steps = submitted_plan.get("steps")
+            if not isinstance(submitted_title, str):
+                raise ValueError("submit_plan title must be a string")
+            if not isinstance(submitted_markdown, str):
+                raise ValueError("submit_plan markdown must be a string")
+            if not isinstance(submitted_steps, list):
+                raise ValueError("submit_plan steps must be an array")
+            revision = new_plan_revision(
+                source_session_key=entry.session_key,
+                source_session_id=entry.session_id,
+                source_epoch=expected_epoch,
+                parent=parent,
+                source_turn_id=(
+                    str(entry.turn_context.get("turn_id"))
+                    if isinstance(entry.turn_context, dict)
+                    and entry.turn_context.get("turn_id")
+                    else None
+                ),
+                source_message_id=entry.message_id,
+                title=submitted_title,
+                markdown=submitted_markdown,
+                steps=submitted_steps,
+            )
+            from opensquilla.session.plans import plan_revision_snapshot
+
+            entry.tool_calls = [
+                *(entry.tool_calls or []),
+                {
+                    "type": "plan",
+                    "snapshot": plan_revision_snapshot(revision, current=True),
+                },
+            ]
+            entry.turn_context = {
+                **(entry.turn_context or {}),
+                "plan_revision_id": revision.revision_id,
+                "plan_parent_revision_id": parent_revision_id,
+            }
+            await self._storage.append_plan_revision(
+                entry,
+                revision,
+                expected_epoch=expected_epoch,
+                expected_parent_revision_id=parent_revision_id,
+            )
         self.notify_message_appended(entry)
         return entry
 

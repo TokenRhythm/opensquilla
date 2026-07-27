@@ -312,6 +312,53 @@ _TEXT_ONLY_TOOL_RECOVERY_MESSAGE = (
     "requires repo inspection, editing, or verification, call the appropriate tool "
     "now; if complete, answer briefly."
 )
+_PLAN_RUN_RECONCILIATION_LIMIT = 1
+
+
+def _plan_run_steps_ready_for_delivery(run: Any) -> bool:
+    """Whether every bounded step is done while task delivery is still pending."""
+
+    if run is None:
+        return False
+    if isinstance(run, Mapping):
+        status = str(run.get("status") or "")
+        current_step_id = run.get("currentStepId", run.get("current_step_id"))
+        raw_steps = run.get("steps", run.get("step_states"))
+    else:
+        status = str(getattr(run, "status", "") or "")
+        current_step_id = getattr(run, "current_step_id", None)
+        raw_steps = getattr(run, "step_states", None)
+    if status not in {"running", "completed"} or current_step_id:
+        return False
+    steps = list(raw_steps or [])
+    if not steps:
+        return False
+    statuses = [
+        str(
+            step.get("status")
+            if isinstance(step, Mapping)
+            else getattr(step, "status", "")
+        )
+        for step in steps
+    ]
+    return all(status in {"completed", "skipped"} for status in statuses)
+
+
+def _plan_run_checkpoint_enters_delivery_phase(result: ToolResult | None) -> bool:
+    if (
+        result is None
+        or result.tool_name != "plan_run_checkpoint"
+        or result.is_error
+    ):
+        return False
+    try:
+        payload = json.loads(result.content)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(payload, Mapping):
+        return False
+    return _plan_run_steps_ready_for_delivery(payload.get("plan_run"))
+
 
 _SOURCE_CONTEXT_TOOL_NAMES: frozenset[str] = frozenset(
     {
@@ -1013,12 +1060,6 @@ _REASONING_ONLY_ACT_NOW_DIRECTIVE = (
     "your current best next step, or state your final answer directly. "
     "Decide with the analysis you already have instead of reasoning further."
 )
-_PLAN_ONLY_ACT_NOW_DIRECTIVE = (
-    "The last several responses only updated the plan without acting on it. "
-    "Planning further will not move the task forward. Act now: issue the "
-    "tool call that carries out the current in-progress step, and update "
-    "the plan again only after real progress."
-)
 # One-shot endgame fix directive (OPENSQUILLA_ENDGAME_FIX_DIRECTIVE_MARGIN_
 # SECONDS). The prefix is distinct from the wrap-up's "Time check: roughly "
 # so the nudge-identity predicates can tell them apart.
@@ -1245,6 +1286,27 @@ def _is_threshold_denial(result: ToolResult) -> bool:
 
 
 _PENDING_APPROVAL_STATUSES: frozenset[str] = frozenset({"approval_required", "approval_pending"})
+
+
+def _pending_user_input_payload(content: str) -> dict[str, Any] | None:
+    """Return the canonical deferred-input envelope, if present."""
+
+    try:
+        payload = json.loads(content)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if (
+        payload.get("status") != "input_required"
+        or payload.get("kind") != "user_input"
+        or payload.get("paused") is not True
+    ):
+        return None
+    schema = payload.get("clarify_schema")
+    if not isinstance(schema, dict) or not isinstance(schema.get("fields"), list):
+        return None
+    return payload
 
 
 def _pending_approval_payload(content: str) -> dict[str, Any] | None:
@@ -1709,16 +1771,15 @@ def _is_mid_budget_nudge_message(message: Message) -> bool:
 def _is_runtime_nudge_message(message: Message) -> bool:
     """Whether a message is a runtime-injected nudge, not conversation history.
 
-    Covers the mid-budget progress nudge, the plan-only act-now directive,
-    and the endgame fix directive — everything the engine appends after tool
-    results that the post-tool shape predicates must see through.
+    Covers the mid-budget progress nudge and the endgame fix directive —
+    everything the engine appends after tool results that the post-tool shape
+    predicates must see through.
     """
 
     if message.role != "user" or not isinstance(message.content, str):
         return False
     return (
         message.content.startswith(_MID_BUDGET_NO_DIFF_NUDGE_PREFIX)
-        or message.content == _PLAN_ONLY_ACT_NOW_DIRECTIVE
         or message.content.startswith(_ENDGAME_FIX_DIRECTIVE_PREFIX)
     )
 
@@ -5009,7 +5070,6 @@ class Agent:
         deadline_thinking_off_armed = False
         endgame_git_freeze_armed = False
         endgame_fix_directive_fired = False
-        plan_only_iteration_streak = 0
         reasoning_only_act_now_message: Message | None = None
         mid_budget_nudge_fired_fractions: set[float] = set()
         workspace_diff_recovery_attempted = False
@@ -5017,6 +5077,13 @@ class Agent:
         post_tool_empty_recovery_attempted = False
         text_only_tool_recovery_injections = 0
         text_only_tool_recovery_pending = False
+        plan_run_reconciliation_attempts = 0
+        attached_plan_run_id = str(
+            getattr(self._tool_context, "plan_run_id", "") or ""
+        ).strip()
+        plan_run_delivery_only = _plan_run_steps_ready_for_delivery(
+            getattr(self._tool_context, "plan_run", None)
+        )
         reasoning_prefill_recovery_attempted = False
         final_diff_contract_recovery_attempted = False
         source_loop_recovery_attempted_keys: set[str] = set()
@@ -5047,7 +5114,7 @@ class Agent:
         finalize_evidence_gate_keys: set[str] = set()
         submit_review_enabled = bool(
             getattr(self.config, "submit_review_enabled", False)
-        )
+        ) and not attached_plan_run_id
         submit_review_state = SubmitReviewState()
         submit_review_diff_max_chars = int(
             getattr(self.config, "submit_review_diff_max_chars", 20000)
@@ -5637,6 +5704,12 @@ class Agent:
                             workspace_edit_gate_recovery_reads_remaining
                         ),
                     )
+                    if plan_run_delivery_only:
+                        provider_tools_for_call = (
+                            self._plan_run_delivery_tool_definitions(
+                                provider_tools_for_call
+                            )
+                        )
                     tools_supported_for_call = (
                         tools_supported
                         and not artifact_delivery_final_response_pending
@@ -6781,10 +6854,6 @@ class Agent:
                         )
                     if not post_tool_turn and (
                         bool(getattr(self.config, "mid_budget_no_diff_nudge", False))
-                        or int(
-                            getattr(self.config, "plan_only_act_now_threshold", 0) or 0
-                        )
-                        > 0
                         or int(
                             getattr(
                                 self.config,
@@ -8249,6 +8318,50 @@ class Agent:
 
                 # No tool calls → we're done
                 if not tool_calls:
+                    plan_run_reconciliation = (
+                        await self._unfinished_plan_run_reconciliation_message()
+                    )
+                    if plan_run_reconciliation is not None:
+                        if visible_text and final_text_parts:
+                            final_text_parts.pop()
+                        if (
+                            plan_run_reconciliation_attempts
+                            < _PLAN_RUN_RECONCILIATION_LIMIT
+                        ):
+                            plan_run_reconciliation_attempts += 1
+                            turn_messages.append(
+                                Message(role="user", content=plan_run_reconciliation)
+                            )
+                            self.config.metadata["plan_run_reconciliations"] = (
+                                self.config.metadata.get("plan_run_reconciliations", 0)
+                                + 1
+                            )
+                            self._write_turn_call_log(
+                                "plan_run_reconciliation",
+                                action="nudge",
+                                reason="final_response_before_terminal_checkpoint",
+                                iteration=iterations,
+                                provider_call_count=turn_llm_calls,
+                            )
+                            yield WarningEvent(
+                                code="plan_run_reconciliation",
+                                message=(
+                                    "The model attempted to finish before the PlanRun "
+                                    "reached a terminal checkpoint; asking it to reconcile "
+                                    "the current step once."
+                                ),
+                            )
+                            continue
+                        yield self._transition(AgentState.ERROR)
+                        terminal_error = ErrorEvent(
+                            message=(
+                                "The implementation turn ended without completing or "
+                                "blocking its attached PlanRun."
+                            ),
+                            code="plan_run_checkpoint_required",
+                        )
+                        yield terminal_error
+                        break
                     text_only_mode = getattr(
                         self.config,
                         "text_only_tool_recovery_mode",
@@ -9208,6 +9321,58 @@ class Agent:
                 # that a parallel tool appearing after a mutex tool cannot start
                 # until that mutex tool has completed.
                 parallel_batch: list[ToolCall] = []
+                dispatch_boundary: ToolResult | None = None
+
+                def _not_executed_after_dispatch_boundary(
+                    tc: ToolCall,
+                    boundary: ToolResult,
+                ) -> ToolResult:
+                    """Pair an undispatched tail call after a hard tool boundary.
+
+                    Providers may emit more than one tool call in a response. Once
+                    a serial control tool ends the turn (for example a terminal
+                    PlanRun checkpoint), later calls must still receive matching
+                    tool-result blocks for transcript validity, but they must not
+                    reach dispatch.
+                    """
+
+                    return ToolResult(
+                        tool_use_id=tc.tool_use_id,
+                        tool_name=tc.tool_name,
+                        content=json.dumps(
+                            {
+                                "status": "not_executed",
+                                "reason": "prior_tool_dispatch_boundary",
+                                "boundary_tool": boundary.tool_name,
+                                "boundary_tool_use_id": boundary.tool_use_id,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        is_error=True,
+                        execution_status=runtime_execution_status(
+                            "cancelled",
+                            reason="turn_terminated",
+                        ),
+                    )
+
+                def _not_executed_during_plan_delivery(tc: ToolCall) -> ToolResult:
+                    return ToolResult(
+                        tool_use_id=tc.tool_use_id,
+                        tool_name=tc.tool_name,
+                        content=json.dumps(
+                            {
+                                "status": "not_executed",
+                                "reason": "plan_run_delivery_only",
+                                "allowed_tools": ["publish_artifact"],
+                            },
+                            ensure_ascii=False,
+                        ),
+                        is_error=True,
+                        execution_status=runtime_execution_status(
+                            "error",
+                            reason="plan_run_delivery_only",
+                        ),
+                    )
 
                 async def _flush_parallel_batch(
                     batch: list[ToolCall],
@@ -9257,7 +9422,49 @@ class Agent:
                         yield event
 
                 for tc in tool_calls:
-                    if submit_review_enabled and tc.tool_name == "submit":
+                    if dispatch_boundary is not None:
+                        results_by_id[tc.tool_use_id] = (
+                            _not_executed_after_dispatch_boundary(
+                                tc,
+                                dispatch_boundary,
+                            )
+                        )
+                        continue
+                    if plan_run_delivery_only and tc.tool_name != "publish_artifact":
+                        results_by_id[tc.tool_use_id] = (
+                            _not_executed_during_plan_delivery(tc)
+                        )
+                        continue
+                    if attached_plan_run_id and tc.tool_name == "submit":
+                        results_by_id[tc.tool_use_id] = ToolResult(
+                            tool_use_id=tc.tool_use_id,
+                            tool_name=tc.tool_name,
+                            content=json.dumps(
+                                {
+                                    "status": "not_executed",
+                                    "reason": "plan_run_checkpoint_required",
+                                },
+                                ensure_ascii=False,
+                            ),
+                            is_error=True,
+                            execution_status=runtime_execution_status(
+                                "error",
+                                reason="plan_run_checkpoint_required",
+                            ),
+                        )
+                        continue
+                    if (
+                        submit_review_enabled
+                        and tc.tool_name == "submit"
+                        and str(
+                            getattr(
+                                self._tool_context,
+                                "collaboration_mode",
+                                "default",
+                            )
+                        )
+                        != "plan"
+                    ):
                         # Control-only tool: never dispatched to the registry
                         # (its body raises). Flush prior work so the captured
                         # diff reflects every edit in this batch, then answer
@@ -9323,13 +9530,16 @@ class Agent:
                                 "terminates_turn": submit_terminates_turn,
                             },
                         )
-                        results_by_id[tc.tool_use_id] = ToolResult(
+                        submit_result = ToolResult(
                             tool_use_id=tc.tool_use_id,
                             tool_name="submit",
                             content=submit_content,
                             is_error=False,
                             terminates_turn=submit_terminates_turn,
                         )
+                        results_by_id[tc.tool_use_id] = submit_result
+                        if submit_result.terminates_turn:
+                            dispatch_boundary = submit_result
                         continue
                     if tc.tool_name == "meta_invoke":
                         async for event in _flush_parallel_batch(parallel_batch):
@@ -9343,6 +9553,9 @@ class Agent:
                                 results_by_id[tc.tool_use_id] = ev
                             else:
                                 yield ev
+                        meta_result = results_by_id.get(tc.tool_use_id)
+                        if meta_result is not None and meta_result.terminates_turn:
+                            dispatch_boundary = meta_result
                         continue
                     if submit_review_enabled:
                         # Any real (non-submit) tool counts as work after a
@@ -9364,6 +9577,11 @@ class Agent:
                             {asyncio.create_task(_run_one(tc)): tc}
                         ):
                             yield event
+                        mutex_result = results_by_id.get(tc.tool_use_id)
+                        if mutex_result is not None and mutex_result.terminates_turn:
+                            dispatch_boundary = mutex_result
+                        if _plan_run_checkpoint_enters_delivery_phase(mutex_result):
+                            plan_run_delivery_only = True
 
                 async for event in _flush_parallel_batch(parallel_batch):
                     yield event
@@ -9378,7 +9596,91 @@ class Agent:
                         result,
                         tool_call=result_tool_call,
                     )
-                    pending_approval = _pending_approval_payload(result.content)
+                    deferred_user_input_handled = False
+                    pending_user_input = (
+                        _pending_user_input_payload(result.content)
+                        if tc.tool_name == "request_user_input"
+                        else None
+                    )
+                    user_input_provider = getattr(
+                        self._tool_context,
+                        "user_input_provider",
+                        None,
+                    )
+                    task_id = str(
+                        getattr(self._tool_context, "task_id", "") or ""
+                    ).strip()
+                    if (
+                        pending_user_input is not None
+                        and user_input_provider is not None
+                        and self._session_key
+                        and task_id
+                    ):
+                        public_request = user_input_provider.open_request(
+                            session_key=self._session_key,
+                            task_id=task_id,
+                            tool_use_id=tc.tool_use_id,
+                            payload=pending_user_input,
+                        )
+                        request_id = str(public_request["request_id"])
+                        pending_result = ToolResult(
+                            tool_use_id=tc.tool_use_id,
+                            tool_name=tc.tool_name,
+                            content=json.dumps(public_request, ensure_ascii=False),
+                            is_error=False,
+                        )
+                        projected_pending = await self._project_tool_result_for_delivery(
+                            pending_result,
+                            tool_call=tc,
+                        )
+                        yield ToolResultEvent(
+                            tool_use_id=projected_pending.tool_use_id,
+                            tool_name=projected_pending.tool_name,
+                            result=projected_pending.content,
+                            is_error=projected_pending.is_error,
+                            arguments=tc.arguments,
+                            execution_status=projected_pending.execution_status,
+                        )
+                        try:
+                            answers = await user_input_provider.wait_for_response(
+                                request_id
+                            )
+                        except asyncio.CancelledError:
+                            user_input_provider.cancel_request(request_id)
+                            raise
+                        result = ToolResult(
+                            tool_use_id=tc.tool_use_id,
+                            tool_name=tc.tool_name,
+                            content=json.dumps(
+                                {
+                                    "status": "answered",
+                                    "kind": "user_input",
+                                    "paused": False,
+                                    "request_id": request_id,
+                                    "answers": answers,
+                                },
+                                ensure_ascii=False,
+                            ),
+                            is_error=False,
+                        )
+                        projected_result = await self._project_tool_result_for_delivery(
+                            result,
+                            tool_call=tc,
+                        )
+                        yield ToolResultEvent(
+                            tool_use_id=projected_result.tool_use_id,
+                            tool_name=projected_result.tool_name,
+                            result=projected_result.content,
+                            is_error=projected_result.is_error,
+                            arguments=tc.arguments,
+                            execution_status=projected_result.execution_status,
+                        )
+                        deferred_user_input_handled = True
+                    pending_approval = (
+                        None
+                        if deferred_user_input_handled
+                        else _pending_approval_payload(result.content)
+                    )
                     if pending_approval is not None and not tc.arguments.get("approval_id"):
                         suspended = _suspend_tool_request(tc, pending_approval)
                         assessment = await _review_pending_elevation_if_configured(
@@ -9482,7 +9784,7 @@ class Agent:
                                 yield replay_event
                             if _pending_approval_payload(result.content) is not None:
                                 turn_yielded = True
-                    else:
+                    elif not deferred_user_input_handled:
                         yield ToolResultEvent(
                             tool_use_id=projected_result.tool_use_id,
                             tool_name=projected_result.tool_name,
@@ -10112,57 +10414,6 @@ class Agent:
                                 ),
                             },
                         )
-                # Plan-only act-now directive: consecutive iterations whose
-                # executed tool calls are all update_plan mean the model is
-                # narrating progress instead of making it.
-                plan_only_threshold = max(
-                    0,
-                    int(getattr(self.config, "plan_only_act_now_threshold", 0) or 0),
-                )
-                if plan_only_threshold > 0:
-                    if executed_results and all(
-                        getattr(result, "tool_name", None) == "update_plan"
-                        for result in executed_results
-                    ):
-                        plan_only_iteration_streak += 1
-                    else:
-                        plan_only_iteration_streak = 0
-                    if plan_only_iteration_streak >= plan_only_threshold:
-                        turn_messages.append(
-                            Message(
-                                role="user",
-                                content=_PLAN_ONLY_ACT_NOW_DIRECTIVE,
-                            )
-                        )
-                        self._write_turn_call_log(
-                            "turn_policy_decision",
-                            action="plan_only_act_now",
-                            reason="plan_only_streak",
-                            code="plan_only_act_now",
-                            iteration=iterations,
-                            streak=plan_only_iteration_streak,
-                            threshold=plan_only_threshold,
-                        )
-                        append_runtime_event(
-                            self.config.runtime_events_path,
-                            {
-                                "feature": "plan_only_act_now",
-                                "name": "plan_only_act_now.injected",
-                                "action": "append_act_now_directive",
-                                "reason": "plan_only_streak",
-                                "iteration": iterations,
-                                "streak": plan_only_iteration_streak,
-                                "threshold": plan_only_threshold,
-                                "session_key": self._session_key,
-                                "agent_id": (
-                                    self.config.tool_result_store_agent_id
-                                    or self.config.metadata.get("agent_id")
-                                ),
-                            },
-                        )
-                        # Reset so the directive re-fires only after another
-                        # full streak, not on every subsequent iteration.
-                        plan_only_iteration_streak = 0
                 # Count iterations that blocked a compacted-placeholder reuse
                 # (preflight or dispatch path) and escalate the recovery
                 # directive once the configured threshold is reached. This
@@ -10462,6 +10713,58 @@ class Agent:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    async def _unfinished_plan_run_reconciliation_message(self) -> str | None:
+        """Return one bounded correction when a PlanRun tries to finish early."""
+
+        ctx = self._tool_context or current_tool_context.get()
+        run_id = str(getattr(ctx, "plan_run_id", "") or "").strip() if ctx else ""
+        if not run_id:
+            return None
+        storage = getattr(ctx, "plan_storage", None)
+        get_plan_run = getattr(storage, "get_plan_run", None)
+        if not callable(get_plan_run):
+            raise RuntimeError("PlanRun storage is unavailable at turn finalization")
+        run = await get_plan_run(run_id)
+        if run is None:
+            raise RuntimeError("The attached PlanRun no longer exists")
+        if str(getattr(run, "driver_kind", "manual") or "manual") == "goal":
+            # Goal controllers own bounded continuation across turns. A Goal
+            # turn may intentionally yield with the run still active; its
+            # driver, not this single-turn guard, decides whether to continue.
+            return None
+        if str(getattr(run, "status", "") or "") != "running":
+            return None
+        if _plan_run_steps_ready_for_delivery(run):
+            return None
+        progress = {
+            "runId": run_id,
+            "stateRevision": int(getattr(run, "state_revision", 0) or 0),
+            "currentStepId": (
+                str(getattr(run, "current_step_id"))
+                if getattr(run, "current_step_id", None)
+                else None
+            ),
+            "steps": [
+                {
+                    "stepId": str(state.get("step_id") or ""),
+                    "status": str(state.get("status") or ""),
+                }
+                for state in list(getattr(run, "step_states", []) or [])
+                if isinstance(state, Mapping)
+            ],
+        }
+        return (
+            "[PlanRun reconciliation]\n"
+            "The attached PlanRun is still running, so a final assistant response "
+            "cannot complete this implementation turn. Do not guess or retroactively "
+            "claim progress. Continue from currentStepId. If that step is truthfully "
+            "completed or skipped, call plan_run_checkpoint for that exact step and "
+            "follow the returned currentStepId. If work cannot continue, checkpoint "
+            "the current step as blocked with the truthful reason. Only finish after "
+            "the run is completed or blocked.\n"
+            + json.dumps(progress, ensure_ascii=False, sort_keys=True)
+        )
 
     def _workspace_write_records(self) -> list[dict[str, Any]]:
         ctx = self._tool_context or current_tool_context.get()
@@ -11965,6 +12268,19 @@ class Agent:
         if gate_details is None or not tools:
             return tools
         return tools
+
+    @staticmethod
+    def _plan_run_delivery_tool_definitions(
+        tools: list[ToolDefinition] | None,
+    ) -> list[ToolDefinition] | None:
+        """Expose only final artifact delivery after all plan steps are done."""
+
+        if not tools:
+            return None
+        delivery_tools = [
+            tool for tool in tools if tool.name == "publish_artifact"
+        ]
+        return delivery_tools or None
 
     def _workspace_edit_gate_system_prompt(
         self,
@@ -15790,7 +16106,6 @@ class Agent:
                 self.config.endgame_fix_directive_margin_seconds
             ),
             reasoning_only_act_now=self.config.reasoning_only_act_now,
-            plan_only_act_now_threshold=self.config.plan_only_act_now_threshold,
             mid_budget_no_diff_nudge=self.config.mid_budget_no_diff_nudge,
             repeated_tool_call_recovery_threshold=(
                 self.config.repeated_tool_call_recovery_threshold

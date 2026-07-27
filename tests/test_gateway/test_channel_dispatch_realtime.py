@@ -37,6 +37,7 @@ from opensquilla.gateway.attachment_ingest import (
 from opensquilla.gateway.channel_dispatch import (
     _artifact_fallback_lines,
     _build_reply_message,
+    _clarify_tool_arguments,
     _deliver_artifacts_as_channel_files,
     _deliver_runtime_channel_reply,
     _dispatch_channel_slash_command,
@@ -151,6 +152,34 @@ class _RunContextSessionManager:
 
     async def get_session(self, session_key: str):
         return self.node
+
+
+def test_clarify_protocol_can_be_recovered_from_tool_result_json() -> None:
+    protocol = {
+        "kind": "user_input",
+        "paused": True,
+        "step": "plan",
+        "run_id": "plan-turn-1",
+        "clarify_schema": {
+            "mode": "form",
+            "fields": [
+                {
+                    "name": "scope",
+                    "type": "enum",
+                    "required": True,
+                    "choices": ["Core", "Full"],
+                }
+            ],
+        },
+    }
+    event = ToolResultEvent(
+        tool_use_id="request-input-1",
+        tool_name="request_user_input",
+        result=json.dumps(protocol),
+        arguments={"questions": [{"id": "scope", "question": "Which scope?"}]},
+    )
+
+    assert _clarify_tool_arguments(event) == protocol
 
 
 def _message() -> IncomingMessage:

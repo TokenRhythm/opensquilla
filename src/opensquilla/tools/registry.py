@@ -22,6 +22,7 @@ from opensquilla.tools.policy_runtime import ToolSurfaceCapabilities
 from opensquilla.tools.types import (
     CallerKind,
     InteractionMode,
+    PlanAccess,
     RegisteredTool,
     ToolContext,
     ToolHandler,
@@ -591,6 +592,8 @@ def tool(
     sandbox: SandboxToolDescriptor | None = None,
     registry: ToolRegistry | None = None,
     *,
+    plan_access: PlanAccess = PlanAccess.DENY,
+    terminates_turn: bool = False,
     runtime_only_arguments: frozenset[str] | set[str] | tuple[str, ...] = (),
 ) -> Any:
     """Decorator to register an async function as a tool.
@@ -615,6 +618,8 @@ def tool(
             execution_timeout_padding=execution_timeout_padding,
             result_budget_class=result_budget_class,
             sandbox=sandbox or SandboxToolDescriptor.custom(kind=name),
+            plan_access=plan_access,
+            terminates_turn=terminates_turn,
         )
         target = registry if registry is not None else _default_registry
         target.register(spec, fn)

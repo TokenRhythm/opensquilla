@@ -4,6 +4,7 @@ import { useToasts } from '@/composables/useToasts'
 import type { RpcClientError } from '@/lib/rpc'
 import type { Attachment, ChatMessage, ChatPendingItem } from '@/types/chat'
 import type { ModelRoutingMode } from '@/types/modelRouting'
+import type { CollaborationMode } from '@/types/plans'
 import type { SandboxRunMode } from '@/types/sandbox'
 import { normalizeSandboxRunMode } from '@/types/sandbox'
 import type {
@@ -46,9 +47,11 @@ interface SendAttempt {
   text: string
   attachments: SendableAttachment[]
   intent: string | null
+  initialCollaborationMode: CollaborationMode | null
   forkBeforeMessageId: string | null
   workspaceId: string | null
   params: ChatSendParams
+  requiresIdempotentReplay?: boolean
 }
 
 export type ChatSendOutcome = 'accepted' | 'deferred' | 'not_sent' | 'retryable_failure'
@@ -123,6 +126,11 @@ function shouldRestoreSendAttempt(err: unknown): boolean {
   return (err as RpcClientError | null | undefined)?.accepted !== true
 }
 
+function hasUnknownAcceptance(err: unknown): boolean {
+  const accepted = (err as RpcClientError | null | undefined)?.accepted
+  return accepted !== true && accepted !== false
+}
+
 interface AcceptedErrorInfo {
   messageId: string
   sessionKey: string
@@ -192,6 +200,7 @@ function matchesRecoveredDraft(
     text: string
     attachments: SendableAttachment[]
     intent: string | null
+    initialCollaborationMode: CollaborationMode | null
     forkBeforeMessageId: string | null
     workspaceId: string | null
   },
@@ -200,6 +209,7 @@ function matchesRecoveredDraft(
     attempt.requestSessionKey === input.requestSessionKey &&
     attempt.text === input.text &&
     attempt.intent === input.intent &&
+    attempt.initialCollaborationMode === input.initialCollaborationMode &&
     attempt.forkBeforeMessageId === input.forkBeforeMessageId &&
     attempt.workspaceId === input.workspaceId &&
     sameSendableAttachments(input.attachments, attempt)
@@ -227,6 +237,7 @@ export interface UseChatSendOptions {
   runMode: Ref<SandboxRunMode>
   pendingAttachments: Ref<Attachment[]>
   pendingSessionIntent: Ref<string | null>
+  initialCollaborationMode: Readonly<Ref<CollaborationMode>>
   pendingForkBeforeMessageId: Ref<string | null>
   pendingWorkspaceId?: Ref<string | null>
   sendBlockedReason?: Readonly<Ref<string | null>>
@@ -332,6 +343,27 @@ export function useChatSend(options: UseChatSendOptions) {
     return context?.sessionKey === options.sessionKey.value
       ? { ownerRequestId: context.ownerRequestId }
       : undefined
+  }
+
+  function initialModeForIntent(intent: string | null): CollaborationMode | null {
+    return intent === 'new_chat' ? options.initialCollaborationMode.value : null
+  }
+
+  function consumeAcceptedSessionIntent(attempt: SendAttempt): void {
+    if (options.sessionKey.value !== attempt.requestSessionKey) return
+    if (attempt.intent === 'new_chat') {
+      options.materializeDraftSession?.(attempt.requestSessionKey)
+    }
+    if (options.pendingSessionIntent.value === attempt.intent) {
+      options.pendingSessionIntent.value = null
+    }
+    if (
+      options.pendingWorkspaceId
+      && attempt.intent === 'new_chat'
+      && options.pendingWorkspaceId.value === attempt.workspaceId
+    ) {
+      acceptPendingWorkspaceBinding(attempt.workspaceId)
+    }
   }
 
   function beginResponseHandoff(
@@ -556,8 +588,14 @@ export function useChatSend(options: UseChatSendOptions) {
     })
   }
 
-  async function onSend() {
-    let text = options.inputText.value.trim()
+  async function onSend(invocation: {
+    bypassSlashCommand?: boolean
+    composerText?: string
+    textOverride?: string
+  } = {}) {
+    const bypassSlashCommand = invocation.bypassSlashCommand === true
+    const composerText = invocation.composerText ?? options.inputText.value
+    let text = (invocation.textOverride ?? options.inputText.value).trim()
     let sendableAttachments = options.pendingAttachments.value.filter(isSendableAttachment)
     let hasPayload = text || sendableAttachments.length > 0
     let isLiteralSlash = false
@@ -568,7 +606,7 @@ export function useChatSend(options: UseChatSendOptions) {
       return
     }
 
-    if (text.startsWith('//')) {
+    if (!bypassSlashCommand && text.startsWith('//')) {
       isLiteralSlash = true
       text = text.slice(1)
       sendableAttachments = options.pendingAttachments.value.filter(isSendableAttachment)
@@ -583,10 +621,24 @@ export function useChatSend(options: UseChatSendOptions) {
       }
     }
 
-    // Retry an ambiguous prior send with its exact original queue semantics,
-    // even if the ambient stream state changed while the error was visible.
-    // Deriving steer/followup again here would create a new fingerprint and
-    // could duplicate a turn that the gateway already accepted.
+    // An unknown acceptance must be resolved by replaying the exact original
+    // request before any edited draft or mode change can become a new turn.
+    // Otherwise a committed new_chat can be stranded behind a second request
+    // id that conflicts with the already-created session.
+    if (
+      !handoffInFlight
+      && recoveredAttempt?.requiresIdempotentReplay
+      && recoveredAttempt.requestSessionKey === options.sessionKey.value
+    ) {
+      await dispatchSend(recoveredAttempt.text, {
+        composerText,
+        queueMode: recoveredAttempt.queueMode,
+      })
+      return
+    }
+
+    // Retry an explicitly rejected prior send with its exact original queue
+    // semantics when the visible draft is unchanged.
     if (
       !handoffInFlight &&
       recoveredAttempt &&
@@ -595,12 +647,13 @@ export function useChatSend(options: UseChatSendOptions) {
         text,
         attachments: sendableAttachments,
         intent: options.pendingSessionIntent.value,
+        initialCollaborationMode: initialModeForIntent(options.pendingSessionIntent.value),
         forkBeforeMessageId: options.pendingForkBeforeMessageId.value,
         workspaceId: pendingWorkspaceForIntent(options.pendingSessionIntent.value),
       })
     ) {
       await dispatchSend(text, {
-        composerText: options.inputText.value,
+        composerText,
         queueMode: recoveredAttempt.queueMode,
       })
       return
@@ -608,7 +661,7 @@ export function useChatSend(options: UseChatSendOptions) {
 
     const compactInFlight = options.isCompactInFlightForCurrentSession()
     if (options.stream.isStreaming.value || compactInFlight || handoffInFlight) {
-      if (!isLiteralSlash && text.startsWith('/')) {
+      if (!bypassSlashCommand && !isLiteralSlash && text.startsWith('/')) {
         pushToast(i18n.global.t(
           compactInFlight ? 'chat.toast.waitCompactionBeforeCommand' : 'chat.toast.waitResponseBeforeCommand',
           { command: text.split(/\s+/, 1)[0] },
@@ -623,8 +676,13 @@ export function useChatSend(options: UseChatSendOptions) {
       // steered, so those sends still queue until it finishes.
       if (options.busySendMode.value === 'steer' && !compactInFlight && !handoffInFlight) {
         await dispatchSend(text, {
-          composerText: options.inputText.value,
+          composerText,
           queueMode: 'steer',
+          payload: {
+            attachments: sendableAttachments,
+            intent: null,
+            forkBeforeMessageId: null,
+          },
         })
         return
       }
@@ -636,14 +694,22 @@ export function useChatSend(options: UseChatSendOptions) {
       return
     }
 
-    if (!isLiteralSlash && text.startsWith('/')) {
+    if (!bypassSlashCommand && !isLiteralSlash && text.startsWith('/')) {
       const handled = await options.executeSlashCommand(text)
       if (handled) return
     }
 
     if (!hasPayload || !options.sessionKey.value) return
 
-    await dispatchSend(text, { composerText: options.inputText.value })
+    await dispatchSend(text, { composerText })
+  }
+
+  async function dispatchComposerPrompt(prompt: string, composerText: string) {
+    await onSend({
+      bypassSlashCommand: true,
+      composerText,
+      textOverride: prompt,
+    })
   }
 
   /**
@@ -745,22 +811,32 @@ export function useChatSend(options: UseChatSendOptions) {
     // queue/steer sends may run before it is accepted, but must neither inherit
     // nor clear that project binding.
     const workspaceId = pendingWorkspaceForIntent(intent)
+    const initialCollaborationMode = initialModeForIntent(intent)
     const initialSendableAttachments = sourceAttachments.filter(isSendableAttachment)
     // This is deliberately before optimistic rendering, composer clearing,
     // stream state, and chat.send. A blocked draft remains exactly editable.
     if (modelImageSendBlocked(initialSendableAttachments)) return 'not_sent'
     const retryCandidate = sendOpts.retryAttempt ?? (preserveComposer ? null : recoveredAttempt)
+    const requiresRecoveryReplay = Boolean(
+      retryCandidate?.requiresIdempotentReplay
+      && retryCandidate.requestSessionKey === requestSessionKey
+      && retryCandidate.queueMode === sendOpts.queueMode,
+    )
     const isRecoveredRetry = Boolean(
-      retryCandidate &&
-      matchesRecoveredDraft(retryCandidate, {
-        requestSessionKey,
-        text,
-        attachments: initialSendableAttachments,
-        intent,
-        forkBeforeMessageId,
-        workspaceId,
-      }) &&
-      retryCandidate.queueMode === sendOpts?.queueMode,
+      requiresRecoveryReplay
+      || (
+        retryCandidate
+        && matchesRecoveredDraft(retryCandidate, {
+          requestSessionKey,
+          text,
+          attachments: initialSendableAttachments,
+          intent,
+          initialCollaborationMode,
+          forkBeforeMessageId,
+          workspaceId,
+        })
+        && retryCandidate.queueMode === sendOpts.queueMode
+      ),
     )
     const retryAttempt = isRecoveredRetry ? retryCandidate : null
     const sendAttachmentIds = new Set(
@@ -819,6 +895,9 @@ export function useChatSend(options: UseChatSendOptions) {
       params._source = chatSourceMetadata(options)
       if (intent) params.intent = intent
       if (intent === 'new_chat' && workspaceId) params.workspaceId = workspaceId
+      if (initialCollaborationMode === 'plan') {
+        params.collaborationMode = initialCollaborationMode
+      }
       if (forkBeforeMessageId) params.forkBeforeMessageId = forkBeforeMessageId
       if (attachmentsToSend.length > 0) {
         params.displayText = userText
@@ -833,6 +912,7 @@ export function useChatSend(options: UseChatSendOptions) {
         text,
         attachments: attachmentsToSend.map(attachment => ({ ...attachment })),
         intent,
+        initialCollaborationMode,
         forkBeforeMessageId,
         workspaceId,
         params,
@@ -851,10 +931,15 @@ export function useChatSend(options: UseChatSendOptions) {
     }
     if (!preserveComposer) {
       recoveredAttempt = null
-      options.inputText.value = ''
+      const composerTextBeforeSend = options.inputText.value
+      const preserveEditedComposer = Boolean(
+        retryAttempt?.requiresIdempotentReplay
+        && composerTextBeforeSend
+        && composerTextBeforeSend !== retryAttempt.composerText
+      )
+      options.inputText.value = preserveEditedComposer ? composerTextBeforeSend : ''
       options.autoResizeTextarea()
       options.pendingAttachments.value = attachmentsToKeep
-      if (options.pendingSessionIntent.value === intent) options.pendingSessionIntent.value = null
       if (options.pendingForkBeforeMessageId.value === forkBeforeMessageId) {
         options.pendingForkBeforeMessageId.value = null
       }
@@ -873,20 +958,10 @@ export function useChatSend(options: UseChatSendOptions) {
 
     try {
       const res = await options.rpc.call<ChatSendResponse>('chat.send', attempt.params)
-      if (
-        options.sessionKey.value === requestSessionKey
-        && attempt.intent === 'new_chat'
-      ) {
-        options.materializeDraftSession?.(requestSessionKey)
-      }
-      if (
-        options.pendingWorkspaceId
-        && attempt.intent === 'new_chat'
-        && options.sessionKey.value === requestSessionKey
-        && options.pendingWorkspaceId.value === attempt.workspaceId
-      ) {
-        acceptPendingWorkspaceBinding(attempt.workspaceId)
-      }
+      // A draft becomes a routable session only after the gateway has durably
+      // accepted its first turn. Keeping the intent until this point avoids
+      // remounting onto an empty history when acceptance fails or is unknown.
+      consumeAcceptedSessionIntent(attempt)
       const taskId = acceptedTaskId(res)
       const terminalStatus = terminalResponseStatus(res)
       if (responseHandoff) {
@@ -978,29 +1053,19 @@ export function useChatSend(options: UseChatSendOptions) {
       return 'accepted'
     } catch (err: unknown) {
       const acceptedError = acceptedErrorInfo(err)
-      if (acceptedError) {
-        if (
-          options.sessionKey.value === requestSessionKey
-          && attempt.intent === 'new_chat'
-        ) {
-          options.materializeDraftSession?.(requestSessionKey)
-        }
-        if (
-          options.pendingWorkspaceId
-          && attempt.intent === 'new_chat'
-          && options.sessionKey.value === requestSessionKey
-          && options.pendingWorkspaceId.value === attempt.workspaceId
-        ) {
-          acceptPendingWorkspaceBinding(attempt.workspaceId)
-        }
-      }
+      if (acceptedError) consumeAcceptedSessionIntent(attempt)
       const acceptedSessionKey = acceptedError?.sessionKey || requestSessionKey
       const rememberRetryableAttempt = (restoreComposer: boolean) => {
         if (!shouldRestoreSendAttempt(err)) return
         if (preserveComposer) {
-          sendOpts.rememberRetryableAttempt?.(attempt)
+          sendOpts.rememberRetryableAttempt?.({
+            ...attempt,
+            requiresIdempotentReplay: hasUnknownAcceptance(err),
+          })
         } else if (restoreComposer) {
-          restoreSendAttempt(attempt)
+          restoreSendAttempt(attempt, {
+            requiresIdempotentReplay: hasUnknownAcceptance(err),
+          })
         }
       }
       const stoppedByUser = freshSendToken?.stoppedByUser === true
@@ -1082,11 +1147,17 @@ export function useChatSend(options: UseChatSendOptions) {
     }
   }
 
-  function restoreSendAttempt(attempt: SendAttempt) {
+  function restoreSendAttempt(
+    attempt: SendAttempt,
+    recovery: { requiresIdempotentReplay: boolean },
+  ) {
     const currentText = options.inputText.value
     if (!currentText) {
       options.inputText.value = attempt.composerText
-    } else if (currentText !== attempt.composerText) {
+    } else if (
+      !recovery.requiresIdempotentReplay
+      && currentText !== attempt.composerText
+    ) {
       options.inputText.value = [attempt.composerText, currentText].filter(Boolean).join('\n')
     }
     restoreSendableAttachments(attempt.attachments)
@@ -1097,7 +1168,10 @@ export function useChatSend(options: UseChatSendOptions) {
     if (options.pendingWorkspaceId && !options.pendingWorkspaceId.value) {
       options.pendingWorkspaceId.value = attempt.workspaceId
     }
-    recoveredAttempt = attempt
+    recoveredAttempt = {
+      ...attempt,
+      requiresIdempotentReplay: recovery.requiresIdempotentReplay,
+    }
     options.autoResizeTextarea()
   }
 
@@ -1371,6 +1445,7 @@ export function useChatSend(options: UseChatSendOptions) {
     onStop,
     sendQueuedSteer,
     sendQueuedFollowup,
+    dispatchComposerPrompt,
     dispatchHiddenSend,
     sendHiddenMetaPreflightConfirmation,
   }

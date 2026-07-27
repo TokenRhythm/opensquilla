@@ -49,6 +49,27 @@
             <Icon name="x" :size="12" />
           </button>
         </div>
+        <div
+          v-if="replanActive"
+          class="chat-replan-draft"
+          role="status"
+          aria-live="polite"
+        >
+          <span class="chat-replan-draft__icon" aria-hidden="true">
+            <Icon name="pencil" :size="14" />
+          </span>
+          <span class="chat-replan-draft__copy">
+            <strong>{{ t('chat.plan.revising') }}</strong>
+            {{ t('chat.plan.reviseDraftHint') }}
+          </span>
+          <button
+            type="button"
+            class="chat-replan-draft__cancel"
+            @click="emit('cancelReplan')"
+          >
+            {{ t('common.cancel') }}
+          </button>
+        </div>
         <div class="chat-input-wrap">
           <textarea
             ref="textareaEl"
@@ -68,9 +89,29 @@
         </div>
         <div class="chat-input-footer">
           <div class="chat-input-actions chat-input-actions--left">
-            <button class="btn btn--icon btn--ghost chat-plus-btn" :title="t('chat.attachFilesTitle')" :aria-label="t('chat.attachFiles')" @click="fileInputEl?.click()">
-              <Icon name="plus" :size="18" />
-            </button>
+            <div ref="addMenuAnchorEl" class="chat-settings-anchor">
+              <button
+                class="btn btn--icon btn--ghost chat-plus-btn"
+                :class="{ 'is-active': addMenuOpen }"
+                :title="t('chat.add')"
+                :aria-label="t('chat.add')"
+                aria-haspopup="menu"
+                :aria-expanded="addMenuOpen ? 'true' : 'false'"
+                @click="toggleAddMenu"
+              >
+                <Icon name="plus" :size="18" />
+              </button>
+              <ChatComposerAddMenu
+                v-if="addMenuOpen"
+                :attachments-disabled="replanActive"
+                :plan-mode-active="collaborationMode === 'plan'"
+                :plan-mode-available="planModeAvailable === true"
+                :plan-mode-busy="planModeBusy === true || planModeDisabled === true"
+                @activate-plan-mode="emit('setCollaborationMode', 'plan')"
+                @attach-files="fileInputEl?.click()"
+                @close="addMenuOpen = false"
+              />
+            </div>
             <button
               v-if="
                 canChooseProject
@@ -204,12 +245,20 @@
               />
             </div>
           </div>
+          <ChatComposerPlanMode
+            :available="planModeAvailable === true"
+            :mode="collaborationMode || 'default'"
+            :busy="planModeBusy === true"
+            :disabled="planModeDisabled === true"
+            :applies-next-turn="planModeAppliesNextTurn === true"
+            @set-mode="emit('setCollaborationMode', $event)"
+          />
           <div class="chat-input-actions chat-input-actions--right">
             <button
               class="btn btn--icon btn--primary chat-send-btn"
               :class="{ 'is-ready': hasSendContent && !sendBlockedMessage }"
               :title="sendBlockedMessage || sendButtonTitle"
-              :aria-label="t('chat.send')"
+              :aria-label="replanActive ? t('chat.plan.reviseSend') : t('chat.send')"
               :aria-describedby="sendBlockedMessage ? 'chat-composer-send-status' : undefined"
               :disabled="Boolean(sendBlockedMessage)"
               @click="emit('send')"
@@ -217,7 +266,17 @@
               <Icon name="arrowUp" :size="17" />
             </button>
             <Transition name="composer-ctl">
-              <button v-if="canStop" class="btn btn--icon btn--danger chat-send-btn" :title="t('chat.stopResponseEsc')" :aria-label="t('chat.stopResponse')" @click="emit('stop')">
+              <button
+                v-if="canStop"
+                class="btn btn--icon btn--danger chat-send-btn"
+                :title="stopTargetsPlanRun
+                  ? t('chat.planRun.stopExecutionEsc')
+                  : t('chat.stopResponseEsc')"
+                :aria-label="stopTargetsPlanRun
+                  ? t('chat.planRun.stopExecution')
+                  : t('chat.stopResponse')"
+                @click="emit('stop')"
+              >
                 <Icon name="stop" :size="16" />
               </button>
             </Transition>
@@ -249,12 +308,15 @@ import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import type { IconName } from '@/utils/icons'
+import ChatComposerAddMenu from '@/components/chat/ChatComposerAddMenu.vue'
 import ChatComposerModelRouting from '@/components/chat/ChatComposerModelRouting.vue'
+import ChatComposerPlanMode from '@/components/chat/ChatComposerPlanMode.vue'
 import ChatComposerSettings from '@/components/chat/ChatComposerSettings.vue'
 import ChatComposerRunMode from '@/components/chat/ChatComposerRunMode.vue'
 import type { Attachment } from '@/types/chat'
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { SandboxRunMode } from '@/types/sandbox'
+import type { CollaborationMode } from '@/types/plans'
 import { isAttachmentBusy, isImageDisplayAttachment } from '@/utils/chat/attachments'
 
 interface ChatComposerExpose {
@@ -270,6 +332,7 @@ const props = withDefaults(defineProps<{
   hasSendContent: boolean
   isStreaming: boolean
   canStop: boolean
+  stopTargetsPlanRun?: boolean
   isNewLanding: boolean
   placeholder: string
   sendButtonTitle: string
@@ -291,6 +354,12 @@ const props = withDefaults(defineProps<{
   projectStatusMessage?: string
   canCloseProject?: boolean
   canChooseProject?: boolean
+  planModeAvailable?: boolean
+  collaborationMode?: CollaborationMode
+  planModeBusy?: boolean
+  planModeDisabled?: boolean
+  planModeAppliesNextTurn?: boolean
+  replanActive?: boolean
 }>(), {
   canChooseProject: true,
 })
@@ -309,6 +378,8 @@ const emit = defineEmits<{
   setModelRoutingMode: [mode: ModelRoutingMode]
   setVisualEffectsEnabled: [enabled: boolean]
   setCodingModeEnabled: [enabled: boolean]
+  setCollaborationMode: [mode: CollaborationMode]
+  cancelReplan: []
   voiceInput: []
   voiceSetup: []
   exportMarkdown: []
@@ -323,6 +394,7 @@ const inputText = defineModel<string>({ required: true })
 const composerEl = ref<HTMLElement | null>(null)
 const textareaEl = ref<HTMLTextAreaElement | null>(null)
 const fileInputEl = ref<HTMLInputElement | null>(null)
+const addMenuOpen = ref(false)
 const settingsOpen = ref(false)
 const modelRoutingOpen = ref(false)
 const moreActionsOpen = ref(false)
@@ -343,12 +415,17 @@ function dismissRouterNewBadge() {
   } catch { /* localStorage unavailable */ }
 }
 const runModeOpen = ref(false)
+const addMenuAnchorEl = ref<HTMLElement | null>(null)
 const modelRoutingAnchorEl = ref<HTMLElement | null>(null)
 const runModeAnchorEl = ref<HTMLElement | null>(null)
 const moreActionsAnchorEl = ref<HTMLElement | null>(null)
 
-const anyPopoverOpen = computed(
-  () => settingsOpen.value || modelRoutingOpen.value || runModeOpen.value || moreActionsOpen.value,
+const anyPopoverOpen = computed(() =>
+  addMenuOpen.value
+  || settingsOpen.value
+  || modelRoutingOpen.value
+  || runModeOpen.value
+  || moreActionsOpen.value,
 )
 
 function eventInsideRoot(event: PointerEvent, root: HTMLElement | null): boolean {
@@ -359,6 +436,9 @@ function eventInsideRoot(event: PointerEvent, root: HTMLElement | null): boolean
 }
 
 function closeOpenPopoversFromOutside(event: PointerEvent) {
+  if (addMenuOpen.value && !eventInsideRoot(event, addMenuAnchorEl.value)) {
+    addMenuOpen.value = false
+  }
   if (
     (settingsOpen.value || moreActionsOpen.value) &&
     !eventInsideRoot(event, moreActionsAnchorEl.value)
@@ -390,6 +470,7 @@ function toggleModelRouting() {
   modelRoutingOpen.value = !modelRoutingOpen.value
   if (modelRoutingOpen.value) {
     dismissRouterNewBadge()
+    addMenuOpen.value = false
     settingsOpen.value = false
     runModeOpen.value = false
     moreActionsOpen.value = false
@@ -400,6 +481,7 @@ function toggleRunMode() {
   if (props.runModeLocked) return
   runModeOpen.value = !runModeOpen.value
   if (runModeOpen.value) {
+    addMenuOpen.value = false
     settingsOpen.value = false
     modelRoutingOpen.value = false
     moreActionsOpen.value = false
@@ -418,12 +500,24 @@ function toggleMoreActions() {
     moreActionsOpen.value = !moreActionsOpen.value
   }
   if (moreActionsOpen.value) {
+    addMenuOpen.value = false
+    modelRoutingOpen.value = false
+    runModeOpen.value = false
+  }
+}
+
+function toggleAddMenu() {
+  addMenuOpen.value = !addMenuOpen.value
+  if (addMenuOpen.value) {
+    settingsOpen.value = false
+    moreActionsOpen.value = false
     modelRoutingOpen.value = false
     runModeOpen.value = false
   }
 }
 
 function openSettings() {
+  addMenuOpen.value = false
   moreActionsOpen.value = false
   settingsOpen.value = true
   modelRoutingOpen.value = false
@@ -724,6 +818,54 @@ defineExpose<ChatComposerExpose>({
   background: var(--bg-surface);
   box-shadow: var(--shadow-xs);
   position: relative;
+}
+
+.chat-replan-draft {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border));
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+
+.chat-replan-draft__icon {
+  display: inline-flex;
+  color: var(--accent);
+}
+
+.chat-replan-draft__copy {
+  min-width: 0;
+}
+
+.chat-replan-draft__copy strong {
+  margin-right: var(--sp-1);
+  color: var(--text);
+}
+
+.chat-replan-draft__cancel {
+  padding: 2px 7px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font: inherit;
+}
+
+.chat-replan-draft__cancel:hover,
+.chat-replan-draft__cancel:focus-visible {
+  border-color: var(--border);
+  background: var(--bg-hover);
+  color: var(--text);
+  outline: none;
+}
+
+.chat-replan-draft__cancel:focus-visible {
+  box-shadow: var(--focus-ring);
 }
 
 .chat-composer--new-landing .chat-input-panel {

@@ -222,6 +222,7 @@ describe('chat send session handoff', () => {
       runMode: ref('trusted'),
       pendingAttachments,
       pendingSessionIntent,
+      initialCollaborationMode: ref<'default' | 'plan'>('default'),
       pendingForkBeforeMessageId: ref('msg-B'),
       aborted,
       activeStreamTaskId,

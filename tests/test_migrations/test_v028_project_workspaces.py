@@ -9,7 +9,7 @@ from yoyo import get_backend, read_migrations
 from opensquilla.persistence.migrator import apply_pending
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MIGRATION_ID = "V025__project_workspaces"
+MIGRATION_ID = "V028__project_workspaces"
 
 
 def _migration_version(path: Path) -> int | None:
@@ -19,13 +19,13 @@ def _migration_version(path: Path) -> int | None:
     return None
 
 
-def test_v025_adds_workspace_table_and_session_binding(tmp_path: Path) -> None:
+def test_v028_adds_workspace_table_and_session_binding(tmp_path: Path) -> None:
     db_path = tmp_path / "sessions.db"
-    migration_slice = tmp_path / "through_v025"
+    migration_slice = tmp_path / "through_v028"
     migration_slice.mkdir()
     for path in MIGRATIONS_DIR.glob("V*.py"):
         version = _migration_version(path)
-        if version is not None and version <= 24:
+        if version is not None and version <= 27:
             shutil.copy2(path, migration_slice / path.name)
     apply_pending(str(db_path), migration_slice)
     with sqlite3.connect(db_path) as conn:
@@ -33,8 +33,8 @@ def test_v025_adds_workspace_table_and_session_binding(tmp_path: Path) -> None:
             "CREATE TABLE sessions (session_key TEXT PRIMARY KEY, title TEXT)"
         )
 
-    v025_path = MIGRATIONS_DIR / "V025__project_workspaces.py"
-    shutil.copy2(v025_path, migration_slice / v025_path.name)
+    v028_path = MIGRATIONS_DIR / "V028__project_workspaces.py"
+    shutil.copy2(v028_path, migration_slice / v028_path.name)
     assert MIGRATION_ID in apply_pending(str(db_path), migration_slice)
 
     with sqlite3.connect(db_path) as conn:
@@ -81,8 +81,8 @@ def test_v025_adds_workspace_table_and_session_binding(tmp_path: Path) -> None:
         assert "workspace_id" not in session_columns
 
 
-def test_v025_prefix_and_dependency_are_unique() -> None:
-    files = sorted(path.name for path in MIGRATIONS_DIR.glob("V025__*.py"))
-    assert files == ["V025__project_workspaces.py"]
+def test_v028_prefix_and_dependency_are_unique() -> None:
+    files = sorted(path.name for path in MIGRATIONS_DIR.glob("V028__*.py"))
+    assert files == ["V028__project_workspaces.py"]
     source = (MIGRATIONS_DIR / files[0]).read_text(encoding="utf-8")
-    assert "V024__usage_native_billing_receipts" in source
+    assert "V027__plan_runs" in source

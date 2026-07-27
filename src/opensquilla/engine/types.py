@@ -722,11 +722,6 @@ class AgentConfig:
     # failure kind. Off by default (the bare retry re-requests with nothing
     # added). Set via OPENSQUILLA_REASONING_ONLY_ACT_NOW.
     reasoning_only_act_now: bool = False
-    # Consecutive update_plan-only iterations before an act-now directive is
-    # appended after the tool results. 0 = off. Counts iterations whose
-    # executed tool calls are all update_plan; any other tool call resets the
-    # streak. Set via OPENSQUILLA_PLAN_ONLY_ACT_NOW_THRESHOLD.
-    plan_only_act_now_threshold: int = 0
     # Mid-budget progress nudges. Off by default. When enabled and the turn
     # has a wall-clock budget (timeout > 0), a one-shot user message is
     # appended after tool results the first time elapsed time crosses 50% and

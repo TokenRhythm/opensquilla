@@ -8,6 +8,7 @@ import json
 import os
 from difflib import SequenceMatcher
 from pathlib import Path
+from typing import Any
 
 from opensquilla.artifact_validation import (
     ArtifactValidationError,
@@ -167,6 +168,68 @@ def _publish_artifact_metadata(
     return artifact_name, artifact_mime
 
 
+def _plan_run_steps_ready_for_delivery(run: Any) -> bool:
+    current_step_id = str(getattr(run, "current_step_id", "") or "")
+    step_states = list(getattr(run, "step_states", []) or [])
+    return (
+        not current_step_id
+        and bool(step_states)
+        and all(
+            isinstance(state, dict)
+            and str(state.get("status") or "") in {"completed", "skipped"}
+            for state in step_states
+        )
+    )
+
+
+async def _require_plan_run_ready_for_publish(ctx: ToolContext) -> None:
+    """Keep artifact delivery behind the authoritative final checkpoint."""
+
+    run_id = str(getattr(ctx, "plan_run_id", "") or "").strip()
+    if not run_id:
+        return
+    storage = getattr(ctx, "plan_storage", None)
+    get_plan_run = getattr(storage, "get_plan_run", None)
+    if not callable(get_plan_run):
+        raise ToolError("PlanRun storage is unavailable for artifact publication")
+    run = await get_plan_run(run_id)
+    if run is None:
+        raise ToolError("The active PlanRun no longer exists")
+    status = str(getattr(run, "status", "") or "")
+    task_id = str(getattr(ctx, "task_id", "") or "").strip()
+    active_task_id = str(getattr(run, "active_task_id", "") or "").strip()
+    if status == "completed":
+        return
+    if status == "running":
+        if not task_id or active_task_id != task_id:
+            raise ToolError(
+                "Artifact publication is unavailable because this task no longer "
+                "owns the attached PlanRun."
+            )
+        if _plan_run_steps_ready_for_delivery(run):
+            return
+    current_step_id = str(getattr(run, "current_step_id", "") or "")
+    current_detail = (
+        f" The current step is {current_step_id}."
+        if current_step_id
+        else ""
+    )
+    message = (
+        "publish_artifact was not executed because the attached PlanRun is "
+        f"{status or 'unavailable'}.{current_detail}"
+    )
+    if status == "running":
+        raise RetryableToolInputError(
+            f"{message} Record truthful checkpoints for the current step in plan "
+            "order, then retry publish_artifact only after the final checkpoint "
+            "returns no current step."
+        )
+    raise ToolError(
+        f"{message} Artifact publication is unavailable for this terminal or "
+        "unowned PlanRun state."
+    )
+
+
 @tool(
     name="publish_artifact",
     description=(
@@ -200,6 +263,7 @@ async def publish_artifact(
     ctx = current_tool_context.get()
     if ctx is None:
         raise ToolError("publish_artifact requires tool context")
+    await _require_plan_run_ready_for_publish(ctx)
     if not ctx.workspace_dir:
         raise ToolError("publish_artifact requires an active workspace")
     if not ctx.artifact_media_root:

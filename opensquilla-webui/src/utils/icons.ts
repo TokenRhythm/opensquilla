@@ -8,6 +8,7 @@ export type IconName =
   | 'refresh' | 'download' | 'save' | 'menu' | 'moreHorizontal' | 'user' | 'search' | 'eye' | 'eye-off'
   | 'edit' | 'info' | 'settings' | 'gear' | 'gauge' | 'router' | 'regenerate'
   | 'pencil' | 'fork' | 'listChecks' | 'chevronDown' | 'chevronRight' | 'arrowUp'
+  | 'expand' | 'collapse'
   | 'panel-left-open' | 'panel-left-close' | 'panel-right-open' | 'panel-right-close'
   | 'sidebar-visible' | 'sidebar-hidden'
   | 'clock' | 'microphone'
@@ -72,6 +73,8 @@ const ICONS: Record<IconName, IconDef> = {
   chevronDown:{ path: '<polyline points="6 9 12 15 18 9"/>', strokeWidth: 1.5 },
   chevronRight:{ path: '<polyline points="9 18 15 12 9 6"/>', strokeWidth: 1.5 },
   arrowUp:    { path: '<path d="M12 19V5"/><path d="M5 12l7-7 7 7"/>', strokeWidth: 2 },
+  expand:     { path: '<polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/>', strokeWidth: 1.5 },
+  collapse:   { path: '<polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="10" y1="14" x2="3" y2="21"/><line x1="14" y1="10" x2="21" y2="3"/>', strokeWidth: 1.5 },
   'panel-left-open':  { path: '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/><path d="M14 9l6 6-6 6"/>' },
   'panel-left-close': { path: '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/><path d="M20 9l-6 6 6 6"/>' },
   'panel-right-open': {

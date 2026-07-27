@@ -10,6 +10,7 @@ import type {
   ChatPendingItem,
   ChatRenderedMessage,
 } from '@/types/chat'
+import type { CollaborationMode } from '@/types/plans'
 import {
   useChatPendingQueue,
   type BusySendMode,
@@ -60,6 +61,7 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
     runMode: ref('trusted'),
     pendingAttachments: ref<Attachment[]>([]),
     pendingSessionIntent: ref(null),
+    initialCollaborationMode: ref<CollaborationMode>('default'),
     pendingForkBeforeMessageId: ref(null),
     aborted: ref(false),
     activeStreamTaskId: ref(''),
@@ -215,8 +217,8 @@ describe('useChatSend attachment payloads', () => {
     await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledOnce())
     await nextTick()
 
-    expect(pendingSessionIntent.value).toBeNull()
-    expect(intentTransitions).toEqual([null])
+    expect(pendingSessionIntent.value).toBe('new_chat')
+    expect(intentTransitions).toEqual([])
     expect(materializeDraftSession).not.toHaveBeenCalled()
 
     options.inputText.value = 'follow-up while first send is pending'
@@ -233,7 +235,7 @@ describe('useChatSend attachment payloads', () => {
 
     expect(pendingSessionIntent.value).toBe('new_chat')
     expect(pendingWorkspaceId.value).toBe('project-a')
-    expect(intentTransitions).toEqual([null, 'new_chat'])
+    expect(intentTransitions).toEqual([])
     expect(materializeDraftSession).not.toHaveBeenCalled()
   })
 
@@ -403,6 +405,101 @@ describe('useChatSend attachment payloads', () => {
     expect(JSON.stringify(options.messages.value[0])).not.toContain('file-ready')
     expect(JSON.stringify(options.messages.value[0])).not.toContain('failed.pdf')
     expect(pendingAttachments.value).toEqual([failed])
+  })
+
+  it('sends a slash-derived Plan prompt through the normal attachment path', async () => {
+    const ready: Attachment = {
+      kind: 'staged',
+      local_id: 7,
+      name: 'architecture.png',
+      mime: 'image/png',
+      file_uuid: 'file-plan-image',
+    }
+    const inputText = ref('/plan analyze this architecture')
+    const pendingAttachments = ref<Attachment[]>([ready])
+    const executeSlashCommand = vi.fn(async () => false)
+    const { api, options, rpc } = makeOptions({
+      executeSlashCommand,
+      inputText,
+      pendingAttachments,
+    })
+
+    await api.dispatchComposerPrompt(
+      'analyze this architecture',
+      '/plan analyze this architecture',
+    )
+
+    expect(executeSlashCommand).not.toHaveBeenCalled()
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      message: 'analyze this architecture',
+      displayText: 'analyze this architecture',
+      attachments: [
+        {
+          type: 'image/png',
+          file_uuid: 'file-plan-image',
+          mime: 'image/png',
+          name: 'architecture.png',
+        },
+      ],
+    }))
+    expect(options.messages.value[0]).toMatchObject({
+      role: 'user',
+      text: 'analyze this architecture',
+      attachments: [
+        {
+          kind: 'staged',
+          displayId: 'local:7',
+          renderKey: 'local:7',
+          name: 'architecture.png',
+          mime: 'image/png',
+        },
+      ],
+    })
+    expect(inputText.value).toBe('')
+    expect(pendingAttachments.value).toEqual([])
+  })
+
+  it('restores and idempotently retries a slash-derived Plan prompt with attachments', async () => {
+    const ready: Attachment = {
+      kind: 'staged',
+      local_id: 8,
+      name: 'diagram.png',
+      mime: 'image/png',
+      file_uuid: 'file-plan-retry',
+    }
+    const originalInput = '/plan analyze this diagram'
+    const inputText = ref(originalInput)
+    const pendingAttachments = ref<Attachment[]>([ready])
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(Object.assign(new Error('network down'), {
+          accepted: false,
+          retryable: true,
+        }))
+        .mockResolvedValueOnce({
+          sessionKey: 'agent:main:webchat:test',
+          task_id: 'task-plan-retry',
+        }),
+    }
+    const { api, options } = makeOptions({
+      inputText,
+      pendingAttachments,
+      rpc,
+    })
+
+    await api.dispatchComposerPrompt('analyze this diagram', originalInput)
+
+    const firstParams = rpc.call.mock.calls[0]?.[1]
+    expect(inputText.value).toBe(originalInput)
+    expect(pendingAttachments.value).toEqual([ready])
+    expect(options.messages.value.filter(message => message.role === 'user')).toHaveLength(1)
+
+    await api.dispatchComposerPrompt('analyze this diagram', originalInput)
+
+    expect(rpc.call.mock.calls[1]?.[1]).toEqual(firstParams)
+    expect(options.messages.value.filter(message => message.role === 'user')).toHaveLength(1)
+    expect(inputText.value).toBe('')
+    expect(pendingAttachments.value).toEqual([])
   })
 
   it('refreshes staged uploads before serializing chat.send attachments', async () => {
@@ -1280,6 +1377,105 @@ describe('useChatSend attachment payloads', () => {
     const secondParams = rpc.call.mock.calls[1]?.[1]
     expect(secondParams.clientRequestId).not.toBe(firstParams.clientRequestId)
     expect(secondParams).toMatchObject({ message: 'edited', _source: { runMode: 'trusted' } })
+  })
+
+  it('uses a new request when the recovered draft collaboration mode changes', async () => {
+    const inputText = ref('inspect and plan')
+    const pendingSessionIntent = ref<string | null>('new_chat')
+    const initialCollaborationMode = ref<CollaborationMode>('plan')
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(Object.assign(new Error('database busy'), {
+          accepted: false,
+          retryable: true,
+        }))
+        .mockResolvedValueOnce({
+          sessionKey: 'agent:main:webchat:test',
+          task_id: 'task-default',
+        }),
+    }
+    const { api } = makeOptions({
+      rpc,
+      inputText,
+      pendingSessionIntent,
+      initialCollaborationMode,
+    })
+
+    await api.onSend()
+    initialCollaborationMode.value = 'default'
+    await api.onSend()
+
+    const firstParams = rpc.call.mock.calls[0]?.[1]
+    const secondParams = rpc.call.mock.calls[1]?.[1]
+    expect(firstParams).toMatchObject({
+      collaborationMode: 'plan',
+      intent: 'new_chat',
+    })
+    expect(secondParams.clientRequestId).not.toBe(firstParams.clientRequestId)
+    expect(secondParams).not.toHaveProperty('collaborationMode')
+  })
+
+  it('replays an unknown-acceptance draft with its original mode and request id', async () => {
+    const inputText = ref('inspect and plan')
+    const pendingSessionIntent = ref<string | null>('new_chat')
+    const initialCollaborationMode = ref<CollaborationMode>('plan')
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(new Error('response lost'))
+        .mockResolvedValueOnce({
+          sessionKey: 'agent:main:webchat:test',
+          task_id: 'task-plan',
+        }),
+    }
+    const { api } = makeOptions({
+      rpc,
+      inputText,
+      pendingSessionIntent,
+      initialCollaborationMode,
+    })
+
+    await api.onSend()
+    initialCollaborationMode.value = 'default'
+    await api.onSend()
+
+    const firstParams = rpc.call.mock.calls[0]?.[1]
+    const secondParams = rpc.call.mock.calls[1]?.[1]
+    expect(secondParams.clientRequestId).toBe(firstParams.clientRequestId)
+    expect(secondParams).toEqual(firstParams)
+    expect(secondParams).toMatchObject({
+      collaborationMode: 'plan',
+      intent: 'new_chat',
+    })
+  })
+
+  it('resolves unknown acceptance before sending an edited draft', async () => {
+    const inputText = ref('inspect and plan')
+    const pendingSessionIntent = ref<string | null>('new_chat')
+    const initialCollaborationMode = ref<CollaborationMode>('plan')
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(new Error('response lost'))
+        .mockResolvedValueOnce({
+          sessionKey: 'agent:main:webchat:test',
+          task_id: 'task-plan',
+        }),
+    }
+    const { api } = makeOptions({
+      rpc,
+      inputText,
+      pendingSessionIntent,
+      initialCollaborationMode,
+    })
+
+    await api.onSend()
+    inputText.value = 'a different follow-up'
+    initialCollaborationMode.value = 'default'
+    await api.onSend()
+
+    const firstParams = rpc.call.mock.calls[0]?.[1]
+    const secondParams = rpc.call.mock.calls[1]?.[1]
+    expect(secondParams).toEqual(firstParams)
+    expect(inputText.value).toBe('a different follow-up')
   })
 
   it('does not restore an attempt explicitly reported as accepted', async () => {
@@ -2603,5 +2799,97 @@ describe('useChatSend Ensemble image guard', () => {
       errorCode: 'provider_custom_failure',
       text: 'Provider supplied this exact explanation.',
     })
+  })
+
+  it('sends the draft Plan mode atomically with intent=new_chat', async () => {
+    const { api, rpc } = makeOptions({
+      pendingSessionIntent: ref('new_chat'),
+      initialCollaborationMode: ref<CollaborationMode>('plan'),
+    })
+
+    await api.onSend()
+
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      intent: 'new_chat',
+      collaborationMode: 'plan',
+    }))
+  })
+
+  it('keeps the default draft compatible with gateways that predate initial modes', async () => {
+    const { api, rpc } = makeOptions({
+      pendingSessionIntent: ref('new_chat'),
+      initialCollaborationMode: ref<CollaborationMode>('default'),
+    })
+
+    await api.onSend()
+
+    const params = rpc.call.mock.calls[0]?.[1]
+    expect(params).toEqual(expect.objectContaining({ intent: 'new_chat' }))
+    expect(params).not.toHaveProperty('collaborationMode')
+  })
+
+  it('materializes a draft intent only after durable acceptance', async () => {
+    let resolveSend!: (value: { sessionKey: string; task_id: string }) => void
+    const pendingSessionIntent = ref<string | null>('new_chat')
+    const rpc = {
+      call: vi.fn(() => new Promise<{ sessionKey: string; task_id: string }>(resolve => {
+        resolveSend = resolve
+      })),
+    }
+    const { api } = makeOptions({
+      rpc: rpc as UseChatSendOptions['rpc'],
+      pendingSessionIntent,
+    })
+
+    const send = api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledOnce())
+    expect(pendingSessionIntent.value).toBe('new_chat')
+
+    resolveSend({
+      sessionKey: 'agent:main:webchat:test',
+      task_id: 'task-first',
+    })
+    await send
+
+    expect(pendingSessionIntent.value).toBeNull()
+  })
+
+  it('does not let a stale accepted response materialize a newer draft', async () => {
+    let resolveSend!: (value: { sessionKey: string; task_id: string }) => void
+    const firstKey = 'agent:main:webchat:first-draft'
+    const secondKey = 'agent:main:webchat:second-draft'
+    const sessionKey = ref(firstKey)
+    const pendingSessionIntent = ref<string | null>('new_chat')
+    const rpc = {
+      call: vi.fn(() => new Promise<{ sessionKey: string; task_id: string }>(resolve => {
+        resolveSend = resolve
+      })),
+    }
+    const { api } = makeOptions({
+      rpc: rpc as UseChatSendOptions['rpc'],
+      sessionKey,
+      pendingSessionIntent,
+    })
+
+    const send = api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledOnce())
+    sessionKey.value = secondKey
+
+    resolveSend({ sessionKey: firstKey, task_id: 'task-first' })
+    await send
+
+    expect(sessionKey.value).toBe(secondKey)
+    expect(pendingSessionIntent.value).toBe('new_chat')
+  })
+
+  it('does not attach an initial collaboration mode to an existing-session send', async () => {
+    const { api, rpc } = makeOptions({
+      initialCollaborationMode: ref<CollaborationMode>('plan'),
+    })
+
+    await api.onSend()
+
+    const params = rpc.call.mock.calls[0]?.[1]
+    expect(params).not.toHaveProperty('collaborationMode')
   })
 })

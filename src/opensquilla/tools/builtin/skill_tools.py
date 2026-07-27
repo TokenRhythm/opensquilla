@@ -22,7 +22,7 @@ from opensquilla.skills.hub.defaults import (
 )
 from opensquilla.skills.types import SkillInstallSpec, SkillLayer, SkillSpec
 from opensquilla.tools.registry import tool
-from opensquilla.tools.types import ToolError, current_tool_context
+from opensquilla.tools.types import PlanAccess, ToolError, current_tool_context
 
 if TYPE_CHECKING:
     from opensquilla.skills.loader import SkillLoader
@@ -260,6 +260,7 @@ def create_skill_tools(
     @tool(
         name="skill_list",
         description="List all available skills with name, description, and eligibility.",
+        plan_access=PlanAccess.READ_ONLY,
     )
     async def skill_list() -> str:
         if _loader is None:
@@ -319,6 +320,7 @@ def create_skill_tools(
             },
         },
         required=["name"],
+        plan_access=PlanAccess.READ_ONLY,
     )
     async def skill_view(name: str, file_path: str | None = None) -> str:
         if _loader is None:
@@ -382,6 +384,7 @@ def create_skill_tools(
             },
         },
         required=["query"],
+        plan_access=PlanAccess.READ_ONLY,
     )
     async def skill_search_community(
         query: str,

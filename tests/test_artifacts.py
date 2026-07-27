@@ -411,6 +411,151 @@ async def test_publish_artifact_tool_allows_workspace_file_only(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_publish_artifact_requires_completed_attached_plan_run(
+    tmp_path: Path,
+) -> None:
+    class PlanStorage:
+        async def get_plan_run(self, run_id: str) -> SimpleNamespace:
+            assert run_id == "run-1"
+            return SimpleNamespace(
+                status="running",
+                current_step_id="verify",
+                active_task_id="task-1",
+            )
+
+    ctx = ToolContext(
+        workspace_dir=str(tmp_path),
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        task_id="task-1",
+        plan_run_id="run-1",
+        plan_storage=PlanStorage(),
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        with pytest.raises(RetryableToolInputError) as exc_info:
+            await publish_artifact(path="report.txt")
+    finally:
+        current_tool_context.reset(token)
+
+    message = exc_info.value.user_message
+    assert "was not executed" in message
+    assert "current step is verify" in message
+    assert "after the final checkpoint returns no current step" in message
+    assert ctx.published_artifacts == []
+
+
+@pytest.mark.asyncio
+async def test_publish_artifact_allows_completed_attached_plan_run(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "report.txt").write_text("ready", encoding="utf-8")
+
+    class PlanStorage:
+        async def get_plan_run(self, run_id: str) -> SimpleNamespace:
+            assert run_id == "run-1"
+            return SimpleNamespace(status="completed", current_step_id=None)
+
+    ctx = ToolContext(
+        workspace_dir=str(workspace),
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        plan_run_id="run-1",
+        plan_storage=PlanStorage(),
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        payload = json.loads(await publish_artifact(path="report.txt"))
+    finally:
+        current_tool_context.reset(token)
+
+    assert payload["status"] == "published"
+    assert len(ctx.published_artifacts) == 1
+
+
+@pytest.mark.asyncio
+async def test_publish_artifact_allows_delivery_ready_running_plan_run(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "report.txt").write_text("ready", encoding="utf-8")
+
+    class PlanStorage:
+        async def get_plan_run(self, run_id: str) -> SimpleNamespace:
+            assert run_id == "run-1"
+            return SimpleNamespace(
+                status="running",
+                current_step_id=None,
+                active_task_id="task-1",
+                step_states=[
+                    {"step_id": "build", "status": "completed"},
+                    {"step_id": "verify", "status": "skipped"},
+                ],
+            )
+
+    ctx = ToolContext(
+        workspace_dir=str(workspace),
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        task_id="task-1",
+        plan_run_id="run-1",
+        plan_storage=PlanStorage(),
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        payload = json.loads(await publish_artifact(path="report.txt"))
+    finally:
+        current_tool_context.reset(token)
+
+    assert payload["status"] == "published"
+    assert len(ctx.published_artifacts) == 1
+
+
+@pytest.mark.asyncio
+async def test_publish_artifact_rejects_paused_plan_run_without_retry(
+    tmp_path: Path,
+) -> None:
+    class PlanStorage:
+        async def get_plan_run(self, run_id: str) -> SimpleNamespace:
+            assert run_id == "run-1"
+            return SimpleNamespace(
+                status="paused",
+                current_step_id=None,
+                step_states=[{"step_id": "build", "status": "completed"}],
+            )
+
+    ctx = ToolContext(
+        workspace_dir=str(tmp_path),
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        plan_run_id="run-1",
+        plan_storage=PlanStorage(),
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        with pytest.raises(ToolError) as exc_info:
+            await publish_artifact(path="report.txt")
+    finally:
+        current_tool_context.reset(token)
+
+    assert not isinstance(exc_info.value, RetryableToolInputError)
+    assert "unavailable for this terminal or unowned PlanRun state" in str(
+        exc_info.value
+    )
+
+
+@pytest.mark.asyncio
 async def test_publish_artifact_tool_allows_large_installer_artifact(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

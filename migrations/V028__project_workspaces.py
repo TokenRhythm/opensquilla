@@ -1,10 +1,10 @@
-"""V025 - persistent project workspaces and optional session bindings."""
+"""V028 - persistent project workspaces and optional session bindings."""
 
 from __future__ import annotations
 
 from yoyo import step
 
-__depends__: set[str] = {"V024__usage_native_billing_receipts"}
+__depends__: set[str] = {"V027__plan_runs"}
 
 
 CREATE_PROJECT_WORKSPACES = """

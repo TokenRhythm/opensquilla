@@ -30,6 +30,14 @@ class InteractionMode(StrEnum):
     UNATTENDED = "unattended"
 
 
+class PlanAccess(StrEnum):
+    """Whether a tool may be exposed or dispatched while planning."""
+
+    DENY = "deny"
+    READ_ONLY = "read_only"
+    CONTROL = "control"
+
+
 @dataclass
 class ToolContext:
     """Constructed at the entry point, flows through to tool list building.
@@ -138,6 +146,32 @@ class ToolContext:
     # separate from ``is_owner`` prevents a generic owner-context leak from
     # promoting a channel caller through the admin-only tool matrix.
     channel_admin_verified: bool = False
+    # Collaboration mode frozen for this turn. Kept separate from run_mode:
+    # run_mode controls sandbox strength, while collaboration_mode constrains
+    # the agent's allowed intent. Unknown modes retain legacy/default behavior
+    # until the collaboration subsystem validates them at its boundary.
+    collaboration_mode: str = "default"
+    collaboration_revision: int = 0
+    active_plan_revision_id: str | None = None
+    # Present only for turns created by ``plans.implement`` (and, later, a
+    # Goal driver). Ordinary Default turns deliberately have no PlanRun.
+    plan_run_id: str | None = None
+    # Runtime-only services are injected after durable turn acceptance. They
+    # must never be serialized into task details or route metadata.
+    plan_storage: Any | None = field(default=None, repr=False)
+    plan_event_emitter: (
+        Callable[[str, str, dict[str, Any]], Awaitable[None]] | None
+    ) = field(default=None, repr=False)
+    # Runtime-owned deferred interaction service. It returns structured answers
+    # to the exact tool call instead of injecting a new user turn.
+    user_input_provider: Any | None = field(default=None, repr=False)
+    # Immutable, validated PlanRevision selected for this turn. This is a
+    # process-local prompt input and is never serialized into task metadata.
+    plan_revision: Any | None = field(default=None, repr=False)
+    # Authoritative mutable PlanRun snapshot captured after this task claims the
+    # run. Runtime-only prompt input; checkpoint tools continue to read live
+    # storage for compare-and-set transitions.
+    plan_run: Any | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.validate_path_roots()
@@ -238,6 +272,13 @@ class ToolSpec:
     # Parameters injected only by the runtime after approval. They remain in
     # the Python handler signature/spec but are omitted from provider schemas.
     runtime_only_arguments: frozenset[str] = field(default_factory=frozenset)
+    # Fail closed for newly registered built-ins, plugins, and MCP bridges.
+    # Read/control access must be granted explicitly by the tool owner.
+    plan_access: PlanAccess = PlanAccess.DENY
+    # Control tools may end the current model tool loop after their result is
+    # persisted. The dispatcher owns this behavior; handlers must not emulate
+    # it with tool-name branches.
+    terminates_turn: bool = False
 
 
 # Registered tool implementation: async fn that accepts keyword args and returns str.

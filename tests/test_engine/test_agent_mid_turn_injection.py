@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -7,7 +8,8 @@ import pytest
 
 from opensquilla.engine import Agent, AgentConfig, ToolResult
 from opensquilla.engine.agent_injection import ListPendingInputProvider
-from opensquilla.engine.types import ToolCall
+from opensquilla.engine.types import ToolCall, ToolResultEvent
+from opensquilla.gateway.user_input_broker import StructuredUserInputBroker
 from opensquilla.provider import (
     ChatConfig,
     ContentBlockText,
@@ -27,6 +29,7 @@ from opensquilla.provider import (
 from opensquilla.provider import (
     ToolUseStartEvent as ProviderToolUseStart,
 )
+from opensquilla.tools.types import ToolContext
 
 
 class _ToolBoundaryProvider:
@@ -270,3 +273,272 @@ async def test_pending_input_is_not_drained_without_a_tool_completion_boundary()
     assert len(provider.calls) == 1
     assert len(pending) == 1
     assert not _text_messages(agent._history, ["NO_BOUNDARY"])
+
+
+class _DeferredUserInputProvider(_ToolBoundaryProvider):
+    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
+        if call_number == 1:
+            yield ProviderToolUseStart(
+                tool_use_id="request-1",
+                tool_name="request_user_input",
+            )
+            yield ProviderToolUseEnd(
+                tool_use_id="request-1",
+                tool_name="request_user_input",
+                arguments={"questions": [{"id": "scope"}]},
+            )
+            yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
+            return
+        yield ProviderText(text="plan complete")
+        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
+
+
+class _ControlBoundaryProvider(_ToolBoundaryProvider):
+    def __init__(self, tool_calls: list[tuple[str, str, dict[str, Any]]]) -> None:
+        super().__init__()
+        self._tool_calls = tool_calls
+
+    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
+        if call_number == 1:
+            for tool_use_id, tool_name, arguments in self._tool_calls:
+                yield ProviderToolUseStart(
+                    tool_use_id=tool_use_id,
+                    tool_name=tool_name,
+                )
+                yield ProviderToolUseEnd(
+                    tool_use_id=tool_use_id,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                )
+            yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
+            return
+        yield ProviderText(text="continued")
+        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
+
+
+@pytest.mark.asyncio
+async def test_terminal_control_tool_prevents_later_batch_calls_from_dispatching() -> None:
+    provider = _ControlBoundaryProvider(
+        [
+            (
+                "checkpoint-1",
+                "plan_run_checkpoint",
+                {"step_id": "verify", "step_status": "blocked"},
+            ),
+            ("write-1", "write_file", {"path": "must-not-run"}),
+        ]
+    )
+    dispatched: list[str] = []
+
+    async def _handler(call: ToolCall) -> ToolResult:
+        dispatched.append(call.tool_name)
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content=json.dumps({"status": "blocked"}),
+            terminates_turn=call.tool_name == "plan_run_checkpoint",
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_iterations=3),
+        tool_definitions=[
+            _tool_def("plan_run_checkpoint"),
+            _tool_def("write_file"),
+        ],
+        tool_handler=_handler,
+    )
+
+    events = [event async for event in agent.run_turn("implement the plan")]
+
+    assert dispatched == ["plan_run_checkpoint"]
+    assert len(provider.calls) == 1
+    results = [event for event in events if isinstance(event, ToolResultEvent)]
+    assert [event.tool_use_id for event in results] == ["checkpoint-1", "write-1"]
+    assert json.loads(results[1].result) == {
+        "status": "not_executed",
+        "reason": "prior_tool_dispatch_boundary",
+        "boundary_tool": "plan_run_checkpoint",
+        "boundary_tool_use_id": "checkpoint-1",
+    }
+    assert results[1].is_error is True
+
+
+@pytest.mark.asyncio
+async def test_deferred_user_input_resumes_same_tool_call_without_user_injection() -> None:
+    provider = _DeferredUserInputProvider()
+    broker = StructuredUserInputBroker()
+
+    async def _request_user_input(call: ToolCall) -> ToolResult:
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content=json.dumps(
+                {
+                    "status": "input_required",
+                    "kind": "user_input",
+                    "paused": True,
+                    "clarify_schema": {
+                        "fields": [
+                            {
+                                "name": "scope",
+                                "type": "enum",
+                                "required": True,
+                                "choices": ["Core", "Full"],
+                            }
+                        ]
+                    },
+                }
+            ),
+            terminates_turn=True,
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_iterations=3),
+        tool_definitions=[_tool_def("request_user_input")],
+        tool_handler=_request_user_input,
+        session_key="agent:main:webchat:deferred-input",
+        tool_context=ToolContext(
+            session_key="agent:main:webchat:deferred-input",
+            task_id="task-1",
+            user_input_provider=broker,
+        ),
+    )
+
+    stream = agent.run_turn("make a plan")
+    events = []
+    async for event in stream:
+        events.append(event)
+        if isinstance(event, ToolResultEvent):
+            payload = json.loads(event.result)
+            if payload.get("status") == "input_required":
+                assert len(provider.calls) == 1
+                assert payload["request_id"]
+                broker.resolve(
+                    session_key="agent:main:webchat:deferred-input",
+                    request_id=payload["request_id"],
+                    fields={"scope": "Core"},
+                )
+
+    tool_results = [
+        event for event in events if isinstance(event, ToolResultEvent)
+    ]
+    assert [event.tool_use_id for event in tool_results] == [
+        "request-1",
+        "request-1",
+    ]
+    assert json.loads(tool_results[0].result)["status"] == "input_required"
+    assert json.loads(tool_results[1].result) == {
+        "status": "answered",
+        "kind": "user_input",
+        "paused": False,
+        "request_id": json.loads(tool_results[0].result)["request_id"],
+        "answers": {"scope": "Core"},
+    }
+    assert len(provider.calls) == 2
+    second_request = provider.calls[1]
+    result_message = next(
+        message for message in second_request if _is_tool_result_message(message)
+    )
+    result_block = next(
+        block
+        for block in result_message.content
+        if getattr(block, "type", None) == "tool_result"
+    )
+    assert json.loads(result_block.content)["answers"] == {"scope": "Core"}
+    assert not any(
+        message.role == "user" and _text_block_texts(message) == ["Core"]
+        for message in second_request
+    )
+
+
+@pytest.mark.asyncio
+async def test_deferred_user_input_defers_later_batch_calls_until_after_answer() -> None:
+    provider = _ControlBoundaryProvider(
+        [
+            (
+                "request-1",
+                "request_user_input",
+                {"questions": [{"id": "scope"}]},
+            ),
+            ("write-1", "write_file", {"path": "must-not-run-before-answer"}),
+        ]
+    )
+    broker = StructuredUserInputBroker()
+    dispatched: list[str] = []
+
+    async def _handler(call: ToolCall) -> ToolResult:
+        dispatched.append(call.tool_name)
+        if call.tool_name != "request_user_input":
+            raise AssertionError("tail tool crossed the user-input dispatch boundary")
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content=json.dumps(
+                {
+                    "status": "input_required",
+                    "kind": "user_input",
+                    "paused": True,
+                    "clarify_schema": {
+                        "fields": [
+                            {
+                                "name": "scope",
+                                "type": "enum",
+                                "required": True,
+                                "choices": ["Core", "Full"],
+                            }
+                        ]
+                    },
+                }
+            ),
+            terminates_turn=True,
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_iterations=3),
+        tool_definitions=[
+            _tool_def("request_user_input"),
+            _tool_def("write_file"),
+        ],
+        tool_handler=_handler,
+        session_key="agent:main:webchat:deferred-boundary",
+        tool_context=ToolContext(
+            session_key="agent:main:webchat:deferred-boundary",
+            task_id="task-boundary",
+            user_input_provider=broker,
+        ),
+    )
+
+    events = []
+    async for event in agent.run_turn("make a plan"):
+        events.append(event)
+        if isinstance(event, ToolResultEvent):
+            payload = json.loads(event.result)
+            if payload.get("status") == "input_required":
+                broker.resolve(
+                    session_key="agent:main:webchat:deferred-boundary",
+                    request_id=payload["request_id"],
+                    fields={"scope": "Core"},
+                )
+
+    assert dispatched == ["request_user_input"]
+    assert len(provider.calls) == 2
+    results = [event for event in events if isinstance(event, ToolResultEvent)]
+    assert [event.tool_use_id for event in results] == [
+        "request-1",
+        "request-1",
+        "write-1",
+    ]
+    assert json.loads(results[2].result)["status"] == "not_executed"
+    second_result_message = next(
+        message for message in provider.calls[1] if _is_tool_result_message(message)
+    )
+    second_results = {
+        block.tool_use_id: json.loads(block.content)
+        for block in second_result_message.content
+        if getattr(block, "type", None) == "tool_result"
+    }
+    assert second_results["request-1"]["answers"] == {"scope": "Core"}
+    assert second_results["write-1"]["status"] == "not_executed"

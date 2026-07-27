@@ -25,7 +25,7 @@ import inspect
 import time
 import uuid
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, TypeVar, cast
@@ -532,6 +532,9 @@ class TaskRuntime:
         self._running_heartbeat_interval_s = running_heartbeat_interval_s
         self._accepted_config_provider = accepted_config_provider
         self._pending_overflow_policy = pending_overflow_policy
+        from opensquilla.gateway.user_input_broker import StructuredUserInputBroker
+
+        self._user_input_broker = StructuredUserInputBroker()
         # Per-session write locks shared with TurnRunner and RPC ingress on
         # gateway-dispatched turns. These guard short transcript/session state
         # mutations only.
@@ -1375,6 +1378,29 @@ class TaskRuntime:
                 return None
             return task.task_id
 
+    async def resolve_user_input(
+        self,
+        *,
+        session_key: str,
+        request_id: str,
+        fields: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Resolve one structured interaction without creating a new turn."""
+
+        return self._user_input_broker.resolve(
+            session_key=session_key,
+            request_id=request_id,
+            fields=fields,
+        )
+
+    def pending_user_inputs(
+        self,
+        session_key: str,
+    ) -> builtins.list[dict[str, Any]]:
+        """Return public pending-interaction payloads for reconnect hydration."""
+
+        return self._user_input_broker.pending_for_session(session_key)
+
     async def _update_transcript_turn_context(
         self,
         session_key: str,
@@ -2061,6 +2087,7 @@ class TaskRuntime:
                     acquired = True
                     async with write_lock:
                         pass
+                    await self._freeze_collaboration_context(task)
                     heartbeat_task = self._start_running_heartbeat(task)
                     metadata = task.envelope.metadata
                     turn_context = {
@@ -2074,6 +2101,25 @@ class TaskRuntime:
                         ),
                         "revision": int(metadata.get("turn_context_revision", 1) or 1),
                     }
+                    if (
+                        metadata.get("collaboration_mode") == "plan"
+                        or int(metadata.get("collaboration_revision", 0) or 0) > 0
+                        or metadata.get("active_plan_revision_id")
+                        or metadata.get("plan_run_id")
+                    ):
+                        turn_context["collaboration_mode"] = metadata.get(
+                            "collaboration_mode",
+                            "default",
+                        )
+                        turn_context["collaboration_revision"] = int(
+                            metadata.get("collaboration_revision", 0) or 0
+                        )
+                    if metadata.get("active_plan_revision_id"):
+                        turn_context["active_plan_revision_id"] = metadata[
+                            "active_plan_revision_id"
+                        ]
+                    if metadata.get("plan_run_id"):
+                        turn_context["plan_run_id"] = metadata["plan_run_id"]
                     for field in ("target_turn_id", "promoted_from_turn_id"):
                         value = metadata.get(field)
                         if isinstance(value, str) and value:
@@ -2135,6 +2181,7 @@ class TaskRuntime:
                             run,
                             write_lock=write_lock,
                         )
+                    await self._emit_plan_revision_if_changed(task)
                     await self._record_drained_steers(task)
                     if heartbeat_task is not None:
                         await self._stop_running_heartbeat(heartbeat_task)
@@ -2227,6 +2274,375 @@ class TaskRuntime:
                 error_message=str(exc),
             )
             await self._promote_reclaimed_steers(task)
+        finally:
+            self._user_input_broker.cancel_task(task.task_id)
+            await self._settle_attached_plan_run(task)
+
+    async def _freeze_collaboration_context(self, task: _RuntimeTask) -> None:
+        """Snapshot session collaboration state at the actual turn boundary.
+
+        A queued task intentionally does not capture Plan/Default at admission:
+        a user may toggle while earlier work is still running. Once this task
+        owns both the same-session execution lane and a global slot, the
+        snapshot is immutable for the complete provider/tool loop.
+        """
+
+        metadata = dict(task.envelope.metadata)
+        getter = getattr(self._storage, "get_session", None)
+        node = None
+        if callable(getter):
+            candidate = getter(task.envelope.session_key)
+            node = await candidate if inspect.isawaitable(candidate) else candidate
+        stored_mode = getattr(node, "collaboration_mode", None)
+        stored_revision = getattr(node, "collaboration_revision", None)
+        if stored_mode in {"default", "plan"} and isinstance(stored_revision, int):
+            metadata["collaboration_mode"] = stored_mode
+            metadata["collaboration_revision"] = stored_revision
+            active_revision = getattr(node, "active_plan_revision_id", None)
+            if isinstance(active_revision, str) and active_revision:
+                metadata["active_plan_revision_id"] = str(active_revision)
+            else:
+                metadata.pop("active_plan_revision_id", None)
+        else:
+            metadata.setdefault("collaboration_mode", "default")
+            metadata.setdefault("collaboration_revision", 0)
+        required_mode = metadata.get("required_collaboration_mode")
+        if required_mode is not None:
+            if required_mode not in {"default", "plan"}:
+                raise RuntimeError("Invalid required collaboration mode")
+            # Explicit Plan operations own their turn capability. A sticky mode
+            # toggle made while they wait applies to later ordinary turns; it
+            # cannot turn an implementation into a read-only Plan turn, or a
+            # replan into a write-capable Default turn.
+            metadata["collaboration_mode"] = required_mode
+        required_revision = metadata.get("required_collaboration_revision")
+        if required_revision is not None:
+            if (
+                not isinstance(required_revision, int)
+                or isinstance(required_revision, bool)
+                or required_revision < 0
+            ):
+                raise RuntimeError("Invalid required collaboration revision")
+            metadata["collaboration_revision"] = required_revision
+        metadata["task_id"] = task.task_id
+        runtime_services = {
+            **task.envelope.runtime_services,
+            "plan_storage": self._storage,
+            "plan_event_emitter": self._emit,
+        }
+        # WebChat has a request-id response RPC and reconnect hydration. Other
+        # interactive surfaces retain the terminating compatibility protocol
+        # until they expose the same reply transport; injecting a waiter there
+        # would strand the turn behind its own session execution lock.
+        if task.envelope.source_kind is SourceKind.WEB:
+            runtime_services["user_input_provider"] = self._user_input_broker
+        attached_run_id = str(metadata.get("plan_run_id") or "").strip()
+        if attached_run_id and not str(
+            metadata.get("plan_revision_id") or ""
+        ).strip():
+            get_plan_run = getattr(self._storage, "get_plan_run", None)
+            if not callable(get_plan_run):
+                raise RuntimeError("PlanRun storage is unavailable")
+            run_candidate = get_plan_run(attached_run_id)
+            attached_run = (
+                await run_candidate
+                if inspect.isawaitable(run_candidate)
+                else run_candidate
+            )
+            if attached_run is None:
+                raise RuntimeError("The accepted PlanRun no longer exists")
+            if str(getattr(attached_run, "session_key", "") or "") != (
+                task.envelope.session_key
+            ):
+                raise RuntimeError("The accepted PlanRun belongs to another session")
+            derived_revision_id = str(
+                getattr(attached_run, "plan_revision_id", "") or ""
+            ).strip()
+            if not derived_revision_id:
+                raise RuntimeError("The accepted PlanRun lost its PlanRevision binding")
+            # Goal controllers only need to attach their durable run id. The
+            # immutable revision is derived authoritatively instead of copied
+            # into every future attempt envelope.
+            metadata["plan_revision_id"] = derived_revision_id
+        requested_revision_id = str(
+            metadata.get("plan_revision_id")
+            or (
+                metadata.get("active_plan_revision_id")
+                if metadata.get("collaboration_mode") == "plan"
+                else ""
+            )
+            or ""
+        ).strip()
+        if requested_revision_id:
+            active_revision_id = str(
+                getattr(node, "active_plan_revision_id", "") or ""
+            )
+            if (
+                bool(metadata.get("require_current_plan_revision"))
+                and active_revision_id != requested_revision_id
+            ):
+                raise RuntimeError(
+                    "The selected plan revision is no longer current"
+                )
+            get_revision = getattr(self._storage, "get_plan_revision", None)
+            if not callable(get_revision):
+                raise RuntimeError("PlanRevision storage is unavailable")
+            revision_candidate = get_revision(requested_revision_id)
+            plan_revision = (
+                await revision_candidate
+                if inspect.isawaitable(revision_candidate)
+                else revision_candidate
+            )
+            if plan_revision is None:
+                raise RuntimeError("The selected plan revision no longer exists")
+            runtime_services["plan_revision"] = plan_revision
+        previous_envelope = task.envelope
+        task.envelope = replace(
+            task.envelope,
+            metadata=metadata,
+            runtime_services=runtime_services,
+        )
+        # ``_last_envelope_by_session`` uses identity to avoid deleting a
+        # newer queued envelope during terminal cleanup.  Preserve that
+        # invariant when this turn replaces its envelope with the frozen
+        # collaboration snapshot.
+        async with self._state_lock:
+            if (
+                self._last_envelope_by_session.get(task.envelope.session_key)
+                is previous_envelope
+            ):
+                self._last_envelope_by_session[task.envelope.session_key] = task.envelope
+        if metadata["collaboration_mode"] == "plan":
+            task.no_memory_capture = True
+        plan_run = await self._start_attached_plan_run(task)
+        if plan_run is not None:
+            previous_envelope = task.envelope
+            task.envelope = replace(
+                task.envelope,
+                runtime_services={
+                    **task.envelope.runtime_services,
+                    "plan_run": plan_run,
+                },
+            )
+            async with self._state_lock:
+                if (
+                    self._last_envelope_by_session.get(task.envelope.session_key)
+                    is previous_envelope
+                ):
+                    self._last_envelope_by_session[task.envelope.session_key] = task.envelope
+
+    async def _start_attached_plan_run(self, task: _RuntimeTask) -> Any | None:
+        run_id = str(task.envelope.metadata.get("plan_run_id") or "").strip()
+        if not run_id:
+            return None
+        getter = getattr(self._storage, "get_plan_run", None)
+        mark_running = getattr(self._storage, "mark_plan_run_running", None)
+        if not callable(getter) or not callable(mark_running):
+            raise RuntimeError("PlanRun storage is unavailable")
+        current = await getter(run_id)
+        if current is None:
+            raise RuntimeError("The accepted PlanRun no longer exists")
+        if str(getattr(current, "session_key", "") or "") != (
+            task.envelope.session_key
+        ):
+            raise RuntimeError("The accepted PlanRun belongs to another session")
+        expected_revision_id = str(
+            task.envelope.metadata.get("plan_revision_id") or ""
+        ).strip()
+        if (
+            expected_revision_id
+            and str(getattr(current, "plan_revision_id", "") or "")
+            != expected_revision_id
+        ):
+            raise RuntimeError("The accepted PlanRun changed its PlanRevision binding")
+        updated = await mark_running(
+            run_id,
+            expected_state_revision=int(current.state_revision),
+            active_task_id=task.task_id,
+        )
+        await self._emit_plan_run(task.envelope.session_key, updated)
+        if str(getattr(updated, "status", "")) != "running":
+            raise RuntimeError("The selected plan revision is no longer executable")
+        return updated
+
+    async def _settle_attached_plan_run(self, task: _RuntimeTask) -> None:
+        """Pause an unfinished manual run when its single turn terminates."""
+
+        run_id = str(task.envelope.metadata.get("plan_run_id") or "").strip()
+        if not run_id:
+            return
+        getter = getattr(self._storage, "get_plan_run", None)
+        complete = getattr(self._storage, "complete_plan_run", None)
+        pause = getattr(self._storage, "pause_plan_run", None)
+        cancel = getattr(self._storage, "cancel_plan_run", None)
+        if not callable(getter):
+            return
+        try:
+            current = await getter(run_id)
+            if current is None:
+                return
+            status = str(getattr(current, "status", ""))
+            if status == "queued" and callable(cancel):
+                updated = await cancel(
+                    run_id,
+                    expected_state_revision=int(current.state_revision),
+                    reason="implementation_turn_ended_before_start",
+                    expected_active_task_id=task.task_id,
+                )
+            elif status == "running" and callable(pause):
+                driver_kind = str(getattr(current, "driver_kind", "manual"))
+                step_states = list(getattr(current, "step_states", []) or [])
+                delivery_ready = (
+                    getattr(current, "current_step_id", None) is None
+                    and bool(step_states)
+                    and all(
+                        isinstance(state, dict)
+                        and str(state.get("status") or "")
+                        in {"completed", "skipped"}
+                        for state in step_states
+                    )
+                )
+                if (
+                    task.status == AgentTaskStatus.SUCCEEDED
+                    and delivery_ready
+                    and callable(complete)
+                ):
+                    updated = await complete(
+                        run_id,
+                        expected_state_revision=int(current.state_revision),
+                        expected_active_task_id=task.task_id,
+                    )
+                    await self._emit_plan_run(task.envelope.session_key, updated)
+                    return
+                task_outcome = str(
+                    getattr(task.status, "value", task.status) or "unknown"
+                )
+                updated = await pause(
+                    run_id,
+                    expected_state_revision=int(current.state_revision),
+                    reason=(
+                        (
+                            "manual_turn_finished"
+                            if driver_kind == "manual"
+                            else "goal_turn_finished"
+                        )
+                        if task.status == AgentTaskStatus.SUCCEEDED
+                        else f"{driver_kind}_turn_{task_outcome}"
+                    ),
+                    expected_active_task_id=task.task_id,
+                    expected_driver_kind=driver_kind,
+                    expected_driver_id=(
+                        str(getattr(current, "driver_id", "") or "") or None
+                    ),
+                )
+            else:
+                return
+            await self._emit_plan_run(task.envelope.session_key, updated)
+        except Exception:  # noqa: BLE001 - plan overlay must not mask task terminal state
+            log.warning(
+                "task_runtime.plan_run_settle_failed",
+                session_key=task.envelope.session_key,
+                task_id=task.task_id,
+                plan_run_id=run_id,
+                exc_info=True,
+            )
+
+    async def _emit_plan_run(self, session_key: str, run: Any) -> None:
+        from opensquilla.session.plans import plan_run_snapshot
+
+        await self._emit(
+            session_key,
+            "session.event.plan_run",
+            {
+                "session_key": session_key,
+                "plan_run": plan_run_snapshot(run),
+            },
+        )
+
+    async def _emit_plan_revision_if_changed(self, task: _RuntimeTask) -> None:
+        getter = getattr(self._storage, "get_session", None)
+        get_revision = getattr(self._storage, "get_plan_revision", None)
+        if not callable(getter) or not callable(get_revision):
+            return
+        try:
+            node_candidate = getter(task.envelope.session_key)
+            node = (
+                await node_candidate
+                if inspect.isawaitable(node_candidate)
+                else node_candidate
+            )
+            if getattr(node, "active_plan_revision_id", None) is not None and not isinstance(
+                getattr(node, "active_plan_revision_id", None),
+                str,
+            ):
+                return
+            current_id = (
+                str(getattr(node, "active_plan_revision_id", "") or "")
+                if node is not None
+                else ""
+            )
+            starting_id = str(
+                task.envelope.metadata.get("active_plan_revision_id") or ""
+            )
+            if not current_id or current_id == starting_id:
+                return
+            revision_candidate = get_revision(current_id)
+            revision = (
+                await revision_candidate
+                if inspect.isawaitable(revision_candidate)
+                else revision_candidate
+            )
+            if revision is None:
+                return
+            from opensquilla.session.plans import plan_revision_snapshot
+
+            await self._emit(
+                task.envelope.session_key,
+                "session.event.plan_revision",
+                {
+                    "session_key": task.envelope.session_key,
+                    "plan_revision": plan_revision_snapshot(
+                        revision,
+                        current=True,
+                    ),
+                    "collaboration": {
+                        "mode": str(
+                            getattr(node, "collaboration_mode", "default")
+                            or "default"
+                        ),
+                        "revision": int(
+                            getattr(node, "collaboration_revision", 0) or 0
+                        ),
+                    },
+                },
+            )
+            # Committing a revision also advances the collaboration CAS
+            # revision.  Publish the authoritative snapshot so clients do not
+            # have to guess that increment before their next mode mutation.
+            await self._emit(
+                task.envelope.session_key,
+                "session.event.collaboration_mode",
+                {
+                    "session_key": task.envelope.session_key,
+                    "collaboration": {
+                        "mode": str(
+                            getattr(node, "collaboration_mode", "default")
+                            or "default"
+                        ),
+                        "revision": int(
+                            getattr(node, "collaboration_revision", 0) or 0
+                        ),
+                        "appliesTo": "next_turn",
+                    },
+                },
+            )
+        except Exception:  # noqa: BLE001 - observer must not change task result
+            log.warning(
+                "task_runtime.plan_revision_emit_failed",
+                session_key=task.envelope.session_key,
+                task_id=task.task_id,
+                exc_info=True,
+            )
 
     async def _promote_reclaimed_steers(self, task: _RuntimeTask) -> None:
         """Preserve accepted input when a non-cancel terminal path wins a race."""

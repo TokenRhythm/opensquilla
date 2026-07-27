@@ -1058,15 +1058,21 @@ def test_warning_handler_forwards_through_transformer() -> None:
     assert state.current_text_parts == ["keep"]
 
 
-def test_warning_handler_discards_superseded_workspace_recovery_text() -> None:
+@pytest.mark.parametrize(
+    "warning_code",
+    ["workspace_diff_recovery", "plan_run_reconciliation"],
+)
+def test_warning_handler_discards_superseded_recovery_text(
+    warning_code: str,
+) -> None:
     state = _make_state()
     state.final_text_parts = ["Earlier.", "Implemented the fix."]
     state.current_text_parts = ["Implemented the fix."]
 
     handler = _WarningHandler(lambda event: event)
-    out = handler.handle(WarningEvent(code="workspace_diff_recovery", message="m"), state)
+    out = handler.handle(WarningEvent(code=warning_code, message="m"), state)
 
-    assert out.code == "workspace_diff_recovery"
+    assert out.code == warning_code
     assert state.final_text_parts == ["Earlier."]
     assert state.current_text_parts == []
 
@@ -1425,6 +1431,99 @@ def _make_publish_tool_context(tmp_path: Path) -> tuple[ToolContext, Path]:
         ],
     )
     return ctx, media_root
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "run_status",
+        "current_step_id",
+        "step_status",
+        "active_task_id",
+        "expected_artifact_count",
+    ),
+    [
+        pytest.param(
+            "running",
+            "step-1",
+            "in_progress",
+            "task-artifact",
+            0,
+            id="running-current-step",
+        ),
+        pytest.param(
+            "running",
+            None,
+            "completed",
+            "task-artifact",
+            1,
+            id="running-delivery-ready-owner",
+        ),
+        pytest.param(
+            "running",
+            None,
+            "completed",
+            "other-task",
+            0,
+            id="running-delivery-ready-other-owner",
+        ),
+        pytest.param(
+            "completed",
+            None,
+            "completed",
+            None,
+            1,
+            id="completed",
+        ),
+    ],
+)
+async def test_plan_run_auto_publish_requires_live_delivery_ready_state(
+    tmp_path: Path,
+    run_status: str,
+    current_step_id: str | None,
+    step_status: str,
+    active_task_id: str | None,
+    expected_artifact_count: int,
+) -> None:
+    class PlanStorage:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def get_plan_run(self, run_id: str) -> SimpleNamespace:
+            self.calls.append(run_id)
+            return SimpleNamespace(
+                status=run_status,
+                current_step_id=current_step_id,
+                active_task_id=active_task_id,
+                step_states=[
+                    {
+                        "step_id": "step-1",
+                        "title": "Create report",
+                        "status": step_status,
+                    }
+                ],
+            )
+
+    ctx, _media_root = _make_publish_tool_context(tmp_path)
+    storage = PlanStorage()
+    ctx.task_id = "task-artifact"
+    ctx.plan_run_id = "run-artifact"
+    ctx.plan_storage = storage
+    state = _make_state()
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="Wrote report.csv"),
+                DoneEvent(text="Wrote report.csv"),
+            ]
+        )
+    )
+
+    await _drain(stage, _make_input(state=state, tool_context=ctx))
+
+    assert storage.calls == ["run-artifact"]
+    assert len(ctx.published_artifacts) == expected_artifact_count
+    assert state.turn_artifacts == ctx.published_artifacts
 
 
 def _gate_real_publish(

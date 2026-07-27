@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import json
 import tracemalloc
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
@@ -20,10 +21,26 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from opensquilla.engine.runtime import TurnRunner
 from opensquilla.gateway import task_runtime
-from opensquilla.gateway.routing import RouteEnvelope, SourceKind
+from opensquilla.gateway.auth import Principal
+from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.routing import (
+    RouteEnvelope,
+    SourceKind,
+    tool_context_from_envelope,
+)
+from opensquilla.gateway.rpc import RpcContext
+from opensquilla.gateway.rpc_sessions import _handle_plans_cancel_run
 from opensquilla.gateway.task_runtime import TaskRuntime
-from opensquilla.session.models import AgentTaskRecord
+from opensquilla.session.manager import SessionManager
+from opensquilla.session.models import (
+    AgentTaskRecord,
+    PlanRevisionRecord,
+    PlanRunRecord,
+    SessionNode,
+)
+from opensquilla.session.storage import SessionStorage
 from opensquilla.session.turn_context import current_turn_context
 
 # ---------------------------------------------------------------------------
@@ -120,6 +137,409 @@ async def test_terminal_clears_all_dicts() -> None:
     # _session_locks is intentionally retained: never pop while _execute may
     # still hold the lock; prevents split-brain on rapid re-enqueue.
     assert sk not in rt._last_envelope_by_session
+
+
+async def _make_durable_plan_run(
+    *,
+    session_key: str,
+    run_id: str,
+    task_id: str,
+    driver_kind: str = "manual",
+    driver_id: str | None = None,
+) -> tuple[SessionStorage, PlanRunRecord]:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    node = SessionNode(
+        session_key=session_key,
+        session_id="session-plan-runtime",
+        agent_id="agent-1",
+        created_at=100,
+        updated_at=100,
+    )
+    await storage.upsert_session(node)
+    revision = await storage.create_plan_revision(
+        PlanRevisionRecord(
+            revision_id="revision-plan-runtime",
+            plan_id="plan-runtime",
+            generation=1,
+            source_session_key=session_key,
+            source_session_id=node.session_id,
+            source_epoch=0,
+            source_message_id="assistant-plan-runtime",
+            title="Runtime plan",
+            markdown="## Runtime plan",
+            steps=[
+                {"step_id": "inspect", "title": "Inspect"},
+                {"step_id": "implement", "title": "Implement"},
+            ],
+            content_hash="",
+            created_at=101,
+        ),
+        expected_parent_revision_id=None,
+    )
+    run = await storage.start_plan_run(
+        PlanRunRecord(
+            run_id=run_id,
+            session_key=session_key,
+            session_id=node.session_id,
+            session_epoch=0,
+            plan_revision_id=revision.revision_id,
+            driver_kind=driver_kind,
+            driver_id=driver_id,
+            status="queued",
+            active_task_id=task_id,
+            created_at=102,
+            updated_at=102,
+        )
+    )
+    return storage, run
+
+
+@pytest.mark.asyncio
+async def test_plan_run_is_running_only_during_its_execution_turn() -> None:
+    session_key = "agent-1::plan-runtime"
+    task_id = "task-plan-runtime"
+    storage, run = await _make_durable_plan_run(
+        session_key=session_key,
+        run_id="run-plan-runtime",
+        task_id=task_id,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    observed_statuses: list[str] = []
+    events: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _handler(_run: Any) -> None:
+        current = await storage.get_plan_run(run.run_id)
+        assert current is not None
+        observed_statuses.append(current.status)
+        entered.set()
+        await release.wait()
+
+    async def _emit(session: str, name: str, payload: dict[str, Any]) -> None:
+        events.append((session, name, payload))
+
+    rt = TaskRuntime(storage=storage, turn_handler=_handler, event_emitter=_emit)
+    envelope = replace(
+        _make_envelope(session_key),
+        metadata={"plan_run_id": run.run_id},
+    )
+    handle = await rt.enqueue(envelope, "Implement the plan", task_id=task_id)
+    await asyncio.wait_for(entered.wait(), timeout=2.0)
+
+    running = await storage.get_plan_run(run.run_id)
+    assert running is not None
+    assert running.status == "running"
+    assert running.current_step_id == "inspect"
+    assert running.step_states[0]["status"] == "in_progress"
+    assert observed_statuses == ["running"]
+
+    release.set()
+    await rt.wait(handle.task_id, timeout=2.0)
+    paused = await storage.get_plan_run(run.run_id)
+    assert paused is not None
+    assert paused.status == "paused"
+    assert paused.active_task_id is None
+    assert [
+        payload["plan_run"]["status"]
+        for _session, name, payload in events
+        if name == "session.event.plan_run"
+    ] == ["running", "paused"]
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_plan_run_completes_only_after_owning_task_succeeds() -> None:
+    session_key = "agent-1::plan-runtime-complete"
+    task_id = "task-plan-runtime-complete"
+    storage, run = await _make_durable_plan_run(
+        session_key=session_key,
+        run_id="run-plan-runtime-complete",
+        task_id=task_id,
+    )
+    observed_after_final_checkpoint: list[tuple[str, str | None, str | None]] = []
+
+    async def _handler(_run: Any) -> None:
+        current = await storage.get_plan_run(run.run_id)
+        assert current is not None
+        advanced = await storage.checkpoint_plan_run(
+            run.run_id,
+            expected_state_revision=current.state_revision,
+            expected_active_task_id=task_id,
+            step_id="inspect",
+            step_status="completed",
+        )
+        final_checkpoint = await storage.checkpoint_plan_run(
+            run.run_id,
+            expected_state_revision=advanced.state_revision,
+            expected_active_task_id=task_id,
+            step_id="implement",
+            step_status="completed",
+        )
+        observed_after_final_checkpoint.append(
+            (
+                final_checkpoint.status,
+                final_checkpoint.current_step_id,
+                final_checkpoint.active_task_id,
+            )
+        )
+
+    runtime = TaskRuntime(storage=storage, turn_handler=_handler)
+    handle = await runtime.enqueue(
+        replace(
+            _make_envelope(session_key),
+            metadata={"plan_run_id": run.run_id},
+        ),
+        "Implement the plan",
+        task_id=task_id,
+    )
+
+    task = await runtime.wait(handle.task_id, timeout=2.0)
+    completed = await storage.get_plan_run(run.run_id)
+
+    assert str(task.status) == "succeeded"
+    assert observed_after_final_checkpoint == [("running", None, task_id)]
+    assert completed is not None
+    assert completed.status == "completed"
+    assert completed.active_task_id is None
+    assert completed.finished_at is not None
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_delivery_after_final_checkpoint_remains_resumable() -> None:
+    session_key = "agent-1::plan-runtime-delivery-failure"
+    task_id = "task-plan-runtime-delivery-failure"
+    storage, run = await _make_durable_plan_run(
+        session_key=session_key,
+        run_id="run-plan-runtime-delivery-failure",
+        task_id=task_id,
+    )
+
+    async def _handler(_run: Any) -> None:
+        current = await storage.get_plan_run(run.run_id)
+        assert current is not None
+        advanced = await storage.checkpoint_plan_run(
+            run.run_id,
+            expected_state_revision=current.state_revision,
+            expected_active_task_id=task_id,
+            step_id="inspect",
+            step_status="completed",
+        )
+        final_checkpoint = await storage.checkpoint_plan_run(
+            run.run_id,
+            expected_state_revision=advanced.state_revision,
+            expected_active_task_id=task_id,
+            step_id="implement",
+            step_status="completed",
+        )
+        assert final_checkpoint.status == "running"
+        assert final_checkpoint.current_step_id is None
+        raise RuntimeError("artifact delivery failed")
+
+    runtime = TaskRuntime(storage=storage, turn_handler=_handler)
+    handle = await runtime.enqueue(
+        replace(
+            _make_envelope(session_key),
+            metadata={"plan_run_id": run.run_id},
+        ),
+        "Implement the plan",
+        task_id=task_id,
+    )
+
+    task = await runtime.wait(handle.task_id, timeout=2.0)
+    paused = await storage.get_plan_run(run.run_id)
+
+    assert str(task.status) == "failed"
+    assert paused is not None
+    assert paused.status == "paused"
+    assert paused.current_step_id is None
+    assert paused.pause_reason == "manual_turn_failed"
+    assert all(
+        step["status"] in {"completed", "skipped"}
+        for step in paused.step_states
+    )
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_goal_owned_plan_run_yields_for_later_driver_attempt() -> None:
+    session_key = "agent-1::goal-plan-runtime"
+    task_id = "task-goal-plan-runtime"
+    storage, run = await _make_durable_plan_run(
+        session_key=session_key,
+        run_id="run-goal-plan-runtime",
+        task_id=task_id,
+        driver_kind="goal",
+        driver_id="goal-1",
+    )
+
+    async def _handler(task: Any) -> None:
+        tool_context = tool_context_from_envelope(task.envelope, is_owner=True)
+        assert tool_context.plan_revision is not None
+        assert tool_context.plan_run is not None
+        assert tool_context.plan_run.driver_kind == "goal"
+
+    runtime = TaskRuntime(storage=storage, turn_handler=_handler)
+    handle = await runtime.enqueue(
+        replace(
+            _make_envelope(session_key),
+            # Future Goal attempts only need the durable run binding; runtime
+            # derives the immutable revision authoritatively.
+            metadata={"plan_run_id": run.run_id},
+        ),
+        "Continue the goal-owned plan",
+        task_id=task_id,
+    )
+
+    task = await runtime.wait(handle.task_id, timeout=2.0)
+    paused = await storage.get_plan_run(run.run_id)
+
+    assert str(task.status) == "succeeded"
+    assert paused is not None
+    assert paused.status == "paused"
+    assert paused.driver_kind == "goal"
+    assert paused.driver_id == "goal-1"
+    assert paused.pause_reason == "goal_turn_finished"
+    assert paused.active_task_id is None
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_resumed_plan_run_progress_is_injected_into_provider_prompt() -> None:
+    session_key = "agent-1::plan-resume-runtime"
+    first_task_id = "task-plan-resume-1"
+    second_task_id = "task-plan-resume-2"
+    storage, run = await _make_durable_plan_run(
+        session_key=session_key,
+        run_id="run-plan-resume",
+        task_id=first_task_id,
+    )
+    running = await storage.mark_plan_run_running(
+        run.run_id,
+        expected_state_revision=run.state_revision,
+        active_task_id=first_task_id,
+    )
+    advanced = await storage.checkpoint_plan_run(
+        run.run_id,
+        expected_state_revision=running.state_revision,
+        expected_active_task_id=first_task_id,
+        step_id="inspect",
+        step_status="completed",
+    )
+    paused = await storage.pause_plan_run(
+        run.run_id,
+        expected_state_revision=advanced.state_revision,
+        expected_active_task_id=first_task_id,
+        reason="manual_turn_finished",
+    )
+    await storage.start_plan_run(
+        paused.model_copy(update={"active_task_id": second_task_id})
+    )
+    captured_context: dict[str, Any] = {}
+
+    async def _handler(task: Any) -> None:
+        tool_context = tool_context_from_envelope(task.envelope, is_owner=True)
+        captured_context.update(
+            TurnRunner._extra_context_for_tool_context(tool_context)
+        )
+        assert tool_context.plan_run is not None
+        assert tool_context.plan_run.status == "running"
+
+    runtime = TaskRuntime(storage=storage, turn_handler=_handler)
+    envelope = replace(
+        _make_envelope(session_key),
+        metadata={
+            "plan_run_id": run.run_id,
+        },
+    )
+    handle = await runtime.enqueue(
+        envelope,
+        "Resume the approved plan",
+        task_id=second_task_id,
+    )
+    await runtime.wait(handle.task_id, timeout=2.0)
+
+    progress = captured_context["PlanRun Progress"]
+    payload = json.loads(progress[progress.index("{") :])
+    assert payload["runId"] == run.run_id
+    assert payload["currentStepId"] == "implement"
+    assert payload["steps"] == [
+        {"stepId": "inspect", "status": "completed"},
+        {"stepId": "implement", "status": "in_progress"},
+    ]
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_plan_run_stops_the_implementation_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_key = "agent-1::plan-cancel"
+    task_id = "task-plan-cancel"
+    storage, run = await _make_durable_plan_run(
+        session_key=session_key,
+        run_id="run-plan-cancel",
+        task_id=task_id,
+    )
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def _handler(_run: Any) -> None:
+        entered.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    async def _ignore_emit(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
+        _ignore_emit,
+    )
+    rt = TaskRuntime(storage=storage, turn_handler=_handler)
+    manager = SessionManager(storage, inject_time_prefix=False, task_runtime=rt)
+    ctx = RpcContext(
+        conn_id="test-plan-cancel",
+        principal=Principal(
+            role="operator",
+            scopes=frozenset({"operator.admin"}),
+            is_owner=True,
+            authenticated=True,
+        ),
+        config=GatewayConfig(memory={"flush_enabled": False}),
+        task_runtime=rt,
+    )
+    ctx.session_manager = manager
+    envelope = replace(
+        _make_envelope(session_key),
+        metadata={"plan_run_id": run.run_id},
+    )
+    handle = await rt.enqueue(envelope, "Implement the plan", task_id=task_id)
+    await asyncio.wait_for(entered.wait(), timeout=2.0)
+    running = await storage.get_plan_run(run.run_id)
+    assert running is not None
+
+    response = await _handle_plans_cancel_run(
+        {
+            "sessionKey": session_key,
+            "runId": run.run_id,
+            "expectedStateRevision": running.state_revision,
+        },
+        ctx,
+    )
+
+    await asyncio.wait_for(cancelled.wait(), timeout=2.0)
+    task = await rt.wait(handle.task_id, timeout=2.0)
+    persisted = await storage.get_plan_run(run.run_id)
+    assert str(task.status) == "cancelled"
+    assert persisted is not None
+    assert persisted.status == "cancelled"
+    assert response["planRun"]["status"] == "cancelled"
+    await storage.close()
 
 
 @pytest.mark.asyncio

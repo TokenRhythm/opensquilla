@@ -5,6 +5,7 @@ import type {
   ChatStreamTimelineItem,
 } from '@/types/chat'
 import { copyTextWithFallback } from '@/utils/browser'
+import { resolveAssistantAnswer } from '@/utils/chat/assistantActivity'
 
 export interface UseChatMessageActionsOptions {
   messages: Ref<ChatMessage[]>
@@ -33,6 +34,21 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     // text (e.g. "<details>") that is visible on screen.
     if ((message.displayRole || message.role) === 'user') {
       return options.stripTimePrefix(message.text || '').trim()
+    }
+    const answer = resolveAssistantAnswer(
+      message,
+      message.timelineItems ?? [],
+      message.interrupted || message.terminalFailure
+        ? 'interrupted'
+        : message.isStreaming
+          ? 'working'
+          : 'settled',
+    )
+    // The same structurally proven PlanRun answer shown outside the collapsed
+    // activity must also be what Copy returns. Otherwise the compact completed
+    // state would silently copy the entire execution narration.
+    if (answer.source === 'terminal-control-boundary') {
+      return options.sanitizeCopyText(answer.text)
     }
     // Tool-bearing turns render text as separate timeline segments; the raw
     // message text concatenates them without separators, so rebuild from the

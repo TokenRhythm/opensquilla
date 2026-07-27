@@ -19,7 +19,7 @@ from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
 from opensquilla.session.keys import build_subagent_session_key, parse_agent_id
 from opensquilla.tools.registry import tool
 from opensquilla.tools.run_mode import current_run_mode
-from opensquilla.tools.types import SafeToolError, ToolError, current_tool_context
+from opensquilla.tools.types import PlanAccess, SafeToolError, ToolError, current_tool_context
 
 _log = structlog.get_logger("opensquilla.tools.sessions")
 
@@ -557,6 +557,7 @@ async def sessions_spawn(
         },
     },
     required=[],
+    plan_access=PlanAccess.READ_ONLY,
 )
 async def sessions_list(
     agent_id: str | None = None,
@@ -598,6 +599,7 @@ async def sessions_list(
         },
     },
     required=["session_key"],
+    plan_access=PlanAccess.READ_ONLY,
 )
 async def sessions_history(session_key: str, limit: int = 20) -> str:
     if not (1 <= limit <= 100):
@@ -807,6 +809,7 @@ async def sessions_yield(
     description="Show current session usage, cost, and model information.",
     params={},
     required=[],
+    plan_access=PlanAccess.READ_ONLY,
 )
 async def session_status() -> str:
     try:

@@ -75,6 +75,26 @@ describe('ChatComposer voice-input gate', () => {
     app.unmount()
   })
 
+  it('names Stop as ending the durable plan execution when it targets a PlanRun', async () => {
+    const onStop = vi.fn()
+    const { app, el } = await mount({
+      canStop: true,
+      stopTargetsPlanRun: true,
+      onStop,
+    })
+    const stop = el.querySelector<HTMLButtonElement>(
+      `button[aria-label="${i18n.global.t('chat.planRun.stopExecution')}"]`,
+    )
+
+    expect(stop).toBeTruthy()
+    expect(stop?.getAttribute('title'))
+      .toBe(i18n.global.t('chat.planRun.stopExecutionEsc'))
+    stop?.click()
+    await nextTick()
+    expect(onStop).toHaveBeenCalledOnce()
+    app.unmount()
+  })
+
   it('records when ready: enabled, normal label, emits voiceInput', async () => {
     const onVoiceInput = vi.fn()
     const onVoiceSetup = vi.fn()

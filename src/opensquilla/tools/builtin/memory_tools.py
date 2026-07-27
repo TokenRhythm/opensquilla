@@ -38,7 +38,7 @@ from opensquilla.memory.types import (
     normalize_memory_source_filter,
 )
 from opensquilla.tools.registry import tool
-from opensquilla.tools.types import ToolError, current_tool_context
+from opensquilla.tools.types import PlanAccess, ToolError, current_tool_context
 
 if TYPE_CHECKING:
     from opensquilla.memory.retrieval import MemoryRetriever
@@ -649,6 +649,7 @@ def create_memory_tools(
             },
         },
         required=["query"],
+        plan_access=PlanAccess.READ_ONLY,
         registry=registry,
     )
     async def memory_search(
@@ -764,6 +765,7 @@ def create_memory_tools(
             "lines": {"type": "integer", "description": "Number of lines to return (optional)"},
         },
         required=["path"],
+        plan_access=PlanAccess.READ_ONLY,
         registry=registry,
     )
     async def memory_get(
