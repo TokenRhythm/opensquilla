@@ -235,20 +235,10 @@
             @set-mode="emit('setCollaborationMode', $event)"
           />
           <div class="chat-input-actions chat-input-actions--right">
-            <button
-              class="btn btn--icon btn--primary chat-send-btn"
-              :class="{ 'is-ready': hasSendContent && !sendBlockedMessage }"
-              :title="sendBlockedMessage || sendButtonTitle"
-              :aria-label="replanActive ? t('chat.plan.reviseSend') : t('chat.send')"
-              :aria-describedby="sendBlockedMessage ? 'chat-composer-send-status' : undefined"
-              :disabled="Boolean(sendBlockedMessage)"
-              @click="emit('send')"
-            >
-              <Icon name="arrowUp" :size="17" />
-            </button>
-            <Transition name="composer-ctl">
+            <Transition name="composer-ctl" mode="out-in">
               <button
                 v-if="canStop"
+                key="stop"
                 class="btn btn--icon btn--danger chat-send-btn"
                 :title="stopTargetsPlanRun
                   ? t('chat.planRun.stopExecutionEsc')
@@ -259,6 +249,19 @@
                 @click="emit('stop')"
               >
                 <Icon name="stop" :size="16" />
+              </button>
+              <button
+                v-else
+                key="send"
+                class="btn btn--icon btn--primary chat-send-btn"
+                :class="{ 'is-ready': hasSendContent && !sendBlockedMessage }"
+                :title="sendBlockedMessage || sendButtonTitle"
+                :aria-label="replanActive ? t('chat.plan.reviseSend') : t('chat.send')"
+                :aria-describedby="sendBlockedMessage ? 'chat-composer-send-status' : undefined"
+                :disabled="Boolean(sendBlockedMessage)"
+                @click="emit('send')"
+              >
+                <Icon name="arrowUp" :size="17" />
               </button>
             </Transition>
           </div>
