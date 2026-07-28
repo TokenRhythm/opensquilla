@@ -24,7 +24,7 @@ function totals(input: number, output: number, cost: number): UsageTotals {
 }
 
 describe('usage ledger day chart', () => {
-  it('uses server calendar-day buckets and does not turn them into session links', () => {
+  it('shows server calendar-day buckets newest first without turning them into session links', () => {
     const chartMode = ref<'tokens' | 'cost'>('tokens')
     const { chartCaption, chartRows } = useUsageChartRows({
       visibleSessions: computed(() => [{ sessionKey: 'should-not-drive-chart', inputTokens: 999 }]),
@@ -40,10 +40,10 @@ describe('usage ledger day chart', () => {
     })
 
     expect(chartCaption.value).toBe('Daily usage')
-    expect(chartRows.value.map(row => row.label)).toEqual(['2026-07-19', '2026-07-20'])
+    expect(chartRows.value.map(row => row.label)).toEqual(['2026-07-20', '2026-07-19'])
     expect(chartRows.value.every(row => row.sessionKey === null)).toBe(true)
-    expect(chartRows.value[1].valueLabel).toBe('30')
-    expect(chartRows.value[1].totalPct).toBeCloseTo(100)
+    expect(chartRows.value[0].valueLabel).toBe('30')
+    expect(chartRows.value[0].totalPct).toBeCloseTo(100)
   })
 
   it('uses native billing context for exact CNY daily costs', () => {
