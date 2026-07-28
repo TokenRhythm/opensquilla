@@ -290,7 +290,11 @@ def test_run_elevated_setup_helper_launches_frozen_helper_without_python_module(
     launched = {}
     marker = tmp_path / "setup_marker.json"
 
-    monkeypatch.setattr(mod.sys, "executable", r"C:\Program Files\OpenSquilla\opensquilla-gateway.exe")
+    monkeypatch.setattr(
+        mod.sys,
+        "executable",
+        r"C:\Program Files\OpenSquilla\opensquilla-gateway.exe",
+    )
     monkeypatch.setattr(mod.sys, "frozen", True, raising=False)
     monkeypatch.setattr(mod, "_current_windows_user_sid", lambda: "S-1-real")
 
