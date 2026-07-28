@@ -87,6 +87,292 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
 }
 
 describe('useChatSend attachment payloads', () => {
+  it('preserves the draft and skips project preflight while live delivery is blocked', async () => {
+    const attachment: Attachment = {
+      kind: 'staged',
+      local_id: 1,
+      name: 'draft.pdf',
+      mime: 'application/pdf',
+      file_uuid: 'file-draft',
+    }
+    const pendingAttachments = ref<Attachment[]>([attachment])
+    const validateActiveProjectBeforeSend = vi.fn(async () => null)
+    const { api, options, rpc } = makeOptions({
+      pendingAttachments,
+      sendBlockedReason: ref('Live updates are unavailable'),
+      validateActiveProjectBeforeSend,
+    })
+
+    await api.onSend()
+
+    expect(validateActiveProjectBeforeSend).not.toHaveBeenCalled()
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.inputText.value).toBe('hello')
+    expect(options.pendingAttachments.value).toEqual([attachment])
+    expect(options.messages.value).toEqual([])
+  })
+
+  it('preserves queued and hidden sends while live delivery is blocked', async () => {
+    const blocker = ref<string | null>('Live updates are unavailable')
+    const queued: ChatPendingItem = {
+      text: 'keep this queued',
+      attachments: [],
+      intent: null,
+    }
+    const { api, options, rpc } = makeOptions({ sendBlockedReason: blocker })
+
+    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('deferred')
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('not_sent')
+    await api.dispatchHiddenSend('provider confirmation', 'Confirmed')
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(queued).toEqual({
+      text: 'keep this queued',
+      attachments: [],
+      intent: null,
+    })
+    expect(options.inputText.value).toBe('hello')
+    expect(options.messages.value).toEqual([])
+  })
+
+  it('queues an immutable hidden confirmation while live delivery is blocked', async () => {
+    const enqueueHiddenControl = vi.fn(() => true)
+    const { api, options, rpc } = makeOptions({
+      sendBlockedReason: ref('Live updates are unavailable'),
+      enqueueHiddenControl,
+    })
+
+    await expect(
+      api.dispatchHiddenSend('provider confirmation', 'Confirmed'),
+    ).resolves.toBe('accepted')
+
+    expect(enqueueHiddenControl).toHaveBeenCalledWith(
+      {
+        text: 'provider confirmation',
+        displayText: 'Confirmed',
+      },
+      undefined,
+    )
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.inputText.value).toBe('hello')
+    expect(options.messages.value).toEqual([])
+  })
+
+  it('retries a hidden queue item with one stable request identity and bubble', async () => {
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(Object.assign(new Error('response lost'), {
+          retryable: true,
+        }))
+        .mockResolvedValueOnce({
+          sessionKey: 'agent:main:webchat:test',
+          task_id: 'task-hidden',
+        }),
+    }
+    const queued: ChatPendingItem = {
+      text: 'provider confirmation',
+      displayTextOverride: 'Confirmed',
+      attachments: [],
+      intent: null,
+      hiddenControl: true,
+      ownerSessionKey: 'agent:main:webchat:test',
+    }
+    const { api, options } = makeOptions({ rpc })
+
+    await expect(api.dispatchHiddenSend(
+      queued.text,
+      queued.displayTextOverride!,
+      queued.ownerSessionKey,
+      queued,
+    )).resolves.toBe('retryable_failure')
+    const firstParams = rpc.call.mock.calls[0]?.[1]
+    expect(queued.hiddenClientRequestId).toBe(firstParams.clientRequestId)
+    expect(queued.hiddenClientMessageId).toBe(firstParams.clientMessageId)
+    expect(queued.hiddenVisibleCommitted).toBe(true)
+
+    await expect(api.dispatchHiddenSend(
+      queued.text,
+      queued.displayTextOverride!,
+      queued.ownerSessionKey,
+      queued,
+    )).resolves.toBe('accepted')
+
+    expect(rpc.call.mock.calls[1]?.[1]).toEqual(firstParams)
+    expect(options.messages.value.filter(message => (
+      message.role === 'user' && message.text === 'Confirmed'
+    ))).toHaveLength(1)
+  })
+
+  it('moves a direct hidden unknown-acceptance failure into the retry queue', async () => {
+    const enqueueHiddenControl = vi.fn(() => true)
+    const rpc = {
+      call: vi.fn().mockRejectedValue(Object.assign(new Error('response lost'), {
+        retryable: true,
+      })),
+    }
+    const { api, options } = makeOptions({
+      rpc,
+      enqueueHiddenControl,
+    })
+
+    await expect(
+      api.dispatchHiddenSend('provider confirmation', 'Confirmed'),
+    ).resolves.toBe('accepted')
+
+    expect(enqueueHiddenControl).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: 'provider confirmation',
+        displayText: 'Confirmed',
+        clientRequestId: expect.any(String),
+        clientMessageId: expect.any(String),
+        visibleCommitted: true,
+      }),
+      undefined,
+    )
+    expect(options.schedulePendingDrainAfterTerminal).toHaveBeenCalledOnce()
+    expect(options.messages.value.filter(message => message.role === 'error')).toHaveLength(0)
+  })
+
+  it('rechecks live delivery after active-project validation resolves', async () => {
+    const blocker = ref<string | null>(null)
+    let finishPreflight!: () => void
+    const validateActiveProjectBeforeSend = vi.fn(() => new Promise<string | null>(
+      resolve => {
+        finishPreflight = () => resolve(null)
+      },
+    ))
+    const { api, options, rpc } = makeOptions({
+      sendBlockedReason: blocker,
+      validateActiveProjectBeforeSend,
+    })
+
+    const send = api.onSend()
+    await vi.waitFor(() => expect(validateActiveProjectBeforeSend).toHaveBeenCalledOnce())
+    blocker.value = 'Live updates are unavailable'
+    finishPreflight()
+    await send
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.inputText.value).toBe('hello')
+    expect(options.messages.value).toEqual([])
+  })
+
+  it('sends the clicked snapshot without clearing edits made during project validation', async () => {
+    const originalAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 31,
+      name: 'original.pdf',
+      mime: 'application/pdf',
+      file_uuid: 'file-original',
+    }
+    const laterAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 32,
+      name: 'later.pdf',
+      mime: 'application/pdf',
+      file_uuid: 'file-later',
+    }
+    const inputText = ref('original prompt')
+    const pendingAttachments = ref<Attachment[]>([originalAttachment])
+    const composerRevision = ref(1)
+    let finishPreflight!: () => void
+    const validateActiveProjectBeforeSend = vi.fn(() => new Promise<string | null>(
+      resolve => {
+        finishPreflight = () => resolve(null)
+      },
+    ))
+    const { api, options, rpc } = makeOptions({
+      inputText,
+      pendingAttachments,
+      composerRevision,
+      validateActiveProjectBeforeSend,
+    })
+
+    const send = api.onSend()
+    await vi.waitFor(() => expect(validateActiveProjectBeforeSend).toHaveBeenCalledOnce())
+    inputText.value = 'new draft typed while validating'
+    pendingAttachments.value = [originalAttachment, laterAttachment]
+    composerRevision.value += 1
+    finishPreflight()
+    await send
+
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      message: 'original prompt',
+      attachments: [
+        expect.objectContaining({ file_uuid: 'file-original' }),
+      ],
+    }))
+    expect(options.messages.value).toContainEqual(expect.objectContaining({
+      role: 'user',
+      text: 'original prompt',
+    }))
+    expect(inputText.value).toBe('new draft typed while validating')
+    expect(pendingAttachments.value).toEqual([laterAttachment])
+  })
+
+  it('cancels an automatic send after any composer edit, even if text is restored', async () => {
+    const inputText = ref('automatic prompt')
+    const composerRevision = ref(4)
+    let finishPreflight!: () => void
+    const validateActiveProjectBeforeSend = vi.fn(() => new Promise<string | null>(
+      resolve => {
+        finishPreflight = () => resolve(null)
+      },
+    ))
+    const { api, options, rpc } = makeOptions({
+      inputText,
+      composerRevision,
+      validateActiveProjectBeforeSend,
+    })
+
+    const send = api.onSend({ cancelIfComposerChanged: true })
+    await vi.waitFor(() => expect(validateActiveProjectBeforeSend).toHaveBeenCalledOnce())
+    inputText.value = 'operator takeover'
+    composerRevision.value += 1
+    inputText.value = 'automatic prompt'
+    composerRevision.value += 1
+    finishPreflight()
+    await send
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.messages.value).toEqual([])
+    expect(inputText.value).toBe('automatic prompt')
+  })
+
+  it('rechecks live delivery after attachment preparation resolves', async () => {
+    const attachment: Attachment = {
+      kind: 'staged',
+      local_id: 2,
+      name: 'ready.pdf',
+      mime: 'application/pdf',
+      file_uuid: 'file-ready',
+    }
+    const blocker = ref<string | null>(null)
+    const pendingAttachments = ref<Attachment[]>([attachment])
+    let finishPreparation!: () => void
+    const prepareAttachmentsForSend = vi.fn(() => new Promise<boolean>(
+      resolve => {
+        finishPreparation = () => resolve(true)
+      },
+    ))
+    const { api, options, rpc } = makeOptions({
+      pendingAttachments,
+      sendBlockedReason: blocker,
+      prepareAttachmentsForSend,
+    })
+
+    const send = api.onSend()
+    await vi.waitFor(() => expect(prepareAttachmentsForSend).toHaveBeenCalledOnce())
+    blocker.value = 'Live updates are unavailable'
+    finishPreparation()
+    await send
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.inputText.value).toBe('hello')
+    expect(options.pendingAttachments.value).toEqual([attachment])
+    expect(options.messages.value).toEqual([])
+  })
+
   it.each(['resolving', 'unavailable', 'removed', 'unknown', 'error'])(
     'does not mutate or call chat.send when project preflight returns %s',
     async reason => {
@@ -130,6 +416,70 @@ describe('useChatSend attachment payloads', () => {
     expect(validateActiveProjectBeforeSend).toHaveBeenCalledOnce()
     expect(rpc.call).not.toHaveBeenCalled()
     expect(options.messages.value).toEqual([])
+  })
+
+  it('keeps queued delivery owned when project validation blocks it', async () => {
+    const validateActiveProjectBeforeSend = vi.fn(async () => 'removed')
+    const queued: ChatPendingItem = {
+      text: 'keep queued',
+      attachments: [],
+      intent: null,
+      ownerSessionKey: 'agent:main:webchat:test',
+    }
+    const { api, options, rpc } = makeOptions({
+      validateActiveProjectBeforeSend,
+    })
+
+    await expect(api.sendQueuedFollowup(
+      queued,
+      'agent:main:webchat:test',
+    )).resolves.toBe('deferred')
+    await expect(api.sendQueuedSteer(
+      queued,
+      'agent:main:webchat:test',
+    )).resolves.toBe('not_sent')
+
+    expect(validateActiveProjectBeforeSend).toHaveBeenCalledTimes(2)
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.inputText.value).toBe('hello')
+    expect(queued.text).toBe('keep queued')
+  })
+
+  it('rechecks live and session ownership after queued project validation', async () => {
+    const blocker = ref<string | null>(null)
+    let finishPreflight!: () => void
+    const validateActiveProjectBeforeSend = vi.fn(() => new Promise<string | null>(
+      resolve => {
+        finishPreflight = () => resolve(null)
+      },
+    ))
+    const queued: ChatPendingItem = {
+      text: 'queued follow-up',
+      attachments: [],
+      intent: null,
+      ownerSessionKey: 'agent:main:webchat:test',
+    }
+    const { api, options, rpc } = makeOptions({
+      sendBlockedReason: blocker,
+      validateActiveProjectBeforeSend,
+    })
+
+    const send = api.sendQueuedFollowup(queued, 'agent:main:webchat:test')
+    await vi.waitFor(() => expect(validateActiveProjectBeforeSend).toHaveBeenCalledOnce())
+    blocker.value = 'Live updates are unavailable'
+    finishPreflight()
+
+    await expect(send).resolves.toBe('deferred')
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.inputText.value).toBe('hello')
+
+    options.sessionKey.value = 'agent:main:webchat:other'
+    blocker.value = null
+    await expect(api.sendQueuedFollowup(
+      queued,
+      'agent:main:webchat:test',
+    )).resolves.toBe('not_sent')
+    expect(validateActiveProjectBeforeSend).toHaveBeenCalledOnce()
   })
 
   it('admits only one send while an active-project preflight is pending', async () => {
@@ -514,18 +864,20 @@ describe('useChatSend attachment payloads', () => {
         file: new File(['pdf'], 'ready.pdf', { type: 'application/pdf' }),
       },
     ])
-    const prepareAttachmentsForSend = vi.fn(async () => {
-      pendingAttachments.value = [
-        {
-          kind: 'staged',
-          local_id: 1,
-          name: 'ready.pdf',
-          mime: 'application/pdf',
-          file_uuid: 'file-fresh',
-          expires_at: Date.now() / 1000 + 600,
-          file: new File(['pdf'], 'ready.pdf', { type: 'application/pdf' }),
-        },
-      ]
+    const prepareAttachmentsForSend = vi.fn(async (context?: {
+      attachments?: Attachment[]
+    }) => {
+      const attachments = context?.attachments
+      if (!attachments) return false
+      attachments[0] = {
+        kind: 'staged',
+        local_id: 1,
+        name: 'ready.pdf',
+        mime: 'application/pdf',
+        file_uuid: 'file-fresh',
+        expires_at: Date.now() / 1000 + 600,
+        file: new File(['pdf'], 'ready.pdf', { type: 'application/pdf' }),
+      }
       return true
     })
     const { api, rpc } = makeOptions({ pendingAttachments, prepareAttachmentsForSend })

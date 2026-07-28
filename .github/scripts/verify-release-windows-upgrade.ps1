@@ -21,6 +21,8 @@ $userData = Join-Path $appData 'OpenSquilla'
 $profile = Join-Path $userData 'opensquilla'
 $probe = Join-Path $PWD '.github\scripts\verify-release-profile-preservation.py'
 $updateBannerSmoke = Join-Path $PWD 'desktop\electron\scripts\test-packaged-update-banner.mjs'
+$sessionRecoverySmoke = Join-Path $PWD 'desktop\electron\scripts\test-packaged-session-recovery.mjs'
+$sessionKey = 'agent:main:webchat:release-recovery-long-session'
 $env:APPDATA = $appData
 $env:OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE = '1'
 $env:OPENSQUILLA_RECOVERY_OFFLINE = '1'
@@ -73,6 +75,16 @@ try {
   Start-Sleep -Seconds 8
   if ($launched.HasExited) {
     throw "Candidate Desktop exited during launch verification: $($launched.ExitCode)"
+  }
+  Stop-InstalledProcesses
+
+  & node $sessionRecoverySmoke `
+    --executable $app `
+    --user-data-dir $userData `
+    --session-key $sessionKey `
+    --label $Label
+  if ($LASTEXITCODE -ne 0) {
+    throw 'Candidate packaged session-recovery smoke failed.'
   }
   Stop-InstalledProcesses
 

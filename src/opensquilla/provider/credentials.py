@@ -2,10 +2,52 @@
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from urllib.parse import urlparse
+
+_TOKENRHYTHM_KEY_RE = re.compile(r"^sk_tr_[A-Za-z0-9_-]{16,}$")
+_OPENROUTER_KEY_RE = re.compile(r"^sk-or-v1-[A-Za-z0-9_-]{16,}$")
+
+
+def credential_provider_hint(
+    api_key: object = "",
+    *,
+    api_key_env: object = "",
+) -> str:
+    """Return a provider id only for globally distinctive credential evidence."""
+
+    key = str(api_key or "").strip()
+    if _TOKENRHYTHM_KEY_RE.fullmatch(key):
+        return "tokenrhythm"
+    if _OPENROUTER_KEY_RE.fullmatch(key):
+        return "openrouter"
+    env_name = str(api_key_env or "").strip().upper()
+    if env_name == "TOKENRHYTHM_API_KEY":
+        return "tokenrhythm"
+    if env_name == "OPENROUTER_API_KEY":
+        return "openrouter"
+    return ""
+
+
+def endpoint_provider_hint(base_url: object = "") -> str:
+    """Return a provider id only for another provider's distinctive official host."""
+
+    value = str(base_url or "").strip()
+    if not value:
+        return ""
+    try:
+        hostname = str(urlparse(value).hostname or "").strip().lower()
+    except ValueError:
+        return ""
+    if hostname == "tokenrhythm.studio":
+        return "tokenrhythm"
+    if hostname == "openrouter.ai":
+        return "openrouter"
+    return ""
 
 
 class NoCredentialsAvailable(RuntimeError):  # noqa: N818 - public compatibility name

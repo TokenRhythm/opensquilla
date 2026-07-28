@@ -25,15 +25,33 @@ export interface SessionProjectWorkspaceMetadata {
 
 export function createDraftProjectHydrationGuard() {
   let generation = 0
+  let activeController: AbortController | null = null
+  const abortActive = () => {
+    activeController?.abort()
+    activeController = null
+  }
   return {
     begin: () => {
+      abortActive()
       generation += 1
       return generation
     },
     invalidate: () => {
+      abortActive()
       generation += 1
     },
     isCurrent: (candidate: number) => candidate === generation,
+    createController: (candidate: number): AbortController | null => {
+      if (candidate !== generation) return null
+      abortActive()
+      activeController = new AbortController()
+      return activeController
+    },
+    complete: (candidate: number, controller: AbortController) => {
+      if (candidate === generation && activeController === controller) {
+        activeController = null
+      }
+    },
   }
 }
 

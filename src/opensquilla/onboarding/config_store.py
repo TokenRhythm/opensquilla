@@ -496,7 +496,9 @@ def restore_runtime_overrides(dump: dict[str, Any], config: GatewayConfig) -> No
     ``llm.proxy``) directly into the live model at boot. Those values must
     never be baked into config.toml by an unrelated save, so each recorded
     override is restored to its stored value — but only while the field
-    still equals the applied env value; an operator edit since boot wins.
+    still equals the applied env value. A missing serialized field also
+    represents an applied empty string because the TOML payload drops empty
+    values; an operator edit since boot still wins.
     Shared by the sparse persister here and the gateway RPC full-dump
     persist (``rpc_config._persist_config``).
     """
@@ -504,7 +506,10 @@ def restore_runtime_overrides(dump: dict[str, Any], config: GatewayConfig) -> No
     if overrides is None:
         return
     for path, (stored, applied) in overrides().items():
-        if _get_dotted(dump, path) == applied:
+        current = _get_dotted(dump, path)
+        if current == applied or (
+            current is None and applied == "" and stored not in (None, "")
+        ):
             _set_dotted(dump, path, stored)
 
 

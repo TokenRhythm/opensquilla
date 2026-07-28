@@ -341,6 +341,12 @@ export interface SessionProjectWorkspaceSnapshot {
 
 export interface SessionMessagesSubscribeResponse extends SessionEventPayload {
   subscribed?: boolean
+  hydration_complete?: boolean
+  hydrationComplete?: boolean
+  deferred_fields?: string[]
+  deferredFields?: string[]
+  projectWorkspaceDeferred?: boolean
+  project_workspace_deferred?: boolean
   replay_complete?: boolean
   current_stream_seq?: number
   active_task_group_ids?: string[]

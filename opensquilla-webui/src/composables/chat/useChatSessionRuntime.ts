@@ -4,7 +4,7 @@ import type {
   ChatRunStatusSource,
 } from '@/types/chat'
 import type { PersistSessionOptions } from '@/composables/chat/useChatSessionRoute'
-import type { SessionSubscriptionOutcome } from '@/composables/chat/useChatSessionSubscription'
+import type { SessionBootstrapRun } from '@/composables/chat/useChatSessionBootstrap'
 
 export interface ChatUsageAccumulator {
   input: number
@@ -36,9 +36,11 @@ export interface UseChatSessionRuntimeOptions {
   usageModel: Ref<string>
   createSessionKey: (agentId?: string) => string
   persistSession: (key: string, options?: PersistSessionOptions) => void
-  unsubscribeSession: () => void | Promise<void>
-  subscribeSession: () => void | Promise<void | SessionSubscriptionOutcome>
-  loadHistory: () => void | Promise<void>
+  cancelSessionBootstrap: () => void
+  startSessionBootstrap: (options?: {
+    includeHistory?: boolean
+    force?: boolean
+  }) => SessionBootstrapRun
   loadCurrentSessionUsage: () => void | Promise<void>
   applySessionRunState: (source: ChatRunStatusSource | null | undefined) => void
   setCompactInFlight: (active: boolean, key?: string) => void
@@ -109,7 +111,7 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
   ): Promise<ResponseSessionAdoptionResult | undefined> {
     if (!key || key === options.sessionKey.value) return
 
-    options.unsubscribeSession()
+    options.cancelSessionBootstrap()
     resetCompactState()
     if (pendingQueuePolicy.kind === 'response_handoff') {
       options.adoptPendingQueue(key, pendingQueuePolicy.ownerRequestId)
@@ -122,10 +124,17 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     options.applySessionRunState({ run_status: 'idle' })
     resetSessionViewState()
     options.restoreWidgetState()
-    options.loadCurrentSessionUsage()
-    const subscription = options.subscribeSession()
-    const history = options.loadHistory()
-    const [subscriptionOutcome] = await Promise.all([subscription, history])
+    // History and live are launched together by the coordinator but remain
+    // orthogonal. Response hand-off only waits for the authoritative live
+    // snapshot; history can recover independently without blocking adoption.
+    const bootstrap = options.startSessionBootstrap({ includeHistory: true })
+    // Usage is optional metadata. Let both critical bootstrap phases finish
+    // before it can enter the Gateway's serialized RPC queue; otherwise an
+    // unresponsive usage read can head-of-line block history and subscribe.
+    void Promise.allSettled([bootstrap.history, bootstrap.live]).then(() => {
+      if (options.sessionKey.value === key) void options.loadCurrentSessionUsage()
+    })
+    const subscriptionOutcome = await bootstrap.live
     return {
       authoritativeIdle: subscriptionOutcome?.authoritative === true
         && subscriptionOutcome.live === false,
@@ -145,7 +154,7 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
   // Drafts keep their provisional key out of the URL and local storage; it
   // only persists once the first message actually goes out.
   function startDraftSession(agentId?: string) {
-    options.unsubscribeSession()
+    options.cancelSessionBootstrap()
     const key = options.createSessionKey(agentId)
     resetCompactState()
     options.switchPendingQueue(key)
@@ -154,7 +163,7 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     options.pendingSessionIntent.value = 'new_chat'
     options.resetDraftComposer?.()
     resetSessionViewState()
-    options.subscribeSession()
+    options.startSessionBootstrap({ includeHistory: false })
   }
 
   return {

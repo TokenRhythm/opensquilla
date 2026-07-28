@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -226,6 +227,28 @@ def test_release_profile_preservation_probe_covers_identity_config_and_chat_db(
         capture_output=True,
     )
     assert "profile preservation verified" in verified.stdout
+    with sqlite3.connect(home / "state" / "sessions.db") as connection:
+        long_session = connection.execute(
+            """
+            SELECT sessions.session_key, COUNT(transcript_entries.id)
+            FROM sessions
+            JOIN transcript_entries USING (session_key)
+            GROUP BY sessions.session_key
+            """
+        ).fetchone()
+        last_message = connection.execute(
+            """
+            SELECT content
+            FROM transcript_entries
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    assert long_session == (
+        "agent:main:webchat:release-recovery-long-session",
+        320,
+    )
+    assert last_message == ("Synthetic retained history message 0320 (contract-probe)",)
 
     reseed = subprocess.run(
         [sys.executable, str(probe), "seed", "--home", str(home), "--label", label],
@@ -259,6 +282,60 @@ def test_release_profile_preservation_probe_covers_identity_config_and_chat_db(
     assert rejected.returncode != 0
     assert "sessions.db retained-chat row changed" in rejected.stderr
 
+    with sqlite3.connect(home / "state" / "sessions.db") as connection:
+        connection.execute(
+            "UPDATE release_preservation_chat SET body = ?",
+            (f"synthetic retained chat ({label})",),
+        )
+        connection.execute(
+            """
+            UPDATE transcript_entries
+            SET content = 'changed'
+            WHERE message_id = 'release-recovery-message-0320'
+            """
+        )
+    rejected = subprocess.run(
+        [sys.executable, str(probe), "verify", "--home", str(home), "--label", label],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    assert rejected.returncode != 0
+    assert "last long-session message changed" in rejected.stderr
+
+    with sqlite3.connect(home / "state" / "sessions.db") as connection:
+        connection.execute(
+            """
+            UPDATE transcript_entries
+            SET content = ?
+            WHERE message_id = 'release-recovery-message-0320'
+            """,
+            ("Synthetic retained history message 0320 (contract-probe)",),
+        )
+
+    async def migrate_and_read_long_session() -> tuple[int, str]:
+        from opensquilla.session.storage import SessionStorage
+
+        storage = await SessionStorage.open(str(home / "state" / "sessions.db"))
+        try:
+            entries = await storage.get_canonical_transcript(
+                "release-recovery-long-session"
+            )
+            return len(entries), entries[-1].content or ""
+        finally:
+            await storage.close()
+
+    migrated_count, migrated_last_message = asyncio.run(migrate_and_read_long_session())
+    assert migrated_count == 320
+    assert migrated_last_message == "Synthetic retained history message 0320 (contract-probe)"
+    migrated_verified = subprocess.run(
+        [sys.executable, str(probe), "verify", "--home", str(home), "--label", label],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    assert "profile preservation verified" in migrated_verified.stdout
+
 
 def test_release_workflow_gates_built_and_downloaded_installers_on_profile_retention() -> None:
     workflow = Path(".github/workflows/wheelhouse-release.yml").read_text(encoding="utf-8")
@@ -268,6 +345,12 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
     )
     update_banner_smoke = Path(
         "desktop/electron/scripts/test-packaged-update-banner.mjs"
+    ).read_text(encoding="utf-8")
+    session_recovery_smoke = Path(
+        "desktop/electron/scripts/test-packaged-session-recovery.mjs"
+    ).read_text(encoding="utf-8")
+    packaged_smoke_helpers = Path(
+        "desktop/electron/scripts/packaged-smoke-helpers.mjs"
     ).read_text(encoding="utf-8")
     probe = Path(".github/scripts/verify-release-profile-preservation.py").read_text(
         encoding="utf-8"
@@ -298,6 +381,8 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
         "sessions.db",
         "PRAGMA quick_check",
         "synthetic retained chat",
+        "LONG_SESSION_MESSAGE_COUNT = 320",
+        "agent:main:webchat:release-recovery-long-session",
     ):
         assert artifact in probe
     for helper in (mac_helper, windows_helper):
@@ -306,6 +391,9 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
         assert "verify-release-profile-preservation.py" in helper
         assert "workspace" in helper
         assert "state" in helper
+        assert "test-packaged-session-recovery.mjs" in helper
+        assert "--session-key" in helper
+        assert "--label" in helper
 
     assert "test-packaged-update-banner.mjs" in windows_helper
     assert "if ($VerifyLongRunningUpdateBanner)" in windows_helper
@@ -325,6 +413,32 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
         "writeSyntheticCanonicalWorkspace(privacyUserDataDir)"
     ) < update_banner_smoke.index("privacyApp = await launchCandidate(")
     assert "GITHUB_ACTIONS: '0'" in update_banner_smoke
+    assert "launchPackagedCandidate" in update_banner_smoke
+    assert "desktop-credential.json" in packaged_smoke_helpers
+    assert "_electron as electron" in packaged_smoke_helpers
+
+    for method in ("chat.history", "sessions.messages.subscribe"):
+        assert method in session_recovery_smoke
+    for contract in (
+        "connectToServer()",
+        "chat-session-load-state",
+        'data-recovery-state=\"history-error\"',
+        'data-recovery-state=\"live-degraded\"',
+        "chat-session-recovery-retry",
+        "composer.isEditable()",
+        "sendButton.isDisabled()",
+        "expectedLastMessage",
+        "socketCount > 1",
+    ):
+        assert contract in session_recovery_smoke
+    assert "page.clock" not in session_recovery_smoke
+    assert "OPENSQUILLA_TESTING: '0'" in session_recovery_smoke
+    assert mac_helper.index("test-packaged-session-recovery.mjs") < mac_helper.index(
+        "recovery inspect"
+    )
+    assert windows_helper.index(
+        "test-packaged-session-recovery.mjs"
+    ) < windows_helper.index("recovery inspect")
 
     mac_audit = workflow[
         workflow.index("  audit-downloaded-macos-release:") : workflow.index(
@@ -339,6 +453,13 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
         assert "gh release download" in audit
         assert "SHA256SUMS" in audit
         assert "isDraft" in audit
+        assert "actions/setup-node@v4" in audit
+        assert "desktop/electron/package-lock.json" in audit
+        assert "working-directory: desktop/electron" in audit
+        assert "run: npm ci" in audit
+        assert audit.index("run: npm ci") < audit.index(
+            "verify-release-", audit.index("run: npm ci")
+        )
     assert "codesign --verify --deep --strict" in mac_audit
     assert "spctl -a -vv -t exec" in mac_audit
     assert "xcrun stapler validate" in mac_audit

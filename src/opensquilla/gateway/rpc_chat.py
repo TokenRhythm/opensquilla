@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 from typing import Any, cast
 from urllib.parse import quote
 from uuid import uuid4
@@ -22,6 +24,10 @@ from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.session.compaction import build_compaction_config_from_provider
 from opensquilla.session.compaction_lifecycle import new_compaction_id
 from opensquilla.session.keys import build_webchat_key, canonicalize_session_key, parse_agent_id
+from opensquilla.session.storage import (
+    StorageBusyError,
+    bounded_interactive_storage_reads,
+)
 
 _d = get_dispatcher()
 log = structlog.get_logger(__name__)
@@ -29,6 +35,8 @@ log = structlog.get_logger(__name__)
 _WEBCHAT_SESSION_KEY = build_webchat_key()
 _CHAT_HISTORY_DEFAULT_LIMIT = 50
 _CHAT_HISTORY_MAX_LIMIT = 200
+_CHAT_HISTORY_LOCK_BUDGET_SECONDS = 2.0
+_CHAT_HISTORY_RETRY_AFTER_MS = 100
 
 
 def _canonical_webchat_session_key(value: object = None) -> str:
@@ -254,6 +262,8 @@ async def _load_chat_history_page(
                 )
                 entries, has_more, canonical_complete = _canonical_page_parts(page)
                 return entries, has_more, True, canonical_complete
+            except StorageBusyError:
+                raise
             except Exception:  # noqa: BLE001 - fall back to active transcript
                 pass
         else:
@@ -268,6 +278,8 @@ async def _load_chat_history_page(
                         after=after,
                     )
                     return entries, has_more, True, True
+                except StorageBusyError:
+                    raise
                 except Exception:  # noqa: BLE001 - fall back to active transcript
                     pass
     transcript_getter = getattr(mgr, "get_transcript", None)
@@ -289,14 +301,22 @@ async def _chat_history_summaries(
     *,
     include_summaries: bool,
 ) -> list[dict[str, Any]]:
+    """Return requested summaries without letting lock contention hide history."""
+
     if not include_summaries:
         return []
     getter = getattr(mgr, "get_summaries", None)
     if not callable(getter):
         return []
     try:
-        summaries = await getter(session_key)
-    except Exception:  # noqa: BLE001 - summaries are optional display metadata
+        with bounded_interactive_storage_reads():
+            summaries = await getter(session_key)
+    except StorageBusyError:
+        # The message page is already available. Let callers retry the optional
+        # summary metadata instead of converting a useful history response into
+        # STORAGE_BUSY.
+        return []
+    except Exception:  # noqa: BLE001 - summaries remain optional display metadata
         return []
     return [_session_summary_to_chat_payload(summary) for summary in summaries or []]
 
@@ -659,22 +679,40 @@ async def _handle_chat_history(params: dict | None, ctx: RpcContext) -> dict:
         )
 
     try:
-        history_lock = get_session_lock(ctx.turn_runner, session_key)
-        if history_lock is None:
-            page_entries, has_more, canonical_available, canonical_complete = (
-                await _load_page()
-            )
-        else:
-            # Canonical reads and compaction rewrites share one aiosqlite
-            # connection.  SQLite statements are snapshots, but a statement on
-            # that same connection can still observe the connection's own
-            # uncommitted archive/delete/reinsert work.  Use the short session
-            # mutation lock so the page and its coverage metadata are read only
-            # before or after a rewrite, never from its intermediate state.
-            async with history_lock:
+        with bounded_interactive_storage_reads():
+            history_lock = get_session_lock(ctx.turn_runner, session_key)
+            if history_lock is None:
                 page_entries, has_more, canonical_available, canonical_complete = (
                     await _load_page()
                 )
+            else:
+                # Canonical reads and compaction rewrites share one aiosqlite
+                # connection.  SQLite statements are snapshots, but a statement on
+                # that same connection can still observe the connection's own
+                # uncommitted archive/delete/reinsert work.  Use the short session
+                # mutation lock so the page and its coverage metadata are read only
+                # before or after a rewrite, never from its intermediate state.
+                started = time.monotonic()
+                acquired = False
+                try:
+                    try:
+                        async with asyncio.timeout(_CHAT_HISTORY_LOCK_BUDGET_SECONDS):
+                            await history_lock.acquire()
+                    except TimeoutError as exc:
+                        raise StorageBusyError(
+                            "chat.history",
+                            waited_ms=max(0, int((time.monotonic() - started) * 1000)),
+                            retry_after_ms=_CHAT_HISTORY_RETRY_AFTER_MS,
+                            stage="lock_acquire",
+                            resource="session_mutation_lock",
+                        ) from exc
+                    acquired = True
+                    page_entries, has_more, canonical_available, canonical_complete = (
+                        await _load_page()
+                    )
+                finally:
+                    if acquired:
+                        history_lock.release()
     except KeyError:
         if _is_webchat_session_key(session_key):
             return _empty_chat_history_payload(limit)

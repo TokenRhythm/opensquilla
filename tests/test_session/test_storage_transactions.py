@@ -16,7 +16,11 @@ from typing import Any
 import pytest
 
 from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus
-from opensquilla.session.storage import SessionStorage, StorageBusyError
+from opensquilla.session.storage import (
+    SessionStorage,
+    StorageBusyError,
+    bounded_interactive_storage_reads,
+)
 
 
 def _agent_task(task_id: str) -> AgentTaskRecord:
@@ -240,6 +244,59 @@ async def test_operation_gate_wait_is_bounded_by_the_write_busy_budget(tmp_path)
         if storage._operation_lock.locked():
             storage._operation_lock.release()
         await asyncio.gather(*writes, return_exceptions=True)
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_read_operation_gate_wait_is_bounded_by_the_busy_budget(tmp_path) -> None:
+    """An explicitly interactive read returns busy instead of waiting forever."""
+
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    storage._busy_budget_seconds = 0.05
+    await storage._operation_lock.acquire()
+    with bounded_interactive_storage_reads():
+        read = asyncio.create_task(
+            storage.get_session("agent:main:webchat:bounded-read")
+        )
+    try:
+        with pytest.raises(StorageBusyError) as caught:
+            await asyncio.wait_for(read, timeout=0.5)
+
+        assert caught.value.operation == "get_session"
+        assert caught.value.waited_ms >= 0
+        assert caught.value.retry_after_ms == 100
+        assert caught.value.stage == "lock_acquire"
+        assert caught.value.resource == "session_storage_operation_lock"
+        storage._operation_lock.release()
+        assert await storage.get_session("agent:main:webchat:bounded-read") is None
+    finally:
+        if storage._operation_lock.locked():
+            storage._operation_lock.release()
+        await asyncio.gather(read, return_exceptions=True)
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_internal_read_operation_gate_keeps_waiting_without_interactive_scope(
+    tmp_path,
+) -> None:
+    """Internal and CLI reads retain the pre-existing wait-for-writer contract."""
+
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    storage._busy_budget_seconds = 0.01
+    await storage._operation_lock.acquire()
+    read = asyncio.create_task(storage.get_session("agent:main:webchat:internal-read"))
+    try:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(read), timeout=0.05)
+        assert read.done() is False
+
+        storage._operation_lock.release()
+        assert await asyncio.wait_for(read, timeout=0.5) is None
+    finally:
+        if storage._operation_lock.locked():
+            storage._operation_lock.release()
+        await asyncio.gather(read, return_exceptions=True)
         await storage.close()
 
 

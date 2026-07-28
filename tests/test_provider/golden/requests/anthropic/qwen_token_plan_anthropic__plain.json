@@ -1,0 +1,35 @@
+{
+  "auth_style": "bearer",
+  "body": {
+    "max_tokens": 16384,
+    "messages": [
+      {
+        "content": "What is the capital of Australia?",
+        "role": "user"
+      },
+      {
+        "content": "Canberra.",
+        "role": "assistant"
+      },
+      {
+        "content": "Repeat the answer as a single word.",
+        "role": "user"
+      },
+      {
+        "content": "Canberra",
+        "role": "assistant"
+      },
+      {
+        "content": "Now write it in uppercase.",
+        "role": "user"
+      }
+    ],
+    "model": "qwen3.8-max-preview",
+    "stream": true,
+    "system": "You are a synthetic assistant used to freeze provider request payloads.",
+    "temperature": 0.7
+  },
+  "content_type": "application/json",
+  "method": "POST",
+  "url": "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic/v1/messages"
+}

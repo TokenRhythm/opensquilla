@@ -30,6 +30,19 @@ describe('useActiveProjectWorkspace', () => {
     expect(guard.isCurrent(projectB)).toBe(false)
   })
 
+  it('synchronously aborts the old project request before a new generation starts', () => {
+    const guard = createDraftProjectHydrationGuard()
+    const projectA = guard.begin()
+    const controllerA = guard.createController(projectA)
+    expect(controllerA?.signal.aborted).toBe(false)
+
+    const projectB = guard.begin()
+
+    expect(controllerA?.signal.aborted).toBe(true)
+    expect(guard.createController(projectA)).toBeNull()
+    expect(guard.createController(projectB)?.signal.aborted).toBe(false)
+  })
+
   it('clears pending binding after acceptance but keeps the active snapshot', () => {
     const state = useActiveProjectWorkspace()
     state.beginProjectDraft(project('p1', true))

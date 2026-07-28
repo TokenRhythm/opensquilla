@@ -960,7 +960,9 @@ def test_desktop_tokenrhythm_single_page_onboarding_defaults_to_router() -> None
     assert "routerDefaultTier: 'c1'," in onboarding_html
     assert "routerTiers," in onboarding_html
     assert "[data-model-routing-mode]" not in onboarding_html
-    assert "selection_mode = ${tomlString(selectionMode)}" in main_ts
+    assert "'selection_mode = \"custom_b5\"'" in main_ts
+    assert "'[[llm_ensemble.candidates]]'" in main_ts
+    assert "DESKTOP_ENSEMBLE_PROFILES[selectionMode]" in main_ts
 
     expected_models = (
         "deepseek-v4-flash",
@@ -1900,6 +1902,31 @@ def test_package_verifier_hard_fails_stale_runtime_and_boot_contract() -> None:
         "process.exit(1)",
     ]:
         assert expected in verifier
+
+
+def test_packaged_session_recovery_gate_uses_installed_electron_and_real_gateway() -> None:
+    package_json = json.loads(_read("desktop/electron/package.json"))
+    recovery = _read("desktop/electron/scripts/test-packaged-session-recovery.mjs")
+    helpers = _read("desktop/electron/scripts/packaged-smoke-helpers.mjs")
+
+    assert (
+        package_json["scripts"]["test:packaged-session-recovery"]
+        == "node scripts/test-packaged-session-recovery.mjs"
+    )
+    assert "_electron as electron" in helpers
+    assert "executablePath" in helpers
+    assert "--user-data-dir=" in helpers
+    assert "connectToServer()" in recovery
+    assert "chat.history" in recovery
+    assert "sessions.messages.subscribe" in recovery
+    assert "client.onMessage" in recovery
+    assert "server.onMessage" in recovery
+    assert "server.send(message)" in recovery
+    assert "client.send(message)" in recovery
+    assert "page.clock" not in recovery
+    assert "socketCount > 1" in recovery
+    assert "expectedLastMessage" in recovery
+    assert "preservedDraft" in recovery
 
 
 def test_desktop_gateway_build_and_verifier_cover_runtime_capabilities() -> None:

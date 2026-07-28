@@ -28,28 +28,6 @@
       </div>
       <div class="chat-input-panel">
         <div
-          v-if="projectWorkspace"
-          class="chat-project-chip"
-          :data-status="projectWorkspaceStatus || 'ready'"
-          :title="projectWorkspace.path"
-        >
-          <Icon name="folder" :size="14" />
-          <span class="chat-project-chip__name">{{ projectWorkspace.name }}</span>
-          <span class="chat-project-chip__path">{{ projectWorkspace.path }}</span>
-          <span v-if="projectStatusMessage" class="chat-project-chip__status">
-            {{ projectStatusMessage }}
-          </span>
-          <button
-            v-if="canCloseProject"
-            type="button"
-            :aria-label="t('workspaces.closeProjectDraft')"
-            :title="t('workspaces.closeProjectDraft')"
-            @click="emit('closeProject')"
-          >
-            <Icon name="x" :size="12" />
-          </button>
-        </div>
-        <div
           v-if="replanActive"
           class="chat-replan-draft"
           role="status"
@@ -111,6 +89,27 @@
                 @attach-files="fileInputEl?.click()"
                 @close="addMenuOpen = false"
               />
+            </div>
+            <div
+              v-if="showProjectContext && projectWorkspace"
+              class="chat-project-chip"
+              :data-status="projectWorkspaceStatus || 'ready'"
+              :title="projectWorkspace.path"
+            >
+              <Icon name="folder" :size="14" />
+              <span class="chat-project-chip__name">{{ projectWorkspace.name }}</span>
+              <span v-if="projectStatusMessage" class="chat-project-chip__status">
+                {{ projectStatusMessage }}
+              </span>
+              <button
+                v-if="canCloseProject"
+                type="button"
+                :aria-label="t('workspaces.closeProjectDraft')"
+                :title="t('workspaces.closeProjectDraft')"
+                @click="emit('closeProject')"
+              >
+                <Icon name="x" :size="12" />
+              </button>
             </div>
             <button
               v-if="
@@ -236,20 +235,10 @@
             @set-mode="emit('setCollaborationMode', $event)"
           />
           <div class="chat-input-actions chat-input-actions--right">
-            <button
-              class="btn btn--icon btn--primary chat-send-btn"
-              :class="{ 'is-ready': hasSendContent && !sendBlockedMessage }"
-              :title="sendBlockedMessage || sendButtonTitle"
-              :aria-label="replanActive ? t('chat.plan.reviseSend') : t('chat.send')"
-              :aria-describedby="sendBlockedMessage ? 'chat-composer-send-status' : undefined"
-              :disabled="Boolean(sendBlockedMessage)"
-              @click="emit('send')"
-            >
-              <Icon name="arrowUp" :size="17" />
-            </button>
-            <Transition name="composer-ctl">
+            <Transition name="composer-ctl" mode="out-in">
               <button
                 v-if="canStop"
+                key="stop"
                 class="btn btn--icon btn--danger chat-send-btn"
                 :title="stopTargetsPlanRun
                   ? t('chat.planRun.stopExecutionEsc')
@@ -260,6 +249,19 @@
                 @click="emit('stop')"
               >
                 <Icon name="stop" :size="16" />
+              </button>
+              <button
+                v-else
+                key="send"
+                class="btn btn--icon btn--primary chat-send-btn"
+                :class="{ 'is-ready': hasSendContent && !sendBlockedMessage }"
+                :title="sendBlockedMessage || sendButtonTitle"
+                :aria-label="replanActive ? t('chat.plan.reviseSend') : t('chat.send')"
+                :aria-describedby="sendBlockedMessage ? 'chat-composer-send-status' : undefined"
+                :disabled="Boolean(sendBlockedMessage)"
+                @click="emit('send')"
+              >
+                <Icon name="arrowUp" :size="17" />
               </button>
             </Transition>
           </div>
@@ -373,6 +375,9 @@ const fileInputEl = ref<HTMLInputElement | null>(null)
 const addMenuOpen = ref(false)
 const modelRoutingOpen = ref(false)
 const moreActionsOpen = ref(false)
+const showProjectContext = computed(() =>
+  Boolean(props.projectWorkspace && (props.canCloseProject || props.projectStatusMessage)),
+)
 
 // "NEW" badge on the routing control — the single-model AI router is now the
 // default, so flag it until the user first opens the control, then never again.
@@ -581,39 +586,63 @@ defineExpose<ChatComposerExpose>({
 }
 
 .chat-project-chip {
+  flex: 0 1 auto;
+  min-width: 0;
   width: fit-content;
-  max-width: 100%;
+  max-width: min(220px, 42vw);
   display: inline-flex;
   align-items: center;
-  gap: var(--sp-2);
-  margin: 0.625rem 0.875rem 0;
-  padding: 4px 8px;
+  gap: 5px;
+  min-height: 30px;
+  padding: 3px 6px;
   border: 0;
-  border-radius: var(--radius-full);
-  background: color-mix(in srgb, var(--accent) 7%, var(--bg-surface));
+  border-radius: var(--radius-control);
+  background: transparent;
   color: var(--text-muted);
   font-size: var(--fs-xs);
 }
-.chat-project-chip__name,
-.chat-project-chip__path {
+.chat-project-chip > .icon {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+}
+.chat-project-chip__name {
+  flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-weight: 400;
 }
-.chat-project-chip__name { flex-shrink: 0; font-weight: 650; }
-.chat-project-chip__path { color: var(--text-muted); font-family: var(--font-mono); }
 .chat-project-chip__status {
-  flex-shrink: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--warning, var(--text-muted));
   font-size: var(--fs-xs);
 }
 .chat-project-chip button {
+  flex: 0 0 auto;
   display: inline-flex;
+  align-items: center;
+  justify-content: center;
   padding: 2px;
   border: 0;
+  border-radius: var(--radius-full);
   background: transparent;
   color: inherit;
+  cursor: pointer;
+}
+.chat-project-chip button:hover,
+.chat-project-chip button:focus-visible {
+  outline: 0;
+  background: var(--bg-hover);
+  color: var(--text);
+}
+.chat-project-chip[data-status="unavailable"],
+.chat-project-chip[data-status="removed"],
+.chat-project-chip[data-status="error"] {
+  background: color-mix(in srgb, var(--warn) 7%, transparent);
 }
 .chat-project-choose {
   flex-shrink: 0;

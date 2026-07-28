@@ -97,6 +97,20 @@ async def test_non_string_req_id_gets_error_res_and_connection_survives() -> Non
     assert ws.close_codes == []
 
 
+async def test_raw_ping_pong_uses_bounded_connection_send_and_survives() -> None:
+    ws = await _run(
+        [
+            _CONNECT_FRAME,
+            '{"type":"ping"}',
+            json.dumps({"type": "req", "id": "after-ping", "method": "noop"}),
+        ]
+    )
+
+    assert '{"type":"pong"}' in ws.sent
+    assert any(r["ok"] and r["id"] == "after-ping" for r in ws.responses())
+    assert ws.close_codes == []
+
+
 async def test_non_string_method_gets_error_res_and_connection_survives() -> None:
     ws = await _run(
         [

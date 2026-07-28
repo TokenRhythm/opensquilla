@@ -161,12 +161,23 @@ def _router_detail(cfg: GatewayConfig, llm_source: str) -> str:
 
 
 def _ensemble_detail(cfg: GatewayConfig) -> str:
-    ensemble = getattr(cfg, "llm_ensemble", None)
-    if ensemble is None or not bool(getattr(ensemble, "enabled", False)):
+    from opensquilla.provider.ensemble import ensemble_runtime_status
+
+    runtime = ensemble_runtime_status(cfg)
+    if not runtime["enabled"]:
         return "disabled"
-    mode = str(getattr(ensemble, "selection_mode", "") or "")
-    options = list(getattr(ensemble, "model_options", []) or [])
-    return f"selection mode: {mode} ({len(options)} models)"
+    mode = str(runtime["selectionMode"])
+    proposer_count = runtime.get("proposerCount")
+    if proposer_count is None:
+        proposer_range = runtime.get("proposerCountRange") or []
+        count_text = (
+            f"{proposer_range[0]}-{proposer_range[1]} proposers"
+            if len(proposer_range) == 2
+            else "dynamic proposers"
+        )
+    else:
+        count_text = f"{proposer_count} proposers"
+    return f"selection mode: {mode} ({count_text})"
 
 
 def _candidate_field(candidate: object, field_name: str) -> object:
@@ -1041,6 +1052,46 @@ def get_onboarding_status(
         section_details["router"]["routerProviderConflicts"] = list(
             _router_provider_conflicts(config)
         )
+    if "ensemble" in section_details:
+        from opensquilla.provider.ensemble import ensemble_runtime_status
+
+        section_details["ensemble"].update(ensemble_runtime_status(config))
+    resolution_getter = getattr(config, "provider_resolution", None)
+    provider_resolution = (
+        resolution_getter() if callable(resolution_getter) else {}
+    )
+    if "llm" in section_details and provider_resolution:
+        effective_provider = provider_resolution.get("effective_provider")
+        section_details["llm"]["providerResolution"] = {
+            "status": str(provider_resolution.get("status") or "explicit"),
+            "effectiveProvider": str(
+                getattr(config.llm, "provider", "")
+                if effective_provider is None
+                else effective_provider
+            ),
+            "source": str(provider_resolution.get("source") or "config"),
+            "reasonCode": str(
+                provider_resolution.get("reason_code") or "provider_explicit"
+            ),
+            "actionRequired": bool(
+                provider_resolution.get("action_required", False)
+            ),
+            "actionRecommended": bool(
+                provider_resolution.get("action_recommended", False)
+            ),
+        }
+
+    warnings: tuple[str, ...] = ()
+    if bool(provider_resolution.get("action_required", False)):
+        warnings = (
+            "Provider evidence conflicts; choose and save the intended provider "
+            "before sending model requests.",
+        )
+    elif bool(provider_resolution.get("action_recommended", False)):
+        warnings = (
+            "Provider was inferred for compatibility; save the intended provider "
+            "to make the identity explicit.",
+        )
 
     llm_profile_status = _llm_profile_status(config, probe_history=probe_history)
     return OnboardingStatus(
@@ -1079,6 +1130,7 @@ def get_onboarding_status(
         ),
         sections=sections,
         section_details=section_details,
+        warnings=warnings,
     )
 
 

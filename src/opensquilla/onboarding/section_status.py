@@ -92,6 +92,10 @@ def llm_section_status(cfg: GatewayConfig) -> SectionStatus:
     missing or undecidable LLM always blocks onboarding.
     """
     llm = cfg.llm
+    resolution_getter = getattr(cfg, "provider_resolution", None)
+    resolution = resolution_getter() if callable(resolution_getter) else {}
+    if bool(resolution.get("action_required", False)):
+        return SectionStatus.DEGRADED
     if not _str(llm, "provider") or not _str(llm, "model"):
         return SectionStatus.MISSING
     try:

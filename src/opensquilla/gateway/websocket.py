@@ -57,6 +57,8 @@ log = structlog.get_logger(__name__)
 # Any future addition to this set MUST be verified against the same
 # upstream invariant.
 _LOSSY_EVENTS: frozenset[str] = frozenset({"tick"})
+_DIRECT_SEND_TIMEOUT_SECONDS = 2.0
+_DIRECT_CLOSE_TIMEOUT_SECONDS = 1.0
 
 # Sentinel pushed into the outbox by ``_stop_writer`` to wake a writer
 # blocked in ``await self._outbox.get()`` and exit cleanly.
@@ -69,7 +71,8 @@ class _OutboundFrame:
 
     ``seq`` is deliberately absent — it is minted by ``_writer_loop`` at
     dequeue time. ``kind`` is used by same-kind eviction; for events it is
-    ``f"event:{event_name}"``, for RPC responses it is ``"res"``.
+    ``f"event:{event_name}"``, for RPC responses it is ``"res"``, and raw
+    protocol frames such as pong use ``"raw"``.
     """
 
     kind: str
@@ -78,6 +81,7 @@ class _OutboundFrame:
     event_name: str | None
     res_frame: ResFrame | None
     meta: dict[str, Any] | None = None
+    raw_text: str | None = None
 
 
 def _payload_field(payload: Any, key: str) -> Any:
@@ -129,6 +133,69 @@ class WsConnection:
         self._seq += 1
         return self._seq
 
+    @staticmethod
+    def _consume_task_result(task: asyncio.Task[Any]) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except BaseException:
+            pass
+
+    async def _send_direct_text(self, text: str) -> None:
+        """Bound legacy direct sends so a wedged socket cannot stall an RPC."""
+
+        if self._closing or self.ws.client_state != WebSocketState.CONNECTED:
+            return
+        send_task = asyncio.create_task(
+            self.ws.send_text(text),
+            name=f"ws-direct-send-{self.conn_id}",
+        )
+        try:
+            done, _ = await asyncio.wait(
+                {send_task},
+                timeout=_DIRECT_SEND_TIMEOUT_SECONDS,
+            )
+        except BaseException:
+            send_task.cancel()
+            send_task.add_done_callback(self._consume_task_result)
+            self._closing = True
+            raise
+        if send_task in done:
+            try:
+                await send_task
+            except BaseException:
+                self._closing = True
+                raise
+            return
+
+        send_task.cancel()
+        send_task.add_done_callback(self._consume_task_result)
+        self._closing = True
+        log.warning(
+            "gateway.ws_direct_send_timeout",
+            conn_id=self.conn_id,
+            timeout_seconds=_DIRECT_SEND_TIMEOUT_SECONDS,
+        )
+
+        close_task = asyncio.create_task(
+            self.ws.close(code=1011, reason="direct_send_timeout"),
+            name=f"ws-direct-close-{self.conn_id}",
+        )
+        done, _ = await asyncio.wait(
+            {close_task},
+            timeout=_DIRECT_CLOSE_TIMEOUT_SECONDS,
+        )
+        if close_task in done:
+            try:
+                await close_task
+            except Exception:
+                pass
+        else:
+            close_task.cancel()
+            close_task.add_done_callback(self._consume_task_result)
+        raise TimeoutError("WebSocket direct send timed out")
+
     # ------------------------------------------------------------------
     # Public send entry points
     # ------------------------------------------------------------------
@@ -139,6 +206,8 @@ class WsConnection:
         payload: Any = None,
         meta: dict[str, Any] | None = None,
     ) -> None:
+        if self._closing:
+            return
         # Atomic check + enqueue. The check and ``put_nowait`` are part of
         # one synchronous flow with no ``await`` between them, so
         # ``_force_close`` cannot flip ``_closing`` mid-flight (asyncio is
@@ -161,11 +230,13 @@ class WsConnection:
             return
         # Legacy direct-send path (pre-auth, kill-switch off, or post-stop).
         async with self._send_lock:
-            if self.ws.client_state == WebSocketState.CONNECTED:
+            if not self._closing and self.ws.client_state == WebSocketState.CONNECTED:
                 wire = make_event(event, payload, seq=self.next_seq(), meta=meta)
-                await self.ws.send_text(wire.model_dump_json())
+                await self._send_direct_text(wire.model_dump_json())
 
     async def send_res(self, frame: ResFrame) -> None:
+        if self._closing:
+            return
         # RPC responses are always CONTROL: they carry state-bearing payloads
         # and a slow-client overflow must close the connection rather than
         # silently dropping the response.
@@ -184,12 +255,37 @@ class WsConnection:
             self._enqueue_frame(outbound)
             return
         async with self._send_lock:
-            if self.ws.client_state == WebSocketState.CONNECTED:
-                await self.ws.send_text(frame.model_dump_json())
+            if not self._closing and self.ws.client_state == WebSocketState.CONNECTED:
+                await self._send_direct_text(frame.model_dump_json())
+
+    async def send_raw_text(self, text: str) -> None:
+        """Send a protocol-level raw frame through the connection writer."""
+
+        if self._closing:
+            return
+        if self._queue_enabled and self._outbox is not None:
+            self._enqueue_frame(
+                _OutboundFrame(
+                    kind="raw",
+                    classification="control",
+                    payload=None,
+                    event_name=None,
+                    res_frame=None,
+                    raw_text=text,
+                )
+            )
+            return
+        async with self._send_lock:
+            if not self._closing and self.ws.client_state == WebSocketState.CONNECTED:
+                await self._send_direct_text(text)
 
     async def close(self, code: int = WS_CLOSE_SERVICE_RESTART, reason: str = "") -> None:
+        self._closing = True
         try:
-            await self.ws.close(code=code)
+            if reason:
+                await self.ws.close(code=code, reason=reason)
+            else:
+                await self.ws.close(code=code)
         except Exception:
             pass
 
@@ -329,6 +425,8 @@ class WsConnection:
                         text = wire.model_dump_json()
                     elif item.res_frame is not None:
                         text = item.res_frame.model_dump_json()
+                    elif item.raw_text is not None:
+                        text = item.raw_text
                     else:
                         continue
                 except asyncio.CancelledError:
@@ -612,7 +710,7 @@ async def handle_ws_connection(
     nonce = str(uuid.uuid4())
     try:
         await conn.send_event("connect.challenge", {"nonce": nonce})
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, TimeoutError):
         return
 
     # Step 2: Pre-auth timeout — client must send connect request
@@ -738,7 +836,10 @@ async def handle_ws_connection(
         ),
         auth=hello_auth_payload(principal),
     )
-    await ws.send_text(hello.model_dump_json())
+    try:
+        await conn.send_raw_text(hello.model_dump_json())
+    except (WebSocketDisconnect, TimeoutError):
+        return
 
     registry.register(conn)
     # Boundary: pre-auth direct-send ends here. After registry.register(conn),
@@ -882,7 +983,7 @@ async def _message_loop(
         frame_type = data.get("type")
 
         if frame_type == "ping":
-            await ws.send_text('{"type":"pong"}')
+            await conn.send_raw_text('{"type":"pong"}')
             continue
 
         if frame_type == "pong":

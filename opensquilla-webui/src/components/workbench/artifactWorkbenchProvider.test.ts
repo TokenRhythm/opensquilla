@@ -197,8 +197,16 @@ describe('artifact Workbench provider', () => {
       version: 1,
       surfaceId: item.id,
       type: 'crashed',
+      detail: { reason: 'unresponsive' },
     }, item)
     expect(renderState.nativeSurfaceState).toBe('crashed')
+    expect(destroySurface).toHaveBeenLastCalledWith(item.id)
+    expect(definition.getToolbarItems?.(item, {
+      active: true,
+      hostAvailable: true,
+      nativeSurface: true,
+      runtimeState: renderState,
+    })?.some(toolbarItem => toolbarItem.id === 'refresh')).toBe(true)
 
     await runtime.handleComponentEvent?.({
       type: 'native-html-ready',

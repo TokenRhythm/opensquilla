@@ -2,6 +2,8 @@ import { ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
 import { useChatSessionSubscription } from './useChatSessionSubscription'
+import { SESSION_PHASE_ATTEMPT_BUDGET_MS } from './sessionBootstrapContract'
+import { RpcTimeoutError, type RpcCallOptions } from '@/lib/rpc'
 import type { ChatRunStatus, ChatRunStatusState } from '@/types/chat'
 
 function createSubscription(hasActiveInterrupt = false) {
@@ -38,6 +40,172 @@ function createSubscription(hasActiveInterrupt = false) {
 }
 
 describe('useChatSessionSubscription', () => {
+  it('keeps mixed-version compatibility when an old Gateway lacks snapshot', async () => {
+    const unsupported = Object.assign(new Error('method not found'), {
+      code: 'METHOD_NOT_FOUND',
+    })
+    const call = vi.fn(async (method: string) => {
+      if (method === 'sessions.messages.snapshot') throw unsupported
+      return {
+        subscribed: true,
+        run_status: 'idle',
+        replay_complete: true,
+        current_stream_seq: 9,
+      }
+    })
+    const rpc = {
+      waitForConnection: vi.fn(async () => {}),
+      call: call as unknown as <T = unknown>(
+        method: string,
+        params?: Record<string, unknown>,
+        options?: RpcCallOptions,
+      ) => Promise<T>,
+    }
+    const subscription = useChatSessionSubscription({
+      rpc,
+      sessionKey: ref('agent:main:webchat:old-gateway'),
+      lastStreamSeq: ref(0),
+      runStatus: ref<ChatRunStatus>({ status: 'idle', label: '', task: null }),
+      isStreaming: ref(false),
+      hasActiveInterrupt: ref(false),
+      activeStreamTaskId: ref(''),
+      activeTaskGroups: ref(new Set<string>()),
+      sessionRunStatus: () => ({ status: 'idle', label: '', task: null }),
+      startStreaming: vi.fn(),
+      loadHistory: vi.fn(),
+      resetStreamIdleTimer: vi.fn(),
+      resetStreamLiveTurnState: vi.fn(),
+      onLiveSnapshot: vi.fn(),
+    })
+
+    const outcome = await subscription.subscribeSession()
+
+    expect(outcome.authoritative).toBe(true)
+    expect(rpc.call).toHaveBeenNthCalledWith(
+      1,
+      'sessions.messages.subscribe',
+      {
+        key: 'agent:main:webchat:old-gateway',
+        since_stream_seq: 0,
+        fast_ack: true,
+      },
+    )
+    expect(rpc.call).toHaveBeenNthCalledWith(
+      2,
+      'sessions.messages.snapshot',
+      { key: 'agent:main:webchat:old-gateway' },
+    )
+  })
+
+  it('skips snapshot on the second bounded bootstrap attempt', async () => {
+    const now = Date.now()
+    const rpc = {
+      waitForConnection: vi.fn(async () => {}),
+      call: vi.fn().mockResolvedValue({
+        subscribed: true,
+        run_status: 'idle',
+        replay_complete: true,
+        current_stream_seq: 0,
+      }),
+    }
+    const subscription = useChatSessionSubscription({
+      rpc,
+      sessionKey: ref('agent:main:webchat:skip-snapshot'),
+      lastStreamSeq: ref(0),
+      runStatus: ref<ChatRunStatus>({ status: 'idle', label: '', task: null }),
+      isStreaming: ref(false),
+      hasActiveInterrupt: ref(false),
+      activeStreamTaskId: ref(''),
+      activeTaskGroups: ref(new Set<string>()),
+      sessionRunStatus: () => ({ status: 'idle', label: '', task: null }),
+      startStreaming: vi.fn(),
+      loadHistory: vi.fn(),
+      resetStreamIdleTimer: vi.fn(),
+      resetStreamLiveTurnState: vi.fn(),
+      onLiveSnapshot: vi.fn(),
+    })
+
+    await subscription.subscribeSession({
+      generation: 1,
+      key: 'agent:main:webchat:skip-snapshot',
+      attempt: 1,
+      deadlineAt: now + 15_000,
+      attemptDeadlineAt: now + 7_000,
+      signal: new AbortController().signal,
+      skipSnapshot: true,
+    })
+
+    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(rpc.call).toHaveBeenCalledWith(
+      'sessions.messages.subscribe',
+      {
+        key: 'agent:main:webchat:skip-snapshot',
+        since_stream_seq: 0,
+        fast_ack: true,
+      },
+      expect.objectContaining({
+        timeoutMs: expect.any(Number),
+        timeoutAction: 'reconnect',
+      }),
+    )
+  })
+
+  it('propagates a snapshot timeout to the coordinator instead of subscribing on a blocked socket', async () => {
+    const now = Date.now()
+    const timeout = new RpcTimeoutError('sessions.messages.snapshot', 3_000)
+    const rpc = {
+      waitForConnection: vi.fn(async () => {}),
+      call: vi.fn().mockRejectedValue(timeout),
+    }
+    const subscription = useChatSessionSubscription({
+      rpc,
+      sessionKey: ref('agent:main:webchat:snapshot-timeout'),
+      lastStreamSeq: ref(0),
+      runStatus: ref<ChatRunStatus>({ status: 'idle', label: '', task: null }),
+      isStreaming: ref(false),
+      hasActiveInterrupt: ref(false),
+      activeStreamTaskId: ref(''),
+      activeTaskGroups: ref(new Set<string>()),
+      sessionRunStatus: () => ({ status: 'idle', label: '', task: null }),
+      startStreaming: vi.fn(),
+      loadHistory: vi.fn(),
+      resetStreamIdleTimer: vi.fn(),
+      resetStreamLiveTurnState: vi.fn(),
+      onLiveSnapshot: vi.fn(),
+    })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const outcome = await subscription.subscribeSession({
+      generation: 1,
+      key: 'agent:main:webchat:snapshot-timeout',
+      attempt: 0,
+      deadlineAt: now + 15_000,
+      attemptDeadlineAt: now + 7_000,
+      signal: new AbortController().signal,
+      skipSnapshot: false,
+    })
+
+    expect(outcome).toMatchObject({
+      authoritative: false,
+      error: timeout,
+      cancelled: false,
+    })
+    expect(rpc.call).toHaveBeenCalledTimes(2)
+    expect(rpc.call).toHaveBeenNthCalledWith(
+      1,
+      'sessions.messages.subscribe',
+      expect.any(Object),
+      expect.any(Object),
+    )
+    expect(rpc.call).toHaveBeenNthCalledWith(
+      2,
+      'sessions.messages.snapshot',
+      expect.any(Object),
+      expect.any(Object),
+    )
+    warn.mockRestore()
+  })
+
   it('restores the compact live snapshot before subscribing from its cursor', async () => {
     const onLiveSnapshot = vi.fn()
     const rpc = {
@@ -96,7 +264,12 @@ describe('useChatSessionSubscription', () => {
 
     await subscription.subscribeSession()
 
-    expect(rpc.call).toHaveBeenNthCalledWith(1, 'sessions.messages.snapshot', {
+    expect(rpc.call).toHaveBeenNthCalledWith(1, 'sessions.messages.subscribe', {
+      key: 'agent:main:webchat:resume',
+      since_stream_seq: 0,
+      fast_ack: true,
+    })
+    expect(rpc.call).toHaveBeenNthCalledWith(2, 'sessions.messages.snapshot', {
       key: 'agent:main:webchat:resume',
     })
     expect(onLiveSnapshot).toHaveBeenCalledWith({
@@ -113,10 +286,6 @@ describe('useChatSessionSubscription', () => {
           },
         },
       ],
-    })
-    expect(rpc.call).toHaveBeenNthCalledWith(2, 'sessions.messages.subscribe', {
-      key: 'agent:main:webchat:resume',
-      since_stream_seq: 2400,
     })
     expect(lastStreamSeq.value).toBe(2402)
   })
@@ -336,7 +505,13 @@ describe('useChatSessionSubscription', () => {
 
     const outcome = await subscription.subscribeSession()
 
-    expect(outcome).toEqual({ authoritative: false, live: false, backgroundOnly: false })
+    expect(outcome).toMatchObject({
+      authoritative: false,
+      live: false,
+      backgroundOnly: false,
+      cancelled: false,
+      error: expect.any(Error),
+    })
     warn.mockRestore()
   })
 
@@ -388,10 +563,11 @@ describe('useChatSessionSubscription', () => {
     })
     pendingSnapshots[0]?.({ subscribed: true, run_status: 'idle' })
 
-    await expect(older).resolves.toEqual({
+    await expect(older).resolves.toMatchObject({
       authoritative: false,
       live: false,
       backgroundOnly: false,
+      cancelled: true,
     })
     expect(runStatus.value.status).toBe('running')
   })
@@ -604,5 +780,242 @@ describe('useChatSessionSubscription', () => {
       2,
     )
     warn.mockRestore()
+  })
+
+  it('keeps fast ACK defaults non-authoritative and hydrates project metadata separately', async () => {
+    const onSnapshot = vi.fn()
+    const onSessionMetadata = vi.fn()
+    const resetStreamLiveTurnState = vi.fn()
+    const runStatus = ref<ChatRunStatus>({
+      status: 'running',
+      label: 'Running',
+      task: null,
+    })
+    let resolveHistory!: () => void
+    const historyTerminal = new Promise<void>(resolve => {
+      resolveHistory = resolve
+    })
+    const markLiveSubscribeSent = vi.fn()
+    const rpc = {
+      waitForConnection: vi.fn(async () => {}),
+      call: async <T = unknown>(method: string) => {
+        if (method === 'sessions.messages.subscribe') {
+          return {
+            subscribed: true,
+            hydration_complete: false,
+            deferred_fields: ['workspaceId', 'projectWorkspace', 'run_status'],
+            projectWorkspaceDeferred: true,
+            replay_complete: true,
+            current_stream_seq: 12,
+            run_status: 'idle',
+          } as T
+        }
+        if (method === 'sessions.messages.hydrate') {
+          return {
+            hydration_complete: true,
+            workspaceId: 'project-deferred',
+            projectWorkspaceDeferred: true,
+            run_status: 'running',
+            active_task: { task_id: 'active-task', status: 'running' },
+          } as T
+        }
+        throw new Error(`Unexpected method: ${method}`)
+      },
+    }
+    const subscription = useChatSessionSubscription({
+      rpc,
+      sessionKey: ref('agent:main:webchat:fast-ack'),
+      lastStreamSeq: ref(0),
+      runStatus,
+      isStreaming: ref(true),
+      hasActiveInterrupt: ref(false),
+      activeStreamTaskId: ref('active-task'),
+      activeTaskGroups: ref(new Set<string>()),
+      sessionRunStatus: source => ({
+        status: source?.run_status === 'running' ? 'running' : 'idle',
+        label: source?.run_status === 'running' ? 'Running' : 'Idle',
+        task: null,
+      }),
+      startStreaming: vi.fn(),
+      loadHistory: vi.fn(),
+      resetStreamIdleTimer: vi.fn(),
+      resetStreamLiveTurnState,
+      beginSessionMetadataResolution: () => 7,
+      onSessionMetadata,
+      onSnapshot,
+    })
+
+    const now = Date.now()
+    const outcome = await subscription.subscribeSession({
+      generation: 1,
+      key: 'agent:main:webchat:fast-ack',
+      attempt: 0,
+      deadlineAt: now + 15_000,
+      attemptDeadlineAt: now + 7_000,
+      signal: new AbortController().signal,
+      skipSnapshot: false,
+      markLiveSubscribeSent,
+      waitForHistoryTerminal: () => historyTerminal,
+    })
+
+    expect(markLiveSubscribeSent).toHaveBeenCalledOnce()
+    expect(onSessionMetadata).not.toHaveBeenCalled()
+    expect(runStatus.value.status).toBe('running')
+    resolveHistory()
+    await vi.waitFor(() => expect(onSessionMetadata).toHaveBeenCalledOnce())
+
+    expect(outcome.authoritative).toBe(true)
+    expect(runStatus.value.status).toBe('running')
+    expect(onSnapshot).toHaveBeenCalledOnce()
+    expect(resetStreamLiveTurnState).not.toHaveBeenCalled()
+    expect(onSessionMetadata).toHaveBeenCalledWith(
+      'agent:main:webchat:fast-ack',
+      7,
+      {
+        workspaceId: 'project-deferred',
+        projectWorkspace: undefined,
+      },
+    )
+  })
+
+  it('gives deferred metadata a fresh bounded window after history exhausts its budget', async () => {
+    let now = 10_000
+    const dateNow = vi.spyOn(Date, 'now').mockImplementation(() => now)
+    const onSessionMetadata = vi.fn()
+    let resolveHistory!: () => void
+    const historyTerminal = new Promise<void>(resolve => {
+      resolveHistory = resolve
+    })
+    const call = vi.fn(async <T = unknown>(method: string, _params?: unknown, options?: {
+        timeoutMs?: number
+      }) => {
+        if (method === 'sessions.messages.subscribe') {
+          return {
+            subscribed: true,
+            hydration_complete: false,
+            current_stream_seq: 0,
+          } as T
+        }
+        if (method === 'sessions.messages.hydrate') {
+          expect(options?.timeoutMs).toBeGreaterThan(0)
+          expect(options?.timeoutMs).toBeLessThanOrEqual(
+            SESSION_PHASE_ATTEMPT_BUDGET_MS,
+          )
+          return {
+            hydration_complete: true,
+            workspaceId: null,
+          } as T
+        }
+        throw new Error(`Unexpected method: ${method}`)
+      })
+    const rpc = {
+      waitForConnection: vi.fn(async () => {}),
+      call: call as unknown as <T = unknown>(
+        method: string,
+        params?: Record<string, unknown>,
+        options?: RpcCallOptions,
+      ) => Promise<T>,
+    }
+    const subscription = useChatSessionSubscription({
+      rpc,
+      sessionKey: ref('agent:main:webchat:expired-history'),
+      lastStreamSeq: ref(0),
+      runStatus: ref<ChatRunStatus>({ status: 'idle', label: '', task: null }),
+      isStreaming: ref(false),
+      hasActiveInterrupt: ref(false),
+      activeStreamTaskId: ref(''),
+      activeTaskGroups: ref(new Set<string>()),
+      sessionRunStatus: () => ({ status: 'idle', label: '', task: null }),
+      startStreaming: vi.fn(),
+      loadHistory: vi.fn(),
+      resetStreamIdleTimer: vi.fn(),
+      resetStreamLiveTurnState: vi.fn(),
+      beginSessionMetadataResolution: () => 9,
+      onSessionMetadata,
+    })
+
+    const outcome = await subscription.subscribeSession({
+      generation: 1,
+      key: 'agent:main:webchat:expired-history',
+      attempt: 1,
+      deadlineAt: now + 100,
+      attemptDeadlineAt: now + 100,
+      signal: new AbortController().signal,
+      skipSnapshot: true,
+      waitForHistoryTerminal: () => historyTerminal,
+    })
+
+    expect(outcome.authoritative).toBe(true)
+    now += 101
+    resolveHistory()
+    await vi.waitFor(() => expect(onSessionMetadata).toHaveBeenCalledOnce())
+    expect(call.mock.calls.map(([method]) => method)).toEqual([
+      'sessions.messages.subscribe',
+      'sessions.messages.hydrate',
+    ])
+    dateNow.mockRestore()
+  })
+
+  it('retries failed session metadata without replacing a healthy live subscription', async () => {
+    const beginSessionMetadataResolution = vi.fn(() => 12)
+    const onSessionMetadata = vi.fn()
+    const rpc = {
+      waitForConnection: vi.fn(async () => {}),
+      call: vi.fn(async <T = unknown>(method: string) => {
+        if (method !== 'sessions.messages.hydrate') {
+          throw new Error(`Unexpected method: ${method}`)
+        }
+        return {
+          hydration_complete: true,
+          workspaceId: 'project-recovered',
+          projectWorkspace: {
+            id: 'project-recovered',
+            name: 'Recovered',
+            path: '/repos/recovered',
+            available: true,
+            removed: false,
+          },
+        } as T
+      }) as unknown as <T = unknown>(
+        method: string,
+        params?: Record<string, unknown>,
+        options?: RpcCallOptions,
+      ) => Promise<T>,
+    }
+    const subscription = useChatSessionSubscription({
+      rpc,
+      sessionKey: ref('agent:main:webchat:metadata-retry'),
+      lastStreamSeq: ref(0),
+      runStatus: ref<ChatRunStatus>({ status: 'idle', label: '', task: null }),
+      isStreaming: ref(false),
+      hasActiveInterrupt: ref(false),
+      activeStreamTaskId: ref(''),
+      activeTaskGroups: ref(new Set<string>()),
+      sessionRunStatus: () => ({ status: 'idle', label: '', task: null }),
+      startStreaming: vi.fn(),
+      loadHistory: vi.fn(),
+      resetStreamIdleTimer: vi.fn(),
+      resetStreamLiveTurnState: vi.fn(),
+      beginSessionMetadataResolution,
+      onSessionMetadata,
+    })
+
+    await expect(subscription.retrySessionMetadata()).resolves.toBe(true)
+
+    expect(rpc.waitForConnection).toHaveBeenCalledOnce()
+    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(rpc.call).toHaveBeenCalledWith(
+      'sessions.messages.hydrate',
+      { key: 'agent:main:webchat:metadata-retry' },
+      expect.objectContaining({
+        timeoutAction: 'reconnect',
+        abortAction: 'reconnect',
+      }),
+    )
+    expect(onSessionMetadata).toHaveBeenCalledWith(
+      'agent:main:webchat:metadata-retry',
+      12,
+      expect.objectContaining({ workspaceId: 'project-recovered' }),
+    )
   })
 })

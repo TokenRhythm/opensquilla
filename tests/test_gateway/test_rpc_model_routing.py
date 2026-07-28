@@ -14,6 +14,7 @@ from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.model_routing import (
     apply_model_routing_mode,
     capture_model_routing_config,
+    ensemble_activation_preview,
     model_routing_mode_for_write,
     model_routing_patches,
     model_routing_snapshot,
@@ -36,9 +37,215 @@ from opensquilla.gateway.rpc_onboarding import (
 )
 from opensquilla.gateway.scopes import ADMIN_SCOPE, METHOD_SCOPES, READ_SCOPE, WRITE_SCOPE
 from opensquilla.gateway.task_runtime import TaskRuntime
+from opensquilla.onboarding.mutations import upsert_llm_ensemble
 from opensquilla.session.models import AgentTaskRecord
 from opensquilla.tools.policy import apply_tool_policy_from_config
 from opensquilla.tools.types import ToolContext
+
+
+def test_fresh_tokenrhythm_ensemble_activation_materializes_custom_lineup() -> None:
+    cfg = GatewayConfig(
+        llm={
+            "provider": "tokenrhythm",
+            "api_key": "sk_tr_abcdefghijklmnop",
+        }
+    )
+
+    changed = upsert_llm_ensemble(cfg, enabled=True).config
+
+    assert changed.llm_ensemble.enabled is True
+    assert changed.llm_ensemble.selection_mode == "custom_b5"
+    assert len(changed.llm_ensemble.candidates) == 5
+    assert {
+        candidate.provider for candidate in changed.llm_ensemble.candidates
+    } == {"tokenrhythm"}
+    assert changed.llm_ensemble.candidates[-1].role == "aggregator"
+    assert "llm_ensemble.selection_mode" in changed.force_persist_paths()
+    assert "llm_ensemble.candidates" in changed.force_persist_paths()
+
+
+def test_fresh_openrouter_ensemble_activation_materializes_custom_lineup() -> None:
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "api_key": "synthetic-openrouter-key",
+        }
+    )
+
+    changed = upsert_llm_ensemble(cfg, enabled=True).config
+
+    assert changed.llm_ensemble.selection_mode == "custom_b5"
+    assert len(changed.llm_ensemble.candidates) == 5
+    assert {
+        candidate.provider for candidate in changed.llm_ensemble.candidates
+    } == {"openrouter"}
+    assert changed.llm_ensemble.candidates[-1].model == "z-ai/glm-5.2"
+    assert changed.llm_ensemble.candidates[-1].role == "aggregator"
+
+
+def test_explicit_cross_provider_ensemble_selection_is_preserved() -> None:
+    cfg = GatewayConfig(
+        llm={"provider": "tokenrhythm", "api_key": "sk_tr_abcdefghijklmnop"},
+        llm_ensemble={"selection_mode": "static_openrouter_b5"},
+    )
+
+    changed = upsert_llm_ensemble(cfg, enabled=True).config
+
+    assert changed.llm_ensemble.selection_mode == "static_openrouter_b5"
+    assert changed.llm_ensemble.candidates == []
+
+
+def test_same_request_explicit_selection_wins_over_activation_planner() -> None:
+    cfg = GatewayConfig(
+        llm={"provider": "tokenrhythm", "api_key": "sk_tr_abcdefghijklmnop"}
+    )
+
+    changed = upsert_llm_ensemble(
+        cfg,
+        enabled=True,
+        selection_mode="static_openrouter_b5",
+    ).config
+
+    assert changed.llm_ensemble.enabled is True
+    assert changed.llm_ensemble.selection_mode == "static_openrouter_b5"
+    assert changed.llm_ensemble.candidates == []
+
+
+def test_reenable_preserves_first_generated_ensemble_selection() -> None:
+    cfg = GatewayConfig(
+        llm={"provider": "tokenrhythm", "api_key": "sk_tr_abcdefghijklmnop"}
+    )
+    enabled = upsert_llm_ensemble(cfg, enabled=True).config
+    original = [
+        candidate.model_dump(mode="python")
+        for candidate in enabled.llm_ensemble.candidates
+    ]
+    disabled = upsert_llm_ensemble(enabled, enabled=False).config
+
+    reenabled = upsert_llm_ensemble(disabled, enabled=True).config
+
+    assert reenabled.llm_ensemble.selection_mode == "custom_b5"
+    assert [
+        candidate.model_dump(mode="python")
+        for candidate in reenabled.llm_ensemble.candidates
+    ] == original
+
+
+def test_other_provider_activation_uses_distinct_router_tiers() -> None:
+    cfg = GatewayConfig(
+        llm={"provider": "openai", "model": "gpt-primary", "api_key": "sk-test-openai"},
+        squilla_router={
+            "tiers": {
+                "c0": {"provider": "openai", "model": "gpt-fast"},
+                "c3": {"provider": "openai", "model": "gpt-strong"},
+            }
+        },
+    )
+
+    changed = upsert_llm_ensemble(cfg, enabled=True).config
+
+    assert changed.llm_ensemble.selection_mode == "custom_b5"
+    assert [candidate.model for candidate in changed.llm_ensemble.candidates] == [
+        "gpt-fast",
+        "gpt-strong",
+    ]
+    assert all(
+        candidate.role != "aggregator"
+        for candidate in changed.llm_ensemble.candidates
+    )
+    assert changed.llm.model == "gpt-primary"
+
+
+def test_other_provider_activation_with_one_candidate_fails_atomically() -> None:
+    cfg = GatewayConfig(
+        llm={"provider": "openai", "model": "gpt-primary", "api_key": "sk-test-openai"},
+        squilla_router={
+            "tiers": {
+                "c0": {"provider": "openai", "model": "same-model"},
+                "c3": {"provider": "openai", "model": "same-model"},
+            }
+        },
+    )
+
+    with pytest.raises(ValueError, match="at least two distinct runtime-supported"):
+        upsert_llm_ensemble(cfg, enabled=True)
+
+    assert cfg.llm_ensemble.enabled is False
+    assert cfg.llm_ensemble.candidates == []
+
+
+@pytest.mark.parametrize("invalid_provider", ["unknown-provider", "github_copilot"])
+def test_other_provider_activation_rejects_non_runtime_candidates_atomically(
+    invalid_provider: str,
+) -> None:
+    cfg = GatewayConfig(
+        llm={"provider": "openai", "model": "gpt-primary", "api_key": "sk-test-openai"},
+        squilla_router={
+            "tiers": {
+                "c0": {"provider": "openai", "model": "gpt-fast"},
+                "c1": {"provider": invalid_provider, "model": "invalid-model"},
+            }
+        },
+    )
+
+    with pytest.raises(ValueError, match="at least two distinct runtime-supported"):
+        upsert_llm_ensemble(cfg, enabled=True)
+
+    assert cfg.llm_ensemble.enabled is False
+    assert cfg.llm_ensemble.candidates == []
+
+
+def test_other_provider_activation_excludes_non_runtime_candidates() -> None:
+    cfg = GatewayConfig(
+        llm={"provider": "openai", "model": "gpt-primary", "api_key": "sk-test-openai"},
+        squilla_router={
+            "tiers": {
+                "c0": {"provider": "openai", "model": "gpt-fast"},
+                "c1": {"provider": "unknown-provider", "model": "invalid-model"},
+                "c2": {"provider": "anthropic", "model": "claude-primary"},
+            }
+        },
+    )
+
+    changed = upsert_llm_ensemble(cfg, enabled=True).config
+
+    assert [
+        (candidate.provider, candidate.model)
+        for candidate in changed.llm_ensemble.candidates
+    ] == [
+        ("openai", "gpt-fast"),
+        ("anthropic", "claude-primary"),
+    ]
+
+
+def test_other_provider_activation_preview_reports_non_runtime_candidates_as_blocked() -> None:
+    cfg = GatewayConfig(
+        llm={"provider": "openai", "model": "gpt-primary"},
+        squilla_router={
+            "tiers": {
+                "c0": {"provider": "openai", "model": "gpt-fast"},
+                "c1": {"provider": "unknown-provider", "model": "invalid-model"},
+            }
+        },
+    )
+
+    preview = ensemble_activation_preview(cfg)
+
+    assert preview["proposer_count"] == 0
+    assert "runtime-supported" in preview["blocked_reason"]
+    assert cfg.llm_ensemble.enabled is False
+    assert cfg.llm_ensemble.candidates == []
+
+
+def test_unconfigured_ensemble_preview_does_not_present_openrouter_default() -> None:
+    preview = ensemble_activation_preview(GatewayConfig())
+
+    assert preview["selection_mode"] == "custom_b5"
+    assert preview["selection_configured"] is False
+    assert preview["proposer_count"] == 4
+    assert preview["member_providers"] == ["tokenrhythm"]
+    assert len(preview["candidates"]) == 5
+    assert preview["candidates"][-1]["role"] == "aggregator"
 
 
 def _ctx(config: GatewayConfig) -> RpcContext:
@@ -190,6 +397,37 @@ async def test_models_routing_set_persists_and_returns_canonical_snapshot(tmp_pa
     assert model_routing_snapshot(reloaded)["mode"] == "direct"
     persisted = tomllib.loads(path.read_text())
     assert persisted["squilla_router"]["enabled"] is False
+
+
+async def test_models_routing_set_first_tokenrhythm_activation_persists_plan(
+    tmp_path,
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "\n".join(
+            [
+                "[llm]",
+                'provider = "tokenrhythm"',
+                'api_key = "sk_tr_abcdefghijklmnop"',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    config = GatewayConfig.load(str(path))
+
+    result = await _handle_models_routing_set({"mode": "ensemble"}, _ctx(config))
+
+    assert result["mode"] == "ensemble"
+    assert result["selection_mode"] == "custom_b5"
+    assert result["selection_configured"] is True
+    assert len(config.llm_ensemble.candidates) == 5
+    persisted = tomllib.loads(path.read_text())
+    assert persisted["llm_ensemble"]["selection_mode"] == "custom_b5"
+    assert len(persisted["llm_ensemble"]["candidates"]) == 5
+    reloaded = GatewayConfig.load(str(path))
+    assert reloaded.llm_ensemble.selection_mode == "custom_b5"
+    assert len(reloaded.llm_ensemble.candidates) == 5
 
 
 async def test_models_routing_get_is_read_only() -> None:

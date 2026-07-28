@@ -42,6 +42,8 @@ function makeOptions(
     pendingForkBeforeMessageId,
     aiGeneratedLabel,
     notifyMessagePending: vi.fn(),
+    canDeliver: () => true,
+    notifyDeliveryBlocked: vi.fn(),
   }
   return { api: useChatMessageActions(options), options, pendingForkBeforeMessageId }
 }
@@ -95,6 +97,31 @@ describe('useChatMessageActions branching edits', () => {
     expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A'])
     expect(options.inputText.value).toBe('B')
     expect(options.sendCurrentInput).toHaveBeenCalledOnce()
+  })
+
+  it('preserves history, fork state, and the current draft when live delivery is unavailable', async () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+    ]
+    const { api, options, pendingForkBeforeMessageId } = makeOptions(messages)
+    options.inputText.value = 'unrelated draft'
+    options.canDeliver = () => false
+
+    api.regenerateMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      sourceIndex: 1,
+      messageId: 'msg-a1',
+      text: 'ack A',
+    }))
+    await nextTick()
+
+    expect(options.messages.value).toEqual(messages)
+    expect(options.inputText.value).toBe('unrelated draft')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    expect(options.notifyDeliveryBlocked).toHaveBeenCalledOnce()
   })
 
   it('keeps an optimistic user row intact until its durable fork id arrives', () => {

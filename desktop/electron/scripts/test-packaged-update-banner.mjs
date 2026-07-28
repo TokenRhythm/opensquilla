@@ -5,58 +5,11 @@ import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { basename, dirname, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 
-import { _electron as electron } from 'playwright'
-
-function option(name) {
-  const index = process.argv.indexOf(name)
-  if (index < 0 || !process.argv[index + 1]) {
-    throw new Error(`Missing required option ${name}`)
-  }
-  return process.argv[index + 1]
-}
-
-async function waitFor(check, label, timeoutMs = 60_000) {
-  const deadline = Date.now() + timeoutMs
-  let lastError
-  while (Date.now() < deadline) {
-    try {
-      const value = await check()
-      if (value) return value
-    } catch (error) {
-      lastError = error
-    }
-    await delay(250)
-  }
-  const detail = lastError ? ` Last error: ${lastError.message || lastError}` : ''
-  throw new Error(`Timed out waiting for ${label}.${detail}`)
-}
-
-async function writeSyntheticCredential(userDataDir, disableNetworkObservability) {
-  await mkdir(userDataDir, { recursive: true })
-  const now = new Date().toISOString()
-  await writeFile(
-    resolve(userDataDir, 'desktop-credential.json'),
-    JSON.stringify({
-      provider: 'ollama',
-      model: 'opensquilla-release-update-smoke',
-      baseUrl: 'http://127.0.0.1:11434',
-      apiKeyEnv: '',
-      encryptedApiKey: '',
-      modelRoutingMode: 'direct',
-      routerMode: 'disabled',
-      routerDefaultTier: 'c1',
-      routerTiers: {},
-      searchProvider: 'duckduckgo',
-      searchApiKeyEnv: '',
-      encryptedSearchApiKey: '',
-      encryption: 'plain',
-      disableNetworkObservability,
-      createdAt: now,
-      updatedAt: now,
-    }, null, 2),
-    { mode: 0o600 },
-  )
-}
+import {
+  launchPackagedCandidate,
+  requiredOption,
+  waitFor,
+} from './packaged-smoke-helpers.mjs'
 
 function updateCachePath(userDataDir) {
   return resolve(userDataDir, 'opensquilla', 'state', 'update_check_rc.json')
@@ -98,22 +51,17 @@ async function launchCandidate(
   privacyDisabled,
   baseVersion,
 ) {
-  await writeSyntheticCredential(userDataDir, privacyDisabled)
   // Seed a fresh successful "no candidate" result before launch. This keeps
   // the gateway's startup check deterministic and lets the page open before
   // the mock release exists without hanging an HTTP request past the product's
   // three-second timeout.
   await writeSyntheticUpdateCache(userDataDir, baseVersion, Math.floor(Date.now() / 1000))
-  return electron.launch({
+  return launchPackagedCandidate({
     executablePath,
-    args: [
-      '--use-mock-keychain',
-      `--user-data-dir=${userDataDir}`,
-    ],
+    userDataDir,
+    disableNetworkObservability: privacyDisabled,
+    model: 'opensquilla-release-update-smoke',
     env: {
-      ...process.env,
-      OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain',
-      OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1',
       OPENSQUILLA_UPDATE_CHECK_ENDPOINT: endpoint,
       OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY: privacyDisabled ? '1' : '0',
       // Release jobs run under GitHub Actions, while the product intentionally
@@ -125,9 +73,9 @@ async function launchCandidate(
   })
 }
 
-const executablePath = resolve(option('--executable'))
-const userDataDir = resolve(option('--user-data-dir'))
-const candidateName = option('--candidate-name')
+const executablePath = resolve(requiredOption('--executable'))
+const userDataDir = resolve(requiredOption('--user-data-dir'))
+const candidateName = requiredOption('--candidate-name')
 const versionMatch = candidateName.match(/(\d+\.\d+\.\d+)-rc(\d+)/i)
 
 if (!versionMatch) {

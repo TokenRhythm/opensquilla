@@ -69,10 +69,45 @@ describe('useChatHistory canonical pagination', () => {
     expect(rpc.call).toHaveBeenCalledWith('chat.history', expect.objectContaining({
       includeCanonical: true,
       includeSummaries: false,
-    }))
+    }), expect.objectContaining({ timeoutAction: 'reconnect' }))
     expect(api.historyState.value).toMatchObject({
       initialLoadStatus: 'ready',
     })
+  })
+
+  it('applies the shared bootstrap deadline and reconnect-on-timeout contract', async () => {
+    const { api, rpc } = makeHistory()
+    const now = Date.now()
+    const controller = new AbortController()
+
+    await api.loadHistory({}, {
+      generation: 1,
+      key: 'agent:main:webchat:test',
+      attempt: 0,
+      deadlineAt: now + 15_000,
+      attemptDeadlineAt: now + 7_000,
+      signal: controller.signal,
+      skipSnapshot: false,
+    })
+
+    expect(rpc.waitForConnection).toHaveBeenCalledWith(
+      expect.any(Number),
+      expect.any(AbortSignal),
+      {
+        timeoutAction: 'reconnect',
+        abortAction: 'reconnect',
+      },
+    )
+    expect(rpc.call).toHaveBeenCalledWith(
+      'chat.history',
+      expect.objectContaining({ includeCanonical: true }),
+      expect.objectContaining({
+        timeoutMs: expect.any(Number),
+        signal: expect.any(AbortSignal),
+        timeoutAction: 'reconnect',
+        abortAction: 'reconnect',
+      }),
+    )
   })
 
   it('enters the initial loading state before the first RPC settles', async () => {
@@ -139,7 +174,8 @@ describe('useChatHistory canonical pagination', () => {
 
     expect(api.historyState.value).toMatchObject({
       initialLoadStatus: 'ready',
-      loadEarlierError: true,
+      loadEarlierError: false,
+      recoveryError: true,
     })
 
     let resolveRetry!: (value: ChatHistoryResponse) => void
@@ -164,6 +200,23 @@ describe('useChatHistory canonical pagination', () => {
       initialLoadStatus: 'ready',
       retrying: false,
       loadEarlierError: false,
+      recoveryError: false,
+    })
+  })
+
+  it('keeps loaded messages visible and exposes an inline recovery error after refresh fails', async () => {
+    const { api, rpc, messages } = makeHistory()
+    await api.loadHistory()
+    expect(messages.value.map(message => message.text)).toEqual(['hello'])
+
+    rpc.call.mockRejectedValueOnce(new Error('refresh disconnected'))
+    await api.loadHistory()
+
+    expect(messages.value.map(message => message.text)).toEqual(['hello'])
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+      loading: false,
+      recoveryError: true,
     })
   })
 
@@ -374,7 +427,7 @@ describe('useChatHistory canonical pagination', () => {
 
     expect(rpc.call).toHaveBeenNthCalledWith(4, 'chat.history', expect.objectContaining({
       before: 'cursor-3',
-    }))
+    }), expect.objectContaining({ timeoutAction: 'reconnect' }))
     await vi.waitFor(() => {
       expect(messages.value.map(message => message.messageId)).toEqual(['m2', 'm3', 'm4', 'm5'])
     })
@@ -424,7 +477,7 @@ describe('useChatHistory canonical pagination', () => {
     expect(messages.value.map(message => message.messageId)).toEqual(['m2', 'm3', 'm4'])
     expect(rpc.call).toHaveBeenNthCalledWith(3, 'chat.history', expect.objectContaining({
       before: 'cursor-4',
-    }))
+    }), expect.objectContaining({ timeoutAction: 'reconnect' }))
   })
 
   it('keeps more than 200 loaded canonical messages during a latest-window refresh', async () => {
@@ -542,16 +595,16 @@ describe('useChatHistory canonical pagination', () => {
     expect(rpc.call).toHaveBeenNthCalledWith(4, 'chat.history', expect.objectContaining({
       after: 'cursor-299',
       limit: 200,
-    }))
+    }), expect.objectContaining({ timeoutAction: 'reconnect' }))
     expect(rpc.call).toHaveBeenNthCalledWith(5, 'chat.history', expect.objectContaining({
       after: 'cursor-499',
       limit: 200,
-    }))
+    }), expect.objectContaining({ timeoutAction: 'reconnect' }))
 
     await api.loadEarlierHistory()
     expect(rpc.call).toHaveBeenNthCalledWith(6, 'chat.history', expect.objectContaining({
       before: 'cursor-200',
-    }))
+    }), expect.objectContaining({ timeoutAction: 'reconnect' }))
   })
 
   it('bounds each disconnected forward bridge and resumes from the saved cursor', async () => {
@@ -620,7 +673,7 @@ describe('useChatHistory canonical pagination', () => {
     await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledTimes(7))
     expect(rpc.call).toHaveBeenNthCalledWith(7, 'chat.history', expect.objectContaining({
       after: 'cursor-12',
-    }))
+    }), expect.objectContaining({ timeoutAction: 'reconnect' }))
     expect(messages.value.map(message => message.messageId)).toEqual([
       'm7', 'm8', 'm9', 'm10', 'm11', 'm12', 'm13', 'm14', 'm15', 'm16',
       'm17', 'm18', 'm19', 'm20',
@@ -699,7 +752,7 @@ describe('useChatHistory canonical pagination', () => {
     ])
     expect(rpc.call).toHaveBeenNthCalledWith(6, 'chat.history', expect.objectContaining({
       after: 'cursor-4',
-    }))
+    }), expect.objectContaining({ timeoutAction: 'reconnect' }))
   })
 
   it('stops a forward bridge when its cursor does not advance', async () => {
@@ -743,7 +796,9 @@ describe('useChatHistory canonical pagination', () => {
     expect(api.historyState.value).toMatchObject({
       oldestCursor: 'cursor-3',
       newestCursor: 'cursor-4',
-      loadEarlierError: true,
+      loadingEarlier: false,
+      loadEarlierError: false,
+      recoveryError: true,
     })
   })
 
@@ -976,6 +1031,24 @@ describe('useChatHistory canonical pagination', () => {
     expect(messages.value.map(message => message.messageId)).toEqual(['new-message'])
     expect(api.historyState.value.loading).toBe(false)
     expect(api.historyState.value.initialLoadStatus).toBe('ready')
+  })
+
+  it('cancels a scheduled history sync before switching to another session or draft', async () => {
+    vi.useFakeTimers()
+    try {
+      const sessionKey = ref('agent:main:webchat:old')
+      const { api, rpc } = makeHistory(false, { sessionKey })
+
+      api.scheduleHistorySync()
+      api.cancelActiveHistory()
+      sessionKey.value = 'agent:main:webchat:new-draft'
+      await vi.advanceTimersByTimeAsync(50)
+
+      expect(rpc.waitForConnection).not.toHaveBeenCalled()
+      expect(rpc.call).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('keeps the new session loading when a stale request fails first', async () => {

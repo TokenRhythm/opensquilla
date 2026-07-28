@@ -102,9 +102,25 @@ SECTION_DETAIL_REQUIRED_KEYS = frozenset(
 # inferring the mode from (provider, tier_profile) pairs. Adding to this map is
 # the conscious decision the friction forces.
 SECTION_EXTRA_KEYS = {
+    "llm": frozenset({"providerResolution"}),
     "router": frozenset(
         {"routerMode", "routerBinding", "routerProviderConflicts"}
-    )
+    ),
+    "ensemble": frozenset(
+        {
+            "enabled",
+            "selectionMode",
+            "runtimeStatus",
+            "configurationReady",
+            "blockedReason",
+            "proposerCount",
+            "proposerCountRange",
+            "aggregatorCount",
+            "perTurnCallCount",
+            "perTurnCallCountRange",
+            "memberProviders",
+        }
+    ),
 }
 
 # Every mode value the router card may carry; matched verbatim by clients.

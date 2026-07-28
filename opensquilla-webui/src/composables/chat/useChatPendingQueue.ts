@@ -19,6 +19,12 @@ export interface PendingQueueOwnerContext {
   ownerRequestId: string
 }
 
+export interface PendingQueuePayload {
+  text: string
+  attachments?: Attachment[]
+  intent?: string | null
+}
+
 export interface UseChatPendingQueueOptions {
   sessionKey: Ref<string>
   ownerContext?: Readonly<Ref<PendingQueueOwnerContext | null>>
@@ -33,11 +39,17 @@ export interface UseChatPendingQueueOptions {
   hasComposer: () => boolean
   // Drain a queued hidden-control send (e.g. meta-preflight confirmation)
   // directly through the dedicated hidden-send path instead of the composer.
-  dispatchHiddenControl?: (providerText: string, displayText: string) => void
+  dispatchHiddenControl?: (
+    item: ChatPendingItem,
+    ownerSessionKey: string,
+  ) => Promise<PendingDeliveryOutcome>
   // The WebUI drains visible queue items through the same composer-preserving
   // transport used by explicit Steer. The legacy callback remains as a
   // fallback for isolated composable consumers.
-  dispatchPendingItem?: (item: ChatPendingItem) => Promise<PendingDeliveryOutcome>
+  dispatchPendingItem?: (
+    item: ChatPendingItem,
+    ownerSessionKey: string,
+  ) => Promise<PendingDeliveryOutcome>
 }
 
 export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
@@ -82,29 +94,48 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       : undefined
   }
 
-  function enqueuePendingInput(text: string, owner?: PendingQueueOwner) {
+  function enqueuePendingPayload(
+    payload: PendingQueuePayload,
+    owner?: PendingQueueOwner,
+  ) {
     if (pendingQueue.value.length >= MAX_PENDING) {
       console.warn(`Pending queue full (${MAX_PENDING})`)
       return false
     }
     const ownerRequestId = resolveOwnerRequestId(owner)
     pendingQueue.value.push({
-      text,
-      attachments: options.pendingAttachments.value.map(a => ({ ...a })),
-      intent: options.pendingSessionIntent.value,
+      text: payload.text,
+      attachments: (payload.attachments || []).map(a => ({ ...a })),
+      intent: payload.intent ?? null,
       ownerSessionKey: options.sessionKey.value,
       ...(ownerRequestId ? { ownerRequestId } : {}),
     })
-    options.inputText.value = ''
-    options.pendingAttachments.value = []
-    options.pendingSessionIntent.value = null
-    options.autoResizeTextarea()
     flushDeferredPendingDrain()
     return true
   }
 
+  function enqueuePendingInput(text: string, owner?: PendingQueueOwner) {
+    const queued = enqueuePendingPayload({
+      text,
+      attachments: options.pendingAttachments.value,
+      intent: options.pendingSessionIntent.value,
+    }, owner)
+    if (!queued) return false
+    options.inputText.value = ''
+    options.pendingAttachments.value = []
+    options.pendingSessionIntent.value = null
+    options.autoResizeTextarea()
+    return true
+  }
+
   function enqueueHiddenControl(
-    item: { text: string; displayText: string },
+    item: {
+      text: string
+      displayText: string
+      clientRequestId?: string
+      clientMessageId?: string
+      visibleCommitted?: boolean
+    },
     owner?: PendingQueueOwner,
   ) {
     if (pendingQueue.value.length >= MAX_PENDING) {
@@ -121,6 +152,13 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       ...(ownerRequestId ? { ownerRequestId } : {}),
       hiddenControl: true,
       displayTextOverride: item.displayText,
+      ...(item.clientRequestId
+        ? { hiddenClientRequestId: item.clientRequestId }
+        : {}),
+      ...(item.clientMessageId
+        ? { hiddenClientMessageId: item.clientMessageId }
+        : {}),
+      ...(item.visibleCommitted ? { hiddenVisibleCommitted: true } : {}),
     })
     flushDeferredPendingDrain()
     return true
@@ -133,9 +171,16 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     return true
   }
 
-  function beginPendingDelivery(index: number): ChatPendingItem | null {
+  function beginPendingDelivery(
+    index: number,
+    allowHiddenControl = false,
+  ): ChatPendingItem | null {
     const item = pendingQueue.value[index]
-    if (!item || item.hiddenControl || item.deliveryState === 'steering') return null
+    if (
+      !item
+      || (item.hiddenControl && !allowHiddenControl)
+      || item.deliveryState === 'steering'
+    ) return null
     const otherDelivery = pendingQueue.value.find(
       candidate => candidate !== item && candidate.deliveryState,
     )
@@ -273,12 +318,32 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     clearPendingDrainAfterTerminalTimer()
     if (pendingQueue.value.length === 0) return
     const head = pendingQueue.value[0]
+    const ownerSessionKey = head?.ownerSessionKey || options.sessionKey.value
+    if (ownerSessionKey !== options.sessionKey.value) {
+      if (head) head.deliveryState = 'retryable'
+      return
+    }
     if (head?.hiddenControl) {
-      pendingQueue.value.shift()
-      // Hidden-control sends bypass the composer entirely.
-      const providerText = head.text || ''
-      const displayText = head.displayTextOverride || ''
-      nextTick(() => options.dispatchHiddenControl?.(providerText, displayText))
+      head.deliveryState = 'steering'
+      // Hidden-control sends bypass the composer entirely, but retain their
+      // queue lease until the transport confirms acceptance.
+      nextTick(() => {
+        void (async () => {
+          let outcome: PendingDeliveryOutcome = 'retryable_failure'
+          try {
+            if (options.sessionKey.value === ownerSessionKey) {
+              outcome = await options.dispatchHiddenControl?.(
+                head,
+                ownerSessionKey,
+              ) ?? 'retryable_failure'
+            }
+          } catch {
+            outcome = 'retryable_failure'
+          } finally {
+            settlePendingDelivery(head, outcome)
+          }
+        })()
+      })
       return
     }
     if (options.dispatchPendingItem) {
@@ -288,7 +353,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         void (async () => {
           let outcome: PendingDeliveryOutcome = 'retryable_failure'
           try {
-            outcome = await options.dispatchPendingItem!(item)
+            if (options.sessionKey.value === ownerSessionKey) {
+              outcome = await options.dispatchPendingItem!(item, ownerSessionKey)
+            }
           } catch {
             // Keep the queue item as an explicit idempotent retry. The send
             // layer normally converts transport errors to this outcome, but
@@ -301,11 +368,19 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       })
       return
     }
-    pendingQueue.value.shift()
-    options.inputText.value = head?.text || ''
-    options.pendingAttachments.value = head?.attachments || []
-    options.pendingSessionIntent.value = head?.intent || null
-    nextTick(() => options.sendCurrentInput())
+    if (!head) return
+    head.deliveryState = 'steering'
+    nextTick(() => {
+      if (
+        options.sessionKey.value !== ownerSessionKey
+        || pendingQueue.value[0] !== head
+      ) return
+      pendingQueue.value.shift()
+      options.inputText.value = head.text || ''
+      options.pendingAttachments.value = head.attachments || []
+      options.pendingSessionIntent.value = head.intent || null
+      options.sendCurrentInput()
+    })
   }
 
   function schedulePendingDrainAfterTerminal() {
@@ -367,6 +442,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     canQueueMore,
     busySendMode,
     maxPending: MAX_PENDING,
+    enqueuePendingPayload,
     enqueuePendingInput,
     enqueueHiddenControl,
     removePendingChip,

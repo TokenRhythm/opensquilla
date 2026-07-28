@@ -88,10 +88,12 @@ import {
   parseNativeWorkbenchCreateRequest,
   parseNativeWorkbenchSurfaceId,
   parseNativeWorkbenchSurfaceRectRequest,
+  type NativeWorkbenchSurfaceEvent,
 } from './native-workbench-surface-contract.js'
 import {
   NativeWorkbenchSurfaceManager,
 } from './native-workbench-surface.js'
+import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
 
 protocol.registerSchemesAsPrivileged([{
   scheme: NATIVE_WORKBENCH_ARTIFACT_SCHEME,
@@ -398,6 +400,23 @@ function desktopLog(event: string, detail?: Record<string, unknown>): void {
   }
 }
 
+function nativeWorkbenchFailureReason(event: NativeWorkbenchSurfaceEvent): string {
+  if (event.type === 'error') return 'load-failed'
+  const reason = event.detail?.reason
+  if (
+    reason === 'unresponsive'
+    || reason === 'owner-unresponsive'
+    || reason === 'clean-exit'
+    || reason === 'abnormal-exit'
+    || reason === 'killed'
+    || reason === 'crashed'
+    || reason === 'oom'
+    || reason === 'launch-failed'
+    || reason === 'integrity-failure'
+  ) return reason
+  return 'unknown'
+}
+
 let gatewayStartPromise: Promise<GatewayState> | null = null
 let resolveOnboarding: ((credential: DesktopConnection) => void) | null = null
 let rejectOnboarding: ((error: Error) => void) | null = null
@@ -450,6 +469,12 @@ const gatewayState: GatewayState = {
 const nativeWorkbenchSurfaces = new NativeWorkbenchSurfaceManager({
   getWindow: () => currentMainWindow(),
   emit: event => {
+    if (event.type === 'error' || event.type === 'crashed') {
+      desktopLog('native_workbench_surface_failed', {
+        type: event.type,
+        reason: nativeWorkbenchFailureReason(event),
+      })
+    }
     const window = currentMainWindow()
     if (
       !window
@@ -994,6 +1019,27 @@ function canonicalTierKey(name: string): string {
 const ROUTER_PROFILE_IDS = new Set(['tokenrhythm', 'openrouter', 'dashscope', 'deepseek', 'gemini', 'volcengine', 'openai', 'zhipu', 'moonshot'])
 const INLINE_ROUTER_PROFILE_IDS = new Set(['tokenrhythm'])
 const TOKENRHYTHM_REGISTER_URL = 'https://tokenrhythm.studio/register'
+const DESKTOP_ENSEMBLE_PROFILES: Record<StaticEnsembleSelectionMode, {
+  provider: string
+  proposers: string[]
+  aggregator: string
+}> = {
+  static_tokenrhythm_b5: {
+    provider: 'tokenrhythm',
+    proposers: ['deepseek-v4-pro', 'glm-5.2', 'kimi-k2.7-code', 'qwen3.7-max'],
+    aggregator: 'glm-5.2',
+  },
+  static_openrouter_b5: {
+    provider: 'openrouter',
+    proposers: [
+      'deepseek/deepseek-v4-pro',
+      'z-ai/glm-5.2',
+      'moonshotai/kimi-k2.7-code',
+      'qwen/qwen3.7-max',
+    ],
+    aggregator: 'z-ai/glm-5.2',
+  },
+}
 
 const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
   {
@@ -1666,11 +1712,32 @@ function ensembleConfigTomlLines(credential: DesktopConnection): string[] {
   if (!selectionMode) {
     throw new Error(`LLM Ensemble is not supported for provider ${credential.provider}.`)
   }
+  const profile = DESKTOP_ENSEMBLE_PROFILES[selectionMode]
+  const roles = ['primary', 'contrast', 'fast_check', 'critic']
+  const candidates = profile.proposers.flatMap((model, index) => [
+    '',
+    '[[llm_ensemble.candidates]]',
+    `provider = ${tomlString(profile.provider)}`,
+    `model = ${tomlString(model)}`,
+    'source = "custom"',
+    'enabled = true',
+    `role = ${tomlString(roles[index] || '')}`,
+  ])
+  candidates.push(
+    '',
+    '[[llm_ensemble.candidates]]',
+    `provider = ${tomlString(profile.provider)}`,
+    `model = ${tomlString(profile.aggregator)}`,
+    'source = "custom"',
+    'enabled = true',
+    'role = "aggregator"',
+  )
   return [
     '',
     '[llm_ensemble]',
     'enabled = true',
-    `selection_mode = ${tomlString(selectionMode)}`,
+    'selection_mode = "custom_b5"',
+    ...candidates,
   ]
 }
 
@@ -7841,6 +7908,11 @@ async function createMainWindow(): Promise<BrowserWindow> {
     },
   })
   mainWindow = window
+  installDesktopZoomShortcuts(
+    window.webContents,
+    window.webContents,
+    () => nativeWorkbenchSurfaces.refreshBounds(window),
+  )
   installEditingContextMenu(window)
 
   window.webContents.setWindowOpenHandler(({ url }) => {

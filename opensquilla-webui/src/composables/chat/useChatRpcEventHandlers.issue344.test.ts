@@ -86,8 +86,7 @@ function makeHarness(activeStreamTaskId = '') {
     schedulePendingDrainAfterTerminal: vi.fn(),
     popAllPendingIntoComposer: vi.fn(() => false),
     saveWidgetState: vi.fn(),
-    subscribeSession: vi.fn(),
-    loadHistory: vi.fn(),
+    handleSessionConnectionState: vi.fn(),
     loadCurrentSessionUsage: vi.fn(),
   }
   const scope = effectScope()

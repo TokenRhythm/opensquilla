@@ -260,16 +260,21 @@ class RpcRegistry:
         except RpcUnavailableError as exc:
             return make_error_res(req_id, ERROR_UNAVAILABLE, str(exc), retryable=True)
         except StorageBusyError as exc:
+            details: dict[str, Any] = {
+                "operation": exc.operation,
+                "waited_ms": exc.waited_ms,
+            }
+            if exc.stage is not None:
+                details["stage"] = exc.stage
+            if exc.resource is not None:
+                details["resource"] = exc.resource
             return make_error_res(
                 req_id,
                 "STORAGE_BUSY",
                 "Session storage is temporarily busy. Retry this operation.",
                 retryable=True,
                 retry_after_ms=exc.retry_after_ms,
-                details={
-                    "operation": exc.operation,
-                    "waited_ms": exc.waited_ms,
-                },
+                details=details,
             )
         except ValueError as exc:
             return make_error_res(req_id, "INVALID_REQUEST", str(exc))

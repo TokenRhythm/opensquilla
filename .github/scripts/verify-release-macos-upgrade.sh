@@ -21,6 +21,8 @@ install_root="${sandbox}/Applications"
 user_data="${sandbox}/user-data/OpenSquilla"
 profile="${user_data}/opensquilla"
 probe="${GITHUB_WORKSPACE}/.github/scripts/verify-release-profile-preservation.py"
+session_recovery_smoke="${GITHUB_WORKSPACE}/desktop/electron/scripts/test-packaged-session-recovery.mjs"
+session_key="agent:main:webchat:release-recovery-long-session"
 old_asset="OpenSquilla-0.5.0-rc3-mac-arm64.dmg"
 mkdir -p "${old_dir}" "${old_mount}" "${candidate_mount}" "${install_root}" "${user_data}"
 
@@ -66,6 +68,12 @@ kill "${app_pid}" || true
 wait "${app_pid}" || true
 app_pid=""
 
+node "${session_recovery_smoke}" \
+  --executable "${app_binary}" \
+  --user-data-dir "${user_data}" \
+  --session-key "${session_key}" \
+  --label "${label}"
+
 gateway_binary="$(find \
   "${install_root}/OpenSquilla.app/Contents/Resources/runtime/gateway" \
   -type f -name opensquilla-gateway -perm -111 -print -quit)"
@@ -102,4 +110,3 @@ PY
 test ! -e "${install_root}/OpenSquilla.app"
 test ! -e "${install_root}/OpenSquilla.rc3.app"
 python "${probe}" verify --home "${profile}" --label "${label}"
-

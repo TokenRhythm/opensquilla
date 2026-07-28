@@ -62,7 +62,7 @@ try {
 
       const events = []
       const owner = new BrowserWindow({
-        show: false,
+        show: true,
         width: 900,
         height: 700,
         webPreferences: {
@@ -109,6 +109,17 @@ try {
           { reason: 'crashed', exitCode: 1 },
         )
         if (!handled) throw new Error('No renderer crash listener was registered.')
+      }
+
+      function emitUnresponsive(contents) {
+        const handled = contents.emit('unresponsive')
+        if (!handled) throw new Error('No renderer unresponsive listener was registered.')
+      }
+
+      function surfaceView(surfaceId) {
+        const view = manager.surfaces.get(surfaceId)?.view
+        if (!view) throw new Error(`Surface view ${surfaceId} was not found.`)
+        return view
       }
 
       function installSyntheticHttpsProtocol(contents) {
@@ -282,6 +293,105 @@ try {
       await manager.destroySurface('artifact:allowed')
       await waitFor(() => allowedContents.isDestroyed(), 'allowed surface destruction')
 
+      const zoomSurface = await manager.createSurface({
+        version: 1,
+        surfaceId: 'artifact:zoom',
+        kind: 'artifact-html',
+        payload: {
+          data: encoder.encode('<!doctype html><title>Zoom preview</title>'),
+          name: 'zoom.html',
+          mime: 'text/html',
+          scopeId: 'synthetic:zoom',
+          allowRemoteResources: false,
+        },
+      })
+      if (!zoomSurface.ok) throw new Error(zoomSurface.message || 'Zoom surface failed to load.')
+      const zoomContents = await waitFor(previewContents, 'zoom preview WebContents')
+      const zoomRect = manager.setSurfaceRect({
+        surfaceId: 'artifact:zoom',
+        x: 120,
+        y: 90,
+        width: 360,
+        height: 240,
+        visible: true,
+      })
+      if (!zoomRect.ok) throw new Error(zoomRect.message || 'Zoom surface bounds were rejected.')
+      const zoomActivation = manager.activateSurface('artifact:zoom')
+      if (!zoomActivation.ok) throw new Error(zoomActivation.message || 'Zoom surface failed to activate.')
+      const zoomView = owner.contentView.children.find(view => view.webContents === zoomContents)
+      if (!zoomView) throw new Error('Zoom surface view was not attached to its owner.')
+      const zoomBoundsBefore = zoomView.getBounds()
+      const zoomModifier = process.platform === 'darwin' ? 'meta' : 'control'
+      zoomContents.sendInputEvent({ type: 'keyDown', keyCode: '=', modifiers: [zoomModifier] })
+      await waitFor(
+        () => Math.abs(owner.webContents.getZoomFactor() - 1.2) < 1e-6,
+        'child zoom shortcut to update the owner factor',
+      )
+      const zoomChildFactor = zoomContents.getZoomFactor()
+      const zoomBoundsAt120 = zoomView.getBounds()
+      zoomContents.sendInputEvent({ type: 'keyDown', keyCode: '0', modifiers: [zoomModifier] })
+      await waitFor(
+        () => Math.abs(owner.webContents.getZoomFactor() - 1) < 1e-6,
+        'child zoom reset to restore the owner factor',
+      )
+      const zoomBoundsAfterReset = zoomView.getBounds()
+      await manager.destroySurface('artifact:zoom')
+      await waitFor(() => zoomContents.isDestroyed(), 'zoom surface destruction')
+
+      const lifecycleSurface = await manager.createSurface({
+        version: 1,
+        surfaceId: 'artifact:lifecycle',
+        kind: 'artifact-html',
+        payload: {
+          data: encoder.encode('<!doctype html><title>Lifecycle preview</title>'),
+          name: 'lifecycle.html',
+          mime: 'text/html',
+          scopeId: 'synthetic:lifecycle',
+          allowRemoteResources: false,
+        },
+      })
+      if (!lifecycleSurface.ok) {
+        throw new Error(lifecycleSurface.message || 'Lifecycle surface failed to load.')
+      }
+      const lifecycleContents = await waitFor(previewContents, 'lifecycle WebContents')
+      const lifecycleView = surfaceView('artifact:lifecycle')
+      const lifecycleRect = {
+        surfaceId: 'artifact:lifecycle',
+        x: 400,
+        y: 80,
+        width: 400,
+        height: 500,
+        visible: true,
+      }
+      const lifecyclePositioned = manager.setSurfaceRect(lifecycleRect)
+      await waitFor(() => lifecycleView.getVisible(), 'visible lifecycle surface')
+      const realIsVisible = owner.isVisible.bind(owner)
+      owner.isVisible = () => false
+      owner.emit('hide')
+      await waitFor(() => !lifecycleView.getVisible(), 'hidden owner surface')
+      const hiddenRectAccepted = manager.setSurfaceRect(lifecycleRect)
+      const hiddenActivation = manager.activateSurface('artifact:lifecycle')
+      const hiddenSurfaceStayedHidden = !lifecycleView.getVisible()
+      owner.isVisible = () => true
+      owner.emit('show')
+      await waitFor(() => lifecycleView.getVisible(), 'surface restored after owner show')
+      // Window-manager support varies in headless CI, especially macOS and
+      // Xvfb. Drive Electron's documented lifecycle event while overriding
+      // only the real BrowserWindow state query used by the manager.
+      const realIsMinimized = owner.isMinimized.bind(owner)
+      owner.isMinimized = () => true
+      owner.emit('minimize')
+      await waitFor(() => !lifecycleView.getVisible(), 'minimized owner surface')
+      const minimizedActivation = manager.activateSurface('artifact:lifecycle')
+      const minimizedSurfaceStayedHidden = !lifecycleView.getVisible()
+      owner.isMinimized = realIsMinimized
+      owner.emit('restore')
+      await waitFor(() => lifecycleView.getVisible(), 'surface restored with owner window')
+      const lifecycleSurfaceRestored = lifecycleView.getVisible()
+      owner.isVisible = realIsVisible
+      await manager.destroySurface('artifact:lifecycle')
+      await waitFor(() => lifecycleContents.isDestroyed(), 'lifecycle surface destruction')
+
       const loadErrorSurface = await manager.createSurface({
         version: 1,
         surfaceId: 'artifact:load-error',
@@ -383,6 +493,132 @@ try {
       })
       await manager.destroySurface('artifact:preview-crash')
 
+      const unresponsiveSurface = await manager.createSurface({
+        version: 1,
+        surfaceId: 'artifact:unresponsive',
+        kind: 'artifact-html',
+        payload: {
+          data: encoder.encode('<!doctype html><title>Unresponsive preview</title>'),
+          name: 'unresponsive.html',
+          mime: 'text/html',
+          scopeId: 'synthetic:unresponsive',
+          allowRemoteResources: false,
+        },
+      })
+      if (!unresponsiveSurface.ok) {
+        throw new Error(unresponsiveSurface.message || 'Unresponsive surface failed to load.')
+      }
+      const unresponsiveContents = await waitFor(
+        previewContents,
+        'unresponsive preview WebContents',
+      )
+      const unresponsiveView = surfaceView('artifact:unresponsive')
+      const unresponsiveRectRequest = {
+        surfaceId: 'artifact:unresponsive',
+        x: 400,
+        y: 80,
+        width: 400,
+        height: 500,
+        visible: true,
+      }
+      manager.setSurfaceRect(unresponsiveRectRequest)
+      await waitFor(() => unresponsiveView.getVisible(), 'visible unresponsive surface')
+      const unresponsiveSurfaceWasVisible = unresponsiveView.getVisible()
+      emitUnresponsive(unresponsiveContents)
+      await waitFor(
+        () => events.some(event =>
+          event.surfaceId === 'artifact:unresponsive'
+          && event.type === 'crashed'
+          && event.detail?.reason === 'unresponsive'),
+        'unresponsive renderer crash event',
+      )
+      await waitFor(
+        () => !unresponsiveView.getVisible(),
+        'unresponsive surface to become physically hidden',
+      )
+      emitUnresponsive(unresponsiveContents)
+      emitRendererGone(unresponsiveContents)
+      unresponsiveContents.emit(
+        'did-fail-load',
+        {},
+        -2,
+        'synthetic failure after unresponsive',
+        unresponsiveContents.getURL(),
+        true,
+      )
+      const unresponsiveTerminalEventCount = events.filter(event =>
+        event.surfaceId === 'artifact:unresponsive'
+        && (event.type === 'error' || event.type === 'crashed')).length
+      const unresponsiveActivation = manager.activateSurface('artifact:unresponsive')
+      const unresponsiveRect = manager.setSurfaceRect(unresponsiveRectRequest)
+      owner.emit('hide')
+      owner.emit('show')
+      owner.setSize(901, 701)
+      owner.webContents.emit('zoom-changed', {}, 'in')
+      await new Promise(resolveWait => setTimeout(resolveWait, 100))
+      const failedSurfaceStayedHidden = !unresponsiveView.getVisible()
+      await manager.destroySurface('artifact:unresponsive')
+
+      const ownerUnresponsiveSurfaceOne = await manager.createSurface({
+        version: 1,
+        surfaceId: 'artifact:owner-unresponsive-one',
+        kind: 'artifact-html',
+        payload: {
+          data: encoder.encode('<!doctype html><title>Owner unresponsive one</title>'),
+          name: 'owner-unresponsive-one.html',
+          mime: 'text/html',
+          scopeId: 'synthetic:owner-unresponsive-one',
+          allowRemoteResources: false,
+        },
+      })
+      const ownerUnresponsiveSurfaceTwo = await manager.createSurface({
+        version: 1,
+        surfaceId: 'artifact:owner-unresponsive-two',
+        kind: 'artifact-html',
+        payload: {
+          data: encoder.encode('<!doctype html><title>Owner unresponsive two</title>'),
+          name: 'owner-unresponsive-two.html',
+          mime: 'text/html',
+          scopeId: 'synthetic:owner-unresponsive-two',
+          allowRemoteResources: false,
+        },
+      })
+      if (!ownerUnresponsiveSurfaceOne.ok || !ownerUnresponsiveSurfaceTwo.ok) {
+        throw new Error('Owner-unresponsive surfaces failed to load.')
+      }
+      const ownerUnresponsiveViewOne = surfaceView('artifact:owner-unresponsive-one')
+      const ownerUnresponsiveViewTwo = surfaceView('artifact:owner-unresponsive-two')
+      manager.setSurfaceRect({
+        surfaceId: 'artifact:owner-unresponsive-one',
+        x: 400,
+        y: 80,
+        width: 400,
+        height: 500,
+        visible: true,
+      })
+      await waitFor(
+        () => ownerUnresponsiveViewOne.getVisible(),
+        'visible owner-unresponsive surface',
+      )
+      emitUnresponsive(owner.webContents)
+      await waitFor(
+        () => events.filter(event =>
+          event.type === 'crashed'
+          && event.detail?.reason === 'owner-unresponsive').length === 2,
+        'owner-unresponsive events for all surfaces',
+      )
+      const ownerUnresponsiveViewsHidden = !ownerUnresponsiveViewOne.getVisible()
+        && !ownerUnresponsiveViewTwo.getVisible()
+      const ownerUnresponsiveActivation = manager.activateSurface(
+        'artifact:owner-unresponsive-one',
+      )
+      emitUnresponsive(owner.webContents)
+      const ownerUnresponsiveTerminalEventCount = events.filter(event =>
+        event.type === 'crashed'
+        && event.detail?.reason === 'owner-unresponsive').length
+      owner.webContents.emit('responsive')
+      await manager.destroyAll()
+
       const ownerCrashSurface = await manager.createSurface({
         version: 1,
         surfaceId: 'artifact:owner-crash',
@@ -417,19 +653,38 @@ try {
         dialogsDisabled,
         downloadPrevented,
         downloadSeen,
+        failedSurfaceStayedHidden,
+        hiddenActivation,
+        hiddenRectAccepted,
+        hiddenSurfaceStayedHidden,
+        lifecyclePositioned,
+        lifecycleSurfaceRestored,
         loadErrorActivation,
+        minimizedActivation,
+        minimizedSurfaceStayedHidden,
         navigationWasBlocked,
         missingResourceEventCount,
         notificationPermission,
         offlineProbe,
         offlineRequestCount: offlineRequestCount(),
         offlineScriptResult,
+        ownerUnresponsiveActivation,
+        ownerUnresponsiveTerminalEventCount,
+        ownerUnresponsiveViewsHidden,
         popupCreated,
         popupWasBlocked,
         previewCrashActivation,
         previewCrashRect,
         raceBaseDestroyed,
         replacementCloseActivation,
+        zoomBoundsAfterReset,
+        zoomBoundsAt120,
+        zoomBoundsBefore,
+        zoomChildFactor,
+        unresponsiveActivation,
+        unresponsiveRect,
+        unresponsiveSurfaceWasVisible,
+        unresponsiveTerminalEventCount,
       }
     },
   )
@@ -483,6 +738,29 @@ try {
   assert.equal(result.notificationPermission, 'denied', 'preview permissions must be denied')
   assert.equal(result.downloadSeen, true, 'download policy must observe attempted downloads')
   assert.equal(result.downloadPrevented, true, 'download policy must prevent the download')
+  assert.equal(result.lifecyclePositioned.ok, true, 'a healthy visible surface must be positioned')
+  assert.equal(result.hiddenRectAccepted.ok, true, 'hidden windows must retain visible surface intent')
+  assert.equal(result.hiddenActivation.ok, true, 'hidden windows must retain surface activation')
+  assert.equal(
+    result.hiddenSurfaceStayedHidden,
+    true,
+    'a surface must remain physically hidden while its owner is hidden',
+  )
+  assert.equal(
+    result.minimizedActivation.ok,
+    true,
+    'minimized windows must retain surface activation',
+  )
+  assert.equal(
+    result.minimizedSurfaceStayedHidden,
+    true,
+    'a surface must remain physically hidden while its owner is minimized',
+  )
+  assert.equal(
+    result.lifecycleSurfaceRestored,
+    true,
+    'a healthy requested surface must return after its owner is restored',
+  )
   assert.equal(
     result.loadErrorActivation.ok,
     false,
@@ -507,6 +785,57 @@ try {
     result.previewCrashRect.ok,
     false,
     'a crashed preview renderer must reject visible bounds until it is recreated',
+  )
+  assert.equal(result.zoomChildFactor, 1, 'child input must leave the preview zoom unchanged')
+  assert.deepEqual(
+    result.zoomBoundsAt120,
+    { x: 144, y: 108, width: 432, height: 288 },
+    'child zoom input must reapply active bounds at the owner zoom factor',
+  )
+  assert.deepEqual(
+    result.zoomBoundsAfterReset,
+    result.zoomBoundsBefore,
+    'child zoom reset must restore the owner-scaled native bounds',
+  )
+  assert.equal(
+    result.unresponsiveSurfaceWasVisible,
+    true,
+    'the unresponsive contract must exercise a physically visible native surface',
+  )
+  assert.equal(
+    result.unresponsiveTerminalEventCount,
+    1,
+    'repeated terminal events must emit one final surface state',
+  )
+  assert.equal(
+    result.unresponsiveActivation.ok,
+    false,
+    'an unresponsive preview renderer must never be reactivated',
+  )
+  assert.equal(
+    result.unresponsiveRect.ok,
+    false,
+    'an unresponsive preview renderer must reject delayed visible bounds',
+  )
+  assert.equal(
+    result.failedSurfaceStayedHidden,
+    true,
+    'show, resize and zoom must not resurrect a failed native surface',
+  )
+  assert.equal(
+    result.ownerUnresponsiveViewsHidden,
+    true,
+    'an unresponsive owner must physically hide all of its child surfaces',
+  )
+  assert.equal(
+    result.ownerUnresponsiveActivation.ok,
+    false,
+    'owner-unresponsive surfaces must reject reactivation',
+  )
+  assert.equal(
+    result.ownerUnresponsiveTerminalEventCount,
+    2,
+    'each surface must emit one owner-unresponsive terminal event',
   )
   assert.equal(result.crashActivation.ok, false, 'owner crash must remove owned surfaces')
 

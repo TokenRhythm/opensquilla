@@ -11,6 +11,23 @@ function payload(state: string, platform = 'win32') {
 }
 
 describe('useSandboxSetupRecovery', () => {
+  it('can defer automatic status RPCs until the session bootstrap admits them', async () => {
+    const rpc = { call: vi.fn(async () => payload('ready')) }
+    const scope = effectScope()
+    const recovery = scope.run(() => useSandboxSetupRecovery({
+      rpc,
+      connectionState: ref('connected'),
+      runMode: ref('standard'),
+      autoRefresh: false,
+    }))!
+
+    await Promise.resolve()
+    expect(rpc.call).not.toHaveBeenCalled()
+    await recovery.refresh()
+    expect(rpc.call).toHaveBeenCalledOnce()
+    scope.stop()
+  })
+
   it('hides ready status and never changes the selected run mode', async () => {
     const runMode = ref<'standard' | 'trusted' | 'full'>('trusted')
     const rpc = { call: vi.fn(async () => payload('ready')) }

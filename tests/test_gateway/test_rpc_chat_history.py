@@ -4,11 +4,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from opensquilla.gateway.rpc import RpcContext
+import opensquilla.gateway.rpc_chat as rpc_chat_module
+from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.rpc_chat import _handle_chat_history
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import SessionSummary, TranscriptEntry
-from opensquilla.session.storage import SessionStorage
+from opensquilla.session.storage import SessionStorage, StorageBusyError
 
 
 class _FakeSessionManager:
@@ -267,6 +268,103 @@ async def test_chat_history_waits_for_same_connection_compaction_rewrite(
 
 
 @pytest.mark.asyncio
+async def test_chat_history_session_lock_wait_is_bounded_and_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(rpc_chat_module, "_CHAT_HISTORY_LOCK_BUDGET_SECONDS", 0.05)
+    session_key = "agent:main:webchat:bounded-history-lock"
+    mutation_lock = asyncio.Lock()
+    await mutation_lock.acquire()
+    manager = _FakeSessionManager([_entry(1)], canonical_entries=[_entry(1)])
+
+    class _LockingTurnRunner:
+        def get_session_lock(self, key: str) -> asyncio.Lock:
+            assert key == session_key
+            return mutation_lock
+
+    context = RpcContext(
+        conn_id="test",
+        principal=SimpleNamespace(role="operator"),
+        session_manager=manager,
+        turn_runner=_LockingTurnRunner(),
+    )
+    try:
+        with pytest.raises(StorageBusyError) as caught:
+            await asyncio.wait_for(
+                _handle_chat_history(
+                    {
+                        "sessionKey": session_key,
+                        "limit": 10,
+                        "includeSummaries": False,
+                    },
+                    context,
+                ),
+                timeout=0.5,
+            )
+
+        assert caught.value.operation == "chat.history"
+        assert caught.value.retry_after_ms == 100
+        assert mutation_lock.locked() is True
+
+        mutation_lock.release()
+        result = await _handle_chat_history(
+            {
+                "sessionKey": session_key,
+                "limit": 10,
+                "includeSummaries": False,
+            },
+            context,
+        )
+        assert [message["text"] for message in result["messages"]] == ["message 1"]
+    finally:
+        if mutation_lock.locked():
+            mutation_lock.release()
+
+
+@pytest.mark.asyncio
+async def test_chat_history_busy_maps_to_retryable_wire_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(rpc_chat_module, "_CHAT_HISTORY_LOCK_BUDGET_SECONDS", 0.01)
+    session_key = "agent:main:webchat:history-wire-busy"
+    mutation_lock = asyncio.Lock()
+    await mutation_lock.acquire()
+
+    class _LockingTurnRunner:
+        def get_session_lock(self, key: str) -> asyncio.Lock:
+            assert key == session_key
+            return mutation_lock
+
+    try:
+        response = await get_dispatcher().dispatch(
+            "history-wire-busy",
+            "chat.history",
+            {"sessionKey": session_key, "includeSummaries": False},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(
+                    role="operator",
+                    scopes=frozenset({"operator.read"}),
+                ),
+                session_manager=_FakeSessionManager([], canonical_entries=[]),
+                turn_runner=_LockingTurnRunner(),
+            ),
+        )
+    finally:
+        mutation_lock.release()
+
+    assert response.ok is False
+    assert response.error is not None
+    assert response.error.code == "STORAGE_BUSY"
+    assert response.error.retryable is True
+    assert response.error.retry_after_ms == 100
+    assert response.error.details["operation"] == "chat.history"
+    assert response.error.details["waited_ms"] >= 0
+    assert response.error.details["stage"] == "lock_acquire"
+    assert response.error.details["resource"] == "session_mutation_lock"
+
+
+@pytest.mark.asyncio
 async def test_chat_history_keeps_explicit_active_transcript_view_compatible() -> None:
     mgr = _FakePagedSessionManager(
         [_entry(3), _entry(4)],
@@ -336,6 +434,61 @@ async def test_chat_history_falls_back_to_active_when_paged_canonical_read_fails
     assert result["canonical_available"] is False
     assert result["canonical_complete"] is False
     assert mgr.used_canonical is False
+
+
+@pytest.mark.asyncio
+async def test_chat_history_does_not_fallback_when_canonical_storage_is_busy() -> None:
+    busy = StorageBusyError(
+        "get_canonical_transcript_page",
+        waited_ms=2000,
+        retry_after_ms=100,
+    )
+    mgr = _FakePagedSessionManager([_entry(1)], page_exception=busy)
+
+    with pytest.raises(StorageBusyError) as caught:
+        await _handle_chat_history(
+            {"sessionKey": "agent:main:webchat:test", "limit": 10},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=mgr,
+            ),
+        )
+
+    assert caught.value is busy
+    assert mgr.used_canonical is False
+
+
+@pytest.mark.asyncio
+async def test_chat_history_skips_summaries_when_not_requested() -> None:
+    summaries_called = False
+
+    class _SlowSummaryManager(_FakeSessionManager):
+        async def get_summaries(self, session_key):
+            nonlocal summaries_called
+            summaries_called = True
+            await asyncio.Event().wait()
+
+    manager = _SlowSummaryManager([_entry(1)], canonical_entries=[_entry(1)])
+    result = await asyncio.wait_for(
+        _handle_chat_history(
+            {
+                "sessionKey": "agent:main:webchat:test",
+                "limit": 10,
+                "includeSummaries": False,
+            },
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        ),
+        timeout=0.5,
+    )
+
+    assert [message["text"] for message in result["messages"]] == ["message 1"]
+    assert result["compaction_summaries"] == []
+    assert summaries_called is False
 
 
 @pytest.mark.asyncio
@@ -481,7 +634,7 @@ async def test_chat_history_exposes_stable_message_identity() -> None:
 
 
 @pytest.mark.asyncio
-async def test_chat_history_exposes_compaction_summary_anchor() -> None:
+async def test_chat_history_returns_requested_compaction_summaries() -> None:
     summary = SessionSummary(
         id=7,
         session_id="parent",
@@ -494,7 +647,6 @@ async def test_chat_history_exposes_compaction_summary_anchor() -> None:
         kept_count=1,
         covered_through_id=42,
     )
-
     result = await _handle_chat_history(
         {"sessionKey": "agent:main:webchat:test"},
         RpcContext(
@@ -505,6 +657,32 @@ async def test_chat_history_exposes_compaction_summary_anchor() -> None:
     )
 
     assert result["compaction_summaries"][0]["covered_through_id"] == 42
+    assert result["history_scope"] == "compacted"
+
+
+@pytest.mark.asyncio
+async def test_chat_history_degrades_requested_summaries_when_storage_is_busy() -> None:
+    class _BusySummaryManager(_FakeSessionManager):
+        async def get_summaries(self, session_key):
+            raise StorageBusyError(
+                "get_all_summaries",
+                waited_ms=2000,
+                retry_after_ms=100,
+                stage="lock_acquire",
+                resource="session_storage_operation_lock",
+            )
+
+    result = await _handle_chat_history(
+        {"sessionKey": "agent:main:webchat:test"},
+        RpcContext(
+            conn_id="test",
+            principal=SimpleNamespace(role="operator"),
+            session_manager=_BusySummaryManager([_entry(1)]),
+        ),
+    )
+
+    assert [message["text"] for message in result["messages"]] == ["message 1"]
+    assert result["compaction_summaries"] == []
 
 
 @pytest.mark.asyncio

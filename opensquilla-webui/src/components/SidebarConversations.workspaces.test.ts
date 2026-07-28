@@ -66,7 +66,8 @@ function i18n() {
         shared: {
           sidebar: {
             recentConversations: 'Recent tasks',
-            recents: 'Tasks',
+            recents: 'Recents',
+            noConversations: 'No tasks yet.',
             refresh: 'Refresh',
             enterSelectionMode: 'Select tasks',
             rowActions: 'Actions for {title}',
@@ -76,6 +77,8 @@ function i18n() {
           },
         },
         workspaces: {
+          projects: 'Projects',
+          createProject: 'Create project',
           projectInfo: '{path}; {count} tasks',
           taskCount: '{count} tasks',
           newTask: 'New project task',
@@ -86,6 +89,8 @@ function i18n() {
           editProject: 'Edit project',
           deleteHistory: 'Delete project task history',
           removeProject: 'Remove project',
+          menuDeleteHistory: 'Delete history',
+          menuRemove: 'Remove',
           deleteHistoryTitle: 'Delete project task history?',
           deleteHistoryBody: 'Delete {count} tasks from {name}.',
           deleteHistoryConfirm: 'Delete history',
@@ -99,10 +104,12 @@ function i18n() {
 async function mountSidebar(
   rows: SidebarSectionRow[],
   canManageProjects = true,
+  canCreateProjects = canManageProjects,
 ) {
   const sections: SidebarSection[] = [{ family: 'chats', label: 'Tasks', rows }]
   const events = {
     select: vi.fn(),
+    newProject: vi.fn(),
     newProjectTask: vi.fn(),
     projectPin: vi.fn(),
     projectEdit: vi.fn(),
@@ -119,7 +126,9 @@ async function mountSidebar(
     contractDebugEnabled: false,
     searchHint: 'Ctrl+K',
     canManageProjects,
+    canCreateProjects,
     onSelect: events.select,
+    onNewProject: events.newProject,
     onNewProjectTask: events.newProjectTask,
     onProjectPin: events.projectPin,
     onProjectEdit: events.projectEdit,
@@ -142,6 +151,60 @@ afterEach(() => {
 })
 
 describe('SidebarConversations project workspaces', () => {
+  it('creates projects from the section header while project-row plus actions remain task scoped', async () => {
+    const { host, events } = await mountSidebar([projectRow(), taskRow()])
+    const createProject = host.querySelector<HTMLButtonElement>('[data-testid="sidebar-create-project"]')
+    const createTask = host.querySelector<HTMLButtonElement>('[data-testid="project-workspace-new-task"]')
+
+    expect(createProject?.getAttribute('aria-label')).toBe('Create project')
+    expect(createTask?.getAttribute('aria-label')).toBe('New project task')
+
+    createProject?.click()
+    await nextTick()
+
+    expect(events.newProject).toHaveBeenCalledOnce()
+    expect(events.newProjectTask).not.toHaveBeenCalled()
+  })
+
+  it('separates project work from ordinary recent tasks', async () => {
+    const { host } = await mountSidebar([
+      projectRow(),
+      taskRow(),
+      taskRow({
+        key: 'agent:main:webchat:ordinary',
+        title: 'Ordinary task',
+        depth: 0,
+        workspaceId: undefined,
+      }),
+    ])
+
+    expect(host.querySelector('.sidebar-recents-eyebrow')?.textContent?.trim()).toBe('Projects')
+    expect(
+      host.querySelector('[data-session-key="agent:main:webchat:task-a"]')
+        ?.getAttribute('data-sidebar-zone'),
+    ).toBe('projects')
+    const ordinary = host.querySelector('[data-session-key="agent:main:webchat:ordinary"]')
+    expect(ordinary?.getAttribute('data-sidebar-zone')).toBe('recents')
+    expect(ordinary?.getAttribute('data-zone-label')).toBe('Recents')
+  })
+
+  it('keeps an empty project compact and gives recents its own empty state', async () => {
+    const { host } = await mountSidebar([
+      projectRow({ workspaceTaskCount: 0 }),
+      {
+        ...taskRow(),
+        rowKind: 'workspace-empty',
+        key: 'workspace:project-a:empty',
+        title: 'No tasks',
+        sessionKind: 'workspace-empty',
+      },
+    ])
+
+    expect(host.querySelector('.sidebar-workspace-empty')).toBeNull()
+    expect(host.querySelector('.sidebar-zone-empty__label')?.textContent).toBe('Recents')
+    expect(host.querySelector('.sidebar-zone-empty__body')?.textContent).toBe('No tasks yet.')
+  })
+
   it('toggles a project without selecting it and keeps project details visible', async () => {
     const { host, events } = await mountSidebar([projectRow(), taskRow()])
     const disclosure = host.querySelector<HTMLButtonElement>('[data-testid="project-workspace-disclosure"]')
@@ -168,16 +231,42 @@ describe('SidebarConversations project workspaces', () => {
     expect(host.querySelector('[data-session-key="agent:main:webchat:task-a"]')).toBeNull()
   })
 
-  it('creates a project task from the pencil action', async () => {
+  it('creates a project task and expands its project from the persistent plus action', async () => {
     const { host, events } = await mountSidebar([projectRow(), taskRow()])
-    const pencil = host.querySelector<HTMLButtonElement>('[data-testid="project-workspace-new-task"]')
+    const plus = host.querySelector<HTMLButtonElement>('[data-testid="project-workspace-new-task"]')
+    const disclosure = host.querySelector<HTMLButtonElement>('[data-testid="project-workspace-disclosure"]')
 
-    expect(pencil).toBeTruthy()
-    pencil?.click()
+    expect(plus).toBeTruthy()
+    expect(plus?.classList.contains('sidebar-project-action--new-task')).toBe(true)
+    expect(plus?.querySelector('svg')).not.toBeNull()
+    disclosure?.click()
+    await nextTick()
+    expect(disclosure?.getAttribute('aria-expanded')).toBe('false')
+
+    plus?.click()
     await nextTick()
 
     expect(events.newProjectTask).toHaveBeenCalledWith('project-a')
     expect(events.select).not.toHaveBeenCalled()
+    expect(disclosure?.getAttribute('aria-expanded')).toBe('true')
+    expect(host.querySelector('[data-session-key="agent:main:webchat:task-a"]')).not.toBeNull()
+  })
+
+  it('keeps a provisional project task current and free of persisted-task actions', async () => {
+    const provisional = taskRow({
+      key: 'draft:project:project-a:1',
+      title: 'New task',
+      provisional: true,
+    })
+    const { host, events } = await mountSidebar([projectRow(), provisional])
+    const row = host.querySelector<HTMLElement>('[data-session-key="draft:project:project-a:1"]')
+
+    row?.querySelector<HTMLButtonElement>('.sidebar-history-item')?.click()
+    await nextTick()
+
+    expect(events.select).not.toHaveBeenCalled()
+    expect(row?.querySelector('.sidebar-row-menu-btn')).toBeNull()
+    expect(row?.querySelector('.sidebar-agent-badge')).toBeNull()
   })
 
   it('disables the new-task action for an unavailable project', async () => {
@@ -185,11 +274,11 @@ describe('SidebarConversations project workspaces', () => {
       projectRow({ workspaceAvailable: false }),
       taskRow(),
     ])
-    const pencil = host.querySelector<HTMLButtonElement>('[data-testid="project-workspace-new-task"]')
+    const plus = host.querySelector<HTMLButtonElement>('[data-testid="project-workspace-new-task"]')
 
-    expect(pencil?.disabled).toBe(true)
-    expect(pencil?.getAttribute('title')).toBe('This project directory is unavailable')
-    pencil?.click()
+    expect(plus?.disabled).toBe(true)
+    expect(plus?.getAttribute('title')).toBe('This project directory is unavailable')
+    plus?.click()
     await nextTick()
 
     expect(events.newProjectTask).not.toHaveBeenCalled()
@@ -198,9 +287,35 @@ describe('SidebarConversations project workspaces', () => {
   it('exposes pin, edit, delete-history, and remove through the project menu', async () => {
     const { host, events } = await mountSidebar([projectRow(), taskRow()])
     const more = host.querySelector<HTMLButtonElement>('[data-testid="project-workspace-more"]')
+    Object.defineProperty(more, 'getBoundingClientRect', {
+      value: () => ({
+        x: 170,
+        y: 20,
+        width: 20,
+        height: 20,
+        top: 20,
+        right: 190,
+        bottom: 40,
+        left: 170,
+        toJSON: () => ({}),
+      }),
+    })
 
     more?.click()
     await nextTick()
+    const menu = document.body.querySelector<HTMLElement>('.sidebar-project-menu')
+    expect(menu?.classList.contains('sidebar-row-menu')).toBe(true)
+    expect(menu?.querySelectorAll('.sidebar-row-menu__item')).toHaveLength(4)
+    expect(menu?.style.left).toBe('196px')
+    expect(menu?.style.transform).toBe('none')
+    expect(
+      Array.from(menu?.querySelectorAll('.sidebar-row-menu__item') || [])
+        .map(item => item.textContent?.trim()),
+    ).toEqual(['Pin project', 'Edit project', 'Delete history', 'Remove'])
+    expect(
+      menu?.querySelector('[data-project-action="delete-history"]')
+        ?.classList.contains('sidebar-row-menu__item--danger'),
+    ).toBe(false)
     document.body.querySelector<HTMLButtonElement>('[data-project-action="pin"]')?.click()
     expect(events.projectPin).toHaveBeenCalledWith({ workspaceId: 'project-a', pinned: true })
 
@@ -229,6 +344,7 @@ describe('SidebarConversations project workspaces', () => {
     )
 
     expect(host.querySelector('[data-testid="project-workspace-disclosure"]')).toBeTruthy()
+    expect(host.querySelector('[data-testid="sidebar-create-project"]')).toBeNull()
     expect(host.querySelector('[data-testid="project-workspace-new-task"]')).toBeNull()
     expect(host.querySelector('[data-testid="project-workspace-more"]')).toBeNull()
 
@@ -237,6 +353,25 @@ describe('SidebarConversations project workspaces', () => {
     )?.click()
     await nextTick()
     expect(events.select).toHaveBeenCalledWith('agent:main:webchat:task-a')
+  })
+
+  it('renders task rows without leading status dots', async () => {
+    const { host } = await mountSidebar([
+      projectRow(),
+      taskRow(),
+      taskRow({
+        key: 'agent:main:webchat:running',
+        title: 'Running task',
+        runStatus: 'running',
+        runLabel: 'Running',
+      }),
+    ])
+
+    expect(host.querySelector('.sidebar-history-dot')).toBeNull()
+    expect(host.querySelector('[data-session-key="agent:main:webchat:task-a"]')?.textContent)
+      .toContain('Project task')
+    expect(host.querySelector('[data-session-key="agent:main:webchat:running"]')?.textContent)
+      .toContain('Running')
   })
 
 })

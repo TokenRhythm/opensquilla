@@ -112,3 +112,73 @@ describe('app store — approval focus request', () => {
     expect(second?.requestId).toBeGreaterThan(first?.requestId ?? 0)
   })
 })
+
+describe('app store — deleted-session approval cleanup', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    localStorage.clear()
+    stubMatchMedia()
+  })
+
+  it('removes only matching session approvals and clears their focus request', () => {
+    const store = useAppStore()
+    store.setPendingApprovals([
+      {
+        approvalId: 'delete-me',
+        sessionKey: 'agent:main:webchat:deleted',
+        tool: 'exec_command',
+        command: 'printf deleted',
+      },
+      {
+        approvalId: 'keep-me',
+        sessionKey: 'agent:main:webchat:other',
+        tool: 'exec_command',
+        command: 'printf other',
+      },
+      {
+        approvalId: 'keep-unscoped',
+        sessionKey: '',
+        tool: 'plugin',
+        command: '',
+      },
+    ])
+    store.requestApprovalFocus(store.pendingApprovals[0]!)
+
+    store.removePendingApprovalsForSessions([
+      'agent:main:webchat:deleted',
+      'agent:main:webchat:deleted',
+      '',
+    ])
+    store.removePendingApprovalsForSessions(['agent:main:webchat:deleted'])
+
+    expect(store.pendingApprovals.map(item => item.approvalId)).toEqual([
+      'keep-me',
+      'keep-unscoped',
+    ])
+    expect(store.approvalCount).toBe(2)
+    expect(store.approvalFocusRequest).toBeNull()
+
+    // A delayed Gateway resolved event is safe after the local session purge.
+    store.removePendingApproval('delete-me')
+    expect(store.pendingApprovals.map(item => item.approvalId)).toEqual([
+      'keep-me',
+      'keep-unscoped',
+    ])
+  })
+
+  it('is idempotent when the resolved event arrives before session deletion', () => {
+    const store = useAppStore()
+    store.setPendingApprovals([{
+      approvalId: 'resolved-first',
+      sessionKey: 'agent:main:webchat:deleted',
+      tool: 'exec_command',
+      command: 'printf done',
+    }])
+
+    store.removePendingApproval('resolved-first')
+    store.removePendingApprovalsForSessions(['agent:main:webchat:deleted'])
+
+    expect(store.pendingApprovals).toEqual([])
+    expect(store.approvalCount).toBe(0)
+  })
+})

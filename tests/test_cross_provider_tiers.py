@@ -114,6 +114,43 @@ def test_unresolvable_credentials_return_none(monkeypatch) -> None:
     assert resolve_tier_provider_config(cfg, "no-such-provider", "m") is None
 
 
+def test_shared_deployment_blocks_known_cross_provider_key_shape(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk_tr_abcdefghijklmnop")
+    cfg = _config_with_flag()
+
+    resolution = resolve_provider_deployment(
+        cfg,
+        "openrouter",
+        "openrouter/model",
+    )
+
+    assert resolution.ready is False
+    assert resolution.reason == "credential_provider_mismatch"
+    assert resolution.provider_config is not None
+    assert resolution.provider_config.api_key == ""
+
+
+def test_shared_deployment_blocks_key_for_conflicting_official_endpoint() -> None:
+    cfg = _config_with_flag()
+
+    resolution = resolve_provider_deployment(
+        cfg,
+        "tokenrhythm",
+        "deepseek-v4-pro",
+        overrides=SimpleNamespace(
+            api_key="sk_tr_abcdefghijklmnop",
+            base_url="https://openrouter.ai/api/v1",
+        ),
+    )
+
+    assert resolution.ready is False
+    assert resolution.reason == "credential_endpoint_provider_mismatch"
+    assert resolution.provider_config is not None
+    assert resolution.provider_config.api_key == ""
+
+
 def test_shared_resolution_reports_only_redacted_profile_provenance(monkeypatch) -> None:
     secret = "sk-test-profile-secret-never-render"
     monkeypatch.setenv("OPENAI_API_KEY", "sk-registry-loses")

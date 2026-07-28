@@ -26,8 +26,9 @@
           {{ attachmentBlockMessage(item) }}
         </span>
       </span>
-      <div v-if="!item.hiddenControl" class="chat-pending-actions">
+      <div class="chat-pending-actions">
         <button
+          v-if="!item.hiddenControl || item.deliveryState === 'retryable'"
           type="button"
           class="chat-pending-action chat-pending-action--steer"
           :title="steerTitle(item)"
@@ -48,7 +49,7 @@
         >
           <Icon name="trash" :size="14" />
         </button>
-        <div class="chat-pending-more-wrap">
+        <div v-if="!item.hiddenControl" class="chat-pending-more-wrap">
           <button
             type="button"
             class="chat-pending-action chat-pending-action--icon"

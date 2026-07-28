@@ -203,6 +203,24 @@ _EXPECTED_CAPS: dict[tuple[str, str, str], tuple[bool, bool, bool, str]] = {
     ("custom", "gemini-3-pro-preview", ""): (False, True, True, "none"),
     ("custom", "o3-mini", ""): (False, True, False, "none"),
     ("custom", "gpt-5.5", ""): (False, True, True, "none"),
+    ("custom_anthropic", "totally-unknown-model-x1", ""): (
+        False,
+        True,
+        False,
+        "none",
+    ),
+    ("qwen_token_plan", "qwen3.8-max-preview", ""): (
+        True,
+        True,
+        True,
+        "qwen_token_plan_qwen",
+    ),
+    ("qwen_token_plan_anthropic", "qwen3.8-max-preview", ""): (
+        True,
+        True,
+        True,
+        "qwen_token_plan_qwen",
+    ),
     ("dashscope", "totally-unknown-model-x1", ""): (False, True, False, "none"),
     ("dashscope", "gpt-4o", ""): (False, True, False, "none"),
     ("dashscope", "deepseek-r1", ""): (False, True, False, "none"),
@@ -846,6 +864,7 @@ _EXPECTED_REQUIRES_API_KEY: dict[str, bool] = {
     "byteplus_coding_plan": True,
     "byteplus_coding_plan_anthropic": True,
     "custom": False,
+    "custom_anthropic": False,
     "dashscope": True,
     "deepseek": True,
     "gemini": True,
@@ -872,6 +891,8 @@ _EXPECTED_REQUIRES_API_KEY: dict[str, bool] = {
     "openrouter": True,
     "ovms": False,
     "qianfan": True,
+    "qwen_token_plan": True,
+    "qwen_token_plan_anthropic": True,
     "siliconflow": True,
     "tencent_token_plan": True,
     "tencent_token_plan_anthropic": True,
@@ -899,6 +920,7 @@ _EXPECTED_UNKNOWN_CONTEXT_WINDOW: dict[str, int] = {
     "byteplus_coding_plan": 200000,
     "byteplus_coding_plan_anthropic": 200000,
     "custom": 8192,
+    "custom_anthropic": 8192,
     "dashscope": 200000,
     "deepseek": 200000,
     "gemini": 200000,
@@ -925,6 +947,8 @@ _EXPECTED_UNKNOWN_CONTEXT_WINDOW: dict[str, int] = {
     "openrouter": 200000,
     "ovms": 8192,
     "qianfan": 200000,
+    "qwen_token_plan": 200000,
+    "qwen_token_plan_anthropic": 200000,
     "siliconflow": 200000,
     "tencent_token_plan": 200000,
     "tencent_token_plan_anthropic": 200000,
@@ -977,17 +1001,21 @@ def test_unknown_model_context_window_parity_every_provider() -> None:
 
 
 def test_named_provider_sets_stay_distinct() -> None:
-    # Unifying membership would flip requires_api_key("vllm") — these MUST
-    # stay two distinct sets with an explicit superset derivation.
-    assert KEYLESS_PROVIDERS == frozenset({"ollama", "lm_studio", "ovms", "custom"})
+    assert KEYLESS_PROVIDERS == frozenset(
+        {"ollama", "lm_studio", "ovms", "custom", "custom_anthropic"}
+    )
     assert LOCAL_RUNTIME_PROVIDERS == KEYLESS_PROVIDERS | {"vllm", "local"}
     # vllm/local are local runtimes for the context heuristic but NOT keyless.
     assert "vllm" in LOCAL_RUNTIME_PROVIDERS
     assert "vllm" not in KEYLESS_PROVIDERS
     assert get_provider_spec("vllm").requires_api_key() is False  # no env_key, not keyless
-    # A vLLM-style deployment CAN carry auth; keyless status is not implied by
-    # being a local runtime. The custom endpoint is keyless AND local.
+    # Generic custom endpoints keep the established conservative local-window
+    # heuristic even when the configured URL is remote.
     assert "custom" in KEYLESS_PROVIDERS and "custom" in LOCAL_RUNTIME_PROVIDERS
+    assert (
+        "custom_anthropic" in KEYLESS_PROVIDERS
+        and "custom_anthropic" in LOCAL_RUNTIME_PROVIDERS
+    )
 
 
 def test_local_runtime_window_matches_membership() -> None:

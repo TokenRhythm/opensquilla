@@ -67,6 +67,29 @@ describe('useSetupEnsembleForm — init + dirty tracking', () => {
     expect(f.isDirty.value).toBe(false)
   })
 
+  it('uses the backend activation preview instead of the dormant legacy default', () => {
+    const f = useSetupEnsembleForm()
+    f.initFromConfig({
+      enabled: false,
+      selection_mode: 'static_openrouter_b5',
+      selection_configured: false,
+      activation_preview: {
+        selection_mode: CUSTOM_B5_SELECTION_MODE,
+        candidates: [
+          { provider: 'tokenrhythm', model: 'deepseek-v4-pro', role: 'primary' },
+          { provider: 'tokenrhythm', model: 'glm-5.2', role: 'aggregator' },
+        ],
+      },
+    })
+
+    expect(f.selectionMode.value).toBe(CUSTOM_B5_SELECTION_MODE)
+    expect(f.candidates.value.map((candidate) => candidate.provider)).toEqual([
+      'tokenrhythm',
+      'tokenrhythm',
+    ])
+    expect(f.isDirty.value).toBe(false)
+  })
+
   it('falls back to the shipped defaults for an empty or invalid config slice', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig({ selection_mode: 'bogus', all_failed_policy: 'bogus', min_successful_proposers: -3 })

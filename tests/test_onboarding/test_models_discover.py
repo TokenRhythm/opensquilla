@@ -95,7 +95,14 @@ def test_selectable_discovery_fails_closed_before_credentials_or_provider_build(
     assert result == ProviderModelsDiscoverResult(ok=True, provider_id="openai")
 
 
-@pytest.mark.parametrize("provider_id", ["openrouter", "tokenrhythm"])
+@pytest.mark.parametrize(
+    "provider_id",
+    [
+        "openrouter",
+        "tokenrhythm",
+        "qwen_token_plan",
+    ],
+)
 def test_selectable_discovery_delegates_verified_official_hosts(
     monkeypatch: Any, provider_id: str
 ) -> None:
@@ -127,11 +134,82 @@ def test_selectable_discovery_delegates_verified_official_hosts(
     ]
 
 
+def test_token_plan_anthropic_discovers_account_entitlements_through_openai_profile(
+    monkeypatch: Any,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    async def _fake_raw(**kwargs: Any) -> ProviderModelsDiscoverResult:
+        calls.append(kwargs)
+        return ProviderModelsDiscoverResult(
+            ok=True,
+            provider_id=kwargs["provider_id"],
+            source="live",
+            models=[{"id": "qwen3.7-plus"}],
+        )
+
+    monkeypatch.setattr(probe_module, "discover_provider_models", _fake_raw)
+
+    result = _discover_selectable(
+        provider_id="qwen_token_plan_anthropic",
+        api_key="synthetic-key",
+    )
+
+    assert result == ProviderModelsDiscoverResult(
+        ok=True,
+        provider_id="qwen_token_plan_anthropic",
+        source="live",
+        models=[{"id": "qwen3.7-plus"}],
+    )
+    assert calls == [
+        {
+            "provider_id": "qwen_token_plan",
+            "api_key": "synthetic-key",
+            "api_key_env": "",
+            "base_url": "",
+            "proxy": "",
+        }
+    ]
+
+
+def test_token_plan_anthropic_discovery_never_reuses_its_messages_path(
+    monkeypatch: Any,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    async def _fake_raw(**kwargs: Any) -> ProviderModelsDiscoverResult:
+        calls.append(kwargs)
+        return ProviderModelsDiscoverResult(
+            ok=True,
+            provider_id=kwargs["provider_id"],
+        )
+
+    monkeypatch.setattr(probe_module, "discover_provider_models", _fake_raw)
+
+    result = _discover_selectable(
+        provider_id="qwen_token_plan_anthropic",
+        api_key="synthetic-key",
+        base_url="https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
+    )
+
+    assert result.provider_id == "qwen_token_plan_anthropic"
+    assert calls[0]["provider_id"] == "qwen_token_plan"
+    assert calls[0]["base_url"] == ""
+
+
 @pytest.mark.parametrize(
     ("provider_id", "base_url"),
     [
         ("openrouter", "https://openrouter.ai.attacker.example/v1"),
         ("tokenrhythm", "https://tokenrhythm.studio.attacker.example/v1"),
+        (
+            "qwen_token_plan",
+            "https://token-plan.cn-beijing.maas.aliyuncs.com.attacker.example/v1",
+        ),
+        (
+            "qwen_token_plan_anthropic",
+            "https://token-plan.cn-beijing.maas.aliyuncs.com.attacker.example/v1",
+        ),
     ],
 )
 def test_selectable_discovery_rejects_non_official_base_url_before_raw_discovery(
@@ -156,6 +234,14 @@ def test_selectable_discovery_rejects_non_official_base_url_before_raw_discovery
     [
         ("openrouter", "http://openrouter.ai/api/v1"),
         ("tokenrhythm", "http://tokenrhythm.studio/v1"),
+        (
+            "qwen_token_plan",
+            "http://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        ),
+        (
+            "qwen_token_plan_anthropic",
+            "http://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
+        ),
     ],
 )
 def test_selectable_discovery_rejects_plain_http_before_credentials_or_raw_discovery(
@@ -187,14 +273,27 @@ def test_selectable_discovery_still_validates_unknown_provider() -> None:
 
 
 @pytest.mark.parametrize(
-    ("provider_id", "base_url"),
+    ("provider_id", "base_url", "discovery_base_url"),
     [
-        ("openrouter", "https://api.openrouter.ai/v1"),
-        ("tokenrhythm", "https://api.tokenrhythm.studio/v1"),
+        ("openrouter", "https://api.openrouter.ai/v1", "https://api.openrouter.ai/v1"),
+        ("tokenrhythm", "https://api.tokenrhythm.studio/v1", "https://api.tokenrhythm.studio/v1"),
+        (
+            "qwen_token_plan",
+            "https://api.token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+            "https://api.token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        ),
+        (
+            "qwen_token_plan_anthropic",
+            "https://api.token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
+            "",
+        ),
     ],
 )
 def test_selectable_discovery_accepts_official_subdomains(
-    monkeypatch: Any, provider_id: str, base_url: str
+    monkeypatch: Any,
+    provider_id: str,
+    base_url: str,
+    discovery_base_url: str,
 ) -> None:
     calls: list[str] = []
 
@@ -207,7 +306,7 @@ def test_selectable_discovery_accepts_official_subdomains(
     result = _discover_selectable(provider_id=provider_id, base_url=base_url)
 
     assert result.ok is True
-    assert calls == [base_url]
+    assert calls == [discovery_base_url]
 
 
 def test_discover_reports_missing_key_without_network(monkeypatch: Any) -> None:

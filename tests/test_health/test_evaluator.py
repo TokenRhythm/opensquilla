@@ -239,6 +239,58 @@ def test_provider_evaluator_reports_ready_active_provider() -> None:
     assert findings[0].severity == "ok"
 
 
+def test_provider_auth_probe_failure_blocks_readiness() -> None:
+    findings = evaluate_provider(
+        {
+            "activeProvider": "openrouter",
+            "providers": [
+                {
+                    "providerId": "openrouter",
+                    "active": True,
+                    "configured": True,
+                    "buildable": True,
+                    "modelProbe": {
+                        "attempted": True,
+                        "status": "error",
+                        "failureKind": "auth_invalid",
+                        "error": "HTTP 401 invalid credential",
+                    },
+                }
+            ],
+        }
+    )
+
+    assert findings[0].id == "provider.active.probe.auth_invalid"
+    assert findings[0].severity == "error"
+    assert _impact(findings[0]) == "blocks_ready"
+
+
+def test_provider_temporary_probe_failure_only_degrades_readiness() -> None:
+    findings = evaluate_provider(
+        {
+            "activeProvider": "openrouter",
+            "providers": [
+                {
+                    "providerId": "openrouter",
+                    "active": True,
+                    "configured": True,
+                    "buildable": True,
+                    "modelProbe": {
+                        "attempted": True,
+                        "status": "error",
+                        "failureKind": "network",
+                        "error": "temporary network failure",
+                    },
+                }
+            ],
+        }
+    )
+
+    assert findings[0].id == "provider.active.probe.network"
+    assert findings[0].severity == "warn"
+    assert _impact(findings[0]) == "degrades"
+
+
 def _healthy_active_row(**extra: object) -> dict[str, object]:
     row: dict[str, object] = {
         "providerId": "openrouter",

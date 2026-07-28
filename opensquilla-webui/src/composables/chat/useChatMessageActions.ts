@@ -18,6 +18,8 @@ export interface UseChatMessageActionsOptions {
   focusComposer: () => void
   pendingForkBeforeMessageId: Ref<string | null>
   aiGeneratedLabel?: () => string
+  canDeliver?: () => boolean
+  notifyDeliveryBlocked?: () => void
   /**
    * User-visible feedback when regenerate/edit cannot run because the anchor
    * user message has no durable server id yet (chat.send ack lost, or an
@@ -95,6 +97,13 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
   function regenerateMessage(message: ChatRenderedMessage) {
     if (options.isStreaming.value) {
       console.warn('Wait for the current response to finish')
+      return
+    }
+    // Regenerate is a send action that also truncates local history and
+    // replaces the composer. Fail closed before any of those mutations when
+    // live delivery cannot receive the resulting turn.
+    if (options.canDeliver && !options.canDeliver()) {
+      options.notifyDeliveryBlocked?.()
       return
     }
     const assistantIndex = sourceMessageIndex(message)

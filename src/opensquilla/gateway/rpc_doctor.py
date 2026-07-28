@@ -8,11 +8,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import Any, cast
 
-from opensquilla.gateway.config import (
-    STATIC_B5_SELECTION_MODE_PROVIDERS,
-    GatewayConfig,
-    static_b5_ensemble_enabled,
-)
+from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.rpc_channels import _handle_channels_status
 from opensquilla.gateway.rpc_logs import _build_logs_status
@@ -325,33 +321,33 @@ def _squilla_router_runtime_payload(ctx: RpcContext) -> dict[str, Any]:
 
 def _llm_ensemble_payload(ctx: RpcContext) -> dict[str, Any]:
     config = getattr(ctx, "config", None)
-    ensemble_cfg = getattr(config, "llm_ensemble", None) if config is not None else None
-    payload: dict[str, Any] = {
-        "enabled": bool(getattr(ensemble_cfg, "enabled", False)),
-        "selectionMode": str(getattr(ensemble_cfg, "selection_mode", "") or ""),
-        "activeProvider": str(
-            getattr(getattr(config, "llm", None), "provider", "") or ""
-        ),
+    if config is None:
+        return {
+            "enabled": False,
+            "selectionMode": "",
+            "activeProvider": "",
+            "runtimeStatus": "disabled",
+            "configurationReady": None,
+        }
+
+    from opensquilla.provider.ensemble import ensemble_runtime_status, static_b5_profile
+
+    payload = {
+        **ensemble_runtime_status(config),
+        "activeProvider": str(getattr(config.llm, "provider", "") or ""),
     }
-    if config is not None and static_b5_ensemble_enabled(config):
-        from opensquilla.provider.ensemble import static_b5_credential_available
+    static_profile = static_b5_profile(str(payload["selectionMode"]))
+    if static_profile is not None and payload["enabled"]:
         from opensquilla.provider.registry import get_provider_spec
 
-        selection_mode = str(getattr(ensemble_cfg, "selection_mode", "") or "")
-        member_provider = STATIC_B5_SELECTION_MODE_PROVIDERS.get(selection_mode, "openrouter")
-        payload["memberProvider"] = member_provider
-        payload["apiKeyEnv"] = str(get_provider_spec(member_provider).env_key or "")
-        payload["credentialAvailable"] = static_b5_credential_available(
-            config,
-            getattr(config, "llm", None),
-            selection_mode,
+        payload["memberProvider"] = static_profile.provider_id
+        payload["apiKeyEnv"] = str(
+            get_provider_spec(static_profile.provider_id).env_key or ""
         )
+        payload["credentialAvailable"] = bool(payload["configurationReady"])
     elif payload["enabled"] and payload["selectionMode"] == "custom_b5":
-        from opensquilla.provider.ensemble import custom_b5_lineup_ready
-
-        ready, reason = custom_b5_lineup_ready(config)
-        payload["lineupReady"] = ready
-        payload["lineupBlockedReason"] = reason
+        payload["lineupReady"] = bool(payload["configurationReady"])
+        payload["lineupBlockedReason"] = str(payload["blockedReason"] or "")
     return payload
 
 
@@ -416,6 +412,7 @@ async def _handle_doctor_status(params: dict | None, ctx: RpcContext) -> dict[st
     params = params or {}
     agent_id = normalize_agent_id(str(params.get("agentId") or "main"))
     deep = bool(params.get("deep", True))
+    probe_providers = bool(params.get("probeProviders", False))
 
     findings: list[HealthFinding] = [
         HealthFinding(
@@ -431,7 +428,10 @@ async def _handle_doctor_status(params: dict | None, ctx: RpcContext) -> dict[st
     collectors: list[tuple[str, Collector, Evaluator]] = [
         (
             "provider",
-            lambda: _handle_providers_status({"probeModels": False}, ctx),
+            lambda: _handle_providers_status(
+                {"probeModels": probe_providers},
+                ctx,
+            ),
             evaluate_provider,
         ),
         ("logs", lambda: _build_logs_status(ctx), evaluate_logs),

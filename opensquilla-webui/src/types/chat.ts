@@ -48,6 +48,11 @@ export interface ChatPendingItem {
   // normal user-bubble push / composer consumption on drain.
   hiddenControl?: boolean
   displayTextOverride?: string
+  /** Stable transport identity for retrying a hidden control exactly once. */
+  hiddenClientRequestId?: string
+  hiddenClientMessageId?: string
+  /** The visible confirmation bubble was already rendered optimistically. */
+  hiddenVisibleCommitted?: boolean
 }
 
 export interface ChatRouterCell {

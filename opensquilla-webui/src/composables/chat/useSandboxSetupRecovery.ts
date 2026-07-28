@@ -15,6 +15,7 @@ export interface UseSandboxSetupRecoveryOptions {
   rpc: SandboxSetupRpc
   connectionState: Ref<string>
   runMode: Ref<SandboxRunMode>
+  autoRefresh?: boolean
 }
 
 function normalizeStatus(payload: unknown): SandboxSetupStatusPayload | null {
@@ -129,7 +130,13 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
       if (changedMode) dismissed.value = false
       requestGeneration++
       clearPoll()
-      if (connection === 'connected' && mode !== 'full') void refresh()
+      if (
+        options.autoRefresh !== false
+        && connection === 'connected'
+        && mode !== 'full'
+      ) {
+        void refresh()
+      }
       else {
         status.value = null
         lastState = ''

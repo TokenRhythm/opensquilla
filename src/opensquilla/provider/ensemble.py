@@ -3335,7 +3335,9 @@ def custom_b5_lineup_ready(
         proxy=str(getattr(inherited, "proxy", "") or ""),
     )
     rows = _custom_b5_candidates(config)
-    if not [row for row in rows if row.role != "aggregator"]:
+    proposer_rows = [row for row in rows if row.role != "aggregator"]
+    aggregator_rows = [row for row in rows if row.role == "aggregator"]
+    if not proposer_rows:
         return False, "no_proposers"
     for row in rows:
         resolution = resolve_provider_deployment(
@@ -3352,6 +3354,21 @@ def custom_b5_lineup_ready(
         )
         if not resolution.ready:
             return False, f"{resolution.reason}:{row.provider}"
+    if not aggregator_rows:
+        aggregator_resolution = resolve_provider_deployment(
+            config,
+            inherited_cfg.provider,
+            inherited_cfg.model,
+            inherited_provider_config=inherited_cfg,
+            replay_provider_state=True,
+            credential_pool_acquirer=credential_pool_acquirer,
+            session_key=session_key,
+        )
+        if not aggregator_resolution.ready:
+            return (
+                False,
+                f"{aggregator_resolution.reason}:{inherited_cfg.provider}",
+            )
     return True, ""
 
 
@@ -3430,6 +3447,103 @@ def static_b5_credential_available(
         ).ready
         for model in member_models
     )
+
+
+def ensemble_runtime_status(config: Any) -> dict[str, Any]:
+    """Return a shared, local-only projection of Ensemble executability."""
+
+    ensemble = getattr(config, "llm_ensemble", None)
+    enabled = bool(getattr(ensemble, "enabled", False))
+    selection_mode = str(getattr(ensemble, "selection_mode", "") or "")
+    base: dict[str, Any] = {
+        "enabled": enabled,
+        "selectionMode": selection_mode,
+        "runtimeStatus": "disabled",
+        "configurationReady": None,
+        "blockedReason": None,
+        "proposerCount": 0,
+        "proposerCountRange": None,
+        "aggregatorCount": 0,
+        "perTurnCallCount": 0,
+        "perTurnCallCountRange": None,
+        "memberProviders": [],
+    }
+    if not enabled:
+        return base
+
+    static_profile = static_b5_profile(selection_mode)
+    if static_profile is not None:
+        ready = static_b5_credential_available(
+            config,
+            getattr(config, "llm", None),
+            selection_mode,
+        )
+        proposer_count = len(static_profile.proposer_models)
+        return {
+            **base,
+            "runtimeStatus": "ready" if ready else "blocked",
+            "configurationReady": ready,
+            "blockedReason": None if ready else "credential_missing",
+            "proposerCount": proposer_count,
+            "aggregatorCount": 1,
+            "perTurnCallCount": proposer_count + 1,
+            "memberProviders": [static_profile.provider_id],
+        }
+
+    if selection_mode == CUSTOM_B5_SELECTION_MODE:
+        rows = _custom_b5_candidates(config)
+        proposers = [row for row in rows if row.role != "aggregator"]
+        aggregators = [row for row in rows if row.role == "aggregator"]
+        ready, reason = custom_b5_lineup_ready(config)
+        providers = {row.provider for row in rows if row.provider}
+        if not aggregators:
+            inherited_provider = str(
+                getattr(getattr(config, "llm", None), "provider", "") or ""
+            ).strip().lower()
+            if inherited_provider:
+                providers.add(inherited_provider)
+        return {
+            **base,
+            "runtimeStatus": "ready" if ready else "blocked",
+            "configurationReady": ready,
+            "blockedReason": None if ready else reason,
+            "proposerCount": len(proposers),
+            "aggregatorCount": 1,
+            "perTurnCallCount": len(proposers) + 1,
+            "memberProviders": sorted(providers),
+        }
+
+    if selection_mode == "router_dynamic":
+        tiers = getattr(getattr(config, "squilla_router", None), "tiers", {}) or {}
+        providers = {
+            str((tier or {}).get("provider") or "").strip().lower()
+            for tier in tiers.values()
+            if isinstance(tier, dict)
+        }
+        providers.discard("")
+        inherited_provider = str(
+            getattr(getattr(config, "llm", None), "provider", "") or ""
+        ).strip().lower()
+        if inherited_provider:
+            providers.add(inherited_provider)
+        return {
+            **base,
+            "runtimeStatus": "conditional",
+            "configurationReady": None,
+            "proposerCount": None,
+            "proposerCountRange": [2, 4],
+            "aggregatorCount": 1,
+            "perTurnCallCount": None,
+            "perTurnCallCountRange": [3, 5],
+            "memberProviders": sorted(providers),
+        }
+
+    return {
+        **base,
+        "runtimeStatus": "blocked",
+        "configurationReady": False,
+        "blockedReason": "unknown_selection_mode",
+    }
 
 
 def _member_from_ref(

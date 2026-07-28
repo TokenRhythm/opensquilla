@@ -31,9 +31,16 @@ describe('useChatSessionRuntime project drafts', () => {
       usageModel: ref(''),
       createSessionKey: vi.fn(() => 'agent:main:webchat:project-b-draft'),
       persistSession: vi.fn(),
-      unsubscribeSession: vi.fn(),
-      subscribeSession: vi.fn(),
-      loadHistory: vi.fn(),
+      cancelSessionBootstrap: vi.fn(),
+      startSessionBootstrap: vi.fn(() => ({
+        generation: 1,
+        history: Promise.resolve({ ok: true }),
+        live: Promise.resolve({
+          authoritative: true,
+          live: false,
+          backgroundOnly: false,
+        }),
+      })),
       loadCurrentSessionUsage: vi.fn(),
       applySessionRunState: vi.fn(),
       setCompactInFlight: vi.fn(),
@@ -51,5 +58,82 @@ describe('useChatSessionRuntime project drafts', () => {
 
     expect(sessionKey.value).toBe('agent:main:webchat:project-b-draft')
     expect(resetDraftComposer).toHaveBeenCalledOnce()
+  })
+
+  it('starts critical session bootstrap before optional usage and waits for both phases', async () => {
+    const sessionKey = ref('agent:main:webchat:first')
+    let resolveHistory!: () => void
+    let resolveLive!: () => void
+    const history = new Promise<{ ok: boolean }>(resolve => {
+      resolveHistory = () => resolve({ ok: true })
+    })
+    const live = new Promise<{
+      authoritative: boolean
+      live: boolean
+      backgroundOnly: boolean
+    }>(resolve => {
+      resolveLive = () => resolve({
+        authoritative: true,
+        live: false,
+        backgroundOnly: false,
+      })
+    })
+    const order: string[] = []
+    const startSessionBootstrap = vi.fn(() => {
+      order.push('bootstrap')
+      return { generation: 1, history, live }
+    })
+    const loadCurrentSessionUsage = vi.fn(() => {
+      order.push('usage')
+    })
+    const runtime = useChatSessionRuntime({
+      sessionKey,
+      messages: ref<ChatMessage[]>([]),
+      pendingSessionIntent: ref<string | null>(null),
+      routerDecisionPending: ref(null),
+      currentEpoch: ref(0),
+      lastStreamSeq: ref(0),
+      activeTaskGroups: ref(new Set<string>()),
+      aborted: ref(false),
+      lastHeaderRole: ref(''),
+      lastHeaderDay: ref(''),
+      usageAccum: ref({
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: null,
+        routedTurns: 0,
+        sessionSaved: 0,
+      }),
+      usageModel: ref(''),
+      createSessionKey: vi.fn(),
+      persistSession: vi.fn((key: string) => {
+        sessionKey.value = key
+      }),
+      cancelSessionBootstrap: vi.fn(),
+      startSessionBootstrap,
+      loadCurrentSessionUsage,
+      applySessionRunState: vi.fn(),
+      setCompactInFlight: vi.fn(),
+      hideCompactStatus: vi.fn(),
+      clearPendingQueue: vi.fn(),
+      switchPendingQueue: vi.fn(),
+      adoptPendingQueue: vi.fn(),
+      resetSavingsPopupCooldown: vi.fn(),
+      restoreWidgetState: vi.fn(),
+      resetStreamLiveTurnState: vi.fn(),
+    })
+
+    const switching = runtime.switchToSession('agent:main:webchat:second')
+    expect(order).toEqual(['bootstrap'])
+
+    resolveLive()
+    await switching
+    expect(loadCurrentSessionUsage).not.toHaveBeenCalled()
+
+    resolveHistory()
+    await vi.waitFor(() => expect(loadCurrentSessionUsage).toHaveBeenCalledOnce())
+    expect(order).toEqual(['bootstrap', 'usage'])
   })
 })

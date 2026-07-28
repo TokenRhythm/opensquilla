@@ -708,6 +708,10 @@ pre {
   line-height: 20px;
 }
 
+.sidebar-recents-eyebrow + .sidebar-cmd-btn {
+  margin-left: auto;
+}
+
 .sidebar-history.is-selecting .sidebar-recents-eyebrow {
   color: var(--sidebar-text);
   letter-spacing: 0;
@@ -905,23 +909,6 @@ pre {
   font-weight: 500;
 }
 
-.sidebar-history-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  flex-shrink: 0;
-}
-/* Spectral status dots: each run-state reads its own calibrated channel.
-   running reuses the strike (orange) with the live pulse; queued is the new
-   indigo channel; idle/cancelled stay quiet. */
-.sidebar-history-dot.status--idle { background: var(--sidebar-text-soft); }
-.sidebar-history-dot.status--running { background: var(--accent); animation: live-pulse var(--dur-pulse) var(--ease-standard) infinite; }
-.sidebar-history-dot.status--queued { background: var(--queued); }
-.sidebar-history-dot.status--interrupted { background: var(--warn-fill); }
-.sidebar-history-dot.status--failed { background: var(--danger); }
-.sidebar-history-dot.status--timeout { background: var(--danger); }
-.sidebar-history-dot.status--cancelled { background: var(--sidebar-text-soft); }
-
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.4; }
@@ -969,6 +956,51 @@ pre {
 
 .sidebar-history-row--workspace {
   margin-top: var(--sp-2);
+}
+
+/* Project work stays grouped under its folder. The first unbound task opens a
+   second, deliberately separated "Recents" zone without introducing another
+   card or divider line into the quiet sidebar surface. */
+.sidebar-history-row--recent-start {
+  margin-top: 43px;
+}
+
+.sidebar-history-row--recent-start::before {
+  content: attr(data-zone-label);
+  position: absolute;
+  top: -35px;
+  left: calc(4px - var(--row-depth, 0) * 14px);
+  right: 4px;
+  display: flex;
+  align-items: center;
+  min-height: 28px;
+  color: var(--sidebar-text-soft);
+  font-size: var(--fs-sm);
+  font-weight: 400;
+  line-height: 20px;
+  pointer-events: none;
+}
+
+.sidebar-zone-empty {
+  margin-top: 13px;
+  padding: 0 4px 8px;
+}
+
+.sidebar-zone-empty__label {
+  display: flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 0 6px;
+  color: var(--sidebar-text-soft);
+  font-size: var(--fs-sm);
+  font-weight: 400;
+  line-height: 20px;
+}
+
+.sidebar-zone-empty__body {
+  padding: 6px 10px;
+  color: var(--sidebar-text-soft);
+  font-size: var(--fs-xs);
 }
 
 .sidebar-workspace-header {
@@ -1093,10 +1125,20 @@ pre {
   transition: opacity var(--dur-fast), background var(--dur-fast), color var(--dur-fast);
 }
 
+.sidebar-project-action--new-task,
+.sidebar-project-action--new-task:disabled {
+  opacity: 0;
+}
+
 .sidebar-history-row--workspace:hover .sidebar-project-action,
 .sidebar-history-row--workspace:focus-within .sidebar-project-action,
 .sidebar-project-action[aria-expanded='true'] {
   opacity: 1;
+}
+
+.sidebar-history-row--workspace:hover .sidebar-project-action--new-task:disabled,
+.sidebar-history-row--workspace:focus-within .sidebar-project-action--new-task:disabled {
+  opacity: 0.34;
 }
 
 .sidebar-workspace-empty {
@@ -1112,8 +1154,25 @@ pre {
   min-height: 26px;
 }
 
-.sidebar-project-menu {
-  min-width: 210px;
+.sidebar-row-menu.sidebar-project-menu {
+  min-width: 152px;
+  padding: 5px;
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+}
+
+.sidebar-project-menu .sidebar-row-menu__item {
+  min-height: 30px;
+  gap: 7px;
+  padding: 5px 8px;
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  line-height: 1.35;
+}
+
+.sidebar-project-menu .sidebar-row-menu__item > svg {
+  flex: 0 0 auto;
+  opacity: 0.78;
 }
 
 .sidebar-workspace-label {
@@ -1121,6 +1180,34 @@ pre {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-weight: 400;
+}
+
+.sidebar-project-create-btn {
+  width: 24px;
+  height: 24px;
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--sidebar-text-soft);
+  cursor: pointer;
+  transition: background var(--dur-fast), color var(--dur-fast);
+}
+
+.sidebar-project-create-btn:hover,
+.sidebar-project-create-btn:focus-visible {
+  background: var(--sidebar-item-hover);
+  color: var(--sidebar-text-strong);
+}
+
+.sidebar-project-create-btn + .sidebar-cmd-btn {
+  margin-left: 0;
 }
 
 .sidebar-history-row.is-selected .sidebar-history-item {

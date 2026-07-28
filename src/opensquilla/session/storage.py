@@ -9,8 +9,9 @@ import logging
 import random
 import sqlite3
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -90,7 +91,7 @@ class CanonicalTranscriptCoverage:
 
 
 class StorageBusyError(RuntimeError):
-    """Raised when a SQLite write lock outlives the bounded retry budget."""
+    """Raised when a session-storage operation outlives its bounded busy budget."""
 
     def __init__(
         self,
@@ -98,11 +99,15 @@ class StorageBusyError(RuntimeError):
         *,
         waited_ms: int,
         retry_after_ms: int,
+        stage: str | None = None,
+        resource: str | None = None,
     ) -> None:
         super().__init__("Session storage is temporarily busy")
         self.operation = operation
         self.waited_ms = waited_ms
         self.retry_after_ms = retry_after_ms
+        self.stage = stage
+        self.resource = resource
 
 
 class StorageConnectionPoisonedError(RuntimeError):
@@ -219,6 +224,10 @@ _SQLITE_BUSY_TIMEOUT_MS = 100
 _INTERACTIVE_BUSY_BUDGET_SECONDS = 2.0
 _BUSY_RETRY_INITIAL_SECONDS = 0.025
 _BUSY_RETRY_MAX_SECONDS = 0.250
+_BOUNDED_INTERACTIVE_READS: ContextVar[bool] = ContextVar(
+    "opensquilla_bounded_interactive_storage_reads",
+    default=False,
+)
 
 
 def _is_sqlite_busy(exc: BaseException) -> bool:
@@ -229,6 +238,17 @@ def _is_sqlite_busy(exc: BaseException) -> bool:
     return "database is locked" in message or "database table is locked" in message
 
 
+@contextlib.contextmanager
+def bounded_interactive_storage_reads() -> Iterator[None]:
+    """Bound shared-connection read-gate waits for an interactive RPC scope."""
+
+    token = _BOUNDED_INTERACTIVE_READS.set(True)
+    try:
+        yield
+    finally:
+        _BOUNDED_INTERACTIVE_READS.reset(token)
+
+
 def _serialized_read[**P, R](
     method: Callable[Concatenate[SessionStorage, P], Awaitable[R]],
 ) -> Callable[Concatenate[SessionStorage, P], Awaitable[R]]:
@@ -236,9 +256,31 @@ def _serialized_read[**P, R](
 
     @wraps(method)
     async def _wrapped(self: SessionStorage, *args: P.args, **kwargs: P.kwargs) -> R:
-        async with self._operation_lock:
+        if not _BOUNDED_INTERACTIVE_READS.get():
+            async with self._operation_lock:
+                self._raise_if_poisoned()
+                return await method(self, *args, **kwargs)
+
+        started = self._monotonic()
+        acquired = False
+        try:
+            try:
+                async with asyncio.timeout(self._busy_budget_seconds):
+                    await self._operation_lock.acquire()
+            except TimeoutError as exc:
+                raise StorageBusyError(
+                    method.__name__,
+                    waited_ms=max(0, int((self._monotonic() - started) * 1000)),
+                    retry_after_ms=_SQLITE_BUSY_TIMEOUT_MS,
+                    stage="lock_acquire",
+                    resource="session_storage_operation_lock",
+                ) from exc
+            acquired = True
             self._raise_if_poisoned()
             return await method(self, *args, **kwargs)
+        finally:
+            if acquired:
+                self._operation_lock.release()
 
     return _wrapped
 

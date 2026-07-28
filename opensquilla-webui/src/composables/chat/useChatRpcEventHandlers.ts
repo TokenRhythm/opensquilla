@@ -23,6 +23,7 @@ import type {
   WarningPayload,
 } from '@/types/rpc'
 import type { ChatRpcSubscriptionHandlers } from '@/composables/chat/useChatRpcSubscriptions'
+import type { SessionBootstrapRun } from '@/composables/chat/useChatSessionBootstrap'
 import type { FrameInput } from '@/types/turnlog'
 import type { FoldLiveTurnMode } from '@/composables/chat/useChatTurnLog'
 import {
@@ -109,9 +110,9 @@ export interface UseChatRpcEventHandlersOptions {
   schedulePendingDrainAfterTerminal: () => void
   popAllPendingIntoComposer: () => boolean
   saveWidgetState: () => void
-  subscribeSession: () => void
-  loadHistory: () => void
+  handleSessionConnectionState: (state: string) => SessionBootstrapRun | undefined
   loadCurrentSessionUsage: () => void
+  refreshRunModePreference?: () => void | Promise<void>
 }
 
 type ChatDoneUsageFields = {
@@ -1084,13 +1085,29 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   }
 
   let connectionLostNoted = false
+  let connectionStateGeneration = 0
   function handleRpcConnectionState(state: string) {
+    const stateGeneration = ++connectionStateGeneration
+    const recovery = options.handleSessionConnectionState(state)
     if (state === 'connected' && sessionKey.value) {
+      const connectedSessionKey = sessionKey.value
       connectionLostNoted = false
       stream.hideThinkingIndicator()
-      options.subscribeSession()
-      options.loadCurrentSessionUsage()
-      options.loadHistory()
+      // The Gateway intentionally dispatches RPCs serially. Optional usage
+      // metadata must not enter that queue ahead of snapshot/subscribe/history
+      // after reconnect, so wait for the coordinator's critical phases.
+      const criticalPhases = recovery
+        ? [recovery.history, recovery.live]
+        : []
+      void Promise.allSettled(criticalPhases).then(() => {
+        if (
+          connectionStateGeneration === stateGeneration
+          && sessionKey.value === connectedSessionKey
+        ) {
+          options.loadCurrentSessionUsage()
+          void options.refreshRunModePreference?.()
+        }
+      })
       if (stream.isStreaming.value) stream.resetStreamIdleTimer()
     }
     if (state === 'disconnected' && stream.isStreaming.value) {

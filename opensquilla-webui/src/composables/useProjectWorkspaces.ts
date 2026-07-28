@@ -1,5 +1,6 @@
 import { computed, ref, watch } from 'vue'
 import { useRpcStore } from '@/stores/rpc'
+import type { RpcCallOptions } from '@/lib/rpc'
 import type {
   ProjectWorkspaceHistoryDeleteResponse,
   ProjectWorkspaceItem,
@@ -50,7 +51,9 @@ export function useProjectWorkspaces() {
     }
   }
 
-  async function loadWorkspaces(): Promise<ProjectWorkspaceItem[]> {
+  async function loadWorkspaces(
+    callOptions?: RpcCallOptions,
+  ): Promise<ProjectWorkspaceItem[]> {
     if (!rpc.canManageProjectWorkspaces) {
       resetWorkspaces()
       return []
@@ -58,7 +61,13 @@ export function useProjectWorkspaces() {
     isLoading.value = true
     error.value = null
     try {
-      const response = await rpc.call<ProjectWorkspacesResponse>('workspaces.list')
+      const response = callOptions
+        ? await rpc.call<ProjectWorkspacesResponse>(
+            'workspaces.list',
+            undefined,
+            callOptions,
+          )
+        : await rpc.call<ProjectWorkspacesResponse>('workspaces.list')
       workspaces.value = (response?.workspaces || [])
         .map(normalizeWorkspace)
         .filter((item): item is ProjectWorkspaceItem => item !== null)

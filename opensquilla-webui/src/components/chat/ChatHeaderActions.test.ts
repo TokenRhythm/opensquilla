@@ -5,7 +5,7 @@ import { createI18n } from 'vue-i18n'
 
 import ChatHeaderActions from './ChatHeaderActions.vue'
 
-type Action = 'deliverables' | 'runs' | 'share' | 'copy-session-key'
+type Action = 'deliverables' | 'share' | 'copy-session-key'
 
 type HeaderInstance = ComponentPublicInstance & {
   focusAction: (action: Action) => boolean
@@ -18,7 +18,6 @@ const BASE_PROPS = {
   copyIcon: 'copy' as const,
   copyLiveText: '',
   deliverableCount: 2,
-  runHistoryVisible: true,
   shareMode: false,
   shareableMessageCount: 3,
 }
@@ -28,8 +27,6 @@ const messages = {
     copied: 'Copied',
     copySessionKey: 'Copy session key',
     deliverablesCount: 'Deliverables ({count})',
-    metaRunHistory: 'Run history',
-    runs: 'Runs',
     sessionActions: 'Session actions',
     share: 'Share',
     shareSelectHint: 'Select messages to share',
@@ -66,7 +63,6 @@ async function mountHeader(
   headerWidth = width
   const handlers = {
     deliverables: vi.fn(),
-    runs: vi.fn(),
     share: vi.fn(),
     copy: vi.fn(),
   }
@@ -76,7 +72,6 @@ async function mountHeader(
     ...BASE_PROPS,
     ...overrides,
     onOpenDeliverables: handlers.deliverables,
-    onOpenRunHistory: handlers.runs,
     onStartShare: handlers.share,
     onCopySessionKey: handlers.copy,
   })
@@ -155,7 +150,7 @@ describe('ChatHeaderActions', () => {
     if (name !== 'wide') await openMenu(el)
 
     const actions = renderedActions(el)
-    expect(actions.sort()).toEqual(['copy-session-key', 'deliverables', 'runs', 'share'].sort())
+    expect(actions.sort()).toEqual(['copy-session-key', 'deliverables', 'share'].sort())
     expect(new Set(actions).size).toBe(actions.length)
 
     if (name === 'compact') {
@@ -178,16 +173,16 @@ describe('ChatHeaderActions', () => {
     await flush()
 
     const items = Array.from(el.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'))
-    expect(items).toHaveLength(3)
+    expect(items).toHaveLength(2)
     expect(document.activeElement).toBe(items[0])
 
     items[0]!.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }))
     expect(document.activeElement).toBe(items[1])
 
     items[1]!.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true }))
-    expect(document.activeElement).toBe(items[2])
+    expect(document.activeElement).toBe(items[1])
 
-    items[2]!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    items[1]!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
     await flush()
     expect(el.querySelector('[role="menu"]')).toBeNull()
     expect(menuTrigger.getAttribute('aria-expanded')).toBe('false')
@@ -197,7 +192,6 @@ describe('ChatHeaderActions', () => {
   it('keeps the menu open and emits nothing when disabled share is activated', async () => {
     const { el, handlers } = await mountHeader(400, {
       deliverableCount: 0,
-      runHistoryVisible: false,
       shareableMessageCount: 0,
     })
     await openMenu(el)
@@ -219,7 +213,6 @@ describe('ChatHeaderActions', () => {
     expect(handlers.deliverables).toHaveBeenCalledTimes(1)
 
     for (const [testId, handler] of [
-      ['chat-session-action-runs', handlers.runs],
       ['chat-session-action-share', handlers.share],
       ['chat-session-action-copy', handlers.copy],
     ] as const) {
@@ -231,7 +224,6 @@ describe('ChatHeaderActions', () => {
     }
 
     expect(handlers.deliverables).toHaveBeenCalledTimes(1)
-    expect(handlers.runs).toHaveBeenCalledTimes(1)
     expect(handlers.share).toHaveBeenCalledTimes(1)
     expect(handlers.copy).toHaveBeenCalledTimes(1)
   })
@@ -245,9 +237,6 @@ describe('ChatHeaderActions', () => {
     expect(document.activeElement).toBe(primary)
 
     expect(instance.focusAction('share')).toBe(true)
-    expect(document.activeElement).toBe(menuTrigger)
-
-    expect(instance.focusAction('runs')).toBe(true)
     expect(document.activeElement).toBe(menuTrigger)
 
     const tight = await mountHeader(120)

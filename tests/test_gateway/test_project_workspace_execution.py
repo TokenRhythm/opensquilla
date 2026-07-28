@@ -2247,8 +2247,9 @@ async def test_bootstrap_uses_canonical_project_path_and_snapshot(
 
 
 @pytest.mark.asyncio
-async def test_messages_subscribe_projects_unavailable_workspace_without_failing_history(
+async def test_legacy_messages_subscribe_preserves_project_workspace_snapshot(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async with open_stack(tmp_path / "sessions.db") as stack:
         project_path = tmp_path / "project"
@@ -2260,11 +2261,26 @@ async def test_messages_subscribe_projects_unavailable_workspace_without_failing
         )
         project_path.rmdir()
 
-        response = await get_dispatcher().dispatch(
-            "subscribe-unavailable",
-            "sessions.messages.subscribe",
-            {"key": session.session_key},
-            stack.context,
+        validation_called = False
+
+        async def _hanging_validation(*_args: Any, **_kwargs: Any) -> None:
+            nonlocal validation_called
+            validation_called = True
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(
+            "opensquilla.gateway.project_workspace_runtime."
+            "resolve_validated_project_workspace",
+            _hanging_validation,
+        )
+        response = await asyncio.wait_for(
+            get_dispatcher().dispatch(
+                "subscribe-unavailable",
+                "sessions.messages.subscribe",
+                {"key": session.session_key},
+                stack.context,
+            ),
+            timeout=0.5,
         )
 
         assert response.ok is True
@@ -2273,10 +2289,13 @@ async def test_messages_subscribe_projects_unavailable_workspace_without_failing
             "id": project.workspace_id,
             "name": project.display_name,
             "path": project.path,
-            "available": False,
+            "available": True,
             "removed": False,
-            "availabilityReason": "unavailable",
+            "availabilityReason": None,
         }
+        assert response.payload["projectWorkspaceDeferred"] is False
+        assert response.payload["hydration_complete"] is True
+        assert validation_called is False
 
 
 @pytest.mark.asyncio

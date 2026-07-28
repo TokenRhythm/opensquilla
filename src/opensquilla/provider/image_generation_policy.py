@@ -6,10 +6,12 @@ import re
 from urllib.parse import urlsplit
 
 from opensquilla.endpoint_identity import base_url_allows_credential_reuse
+from opensquilla.provider.qwen_token_plan import QWEN_TOKEN_PLAN_IMAGE_BASE_URL
 
 IMAGE_GENERATION_OFFICIAL_BASE_URLS: dict[str, str] = {
     "openai": "https://api.openai.com/v1",
     "openrouter": "https://openrouter.ai/api/v1",
+    "qwen_token_plan": QWEN_TOKEN_PLAN_IMAGE_BASE_URL,
 }
 _PROVIDER_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -124,6 +126,11 @@ def resolve_image_generation_base_url(
     """
 
     base_url = _config_string(provider_config, "base_url", default_base_url) or default_base_url
+    # Token Plan chat and image generation share an origin and credential but
+    # use different native path roots. Reuse its credential, never its chat
+    # base path, unless the image endpoint itself was explicitly overridden.
+    if provider_id == "qwen_token_plan":
+        return base_url
     if not _field_was_set(provider_config, "base_url") and _llm_provider_matches(
         llm_config,
         provider_id,

@@ -1,6 +1,11 @@
 import { ref, computed } from 'vue'
 import { defineStore } from 'pinia'
-import { RpcClient, type RpcEventHandler } from '@/lib/rpc'
+import {
+  RpcClient,
+  type RpcCallOptions,
+  type RpcConnectionWaitOptions,
+  type RpcEventHandler,
+} from '@/lib/rpc'
 
 const WS_URL_KEY = 'opensquilla.wsUrl'
 const WS_TOKEN_KEY = 'opensquilla.wsToken'
@@ -176,12 +181,20 @@ export const useRpcStore = defineStore('rpc', () => {
     unavailableMethods.value = new Set([...unavailableMethods.value, method])
   }
 
-  async function call<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T> {
+  async function call<T = unknown>(
+    method: string,
+    params?: Record<string, unknown>,
+    options?: RpcCallOptions,
+  ): Promise<T> {
     if (!client.value) throw new Error('RPC client not initialized')
     if (state.value !== 'connected') {
       throw new Error(`Cannot call ${method}: not connected (state: ${state.value})`)
     }
-    return client.value.call(method, params) as Promise<T>
+    return (
+      options
+        ? client.value.call(method, params, options)
+        : client.value.call(method, params)
+    ) as Promise<T>
   }
 
   function on(event: string, handler: RpcEventHandler): () => void {
@@ -192,10 +205,13 @@ export const useRpcStore = defineStore('rpc', () => {
     return client.value.on(event, handler)
   }
 
-  function waitForConnection(timeoutMs?: number): Promise<void> {
+  function waitForConnection(
+    timeoutMs?: number,
+    signal?: AbortSignal,
+    actions?: RpcConnectionWaitOptions,
+  ): Promise<void> {
     if (!client.value) return Promise.reject(new Error('RPC client not initialized'))
-    if (state.value === 'connected') return Promise.resolve()
-    return client.value.waitForConnection(timeoutMs)
+    return client.value.waitForConnection(timeoutMs, signal, actions)
   }
 
   return {

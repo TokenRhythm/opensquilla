@@ -344,6 +344,7 @@ function scheduleSessionRefresh() {
 function applyLocalDeletedSessions(keys: Set<string>) {
   if (keys.size === 0) return
   sessionsList.value = sessionsList.value.filter(item => !keys.has(itemKey(item)))
+  pendingApprovals.value = pendingApprovals.value.filter(key => !keys.has(key))
   if (inspectKey.value && keys.has(inspectKey.value)) closeInspect()
 }
 

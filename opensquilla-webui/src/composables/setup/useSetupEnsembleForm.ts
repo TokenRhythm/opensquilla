@@ -186,6 +186,12 @@ export interface EnsembleCustomLineupView {
 export interface EnsembleConfigSlice {
   enabled?: boolean
   selection_mode?: string
+  selection_configured?: boolean
+  activation_preview?: {
+    selection_mode?: string
+    candidates?: EnsembleCandidateConfig[]
+    blocked_reason?: string | null
+  }
   model_options?: string[]
   candidates?: EnsembleCandidateConfig[]
   min_successful_proposers?: number
@@ -464,9 +470,23 @@ export function useSetupEnsembleForm() {
 
   function initFromConfig(config: EnsembleConfigSlice) {
     enabled.value = config.enabled === true
-    selectionMode.value = normalizeSelectionMode(config.selection_mode)
+    const usePlannedActivation = (
+      config.enabled !== true && config.selection_configured === false
+    )
+    const plannedActivation = usePlannedActivation
+      ? config.activation_preview
+      : undefined
+    selectionMode.value = (
+      usePlannedActivation
+        ? normalizeSelectionMode(
+            plannedActivation?.selection_mode ?? CUSTOM_B5_SELECTION_MODE,
+          )
+        : normalizeSelectionMode(config.selection_mode)
+    )
     modelOptions.value = normalizeModelOptions(config.model_options)
-    candidates.value = normalizeCandidates(config.candidates)
+    candidates.value = normalizeCandidates(
+      plannedActivation?.candidates ?? config.candidates,
+    )
     minSuccessfulProposers.value = normalizeMinSuccessful(
       config.min_successful_proposers ?? DEFAULT_MIN_SUCCESSFUL_PROPOSERS,
     )

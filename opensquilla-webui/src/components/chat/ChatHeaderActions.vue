@@ -37,19 +37,6 @@
         <span class="chat-share-btn__label">{{ deliverablesLabel }}</span>
       </button>
       <button
-        v-if="runHistoryVisible"
-        ref="wideRunsRef"
-        type="button"
-        class="chat-header__action chat-share-btn"
-        :title="t('chat.metaRunHistory')"
-        :aria-label="t('chat.metaRunHistory')"
-        data-testid="chat-session-action-runs"
-        @click="emit('open-run-history')"
-      >
-        <Icon name="clock" :size="14" />
-        <span class="chat-share-btn__label">{{ t('chat.runs') }}</span>
-      </button>
-      <button
         v-if="!shareMode"
         ref="wideShareRef"
         type="button"
@@ -123,17 +110,6 @@
           <span>{{ deliverablesLabel }}</span>
         </button>
         <button
-          v-if="menuActions.includes('runs')"
-          type="button"
-          class="chat-header__menu-item"
-          role="menuitem"
-          data-testid="chat-session-action-runs"
-          @click="invoke('runs', true)"
-        >
-          <Icon name="clock" :size="16" />
-          <span>{{ t('chat.metaRunHistory') }}</span>
-        </button>
-        <button
           v-if="menuActions.includes('share')"
           type="button"
           class="chat-header__menu-item"
@@ -172,7 +148,7 @@ import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import type { IconName } from '@/utils/icons'
 
 type Layout = 'wide' | 'compact' | 'tight'
-type Action = 'deliverables' | 'runs' | 'share' | 'copy-session-key'
+type Action = 'deliverables' | 'share' | 'copy-session-key'
 
 const props = defineProps<{
   title: string
@@ -181,14 +157,12 @@ const props = defineProps<{
   copyIcon: IconName
   copyLiveText: string
   deliverableCount: number
-  runHistoryVisible: boolean
   shareMode: boolean
   shareableMessageCount: number
 }>()
 
 const emit = defineEmits<{
   'open-deliverables': []
-  'open-run-history': []
   'start-share': []
   'copy-session-key': []
 }>()
@@ -200,7 +174,6 @@ const menuTriggerRef = ref<HTMLButtonElement | null>(null)
 const menuRef = ref<HTMLDivElement | null>(null)
 const primaryActionRef = ref<HTMLButtonElement | null>(null)
 const wideDeliverablesRef = ref<HTMLButtonElement | null>(null)
-const wideRunsRef = ref<HTMLButtonElement | null>(null)
 const wideShareRef = ref<HTMLButtonElement | null>(null)
 const wideCopyRef = ref<HTMLButtonElement | null>(null)
 const layout = ref<Layout>('wide')
@@ -231,7 +204,6 @@ const primaryActionLabel = computed(() => primaryAction.value === 'deliverables'
 const menuActions = computed<Action[]>(() => {
   const actions: Action[] = []
   if (props.deliverableCount > 0 && primaryAction.value !== 'deliverables') actions.push('deliverables')
-  if (props.runHistoryVisible) actions.push('runs')
   if (!props.shareMode && primaryAction.value !== 'share') actions.push('share')
   actions.push('copy-session-key')
   return actions
@@ -258,7 +230,6 @@ function syncLayout() {
         return
       }
       const fallback = wideDeliverablesRef.value
-        || wideRunsRef.value
         || wideShareRef.value
         || wideCopyRef.value
       fallback?.focus()
@@ -297,7 +268,6 @@ function invoke(action: Action, fromMenu = false) {
   // before the menu item is unmounted so close-focus never falls back to body.
   if (fromMenu) closeMenu(true)
   if (action === 'deliverables') emit('open-deliverables')
-  if (action === 'runs') emit('open-run-history')
   if (action === 'share') emit('start-share')
   if (action === 'copy-session-key') emit('copy-session-key')
 }
@@ -328,11 +298,9 @@ function onMenuKeydown(event: KeyboardEvent) {
 function focusAction(action: Action): boolean {
   const direct = action === 'deliverables'
     ? wideDeliverablesRef.value
-    : action === 'runs'
-      ? wideRunsRef.value
-      : action === 'share'
-        ? wideShareRef.value
-        : wideCopyRef.value
+    : action === 'share'
+      ? wideShareRef.value
+      : wideCopyRef.value
   if (isVisible(direct)) {
     direct.focus()
     return true
@@ -364,7 +332,6 @@ useDocumentEvent('keydown', (event) => {
 
 watch(() => [
   props.deliverableCount,
-  props.runHistoryVisible,
   props.shareMode,
   props.shareableMessageCount,
 ], () => {

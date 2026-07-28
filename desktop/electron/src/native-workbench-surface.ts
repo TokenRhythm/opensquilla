@@ -18,6 +18,7 @@ import {
   type NativeWorkbenchSurfaceRect,
   type NativeWorkbenchSurfaceRectRequest,
 } from './native-workbench-surface-contract.js'
+import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
 
 function artifactHtmlCsp(allowRemoteResources: boolean): string {
   const remote = allowRemoteResources ? ' https:' : ''
@@ -55,6 +56,7 @@ interface NativeWorkbenchSurfaceRecord {
   crashed: boolean
   missingResourceReported: boolean
   subresourceRequestCount: number
+  removeZoomShortcuts: () => void
 }
 
 // A single-file preview cannot legitimately need an unbounded number of
@@ -96,6 +98,7 @@ export class NativeWorkbenchSurfaceManager {
   private readonly surfaces = new Map<string, NativeWorkbenchSurfaceRecord>()
   private readonly surfaceQueues = new Map<string, Promise<void>>()
   private readonly hookedWindows = new WeakSet<BrowserWindow>()
+  private readonly unresponsiveWindows = new WeakSet<BrowserWindow>()
   private activeSurfaceId: string | null = null
 
   constructor(private readonly options: NativeWorkbenchSurfaceManagerOptions) {}
@@ -153,7 +156,13 @@ export class NativeWorkbenchSurfaceManager {
       crashed: false,
       missingResourceReported: false,
       subresourceRequestCount: 0,
+      removeZoomShortcuts: () => {},
     }
+    record.removeZoomShortcuts = installDesktopZoomShortcuts(
+      record.view.webContents,
+      owner.webContents,
+      () => this.refreshBounds(owner),
+    )
     this.surfaces.set(record.id, record)
 
     try {
@@ -171,9 +180,12 @@ export class NativeWorkbenchSurfaceManager {
         await this.destroyRecord(record)
         return { ok: false, message: 'The native Workbench surface was closed.' }
       }
+      if (record.crashed) {
+        return { ok: false, message: 'The native Workbench surface renderer failed.' }
+      }
       return { ok: true }
     } catch (error) {
-      if (!record.disposed) this.emit(record, 'error', { message: errorMessage(error) })
+      this.failRecord(record, 'error', { message: errorMessage(error) })
       await this.destroyRecord(record)
       return { ok: false, message: errorMessage(error) }
     }
@@ -242,6 +254,9 @@ export class NativeWorkbenchSurfaceManager {
     record.disposed = true
     record.visibleRequested = false
 
+    try {
+      record.removeZoomShortcuts()
+    } catch {}
     try {
       record.view.setVisible(false)
       if (!record.owner.isDestroyed()) record.owner.contentView.removeChildView(record.view)
@@ -391,17 +406,15 @@ export class NativeWorkbenchSurfaceManager {
       if (!isMainFrame || record.disposed || errorCode === -3) return
       // A failed native document must yield to the DOM error state. Keeping the
       // child view visible would cover the recovery controls rendered by Vue.
-      record.crashed = true
-      record.visibleRequested = false
-      this.hideRecord(record)
-      this.emit(record, 'error', { message: errorDescription || `Load failed (${errorCode})` })
+      this.failRecord(record, 'error', {
+        message: errorDescription || `Load failed (${errorCode})`,
+      })
     })
     contents.on('render-process-gone', (_event, detail) => {
-      if (record.disposed) return
-      record.crashed = true
-      record.visibleRequested = false
-      this.hideRecord(record)
-      this.emit(record, 'crashed', { reason: detail.reason })
+      this.failRecord(record, 'crashed', { reason: detail.reason })
+    })
+    contents.on('unresponsive', () => {
+      this.failRecord(record, 'crashed', { reason: 'unresponsive' })
     })
   }
 
@@ -412,36 +425,98 @@ export class NativeWorkbenchSurfaceManager {
     }
     this.activeSurfaceId = record.id
     record.view.setBounds(record.rect)
-    record.view.setVisible(true)
+    this.setPhysicalVisibility(record, this.ownerCanShowSurfaces(record.owner))
   }
 
   private hideRecord(record: NativeWorkbenchSurfaceRecord): void {
     if (this.activeSurfaceId === record.id) this.activeSurfaceId = null
+    this.setPhysicalVisibility(record, false)
+  }
+
+  private setPhysicalVisibility(
+    record: NativeWorkbenchSurfaceRecord,
+    visible: boolean,
+  ): void {
     try {
-      record.view.setVisible(false)
+      record.view.setVisible(visible)
     } catch {}
+  }
+
+  refreshBounds(owner: BrowserWindow): void {
+    this.reapplyActiveBounds(owner)
   }
 
   private reapplyActiveBounds(owner: BrowserWindow): void {
     if (!this.activeSurfaceId) return
     const record = this.surfaces.get(this.activeSurfaceId)
+    if (record?.disposed || record?.crashed) {
+      this.hideRecord(record)
+      return
+    }
     if (!record || record.owner !== owner || !record.requestedRect || !record.visibleRequested) {
       return
     }
     record.rect = this.resolveSurfaceRect(record)
     if (!record.rect) {
-      this.hideRecord(record)
+      this.setPhysicalVisibility(record, false)
       return
     }
     record.view.setBounds(record.rect)
+    this.setPhysicalVisibility(record, this.ownerCanShowSurfaces(owner))
+  }
+
+  private ownerCanShowSurfaces(owner: BrowserWindow): boolean {
+    return !owner.isDestroyed()
+      && !this.unresponsiveWindows.has(owner)
+      && owner.isVisible()
+      && !owner.isMinimized()
+  }
+
+  private hideOwnedViews(owner: BrowserWindow): void {
+    for (const record of this.surfaces.values()) {
+      if (record.owner === owner) this.setPhysicalVisibility(record, false)
+    }
+  }
+
+  private failOwnedSurfaces(owner: BrowserWindow, reason: string): void {
+    for (const record of this.surfaces.values()) {
+      if (record.owner === owner) {
+        this.failRecord(record, 'crashed', { reason })
+      }
+    }
+  }
+
+  private failRecord(
+    record: NativeWorkbenchSurfaceRecord,
+    type: 'error' | 'crashed',
+    detail: NonNullable<NativeWorkbenchSurfaceEvent['detail']>,
+  ): boolean {
+    if (record.disposed || record.crashed) return false
+    record.crashed = true
+    record.visibleRequested = false
+    this.hideRecord(record)
+    this.emit(record, type, detail)
+    return true
   }
 
   private hookWindow(owner: BrowserWindow): void {
     if (this.hookedWindows.has(owner)) return
     this.hookedWindows.add(owner)
     owner.on('resize', () => this.reapplyActiveBounds(owner))
+    owner.on('hide', () => this.hideOwnedViews(owner))
+    owner.on('minimize', () => this.hideOwnedViews(owner))
+    owner.on('show', () => this.reapplyActiveBounds(owner))
+    owner.on('restore', () => this.reapplyActiveBounds(owner))
     owner.webContents.on('zoom-changed', () => this.reapplyActiveBounds(owner))
+    owner.webContents.on('unresponsive', () => {
+      this.unresponsiveWindows.add(owner)
+      this.failOwnedSurfaces(owner, 'owner-unresponsive')
+    })
+    owner.webContents.on('responsive', () => {
+      this.unresponsiveWindows.delete(owner)
+    })
     owner.webContents.on('render-process-gone', () => {
+      this.unresponsiveWindows.add(owner)
       void this.destroyAll()
     })
     owner.once('closed', () => {
@@ -454,7 +529,10 @@ export class NativeWorkbenchSurfaceManager {
     type: NativeWorkbenchSurfaceEvent['type'],
     detail?: NativeWorkbenchSurfaceEvent['detail'],
   ): void {
-    if (record.disposed) return
+    if (
+      record.disposed
+      || (record.crashed && type !== 'error' && type !== 'crashed')
+    ) return
     this.options.emit({
       version: NATIVE_WORKBENCH_PROTOCOL_VERSION,
       surfaceId: record.id,

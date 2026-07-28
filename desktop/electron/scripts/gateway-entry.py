@@ -26,6 +26,13 @@ if __name__ == "__main__":
     if sys.argv[1:] == [_DESKTOP_CA_PROBE_ARG]:
         raise SystemExit(_run_desktop_ca_probe())
 
+    if len(sys.argv) == 3 and sys.argv[1] == "--elevated-helper":
+        from opensquilla.sandbox.backend.windows_default_setup import (
+            elevated_setup_helper_main,
+        )
+
+        raise SystemExit(elevated_setup_helper_main(sys.argv[1:]))
+
     from opensquilla.cli.main import app
 
     app()

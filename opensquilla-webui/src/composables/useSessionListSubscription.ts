@@ -8,6 +8,7 @@ type SessionListRpc = {
 export interface UseSessionListSubscriptionOptions {
   rpc: SessionListRpc
   isConnected: () => boolean
+  isAdmitted?: () => boolean
   refresh: () => void | Promise<void>
   scheduleRefresh: () => void
   warn?: (message: string, error?: unknown) => void
@@ -33,7 +34,12 @@ export function useSessionListSubscription(options: UseSessionListSubscriptionOp
   }
 
   function ensureSubscribed(): Promise<void> | null {
-    if (!active || !options.isConnected() || subscribed) return null
+    if (
+      !active
+      || !options.isConnected()
+      || options.isAdmitted?.() === false
+      || subscribed
+    ) return null
     if (subscribeWork) return subscribeWork
 
     const generation = connectionGeneration
@@ -93,6 +99,7 @@ export function useSessionListSubscription(options: UseSessionListSubscriptionOp
 
   return {
     subscribe,
+    resume: ensureSubscribed,
     cleanup,
   }
 }

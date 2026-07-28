@@ -294,6 +294,9 @@ class AnthropicProvider:
         replay_provider_state: bool = True,
         auth_header_style: AuthHeaderStyle = "x-api-key",
         provider_id: str | None = None,
+        listing_model_ids: tuple[str, ...] | None = None,
+        temperature_floor_model_ids: frozenset[str] = frozenset(),
+        temperature_floor: float = 0.0,
     ) -> None:
         # The default auth style matches Anthropic proper so direct
         # construction (tests, embedding) against the default host behaves
@@ -309,6 +312,9 @@ class AnthropicProvider:
         # profiles such as MiniMax carry their own configured identity for
         # response attribution without changing Anthropic-shaped behavior.
         self.provider_id = (provider_id or self.provider_name).strip()
+        self._listing_model_ids = listing_model_ids
+        self._temperature_floor_model_ids = temperature_floor_model_ids
+        self._temperature_floor = temperature_floor
 
     @property
     def model(self) -> str:
@@ -382,7 +388,13 @@ class AnthropicProvider:
         if system_payload:
             payload["system"] = system_payload
         if cfg.temperature is not None and not cfg.thinking:
-            payload["temperature"] = cfg.temperature
+            temperature = cfg.temperature
+            if (
+                self._model.rsplit("/", 1)[-1].strip().lower()
+                in self._temperature_floor_model_ids
+            ):
+                temperature = max(temperature, self._temperature_floor)
+            payload["temperature"] = temperature
         if cfg.stop_sequences:
             payload["stop_sequences"] = cfg.stop_sequences
         if tools:
@@ -428,10 +440,11 @@ class AnthropicProvider:
             "content-type": "application/json",
             "accept": "text/event-stream",
         }
-        if self._auth_header_style == "bearer":
-            headers["Authorization"] = f"Bearer {self._api_key}"
-        else:
-            headers["x-api-key"] = self._api_key
+        if self._api_key:
+            if self._auth_header_style == "bearer":
+                headers["Authorization"] = f"Bearer {self._api_key}"
+            else:
+                headers["x-api-key"] = self._api_key
         endpoint = self._api_url("/v1/messages")
         trace = LLMTraceRecorder(
             provider="anthropic",
@@ -1024,20 +1037,27 @@ class AnthropicProvider:
             )
 
     async def list_models(self) -> list[ModelInfo]:
-        """Build listing rows for the adapter's SKUs from the shared catalog.
+        """Build listing rows for this provider identity from the shared catalog.
 
         The catalog's canonical costs are USD per million tokens; the
         ``ModelInfo`` wire contract carries per-1k floats (rpc_models
         renders per-1k), so entry costs are converted back (÷1000).
         Capability flags stay at ``ModelInfo`` defaults — the listing has
-        only ever advertised identity, windows, and pricing.
+        only ever advertised identity, windows, and pricing. Native Anthropic
+        uses its built-in SKU list; compatibility endpoints receive an exact
+        registry list or the configured model from the selector.
         """
         rows: list[ModelInfo] = []
-        for model_id in _LISTING_MODEL_IDS:
-            entry = shared_catalog().resolve_entry(model_id, provider=self.provider_name)
+        model_ids = (
+            _LISTING_MODEL_IDS
+            if self._listing_model_ids is None
+            else self._listing_model_ids
+        )
+        for model_id in model_ids:
+            entry = shared_catalog().resolve_entry(model_id, provider=self.provider_id)
             rows.append(
                 ModelInfo(
-                    provider=self.provider_name,
+                    provider=self.provider_id,
                     model_id=model_id,
                     display_name=entry.display_name or model_id,
                     context_window=entry.context_window,

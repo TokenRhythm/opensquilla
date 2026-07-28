@@ -9,6 +9,7 @@ import uuid
 from dataclasses import dataclass, field, replace
 from io import BytesIO
 from typing import Protocol
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 from PIL import Image
@@ -26,6 +27,10 @@ from opensquilla.provider.image_generation_policy import (
     is_valid_image_generation_base_url,
     parse_image_generation_model_ref,
     resolve_image_generation_base_url,
+)
+from opensquilla.provider.qwen_token_plan import (
+    QWEN_TOKEN_PLAN_API_KEY_ENV,
+    QWEN_TOKEN_PLAN_IMAGE_BASE_URL,
 )
 from opensquilla.provider.tokenrhythm_correlation import (
     tokenrhythm_correlation_headers,
@@ -277,6 +282,114 @@ class OpenRouterImageGenerationProvider:
         )
 
 
+class QwenTokenPlanImageGenerationProvider:
+    """Native adapter for the Token Plan multimodal-generation API."""
+
+    provider_id = "qwen_token_plan"
+    default_model = "wan2.7-image"
+    auth_env_vars: tuple[str, ...] = (QWEN_TOKEN_PLAN_API_KEY_ENV,)
+    _generation_path = "/services/aigc/multimodal-generation/generation"
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        api_key_env: str = QWEN_TOKEN_PLAN_API_KEY_ENV,
+        base_url: str = QWEN_TOKEN_PLAN_IMAGE_BASE_URL,
+    ) -> None:
+        self._api_key = api_key
+        self._api_key_env = api_key_env
+        self._base_url = base_url.rstrip("/")
+
+    def _resolve_api_key(self) -> str:
+        return clean_header_secret(
+            self._api_key or os.environ.get(self._api_key_env, ""),
+            label=f"{self.provider_id} image API key",
+        )
+
+    @staticmethod
+    def _wire_size(size: str) -> str:
+        normalized = str(size or "").strip().lower().replace("*", "x")
+        dimensions = normalized.split("x")
+        if (
+            len(dimensions) != 2
+            or not all(part.isdigit() for part in dimensions)
+            or any(int(part) <= 0 for part in dimensions)
+        ):
+            raise RuntimeError(f"Invalid Token Plan image size: {size!r}")
+        return "*".join(dimensions)
+
+    async def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
+        _raise_for_conflicting_official_endpoint(self.provider_id, self._base_url)
+        api_key = self._resolve_api_key()
+        if not api_key:
+            raise RuntimeError(f"{self._api_key_env} is not set")
+
+        payload = {
+            "model": request.model,
+            "input": {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"text": request.prompt}],
+                    }
+                ]
+            },
+            "parameters": {
+                "size": self._wire_size(request.size),
+                "n": 1,
+                "thinking_mode": False,
+            },
+        }
+        from opensquilla.engine.usage_http import reserve_direct_usage_call
+
+        usage = await reserve_direct_usage_call(
+            provider=self.provider_id,
+            model=request.model,
+            base_url=self._base_url,
+        )
+        try:
+            async with httpx.AsyncClient(
+                timeout=request.timeout_seconds,
+                trust_env=_trust_env(),
+                follow_redirects=False,
+            ) as client:
+                response = await client.post(
+                    f"{self._base_url}{self._generation_path}",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+                response.raise_for_status()
+                data = response.json()
+                await usage.finalize_openai_response(
+                    data,
+                    raw_json=str(getattr(response, "text", "") or ""),
+                )
+        except asyncio.CancelledError:
+            await usage.mark_unknown("cancelled")
+            raise
+        except Exception:
+            await usage.mark_unknown("direct_request_failed")
+            raise
+
+        image_url = _extract_qwen_token_plan_image_url(data)
+        if not image_url:
+            raise RuntimeError("Image generation provider returned no images")
+        mime_type, image_bytes = await _download_qwen_token_plan_image(
+            image_url,
+            timeout_seconds=request.timeout_seconds,
+        )
+        return ImageGenerationResult(
+            image_bytes=image_bytes,
+            mime_type=mime_type,
+            model=request.model,
+            provider=self.provider_id,
+        )
+
+
 def _extract_openrouter_image_url(data: dict) -> str | None:
     for choice in data.get("choices") or []:
         message = choice.get("message") or {}
@@ -286,6 +399,107 @@ def _extract_openrouter_image_url(data: dict) -> str | None:
             if isinstance(url, str) and url:
                 return url
     return None
+
+
+def _extract_qwen_token_plan_image_url(data: dict) -> str | None:
+    output = data.get("output") or {}
+    for choice in output.get("choices") or []:
+        message = choice.get("message") or {}
+        for item in message.get("content") or []:
+            if not isinstance(item, dict):
+                continue
+            image_url = item.get("image") or item.get("image_url")
+            if isinstance(image_url, str) and image_url:
+                return image_url
+    return None
+
+
+_GENERATED_IMAGE_DOWNLOAD_LIMIT = 20 * 1024 * 1024
+_GENERATED_IMAGE_REDIRECT_LIMIT = 3
+
+
+async def _download_qwen_token_plan_image(
+    image_url: str,
+    *,
+    timeout_seconds: float,
+) -> tuple[str, bytes]:
+    """Download one signed result URL without exposing it in failures."""
+
+    from opensquilla.tools.ssrf import (
+        environment_proxy_url,
+        pinned_transport,
+        validate_http_url_for_fetch,
+    )
+
+    current_url = image_url
+    for redirect_count in range(_GENERATED_IMAGE_REDIRECT_LIMIT + 1):
+        try:
+            parsed = urlsplit(current_url)
+            if (
+                parsed.scheme.lower() != "https"
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.fragment
+            ):
+                raise ValueError("unsafe generated image URL")
+            vetted_ips = validate_http_url_for_fetch(current_url)
+
+            transport_kwargs: dict[str, object] = {}
+            if _trust_env():
+                proxy_url = environment_proxy_url(current_url)
+                if proxy_url is not None:
+                    transport_kwargs["proxy"] = proxy_url
+            transport = pinned_transport(current_url, vetted_ips, **transport_kwargs)
+            client_kwargs: dict[str, object] = {
+                "timeout": timeout_seconds,
+                "follow_redirects": False,
+                "trust_env": _trust_env(),
+            }
+            if transport is not None:
+                client_kwargs["transport"] = transport
+
+            async with httpx.AsyncClient(**client_kwargs) as client:  # type: ignore[arg-type]
+                async with client.stream("GET", current_url) as response:
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise ValueError("redirect without location")
+                        current_url = urljoin(current_url, location)
+                        continue
+
+                    response.raise_for_status()
+                    content_length = response.headers.get("content-length")
+                    if (
+                        content_length is not None
+                        and content_length.isdigit()
+                        and int(content_length) > _GENERATED_IMAGE_DOWNLOAD_LIMIT
+                    ):
+                        raise ValueError("generated image exceeds download limit")
+                    image_bytes = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        image_bytes.extend(chunk)
+                        if len(image_bytes) > _GENERATED_IMAGE_DOWNLOAD_LIMIT:
+                            raise ValueError("generated image exceeds download limit")
+                    content_type = (
+                        response.headers.get("content-type", "image/png")
+                        .split(";", 1)[0]
+                        .strip()
+                        .lower()
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise RuntimeError(
+                "Failed to securely download the generated Token Plan image"
+            ) from None
+
+        if not image_bytes:
+            raise RuntimeError("Token Plan returned an empty generated image")
+        mime_type = content_type if content_type.startswith("image/") else "image/png"
+        return mime_type, bytes(image_bytes)
+
+    raise RuntimeError("Token Plan generated image exceeded the redirect limit")
 
 
 def _decode_data_url(data_url: str) -> tuple[str, bytes]:
@@ -442,6 +656,7 @@ def reset_image_generation_providers(
     providers_config = getattr(image_config, "providers", None)
     openai_config = getattr(providers_config, "openai", None)
     openrouter_config = getattr(providers_config, "openrouter", None)
+    qwen_token_plan_config = getattr(providers_config, "qwen_token_plan", None)
 
     openai_base_url = _resolve_configured_base_url(
         provider_id="openai",
@@ -499,6 +714,40 @@ def reset_image_generation_providers(
             ),
             api_key_env=openrouter_api_key_env,
             base_url=openrouter_base_url,
+        )
+    )
+    qwen_token_plan_base_url = _resolve_configured_base_url(
+        provider_id="qwen_token_plan",
+        provider_config=qwen_token_plan_config,
+        llm_config=llm_config,
+        default_base_url=QWEN_TOKEN_PLAN_IMAGE_BASE_URL,
+    )
+    qwen_token_plan_api_key_env = credential_env_for_endpoint(
+        configured_env=_get_config_attr(
+            qwen_token_plan_config,
+            "api_key_env",
+            QWEN_TOKEN_PLAN_API_KEY_ENV,
+        ),
+        configured_explicitly=_field_was_set(
+            qwen_token_plan_config,
+            "api_key_env",
+        ),
+        default_env=QWEN_TOKEN_PLAN_API_KEY_ENV,
+        default_base_url=QWEN_TOKEN_PLAN_IMAGE_BASE_URL,
+        effective_base_url=qwen_token_plan_base_url,
+    )
+    register_image_generation_provider(
+        QwenTokenPlanImageGenerationProvider(
+            api_key=_resolve_configured_api_key(
+                provider_id="qwen_token_plan",
+                provider_config=qwen_token_plan_config,
+                llm_config=llm_config,
+                api_key_env=qwen_token_plan_api_key_env,
+                default_base_url=QWEN_TOKEN_PLAN_IMAGE_BASE_URL,
+                effective_base_url=qwen_token_plan_base_url,
+            ),
+            api_key_env=qwen_token_plan_api_key_env,
+            base_url=qwen_token_plan_base_url,
         )
     )
 

@@ -5,10 +5,14 @@ import { useChatPendingQueue } from './useChatPendingQueue'
 import type { Attachment, ChatPendingItem } from '@/types/chat'
 
 function makeQueue(
-  dispatchPendingItem?: (item: ChatPendingItem) => Promise<
+  dispatchPendingItem?: (item: ChatPendingItem, ownerSessionKey: string) => Promise<
     'accepted' | 'deferred' | 'not_sent' | 'retryable_failure'
   >,
   isBlocked: () => boolean = () => false,
+  dispatchHiddenControl?: (
+    item: ChatPendingItem,
+    ownerSessionKey: string,
+  ) => Promise<'accepted' | 'deferred' | 'not_sent' | 'retryable_failure'>,
 ) {
   const sessionKey = ref('agent:main:webchat:test')
   const inputText = ref('')
@@ -28,9 +32,10 @@ function makeQueue(
     resetInputHistory: vi.fn(),
     hasComposer: () => true,
     dispatchPendingItem,
+    dispatchHiddenControl,
   })
 
-  return { inputText, queue, sendCurrentInput }
+  return { inputText, queue, sendCurrentInput, sessionKey }
 }
 
 describe('useChatPendingQueue delivery state', () => {
@@ -125,7 +130,7 @@ describe('useChatPendingQueue delivery state', () => {
 
       expect(dispatchPendingItem).toHaveBeenCalledWith(expect.objectContaining({
         text: 'next queued item',
-      }))
+      }), 'agent:main:webchat:test')
       expect(inputText.value).toBe('draft written while steering')
       expect(queue.pendingQueue.value).toEqual([])
     } finally {
@@ -177,6 +182,44 @@ describe('useChatPendingQueue delivery state', () => {
     }
   })
 
+  it.each(['visible', 'hidden'] as const)(
+    'never dispatches an A-session %s lease after switching to B before nextTick',
+    async kind => {
+      vi.useFakeTimers()
+      const dispatchPendingItem = vi.fn(async () => 'accepted' as const)
+      const dispatchHiddenControl = vi.fn(async () => 'accepted' as const)
+      const { inputText, queue, sessionKey } = makeQueue(
+        dispatchPendingItem,
+        () => false,
+        dispatchHiddenControl,
+      )
+      try {
+        if (kind === 'hidden') {
+          queue.enqueueHiddenControl({
+            text: 'A hidden control',
+            displayText: 'A control',
+          })
+        } else {
+          inputText.value = 'A visible follow-up'
+          queue.enqueuePendingInput(inputText.value)
+        }
+        queue.schedulePendingDrainAfterTerminal()
+
+        vi.advanceTimersByTime(50)
+        queue.switchPendingQueue('agent:main:webchat:B')
+        sessionKey.value = 'agent:main:webchat:B'
+        await nextTick()
+
+        expect(dispatchPendingItem).not.toHaveBeenCalled()
+        expect(dispatchHiddenControl).not.toHaveBeenCalled()
+        expect(queue.pendingQueue.value).toEqual([])
+      } finally {
+        queue.cleanup()
+        vi.useRealTimers()
+      }
+    },
+  )
+
   it('does not remove a steering item through remove or clear', () => {
     const { inputText, queue } = makeQueue()
     inputText.value = 'in flight'
@@ -191,6 +234,24 @@ describe('useChatPendingQueue delivery state', () => {
     queue.clearPendingQueue()
     expect(queue.pendingQueue.value.map(item => item.text)).toEqual(['in flight'])
     expect(queue.pendingQueue.value[0]?.deliveryState).toBe('steering')
+    queue.cleanup()
+  })
+
+  it('lets an operator retry or remove a terminal hidden-control failure', () => {
+    const { queue } = makeQueue()
+    queue.enqueueHiddenControl({
+      text: 'provider confirmation',
+      displayText: 'Confirmed',
+    })
+    const hidden = queue.pendingQueue.value[0]!
+    hidden.deliveryState = 'retryable'
+
+    expect(queue.beginPendingDelivery(0)).toBeNull()
+    expect(queue.beginPendingDelivery(0, true)).toBe(hidden)
+    queue.settlePendingDelivery(hidden, 'retryable_failure')
+    expect(hidden.deliveryState).toBe('retryable')
+    expect(queue.removePendingChip(0)).toBe(true)
+    expect(queue.pendingQueue.value).toEqual([])
     queue.cleanup()
   })
 

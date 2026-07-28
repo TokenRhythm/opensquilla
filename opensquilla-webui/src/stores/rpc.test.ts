@@ -8,6 +8,7 @@ const connectCalls: Array<{ url: string; token?: string }> = []
 const clients: Array<{
   emit: (event: string, ...args: unknown[]) => void
   disconnect: ReturnType<typeof vi.fn>
+  waitForConnection: ReturnType<typeof vi.fn>
 }> = []
 
 vi.mock('@/lib/rpc', () => ({
@@ -81,6 +82,24 @@ describe('rpc link-token bootstrap', () => {
     expect(sessionStorage.getItem('opensquilla.wsToken')).toBe('new-token')
     expect(sessionStorage.getItem('opensquilla.cachedAuth')).toBeNull()
     expect(window.location.href).toBe('http://localhost:3000/control/')
+  })
+
+  it('delegates an aborted wait even when the reactive store is connected', async () => {
+    const store = useRpcStore()
+    store.init()
+    const controller = new AbortController()
+    controller.abort()
+    const abortError = new Error('aborted')
+    clients[0].waitForConnection.mockRejectedValueOnce(abortError)
+
+    await expect(
+      store.waitForConnection(123, controller.signal, { abortAction: 'reconnect' }),
+    ).rejects.toBe(abortError)
+    expect(clients[0].waitForConnection).toHaveBeenCalledWith(
+      123,
+      controller.signal,
+      { abortAction: 'reconnect' },
+    )
   })
 
   it('reconnects with a URL token when an already-loaded app navigates to a token link', () => {

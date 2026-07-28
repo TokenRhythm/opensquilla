@@ -8,6 +8,7 @@ surface observes and mutates the same state machine.
 from __future__ import annotations
 
 import copy
+import os
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -54,6 +55,227 @@ def _clean(value: object) -> str:
     return str(value or "").strip().lower()
 
 
+def ensemble_selection_configured(config: Any) -> bool:
+    """Whether ``selection_mode`` came from an operator-owned config source."""
+
+    ensemble = getattr(config, "llm_ensemble", None)
+    if ensemble is None:
+        return False
+    force_paths = getattr(config, "force_persist_paths", None)
+    if callable(force_paths) and "llm_ensemble.selection_mode" in force_paths():
+        return True
+    raw = getattr(config, "_persist_raw_base", None)
+    if isinstance(raw, dict):
+        raw_ensemble = raw.get("llm_ensemble")
+        if isinstance(raw_ensemble, dict) and "selection_mode" in raw_ensemble:
+            return True
+        # A loaded/persisted raw snapshot is authoritative: rebuilding a
+        # Pydantic section from a partial mutation must not turn omitted
+        # defaults into operator-authored fields.
+        return bool(
+            os.environ.get("OPENSQUILLA_LLM_ENSEMBLE_SELECTION_MODE", "").strip()
+        )
+    fields_set = getattr(ensemble, "model_fields_set", None)
+    if fields_set is None:
+        # Config-like compatibility objects have no provenance channel; an
+        # existing selection value is therefore the only safe interpretation.
+        return bool(str(getattr(ensemble, "selection_mode", "") or "").strip())
+    return "selection_mode" in set(fields_set)
+
+
+def _custom_candidate(
+    provider: str,
+    model: str,
+    *,
+    role: str = "",
+) -> dict[str, Any]:
+    return {
+        "provider": provider,
+        "model": model,
+        "source": "custom",
+        "enabled": True,
+        "role": role,
+        "thinking_level": "",
+    }
+
+
+def _provider_is_runtime_supported(provider: str) -> bool:
+    """Whether a provider can structurally participate in model execution."""
+
+    from opensquilla.provider.registry import UnknownProviderError, get_provider_spec
+
+    try:
+        return bool(get_provider_spec(provider).runtime_supported)
+    except UnknownProviderError:
+        return False
+
+
+def _provider_ensemble_candidates(config: Any) -> list[dict[str, Any]]:
+    """Build the provider-aware first-activation custom lineup."""
+
+    provider = _clean(getattr(getattr(config, "llm", None), "provider", ""))
+    from opensquilla.provider.ensemble import (
+        CUSTOM_B5_PROPOSER_ROLES,
+        STATIC_B5_PROFILES,
+    )
+
+    static_profile = next(
+        (
+            profile
+            for profile in STATIC_B5_PROFILES.values()
+            if _clean(profile.provider_id) == provider
+        ),
+        None,
+    )
+    if static_profile is not None:
+        static_candidates = [
+            _custom_candidate(
+                static_profile.provider_id,
+                model,
+                role=(
+                    CUSTOM_B5_PROPOSER_ROLES[index]
+                    if index < len(CUSTOM_B5_PROPOSER_ROLES)
+                    else ""
+                ),
+            )
+            for index, model in enumerate(static_profile.proposer_models)
+        ]
+        static_candidates.append(
+            _custom_candidate(
+                static_profile.provider_id,
+                static_profile.aggregator_model,
+                role="aggregator",
+            )
+        )
+        return static_candidates
+
+    router = getattr(config, "squilla_router", None)
+    tiers = getattr(router, "tiers", {}) or {}
+    tier_order = ("c0", "c1", "c2", "c3")
+    role_by_tier = {
+        "c0": "fast_check",
+        "c1": "primary",
+        "c2": "contrast",
+        "c3": "critic",
+    }
+    seen: set[tuple[str, str]] = set()
+    candidates: list[dict[str, Any]] = []
+    if isinstance(tiers, dict):
+        normalized: dict[str, dict[str, Any]] = {}
+        for raw_tier, raw_cfg in tiers.items():
+            tier = _clean(raw_tier)
+            if tier.startswith("t") and tier[1:] in {"0", "1", "2", "3"}:
+                tier = f"c{tier[1:]}"
+            if tier in tier_order and isinstance(raw_cfg, dict):
+                normalized[tier] = raw_cfg
+        for tier in tier_order:
+            tier_cfg = normalized.get(tier)
+            if not tier_cfg:
+                continue
+            member_provider = _clean(tier_cfg.get("provider") or provider)
+            model = str(tier_cfg.get("model") or "").strip()
+            identity = (member_provider, model)
+            if (
+                not member_provider
+                or not model
+                or identity in seen
+                or not _provider_is_runtime_supported(member_provider)
+            ):
+                continue
+            seen.add(identity)
+            candidates.append(
+                _custom_candidate(
+                    member_provider,
+                    model,
+                    role=role_by_tier[tier],
+                )
+            )
+            if len(candidates) >= 6:
+                break
+    if len(candidates) < 2:
+        raise ValueError(
+            "Ensemble needs at least two distinct runtime-supported Router tier candidates; "
+            "configure the lineup before enabling it"
+        )
+    return candidates
+
+
+def ensemble_activation_patches(config: Any) -> dict[str, Any]:
+    """Return first-activation selection/candidate patches, or none."""
+
+    ensemble = getattr(config, "llm_ensemble", None)
+    if ensemble is None or bool(getattr(ensemble, "enabled", False)):
+        return {}
+    if ensemble_selection_configured(config):
+        return {}
+    return {
+        "llm_ensemble.selection_mode": "custom_b5",
+        "llm_ensemble.candidates": _provider_ensemble_candidates(config),
+    }
+
+
+def ensemble_activation_preview(config: Any) -> dict[str, Any]:
+    """Return a non-secret preview of the current or planned Ensemble lineup."""
+
+    ensemble = getattr(config, "llm_ensemble", None)
+    configured = ensemble_selection_configured(config)
+    if ensemble is None:
+        return {
+            "selection_mode": "",
+            "proposer_count": 0,
+            "member_providers": [],
+            "candidates": [],
+            "blocked_reason": "llm_ensemble_missing",
+        }
+    try:
+        patches = ensemble_activation_patches(config)
+    except ValueError as exc:
+        return {
+            "selection_mode": "custom_b5",
+            "proposer_count": 0,
+            "member_providers": [],
+            "candidates": [],
+            "blocked_reason": str(exc),
+        }
+    selection_mode = str(
+        patches.get("llm_ensemble.selection_mode")
+        or getattr(ensemble, "selection_mode", "")
+    )
+    candidates = patches.get("llm_ensemble.candidates")
+    if candidates is None:
+        candidates = [
+            candidate.model_dump(mode="python")
+            if hasattr(candidate, "model_dump")
+            else dict(candidate)
+            for candidate in list(getattr(ensemble, "candidates", []) or [])
+        ]
+    enabled_candidates = [
+        candidate
+        for candidate in candidates
+        if isinstance(candidate, dict) and candidate.get("enabled", True) is not False
+    ]
+    proposers = [
+        candidate
+        for candidate in enabled_candidates
+        if str(candidate.get("role") or "") != "aggregator"
+    ]
+    providers = sorted(
+        {
+            _clean(candidate.get("provider"))
+            for candidate in enabled_candidates
+            if _clean(candidate.get("provider"))
+        }
+    )
+    return {
+        "selection_mode": selection_mode,
+        "selection_configured": configured,
+        "proposer_count": len(proposers),
+        "member_providers": providers,
+        "candidates": enabled_candidates,
+        "blocked_reason": None,
+    }
+
+
 def model_routing_snapshot(config: Any) -> dict[str, Any]:
     """Return the additive public snapshot for the current runtime strategy."""
 
@@ -78,12 +300,19 @@ def model_routing_snapshot(config: Any) -> dict[str, Any]:
         "ensemble_enabled": ensemble_enabled,
         "rollout_phase": rollout_phase,
         "selection_mode": selection_mode,
+        "selection_configured": ensemble_selection_configured(config),
+        "activation_preview": ensemble_activation_preview(config),
         "router_required_by_ensemble": router_required,
         "applies_to": "next_accepted_turn",
     }
 
 
-def model_routing_patches(config: Any, mode: str) -> dict[str, Any]:
+def model_routing_patches(
+    config: Any,
+    mode: str,
+    *,
+    activation_config: Any = None,
+) -> dict[str, Any]:
     """Translate one public mode into the persisted config patch contract."""
 
     normalized = _clean(mode)
@@ -103,10 +332,14 @@ def model_routing_patches(config: Any, mode: str) -> dict[str, Any]:
             "squilla_router.rollout_phase": "full",
         }
 
+    planner_config = activation_config if activation_config is not None else config
+    patches = ensemble_activation_patches(planner_config)
     selection_mode = _clean(
-        getattr(getattr(config, "llm_ensemble", None), "selection_mode", "")
+        patches.get("llm_ensemble.selection_mode")
+        or getattr(getattr(config, "llm_ensemble", None), "selection_mode", "")
     )
     return {
+        **patches,
         "llm_ensemble.enabled": True,
         "squilla_router.enabled": selection_mode not in _INDEPENDENT_ENSEMBLE_MODES,
         "squilla_router.rollout_phase": "full",
@@ -206,7 +439,12 @@ def model_routing_mode_for_write(
     return None
 
 
-def apply_model_routing_mode(config: Any, mode: str) -> dict[str, Any]:
+def apply_model_routing_mode(
+    config: Any,
+    mode: str,
+    *,
+    activation_config: Any = None,
+) -> dict[str, Any]:
     """Apply one canonical mode to a config-like object in place.
 
     The returned mapping contains only fields whose values changed.  All three
@@ -215,11 +453,24 @@ def apply_model_routing_mode(config: Any, mode: str) -> dict[str, Any]:
     """
 
     changed: dict[str, Any] = {}
-    for path, value in model_routing_patches(config, mode).items():
+    for path, value in model_routing_patches(
+        config,
+        mode,
+        activation_config=activation_config,
+    ).items():
         section_name, field_name = path.split(".", 1)
         section = getattr(config, section_name, None)
         if section is None:
             continue
+        if path == "llm_ensemble.candidates":
+            from opensquilla.gateway.config import LlmEnsembleCandidateConfig
+
+            value = [
+                candidate
+                if isinstance(candidate, LlmEnsembleCandidateConfig)
+                else LlmEnsembleCandidateConfig.model_validate(candidate)
+                for candidate in list(value or [])
+            ]
         if getattr(section, field_name, None) != value:
             setattr(section, field_name, value)
             changed[path] = value
@@ -247,7 +498,20 @@ def reconcile_model_routing_write(
 
     mode = model_routing_mode_for_write(config, explicit_paths, previous=previous)
     if mode is not None:
-        return apply_model_routing_mode(config, mode)
+        activation_config = (
+            previous
+            if (
+                mode == "ensemble"
+                and previous is not None
+                and "llm_ensemble.selection_mode" not in explicit_paths
+            )
+            else None
+        )
+        return apply_model_routing_mode(
+            config,
+            mode,
+            activation_config=activation_config,
+        )
 
     if (
         "llm_ensemble.selection_mode" not in explicit_paths

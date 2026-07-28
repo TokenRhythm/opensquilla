@@ -985,8 +985,10 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     assert "frontend_changed == 'true'" in jobs["desktop-recovery-e2e"]["if"]
     assert "platform_sensitive_changed == 'true'" in jobs["desktop-recovery-e2e"]["if"]
     assert "desktop_changed == 'true'" in jobs["desktop-recovery-e2e"]["if"]
+    assert "platform_sensitive_changed == 'true'" in jobs["webui-chat-recovery"]["if"]
     assert "release_changed == 'true'" in jobs["release-packaging"]["if"]
     assert "tui-check" in jobs["ci-result"]["needs"]
+    assert "webui-chat-recovery" in jobs["ci-result"]["needs"]
     assert "desktop-check" in jobs["ci-result"]["needs"]
     assert "ubuntu-full" in jobs["ci-result"]["needs"]
     assert "macos-recovery" in jobs["ci-result"]["needs"]
@@ -1008,6 +1010,7 @@ def test_ci_result_gate_covers_every_conditional_job_and_classifier_flag() -> No
         "workflow-lint",
         "readme-locale-check",
         "frontend-check",
+        "webui-chat-recovery",
         "tui-check",
         "desktop-check",
         "ubuntu-quality",
@@ -1064,6 +1067,12 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
         if step.get("name") == "Verify downloaded frontend artifact on consumer OS"
     )
     build = next(step for step in steps if step.get("name") == "Build Desktop TypeScript")
+    session_recovery = next(
+        step
+        for step in steps
+        if step.get("name")
+        == "Run cross-platform production-dist browser session hang contract"
+    )
     run = next(
         step for step in steps if step.get("name") == "Run compiled Desktop recovery flows"
     )
@@ -1078,6 +1087,11 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
         "src/opensquilla/gateway/static/dist"
     )
     assert build["run"] == "npm run build"
+    assert session_recovery["working-directory"] == "opensquilla-webui"
+    assert session_recovery["env"]["OPENSQUILLA_PLAYWRIGHT_MANAGE_WEBUI"] == "gateway"
+    assert session_recovery["env"]["OPENSQUILLA_WEBUI_BASE_URL"].endswith(":18791")
+    assert "history-hydration.spec.ts" in session_recovery["run"]
+    assert '--grep "terminates stalled"' in session_recovery["run"]
     assert "xvfb-run -a node" in run["run"]
     assert "test-profile-consolidation-flow.mjs" in run["run"]
     assert "test-primary-repair-accessibility.mjs" in run["run"]
@@ -1087,6 +1101,31 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     assert "exit 1" in run["run"]
     assert upload["if"] == "${{ always() }}"
     assert "github.run_attempt" in upload["with"]["name"]
+
+
+def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
+    job = _workflow("ci.yml")["jobs"]["webui-chat-recovery"]
+    steps = job["steps"]
+    download = next(
+        step for step in steps if step.get("name") == "Download verified frontend artifact"
+    )
+    install_gateway = next(
+        step for step in steps if step.get("name") == "Install Gateway dependencies"
+    )
+    run = next(
+        step
+        for step in steps
+        if step.get("name") == "Run production-dist chat recovery browser contract"
+    )
+
+    assert job["needs"] == ["classify-changes", "frontend-check"]
+    assert download["with"]["name"] == "opensquilla-webui-dist"
+    assert download["with"]["path"] == "src/opensquilla/gateway/static/dist/"
+    assert steps.index(download) < steps.index(install_gateway) < steps.index(run)
+    assert install_gateway["run"] == "uv sync --frozen"
+    assert job["env"]["OPENSQUILLA_PLAYWRIGHT_MANAGE_WEBUI"] == "gateway"
+    assert job["env"]["OPENSQUILLA_WEBUI_BASE_URL"].endswith(":18791")
+    assert "history-hydration.spec.ts" in run["run"]
 
 
 def test_windows_smoke_does_not_install_bun_by_default() -> None:

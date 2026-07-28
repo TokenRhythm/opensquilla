@@ -212,7 +212,7 @@ afterEach(() => {
 })
 
 describe('AssistantMessage activity disclosure', () => {
-  it('keeps the canonical answer outside a collapsed recovered-failure activity', async () => {
+  it('keeps the canonical answer outside activity and hides failed tool content', async () => {
     const el = mountMessage(baseMessage())
     await nextTick()
 
@@ -225,19 +225,21 @@ describe('AssistantMessage activity disclosure', () => {
     expect(activity).not.toBeNull()
     expect(summary?.getAttribute('aria-expanded')).toBe('false')
     expect(activity?.dataset.shareExpanded).toBe('false')
-    expect(activity?.querySelectorAll('details')).toHaveLength(0)
+    const reasoningFold = activity?.querySelector<HTMLDetailsElement>('details.thinking-fold')
+    expect(reasoningFold).not.toBeNull()
+    expect(reasoningFold?.open).toBe(false)
     expect(activity?.querySelector('.assistant-activity__chevron')).toBeNull()
     expect(activity?.querySelector('.assistant-activity__summary-arrow')).not.toBeNull()
     expect(activity?.textContent).toContain('Checked the available evidence.')
     expect(activity?.textContent).toContain('Searched the web')
-    expect(activity?.textContent).toContain('1 web action')
-    expect(activity?.textContent).toContain('1 failure recovered')
-    expect(failedRow).not.toBeNull()
-    expect(failedRow?.getAttribute('aria-expanded')).toBe('true')
+    expect(activity?.textContent).not.toContain('1 web action')
+    expect(activity?.textContent).not.toContain('failure recovered')
+    expect(failedRow).toBeNull()
 
     expect(answer?.textContent).toBe('Canonical answer')
     expect(activity?.contains(answer ?? null)).toBe(false)
-    expect(el.querySelectorAll('.msg-ai-text')).toHaveLength(2)
+    expect(el.querySelectorAll('.msg-ai-text')).toHaveLength(1)
+    expect(activity?.querySelector('.activity-narration')?.textContent).toContain('Draft prefix')
     expect(activity?.textContent).toContain('Draft prefix')
     expect(el.textContent).not.toContain('Draft suffix')
   })
@@ -248,7 +250,9 @@ describe('AssistantMessage activity disclosure', () => {
 
     const summary = el.querySelector('.assistant-activity__summary')
     expect(summary?.getAttribute('aria-expanded')).toBe('false')
-    expect(summary?.textContent).toContain('1 web action')
+    expect(summary?.textContent).toContain('Completed · 7s')
+    expect(summary?.textContent).not.toContain('item')
+    expect(el.querySelector('.assistant-activity__detail')?.textContent).toContain('1 web action')
     expect(summary?.textContent).not.toContain('Activity ·')
     expect(el.querySelector('.assistant-activity')?.getAttribute('data-share-expanded')).toBe('false')
     expect(el.querySelector('.tool-row')).not.toBeNull()
@@ -324,7 +328,7 @@ describe('AssistantMessage activity disclosure', () => {
     expect(el.textContent).not.toContain('Inspecting files.Implementation complete.')
   })
 
-  it('keeps a terminal failure open at the failed tool', async () => {
+  it('does not render an activity disclosure containing only a failed tool', async () => {
     const timelineItems = failedTimeline().filter(item => item.type === 'tool-group')
     const el = mountMessage(baseMessage({
       text: '',
@@ -336,16 +340,47 @@ describe('AssistantMessage activity disclosure', () => {
     await nextTick()
 
     const activity = el.querySelector('.assistant-activity')
-    expect(activity?.classList.contains('assistant-activity--failed')).toBe(true)
-    expect(activity?.querySelector('.assistant-activity__summary')?.getAttribute('aria-expanded')).toBe('true')
-    expect(activity?.querySelector('.assistant-activity__summary')?.textContent)
-      .toContain('1 web action')
-    expect(activity?.querySelector('.assistant-activity__summary')?.textContent)
-      .not.toContain('Completed ·')
-    expect(activity?.querySelector('.tool-row--error')).not.toBeNull()
+    expect(activity).toBeNull()
+    expect(el.querySelector('.tool-row--error')).toBeNull()
   })
 
-  it('keeps interrupted activity open while leaving the answer outside', async () => {
+  it('hides restored failures whose error state only survived on the group', async () => {
+    const staleFailure = timelineGroup(successfulCall('stale-failure', 'execute_code'))
+    if (staleFailure.type !== 'tool-group') throw new Error('expected tool group')
+    staleFailure.group.isError = true
+    staleFailure.group.status = 'error'
+    const el = mountMessage(baseMessage({
+      timelineItems: [staleFailure],
+      parts: [],
+      statusHistory: [],
+    }))
+    await nextTick()
+
+    expect(el.querySelector('.assistant-activity')).toBeNull()
+    expect(el.querySelector('.tool-row')).toBeNull()
+    expect(el.textContent).not.toContain('Failed')
+  })
+
+  it('keeps successful calls while removing failed calls from a mixed group', async () => {
+    const success = successfulCall('successful-command', 'execute_code')
+    const mixed = timelineGroup(success)
+    if (mixed.type !== 'tool-group') throw new Error('expected tool group')
+    mixed.group.calls = [success, failedCall()]
+    mixed.group.isError = true
+    mixed.group.status = 'error'
+    const el = mountMessage(baseMessage({
+      timelineItems: [mixed],
+      parts: [],
+      statusHistory: [],
+    }))
+    await nextTick()
+
+    expect(el.querySelectorAll('.tool-row')).toHaveLength(1)
+    expect(el.querySelector('.tool-row--error')).toBeNull()
+    expect(el.textContent).not.toContain('Network unavailable')
+  })
+
+  it('keeps interrupted activity collapsed while leaving the answer outside', async () => {
     const el = mountMessage(baseMessage({
       interrupted: true,
       timelineItems: successfulTimeline(),
@@ -356,7 +391,8 @@ describe('AssistantMessage activity disclosure', () => {
     const answer = [...el.querySelectorAll<HTMLElement>('.msg-ai-text')]
       .find(node => !activity?.contains(node))
     expect(activity?.classList.contains('assistant-activity--interrupted')).toBe(true)
-    expect(activity?.querySelector('.assistant-activity__summary')?.getAttribute('aria-expanded')).toBe('true')
+    expect(activity?.querySelector('.assistant-activity__summary')?.getAttribute('aria-expanded'))
+      .toBe('false')
     expect(activity?.querySelector('.assistant-activity__summary')?.textContent)
       .not.toContain('Completed ·')
     expect(answer?.textContent).toBe('Canonical answer')
@@ -418,7 +454,7 @@ describe('AssistantMessage activity disclosure', () => {
     await nextTick()
 
     expect(el.querySelector('.assistant-activity__summary')?.textContent)
-      .toContain('Completed ·')
+      .toBe('Completed')
   })
 
   it('uses an exact local duration when the live status snapshot provides one', async () => {
@@ -432,7 +468,9 @@ describe('AssistantMessage activity disclosure', () => {
     }))
     await nextTick()
 
-    expect(el.querySelector('.assistant-activity__summary')?.textContent).toContain('Worked for 21s')
+    expect(el.querySelector('.assistant-activity__summary')?.textContent)
+      .toContain('Completed · 21s')
+    expect(el.querySelector('.assistant-activity__detail')?.textContent).toContain('Worked for 21s')
   })
 
   it('keeps the exact duration when same-session history replaces the local row', async () => {
@@ -446,7 +484,7 @@ describe('AssistantMessage activity disclosure', () => {
       timelineItems: successfulTimeline(),
     }))
     await nextTick()
-    expect(local.querySelector('.assistant-activity__summary')?.textContent).toContain('Worked for 21s')
+    expect(local.querySelector('.assistant-activity__detail')?.textContent).toContain('Worked for 21s')
 
     const restored = mountMessage(baseMessage({
       id: 'server-assistant',
@@ -455,10 +493,10 @@ describe('AssistantMessage activity disclosure', () => {
       timelineItems: successfulTimeline(),
     }))
     await nextTick()
-    expect(restored.querySelector('.assistant-activity__summary')?.textContent).toContain('Worked for 21s')
+    expect(restored.querySelector('.assistant-activity__detail')?.textContent).toContain('Worked for 21s')
   })
 
-  it('summarizes the collapsed row as footprint parts, overflow, then elapsed time last', async () => {
+  it('keeps the collapsed row compact and moves footprint and elapsed time into details', async () => {
     const el = mountMessage(baseMessage({
       ts: 1_725_000_022,
       statusHistory: [
@@ -473,9 +511,12 @@ describe('AssistantMessage activity disclosure', () => {
     }))
     await nextTick()
 
-    // Footprint first, the projection's own "{count} more" for the overflow,
-    // and the elapsed time strictly last — time must not lead the row.
     expect(el.querySelector('.assistant-activity__label')?.textContent)
+      .toBe('Completed · 21s')
+    // The expanded detail preserves the exact footprint and elapsed metadata.
+    expect(el.querySelector('.assistant-activity__label')?.textContent)
+      .not.toContain('item')
+    expect(el.querySelector('.assistant-activity__detail')?.textContent)
       .toBe('1 web action · 1 command · 2 more · Worked for 21s')
   })
 
@@ -502,8 +543,23 @@ describe('AssistantMessage activity disclosure', () => {
     }))
     await nextTick()
 
-    expect(restored.querySelector('.assistant-activity__label')?.textContent)
+    expect(restored.querySelector('.assistant-activity__detail')?.textContent)
       .toContain('Worked for 21s')
+  })
+
+  it('keeps streaming work collapsed until the user expands it', async () => {
+    const el = mountMessage(baseMessage({
+      isStreaming: true,
+      timelineItems: successfulTimeline(),
+    }))
+    await nextTick()
+
+    const summary = el.querySelector<HTMLButtonElement>('.assistant-activity__live-head')
+    const body = el.querySelector<HTMLElement>('.assistant-activity__body')
+    expect(summary?.getAttribute('aria-expanded')).toBe('false')
+    expect(summary?.textContent).toContain('Working')
+    expect(body?.getAttribute('aria-hidden')).toBe('true')
+    expect(body?.classList.contains('is-open')).toBe(false)
   })
 
   it('does not let the tool-detail preference force the outer activity open', async () => {
@@ -523,7 +579,7 @@ describe('AssistantMessage activity disclosure', () => {
     await nextTick()
 
     expect(el.querySelector('.assistant-activity__summary')?.getAttribute('aria-expanded')).toBe('false')
-    expect(el.querySelector('.thinking-block')).not.toBeNull()
+    expect(el.querySelector<HTMLDetailsElement>('.thinking-fold')?.open).toBe(false)
   })
 
   it('expands the settled activity from the whole summary row with a hover affordance', async () => {
@@ -539,7 +595,10 @@ describe('AssistantMessage activity disclosure', () => {
 
     expect(summary?.getAttribute('aria-expanded')).toBe('true')
     expect(activity?.dataset.shareExpanded).toBe('true')
-    expect(activity?.querySelector<HTMLElement>('.assistant-activity__body')?.style.display).not.toBe('none')
+    expect(activity?.querySelector('.assistant-activity__body')?.getAttribute('aria-hidden'))
+      .toBe('false')
+    expect(activity?.querySelector('.assistant-activity__body')?.classList.contains('is-open'))
+      .toBe(true)
   })
 
   it('keeps user expansion through a same-session history replacement', async () => {
@@ -589,7 +648,7 @@ describe('AssistantMessage activity disclosure', () => {
     expect(summary?.textContent).not.toContain('Worked for 21s')
   })
 
-  it('keeps partial output activity open when the turn ends with a terminal failure', async () => {
+  it('keeps partial output activity collapsed when the turn ends with a terminal failure', async () => {
     const el = mountMessage(baseMessage({
       text: 'Partial answer before failure.',
       terminalFailure: true,
@@ -600,11 +659,11 @@ describe('AssistantMessage activity disclosure', () => {
     const activity = el.querySelector('.assistant-activity')
     expect(activity?.classList.contains('assistant-activity--failed')).toBe(true)
     expect(activity?.querySelector('.assistant-activity__summary')?.getAttribute('aria-expanded'))
-      .toBe('true')
+      .toBe('false')
     expect(el.textContent).toContain('Partial answer before failure.')
   })
 
-  it('preserves legacy timeline order when no canonical answer exists', async () => {
+  it('preserves legacy narration but removes failed tool rows when no canonical answer exists', async () => {
     const el = mountMessage(baseMessage({
       text: '   ',
       parts: [],
@@ -616,8 +675,9 @@ describe('AssistantMessage activity disclosure', () => {
     expect(el.querySelector('.assistant-activity')).toBeNull()
     expect(text).toContain('Draft prefix')
     expect(text).toContain('Draft suffix')
-    expect(text.indexOf('Draft prefix')).toBeLessThan(text.indexOf('Search'))
-    expect(text.indexOf('Search')).toBeLessThan(text.indexOf('Draft suffix'))
+    expect(text).not.toContain('Search')
+    expect(text).not.toContain('Network unavailable')
+    expect(text.indexOf('Draft prefix')).toBeLessThan(text.indexOf('Draft suffix'))
   })
 
   it('keeps artifacts outside the activity disclosure and actionable', async () => {

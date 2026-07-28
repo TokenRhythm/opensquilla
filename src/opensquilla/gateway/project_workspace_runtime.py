@@ -134,6 +134,51 @@ async def project_workspace_snapshot(
     }
 
 
+async def persisted_project_workspace_snapshot(
+    storage: SessionStorage,
+    session: SessionNode,
+) -> dict[str, Any] | None:
+    """Project a legacy-compatible snapshot without touching the filesystem.
+
+    This is suitable for latency-sensitive metadata RPCs only. A persisted,
+    trusted, non-removed binding is reported as available so older clients can
+    restore their composer state, but turn ingress must still resolve and
+    validate the directory before any tool execution.
+    """
+
+    workspace_id = getattr(session, "workspace_id", None)
+    if not workspace_id:
+        return None
+    workspace = await storage.get_project_workspace(workspace_id)
+    if workspace is None:
+        return {
+            "id": workspace_id,
+            "name": None,
+            "path": None,
+            "available": False,
+            "removed": False,
+            "availabilityReason": "not_found",
+        }
+    if workspace.removed_at is not None:
+        return {
+            "id": workspace.workspace_id,
+            "name": workspace.display_name,
+            "path": workspace.path,
+            "available": False,
+            "removed": True,
+            "availabilityReason": "removed",
+        }
+    trusted = workspace.trusted_at is not None
+    return {
+        "id": workspace.workspace_id,
+        "name": workspace.display_name,
+        "path": workspace.path,
+        "available": trusted,
+        "removed": False,
+        "availabilityReason": None if trusted else "untrusted",
+    }
+
+
 def map_project_workspace_error(
     error: ProjectWorkspaceStateError,
     *,
@@ -158,6 +203,7 @@ __all__ = [
     "apply_accepted_run_mode_override",
     "authoritative_project_run_context",
     "map_project_workspace_error",
+    "persisted_project_workspace_snapshot",
     "project_workspace_snapshot",
     "resolve_session_project_workspace",
 ]

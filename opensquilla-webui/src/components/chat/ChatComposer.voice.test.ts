@@ -67,11 +67,29 @@ describe('ChatComposer voice-input gate', () => {
     const stop = el.querySelector<HTMLButtonElement>(
       `button[aria-label="${i18n.global.t('chat.stopResponse')}"]`,
     )
+    const send = el.querySelector<HTMLButtonElement>(
+      `button[aria-label="${i18n.global.t('chat.send')}"]`,
+    )
 
     expect(stop).toBeTruthy()
+    expect(send).toBeNull()
     stop?.click()
     await nextTick()
     expect(onStop).toHaveBeenCalledOnce()
+    app.unmount()
+  })
+
+  it('shows Send instead of Stop when no response can be stopped', async () => {
+    const { app, el } = await mount({ canStop: false })
+    const send = el.querySelector<HTMLButtonElement>(
+      `button[aria-label="${i18n.global.t('chat.send')}"]`,
+    )
+    const stop = el.querySelector<HTMLButtonElement>(
+      `button[aria-label="${i18n.global.t('chat.stopResponse')}"]`,
+    )
+
+    expect(send).toBeTruthy()
+    expect(stop).toBeNull()
     app.unmount()
   })
 

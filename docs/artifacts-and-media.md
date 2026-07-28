@@ -77,6 +77,11 @@ Configure image generation:
 opensquilla configure image-generation
 ```
 
+Supported built-in image providers include OpenAI Images, OpenRouter Images,
+and Qwen Token Plan (`wan2.7-image` / `wan2.7-image-pro`). Token Plan uses
+`QWEN_TOKEN_PLAN_API_KEY`; its image-generation provider is distinct from the
+Qwen model used to analyze image inputs.
+
 Then ask for images in chat:
 
 ```text

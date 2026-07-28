@@ -17,6 +17,7 @@ from opensquilla.provider.selector import ProviderBuildError, ProviderConfig, _b
         ("dashscope", "dashscope"),
         ("bailian_coding", "bailian_coding"),
         ("bailian_coding_cn", "bailian_coding"),
+        ("qwen_token_plan", "qwen_token_plan"),
         ("moonshot", "moonshot"),
         ("kimi_coding_openai", "moonshot"),
         ("minimax_coding_openai", "minimax"),
@@ -63,6 +64,11 @@ def test_new_openai_compatible_profiles_have_vendor_provider_kind(
             "bailian_coding_cn",
             "BAILIAN_API_KEY",
             "https://coding.dashscope.aliyuncs.com/v1",
+        ),
+        (
+            "qwen_token_plan",
+            "QWEN_TOKEN_PLAN_API_KEY",
+            "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
         ),
         ("moonshot", "MOONSHOT_API_KEY", "https://api.moonshot.ai/v1"),
         (
@@ -178,6 +184,61 @@ def test_model_selector_builds_tencent_token_plan_providers() -> None:
         ProviderConfig(provider="tencent_token_plan_anthropic", model="hy3", api_key="test-key")
     )
     assert isinstance(messages, AnthropicProvider)
+
+
+def test_qwen_token_plan_profiles_pin_documented_endpoints() -> None:
+    plan = get_provider_spec("qwen_token_plan")
+    assert plan.backend == "openai_compat"
+    assert plan.provider_kind == "qwen_token_plan"
+    assert plan.env_key == "QWEN_TOKEN_PLAN_API_KEY"
+    assert (
+        plan.default_base_url
+        == "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+    )
+    assert plan.capabilities == frozenset({"chat", "coding_plan"})
+
+    plan_anthropic = get_provider_spec("qwen_token_plan_anthropic")
+    assert plan_anthropic.backend == "anthropic"
+    assert plan_anthropic.provider_kind == "qwen_token_plan"
+    assert plan_anthropic.env_key == "QWEN_TOKEN_PLAN_API_KEY"
+    assert (
+        plan_anthropic.default_base_url
+        == "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic"
+    )
+    assert plan_anthropic.failure_family == "anthropic"
+    assert plan_anthropic.auth_header_style == "bearer"
+    assert plan_anthropic.capabilities == frozenset({"chat", "coding_plan"})
+    assert len(plan_anthropic.static_model_ids) == 15
+
+
+def test_model_selector_builds_qwen_token_plan_and_custom_anthropic() -> None:
+    chat = _build_provider(
+        ProviderConfig(
+            provider="qwen_token_plan",
+            model="qwen3.8-max-preview",
+            api_key="test-key",
+        )
+    )
+    assert isinstance(chat, OpenAIProvider)
+
+    messages = _build_provider(
+        ProviderConfig(
+            provider="qwen_token_plan_anthropic",
+            model="qwen3.8-max-preview",
+            api_key="test-key",
+        )
+    )
+    assert isinstance(messages, AnthropicProvider)
+
+    custom_messages = _build_provider(
+        ProviderConfig(
+            provider="custom_anthropic",
+            model="vendor-model",
+            api_key="optional",
+            base_url="https://llm.example.test/anthropic",
+        )
+    )
+    assert isinstance(custom_messages, AnthropicProvider)
 
 
 def test_model_selector_builds_tencent_tokenhub_anthropic_provider() -> None:

@@ -21,10 +21,28 @@ import {
 } from '@/utils/chat/scrollAnchor'
 import type { InitialHistoryLoadStatus } from '@/utils/chat/sessionLoadState'
 import { planRevisionsFromToolSegments } from '@/utils/chat/plans'
+import {
+  SESSION_PHASE_ATTEMPT_BUDGET_MS,
+  isRpcAbort,
+  phaseCallOptions,
+  phaseConnectionWaitOptions,
+  phaseTimeoutMs,
+  type SessionBootstrapPhaseContext,
+  type SessionPhaseResult,
+} from '@/composables/chat/sessionBootstrapContract'
+import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
 
 type RpcClient = {
-  waitForConnection: () => Promise<void>
-  call: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
+  waitForConnection: (
+    timeoutMs?: number,
+    signal?: AbortSignal,
+    actions?: RpcConnectionWaitOptions,
+  ) => Promise<void>
+  call: <T = unknown>(
+    method: string,
+    params?: Record<string, unknown>,
+    options?: RpcCallOptions,
+  ) => Promise<T>
 }
 
 function recordArray<T extends Record<string, unknown>>(value: unknown): T[] {
@@ -69,6 +87,7 @@ export interface ChatHistoryState {
   retrying: boolean
   initialLoadStatus: InitialHistoryLoadStatus
   loadEarlierError: boolean
+  recoveryError: boolean
 }
 
 interface HistoryLoadParams {
@@ -96,11 +115,16 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   let historySyncTimer: ReturnType<typeof setTimeout> | null = null
   let historyRequestSeq = 0
   let historySyncPending = false
-  let loadingHistoryKey = ''
   let historySessionKey = ''
   let hasLoadedEarlier = false
   let loadEarlierPending = false
   let failedHistoryRequest: FailedHistoryRequest | null = null
+  let activeHistory: {
+    key: string
+    bootstrapGeneration: number
+    controller: AbortController
+    promise: Promise<SessionPhaseResult | void>
+  } | null = null
   let stopAnchorStabilization: () => void = () => {}
   const loadedEarlierCursors = new Set<string>()
   const historyState = ref<ChatHistoryState>({
@@ -115,6 +139,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     retrying: false,
     initialLoadStatus: 'pending',
     loadEarlierError: false,
+    recoveryError: false,
   })
 
   function cancelAnchorStabilization() {
@@ -221,6 +246,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         ? historyState.value.initialLoadStatus
         : initialLoadError ? 'error' : 'ready',
       loadEarlierError: false,
+      recoveryError: prepend ? historyState.value.recoveryError : initialLoadError,
     }
   }
 
@@ -245,22 +271,29 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       retrying: false,
       initialLoadStatus: 'pending',
       loadEarlierError: false,
+      recoveryError: false,
     }
     return crossedSession
   }
 
-  async function loadHistory(params: HistoryLoadParams = {}) {
+  function callHistory<T>(
+    request: Record<string, unknown>,
+    bootstrap: SessionBootstrapPhaseContext,
+  ): Promise<T> {
+    return options.rpc.call<T>(
+      'chat.history',
+      request,
+      phaseCallOptions(bootstrap, 'chat.history'),
+    )
+  }
+
+  async function runHistoryLoad(
+    params: HistoryLoadParams = {},
+    bootstrap: SessionBootstrapPhaseContext,
+  ): Promise<SessionPhaseResult | void> {
     if (!options.sessionKey.value) return
     const key = options.sessionKey.value
     const crossedSession = resetForSession(key)
-    if (historyState.value.loading && loadingHistoryKey === key) {
-      if (params.prepend) {
-        if (!historyState.value.loadingEarlier) loadEarlierPending = true
-      } else {
-        historySyncPending = true
-      }
-      return
-    }
     cancelAnchorStabilization()
     const requestSeq = ++historyRequestSeq
     let bridgeAttempted = Boolean(params.bridgeRetry)
@@ -269,21 +302,27 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         historyState.value.initialLoadStatus === 'pending'
         || historyState.value.initialLoadStatus === 'error'
       )
-    loadingHistoryKey = key
     historyState.value = {
       ...historyState.value,
       loading: true,
-      loadingEarlier: Boolean(params.prepend || params.bridgeRetry),
-      retrying: Boolean(params.retry),
+      // Only explicit backward pagination owns the sentinel. Forward
+      // catch-up/bridge recovery is a session-recovery concern and must not
+      // impersonate "load earlier" progress or failure.
+      loadingEarlier: Boolean(params.prepend),
+      retrying: Boolean(params.retry && !params.prepend),
       initialLoadStatus: isInitialLoad ? 'loading' : historyState.value.initialLoadStatus,
       loadEarlierError: false,
+      recoveryError: params.prepend ? historyState.value.recoveryError : false,
     }
     const isCurrentRequest = () => key === options.sessionKey.value && requestSeq === historyRequestSeq
     try {
-      await options.rpc.waitForConnection()
+      await options.rpc.waitForConnection(
+        phaseTimeoutMs(bootstrap, 'chat.history'),
+        bootstrap.signal,
+        phaseConnectionWaitOptions(),
+      )
       if (!isCurrentRequest()) {
         if (requestSeq === historyRequestSeq) {
-          loadingHistoryKey = ''
           historyState.value = {
             ...historyState.value,
             loading: false,
@@ -292,7 +331,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           }
           flushPendingHistorySync()
         }
-        return
+        return { ok: false, cancelled: true }
       }
       const request: Record<string, unknown> = {
         sessionKey: key,
@@ -303,8 +342,8 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         includeSummaries: false,
       }
       if (params.before != null) request.before = params.before
-      const data = await options.rpc.call<ChatHistoryResponse>('chat.history', request)
-      if (!isCurrentRequest()) return
+      const data = await callHistory<ChatHistoryResponse>(request, bootstrap)
+      if (!isCurrentRequest()) return { ok: false, cancelled: true }
       const msgs = data.messages || []
       const canonicalAvailable = data.canonical_available ?? data.canonicalAvailable
       if (canonicalAvailable === false) {
@@ -317,7 +356,6 @@ export function useChatHistory(options: UseChatHistoryOptions) {
               prepend: Boolean(params.prepend),
             }
         if (params.prepend || hasLoadedEarlier) {
-          loadingHistoryKey = ''
           historyState.value = {
             ...historyState.value,
             canonicalAvailable: false,
@@ -326,9 +364,10 @@ export function useChatHistory(options: UseChatHistoryOptions) {
             loadingEarlier: false,
             retrying: false,
             loadEarlierError: false,
+            recoveryError: !params.prepend,
           }
           flushPendingHistorySync()
-          return
+          return { ok: !historyState.value.recoveryError }
         }
       }
 
@@ -346,7 +385,6 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         failedHistoryRequest = { kind: 'bridge', key }
         historyState.value = {
           ...historyState.value,
-          loadingEarlier: true,
           loadEarlierError: false,
         }
 
@@ -374,17 +412,19 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           }
           visitedCursors.add(afterKey)
 
-          const bridgeData = await options.rpc.call<ChatHistoryResponse>('chat.history', {
-            sessionKey: key,
-            limit: 200,
-            after,
-            includeCanonical: true,
-            includeSummaries: false,
-          })
-          if (!isCurrentRequest()) return
+          const bridgeData = await callHistory<ChatHistoryResponse>(
+            {
+              sessionKey: key,
+              limit: 200,
+              after,
+              includeCanonical: true,
+              includeSummaries: false,
+            },
+            bootstrap,
+          )
+          if (!isCurrentRequest()) return { ok: false, cancelled: true }
           const bridgeAvailable = bridgeData.canonical_available ?? bridgeData.canonicalAvailable
           if (bridgeAvailable === false) {
-            loadingHistoryKey = ''
             historyState.value = {
               ...historyState.value,
               canonicalAvailable: false,
@@ -393,9 +433,10 @@ export function useChatHistory(options: UseChatHistoryOptions) {
               loadingEarlier: false,
               retrying: false,
               loadEarlierError: false,
+              recoveryError: true,
             }
             flushPendingHistorySync()
-            return
+            return { ok: false }
           }
 
           const page = (bridgeData.messages || []).map(mapHistoryMessage)
@@ -463,7 +504,6 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         Boolean(params.prepend),
         initialCanonicalLoadFailed,
       )
-      loadingHistoryKey = ''
       if (params.prepend && params.before != null) {
         hasLoadedEarlier = true
         loadedEarlierCursors.add(String(params.before))
@@ -481,7 +521,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           options.lastHeaderDay.value = ''
         }
         flushPendingHistorySync()
-        return
+        return { ok: true }
       }
 
       const prependContainer = params.prepend ? options.threadRef?.value ?? null : null
@@ -535,14 +575,11 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       // and cancellable rather than one unbounded request or DOM update.
       if (bridgeContinuationNeeded) historySyncPending = true
       flushPendingHistorySync()
-    } catch {
+      return { ok: true }
+    } catch (error: unknown) {
       // History endpoint may not exist yet.
       if (isCurrentRequest()) {
         const initialLoadFailed = isInitialLoad && !bridgeAttempted
-        const emptyRefreshFailed = !isInitialLoad
-          && !params.prepend
-          && !bridgeAttempted
-          && options.messages.value.length === 0
         failedHistoryRequest = bridgeAttempted
           ? { kind: 'bridge', key }
           : {
@@ -551,7 +588,6 @@ export function useChatHistory(options: UseChatHistoryOptions) {
               before: params.before ?? null,
               prepend: Boolean(params.prepend),
             }
-        loadingHistoryKey = ''
         historyState.value = {
           ...historyState.value,
           loading: false,
@@ -560,14 +596,81 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           initialLoadStatus: initialLoadFailed
             ? 'error'
             : historyState.value.initialLoadStatus,
-          loadEarlierError: Boolean(params.prepend || bridgeAttempted || emptyRefreshFailed),
+          loadEarlierError: Boolean(params.prepend),
+          recoveryError: !params.prepend,
         }
         flushPendingHistorySync()
+      }
+      return {
+        ok: false,
+        error,
+        cancelled: !isCurrentRequest() || bootstrap.signal.aborted || isRpcAbort(error),
       }
     }
   }
 
-  function loadEarlierHistory() {
+  function loadHistory(
+    params: HistoryLoadParams = {},
+    bootstrap?: SessionBootstrapPhaseContext,
+  ): Promise<SessionPhaseResult | void> | undefined {
+    const key = options.sessionKey.value
+    if (!key) return
+    if (activeHistory) {
+      if (
+        activeHistory.key === key
+        && (
+          !bootstrap
+          || activeHistory.bootstrapGeneration === bootstrap.generation
+        )
+      ) {
+        if (params.prepend) {
+          if (!historyState.value.loadingEarlier) loadEarlierPending = true
+        } else {
+          historySyncPending = true
+        }
+        // Never report a deduplicated request as a successful bootstrap.
+        // The caller observes the real terminal result of the in-flight read.
+        return activeHistory.promise
+      }
+      cancelActiveHistory()
+    }
+
+    const controller = new AbortController()
+    const parentSignal = bootstrap?.signal
+    const relayAbort = () => controller.abort()
+    if (parentSignal?.aborted) controller.abort()
+    else parentSignal?.addEventListener('abort', relayAbort, { once: true })
+    const now = Date.now()
+    const boundedContext: SessionBootstrapPhaseContext = bootstrap
+      ? { ...bootstrap, signal: controller.signal }
+      : {
+          generation: -1,
+          key,
+          attempt: 0,
+          deadlineAt: now + SESSION_PHASE_ATTEMPT_BUDGET_MS,
+          attemptDeadlineAt: now + SESSION_PHASE_ATTEMPT_BUDGET_MS,
+          signal: controller.signal,
+          skipSnapshot: false,
+        }
+
+    const request = runHistoryLoad(params, boundedContext)
+    const tracked = request.finally(() => {
+      parentSignal?.removeEventListener('abort', relayAbort)
+      if (activeHistory?.promise === tracked) {
+        activeHistory = null
+        flushPendingHistorySync()
+      }
+    })
+    activeHistory = {
+      key,
+      bootstrapGeneration: bootstrap?.generation ?? -1,
+      controller,
+      promise: tracked,
+    }
+    return tracked
+  }
+
+  function loadEarlierHistory(bootstrap?: SessionBootstrapPhaseContext) {
     if (!historyState.value.hasMore) return
     if (historyState.value.loading) {
       if (!historyState.value.loadingEarlier) loadEarlierPending = true
@@ -575,28 +678,51 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     }
     const cursor = historyState.value.oldestCursor
     if (cursor == null || loadedEarlierCursors.has(String(cursor))) return
-    return loadHistory({ before: cursor, prepend: true })
+    return loadHistory({ before: cursor, prepend: true }, bootstrap)
   }
 
-  function retryHistory() {
+  function retryHistory(bootstrap?: SessionBootstrapPhaseContext) {
     const failed = failedHistoryRequest
     if (failed?.key === options.sessionKey.value) {
-      if (failed.kind === 'bridge') return loadHistory({ bridgeRetry: true, retry: true })
+      if (failed.kind === 'bridge') {
+        return loadHistory({ bridgeRetry: true, retry: true }, bootstrap)
+      }
       return loadHistory({
         before: failed.before,
         prepend: failed.prepend,
         retry: true,
-      })
+      }, bootstrap)
     }
-    if (historyState.value.canonicalAvailable === false) return loadHistory({ retry: true })
-    return loadEarlierHistory()
+    if (historyState.value.canonicalAvailable === false) {
+      return loadHistory({ retry: true }, bootstrap)
+    }
+    if (historyState.value.recoveryError || historyState.value.initialLoadStatus === 'error') {
+      return loadHistory({ retry: true }, bootstrap)
+    }
+    return loadEarlierHistory(bootstrap)
   }
 
-  function cleanup() {
+  function cancelActiveHistory() {
+    activeHistory?.controller.abort()
+    activeHistory = null
+    ++historyRequestSeq
     if (historySyncTimer) {
       clearTimeout(historySyncTimer)
       historySyncTimer = null
     }
+    historySyncPending = false
+    loadEarlierPending = false
+    cancelAnchorStabilization()
+    historyState.value = {
+      ...historyState.value,
+      loading: false,
+      loadingEarlier: false,
+      retrying: false,
+    }
+  }
+
+  function cleanup() {
+    cancelActiveHistory()
     historySyncPending = false
     loadEarlierPending = false
     cancelAnchorStabilization()
@@ -609,6 +735,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     retryHistory,
     scheduleHistorySync,
     cancelAnchorStabilization,
+    cancelActiveHistory,
     cleanup,
   }
 }
