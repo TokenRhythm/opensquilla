@@ -410,6 +410,8 @@ are released under OpenSquilla's repository license (Apache-2.0; see `LICENSE`):
 - `voice-clone-lab`
 - `voice-conversion-studio`
 - `voiceover-studio`
+- `say-and-dispatch`
+- `dispatch-worker`
 
 ## tokenjuice adapted reduction rules
 
