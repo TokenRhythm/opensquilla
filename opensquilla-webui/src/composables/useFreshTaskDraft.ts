@@ -7,6 +7,7 @@ export interface FreshTaskDraftRequest {
 }
 
 const request = shallowRef<FreshTaskDraftRequest | null>(null)
+const materializedWorkspaceBySession = shallowRef<Record<string, string>>({})
 let nextRequestId = 0
 
 /**
@@ -25,8 +26,34 @@ export function useFreshTaskDraft() {
     }
   }
 
+  function bindMaterializedProjectTask(sessionKey: string, workspaceId: string) {
+    if (!sessionKey || !workspaceId) return
+    if (materializedWorkspaceBySession.value[sessionKey] === workspaceId) return
+    materializedWorkspaceBySession.value = {
+      ...materializedWorkspaceBySession.value,
+      [sessionKey]: workspaceId,
+    }
+  }
+
+  function confirmMaterializedProjectTask(sessionKey: string, workspaceId?: string | null) {
+    const optimisticWorkspaceId = materializedWorkspaceBySession.value[sessionKey]
+    if (!optimisticWorkspaceId || !workspaceId) return
+    const { [sessionKey]: _confirmed, ...remaining } = materializedWorkspaceBySession.value
+    materializedWorkspaceBySession.value = remaining
+  }
+
+  function forgetMaterializedProjectTask(sessionKey: string) {
+    if (!materializedWorkspaceBySession.value[sessionKey]) return
+    const { [sessionKey]: _forgotten, ...remaining } = materializedWorkspaceBySession.value
+    materializedWorkspaceBySession.value = remaining
+  }
+
   return {
     request: readonly(request),
+    materializedWorkspaceBySession: readonly(materializedWorkspaceBySession),
     requestFreshTask,
+    bindMaterializedProjectTask,
+    confirmMaterializedProjectTask,
+    forgetMaterializedProjectTask,
   }
 }

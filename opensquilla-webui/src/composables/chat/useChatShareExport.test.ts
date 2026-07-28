@@ -296,7 +296,7 @@ describe('ActivityDisclosure share hook contract', () => {
     expect(stage.textContent).not.toContain('step output')
   })
 
-  it('exports live activity as expanded static content', () => {
+  it('drops live activity from the share image while it is collapsed', () => {
     const host = mountDisclosure({
       lifecycle: 'working',
       stepCount: 3,
@@ -305,15 +305,13 @@ describe('ActivityDisclosure share hook contract', () => {
     })
     const activity = host.querySelector<HTMLElement>('[data-share-activity]')
 
-    expect(activity?.dataset.shareExpanded).toBe('true')
+    expect(activity?.dataset.shareExpanded).toBe('false')
     expect(activity?.querySelector('[data-share-activity-label]')).not.toBeNull()
     expect(activity?.querySelector('[data-share-activity-body]')).not.toBeNull()
 
     const stage = buildShareDom([host])
 
-    expect(stage.querySelector('.chat-share-export-activity__label')?.textContent)
-      .toContain('Running commands')
-    expect(stage.querySelector('.chat-share-export-activity__body')?.textContent)
-      .toContain('step output')
+    expect(stage.querySelector('.chat-share-export-activity')).toBeNull()
+    expect(stage.textContent).not.toContain('step output')
   })
 })

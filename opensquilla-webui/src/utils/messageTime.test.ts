@@ -49,7 +49,9 @@ describe('relativeTime', () => {
     expect(relativeTime(now - 5_000, now)).toBe('just now')
     expect(relativeTime(now - 5 * 60_000, now)).toBe('5m ago')
     expect(relativeTime(now - 2 * 3_600_000, now)).toBe('2h ago')
-    expect(relativeTime(now - 3 * 86_400_000, now)).toBe('3d ago')
+    expect(relativeTime(now - 23 * 3_600_000, now)).toBe('23h ago')
+    expect(relativeTime(now - 86_400_000, now)).toBe('')
+    expect(relativeTime(now - 3 * 86_400_000, now)).toBe('')
   })
 
   it('clamps a future timestamp (clock skew) to "just now"', () => {
@@ -100,6 +102,10 @@ describe('absoluteTime', () => {
 
   it('produces a non-empty, digit-bearing local label', () => {
     expect(absoluteTime(Date.now())).toMatch(/\d/)
+  })
+
+  it('always includes the full local calendar year', () => {
+    expect(absoluteTime(MS_2026)).toContain(String(new Date(MS_2026).getFullYear()))
   })
 })
 

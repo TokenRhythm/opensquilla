@@ -6,7 +6,7 @@ async function openControl(page: Page) {
   await page.goto(CONTROL_URL)
   await page.waitForSelector('.conn-pill', { timeout: 10000 })
   await page.waitForSelector('.conn-pill.connected', { timeout: 10000 }).catch(() => {})
-  await expect(page.getByRole('navigation', { name: 'Primary' })).toBeVisible()
+  await expect(page.locator('#sidebar-nav')).toBeVisible()
 }
 
 type RpcParams = Record<string, unknown>
@@ -284,10 +284,7 @@ test.describe('Project workspaces', () => {
     await installProjectLifecycleRpc(page)
     await openControl(page)
 
-    await page
-      .getByRole('navigation', { name: 'Control navigation' })
-      .getByRole('button', { name: 'Choose project' })
-      .click()
+    await page.getByRole('button', { name: 'Choose project', exact: true }).click()
 
     const picker = page.getByRole('dialog', { name: 'Choose project' })
     const list = picker.locator('.project-picker__entries')
@@ -305,7 +302,7 @@ test.describe('Project workspaces', () => {
     await expect.poll(() => list.evaluate(element => element.scrollTop)).toBeGreaterThan(0)
   })
 
-  test('offers project selection from both the sidebar and an ordinary draft', async ({ page }) => {
+  test('offers project selection in an ordinary draft but not the sidebar navigation', async ({ page }) => {
     await installProjectLifecycleRpc(page)
     await openControl(page)
 
@@ -313,13 +310,13 @@ test.describe('Project workspaces', () => {
       page
         .getByRole('navigation', { name: 'Control navigation' })
         .getByRole('button', { name: 'Choose project' }),
-    ).toBeVisible()
+    ).toHaveCount(0)
     await page.locator('.sidebar-new-session').click()
     await expect(page).toHaveURL(/\/chat\/new\?agent=main$/)
-    await expect(page.getByRole('button', { name: 'Choose project' }).last()).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Choose project', exact: true })).toBeVisible()
   })
 
-  test('project names only disclose tasks while the pencil opens a project draft', async ({ page }) => {
+  test('project names only disclose tasks while the plus opens a project draft', async ({ page }) => {
     const state = await installProjectLifecycleRpc(page)
     state.projectPresent = true
     state.sent = true
@@ -328,7 +325,7 @@ test.describe('Project workspaces', () => {
 
     const disclosure = project.getByTestId('project-workspace-disclosure')
     const info = project.getByTestId('project-workspace-info')
-    const pencil = project.getByTestId('project-workspace-new-task')
+    const plus = project.getByTestId('project-workspace-new-task')
 
     await expect(info).toBeVisible()
     await expect(disclosure).toHaveAttribute('aria-expanded', /true|false/)
@@ -337,19 +334,21 @@ test.describe('Project workspaces', () => {
     await expect(disclosure).toHaveAttribute('aria-expanded', String(!startedExpanded))
     await expect(page).not.toHaveURL(/\/chat\?session=/)
 
-    await pencil.click()
+    await plus.click()
     await expect(page).toHaveURL(/\/chat\/new\?agent=main&project=[^&]+$/)
     await expect(page.locator('.chat-project-chip')).toBeVisible()
+    await expect(disclosure).toHaveAttribute('aria-expanded', 'true')
+    const draftRow = page.locator('[data-session-key^="draft:project:"]')
+    await expect(draftRow).toHaveCount(1)
+    await expect(draftRow.locator('.sidebar-history-item')).toHaveClass(/is-current/)
+    await expect(draftRow.locator('.sidebar-history-title')).not.toBeEmpty()
   })
 
   test('project picker, trust, first send, reload, remove, reopen, and history delete', async ({ page }) => {
     const state = await installProjectLifecycleRpc(page)
     await openControl(page)
 
-    await page
-      .getByRole('navigation', { name: 'Control navigation' })
-      .getByRole('button', { name: 'Choose project' })
-      .click()
+    await page.getByRole('button', { name: 'Choose project', exact: true }).click()
     await expect.poll(() => state.pathListRequests.length).toBe(1)
     expect(state.pathListRequests[0]).not.toHaveProperty('path')
     expect(state.pathListRequests[0]).toMatchObject({
@@ -387,7 +386,7 @@ test.describe('Project workspaces', () => {
     await expect(page.locator('.chat-project-chip')).toContainText('/repos/demo')
     const projectRow = page.locator('.sidebar-history-row--workspace').first()
     await projectRow.getByTestId('project-workspace-more').click()
-    await page.getByRole('menuitem', { name: 'Remove project' }).click()
+    await page.getByRole('menuitem', { name: 'Remove' }).click()
     await page.getByRole('button', { name: 'Remove project' }).click()
     await expect.poll(() => state.removed).toBe(true)
     await expect(page.locator('.chat-project-chip')).toContainText('/repos/demo')
@@ -396,10 +395,9 @@ test.describe('Project workspaces', () => {
     await expect(blockedSend).toBeDisabled()
     expect(state.sends).toHaveLength(1)
 
-    await page
-      .getByRole('navigation', { name: 'Control navigation' })
-      .getByRole('button', { name: 'Choose project' })
-      .click()
+    await page.locator('.sidebar-new-session').click()
+    await expect(page).toHaveURL(/\/chat\/new\?agent=main$/)
+    await page.getByRole('button', { name: 'Choose project', exact: true }).click()
     const reopenedPicker = page.getByRole('dialog', { name: 'Choose project' })
     await reopenedPicker.getByRole('option', { name: 'demo' }).click()
     await reopenedPicker
@@ -411,7 +409,7 @@ test.describe('Project workspaces', () => {
     const reopenedRow = page.locator('.sidebar-history-row--workspace').first()
     await reopenedRow.getByTestId('project-workspace-more').click()
     await page
-      .getByRole('menuitem', { name: 'Delete project task history' })
+      .getByRole('menuitem', { name: 'Delete history' })
       .click()
     await page.getByRole('button', { name: 'Delete history' }).click()
     await expect.poll(() => state.historyDeleted).toBe(true)
@@ -419,6 +417,7 @@ test.describe('Project workspaces', () => {
     await expect.poll(() => state.postDeleteSessionLists).toBeGreaterThan(0)
     expect(state.historyDeleteRequests).toEqual([{ workspaceId: 'project-demo' }])
     await expect(page.locator(`[data-session-key="${state.sessionKey}"]`)).toHaveCount(0)
-    await expect(page.locator('.sidebar-workspace-empty')).toHaveText('No tasks')
+    await expect(page.locator('.sidebar-workspace-empty')).toHaveCount(0)
+    await expect(page.locator('.sidebar-zone-empty__body')).toHaveText('No tasks yet.')
   })
 })

@@ -1,34 +1,21 @@
 <template>
   <div class="empty-state">
     <p class="empty-state__greeting">{{ greeting }}</p>
-    <div v-if="!suppressed" class="empty-state__chips" role="group" :aria-label="t('chat.suggestedTasks')">
-      <button
-        v-for="chip in chips"
-        :key="chip"
-        type="button"
-        class="empty-state__chip"
-        @click="emit('pick', chip)"
-      >{{ chip }}</button>
-    </div>
     <div
-      v-if="!suppressed && metaSkills.length"
-      class="empty-state__meta"
+      v-if="!suppressed"
+      class="empty-state__chips"
       role="group"
-      :aria-label="t('cronSkills.skillsView.metaSkillsTitle')"
+      :aria-label="t('chat.suggestedTasks')"
+      :aria-disabled="disabled || undefined"
     >
       <button
-        v-for="skill in metaSkills"
-        :key="skill.value"
+        v-for="chip in chips"
+        :key="chip.label"
         type="button"
-        class="empty-state__meta-chip"
-        :title="skill.description"
-        @click="emit('pick', `/meta ${skill.value}`)"
-      >
-        <span class="empty-state__meta-icon" aria-hidden="true">
-          <Icon :name="metaSkillIcon(skill.value)" :size="16" />
-        </span>
-        <span class="empty-state__meta-label">{{ metaSkillLabel(skill.value) }}</span>
-      </button>
+        class="empty-state__chip"
+        :disabled="disabled"
+        @click="emit('pick', chip.prompt)"
+      >{{ chip.label }}</button>
     </div>
   </div>
 </template>
@@ -36,9 +23,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
-import Icon from '@/components/Icon.vue'
 import { useRpcCall } from '@/composables/useRpc'
-import type { IconName } from '@/utils/icons'
 
 const { t } = useI18n()
 
@@ -51,23 +36,37 @@ interface CapabilityStatus {
 
 withDefaults(defineProps<{
   agentId: string
-  metaSkills?: Array<{ value: string; description: string }>
   suppressed?: boolean
+  disabled?: boolean
 }>(), {
-  metaSkills: () => [],
   suppressed: false,
+  disabled: false,
 })
 
 const emit = defineEmits<{
   pick: [text: string]
 }>()
 
+interface SuggestionChip {
+  label: string
+  prompt: string
+}
+
+function ordinaryChip(label: string): SuggestionChip {
+  return { label, prompt: label }
+}
+
+const buildGameChip = computed<SuggestionChip>(() => ({
+  label: t('chat.chips.buildGame'),
+  prompt: t('chat.chips.buildGamePrompt'),
+}))
+
 // Rendered immediately so a late capability lookup swaps labels in place
 // instead of shifting the landing layout, and kept whenever the lookup fails.
 const FALLBACK_CHIPS = computed(() => [
-  t('chat.chips.whatCanYouDo'),
-  t('chat.chips.summarizeWebpage'),
-  t('chat.chips.planWeek'),
+  buildGameChip.value,
+  ordinaryChip(t('chat.chips.summarizeWebpage')),
+  ordinaryChip(t('chat.chips.planWeek')),
 ])
 
 const capabilityStatus = useRpcCall<CapabilityStatus>('onboarding.status')
@@ -82,30 +81,18 @@ const greeting = computed(() => {
 const chips = computed(() => {
   const status = capabilityStatus.data.value
   if (!status) return FALLBACK_CHIPS.value
-  const derived: string[] = []
-  if (status.searchConfigured) derived.push(t('chat.chips.searchAiNews'))
+  const derived: SuggestionChip[] = []
+  if (status.searchConfigured) derived.push(ordinaryChip(t('chat.chips.searchAiNews')))
   if (status.imageGenerationConfigured && status.imageGenerationEnabled !== false) {
-    derived.push(t('chat.chips.generateImage'))
+    derived.push(ordinaryChip(t('chat.chips.generateImage')))
   }
-  derived.push(t('chat.chips.summarizeWebpage'), t('chat.chips.whatCanYouDo'))
-  if (derived.length < 3) derived.push(t('chat.chips.planWeek'))
+  derived.push(
+    ordinaryChip(t('chat.chips.summarizeWebpage')),
+    buildGameChip.value,
+  )
+  if (derived.length < 3) derived.push(ordinaryChip(t('chat.chips.planWeek')))
   return derived.slice(0, 4)
 })
-
-function metaSkillLabel(name: string): string {
-  const labels: Record<string, string> = {
-    AwesomeWebpageMetaSkill: t('chat.metaQuick.webpage'),
-    'meta-short-drama': t('chat.metaQuick.shortDrama'),
-    'meta-paper-write': t('chat.metaQuick.paperWriting'),
-  }
-  return labels[name] || name
-}
-
-function metaSkillIcon(name: string): IconName {
-  if (name === 'AwesomeWebpageMetaSkill') return 'fileCode'
-  if (name === 'meta-short-drama') return 'play'
-  return 'fileText'
-}
 </script>
 
 <style scoped>
@@ -188,60 +175,20 @@ function metaSkillIcon(name: string): IconName {
   color: var(--text);
 }
 
+.empty-state__chip:disabled {
+  cursor: default;
+  opacity: 0.72;
+}
+
+.empty-state__chip:disabled:hover {
+  background: var(--bg-elevated);
+  border-color: var(--border);
+  color: var(--text-muted);
+}
+
 .empty-state__chip:focus-visible {
   outline: none;
   box-shadow: var(--focus-ring);
-}
-
-.empty-state__meta {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-  justify-content: center;
-  margin-top: var(--sp-1);
-  max-width: 100%;
-}
-
-.empty-state__meta-chip {
-  align-items: center;
-  background: transparent;
-  border: 0;
-  border-radius: var(--radius-sm);
-  color: var(--text-muted);
-  cursor: pointer;
-  display: inline-flex;
-  font: inherit;
-  font-size: 13px;
-  font-weight: 600;
-  gap: 6px;
-  min-height: 32px;
-  padding: 5px 9px;
-  white-space: nowrap;
-  transition: background var(--transition), border-color var(--transition), color var(--transition);
-}
-
-.empty-state__meta-chip:hover {
-  background: color-mix(in srgb, var(--text) 5%, transparent);
-  color: var(--text);
-}
-
-.empty-state__meta-chip:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-ring);
-}
-
-.empty-state__meta-icon {
-  align-items: center;
-  color: var(--text-muted);
-  display: inline-flex;
-  flex: 0 0 16px;
-  height: 16px;
-  justify-content: center;
-  width: 16px;
-}
-
-.empty-state__meta-label {
-  line-height: 20px;
 }
 
 @media (max-width: 768px) {
@@ -253,13 +200,6 @@ function metaSkillIcon(name: string): IconName {
     min-height: 2.75rem;
   }
 
-  .empty-state__meta-chip {
-    min-height: 40px;
-  }
-
-  .empty-state__meta {
-    max-width: calc(100vw - 32px);
-  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -271,8 +211,5 @@ function metaSkillIcon(name: string): IconName {
     transition: none;
   }
 
-  .empty-state__meta-chip {
-    transition: none;
-  }
 }
 </style>

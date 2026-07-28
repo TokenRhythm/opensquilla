@@ -4,9 +4,17 @@
     class="assistant-activity assistant-activity--live"
     data-testid="assistant-activity"
     data-share-activity="true"
-    data-share-expanded="true"
+    :data-share-expanded="open ? 'true' : 'false'"
   >
-    <header class="assistant-activity__live-head" data-share-activity-label>
+    <button
+      type="button"
+      class="assistant-activity__live-head"
+      data-share-activity-label
+      data-share-control
+      :aria-expanded="open"
+      :aria-controls="bodyId"
+      @click.stop="open = !open"
+    >
       <span
         class="assistant-activity__live-dot"
         :class="{ 'is-active': !stale, 'is-stale': stale }"
@@ -31,22 +39,27 @@
       <span v-if="stepCount > 0" class="assistant-activity__live-step">
         {{ t('chat.activity.liveStep', { n: stepCount }) }}
       </span>
-      <span v-if="failureCount > 0" class="assistant-activity__sep" aria-hidden="true">·</span>
-      <!-- Always-mounted polite region so failures announce exactly when the
-           count changes, instead of riding along with phase-label updates. -->
-      <span
-        class="assistant-activity__live-failure"
-        role="status"
-        aria-live="polite"
-        aria-atomic="true"
-      >
-        <template v-if="failureCount > 0">
-          {{ t('chat.activityFailures', { count: failureCount }) }}
-        </template>
-      </span>
-    </header>
-    <div class="assistant-activity__body" data-share-activity-body>
-      <slot />
+      <Icon
+        class="assistant-activity__summary-arrow"
+        name="chevronRight"
+        :size="13"
+        aria-hidden="true"
+      />
+    </button>
+    <div
+      :id="bodyId"
+      class="assistant-activity__body"
+      :class="{ 'is-open': open }"
+      :aria-hidden="!open"
+      :inert="open ? undefined : true"
+      data-share-activity-body
+    >
+      <div class="assistant-activity__body-inner">
+        <div v-if="detailLabel" class="assistant-activity__detail">
+          {{ detailLabel }}
+        </div>
+        <slot />
+      </div>
     </div>
   </section>
 
@@ -71,12 +84,6 @@
       @click.stop="open = !open"
     >
       <span class="assistant-activity__label">{{ resolvedSummaryLabel }}</span>
-      <!-- Real DOM separator: the button's textContent doubles as the share
-           label and the accessible name, and ::before content reaches neither. -->
-      <span v-if="failureCount" class="assistant-activity__sep">{{ ' · ' }}</span>
-      <span v-if="failureCount" class="assistant-activity__failure">
-        {{ resolvedFailureLabel }}
-      </span>
       <Icon
         class="assistant-activity__summary-arrow"
         name="chevronRight"
@@ -84,8 +91,20 @@
         aria-hidden="true"
       />
     </button>
-    <div :id="bodyId" v-show="open" class="assistant-activity__body" data-share-activity-body>
-      <slot />
+    <div
+      :id="bodyId"
+      class="assistant-activity__body"
+      :class="{ 'is-open': open }"
+      :aria-hidden="!open"
+      :inert="open ? undefined : true"
+      data-share-activity-body
+    >
+      <div class="assistant-activity__body-inner">
+        <div v-if="detailLabel" class="assistant-activity__detail">
+          {{ detailLabel }}
+        </div>
+        <slot />
+      </div>
     </div>
   </section>
 </template>
@@ -106,6 +125,7 @@ const props = withDefaults(defineProps<{
   durationSeconds?: number
   completionConfirmed?: boolean
   summaryLabel?: string
+  detailLabel?: string
   phaseLabel?: string
   elapsedLabel?: string
   stale?: boolean
@@ -117,6 +137,7 @@ const props = withDefaults(defineProps<{
   durationSeconds: 0,
   completionConfirmed: false,
   summaryLabel: '',
+  detailLabel: '',
   phaseLabel: '',
   elapsedLabel: '',
   stale: false,
@@ -127,10 +148,7 @@ const props = withDefaults(defineProps<{
 
 const { t } = useI18n()
 const bodyId = `assistant-activity-body-${useId()}`
-const initialOpen = () =>
-  props.defaultOpen
-  || props.lifecycle === 'failed'
-  || props.lifecycle === 'interrupted'
+const initialOpen = () => props.defaultOpen
 const open = ref(readAssistantActivityExpansion(
   props.stateKey,
   initialOpen(),
@@ -146,16 +164,9 @@ watch(() => [props.stateKey, props.continuityKey] as const, ([key, continuityKey
 })
 
 watch(
-  () => [props.lifecycle, props.defaultOpen] as const,
-  ([lifecycle, defaultOpen], [previousLifecycle, previousDefaultOpen]) => {
-    const becameTerminal = (
-      lifecycle === 'failed'
-      || lifecycle === 'interrupted'
-    ) && (
-      previousLifecycle !== 'failed'
-      && previousLifecycle !== 'interrupted'
-    )
-    if (becameTerminal || (defaultOpen && !previousDefaultOpen)) {
+  () => props.defaultOpen,
+  (defaultOpen, previousDefaultOpen) => {
+    if (defaultOpen && !previousDefaultOpen) {
       open.value = true
     }
   },
@@ -184,15 +195,6 @@ const resolvedSummaryLabel = computed(() => {
     { count: Math.max(1, props.stepCount) },
   )
 })
-
-const resolvedFailureLabel = computed(() =>
-  t(
-    props.lifecycle === 'settled' && props.completionConfirmed
-      ? 'chat.activityFailuresRecovered'
-      : 'chat.activityFailures',
-    { count: props.failureCount },
-  ),
-)
 </script>
 
 <style scoped>
@@ -211,12 +213,29 @@ const resolvedFailureLabel = computed(() =>
 .assistant-activity__live-head {
   display: flex;
   align-items: center;
+  width: fit-content;
+  max-width: 100%;
   min-width: 0;
   min-height: 1.75rem;
   gap: 0.5rem;
+  padding: 0.1875rem 0.25rem;
+  border: 0;
+  background: transparent;
   color: color-mix(in srgb, var(--text) 90%, transparent);
+  cursor: pointer;
+  font: inherit;
   font-size: 0.875rem;
   line-height: 1.5;
+  text-align: left;
+}
+
+.assistant-activity__live-head:hover {
+  color: var(--text);
+}
+
+.assistant-activity__live-head:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
 }
 
 .assistant-activity__live-dot {
@@ -260,23 +279,10 @@ const resolvedFailureLabel = computed(() =>
   font-variant-numeric: tabular-nums;
 }
 
-.assistant-activity__live-failure {
-  flex: 0 0 auto;
-  color: var(--warn);
-  font-size: 0.75rem;
-  white-space: nowrap;
-}
-
 .assistant-activity__live-step::before {
   content: "·";
   margin-right: 0.375rem;
   color: var(--text-dim);
-}
-
-.assistant-activity__sep {
-  flex: 0 0 auto;
-  color: var(--text-dim);
-  font-size: 0.75rem;
 }
 
 .assistant-activity__summary {
@@ -315,21 +321,6 @@ const resolvedFailureLabel = computed(() =>
   overflow-wrap: anywhere;
 }
 
-.assistant-activity__failure {
-  flex: 0 0 auto;
-  color: var(--text-muted);
-  white-space: nowrap;
-}
-
-.assistant-activity--failed .assistant-activity__failure {
-  color: var(--danger);
-}
-
-.assistant-activity--failed :deep(.tool-timeline--activity .tool-row--error .tool-row__status),
-.assistant-activity--failed :deep(.tool-timeline--activity .tool-row__activity-icon--error) {
-  color: var(--danger);
-}
-
 .assistant-activity__summary-arrow {
   flex: 0 0 auto;
   color: currentColor;
@@ -341,31 +332,92 @@ const resolvedFailureLabel = computed(() =>
 }
 
 .assistant-activity__summary:hover .assistant-activity__summary-arrow,
-.assistant-activity__summary:focus-visible .assistant-activity__summary-arrow {
+.assistant-activity__summary:focus-visible .assistant-activity__summary-arrow,
+.assistant-activity__live-head:hover .assistant-activity__summary-arrow,
+.assistant-activity__live-head:focus-visible .assistant-activity__summary-arrow {
   opacity: 0.8;
   transform: translateX(0);
 }
 
-.assistant-activity__summary[aria-expanded="true"] .assistant-activity__summary-arrow {
+.assistant-activity__summary[aria-expanded="true"] .assistant-activity__summary-arrow,
+.assistant-activity__live-head[aria-expanded="true"] .assistant-activity__summary-arrow {
   opacity: 0.55;
   transform: rotate(90deg);
 }
 
 .assistant-activity__summary[aria-expanded="true"]:hover .assistant-activity__summary-arrow,
-.assistant-activity__summary[aria-expanded="true"]:focus-visible .assistant-activity__summary-arrow {
+.assistant-activity__summary[aria-expanded="true"]:focus-visible .assistant-activity__summary-arrow,
+.assistant-activity__live-head[aria-expanded="true"]:hover .assistant-activity__summary-arrow,
+.assistant-activity__live-head[aria-expanded="true"]:focus-visible .assistant-activity__summary-arrow {
   opacity: 0.8;
   transform: rotate(90deg);
 }
 
 .assistant-activity__body {
   display: grid;
+  grid-template-rows: 0fr;
   min-width: 0;
+  opacity: 0;
+  pointer-events: none;
+  visibility: hidden;
+  transform: translateY(-0.25rem);
+  transition:
+    grid-template-rows var(--dur-base) var(--ease-standard),
+    opacity var(--dur-fast) var(--ease-standard),
+    transform var(--dur-base) var(--ease-standard);
+}
+
+.assistant-activity__body.is-open {
+  grid-template-rows: 1fr;
+  opacity: 1;
+  pointer-events: auto;
+  visibility: visible;
+  transform: translateY(0);
+}
+
+.assistant-activity__body-inner {
+  display: grid;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
   gap: 0.25rem;
   margin: 0.125rem 0 0.25rem;
   padding: 0 0 0 0.75rem;
   border: 0;
   border-left: 1px solid var(--border);
   background: transparent;
+}
+
+.assistant-activity__detail {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  line-height: 1.5;
+}
+
+.assistant-activity__body.is-open .assistant-activity__detail,
+.assistant-activity__body.is-open :deep(.thinking-block),
+.assistant-activity__body.is-open :deep(.assistant-activity-status__row),
+.assistant-activity__body.is-open :deep(.tool-row) {
+  animation: assistant-activity-item-enter var(--dur-base) var(--ease-standard) backwards;
+}
+
+.assistant-activity__body.is-open :deep(.thinking-block) {
+  animation-delay: 35ms;
+}
+
+.assistant-activity__body.is-open :deep(.assistant-activity-status__row:nth-child(1)),
+.assistant-activity__body.is-open :deep(.tool-row:nth-child(1)) {
+  animation-delay: 60ms;
+}
+
+.assistant-activity__body.is-open :deep(.assistant-activity-status__row:nth-child(2)),
+.assistant-activity__body.is-open :deep(.tool-row:nth-child(2)) {
+  animation-delay: 90ms;
+}
+
+.assistant-activity__body.is-open :deep(.assistant-activity-status__row:nth-child(n + 3)),
+.assistant-activity__body.is-open :deep(.tool-row:nth-child(n + 3)) {
+  animation-delay: 120ms;
 }
 
 .assistant-activity--settled[data-share-expanded="true"]::after {
@@ -379,6 +431,13 @@ const resolvedFailureLabel = computed(() =>
   0%,
   100% { opacity: 0.45; }
   50% { opacity: 1; }
+}
+
+@keyframes assistant-activity-item-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-0.1875rem);
+  }
 }
 
 @media (max-width: 480px) {
@@ -399,11 +458,19 @@ const resolvedFailureLabel = computed(() =>
 
 @media (prefers-reduced-motion: reduce) {
   .assistant-activity__summary,
-  .assistant-activity__summary-arrow {
+  .assistant-activity__summary-arrow,
+  .assistant-activity__body {
     transition: none;
   }
 
   .assistant-activity__live-dot.is-active {
+    animation: none;
+  }
+
+  .assistant-activity__body.is-open .assistant-activity__detail,
+  .assistant-activity__body.is-open :deep(.thinking-block),
+  .assistant-activity__body.is-open :deep(.assistant-activity-status__row),
+  .assistant-activity__body.is-open :deep(.tool-row) {
     animation: none;
   }
 }

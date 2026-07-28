@@ -23,6 +23,8 @@ describe('ChatComposer project draft', () => {
       sendButtonTitle: 'Send',
       runMode: 'trusted',
       allowedRunModes: ['standard', 'trusted', 'full'],
+      runModeLocked: false,
+      runModeLockMessage: '',
       modelRoutingMode: 'off',
       modelRoutingSettingsBusy: false,
       routerVisualEffectsEnabled: true,
@@ -78,7 +80,7 @@ describe('ChatComposer project draft', () => {
     app.unmount()
   })
 
-  it('shows both the project name and path and lets a blank draft close it', async () => {
+  it('shows a new project draft in the bottom toolbar and lets it close', async () => {
     const closeProject = vi.fn()
     const host = document.createElement('div')
     document.body.appendChild(host)
@@ -91,15 +93,17 @@ describe('ChatComposer project draft', () => {
     await nextTick()
 
     expect(host.querySelector('.chat-project-chip__name')?.textContent).toBe('Project A')
-    expect(host.querySelector('.chat-project-chip__path')?.textContent).toBe('D:\\repos\\project-a')
-    expect(host.querySelector('.chat-project-chip')?.closest('.chat-input-panel')).toBeTruthy()
+    expect(host.querySelector('.chat-project-chip__path')).toBeNull()
+    expect(host.querySelector('.chat-project-chip')?.getAttribute('title')).toBe('D:\\repos\\project-a')
+    expect(host.querySelector('.chat-project-chip')?.closest('.chat-input-footer')).toBeTruthy()
+    expect(host.querySelector('.chat-project-chip')?.parentElement?.classList.contains('chat-input-actions--left')).toBe(true)
     host.querySelector<HTMLButtonElement>('.chat-project-chip button')?.click()
     expect(closeProject).toHaveBeenCalledOnce()
 
     app.unmount()
   })
 
-  it('keeps a durable project chip visible without a close control', async () => {
+  it('hides redundant project context inside a durable project task', async () => {
     const host = document.createElement('div')
     document.body.appendChild(host)
     const app = createApp(ChatComposer, composerProps({
@@ -110,8 +114,7 @@ describe('ChatComposer project draft', () => {
     app.mount(host)
     await nextTick()
 
-    expect(host.querySelector('.chat-project-chip__name')?.textContent).toBe('Project A')
-    expect(host.querySelector('.chat-project-chip button')).toBeNull()
+    expect(host.querySelector('.chat-project-chip')).toBeNull()
 
     app.unmount()
   })
@@ -120,6 +123,8 @@ describe('ChatComposer project draft', () => {
     const host = document.createElement('div')
     document.body.appendChild(host)
     const app = createApp(ChatComposer, composerProps({
+      isNewLanding: false,
+      canCloseProject: false,
       modelValue: 'hello',
       hasSendContent: true,
       projectWorkspaceStatus: 'unavailable',

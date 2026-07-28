@@ -23,4 +23,18 @@ describe('useFreshTaskDraft', () => {
 
     expect(drafts.request.value?.workspaceId).toBeNull()
   })
+
+  it('keeps a materialized project task bound until canonical metadata confirms it', () => {
+    const drafts = useFreshTaskDraft()
+    const sessionKey = 'agent:main:webchat:project-transition'
+
+    drafts.bindMaterializedProjectTask(sessionKey, 'project-a')
+    expect(drafts.materializedWorkspaceBySession.value[sessionKey]).toBe('project-a')
+
+    drafts.confirmMaterializedProjectTask(sessionKey, null)
+    expect(drafts.materializedWorkspaceBySession.value[sessionKey]).toBe('project-a')
+
+    drafts.confirmMaterializedProjectTask(sessionKey, 'project-a')
+    expect(drafts.materializedWorkspaceBySession.value[sessionKey]).toBeUndefined()
+  })
 })

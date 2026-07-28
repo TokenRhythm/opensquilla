@@ -85,8 +85,8 @@
             <EmptyStateChips
               :key="landingAgentId"
               :agent-id="landingAgentId"
-              :meta-skills="metaSkillChoices"
-              :suppressed="landingSuggestionsSuppressed"
+              :suppressed="landingSuggestionsHidden"
+              :disabled="landingSuggestionsDisabled"
               @pick="applyLandingSuggestion"
             />
           </div>
@@ -745,7 +745,7 @@ import {
 } from '@/utils/chat/attachments'
 import { isShareableChatMessage } from '@/utils/chat/messageIdentity'
 import { agentIdFromSessionKey } from '@/utils/chat/sessionKeys'
-import { shouldSuppressLandingSuggestions } from '@/utils/chat/landingSuggestions'
+import { shouldDisableLandingSuggestions } from '@/utils/chat/landingSuggestions'
 import { clearAssistantActivityExpansionState } from '@/utils/chat/activityDisclosureState'
 import {
   resolveChatSessionLoadState,
@@ -1536,7 +1536,6 @@ const chatSlashCommands = useChatSlashCommands({
 const {
   slashOpen,
   slashIdx,
-  metaSkillChoices,
   filteredSlashCmds,
   loadSlashCommands,
   handleSlashInput,
@@ -1591,6 +1590,10 @@ const chatSend = useChatSend({
   pendingForkBeforeMessageId,
   materializeDraftSession: key => {
     if (!isDraftRoute()) return
+    const workspaceId = pendingWorkspaceId.value
+    if (workspaceId) {
+      freshTaskDraft.bindMaterializedProjectTask(key, workspaceId)
+    }
     persistSession(key, { source: 'chatView.draftAccepted' })
   },
   aborted,
@@ -1600,7 +1603,16 @@ const chatSend = useChatSend({
   stream: chatStream,
   canStop: () => canStop.value,
   normalizeElevatedMode,
-  adoptResponseSession,
+  adoptResponseSession: async (key, ownerRequestId) => {
+    const sourceKey = sessionKey.value
+    const workspaceId = freshTaskDraft.materializedWorkspaceBySession.value[sourceKey]
+      || boundWorkspaceId.value
+    if (workspaceId && key !== sourceKey) {
+      freshTaskDraft.bindMaterializedProjectTask(key, workspaceId)
+      freshTaskDraft.forgetMaterializedProjectTask(sourceKey)
+    }
+    return adoptResponseSession(key, ownerRequestId)
+  },
   scheduleHistorySync,
   schedulePendingDrainAfterTerminal,
   flushDeferredPendingDrain,
@@ -2162,7 +2174,8 @@ const currentPlanInHistory = computed(() => {
   )
 })
 
-const landingSuggestionsSuppressed = computed(() => shouldSuppressLandingSuggestions({
+const landingSuggestionsHidden = computed(() => landingPrefilled.value)
+const landingSuggestionsDisabled = computed(() => shouldDisableLandingSuggestions({
   landingPrefilled: landingPrefilled.value,
   composerText: inputText.value,
   attachmentCount: pendingAttachments.value.length,
@@ -2306,7 +2319,7 @@ async function setComposerModelRoutingMode(mode: ModelRoutingMode) {
 // composer-backed send path as every other message so routing, attachments,
 // optimistic state, and recovery behavior stay identical.
 function applyLandingSuggestion(text: string) {
-  if (landingSuggestionsSuppressed.value) return
+  if (landingSuggestionsDisabled.value) return
   sendComposerText(text)
 }
 

@@ -1,5 +1,6 @@
 {
   "workspaces": {
+    "projects": "项目",
     "noTasks": "无任务",
     "chooseProject": "选择项目",
     "webPickerScope": "这里显示的是网关主机上的目录。",
@@ -30,6 +31,8 @@
     "unpin": "取消置顶",
     "deleteHistory": "删除项目任务历史",
     "removeProject": "移除项目",
+    "menuDeleteHistory": "删除历史",
+    "menuRemove": "移除",
     "deleteHistoryTitle": "删除项目任务历史？",
     "deleteHistoryBody": "将永久删除 {name} 中的 {count} 个任务，但不会删除项目目录中的文件。",
     "deleteHistoryConfirm": "删除历史",
@@ -2902,6 +2905,7 @@
     "thinkingForSeconds": "思考中 · {seconds} 秒",
     "thoughtForSeconds": "思考了 {seconds} 秒",
     "thoughtForMinutes": "思考了 {minutes} 分 {seconds} 秒",
+    "activityTechnicalDetails": "技术细节",
     "toolResult": "工具结果",
     "subagentPrefix": "子智能体：",
     "subagentCompletion": "子智能体完成",
@@ -2973,6 +2977,8 @@
     "activityWorking": "正在工作",
     "workedForSeconds": "工作了 {seconds} 秒",
     "workedForMinutes": "工作了 {minutes} 分 {seconds} 秒",
+    "activityDurationSeconds": "{seconds} 秒",
+    "activityDurationMinutes": "{minutes} 分 {seconds} 秒",
     "activity": {
       "lifecycle": {
         "working": "正在工作",
@@ -3242,6 +3248,8 @@
     },
     "chips": {
       "whatCanYouDo": "你能做什么？",
+      "buildGame": "帮我做个游戏",
+      "buildGamePrompt": "构建一个可玩的浏览器端体素竞速游戏原型，包含响应式操控、加速/刹车、可读赛道、碰撞检测、检查点、圈速计时和重启流程。用代码生成体素风格的赛车和场景，不使用付费素材。运行游戏、测试控制、修复阻塞性问题后交付。我希望风景更好,开放世界。且地图在有opensquilla和 tokenrhythm这两个标识 是赞助商彩蛋",
       "summarizeWebpage": "帮我总结一个网页",
       "planWeek": "为我这一周拟定计划",
       "searchAiNews": "搜索今天的 AI 新闻",
@@ -3313,6 +3321,7 @@
     },
     "msgMeta": {
       "ensembleModels": "聚合 · {count} 个模型",
+      "model": "模型",
       "tokens": "令牌",
       "cache": "缓存",
       "think": "思考",

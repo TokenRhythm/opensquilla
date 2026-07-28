@@ -59,16 +59,6 @@
              disabled (Settings → Keyboard), so it never advertises a dead key. -->
         <kbd v-if="newChatHint" class="sidebar-kbd" aria-hidden="true">{{ newChatHint }}</kbd>
       </button>
-      <button
-        v-if="rpcStore.canChooseProject"
-        type="button"
-        class="sidebar-fn-item"
-        :title="t('workspaces.chooseProject')"
-        @click="openProjectPicker"
-      >
-        <Icon name="sessions" :size="16" />
-        <span class="sidebar-fn-label">{{ t('workspaces.chooseProject') }}</span>
-      </button>
       <!-- Overview / Skills & Channels / Cron, single-sourced from route
            metadata so the rail, mobile drawer, and palette never drift. -->
       <router-link
@@ -92,7 +82,7 @@
       :sections="sidebarSections"
       :error="sessionListError"
       :loading="isLoading"
-      :current-key="currentSessionKey"
+      :current-key="sidebarCurrentKey"
       :contract-debug-enabled="contractDebugEnabled"
       :search-hint="commandPaletteHint"
       :can-manage-projects="rpcStore.canManageProjectWorkspaces"
@@ -616,6 +606,19 @@ const currentSessionKey = computed(() => {
 
 // Chat layout applies to both the session view and the draft route.
 const isChatRoute = computed(() => $route.path === '/chat' || $route.path === '/chat/new')
+const activeProjectDraftId = computed(() =>
+  $route.path === '/chat/new' ? String($route.query.project || '') : '',
+)
+const activeProjectDraftKey = computed(() => {
+  const workspaceId = activeProjectDraftId.value
+  if (!workspaceId) return ''
+  const request = freshTaskDraft.request.value
+  const requestId = request?.workspaceId === workspaceId ? request.id : 0
+  return `draft:project:${workspaceId}:${requestId}`
+})
+const sidebarCurrentKey = computed(() =>
+  currentSessionKey.value || activeProjectDraftKey.value,
+)
 
 watch(
   [
@@ -696,12 +699,22 @@ function syntheticChatSession(
   effectiveAgentId: string,
   title: string,
   updatedAt: number,
+  project?: {
+    id: string
+    name: string
+    path: string
+    provisional?: boolean
+  },
 ): SessionItem {
   return {
     key,
     title,
     subtitle: '',
     groupLabel: normalizeAgentId(effectiveAgentId),
+    workspace: project?.path,
+    workspaceId: project?.id,
+    workspaceLabel: project?.name,
+    workspaceDisplayPath: project?.path,
     effectiveAgentId,
     sessionKind: 'chat',
     surface: 'webchat',
@@ -715,9 +728,28 @@ function syntheticChatSession(
     messageCount: null,
     updatedAt,
     interactive: true,
+    provisional: project?.provisional,
     forkedFromParent: false,
     contractGaps: [],
     raw: { key },
+  }
+}
+
+function optimisticProjectForSession(key: string) {
+  const workspaceId = freshTaskDraft.materializedWorkspaceBySession.value[key]
+  return workspaceId ? projectWorkspaces.byId.value.get(workspaceId) || null : null
+}
+
+function withOptimisticProjectBinding(item: SessionItem): SessionItem {
+  if (item.workspaceId) return item
+  const project = optimisticProjectForSession(item.key)
+  if (!project) return item
+  return {
+    ...item,
+    workspace: project.path,
+    workspaceId: project.id,
+    workspaceLabel: project.name,
+    workspaceDisplayPath: project.path,
   }
 }
 
@@ -730,19 +762,60 @@ const sidebarSessionItems = computed((): SessionItem[] => {
   for (const item of allSessions.value) {
     if (!item.key || item.key === 'unknown') continue
     seen.add(item.key)
-    items.push(item)
+    items.push(withOptimisticProjectBinding(item))
   }
   for (const [key, local] of Object.entries(localChatSessions.value)) {
     if (seen.has(key)) continue
     seen.add(key)
-    items.push(syntheticChatSession(key, local.effectiveAgentId, local.title || t('chrome.newChat'), local.updatedAt))
+    const project = optimisticProjectForSession(key) || undefined
+    items.push(syntheticChatSession(
+      key,
+      local.effectiveAgentId,
+      local.title || t('chrome.newChat'),
+      local.updatedAt,
+      project,
+    ))
+  }
+  const draftWorkspaceId = activeProjectDraftId.value
+  const draftKey = activeProjectDraftKey.value
+  const draftProject = draftWorkspaceId
+    ? projectWorkspaces.byId.value.get(draftWorkspaceId)
+    : null
+  if (draftKey && draftProject && !seen.has(draftKey)) {
+    seen.add(draftKey)
+    items.push(syntheticChatSession(
+      draftKey,
+      'main',
+      t('chrome.newTask'),
+      Date.now(),
+      {
+        id: draftProject.id,
+        name: draftProject.name,
+        path: draftProject.path,
+        provisional: true,
+      },
+    ))
   }
   const current = currentSessionKey.value
   if (current && !seen.has(current)) {
     const currentAgentId = normalizeAgentId(current.split(':')[1] || 'main')
-    items.push(syntheticChatSession(current, currentAgentId, t('shared.sidebar.currentTask'), Date.now()))
+    const project = optimisticProjectForSession(current) || undefined
+    items.push(syntheticChatSession(
+      current,
+      currentAgentId,
+      t('shared.sidebar.currentTask'),
+      Date.now(),
+      project,
+    ))
   }
   return items
+})
+
+watch(allSessions, sessions => {
+  for (const item of sessions) {
+    if (!item.key || !item.workspaceId) continue
+    freshTaskDraft.confirmMaterializedProjectTask(item.key, item.workspaceId)
+  }
 })
 
 // Collapsible family sections (Chats / Channels / Automations). Row titles and
@@ -894,12 +967,6 @@ function openDefaultDraft() {
 function startNewChatInstant() {
   handleNavClick()
   void openDefaultDraft()
-}
-
-function openProjectPicker() {
-  if (!rpcStore.canChooseProject) return
-  handleNavClick()
-  projectPickerOpen.value = true
 }
 
 function startProjectTask(workspaceId: string) {

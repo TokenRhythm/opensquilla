@@ -49,6 +49,31 @@ describe('persisted project sidebar arrangement', () => {
       .toEqual(['workspace:b', 'workspace:a'])
   })
 
+  it('shows a provisional draft under its project and includes it in the visible count', () => {
+    const projects: ProjectWorkspaceItem[] = [
+      { id: 'project-a', name: 'Project A', path: '/repo/a', taskCount: 0, pinned: false, available: true },
+    ]
+    const draft = session({
+      key: 'draft:project:project-a:1',
+      title: 'New task',
+      updatedAt: 300,
+      workspaceId: 'project-a',
+    })
+    draft.provisional = true
+    draft.sessionKind = 'chat'
+    draft.surface = 'webchat'
+    const rows = arrangeSidebarSections([draft], projects)[0].rows
+
+    expect(rows.map(row => row.rowKind)).toEqual(['workspace', 'session'])
+    expect(rows[0].workspaceTaskCount).toBe(1)
+    expect(rows[1]).toMatchObject({
+      key: 'draft:project:project-a:1',
+      workspaceId: 'project-a',
+      provisional: true,
+      depth: 1,
+    })
+  })
+
   it('keeps workspace-bound tasks visible while the canonical project list is unavailable', () => {
     const rows = arrangeSidebarSections([
       session({

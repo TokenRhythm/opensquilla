@@ -30,6 +30,8 @@ export interface SessionItem {
   messageCount: number | null
   updatedAt: number
   interactive: boolean
+  /** Client-only draft that has not been materialized by its first send yet. */
+  provisional?: boolean
   /** True when this session was forked from its parent's transcript. */
   forkedFromParent: boolean
   contractGaps: string[]
@@ -421,6 +423,7 @@ export interface SidebarSectionRow {
   workspaceTaskCount?: number
   workspacePinned?: boolean
   workspaceAvailable?: boolean
+  provisional?: boolean
 }
 
 /** One collapsible family section with its recency-ordered rows. */
@@ -498,6 +501,7 @@ export function arrangeSidebarSections(
     workspaceId: item.workspaceId,
     workspaceLabel: item.workspaceLabel,
     workspaceDisplayPath: item.workspaceDisplayPath,
+    provisional: item.provisional,
   })
 
   type WorkspaceBucket = {
@@ -595,7 +599,8 @@ export function arrangeSidebarSections(
         workspaceId: project.id,
         workspaceLabel: project.name,
         workspaceDisplayPath: project.path,
-        workspaceTaskCount: project.taskCount,
+        workspaceTaskCount: project.taskCount
+          + projectEntries.filter(entry => entry.item.provisional).length,
         workspacePinned: project.pinned,
         workspaceAvailable: project.available,
       })

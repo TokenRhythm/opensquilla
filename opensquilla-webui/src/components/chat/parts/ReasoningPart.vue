@@ -10,7 +10,11 @@
        as the nested-context marker: inside ActivityDisclosure the activity body
        already draws the fold's left rule, and a second rule here reads as
        doubled chrome. -->
-  <details v-else class="thinking-fold" :class="{ 'thinking-fold--in-activity': live }">
+  <details
+    v-else
+    class="thinking-fold"
+    :class="{ 'thinking-fold--in-activity': nested || live }"
+  >
     <summary class="thinking-fold__summary">
       <Icon class="thinking-fold__chevron" name="chevronRight" :size="12" />
       <span>{{ summary }}</span>
@@ -30,6 +34,8 @@ const { t } = useI18n()
 const props = defineProps<{
   part: Extract<ChatPart, { type: 'reasoning' }>
   embedded?: boolean
+  /** Nested inside the outer activity disclosure. */
+  nested?: boolean
   /** Streaming turn: label the fold "Thinking · Ns" (matching the live
    * elapsed ticker) instead of the settled "Thought for …" wording. */
   live?: boolean

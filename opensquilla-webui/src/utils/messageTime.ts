@@ -22,7 +22,8 @@ export function messageDate(ts: string | number | null | undefined): Date | null
   return Number.isNaN(date.getTime()) ? null : date
 }
 
-// Coarse relative label: "just now" / "5m ago" / "2h ago" / "3d ago".
+// Coarse relative label for messages less than one day old. Older messages keep
+// their absolute timestamp without a redundant age suffix.
 // Pass a ticking `now` (epoch ms) to keep the label live without per-component
 // timers; it defaults to the current time for one-shot callers (e.g. export).
 export function relativeTime(
@@ -37,7 +38,7 @@ export function relativeTime(
   if (diff < 60) return 'just now'
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`
   if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`
-  return `${Math.floor(diff / 86400)}d ago`
+  return ''
 }
 
 // Locale-aware coarse relative label for status readouts ("5 minutes ago",
@@ -62,22 +63,17 @@ export function localizedRelativeTime(
   return formatter.format(-Math.floor(diff / 86400), 'day')
 }
 
-// Compact absolute local time: time-only for today, "Mon DD, HH:MM" within the
-// current year, and a full date otherwise. Always in the browser locale + tz.
+// Full local date and minute-level time. Keeping the year visible makes every
+// message timestamp self-contained, regardless of how old the task is.
 export function absoluteTime(ts: string | number | null | undefined): string {
   const date = messageDate(ts)
   if (!date) return ''
   const time = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-  const startOfToday = new Date()
-  startOfToday.setHours(0, 0, 0, 0)
-  if (date.getTime() >= startOfToday.getTime()) return time
-  const sameYear = date.getFullYear() === startOfToday.getFullYear()
-  const day = date.toLocaleDateString(
-    [],
-    sameYear
-      ? { month: 'short', day: 'numeric' }
-      : { year: 'numeric', month: 'short', day: 'numeric' },
-  )
+  const day = date.toLocaleDateString([], {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+  })
   return `${day}, ${time}`
 }
 

@@ -87,8 +87,8 @@
       </button>
       <time v-if="timeIso" class="msg-time" :datetime="timeIso" :title="timeFull">
         <span class="msg-time__abs">{{ timeAbs }}</span>
-        <span class="msg-time__dot" aria-hidden="true">·</span>
-        <span class="msg-time__rel">{{ timeRel }}</span>
+        <span v-if="timeRel" class="msg-time__dot" aria-hidden="true">·</span>
+        <span v-if="timeRel" class="msg-time__rel">{{ timeRel }}</span>
       </time>
     </div>
   </div>
