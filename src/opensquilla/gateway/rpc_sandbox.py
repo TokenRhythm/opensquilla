@@ -153,25 +153,37 @@ def _path_entry_payload(path: Path, *, selection_kind: str) -> dict[str, Any]:
 
 
 _MACOS_DIRECTORY_PICKER_SCRIPT = """
-on run argv
-    set dialogPrompt to item 1 of argv
-    if (count of argv) > 1 then
-        set initialFolder to POSIX file (item 2 of argv)
-        set selectedFolder to choose folder with prompt dialogPrompt default location initialFolder
-    else
-        set selectedFolder to choose folder with prompt dialogPrompt
-    end if
-    return POSIX path of selectedFolder
-end run
+ObjC.import("AppKit");
+ObjC.import("Foundation");
+
+function run(argv) {
+    const panel = $.NSOpenPanel.openPanel;
+    panel.canChooseFiles = false;
+    panel.canChooseDirectories = true;
+    panel.allowsMultipleSelection = false;
+    panel.canCreateDirectories = true;
+    panel.resolvesAliases = true;
+    panel.prompt = panel.title;
+
+    if (argv.length > 0 && argv[0]) {
+        panel.directoryURL = $.NSURL.fileURLWithPath(argv[0]);
+    }
+
+    if (panel.runModal === $.NSModalResponseOK) {
+        return ObjC.unwrap(panel.URL.path);
+    }
+    return "";
+}
 """
 
 
 def _pick_directory_path_macos(initial_dir: str | None = None) -> str | None:
     command = [
         "osascript",
+        "-l",
+        "JavaScript",
         "-e",
         _MACOS_DIRECTORY_PICKER_SCRIPT,
-        "Choose a project folder",
     ]
     if initial_dir:
         command.append(initial_dir)
@@ -257,9 +269,7 @@ async def _pick_directory_path_windows(initial_dir: str | None = None) -> str | 
     try:
         payload = json.loads(stdout.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RpcUnavailableError(
-            "Directory picker returned an invalid response."
-        ) from exc
+        raise RpcUnavailableError("Directory picker returned an invalid response.") from exc
     selected = payload.get("path")
     if selected is None:
         return None
