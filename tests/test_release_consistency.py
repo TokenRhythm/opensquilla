@@ -455,9 +455,9 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
         assert "verify-release-profile-preservation.py" in helper
         assert "workspace" in helper
         assert "state" in helper
-        assert "test-packaged-session-recovery.mjs" in helper
-        assert "--session-key" in helper
         assert "--label" in helper
+        assert "test-packaged-session-recovery.mjs" not in helper
+        assert "--session-key" not in helper
 
     assert "test-packaged-update-banner.mjs" in windows_helper
     assert "if ($VerifyLongRunningUpdateBanner)" in windows_helper
@@ -497,12 +497,6 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
         assert contract in session_recovery_smoke
     assert "page.clock" not in session_recovery_smoke
     assert "OPENSQUILLA_TESTING: '0'" in session_recovery_smoke
-    assert mac_helper.index("test-packaged-session-recovery.mjs") < mac_helper.index(
-        "recovery inspect"
-    )
-    assert windows_helper.index(
-        "test-packaged-session-recovery.mjs"
-    ) < windows_helper.index("recovery inspect")
     assert mac_helper.count("verify-runtime") == 2
     assert windows_helper.count("verify-runtime") == 2
 
