@@ -86,12 +86,14 @@
       :contract-debug-enabled="contractDebugEnabled"
       :search-hint="commandPaletteHint"
       :can-manage-projects="rpcStore.canManageProjectWorkspaces"
+      :can-create-projects="rpcStore.canChooseProject"
       @select="switchToSession"
       @refresh="loadSidebarData"
       @rename="onRenameSession"
       @delete="onDeleteSession"
       @bulk-delete="onBulkDeleteSessions"
       @new-chat="startNewChatInstant"
+      @new-project="openProjectCreator"
       @new-project-task="startProjectTask"
       @project-pin="onProjectPin"
       @project-edit="openProjectEditor"
@@ -352,12 +354,25 @@
 
   <ConfirmModal />
 
+  <ProjectWorkspaceCreateDialog
+    v-if="rpcStore.canChooseProject"
+    :open="projectCreateOpen && !projectPickerOpen && !projectCreateConfirming"
+    :name="projectCreateName"
+    :source-path="projectCreateSourcePath"
+    :busy="projectCreateBusy"
+    @update:name="projectCreateName = $event"
+    @choose-source="openProjectSourcePicker"
+    @close="closeProjectCreator"
+    @create="createProjectWorkspace"
+  />
+
   <ProjectWorkspacePickerDialog
     v-if="rpcStore.canChooseProject"
     :open="projectPickerOpen"
     :enabled="rpcStore.canChooseProject"
     :session-key="currentSessionKey || 'agent:main:webchat:workspace-picker'"
-    @close="projectPickerOpen = false"
+    :initial-path="projectCreateSourcePath"
+    @close="closeProjectSourcePicker"
     @choose="onProjectPathChosen"
   />
 
@@ -397,6 +412,7 @@ import Icon from './components/Icon.vue'
 import ErrorBoundary from './components/ErrorBoundary.vue'
 import ToastHost from './components/ToastHost.vue'
 import ConfirmModal from './components/ConfirmModal.vue'
+import ProjectWorkspaceCreateDialog from './components/ProjectWorkspaceCreateDialog.vue'
 import ProjectWorkspaceEditDialog from './components/ProjectWorkspaceEditDialog.vue'
 import ProjectWorkspacePickerDialog from './components/ProjectWorkspacePickerDialog.vue'
 import UpdateBanner from './components/UpdateBanner.vue'
@@ -495,6 +511,11 @@ const { pushToast } = useToasts()
 const { confirm } = useConfirm()
 const projectWorkspaces = useProjectWorkspaces()
 const freshTaskDraft = useFreshTaskDraft()
+const projectCreateOpen = ref(false)
+const projectCreateName = ref('')
+const projectCreateSourcePath = ref('')
+const projectCreateBusy = ref(false)
+const projectCreateConfirming = ref(false)
 const projectPickerOpen = ref(false)
 const editingProjectId = ref('')
 const editingProject = computed(() =>
@@ -509,6 +530,11 @@ watch(
       void projectWorkspaces.loadWorkspaces().catch(() => undefined)
       return
     }
+    projectCreateOpen.value = false
+    projectCreateName.value = ''
+    projectCreateSourcePath.value = ''
+    projectCreateBusy.value = false
+    projectCreateConfirming.value = false
     projectPickerOpen.value = false
     editingProjectId.value = ''
   },
@@ -979,21 +1005,83 @@ function startProjectTask(workspaceId: string) {
   })
 }
 
-async function onProjectPathChosen(path: string) {
+function projectNameFromPath(path: string): string {
+  const normalized = path.trim().replace(/[\\/]+$/, '')
+  return normalized.split(/[\\/]/).pop() || normalized
+}
+
+function resetProjectCreator() {
+  projectCreateOpen.value = false
+  projectCreateName.value = ''
+  projectCreateSourcePath.value = ''
+  projectCreateBusy.value = false
+  projectCreateConfirming.value = false
   projectPickerOpen.value = false
+}
+
+function openProjectCreator() {
   if (!rpcStore.canChooseProject) return
+  projectCreateName.value = ''
+  projectCreateSourcePath.value = ''
+  projectCreateBusy.value = false
+  projectCreateConfirming.value = false
+  projectPickerOpen.value = false
+  projectCreateOpen.value = true
+}
+
+function closeProjectCreator() {
+  if (projectCreateBusy.value) return
+  resetProjectCreator()
+}
+
+function openProjectSourcePicker() {
+  if (!projectCreateOpen.value || !rpcStore.canChooseProject || projectCreateBusy.value) return
+  projectPickerOpen.value = true
+}
+
+function closeProjectSourcePicker() {
+  projectPickerOpen.value = false
+}
+
+function onProjectPathChosen(path: string) {
+  projectPickerOpen.value = false
+  if (!projectCreateOpen.value || !rpcStore.canChooseProject) return
+  projectCreateSourcePath.value = path
+  if (!projectCreateName.value.trim()) {
+    projectCreateName.value = projectNameFromPath(path)
+  }
+}
+
+async function createProjectWorkspace(payload: { name: string; path: string }) {
+  if (!projectCreateOpen.value || !rpcStore.canChooseProject || projectCreateBusy.value) return
+  const name = payload.name.trim()
+  const path = payload.path.trim()
+  if (!name || !path) return
+  projectCreateConfirming.value = true
+  await nextTick()
   const trusted = await confirm({
     title: t('workspaces.trustTitle'),
     body: t('workspaces.trustBody', { path }),
     primaryLabel: t('workspaces.trustConfirm'),
     primaryClass: 'btn--primary',
   })
-  if (!trusted) return
+  if (!trusted) {
+    projectCreateConfirming.value = false
+    return
+  }
+  projectCreateBusy.value = true
   try {
     const workspace = await projectWorkspaces.openWorkspace(path)
-    if (workspace) startProjectTask(workspace.id)
+    if (!workspace) throw new Error('Gateway returned an empty project.')
+    if (workspace.name !== name) {
+      await projectWorkspaces.renameWorkspace(workspace.id, name)
+    }
+    resetProjectCreator()
+    pushToast(t('workspaces.projectCreated', { name }), { tone: 'ok' })
   } catch (err) {
-    pushToast(t('workspaces.openFailed', { error: errorMessage(err) }), { tone: 'danger' })
+    projectCreateBusy.value = false
+    projectCreateConfirming.value = false
+    pushToast(t('workspaces.createProjectFailed', { error: errorMessage(err) }), { tone: 'danger' })
   }
 }
 

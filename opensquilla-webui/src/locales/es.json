@@ -1,6 +1,13 @@
 {
   "workspaces": {
     "projects": "Proyectos",
+    "createProject": "Crear proyecto",
+    "projectNamePlaceholder": "Nombre del proyecto",
+    "sourceFolders": "Carpetas de origen",
+    "addSourceFolder": "Añadir una carpeta que OpenSquilla pueda leer y editar",
+    "creatingProject": "Creando…",
+    "projectCreated": "Proyecto «{name}» creado",
+    "createProjectFailed": "No se pudo crear el proyecto: {error}",
     "noTasks": "Sin tareas",
     "chooseProject": "Elegir proyecto",
     "webPickerScope": "Estas rutas pertenecen al host de Gateway.",

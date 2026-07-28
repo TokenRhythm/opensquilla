@@ -1,6 +1,13 @@
 {
   "workspaces": {
     "projects": "プロジェクト",
+    "createProject": "プロジェクトを作成",
+    "projectNamePlaceholder": "プロジェクト名",
+    "sourceFolders": "ソースフォルダ",
+    "addSourceFolder": "OpenSquilla が読み書きできるフォルダを追加",
+    "creatingProject": "作成中…",
+    "projectCreated": "プロジェクト「{name}」を作成しました",
+    "createProjectFailed": "プロジェクトを作成できませんでした: {error}",
     "noTasks": "タスクなし",
     "chooseProject": "プロジェクトを選択",
     "webPickerScope": "ここには Gateway ホスト上のパスが表示されます。",

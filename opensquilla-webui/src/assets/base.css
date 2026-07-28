@@ -1125,18 +1125,20 @@ pre {
   transition: opacity var(--dur-fast), background var(--dur-fast), color var(--dur-fast);
 }
 
-.sidebar-project-action--new-task {
-  opacity: 0.68;
-}
-
+.sidebar-project-action--new-task,
 .sidebar-project-action--new-task:disabled {
-  opacity: 0.28;
+  opacity: 0;
 }
 
 .sidebar-history-row--workspace:hover .sidebar-project-action,
 .sidebar-history-row--workspace:focus-within .sidebar-project-action,
 .sidebar-project-action[aria-expanded='true'] {
   opacity: 1;
+}
+
+.sidebar-history-row--workspace:hover .sidebar-project-action--new-task:disabled,
+.sidebar-history-row--workspace:focus-within .sidebar-project-action--new-task:disabled {
+  opacity: 0.34;
 }
 
 .sidebar-workspace-empty {
@@ -1179,6 +1181,33 @@ pre {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-weight: 400;
+}
+
+.sidebar-project-create-btn {
+  width: 24px;
+  height: 24px;
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--sidebar-text-soft);
+  cursor: pointer;
+  transition: background var(--dur-fast), color var(--dur-fast);
+}
+
+.sidebar-project-create-btn:hover,
+.sidebar-project-create-btn:focus-visible {
+  background: var(--sidebar-item-hover);
+  color: var(--sidebar-text-strong);
+}
+
+.sidebar-project-create-btn + .sidebar-cmd-btn {
+  margin-left: 0;
 }
 
 .sidebar-history-row.is-selected .sidebar-history-item {

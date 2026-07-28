@@ -1,6 +1,13 @@
 {
   "workspaces": {
     "projects": "项目",
+    "createProject": "创建项目",
+    "projectNamePlaceholder": "项目名称",
+    "sourceFolders": "源文件夹",
+    "addSourceFolder": "添加 OpenSquilla 可读取和编辑的文件夹",
+    "creatingProject": "正在创建…",
+    "projectCreated": "已创建项目“{name}”",
+    "createProjectFailed": "无法创建项目：{error}",
     "noTasks": "无任务",
     "chooseProject": "选择项目",
     "webPickerScope": "这里显示的是网关主机上的目录。",

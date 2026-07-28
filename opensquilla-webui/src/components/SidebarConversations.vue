@@ -55,8 +55,10 @@ const props = withDefaults(defineProps<{
   /** Command-palette chord, shown in the search button's tooltip. */
   searchHint: string
   canManageProjects?: boolean
+  canCreateProjects?: boolean
 }>(), {
   canManageProjects: true,
+  canCreateProjects: true,
 })
 
 const emit = defineEmits<{
@@ -66,6 +68,7 @@ const emit = defineEmits<{
   (e: 'delete', key: string): void
   (e: 'bulk-delete', keys: string[]): void
   (e: 'new-chat'): void
+  (e: 'new-project'): void
   (e: 'new-project-task', workspaceId: string): void
   (e: 'project-pin', payload: { workspaceId: string; pinned: boolean }): void
   (e: 'project-edit', workspaceId: string): void
@@ -249,7 +252,6 @@ const projectRowKeys = computed(() => {
 })
 
 const firstRecentRowKey = computed(() => {
-  if (visibleProjectCount.value === 0) return ''
   for (const section of visibleSections.value) {
     const row = section.rows.find(item =>
       item.rowKind === 'session' && !projectRowKeys.value.has(item.key),
@@ -562,7 +564,7 @@ function onSelectRow(row: SidebarConversationItem) {
 
 <template>
   <div
-    v-if="error || totalRows > 0 || visibleProjectCount > 0"
+    v-if="error || totalRows > 0 || visibleProjectCount > 0 || props.canManageProjects"
     class="sidebar-section sidebar-history"
     :class="{
       'is-selecting': selectionMode,
@@ -577,7 +579,7 @@ function onSelectRow(row: SidebarConversationItem) {
             ? selectedCount > 0
               ? t('shared.sidebar.selectedCountLabel', { count: selectedCount })
               : t('shared.sidebar.selectionModeLabel')
-            : visibleProjectCount > 0
+            : props.canManageProjects
               ? t('workspaces.projects')
               : t('shared.sidebar.recents')
         }}
@@ -586,6 +588,17 @@ function onSelectRow(row: SidebarConversationItem) {
         v-if="!selectionMode && visibleProjectCount === 0 && totalRows > 0"
         class="sidebar-recents-count"
       >{{ totalRows }}</span>
+      <button
+        v-if="!selectionMode && props.canManageProjects && props.canCreateProjects"
+        type="button"
+        class="sidebar-project-create-btn"
+        data-testid="sidebar-create-project"
+        :aria-label="t('workspaces.createProject')"
+        :title="t('workspaces.createProject')"
+        @click="emit('new-project')"
+      >
+        <Icon name="plus" :size="13" />
+      </button>
       <!-- Conversation search lives on the recents header, beside the selection
            and refresh controls, because the palette's hits are these rows.
            Hidden while selecting: that mode owns the header's spare width. -->

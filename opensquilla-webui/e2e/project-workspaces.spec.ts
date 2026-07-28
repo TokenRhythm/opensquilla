@@ -252,7 +252,7 @@ test.describe('Project workspaces', () => {
 
     await page.goto(`/control/chat?session=${encodeURIComponent(state.sessionKey)}`)
     await expect(page.locator('.conn-pill.connected')).toBeVisible()
-    await expect(page.locator('.chat-project-chip')).toContainText('/repos/demo')
+    await expect(page.locator('.chat-project-chip')).toHaveCount(0)
     await expect(page.getByRole('button', { name: 'Choose project' })).toHaveCount(0)
 
     await page.getByRole('textbox', { name: 'Message to send' }).fill('continue')
@@ -284,6 +284,7 @@ test.describe('Project workspaces', () => {
     await installProjectLifecycleRpc(page)
     await openControl(page)
 
+    await page.locator('.sidebar-new-session').click()
     await page.getByRole('button', { name: 'Choose project', exact: true }).click()
 
     const picker = page.getByRole('dialog', { name: 'Choose project' })
@@ -316,6 +317,33 @@ test.describe('Project workspaces', () => {
     await expect(page.getByRole('button', { name: 'Choose project', exact: true })).toBeVisible()
   })
 
+  test('creates a project from the projects header without starting a task', async ({ page }) => {
+    const state = await installProjectLifecycleRpc(page)
+    await openControl(page)
+
+    await page.getByTestId('sidebar-create-project').click()
+
+    let creator = page.getByRole('dialog', { name: 'Create project' })
+    await expect(creator).toBeVisible()
+    await creator
+      .getByRole('button', { name: 'Add a folder OpenSquilla can read and edit', exact: true })
+      .click()
+
+    const picker = page.getByRole('dialog', { name: 'Choose project' })
+    await picker.getByRole('option', { name: 'demo', exact: true }).click()
+    await picker.getByRole('button', { name: 'Choose selected directory', exact: true }).click()
+
+    creator = page.getByRole('dialog', { name: 'Create project' })
+    await expect(creator.getByRole('textbox', { name: 'Project name' })).toHaveValue('demo')
+    await creator.getByRole('button', { name: 'Create project', exact: true }).click()
+    await page.getByRole('button', { name: 'Trust and open', exact: true }).click()
+
+    await expect.poll(() => state.projectPresent).toBe(true)
+    await expect(page.locator('.sidebar-history-row--workspace')).toHaveCount(1)
+    await expect(page.locator('[data-session-key^="draft:project:"]')).toHaveCount(0)
+    await expect(page).not.toHaveURL(/project=project-demo/)
+  })
+
   test('project names only disclose tasks while the plus opens a project draft', async ({ page }) => {
     const state = await installProjectLifecycleRpc(page)
     state.projectPresent = true
@@ -328,12 +356,15 @@ test.describe('Project workspaces', () => {
     const plus = project.getByTestId('project-workspace-new-task')
 
     await expect(info).toBeVisible()
+    await expect(plus).toHaveCSS('opacity', '0')
     await expect(disclosure).toHaveAttribute('aria-expanded', /true|false/)
     const startedExpanded = await disclosure.getAttribute('aria-expanded') === 'true'
     await disclosure.click()
     await expect(disclosure).toHaveAttribute('aria-expanded', String(!startedExpanded))
     await expect(page).not.toHaveURL(/\/chat\?session=/)
 
+    await project.hover()
+    await expect(plus).toHaveCSS('opacity', '1')
     await plus.click()
     await expect(page).toHaveURL(/\/chat\/new\?agent=main&project=[^&]+$/)
     await expect(page.locator('.chat-project-chip')).toBeVisible()
@@ -348,6 +379,7 @@ test.describe('Project workspaces', () => {
     const state = await installProjectLifecycleRpc(page)
     await openControl(page)
 
+    await page.locator('.sidebar-new-session').click()
     await page.getByRole('button', { name: 'Choose project', exact: true }).click()
     await expect.poll(() => state.pathListRequests.length).toBe(1)
     expect(state.pathListRequests[0]).not.toHaveProperty('path')
@@ -361,7 +393,8 @@ test.describe('Project workspaces', () => {
     await page.getByRole('button', { name: 'Trust and open' }).click()
     await expect(page).toHaveURL(/\/chat\/new\?agent=main&project=project-demo$/)
     const projectChip = page.locator('.chat-project-chip')
-    await expect(projectChip).toContainText('/repos/demo')
+    await expect(projectChip).toContainText('demo')
+    await expect(projectChip).not.toContainText('/repos/demo')
     await expect(projectChip).toHaveAttribute('data-status', 'ready')
     await expect.poll(
       () => state.requestMethods.filter(method => method === 'sessions.messages.subscribe').length,
@@ -380,16 +413,16 @@ test.describe('Project workspaces', () => {
     })
     expect(state.sends[0]._source).toMatchObject({ runMode: 'full' })
     await expect(page).toHaveURL(/\/chat\?session=/)
-    await expect(page.locator('.chat-project-chip')).toContainText('/repos/demo')
+    await expect(page.locator('.chat-project-chip')).toHaveCount(0)
 
     await page.reload()
-    await expect(page.locator('.chat-project-chip')).toContainText('/repos/demo')
+    await expect(page.locator('.chat-project-chip')).toHaveCount(0)
     const projectRow = page.locator('.sidebar-history-row--workspace').first()
     await projectRow.getByTestId('project-workspace-more').click()
     await page.getByRole('menuitem', { name: 'Remove' }).click()
     await page.getByRole('button', { name: 'Remove project' }).click()
     await expect.poll(() => state.removed).toBe(true)
-    await expect(page.locator('.chat-project-chip')).toContainText('/repos/demo')
+    await expect(page.locator('.chat-project-chip')).toContainText('demo')
     const blockedSend = page.getByRole('button', { name: 'Send' })
     await page.getByRole('textbox', { name: 'Message to send' }).fill('must stay')
     await expect(blockedSend).toBeDisabled()

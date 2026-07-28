@@ -78,6 +78,7 @@ function i18n() {
         },
         workspaces: {
           projects: 'Projects',
+          createProject: 'Create project',
           projectInfo: '{path}; {count} tasks',
           taskCount: '{count} tasks',
           newTask: 'New project task',
@@ -107,6 +108,7 @@ async function mountSidebar(
   const sections: SidebarSection[] = [{ family: 'chats', label: 'Tasks', rows }]
   const events = {
     select: vi.fn(),
+    newProject: vi.fn(),
     newProjectTask: vi.fn(),
     projectPin: vi.fn(),
     projectEdit: vi.fn(),
@@ -124,6 +126,7 @@ async function mountSidebar(
     searchHint: 'Ctrl+K',
     canManageProjects,
     onSelect: events.select,
+    onNewProject: events.newProject,
     onNewProjectTask: events.newProjectTask,
     onProjectPin: events.projectPin,
     onProjectEdit: events.projectEdit,
@@ -146,6 +149,21 @@ afterEach(() => {
 })
 
 describe('SidebarConversations project workspaces', () => {
+  it('creates projects from the section header while project-row plus actions remain task scoped', async () => {
+    const { host, events } = await mountSidebar([projectRow(), taskRow()])
+    const createProject = host.querySelector<HTMLButtonElement>('[data-testid="sidebar-create-project"]')
+    const createTask = host.querySelector<HTMLButtonElement>('[data-testid="project-workspace-new-task"]')
+
+    expect(createProject?.getAttribute('aria-label')).toBe('Create project')
+    expect(createTask?.getAttribute('aria-label')).toBe('New project task')
+
+    createProject?.click()
+    await nextTick()
+
+    expect(events.newProject).toHaveBeenCalledOnce()
+    expect(events.newProjectTask).not.toHaveBeenCalled()
+  })
+
   it('separates project work from ordinary recent tasks', async () => {
     const { host } = await mountSidebar([
       projectRow(),
@@ -324,6 +342,7 @@ describe('SidebarConversations project workspaces', () => {
     )
 
     expect(host.querySelector('[data-testid="project-workspace-disclosure"]')).toBeTruthy()
+    expect(host.querySelector('[data-testid="sidebar-create-project"]')).toBeNull()
     expect(host.querySelector('[data-testid="project-workspace-new-task"]')).toBeNull()
     expect(host.querySelector('[data-testid="project-workspace-more"]')).toBeNull()
 
