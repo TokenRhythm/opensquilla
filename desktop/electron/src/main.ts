@@ -92,6 +92,7 @@ import {
 import {
   NativeWorkbenchSurfaceManager,
 } from './native-workbench-surface.js'
+import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
 
 protocol.registerSchemesAsPrivileged([{
   scheme: NATIVE_WORKBENCH_ARTIFACT_SCHEME,
@@ -7841,6 +7842,11 @@ async function createMainWindow(): Promise<BrowserWindow> {
     },
   })
   mainWindow = window
+  installDesktopZoomShortcuts(
+    window.webContents,
+    window.webContents,
+    () => nativeWorkbenchSurfaces.refreshBounds(window),
+  )
   installEditingContextMenu(window)
 
   window.webContents.setWindowOpenHandler(({ url }) => {

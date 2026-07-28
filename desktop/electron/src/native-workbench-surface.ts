@@ -422,6 +422,10 @@ export class NativeWorkbenchSurfaceManager {
     } catch {}
   }
 
+  refreshBounds(owner: BrowserWindow): void {
+    this.reapplyActiveBounds(owner)
+  }
+
   private reapplyActiveBounds(owner: BrowserWindow): void {
     if (!this.activeSurfaceId) return
     const record = this.surfaces.get(this.activeSurfaceId)
