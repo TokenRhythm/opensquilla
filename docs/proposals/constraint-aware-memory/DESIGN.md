@@ -112,7 +112,7 @@ CandidateKind = Literal[
 │   问: 这条记忆是什么类型的推理资源？                              │
 │   做: 索引时标注 constraint_type                                 │
 ├─────────────────────────────────────────────────────────────────┤
-│ L0: 归档 Transcript 可搜索 (infrastructure, always on)           │
+│ L0: 归档 Transcript 可搜索 ✅ (infrastructure, always on)        │
 │   修复: 让模型能搜索被压缩掉的原始对话                            │
 │   意义: 为 L1-L3 提供 ground truth 参照物                        │
 └─────────────────────────────────────────────────────────────────┘

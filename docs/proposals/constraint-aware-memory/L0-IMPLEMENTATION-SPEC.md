@@ -1,6 +1,6 @@
 # L0: Archived Transcript Searchable — Implementation Spec
 
-> Status: Draft
+> Status: Implemented (commit 648628e6, 2026-07-29)
 > Branch: `feature/constraint-aware-memory`
 > Layer: 0 (infrastructure, always-on)
 > Depends on: none
@@ -348,14 +348,14 @@ Location: `tests/session/test_storage_compacted_fts.py`
 
 ## 12. Definition of Done
 
-- [ ] `storage.py` contains `_CREATE_COMPACTED_TRANSCRIPT_FTS` and three trigger constants.
-- [ ] `_create_schema()` calls `_migrate_compacted_transcript_fts()` after existing migrations.
-- [ ] `search_transcript(include_archived=True)` returns archived hits with `"source"` key.
-- [ ] `search_transcript_like(include_archived=True)` same.
-- [ ] `session_search` tool description updated; result includes `"source"`.
-- [ ] All 10 unit tests pass.
-- [ ] Existing test suite passes (no regressions).
-- [ ] Commit on `feature/constraint-aware-memory`, NOT merged to `main`.
+- [x] `storage.py` contains `_CREATE_COMPACTED_TRANSCRIPT_FTS` and three trigger constants.
+- [x] `_initialize_schema()` calls `_migrate_compacted_transcript_fts()` after existing migrations.
+- [x] `search_transcript(include_archived=True)` returns archived hits with `"source"` key.
+- [x] `search_transcript_like(include_archived=True)` same.
+- [x] `session_search` tool description updated; result includes `"source"`.
+- [x] All 11 unit tests pass (10 spec tests + 1 LIKE search extension, 2.06s).
+- [x] Existing test suite passes (374 passed, 1 pre-existing failure unrelated to L0, 0 regressions).
+- [x] Commit `648628e6` on `feature/constraint-aware-memory`, NOT merged to `main`.
 
 ## 13. Implementation Order
 
