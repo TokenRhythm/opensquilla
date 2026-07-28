@@ -1,14 +1,15 @@
 <template>
-  <div class="settings-overlay" @click.self="requestClose()">
-    <Transition name="settings-pop" appear @after-leave="onLeaveComplete">
-    <section
-      v-if="visible"
-      ref="modalRef"
-      class="settings-modal"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="settings-modal-title"
-    >
+  <Teleport to="body">
+    <div class="settings-overlay" @click.self="requestClose()">
+      <Transition name="settings-pop" appear @after-leave="onLeaveComplete">
+      <section
+        v-if="visible"
+        ref="modalRef"
+        class="settings-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="settings-modal-title"
+      >
       <div
         class="settings-body"
         :inert="saveAllPending ? true : undefined"
@@ -210,9 +211,10 @@
         <span class="settings-foot__sep" aria-hidden="true">&middot;</span>
         <span class="settings-foot__text">{{ t('settings.dialog.applyLiveNote') }}</span>
       </footer>
-    </section>
-    </Transition>
-  </div>
+      </section>
+      </Transition>
+    </div>
+  </Teleport>
 </template>
 
 <script setup lang="ts">

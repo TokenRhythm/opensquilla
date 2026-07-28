@@ -100,7 +100,7 @@ async function mountDialog(path: '/settings/advanced' | '/settings/dataMigration
   mounted.push(app)
   await settle()
   await vue.nextTick()
-  return { el, router }
+  return { el: document.body, router }
 }
 
 afterEach(() => {
