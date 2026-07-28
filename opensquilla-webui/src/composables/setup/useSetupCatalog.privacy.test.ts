@@ -3501,71 +3501,77 @@ describe('useSetupCatalog optional provider credentials', () => {
     })
   }
 
-  it('exposes an optional custom key and blocks probes until required fields exist', async () => {
-    rpcCall.mockImplementation(async (method: string) => {
-      if (method === 'onboarding.catalog') {
-        return {
-          providers: [
-            {
-              providerId: 'custom',
-              label: 'Custom OpenAI-compatible endpoint',
-              runtimeSupported: true,
-              acceptsApiKey: true,
-              requiresApiKey: false,
-              envKey: 'CUSTOM_LLM_API_KEY',
-              fields: [
-                { name: 'model', label: 'Model id', required: true, default: '' },
-                { name: 'api_key', label: 'API key', required: false, secret: true },
-                { name: 'base_url', label: 'Base URL', required: true, default: '' },
-              ],
-            },
-          ],
+  it.each([
+    ['custom', 'Custom OpenAI-compatible endpoint', 'CUSTOM_LLM_API_KEY'],
+    ['custom_anthropic', 'Custom Anthropic-compatible endpoint', 'CUSTOM_ANTHROPIC_API_KEY'],
+  ])(
+    'exposes an optional key and blocks %s probes until required fields exist',
+    async (providerId, label, envKey) => {
+      rpcCall.mockImplementation(async (method: string) => {
+        if (method === 'onboarding.catalog') {
+          return {
+            providers: [
+              {
+                providerId,
+                label,
+                runtimeSupported: true,
+                acceptsApiKey: true,
+                requiresApiKey: false,
+                envKey,
+                fields: [
+                  { name: 'model', label: 'Model id', required: true, default: '' },
+                  { name: 'api_key', label: 'API key', required: false, secret: true },
+                  { name: 'base_url', label: 'Base URL', required: true, default: '' },
+                ],
+              },
+            ],
+          }
         }
-      }
-      if (method === 'onboarding.status') {
-        return { hasConfig: false, llmConfigured: false, llmCredentialStatus: {} }
-      }
-      if (method === 'channels.status') return { channels: [] }
-      if (method === 'config.get') return {}
-      if (method === 'onboarding.provider.probe') {
-        return { ok: false, failureKind: 'transport_transient', message: 'offline' }
-      }
-      throw new Error(`Unexpected RPC method: ${method}`)
-    })
-    const { api, app } = await mountCatalog()
+        if (method === 'onboarding.status') {
+          return { hasConfig: false, llmConfigured: false, llmCredentialStatus: {} }
+        }
+        if (method === 'channels.status') return { channels: [] }
+        if (method === 'config.get') return {}
+        if (method === 'onboarding.provider.probe') {
+          return { ok: false, failureKind: 'transport_transient', message: 'offline' }
+        }
+        throw new Error(`Unexpected RPC method: ${method}`)
+      })
+      const { api, app } = await mountCatalog()
 
-    api.selectProvider('custom')
-    api.onProviderChange()
+      api.selectProvider(providerId)
+      api.onProviderChange()
 
-    let credential = api.providerPanel.value.credentialPanel
-    expect(credential).toMatchObject({
-      acceptsApiKey: true,
-      requiresApiKey: false,
-      source: 'not_required',
-      probeReady: false,
-    })
-    expect(credential?.probeDisabledReason).toBe(
-      'Complete required fields before verifying: Model, Base URL.',
-    )
+      let credential = api.providerPanel.value.credentialPanel
+      expect(credential).toMatchObject({
+        acceptsApiKey: true,
+        requiresApiKey: false,
+        source: 'not_required',
+        probeReady: false,
+      })
+      expect(credential?.probeDisabledReason).toBe(
+        'Complete required fields before verifying: Model, Base URL.',
+      )
 
-    api.probeProviderConnection()
-    expect(rpcCall.mock.calls.some(call => call[0] === 'onboarding.provider.probe')).toBe(false)
+      api.probeProviderConnection()
+      expect(rpcCall.mock.calls.some(call => call[0] === 'onboarding.provider.probe')).toBe(false)
 
-    api.updateProviderField('model', 'test-model')
-    api.updateProviderField('base_url', 'https://custom.example.test/v1')
-    credential = api.providerPanel.value.credentialPanel
-    expect(credential?.probeReady).toBe(true)
-    expect(credential?.probeDisabledReason).toBe('')
+      api.updateProviderField('model', 'test-model')
+      api.updateProviderField('base_url', 'https://custom.example.test/v1')
+      credential = api.providerPanel.value.credentialPanel
+      expect(credential?.probeReady).toBe(true)
+      expect(credential?.probeDisabledReason).toBe('')
 
-    api.probeProviderConnection()
-    await Promise.resolve()
-    expect(rpcCall).toHaveBeenCalledWith('onboarding.provider.probe', {
-      providerId: 'custom',
-      baseUrl: 'https://custom.example.test/v1',
-      model: 'test-model',
-    })
-    app.unmount()
-  })
+      api.probeProviderConnection()
+      await Promise.resolve()
+      expect(rpcCall).toHaveBeenCalledWith('onboarding.provider.probe', {
+        providerId,
+        baseUrl: 'https://custom.example.test/v1',
+        model: 'test-model',
+      })
+      app.unmount()
+    },
+  )
 
   it('falls back conservatively to requiresApiKey when an older gateway omits acceptsApiKey', async () => {
     rpcCall.mockImplementation(async (method: string) => {

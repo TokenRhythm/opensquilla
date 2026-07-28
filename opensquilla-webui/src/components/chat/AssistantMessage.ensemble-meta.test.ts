@@ -74,7 +74,7 @@ describe('AssistantMessage ensemble footer metadata', () => {
     unsafe.app.unmount()
   })
 
-  it('shows the current message token counts in its usage popover', async () => {
+  it('keeps model, cost, and token details behind one info control', async () => {
     const { app, el } = await mountMessage(
       assistantMessage({
         meta: {
@@ -95,12 +95,17 @@ describe('AssistantMessage ensemble footer metadata', () => {
     el.querySelector<HTMLButtonElement>('.msg-meta__more-btn')?.click()
     await nextTick()
 
-    expect(el.querySelector('.msg-meta-popover__label')?.textContent).toBe('tokens')
-    expect(el.querySelector('.msg-meta-popover__value')?.textContent).toBe('↑120 ↓40')
+    expect(el.querySelectorAll('.msg-meta__more-btn')).toHaveLength(1)
+    expect(el.querySelector('.msg-meta__model')).toBeNull()
+    expect(el.querySelector('.msg-meta__cost')).toBeNull()
+    const rows = Array.from(el.querySelectorAll('.msg-meta-popover__row')).map(row => row.textContent)
+    expect(rows).toContain('modelglm-5.2-20260616')
+    expect(rows).toContain('cost$0.050328')
+    expect(rows).toContain('tokens↑120 ↓40')
     app.unmount()
   })
 
-  it('does not present ensemble aggregate metadata as single-model footer metadata', async () => {
+  it('keeps ensemble metadata behind the same single info control', async () => {
     const { app, el } = await mountMessage(
       assistantMessage({
         meta: {
@@ -133,7 +138,8 @@ describe('AssistantMessage ensemble footer metadata', () => {
     expect(el.querySelector('.msg-meta__model')).toBeNull()
     expect(el.querySelector('.msg-meta__cost')).toBeNull()
     expect(el.querySelector('.savings-indicator')).toBeNull()
-    expect(el.querySelector('.msg-meta__ensemble')?.textContent).toBe('Ensemble · 5 models')
+    expect(el.querySelector('.msg-meta__ensemble')).toBeNull()
+    expect(el.querySelectorAll('.msg-meta__more-btn')).toHaveLength(1)
     app.unmount()
   })
 
@@ -180,7 +186,7 @@ describe('AssistantMessage ensemble footer metadata', () => {
     app.unmount()
   })
 
-  it('keeps the savings badge for non-ensemble optimized messages', async () => {
+  it('does not show a savings badge beside the info control', async () => {
     const { app, el } = await mountMessage(
       assistantMessage({
         meta: {
@@ -198,13 +204,16 @@ describe('AssistantMessage ensemble footer metadata', () => {
       }),
     )
 
-    expect(el.querySelector('.savings-indicator')?.textContent).toBe('Saved ~92%')
+    expect(el.querySelector('.savings-indicator')).toBeNull()
+    expect(el.querySelectorAll('.msg-meta__more-btn')).toHaveLength(1)
     app.unmount()
   })
 
-  it('keeps the ensemble summary broad enough on compact layouts', () => {
-    expect(source).not.toContain('max-width: 7rem;')
-    expect(source).toContain('max-width: min(14rem, 100%);')
+  it('does not render inline model, cost, ensemble, or savings metadata', () => {
+    expect(source).not.toContain('class="msg-meta__model"')
+    expect(source).not.toContain('class="msg-meta__cost"')
+    expect(source).not.toContain('class="msg-meta__ensemble"')
+    expect(source).not.toContain('class="savings-indicator"')
   })
 
   it('does not toggle share selection for stopped-output notices', async () => {

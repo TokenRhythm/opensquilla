@@ -699,6 +699,72 @@ def _should_send_temperature(
     return True
 
 
+def _apply_compat_request_constraints(
+    payload: dict[str, Any],
+    *,
+    policy: OpenAICompatPolicy,
+    model: str,
+    cfg: ChatConfig,
+    has_tools: bool,
+) -> None:
+    """Apply declarative endpoint constraints after generic payload assembly."""
+
+    model_name = _model_basename(model)
+    force_thinking = model_name in policy.force_thinking_model_ids
+    if force_thinking:
+        payload["enable_thinking"] = True
+
+    if (
+        policy.thinking_tool_choice_auto_only
+        and (
+            payload.get("enable_thinking") is True
+            or model_name in policy.implicit_thinking_tool_choice_model_ids
+        )
+        and "tool_choice" in payload
+    ):
+        tool_choice = payload["tool_choice"]
+        pinned_tool_choice = False
+        if isinstance(tool_choice, Mapping):
+            tool_choice_type = tool_choice.get("type")
+            pinned_tool_choice = tool_choice_type in {"tool", "function"}
+        else:
+            tool_choice_type = tool_choice
+        if tool_choice_type in {"auto", "none"}:
+            payload["tool_choice"] = tool_choice_type
+        elif (
+            policy.prefer_pinned_tool_choice_over_thinking
+            and pinned_tool_choice
+            and not force_thinking
+        ):
+            payload["enable_thinking"] = False
+            payload.pop("thinking_budget", None)
+            payload.pop("reasoning_effort", None)
+            payload.pop("preserve_thinking", None)
+            for message in payload.get("messages", ()):
+                if isinstance(message, dict):
+                    message.pop("reasoning_content", None)
+        else:
+            # The endpoint rejects required/pinned choices while thinking.
+            # Preserve the requested reasoning mode and degrade the selector
+            # to the nearest accepted value.
+            payload["tool_choice"] = "auto"
+
+    if has_tools and model_name in policy.tool_stream_model_ids:
+        payload["tool_stream"] = True
+
+    if (
+        model_name in policy.temperature_floor_model_ids
+        and policy.temperature_floor > 0
+        and isinstance(payload.get("temperature"), int | float)
+    ):
+        payload["temperature"] = max(
+            float(payload["temperature"]), policy.temperature_floor
+        )
+
+    if policy.omit_implicit_thinking_budget and not cfg.thinking_budget_explicit:
+        payload.pop("thinking_budget", None)
+
+
 def _resolve_llm_proxy(proxy: str | None) -> str | None:
     if proxy is None:
         return os.environ.get("OPENSQUILLA_LLM_PROXY", "").strip() or None
@@ -2373,8 +2439,40 @@ def _reasoning_echo_allowed_indexes(
     return set(assistant_indexes[-echo_turns:])
 
 
-def _requires_assistant_reasoning_content(policy: OpenAICompatPolicy, model: str) -> bool:
-    return model.strip().lower() in policy.require_reasoning_content_model_ids
+def _requires_assistant_reasoning_content(
+    policy: OpenAICompatPolicy,
+    model: str,
+    *,
+    thinking: bool = False,
+) -> bool:
+    model_name = _model_basename(model)
+    return model.strip().lower() in policy.require_reasoning_content_model_ids or (
+        thinking
+        and model_name
+        in policy.require_reasoning_content_when_thinking_model_ids
+    )
+
+
+def _effective_policy_thinking(
+    policy: OpenAICompatPolicy,
+    model: str,
+    *,
+    thinking: bool,
+) -> bool:
+    return thinking or _model_basename(model) in policy.force_thinking_model_ids
+
+
+def _requires_tool_call_reasoning_content(
+    policy: OpenAICompatPolicy,
+    model: str,
+    *,
+    thinking: bool,
+) -> bool:
+    return (
+        thinking
+        and _model_basename(model)
+        in policy.require_tool_call_reasoning_content_when_thinking_model_ids
+    )
 
 
 def _should_replay_reasoning_content(
@@ -2384,12 +2482,24 @@ def _should_replay_reasoning_content(
     caps: ModelCapabilities | None,
     thinking: bool = False,
 ) -> bool:
-    if _requires_assistant_reasoning_content(policy, model):
+    model_name = _model_basename(model)
+    effective_thinking = _effective_policy_thinking(
+        policy, model, thinking=thinking
+    )
+    if _requires_assistant_reasoning_content(
+        policy, model, thinking=effective_thinking
+    ):
+        return True
+    if _requires_tool_call_reasoning_content(
+        policy, model, thinking=effective_thinking
+    ):
         return True
     if not caps or not caps.supports_reasoning:
         return False
+    if effective_thinking and model_name in policy.preserve_thinking_model_ids:
+        return True
     if caps.reasoning_format == "dashscope":
-        if not thinking:
+        if not effective_thinking:
             return False
         return _dashscope_supports_preserve_thinking(model)
     return bool(policy.replay_reasoning_format) and (
@@ -2402,6 +2512,7 @@ def _build_openai_messages(
     *,
     include_reasoning_content: bool = True,
     require_assistant_reasoning_content: bool = False,
+    require_tool_call_reasoning_content: bool = False,
     replay_provider_state: bool = True,
 ) -> list[dict[str, Any]]:
     """Convert a opensquilla Message into one or more OpenAI-format message dicts.
@@ -2487,7 +2598,10 @@ def _build_openai_messages(
                 msg,
                 result,
                 include_reasoning_content=include_reasoning_content,
-                require_assistant_reasoning_content=require_assistant_reasoning_content,
+                require_assistant_reasoning_content=(
+                    require_assistant_reasoning_content
+                    or require_tool_call_reasoning_content
+                ),
             )
         ]
 
@@ -2559,6 +2673,9 @@ def _build_openai_wire_messages(
         else None
     )
     for message_index, message in enumerate(messages):
+        effective_thinking = _effective_policy_thinking(
+            policy, model, thinking=cfg.thinking
+        )
         openai_messages.extend(
             _build_openai_messages(
                 message,
@@ -2568,7 +2685,14 @@ def _build_openai_wire_messages(
                     else message_index in reasoning_echo_allowed
                 ),
                 require_assistant_reasoning_content=(
-                    _requires_assistant_reasoning_content(policy, model)
+                    _requires_assistant_reasoning_content(
+                        policy, model, thinking=effective_thinking
+                    )
+                ),
+                require_tool_call_reasoning_content=(
+                    _requires_tool_call_reasoning_content(
+                        policy, model, thinking=effective_thinking
+                    )
                 ),
                 replay_provider_state=replay_provider_state,
             )
@@ -2774,7 +2898,13 @@ class OpenAIProvider:
                     "schema": cfg.output_json_schema,
                 },
             }
-        if self._provider_kind == "dashscope" and include_reasoning_content:
+        if (
+            include_reasoning_content
+            and _model_basename(self._model)
+            in self._compat.preserve_thinking_model_ids
+        ) or (
+            self._provider_kind == "dashscope" and include_reasoning_content
+        ):
             payload["preserve_thinking"] = True
         if _should_use_max_completion_tokens(
             self._compat,
@@ -2868,6 +2998,10 @@ class OpenAIProvider:
                 ReasoningEnableArgs(
                     thinking_level=cfg.thinking_level,
                     thinking_budget_tokens=cfg.thinking_budget_tokens,
+                    model=self._model,
+                    thinking_budget_explicit=bool(
+                        cfg.thinking_budget_explicit
+                    ),
                 ),
             )
             if reasoning_format == "dashscope":
@@ -2880,9 +3014,12 @@ class OpenAIProvider:
                 elif not cfg.thinking_budget_explicit:
                     payload.pop("thinking_budget", None)
         elif (
-            self._compat.thinking_required_model_prefixes
-            and self._model.strip().lower().startswith(
+            _model_basename(self._model) in self._compat.force_thinking_model_ids
+            or (
                 self._compat.thinking_required_model_prefixes
+                and self._model.strip().lower().startswith(
+                    self._compat.thinking_required_model_prefixes
+                )
             )
         ):
             # Forced-thinking endpoints reject enable_thinking=False; omit the
@@ -2904,6 +3041,14 @@ class OpenAIProvider:
                     ),
                 ),
             )
+
+        _apply_compat_request_constraints(
+            payload,
+            policy=self._compat,
+            model=self._model,
+            cfg=cfg,
+            has_tools=bool(tools),
+        )
 
         if self._provider_kind == "dashscope":
             log.info(
@@ -2961,10 +3106,11 @@ class OpenAIProvider:
             return
 
         headers: dict[str, str] = {
-            "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
         }
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
         headers.update(provider_app_headers(self._base_url))
         headers.update(
             tokenrhythm_correlation_headers(
@@ -5274,7 +5420,11 @@ class OpenAIProvider:
         so callers that must distinguish a wrong key from an empty catalog
         (e.g. onboarding discovery) can classify it.
         """
-        headers = {"Authorization": f"Bearer {self._api_key}"}
+        headers = (
+            {"Authorization": f"Bearer {self._api_key}"}
+            if self._api_key
+            else {}
+        )
         headers.update(provider_app_headers(self._base_url))
         try:
             async with httpx.AsyncClient(
@@ -5285,6 +5435,17 @@ class OpenAIProvider:
                 resp = await client.get(self._api_url("/v1/models"), headers=headers)
                 resp.raise_for_status()
                 data = resp.json()
+                rows = data.get("data", [])
+                if self._compat.model_listing_excluded_ids:
+                    excluded_model_ids = {
+                        model_id.lower()
+                        for model_id in self._compat.model_listing_excluded_ids
+                    }
+                    rows = [
+                        row
+                        for row in rows
+                        if str(row.get("id", "")).lower() not in excluded_model_ids
+                    ]
                 return [
                     ModelInfo(
                         provider=self._provider_kind,
@@ -5294,7 +5455,7 @@ class OpenAIProvider:
                         max_output_tokens=(m.get("top_provider") or {}).get("max_completion_tokens")
                         or 0,
                     )
-                    for m in data.get("data", [])
+                    for m in rows
                 ]
         except httpx.HTTPError as exc:
             if raise_on_error:

@@ -548,6 +548,131 @@ supports_tools = true
 supports_vision = false
 reasoning_format = "none"
 
+# qwen_token_plan: exact subscription allowlist shared by the OpenAI and
+# Anthropic protocol profiles. The Anthropic profile resolves through this
+# table via model_catalog's corrections alias. Costs stay unset because
+# Credits are subscription quota, not per-token USD billing.
+
+[qwen_token_plan."qwen3.8-max-preview"]
+context_window = 983616
+max_output_tokens = 131072
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "qwen_token_plan_qwen"
+
+[qwen_token_plan."qwen3.7-max"]
+context_window = 1000000
+max_output_tokens = 65536
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "qwen_token_plan_qwen"
+
+[qwen_token_plan."qwen3.7-plus"]
+context_window = 1000000
+max_output_tokens = 65536
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "qwen_token_plan_qwen"
+
+[qwen_token_plan."qwen3.6-plus"]
+context_window = 1000000
+max_output_tokens = 65536
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "qwen_token_plan_qwen"
+
+[qwen_token_plan."qwen3.6-flash"]
+context_window = 1000000
+max_output_tokens = 65536
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "qwen_token_plan_qwen"
+
+[qwen_token_plan."deepseek-v4-pro"]
+context_window = 1000000
+max_output_tokens = 393216
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "qwen_token_plan_deepseek"
+
+[qwen_token_plan."deepseek-v4-flash"]
+context_window = 1000000
+max_output_tokens = 393216
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "qwen_token_plan_deepseek"
+
+[qwen_token_plan."deepseek-v3.2"]
+context_window = 131072
+max_output_tokens = 65536
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "qwen_token_plan"
+
+[qwen_token_plan."kimi-k2.7-code"]
+context_window = 262144
+max_output_tokens = 16384
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "qwen_token_plan_kimi"
+
+[qwen_token_plan."kimi-k2.6"]
+context_window = 262144
+max_output_tokens = 98304
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "qwen_token_plan_kimi"
+
+[qwen_token_plan."kimi-k2.5"]
+context_window = 262144
+max_output_tokens = 32768
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "qwen_token_plan_kimi"
+
+[qwen_token_plan."glm-5.2"]
+context_window = 1000000
+max_output_tokens = 131072
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "qwen_token_plan_glm"
+
+[qwen_token_plan."glm-5.1"]
+context_window = 202752
+max_output_tokens = 131072
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "qwen_token_plan_glm"
+
+[qwen_token_plan."glm-5"]
+context_window = 202752
+max_output_tokens = 16384
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "qwen_token_plan_glm"
+
+[qwen_token_plan."minimax-m2.5"]
+context_window = 196608
+max_output_tokens = 32768
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "qwen_token_plan"
+
 # tokenrhythm (TokenRhythm aggregator, tokenrhythm.studio): not on
 # models.dev, so these rows are the offline metadata for its catalog —
 # the fallback beneath the boot-time live ingest of the platform's public

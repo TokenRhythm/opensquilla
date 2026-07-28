@@ -12,7 +12,12 @@ from opensquilla.provider.image_generation import (
     ImageGenerationRequest,
     ImageGenerationResult,
     OpenRouterImageGenerationProvider,
+    QwenTokenPlanImageGenerationProvider,
     get_image_generation_provider,
+)
+from opensquilla.provider.qwen_token_plan import (
+    QWEN_TOKEN_PLAN_IMAGE_BASE_URL,
+    QWEN_TOKEN_PLAN_OPENAI_BASE_URL,
 )
 
 
@@ -101,6 +106,189 @@ async def test_openrouter_image_provider_adds_app_attribution_headers(monkeypatc
         "X-Title": "OpenSquilla",
     }
     assert result.image_bytes == b"opensquilla"
+
+
+@pytest.mark.asyncio
+async def test_qwen_token_plan_image_provider_uses_native_contract(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    image_url = "https://generated.example.test/result.png?signature=secret"
+
+    class FakeResponse:
+        text = ""
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "output": {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": [{"type": "image", "image": image_url}]
+                            }
+                        }
+                    ]
+                },
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 2,
+                    "total_tokens": 14,
+                    "image_count": 1,
+                },
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def post(self, url, *, headers, json):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["json"] = json
+            return FakeResponse()
+
+    async def fake_download(url: str, *, timeout_seconds: float):
+        captured["download_url"] = url
+        captured["download_timeout"] = timeout_seconds
+        return "image/png", _test_png_bytes()
+
+    monkeypatch.setattr(
+        "opensquilla.provider.image_generation.httpx.AsyncClient",
+        lambda **kwargs: FakeClient(),
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.image_generation._download_qwen_token_plan_image",
+        fake_download,
+    )
+
+    provider = QwenTokenPlanImageGenerationProvider(api_key="synthetic-token-plan-key")
+    result = await provider.generate(
+        ImageGenerationRequest(
+            prompt="draw a friendly squid",
+            model="wan2.7-image-pro",
+            size="768x768",
+            timeout_seconds=12.0,
+        )
+    )
+
+    assert (
+        captured["url"]
+        == f"{QWEN_TOKEN_PLAN_IMAGE_BASE_URL}"
+        "/services/aigc/multimodal-generation/generation"
+    )
+    assert captured["headers"] == {
+        "Authorization": "Bearer synthetic-token-plan-key",
+        "Content-Type": "application/json",
+    }
+    assert captured["json"] == {
+        "model": "wan2.7-image-pro",
+        "input": {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"text": "draw a friendly squid"}],
+                }
+            ]
+        },
+        "parameters": {
+            "size": "768*768",
+            "n": 1,
+            "thinking_mode": False,
+        },
+    }
+    assert captured["download_url"] == image_url
+    assert captured["download_timeout"] == 12.0
+    assert result.provider == "qwen_token_plan"
+    assert result.model == "wan2.7-image-pro"
+    assert result.image_bytes == _test_png_bytes()
+
+
+@pytest.mark.asyncio
+async def test_qwen_token_plan_generated_url_rejection_redacts_signature() -> None:
+    from opensquilla.provider.image_generation import (
+        _download_qwen_token_plan_image,
+    )
+
+    signed_url = "https://127.0.0.1/generated.png?signature=must-not-leak"
+    with pytest.raises(RuntimeError) as exc_info:
+        await _download_qwen_token_plan_image(
+            signed_url,
+            timeout_seconds=1.0,
+        )
+
+    message = str(exc_info.value)
+    assert message == "Failed to securely download the generated Token Plan image"
+    assert "must-not-leak" not in message
+    assert exc_info.value.__cause__ is None
+
+
+@pytest.mark.asyncio
+async def test_qwen_token_plan_generated_image_download_is_bounded(monkeypatch) -> None:
+    from opensquilla.provider import image_generation
+    from opensquilla.tools import ssrf
+
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        status_code = 200
+        headers = {
+            "content-type": "image/png",
+            "content-length": str(20 * 1024 * 1024 + 1),
+        }
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        def raise_for_status(self) -> None:
+            return None
+
+        async def aiter_bytes(self):
+            yield _test_png_bytes()
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        def stream(self, method, url):
+            captured["method"] = method
+            captured["url"] = url
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        ssrf,
+        "validate_http_url_for_fetch",
+        lambda _url: ["203.0.113.10"],
+    )
+    monkeypatch.setattr(ssrf, "pinned_transport", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        image_generation.httpx,
+        "AsyncClient",
+        lambda **_kwargs: FakeClient(),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="Failed to securely download",
+    ):
+        await image_generation._download_qwen_token_plan_image(
+            "https://generated.example.test/result.png?signature=redacted",
+            timeout_seconds=1.0,
+        )
+
+    assert captured == {
+        "method": "GET",
+        "url": "https://generated.example.test/result.png?signature=redacted",
+    }
 
 
 @pytest.mark.asyncio
@@ -902,6 +1090,31 @@ def test_image_generation_llm_key_reused_on_same_endpoint_origin(monkeypatch) ->
     provider = get_image_generation_provider("openai")
     assert provider is not None
     assert provider._resolve_api_key() == "sk-real"
+
+
+def test_qwen_token_plan_image_provider_reuses_key_but_not_chat_path(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("QWEN_TOKEN_PLAN_API_KEY", raising=False)
+
+    from opensquilla.gateway.config import ImageGenerationConfig, LlmProviderConfig
+    from opensquilla.tools.builtin.media import configure_image_generation
+
+    llm_config = LlmProviderConfig(
+        provider="qwen_token_plan",
+        model="qwen3.7-plus",
+        api_key="synthetic-token-plan-key",
+        base_url=QWEN_TOKEN_PLAN_OPENAI_BASE_URL,
+    )
+
+    configure_image_generation(ImageGenerationConfig(enabled=True), llm_config=llm_config)
+    try:
+        provider = get_image_generation_provider("qwen_token_plan")
+        assert provider is not None
+        assert provider._base_url == QWEN_TOKEN_PLAN_IMAGE_BASE_URL
+        assert provider._resolve_api_key() == "synthetic-token-plan-key"
+    finally:
+        configure_image_generation(None)
 
 
 def test_vision_provider_uses_configured_router_image_tier(monkeypatch) -> None:

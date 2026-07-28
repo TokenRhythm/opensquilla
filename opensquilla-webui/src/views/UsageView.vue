@@ -530,8 +530,10 @@ async function refresh() {
   text-decoration: underline;
 }
 .usage-mono {
-  font-family: var(--font-mono);
-  font-variant-numeric: tabular-nums;
+  font-family: var(--font-sans);
+  font-variant-numeric: lining-nums tabular-nums;
+  font-feature-settings: "lnum" 1, "tnum" 1;
+  letter-spacing: -0.012em;
 }
 .usage-dim {
   color: var(--text-dim);

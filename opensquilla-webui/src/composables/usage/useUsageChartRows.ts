@@ -40,7 +40,9 @@ export function useUsageChartRows(options: {
   const chartRows = computed((): ChartRow[] => {
     const days = options.serverDays?.value
     if (days) {
-      const visibleDays = days.slice(-30)
+      const visibleDays = [...days]
+        .sort((a, b) => b.date.localeCompare(a.date))
+        .slice(0, 30)
       if (visibleDays.length === 0) return []
       let maxValue = Math.max(...visibleDays.map(day => (
         options.chartMode.value === 'cost'

@@ -1,5 +1,13 @@
 {
   "workspaces": {
+    "projects": "Projects",
+    "createProject": "Create project",
+    "projectNamePlaceholder": "Project name",
+    "sourceFolders": "Source folders",
+    "addSourceFolder": "Add a folder OpenSquilla can read and edit",
+    "creatingProject": "Creating…",
+    "projectCreated": "Created project “{name}”",
+    "createProjectFailed": "Could not create the project: {error}",
     "noTasks": "No tasks",
     "chooseProject": "Choose project",
     "webPickerScope": "These paths are on the Gateway host.",
@@ -30,6 +38,8 @@
     "unpin": "Unpin project",
     "deleteHistory": "Delete project task history",
     "removeProject": "Remove project",
+    "menuDeleteHistory": "Delete history",
+    "menuRemove": "Remove",
     "deleteHistoryTitle": "Delete project task history?",
     "deleteHistoryBody": "Permanently delete {count} tasks from {name}. Files in the project directory will not be deleted.",
     "deleteHistoryConfirm": "Delete history",
@@ -2902,6 +2912,7 @@
     "thinkingForSeconds": "Thinking · {seconds}s",
     "thoughtForSeconds": "Thought for {seconds}s",
     "thoughtForMinutes": "Thought for {minutes}m {seconds}s",
+    "activityTechnicalDetails": "Technical details",
     "toolResult": "Tool Result",
     "subagentPrefix": "Subagent: ",
     "subagentCompletion": "Subagent completion",
@@ -2973,6 +2984,8 @@
     "activityWorking": "Working",
     "workedForSeconds": "Worked for {seconds}s",
     "workedForMinutes": "Worked for {minutes}m {seconds}s",
+    "activityDurationSeconds": "{seconds}s",
+    "activityDurationMinutes": "{minutes}m {seconds}s",
     "activity": {
       "lifecycle": {
         "working": "Working",
@@ -3242,6 +3255,8 @@
     },
     "chips": {
       "whatCanYouDo": "What can you do?",
+      "buildGame": "Build me a game",
+      "buildGamePrompt": "Build a playable browser-based voxel racing game prototype with responsive controls, acceleration and braking, a readable track, collision detection, checkpoints, lap timing, and a restart flow. Generate the voxel-style race car and scenery in code without paid assets. Run the game, test the controls, fix blocking issues, and then deliver it. Make the scenery more beautiful and the world open. Include OpenSquilla and TokenRhythm signage on the map as sponsor Easter eggs.",
       "summarizeWebpage": "Summarize a webpage for me",
       "planWeek": "Draft a plan for my week",
       "searchAiNews": "Search today's AI news",
@@ -3313,6 +3328,7 @@
     },
     "msgMeta": {
       "ensembleModels": "Ensemble · {count} models",
+      "model": "model",
       "tokens": "tokens",
       "cache": "cache",
       "think": "think",

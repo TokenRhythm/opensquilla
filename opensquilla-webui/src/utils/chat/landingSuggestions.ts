@@ -4,7 +4,7 @@ interface LandingSuggestionState {
   attachmentCount: number
 }
 
-export function shouldSuppressLandingSuggestions({
+export function shouldDisableLandingSuggestions({
   landingPrefilled,
   composerText,
   attachmentCount,

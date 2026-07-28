@@ -158,7 +158,27 @@ describe('AssistantActivityTimeline', () => {
     ])
 
     expect(root.querySelectorAll('.step-card')).toHaveLength(2)
+    expect(root.querySelector('.assistant-activity-tool-batch')).toBeNull()
     expect(root.textContent).toContain('Checking the first change.')
+  })
+
+  it('folds consecutive tool purposes into a readable batch before call details', async () => {
+    const root = await mountTimeline([
+      group(toolCall('read-one', 'read_file')),
+      group(toolCall('run-one', 'execute_code')),
+    ])
+
+    const batch = root.querySelector<HTMLDetailsElement>('.assistant-activity-tool-batch')
+    expect(batch).not.toBeNull()
+    expect(batch?.open).toBe(false)
+    expect(batch?.querySelector('.assistant-activity-tool-batch__summary')?.textContent)
+      .toContain('Inspected files')
+    expect(batch?.querySelector('.assistant-activity-tool-batch__summary')?.textContent)
+      .toContain('Ran commands')
+    expect(batch?.querySelectorAll('.tool-row')).toHaveLength(2)
+
+    batch?.querySelector<HTMLElement>('summary')?.click()
+    expect(batch?.open).toBe(true)
   })
 
   it('keeps lifecycle phases out of the live action body', async () => {

@@ -20,6 +20,15 @@ from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from typing import Literal
 
+from .qwen_token_plan import (
+    QWEN_TOKEN_PLAN_DEEPSEEK_V4_MODEL_IDS,
+    QWEN_TOKEN_PLAN_FORCE_THINKING_MODEL_IDS,
+    QWEN_TOKEN_PLAN_GLM_MODEL_IDS,
+    QWEN_TOKEN_PLAN_IMAGE_MODEL_IDS,
+    QWEN_TOKEN_PLAN_KIMI_MODEL_IDS,
+    QWEN_TOKEN_PLAN_PRESERVE_THINKING_MODEL_IDS,
+)
+
 TextToolDialect = Literal["qwen_tag", "minimax_xml", "plain_json"]
 
 TEXT_TOOL_DIALECT_QWEN_TAG: TextToolDialect = "qwen_tag"
@@ -161,6 +170,50 @@ class OpenAICompatPolicy:
     # openai.py, covering all five agent-loop disable sites at once.
     thinking_required_model_prefixes: tuple[str, ...] = ()
 
+    # Exact forced-thinking ids for multi-family endpoints where a prefix
+    # would be too broad. These models receive enable_thinking=True even
+    # when the local preference is off.
+    force_thinking_model_ids: frozenset[str] = frozenset()
+
+    # Models whose reasoning history can be replayed and whose request must
+    # opt into that continuity with preserve_thinking=True.
+    preserve_thinking_model_ids: frozenset[str] = frozenset()
+
+    # Reasoning models that require an assistant reasoning_content key only
+    # while thinking is enabled. The tool-call set is narrower: some models
+    # require the key only on assistant tool-call turns.
+    require_reasoning_content_when_thinking_model_ids: frozenset[str] = frozenset()
+    require_tool_call_reasoning_content_when_thinking_model_ids: frozenset[str] = (
+        frozenset()
+    )
+
+    # Thinking-mode tool choice accepts only auto/none on this endpoint.
+    thinking_tool_choice_auto_only: bool = False
+    # Models that are reasoning-only upstream even when the endpoint does not
+    # accept or emit an explicit enable_thinking toggle.  Their tool selector
+    # follows the same auto/none restriction as an explicitly enabled request.
+    implicit_thinking_tool_choice_model_ids: frozenset[str] = frozenset()
+    # When a non-forced model receives an explicit pinned tool selector,
+    # preserve the selector by disabling thinking instead of silently changing
+    # the selected function. Forced-thinking models still normalize to auto.
+    prefer_pinned_tool_choice_over_thinking: bool = False
+
+    # Models that require tool_stream=True whenever tools are present.
+    tool_stream_model_ids: frozenset[str] = frozenset()
+
+    # A thinking-only model may impose a minimum sampling temperature.
+    temperature_floor_model_ids: frozenset[str] = frozenset()
+    temperature_floor: float = 0.0
+
+    # Provider listings can mix non-chat products into the same /models
+    # response. Keep picker filtering declarative rather than branching in
+    # the generic OpenAI transport.
+    model_listing_excluded_ids: frozenset[str] = frozenset()
+
+    # Omit a framework-default thinking budget so the service can apply its
+    # own model default; an explicitly configured budget is still sent.
+    omit_implicit_thinking_budget: bool = False
+
     @property
     def text_tool_synthesis(self) -> bool:
         """Deprecated read-only compatibility view.
@@ -259,8 +312,38 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
         supports_explicit_prompt_cache=True,
         stream_timeout_fallback=True,
         thinking_required_model_prefixes=("qwen3.8-",),
+        thinking_tool_choice_auto_only=True,
+        implicit_thinking_tool_choice_model_ids=_DEEPSEEK_V4_MODEL_IDS,
     ),
     "bailian_coding": OpenAICompatPolicy(display_name="Bailian Coding"),
+    "qwen_token_plan": OpenAICompatPolicy(
+        display_name="Qwen Token Plan",
+        official_host="token-plan.cn-beijing.maas.aliyuncs.com",
+        text_tool_profile=TextToolCompatProfile(
+            model_rules=(
+                TextToolModelRule(
+                    model_patterns=("qwen*",),
+                    dialects=frozenset({TEXT_TOOL_DIALECT_QWEN_TAG}),
+                ),
+            ),
+        ),
+        stream_timeout_fallback=True,
+        force_thinking_model_ids=QWEN_TOKEN_PLAN_FORCE_THINKING_MODEL_IDS,
+        preserve_thinking_model_ids=QWEN_TOKEN_PLAN_PRESERVE_THINKING_MODEL_IDS,
+        require_reasoning_content_when_thinking_model_ids=(
+            QWEN_TOKEN_PLAN_DEEPSEEK_V4_MODEL_IDS
+        ),
+        require_tool_call_reasoning_content_when_thinking_model_ids=(
+            QWEN_TOKEN_PLAN_KIMI_MODEL_IDS
+        ),
+        thinking_tool_choice_auto_only=True,
+        prefer_pinned_tool_choice_over_thinking=True,
+        tool_stream_model_ids=QWEN_TOKEN_PLAN_GLM_MODEL_IDS,
+        temperature_floor_model_ids=frozenset({"qwen3.8-max-preview"}),
+        temperature_floor=0.6,
+        model_listing_excluded_ids=frozenset(QWEN_TOKEN_PLAN_IMAGE_MODEL_IDS),
+        omit_implicit_thinking_budget=True,
+    ),
     "moonshot": OpenAICompatPolicy(
         display_name="Moonshot",
         fixed_sampling_model_prefixes=("kimi-k2.5", "kimi-k2.6", "kimi-k2.7"),

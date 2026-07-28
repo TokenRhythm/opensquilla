@@ -1390,12 +1390,21 @@ class ImageGenerationOpenRouterProviderConfig(BaseModel):
     api_key_env: str = "OPENROUTER_API_KEY"
 
 
+class ImageGenerationQwenTokenPlanProviderConfig(BaseModel):
+    base_url: str = "https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1"
+    api_key: str = ""
+    api_key_env: str = "QWEN_TOKEN_PLAN_API_KEY"
+
+
 class ImageGenerationProvidersConfig(BaseModel):
     openai: ImageGenerationOpenAIProviderConfig = Field(
         default_factory=ImageGenerationOpenAIProviderConfig
     )
     openrouter: ImageGenerationOpenRouterProviderConfig = Field(
         default_factory=ImageGenerationOpenRouterProviderConfig
+    )
+    qwen_token_plan: ImageGenerationQwenTokenPlanProviderConfig = Field(
+        default_factory=ImageGenerationQwenTokenPlanProviderConfig
     )
 
 

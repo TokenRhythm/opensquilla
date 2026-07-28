@@ -159,6 +159,13 @@ base_url = "https://tokenrhythm.studio/v1"
 # # api_key is optional: set env CUSTOM_LLM_API_KEY (or api_key here) only if
 # # your endpoint enforces one. Declare the endpoint's real context window via
 # # [models.custom."qwen3-32b-awq"] — see the per-model overrides section below.
+#
+# Example custom Anthropic Messages endpoint:
+# provider = "custom_anthropic"
+# base_url = "https://llm.example.com/anthropic"
+# model = "vendor-model"
+# # api_key is optional; env CUSTOM_ANTHROPIC_API_KEY also works. The adapter
+# # appends /v1/messages and uses Authorization: Bearer when a key is present.
 
 # Pin each model to its native upstream provider on OpenRouter.
 # Sends provider.only=[slug] + allow_fallbacks=true per request.
@@ -284,17 +291,25 @@ all_failed_policy = "fallback_single"
 # max_output_tokens = 8192
 # supports_tools = true
 #
-# The generic `custom` provider (any self-hosted OpenAI-compatible endpoint;
-# see the [llm] example above) uses the same override table, keyed by its
-# served model id:
+# The generic `custom` and `custom_anthropic` providers use the same override
+# table shape, keyed by the served model id. Unknown custom models retain the
+# conservative 8k fallback for upgrade compatibility; both remote gateways
+# and local servers should declare their actual window:
 # [models.custom."qwen3-32b-awq"]
+# context_window = 131072
+# max_output_tokens = 8192
+# supports_tools = true
+#
+# [models.custom_anthropic."vendor-model"]
 # context_window = 131072
 # max_output_tokens = 8192
 # supports_tools = true
 #
 # [models.openrouter."z-ai/glm-5.2"]
 # # reasoning_format: openrouter | openai | deepseek | gemini | zai |
-# #                   dashscope | moonshot | volcengine | none
+# #                   dashscope | moonshot | volcengine | qwen_token_plan |
+# #                   qwen_token_plan_qwen | qwen_token_plan_deepseek |
+# #                   qwen_token_plan_glm | qwen_token_plan_kimi | none
 # reasoning_format = "openrouter"
 # supports_reasoning = true
 # input_cost_per_mtok = 0.5        # USD per million input tokens (example value)
@@ -444,6 +459,20 @@ image_only = true
 #
 # [squilla_router]
 # tier_profile = "dashscope"
+
+# Example: Qwen Token Plan native image generation. This uses the same
+# QWEN_TOKEN_PLAN_API_KEY as the qwen_token_plan LLM provider, but a distinct
+# official API path.
+#
+# [image_generation]
+# enabled = true
+# primary = "qwen_token_plan/wan2.7-image"
+# size = "768x768"
+# output_format = "png"
+#
+# [image_generation.providers.qwen_token_plan]
+# api_key_env = "QWEN_TOKEN_PLAN_API_KEY"
+# base_url = "https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Tool policy

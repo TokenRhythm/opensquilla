@@ -34,7 +34,12 @@ function part(text: string, seconds: number): ReasoningChatPart {
   return { type: 'reasoning', key: `reasoning:${seconds}`, text, seconds }
 }
 
-function mount(props: { part: ReasoningChatPart; embedded?: boolean; live?: boolean }) {
+function mount(props: {
+  part: ReasoningChatPart
+  embedded?: boolean
+  live?: boolean
+  nested?: boolean
+}) {
   const host = document.createElement('div')
   document.body.appendChild(host)
   const app = createApp({ render: () => h(ReasoningPart, props) })
@@ -92,6 +97,13 @@ describe('ReasoningPart nested-in-activity variant', () => {
   it('marks the live fold as in-activity so the doubled left rule is dropped', () => {
     const host = mount({ part: part('t', 4), live: true })
     expect(host.querySelector('details.thinking-fold--in-activity')).not.toBeNull()
+  })
+
+  it('marks a settled nested fold without using live wording', () => {
+    const host = mount({ part: part('t', 4), nested: true })
+    expect(host.querySelector('details.thinking-fold--in-activity')).not.toBeNull()
+    expect(host.querySelector('.thinking-fold__summary')?.textContent)
+      .toContain('Thought for 4s')
   })
 
   it('keeps the standalone compat fold free of the in-activity modifier', () => {

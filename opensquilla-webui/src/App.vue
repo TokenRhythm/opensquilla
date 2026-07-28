@@ -82,16 +82,18 @@
       :sections="sidebarSections"
       :error="sessionListError"
       :loading="isLoading"
-      :current-key="currentSessionKey"
+      :current-key="sidebarCurrentKey"
       :contract-debug-enabled="contractDebugEnabled"
       :search-hint="commandPaletteHint"
       :can-manage-projects="rpcStore.canManageProjectWorkspaces"
+      :can-create-projects="rpcStore.canChooseProject"
       @select="switchToSession"
       @refresh="loadSidebarData"
       @rename="onRenameSession"
       @delete="onDeleteSession"
       @bulk-delete="onBulkDeleteSessions"
       @new-chat="startNewChatInstant"
+      @new-project="openProjectCreator"
       @new-project-task="startProjectTask"
       @project-pin="onProjectPin"
       @project-edit="openProjectEditor"
@@ -352,6 +354,29 @@
 
   <ConfirmModal />
 
+  <ProjectWorkspaceCreateDialog
+    v-if="rpcStore.canChooseProject"
+    :open="projectCreateOpen && !projectCreateConfirming && !projectSourcePickerOpen"
+    :name="projectCreateName"
+    :source-path="projectCreateSourcePath"
+    :busy="projectCreateBusy"
+    :source-picking="projectCreateSourcePicking"
+    @update:name="projectCreateName = $event"
+    @choose-source="chooseProjectSourceDirectory"
+    @close="closeProjectCreator"
+    @create="createProjectWorkspace"
+  />
+
+  <ProjectWorkspacePickerDialog
+    v-if="rpcStore.canChooseProject"
+    :open="projectCreateOpen && projectSourcePickerOpen"
+    :enabled="rpcStore.canChooseProject"
+    :session-key="currentSessionKey || 'agent:main:webchat:workspace-picker'"
+    :initial-path="projectCreateSourcePath"
+    @close="projectSourcePickerOpen = false"
+    @choose="onProjectSourcePathChosen"
+  />
+
   <ProjectWorkspaceEditDialog
     v-if="rpcStore.canManageProjectWorkspaces"
     :open="Boolean(editingProject)"
@@ -388,7 +413,9 @@ import Icon from './components/Icon.vue'
 import ErrorBoundary from './components/ErrorBoundary.vue'
 import ToastHost from './components/ToastHost.vue'
 import ConfirmModal from './components/ConfirmModal.vue'
+import ProjectWorkspaceCreateDialog from './components/ProjectWorkspaceCreateDialog.vue'
 import ProjectWorkspaceEditDialog from './components/ProjectWorkspaceEditDialog.vue'
+import ProjectWorkspacePickerDialog from './components/ProjectWorkspacePickerDialog.vue'
 import UpdateBanner from './components/UpdateBanner.vue'
 import DesktopUpdateIndicator from './components/DesktopUpdateIndicator.vue'
 import SidebarConversations from './components/SidebarConversations.vue'
@@ -485,6 +512,13 @@ const { pushToast } = useToasts()
 const { confirm } = useConfirm()
 const projectWorkspaces = useProjectWorkspaces()
 const freshTaskDraft = useFreshTaskDraft()
+const projectCreateOpen = ref(false)
+const projectCreateName = ref('')
+const projectCreateSourcePath = ref('')
+const projectCreateBusy = ref(false)
+const projectCreateSourcePicking = ref(false)
+const projectCreateConfirming = ref(false)
+const projectSourcePickerOpen = ref(false)
 const editingProjectId = ref('')
 const editingProject = computed(() =>
   editingProjectId.value
@@ -498,6 +532,13 @@ watch(
       void projectWorkspaces.loadWorkspaces().catch(() => undefined)
       return
     }
+    projectCreateOpen.value = false
+    projectCreateName.value = ''
+    projectCreateSourcePath.value = ''
+    projectCreateBusy.value = false
+    projectCreateSourcePicking.value = false
+    projectCreateConfirming.value = false
+    projectSourcePickerOpen.value = false
     editingProjectId.value = ''
   },
 )
@@ -594,6 +635,19 @@ const currentSessionKey = computed(() => {
 
 // Chat layout applies to both the session view and the draft route.
 const isChatRoute = computed(() => $route.path === '/chat' || $route.path === '/chat/new')
+const activeProjectDraftId = computed(() =>
+  $route.path === '/chat/new' ? String($route.query.project || '') : '',
+)
+const activeProjectDraftKey = computed(() => {
+  const workspaceId = activeProjectDraftId.value
+  if (!workspaceId) return ''
+  const request = freshTaskDraft.request.value
+  const requestId = request?.workspaceId === workspaceId ? request.id : 0
+  return `draft:project:${workspaceId}:${requestId}`
+})
+const sidebarCurrentKey = computed(() =>
+  currentSessionKey.value || activeProjectDraftKey.value,
+)
 
 watch(
   [
@@ -674,12 +728,22 @@ function syntheticChatSession(
   effectiveAgentId: string,
   title: string,
   updatedAt: number,
+  project?: {
+    id: string
+    name: string
+    path: string
+    provisional?: boolean
+  },
 ): SessionItem {
   return {
     key,
     title,
     subtitle: '',
     groupLabel: normalizeAgentId(effectiveAgentId),
+    workspace: project?.path,
+    workspaceId: project?.id,
+    workspaceLabel: project?.name,
+    workspaceDisplayPath: project?.path,
     effectiveAgentId,
     sessionKind: 'chat',
     surface: 'webchat',
@@ -693,9 +757,28 @@ function syntheticChatSession(
     messageCount: null,
     updatedAt,
     interactive: true,
+    provisional: project?.provisional,
     forkedFromParent: false,
     contractGaps: [],
     raw: { key },
+  }
+}
+
+function optimisticProjectForSession(key: string) {
+  const workspaceId = freshTaskDraft.materializedWorkspaceBySession.value[key]
+  return workspaceId ? projectWorkspaces.byId.value.get(workspaceId) || null : null
+}
+
+function withOptimisticProjectBinding(item: SessionItem): SessionItem {
+  if (item.workspaceId) return item
+  const project = optimisticProjectForSession(item.key)
+  if (!project) return item
+  return {
+    ...item,
+    workspace: project.path,
+    workspaceId: project.id,
+    workspaceLabel: project.name,
+    workspaceDisplayPath: project.path,
   }
 }
 
@@ -708,19 +791,60 @@ const sidebarSessionItems = computed((): SessionItem[] => {
   for (const item of allSessions.value) {
     if (!item.key || item.key === 'unknown') continue
     seen.add(item.key)
-    items.push(item)
+    items.push(withOptimisticProjectBinding(item))
   }
   for (const [key, local] of Object.entries(localChatSessions.value)) {
     if (seen.has(key)) continue
     seen.add(key)
-    items.push(syntheticChatSession(key, local.effectiveAgentId, local.title || t('chrome.newChat'), local.updatedAt))
+    const project = optimisticProjectForSession(key) || undefined
+    items.push(syntheticChatSession(
+      key,
+      local.effectiveAgentId,
+      local.title || t('chrome.newChat'),
+      local.updatedAt,
+      project,
+    ))
+  }
+  const draftWorkspaceId = activeProjectDraftId.value
+  const draftKey = activeProjectDraftKey.value
+  const draftProject = draftWorkspaceId
+    ? projectWorkspaces.byId.value.get(draftWorkspaceId)
+    : null
+  if (draftKey && draftProject && !seen.has(draftKey)) {
+    seen.add(draftKey)
+    items.push(syntheticChatSession(
+      draftKey,
+      'main',
+      t('chrome.newTask'),
+      Date.now(),
+      {
+        id: draftProject.id,
+        name: draftProject.name,
+        path: draftProject.path,
+        provisional: true,
+      },
+    ))
   }
   const current = currentSessionKey.value
   if (current && !seen.has(current)) {
     const currentAgentId = normalizeAgentId(current.split(':')[1] || 'main')
-    items.push(syntheticChatSession(current, currentAgentId, t('shared.sidebar.currentTask'), Date.now()))
+    const project = optimisticProjectForSession(current) || undefined
+    items.push(syntheticChatSession(
+      current,
+      currentAgentId,
+      t('shared.sidebar.currentTask'),
+      Date.now(),
+      project,
+    ))
   }
   return items
+})
+
+watch(allSessions, sessions => {
+  for (const item of sessions) {
+    if (!item.key || !item.workspaceId) continue
+    freshTaskDraft.confirmMaterializedProjectTask(item.key, item.workspaceId)
+  }
 })
 
 // Collapsible family sections (Chats / Channels / Automations). Row titles and
@@ -882,6 +1006,118 @@ function startProjectTask(workspaceId: string) {
     path: '/chat/new',
     query: { agent: 'main', project: workspaceId },
   })
+}
+
+function projectNameFromPath(path: string): string {
+  const normalized = path.trim().replace(/[\\/]+$/, '')
+  return normalized.split(/[\\/]/).pop() || normalized
+}
+
+function resetProjectCreator() {
+  projectCreateOpen.value = false
+  projectCreateName.value = ''
+  projectCreateSourcePath.value = ''
+  projectCreateBusy.value = false
+  projectCreateSourcePicking.value = false
+  projectCreateConfirming.value = false
+  projectSourcePickerOpen.value = false
+}
+
+function openProjectCreator() {
+  if (!rpcStore.canChooseProject) return
+  projectCreateName.value = ''
+  projectCreateSourcePath.value = ''
+  projectCreateBusy.value = false
+  projectCreateSourcePicking.value = false
+  projectCreateConfirming.value = false
+  projectSourcePickerOpen.value = false
+  projectCreateOpen.value = true
+}
+
+function closeProjectCreator() {
+  if (projectCreateBusy.value) return
+  resetProjectCreator()
+}
+
+function onProjectPathChosen(path: string) {
+  if (!projectCreateOpen.value || !rpcStore.canChooseProject) return
+  projectCreateSourcePath.value = path
+  if (!projectCreateName.value.trim()) {
+    projectCreateName.value = projectNameFromPath(path)
+  }
+}
+
+function onProjectSourcePathChosen(path: string) {
+  projectSourcePickerOpen.value = false
+  onProjectPathChosen(path)
+}
+
+async function chooseProjectSourceDirectory() {
+  if (
+    !projectCreateOpen.value
+    || !rpcStore.canChooseProject
+    || projectCreateBusy.value
+    || projectCreateSourcePicking.value
+    || projectSourcePickerOpen.value
+  ) return
+
+  const nativePicker = getPlatform().files.chooseProjectDirectory
+  if (typeof nativePicker !== 'function') {
+    projectSourcePickerOpen.value = true
+    return
+  }
+
+  projectCreateSourcePicking.value = true
+  try {
+    const choice = await nativePicker()
+    const selected = String(choice?.path || '').trim()
+    if (selected) onProjectPathChosen(selected)
+  } catch (err) {
+    pushToast(t('workspaces.directoryPickerFailed', { error: errorMessage(err) }), {
+      tone: 'danger',
+    })
+  } finally {
+    projectCreateSourcePicking.value = false
+  }
+}
+
+async function createProjectWorkspace(payload: { name: string; path: string }) {
+  if (
+    !projectCreateOpen.value
+    || !rpcStore.canChooseProject
+    || projectCreateBusy.value
+    || projectCreateSourcePicking.value
+    || projectSourcePickerOpen.value
+  ) return
+  const name = payload.name.trim()
+  const path = payload.path.trim()
+  if (!name || !path) return
+  projectCreateConfirming.value = true
+  await nextTick()
+  const trusted = await confirm({
+    title: t('workspaces.trustTitle'),
+    body: t('workspaces.trustBody', { path }),
+    primaryLabel: t('workspaces.trustConfirm'),
+    primaryClass: 'btn--primary',
+  })
+  if (!trusted) {
+    projectCreateConfirming.value = false
+    return
+  }
+  projectCreateBusy.value = true
+  try {
+    const workspace = await projectWorkspaces.openWorkspace(path)
+    if (!workspace) throw new Error('Gateway returned an empty project.')
+    if (workspace.name !== name) {
+      await projectWorkspaces.renameWorkspace(workspace.id, name)
+    }
+    resetProjectCreator()
+    pushToast(t('workspaces.projectCreated', { name }), { tone: 'ok' })
+  } catch (err) {
+    projectCreateBusy.value = false
+    projectCreateConfirming.value = false
+    pushToast(t('workspaces.createProjectFailed', { error: errorMessage(err) }), { tone: 'danger' })
+  }
 }
 
 async function onProjectPin(payload: { workspaceId: string; pinned: boolean }) {

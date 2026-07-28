@@ -26,7 +26,7 @@ from typing import Any, cast
 import httpx
 import structlog
 
-from opensquilla.provider.app_attribution import is_provider_app_host
+from opensquilla.provider.app_attribution import is_host_or_subdomain
 from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
 from opensquilla.provider.protocol import LLMProvider
 from opensquilla.provider.registry import get_provider_spec
@@ -489,17 +489,37 @@ async def discover_selectable_provider_models(
     if (
         not uses_https
         or not spec.compat.official_host
-        or not is_provider_app_host(effective_base_url, spec.compat.official_host)
+        or not is_host_or_subdomain(effective_base_url, spec.compat.official_host)
     ):
         return ProviderModelsDiscoverResult(ok=True, provider_id=provider_id)
 
+    discovery_provider_id = (
+        spec.selectable_model_discovery_provider_id or provider_id
+    )
     discover_kwargs: dict[str, Any] = {
-        "provider_id": provider_id,
+        "provider_id": discovery_provider_id,
         "api_key": api_key,
         "api_key_env": api_key_env,
-        "base_url": base_url.strip(),
+        # A sibling discovery provider owns a different protocol path. Its
+        # registry default is the only trusted listing endpoint; never pass
+        # the configured chat base path across protocols.
+        "base_url": (
+            base_url.strip()
+            if discovery_provider_id == provider_id
+            else ""
+        ),
         "proxy": proxy,
     }
     if not allow_default_api_key_env:
         discover_kwargs["allow_default_api_key_env"] = False
-    return await discover_provider_models(**discover_kwargs)
+    result = await discover_provider_models(**discover_kwargs)
+    if result.provider_id == provider_id:
+        return result
+    return ProviderModelsDiscoverResult(
+        ok=result.ok,
+        provider_id=provider_id,
+        failure_kind=result.failure_kind,
+        detail=result.detail,
+        source=result.source,
+        models=result.models,
+    )

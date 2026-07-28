@@ -92,6 +92,13 @@ _SYNTHESIZED_DEFAULTS: dict[str, Any] = {
     "supports_reasoning": False,
 }
 
+# Protocol variants that share one service-side model catalog. User and live
+# overrides remain keyed to the exact configured provider; only packaged
+# corrections use this alias.
+_CORRECTIONS_PROVIDER_ALIASES: dict[str, str] = {
+    "qwen_token_plan_anthropic": "qwen_token_plan",
+}
+
 
 def _normalize_corrections(payload: Mapping[str, Any]) -> dict[str, dict[str, dict[str, Any]]]:
     """Normalize a parsed catalog_overrides.toml payload.
@@ -160,6 +167,7 @@ def _provider_corrections_budget(provider_id: str, model_id: str) -> tuple[int, 
     consulted for budgets.
     """
     provider_l = (provider_id or "").strip().lower()
+    provider_l = _CORRECTIONS_PROVIDER_ALIASES.get(provider_l, provider_l)
     model_l = (model_id or "").strip().lower()
     if not provider_l or not model_l:
         return None
@@ -264,7 +272,9 @@ def _corrections_layer_fields(provider_id: str, model_id: str) -> dict[str, Any]
     """
     if not provider_id:
         return {}
-    table = _corrections_tables().get(provider_id)
+    provider_l = provider_id.strip().lower()
+    provider_l = _CORRECTIONS_PROVIDER_ALIASES.get(provider_l, provider_l)
+    table = _corrections_tables().get(provider_l)
     if not table:
         return {}
     model_l = model_id.strip().lower()

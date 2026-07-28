@@ -140,7 +140,7 @@ describe('ActivityDisclosure resting affordance', () => {
 })
 
 describe('ActivityDisclosure summary label', () => {
-  it('prefers a supplied summaryLabel and composes it with the failure chip', async () => {
+  it('prefers a supplied summaryLabel without surfacing failure metadata', async () => {
     const host = mountDisclosure({
       lifecycle: 'settled',
       stepCount: 9,
@@ -152,11 +152,11 @@ describe('ActivityDisclosure summary label', () => {
 
     expect(host.querySelector('.assistant-activity__label')?.textContent?.trim())
       .toBe('Searched the web, edited 2 files')
-    expect(host.querySelector('.assistant-activity__failure')?.textContent?.trim())
-      .toBe('2 failed')
+    expect(host.querySelector('.assistant-activity__failure')).toBeNull()
+    expect(host.textContent).not.toContain('2 failed')
   })
 
-  it('separates the label and failure chip with real text, not CSS content', async () => {
+  it('keeps recovered failures out of both summary and detail', async () => {
     const host = mountDisclosure({
       lifecycle: 'settled',
       stepCount: 3,
@@ -167,12 +167,13 @@ describe('ActivityDisclosure summary label', () => {
     await nextTick()
 
     // The button's textContent is reused verbatim as the share-export label
-    // and the accessible name, so the separator must live in the DOM.
+    // and the accessible name, so recovered failures move into the detail row.
     const button = host.querySelector<HTMLButtonElement>('.assistant-activity__summary')
     expect(button?.textContent?.replace(/\s+/g, ' ').trim())
-      .toBe('Worked for 12s · 1 failure recovered')
-    expect(activityDisclosureSource).not.toContain('.assistant-activity__failure::before')
-    expect(activityDisclosureSource).not.toContain('.assistant-activity__live-failure::before')
+      .toBe('Worked for 12s')
+    expect(host.querySelector('.assistant-activity__detail')).toBeNull()
+    expect(host.textContent).not.toContain('failure')
+    expect(host.textContent).not.toContain('failed')
   })
 
   it('keeps the duration/count fallback chain when summaryLabel is empty', async () => {
@@ -203,7 +204,30 @@ describe('ActivityDisclosure summary label', () => {
 })
 
 describe('ActivityDisclosure live header', () => {
-  it('renders step and failure counts during a live turn', async () => {
+  it('starts live work collapsed and expands from its status row', async () => {
+    const host = mountDisclosure({
+      lifecycle: 'working',
+      stepCount: 2,
+      failureCount: 0,
+    })
+    await nextTick()
+
+    const summary = host.querySelector<HTMLButtonElement>('.assistant-activity__live-head')
+    const body = host.querySelector<HTMLElement>('.assistant-activity__body')
+    expect(summary?.getAttribute('aria-expanded')).toBe('false')
+    expect(body?.getAttribute('aria-hidden')).toBe('true')
+    expect(body?.classList.contains('is-open')).toBe(false)
+    expect(host.querySelector('.assistant-activity')?.getAttribute('data-share-expanded')).toBe('false')
+
+    summary?.click()
+    await nextTick()
+
+    expect(summary?.getAttribute('aria-expanded')).toBe('true')
+    expect(body?.getAttribute('aria-hidden')).toBe('false')
+    expect(body?.classList.contains('is-open')).toBe(true)
+  })
+
+  it('renders live step count without surfacing failures', async () => {
     const host = mountDisclosure({
       lifecycle: 'working',
       stepCount: 4,
@@ -213,25 +237,16 @@ describe('ActivityDisclosure live header', () => {
     await nextTick()
 
     const step = host.querySelector('.assistant-activity__live-step')
-    const failure = host.querySelector('.assistant-activity__live-failure')
     const elapsed = host.querySelector('.assistant-activity__live-elapsed')
 
     expect(step?.textContent?.trim()).toBe('step 4')
-    expect(failure?.textContent?.trim()).toBe('3 failed')
-
-    // The failure count is real information — it must stay readable, while
-    // the per-second elapsed label stays hidden from screen readers.
-    expect(failure?.getAttribute('aria-hidden')).toBeNull()
     expect(step?.getAttribute('aria-hidden')).toBeNull()
     expect(elapsed?.getAttribute('aria-hidden')).toBe('true')
-
-    const failureRule = cssRule('.assistant-activity__live-failure')
-    expect(failureRule).toContain('color: var(--warn);')
-    expect(failureRule).toContain('flex: 0 0 auto;')
-    expect(failureRule).toContain('font-size: 0.75rem;')
+    expect(host.querySelector('.assistant-activity__live-failure')).toBeNull()
+    expect(host.textContent).not.toContain('3 failed')
   })
 
-  it('shows no step or failure text when their counts are zero', async () => {
+  it('shows no step or failure text when the step count is zero', async () => {
     const host = mountDisclosure({
       lifecycle: 'working',
       stepCount: 0,
@@ -242,42 +257,7 @@ describe('ActivityDisclosure live header', () => {
 
     expect(host.querySelector('.assistant-activity__live-step')).toBeNull()
     expect(host.querySelector('.assistant-activity__sep')).toBeNull()
-    // The failure region stays mounted (it is a live region) but must stay
-    // visually and textually empty at zero.
-    const failure = host.querySelector('.assistant-activity__live-failure')
-    expect(failure).not.toBeNull()
-    expect(failure?.textContent?.trim()).toBe('')
-  })
-
-  it('announces failure count changes through an always-mounted polite region', async () => {
-    const state = reactive({ failureCount: 0 })
-    const host = document.createElement('div')
-    document.body.appendChild(host)
-    const app = createApp({
-      render: () => h(ActivityDisclosure, {
-        lifecycle: 'working',
-        stepCount: 2,
-        failureCount: state.failureCount,
-      }, { default: () => 'Activity details' }),
-    })
-    mountedApps.push(app)
-    app.use(i18n)
-    app.mount(host)
-    await nextTick()
-
-    const region = host.querySelector('.assistant-activity__live-failure')
-    expect(region?.getAttribute('role')).toBe('status')
-    expect(region?.getAttribute('aria-live')).toBe('polite')
-    expect(region?.getAttribute('aria-atomic')).toBe('true')
-    expect(region?.textContent?.trim()).toBe('')
-
-    state.failureCount = 2
-    await nextTick()
-
-    // The same element must gain the text — a live region only announces
-    // content changes inside a node that was already in the tree.
-    expect(host.querySelector('.assistant-activity__live-failure')).toBe(region)
-    expect(region?.textContent?.trim()).toBe('2 failed')
+    expect(host.querySelector('.assistant-activity__live-failure')).toBeNull()
   })
 })
 
@@ -339,10 +319,21 @@ describe('ActivityDisclosure stale state', () => {
 })
 
 describe('ActivityDisclosure expanded boundary', () => {
-  it('contains the fold body with a 1px left rule and closes it with a separator', () => {
+  it('reveals its height progressively and closes it with a separator', () => {
     const bodyRule = cssRule('.assistant-activity__body')
-    expect(bodyRule).toContain('border-left: 1px solid var(--border);')
-    expect(bodyRule).toContain('padding: 0 0 0 0.75rem;')
+    expect(bodyRule).toContain('grid-template-rows: 0fr;')
+    expect(bodyRule).toContain('grid-template-rows var(--dur-base)')
+    expect(bodyRule).toContain('opacity: 0;')
+
+    const openRule = cssRule('.assistant-activity__body.is-open')
+    expect(openRule).toContain('grid-template-rows: 1fr;')
+    expect(openRule).toContain('opacity: 1;')
+
+    const innerRule = cssRule('.assistant-activity__body-inner')
+    expect(innerRule).toContain('overflow: hidden;')
+    expect(innerRule).toContain('border-left: 1px solid var(--border);')
+    expect(innerRule).toContain('padding: 0 0 0 0.75rem;')
+    expect(activityDisclosureSource).toContain('assistant-activity-item-enter')
 
     const separatorRule = cssRule(
       '.assistant-activity--settled[data-share-expanded="true"]::after',
@@ -352,12 +343,13 @@ describe('ActivityDisclosure expanded boundary', () => {
   })
 })
 
-describe('ActivityDisclosure failure tone', () => {
-  it('reserves danger for terminal turn failure summaries', () => {
-    expect(cssRule('.assistant-activity__failure'))
-      .toContain('color: var(--text-muted);')
-    expect(cssRule('.assistant-activity--failed .assistant-activity__failure'))
-      .toContain('color: var(--danger);')
+describe('ActivityDisclosure failure visibility', () => {
+  it('contains no failure label or failure-specific styling', () => {
+    expect(activityDisclosureSource).not.toContain('resolvedFailureLabel')
+    expect(activityDisclosureSource).not.toContain('showDetailFailure')
+    expect(activityDisclosureSource).not.toContain('showSummaryFailure')
+    expect(activityDisclosureSource).not.toContain('assistant-activity__failure')
+    expect(activityDisclosureSource).not.toContain('assistant-activity__live-failure')
   })
 })
 

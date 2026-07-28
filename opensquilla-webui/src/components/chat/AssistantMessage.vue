@@ -40,22 +40,28 @@
           v-if="hasActivity"
           :lifecycle="activityLifecycle"
           :step-count="activityStepCount"
-          :failure-count="activityProjection.failureCount"
+          :failure-count="0"
           :duration-seconds="activityDurationSeconds"
           :summary-label="activitySummaryLabel"
+          :detail-label="activityDetailLabel"
           :completion-confirmed="activityCompletionConfirmed"
           :default-open="activityDefaultOpen"
           :state-key="activityStateKey"
           :continuity-key="activityContinuityKey"
         >
-          <ReasoningPart v-if="reasoningPart" :part="reasoningPart" embedded />
+          <ReasoningPart
+            v-if="reasoningPart"
+            :part="reasoningPart"
+            :live="activityLifecycle === 'working' || activityLifecycle === 'answering'"
+            nested
+          />
           <AssistantActivityTimeline
             v-if="
-              activityProjection.activityItems.length
+              visibleActivityItems.length
               || activityProjection.statusSteps.length
             "
-            :projection="activityProjection"
-            :timeline-items="activityProjection.activityItems"
+            :projection="visibleActivityProjection"
+            :timeline-items="visibleActivityItems"
             :state-scope="toolStateScope"
             :is-tool-group-open="isToolGroupOpen"
             :is-tool-item-open="isToolItemOpen"
@@ -93,7 +99,7 @@
       <template v-else>
         <ReasoningPart v-if="reasoningPart" :part="reasoningPart" />
         <ToolCallTimeline
-          :items="message.timelineItems ?? []"
+          :items="visibleLegacyTimelineItems"
           :state-scope="toolStateScope"
           :is-tool-group-open="isToolGroupOpen"
           :is-tool-item-open="isToolItemOpen"
@@ -151,10 +157,6 @@
           {{ t('chat.provenance.scheduled') }}
         </span>
         <div v-if="message.meta" class="msg-ai-meta">
-          <span v-if="message.meta.model && !message.meta.ensemble" class="msg-meta__model">{{ message.meta.modelShort }}</span>
-          <span v-if="message.meta.costUsd && !message.meta.ensemble" class="msg-meta__cost">${{ message.meta.costUsd.toFixed(6).replace(/\.?0+$/, '') }}</span>
-          <span v-if="message.meta.ensemble" class="msg-meta__ensemble">{{ t('chat.msgMeta.ensembleModels', { count: message.meta.ensemble.modelCount }) }}</span>
-          <span v-if="message.meta.hasSaved && !message.meta.ensemble" class="savings-indicator">{{ message.meta.savedLabel }}</span>
           <span
             v-if="hasMetaDetails"
             ref="metaMoreRef"
@@ -182,6 +184,14 @@
               role="group"
               :aria-label="t('chat.usageDetails')"
             >
+              <div v-if="message.meta.model && !message.meta.ensemble" class="msg-meta-popover__row">
+                <span class="msg-meta-popover__label">{{ t('chat.msgMeta.model') }}</span>
+                <span class="msg-meta-popover__value">{{ message.meta.modelShort }}</span>
+              </div>
+              <div v-if="message.meta.costUsd && !message.meta.ensemble" class="msg-meta-popover__row">
+                <span class="msg-meta-popover__label">{{ t('chat.msgMeta.cost') }}</span>
+                <span class="msg-meta-popover__value">{{ fmtUsd(message.meta.costUsd) }}</span>
+              </div>
               <div v-if="message.meta.hasTokens" class="msg-meta-popover__row">
                 <span class="msg-meta-popover__label">{{ t('chat.msgMeta.tokens') }}</span>
                 <span class="msg-meta-popover__value">&#8593;{{ fmtTok(message.meta.input) }} &#8595;{{ fmtTok(message.meta.output) }}</span>
@@ -278,8 +288,8 @@
           </button>
           <time v-if="timeIso" class="msg-time" :datetime="timeIso" :title="timeFull">
             <span class="msg-time__abs">{{ timeAbs }}</span>
-            <span class="msg-time__dot" aria-hidden="true">·</span>
-            <span class="msg-time__rel">{{ timeRel }}</span>
+            <span v-if="timeRel" class="msg-time__dot" aria-hidden="true">·</span>
+            <span v-if="timeRel" class="msg-time__rel">{{ timeRel }}</span>
           </time>
         </div>
       </div>
@@ -513,7 +523,14 @@ const showDoneBlock = computed(() =>
 const hasMetaDetails = computed(() => {
   const meta = props.message.meta
   if (!meta) return false
-  return meta.hasTokens || meta.cachedTokens > 0 || meta.reasoningTokens > 0 || !!meta.ensemble
+  return !!(
+    meta.model
+    || meta.costUsd
+    || meta.hasTokens
+    || meta.cachedTokens > 0
+    || meta.reasoningTokens > 0
+    || meta.ensemble
+  )
 })
 
 const ensembleSummary = computed(() => {
@@ -593,8 +610,9 @@ const activityLifecycle = computed<AssistantActivityLifecycle>(() => {
         item.type === 'tool-group'
         && item.group.calls.some(call => call.isError || call.status === 'error'),
       )
-    )
-  return hasTerminalFailure ? 'failed' : 'settled'
+  )
+  if (hasTerminalFailure) return 'failed'
+  return props.message.isStreaming ? 'working' : 'settled'
 })
 
 const activityProjection = computed(() =>
@@ -609,21 +627,82 @@ const activityProjection = computed(() =>
   ),
 )
 
+function withoutFailedActivity(
+  items: ChatStreamTimelineItem[],
+): ChatStreamTimelineItem[] {
+  return items.flatMap((item): ChatStreamTimelineItem[] => {
+    if (item.type !== 'tool-group') return [item]
+    const failedCalls = item.group.calls.filter(
+      call => call.isError || call.status === 'error',
+    )
+    // Some restored histories only carry the failure marker on the group.
+    // Treat that group-level state as authoritative when no call-level marker
+    // survived serialization.
+    if (
+      (item.group.isError || item.group.status === 'error')
+      && failedCalls.length === 0
+    ) {
+      return []
+    }
+    const calls = item.group.calls.filter(
+      call => !call.isError && call.status !== 'error',
+    )
+    if (calls.length === 0) return []
+    const isRunning = calls.some(call => call.isRunning)
+    return [{
+      ...item,
+      group: {
+        ...item.group,
+        calls,
+        isRunning,
+        isError: false,
+        status: isRunning
+          ? ''
+          : calls.every(call => call.status === 'success')
+            ? 'success'
+            : '',
+      },
+    }]
+  })
+}
+
+const visibleActivityItems = computed(() =>
+  withoutFailedActivity(activityProjection.value.activityItems),
+)
+const visibleLegacyTimelineItems = computed(() =>
+  withoutFailedActivity(props.message.timelineItems ?? []),
+)
+const visibleActivityCallKeys = computed(() => new Set(
+  visibleActivityItems.value.flatMap(item =>
+    item.type === 'tool-group'
+      ? item.group.calls.map(call => call.renderKey)
+      : [],
+  ),
+))
+const visibleActivityClusters = computed(() =>
+  activityProjection.value.activityClusters.filter(cluster =>
+    !cluster.isFailure
+    && cluster.calls.some(call => visibleActivityCallKeys.value.has(call.renderKey)),
+  ),
+)
+const visibleActivityProjection = computed(() => ({
+  ...activityProjection.value,
+  activityClusters: visibleActivityClusters.value,
+}))
+const hasVisibleActivityItem = computed(() => visibleActivityItems.value.length > 0)
 const hasActivity = computed(() =>
   !!reasoningPart.value
-  || activityProjection.value.activityItems.length > 0
+  || hasVisibleActivityItem.value
   || statusHistory.value.length > 0,
 )
 
 const activityStepCount = computed(() => Math.max(
   1,
-  activityProjection.value.activityClusters.length
+  visibleActivityClusters.value.length
     + activityProjection.value.statusSteps.length
     + (reasoningPart.value ? 1 : 0),
 ))
-const activityDefaultOpen = computed(() =>
-  activityLifecycle.value === 'failed' || activityLifecycle.value === 'interrupted',
-)
+const activityDefaultOpen = computed(() => false)
 const activityCompletionConfirmed = computed(() =>
   activityLifecycle.value === 'settled'
   && !props.message.isStreaming
@@ -653,10 +732,13 @@ const activityContinuityKey = computed(() =>
 const activityDurationSeconds = computed(() => {
   const measured = measuredActivityDurationSeconds.value
   if (measured > 0) return measured
-  return readAssistantActivityDuration(
+  const persisted = readAssistantActivityDuration(
     activityStateKey.value,
     activityContinuityKey.value,
   )
+  if (persisted > 0) return persisted
+  const reasoningSeconds = Math.floor(Number(reasoningPart.value?.seconds || 0))
+  return reasoningSeconds > 0 ? reasoningSeconds : 0
 })
 
 // Persisting a measured duration is a side effect, so it lives in a watcher
@@ -684,20 +766,49 @@ const activityElapsedLabel = computed(() => {
   })
 })
 
-// The collapsed row leads with what the turn did (the projection's footprint,
-// which already caps itself at two kinds plus a "{count} more" descriptor) and
-// appends the elapsed time last — time is the least important fact, so it must
-// not lead. An empty footprint passes '' so the disclosure keeps its own
-// duration/count fallback chain.
-const activitySummaryLabel = computed(() => {
-  const summary = activityProjection.value.footprintSummary
-  if (!summary.codes.length) return ''
-  const parts = summary.codes.map(part => String(t(part.code, part.params)))
-  if (summary.remaining) {
-    parts.push(String(t(summary.remaining.code, summary.remaining.params)))
+const activityCompactElapsedLabel = computed(() => {
+  const seconds = Math.max(0, Math.floor(activityDurationSeconds.value || 0))
+  if (seconds <= 0) return ''
+  if (seconds < 60) return String(t('chat.activityDurationSeconds', { seconds }))
+  return String(t('chat.activityDurationMinutes', {
+    minutes: Math.floor(seconds / 60),
+    seconds: seconds % 60,
+  }))
+})
+
+// Expanded metadata keeps the activity footprint (capped at two kinds plus a
+// "{count} more" descriptor) and the verbose elapsed copy. The collapsed,
+// completed row uses the compact elapsed label above instead of an arbitrary
+// item count.
+const activityDetailLabel = computed(() => {
+  const counts = new Map<string, number>()
+  for (const cluster of visibleActivityClusters.value) {
+    const code = cluster.footprint.code
+    const count = Number(cluster.footprint.params.count ?? cluster.callCount)
+    counts.set(code, (counts.get(code) ?? 0) + count)
+  }
+  const descriptors = [...counts].map(([code, count]) => ({ code, count }))
+  const parts = descriptors.slice(0, 2).map(part =>
+    String(t(part.code, { count: part.count })),
+  )
+  if (descriptors.length > 2) {
+    const remainingCount = descriptors
+      .slice(2)
+      .reduce((total, part) => total + part.count, 0)
+    parts.push(String(t('chat.activity.more', { count: remainingCount })))
   }
   if (activityElapsedLabel.value) parts.push(activityElapsedLabel.value)
   return parts.join(' · ')
+})
+
+const activitySummaryLabel = computed(() => {
+  if (activityCompletionConfirmed.value) {
+    return [
+      String(t('chat.activity.lifecycle.settled')),
+      activityCompactElapsedLabel.value,
+    ].filter(Boolean).join(' · ')
+  }
+  return activityDetailLabel.value
 })
 
 function onMessageClick(event: MouseEvent) {
@@ -990,35 +1101,8 @@ function ensembleRole(role: string, label: string): string {
 
 .msg-ai-meta {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
-  min-width: 0;
-  gap: 0.5rem;
-  font-size: 0.8125rem;
-  line-height: 1.35;
   color: color-mix(in srgb, var(--text-muted) 56%, transparent);
-}
-
-.msg-ai-meta > span:not(.savings-indicator):not(.msg-meta__more) {
-  opacity: 0.72;
-  transition: opacity var(--dur-base) var(--ease-standard), color var(--dur-base) var(--ease-standard);
-}
-
-.msg-ai:hover .msg-ai-meta > span:not(.savings-indicator):not(.msg-meta__more) {
-  opacity: 0.88;
-}
-
-.msg-meta__cost,
-.msg-meta__ensemble {
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-
-.msg-meta__ensemble {
-  color: color-mix(in srgb, var(--accent) 70%, var(--text-muted));
-  max-width: 10rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .msg-meta__more {
@@ -1132,81 +1216,17 @@ function ensembleRole(role: string, label: string): string {
   font-variant-numeric: tabular-nums;
 }
 
-.savings-indicator {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  min-height: 1.25rem;
-  padding: 0 0.45rem;
-  overflow: hidden;
-  border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent);
-  border-radius: var(--radius-full);
-  background:
-    linear-gradient(135deg, color-mix(in srgb, var(--accent) 8%, var(--bg-surface)), var(--bg-surface) 48%, color-mix(in srgb, var(--ok) 8%, var(--bg-surface))),
-    radial-gradient(circle at 18% 0%, color-mix(in srgb, var(--warn) 34%, transparent), transparent 42%);
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--bg-surface) 85%, transparent),
-    0 5px 14px color-mix(in srgb, var(--accent) 8%, transparent);
-  color: var(--accent);
-  font-weight: 650;
-  isolation: isolate;
-}
-
-.savings-indicator::after {
-  content: '';
-  position: absolute;
-  inset: -40% auto -40% -60%;
-  width: 42%;
-  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--bg-surface) 82%, transparent), transparent);
-  transform: skewX(-18deg);
-  animation: savingsSweep 5.6s ease-in-out infinite;
-  opacity: 0.55;
-  pointer-events: none;
-}
-
-@keyframes savingsSweep {
-  0%, 62% {
-    left: -60%;
-  }
-  84%, 100% {
-    left: 118%;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .savings-indicator::after {
-    animation: none;
-    display: none;
-  }
-}
-
 @media (max-width: 768px) {
   .msg-ai-footer {
     min-width: 0;
   }
 
   .msg-ai-meta {
-    flex: 1;
-    flex-wrap: nowrap;
-    gap: 0.375rem;
+    flex: 0 0 auto;
   }
 
-  .msg-meta__model {
-    flex: 0 1 auto;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .msg-meta__cost,
-  .savings-indicator,
   .msg-meta__more {
     flex-shrink: 0;
-  }
-
-  .msg-meta__ensemble {
-    max-width: min(14rem, 100%);
   }
 }
 

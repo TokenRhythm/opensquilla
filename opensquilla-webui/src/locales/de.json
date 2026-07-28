@@ -1,5 +1,13 @@
 {
   "workspaces": {
+    "projects": "Projekte",
+    "createProject": "Projekt erstellen",
+    "projectNamePlaceholder": "Projektname",
+    "sourceFolders": "Quellordner",
+    "addSourceFolder": "Einen Ordner hinzufügen, den OpenSquilla lesen und bearbeiten kann",
+    "creatingProject": "Wird erstellt…",
+    "projectCreated": "Projekt „{name}“ erstellt",
+    "createProjectFailed": "Projekt konnte nicht erstellt werden: {error}",
     "noTasks": "Keine Aufgaben",
     "chooseProject": "Projekt auswählen",
     "webPickerScope": "Diese Pfade befinden sich auf dem Gateway-Host.",
@@ -30,6 +38,8 @@
     "unpin": "Projekt lösen",
     "deleteHistory": "Projektaufgabenverlauf löschen",
     "removeProject": "Projekt entfernen",
+    "menuDeleteHistory": "Verlauf löschen",
+    "menuRemove": "Entfernen",
     "deleteHistoryTitle": "Projektaufgabenverlauf löschen?",
     "deleteHistoryBody": "{count} Aufgaben aus {name} werden dauerhaft gelöscht. Dateien im Projektordner bleiben erhalten.",
     "deleteHistoryConfirm": "Verlauf löschen",
@@ -2902,6 +2912,7 @@
     "thinkingForSeconds": "Denkt nach · {seconds}s",
     "thoughtForSeconds": "{seconds}s nachgedacht",
     "thoughtForMinutes": "{minutes}min {seconds}s nachgedacht",
+    "activityTechnicalDetails": "Technische Details",
     "toolResult": "Werkzeugergebnis",
     "subagentPrefix": "Subagent: ",
     "subagentCompletion": "Subagent-Abschluss",
@@ -2973,6 +2984,8 @@
     "activityWorking": "In Arbeit",
     "workedForSeconds": "{seconds} Sek. gearbeitet",
     "workedForMinutes": "{minutes} Min. {seconds} Sek. gearbeitet",
+    "activityDurationSeconds": "{seconds} Sek.",
+    "activityDurationMinutes": "{minutes} Min. {seconds} Sek.",
     "activity": {
       "lifecycle": {
         "working": "In Arbeit",
@@ -3242,6 +3255,8 @@
     },
     "chips": {
       "whatCanYouDo": "Was kannst du?",
+      "buildGame": "Baue mir ein Spiel",
+      "buildGamePrompt": "Erstelle einen spielbaren, browserbasierten Prototyp eines Voxel-Rennspiels mit reaktionsschneller Steuerung, Beschleunigen und Bremsen, einer gut lesbaren Strecke, Kollisionserkennung, Kontrollpunkten, Rundenzeitmessung und einem Neustart-Ablauf. Generiere Rennwagen und Landschaft im Voxel-Stil per Code und verwende keine kostenpflichtigen Assets. Starte das Spiel, teste die Steuerung, behebe blockierende Probleme und liefere es anschließend aus. Die Landschaft soll schöner und die Welt offen sein. Platziere OpenSquilla- und TokenRhythm-Schilder als Sponsor-Easter-Eggs auf der Karte.",
       "summarizeWebpage": "Fasse eine Webseite für mich zusammen",
       "planWeek": "Entwirf einen Plan für meine Woche",
       "searchAiNews": "Suche die heutigen AI-News",
@@ -3313,6 +3328,7 @@
     },
     "msgMeta": {
       "ensembleModels": "Ensemble · {count} Modelle",
+      "model": "Modell",
       "tokens": "Tokens",
       "cache": "Cache",
       "think": "Denken",

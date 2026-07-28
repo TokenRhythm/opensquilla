@@ -197,6 +197,7 @@ class ProviderBuildContext:
     # Spec-derived fields.
     auth_header_style: AuthHeaderStyle = "bearer"
     compat: OpenAICompatPolicy = field(default_factory=OpenAICompatPolicy)
+    static_model_ids: tuple[str, ...] = ()
 
 
 def _build_context(cfg: ProviderConfig, spec: ProviderSpec) -> ProviderBuildContext:
@@ -213,6 +214,7 @@ def _build_context(cfg: ProviderConfig, spec: ProviderSpec) -> ProviderBuildCont
         replay_provider_state=cfg.replay_provider_state,
         auth_header_style=spec.auth_header_style,
         compat=spec.compat,
+        static_model_ids=spec.static_model_ids,
     )
 
 
@@ -223,6 +225,16 @@ def _build_anthropic(ctx: ProviderBuildContext) -> LLMProvider:
         "replay_provider_state": ctx.replay_provider_state,
         "auth_header_style": ctx.auth_header_style,
         "provider_id": ctx.provider_id,
+        # Native Anthropic keeps its built-in SKU list. Compatibility
+        # endpoints use an exact registry list when present, otherwise the
+        # configured model only — never an unrelated Claude catalog.
+        "listing_model_ids": (
+            None
+            if ctx.provider_id == "anthropic"
+            else (ctx.static_model_ids or ((ctx.model,) if ctx.model else ()))
+        ),
+        "temperature_floor_model_ids": ctx.compat.temperature_floor_model_ids,
+        "temperature_floor": ctx.compat.temperature_floor,
     }
     if ctx.base_url:
         kwargs["base_url"] = ctx.base_url

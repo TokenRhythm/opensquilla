@@ -1,0 +1,45 @@
+# Packaged SquillaRouter tier preset. Applied as inline tiers so older
+# releases that do not know this provider never need to parse a new
+# tier_profile enum value.
+[preset]
+id = "qwen_token_plan"
+provider = "qwen_token_plan"
+label = "Qwen Token Plan"
+description = "Curated Token Plan ladder for fast, balanced, advanced, and highest-capability agent turns."
+default_model = "qwen3.7-plus"
+
+[tiers.c0]
+provider = "qwen_token_plan"
+model = "qwen3.6-flash"
+description = "Fast route for short edits, extraction, simple questions, and low-risk tool work."
+thinking_level = "low"
+supports_image = true
+
+[tiers.c1]
+provider = "qwen_token_plan"
+model = "qwen3.7-plus"
+description = "Balanced default route for coding, debugging, normal agent work, and large-context synthesis."
+thinking_level = "medium"
+supports_image = true
+
+[tiers.c2]
+provider = "qwen_token_plan"
+model = "qwen3.7-max"
+description = "Advanced text route for multi-step implementation, complex debugging, and deep review."
+thinking_level = "high"
+supports_image = false
+
+[tiers.c3]
+provider = "qwen_token_plan"
+model = "qwen3.8-max-preview"
+description = "Highest-capability reasoning route for difficult planning, architecture, and high-stakes synthesis."
+thinking_level = "xhigh"
+supports_image = true
+
+[tiers.image_model]
+provider = "qwen_token_plan"
+model = "qwen3.7-plus"
+description = "Vision-capable route for screenshots, diagrams, and other image attachments."
+thinking_level = "medium"
+supports_image = true
+image_only = true

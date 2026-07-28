@@ -14,32 +14,82 @@
         <span>{{ t(step.label.code, step.label.params) }}</span>
       </li>
     </ol>
-    <ToolCallTimeline
-      v-if="items.length"
-      :items="items"
-      :variant="variant"
-      presentation="activity"
-      :state-scope="stateScope"
-      :is-tool-group-open="isToolGroupOpen"
-      :is-tool-item-open="isToolItemOpen"
-      :tool-group-status-text="toolGroupStatusText"
-      :tool-status-text="toolStatusText"
-      :tool-secondary-text="toolSecondaryText"
-      :tool-elapsed-text="toolElapsedText"
-      @toggle-group="$emit('toggleGroup', $event)"
-      @toggle-item="$emit('toggleItem', $event)"
-      @show-result="(content, title, context) => $emit('showResult', content, title, context)"
-    >
-      <template #interrupt="{ part }">
-        <slot name="interrupt" :part="part" />
-      </template>
-    </ToolCallTimeline>
+    <template v-for="segment in segments" :key="segment.key">
+      <ActivityNarration
+        v-if="segment.type === 'narration'"
+        :item="segment.item"
+      />
+      <details
+        v-else-if="segment.type === 'tools' && segment.items.length > 1"
+        class="assistant-activity-tool-batch"
+      >
+        <summary class="assistant-activity-tool-batch__summary">
+          <Icon
+            :name="segment.items[0]?.group.iconName || 'gear'"
+            :size="14"
+            aria-hidden="true"
+          />
+          <span class="assistant-activity-tool-batch__label">
+            {{ toolBatchSummary(segment.items) }}
+          </span>
+          <Icon
+            class="assistant-activity-tool-batch__chevron"
+            name="chevronRight"
+            :size="13"
+            aria-hidden="true"
+          />
+        </summary>
+        <div class="assistant-activity-tool-batch__body">
+          <ToolCallTimeline
+            :items="segment.items"
+            :variant="variant"
+            presentation="activity"
+            :state-scope="stateScope"
+            :is-tool-group-open="isToolGroupOpen"
+            :is-tool-item-open="isToolItemOpen"
+            :tool-group-status-text="toolGroupStatusText"
+            :tool-status-text="toolStatusText"
+            :tool-secondary-text="toolSecondaryText"
+            :tool-elapsed-text="toolElapsedText"
+            @toggle-group="$emit('toggleGroup', $event)"
+            @toggle-item="$emit('toggleItem', $event)"
+            @show-result="(content, title, context) => $emit('showResult', content, title, context)"
+          >
+            <template #interrupt="{ part }">
+              <slot name="interrupt" :part="part" />
+            </template>
+          </ToolCallTimeline>
+        </div>
+      </details>
+      <ToolCallTimeline
+        v-else
+        :items="segment.items"
+        :variant="variant"
+        presentation="activity"
+        :state-scope="stateScope"
+        :is-tool-group-open="isToolGroupOpen"
+        :is-tool-item-open="isToolItemOpen"
+        :tool-group-status-text="toolGroupStatusText"
+        :tool-status-text="toolStatusText"
+        :tool-secondary-text="toolSecondaryText"
+        :tool-elapsed-text="toolElapsedText"
+        @toggle-group="$emit('toggleGroup', $event)"
+        @toggle-item="$emit('toggleItem', $event)"
+        @show-result="(content, title, context) => $emit('showResult', content, title, context)"
+      >
+        <template #interrupt="{ part }">
+          <slot name="interrupt" :part="part" />
+        </template>
+      </ToolCallTimeline>
+    </template>
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
+import Icon from '@/components/Icon.vue'
+import ActivityNarration from '@/components/chat/ActivityNarration.vue'
 import ToolCallTimeline from '@/components/chat/ToolCallTimeline.vue'
 import type {
   ChatStreamTimelineItem,
@@ -150,6 +200,62 @@ const items = computed<ChatStreamTimelineItem[]>(() => {
 
   return props.projection.activityClusters.flatMap(cluster => clusterItem(cluster) ?? [])
 })
+
+type ToolTimelineItem = Extract<ChatStreamTimelineItem, { type: 'tool-group' }>
+type ActivitySegment =
+  | {
+      type: 'narration'
+      key: string
+      item: Extract<ChatStreamTimelineItem, { type: 'text' }>
+    }
+  | {
+      type: 'tools'
+      key: string
+      items: ToolTimelineItem[]
+    }
+  | {
+      type: 'interrupt'
+      key: string
+      items: Array<Extract<ChatStreamTimelineItem, { type: 'interrupt' }>>
+    }
+
+const segments = computed<ActivitySegment[]>(() => {
+  const result: ActivitySegment[] = []
+  for (const item of items.value) {
+    if (item.type === 'text') {
+      result.push({ type: 'narration', key: item.key, item })
+      continue
+    }
+    if (item.type === 'interrupt') {
+      result.push({ type: 'interrupt', key: item.key, items: [item] })
+      continue
+    }
+    const last = result[result.length - 1]
+    if (last?.type === 'tools') {
+      last.items.push(item)
+    } else {
+      result.push({ type: 'tools', key: `tool-batch:${item.key}`, items: [item] })
+    }
+  }
+  return result
+})
+
+function toolBatchSummary(batchItems: ChatStreamTimelineItem[]): string {
+  const groups = batchItems.filter(
+    (item): item is ToolTimelineItem => item.type === 'tool-group',
+  )
+  const labels = groups.map(item =>
+    [item.group.label, item.group.secondary].filter(Boolean).join(' · '),
+  )
+  const visible = labels.slice(0, 3)
+  if (labels.length > visible.length) {
+    const remainingCount = groups
+      .slice(visible.length)
+      .reduce((total, item) => total + item.group.calls.length, 0)
+    visible.push(String(t('chat.activity.more', { count: remainingCount })))
+  }
+  return visible.join(' · ')
+}
 </script>
 
 <style scoped>
@@ -193,5 +299,65 @@ const items = computed<ChatStreamTimelineItem[]>(() => {
 
 .assistant-activity-status__row--current .assistant-activity-status__dot {
   background: var(--accent);
+}
+
+.assistant-activity-tool-batch {
+  min-width: 0;
+}
+
+.assistant-activity-tool-batch__summary {
+  display: flex;
+  align-items: center;
+  min-height: 1.75rem;
+  gap: 0.625rem;
+  padding: 0.25rem 0.125rem;
+  color: color-mix(in srgb, var(--text) 76%, transparent);
+  cursor: pointer;
+  list-style: none;
+}
+
+.assistant-activity-tool-batch__summary::-webkit-details-marker {
+  display: none;
+}
+
+.assistant-activity-tool-batch__summary:hover {
+  color: var(--text);
+}
+
+.assistant-activity-tool-batch__summary:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.assistant-activity-tool-batch__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.8125rem;
+}
+
+.assistant-activity-tool-batch__chevron {
+  flex: 0 0 auto;
+  margin-left: auto;
+  opacity: 0.5;
+  transition: transform var(--dur-fast) var(--ease-standard);
+}
+
+.assistant-activity-tool-batch[open]
+  > .assistant-activity-tool-batch__summary
+  .assistant-activity-tool-batch__chevron {
+  transform: rotate(90deg);
+}
+
+.assistant-activity-tool-batch__body {
+  min-width: 0;
+  padding-left: 1.5rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .assistant-activity-tool-batch__chevron {
+    transition: none;
+  }
 }
 </style>

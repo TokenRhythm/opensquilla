@@ -725,6 +725,7 @@
     "tests/test_provider_terminal_evidence.py": 0.01,
     "tests/test_provider_terminal_evidence_anthropic_codex.py": 0.01,
     "tests/test_provider_text_tool_normalization.py": 0.01,
+    "tests/test_provider_qwen_token_plan.py": 0.01,
     "tests/test_provider_tokenrhythm_correlation.py": 0.01,
     "tests/test_provider_tool_stream_accumulator.py": 0.01,
     "tests/test_provider_trace_recorder.py": 0.015,

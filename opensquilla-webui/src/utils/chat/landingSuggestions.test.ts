@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import viewSource from '../../views/ChatView.vue?raw'
-import { shouldSuppressLandingSuggestions } from './landingSuggestions'
+import { shouldDisableLandingSuggestions } from './landingSuggestions'
 
 describe('landing suggestion protection', () => {
   it.each([
@@ -16,12 +16,12 @@ describe('landing suggestion protection', () => {
       name: 'an attachment in any state',
       state: { landingPrefilled: false, composerText: '', attachmentCount: 1 },
     },
-  ])('suppresses suggestions for $name', ({ state }) => {
-    expect(shouldSuppressLandingSuggestions(state)).toBe(true)
+  ])('disables suggestions for $name', ({ state }) => {
+    expect(shouldDisableLandingSuggestions(state)).toBe(true)
   })
 
   it('keeps suggestions available for an otherwise empty landing composer', () => {
-    expect(shouldSuppressLandingSuggestions({
+    expect(shouldDisableLandingSuggestions({
       landingPrefilled: false,
       composerText: '   ',
       attachmentCount: 0,
@@ -29,9 +29,10 @@ describe('landing suggestion protection', () => {
   })
 
   it('uses the same state for rendering and stale-click protection', () => {
-    expect(viewSource).toContain(':suppressed="landingSuggestionsSuppressed"')
+    expect(viewSource).toContain(':suppressed="landingSuggestionsHidden"')
+    expect(viewSource).toContain(':disabled="landingSuggestionsDisabled"')
     expect(viewSource).toMatch(
-      /function applyLandingSuggestion\(text: string\) \{\s+if \(landingSuggestionsSuppressed\.value\) return\s+sendComposerText\(text\)\s+\}/,
+      /function applyLandingSuggestion\(text: string\) \{\s+if \(landingSuggestionsDisabled\.value\) return\s+sendComposerText\(text\)\s+\}/,
     )
   })
 })

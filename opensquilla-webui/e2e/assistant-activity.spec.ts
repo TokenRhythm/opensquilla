@@ -226,9 +226,10 @@ test.describe('Completed assistant activity disclosure', () => {
     const activity = page.getByTestId('assistant-activity')
     await expect(activity).toBeVisible()
     await expect(activity).toHaveAttribute('data-share-expanded', 'false')
-    // The collapsed row leads with what the turn did (footprint summary)
-    // rather than the generic "Completed · N items" count.
-    await expect(activity).toContainText('1 web action')
+    // Completed history without timing metadata stays compact and never falls
+    // back to an arbitrary activity-item count.
+    await expect(activity.locator('.assistant-activity__summary')).toContainText('Completed')
+    await expect(activity.locator('.assistant-activity__summary')).not.toContainText('item')
 
     const answer = page.getByText('The canonical answer is complete.', { exact: true })
     await expect(answer).toBeVisible()
@@ -285,7 +286,11 @@ test.describe('Completed assistant activity disclosure', () => {
     await expect(activity).toHaveAttribute('data-share-expanded', 'true')
     await expect(row).toBeVisible()
     await expect(processPrefix).toBeVisible()
-    await expect(activity.locator('.thinking-block__body')).toContainText(
+    const reasoningFold = activity.locator('details.thinking-fold')
+    await expect(reasoningFold).not.toHaveAttribute('open', '')
+    await expect(reasoningFold.locator('.thinking-fold__body')).toBeHidden()
+    await reasoningFold.locator('summary').click()
+    await expect(reasoningFold.locator('.thinking-fold__body')).toContainText(
       'I compared the available evidence before answering.',
     )
 
@@ -356,7 +361,7 @@ test.describe('Completed assistant activity disclosure', () => {
     await expect(answer).toBeVisible()
   })
 
-  test('keeps recovered failures collapsed and exposes the full error on demand', async ({ page }) => {
+  test('omits failed work from the activity disclosure', async ({ page }) => {
     await mockActivityHistory(page, { failed: true })
     await page.setViewportSize({ width: 320, height: 844 })
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(`${SESSION_KEY}-failed`))
@@ -365,18 +370,15 @@ test.describe('Completed assistant activity disclosure', () => {
     const activity = page.getByTestId('assistant-activity')
     await expect(activity).toBeVisible()
     await expect(activity).toHaveAttribute('data-share-expanded', 'false')
-    await expect(activity).toContainText('1 failure recovered')
+    await expect(activity).not.toContainText('failure recovered')
 
     const errorRow = activity.locator('.tool-row--error')
-    await expect(errorRow).toBeHidden()
+    await expect(errorRow).toHaveCount(0)
     const summary = activity.locator('.assistant-activity__summary')
     await summary.press('Enter')
     await expect(activity).toHaveAttribute('data-share-expanded', 'true')
-    await expect(errorRow).toBeVisible()
-    await expect(errorRow).toHaveAttribute('aria-expanded', 'true')
-    await expect(activity.locator('.activity-tool-details__line--error')).toContainText(
-      'Search service unavailable',
-    )
+    await expect(errorRow).toHaveCount(0)
+    await expect(activity).not.toContainText('Search service unavailable')
     await expect(activity.locator('.tool-row-section--error')).toHaveCount(0)
     await expect(
       page.getByText('The canonical answer is complete.', { exact: true }),
@@ -411,20 +413,20 @@ test.describe('Live assistant activity lifecycle', () => {
     const liveActivity = page.locator('.assistant-activity--live')
     await expect(liveActivity).toBeVisible()
     await expect(page.locator('.work-card')).toHaveCount(0)
+    const liveSummary = liveActivity.locator('.assistant-activity__live-head')
+    await expect(liveSummary).toHaveAttribute('aria-expanded', 'false')
+    await liveSummary.click()
+    await expect(liveSummary).toHaveAttribute('aria-expanded', 'true')
     const liveStatus = liveActivity.locator('.assistant-activity__live-label')
     await expect(liveStatus).toHaveText('Working')
     await expect(liveStatus).toHaveAttribute('role', 'status')
     await expect(liveStatus).toHaveAttribute('aria-live', 'polite')
     await expect(liveStatus).toHaveAttribute('aria-atomic', 'true')
     await expect(liveActivity.getByText('Working', { exact: true })).toHaveCount(1)
-    // Exactly two deliberate polite regions with disjoint content: the phase
-    // label, and the always-mounted failure counter (empty until a failure
-    // lands, so it announces only when the count actually changes). Anything
-    // beyond these two would double-announce streaming updates.
-    await expect(liveActivity.locator('[role="status"]')).toHaveCount(2)
-    const liveFailureRegion = liveActivity.locator('.assistant-activity__live-failure')
-    await expect(liveFailureRegion).toHaveAttribute('aria-live', 'polite')
-    await expect(liveFailureRegion).toHaveText('')
+    // The phase label is the only polite live region. Failed work is omitted
+    // from the disclosure, so it must not mount a second announcement region.
+    await expect(liveActivity.locator('[role="status"]')).toHaveCount(1)
+    await expect(liveActivity.locator('.assistant-activity__live-failure')).toHaveCount(0)
     await expect(liveActivity.locator('.assistant-activity-status__row')).toHaveCount(0)
     const liveMotion = await liveActivity.evaluate((element) => ({
       dot: getComputedStyle(

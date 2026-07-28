@@ -76,6 +76,10 @@ COMPAT_THINKING_MODELS: dict[str, tuple[str, str]] = {
     # qwen3 prefix ladder (model_catalog dashscope branch) -> "dashscope".
     "dashscope": ("qwen3-coder-plus", "dashscope"),
     "bailian_coding": (_NEUTRAL_MODEL, "none"),
+    # Qwen 3.8 is forced-thinking on Token Plan. The plain/tools/thinking
+    # matrix freezes enable_thinking, preserve_thinking, temperature floor,
+    # and the plan-specific reasoning dialect.
+    "qwen_token_plan": ("qwen3.8-max-preview", "qwen_token_plan_qwen"),
     # kimi-k2.7 ladder (model_catalog moonshot branch) -> "moonshot"; also in
     # fixed_sampling_model_prefixes so the non-default temperature is dropped.
     "moonshot": ("kimi-k2.7-code", "moonshot"),
@@ -266,6 +270,15 @@ def build_cases() -> list[GoldenCase]:
                 slug="tencent_token_plan_anthropic__plain",
                 provider_id="tencent_token_plan_anthropic",
                 model="hy3",
+            ),
+            # Qwen Token Plan's Anthropic-compatible service uses bearer auth,
+            # appends /v1/messages to /apps/anthropic, and applies the Qwen
+            # 3.8 temperature floor.
+            GoldenCase(
+                backend="anthropic",
+                slug="qwen_token_plan_anthropic__plain",
+                provider_id="qwen_token_plan_anthropic",
+                model="qwen3.8-max-preview",
             ),
         ]
     )

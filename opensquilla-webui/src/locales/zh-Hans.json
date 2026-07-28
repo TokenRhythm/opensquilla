@@ -1,5 +1,13 @@
 {
   "workspaces": {
+    "projects": "项目",
+    "createProject": "创建项目",
+    "projectNamePlaceholder": "项目名称",
+    "sourceFolders": "源文件夹",
+    "addSourceFolder": "添加 OpenSquilla 可读取和编辑的文件夹",
+    "creatingProject": "正在创建…",
+    "projectCreated": "已创建项目“{name}”",
+    "createProjectFailed": "无法创建项目：{error}",
     "noTasks": "无任务",
     "chooseProject": "选择项目",
     "webPickerScope": "这里显示的是网关主机上的目录。",
@@ -30,6 +38,8 @@
     "unpin": "取消置顶",
     "deleteHistory": "删除项目任务历史",
     "removeProject": "移除项目",
+    "menuDeleteHistory": "删除历史",
+    "menuRemove": "移除",
     "deleteHistoryTitle": "删除项目任务历史？",
     "deleteHistoryBody": "将永久删除 {name} 中的 {count} 个任务，但不会删除项目目录中的文件。",
     "deleteHistoryConfirm": "删除历史",
@@ -847,7 +857,7 @@
       "modeRecommended": "跟随当前服务商分层",
       "modeDisabled": "关",
       "routingDisabledHint": "开启 AI 智能单模型路由后可编辑模型分层。",
-      "routingEnsembleReadOnlyHint": "当前已启用 AI 智能聚合路由，普通模型分层设置暂不生效。",
+      "routingEnsembleReadOnlyHint": "当前已启用 AI 智能融合路由，普通模型分层设置暂不生效。",
       "defaultTextModel": "默认模型分层",
       "panelLabel": "模型分层表",
       "panelDesc": "分层表中的模型会通过各行的服务商发送，因此每个服务商都使用相同的路由表结构。",
@@ -864,9 +874,9 @@
       "save": "保存路由",
       "chooseProviderFirst": "请先选择服务商",
       "summaryDisabled": "关",
-      "summaryEnsemble": "AI 智能聚合路由",
-      "ensembleProfileTitle": "AI 智能聚合路由",
-      "ensembleProfileDesc": "模型分层表会为 AI 智能聚合路由提供候选模型。",
+      "summaryEnsemble": "AI 智能融合路由",
+      "ensembleProfileTitle": "AI 智能融合路由",
+      "ensembleProfileDesc": "模型分层表会为 AI 智能融合路由提供候选模型。",
       "visualMode": {
         "real_candidates": "真实路由候选",
         "legacy_grid": "三层可视化面板"
@@ -881,8 +891,8 @@
       }
     },
     "ensemble": {
-      "statusOn": "AI 智能聚合路由已开启——多个模型作答，由一个模型整合最终回复。",
-      "statusOff": "AI 智能聚合路由已关闭。",
+      "statusOn": "AI 智能融合路由已开启——多个模型作答，由一个模型整合最终回复。",
+      "statusOff": "AI 智能融合路由已关闭。",
       "allFailedFallback": "回退到单一模型",
       "allFailedError": "停止并报告错误"
     },
@@ -2902,6 +2912,7 @@
     "thinkingForSeconds": "思考中 · {seconds} 秒",
     "thoughtForSeconds": "思考了 {seconds} 秒",
     "thoughtForMinutes": "思考了 {minutes} 分 {seconds} 秒",
+    "activityTechnicalDetails": "技术细节",
     "toolResult": "工具结果",
     "subagentPrefix": "子智能体：",
     "subagentCompletion": "子智能体完成",
@@ -2973,6 +2984,8 @@
     "activityWorking": "正在工作",
     "workedForSeconds": "工作了 {seconds} 秒",
     "workedForMinutes": "工作了 {minutes} 分 {seconds} 秒",
+    "activityDurationSeconds": "{seconds} 秒",
+    "activityDurationMinutes": "{minutes} 分 {seconds} 秒",
     "activity": {
       "lifecycle": {
         "working": "正在工作",
@@ -3163,7 +3176,7 @@
       "modelRoutingOffDesc": "每轮都发送到当前选定模型。",
       "modelRoutingSquillaRouter": "AI 智能单模型路由",
       "modelRoutingSquillaRouterDesc": "由 AI 为每轮智能选择一个合适模型，优先降低成本。",
-      "modelRoutingEnsemble": "AI 智能聚合路由",
+      "modelRoutingEnsemble": "AI 智能融合路由",
       "modelRoutingEnsembleDesc": "由 AI 协调多个模型协同生成，优先提升复杂任务能力。",
       "runMode": "执行模式",
       "runModeStandard": "每次询问",
@@ -3242,6 +3255,8 @@
     },
     "chips": {
       "whatCanYouDo": "你能做什么？",
+      "buildGame": "帮我做个游戏",
+      "buildGamePrompt": "构建一个可玩的浏览器端体素竞速游戏原型，包含响应式操控、加速/刹车、可读赛道、碰撞检测、检查点、圈速计时和重启流程。用代码生成体素风格的赛车和场景，不使用付费素材。运行游戏、测试控制、修复阻塞性问题后交付。我希望风景更好,开放世界。且地图在有opensquilla和 tokenrhythm这两个标识 是赞助商彩蛋",
       "summarizeWebpage": "帮我总结一个网页",
       "planWeek": "为我这一周拟定计划",
       "searchAiNews": "搜索今天的 AI 新闻",
@@ -3313,6 +3328,7 @@
     },
     "msgMeta": {
       "ensembleModels": "聚合 · {count} 个模型",
+      "model": "模型",
       "tokens": "令牌",
       "cache": "缓存",
       "think": "思考",

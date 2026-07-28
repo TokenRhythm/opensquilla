@@ -743,9 +743,51 @@ function decorateCodeBlocks() {
 // Chat passes `items` (proven group data); non-chat surfaces pass flat steps,
 // which compose into the same tool-group timeline shape so the markup never
 // branches on input source.
+function withoutFailedActivityRows(
+  items: ChatStreamTimelineItem[],
+): ChatStreamTimelineItem[] {
+  if (props.presentation !== 'activity') return items
+
+  return items.flatMap((item): ChatStreamTimelineItem[] => {
+    if (item.type !== 'tool-group') return [item]
+
+    const failedCalls = item.group.calls.filter(
+      call => call.isError || call.status === 'error',
+    )
+    // Restored histories can retain only the group-level failure marker. In
+    // that case none of the calls is safe to present as completed activity.
+    if (
+      (item.group.isError || item.group.status === 'error')
+      && failedCalls.length === 0
+    ) {
+      return []
+    }
+
+    const calls = item.group.calls.filter(
+      call => !call.isError && call.status !== 'error',
+    )
+    if (calls.length === 0) return []
+
+    const isRunning = calls.some(call => call.isRunning)
+    return [{
+      ...item,
+      group: {
+        ...item.group,
+        calls,
+        isRunning,
+        isError: false,
+        status: isRunning
+          ? ''
+          : calls.every(call => call.status === 'success')
+            ? 'success'
+            : '',
+      },
+    }]
+  })
+}
+
 const resolvedItems = computed<ChatStreamTimelineItem[]>(() => {
-  if (props.items) return props.items
-  return composeTree(props.steps ?? []).map((node): ChatStreamTimelineItem => {
+  const items = props.items ?? composeTree(props.steps ?? []).map((node): ChatStreamTimelineItem => {
     const members = node.children.length ? node.children.map(child => child.step) : [node.step]
     const calls = members.map(stepToRenderItem)
     const isError = calls.some(call => call.isError || call.status === 'error')
@@ -766,6 +808,7 @@ const resolvedItems = computed<ChatStreamTimelineItem[]>(() => {
     }
     return { type: 'tool-group', key: node.step.id, group }
   })
+  return withoutFailedActivityRows(items)
 })
 
 function stepToRenderItem(step: NodeStep): ChatToolCallRenderItem {

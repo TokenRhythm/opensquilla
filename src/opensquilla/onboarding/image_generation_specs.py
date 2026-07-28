@@ -57,6 +57,16 @@ _IMAGE_PROVIDER_DATA: dict[str, dict[str, Any]] = {
         "default_model": "openrouter/google/gemini-3.1-flash-image-preview",
         "suggested_models": ("openrouter/google/gemini-3.1-flash-image-preview",),
     },
+    "qwen_token_plan": {
+        "label": "Qwen Token Plan Images",
+        "env_key": "QWEN_TOKEN_PLAN_API_KEY",
+        "default_base_url": IMAGE_GENERATION_OFFICIAL_BASE_URLS["qwen_token_plan"],
+        "default_model": "qwen_token_plan/wan2.7-image",
+        "suggested_models": (
+            "qwen_token_plan/wan2.7-image",
+            "qwen_token_plan/wan2.7-image-pro",
+        ),
+    },
 }
 
 

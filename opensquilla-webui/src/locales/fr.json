@@ -1,5 +1,13 @@
 {
   "workspaces": {
+    "projects": "Projets",
+    "createProject": "Créer un projet",
+    "projectNamePlaceholder": "Nom du projet",
+    "sourceFolders": "Dossiers source",
+    "addSourceFolder": "Ajouter un dossier que OpenSquilla peut lire et modifier",
+    "creatingProject": "Création…",
+    "projectCreated": "Projet « {name} » créé",
+    "createProjectFailed": "Impossible de créer le projet : {error}",
     "noTasks": "Aucune tâche",
     "chooseProject": "Choisir un projet",
     "webPickerScope": "Ces chemins se trouvent sur l’hôte Gateway.",
@@ -30,6 +38,8 @@
     "unpin": "Désépingler le projet",
     "deleteHistory": "Supprimer l’historique des tâches",
     "removeProject": "Retirer le projet",
+    "menuDeleteHistory": "Supprimer l’historique",
+    "menuRemove": "Retirer",
     "deleteHistoryTitle": "Supprimer l’historique des tâches du projet ?",
     "deleteHistoryBody": "Supprime définitivement {count} tâches de {name}. Les fichiers du projet ne seront pas supprimés.",
     "deleteHistoryConfirm": "Supprimer l’historique",
@@ -2902,6 +2912,7 @@
     "thinkingForSeconds": "Réflexion · {seconds} s",
     "thoughtForSeconds": "A réfléchi pendant {seconds} s",
     "thoughtForMinutes": "A réfléchi pendant {minutes} min {seconds} s",
+    "activityTechnicalDetails": "Détails techniques",
     "toolResult": "Résultat de l'outil",
     "subagentPrefix": "Sous-agent : ",
     "subagentCompletion": "Achèvement du sous-agent",
@@ -2973,6 +2984,8 @@
     "activityWorking": "Travail en cours",
     "workedForSeconds": "Travail effectué pendant {seconds} s",
     "workedForMinutes": "Travail effectué pendant {minutes} min {seconds} s",
+    "activityDurationSeconds": "{seconds} s",
+    "activityDurationMinutes": "{minutes} min {seconds} s",
     "activity": {
       "lifecycle": {
         "working": "En cours",
@@ -3242,6 +3255,8 @@
     },
     "chips": {
       "whatCanYouDo": "Que peux-tu faire ?",
+      "buildGame": "Crée-moi un jeu",
+      "buildGamePrompt": "Construis un prototype jouable dans le navigateur d’un jeu de course en voxels, avec des commandes réactives, accélération et freinage, une piste lisible, la détection des collisions, des points de contrôle, le chronométrage des tours et un parcours de redémarrage. Génère en code la voiture et les décors en style voxel, sans ressources payantes. Lance le jeu, teste les commandes, corrige les problèmes bloquants, puis livre-le. Je veux de plus beaux paysages et un monde ouvert. Ajoute sur la carte des enseignes OpenSquilla et TokenRhythm comme clins d’œil de sponsors.",
       "summarizeWebpage": "Résume une page web pour moi",
       "planWeek": "Ébauche un plan pour ma semaine",
       "searchAiNews": "Recherche les actualités IA du jour",
@@ -3313,6 +3328,7 @@
     },
     "msgMeta": {
       "ensembleModels": "Ensemble · {count} modèles",
+      "model": "modèle",
       "tokens": "jetons",
       "cache": "cache",
       "think": "raisonnement",

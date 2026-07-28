@@ -1,5 +1,13 @@
 {
   "workspaces": {
+    "projects": "Proyectos",
+    "createProject": "Crear proyecto",
+    "projectNamePlaceholder": "Nombre del proyecto",
+    "sourceFolders": "Carpetas de origen",
+    "addSourceFolder": "Añadir una carpeta que OpenSquilla pueda leer y editar",
+    "creatingProject": "Creando…",
+    "projectCreated": "Proyecto «{name}» creado",
+    "createProjectFailed": "No se pudo crear el proyecto: {error}",
     "noTasks": "Sin tareas",
     "chooseProject": "Elegir proyecto",
     "webPickerScope": "Estas rutas pertenecen al host de Gateway.",
@@ -30,6 +38,8 @@
     "unpin": "Desfijar proyecto",
     "deleteHistory": "Eliminar historial de tareas",
     "removeProject": "Quitar proyecto",
+    "menuDeleteHistory": "Eliminar historial",
+    "menuRemove": "Quitar",
     "deleteHistoryTitle": "¿Eliminar el historial de tareas del proyecto?",
     "deleteHistoryBody": "Se eliminarán permanentemente {count} tareas de {name}. No se borrarán los archivos del proyecto.",
     "deleteHistoryConfirm": "Eliminar historial",
@@ -2902,6 +2912,7 @@
     "thinkingForSeconds": "Razonando · {seconds} s",
     "thoughtForSeconds": "Razonó durante {seconds} s",
     "thoughtForMinutes": "Razonó durante {minutes} min {seconds} s",
+    "activityTechnicalDetails": "Detalles técnicos",
     "toolResult": "Resultado de la herramienta",
     "subagentPrefix": "Subagente: ",
     "subagentCompletion": "Finalización del subagente",
@@ -2973,6 +2984,8 @@
     "activityWorking": "Trabajando",
     "workedForSeconds": "Trabajó durante {seconds} s",
     "workedForMinutes": "Trabajó durante {minutes} min {seconds} s",
+    "activityDurationSeconds": "{seconds} s",
+    "activityDurationMinutes": "{minutes} min {seconds} s",
     "activity": {
       "lifecycle": {
         "working": "En curso",
@@ -3242,6 +3255,8 @@
     },
     "chips": {
       "whatCanYouDo": "¿Qué puedes hacer?",
+      "buildGame": "Hazme un juego",
+      "buildGamePrompt": "Construye un prototipo jugable en el navegador de un juego de carreras de vóxeles, con controles responsivos, aceleración y frenado, una pista legible, detección de colisiones, puntos de control, cronometraje de vueltas y un flujo de reinicio. Genera con código el coche de carreras y los escenarios de estilo vóxel, sin usar recursos de pago. Ejecuta el juego, prueba los controles, corrige los problemas bloqueantes y luego entrégalo. Quiero mejores paisajes y un mundo abierto. Incluye señalización de OpenSquilla y TokenRhythm en el mapa como guiños de patrocinadores.",
       "summarizeWebpage": "Resúmeme una página web",
       "planWeek": "Esboza un plan para mi semana",
       "searchAiNews": "Busca las noticias de IA de hoy",
@@ -3313,6 +3328,7 @@
     },
     "msgMeta": {
       "ensembleModels": "Conjunto · {count} modelos",
+      "model": "modelo",
       "tokens": "tokens",
       "cache": "caché",
       "think": "razonamiento",

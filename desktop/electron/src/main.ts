@@ -88,6 +88,7 @@ import {
   parseNativeWorkbenchCreateRequest,
   parseNativeWorkbenchSurfaceId,
   parseNativeWorkbenchSurfaceRectRequest,
+  type NativeWorkbenchSurfaceEvent,
 } from './native-workbench-surface-contract.js'
 import {
   NativeWorkbenchSurfaceManager,
@@ -399,6 +400,23 @@ function desktopLog(event: string, detail?: Record<string, unknown>): void {
   }
 }
 
+function nativeWorkbenchFailureReason(event: NativeWorkbenchSurfaceEvent): string {
+  if (event.type === 'error') return 'load-failed'
+  const reason = event.detail?.reason
+  if (
+    reason === 'unresponsive'
+    || reason === 'owner-unresponsive'
+    || reason === 'clean-exit'
+    || reason === 'abnormal-exit'
+    || reason === 'killed'
+    || reason === 'crashed'
+    || reason === 'oom'
+    || reason === 'launch-failed'
+    || reason === 'integrity-failure'
+  ) return reason
+  return 'unknown'
+}
+
 let gatewayStartPromise: Promise<GatewayState> | null = null
 let resolveOnboarding: ((credential: DesktopConnection) => void) | null = null
 let rejectOnboarding: ((error: Error) => void) | null = null
@@ -451,6 +469,12 @@ const gatewayState: GatewayState = {
 const nativeWorkbenchSurfaces = new NativeWorkbenchSurfaceManager({
   getWindow: () => currentMainWindow(),
   emit: event => {
+    if (event.type === 'error' || event.type === 'crashed') {
+      desktopLog('native_workbench_surface_failed', {
+        type: event.type,
+        reason: nativeWorkbenchFailureReason(event),
+      })
+    }
     const window = currentMainWindow()
     if (
       !window

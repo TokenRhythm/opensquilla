@@ -1,5 +1,13 @@
 {
   "workspaces": {
+    "projects": "プロジェクト",
+    "createProject": "プロジェクトを作成",
+    "projectNamePlaceholder": "プロジェクト名",
+    "sourceFolders": "ソースフォルダ",
+    "addSourceFolder": "OpenSquilla が読み書きできるフォルダを追加",
+    "creatingProject": "作成中…",
+    "projectCreated": "プロジェクト「{name}」を作成しました",
+    "createProjectFailed": "プロジェクトを作成できませんでした: {error}",
     "noTasks": "タスクなし",
     "chooseProject": "プロジェクトを選択",
     "webPickerScope": "ここには Gateway ホスト上のパスが表示されます。",
@@ -30,6 +38,8 @@
     "unpin": "ピン留めを解除",
     "deleteHistory": "プロジェクトのタスク履歴を削除",
     "removeProject": "プロジェクトを削除",
+    "menuDeleteHistory": "履歴を削除",
+    "menuRemove": "リストから外す",
     "deleteHistoryTitle": "プロジェクトのタスク履歴を削除しますか？",
     "deleteHistoryBody": "{name} の {count} 件のタスクを完全に削除します。プロジェクト内のファイルは削除されません。",
     "deleteHistoryConfirm": "履歴を削除",
@@ -2902,6 +2912,7 @@
     "thinkingForSeconds": "思考中 · {seconds} 秒",
     "thoughtForSeconds": "{seconds} 秒間思考",
     "thoughtForMinutes": "{minutes} 分 {seconds} 秒間思考",
+    "activityTechnicalDetails": "技術的な詳細",
     "toolResult": "ツールの結果",
     "subagentPrefix": "サブエージェント: ",
     "subagentCompletion": "サブエージェントの完了",
@@ -2973,6 +2984,8 @@
     "activityWorking": "作業中",
     "workedForSeconds": "{seconds} 秒間作業",
     "workedForMinutes": "{minutes} 分 {seconds} 秒間作業",
+    "activityDurationSeconds": "{seconds} 秒",
+    "activityDurationMinutes": "{minutes} 分 {seconds} 秒",
     "activity": {
       "lifecycle": {
         "working": "作業中",
@@ -3242,6 +3255,8 @@
     },
     "chips": {
       "whatCanYouDo": "何ができますか？",
+      "buildGame": "ゲームを作って",
+      "buildGamePrompt": "レスポンスの良い操作、加速とブレーキ、見やすいコース、衝突判定、チェックポイント、ラップタイム計測、リスタート手順を備えた、ブラウザで遊べるボクセルレーシングゲームのプロトタイプを構築してください。ボクセル調のレーシングカーと風景は有料素材を使わずコードで生成してください。ゲームを実行し、操作をテストし、進行を妨げる問題を修正してから納品してください。美しい風景とオープンワールドを実現し、マップ上にスポンサーのイースターエッグとして OpenSquilla と TokenRhythm の看板を配置してください。",
       "summarizeWebpage": "ウェブページを要約して",
       "planWeek": "今週の計画を立てて",
       "searchAiNews": "今日の AI ニュースを検索して",
@@ -3313,6 +3328,7 @@
     },
     "msgMeta": {
       "ensembleModels": "アンサンブル · {count} モデル",
+      "model": "モデル",
       "tokens": "トークン",
       "cache": "キャッシュ",
       "think": "推論",
