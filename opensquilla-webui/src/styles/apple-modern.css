@@ -837,8 +837,9 @@ select:focus,
 /* Settings reads like a macOS preference window: one floating sheet, a quiet
    navigation rail, and content grouped by whitespace instead of rules. */
 #app .settings-overlay {
-  backdrop-filter: blur(18px) saturate(0.9);
-  -webkit-backdrop-filter: blur(18px) saturate(0.9);
+  background: color-mix(in srgb, var(--scrim) 28%, transparent);
+  backdrop-filter: blur(12px) saturate(0.98);
+  -webkit-backdrop-filter: blur(12px) saturate(0.98);
 }
 
 #app .settings-overlay .settings-modal {
