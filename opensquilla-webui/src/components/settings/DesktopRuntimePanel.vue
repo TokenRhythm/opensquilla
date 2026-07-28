@@ -9,6 +9,7 @@ import {
   type DesktopMainWindowCloseBehavior,
   type DesktopPreferences,
   type GatewayStatus,
+  type WorkbenchPreviewMode,
 } from '@/platform'
 import { useToasts } from '@/composables/useToasts'
 
@@ -24,6 +25,7 @@ const busy = ref(false)
 const gateway = shallowRef<GatewayStatus | null>(null)
 const desktopPreferences = shallowRef<DesktopPreferences | null>(null)
 const closeBehavior = ref<DesktopMainWindowCloseBehavior>('quit')
+const previewMode = ref<WorkbenchPreviewMode>('full')
 const preferencesSaving = ref(false)
 // Read-failure state, tracked separately from the loaded value: a failed read
 // keeps the preference row visible with an inline error and Retry, while an
@@ -75,11 +77,39 @@ async function loadDesktopPreferences() {
     const preferences = await platform.settings.getDesktopPreferences()
     desktopPreferences.value = preferences
     closeBehavior.value = preferences.mainWindowCloseBehavior
+    previewMode.value = preferences.workbenchPreviewMode ?? 'full'
     preferencesLoadError.value = ''
   } catch (err) {
     preferencesLoadError.value = err instanceof Error ? err.message : String(err)
   } finally {
     preferencesLoading.value = false
+  }
+}
+
+async function savePreviewMode(event: Event) {
+  const value = (event.target as HTMLSelectElement).value as WorkbenchPreviewMode
+  const previous = previewMode.value
+  if (
+    (value !== 'full' && value !== 'offline')
+    || !platform.settings.saveDesktopPreferences
+  ) return
+
+  previewMode.value = value
+  preferencesSaving.value = true
+  try {
+    const saved = await platform.settings.saveDesktopPreferences({
+      workbenchPreviewMode: value,
+    })
+    desktopPreferences.value = saved
+    closeBehavior.value = saved.mainWindowCloseBehavior
+    previewMode.value = saved.workbenchPreviewMode ?? value
+  } catch (err) {
+    previewMode.value = previous
+    pushToast(t('setup.runtime.previewModeSaveFailed', {
+      error: err instanceof Error ? err.message : String(err),
+    }), { tone: 'danger' })
+  } finally {
+    preferencesSaving.value = false
   }
 }
 
@@ -286,6 +316,53 @@ onMounted(() => {
         >
           {{ t('setup.runtime.closeBehaviorRetry') }}
         </button>
+      </div>
+    </div>
+
+    <div
+      v-if="desktopPreferences"
+      class="control-row desktop-preferences"
+      data-testid="desktop-preview-mode"
+    >
+      <div class="control-row__label-block">
+        <label for="desktop-preview-mode-select" class="control-row__label">
+          {{ t('setup.runtime.previewModeLabel') }}
+        </label>
+        <span id="desktop-preview-mode-description" class="control-row__desc">
+          {{ t('setup.runtime.previewModeDesc') }}
+        </span>
+      </div>
+      <div class="control-row__control">
+        <span
+          v-if="desktopPreferences.workbenchPreviewForcedOffline"
+          id="desktop-preview-mode-forced"
+          class="desktop-preferences__error"
+          role="status"
+          data-testid="desktop-preview-mode-forced"
+        >
+          {{ t('setup.runtime.previewModeForcedOffline') }}
+        </span>
+        <span
+          v-else-if="preferencesSaving"
+          class="desktop-preferences__saving"
+          role="status"
+        >
+          {{ t('setup.runtime.previewModeSaving') }}
+        </span>
+        <select
+          id="desktop-preview-mode-select"
+          class="control-input desktop-preferences__select"
+          data-testid="desktop-preview-mode-select"
+          :value="previewMode"
+          :disabled="preferencesSaving"
+          :aria-describedby="desktopPreferences.workbenchPreviewForcedOffline
+            ? 'desktop-preview-mode-description desktop-preview-mode-forced'
+            : 'desktop-preview-mode-description'"
+          @change="savePreviewMode"
+        >
+          <option value="full">{{ t('setup.runtime.previewModeFull') }}</option>
+          <option value="offline">{{ t('setup.runtime.previewModeOffline') }}</option>
+        </select>
       </div>
     </div>
 

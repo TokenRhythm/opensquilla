@@ -231,7 +231,7 @@ from opensquilla.usage_reasons import (
 )
 
 from .context import ContextAssembly
-from .subagent import SubagentManager, SubagentSpec
+from .subagent import SubagentManager, SubagentSpec, SubagentUsage
 from .types import (
     _THINKING_BUDGET_DEFAULT,
     AgentConfig,
@@ -735,6 +735,69 @@ def _cost_source_for_usage(
     return "unavailable"
 
 
+_ESTIMATE_COST_SOURCES = frozenset(
+    {"opensquilla_estimate", "opensquilla_static_estimate"}
+)
+
+
+def _cost_component_flags(
+    *,
+    cost_source: str,
+    cost_usd: float,
+    billed_cost: float,
+    missing_cost_entries: int = 0,
+    estimate_basis: str | None = None,
+    infer_missing: bool = True,
+) -> tuple[bool, bool, int]:
+    """Return billed, estimated, and missing components for one usage report."""
+    source = str(cost_source or "").strip().lower()
+    if source == "openrouter_usage":
+        source = "provider_billed"
+    billed = (
+        source == "provider_billed"
+        or billed_cost > 0.0
+        or (source == "mixed" and missing_cost_entries <= 0)
+    )
+    estimated = source in _ESTIMATE_COST_SOURCES or cost_usd > billed_cost + 1e-12
+    missing = max(0, int(missing_cost_entries or 0))
+    if (
+        infer_missing
+        and source == "unavailable"
+        and estimate_basis != "free"
+        and missing == 0
+    ):
+        missing = 1
+    return billed, estimated, missing
+
+
+def _classify_cost_components(
+    *,
+    has_billed: bool,
+    has_estimate: bool,
+    missing_cost_entries: int,
+    estimate_source: str = "opensquilla_estimate",
+) -> str:
+    """Classify billed, estimated, and missing cost components."""
+    category_count = sum(
+        (
+            bool(has_billed),
+            bool(has_estimate),
+            missing_cost_entries > 0,
+        )
+    )
+    if category_count > 1:
+        return "mixed"
+    if has_billed:
+        return "provider_billed"
+    if has_estimate:
+        return (
+            estimate_source
+            if estimate_source in _ESTIMATE_COST_SOURCES
+            else "opensquilla_estimate"
+        )
+    return "unavailable"
+
+
 def _usage_int(value: Any) -> int:
     try:
         return max(0, int(value or 0))
@@ -749,24 +812,126 @@ def _usage_float(value: Any) -> float:
         return 0.0
 
 
-def _model_usage_row_cost_source(sources: list[str], *, cost_usd: float) -> str:
-    meaningful = [source for source in sources if source not in {"", "none"}]
-    if not meaningful:
-        return "unavailable" if cost_usd <= 0.0 else "opensquilla_estimate"
-    unique = set(meaningful)
-    if unique == {"provider_billed"}:
-        return "provider_billed"
-    if unique <= {"opensquilla_estimate", "unavailable"}:
-        return "opensquilla_estimate" if cost_usd > 0.0 else "unavailable"
-    return "mixed"
+def _subagent_usage_breakdown_rows(usage: SubagentUsage) -> list[dict[str, Any]]:
+    """Return copied child rows, or one synthetic row for a legacy child."""
+    if usage.model_usage_breakdown:
+        rows = [dict(row) for row in usage.model_usage_breakdown]
+    elif usage.model:
+        estimated_cost = max(0.0, usage.cost_usd - usage.billed_cost)
+        rows = [
+            {
+                "role": "subagent",
+                "label": "subagent",
+                "provider": usage.provider,
+                "model": usage.model,
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "reasoning_tokens": usage.reasoning_tokens,
+                "cached_tokens": usage.cached_tokens,
+                "cache_write_tokens": usage.cache_write_tokens,
+                "cost_usd": usage.cost_usd,
+                "billed_cost": usage.billed_cost,
+                "billed_cost_usd": usage.billed_cost,
+                "estimated_cost_usd": estimated_cost,
+                "cost_source": usage.cost_source,
+                "estimate_basis": usage.estimate_basis,
+                "missing_cost_entries": usage.missing_cost_entries,
+                "request_count": 1,
+            }
+        ]
+    else:
+        return []
+    for row in rows:
+        # A child Agent already finalized the cost fields in these rows. The
+        # parent must aggregate that report, not re-price it with its own
+        # provider/model defaults.
+        row["_opensquilla_reported_cost"] = True
+    return rows
+
+
+def _add_subagent_usage_to_tracker(
+    tracker: Any,
+    session_key: str,
+    usage: SubagentUsage,
+    rows: list[dict[str, Any]],
+) -> None:
+    """Add a completed child's physical model rows to the parent session tracker."""
+    session_usage = tracker.get(session_key)
+    session_model = getattr(session_usage, "model_id", "") if session_usage else ""
+    session_provider = getattr(session_usage, "provider", "") if session_usage else ""
+    if not rows:
+        tracker.add(
+            session_key,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            model_id=usage.model,
+            cache_read_tokens=usage.cached_tokens,
+            cache_write_tokens=usage.cache_write_tokens,
+            billed_cost=usage.billed_cost,
+            provider=usage.provider,
+            cost_source=usage.cost_source,
+        )
+    else:
+        for row in rows:
+            cache_read = (
+                row.get("cache_read_tokens")
+                if "cache_read_tokens" in row
+                else row.get("cached_tokens", row.get("cacheReadTokens"))
+            )
+            tracker.add(
+                session_key,
+                input_tokens=_usage_int(
+                    row.get("input_tokens", row.get("inputTokens", 0))
+                ),
+                output_tokens=_usage_int(
+                    row.get("output_tokens", row.get("outputTokens", 0))
+                ),
+                model_id=str(row.get("model") or usage.model or ""),
+                cache_read_tokens=_usage_int(cache_read or 0),
+                cache_write_tokens=_usage_int(
+                    row.get("cache_write_tokens", row.get("cacheWriteTokens", 0))
+                ),
+                billed_cost=_usage_float(
+                    row.get(
+                        "billed_cost",
+                        row.get(
+                            "billedCost",
+                            row.get("billed_cost_usd", row.get("billedCostUsd", 0.0)),
+                        ),
+                    ),
+                ),
+                provider=str(row.get("provider") or usage.provider or ""),
+                cost_source=str(
+                    row.get("cost_source")
+                    or row.get("costSource")
+                    or usage.cost_source
+                ),
+            )
+    current_session_usage = tracker.get(session_key)
+    if current_session_usage is not None:
+        # The child rows belong in the model breakdown, but the session's
+        # terminal identity remains the parent model/provider.
+        current_session_usage.model_id = session_model
+        current_session_usage.provider = session_provider
+
+
+def _model_usage_row_cost_source(
+    components: list[tuple[bool, bool, int]],
+) -> str:
+    return _classify_cost_components(
+        has_billed=any(component[0] for component in components),
+        has_estimate=any(component[1] for component in components),
+        missing_cost_entries=sum(component[2] for component in components),
+    )
 
 
 def _with_model_usage_cost_fields(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     enriched: list[dict[str, Any]] = []
     for row in rows:
         item = dict(row)
+        reported_cost = bool(item.pop("_opensquilla_reported_cost", False))
         model_id = str(item.get("model") or "")
-        if model_id:
+        if model_id and not reported_cost:
             cache_read = (
                 item.get("cache_read_tokens")
                 if "cache_read_tokens" in item
@@ -808,7 +973,10 @@ def _with_model_usage_cost_fields(rows: list[dict[str, Any]]) -> list[dict[str, 
 
 def _summarize_model_usage_breakdown(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     aggregated: dict[tuple[str, str, str, str], dict[str, Any]] = {}
-    sources_by_key: dict[tuple[str, str, str, str], list[str]] = {}
+    components_by_key: dict[
+        tuple[str, str, str, str],
+        list[tuple[bool, bool, int]],
+    ] = {}
     for row in _with_model_usage_cost_fields(rows):
         model_id = str(row.get("model") or "").strip()
         if not model_id:
@@ -834,9 +1002,10 @@ def _summarize_model_usage_breakdown(rows: list[dict[str, Any]]) -> list[dict[st
                 "cost_usd": 0.0,
                 "billed_cost_usd": 0.0,
                 "estimated_cost_usd": 0.0,
+                "missing_cost_entries": 0,
                 "request_count": 0,
             }
-            sources_by_key[key] = []
+            components_by_key[key] = []
         target = aggregated[key]
         for usage_field in (
             "input_tokens",
@@ -856,8 +1025,32 @@ def _summarize_model_usage_breakdown(rows: list[dict[str, Any]]) -> list[dict[st
         target["estimated_cost_usd"] += _usage_float(
             row.get("estimated_cost_usd") or row.get("estimatedCostUsd")
         )
+        row_missing_cost_entries = _usage_int(row.get("missing_cost_entries") or 0)
+        target["missing_cost_entries"] += row_missing_cost_entries
         target["request_count"] += max(1, _usage_int(row.get("request_count") or 1))
-        sources_by_key[key].append(str(row.get("cost_source") or row.get("costSource") or "none"))
+        components_by_key[key].append(
+            _cost_component_flags(
+                cost_source=str(
+                    row.get("cost_source") or row.get("costSource") or "none"
+                ),
+                cost_usd=_usage_float(row.get("cost_usd") or row.get("costUsd")),
+                billed_cost=_usage_float(
+                    row.get("billed_cost")
+                    or row.get("billedCost")
+                    or row.get("billed_cost_usd")
+                    or row.get("billedCostUsd")
+                ),
+                missing_cost_entries=row_missing_cost_entries,
+                estimate_basis=(
+                    str(
+                        row.get("estimate_basis")
+                        or row.get("estimateBasis")
+                        or ""
+                    )
+                    or None
+                ),
+            )
+        )
 
     summarized: list[dict[str, Any]] = []
     for key, row in aggregated.items():
@@ -866,8 +1059,7 @@ def _summarize_model_usage_breakdown(rows: list[dict[str, Any]]) -> list[dict[st
         row["billed_cost_usd"] = round(float(row["billed_cost_usd"] or 0.0), 6)
         row["estimated_cost_usd"] = round(float(row["estimated_cost_usd"] or 0.0), 6)
         row["cost_source"] = _model_usage_row_cost_source(
-            sources_by_key.get(key, []),
-            cost_usd=float(row["cost_usd"] or 0.0),
+            components_by_key.get(key, []),
         )
         row["costUsd"] = row["cost_usd"]
         row["billedCostUsd"] = row["billed_cost_usd"]
@@ -4985,6 +5177,7 @@ class Agent:
         total_billed_cost = 0.0
         total_provider_billed_entries = 0
         total_unbilled_entries = 0
+        total_missing_cost_entries = 0
         # Estimate-backed accumulator for max_turn_cost_usd: billed cost when a
         # call reported one, otherwise the layered-resolver estimate — unlike
         # total_billed_cost, this never sits at 0.0 for a cost-blind provider.
@@ -6451,6 +6644,9 @@ class Agent:
                                 total_reasoning_tokens += raw_ev.reasoning_tokens
                                 total_cached_tokens += raw_ev.cached_tokens
                                 total_cache_write_tokens += raw_ev.cache_write_tokens
+                                total_missing_cost_entries += _usage_int(
+                                    getattr(raw_ev, "usage_missing_count", 0)
+                                )
                                 usage_breakdown = getattr(
                                     raw_ev,
                                     "model_usage_breakdown",
@@ -10576,11 +10772,6 @@ class Agent:
             )
             estimate_basis = "free" if turn_estimate.basis == "free" and has_turn_tokens else None
 
-        session_totals = (
-            self._usage_tracker.session_snapshot(self._session_key)
-            if self._usage_tracker and self._session_key
-            else None
-        )
         turn_usage_delta = (
             self._usage_tracker.session_delta_snapshot(self._session_key, usage_turn_baseline)
             if self._usage_tracker and self._session_key
@@ -10620,18 +10811,72 @@ class Agent:
                 # "unavailable": no estimated dollars in the reported cost.
                 estimate_basis = None
 
-        has_usage = bool(
+        # Freeze the parent delta before any completed child usage is added to
+        # the shared tracker. This keeps the current turn from counting its own
+        # child twice while allowing later session snapshots to retain settled
+        # child usage even though each production turn gets a new manager.
+        message_output_tokens = done_output_tokens
+        done_reasoning_tokens = total_reasoning_tokens
+        parent_has_usage = bool(
             done_input_tokens
             or done_output_tokens
-            or total_reasoning_tokens
+            or done_reasoning_tokens
             or done_cached_tokens
             or done_cache_write_tokens
             or done_billed_cost
             or total_provider_billed_entries
         )
-        summarized_model_usage_breakdown = _summarize_model_usage_breakdown(
-            turn_model_usage_breakdown
+        has_billed_component, has_estimated_component, missing_cost_entries = (
+            _cost_component_flags(
+                cost_source=cost_source,
+                cost_usd=done_cost,
+                billed_cost=done_billed_cost,
+                missing_cost_entries=total_missing_cost_entries,
+                estimate_basis=estimate_basis,
+                infer_missing=parent_has_usage,
+            )
         )
+        estimate_bases = (
+            [estimate_basis]
+            if has_estimated_component and estimate_basis not in {None, "free"}
+            else []
+        )
+        has_free_cost_component = bool(
+            parent_has_usage
+            and estimate_basis == "free"
+            and missing_cost_entries == 0
+            and not has_estimated_component
+        )
+        estimate_source = (
+            cost_source
+            if cost_source in _ESTIMATE_COST_SOURCES
+            else "opensquilla_estimate"
+        )
+        parent_breakdown_rows: list[dict[str, Any]] = []
+        if parent_has_usage and not turn_model_usage_breakdown and done_model:
+            parent_estimated_cost = max(0.0, done_cost - done_billed_cost)
+            parent_breakdown_rows = [
+                {
+                    "role": "agent",
+                    "label": "agent",
+                    "provider": done_provider,
+                    "model": done_model,
+                    "input_tokens": done_input_tokens,
+                    "output_tokens": done_output_tokens,
+                    "reasoning_tokens": done_reasoning_tokens,
+                    "cached_tokens": done_cached_tokens,
+                    "cache_write_tokens": done_cache_write_tokens,
+                    "cost_usd": done_cost,
+                    "billed_cost": done_billed_cost,
+                    "billed_cost_usd": done_billed_cost,
+                    "estimated_cost_usd": parent_estimated_cost,
+                    "cost_source": cost_source,
+                    "estimate_basis": estimate_basis,
+                    "missing_cost_entries": missing_cost_entries,
+                    "request_count": max(1, turn_llm_calls),
+                    "_opensquilla_reported_cost": True,
+                }
+            ]
         final_ensemble_trace = (
             dict(last_ensemble_trace) if isinstance(last_ensemble_trace, dict) else None
         )
@@ -10686,14 +10931,102 @@ class Agent:
                         injected_to_model=False,
                         hint_text=None,
                     )
+        if terminal_error is None:
+            # This is the final suspension point before child usage is
+            # consumed. Cancellation while the DONE state event is being
+            # delivered leaves every handle available and unmodified.
+            yield self._transition(AgentState.DONE)
+
+        # Do not add an await or another yield between this drain and the
+        # terminal DoneEvent. A completed child is marked consumed only inside
+        # the same event-loop slice that delivers the aggregate report.
+        rolled_subagent_usage = False
+        for child_usage in self.subagent_manager.drain_completed_usage():
+            rolled_subagent_usage = True
+            child_rows = _subagent_usage_breakdown_rows(child_usage)
+            turn_model_usage_breakdown.extend(child_rows)
+            done_input_tokens += child_usage.input_tokens
+            done_output_tokens += child_usage.output_tokens
+            done_reasoning_tokens += child_usage.reasoning_tokens
+            done_cached_tokens += child_usage.cached_tokens
+            done_cache_write_tokens += child_usage.cache_write_tokens
+            done_cost += child_usage.cost_usd
+            done_billed_cost += child_usage.billed_cost
+            child_billed, child_estimated, child_missing = _cost_component_flags(
+                cost_source=child_usage.cost_source,
+                cost_usd=child_usage.cost_usd,
+                billed_cost=child_usage.billed_cost,
+                missing_cost_entries=child_usage.missing_cost_entries,
+                estimate_basis=child_usage.estimate_basis,
+                infer_missing=child_usage.has_usage,
+            )
+            has_billed_component |= child_billed
+            has_estimated_component |= child_estimated
+            missing_cost_entries += child_missing
+            if (
+                child_estimated
+                and child_usage.estimate_basis not in {None, "free"}
+            ):
+                estimate_bases.append(child_usage.estimate_basis)
+            has_free_cost_component |= bool(
+                child_usage.has_usage
+                and child_usage.estimate_basis == "free"
+                and child_missing == 0
+                and not child_estimated
+            )
+            if (
+                estimate_source == "opensquilla_estimate"
+                and child_usage.cost_source in _ESTIMATE_COST_SOURCES
+            ):
+                estimate_source = child_usage.cost_source
+            if self._usage_tracker and self._session_key:
+                _add_subagent_usage_to_tracker(
+                    self._usage_tracker,
+                    self._session_key,
+                    child_usage,
+                    child_rows,
+                )
+
+        cost_source = _classify_cost_components(
+            has_billed=has_billed_component,
+            has_estimate=has_estimated_component,
+            missing_cost_entries=missing_cost_entries,
+            estimate_source=estimate_source,
+        )
+        if has_estimated_component:
+            estimate_basis = estimate_bases[0] if estimate_bases else None
+        elif missing_cost_entries:
+            estimate_basis = None
+        else:
+            estimate_basis = "free" if has_free_cost_component else None
+        session_totals = (
+            self._usage_tracker.session_snapshot(self._session_key)
+            if self._usage_tracker and self._session_key
+            else None
+        )
+        summarized_model_usage_breakdown = _summarize_model_usage_breakdown(
+            [
+                *(parent_breakdown_rows if rolled_subagent_usage else []),
+                *turn_model_usage_breakdown,
+            ]
+        )
+        has_usage = bool(
+            done_input_tokens
+            or done_output_tokens
+            or done_reasoning_tokens
+            or done_cached_tokens
+            or done_cache_write_tokens
+            or done_cost
+            or done_billed_cost
+            or missing_cost_entries
+            or total_provider_billed_entries
+        )
         if terminal_error is None or has_usage:
-            if terminal_error is None:
-                yield self._transition(AgentState.DONE)
-            yield DoneEvent(
+            done_event = DoneEvent(
                 text="".join(final_text_parts),
                 input_tokens=done_input_tokens,
                 output_tokens=done_output_tokens,
-                reasoning_tokens=total_reasoning_tokens,
+                reasoning_tokens=done_reasoning_tokens,
                 cached_tokens=done_cached_tokens,
                 cache_write_tokens=done_cache_write_tokens,
                 iterations=iterations,
@@ -10712,7 +11045,10 @@ class Agent:
                 ensemble_trace=final_ensemble_trace,
                 estimate_basis=estimate_basis,
                 text_snapshot="".join(final_text_parts),
+                message_output_tokens=message_output_tokens,
+                missing_cost_entries=missing_cost_entries,
             )
+            yield done_event
         # Reset for next turn
         self._state = AgentState.IDLE
 

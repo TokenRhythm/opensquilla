@@ -46,4 +46,5 @@ export type {
   PlatformUpdatesApi,
   PlatformSettingsApi,
   SearchProviderOption,
+  WorkbenchPreviewMode,
 } from './types'

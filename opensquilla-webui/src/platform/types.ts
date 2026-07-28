@@ -94,11 +94,17 @@ export interface DesktopSettingsPayload {
 }
 
 export type DesktopMainWindowCloseBehavior = 'background' | 'quit' | 'ask'
+export type WorkbenchPreviewMode = 'full' | 'offline'
 
 export interface DesktopPreferences {
+  schemaVersion?: number
   mainWindowCloseBehavior: DesktopMainWindowCloseBehavior
   canRunInBackground: boolean
   platform: 'darwin' | 'win32' | 'linux' | 'other'
+  workbenchPreviewMode?: WorkbenchPreviewMode
+  effectiveWorkbenchPreviewMode?: WorkbenchPreviewMode
+  workbenchPreviewNoticeShown?: boolean
+  workbenchPreviewForcedOffline?: boolean
 }
 
 export interface PlatformCapabilities {
@@ -147,7 +153,7 @@ export interface PlatformFilesApi {
   chooseProjectDirectory?: () => Promise<{ path: string } | null>
 }
 
-export interface NativeWorkbenchCreateSurfaceRequest {
+export interface NativeWorkbenchCreateSurfaceRequestV1 {
   version: 1
   surfaceId: string
   kind: 'artifact-html'
@@ -160,6 +166,39 @@ export interface NativeWorkbenchCreateSurfaceRequest {
     /** Explicit, per-surface user choice. Defaults to false in the UI. */
     allowRemoteResources: boolean
   }
+}
+
+export interface NativeWorkbenchCreateArtifactSurfaceRequestV2 {
+  version: 2
+  surfaceId: string
+  kind: 'artifact-preview'
+  payload: {
+    launchUrl: string
+    expectedOrigin: string
+    scopeId: string
+    mode: WorkbenchPreviewMode
+  }
+}
+
+export interface NativeWorkbenchCreateUrlSurfaceRequestV2 {
+  version: 2
+  surfaceId: string
+  kind: 'url-preview'
+  payload: {
+    url: string
+    scopeId: string
+  }
+}
+
+export type NativeWorkbenchCreateSurfaceRequest =
+  | NativeWorkbenchCreateSurfaceRequestV1
+  | NativeWorkbenchCreateArtifactSurfaceRequestV2
+  | NativeWorkbenchCreateUrlSurfaceRequestV2
+
+export interface NativeWorkbenchCapabilities {
+  protocolVersions: Array<1 | 2>
+  modes: WorkbenchPreviewMode[]
+  maxSurfaces: number
 }
 
 export interface NativeWorkbenchSurfaceRectRequest {
@@ -180,22 +219,88 @@ export type NativeWorkbenchSurfaceEventType =
   | 'loading'
   | 'ready'
   | 'missing-resource'
+  | 'navigation-state'
+  | 'permission-request'
+  | 'blocked-action'
+  | 'capability-expired'
+  | 'unresponsive'
+  | 'responsive'
   | 'error'
   | 'crashed'
   | 'escape'
 
 export interface NativeWorkbenchSurfaceEvent {
-  version: 1
+  version: 1 | 2
   surfaceId: string
   type: NativeWorkbenchSurfaceEventType
   detail?: {
+    requestId?: string
+    permission?: string
+    requestingOrigin?: string
+    url?: string
+    title?: string
+    loading?: boolean
+    canGoBack?: boolean
+    canGoForward?: boolean
+    action?: string
+    code?: string
     message?: string
     path?: string
     reason?: string
   }
 }
 
+export interface NativeWorkbenchNavigateRequest {
+  version: 2
+  surfaceId: string
+  action: 'back' | 'forward' | 'reload' | 'stop' | 'navigate'
+  url?: string
+}
+
+export interface NativeWorkbenchPermissionResponse {
+  version: 2
+  surfaceId: string
+  requestId: string
+  allow: boolean
+}
+
+export interface NativeArtifactPreviewLeaseCreateRequest {
+  version: 1
+  artifactId: string
+  scopeId: string
+  mode: WorkbenchPreviewMode
+  authToken?: string
+}
+
+export interface NativeArtifactPreviewLeaseControlRequest {
+  version: 1
+  leaseId: string
+  scopeId: string
+  authToken?: string
+}
+
+export type NativeArtifactPreviewLeaseBrokerResult = {
+  ok: true
+  status: number
+  payload: unknown
+} | {
+  ok: false
+  status: number
+  code: string
+  message: string
+}
+
 export interface NativeWorkbenchApi {
+  getCapabilities?(): Promise<NativeWorkbenchCapabilities>
+  createArtifactPreviewLease?(
+    request: NativeArtifactPreviewLeaseCreateRequest,
+  ): Promise<NativeArtifactPreviewLeaseBrokerResult>
+  renewArtifactPreviewLease?(
+    request: NativeArtifactPreviewLeaseControlRequest,
+  ): Promise<NativeArtifactPreviewLeaseBrokerResult>
+  revokeArtifactPreviewLease?(
+    request: NativeArtifactPreviewLeaseControlRequest,
+  ): Promise<NativeArtifactPreviewLeaseBrokerResult>
   createSurface(
     request: NativeWorkbenchCreateSurfaceRequest,
   ): Promise<NativeWorkbenchSurfaceResult>
@@ -204,6 +309,12 @@ export interface NativeWorkbenchApi {
   ): Promise<NativeWorkbenchSurfaceResult>
   activateSurface(surfaceId: string): Promise<NativeWorkbenchSurfaceResult>
   destroySurface(surfaceId: string): Promise<NativeWorkbenchSurfaceResult>
+  navigateSurface?(
+    request: NativeWorkbenchNavigateRequest,
+  ): Promise<NativeWorkbenchSurfaceResult>
+  respondToPermission?(
+    request: NativeWorkbenchPermissionResponse,
+  ): Promise<NativeWorkbenchSurfaceResult>
   onSurfaceEvent(callback: (event: NativeWorkbenchSurfaceEvent) => void): () => void
 }
 
@@ -236,7 +347,11 @@ export interface PlatformSettingsApi {
   resetDesktopSettings?: () => Promise<{ ok: boolean }>
   getDesktopPreferences?: () => Promise<DesktopPreferences>
   saveDesktopPreferences?: (
-    payload: { mainWindowCloseBehavior: DesktopMainWindowCloseBehavior },
+    payload: {
+      mainWindowCloseBehavior?: DesktopMainWindowCloseBehavior
+      workbenchPreviewMode?: WorkbenchPreviewMode
+      workbenchPreviewNoticeShown?: boolean
+    },
   ) => Promise<DesktopPreferences>
 }
 

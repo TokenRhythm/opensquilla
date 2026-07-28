@@ -107,6 +107,27 @@ describe('workbench store', () => {
     expect(store.activeItemId).toBe('preview-new')
   })
 
+  it('refuses a ninth native surface without evicting a hidden item', () => {
+    const store = useWorkbenchStore()
+    const nativeItem = (id: string): WorkbenchItem => ({
+      ...item(id),
+      hostKind: 'native-webcontents',
+    })
+    for (let index = 0; index < WORKBENCH_PREVIEW_ITEM_LIMIT; index += 1) {
+      expect(store.openItem(nativeItem(`native-${index}`))).toBe(true)
+    }
+
+    expect(store.openItem(nativeItem('native-new'))).toBe(false)
+    expect(store.items).toHaveLength(WORKBENCH_PREVIEW_ITEM_LIMIT)
+    expect(store.items.map(candidate => candidate.id)).toEqual(
+      Array.from(
+        { length: WORKBENCH_PREVIEW_ITEM_LIMIT },
+        (_, index) => `native-${index}`,
+      ),
+    )
+    expect(store.activeItemId).toBe('native-7')
+  })
+
   it('updates background item payloads without stealing the active tab', () => {
     const store = useWorkbenchStore()
     store.openItem(item('collection'))

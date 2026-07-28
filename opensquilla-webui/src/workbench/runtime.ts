@@ -301,6 +301,36 @@ export class WorkbenchRuntimeManager {
       message: 'Workbench surface is no longer active',
     })
     return {
+      ...(nativeApi.getCapabilities
+        ? { getCapabilities: () => nativeApi.getCapabilities!() }
+        : {}),
+      ...(nativeApi.createArtifactPreviewLease
+        && nativeApi.renewArtifactPreviewLease
+        && nativeApi.revokeArtifactPreviewLease
+        ? {
+            createArtifactPreviewLease: request => (
+              isCurrent()
+                ? nativeApi.createArtifactPreviewLease!(request)
+                : Promise.resolve({
+                    ok: false as const,
+                    status: 409,
+                    code: 'WORKBENCH_SURFACE_INACTIVE',
+                    message: 'Workbench surface is no longer active',
+                  })
+            ),
+            renewArtifactPreviewLease: request => (
+              isCurrent()
+                ? nativeApi.renewArtifactPreviewLease!(request)
+                : Promise.resolve({
+                    ok: false as const,
+                    status: 409,
+                    code: 'WORKBENCH_SURFACE_INACTIVE',
+                    message: 'Workbench surface is no longer active',
+                  })
+            ),
+            revokeArtifactPreviewLease: request => nativeApi.revokeArtifactPreviewLease!(request),
+          }
+        : {}),
       async createSurface(request) {
         if (!isCurrent()) return ignored()
         const result = await nativeApi.createSurface(request)
@@ -332,6 +362,22 @@ export class WorkbenchRuntimeManager {
         return nativeApi.activateSurface(surfaceId)
       },
       destroySurface: surfaceId => nativeApi.destroySurface(surfaceId),
+      ...(nativeApi.navigateSurface
+        ? {
+            async navigateSurface(request) {
+              if (!isCurrent()) return ignored()
+              return nativeApi.navigateSurface!(request)
+            },
+          }
+        : {}),
+      ...(nativeApi.respondToPermission
+        ? {
+            async respondToPermission(request) {
+              if (!isCurrent()) return ignored()
+              return nativeApi.respondToPermission!(request)
+            },
+          }
+        : {}),
       onSurfaceEvent: callback => nativeApi.onSurfaceEvent(callback),
     }
   }

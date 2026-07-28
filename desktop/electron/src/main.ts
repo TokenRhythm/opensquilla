@@ -82,10 +82,19 @@ import {
   type DesktopExitPhase,
   type DesktopMainWindowCloseBehavior,
   type DesktopPreferencesFile,
+  type DesktopWorkbenchPreviewMode,
 } from './desktop-window-lifecycle.js'
 import {
+  DESKTOP_DEEP_LINK_SCHEME,
+  desktopDeepLinkArguments,
+  parseDesktopDeepLink,
+} from './desktop-deep-link.js'
+import {
+  NATIVE_WORKBENCH_CAPABILITIES,
   NATIVE_WORKBENCH_ARTIFACT_SCHEME,
   parseNativeWorkbenchCreateRequest,
+  parseNativeWorkbenchNavigationRequest,
+  parseNativeWorkbenchPermissionResponse,
   parseNativeWorkbenchSurfaceId,
   parseNativeWorkbenchSurfaceRectRequest,
   type NativeWorkbenchSurfaceEvent,
@@ -94,6 +103,9 @@ import {
   NativeWorkbenchSurfaceManager,
 } from './native-workbench-surface.js'
 import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
+import {
+  ArtifactPreviewLeaseBroker,
+} from './artifact-preview-lease-broker.js'
 
 protocol.registerSchemesAsPrivileged([{
   scheme: NATIVE_WORKBENCH_ARTIFACT_SCHEME,
@@ -226,10 +238,17 @@ interface DesktopSettingsSnapshot {
 
 interface DesktopPreferencesPayload {
   mainWindowCloseBehavior?: unknown
+  workbenchPreviewMode?: unknown
+  workbenchPreviewNoticeShown?: unknown
 }
 
 interface DesktopPreferencesSnapshot {
+  schemaVersion: 2
   mainWindowCloseBehavior: DesktopMainWindowCloseBehavior
+  workbenchPreviewMode: DesktopWorkbenchPreviewMode
+  effectiveWorkbenchPreviewMode: DesktopWorkbenchPreviewMode
+  workbenchPreviewNoticeShown: boolean
+  workbenchPreviewForcedOffline: boolean
   canRunInBackground: boolean
   platform: 'darwin' | 'win32' | 'linux' | 'other'
 }
@@ -332,6 +351,8 @@ let systemSessionEnding = false
 let windowsSessionEndPreviousPhase: DesktopExitPhase | null = null
 let windowsSessionEndResetTimer: NodeJS.Timeout | null = null
 let mainWindowClosePrompt: Promise<void> | null = null
+let pendingDesktopDeepLinkOpen = false
+let desktopDeepLinkActivationReady = false
 let desktopPreferencesCache: {
   value: DesktopPreferencesFile
   writable: boolean
@@ -466,11 +487,26 @@ const gatewayState: GatewayState = {
   logPath: '',
 }
 
+const artifactPreviewLeaseBroker = new ArtifactPreviewLeaseBroker({
+  getOwnedGatewayUrl: () => (
+    gatewayState.owned && gatewayState.status === 'ready'
+      ? gatewayState.url
+      : null
+  ),
+})
+
 const nativeWorkbenchSurfaces = new NativeWorkbenchSurfaceManager({
+  forceArtifactPreviewsOffline: process.env.OPENSQUILLA_PREVIEW_FORCE_OFFLINE === '1',
+  getPrivilegedGatewayUrl: () => (
+    gatewayState.status === 'ready' && gatewayState.url
+      ? gatewayState.url
+      : null
+  ),
   getWindow: () => currentMainWindow(),
   emit: event => {
     if (event.type === 'error' || event.type === 'crashed') {
       desktopLog('native_workbench_surface_failed', {
+        platform: process.platform,
         type: event.type,
         reason: nativeWorkbenchFailureReason(event),
       })
@@ -1987,8 +2023,16 @@ function loadDesktopPreferencesRecord(): {
 
 function desktopPreferencesSnapshot(): DesktopPreferencesSnapshot {
   const preferences = loadDesktopPreferencesRecord().value
+  const previewForcedOffline = process.env.OPENSQUILLA_PREVIEW_FORCE_OFFLINE === '1'
   return {
+    schemaVersion: 2,
     mainWindowCloseBehavior: preferences.main_window_close_behavior,
+    workbenchPreviewMode: preferences.workbench_preview_mode,
+    effectiveWorkbenchPreviewMode: previewForcedOffline
+      ? 'offline'
+      : preferences.workbench_preview_mode,
+    workbenchPreviewNoticeShown: preferences.workbench_preview_notice_shown,
+    workbenchPreviewForcedOffline: previewForcedOffline,
     canRunInBackground: canRunDesktopInBackground(),
     platform: desktopPlatformName(),
   }
@@ -2027,15 +2071,39 @@ async function saveDesktopPreferences(
   payload: DesktopPreferencesPayload,
 ): Promise<DesktopPreferencesSnapshot> {
   const behavior = payload?.mainWindowCloseBehavior
-  if (behavior !== 'background' && behavior !== 'quit' && behavior !== 'ask') {
+  const previewMode = payload?.workbenchPreviewMode
+  const previewNoticeShown = payload?.workbenchPreviewNoticeShown
+  if (
+    behavior !== undefined
+    && behavior !== 'background'
+    && behavior !== 'quit'
+    && behavior !== 'ask'
+  ) {
     throw new Error('Choose a supported main-window close behavior.')
   }
-  if (behavior !== 'quit' && !canRunDesktopInBackground()) {
+  if (behavior !== undefined && behavior !== 'quit' && !canRunDesktopInBackground()) {
     throw new Error('Background window mode is unavailable because no restore surface is active.')
+  }
+  if (previewMode !== undefined && previewMode !== 'full' && previewMode !== 'offline') {
+    throw new Error('Choose a supported Workbench preview mode.')
+  }
+  if (previewNoticeShown !== undefined && typeof previewNoticeShown !== 'boolean') {
+    throw new Error('The Workbench preview notice state is invalid.')
+  }
+  if (
+    behavior === undefined
+    && previewMode === undefined
+    && previewNoticeShown === undefined
+  ) {
+    throw new Error('No supported Desktop preference was provided.')
   }
   return await enqueueDesktopPreferencesUpdate((current) => ({
     ...current,
-    main_window_close_behavior: behavior,
+    ...(behavior !== undefined ? { main_window_close_behavior: behavior } : {}),
+    ...(previewMode !== undefined ? { workbench_preview_mode: previewMode } : {}),
+    ...(previewNoticeShown !== undefined
+      ? { workbench_preview_notice_shown: previewNoticeShown }
+      : {}),
   }))
 }
 
@@ -2542,6 +2610,7 @@ async function saveDesktopSettings(payload: DesktopSettingsPayload): Promise<Des
 }
 
 function clearReusableGatewayState(): void {
+  artifactPreviewLeaseBroker.clear()
   gatewayState.url = ''
   gatewayState.port = 0
   gatewayState.owned = false
@@ -4149,14 +4218,108 @@ function hideMainWindow(window: BrowserWindow): void {
   showWindowsBackgroundCloseNotice()
 }
 
+async function activateMainWindow(source = 'desktop-activation'): Promise<void> {
+  if (!canRevealDesktopApp(appExitPhase)) {
+    desktopLog('main_window_activation_ignored', { source, appExitPhase })
+    return
+  }
+
+  // Surface an existing window immediately while any single-flight startup or
+  // Gateway recovery continues in the background.
+  if (process.platform === 'darwin') app.focus({ steal: true })
+  const focusedImmediately = focusMainWindow()
+
+  // Profile migration, cleanup, update, and quit drains may safely reveal an
+  // existing renderer, but must not create a replacement window or Gateway.
+  if (isQuitting) {
+    desktopLog('main_window_activation_during_shutdown', {
+      source,
+      focused: focusedImmediately,
+    })
+    return
+  }
+
+  // Activating an existing window is complete after the synchronous focus
+  // sequence above. Starting another open flow here can invalidate a startup
+  // that is still settling and later re-show a window the user has hidden.
+  if (focusedImmediately) {
+    desktopLog('main_window_activated', {
+      source,
+      created: false,
+      focused: true,
+    })
+    return
+  }
+
+  await openOrResumeDesktopApp()
+
+  // openOrResumeDesktopApp creates the window when it was absent. Repeat the
+  // idempotent focus sequence after that asynchronous boundary.
+  if (process.platform === 'darwin') app.focus({ steal: true })
+  const focused = focusMainWindow()
+  desktopLog('main_window_activated', {
+    source,
+    created: true,
+    focused,
+  })
+}
+
 function revealDesktopApp(): void {
-  if (!canRevealDesktopApp(appExitPhase)) return
-  focusMainWindow()
-  // Profile migration and cleanup reuse isQuitting as a spawn gate. The hidden
-  // renderer is still safe to reveal during those operations, but opening a
-  // missing window or starting another Gateway is not.
-  if (isQuitting) return
-  void openOrResumeDesktopApp()
+  void activateMainWindow('desktop-reveal')
+}
+
+function handleDeepLink(rawUrl: unknown, source = 'unknown'): boolean {
+  const action = parseDesktopDeepLink(rawUrl)
+  if (action !== 'open') {
+    // Never persist an untrusted URL: query strings may contain credentials or
+    // other private browser state even though this parser rejects them.
+    desktopLog('deep_link_ignored', { source })
+    return false
+  }
+
+  desktopLog('deep_link_accepted', {
+    source,
+    action,
+    activationReady: desktopDeepLinkActivationReady,
+  })
+  if (!desktopDeepLinkActivationReady) {
+    pendingDesktopDeepLinkOpen = true
+    return true
+  }
+
+  void activateMainWindow(`deep-link:${source}`)
+  return true
+}
+
+function handleDeepLinksFromCommandLine(
+  commandLine: readonly string[],
+  source: string,
+): boolean {
+  const candidates = desktopDeepLinkArguments(commandLine)
+  for (const candidate of candidates) handleDeepLink(candidate, source)
+  return candidates.length > 0
+}
+
+function activatePendingDesktopDeepLink(): boolean {
+  if (!pendingDesktopDeepLinkOpen) return false
+  pendingDesktopDeepLinkOpen = false
+  void activateMainWindow('deep-link:pending')
+  return true
+}
+
+function registerDesktopDeepLinkProtocolClient(): void {
+  if (!app.isPackaged) {
+    desktopLog('deep_link_protocol_registration_skipped', { reason: 'development' })
+    return
+  }
+  try {
+    const registered = app.setAsDefaultProtocolClient(DESKTOP_DEEP_LINK_SCHEME)
+    desktopLog('deep_link_protocol_registered', { registered })
+  } catch (error) {
+    desktopLog('deep_link_protocol_registration_failed', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }
 }
 
 async function promptForMainWindowClose(window: BrowserWindow): Promise<void> {
@@ -7570,6 +7733,7 @@ async function recoverVerifiedOrphanGatewayBeforeSpawn(
 async function startGateway(): Promise<GatewayState> {
   const reusableGateway = forceOnboardingOnNextStartup ? null : await reuseHealthyGatewayState()
   if (reusableGateway) return reusableGateway
+  artifactPreviewLeaseBroker.clear()
 
   assertSupportedMacInstallLocation()
 
@@ -8361,6 +8525,7 @@ function terminateGatewayProcess(
 }
 
 function stopGateway(): void {
+  artifactPreviewLeaseBroker.clear()
   if (!gatewayProcess || !gatewayState.owned) return
   const child = gatewayProcess
   const url = gatewayState.url
@@ -9964,11 +10129,57 @@ ipcMain.handle('desktop:workspace:choose-directory', async (event) => {
   if (choice.canceled || choice.filePaths.length !== 1) return null
   return { path: resolve(choice.filePaths[0]!) }
 })
+ipcMain.handle('desktop:workbench:capabilities', (event) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  return process.env.OPENSQUILLA_PREVIEW_FORCE_OFFLINE === '1'
+    ? { ...NATIVE_WORKBENCH_CAPABILITIES, modes: ['offline'] as const }
+    : NATIVE_WORKBENCH_CAPABILITIES
+})
+ipcMain.handle('desktop:workbench:preview-lease:create', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  return await artifactPreviewLeaseBroker.create(payload)
+})
+ipcMain.handle('desktop:workbench:preview-lease:renew', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  return await artifactPreviewLeaseBroker.renew(payload)
+})
+ipcMain.handle('desktop:workbench:preview-lease:revoke', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  return await artifactPreviewLeaseBroker.revoke(payload)
+})
 ipcMain.handle('desktop:workbench:surface:create', async (event, payload: unknown) => {
   if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
   try {
-    return await nativeWorkbenchSurfaces.createSurface(
-      parseNativeWorkbenchCreateRequest(payload),
+    const request = parseNativeWorkbenchCreateRequest(payload)
+    if (
+      request.kind === 'artifact-preview'
+      && !artifactPreviewLeaseBroker.authorizesSurface(request.payload)
+    ) {
+      return {
+        ok: false,
+        message: 'The artifact preview lease is not authorized by this Desktop Gateway.',
+      }
+    }
+    return await nativeWorkbenchSurfaces.createSurface(request)
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
+})
+ipcMain.handle('desktop:workbench:surface:navigate', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  try {
+    return await nativeWorkbenchSurfaces.navigateSurface(
+      parseNativeWorkbenchNavigationRequest(payload),
+    )
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
+})
+ipcMain.handle('desktop:workbench:permission:respond', (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  try {
+    return nativeWorkbenchSurfaces.respondToPermission(
+      parseNativeWorkbenchPermissionResponse(payload),
     )
   } catch (error) {
     return { ok: false, message: error instanceof Error ? error.message : String(error) }
@@ -12180,6 +12391,7 @@ async function drainOwnedGatewayForQuit(
 
 app.on('before-quit', (event) => {
   desktopUpdateCheckScheduler.stop()
+  artifactPreviewLeaseBroker.clear()
   // Remove native child views immediately so they cannot outlive the trusted
   // Control UI while the gateway/writer shutdown drain keeps Electron alive.
   void nativeWorkbenchSurfaces.destroyAll()
@@ -12318,6 +12530,10 @@ app.on('will-quit', destroyWindowsTray)
 
 configureChromiumKeychainPolicy()
 
+const initialDesktopDeepLinkArguments = process.platform === 'win32'
+  ? desktopDeepLinkArguments(process.argv)
+  : []
+
 // Bounded retry for the single-instance lock. A relaunch immediately after
 // closing the previous instance can race that instance's teardown (Electron
 // exit + gateway TerminateProcess), during which the lock is briefly still
@@ -12338,6 +12554,14 @@ function acquireSingleInstanceLockWithRetry(): boolean {
       desktopLog('single_instance_lock_acquired', { attempt })
       return true
     }
+    // A Windows protocol launch targets the current instance and does not need
+    // the normal close/relaunch race retry. The failed lock request has already
+    // delivered its command line through second-instance; exit the forwarding
+    // process immediately instead of sending the same deep link for five seconds.
+    if (initialDesktopDeepLinkArguments.length > 0) {
+      desktopLog('single_instance_deep_link_forwarded', { attempt })
+      return false
+    }
     const remaining = deadline - Date.now()
     if (remaining <= 0) {
       desktopLog('single_instance_lock_unavailable', { attempt })
@@ -12347,6 +12571,11 @@ function acquireSingleInstanceLockWithRetry(): boolean {
   }
 }
 
+app.on('open-url', (event, rawUrl) => {
+  event.preventDefault()
+  handleDeepLink(rawUrl, 'open-url')
+})
+
 desktopLog('launch', { platform: process.platform, argv: process.argv.length })
 const gotSingleInstanceLock = acquireSingleInstanceLockWithRetry()
 
@@ -12355,22 +12584,32 @@ if (!gotSingleInstanceLock) {
   // to surface its window (the second-instance handler calls
   // openOrResumeDesktopApp), show an explicit dialog so the launch is never a
   // silent no-op, then quit.
-  desktopLog('launch_aborted_lock_held')
-  try {
-    // This runs before app.whenReady, so app.getLocale() is unreliable; fall back
-    // to the persisted onboarding locale (a plain file read) for this dialog.
-    desktopLocale = loadPersistedDesktopLocale() ?? desktopLocale
-    dialog.showErrorBox(
-      desktopT('launch.alreadyRunningTitle'),
-      desktopT('launch.alreadyRunningMessage'),
-    )
-  } catch {
-    // Dialog is best-effort; the diagnostic log is the durable record.
+  desktopLog('launch_aborted_lock_held', {
+    deepLinkHandoff: initialDesktopDeepLinkArguments.length > 0,
+  })
+  if (initialDesktopDeepLinkArguments.length === 0) {
+    try {
+      // This runs before app.whenReady, so app.getLocale() is unreliable; fall back
+      // to the persisted onboarding locale (a plain file read) for this dialog.
+      desktopLocale = loadPersistedDesktopLocale() ?? desktopLocale
+      dialog.showErrorBox(
+        desktopT('launch.alreadyRunningTitle'),
+        desktopT('launch.alreadyRunningMessage'),
+      )
+    } catch {
+      // Dialog is best-effort; the diagnostic log is the durable record.
+    }
   }
   app.quit()
 } else {
-  app.on('second-instance', () => {
-    desktopLog('second_instance')
+  if (process.platform === 'win32') {
+    handleDeepLinksFromCommandLine(process.argv, 'initial-argv')
+  }
+
+  app.on('second-instance', (_event, commandLine) => {
+    const hadDeepLink = handleDeepLinksFromCommandLine(commandLine, 'second-instance')
+    desktopLog('second_instance', { hadDeepLink })
+    if (hadDeepLink) return
     revealDesktopApp()
   })
 
@@ -12379,7 +12618,9 @@ if (!gotSingleInstanceLock) {
     desktopLocale = loadPersistedDesktopLocale() ?? resolveDesktopLocale()
     createApplicationMenu()
     createWindowsTray()
-    void openOrResumeDesktopApp()
+    registerDesktopDeepLinkProtocolClient()
+    desktopDeepLinkActivationReady = true
+    if (!activatePendingDesktopDeepLink()) void openOrResumeDesktopApp()
     initAutoUpdater()
     if (mockUpdateVersion() !== null) {
       desktopUpdateCheckScheduler.start(MOCK_UPDATE_CHECK_INITIAL_DELAY_MS)

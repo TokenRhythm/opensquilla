@@ -101,6 +101,13 @@ class OpenAICompatPolicy:
     # JSON Schema keywords the upstream rejects in tool definitions.
     tool_schema_unsupported_keywords: frozenset[str] = frozenset()
 
+    # Whether the chat-completions endpoint reliably supports native
+    # ``response_format.type=json_schema``.  When false, the OpenAI-compatible
+    # adapter keeps the same provider/model and places the authoritative
+    # schema in the system prompt instead; callers still validate the returned
+    # artifact locally.
+    supports_native_json_schema_output: bool = True
+
     # Text-to-tool execution is deliberately dialect- and model-scoped.  This
     # record is trusted packaged metadata: an online model catalog must never
     # be able to grant text the authority to become an executable tool call.
@@ -386,6 +393,7 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
     "tokenrhythm": OpenAICompatPolicy(
         display_name="TokenRhythm",
         official_host="tokenrhythm.studio",
+        supports_native_json_schema_output=False,
         text_tool_profile=TextToolCompatProfile(
             model_rules=(
                 TextToolModelRule(

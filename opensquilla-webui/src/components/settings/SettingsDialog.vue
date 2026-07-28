@@ -83,6 +83,11 @@
                when the gateway is down and config never loaded. -->
           <DesktopRuntimePanel v-else-if="section === 'runtime' && isDesktop" />
 
+          <!-- Memory import is an action flow with its own RPC capability gate,
+               rather than a config-backed form. It remains usable even when
+               readiness catalog loading is unavailable. -->
+          <SettingsMemoryPanel v-else-if="section === 'memory'" />
+
           <!-- Optional cross-installation discovery is deliberately mounted
                only when the user opens this section. It never runs at app or
                Settings-dialog startup. -->
@@ -232,6 +237,7 @@ import SettingsPrivacyPanel from '@/components/settings/SettingsPrivacyPanel.vue
 import SettingsAppearancePanel from '@/components/settings/SettingsAppearancePanel.vue'
 import SettingsKeyboardPanel from '@/components/settings/SettingsKeyboardPanel.vue'
 import SettingsAdvancedPanel from '@/components/settings/SettingsAdvancedPanel.vue'
+import SettingsMemoryPanel from '@/components/settings/SettingsMemoryPanel.vue'
 import DesktopRuntimePanel from '@/components/settings/DesktopRuntimePanel.vue'
 import DataMigrationPanel from '@/components/settings/DataMigrationPanel.vue'
 import { useSetupCatalog, SETTINGS_SECTIONS } from '@/composables/setup/useSetupCatalog'

@@ -359,6 +359,7 @@ jobs:
           node scripts/test-desktop-gateway-lifecycle.mjs
           node scripts/test-desktop-window-lifecycle.mjs
           node scripts/test-desktop-cleanup-contract.mjs
+          node scripts/test-artifact-preview-lease-broker.mjs
           node scripts/test-native-workbench-surface.mjs
 
   ubuntu-quality:
@@ -1014,6 +1015,7 @@ jobs:
             'window-background-flow:scripts/test-desktop-window-background-flow.mjs' \
             'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs' \
             'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs' \
+            'native-workbench-v2:scripts/test-native-workbench-v2-electron.mjs' \
             'unsafe-legacy-recovery-no-write:scripts/test-unsafe-legacy-recovery-no-write.mjs'
           do
             name="${entry%%:*}"

@@ -20,8 +20,24 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
   setNativeTheme: (payload: unknown) => ipcRenderer.invoke('desktop:theme:set', payload),
   openArtifact: (payload: unknown) => ipcRenderer.invoke('desktop:artifact:open', payload),
   chooseProjectDirectory: () => ipcRenderer.invoke('desktop:workspace:choose-directory'),
+  getWorkbenchCapabilities: () => ipcRenderer.invoke('desktop:workbench:capabilities'),
+  createArtifactPreviewLease: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:preview-lease:create', payload)
+  ),
+  renewArtifactPreviewLease: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:preview-lease:renew', payload)
+  ),
+  revokeArtifactPreviewLease: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:preview-lease:revoke', payload)
+  ),
   createWorkbenchSurface: (payload: unknown) => (
     ipcRenderer.invoke('desktop:workbench:surface:create', payload)
+  ),
+  navigateWorkbenchSurface: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:surface:navigate', payload)
+  ),
+  respondToWorkbenchPermission: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:permission:respond', payload)
   ),
   setWorkbenchSurfaceRect: (payload: unknown) => (
     ipcRenderer.invoke('desktop:workbench:surface:set-rect', payload)

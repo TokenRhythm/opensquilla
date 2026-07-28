@@ -16,10 +16,17 @@ export const DESKTOP_MAIN_WINDOW_CLOSE_BEHAVIORS = [
 export type DesktopMainWindowCloseBehavior =
   typeof DESKTOP_MAIN_WINDOW_CLOSE_BEHAVIORS[number]
 
+export const DESKTOP_WORKBENCH_PREVIEW_MODES = ['full', 'offline'] as const
+
+export type DesktopWorkbenchPreviewMode =
+  typeof DESKTOP_WORKBENCH_PREVIEW_MODES[number]
+
 export interface DesktopPreferencesFile {
-  schema_version: 1
+  schema_version: 2
   main_window_close_behavior: DesktopMainWindowCloseBehavior
   background_close_notice_shown: boolean
+  workbench_preview_mode: DesktopWorkbenchPreviewMode
+  workbench_preview_notice_shown: boolean
 }
 
 export interface DesktopPreferencesNormalization {
@@ -48,10 +55,13 @@ export interface DesktopMainWindowCloseContext {
 }
 
 const CLOSE_BEHAVIOR_SET = new Set<string>(DESKTOP_MAIN_WINDOW_CLOSE_BEHAVIORS)
+const PREVIEW_MODE_SET = new Set<string>(DESKTOP_WORKBENCH_PREVIEW_MODES)
 const PREFERENCES_KEYS = new Set<string>([
   'schema_version',
   'main_window_close_behavior',
   'background_close_notice_shown',
+  'workbench_preview_mode',
+  'workbench_preview_notice_shown',
 ])
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -64,6 +74,10 @@ function isCloseBehavior(value: unknown): value is DesktopMainWindowCloseBehavio
   return typeof value === 'string' && CLOSE_BEHAVIOR_SET.has(value)
 }
 
+function isPreviewMode(value: unknown): value is DesktopWorkbenchPreviewMode {
+  return typeof value === 'string' && PREVIEW_MODE_SET.has(value)
+}
+
 export function defaultDesktopMainWindowCloseBehavior(
   platform: NodeJS.Platform,
 ): DesktopMainWindowCloseBehavior {
@@ -72,9 +86,11 @@ export function defaultDesktopMainWindowCloseBehavior(
 
 export function defaultDesktopPreferences(platform: NodeJS.Platform): DesktopPreferencesFile {
   return {
-    schema_version: 1,
+    schema_version: 2,
     main_window_close_behavior: defaultDesktopMainWindowCloseBehavior(platform),
     background_close_notice_shown: false,
+    workbench_preview_mode: 'full',
+    workbench_preview_notice_shown: false,
   }
 }
 
@@ -92,15 +108,16 @@ export function normalizeDesktopPreferences(
   if (!payload) return { value: defaults, writable: true }
 
   const schemaVersion = payload.schema_version
-  const currentSchema = schemaVersion === 1
-  const futureSchema = Number.isSafeInteger(schemaVersion) && Number(schemaVersion) > 1
-  if (!currentSchema && !futureSchema) {
+  const legacySchema = schemaVersion === 1
+  const currentSchema = schemaVersion === 2
+  const futureSchema = Number.isSafeInteger(schemaVersion) && Number(schemaVersion) > 2
+  if (!legacySchema && !currentSchema && !futureSchema) {
     return { value: defaults, writable: true }
   }
 
   return {
     value: {
-      schema_version: 1,
+      schema_version: 2,
       main_window_close_behavior: isCloseBehavior(payload.main_window_close_behavior)
         ? payload.main_window_close_behavior
         : defaults.main_window_close_behavior,
@@ -108,13 +125,24 @@ export function normalizeDesktopPreferences(
         typeof payload.background_close_notice_shown === 'boolean'
           ? payload.background_close_notice_shown
           : false,
+      workbench_preview_mode:
+        currentSchema || futureSchema
+          ? isPreviewMode(payload.workbench_preview_mode)
+            ? payload.workbench_preview_mode
+            : defaults.workbench_preview_mode
+          : defaults.workbench_preview_mode,
+      workbench_preview_notice_shown:
+        (currentSchema || futureSchema)
+        && typeof payload.workbench_preview_notice_shown === 'boolean'
+          ? payload.workbench_preview_notice_shown
+          : false,
     },
-    writable: currentSchema,
+    writable: legacySchema || currentSchema,
   }
 }
 
 /**
- * Emit one canonical schema-v1 document. Serialization is deliberately strict:
+ * Emit one canonical schema-v2 document. Serialization is deliberately strict:
  * callers must normalize untrusted input first, and accidental future/unknown
  * fields must not be silently downgraded.
  */
@@ -122,17 +150,21 @@ export function serializeDesktopPreferences(value: DesktopPreferencesFile): stri
   const payload = record(value)
   if (
     !payload
-    || payload.schema_version !== 1
+    || payload.schema_version !== 2
     || !isCloseBehavior(payload.main_window_close_behavior)
     || typeof payload.background_close_notice_shown !== 'boolean'
+    || !isPreviewMode(payload.workbench_preview_mode)
+    || typeof payload.workbench_preview_notice_shown !== 'boolean'
     || Object.keys(payload).some((key) => !PREFERENCES_KEYS.has(key))
   ) {
-    throw new Error('Desktop preferences are not a valid schema-v1 document.')
+    throw new Error('Desktop preferences are not a valid schema-v2 document.')
   }
   const canonical: DesktopPreferencesFile = {
-    schema_version: 1,
+    schema_version: 2,
     main_window_close_behavior: payload.main_window_close_behavior,
     background_close_notice_shown: payload.background_close_notice_shown,
+    workbench_preview_mode: payload.workbench_preview_mode,
+    workbench_preview_notice_shown: payload.workbench_preview_notice_shown,
   }
   return `${JSON.stringify(canonical, null, 2)}\n`
 }

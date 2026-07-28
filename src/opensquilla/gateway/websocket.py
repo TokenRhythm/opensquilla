@@ -19,6 +19,7 @@ from opensquilla.gateway.config import (
     effective_agent_stream_idle_timeout_seconds,
     effective_webui_stream_idle_grace_seconds,
 )
+from opensquilla.gateway.origin_guard import websocket_origin_allowed
 from opensquilla.gateway.protocol import (
     PREAUTH_TIMEOUT_MS,
     PROTOCOL_VERSION,
@@ -699,6 +700,14 @@ async def handle_ws_connection(
     memory_retrievers: dict[str, Any] | None = None,
 ) -> None:
     """Main WebSocket connection handler."""
+    if not websocket_origin_allowed(ws, config):
+        log.warning(
+            "gateway.origin_rejected",
+            category="websocket_cross_origin",
+        )
+        await ws.close(code=1008)
+        return
+
     conn_id = str(uuid.uuid4())
     conn = WsConnection(conn_id=conn_id, ws=ws)
     registry = get_registry()

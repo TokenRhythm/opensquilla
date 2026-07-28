@@ -2795,6 +2795,16 @@ class TurnRunner:
 
     def _handle_bootstrap_source_write(self, agent_id: str, path: str) -> None:
         """Drop frozen bootstrap snapshots after a bootstrap workspace file write."""
+        self.invalidate_profile_snapshot(agent_id)
+
+    def invalidate_profile_snapshot(self, agent_id: str) -> None:
+        """Drop cached bootstrap/profile files for every session of one agent.
+
+        Profile writers outside the tool loop (for example, an operator-confirmed
+        profile import) call this after committing ``USER.md`` so the next turn
+        reloads the file from disk.  Memory snapshots are intentionally separate
+        and continue to be refreshed through :meth:`refresh_memory_snapshot`.
+        """
         for key in list(self._bootstrap_snapshots):
             if key[0] == agent_id:
                 del self._bootstrap_snapshots[key]

@@ -37,6 +37,7 @@ async function mainWindowSnapshot(app) {
       webContentsId: window.webContents.id,
       url: window.webContents.getURL(),
       visible: window.isVisible(),
+      minimized: window.isMinimized(),
       destroyed: window.isDestroyed(),
     }
   })
@@ -187,6 +188,137 @@ try {
       'revealing a hidden desktop window must preserve renderer state',
     )
 
+    await desktopApp.evaluate(({ app, BrowserWindow }) => {
+      const window = BrowserWindow.getAllWindows().find((candidate) => (
+        candidate.webContents.getURL().includes('/control/')
+      ))
+      if (!window) throw new Error('Main Control UI window is unavailable.')
+      // Reproduce the activation race deterministically: activateMainWindow()
+      // focuses synchronously, then continues across an asynchronous startup
+      // boundary. A user hide after that first focus must not be undone by a
+      // delayed second focus.
+      app.emit('activate')
+      window.hide()
+    })
+    await waitFor(
+      async () => {
+        const snapshot = await mainWindowSnapshot(desktopApp)
+        return snapshot && !snapshot.visible ? snapshot : null
+      },
+      'main window to hide before deep-link activation',
+    )
+    await delay(350)
+    assert.equal(
+      (await mainWindowSnapshot(desktopApp))?.visible,
+      false,
+      'an asynchronous activation tail must not reveal a window hidden afterward',
+    )
+
+    await desktopApp.evaluate(({ app }) => {
+      app.emit(
+        'second-instance',
+        {},
+        ['OpenSquilla', 'opensquilla://unknown'],
+        process.cwd(),
+        {},
+      )
+    })
+    await delay(350)
+    assert.equal(
+      (await mainWindowSnapshot(desktopApp))?.visible,
+      false,
+      'an unknown deep-link action must not reveal the window',
+    )
+
+    await desktopApp.evaluate(({ app }) => {
+      app.emit(
+        'second-instance',
+        {},
+        ['OpenSquilla', 'opensquilla://open'],
+        process.cwd(),
+        {},
+      )
+    })
+    const secondInstanceRevealed = await waitFor(
+      async () => {
+        const snapshot = await mainWindowSnapshot(desktopApp)
+        return snapshot?.visible ? snapshot : null
+      },
+      'second-instance deep link to reveal the same main window',
+    )
+    assert.equal(secondInstanceRevealed.browserWindowId, before.browserWindowId)
+    assert.equal(secondInstanceRevealed.webContentsId, before.webContentsId)
+
+    await desktopApp.evaluate(({ BrowserWindow }) => {
+      const window = BrowserWindow.getAllWindows().find((candidate) => (
+        candidate.webContents.getURL().includes('/control/')
+      ))
+      if (!window) throw new Error('Main Control UI window is unavailable.')
+      window.hide()
+    })
+    const openUrlPrevented = await desktopApp.evaluate(({ app }) => {
+      let prevented = false
+      app.emit('open-url', {
+        preventDefault() {
+          prevented = true
+        },
+      }, 'opensquilla://open')
+      return prevented
+    })
+    assert.equal(openUrlPrevented, true)
+    const openUrlRevealed = await waitFor(
+      async () => {
+        const snapshot = await mainWindowSnapshot(desktopApp)
+        return snapshot?.visible ? snapshot : null
+      },
+      'open-url deep link to reveal the same main window',
+    )
+    assert.equal(openUrlRevealed.browserWindowId, before.browserWindowId)
+    assert.equal(openUrlRevealed.webContentsId, before.webContentsId)
+
+    const minimizable = await desktopApp.evaluate(({ BrowserWindow }) => {
+      const window = BrowserWindow.getAllWindows().find((candidate) => (
+        candidate.webContents.getURL().includes('/control/')
+      ))
+      if (!window || !window.isMinimizable()) return false
+      window.minimize()
+      return true
+    })
+    const minimized = minimizable && Boolean(await waitFor(
+      async () => {
+        const snapshot = await mainWindowSnapshot(desktopApp)
+        return snapshot?.minimized ? snapshot : null
+      },
+      'main window to minimize before deep-link activation',
+      5_000,
+    ).catch(() => null))
+    if (minimized) {
+      await desktopApp.evaluate(({ app }) => {
+        app.emit(
+          'second-instance',
+          {},
+          ['OpenSquilla', 'opensquilla://open'],
+          process.cwd(),
+          {},
+        )
+      })
+      const restored = await waitFor(
+        async () => {
+          const snapshot = await mainWindowSnapshot(desktopApp)
+          return snapshot?.visible && !snapshot.minimized ? snapshot : null
+        },
+        'deep link to restore a minimized main window',
+      )
+      assert.equal(restored.browserWindowId, before.browserWindowId)
+      assert.equal(restored.webContentsId, before.webContentsId)
+    }
+
+    assert.equal(
+      await page.evaluate(() => window.__opensquillaWindowLifecycleMarker),
+      marker,
+      'deep-link activation must preserve renderer state',
+    )
+
     console.log(JSON.stringify({
       ok: true,
       platform: runtimeIsolation.platform,
@@ -195,6 +327,9 @@ try {
       browserWindowId: revealed.browserWindowId,
       webContentsId: revealed.webContentsId,
       rendererPreserved: true,
+      secondInstanceDeepLink: true,
+      openUrlDeepLink: true,
+      minimizedRestored: minimized,
     }, null, 2))
   }
 } catch (error) {

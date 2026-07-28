@@ -358,7 +358,24 @@ describe('WorkbenchHost', () => {
     expect(mounted.store.hostAvailable).toBe(false)
   })
 
-  it('hides and suspends native surfaces while a DOM modal blocks them', async () => {
+  it('keeps dispose-on-suspend panels alive while a modal blocks interaction', async () => {
+    const mounted = await mountHost(1200, undefined, true)
+    mounted.store.openItem(item('volatile', 'dom', 'dispose-on-suspend'))
+    await nextTick()
+
+    mounted.modalBlocked.value = true
+    await nextTick()
+
+    const workbench = mounted.host.querySelector<HTMLElement>(
+      '[data-testid="workbench-host"]',
+    )!
+    expect(workbench.getAttribute('aria-hidden')).toBe('true')
+    expect(workbench.hasAttribute('inert')).toBe(true)
+    expect(mounted.store.hostAvailable).toBe(true)
+    expect(mounted.host.querySelector('[data-testid="panel-volatile"]')).toBeTruthy()
+  })
+
+  it('hides native surfaces without disposing them while a DOM modal blocks them', async () => {
     const mounted = await mountHost(1200)
     mounted.store.openItem(item('native', 'native-webcontents'))
     await nextTick()
@@ -391,7 +408,7 @@ describe('WorkbenchHost', () => {
     )!
     expect(workbench.getAttribute('aria-hidden')).toBe('true')
     expect(workbench.hasAttribute('inert')).toBe(true)
-    expect(mounted.store.hostAvailable).toBe(false)
+    expect(mounted.store.hostAvailable).toBe(true)
     expect(mounted.onSurfaceRect).toHaveBeenLastCalledWith(
       expect.objectContaining({ itemId: 'native', visible: false }),
     )

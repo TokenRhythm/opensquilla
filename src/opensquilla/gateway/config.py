@@ -157,7 +157,10 @@ class ControlUiConfig(BaseSettings):
     @field_validator("base_path")
     @classmethod
     def _strip_trailing_slash(cls, v: str) -> str:
-        return v.rstrip("/")
+        # Keep the root mount explicit.  Returning ``""`` for ``"/"`` makes
+        # prefix checks such as ``path.startswith(base_path)`` match every
+        # request, including authenticated API routes.
+        return v.rstrip("/") or "/"
 
     @field_validator("frontend", mode="before")
     @classmethod

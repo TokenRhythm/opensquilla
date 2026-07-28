@@ -7,6 +7,7 @@ import inspect
 import logging
 import os
 import secrets
+import socket
 import sys
 import time
 import uuid
@@ -590,6 +591,10 @@ class ServiceContainer:
     usage_event_sink: Any = None
     usage_backfill_task: asyncio.Task[Any] | None = None
     sandbox_setup_task: asyncio.Task[Any] | None = field(default=None, repr=False)
+    profile_import_maintenance_task: asyncio.Task[Any] | None = field(
+        default=None,
+        repr=False,
+    )
     cron_scheduler: SchedulerEngine | None = None
     model_catalog: ModelCatalog | None = None
     agent_registry: Any = None
@@ -632,6 +637,27 @@ class ServiceContainer:
         an in-flight cron job or heartbeat tick can drive TurnRunner ->
         TurnCaptureService.capture_turn against an already-closed store.
         """
+        profile_import_maintenance_task = self.profile_import_maintenance_task
+        self.profile_import_maintenance_task = None
+        if profile_import_maintenance_task is not None:
+            profile_import_maintenance_task.cancel()
+            try:
+                await profile_import_maintenance_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.debug(
+                    "gateway.profile_import_maintenance_close_failed",
+                    exc_info=True,
+                )
+        try:
+            from opensquilla.memory.profile_import.jobs import (
+                shutdown_current_profile_import_job_runner,
+            )
+
+            await shutdown_current_profile_import_job_runner()
+        except Exception:
+            log.debug("gateway.profile_import_jobs_close_failed", exc_info=True)
         if self.usage_backfill_task is not None:
             self.usage_backfill_task.cancel()
             try:
@@ -1265,14 +1291,16 @@ async def dispatch_task_runtime_turn(
 def build_session_material_cleanup(config: Any) -> Any:
     """Build the session-material cleanup that runs on ``delete_session``.
 
-    Removes both on-disk material stores for a deleted session: the canonical
+    Removes all on-disk material stores for a deleted session: the canonical
     transcript-material store (``<media_root>/transcripts/<sid>/``) and the
     tool-visible workspace materialization
-    (``<workspace>/.opensquilla/attachments/<segment>/``). Lives in the gateway
+    (``<workspace>/.opensquilla/attachments/<segment>/``), plus generated
+    Artifact files and bundle blobs below ``<media_root>/artifacts``. Lives in the gateway
     layer because it resolves the agent workspace via ``agents.scope``; the
     low-level ``session`` package only owns the hook registry + guarded remover.
     """
     from opensquilla.agents.scope import resolve_agent_workspace_dir
+    from opensquilla.artifacts import ArtifactStore
     from opensquilla.attachment_refs import transcript_material_dir
     from opensquilla.attachment_workspace import _safe_path_segment
     from opensquilla.paths import media_root_from_config
@@ -1295,6 +1323,9 @@ def build_session_material_cleanup(config: Any) -> Any:
         segment = _safe_path_segment(session_id, fallback="session")
         attachments_dir = workspace / ".opensquilla" / "attachments" / segment
         rmtree_scoped(attachments_dir, expected_name=segment)
+        # 3. Generated artifacts, including content-addressed bundle blobs and
+        #    legacy layouts. ArtifactStore owns the layout and deletion guards.
+        ArtifactStore(media_root).delete_session_artifacts(session_id)
 
     return _cleanup
 
@@ -1779,6 +1810,10 @@ class GatewayServer:
     config: GatewayConfig
     _server: uvicorn.Server | None = field(default=None, repr=False)
     _task: asyncio.Task | None = field(default=None, repr=False)
+    _preview_server: uvicorn.Server | None = field(default=None, repr=False)
+    _preview_task: asyncio.Task | None = field(default=None, repr=False)
+    _preview_socket: socket.socket | None = field(default=None, repr=False)
+    _preview_service: Any = field(default=None, repr=False)
     _channel_manager: Any = field(default=None, repr=False)
     # Zero-arg resolver for the LIVE manager: live reconcile can create the
     # manager after boot (zero-channel start + first live add), so shutdown
@@ -1868,6 +1903,22 @@ class GatewayServer:
                         await asyncio.wait_for(self._task, timeout=5.0)
                     except TimeoutError:
                         self._task.cancel()
+                preview_server = getattr(self, "_preview_server", None)
+                preview_task = getattr(self, "_preview_task", None)
+                preview_socket = getattr(self, "_preview_socket", None)
+                preview_service = getattr(self, "_preview_service", None)
+                if preview_service is not None:
+                    preview_service.revoke_all()
+                    preview_service.clear_listener_port()
+                if preview_server is not None:
+                    preview_server.should_exit = True
+                if preview_task is not None:
+                    try:
+                        await asyncio.wait_for(preview_task, timeout=5.0)
+                    except TimeoutError:
+                        preview_task.cancel()
+                if preview_socket is not None:
+                    preview_socket.close()
                 if self._services is not None:
                     try:
                         await self._services.close()
@@ -3255,6 +3306,29 @@ async def start_gateway_server(
         _pid_lock.release()
         raise
 
+    # An interrupted profile import may span USER.md and a separate memory
+    # root. Recover those canonical files before TurnRunner, channels, or the
+    # HTTP server can observe a half-published batch. Recovery is deliberately
+    # serial because every agent shares the same profile operation lock.
+    try:
+        from opensquilla.gateway.rpc_memory_import import (
+            run_profile_import_startup_recovery,
+        )
+
+        recovered_profile_import_batches = await run_profile_import_startup_recovery(
+            config=config,
+            memory_managers=svc.memory_managers,
+        )
+    except BaseException:
+        log.error("gateway.profile_import_recovery_failed", exc_info=True)
+        try:
+            await svc.close()
+        except Exception:
+            log.debug("gateway.services_close_after_recovery_failed", exc_info=True)
+        finally:
+            _pid_lock.release()
+        raise
+
     # Daily usage uses the existing telemetry service's dedicated /v1/usage
     # route and the same unified privacy switch. Upload once at startup and
     # every hour while the gateway is running; failures remain pending.
@@ -3305,6 +3379,34 @@ async def start_gateway_server(
     # Patch deferred callback so memory writes refresh TurnRunner snapshots
     if hasattr(svc, "_turn_runner_ref"):
         svc._turn_runner_ref.append(turn_runner)  # type: ignore[attr-defined]
+
+    # Canonical journal recovery already completed before TurnRunner was built.
+    # Permission hardening, expired private-input cleanup, and derived index
+    # refresh are best-effort and may continue after readiness.
+    async def maintain_profile_imports() -> None:
+        try:
+            from opensquilla.gateway.rpc_memory_import import (
+                run_profile_import_startup_maintenance,
+            )
+
+            failures = await run_profile_import_startup_maintenance(
+                config=config,
+                memory_managers=svc.memory_managers,
+                turn_runner=turn_runner,
+                recovered_batches=recovered_profile_import_batches,
+            )
+            for agent_id, error in failures.items():
+                log.warning(
+                    "gateway.profile_import_maintenance_failed",
+                    agent_id=agent_id,
+                    error=error,
+                )
+        except Exception:
+            log.warning("gateway.profile_import_maintenance_failed", exc_info=True)
+
+    svc.profile_import_maintenance_task = create_background_task(
+        maintain_profile_imports(),
+    )
 
     memory_repair_service = getattr(svc, "memory_repair_service", None)
     if memory_repair_service is not None:
@@ -4062,13 +4164,62 @@ async def start_gateway_server(
     server_handle._channel_manager_ref = lambda: _cm_holder[0]
     server_handle._services = svc
     server_handle._background_completion_manager = background_completion_manager
+    server_handle._preview_service = getattr(app.state, "artifact_preview_service", None)
 
     if run:
+        preview_service = server_handle._preview_service
+        if preview_service is not None and config.control_ui.enabled:
+            preview_socket: socket.socket | None = None
+            try:
+                from opensquilla.gateway.artifact_preview import (
+                    create_artifact_preview_resource_app,
+                )
+
+                preview_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                preview_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                preview_socket.bind(("127.0.0.1", 0))
+                preview_socket.listen(128)
+                preview_socket.setblocking(False)
+                preview_port = int(preview_socket.getsockname()[1])
+                preview_service.set_listener_port(preview_port)
+                preview_config = uvicorn.Config(
+                    app=create_artifact_preview_resource_app(preview_service),
+                    host="127.0.0.1",
+                    port=preview_port,
+                    log_level="warning",
+                    access_log=False,
+                    lifespan="off",
+                )
+                preview_server = uvicorn.Server(preview_config)
+                setattr(preview_server, "install_signal_handlers", lambda: None)  # noqa: B010
+                server_handle._preview_server = preview_server
+                server_handle._preview_socket = preview_socket
+                server_handle._preview_task = create_background_task(
+                    preview_server.serve(sockets=[preview_socket])
+                )
+                log.info(
+                    "gateway.artifact_preview_listener_started",
+                    host="127.0.0.1",
+                    port=preview_port,
+                )
+            except Exception:
+                preview_service.clear_listener_port()
+                if preview_socket is not None:
+                    preview_socket.close()
+                log.warning(
+                    "gateway.artifact_preview_listener_unavailable",
+                    category="listener_start_failed",
+                )
+
         uvicorn_kwargs: dict[str, Any] = {
             "app": app,
             "host": config.host,
             "port": config.port,
             "log_level": "info" if not config.debug else "debug",
+            # Capability URLs and historical sessionKey query parameters are
+            # bearer material. Keep request targets out of uvicorn's access
+            # logger; structured gateway events remain available.
+            "access_log": False,
         }
         if config.tls.keyfile and config.tls.certfile:
             uvicorn_kwargs["ssl_keyfile"] = config.tls.keyfile

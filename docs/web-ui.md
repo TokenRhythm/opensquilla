@@ -143,6 +143,25 @@ Artifact cards may include thumbnails or preview metadata, and the deliverables
 drawer keeps published outputs discoverable after the originating turn has
 scrolled away.
 
+HTML artifact previews always show whether they are using full network access
+or offline mode. A local Web UI may request either mode; a remotely reached Web
+UI is forced offline and runs bundle scripts in an opaque sandbox while
+explicitly reporting that workers, persistent storage, and root-absolute paths
+are not guaranteed. Ordinary web links continue to open in a separate browser
+tab with `noopener,noreferrer`. The Desktop app additionally offers an explicit
+action to open an HTTP(S) link in its isolated side browser.
+
+The full Desktop preview is intentionally browser-like, not a privileged
+Electron view. Each open item has a separate temporary cookie/storage/cache
+partition and no Node, preload, IPC, host filesystem, OpenSquilla identity, or
+system-browser session. Closing an item clears its temporary state. Device
+permissions, user-initiated downloads, popups, and external protocols remain
+host-mediated; client certificates from the operating-system store are never
+offered to preview pages. The active OpenSquilla Gateway is also unreachable
+inside side previews, preventing network proximity from becoming an ambient
+OpenSquilla identity; users can still open an explicit link in the system
+browser.
+
 For channel delivery limits and artifact recovery, see
 [`artifacts-and-media.md`](artifacts-and-media.md).
 

@@ -2,10 +2,12 @@ import { test, expect } from '@playwright/test'
 
 const CONTROL_URL = '/control/'
 // Backend-config sections carry a readiness/status dot; Connection is the first
-// entry (live socket state). Appearance, Keyboard, and Advanced are client-only.
+// entry (live socket state). Memory & Profile is an RPC action surface that
+// deliberately stays outside config save state; the remaining entries below
+// are ordinary client-only preferences.
 // (Runtime exists too, but it is desktop-only so the web rail hides it.)
 const SECTIONS = ['Connection', 'Model Service', 'Model Routing', 'Capabilities', 'Behavior', 'Privacy']
-const CLIENT_SECTIONS = ['Appearance', 'Keyboard', 'Advanced']
+const CLIENT_SECTIONS = ['Memory & Profile', 'Appearance', 'Keyboard', 'Advanced']
 
 const settingsRow = (page: import('@playwright/test').Page) =>
   page.locator('.sidebar-foot button')
@@ -96,6 +98,19 @@ test.describe('Settings modal', () => {
     await page.goBack()
     await expect(dialog(page)).toBeHidden()
     await expect(page).not.toHaveURL(/\/settings/)
+  })
+
+  test('opens Memory & Profile as a first-level action route without global save state', async ({ page }) => {
+    await openFromSidebar(page)
+
+    const memoryTab = dialog(page).getByRole('tab', { name: 'Memory & Profile', exact: true })
+    await memoryTab.click()
+
+    await expect(memoryTab).toHaveAttribute('aria-selected', 'true')
+    await expect(page).toHaveURL(/\/settings\/memory$/)
+    await expect(dialog(page).getByRole('heading', { name: 'Memory & Profile' })).toBeVisible()
+    await expect(dialog(page).locator('[data-testid="settings-memory-panel"]')).toBeVisible()
+    await expect(dialog(page).locator('.settings-dirtybar')).toBeHidden()
   })
 
   test('keeps the SettingsDialog mounted when routing from default settings to a section', async ({ page }) => {

@@ -7,7 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from opensquilla.artifacts import ArtifactStore
+from opensquilla.artifacts import (
+    ArtifactBundle,
+    ArtifactBundleSourceFile,
+    ArtifactStore,
+)
 from opensquilla.attachment_refs import (
     copy_transcript_material,
     make_attachment_ref,
@@ -141,6 +145,50 @@ def test_long_media_roundtrips_material_artifacts_and_downloads(tmp_path: Path) 
             session_id="session-child",
         )
         assert child_artifact.session_key == "agent:main:webchat:child"
+
+        bundle = ArtifactBundle(
+            entrypoint="index.html",
+            files=(
+                ArtifactBundleSourceFile(
+                    path="assets/app.js",
+                    mime="text/javascript",
+                    data=b"window.longPathBundle = true",
+                ),
+                ArtifactBundleSourceFile(
+                    path="index.html",
+                    mime="text/html",
+                    data=b'<script src="./assets/app.js"></script>',
+                ),
+            ),
+        )
+        bundle_ref = store.publish_bundle(
+            bundle,
+            session_id="session-parent",
+            session_key="agent:main:webchat:long",
+            name="index.html",
+            mime="text/html",
+            source="publish_artifact",
+        )
+        bundle_resource = store.resolve_preview_resource(
+            bundle_ref.id,
+            session_id="session-parent",
+            logical_path="assets/app.js",
+        )
+        assert bundle_resource.path.read_bytes() == b"window.longPathBundle = true"
+        assert (
+            store.copy_session_artifacts(
+                source_session_id="session-parent",
+                target_session_id="session-bundle-child",
+                target_session_key="agent:main:webchat:bundle-child",
+            )
+            == 2
+        )
+        child_bundle_resource = store.resolve_preview_resource(
+            bundle_ref.id,
+            session_id="session-bundle-child",
+            logical_path="assets/app.js",
+        )
+        assert child_bundle_resource.path.read_bytes() == b"window.longPathBundle = true"
 
         with TestClient(_app(media_root)) as client:
             attachment_response = client.get(

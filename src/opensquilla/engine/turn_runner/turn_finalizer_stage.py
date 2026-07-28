@@ -285,6 +285,9 @@ def _turn_usage_payload(
         "cost_usd": float(done_event.cost_usd or 0.0),
         "billed_cost": float(done_event.billed_cost or 0.0),
         "cost_source": done_event.cost_source or "none",
+        "missing_cost_entries": int(
+            getattr(done_event, "missing_cost_entries", 0) or 0
+        ),
         "model": model,
         "routed_model": done_event.routed_model or "",
         "routed_tier": done_event.routed_tier or None,
@@ -674,9 +677,18 @@ class TurnFinalizerStage:
                 )
             ):
                 reasoning_content = inp.done_event.reasoning_content
-            token_count = (
-                inp.done_event.output_tokens if inp.done_event is not None else None
-            )
+            token_count = None
+            if inp.done_event is not None:
+                message_output_tokens = getattr(
+                    inp.done_event,
+                    "message_output_tokens",
+                    None,
+                )
+                token_count = (
+                    message_output_tokens
+                    if message_output_tokens is not None
+                    else inp.done_event.output_tokens
+                )
             append_result = await self._transcript_append.append_message(
                 inp.session_key,
                 role="assistant",

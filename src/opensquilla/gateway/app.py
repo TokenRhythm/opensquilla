@@ -26,6 +26,7 @@ from opensquilla.gateway.middleware import (
     ErrorHandlingMiddleware,
     RateLimitMiddleware,
     SecurityHeadersMiddleware,
+    UnsafeOriginGuardMiddleware,
 )
 from opensquilla.gateway.origin_guard import (
     extract_http_token,
@@ -665,8 +666,13 @@ def create_gateway_app(
 
     # ── Routes ───────────────────────────────────────────────────────────────
 
+    root_routes = (
+        []
+        if config.control_ui.enabled and config.control_ui.base_path == "/"
+        else [Route("/", root, methods=["GET"])]
+    )
     routes = [
-        Route("/", root, methods=["GET"]),
+        *root_routes,
         Route("/health", health, methods=["GET"]),
         Route("/healthz", health, methods=["GET"]),
         Route("/ready", ready, methods=["GET"]),
@@ -707,30 +713,28 @@ def create_gateway_app(
     if extra_routes:
         routes.extend(extra_routes)
 
-    # ── Control UI routes ────────────────────────────────────────────────
-    routes.extend(create_control_ui_routes(config))
-
     # ── Middleware ───────────────────────────────────────────────────────────
 
-    middleware = [Middleware(ErrorHandlingMiddleware)]
-    if config.cors.allowed_origins:
+    middleware = [
+        Middleware(ErrorHandlingMiddleware),
+        Middleware(UnsafeOriginGuardMiddleware, config=config),
+    ]
+    exact_cors_origins = [
+        origin for origin in config.cors.allowed_origins if origin != "*"
+    ]
+    if "*" in config.cors.allowed_origins:
+        log.warning(
+            "gateway.cors_wildcard_ignored",
+            category="cors_wildcard_not_permitted",
+        )
+    if exact_cors_origins:
         # CORS headers are opt-in: the default empty list installs no CORS
         # middleware at all, so browsers refuse cross-origin reads. The Web UI
         # is same-origin and non-browser clients never need CORS.
-        if "*" in config.cors.allowed_origins and config.cors.allow_credentials:
-            log.warning(
-                "gateway.cors_wildcard_with_credentials",
-                detail=(
-                    "cors.allowed_origins contains '*' with allow_credentials "
-                    "enabled, which lets any website the browser visits read "
-                    "authenticated gateway responses — list explicit origins "
-                    "instead."
-                ),
-            )
         middleware.append(
             Middleware(
                 CORSMiddleware,
-                allow_origins=config.cors.allowed_origins,
+                allow_origins=exact_cors_origins,
                 allow_credentials=config.cors.allow_credentials,
                 allow_methods=config.cors.allowed_methods,
                 allow_headers=config.cors.allowed_headers,
@@ -739,7 +743,11 @@ def create_gateway_app(
     middleware.extend(
         [
             Middleware(RateLimitMiddleware, config=config),
-            Middleware(SecurityHeadersMiddleware, path_prefix=config.control_ui.base_path),
+            Middleware(
+                SecurityHeadersMiddleware,
+                path_prefix=config.control_ui.base_path,
+                enabled=config.control_ui.enabled,
+            ),
             Middleware(AuthMiddleware, config=config),
         ]
     )
@@ -801,9 +809,22 @@ def create_gateway_app(
         config=config,
         session_manager=session_manager,
     )
+    from opensquilla.gateway.artifact_preview import (  # noqa: PLC0415
+        register_artifact_preview_routes,
+    )
+
+    app.state.artifact_preview_service = register_artifact_preview_routes(
+        app,
+        config=config,
+        session_manager=session_manager,
+    )
     register_audio_transcription_routes(app, config=config)
     from opensquilla.gateway.bundle_routes import register_bundle_routes  # noqa: PLC0415
 
     register_bundle_routes(app, config=config)
+
+    # Keep the SPA catch-all last.  This is required when the Control UI is
+    # mounted at "/" so dynamically registered API routes are still reachable.
+    app.router.routes.extend(create_control_ui_routes(config))
 
     return app

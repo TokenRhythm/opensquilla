@@ -7,6 +7,7 @@ import type {
   DesktopUpdateState,
   DesktopUpdateStatus,
   NativeWorkbenchApi,
+  NativeWorkbenchCapabilities,
   NativeWorkbenchSurfaceEvent,
   NativeWorkbenchSurfaceEventType,
   Platform,
@@ -43,6 +44,12 @@ const NATIVE_SURFACE_EVENT_TYPES = new Set<NativeWorkbenchSurfaceEventType>([
   'loading',
   'ready',
   'missing-resource',
+  'navigation-state',
+  'permission-request',
+  'blocked-action',
+  'capability-expired',
+  'unresponsive',
+  'responsive',
   'error',
   'crashed',
   'escape',
@@ -52,7 +59,7 @@ function normalizeNativeSurfaceEvent(payload: unknown): NativeWorkbenchSurfaceEv
   if (!payload || typeof payload !== 'object') return null
   const raw = payload as Record<string, unknown>
   if (
-    raw.version !== 1
+    (raw.version !== 1 && raw.version !== 2)
     || typeof raw.surfaceId !== 'string'
     || !NATIVE_SURFACE_EVENT_TYPES.has(raw.type as NativeWorkbenchSurfaceEventType)
   ) return null
@@ -64,10 +71,28 @@ function normalizeNativeSurfaceEvent(payload: unknown): NativeWorkbenchSurfaceEv
         ...(typeof rawDetail.message === 'string' ? { message: rawDetail.message } : {}),
         ...(typeof rawDetail.path === 'string' ? { path: rawDetail.path } : {}),
         ...(typeof rawDetail.reason === 'string' ? { reason: rawDetail.reason } : {}),
+        ...(typeof rawDetail.requestId === 'string' ? { requestId: rawDetail.requestId } : {}),
+        ...(typeof rawDetail.permission === 'string'
+          ? { permission: rawDetail.permission }
+          : {}),
+        ...(typeof rawDetail.requestingOrigin === 'string'
+          ? { requestingOrigin: rawDetail.requestingOrigin }
+          : {}),
+        ...(typeof rawDetail.url === 'string' ? { url: rawDetail.url } : {}),
+        ...(typeof rawDetail.title === 'string' ? { title: rawDetail.title } : {}),
+        ...(typeof rawDetail.loading === 'boolean' ? { loading: rawDetail.loading } : {}),
+        ...(typeof rawDetail.canGoBack === 'boolean'
+          ? { canGoBack: rawDetail.canGoBack }
+          : {}),
+        ...(typeof rawDetail.canGoForward === 'boolean'
+          ? { canGoForward: rawDetail.canGoForward }
+          : {}),
+        ...(typeof rawDetail.action === 'string' ? { action: rawDetail.action } : {}),
+        ...(typeof rawDetail.code === 'string' ? { code: rawDetail.code } : {}),
       }
     : undefined
   return {
-    version: 1,
+    version: raw.version,
     surfaceId: raw.surfaceId,
     type: raw.type as NativeWorkbenchSurfaceEventType,
     ...(detail ? { detail } : {}),
@@ -82,11 +107,56 @@ function desktopNativeWorkbenchApi(api: OpenSquillaDesktopApi): NativeWorkbenchA
     || typeof api.destroyWorkbenchSurface !== 'function'
     || typeof api.onWorkbenchSurfaceEvent !== 'function'
   ) return undefined
+
+  async function getCapabilities(): Promise<NativeWorkbenchCapabilities> {
+    if (typeof api.getWorkbenchCapabilities !== 'function') {
+      return { protocolVersions: [1], modes: ['offline'], maxSurfaces: 8 }
+    }
+    try {
+      const payload = await api.getWorkbenchCapabilities()
+      const raw = payload && typeof payload === 'object'
+        ? payload as Record<string, unknown>
+        : {}
+      const versions = Array.isArray(raw.protocolVersions)
+        ? raw.protocolVersions.filter((value): value is 1 | 2 => value === 1 || value === 2)
+        : []
+      const modes = Array.isArray(raw.modes)
+        ? raw.modes.filter((value): value is 'full' | 'offline' =>
+            value === 'full' || value === 'offline')
+        : []
+      return {
+        protocolVersions: versions.length > 0 ? versions : [1],
+        modes: modes.length > 0 ? modes : ['offline'],
+        maxSurfaces: typeof raw.maxSurfaces === 'number' && Number.isFinite(raw.maxSurfaces)
+          ? Math.max(1, Math.floor(raw.maxSurfaces))
+          : 8,
+      }
+    } catch {
+      return { protocolVersions: [1], modes: ['offline'], maxSurfaces: 8 }
+    }
+  }
+
   return {
+    getCapabilities,
+    ...(typeof api.createArtifactPreviewLease === 'function'
+      && typeof api.renewArtifactPreviewLease === 'function'
+      && typeof api.revokeArtifactPreviewLease === 'function'
+      ? {
+          createArtifactPreviewLease: payload => api.createArtifactPreviewLease!(payload),
+          renewArtifactPreviewLease: payload => api.renewArtifactPreviewLease!(payload),
+          revokeArtifactPreviewLease: payload => api.revokeArtifactPreviewLease!(payload),
+        }
+      : {}),
     createSurface: payload => api.createWorkbenchSurface!(payload),
     setSurfaceRect: payload => api.setWorkbenchSurfaceRect!(payload),
     activateSurface: surfaceId => api.activateWorkbenchSurface!(surfaceId),
     destroySurface: surfaceId => api.destroyWorkbenchSurface!(surfaceId),
+    ...(typeof api.navigateWorkbenchSurface === 'function'
+      ? { navigateSurface: payload => api.navigateWorkbenchSurface!(payload) }
+      : {}),
+    ...(typeof api.respondToWorkbenchPermission === 'function'
+      ? { respondToPermission: payload => api.respondToWorkbenchPermission!(payload) }
+      : {}),
     onSurfaceEvent(callback) {
       return api.onWorkbenchSurfaceEvent!((payload) => {
         const event = normalizeNativeSurfaceEvent(payload)

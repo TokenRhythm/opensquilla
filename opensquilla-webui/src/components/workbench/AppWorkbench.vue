@@ -67,6 +67,36 @@
           />
           <span>{{ toolbarItem.text }}</span>
         </span>
+        <select
+          v-else-if="toolbarItem.kind === 'select'"
+          class="app-workbench__switcher app-workbench__mode-select"
+          :value="toolbarItem.value"
+          :aria-label="toolbarItem.label"
+          :title="toolbarItem.label"
+          @change="performPanelSelection(item, toolbarItem, $event)"
+        >
+          <option
+            v-for="option in toolbarItem.options"
+            :key="option.value"
+            :value="option.value"
+            :disabled="option.disabled"
+          >
+            {{ option.label }}
+          </option>
+          <optgroup
+            v-if="toolbarItem.actionOptions?.length"
+            :label="toolbarItem.actionGroupLabel"
+          >
+            <option
+              v-for="option in toolbarItem.actionOptions"
+              :key="option.value"
+              :value="option.value"
+              :disabled="option.disabled"
+            >
+              {{ option.label }}
+            </option>
+          </optgroup>
+        </select>
         <button
           v-else
           type="button"
@@ -134,9 +164,19 @@ import {
   sessionKeyFromWorkbenchItem,
 } from '@/workbench/artifactItems'
 import {
+  BROWSER_WORKBENCH_OPEN_EVENT,
+  createBrowserWorkbenchItem,
+  normalizeBrowserUrl,
+  type BrowserWorkbenchOpenEventDetail,
+} from '@/workbench/browserItems'
+import {
   artifactCategory,
   artifactFileTitle,
 } from '@/utils/chat/artifacts'
+import {
+  readPreviewPreferences,
+  savePreviewPreferences,
+} from '@/utils/workbench/previewPreferences'
 import {
   attachWorkbenchRuntime,
   WorkbenchRuntimeManager,
@@ -148,9 +188,11 @@ import type {
   WorkbenchItem,
   WorkbenchPanelHeader,
   WorkbenchPanelRenderState,
+  WorkbenchToolbarSelectOption,
   WorkbenchToolbarItem,
 } from '@/workbench/types'
 import { createArtifactWorkbenchDefinitions } from './artifactWorkbenchProvider'
+import { createBrowserWorkbenchDefinition } from './browserWorkbenchProvider'
 import WorkbenchHost from './WorkbenchHost.vue'
 
 const props = withDefaults(defineProps<{
@@ -194,9 +236,60 @@ function readAuthToken(): string {
   }
 }
 
+function confirmWorkbenchPermission(request: {
+  permission: string
+  requestingOrigin: string
+}): Promise<boolean> {
+  return confirm({
+    title: t('workbench.artifactPreview.permissionTitle'),
+    body: t('workbench.artifactPreview.permissionBody', {
+      origin: request.requestingOrigin || t('workbench.artifactPreview.unknownOrigin'),
+      permission: request.permission,
+    }),
+    primaryLabel: t('workbench.artifactPreview.permissionAllow'),
+    primaryClass: 'btn--primary',
+  })
+}
+
+function openExternalUrl(value: string) {
+  const url = normalizeBrowserUrl(value)
+  if (!url || typeof window === 'undefined') return
+  const opened = window.open(url, '_blank', 'noopener,noreferrer')
+  if (opened) opened.opener = null
+}
+
+function openBrowserUrl(value: string) {
+  const sessionId = store.activeSessionId || props.sessionId
+  if (!nativeApi || !sessionId) {
+    openExternalUrl(value)
+    return
+  }
+  const item = createBrowserWorkbenchItem({ scopeId: sessionId, url: value })
+  if (!item) return
+  if (!store.openItem(item)) {
+    pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+  }
+}
+
+function onBrowserWorkbenchOpen(event: Event) {
+  const detail = (event as CustomEvent<BrowserWorkbenchOpenEventDetail>).detail
+  if (detail && typeof detail.url === 'string') openBrowserUrl(detail.url)
+}
+
 for (const definition of createArtifactWorkbenchDefinitions({
   authToken: readAuthToken,
   baseOrigin,
+  confirmModeSwitch: mode => confirm({
+    title: t('workbench.artifactPreview.modeSwitchTitle'),
+    body: t('workbench.artifactPreview.modeSwitchBody', {
+      mode: t(mode === 'full'
+        ? 'workbench.artifactPreview.fullMode'
+        : 'workbench.artifactPreview.offlineMode'),
+    }),
+    primaryLabel: t('workbench.artifactPreview.modeSwitchAction'),
+    primaryClass: 'btn--primary',
+  }),
+  confirmPermission: confirmWorkbenchPermission,
   confirmRemoteResources: () => confirm({
     title: t('workbench.artifactPreview.remoteResourcesConfirmTitle'),
     body: t('workbench.artifactPreview.remoteResourcesConfirmBody'),
@@ -204,6 +297,7 @@ for (const definition of createArtifactWorkbenchDefinitions({
     primaryClass: 'btn--primary',
   }),
   currentSessionId: () => store.activeSessionId || props.sessionId,
+  getPreviewPreferences: () => readPreviewPreferences(platform),
   openArtifact: (artifact, sessionKey, navigationArtifacts) => {
     if (artifactCategory(artifact) === 'visual') {
       artifactImageLightbox.open({
@@ -213,7 +307,7 @@ for (const definition of createArtifactWorkbenchDefinitions({
       })
       return
     }
-    store.openItem(createArtifactPreviewWorkbenchItem({
+    const opened = store.openItem(createArtifactPreviewWorkbenchItem({
       artifact,
       navigationArtifacts,
       nativeHtml: Boolean(
@@ -222,13 +316,28 @@ for (const definition of createArtifactWorkbenchDefinitions({
       ),
       sessionKey,
     }))
+    if (!opened) {
+      pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+    }
   },
   platform,
+  previewLeasesEnabled: true,
   pushToast: (message, options) => pushToast(message, options),
+  savePreviewPreferences: preferences => savePreviewPreferences(platform, preferences),
+  showFullPreviewNotice: () => pushToast(
+    t('workbench.artifactPreview.fullModeNotice'),
+    { tone: 'info', duration: 9000 },
+  ),
   t: (key, params) => String(t(key, params || {})),
 })) {
   workbenchPanelRegistry.register(definition, { replace: true })
 }
+workbenchPanelRegistry.register(createBrowserWorkbenchDefinition({
+  confirmPermission: confirmWorkbenchPermission,
+  openExternal: openExternalUrl,
+  platform,
+  t: (key, params) => String(t(key, params || {})),
+}), { replace: true })
 detachRuntime = attachWorkbenchRuntime(store, runtimeManager)
 
 function panelComponent(item: WorkbenchItem) {
@@ -284,7 +393,7 @@ function selectNavigationArtifact(
   if (!artifact || select.value === item.id) return
   const navigationArtifacts = navigationArtifactsFromWorkbenchItem(item)
   const sessionKey = sessionKeyFromWorkbenchItem(item)
-  store.openItem(createArtifactPreviewWorkbenchItem({
+  const opened = store.openItem(createArtifactPreviewWorkbenchItem({
     artifact,
     navigationArtifacts,
     nativeHtml: Boolean(
@@ -293,6 +402,9 @@ function selectNavigationArtifact(
     ),
     sessionKey,
   }))
+  if (!opened) {
+    pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+  }
 }
 
 function panelHeader(item: WorkbenchItem | null): WorkbenchPanelHeader {
@@ -342,6 +454,25 @@ function performPanelAction(item: WorkbenchItem | null, actionId: string) {
   if (item) runtimeManager.performAction(item, actionId)
 }
 
+function performPanelSelection(
+  item: WorkbenchItem | null,
+  toolbarItem: Extract<WorkbenchToolbarItem, { kind: 'select' }>,
+  event: Event,
+) {
+  const select = event.currentTarget as HTMLSelectElement
+  const selectedValue = select.value
+  const selected = [
+    ...toolbarItem.options,
+    ...(toolbarItem.actionOptions || []),
+  ].find((option: WorkbenchToolbarSelectOption) => option.value === selectedValue)
+
+  // Keep the control on the effective mode while an async confirmation or
+  // lease replacement runs. The render state selects the new value on success.
+  select.value = toolbarItem.value
+  if (!item || !selected || selectedValue === toolbarItem.value) return
+  runtimeManager.performAction(item, selected.actionId)
+}
+
 function restoreWorkbenchFocus() {
   void nextTick(() => {
     const candidates = document.querySelectorAll<HTMLElement>([
@@ -379,9 +510,11 @@ watch(
 
 onMounted(() => {
   if (nativeApi) stopSurfaceEvents = nativeApi.onSurfaceEvent(onNativeSurfaceEvent)
+  window.addEventListener(BROWSER_WORKBENCH_OPEN_EVENT, onBrowserWorkbenchOpen)
 })
 
 onBeforeUnmount(() => {
+  window.removeEventListener(BROWSER_WORKBENCH_OPEN_EVENT, onBrowserWorkbenchOpen)
   stopSurfaceEvents?.()
   stopSurfaceEvents = null
   if (detachRuntime) void detachRuntime()
@@ -464,6 +597,14 @@ onBeforeUnmount(() => {
   border-color: var(--accent);
   outline: 2px solid var(--accent);
   outline-offset: -2px;
+}
+
+.app-workbench__mode-select {
+  width: min(174px, 30vw);
+  border-color: var(--border);
+  background-color: var(--bg-surface);
+  color: var(--text);
+  font-weight: 600;
 }
 
 .app-workbench__action:hover {

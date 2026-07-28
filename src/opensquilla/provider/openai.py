@@ -2715,6 +2715,40 @@ def _build_openai_wire_messages(
     return openai_messages
 
 
+def _prompt_json_schema_config(
+    cfg: ChatConfig,
+    *,
+    policy: OpenAICompatPolicy,
+) -> ChatConfig:
+    """Embed an output schema when the endpoint lacks native JSON Schema output.
+
+    This is a request-shape compatibility path, not a provider or model
+    fallback.  The caller's ``ChatConfig`` remains unchanged, and the
+    authoritative schema stays in a trusted system message.
+    """
+
+    schema = cfg.output_json_schema
+    if schema is None or policy.supports_native_json_schema_output:
+        return cfg
+    compact_schema = json.dumps(
+        schema,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    directive = (
+        "Return exactly one JSON value that validates against the authoritative "
+        "JSON Schema below. Do not use Markdown fences or add commentary.\n"
+        f"{compact_schema}"
+    )
+    system = str(cfg.system or "").rstrip()
+    return cfg.model_copy(
+        update={
+            "system": f"{system}\n\n{directive}" if system else directive,
+        }
+    )
+
+
 class OpenAIProvider:
     """Streams from OpenAI-compatible Chat Completions API (SSE)."""
 
@@ -2866,6 +2900,7 @@ class OpenAIProvider:
         tools: list[ToolDefinition] | None,
         cfg: ChatConfig,
     ) -> AsyncIterator[StreamEvent]:
+        wire_cfg = _prompt_json_schema_config(cfg, policy=self._compat)
         caps = cfg.model_capabilities
         include_reasoning_content = _should_replay_reasoning_content(
             policy=self._compat,
@@ -2875,7 +2910,7 @@ class OpenAIProvider:
         )
         openai_messages = _build_openai_wire_messages(
             messages,
-            cfg,
+            wire_cfg,
             policy=self._compat,
             provider_kind=self._provider_kind,
             model=self._model,
@@ -2889,7 +2924,10 @@ class OpenAIProvider:
             "stream": True,
             "stream_options": {"include_usage": True},
         }
-        if cfg.output_json_schema is not None:
+        if (
+            cfg.output_json_schema is not None
+            and self._compat.supports_native_json_schema_output
+        ):
             payload["response_format"] = {
                 "type": "json_schema",
                 "json_schema": {

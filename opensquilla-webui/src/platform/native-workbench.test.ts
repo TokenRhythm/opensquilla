@@ -27,6 +27,21 @@ describe('native Workbench platform bridge', () => {
     const setRect = vi.fn(async () => ({ ok: true }))
     const activate = vi.fn(async () => ({ ok: true }))
     const destroy = vi.fn(async () => ({ ok: true }))
+    const createLease = vi.fn(async () => ({
+      ok: true as const,
+      status: 201,
+      payload: { version: 1 },
+    }))
+    const renewLease = vi.fn(async () => ({
+      ok: true as const,
+      status: 200,
+      payload: { version: 1 },
+    }))
+    const revokeLease = vi.fn(async () => ({
+      ok: true as const,
+      status: 204,
+      payload: undefined,
+    }))
     let emit: ((payload: unknown) => void) | undefined
     const unsubscribe = vi.fn()
     setDesktopApi({
@@ -34,6 +49,9 @@ describe('native Workbench platform bridge', () => {
       setWorkbenchSurfaceRect: setRect,
       activateWorkbenchSurface: activate,
       destroyWorkbenchSurface: destroy,
+      createArtifactPreviewLease: createLease,
+      renewArtifactPreviewLease: renewLease,
+      revokeArtifactPreviewLease: revokeLease,
       onWorkbenchSurfaceEvent: (callback: (payload: unknown) => void) => {
         emit = callback
         return unsubscribe
@@ -68,6 +86,22 @@ describe('native Workbench platform bridge', () => {
     })
     await native!.activateSurface('artifact:fixture')
     await native!.destroySurface('artifact:fixture')
+    await native!.createArtifactPreviewLease?.({
+      version: 1,
+      artifactId: 'art-fixture',
+      scopeId: 'session:fixture',
+      mode: 'full',
+    })
+    await native!.renewArtifactPreviewLease?.({
+      version: 1,
+      leaseId: 'apl-fixture',
+      scopeId: 'session:fixture',
+    })
+    await native!.revokeArtifactPreviewLease?.({
+      version: 1,
+      leaseId: 'apl-fixture',
+      scopeId: 'session:fixture',
+    })
 
     expect(create).toHaveBeenCalledTimes(1)
     expect(create).toHaveBeenCalledWith(expect.objectContaining({
@@ -76,10 +110,13 @@ describe('native Workbench platform bridge', () => {
     expect(setRect).toHaveBeenCalledTimes(1)
     expect(activate).toHaveBeenCalledWith('artifact:fixture')
     expect(destroy).toHaveBeenCalledWith('artifact:fixture')
+    expect(createLease).toHaveBeenCalledTimes(1)
+    expect(renewLease).toHaveBeenCalledTimes(1)
+    expect(revokeLease).toHaveBeenCalledTimes(1)
 
     const listener = vi.fn()
     expect(native!.onSurfaceEvent(listener)).toBe(unsubscribe)
-    emit?.({ version: 2, surfaceId: 'artifact:fixture', type: 'ready' })
+    emit?.({ version: 3, surfaceId: 'artifact:fixture', type: 'ready' })
     emit?.({
       version: 1,
       surfaceId: 'artifact:fixture',

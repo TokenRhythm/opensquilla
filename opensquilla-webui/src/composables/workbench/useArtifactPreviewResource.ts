@@ -24,6 +24,7 @@ export type ArtifactPreviewResourceState =
   | 'missing-resource'
   | 'offline'
   | 'ready'
+  | 'ready-with-warnings'
   | 'suspended'
   | 'unsupported'
 
@@ -35,6 +36,7 @@ export type ArtifactPreviewErrorCode =
   | 'native-error'
   | 'native-crashed'
   | 'offline'
+  | 'preview-blocked'
   | 'too-large'
   | 'unsupported'
 
@@ -53,6 +55,9 @@ export interface ArtifactPreviewResourceOptions {
   baseOrigin?: () => string
   createObjectUrl?: (blob: Blob) => string
   fetchImpl?: typeof fetch
+  htmlCollectionStatus?: () => 'complete' | 'partial' | 'not_applicable'
+  htmlLaunchUrl?: () => string
+  htmlLeaseState?: () => 'ready' | 'pending' | 'blocked'
   nativeHtml?: () => boolean
   onNativeHtmlReady?: (resource: NativeHtmlArtifactResource) => void
   revokeObjectUrl?: (url: string) => void
@@ -232,11 +237,15 @@ export function createArtifactPreviewResource(
   let suspended = false
   let stateBeforeSuspend: ArtifactPreviewResourceState = 'idle'
   let nativePayloadDelivered = false
+  let objectUrlOwned = false
 
   function revokeCurrentObjectUrl() {
     if (!objectUrl.value) return
-    try { revokeObjectUrl(objectUrl.value) } catch {}
+    if (objectUrlOwned) {
+      try { revokeObjectUrl(objectUrl.value) } catch {}
+    }
     objectUrl.value = ''
+    objectUrlOwned = false
   }
 
   function clearOutput() {
@@ -277,6 +286,33 @@ export function createArtifactPreviewResource(
     if (nextKind === 'unsupported') {
       setFailure('unsupported', 'unsupported')
       return
+    }
+    if (nextKind === 'html') {
+      const leaseState = options.htmlLeaseState?.() || 'ready'
+      if (leaseState === 'pending') {
+        state.value = 'loading'
+        return
+      }
+      if (leaseState === 'blocked') {
+        setFailure('error', 'preview-blocked')
+        return
+      }
+    }
+
+    if (nextKind === 'html') {
+      const launchUrl = options.htmlLaunchUrl?.() || ''
+      try {
+        const parsed = new URL(launchUrl)
+        if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+          objectUrl.value = parsed.toString()
+          objectUrlOwned = false
+          progress.value = 100
+          state.value = options.htmlCollectionStatus?.() === 'partial'
+            ? 'ready-with-warnings'
+            : 'ready'
+          return
+        }
+      } catch {}
     }
 
     const limit = artifactPreviewLimit(nextKind)
@@ -381,6 +417,7 @@ export function createArtifactPreviewResource(
             return
           }
           objectUrl.value = nextObjectUrl
+          objectUrlOwned = true
         }
         state.value = missing.length > 0 ? 'missing-resource' : 'ready'
       } else if (nextKind === 'markdown') {
@@ -397,6 +434,7 @@ export function createArtifactPreviewResource(
           return
         }
         objectUrl.value = nextObjectUrl
+        objectUrlOwned = true
         state.value = 'ready'
       }
       progress.value = 100
@@ -437,7 +475,10 @@ export function createArtifactPreviewResource(
       || nativePayloadDelivered
     )
     if (hasReadyOutput) {
-      state.value = stateBeforeSuspend === 'missing-resource' ? 'missing-resource' : 'ready'
+      state.value = stateBeforeSuspend === 'missing-resource'
+        || stateBeforeSuspend === 'ready-with-warnings'
+        ? stateBeforeSuspend
+        : 'ready'
       return
     }
     await load()

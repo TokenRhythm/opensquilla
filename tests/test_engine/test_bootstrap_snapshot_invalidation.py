@@ -34,6 +34,23 @@ def test_bootstrap_write_evicts_only_matching_agent_snapshots() -> None:
     assert "USER.md" not in filter_workspace_filenames_for_session(None, "subagent:worker")
 
 
+def test_public_profile_snapshot_invalidation_evicts_only_matching_agent() -> None:
+    runner = TurnRunner(provider_selector=None)
+    runner._bootstrap_snapshots[("main", "session-a", "full")] = BootstrapSnapshot(
+        workspace_files={"USER.md": "main"},
+        report=[],
+    )
+    runner._bootstrap_snapshots[("other", "session-a", "full")] = BootstrapSnapshot(
+        workspace_files={"USER.md": "other"},
+        report=[],
+    )
+
+    runner.invalidate_profile_snapshot("main")
+
+    assert ("main", "session-a", "full") not in runner._bootstrap_snapshots
+    assert ("other", "session-a", "full") in runner._bootstrap_snapshots
+
+
 def test_runtime_write_callbacks_are_composed() -> None:
     runner = TurnRunner(provider_selector=None)
     memory_calls: list[tuple[str, str]] = []

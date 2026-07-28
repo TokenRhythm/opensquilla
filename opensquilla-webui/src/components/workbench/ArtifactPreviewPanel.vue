@@ -20,7 +20,7 @@
           :aria-label="t('workbench.artifactPreview.refresh')"
           :title="t('workbench.artifactPreview.refresh')"
           :disabled="preview.state.value === 'loading'"
-          @click="preview.reload"
+          @click="reloadPreview"
         >
           <Icon name="refresh" :size="15" />
         </button>
@@ -46,12 +46,21 @@
     </header>
 
     <p
-      v-if="preview.state.value === 'missing-resource'"
+      v-if="preview.state.value === 'missing-resource'
+        || preview.state.value === 'ready-with-warnings'"
       class="artifact-preview__notice"
       role="status"
     >
       <Icon name="info" :size="14" />
       <span>{{ t('workbench.artifactPreview.missingResources') }}</span>
+    </p>
+    <p
+      v-if="showOfflineWebLimits"
+      class="artifact-preview__notice"
+      role="status"
+    >
+      <Icon name="shield" :size="14" />
+      <span>{{ t('workbench.artifactPreview.offlineWebLimits') }}</span>
     </p>
 
     <div class="artifact-preview__viewport">
@@ -89,7 +98,7 @@
             v-if="preview.state.value !== 'unsupported' || preview.errorCode.value !== 'unsupported'"
             type="button"
             class="btn btn--ghost"
-            @click="preview.reload"
+            @click="reloadPreview"
           >
             <Icon name="refresh" :size="14" />
             <span>{{ t('chat.retry') }}</span>
@@ -149,12 +158,14 @@
         >{{ preview.text.value }}</pre>
         <iframe
           v-else-if="preview.kind.value === 'html' && !nativeHtml"
+          :key="htmlFrameGeneration"
           ref="previewFrameRef"
           class="artifact-preview__frame artifact-preview__frame--html"
           :src="preview.objectUrl.value"
           :title="t('chat.previewOf', { title: artifactFileTitle(artifact) })"
           tabindex="0"
-          sandbox="allow-scripts"
+          :sandbox="htmlSandbox"
+          :allow="htmlPermissions"
           referrerpolicy="no-referrer"
         />
         <div
@@ -196,6 +207,11 @@ const props = withDefaults(defineProps<{
   baseOrigin?: string
   nativeHtml?: boolean
   nativeSurfaceState?: 'crashed' | 'error' | 'loading' | 'ready'
+  previewBlocked?: boolean
+  previewCollectionStatus?: 'complete' | 'partial' | 'not_applicable'
+  previewErrorMessage?: string
+  previewLaunchUrl?: string
+  previewMode?: 'full' | 'offline'
   sessionKey?: string
   showHeader?: boolean
   suspended?: boolean
@@ -204,6 +220,11 @@ const props = withDefaults(defineProps<{
   baseOrigin: '',
   nativeHtml: false,
   nativeSurfaceState: 'loading',
+  previewBlocked: false,
+  previewCollectionStatus: 'not_applicable',
+  previewErrorMessage: '',
+  previewLaunchUrl: '',
+  previewMode: 'offline',
   sessionKey: '',
   showHeader: true,
   suspended: false,
@@ -219,11 +240,17 @@ const emit = defineEmits<{
 
 const { t } = useI18n()
 const previewFrameRef = ref<HTMLIFrameElement | null>(null)
+const htmlFrameGeneration = ref(0)
 
 const preview = useArtifactPreviewResource({
   artifact: () => props.artifact,
   authToken: () => props.authToken,
   baseOrigin: () => props.baseOrigin,
+  htmlCollectionStatus: () => props.previewCollectionStatus,
+  htmlLaunchUrl: () => props.previewLaunchUrl,
+  htmlLeaseState: () => props.previewBlocked
+    ? props.previewErrorMessage ? 'blocked' : 'pending'
+    : 'ready',
   nativeHtml: () => props.nativeHtml,
   onNativeHtmlReady: resource => {
     emit('native-html-ready', resource)
@@ -242,6 +269,11 @@ const resourceSignature = computed(() => [
   props.authToken,
   props.baseOrigin,
   props.nativeHtml ? 'native' : 'web',
+  props.previewBlocked ? 'blocked' : 'unblocked',
+  props.previewCollectionStatus,
+  props.previewErrorMessage,
+  props.previewLaunchUrl,
+  props.previewMode,
 ].join('\u0000'))
 
 watch(
@@ -287,7 +319,22 @@ function emitArtifactEvent(
 }
 
 const isRenderable = computed(() =>
-  preview.state.value === 'ready' || preview.state.value === 'missing-resource')
+  preview.state.value === 'ready'
+  || preview.state.value === 'ready-with-warnings'
+  || preview.state.value === 'missing-resource')
+
+const showOfflineWebLimits = computed(() =>
+  !props.nativeHtml
+  && props.previewMode === 'offline'
+  && preview.kind.value === 'html')
+
+const htmlSandbox = computed(() => props.previewMode === 'full'
+  ? 'allow-scripts allow-same-origin allow-forms allow-modals allow-pointer-lock allow-presentation'
+  : 'allow-scripts')
+
+const htmlPermissions = computed(() => props.previewMode === 'full'
+  ? 'camera; microphone; geolocation; clipboard-read; clipboard-write; fullscreen; display-capture'
+  : '')
 
 const pdfFrameUrl = computed(() => {
   const url = preview.objectUrl.value
@@ -304,6 +351,17 @@ function onPreviewFrameMessage(event: MessageEvent) {
 
 function requestWorkbenchCollapse() {
   emit('workbench-event', { type: 'request-collapse' })
+}
+
+async function reloadPreview() {
+  if (props.previewBlocked) {
+    emit('workbench-event', { type: 'preview-retry' })
+    return
+  }
+  await preview.reload()
+  if (preview.kind.value === 'html' && props.previewLaunchUrl) {
+    htmlFrameGeneration.value += 1
+  }
 }
 
 onMounted(() => window.addEventListener('message', onPreviewFrameMessage))
@@ -327,6 +385,9 @@ const failureTitle = computed(() => {
 })
 
 const failureDetail = computed(() => {
+  if (preview.errorCode.value === 'preview-blocked' && props.previewErrorMessage) {
+    return props.previewErrorMessage
+  }
   if (preview.errorCode.value === 'integrity-error') {
     return t('workbench.artifactPreview.integrityErrorDetail')
   }
@@ -350,7 +411,7 @@ const failureDetail = computed(() => {
 
 defineExpose({
   kind: preview.kind,
-  reload: preview.reload,
+  reload: reloadPreview,
   state: preview.state,
 })
 </script>

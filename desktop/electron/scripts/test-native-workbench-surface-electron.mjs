@@ -475,6 +475,7 @@ try {
         throw new Error(previewCrashSurface.message || 'Preview-crash surface failed to load.')
       }
       const previewCrashContents = await waitFor(previewContents, 'preview-crash WebContents')
+      const previewCrashView = surfaceView('artifact:preview-crash')
       emitRendererGone(previewCrashContents)
       await waitFor(
         () => events.some(event =>
@@ -482,6 +483,12 @@ try {
           && event.type === 'crashed'),
         'preview renderer crash event',
       )
+      await waitFor(
+        () => previewCrashContents.isDestroyed()
+          && !manager.surfaces.has('artifact:preview-crash'),
+        'preview renderer crash teardown',
+      )
+      const previewCrashDetached = !owner.contentView.children.includes(previewCrashView)
       const previewCrashActivation = manager.activateSurface('artifact:preview-crash')
       const previewCrashRect = manager.setSurfaceRect({
         surfaceId: 'artifact:preview-crash',
@@ -491,8 +498,6 @@ try {
         height: 500,
         visible: true,
       })
-      await manager.destroySurface('artifact:preview-crash')
-
       const unresponsiveSurface = await manager.createSurface({
         version: 1,
         surfaceId: 'artifact:unresponsive',
@@ -512,6 +517,7 @@ try {
         previewContents,
         'unresponsive preview WebContents',
       )
+      const unresponsiveUrl = unresponsiveContents.getURL()
       const unresponsiveView = surfaceView('artifact:unresponsive')
       const unresponsiveRectRequest = {
         surfaceId: 'artifact:unresponsive',
@@ -528,13 +534,14 @@ try {
       await waitFor(
         () => events.some(event =>
           event.surfaceId === 'artifact:unresponsive'
-          && event.type === 'crashed'
+          && event.type === 'unresponsive'
           && event.detail?.reason === 'unresponsive'),
-        'unresponsive renderer crash event',
+        'unresponsive renderer terminal event',
       )
       await waitFor(
-        () => !unresponsiveView.getVisible(),
-        'unresponsive surface to become physically hidden',
+        () => unresponsiveContents.isDestroyed()
+          && !manager.surfaces.has('artifact:unresponsive'),
+        'unresponsive surface teardown',
       )
       emitUnresponsive(unresponsiveContents)
       emitRendererGone(unresponsiveContents)
@@ -543,12 +550,16 @@ try {
         {},
         -2,
         'synthetic failure after unresponsive',
-        unresponsiveContents.getURL(),
+        unresponsiveUrl,
         true,
       )
       const unresponsiveTerminalEventCount = events.filter(event =>
         event.surfaceId === 'artifact:unresponsive'
-        && (event.type === 'error' || event.type === 'crashed')).length
+        && (
+          event.type === 'error'
+          || event.type === 'crashed'
+          || event.type === 'unresponsive'
+        )).length
       const unresponsiveActivation = manager.activateSurface('artifact:unresponsive')
       const unresponsiveRect = manager.setSurfaceRect(unresponsiveRectRequest)
       owner.emit('hide')
@@ -557,7 +568,7 @@ try {
       owner.webContents.emit('zoom-changed', {}, 'in')
       await new Promise(resolveWait => setTimeout(resolveWait, 100))
       const failedSurfaceStayedHidden = !unresponsiveView.getVisible()
-      await manager.destroySurface('artifact:unresponsive')
+      const unresponsiveDetached = !owner.contentView.children.includes(unresponsiveView)
 
       const ownerUnresponsiveSurfaceOne = await manager.createSurface({
         version: 1,
@@ -674,6 +685,7 @@ try {
         popupCreated,
         popupWasBlocked,
         previewCrashActivation,
+        previewCrashDetached,
         previewCrashRect,
         raceBaseDestroyed,
         replacementCloseActivation,
@@ -682,6 +694,7 @@ try {
         zoomBoundsBefore,
         zoomChildFactor,
         unresponsiveActivation,
+        unresponsiveDetached,
         unresponsiveRect,
         unresponsiveSurfaceWasVisible,
         unresponsiveTerminalEventCount,
@@ -798,6 +811,11 @@ try {
     'child zoom reset must restore the owner-scaled native bounds',
   )
   assert.equal(
+    result.previewCrashDetached,
+    true,
+    'a crashed renderer must remove its native child view without a separate close request',
+  )
+  assert.equal(
     result.unresponsiveSurfaceWasVisible,
     true,
     'the unresponsive contract must exercise a physically visible native surface',
@@ -816,6 +834,11 @@ try {
     result.unresponsiveRect.ok,
     false,
     'an unresponsive preview renderer must reject delayed visible bounds',
+  )
+  assert.equal(
+    result.unresponsiveDetached,
+    true,
+    'an unresponsive renderer must remove its native child view without a separate close request',
   )
   assert.equal(
     result.failedSurfaceStayedHidden,

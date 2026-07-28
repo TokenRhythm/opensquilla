@@ -15,14 +15,18 @@ assert.equal(defaultDesktopMainWindowCloseBehavior('linux'), 'quit')
 assert.equal(defaultDesktopMainWindowCloseBehavior('freebsd'), 'quit')
 
 assert.deepEqual(defaultDesktopPreferences('darwin'), {
-  schema_version: 1,
+  schema_version: 2,
   main_window_close_behavior: 'background',
   background_close_notice_shown: false,
+  workbench_preview_mode: 'full',
+  workbench_preview_notice_shown: false,
 })
 assert.deepEqual(defaultDesktopPreferences('linux'), {
-  schema_version: 1,
+  schema_version: 2,
   main_window_close_behavior: 'quit',
   background_close_notice_shown: false,
+  workbench_preview_mode: 'full',
+  workbench_preview_notice_shown: false,
 })
 
 for (const invalid of [
@@ -41,9 +45,11 @@ for (const invalid of [
     normalizeDesktopPreferences(invalid, 'win32'),
     {
       value: {
-        schema_version: 1,
+        schema_version: 2,
         main_window_close_behavior: 'background',
         background_close_notice_shown: false,
+        workbench_preview_mode: 'full',
+        workbench_preview_notice_shown: false,
       },
       writable: true,
     },
@@ -62,9 +68,11 @@ for (const behavior of ['background', 'quit', 'ask']) {
       }, 'linux'),
       {
         value: {
-          schema_version: 1,
+          schema_version: 2,
           main_window_close_behavior: behavior,
           background_close_notice_shown: noticeShown,
+          workbench_preview_mode: 'full',
+          workbench_preview_notice_shown: false,
         },
         writable: true,
       },
@@ -80,9 +88,11 @@ assert.deepEqual(
   }, 'linux'),
   {
     value: {
-      schema_version: 1,
+      schema_version: 2,
       main_window_close_behavior: 'quit',
       background_close_notice_shown: false,
+      workbench_preview_mode: 'full',
+      workbench_preview_notice_shown: false,
     },
     writable: true,
   },
@@ -94,13 +104,37 @@ assert.deepEqual(
     schema_version: 2,
     main_window_close_behavior: 'ask',
     background_close_notice_shown: true,
+    workbench_preview_mode: 'offline',
+    workbench_preview_notice_shown: true,
+  }, 'win32'),
+  {
+    value: {
+      schema_version: 2,
+      main_window_close_behavior: 'ask',
+      background_close_notice_shown: true,
+      workbench_preview_mode: 'offline',
+      workbench_preview_notice_shown: true,
+    },
+    writable: true,
+  },
+  'schema-v2 preview preferences are normalized without coercion',
+)
+assert.deepEqual(
+  normalizeDesktopPreferences({
+    schema_version: 3,
+    main_window_close_behavior: 'ask',
+    background_close_notice_shown: true,
+    workbench_preview_mode: 'offline',
+    workbench_preview_notice_shown: true,
     future_field: { preservedByCaller: true },
   }, 'win32'),
   {
     value: {
-      schema_version: 1,
+      schema_version: 2,
       main_window_close_behavior: 'ask',
       background_close_notice_shown: true,
+      workbench_preview_mode: 'offline',
+      workbench_preview_notice_shown: true,
     },
     writable: false,
   },
@@ -111,12 +145,16 @@ assert.deepEqual(
     schema_version: 999,
     main_window_close_behavior: 'future-choice',
     background_close_notice_shown: 'yes',
+    workbench_preview_mode: 'browser-like',
+    workbench_preview_notice_shown: 1,
   }, 'linux'),
   {
     value: {
-      schema_version: 1,
+      schema_version: 2,
       main_window_close_behavior: 'quit',
       background_close_notice_shown: false,
+      workbench_preview_mode: 'full',
+      workbench_preview_notice_shown: false,
     },
     writable: false,
   },
@@ -124,17 +162,21 @@ assert.deepEqual(
 )
 
 const preferences = {
-  schema_version: 1,
+  schema_version: 2,
   main_window_close_behavior: 'ask',
   background_close_notice_shown: true,
+  workbench_preview_mode: 'offline',
+  workbench_preview_notice_shown: true,
 }
 const serialized = serializeDesktopPreferences(preferences)
 assert.equal(
   serialized,
   '{\n'
-    + '  "schema_version": 1,\n'
+    + '  "schema_version": 2,\n'
     + '  "main_window_close_behavior": "ask",\n'
-    + '  "background_close_notice_shown": true\n'
+    + '  "background_close_notice_shown": true,\n'
+    + '  "workbench_preview_mode": "offline",\n'
+    + '  "workbench_preview_notice_shown": true\n'
     + '}\n',
 )
 assert.deepEqual(
@@ -145,14 +187,16 @@ assert.deepEqual(
 for (const invalid of [
   null,
   {},
-  { ...preferences, schema_version: 2 },
+  { ...preferences, schema_version: 1 },
   { ...preferences, main_window_close_behavior: 'close' },
   { ...preferences, background_close_notice_shown: 1 },
+  { ...preferences, workbench_preview_mode: 'browser-like' },
+  { ...preferences, workbench_preview_notice_shown: 1 },
   { ...preferences, unexpected: true },
 ]) {
   assert.throws(
     () => serializeDesktopPreferences(invalid),
-    /not a valid schema-v1 document/,
+    /not a valid schema-v2 document/,
     'serialization must reject malformed, future, and non-canonical documents',
   )
 }

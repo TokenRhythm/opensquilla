@@ -221,8 +221,12 @@ function verifyMainProcess(source, label) {
     fail(`${label} main process does not create the desktop window before gateway startup`)
   }
 
+  const activateIndex = source.indexOf('async function activateMainWindow')
+  const activateSource = activateIndex === -1 ? '' : source.slice(activateIndex, activateIndex + 2_400)
+  const activateRoutesToDesktopOpen = activateSource.includes('openOrResumeDesktopApp()')
   const revealRoutesToDesktopOpen =
-    /function revealDesktopApp\([^)]*\)[^{]*\{[^}]{0,600}openOrResumeDesktopApp\(\)/.test(source)
+    /function revealDesktopApp\([^)]*\)[^{]*\{[^}]{0,300}activateMainWindow\(/.test(source)
+    && activateRoutesToDesktopOpen
   const handlerRoutesToDesktopOpen = (handlerPattern) => {
     const directRoute = new RegExp(
       `${handlerPattern}[\\s\\S]{0,240}openOrResumeDesktopApp`,
@@ -298,6 +302,17 @@ async function verifyInstallerDataPolicy() {
   const packageJson = JSON.parse(await readFile(packageJsonPath, 'utf8'))
   if (packageJson.build?.nsis?.deleteAppDataOnUninstall !== false) {
     fail('NSIS uninstall must preserve Desktop profile data (deleteAppDataOnUninstall=false)')
+  }
+  const protocols = packageJson.build?.protocols
+  if (
+    !Array.isArray(protocols)
+    || protocols.length !== 1
+    || protocols[0]?.name !== 'OpenSquilla'
+    || !Array.isArray(protocols[0]?.schemes)
+    || protocols[0].schemes.length !== 1
+    || protocols[0].schemes[0] !== 'opensquilla'
+  ) {
+    fail('electron-builder must register only the opensquilla URL protocol')
   }
 }
 

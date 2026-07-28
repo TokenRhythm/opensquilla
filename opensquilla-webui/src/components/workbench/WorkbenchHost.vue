@@ -256,7 +256,6 @@ const shouldMount = computed(() =>
 const runtimeAvailable = computed(() =>
   props.enabled
   && props.routeActive
-  && !props.modalBlocked
   && shouldRender.value)
 const mobileDialogOpen = computed(() =>
   shouldRender.value && layoutMode.value === 'mobile-dialog')
@@ -415,6 +414,7 @@ watch(runtimeAvailable, available => {
   void nextTick(scheduleSurfaceRect)
 }, { immediate: true })
 
+watch(() => props.modalBlocked, () => void nextTick(scheduleSurfaceRect))
 watch(() => store.activeItem?.id, () => void nextTick(scheduleSurfaceRect))
 watch(() => store.activeItem?.hostKind, () => void nextTick(scheduleSurfaceRect))
 watch(effectiveWidth, scheduleSurfaceRect)

@@ -20,6 +20,8 @@ from pathlib import Path
 
 import pytest
 import structlog.testing
+from starlette.responses import JSONResponse
+from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from opensquilla.gateway.app import create_gateway_app
@@ -30,8 +32,7 @@ from opensquilla.gateway.config import GatewayConfig
 _OWNER_PEER = ("127.0.0.1", 51000)
 
 _FOREIGN_ORIGIN = "https://evil.example"
-# TestClient requests carry base URL http://testserver, so this is same-origin.
-_SAME_ORIGIN = "http://testserver"
+_SAME_ORIGIN = "http://127.0.0.1:18791"
 
 # Every state-changing HTTP route behind the shared guard. Bodies are the
 # minimal synthetic payloads that get each handler past input validation far
@@ -79,7 +80,11 @@ def _hermetic_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _client(config: GatewayConfig | None = None) -> TestClient:
-    return TestClient(create_gateway_app(config or GatewayConfig()), client=_OWNER_PEER)
+    return TestClient(
+        create_gateway_app(config or GatewayConfig()),
+        base_url=_SAME_ORIGIN,
+        client=_OWNER_PEER,
+    )
 
 
 def _post(client: TestClient, path: str, body: dict | None, origin: str | None):
@@ -137,7 +142,7 @@ def test_foreign_origin_never_reaches_the_shutdown_trigger() -> None:
     app = create_gateway_app(GatewayConfig())
     app.state.request_shutdown = calls.append
 
-    with TestClient(app, client=_OWNER_PEER) as client:
+    with TestClient(app, base_url=_SAME_ORIGIN, client=_OWNER_PEER) as client:
         forbidden = client.post("/api/system/shutdown", headers={"Origin": _FOREIGN_ORIGIN})
         assert forbidden.status_code == 403
         assert calls == []
@@ -180,6 +185,53 @@ def test_wildcard_origin_does_not_bypass_the_guard() -> None:
     assert response.json()["code"] == "FORBIDDEN_ORIGIN"
 
 
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "null",
+        "http://127.0.0.1:18791/path",
+        "http://127.0.0.1:18791?query",
+        "http://127.0.0.1:18791#fragment",
+        "http://user@127.0.0.1:18791",
+        "ws://127.0.0.1:18791",
+        "not an origin",
+    ],
+)
+def test_malformed_or_non_http_origin_is_rejected(origin: str) -> None:
+    with _client() as client:
+        response = client.post(
+            "/api/approvals/settings",
+            json={"mode": "prompt"},
+            headers={"Origin": origin},
+        )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "FORBIDDEN_ORIGIN"
+
+
+def test_shared_middleware_guards_dynamically_registered_mutation_routes() -> None:
+    calls: list[str] = []
+
+    async def mutate(_request):
+        calls.append("called")
+        return JSONResponse({"ok": True})
+
+    app = create_gateway_app(
+        GatewayConfig(),
+        extra_routes=[Route("/dynamic-mutation", mutate, methods=["POST"])],
+    )
+    with TestClient(app, client=_OWNER_PEER) as client:
+        rejected = client.post(
+            "/dynamic-mutation",
+            headers={"Origin": _FOREIGN_ORIGIN},
+        )
+        accepted = client.post("/dynamic-mutation")
+
+    assert rejected.status_code == 403
+    assert accepted.status_code == 200
+    assert calls == ["called"]
+
+
 # ── CORS headers off by default, opt-in per origin ──────────────────────────
 
 
@@ -207,7 +259,7 @@ def test_explicitly_configured_origin_still_gets_cors_headers() -> None:
 # ── Boot-time wildcard warning ───────────────────────────────────────────────
 
 
-def test_wildcard_with_credentials_warns_once_at_boot() -> None:
+def test_wildcard_is_ignored_and_warns_once_at_boot() -> None:
     config = GatewayConfig()
     config.cors.allowed_origins = ["*"]
     config.cors.allow_credentials = True
@@ -215,7 +267,7 @@ def test_wildcard_with_credentials_warns_once_at_boot() -> None:
     with structlog.testing.capture_logs() as captured:
         create_gateway_app(config)
 
-    events = [e for e in captured if e["event"] == "gateway.cors_wildcard_with_credentials"]
+    events = [e for e in captured if e["event"] == "gateway.cors_wildcard_ignored"]
     assert len(events) == 1
     assert events[0]["log_level"] == "warning"
 
@@ -223,13 +275,116 @@ def test_wildcard_with_credentials_warns_once_at_boot() -> None:
 def test_no_wildcard_warning_for_default_or_explicit_origins() -> None:
     explicit = GatewayConfig()
     explicit.cors.allowed_origins = ["https://frontend.example"]
-    wildcard_without_credentials = GatewayConfig()
-    wildcard_without_credentials.cors.allowed_origins = ["*"]
-    wildcard_without_credentials.cors.allow_credentials = False
 
     with structlog.testing.capture_logs() as captured:
         create_gateway_app(GatewayConfig())
         create_gateway_app(explicit)
-        create_gateway_app(wildcard_without_credentials)
+    assert not [e for e in captured if e["event"] == "gateway.cors_wildcard_ignored"]
 
-    assert not [e for e in captured if e["event"] == "gateway.cors_wildcard_with_credentials"]
+
+def test_wildcard_without_credentials_does_not_emit_cors_headers() -> None:
+    config = GatewayConfig()
+    config.cors.allowed_origins = ["*"]
+    config.cors.allow_credentials = False
+
+    with _client(config) as client:
+        response = client.get("/api/config", headers={"Origin": _FOREIGN_ORIGIN})
+
+    assert response.status_code == 200
+    assert "access-control-allow-origin" not in response.headers
+
+
+def test_matching_host_and_origin_cannot_rebind_loopback_gateway() -> None:
+    with _client() as client:
+        response = client.post(
+            "/api/approvals/settings",
+            json={"mode": "prompt"},
+            headers={
+                "Host": "evil.example:18791",
+                "Origin": "http://evil.example:18791",
+            },
+        )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "FORBIDDEN_ORIGIN"
+
+
+def test_wildcard_bind_rejects_unconfigured_hostname_from_remote_peer() -> None:
+    config = GatewayConfig()
+    config.host = "0.0.0.0"
+    app = create_gateway_app(config)
+
+    with TestClient(
+        app,
+        base_url="http://192.0.2.10:18791",
+        client=("192.0.2.20", 51000),
+    ) as client:
+        response = client.post(
+            "/api/approvals/settings",
+            json={"mode": "prompt"},
+            headers={
+                "Host": "rebinding.example:18791",
+                "Origin": "http://rebinding.example:18791",
+                # Proxy metadata must not turn a browser-controlled authority
+                # into one the wildcard listener implicitly trusts.
+                "X-Forwarded-For": "127.0.0.1",
+            },
+        )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "FORBIDDEN_ORIGIN"
+
+
+def test_wildcard_bind_accepts_same_origin_ip_authority() -> None:
+    calls: list[str] = []
+
+    async def mutate(_request):
+        calls.append("called")
+        return JSONResponse({"ok": True})
+
+    config = GatewayConfig()
+    config.host = "0.0.0.0"
+    app = create_gateway_app(
+        config,
+        extra_routes=[Route("/dynamic-mutation", mutate, methods=["POST"])],
+    )
+    with TestClient(
+        app,
+        base_url="http://192.0.2.10:18791",
+        client=("192.0.2.20", 51000),
+    ) as client:
+        response = client.post(
+            "/dynamic-mutation",
+            headers={"Origin": "http://192.0.2.10:18791"},
+        )
+
+    assert response.status_code == 200
+    assert calls == ["called"]
+
+
+def test_wildcard_bind_accepts_explicit_custom_hostname_origin() -> None:
+    calls: list[str] = []
+
+    async def mutate(_request):
+        calls.append("called")
+        return JSONResponse({"ok": True})
+
+    config = GatewayConfig()
+    config.host = "0.0.0.0"
+    config.cors.allowed_origins = ["https://control.example"]
+    app = create_gateway_app(
+        config,
+        extra_routes=[Route("/dynamic-mutation", mutate, methods=["POST"])],
+    )
+    with TestClient(
+        app,
+        base_url="https://control.example",
+        client=("192.0.2.20", 51000),
+    ) as client:
+        response = client.post(
+            "/dynamic-mutation",
+            headers={"Origin": "https://control.example"},
+        )
+
+    assert response.status_code == 200
+    assert calls == ["called"]

@@ -80,6 +80,7 @@ def test_tokenrhythm_never_toggles_thinking_but_replays_v4_reasoning() -> None:
     assert policy.thinking_toggle_model_ids == frozenset()
     assert policy.default_reasoning_format == ""
     assert policy.replay_reasoning_format == ""
+    assert policy.supports_native_json_schema_output is False
     # cost_cny is CNY — booking it as USD would corrupt cost rollups.
     assert policy.trust_billed_cost is False
     assert policy.allow_post_terminal_noop_choice is True
@@ -97,6 +98,12 @@ def test_tokenrhythm_never_toggles_thinking_but_replays_v4_reasoning() -> None:
     assert not _should_replay_reasoning_content(
         policy=policy, model="glm-5", caps=None
     )
+
+
+def test_native_json_schema_output_stays_enabled_by_default() -> None:
+    assert compat_policy_for_kind("openai").supports_native_json_schema_output is True
+    assert compat_policy_for_kind("openrouter").supports_native_json_schema_output is True
+    assert OpenAICompatPolicy().supports_native_json_schema_output is True
 
 
 def test_deepseek_replay_stays_v4_gated() -> None:

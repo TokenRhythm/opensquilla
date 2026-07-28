@@ -67,6 +67,13 @@ export interface WorkbenchPanelHeader {
   icon?: IconName
 }
 
+export interface WorkbenchToolbarSelectOption {
+  value: string
+  label: string
+  actionId: string
+  disabled?: boolean
+}
+
 export type WorkbenchToolbarItem =
   | {
       kind: 'action'
@@ -82,6 +89,15 @@ export type WorkbenchToolbarItem =
       label: string
       text: string
       icon?: IconName
+    }
+  | {
+      kind: 'select'
+      id: string
+      label: string
+      value: string
+      options: readonly WorkbenchToolbarSelectOption[]
+      actionGroupLabel?: string
+      actionOptions?: readonly WorkbenchToolbarSelectOption[]
     }
 
 export interface WorkbenchRuntimeContext {

@@ -143,6 +143,12 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     # narrow top-level facade. Recovery owns the platform-specific mechanics;
     # lower-level packages must not import the recovery package directly.
     ("profile_operation_lock.py", "recovery"),
+    # Profile import uses a narrow top-level facade for no-replace publication,
+    # metadata preservation, native path handling, and the shared profile lock.
+    ("profile_import_io.py", "recovery"),
+    # The same facade reuses migration's handle-pinned Windows source reader;
+    # the lower-level memory package remains independent of migration internals.
+    ("profile_import_io.py", "migration"),
     ("permissions.py", "sandbox"),
     # turn_error_writer scrubs free-text error records through the low-level
     # observability.redact utility before insert — sound downward layering.

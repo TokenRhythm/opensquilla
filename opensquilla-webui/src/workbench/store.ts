@@ -129,7 +129,16 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     return true
   }
 
-  function openItem(item: WorkbenchItem) {
+  function openItem(item: WorkbenchItem): boolean {
+    const existing = items.value.some(candidate => candidate.id === item.id)
+    if (
+      !existing
+      && item.hostKind === 'native-webcontents'
+      && items.value.filter(candidate => candidate.hostKind === 'native-webcontents').length
+        >= WORKBENCH_PREVIEW_ITEM_LIMIT
+    ) {
+      return false
+    }
     if (!updateItem(item)) {
       items.value.push(item)
       notify({ type: 'open', item })
@@ -137,6 +146,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     expanded.value = true
     activateItem(item.id)
     evictLeastRecentArtifactPreviews(item.id)
+    return true
   }
 
   /**
@@ -153,7 +163,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       const staleId = activationOrder.find(id => {
         if (id === protectedId) return false
         return items.value.some(
-          candidate => candidate.id === id && candidate.kind === 'artifact-preview',
+          candidate =>
+            candidate.id === id
+            && candidate.kind === 'artifact-preview'
+            && candidate.hostKind !== 'native-webcontents',
         )
       })
       if (!staleId || !closeItem(staleId, 'evicted')) break

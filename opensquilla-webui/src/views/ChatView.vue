@@ -2835,7 +2835,7 @@ function openArtifact(artifact: ArtifactPayload): boolean {
     return true
   }
   if (!workbenchEnabled.value || !sessionKey.value) return false
-  workbenchStore.openItem(createArtifactPreviewWorkbenchItem({
+  const opened = workbenchStore.openItem(createArtifactPreviewWorkbenchItem({
     artifact,
     navigationArtifacts: sessionArtifacts.value,
     nativeHtml: Boolean(
@@ -2844,7 +2844,10 @@ function openArtifact(artifact: ArtifactPayload): boolean {
     ),
     sessionKey: sessionKey.value,
   }))
-  return true
+  if (!opened) {
+    pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+  }
+  return opened
 }
 
 function closeDeliverables() {

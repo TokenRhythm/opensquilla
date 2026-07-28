@@ -53,7 +53,7 @@ afterEach(() => {
 })
 
 describe('ArtifactPreviewPanel', () => {
-  it('renders web HTML in a script-only opaque sandbox', async () => {
+  it('runs offline web HTML scripts in an opaque sandbox', async () => {
     const observed: { blob?: Blob } = {}
     const createObjectUrl = vi.spyOn(URL, 'createObjectURL').mockImplementation(blob => {
       observed.blob = blob as Blob

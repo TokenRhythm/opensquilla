@@ -1889,6 +1889,46 @@ def test_openrouter_sends_configured_json_output_schema(monkeypatch: Any) -> Non
     }
 
 
+def test_tokenrhythm_embeds_json_schema_without_response_format(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="glm-5.2",
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+    )
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"schema_version": {"type": "integer", "const": 1}},
+        "required": ["schema_version"],
+    }
+    config = ChatConfig(
+        system="Fuse the imported profile.",
+        output_json_schema=schema,
+    )
+
+    _collect(provider, config)
+
+    payload = captured["payload"]
+    assert "response_format" not in payload
+    assert payload["messages"][0] == {
+        "role": "system",
+        "content": (
+            "Fuse the imported profile.\n\n"
+            "Return exactly one JSON value that validates against the authoritative "
+            "JSON Schema below. Do not use Markdown fences or add commentary.\n"
+            f"{json.dumps(schema, ensure_ascii=False, separators=(',', ':'), sort_keys=True)}"
+        ),
+    }
+    assert payload["messages"][1] == {"role": "user", "content": "hi"}
+    assert config.system == "Fuse the imported profile."
+    assert config.output_json_schema == schema
+
+
 def test_openrouter_omits_response_format_without_output_schema(monkeypatch: Any) -> None:
     captured: dict[str, Any] = {}
     _patch_transport(monkeypatch, captured)

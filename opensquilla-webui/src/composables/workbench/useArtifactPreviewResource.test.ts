@@ -158,6 +158,42 @@ describe('createArtifactPreviewResource', () => {
     expect(new TextDecoder().decode(payload?.data)).toContain('Preview')
   })
 
+  it('uses the explicit ready-with-warnings state for partial bundle leases', async () => {
+    const fetchImpl = vi.fn()
+    const controller = createArtifactPreviewResource({
+      artifact: () => artifact({ name: 'page.html', mime: 'text/html' }),
+      fetchImpl,
+      htmlCollectionStatus: () => 'partial',
+      htmlLaunchUrl: () => 'https://preview.example.test/index.html',
+    })
+
+    await controller.load()
+
+    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(controller.objectUrl.value).toBe('https://preview.example.test/index.html')
+    expect(controller.state.value).toBe('ready-with-warnings')
+  })
+
+  it('never downloads the entry HTML while a preview lease is pending or blocked', async () => {
+    const fetchImpl = vi.fn()
+    let leaseState: 'pending' | 'blocked' = 'pending'
+    const controller = createArtifactPreviewResource({
+      artifact: () => artifact({ name: 'page.html', mime: 'text/html' }),
+      fetchImpl,
+      htmlLeaseState: () => leaseState,
+    })
+
+    await controller.load()
+    expect(controller.state.value).toBe('loading')
+    expect(fetchImpl).not.toHaveBeenCalled()
+
+    leaseState = 'blocked'
+    await controller.reload()
+    expect(controller.state.value).toBe('error')
+    expect(controller.errorCode.value).toBe('preview-blocked')
+    expect(fetchImpl).not.toHaveBeenCalled()
+  })
+
   it('keeps recoverable native load errors distinct from renderer crashes', () => {
     const controller = createArtifactPreviewResource({
       artifact: () => artifact({ name: 'page.html', mime: 'text/html' }),

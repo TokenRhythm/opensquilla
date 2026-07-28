@@ -66,17 +66,26 @@ def test_desktop_activation_and_second_instance_share_safe_reveal_helper() -> No
     assert "if (process.platform !== 'darwin') app.quit()" in main_ts
     assert "app.on('activate', () => {\n  revealDesktopApp()" in main_ts
     assert "function revealDesktopApp(): void" in main_ts
-    assert "if (!canRevealDesktopApp(appExitPhase)) return" in main_ts
-    assert "focusMainWindow()" in _section(
+    activation = _section(
+        main_ts,
+        "async function activateMainWindow(",
+        "function revealDesktopApp(): void",
+    )
+    reveal = _section(
         main_ts,
         "function revealDesktopApp(): void",
         "async function promptForMainWindowClose",
     )
+    assert "if (!canRevealDesktopApp(appExitPhase))" in activation
+    assert "focusMainWindow()" in activation
+    assert "await openOrResumeDesktopApp()" in activation
+    assert "app.focus({ steal: true })" in activation
+    assert "activateMainWindow('desktop-reveal')" in reveal
     # second-instance reveals the app via the shared helper (a diagnostic log
     # line precedes the resume call — see the #446 relaunch-retry contract).
     second_instance = _section(
         main_ts,
-        "app.on('second-instance', () => {",
+        "app.on('second-instance',",
         "void app.whenReady().then",
     )
     assert "revealDesktopApp()" in second_instance
@@ -86,6 +95,56 @@ def test_desktop_activation_and_second_instance_share_safe_reveal_helper() -> No
         "void app.whenReady().then",
         "})\n}",
     )
+
+
+def test_desktop_deep_link_protocol_is_registered_and_safely_activated() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    package = json.loads(_read("desktop/electron/package.json"))
+
+    assert package["build"]["protocols"] == [
+        {
+            "name": "OpenSquilla",
+            "schemes": ["opensquilla"],
+        }
+    ]
+    assert (
+        "from './desktop-deep-link.js'"
+        in main_ts
+    )
+    assert "async function activateMainWindow(" in main_ts
+    assert "function handleDeepLink(rawUrl: unknown" in main_ts
+    assert "parseDesktopDeepLink(rawUrl)" in main_ts
+    assert "desktopDeepLinkArguments(commandLine)" in main_ts
+    assert "app.setAsDefaultProtocolClient(DESKTOP_DEEP_LINK_SCHEME)" in main_ts
+
+    open_url = _section(
+        main_ts,
+        "app.on('open-url'",
+        "desktopLog('launch',",
+    )
+    assert "event.preventDefault()" in open_url
+    assert "handleDeepLink(rawUrl, 'open-url')" in open_url
+    assert main_ts.index("app.on('open-url'") < main_ts.index("void app.whenReady().then")
+
+    second_instance = _section(
+        main_ts,
+        "app.on('second-instance'",
+        "void app.whenReady().then",
+    )
+    assert "commandLine" in second_instance
+    assert "handleDeepLinksFromCommandLine(commandLine, 'second-instance')" in (
+        second_instance
+    )
+
+    initial_argv = _section(
+        main_ts,
+        "if (process.platform === 'win32') {\n    handleDeepLinksFromCommandLine",
+        "app.on('second-instance'",
+    )
+    assert "process.argv" in initial_argv
+    assert "'initial-argv'" in initial_argv
+    assert "pendingDesktopDeepLinkOpen" in main_ts
+    assert "desktopDeepLinkActivationReady" in main_ts
 
 
 def test_desktop_window_close_has_a_visible_background_recovery_surface() -> None:

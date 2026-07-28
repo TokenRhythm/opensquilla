@@ -25,6 +25,34 @@ Expert skill for professional HTML development with focus on semantic markup, ac
 - Using HTML5 APIs (Canvas, SVG, Storage, Geolocation)
 - Troubleshooting validation or accessibility issues
 
+## OpenSquilla Webpage Delivery
+
+For a new runnable webpage when workspace file-authoring tools are available:
+
+1. Create a filesystem-safe, dedicated project subdirectory such as
+   `webpage-<topic-slug>/`; never place a generated site directly in the
+   workspace root.
+2. Keep `index.html`, local CSS/JavaScript, and every local asset inside that
+   project root, using browser-relative references.
+3. Validate the finished project, then call `publish_artifact` exactly once
+   with the entry file and the complete dedicated root:
+
+```json
+{
+  "path": "webpage-<topic-slug>/index.html",
+  "mime": "text/html",
+  "bundle": "directory",
+  "bundle_root": "webpage-<topic-slug>"
+}
+```
+
+Do not bundle the entire workspace. When a caller explicitly requests
+source-only output, forbids tool calls, or supplies its own deterministic
+writer—as AwesomeWebpageMetaSkill does—follow that narrower caller contract
+instead. When file authoring or `publish_artifact` is unavailable, return only
+the requested guidance or source and do not claim that a runnable project was
+published.
+
 ## Core Capabilities
 
 - **Semantic HTML**: Document structure, content sections, accessibility-first markup

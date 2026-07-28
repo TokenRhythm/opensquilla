@@ -50,6 +50,14 @@ function findCloseBehaviorSelect(el: HTMLElement): HTMLSelectElement {
   return select
 }
 
+function findPreviewModeSelect(el: HTMLElement): HTMLSelectElement {
+  const select = el.querySelector<HTMLSelectElement>(
+    '[data-testid="desktop-preview-mode-select"]',
+  )
+  if (!select) throw new Error('Desktop preview mode select was not rendered')
+  return select
+}
+
 beforeEach(() => setDesktopApi(undefined))
 
 describe('DesktopRuntimePanel close behavior preference', () => {
@@ -210,6 +218,67 @@ describe('DesktopRuntimePanel close behavior preference', () => {
     expect(background?.disabled).toBe(true)
     expect(ask?.disabled).toBe(true)
     expect(el.textContent).toContain('Background mode is unavailable on this platform.')
+    app.unmount()
+  })
+
+  it('loads and saves the default webpage preview mode', async () => {
+    const saveDesktopPreferences = vi.fn(async (payload: {
+      workbenchPreviewMode?: 'full' | 'offline'
+    }) => ({
+      mainWindowCloseBehavior: 'quit' as const,
+      canRunInBackground: true,
+      platform: 'darwin' as const,
+      schemaVersion: 2,
+      workbenchPreviewMode: payload.workbenchPreviewMode ?? 'offline',
+      effectiveWorkbenchPreviewMode: payload.workbenchPreviewMode ?? 'offline',
+      workbenchPreviewNoticeShown: false,
+      workbenchPreviewForcedOffline: false,
+    }))
+    const { app, el } = await mountPanel(desktopApi({
+      getDesktopPreferences: async () => ({
+        mainWindowCloseBehavior: 'quit' as const,
+        canRunInBackground: true,
+        platform: 'darwin' as const,
+        schemaVersion: 2,
+        workbenchPreviewMode: 'offline' as const,
+        effectiveWorkbenchPreviewMode: 'offline' as const,
+        workbenchPreviewNoticeShown: false,
+        workbenchPreviewForcedOffline: false,
+      }),
+      saveDesktopPreferences,
+    }))
+    const select = findPreviewModeSelect(el)
+
+    expect(select.value).toBe('offline')
+    select.value = 'full'
+    select.dispatchEvent(new Event('change', { bubbles: true }))
+    await settle()
+
+    expect(saveDesktopPreferences).toHaveBeenCalledWith({
+      workbenchPreviewMode: 'full',
+    })
+    expect(select.value).toBe('full')
+    app.unmount()
+  })
+
+  it('explains when the process-level incident switch forces offline previews', async () => {
+    const { app, el } = await mountPanel(desktopApi({
+      getDesktopPreferences: async () => ({
+        mainWindowCloseBehavior: 'quit' as const,
+        canRunInBackground: true,
+        platform: 'linux' as const,
+        schemaVersion: 2,
+        workbenchPreviewMode: 'full' as const,
+        effectiveWorkbenchPreviewMode: 'offline' as const,
+        workbenchPreviewNoticeShown: false,
+        workbenchPreviewForcedOffline: true,
+      }),
+      saveDesktopPreferences: vi.fn(),
+    }))
+
+    expect(findPreviewModeSelect(el).value).toBe('full')
+    const warning = el.querySelector<HTMLElement>('[data-testid="desktop-preview-mode-forced"]')
+    expect(warning?.textContent).toContain('OPENSQUILLA_PREVIEW_FORCE_OFFLINE')
     app.unmount()
   })
 })
