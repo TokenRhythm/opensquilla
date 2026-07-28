@@ -292,6 +292,7 @@ jobs:
           node scripts/test-update-resolver.mjs
           node scripts/test-update-check-scheduler.mjs
           node scripts/test-desktop-locale.mjs
+          node scripts/test-desktop-zoom-shortcuts.mjs --contracts-only
           node scripts/test-desktop-profile-substrate.mjs
           node scripts/test-desktop-profile-consolidation.mjs
           node scripts/test-desktop-gateway-ownership.mjs
@@ -920,6 +921,7 @@ jobs:
             'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs' \
             'window-background-flow:scripts/test-desktop-window-background-flow.mjs' \
             'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs' \
+            'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs' \
             'unsafe-legacy-recovery-no-write:scripts/test-unsafe-legacy-recovery-no-write.mjs'
           do
             name="${entry%%:*}"

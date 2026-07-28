@@ -282,6 +282,51 @@ try {
       await manager.destroySurface('artifact:allowed')
       await waitFor(() => allowedContents.isDestroyed(), 'allowed surface destruction')
 
+      const zoomSurface = await manager.createSurface({
+        version: 1,
+        surfaceId: 'artifact:zoom',
+        kind: 'artifact-html',
+        payload: {
+          data: encoder.encode('<!doctype html><title>Zoom preview</title>'),
+          name: 'zoom.html',
+          mime: 'text/html',
+          scopeId: 'synthetic:zoom',
+          allowRemoteResources: false,
+        },
+      })
+      if (!zoomSurface.ok) throw new Error(zoomSurface.message || 'Zoom surface failed to load.')
+      const zoomContents = await waitFor(previewContents, 'zoom preview WebContents')
+      const zoomRect = manager.setSurfaceRect({
+        surfaceId: 'artifact:zoom',
+        x: 120,
+        y: 90,
+        width: 360,
+        height: 240,
+        visible: true,
+      })
+      if (!zoomRect.ok) throw new Error(zoomRect.message || 'Zoom surface bounds were rejected.')
+      const zoomActivation = manager.activateSurface('artifact:zoom')
+      if (!zoomActivation.ok) throw new Error(zoomActivation.message || 'Zoom surface failed to activate.')
+      const zoomView = owner.contentView.children.find(view => view.webContents === zoomContents)
+      if (!zoomView) throw new Error('Zoom surface view was not attached to its owner.')
+      const zoomBoundsBefore = zoomView.getBounds()
+      const zoomModifier = process.platform === 'darwin' ? 'meta' : 'control'
+      zoomContents.sendInputEvent({ type: 'keyDown', keyCode: '=', modifiers: [zoomModifier] })
+      await waitFor(
+        () => Math.abs(owner.webContents.getZoomFactor() - 1.2) < 1e-6,
+        'child zoom shortcut to update the owner factor',
+      )
+      const zoomChildFactor = zoomContents.getZoomFactor()
+      const zoomBoundsAt120 = zoomView.getBounds()
+      zoomContents.sendInputEvent({ type: 'keyDown', keyCode: '0', modifiers: [zoomModifier] })
+      await waitFor(
+        () => Math.abs(owner.webContents.getZoomFactor() - 1) < 1e-6,
+        'child zoom reset to restore the owner factor',
+      )
+      const zoomBoundsAfterReset = zoomView.getBounds()
+      await manager.destroySurface('artifact:zoom')
+      await waitFor(() => zoomContents.isDestroyed(), 'zoom surface destruction')
+
       const loadErrorSurface = await manager.createSurface({
         version: 1,
         surfaceId: 'artifact:load-error',
@@ -430,6 +475,10 @@ try {
         previewCrashRect,
         raceBaseDestroyed,
         replacementCloseActivation,
+        zoomBoundsAfterReset,
+        zoomBoundsAt120,
+        zoomBoundsBefore,
+        zoomChildFactor,
       }
     },
   )
@@ -507,6 +556,17 @@ try {
     result.previewCrashRect.ok,
     false,
     'a crashed preview renderer must reject visible bounds until it is recreated',
+  )
+  assert.equal(result.zoomChildFactor, 1, 'child input must leave the preview zoom unchanged')
+  assert.deepEqual(
+    result.zoomBoundsAt120,
+    { x: 144, y: 108, width: 432, height: 288 },
+    'child zoom input must reapply active bounds at the owner zoom factor',
+  )
+  assert.deepEqual(
+    result.zoomBoundsAfterReset,
+    result.zoomBoundsBefore,
+    'child zoom reset must restore the owner-scaled native bounds',
   )
   assert.equal(result.crashActivation.ok, false, 'owner crash must remove owned surfaces')
 
