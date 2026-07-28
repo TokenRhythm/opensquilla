@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import runpy
 import sys
 from collections.abc import Iterator
 from pathlib import Path
@@ -276,3 +277,38 @@ def test_desktop_build_and_smoke_wire_the_ca_contract() -> None:
         "SSL_CERT_FILE",
     ):
         assert f"'{name}'" in smoke_source
+
+
+def test_desktop_gateway_entry_routes_sandbox_helper_before_cli(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry_path = ROOT / "desktop/electron/scripts/gateway-entry.py"
+    helper_arguments: list[list[str]] = []
+    app_called = False
+
+    def elevated_setup_helper_main(arguments: list[str]) -> int:
+        helper_arguments.append(arguments)
+        return 17
+
+    def app() -> None:
+        nonlocal app_called
+        app_called = True
+
+    helper_module = ModuleType("opensquilla.sandbox.backend.windows_default_setup")
+    helper_module.elevated_setup_helper_main = elevated_setup_helper_main
+    cli_module = ModuleType("opensquilla.cli.main")
+    cli_module.app = app
+    monkeypatch.setitem(
+        sys.modules,
+        "opensquilla.sandbox.backend.windows_default_setup",
+        helper_module,
+    )
+    monkeypatch.setitem(sys.modules, "opensquilla.cli.main", cli_module)
+    monkeypatch.setattr(sys, "argv", [str(entry_path), "--elevated-helper", "payload"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        runpy.run_path(str(entry_path), run_name="__main__")
+
+    assert helper_arguments == [["--elevated-helper", "payload"]]
+    assert exc_info.value.code == 17
+    assert app_called is False
