@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import plistlib
 import subprocess
 import sys
 from collections.abc import AsyncIterator
@@ -1938,31 +1939,88 @@ def test_pick_directory_path_uses_native_macos_picker(
     assert native_picker.calls == ["/Volumes/workspace"]
 
 
-def test_native_macos_picker_returns_path_and_passes_initial_directory_as_argument(
+def _install_fake_native_macos_picker(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+    tmp_path: Path,
+    *,
+    selected_path: str | None,
+):
     import opensquilla.gateway.rpc_sandbox as rpc_sandbox
 
     run_calls = []
+    observations = {}
+    appkit_resources = tmp_path / "AppKitResources"
+    (appkit_resources / "en.lproj").mkdir(parents=True)
+    (appkit_resources / "zh_CN.lproj").mkdir()
+    monkeypatch.setattr(
+        rpc_sandbox,
+        "_MACOS_APPKIT_RESOURCES",
+        appkit_resources,
+        raising=False,
+    )
 
     def fake_run(command, **kwargs):
         run_calls.append((command, kwargs))
+        if command[0] == "osacompile":
+            app_path = Path(command[command.index("-o") + 1])
+            resources = app_path / "Contents" / "Resources"
+            resources.mkdir(parents=True)
+            with (app_path / "Contents" / "Info.plist").open("wb") as handle:
+                plistlib.dump(
+                    {
+                        "CFBundleName": "applet",
+                        "CFBundleSignature": "aplt",
+                        "LSRequiresCarbon": True,
+                    },
+                    handle,
+                )
+            return subprocess.CompletedProcess(command, returncode=0, stdout="", stderr="")
+
+        app_path = Path(command[-1])
+        with (app_path / "Contents" / "Info.plist").open("rb") as handle:
+            observations["plist"] = plistlib.load(handle)
+        observations["localizations"] = {
+            path.name for path in (app_path / "Contents" / "Resources").glob("*.lproj")
+        }
+        result_path = app_path.parent / "selection.txt"
+        result_path.write_text(selected_path or "", encoding="utf-8")
         return subprocess.CompletedProcess(
             command,
             returncode=0,
-            stdout="/Volumes/workspace/My Project/\n",
+            stdout="",
             stderr="",
         )
 
     monkeypatch.setattr(subprocess, "run", fake_run)
+    return rpc_sandbox, run_calls, observations
+
+
+def test_native_macos_picker_returns_path_and_launches_a_native_app_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    rpc_sandbox, run_calls, _observations = _install_fake_native_macos_picker(
+        monkeypatch,
+        tmp_path,
+        selected_path="/Volumes/workspace/My Project/",
+    )
 
     result = rpc_sandbox._pick_directory_path_macos("/Volumes/workspace")
 
     assert result == "/Volumes/workspace/My Project/"
-    command, kwargs = run_calls[0]
-    assert command[:4] == ["osascript", "-l", "JavaScript", "-e"]
-    assert command[-1] == "/Volumes/workspace"
-    assert kwargs == {
+    compile_command, compile_kwargs = run_calls[0]
+    launch_command, launch_kwargs = run_calls[1]
+    assert compile_command[:3] == ["osacompile", "-l", "JavaScript"]
+    assert "-o" in compile_command
+    assert "/Volumes/workspace" in compile_command[-1]
+    assert launch_command[:3] == ["open", "-W", "-n"]
+    assert launch_command[-1].endswith("OpenSquilla Directory Picker.app")
+    assert compile_kwargs == {
+        "capture_output": True,
+        "check": False,
+        "text": True,
+    }
+    assert launch_kwargs == {
         "capture_output": True,
         "check": False,
         "text": True,
@@ -1971,75 +2029,97 @@ def test_native_macos_picker_returns_path_and_passes_initial_directory_as_argume
 
 def test_native_macos_picker_allows_creating_directories(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    import opensquilla.gateway.rpc_sandbox as rpc_sandbox
-
-    run_calls = []
-
-    def fake_run(command, **kwargs):
-        run_calls.append(command)
-        return subprocess.CompletedProcess(
-            command,
-            returncode=0,
-            stdout="/Volumes/workspace/New Project\n",
-            stderr="",
-        )
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    rpc_sandbox, run_calls, _observations = _install_fake_native_macos_picker(
+        monkeypatch,
+        tmp_path,
+        selected_path="/Volumes/workspace/New Project",
+    )
 
     rpc_sandbox._pick_directory_path_macos("/Volumes/workspace")
 
-    script = run_calls[0][4]
+    script = run_calls[0][0][-1]
     assert "NSOpenPanel.openPanel" in script
     assert "canChooseFiles = false" in script
     assert "canChooseDirectories = true" in script
     assert "canCreateDirectories = true" in script
 
 
-def test_native_macos_picker_does_not_override_system_localized_copy(
+def test_native_macos_picker_activates_a_regular_app_before_running_modal(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    import opensquilla.gateway.rpc_sandbox as rpc_sandbox
-
-    run_calls = []
-
-    def fake_run(command, **kwargs):
-        run_calls.append(command)
-        return subprocess.CompletedProcess(
-            command,
-            returncode=0,
-            stdout="/Volumes/workspace/项目\n",
-            stderr="",
-        )
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    rpc_sandbox, run_calls, _observations = _install_fake_native_macos_picker(
+        monkeypatch,
+        tmp_path,
+        selected_path="/Volumes/workspace/project",
+    )
 
     rpc_sandbox._pick_directory_path_macos("/Volumes/workspace")
 
-    command = run_calls[0]
-    script = command[4]
-    assert "Choose a project folder" not in command
+    script = run_calls[0][0][-1]
+    application = script.index("$.NSApplication.sharedApplication")
+    regular_policy = script.index("$.NSApplicationActivationPolicyRegular")
+    activate = script.index("activateIgnoringOtherApps(true)")
+    run_modal = script.index("panel.runModal")
+
+    assert application < regular_policy < activate < run_modal
+
+
+def test_native_macos_picker_uses_all_system_localizations_without_overriding_copy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    rpc_sandbox, run_calls, observations = _install_fake_native_macos_picker(
+        monkeypatch,
+        tmp_path,
+        selected_path="/Volumes/workspace/项目",
+    )
+
+    rpc_sandbox._pick_directory_path_macos("/Volumes/workspace")
+
+    script = run_calls[0][0][-1]
+    assert "Choose a project folder" not in script
     assert "panel.message" not in script
-    assert "panel.prompt = panel.title" in script
+    assert "panel.prompt" not in script
+    assert observations["plist"]["CFBundleAllowMixedLocalizations"] is True
+    assert "LSRequiresCarbon" not in observations["plist"]
+    assert observations["localizations"] == {"en.lproj", "zh_CN.lproj"}
 
 
 def test_native_macos_picker_treats_user_cancellation_as_no_selection(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    import opensquilla.gateway.rpc_sandbox as rpc_sandbox
-
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda command, **kwargs: subprocess.CompletedProcess(
-            command,
-            returncode=1,
-            stdout="",
-            stderr="execution error: User canceled. (-128)\n",
-        ),
+    rpc_sandbox, _run_calls, _observations = _install_fake_native_macos_picker(
+        monkeypatch,
+        tmp_path,
+        selected_path=None,
     )
 
     assert rpc_sandbox._pick_directory_path_macos(None) is None
+
+
+def test_native_macos_picker_reports_an_invalid_app_bundle_as_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.gateway.rpc_sandbox as rpc_sandbox
+
+    def fake_run(command, **_kwargs):
+        app_path = Path(command[command.index("-o") + 1])
+        info_path = app_path / "Contents" / "Info.plist"
+        info_path.parent.mkdir(parents=True)
+        info_path.write_text("not a plist", encoding="utf-8")
+        return subprocess.CompletedProcess(command, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(
+        rpc_sandbox.RpcUnavailableError,
+        match="Directory picker is not available",
+    ):
+        rpc_sandbox._pick_directory_path_macos(None)
 
 
 @pytest.mark.asyncio

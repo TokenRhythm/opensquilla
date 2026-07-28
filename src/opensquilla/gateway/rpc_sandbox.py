@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import plistlib
 import stat
 import subprocess
 import sys
+import tempfile
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -152,60 +154,142 @@ def _path_entry_payload(path: Path, *, selection_kind: str) -> dict[str, Any]:
     return payload
 
 
+_MACOS_APPKIT_RESOURCES = Path("/System/Library/Frameworks/AppKit.framework/Resources")
+_MACOS_APPLET_INFO_KEYS_TO_REMOVE = (
+    "CFBundleSignature",
+    "LSMinimumSystemVersionByArchitecture",
+    "LSRequiresCarbon",
+    "NSAppleEventsUsageDescription",
+    "NSAppleMusicUsageDescription",
+    "NSCalendarsUsageDescription",
+    "NSCameraUsageDescription",
+    "NSContactsUsageDescription",
+    "NSHomeKitUsageDescription",
+    "NSMicrophoneUsageDescription",
+    "NSPhotoLibraryUsageDescription",
+    "NSRemindersUsageDescription",
+    "NSSiriUsageDescription",
+    "NSSystemAdministrationUsageDescription",
+)
 _MACOS_DIRECTORY_PICKER_SCRIPT = """
 ObjC.import("AppKit");
 ObjC.import("Foundation");
 
-function run(argv) {
+const initialDirectory = __INITIAL_DIRECTORY__;
+const resultPath = __RESULT_PATH__;
+
+function writeSelection(selection) {
+    const data = $(selection).dataUsingEncoding($.NSUTF8StringEncoding);
+    data.writeToFileAtomically(resultPath, true);
+}
+
+function run() {
+    const app = $.NSApplication.sharedApplication;
+    app.setActivationPolicy($.NSApplicationActivationPolicyRegular);
+
     const panel = $.NSOpenPanel.openPanel;
     panel.canChooseFiles = false;
     panel.canChooseDirectories = true;
     panel.allowsMultipleSelection = false;
     panel.canCreateDirectories = true;
     panel.resolvesAliases = true;
-    panel.prompt = panel.title;
 
-    if (argv.length > 0 && argv[0]) {
-        panel.directoryURL = $.NSURL.fileURLWithPath(argv[0]);
+    if (initialDirectory) {
+        panel.directoryURL = $.NSURL.fileURLWithPath(initialDirectory);
     }
 
+    app.activateIgnoringOtherApps(true);
     if (panel.runModal === $.NSModalResponseOK) {
-        return ObjC.unwrap(panel.URL.path);
+        writeSelection(ObjC.unwrap(panel.URL.path));
+    } else {
+        writeSelection("");
     }
-    return "";
 }
 """
 
 
-def _pick_directory_path_macos(initial_dir: str | None = None) -> str | None:
-    command = [
-        "osascript",
-        "-l",
-        "JavaScript",
-        "-e",
-        _MACOS_DIRECTORY_PICKER_SCRIPT,
-    ]
-    if initial_dir:
-        command.append(initial_dir)
-    try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            check=False,
-            text=True,
-        )
-    except OSError as exc:  # pragma: no cover - host environment dependent
-        raise RpcUnavailableError("Directory picker is not available on this host.") from exc
+def _macos_directory_picker_script(
+    initial_dir: str | None,
+    result_path: Path,
+) -> str:
+    return _MACOS_DIRECTORY_PICKER_SCRIPT.replace(
+        "__INITIAL_DIRECTORY__",
+        json.dumps(initial_dir),
+    ).replace(
+        "__RESULT_PATH__",
+        json.dumps(str(result_path)),
+    )
 
-    if result.returncode == 0:
-        return result.stdout.strip() or None
-    if "(-128)" in result.stderr:
-        return None
+
+def _prepare_macos_directory_picker_bundle(app_path: Path) -> None:
+    info_path = app_path / "Contents" / "Info.plist"
+    with info_path.open("rb") as handle:
+        info = plistlib.load(handle)
+
+    for key in _MACOS_APPLET_INFO_KEYS_TO_REMOVE:
+        info.pop(key, None)
+    info["CFBundleAllowMixedLocalizations"] = True
+    info["CFBundleIdentifier"] = "ai.opensquilla.directory-picker"
+
+    with info_path.open("wb") as handle:
+        plistlib.dump(info, handle)
+
+    resources = app_path / "Contents" / "Resources"
+    localizations = list(_MACOS_APPKIT_RESOURCES.glob("*.lproj"))
+    if not localizations:
+        localizations = [Path("en.lproj")]
+    for localization in localizations:
+        (resources / localization.name).mkdir(exist_ok=True)
+
+
+def _macos_picker_error(result: subprocess.CompletedProcess[str]) -> RpcUnavailableError:
     detail = result.stderr.strip()
     message = "Directory picker is not available on this host."
     if detail:
         message = f"{message} {detail}"
-    raise RpcUnavailableError(message)
+    return RpcUnavailableError(message)
+
+
+def _pick_directory_path_macos(initial_dir: str | None = None) -> str | None:
+    try:
+        with tempfile.TemporaryDirectory(prefix="opensquilla-directory-picker-") as temp_dir:
+            temp_path = Path(temp_dir)
+            app_path = temp_path / "OpenSquilla Directory Picker.app"
+            result_path = temp_path / "selection.txt"
+            script = _macos_directory_picker_script(initial_dir, result_path)
+
+            compile_result = subprocess.run(
+                [
+                    "osacompile",
+                    "-l",
+                    "JavaScript",
+                    "-o",
+                    str(app_path),
+                    "-e",
+                    script,
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+            if compile_result.returncode != 0:
+                raise _macos_picker_error(compile_result)
+
+            _prepare_macos_directory_picker_bundle(app_path)
+            launch_result = subprocess.run(
+                ["open", "-W", "-n", str(app_path)],
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+            if launch_result.returncode != 0:
+                raise _macos_picker_error(launch_result)
+            if not result_path.is_file():
+                raise RpcUnavailableError("Directory picker closed without returning a result.")
+
+            return result_path.read_text(encoding="utf-8") or None
+    except (OSError, plistlib.InvalidFileException) as exc:
+        raise RpcUnavailableError("Directory picker is not available on this host.") from exc
 
 
 def _pick_directory_path(initial_dir: str | None = None) -> str | None:
