@@ -497,8 +497,9 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
         assert contract in session_recovery_smoke
     assert "page.clock" not in session_recovery_smoke
     assert "OPENSQUILLA_TESTING: '0'" in session_recovery_smoke
+    assert "verify-runtime" not in windows_helper
     assert mac_helper.count("verify-runtime") == 2
-    assert windows_helper.count("verify-runtime") == 2
+    assert windows_helper.count("verify --home") == 3
 
     mac_audit = workflow[
         workflow.index("  audit-downloaded-macos-release:") : workflow.index(

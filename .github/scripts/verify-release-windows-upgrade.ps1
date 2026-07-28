@@ -115,7 +115,7 @@ try {
   ) {
     throw 'Candidate selected a different state directory after upgrade.'
   }
-  python $probe verify-runtime --home $profile --label $Label
+  python $probe verify --home $profile --label $Label
   if ($LASTEXITCODE -ne 0) { throw 'Candidate launch changed RC3 profile data.' }
 
   $uninstaller = Get-ChildItem -LiteralPath $installDir -Filter 'Uninstall*.exe' -File |
@@ -136,7 +136,7 @@ try {
   if (Test-Path -LiteralPath $app -PathType Leaf) {
     throw 'Candidate uninstaller did not remove OpenSquilla.exe.'
   }
-  python $probe verify-runtime --home $profile --label $Label
+  python $probe verify --home $profile --label $Label
   if ($LASTEXITCODE -ne 0) { throw 'Candidate uninstaller changed RC3 profile data.' }
 } finally {
   Stop-InstalledProcesses
