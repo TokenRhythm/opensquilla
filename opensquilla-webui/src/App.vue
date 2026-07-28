@@ -59,16 +59,6 @@
              disabled (Settings → Keyboard), so it never advertises a dead key. -->
         <kbd v-if="newChatHint" class="sidebar-kbd" aria-hidden="true">{{ newChatHint }}</kbd>
       </button>
-      <button
-        v-if="rpcStore.canChooseProject"
-        type="button"
-        class="sidebar-fn-item"
-        :title="t('workspaces.chooseProject')"
-        @click="openProjectPicker"
-      >
-        <Icon name="sessions" :size="16" />
-        <span class="sidebar-fn-label">{{ t('workspaces.chooseProject') }}</span>
-      </button>
       <!-- Overview / Skills & Channels / Cron, single-sourced from route
            metadata so the rail, mobile drawer, and palette never drift. -->
       <router-link
@@ -362,15 +352,6 @@
 
   <ConfirmModal />
 
-  <ProjectWorkspacePickerDialog
-    v-if="rpcStore.canChooseProject"
-    :open="projectPickerOpen"
-    :enabled="rpcStore.canChooseProject"
-    :session-key="currentSessionKey || 'agent:main:webchat:workspace-picker'"
-    @close="projectPickerOpen = false"
-    @choose="onProjectPathChosen"
-  />
-
   <ProjectWorkspaceEditDialog
     v-if="rpcStore.canManageProjectWorkspaces"
     :open="Boolean(editingProject)"
@@ -408,7 +389,6 @@ import ErrorBoundary from './components/ErrorBoundary.vue'
 import ToastHost from './components/ToastHost.vue'
 import ConfirmModal from './components/ConfirmModal.vue'
 import ProjectWorkspaceEditDialog from './components/ProjectWorkspaceEditDialog.vue'
-import ProjectWorkspacePickerDialog from './components/ProjectWorkspacePickerDialog.vue'
 import UpdateBanner from './components/UpdateBanner.vue'
 import DesktopUpdateIndicator from './components/DesktopUpdateIndicator.vue'
 import SidebarConversations from './components/SidebarConversations.vue'
@@ -505,7 +485,6 @@ const { pushToast } = useToasts()
 const { confirm } = useConfirm()
 const projectWorkspaces = useProjectWorkspaces()
 const freshTaskDraft = useFreshTaskDraft()
-const projectPickerOpen = ref(false)
 const editingProjectId = ref('')
 const editingProject = computed(() =>
   editingProjectId.value
@@ -519,7 +498,6 @@ watch(
       void projectWorkspaces.loadWorkspaces().catch(() => undefined)
       return
     }
-    projectPickerOpen.value = false
     editingProjectId.value = ''
   },
 )
@@ -896,12 +874,6 @@ function startNewChatInstant() {
   void openDefaultDraft()
 }
 
-function openProjectPicker() {
-  if (!rpcStore.canChooseProject) return
-  handleNavClick()
-  projectPickerOpen.value = true
-}
-
 function startProjectTask(workspaceId: string) {
   if (!workspaceId || !rpcStore.canManageProjectWorkspaces) return
   handleNavClick()
@@ -910,24 +882,6 @@ function startProjectTask(workspaceId: string) {
     path: '/chat/new',
     query: { agent: 'main', project: workspaceId },
   })
-}
-
-async function onProjectPathChosen(path: string) {
-  projectPickerOpen.value = false
-  if (!rpcStore.canChooseProject) return
-  const trusted = await confirm({
-    title: t('workspaces.trustTitle'),
-    body: t('workspaces.trustBody', { path }),
-    primaryLabel: t('workspaces.trustConfirm'),
-    primaryClass: 'btn--primary',
-  })
-  if (!trusted) return
-  try {
-    const workspace = await projectWorkspaces.openWorkspace(path)
-    if (workspace) startProjectTask(workspace.id)
-  } catch (err) {
-    pushToast(t('workspaces.openFailed', { error: errorMessage(err) }), { tone: 'danger' })
-  }
 }
 
 async function onProjectPin(payload: { workspaceId: string; pinned: boolean }) {

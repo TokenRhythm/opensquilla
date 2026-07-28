@@ -13,4 +13,13 @@ describe('App sidebar chrome contract', () => {
     expect(brandMarkup).not.toContain('@click')
     expect(brandMarkup).not.toContain('to="/overview"')
   })
+
+  it('keeps project selection out of the primary sidebar controls', () => {
+    const newTaskStart = appSource.indexOf('class="sidebar-new-session"')
+    const workNavStart = appSource.indexOf('<router-link', newTaskStart)
+    const primaryControls = appSource.slice(newTaskStart, workNavStart)
+
+    expect(primaryControls).not.toContain('@click="openProjectPicker"')
+    expect(primaryControls).not.toContain("t('workspaces.chooseProject')")
+  })
 })
