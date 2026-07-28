@@ -1263,7 +1263,9 @@ function removeLocalSessions(keys: Set<string>) {
 function handleLocalSessionsDeleted(event: Event) {
   const detail = localSessionsDeletedDetail(event)
   if (!detail || detail.source === APP_SESSION_SYNC_SOURCE) return
-  removeLocalSessions(new Set(detail.keys))
+  const deleted = new Set(detail.keys)
+  removeLocalSessions(deleted)
+  appStore.removePendingApprovalsForSessions(deleted)
   void loadSessions()
 }
 
@@ -1293,6 +1295,7 @@ async function onBulkDeleteSessions(keys: string[]) {
     return
   }
   removeLocalSessions(deleted)
+  appStore.removePendingApprovalsForSessions(deleted)
   dispatchLocalSessionsDeleted(deleted, APP_SESSION_SYNC_SOURCE)
   const failedCount = Math.max(0, uniqueKeys.length - deleted.size)
   pushToast(t('shared.sidebar.bulkDeleteDone', { count: deleted.size }), { tone: 'ok' })
@@ -1318,6 +1321,7 @@ async function onDeleteSession(key: string) {
   pushToast('Session deleted', { tone: 'ok' })
   const deleted = new Set([key])
   removeLocalSessions(deleted)
+  appStore.removePendingApprovalsForSessions(deleted)
   dispatchLocalSessionsDeleted(deleted, APP_SESSION_SYNC_SOURCE)
   await loadSessions()
   if (wasCurrent) {

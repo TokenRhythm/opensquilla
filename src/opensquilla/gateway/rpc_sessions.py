@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import re
 import sqlite3
@@ -18,6 +19,9 @@ from opensquilla.agents.scope import default_workspace_dir, resolve_agent_worksp
 from opensquilla.artifacts import enrich_artifact_event_dict
 from opensquilla.engine.cache_break_monitor import notify_compaction
 from opensquilla.engine.start_turn import reserve_turn_via_runtime, start_turn_via_runtime
+from opensquilla.engine.steps.router_decision_record import (
+    drain_pending_flushes_for_sessions,
+)
 from opensquilla.gateway import attachment_ingest as _attachment_ingest
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
 from opensquilla.gateway.config import effective_agent_stream_idle_timeout_seconds
@@ -43,6 +47,9 @@ from opensquilla.gateway.session_services import (
 )
 from opensquilla.gateway.session_streams import get_session_streams
 from opensquilla.gateway.session_view import build_session_view_item, derive_transcript_title
+from opensquilla.gateway.subagent_announce import (
+    quiesce_background_completion_sessions,
+)
 from opensquilla.gateway.turn_ingress import (
     accepted_turn_payload,
     complete_durable_ingress,
@@ -4512,6 +4519,86 @@ def _reset_response(
     }
 
 
+async def _settle_session_delete_despite_cancellation(awaitable: Any) -> Any:
+    """Finish one fenced delete before propagating caller cancellation."""
+
+    operation = asyncio.ensure_future(awaitable)
+    cancellation: asyncio.CancelledError | None = None
+    while not operation.done():
+        try:
+            await asyncio.shield(operation)
+        except asyncio.CancelledError as exc:
+            cancellation = cancellation or exc
+    if cancellation is not None:
+        with contextlib.suppress(BaseException):
+            operation.result()
+        raise cancellation
+    return operation.result()
+
+
+async def _delete_session_with_lifecycle(
+    *,
+    canonical_key: str,
+    ctx: RpcContext,
+    storage: Any,
+) -> None:
+    """Quiesce every writer and fail closed before deleting one session."""
+
+    session_keys = [canonical_key]
+    async with contextlib.AsyncExitStack() as fences:
+        # Child completion can schedule a parent wake while the runtime task is
+        # draining, so fence that path before cancelling the task driver.
+        await fences.enter_async_context(
+            quiesce_background_completion_sessions(session_keys)
+        )
+
+        task_runtime = getattr(ctx, "task_runtime", None)
+        quiesce_runtime = getattr(task_runtime, "quiesce_sessions", None)
+        if callable(quiesce_runtime):
+            await fences.enter_async_context(quiesce_runtime(session_keys))
+
+        await fences.enter_async_context(
+            get_agent_task_registry().quiesce_sessions(session_keys)
+        )
+
+        lock = get_session_lock(ctx.turn_runner, canonical_key)
+        if lock is not None:
+            await fences.enter_async_context(lock)
+
+        # These durable writers may outlive the task coroutine that scheduled
+        # them. Settle both before the row and its generation disappear.
+        await drain_pending_flushes_for_sessions(session_keys)
+        drain_turn_writes = getattr(
+            ctx.turn_runner,
+            "drain_session_background_writes",
+            None,
+        )
+        if callable(drain_turn_writes):
+            await drain_turn_writes(session_keys)
+
+        get_session = getattr(storage, "get_session", None)
+        session = await get_session(canonical_key) if callable(get_session) else None
+        session_id = getattr(session, "session_id", None)
+        if not isinstance(session_id, str) or not session_id:
+            session_id = None
+
+        # Terminal task cleanup normally expires owned approvals. Repeat the
+        # operation here so already-orphaned and claimed approvals also fail
+        # closed before their session record is removed.
+        from opensquilla.gateway.approval_queue import get_approval_queue
+
+        get_approval_queue().expire_pending_for_session(canonical_key)
+        await storage.delete_session(canonical_key)
+
+        evict_runtime_state = getattr(
+            ctx.session_manager,
+            "evict_session_runtime_state",
+            None,
+        )
+        if callable(evict_runtime_state):
+            evict_runtime_state(canonical_key, session_id=session_id)
+
+
 @_d.method("sessions.delete", scope="operator.write")
 async def _handle_sessions_delete(params: dict | None, ctx: RpcContext) -> dict:
     """Delete one or more sessions. Accepts {key} for single or {keys} for bulk."""
@@ -4538,12 +4625,13 @@ async def _handle_sessions_delete(params: dict | None, ctx: RpcContext) -> dict:
     for k in keys:
         try:
             canonical_key = canonicalize_session_key(k)
-            lock = get_session_lock(ctx.turn_runner, canonical_key)
-            if lock is None:
-                await storage.delete_session(canonical_key)
-            else:
-                async with lock:
-                    await storage.delete_session(canonical_key)
+            await _settle_session_delete_despite_cancellation(
+                _delete_session_with_lifecycle(
+                    canonical_key=canonical_key,
+                    ctx=ctx,
+                    storage=storage,
+                )
+            )
             deleted.append(k)
         except Exception as exc:
             errors.append(f"{k}: {exc}")

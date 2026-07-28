@@ -4001,6 +4001,24 @@ class TestSessionsReset:
 
 
 class TestSessionsDelete:
+    @pytest.fixture(autouse=True)
+    def _isolated_approval_queue(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path,
+    ):
+        from opensquilla.application.approval_queue import ApprovalQueue
+
+        queue = ApprovalQueue(db_path=str(tmp_path / "approval_queue.sqlite"))
+        monkeypatch.setattr(
+            "opensquilla.gateway.approval_queue.get_approval_queue",
+            lambda: queue,
+        )
+        try:
+            yield queue
+        finally:
+            queue.close()
+
     @pytest.mark.asyncio
     async def test_delete_valid(self, dispatcher, ctx_with_sessions, session):
         res = await dispatcher.dispatch(
@@ -4009,14 +4027,25 @@ class TestSessionsDelete:
         assert res.ok is True
 
     @pytest.mark.asyncio
-    async def test_delete_not_found(self, dispatcher, ctx_with_sessions):
+    async def test_delete_not_found(
+        self,
+        dispatcher,
+        ctx_with_sessions,
+        _isolated_approval_queue,
+    ):
+        missing_key = "agent:main:webchat:nonexistent"
+        approval_id = _isolated_approval_queue.request(
+            "exec",
+            {"sessionKey": missing_key, "toolName": "orphaned-shell"},
+        )
         res = await dispatcher.dispatch(
-            "r1", "sessions.delete", {"key": "nonexistent"}, ctx_with_sessions
+            "r1", "sessions.delete", {"key": missing_key}, ctx_with_sessions
         )
         # Bulk-delete returns ok=True but populates errors list for missing keys
         assert res.ok is True
         assert res.payload["deleted"] == []
         assert len(res.payload["errors"]) == 1
+        assert _isolated_approval_queue.get(approval_id).resolution == "expired"
 
     @pytest.mark.asyncio
     async def test_delete_waits_for_session_lock(self, dispatcher, session):
@@ -4073,6 +4102,322 @@ class TestSessionsDelete:
         assert res.ok is True
         assert res.payload["deleted"] == ["webchat:default"]
         assert await manager._storage.get_session(session.session_key) is None
+
+    @pytest.mark.asyncio
+    async def test_delete_legacy_alias_expires_canonical_session_approval(
+        self,
+        dispatcher,
+        _isolated_approval_queue,
+    ):
+        session = FakeSession(session_key="agent:main:webchat:default")
+        manager = FakeSessionManager([session])
+        approval_id = _isolated_approval_queue.request(
+            "exec",
+            {"sessionKey": session.session_key, "toolName": "synthetic-shell"},
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.delete",
+            {"key": "webchat:default"},
+            make_ctx(session_manager=manager),
+        )
+
+        assert res.ok is True
+        assert res.payload == {"deleted": ["webchat:default"], "errors": []}
+        assert _isolated_approval_queue.get(approval_id).resolution == "expired"
+
+    @pytest.mark.asyncio
+    async def test_delete_expires_owned_approvals_and_evicts_runtime_state(
+        self,
+        dispatcher,
+        session,
+        _isolated_approval_queue,
+    ):
+        queue = _isolated_approval_queue
+        events: list[tuple[str, dict[str, Any]]] = []
+        queue.add_event_listener(lambda event, info: events.append((event, info)))
+        matching_ids = [
+            queue.request(
+                "exec",
+                {"sessionKey": session.session_key, "toolName": "synthetic-shell"},
+            ),
+            queue.request(
+                "plugin",
+                {"session_key": session.session_key, "pluginId": "synthetic-plugin"},
+            ),
+        ]
+        queue.claim_resolution(matching_ids[-1])
+        unrelated_id = queue.request(
+            "exec",
+            {"sessionKey": "agent:main:webchat:unrelated", "toolName": "other-shell"},
+        )
+        unscoped_id = queue.request("plugin", {"pluginId": "unscoped-plugin"})
+
+        manager = FakeSessionManager([session])
+        evicted: list[tuple[str, str | None]] = []
+
+        def evict_runtime_state(
+            session_key: str,
+            *,
+            session_id: str | None = None,
+        ) -> None:
+            evicted.append((session_key, session_id))
+
+        manager.evict_session_runtime_state = evict_runtime_state  # type: ignore[attr-defined]
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.delete",
+            {"key": session.session_key},
+            make_ctx(session_manager=manager),
+        )
+
+        assert res.ok is True
+        assert res.payload == {"deleted": [session.session_key], "errors": []}
+        assert await manager._storage.get_session(session.session_key) is None
+        assert evicted == [(session.session_key, session.session_id)]
+        for approval_id in matching_ids:
+            entry = queue.get(approval_id)
+            assert entry.resolved is True
+            assert entry.approved is False
+            assert entry.resolution == "expired"
+        assert queue.get(unrelated_id).resolved is False
+        assert queue.get(unscoped_id).resolved is False
+        assert {
+            info["id"]
+            for event, info in events
+            if event == "resolved"
+        } == set(matching_ids)
+
+    @pytest.mark.asyncio
+    async def test_delete_holds_lifecycle_fences_through_cleanup(
+        self,
+        dispatcher,
+        monkeypatch: pytest.MonkeyPatch,
+        session,
+        _isolated_approval_queue,
+    ):
+        order: list[str] = []
+        active_fences: set[str] = set()
+
+        @asynccontextmanager
+        async def fence(name: str, keys: list[str]):
+            assert keys == [session.session_key]
+            order.append(f"{name}:enter")
+            active_fences.add(name)
+            try:
+                yield
+            finally:
+                active_fences.remove(name)
+                order.append(f"{name}:exit")
+
+        class WriteLock:
+            async def __aenter__(self):
+                order.append("write:enter")
+                active_fences.add("write")
+
+            async def __aexit__(self, *_args):
+                active_fences.remove("write")
+                order.append("write:exit")
+
+        manager = FakeSessionManager([session])
+        original_delete = manager._storage.delete_session
+
+        async def observed_delete(key: str) -> None:
+            assert active_fences == {"background", "runtime", "direct", "write"}
+            order.append("delete")
+            await original_delete(key)
+
+        manager._storage.delete_session = observed_delete  # type: ignore[method-assign]
+
+        def evict_runtime_state(
+            session_key: str,
+            *,
+            session_id: str | None = None,
+        ) -> None:
+            assert session_key == session.session_key
+            assert session_id == session.session_id
+            assert active_fences == {"background", "runtime", "direct", "write"}
+            order.append("evict")
+
+        manager.evict_session_runtime_state = evict_runtime_state  # type: ignore[attr-defined]
+
+        async def drain_router(keys: list[str]) -> None:
+            assert keys == [session.session_key]
+            assert active_fences == {"background", "runtime", "direct", "write"}
+            order.append("router-drain")
+
+        async def drain_turn(keys: list[str]) -> None:
+            assert keys == [session.session_key]
+            assert active_fences == {"background", "runtime", "direct", "write"}
+            order.append("turn-drain")
+
+        original_expire = _isolated_approval_queue.expire_pending_for_session
+
+        def observed_expire(key: str) -> int:
+            assert key == session.session_key
+            assert active_fences == {"background", "runtime", "direct", "write"}
+            order.append("expire")
+            return original_expire(key)
+
+        monkeypatch.setattr(
+            rpc_sessions,
+            "quiesce_background_completion_sessions",
+            lambda keys: fence("background", keys),
+        )
+        monkeypatch.setattr(
+            rpc_sessions,
+            "get_agent_task_registry",
+            lambda: SimpleNamespace(
+                quiesce_sessions=lambda keys: fence("direct", keys),
+            ),
+        )
+        monkeypatch.setattr(
+            rpc_sessions,
+            "drain_pending_flushes_for_sessions",
+            drain_router,
+        )
+        monkeypatch.setattr(
+            _isolated_approval_queue,
+            "expire_pending_for_session",
+            observed_expire,
+        )
+        ctx = make_ctx(
+            session_manager=manager,
+            task_runtime=SimpleNamespace(
+                quiesce_sessions=lambda keys: fence("runtime", keys),
+            ),
+            turn_runner=SimpleNamespace(
+                get_session_lock=lambda _key: WriteLock(),
+                drain_session_background_writes=drain_turn,
+            ),
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.delete",
+            {"key": session.session_key},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert order == [
+            "background:enter",
+            "runtime:enter",
+            "direct:enter",
+            "write:enter",
+            "router-drain",
+            "turn-drain",
+            "expire",
+            "delete",
+            "evict",
+            "write:exit",
+            "direct:exit",
+            "runtime:exit",
+            "background:exit",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_delete_finishes_after_rpc_cancellation(
+        self,
+        dispatcher,
+        session,
+        _isolated_approval_queue,
+    ):
+        manager = FakeSessionManager([session])
+        delete_started = asyncio.Event()
+        release_delete = asyncio.Event()
+        original_delete = manager._storage.delete_session
+        evicted: list[tuple[str, str | None]] = []
+
+        async def paused_delete(key: str) -> None:
+            delete_started.set()
+            await release_delete.wait()
+            await original_delete(key)
+
+        manager._storage.delete_session = paused_delete  # type: ignore[method-assign]
+        manager.evict_session_runtime_state = (  # type: ignore[attr-defined]
+            lambda key, *, session_id=None: evicted.append((key, session_id))
+        )
+        approval_id = _isolated_approval_queue.request(
+            "plugin",
+            {"session_key": session.session_key, "pluginId": "synthetic-plugin"},
+        )
+
+        deleting = asyncio.create_task(
+            dispatcher.dispatch(
+                "r1",
+                "sessions.delete",
+                {"key": session.session_key},
+                make_ctx(session_manager=manager),
+            )
+        )
+        await asyncio.wait_for(delete_started.wait(), timeout=1)
+        deleting.cancel()
+        await asyncio.sleep(0)
+        assert deleting.done() is False
+
+        release_delete.set()
+        with pytest.raises(asyncio.CancelledError):
+            await deleting
+
+        assert await manager._storage.get_session(session.session_key) is None
+        assert _isolated_approval_queue.get(approval_id).resolution == "expired"
+        assert evicted == [(session.session_key, session.session_id)]
+
+    @pytest.mark.asyncio
+    async def test_bulk_delete_isolates_failures_and_repeated_cleanup_is_idempotent(
+        self,
+        dispatcher,
+        session,
+        _isolated_approval_queue,
+    ):
+        missing_key = "agent:main:webchat:missing-bulk"
+        manager = FakeSessionManager([session])
+        matching_ids = [
+            _isolated_approval_queue.request(
+                "exec",
+                {"sessionKey": session.session_key, "toolName": "existing-shell"},
+            ),
+            _isolated_approval_queue.request(
+                "plugin",
+                {"session_key": missing_key, "pluginId": "orphaned-plugin"},
+            ),
+        ]
+        resolved_events: list[str] = []
+        _isolated_approval_queue.add_event_listener(
+            lambda event, info: (
+                resolved_events.append(str(info["id"]))
+                if event == "resolved"
+                else None
+            )
+        )
+        ctx = make_ctx(session_manager=manager)
+
+        first = await dispatcher.dispatch(
+            "r1",
+            "sessions.delete",
+            {"keys": [session.session_key, missing_key]},
+            ctx,
+        )
+        second = await dispatcher.dispatch(
+            "r2",
+            "sessions.delete",
+            {"keys": [session.session_key, missing_key]},
+            ctx,
+        )
+
+        assert first.ok is True
+        assert first.payload["deleted"] == [session.session_key]
+        assert len(first.payload["errors"]) == 1
+        assert second.ok is True
+        assert second.payload["deleted"] == []
+        assert len(second.payload["errors"]) == 2
+        assert {
+            _isolated_approval_queue.get(approval_id).resolution
+            for approval_id in matching_ids
+        } == {"expired"}
+        assert resolved_events == matching_ids
 
 
 class TestSessionsCompact:

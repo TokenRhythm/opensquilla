@@ -367,6 +367,28 @@ export const useAppStore = defineStore('app', () => {
     }
   }
 
+  // A deleted session cannot own an actionable approval. Apply this locally
+  // as an idempotent latency guard; the Gateway remains authoritative and
+  // emits the matching `*.approval.resolved` events.
+  function removePendingApprovalsForSessions(sessionKeys: Iterable<string>) {
+    const keys = new Set(
+      [...sessionKeys]
+        .map(key => String(key || '').trim())
+        .filter(Boolean),
+    )
+    if (keys.size === 0) return
+    approvalsLive.value = true
+    pendingApprovals.value = pendingApprovals.value.filter(
+      approval => !keys.has(approval.sessionKey),
+    )
+    if (
+      approvalFocusRequest.value
+      && keys.has(approvalFocusRequest.value.sessionKey)
+    ) {
+      approvalFocusRequest.value = null
+    }
+  }
+
   function requestApprovalFocus(
     approval: Pick<PendingApproval, 'approvalId' | 'sessionKey'>,
   ) {
@@ -425,6 +447,7 @@ export const useAppStore = defineStore('app', () => {
     setPendingApprovals,
     upsertPendingApproval,
     removePendingApproval,
+    removePendingApprovalsForSessions,
     requestApprovalFocus,
     clearApprovalFocusRequest,
   }
