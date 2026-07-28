@@ -1019,6 +1019,27 @@ function canonicalTierKey(name: string): string {
 const ROUTER_PROFILE_IDS = new Set(['tokenrhythm', 'openrouter', 'dashscope', 'deepseek', 'gemini', 'volcengine', 'openai', 'zhipu', 'moonshot'])
 const INLINE_ROUTER_PROFILE_IDS = new Set(['tokenrhythm'])
 const TOKENRHYTHM_REGISTER_URL = 'https://tokenrhythm.studio/register'
+const DESKTOP_ENSEMBLE_PROFILES: Record<StaticEnsembleSelectionMode, {
+  provider: string
+  proposers: string[]
+  aggregator: string
+}> = {
+  static_tokenrhythm_b5: {
+    provider: 'tokenrhythm',
+    proposers: ['deepseek-v4-pro', 'glm-5.2', 'kimi-k2.7-code', 'qwen3.7-max'],
+    aggregator: 'glm-5.2',
+  },
+  static_openrouter_b5: {
+    provider: 'openrouter',
+    proposers: [
+      'deepseek/deepseek-v4-pro',
+      'z-ai/glm-5.2',
+      'moonshotai/kimi-k2.7-code',
+      'qwen/qwen3.7-max',
+    ],
+    aggregator: 'z-ai/glm-5.2',
+  },
+}
 
 const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
   {
@@ -1691,11 +1712,32 @@ function ensembleConfigTomlLines(credential: DesktopConnection): string[] {
   if (!selectionMode) {
     throw new Error(`LLM Ensemble is not supported for provider ${credential.provider}.`)
   }
+  const profile = DESKTOP_ENSEMBLE_PROFILES[selectionMode]
+  const roles = ['primary', 'contrast', 'fast_check', 'critic']
+  const candidates = profile.proposers.flatMap((model, index) => [
+    '',
+    '[[llm_ensemble.candidates]]',
+    `provider = ${tomlString(profile.provider)}`,
+    `model = ${tomlString(model)}`,
+    'source = "custom"',
+    'enabled = true',
+    `role = ${tomlString(roles[index] || '')}`,
+  ])
+  candidates.push(
+    '',
+    '[[llm_ensemble.candidates]]',
+    `provider = ${tomlString(profile.provider)}`,
+    `model = ${tomlString(profile.aggregator)}`,
+    'source = "custom"',
+    'enabled = true',
+    'role = "aggregator"',
+  )
   return [
     '',
     '[llm_ensemble]',
     'enabled = true',
-    `selection_mode = ${tomlString(selectionMode)}`,
+    'selection_mode = "custom_b5"',
+    ...candidates,
   ]
 }
 

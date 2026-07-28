@@ -31,6 +31,10 @@ from opensquilla.gateway.config_migration import (
     migrate_config_payload,
 )
 from opensquilla.paths import default_opensquilla_home, native_io_path
+from opensquilla.provider.credentials import (
+    credential_provider_hint,
+    endpoint_provider_hint,
+)
 from opensquilla.provider.preset_registry import get_preset, legacy_profile_ids
 from opensquilla.router_tiers import (
     DEFAULT_TEXT_TIER,
@@ -345,6 +349,8 @@ class TaskRuntimeConfig(BaseModel):
 LEGACY_DEFAULT_LLM_PROVIDER = "openrouter"
 LEGACY_DEFAULT_LLM_MODEL = "deepseek/deepseek-v4-pro"
 LEGACY_DEFAULT_LLM_BASE_URL = "https://openrouter.ai/api/v1"
+TOKENRHYTHM_DEFAULT_LLM_PROVIDER = "tokenrhythm"
+TOKENRHYTHM_DEFAULT_LLM_BASE_URL = "https://tokenrhythm.studio/v1"
 
 
 class LlmProviderConfig(BaseSettings):
@@ -2217,15 +2223,123 @@ class GatewayConfig(BaseSettings):
         llm = self.llm
         fields_set = set(getattr(llm, "model_fields_set", set()))
         provider = str(llm.provider or "").strip().lower()
+        resolution = {
+            "status": "explicit",
+            "effective_provider": provider,
+            "source": "config",
+            "reason_code": "provider_explicit",
+            "action_required": False,
+            "action_recommended": False,
+        }
         if "provider" not in fields_set:
             profile = str(getattr(self.squilla_router, "tier_profile", "") or "")
+            router_fields_set = set(
+                getattr(self.squilla_router, "model_fields_set", set())
+            )
             legacy_intent = bool(
                 {"model", "base_url", "api_key", "api_key_env"} & fields_set
-            ) or profile.strip().lower() == LEGACY_DEFAULT_LLM_PROVIDER
+            ) or (
+                "tier_profile" in router_fields_set
+                and profile.strip().lower() == LEGACY_DEFAULT_LLM_PROVIDER
+            )
+            credential_hints = {
+                hint
+                for hint in (
+                    credential_provider_hint(
+                        llm.api_key if "api_key" in fields_set else ""
+                    ),
+                    credential_provider_hint(
+                        "",
+                        api_key_env=(
+                            llm.api_key_env if "api_key_env" in fields_set else ""
+                        ),
+                    ),
+                )
+                if hint
+            }
+            origin_hint = endpoint_provider_hint(
+                llm.base_url if "base_url" in fields_set else ""
+            )
+            explicit_profile_hint = (
+                LEGACY_DEFAULT_LLM_PROVIDER
+                if "tier_profile" in router_fields_set
+                and profile.strip().lower() == LEGACY_DEFAULT_LLM_PROVIDER
+                else ""
+            )
             env_openrouter = bool(os.environ.get("OPENROUTER_API_KEY", "").strip())
             env_tokenrhythm = bool(os.environ.get("TOKENRHYTHM_API_KEY", "").strip())
-            if legacy_intent or (env_openrouter and not env_tokenrhythm):
+            ambient_credential_hints = (
+                {
+                    hint
+                    for hint, available in (
+                        (LEGACY_DEFAULT_LLM_PROVIDER, env_openrouter),
+                        (TOKENRHYTHM_DEFAULT_LLM_PROVIDER, env_tokenrhythm),
+                    )
+                    if available
+                }
+                if not ({"api_key", "api_key_env"} & fields_set)
+                else set()
+            )
+            strong_hints = {
+                hint
+                for hint in (
+                    *credential_hints,
+                    *ambient_credential_hints,
+                    origin_hint,
+                    explicit_profile_hint,
+                )
+                if hint
+            }
+            if strong_hints == {TOKENRHYTHM_DEFAULT_LLM_PROVIDER}:
+                provider = TOKENRHYTHM_DEFAULT_LLM_PROVIDER
+                resolution = {
+                    "status": "recovered",
+                    "effective_provider": provider,
+                    "source": "strong_evidence",
+                    "reason_code": "providerless_tokenrhythm_recovered",
+                    "action_required": False,
+                    "action_recommended": True,
+                }
+            elif len(strong_hints) > 1:
                 provider = LEGACY_DEFAULT_LLM_PROVIDER
+                resolution = {
+                    "status": "conflict",
+                    "effective_provider": "",
+                    "source": "conflicting_evidence",
+                    "reason_code": "providerless_provider_conflict",
+                    "action_required": True,
+                    "action_recommended": True,
+                }
+            elif legacy_intent or (env_openrouter and not env_tokenrhythm):
+                provider = LEGACY_DEFAULT_LLM_PROVIDER
+                explicit_openrouter = (
+                    strong_hints == {LEGACY_DEFAULT_LLM_PROVIDER}
+                    or (env_openrouter and not env_tokenrhythm and not legacy_intent)
+                )
+                resolution = {
+                    "status": "legacy_inferred",
+                    "effective_provider": provider,
+                    "source": (
+                        "strong_evidence" if explicit_openrouter else "legacy_compat"
+                    ),
+                    "reason_code": (
+                        "providerless_openrouter_evidence"
+                        if explicit_openrouter
+                        else "providerless_ambiguous_legacy_openrouter"
+                    ),
+                    "action_required": False,
+                    "action_recommended": not explicit_openrouter,
+                }
+            else:
+                resolution = {
+                    "status": "default",
+                    "effective_provider": provider,
+                    "source": "built_in_default",
+                    "reason_code": "provider_unset_default_tokenrhythm",
+                    "action_required": False,
+                    "action_recommended": False,
+                }
+        self._provider_resolution = resolution
         if provider != LEGACY_DEFAULT_LLM_PROVIDER:
             return self
         payload = llm.model_dump(mode="python")
@@ -2576,6 +2690,7 @@ class GatewayConfig(BaseSettings):
     _persist_raw_base: dict[str, Any] | None = PrivateAttr(default=None)
     _runtime_field_overrides: dict[str, tuple[Any, Any]] = PrivateAttr(default_factory=dict)
     _force_persist_paths: set[tuple[str, ...]] = PrivateAttr(default_factory=set)
+    _provider_resolution: dict[str, Any] = PrivateAttr(default_factory=dict)
 
     def to_toml_dict(self) -> dict[str, Any]:
         """Convert config to a TOML-writable dict."""
@@ -2652,6 +2767,15 @@ class GatewayConfig(BaseSettings):
     def to_public_dict(self) -> dict[str, Any]:
         """Return a redacted config view safe for public control surfaces."""
         data = cast(dict[str, Any], redact_public_config(self.model_dump()))
+        ensemble = data.get("llm_ensemble")
+        if isinstance(ensemble, dict):
+            from opensquilla.gateway.model_routing import (
+                ensemble_activation_preview,
+                ensemble_selection_configured,
+            )
+
+            ensemble["selection_configured"] = ensemble_selection_configured(self)
+            ensemble["activation_preview"] = ensemble_activation_preview(self)
         privacy = data.get("privacy")
         if isinstance(privacy, dict):
             from opensquilla.observability.network_policy import (
@@ -2723,6 +2847,43 @@ class GatewayConfig(BaseSettings):
         self._persist_raw_base = copy.deepcopy(other._persist_raw_base)
         self._runtime_field_overrides = dict(other._runtime_field_overrides)
         self._force_persist_paths = set(other._force_persist_paths)
+        self._provider_resolution = dict(other._provider_resolution)
+
+    def provider_resolution(self) -> dict[str, Any]:
+        """Return non-secret provider identity provenance for diagnostics."""
+
+        if self._provider_resolution:
+            return dict(self._provider_resolution)
+        provider = str(getattr(self.llm, "provider", "") or "").strip().lower()
+        return {
+            "status": "explicit",
+            "effective_provider": provider,
+            "source": "config",
+            "reason_code": "provider_explicit",
+            "action_required": False,
+            "action_recommended": False,
+        }
+
+    def set_provider_resolution(
+        self,
+        *,
+        status: str,
+        effective_provider: str,
+        source: str,
+        reason_code: str,
+        action_required: bool = False,
+        action_recommended: bool = False,
+    ) -> None:
+        """Update runtime-only provider identity provenance after a mutation."""
+
+        self._provider_resolution = {
+            "status": str(status),
+            "effective_provider": str(effective_provider),
+            "source": str(source),
+            "reason_code": str(reason_code),
+            "action_required": bool(action_required),
+            "action_recommended": bool(action_recommended),
+        }
 
     def set_persist_snapshot(
         self,
@@ -2778,6 +2939,7 @@ class GatewayConfig(BaseSettings):
         self._persist_baseline = copy.deepcopy(other._persist_baseline)
         self._persist_raw_base = copy.deepcopy(other._persist_raw_base)
         self._force_persist_paths = set(other._force_persist_paths)
+        self._provider_resolution = dict(other._provider_resolution)
 
     def mark_force_persist(self, path: str) -> None:
         """Always write ``path`` on the next persist, even if it equals the

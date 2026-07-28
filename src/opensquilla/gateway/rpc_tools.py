@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
+from opensquilla.redaction import redact_error_text
 from opensquilla.sandbox.integration import run_in_process_network_action
 from opensquilla.sandbox.types import DenialResult
 from opensquilla.tools.builtin.web import (
@@ -174,15 +175,52 @@ async def _model_probe(provider_id: str, ctx: RpcContext) -> dict[str, Any]:
             "error": "No provider selector configured",
         }
     try:
-        rows = await selector.list_models()
+        detailed_listing = getattr(selector, "list_models_detailed", None)
+        if callable(detailed_listing):
+            detailed = await detailed_listing()
+            rows = list(getattr(detailed, "models", []) or [])
+            matching_errors = [
+                error
+                for error in list(getattr(detailed, "errors", []) or [])
+                if str(getattr(error, "provider", "") or "").strip().lower()
+                == provider_id.strip().lower()
+            ]
+        else:
+            rows = await selector.list_models()
+            matching_errors = []
         matching = [
             row
             for row in rows
-            if isinstance(row, dict) and str(row.get("provider") or "") == provider_id
+            if isinstance(row, dict)
+            and str(row.get("provider") or "").strip().lower()
+            == provider_id.strip().lower()
         ]
-        return {"attempted": True, "status": "ok", "count": len(matching), "error": None}
+        if matching_errors:
+            first = matching_errors[0]
+            detail = redact_error_text(str(getattr(first, "detail", "") or ""))
+            failure_kind = str(getattr(first, "kind", "") or "unknown")
+            return {
+                "attempted": True,
+                "status": "degraded" if matching else "error",
+                "count": len(matching),
+                "error": detail or failure_kind,
+                "failureKind": failure_kind,
+            }
+        return {
+            "attempted": True,
+            "status": "ok",
+            "count": len(matching),
+            "error": None,
+            "failureKind": None,
+        }
     except Exception as exc:  # noqa: BLE001 - diagnostic surface
-        return {"attempted": True, "status": "error", "count": 0, "error": str(exc)}
+        return {
+            "attempted": True,
+            "status": "error",
+            "count": 0,
+            "error": redact_error_text(str(exc)),
+            "failureKind": "unknown",
+        }
 
 
 @_d.method("providers.status", scope="operator.read")
@@ -205,6 +243,9 @@ async def _handle_providers_status(params: dict | None, ctx: RpcContext) -> dict
 
     active = _active_llm_provider(ctx)
     llm_cfg = getattr(getattr(ctx, "config", None), "llm", None)
+    resolution_getter = getattr(getattr(ctx, "config", None), "provider_resolution", None)
+    resolution = resolution_getter() if callable(resolution_getter) else {}
+    provider_resolution_blocked = bool(resolution.get("action_required", False))
     rows: list[dict[str, Any]] = []
     for spec in specs:
         is_active = spec.provider_id == active
@@ -212,35 +253,97 @@ async def _handle_providers_status(params: dict | None, ctx: RpcContext) -> dict
         api_key_configured = _provider_key_configured(spec.provider_id, api_key_env, ctx)
         api_key_shape = _provider_api_key_shape(spec.provider_id, api_key_env, ctx)
         base_url = _provider_base_url(spec.provider_id, spec.default_base_url, ctx)
+        if is_active:
+            from opensquilla.provider.credentials import (
+                credential_provider_hint,
+                endpoint_provider_hint,
+            )
+
+            credential_hint = credential_provider_hint(
+                _provider_key_material(spec.provider_id, api_key_env, ctx),
+                api_key_env=api_key_env,
+            )
+            endpoint_hint = endpoint_provider_hint(base_url)
+            mismatch_reason = ""
+            mismatch_source = ""
+            if credential_hint and credential_hint != spec.provider_id:
+                mismatch_reason = "credential_provider_mismatch"
+                mismatch_source = "credential_shape"
+            elif (
+                credential_hint
+                and endpoint_hint
+                and credential_hint != endpoint_hint
+            ):
+                mismatch_reason = "credential_endpoint_provider_mismatch"
+                mismatch_source = "credential_endpoint"
+            if mismatch_reason:
+                provider_resolution_blocked = True
+                if not bool(resolution.get("action_required", False)):
+                    resolution = {
+                        "status": "conflict",
+                        "effective_provider": spec.provider_id,
+                        "source": mismatch_source,
+                        "reason_code": mismatch_reason,
+                        "action_required": True,
+                        "action_recommended": True,
+                    }
         base_url_configured = bool(base_url)
         configured = (
             spec.runtime_supported
             and (not spec.requires_api_key or api_key_configured)
             and (not spec.requires_base_url or base_url_configured)
         )
+        if is_active and provider_resolution_blocked:
+            configured = False
         model = str(getattr(llm_cfg, "model", "") or "") if is_active else ""
         api_key = str(getattr(llm_cfg, "api_key", "") or "") if is_active else ""
         if is_active and not api_key and api_key_env:
             api_key = os.environ.get(api_key_env, "")
         error: str | None = None
         buildable = False
-        try:
-            build_provider(
-                spec.provider_id,
-                model or "diagnostic-model",
-                api_key=api_key,
-                base_url=base_url,
+        if is_active and provider_resolution_blocked:
+            error = str(
+                resolution.get("reason_code") or "provider_resolution_blocked"
             )
-            buildable = True
-        except ProviderBuildError as exc:
-            error = str(exc)
-        except Exception as exc:  # noqa: BLE001 - diagnostic surface
-            error = str(exc)
-        probe = (
-            await _model_probe(spec.provider_id, ctx)
-            if probe_models and is_active
-            else {"attempted": False, "status": "skipped", "count": 0, "error": None}
-        )
+        else:
+            try:
+                build_provider(
+                    spec.provider_id,
+                    model or "diagnostic-model",
+                    api_key=api_key,
+                    base_url=base_url,
+                )
+                buildable = True
+            except ProviderBuildError as exc:
+                error = str(exc)
+            except Exception as exc:  # noqa: BLE001 - diagnostic surface
+                error = str(exc)
+        if probe_models and is_active and provider_resolution_blocked:
+            probe = {
+                "attempted": False,
+                "status": "unavailable",
+                "count": 0,
+                "error": str(
+                    resolution.get("reason_code")
+                    or "provider_resolution_blocked"
+                ),
+                "failureKind": str(
+                    resolution.get("reason_code")
+                    or "provider_resolution_blocked"
+                ),
+            }
+        else:
+            probe = (
+                await _model_probe(spec.provider_id, ctx)
+                if probe_models and is_active
+                else {
+                    "attempted": False,
+                    "status": "skipped",
+                    "count": 0,
+                    "error": None,
+                    "failureKind": None,
+                }
+            )
         rows.append(
             {
                 "providerId": spec.provider_id,
@@ -262,7 +365,23 @@ async def _handle_providers_status(params: dict | None, ctx: RpcContext) -> dict
                 ),
             }
         )
-    return {"activeProvider": active, "providers": rows, "count": len(rows)}
+    effective_provider = resolution.get("effective_provider")
+    provider_resolution = {
+        "status": str(resolution.get("status") or "explicit"),
+        "effectiveProvider": str(
+            active if effective_provider is None else effective_provider
+        ),
+        "source": str(resolution.get("source") or "config"),
+        "reasonCode": str(resolution.get("reason_code") or "provider_explicit"),
+        "actionRequired": bool(resolution.get("action_required", False)),
+        "actionRecommended": bool(resolution.get("action_recommended", False)),
+    }
+    return {
+        "activeProvider": active,
+        "providerResolution": provider_resolution,
+        "providers": rows,
+        "count": len(rows),
+    }
 
 
 @_d.method("search.status", scope="operator.read")

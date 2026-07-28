@@ -28,6 +28,7 @@ from opensquilla.gateway.config_secrets import (
 )
 from opensquilla.gateway.model_routing import (
     apply_model_routing_mode,
+    ensemble_activation_patches,
     reconcile_model_routing_write,
 )
 from opensquilla.onboarding.audio_specs import get_audio_provider_setup_spec
@@ -825,6 +826,19 @@ def upsert_llm_provider(
         }
     )
     new_cfg.llm = LlmProviderConfig(**llm_payload)
+    # ``provider_id`` is a required argument on this mutation, so it is an
+    # explicit operator identity decision even when it equals the built-in
+    # default. Sparse persistence must not erase that provenance: a
+    # provider-less file carrying only a key is intentionally interpreted as
+    # legacy OpenRouter on reload.
+    new_cfg.mark_force_persist("llm.provider")
+    new_cfg.clear_runtime_override("llm.api_key")
+    new_cfg.set_provider_resolution(
+        status="explicit",
+        effective_provider=provider_id,
+        source="operator",
+        reason_code="provider_explicit",
+    )
     _apply_primary_provider_router_policy(
         config,
         new_cfg,
@@ -1120,9 +1134,14 @@ def upsert_llm_ensemble(
     """
     current = config.llm_ensemble.model_dump(mode="python")
     merged = dict(current)
+    explicit_fields = set(
+        getattr(config.llm_ensemble, "model_fields_set", set())
+    )
+    generated_fields: set[str] = set()
 
     if enabled is not None:
         merged["enabled"] = bool(enabled)
+        explicit_fields.add("enabled")
     if selection_mode is not None:
         mode_clean = str(selection_mode).strip()
         if mode_clean not in _LLM_ENSEMBLE_SELECTION_MODES:
@@ -1131,10 +1150,12 @@ def upsert_llm_ensemble(
                 + ", ".join(_LLM_ENSEMBLE_SELECTION_MODES)
             )
         merged["selection_mode"] = mode_clean
+        explicit_fields.add("selection_mode")
     if model_options is not None:
         if not isinstance(model_options, (list, tuple)):
             raise ValueError("model_options must be a list of model ids")
         merged["model_options"] = [str(option) for option in model_options]
+        explicit_fields.add("model_options")
     if candidates is not None:
         if not isinstance(candidates, (list, tuple)):
             raise ValueError("candidates must be a list of candidate objects")
@@ -1169,10 +1190,12 @@ def upsert_llm_ensemble(
                 merged_row = incoming
             candidate_payloads.append(merged_row)
         merged["candidates"] = candidate_payloads
+        explicit_fields.add("candidates")
     if min_successful_proposers is not None:
         merged["min_successful_proposers"] = _positive_int(
             min_successful_proposers, label="min_successful_proposers"
         )
+        explicit_fields.add("min_successful_proposers")
     if all_failed_policy is not None:
         policy_clean = str(all_failed_policy).strip()
         if policy_clean not in _LLM_ENSEMBLE_ALL_FAILED_POLICIES:
@@ -1181,6 +1204,19 @@ def upsert_llm_ensemble(
                 + ", ".join(_LLM_ENSEMBLE_ALL_FAILED_POLICIES)
             )
         merged["all_failed_policy"] = policy_clean
+        explicit_fields.add("all_failed_policy")
+
+    if (
+        enabled is True
+        and not bool(current.get("enabled", False))
+        and selection_mode is None
+    ):
+        activation = ensemble_activation_patches(config)
+        if activation:
+            merged["selection_mode"] = activation["llm_ensemble.selection_mode"]
+            merged["candidates"] = activation["llm_ensemble.candidates"]
+            generated_fields.update({"selection_mode", "candidates"})
+            explicit_fields.update(generated_fields)
 
     try:
         new_ensemble = LlmEnsembleConfig(**merged)
@@ -1188,6 +1224,11 @@ def upsert_llm_ensemble(
         raise ValueError(str(exc)) from exc
 
     new_cfg = _clone(config)
+    object.__setattr__(
+        new_ensemble,
+        "__pydantic_fields_set__",
+        explicit_fields,
+    )
     new_cfg.llm_ensemble = new_ensemble
     routing_changes: dict[str, Any] = {}
     enabled_changed = enabled is not None and bool(enabled) != bool(
@@ -1216,6 +1257,10 @@ def upsert_llm_ensemble(
         # `configure ensemble --disabled` on a fresh config persists nothing
         # and is indistinguishable from a silent no-op.
         new_cfg.mark_force_persist("llm_ensemble.enabled")
+    if selection_mode is not None or "selection_mode" in generated_fields:
+        new_cfg.mark_force_persist("llm_ensemble.selection_mode")
+    if candidates is not None or "candidates" in generated_fields:
+        new_cfg.mark_force_persist("llm_ensemble.candidates")
 
     payload: dict[str, Any] = {
         "enabled": new_ensemble.enabled,

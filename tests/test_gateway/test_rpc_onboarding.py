@@ -1608,6 +1608,8 @@ async def test_provider_configure_refreshes_shared_live_catalog_before_return(
 
         assert res.error is None, res.error
         assert fetches == ["https://tokenrhythm.studio/api/models"]
+        persisted = tomllib.loads((tmp_path / "c.toml").read_text())
+        assert persisted["llm"]["provider"] == "tokenrhythm"
         assert catalog.resolve_entry("qwen3.7-max", provider="tokenrhythm").source == "live"
         assert catalog.resolve_max_tokens("qwen3.7-max", provider="tokenrhythm") == 131_072
     finally:

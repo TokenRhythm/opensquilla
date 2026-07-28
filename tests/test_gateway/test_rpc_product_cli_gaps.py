@@ -1279,6 +1279,183 @@ async def test_providers_status_honors_configured_active_api_key_env(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_providers_status_probe_surfaces_classified_active_error(monkeypatch):
+    from opensquilla.provider.selector import ModelListResult, ProviderListError
+
+    leaked = "sk-or-v1-abcdefghijklmnopqrstuvwxyz"
+
+    class _Selector:
+        is_configured = True
+
+        async def list_models_detailed(self):
+            return ModelListResult(
+                errors=[
+                    ProviderListError(
+                        provider="openrouter",
+                        model_hint="openrouter/model",
+                        kind="auth_invalid",
+                        detail=f"HTTP 401 invalid key {leaked}",
+                    )
+                ]
+            )
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "openrouter/model",
+            "api_key": "synthetic-unclassified-key",
+        }
+    )
+
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "providers.status",
+        {"provider": "openrouter", "probeModels": True},
+        _ctx(config=cfg, provider_selector=_Selector()),
+    )
+
+    assert res.error is None, res.error
+    probe = res.payload["providers"][0]["modelProbe"]
+    assert probe["status"] == "error"
+    assert probe["count"] == 0
+    assert probe["failureKind"] == "auth_invalid"
+    assert leaked not in repr(res.payload)
+
+
+@pytest.mark.asyncio
+async def test_providers_status_probe_distinguishes_empty_and_degraded_catalogs(
+    monkeypatch,
+):
+    from opensquilla.provider.selector import ModelListResult, ProviderListError
+
+    class _Selector:
+        is_configured = True
+
+        def __init__(self):
+            self.result = ModelListResult()
+
+        async def list_models_detailed(self):
+            return self.result
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    selector = _Selector()
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "openrouter/model",
+            "api_key": "synthetic-unclassified-key",
+        }
+    )
+    ctx = _ctx(config=cfg, provider_selector=selector)
+
+    empty = await get_dispatcher().dispatch(
+        "r-empty",
+        "providers.status",
+        {"provider": "openrouter", "probeModels": True},
+        ctx,
+    )
+    empty_probe = empty.payload["providers"][0]["modelProbe"]
+    assert empty_probe == {
+        "attempted": True,
+        "status": "ok",
+        "count": 0,
+        "error": None,
+        "failureKind": None,
+    }
+
+    selector.result = ModelListResult(
+        models=[{"provider": "openrouter", "model_id": "available/model"}],
+        errors=[
+            ProviderListError(
+                provider="openrouter",
+                model_hint="fallback/model",
+                kind="rate_limited",
+                detail="HTTP 429",
+            )
+        ],
+    )
+    degraded = await get_dispatcher().dispatch(
+        "r-degraded",
+        "providers.status",
+        {"provider": "openrouter", "probeModels": True},
+        ctx,
+    )
+    degraded_probe = degraded.payload["providers"][0]["modelProbe"]
+    assert degraded_probe["status"] == "degraded"
+    assert degraded_probe["count"] == 1
+    assert degraded_probe["failureKind"] == "rate_limited"
+
+
+@pytest.mark.asyncio
+async def test_providers_status_conflict_blocks_probe_before_selector_call(monkeypatch):
+    calls = 0
+
+    class _Selector:
+        is_configured = True
+
+        async def list_models_detailed(self):
+            nonlocal calls
+            calls += 1
+            raise AssertionError("provider conflict must block the probe")
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("TOKENRHYTHM_API_KEY", raising=False)
+    cfg = GatewayConfig(
+        llm={
+            "api_key": "sk_tr_abcdefghijklmnop",
+            "base_url": "https://openrouter.ai/api/v1",
+        }
+    )
+
+    res = await get_dispatcher().dispatch(
+        "r-conflict",
+        "providers.status",
+        {"probeModels": True},
+        _ctx(config=cfg, provider_selector=_Selector()),
+    )
+
+    assert res.error is None, res.error
+    assert calls == 0
+    assert res.payload["providerResolution"]["actionRequired"] is True
+    assert res.payload["providerResolution"]["effectiveProvider"] == ""
+    assert res.payload["providerResolution"]["reasonCode"] == (
+        "providerless_provider_conflict"
+    )
+    active = next(row for row in res.payload["providers"] if row["active"])
+    assert active["configured"] is False
+    assert active["modelProbe"]["status"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_providers_status_blocks_key_for_conflicting_official_endpoint():
+    cfg = GatewayConfig(
+        llm={
+            "provider": "tokenrhythm",
+            "api_key": "sk_tr_abcdefghijklmnop",
+            "base_url": "https://openrouter.ai/api/v1",
+        }
+    )
+
+    res = await get_dispatcher().dispatch(
+        "r-endpoint-conflict",
+        "providers.status",
+        {"provider": "tokenrhythm", "probeModels": True},
+        _ctx(config=cfg),
+    )
+
+    assert res.error is None, res.error
+    assert res.payload["providerResolution"]["actionRequired"] is True
+    assert res.payload["providerResolution"]["reasonCode"] == (
+        "credential_endpoint_provider_mismatch"
+    )
+    active = res.payload["providers"][0]
+    assert active["configured"] is False
+    assert active["buildable"] is False
+    assert active["modelProbe"]["attempted"] is False
+
+
+@pytest.mark.asyncio
 async def test_providers_status_reports_ok_api_key_shape_and_null_latency(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     cfg = GatewayConfig(

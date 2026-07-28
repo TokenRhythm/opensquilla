@@ -286,6 +286,14 @@ interface ConfigData {
   llm_ensemble?: {
     enabled?: boolean
     selection_mode?: string
+    selection_configured?: boolean
+    activation_preview?: {
+      selection_mode?: string
+      proposer_count?: number
+      member_providers?: string[]
+      candidates?: EnsembleCandidateConfig[]
+      blocked_reason?: string | null
+    }
     model_options?: string[]
     candidates?: EnsembleCandidateConfig[]
     min_successful_proposers?: number

@@ -350,16 +350,60 @@ def evaluate_provider(payload: dict[str, Any]) -> list[HealthFinding]:
                 )
             )
         else:
-            findings.append(
-                HealthFinding(
-                    id="provider.active.ready",
-                    severity="ok",
-                    surface="provider",
-                    title="Active provider ready",
-                    detail=f"{provider_id} is configured and buildable.",
-                    evidence={"providerId": provider_id, "model": active_row.get("model")},
+            probe = active_row.get("modelProbe")
+            attempted = isinstance(probe, dict) and bool(probe.get("attempted"))
+            probe_status = str(probe.get("status") or "") if isinstance(probe, dict) else ""
+            if attempted and probe_status in {"error", "degraded"}:
+                failure_kind = str(probe.get("failureKind") or "unknown")
+                blocking = failure_kind in {"auth_invalid", "insufficient_credits"}
+                findings.append(
+                    HealthFinding(
+                        id=f"provider.active.probe.{failure_kind}",
+                        severity="error" if blocking else "warn",
+                        readiness_impact="blocks_ready" if blocking else "degrades",
+                        surface="provider",
+                        title="Active provider probe failed",
+                        detail=str(
+                            probe.get("error")
+                            or "The provider model-list probe did not succeed."
+                        ),
+                        evidence={
+                            "providerId": provider_id,
+                            "failureKind": failure_kind,
+                            "probeStatus": probe_status,
+                        },
+                        fix_steps=[
+                            FixStep(
+                                label="Inspect provider probe",
+                                command=(
+                                    "opensquilla providers status "
+                                    f"{provider_id} --probe-models"
+                                ),
+                            ),
+                            FixStep(
+                                label="Reconfigure provider",
+                                command=(
+                                    "opensquilla providers configure "
+                                    f"{provider_id} --api-key {_API_KEY_PLACEHOLDER}"
+                                ),
+                            ),
+                        ],
+                    )
                 )
-            )
+            else:
+                findings.append(
+                    HealthFinding(
+                        id="provider.active.ready",
+                        severity="ok",
+                        surface="provider",
+                        title="Active provider ready",
+                        detail=f"{provider_id} is configured and buildable.",
+                        evidence={
+                            "providerId": provider_id,
+                            "model": active_row.get("model"),
+                        },
+                    )
+                )
     return findings
 
 

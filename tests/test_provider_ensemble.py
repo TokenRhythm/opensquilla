@@ -37,6 +37,7 @@ from opensquilla.provider.ensemble import (
     _MemberRequestBudgetBinding,
     _stream_with_heartbeats,
     build_ensemble_provider_from_config,
+    ensemble_runtime_status,
 )
 from opensquilla.provider.selector import ProviderConfig
 from opensquilla.provider.types import (
@@ -3845,3 +3846,64 @@ def test_static_b5_credential_gate_agrees_with_config_side_floor_gate(
             config, config.llm, selection_mode
         )
         assert static_b5_ensemble_active(config) is expected
+
+
+def test_ensemble_runtime_status_counts_static_custom_and_dynamic() -> None:
+    static_cfg = GatewayConfig(
+        llm={"provider": "tokenrhythm", "api_key": "sk_tr_abcdefghijklmnop"},
+        llm_ensemble={"enabled": True, "selection_mode": "static_tokenrhythm_b5"},
+    )
+    static_status = ensemble_runtime_status(static_cfg)
+    assert static_status["runtimeStatus"] == "ready"
+    assert static_status["proposerCount"] == 4
+    assert static_status["aggregatorCount"] == 1
+    assert static_status["perTurnCallCount"] == 5
+
+    custom_cfg = GatewayConfig(
+        llm={"provider": "tokenrhythm", "api_key": "sk_tr_abcdefghijklmnop"},
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "custom_b5",
+            "candidates": [
+                {"provider": "tokenrhythm", "model": "m1"},
+                {"provider": "tokenrhythm", "model": "m2"},
+            ],
+        },
+    )
+    custom_status = ensemble_runtime_status(custom_cfg)
+    assert custom_status["runtimeStatus"] == "ready"
+    assert custom_status["proposerCount"] == 2
+    assert custom_status["aggregatorCount"] == 1
+    assert custom_status["perTurnCallCount"] == 3
+
+    dynamic_cfg = GatewayConfig(
+        llm_ensemble={"enabled": True, "selection_mode": "router_dynamic"}
+    )
+    dynamic_status = ensemble_runtime_status(dynamic_cfg)
+    assert dynamic_status["runtimeStatus"] == "conditional"
+    assert dynamic_status["proposerCountRange"] == [2, 4]
+    assert dynamic_status["perTurnCallCountRange"] == [3, 5]
+
+
+def test_ensemble_runtime_status_checks_inherited_custom_aggregator_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TOKENRHYTHM_API_KEY", "synthetic-tokenrhythm-key")
+    cfg = GatewayConfig(
+        llm={"provider": "groq", "model": "groq-aggregator"},
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "custom_b5",
+            "candidates": [
+                {"provider": "tokenrhythm", "model": "tr-proposer-1"},
+                {"provider": "tokenrhythm", "model": "tr-proposer-2"},
+            ],
+        },
+    )
+
+    status = ensemble_runtime_status(cfg)
+
+    assert status["runtimeStatus"] == "blocked"
+    assert status["configurationReady"] is False
+    assert status["aggregatorCount"] == 1
+    assert "groq" in str(status["blockedReason"])

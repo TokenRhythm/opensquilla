@@ -1352,4 +1352,7 @@ def test_doctor_json_uses_gateway_doctor_rpc(monkeypatch):
 
     assert result.exit_code == 0, result.stdout
     assert json.loads(result.stdout)["ready"] is True
-    assert ("doctor.status", {"agentId": "main", "deep": True}) in fake.calls
+    assert (
+        "doctor.status",
+        {"agentId": "main", "deep": True, "probeProviders": False},
+    ) in fake.calls

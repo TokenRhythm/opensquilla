@@ -110,7 +110,10 @@ def test_doctor_json_calls_doctor_status(monkeypatch) -> None:
     assert result.exit_code == 1
     payload = json.loads(result.stdout)
     assert payload["status"] == "action_required"
-    assert ("doctor.status", {"agentId": "main", "deep": True}) in _FakeGatewayClient.calls
+    assert (
+        "doctor.status",
+        {"agentId": "main", "deep": True, "probeProviders": False},
+    ) in _FakeGatewayClient.calls
 
 
 def test_doctor_quick_skips_deep_memory_diagnostics(monkeypatch) -> None:
@@ -120,7 +123,10 @@ def test_doctor_quick_skips_deep_memory_diagnostics(monkeypatch) -> None:
     result = runner.invoke(app, ["doctor", "--quick", "--json"])
 
     assert result.exit_code == 1
-    assert ("doctor.status", {"agentId": "main", "deep": False}) in _FakeGatewayClient.calls
+    assert (
+        "doctor.status",
+        {"agentId": "main", "deep": False, "probeProviders": False},
+    ) in _FakeGatewayClient.calls
 
 
 def test_doctor_config_targets_gateway_from_config_path(tmp_path, monkeypatch) -> None:
@@ -133,7 +139,23 @@ def test_doctor_config_targets_gateway_from_config_path(tmp_path, monkeypatch) -
 
     assert result.exit_code == 1
     assert ("connect", "ws://127.0.0.1:20002/ws") in _FakeGatewayClient.calls
-    assert ("doctor.status", {"agentId": "main", "deep": True}) in _FakeGatewayClient.calls
+    assert (
+        "doctor.status",
+        {"agentId": "main", "deep": True, "probeProviders": False},
+    ) in _FakeGatewayClient.calls
+
+
+def test_doctor_provider_probe_is_explicit_opt_in(monkeypatch) -> None:
+    _FakeGatewayClient.calls = []
+    monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", _FakeGatewayClient)
+
+    result = runner.invoke(app, ["doctor", "--probe-providers", "--json"])
+
+    assert result.exit_code == 1
+    assert (
+        "doctor.status",
+        {"agentId": "main", "deep": True, "probeProviders": True},
+    ) in _FakeGatewayClient.calls
 
 
 def test_doctor_config_derived_gateway_recovery_preserves_config_target(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import httpx
 import pytest
 
 from opensquilla.provider.failures import ProviderFailureKind
@@ -177,6 +178,13 @@ class _HealthyProvider:
         return [ModelInfo(provider="ollama", model_id="test-model-good")]
 
 
+class _CompatibilityProviderThatSwallowsByDefault:
+    async def list_models(self, *, raise_on_error: bool = False) -> list[ModelInfo]:
+        if raise_on_error:
+            raise RuntimeError(f"HTTP 401: invalid api key {FAKE_LEAKED_KEY}")
+        return []
+
+
 def _selector_with_failing_primary(monkeypatch) -> ModelSelector:
     def fake_build_provider(cfg: ProviderConfig):
         if cfg.provider == "openrouter":
@@ -244,6 +252,100 @@ async def test_list_models_detailed_reports_every_failed_chain_link(monkeypatch)
         ("openrouter", "openrouter/auth-locked-a"),
         ("deepseek", "deepseek/auth-locked-b"),
     ]
+
+
+async def test_detailed_listing_enables_adapter_strict_mode(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "opensquilla.provider.selector._build_provider",
+        lambda _cfg: _CompatibilityProviderThatSwallowsByDefault(),
+    )
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig(
+                provider="openrouter",
+                model="openrouter/auth-locked",
+                api_key=FAKE_LEAKED_KEY,
+            )
+        )
+    )
+
+    result = await selector.list_models_detailed()
+
+    assert result.models == []
+    assert result.errors[0].kind == ProviderFailureKind.AUTH_INVALID.value
+    assert FAKE_LEAKED_KEY not in result.errors[0].detail
+    assert await selector.list_models() == []
+
+
+async def test_known_cross_provider_key_never_reaches_transport(monkeypatch) -> None:
+    requests: list[httpx.Request] = []
+    transport = httpx.MockTransport(
+        lambda request: (
+            requests.append(request)
+            or httpx.Response(200, json={"data": []}, request=request)
+        )
+    )
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", patched_async_client)
+    leaked = "sk_tr_abcdefghijklmnop"
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig(
+                provider="openrouter",
+                model="openrouter/model",
+                api_key=leaked,
+                base_url="https://openrouter.ai/api/v1",
+            )
+        )
+    )
+
+    result = await selector.list_models_detailed()
+
+    assert requests == []
+    assert result.models == []
+    assert result.errors[0].kind == ProviderFailureKind.UNKNOWN.value
+    assert "tokenrhythm" in result.errors[0].detail
+    assert leaked not in result.errors[0].detail
+
+
+async def test_known_key_never_reaches_conflicting_official_host(monkeypatch) -> None:
+    requests: list[httpx.Request] = []
+    transport = httpx.MockTransport(
+        lambda request: (
+            requests.append(request)
+            or httpx.Response(200, json={"data": []}, request=request)
+        )
+    )
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", patched_async_client)
+    leaked = "sk_tr_abcdefghijklmnop"
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig(
+                provider="tokenrhythm",
+                model="deepseek-v4-pro",
+                api_key=leaked,
+                base_url="https://openrouter.ai/api/v1",
+            )
+        )
+    )
+
+    result = await selector.list_models_detailed()
+
+    assert requests == []
+    assert result.models == []
+    assert "openrouter" in result.errors[0].detail
+    assert leaked not in result.errors[0].detail
 
 
 # ---------------------------------------------------------------------------

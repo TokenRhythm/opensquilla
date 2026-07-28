@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 
@@ -9,6 +10,7 @@ from opensquilla.redaction import redact_error_text
 
 from .anthropic import AnthropicProvider
 from .compat_policy import OpenAICompatPolicy
+from .credentials import credential_provider_hint, endpoint_provider_hint
 from .failures import classify_provider_error
 from .ollama import OllamaProvider
 from .openai import OpenAIProvider
@@ -76,6 +78,19 @@ class ModelListResult:
 
     models: list[dict] = field(default_factory=list)
     errors: list[ProviderListError] = field(default_factory=list)
+
+
+async def _list_provider_models_detailed(provider: LLMProvider) -> list:
+    """Ask adapters to surface listing failures when they expose that capability."""
+
+    list_models = provider.list_models
+    try:
+        supports_strict = "raise_on_error" in inspect.signature(list_models).parameters
+    except (TypeError, ValueError):
+        supports_strict = False
+    if supports_strict:
+        return await list_models(raise_on_error=True)  # type: ignore[call-arg]
+    return await list_models()
 
 
 class ProviderBuildError(Exception):
@@ -150,6 +165,19 @@ def _without_provider_state_replay(cfg: ProviderConfig) -> ProviderConfig:
 
 def _build_provider(cfg: ProviderConfig) -> LLMProvider:
     """Instantiate the correct provider class from a ProviderConfig."""
+    provider_id = str(cfg.provider or "").strip().lower()
+    credential_hint = credential_provider_hint(cfg.api_key)
+    if credential_hint and credential_hint != provider_id:
+        raise ProviderBuildError(
+            f"Credential format belongs to provider '{credential_hint}', "
+            f"not configured provider '{provider_id or '(unset)'}'"
+        )
+    endpoint_hint = endpoint_provider_hint(cfg.base_url)
+    if credential_hint and endpoint_hint and credential_hint != endpoint_hint:
+        raise ProviderBuildError(
+            f"Credential format belongs to provider '{credential_hint}', "
+            f"but the configured endpoint belongs to provider '{endpoint_hint}'"
+        )
     try:
         spec = get_provider_spec(cfg.provider)
     except UnknownProviderError as exc:
@@ -631,7 +659,7 @@ class ModelSelector:
         for cfg in self._chain:
             try:
                 provider = _build_provider(cfg)
-                provider_models = await provider.list_models()
+                provider_models = await _list_provider_models_detailed(provider)
                 result.models.extend(m.model_dump() for m in provider_models)
             except Exception as exc:
                 result.errors.append(
