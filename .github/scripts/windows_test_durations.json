@@ -300,6 +300,7 @@
     "tests/test_engine/test_spawn_depth_unified.py": 0.01,
     "tests/test_engine/test_stream_wrappers.py": 0.357,
     "tests/test_engine/test_subagent_run_mode_inheritance.py": 0.01,
+    "tests/test_engine/test_subagent_usage_rollup.py": 0.03,
     "tests/test_engine/test_t3_upgrade_compaction.py": 0.172,
     "tests/test_engine/test_text_only_tool_recovery.py": 0.268,
     "tests/test_engine/test_tokenjuice_tool_result_projection.py": 0.622,
