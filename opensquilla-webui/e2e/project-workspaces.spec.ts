@@ -124,6 +124,7 @@ async function installProjectLifecycleRpc(
             currentPath: '/repos',
             path: '/repos',
             parentPath: '/',
+            systemPickerAvailable: false,
             entries: [
               {
                 name: 'demo',
@@ -330,6 +331,8 @@ test.describe('Project workspaces', () => {
       .click()
 
     const picker = page.getByRole('dialog', { name: 'Choose project' })
+    await expect.poll(() => state.pathListRequests.length).toBe(1)
+    expect(state.requestMethods).not.toContain('sandbox.path.pick')
     await picker.getByRole('option', { name: 'demo', exact: true }).click()
     await picker.getByRole('button', { name: 'Choose selected directory', exact: true }).click()
 

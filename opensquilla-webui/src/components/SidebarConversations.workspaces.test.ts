@@ -104,6 +104,7 @@ function i18n() {
 async function mountSidebar(
   rows: SidebarSectionRow[],
   canManageProjects = true,
+  canCreateProjects = canManageProjects,
 ) {
   const sections: SidebarSection[] = [{ family: 'chats', label: 'Tasks', rows }]
   const events = {
@@ -125,6 +126,7 @@ async function mountSidebar(
     contractDebugEnabled: false,
     searchHint: 'Ctrl+K',
     canManageProjects,
+    canCreateProjects,
     onSelect: events.select,
     onNewProject: events.newProject,
     onNewProjectTask: events.newProjectTask,

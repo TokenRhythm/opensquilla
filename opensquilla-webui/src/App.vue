@@ -356,7 +356,7 @@
 
   <ProjectWorkspaceCreateDialog
     v-if="rpcStore.canChooseProject"
-    :open="projectCreateOpen && !projectCreateConfirming"
+    :open="projectCreateOpen && !projectCreateConfirming && !projectSourcePickerOpen"
     :name="projectCreateName"
     :source-path="projectCreateSourcePath"
     :busy="projectCreateBusy"
@@ -365,6 +365,16 @@
     @choose-source="chooseProjectSourceDirectory"
     @close="closeProjectCreator"
     @create="createProjectWorkspace"
+  />
+
+  <ProjectWorkspacePickerDialog
+    v-if="rpcStore.canChooseProject"
+    :open="projectCreateOpen && projectSourcePickerOpen"
+    :enabled="rpcStore.canChooseProject"
+    :session-key="currentSessionKey || 'agent:main:webchat:workspace-picker'"
+    :initial-path="projectCreateSourcePath"
+    @close="projectSourcePickerOpen = false"
+    @choose="onProjectSourcePathChosen"
   />
 
   <ProjectWorkspaceEditDialog
@@ -405,6 +415,7 @@ import ToastHost from './components/ToastHost.vue'
 import ConfirmModal from './components/ConfirmModal.vue'
 import ProjectWorkspaceCreateDialog from './components/ProjectWorkspaceCreateDialog.vue'
 import ProjectWorkspaceEditDialog from './components/ProjectWorkspaceEditDialog.vue'
+import ProjectWorkspacePickerDialog from './components/ProjectWorkspacePickerDialog.vue'
 import UpdateBanner from './components/UpdateBanner.vue'
 import DesktopUpdateIndicator from './components/DesktopUpdateIndicator.vue'
 import SidebarConversations from './components/SidebarConversations.vue'
@@ -507,6 +518,7 @@ const projectCreateSourcePath = ref('')
 const projectCreateBusy = ref(false)
 const projectCreateSourcePicking = ref(false)
 const projectCreateConfirming = ref(false)
+const projectSourcePickerOpen = ref(false)
 const editingProjectId = ref('')
 const editingProject = computed(() =>
   editingProjectId.value
@@ -526,6 +538,7 @@ watch(
     projectCreateBusy.value = false
     projectCreateSourcePicking.value = false
     projectCreateConfirming.value = false
+    projectSourcePickerOpen.value = false
     editingProjectId.value = ''
   },
 )
@@ -1007,6 +1020,7 @@ function resetProjectCreator() {
   projectCreateBusy.value = false
   projectCreateSourcePicking.value = false
   projectCreateConfirming.value = false
+  projectSourcePickerOpen.value = false
 }
 
 function openProjectCreator() {
@@ -1016,6 +1030,7 @@ function openProjectCreator() {
   projectCreateBusy.value = false
   projectCreateSourcePicking.value = false
   projectCreateConfirming.value = false
+  projectSourcePickerOpen.value = false
   projectCreateOpen.value = true
 }
 
@@ -1032,29 +1047,29 @@ function onProjectPathChosen(path: string) {
   }
 }
 
+function onProjectSourcePathChosen(path: string) {
+  projectSourcePickerOpen.value = false
+  onProjectPathChosen(path)
+}
+
 async function chooseProjectSourceDirectory() {
   if (
     !projectCreateOpen.value
     || !rpcStore.canChooseProject
     || projectCreateBusy.value
     || projectCreateSourcePicking.value
+    || projectSourcePickerOpen.value
   ) return
+
+  const nativePicker = getPlatform().files.chooseProjectDirectory
+  if (typeof nativePicker !== 'function') {
+    projectSourcePickerOpen.value = true
+    return
+  }
 
   projectCreateSourcePicking.value = true
   try {
-    const nativePicker = getPlatform().files.chooseProjectDirectory
-    const choice = typeof nativePicker === 'function'
-      ? await nativePicker()
-      : await rpcStore.call<{ path: string | null }>(
-          'sandbox.path.pick',
-          {
-            sessionKey: currentSessionKey.value || 'agent:main:webchat:workspace-picker',
-            kind: 'workspace',
-            ...(projectCreateSourcePath.value.trim()
-              ? { initialPath: projectCreateSourcePath.value.trim() }
-              : {}),
-          },
-        )
+    const choice = await nativePicker()
     const selected = String(choice?.path || '').trim()
     if (selected) onProjectPathChosen(selected)
   } catch (err) {
@@ -1072,6 +1087,7 @@ async function createProjectWorkspace(payload: { name: string; path: string }) {
     || !rpcStore.canChooseProject
     || projectCreateBusy.value
     || projectCreateSourcePicking.value
+    || projectSourcePickerOpen.value
   ) return
   const name = payload.name.trim()
   const path = payload.path.trim()

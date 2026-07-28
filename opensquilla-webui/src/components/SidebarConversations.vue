@@ -57,8 +57,8 @@ const props = withDefaults(defineProps<{
   canManageProjects?: boolean
   canCreateProjects?: boolean
 }>(), {
-  canManageProjects: true,
-  canCreateProjects: true,
+  canManageProjects: false,
+  canCreateProjects: false,
 })
 
 const emit = defineEmits<{
