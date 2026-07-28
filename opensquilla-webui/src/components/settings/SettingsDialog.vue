@@ -1,6 +1,6 @@
 <template>
   <Teleport to="body">
-    <div class="settings-overlay" @click.self="requestClose()">
+    <div class="settings-overlay" @click.self="requestClose($event)">
       <Transition name="settings-pop" appear @after-leave="onLeaveComplete">
       <section
         v-if="visible"
@@ -56,7 +56,7 @@
               :disabled="hasPendingSettingsWrite"
               :aria-label="t('common.close')"
               :title="t('common.close')"
-              @click="requestClose()"
+              @click="requestClose($event)"
             >
               <Icon name="x" :size="16" />
             </button>
@@ -549,13 +549,16 @@ function onLeaveComplete() {
   if (closing) navigateAway()
 }
 
-function closeOverlay() {
+function closeOverlay(restoreFocus = true) {
   if (closing) return
   closing = true
-  // Restore focus to the invoker synchronously (don't wait out the leave
-  // animation) so keyboard users and the focus-return tests see focus land now.
-  const target = usableInvoker() ?? sidebarSettingsButton()
-  target?.focus()
+  // Pointer users already chose their next location by clicking, so forcing
+  // focus back to the Settings row leaves a misleading orange keyboard ring.
+  // Keyboard-triggered closes still restore focus synchronously.
+  if (restoreFocus) {
+    const target = usableInvoker() ?? sidebarSettingsButton()
+    target?.focus()
+  }
   invokerEl = null
   // Flip visibility to play the modal's leave transition; onLeaveComplete then
   // navigates away (which unmounts the route component).
@@ -605,10 +608,12 @@ function confirmDiscard(): Promise<boolean> {
 }
 
 // Closes unless a section carries unsaved edits and the user keeps them.
-async function requestClose(): Promise<boolean> {
+async function requestClose(event?: MouseEvent): Promise<boolean> {
   if (hasPendingSettingsWrite.value) return false
   if (hasSettingsExitDraft.value && !(await confirmDiscard())) return false
-  closeOverlay()
+  // Keyboard-generated click events have detail 0; real pointer clicks have a
+  // positive click count. Preserve focus restoration for keyboard activation.
+  closeOverlay(!event || event.detail === 0)
   return true
 }
 

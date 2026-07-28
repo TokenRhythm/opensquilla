@@ -213,6 +213,43 @@ describe('SettingsDialog save-all pending state', () => {
 })
 
 describe('SettingsDialog exit protection', () => {
+  it('does not leave a keyboard focus ring on Settings after a pointer close', async () => {
+    const controls = mockCatalog()
+    controls.saveAllPending.value = false
+    controls.hasUnsavedChanges.value = false
+    catalogApi.dirtySections.value = []
+    const invoker = document.createElement('button')
+    invoker.dataset.icon = 'settings'
+    invoker.className = 'sidebar-fn-item'
+    document.body.appendChild(invoker)
+    invoker.focus()
+
+    const el = await mountDialog()
+    const close = el.querySelector<HTMLButtonElement>('.settings-modal__head button')!
+    close.dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 }))
+    await nextTick()
+
+    expect(document.activeElement).not.toBe(invoker)
+  })
+
+  it('restores Settings focus for keyboard-style close activation', async () => {
+    const controls = mockCatalog()
+    controls.saveAllPending.value = false
+    controls.hasUnsavedChanges.value = false
+    catalogApi.dirtySections.value = []
+    const invoker = document.createElement('button')
+    invoker.dataset.icon = 'settings'
+    invoker.className = 'sidebar-fn-item'
+    document.body.appendChild(invoker)
+    invoker.focus()
+
+    const el = await mountDialog()
+    el.querySelector<HTMLButtonElement>('.settings-modal__head button')?.click()
+    await nextTick()
+
+    expect(document.activeElement).toBe(invoker)
+  })
+
   it('guards provider-only drafts on close and external navigation without adding the dirty bar', async () => {
     const controls = mockCatalog()
     controls.saveAllPending.value = false
