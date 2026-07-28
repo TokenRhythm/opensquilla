@@ -43,22 +43,32 @@ try {
       OPENSQUILLA_TESTING: '0',
     },
   })
-  const page = await app.firstWindow({ timeout: 60_000 })
-  await waitFor(() => page.url().includes('/control/chat'), 'candidate Control UI')
-
-  await page.routeWebSocket(/\/ws$/, (client) => {
-    socketCount += 1
+  await app.context().routeWebSocket(/\/ws$/, (client) => {
+    let targetSocketCounted = false
+    const countTargetSocket = () => {
+      if (targetSocketCounted) return
+      targetSocketCounted = true
+      socketCount += 1
+    }
     const server = client.connectToServer()
 
     client.onMessage((message) => {
       try {
         const frame = JSON.parse(String(message))
         if (frame?.type === 'req' && injectHang) {
-          if (frame.method === 'chat.history') {
+          if (
+            frame.method === 'chat.history'
+            && frame.params?.sessionKey === sessionKey
+          ) {
+            countTargetSocket()
             heldHistoryRequests += 1
             return
           }
-          if (frame.method === 'sessions.messages.subscribe') {
+          if (
+            frame.method === 'sessions.messages.subscribe'
+            && frame.params?.key === sessionKey
+          ) {
+            countTargetSocket()
             heldSubscribeRequests += 1
             return
           }
@@ -90,6 +100,13 @@ try {
       }
     })
   })
+
+  const page = await app.firstWindow({ timeout: 60_000 })
+  await waitFor(() => page.url().includes('/control/chat'), 'candidate Control UI')
+  // The preceding release-upgrade launch can persist this exact chat URL. In
+  // that case page.goto() below may not create a new socket, so explicitly
+  // reload after installing the context-wide route.
+  await page.reload({ waitUntil: 'domcontentloaded' })
 
   const sessionUrl = new URL(page.url())
   sessionUrl.pathname = '/control/chat'
