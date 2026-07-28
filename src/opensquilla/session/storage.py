@@ -617,6 +617,41 @@ CREATE TRIGGER IF NOT EXISTS transcript_fts_au AFTER UPDATE ON transcript_entrie
 END
 """
 
+# ── FTS5 for archived (compacted) transcript entries ──────────────────────
+# Mirrors the transcript_fts pattern so that entries moved to
+# compacted_transcript_entries during compaction remain full-text searchable.
+
+_CREATE_COMPACTED_TRANSCRIPT_FTS = """
+CREATE VIRTUAL TABLE IF NOT EXISTS compacted_transcript_fts
+USING fts5(content, content=compacted_transcript_entries, content_rowid=id)
+"""
+
+_CREATE_COMPACTED_FTS_TRIGGER_INSERT = """
+CREATE TRIGGER IF NOT EXISTS compacted_transcript_fts_ai
+AFTER INSERT ON compacted_transcript_entries BEGIN
+    INSERT INTO compacted_transcript_fts(rowid, content)
+    VALUES (new.id, new.content);
+END
+"""
+
+_CREATE_COMPACTED_FTS_TRIGGER_DELETE = """
+CREATE TRIGGER IF NOT EXISTS compacted_transcript_fts_ad
+AFTER DELETE ON compacted_transcript_entries BEGIN
+    INSERT INTO compacted_transcript_fts(compacted_transcript_fts, rowid, content)
+    VALUES ('delete', old.id, old.content);
+END
+"""
+
+_CREATE_COMPACTED_FTS_TRIGGER_UPDATE = """
+CREATE TRIGGER IF NOT EXISTS compacted_transcript_fts_au
+AFTER UPDATE ON compacted_transcript_entries BEGIN
+    INSERT INTO compacted_transcript_fts(compacted_transcript_fts, rowid, content)
+    VALUES ('delete', old.id, old.content);
+    INSERT INTO compacted_transcript_fts(rowid, content)
+    VALUES (new.id, new.content);
+END
+"""
+
 _CREATE_SUMMARIES = """
 CREATE TABLE IF NOT EXISTS session_summaries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1548,6 +1583,7 @@ class SessionStorage:
         await self._migrate_transcript_turn_context_column()
         await self._migrate_summary_metadata_columns()
         await self._migrate_memory_durable_receipt_coverage_columns()
+        await self._migrate_compacted_transcript_fts()
         await self._conn.execute(_CREATE_IDX_MEMORY_DURABLE_RECEIPTS_COVERAGE)
         # Recency index for list_sessions / title search. Guarded on the column
         # because a very old (pre-updated_at) sessions table can survive here
@@ -1888,6 +1924,31 @@ class SessionStorage:
                 changed = True
         if changed:
             await self._conn.commit()
+
+    async def _migrate_compacted_transcript_fts(self) -> None:
+        """Idempotently create FTS5 index for archived transcript entries.
+
+        Creates the ``compacted_transcript_fts`` virtual table and its
+        auto-sync triggers, then backfills any rows already present in
+        ``compacted_transcript_entries``.  Safe to call on every startup.
+        """
+        assert self._conn is not None
+        await self._conn.execute(_CREATE_COMPACTED_TRANSCRIPT_FTS)
+        await self._conn.execute(_CREATE_COMPACTED_FTS_TRIGGER_INSERT)
+        await self._conn.execute(_CREATE_COMPACTED_FTS_TRIGGER_DELETE)
+        await self._conn.execute(_CREATE_COMPACTED_FTS_TRIGGER_UPDATE)
+        # Rebuild the FTS index from the external content table.
+        # For FTS5 external-content tables, COUNT(*) reads the content table
+        # (not the index), so we cannot use it as a "needs backfill" guard.
+        # The 'rebuild' command is idempotent: it re-reads all rows from
+        # compacted_transcript_entries and reconstructs the inverted index.
+        # On a fresh database the content table is empty so this is a no-op;
+        # on an upgraded database it populates the index for the first time.
+        await self._conn.execute(
+            "INSERT INTO compacted_transcript_fts(compacted_transcript_fts) "
+            "VALUES ('rebuild')"
+        )
+        await self._conn.commit()
 
     @property
     def conn(self) -> Any:
@@ -7244,15 +7305,23 @@ class SessionStorage:
         query: str,
         session_id: str | None = None,
         limit: int = 20,
+        *,
+        include_archived: bool = True,
     ) -> list[dict[str, Any]]:
         """Full-text search across transcript entries.
 
-        Returns dicts with: id, session_key, role, snippet, created_at.
+        Searches the active transcript first, then (when *include_archived*
+        is True and fewer than *limit* results were found) fills remaining
+        slots from the archived ``compacted_transcript_entries`` table.
+
+        Returns dicts with: id, session_key, role, snippet, created_at, source.
+        ``source`` is ``"active"`` or ``"archived"``.
         """
         safe_q = self.sanitize_fts_query(query)
         if safe_q == '""':
             return []
 
+        # ── Active transcript search ──
         if session_id:
             sql = (
                 "SELECT t.id, t.session_key, t.role, t.created_at, "
@@ -7276,7 +7345,42 @@ class SessionStorage:
 
         async with self.conn.execute(sql, params) as cur:
             rows = await cur.fetchall()
-        return [dict(r) for r in rows]
+        results: list[dict[str, Any]] = [dict(r) for r in rows]
+        for r in results:
+            r["source"] = "active"
+
+        # ── Archived (compacted) transcript search ──
+        if include_archived and len(results) < limit:
+            remaining = limit - len(results)
+            if session_id:
+                arch_sql = (
+                    "SELECT c.id, c.session_key, c.role, c.created_at, "
+                    "snippet(compacted_transcript_fts, 0, '>>>', '<<<', '...', 48) AS snippet "
+                    "FROM compacted_transcript_fts f "
+                    "JOIN compacted_transcript_entries c ON f.rowid = c.id "
+                    "WHERE f.content MATCH ? AND c.session_id = ? "
+                    "ORDER BY f.rank LIMIT ?"
+                )
+                arch_params: list[Any] = [safe_q, session_id, remaining]
+            else:
+                arch_sql = (
+                    "SELECT c.id, c.session_key, c.role, c.created_at, "
+                    "snippet(compacted_transcript_fts, 0, '>>>', '<<<', '...', 48) AS snippet "
+                    "FROM compacted_transcript_fts f "
+                    "JOIN compacted_transcript_entries c ON f.rowid = c.id "
+                    "WHERE f.content MATCH ? "
+                    "ORDER BY f.rank LIMIT ?"
+                )
+                arch_params = [safe_q, remaining]
+
+            async with self.conn.execute(arch_sql, arch_params) as cur:
+                arch_rows = await cur.fetchall()
+            for r in arch_rows:
+                d = dict(r)
+                d["source"] = "archived"
+                results.append(d)
+
+        return results[:limit]
 
     @staticmethod
     def _like_escape(raw: str) -> str:
@@ -7361,6 +7465,8 @@ class SessionStorage:
         query: str,
         session_id: str | None = None,
         limit: int = 20,
+        *,
+        include_archived: bool = True,
     ) -> list[dict[str, Any]]:
         """Substring content search for queries the FTS tokenizer can't handle.
 
@@ -7370,15 +7476,19 @@ class SessionStorage:
         must appear in the content, so mixed/multi-word queries match all terms;
         cased non-ASCII scripts fold via ``py_lower`` (caseless CJK skips it for
         speed). The handler only reaches this for non-ASCII queries (ASCII stays
-        on the indexed FTS path). Returns the same shape as ``search_transcript``.
+        on the indexed FTS path). Returns the same shape as ``search_transcript``
+        including the ``source`` provenance key.
         """
         tokens = self._like_tokens(query)
         if not tokens:
             return []
         col = "py_lower(content)" if self._needs_unicode_fold(query) else "content"
         clauses = [f"{col} LIKE ? ESCAPE '\\'" for _ in tokens]
-        params: list[Any] = list(tokens)
+        first_term = query.split()[0]
+
+        # ── Active transcript ──
         where = " AND ".join(clauses)
+        params: list[Any] = list(tokens)
         if session_id:
             where += " AND session_id = ?"
             params.append(session_id)
@@ -7390,8 +7500,6 @@ class SessionStorage:
         )
         async with self.conn.execute(sql, params) as cur:
             rows = await cur.fetchall()
-        # Snippet highlights the first term; the others are guaranteed present too.
-        first_term = query.split()[0]
         out: list[dict[str, Any]] = []
         for r in rows:
             d = dict(r)
@@ -7402,9 +7510,40 @@ class SessionStorage:
                     "role": d.get("role"),
                     "created_at": d.get("created_at"),
                     "snippet": self._make_snippet(str(d.get("content") or ""), first_term),
+                    "source": "active",
                 }
             )
-        return out
+
+        # ── Archived (compacted) transcript ──
+        if include_archived and len(out) < limit:
+            remaining = limit - len(out)
+            arch_where = " AND ".join(clauses)
+            arch_params: list[Any] = list(tokens)
+            if session_id:
+                arch_where += " AND session_id = ?"
+                arch_params.append(session_id)
+            arch_params.append(remaining)
+            arch_sql = (
+                "SELECT id, session_key, role, content, created_at "
+                f"FROM compacted_transcript_entries WHERE {arch_where} "
+                "ORDER BY created_at DESC LIMIT ?"
+            )
+            async with self.conn.execute(arch_sql, arch_params) as cur:
+                arch_rows = await cur.fetchall()
+            for r in arch_rows:
+                d = dict(r)
+                out.append(
+                    {
+                        "id": d.get("id"),
+                        "session_key": d.get("session_key"),
+                        "role": d.get("role"),
+                        "created_at": d.get("created_at"),
+                        "snippet": self._make_snippet(str(d.get("content") or ""), first_term),
+                        "source": "archived",
+                    }
+                )
+
+        return out[:limit]
 
     async def __aenter__(self) -> SessionStorage:
         await self.connect()
