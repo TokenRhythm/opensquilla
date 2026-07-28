@@ -52,6 +52,7 @@ let desktopApp
 try {
   desktopApp = await electron.launch({ args: [fixtureRoot] })
   const page = await desktopApp.firstWindow({ timeout: 30_000 })
+  await page.waitForSelector('main')
   const platform = await desktopApp.evaluate(() => process.platform)
   const primaryModifier = platform === 'darwin' ? 'Meta' : 'Control'
   const zoomFactor = () => desktopApp.evaluate(({ BrowserWindow }) => (
@@ -66,9 +67,14 @@ try {
     assert.ok(Math.abs((await zoomFactor()) - expected) < 1e-6)
   }
   const pressShortcut = async key => {
-    await page.keyboard.down(primaryModifier)
-    await page.keyboard.press(key)
-    await page.keyboard.up(primaryModifier)
+    const keyCode = key === 'Equal' ? '=' : key === 'Minus' ? '-' : '0'
+    await desktopApp.evaluate(({ BrowserWindow }, input) => {
+      BrowserWindow.getAllWindows()[0]?.webContents.sendInputEvent(input)
+    }, {
+      type: 'keyDown',
+      keyCode,
+      modifiers: [primaryModifier === 'Meta' ? 'meta' : 'control'],
+    })
   }
 
   await pressShortcut('Equal')
