@@ -342,6 +342,37 @@ async def test_simple_text_with_done_event_fires_rollup() -> None:
 
 
 @pytest.mark.asyncio
+async def test_aggregated_usage_keeps_parent_message_token_count() -> None:
+    stage, recs = _make_stage()
+    done = DoneEvent(
+        text="parent answer",
+        input_tokens=1070,
+        output_tokens=207,
+        message_output_tokens=7,
+        cost_usd=0.57,
+        billed_cost=0.57,
+        cost_source="provider_billed",
+        missing_cost_entries=0,
+        model="fake/parent-model",
+    )
+
+    await stage.run(
+        _make_input(
+            final_text_parts=["parent answer"],
+            done_event=done,
+        )
+    )
+
+    transcript_call = recs["transcript_append"].calls[0]
+    assert transcript_call["token_count"] == 7
+    assert transcript_call["turn_usage"]["input_tokens"] == 1070
+    assert transcript_call["turn_usage"]["output_tokens"] == 207
+    assert transcript_call["turn_usage"]["cost_usd"] == pytest.approx(0.57)
+    assert transcript_call["turn_usage"]["missing_cost_entries"] == 0
+    assert recs["session_totals"].calls[0]["done_event"] is done
+
+
+@pytest.mark.asyncio
 async def test_turn_usage_persists_ensemble_breakdown_and_trace() -> None:
     stage, recs = _make_stage()
     done = DoneEvent(

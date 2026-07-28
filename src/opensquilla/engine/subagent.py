@@ -70,11 +70,32 @@ class SubagentUsage:
     estimate_basis: str | None = None
     model: str = ""
     provider: str = ""
+    missing_cost_entries: int = 0
+    model_usage_breakdown: tuple[dict[str, Any], ...] = ()
 
     @classmethod
     def from_done_event(cls, event: Any) -> SubagentUsage:
         """Build a snapshot from an engine DoneEvent (defensively coerced)."""
         estimate_basis = getattr(event, "estimate_basis", None)
+        cost_source = str(getattr(event, "cost_source", "") or "none")
+        model_usage_breakdown = getattr(event, "model_usage_breakdown", None)
+        missing_cost_entries = _usage_int(getattr(event, "missing_cost_entries", 0))
+        has_tokens = bool(
+            _usage_int(getattr(event, "input_tokens", 0))
+            or _usage_int(getattr(event, "output_tokens", 0))
+            or _usage_int(getattr(event, "cached_tokens", 0))
+            or _usage_int(getattr(event, "cache_write_tokens", 0))
+        )
+        if (
+            missing_cost_entries == 0
+            and cost_source.strip().lower() == "unavailable"
+            and estimate_basis != "free"
+            and has_tokens
+        ):
+            # Legacy child producers do not carry missing_cost_entries. Keep
+            # their unavailable, non-free usage visible instead of silently
+            # treating the unknown component as a complete zero-cost receipt.
+            missing_cost_entries = 1
         return cls(
             input_tokens=_usage_int(getattr(event, "input_tokens", 0)),
             output_tokens=_usage_int(getattr(event, "output_tokens", 0)),
@@ -83,10 +104,16 @@ class SubagentUsage:
             cache_write_tokens=_usage_int(getattr(event, "cache_write_tokens", 0)),
             cost_usd=_usage_float(getattr(event, "cost_usd", 0.0)),
             billed_cost=_usage_float(getattr(event, "billed_cost", 0.0)),
-            cost_source=str(getattr(event, "cost_source", "") or "none"),
+            cost_source=cost_source,
             estimate_basis=str(estimate_basis) if estimate_basis else None,
             model=str(getattr(event, "model", "") or ""),
             provider=str(getattr(event, "provider", "") or ""),
+            missing_cost_entries=missing_cost_entries,
+            model_usage_breakdown=(
+                tuple(dict(row) for row in model_usage_breakdown if isinstance(row, dict))
+                if isinstance(model_usage_breakdown, list)
+                else ()
+            ),
         )
 
     @property
@@ -99,6 +126,7 @@ class SubagentUsage:
             or self.cache_write_tokens
             or self.cost_usd
             or self.billed_cost
+            or self.missing_cost_entries
         )
 
 
@@ -121,8 +149,7 @@ class SubagentHandle:
     # report, though the durable ledger still holds its provider calls).
     usage: SubagentUsage | None = None
     # Set once the parent turn has folded this handle's usage into its
-    # reported totals, so a handle surviving into later turns is not
-    # double-counted.
+    # reported totals.
     usage_rolled_up: bool = False
 
 
@@ -179,8 +206,8 @@ class SubagentRegistry:
         """Return captured child usage not yet rolled into a parent turn.
 
         Marks each returned handle consumed so every child run is reported
-        by exactly one parent turn. Archived handles are included: archiving
-        moves a handle out of the active map without settling its usage.
+        at most once. Archived handles are included: archiving moves a handle
+        out of the active map without settling its usage.
         """
         drained: list[SubagentUsage] = []
         for handle in list(self._runs.values()) + list(self._archived.values()):
@@ -320,13 +347,23 @@ class SubagentManager:
             collected: list[str] = []
             terminal_text_present = False
             terminal_text = ""
-            async for event in child_agent.run_turn(spec.task):
-                if hasattr(event, "text") and event.kind == "text_delta":  # type: ignore[union-attr]
-                    collected.append(event.text)  # type: ignore[union-attr]
-                elif event.kind == "done":  # type: ignore[union-attr]
-                    terminal_usage.append(SubagentUsage.from_done_event(event))
-                    terminal_text_present, terminal_text = done_text_snapshot(event)
-                    break
+            stream = child_agent.run_turn(spec.task)
+            try:
+                async for event in stream:
+                    if hasattr(event, "text") and event.kind == "text_delta":  # type: ignore[union-attr]
+                        collected.append(event.text)  # type: ignore[union-attr]
+                    elif event.kind == "done":  # type: ignore[union-attr]
+                        terminal_usage.append(SubagentUsage.from_done_event(event))
+                        terminal_text_present, terminal_text = done_text_snapshot(event)
+                        break
+            finally:
+                close = getattr(stream, "aclose", None)
+                if callable(close):
+                    # Closing in the child task that iterated the stream keeps
+                    # Agent.run_turn's ContextVar token reset in its creation
+                    # context instead of deferring async-generator cleanup to
+                    # an unrelated event-loop finalizer task.
+                    await close()
             return terminal_text if terminal_text_present else "".join(collected)
 
         async def _run_with_timeout() -> str:

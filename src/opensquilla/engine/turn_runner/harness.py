@@ -1283,27 +1283,66 @@ class _TurnRunnerSessionTotalsAdapter(SessionTotalsPort):
             next_estimated_component = (
                 getattr(current_session, "estimated_cost_component_usd", 0.0) or 0.0
             )
-            if event_cost_source == "opensquilla_estimate":
-                next_estimated_component += done_event.cost_usd
-            elif event_cost_source == "mixed":
-                next_estimated_component += max(
-                    0.0,
-                    done_event.cost_usd - done_event.billed_cost,
-                )
+            event_estimated_component = max(
+                0.0,
+                done_event.cost_usd - done_event.billed_cost,
+            )
+            next_estimated_component += event_estimated_component
             next_missing_entries = (
                 getattr(current_session, "missing_cost_entries", 0) or 0
             )
-            if event_cost_source == "unavailable":
-                next_missing_entries += 1
+            event_missing_entries = max(
+                0,
+                int(getattr(done_event, "missing_cost_entries", 0) or 0),
+            )
+            if (
+                event_missing_entries == 0
+                and event_cost_source == "unavailable"
+                and getattr(done_event, "estimate_basis", None) != "free"
+            ):
+                # Compatibility for legacy DoneEvent producers.
+                event_missing_entries = 1
+            next_missing_entries += event_missing_entries
             current_cost_source = str(
                 getattr(current_session, "cost_source", "none") or "none"
             ).strip().lower()
-            provider_billed_entries = int(
-                current_cost_source in {"provider_billed", "mixed"}
-            ) + int(event_cost_source in {"provider_billed", "mixed"})
-            estimated_cost_entries = int(
-                current_cost_source in {"opensquilla_estimate", "mixed"}
-            ) + int(event_cost_source in {"opensquilla_estimate", "mixed"})
+            current_billed_cost = float(
+                getattr(current_session, "billed_cost_usd", 0.0) or 0.0
+            )
+            current_estimated_component = float(
+                getattr(current_session, "estimated_cost_component_usd", 0.0) or 0.0
+            )
+            current_missing_entries = int(
+                getattr(current_session, "missing_cost_entries", 0) or 0
+            )
+            current_has_billed = (
+                current_billed_cost > 0.0
+                or current_cost_source == "provider_billed"
+                or (
+                    current_cost_source == "mixed"
+                    and not (
+                        current_estimated_component > 0.0
+                        and current_missing_entries > 0
+                        and current_billed_cost <= 0.0
+                    )
+                )
+            )
+            event_has_billed = (
+                done_event.billed_cost > 0.0
+                or event_cost_source == "provider_billed"
+                or (
+                    event_cost_source == "mixed"
+                    and not (
+                        event_estimated_component > 0.0
+                        and event_missing_entries > 0
+                        and done_event.billed_cost <= 0.0
+                    )
+                )
+            )
+            provider_billed_entries = int(current_has_billed) + int(event_has_billed)
+            estimated_cost_entries = int(current_estimated_component > 0.0) + int(
+                event_estimated_component > 0.0
+            )
             next_cost_source = rollup_cost_source(
                 billed_cost_usd=next_billed_cost,
                 estimated_cost_component_usd=next_estimated_component,

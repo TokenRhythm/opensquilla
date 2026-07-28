@@ -7,11 +7,12 @@ from typing import Any
 
 import pytest
 
-from opensquilla.engine import Agent, AgentConfig, SubagentSpec
+from opensquilla.engine import Agent, AgentConfig, SubagentSpec, ToolResult
 from opensquilla.engine.outcome import outcome_from_error
 from opensquilla.engine.pricing import PriceEntry, ResolvedModelPrice
 from opensquilla.engine.runtime import TurnRunner, _SelectorFallbackProvider
-from opensquilla.engine.types import ErrorEvent
+from opensquilla.engine.types import DoneEvent as EngineDoneEvent
+from opensquilla.engine.types import ErrorEvent, ToolCall
 from opensquilla.engine.usage_accounting import (
     UsageAccountingScope,
     UsageAccountingUnavailableError,
@@ -28,6 +29,10 @@ from opensquilla.provider import (
     Message,
     ModelCapabilities,
     ProviderRequestCorrelation,
+    ToolDefinition,
+    ToolInputSchema,
+    ToolUseEndEvent,
+    ToolUseStartEvent,
 )
 from opensquilla.provider import DoneEvent as ProviderDone
 from opensquilla.provider import ErrorEvent as ProviderError
@@ -177,6 +182,66 @@ class _SequenceProvider:
     async def _stream(self, events: list[Any]) -> AsyncIterator[Any]:
         for event in events:
             yield event
+
+
+class _ParentChildSequenceProvider:
+    """Three physical calls: parent tool leg, child leg, parent final leg."""
+
+    provider_name = "fake"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        del messages, tools, config
+        self.calls += 1
+        return self._stream(self.calls)
+
+    async def _stream(self, call: int) -> AsyncIterator[Any]:
+        if call == 1:
+            yield ToolUseStartEvent(tool_use_id="spawn-1", tool_name="spawn_helper")
+            yield ToolUseEndEvent(
+                tool_use_id="spawn-1",
+                tool_name="spawn_helper",
+                arguments={},
+            )
+            yield ProviderDone(
+                stop_reason="tool_use",
+                input_tokens=30,
+                output_tokens=3,
+                billed_cost=0.03,
+                cost_source="provider_billed",
+                provider="fake",
+                model="parent-model",
+            )
+            return
+        if call == 2:
+            yield ProviderText(text="child result")
+            yield ProviderDone(
+                stop_reason="end_turn",
+                input_tokens=1000,
+                output_tokens=200,
+                billed_cost=0.5,
+                cost_source="provider_billed",
+                provider="fake",
+                model="child-model",
+            )
+            return
+        yield ProviderText(text="parent answer")
+        yield ProviderDone(
+            stop_reason="end_turn",
+            input_tokens=40,
+            output_tokens=4,
+            billed_cost=0.04,
+            cost_source="provider_billed",
+            provider="fake",
+            model="parent-model",
+        )
 
 
 class _PhysicalLegProvider(_SequenceProvider):
@@ -1006,6 +1071,84 @@ def test_runtime_subagent_inherits_sink_with_distinct_execution() -> None:
     assert child_context.session_id == "session-1"
     assert child_context.session_epoch == 7
     assert child_context.run_kind == "subagent"
+
+
+@pytest.mark.asyncio
+async def test_real_subagent_rollup_preserves_three_physical_ledger_calls() -> None:
+    sink = _RecordingSink()
+    provider = _ParentChildSequenceProvider()
+    loop = asyncio.get_running_loop()
+    unhandled: list[dict[str, Any]] = []
+    previous_handler = loop.get_exception_handler()
+    agent: Agent | None = None
+
+    async def tool_handler(call: ToolCall) -> ToolResult:
+        assert agent is not None
+        run_id = await agent.spawn_subagent(
+            SubagentSpec(task="child task", timeout=0, max_iterations=1)
+        )
+        handle = agent.subagent_manager.registry.get(run_id)
+        assert handle is not None
+        await handle.task
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="child finished",
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=3,
+            provider_id="fake",
+            model_id="parent-model",
+        ),
+        tool_definitions=[
+            ToolDefinition(
+                name="spawn_helper",
+                description="spawn a helper",
+                input_schema=ToolInputSchema(properties={}, required=[]),
+            )
+        ],
+        tool_handler=tool_handler,
+        usage_event_sink=sink,
+        usage_execution_context=UsageExecutionContext(
+            execution_id="parent-turn",
+            agent_run_id="parent-run",
+            turn_id="parent-turn",
+            session_id="session-1",
+            session_epoch=7,
+            agent_id="main",
+            run_kind="agent",
+        ),
+    )
+
+    loop.set_exception_handler(lambda _loop, context: unhandled.append(dict(context)))
+    try:
+        events = [event async for event in agent.run_turn("delegate this")]
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    done = next(event for event in events if isinstance(event, EngineDoneEvent))
+    assert done.input_tokens == 1070
+    assert done.output_tokens == 207
+    assert done.message_output_tokens == 7
+    assert done.cost_usd == pytest.approx(0.57)
+    assert done.billed_cost == pytest.approx(0.57)
+    assert [call.run_kind for call in sink.started] == ["agent", "subagent", "agent"]
+    assert [call.run_kind for call, _result in sink.finalized] == [
+        "agent",
+        "subagent",
+        "agent",
+    ]
+    assert len(sink.started) == len(sink.finalized) == 3
+    assert sum(result.billed_cost_nanos for _call, result in sink.finalized) == (
+        usd_to_nanos("0.57")
+    )
+    assert sink.unknown == []
+    assert unhandled == []
 
 
 @pytest.mark.asyncio

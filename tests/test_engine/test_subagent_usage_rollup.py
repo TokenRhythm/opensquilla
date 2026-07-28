@@ -8,15 +8,14 @@ loop, so per-turn cost systematically under-reported delegated work.
 
 Boundary notes:
 
-- The rollup only changes the parent's terminal ``DoneEvent`` (and the
-  ``turn_usage`` payload the TurnFinalizerStage derives from it). It
-  must NOT re-feed child usage into the parent session's
-  ``UsageTracker`` — child provider calls are already recorded at call
-  time by the durable usage ledger (``run_kind="subagent"``), and the
-  tracker-based session snapshot remains the parent-only view.
-- Each handle's captured usage is drained exactly once, so a child that
-  settles during a later turn rolls into that turn instead of being
-  double-counted across turns.
+- Only child runs completed before the parent terminal event are rolled
+  into that event.
+- The parent delta is captured first, then completed child rows are added
+  to the in-memory UsageTracker without writing another durable ledger
+  event. This preserves cumulative session snapshots without counting
+  the child twice in the current turn.
+- A late child remains ledger-only. Production creates a new manager for
+  the next turn, so late usage must never drift into a different turn.
 """
 
 from __future__ import annotations
@@ -66,6 +65,17 @@ class _HangingChildAgent:
         await asyncio.Event().wait()
 
 
+class _GatedChildAgent:
+    """Child that finishes only after the parent turn has already ended."""
+
+    def __init__(self, gate: asyncio.Event) -> None:
+        self._gate = gate
+
+    async def run_turn(self, _task: str) -> AsyncIterator[AgentEvent]:
+        await self._gate.wait()
+        yield _child_done()
+
+
 def _child_done(
     *,
     input_tokens: int = 1000,
@@ -76,7 +86,11 @@ def _child_done(
     cost_usd: float = 0.5,
     billed_cost: float = 0.5,
     cost_source: str = "provider_billed",
-    model: str = "child/model",
+    estimate_basis: str | None = None,
+    missing_cost_entries: int = 0,
+    model: str = "deepseek/deepseek-v4-pro",
+    provider: str = "openai",
+    model_usage_breakdown: list[dict[str, Any]] | None = None,
 ) -> EngineDoneEvent:
     return EngineDoneEvent(
         text="child result",
@@ -89,7 +103,11 @@ def _child_done(
         cost_usd=cost_usd,
         billed_cost=billed_cost,
         cost_source=cost_source,
+        estimate_basis=estimate_basis,
+        missing_cost_entries=missing_cost_entries,
         model=model,
+        provider=provider,
+        model_usage_breakdown=model_usage_breakdown or [],
     )
 
 
@@ -203,12 +221,20 @@ async def test_single_subagent_usage_rolls_into_parent_turn() -> None:
 
     assert done.input_tokens == 70 + 1000
     assert done.output_tokens == 7 + 200
+    assert done.message_output_tokens == 7
     assert done.reasoning_tokens == 7
     assert done.cached_tokens == 50
     assert done.cache_write_tokens == 25
     assert done.billed_cost == pytest.approx(0.07 + 0.5)
     assert done.cost_usd == pytest.approx(0.07 + 0.5)
     assert done.cost_source == "provider_billed"
+    assert {row["model"] for row in done.model_usage_breakdown} == {
+        "fake/parent-model",
+        "deepseek/deepseek-v4-pro",
+    }
+    assert sum(row["cost_usd"] for row in done.model_usage_breakdown) == pytest.approx(
+        0.57
+    )
 
     payload = _turn_usage_payload(done, resolved_model="fake/parent-model")
     assert payload is not None
@@ -303,30 +329,8 @@ async def test_aborted_subagent_without_terminal_usage_contributes_nothing() -> 
     assert done.cost_usd == pytest.approx(0.07)
 
 
-async def test_subagent_usage_drains_exactly_once_across_turns() -> None:
-    """A child rolled into one turn must not be re-counted by later turns."""
-
-    manager = SubagentManager()
-
-    async def spawn_action(inner: SubagentManager) -> None:
-        await _spawn_and_wait(inner, [_child_done()])
-
-    first = await _run_parent_turn(manager, spawn_action)
-    assert first.input_tokens == 1070
-
-    async def no_spawn(_inner: SubagentManager) -> None:
-        return None
-
-    second = await _run_parent_turn(manager, no_spawn)
-    assert second.input_tokens == 70
-    assert second.output_tokens == 7
-    assert second.billed_cost == pytest.approx(0.07)
-
-
-async def test_rollup_does_not_feed_child_usage_into_session_tracker() -> None:
-    """The tracker (usage.status / session snapshot view) stays parent-only;
-    the durable ledger already accounts child provider calls at call time, so
-    re-adding the rollup there would double-count."""
+async def test_new_manager_next_turn_keeps_child_only_in_cumulative_snapshot() -> None:
+    """Production creates a new manager per turn while reusing the tracker."""
 
     tracker = UsageTracker()
     session_key = "agent:test:webchat:subagent-rollup"
@@ -334,21 +338,41 @@ async def test_rollup_does_not_feed_child_usage_into_session_tracker() -> None:
     async def spawn_action(manager: SubagentManager) -> None:
         await _spawn_and_wait(manager, [_child_done()])
 
-    done = await _run_parent_turn(
+    first = await _run_parent_turn(
         SubagentManager(),
         spawn_action,
         usage_tracker=tracker,
         session_key=session_key,
     )
 
-    assert done.input_tokens == 1070
-    assert done.billed_cost == pytest.approx(0.57)
-
+    assert first.input_tokens == 1070
+    assert first.output_tokens == 207
+    assert first.billed_cost == pytest.approx(0.57)
+    assert first.session_totals is not None
+    assert first.session_totals.input_tokens == 1070
+    assert first.session_totals.output_tokens == 207
+    assert first.session_totals.cost_usd == pytest.approx(0.57)
     session_usage = tracker.get(session_key)
     assert session_usage is not None
-    assert session_usage.input_tokens == 70
-    assert session_usage.output_tokens == 7
-    assert session_usage.billed_cost == pytest.approx(0.07)
+    assert session_usage.model_id == "fake/parent-model"
+
+    async def no_spawn(_manager: SubagentManager) -> None:
+        return None
+
+    second = await _run_parent_turn(
+        SubagentManager(),
+        no_spawn,
+        usage_tracker=tracker,
+        session_key=session_key,
+    )
+
+    assert second.input_tokens == 70
+    assert second.output_tokens == 7
+    assert second.billed_cost == pytest.approx(0.07)
+    assert second.session_totals is not None
+    assert second.session_totals.input_tokens == 1140
+    assert second.session_totals.output_tokens == 214
+    assert second.session_totals.cost_usd == pytest.approx(0.64)
 
 
 async def test_child_estimate_mixes_with_parent_billed_cost_source() -> None:
@@ -369,6 +393,187 @@ async def test_child_estimate_mixes_with_parent_billed_cost_source() -> None:
     assert done.billed_cost == pytest.approx(0.07)
     assert done.cost_usd == pytest.approx(0.07 + 0.5)
     assert done.cost_source == "mixed"
+    assert done.missing_cost_entries == 0
+
+
+@pytest.mark.parametrize(
+    ("children", "expected_cost", "expected_billed", "expected_source", "expected_missing"),
+    [
+        ([_child_done()], 0.57, 0.57, "provider_billed", 0),
+        (
+            [
+                _child_done(
+                    cost_usd=0.5,
+                    billed_cost=0.0,
+                    cost_source="opensquilla_static_estimate",
+                    estimate_basis="cache_aware",
+                )
+            ],
+            0.57,
+            0.07,
+            "mixed",
+            0,
+        ),
+        (
+            [
+                _child_done(
+                    cost_usd=0.0,
+                    billed_cost=0.0,
+                    cost_source="unavailable",
+                    missing_cost_entries=1,
+                )
+            ],
+            0.07,
+            0.07,
+            "mixed",
+            1,
+        ),
+        (
+            [
+                _child_done(
+                    cost_usd=0.0,
+                    billed_cost=0.0,
+                    cost_source="unavailable",
+                    estimate_basis="free",
+                )
+            ],
+            0.07,
+            0.07,
+            "provider_billed",
+            0,
+        ),
+        (
+            [
+                _child_done(
+                    cost_usd=0.5,
+                    billed_cost=0.0,
+                    cost_source="opensquilla_static_estimate",
+                    estimate_basis="cache_aware",
+                ),
+                _child_done(
+                    cost_usd=0.0,
+                    billed_cost=0.0,
+                    cost_source="unavailable",
+                    missing_cost_entries=1,
+                ),
+            ],
+            0.57,
+            0.07,
+            "mixed",
+            1,
+        ),
+    ],
+)
+async def test_cost_provenance_matrix(
+    children: list[EngineDoneEvent],
+    expected_cost: float,
+    expected_billed: float,
+    expected_source: str,
+    expected_missing: int,
+) -> None:
+    async def spawn_action(manager: SubagentManager) -> None:
+        for child in children:
+            await _spawn_and_wait(manager, [child])
+
+    done = await _run_parent_turn(SubagentManager(), spawn_action)
+
+    assert done.cost_usd == pytest.approx(expected_cost)
+    assert done.billed_cost == pytest.approx(expected_billed)
+    assert done.cost_source == expected_source
+    assert done.missing_cost_entries == expected_missing
+    if any(child.estimate_basis not in {None, "free"} for child in children):
+        assert done.estimate_basis != "free"
+
+
+async def test_cancel_before_terminal_delivery_does_not_consume_child_usage() -> None:
+    manager = SubagentManager()
+
+    async def spawn_action(inner: SubagentManager) -> None:
+        await _spawn_and_wait(inner, [_child_done()])
+
+    async def tool_handler(call: ToolCall) -> ToolResult:
+        await spawn_action(manager)
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="helper finished",
+        )
+
+    agent = Agent(
+        provider=_SpawningToolProvider(),
+        config=AgentConfig(max_iterations=3),
+        tool_definitions=[_SPAWN_TOOL],
+        tool_handler=tool_handler,
+        subagent_manager=manager,
+    )
+    stream = agent.run_turn("delegate this")
+    async for event in stream:
+        if event.kind == "state_change" and event.to_state.value == "done":
+            break
+    await stream.aclose()
+
+    handle = manager.registry.all_handles()[0]
+    assert handle.usage is not None
+    assert handle.usage_rolled_up is False
+    assert manager.drain_completed_usage() == [handle.usage]
+    assert manager.drain_completed_usage() == []
+
+
+async def test_successful_done_delivery_consumes_child_usage_once() -> None:
+    manager = SubagentManager()
+
+    async def spawn_action(inner: SubagentManager) -> None:
+        await _spawn_and_wait(inner, [_child_done()])
+
+    done = await _run_parent_turn(manager, spawn_action)
+
+    assert done.cost_usd == pytest.approx(0.57)
+    handle = manager.registry.all_handles()[0]
+    assert handle.usage_rolled_up is True
+    assert manager.drain_completed_usage() == []
+
+
+async def test_late_child_stays_out_of_parent_and_next_turn() -> None:
+    tracker = UsageTracker()
+    session_key = "agent:test:webchat:late-child"
+    gate = asyncio.Event()
+    late_handle = None
+
+    async def spawn_late(manager: SubagentManager) -> None:
+        nonlocal late_handle
+        late_handle = await manager.spawn(
+            SubagentSpec(task="late child", timeout=0),
+            lambda _spec, _depth: _GatedChildAgent(gate),
+        )
+
+    first = await _run_parent_turn(
+        SubagentManager(),
+        spawn_late,
+        usage_tracker=tracker,
+        session_key=session_key,
+    )
+    assert first.cost_usd == pytest.approx(0.07)
+    assert first.input_tokens == 70
+    assert first.session_totals is not None
+    assert first.session_totals.cost_usd == pytest.approx(0.07)
+
+    gate.set()
+    assert late_handle is not None
+    await late_handle.task
+
+    async def no_spawn(_manager: SubagentManager) -> None:
+        return None
+
+    second = await _run_parent_turn(
+        SubagentManager(),
+        no_spawn,
+        usage_tracker=tracker,
+        session_key=session_key,
+    )
+    assert second.cost_usd == pytest.approx(0.07)
+    assert second.input_tokens == 70
+    assert second.session_totals is not None
+    assert second.session_totals.cost_usd == pytest.approx(0.14)
 
 
 async def test_handle_captures_child_done_usage_snapshot() -> None:
@@ -390,4 +595,4 @@ async def test_handle_captures_child_done_usage_snapshot() -> None:
     assert handle.usage.cost_usd == pytest.approx(0.5)
     assert handle.usage.billed_cost == pytest.approx(0.5)
     assert handle.usage.cost_source == "provider_billed"
-    assert handle.usage.model == "child/model"
+    assert handle.usage.model == "deepseek/deepseek-v4-pro"

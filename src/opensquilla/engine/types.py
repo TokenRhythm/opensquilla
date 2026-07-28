@@ -220,6 +220,11 @@ class DoneEvent:
     # Configured registry identity that served the terminal model response.
     # Appended for compatibility with existing positional construction.
     provider: str = ""
+    # Historical output-token count for the parent assistant message itself.
+    # Aggregated output_tokens may also include completed in-process subagents.
+    message_output_tokens: int | None = None
+    # Number of non-free usage components whose cost could not be determined.
+    missing_cost_entries: int = 0
 
     @property
     def upstream_cost_usd(self) -> float:
