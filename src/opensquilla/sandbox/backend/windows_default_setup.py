@@ -216,13 +216,11 @@ def run_elevated_setup_helper(path: Path) -> None:
     except FileNotFoundError:
         pass
     payload = _encode_setup_helper_payload(path, user_sid=_current_windows_user_sid())
+    helper_args = ["--elevated-helper", payload]
+    if not getattr(sys, "frozen", False):
+        helper_args = ["-m", "opensquilla.sandbox.backend.windows_default_setup", *helper_args]
     parameters = subprocess.list2cmdline(
-        [
-            "-m",
-            "opensquilla.sandbox.backend.windows_default_setup",
-            "--elevated-helper",
-            payload,
-        ]
+        helper_args
     )
     exit_code = _shell_execute_runas_and_wait(
         executable=sys.executable,
