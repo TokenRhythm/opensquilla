@@ -90,7 +90,7 @@ configured_state = [
 assert len(configured_state) == 1, report
 assert Path(configured_state[0]["path"]).resolve() == home / "state", report
 PY
-python "${probe}" verify-runtime --home "${profile}" --label "${label}"
+python "${probe}" verify --home "${profile}" --label "${label}"
 
 python - "${install_root}/OpenSquilla.app" "${install_root}/OpenSquilla.rc3.app" <<'PY'
 import shutil
@@ -101,4 +101,4 @@ for app_path in sys.argv[1:]:
 PY
 test ! -e "${install_root}/OpenSquilla.app"
 test ! -e "${install_root}/OpenSquilla.rc3.app"
-python "${probe}" verify-runtime --home "${profile}" --label "${label}"
+python "${probe}" verify --home "${profile}" --label "${label}"
