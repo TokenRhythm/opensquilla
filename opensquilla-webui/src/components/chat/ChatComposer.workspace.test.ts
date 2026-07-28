@@ -99,7 +99,7 @@ describe('ChatComposer project draft', () => {
     app.unmount()
   })
 
-  it('keeps a durable project chip visible without a close control', async () => {
+  it('hides the project chip after the draft becomes a durable task', async () => {
     const host = document.createElement('div')
     document.body.appendChild(host)
     const app = createApp(ChatComposer, composerProps({
@@ -110,8 +110,7 @@ describe('ChatComposer project draft', () => {
     app.mount(host)
     await nextTick()
 
-    expect(host.querySelector('.chat-project-chip__name')?.textContent).toBe('Project A')
-    expect(host.querySelector('.chat-project-chip button')).toBeNull()
+    expect(host.querySelector('.chat-project-chip')).toBeNull()
 
     app.unmount()
   })

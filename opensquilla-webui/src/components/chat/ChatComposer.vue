@@ -28,7 +28,7 @@
       </div>
       <div class="chat-input-panel">
         <div
-          v-if="projectWorkspace"
+          v-if="projectWorkspace && isNewLanding"
           class="chat-project-chip"
           :data-status="projectWorkspaceStatus || 'ready'"
           :title="projectWorkspace.path"
