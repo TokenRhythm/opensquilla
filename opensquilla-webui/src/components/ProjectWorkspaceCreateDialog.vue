@@ -45,7 +45,7 @@
           <button
             type="button"
             class="project-create__source-picker"
-            :disabled="busy"
+            :disabled="busy || sourcePicking"
             @click="emit('choose-source')"
           >
             <Icon name="folder" :size="21" />
@@ -81,6 +81,7 @@ const props = defineProps<{
   name: string
   sourcePath: string
   busy: boolean
+  sourcePicking?: boolean
 }>()
 const emit = defineEmits<{
   close: []
@@ -97,7 +98,10 @@ const sourceName = computed(() => {
   return normalized.split(/[\\/]/).pop() || normalized
 })
 const canCreate = computed(() =>
-  !props.busy && Boolean(props.name.trim()) && Boolean(props.sourcePath.trim()),
+  !props.busy
+  && !props.sourcePicking
+  && Boolean(props.name.trim())
+  && Boolean(props.sourcePath.trim()),
 )
 
 function updateName(event: Event) {
@@ -185,10 +189,10 @@ useDialogA11y(dialogRef, computed(() => props.open), close, {
 
 .project-create__input-wrap:focus-within {
   border-color: var(--accent);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 14%, transparent);
+  box-shadow: none;
 }
 
-.project-create__input-wrap input {
+.project-create__input-wrap input:not([type="radio"]):not([type="checkbox"]) {
   width: 100%;
   min-width: 0;
   min-height: 40px;
@@ -196,6 +200,13 @@ useDialogA11y(dialogRef, computed(() => props.open), close, {
   border: 0;
   outline: 0;
   background: transparent;
+  box-shadow: none;
+}
+
+.project-create__input-wrap input:not([type="radio"]):not([type="checkbox"]):focus {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
 }
 
 .project-create__source {
@@ -209,14 +220,14 @@ useDialogA11y(dialogRef, computed(() => props.open), close, {
 }
 
 .project-create__source-picker {
-  min-height: 98px;
+  min-height: 82px;
   display: flex;
   align-items: center;
   justify-content: center;
   gap: var(--sp-3);
   padding: 16px;
   border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-md);
   background: var(--bg);
   color: var(--text-muted);
   cursor: pointer;
@@ -225,9 +236,11 @@ useDialogA11y(dialogRef, computed(() => props.open), close, {
 
 .project-create__source-picker:not(:disabled):hover,
 .project-create__source-picker:not(:disabled):focus-visible {
-  border-color: color-mix(in srgb, var(--accent) 44%, var(--border));
+  border-color: var(--border-strong);
   background: var(--bg-hover);
   color: var(--text);
+  outline: none;
+  box-shadow: none;
 }
 
 .project-create__source-picker:disabled {

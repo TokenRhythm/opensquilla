@@ -26,7 +26,12 @@ function i18n() {
   })
 }
 
-async function mountDialog(options: { name?: string; sourcePath?: string; busy?: boolean } = {}) {
+async function mountDialog(options: {
+  name?: string
+  sourcePath?: string
+  busy?: boolean
+  sourcePicking?: boolean
+} = {}) {
   const host = document.createElement('div')
   document.body.appendChild(host)
   const name = ref(options.name || '')
@@ -38,6 +43,7 @@ async function mountDialog(options: { name?: string; sourcePath?: string; busy?:
     name: name.value,
     sourcePath: options.sourcePath || '',
     busy: options.busy || false,
+    sourcePicking: options.sourcePicking || false,
     'onUpdate:name': (value: string) => { name.value = value },
     onChooseSource: chooseSource,
     onCreate: create,
@@ -86,5 +92,27 @@ describe('ProjectWorkspaceCreateDialog', () => {
       .find(button => button.textContent?.trim() === 'Create project')
 
     expect(create?.disabled).toBe(true)
+  })
+
+  it('prevents duplicate folder picks and creation while the system picker is open', async () => {
+    const events = await mountDialog({
+      name: 'Demo',
+      sourcePath: '/repos/demo',
+      sourcePicking: true,
+    })
+    const dialog = document.body.querySelector<HTMLElement>('[role="dialog"]')
+    const source = dialog?.querySelector<HTMLButtonElement>('.project-create__source-picker')
+    const create = Array.from(dialog?.querySelectorAll<HTMLButtonElement>('button') || [])
+      .find(button => button.textContent?.trim() === 'Create project')
+
+    expect(source?.disabled).toBe(true)
+    expect(create?.disabled).toBe(true)
+
+    source?.click()
+    create?.click()
+    await nextTick()
+
+    expect(events.chooseSource).not.toHaveBeenCalled()
+    expect(events.create).not.toHaveBeenCalled()
   })
 })
