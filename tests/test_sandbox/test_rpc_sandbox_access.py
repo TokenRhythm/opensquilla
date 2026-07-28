@@ -1835,10 +1835,10 @@ async def test_rpc_sandbox_path_pick_uses_permission_based_workspace_selection(
         _ctx(manager),
     )
 
-    assert result == {
-        "path": str(Path("/etc/shadow").resolve(strict=False)),
-        "kind": "workspace",
-    }
+    expected_path = (
+        "/etc/shadow" if os.name == "nt" else str(Path("/etc/shadow").resolve(strict=False))
+    )
+    assert result == {"path": expected_path, "kind": "workspace"}
 
 
 @pytest.mark.asyncio
