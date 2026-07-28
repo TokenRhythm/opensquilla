@@ -281,6 +281,38 @@ def test_run_elevated_setup_helper_launches_python_module_with_runas(
     assert (Path(launched["directory"]) / "opensquilla").exists()
 
 
+def test_run_elevated_setup_helper_launches_frozen_helper_without_python_module(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+
+    launched = {}
+    marker = tmp_path / "setup_marker.json"
+
+    monkeypatch.setattr(
+        mod.sys,
+        "executable",
+        r"C:\Program Files\OpenSquilla\opensquilla-gateway.exe",
+    )
+    monkeypatch.setattr(mod.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(mod, "_current_windows_user_sid", lambda: "S-1-real")
+
+    def fake_runas(*, executable, parameters, directory):
+        launched["executable"] = executable
+        launched["parameters"] = parameters
+        launched["directory"] = directory
+        return 0
+
+    monkeypatch.setattr(mod, "_shell_execute_runas_and_wait", fake_runas)
+
+    mod.run_elevated_setup_helper(marker)
+
+    assert launched["executable"].endswith("opensquilla-gateway.exe")
+    assert launched["parameters"].startswith("--elevated-helper ")
+    assert "-m" not in launched["parameters"]
+
+
 def test_runas_setup_helper_uses_hidden_window() -> None:
     from opensquilla.sandbox.backend import windows_default_setup as mod
 

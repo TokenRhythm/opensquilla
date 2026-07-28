@@ -1835,7 +1835,10 @@ async def test_rpc_sandbox_path_pick_uses_permission_based_workspace_selection(
         _ctx(manager),
     )
 
-    assert result == {"path": "/etc/shadow", "kind": "workspace"}
+    expected_path = (
+        "/etc/shadow" if os.name == "nt" else str(Path("/etc/shadow").resolve(strict=False))
+    )
+    assert result == {"path": expected_path, "kind": "workspace"}
 
 
 @pytest.mark.asyncio
@@ -1957,13 +1960,67 @@ def test_native_macos_picker_returns_path_and_passes_initial_directory_as_argume
 
     assert result == "/Volumes/workspace/My Project/"
     command, kwargs = run_calls[0]
-    assert command[:2] == ["osascript", "-e"]
+    assert command[:4] == ["osascript", "-l", "JavaScript", "-e"]
     assert command[-1] == "/Volumes/workspace"
     assert kwargs == {
         "capture_output": True,
         "check": False,
         "text": True,
     }
+
+
+def test_native_macos_picker_allows_creating_directories(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.gateway.rpc_sandbox as rpc_sandbox
+
+    run_calls = []
+
+    def fake_run(command, **kwargs):
+        run_calls.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            returncode=0,
+            stdout="/Volumes/workspace/New Project\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    rpc_sandbox._pick_directory_path_macos("/Volumes/workspace")
+
+    script = run_calls[0][4]
+    assert "NSOpenPanel.openPanel" in script
+    assert "canChooseFiles = false" in script
+    assert "canChooseDirectories = true" in script
+    assert "canCreateDirectories = true" in script
+
+
+def test_native_macos_picker_does_not_override_system_localized_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.gateway.rpc_sandbox as rpc_sandbox
+
+    run_calls = []
+
+    def fake_run(command, **kwargs):
+        run_calls.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            returncode=0,
+            stdout="/Volumes/workspace/项目\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    rpc_sandbox._pick_directory_path_macos("/Volumes/workspace")
+
+    command = run_calls[0]
+    script = command[4]
+    assert "Choose a project folder" not in command
+    assert "panel.message" not in script
+    assert "panel.prompt = panel.title" in script
 
 
 def test_native_macos_picker_treats_user_cancellation_as_no_selection(

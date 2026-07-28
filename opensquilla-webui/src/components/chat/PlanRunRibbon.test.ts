@@ -493,6 +493,12 @@ describe('PlanRunRibbon', () => {
     expect(host.querySelector('.plan-run__static-status')?.textContent.trim()).toBe('1/3')
   })
 
+  it('centers terminal summaries within the fixed-width execution ribbon', () => {
+    expect(planRunRibbonSource).toContain(
+      '.plan-run__static {\n  margin-inline: auto;\n}',
+    )
+  })
+
   it('counts completed and skipped todos in the completed summary', async () => {
     const host = mountRibbon(run({
       status: 'completed',

@@ -541,6 +541,10 @@ function stepStatusLabel(status: PlanRunStepStatus): string {
     box-shadow var(--dur-fast) var(--ease-standard);
 }
 
+.plan-run__static {
+  margin-inline: auto;
+}
+
 .plan-run__summary::before {
   position: absolute;
   inset: -4px 0;
