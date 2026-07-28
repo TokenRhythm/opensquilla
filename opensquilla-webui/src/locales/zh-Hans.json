@@ -857,7 +857,7 @@
       "modeRecommended": "跟随当前服务商分层",
       "modeDisabled": "关",
       "routingDisabledHint": "开启 AI 智能单模型路由后可编辑模型分层。",
-      "routingEnsembleReadOnlyHint": "当前已启用 AI 智能聚合路由，普通模型分层设置暂不生效。",
+      "routingEnsembleReadOnlyHint": "当前已启用 AI 智能融合路由，普通模型分层设置暂不生效。",
       "defaultTextModel": "默认模型分层",
       "panelLabel": "模型分层表",
       "panelDesc": "分层表中的模型会通过各行的服务商发送，因此每个服务商都使用相同的路由表结构。",
@@ -874,9 +874,9 @@
       "save": "保存路由",
       "chooseProviderFirst": "请先选择服务商",
       "summaryDisabled": "关",
-      "summaryEnsemble": "AI 智能聚合路由",
-      "ensembleProfileTitle": "AI 智能聚合路由",
-      "ensembleProfileDesc": "模型分层表会为 AI 智能聚合路由提供候选模型。",
+      "summaryEnsemble": "AI 智能融合路由",
+      "ensembleProfileTitle": "AI 智能融合路由",
+      "ensembleProfileDesc": "模型分层表会为 AI 智能融合路由提供候选模型。",
       "visualMode": {
         "real_candidates": "真实路由候选",
         "legacy_grid": "三层可视化面板"
@@ -891,8 +891,8 @@
       }
     },
     "ensemble": {
-      "statusOn": "AI 智能聚合路由已开启——多个模型作答，由一个模型整合最终回复。",
-      "statusOff": "AI 智能聚合路由已关闭。",
+      "statusOn": "AI 智能融合路由已开启——多个模型作答，由一个模型整合最终回复。",
+      "statusOff": "AI 智能融合路由已关闭。",
       "allFailedFallback": "回退到单一模型",
       "allFailedError": "停止并报告错误"
     },
@@ -3176,7 +3176,7 @@
       "modelRoutingOffDesc": "每轮都发送到当前选定模型。",
       "modelRoutingSquillaRouter": "AI 智能单模型路由",
       "modelRoutingSquillaRouterDesc": "由 AI 为每轮智能选择一个合适模型，优先降低成本。",
-      "modelRoutingEnsemble": "AI 智能聚合路由",
+      "modelRoutingEnsemble": "AI 智能融合路由",
       "modelRoutingEnsembleDesc": "由 AI 协调多个模型协同生成，优先提升复杂任务能力。",
       "runMode": "执行模式",
       "runModeStandard": "每次询问",
