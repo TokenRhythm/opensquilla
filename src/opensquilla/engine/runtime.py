@@ -3963,7 +3963,10 @@ class TurnRunner:
                 fallback_error_message=str(exc) or "Agent error",
             )
             if isinstance(exc, UsageAccountingUnavailableError):
-                event_code = UsageAccountingUnavailableError.code
+                event_code = str(
+                    getattr(exc, "code", UsageAccountingUnavailableError.code)
+                    or UsageAccountingUnavailableError.code
+                )
                 error_code = event_code
                 error_message = str(exc) or (
                     "Usage accounting is temporarily unavailable; retry the turn."

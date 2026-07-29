@@ -57,6 +57,50 @@ function summary(source: UsageTotals, selectedCurrency: 'USD' | 'CNY') {
 }
 
 describe('usage total native billing presentation', () => {
+  it('reactively converts mixed billing totals when the display currency changes', () => {
+    const source = totals({
+      cost: 3,
+      billedCost: 2,
+      estimatedCost: 1,
+      costSource: 'mixed',
+      costSourceCounts: { provider_billed: 2, opensquilla_estimate: 1 },
+      nativeBilledByCurrency: {
+        ...cnyReceipt(),
+        USD: {
+          amountNanos: '1000000000',
+          amount: '1',
+          usdEquivalentNanos: '1000000000',
+          receiptCount: 1,
+          normalizationRatesNativePerUsd: ['1'],
+        },
+      },
+    })
+    const currency = ref('USD')
+    const result = useUsageTotals({
+      visibleSessions: computed(() => []),
+      serverTotals: computed(() => source),
+      currency,
+      cnyRate: 7.25,
+      rowVal: (row, ...keys) => keys.map(key => row[key]).find(item => item != null),
+      fmtCost: (usd, options) => formatUsageCost(
+        usd,
+        currency.value,
+        7.25,
+        options?.decimals,
+        options?.source as Record<string, unknown> | undefined,
+      ),
+      sourceCompositionHint: () => '',
+    })
+
+    expect(result.totalCostDisplay.value).toBe('$3.0000')
+    expect(result.avgCostDisplay.value).toBe('$3.0000')
+
+    currency.value = 'CNY'
+
+    expect(result.totalCostDisplay.value).toBe('¥21.7500')
+    expect(result.avgCostDisplay.value).toBe('¥21.7500')
+  })
+
   it('uses exact CNY and the receipt conversion hint for a pure confirmed row', () => {
     const source = totals({
       nativeBilledByCurrency: cnyReceipt(),
@@ -75,7 +119,7 @@ describe('usage total native billing presentation', () => {
     expect(usd.costHintTitle.value).toContain('fixed normalization rate')
   })
 
-  it('keeps mixed native currency canonical and lists native subtotals', () => {
+  it('converts mixed native currency and lists native subtotals', () => {
     const source = totals({
       cost: 3,
       billedCost: 2,
@@ -95,13 +139,14 @@ describe('usage total native billing presentation', () => {
     })
     const result = summary(source, 'CNY')
 
-    expect(result.totalCostDisplay.value).toBe('$3.0000')
-    expect(result.avgCostDisplay.value).toBe('$3.0000')
+    expect(result.totalCostDisplay.value).toBe('¥21.7500')
+    expect(result.avgCostDisplay.value).toBe('¥21.7500')
+    expect(result.costHintText.value).toContain('≈ $3.0000 USD')
     expect(result.costHintText.value).toContain('Original receipts: ¥6.975 · $1')
-    expect(result.costHintTitle.value).toContain('canonical USD')
+    expect(result.costHintTitle.value).toContain('7.25')
   })
 
-  it('keeps pending billing canonical and surfaces the pending count', () => {
+  it('converts pending billing and surfaces the pending count', () => {
     const source = totals({
       cost: 0.5,
       billedCost: 0,
@@ -113,8 +158,9 @@ describe('usage total native billing presentation', () => {
     })
     const result = summary(source, 'CNY')
 
-    expect(result.totalCostDisplay.value).toBe('$0.5000')
-    expect(result.avgCostDisplay.value).toBe('$0.5000')
+    expect(result.totalCostDisplay.value).toBe('¥3.6250')
+    expect(result.avgCostDisplay.value).toBe('¥3.6250')
+    expect(result.costHintText.value).toContain('≈ $0.5000 USD')
     expect(result.costHintText.value).toContain('1 provider billing receipts are pending')
   })
 

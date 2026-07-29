@@ -72,6 +72,51 @@ _DEFAULT_GRACEFUL_TIMEOUT_S = 30.0
 _MAX_GRACEFUL_TIMEOUT_S = 120.0
 
 
+def _elapsed_monotonic_ms(started_at: float, ended_at: float | None = None) -> int:
+    end = time.monotonic() if ended_at is None else ended_at
+    return max(0, int((end - started_at) * 1000))
+
+
+def _log_gateway_startup_phase(
+    phase: str,
+    *,
+    startup_started_at: float,
+    phase_started_at: float,
+    status: str = "ready",
+) -> float:
+    completed_at = time.monotonic()
+    log.info(
+        "gateway.startup_phase",
+        phase=phase,
+        status=status,
+        duration_ms=_elapsed_monotonic_ms(phase_started_at, completed_at),
+        startup_elapsed_ms=_elapsed_monotonic_ms(startup_started_at, completed_at),
+    )
+    # Do not charge structured-log I/O to the phase that follows this one.
+    return time.monotonic()
+
+
+def _start_background_install_telemetry(config: GatewayConfig) -> None:
+    def _log_result(result: Any) -> None:
+        log.debug(
+            "gateway.install_telemetry",
+            skipped_reason=result.skipped_reason,
+            telemetry_event=result.event,
+            sent=result.sent,
+            uploaded=result.uploaded,
+            endpoint_configured=result.endpoint_configured,
+        )
+
+    try:
+        from opensquilla.observability.install_telemetry import (
+            start_background_install_telemetry,
+        )
+
+        start_background_install_telemetry(config=config, on_result=_log_result)
+    except Exception:
+        log.debug("gateway.install_telemetry_skipped", exc_info=True)
+
+
 def _auto_propose_usage_execution_context(
     agent_id: str,
     usage_event_sink: Any | None,
@@ -2348,6 +2393,8 @@ async def build_services(
 
     Returns a populated :class:`ServiceContainer`.
     """
+    services_started_at = time.monotonic()
+
     # ── Load .env files (cwd/.env > ~/.opensquilla/.env, never override existing) ──
     from opensquilla.env import load_env
 
@@ -2424,6 +2471,7 @@ async def build_services(
     if session_db_path != ":memory:":
         from opensquilla.persistence.migrator import _native_sqlite_path, apply_pending
 
+        migrations_started_at = time.monotonic()
         log.info("build_services.migrations_started")
         if "://" not in session_db_path:
             # 0o700: session transcripts are sensitive — keep a freshly created
@@ -2435,7 +2483,11 @@ async def build_services(
         applied = apply_pending(storage_db_path, migrations_dir)
         if applied:
             log.info("build_services.migrations_applied", count=len(applied), ids=applied)
-        log.info("build_services.migrations_ready", count=len(applied))
+        log.info(
+            "build_services.migrations_ready",
+            count=len(applied),
+            duration_ms=_elapsed_monotonic_ms(migrations_started_at),
+        )
 
     # ── Agent registry (built early so SessionManager can resolve agent configs) ─
     from opensquilla.agents.registry import AgentRegistry
@@ -2448,12 +2500,16 @@ async def build_services(
         from opensquilla.session.manager import SessionManager
         from opensquilla.session.storage import SessionStorage
 
+        session_storage_started_at = time.monotonic()
         log.info("build_services.session_storage_started")
         if storage_db_path != ":memory:" and "://" not in storage_db_path:
             os.makedirs(os.path.dirname(storage_db_path) or os.curdir, mode=0o700, exist_ok=True)
         storage = SessionStorage(storage_db_path)
         await storage.connect()
-        log.info("build_services.session_storage_ready")
+        log.info(
+            "build_services.session_storage_ready",
+            duration_ms=_elapsed_monotonic_ms(session_storage_started_at),
+        )
         session_manager = SessionManager(
             storage,
             agent_registry=agent_registry,
@@ -2655,11 +2711,14 @@ async def build_services(
     turn_capture_services: dict[str, Any] = {}
     memory_watchers: list[Any] = []
     _turn_runner_ref: list = []
+    memory_started_at = time.monotonic()
+    memory_degraded = False
     try:
         from opensquilla.memory.manager import build_memory_managers
         from opensquilla.tools.builtin.memory_tools import create_memory_tools
 
         agent_ids = _configured_agent_ids(config, extra_agent_ids)
+        log.info("build_services.memory_started", agents=len(agent_ids))
         memory_managers = await build_memory_managers(
             config,
             agent_ids,
@@ -2696,7 +2755,14 @@ async def build_services(
             )
             log.info("build_services.memory_tools_registered", agents=list(memory_stores))
     except Exception as e:
+        memory_degraded = True
         log.warning("build_services.memory_tools_failed", error=str(e))
+    log.info(
+        "build_services.memory_ready",
+        agents=len(memory_managers),
+        degraded=memory_degraded,
+        duration_ms=_elapsed_monotonic_ms(memory_started_at),
+    )
 
     # ── Skill loader (boot order 19) ────────────────────────────────
     skill_loader = None
@@ -2823,7 +2889,12 @@ async def build_services(
         from opensquilla.mcp.types import MCPServerConfig
 
         timeout = config.mcp.connect_timeout_seconds
-        for entry in config.mcp.servers:
+        mcp_started_at = time.monotonic()
+        mcp_registered = 0
+        mcp_failures = 0
+        log.info("build_services.mcp_discovery_started", servers=len(config.mcp.servers))
+        for server_index, entry in enumerate(config.mcp.servers):
+            server_started_at = time.monotonic()
             try:
                 mcp_cfg = MCPServerConfig(
                     name=entry.name,
@@ -2843,18 +2914,49 @@ async def build_services(
                     server=entry.name,
                     tools=len(names),
                 )
+                mcp_registered += 1
+                log.info(
+                    "build_services.mcp_server_timing",
+                    server_index=server_index,
+                    status="ready",
+                    duration_ms=_elapsed_monotonic_ms(server_started_at),
+                    tool_count=len(names),
+                )
             except TimeoutError:
+                mcp_failures += 1
                 log.warning(
                     "build_services.mcp_server_timeout",
                     server=entry.name,
                     timeout=timeout,
                 )
+                log.info(
+                    "build_services.mcp_server_timing",
+                    server_index=server_index,
+                    status="timeout",
+                    duration_ms=_elapsed_monotonic_ms(server_started_at),
+                    tool_count=0,
+                )
             except Exception as e:
+                mcp_failures += 1
                 log.warning(
                     "build_services.mcp_server_failed",
                     server=entry.name,
                     error=str(e),
                 )
+                log.info(
+                    "build_services.mcp_server_timing",
+                    server_index=server_index,
+                    status="failed",
+                    duration_ms=_elapsed_monotonic_ms(server_started_at),
+                    tool_count=0,
+                )
+        log.info(
+            "build_services.mcp_discovery_ready",
+            servers=len(config.mcp.servers),
+            registered=mcp_registered,
+            failures=mcp_failures,
+            duration_ms=_elapsed_monotonic_ms(mcp_started_at),
+        )
     elif config.mcp.enabled:
         log.info("build_services.mcp_enabled_no_servers")
 
@@ -3061,6 +3163,10 @@ async def build_services(
     )
     # Attach deferred callback ref so start_gateway_server can wire TurnRunner
     svc._turn_runner_ref = _turn_runner_ref  # type: ignore[attr-defined]
+    log.info(
+        "build_services.ready",
+        duration_ms=_elapsed_monotonic_ms(services_started_at),
+    )
     return svc
 
 
@@ -3178,6 +3284,7 @@ async def start_gateway_server(
     channel_manager: Any = None,
     usage_tracker: Any = None,
     run: bool = True,
+    _startup_started_at: float | None = None,
 ) -> GatewayServer:
     """
     Boot sequence:
@@ -3186,6 +3293,9 @@ async def start_gateway_server(
     3. Build ASGI app
     4. Start uvicorn server
     """
+    startup_started_at = time.monotonic() if _startup_started_at is None else _startup_started_at
+    startup_phase_started_at = startup_started_at
+
     # ── Gateway-specific config handling ─────────────────────────────
     if config is None:
         config = GatewayConfig.load(os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH"))
@@ -3233,6 +3343,11 @@ async def start_gateway_server(
     # Surface lexical degradation when the operator enabled filter_enabled=true
     # with a strategy that needs the local ONNX embedding backend.
     emit_skill_filter_banner(config.skills)
+    startup_phase_started_at = _log_gateway_startup_phase(
+        "config",
+        startup_started_at=startup_started_at,
+        phase_started_at=startup_phase_started_at,
+    )
 
     # ── PID file lock ───────────────────────────────────────────────
     # Prevents two gateway instances from sharing the same STATE_DIR.
@@ -3264,23 +3379,11 @@ async def start_gateway_server(
         except BaseException:
             _pid_lock.release()
             raise
-
-    # Anonymous install telemetry is best-effort: it must never block gateway
-    # startup. The built-in endpoint is intentionally empty until configured.
-    try:
-        from opensquilla.observability.install_telemetry import collect_install_telemetry
-
-        result = collect_install_telemetry(config=config)
-        log.debug(
-            "gateway.install_telemetry",
-            skipped_reason=result.skipped_reason,
-            telemetry_event=result.event,
-            sent=result.sent,
-            uploaded=result.uploaded,
-            endpoint_configured=result.endpoint_configured,
-        )
-    except Exception:
-        log.debug("gateway.install_telemetry_skipped", exc_info=True)
+    startup_phase_started_at = _log_gateway_startup_phase(
+        "ownership",
+        startup_started_at=startup_started_at,
+        phase_started_at=startup_phase_started_at,
+    )
 
     # Passive update-availability check is best-effort and runs in a background
     # daemon thread: it must never block startup. It powers the "a newer version
@@ -3305,6 +3408,11 @@ async def start_gateway_server(
     except BaseException:
         _pid_lock.release()
         raise
+    startup_phase_started_at = _log_gateway_startup_phase(
+        "services",
+        startup_started_at=startup_started_at,
+        phase_started_at=startup_phase_started_at,
+    )
 
     # An interrupted profile import may span USER.md and a separate memory
     # root. Recover those canonical files before TurnRunner, channels, or the
@@ -3328,25 +3436,11 @@ async def start_gateway_server(
         finally:
             _pid_lock.release()
         raise
-
-    # Daily usage uses the existing telemetry service's dedicated /v1/usage
-    # route and the same unified privacy switch. Upload once at startup and
-    # every hour while the gateway is running; failures remain pending.
-    try:
-        from opensquilla.observability.usage_telemetry import (
-            run_daily_usage_upload_loop,
-        )
-
-        daily_usage_storage = get_session_storage(svc.session_manager)
-        if daily_usage_storage is not None:
-            svc.daily_usage_telemetry_task = create_background_task(
-                run_daily_usage_upload_loop(
-                    daily_usage_storage,
-                    config=config,
-                )
-            )
-    except Exception:
-        log.debug("gateway.usage_telemetry_upload_skipped", exc_info=True)
+    startup_phase_started_at = _log_gateway_startup_phase(
+        "profile_recovery",
+        startup_started_at=startup_started_at,
+        phase_started_at=startup_phase_started_at,
+    )
 
     # Some embedding/tests provide a service-shaped object from an older
     # bootstrap contract.  Treat the ledger sink as an optional additive
@@ -4157,6 +4251,57 @@ async def start_gateway_server(
         shutdown_relay = _GatewayShutdownRelay()
         app.state.request_shutdown = shutdown_relay
         app.state.install_shutdown_handler = shutdown_relay.install
+    startup_phase_started_at = _log_gateway_startup_phase(
+        "app",
+        startup_started_at=startup_started_at,
+        phase_started_at=startup_phase_started_at,
+    )
+    listener_ready = False
+    runtime_state_ready = False
+    gateway_ready_phase_emitted = False
+    post_ready_observability_started = False
+    gateway_ready_wait_started_at = startup_phase_started_at
+
+    def _start_post_ready_observability() -> None:
+        nonlocal post_ready_observability_started
+        if post_ready_observability_started:
+            return
+        post_ready_observability_started = True
+
+        # Anonymous install telemetry is best-effort. Its daemon worker is
+        # never joined during shutdown, so a slow proxy cannot delay bind or
+        # exit. Daily usage keeps its existing owned/cancelled asyncio task.
+        _start_background_install_telemetry(config)
+        try:
+            from opensquilla.observability.usage_telemetry import (
+                run_daily_usage_upload_loop,
+            )
+
+            daily_usage_storage = get_session_storage(svc.session_manager)
+            if daily_usage_storage is not None:
+                svc.daily_usage_telemetry_task = create_background_task(
+                    run_daily_usage_upload_loop(
+                        daily_usage_storage,
+                        config=config,
+                    )
+                )
+        except Exception:
+            log.debug("gateway.usage_telemetry_upload_skipped", exc_info=True)
+
+    def _publish_gateway_ready_if_complete() -> None:
+        nonlocal gateway_ready_phase_emitted
+        if gateway_ready_phase_emitted or not listener_ready or not runtime_state_ready:
+            return
+        gateway_ready_phase_emitted = True
+        ready_at = time.monotonic()
+        log.info(
+            "gateway.startup_phase",
+            phase="gateway_ready",
+            status="ready",
+            duration_ms=_elapsed_monotonic_ms(gateway_ready_wait_started_at, ready_at),
+            startup_elapsed_ms=_elapsed_monotonic_ms(startup_started_at, ready_at),
+        )
+        _start_post_ready_observability()
 
     server_handle = GatewayServer(app=app, config=config)
     server_handle._pid_lock = _pid_lock
@@ -4211,11 +4356,34 @@ async def start_gateway_server(
                     category="listener_start_failed",
                 )
 
+        listener_scheduled_at = time.monotonic()
+        listener_phase_emitted = False
+
+        async def _notify_listener_ready() -> None:
+            nonlocal listener_phase_emitted, listener_ready
+            if listener_phase_emitted:
+                return
+            listener_phase_emitted = True
+            listener_ready = True
+            ready_at = time.monotonic()
+            log.info(
+                "gateway.startup_phase",
+                phase="listener",
+                status="ready",
+                duration_ms=_elapsed_monotonic_ms(listener_scheduled_at, ready_at),
+                startup_elapsed_ms=_elapsed_monotonic_ms(startup_started_at, ready_at),
+            )
+            _publish_gateway_ready_if_complete()
+
         uvicorn_kwargs: dict[str, Any] = {
             "app": app,
             "host": config.host,
             "port": config.port,
             "log_level": "info" if not config.debug else "debug",
+            # Uvicorn invokes this only after its socket server has been
+            # created. Keep the callback one-shot because callback_notify is
+            # also used for periodic worker health notifications.
+            "callback_notify": _notify_listener_ready,
             # Capability URLs and historical sessionKey query parameters are
             # bearer material. Keep request targets out of uvicorn's access
             # logger; structured gateway events remain available.
@@ -4238,6 +4406,7 @@ async def start_gateway_server(
         setattr(server, "install_signal_handlers", lambda: None)  # noqa: B010
         server_handle._server = server
 
+        listener_scheduled_at = time.monotonic()
         task = create_background_task(server.serve())
         server_handle._task = task
 
@@ -4282,6 +4451,17 @@ async def start_gateway_server(
         log.info("gateway.squilla_router_preload_skipped", reason="desktop_fast_start")
 
     app.state.gateway_ready = True
+    runtime_state_ready = True
+    _log_gateway_startup_phase(
+        "runtime_state",
+        startup_started_at=startup_started_at,
+        phase_started_at=startup_phase_started_at,
+    )
+    _publish_gateway_ready_if_complete()
+    if not run:
+        # Embedders/tests without a network listener still retain the existing
+        # telemetry lifecycle, but only after in-process readiness is visible.
+        _start_post_ready_observability()
     usage_storage = get_session_storage(svc.session_manager)
     if usage_storage is not None and hasattr(usage_storage, "get_usage_backfill_batch"):
         from opensquilla.gateway.usage_backfill import run_usage_backfill

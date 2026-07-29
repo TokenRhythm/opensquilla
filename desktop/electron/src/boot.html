@@ -135,7 +135,9 @@
       border-radius: 999px;
       background: var(--muted);
       opacity: 0.15;
-      transform: rotate(calc(var(--i) * 45deg));
+      /* Negative phase delays advance toward lower indices. Numbering the
+         segments counter-clockwise makes that visible motion clockwise. */
+      transform: rotate(calc(var(--i) * -45deg));
       transform-origin: 2px 26px;
       animation: loader-segment 1.1s linear infinite;
       animation-delay: calc(var(--i) * -0.1375s);

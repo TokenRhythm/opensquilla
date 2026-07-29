@@ -1099,6 +1099,26 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
                   <strong>{{ selectedProviderLabel }}</strong>
                 </label>
 
+                <section
+                  v-if="endpointFields.length"
+                  class="setup-provider-modal__endpoint"
+                  data-testid="setup-provider-modal-endpoint"
+                >
+                  <div class="setup-provider-options__head">
+                    <h5>{{ t('setup.provider.endpointTitle', { provider: selectedProviderLabel }) }}</h5>
+                    <p>{{ t('setup.provider.endpointDesc', { provider: selectedProviderLabel }) }}</p>
+                  </div>
+                  <template v-for="field in endpointFields" :key="field.name">
+                    <SetupField
+                      :field="field"
+                      :value="panel.providerFieldValue(field)"
+                      scope="provider"
+                      stack
+                      @update="(name, val) => emit('updateProviderField', name, val)"
+                    />
+                  </template>
+                </section>
+
                 <SetupProviderCredentialCard
                   v-if="panel.credentialPanel"
                   compact
@@ -1791,6 +1811,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
   font-size: var(--fs-md);
 }
 
+.setup-provider-modal__endpoint,
 .setup-provider-modal__model {
   border-top: 1px solid var(--border);
   padding-top: var(--sp-4);

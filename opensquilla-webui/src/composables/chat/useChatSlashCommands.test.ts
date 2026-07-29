@@ -2,6 +2,7 @@ import { ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
 import { useChatSlashCommands } from './useChatSlashCommands'
+import type { RpcCallOptions } from '@/lib/rpc'
 
 function deferred() {
   let resolve!: () => void
@@ -15,6 +16,7 @@ function harness(
   planModeAvailable: boolean,
   commands: Array<Record<string, unknown>> = [],
   waitForConnection: Promise<void> = Promise.resolve(),
+  catalogCallOptions?: RpcCallOptions,
 ) {
   const inputText = ref('')
   const rpc = {
@@ -31,6 +33,7 @@ function harness(
   const dispatchPlanPrompt = vi.fn()
   const api = useChatSlashCommands({
     rpc,
+    catalogCallOptions,
     inputText,
     sessionKey: ref('agent:main:webchat:test'),
     autoResizeTextarea: vi.fn(),
@@ -60,8 +63,31 @@ function harness(
 
 describe('useChatSlashCommands plan compatibility', () => {
   it('adds and executes /plan when the connected gateway advertises plan mode', async () => {
-    const { api, inputText, activatePlanMode } = harness(true)
+    const catalogCallOptions: RpcCallOptions = {
+      timeoutMs: 2_000,
+      timeoutAction: 'reconnect',
+      abortAction: 'reconnect',
+    }
+    const { api, inputText, activatePlanMode, rpc } = harness(
+      true,
+      [],
+      Promise.resolve(),
+      catalogCallOptions,
+    )
     await api.loadSlashCommands()
+    expect(rpc.waitForConnection).toHaveBeenCalledWith(
+      2_000,
+      undefined,
+      {
+        timeoutAction: 'reconnect',
+        abortAction: 'reconnect',
+      },
+    )
+    expect(rpc.call).toHaveBeenCalledWith(
+      'commands.list_for_surface',
+      { surface: 'web_chat' },
+      catalogCallOptions,
+    )
     inputText.value = '/pl'
     api.handleSlashInput()
 

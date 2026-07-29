@@ -11,15 +11,28 @@ import {
   normalizeRouterVisualMode,
 } from '@/utils/chat/routerVisualMode'
 import { useRouterVisualEffectsPreference } from '@/composables/useRouterVisualEffectsPreference'
+import {
+  waitForSessionRpcConnection,
+} from '@/composables/chat/sessionBootstrapAdmission'
+import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
 
 type RpcClient = {
-  waitForConnection: () => Promise<void>
-  call: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
+  waitForConnection: (
+    timeoutMs?: number,
+    signal?: AbortSignal,
+    actions?: RpcConnectionWaitOptions,
+  ) => Promise<void>
+  call: <T = unknown>(
+    method: string,
+    params?: Record<string, unknown>,
+    callOptions?: RpcCallOptions,
+  ) => Promise<T>
   on?: (event: string, handler: (payload: unknown) => void) => () => void
 }
 
 export interface UseChatFeatureTogglesOptions {
   rpc: RpcClient
+  readCallOptions?: RpcCallOptions
   setGlobalElevatedMode: (mode: string) => void
   loadCurrentSessionUsage: () => void | Promise<void>
 }
@@ -142,11 +155,23 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
 
   async function loadFeatureToggles() {
     try {
-      await options.rpc.waitForConnection()
-      const cfg = await options.rpc.call<ChatFeatureConfig>('config.get')
+      await waitForSessionRpcConnection(options.rpc, options.readCallOptions)
+      const cfg = options.readCallOptions
+        ? await options.rpc.call<ChatFeatureConfig>(
+            'config.get',
+            undefined,
+            options.readCallOptions,
+          )
+        : await options.rpc.call<ChatFeatureConfig>('config.get')
       await applyFeatureConfig(cfg, { refreshUsage: true })
       try {
-        const routing = await options.rpc.call<ModelRoutingSnapshot>('models.routing.get')
+        const routing = options.readCallOptions
+          ? await options.rpc.call<ModelRoutingSnapshot>(
+              'models.routing.get',
+              undefined,
+              options.readCallOptions,
+            )
+          : await options.rpc.call<ModelRoutingSnapshot>('models.routing.get')
         applyModelRoutingSnapshot(routing)
       } catch {
         // Older Gateways have no canonical routing RPC; the config projection

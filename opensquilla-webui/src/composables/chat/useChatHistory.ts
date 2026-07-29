@@ -25,7 +25,6 @@ import {
   SESSION_PHASE_ATTEMPT_BUDGET_MS,
   isRpcAbort,
   phaseCallOptions,
-  phaseConnectionWaitOptions,
   phaseTimeoutMs,
   type SessionBootstrapPhaseContext,
   type SessionPhaseResult,
@@ -33,6 +32,7 @@ import {
 import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
 
 type RpcClient = {
+  policy?: Record<string, unknown> | null
   waitForConnection: (
     timeoutMs?: number,
     signal?: AbortSignal,
@@ -43,6 +43,16 @@ type RpcClient = {
     params?: Record<string, unknown>,
     options?: RpcCallOptions,
   ) => Promise<T>
+}
+
+function historyTerminationActions(rpc: RpcClient) {
+  const action = rpc.policy?.concurrent_history_reads === true
+    ? 'reject' as const
+    : 'reconnect' as const
+  return {
+    timeoutAction: action,
+    abortAction: action,
+  }
 }
 
 function recordArray<T extends Record<string, unknown>>(value: unknown): T[] {
@@ -280,11 +290,22 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     request: Record<string, unknown>,
     bootstrap: SessionBootstrapPhaseContext,
   ): Promise<T> {
-    return options.rpc.call<T>(
+    const callOptions = {
+      ...phaseCallOptions(bootstrap, 'chat.history'),
+      // History is background content. A slow read may fail independently,
+      // without recycling a Gateway that advertises concurrent reads. Legacy
+      // serial Gateways still need a fresh connection to escape a stuck read.
+      ...historyTerminationActions(options.rpc),
+      onSent: (socketGeneration: number) => {
+        bootstrap.markHistoryRequestSent?.(socketGeneration)
+      },
+    }
+    const response = options.rpc.call<T>(
       'chat.history',
       request,
-      phaseCallOptions(bootstrap, 'chat.history'),
+      callOptions,
     )
+    return response
   }
 
   async function runHistoryLoad(
@@ -319,7 +340,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       await options.rpc.waitForConnection(
         phaseTimeoutMs(bootstrap, 'chat.history'),
         bootstrap.signal,
-        phaseConnectionWaitOptions(),
+        historyTerminationActions(options.rpc),
       )
       if (!isCurrentRequest()) {
         if (requestSeq === historyRequestSeq) {

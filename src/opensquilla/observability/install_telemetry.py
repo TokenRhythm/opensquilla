@@ -17,7 +17,10 @@ import re
 import socket
 import sys
 import tempfile
+import threading
 import uuid
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -45,6 +48,22 @@ _AUTO_SKIP_ENV_VARS = ("GITHUB_ACTIONS", "PYTEST_CURRENT_TEST", TELEMETRY_TESTIN
 _STABLE_INSTALL_ID_PREFIX = "opensquilla-install-v2"
 _STABLE_INSTALL_ID_SOURCES = {"stable-v2-mac", "stable-v2-ip"}
 _MAC_HEX_RE = re.compile(r"^[0-9a-f]{12}$")
+_COLLECT_LOCK = threading.Lock()
+_STATE_LOCK = threading.RLock()
+_STATE_TRANSACTION_TIMEOUT_SECONDS = 1.0
+
+
+@contextmanager
+def _state_transaction(path: Path) -> Iterator[None]:
+    """Serialize one short telemetry-state transaction across threads/processes."""
+    # Import lazily so merely importing telemetry during boot does not load the
+    # platform-specific lock implementation. The exact JSON path is the key, so
+    # this never contends with the long-lived profile-home operation lock.
+    from opensquilla.profile_operation_lock import ProfileOperationLock
+
+    with _STATE_LOCK:
+        with ProfileOperationLock(path, timeout=_STATE_TRANSACTION_TIMEOUT_SECONDS):
+            yield
 
 
 @dataclass(frozen=True)
@@ -83,52 +102,90 @@ def collect_install_telemetry(
             )
 
         current_version = (version or __version__ or "unknown").strip() or "unknown"
-        state = _load_or_create_state(path)
-        event = _next_event(state, current_version)
-        if event is None:
-            return InstallTelemetryResult(
-                state_path=path,
-                endpoint_configured=bool(endpoint),
-                skipped_reason="already_uploaded",
-            )
+        # Serialize install/version event selection, but do not hold the state
+        # lock across network I/O. Daily usage telemetry shares this state file
+        # for the anonymous install id and must remain free to read it.
+        with _COLLECT_LOCK:
+            with _state_transaction(path):
+                state = _load_or_create_state(path)
+                event = _next_event(state, current_version)
+                if event is None:
+                    return InstallTelemetryResult(
+                        state_path=path,
+                        endpoint_configured=bool(endpoint),
+                        skipped_reason="already_uploaded",
+                    )
 
-        if not endpoint:
-            state["last_skip_reason"] = "endpoint_empty"
-            _write_state(path, state)
+                if not endpoint:
+                    state["last_skip_reason"] = "endpoint_empty"
+                    _write_state(path, state)
+                    return InstallTelemetryResult(
+                        state_path=path,
+                        endpoint_configured=False,
+                        event=event,
+                        skipped_reason="endpoint_empty",
+                    )
+
+                now = _utc_now()
+                payload = _build_payload(
+                    state,
+                    event=event,
+                    current_version=current_version,
+                    sent_at=now,
+                )
+                skip_reason = _telemetry_skip_reason(config=config)
+                if skip_reason:
+                    return InstallTelemetryResult(
+                        state_path=path,
+                        endpoint_configured=True,
+                        disabled=True,
+                        event=event,
+                        skipped_reason=skip_reason,
+                    )
+                state["last_attempt_at"] = now
+                state["last_skip_reason"] = None
+                # Persist the selected install id before the background network
+                # call. A concurrent usage upload will then use the same id.
+                _write_state(path, state)
+
+            # The privacy setting is live-editable. Re-check at the last safe
+            # point before starting a new request; an already-entered socket
+            # operation cannot be recalled, but no later request should begin.
+            skip_reason = _telemetry_skip_reason(config=config)
+            if skip_reason:
+                return InstallTelemetryResult(
+                    state_path=path,
+                    endpoint_configured=True,
+                    disabled=True,
+                    event=event,
+                    skipped_reason=skip_reason,
+                )
+            uploaded, error = _post_payload(
+                endpoint,
+                payload,
+                timeout=DEFAULT_TIMEOUT_SECONDS,
+            )
+            with _state_transaction(path):
+                # Merge the result into the latest state rather than overwriting
+                # another telemetry writer's atomic update.
+                state = _load_or_create_state(path)
+                if uploaded:
+                    state["last_success_at"] = now
+                    state["last_error"] = None
+                    state["uploaded_install"] = True
+                    _add_uploaded_version(state, current_version)
+                else:
+                    state["last_error"] = error or "upload_failed"
+                _write_state(path, state)
+
             return InstallTelemetryResult(
                 state_path=path,
-                endpoint_configured=False,
+                endpoint_configured=True,
                 event=event,
-                skipped_reason="endpoint_empty",
+                sent=True,
+                uploaded=uploaded,
+                error=error,
             )
-
-        now = _utc_now()
-        payload = _build_payload(
-            state,
-            event=event,
-            current_version=current_version,
-            sent_at=now,
-        )
-        state["last_attempt_at"] = now
-        state["last_skip_reason"] = None
-        uploaded, error = _post_payload(endpoint, payload, timeout=DEFAULT_TIMEOUT_SECONDS)
-        if uploaded:
-            state["last_success_at"] = now
-            state["last_error"] = None
-            state["uploaded_install"] = True
-            _add_uploaded_version(state, current_version)
-        else:
-            state["last_error"] = error or "upload_failed"
-
-        _write_state(path, state)
-        return InstallTelemetryResult(
-            state_path=path,
-            endpoint_configured=True,
-            event=event,
-            sent=True,
-            uploaded=uploaded,
-            error=error,
-        )
     except Exception as exc:  # pragma: no cover - defensive startup guard
         log.debug("Install telemetry skipped: %s", exc, exc_info=True)
         return InstallTelemetryResult(
@@ -137,6 +194,71 @@ def collect_install_telemetry(
             skipped_reason="error",
             error=str(exc),
         )
+
+
+def start_background_install_telemetry(
+    *,
+    config: Any | None = None,
+    state_path: str | Path | None = None,
+    version: str | None = None,
+    on_result: Callable[[InstallTelemetryResult], None] | None = None,
+) -> threading.Thread | None:
+    """Collect install telemetry in a daemon thread without delaying startup.
+
+    Privacy-disabled calls are resolved synchronously without creating state or
+    a thread. The returned thread exists only to let tests observe completion;
+    gateway shutdown deliberately never joins this best-effort worker.
+    """
+
+    def _notify_result(result: InstallTelemetryResult) -> None:
+        if on_result is None:
+            return
+        try:
+            on_result(result)
+        except Exception:  # pragma: no cover - caller diagnostic guard
+            log.debug("Install telemetry result callback failed", exc_info=True)
+
+    if _telemetry_skip_reason(config=config):
+        result = collect_install_telemetry(
+            config=config,
+            state_path=state_path,
+            version=version,
+        )
+        _notify_result(result)
+        return None
+
+    def _run() -> None:
+        result = collect_install_telemetry(
+            config=config,
+            state_path=state_path,
+            version=version,
+        )
+        _notify_result(result)
+
+    try:
+        thread = threading.Thread(
+            target=_run,
+            name="opensquilla-install-telemetry",
+            daemon=True,
+        )
+        thread.start()
+        return thread
+    except Exception:  # pragma: no cover - thread spawn failure
+        log.debug("Could not start install telemetry thread", exc_info=True)
+        return None
+
+
+def ensure_install_telemetry_id(
+    *,
+    config: Any | None = None,
+    state_path: str | Path | None = None,
+) -> str:
+    """Return and durably persist the shared anonymous install id."""
+    path = _state_path(config=config, explicit=state_path)
+    with _state_transaction(path):
+        state = _load_or_create_state(path)
+        _write_state(path, state)
+        return str(state["install_id"])
 
 
 def _state_path(*, config: Any | None, explicit: str | Path | None) -> Path:

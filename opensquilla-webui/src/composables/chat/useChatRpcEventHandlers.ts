@@ -695,11 +695,15 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     stream.resetStreamIdleTimer()
     if (stream.streamBubble.value && !stream.streamHasVisibleOutput.value) {
       const phase = String(payload.phase || '')
+      // The channel wrapper emits a generic keepalive on the same cadence as
+      // ensemble heartbeats. It proves liveness but does not represent a phase
+      // transition, so changing the activity would restart its timer.
+      const isPhaseAgnosticKeepalive = phase === 'channel'
       if (phase.startsWith('ensemble_proposers')) {
         stream.setStreamActivity('Generating candidates')
       } else if (phase.startsWith('ensemble_aggregator')) {
         stream.setStreamActivity('Synthesizing candidates')
-      } else {
+      } else if (!isPhaseAgnosticKeepalive) {
         stream.setStreamActivity('Planning next step')
       }
     } else if (!stream.streamBubble.value) {
@@ -1093,13 +1097,11 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       const connectedSessionKey = sessionKey.value
       connectionLostNoted = false
       stream.hideThinkingIndicator()
-      // The Gateway intentionally dispatches RPCs serially. Optional usage
-      // metadata must not enter that queue ahead of snapshot/subscribe/history
-      // after reconnect, so wait for the coordinator's critical phases.
-      const criticalPhases = recovery
-        ? [recovery.history, recovery.live]
-        : []
-      void Promise.allSettled(criticalPhases).then(() => {
+      // Preserve critical frame ordering after reconnect without waiting for a
+      // potentially slow history response before refreshing independent UI.
+      const criticalRequestsQueued = recovery?.criticalRequestsQueued
+        ?? Promise.resolve()
+      void criticalRequestsQueued.then(() => {
         if (
           connectionStateGeneration === stateGeneration
           && sessionKey.value === connectedSessionKey

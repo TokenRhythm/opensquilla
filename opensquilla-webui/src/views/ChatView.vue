@@ -90,9 +90,9 @@
           </div>
         </template>
         <ChatSessionRecoveryStatus
-          v-if="historyRecoveryState"
+          v-if="visibleHistoryRecoveryState"
           :key="`${sessionKey}:history`"
-          :state="historyRecoveryState"
+          :state="visibleHistoryRecoveryState"
           @retry="retryHistory"
         />
         <ChatSessionRecoveryStatus
@@ -743,6 +743,7 @@ import { clearAssistantActivityExpansionState } from '@/utils/chat/activityDiscl
 import {
   resolveChatHistoryRecoveryState,
   shouldShowConfirmedEmptySession,
+  visibleChatHistoryRecoveryState,
 } from '@/utils/chat/sessionLoadState'
 import {
   isSemanticActivityStatusStep,
@@ -889,6 +890,7 @@ const {
   applyRunModePreferenceChanged,
 } = useChatRunModePreference({
   rpc,
+  hydrateCallOptions: optionalSessionRpcCallOptions,
   runModePolicy: () => {
     const auth = rpc.auth as RpcAuthPayload | null
     return auth?.runModePolicy
@@ -1143,6 +1145,7 @@ const compactGaugeVisible = computed(() =>
 
 const chatUsageWidget = useChatUsageWidget({
   rpc,
+  readCallOptions: optionalSessionRpcCallOptions,
   sessionKey,
   tokenVizEnabled: () => appStore.features.tokenViz,
 })
@@ -1157,6 +1160,7 @@ const {
 
 const chatFeatureToggles = useChatFeatureToggles({
   rpc,
+  readCallOptions: optionalSessionRpcCallOptions,
   setGlobalElevatedMode,
   loadCurrentSessionUsage,
 })
@@ -1541,38 +1545,59 @@ function releaseOptionalRpcAdmissionAfter(
 }
 
 function trackSessionBootstrapAdmission<T extends {
-  history: Promise<unknown>
-  live: Promise<unknown>
+  criticalRequestsQueued: Promise<void>
 }>(run: T): T {
   const admissionGeneration = holdOptionalRpcAdmission()
   releaseOptionalRpcAdmissionAfter(
-    [run.history, run.live],
+    [run.criticalRequestsQueued],
     admissionGeneration,
   )
   return run
+}
+
+let postBootstrapMetadataStarted = false
+function schedulePostBootstrapMetadata(
+  run: {
+    generation: number
+    criticalRequestsQueued: Promise<void>
+  },
+  key: string,
+) {
+  if (postBootstrapMetadataStarted) return
+  void run.criticalRequestsQueued.then(() => {
+    if (
+      postBootstrapMetadataStarted
+      || chatViewDisposed
+      || sessionKey.value !== key
+      || !isSessionBootstrapCurrent(run.generation, key)
+    ) return
+    postBootstrapMetadataStarted = true
+    void refreshPostBootstrapMetadata()
+    void loadFeatureToggles().then(() => {
+      if (!chatViewDisposed) unsubs.push(bindFeatureRefresh(scheduleHistorySync))
+    })
+    loadSlashCommands()
+  })
 }
 
 function startSessionBootstrap(options?: {
   includeHistory?: boolean
   force?: boolean
 }) {
-  return trackSessionBootstrapAdmission(
+  const key = sessionKey.value
+  const run = trackSessionBootstrapAdmission(
     startSessionBootstrapCoordinator(options),
   )
+  schedulePostBootstrapMetadata(run, key)
+  return run
 }
 
 function retryHistory() {
-  const admissionGeneration = holdOptionalRpcAdmission()
-  const retry = retryHistoryCoordinator()
-  releaseOptionalRpcAdmissionAfter([retry], admissionGeneration)
-  return retry
+  return retryHistoryCoordinator()
 }
 
 function retryLive() {
-  const admissionGeneration = holdOptionalRpcAdmission()
-  const retry = retryLiveCoordinator()
-  releaseOptionalRpcAdmissionAfter([retry], admissionGeneration)
-  return retry
+  return retryLiveCoordinator()
 }
 
 function cancelSessionBootstrap() {
@@ -1708,6 +1733,7 @@ function switchToSession(nextSessionKey: string) {
 
 const chatSlashCommands = useChatSlashCommands({
   rpc,
+  catalogCallOptions: optionalSessionRpcCallOptions,
   inputText,
   sessionKey,
   autoResizeTextarea,
@@ -2304,6 +2330,10 @@ const historyRecoveryState = computed(() => {
     recoveryError: historyState.value.recoveryError,
   })
 })
+
+const visibleHistoryRecoveryState = computed(() => (
+  visibleChatHistoryRecoveryState(historyRecoveryState.value)
+))
 
 const liveRecoveryState = computed(() => {
   if (livePhase.value === 'degraded') return 'live-degraded' as const
@@ -3470,20 +3500,6 @@ onMounted(async () => {
     : sessionBootstrap.live.then(() =>
         syncDraftProjectFromRoute(initialDraftProjectGeneration!),
       )
-  void Promise.allSettled([
-    sessionBootstrap.history,
-    sessionBootstrap.live,
-    initialDraftProjectSync,
-  ]).then(async () => {
-    if (chatViewDisposed) return
-    await refreshPostBootstrapMetadata()
-    if (chatViewDisposed) return
-    void loadFeatureToggles().then(() => {
-      if (!chatViewDisposed) unsubs.push(bindFeatureRefresh(scheduleHistorySync))
-    })
-    loadSlashCommands()
-  })
-
   // Composer resize observer
   const composerEl = composerRef.value?.composerElement()
   if (composerEl) {

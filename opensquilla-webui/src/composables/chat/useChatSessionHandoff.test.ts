@@ -128,6 +128,7 @@ describe('chat send session handoff', () => {
       loadHistory()
       return {
         generation: 1,
+        criticalRequestsQueued: Promise.resolve(),
         history: Promise.resolve({ ok: true }),
         live,
       }

@@ -387,7 +387,12 @@ def _validate_recovery_container_metadata(path: Path) -> None:
         )
 
 
-def _validate_base_paths(user_data: Path, primary_home: Path) -> None:
+def _validate_base_paths(
+    user_data: Path,
+    primary_home: Path,
+    *,
+    inspect_primary_tree: bool = True,
+) -> None:
     _plain_directory(user_data, label="Electron userData")
     expected = user_data / "opensquilla"
     if os.path.normcase(os.path.normpath(str(primary_home))) != os.path.normcase(
@@ -401,7 +406,8 @@ def _validate_base_paths(user_data: Path, primary_home: Path) -> None:
     else:
         if _is_link_or_reparse(primary_stat) or not stat.S_ISDIR(primary_stat.st_mode):
             raise UnsafePathError("primary home must be a real directory")
-        profile_no_follow_manifest(primary_home)
+        if inspect_primary_tree:
+            profile_no_follow_manifest(primary_home)
     _plain_optional_file(user_data / _CONTEXT_NAME, label="Desktop profile context")
 
 
@@ -4022,9 +4028,20 @@ def consolidate_recovery_profiles(
     primary_path = _absolute(primary_home)
     journal_path = user_data_path / _JOURNAL_NAME
     try:
-        _validate_base_paths(user_data_path, primary_path)
+        # Most launches have one healthy primary profile and no recovery work.
+        # Validate only the canonical boundary first so an unrelated nested
+        # link/reparse point in the active profile cannot turn that no-op
+        # preflight into a startup-blocking consolidation failure.
+        _validate_base_paths(
+            user_data_path,
+            primary_path,
+            inspect_primary_tree=False,
+        )
         journal = _load_journal(journal_path, user_data_path, primary_path)
         if journal is not None:
+            # A durable transaction may have moved or published the primary,
+            # so preserve the strict no-follow inspection before resuming it.
+            _validate_base_paths(user_data_path, primary_path)
             if not _restart_legacy_prepared_journal_if_safe(
                 user_data_path,
                 primary_path,
@@ -4087,6 +4104,9 @@ def consolidate_recovery_profiles(
                 revision=0,
             )
 
+        # Recursive primary inspection is required only when data will really
+        # be read from or written into the consolidation transaction.
+        _validate_base_paths(user_data_path, primary_path)
         transaction_id = str(uuid.uuid4())
         backup_path = user_data_path / _BACKUPS_RELATIVE / transaction_id
         receipt_path = backup_path / "receipt.json"

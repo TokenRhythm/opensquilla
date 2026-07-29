@@ -690,17 +690,20 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
     }
   })
 
-  it('maps ensemble heartbeats to neutral proposer and aggregator phase copy', () => {
+  it('maps ensemble heartbeats without letting channel keepalives replace the phase', () => {
     const { api, stream, stop } = createHarness()
 
     try {
       api.handlers.onRunHeartbeat({ stream_seq: 1, phase: 'ensemble_proposers_wait' })
       expect(stream.setStreamActivity).toHaveBeenLastCalledWith('Generating candidates')
 
-      api.handlers.onRunHeartbeat({ stream_seq: 2, phase: 'ensemble_aggregator_stream' })
+      api.handlers.onRunHeartbeat({ stream_seq: 2, phase: 'channel' })
+      expect(stream.setStreamActivity).toHaveBeenCalledTimes(1)
+
+      api.handlers.onRunHeartbeat({ stream_seq: 3, phase: 'ensemble_aggregator_stream' })
       expect(stream.setStreamActivity).toHaveBeenLastCalledWith('Synthesizing candidates')
 
-      api.handlers.onRunHeartbeat({ stream_seq: 3, phase: 'provider_wait' })
+      api.handlers.onRunHeartbeat({ stream_seq: 4, phase: 'provider_wait' })
       expect(stream.setStreamActivity).toHaveBeenLastCalledWith('Planning next step')
     } finally {
       stop()
@@ -719,9 +722,13 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
     }
   })
 
-  it('defers optional reconnect metadata until both bootstrap phases terminate', async () => {
+  it('refreshes reconnect metadata once critical requests are queued', async () => {
+    let resolveCriticalRequestsQueued!: () => void
     let resolveHistory!: () => void
     let resolveLive!: () => void
+    const criticalRequestsQueued = new Promise<void>(resolve => {
+      resolveCriticalRequestsQueued = resolve
+    })
     const history = new Promise<{ ok: boolean }>(resolve => {
       resolveHistory = () => resolve({ ok: true })
     })
@@ -738,6 +745,7 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
     })
     const run: SessionBootstrapRun = {
       generation: 2,
+      criticalRequestsQueued,
       history,
       live,
     }
@@ -751,15 +759,15 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
       expect(harness.loadCurrentSessionUsage).not.toHaveBeenCalled()
       expect(harness.refreshRunModePreference).not.toHaveBeenCalled()
 
-      resolveLive()
-      await Promise.resolve()
-      expect(harness.loadCurrentSessionUsage).not.toHaveBeenCalled()
-
-      resolveHistory()
+      resolveCriticalRequestsQueued()
       await vi.waitFor(() => {
         expect(harness.loadCurrentSessionUsage).toHaveBeenCalledOnce()
         expect(harness.refreshRunModePreference).toHaveBeenCalledOnce()
       })
+
+      resolveLive()
+      resolveHistory()
+      await Promise.all([live, history])
     } finally {
       harness.stop()
     }

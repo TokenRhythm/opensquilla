@@ -1097,6 +1097,7 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     assert "test-primary-repair-accessibility.mjs" in run["run"]
     assert "test-profile-import-flow.mjs" in run["run"]
     assert "test-desktop-cleanup-flow.mjs" in run["run"]
+    assert "test-desktop-gateway-ownership.mjs" in run["run"]
     assert "test-unsafe-legacy-recovery-no-write.mjs" in run["run"]
     assert "exit 1" in run["run"]
     assert upload["if"] == "${{ always() }}"

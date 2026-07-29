@@ -141,6 +141,23 @@ describe('RpcClient', () => {
     client.disconnect()
   })
 
+  it('reports the socket generation only after a request frame is sent', async () => {
+    const client = new RpcClient()
+    const onSent = vi.fn()
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+
+    const result = client.call('chat.history', {}, { onSent })
+    const request = JSON.parse(socket.sent[0]) as { id: string }
+
+    expect(onSent).toHaveBeenCalledOnce()
+    expect(onSent).toHaveBeenCalledWith(expect.any(Number))
+
+    socket.receive({ type: 'res', id: request.id, ok: true, payload: {} })
+    await expect(result).resolves.toEqual({})
+    client.disconnect()
+  })
+
   it('rejects a bounded call with a typed timeout and ignores a late response', async () => {
     const client = new RpcClient()
     client.connect('ws://rpc.test')
@@ -257,13 +274,19 @@ describe('RpcClient', () => {
 
   it('cleans a call when send throws and recycles the failed socket', async () => {
     const client = new RpcClient()
+    const onSent = vi.fn()
     client.connect('ws://rpc.test')
     const socket = MockWebSocket.instances[0]
     socket.throwOnSend = true
 
-    const error = await client.call('chat.history').catch((caught: unknown) => caught)
+    const error = await client.call(
+      'chat.history',
+      {},
+      { onSent },
+    ).catch((caught: unknown) => caught)
 
     expect(error).toMatchObject({ message: 'send failed' })
+    expect(onSent).not.toHaveBeenCalled()
     expect(pendingCount(client)).toBe(0)
     expect(socket.readyState).toBe(MockWebSocket.CLOSED)
 

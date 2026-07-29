@@ -32,13 +32,27 @@ function createBootstrap(overrides: {
   subscribeSession?: (
     context: SessionBootstrapPhaseContext,
   ) => Promise<SessionSubscriptionOutcome>
+  markCriticalRequestsSent?: boolean
 } = {}) {
-  const loadHistory = vi.fn(overrides.loadHistory || (async () => ({ ok: true })))
+  const loadHistoryImplementation = overrides.loadHistory || (async () => ({ ok: true }))
+  const loadHistory = vi.fn(async (
+    context: SessionBootstrapPhaseContext,
+    retry: boolean,
+  ) => {
+    // Production marks immediately after RpcClient synchronously sends the
+    // history frame.
+    if (overrides.markCriticalRequestsSent !== false) {
+      context.markHistoryRequestSent?.(context.attempt + 1)
+    }
+    return loadHistoryImplementation(context, retry)
+  })
   const subscribeImplementation = overrides.subscribeSession || (async () => LIVE_READY)
   const subscribeSession = vi.fn(async (context: SessionBootstrapPhaseContext) => {
     // The production subscription marks immediately after its subscribe frame
     // is synchronously sent. Test doubles must model the same wire boundary.
-    context.markLiveSubscribeSent?.()
+    if (overrides.markCriticalRequestsSent !== false) {
+      context.markLiveSubscribeSent?.(context.attempt + 1)
+    }
     return subscribeImplementation(context)
   })
   const cancelHistory = vi.fn()
@@ -69,6 +83,187 @@ afterEach(() => {
 })
 
 describe('useChatSessionBootstrap', () => {
+  it('releases optional traffic after critical frames are queued, not responses', async () => {
+    let resolveHistory!: (result: SessionPhaseResult) => void
+    let resolveLive!: (result: SessionSubscriptionOutcome) => void
+    const history = new Promise<SessionPhaseResult>(resolve => {
+      resolveHistory = resolve
+    })
+    const live = new Promise<SessionSubscriptionOutcome>(resolve => {
+      resolveLive = resolve
+    })
+    const { api } = createBootstrap({
+      loadHistory: async () => history,
+      subscribeSession: async () => live,
+    })
+
+    const run = api.startSessionBootstrap()
+    await run.criticalRequestsQueued
+
+    expect(api.historyPhase.value).toBe('loading')
+    expect(api.livePhase.value).toBe('connecting')
+
+    resolveHistory({ ok: true })
+    resolveLive(LIVE_READY)
+    await Promise.all([run.history, run.live])
+  })
+
+  it('retries a history-only timeout without waiting for a new live registration', async () => {
+    vi.useFakeTimers()
+    let historyAttempt = 0
+    const { api, loadHistory, subscribeSession } = createBootstrap({
+      loadHistory: async () => {
+        historyAttempt += 1
+        return historyAttempt === 1
+          ? {
+              ok: false,
+              error: new RpcTimeoutError('chat.history', 7_000),
+            }
+          : { ok: true }
+      },
+    })
+
+    const run = api.startSessionBootstrap()
+    await vi.runAllTimersAsync()
+    await Promise.all([run.history, run.live])
+
+    expect(loadHistory).toHaveBeenCalledTimes(2)
+    expect(subscribeSession).toHaveBeenCalledOnce()
+    expect(api.historyPhase.value).toBe('ready')
+    expect(api.livePhase.value).toBe('ready')
+  })
+
+  it('queues replacement live registration before retrying legacy history', async () => {
+    const order: string[] = []
+    let resolveFirstHistory!: (result: SessionPhaseResult) => void
+    const { api } = createBootstrap({
+      subscribeSession: async context => {
+        order.push(`subscribe:${context.attempt}`)
+        return LIVE_READY
+      },
+      loadHistory: async context => {
+        order.push(`history:${context.attempt}`)
+        if (context.attempt === 0) {
+          return new Promise(resolve => {
+            resolveFirstHistory = resolve
+          })
+        }
+        return { ok: true }
+      },
+    })
+
+    const run = api.startSessionBootstrap()
+    await run.live
+    api.handleConnectionState('disconnected')
+    resolveFirstHistory({
+      ok: false,
+      error: new RpcTimeoutError('chat.history', 7_000),
+    })
+    await Promise.all([run.history, api.handleConnectionState('connected')!.live])
+
+    expect(order).toEqual([
+      'subscribe:0',
+      'history:0',
+      'subscribe:1',
+      'history:1',
+    ])
+    expect(api.livePhase.value).toBe('ready')
+    expect(api.historyPhase.value).toBe('ready')
+  })
+
+  it('rearms the critical queue for a replacement socket', async () => {
+    let resolveFirstHistory!: (result: SessionPhaseResult) => void
+    let historyAttempt = 0
+    const connectionFailure = new Error('connection closed')
+    const { api, loadHistory, subscribeSession } = createBootstrap({
+      loadHistory: async () => {
+        historyAttempt += 1
+        if (historyAttempt === 1) {
+          return new Promise(resolve => {
+            resolveFirstHistory = resolve
+          })
+        }
+        return { ok: true }
+      },
+    })
+
+    const initial = api.startSessionBootstrap()
+    await initial.criticalRequestsQueued
+    await initial.live
+
+    const recovery = api.handleConnectionState('disconnected')!
+    let replacementQueued = false
+    void recovery.criticalRequestsQueued.then(() => {
+      replacementQueued = true
+    })
+    await Promise.resolve()
+    expect(replacementQueued).toBe(false)
+
+    resolveFirstHistory({ ok: false, error: connectionFailure })
+    await recovery.criticalRequestsQueued
+    await Promise.all([recovery.history, recovery.live])
+
+    expect(loadHistory).toHaveBeenCalledTimes(2)
+    expect(subscribeSession).toHaveBeenCalledTimes(2)
+    expect(replacementQueued).toBe(true)
+  })
+
+  it('keeps existing queue waiters blocked across a same-run reconnect', async () => {
+    let resolveFirstLive!: (result: SessionSubscriptionOutcome) => void
+    let liveAttempt = 0
+    const { api } = createBootstrap({
+      markCriticalRequestsSent: false,
+      subscribeSession: async context => {
+        liveAttempt += 1
+        if (liveAttempt === 1) {
+          return new Promise(resolve => {
+            resolveFirstLive = resolve
+          })
+        }
+        context.markLiveSubscribeSent?.(2)
+        return LIVE_READY
+      },
+      loadHistory: async context => {
+        context.markHistoryRequestSent?.(2)
+        return { ok: true }
+      },
+    })
+
+    const initial = api.startSessionBootstrap()
+    let initialQueued = false
+    void initial.criticalRequestsQueued.then(() => {
+      initialQueued = true
+    })
+
+    const firstRecovery = api.handleConnectionState('disconnected')!
+    let firstReplacementQueued = false
+    void firstRecovery.criticalRequestsQueued.then(() => {
+      firstReplacementQueued = true
+    })
+    const latestRecovery = api.handleConnectionState('disconnected')!
+    let latestReplacementQueued = false
+    void latestRecovery.criticalRequestsQueued.then(() => {
+      latestReplacementQueued = true
+    })
+    await Promise.resolve()
+    expect(initialQueued).toBe(false)
+    expect(firstReplacementQueued).toBe(false)
+    expect(latestReplacementQueued).toBe(false)
+
+    resolveFirstLive({
+      ...UNAVAILABLE_FOR_TEST,
+      error: new Error('connection closed'),
+    })
+    await latestRecovery.criticalRequestsQueued
+    await firstRecovery.criticalRequestsQueued
+    await Promise.all([latestRecovery.history, latestRecovery.live])
+
+    expect(initialQueued).toBe(true)
+    expect(firstReplacementQueued).toBe(true)
+    expect(latestReplacementQueued).toBe(true)
+    expect(liveAttempt).toBe(2)
+  })
+
   it('cancels delayed auto-send when text or attachments changed', () => {
     const attachment = { id: 1 }
     expect(autoSendDraftIsUnchanged(

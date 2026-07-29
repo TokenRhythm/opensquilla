@@ -34,6 +34,7 @@ describe('useChatSessionRuntime project drafts', () => {
       cancelSessionBootstrap: vi.fn(),
       startSessionBootstrap: vi.fn(() => ({
         generation: 1,
+        criticalRequestsQueued: Promise.resolve(),
         history: Promise.resolve({ ok: true }),
         live: Promise.resolve({
           authoritative: true,
@@ -60,10 +61,14 @@ describe('useChatSessionRuntime project drafts', () => {
     expect(resetDraftComposer).toHaveBeenCalledOnce()
   })
 
-  it('starts critical session bootstrap before optional usage and waits for both phases', async () => {
+  it('loads optional usage once critical requests are queued without waiting for history', async () => {
     const sessionKey = ref('agent:main:webchat:first')
+    let resolveCriticalRequestsQueued!: () => void
     let resolveHistory!: () => void
     let resolveLive!: () => void
+    const criticalRequestsQueued = new Promise<void>(resolve => {
+      resolveCriticalRequestsQueued = resolve
+    })
     const history = new Promise<{ ok: boolean }>(resolve => {
       resolveHistory = () => resolve({ ok: true })
     })
@@ -81,7 +86,12 @@ describe('useChatSessionRuntime project drafts', () => {
     const order: string[] = []
     const startSessionBootstrap = vi.fn(() => {
       order.push('bootstrap')
-      return { generation: 1, history, live }
+      return {
+        generation: 1,
+        criticalRequestsQueued,
+        history,
+        live,
+      }
     })
     const loadCurrentSessionUsage = vi.fn(() => {
       order.push('usage')
@@ -127,13 +137,17 @@ describe('useChatSessionRuntime project drafts', () => {
 
     const switching = runtime.switchToSession('agent:main:webchat:second')
     expect(order).toEqual(['bootstrap'])
+    expect(loadCurrentSessionUsage).not.toHaveBeenCalled()
+
+    resolveCriticalRequestsQueued()
+    await vi.waitFor(() => expect(loadCurrentSessionUsage).toHaveBeenCalledOnce())
+    expect(order).toEqual(['bootstrap', 'usage'])
 
     resolveLive()
     await switching
-    expect(loadCurrentSessionUsage).not.toHaveBeenCalled()
+    expect(loadCurrentSessionUsage).toHaveBeenCalledOnce()
 
     resolveHistory()
-    await vi.waitFor(() => expect(loadCurrentSessionUsage).toHaveBeenCalledOnce())
-    expect(order).toEqual(['bootstrap', 'usage'])
+    await history
   })
 })

@@ -353,6 +353,114 @@ def test_merge_session_database_imports_complete_supported_session_graph(
         assert merged.execute("SELECT COUNT(*) FROM router_decisions").fetchone() == (0,)
 
 
+def test_deduplicated_session_imports_missing_usage_graph_idempotently(
+    tmp_path: Path,
+) -> None:
+    target_path = tmp_path / "target.db"
+    source_path = tmp_path / "source.db"
+    target = _database(target_path)
+    source = _database(source_path)
+    key = "agent:main:same"
+    _add_session(
+        target,
+        key=key,
+        session_id="primary-session",
+        content="same conversation",
+        suffix="same",
+    )
+    _add_session(
+        source,
+        key=key,
+        session_id="recovery-session",
+        content="same conversation",
+        suffix="same",
+    )
+    source.execute(
+        """
+        INSERT INTO usage_events(event_id, execution_id, call_index, session_id, status)
+        VALUES ('event-source-only', 'execution-source-only', 0, ?, 'finalized')
+        """,
+        ("recovery-session",),
+    )
+    source.execute(
+        """
+        INSERT INTO usage_event_items(event_id, ordinal, model)
+        VALUES ('event-source-only', 0, 'source-model')
+        """
+    )
+    source.execute(
+        """
+        INSERT INTO usage_item_billing_receipts(event_id, ordinal, currency)
+        VALUES ('event-source-only', 0, 'USD')
+        """
+    )
+    source.commit()
+    target.execute("DELETE FROM usage_item_billing_receipts")
+    target.execute("DELETE FROM usage_event_items")
+    target.execute("DELETE FROM usage_legacy_baselines")
+    target.commit()
+    target.close()
+    source.close()
+
+    first = merge_session_database(
+        target_path,
+        source_path,
+        source_id="13131313-1313-4313-8313-131313131313",
+    )
+
+    assert first.imported_sessions == 0
+    assert first.deduplicated_sessions == 1
+    assert first.imported_rows == {
+        "usage_events": 1,
+        "usage_event_items": 2,
+        "usage_item_billing_receipts": 2,
+        "usage_legacy_baselines": 1,
+    }
+    with sqlite3.connect(target_path) as merged:
+        assert merged.execute("SELECT COUNT(*) FROM sessions").fetchone() == (1,)
+        assert merged.execute(
+            "SELECT event_id, session_id FROM usage_events ORDER BY event_id"
+        ).fetchall() == [
+            ("event-same", "primary-session"),
+            ("event-source-only", "primary-session"),
+        ]
+        assert merged.execute(
+            "SELECT event_id, ordinal FROM usage_event_items ORDER BY event_id"
+        ).fetchall() == [("event-same", 0), ("event-source-only", 0)]
+        assert merged.execute(
+            "SELECT event_id, ordinal FROM usage_item_billing_receipts ORDER BY event_id"
+        ).fetchall() == [("event-same", 0), ("event-source-only", 0)]
+        assert merged.execute(
+            "SELECT session_id, session_epoch, total_tokens "
+            "FROM usage_legacy_baselines"
+        ).fetchall() == [("primary-session", 0, 7)]
+        counts_before = {
+            table: merged.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in (
+                "sessions",
+                "usage_events",
+                "usage_event_items",
+                "usage_item_billing_receipts",
+                "usage_legacy_baselines",
+            )
+        }
+
+    second = merge_session_database(
+        target_path,
+        source_path,
+        source_id="13131313-1313-4313-8313-131313131313",
+    )
+
+    assert second.imported_sessions == 0
+    assert second.deduplicated_sessions == 1
+    assert second.imported_rows == {}
+    with sqlite3.connect(target_path) as merged:
+        assert {
+            table: merged.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in counts_before
+        } == counts_before
+
+
 def test_merge_uses_injected_schema_preparer_for_existing_target(
     tmp_path: Path,
 ) -> None:

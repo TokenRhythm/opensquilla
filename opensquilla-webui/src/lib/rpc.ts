@@ -24,6 +24,8 @@ export interface RpcCallOptions {
   signal?: AbortSignal;
   timeoutAction?: RpcTerminationAction;
   abortAction?: RpcTerminationAction;
+  /** Called synchronously only after the request frame is accepted by send(). */
+  onSent?: (socketGeneration: number) => void;
 }
 
 export interface RpcConnectionWaitOptions {
@@ -206,6 +208,13 @@ export class RpcClient {
           error instanceof Error ? error : new Error('Failed to send RPC request');
         this._rejectPending(id, sendError, generation);
         this._recycleConnection(generation, sendError);
+        return;
+      }
+      try {
+        options.onSent?.(generation);
+      } catch {
+        // A send receipt is observational. It must never fail a request whose
+        // frame is already on the wire.
       }
     });
   }
