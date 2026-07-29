@@ -9,6 +9,16 @@ function successResponse(id: string, payload: unknown) {
   return JSON.stringify({ type: 'res', id, ok: true, payload })
 }
 
+function helloResponse(tickIntervalMs: number) {
+  return JSON.stringify({
+    protocol: 3,
+    policy: {
+      tick_interval_ms: tickIntervalMs,
+      concurrent_history_reads: true,
+    },
+  })
+}
+
 function basePayload(method: string): unknown {
   const payloads: Record<string, unknown> = {
     'agents.list': { agents: [] },
@@ -58,13 +68,13 @@ async function stubApprovals(page: Page) {
 }
 
 test('keeps the conversation usable while startup and long history are delayed', async ({ page }) => {
-  let releaseConfig: (() => void) | undefined
   let releaseHistory: (() => void) | undefined
+  let chatSendRequests = 0
   let usageRequests = 0
   const receivedMethods: string[] = []
   const sessionRequestOrder: string[] = []
 
-  await page.setViewportSize({ width: 390, height: 844 })
+  await page.setViewportSize({ width: 1280, height: 900 })
   await page.addInitScript(() => {
     const state = { emptySeen: false }
     Object.defineProperty(window, '__opensquillaHistoryHydrationTest', { value: state })
@@ -76,83 +86,99 @@ test('keeps the conversation usable while startup and long history are delayed',
   })
   await stubApprovals(page)
   await page.routeWebSocket(/\/ws$/, ws => {
-    const queue: Array<Record<string, unknown>> = []
-    let active: Record<string, unknown> | null = null
-    const finish = (frame: Record<string, unknown>, payload: unknown) => {
-      ws.send(successResponse(String(frame.id), payload))
-      active = null
-      drain()
-    }
-    const drain = () => {
-      if (active || queue.length === 0) return
-      const frame = queue.shift()!
-      active = frame
-      const method = String(frame.method || '')
-      if (method.startsWith('sessions.messages.') || method === 'chat.history') {
-        sessionRequestOrder.push(method)
-      }
-      if (method === 'config.get') {
-        releaseConfig = () => finish(frame, {
-          squilla_router: { enabled: false, rollout_phase: 'observe', tiers: {} },
-          permissions: {},
-          skills: {},
-        })
-        return
-      }
-      if (method === 'usage.status') {
-        usageRequests += 1
-        // Optional metadata remains intentionally stalled. It must only
-        // enter the serialized queue after history/live are terminal.
-        return
-      }
-      if (method === 'chat.history') {
-        releaseHistory = () => finish(frame, {
-          messages: longHistoryMessages(),
-          has_more: true,
-          oldest_cursor: 'cursor-50',
-          newest_cursor: 'cursor-100',
-          canonical_available: true,
-          canonical_complete: true,
-        })
-        return
-      }
-      if (method === 'sessions.messages.snapshot') {
-        finish(frame, {
-          key: SESSION_KEY,
-          events: [],
-          current_stream_seq: 0,
-        })
-        return
-      }
-      finish(frame, basePayload(method))
-    }
     ws.send(JSON.stringify({ type: 'event', event: 'connect.challenge', payload: {} }))
     ws.onMessage(message => {
       try {
         const frame = JSON.parse(String(message))
         if (frame?.type !== 'req') return
         if (frame.method === 'connect') {
-          ws.send(JSON.stringify({ protocol: 3, policy: { tick_interval_ms: 30000 } }))
+          ws.send(helloResponse(30000))
           return
         }
-        receivedMethods.push(String(frame.method || ''))
-        queue.push(frame)
-        drain()
+        const method = String(frame.method || '')
+        receivedMethods.push(method)
+        if (method.startsWith('sessions.messages.') || method === 'chat.history') {
+          sessionRequestOrder.push(method)
+        }
+        if (method === 'chat.history') {
+          releaseHistory = () => ws.send(successResponse(String(frame.id), {
+            messages: longHistoryMessages(),
+            has_more: true,
+            oldest_cursor: 'cursor-50',
+            newest_cursor: 'cursor-100',
+            canonical_available: true,
+            canonical_complete: true,
+          }))
+          return
+        }
+        if (method === 'sessions.messages.snapshot') {
+          ws.send(successResponse(String(frame.id), {
+            key: SESSION_KEY,
+            events: [],
+            current_stream_seq: 0,
+          }))
+          return
+        }
+        if (method === 'sessions.messages.subscribe') {
+          ws.send(successResponse(String(frame.id), {
+            subscribed: true,
+            hydration_complete: false,
+            replay_complete: true,
+            current_stream_seq: 0,
+            run_status: 'idle',
+          }))
+          return
+        }
+        if (method === 'sessions.messages.hydrate') {
+          ws.send(successResponse(String(frame.id), {
+            hydration_complete: true,
+            workspaceId: null,
+            run_status: 'idle',
+          }))
+          return
+        }
+        if (method === 'sessions.list') {
+          ws.send(successResponse(String(frame.id), {
+            sessions: [{
+              key: SESSION_KEY,
+              title: 'Visible while history is pending',
+              sessionKind: 'chat',
+              surface: 'webchat',
+              conversationKind: 'direct',
+              effectiveAgentId: 'main',
+              updatedAt: 100,
+              messageCount: 50,
+              status: 'ok',
+              runStatus: 'idle',
+            }],
+            has_more: false,
+          }))
+          return
+        }
+        if (method === 'chat.send') {
+          chatSendRequests += 1
+          ws.send(successResponse(String(frame.id), {
+            sessionKey: SESSION_KEY,
+            status: 'accepted',
+            task_id: 'e2e-history-interactive-send',
+            message_id: 'e2e-history-interactive-message',
+          }))
+          return
+        }
+        if (method === 'usage.status') usageRequests += 1
+        ws.send(successResponse(String(frame.id), basePayload(method)))
       } catch {}
     })
   })
 
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-  const recovery = page.locator(
+  const hiddenRecovery = page.locator(
     '[data-testid="chat-session-recovery-status"][data-recovery-state="history-loading"]',
   )
   const thread = page.locator('.chat-thread')
   const composer = page.getByRole('textbox', { name: 'Message to send' })
 
   await expect.poll(() => Boolean(releaseHistory)).toBe(true)
-  // Optional configuration must not be queued ahead of critical session
-  // recovery on the Gateway's serial dispatcher.
-  expect(releaseConfig).toBeUndefined()
   const criticalStartupOrder = [
     'sessions.messages.subscribe',
     'sessions.messages.snapshot',
@@ -164,41 +190,46 @@ test('keeps the conversation usable while startup and long history are delayed',
   expect(sessionRequestOrder.slice(0, criticalStartupOrder.length)).toEqual(
     criticalStartupOrder,
   )
+  // Critical ordering is preserved, but independent UI data starts as soon as
+  // those frames are queued instead of waiting for the history response.
   for (const optionalMethod of [
     'onboarding.status',
-    'sandbox.setup.status',
     'sessions.subscribe',
     'sessions.list',
     'agents.list',
-    'workspaces.list',
     'config.get',
     'commands.list_for_surface',
     'usage.status',
   ]) {
-    expect(receivedMethods).not.toContain(optionalMethod)
+    await expect.poll(() => receivedMethods).toContain(optionalMethod)
   }
-  await expect(recovery).toBeVisible()
-  await expect(recovery).toHaveAttribute('data-recovery-state', 'history-loading')
-  await expect(recovery).toHaveAttribute('role', 'status')
+  await expect.poll(() => receivedMethods).toContain('sessions.messages.hydrate')
+  await expect.poll(() => usageRequests).toBeGreaterThan(0)
+  await expect(hiddenRecovery).toHaveCount(0)
   await expect(page.getByTestId('chat-session-load-state')).toHaveCount(0)
   await expect(thread).toHaveAttribute('aria-busy', 'false')
+  await expect(
+    page.locator('.sidebar-history-row[data-session-key]')
+      .filter({ hasText: 'Visible while history is pending' }),
+  ).toBeVisible()
   await expect(composer).toBeEditable()
   await composer.fill('Draft remains editable while history loads.')
   await expect(composer).toHaveValue('Draft remains editable while history loads.')
+  await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeEnabled()
   await expect(page.locator('.chat-empty')).toHaveCount(0)
+  const themeButton = page.getByRole('button', { name: 'Theme', exact: true })
+  await themeButton.click()
+  await expect(page.getByRole('menu', { name: 'Theme' })).toBeVisible()
+  await page.keyboard.press('Escape')
+  await expect(page.getByRole('menu', { name: 'Theme' })).toHaveCount(0)
+  await page.getByRole('button', { name: 'Send', exact: true }).click()
+  await expect.poll(() => chatSendRequests).toBe(1)
 
-  // The session becomes usable before optional configuration and usage begin.
   releaseHistory?.()
   await expect(page.getByText('Hydration complete.')).toBeVisible()
-  await expect(recovery).toHaveCount(0)
-  await expect(thread).toHaveAttribute('aria-busy', 'false')
+  await expect(hiddenRecovery).toHaveCount(0)
   await expect(page.getByTestId('history-load-sentinel')).toBeAttached()
-  await expect(composer).toHaveValue('Draft remains editable while history loads.')
-  await expect.poll(() => Boolean(releaseConfig)).toBe(true)
-  releaseConfig?.()
-  await expect.poll(() => usageRequests).toBe(1)
-  await expect(page.getByText('Hydration complete.')).toBeVisible()
-  await expect(composer).toHaveValue('Draft remains editable while history loads.')
+  await expect(composer).toHaveValue('')
   await expect.poll(() => page.evaluate(() => {
     const state = (window as unknown as {
       __opensquillaHistoryHydrationTest?: { emptySeen?: boolean }
@@ -208,6 +239,99 @@ test('keeps the conversation usable while startup and long history are delayed',
   await expect.poll(() => page.evaluate(() => (
     document.documentElement.scrollWidth <= document.documentElement.clientWidth
   ))).toBe(true)
+})
+
+test('recovers from stuck automatic metadata before sending', async ({ page }) => {
+  let socketCount = 0
+  let heldConfigRequests = 0
+  let chatSendSocket = 0
+
+  await stubApprovals(page)
+  await page.routeWebSocket(/\/ws$/, ws => {
+    const socketNumber = ++socketCount
+    let metadataStuck = false
+    ws.send(JSON.stringify({ type: 'event', event: 'connect.challenge', payload: {} }))
+    ws.onMessage(message => {
+      try {
+        const frame = JSON.parse(String(message))
+        if (frame?.type !== 'req') return
+        const method = String(frame.method || '')
+        if (method === 'connect') {
+          ws.send(helloResponse(30000))
+          return
+        }
+        if (socketNumber === 1 && method === 'config.get') {
+          heldConfigRequests += 1
+          metadataStuck = true
+          return
+        }
+        // Model the Gateway's serial dispatcher: once the optional read is
+        // stuck, every later request on this socket remains queued behind it.
+        if (socketNumber === 1 && metadataStuck) return
+        if (method === 'sessions.messages.snapshot') {
+          ws.send(successResponse(String(frame.id), {
+            key: SESSION_KEY,
+            events: [],
+            current_stream_seq: 0,
+          }))
+          return
+        }
+        if (method === 'sessions.messages.subscribe') {
+          ws.send(successResponse(String(frame.id), {
+            subscribed: true,
+            hydration_complete: true,
+            replay_complete: true,
+            current_stream_seq: 0,
+            run_status: 'idle',
+          }))
+          return
+        }
+        if (method === 'sessions.messages.hydrate') {
+          ws.send(successResponse(String(frame.id), {
+            hydration_complete: true,
+            run_status: 'idle',
+          }))
+          return
+        }
+        if (method === 'chat.history') {
+          ws.send(successResponse(String(frame.id), {
+            messages: [],
+            has_more: false,
+            oldest_cursor: null,
+            newest_cursor: null,
+            canonical_available: true,
+            canonical_complete: true,
+          }))
+          return
+        }
+        if (method === 'chat.send') {
+          chatSendSocket = socketNumber
+          ws.send(successResponse(String(frame.id), {
+            sessionKey: SESSION_KEY,
+            status: 'accepted',
+            task_id: 'e2e-after-metadata-reconnect',
+            message_id: 'e2e-after-metadata-reconnect-message',
+          }))
+          return
+        }
+        ws.send(successResponse(String(frame.id), basePayload(method)))
+      } catch {}
+    })
+  })
+
+  await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
+  await expect.poll(() => heldConfigRequests).toBeGreaterThan(0)
+  await expect.poll(() => socketCount, { timeout: 10_000 }).toBeGreaterThan(1)
+
+  const composer = page.getByRole('textbox', { name: 'Message to send' })
+  const send = page.getByRole('button', { name: 'Send', exact: true })
+  await expect(composer).toBeEditable()
+  await composer.fill('Send after automatic metadata recovery.')
+  await expect(send).toBeEnabled()
+  await send.click()
+
+  await expect.poll(() => chatSendSocket).toBeGreaterThan(1)
+  await expect(composer).toHaveValue('')
 })
 
 test('shows a recoverable initial failure and retries it', async ({ page }) => {
@@ -222,7 +346,7 @@ test('shows a recoverable initial failure and retries it', async ({ page }) => {
         const frame = JSON.parse(String(message))
         if (frame?.type !== 'req') return
         if (frame.method === 'connect') {
-          ws.send(JSON.stringify({ protocol: 3, policy: { tick_interval_ms: 30000 } }))
+          ws.send(helloResponse(30000))
           return
         }
         if (frame.method === 'config.get') {
@@ -333,7 +457,7 @@ test('terminates stalled history and live hydration despite ongoing ticks, then 
         const frame = JSON.parse(String(message))
         if (frame?.type !== 'req') return
         if (frame.method === 'connect') {
-          ws.send(JSON.stringify({ protocol: 3, policy: { tick_interval_ms: 1000 } }))
+          ws.send(helloResponse(1000))
           return
         }
         if (frame.method === 'sessions.messages.snapshot') {
@@ -464,7 +588,7 @@ test('preserves a Sessions Hub auto-send draft when live recovery terminates', a
         const frame = JSON.parse(String(message))
         if (frame?.type !== 'req') return
         if (frame.method === 'connect') {
-          ws.send(JSON.stringify({ protocol: 3, policy: { tick_interval_ms: 1000 } }))
+          ws.send(helloResponse(1000))
           return
         }
         if (frame.method === 'sessions.messages.snapshot') {
@@ -549,7 +673,7 @@ test('cancels delayed auto-send when the user edits the draft before live is rea
         const frame = JSON.parse(String(message))
         if (frame?.type !== 'req') return
         if (frame.method === 'connect') {
-          ws.send(JSON.stringify({ protocol: 3, policy: { tick_interval_ms: 30000 } }))
+          ws.send(helloResponse(30000))
           return
         }
         if (frame.method === 'sessions.messages.snapshot') {
@@ -612,7 +736,7 @@ test('keeps loaded messages visible when an earlier page fails and retries inlin
         const frame = JSON.parse(String(message))
         if (frame?.type !== 'req') return
         if (frame.method === 'connect') {
-          ws.send(JSON.stringify({ protocol: 3, policy: { tick_interval_ms: 30000 } }))
+          ws.send(helloResponse(30000))
           return
         }
         if (frame.method === 'config.get') {
@@ -700,7 +824,7 @@ test('ignores a late history response after navigating to another session', asyn
         const frame = JSON.parse(String(message))
         if (frame?.type !== 'req') return
         if (frame.method === 'connect') {
-          ws.send(JSON.stringify({ protocol: 3, policy: { tick_interval_ms: 30000 } }))
+          ws.send(helloResponse(30000))
           return
         }
         if (frame.method === 'sessions.list') {

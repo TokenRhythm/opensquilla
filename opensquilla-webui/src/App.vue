@@ -508,7 +508,9 @@ const router = useRouter()
 watch(() => appStore.locale, () => {
   document.title = `${routeTitle($route)} — OpenSquilla`
 })
-const { allSessions, sessionListError, isLoading, loadSessions } = useSessions()
+const { allSessions, sessionListError, isLoading, loadSessions } = useSessions(
+  optionalSessionRpcCallOptions,
+)
 const { bottomRoutes, workNav } = useNavigation()
 // Axis-B: the active expressive skin for the routed content area (meta.skin).
 const { skinId, variants } = useSurfaceSkin()
@@ -554,7 +556,7 @@ const webConfigEnabled = getPlatform().capabilities.hasWebConfig
 installSessionNavigationDiagConsole()
 
 // Shared agents.list state + fetch (singleton) for sidebar session metadata.
-const { agents, loadAgents } = useAgentOptions()
+const { agents, loadAgents } = useAgentOptions(optionalSessionRpcCallOptions)
 const mobileKeyboardOpen = ref(false)
 const commandPaletteOpen = ref(false)
 const localChatSessions = ref<Record<string, { effectiveAgentId: string; title: string; updatedAt: number }>>({})
@@ -1420,6 +1422,7 @@ function refreshSidebarDataWhenAdmitted(): void | Promise<void> {
 
 const sessionListSubscription = useSessionListSubscription({
   rpc: rpcStore,
+  callOptions: optionalSessionRpcCallOptions,
   isConnected: () => rpcStore.isConnected,
   isAdmitted: () => optionalSessionRpcAllowed.value,
   refresh: refreshSidebarDataWhenAdmitted,

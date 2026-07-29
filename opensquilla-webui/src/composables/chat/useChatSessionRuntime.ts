@@ -128,10 +128,9 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     // orthogonal. Response hand-off only waits for the authoritative live
     // snapshot; history can recover independently without blocking adoption.
     const bootstrap = options.startSessionBootstrap({ includeHistory: true })
-    // Usage is optional metadata. Let both critical bootstrap phases finish
-    // before it can enter the Gateway's serialized RPC queue; otherwise an
-    // unresponsive usage read can head-of-line block history and subscribe.
-    void Promise.allSettled([bootstrap.history, bootstrap.live]).then(() => {
+    // Usage is optional metadata. Start it once the critical request frames are
+    // queued; a slow history response must not withhold the rest of the UI.
+    void bootstrap.criticalRequestsQueued.then(() => {
       if (options.sessionKey.value === key) void options.loadCurrentSessionUsage()
     })
     const subscriptionOutcome = await bootstrap.live

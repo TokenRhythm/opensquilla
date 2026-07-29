@@ -1125,10 +1125,11 @@ def test_desktop_recovers_only_cryptographically_verified_orphan_gateway() -> No
     start = _section(main_ts, "async function startGateway", "async function loadControlUi")
 
     assert "loadDesktopGatewayOwnershipRecord(ownershipDir)" in recovery
-    assert "record.profile_fingerprint !== desktopProfileFingerprint(profile.home)" in recovery
-    assert "await verifyDesktopGatewayOwnershipWhenReady(ownershipDir, record)" in recovery
-    assert "await requestVerifiedDesktopGatewayShutdown(record)" in recovery
-    assert "await waitForDesktopGatewayOwnershipRelease(ownershipDir, record" in recovery
+    assert "runRecovery(ownershipDir, record" in recovery
+    assert "current.profile_fingerprint !== desktopProfileFingerprint(profile.home)" in recovery
+    assert "await verifyDesktopGatewayOwnershipWhenReady(ownershipDir, current)" in recovery
+    assert "await requestVerifiedDesktopGatewayShutdown(current)" in recovery
+    assert "await waitForDesktopGatewayOwnershipRelease(ownershipDir, current" in recovery
     assert "process.kill(" not in recovery
     assert "hardTerminateGatewayProcess(" not in recovery
     assert "unlink(" not in recovery
@@ -1159,9 +1160,9 @@ def test_unverified_or_legacy_gateway_record_never_grants_stop_authority() -> No
     )
 
     verification = recovery.index(
-        "if (!await verifyDesktopGatewayOwnershipWhenReady(ownershipDir, record))"
+        "if (!await verifyDesktopGatewayOwnershipWhenReady(ownershipDir, current))"
     )
-    shutdown = recovery.index("requestVerifiedDesktopGatewayShutdown(record)")
+    shutdown = recovery.index("requestVerifiedDesktopGatewayShutdown(current)")
     assert verification < shutdown
     assert "gateway_ownership_record_untrusted" in recovery
     assert "gateway_ownership_not_verified" in recovery

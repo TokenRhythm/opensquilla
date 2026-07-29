@@ -25,9 +25,14 @@ export interface SessionBootstrapPhaseContext {
    * Marks that this attempt's subscribe frame was synchronously sent. History
    * may then enter the serialized Gateway queue behind it.
    */
-  markLiveSubscribeSent?: () => void
-  /** Optional metadata hydration starts only after canonical history settles. */
-  waitForHistoryTerminal?: () => Promise<unknown>
+  markLiveSubscribeSent?: (socketGeneration: number) => void
+  /** Marks that the canonical history frame was synchronously sent. */
+  markHistoryRequestSent?: (socketGeneration: number) => void
+  /**
+   * Optional metadata may start once the critical frames are on the wire. It
+   * must not wait for a potentially slow history response.
+   */
+  waitForCriticalRequestsQueued?: () => Promise<void>
 }
 
 export interface SessionPhaseResult<T = void> {

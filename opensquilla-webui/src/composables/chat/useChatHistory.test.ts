@@ -12,6 +12,7 @@ function makeHistory(autoScroll = true, overrides: {
   preserveLiveTail?: boolean
   sessionKey?: Ref<string>
   threadRef?: Ref<HTMLElement | null>
+  concurrentHistoryReads?: boolean
 } = {}) {
   const response: ChatHistoryResponse = overrides.response || {
     messages: [
@@ -30,6 +31,9 @@ function makeHistory(autoScroll = true, overrides: {
   }
   const messages = ref<ChatMessage[]>(overrides.messages || [])
   const rpc = {
+    policy: {
+      concurrent_history_reads: overrides.concurrentHistoryReads ?? true,
+    },
     waitForConnection: vi.fn().mockResolvedValue(undefined),
     call: vi.fn().mockResolvedValue(response),
   }
@@ -69,13 +73,13 @@ describe('useChatHistory canonical pagination', () => {
     expect(rpc.call).toHaveBeenCalledWith('chat.history', expect.objectContaining({
       includeCanonical: true,
       includeSummaries: false,
-    }), expect.objectContaining({ timeoutAction: 'reconnect' }))
+    }), expect.objectContaining({ timeoutAction: 'reject' }))
     expect(api.historyState.value).toMatchObject({
       initialLoadStatus: 'ready',
     })
   })
 
-  it('applies the shared bootstrap deadline and reconnect-on-timeout contract', async () => {
+  it('applies the shared bootstrap deadline without recycling on history timeout', async () => {
     const { api, rpc } = makeHistory()
     const now = Date.now()
     const controller = new AbortController()
@@ -94,8 +98,8 @@ describe('useChatHistory canonical pagination', () => {
       expect.any(Number),
       expect.any(AbortSignal),
       {
-        timeoutAction: 'reconnect',
-        abortAction: 'reconnect',
+        timeoutAction: 'reject',
+        abortAction: 'reject',
       },
     )
     expect(rpc.call).toHaveBeenCalledWith(
@@ -104,6 +108,33 @@ describe('useChatHistory canonical pagination', () => {
       expect.objectContaining({
         timeoutMs: expect.any(Number),
         signal: expect.any(AbortSignal),
+        timeoutAction: 'reject',
+        abortAction: 'reject',
+        onSent: expect.any(Function),
+      }),
+    )
+  })
+
+  it('recycles a legacy serial Gateway when history is abandoned', async () => {
+    const { api, rpc } = makeHistory(true, {
+      concurrentHistoryReads: false,
+    })
+    const now = Date.now()
+
+    await api.loadHistory({}, {
+      generation: 1,
+      key: 'agent:main:webchat:test',
+      attempt: 0,
+      deadlineAt: now + 15_000,
+      attemptDeadlineAt: now + 7_000,
+      signal: new AbortController().signal,
+      skipSnapshot: false,
+    })
+
+    expect(rpc.call).toHaveBeenCalledWith(
+      'chat.history',
+      expect.any(Object),
+      expect.objectContaining({
         timeoutAction: 'reconnect',
         abortAction: 'reconnect',
       }),
@@ -427,7 +458,7 @@ describe('useChatHistory canonical pagination', () => {
 
     expect(rpc.call).toHaveBeenNthCalledWith(4, 'chat.history', expect.objectContaining({
       before: 'cursor-3',
-    }), expect.objectContaining({ timeoutAction: 'reconnect' }))
+    }), expect.objectContaining({ timeoutAction: 'reject' }))
     await vi.waitFor(() => {
       expect(messages.value.map(message => message.messageId)).toEqual(['m2', 'm3', 'm4', 'm5'])
     })
@@ -477,7 +508,7 @@ describe('useChatHistory canonical pagination', () => {
     expect(messages.value.map(message => message.messageId)).toEqual(['m2', 'm3', 'm4'])
     expect(rpc.call).toHaveBeenNthCalledWith(3, 'chat.history', expect.objectContaining({
       before: 'cursor-4',
-    }), expect.objectContaining({ timeoutAction: 'reconnect' }))
+    }), expect.objectContaining({ timeoutAction: 'reject' }))
   })
 
   it('keeps more than 200 loaded canonical messages during a latest-window refresh', async () => {
@@ -595,16 +626,16 @@ describe('useChatHistory canonical pagination', () => {
     expect(rpc.call).toHaveBeenNthCalledWith(4, 'chat.history', expect.objectContaining({
       after: 'cursor-299',
       limit: 200,
-    }), expect.objectContaining({ timeoutAction: 'reconnect' }))
+    }), expect.objectContaining({ timeoutAction: 'reject' }))
     expect(rpc.call).toHaveBeenNthCalledWith(5, 'chat.history', expect.objectContaining({
       after: 'cursor-499',
       limit: 200,
-    }), expect.objectContaining({ timeoutAction: 'reconnect' }))
+    }), expect.objectContaining({ timeoutAction: 'reject' }))
 
     await api.loadEarlierHistory()
     expect(rpc.call).toHaveBeenNthCalledWith(6, 'chat.history', expect.objectContaining({
       before: 'cursor-200',
-    }), expect.objectContaining({ timeoutAction: 'reconnect' }))
+    }), expect.objectContaining({ timeoutAction: 'reject' }))
   })
 
   it('bounds each disconnected forward bridge and resumes from the saved cursor', async () => {
@@ -673,7 +704,7 @@ describe('useChatHistory canonical pagination', () => {
     await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledTimes(7))
     expect(rpc.call).toHaveBeenNthCalledWith(7, 'chat.history', expect.objectContaining({
       after: 'cursor-12',
-    }), expect.objectContaining({ timeoutAction: 'reconnect' }))
+    }), expect.objectContaining({ timeoutAction: 'reject' }))
     expect(messages.value.map(message => message.messageId)).toEqual([
       'm7', 'm8', 'm9', 'm10', 'm11', 'm12', 'm13', 'm14', 'm15', 'm16',
       'm17', 'm18', 'm19', 'm20',
@@ -752,7 +783,7 @@ describe('useChatHistory canonical pagination', () => {
     ])
     expect(rpc.call).toHaveBeenNthCalledWith(6, 'chat.history', expect.objectContaining({
       after: 'cursor-4',
-    }), expect.objectContaining({ timeoutAction: 'reconnect' }))
+    }), expect.objectContaining({ timeoutAction: 'reject' }))
   })
 
   it('stops a forward bridge when its cursor does not advance', async () => {

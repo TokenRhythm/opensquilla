@@ -131,9 +131,9 @@ try {
   assert.equal(
     await page.locator(
       '[data-testid="chat-session-recovery-status"][data-recovery-state="history-loading"]',
-    ).isVisible(),
-    true,
-    'packaged history recovery must use the compact non-blocking status',
+    ).count(),
+    0,
+    'routine packaged history loading must not render a recovery notice',
   )
   assert.equal(
     await thread.getAttribute('aria-busy'),

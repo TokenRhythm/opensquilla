@@ -9,6 +9,7 @@ import {
   useChatRunModePreference,
   type RunModePolicy,
 } from './useChatRunModePreference'
+import type { RpcCallOptions } from '@/lib/rpc'
 
 function createRpc() {
   return {
@@ -20,11 +21,13 @@ function createRpc() {
 function runInScope(
   policy: ReturnType<typeof ref<RunModePolicy | null>>,
   rpc = createRpc(),
+  hydrateCallOptions?: RpcCallOptions,
 ) {
   const scope = effectScope()
   const api = scope.run(() => useChatRunModePreference({
     runModePolicy: () => policy.value,
     rpc,
+    hydrateCallOptions,
   }))!
   return { api, scope, rpc }
 }
@@ -69,12 +72,29 @@ describe('useChatRunModePreference', () => {
       allowedRunModes: ['standard', 'trusted', 'full'],
     })
     const rpc = createRpc()
+    const hydrateCallOptions: RpcCallOptions = {
+      timeoutMs: 2_000,
+      timeoutAction: 'reconnect',
+      abortAction: 'reconnect',
+    }
     rpc.call.mockResolvedValueOnce({ runMode: 'trusted', source: 'preference' })
-    const { api, scope } = runInScope(policy, rpc)
+    const { api, scope } = runInScope(policy, rpc, hydrateCallOptions)
 
     await api.hydrateRunModePreference()
 
-    expect(rpc.call).toHaveBeenCalledWith('sandbox.run_mode.preference.get')
+    expect(rpc.call).toHaveBeenCalledWith(
+      'sandbox.run_mode.preference.get',
+      undefined,
+      hydrateCallOptions,
+    )
+    expect(rpc.waitForConnection).toHaveBeenCalledWith(
+      2_000,
+      undefined,
+      {
+        timeoutAction: 'reconnect',
+        abortAction: 'reconnect',
+      },
+    )
     expect(api.runMode.value).toBe('trusted')
     expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBe('trusted')
     scope.stop()

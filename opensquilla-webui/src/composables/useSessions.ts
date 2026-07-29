@@ -1,6 +1,10 @@
 import { ref, computed } from 'vue'
 import i18n from '@/i18n'
+import {
+  waitForSessionRpcConnection,
+} from '@/composables/chat/sessionBootstrapAdmission'
 import { useRpcStore } from '@/stores/rpc'
+import type { RpcCallOptions } from '@/lib/rpc'
 import type { RawSessionItem, RawSessionListEntry, SessionsListResponse } from '@/types/rpc'
 import type { ProjectWorkspaceItem } from '@/types/rpc'
 
@@ -698,7 +702,7 @@ export function groupSessions(items: SessionItem[]): SessionGroup[] {
     .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
 }
 
-export function useSessions() {
+export function useSessions(readCallOptions?: RpcCallOptions) {
   const rpc = useRpcStore()
   const sessionsList = ref<RawSessionListEntry[]>([])
   const sessionListError = ref(false)
@@ -717,8 +721,15 @@ export function useSessions() {
     isLoading.value = true
     sessionListError.value = false
     try {
-      await rpc.waitForConnection()
-      const data = await rpc.call<SessionsListResponse>('sessions.list', { limit: 200, view: SESSION_LIST_VIEW })
+      await waitForSessionRpcConnection(rpc, readCallOptions)
+      const params = { limit: 200, view: SESSION_LIST_VIEW }
+      const data = readCallOptions
+        ? await rpc.call<SessionsListResponse>(
+            'sessions.list',
+            params,
+            readCallOptions,
+          )
+        : await rpc.call<SessionsListResponse>('sessions.list', params)
       const raw = data?.sessions || data?.keys || []
       sessionsList.value = raw.filter(s => !!itemKey(s))
     } catch (err: unknown) {

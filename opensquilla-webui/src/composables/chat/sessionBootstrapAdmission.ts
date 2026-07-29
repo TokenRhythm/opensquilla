@@ -1,5 +1,5 @@
 import { computed, ref } from 'vue'
-import type { RpcCallOptions } from '@/lib/rpc'
+import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
 
 const activeHolds = ref(0)
 let primedRelease: (() => void) | null = null
@@ -7,15 +7,41 @@ let primedRelease: (() => void) | null = null
 /**
  * Optional, mount-time RPCs must not enter the Gateway's serialized dispatch
  * queue ahead of chat session recovery. ChatView acquires a hold synchronously
- * during setup (before child mounted hooks run) and releases it only after the
- * history/live phases reach terminal states.
+ * during setup (before child mounted hooks run) and releases it as soon as the
+ * critical request frames have been queued.
  */
 export const optionalSessionRpcAllowed = computed(() => activeHolds.value === 0)
 
 export const optionalSessionRpcCallOptions: RpcCallOptions = {
   timeoutMs: 2_000,
+  // These methods still use the Gateway's serial dispatcher. Retire the
+  // connection when one is abandoned so a stuck handler cannot keep later
+  // navigation and control requests trapped behind it.
   timeoutAction: 'reconnect',
   abortAction: 'reconnect',
+}
+
+type OptionalSessionRpcClient = {
+  waitForConnection: (
+    timeoutMs?: number,
+    signal?: AbortSignal,
+    actions?: RpcConnectionWaitOptions,
+  ) => Promise<unknown>
+}
+
+export function waitForSessionRpcConnection(
+  rpc: OptionalSessionRpcClient,
+  callOptions?: RpcCallOptions,
+): Promise<unknown> {
+  if (!callOptions) return rpc.waitForConnection()
+  return rpc.waitForConnection(
+    callOptions.timeoutMs,
+    callOptions.signal,
+    {
+      timeoutAction: callOptions.timeoutAction,
+      abortAction: callOptions.abortAction,
+    },
+  )
 }
 
 function createSessionBootstrapAdmission(): () => void {

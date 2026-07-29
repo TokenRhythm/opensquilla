@@ -31,6 +31,12 @@ export function resolveChatHistoryRecoveryState(
   return null
 }
 
+export function visibleChatHistoryRecoveryState(
+  state: ChatHistoryRecoveryState,
+): ChatHistoryRecoveryState {
+  return state === 'history-loading' ? null : state
+}
+
 export function shouldShowConfirmedEmptySession(options: {
   isDraftLanding: boolean
   isStreaming: boolean

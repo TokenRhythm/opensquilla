@@ -39,4 +39,12 @@ describe('App sidebar chrome contract', () => {
     const singleDelete = appSource.slice(singleStart, singleEnd)
     expect(singleDelete).toContain('appStore.removePendingApprovalsForSessions(deleted)')
   })
+
+  it('bounds automatic sidebar RPCs after chat bootstrap admission', () => {
+    expect(appSource).toContain('useSessions(\n  optionalSessionRpcCallOptions,\n)')
+    expect(appSource).toContain('useAgentOptions(optionalSessionRpcCallOptions)')
+    expect(appSource).toContain(
+      'useSessionListSubscription({\n  rpc: rpcStore,\n  callOptions: optionalSessionRpcCallOptions,',
+    )
+  })
 })

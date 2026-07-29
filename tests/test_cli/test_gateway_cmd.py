@@ -682,8 +682,11 @@ def test_gateway_run_uses_config_host_port_when_flags_are_omitted(
         async def close(self, _reason):
             return None
 
-    async def fake_start_gateway_server(*, config, subscription_manager, run):
+    async def fake_start_gateway_server(
+        *, config, subscription_manager, run, _startup_started_at
+    ):
         captured["config"] = config
+        captured["startup_started_at"] = _startup_started_at
 
         async def done():
             return None
@@ -705,6 +708,7 @@ def test_gateway_run_uses_config_host_port_when_flags_are_omitted(
 
     assert captured["config"].host == "127.0.0.2"
     assert captured["config"].port == 19999
+    assert isinstance(captured["startup_started_at"], float)
 
 
 def test_gateway_run_records_cli_flags_as_runtime_overrides(
@@ -724,7 +728,9 @@ def test_gateway_run_records_cli_flags_as_runtime_overrides(
         async def close(self, _reason):
             return None
 
-    async def fake_start_gateway_server(*, config, subscription_manager, run):
+    async def fake_start_gateway_server(
+        *, config, subscription_manager, run, _startup_started_at
+    ):
         captured["config"] = config
 
         async def done():
@@ -769,7 +775,9 @@ def test_gateway_run_flags_do_not_leak_into_config_via_unrelated_persist(
         async def close(self, _reason):
             return None
 
-    async def fake_start_gateway_server(*, config, subscription_manager, run):
+    async def fake_start_gateway_server(
+        *, config, subscription_manager, run, _startup_started_at
+    ):
         captured["config"] = config
 
         async def done():
@@ -827,7 +835,9 @@ def test_gateway_run_keeps_missing_explicit_config_path_for_setup(
         async def close(self, _reason):
             return None
 
-    async def fake_start_gateway_server(*, config, subscription_manager, run):
+    async def fake_start_gateway_server(
+        *, config, subscription_manager, run, _startup_started_at
+    ):
         captured["config"] = config
 
         async def done():
@@ -1169,7 +1179,7 @@ class _ShutdownProbeServer:
 
 
 def _install_fake_start(server, holder, monkeypatch) -> None:
-    async def fake_start(*, config, subscription_manager, run):
+    async def fake_start(*, config, subscription_manager, run, _startup_started_at):
         server.spawn()
         holder["server"] = server
         return server

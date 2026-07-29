@@ -6,7 +6,6 @@ import {
   SESSION_BOOTSTRAP_BUDGET_MS,
   SESSION_PHASE_ATTEMPT_BUDGET_MS,
   isRpcAbort,
-  isRpcTimeout,
   retryAfterMs,
   shouldRetrySessionPhase,
   type SessionBootstrapPhaseContext,
@@ -24,11 +23,23 @@ interface PhaseRuntime<T> {
   skipSnapshot: boolean
 }
 
+interface CriticalRequestQueue {
+  promise: Promise<void>
+  resolve: () => void
+  released: boolean
+  historyRequired: boolean
+  liveSocketGeneration: number | null
+  historySocketGeneration: number | null
+  liveTerminal: boolean
+  historyTerminal: boolean
+}
+
 interface ActiveBootstrap {
   generation: number
   key: string
   includeHistory: boolean
   controller: AbortController
+  criticalQueue: CriticalRequestQueue
   liveQueueSequence: number
   liveQueueWaiters: Set<{
     minimum: number
@@ -41,6 +52,7 @@ interface ActiveBootstrap {
 
 export interface SessionBootstrapRun {
   generation: number
+  criticalRequestsQueued: Promise<void>
   history: Promise<SessionPhaseResult>
   live: Promise<SessionSubscriptionOutcome>
 }
@@ -126,21 +138,69 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
       skipSnapshot: phase.skipSnapshot,
       ...(phase === run.live
         ? {
-            markLiveSubscribeSent: () => markLiveSubscribeSent(run),
-            waitForHistoryTerminal: () => run.history.promise,
+            markLiveSubscribeSent: (socketGeneration: number) =>
+              markLiveSubscribeSent(run, socketGeneration),
+            waitForCriticalRequestsQueued: () => run.criticalQueue.promise,
           }
-        : {}),
+        : {
+            markHistoryRequestSent: (socketGeneration: number) =>
+              markHistoryRequestSent(run, socketGeneration),
+          }),
     }
   }
 
-  function markLiveSubscribeSent(run: ActiveBootstrap) {
+  function releaseCriticalRequestsIfReady(run: ActiveBootstrap) {
+    const queue = run.criticalQueue
+    if (queue.released) return
+    const liveQueued = queue.liveSocketGeneration !== null
+    const historyQueued = (
+      !queue.historyRequired
+      || queue.historySocketGeneration !== null
+    )
+    const queuedOnSameSocket = (
+      liveQueued
+      && historyQueued
+      && (
+        !queue.historyRequired
+        || queue.liveSocketGeneration === queue.historySocketGeneration
+      )
+    )
+    const terminalWithoutQueue = (
+      (queue.liveTerminal || (queue.historyRequired && queue.historyTerminal))
+      && (liveQueued || queue.liveTerminal)
+      && (
+        !queue.historyRequired
+        || historyQueued
+        || queue.historyTerminal
+      )
+    )
+    if (!queuedOnSameSocket && !terminalWithoutQueue) return
+    queue.released = true
+    queue.resolve()
+  }
+
+  function markLiveSubscribeSent(
+    run: ActiveBootstrap,
+    socketGeneration: number,
+  ) {
     if (!isCurrent(run)) return
+    run.criticalQueue.liveSocketGeneration = socketGeneration
     run.liveQueueSequence += 1
     for (const waiter of [...run.liveQueueWaiters]) {
       if (run.liveQueueSequence < waiter.minimum) continue
       run.liveQueueWaiters.delete(waiter)
       waiter.resolve(true)
     }
+    releaseCriticalRequestsIfReady(run)
+  }
+
+  function markHistoryRequestSent(
+    run: ActiveBootstrap,
+    socketGeneration: number,
+  ) {
+    if (!isCurrent(run)) return
+    run.criticalQueue.historySocketGeneration = socketGeneration
+    releaseCriticalRequestsIfReady(run)
   }
 
   async function waitForLiveSubscribeSent(
@@ -175,7 +235,6 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
   }
 
   function requiresFreshLiveQueue(error: unknown): boolean {
-    if (isRpcTimeout(error)) return true
     const message = error instanceof Error ? error.message.toLowerCase() : ''
     return (
       message.includes('connection')
@@ -276,6 +335,10 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
       if (isCurrent(run)) historyPhase.value = 'error'
       return lastResult
     })().finally(() => {
+      // A disconnected or exhausted phase may terminate before it can send.
+      // Optional UI traffic must not remain globally blocked in that case.
+      run.criticalQueue.historyTerminal = true
+      releaseCriticalRequestsIfReady(run)
       phase.running = false
       phase.result = null
     })
@@ -328,9 +391,54 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
       if (isCurrent(run)) livePhase.value = 'degraded'
       return lastResult
     })().finally(() => {
+      // Match the history fallback above: failure to queue a critical request
+      // is terminal for this attempt, not a reason to freeze the whole app.
+      run.criticalQueue.liveTerminal = true
+      releaseCriticalRequestsIfReady(run)
       phase.running = false
     })
     return phase.promise
+  }
+
+  function createCriticalQueue(
+    historyRequired: boolean,
+    liveSocketGeneration: number | null = null,
+  ): CriticalRequestQueue {
+    let resolve = () => {}
+    const promise = new Promise<void>(done => {
+      resolve = done
+    })
+    return {
+      promise,
+      resolve,
+      released: false,
+      historyRequired,
+      liveSocketGeneration,
+      historySocketGeneration: null,
+      liveTerminal: false,
+      historyTerminal: !historyRequired,
+    }
+  }
+
+  function rearmCriticalQueue(
+    run: ActiveBootstrap,
+    historyRequired: boolean,
+    liveSocketGeneration: number | null = null,
+  ) {
+    const previousQueue = run.criticalQueue
+    const replacementQueue = createCriticalQueue(
+      historyRequired,
+      liveSocketGeneration,
+    )
+    run.criticalQueue = replacementQueue
+    // Existing consumers hold the previous promise. Keep it pending across a
+    // same-run reconnect and release it only after the replacement socket has
+    // queued its critical frames. Repeated reconnects form a chain to the
+    // newest epoch; cancellation resolves the current epoch and unwinds it.
+    void replacementQueue.promise.then(() => {
+      previousQueue.released = true
+      previousQueue.resolve()
+    })
   }
 
   function createRun(key: string, includeHistory: boolean): ActiveBootstrap {
@@ -340,6 +448,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
       key,
       includeHistory,
       controller: new AbortController(),
+      criticalQueue: createCriticalQueue(includeHistory),
       liveQueueSequence: 0,
       liveQueueWaiters: new Set(),
       freshLiveOutageForHistoryRetry: false,
@@ -355,6 +464,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
   function publicRun(run: ActiveBootstrap): SessionBootstrapRun {
     return {
       generation: run.generation,
+      criticalRequestsQueued: run.criticalQueue.promise,
       history: run.history.promise,
       live: run.live.promise,
     }
@@ -369,6 +479,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     if (!key) {
       return {
         generation,
+        criticalRequestsQueued: Promise.resolve(),
         history: Promise.resolve(EMPTY_HISTORY_RESULT),
         live: Promise.resolve(UNAVAILABLE_LIVE_RESULT),
       }
@@ -383,7 +494,10 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
         if (Date.now() >= active.history.deadlineAt) {
           return startSessionBootstrap({ includeHistory: true, force: true })
         }
+        const liveSocketGeneration =
+          active.criticalQueue.liveSocketGeneration
         active.includeHistory = true
+        rearmCriticalQueue(active, true, liveSocketGeneration)
         active.history = historyRuntime(active.live.deadlineAt)
         active.history.promise = runHistoryPhase(active, false)
       }
@@ -446,6 +560,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     connectionRecoveryArmed = false
     cancelled?.controller.abort()
     if (cancelled) {
+      cancelled.criticalQueue.resolve()
       for (const waiter of cancelled.liveQueueWaiters) waiter.resolve(false)
       cancelled.liveQueueWaiters.clear()
     }
@@ -483,7 +598,12 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
         && !run.controller.signal.aborted
       if (currentRun && (run.history.running || run.live.running)) {
         const liveWasReady = livePhase.value === 'ready'
-        if (run.live.running || liveWasReady) {
+        const liveWillRecover = run.live.running || liveWasReady
+        if (liveWillRecover) {
+          rearmCriticalQueue(
+            run,
+            run.includeHistory && run.history.running,
+          )
           livePhase.value = 'connecting'
         }
         // A timeout/abort owned by this run may recycle the socket. Keep the
@@ -502,7 +622,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
           }
           run.live.promise = runLivePhase(run)
         }
-        if (run.live.running || liveWasReady) connectionRecoveryArmed = false
+        if (liveWillRecover) connectionRecoveryArmed = false
         return publicRun(run)
       }
       // Once a recovery budget reaches a terminal degraded state, background

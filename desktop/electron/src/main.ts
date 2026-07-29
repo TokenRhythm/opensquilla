@@ -24,16 +24,15 @@ import { DesktopWriterAdmission } from './desktop-writer-admission.js'
 import {
   createDesktopGatewayInstanceNonce,
   desktopGatewayOwnershipMatchesLaunch,
-  desktopGatewayStartIdentityConflict,
-  desktopProcessStartIdentity,
   desktopProfileFingerprint,
   loadDesktopGatewayOwnershipRecord,
   requestVerifiedDesktopGatewayShutdown,
-  sameDesktopGatewayOwnershipInstance,
-  verifyDesktopGatewayOwnership,
   waitForDesktopGatewayOwnershipRelease,
   type DesktopGatewayOwnershipRecord,
 } from './desktop-gateway-ownership.js'
+import {
+  DesktopGatewayOwnershipVerificationCoordinator,
+} from './desktop-gateway-ownership-verification.js'
 import {
   lifecycleAllowsProcessSpawn,
   stopAndJoinLifecycleProcesses,
@@ -7619,7 +7618,11 @@ async function reuseHealthyGatewayState(): Promise<GatewayState | null> {
 }
 
 const VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS = 80_000
-const VERIFIED_ORPHAN_IDENTITY_READY_TIMEOUT_MS = 45_000
+const desktopGatewayOwnershipVerification = new DesktopGatewayOwnershipVerificationCoordinator({
+  onPidRecycled: (record) => {
+    desktopLog('gateway_ownership_pid_recycled', { pid: record.pid, port: record.port })
+  },
+})
 
 function verifiedOrphanGatewayError(detail: string): Error {
   return new Error(
@@ -7629,49 +7632,11 @@ function verifiedOrphanGatewayError(detail: string): Error {
   )
 }
 
-function processIdMayStillBeAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    // EPERM still proves that a process occupies the PID. Only ESRCH is a
-    // reliable negative across supported Node platforms.
-    return (error as NodeJS.ErrnoException).code !== 'ESRCH'
-  }
-}
-
 async function verifyDesktopGatewayOwnershipWhenReady(
   ownershipDir: string,
   record: DesktopGatewayOwnershipRecord,
 ): Promise<boolean> {
-  const deadline = Date.now() + VERIFIED_ORPHAN_IDENTITY_READY_TIMEOUT_MS
-  let startIdentityChecked = false
-  do {
-    if (await verifyDesktopGatewayOwnership(record, { timeoutMs: 750 })) return true
-    const current = loadDesktopGatewayOwnershipRecord(ownershipDir)
-    if (
-      current.status !== 'valid'
-      || !sameDesktopGatewayOwnershipInstance(current.record, record)
-      || !processIdMayStillBeAlive(record.pid)
-    ) return false
-    if (!startIdentityChecked) {
-      // The liveness probe cannot tell a slowly-starting orphan from an
-      // unrelated process that recycled the recorded PID (EPERM also counts
-      // as alive). When the live process's start identity provably disagrees
-      // with the record, the record is stale: stop waiting out the full
-      // ready timeout for a Gateway that no longer exists. An unavailable
-      // probe keeps the conservative wait; it never grants stop authority.
-      startIdentityChecked = true
-      const liveStartIdentity = desktopProcessStartIdentity(record.pid)
-      if (desktopGatewayStartIdentityConflict(record.start_identity, liveStartIdentity)) {
-        desktopLog('gateway_ownership_pid_recycled', { pid: record.pid, port: record.port })
-        return false
-      }
-    }
-    if (Date.now() >= deadline) break
-    await new Promise((resolveWait) => setTimeout(resolveWait, 250))
-  } while (true)
-  return false
+  return await desktopGatewayOwnershipVerification.verifyWhenReady(ownershipDir, record)
 }
 
 /**
@@ -7693,42 +7658,47 @@ async function recoverVerifiedOrphanGatewayBeforeSpawn(
   }
 
   const record: DesktopGatewayOwnershipRecord = loaded.record
-  if (record.profile_fingerprint !== desktopProfileFingerprint(profile.home)) {
-    desktopLog('gateway_ownership_profile_mismatch', { pid: record.pid, port: record.port })
-    return
-  }
-  if (!await verifyDesktopGatewayOwnershipWhenReady(ownershipDir, record)) {
-    // A stale record after SIGKILL is harmless: the OS has already released the
-    // profile lock and the next admitted Gateway will replace the record. Do
-    // not unlink it or infer authority over whatever now owns the PID/port.
-    desktopLog('gateway_ownership_not_verified', { pid: record.pid, port: record.port })
-    return
-  }
+  await desktopGatewayOwnershipVerification.runRecovery(ownershipDir, record, async (current) => {
+    if (current.profile_fingerprint !== desktopProfileFingerprint(profile.home)) {
+      desktopLog('gateway_ownership_profile_mismatch', {
+        pid: current.pid,
+        port: current.port,
+      })
+      return
+    }
+    if (!await verifyDesktopGatewayOwnershipWhenReady(ownershipDir, current)) {
+      // A stale record after SIGKILL is harmless: the OS has already released the
+      // profile lock and the next admitted Gateway will replace the record. Do
+      // not unlink it or infer authority over whatever now owns the PID/port.
+      desktopLog('gateway_ownership_not_verified', { pid: current.pid, port: current.port })
+      return
+    }
 
-  desktopLog('gateway_orphan_verified', {
-    pid: record.pid,
-    port: record.port,
-    version: record.version,
+    desktopLog('gateway_orphan_verified', {
+      pid: current.pid,
+      port: current.port,
+      version: current.version,
+    })
+    const accepted = await requestVerifiedDesktopGatewayShutdown(current)
+    if (!accepted) {
+      // The verified process may have completed shutdown between the challenge
+      // and the authenticated request. The ownership record is removed only
+      // after its writer leases are released, so that disappearance is sufficient.
+      if (loadDesktopGatewayOwnershipRecord(ownershipDir).status === 'missing') return
+      throw verifiedOrphanGatewayError('The verified Gateway rejected the shutdown request.')
+    }
+    const released = await waitForDesktopGatewayOwnershipRelease(ownershipDir, current, {
+      timeoutMs: VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS,
+    })
+    desktopLog('gateway_orphan_shutdown_complete', {
+      pid: current.pid,
+      port: current.port,
+      released,
+    })
+    if (!released) {
+      throw verifiedOrphanGatewayError('The verified Gateway did not finish shutting down.')
+    }
   })
-  const accepted = await requestVerifiedDesktopGatewayShutdown(record)
-  if (!accepted) {
-    // The verified process may have completed shutdown between the challenge
-    // and the authenticated request. The ownership record is removed only
-    // after its writer leases are released, so that disappearance is sufficient.
-    if (loadDesktopGatewayOwnershipRecord(ownershipDir).status === 'missing') return
-    throw verifiedOrphanGatewayError('The verified Gateway rejected the shutdown request.')
-  }
-  const released = await waitForDesktopGatewayOwnershipRelease(ownershipDir, record, {
-    timeoutMs: VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS,
-  })
-  desktopLog('gateway_orphan_shutdown_complete', {
-    pid: record.pid,
-    port: record.port,
-    released,
-  })
-  if (!released) {
-    throw verifiedOrphanGatewayError('The verified Gateway did not finish shutting down.')
-  }
 }
 
 async function startGateway(): Promise<GatewayState> {

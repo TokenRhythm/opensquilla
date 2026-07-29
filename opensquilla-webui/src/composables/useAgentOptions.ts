@@ -1,7 +1,11 @@
 import { ref } from 'vue'
+import {
+  waitForSessionRpcConnection,
+} from '@/composables/chat/sessionBootstrapAdmission'
 import { useRpcStore } from '@/stores/rpc'
 import { normalizeAgentId } from '@/utils/chat/sessionKeys'
 import type { AgentOption, AgentsListResponse } from '@/types/rpc'
+import type { RpcCallOptions } from '@/lib/rpc'
 
 /** The implicit default agent every chat surface can always start against. */
 const MAIN_AGENT: AgentOption = { id: 'main', name: 'Main Agent' }
@@ -18,7 +22,7 @@ let loadPromise: Promise<void> | null = null
  * Shared `agents.list` fetch for sidebar session metadata. IDs are normalized
  * once here so every sidebar consumer sees the same canonical value.
  */
-export function useAgentOptions() {
+export function useAgentOptions(readCallOptions?: RpcCallOptions) {
   const rpc = useRpcStore()
 
   function loadAgents(): Promise<void> {
@@ -26,8 +30,14 @@ export function useAgentOptions() {
     loadPromise = (async () => {
       agentListError.value = false
       try {
-        await rpc.waitForConnection()
-        const data = await rpc.call<AgentsListResponse>('agents.list')
+        await waitForSessionRpcConnection(rpc, readCallOptions)
+        const data = readCallOptions
+          ? await rpc.call<AgentsListResponse>(
+              'agents.list',
+              undefined,
+              readCallOptions,
+            )
+          : await rpc.call<AgentsListResponse>('agents.list')
         agents.value = (data?.agents || [])
           .map(a => ({
             id: normalizeAgentId(a.id || a.agentId || a.name || ''),

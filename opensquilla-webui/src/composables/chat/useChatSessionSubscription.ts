@@ -231,7 +231,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
   ) {
     void (async () => {
       try {
-        await bootstrap.waitForHistoryTerminal?.()
+        await bootstrap.waitForCriticalRequestsQueued?.()
         if (
           attempt !== subscriptionAttempt
           || metadataHydration !== metadataHydrationSequence
@@ -239,9 +239,9 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
           || bootstrap.signal.aborted
         ) return
         // Storage-backed metadata is deliberately outside the critical
-        // history/live bootstrap. Once history is terminal it receives its own
-        // bounded window; an exhausted history budget must not turn a healthy
-        // live registration into a permanently unusable composer.
+        // history/live bootstrap. Once their request frames are queued it
+        // receives its own bounded window; slow history must not keep a healthy
+        // project session permanently unresolved.
         const hydrationDeadlineAt = Date.now() + SESSION_PHASE_ATTEMPT_BUDGET_MS
         const hydrationContext = {
           ...bootstrap,
@@ -315,31 +315,66 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         since_stream_seq: sinceStreamSeq,
         fast_ack: true,
       }
+      const onLiveSnapshot = options.onLiveSnapshot
+      const snapshotRequired = Boolean(
+        onLiveSnapshot && !bootstrap?.skipSnapshot,
+      )
+      let subscribeSocketGeneration: number | null = null
+      let snapshotSocketGeneration: number | null = null
+      let liveFramesMarked = false
+      const markLiveFramesSent = () => {
+        if (
+          !bootstrap
+          || liveFramesMarked
+          || subscribeSocketGeneration === null
+          || (snapshotRequired && snapshotSocketGeneration === null)
+          || (
+            snapshotSocketGeneration !== null
+            && snapshotSocketGeneration !== subscribeSocketGeneration
+          )
+        ) return
+        liveFramesMarked = true
+        bootstrap.markLiveSubscribeSent?.(subscribeSocketGeneration)
+      }
+      const subscribeCallOptions = bootstrap
+        ? {
+            ...phaseCallOptions(bootstrap, 'sessions.messages.subscribe'),
+            onSent: (socketGeneration: number) => {
+              subscribeSocketGeneration = socketGeneration
+              markLiveFramesSent()
+            },
+          }
+        : undefined
       const subscribePromise = bootstrap
         ? options.rpc.call<SessionMessagesSubscribeResponse>(
             'sessions.messages.subscribe',
             params,
-            phaseCallOptions(bootstrap, 'sessions.messages.subscribe'),
+            subscribeCallOptions,
           )
         : options.rpc.call<SessionMessagesSubscribeResponse>(
             'sessions.messages.subscribe',
             params,
           )
-      const onLiveSnapshot = options.onLiveSnapshot
       // Pipeline the in-memory snapshot directly behind subscribe. Only after
       // both frames are on the wire may history enter the serialized queue:
       // subscribe → snapshot → history. Slow storage metadata is deferred.
-      const snapshotPromise = onLiveSnapshot && !bootstrap?.skipSnapshot
+      const snapshotPromise = snapshotRequired
         ? (
             bootstrap
               ? options.rpc.call<SessionMessagesSnapshotResponse>(
                   'sessions.messages.snapshot',
                   { key },
-                  phaseCallOptions(
-                    bootstrap,
-                    'sessions.messages.snapshot',
-                    SESSION_SNAPSHOT_BUDGET_MS,
-                  ),
+                  {
+                    ...phaseCallOptions(
+                      bootstrap,
+                      'sessions.messages.snapshot',
+                      SESSION_SNAPSHOT_BUDGET_MS,
+                    ),
+                    onSent: (socketGeneration: number) => {
+                      snapshotSocketGeneration = socketGeneration
+                      markLiveFramesSent()
+                    },
+                  },
                 )
               : options.rpc.call<SessionMessagesSnapshotResponse>(
                   'sessions.messages.snapshot',
@@ -347,7 +382,6 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
                 )
           )
         : null
-      bootstrap?.markLiveSubscribeSent?.()
 
       const [subscribeResult, snapshotResult] = await Promise.allSettled([
         subscribePromise,
