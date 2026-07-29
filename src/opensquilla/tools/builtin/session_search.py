@@ -55,6 +55,15 @@ def create_session_search_tool(
                 "type": "integer",
                 "description": "Max results to return (1-50, default 20).",
             },
+            "anchor": {
+                "type": "string",
+                "description": (
+                    "Exact anchor reference from a compaction summary, "
+                    "format: '<compaction_index>:<entry_anchor_id>'. "
+                    "When provided, returns the original transcript entry "
+                    "verbatim. Requires session_id."
+                ),
+            },
         },
         required=["query"],
         owner_only=True,
@@ -65,20 +74,22 @@ def create_session_search_tool(
         query: str,
         session_id: str | None = None,
         limit: int = 20,
+        anchor: str | None = None,
     ) -> str:
         if active_storage is None:
             raise ToolError("Session storage not available")
 
-        if not query.strip():
-            raise ToolError("Query must not be empty")
+        if not query.strip() and anchor is None:
+            raise ToolError("Query must not be empty (unless anchor is provided)")
 
         limit = max(1, min(50, limit))
 
         try:
             results = await active_storage.search_transcript(
-                query=query,
+                query=query if anchor is None else None,
                 session_id=session_id,
                 limit=limit,
+                anchor=anchor,
             )
         except Exception as exc:
             logger.warning("session_search.error", query=query[:80], error=str(exc))
@@ -98,6 +109,7 @@ def create_session_search_tool(
                         "snippet": r["snippet"],
                         "created_at": r["created_at"],
                         "source": r.get("source", "active"),
+                        "anchor": r.get("anchor"),
                     }
                     for r in results
                 ],

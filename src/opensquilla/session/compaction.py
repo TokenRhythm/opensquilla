@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -28,6 +29,40 @@ if TYPE_CHECKING:
 
 log = structlog.get_logger(__name__)
 
+# ── D12: Compaction Anchor ──────────────────────────────────────────────────
+
+_ANCHOR_INSTRUCTION = (
+    "\n\nThe conversation entries above are labeled [entry_NNN | role]. "
+    "When your summary references a specific statement, decision, or tool output "
+    "whose exact original wording might matter later, append an anchor:\n"
+    "  [anchor:{compaction_index}:entry_NNN]\n"
+    "Use anchors sparingly — only where a future reader might need to expand "
+    "for full detail. Do not anchor every entry. Do not invent entry numbers."
+)
+
+_ANCHOR_PATTERN = re.compile(
+    r"\[anchor:(?P<compaction_index>\d+):(?P<entry_anchor_id>entry_\d+)\]"
+)
+
+
+def extract_anchors_from_summary(summary_text: str) -> list[dict[str, Any]]:
+    """Parse anchor references from a compaction summary (D12).
+
+    Returns a list of ``{"compaction_index": int, "entry_anchor_id": str}``
+    dicts.  Duplicate anchors are deduplicated.
+    """
+    seen: set[tuple[int, str]] = set()
+    anchors: list[dict[str, Any]] = []
+    for m in _ANCHOR_PATTERN.finditer(summary_text):
+        key = (int(m.group("compaction_index")), m.group("entry_anchor_id"))
+        if key not in seen:
+            seen.add(key)
+            anchors.append(
+                {"compaction_index": key[0], "entry_anchor_id": key[1]}
+            )
+    return anchors
+
+
 _COMPACTION_TIMEOUT = 90.0
 _MAX_CUSTOM_INSTRUCTIONS_CHARS = 2000
 CompactionProfile = Literal["conversation", "coding", "research", "support"]
@@ -49,6 +84,7 @@ class CompactionConfig:
     coverage_blocking: bool = False
     compaction_profile: CompactionProfile = "conversation"
     protected_recent_messages: int = 0
+    anchor_enabled: bool = False  # D12: emit [entry_NNN] labels + anchor instructions
 
 
 @dataclass
@@ -65,6 +101,7 @@ class CompactionRequest:
     forced_prefix_cut: int | None = None
     trigger: CompactionTrigger = "token_budget"
     reason: str | None = None
+    compaction_index: int | None = None  # D12: predicted index for anchor references
     provider_request_correlation: ProviderRequestCorrelation | None = field(
         default=None,
         repr=False,
@@ -82,6 +119,7 @@ class CompactionResult:
     tokens_after: int = 0
     remaining_budget_tokens: int = 0
     summary_payload: dict[str, Any] | None = None
+    extracted_anchors: list[dict[str, Any]] | None = None  # D12
     summary_format: str = "text"
     coverage_status: str = "unknown"
     missing_obligations: list[str] | None = None
@@ -122,6 +160,7 @@ def build_compaction_config_from_provider(
     for attr in (
         "compaction_profile",
         "protected_recent_messages",
+        "anchor_enabled",
     ):
         if compaction_config is not None and hasattr(compaction_config, attr):
             setattr(cfg, attr, getattr(compaction_config, attr))
@@ -532,13 +571,28 @@ def _summarize_tool_calls_for_llm(tool_calls: Any) -> str:
     return "\n".join(lines)
 
 
-def _format_chunk_for_llm(chunk: list[dict[str, Any]]) -> str:
-    """Format conversation entries into readable text for the compaction LLM."""
+def _format_chunk_for_llm(
+    chunk: list[dict[str, Any]],
+    *,
+    anchor_base: int = 0,
+    include_anchors: bool = False,
+) -> str:
+    """Format conversation entries into readable text for the compaction LLM.
+
+    When *include_anchors* is True, each entry is prefixed with a stable
+    ``[entry_NNN | role]`` label that the LLM can reference via
+    ``[anchor:<compaction_index>:entry_NNN]`` in its summary output.
+    *anchor_base* is the 0-based offset for multi-chunk compaction.
+    """
     lines: list[str] = []
-    for entry in chunk:
+    for idx, entry in enumerate(chunk):
         role = entry.get("role", "unknown")
         content = _summarize_if_envelope(str(entry.get("content") or ""))
-        rendered_parts = [f"[{role}]: {content}"]
+        if include_anchors:
+            header = f"[entry_{anchor_base + idx:03d} | {role}]"
+        else:
+            header = f"[{role}]"
+        rendered_parts = [f"{header}: {content}"]
         tool_summary = _summarize_tool_calls_for_llm(entry.get("tool_calls"))
         if tool_summary:
             rendered_parts.append(tool_summary)
@@ -585,8 +639,14 @@ async def call_compaction_llm(
     custom_instructions: str | None = None,
     provider: str = "",
     provider_request_correlation: ProviderRequestCorrelation | None = None,
+    *,
+    compaction_index: int | None = None,
 ) -> str | None:
-    """Call LLM to summarize a conversation chunk. Returns None on failure."""
+    """Call LLM to summarize a conversation chunk. Returns None on failure.
+
+    When *compaction_index* is provided, appends anchor instructions so the
+    LLM can emit ``[anchor:N:entry_NNN]`` references for future expansion.
+    """
     if not api_key:
         return None
 
@@ -603,6 +663,8 @@ async def call_compaction_llm(
     )
     if identifier_instruction:
         system = f"{system}\n\n{identifier_instruction}"
+    if compaction_index is not None:
+        system += _ANCHOR_INSTRUCTION.format(compaction_index=compaction_index)
 
     user_content = f"Summarize this conversation:\n\n{chunk_text}"
     normalized_instructions = _normalize_custom_instructions(custom_instructions)
@@ -896,6 +958,7 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
     summaries: list[str] = []
     llm_chunks = 0
     fallback_chunks = 0
+    anchor_base = 0
     for chunk in chunks:
         if cfg.api_key and cfg.model:
             llm_kwargs: dict[str, Any] = {}
@@ -903,8 +966,14 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
                 llm_kwargs["provider_request_correlation"] = (
                     request.provider_request_correlation
                 )
+            if cfg.anchor_enabled:
+                llm_kwargs["compaction_index"] = request.compaction_index
             llm_result = await call_compaction_llm(
-                chunk_text=_format_chunk_for_llm(chunk),
+                chunk_text=_format_chunk_for_llm(
+                    chunk,
+                    anchor_base=anchor_base,
+                    include_anchors=cfg.anchor_enabled,
+                ),
                 identifier_instruction=id_instruction,
                 model=cfg.model,
                 api_key=cfg.api_key,
@@ -917,9 +986,11 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
             if llm_result:
                 summaries.append(llm_result)
                 llm_chunks += 1
+                anchor_base += len(chunk)
                 continue
         summaries.append(_summarize_chunk_fallback(chunk, cfg.identifier_policy))
         fallback_chunks += 1
+        anchor_base += len(chunk)
 
     merged = _merge_summaries(summaries)
 
@@ -1021,6 +1092,11 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
             quality_report=quality_report,
         )
 
+    # D12: extract anchor references from the merged summary.
+    extracted_anchors = (
+        extract_anchors_from_summary(merged) if cfg.anchor_enabled else None
+    )
+
     return CompactionResult(
         summary=merged,
         kept_entries=kept,
@@ -1031,6 +1107,7 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
         tokens_after=tokens_after,
         remaining_budget_tokens=max(window - tokens_after, 0),
         summary_payload=structured_summary.model_dump(mode="json"),
+        extracted_anchors=extracted_anchors,
         summary_format="structured_v1",
         coverage_status=coverage.status,
         missing_obligations=coverage.missing_obligations,

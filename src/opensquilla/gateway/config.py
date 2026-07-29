@@ -1299,6 +1299,7 @@ class CompactionLlmConfig(BaseSettings):
     enabled: bool = True
     compaction_profile: Literal["conversation", "coding", "research", "support"] = "conversation"
     protected_recent_messages: int = Field(default=0, ge=0)
+    anchor_enabled: bool = False  # D12: compaction anchor references
 
 
 class SessionNamingConfig(BaseSettings):

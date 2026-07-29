@@ -1744,6 +1744,7 @@ class SessionManager:
                 config=config or CompactionConfig(),
                 custom_instructions=custom_instructions,
                 provider_request_correlation=provider_request_correlation,
+                compaction_index=node.compaction_count or 0,
             )
         )
 
@@ -1827,6 +1828,8 @@ class SessionManager:
                 entries=kept_entries,
                 context_states=[context_state] if context_state is not None else None,
                 archived_entries=removed_entries,
+                anchor_enabled=config.anchor_enabled if config else False,
+                extracted_anchors=result.extracted_anchors,
             )
         return result
 
@@ -1936,6 +1939,8 @@ class SessionManager:
             entries=rewritten_entries,
             context_states=[context_state] if context_state is not None else None,
             archived_entries=removed_entries if summary_record is not None else None,
+            anchor_enabled=False,
+            extracted_anchors=None,
         )
         _log.info(
             "persist_compaction.done",
