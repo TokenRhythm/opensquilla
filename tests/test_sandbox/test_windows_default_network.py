@@ -355,6 +355,120 @@ def test_elevated_setup_helper_main_writes_failure_report(monkeypatch, tmp_path)
     assert "Set-LocalUser access denied" in report["detail"]
 
 
+def test_elevated_setup_helper_accepts_desktop_profile_marker(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+    from opensquilla.sandbox.backend.windows_default_network import (
+        FIREWALL_RULE_VERSION,
+        WFP_RULE_VERSION,
+        WindowsNetworkSetup,
+    )
+
+    profile = tmp_path / "profile"
+    desktop_home = (
+        profile / "AppData" / "Roaming" / "@opensquilla" / "desktop-electron" / "opensquilla"
+    )
+    desktop_home.mkdir(parents=True)
+    marker = desktop_home / "sandbox" / "setup_marker.json"
+    payload = mod._encode_setup_helper_payload(marker, user_sid="S-1-real")
+    network = WindowsNetworkSetup(
+        offline_user_sid="S-1-offline",
+        allowed_proxy_ports=(48123,),
+        allow_local_binding=False,
+        firewall_rule_version=FIREWALL_RULE_VERSION,
+        wfp_rule_version=WFP_RULE_VERSION,
+    )
+    locked_roots = []
+
+    def fake_lock(
+        marker_path,
+        *,
+        offline_sid,
+        real_user_sid,
+        lease,
+    ):
+        assert marker_path == marker
+        assert offline_sid == "S-1-offline"
+        assert real_user_sid == "S-1-real"
+        assert lease.profile_path == profile
+        locked_roots.extend(lease.roots)
+
+    monkeypatch.setattr(mod, "_windows_profile_path_for_sid", lambda _sid: profile)
+    monkeypatch.setattr(mod, "establish_windows_network_setup", lambda _path: network)
+    monkeypatch.setattr(mod, "lock_persistent_sandbox_dirs", fake_lock)
+
+    assert mod.elevated_setup_helper_main(["--elevated-helper", payload]) == 0
+    assert mod.read_setup_marker(marker) is not None
+    assert mod.read_setup_helper_report(marker) == {
+        "state": "ready",
+        "detail": "setup_complete",
+    }
+    assert locked_roots == [
+        desktop_home / "sandbox",
+        desktop_home / "sandbox-secrets",
+        desktop_home / "sandbox-bin",
+    ]
+
+
+def test_elevated_setup_rejects_unrecognized_marker_inside_profile(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    marker = (
+        profile
+        / "AppData"
+        / "Roaming"
+        / "other-app"
+        / "opensquilla"
+        / "sandbox"
+        / "setup_marker.json"
+    )
+    payload = mod._encode_setup_helper_payload(marker, user_sid="S-1-real")
+    monkeypatch.setattr(mod, "_windows_profile_path_for_sid", lambda _sid: profile)
+
+    assert mod.elevated_setup_helper_main(["--elevated-helper", payload]) == 2
+    assert not marker.parent.exists()
+
+
+def test_windows_setup_readiness_uses_validated_desktop_marker(tmp_path) -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+    from opensquilla.sandbox.backend.windows_default_network import (
+        FIREWALL_RULE_VERSION,
+        WFP_RULE_VERSION,
+        WindowsNetworkSetup,
+    )
+
+    profile = tmp_path / "profile"
+    marker = (
+        profile
+        / "AppData"
+        / "Roaming"
+        / "@opensquilla"
+        / "desktop-electron"
+        / "opensquilla"
+        / "sandbox"
+        / "setup_marker.json"
+    )
+    mod.write_setup_marker(
+        marker,
+        network=WindowsNetworkSetup(
+            offline_user_sid="S-1-offline",
+            allowed_proxy_ports=(48123,),
+            allow_local_binding=False,
+            firewall_rule_version=FIREWALL_RULE_VERSION,
+            wfp_rule_version=WFP_RULE_VERSION,
+        ),
+    )
+
+    assert mod._windows_setup_is_ready(marker) is True
+
+
 def test_elevated_setup_helper_serializes_mutation_and_rechecks_readiness(
     monkeypatch,
     tmp_path,
@@ -380,7 +494,7 @@ def test_elevated_setup_helper_serializes_mutation_and_rechecks_readiness(
     monkeypatch.setattr(
         mod,
         "_windows_setup_is_ready",
-        lambda _marker_path, _profile_path: events.append("ready_check") or False,
+        lambda _marker_path: events.append("ready_check") or False,
         raising=False,
     )
     monkeypatch.setattr(

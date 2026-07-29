@@ -24,6 +24,13 @@ SETUP_VERSION = 2
 OFFLINE_USERNAME = "OpenSquillaSandbox"
 SETUP_HELPER_REPORT = "setup_helper_report.json"
 SETUP_PROCESS_LOCK_TIMEOUT_MS = 10 * 60 * 1000
+_DESKTOP_PRIMARY_HOME_PARTS = (
+    "AppData",
+    "Roaming",
+    "@opensquilla",
+    "desktop-electron",
+    "opensquilla",
+)
 
 
 @dataclass(frozen=True)
@@ -219,9 +226,7 @@ def run_elevated_setup_helper(path: Path) -> None:
     helper_args = ["--elevated-helper", payload]
     if not getattr(sys, "frozen", False):
         helper_args = ["-m", "opensquilla.sandbox.backend.windows_default_setup", *helper_args]
-    parameters = subprocess.list2cmdline(
-        helper_args
-    )
+    parameters = subprocess.list2cmdline(helper_args)
     exit_code = _shell_execute_runas_and_wait(
         executable=sys.executable,
         parameters=parameters,
@@ -249,7 +254,7 @@ def elevated_setup_helper_main(argv: list[str] | None = None) -> int:
     try:
         with _windows_setup_process_lock(marker_path):
             with _secure_setup_directory_lease(marker_path, profile_path) as lease:
-                if _windows_setup_is_ready(marker_path, profile_path):
+                if _windows_setup_is_ready(marker_path):
                     write_setup_helper_report(
                         marker_path,
                         state="ready",
@@ -339,9 +344,16 @@ def _validated_elevated_setup_target(payload: dict[str, str]) -> tuple[Path, Pat
     if not sid:
         raise OSError("windows_setup_helper_real_user_sid_missing")
     profile_path = _windows_profile_path_for_sid(sid).expanduser().absolute()
-    expected = default_setup_marker_path(profile_path).absolute()
     supplied = Path(payload["markerPath"]).expanduser().absolute()
-    if _setup_path_key(supplied) != _setup_path_key(expected):
+    expected = next(
+        (
+            candidate
+            for candidate in _allowed_setup_marker_paths(profile_path)
+            if _setup_path_key(supplied) == _setup_path_key(candidate)
+        ),
+        None,
+    )
+    if expected is None:
         raise OSError("windows_setup_helper_marker_path_mismatch")
     _validate_existing_non_reparse_components(expected)
     profile_canonical = profile_path.resolve(strict=True)
@@ -351,6 +363,18 @@ def _validated_elevated_setup_target(payload: dict[str, str]) -> tuple[Path, Pat
     except ValueError as exc:
         raise OSError("windows_setup_helper_marker_outside_profile") from exc
     return expected, profile_path
+
+
+def _allowed_setup_marker_paths(profile_path: Path) -> tuple[Path, ...]:
+    # The SID-derived profile is the trusted anchor for both supported state
+    # layouts. Never trust OPENSQUILLA_STATE_DIR in the elevated process: it is
+    # inherited from the unelevated caller and could name an arbitrary path.
+    profile = profile_path.expanduser().absolute()
+    desktop_home = profile.joinpath(*_DESKTOP_PRIMARY_HOME_PARTS)
+    return (
+        default_setup_marker_path(profile).absolute(),
+        (desktop_home / "sandbox" / "setup_marker.json").absolute(),
+    )
 
 
 def _windows_profile_path_for_sid(sid: str) -> Path:
@@ -373,20 +397,13 @@ def _setup_path_key(path: Path) -> str:
     return os.path.normcase(os.path.abspath(str(path))).replace("\\", "/").rstrip("/")
 
 
-def _windows_setup_is_ready(marker_path: Path, profile_path: Path) -> bool:
+def _windows_setup_is_ready(marker_path: Path) -> bool:
     marker = read_setup_marker(marker_path)
     if marker is None or marker.network is None:
         return False
-
-    from opensquilla.sandbox.backend.windows_default_support import (
-        probe_windows_default_support,
+    return marker.setup_version == SETUP_VERSION and marker.network.is_current_for_ports(
+        marker.network.allowed_proxy_ports
     )
-
-    support = probe_windows_default_support(
-        home=profile_path,
-        proxy_ports=marker.network.allowed_proxy_ports,
-    )
-    return support.default_backend_available and support.proxy_allowlist_enforced
 
 
 @contextmanager
@@ -551,7 +568,7 @@ def _secure_setup_directory_lease(
     marker_path: Path,
     profile_path: Path,
 ) -> Iterator[_SetupDirectoryLease]:
-    opensquilla_root = profile_path / ".opensquilla"
+    opensquilla_root = marker_path.parent.parent
     roots = (
         opensquilla_root / "sandbox",
         opensquilla_root / "sandbox-secrets",
