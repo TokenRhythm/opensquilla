@@ -76,6 +76,23 @@ known_hashes = {
 | evidence store 为空 | known_hashes=空集 → 不去重 |
 | evidence store 读取失败 | known_hashes=空集 → 不去重 |
 
+### 2.6 Cursor high-watermark invariant
+
+The scanner returns a structured batch containing candidates, unchanged-file
+counts, and a safe cursor high-water mark:
+
+- If every changed candidate fits in the batch, hash-equivalent files may
+  advance the cursor because their information utility is already represented
+  by the evidence store.
+- If `max_batch_size` defers any changed candidate, the high-water mark must not
+  move past the selected candidate batch. A newer unchanged file must never
+  cause a real information change to be skipped.
+- Dry runs never persist the cursor.
+
+This makes content-hash dedup a semantics-preserving transformation: duplicate
+observations are discarded, while unprocessed information-bearing changes
+remain reachable.
+
 ## 3. 改动文件
 
 | 文件 | 变更 |

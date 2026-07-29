@@ -1,9 +1,21 @@
 import { computed, ref, type Ref } from 'vue'
 import i18n from '@/i18n'
+import {
+  waitForSessionRpcConnection,
+} from '@/composables/chat/sessionBootstrapAdmission'
+import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
 
 type RpcClient = {
-  waitForConnection: () => Promise<void>
-  call: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
+  waitForConnection: (
+    timeoutMs?: number,
+    signal?: AbortSignal,
+    actions?: RpcConnectionWaitOptions,
+  ) => Promise<void>
+  call: <T = unknown>(
+    method: string,
+    params?: Record<string, unknown>,
+    callOptions?: RpcCallOptions,
+  ) => Promise<T>
 }
 
 export interface ArgumentChoice {
@@ -50,6 +62,7 @@ interface UsageStatusResult {
 
 export interface UseChatSlashCommandsOptions {
   rpc: RpcClient
+  catalogCallOptions?: RpcCallOptions
   inputText: Ref<string>
   sessionKey: Ref<string>
   autoResizeTextarea: () => void
@@ -147,8 +160,18 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
 
   async function loadSlashCommands() {
     try {
-      await options.rpc.waitForConnection()
-      const res = await options.rpc.call<{ commands?: ChatSlashCommand[] }>('commands.list_for_surface', { surface: 'web_chat' })
+      await waitForSessionRpcConnection(options.rpc, options.catalogCallOptions)
+      const params = { surface: 'web_chat' }
+      const res = options.catalogCallOptions
+        ? await options.rpc.call<{ commands?: ChatSlashCommand[] }>(
+            'commands.list_for_surface',
+            params,
+            options.catalogCallOptions,
+          )
+        : await options.rpc.call<{ commands?: ChatSlashCommand[] }>(
+            'commands.list_for_surface',
+            params,
+          )
       slashCmds.value = (Array.isArray(res?.commands) ? res.commands : []).map(normalizeSlashCommand)
       if (
         options.activatePlanMode

@@ -76,6 +76,97 @@ def test_gateway_boot_bridges_compaction_notifications_to_session_stream() -> No
     assert "_compaction_listener_remove" in source
 
 
+def test_gateway_startup_phase_log_uses_bounded_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.gateway import boot
+
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    class FakeLog:
+        def info(self, event: str, **kwargs: Any) -> None:
+            events.append((event, kwargs))
+
+    monkeypatch.setattr(boot, "log", FakeLog())
+    ticks = iter((12.5, 12.75))
+    monkeypatch.setattr(boot.time, "monotonic", lambda: next(ticks))
+
+    completed_at = boot._log_gateway_startup_phase(
+        "services",
+        startup_started_at=10.0,
+        phase_started_at=11.5,
+    )
+
+    assert completed_at == 12.75
+    assert events == [
+        (
+            "gateway.startup_phase",
+            {
+                "phase": "services",
+                "status": "ready",
+                "duration_ms": 1000,
+                "startup_elapsed_ms": 2500,
+            },
+        )
+    ]
+
+
+def test_uvicorn_listener_callback_observes_a_real_bound_socket() -> None:
+    import httpx
+    import uvicorn
+
+    async def run_case() -> None:
+        callback_called = asyncio.Event()
+        callback_ports: list[int] = []
+        server: uvicorn.Server
+
+        async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+            assert scope["type"] == "http"
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 204,
+                    "headers": [],
+                }
+            )
+            await send({"type": "http.response.body", "body": b""})
+
+        async def listener_ready() -> None:
+            assert server.started is True
+            assert server.servers
+            sockets = server.servers[0].sockets
+            assert sockets
+            callback_ports.append(int(sockets[0].getsockname()[1]))
+            callback_called.set()
+
+        config = uvicorn.Config(
+            app=app,
+            host="127.0.0.1",
+            port=0,
+            lifespan="off",
+            access_log=False,
+            log_level="warning",
+            callback_notify=listener_ready,
+        )
+        server = uvicorn.Server(config)
+        setattr(server, "install_signal_handlers", lambda: None)
+        task = asyncio.create_task(server.serve())
+        try:
+            await asyncio.wait_for(callback_called.wait(), timeout=5)
+            assert len(callback_ports) == 1
+            async with httpx.AsyncClient(trust_env=False) as client:
+                response = await client.get(
+                    f"http://127.0.0.1:{callback_ports[0]}/healthz",
+                    timeout=5,
+                )
+            assert response.status_code == 204
+        finally:
+            server.should_exit = True
+            await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(run_case())
+
+
 def test_task_runtime_default_hard_deadline_is_unbounded() -> None:
     config = GatewayConfig()
 
@@ -133,6 +224,11 @@ def test_start_gateway_server_releases_pid_lock_when_build_services_fails(
         events.append("build_services")
         raise RuntimeError("service construction failed")
 
+    monkeypatch.setattr(
+        boot,
+        "_start_background_install_telemetry",
+        lambda config: events.append("install_telemetry"),
+    )
     monkeypatch.setattr(boot, "build_services", fail_build_services)
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
     monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
@@ -160,20 +256,29 @@ def test_start_gateway_server_releases_pid_lock_when_build_services_fails(
     asyncio.run(run_case())
 
 
-def test_start_gateway_server_logs_install_telemetry_without_structlog_event_collision(
+def test_start_gateway_server_starts_telemetry_after_listener_and_runtime_are_ready(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from opensquilla.gateway import boot
 
     debug_logs: list[tuple[str, dict[str, Any]]] = []
+    call_order: list[str] = []
+    app_holder: dict[str, Any] = {}
 
     class FakeLog:
         def debug(self, event: str, **kwargs: Any) -> None:
             debug_logs.append((event, kwargs))
 
-        def info(self, _event: str, **_kwargs: Any) -> None:
-            return None
+        def info(self, event: str, **kwargs: Any) -> None:
+            if event != "gateway.startup_phase":
+                return
+            phase = kwargs.get("phase")
+            if phase == "runtime_state":
+                assert app_holder["app"].state.gateway_ready is True
+                call_order.append("runtime_state")
+            elif phase in {"listener", "gateway_ready"}:
+                call_order.append(str(phase))
 
         def warning(self, _event: str, **_kwargs: Any) -> None:
             return None
@@ -185,7 +290,17 @@ def test_start_gateway_server_logs_install_telemetry_without_structlog_event_col
         def set_session_lock_provider(self, _provider: Any) -> None:
             return None
 
+    class FakeUvicornServer:
+        def __init__(self, config: Any) -> None:
+            self.config = config
+            self.should_exit = False
+
+        async def serve(self) -> None:
+            call_order.append("listener_callback")
+            await self.config.callback_notify()
+
     async def fake_build_services(**kwargs: Any) -> Any:
+        call_order.append("build_services")
         config = kwargs["config"]
 
         async def close() -> None:
@@ -212,23 +327,55 @@ def test_start_gateway_server_logs_install_telemetry_without_structlog_event_col
             close=close,
         )
 
-    def fake_collect_install_telemetry(*, config: GatewayConfig) -> Any:
-        return SimpleNamespace(
-            skipped_reason=None,
-            event="install",
-            sent=True,
-            uploaded=False,
-            endpoint_configured=True,
+    def fake_start_background_install_telemetry(
+        *,
+        config: GatewayConfig,
+        on_result: Any,
+    ) -> None:
+        assert app_holder["app"].state.gateway_ready is True
+        call_order.append("install_telemetry")
+        on_result(
+            SimpleNamespace(
+                skipped_reason=None,
+                event="install",
+                sent=True,
+                uploaded=False,
+                endpoint_configured=True,
+            )
         )
+
+    def fake_daily_usage_loop(storage: Any, *, config: GatewayConfig) -> Any:
+        assert app_holder["app"].state.gateway_ready is True
+        call_order.append("daily_usage")
+
+        async def complete() -> None:
+            return None
+
+        return complete()
+
+    real_create_gateway_app = boot.create_gateway_app
+
+    def capture_gateway_app(*args: Any, **kwargs: Any) -> Any:
+        app = real_create_gateway_app(*args, **kwargs)
+        app_holder["app"] = app
+        return app
 
     monkeypatch.setattr(boot, "log", FakeLog())
     monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
     monkeypatch.setattr(boot, "build_services", fake_build_services)
+    monkeypatch.setattr(boot, "create_gateway_app", capture_gateway_app)
+    monkeypatch.setattr(boot, "get_session_storage", lambda manager: object())
+    monkeypatch.setattr(boot.uvicorn, "Server", FakeUvicornServer)
+    monkeypatch.setattr(boot, "_desktop_router_preload_enabled", lambda: False)
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
     monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
     monkeypatch.setattr(
-        "opensquilla.observability.install_telemetry.collect_install_telemetry",
-        fake_collect_install_telemetry,
+        "opensquilla.observability.install_telemetry.start_background_install_telemetry",
+        fake_start_background_install_telemetry,
+    )
+    monkeypatch.setattr(
+        "opensquilla.observability.usage_telemetry.run_daily_usage_upload_loop",
+        fake_daily_usage_loop,
     )
     monkeypatch.setattr(
         "opensquilla.gateway.pidlock.GatewayPidLock.acquire",
@@ -246,9 +393,11 @@ def test_start_gateway_server_logs_install_telemetry_without_structlog_event_col
     )
 
     async def run_case() -> None:
-        server = await boot.start_gateway_server(config=config, run=False)
+        server = await boot.start_gateway_server(config=config, run=True)
 
         try:
+            assert call_order == ["build_services", "runtime_state"]
+            await asyncio.sleep(0)
             telemetry_logs = [
                 kwargs for event, kwargs in debug_logs if event == "gateway.install_telemetry"
             ]
@@ -258,6 +407,15 @@ def test_start_gateway_server_logs_install_telemetry_without_structlog_event_col
             assert "gateway.install_telemetry_skipped" not in {
                 event for event, _kwargs in debug_logs
             }
+            assert call_order == [
+                "build_services",
+                "runtime_state",
+                "listener_callback",
+                "listener",
+                "gateway_ready",
+                "install_telemetry",
+                "daily_usage",
+            ]
         finally:
             await server.close()
 
@@ -1312,6 +1470,7 @@ def test_start_gateway_server_passes_tls_files_to_uvicorn(
             assert captured_config["ssl_keyfile"] == keyfile
             assert captured_config["ssl_certfile"] == certfile
             assert captured_config["access_log"] is False
+            assert callable(captured_config["callback_notify"])
         finally:
             await server.close()
 

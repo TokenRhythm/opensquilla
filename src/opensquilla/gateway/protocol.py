@@ -142,6 +142,7 @@ class PolicyInfo(BaseModel):
     max_payload: int = MAX_PAYLOAD_BYTES
     max_buffered_bytes: int = MAX_BUFFERED_BYTES
     tick_interval_ms: int = TICK_INTERVAL_MS
+    concurrent_history_reads: bool = False
     agent_stream_heartbeat_interval_ms: int = 15_000
     agent_stream_idle_timeout_ms: int = 600_000
     webui_stream_idle_grace_ms: int = 630_000

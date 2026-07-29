@@ -782,7 +782,7 @@ describe('useChatSessionSubscription', () => {
     warn.mockRestore()
   })
 
-  it('keeps fast ACK defaults non-authoritative and hydrates project metadata separately', async () => {
+  it('hydrates project metadata after critical requests queue without waiting for history', async () => {
     const onSnapshot = vi.fn()
     const onSessionMetadata = vi.fn()
     const resetStreamLiveTurnState = vi.fn()
@@ -791,14 +791,26 @@ describe('useChatSessionSubscription', () => {
       label: 'Running',
       task: null,
     })
+    let resolveCriticalRequestsQueued!: () => void
     let resolveHistory!: () => void
-    const historyTerminal = new Promise<void>(resolve => {
+    let historySettled = false
+    const criticalRequestsQueued = new Promise<void>(resolve => {
+      resolveCriticalRequestsQueued = resolve
+    })
+    const history = new Promise<void>(resolve => {
       resolveHistory = resolve
+    }).then(() => {
+      historySettled = true
     })
     const markLiveSubscribeSent = vi.fn()
     const rpc = {
       waitForConnection: vi.fn(async () => {}),
-      call: async <T = unknown>(method: string) => {
+      call: async <T = unknown>(
+        method: string,
+        _params?: Record<string, unknown>,
+        callOptions?: RpcCallOptions,
+      ) => {
+        callOptions?.onSent?.(1)
         if (method === 'sessions.messages.subscribe') {
           return {
             subscribed: true,
@@ -855,14 +867,16 @@ describe('useChatSessionSubscription', () => {
       signal: new AbortController().signal,
       skipSnapshot: false,
       markLiveSubscribeSent,
-      waitForHistoryTerminal: () => historyTerminal,
+      waitForCriticalRequestsQueued: () => criticalRequestsQueued,
     })
 
     expect(markLiveSubscribeSent).toHaveBeenCalledOnce()
     expect(onSessionMetadata).not.toHaveBeenCalled()
+    expect(historySettled).toBe(false)
     expect(runStatus.value.status).toBe('running')
-    resolveHistory()
+    resolveCriticalRequestsQueued()
     await vi.waitFor(() => expect(onSessionMetadata).toHaveBeenCalledOnce())
+    expect(historySettled).toBe(false)
 
     expect(outcome.authoritative).toBe(true)
     expect(runStatus.value.status).toBe('running')
@@ -876,15 +890,24 @@ describe('useChatSessionSubscription', () => {
         projectWorkspace: undefined,
       },
     )
+    resolveHistory()
+    await history
   })
 
-  it('gives deferred metadata a fresh bounded window after history exhausts its budget', async () => {
+  it('gives deferred metadata a fresh bounded window after critical requests queue', async () => {
     let now = 10_000
     const dateNow = vi.spyOn(Date, 'now').mockImplementation(() => now)
     const onSessionMetadata = vi.fn()
+    let resolveCriticalRequestsQueued!: () => void
     let resolveHistory!: () => void
-    const historyTerminal = new Promise<void>(resolve => {
+    let historySettled = false
+    const criticalRequestsQueued = new Promise<void>(resolve => {
+      resolveCriticalRequestsQueued = resolve
+    })
+    const history = new Promise<void>(resolve => {
       resolveHistory = resolve
+    }).then(() => {
+      historySettled = true
     })
     const call = vi.fn(async <T = unknown>(method: string, _params?: unknown, options?: {
         timeoutMs?: number
@@ -942,17 +965,22 @@ describe('useChatSessionSubscription', () => {
       attemptDeadlineAt: now + 100,
       signal: new AbortController().signal,
       skipSnapshot: true,
-      waitForHistoryTerminal: () => historyTerminal,
+      waitForCriticalRequestsQueued: () => criticalRequestsQueued,
     })
 
     expect(outcome.authoritative).toBe(true)
+    expect(onSessionMetadata).not.toHaveBeenCalled()
+    expect(historySettled).toBe(false)
     now += 101
-    resolveHistory()
+    resolveCriticalRequestsQueued()
     await vi.waitFor(() => expect(onSessionMetadata).toHaveBeenCalledOnce())
+    expect(historySettled).toBe(false)
     expect(call.mock.calls.map(([method]) => method)).toEqual([
       'sessions.messages.subscribe',
       'sessions.messages.hydrate',
     ])
+    resolveHistory()
+    await history
     dateNow.mockRestore()
   })
 

@@ -2,9 +2,18 @@
 
 from __future__ import annotations
 
+import os
 import time
+from types import SimpleNamespace
 
-from opensquilla.memory.dream.candidates import scan_dream_candidates
+import pytest
+
+from opensquilla.memory.dream.candidates import (
+    DreamCandidateScan,
+    scan_dream_candidate_batch,
+    scan_dream_candidates,
+)
+from opensquilla.memory.dream.runner import Dream
 
 
 class TestScanDeduplication:
@@ -140,3 +149,98 @@ class TestScanDeduplication:
             known_hashes=None,
         )
         assert len(candidates) == 3
+
+    def test_scan_reports_unchanged_high_watermark(self, tmp_path):
+        """Hash-equivalent files remain visible as consumed scan observations."""
+        workspace = tmp_path / "ws"
+        memory_dir = workspace / "memory"
+        memory_dir.mkdir(parents=True)
+        path = memory_dir / "test.md"
+        path.write_text("We decided to use PostgreSQL.", encoding="utf-8")
+
+        first = scan_dream_candidates(
+            workspace, cursor=0.0, max_batch_size=20, agent_id="main",
+        )
+        scan = scan_dream_candidate_batch(
+            workspace,
+            cursor=0.0,
+            max_batch_size=20,
+            agent_id="main",
+            known_hashes={first[0].snippet_sha256},
+        )
+
+        assert scan.candidates == []
+        assert scan.files_considered == 1
+        assert scan.files_skipped_unchanged == 1
+        assert scan.cursor_high_watermark == path.stat().st_mtime
+
+    def test_high_watermark_does_not_skip_deferred_changed_file(self, tmp_path):
+        """A newer unchanged file cannot move the cursor past a capped candidate."""
+        workspace = tmp_path / "ws"
+        memory_dir = workspace / "memory"
+        memory_dir.mkdir(parents=True)
+        first = memory_dir / "first.md"
+        deferred = memory_dir / "deferred.md"
+        unchanged = memory_dir / "unchanged.md"
+        first.write_text("First changed content.", encoding="utf-8")
+        deferred.write_text("Deferred changed content.", encoding="utf-8")
+        unchanged.write_text("Stable unchanged content.", encoding="utf-8")
+        os.utime(first, (100.0, 100.0))
+        os.utime(deferred, (200.0, 200.0))
+        os.utime(unchanged, (300.0, 300.0))
+
+        initial = scan_dream_candidates(
+            workspace, cursor=0.0, max_batch_size=20, agent_id="main",
+        )
+        unchanged_hash = next(
+            item.snippet_sha256
+            for item in initial
+            if item.source_path == "memory/unchanged.md"
+        )
+        scan = scan_dream_candidate_batch(
+            workspace,
+            cursor=0.0,
+            max_batch_size=1,
+            agent_id="main",
+            known_hashes={unchanged_hash},
+        )
+
+        assert [item.source_path for item in scan.candidates] == ["memory/first.md"]
+        assert scan.cursor_high_watermark == 100.0
+
+    @pytest.mark.asyncio
+    async def test_unchanged_only_run_advances_cursor(self, tmp_path, monkeypatch):
+        """An unchanged-only Dream run must not rescan the observation forever."""
+        workspace = tmp_path / "ws"
+        (workspace / "memory").mkdir(parents=True)
+        scan = DreamCandidateScan(
+            candidates=[],
+            files_considered=1,
+            files_skipped_unchanged=1,
+            cursor_high_watermark=123.5,
+        )
+        monkeypatch.setattr(
+            "opensquilla.memory.dream.runner.scan_dream_candidate_batch",
+            lambda *args, **kwargs: scan,
+        )
+        dream = Dream(
+            workspace=workspace,
+            provider=None,
+            session_lock=None,
+            config=SimpleNamespace(
+                max_batch_size=20,
+                min_batch_size=1,
+                evidence_quarantine_enabled=True,
+                input_slimming="off",
+                preview_mode=False,
+                dry_run=False,
+            ),
+            agent_id="main",
+        )
+
+        result = await dream._run_evidence_consolidation()
+
+        assert result.files_considered == 1
+        assert result.files_skipped_unchanged == 1
+        assert result.cursor_after == 123.5
+        assert dream.cursor.load() == 123.5

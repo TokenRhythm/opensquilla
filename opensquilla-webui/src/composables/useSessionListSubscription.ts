@@ -1,7 +1,11 @@
-import type { ConnectionState, RpcEventHandler } from '@/lib/rpc'
+import type { ConnectionState, RpcCallOptions, RpcEventHandler } from '@/lib/rpc'
 
 type SessionListRpc = {
-  call(method: string, params?: Record<string, unknown>): Promise<unknown>
+  call(
+    method: string,
+    params?: Record<string, unknown>,
+    callOptions?: RpcCallOptions,
+  ): Promise<unknown>
   on(event: string, handler: RpcEventHandler): () => void
 }
 
@@ -12,6 +16,7 @@ export interface UseSessionListSubscriptionOptions {
   refresh: () => void | Promise<void>
   scheduleRefresh: () => void
   warn?: (message: string, error?: unknown) => void
+  callOptions?: RpcCallOptions
 }
 
 export function useSessionListSubscription(options: UseSessionListSubscriptionOptions) {
@@ -47,7 +52,15 @@ export function useSessionListSubscription(options: UseSessionListSubscriptionOp
     subscribeAttempt = attempt
     subscribeWork = (async () => {
       try {
-        await options.rpc.call('sessions.subscribe')
+        if (options.callOptions) {
+          await options.rpc.call(
+            'sessions.subscribe',
+            undefined,
+            options.callOptions,
+          )
+        } else {
+          await options.rpc.call('sessions.subscribe')
+        }
         if (!active || !options.isConnected() || generation !== connectionGeneration) return
         subscribed = true
         await options.refresh()
@@ -91,7 +104,14 @@ export function useSessionListSubscription(options: UseSessionListSubscriptionOp
     removeListeners = []
 
     if (shouldUnsubscribe && options.isConnected()) {
-      void options.rpc.call('sessions.unsubscribe').catch(error => {
+      const unsubscribe = options.callOptions
+        ? options.rpc.call(
+            'sessions.unsubscribe',
+            undefined,
+            options.callOptions,
+          )
+        : options.rpc.call('sessions.unsubscribe')
+      void unsubscribe.catch(error => {
         warn('Session list unsubscribe failed', error)
       })
     }

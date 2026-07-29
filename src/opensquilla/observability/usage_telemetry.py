@@ -117,16 +117,24 @@ async def upload_pending_daily_usage(
     if not rows:
         return 0
 
-    state_path = install_telemetry._state_path(config=config, explicit=None)
-    state = install_telemetry._load_or_create_state(state_path)
-    install_telemetry._write_state(state_path, state)
+    install_id = await asyncio.to_thread(
+        install_telemetry.ensure_install_telemetry_id,
+        config=config,
+    )
+    if install_telemetry._telemetry_skip_reason(config=config) is not None:
+        return 0
+
     uploaded = 0
     for row in rows:
         payload = _daily_payload(
             row,
-            install_id=state["install_id"],
+            install_id=install_id,
             sent_at=_utc_now(),
         )
+        # The privacy flag is hot-reloadable. Do not start another request
+        # after an operator opts out while a multi-day batch is in flight.
+        if install_telemetry._telemetry_skip_reason(config=config) is not None:
+            break
         ok, error = await _post_payload(endpoint, payload)
         if not ok:
             log.debug("Daily usage telemetry upload failed: %s", error)

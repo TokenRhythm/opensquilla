@@ -19,7 +19,7 @@ import {
 } from '@/composables/chat/sessionBootstrapAdmission'
 
 describe('useRpcCall session bootstrap admission', () => {
-  it('defers and coalesces mount-time optional RPCs until recovery is terminal', async () => {
+  it('defers and coalesces mount-time optional RPCs until critical frames are queued', async () => {
     rpc.call.mockClear()
     const release = acquireSessionBootstrapAdmission()
     const component = defineComponent({
@@ -47,6 +47,10 @@ describe('useRpcCall session bootstrap admission', () => {
       undefined,
       optionalSessionRpcCallOptions,
     )
+    expect(optionalSessionRpcCallOptions).toMatchObject({
+      timeoutAction: 'reconnect',
+      abortAction: 'reconnect',
+    })
     app.unmount()
   })
 })

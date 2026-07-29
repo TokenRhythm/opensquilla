@@ -1,8 +1,20 @@
 import { computed, ref, type Ref } from 'vue'
+import {
+  waitForSessionRpcConnection,
+} from '@/composables/chat/sessionBootstrapAdmission'
+import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
 
 type RpcClient = {
-  waitForConnection: () => Promise<void>
-  call: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
+  waitForConnection: (
+    timeoutMs?: number,
+    signal?: AbortSignal,
+    actions?: RpcConnectionWaitOptions,
+  ) => Promise<void>
+  call: <T = unknown>(
+    method: string,
+    params?: Record<string, unknown>,
+    callOptions?: RpcCallOptions,
+  ) => Promise<T>
 }
 
 export interface ChatUsageAccumulator {
@@ -17,6 +29,7 @@ export interface ChatUsageAccumulator {
 
 export interface UseChatUsageWidgetOptions {
   rpc: RpcClient
+  readCallOptions?: RpcCallOptions
   sessionKey: Ref<string>
   tokenVizEnabled: () => boolean
 }
@@ -148,8 +161,15 @@ export function useChatUsageWidget(options: UseChatUsageWidgetOptions) {
   async function loadCurrentSessionUsage() {
     if (!options.sessionKey.value) return
     try {
-      await options.rpc.waitForConnection()
-      const usage = await options.rpc.call<UsageStatusResponse>('usage.status', { sessionKey: options.sessionKey.value })
+      await waitForSessionRpcConnection(options.rpc, options.readCallOptions)
+      const params = { sessionKey: options.sessionKey.value }
+      const usage = options.readCallOptions
+        ? await options.rpc.call<UsageStatusResponse>(
+            'usage.status',
+            params,
+            options.readCallOptions,
+          )
+        : await options.rpc.call<UsageStatusResponse>('usage.status', params)
       const sessions = usage?.sessions || []
       const current = sessions.find(s => (s.session || s.sessionKey || s.key) === options.sessionKey.value)
       if (current) {

@@ -1011,6 +1011,7 @@ jobs:
             'primary-repair-accessibility:scripts/test-primary-repair-accessibility.mjs' \
             'profile-import-flow:scripts/test-profile-import-flow.mjs' \
             'desktop-cleanup-flow:scripts/test-desktop-cleanup-flow.mjs' \
+            'gateway-ownership:scripts/test-desktop-gateway-ownership.mjs' \
             'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs' \
             'window-background-flow:scripts/test-desktop-window-background-flow.mjs' \
             'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs' \

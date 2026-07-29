@@ -3,12 +3,23 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from pathlib import Path
 
 from opensquilla.memory.dream.models import RawDreamCandidate
 from opensquilla.memory.dream.quarantine import is_quarantined_path, is_quarantined_text
 
 _SNIPPET_MAX_CHARS = 4000
+
+
+@dataclass(frozen=True)
+class DreamCandidateScan:
+    """Candidates plus enough scan state to advance the Dream cursor safely."""
+
+    candidates: list[RawDreamCandidate]
+    files_considered: int
+    files_skipped_unchanged: int
+    cursor_high_watermark: float
 
 
 def _workspace_relative(workspace: Path, path: Path) -> str:
@@ -54,7 +65,7 @@ def classify_signal(text: str) -> str:
     return "neutral"
 
 
-def scan_dream_candidates(
+def scan_dream_candidate_batch(
     workspace: Path,
     *,
     cursor: float,
@@ -62,11 +73,12 @@ def scan_dream_candidates(
     agent_id: str,
     quarantine_enabled: bool = True,
     known_hashes: set[str] | None = None,
-) -> list[RawDreamCandidate]:
+) -> DreamCandidateScan:
     memory_dir = workspace / "memory"
     if not memory_dir.exists():
-        return []
+        return DreamCandidateScan([], 0, 0, cursor)
     candidates: list[tuple[float, RawDreamCandidate]] = []
+    unchanged_mtimes: list[float] = []
     for path in memory_dir.iterdir():
         try:
             if not path.is_file():
@@ -95,6 +107,7 @@ def scan_dream_candidates(
         # D10: skip files whose content hash matches a previously-seen candidate
         snippet_sha = _sha256(snippet)
         if known_hashes and snippet_sha in known_hashes:
+            unchanged_mtimes.append(stat.st_mtime)
             continue
         candidates.append(
             (
@@ -114,4 +127,45 @@ def scan_dream_candidates(
             )
         )
     candidates.sort(key=lambda item: item[0])
-    return [candidate for _mtime, candidate in candidates[: max(0, int(max_batch_size))]]
+    selected = candidates[: max(0, int(max_batch_size))]
+
+    # Never advance past a changed candidate deferred by max_batch_size.
+    # When every changed candidate fits, unchanged files are already
+    # semantically represented by evidence and may advance the cursor too.
+    if len(selected) < len(candidates):
+        high_watermark = max((mtime for mtime, _candidate in selected), default=cursor)
+    else:
+        high_watermark = max(
+            (
+                *(mtime for mtime, _candidate in selected),
+                *unchanged_mtimes,
+            ),
+            default=cursor,
+        )
+
+    return DreamCandidateScan(
+        candidates=[candidate for _mtime, candidate in selected],
+        files_considered=len(candidates) + len(unchanged_mtimes),
+        files_skipped_unchanged=len(unchanged_mtimes),
+        cursor_high_watermark=high_watermark,
+    )
+
+
+def scan_dream_candidates(
+    workspace: Path,
+    *,
+    cursor: float,
+    max_batch_size: int,
+    agent_id: str,
+    quarantine_enabled: bool = True,
+    known_hashes: set[str] | None = None,
+) -> list[RawDreamCandidate]:
+    """Backward-compatible candidate-only view of a Dream scan."""
+    return scan_dream_candidate_batch(
+        workspace,
+        cursor=cursor,
+        max_batch_size=max_batch_size,
+        agent_id=agent_id,
+        quarantine_enabled=quarantine_enabled,
+        known_hashes=known_hashes,
+    ).candidates

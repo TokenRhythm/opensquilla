@@ -1190,6 +1190,7 @@
     "tests/unit/cli/tui/test_tui_replay_harness.py": 0.055,
     "tests/unit/test_env.py": 0.049,
     "tests/unit/test_env_loading.py": 0.023,
-    "tests/unit/test_ui.py": 0.051
+    "tests/unit/test_ui.py": 0.051,
+    "tests/test_gateway/test_websocket_request_concurrency.py": 0.01
   }
 }

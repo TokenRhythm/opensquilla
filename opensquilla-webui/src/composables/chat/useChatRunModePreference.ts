@@ -1,5 +1,9 @@
 import { computed, ref, watch } from 'vue'
 
+import {
+  waitForSessionRpcConnection,
+} from '@/composables/chat/sessionBootstrapAdmission'
+import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
 import { SANDBOX_RUN_MODES, isSandboxRunMode, type SandboxRunMode } from '@/types/sandbox'
 
 export const RUN_MODE_STORAGE_KEY = 'opensquilla.chat.runMode'
@@ -13,11 +17,20 @@ export interface RunModePolicy {
 interface UseChatRunModePreferenceOptions {
   runModePolicy: () => RunModePolicy | null | undefined
   rpc: RunModePreferenceRpc
+  hydrateCallOptions?: RpcCallOptions
 }
 
 interface RunModePreferenceRpc {
-  waitForConnection: (timeoutMs?: number) => Promise<void>
-  call: (method: string, params?: Record<string, unknown>) => Promise<unknown>
+  waitForConnection: (
+    timeoutMs?: number,
+    signal?: AbortSignal,
+    actions?: RpcConnectionWaitOptions,
+  ) => Promise<void>
+  call: (
+    method: string,
+    params?: Record<string, unknown>,
+    callOptions?: RpcCallOptions,
+  ) => Promise<unknown>
 }
 
 interface RunModeRpc {
@@ -164,8 +177,14 @@ export function useChatRunModePreference(options: UseChatRunModePreferenceOption
   }
 
   async function hydrateRunModePreference(): Promise<SandboxRunMode> {
-    await options.rpc.waitForConnection()
-    const payload = await options.rpc.call('sandbox.run_mode.preference.get')
+    await waitForSessionRpcConnection(options.rpc, options.hydrateCallOptions)
+    const payload = options.hydrateCallOptions
+      ? await options.rpc.call(
+          'sandbox.run_mode.preference.get',
+          undefined,
+          options.hydrateCallOptions,
+        )
+      : await options.rpc.call('sandbox.run_mode.preference.get')
     const source = payload && typeof payload === 'object'
       ? (payload as Record<string, unknown>).source
       : null

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   resolveChatHistoryRecoveryState,
   shouldShowConfirmedEmptySession,
+  visibleChatHistoryRecoveryState,
 } from './sessionLoadState'
 
 describe('resolveChatHistoryRecoveryState', () => {
@@ -39,6 +40,14 @@ describe('resolveChatHistoryRecoveryState', () => {
       initialHistoryStatus: 'loading',
       retrying: false,
     })).toBeNull()
+  })
+})
+
+describe('visibleChatHistoryRecoveryState', () => {
+  it('hides routine initial loading while preserving actionable recovery states', () => {
+    expect(visibleChatHistoryRecoveryState('history-loading')).toBeNull()
+    expect(visibleChatHistoryRecoveryState('history-retrying')).toBe('history-retrying')
+    expect(visibleChatHistoryRecoveryState('history-error')).toBe('history-error')
   })
 })
 

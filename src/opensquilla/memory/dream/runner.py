@@ -15,7 +15,10 @@ from opensquilla.engine.usage_accounting import (
     current_usage_accounting_scope,
     provider_accounts_physical_usage,
 )
-from opensquilla.memory.dream.candidates import scan_dream_candidates
+from opensquilla.memory.dream.candidates import (
+    scan_dream_candidate_batch,
+    scan_dream_candidates,
+)
 from opensquilla.memory.dream.curated_apply import apply_promotion_patch
 from opensquilla.memory.dream.evidence import (
     mark_evidence_promoted,
@@ -269,7 +272,7 @@ class Dream:
         except Exception:  # noqa: BLE001
             pass  # D10 is best-effort; degrade to full scan
 
-        raw_candidates = scan_dream_candidates(
+        candidate_scan = scan_dream_candidate_batch(
             self.workspace,
             cursor=result.cursor_before,
             max_batch_size=getattr(self.config, "max_batch_size", 20),
@@ -277,9 +280,19 @@ class Dream:
             quarantine_enabled=getattr(self.config, "evidence_quarantine_enabled", True),
             known_hashes=d10_known_hashes,
         )
-        result.files_considered = len(raw_candidates)
+        raw_candidates = candidate_scan.candidates
+        result.files_considered = candidate_scan.files_considered
+        result.files_skipped_unchanged = candidate_scan.files_skipped_unchanged
         if len(raw_candidates) < getattr(self.config, "min_batch_size", 1):
-            result.cursor_after = result.cursor_before
+            if (
+                not raw_candidates
+                and result.files_skipped_unchanged
+                and not result.dry_run
+            ):
+                self.cursor.save(candidate_scan.cursor_high_watermark)
+                result.cursor_after = candidate_scan.cursor_high_watermark
+            else:
+                result.cursor_after = result.cursor_before
             try:
                 self._emit_log(result)
             except Exception as exc:  # noqa: BLE001
@@ -329,10 +342,7 @@ class Dream:
             return result
 
         if not ranked:
-            max_mtime = max(
-                (candidate.source_mtime_ns / 1_000_000_000 for candidate in raw_candidates),
-                default=result.cursor_before,
-            )
+            max_mtime = candidate_scan.cursor_high_watermark
             if not result.dry_run:
                 write_evidence_store(self.workspace, store)
                 result.files_processed = len(raw_candidates)
@@ -440,10 +450,7 @@ class Dream:
                 mark_evidence_promoted(store, promoted_ids, now_iso)
                 mark_evidence_represented(store, represented_ids, "no_curated_change")
                 write_evidence_store(self.workspace, store)
-                max_mtime = max(
-                    (candidate.source_mtime_ns / 1_000_000_000 for candidate in raw_candidates),
-                    default=result.cursor_before,
-                )
+                max_mtime = candidate_scan.cursor_high_watermark
                 result.files_processed = len(raw_candidates)
                 self.cursor.save(max_mtime)
                 result.cursor_after = max_mtime

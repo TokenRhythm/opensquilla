@@ -1097,13 +1097,11 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       const connectedSessionKey = sessionKey.value
       connectionLostNoted = false
       stream.hideThinkingIndicator()
-      // The Gateway intentionally dispatches RPCs serially. Optional usage
-      // metadata must not enter that queue ahead of snapshot/subscribe/history
-      // after reconnect, so wait for the coordinator's critical phases.
-      const criticalPhases = recovery
-        ? [recovery.history, recovery.live]
-        : []
-      void Promise.allSettled(criticalPhases).then(() => {
+      // Preserve critical frame ordering after reconnect without waiting for a
+      // potentially slow history response before refreshing independent UI.
+      const criticalRequestsQueued = recovery?.criticalRequestsQueued
+        ?? Promise.resolve()
+      void criticalRequestsQueued.then(() => {
         if (
           connectionStateGeneration === stateGeneration
           && sessionKey.value === connectedSessionKey
