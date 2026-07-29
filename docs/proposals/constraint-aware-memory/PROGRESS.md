@@ -227,10 +227,28 @@ Total regression: 616 passed, 7 skipped (1 pre-existing failure unrelated)
 
 ---
 
+## D10: Dream 增量 Diff ✅
+
+### 改动文件
+
+| 文件 | 变更 |
+|------|------|
+| `src/opensquilla/memory/dream/candidates.py` | `known_hashes` 参数 + content-hash 去重 |
+| `src/opensquilla/memory/dream/runner.py` | evidence store hash 提取 + `files_skipped_unchanged` |
+| `tests/test_memory/test_dream_dedup.py` | 6 个新测试 |
+
+### 测试结果
+
+```
+tests/test_memory/test_dream_dedup.py: 6 passed
+tests/test_memory_dream_runner.py + paths + handler: 17 passed (no regression)
+```
+
+---
+
 ## 后议项
 
 | # | 内容 | 优先级 |
 |---|------|--------|
-| D10 | Dream 增量 Diff 模式 | 🟡 中期 |
 | Q1 | Pattern 跨 session 匹配 | 🟢 长期 |
 | A1-D | A1 动态自适应路由（阈值/成本预算/反馈回路） | 🟢 长期 |

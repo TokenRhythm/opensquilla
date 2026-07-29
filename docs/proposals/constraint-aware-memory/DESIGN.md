@@ -569,6 +569,7 @@ Layer 0 无开关，始终启用（基础设施修复）。
 | v0.7.0+ | A1 写入路径分层升级 + B6 中文意图覆盖 | `3cf54191` | ✅ 已实现 |
 | v0.7.1 | A1-3 LLM 注入 store 直接索引路径 | `1e77f919` | ✅ 已实现 |
 | v0.7.2 | D11 Usage Tracking + D5 Dream 评分增强 | `a07ae662` | ✅ 已实现 |
+| v0.7.3 | D10 Dream 增量 Diff（content-hash 去重） | `06cf8e00` | ✅ 已实现 |
 | v0.8.0 | 若准确率 > 85%：Layer 1+2 默认开启 | 数据驱动 | 🔶 待启动 |
 | v0.9.0 | Layer 3 作为 experimental | Config gate | 🔶 待实现 |
 | v1.0.0 | 评估用充分性检查替代 coverage check | 验证 | 🔶 待评估 |
@@ -709,5 +710,7 @@ score = (
 | `docs/proposals/constraint-aware-memory/RESEARCH_B6_CHINESE_INTENT_COVERAGE.md` | B6 中文意图调研 |
 | `docs/proposals/constraint-aware-memory/SPEC_A1_3_LLM_INJECTION.md` | A1-3 LLM 注入设计 |
 | `docs/proposals/constraint-aware-memory/SPEC_D11_D5_USAGE_DREAM.md` | D11+D5 Usage+Dream 设计 |
+| `docs/proposals/constraint-aware-memory/SPEC_D10_INCREMENTAL_DIFF.md` | D10 增量 Diff 设计 |
+| `tests/test_memory/test_dream_dedup.py` | D10: 6 tests |
 | `src/opensquilla/memory/dream_factory.py` | Dream 工厂 + memory_store 注入 |
 | `tests/test_memory/test_usage_tracking.py` | D11+D5: 24 tests |
