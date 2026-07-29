@@ -655,3 +655,257 @@ class TestA1SyncPath:
         ct, conf = classify_constraint_sync(text)
         assert ct == ConstraintType.procedure
         assert conf == 0.9
+
+
+# ── A1-3: Store LLM Injection (index_file with async classify) ────────────
+
+
+class TestA13StoreLlmInjection:
+    """A1-3: store.index_file() uses async classify_constraint with LLM escalation."""
+
+    @pytest.mark.asyncio
+    async def test_llm_call_used_for_low_confidence(self, tmp_path):
+        """Low-confidence heuristic text triggers LLM escalation via llm_call."""
+        from opensquilla.memory.store import LongTermMemoryStore
+        from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.types import MemorySource
+
+        llm_calls: list[str] = []
+
+        async def mock_llm(prompt: str) -> str:
+            llm_calls.append(prompt)
+            return "event"
+
+        store = LongTermMemoryStore(
+            db_path=str(tmp_path / "test_memory.db"),
+            embedding_provider=NullEmbeddingProvider(),
+            constraint_annotation_enabled=True,
+            constraint_llm_call=mock_llm,
+        )
+        await store.initialize()
+        try:
+            # "Yesterday we deployed..." has heuristic conf=0.5 < 0.6 → LLM escalated
+            await store.index_file(
+                "memory/test.md",
+                "Yesterday we deployed the new version of the production environment system to the online server.",
+                source=MemorySource.memory,
+            )
+            async with store._db.execute(
+                "SELECT constraint_type, constraint_confidence FROM chunks WHERE path = ?",
+                ("memory/test.md",),
+            ) as cur:
+                rows = await cur.fetchall()
+            assert len(rows) == 1
+            # LLM returned "event" with _LLM_CONFIDENCE=0.8
+            assert rows[0][0] == "event"
+            assert rows[0][1] == 0.8
+            # LLM was actually called
+            assert len(llm_calls) == 1
+        finally:
+            await store.close()
+
+    @pytest.mark.asyncio
+    async def test_llm_skipped_for_high_confidence(self, tmp_path):
+        """High-confidence heuristic text (>= 0.6) skips LLM entirely."""
+        from opensquilla.memory.store import LongTermMemoryStore
+        from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.types import MemorySource
+
+        llm_calls: list[str] = []
+
+        async def mock_llm(prompt: str) -> str:
+            llm_calls.append(prompt)
+            return "fact"
+
+        store = LongTermMemoryStore(
+            db_path=str(tmp_path / "test_memory.db"),
+            embedding_provider=NullEmbeddingProvider(),
+            constraint_annotation_enabled=True,
+            constraint_llm_call=mock_llm,
+        )
+        await store.initialize()
+        try:
+            # "We decided to use PostgreSQL..." has heuristic conf=0.6 >= 0.6 → LLM skipped
+            await store.index_file(
+                "memory/test.md",
+                "We decided to use PostgreSQL for the production database.",
+                source=MemorySource.memory,
+            )
+            async with store._db.execute(
+                "SELECT constraint_type, constraint_confidence FROM chunks WHERE path = ?",
+                ("memory/test.md",),
+            ) as cur:
+                rows = await cur.fetchall()
+            assert len(rows) == 1
+            assert rows[0][0] == "decision"
+            assert rows[0][1] == 0.6
+            # LLM was NOT called (heuristic accepted directly)
+            assert len(llm_calls) == 0
+        finally:
+            await store.close()
+
+    @pytest.mark.asyncio
+    async def test_llm_failure_falls_back_to_heuristic(self, tmp_path):
+        """When LLM call raises, falls back to heuristic result."""
+        from opensquilla.memory.store import LongTermMemoryStore
+        from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.types import MemorySource
+
+        async def failing_llm(prompt: str) -> str:
+            raise RuntimeError("LLM unavailable")
+
+        store = LongTermMemoryStore(
+            db_path=str(tmp_path / "test_memory.db"),
+            embedding_provider=NullEmbeddingProvider(),
+            constraint_annotation_enabled=True,
+            constraint_llm_call=failing_llm,
+        )
+        await store.initialize()
+        try:
+            await store.index_file(
+                "memory/test.md",
+                "Yesterday we deployed the new version of the production environment system to the online server.",
+                source=MemorySource.memory,
+            )
+            async with store._db.execute(
+                "SELECT constraint_type, constraint_confidence FROM chunks WHERE path = ?",
+                ("memory/test.md",),
+            ) as cur:
+                rows = await cur.fetchall()
+            assert len(rows) == 1
+            # Falls back to heuristic: event, 0.5
+            assert rows[0][0] == "event"
+            assert rows[0][1] == 0.5
+        finally:
+            await store.close()
+
+    @pytest.mark.asyncio
+    async def test_no_llm_call_uses_sync_fallback(self, tmp_path):
+        """Without llm_call, store uses classify_constraint_sync (current behavior)."""
+        from opensquilla.memory.store import LongTermMemoryStore
+        from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.types import MemorySource
+
+        store = LongTermMemoryStore(
+            db_path=str(tmp_path / "test_memory.db"),
+            embedding_provider=NullEmbeddingProvider(),
+            constraint_annotation_enabled=True,
+            constraint_llm_call=None,  # explicit None
+        )
+        await store.initialize()
+        try:
+            await store.index_file(
+                "memory/test.md",
+                "Yesterday we deployed the new version of the production environment system to the online server.",
+                source=MemorySource.memory,
+            )
+            async with store._db.execute(
+                "SELECT constraint_type, constraint_confidence FROM chunks WHERE path = ?",
+                ("memory/test.md",),
+            ) as cur:
+                rows = await cur.fetchall()
+            assert len(rows) == 1
+            # Sync path: heuristic only, event 0.5
+            assert rows[0][0] == "event"
+            assert rows[0][1] == 0.5
+        finally:
+            await store.close()
+
+    @pytest.mark.asyncio
+    async def test_annotation_off_ignores_llm_call(self, tmp_path):
+        """With annotation disabled, llm_call is never invoked."""
+        from opensquilla.memory.store import LongTermMemoryStore
+        from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.types import MemorySource
+
+        llm_calls: list[str] = []
+
+        async def mock_llm(prompt: str) -> str:
+            llm_calls.append(prompt)
+            return "decision"
+
+        store = LongTermMemoryStore(
+            db_path=str(tmp_path / "test_memory.db"),
+            embedding_provider=NullEmbeddingProvider(),
+            constraint_annotation_enabled=False,
+            constraint_llm_call=mock_llm,
+        )
+        await store.initialize()
+        try:
+            await store.index_file(
+                "memory/test.md",
+                "We decided to use PostgreSQL for the production database.",
+                source=MemorySource.memory,
+            )
+            async with store._db.execute(
+                "SELECT constraint_type, constraint_confidence FROM chunks WHERE path = ?",
+                ("memory/test.md",),
+            ) as cur:
+                rows = await cur.fetchall()
+            assert len(rows) == 1
+            # Default: fact, NULL (not annotated)
+            assert rows[0][0] == "fact"
+            assert rows[0][1] is None
+            assert len(llm_calls) == 0
+        finally:
+            await store.close()
+
+
+class TestA13ManagerAdapter:
+    """A1-3: _make_constraint_llm_call adapter tests."""
+
+    @pytest.mark.asyncio
+    async def test_adapter_with_complete_provider(self):
+        """Provider with complete() → adapter returns text."""
+        from opensquilla.memory.manager import _make_constraint_llm_call
+
+        class FakeCompleteProvider:
+            async def complete(self, messages, max_tokens=100):
+                class Resp:
+                    content = "decision"
+                return Resp()
+
+        llm_call = _make_constraint_llm_call(FakeCompleteProvider())
+        assert llm_call is not None
+        result = await llm_call("classify this text")
+        assert result == "decision"
+
+    @pytest.mark.asyncio
+    async def test_adapter_with_chat_provider(self):
+        """Provider with chat() (streaming) → adapter collects text_delta."""
+        from opensquilla.memory.manager import _make_constraint_llm_call
+
+        class FakeTextDelta:
+            kind = "text_delta"
+            text = "event"
+
+        class FakeDone:
+            kind = "done"
+            text = ""
+
+        class FakeChatProvider:
+            def chat(self, messages, config=None):
+                async def _stream():
+                    yield FakeTextDelta()
+                    yield FakeDone()
+                return _stream()
+
+        llm_call = _make_constraint_llm_call(FakeChatProvider())
+        assert llm_call is not None
+        result = await llm_call("classify this text")
+        assert result == "event"
+
+    def test_adapter_returns_none_for_no_provider(self):
+        """None provider → None adapter."""
+        from opensquilla.memory.manager import _make_constraint_llm_call
+
+        assert _make_constraint_llm_call(None) is None
+
+    def test_adapter_returns_none_for_unsupported_provider(self):
+        """Provider without complete/chat → None adapter."""
+        from opensquilla.memory.manager import _make_constraint_llm_call
+
+        class EmptyProvider:
+            pass
+
+        assert _make_constraint_llm_call(EmptyProvider()) is None

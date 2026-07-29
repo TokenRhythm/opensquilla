@@ -2664,6 +2664,7 @@ async def build_services(
             config,
             agent_ids,
             session_storage=session_storage,
+            provider_selector=provider_selector,
         )
 
         # Derive legacy per-tier views from the managers. These remain in

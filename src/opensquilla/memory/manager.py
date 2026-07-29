@@ -417,11 +417,53 @@ class MemoryManager:
         await self._best_effort_call("store", "close", self.store)
 
 
+def _make_constraint_llm_call(provider: Any) -> Any | None:
+    """Create a simple text-in/text-out LLM call adapter for constraint classification.
+
+    Returns a ``Callable[[str], Awaitable[str]]`` matching ``LlmCallFn``, or None
+    if the provider supports neither ``complete()`` nor ``chat()``.
+
+    Design decisions (A1-3, aligned 2026-07-29):
+    - max_tokens=100: classification response is a single word
+    - No usage tracking: best-effort classification, not user-visible
+    - Prefer complete() over chat(): simpler, avoids streaming overhead
+    """
+    complete = getattr(provider, "complete", None)
+    chat = getattr(provider, "chat", None)
+    if not callable(complete) and not callable(chat):
+        return None
+
+    async def _call(prompt: str) -> str:
+        from opensquilla.provider.types import ChatConfig, ContentBlockText, Message
+
+        messages = [Message(role="user", content=[ContentBlockText(text=prompt)])]
+        if callable(complete):
+            resp = await complete(messages=messages, max_tokens=100)
+            return getattr(resp, "content", None) or getattr(resp, "text", "") or ""
+        # Streaming chat fallback
+        config = ChatConfig(max_tokens=100)
+        stream = chat(messages, config=config)
+        chunks: list[str] = []
+        try:
+            async for event in stream:
+                text = getattr(event, "text", "") or ""
+                if text and getattr(event, "kind", "") == "text_delta":
+                    chunks.append(text)
+        finally:
+            aclose = getattr(stream, "aclose", None)
+            if callable(aclose):
+                await aclose()
+        return "".join(chunks)
+
+    return _call
+
+
 async def build_memory_managers(
     config: GatewayConfig,
     agent_ids: list[str],
     *,
     session_storage: Any | None = None,
+    provider_selector: Any | None = None,
 ) -> dict[str, MemoryManager]:
     """Construct per-agent ``MemoryManager`` instances from gateway config.
 
@@ -478,6 +520,19 @@ async def build_memory_managers(
         reason=embedding_decision.reason,
     )
 
+    # A1-3: Build LLM call adapter for constraint classification (best-effort).
+    # If provider_selector is unavailable or resolve() fails, constraint_llm_call
+    # stays None and store falls back to heuristic-only classification.
+    constraint_llm_call = None
+    if provider_selector is not None:
+        try:
+            _resolver = getattr(provider_selector, "resolve", None)
+            _provider = _resolver() if callable(_resolver) else None
+            if _provider is not None:
+                constraint_llm_call = _make_constraint_llm_call(_provider)
+        except Exception:  # noqa: BLE001
+            pass  # Degrade gracefully: heuristic-only classification
+
     # One-time legacy data migration (no-op if already migrated)
     maybe_migrate_legacy_memory("data")
 
@@ -513,6 +568,7 @@ async def build_memory_managers(
                     "constraint_annotation",
                     False,
                 ),
+                constraint_llm_call=constraint_llm_call,
             )
             await in_flight_store.initialize()
 

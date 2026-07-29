@@ -35,7 +35,11 @@ from .types import (
     MemorySource,
     SearchMode,
 )
-from .constraint_classifier import classify_constraint_sync
+from .constraint_classifier import (
+    LlmCallFn,
+    classify_constraint,
+    classify_constraint_sync,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -191,6 +195,7 @@ class LongTermMemoryStore:
         embedding_provider: EmbeddingProvider | None = None,
         query_embedding_cache_mode: str = "on",
         constraint_annotation_enabled: bool = False,
+        constraint_llm_call: LlmCallFn | None = None,
     ) -> None:
         self._db_path = str(db_path)
         self._provider: EmbeddingProvider = embedding_provider or NullEmbeddingProvider()
@@ -200,6 +205,9 @@ class LongTermMemoryStore:
         self._db: aiosqlite.Connection | None = None
         self._dirty = False
         self._constraint_annotation_enabled = constraint_annotation_enabled
+        # A1-3: LLM call for tiered escalation classification in index_file.
+        # None → falls back to heuristic-only (classify_constraint_sync).
+        self._constraint_llm_call = constraint_llm_call
         self._embedding_usage: dict[str, Any] = _zero_embedding_usage(self._provider)
 
     async def initialize(self) -> None:
@@ -783,6 +791,20 @@ class LongTermMemoryStore:
             except Exception as e:
                 logger.warning("embedding_failed_fallback_fts", path=path, error=str(e))
 
+        # A1-3: Pre-compute constraint types OUTSIDE the transaction (LLM I/O
+        # must not hold the DB lock). Mirrors the embeddings pattern above.
+        constraint_results: list[tuple] | None = None
+        if self._constraint_annotation_enabled:
+            constraint_results = []
+            for _cid, _p, _src, _sl, _el, _h, _mdl, txt, _ts in chunk_records:
+                try:
+                    ct, conf = await classify_constraint(
+                        txt, llm_call=self._constraint_llm_call
+                    )
+                except Exception:
+                    ct, conf = classify_constraint_sync(txt)
+                constraint_results.append((ct, conf))
+
         # Wrap all SQLite mutations in an explicit transaction so a crash mid-operation
         # leaves the DB in a consistent state (either fully updated or fully rolled back).
         await self._db.execute("BEGIN IMMEDIATE")
@@ -830,12 +852,13 @@ class LongTermMemoryStore:
                         logger.warning("vec_insert_failed", chunk_id=cid, error=str(e))
 
             # L1: Constraint type annotation (experimental, default off)
-            if self._constraint_annotation_enabled:
+            # A1-3: constraint_results pre-computed BEFORE transaction (see above)
+            if self._constraint_annotation_enabled and constraint_results:
                 for i, (cid, _p, _src, _sl, _el, _h, _mdl, txt, _ts) in enumerate(
                     chunk_records
                 ):
+                    ct, conf = constraint_results[i]
                     try:
-                        ct, conf = classify_constraint_sync(txt)
                         await self._db.execute(
                             "UPDATE chunks SET constraint_type=?, constraint_confidence=? WHERE id=?",
                             (ct.value, conf, cid),
