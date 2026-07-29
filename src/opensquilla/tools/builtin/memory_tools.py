@@ -33,6 +33,7 @@ from opensquilla.memory.constraint_routing import (
     format_provenance_marker,
     should_add_provenance_marker,
 )
+from opensquilla.memory.sufficiency_check import maybe_append_sufficiency_note
 from opensquilla.memory.redaction import redact_memory_text
 from opensquilla.memory.source_paths import is_memory_source_path, is_searchable_source_path
 from opensquilla.memory.types import (
@@ -681,8 +682,19 @@ def create_memory_tools(
             and is_searchable_source_path(result.source, str(result.path))
             and not _is_checkpoint_sidecar_path(str(result.path))
         ]
+        # L3: sufficiency check state (read once, used at both exit points)
+        _sufficiency_on = getattr(r.retriever, "sufficiency_check_enabled", False)
+        _l3_intent = getattr(r.retriever, "last_query_intent", None)
+        _l3_conf = getattr(r.retriever, "last_query_confidence", None)
+
         if not results:
-            return "No results found."
+            empty_msg = "No results found."
+            if _sufficiency_on and _l3_intent is not None and _l3_conf is not None:
+                empty_msg = maybe_append_sufficiency_note(
+                    query, 0, empty_msg, _l3_intent, _l3_conf,
+                    enabled=True,
+                )
+            return empty_msg
 
         # D9: Provenance marker — only when L2 routing is active
         _routing_on = getattr(r.retriever, "constraint_routing_enabled", False)
@@ -699,7 +711,15 @@ def create_memory_tools(
                 f"citation: {citation}; {', '.join(_score_parts(result))})\n"
                 f"{evidence}"
             )
-        return "\n\n".join(lines)
+        formatted = "\n\n".join(lines)
+
+        # L3: Append sufficiency note for partial results if needed
+        if _sufficiency_on and _l3_intent is not None and _l3_conf is not None:
+            formatted = maybe_append_sufficiency_note(
+                query, len(results), formatted, _l3_intent, _l3_conf,
+                enabled=True,
+            )
+        return formatted
 
     @tool(
         name="memory_save",

@@ -24,7 +24,7 @@ _LOCAL_AVAILABLE_PATH = "opensquilla.memory.embedding_resolver.local_bge_availab
 class _FakeStore:
     providers: list[object] = []
 
-    def __init__(self, db_path, embedding_provider=None, query_embedding_cache_mode="on"):
+    def __init__(self, db_path, embedding_provider=None, query_embedding_cache_mode="on", **kwargs):
         self.db_path = db_path
         self.embedding_provider = embedding_provider
         self.query_embedding_cache_mode = query_embedding_cache_mode

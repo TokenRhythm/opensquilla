@@ -599,6 +599,11 @@ async def build_memory_managers(
                     "constraint_routing",
                     False,
                 ),
+                sufficiency_check_enabled=getattr(
+                    getattr(cfg, "experimental", None),
+                    "sufficiency_check",
+                    False,
+                ),
             )
 
             turn_capture = TurnCaptureService(

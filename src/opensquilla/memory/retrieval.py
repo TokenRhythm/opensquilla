@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .source_paths import is_searchable_source_path
-from .constraint_routing import apply_constraint_boost, classify_query_intent
+from .constraint_routing import QueryIntent, apply_constraint_boost, classify_query_intent
 from .store import LongTermMemoryStore
 from .types import (
     MemorySearchOpts,
@@ -171,6 +171,7 @@ class MemoryRetriever:
         sync_manager: Any | None = None,
         effective_metadata: dict[str, str] | None = None,
         constraint_routing_enabled: bool = False,
+        sufficiency_check_enabled: bool = False,
     ) -> None:
         self._store = store
         self._temporal_decay_enabled = temporal_decay_enabled
@@ -183,6 +184,10 @@ class MemoryRetriever:
         self._sync_manager = sync_manager
         self._effective_metadata = dict(effective_metadata or {})
         self._constraint_routing_enabled = constraint_routing_enabled
+        self._sufficiency_check_enabled = sufficiency_check_enabled
+        # L3: cache last classified intent/confidence for sufficiency check
+        self._last_query_intent: QueryIntent | None = None
+        self._last_query_confidence: float | None = None
 
     async def search(
         self,
@@ -248,10 +253,13 @@ class MemoryRetriever:
         ]
         filtered.sort(key=lambda r: _rank_score(r, self._source_weights), reverse=True)
 
-        # L2: Constraint-aware routing boost (experimental, default off)
-        if self._constraint_routing_enabled:
-            query_intent, _ = classify_query_intent(query)
-            filtered = apply_constraint_boost(filtered, query_intent)
+        # L2/L3: Constraint-aware routing (experimental, default off)
+        if self._constraint_routing_enabled or self._sufficiency_check_enabled:
+            query_intent, query_confidence = classify_query_intent(query)
+            self._last_query_intent = query_intent
+            self._last_query_confidence = query_confidence
+            if self._constraint_routing_enabled:
+                filtered = apply_constraint_boost(filtered, query_intent)
 
         if self._mmr_enabled:
             weighted = [
@@ -276,6 +284,21 @@ class MemoryRetriever:
         """Whether L2 constraint-aware routing is active."""
         return self._constraint_routing_enabled
 
+    @property
+    def sufficiency_check_enabled(self) -> bool:
+        """Whether L3 retrieval sufficiency check is active."""
+        return self._sufficiency_check_enabled
+
+    @property
+    def last_query_intent(self) -> QueryIntent | None:
+        """Intent classified during the most recent search (L3)."""
+        return self._last_query_intent
+
+    @property
+    def last_query_confidence(self) -> float | None:
+        """Confidence of the most recent intent classification (L3)."""
+        return self._last_query_confidence
+
     async def close(self) -> None:
         return None
 
@@ -289,4 +312,6 @@ class MemoryRetriever:
         metadata.update(self._effective_metadata)
         if self._constraint_routing_enabled:
             metadata["constraint_routing"] = "on"
+        if self._sufficiency_check_enabled:
+            metadata["sufficiency_check"] = "on"
         return metadata
