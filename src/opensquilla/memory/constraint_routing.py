@@ -143,6 +143,8 @@ QUERY_INTENT_BOOST: dict[QueryIntent, dict[ConstraintType, float]] = {
         ConstraintType.decision: 1.5,
     },
     QueryIntent.avoid_failure: {
+        ConstraintType.decision: 1.2,
+        ConstraintType.procedure: 1.3,
         # v0.8: ConstraintType.anti_pattern: 1.8,
         # v0.8: ConstraintType.constraint: 1.3,
     },
