@@ -508,6 +508,11 @@ async def build_memory_managers(
                 query_embedding_cache_mode=getattr(
                     getattr(cfg, "cost", None), "query_embedding_cache", "on"
                 ),
+                constraint_annotation_enabled=getattr(
+                    getattr(cfg, "experimental", None),
+                    "constraint_annotation",
+                    False,
+                ),
             )
             await in_flight_store.initialize()
 

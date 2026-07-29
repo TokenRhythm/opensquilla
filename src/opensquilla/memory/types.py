@@ -73,6 +73,49 @@ class SearchIntent(StrEnum):
     ADMIN = "admin"  # CLI / admin queries
 
 
+class ConstraintType(StrEnum):
+    """Constraint type annotation for memory chunks (L1).
+
+    Core 6 types are active in v0.7; extended 4 types are reserved for v0.8.
+    """
+
+    # Core 6 (v0.7)
+    fact = "fact"
+    event = "event"
+    preference = "preference"
+    decision = "decision"
+    procedure = "procedure"
+    goal = "goal"
+
+    # Extended 4 (v0.8, reserved)
+    assumption = "assumption"
+    constraint = "constraint"
+    anti_pattern = "anti_pattern"
+    pattern = "pattern"
+
+
+# Mapping from session_flush CandidateKind to ConstraintType
+CANDIDATE_KIND_TO_CONSTRAINT: dict[str, ConstraintType] = {
+    "fact": ConstraintType.fact,
+    "event": ConstraintType.event,
+    "preference": ConstraintType.preference,
+    "decision": ConstraintType.decision,
+    "procedure": ConstraintType.procedure,
+    "todo": ConstraintType.goal,
+    "goal": ConstraintType.goal,
+}
+
+# Core types eligible for L1 annotation (v0.7)
+CORE_CONSTRAINT_TYPES: frozenset[ConstraintType] = frozenset({
+    ConstraintType.fact,
+    ConstraintType.event,
+    ConstraintType.preference,
+    ConstraintType.decision,
+    ConstraintType.procedure,
+    ConstraintType.goal,
+})
+
+
 @dataclass
 class MemorySearchResult:
     """A result from memory search."""

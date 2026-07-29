@@ -907,6 +907,14 @@ class MemoryCostConfig(BaseModel):
     query_embedding_cache: Literal["off", "shadow", "on"] = "on"
 
 
+class MemoryExperimentalConfig(BaseModel):
+    """Experimental memory features (L1/L2/L3). All default off."""
+
+    constraint_annotation: bool = False  # L1: annotate chunks with constraint_type
+    constraint_routing: bool = False  # L2: constraint-aware retrieval routing
+    sufficiency_check: bool = False  # L3: retrieval sufficiency meta-cognition
+
+
 class MemoryConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="OPENSQUILLA_MEMORY_",
@@ -987,6 +995,9 @@ class MemoryConfig(BaseSettings):
 
     # Dream consolidation
     dream: DreamConfig = Field(default_factory=DreamConfig)
+
+    # Experimental features (L1/L2/L3)
+    experimental: MemoryExperimentalConfig = Field(default_factory=MemoryExperimentalConfig)
 
 
 def _default_tiers() -> dict:

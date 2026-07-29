@@ -35,6 +35,7 @@ from .types import (
     MemorySource,
     SearchMode,
 )
+from .constraint_classifier import classify_constraint_sync
 
 logger = structlog.get_logger(__name__)
 
@@ -189,6 +190,7 @@ class LongTermMemoryStore:
         db_path: str | Path,
         embedding_provider: EmbeddingProvider | None = None,
         query_embedding_cache_mode: str = "on",
+        constraint_annotation_enabled: bool = False,
     ) -> None:
         self._db_path = str(db_path)
         self._provider: EmbeddingProvider = embedding_provider or NullEmbeddingProvider()
@@ -197,6 +199,7 @@ class LongTermMemoryStore:
         self._fts_available = False
         self._db: aiosqlite.Connection | None = None
         self._dirty = False
+        self._constraint_annotation_enabled = constraint_annotation_enabled
         self._embedding_usage: dict[str, Any] = _zero_embedding_usage(self._provider)
 
     async def initialize(self) -> None:
@@ -396,6 +399,7 @@ class LongTermMemoryStore:
         await self._db.execute(DDL_EMBEDDING_CACHE)
         await self._db.execute(DDL_META)
         await self._migrate_schema_version_columns()
+        await self._ensure_constraint_columns()
 
         # Migrate old external-content FTS to contentless mode
         async with self._db.execute(
@@ -484,6 +488,27 @@ class LongTermMemoryStore:
                 continue
             await self._db.execute(
                 f"ALTER TABLE {table} ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1"
+            )
+        await self._db.commit()
+
+    async def _ensure_constraint_columns(self) -> None:
+        """Idempotently add constraint_type and constraint_confidence columns (L1).
+
+        Columns are always present (nullable with defaults) so that enabling
+        constraint_annotation later does not require a separate migration.
+        """
+        assert self._db is not None
+        async with self._db.execute("PRAGMA table_info(chunks)") as cur:
+            columns = {row[1] for row in await cur.fetchall()}
+        if not columns:
+            return
+        if "constraint_type" not in columns:
+            await self._db.execute(
+                "ALTER TABLE chunks ADD COLUMN constraint_type TEXT DEFAULT 'fact'"
+            )
+        if "constraint_confidence" not in columns:
+            await self._db.execute(
+                "ALTER TABLE chunks ADD COLUMN constraint_confidence REAL"
             )
         await self._db.commit()
 
@@ -803,6 +828,20 @@ class LongTermMemoryStore:
                         )
                     except Exception as e:
                         logger.warning("vec_insert_failed", chunk_id=cid, error=str(e))
+
+            # L1: Constraint type annotation (experimental, default off)
+            if self._constraint_annotation_enabled:
+                for i, (cid, _p, _src, _sl, _el, _h, _mdl, txt, _ts) in enumerate(
+                    chunk_records
+                ):
+                    try:
+                        ct, conf = classify_constraint_sync(txt)
+                        await self._db.execute(
+                            "UPDATE chunks SET constraint_type=?, constraint_confidence=? WHERE id=?",
+                            (ct.value, conf, cid),
+                        )
+                    except Exception:
+                        logger.debug("constraint_annotation_failed", chunk_id=cid, exc_info=True)
 
             # Upsert file record
             await self._db.execute(
