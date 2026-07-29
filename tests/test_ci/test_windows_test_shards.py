@@ -153,6 +153,17 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_tools/test_shell_self_kill_policy.py",
     "tests/test_tools/test_run_mode_full_host_fallback.py",
     "tests/test_tools/test_workspace_write_deny_effects.py",
+    "tests/test_gateway/test_approval_restart_recovery.py",
+    "tests/test_gateway/test_rpc_run_mode_preference.py",
+    "tests/test_memory/test_constraint_annotation.py",
+    "tests/test_memory/test_constraint_routing.py",
+    "tests/test_memory/test_dream_dedup.py",
+    "tests/test_memory/test_usage_tracking.py",
+    "tests/test_session/test_compaction_anchor.py",
+    "tests/test_session/test_runtime_preferences.py",
+    "tests/test_session/test_storage_compacted_fts.py",
+    "tests/test_sufficiency_check.py",
+    "tests/test_thinking_level_propagation.py",
 }
 
 
