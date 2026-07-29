@@ -50,6 +50,12 @@ class UsageAccountingUnavailableError(RuntimeError):
     retryable = True
 
 
+class UsageAccountingBusyError(UsageAccountingUnavailableError):
+    """A transient ledger lock remained busy after its bounded retry."""
+
+    code = "usage_accounting_busy"
+
+
 def usd_to_nanos(value: object) -> int:
     """Convert a non-negative USD value to an integer nano-USD amount.
 
@@ -713,6 +719,7 @@ def normalize_provider_usage(
 
 
 __all__ = [
+    "UsageAccountingBusyError",
     "UsageAccountingScope",
     "UsageAccountingUnavailableError",
     "UsageCallItem",

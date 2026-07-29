@@ -426,6 +426,133 @@ def _unique_text_key(
     return candidate
 
 
+def _rows_equivalent(
+    existing: Mapping[str, Any],
+    incoming: Mapping[str, Any],
+    *,
+    omit: frozenset[str] = frozenset(),
+) -> bool:
+    """Compare the source fields that the target schema can represent."""
+
+    shared = set(existing).intersection(incoming).difference(omit)
+    return all(existing[column] == incoming[column] for column in shared)
+
+
+def _usage_event_resolution(
+    target: sqlite3.Connection,
+    row: Mapping[str, Any],
+) -> tuple[str | None, bool, bool]:
+    """Find an idempotent event match and report identity collisions."""
+
+    event_id = str(row["event_id"])
+    by_event_id = _rows(target, "usage_events", "event_id = ?", (event_id,))
+    if len(by_event_id) > 1:
+        raise sqlite3.DatabaseError(f"target usage event is not unique: {event_id}")
+
+    execution_id = row.get("execution_id")
+    call_index = row.get("call_index")
+    by_execution: list[dict[str, Any]] = []
+    if isinstance(execution_id, str) and call_index is not None:
+        by_execution = _rows(
+            target,
+            "usage_events",
+            "execution_id = ? AND call_index = ?",
+            (execution_id, call_index),
+        )
+        if len(by_execution) > 1:
+            raise sqlite3.DatabaseError(
+                f"target usage execution is not unique: {execution_id}/{call_index}"
+            )
+
+    candidates = {
+        str(candidate["event_id"]): candidate
+        for candidate in (*by_event_id, *by_execution)
+    }
+    equivalent = [
+        candidate
+        for candidate in candidates.values()
+        if _rows_equivalent(candidate, row, omit=frozenset({"event_id"}))
+    ]
+    if len(equivalent) > 1:
+        raise sqlite3.DatabaseError(
+            f"target usage event identity is ambiguous: {event_id}"
+        )
+    return (
+        str(equivalent[0]["event_id"]) if equivalent else None,
+        bool(by_event_id),
+        bool(by_execution),
+    )
+
+
+def _copy_usage_event(
+    target: sqlite3.Connection,
+    source_row: Mapping[str, Any],
+    *,
+    source_id: str,
+    id_map: Mapping[str, str],
+    counts: dict[str, int],
+) -> str:
+    """Copy or reuse one physical usage event without counting it twice."""
+
+    row = _replace_session_references(source_row, key_map={}, id_map=id_map)
+    original_event_id = str(source_row["event_id"])
+    resolved, event_collision, execution_collision = _usage_event_resolution(target, row)
+    if resolved is not None:
+        return resolved
+
+    suffix = _source_suffix(source_id)
+    if event_collision:
+        row["event_id"] = f"{original_event_id}:recovered:{suffix}"
+    execution_id = row.get("execution_id")
+    if execution_collision and isinstance(execution_id, str):
+        row["execution_id"] = f"{execution_id}:recovered:{suffix}"
+
+    resolved, recovered_event_collision, recovered_execution_collision = (
+        _usage_event_resolution(target, row)
+    )
+    if resolved is not None:
+        return resolved
+    if recovered_event_collision or recovered_execution_collision:
+        raise sqlite3.DatabaseError(
+            f"recovered usage event identity conflicts with prior data: {original_event_id}"
+        )
+
+    _insert(target, "usage_events", row)
+    _increment(counts, "usage_events")
+    return str(row["event_id"])
+
+
+def _copy_usage_child_row(
+    target: sqlite3.Connection,
+    table: str,
+    source_row: Mapping[str, Any],
+    *,
+    event_id: str,
+    counts: dict[str, int],
+) -> None:
+    row = dict(source_row)
+    row["event_id"] = event_id
+    ordinal = row.get("ordinal")
+    existing = _rows(
+        target,
+        table,
+        "event_id = ? AND ordinal = ?",
+        (event_id, ordinal),
+    )
+    if len(existing) > 1:
+        raise sqlite3.DatabaseError(
+            f"target {table} row is not unique: {event_id}/{ordinal}"
+        )
+    if existing:
+        if not _rows_equivalent(existing[0], row):
+            raise sqlite3.DatabaseError(
+                f"target {table} conflicts with recovered usage: {event_id}/{ordinal}"
+            )
+        return
+    _insert(target, table, row)
+    _increment(counts, table)
+
+
 def _copy_core_rows(
     target: sqlite3.Connection,
     source: sqlite3.Connection,
@@ -571,59 +698,46 @@ def _copy_referenced_workspaces(
 def _copy_usage_rows(
     target: sqlite3.Connection,
     source: sqlite3.Connection,
-    imports: list[_SessionImport],
+    sessions: list[_SessionImport],
     *,
     source_id: str,
     id_map: Mapping[str, str],
     counts: dict[str, int],
 ) -> None:
-    if not _table_exists(source, "usage_events") or not _table_exists(target, "usage_events"):
-        return
-    imported_ids = {item.source_id for item in imports}
-    selected_events: dict[str, dict[str, Any]] = {}
-    for session_id in imported_ids:
-        for row in _rows(source, "usage_events", "session_id = ?", (session_id,)):
-            selected_events[str(row["event_id"])] = row
+    selected_ids = {item.source_id for item in sessions}
+    if _table_exists(source, "usage_events") and _table_exists(target, "usage_events"):
+        selected_events: dict[str, dict[str, Any]] = {}
+        for session_id in selected_ids:
+            for row in _rows(source, "usage_events", "session_id = ?", (session_id,)):
+                selected_events[str(row["event_id"])] = row
 
-    event_map: dict[str, str] = {}
-    for source_row in selected_events.values():
-        row = _replace_session_references(source_row, key_map={}, id_map=id_map)
-        original = str(source_row["event_id"])
-        event_id = _unique_text_key(
-            target,
-            table="usage_events",
-            column="event_id",
-            original=original,
-            source_id=source_id,
-        )
-        event_map[original] = event_id
-        row["event_id"] = event_id
-        execution_id = row.get("execution_id")
-        call_index = row.get("call_index")
-        if isinstance(execution_id, str) and call_index is not None:
-            collision = target.execute(
-                "SELECT 1 FROM usage_events WHERE execution_id=? AND call_index=? LIMIT 1",
-                (execution_id, call_index),
-            ).fetchone()
-            if collision is not None:
-                row["execution_id"] = f"{execution_id}:recovered:{_source_suffix(source_id)}"
-        _insert(target, "usage_events", row)
-        _increment(counts, "usage_events")
-
-    for table in ("usage_event_items", "usage_item_billing_receipts"):
-        if not _table_exists(source, table) or not _table_exists(target, table):
-            continue
-        for original, mapped in event_map.items():
-            for source_row in _rows(source, table, "event_id = ?", (original,)):
-                row = dict(source_row)
-                row["event_id"] = mapped
-                _insert(target, table, row)
-                _increment(counts, table)
+        event_map = {
+            original: _copy_usage_event(
+                target,
+                source_row,
+                source_id=source_id,
+                id_map=id_map,
+                counts=counts,
+            )
+            for original, source_row in selected_events.items()
+        }
+        for table in ("usage_event_items", "usage_item_billing_receipts"):
+            if not _table_exists(source, table) or not _table_exists(target, table):
+                continue
+            for original, mapped in event_map.items():
+                for source_row in _rows(source, table, "event_id = ?", (original,)):
+                    _copy_usage_child_row(
+                        target,
+                        table,
+                        source_row,
+                        event_id=mapped,
+                        counts=counts,
+                    )
 
     if _table_exists(source, "usage_legacy_baselines") and _table_exists(
         target, "usage_legacy_baselines"
     ):
-        for source_session_id in imported_ids:
+        for source_session_id in selected_ids:
             for source_row in _rows(
                 source,
                 "usage_legacy_baselines",
@@ -632,6 +746,19 @@ def _copy_usage_rows(
             ):
                 row = dict(source_row)
                 row["session_id"] = id_map.get(source_session_id, source_session_id)
+                existing = _rows(
+                    target,
+                    "usage_legacy_baselines",
+                    "session_id = ? AND session_epoch = ?",
+                    (row["session_id"], row.get("session_epoch", 0)),
+                )
+                if len(existing) > 1:
+                    raise sqlite3.DatabaseError(
+                        "target usage legacy baseline is not unique: "
+                        f"{row['session_id']}/{row.get('session_epoch', 0)}"
+                    )
+                if existing:
+                    continue
                 _insert(target, "usage_legacy_baselines", row)
                 _increment(counts, "usage_legacy_baselines")
 
@@ -778,6 +905,7 @@ def _merge_session_database_from_private(
     resolved_keys: dict[str, str] = {}
     resolved_ids: dict[str, str] = {}
     imports: list[_SessionImport] = []
+    usage_sessions: list[_SessionImport] = []
     deduplicated = 0
 
     target_connection = sqlite3.connect(_native_io_path(target_path))
@@ -840,6 +968,14 @@ def _merge_session_database_from_private(
                         resolved_ids[source_session_id] = existing_id
                         if source_session_id != existing_id:
                             remapped_ids[source_session_id] = existing_id
+                        usage_sessions.append(
+                            _SessionImport(
+                                source_key=source_key,
+                                source_id=source_session_id,
+                                target_key=source_key,
+                                target_id=existing_id,
+                            )
+                        )
                         deduplicated += 1
                         continue
                     target_key = _remapped_session_key(source_key, source_id)
@@ -867,6 +1003,14 @@ def _merge_session_database_from_private(
                             remapped_ids[source_session_id] = candidate_id
                             resolved_keys[source_key] = target_key
                             resolved_ids[source_session_id] = candidate_id
+                            usage_sessions.append(
+                                _SessionImport(
+                                    source_key=source_key,
+                                    source_id=source_session_id,
+                                    target_key=target_key,
+                                    target_id=candidate_id,
+                                )
+                            )
                             deduplicated += 1
                             continue
                     target_key = f"{target_key}:{source_fingerprint[:8]}"
@@ -907,14 +1051,14 @@ def _merge_session_database_from_private(
                     target_session_id = source_session_id
                 reserved_keys.add(target_key)
                 reserved_ids.add(target_session_id)
-                imports.append(
-                    _SessionImport(
-                        source_key=source_key,
-                        source_id=source_session_id,
-                        target_key=target_key,
-                        target_id=target_session_id,
-                    )
+                session_import = _SessionImport(
+                    source_key=source_key,
+                    source_id=source_session_id,
+                    target_key=target_key,
+                    target_id=target_session_id,
                 )
+                imports.append(session_import)
+                usage_sessions.append(session_import)
 
             key_map = {
                 **resolved_keys,
@@ -946,7 +1090,7 @@ def _merge_session_database_from_private(
                 _copy_usage_rows(
                     target_connection,
                     source_connection,
-                    imports,
+                    usage_sessions,
                     source_id=source_id,
                     id_map=id_map,
                     counts=imported_rows,
@@ -981,9 +1125,10 @@ def merge_session_database(
 
     A missing target is created with SQLite's backup API, preserving every
     source schema object and committed WAL page.  Existing targets receive the
-    supported session graph row-by-row.  Exact conversation duplicates are
-    ignored; divergent session-key collisions get deterministic key and ID
-    remaps so both conversations remain addressable.
+    supported session graph row-by-row.  Exact conversation duplicates share
+    one session while their missing usage records are reconciled; divergent
+    session-key collisions get deterministic key and ID remaps so both
+    conversations remain addressable.
 
     SQLite only opens a stable private copy.  The recovery source bundle is
     never opened by SQLite and therefore cannot gain a transient ``-shm`` file.

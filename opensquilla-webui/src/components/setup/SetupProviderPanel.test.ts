@@ -359,6 +359,64 @@ describe('SetupProviderPanel — configured provider management', () => {
     app.unmount()
   })
 
+  it.each([
+    ['custom', 'Custom OpenAI-compatible endpoint'],
+    ['custom_anthropic', 'Custom Anthropic-compatible endpoint'],
+  ])('exposes and edits the Base URL for %s in the provider dialog', async (providerId, label) => {
+    const onUpdateProviderField = vi.fn()
+    const savedBaseUrl = `https://${providerId}.example.test/v1`
+    const { app, el } = await mountPanel({
+      providerSelected: providerId,
+      providerSummary: label,
+      runtimeProviders: [{ providerId, label }],
+      configuredProviders: [{
+        providerId,
+        label,
+        active: true,
+        ready: true,
+        credentialSource: 'explicit',
+        credentialEnv: '',
+        endpointSource: 'explicit',
+        reason: '',
+      }],
+      providerCoreFields: [{ name: 'model', label: 'Model', required: true }],
+      providerAdvancedFields: [
+        { name: 'base_url', label: 'Base URL', required: true },
+      ],
+      providerFieldValue: (field: { name: string }) => ({
+        model: 'test-model',
+        base_url: savedBaseUrl,
+      })[field.name] || '',
+      credentialPanel: {
+        ...(panel().credentialPanel as Record<string, unknown>),
+        providerLabel: label,
+        requiresApiKey: false,
+      },
+    }, { onUpdateProviderField })
+
+    el.querySelector<HTMLButtonElement>(
+      `[data-provider-id="${providerId}"] .setup-provider-card__select`,
+    )?.click()
+    await nextTick()
+
+    const endpoint = document.body.querySelector<HTMLElement>(
+      '[role="dialog"] [data-testid="setup-provider-modal-endpoint"]',
+    )
+    const input = endpoint?.querySelector<HTMLInputElement>(
+      'input[name="setup_provider_base_url"]',
+    )
+    expect(input?.value).toBe(savedBaseUrl)
+
+    input!.value = `https://${providerId}.new.example.test/v1`
+    input!.dispatchEvent(new Event('input', { bubbles: true }))
+    expect(onUpdateProviderField).toHaveBeenCalledWith(
+      'base_url',
+      `https://${providerId}.new.example.test/v1`,
+    )
+
+    app.unmount()
+  })
+
   it('selects the editor from the full information block with native click and Enter semantics', async () => {
     const onSelectConfiguredProvider = vi.fn()
     const { app, el } = await mountPanel({ configuredProviders: configured }, {

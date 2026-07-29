@@ -344,10 +344,10 @@ export function createDesktopPlatform(): Platform {
     },
     files: {
       openArtifact: (payload) => requireDesktopApi().openArtifact(payload),
-      async chooseProjectDirectory() {
+      async chooseProjectDirectory(request) {
         const api = requireDesktopApi()
         if (typeof api.chooseProjectDirectory !== 'function') return null
-        return api.chooseProjectDirectory()
+        return api.chooseProjectDirectory(request)
       },
     },
     workbench: {

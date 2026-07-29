@@ -16,7 +16,7 @@ from opensquilla.sandbox.run_context import (
     run_context_for_subagent,
     run_context_from_origin_payload,
 )
-from opensquilla.sandbox.run_mode import RunMode, normalize_run_mode
+from opensquilla.sandbox.run_mode import RunMode, execution_target, normalize_run_mode
 from opensquilla.session.keys import normalize_agent_id, parse_agent_id
 from opensquilla.tools.policy import apply_tool_policy_layer
 from opensquilla.tools.types import (
@@ -272,6 +272,17 @@ def build_cron_route_envelope(
     if creator_is_owner:
         metadata["principal_is_owner"] = True
         metadata["cron_trusted_owner"] = True
+    job_run_mode = getattr(job, "run_mode", "")
+    if job_run_mode:
+        try:
+            normalized_job_run_mode = normalize_run_mode(job_run_mode)
+        except ValueError:
+            normalized_job_run_mode = None
+        if normalized_job_run_mode is not None:
+            metadata["run_mode"] = normalized_job_run_mode.value
+            metadata["execution_target"] = execution_target(normalized_job_run_mode)
+            if normalized_job_run_mode is RunMode.FULL and creator_is_owner:
+                metadata["elevated"] = "full"
     tool_policy = getattr(job, "tool_policy", None)
     if isinstance(tool_policy, dict) and tool_policy:
         metadata["tool_policy"] = dict(tool_policy)
@@ -496,17 +507,17 @@ def tool_context_from_envelope(
             run_mode = None
         if run_mode == RunMode.FULL and not is_owner:
             run_mode = RunMode.TRUSTED
-    elif legacy_elevated in ("on", "bypass") and is_owner:
+    elif legacy_elevated == "on" and is_owner:
         run_mode = RunMode.TRUSTED
-    elif legacy_elevated == "full" and is_owner:
+    elif legacy_elevated in ("bypass", "full") and is_owner:
         run_mode = RunMode.FULL
-    elif default_elevated == "full" and is_owner:
+    elif default_elevated in ("bypass", "full") and is_owner:
         run_mode = RunMode.FULL
     else:
         run_mode = None
     if run_mode == RunMode.FULL and is_owner:
         elevated = "full"
-    elif legacy_elevated in ("on", "bypass") and is_owner:
+    elif legacy_elevated == "on" and is_owner:
         elevated = legacy_elevated
     sandbox_run_context_fresh = bool(
         getattr(envelope, "sandbox_run_context_fresh", False)

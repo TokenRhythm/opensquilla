@@ -695,11 +695,15 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     stream.resetStreamIdleTimer()
     if (stream.streamBubble.value && !stream.streamHasVisibleOutput.value) {
       const phase = String(payload.phase || '')
+      // The channel wrapper emits a generic keepalive on the same cadence as
+      // ensemble heartbeats. It proves liveness but does not represent a phase
+      // transition, so changing the activity would restart its timer.
+      const isPhaseAgnosticKeepalive = phase === 'channel'
       if (phase.startsWith('ensemble_proposers')) {
         stream.setStreamActivity('Generating candidates')
       } else if (phase.startsWith('ensemble_aggregator')) {
         stream.setStreamActivity('Synthesizing candidates')
-      } else {
+      } else if (!isPhaseAgnosticKeepalive) {
         stream.setStreamActivity('Planning next step')
       }
     } else if (!stream.streamBubble.value) {

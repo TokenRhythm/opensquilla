@@ -139,6 +139,49 @@ def _config_text(home: Path, label: str) -> str:
         f"# Synthetic {label} release-preservation profile\n"
         f"state_dir = {json.dumps(str(home / 'state'))}\n"
         f"workspace_dir = {json.dumps(str(home / 'workspace'))}\n"
+        'search_provider = "duckduckgo"\n'
+        "\n"
+        "[llm]\n"
+        'provider = "ollama"\n'
+        'model = "opensquilla-release-session-recovery-smoke"\n'
+        'base_url = "http://127.0.0.1:11434"\n'
+        "\n"
+        "[squilla_router]\n"
+        "enabled = false\n"
+        "\n"
+        "[llm_ensemble]\n"
+        "enabled = false\n"
+        "\n"
+        "[privacy]\n"
+        "disable_network_observability = false\n"
+    )
+
+
+def _runtime_config_text(home: Path) -> str:
+    """Return the deterministic config produced by the first current-runtime load."""
+
+    return (
+        f"state_dir = {json.dumps(str(home / 'state'))}\n"
+        f"workspace_dir = {json.dumps(str(home / 'workspace'))}\n"
+        'search_provider = "duckduckgo"\n'
+        "config_version = 1\n"
+        "\n"
+        "[llm]\n"
+        'provider = "ollama"\n'
+        'model = "opensquilla-release-session-recovery-smoke"\n'
+        'base_url = "http://127.0.0.1:11434"\n'
+        "\n"
+        "[squilla_router]\n"
+        "enabled = false\n"
+        "\n"
+        "[llm_ensemble]\n"
+        "enabled = false\n"
+        "\n"
+        "[privacy]\n"
+        "disable_network_observability = false\n"
+        "\n"
+        "[control_ui]\n"
+        'default_locale = "en"\n'
     )
 
 
@@ -231,7 +274,7 @@ def seed_profile(home: Path, label: str) -> None:
             raise RuntimeError(f"seeded sessions.db failed PRAGMA quick_check: {result!r}")
 
 
-def verify_profile(home: Path, label: str) -> None:
+def verify_profile(home: Path, label: str, *, runtime_migrated: bool = False) -> None:
     """Verify exact fixture bytes and a read-only SQLite integrity probe."""
 
     home = home.resolve()
@@ -243,8 +286,12 @@ def verify_profile(home: Path, label: str) -> None:
             raise AssertionError(f"{name} changed while installing or uninstalling Desktop")
 
     actual_config = (home / "config.toml").read_text(encoding="utf-8")
-    if actual_config != _config_text(home, label):
-        raise AssertionError("config.toml changed while installing or uninstalling Desktop")
+    expected_config = (
+        _runtime_config_text(home) if runtime_migrated else _config_text(home, label)
+    )
+    if actual_config != expected_config:
+        phase = "after expected runtime migration" if runtime_migrated else "during installation"
+        raise AssertionError(f"config.toml changed unexpectedly {phase}")
 
     database = state / "sessions.db"
     with sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True) as connection:
@@ -319,7 +366,7 @@ def verify_profile(home: Path, label: str) -> None:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("operation", choices=("seed", "verify"))
+    parser.add_argument("operation", choices=("seed", "verify", "verify-runtime"))
     parser.add_argument("--home", type=Path, required=True)
     parser.add_argument("--label", type=_validated_label, required=True)
     return parser
@@ -332,8 +379,10 @@ def main() -> int:
             seed_profile(args.home, args.label)
             print(f"profile preservation fixture seeded: {args.home}")
         else:
-            verify_profile(args.home, args.label)
-            print(f"profile preservation verified: {args.home}")
+            runtime_migrated = args.operation == "verify-runtime"
+            verify_profile(args.home, args.label, runtime_migrated=runtime_migrated)
+            suffix = " after runtime migration" if runtime_migrated else ""
+            print(f"profile preservation verified{suffix}: {args.home}")
     except (
         AssertionError,
         FileExistsError,

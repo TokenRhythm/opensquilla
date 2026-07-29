@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any, Protocol
 
 import structlog
 
+from opensquilla.scheduler.parser import parse_cron, parse_iso_at
 from opensquilla.scheduler.payloads import (
     REMINDER_KIND,
     SYSTEM_EVENT_KIND,
@@ -75,6 +77,8 @@ class _SchedulerProtocol(Protocol):
         creator_session_key: str = "",
         creator_sender_id: str = "",
         creator_is_owner: bool = False,
+        run_mode: str = "",
+        idempotency_key: str = "",
     ) -> Any: ...
 
     async def update_job(self, job_id: str, **patch: Any) -> Any: ...
@@ -109,6 +113,56 @@ def scheduler_available() -> bool:
 
 def gateway_config_available() -> bool:
     return _gateway_config is not None
+
+
+def _cron_tool_idempotency_key(
+    *,
+    task_id: str,
+    schedule_kind: ScheduleKind,
+    schedule_value: str,
+    schedule_tz: str,
+    task: str,
+    job_kind: str,
+    session_target: str,
+    session_key: str,
+    agent_id: str,
+    wake_mode: str,
+    tool_policy: dict[str, Any] | None,
+    creator_session_key: str,
+    creator_sender_id: str,
+) -> str:
+    if schedule_kind is ScheduleKind.CRON:
+        canonical_schedule_value = " ".join(parse_cron(schedule_value).raw.split())
+    elif schedule_kind is ScheduleKind.AT:
+        canonical_schedule_value = parse_iso_at(schedule_value).isoformat()
+    else:
+        canonical_schedule_value = str(int(schedule_value))
+    canonical = {
+        "task_id": task_id,
+        "schedule": {
+            "kind": schedule_kind.value,
+            "value": canonical_schedule_value,
+            "tz": schedule_tz,
+        },
+        "task": task,
+        "job_kind": job_kind,
+        "session_target": session_target,
+        "session_key": session_key,
+        "agent_id": agent_id,
+        "wake_mode": wake_mode,
+        "tool_policy": tool_policy or {},
+        "creator_session_key": creator_session_key,
+        "creator_sender_id": creator_sender_id,
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            canonical,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return f"cron-tool:{digest}"
 
 
 # ---------------------------------------------------------------------------
@@ -480,16 +534,43 @@ async def cron(
             payload = make_agent_turn_payload(task, agent_id)
             handler_key = "agent_run"
         effective_tz = (schedule_tz or tz or "").strip()
+        resolved_session_key = (
+            caller_session_key
+            if session_target == "current"
+            else (target_session_key or "")
+        )
+        task_id = str(getattr(ctx, "task_id", "") or "") if ctx is not None else ""
+        idempotency_key = (
+            _cron_tool_idempotency_key(
+                task_id=task_id,
+                schedule_kind=schedule_kind,
+                schedule_value=schedule_value,
+                schedule_tz=effective_tz,
+                task=task,
+                job_kind=job_kind,
+                session_target=session_target,
+                session_key=resolved_session_key,
+                agent_id=agent_id,
+                wake_mode=wake_mode,
+                tool_policy=tool_policy,
+                creator_session_key=caller_session_key,
+                creator_sender_id=caller_sender_id,
+            )
+            if task_id
+            else ""
+        )
+        context_run_mode = str(getattr(ctx, "run_mode", "") or "") if ctx is not None else ""
+        creator_run_mode = (
+            context_run_mode
+            if context_run_mode in {"standard", "trusted", "full"}
+            else ("full" if is_owner_caller else "trusted")
+        )
         job = await sched.add_job(
             name=task or "cron-tool-job",
             handler_key=handler_key,
             payload=payload,
             session_target=SessionTarget(session_target),
-            session_key=(
-                caller_session_key
-                if session_target == "current"
-                else (target_session_key or "")
-            ),
+            session_key=resolved_session_key,
             wake_mode=wake_mode,
             delivery=delivery,
             origin_session_key=caller_session_key,
@@ -498,6 +579,8 @@ async def cron(
             creator_session_key=caller_session_key,
             creator_sender_id=caller_sender_id,
             creator_is_owner=is_owner_caller,
+            run_mode=creator_run_mode,
+            idempotency_key=idempotency_key,
             schedule_kind=schedule_kind,
             schedule_value=schedule_value,
             schedule_tz=effective_tz,
@@ -521,6 +604,7 @@ async def cron(
                 "wake_mode": wake_mode,
                 "tz": effective_tz,
                 "status": "scheduled",
+                "deduplicated": bool(getattr(job, "deduplicated", False)),
             }
         )
 

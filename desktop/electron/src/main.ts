@@ -89,6 +89,7 @@ import {
   desktopDeepLinkArguments,
   parseDesktopDeepLink,
 } from './desktop-deep-link.js'
+import { projectDirectoryDialogOptions } from './project-directory-picker.js'
 import {
   NATIVE_WORKBENCH_CAPABILITIES,
   NATIVE_WORKBENCH_ARTIFACT_SCHEME,
@@ -10120,12 +10121,12 @@ ipcMain.handle('desktop:preferences:save', async (event, payload: DesktopPrefere
   return await saveDesktopPreferences(payload)
 })
 ipcMain.handle('desktop:artifact:open', async (_event, payload: ArtifactOpenRequest) => openArtifactWithDefaultApp(payload))
-ipcMain.handle('desktop:workspace:choose-directory', async (event) => {
+ipcMain.handle('desktop:workspace:choose-directory', async (event, payload: unknown) => {
   if (!trustedControlUiIpc(event)) return null
-  const choice = await dialog.showOpenDialog(currentMainWindow()!, {
-    title: 'Choose a project',
-    properties: ['openDirectory'],
-  })
+  const choice = await dialog.showOpenDialog(
+    currentMainWindow()!,
+    projectDirectoryDialogOptions(process.platform, payload),
+  )
   if (choice.canceled || choice.filePaths.length !== 1) return null
   return { path: resolve(choice.filePaths[0]!) }
 })

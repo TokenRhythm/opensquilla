@@ -690,17 +690,20 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
     }
   })
 
-  it('maps ensemble heartbeats to neutral proposer and aggregator phase copy', () => {
+  it('maps ensemble heartbeats without letting channel keepalives replace the phase', () => {
     const { api, stream, stop } = createHarness()
 
     try {
       api.handlers.onRunHeartbeat({ stream_seq: 1, phase: 'ensemble_proposers_wait' })
       expect(stream.setStreamActivity).toHaveBeenLastCalledWith('Generating candidates')
 
-      api.handlers.onRunHeartbeat({ stream_seq: 2, phase: 'ensemble_aggregator_stream' })
+      api.handlers.onRunHeartbeat({ stream_seq: 2, phase: 'channel' })
+      expect(stream.setStreamActivity).toHaveBeenCalledTimes(1)
+
+      api.handlers.onRunHeartbeat({ stream_seq: 3, phase: 'ensemble_aggregator_stream' })
       expect(stream.setStreamActivity).toHaveBeenLastCalledWith('Synthesizing candidates')
 
-      api.handlers.onRunHeartbeat({ stream_seq: 3, phase: 'provider_wait' })
+      api.handlers.onRunHeartbeat({ stream_seq: 4, phase: 'provider_wait' })
       expect(stream.setStreamActivity).toHaveBeenLastCalledWith('Planning next step')
     } finally {
       stop()

@@ -6,8 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-29
+
 ### Added
 
+- Durable Plan mode, project workspaces, native macOS project-folder creation,
+  desktop deep links, richer artifact workbench previews, and general pasted
+  file attachments.
+- Qwen Token Plan and custom Anthropic-compatible providers.
+- Recoverable Desktop profile import and bounded primary-profile
+  consolidation.
 - New agent tool `audio_config`: configures the audio (TTS) provider through
   the same validated path as onboarding — atomic UTF-8 persistence with
   backup, live hot-apply, and `restartRequired: false`. Agent-driven setup is
@@ -17,6 +25,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Local-owner `bypass` again resolves to Full host execution consistently
+  across Web, CLI, TaskRuntime, and Cron. Full file, Shell, and Git operations
+  no longer initialize a sandbox worker or apply sandbox path checks.
+- Cron creation is atomically idempotent for identical tool requests, and
+  owner jobs preserve their host execution target.
+- Frozen macOS filesystem workers start through the packaged gateway's
+  dedicated worker entry point, while frozen Windows gateways resolve sandbox
+  setup paths correctly.
+- First-install provider and model routing state, long-session recovery,
+  reasoning timers, subagent usage accounting, and session deletion lifecycle
+  handling are more reliable.
+- Settings overlays cover the viewport, Skills navigation remains stable, and
+  project/chat activity, onboarding, assistant activity, and provider settings
+  are clearer.
 - The `gateway` tool no longer advertises capabilities it cannot deliver:
   `restart` and `config_set` now report their actual availability, audio
   settings point to `audio_config`, and `config_get` uses the canonical
@@ -32,6 +54,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- The packaged Desktop gateway carries its CA trust bundle, channel
+  administration approvals are aligned, and coding/delivery guidance now
+  reflects actual runtime capability.
 - Desktop now consolidates data from legacy recovery profiles into the single
   primary profile before startup. Existing primary settings remain
   authoritative; when the primary profile has no settings, the newest legacy

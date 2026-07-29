@@ -88,6 +88,11 @@ export function useUsageTotals(options: {
     const totalCostUsd = usageTotals.value.cost
     const native = nativeDisplay.value
     if (native.useCanonicalUsd) {
+      if (options.currency.value === 'CNY') {
+        hints.push(`≈ $${Number(totalCostUsd).toFixed(4)} USD`)
+      } else {
+        hints.push(`≈ ¥${(Number(totalCostUsd) * toValue(options.cnyRate)).toFixed(4)} CNY`)
+      }
       if (native.subtotalText) {
         hints.push(t('usageLogs.nativeBillingSubtotals', { amounts: native.subtotalText }))
       }
@@ -108,7 +113,9 @@ export function useUsageTotals(options: {
 
   const costHintTitle = computed(() => {
     if (nativeDisplay.value.exactCny != null) return t('usageLogs.nativeCostHintTitle')
-    if (nativeDisplay.value.useCanonicalUsd) return t('usageLogs.nativeMixedCostHintTitle')
+    if (nativeDisplay.value.useCanonicalUsd && options.currency.value === 'USD') {
+      return t('usageLogs.nativeMixedCostHintTitle')
+    }
     return t('usageLogs.costHintTitle', { rate: toValue(options.cnyRate) })
   })
 

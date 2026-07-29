@@ -1,6 +1,6 @@
 [project]
 name = "opensquilla"
-version = "0.5.0"
+version = "0.5.1"
 description = "OpenSquilla — microkernel Python agent runtime with MCP-native tools and multi-channel messaging"
 license = "Apache-2.0"
 readme = "README.md"

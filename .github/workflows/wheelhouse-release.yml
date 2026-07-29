@@ -406,7 +406,10 @@ jobs:
   build-desktop-windows:
     name: Build unsigned Windows Electron installer
     needs: build-control-ui
-    runs-on: windows-latest
+    # Keep the v0.5.0rc3 upgrade baseline on the OS generation it shipped on.
+    # The legacy NSIS installer can crash with 0xC0000005 on Windows Server 2025
+    # before the candidate installer or profile-preservation checks run.
+    runs-on: windows-2022
     timeout-minutes: 150
     steps:
       - name: Checkout
@@ -959,7 +962,8 @@ jobs:
     name: Audit downloaded Windows draft asset
     if: ${{ github.event_name == 'push' || github.event.inputs.tag != '' }}
     needs: publish-release
-    runs-on: windows-latest
+    # Match the build-time upgrade gate while v0.5.0rc3 is the baseline.
+    runs-on: windows-2022
     timeout-minutes: 75
     permissions:
       contents: write

@@ -146,11 +146,18 @@ export interface ArtifactNativeOpenResult {
   message?: string
 }
 
+export interface ProjectDirectoryPickerRequest {
+  /** Directory the native picker should reveal when it opens. */
+  initialPath?: string
+}
+
 export interface PlatformFilesApi {
   /** Write the bytes to a temp file and open it with the OS default app. */
   openArtifact?: (payload: ArtifactOpenRequest) => Promise<ArtifactNativeOpenResult>
   /** Open the trusted host's native folder picker. Undefined on the web. */
-  chooseProjectDirectory?: () => Promise<{ path: string } | null>
+  chooseProjectDirectory?: (
+    request?: ProjectDirectoryPickerRequest,
+  ) => Promise<{ path: string } | null>
 }
 
 export interface NativeWorkbenchCreateSurfaceRequestV1 {

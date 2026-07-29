@@ -32,7 +32,11 @@ def test_sandbox_status_reports_default_full_host_access(tmp_path: Path) -> None
     assert payload["posture"] == "full"
     assert payload["sandbox"]["sandbox"] is False
     assert payload["sandbox"]["security_grading"] is False
-    assert payload["permissions"]["default_mode"] == "full"
+    assert payload["permissions"]["default_mode"] == "bypass"
+    assert payload["permissions"]["effective_mode"] == "full"
+    assert payload["owner_execution_target"] == "host"
+    assert payload["sandbox_required_for_owner_default"] is False
+    assert payload["sandbox_backend_configured"] == "auto"
     assert payload["restart_required"] is False
 
 
@@ -77,21 +81,22 @@ def test_sandbox_trust_repairs_legacy_disabled_network_default(tmp_path: Path) -
     assert cfg.sandbox.network_default == "proxy_allowlist"
 
 
-def test_sandbox_bypass_fails_without_mutating_config(tmp_path: Path) -> None:
+def test_sandbox_bypass_restores_owner_full_with_restricted_runtime_available(
+    tmp_path: Path,
+) -> None:
     config_path = tmp_path / "config.toml"
     before = _invoke(config_path, "on")
     assert before.exit_code == 0, before.output
 
     result = _invoke(config_path, "bypass")
 
-    assert result.exit_code != 0
-    assert "removed" in result.output.lower()
-    assert "sandbox trust" in result.output
+    assert result.exit_code == 0, result.output
     cfg = load_config(config_path)
-    assert cfg.sandbox.run_mode == "trusted"
+    assert cfg.sandbox.run_mode is None
     assert cfg.sandbox.sandbox is True
     assert cfg.sandbox.security_grading is True
-    assert cfg.permissions.default_mode == "off"
+    assert cfg.sandbox.network_default == "proxy_allowlist"
+    assert cfg.permissions.default_mode == "bypass"
 
 
 def test_sandbox_full_and_on_are_reversible(tmp_path: Path) -> None:
@@ -125,8 +130,8 @@ def test_sandbox_reset_restores_full_host_access(tmp_path: Path) -> None:
     assert full.exit_code == 0, full.output
     assert reset.exit_code == 0, reset.output
     cfg = load_config(config_path)
-    assert cfg.sandbox.run_mode == "full"
-    assert cfg.sandbox.sandbox is False
-    assert cfg.sandbox.security_grading is False
-    assert cfg.sandbox.network_default == "none"
-    assert cfg.permissions.default_mode == "full"
+    assert cfg.sandbox.run_mode is None
+    assert cfg.sandbox.sandbox is True
+    assert cfg.sandbox.security_grading is True
+    assert cfg.sandbox.network_default == "proxy_allowlist"
+    assert cfg.permissions.default_mode == "bypass"

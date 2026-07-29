@@ -1685,7 +1685,10 @@ async def test_rpc_sandbox_status_reports_backend_managed_network_and_run_mode()
     for bundle_id, expected_domains in expected_catalog_subsets.items():
         assert bundle_id in catalog_by_id
         assert expected_domains.issubset(catalog_by_id[bundle_id])
-    assert result["permissions"] == {"default_mode": "off"}
+    assert result["permissions"] == {
+        "default_mode": "off",
+        "effective_mode": "standard",
+    }
 
 
 @pytest.mark.asyncio

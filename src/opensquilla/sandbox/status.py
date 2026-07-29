@@ -29,9 +29,7 @@ def status_payload(config: Any, *, restart_required: bool = False) -> dict[str, 
     target = execution_target(run_mode)
     sandbox_enabled = target == "sandbox" and bool(sandbox_cfg.sandbox)
     security_grading = target == "sandbox" and bool(sandbox_cfg.security_grading)
-    permissions_default_mode = (
-        "full" if target == "host" else str(config.permissions.default_mode)
-    )
+    permissions_default_mode = str(config.permissions.default_mode)
     managed_network = (
         "ready"
         if target == "sandbox"
@@ -43,6 +41,9 @@ def status_payload(config: Any, *, restart_required: bool = False) -> dict[str, 
         "run_mode": run_mode.value,
         "run_mode_label": display_name(run_mode),
         "execution_target": target,
+        "owner_execution_target": target,
+        "sandbox_required_for_owner_default": target == "sandbox",
+        "sandbox_backend_configured": str(getattr(sandbox_cfg, "backend", "auto")),
         "project_default_run_mode": project_default.value,
         "runtime_capability_run_mode": runtime_capability.value,
         "runtime_sandbox_required": runtime_capability is not RunMode.FULL,
@@ -65,6 +66,7 @@ def status_payload(config: Any, *, restart_required: bool = False) -> dict[str, 
         ],
         "permissions": {
             "default_mode": permissions_default_mode,
+            "effective_mode": "full" if target == "host" else run_mode.value,
         },
         "restart_required": restart_required,
     }

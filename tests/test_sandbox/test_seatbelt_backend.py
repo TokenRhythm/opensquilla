@@ -1078,6 +1078,31 @@ def test_filesystem_worker_runtime_roots_cover_python_and_import_closure(
     assert len(roots) == len(set(roots))
 
 
+def test_filesystem_worker_argv_uses_python_module_outside_frozen_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(seatbelt_mod.sys, "frozen", False, raising=False)
+
+    assert seatbelt_mod._filesystem_worker_argv() == (
+        str(seatbelt_mod._python_executable()),
+        "-B",
+        "-m",
+        "opensquilla.sandbox.filesystem_worker",
+        "-",
+    )
+
+
+def test_filesystem_worker_argv_uses_internal_entrypoint_when_frozen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(seatbelt_mod.sys, "frozen", True, raising=False)
+
+    assert seatbelt_mod._filesystem_worker_argv() == (
+        str(seatbelt_mod._python_executable()),
+        "--_sandbox-filesystem-worker",
+    )
+
+
 @pytest.mark.asyncio
 async def test_public_run_never_supplies_private_transport(
     monkeypatch: pytest.MonkeyPatch,
@@ -1311,6 +1336,48 @@ async def test_real_seatbelt_scoped_filesystem_worker_runtime_closure(
     )
 
     assert "hello" in result.message
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "darwin", reason="native Seatbelt required")
+async def test_real_seatbelt_frozen_filesystem_worker_entry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    binary = os.environ.get("OPENSQUILLA_PACKAGED_GATEWAY_BINARY", "")
+    if not binary:
+        pytest.skip("requires OPENSQUILLA_PACKAGED_GATEWAY_BINARY")
+    packaged_gateway = Path(binary).resolve()
+    if not packaged_gateway.is_file():
+        pytest.skip("packaged gateway binary is unavailable")
+    backend = SeatbeltBackend()
+    if not backend.available():
+        pytest.skip("requires macOS sandbox-exec")
+
+    workspace = tmp_path / "workspace"
+    target = workspace / "notes.txt"
+    workspace.mkdir()
+    target.write_text("frozen-worker-ok\n", encoding="utf-8")
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        host_root_readonly=False,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+    )
+    monkeypatch.setattr(seatbelt_mod.sys, "executable", str(packaged_gateway))
+    monkeypatch.setattr(seatbelt_mod.sys, "frozen", True, raising=False)
+
+    result = await backend.run_operation(
+        SandboxOperation.filesystem(
+            kind="read_file",
+            workspace=workspace,
+            run_mode="trusted",
+            path=target,
+            file_system_profile=profile,
+        )
+    )
+
+    assert result.message == "1\tfrozen-worker-ok\n"
 
 
 @pytest.mark.asyncio

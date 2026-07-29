@@ -14,6 +14,7 @@ from opensquilla.engine.runtime import TurnRunner, _SelectorFallbackProvider
 from opensquilla.engine.types import DoneEvent as EngineDoneEvent
 from opensquilla.engine.types import ErrorEvent, ToolCall
 from opensquilla.engine.usage_accounting import (
+    UsageAccountingBusyError,
     UsageAccountingScope,
     UsageAccountingUnavailableError,
     UsageCallResult,
@@ -71,6 +72,12 @@ class _UnavailableSink(_RecordingSink):
     async def start(self, call: UsageCallStart) -> None:
         self.started.append(call)
         raise UsageAccountingUnavailableError("ledger busy")
+
+
+class _BusySink(_RecordingSink):
+    async def start(self, call: UsageCallStart) -> None:
+        self.started.append(call)
+        raise UsageAccountingBusyError("ledger remained busy")
 
 
 class _DoneProvider:
@@ -1330,13 +1337,23 @@ async def test_shared_turn_scope_keeps_helper_and_agent_call_indices_unique() ->
 
 
 @pytest.mark.asyncio
-async def test_turn_runner_preserves_retryable_ledger_start_error_code() -> None:
+@pytest.mark.parametrize(
+    ("sink_type", "expected_code"),
+    [
+        (_UnavailableSink, UsageAccountingUnavailableError.code),
+        (_BusySink, UsageAccountingBusyError.code),
+    ],
+)
+async def test_turn_runner_preserves_retryable_ledger_start_error_code(
+    sink_type,
+    expected_code: str,
+) -> None:
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
     session_key = "agent:main:usage-start-failure"
     await manager.create(session_key)
-    sink = _UnavailableSink()
+    sink = sink_type()
     provider = _SequenceProvider([[ProviderDone()]])
     runner = TurnRunner(
         provider_selector=_SingleProviderSelector(provider),
@@ -1362,5 +1379,8 @@ async def test_turn_runner_preserves_retryable_ledger_start_error_code() -> None
 
     errors = [event for event in events if isinstance(event, ErrorEvent)]
     assert len(errors) == 1
-    assert errors[0].code == UsageAccountingUnavailableError.code
+    assert errors[0].code == expected_code
     assert provider.calls == 0
+    outcome = outcome_from_error(code=expected_code)
+    assert outcome.kind == "blocked"
+    assert outcome.retryable is True

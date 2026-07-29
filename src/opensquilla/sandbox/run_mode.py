@@ -25,6 +25,7 @@ class RunModeConfigPatch:
 _RUN_MODE_ALIASES = {
     "on": RunMode.STANDARD,
     "off": RunMode.STANDARD,
+    "bypass": RunMode.FULL,
     "standard": RunMode.STANDARD,
     "standard-sandbox": RunMode.STANDARD,
     "standard_sandbox": RunMode.STANDARD,
@@ -95,9 +96,9 @@ def legacy_state_to_run_mode(
     permissions_default_mode: Any,
 ) -> RunMode:
     permission_mode = str(permissions_default_mode or "").strip().lower()
-    if permission_mode == "full":
+    if permission_mode in {"bypass", "full"}:
         return RunMode.FULL
-    if permission_mode in {"bypass", "off", "on", ""}:
+    if permission_mode in {"off", "on", ""}:
         return RunMode.TRUSTED
     if permission_mode in {"standard", "standard-sandbox", "standard_sandbox", "restricted"}:
         return RunMode.STANDARD
@@ -116,7 +117,7 @@ def config_run_mode(config: Any) -> RunMode:
 
     permissions = getattr(config, "permissions", None)
     permission_mode = str(getattr(permissions, "default_mode", "off") or "").strip().lower()
-    if permission_mode == "full":
+    if permission_mode in {"bypass", "full"}:
         return RunMode.FULL
     if _field_was_set(sandbox, "sandbox") and not bool(getattr(sandbox, "sandbox", False)):
         return RunMode.FULL
@@ -149,6 +150,9 @@ def _full_mode_is_explicit(config: Any) -> bool:
     sandbox_enabled = getattr(sandbox, "sandbox", None)
     if _field_was_set(sandbox, "sandbox") and not bool(sandbox_enabled):
         return True
+    # ``bypass`` is the owner/project default host mode, but the process still
+    # keeps a sandbox-capable runtime for explicit Standard/Trusted calls.
+    # Only an explicit ``full`` selection disables that process-wide capability.
     return str(getattr(permissions, "default_mode", "")).strip().lower() == "full"
 
 

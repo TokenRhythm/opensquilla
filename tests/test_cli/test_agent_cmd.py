@@ -952,7 +952,8 @@ async def test_run_agent_once_passes_bypass_permissions_to_tool_context(
 
     ctx = captured["tool_context"]
     assert ctx.interaction_mode is InteractionMode.UNATTENDED
-    assert ctx.elevated == "bypass"
+    assert ctx.elevated == "full"
+    assert ctx.run_mode == "full"
 
 
 @pytest.mark.asyncio
@@ -1039,7 +1040,8 @@ async def test_run_agent_once_uses_configured_permissions_default(
         config=GatewayConfig(permissions=PermissionsConfig(default_mode="bypass")),
     )
 
-    assert captured["tool_context"].elevated == "bypass"
+    assert captured["tool_context"].elevated == "full"
+    assert captured["tool_context"].run_mode == "full"
 
 
 @pytest.mark.asyncio

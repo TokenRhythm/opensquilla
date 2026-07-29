@@ -19,6 +19,7 @@ import structlog
 
 from opensquilla.asyncio_utils import create_background_task
 from opensquilla.engine.usage_accounting import (
+    UsageAccountingBusyError,
     UsageAccountingScope,
     UsageAccountingUnavailableError,
     UsageCallItem,
@@ -27,6 +28,7 @@ from opensquilla.engine.usage_accounting import (
     UsageExecutionContext,
 )
 from opensquilla.gateway.session_services import get_session_storage
+from opensquilla.session.storage import StorageBusyError
 from opensquilla.session.usage_ledger import (
     UsageEventCompletion,
     UsageEventItem,
@@ -227,9 +229,13 @@ class SessionUsageEventSink:
         self,
         storage: Any,
         *,
+        start_retry_delays: tuple[float, ...] = (0.1,),
         retry_delays: tuple[float, ...] = (0.05, 0.2, 1.0, 5.0),
     ) -> None:
         self._storage = storage
+        self._start_retry_delays = tuple(
+            max(0.0, float(delay)) for delay in start_retry_delays
+        )
         self._retry_delays = retry_delays
         self._tasks: set[asyncio.Task[Any]] = set()
 
@@ -258,14 +264,35 @@ class SessionUsageEventSink:
         )
 
     async def start(self, call: UsageCallStart) -> None:
-        try:
-            await self._storage.start_usage_event(self._start_record(call))
-        except UsageLedgerStorageError:
-            raise
-        except Exception as exc:
-            raise UsageLedgerStorageError(
-                "usage ledger is temporarily unavailable; provider request was not sent"
-            ) from exc
+        record = self._start_record(call)
+        attempt = 0
+        while True:
+            try:
+                await self._storage.start_usage_event(record)
+                return
+            except StorageBusyError as exc:
+                if attempt >= len(self._start_retry_delays):
+                    raise UsageAccountingBusyError(
+                        "usage ledger is temporarily busy after retry; "
+                        "provider request was not sent"
+                    ) from exc
+                delay = self._start_retry_delays[attempt]
+                attempt += 1
+                log.info(
+                    "usage.ledger_start_retry",
+                    event_id=call.event_id,
+                    attempt=attempt,
+                    delay_ms=int(delay * 1_000),
+                    operation=exc.operation,
+                    waited_ms=exc.waited_ms,
+                )
+                await asyncio.sleep(delay)
+            except UsageLedgerStorageError:
+                raise
+            except Exception as exc:
+                raise UsageLedgerStorageError(
+                    "usage ledger is temporarily unavailable; provider request was not sent"
+                ) from exc
 
     async def finalize(self, call: UsageCallStart, result: UsageCallResult) -> None:
         completion = _completion(call, result)

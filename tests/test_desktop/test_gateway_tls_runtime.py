@@ -1,6 +1,8 @@
 import importlib.util
+import json
 import os
 import runpy
+import subprocess
 import sys
 from collections.abc import Iterator
 from pathlib import Path
@@ -263,8 +265,11 @@ def test_desktop_build_and_smoke_wire_the_ca_contract() -> None:
     assert "'--hidden-import',\n  'certifi'," in build_source
     assert '"certifi>=2024.7.4"' in project_source
     assert "--_desktop-ca-probe" in entry_source
+    assert "--_sandbox-filesystem-worker" in entry_source
+    assert "--elevated-helper" in entry_source
     assert "x509_ca={ca_certificate_count}" in entry_source
     assert "spawnSync(gatewayBinary, ['--_desktop-ca-probe']" in smoke_source
+    assert "spawnSync(gatewayBinary, ['--_sandbox-filesystem-worker']" in smoke_source
     assert "caCertificateCount <= 0" in smoke_source
     for name in (
         "ALL_PROXY",
@@ -277,6 +282,32 @@ def test_desktop_build_and_smoke_wire_the_ca_contract() -> None:
         "SSL_CERT_FILE",
     ):
         assert f"'{name}'" in smoke_source
+
+
+def test_gateway_entry_runs_hidden_filesystem_worker_without_entering_cli(
+    tmp_path: Path,
+) -> None:
+    gateway_entry = ROOT / "desktop/electron/scripts/gateway-entry.py"
+    target = tmp_path / "worker-probe.txt"
+    target.write_text("worker-ok\n", encoding="utf-8")
+    payload = {
+        "kind": "read_file",
+        "path": str(target),
+        "displayPath": str(target),
+    }
+
+    completed = subprocess.run(
+        [sys.executable, str(gateway_entry), "--_sandbox-filesystem-worker"],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=20,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout)["message"].splitlines() == ["1\tworker-ok"]
+    assert completed.stderr == ""
 
 
 def test_desktop_gateway_entry_routes_sandbox_helper_before_cli(

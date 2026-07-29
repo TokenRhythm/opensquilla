@@ -1391,6 +1391,115 @@ def test_fresh_noop_does_not_create_context_or_follow_backup_symlink(
     assert not (user_data / "desktop-profile-context.json").exists()
 
 
+def test_fresh_noop_does_not_scan_primary_profile_tree(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
+    user_data = tmp_path / "user-data"
+    primary = user_data / "opensquilla"
+    primary.mkdir(parents=True)
+    (primary / "config.toml").write_text("primary = true\n", encoding="utf-8")
+    consolidate_module = importlib.import_module("opensquilla.recovery.consolidate")
+
+    def fail_if_primary_is_scanned(_home: Path) -> object:
+        raise AssertionError("a primary-only startup must not scan the primary profile tree")
+
+    monkeypatch.setattr(
+        consolidate_module,
+        "profile_no_follow_manifest",
+        fail_if_primary_is_scanned,
+    )
+
+    result = consolidate_recovery_profiles(user_data, primary)
+
+    assert result.outcome == "noop"
+    assert result.stable_code == "no_recovery_profiles"
+
+
+def test_fresh_noop_ignores_unrelated_primary_directory_link(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
+    user_data = tmp_path / "user-data"
+    primary = user_data / "opensquilla"
+    primary.mkdir(parents=True)
+    (primary / "config.toml").write_text("primary = true\n", encoding="utf-8")
+    unrelated_link = primary / "unrelated-link"
+    _make_dangling_directory_link(unrelated_link)
+
+    try:
+        result = consolidate_recovery_profiles(user_data, primary)
+
+        assert result.outcome == "noop"
+        assert result.stable_code == "no_recovery_profiles"
+        assert os.path.lexists(_native_io_path(unrelated_link))
+    finally:
+        _remove_dangling_directory_link(unrelated_link)
+
+
+def test_consolidate_cli_no_recovery_ignores_primary_directory_link(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
+    user_data = tmp_path / "user-data"
+    primary = user_data / "opensquilla"
+    primary.mkdir(parents=True)
+    (primary / "config.toml").write_text("primary = true\n", encoding="utf-8")
+    unrelated_link = primary / "unrelated-link"
+    _make_dangling_directory_link(unrelated_link)
+
+    try:
+        completed = CliRunner().invoke(
+            recovery_app,
+            [
+                "consolidate-profiles",
+                "--user-data",
+                str(user_data),
+                "--primary-home",
+                str(primary),
+                "--json",
+            ],
+        )
+
+        assert completed.exit_code == 0, completed.output
+        payload = json.loads(completed.stdout)
+        assert payload["outcome"] == "noop"
+        assert payload["stable_code"] == "no_recovery_profiles"
+        assert payload["errors"] == []
+        assert os.path.lexists(_native_io_path(unrelated_link))
+    finally:
+        _remove_dangling_directory_link(unrelated_link)
+
+
+def test_real_recovery_still_rejects_unsafe_primary_directory_link(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
+    user_data = tmp_path / "user-data"
+    primary = user_data / "opensquilla"
+    primary.mkdir(parents=True)
+    (primary / "config.toml").write_text("primary = true\n", encoding="utf-8")
+    recovery_id = str(uuid.uuid4())
+    recovery_root = user_data / "recovery-profiles" / recovery_id
+    recovery_root.mkdir(parents=True)
+    unrelated_link = primary / "unrelated-link"
+    _make_dangling_directory_link(unrelated_link)
+
+    try:
+        result = consolidate_recovery_profiles(user_data, primary)
+
+        assert result.outcome == "blocked"
+        assert result.stable_code == "unsafe_path"
+        assert recovery_root.is_dir()
+        assert os.path.lexists(_native_io_path(unrelated_link))
+    finally:
+        _remove_dangling_directory_link(unrelated_link)
+
+
 def test_primary_configuration_still_validates_unsafe_credential_leaf(
     tmp_path: Path,
     monkeypatch,

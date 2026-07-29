@@ -384,7 +384,9 @@ async function runNativePicker(epoch: number) {
   phase.value = 'native-picking'
   error.value = ''
   try {
-    const choice = await nativePicker()
+    const choice = await nativePicker({
+      initialPath: props.initialPath?.trim() || undefined,
+    })
     if (epoch !== openEpoch || !props.open) return
     if (choice?.path) {
       const selected = choice.path

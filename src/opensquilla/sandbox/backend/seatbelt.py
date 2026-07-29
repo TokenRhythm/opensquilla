@@ -60,6 +60,7 @@ log = logging.getLogger(__name__)
 _SANDBOX_EXEC_NAME = "sandbox-exec"
 _SANDBOX_EXEC_SYSTEM_PATH = Path("/usr/bin/sandbox-exec")
 _FILESYSTEM_WORKER_MODULE = "opensquilla.sandbox.filesystem_worker"
+_FROZEN_FILESYSTEM_WORKER_ARG = "--_sandbox-filesystem-worker"
 _FILESYSTEM_PATH_OPERATION_KINDS = frozenset(
     {
         "read_file",
@@ -106,6 +107,25 @@ _SEATBELT_BASE_POLICY = """(version 1)
 
 ; sysctls permitted.
 (allow sysctl-read)
+
+; dyld and getcwd inspect the filesystem root itself before resolving allowed
+; runtime subpaths.
+(allow file-read* file-test-existence (literal "/"))
+
+; Allow dyld to map platform libraries and frameworks. File reads remain
+; constrained separately; this grants only executable mappings from standard
+; macOS runtime locations.
+(allow file-map-executable
+  (subpath "/Library/Apple/System/Library/Frameworks")
+  (subpath "/Library/Apple/System/Library/PrivateFrameworks")
+  (subpath "/Library/Apple/usr/lib")
+  (subpath "/System/Library/Frameworks")
+  (subpath "/System/Library/PrivateFrameworks")
+  (subpath "/System/Library/SubFrameworks")
+  (subpath "/System/iOSSupport/System/Library/Frameworks")
+  (subpath "/System/iOSSupport/System/Library/PrivateFrameworks")
+  (subpath "/System/iOSSupport/System/Library/SubFrameworks")
+  (subpath "/usr/lib"))
 
 ; IOKit and common macOS runtime services.
 (allow iokit-open
@@ -335,7 +355,7 @@ def _seatbelt_access_rule(
     root: Path,
     excluded: tuple[Path, ...],
 ) -> str:
-    if action not in {"file-read*", "file-write*"}:
+    if action not in {"file-map-executable", "file-read*", "file-write*"}:
         raise ValueError(f"unsupported Seatbelt filesystem action: {action!r}")
     root = _seatbelt_path(root)
     excluded = _unique_seatbelt_paths(excluded)
@@ -351,6 +371,14 @@ def _seatbelt_access_rule(
     exact = f"(require-all {_literal(root)}{guard_suffix})"
     descendants = f"(require-all {_subpath(root)}{guard_suffix})"
     return f"(allow {action} {exact} {descendants})"
+
+
+def _seatbelt_path_ancestor_rule(root: Path) -> str:
+    root = _seatbelt_path(root)
+    return (
+        "(allow file-read-metadata file-test-existence "
+        f"(path-ancestors {_scheme_string(str(root))}))"
+    )
 
 
 def _seatbelt_proxy_endpoint(proxy: NetworkProxySpec) -> str:
@@ -509,15 +537,37 @@ def _render_seatbelt_profile(
     ]
     lines.extend(_profile_read_rules(file_system))
     lines.extend(_profile_write_rules(file_system))
+    profile_runtime_roots = _profile_roots(
+        file_system,
+        frozenset({FileSystemAccess.READ, FileSystemAccess.WRITE}),
+    )
+    lines.extend(
+        _seatbelt_path_ancestor_rule(root)
+        for root in profile_runtime_roots
+        if root != Path("/")
+    )
 
     private_read_roots, private_write_roots = _private_transport_roots(
         private_transport,
         require_exists=require_private_roots,
     )
+    lines.extend(
+        _seatbelt_path_ancestor_rule(root)
+        for root in _unique_seatbelt_paths((*private_read_roots, *private_write_roots))
+        if root != Path("/")
+    )
     denied = frozenset({FileSystemAccess.DENY})
     lines.extend(
         _seatbelt_access_rule(
             "file-read*",
+            root,
+            _private_transport_exclusions(file_system, root, denied),
+        )
+        for root in private_read_roots
+    )
+    lines.extend(
+        _seatbelt_access_rule(
+            "file-map-executable",
             root,
             _private_transport_exclusions(file_system, root, denied),
         )
@@ -531,6 +581,7 @@ def _render_seatbelt_profile(
                 f"seatbelt private transport root is explicitly read-only: {root}"
             )
         lines.append(_seatbelt_access_rule("file-write*", root, exclusions))
+        lines.append(_seatbelt_access_rule("file-map-executable", root, exclusions))
 
     if policy.network == NetworkMode.NONE:
         lines.append("(deny network*)")
@@ -751,13 +802,7 @@ def _filesystem_operation_launch(
     env = _filesystem_worker_env()
     stdin = json.dumps(operation.to_payload(), ensure_ascii=False).encode("utf-8")
     sandbox_request = SandboxRequest(
-        argv=(
-            str(_python_executable()),
-            "-B",
-            "-m",
-            _FILESYSTEM_WORKER_MODULE,
-            "-",
-        ),
+        argv=_filesystem_worker_argv(),
         cwd=workspace,
         action_kind=f"fs.worker.{operation.kind}",
         policy=policy,
@@ -797,13 +842,7 @@ def _filesystem_worker_private_transport(
 ) -> _SeatbeltPrivateTransport:
     if operation.kind not in _FILESYSTEM_OPERATION_KINDS:
         raise SandboxBackendError(f"unsupported filesystem operation: {operation.kind!r}")
-    expected_argv = (
-        str(_python_executable()),
-        "-B",
-        "-m",
-        _FILESYSTEM_WORKER_MODULE,
-        "-",
-    )
+    expected_argv = _filesystem_worker_argv()
     if request.argv != expected_argv:
         raise SandboxBackendError("seatbelt filesystem worker argv is inconsistent")
     if request.action_kind != f"fs.worker.{operation.kind}":
@@ -912,12 +951,20 @@ def _validate_filesystem_private_transport_roots(
 
 def _runtime_readonly_roots() -> tuple[Path, ...]:
     executable = _python_executable().expanduser()
+    symlink_roots: tuple[Path, ...] = ()
+    if executable.is_symlink():
+        link_target = executable.readlink()
+        if not link_target.is_absolute():
+            link_target = executable.parent / link_target
+        symlink_roots = (link_target.parent, link_target.parent.parent)
     prefix = Path(sys.prefix).expanduser().resolve(strict=False)
     base_prefix = Path(sys.base_prefix).expanduser().resolve(strict=False)
     configured = sysconfig.get_paths()
     candidates = [
         executable.parent,
+        *symlink_roots,
         executable.resolve(strict=False).parent,
+        executable.resolve(strict=False).parent.parent,
         *((prefix,) if prefix != base_prefix else ()),
         *(
             Path(configured[name])
@@ -929,14 +976,16 @@ def _runtime_readonly_roots() -> tuple[Path, ...]:
     roots: list[Path] = []
     seen: set[str] = set()
     for candidate in candidates:
-        root = candidate.expanduser().resolve(strict=False)
-        if root == Path(root.anchor) or not root.exists():
-            continue
-        key = str(root)
-        if key in seen:
-            continue
-        seen.add(key)
-        roots.append(root)
+        raw_root = candidate.expanduser().absolute()
+        resolved_root = raw_root.resolve(strict=False)
+        for root in (raw_root, resolved_root):
+            if root == Path(root.anchor) or not root.exists():
+                continue
+            key = str(root)
+            if key in seen:
+                continue
+            seen.add(key)
+            roots.append(root)
     return tuple(roots)
 
 
@@ -958,7 +1007,19 @@ def _pythonpath_for_worker() -> str:
 
 
 def _python_executable() -> Path:
-    return Path(sys.executable)
+    return Path(sys.executable).expanduser().absolute()
+
+
+def _filesystem_worker_argv() -> tuple[str, ...]:
+    if bool(getattr(sys, "frozen", False)):
+        return (str(_python_executable()), _FROZEN_FILESYSTEM_WORKER_ARG)
+    return (
+        str(_python_executable()),
+        "-B",
+        "-m",
+        _FILESYSTEM_WORKER_MODULE,
+        "-",
+    )
 
 
 def _filesystem_worker_env() -> dict[str, str]:
@@ -1014,6 +1075,14 @@ class SeatbeltBackend(Backend):
         )
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip() or "filesystem worker failed"
+            log.error(
+                "sandbox.seatbelt_filesystem_worker_failed: frozen=%s entrypoint=%s "
+                "returncode=%d action=%s",
+                bool(getattr(sys, "frozen", False)),
+                "desktop_internal" if bool(getattr(sys, "frozen", False)) else "python_module",
+                result.returncode,
+                operation.kind,
+            )
             raise SandboxBackendError(f"seatbelt filesystem worker failed: {detail}")
         return SandboxOperationResult.from_worker_stdout(result.stdout)
 

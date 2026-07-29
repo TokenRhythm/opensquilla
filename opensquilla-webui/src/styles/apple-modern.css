@@ -78,7 +78,7 @@ select:focus,
 .sidebar-row-menu__item,
 .control-segmented__btn,
 .route-hub__tab,
-#app .settings-modal .settings-rail__item {
+body > .settings-overlay .settings-modal .settings-rail__item {
   transform-origin: center;
   transition:
     background var(--dur-fast) var(--ease-standard),
@@ -98,7 +98,7 @@ select:focus,
 .sidebar-row-menu__item:not(:disabled):active,
 .control-segmented__btn:not(:disabled):active,
 .route-hub__tab:not(:disabled):active,
-#app .settings-modal .settings-rail__item:not(:disabled):active {
+body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):active {
   transform: scale(var(--modern-press-scale));
 }
 
@@ -836,33 +836,33 @@ select:focus,
 
 /* Settings reads like a macOS preference window: one floating sheet, a quiet
    navigation rail, and content grouped by whitespace instead of rules. */
-#app .settings-overlay {
-  backdrop-filter: blur(18px) saturate(0.9);
-  -webkit-backdrop-filter: blur(18px) saturate(0.9);
+body > .settings-overlay {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 
-#app .settings-overlay .settings-modal {
+body > .settings-overlay .settings-modal {
   border-color: transparent;
   box-shadow: var(--shadow-xl);
 }
 
-#app .settings-modal .settings-modal__head {
+body > .settings-overlay .settings-modal .settings-modal__head {
   border-bottom: 0;
   min-height: 60px;
   padding: var(--sp-3) var(--sp-5);
 }
 
-#app .settings-modal .settings-modal__title {
+body > .settings-overlay .settings-modal .settings-modal__title {
   font-size: 1.25rem;
   font-weight: 680;
   letter-spacing: -0.025em;
 }
 
-#app .settings-modal .settings-body {
+body > .settings-overlay .settings-modal .settings-body {
   background: var(--bg-surface-2);
 }
 
-#app .settings-modal .settings-rail {
+body > .settings-overlay .settings-modal .settings-rail {
   background: var(--bg-surface-2);
   border-right: 0;
   gap: 4px;
@@ -870,26 +870,26 @@ select:focus,
   width: 220px;
 }
 
-#app .settings-modal .settings-rail__group {
+body > .settings-overlay .settings-modal .settings-rail__group {
   letter-spacing: 0.02em;
   margin-top: var(--sp-4);
   text-transform: none;
 }
 
-#app .settings-modal .settings-rail__item {
+body > .settings-overlay .settings-modal .settings-rail__item {
   border-radius: var(--radius-control);
   min-height: 38px;
   padding: 9px var(--sp-3);
   position: relative;
 }
 
-#app .settings-modal .settings-rail__item.is-active {
+body > .settings-overlay .settings-modal .settings-rail__item.is-active {
   background: var(--bg-surface);
   box-shadow: var(--shadow-xs);
   color: var(--text);
 }
 
-#app .settings-modal .settings-rail__item.is-active::before {
+body > .settings-overlay .settings-modal .settings-rail__item.is-active::before {
   background: var(--accent);
   border-radius: var(--radius-pill);
   box-shadow: 0 0 12px color-mix(in srgb, var(--accent) 38%, transparent);
@@ -902,24 +902,24 @@ select:focus,
   width: 3px;
 }
 
-#app .settings-modal .settings-panel {
+body > .settings-overlay .settings-modal .settings-panel {
   background: var(--bg-surface);
   padding: var(--sp-5) var(--sp-6) var(--sp-8);
 }
 
-#app .settings-modal .settings-foot {
+body > .settings-overlay .settings-modal .settings-foot {
   background: var(--bg-surface-2);
   border-top: 0;
   min-height: 42px;
   padding-inline: var(--sp-5);
 }
 
-#app .settings-modal .setup-provider-overview,
-#app .settings-modal .setup-provider-editor-head {
+body > .settings-overlay .settings-modal .setup-provider-overview,
+body > .settings-overlay .settings-modal .setup-provider-editor-head {
   border: 0;
 }
 
-#app .settings-modal .setup-provider-card {
+body > .settings-overlay .settings-modal .setup-provider-card {
   background: var(--bg-surface-2);
   border: 0;
   border-radius: var(--radius-card);
@@ -927,14 +927,14 @@ select:focus,
   padding: var(--sp-3) var(--sp-4);
 }
 
-#app .settings-modal .setup-provider-card.is-selected {
+body > .settings-overlay .settings-modal .setup-provider-card.is-selected {
   background: color-mix(in srgb, var(--accent) 6%, var(--bg-surface-2));
   box-shadow: inset 3px 0 0 var(--accent);
 }
 
-#app .settings-modal .setup-provider-routing,
-#app .settings-modal .setup-provider-model__routing-owner,
-#app .settings-modal .setup-provider-empty {
+body > .settings-overlay .settings-modal .setup-provider-routing,
+body > .settings-overlay .settings-modal .setup-provider-model__routing-owner,
+body > .settings-overlay .settings-modal .setup-provider-empty {
   background: var(--bg-surface-2);
   border-color: transparent;
   border-radius: var(--radius-card);
@@ -965,12 +965,12 @@ select:focus,
     opacity: 1;
   }
 
-  #app .settings-modal .settings-rail {
+  body > .settings-overlay .settings-modal .settings-rail {
     background: var(--bg-surface);
     width: auto;
   }
 
-  #app .settings-modal .settings-panel {
+  body > .settings-overlay .settings-modal .settings-panel {
     padding: var(--sp-4);
   }
 }
@@ -986,7 +986,7 @@ select:focus,
   .sidebar-row-menu__item,
   .control-segmented__btn,
   .route-hub__tab,
-  #app .settings-modal .settings-rail__item {
+  body > .settings-overlay .settings-modal .settings-rail__item {
     transition: none;
   }
 
@@ -999,7 +999,7 @@ select:focus,
   .sidebar-row-menu__item:not(:disabled):active,
   .control-segmented__btn:not(:disabled):active,
   .route-hub__tab:not(:disabled):active,
-  #app .settings-modal .settings-rail__item:not(:disabled):active {
+  body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):active {
     transform: none;
   }
 

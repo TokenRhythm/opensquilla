@@ -1976,8 +1976,15 @@ def test_packaged_session_recovery_gate_uses_installed_electron_and_real_gateway
     assert "executablePath" in helpers
     assert "--user-data-dir=" in helpers
     assert "connectToServer()" in recovery
+    assert "app.context().routeWebSocket" in recovery
+    assert recovery.index("app.context().routeWebSocket") < recovery.index("app.firstWindow")
+    assert recovery.index("page.reload") < recovery.index("page.goto(sessionUrl")
     assert "chat.history" in recovery
     assert "sessions.messages.subscribe" in recovery
+    assert "frame.params?.sessionKey === sessionKey" in recovery
+    assert "frame.params?.key === sessionKey" in recovery
+    assert "let targetSocketCounted = false" in recovery
+    assert recovery.count("countTargetSocket()") == 2
     assert "client.onMessage" in recovery
     assert "server.onMessage" in recovery
     assert "server.send(message)" in recovery

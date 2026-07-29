@@ -26,6 +26,22 @@ trailers.
 | [@ab2ence](https://github.com/ab2ence) | macOS Seatbelt backend execution, denial escalation, and release-candidate type-check cleanup. | [#46](https://github.com/opensquilla/opensquilla/pull/46), [`fb1e6225`](https://github.com/opensquilla/opensquilla/pull/46/commits/fb1e6225e4db9cb0801ea347a89c2066e3e0601b), [`f73ac3eb`](https://github.com/opensquilla/opensquilla/pull/46/commits/f73ac3eb0044c64c79cfd18f9ec03d1bba9128ff), [`cf3b046f`](https://github.com/opensquilla/opensquilla/pull/46/commits/cf3b046f42a42efc951320b0af80e9d066dcf7d2) |
 | [@kimjune01](https://github.com/kimjune01) | Provider stream timeout cleanup fix that prevents double-closing provider streams. | [#46](https://github.com/opensquilla/opensquilla/pull/46), [`06e3126d`](https://github.com/opensquilla/opensquilla/pull/46/commits/06e3126d8ebda4ad4cf349ca7be0d0804e0c008d) |
 
+## OpenSquilla 0.5.1
+
+The 0.5.1 maintenance release records new human contributor work after the
+0.5.0 stable release.
+
+| Contributor | 0.5.1 contribution | Evidence |
+| --- | --- | --- |
+| [@joyfan621-png](https://github.com/joyfan621-png) | Improved Desktop onboarding and startup presentation, project and chat UX, provider settings, and Settings overlay behavior. | [#819](https://github.com/opensquilla/opensquilla/pull/819), [#832](https://github.com/opensquilla/opensquilla/pull/832), [#836](https://github.com/opensquilla/opensquilla/pull/836), [#838](https://github.com/opensquilla/opensquilla/pull/838), [#856](https://github.com/opensquilla/opensquilla/pull/856), [#868](https://github.com/opensquilla/opensquilla/pull/868) |
+| [@jiaoqingrui](https://github.com/jiaoqingrui) | Added Desktop deep linking and consolidated recovery profiles without discarding existing recovery data. | [#800](https://github.com/opensquilla/opensquilla/pull/800), [#828](https://github.com/opensquilla/opensquilla/pull/828), [#864](https://github.com/opensquilla/opensquilla/pull/864) |
+| [@shixi-li](https://github.com/shixi-li) | Corrected subagent usage rollup into the parent turn. | [#845](https://github.com/opensquilla/opensquilla/pull/845) |
+| [@Liu-RK](https://github.com/Liu-RK) | Added and hardened project workspaces, improved the macOS project picker, and fixed frozen Windows gateway sandbox setup paths. | [#831](https://github.com/opensquilla/opensquilla/pull/831), [#850](https://github.com/opensquilla/opensquilla/pull/850), [#851](https://github.com/opensquilla/opensquilla/pull/851), [#857](https://github.com/opensquilla/opensquilla/pull/857) |
+| [@RickyYii](https://github.com/RickyYii) | Isolated ambient proxy state from direct-upstream sandbox checks. | [#817](https://github.com/opensquilla/opensquilla/pull/817) |
+| [@HuaXiawithMoon](https://github.com/HuaXiawithMoon) | Propagated reasoning levels through direct and custom Model Ensemble paths. | [#797](https://github.com/opensquilla/opensquilla/pull/797) |
+| [@TUOXI293](https://github.com/TUOXI293) | Refined Cron, Skills, and MetaSkill workflows. | [#829](https://github.com/opensquilla/opensquilla/pull/829) |
+| [@JarvisPei](https://github.com/JarvisPei) | Added safe audio configuration, corrected gateway tool capabilities, and prevented gateway self-termination through Shell tools. | [#821](https://github.com/opensquilla/opensquilla/pull/821), [#822](https://github.com/opensquilla/opensquilla/pull/822) |
+
 ## OpenSquilla 0.5.0
 
 The 0.5.0 stable release records new human contributor work after the 0.5.0

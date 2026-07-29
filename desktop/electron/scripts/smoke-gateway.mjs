@@ -170,6 +170,41 @@ function verifyGatewayCaStore(gatewayBinary, env) {
   }
 }
 
+function verifyGatewayFilesystemWorker(gatewayBinary, env, targetPath) {
+  const payload = JSON.stringify({
+    kind: 'read_file',
+    path: targetPath,
+    displayPath: targetPath,
+  })
+  const result = spawnSync(gatewayBinary, ['--_sandbox-filesystem-worker'], {
+    cwd: dirname(gatewayBinary),
+    env,
+    input: payload,
+    encoding: 'utf8',
+    windowsHide: true,
+  })
+  if (result.error) throw result.error
+  let response = null
+  try {
+    response = JSON.parse(result.stdout)
+  } catch {
+    response = null
+  }
+  if (
+    result.status !== 0
+    || typeof response?.message !== 'string'
+    || !response.message.includes('synthetic packaged gateway smoke')
+  ) {
+    throw new Error(
+      `Packaged gateway filesystem worker probe failed with exit ${result.status ?? 'null'}.`
+        + formatTail(
+          result.stdout ? result.stdout.trim().split(/\r?\n/) : [],
+          result.stderr ? result.stderr.trim().split(/\r?\n/) : [],
+        ),
+    )
+  }
+}
+
 async function findFreePort() {
   return await new Promise((resolvePort, reject) => {
     const server = createServer()
@@ -397,6 +432,7 @@ async function main() {
 
     const env = smokeEnv(tempHome, config)
     verifyGatewayCaStore(gatewayBinary, env)
+    verifyGatewayFilesystemWorker(gatewayBinary, env, join(workspaceDir, 'SOUL.md'))
 
     const port = await findFreePort()
     child = spawn(gatewayBinary, ['gateway', 'run', '--port', String(port), '--bind', '127.0.0.1', '--config', config], {

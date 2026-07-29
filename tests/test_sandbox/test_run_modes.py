@@ -4,7 +4,7 @@ import types
 
 import pytest
 
-from opensquilla.gateway.config import PermissionsConfig
+from opensquilla.gateway.config import GatewayConfig, PermissionsConfig
 from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.sandbox.run_mode import (
     RunMode,
@@ -18,6 +18,15 @@ from opensquilla.sandbox.run_mode import (
     sandbox_runtime_capability_mode,
 )
 from opensquilla.sandbox.status import status_payload
+
+
+def test_gateway_permissions_default_to_bypass_full_host_access() -> None:
+    config = GatewayConfig()
+
+    assert config.permissions.default_mode == "bypass"
+    assert config_run_mode(config) is RunMode.FULL
+    assert project_default_run_mode(config) is RunMode.FULL
+    assert sandbox_runtime_capability_mode(config) is RunMode.STANDARD
 
 
 def test_sandbox_defaults_to_root_readonly_and_auto_review() -> None:
@@ -65,14 +74,14 @@ def test_normalize_run_mode_defaults_to_full() -> None:
     assert normalize_run_mode("standard") == RunMode.STANDARD
 
 
-def test_legacy_bypass_state_maps_to_trusted_without_preserving_host_bypass() -> None:
+def test_legacy_bypass_state_maps_to_full_host_access() -> None:
     mode = legacy_state_to_run_mode(
         sandbox_enabled=False,
         grading_enabled=False,
         permissions_default_mode="bypass",
     )
 
-    assert mode == RunMode.TRUSTED
+    assert mode == RunMode.FULL
 
 
 def test_default_sandbox_settings_resolve_to_full_host_access_run_mode() -> None:
@@ -171,11 +180,17 @@ def test_configured_default_elevated_only_returns_full() -> None:
     assert configured_default_run_mode(config) == RunMode.FULL
     assert configured_default_elevated(config) == "full"
 
+    config.sandbox.run_mode = None
+    config.permissions.default_mode = "bypass"
+    assert configured_default_run_mode(config) == RunMode.FULL
+    assert configured_default_elevated(config) == "full"
+
 
 def test_normalize_run_mode_accepts_user_facing_spellings() -> None:
     assert normalize_run_mode("standard-sandbox") == RunMode.STANDARD
     assert normalize_run_mode("trusted") == RunMode.TRUSTED
     assert normalize_run_mode("full-host-access") == RunMode.FULL
+    assert normalize_run_mode("bypass") == RunMode.FULL
 
 
 def test_bare_config_keeps_full_for_ordinary_and_project_execution() -> None:
@@ -255,6 +270,13 @@ def test_bare_config_status_reports_full_project_default_and_standard_capability
 
     assert payload["run_mode"] == "full"
     assert payload["execution_target"] == "host"
+    assert payload["owner_execution_target"] == "host"
+    assert payload["sandbox_required_for_owner_default"] is False
+    assert payload["sandbox_backend_configured"] == "auto"
     assert payload["project_default_run_mode"] == "full"
     assert payload["runtime_capability_run_mode"] == "standard"
     assert payload["runtime_sandbox_required"] is True
+    assert payload["permissions"] == {
+        "default_mode": "bypass",
+        "effective_mode": "full",
+    }
