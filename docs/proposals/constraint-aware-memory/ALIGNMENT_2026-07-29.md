@@ -1,7 +1,7 @@
 # Constraint-Aware Memory: 对齐记录 2026-07-29
 
 > **Participants**: KunYu + OpenSquilla
-> **Context**: DESIGN.md v1.1 + COMPARISON_CODEX.md 对比学习后的设计对齐
+> **Context**: DESIGN.md v1.1 设计对齐
 > **Status**: ✅ 全部确认（除 D5/D10/D11 后议）
 > **Final confirmation**: 2026-07-29 12:50 CST — KunYu 确认 Q1/Q2/Q3 + D1-D9 + D12 + 推进顺序 1→2→3→4
 
@@ -97,7 +97,6 @@ constraint_type: procedure
 </memory_result>
 ```
 
-- Codex 验证过类似模式（`ContextualUserFragment` + markers）
 - 额外 token ~40-50/条，可忽略
 - 让模型知道"为什么这条被选中"
 - 方便 L3 充分性检查引用
@@ -193,16 +192,6 @@ Compaction Summary 输出：
 
 ---
 
-## 5. 与 Codex 对比的关键借鉴（已纳入设计）
-
-| 借鉴 | 来源 | 纳入位置 |
-|------|------|---------|
-| No-op Signal Gate | Phase 1 prompt "No-op is allowed and preferred" | D8 |
-| Provenance Markers | `ContextualUserFragment` + markers | D9 |
-| Citation/Anchor | `MemoryCitation` + `rollout_ids` | D12 |
-| Progressive Disclosure | memory_summary → MEMORY.md → skills | 中期三层注入 |
-| Usage Telemetry | `MemoriesUsageKind` 5 种追踪 | D11（后议） |
-
 ---
 
 ## 6. 设计原则（确认）
@@ -222,7 +211,6 @@ Compaction Summary 输出：
 | 文档 | 路径 | 状态 |
 |------|------|------|
 | 设计提案 | `DESIGN.md` | v1.1（待更新为 v1.2） |
-| Codex 对比分析 | `COMPARISON_CODEX.md` | ✅ |
 | 2026-07-29 对齐记录 | `ALIGNMENT_2026-07-29.md` | ✅ |
 | L0 实现 spec | `SPEC_L0_ARCHIVED_TRANSCRIPT_SEARCH.md` | ✅ 已实现 |
 | D12 Compaction Anchor spec | `SPEC_D12_COMPACTION_ANCHOR.md` | ✅ 待实现 |

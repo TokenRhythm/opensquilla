@@ -183,7 +183,6 @@ L0 无开关，始终启用（基础设施修复）。
 | 进度跟踪 | `PROGRESS.md` | ✅ |
 | 原始设计提案 | `DESIGN.md` | v1.1 |
 | 对齐记录 | `ALIGNMENT_2026-07-29.md` | ✅ |
-| Codex 对比分析 | `COMPARISON_CODEX.md` | ✅ |
 | L0 实现 spec | `SPEC_L0_ARCHIVED_TRANSCRIPT_SEARCH.md` | ✅ 已实现 |
 | D12 实现 spec | `SPEC_D12_COMPACTION_ANCHOR.md` | ✅ 已实现 |
 | L1 实现 spec | `SPEC_L1_CONSTRAINT_ANNOTATION.md` | ✅ 已实现 |
@@ -225,7 +224,6 @@ score = (
 ### 9.3 Flush
 `session_flush.py` 的 `CandidateKind` 直接映射到统一 ontology。无行为变更。
 
-### 9.4 Codex 对比借鉴
 
 | 借鉴 | 来源 | 纳入位置 |
 |------|------|---------|
