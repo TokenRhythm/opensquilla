@@ -9,8 +9,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .source_paths import is_searchable_source_path
 from .constraint_routing import QueryIntent, apply_constraint_boost, classify_query_intent
+from .source_paths import is_searchable_source_path
 from .store import LongTermMemoryStore
 from .types import (
     MemorySearchOpts,

@@ -27,7 +27,6 @@ from opensquilla.memory.constraint_routing import (
 )
 from opensquilla.memory.types import ConstraintType, MemorySearchResult, MemorySource
 
-
 # ── Helpers ───────────────────────────────────────────────────────────────
 
 
@@ -330,19 +329,13 @@ class TestRegressionNoOp:
                 f"fact should not have boost for {intent}"
             )
 
-    def test_avoid_failure_v07_empty_core_types(self):
-        """v0.7: avoid_failure boost map should not contain core types."""
+    def test_avoid_failure_v07_boosts_decision_and_procedure(self):
+        """v0.7: avoid_failure boosts decision (past choices) and procedure (fix steps)."""
         af_map = QUERY_INTENT_BOOST[QueryIntent.avoid_failure]
-        core = {
-            ConstraintType.fact,
-            ConstraintType.event,
-            ConstraintType.preference,
-            ConstraintType.decision,
-            ConstraintType.procedure,
-            ConstraintType.goal,
+        assert af_map == {
+            ConstraintType.decision: 1.2,
+            ConstraintType.procedure: 1.3,
         }
-        for ct in af_map:
-            assert ct not in core, f"v0.7 avoid_failure should not boost core type {ct}"
 
 
 # ── B6: Chinese Intent Expansion ────────────────────────────────────────────
@@ -366,7 +359,9 @@ class TestB6ChineseExpandedKeywords:
             "出错了",
         ]:
             intent, conf = classify_query_intent(q)
-            assert intent == QueryIntent.avoid_failure, f"Expected avoid_failure for: {q}, got {intent}"
+            assert intent == QueryIntent.avoid_failure, (
+                f"Expected avoid_failure for: {q}, got {intent}"
+            )
             assert conf == 0.7
 
     def test_continue_task_chinese_expanded(self):
@@ -381,7 +376,9 @@ class TestB6ChineseExpandedKeywords:
             "往下做",
         ]:
             intent, conf = classify_query_intent(q)
-            assert intent == QueryIntent.continue_task, f"Expected continue_task for: {q}, got {intent}"
+            assert intent == QueryIntent.continue_task, (
+                f"Expected continue_task for: {q}, got {intent}"
+            )
             assert conf == 0.7
 
     def test_retrieve_rationale_chinese_expanded(self):
@@ -395,7 +392,9 @@ class TestB6ChineseExpandedKeywords:
             "根本原因",
         ]:
             intent, conf = classify_query_intent(q)
-            assert intent == QueryIntent.retrieve_rationale, f"Expected retrieve_rationale for: {q}, got {intent}"
+            assert intent == QueryIntent.retrieve_rationale, (
+                f"Expected retrieve_rationale for: {q}, got {intent}"
+            )
             assert conf == 0.7
 
     def test_transfer_knowledge_chinese_expanded(self):
@@ -407,7 +406,9 @@ class TestB6ChineseExpandedKeywords:
             "相似的经验",
         ]:
             intent, conf = classify_query_intent(q)
-            assert intent == QueryIntent.transfer_knowledge, f"Expected transfer_knowledge for: {q}, got {intent}"
+            assert intent == QueryIntent.transfer_knowledge, (
+                f"Expected transfer_knowledge for: {q}, got {intent}"
+            )
             assert conf == 0.6
 
     def test_avoid_failure_english_expanded(self):
@@ -419,7 +420,9 @@ class TestB6ChineseExpandedKeywords:
             "the test is flaky",
         ]:
             intent, conf = classify_query_intent(q)
-            assert intent == QueryIntent.avoid_failure, f"Expected avoid_failure for: {q}, got {intent}"
+            assert intent == QueryIntent.avoid_failure, (
+                f"Expected avoid_failure for: {q}, got {intent}"
+            )
 
     def test_continue_task_english_expanded(self):
         for q in [
@@ -428,7 +431,9 @@ class TestB6ChineseExpandedKeywords:
             "carry on with the implementation",
         ]:
             intent, conf = classify_query_intent(q)
-            assert intent == QueryIntent.continue_task, f"Expected continue_task for: {q}, got {intent}"
+            assert intent == QueryIntent.continue_task, (
+                f"Expected continue_task for: {q}, got {intent}"
+            )
 
     def test_transfer_knowledge_english_expanded(self):
         for q in [
@@ -437,7 +442,9 @@ class TestB6ChineseExpandedKeywords:
             "looking for a comparable solution",
         ]:
             intent, conf = classify_query_intent(q)
-            assert intent == QueryIntent.transfer_knowledge, f"Expected transfer_knowledge for: {q}, got {intent}"
+            assert intent == QueryIntent.transfer_knowledge, (
+                f"Expected transfer_knowledge for: {q}, got {intent}"
+            )
 
 
 # ── B6: Negation Detection ─────────────────────────────────────────────────
@@ -459,7 +466,9 @@ class TestB6NegationDetection:
             "无异常",
         ]:
             intent, conf = classify_query_intent(q)
-            assert intent == QueryIntent.general, f"Expected general (negated) for: {q}, got {intent}"
+            assert intent == QueryIntent.general, (
+                f"Expected general (negated) for: {q}, got {intent}"
+            )
 
     def test_negation_blocks_continue_task(self):
         for q in [
@@ -468,7 +477,9 @@ class TestB6NegationDetection:
             "别继续了",
         ]:
             intent, conf = classify_query_intent(q)
-            assert intent == QueryIntent.general, f"Expected general (negated) for: {q}, got {intent}"
+            assert intent == QueryIntent.general, (
+                f"Expected general (negated) for: {q}, got {intent}"
+            )
 
     def test_negation_blocks_transfer_knowledge(self):
         intent, conf = classify_query_intent("没有类似经验")

@@ -16,6 +16,11 @@ import structlog
 
 from opensquilla.compat import aiosqlite
 
+from .constraint_classifier import (
+    LlmCallFn,
+    classify_constraint,
+    classify_constraint_sync,
+)
 from .embedding import (
     EmbeddingProvider,
     NullEmbeddingProvider,
@@ -34,11 +39,6 @@ from .types import (
     MemorySearchResult,
     MemorySource,
     SearchMode,
-)
-from .constraint_classifier import (
-    LlmCallFn,
-    classify_constraint,
-    classify_constraint_sync,
 )
 
 logger = structlog.get_logger(__name__)
@@ -971,7 +971,8 @@ class LongTermMemoryStore:
                     ct, conf = constraint_results[i]
                     try:
                         await self._db.execute(
-                            "UPDATE chunks SET constraint_type=?, constraint_confidence=? WHERE id=?",
+                            "UPDATE chunks SET constraint_type=?, constraint_confidence=?"
+                            " WHERE id=?",
                             (ct.value, conf, cid),
                         )
                     except Exception:

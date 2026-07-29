@@ -29,7 +29,6 @@ from opensquilla.memory.types import (
     ConstraintType,
 )
 
-
 # ── Signal Gate (D8) ──────────────────────────────────────────────────────
 
 
@@ -322,8 +321,8 @@ class TestStoreSchemaMigration:
     @pytest.mark.asyncio
     async def test_constraint_columns_added(self, tmp_path):
         """initialize() idempotently adds constraint_type and constraint_confidence."""
-        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.store import LongTermMemoryStore
 
         store = LongTermMemoryStore(
             db_path=str(tmp_path / "test_memory.db"),
@@ -341,8 +340,8 @@ class TestStoreSchemaMigration:
     @pytest.mark.asyncio
     async def test_constraint_columns_idempotent(self, tmp_path):
         """Calling initialize() twice doesn't error."""
-        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.store import LongTermMemoryStore
 
         store = LongTermMemoryStore(
             db_path=str(tmp_path / "test_memory.db"),
@@ -369,8 +368,8 @@ class TestStoreIndexFileAnnotation:
     @pytest.mark.asyncio
     async def test_annotation_off_default(self, tmp_path):
         """With annotation off, chunks get DEFAULT 'fact' and NULL confidence."""
-        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.types import MemorySource
 
         store = LongTermMemoryStore(
@@ -400,8 +399,8 @@ class TestStoreIndexFileAnnotation:
     @pytest.mark.asyncio
     async def test_annotation_on_classifies(self, tmp_path):
         """With annotation on, chunks get heuristic classification."""
-        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.types import MemorySource
 
         store = LongTermMemoryStore(
@@ -431,8 +430,8 @@ class TestStoreIndexFileAnnotation:
     @pytest.mark.asyncio
     async def test_frontmatter_override_in_store(self, tmp_path):
         """Frontmatter constraint_type overrides heuristic classification."""
-        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.types import MemorySource
 
         store = LongTermMemoryStore(
@@ -467,8 +466,8 @@ class TestStoreIndexFileAnnotation:
     @pytest.mark.asyncio
     async def test_annotation_off_no_regression(self, tmp_path):
         """With annotation off, index_file behaves exactly as before."""
-        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.types import MemorySource
 
         store = LongTermMemoryStore(
@@ -561,7 +560,8 @@ class TestA1TieredEscalation:
             return "event"
 
         # "决定" → decision, 0.6 >= threshold → LLM skipped
-        ct, conf = await classify_constraint("我们经过充分讨论后决定用 Python 做后端开发框架", llm_call=fake_llm)
+        text = "我们经过充分讨论后决定用 Python 做后端开发框架"
+        ct, conf = await classify_constraint(text, llm_call=fake_llm)
         assert ct == ConstraintType.decision
         assert conf == 0.6
         assert not llm_called, "LLM should NOT be called when heuristic confidence is high"
@@ -579,7 +579,8 @@ class TestA1TieredEscalation:
             return "event"
 
         # "昨天" → event, 0.5 < threshold → LLM called
-        ct, conf = await classify_constraint("昨天下午开会讨论了项目架构设计方案和技术选型", llm_call=fake_llm)
+        text = "昨天下午开会讨论了项目架构设计方案和技术选型"
+        ct, conf = await classify_constraint(text, llm_call=fake_llm)
         assert llm_called, "LLM should be called when heuristic confidence is low"
         assert ct == ConstraintType.event
         assert conf == 0.8  # LLM confidence (_LLM_CONFIDENCE)
@@ -589,7 +590,8 @@ class TestA1TieredEscalation:
         """When LLM is not available, low-confidence heuristic result is returned."""
         from opensquilla.memory.constraint_classifier import classify_constraint
 
-        ct, conf = await classify_constraint("昨天下午开会讨论了项目架构设计方案和技术选型", llm_call=None)
+        text = "昨天下午开会讨论了项目架构设计方案和技术选型"
+        ct, conf = await classify_constraint(text, llm_call=None)
         assert ct == ConstraintType.event
         assert conf == 0.5  # heuristic confidence
 
@@ -601,7 +603,8 @@ class TestA1TieredEscalation:
         async def failing_llm(prompt: str) -> str:
             return "bogus_response_that_wont_parse_to_any_type"
 
-        ct, conf = await classify_constraint("昨天下午开会讨论了项目架构设计方案和技术选型", llm_call=failing_llm)
+        text = "昨天下午开会讨论了项目架构设计方案和技术选型"
+        ct, conf = await classify_constraint(text, llm_call=failing_llm)
         assert ct == ConstraintType.event
         assert conf == 0.5
 
@@ -666,8 +669,8 @@ class TestA13StoreLlmInjection:
     @pytest.mark.asyncio
     async def test_llm_call_used_for_low_confidence(self, tmp_path):
         """Low-confidence heuristic text triggers LLM escalation via llm_call."""
-        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.types import MemorySource
 
         llm_calls: list[str] = []
@@ -687,7 +690,8 @@ class TestA13StoreLlmInjection:
             # "Yesterday we deployed..." has heuristic conf=0.5 < 0.6 → LLM escalated
             await store.index_file(
                 "memory/test.md",
-                "Yesterday we deployed the new version of the production environment system to the online server.",
+                "Yesterday we deployed the new version of the production"
+                " environment system to the online server.",
                 source=MemorySource.memory,
             )
             async with store._db.execute(
@@ -707,8 +711,8 @@ class TestA13StoreLlmInjection:
     @pytest.mark.asyncio
     async def test_llm_skipped_for_high_confidence(self, tmp_path):
         """High-confidence heuristic text (>= 0.6) skips LLM entirely."""
-        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.types import MemorySource
 
         llm_calls: list[str] = []
@@ -747,8 +751,8 @@ class TestA13StoreLlmInjection:
     @pytest.mark.asyncio
     async def test_llm_failure_falls_back_to_heuristic(self, tmp_path):
         """When LLM call raises, falls back to heuristic result."""
-        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.types import MemorySource
 
         async def failing_llm(prompt: str) -> str:
@@ -764,7 +768,8 @@ class TestA13StoreLlmInjection:
         try:
             await store.index_file(
                 "memory/test.md",
-                "Yesterday we deployed the new version of the production environment system to the online server.",
+                "Yesterday we deployed the new version of the production"
+                " environment system to the online server.",
                 source=MemorySource.memory,
             )
             async with store._db.execute(
@@ -782,8 +787,8 @@ class TestA13StoreLlmInjection:
     @pytest.mark.asyncio
     async def test_no_llm_call_uses_sync_fallback(self, tmp_path):
         """Without llm_call, store uses classify_constraint_sync (current behavior)."""
-        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.types import MemorySource
 
         store = LongTermMemoryStore(
@@ -796,7 +801,8 @@ class TestA13StoreLlmInjection:
         try:
             await store.index_file(
                 "memory/test.md",
-                "Yesterday we deployed the new version of the production environment system to the online server.",
+                "Yesterday we deployed the new version of the production"
+                " environment system to the online server.",
                 source=MemorySource.memory,
             )
             async with store._db.execute(
@@ -814,8 +820,8 @@ class TestA13StoreLlmInjection:
     @pytest.mark.asyncio
     async def test_annotation_off_ignores_llm_call(self, tmp_path):
         """With annotation disabled, llm_call is never invoked."""
-        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.types import MemorySource
 
         llm_calls: list[str] = []
