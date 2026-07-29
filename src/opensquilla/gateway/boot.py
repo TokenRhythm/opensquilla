@@ -3986,7 +3986,7 @@ async def start_gateway_server(
             build_dream=build_dream_factory(
                 config=config,
                 turn_runner=turn_runner,
-                memory_stores=memory_stores,
+                memory_stores=svc.memory_stores,
             ),
             should_skip=lambda: (
                 "disabled" if not getattr(config.memory.dream, "enabled", False) else None

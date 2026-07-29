@@ -15,7 +15,6 @@ from opensquilla.memory.dream.ranking import (
     rank_promotion_candidates,
 )
 
-
 # ── D11: Store-level usage tracking ──────────────────────────────────────
 
 
@@ -23,8 +22,8 @@ class TestChunkUsageSchema:
     @pytest.mark.asyncio
     async def test_chunk_usage_table_created(self, tmp_path):
         """initialize() creates chunk_usage table with correct columns."""
-        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.store import LongTermMemoryStore
 
         store = LongTermMemoryStore(
             db_path=str(tmp_path / "test.db"),
@@ -44,8 +43,8 @@ class TestChunkUsageSchema:
     @pytest.mark.asyncio
     async def test_index_exists(self, tmp_path):
         """idx_chunk_usage_chunk index is created."""
-        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.store import LongTermMemoryStore
 
         store = LongTermMemoryStore(
             db_path=str(tmp_path / "test.db"),
@@ -66,8 +65,8 @@ class TestRecordChunkUsage:
     @pytest.mark.asyncio
     async def test_increment_and_aggregate(self, tmp_path):
         """record_chunk_usage increments counts; get_usage_stats aggregates."""
-        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.types import MemorySource
 
         store = LongTermMemoryStore(
@@ -116,8 +115,8 @@ class TestRecordChunkUsage:
     @pytest.mark.asyncio
     async def test_empty_chunk_ids_noop(self, tmp_path):
         """record_chunk_usage with empty list is a no-op."""
-        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.store import LongTermMemoryStore
 
         store = LongTermMemoryStore(
             db_path=str(tmp_path / "test.db"),
@@ -134,8 +133,8 @@ class TestRecordChunkUsage:
     @pytest.mark.asyncio
     async def test_get_usage_stats_empty_paths(self, tmp_path):
         """get_usage_stats with empty paths returns empty dict."""
-        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.store import LongTermMemoryStore
 
         store = LongTermMemoryStore(
             db_path=str(tmp_path / "test.db"),
@@ -152,8 +151,8 @@ class TestDominantConstraintTypes:
     @pytest.mark.asyncio
     async def test_dominant_type_by_confidence(self, tmp_path):
         """get_dominant_constraint_types returns type with highest total confidence."""
-        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.types import MemorySource
 
         store = LongTermMemoryStore(
@@ -176,8 +175,8 @@ class TestDominantConstraintTypes:
     @pytest.mark.asyncio
     async def test_no_annotated_chunks(self, tmp_path):
         """Files without annotated chunks return empty result."""
-        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.types import MemorySource
 
         store = LongTermMemoryStore(
@@ -199,8 +198,8 @@ class TestDominantConstraintTypes:
 
     @pytest.mark.asyncio
     async def test_empty_paths_returns_empty(self, tmp_path):
-        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.store import LongTermMemoryStore
 
         store = LongTermMemoryStore(
             db_path=str(tmp_path / "test.db"),
@@ -220,9 +219,9 @@ class TestRetrieverUsageTracking:
     @pytest.mark.asyncio
     async def test_search_triggers_usage_write(self, tmp_path):
         """search() with usage_tracking_enabled fires record_chunk_usage."""
-        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.embedding import NullEmbeddingProvider
         from opensquilla.memory.retrieval import MemoryRetriever
+        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.types import MemorySource
 
         store = LongTermMemoryStore(
@@ -256,9 +255,9 @@ class TestRetrieverUsageTracking:
     @pytest.mark.asyncio
     async def test_usage_tracking_disabled_no_write(self, tmp_path):
         """search() with usage_tracking_enabled=False does not write usage."""
-        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.embedding import NullEmbeddingProvider
         from opensquilla.memory.retrieval import MemoryRetriever
+        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.types import MemorySource
 
         store = LongTermMemoryStore(
@@ -286,9 +285,9 @@ class TestRetrieverUsageTracking:
     @pytest.mark.asyncio
     async def test_usage_tracking_property(self, tmp_path):
         """usage_tracking_enabled property reflects constructor arg."""
-        from opensquilla.memory.store import LongTermMemoryStore
         from opensquilla.memory.embedding import NullEmbeddingProvider
         from opensquilla.memory.retrieval import MemoryRetriever
+        from opensquilla.memory.store import LongTermMemoryStore
 
         store = LongTermMemoryStore(
             db_path=str(tmp_path / "test.db"),

@@ -2,18 +2,13 @@
 
 from __future__ import annotations
 
-import pytest
-
 from opensquilla.memory.constraint_routing import QueryIntent
 from opensquilla.memory.sufficiency_check import (
-    SUFFICIENCY_CONFIDENCE_THRESHOLD,
-    SUFFICIENCY_RESULT_THRESHOLD,
     format_sufficiency_note,
     maybe_append_sufficiency_note,
     query_is_cjk,
     should_emit_sufficiency_note,
 )
-
 
 # ── query_is_cjk ──────────────────────────────────────────────────────────
 

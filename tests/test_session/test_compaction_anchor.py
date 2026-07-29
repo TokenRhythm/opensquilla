@@ -24,7 +24,6 @@ from opensquilla.session.models import (
 )
 from opensquilla.session.storage import SessionStorage
 
-
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 
@@ -170,10 +169,11 @@ async def test_anchor_archive_and_lookup(tmp_path) -> None:
         node = _node("agent:main:webchat:anchor-test", "sid-anchor")
         await storage.upsert_session(node)
 
+        sk = "agent:main:webchat:anchor-test"
         entries = [
-            _entry("sid-anchor", "agent:main:webchat:anchor-test", "user", "first message", created_at=100),
-            _entry("sid-anchor", "agent:main:webchat:anchor-test", "assistant", "second message", created_at=200),
-            _entry("sid-anchor", "agent:main:webchat:anchor-test", "user", "third message", created_at=300),
+            _entry("sid-anchor", sk, "user", "first message", created_at=100),
+            _entry("sid-anchor", sk, "assistant", "second message", created_at=200),
+            _entry("sid-anchor", sk, "user", "third message", created_at=300),
         ]
 
         summary = SessionSummary(
@@ -301,8 +301,9 @@ async def test_anchor_disabled_no_anchor_ids(tmp_path) -> None:
         node = _node("agent:main:webchat:no-anchor", "sid-no-anchor")
         await storage.upsert_session(node)
 
+        sk = "agent:main:webchat:no-anchor"
         entries = [
-            _entry("sid-no-anchor", "agent:main:webchat:no-anchor", "user", "hello", created_at=100),
+            _entry("sid-no-anchor", sk, "user", "hello", created_at=100),
         ]
         summary = SessionSummary(
             session_id="sid-no-anchor",

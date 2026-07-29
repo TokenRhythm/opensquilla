@@ -33,9 +33,9 @@ from opensquilla.memory.constraint_routing import (
     format_provenance_marker,
     should_add_provenance_marker,
 )
-from opensquilla.memory.sufficiency_check import maybe_append_sufficiency_note
 from opensquilla.memory.redaction import redact_memory_text
 from opensquilla.memory.source_paths import is_memory_source_path, is_searchable_source_path
+from opensquilla.memory.sufficiency_check import maybe_append_sufficiency_note
 from opensquilla.memory.types import (
     DEFAULT_MEMORY_SEARCH_MIN_SCORE,
     DEFAULT_MEMORY_SEARCH_RESULTS,

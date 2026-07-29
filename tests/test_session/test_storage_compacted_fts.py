@@ -16,7 +16,6 @@ from opensquilla.session.models import (
 )
 from opensquilla.session.storage import SessionStorage
 
-
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 

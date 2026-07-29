@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import time
 
-import pytest
-
 from opensquilla.memory.dream.candidates import scan_dream_candidates
 
 
