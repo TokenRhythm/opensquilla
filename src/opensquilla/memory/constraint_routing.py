@@ -37,8 +37,10 @@ _INTENT_PATTERNS: list[tuple[re.Pattern[str], QueryIntent, float]] = [
     # avoid_failure — highest priority (error avoidance is safety-critical)
     (
         re.compile(
-            r"\b(problem|error|wrong|bug|fail|crash|broken|issue)\b"
-            r"|(问题|错误|失败|崩溃|故障|异常|报错)",
+            r"\b(problem|error|wrong|bug|fail(?:ed|ure|ing)?|crash(?:ed|es)?|broken|issue|exception"
+            r"|traceback|panic|fatal|regression|flaky|timeout|deadlock)\b"
+            r"|(问题|错误|失败|崩溃|故障|异常|报错|出错|挂了|挂了|宕机"
+            r"|卡死|超时|死锁|回滚|紧急|严重|阻塞|不工作|跑不通)",
             re.IGNORECASE,
         ),
         QueryIntent.avoid_failure,
@@ -47,8 +49,10 @@ _INTENT_PATTERNS: list[tuple[re.Pattern[str], QueryIntent, float]] = [
     # continue_task — resume/continue
     (
         re.compile(
-            r"\b(continue|resume|next step|pick up|where (was|are) we)\b"
-            r"|(继续|接着|上次|接下来|下一步|接着做)",
+            r"\b(continue|resume|next step|pick up|where (was|are) we"
+            r"|carry on|move on|proceed|what.s next)\b"
+            r"|(继续|接着|上次|接下来|下一步|接着做|回到|进展|做到哪"
+            r"|停在哪|还没做完|待完成|后续|往下)",
             re.IGNORECASE,
         ),
         QueryIntent.continue_task,
@@ -57,8 +61,10 @@ _INTENT_PATTERNS: list[tuple[re.Pattern[str], QueryIntent, float]] = [
     # retrieve_rationale — why/reason
     (
         re.compile(
-            r"\b(why|reason|rationale|because|explain)\b"
-            r"|(为什么|原因|怎么回事|为何|理由)",
+            r"\b(why|reason|rationale|because|explain|justification"
+            r"|motivation|root cause)\b"
+            r"|(为什么|原因|怎么回事|为何|理由|为啥|凭什么|根据什么"
+            r"|出于什么|动机|根因|根本原因|解释)",
             re.IGNORECASE,
         ),
         QueryIntent.retrieve_rationale,
@@ -67,8 +73,10 @@ _INTENT_PATTERNS: list[tuple[re.Pattern[str], QueryIntent, float]] = [
     # transfer_knowledge — similar/before
     (
         re.compile(
-            r"\b(similar|like before|same as|analogous|experience)\b"
-            r"|(类似|有没有经验|以前|之前做过|同样)",
+            r"\b(similar|like before|same as|analogous|experience"
+            r"|precedent|prior art|reference|comparable)\b"
+            r"|(类似|有没有经验|以前|之前做过|同样|参考|先例|借鉴"
+            r"|有没有先例|类似情况|同类|相似)",
             re.IGNORECASE,
         ),
         QueryIntent.transfer_knowledge,
@@ -77,14 +85,46 @@ _INTENT_PATTERNS: list[tuple[re.Pattern[str], QueryIntent, float]] = [
 ]
 
 
+# B6: Negation prefix detection for Chinese queries.
+# "没有问题" / "不是错误" should NOT match avoid_failure.
+_NEGATION_PREFIX_RE = re.compile(
+    r"(没有|不是|不存在|无需|不用|别|不要|没|未|无|非)"
+)
+# Interrogative markers that contain negation words but are NOT negations.
+# e.g. "有没有X" = "is there any X", "是不是X" = "is it X".
+_INTERROGATIVE_RE = re.compile(r"(有没有|是不是|会不会|能不能|可不可以)")
+
+
+def _has_negation_before_match(query: str, match_start: int) -> bool:
+    """Check if a negation word immediately precedes the match position.
+
+    Looks at up to 5 characters before match_start for Chinese negation prefixes.
+    Interrogative markers (有没有, 是不是, etc.) are excluded because they
+    are questions, not negations.
+    """
+    prefix_window = query[max(0, match_start - 5):match_start]
+    # Exclude interrogative markers first
+    if _INTERROGATIVE_RE.search(prefix_window):
+        return False
+    return bool(_NEGATION_PREFIX_RE.search(prefix_window))
+
+
 def classify_query_intent(query: str) -> tuple[QueryIntent, float]:
     """Classify query intent using keyword heuristics.
 
     Returns (intent, confidence). Default: (general, 0.5).
     Confidence < 0.7 means L3 sufficiency check won't trigger (D4).
+
+    B6: Chinese negation detection — if a keyword match is immediately
+    preceded by a negation word (e.g. "没有问题"), the match is rejected
+    and classification falls through to the next pattern or general.
     """
     for pattern, intent, confidence in _INTENT_PATTERNS:
-        if pattern.search(query):
+        m = pattern.search(query)
+        if m:
+            # B6: reject match if negated (Chinese only, English handled by \b)
+            if _has_negation_before_match(query, m.start()):
+                continue
             return intent, confidence
     return QueryIntent.general, 0.5
 

@@ -1,9 +1,10 @@
 """Constraint type classifier for memory chunks (L1).
 
-Implements the three-tier classification pipeline:
+Implements the tiered escalation classification pipeline (A1):
 1. Signal Gate: skip low-signal chunks (saves 30-40% LLM calls)
-2. LLM classification (primary path)
-3. Heuristic keyword matching (fallback)
+2. Heuristic keyword matching (fast path, high-confidence accepted directly)
+3. LLM escalation (only for low-confidence chunks, ~25% of traffic)
+4. Heuristic fallback (when LLM unavailable or fails)
 
 Design principles (aligned 2026-07-29):
 - Wrong classification is worse than no classification
@@ -154,6 +155,11 @@ Reply with ONLY the type name."""
 _LLM_CONFIDENCE = 0.8
 _LLM_MAX_CHUNK_CHARS = 2000  # truncate to avoid token limits
 
+# A1: heuristic confidence >= this threshold -> accept directly, skip LLM.
+# Aligned with L2 CONFIDENCE_THRESHOLD (0.6) so heuristic-accepted chunks
+# receive boost in retrieval routing.
+_HEURISTIC_ACCEPT_THRESHOLD = 0.6
+
 
 async def llm_classify(
     text: str,
@@ -249,11 +255,13 @@ async def classify_constraint(
 ) -> tuple[ConstraintType, float | None]:
     """Classify a memory chunk into a constraint type.
 
-    Pipeline:
+    Pipeline (A1 tiered escalation, aligned 2026-07-29):
     1. Frontmatter override → (type, 1.0)
-    2. Signal Gate → skip → (fact, None)
-    3. LLM classification → (type, 0.8)
-    4. Heuristic fallback → (type, 0.4-0.6)
+    2. Inline constraint marker → (type, 0.9)
+    3. Signal Gate → skip → (fact, None)
+    4. Heuristic first → conf >= 0.6 → accept directly (no LLM cost)
+    5. LLM escalation → only for low-confidence heuristic (conf < 0.6)
+    6. Fallback → heuristic result (if LLM unavailable or fails)
 
     Returns (constraint_type, confidence).
     Confidence is None when skipped by Signal Gate (means "not annotated").
@@ -272,14 +280,19 @@ async def classify_constraint(
     if not should_classify(text):
         return ConstraintType.fact, None
 
-    # 3. LLM classification (if available)
+    # 4. Heuristic first (A1: cost-efficient, high-confidence accepted directly)
+    h_type, h_conf = heuristic_classify(text)
+    if h_conf >= _HEURISTIC_ACCEPT_THRESHOLD:
+        return h_type, h_conf
+
+    # 5. LLM escalation (A1: only for low-confidence heuristic results)
     if llm_call is not None:
         result = await llm_classify(text, llm_call)
         if result is not None:
             return result
 
-    # 4. Heuristic fallback
-    return heuristic_classify(text)
+    # 6. Fallback to heuristic result
+    return h_type, h_conf
 
 
 def classify_constraint_sync(text: str) -> tuple[ConstraintType, float | None]:

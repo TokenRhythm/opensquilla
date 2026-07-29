@@ -343,3 +343,199 @@ class TestRegressionNoOp:
         }
         for ct in af_map:
             assert ct not in core, f"v0.7 avoid_failure should not boost core type {ct}"
+
+
+# ── B6: Chinese Intent Expansion ────────────────────────────────────────────
+
+
+class TestB6ChineseExpandedKeywords:
+    """B6: expanded Chinese keyword patterns for all 4 intents."""
+
+    def test_avoid_failure_chinese_expanded(self):
+        for q in [
+            "系统挂了",
+            "服务宕机了",
+            "请求超时了",
+            "死锁了",
+            "回滚失败",
+            "紧急修复",
+            "严重bug",
+            "阻塞了",
+            "不工作了",
+            "跑不通",
+            "出错了",
+        ]:
+            intent, conf = classify_query_intent(q)
+            assert intent == QueryIntent.avoid_failure, f"Expected avoid_failure for: {q}, got {intent}"
+            assert conf == 0.7
+
+    def test_continue_task_chinese_expanded(self):
+        for q in [
+            "回到之前的话题",
+            "进展如何了",
+            "做到哪儿了",
+            "停在哪里了",
+            "还没做完",
+            "待完成的任务",
+            "后续步骤",
+            "往下做",
+        ]:
+            intent, conf = classify_query_intent(q)
+            assert intent == QueryIntent.continue_task, f"Expected continue_task for: {q}, got {intent}"
+            assert conf == 0.7
+
+    def test_retrieve_rationale_chinese_expanded(self):
+        for q in [
+            "为啥这么做",
+            "凭什么",
+            "根据什么",
+            "出于什么原因",
+            "动机是什么",
+            "根因是什么",
+            "根本原因",
+        ]:
+            intent, conf = classify_query_intent(q)
+            assert intent == QueryIntent.retrieve_rationale, f"Expected retrieve_rationale for: {q}, got {intent}"
+            assert conf == 0.7
+
+    def test_transfer_knowledge_chinese_expanded(self):
+        for q in [
+            "参考一下",
+            "有没有先例",
+            "借鉴一下",
+            "类似情况",
+            "相似的经验",
+        ]:
+            intent, conf = classify_query_intent(q)
+            assert intent == QueryIntent.transfer_knowledge, f"Expected transfer_knowledge for: {q}, got {intent}"
+            assert conf == 0.6
+
+    def test_avoid_failure_english_expanded(self):
+        for q in [
+            "got an exception in the parser",
+            "the request timeout after 30s",
+            "there is a deadlock in the database",
+            "fatal error in production",
+            "the test is flaky",
+        ]:
+            intent, conf = classify_query_intent(q)
+            assert intent == QueryIntent.avoid_failure, f"Expected avoid_failure for: {q}, got {intent}"
+
+    def test_continue_task_english_expanded(self):
+        for q in [
+            "proceed with the deployment",
+            "what's next on the agenda",
+            "carry on with the implementation",
+        ]:
+            intent, conf = classify_query_intent(q)
+            assert intent == QueryIntent.continue_task, f"Expected continue_task for: {q}, got {intent}"
+
+    def test_transfer_knowledge_english_expanded(self):
+        for q in [
+            "is there a precedent for this approach",
+            "any prior art on this topic",
+            "looking for a comparable solution",
+        ]:
+            intent, conf = classify_query_intent(q)
+            assert intent == QueryIntent.transfer_knowledge, f"Expected transfer_knowledge for: {q}, got {intent}"
+
+
+# ── B6: Negation Detection ─────────────────────────────────────────────────
+
+
+class TestB6NegationDetection:
+    """B6: negation words should prevent keyword matching."""
+
+    def test_negation_blocks_avoid_failure(self):
+        for q in [
+            "没有问题",
+            "没有错误",
+            "不是bug",
+            "不存在故障",
+            "无需修复",
+            "不要报错",
+            "没失败",
+            "未崩溃",
+            "无异常",
+        ]:
+            intent, conf = classify_query_intent(q)
+            assert intent == QueryIntent.general, f"Expected general (negated) for: {q}, got {intent}"
+
+    def test_negation_blocks_continue_task(self):
+        for q in [
+            "没有继续做",
+            "不要接着",
+            "别继续了",
+        ]:
+            intent, conf = classify_query_intent(q)
+            assert intent == QueryIntent.general, f"Expected general (negated) for: {q}, got {intent}"
+
+    def test_negation_blocks_transfer_knowledge(self):
+        intent, conf = classify_query_intent("没有类似经验")
+        assert intent == QueryIntent.general
+
+    def test_negation_only_blocks_when_adjacent(self):
+        """Negation must be immediately before the keyword, not far away."""
+        # "崩溃" is far from "没有" (separated by "关系，但是服务")
+        intent, conf = classify_query_intent("没有关系，但是服务崩溃了")
+        assert intent == QueryIntent.avoid_failure
+
+    def test_positive_still_works_after_negation_feature(self):
+        """Non-negated queries should still match correctly."""
+        intent, conf = classify_query_intent("这里有个问题需要解决")
+        assert intent == QueryIntent.avoid_failure
+
+
+# ── B6: Interrogative Exclusion ─────────────────────────────────────────────
+
+
+class TestB6InterrogativeExclusion:
+    """B6: interrogative markers should NOT be treated as negations."""
+
+    def test_youmeiyou_does_not_block_avoid_failure(self):
+        # "有没有问题" = "is there a problem" → should match
+        intent, conf = classify_query_intent("有没有问题")
+        assert intent == QueryIntent.avoid_failure
+
+    def test_youmeiyou_does_not_block_transfer(self):
+        # "有没有类似的经验可以借鉴？" → should match transfer_knowledge
+        intent, conf = classify_query_intent("有没有类似的经验可以借鉴？")
+        assert intent == QueryIntent.transfer_knowledge
+
+    def test_shibushi_does_not_block(self):
+        intent, conf = classify_query_intent("是不是可以继续了")
+        assert intent == QueryIntent.continue_task
+
+    def test_huibuhui_does_not_block(self):
+        intent, conf = classify_query_intent("会不会失败")
+        assert intent == QueryIntent.avoid_failure
+
+    def test_nengbuneng_does_not_block(self):
+        intent, conf = classify_query_intent("能不能解释一下原因")
+        assert intent == QueryIntent.retrieve_rationale
+
+    def test_keyibukei_does_not_block(self):
+        intent, conf = classify_query_intent("可不可以解释")
+        assert intent == QueryIntent.retrieve_rationale
+
+
+# ── B6: English Regression ─────────────────────────────────────────────────
+
+
+class TestB6EnglishRegression:
+    """B6 changes should not affect English keyword matching."""
+
+    def test_english_avoid_failure(self):
+        for q in ["there is a problem", "got an error", "it crashed"]:
+            intent, conf = classify_query_intent(q)
+            assert intent == QueryIntent.avoid_failure
+
+    def test_english_continue_task(self):
+        intent, conf = classify_query_intent("continue from where we left off")
+        assert intent == QueryIntent.continue_task
+
+    def test_english_negation_known_limitation(self):
+        """English negation is not handled (v0.7 scope, documented in B6 spec)."""
+        # "no problem" still matches avoid_failure — known limitation
+        intent, conf = classify_query_intent("no problem, everything is fine")
+        assert intent == QueryIntent.avoid_failure  # documented limitation

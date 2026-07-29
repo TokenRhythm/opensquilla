@@ -512,3 +512,146 @@ class TestConfigIntegration:
 
         cfg = MemoryExperimentalConfig(constraint_annotation=True)
         assert cfg.constraint_annotation is True
+
+
+# ── A1: Tiered Escalation Pipeline ──────────────────────────────────────────
+
+
+class TestA1TieredEscalation:
+    """A1: heuristic-first with LLM escalation for low-confidence chunks."""
+
+    def test_heuristic_high_confidence_accepted_directly(self):
+        """Heuristic confidence >= 0.6 should be accepted without LLM call."""
+        from opensquilla.memory.constraint_classifier import (
+            _HEURISTIC_ACCEPT_THRESHOLD,
+            heuristic_classify,
+        )
+        # "decided" → decision, confidence 0.6
+        h_type, h_conf = heuristic_classify("we decided to use Python for the backend")
+        assert h_type == ConstraintType.decision
+        assert h_conf >= _HEURISTIC_ACCEPT_THRESHOLD
+
+    def test_heuristic_low_confidence_below_threshold(self):
+        """Heuristic confidence < 0.6 should NOT be treated as final."""
+        from opensquilla.memory.constraint_classifier import (
+            _HEURISTIC_ACCEPT_THRESHOLD,
+            heuristic_classify,
+        )
+        # "yesterday" → event, confidence 0.5 (below threshold)
+        h_type, h_conf = heuristic_classify("yesterday we had a long meeting about architecture")
+        assert h_type == ConstraintType.event
+        assert h_conf < _HEURISTIC_ACCEPT_THRESHOLD
+
+    def test_threshold_consistent_with_l2(self):
+        """A1 _HEURISTIC_ACCEPT_THRESHOLD must equal L2 CONFIDENCE_THRESHOLD."""
+        from opensquilla.memory.constraint_classifier import _HEURISTIC_ACCEPT_THRESHOLD
+        from opensquilla.memory.constraint_routing import CONFIDENCE_THRESHOLD
+        assert _HEURISTIC_ACCEPT_THRESHOLD == CONFIDENCE_THRESHOLD
+
+    @pytest.mark.asyncio
+    async def test_high_confidence_skips_llm(self):
+        """LLM call should NOT be invoked when heuristic confidence >= 0.6."""
+        from opensquilla.memory.constraint_classifier import classify_constraint
+
+        llm_called = False
+
+        async def fake_llm(prompt: str) -> str:
+            nonlocal llm_called
+            llm_called = True
+            return "event"
+
+        # "决定" → decision, 0.6 >= threshold → LLM skipped
+        ct, conf = await classify_constraint("我们经过充分讨论后决定用 Python 做后端开发框架", llm_call=fake_llm)
+        assert ct == ConstraintType.decision
+        assert conf == 0.6
+        assert not llm_called, "LLM should NOT be called when heuristic confidence is high"
+
+    @pytest.mark.asyncio
+    async def test_low_confidence_triggers_llm(self):
+        """LLM call should be invoked when heuristic confidence < 0.6."""
+        from opensquilla.memory.constraint_classifier import classify_constraint
+
+        llm_called = False
+
+        async def fake_llm(prompt: str) -> str:
+            nonlocal llm_called
+            llm_called = True
+            return "event"
+
+        # "昨天" → event, 0.5 < threshold → LLM called
+        ct, conf = await classify_constraint("昨天下午开会讨论了项目架构设计方案和技术选型", llm_call=fake_llm)
+        assert llm_called, "LLM should be called when heuristic confidence is low"
+        assert ct == ConstraintType.event
+        assert conf == 0.8  # LLM confidence (_LLM_CONFIDENCE)
+
+    @pytest.mark.asyncio
+    async def test_llm_unavailable_falls_back_to_heuristic(self):
+        """When LLM is not available, low-confidence heuristic result is returned."""
+        from opensquilla.memory.constraint_classifier import classify_constraint
+
+        ct, conf = await classify_constraint("昨天下午开会讨论了项目架构设计方案和技术选型", llm_call=None)
+        assert ct == ConstraintType.event
+        assert conf == 0.5  # heuristic confidence
+
+    @pytest.mark.asyncio
+    async def test_llm_parse_failure_falls_back(self):
+        """When LLM returns unparseable response, fall back to heuristic."""
+        from opensquilla.memory.constraint_classifier import classify_constraint
+
+        async def failing_llm(prompt: str) -> str:
+            return "bogus_response_that_wont_parse_to_any_type"
+
+        ct, conf = await classify_constraint("昨天下午开会讨论了项目架构设计方案和技术选型", llm_call=failing_llm)
+        assert ct == ConstraintType.event
+        assert conf == 0.5
+
+    @pytest.mark.asyncio
+    async def test_inline_marker_bypasses_heuristic_and_llm(self):
+        """Inline marker (B4 path) should be resolved before heuristic/LLM."""
+        from opensquilla.memory.constraint_classifier import classify_constraint
+
+        llm_called = False
+
+        async def fake_llm(prompt: str) -> str:
+            nonlocal llm_called
+            llm_called = True
+            return "fact"
+
+        text = "<!-- opensquilla-constraint: decision --> we discussed something yesterday"
+        ct, conf = await classify_constraint(text, llm_call=fake_llm)
+        assert ct == ConstraintType.decision
+        assert conf == 0.9
+        assert not llm_called, "Inline marker should bypass both heuristic and LLM"
+
+    @pytest.mark.asyncio
+    async def test_frontmatter_still_highest_priority(self):
+        """Frontmatter override should bypass everything."""
+        from opensquilla.memory.constraint_classifier import classify_constraint
+
+        async def fake_llm(prompt: str) -> str:
+            return "event"
+
+        text = "---\nconstraint_type: goal\n---\nWe decided something important."
+        ct, conf = await classify_constraint(text, llm_call=fake_llm)
+        assert ct == ConstraintType.goal
+        assert conf == 1.0
+
+
+class TestA1SyncPath:
+    """Sync path (classify_constraint_sync) should use heuristic-only (no escalation)."""
+
+    def test_sync_high_confidence(self):
+        ct, conf = classify_constraint_sync("我们最终决定采用 Redis 作为分布式缓存方案")
+        assert ct == ConstraintType.decision
+        assert conf == 0.6
+
+    def test_sync_low_confidence(self):
+        ct, conf = classify_constraint_sync("昨天下午我们部署了新版本的生产环境系统到线上服务器")
+        assert ct == ConstraintType.event
+        assert conf == 0.5
+
+    def test_sync_inline_marker(self):
+        text = "<!-- opensquilla-constraint: procedure --> install the package"
+        ct, conf = classify_constraint_sync(text)
+        assert ct == ConstraintType.procedure
+        assert conf == 0.9
