@@ -1035,6 +1035,7 @@ class SessionManager:
                         SessionSummary(
                             session_id=child.session_id,
                             session_key=new_session_key,
+                            compaction_index=summary.compaction_index,
                             compaction_id=summary.compaction_id,
                             trigger_reason=summary.trigger_reason,
                             summary_text=summary.summary_text,
@@ -1050,9 +1051,11 @@ class SessionManager:
                             kept_count=summary.kept_count,
                             chunk_count=summary.chunk_count,
                             flush_receipt_status=summary.flush_receipt_status,
+                            extracted_anchors=summary.extracted_anchors,
                             covered_through_id=summary.covered_through_id,
                             created_at=summary.created_at,
-                        )
+                        ),
+                        preserve_compaction_index=True,
                     )
                 for state in parent_context_states:
                     await self._storage.save_context_state(

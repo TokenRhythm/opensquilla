@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib
 import json
@@ -20,6 +21,7 @@ from .constraint_classifier import (
     LlmCallFn,
     classify_constraint,
     classify_constraint_sync,
+    parse_frontmatter_constraint,
 )
 from .embedding import (
     EmbeddingProvider,
@@ -36,6 +38,7 @@ from .types import (
     LEXICAL_GUARANTEE_METADATA_VALUE,
     RELAXED_KEYWORD_MATCH_METADATA_KEY,
     RELAXED_KEYWORD_MATCH_METADATA_VALUE,
+    ConstraintType,
     MemorySearchResult,
     MemorySource,
     SearchMode,
@@ -214,6 +217,7 @@ class LongTermMemoryStore:
         self._vec_available = False
         self._fts_available = False
         self._db: aiosqlite.Connection | None = None
+        self._write_lock = asyncio.Lock()
         self._dirty = False
         self._constraint_annotation_enabled = constraint_annotation_enabled
         # A1-3: LLM call for tiered escalation classification in index_file.
@@ -288,6 +292,14 @@ class LongTermMemoryStore:
             fts_tokenizer="unicode61",
             sources=["memory", "sessions"],
             provider_fingerprint=self._provider_fingerprint(),
+            constraint_annotation_version=(
+                "v1-llm"
+                if self._constraint_annotation_enabled
+                and self._constraint_llm_call is not None
+                else "v1-heuristic"
+                if self._constraint_annotation_enabled
+                else "off"
+            ),
         )
 
         async with self._db.execute(
@@ -305,6 +317,7 @@ class LongTermMemoryStore:
             )
             # Clear all indexed data so next file sync rebuilds from disk.
             await self._db.execute("DELETE FROM chunks_fts")
+            await self._db.execute("DELETE FROM chunk_usage")
             await self._db.execute("DELETE FROM chunks")
             await self._db.execute("DELETE FROM files")
             if self._vec_available:
@@ -433,6 +446,10 @@ class LongTermMemoryStore:
 
         # D11: Usage tracking table (always created, gated by feature flag at write time)
         await self._db.executescript(DDL_CHUNK_USAGE)
+        await self._db.execute(
+            "DELETE FROM chunk_usage "
+            "WHERE chunk_id NOT IN (SELECT id FROM chunks)"
+        )
 
         # --- Schema version check ---
         async with self._db.execute("SELECT value FROM meta WHERE key = ?", (META_KEY,)) as cur:
@@ -448,6 +465,7 @@ class LongTermMemoryStore:
             await self._db.execute("DROP TABLE IF EXISTS chunks")
             await self._db.execute("DROP TABLE IF EXISTS files")
             await self._db.execute("DROP TABLE IF EXISTS embedding_cache")
+            await self._db.execute("DELETE FROM chunk_usage")
             try:
                 await self._db.execute("DROP TABLE IF EXISTS chunks_vec")
             except Exception:
@@ -548,21 +566,23 @@ class LongTermMemoryStore:
             return
         try:
             now = time.time()
-            await self._db.execute("BEGIN IMMEDIATE")
-            try:
+            async with self._write_lock:
+                await self._db.execute("BEGIN IMMEDIATE")
                 for cid in chunk_ids:
                     await self._db.execute(
                         "INSERT INTO chunk_usage (chunk_id, intent, recall_count, last_recalled_at)"
-                        " VALUES (?, ?, 1, ?)"
+                        " SELECT ?, ?, 1, ?"
+                        " WHERE EXISTS (SELECT 1 FROM chunks WHERE id = ?)"
                         " ON CONFLICT(chunk_id, intent) DO UPDATE SET"
                         " recall_count = recall_count + 1, last_recalled_at = ?",
-                        (cid, intent, now, now),
+                        (cid, intent, now, cid, now),
                     )
                 await self._db.commit()
-            except BaseException:
-                await self._db.rollback()
-                raise
         except Exception:
+            try:
+                await self._db.rollback()
+            except Exception:
+                pass
             logger.debug("chunk_usage_record_failed", exc_info=True)
 
     async def get_usage_stats(self, paths: list[str]) -> dict[str, dict]:
@@ -756,6 +776,7 @@ class LongTermMemoryStore:
 
         provider_id, model, provider_key = self._cache_key_prefix()
         now = time.time()
+        await self._write_lock.acquire()
         try:
             for h, vec in items:
                 await self._db.execute(
@@ -788,6 +809,8 @@ class LongTermMemoryStore:
                 logger.warning("embedding_cache_table_missing", error=str(exc))
                 return
             logger.warning("embedding_cache_write_failed", error=str(exc))
+        finally:
+            self._write_lock.release()
 
     async def _embed_query_cached(self, query: str) -> list[float]:
         """Embed a search query with the same rebuildable cache used for chunks."""
@@ -904,22 +927,29 @@ class LongTermMemoryStore:
 
         # A1-3: Pre-compute constraint types OUTSIDE the transaction (LLM I/O
         # must not hold the DB lock). Mirrors the embeddings pattern above.
-        constraint_results: list[tuple] | None = None
+        constraint_results: list[tuple[ConstraintType, float | None]] | None = None
         if self._constraint_annotation_enabled:
             constraint_results = []
+            file_override = parse_frontmatter_constraint(content)
             for _cid, _p, _src, _sl, _el, _h, _mdl, txt, _ts in chunk_records:
-                try:
-                    ct, conf = await classify_constraint(
-                        txt, llm_call=self._constraint_llm_call
-                    )
-                except Exception:
-                    ct, conf = classify_constraint_sync(txt)
+                ct: ConstraintType
+                conf: float | None
+                if file_override is not None:
+                    ct, conf = file_override, 1.0
+                else:
+                    try:
+                        ct, conf = await classify_constraint(
+                            txt, llm_call=self._constraint_llm_call
+                        )
+                    except Exception:
+                        ct, conf = classify_constraint_sync(txt)
                 constraint_results.append((ct, conf))
 
         # Wrap all SQLite mutations in an explicit transaction so a crash mid-operation
         # leaves the DB in a consistent state (either fully updated or fully rolled back).
-        await self._db.execute("BEGIN IMMEDIATE")
+        await self._write_lock.acquire()
         try:
+            await self._db.execute("BEGIN IMMEDIATE")
             # Delete old chunks — vec first (needs chunk IDs before they're deleted)
             if self._vec_available:
                 try:
@@ -930,6 +960,11 @@ class LongTermMemoryStore:
                 except Exception:
                     pass
             await self._db.execute("DELETE FROM chunks_fts WHERE path = ?", (path,))
+            await self._db.execute(
+                "DELETE FROM chunk_usage "
+                "WHERE chunk_id IN (SELECT id FROM chunks WHERE path = ?)",
+                (path,),
+            )
             await self._db.execute("DELETE FROM chunks WHERE path = ?", (path,))
 
             # Insert new chunks
@@ -988,14 +1023,17 @@ class LongTermMemoryStore:
         except BaseException:
             await self._db.rollback()
             raise
+        finally:
+            self._write_lock.release()
 
         self._dirty = False
         return len(chunk_records)
 
     async def remove_file(self, path: str) -> None:
         assert self._db is not None
-        await self._db.execute("BEGIN IMMEDIATE")
+        await self._write_lock.acquire()
         try:
+            await self._db.execute("BEGIN IMMEDIATE")
             # Vec first — needs chunk IDs before they're deleted (same pattern as index_file)
             if self._vec_available:
                 try:
@@ -1007,12 +1045,19 @@ class LongTermMemoryStore:
                 except Exception:
                     pass
             await self._db.execute("DELETE FROM chunks_fts WHERE path = ?", (path,))
+            await self._db.execute(
+                "DELETE FROM chunk_usage "
+                "WHERE chunk_id IN (SELECT id FROM chunks WHERE path = ?)",
+                (path,),
+            )
             await self._db.execute("DELETE FROM chunks WHERE path = ?", (path,))
             await self._db.execute("DELETE FROM files WHERE path = ?", (path,))
             await self._db.commit()
         except BaseException:
             await self._db.rollback()
             raise
+        finally:
+            self._write_lock.release()
 
     async def rebuild(self) -> None:
         """Clear rebuildable index rows.
@@ -1021,15 +1066,17 @@ class LongTermMemoryStore:
         memory sources and derived session sources after this call.
         """
         assert self._db is not None
-        if self._vec_available:
-            try:
-                await self._db.execute("DELETE FROM chunks_vec")
-            except Exception:
-                pass
-        await self._db.execute("DELETE FROM chunks_fts")
-        await self._db.execute("DELETE FROM chunks")
-        await self._db.execute("DELETE FROM files")
-        await self._db.commit()
+        async with self._write_lock:
+            if self._vec_available:
+                try:
+                    await self._db.execute("DELETE FROM chunks_vec")
+                except Exception:
+                    pass
+            await self._db.execute("DELETE FROM chunks_fts")
+            await self._db.execute("DELETE FROM chunk_usage")
+            await self._db.execute("DELETE FROM chunks")
+            await self._db.execute("DELETE FROM files")
+            await self._db.commit()
         self._dirty = True
 
     async def health(self) -> dict[str, Any]:

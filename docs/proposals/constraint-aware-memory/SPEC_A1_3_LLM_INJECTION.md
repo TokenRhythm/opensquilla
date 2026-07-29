@@ -66,7 +66,7 @@ def _make_constraint_llm_call(provider: Any) -> LlmCallFn | None:
 
 **设计决策**：
 - `max_tokens=100`：分类响应是单个词（fact/decision/...）
-- 无 usage tracking：best-effort 分类，非用户可见
+- usage tracking 接入 gateway UsageTracker；provider 无 receipt 时使用有界 token 估算，避免隐藏成本
 - 无 streaming 复杂性：只收集 text_delta
 - 优先 `complete()`：更简单，避免 streaming 开销
 

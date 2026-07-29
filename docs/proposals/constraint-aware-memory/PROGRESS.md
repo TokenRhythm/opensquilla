@@ -127,7 +127,7 @@ Total: 75 passed
 |---|------|------|
 | D3 | Boost 范围 | [0.85, 1.8]，永不完全抑制 |
 | D9 | Provenance Marker | `<memory_result type="..." confidence="...">` |
-| D4 | L3 触发条件 | results < 3 AND intent_confidence > 0.7 AND constraint_routing_enabled |
+| D4 | L3 触发条件 | results < 3 AND intent_confidence >= 0.7 |
 
 ### 实现步骤
 
@@ -177,7 +177,7 @@ Total: 278 passed, 6 skipped, 0 failures
 ### 已实现（`9de891cb`）
 
 - `check_retrieval_sufficiency()` 函数
-- 元认知提示注入（不阻塞），触发条件：results < 3 AND intent_confidence > 0.7
+- 元认知提示注入（不阻塞），触发条件：results < 3 AND intent_confidence >= 0.7
 - 中英双语跟随 query
 - 两种提示强度（empty vs partial）
 - 37 新测试 + 241 回归全通过
@@ -233,7 +233,7 @@ Total regression: 616 passed, 7 skipped (1 pre-existing failure unrelated)
 
 | 文件 | 变更 |
 |------|------|
-| `src/opensquilla/memory/dream/candidates.py` | `known_hashes` 参数 + content-hash 去重 |
+| `src/opensquilla/memory/dream/candidates.py` | `known_observations` 参数 + `(source_path, content_hash)` 去重 |
 | `src/opensquilla/memory/dream/runner.py` | evidence store hash 提取 + `files_skipped_unchanged` |
 | `tests/test_memory/test_dream_dedup.py` | 6 个新测试 |
 

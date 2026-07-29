@@ -8,7 +8,7 @@ Design decisions (aligned 2026-07-29):
 - Injection point: memory_tools.py return layer (after formatting)
 - Language: follow query language (CJK ratio > 0.3 → Chinese)
 - Format: bounded XML marker <memory_sufficiency_note>
-- Trigger: result_count < 3 AND intent_confidence > 0.7
+- Trigger: result_count < 3 AND intent_confidence >= 0.7
 - Two severities:
   - empty   (count == 0) → stronger prompt to seek external context
   - partial (0 < count < 3) → suggest re-query / broaden
@@ -55,12 +55,12 @@ def should_emit_sufficiency_note(
 
     Conditions (all must hold):
     - enabled is True
-    - confidence > SUFFICIENCY_CONFIDENCE_THRESHOLD (strictly greater)
+    - confidence >= SUFFICIENCY_CONFIDENCE_THRESHOLD
     - result_count < SUFFICIENCY_RESULT_THRESHOLD
     """
     if not enabled:
         return False
-    if confidence <= SUFFICIENCY_CONFIDENCE_THRESHOLD:
+    if confidence < SUFFICIENCY_CONFIDENCE_THRESHOLD:
         return False
     return result_count < SUFFICIENCY_RESULT_THRESHOLD
 

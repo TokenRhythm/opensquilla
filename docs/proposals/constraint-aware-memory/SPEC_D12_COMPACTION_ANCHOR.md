@@ -1,6 +1,6 @@
 # D12: Compaction Anchor 机制 — 实现 Spec
 
-> **Status**: 待实现（L0 的自然延伸）
+> **Status**: ✅ 已实现并完成当前会话与 full-fork 闭环验证
 > **依赖**: L0（归档 Transcript 可搜索）✅ 已实现
 > **分支**: `feature/constraint-aware-memory`
 > **作者**: KunYu + OpenSquilla
@@ -291,7 +291,7 @@ async def search_transcript(
 
 **约束**：
 - `anchor` 和 `query` 至少提供一个
-- 提供 `anchor` 时，`session_id` 必填（防止跨 session 泄漏）
+- 提供 `anchor` 时默认绑定当前 ToolContext 会话；仅显式跨会话查询需要 `session_id`
 
 **Anchor 模式实现**：
 
@@ -335,7 +335,7 @@ if anchor:
 {
   "anchor": {
     "type": "string",
-    "description": "Exact anchor reference from a compaction summary, format: '<compaction_index>:<entry_anchor_id>'. When provided, returns the original transcript entry verbatim. Requires session_id."
+    "description": "Exact anchor reference from a compaction summary, format: '<compaction_index>:<entry_anchor_id>'. Defaults to the current session; explicit cross-session lookup requires session_id."
   }
 }
 ```
@@ -347,7 +347,7 @@ if anchor:
 ```text
 This summary contains [anchor:N:entry_NNN] references. If you need the exact
 original text behind a statement, call session_search with
-anchor="N:entry_NNN" and session_id="<current_session_id>".
+anchor="N:entry_NNN". The current session is selected automatically.
 Only use anchors explicitly present in the summary. Do not guess anchor values.
 ```
 
@@ -407,7 +407,7 @@ Compaction 触发
 后续推理中模型需要展开：
   │
   ├─ 模型看到 summary 中 [anchor:2:entry_005]
-  ├─ 调用 session_search(anchor="2:entry_005", session_id="...")
+  ├─ 调用 session_search(anchor="2:entry_005")
   └─ 返回原始 entry 全文（content, role, tool_calls, created_at）
 ```
 
@@ -447,6 +447,6 @@ D12 与约束感知 memory 是**正交**的：
 | # | 问题 | 默认 |
 |---|------|------|
 | 1 | `entry_anchor_id` 用 `entry_<n>` 方案？ | 是 |
-| 2 | anchor 查找是否允许跨 session？ | 不允许（必须提供 session_id） |
+| 2 | anchor 查找是否允许跨 session？ | 默认仅当前会话；显式 session_id 遵循 owner-only 工具边界 |
 | 3 | summary 中保留原始 `[anchor:...]` 文本？ | 是（模型可读可展开） |
 | 4 | 多 chunk 时 anchor_base 如何累加？ | 按 chunk 顺序累加 |

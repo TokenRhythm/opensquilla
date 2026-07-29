@@ -24,6 +24,7 @@ import ntpath
 import os
 import re
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -417,7 +418,11 @@ class MemoryManager:
         await self._best_effort_call("store", "close", self.store)
 
 
-def _make_constraint_llm_call(provider: Any) -> Any | None:
+def _make_constraint_llm_call(
+    provider: Any,
+    *,
+    usage_recorder: Callable[..., None] | None = None,
+) -> Any | None:
     """Create a simple text-in/text-out LLM call adapter for constraint classification.
 
     Returns a ``Callable[[str], Awaitable[str]]`` matching ``LlmCallFn``, or None
@@ -425,7 +430,8 @@ def _make_constraint_llm_call(provider: Any) -> Any | None:
 
     Design decisions (A1-3, aligned 2026-07-29):
     - max_tokens=100: classification response is a single word
-    - No usage tracking: best-effort classification, not user-visible
+    - Usage is recorded when a recorder is supplied; missing provider receipts
+      fall back to a bounded token estimate instead of becoming hidden spend.
     - Prefer complete() over chat(): simpler, avoids streaming overhead
     """
     complete = getattr(provider, "complete", None)
@@ -436,25 +442,68 @@ def _make_constraint_llm_call(provider: Any) -> Any | None:
     async def _call(prompt: str) -> str:
         from opensquilla.provider.types import ChatConfig, ContentBlockText, Message
 
+        def record_usage(receipt: Any, output_text: str) -> None:
+            if usage_recorder is None:
+                return
+            input_tokens = int(getattr(receipt, "input_tokens", 0) or 0)
+            output_tokens = int(getattr(receipt, "output_tokens", 0) or 0)
+            if input_tokens <= 0:
+                input_tokens = max(1, len(prompt) // 4)
+            if output_tokens <= 0:
+                output_tokens = max(1, len(output_text) // 4)
+            try:
+                usage_recorder(
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    model_id=str(
+                        getattr(receipt, "model", "")
+                        or getattr(provider, "model", "")
+                        or ""
+                    ),
+                    provider=str(
+                        getattr(receipt, "provider", "")
+                        or getattr(provider, "provider_id", "")
+                        or ""
+                    ),
+                    billed_cost=float(getattr(receipt, "billed_cost", 0.0) or 0.0),
+                    cost_source=str(getattr(receipt, "cost_source", "") or "none"),
+                )
+            except Exception:  # noqa: BLE001
+                log.debug("constraint_classification_usage_record_failed")
+
         messages = [Message(role="user", content=[ContentBlockText(text=prompt)])]
         if callable(complete):
-            resp = await complete(messages=messages, max_tokens=100)
-            return getattr(resp, "content", None) or getattr(resp, "text", "") or ""
+            try:
+                resp = await complete(messages=messages, max_tokens=100)
+            except Exception:
+                record_usage(None, "")
+                raise
+            text = getattr(resp, "content", None) or getattr(resp, "text", "") or ""
+            record_usage(resp, text)
+            return text
         # Streaming chat fallback
         assert callable(chat)  # guaranteed by the guard above
         config = ChatConfig(max_tokens=100)
         stream = chat(messages, config=config)
         chunks: list[str] = []
+        done_event: Any = None
         try:
             async for event in stream:
                 text = getattr(event, "text", "") or ""
                 if text and getattr(event, "kind", "") == "text_delta":
                     chunks.append(text)
+                if getattr(event, "kind", "") == "done":
+                    done_event = event
+        except Exception:
+            record_usage(done_event, "".join(chunks))
+            raise
         finally:
             aclose = getattr(stream, "aclose", None)
             if callable(aclose):
                 await aclose()
-        return "".join(chunks)
+        text = "".join(chunks)
+        record_usage(done_event, text)
+        return text
 
     return _call
 
@@ -465,6 +514,7 @@ async def build_memory_managers(
     *,
     session_storage: Any | None = None,
     provider_selector: Any | None = None,
+    usage_tracker: Any | None = None,
 ) -> dict[str, MemoryManager]:
     """Construct per-agent ``MemoryManager`` instances from gateway config.
 
@@ -530,7 +580,16 @@ async def build_memory_managers(
             _resolver = getattr(provider_selector, "resolve", None)
             _provider = _resolver() if callable(_resolver) else None
             if _provider is not None:
-                constraint_llm_call = _make_constraint_llm_call(_provider)
+                usage_recorder = None
+                if usage_tracker is not None:
+                    def record_constraint_usage(**usage: Any) -> None:
+                        usage_tracker.add("system:memory:index", **usage)
+
+                    usage_recorder = record_constraint_usage
+                constraint_llm_call = _make_constraint_llm_call(
+                    _provider,
+                    usage_recorder=usage_recorder,
+                )
         except Exception:  # noqa: BLE001
             pass  # Degrade gracefully: heuristic-only classification
 

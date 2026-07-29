@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 import structlog
 
 from opensquilla.tools.registry import ToolRegistry, tool
-from opensquilla.tools.types import PlanAccess, ToolError
+from opensquilla.tools.types import PlanAccess, ToolError, current_tool_context
 
 if TYPE_CHECKING:
     from opensquilla.session.storage import SessionStorage
@@ -40,7 +40,10 @@ def create_session_search_tool(
             "from persisted sessions are needed. Ordinary recall should start with "
             "memory_search, which defaults to curated memory source files. To search "
             "indexed session snippets through memory_search, use source=sessions or "
-            "source=all. session_search does not search MEMORY.md or memory/**/*.md."
+            "source=all. Compaction summary anchors can be expanded by passing their "
+            "'<compaction_index>:<entry_anchor_id>' value as anchor; the current "
+            "session is selected automatically. session_search does not search "
+            "MEMORY.md or memory/**/*.md."
         ),
         params={
             "query": {
@@ -61,7 +64,8 @@ def create_session_search_tool(
                     "Exact anchor reference from a compaction summary, "
                     "format: '<compaction_index>:<entry_anchor_id>'. "
                     "When provided, returns the original transcript entry "
-                    "verbatim. Requires session_id."
+                    "verbatim. Defaults to the current session; session_id is "
+                    "needed only for an explicit cross-session lookup."
                 ),
             },
         },
@@ -83,11 +87,22 @@ def create_session_search_tool(
             raise ToolError("Query must not be empty (unless anchor is provided)")
 
         limit = max(1, min(50, limit))
+        resolved_session_id = session_id
+        if anchor is not None and not resolved_session_id:
+            ctx = current_tool_context.get()
+            if ctx is not None and ctx.session_key:
+                current_session = await active_storage.get_session(ctx.session_key)
+                if current_session is not None:
+                    resolved_session_id = current_session.session_id
+            if not resolved_session_id:
+                raise ToolError(
+                    "Anchor lookup requires an active session context or session_id"
+                )
 
         try:
             results = await active_storage.search_transcript(
                 query=query if anchor is None else None,
-                session_id=session_id,
+                session_id=resolved_session_id,
                 limit=limit,
                 anchor=anchor,
             )

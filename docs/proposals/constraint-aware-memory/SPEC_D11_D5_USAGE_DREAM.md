@@ -5,6 +5,16 @@
 > **Scope**: D11 chunk 使用统计 + D5 Dream promotion 评分增强
 > **Depends on**: A1-3 (constraint_type annotations on chunks)
 
+## Compatibility and lifecycle invariant
+
+- D5 uses the exact pre-D5 formula when neither valid constraint data nor
+  usage data exists. “No new signal” is a strict no-op.
+- D11 classifies query intent independently when usage tracking is enabled.
+- Usage writes are serialized with index mutations, drained on retriever
+  shutdown, and orphan rows are removed with replaced/deleted chunks.
+- Dream loads D5 signals for every pending evidence entry, not only the
+  current scan batch.
+
 ---
 
 ## 1. 问题陈述

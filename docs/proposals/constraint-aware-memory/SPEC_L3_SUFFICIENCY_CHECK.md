@@ -1,6 +1,6 @@
 # L3: 检索充分性检查 — 实现 Spec
 
-> **Status**: 实现中
+> **Status**: ✅ 已实现并完成跨层验证
 > **依赖**: L2（约束感知检索路由）✅ 已实现
 > **Feature flag**: `memory.experimental.sufficiency_check = false`
 > **分支**: `feature/constraint-aware-memory`
@@ -28,7 +28,7 @@
 | D2 | 语言策略 | 跟随 query 语言（CJK 比例 > 0.3 → 中文） | 和约束 ontology 双语设计一致 |
 | D3 | 注入格式 | `<memory_sufficiency_note>` 有界 XML 标记 | Codex `ContextualUserFragment`（有界、可识别、不可变） |
 | D4 | 提示强度 | 区分"无结果"(results=0)和"不充分"(0<results<3) | 反转 OpenHuman 静默-section 模式：无结果时反而告知 |
-| D5 | 触发条件 | `results < 3 AND intent_confidence > 0.7` | D4 不阻塞原则 + 低置信度不自扰 |
+| D5 | 触发条件 | `results < 3 AND intent_confidence >= 0.7` | 接受真实分类器最高置信度，同时保持低置信度不自扰 |
 
 ### 2.1 为何不注入到 `retrieval.py` 内部
 
@@ -112,7 +112,7 @@ L3 检查（sufficiency_check_enabled?）
     │
     └── 是 → 读取 retriever.last_query_intent / last_query_confidence
            │
-           ├── confidence > 0.7 AND results < 3
+           ├── confidence >= 0.7 AND results < 3
            │     ├── results = 0 → 注入"无结果"提示
            │     └── results > 0 → 注入"不充分"提示
            │
@@ -146,7 +146,7 @@ L3 检查（sufficiency_check_enabled?）
 | T7 | 英文 query + 不充分 | query="what was that bug", count=1, conf=0.9 | 英文提示 |
 | T8 | 置信度为 None | count=0, conf=None | 不注入（retriever 未分类） |
 | T9 | 边界：results=3 | count=3, conf=0.9 | 不注入 |
-| T10 | 边界：confidence=0.7 | count=0, conf=0.7 | 不注入（strictly greater） |
+| T10 | 边界：confidence=0.7 | count=0, conf=0.7 | 注入（真实分类器可达） |
 | T11 | CJK 检测：混合 | query="Python 错误处理" | 中文（CJK > 30%） |
 | T12 | CJK 检测：纯英文 | query="error handling in Python" | 英文 |
 

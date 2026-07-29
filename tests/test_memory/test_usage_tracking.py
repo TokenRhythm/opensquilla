@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 
 import pytest
 
@@ -253,6 +254,75 @@ class TestRetrieverUsageTracking:
             await store.close()
 
     @pytest.mark.asyncio
+    async def test_usage_only_gate_records_real_query_intent(self, tmp_path):
+        """D11 must classify intent even when L2 and L3 are disabled."""
+        from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.retrieval import MemoryRetriever
+        from opensquilla.memory.store import LongTermMemoryStore
+        from opensquilla.memory.types import MemorySource
+
+        store = LongTermMemoryStore(
+            db_path=str(tmp_path / "test.db"),
+            embedding_provider=NullEmbeddingProvider(),
+        )
+        await store.initialize()
+        retriever = MemoryRetriever(store=store, usage_tracking_enabled=True)
+        try:
+            await store.index_file(
+                "memory/test.md",
+                "The service error was fixed with a rollback.",
+                source=MemorySource.memory,
+            )
+            results = await retriever.search("the service error")
+            await retriever.close()
+            assert results
+            async with store._db.execute(
+                "SELECT DISTINCT intent FROM chunk_usage"
+            ) as cur:
+                intents = {row[0] for row in await cur.fetchall()}
+            assert intents == {"avoid_failure"}
+        finally:
+            await store.close()
+
+    @pytest.mark.asyncio
+    async def test_reindex_cleans_orphaned_usage_and_serializes_writes(self, tmp_path):
+        from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.store import LongTermMemoryStore
+        from opensquilla.memory.types import MemorySource
+
+        store = LongTermMemoryStore(
+            db_path=str(tmp_path / "test.db"),
+            embedding_provider=NullEmbeddingProvider(),
+        )
+        await store.initialize()
+        try:
+            await store.index_file(
+                "memory/test.md", "Original decision.", source=MemorySource.memory
+            )
+            async with store._db.execute(
+                "SELECT id FROM chunks WHERE path = ?", ("memory/test.md",)
+            ) as cur:
+                old_chunk_id = (await cur.fetchone())[0]
+            await store.record_chunk_usage([old_chunk_id], intent="continue_task")
+
+            await asyncio.gather(
+                store.record_chunk_usage([old_chunk_id], intent="avoid_failure"),
+                store.index_file(
+                    "memory/test.md",
+                    "Replacement procedure with different content.",
+                    source=MemorySource.memory,
+                ),
+            )
+
+            async with store._db.execute(
+                "SELECT COUNT(*) FROM chunk_usage "
+                "WHERE chunk_id NOT IN (SELECT id FROM chunks)"
+            ) as cur:
+                assert (await cur.fetchone())[0] == 0
+        finally:
+            await store.close()
+
+    @pytest.mark.asyncio
     async def test_usage_tracking_disabled_no_write(self, tmp_path):
         """search() with usage_tracking_enabled=False does not write usage."""
         from opensquilla.memory.embedding import NullEmbeddingProvider
@@ -387,10 +457,17 @@ class TestCrossTaskRelevance:
 
 class TestD5Scoring:
     def test_backward_compatible_no_extras(self):
-        """Without usage_stats/constraint_type, score is still valid [0,1]."""
+        """Without D5 signals, preserve the exact pre-D5 score."""
         entry = _make_entry()
         score = _score(entry)
-        assert 0.0 <= score <= 1.0
+        frequency = math.log1p(entry.seen_count) / math.log1p(6)
+        expected = (
+            0.35 * frequency
+            + 0.30 * 0.85
+            + 0.20 * 0.75
+            + 0.15 * (2 / 3)
+        )
+        assert score == pytest.approx(expected)
 
     def test_enhanced_score_higher_with_good_data(self):
         """Stable type + high usage -> higher score than baseline."""

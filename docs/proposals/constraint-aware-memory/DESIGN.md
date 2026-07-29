@@ -448,7 +448,7 @@ constraint_routing enabled
 
 ## 7. Layer 3: 检索充分性检查
 
-> **🔶 待实现** — 元认知提示注入（不阻塞）；触发：results<3 AND intent_confidence>0.7
+> **✅ 已实现** — 元认知提示注入（不阻塞）；触发：results<3 AND intent_confidence>=0.7
 
 **Config gate**: `memory.experimental.sufficiency_check = false`
 **Depends on**: Layer 2
@@ -571,7 +571,7 @@ Layer 0 无开关，始终启用（基础设施修复）。
 | v0.7.2 | D11 Usage Tracking + D5 Dream 评分增强 | `a07ae662` | ✅ 已实现 |
 | v0.7.3 | D10 Dream 增量 Diff（content-hash 去重） | `06cf8e00` | ✅ 已实现 |
 | v0.8.0 | 若准确率 > 85%：Layer 1+2 默认开启 | 数据驱动 | 🔶 待启动 |
-| v0.9.0 | Layer 3 作为 experimental | Config gate | 🔶 待实现 |
+| v0.9.0 | Layer 3 作为 experimental | Config gate | ✅ 已实现 |
 | v1.0.0 | 评估用充分性检查替代 coverage check | 验证 | 🔶 待评估 |
 
 ---

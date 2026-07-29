@@ -464,6 +464,87 @@ class TestStoreIndexFileAnnotation:
             await store.close()
 
     @pytest.mark.asyncio
+    async def test_frontmatter_override_applies_to_every_chunk(self, tmp_path):
+        """A file-level override must survive chunking and annotate all content."""
+        from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.store import LongTermMemoryStore
+        from opensquilla.memory.types import MemorySource
+
+        store = LongTermMemoryStore(
+            db_path=str(tmp_path / "test_memory.db"),
+            embedding_provider=NullEmbeddingProvider(),
+            constraint_annotation_enabled=True,
+        )
+        await store.initialize()
+        try:
+            content = (
+                "---\nconstraint_type: procedure\n---\n"
+                + "\n".join(
+                    f"Step {index}: perform the deployment action carefully."
+                    for index in range(30)
+                )
+            )
+            count = await store.index_file(
+                "memory/long.md",
+                content,
+                source=MemorySource.memory,
+                chunk_tokens=20,
+                chunk_overlap=0,
+            )
+            assert count > 1
+            async with store._db.execute(
+                "SELECT constraint_type, constraint_confidence "
+                "FROM chunks WHERE path = ?",
+                ("memory/long.md",),
+            ) as cur:
+                rows = await cur.fetchall()
+            assert rows
+            assert all(row[0] == "procedure" and row[1] == 1.0 for row in rows)
+        finally:
+            await store.close()
+
+    @pytest.mark.asyncio
+    async def test_enabling_annotation_reindexes_unchanged_files(self, tmp_path):
+        """Turning L1 on must not strand an existing unannotated index."""
+        from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.store import LongTermMemoryStore
+        from opensquilla.memory.types import MemorySource
+
+        db_path = str(tmp_path / "test_memory.db")
+        content = "We decided to use PostgreSQL for production."
+        disabled = LongTermMemoryStore(
+            db_path=db_path,
+            embedding_provider=NullEmbeddingProvider(),
+            constraint_annotation_enabled=False,
+        )
+        await disabled.initialize()
+        await disabled.index_file(
+            "memory/test.md", content, source=MemorySource.memory
+        )
+        await disabled.close()
+
+        enabled = LongTermMemoryStore(
+            db_path=db_path,
+            embedding_provider=NullEmbeddingProvider(),
+            constraint_annotation_enabled=True,
+        )
+        await enabled.initialize()
+        try:
+            count = await enabled.index_file(
+                "memory/test.md", content, source=MemorySource.memory
+            )
+            assert count == 1
+            async with enabled._db.execute(
+                "SELECT constraint_type FROM chunks WHERE path = ?",
+                ("memory/test.md",),
+            ) as cur:
+                row = await cur.fetchone()
+            assert row is not None
+            assert row[0] == "decision"
+        finally:
+            await enabled.close()
+
+    @pytest.mark.asyncio
     async def test_annotation_off_no_regression(self, tmp_path):
         """With annotation off, index_file behaves exactly as before."""
         from opensquilla.memory.embedding import NullEmbeddingProvider
@@ -875,6 +956,42 @@ class TestA13ManagerAdapter:
         assert llm_call is not None
         result = await llm_call("classify this text")
         assert result == "decision"
+
+    @pytest.mark.asyncio
+    async def test_adapter_records_usage_or_bounded_estimate(self):
+        from opensquilla.memory.manager import _make_constraint_llm_call
+
+        recorded: list[dict] = []
+
+        class FakeCompleteProvider:
+            model = "test-model"
+            provider_id = "test-provider"
+
+            async def complete(self, messages, max_tokens=100):
+                class Resp:
+                    content = "decision"
+                    input_tokens = 12
+                    output_tokens = 1
+
+                return Resp()
+
+        llm_call = _make_constraint_llm_call(
+            FakeCompleteProvider(),
+            usage_recorder=lambda **usage: recorded.append(usage),
+        )
+        assert llm_call is not None
+        await llm_call("classify this text")
+
+        assert recorded == [
+            {
+                "input_tokens": 12,
+                "output_tokens": 1,
+                "model_id": "test-model",
+                "provider": "test-provider",
+                "billed_cost": 0.0,
+                "cost_source": "none",
+            }
+        ]
 
     @pytest.mark.asyncio
     async def test_adapter_with_chat_provider(self):

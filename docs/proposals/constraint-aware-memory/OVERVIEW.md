@@ -115,7 +115,7 @@ L3 (sufficiency)        ── 依赖 L2（需要路由后的结果）
 ### D12: Compaction Anchor ✅
 
 - **机制**：compaction summary 嵌入 `[anchor:N:entry_NNN]` 标记
-- **展开**：`session_search(anchor="N:entry_NNN", session_id="...")` 精确查找
+- **展开**：`session_search(anchor="N:entry_NNN")` 在当前会话精确查找
 - **核心原则**：模型主动判断是否需要展开（不自动展开）
 - **Feature flag**：`compaction.anchor_enabled`（`CompactionLlmConfig`）
 
@@ -138,7 +138,7 @@ L3 (sufficiency)        ── 依赖 L2（需要路由后的结果）
 ### L3: 检索充分性检查 ⬜
 
 - **机制**：检索后注入元认知提示（不阻塞）
-- **触发条件**：`results < 3 AND intent_confidence > 0.7 AND constraint_routing_enabled`
+- **触发条件**：`results < 3 AND intent_confidence >= 0.7`
 - **Feature flag**：`memory.experimental.sufficiency_check`
 
 ---
@@ -150,7 +150,7 @@ L3 (sufficiency)        ── 依赖 L2（需要路由后的结果）
 [compaction]
 anchor_enabled = false
 
-# Memory Experimental Features (L1/L2/L3) — 待实现
+# Memory Experimental Features (L1/L2/L3) — 已实现并完成跨层验证
 [memory.experimental]
 constraint_annotation = false   # L1
 constraint_routing = false      # L2

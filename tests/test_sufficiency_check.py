@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from opensquilla.memory.constraint_routing import QueryIntent
+from opensquilla.memory.constraint_routing import QueryIntent, classify_query_intent
 from opensquilla.memory.sufficiency_check import (
     format_sufficiency_note,
     maybe_append_sufficiency_note,
@@ -68,10 +68,16 @@ class TestShouldEmit:
 
     def test_boundary_confidence_exact(self):
         # strictly greater → 0.7 exactly should NOT trigger
-        assert should_emit_sufficiency_note(0, 0.7) is False
+        assert should_emit_sufficiency_note(0, 0.7) is True
 
     def test_boundary_confidence_above(self):
         assert should_emit_sufficiency_note(0, 0.71) is True
+
+    def test_real_classifier_output_can_trigger(self):
+        intent, confidence = classify_query_intent("continue the previous task")
+        assert intent is QueryIntent.continue_task
+        assert confidence == 0.7
+        assert should_emit_sufficiency_note(0, confidence) is True
 
     def test_disabled(self):
         assert should_emit_sufficiency_note(0, 0.9, enabled=False) is False

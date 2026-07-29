@@ -72,7 +72,7 @@ def scan_dream_candidate_batch(
     max_batch_size: int,
     agent_id: str,
     quarantine_enabled: bool = True,
-    known_hashes: set[str] | None = None,
+    known_observations: set[tuple[str, str]] | None = None,
 ) -> DreamCandidateScan:
     memory_dir = workspace / "memory"
     if not memory_dir.exists():
@@ -104,9 +104,11 @@ def scan_dream_candidate_batch(
             snippet = snippet[:_SNIPPET_MAX_CHARS].rstrip()
         if not snippet:
             continue
-        # D10: skip files whose content hash matches a previously-seen candidate
+        # D10: a touch-only rewrite of the same file is not a new observation.
+        # Identical content in another file remains independent recurrence
+        # evidence for source diversity and source-day frequency.
         snippet_sha = _sha256(snippet)
-        if known_hashes and snippet_sha in known_hashes:
+        if known_observations and (rel_path, snippet_sha) in known_observations:
             unchanged_mtimes.append(stat.st_mtime)
             continue
         candidates.append(
@@ -158,7 +160,7 @@ def scan_dream_candidates(
     max_batch_size: int,
     agent_id: str,
     quarantine_enabled: bool = True,
-    known_hashes: set[str] | None = None,
+    known_observations: set[tuple[str, str]] | None = None,
 ) -> list[RawDreamCandidate]:
     """Backward-compatible candidate-only view of a Dream scan."""
     return scan_dream_candidate_batch(
@@ -167,5 +169,5 @@ def scan_dream_candidates(
         max_batch_size=max_batch_size,
         agent_id=agent_id,
         quarantine_enabled=quarantine_enabled,
-        known_hashes=known_hashes,
+        known_observations=known_observations,
     ).candidates

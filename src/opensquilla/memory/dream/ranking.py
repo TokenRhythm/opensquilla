@@ -65,6 +65,30 @@ def _cross_task_relevance(usage: dict | None) -> float:
     return _clamp_score(freq_component * diversity_component)
 
 
+def _legacy_score(entry: PromotionEvidenceEntry) -> float:
+    """Return the exact pre-D5 score for disabled/no-signal compatibility."""
+    frequency = _clamp_score(math.log1p(max(0, entry.seen_count)) / math.log1p(6))
+    positive_or_manual = entry.positive_signal_count + entry.manual_signal_count
+    negative = entry.correction_signal_count + entry.failure_signal_count
+    signal_balance = 0.55
+    if positive_or_manual > 0:
+        signal_balance += 0.3
+    if entry.manual_signal_count > 0:
+        signal_balance += 0.1
+    if negative > 0 and positive_or_manual == 0:
+        signal_balance -= 0.25
+        if negative > 1:
+            signal_balance += 0.25
+    source_confidence = 0.75 if entry.source_kind == "memory_file" else 0.5
+    consolidation = _clamp_score(len(entry.source_days) / 3)
+    return _clamp_score(
+        0.35 * frequency
+        + 0.30 * _clamp_score(signal_balance)
+        + 0.20 * source_confidence
+        + 0.15 * consolidation
+    )
+
+
 def _score(
     entry: PromotionEvidenceEntry,
     *,
@@ -83,6 +107,9 @@ def _score(
         + 0.15 * constraint_stability   (NEW)
         + 0.10 * cross_task_relevance   (NEW)
     """
+    if not usage_stats and constraint_type not in _CONSTRAINT_STABILITY:
+        return _legacy_score(entry)
+
     frequency = _clamp_score(math.log1p(max(0, entry.seen_count)) / math.log1p(6))
     positive_or_manual = entry.positive_signal_count + entry.manual_signal_count
     negative = entry.correction_signal_count + entry.failure_signal_count

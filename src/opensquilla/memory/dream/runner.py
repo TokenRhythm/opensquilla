@@ -258,16 +258,17 @@ class Dream:
                 or getattr(self.config, "dry_run", False)
             ),
         )
-        # D10: collect known content hashes for incremental dedup
-        d10_known_hashes: set[str] | None = None
+        # D10: deduplicate only touch-only rewrites of the same source.
+        # Identical content in another source is recurrence evidence.
+        d10_known_observations: set[tuple[str, str]] | None = None
         try:
             from opensquilla.memory.dream.evidence import load_evidence_store
 
             _ev_store = load_evidence_store(self.workspace)
-            d10_known_hashes = {
-                e.snippet_sha256
+            d10_known_observations = {
+                (e.source_path, e.snippet_sha256)
                 for e in _ev_store.entries.values()
-                if e.snippet_sha256
+                if e.source_path and e.snippet_sha256
             }
         except Exception:  # noqa: BLE001
             pass  # D10 is best-effort; degrade to full scan
@@ -278,7 +279,7 @@ class Dream:
             max_batch_size=getattr(self.config, "max_batch_size", 20),
             agent_id=getattr(self, "agent_id", "main"),
             quarantine_enabled=getattr(self.config, "evidence_quarantine_enabled", True),
-            known_hashes=d10_known_hashes,
+            known_observations=d10_known_observations,
         )
         raw_candidates = candidate_scan.candidates
         result.files_considered = candidate_scan.files_considered
@@ -312,7 +313,13 @@ class Dream:
             d5_usage_stats: dict[str, dict] | None = None
             d5_constraint_types: dict[str, str] | None = None
             if self._memory_store is not None:
-                candidate_paths = list({c.source_path for c in raw_candidates})
+                candidate_paths = list(
+                    {
+                        entry.source_path
+                        for entry in store.entries.values()
+                        if entry.status == "candidate" and entry.source_path
+                    }
+                )
                 try:
                     d5_usage_stats = await self._memory_store.get_usage_stats(candidate_paths)
                     d5_constraint_types = await self._memory_store.get_dominant_constraint_types(

@@ -942,6 +942,45 @@ async def test_branch_fork_transcript(manager):
 
 
 @pytest.mark.asyncio
+async def test_full_fork_preserves_compaction_anchor_mapping(manager):
+    parent = await manager.create("agent:main:main")
+    await manager.append_message(parent.session_key, "user", "exact archived decision")
+    archived = await manager.get_transcript(parent.session_key)
+    summary = SessionSummary(
+        session_id=parent.session_id,
+        session_key=parent.session_key,
+        compaction_index=0,
+        summary_text="Decision [anchor:0:entry_000]",
+        extracted_anchors=[
+            {"compaction_index": 0, "entry_anchor_id": "entry_000"}
+        ],
+    )
+    await manager._storage.rewrite_compacted_session(
+        node=parent,
+        summary=summary,
+        entries=[],
+        archived_entries=archived,
+        anchor_enabled=True,
+        extracted_anchors=summary.extracted_anchors,
+    )
+
+    child = await manager.branch(
+        parent.session_key,
+        "agent:main:direct:anchor-child",
+        fork_transcript=True,
+    )
+
+    child_summaries = await manager.get_summaries(child.session_key)
+    assert child_summaries[0].compaction_index == 0
+    assert child_summaries[0].extracted_anchors == summary.extracted_anchors
+    results = await manager._storage.search_transcript(
+        session_id=child.session_id,
+        anchor="0:entry_000",
+    )
+    assert results[0]["snippet"] == "exact archived decision"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("parent_state", ["complete", "incomplete", "missing"])
 async def test_legacy_zero_evidence_fork_fails_closed(
     manager,

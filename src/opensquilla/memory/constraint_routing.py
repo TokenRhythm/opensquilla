@@ -120,8 +120,7 @@ def classify_query_intent(query: str) -> tuple[QueryIntent, float]:
     and classification falls through to the next pattern or general.
     """
     for pattern, intent, confidence in _INTENT_PATTERNS:
-        m = pattern.search(query)
-        if m:
+        for m in pattern.finditer(query):
             # B6: reject match if negated (Chinese only, English handled by \b)
             if _has_negation_before_match(query, m.start()):
                 continue

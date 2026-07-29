@@ -54,6 +54,32 @@ async def _setup_storage(tmp_path) -> SessionStorage:
     return storage
 
 
+@pytest.mark.asyncio
+async def test_archived_fts_backfill_has_one_time_marker(tmp_path) -> None:
+    db_path = tmp_path / "sessions.db"
+    storage = SessionStorage(str(db_path))
+    await storage.connect()
+    try:
+        async with storage.conn.execute(
+            "SELECT value FROM session_storage_meta "
+            "WHERE key = 'compacted_transcript_fts_backfill'"
+        ) as cur:
+            assert (await cur.fetchone())[0] == "1"
+    finally:
+        await storage.close()
+
+    reopened = SessionStorage(str(db_path))
+    await reopened.connect()
+    try:
+        async with reopened.conn.execute(
+            "SELECT COUNT(*) FROM session_storage_meta "
+            "WHERE key = 'compacted_transcript_fts_backfill'"
+        ) as cur:
+            assert (await cur.fetchone())[0] == 1
+    finally:
+        await reopened.close()
+
+
 async def _create_session_with_entries(
     storage: SessionStorage,
     session_key: str,

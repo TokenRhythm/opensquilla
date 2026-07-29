@@ -658,6 +658,16 @@ AFTER UPDATE ON compacted_transcript_entries BEGIN
 END
 """
 
+_CREATE_SESSION_STORAGE_META = """
+CREATE TABLE IF NOT EXISTS session_storage_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+)
+"""
+
+_COMPACTED_FTS_BACKFILL_KEY = "compacted_transcript_fts_backfill"
+_COMPACTED_FTS_BACKFILL_VERSION = "1"
+
 _CREATE_SUMMARIES = """
 CREATE TABLE IF NOT EXISTS session_summaries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1079,6 +1089,7 @@ def _deserialize_row(row: dict[str, Any]) -> dict[str, Any]:
         "summary_payload",
         "missing_obligations",
         "critical_carry_forward",
+        "extracted_anchors",
         "payload",
         "steps",
         "step_states",
@@ -1941,21 +1952,40 @@ class SessionStorage:
         ``compacted_transcript_entries``.  Safe to call on every startup.
         """
         assert self._conn is not None
+        await self._conn.execute(_CREATE_SESSION_STORAGE_META)
+        async with self._conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'compacted_transcript_fts'"
+        ) as cur:
+            fts_existed = await cur.fetchone() is not None
         await self._conn.execute(_CREATE_COMPACTED_TRANSCRIPT_FTS)
         await self._conn.execute(_CREATE_COMPACTED_FTS_TRIGGER_INSERT)
         await self._conn.execute(_CREATE_COMPACTED_FTS_TRIGGER_DELETE)
         await self._conn.execute(_CREATE_COMPACTED_FTS_TRIGGER_UPDATE)
-        # Rebuild the FTS index from the external content table.
-        # For FTS5 external-content tables, COUNT(*) reads the content table
-        # (not the index), so we cannot use it as a "needs backfill" guard.
-        # The 'rebuild' command is idempotent: it re-reads all rows from
-        # compacted_transcript_entries and reconstructs the inverted index.
-        # On a fresh database the content table is empty so this is a no-op;
-        # on an upgraded database it populates the index for the first time.
-        await self._conn.execute(
-            "INSERT INTO compacted_transcript_fts(compacted_transcript_fts) "
-            "VALUES ('rebuild')"
-        )
+        async with self._conn.execute(
+            "SELECT value FROM session_storage_meta WHERE key = ?",
+            (_COMPACTED_FTS_BACKFILL_KEY,),
+        ) as cur:
+            marker = await cur.fetchone()
+        if (
+            not fts_existed
+            or marker is None
+            or marker[0] != _COMPACTED_FTS_BACKFILL_VERSION
+        ):
+            # External-content FTS cannot use COUNT(*) as a backfill guard.
+            # Persist a migration marker so the O(history) rebuild runs once.
+            await self._conn.execute(
+                "INSERT INTO compacted_transcript_fts(compacted_transcript_fts) "
+                "VALUES ('rebuild')"
+            )
+            await self._conn.execute(
+                "INSERT OR REPLACE INTO session_storage_meta(key, value) "
+                "VALUES (?, ?)",
+                (
+                    _COMPACTED_FTS_BACKFILL_KEY,
+                    _COMPACTED_FTS_BACKFILL_VERSION,
+                ),
+            )
         await self._conn.commit()
 
     async def _migrate_compaction_anchor_columns(self) -> None:
@@ -6780,6 +6810,7 @@ class SessionStorage:
                 session_key,
                 compaction_id,
                 compaction_index,
+                compaction_anchor_id,
                 original_entry_id,
                 message_id,
                 role,
@@ -6804,6 +6835,7 @@ class SessionStorage:
                 ?,
                 compaction_id,
                 compaction_index,
+                compaction_anchor_id,
                 original_entry_id,
                 message_id,
                 role,
@@ -6984,16 +7016,26 @@ class SessionStorage:
 
     # ── SessionSummary CRUD ──────────────────────────────────────────────────
 
-    async def save_summary(self, summary: SessionSummary) -> SessionSummary:
-        """Persist a compaction summary. Sets compaction_index automatically."""
+    async def save_summary(
+        self,
+        summary: SessionSummary,
+        *,
+        preserve_compaction_index: bool = False,
+    ) -> SessionSummary:
+        """Persist a compaction summary.
+
+        Normal writes allocate the next index. Full-session forks preserve the
+        parent's index so summary anchors keep referring to the copied archive.
+        """
         _next_idx_sql = (
             "SELECT COALESCE(MAX(compaction_index), -1) + 1 "
             "FROM session_summaries WHERE session_id = ?"
         )
         async with self._write_transaction("save_summary") as conn:
-            async with conn.execute(_next_idx_sql, (summary.session_id,)) as cur:
-                row = await cur.fetchone()
-            summary.compaction_index = row[0] if row else 0
+            if not preserve_compaction_index:
+                async with conn.execute(_next_idx_sql, (summary.session_id,)) as cur:
+                    row = await cur.fetchone()
+                summary.compaction_index = row[0] if row else 0
 
             data = summary.model_dump(exclude={"id"})
             cols = list(data.keys())

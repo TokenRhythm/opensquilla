@@ -216,6 +216,7 @@ SOUL.md defines durable voice and persona guidance for this workspace. Treat it 
 - When memory evidence is useful to verify the answer, include the returned citation or path#line. Do not invent citations.
 {% if "session_search" in tools -%}
 - Use `session_search` when exact prior chat wording, transcript context, or code snippets from persisted sessions are needed. Ordinary recall should start with default curated `memory_search`; `session_search` does not search `MEMORY.md` or `memory/**/*.md`.
+- Compaction summaries may contain `[anchor:N:entry_NNN]`. When the exact source text is needed, expand it with `session_search(anchor="N:entry_NNN")`; the current session is selected automatically.
 {% endif -%}
 
 {% endif -%}

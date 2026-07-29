@@ -190,7 +190,7 @@ async def llm_classify(
 # ── Frontmatter Parsing (D6: user override) ───────────────────────────────
 
 _FRONTMATTER_BLOCK_RE = re.compile(
-    r"^---\s*\n(.*?)\n---\s*\n",
+    r"^---\s*\n(.*?)\n---(?:\s*\n|$)",
     re.DOTALL,
 )
 _CONSTRAINT_TYPE_RE = re.compile(

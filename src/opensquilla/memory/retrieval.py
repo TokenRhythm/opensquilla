@@ -188,6 +188,7 @@ class MemoryRetriever:
         self._constraint_routing_enabled = constraint_routing_enabled
         self._sufficiency_check_enabled = sufficiency_check_enabled
         self._usage_tracking_enabled = usage_tracking_enabled
+        self._usage_tasks: set[asyncio.Task[None]] = set()
         # L3: cache last classified intent/confidence for sufficiency check
         self._last_query_intent: QueryIntent | None = None
         self._last_query_confidence: float | None = None
@@ -257,12 +258,21 @@ class MemoryRetriever:
         filtered.sort(key=lambda r: _rank_score(r, self._source_weights), reverse=True)
 
         # L2/L3: Constraint-aware routing (experimental, default off)
-        if self._constraint_routing_enabled or self._sufficiency_check_enabled:
+        query_intent: QueryIntent | None = None
+        if (
+            self._constraint_routing_enabled
+            or self._sufficiency_check_enabled
+            or self._usage_tracking_enabled
+        ):
             query_intent, query_confidence = classify_query_intent(query)
             self._last_query_intent = query_intent
             self._last_query_confidence = query_confidence
             if self._constraint_routing_enabled:
                 filtered = apply_constraint_boost(filtered, query_intent)
+                filtered.sort(
+                    key=lambda r: _rank_score(r, self._source_weights),
+                    reverse=True,
+                )
 
         if self._mmr_enabled:
             weighted = [
@@ -284,16 +294,18 @@ class MemoryRetriever:
         # D11: Non-blocking usage tracking (fire-and-forget, never blocks search)
         if self._usage_tracking_enabled and k_selected:
             intent_str = (
-                self._last_query_intent.value
-                if self._last_query_intent is not None
+                query_intent.value
+                if query_intent is not None
                 else "general"
             )
             chunk_ids = [r.chunk_id for r in k_selected]
             try:
                 loop = asyncio.get_running_loop()
-                loop.create_task(
+                task = loop.create_task(
                     self._store.record_chunk_usage(chunk_ids, intent=intent_str)
                 )
+                self._usage_tasks.add(task)
+                task.add_done_callback(self._usage_tasks.discard)
             except RuntimeError:
                 pass  # No running event loop (e.g. sync test) — skip
 
@@ -325,7 +337,8 @@ class MemoryRetriever:
         return self._last_query_confidence
 
     async def close(self) -> None:
-        return None
+        if self._usage_tasks:
+            await asyncio.gather(*tuple(self._usage_tasks), return_exceptions=True)
 
     def effective_retrieval_metadata(self) -> dict[str, str]:
         effective_mode = "fts_only" if self._vector_weight == 0.0 else "hybrid"

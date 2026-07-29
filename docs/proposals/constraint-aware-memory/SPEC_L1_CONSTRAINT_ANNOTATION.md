@@ -1,6 +1,6 @@
 ﻿# L1: 约束类型标注 — 实现 Spec
 
-> **Status**: 🔶 实现中
+> **Status**: ✅ 已实现并完成跨层验证
 > **依赖**: 无（可独立运行）
 > **Feature flag**: `memory.experimental.constraint_annotation = false`
 > **分支**: `feature/constraint-aware-memory`

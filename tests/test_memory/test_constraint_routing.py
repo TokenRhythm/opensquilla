@@ -35,6 +35,7 @@ def _make_result(
     ctype: str = "fact",
     confidence: float | None = 0.8,
     chunk_id: str = "test",
+    source: MemorySource = MemorySource.memory,
 ) -> MemorySearchResult:
     meta: dict[str, str] = {}
     if ctype:
@@ -43,8 +44,12 @@ def _make_result(
         meta["constraint_confidence"] = str(confidence)
     return MemorySearchResult(
         chunk_id=chunk_id,
-        path="memory/test.md",
-        source=MemorySource.memory,
+        path=(
+            "memory/test.md"
+            if source is MemorySource.memory
+            else "sessions/main/test.md"
+        ),
+        source=source,
         start_line=1,
         end_line=10,
         snippet="test snippet",
@@ -491,6 +496,10 @@ class TestB6NegationDetection:
         intent, conf = classify_query_intent("没有关系，但是服务崩溃了")
         assert intent == QueryIntent.avoid_failure
 
+    def test_later_positive_match_survives_earlier_negated_match(self):
+        intent, conf = classify_query_intent("没有问题，但后来服务报错了")
+        assert intent == QueryIntent.avoid_failure
+
     def test_positive_still_works_after_negation_feature(self):
         """Non-negated queries should still match correctly."""
         intent, conf = classify_query_intent("这里有个问题需要解决")
@@ -550,3 +559,43 @@ class TestB6EnglishRegression:
         # "no problem" still matches avoid_failure — known limitation
         intent, conf = classify_query_intent("no problem, everything is fine")
         assert intent == QueryIntent.avoid_failure  # documented limitation
+
+
+@pytest.mark.asyncio
+async def test_l2_preserves_source_weight_order_without_boosts():
+    """L2 no-op annotations must not undo the existing source weighting."""
+    from opensquilla.memory.retrieval import MemoryRetriever
+
+    class Store:
+        async def search(self, **_kwargs):
+            return (
+                [
+                    _make_result(
+                        score=0.9,
+                        confidence=None,
+                        chunk_id="session",
+                        source=MemorySource.sessions,
+                    ),
+                    _make_result(
+                        score=0.85,
+                        confidence=None,
+                        chunk_id="memory",
+                        source=MemorySource.memory,
+                    ),
+                ],
+                "fts",
+            )
+
+    retriever = MemoryRetriever(
+        Store(),  # type: ignore[arg-type]
+        source_weights={MemorySource.sessions: 0.5},
+        constraint_routing_enabled=True,
+    )
+    from types import SimpleNamespace
+
+    results = await retriever.search(
+        "continue the previous task",
+        opts=SimpleNamespace(max_results=2, min_score=0.0, source=None),
+    )
+
+    assert [result.chunk_id for result in results] == ["memory", "session"]

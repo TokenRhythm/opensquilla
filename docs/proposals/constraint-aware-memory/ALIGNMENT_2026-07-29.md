@@ -64,7 +64,7 @@ chunk 写入
 ```python
 trigger_l3 = (
     len(results) < 3
-    and intent_confidence > 0.7  # intent 不确定时充分性检查无意义
+    and intent_confidence >= 0.7  # 接受真实分类器的最高置信度
     and constraint_routing_enabled
 )
 ```
@@ -213,7 +213,7 @@ Compaction Summary 输出：
 | 设计提案 | `DESIGN.md` | v1.1（待更新为 v1.2） |
 | 2026-07-29 对齐记录 | `ALIGNMENT_2026-07-29.md` | ✅ |
 | L0 实现 spec | `SPEC_L0_ARCHIVED_TRANSCRIPT_SEARCH.md` | ✅ 已实现 |
-| D12 Compaction Anchor spec | `SPEC_D12_COMPACTION_ANCHOR.md` | ✅ 待实现 |
+| D12 Compaction Anchor spec | `SPEC_D12_COMPACTION_ANCHOR.md` | ✅ 已实现 |
 
 ## 8. 推进计划（已确认）
 

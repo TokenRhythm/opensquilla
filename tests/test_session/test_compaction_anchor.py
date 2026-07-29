@@ -23,6 +23,9 @@ from opensquilla.session.models import (
     TranscriptEntry,
 )
 from opensquilla.session.storage import SessionStorage
+from opensquilla.tools.builtin.session_search import create_session_search_tool
+from opensquilla.tools.registry import ToolRegistry
+from opensquilla.tools.types import ToolContext, current_tool_context
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -215,6 +218,46 @@ async def test_anchor_archive_and_lookup(tmp_path) -> None:
             anchor="0:entry_099",
         )
         assert results3 == []
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_session_search_anchor_defaults_to_current_session(tmp_path) -> None:
+    storage = await _setup_storage(tmp_path)
+    try:
+        session_key = "agent:main:webchat:anchor-current"
+        node = _node(session_key, "sid-anchor-current")
+        await storage.upsert_session(node)
+        summary = SessionSummary(
+            session_id=node.session_id,
+            session_key=session_key,
+            summary_text="Decision [anchor:0:entry_000]",
+        )
+        await storage.rewrite_compacted_session(
+            node=node,
+            summary=summary,
+            entries=[],
+            archived_entries=[
+                _entry(node.session_id, session_key, "user", "exact original decision")
+            ],
+            anchor_enabled=True,
+        )
+        registry = ToolRegistry()
+        create_session_search_tool(storage, registry=registry)
+        registered = registry.get("session_search")
+        assert registered is not None
+
+        token = current_tool_context.set(
+            ToolContext(is_owner=True, session_key=session_key)
+        )
+        try:
+            output = await registered.handler(anchor="0:entry_000")
+        finally:
+            current_tool_context.reset(token)
+
+        payload = json.loads(output)
+        assert payload["results"][0]["snippet"] == "exact original decision"
     finally:
         await storage.close()
 

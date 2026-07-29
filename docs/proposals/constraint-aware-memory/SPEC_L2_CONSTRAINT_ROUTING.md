@@ -1,6 +1,6 @@
 # L2: 约束感知检索路由 — 实现 Spec
 
-> **Status**: 🔶 实现中
+> **Status**: ✅ 已实现并完成跨层验证
 > **依赖**: L1（需要 constraint_type 元数据）✅ 已实现
 > **Feature flag**: `memory.experimental.constraint_routing = false`
 > **分支**: `feature/constraint-aware-memory`
@@ -239,4 +239,4 @@ retriever = MemoryRetriever(
   - L1 开启 + L2 开启 → 完整约束感知检索
 - **L3**：依赖 L2 路由后的结果 + intent_confidence
   - L3 仅在 L2 开启时可用
-  - L3 触发条件：`results < 3 AND intent_confidence > 0.7 AND constraint_routing_enabled`
+  - L3 触发条件：`results < 3 AND intent_confidence >= 0.7`

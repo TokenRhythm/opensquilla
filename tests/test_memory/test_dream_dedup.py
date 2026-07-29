@@ -17,8 +17,8 @@ from opensquilla.memory.dream.runner import Dream
 
 
 class TestScanDeduplication:
-    def test_scan_without_known_hashes(self, tmp_path):
-        """Without known_hashes, all files are processed (backward compat)."""
+    def test_scan_without_known_observations(self, tmp_path):
+        """Without known observations, all files are processed."""
         workspace = tmp_path / "ws"
         memory_dir = workspace / "memory"
         memory_dir.mkdir(parents=True)
@@ -33,8 +33,8 @@ class TestScanDeduplication:
         assert len(candidates) == 1
         assert candidates[0].source_path == "memory/test.md"
 
-    def test_scan_with_empty_known_hashes(self, tmp_path):
-        """Empty known_hashes set processes all files."""
+    def test_scan_with_empty_known_observations(self, tmp_path):
+        """An empty observation set processes all files."""
         workspace = tmp_path / "ws"
         memory_dir = workspace / "memory"
         memory_dir.mkdir(parents=True)
@@ -45,7 +45,7 @@ class TestScanDeduplication:
             cursor=0.0,
             max_batch_size=20,
             agent_id="main",
-            known_hashes=set(),
+            known_observations=set(),
         )
         assert len(candidates) == 1
 
@@ -63,13 +63,13 @@ class TestScanDeduplication:
         assert len(candidates) == 1
         known_hash = candidates[0].snippet_sha256
 
-        # Second scan with known_hashes should skip
+        # A second scan with the same source observation should skip.
         candidates2 = scan_dream_candidates(
             workspace,
             cursor=0.0,
             max_batch_size=20,
             agent_id="main",
-            known_hashes={known_hash},
+            known_observations={("memory/test.md", known_hash)},
         )
         assert len(candidates2) == 0
 
@@ -96,7 +96,7 @@ class TestScanDeduplication:
             cursor=0.0,
             max_batch_size=20,
             agent_id="main",
-            known_hashes={old_hash},
+            known_observations={("memory/test.md", old_hash)},
         )
         assert len(candidates2) == 1
         assert candidates2[0].snippet_sha256 != old_hash
@@ -121,20 +121,20 @@ class TestScanDeduplication:
         time.sleep(0.01)
 
         # Scan with known hashes
-        known = set(hashes.values())
+        known = set(hashes.items())
         candidates2 = scan_dream_candidates(
             workspace,
             cursor=0.0,
             max_batch_size=20,
             agent_id="main",
-            known_hashes=known,
+            known_observations=known,
         )
         # Only changed.md should appear
         assert len(candidates2) == 1
         assert candidates2[0].source_path == "memory/changed.md"
 
-    def test_scan_none_known_hashes_processes_all(self, tmp_path):
-        """None known_hashes is same as not passing it."""
+    def test_scan_none_known_observations_processes_all(self, tmp_path):
+        """None is the same as not passing known observations."""
         workspace = tmp_path / "ws"
         memory_dir = workspace / "memory"
         memory_dir.mkdir(parents=True)
@@ -146,7 +146,7 @@ class TestScanDeduplication:
             cursor=0.0,
             max_batch_size=20,
             agent_id="main",
-            known_hashes=None,
+            known_observations=None,
         )
         assert len(candidates) == 3
 
@@ -166,7 +166,7 @@ class TestScanDeduplication:
             cursor=0.0,
             max_batch_size=20,
             agent_id="main",
-            known_hashes={first[0].snippet_sha256},
+            known_observations={("memory/test.md", first[0].snippet_sha256)},
         )
 
         assert scan.candidates == []
@@ -202,11 +202,41 @@ class TestScanDeduplication:
             cursor=0.0,
             max_batch_size=1,
             agent_id="main",
-            known_hashes={unchanged_hash},
+            known_observations={("memory/unchanged.md", unchanged_hash)},
         )
 
         assert [item.source_path for item in scan.candidates] == ["memory/first.md"]
         assert scan.cursor_high_watermark == 100.0
+
+    def test_identical_content_in_another_source_is_recurrence(self, tmp_path):
+        """Content equality across files must preserve source diversity evidence."""
+        workspace = tmp_path / "ws"
+        memory_dir = workspace / "memory"
+        memory_dir.mkdir(parents=True)
+        first = memory_dir / "2026-07-29.md"
+        second = memory_dir / "2026-07-30.md"
+        first.write_text("The same failure happened.", encoding="utf-8")
+        second.write_text("The same failure happened.", encoding="utf-8")
+
+        initial = scan_dream_candidates(
+            workspace, cursor=0.0, max_batch_size=20, agent_id="main",
+        )
+        first_candidate = next(
+            item for item in initial if item.source_path == "memory/2026-07-29.md"
+        )
+        scan = scan_dream_candidate_batch(
+            workspace,
+            cursor=0.0,
+            max_batch_size=20,
+            agent_id="main",
+            known_observations={
+                (first_candidate.source_path, first_candidate.snippet_sha256)
+            },
+        )
+
+        assert [item.source_path for item in scan.candidates] == [
+            "memory/2026-07-30.md"
+        ]
 
     @pytest.mark.asyncio
     async def test_unchanged_only_run_advances_cursor(self, tmp_path, monkeypatch):

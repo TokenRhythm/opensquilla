@@ -5,6 +5,24 @@
 > **Scope**: Dream candidate 扫描阶段的内容去重
 > **Depends on**: evidence store (existing)
 
+## v1.1 semantic identity correction
+
+Deduplication is scoped to an observation identity, not a global content hash:
+
+```python
+known_observations: set[tuple[str, str]]  # (source_path, snippet_sha256)
+```
+
+- The same source path with the same normalized content is a touch-only
+  duplicate and does not increment evidence.
+- Identical content in a different path or dated note is an independent
+  recurrence. It remains visible so `seen_count`, `source_days`, and source
+  diversity preserve their information utility.
+- Cursor advancement means “scanned through”, never “all equal hashes have
+  been semantically absorbed”.
+
+The implementation and examples below use this observation-scoped identity.
+
 ---
 
 ## 1. 问题陈述
@@ -22,7 +40,7 @@
 
 ### 2.1 Content-hash 去重
 
-在 `scan_dream_candidates()` 中加可选参数 `known_hashes: set[str] | None`：
+在 `scan_dream_candidates()` 中加可选参数 `known_observations: set[tuple[str, str]] | None`：
 
 ```python
 def scan_dream_candidates(
@@ -32,27 +50,27 @@ def scan_dream_candidates(
     max_batch_size: int,
     agent_id: str,
     quarantine_enabled: bool = True,
-    known_hashes: set[str] | None = None,  # D10: skip unchanged content
+    known_observations: set[tuple[str, str]] | None = None,
 ) -> list[RawDreamCandidate]:
     ...
     snippet_sha = _sha256(snippet)
-    if known_hashes and snippet_sha in known_hashes:
+    if known_observations and (rel_path, snippet_sha) in known_observations:
         skipped_count += 1
         continue  # D10: content unchanged since last Dream run
     ...
 ```
 
-### 2.2 known_hashes 来源
+### 2.2 known_observations 来源
 
 `Dream._run_evidence_consolidation()` 在调用 scan 前，从 evidence store 提取
 所有已有 entry 的 `snippet_sha256`：
 
 ```python
 evidence = load_evidence_store(self.workspace)
-known_hashes = {
-    entry.snippet_sha256
+known_observations = {
+    (entry.source_path, entry.snippet_sha256)
     for entry in evidence.entries.values()
-    if entry.snippet_sha256
+    if entry.source_path and entry.snippet_sha256
 }
 ```
 
@@ -72,9 +90,9 @@ known_hashes = {
 
 | 条件 | 行为 |
 |------|------|
-| known_hashes=None | 当前行为（不去重） |
-| evidence store 为空 | known_hashes=空集 → 不去重 |
-| evidence store 读取失败 | known_hashes=空集 → 不去重 |
+| known_observations=None | 当前行为（不去重） |
+| evidence store 为空 | known_observations=空集 → 不去重 |
+| evidence store 读取失败 | known_observations=空集 → 不去重 |
 
 ### 2.6 Cursor high-watermark invariant
 
@@ -97,14 +115,14 @@ remain reachable.
 
 | 文件 | 变更 |
 |------|------|
-| `src/opensquilla/memory/dream/candidates.py` | `scan_dream_candidates` 加 `known_hashes` 参数 |
-| `src/opensquilla/memory/dream/runner.py` | 提取 known_hashes + 传给 scan + DreamResult 新字段 |
+| `src/opensquilla/memory/dream/candidates.py` | `scan_dream_candidates` 加 `known_observations` 参数 |
+| `src/opensquilla/memory/dream/runner.py` | 提取 known_observations + 传给 scan + DreamResult 新字段 |
 | `tests/test_memory_dream_runner.py` | D10 去重测试 |
 
 ## 4. 测试计划
 
-1. **Unit**: scan with known_hashes skips matching content
-2. **Unit**: scan without known_hashes processes all (backward compat)
-3. **Unit**: scan with empty known_hashes processes all
+1. **Unit**: same-path known observation skips touch-only content
+2. **Unit**: same hash in a different path remains a recurrence
+3. **Unit**: scan without known observations processes all
 4. **Integration**: Dream run with unchanged files → files_skipped_unchanged > 0
 5. **Regression**: existing Dream tests pass unchanged
