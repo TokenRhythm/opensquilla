@@ -579,16 +579,6 @@ function handleCronRunFinished(payload: unknown) {
   })
 }
 
-watch(
-  () => rpcStore.state,
-  state => {
-    if (state === 'connected') {
-      void rpcStore.call('cron.subscribe', {}).catch(() => undefined)
-    }
-  },
-  { immediate: true },
-)
-
 installSessionNavigationDiagConsole()
 
 // Shared agents.list state + fetch (singleton) for sidebar session metadata.
@@ -1465,8 +1455,18 @@ const sessionListSubscription = useSessionListSubscription({
   warn: (message, error) => console.warn(`[App] ${message}:`, errorMessage(error)),
 })
 
+function subscribeCronEventsWhenAdmitted() {
+  if (
+    !appAutomaticRpcMounted
+    || !optionalSessionRpcAllowed.value
+    || !rpcStore.isConnected
+  ) return
+  void rpcStore.call('cron.subscribe', {}).catch(() => undefined)
+}
+
 function resumeAutomaticAppRpc() {
   if (!appAutomaticRpcMounted || !optionalSessionRpcAllowed.value) return
+  subscribeCronEventsWhenAdmitted()
   sessionListSubscription.resume()
   if (!appAutomaticRpcStarted) {
     appAutomaticRpcStarted = true
@@ -1479,6 +1479,13 @@ function resumeAutomaticAppRpc() {
 watch(optionalSessionRpcAllowed, admitted => {
   if (admitted) resumeAutomaticAppRpc()
 }, { flush: 'sync' })
+
+watch(
+  () => rpcStore.state,
+  state => {
+    if (state === 'connected') subscribeCronEventsWhenAdmitted()
+  },
+)
 
 function handleKeydown(e: KeyboardEvent) {
   // Chord bindings carry the primary modifier as Cmd on Apple platforms and Ctrl
@@ -1697,7 +1704,6 @@ onMounted(() => {
   // Keep the approval badge/count live app-wide, not just on the Approvals page.
   subscribeApprovals()
   unsubscribeCronFinished = rpcStore.on('cron.run.finished', handleCronRunFinished)
-  if (rpcStore.isConnected) void rpcStore.call('cron.subscribe', {}).catch(() => undefined)
   // Seed now in case the socket is already connected (the `_state` listener
   // covers later reconnects); recovers a request pending before mount.
   if (rpcStore.isConnected) void seedPendingApprovals()
