@@ -61,6 +61,7 @@ def scan_dream_candidates(
     max_batch_size: int,
     agent_id: str,
     quarantine_enabled: bool = True,
+    known_hashes: set[str] | None = None,
 ) -> list[RawDreamCandidate]:
     memory_dir = workspace / "memory"
     if not memory_dir.exists():
@@ -91,6 +92,10 @@ def scan_dream_candidates(
             snippet = snippet[:_SNIPPET_MAX_CHARS].rstrip()
         if not snippet:
             continue
+        # D10: skip files whose content hash matches a previously-seen candidate
+        snippet_sha = _sha256(snippet)
+        if known_hashes and snippet_sha in known_hashes:
+            continue
         candidates.append(
             (
                 stat.st_mtime,
@@ -101,7 +106,7 @@ def scan_dream_candidates(
                     source_mtime_ns=stat.st_mtime_ns,
                     source_size=stat.st_size,
                     snippet=snippet,
-                    snippet_sha256=_sha256(snippet),
+                    snippet_sha256=snippet_sha,
                     claim_sha256=_sha256(_normalize_snippet(snippet).lower()),
                     source_day=_source_day(path),
                     signal_kind=classify_signal(snippet),

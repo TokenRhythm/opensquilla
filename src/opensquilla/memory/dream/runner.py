@@ -134,6 +134,7 @@ class DreamResult:
 
     files_considered: int = 0
     files_processed: int = 0
+    files_skipped_unchanged: int = 0  # D10: content-hash dedup
     evidence_status: str = "skipped"  # skipped | ok | error
     apply_status: str = "skipped"  # skipped | ok | error
     evidence_ms: int = 0
@@ -188,6 +189,7 @@ class Dream:
             "cursor_after": result.cursor_after,
             "files_considered": result.files_considered,
             "files_processed": result.files_processed,
+            "files_skipped_unchanged": result.files_skipped_unchanged,
             "evidence_ms": result.evidence_ms,
             "evidence_status": result.evidence_status,
             "apply_ms": result.apply_ms,
@@ -253,12 +255,27 @@ class Dream:
                 or getattr(self.config, "dry_run", False)
             ),
         )
+        # D10: collect known content hashes for incremental dedup
+        d10_known_hashes: set[str] | None = None
+        try:
+            from opensquilla.memory.dream.evidence import load_evidence_store
+
+            _ev_store = load_evidence_store(self.workspace)
+            d10_known_hashes = {
+                e.snippet_sha256
+                for e in _ev_store.entries.values()
+                if e.snippet_sha256
+            }
+        except Exception:  # noqa: BLE001
+            pass  # D10 is best-effort; degrade to full scan
+
         raw_candidates = scan_dream_candidates(
             self.workspace,
             cursor=result.cursor_before,
             max_batch_size=getattr(self.config, "max_batch_size", 20),
             agent_id=getattr(self, "agent_id", "main"),
             quarantine_enabled=getattr(self.config, "evidence_quarantine_enabled", True),
+            known_hashes=d10_known_hashes,
         )
         result.files_considered = len(raw_candidates)
         if len(raw_candidates) < getattr(self.config, "min_batch_size", 1):
