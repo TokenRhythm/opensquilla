@@ -96,6 +96,7 @@ def classify_query_intent(query: str) -> tuple[QueryIntent, float]:
 QUERY_INTENT_BOOST: dict[QueryIntent, dict[ConstraintType, float]] = {
     QueryIntent.continue_task: {
         ConstraintType.goal: 1.5,
+        ConstraintType.event: 1.3,  # "上次做到哪了" needs event context
         ConstraintType.decision: 1.2,
     },
     QueryIntent.retrieve_rationale: {

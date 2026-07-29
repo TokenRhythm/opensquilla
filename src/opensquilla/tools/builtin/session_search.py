@@ -65,13 +65,13 @@ def create_session_search_tool(
                 ),
             },
         },
-        required=["query"],
+        required=[],  # query or anchor — validated at runtime (B5)
         owner_only=True,
         plan_access=PlanAccess.READ_ONLY,
         registry=registry,
     )
     async def session_search(
-        query: str,
+        query: str = "",
         session_id: str | None = None,
         limit: int = 20,
         anchor: str | None = None,

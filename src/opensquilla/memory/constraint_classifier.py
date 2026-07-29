@@ -18,7 +18,7 @@ import logging
 import re
 from typing import Awaitable, Callable
 
-from .types import CORE_CONSTRAINT_TYPES, ConstraintType
+from .types import CANDIDATE_KIND_TO_CONSTRAINT, CORE_CONSTRAINT_TYPES, ConstraintType
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +40,9 @@ _STATUS_PATTERNS = re.compile(
 
 # Patterns that indicate structured tool output (not natural language)
 _TOOL_OUTPUT_RE = re.compile(
-    r"(exit_code=\d+|traceback|\bstdout\b|\bstderr\b)"
-    r"|^[\d\s.,;:=+\-*/(){}\[\]<>\"'!@#$%^&|\\~`]+$"
+    r"(exit_code=\d+|traceback|\bstdout\s*:|\bstderr\s*:)"
+    r"|^[\d\s.,;:=+\-*/(){}\[\]<>\"'!@#$%^&|\\~`]+$",
+    re.IGNORECASE,
 )
 
 
@@ -211,6 +212,33 @@ def parse_frontmatter_constraint(text: str) -> ConstraintType | None:
         return None
 
 
+# ── Inline Constraint Marker (B4: flush path) ────────────────────────────
+
+_INLINE_CONSTRAINT_RE = re.compile(
+    r"<!--\s*opensquilla-constraint:\s*(\S+)\s*-->"
+)
+
+
+def parse_inline_constraint(text: str) -> ConstraintType | None:
+    """Extract constraint_type from inline HTML comment marker.
+
+    Session flush embeds ``<!-- opensquilla-constraint: <kind> -->`` in
+    rendered markdown bullets so the L1 classifier can use the LLM-extracted
+    candidate kind directly, bypassing heuristic classification.
+    """
+    m = _INLINE_CONSTRAINT_RE.search(text)
+    if not m:
+        return None
+    raw = m.group(1).strip().lower()
+    # Direct ConstraintType match (fact, event, preference, decision, procedure, goal)
+    try:
+        return ConstraintType(raw)
+    except ValueError:
+        pass
+    # Fallback: CANDIDATE_KIND_TO_CONSTRAINT mapping (e.g. "todo" -> goal)
+    return CANDIDATE_KIND_TO_CONSTRAINT.get(raw)
+
+
 # ── Unified Classification Entry Point ────────────────────────────────────
 
 
@@ -235,6 +263,11 @@ async def classify_constraint(
     if fm_type is not None:
         return fm_type, 1.0
 
+    # 1.5. Inline constraint marker from flush path (B4)
+    inline_type = parse_inline_constraint(text)
+    if inline_type is not None:
+        return inline_type, 0.9
+
     # 2. Signal Gate
     if not should_classify(text):
         return ConstraintType.fact, None
@@ -258,6 +291,11 @@ def classify_constraint_sync(text: str) -> tuple[ConstraintType, float | None]:
     fm_type = parse_frontmatter_constraint(text)
     if fm_type is not None:
         return fm_type, 1.0
+
+    # 1.5. Inline constraint marker from flush path (B4)
+    inline_type = parse_inline_constraint(text)
+    if inline_type is not None:
+        return inline_type, 0.9
 
     # 2. Signal Gate
     if not should_classify(text):

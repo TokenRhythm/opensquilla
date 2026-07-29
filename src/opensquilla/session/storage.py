@@ -7019,6 +7019,10 @@ class SessionStorage:
             return
         archived_at = _now_ms()
         # When anchor_enabled, sort by (created_at, id) for stable anchor IDs.
+        # NOTE (A4): The compaction LLM sees entries in original list order with
+        # anchor_base offsets.  If the input list is not already sorted by
+        # (created_at, id), the DB anchor IDs will differ from what the LLM
+        # referenced.  Callers MUST pass entries in chronological order.
         sorted_entries = (
             sorted(entries, key=lambda e: (e.created_at or 0, e.id or 0))
             if anchor_enabled
