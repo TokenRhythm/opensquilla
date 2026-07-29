@@ -2293,6 +2293,13 @@
       "colKind": "Tipo",
       "colTarget": "Destino",
       "colSchedule": "Programación",
+      "colWorkspace": "Proyecto",
+      "defaultWorkspace": "Espacio de trabajo predeterminado",
+      "noWorkspace": "Sin espacio de proyecto",
+      "workspaceUnavailable": "{name} (no disponible)",
+      "rebindWorkspace": "Volver a vincular",
+      "rebindBeforeRun": "Vuelve a vincular el espacio del proyecto antes de ejecutar",
+      "retry": "Reintentar",
       "colStatus": "Estado",
       "colLastRun": "Última ejecución",
       "colNextRun": "Próxima ejecución",
@@ -2393,6 +2400,12 @@
       ,"moreRuntimeSettings": "Más ajustes de ejecución (opcional)"
       ,"advancedTimeHint": "Úsalo solo si el selector de hora anterior no es suficiente."
       ,"timezoneSimpleHint": "Normalmente no es necesario cambiarlo."
+      ,"projectWorkspace": "Espacio de trabajo del proyecto"
+      ,"defaultWorkspace": "Usar el espacio de trabajo predeterminado"
+      ,"noWorkspace": "Sin espacio de proyecto"
+      ,"workspaceUnavailable": "{name} (no disponible)"
+      ,"workspaceRequiredHint": "Elige el proyecto que debe revisar esta tarea. La tarea trabajará únicamente dentro de ese proyecto."
+      ,"workspaceOptionalHint": "Opcional. Elige «Sin espacio de proyecto» para tareas generales o un proyecto cuando necesite sus archivos."
     },
     "form": {
       "cronPreviewPlaceholder": "Introduce una expresión cron de 5 campos para previsualizar",
@@ -2425,6 +2438,7 @@
         "agentTurn": "Prompt de la tarea"
       },
       "toastNameRequired": "El nombre es obligatorio",
+      "toastWorkspaceRequired": "Elige un espacio de trabajo de proyecto para esta tarea",
       "toastIntervalInvalid": "El intervalo debe ser un número entero de segundos",
       "toastIsoTimeRequired": "La hora ISO es obligatoria",
       "toastCurrentSessionRequired": "La clave de sesión actual es obligatoria",
@@ -2442,6 +2456,11 @@
       "toastRunFailed": "Error al ejecutar: {error}",
       "toastRunComplete": "Ejecución completada: {reply}",
       "toastTriggered": "Tarea disparada",
+      "toastConnectionRecovered": "Conexión restablecida y estado de tareas actualizado",
+      "toastConnectionRetry": "La conexión aún no se ha restablecido. Actualiza la página en breve.",
+      "toastBackgroundComplete": "La tarea «{name}» terminó. Consulta el resultado en el historial.",
+      "toastBackgroundFailed": "La tarea «{name}» falló. Usa el botón Reintentar de su tarjeta.",
+      "unnamedTask": "Tarea sin nombre",
       "toastDeleted": "Tarea eliminada",
       "running": "ejecutando",
       "awaitingUpdate": "a la espera de actualización",

@@ -2293,6 +2293,13 @@
       "colKind": "Kind",
       "colTarget": "Target",
       "colSchedule": "Schedule",
+      "colWorkspace": "Project",
+      "defaultWorkspace": "Default workspace",
+      "noWorkspace": "No project workspace",
+      "workspaceUnavailable": "{name} (unavailable)",
+      "rebindWorkspace": "Rebind",
+      "rebindBeforeRun": "Rebind the project workspace before running",
+      "retry": "Retry",
       "colStatus": "Status",
       "colLastRun": "Last Run",
       "colNextRun": "Next Run",
@@ -2393,6 +2400,12 @@
       ,"moreRuntimeSettings": "More runtime settings (optional)"
       ,"advancedTimeHint": "Use this only when the schedule picker above is not flexible enough."
       ,"timezoneSimpleHint": "Usually you do not need to change this."
+      ,"projectWorkspace": "Project workspace"
+      ,"defaultWorkspace": "Use the default workspace"
+      ,"noWorkspace": "No project workspace"
+      ,"workspaceUnavailable": "{name} (unavailable)"
+      ,"workspaceRequiredHint": "Choose the project this task should inspect. The task will read and work only in that project."
+      ,"workspaceOptionalHint": "Optional. Choose “No project workspace” for general tasks, or select a project when the task needs its files."
     },
     "form": {
       "cronPreviewPlaceholder": "Enter a 5-field cron expression to preview",
@@ -2425,6 +2438,7 @@
         "agentTurn": "Task prompt"
       },
       "toastNameRequired": "Name is required",
+      "toastWorkspaceRequired": "Choose a project workspace for this task",
       "toastIntervalInvalid": "Interval must be an integer number of seconds",
       "toastIsoTimeRequired": "ISO time is required",
       "toastCurrentSessionRequired": "Current session key is required",
@@ -2442,6 +2456,11 @@
       "toastRunFailed": "Run failed: {error}",
       "toastRunComplete": "Run complete: {reply}",
       "toastTriggered": "Job triggered",
+      "toastConnectionRecovered": "Connection restored and task status refreshed",
+      "toastConnectionRetry": "Connection is not restored yet. Refresh the page shortly.",
+      "toastBackgroundComplete": "Task “{name}” completed. View the result in run history.",
+      "toastBackgroundFailed": "Task “{name}” failed. Use the retry button on its card.",
+      "unnamedTask": "Unnamed task",
       "toastDeleted": "Job deleted",
       "running": "running",
       "awaitingUpdate": "awaiting update",

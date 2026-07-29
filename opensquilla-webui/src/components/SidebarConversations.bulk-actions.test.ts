@@ -52,6 +52,39 @@ async function mountSidebar(options: {
 }
 
 describe('SidebarConversations bulk actions', () => {
+  it('offers rename and delete actions for automation run records', async () => {
+    await mountSidebar({
+      sections: [{
+        family: 'automations',
+        label: 'Automations',
+        rows: [{
+          rowKind: 'session',
+          key: 'cron-session-1',
+          title: 'Cron isolated run',
+          effectiveAgentId: 'main',
+          agentName: 'Main',
+          sessionKind: 'cron',
+          depth: 0,
+          runStatus: 'idle',
+          runLabel: 'Idle',
+          updatedAt: Date.now(),
+          hasContractGaps: false,
+        }],
+      }],
+    })
+
+    const menuButton = document.body.querySelector<HTMLButtonElement>(
+      '[aria-label="Actions for Cron isolated run"]',
+    )
+    expect(menuButton).not.toBeNull()
+    menuButton?.click()
+    await nextTick()
+
+    const menuText = document.body.querySelector('.sidebar-row-menu')?.textContent
+    expect(menuText).toContain('Rename')
+    expect(menuText).toContain('Delete')
+  })
+
   it('does not render the conversations region until a session exists', async () => {
     const root = await mountSidebar({ sections: [] })
 

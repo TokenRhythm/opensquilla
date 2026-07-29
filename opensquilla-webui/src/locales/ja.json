@@ -2293,6 +2293,13 @@
       "colKind": "種類",
       "colTarget": "対象",
       "colSchedule": "スケジュール",
+      "colWorkspace": "プロジェクト",
+      "defaultWorkspace": "既定のワークスペース",
+      "noWorkspace": "プロジェクトワークスペースなし",
+      "workspaceUnavailable": "{name}（利用不可）",
+      "rebindWorkspace": "再設定",
+      "rebindBeforeRun": "実行前にプロジェクトワークスペースを再設定してください",
+      "retry": "再試行",
       "colStatus": "状態",
       "colLastRun": "前回実行",
       "colNextRun": "次回実行",
@@ -2393,6 +2400,12 @@
       ,"moreRuntimeSettings": "その他の実行設定（任意）"
       ,"advancedTimeHint": "上の時間選択で対応できない場合にのみ使用します。"
       ,"timezoneSimpleHint": "通常は変更不要です。"
+      ,"projectWorkspace": "プロジェクトワークスペース"
+      ,"defaultWorkspace": "既定のワークスペースを使用"
+      ,"noWorkspace": "プロジェクトワークスペースなし"
+      ,"workspaceUnavailable": "{name}（利用不可）"
+      ,"workspaceRequiredHint": "このタスクが確認するプロジェクトを選択してください。タスクは選択したプロジェクト内だけを処理します。"
+      ,"workspaceOptionalHint": "任意。一般的なタスクは「プロジェクトワークスペースなし」を選び、ファイルが必要な場合はプロジェクトを選択します。"
     },
     "form": {
       "cronPreviewPlaceholder": "プレビューするには 5 フィールドの cron 式を入力してください",
@@ -2425,6 +2438,7 @@
         "agentTurn": "タスクのプロンプト"
       },
       "toastNameRequired": "名前は必須です",
+      "toastWorkspaceRequired": "このタスクのプロジェクトワークスペースを選択してください",
       "toastIntervalInvalid": "間隔は整数の秒数である必要があります",
       "toastIsoTimeRequired": "ISO 時刻は必須です",
       "toastCurrentSessionRequired": "現在のセッションキーは必須です",
@@ -2442,6 +2456,11 @@
       "toastRunFailed": "実行に失敗しました: {error}",
       "toastRunComplete": "実行が完了しました: {reply}",
       "toastTriggered": "ジョブをトリガーしました",
+      "toastConnectionRecovered": "接続が復旧し、タスク状態を更新しました",
+      "toastConnectionRetry": "接続はまだ復旧していません。しばらくしてからページを更新してください。",
+      "toastBackgroundComplete": "タスク「{name}」が完了しました。実行履歴で結果を確認できます。",
+      "toastBackgroundFailed": "タスク「{name}」が失敗しました。カードの再試行ボタンを使用してください。",
+      "unnamedTask": "名称未設定のタスク",
       "toastDeleted": "ジョブを削除しました",
       "running": "実行中",
       "awaitingUpdate": "更新待ち",

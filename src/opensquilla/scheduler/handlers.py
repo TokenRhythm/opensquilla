@@ -236,12 +236,18 @@ def make_agent_run_handler(
 
         # Session setup
         if sm is not None:
+            workspace_id = job.payload.get("_workspace_id")
             try:
                 await sm.get_or_create(
                     session_key=session_key,
                     agent_id=agent_id,
                     display_name=f"Cron: {job.name[:50]}",
                 )
+                if isinstance(workspace_id, str) and workspace_id:
+                    storage = getattr(sm, "_storage", None)
+                    if storage is None or not hasattr(storage, "bind_session_workspace"):
+                        raise RuntimeError("project workspace storage is unavailable")
+                    await storage.bind_session_workspace(session_key, workspace_id)
                 _persisted = await sm.append_message(session_key, role="user", content=task)
                 if _persisted is not None and isinstance(_persisted.content, str):
                     task = _persisted.content
@@ -252,6 +258,8 @@ def make_agent_run_handler(
                     session_key=session_key,
                     exc_info=True,
                 )
+                if isinstance(workspace_id, str) and workspace_id:
+                    raise
 
         # Emit cron.run.start (pre-execution notification, best-effort)
         await delivery_chain.notify_start(job, task)

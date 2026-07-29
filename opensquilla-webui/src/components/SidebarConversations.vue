@@ -920,7 +920,7 @@ function onSelectRow(row: SidebarConversationItem) {
             <div
               v-if="
                 row.rowKind === 'session'
-                && row.sessionKind === 'chat'
+                && (row.sessionKind === 'chat' || row.sessionKind === 'cron')
                 && !row.provisional
                 && renamingKey !== row.key
                 && !selectionMode

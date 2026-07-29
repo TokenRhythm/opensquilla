@@ -1281,7 +1281,7 @@ async function uninstallSkillAndClose(name: string) {
   padding: 14px 2px 12px;
 }
 .sk-group--skills > .sk-grid {
-  padding: 0 0 18px;
+  padding: 16px 0 18px;
 }
 
 /* Skills page typography and alignment contract. */

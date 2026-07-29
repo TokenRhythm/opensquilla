@@ -2293,6 +2293,13 @@
       "colKind": "Art",
       "colTarget": "Ziel",
       "colSchedule": "Zeitplan",
+      "colWorkspace": "Projekt",
+      "defaultWorkspace": "Standard-Arbeitsbereich",
+      "noWorkspace": "Kein Projekt-Arbeitsbereich",
+      "workspaceUnavailable": "{name} (nicht verfügbar)",
+      "rebindWorkspace": "Neu verbinden",
+      "rebindBeforeRun": "Projekt-Arbeitsbereich vor der Ausführung neu verbinden",
+      "retry": "Erneut versuchen",
       "colStatus": "Status",
       "colLastRun": "Letzter Lauf",
       "colNextRun": "Nächster Lauf",
@@ -2393,6 +2400,12 @@
       ,"moreRuntimeSettings": "Weitere Ausführungseinstellungen (optional)"
       ,"advancedTimeHint": "Nur verwenden, wenn die obige Zeitauswahl nicht ausreicht."
       ,"timezoneSimpleHint": "Normalerweise ist keine Änderung erforderlich."
+      ,"projectWorkspace": "Projekt-Arbeitsbereich"
+      ,"defaultWorkspace": "Standard-Arbeitsbereich verwenden"
+      ,"noWorkspace": "Kein Projekt-Arbeitsbereich"
+      ,"workspaceUnavailable": "{name} (nicht verfügbar)"
+      ,"workspaceRequiredHint": "Wählen Sie das zu prüfende Projekt. Die Aufgabe arbeitet ausschließlich in diesem Projekt."
+      ,"workspaceOptionalHint": "Optional. Wählen Sie für allgemeine Aufgaben „Kein Projekt-Arbeitsbereich“ oder ein Projekt, wenn dessen Dateien benötigt werden."
     },
     "form": {
       "cronPreviewPlaceholder": "Geben Sie einen Cron-Ausdruck mit 5 Feldern ein, um eine Vorschau zu sehen",
@@ -2425,6 +2438,7 @@
         "agentTurn": "Aufgaben-Prompt"
       },
       "toastNameRequired": "Name ist erforderlich",
+      "toastWorkspaceRequired": "Wählen Sie einen Projekt-Arbeitsbereich für diese Aufgabe",
       "toastIntervalInvalid": "Das Intervall muss eine ganze Zahl in Sekunden sein",
       "toastIsoTimeRequired": "ISO-Zeit ist erforderlich",
       "toastCurrentSessionRequired": "Aktueller Sitzungsschlüssel ist erforderlich",
@@ -2442,6 +2456,11 @@
       "toastRunFailed": "Lauf fehlgeschlagen: {error}",
       "toastRunComplete": "Lauf abgeschlossen: {reply}",
       "toastTriggered": "Job ausgelöst",
+      "toastConnectionRecovered": "Verbindung wiederhergestellt und Aufgabenstatus aktualisiert",
+      "toastConnectionRetry": "Verbindung noch nicht wiederhergestellt. Bitte die Seite später aktualisieren.",
+      "toastBackgroundComplete": "Aufgabe „{name}“ abgeschlossen. Das Ergebnis ist im Ausführungsverlauf verfügbar.",
+      "toastBackgroundFailed": "Aufgabe „{name}“ fehlgeschlagen. Bitte die Schaltfläche zum erneuten Versuch verwenden.",
+      "unnamedTask": "Unbenannte Aufgabe",
       "toastDeleted": "Job gelöscht",
       "running": "läuft",
       "awaitingUpdate": "wartet auf Aktualisierung",

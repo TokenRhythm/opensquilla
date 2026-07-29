@@ -111,6 +111,8 @@
       :running-job-ids="runningJobIds"
       :bulk-mode="bulkMode"
       :selected-job-ids="selectedJobIds"
+      :project-workspaces="cronForm.projectWorkspaces.value"
+      :project-workspaces-loaded="cronForm.projectWorkspacesLoaded.value"
       @update:view-mode="cronJobs.viewMode.value = $event"
       @toggle-selection="toggleBulkSelection"
       @create="cronForm.openPanel(null)"
@@ -179,6 +181,8 @@
       :target-session-label="cronForm.targetSessionLabel.value"
       :target-session-hint="cronForm.targetSessionHint.value"
       :message-label="cronForm.messageLabel.value"
+      :project-workspaces="cronForm.projectWorkspaces.value"
+      :project-workspaces-loading="cronForm.projectWorkspacesLoading.value"
       @close="cronForm.closePanel"
       @save="cronForm.saveJob"
       @cron-input="cronForm.renderCronExplain(cronForm.form.cron)"
@@ -197,7 +201,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, ref } from 'vue'
+import { computed, nextTick, onActivated, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
@@ -232,6 +236,10 @@ const cronJobs = useCronJobs()
 const cronRuns = useCronRuns(selectedId)
 const cronForm = useCronForm({ afterSaved: cronJobs.loadData })
 
+onActivated(() => {
+  void cronForm.loadProjectWorkspaces().catch(() => undefined)
+})
+
 interface AutomationTemplate extends CronPanelTemplate {
   id: string
   title: string
@@ -257,7 +265,7 @@ const automationTemplates: AutomationTemplate[] = [
     expression: '0 8 * * *',
     payloadKind: 'agent_turn',
     sessionTarget: 'isolated',
-    message: '检索过去 24 小时的重要 AI 产品、模型与行业新闻。合并重复事件，按产品、技术、商业分类；每条包含标题、简短摘要、来源、发布时间和链接。最多保留 10 条，最后附来源清单，不要编造无法核验的信息。',
+    message: '检索过去 24 小时的重要 AI 产品、模型与行业新闻，合并重复事件并整理成面向普通用户的中文简报。检索、抓取、筛选、去重和核验必须静默完成：回复开头直接输出“过去 24 小时 AI 重要新闻简报”，禁止展示任务开始时间、检索窗口、搜索步骤、抓取过程、候选、自检、验证过程、舍弃条目或舍弃原因，也不要使用“我将”“让我”“正在”等过程性表述。每条新闻仅展示标题、简短摘要、发布时间、来源和可点击链接；链接应与当前新闻相符，不要混入其他事件的链接。优先选择官方来源或可靠媒体；发布时间能确认到日期即可，无法确认的细节不要补写。最多保留 10 条，不足时按实际数量输出。如果没有合适新闻，只写“过去 24 小时暂无值得关注的 AI 新闻”。最终回复只能包含简报正文和来源。',
   },
   {
     id: 'weekly-report',
@@ -271,6 +279,7 @@ const automationTemplates: AutomationTemplate[] = [
     expression: '30 17 * * 5',
     payloadKind: 'agent_turn',
     sessionTarget: 'isolated',
+    requiresWorkspace: true,
     message: '汇总本周已完成任务、进行中事项和主要交付物，整理为结构化周报。必须包含：本周成果、关键数据、风险与阻塞、需要协作的事项、下周三项最高优先级。对无法确认的信息明确标为待核验。',
   },
   {
@@ -299,7 +308,8 @@ const automationTemplates: AutomationTemplate[] = [
     expression: '0 10 * * 1-5',
     payloadKind: 'agent_turn',
     sessionTarget: 'isolated',
-    message: '检查当前工作区中的项目状态、近期错误日志、未完成事项与可能延期的交付。按高、中、低风险分级，说明证据、影响范围和建议动作。不要执行删除、发布或修改生产配置等不可逆操作。',
+    requiresWorkspace: true,
+    message: '仅检查当前绑定的项目空间，读取其中的项目文件、错误日志和待办记录。只报告有直接证据的项目风险，并按高、中、低风险分级，说明证据、影响范围和建议动作。缺少 Git 仓库、AGENTS.md、TOOLS.md、HEARTBEAT.md 等可选文件，以及本次巡检任务自身正在运行，均不得列为风险。不要检查 OpenSquilla 安装目录、Gateway、模型路由或系统依赖状态。没有证据的风险等级写“暂无”。不要执行删除、发布或修改生产配置等不可逆操作。',
   },
   {
     id: 'knowledge-review',
@@ -313,6 +323,7 @@ const automationTemplates: AutomationTemplate[] = [
     expression: '0 18 * * 0',
     payloadKind: 'agent_turn',
     sessionTarget: 'isolated',
+    requiresWorkspace: true,
     message: '整理本周新增的笔记、会议纪要与收藏内容。合并重复主题，提炼关键结论，建议标签和关联条目，并输出下周最值得继续消化的 5 项内容。保留原始来源路径或链接。',
   },
   {
@@ -569,6 +580,47 @@ async function confirmDelete() {
   height: 15px;
   margin: 0;
   width: 15px;
+}
+
+.cron-card__workspace,
+.cron-table__workspace {
+  align-items: center;
+  color: var(--text-muted);
+  display: flex;
+  font-size: var(--fs-xs);
+  gap: 6px;
+  min-width: 0;
+}
+
+.cron-card__workspace {
+  padding: 0 2px;
+}
+
+.cron-card__workspace span,
+.cron-table__workspace span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cron-card__workspace.is-unavailable,
+.cron-table__workspace.is-unavailable {
+  color: var(--danger);
+}
+
+.cron-workspace-rebind {
+  background: transparent;
+  border: 0;
+  color: var(--accent);
+  cursor: pointer;
+  flex: 0 0 auto;
+  font: inherit;
+  font-weight: 600;
+  padding: 0;
+}
+
+.cron-workspace-rebind:hover {
+  text-decoration: underline;
 }
 
 .cron-table__check {

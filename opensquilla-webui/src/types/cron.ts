@@ -22,6 +22,9 @@ export interface CronJob {
   wakeMode?: string
   wake_mode?: string
   agentId?: string
+  workspaceId?: string
+  workspaceName?: string
+  templateId?: string
   delivery?: DeliveryConfig
   originSessionKey?: string
   origin_session_key?: string
@@ -68,6 +71,7 @@ export interface CronRun {
 }
 
 export interface CronPanelTemplate {
+  id?: string
   name?: string
   expression?: string
   payloadKind?: string
@@ -81,6 +85,8 @@ export interface CronPanelTemplate {
   sessionTarget?: string
   agentId?: string
   targetSessionKey?: string
+  workspaceId?: string
+  requiresWorkspace?: boolean
 }
 
 export interface CronDeliveryFormValues {
@@ -100,6 +106,7 @@ export interface CronDeliveryFormValues {
 }
 
 export interface CronJobFormModel {
+  templateId: string
   name: string
   type: string
   cron: string
@@ -108,6 +115,8 @@ export interface CronJobFormModel {
   tz: string
   payloadKind: string
   agentId: string
+  workspaceId: string
+  workspaceRequired: boolean
   sessionTarget: string
   targetSessionKey: string
   message: string

@@ -457,6 +457,7 @@ import {
   optionalSessionRpcAllowed,
   optionalSessionRpcCallOptions,
 } from './composables/chat/sessionBootstrapAdmission'
+import { markCronFinishNotified } from './utils/cron/notifications'
 
 const appStore = useAppStore()
 const rpcStore = useRpcStore()
@@ -550,6 +551,43 @@ watch(
 // Settings → Appearance and the command palette.
 const { enabled: bgmEnabled } = useBgm()
 const webConfigEnabled = getPlatform().capabilities.hasWebConfig
+
+interface AppCronRunFinishedPayload {
+  jobId?: string
+  jobName?: string
+  success?: boolean
+}
+
+let unsubscribeCronFinished: (() => void) | null = null
+
+function handleCronRunFinished(payload: unknown) {
+  if (!payload || typeof payload !== 'object') return
+  const event = payload as AppCronRunFinishedPayload
+  const jobId = typeof event.jobId === 'string' ? event.jobId : ''
+  const jobName = event.jobName?.trim() || t('cronSkills.jobs.unnamedTask')
+  markCronFinishNotified(jobId)
+  if (event.success === false) {
+    pushToast(t('cronSkills.jobs.toastBackgroundFailed', { name: jobName }), {
+      tone: 'danger',
+      duration: 9_000,
+    })
+    return
+  }
+  pushToast(t('cronSkills.jobs.toastBackgroundComplete', { name: jobName }), {
+    tone: 'ok',
+    duration: 7_000,
+  })
+}
+
+watch(
+  () => rpcStore.state,
+  state => {
+    if (state === 'connected') {
+      void rpcStore.call('cron.subscribe', {}).catch(() => undefined)
+    }
+  },
+  { immediate: true },
+)
 
 installSessionNavigationDiagConsole()
 
@@ -1658,6 +1696,8 @@ onMounted(() => {
   resumeAutomaticAppRpc()
   // Keep the approval badge/count live app-wide, not just on the Approvals page.
   subscribeApprovals()
+  unsubscribeCronFinished = rpcStore.on('cron.run.finished', handleCronRunFinished)
+  if (rpcStore.isConnected) void rpcStore.call('cron.subscribe', {}).catch(() => undefined)
   // Seed now in case the socket is already connected (the `_state` listener
   // covers later reconnects); recovers a request pending before mount.
   if (rpcStore.isConnected) void seedPendingApprovals()
@@ -1670,6 +1710,9 @@ onUnmounted(() => {
   if (sessionRefreshTimer) clearTimeout(sessionRefreshTimer)
   sessionListSubscription.cleanup()
   unsubscribeApprovals()
+  unsubscribeCronFinished?.()
+  unsubscribeCronFinished = null
+  void rpcStore.call('cron.unsubscribe', {}).catch(() => undefined)
   if (titleDebounce) {
     clearTimeout(titleDebounce)
     titleDebounce = null

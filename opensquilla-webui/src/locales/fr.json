@@ -2293,6 +2293,13 @@
       "colKind": "Type",
       "colTarget": "Cible",
       "colSchedule": "Planification",
+      "colWorkspace": "Projet",
+      "defaultWorkspace": "Espace de travail par défaut",
+      "noWorkspace": "Aucun espace de projet",
+      "workspaceUnavailable": "{name} (indisponible)",
+      "rebindWorkspace": "Réassocier",
+      "rebindBeforeRun": "Réassociez l’espace de projet avant l’exécution",
+      "retry": "Réessayer",
       "colStatus": "État",
       "colLastRun": "Dernière exécution",
       "colNextRun": "Prochaine exécution",
@@ -2393,6 +2400,12 @@
       ,"moreRuntimeSettings": "Autres paramètres d’exécution (facultatif)"
       ,"advancedTimeHint": "À utiliser uniquement si le sélecteur ci-dessus ne suffit pas."
       ,"timezoneSimpleHint": "Il n’est généralement pas nécessaire de modifier ce réglage."
+      ,"projectWorkspace": "Espace de travail du projet"
+      ,"defaultWorkspace": "Utiliser l’espace de travail par défaut"
+      ,"noWorkspace": "Aucun espace de projet"
+      ,"workspaceUnavailable": "{name} (indisponible)"
+      ,"workspaceRequiredHint": "Choisissez le projet à examiner. La tâche travaillera uniquement dans ce projet."
+      ,"workspaceOptionalHint": "Facultatif. Choisissez « Aucun espace de projet » pour une tâche générale, ou un projet si ses fichiers sont nécessaires."
     },
     "form": {
       "cronPreviewPlaceholder": "Saisissez une expression cron à 5 champs pour la prévisualiser",
@@ -2425,6 +2438,7 @@
         "agentTurn": "Invite de la tâche"
       },
       "toastNameRequired": "Le nom est requis",
+      "toastWorkspaceRequired": "Choisissez un espace de travail de projet pour cette tâche",
       "toastIntervalInvalid": "L'intervalle doit être un nombre entier de secondes",
       "toastIsoTimeRequired": "L'heure ISO est requise",
       "toastCurrentSessionRequired": "La clé de session actuelle est requise",
@@ -2442,6 +2456,11 @@
       "toastRunFailed": "Échec de l'exécution : {error}",
       "toastRunComplete": "Exécution terminée : {reply}",
       "toastTriggered": "Tâche déclenchée",
+      "toastConnectionRecovered": "Connexion rétablie et état des tâches actualisé",
+      "toastConnectionRetry": "La connexion n’est pas encore rétablie. Actualisez bientôt la page.",
+      "toastBackgroundComplete": "La tâche « {name} » est terminée. Consultez le résultat dans l’historique.",
+      "toastBackgroundFailed": "La tâche « {name} » a échoué. Utilisez le bouton Réessayer de sa carte.",
+      "unnamedTask": "Tâche sans nom",
       "toastDeleted": "Tâche supprimée",
       "running": "en cours",
       "awaitingUpdate": "en attente de mise à jour",

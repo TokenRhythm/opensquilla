@@ -10,11 +10,13 @@ Covers:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from opensquilla.gateway.rpc import RpcContext
 from opensquilla.gateway.rpc_cron import _handle_cron_add, _handle_cron_update, _job_to_wire
-from opensquilla.scheduler.payloads import AGENT_TURN_KIND
+from opensquilla.scheduler.payloads import AGENT_TURN_KIND, normalize_contract
 from opensquilla.scheduler.types import CronJob, DeliveryConfig, ScheduleKind
 
 
@@ -75,6 +77,27 @@ class _FakeScheduler:
         return self.job
 
 
+def test_scheduler_normalization_preserves_validated_workspace_metadata() -> None:
+    _, payload, _, _ = normalize_contract(
+        handler_key="agent_run",
+        payload={
+            "kind": AGENT_TURN_KIND,
+            "task": "inspect",
+            "agent_id": "main",
+            "_workspace_id": "project-123",
+            "_workspace_name": "Customer portal",
+            "_template_id": "project-risk",
+            "untrusted_extra": "drop me",
+        },
+        session_target="isolated",
+    )
+
+    assert payload["_workspace_id"] == "project-123"
+    assert payload["_workspace_name"] == "Customer portal"
+    assert payload["_template_id"] == "project-risk"
+    assert "untrusted_extra" not in payload
+
+
 @pytest.mark.asyncio
 async def test_rpc_create_with_structured_cron_returns_normalized_expression() -> None:
     scheduler = _FakeScheduler()
@@ -97,6 +120,74 @@ async def test_rpc_create_with_structured_cron_returns_normalized_expression() -
     assert result["expression"] == "*/5 * * * *"
     assert result["scheduleRaw"] == "*/5 * * * *"
     assert result["scheduleKind"] == "cron"
+
+
+@pytest.mark.asyncio
+async def test_rpc_create_persists_a_validated_project_workspace(monkeypatch) -> None:
+    scheduler = _FakeScheduler()
+    storage = object()
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_cron.get_session_storage",
+        lambda _manager: storage,
+    )
+
+    async def resolve_workspace(candidate, workspace_id):
+        assert candidate is storage
+        assert workspace_id == "project-123"
+        return SimpleNamespace(
+            workspace=SimpleNamespace(display_name="Customer portal"),
+        )
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_cron.resolve_validated_project_workspace",
+        resolve_workspace,
+    )
+
+    result = await _handle_cron_add(
+        {
+            "name": "project check",
+            "schedule": {"kind": "cron", "expr": "0 9 * * 1"},
+            "payloadKind": AGENT_TURN_KIND,
+            "text": "inspect the project",
+            "agentId": "main",
+            "workspaceId": "project-123",
+            "templateId": "project-risk",
+        },
+        RpcContext(
+            conn_id="test",
+            cron_scheduler=scheduler,
+            session_manager=object(),
+        ),
+    )
+
+    assert scheduler.added is not None
+    assert scheduler.added["payload"]["_workspace_id"] == "project-123"
+    assert scheduler.added["payload"]["_workspace_name"] == "Customer portal"
+    assert scheduler.added["payload"]["_template_id"] == "project-risk"
+    assert result["workspaceId"] == "project-123"
+    assert result["workspaceName"] == "Customer portal"
+    assert result["templateId"] == "project-risk"
+
+
+@pytest.mark.asyncio
+async def test_rpc_create_rejects_a_project_template_without_a_workspace() -> None:
+    scheduler = _FakeScheduler()
+
+    with pytest.raises(ValueError, match="requires a project workspace"):
+        await _handle_cron_add(
+            {
+                "name": "project check",
+                "schedule": {"kind": "cron", "expr": "0 9 * * 1"},
+                "payloadKind": AGENT_TURN_KIND,
+                "text": "inspect the project",
+                "agentId": "main",
+                "templateId": "project-risk",
+            },
+            RpcContext(conn_id="test", cron_scheduler=scheduler),
+        )
+
+    assert scheduler.added is None
 
 
 @pytest.mark.asyncio

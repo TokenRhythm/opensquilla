@@ -15,6 +15,7 @@ afterEach(() => {
 
 function formModel(): CronJobFormModel {
   return {
+    templateId: '',
     name: 'test',
     type: 'cron',
     cron: '0 9 * * *',
@@ -23,6 +24,8 @@ function formModel(): CronJobFormModel {
     tz: '',
     payloadKind: 'reminder',
     agentId: 'main',
+    workspaceId: '',
+    workspaceRequired: false,
     sessionTarget: 'isolated',
     targetSessionKey: '',
     message: 'hello',
@@ -65,6 +68,8 @@ function mountPanel() {
       targetSessionLabel: '',
       targetSessionHint: '',
       messageLabel: '',
+      projectWorkspaces: [],
+      projectWorkspacesLoading: false,
     }),
   })
   app.use(createI18n({
