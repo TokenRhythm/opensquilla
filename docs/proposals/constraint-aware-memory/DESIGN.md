@@ -1,6 +1,7 @@
 # Constraint-Aware Memory: 设计提案
 
-> **Status**: Draft / Ready for implementation
+> **Status**: Active development — L0/D12/L1/L2 ✅ implemented, L3 🔶 pending
+> **Version**: v1.2 (2026-07-29)
 > **Branch**: `feature/constraint-aware-memory`
 > **Base**: `origin/main`
 > **Date**: 2026-07-29
@@ -57,7 +58,7 @@
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 1.1 关键缺口：归档 Transcript 不可达
+### 1.1 关键缺口：归档 Transcript 不可达（✅ 已由 L0 修复）
 
 Compaction 后，原始 entries 被移入 `compacted_transcript_entries`。该表：
 
@@ -127,9 +128,23 @@ L2 (routing)        ── 依赖 L1（需要 constraint_type 元数据）
 L3 (sufficiency)    ── 依赖 L2（需要路由后的结果）
 ```
 
+### 实现状态（2026-07-29）
+
+| 层 | 状态 | Commit | Feature Flag | 测试 |
+|----|------|--------|-------------|------|
+| L0 | ✅ 已实现 | `648628e6` | always on | 回归通过 |
+| D12 | ✅ 已实现 | `6038ff55` | `compaction.anchor_enabled` | 20 tests |
+| L1 | ✅ 已实现 | `ef5fc037` | `memory.experimental.constraint_annotation` | 55 tests |
+| L2 | ✅ 已实现 | `69d7fdd8` | `memory.experimental.constraint_routing` | 43 tests |
+| L3 | 🔶 待实现 | — | `memory.experimental.sufficiency_check` | — |
+
+**全套件**: 159 passed, 6 skipped, 0 failures
+
 ---
 
 ## 4. Layer 0: 归档 Transcript 可搜索
+
+> **✅ 已实现** (`648628e6`) — FTS5 索引 + 触发器 + `include_archived` 参数 + 存量回填
 
 ### 4.1 为什么是必做的基础设施
 
@@ -221,6 +236,8 @@ WHERE content IS NOT NULL;
 ---
 
 ## 5. Layer 1: 约束类型标注
+
+> **✅ 已实现** (`ef5fc037`) — Signal Gate + LLM/启发式三级降级 + frontmatter 覆盖 + 置信度保护
 
 **Config gate**: `memory.experimental.constraint_annotation = false`
 
@@ -328,6 +345,8 @@ Sync 时解析 frontmatter → 覆盖 LLM 分类结果。
 
 ## 6. Layer 2: 约束感知检索路由
 
+> **✅ 已实现** (`69d7fdd8`) — QueryIntent 5 种意图 + 双语启发式 + boost [0.85, 1.8] + D9 Provenance Marker
+
 **Config gate**: `memory.experimental.constraint_routing = false`
 **Depends on**: Layer 1
 
@@ -378,6 +397,8 @@ constraint_routing enabled
 ---
 
 ## 7. Layer 3: 检索充分性检查
+
+> **🔶 待实现** — 元认知提示注入（不阻塞）；触发：results<3 AND intent_confidence>0.7
 
 **Config gate**: `memory.experimental.sufficiency_check = false`
 **Depends on**: Layer 2
@@ -490,14 +511,14 @@ Layer 0 无开关，始终启用（基础设施修复）。
 
 ## 10. 版本路线图
 
-| 版本 | 范围 | 门控 |
-|------|------|------|
-| v0.6.x | Layer 0（归档 FTS）作为基础设施修复 | 始终启用 |
-| v0.7.0 | Layer 1 + 2 作为 experimental，默认关闭 | Config gate |
-| v0.7.x | 收集约束分类准确率数据 | Telemetry |
-| v0.8.0 | 若准确率 > 85%：Layer 1+2 默认开启 | 数据驱动 |
-| v0.9.0 | Layer 3 作为 experimental | Config gate |
-| v1.0.0 | 评估用充分性检查替代 coverage check | 验证 |
+| 版本 | 范围 | 门控 | 状态 |
+|------|------|------|------|
+| v0.6.x | Layer 0 + D12 (Compaction Anchor) | 始终启用 / config | ✅ 已实现 |
+| v0.7.0 | Layer 1 + 2 作为 experimental，默认关闭 | Config gate | ✅ 已实现 |
+| v0.7.x | 收集约束分类准确率数据 | Telemetry | 🔶 待启动 |
+| v0.8.0 | 若准确率 > 85%：Layer 1+2 默认开启 | 数据驱动 | 🔶 待启动 |
+| v0.9.0 | Layer 3 作为 experimental | Config gate | 🔶 待实现 |
+| v1.0.0 | 评估用充分性检查替代 coverage check | 验证 | 🔶 待评估 |
 
 ---
 
@@ -548,6 +569,17 @@ score = (
 ---
 
 ## 13. 测试策略
+
+### 实际测试结果（2026-07-29）
+
+| 模块 | 测试数 | 状态 |
+|------|--------|------|
+| L1 约束类型标注 | 55 | ✅ 全部通过 |
+| L2 约束感知检索路由 | 43 | ✅ 全部通过 |
+| D12 Compaction Anchor | 20 | ✅ 全部通过 |
+| 回归（全套件） | 159 passed, 6 skipped | ✅ 0 failures |
+
+### 计划测试矩阵
 
 | 层 | 测试类型 | 方法 |
 |----|---------|------|
@@ -603,3 +635,8 @@ score = (
 | `src/opensquilla/session/storage.py` | Transcript 存储 + FTS |
 | `src/opensquilla/session/compaction.py` | Context 压缩主逻辑 |
 | `src/opensquilla/session/compaction_state.py` | 结构化摘要 + obligation |
+| `src/opensquilla/memory/constraint_classifier.py` | L1: Signal Gate + LLM/启发式分类 |
+| `src/opensquilla/memory/constraint_routing.py` | L2: QueryIntent 分类 + boost + D9 marker |
+| `src/opensquilla/gateway/config.py` | MemoryExperimentalConfig (L1/L2/L3 flags) |
+| `tests/test_memory/test_constraint_annotation.py` | L1: 55 tests |
+| `tests/test_memory/test_constraint_routing.py` | L2: 43 tests |
