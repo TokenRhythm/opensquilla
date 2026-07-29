@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .source_paths import is_searchable_source_path
+from .constraint_routing import apply_constraint_boost, classify_query_intent
 from .store import LongTermMemoryStore
 from .types import (
     MemorySearchOpts,
@@ -169,6 +170,7 @@ class MemoryRetriever:
         source_weights: dict[MemorySource, float] | None = None,
         sync_manager: Any | None = None,
         effective_metadata: dict[str, str] | None = None,
+        constraint_routing_enabled: bool = False,
     ) -> None:
         self._store = store
         self._temporal_decay_enabled = temporal_decay_enabled
@@ -180,6 +182,7 @@ class MemoryRetriever:
         self._source_weights = source_weights or {MemorySource.sessions: 0.92}
         self._sync_manager = sync_manager
         self._effective_metadata = dict(effective_metadata or {})
+        self._constraint_routing_enabled = constraint_routing_enabled
 
     async def search(
         self,
@@ -245,6 +248,11 @@ class MemoryRetriever:
         ]
         filtered.sort(key=lambda r: _rank_score(r, self._source_weights), reverse=True)
 
+        # L2: Constraint-aware routing boost (experimental, default off)
+        if self._constraint_routing_enabled:
+            query_intent, _ = classify_query_intent(query)
+            filtered = apply_constraint_boost(filtered, query_intent)
+
         if self._mmr_enabled:
             weighted = [
                 _copy_result_with_score(r, _rank_score(r, self._source_weights))
@@ -263,6 +271,11 @@ class MemoryRetriever:
             result.metadata["search_intent"] = intent.value
         return k_selected
 
+    @property
+    def constraint_routing_enabled(self) -> bool:
+        """Whether L2 constraint-aware routing is active."""
+        return self._constraint_routing_enabled
+
     async def close(self) -> None:
         return None
 
@@ -274,4 +287,6 @@ class MemoryRetriever:
             "text_weight": str(self._text_weight),
         }
         metadata.update(self._effective_metadata)
+        if self._constraint_routing_enabled:
+            metadata["constraint_routing"] = "on"
         return metadata

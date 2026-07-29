@@ -594,6 +594,11 @@ async def build_memory_managers(
                 text_weight=effective_text_weight,
                 sync_manager=in_flight_sync,
                 effective_metadata=retrieval_metadata,
+                constraint_routing_enabled=getattr(
+                    getattr(cfg, "experimental", None),
+                    "constraint_routing",
+                    False,
+                ),
             )
 
             turn_capture = TurnCaptureService(

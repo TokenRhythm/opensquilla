@@ -1,6 +1,6 @@
 # Constraint-Aware Memory: 进度跟踪
 
-> **Last updated**: 2026-07-29 (L1 implemented)
+> **Last updated**: 2026-07-29 (L2 implemented)
 > **Branch**: `feature/constraint-aware-memory`
 
 ---
@@ -11,8 +11,8 @@
 |----|------|------|--------|-------------|
 | L0 | 归档 Transcript 可搜索 | ✅ 已实现 | `648628e6` | always on |
 | D12 | Compaction Anchor | ✅ 已实现 | `6038ff55` | `compaction.anchor_enabled` |
-| L1 | 约束类型标注 | ✅ 已实现 | pending | `memory.experimental.constraint_annotation` |
-| L2 | 约束感知检索路由 | ⬜ 待实现 | — | `memory.experimental.constraint_routing` |
+| L1 | 约束类型标注 | ✅ 已实现 | `ef5fc037` | `memory.experimental.constraint_annotation` |
+| L2 | 约束感知检索路由 | ✅ 已实现 | pending | `memory.experimental.constraint_routing` |
 | L3 | 检索充分性检查 | ⬜ 待实现 | — | `memory.experimental.sufficiency_check` |
 
 ---
@@ -60,7 +60,7 @@ c7cef6fe docs(constraint-aware-memory): add alignment record, Codex comparison, 
 
 ---
 
-## L1: 约束类型标注 🔶
+## L1: 约束类型标注 ✅
 
 ### 已对齐设计决策
 
@@ -103,21 +103,44 @@ Total: 75 passed
 
 ---
 
-## L2: 约束感知检索路由 ⬜
+## L2: 约束感知检索路由 ✅
 
 ### 已对齐设计决策
 
 | # | 决策 | 内容 |
 |---|------|------|
-| D3 | Boost 范围 | [0.85, 1.8] |
+| D3 | Boost 范围 | [0.85, 1.8]，永不完全抑制 |
 | D9 | Provenance Marker | `<memory_result type="..." confidence="...">` |
+| D4 | L3 触发条件 | results < 3 AND intent_confidence > 0.7 AND constraint_routing_enabled |
 
-### 待实现
+### 实现步骤
 
-1. Query 意图分类（5 种）
-2. Boost 计算 + 排序
-3. Provenance Marker 注入
-4. 降级链
+- [x] 1. Store 检索路径返回 constraint_type + constraint_confidence 元数据
+- [x] 2. `constraint_routing.py` 新模块：QueryIntent 枚举 + 意图分类 + boost 计算 + marker
+- [x] 3. `MemoryRetriever` 集成 boost（feature flag 控制）
+- [x] 4. D9 Provenance Marker 注入到 `memory_tools.py`
+- [x] 5. Manager 接线 config flag → retriever
+- [x] 6. Tests: 43/43 ✅（intent + boost + marker + degradation + regression）
+
+### 改动文件
+
+| 文件 | 变更 |
+|------|------|
+| `src/opensquilla/memory/constraint_routing.py` | **新文件**：QueryIntent + 意图分类 + boost + D9 marker |
+| `src/opensquilla/memory/store.py` | FTS/hybrid 检索 SQL 加 constraint 列 + metadata 填充 |
+| `src/opensquilla/memory/retrieval.py` | MemoryRetriever 加 `constraint_routing_enabled` + boost 调用 + 公开属性 |
+| `src/opensquilla/memory/manager.py` | 接线 config flag → retriever constructor |
+| `src/opensquilla/tools/builtin/memory_tools.py` | D9 Provenance Marker 注入 |
+| `tests/test_memory/test_constraint_routing.py` | **新文件**：43 个测试 |
+
+### 测试结果
+
+```
+tests/test_memory/test_constraint_routing.py: 43 passed
+tests/test_memory/test_constraint_annotation.py: 55 passed (no regression)
+tests/test_session/test_compaction_anchor.py: 20 passed (no regression)
+Total: 159 passed, 6 skipped, 0 failures
+```
 
 ---
 

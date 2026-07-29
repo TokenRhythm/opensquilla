@@ -29,6 +29,10 @@ from typing import TYPE_CHECKING, Any, Final, NamedTuple
 
 import structlog
 
+from opensquilla.memory.constraint_routing import (
+    format_provenance_marker,
+    should_add_provenance_marker,
+)
 from opensquilla.memory.redaction import redact_memory_text
 from opensquilla.memory.source_paths import is_memory_source_path, is_searchable_source_path
 from opensquilla.memory.types import (
@@ -680,10 +684,15 @@ def create_memory_tools(
         if not results:
             return "No results found."
 
+        # D9: Provenance marker — only when L2 routing is active
+        _routing_on = getattr(r.retriever, "constraint_routing_enabled", False)
+
         lines = []
         for i, result in enumerate(results, 1):
             citation = result.citation or f"{result.path}#L{result.start_line}-L{result.end_line}"
             evidence = _bounded_memory_search_evidence(result.text or result.snippet, query=query)
+            if _routing_on and should_add_provenance_marker(result):
+                evidence = format_provenance_marker(result, evidence)
             lines.append(
                 f"[{i}] {result.path} "
                 f"(source: {result.source.value}; lines {result.start_line}-{result.end_line}; "

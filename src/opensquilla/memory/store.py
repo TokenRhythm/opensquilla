@@ -1027,6 +1027,7 @@ class LongTermMemoryStore:
         try:
             sql = """
             SELECT chunks_fts.id, c.path, c.source, c.start_line, c.end_line, c.text,
+                   c.constraint_type, c.constraint_confidence,
                    bm25(chunks_fts) as rank
             FROM chunks_fts
             JOIN chunks c ON c.id = chunks_fts.id
@@ -1044,8 +1045,13 @@ class LongTermMemoryStore:
             results = []
             relaxed_results = []
             for row in rows:
-                cid, path, source, sl, el, text, rank = row
+                cid, path, source, sl, el, text, ct, cc, rank = row
                 score = _bm25_to_score(rank)
+                _fts_meta: dict[str, str] = {}
+                if ct:
+                    _fts_meta["constraint_type"] = ct
+                if cc is not None:
+                    _fts_meta["constraint_confidence"] = str(cc)
                 result = MemorySearchResult(
                     chunk_id=cid,
                     path=path,
@@ -1056,6 +1062,7 @@ class LongTermMemoryStore:
                     score=score,
                     text_score=score,
                     text=text,
+                    metadata=_fts_meta,
                     citation=f"{path}#L{sl}-L{el}",
                 )
                 relaxed_results.append(result)
@@ -1123,7 +1130,8 @@ class LongTermMemoryStore:
         placeholders = ",".join("?" * len(all_ids))
         assert self._db is not None
         async with self._db.execute(
-            "SELECT id, path, source, start_line, end_line, text, hash"
+            "SELECT id, path, source, start_line, end_line, text, hash,"
+            " constraint_type, constraint_confidence"
             f" FROM chunks WHERE id IN ({placeholders})",
             all_ids,
         ) as cur:
@@ -1138,6 +1146,11 @@ class LongTermMemoryStore:
             tscore = s.get("text", 0.0)
             combined = vector_weight * vscore + text_weight * tscore
             if combined >= min_score:
+                _hs_meta: dict[str, str] = {}
+                if row[7]:
+                    _hs_meta["constraint_type"] = row[7]
+                if row[8] is not None:
+                    _hs_meta["constraint_confidence"] = str(row[8])
                 results.append(
                     MemorySearchResult(
                         chunk_id=cid,
@@ -1151,6 +1164,7 @@ class LongTermMemoryStore:
                         text_score=tscore,
                         text=row[5],
                         chunk_hash=row[6],
+                        metadata=_hs_meta,
                         citation=f"{row[1]}#L{row[3]}-L{row[4]}",
                     )
                 )
@@ -1167,6 +1181,15 @@ class LongTermMemoryStore:
                 row = chunk_rows[cid]
                 vscore = s.get("vector", 0.0)
                 combined = vector_weight * vscore + text_weight * tscore
+                _lg_meta: dict[str, str] = {
+                    LEXICAL_GUARANTEE_METADATA_KEY: (
+                        LEXICAL_GUARANTEE_METADATA_VALUE
+                    )
+                }
+                if row[7]:
+                    _lg_meta["constraint_type"] = row[7]
+                if row[8] is not None:
+                    _lg_meta["constraint_confidence"] = str(row[8])
                 lexical_guarantees.append(
                     MemorySearchResult(
                         chunk_id=cid,
@@ -1180,11 +1203,7 @@ class LongTermMemoryStore:
                         text_score=tscore,
                         text=row[5],
                         chunk_hash=row[6],
-                        metadata={
-                            LEXICAL_GUARANTEE_METADATA_KEY: (
-                                LEXICAL_GUARANTEE_METADATA_VALUE
-                            )
-                        },
+                        metadata=_lg_meta,
                         citation=f"{row[1]}#L{row[3]}-L{row[4]}",
                     )
                 )
@@ -1199,6 +1218,15 @@ class LongTermMemoryStore:
                 tscore = s.get("text", 0.0)
                 combined = vector_weight * vscore + text_weight * tscore
                 if combined >= relaxed_min_score or tscore >= min_score:
+                    _rx_meta: dict[str, str] = {
+                        RELAXED_KEYWORD_MATCH_METADATA_KEY: (
+                            RELAXED_KEYWORD_MATCH_METADATA_VALUE
+                        )
+                    }
+                    if row[7]:
+                        _rx_meta["constraint_type"] = row[7]
+                    if row[8] is not None:
+                        _rx_meta["constraint_confidence"] = str(row[8])
                     results.append(
                         MemorySearchResult(
                             chunk_id=cid,
@@ -1212,11 +1240,7 @@ class LongTermMemoryStore:
                             text_score=tscore,
                             text=row[5],
                             chunk_hash=row[6],
-                            metadata={
-                                RELAXED_KEYWORD_MATCH_METADATA_KEY: (
-                                    RELAXED_KEYWORD_MATCH_METADATA_VALUE
-                                )
-                            },
+                            metadata=_rx_meta,
                             citation=f"{row[1]}#L{row[3]}-L{row[4]}",
                         )
                     )

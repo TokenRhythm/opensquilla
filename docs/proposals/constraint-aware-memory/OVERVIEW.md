@@ -167,7 +167,7 @@ L0 无开关，始终启用（基础设施修复）。
 |------|------|------|------|
 | v0.6.x | L0（归档 FTS） | 始终启用 | ✅ 已实现 |
 | v0.6.x | D12（Compaction Anchor） | Config gate | ✅ 已实现 |
-| v0.7.0 | L1 + L2 作为 experimental | Config gate | ✅ L1 已实现 / L2 待实现 |
+| v0.7.0 | L1 + L2 作为 experimental | Config gate | 🔶 L1 已实现 / L2 已实现 |
 | v0.7.x | 收集约束分类准确率数据 | Telemetry | ⬜ |
 | v0.8.0 | 扩展 4 类激活 + L1+2 默认开启 | 数据驱动 | ⬜ |
 | v0.9.0 | L3 作为 experimental | Config gate | ⬜ |
@@ -187,6 +187,7 @@ L0 无开关，始终启用（基础设施修复）。
 | L0 实现 spec | `SPEC_L0_ARCHIVED_TRANSCRIPT_SEARCH.md` | ✅ 已实现 |
 | D12 实现 spec | `SPEC_D12_COMPACTION_ANCHOR.md` | ✅ 已实现 |
 | L1 实现 spec | `SPEC_L1_CONSTRAINT_ANNOTATION.md` | ✅ 已实现 |
+| L2 实现 spec | `SPEC_L2_CONSTRAINT_ROUTING.md` | ✅ 已实现 |
 
 ---
 
