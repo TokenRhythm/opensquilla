@@ -184,13 +184,53 @@ Total: 278 passed, 6 skipped, 0 failures
 
 ---
 
+## A1-3: LLM 注入 Store 直接索引路径 ✅
+
+### 改动文件
+
+| 文件 | 变更 |
+|------|------|
+| `src/opensquilla/memory/store.py` | `__init__` 加 `constraint_llm_call`；`index_file` 事务外分类 |
+| `src/opensquilla/memory/manager.py` | `_make_constraint_llm_call()` 适配器 + 传参 |
+| `src/opensquilla/gateway/boot.py` | 传 `provider_selector` 给 `build_memory_managers` |
+| `tests/test_memory/test_constraint_annotation.py` | 9 个 A1-3 新测试 |
+
+### 测试结果
+
+```
+tests/test_memory/test_constraint_annotation.py: 140 passed
+```
+
+---
+
+## D11: Usage Tracking + D5: Dream 评分增强 ✅
+
+### 改动文件
+
+| 文件 | 变更 |
+|------|------|
+| `src/opensquilla/memory/store.py` | `chunk_usage` 表 + `record_chunk_usage()` + `get_usage_stats()` + `get_dominant_constraint_types()` |
+| `src/opensquilla/memory/retrieval.py` | `usage_tracking_enabled` flag + search() 非阻塞写入 |
+| `src/opensquilla/gateway/config.py` | `memory.experimental.usage_tracking` |
+| `src/opensquilla/memory/dream/ranking.py` | D5 增强评分公式 + stability/cross_task 项 |
+| `src/opensquilla/memory/dream/runner.py` | 注入 usage_stats + constraint_types |
+| `src/opensquilla/memory/dream_factory.py` | `memory_stores` 接线 |
+| `src/opensquilla/gateway/boot.py` | 传 `memory_stores` 给 factory |
+| `tests/test_memory/test_usage_tracking.py` | 24 个新测试 |
+
+### 测试结果
+
+```
+tests/test_memory/test_usage_tracking.py: 24 passed
+Total regression: 616 passed, 7 skipped (1 pre-existing failure unrelated)
+```
+
+---
+
 ## 后议项
 
 | # | 内容 | 优先级 |
 |---|------|--------|
-| D5 | Dream 评分权重重分配 | 🟡 中期 |
 | D10 | Dream 增量 Diff 模式 | 🟡 中期 |
-| D11 | Usage Tracking | 🟡 中期 |
 | Q1 | Pattern 跨 session 匹配 | 🟢 长期 |
-| A1-3 | A1 LLM 注入到 store 直接索引路径（SPEC_A1 #3-5） | 🟡 中期 |
 | A1-D | A1 动态自适应路由（阈值/成本预算/反馈回路） | 🟢 长期 |

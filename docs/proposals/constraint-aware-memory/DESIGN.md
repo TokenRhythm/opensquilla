@@ -567,7 +567,8 @@ Layer 0 无开关，始终启用（基础设施修复）。
 | v0.7.0 | Layer 1 + 2 作为 experimental，默认关闭 | Config gate | ✅ 已实现 |
 | v0.7.x | 收集约束分类准确率数据 | Telemetry | 🔶 待启动 |
 | v0.7.0+ | A1 写入路径分层升级 + B6 中文意图覆盖 | `3cf54191` | ✅ 已实现 |
-| v0.7.1 | A1 LLM 注入到 store 直接索引路径 | SPEC_A1 #3-5 | 🔶 待实现 |
+| v0.7.1 | A1-3 LLM 注入 store 直接索引路径 | `1e77f919` | ✅ 已实现 |
+| v0.7.2 | D11 Usage Tracking + D5 Dream 评分增强 | `a07ae662` | ✅ 已实现 |
 | v0.8.0 | 若准确率 > 85%：Layer 1+2 默认开启 | 数据驱动 | 🔶 待启动 |
 | v0.9.0 | Layer 3 作为 experimental | Config gate | 🔶 待实现 |
 | v1.0.0 | 评估用充分性检查替代 coverage check | 验证 | 🔶 待评估 |
@@ -584,6 +585,8 @@ Layer 0 无开关，始终启用（基础设施修复）。
 - Layer 0（归档搜索）给 compaction 提供 ground truth 参照
 
 ### 11.2 Dream
+
+> **✅ 已实现** (`a07ae662`) — constraint_stability 从 L1 annotation 读取（`get_dominant_constraint_types()`），cross_task_relevance 从 D11 `chunk_usage` 表计算
 
 Promotion scoring 增加附加项：
 
@@ -704,3 +707,7 @@ score = (
 | `docs/proposals/constraint-aware-memory/SPEC_L3_SUFFICIENCY_CHECK.md` | L3 实现规格 |
 | `docs/proposals/constraint-aware-memory/SPEC_A1_WRITE_PATH_DESIGN.md` | A1 写入路径设计 |
 | `docs/proposals/constraint-aware-memory/RESEARCH_B6_CHINESE_INTENT_COVERAGE.md` | B6 中文意图调研 |
+| `docs/proposals/constraint-aware-memory/SPEC_A1_3_LLM_INJECTION.md` | A1-3 LLM 注入设计 |
+| `docs/proposals/constraint-aware-memory/SPEC_D11_D5_USAGE_DREAM.md` | D11+D5 Usage+Dream 设计 |
+| `src/opensquilla/memory/dream_factory.py` | Dream 工厂 + memory_store 注入 |
+| `tests/test_memory/test_usage_tracking.py` | D11+D5: 24 tests |
