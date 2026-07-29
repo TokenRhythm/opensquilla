@@ -35,6 +35,7 @@ const DISCOVERED: DiscoveredModel[] = [
 ]
 
 const TOKENRHYTHM_REGISTRATION_URL = 'https://tokenrhythm.studio/register'
+const TOKENRHYTHM_CATALOG_URL = 'https://tokenrhythm.studio/'
 const TOKENRHYTHM_PROVIDER = { providerId: 'tokenrhythm', label: 'TokenRhythm' }
 const OPENROUTER_PROVIDER = { providerId: 'openrouter', label: 'OpenRouter' }
 
@@ -580,6 +581,34 @@ describe('SetupProviderPanel — configured provider management', () => {
 
     options[0]?.click()
     expect(onAddProvider).toHaveBeenCalledWith('gemini')
+    app.unmount()
+  })
+
+  it('opens the TokenRhythm limited-time offer without selecting the provider', async () => {
+    const onAddProvider = vi.fn()
+    const { app, el } = await mountPanel({
+      configuredProviders: [],
+      runtimeProviders: [TOKENRHYTHM_PROVIDER, OPENROUTER_PROVIDER],
+    }, { onAddProvider })
+
+    Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === 'Add provider')?.click()
+    await nextTick()
+    await nextTick()
+
+    const offer = document.body.querySelector<HTMLAnchorElement>('.provider-picker__offer')
+    expect(offer?.href).toBe(TOKENRHYTHM_CATALOG_URL)
+    expect(offer?.getAttribute('target')).toBe('_blank')
+    expect(offer?.getAttribute('rel')).toBe('noopener noreferrer')
+    expect(offer?.getAttribute('aria-label')).toContain('opens in a new tab')
+    expect(offer?.textContent).toContain('Limited-time free access')
+
+    offer?.addEventListener('click', event => event.preventDefault(), { once: true })
+    offer?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    await nextTick()
+
+    expect(onAddProvider).not.toHaveBeenCalled()
+    expect(document.body.querySelector('[data-testid="provider-catalog-picker"]')).toBeTruthy()
     app.unmount()
   })
 
@@ -1177,7 +1206,7 @@ describe('SetupProviderPanel — configured provider management', () => {
     expect(document.body.querySelector('.provider-picker__list')).toBeTruthy()
     expect(Array.from(document.body.querySelectorAll<HTMLButtonElement>('button'))
       .some(button => button.textContent?.includes('Browse all providers'))).toBe(false)
-    expect(document.body.querySelector('.provider-picker__option .control-pill')?.textContent)
+    expect(document.body.querySelector('.provider-picker__offer')?.textContent)
       .toContain('Limited-time free access')
 
     const search = document.body.querySelector<HTMLInputElement>('input[name="setup_provider_search"]')!

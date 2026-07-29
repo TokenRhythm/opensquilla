@@ -1140,8 +1140,7 @@ function ensembleRole(role: string, label: string): string {
 .msg-meta-popover {
   position: absolute;
   bottom: calc(100% + 0.375rem);
-  left: 50%;
-  transform: translateX(-50%);
+  left: 0;
   z-index: 20;
   display: flex;
   flex-direction: column;

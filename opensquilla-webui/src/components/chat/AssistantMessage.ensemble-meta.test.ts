@@ -216,6 +216,13 @@ describe('AssistantMessage ensemble footer metadata', () => {
     expect(source).not.toContain('class="savings-indicator"')
   })
 
+  it('opens the info popover inward from the left edge of the message pane', () => {
+    const popoverRule = source.match(/\.msg-meta-popover\s*\{([^}]*)\}/)?.[1] || ''
+
+    expect(popoverRule).toMatch(/\bleft:\s*0;/)
+    expect(popoverRule).not.toContain('translateX(-50%)')
+  })
+
   it('does not toggle share selection for stopped-output notices', async () => {
     const onToggleShare = vi.fn()
     const { app, el } = await mountMessage(
