@@ -237,7 +237,7 @@ WHERE content IS NOT NULL;
 
 ## 5. Layer 1: 约束类型标注
 
-> **✅ 已实现** (`ef5fc037`) — Signal Gate + LLM/启发式三级降级 + frontmatter 覆盖 + 置信度保护
+> **✅ 已实现** (`ef5fc037` + A1 `3cf54191`) — Signal Gate + 启发式优先 + LLM 分层升级 + frontmatter 覆盖 + 置信度保护
 
 **Config gate**: `memory.experimental.constraint_annotation = false`
 
@@ -268,6 +268,8 @@ ALTER TABLE chunks ADD COLUMN constraint_confidence REAL DEFAULT NULL;
 Nullable 列。现有行默认 `'fact'`。无需迁移现有数据。
 
 ### 5.3 标注管线
+
+**A1 分层升级**（`3cf54191`）：`classify_constraint()` 改为启发式优先（conf >= 0.6 直接接受，零 LLM 成本），仅低置信度 chunk 升级到 LLM（~25% traffic）。详见 §5.7。
 
 **触发点 A：memory 文件 sync 时**（`LongTermMemoryStore.index_file()`）
 
@@ -343,6 +345,52 @@ Sync 时解析 frontmatter → 覆盖 LLM 分类结果。
 
 ---
 
+### 5.7 A1 写入路径分层升级（Tiered Escalation）
+
+> **✅ 已实现** (`3cf54191`)：`classify_constraint()` async 版已实现启发式优先 + LLM 升级。
+> **⚠️ 已知限制**：`store.py` 直接索引路径仍调用 `classify_constraint_sync`（纯启发式），LLM 注入尚未接通（SPEC_A1 清单 #3-5）。
+
+**管线顺序**（A1 修改后）：
+
+```
+写入 chunk
+  →
+  ├─ ① Frontmatter override ──────────→ (type, 1.0)  [用户显式标注]
+  │
+  ├─ ② Inline marker (flush path) ───→ (type, 0.9)  [LLM 已分类]
+  │
+  ├─ ③ Signal Gate ──────────────────→ (fact, None)  [低信号跳过]
+  │
+  ├─ ④ Heuristic classify
+  │    ├─ conf >= 0.6 ──────────────→ (type, conf)  [高置信度接受，零 LLM 成本]
+  │    └─ conf < 0.6
+  │          ├─ llm_call available ──→ LLM classify → (type, 0.8)
+  │          └─ llm_call unavailable → (type, conf)  [保持启发式]
+  │
+  └─ ⑤ LLM classify
+        ├─ success ─────────────────→ (type, 0.8)
+        └─ failure ─────────────────→ 回退到启发式结果
+```
+
+**阈值**：`_HEURISTIC_ACCEPT_THRESHOLD = 0.6`（与 L2 boost 阈值对齐）
+
+**置信度体系**：
+
+| 来源 | 置信度 | 说明 |
+|------|--------|------|
+| Frontmatter override | 1.0 | 用户显式标注 |
+| Inline marker (flush) | 0.9 | LLM 在 flush 时已分类 |
+| LLM escalation | 0.8 | 写入时 LLM 分类 |
+| Heuristic (high conf >= 0.6) | 0.6 | 关键词强匹配 |
+| Heuristic (low conf < 0.6) | 0.4–0.5 | 弱匹配 / 默认 fact |
+| Signal Gate skip | None | 未标注 |
+
+**成本估算**（典型 50 chunk reindex）：Signal Gate 过滤 ~35% → 启发式接受 ~40% → 需 LLM 升级 ~25%（~13 次调用，~2,665 tokens）。对比 Mem0（每 chunk 2 次 LLM），约为其 **1/4**。
+
+**测试**：6 个新测试（含 LLM mock 验证跳过逻辑），全量 172 passed
+
+---
+
 ## 6. Layer 2: 约束感知检索路由
 
 > **✅ 已实现** (`69d7fdd8`) — QueryIntent 5 种意图 + 双语启发式 + boost [0.85, 1.8] + D9 Provenance Marker
@@ -351,6 +399,8 @@ Sync 时解析 frontmatter → 覆盖 LLM 分类结果。
 **Depends on**: Layer 1
 
 ### 6.1 Query 意图分类
+
+> **B6 中文覆盖**（`3cf54191`）：扩展 ~40 个中文关键词 + 否定检测（`_NEGATION_PREFIX_RE`，window=5 字符）+ 疑问句排除（`_INTERROGATIVE_RE`：有没有/是不是/会不会/能不能/可不可以）+ 英文词形变体（crashed/failed/failure）。~30 个新测试。
 
 | query_intent | 触发模式 | 优先约束类型 |
 |-------------|---------|------------|
@@ -516,6 +566,8 @@ Layer 0 无开关，始终启用（基础设施修复）。
 | v0.6.x | Layer 0 + D12 (Compaction Anchor) | 始终启用 / config | ✅ 已实现 |
 | v0.7.0 | Layer 1 + 2 作为 experimental，默认关闭 | Config gate | ✅ 已实现 |
 | v0.7.x | 收集约束分类准确率数据 | Telemetry | 🔶 待启动 |
+| v0.7.0+ | A1 写入路径分层升级 + B6 中文意图覆盖 | `3cf54191` | ✅ 已实现 |
+| v0.7.1 | A1 LLM 注入到 store 直接索引路径 | SPEC_A1 #3-5 | 🔶 待实现 |
 | v0.8.0 | 若准确率 > 85%：Layer 1+2 默认开启 | 数据驱动 | 🔶 待启动 |
 | v0.9.0 | Layer 3 作为 experimental | Config gate | 🔶 待实现 |
 | v1.0.0 | 评估用充分性检查替代 coverage check | 验证 | 🔶 待评估 |
@@ -603,9 +655,11 @@ score = (
 
 3. **分类成本**：大规模（1000+ chunks）时，每 chunk LLM 分类可能昂贵。考虑批量分类或 embedding-based zero-shot。推迟到 v0.7.x telemetry。
 
-4. **Compaction 集成**：compaction 的 obligation 提取是否应直接查询 memory 的 active constraints？这会耦合两个系统。推迟到 v1.0 评估。
+4. **A1 LLM 注入**：`classify_constraint()` async 版已实现分层升级，但 `store.py` 直接索引路径仍调用 `classify_constraint_sync`（纯启发式）。需 MemoryManager 注入 `constraint_llm_call` 参数（SPEC_A1 清单 #3-5）。
 
-5. **Multi-agent**：多 agent workspace 中，constraint types 是 per-agent 还是共享？当前设计：per-agent（跟随现有 `agent_id` scoping）。
+5. **Compaction 集成**：compaction 的 obligation 提取是否应直接查询 memory 的 active constraints？这会耦合两个系统。推迟到 v1.0 评估。
+
+6. **Multi-agent**：多 agent workspace 中，constraint types 是 per-agent 还是共享？当前设计：per-agent（跟随现有 `agent_id` scoping）。
 
 ---
 
@@ -648,3 +702,5 @@ score = (
 | `docs/proposals/constraint-aware-memory/SPEC_L1_CONSTRAINT_ANNOTATION.md` | L1 实现规格 |
 | `docs/proposals/constraint-aware-memory/SPEC_L2_CONSTRAINT_ROUTING.md` | L2 实现规格 |
 | `docs/proposals/constraint-aware-memory/SPEC_L3_SUFFICIENCY_CHECK.md` | L3 实现规格 |
+| `docs/proposals/constraint-aware-memory/SPEC_A1_WRITE_PATH_DESIGN.md` | A1 写入路径设计 |
+| `docs/proposals/constraint-aware-memory/RESEARCH_B6_CHINESE_INTENT_COVERAGE.md` | B6 中文意图调研 |

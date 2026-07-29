@@ -1,6 +1,6 @@
 # Constraint-Aware Memory: 进度跟踪
 
-> **Last updated**: 2026-07-29 (L3 implemented)
+> **Last updated**: 2026-07-29 (A1 + B6 implemented)
 > **Branch**: `feature/constraint-aware-memory`
 
 ---
@@ -12,8 +12,10 @@
 | L0 | 归档 Transcript 可搜索 | ✅ 已实现 | `648628e6` | always on |
 | D12 | Compaction Anchor | ✅ 已实现 | `6038ff55` | `compaction.anchor_enabled` |
 | L1 | 约束类型标注 | ✅ 已实现 | `ef5fc037` | `memory.experimental.constraint_annotation` |
-| L2 | 约束感知检索路由 | ✅ 已实现 | pending | `memory.experimental.constraint_routing` |
+| L2 | 约束感知检索路由 | ✅ 已实现 | `69d7fdd8` | `memory.experimental.constraint_routing` |
 | L3 | 检索充分性检查 | ✅ 已实现 | `9de891cb` | `memory.experimental.sufficiency_check` |
+| A1 | L1 写入路径分层升级 | ✅ 已实现 | `3cf54191` | `memory.experimental.constraint_annotation` |
+| B6 | L2 中文意图覆盖 | ✅ 已实现 | `3cf54191` | `memory.experimental.constraint_routing` |
 
 ---
 
@@ -67,7 +69,7 @@ c7cef6fe docs(constraint-aware-memory): add alignment record, Codex comparison, 
 | # | 决策 | 内容 |
 |---|------|------|
 | D1 | Ontology 粒度 | 核心 6 类（v0.7）+ 扩展 4 类（v0.8） |
-| D2 | 分类方法 | LLM 主路径 → 启发式降级 → 默认 "fact" |
+| D2 | 分类方法 | A1 分层升级：启发式优先 → LLM 升级（低置信度）→ 默认 "fact" |
 | D7 | todo → goal | CandidateKind.todo 映射到 goal |
 | D8 | Signal Gate | <20字/纯工具输出/心跳 → 跳过分类 |
 | D6 | 用户覆盖 | Markdown frontmatter `constraint_type:` |
@@ -76,7 +78,7 @@ c7cef6fe docs(constraint-aware-memory): add alignment record, Codex comparison, 
 
 - [x] 1. Schema: `chunks` 表新增 `constraint_type` + `constraint_confidence`
 - [x] 2. Types: 新增 `ConstraintType` 枚举 + `CANDIDATE_KIND_TO_CONSTRAINT` 映射
-- [x] 3. Classifier: Signal Gate + LLM + 启发式降级 + Frontmatter 覆盖
+- [x] 3. Classifier: Signal Gate + 启发式优先 + LLM 分层升级 (A1) + Frontmatter 覆盖
 - [x] 4. Store 集成: `index_file` 路径调用 `classify_constraint_sync`
 - [x] 5. Config: `MemoryExperimentalConfig` + `MemoryConfig.experimental`
 - [x] 6. Manager: wire `config.experimental.constraint_annotation` → store
@@ -100,6 +102,20 @@ tests/test_memory/test_constraint_annotation.py: 55 passed
 tests/test_session/test_compaction_anchor.py: 20 passed (no regression)
 Total: 75 passed
 ```
+
+### A1: 写入路径分层升级（`3cf54191`）
+
+**设计文档**：`SPEC_A1_WRITE_PATH_DESIGN.md`
+
+**改动**：`classify_constraint()` 从"LLM 优先 → 启发式降级"改为"启发式优先 → LLM 升级"：
+- `_HEURISTIC_ACCEPT_THRESHOLD = 0.6`：启发式 conf >= 0.6 直接接受，零 LLM 成本
+- 仅低置信度 chunk（~25%）升级到 LLM
+- LLM 不可用/失败时回退到启发式结果
+- Inline marker / frontmatter 仍绕过 LLM（不变）
+
+**已知限制**：`store.py` 直接索引路径仍调用 `classify_constraint_sync`（纯启发式），LLM 注入尚未接通（SPEC_A1 清单 #3-5）
+
+**测试**：6 个新测试（含 LLM mock 验证跳过逻辑），全量 172 passed
 
 ---
 
@@ -142,15 +158,29 @@ tests/test_session/test_compaction_anchor.py: 20 passed (no regression)
 Total: 278 passed, 6 skipped, 0 failures
 ```
 
+### B6: 中文意图覆盖（`3cf54191`）
+
+**调研文档**：`RESEARCH_B6_CHINESE_INTENT_COVERAGE.md`
+
+**改动**：
+- 4 种 intent 中文关键词扩展（~40 新词：恢复/没做完/参考/借鉴/决策依据/怎么修/搞不定/出错了/排查 等）
+- 否定检测：`_NEGATION_PREFIX_RE`（没有/不是/别/未/无/非），window=5 字符
+- 疑问句排除：`_INTERROGATIVE_RE`（有没有/是不是/会不会/能不能/可不可以）
+- 英文词形变体：crashed/failed/failure 等
+
+**测试**：~30 个新测试（中文/否定/疑问句/英文回归），全量 172 passed
+
 ---
 
-## L3: 检索充分性检查 ⬜
+## L3: 检索充分性检查 ✅
 
-### 待实现
+### 已实现（`9de891cb`）
 
-1. `check_retrieval_sufficiency()` 函数
-2. 元认知提示注入（不阻塞）
-3. 成本控制
+- `check_retrieval_sufficiency()` 函数
+- 元认知提示注入（不阻塞），触发条件：results < 3 AND intent_confidence > 0.7
+- 中英双语跟随 query
+- 两种提示强度（empty vs partial）
+- 37 新测试 + 241 回归全通过
 
 ---
 
@@ -162,3 +192,5 @@ Total: 278 passed, 6 skipped, 0 failures
 | D10 | Dream 增量 Diff 模式 | 🟡 中期 |
 | D11 | Usage Tracking | 🟡 中期 |
 | Q1 | Pattern 跨 session 匹配 | 🟢 长期 |
+| A1-3 | A1 LLM 注入到 store 直接索引路径（SPEC_A1 #3-5） | 🟡 中期 |
+| A1-D | A1 动态自适应路由（阈值/成本预算/反馈回路） | 🟢 长期 |
