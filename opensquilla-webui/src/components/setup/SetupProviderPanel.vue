@@ -1099,6 +1099,13 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
                   <strong>{{ selectedProviderLabel }}</strong>
                 </label>
 
+                <SetupProviderRecommendation
+                  v-if="tokenRhythmSelected"
+                  compact
+                  :token-rhythm-selected="tokenRhythmSelected"
+                  :credential-replacement-required="tokenRhythmCredentialReplacementRequired"
+                />
+
                 <section
                   v-if="endpointFields.length"
                   class="setup-provider-modal__endpoint"

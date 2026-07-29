@@ -612,6 +612,60 @@ describe('SetupProviderPanel — configured provider management', () => {
     app.unmount()
   })
 
+  it('keeps the TokenRhythm offer visible in the editor for a configured provider', async () => {
+    const onAddProvider = vi.fn()
+    const onUpdateProviderField = vi.fn()
+    const { app, el } = await mountPanel({
+      providerSelected: 'tokenrhythm',
+      runtimeProviders: [TOKENRHYTHM_PROVIDER, OPENROUTER_PROVIDER],
+      configuredProviders: [{
+        providerId: 'tokenrhythm',
+        label: 'TokenRhythm',
+        active: true,
+        ready: true,
+        credentialSource: 'explicit',
+        credentialEnv: '',
+        endpointSource: 'registry',
+        reason: '',
+      }],
+      credentialPanel: {
+        ...(panel().credentialPanel as Record<string, unknown>),
+        providerLabel: 'TokenRhythm',
+        envKey: 'TOKENRHYTHM_API_KEY',
+        masked: 'tr-••••1234',
+      },
+    }, { onAddProvider, onUpdateProviderField })
+
+    expect(el.querySelector('[data-testid="tokenrhythm-recommendation"]')).toBeNull()
+
+    el.querySelector<HTMLButtonElement>(
+      '[data-provider-id="tokenrhythm"] .setup-provider-card__select',
+    )?.click()
+    await nextTick()
+
+    const dialog = document.body.querySelector<HTMLElement>('[role="dialog"]')!
+    const offer = dialog.querySelector<HTMLElement>('[data-testid="tokenrhythm-recommendation"]')
+    const link = offer?.querySelector<HTMLAnchorElement>('a')
+
+    expect(offer?.classList.contains('setup-provider-recommendation--compact')).toBe(true)
+    expect(offer?.textContent).toContain('Recommended: TokenRhythm')
+    expect(offer?.textContent).toContain('TokenRhythm API calls are free for a limited time.')
+    expect(offer?.querySelector('[data-testid="tokenrhythm-recommendation-step"]')).toBeNull()
+    expect(link?.href).toBe(TOKENRHYTHM_REGISTRATION_URL)
+    expect(link?.getAttribute('target')).toBe('_blank')
+    expect(link?.getAttribute('rel')).toBe('noopener noreferrer')
+    expect(link?.getAttribute('aria-label')).toContain('opens in a new tab')
+
+    link?.addEventListener('click', event => event.preventDefault(), { once: true })
+    link?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    await nextTick()
+
+    expect(onAddProvider).not.toHaveBeenCalled()
+    expect(onUpdateProviderField).not.toHaveBeenCalled()
+    expect(document.body.querySelector('[role="dialog"]')).toBeTruthy()
+    app.unmount()
+  })
+
   it('closes the inline picker with Escape and restores focus to Add provider', async () => {
     const { app, el } = await mountPanel({
       runtimeProviders: [
