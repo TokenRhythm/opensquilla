@@ -913,6 +913,7 @@ class MemoryExperimentalConfig(BaseModel):
     constraint_annotation: bool = False  # L1: annotate chunks with constraint_type
     constraint_routing: bool = False  # L2: constraint-aware retrieval routing
     sufficiency_check: bool = False  # L3: retrieval sufficiency meta-cognition
+    usage_tracking: bool = False  # D11: chunk recall usage statistics for Dream
 
 
 class MemoryConfig(BaseSettings):

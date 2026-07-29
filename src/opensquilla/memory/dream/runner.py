@@ -161,6 +161,7 @@ class Dream:
         session_lock: asyncio.Lock | None,
         config: Any,  # DreamConfig — avoid circular import
         agent_id: str = "main",
+        memory_store: Any | None = None,
     ) -> None:
         self.workspace = workspace
         self.memory_dir = workspace / "memory"
@@ -170,6 +171,8 @@ class Dream:
         self.session_lock = session_lock
         self.config = config
         self.agent_id = agent_id
+        # D5: optional LongTermMemoryStore for usage stats + constraint types
+        self._memory_store = memory_store
 
     def _emit_log(self, result: DreamResult) -> None:
         from datetime import UTC, datetime
@@ -275,6 +278,19 @@ class Dream:
                 now_iso=now_iso,
                 persist=not result.dry_run,
             )
+            # D5: gather usage stats + constraint types for enhanced scoring
+            d5_usage_stats: dict[str, dict] | None = None
+            d5_constraint_types: dict[str, str] | None = None
+            if self._memory_store is not None:
+                candidate_paths = list({c.source_path for c in raw_candidates})
+                try:
+                    d5_usage_stats = await self._memory_store.get_usage_stats(candidate_paths)
+                    d5_constraint_types = await self._memory_store.get_dominant_constraint_types(
+                        candidate_paths
+                    )
+                except Exception:  # noqa: BLE001
+                    pass  # D5 is best-effort; degrade to old scoring
+
             ranked = rank_promotion_candidates(
                 store,
                 min_score=getattr(self.config, "evidence_min_score", 0.55),
@@ -283,6 +299,8 @@ class Dream:
                 ),
                 min_seen_count=getattr(self.config, "evidence_min_seen_count", 1),
                 limit=getattr(self.config, "max_batch_size", 20),
+                usage_stats=d5_usage_stats,
+                constraint_types=d5_constraint_types,
             )
             result.evidence_status = "ok"
             result.evidence_ms = int((time.monotonic() - evidence_start) * 1000)

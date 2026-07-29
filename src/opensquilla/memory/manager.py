@@ -660,6 +660,11 @@ async def build_memory_managers(
                     "sufficiency_check",
                     False,
                 ),
+                usage_tracking_enabled=getattr(
+                    getattr(cfg, "experimental", None),
+                    "usage_tracking",
+                    False,
+                ),
             )
 
             turn_capture = TurnCaptureService(

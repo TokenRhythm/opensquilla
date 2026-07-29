@@ -124,6 +124,17 @@ CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);
 CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source);
 """
 
+DDL_CHUNK_USAGE = """
+CREATE TABLE IF NOT EXISTS chunk_usage (
+    chunk_id TEXT NOT NULL,
+    intent TEXT NOT NULL DEFAULT 'general',
+    recall_count INTEGER NOT NULL DEFAULT 0,
+    last_recalled_at REAL,
+    PRIMARY KEY (chunk_id, intent)
+);
+CREATE INDEX IF NOT EXISTS idx_chunk_usage_chunk ON chunk_usage(chunk_id);
+"""
+
 
 def _float_list_to_blob(floats: list[float]) -> bytes:
     return struct.pack(f"{len(floats)}f", *floats)
@@ -420,6 +431,9 @@ class LongTermMemoryStore:
 
         await self._db.execute(DDL_FTS)
 
+        # D11: Usage tracking table (always created, gated by feature flag at write time)
+        await self._db.executescript(DDL_CHUNK_USAGE)
+
         # --- Schema version check ---
         async with self._db.execute("SELECT value FROM meta WHERE key = ?", (META_KEY,)) as cur:
             row = await cur.fetchone()
@@ -519,6 +533,103 @@ class LongTermMemoryStore:
                 "ALTER TABLE chunks ADD COLUMN constraint_confidence REAL"
             )
         await self._db.commit()
+
+    # ── D11: Usage Tracking ──────────────────────────────────────────────
+
+    async def record_chunk_usage(
+        self, chunk_ids: list[str], intent: str = "general"
+    ) -> None:
+        """Increment recall count for chunks. Best-effort, never raises.
+
+        Called by MemoryRetriever.search() after returning results.
+        Uses a single transaction for all chunk_ids (batch upsert).
+        """
+        if not chunk_ids or self._db is None:
+            return
+        try:
+            now = time.time()
+            await self._db.execute("BEGIN IMMEDIATE")
+            try:
+                for cid in chunk_ids:
+                    await self._db.execute(
+                        "INSERT INTO chunk_usage (chunk_id, intent, recall_count, last_recalled_at)"
+                        " VALUES (?, ?, 1, ?)"
+                        " ON CONFLICT(chunk_id, intent) DO UPDATE SET"
+                        " recall_count = recall_count + 1, last_recalled_at = ?",
+                        (cid, intent, now, now),
+                    )
+                await self._db.commit()
+            except BaseException:
+                await self._db.rollback()
+                raise
+        except Exception:
+            logger.debug("chunk_usage_record_failed", exc_info=True)
+
+    async def get_usage_stats(self, paths: list[str]) -> dict[str, dict]:
+        """Aggregate chunk_usage by file path for Dream consumption.
+
+        Returns {path: {total_recalls, intent_diversity, last_recalled_at}}.
+        """
+        if not paths or self._db is None:
+            return {}
+        try:
+            placeholders = ",".join("?" for _ in paths)
+            query = (
+                f"SELECT c.path, SUM(cu.recall_count), COUNT(DISTINCT cu.intent),"
+                f" MAX(cu.last_recalled_at)"
+                f" FROM chunk_usage cu"
+                f" JOIN chunks c ON c.id = cu.chunk_id"
+                f" WHERE c.path IN ({placeholders})"
+                f" GROUP BY c.path"
+            )
+            async with self._db.execute(query, paths) as cur:
+                rows = await cur.fetchall()
+            return {
+                row[0]: {
+                    "total_recalls": int(row[1] or 0),
+                    "intent_diversity": int(row[2] or 0),
+                    "last_recalled_at": float(row[3]) if row[3] else None,
+                }
+                for row in rows
+            }
+        except Exception:
+            logger.debug("chunk_usage_stats_failed", exc_info=True)
+            return {}
+
+    async def get_dominant_constraint_types(
+        self, paths: list[str]
+    ) -> dict[str, str]:
+        """Return the dominant constraint_type per file path.
+
+        Dominant = the type with the highest total constraint_confidence
+        across all chunks in that file. Ties broken alphabetically.
+        Returns {} on error (best-effort).
+        """
+        if not paths or self._db is None:
+            return {}
+        try:
+            placeholders = ",".join("?" for _ in paths)
+            query = (
+                f"SELECT path, constraint_type,"
+                f" SUM(COALESCE(constraint_confidence, 0)) as total_conf"
+                f" FROM chunks"
+                f" WHERE path IN ({placeholders})"
+                f" AND constraint_confidence IS NOT NULL"
+                f" GROUP BY path, constraint_type"
+                f" ORDER BY path, total_conf DESC, constraint_type ASC"
+            )
+            async with self._db.execute(query, paths) as cur:
+                rows = await cur.fetchall()
+            # First row per path has highest total_conf (ORDER BY)
+            result: dict[str, str] = {}
+            for row in rows:
+                path, ctype = row[0], row[1]
+                if path not in result:
+                    result[path] = ctype
+            return result
+        except Exception:
+            logger.debug("dominant_constraint_types_failed", exc_info=True)
+            return {}
 
     async def _probe_vec_extension(self) -> None:
         """Attempt to load sqlite-vec extension."""

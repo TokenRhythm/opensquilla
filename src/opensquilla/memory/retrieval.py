@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 import re
 from datetime import UTC, datetime
@@ -172,6 +173,7 @@ class MemoryRetriever:
         effective_metadata: dict[str, str] | None = None,
         constraint_routing_enabled: bool = False,
         sufficiency_check_enabled: bool = False,
+        usage_tracking_enabled: bool = False,
     ) -> None:
         self._store = store
         self._temporal_decay_enabled = temporal_decay_enabled
@@ -185,6 +187,7 @@ class MemoryRetriever:
         self._effective_metadata = dict(effective_metadata or {})
         self._constraint_routing_enabled = constraint_routing_enabled
         self._sufficiency_check_enabled = sufficiency_check_enabled
+        self._usage_tracking_enabled = usage_tracking_enabled
         # L3: cache last classified intent/confidence for sufficiency check
         self._last_query_intent: QueryIntent | None = None
         self._last_query_confidence: float | None = None
@@ -277,6 +280,23 @@ class MemoryRetriever:
             k_selected = filtered[: opts.max_results]
         for result in k_selected:
             result.metadata["search_intent"] = intent.value
+
+        # D11: Non-blocking usage tracking (fire-and-forget, never blocks search)
+        if self._usage_tracking_enabled and k_selected:
+            intent_str = (
+                self._last_query_intent.value
+                if self._last_query_intent is not None
+                else "general"
+            )
+            chunk_ids = [r.chunk_id for r in k_selected]
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(
+                    self._store.record_chunk_usage(chunk_ids, intent=intent_str)
+                )
+            except RuntimeError:
+                pass  # No running event loop (e.g. sync test) — skip
+
         return k_selected
 
     @property
@@ -288,6 +308,11 @@ class MemoryRetriever:
     def sufficiency_check_enabled(self) -> bool:
         """Whether L3 retrieval sufficiency check is active."""
         return self._sufficiency_check_enabled
+
+    @property
+    def usage_tracking_enabled(self) -> bool:
+        """Whether D11 chunk usage tracking is active."""
+        return self._usage_tracking_enabled
 
     @property
     def last_query_intent(self) -> QueryIntent | None:
