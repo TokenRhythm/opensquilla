@@ -441,6 +441,7 @@ def _make_constraint_llm_call(provider: Any) -> Any | None:
             resp = await complete(messages=messages, max_tokens=100)
             return getattr(resp, "content", None) or getattr(resp, "text", "") or ""
         # Streaming chat fallback
+        assert callable(chat)  # guaranteed by the guard above
         config = ChatConfig(max_tokens=100)
         stream = chat(messages, config=config)
         chunks: list[str] = []

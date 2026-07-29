@@ -7442,7 +7442,7 @@ class SessionStorage:
 
         async with self.conn.execute(sql, params) as cur:
             rows = await cur.fetchall()
-        results: list[dict[str, Any]] = [dict(r) for r in rows]
+        results = [dict(r) for r in rows]
         for r in results:
             r["source"] = "active"
 
