@@ -279,16 +279,6 @@ function onBrowserWorkbenchOpen(event: Event) {
 for (const definition of createArtifactWorkbenchDefinitions({
   authToken: readAuthToken,
   baseOrigin,
-  confirmModeSwitch: mode => confirm({
-    title: t('workbench.artifactPreview.modeSwitchTitle'),
-    body: t('workbench.artifactPreview.modeSwitchBody', {
-      mode: t(mode === 'full'
-        ? 'workbench.artifactPreview.fullMode'
-        : 'workbench.artifactPreview.offlineMode'),
-    }),
-    primaryLabel: t('workbench.artifactPreview.modeSwitchAction'),
-    primaryClass: 'btn--primary',
-  }),
   confirmPermission: confirmWorkbenchPermission,
   confirmRemoteResources: () => confirm({
     title: t('workbench.artifactPreview.remoteResourcesConfirmTitle'),
@@ -466,8 +456,8 @@ function performPanelSelection(
     ...(toolbarItem.actionOptions || []),
   ].find((option: WorkbenchToolbarSelectOption) => option.value === selectedValue)
 
-  // Keep the control on the effective mode while an async confirmation or
-  // lease replacement runs. The render state selects the new value on success.
+  // Keep the control on the effective mode while the async lease replacement
+  // runs. The render state selects the new value on success.
   select.value = toolbarItem.value
   if (!item || !selected || selectedValue === toolbarItem.value) return
   runtimeManager.performAction(item, selected.actionId)

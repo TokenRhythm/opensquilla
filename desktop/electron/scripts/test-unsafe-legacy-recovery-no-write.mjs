@@ -120,6 +120,13 @@ try {
   }, 'primary-only response to unsafe legacy recovery')
 
   await delay(1_000)
+  assert.equal(
+    await page.locator('#setup-form').count(),
+    1,
+    'unsafe legacy maintenance must not replace a usable onboarding path with recovery UI',
+  )
+  assert.equal(await page.locator('#recoveryPanel.visible').count(), 0)
+  assert.equal(await page.locator('#errorPanel.visible').count(), 0)
   assert.deepEqual(await readdir(outside), ['opensquilla'])
   assert.equal(
     await readFile(unsafeUpdateState, 'utf8'),

@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import functools
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -5248,6 +5249,7 @@ class Agent:
         turn_ensemble_request_count = 0
         terminal_error: ErrorEvent | None = None
         final_text_parts: list[str] = []
+        applied_model_call_boundaries: list[dict[str, Any]] = []
         final_reasoning_parts: list[str] = []
         artifact_delivery_final_response_pending = False
         artifact_delivery_degraded_final_response = False
@@ -5601,6 +5603,227 @@ class Agent:
                 ),
                 code="turn_llm_call_budget_exceeded",
             )
+
+        pending_input_batch_staged = False
+        staged_pending_input_message: Message | None = None
+
+        def _continuation_capabilities() -> tuple[int, bool, bool, str] | None:
+            """Resolve capabilities for the physical leg that just completed."""
+
+            route_plan = self.config.metadata.get("route_plan")
+            if not isinstance(route_plan, Mapping):
+                capabilities = self.config.model_capabilities
+                return (
+                    max(0, int(self.config.context_window_tokens or 0)),
+                    bool(
+                        getattr(capabilities, "supports_tools", True)
+                        if capabilities is not None
+                        else True
+                    ),
+                    bool(
+                        getattr(capabilities, "supports_vision", False)
+                        if capabilities is not None
+                        else False
+                    ),
+                    "configured_model",
+                )
+
+            actual_provider = str(last_actual_provider or "").strip()
+            actual_model = str(last_actual_model or "").strip()
+
+            def _matches_leg(candidate: Mapping[str, Any]) -> bool:
+                return (
+                    bool(actual_provider)
+                    and bool(actual_model)
+                    and str(candidate.get("provider") or "").strip() == actual_provider
+                    and str(candidate.get("model") or "").strip() == actual_model
+                )
+
+            selected_leg: Mapping[str, Any] | None = None
+            leg_kind = ""
+            if _matches_leg(route_plan):
+                selected_leg = route_plan
+                leg_kind = "primary"
+            else:
+                fallback_chain = route_plan.get("fallback_chain")
+                if isinstance(fallback_chain, list):
+                    selected_leg = next(
+                        (
+                            candidate
+                            for candidate in fallback_chain
+                            if isinstance(candidate, Mapping) and _matches_leg(candidate)
+                        ),
+                        None,
+                    )
+                if selected_leg is not None:
+                    leg_kind = "fallback"
+            if selected_leg is None:
+                return None
+
+            capabilities = selected_leg.get("capabilities")
+            if not isinstance(capabilities, Mapping):
+                return None
+            try:
+                context_window = max(0, int(capabilities.get("context_window") or 0))
+            except (TypeError, ValueError):
+                context_window = 0
+            return (
+                context_window,
+                capabilities.get("supports_tools") is True,
+                capabilities.get("supports_vision") is True,
+                leg_kind,
+            )
+
+        def _continuation_request_fits(
+            pending_message: Message,
+        ) -> bool:
+            capability_snapshot = _continuation_capabilities()
+            if capability_snapshot is None:
+                self._write_turn_call_log(
+                    "same_turn_steer_admission",
+                    action="defer_to_follow_up",
+                    reason="unknown_execution_leg",
+                    provider=last_actual_provider,
+                    model=last_actual_model,
+                )
+                return False
+            context_window, supports_tools, supports_vision, leg_kind = capability_snapshot
+            if context_window <= 0:
+                self._write_turn_call_log(
+                    "same_turn_steer_admission",
+                    action="defer_to_follow_up",
+                    reason="unknown_context_window",
+                    execution_leg=leg_kind,
+                )
+                return False
+            if provider_tool_definitions and not supports_tools:
+                self._write_turn_call_log(
+                    "same_turn_steer_admission",
+                    action="defer_to_follow_up",
+                    reason="tools_unsupported",
+                    execution_leg=leg_kind,
+                )
+                return False
+            if self._count_image_blocks(turn_messages) > 0 and not supports_vision:
+                self._write_turn_call_log(
+                    "same_turn_steer_admission",
+                    action="defer_to_follow_up",
+                    reason="vision_unsupported",
+                    execution_leg=leg_kind,
+                )
+                return False
+
+            if message_count_request_view is not None:
+                base_messages = message_count_request_view.materialize(turn_messages)
+                request_context_index = (
+                    message_count_request_view.request_context_insert_index
+                )
+                runtime_context_index = (
+                    message_count_request_view.runtime_context_insert_index
+                )
+            else:
+                base_messages = turn_messages
+                request_context_index = request_context_insert_index
+                runtime_context_index = runtime_context_insert_index
+            prospective_request = self._provider_request_messages_for_count_projection(
+                [*base_messages, pending_message],
+                request_context_message=request_context_message,
+                request_context_insert_index=request_context_index,
+                runtime_context_message=runtime_context_message,
+                runtime_context_insert_index=runtime_context_index,
+                turn_objective_message=turn_objective_message,
+            )
+            estimated_tokens = self._estimate_live_request_tokens(
+                prospective_request,
+                tools=provider_tool_definitions,
+                config=chat_cfg,
+            )
+            threshold = max(
+                1,
+                int(context_window * self.config.context_overflow_threshold),
+            )
+            if estimated_tokens > threshold:
+                self._write_turn_call_log(
+                    "same_turn_steer_admission",
+                    action="defer_to_follow_up",
+                    reason="context_window_threshold",
+                    execution_leg=leg_kind,
+                    estimated_tokens=estimated_tokens,
+                    threshold_tokens=threshold,
+                    context_window_tokens=context_window,
+                )
+                return False
+            return True
+
+        def _claim_pending_inputs_for_next_call() -> bool:
+            """Claim one FIFO steer batch when another model call has headroom."""
+
+            nonlocal pending_input_batch_staged
+            nonlocal staged_pending_input_message
+            if pending_input_provider is None or pending_input_batch_staged:
+                return False
+            if _turn_budget_error() is not None:
+                return False
+            if _turn_llm_call_budget_error(turn_llm_calls + 1) is not None:
+                return False
+            if _total_deadline is not None and _loop.time() >= _total_deadline:
+                return False
+            if self.config.max_iterations > 0 and iterations >= self.config.max_iterations:
+                return False
+            peek_pending = getattr(pending_input_provider, "peek_pending", None)
+            if not callable(peek_pending):
+                return False
+            pending_preview = peek_pending()
+            if not pending_preview:
+                return False
+            pending_message = Message(
+                role="user",
+                content=[
+                    ContentBlockText(text=pending_input)
+                    for pending_input in pending_preview
+                ],
+            )
+            if not _continuation_request_fits(pending_message):
+                return False
+            pending_inputs = pending_input_provider.drain_pending()
+            if not pending_inputs:
+                return False
+            staged_pending_input_message = pending_message
+            turn_messages.append(staged_pending_input_message)
+            pending_input_batch_staged = True
+            return True
+
+        async def _mark_staged_pending_inputs_applied(
+            *,
+            iteration: int,
+            model_call_id: str,
+        ) -> None:
+            """Acknowledge a claimed batch only after its provider call starts."""
+
+            nonlocal pending_input_batch_staged
+            nonlocal staged_pending_input_message
+            if not pending_input_batch_staged or pending_input_provider is None:
+                return
+            mark_applied = getattr(pending_input_provider, "mark_applied", None)
+            if callable(mark_applied):
+                result = mark_applied(
+                    iteration=iteration,
+                    model_call_id=model_call_id,
+                )
+                if inspect.isawaitable(result):
+                    await result
+            applied_model_call_boundaries.append(
+                {
+                    "model_call_id": model_call_id,
+                    "iteration": iteration,
+                    # Python string length is a Unicode-codepoint count. The
+                    # WebUI mirrors it with Array.from(text), avoiding UTF-16
+                    # offsets that would split astral characters.
+                    "start_codepoint": len("".join(final_text_parts)),
+                }
+            )
+            pending_input_batch_staged = False
+            staged_pending_input_message = None
 
         def _finish_artifact_delivery_degraded(
             *,
@@ -6195,6 +6418,16 @@ class Agent:
                             loop=_loop,
                             total_deadline=_total_deadline,
                         ):
+                            if not isinstance(raw_ev, ProviderErrorEvent):
+                                # Provider.chat commonly returns an async
+                                # generator before it performs network I/O.
+                                # Confirm application only once the request
+                                # produces a real event; a first-pull failure
+                                # leaves the claimed steer promotable.
+                                await _mark_staged_pending_inputs_applied(
+                                    iteration=iterations,
+                                    model_call_id=call_id,
+                                )
                             if first_event_at is None:
                                 first_event_at = time.monotonic()
                             if isinstance(raw_ev, ProviderTextDelta):
@@ -8520,6 +8753,12 @@ class Agent:
 
                 # No tool calls → we're done
                 if not tool_calls:
+                    if _claim_pending_inputs_for_next_call():
+                        # A plain response is also a safe same-turn boundary.
+                        # Keep the assistant output already emitted above, then
+                        # continue with the claimed steer in this turn.
+                        yield self._transition(AgentState.THINKING)
+                        continue
                     plan_run_reconciliation = (
                         await self._unfinished_plan_run_reconciliation_message()
                     )
@@ -10487,18 +10726,7 @@ class Agent:
                 turn_messages.append(
                     Message(role="user", content=tool_result_blocks)  # type: ignore[arg-type]
                 )
-                if pending_input_provider is not None:
-                    pending_inputs = pending_input_provider.drain_pending()
-                    if pending_inputs:
-                        turn_messages.append(
-                            Message(
-                                role="user",
-                                content=[
-                                    ContentBlockText(text=pending_input)
-                                    for pending_input in pending_inputs
-                                ],
-                            )
-                        )
+                _claim_pending_inputs_for_next_call()
                 if progress_watchdog_guidance is not None:
                     turn_messages.append(Message(role="user", content=progress_watchdog_guidance))
                 if (
@@ -10711,6 +10939,14 @@ class Agent:
                     code="agent_runtime_timeout",
                 )
                 yield terminal_error
+
+        if pending_input_batch_staged and staged_pending_input_message is not None:
+            # The turn ended after claim but before a provider call could
+            # acknowledge the batch. Keep it out of the agent's canonical
+            # history; the owning runtime will reclaim and promote it.
+            turn_messages = [
+                item for item in turn_messages if item is not staged_pending_input_message
+            ]
 
         if terminal_error is None:
             # Persist successful turns into in-memory history. Error turns are
@@ -11022,8 +11258,21 @@ class Agent:
             or total_provider_billed_entries
         )
         if terminal_error is None or has_usage:
+            final_text = "".join(final_text_parts)
+            total_codepoints = len(final_text)
+            model_call_segments = [
+                {
+                    **boundary,
+                    "end_codepoint": (
+                        applied_model_call_boundaries[index + 1]["start_codepoint"]
+                        if index + 1 < len(applied_model_call_boundaries)
+                        else total_codepoints
+                    ),
+                }
+                for index, boundary in enumerate(applied_model_call_boundaries)
+            ]
             done_event = DoneEvent(
-                text="".join(final_text_parts),
+                text=final_text,
                 input_tokens=done_input_tokens,
                 output_tokens=done_output_tokens,
                 reasoning_tokens=done_reasoning_tokens,
@@ -11044,9 +11293,10 @@ class Agent:
                 model_usage_breakdown=summarized_model_usage_breakdown,
                 ensemble_trace=final_ensemble_trace,
                 estimate_basis=estimate_basis,
-                text_snapshot="".join(final_text_parts),
+                text_snapshot=final_text,
                 message_output_tokens=message_output_tokens,
                 missing_cost_entries=missing_cost_entries,
+                model_call_segments=model_call_segments,
             )
             yield done_event
         # Reset for next turn

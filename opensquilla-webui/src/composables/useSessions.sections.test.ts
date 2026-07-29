@@ -68,7 +68,7 @@ describe('arrangeSidebarSections cancel stop labels', () => {
     expect(row.runLabel).toBe('Stopped after 1s')
   })
 
-  it('falls back to an interrupted-output label when a cancelled turn has no timing', () => {
+  it('falls back to a stopped label when a cancelled turn has no timing', () => {
     const sections = arrangeSidebarSections([
       session({
         key: 'agent:main:webchat:stopped',
@@ -80,7 +80,7 @@ describe('arrangeSidebarSections cancel stop labels', () => {
     ])
 
     const [row] = sectionFor(sections, 'chats').rows
-    expect(row.runLabel).toBe('Output interrupted')
+    expect(row.runLabel).toBe('Stopped')
   })
 })
 

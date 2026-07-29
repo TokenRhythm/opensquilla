@@ -283,6 +283,45 @@ async def test_tool_boundary_text_is_persisted_as_readable_paragraphs() -> None:
 
 
 @pytest.mark.asyncio
+async def test_model_call_segments_rebase_over_persistence_paragraphs() -> None:
+    stage, recs = _make_stage()
+    done = DoneEvent(
+        text="前😀后续",
+        text_snapshot="前😀后续",
+        model_call_segments=[
+            {
+                "model_call_id": "2.0",
+                "iteration": 2,
+                "start_codepoint": 2,
+                "end_codepoint": 4,
+            }
+        ],
+    )
+
+    await stage.run(
+        _make_input(
+            final_text_parts=["前😀", "后续"],
+            turn_segments=[
+                {"type": "text", "text": "前😀"},
+                {"type": "text", "text": "后续"},
+            ],
+            done_event=done,
+        )
+    )
+
+    transcript_call = recs["transcript_append"].calls[0]
+    assert transcript_call["content"] == "前😀\n\n后续"
+    assert transcript_call["turn_usage"]["model_call_segments"] == [
+        {
+            "model_call_id": "2.0",
+            "iteration": 2,
+            "start_codepoint": 2,
+            "end_codepoint": 6,
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_legacy_boolean_transcript_port_remains_compatible() -> None:
     stage, _ = _make_stage(
         transcript_append=_RecordingTranscriptAppend(return_value=True),
@@ -317,12 +356,21 @@ async def test_simple_text_with_done_event_fires_rollup() -> None:
     )
     done = DoneEvent(
         text="hi",
+        text_snapshot="hi",
         input_tokens=5,
         output_tokens=3,
         model="synthetic-turn-model-4.5",
         routed_tier="c2",
         routing_applied=False,
         rollout_phase="observe",
+        model_call_segments=[
+            {
+                "model_call_id": "2.0",
+                "iteration": 2,
+                "start_codepoint": 1,
+                "end_codepoint": 2,
+            }
+        ],
     )
     inp = _make_input(final_text_parts=["hi"], done_event=done)
     outcome = await stage.run(inp)
@@ -339,6 +387,14 @@ async def test_simple_text_with_done_event_fires_rollup() -> None:
     assert recs["transcript_append"].calls[0]["turn_usage"]["routed_tier"] == "c2"
     assert recs["transcript_append"].calls[0]["turn_usage"]["routing_applied"] is False
     assert recs["transcript_append"].calls[0]["turn_usage"]["rollout_phase"] == "observe"
+    assert recs["transcript_append"].calls[0]["turn_usage"]["model_call_segments"] == [
+        {
+            "model_call_id": "2.0",
+            "iteration": 2,
+            "start_codepoint": 1,
+            "end_codepoint": 2,
+        }
+    ]
 
 
 @pytest.mark.asyncio

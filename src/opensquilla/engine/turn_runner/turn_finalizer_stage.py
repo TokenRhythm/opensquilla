@@ -272,6 +272,7 @@ def _turn_usage_payload(
     done_event: Any | None,
     *,
     resolved_model: str | None,
+    persisted_text: str | None = None,
 ) -> dict[str, Any] | None:
     if done_event is None:
         return None
@@ -308,6 +309,12 @@ def _turn_usage_payload(
         # feedback (router.feedback.submit) to this exact routing decision.
         # None when no decision was staged (router off / bypass / no writer).
         "decision_id": getattr(done_event, "decision_id", None),
+        "route_plan": getattr(done_event, "route_plan", None),
+        "execution_legs": list(getattr(done_event, "execution_legs", []) or []),
+        "model_call_segments": _model_call_segments_for_persisted_text(
+            done_event,
+            persisted_text=persisted_text,
+        ),
     }
     optional_fields = {
         "provider": getattr(done_event, "provider", None),
@@ -359,6 +366,107 @@ def _turn_usage_payload(
     if isinstance(ensemble_trace, dict) and ensemble_trace:
         payload["ensemble_trace"] = dict(ensemble_trace)
     return payload
+
+
+def _model_call_segments_for_persisted_text(
+    done_event: Any,
+    *,
+    persisted_text: str | None,
+) -> list[dict[str, Any]]:
+    """Rebase model-call codepoint ranges after persistence-only formatting."""
+
+    raw_segments = [
+        dict(segment)
+        for segment in (getattr(done_event, "model_call_segments", []) or [])
+        if isinstance(segment, dict)
+    ]
+    if not raw_segments:
+        return []
+
+    original_text = str(
+        getattr(done_event, "text_snapshot", None)
+        if getattr(done_event, "text_snapshot", None) is not None
+        else getattr(done_event, "text", "")
+    )
+    target_text = original_text if persisted_text is None else persisted_text
+    original_length = len(original_text)
+
+    normalized: list[dict[str, Any]] = []
+    seen_call_ids: set[str] = set()
+    previous_end: int | None = None
+    for segment in raw_segments:
+        call_id = str(segment.get("model_call_id") or "").strip()
+        raw_iteration = segment.get("iteration")
+        raw_start = segment.get("start_codepoint")
+        raw_end = segment.get("end_codepoint")
+        if raw_iteration is None or raw_start is None or raw_end is None:
+            return []
+        try:
+            iteration = int(raw_iteration)
+            start = int(raw_start)
+            end = int(raw_end)
+        except (TypeError, ValueError):
+            return []
+        if (
+            not call_id
+            or call_id in seen_call_ids
+            or iteration < 1
+            or start < 0
+            or end < start
+            or end > original_length
+            or (previous_end is not None and start != previous_end)
+        ):
+            return []
+        seen_call_ids.add(call_id)
+        previous_end = end
+        normalized.append(
+            {
+                "model_call_id": call_id,
+                "iteration": iteration,
+                "start_codepoint": start,
+                "end_codepoint": end,
+            }
+        )
+    if normalized[-1]["end_codepoint"] != original_length:
+        return []
+    if target_text == original_text:
+        return normalized
+
+    def _rebase_boundary(boundary: int) -> int | None:
+        original_index = 0
+        target_index = 0
+        while original_index < boundary:
+            expected = original_text[original_index]
+            while target_index < len(target_text) and target_text[target_index] != expected:
+                target_index += 1
+            if target_index >= len(target_text):
+                return None
+            original_index += 1
+            target_index += 1
+        return target_index
+
+    # Persistence may add paragraph separators or a terminal notice, but it
+    # must not delete/rewrite the model text for these ranges to stay causal.
+    if _rebase_boundary(original_length) is None:
+        return []
+    rebased_starts: list[int] = []
+    for segment in normalized:
+        rebased_start = _rebase_boundary(int(segment["start_codepoint"]))
+        if rebased_start is None:
+            return []
+        rebased_starts.append(rebased_start)
+    return [
+        {
+            **segment,
+            "start_codepoint": rebased_starts[index],
+            "end_codepoint": (
+                rebased_starts[index + 1]
+                if index + 1 < len(rebased_starts)
+                else len(target_text)
+            ),
+        }
+        for index, segment in enumerate(normalized)
+    ]
 
 @runtime_checkable
 class SessionTotalsPort(Protocol):
@@ -698,6 +806,7 @@ class TurnFinalizerStage:
                 turn_usage=_turn_usage_payload(
                     inp.done_event,
                     resolved_model=inp.resolved_model,
+                    persisted_text=final_text,
                 ),
                 token_count=token_count,
             )

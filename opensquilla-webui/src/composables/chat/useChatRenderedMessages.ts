@@ -163,6 +163,9 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     let turnRouterIdx = -1
     let turnIdx = 0
     let turnIdentity = 'turn-0'
+    let explicitTurnId = ''
+    let turnResultStartIndex = 0
+    let currentTurnHasUserAnchor = false
     let lastAssistantResultIndex = -1
     let turnRequestKind: ChatRouterRequestKind = 'text'
 
@@ -185,13 +188,46 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         prevRole = ''
       }
 
-      if (msg.role === 'user') {
+      const messageTurnId = String(msg.turnId || '').trim()
+      const explicitTurnChanged = Boolean(
+        messageTurnId && messageTurnId !== explicitTurnId,
+      )
+      const legacyUserStartsTurn = msg.role === 'user' && !messageTurnId
+      const adoptsLegacyTurnId = Boolean(
+        messageTurnId
+        && !explicitTurnId
+        && currentTurnHasUserAnchor,
+      )
+      if (adoptsLegacyTurnId) {
+        turnIdentity = messageTurnId
+        const adoptedTurnKey = `turn:${messageTurnId}`
+        const adoptedRouterKey = `router-turn:${messageTurnId}`
+        for (let index = turnResultStartIndex; index < result.length; index++) {
+          result[index]!.turnKey = adoptedTurnKey
+          if (result[index]!.isRouterStrip) {
+            result[index]!.routerTurnKey = adoptedRouterKey
+          }
+        }
+      } else if (explicitTurnChanged || legacyUserStartsTurn) {
         turnRouterIdx = -1
         lastAssistantResultIndex = -1
-        turnRequestKind = routerRequestKindFromAttachments(msg.attachments)
+        turnRequestKind = msg.role === 'user'
+          ? routerRequestKindFromAttachments(msg.attachments)
+          : 'text'
         turnIdx++
-        turnIdentity = msg.clientId || msg.messageId || String(msg.ts || `turn-${turnIdx}`)
+        turnIdentity = messageTurnId
+          || msg.clientId
+          || msg.messageId
+          || String(msg.ts || `turn-${turnIdx}`)
+        turnResultStartIndex = result.length
+        currentTurnHasUserAnchor = msg.role === 'user'
       }
+      if (messageTurnId) {
+        explicitTurnId = messageTurnId
+      } else if (legacyUserStartsTurn) {
+        explicitTurnId = ''
+      }
+      if (msg.role === 'user') currentTurnHasUserAnchor = true
 
       // Internal control turns can intentionally carry an empty displayText
       // while retaining their provider-facing text in the transcript. They
@@ -300,6 +336,9 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         showHeader: !sameGroup,
         messageId: msg.messageId,
         turnKey: `turn:${turnIdentity === 'turn-0' ? ownerKey : turnIdentity}`,
+        inputDisposition: msg.inputDisposition,
+        inputDispositionRevision: msg.inputDispositionRevision,
+        turnOutcome: msg.turnOutcome,
         hasAttachments: !!msg.attachments?.length,
         attachments: msg.attachments,
         // submit_plan is a transport/control detail. Once a typed immutable
@@ -385,6 +424,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       sourceIndex: index,
       isRouterStrip: true,
       routerTurnKey: `router-turn:${turnIdentity}`,
+      turnKey: `turn:${turnIdentity}`,
       routerState: routerDecisionState(decision),
       routerSource: decision.source || 'none',
       routerObserve: decision.routing_applied === false,
@@ -419,6 +459,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       sourceIndex: index,
       isRouterStrip: true,
       routerTurnKey: `router-turn:${turnIdentity}`,
+      turnKey: `turn:${turnIdentity}`,
       routerState: msg.routerSettled === true ? 'settled' : 'pending',
       routerSource: 'llm_ensemble',
       routerObserve: false,
@@ -985,15 +1026,30 @@ export function normalizeRouterDecision(raw: unknown): NormalizedRouterDecision 
 function routerDecisionFromUsage(msg: ChatMessage): NormalizedRouterDecision | null {
   const usage = msg.usage || msg.turn_usage
   if (!usage || usage.routing_source === 'none') return null
-  const tier = typeof usage.routed_tier === 'string' ? usage.routed_tier : ''
+  const routePlan = usage.route_plan
+  const immutablePlan = (
+    routePlan
+    && typeof routePlan === 'object'
+    && !Array.isArray(routePlan)
+  )
+    ? routePlan as Record<string, unknown>
+    : null
+  const tier = typeof immutablePlan?.tier === 'string'
+    ? immutablePlan.tier
+    : typeof usage.routed_tier === 'string' ? usage.routed_tier : ''
   if (!tier) return null
+  const source = typeof immutablePlan?.source === 'string'
+    ? immutablePlan.source
+    : usage.routing_source || 'none'
   return normalizeRouterDecision({
     tier,
-    model: usage.routed_model || usage.model || msg.model || '',
-    source: usage.routing_source || 'none',
+    model: immutablePlan?.model || usage.routed_model || usage.model || msg.model || '',
+    source,
     confidence: typeof usage.routing_confidence === 'number' ? usage.routing_confidence : 0,
-    fallback: usage.routing_source === 'fallback',
-    routing_applied: usage.routing_applied !== false,
+    fallback: source === 'fallback',
+    routing_applied: typeof immutablePlan?.routing_applied === 'boolean'
+      ? immutablePlan.routing_applied
+      : usage.routing_applied !== false,
     rollout_phase: usage.rollout_phase || 'full',
   })
 }

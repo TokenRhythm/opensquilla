@@ -16,7 +16,7 @@ from opensquilla.chat.source import chat_source_metadata
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.context_overflow import apply_context_overflow_policy
 from opensquilla.gateway.rpc import RpcContext, RpcUnavailableError, get_dispatcher
-from opensquilla.gateway.session_services import get_session_lock
+from opensquilla.gateway.session_services import get_session_lock, get_session_storage
 from opensquilla.observability.network_policy import (
     provider_request_correlation_disabled,
 )
@@ -110,6 +110,7 @@ def _empty_chat_history_payload(limit: int) -> dict[str, Any]:
         # normal state from a temporary reader failure or lost legacy archive.
         "canonical_complete": True,
         "compaction_summaries": [],
+        "turn_outcomes": [],
     }
 
 
@@ -121,6 +122,97 @@ def _chat_history_bool(value: object, *, default: bool) -> bool:
     if isinstance(value, str):
         return value.strip().lower() not in {"0", "false", "no", "off"}
     return bool(value)
+
+
+async def _chat_history_turn_outcomes(
+    ctx: RpcContext,
+    session_key: str,
+    entries: list[object],
+) -> list[dict[str, Any]]:
+    """Return typed outcomes only for explicit turn ids present in this page."""
+
+    turn_ids = {
+        str(turn_id)
+        for entry in entries
+        if isinstance((turn_context := getattr(entry, "turn_context", None)), dict)
+        and isinstance((turn_id := turn_context.get("turn_id")), str)
+        and turn_id
+    }
+    if not turn_ids:
+        return []
+    storage = get_session_storage(getattr(ctx, "session_manager", None))
+    exact_tasks = getattr(storage, "get_agent_tasks_by_ids", None)
+    get_task = getattr(storage, "get_agent_task", None)
+    list_tasks = getattr(storage, "list_agent_tasks", None)
+    try:
+        if callable(exact_tasks):
+            rows = await exact_tasks(sorted(turn_ids))
+        elif callable(get_task):
+            rows = [
+                row
+                for turn_id in sorted(turn_ids)
+                if (row := await get_task(turn_id)) is not None
+            ]
+        elif callable(list_tasks):
+            rows = await list_tasks(session_key=session_key)
+        else:
+            return []
+    except Exception:  # noqa: BLE001 - history remains readable without outcomes.
+        log.warning(
+            "chat.history.turn_outcomes_failed",
+            session_key=session_key,
+            exc_info=True,
+        )
+        return []
+
+    outcomes: list[dict[str, Any]] = []
+    for row in rows:
+        task_id = getattr(row, "task_id", None)
+        details = getattr(row, "details", None)
+        details = details if isinstance(details, dict) else {}
+        turn_id = details.get("turn_id") or task_id
+        status = getattr(row, "status", None)
+        status = str(getattr(status, "value", status) or "")
+        outcome = details.get("turn_outcome")
+        if not isinstance(outcome, dict):
+            # Upgrade compatibility: older task rows predate typed outcomes.
+            # Derive only from that row's own explicit terminal status; never
+            # inspect neighboring transcript roles or repeated user messages.
+            legacy_kind = {
+                "succeeded": "completed",
+                "failed": "failed",
+                "cancelled": "interrupted",
+                "timeout": "interrupted",
+                "abandoned": "interrupted",
+            }.get(status)
+            if legacy_kind is None:
+                continue
+            outcome = {
+                "kind": legacy_kind,
+                "reason": status,
+            }
+        if (
+            not isinstance(turn_id, str)
+            or turn_id not in turn_ids
+        ):
+            continue
+        outcomes.append(
+            {
+                "turn_id": turn_id,
+                "task_id": task_id,
+                "status": status,
+                "started_at": getattr(row, "started_at", None),
+                "finished_at": getattr(row, "finished_at", None),
+                "outcome": dict(outcome),
+            }
+        )
+    outcomes.sort(
+        key=lambda item: (
+            int(item.get("started_at") or 0),
+            str(item.get("task_id") or ""),
+        )
+    )
+    return outcomes
 
 
 def _chat_history_cursor(entry: object | None) -> str | None:
@@ -730,6 +822,11 @@ async def _handle_chat_history(params: dict | None, ctx: RpcContext) -> dict:
         history_scope = "complete"
 
     messages = transcript_entries_to_chat_messages(page_entries, limit=None)
+    turn_outcomes = await _chat_history_turn_outcomes(
+        ctx,
+        session_key,
+        page_entries,
+    )
     return {
         "messages": _annotate_transcript_attachment_downloads(
             messages,
@@ -744,6 +841,7 @@ async def _handle_chat_history(params: dict | None, ctx: RpcContext) -> dict:
         "canonical_available": canonical_available,
         "canonical_complete": canonical_complete,
         "compaction_summaries": summaries,
+        "turn_outcomes": turn_outcomes,
     }
 
 

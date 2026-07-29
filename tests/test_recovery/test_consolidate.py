@@ -78,8 +78,7 @@ def _write_text(path: Path, value: str) -> None:
         handle.write(value)
 
 
-def _make_dangling_directory_link(link: Path) -> None:
-    target = link.with_name(f"{link.name}-target")
+def _make_directory_link(link: Path, target: Path) -> None:
     target.mkdir(parents=True)
     if os.name == "nt":
         completed = subprocess.run(
@@ -92,17 +91,26 @@ def _make_dangling_directory_link(link: Path) -> None:
             pytest.skip(f"junction creation is unavailable: {completed.stderr}")
     else:
         link.symlink_to(target, target_is_directory=True)
-    target.rmdir()
-    assert os.path.lexists(_native_io_path(link))
 
 
-def _remove_dangling_directory_link(link: Path) -> None:
+def _remove_directory_link(link: Path) -> None:
     if not os.path.lexists(_native_io_path(link)):
         return
     if os.name == "nt":
         os.rmdir(_native_io_path(link))
     else:
         link.unlink()
+
+
+def _make_dangling_directory_link(link: Path) -> None:
+    target = link.with_name(f"{link.name}-target")
+    _make_directory_link(link, target)
+    target.rmdir()
+    assert os.path.lexists(_native_io_path(link))
+
+
+def _remove_dangling_directory_link(link: Path) -> None:
+    _remove_directory_link(link)
 
 
 @pytest.mark.parametrize(
@@ -1417,9 +1425,11 @@ def test_fresh_noop_does_not_scan_primary_profile_tree(
     assert result.stable_code == "no_recovery_profiles"
 
 
+@pytest.mark.parametrize("target_kind", ["dangling", "inside", "outside"])
 def test_fresh_noop_ignores_unrelated_primary_directory_link(
     tmp_path: Path,
     monkeypatch,
+    target_kind: str,
 ) -> None:
     monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
     user_data = tmp_path / "user-data"
@@ -1427,7 +1437,14 @@ def test_fresh_noop_ignores_unrelated_primary_directory_link(
     primary.mkdir(parents=True)
     (primary / "config.toml").write_text("primary = true\n", encoding="utf-8")
     unrelated_link = primary / "unrelated-link"
-    _make_dangling_directory_link(unrelated_link)
+    target = (
+        primary / "inside-target"
+        if target_kind == "inside"
+        else tmp_path / "outside-target"
+    )
+    _make_directory_link(unrelated_link, target)
+    if target_kind == "dangling":
+        target.rmdir()
 
     try:
         result = consolidate_recovery_profiles(user_data, primary)
@@ -1436,7 +1453,7 @@ def test_fresh_noop_ignores_unrelated_primary_directory_link(
         assert result.stable_code == "no_recovery_profiles"
         assert os.path.lexists(_native_io_path(unrelated_link))
     finally:
-        _remove_dangling_directory_link(unrelated_link)
+        _remove_directory_link(unrelated_link)
 
 
 def test_consolidate_cli_no_recovery_ignores_primary_directory_link(
@@ -1474,9 +1491,39 @@ def test_consolidate_cli_no_recovery_ignores_primary_directory_link(
         _remove_dangling_directory_link(unrelated_link)
 
 
-def test_real_recovery_still_rejects_unsafe_primary_directory_link(
+def test_real_recovery_accepts_normal_unrelated_primary_directory(
     tmp_path: Path,
     monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
+    user_data = tmp_path / "user-data"
+    primary = user_data / "opensquilla"
+    (primary / "unrelated-directory").mkdir(parents=True)
+    (primary / "config.toml").write_text("primary = true\n", encoding="utf-8")
+    recovery_id = str(uuid.uuid4())
+    _recovery(
+        user_data,
+        recovery_id,
+        config="recovery = true\n",
+        credential="{}\n",
+        memory="memory\n",
+        conflict="recovery",
+        extra_name="recovery.txt",
+        session_key="agent:main:recovery",
+    )
+
+    result = consolidate_recovery_profiles(user_data, primary)
+
+    assert result.outcome == "consolidated", result
+    assert (primary / "unrelated-directory").is_dir()
+    assert not (user_data / "recovery-profiles").exists()
+
+
+@pytest.mark.parametrize("target_kind", ["dangling", "inside", "outside"])
+def test_real_recovery_rejects_unrelated_unsafe_primary_directory_link(
+    tmp_path: Path,
+    monkeypatch,
+    target_kind: str,
 ) -> None:
     monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
     user_data = tmp_path / "user-data"
@@ -1487,17 +1534,120 @@ def test_real_recovery_still_rejects_unsafe_primary_directory_link(
     recovery_root = user_data / "recovery-profiles" / recovery_id
     recovery_root.mkdir(parents=True)
     unrelated_link = primary / "unrelated-link"
-    _make_dangling_directory_link(unrelated_link)
+    target = (
+        primary / "inside-target"
+        if target_kind == "inside"
+        else tmp_path / "outside-target"
+    )
+    _make_directory_link(unrelated_link, target)
+    if target_kind == "dangling":
+        target.rmdir()
 
     try:
         result = consolidate_recovery_profiles(user_data, primary)
 
         assert result.outcome == "blocked"
         assert result.stable_code == "unsafe_path"
+        # The CLI remains strictly fail-closed. Electron independently inspects
+        # primary before deciding whether this maintenance failure may defer.
+        assert result.primary_home_intact is False
+        assert str(unrelated_link) in result.errors[0]
+        assert recovery_root.is_dir()
+        assert os.path.lexists(_native_io_path(unrelated_link))
+        assert not (user_data / ".opensquilla-profile-consolidation.json").exists()
+    finally:
+        _remove_directory_link(unrelated_link)
+
+
+def test_consolidate_cli_preserves_recovery_and_reports_offending_path(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
+    user_data = tmp_path / "user-data"
+    primary = user_data / "opensquilla"
+    primary.mkdir(parents=True)
+    (primary / "config.toml").write_text("primary = true\n", encoding="utf-8")
+    recovery_root = user_data / "recovery-profiles" / str(uuid.uuid4())
+    recovery_root.mkdir(parents=True)
+    unrelated_link = primary / "unrelated-link"
+    _make_dangling_directory_link(unrelated_link)
+
+    try:
+        completed = CliRunner().invoke(
+            recovery_app,
+            [
+                "consolidate-profiles",
+                "--user-data",
+                str(user_data),
+                "--primary-home",
+                str(primary),
+                "--json",
+            ],
+        )
+
+        assert completed.exit_code == 2, completed.output
+        payload = json.loads(completed.stdout)
+        assert payload["outcome"] == "blocked"
+        assert payload["stable_code"] == "unsafe_path"
+        assert payload["primary_home_intact"] is False
+        assert str(unrelated_link) in payload["errors"][0]
         assert recovery_root.is_dir()
         assert os.path.lexists(_native_io_path(unrelated_link))
     finally:
         _remove_dangling_directory_link(unrelated_link)
+
+
+def test_unsafe_primary_authority_link_does_not_enable_fallback(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
+    user_data = tmp_path / "user-data"
+    primary = user_data / "opensquilla"
+    primary.mkdir(parents=True)
+    real_config = tmp_path / "real-config.toml"
+    real_config.write_text("primary = true\n", encoding="utf-8")
+    try:
+        (primary / "config.toml").symlink_to(real_config)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+    recovery_root = user_data / "recovery-profiles" / str(uuid.uuid4())
+    recovery_root.mkdir(parents=True)
+
+    result = consolidate_recovery_profiles(user_data, primary)
+
+    assert result.outcome == "blocked"
+    assert result.stable_code == "unsafe_path"
+    assert result.primary_home_intact is False
+    assert str(primary / "config.toml") in result.errors[0]
+    assert recovery_root.is_dir()
+
+
+def test_unsafe_primary_state_junction_does_not_enable_fallback(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "locks"))
+    user_data = tmp_path / "user-data"
+    primary = user_data / "opensquilla"
+    primary.mkdir(parents=True)
+    (primary / "config.toml").write_text("primary = true\n", encoding="utf-8")
+    state_link = primary / "state"
+    _make_directory_link(state_link, tmp_path / "external-state")
+    recovery_root = user_data / "recovery-profiles" / str(uuid.uuid4())
+    recovery_root.mkdir(parents=True)
+
+    try:
+        result = consolidate_recovery_profiles(user_data, primary)
+
+        assert result.outcome == "blocked"
+        assert result.stable_code == "unsafe_path"
+        assert result.primary_home_intact is False
+        assert str(state_link) in result.errors[0]
+        assert recovery_root.is_dir()
+    finally:
+        _remove_directory_link(state_link)
 
 
 def test_primary_configuration_still_validates_unsafe_credential_leaf(

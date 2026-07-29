@@ -13,8 +13,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-CURRENT_VERSION = "0.5.1"
-CURRENT_DESKTOP_VERSION = "0.5.1"
+CURRENT_VERSION = "0.5.2"
+CURRENT_DESKTOP_VERSION = "0.5.2"
 CURRENT_TAG = f"v{CURRENT_VERSION}"
 HISTORICAL_PREVIEW_VERSION = "0.2.0rc1"
 HISTORICAL_PREVIEW_TAG = f"v{HISTORICAL_PREVIEW_VERSION}"
@@ -938,7 +938,7 @@ def test_historical_040_release_notes_remain_available() -> None:
     assert "OpenSquilla-0.4.0-mac-arm64.dmg" in notes
 
 
-def test_current_release_notes_cover_host_execution_projects_upgrade_and_containers() -> None:
+def test_current_release_notes_cover_steering_startup_upgrade_and_containers() -> None:
     notes = Path(f"docs/releases/{CURRENT_VERSION}.md").read_text(encoding="utf-8")
 
     assert "## Downloads" in notes
@@ -946,23 +946,25 @@ def test_current_release_notes_cover_host_execution_projects_upgrade_and_contain
     assert f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-mac-arm64.zip" in notes
     assert f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-win-x64.exe" in notes
     assert f"opensquilla-{CURRENT_VERSION}-py3-none-any.whl" in notes
-    assert notes.index("### Full host execution and scheduled tasks") < notes.index(
-        "### Plan mode, projects, and artifacts"
+    assert notes.index("### Same-turn steering across clients") < notes.index(
+        "### Faster startup and safer recovery"
     )
-    assert notes.index("### Desktop startup and profile recovery") < notes.index(
-        "### Control console and providers"
+    assert notes.index("### Desktop projects and artifact previews") < notes.index(
+        "### Provider and usage settings"
     )
     assert notes.index("## ✨ What's Improved") < notes.index("## Downloads")
     assert "Normal version upgrades do not require a data transfer" in notes
-    assert "Full host execution" in notes
-    assert "atomic idempotency" in notes
-    assert "dedicated internal" in notes
-    assert "No Windows Portable assets are published for 0.5.1" in notes
-    assert "0.5.1 Portable zip" in notes
-    assert "## Upgrading from 0.5.0" in notes
+    assert "without cancelling or recreating" in notes
+    assert "No database or configuration migration is required" in notes
+    assert "legacy-recovery maintenance" in notes
+    assert "history loads or recovers" in notes
+    assert "Base URL fields" in notes
+    assert "No Windows Portable assets are published for 0.5.2" in notes
+    assert "0.5.2 Portable zip" in notes
+    assert "## Upgrading from 0.5.1" in notes
     assert "must not\n> uninstall that build first" in notes
     assert r"%APPDATA%\OpenSquilla" in notes
-    assert "ghcr.io/opensquilla/opensquilla:v0.5.1" in notes
+    assert "ghcr.io/opensquilla/opensquilla:v0.5.2" in notes
     assert "`latest` tag follows the most recently verified release tag" in notes
     assert (
         "https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/latest/"
@@ -977,11 +979,9 @@ def test_current_release_notes_cover_host_execution_projects_upgrade_and_contain
     assert "release gate" not in notes
     assert "## Acknowledgements" in notes
     for login in [
-        "@HuaXiawithMoon",
         "@joyfan621-png",
         "@jiaoqingrui",
         "@Liu-RK",
-        "@TUOXI293",
     ]:
         assert login in notes
     assert "CONTRIBUTORS.md" in notes
@@ -994,21 +994,18 @@ def test_docs_index_links_current_release_notes() -> None:
     assert "releases/0.4.0.md" in index
 
 
-def test_current_contributor_ledger_records_051_attribution() -> None:
+def test_current_contributor_ledger_records_052_attribution() -> None:
     ledger = Path("CONTRIBUTORS.md").read_text(encoding="utf-8")
-    section = ledger.split("## OpenSquilla 0.5.1", 1)[1].split("## OpenSquilla 0.5.0", 1)[0]
+    section = ledger.split("## OpenSquilla 0.5.2", 1)[1].split("## OpenSquilla 0.5.1", 1)[0]
 
     expected = {
-        "@joyfan621-png": "#868",
-        "@jiaoqingrui": "#864",
-        "@Liu-RK": "#850",
-        "@HuaXiawithMoon": "#797",
-        "@TUOXI293": "#829",
-        "@JarvisPei": "#821",
+        "@jiaoqingrui": "#903",
+        "@Liu-RK": "#887",
+        "@joyfan621-png": "#901",
     }
     for login, evidence in expected.items():
         assert login in section
         assert evidence in section
-    assert "#845" in section
+    assert "#877" in section
     assert "Codex" not in section
     assert "Claude Code" not in section

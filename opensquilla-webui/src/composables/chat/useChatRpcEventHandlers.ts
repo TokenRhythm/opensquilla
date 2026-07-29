@@ -11,6 +11,7 @@ import type {
   CompactionPayload,
   CronResultPayload,
   EnsembleProgressPayload,
+  InputDispositionPayload,
   RouterDecisionPayload,
   SessionEventPayload,
   SessionMessagesSnapshotResponse,
@@ -42,8 +43,8 @@ import {
   taskTerminalAsSessionEvent as normalizeTaskTerminalEvent,
   taskTerminalStatus as eventTaskTerminalStatus,
 } from '@/utils/chat/streamEvents'
-import { stoppedOutputNoticeMessage } from '@/composables/chat/stoppedOutputNotice'
 import { localizedChatErrorMessage } from '@/utils/chat/errors'
+import { rehomePromotedSteerRows } from '@/utils/chat/historyMerge'
 
 export interface ChatUsageAccumulator {
   input: number
@@ -61,6 +62,7 @@ export interface ChatRpcStreamApi {
   streamHasVisibleOutput: Ref<boolean>
   startStreaming: () => void
   endStreaming: (opts?: { reason?: string }) => void
+  checkpointForUserMessage?: (turnId: string) => void
   appendDelta: (text: string) => void
   scheduleRender: () => void
   appendToolCall: (payload: ToolUsePayload) => void
@@ -109,6 +111,7 @@ export interface UseChatRpcEventHandlersOptions {
   scheduleHistorySync: () => void
   schedulePendingDrainAfterTerminal: () => void
   popAllPendingIntoComposer: () => boolean
+  restoreSteerIntoComposer?: (text: string) => void
   saveWidgetState: () => void
   handleSessionConnectionState: (state: string) => SessionBootstrapRun | undefined
   loadCurrentSessionUsage: () => void
@@ -240,6 +243,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   const pendingTerminalEvents = new Map<string, BufferedTerminalEvent>()
   const pendingStreamEvents = new Map<string, BufferedPendingStreamEvent[]>()
   const settledTaskIds = new Set<string>()
+  const restoredSteerRequestIds = new Set<string>()
 
   function terminalEventPriority(event: string): number {
     if (event === 'session.event.done' || event === 'chat.done' || event.endsWith('.error')) return 3
@@ -595,7 +599,6 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     const interrupted = state.status === 'cancelled' || state.status === 'interrupted'
     if (stream.isStreaming.value) stream.endStreaming(interrupted ? { reason: 'aborted' } : undefined)
     options.applySessionRunState(payload)
-    materializeStoppedOutputNotice(state)
     options.scheduleHistorySync()
     if (interrupted) {
       options.popAllPendingIntoComposer()
@@ -730,6 +733,124 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     options.showWarningToast(String(payload.message || ''))
   }
 
+  function handleRpcInputDisposition(payload: InputDispositionPayload) {
+    if (isStaleEpoch(payload)) return
+    if (!isCurrentSessionPayload(payload)) return
+    if (!acceptStreamSeq(payload)) return
+    // Primary sends also publish durable queued/applied disposition events.
+    // Those events describe ingress ownership, not same-turn Steer UX. Older
+    // gateways omitted intent for steer events, so only an explicit non-steer
+    // intent is ignored for compatibility.
+    if (payload.intent && payload.intent !== 'steer') return
+    const disposition = payload.disposition
+    if (!disposition) return
+    const clientRequestId = String(payload.client_request_id || '')
+    const clientMessageId = String(payload.client_message_id || '')
+    const userMessageId = String(payload.user_message_id || '')
+    const message = messages.value.find(candidate =>
+      (clientMessageId && (
+        candidate.clientId === clientMessageId
+        || candidate.steerClientMessageId === clientMessageId
+      ))
+      || (clientRequestId && candidate.steerClientRequestId === clientRequestId)
+      || (userMessageId && candidate.messageId === userMessageId),
+    )
+    const pendingIndex = pendingQueue.value.findIndex(candidate =>
+      (clientRequestId && candidate.steerClientRequestId === clientRequestId)
+      || (clientMessageId && candidate.steerClientMessageId === clientMessageId),
+    )
+    const pending = pendingIndex >= 0 ? pendingQueue.value[pendingIndex] : undefined
+    const rawRevision = Number(payload.revision)
+    const incomingRevision = Number.isInteger(rawRevision) && rawRevision >= 0
+      ? rawRevision
+      : undefined
+    const currentRevision = message?.inputDispositionRevision
+    const currentTerminal = message?.inputDisposition
+      ? ['applied', 'promoted', 'cancelled', 'rejected'].includes(message.inputDisposition)
+      : false
+    const staleDisposition = Boolean(message) && (
+      (
+        currentRevision !== undefined
+        && (
+          incomingRevision === undefined
+          || incomingRevision < currentRevision
+        )
+      )
+      || (
+        currentTerminal
+        && disposition !== message?.inputDisposition
+        && (
+          incomingRevision === undefined
+          || (
+            currentRevision !== undefined
+            && incomingRevision <= currentRevision
+          )
+        )
+      )
+    )
+    if (staleDisposition) return
+    const promotedTurnId = String(payload.promoted_turn_id || '').trim()
+    const targetTurnId = String(
+      promotedTurnId
+      || payload.turn_id
+      || payload.target_turn_id
+      || payload.task_id
+      || '',
+    ).trim()
+    if (message) {
+      message.inputDisposition = disposition
+      if (['applied', 'promoted', 'cancelled', 'rejected'].includes(disposition)) {
+        message.steerStopRequested = false
+      }
+      if (incomingRevision !== undefined) {
+        message.inputDispositionRevision = incomingRevision
+      }
+      if (userMessageId) message.messageId = userMessageId
+      if (clientRequestId) message.steerClientRequestId = clientRequestId
+      if (clientMessageId) message.steerClientMessageId = clientMessageId
+      if (targetTurnId) message.turnId = targetTurnId
+      if (disposition === 'promoted') {
+        const promotedFromTurnId = String(
+          payload.promoted_from_turn_id
+          || payload.target_turn_id
+          || payload.turn_id
+          || '',
+        ).trim()
+        if (promotedFromTurnId) message.promotedFromTurnId = promotedFromTurnId
+        messages.value = rehomePromotedSteerRows(messages.value)
+      }
+    }
+    if (
+      pendingIndex >= 0
+      && ['applied', 'promoted', 'cancelled', 'rejected'].includes(disposition)
+    ) {
+      pendingQueue.value.splice(pendingIndex, 1)
+    }
+    const recovery = String(payload.recovery || '').trim().toLowerCase()
+    const shouldRestore = disposition === 'cancelled'
+      || (
+        disposition === 'rejected'
+        && (
+          payload.retryable === true
+          || recovery.includes('retry')
+          || recovery.includes('resend')
+          || recovery.includes('restore')
+        )
+      )
+    const restoreKey = clientRequestId || clientMessageId || userMessageId
+    if (shouldRestore && restoreKey) {
+      const alreadyRestored = restoredSteerRequestIds.has(restoreKey)
+        || message?.steerRestored === true
+      if (!alreadyRestored) {
+        const text = message?.text || pending?.text || ''
+        if (text) options.restoreSteerIntoComposer?.(text)
+        restoredSteerRequestIds.add(restoreKey)
+        if (message) message.steerRestored = true
+      }
+    }
+    options.scheduleHistorySync()
+  }
+
   function messageAlreadyPresent(candidate: ChatMessage): boolean {
     if (candidate.messageId) {
       return messages.value.some(message => message.messageId === candidate.messageId)
@@ -829,6 +950,18 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       syncTerminalSessionChange(payload)
       return
     }
+    const carriesRunState = (
+      'run_status' in payload
+      || 'runStatus' in payload
+      || 'active_task' in payload
+      || 'activeTask' in payload
+      || 'last_task' in payload
+      || 'lastTask' in payload
+    )
+    // Recents-only changes (for example an asynchronously generated title)
+    // share the sessions.changed event name but carry no task state. They must
+    // not collapse a live task snapshot or discard its steer capability.
+    if (!carriesRunState) return
     options.applySessionRunState(payload)
   }
 
@@ -942,9 +1075,6 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       } else {
         const terminalRunState = { run_status: terminalRunStatus, last_task: { ...(payloadObj || {}), status: terminalStatus } }
         options.applySessionRunState(terminalRunState)
-        if (!stream.isStreaming.value) {
-          materializeStoppedOutputNotice(options.sessionRunStatus(terminalRunState))
-        }
       }
     }
 
@@ -1047,7 +1177,6 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         options.popAllPendingIntoComposer()
         const cancelledRunState = { run_status: 'cancelled', last_task: { ...(payload || {}), status: 'cancelled' } }
         options.applySessionRunState(cancelledRunState)
-        materializeStoppedOutputNotice(options.sessionRunStatus(cancelledRunState))
       } else if (activeTaskGroups.value.size > 0) {
         options.applySessionRunState(activeTaskGroupRunState({ reason: 'task_group_active' }))
       } else {
@@ -1081,11 +1210,6 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       }
       activeStreamTaskId.value = FINISHED_STREAM_TASK_ID
     }
-  }
-
-  function materializeStoppedOutputNotice(state: ChatRunStatus) {
-    const notice = stoppedOutputNoticeMessage(messages.value, state)
-    if (notice) messages.value.push(notice)
   }
 
   let connectionLostNoted = false
@@ -1134,6 +1258,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     onRunHeartbeat: handleRpcRunHeartbeat,
     onCompaction: handleRpcCompaction,
     onWarning: handleRpcWarning,
+    onInputDisposition: handleRpcInputDisposition,
     onCronResult: handleRpcCronResult,
     onSubagentCompletion: handleRpcSubagentCompletion,
     onEpochChanged: handleRpcEpochChanged,

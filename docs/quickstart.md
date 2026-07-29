@@ -17,7 +17,7 @@ UI, SquillaRouter, memory/search support, and safe local defaults.
 Install the current release wheel with the recommended extras:
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.1/opensquilla-0.5.1-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.2/opensquilla-0.5.2-py3-none-any.whl"
 ```
 
 The `recommended` extra includes SquillaRouter dependencies and memory/search

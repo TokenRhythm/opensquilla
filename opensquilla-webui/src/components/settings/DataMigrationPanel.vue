@@ -86,6 +86,7 @@ interface CleanupResult {
 
 interface DesktopMigrationBridge {
   getRecoveryState?: () => Promise<unknown>
+  retryProfileConsolidation?: () => Promise<{ ok: boolean; error?: string }>
   chooseLegacyAgentDataLocation?: (payload?: Record<string, never>) => Promise<unknown>
   migrationSummary?: (payload?: { source?: string }) => Promise<{
     ok: boolean
@@ -170,6 +171,13 @@ interface RecoveryInspection {
   allowed_actions?: string[]
 }
 
+interface RecoveryMaintenance {
+  kind?: string
+  stable_code?: string
+  retryable?: boolean
+  recovery_profile_count?: number
+}
+
 const MANUAL_SOURCE_KINDS: ProfileSourceKind[] = [
   'cli-home',
   'desktop-home',
@@ -228,6 +236,7 @@ const phase = ref('')
 const inlineError = ref('')
 const lastResult = shallowRef<MigrationTerminalResult | null>(null)
 const recoveryInspection = shallowRef<RecoveryInspection | null>(null)
+const recoveryMaintenance = shallowRef<RecoveryMaintenance | null>(null)
 const headingEl = ref<HTMLElement | null>(null)
 const cleanupOpen = ref(false)
 const cleanupBusy = ref(false)
@@ -258,6 +267,14 @@ const technicalAttention = computed(() => {
 const canChooseLegacyAgentData = computed(() => Boolean(
   knownAttention.value
   && desktopBridge?.chooseLegacyAgentDataLocation,
+))
+const consolidationMaintenance = computed(() => {
+  const maintenance = recoveryMaintenance.value
+  return maintenance?.kind === 'profile-consolidation' ? maintenance : null
+})
+const canRepairConsolidation = computed(() => Boolean(
+  consolidationMaintenance.value?.retryable
+  && desktopBridge?.retryProfileConsolidation,
 ))
 
 const candidateGroups = computed(() => ([
@@ -470,10 +487,15 @@ async function loadRecoveryContext(): Promise<void> {
   try {
     const raw = await desktopBridge?.getRecoveryState?.()
     if (raw && typeof raw === 'object') {
-      const inspection = (raw as Record<string, unknown>).inspection
+      const state = raw as Record<string, unknown>
+      const inspection = state.inspection
       if (inspection && typeof inspection === 'object') {
         recoveryInspection.value = inspection as RecoveryInspection
       }
+      const maintenance = state.maintenance
+      recoveryMaintenance.value = maintenance && typeof maintenance === 'object'
+        ? maintenance as RecoveryMaintenance
+        : null
     }
   } catch {
     // Compatibility context is optional; migration discovery remains usable.
@@ -735,6 +757,24 @@ async function chooseLegacyAgentDataLocation(): Promise<void> {
   }
 }
 
+async function repairProfileConsolidation(): Promise<void> {
+  if (!desktopBridge?.retryProfileConsolidation) return
+  busy.value = true
+  inlineError.value = ''
+  try {
+    const result = await desktopBridge.retryProfileConsolidation()
+    if (!result?.ok) {
+      throw new Error(result?.error || t('settings.dataMigration.maintenanceRepairFailed'))
+    }
+    recoveryMaintenance.value = null
+    pushToast(t('settings.dataMigration.maintenanceRepairStarted'), { tone: 'ok' })
+  } catch (error) {
+    inlineError.value = presentationError(error)
+  } finally {
+    busy.value = false
+  }
+}
+
 async function openCleanup(mode: CleanupMode, trigger?: EventTarget | null): Promise<void> {
   if (!desktopBridge?.inspectDesktopCleanup) return
   if (trigger instanceof HTMLElement) cleanupReturnFocusEl.value = trigger
@@ -893,6 +933,29 @@ onUnmounted(unsubscribeProgress)
         <Icon name="refresh" :size="15" aria-hidden="true" />
         {{ t('settings.dataMigration.refresh') }}
       </button>
+    </div>
+
+    <div
+      v-if="consolidationMaintenance"
+      class="data-migration__compat"
+      data-testid="profile-consolidation-maintenance"
+    >
+      <strong>{{ t('settings.dataMigration.maintenanceTitle') }}</strong>
+      <p>{{ t('settings.dataMigration.maintenanceDesc') }}</p>
+      <button
+        v-if="canRepairConsolidation"
+        type="button"
+        class="btn btn--ghost"
+        :disabled="busy"
+        data-testid="profile-consolidation-repair"
+        @click="repairProfileConsolidation"
+      >
+        {{ t('settings.dataMigration.maintenanceRepair') }}
+      </button>
+      <details>
+        <summary>{{ t('setup.runtime.migrationTechnicalDetails') }}</summary>
+        <code>{{ consolidationMaintenance.stable_code }}</code>
+      </details>
     </div>
 
     <div v-if="knownAttention" class="data-migration__compat" data-testid="data-migration-compatibility">

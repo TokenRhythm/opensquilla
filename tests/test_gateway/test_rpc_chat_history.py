@@ -8,8 +8,14 @@ import opensquilla.gateway.rpc_chat as rpc_chat_module
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.rpc_chat import _handle_chat_history
 from opensquilla.session.manager import SessionManager
-from opensquilla.session.models import SessionSummary, TranscriptEntry
+from opensquilla.session.models import (
+    AgentTaskRecord,
+    AgentTaskStatus,
+    SessionSummary,
+    TranscriptEntry,
+)
 from opensquilla.session.storage import SessionStorage, StorageBusyError
+from opensquilla.session.turn_context import turn_context_scope
 
 
 class _FakeSessionManager:
@@ -94,6 +100,148 @@ async def test_chat_history_returns_pagination_metadata_with_legacy_messages() -
     assert result["page_size"] == 2
     assert result["canonical_available"] is True
     assert result["canonical_complete"] is True
+
+
+@pytest.mark.asyncio
+async def test_chat_history_returns_typed_outcomes_for_explicit_page_turns(
+    tmp_path,
+) -> None:
+    storage = SessionStorage(str(tmp_path / "history-turn-outcomes.db"))
+    await storage.connect()
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:typed-outcome"
+    await manager.create(session_key)
+    try:
+        # The exact page lookup must not depend on list_agent_tasks' oldest-100
+        # default window.
+        for index in range(101):
+            await storage.create_agent_task(
+                AgentTaskRecord(
+                    task_id=f"older-turn-{index}",
+                    session_key=session_key,
+                    agent_id="main",
+                    source_kind="webui",
+                    queue_mode="followup",
+                    run_kind="session_turn",
+                    status=AgentTaskStatus.SUCCEEDED,
+                )
+            )
+        with turn_context_scope({"turn_id": "turn-stopped"}):
+            await manager.append_message(session_key, "user", "stop this")
+        await storage.create_agent_task(
+            AgentTaskRecord(
+                task_id="turn-stopped",
+                session_key=session_key,
+                agent_id="main",
+                source_kind="webui",
+                queue_mode="followup",
+                run_kind="session_turn",
+                status=AgentTaskStatus.CANCELLED,
+                started_at=110,
+                finished_at=120,
+                details={
+                    "turn_id": "turn-stopped",
+                    "turn_outcome": {
+                        "kind": "interrupted",
+                        "reason": "cancelled",
+                        "cancellation_source": "webui_stop",
+                        "retryable": True,
+                    },
+                },
+            )
+        )
+
+        result = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 10},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+
+        assert result["turn_outcomes"] == [
+            {
+                "turn_id": "turn-stopped",
+                "task_id": "turn-stopped",
+                "status": "cancelled",
+                "started_at": 110,
+                "finished_at": 120,
+                "outcome": {
+                    "kind": "interrupted",
+                    "reason": "cancelled",
+                    "cancellation_source": "webui_stop",
+                    "retryable": True,
+                },
+            }
+        ]
+        assert result["messages"][0]["turn_context"]["turn_id"] == "turn-stopped"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_history_derives_legacy_outcomes_only_from_explicit_task_status(
+    tmp_path,
+) -> None:
+    storage = SessionStorage(str(tmp_path / "history-legacy-turn-outcomes.db"))
+    await storage.connect()
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:legacy-outcomes"
+    await manager.create(session_key)
+    cases = [
+        ("turn-succeeded", AgentTaskStatus.SUCCEEDED, "completed"),
+        ("turn-cancelled", AgentTaskStatus.CANCELLED, "interrupted"),
+        ("turn-timeout", AgentTaskStatus.TIMEOUT, "interrupted"),
+        ("turn-failed", AgentTaskStatus.FAILED, "failed"),
+        ("turn-abandoned", AgentTaskStatus.ABANDONED, "interrupted"),
+    ]
+    try:
+        for index, (turn_id, status, _kind) in enumerate(cases, start=1):
+            with turn_context_scope({"turn_id": turn_id}):
+                await manager.append_message(session_key, "user", f"prompt {index}")
+            await storage.create_agent_task(
+                AgentTaskRecord(
+                    task_id=turn_id,
+                    session_key=session_key,
+                    agent_id="main",
+                    source_kind="webui",
+                    queue_mode="followup",
+                    run_kind="session_turn",
+                    status=status,
+                    started_at=index * 10,
+                    finished_at=index * 10 + 5,
+                    # No details.turn_outcome: this is an upgraded legacy row.
+                    details={},
+                )
+            )
+
+        result = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 10},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+
+        assert [
+            (
+                item["turn_id"],
+                item["status"],
+                item["outcome"],
+            )
+            for item in result["turn_outcomes"]
+        ] == [
+            (
+                turn_id,
+                status.value,
+                {"kind": kind, "reason": status.value},
+            )
+            for turn_id, status, kind in cases
+        ]
+    finally:
+        await storage.close()
 
 
 @pytest.mark.asyncio
@@ -547,10 +695,11 @@ async def test_chat_history_returns_empty_for_missing_webchat_session(
         "history_scope": "complete",
         "loaded_count": 0,
         "page_size": 2,
-        "canonical_available": False,
-        "canonical_complete": True,
-        "compaction_summaries": [],
-    }
+            "canonical_available": False,
+            "canonical_complete": True,
+            "compaction_summaries": [],
+            "turn_outcomes": [],
+        }
 
 
 @pytest.mark.asyncio

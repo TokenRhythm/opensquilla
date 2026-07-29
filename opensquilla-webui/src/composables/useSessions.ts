@@ -7,6 +7,7 @@ import { useRpcStore } from '@/stores/rpc'
 import type { RpcCallOptions } from '@/lib/rpc'
 import type { RawSessionItem, RawSessionListEntry, SessionsListResponse } from '@/types/rpc'
 import type { ProjectWorkspaceItem } from '@/types/rpc'
+import { normalizeTurnOutcome, turnOutcomePresentation } from '@/utils/chat/turnOutcome'
 
 export const SESSION_LIST_VIEW = 'session-list-v1'
 
@@ -89,9 +90,14 @@ function stoppedTaskDurationSeconds(row: RawSessionItem | undefined): number | n
 export function runStatusLabelText(status: string, row?: RawSessionItem): string {
   const t = i18n.global.t
   if (status === 'cancelled' || status === 'interrupted') {
+    const task = row?.last_task || row?.lastTask || null
+    const presentation = normalizeTurnOutcome(task)
+      ? turnOutcomePresentation(normalizeTurnOutcome(task))
+      : status === 'cancelled' ? 'stopped' : 'interrupted'
+    if (presentation === 'interrupted') return t('sessions.status.interrupted')
     const seconds = stoppedTaskDurationSeconds(row)
     if (seconds != null) return t('sessions.status.stoppedAfterSeconds', { seconds })
-    return t('sessions.status.outputInterrupted')
+    return t('sessions.status.cancelled')
   }
   const keys: Record<string, string> = {
     queued: 'sessions.status.queued',

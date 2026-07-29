@@ -6,6 +6,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-07-30
+
+### Added
+
+- Versioned same-turn steering now works consistently across the Web UI, CLI,
+  Gateway, and shared runtime for supported single-model and router turns.
+  Accepted input is idempotent and survives reconnects and eligible provider
+  fallback without rerouting the logical turn; older clients and gateways keep
+  their legacy or visible queue compatibility paths.
+
+### Fixed
+
+- Desktop and Gateway startup no longer wait on unnecessary recovery scans,
+  legacy-recovery maintenance, repeated ownership readiness windows, or
+  historical usage backfill.
+- Retained session history loads independently from interactive controls, so
+  navigation, controls, existing messages, and message sending remain usable
+  during hydration and recovery.
+- Recovery consolidation preserves historical usage for deduplicated sessions,
+  and usage backfill uses smaller transactions with bounded SQLite contention
+  handling.
+- Windows Desktop validates the Electron profile marker for sandbox setup, and
+  the macOS project picker supports folder creation, system-localized text, and
+  the intended initial directory.
+- Desktop HTML artifacts render when their native preview surface appears, and
+  preview mode switches no longer require an extra confirmation or overwrite
+  the saved default.
+- Custom compatible providers expose their Base URL fields again, the Usage
+  currency toggle applies consistently, and provider/usage presentation avoids
+  clipped or ambiguous actions.
+- Model Ensemble activity timing remains stable across generic channel
+  heartbeats, and the Desktop startup loader rotates in the expected direction.
+
 ## [0.5.1] - 2026-07-29
 
 ### Added

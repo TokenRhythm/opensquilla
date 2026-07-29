@@ -460,6 +460,7 @@
       :items="pendingQueue"
       :max-pending="maxPending"
       :image-blocked-message="queuedImageSendBlockedMessage"
+      :steer-available="sameTurnSteerAvailable"
       @clear="clearPendingQueue"
       @edit="editPendingMessage"
       @remove="removePendingChip"
@@ -628,7 +629,6 @@ import {
   truncate,
   useChatRenderedMessages,
 } from '@/composables/chat/useChatRenderedMessages'
-import { messagesWithStoppedOutputNotice } from '@/composables/chat/stoppedOutputNotice'
 import { useChatRouterDecisionRuntime } from '@/composables/chat/useChatRouterDecisionRuntime'
 import { useChatAnswerReveal } from '@/composables/chat/useChatAnswerReveal'
 import { useChatRpcEventHandlers } from '@/composables/chat/useChatRpcEventHandlers'
@@ -991,6 +991,7 @@ const chatStream = useChatStream({
   lastHeaderRole,
   aborted,
   autoScroll,
+  runStatus,
   applySessionRunState: source => applySessionRunState(source),
   renderMarkdown,
   stripDirectiveTags,
@@ -1106,6 +1107,7 @@ const {
   enqueuePendingPayload,
   enqueuePendingInput,
   enqueueHiddenControl,
+  enqueuePendingSteerRetry,
   removePendingChip,
   beginPendingDelivery,
   settlePendingDelivery,
@@ -1275,13 +1277,7 @@ const {
   replanActive,
 } = chatPlans
 
-const renderSourceMessages = computed(() =>
-  messagesWithStoppedOutputNotice(
-    messages.value,
-    runStatus.value,
-    t('sessions.status.outputInterrupted'),
-  ),
-)
+const renderSourceMessages = computed(() => messages.value)
 const chatRenderedMessages = useChatRenderedMessages({
   messages: renderSourceMessages,
   interruptState,
@@ -1315,10 +1311,14 @@ function shouldRenderRouterStrip(_message: ChatRenderedMessage): boolean {
 const routerStripReserve = computed<ChatRenderedMessage | null>(() => {
   if (!isStreaming.value || !routerEnabled.value || !routerVisualEffectsEnabled.value) return null
   const rendered = renderedMessages.value
+  const liveTurnKey = [...rendered]
+    .reverse()
+    .find(message => message.displayRole === 'user')
+    ?.turnKey
   for (let i = rendered.length - 1; i >= 0; i--) {
     const msg = rendered[i]
-    if (msg.isRouterStrip) return null
-    if (msg.displayRole === 'user') break
+    if (msg.isRouterStrip && (!liveTurnKey || msg.turnKey === liveTurnKey)) return null
+    if (msg.displayRole === 'user' && msg.turnKey !== liveTurnKey) break
   }
   if (modelRoutingMode.value === 'llm_ensemble') {
     return {
@@ -1795,6 +1795,11 @@ resetComposerInputHistory = chatComposerShortcuts.resetInputHistory
 
 const chatSend = useChatSend({
   rpc,
+  supportsMethod: method => rpc.supportsMethod(method),
+  activeSteerCapability: computed(() => {
+    const task = runStatus.value.task
+    return task?.steer_capability || task?.steerCapability || null
+  }),
   inputText,
   messages,
   sessionKey,
@@ -1848,6 +1853,8 @@ const chatSend = useChatSend({
   enqueuePendingInput,
   enqueuePendingPayload,
   enqueueHiddenControl,
+  enqueuePendingSteerRetry,
+  restoreSteerIntoComposer: text => appendComposerText(text),
   popAllPendingIntoComposer,
   executeSlashCommand,
   closeSlashMenu,
@@ -1863,6 +1870,21 @@ const {
   dispatchHiddenSend,
   sendHiddenMetaPreflightConfirmation,
 } = chatSend
+const sameTurnSteerAvailable = computed(() => (
+  isStreaming.value
+  && chatSend.supportsSameTurnSteer()
+))
+const composerSameTurnSteerAvailable = computed(() => (
+  sameTurnSteerAvailable.value
+  && pendingAttachments.value.length === 0
+  && !pendingSessionIntent.value
+  && !pendingForkBeforeMessageId.value
+))
+watch(composerSameTurnSteerAvailable, (available) => {
+  if (!available && busySendMode.value === 'steer') {
+    busySendMode.value = 'queue'
+  }
+})
 
 async function onComposerSend() {
   // All composer submission modes, including keyboard-driven plan revision,
@@ -2011,6 +2033,7 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   scheduleHistorySync,
   schedulePendingDrainAfterTerminal,
   popAllPendingIntoComposer,
+  restoreSteerIntoComposer: text => appendComposerText(text),
   saveWidgetState,
   handleSessionConnectionState: state =>
     handleSessionConnectionState(state, !isDraftRoute()),
@@ -2503,7 +2526,7 @@ const sendButtonTitle = computed(() => {
   if (composerSendBlockedMessage.value) return composerSendBlockedMessage.value
   if (isCompactInFlightForCurrentSession()) return t('chat.sendQueuesUntilCompaction')
   if (isStreaming.value) {
-    return busySendMode.value === 'steer'
+    return busySendMode.value === 'steer' && composerSameTurnSteerAvailable.value
       ? t('chat.sendSteers')
       : t('chat.sendQueues')
   }

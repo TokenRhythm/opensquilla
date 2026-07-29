@@ -203,6 +203,46 @@ describe('DataMigrationPanel desktop provider', () => {
       .not.toContain('/synthetic/legacy-agent-data')
   })
 
+  it('keeps deferred profile maintenance non-blocking and offers one-click repair', async () => {
+    const retryProfileConsolidation = vi.fn(async () => ({ ok: true }))
+    const { el } = await mountPanel({
+      desktopApi: {
+        getOsLocale: async () => 'en',
+        getRecoveryState: async () => ({
+          inspection: { outcome: 'ready', stable_code: 'ready' },
+          maintenance: {
+            kind: 'profile-consolidation',
+            stable_code: 'unsafe_path',
+            retryable: true,
+            recovery_profile_count: 2,
+          },
+        }),
+        retryProfileConsolidation,
+        migrationSummary: vi.fn(async () => ({
+          ok: true,
+          candidates: [],
+          candidate: null,
+          report: null,
+        })),
+        migrationRun: vi.fn(),
+      },
+    })
+
+    const maintenance = el.querySelector('[data-testid="profile-consolidation-maintenance"]')
+    expect(maintenance?.textContent).toContain('Historical data is safely preserved')
+    expect(maintenance?.textContent).toContain('OpenSquilla is ready to use')
+    expect(maintenance?.textContent).toContain('unsafe_path')
+    expect(maintenance?.textContent).not.toContain('/synthetic/')
+
+    maintenance?.querySelector<HTMLButtonElement>(
+      '[data-testid="profile-consolidation-repair"]',
+    )?.click()
+    await settle()
+
+    expect(retryProfileConsolidation).toHaveBeenCalledTimes(1)
+    expect(el.querySelector('[data-testid="profile-consolidation-maintenance"]')).toBeNull()
+  })
+
   it('confirms an empty-target copy and sends only the opaque preview approval', async () => {
     const candidate = desktopCandidate()
     const migrationRun = vi.fn(async () => ({ ok: true, migrationApplied: true, restartOk: true }))

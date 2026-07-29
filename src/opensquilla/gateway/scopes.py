@@ -187,6 +187,7 @@ METHOD_SCOPES: dict[str, str] = {
     "plans.revise": WRITE_SCOPE,
     "plans.cancelRun": WRITE_SCOPE,
     "sessions.steer": WRITE_SCOPE,
+    "sessions.steer.v2": WRITE_SCOPE,
     "sessions.abort": WRITE_SCOPE,
     "sessions.reset": WRITE_SCOPE,
     "sessions.contextCompact": WRITE_SCOPE,

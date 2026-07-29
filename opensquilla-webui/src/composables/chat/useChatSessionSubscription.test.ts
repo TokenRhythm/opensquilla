@@ -40,6 +40,60 @@ function createSubscription(hasActiveInterrupt = false) {
 }
 
 describe('useChatSessionSubscription', () => {
+  it('preserves same-turn capability across compact lifecycle updates for the same task', () => {
+    const runStatus = ref<ChatRunStatus>({
+      status: 'running',
+      label: 'Running',
+      task: {
+        task_id: 'turn-current',
+        status: 'running',
+        steer_capability: {
+          mode: 'same_turn',
+          expected_turn_id: 'turn-current',
+          input_kinds: ['text'],
+        },
+      },
+    })
+    const subscription = useChatSessionSubscription({
+      rpc: {
+        waitForConnection: vi.fn(async () => {}),
+        call: vi.fn(),
+      },
+      sessionKey: ref('agent:main:webchat:steer-capability'),
+      lastStreamSeq: ref(0),
+      runStatus,
+      isStreaming: ref(true),
+      hasActiveInterrupt: ref(false),
+      activeStreamTaskId: ref('turn-current'),
+      activeTaskGroups: ref(new Set<string>()),
+      sessionRunStatus: source => ({
+        status: (source?.run_status || 'idle') as ChatRunStatusState,
+        label: 'Running',
+        task: source?.active_task || null,
+      }),
+      startStreaming: vi.fn(),
+      loadHistory: vi.fn(),
+      resetStreamIdleTimer: vi.fn(),
+      resetStreamLiveTurnState: vi.fn(),
+    })
+
+    subscription.applySessionRunState({
+      run_status: 'running',
+      active_task: {
+        task_id: 'turn-current',
+        status: 'running',
+      },
+    })
+
+    expect(runStatus.value.task).toMatchObject({
+      task_id: 'turn-current',
+      steer_capability: {
+        mode: 'same_turn',
+        expected_turn_id: 'turn-current',
+      },
+    })
+  })
+
   it('keeps mixed-version compatibility when an old Gateway lacks snapshot', async () => {
     const unsupported = Object.assign(new Error('method not found'), {
       code: 'METHOD_NOT_FOUND',
@@ -479,6 +533,62 @@ describe('useChatSessionSubscription', () => {
     expect(startStreaming).toHaveBeenCalledOnce()
     expect(activeStreamTaskId.value).toBe('task-live')
     expect(outcome).toEqual({ authoritative: true, live: true, backgroundOnly: false })
+  })
+
+  it('preserves the authoritative steer capability when hydration starts a live bubble', async () => {
+    const isStreaming = ref(false)
+    const runStatus = ref<ChatRunStatus>({ status: 'idle', label: '', task: null })
+    const snapshot = {
+      subscribed: true,
+      run_status: 'running',
+      active_task: {
+        task_id: 'task-steerable',
+        status: 'running',
+        steer_capability: {
+          mode: 'same_turn' as const,
+          expected_turn_id: 'task-steerable',
+          input_kinds: ['text'],
+        },
+      },
+      current_stream_seq: 4,
+    }
+    const subscription = useChatSessionSubscription({
+      rpc: {
+        waitForConnection: vi.fn(async () => {}),
+        call: async <T = unknown>() => snapshot as T,
+      },
+      sessionKey: ref('agent:main:webchat:steer-hydration'),
+      lastStreamSeq: ref(0),
+      runStatus,
+      isStreaming,
+      hasActiveInterrupt: ref(false),
+      activeStreamTaskId: ref(''),
+      activeTaskGroups: ref(new Set<string>()),
+      sessionRunStatus: source => ({
+        status: String(
+          source?.run_status || source?.active_task?.status || 'idle',
+        ) as ChatRunStatusState,
+        label: '',
+        task: source?.active_task || null,
+      }),
+      startStreaming: () => {
+        isStreaming.value = true
+        runStatus.value = {
+          status: 'running',
+          label: '',
+          task: { status: 'running' },
+        }
+      },
+      loadHistory: vi.fn(),
+      resetStreamIdleTimer: vi.fn(),
+      resetStreamLiveTurnState: vi.fn(),
+    })
+
+    await subscription.subscribeSession()
+
+    expect(runStatus.value.task?.steer_capability).toEqual(
+      snapshot.active_task.steer_capability,
+    )
   })
 
   it('reports a failed subscription as non-authoritative', async () => {

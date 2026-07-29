@@ -43,6 +43,9 @@ class TurnContext:
         default=None,
         repr=False,
     )
+    # Pinned once after model/catalog resolution. Provider retries and
+    # same-turn pending-input continuations must not replace this value.
+    route_plan: Any | None = field(default=None, repr=False)
     # PR3 (design §14): surface origin so PR4's clarify reply parser
     # can adapt its tolerance per surface. Defaults to "unknown" so
     # the gateway/CLI/channel adapters can set it post-construction.

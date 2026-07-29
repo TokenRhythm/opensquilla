@@ -180,7 +180,7 @@ describe('artifact Workbench provider', () => {
     ]))
   })
 
-  it('keeps explicit mode selection and default saving idempotent', async () => {
+  it('keeps temporary mode selection separate from the saved default', async () => {
     const requestedModes: string[] = []
     let leaseSequence = 0
     const createLease = vi.fn(async (request: { mode: 'full' | 'offline' }) => {
@@ -239,7 +239,6 @@ describe('artifact Workbench provider', () => {
     const renderState: Record<string, unknown> = {}
     const pushToast = vi.fn()
     const savePreviewPreferences = vi.fn(async () => undefined)
-    const confirmModeSwitch = vi.fn(async () => true)
     const item = createArtifactPreviewWorkbenchItem({
       artifact,
       nativeHtml: true,
@@ -248,10 +247,9 @@ describe('artifact Workbench provider', () => {
     const definition = createArtifactWorkbenchDefinitions({
       authToken: () => '',
       baseOrigin: 'http://127.0.0.1:18791',
-      confirmModeSwitch,
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
-      getPreviewPreferences: async () => ({ mode: 'full', noticeShown: true }),
+      getPreviewPreferences: async () => ({ mode: 'offline', noticeShown: false }),
       openArtifact: vi.fn(),
       platform: {
         id: 'desktop',
@@ -272,19 +270,28 @@ describe('artifact Workbench provider', () => {
       reportError: vi.fn(),
     })
 
-    await runtime.performAction?.('set-preview-mode-offline', item)
-    await runtime.performAction?.('set-preview-mode-offline', item)
+    await runtime.performAction?.('set-preview-mode-full', item)
+    await runtime.performAction?.('set-preview-mode-full', item)
 
-    expect(requestedModes).toEqual(['full', 'offline'])
-    expect(confirmModeSwitch).toHaveBeenCalledOnce()
-    expect(renderState.previewMode).toBe('offline')
-
-    await runtime.performAction?.('set-default-preview-mode', item)
-    await runtime.performAction?.('set-default-preview-mode', item)
-
-    expect(savePreviewPreferences).toHaveBeenCalledOnce()
-    expect(pushToast).toHaveBeenCalledOnce()
+    expect(requestedModes).toEqual(['offline', 'full'])
+    expect(renderState.previewMode).toBe('full')
     expect(renderState.previewDefaultMode).toBe('offline')
+    expect(savePreviewPreferences).toHaveBeenCalledOnce()
+    expect(savePreviewPreferences).toHaveBeenLastCalledWith({
+      mode: 'offline',
+      noticeShown: true,
+    })
+
+    await runtime.performAction?.('set-default-preview-mode', item)
+    await runtime.performAction?.('set-default-preview-mode', item)
+
+    expect(savePreviewPreferences).toHaveBeenCalledTimes(2)
+    expect(savePreviewPreferences).toHaveBeenLastCalledWith({
+      mode: 'full',
+      noticeShown: true,
+    })
+    expect(pushToast).toHaveBeenCalledOnce()
+    expect(renderState.previewDefaultMode).toBe('full')
     await runtime.dispose?.('closed')
   })
 

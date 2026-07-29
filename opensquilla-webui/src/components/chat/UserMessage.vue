@@ -70,6 +70,18 @@
       <div v-if="message.text" class="msg-user-bubble">
         {{ stripTimePrefix(message.text) }}
       </div>
+      <span
+        v-if="steerStatusLabel"
+        class="msg-user-steer-status"
+        :class="`msg-user-steer-status--${message.inputDisposition}`"
+        role="status"
+      >
+        {{ steerStatusLabel }}
+      </span>
+      <TurnOutcomeStatus
+        v-if="showTurnOutcome && message.turnOutcome"
+        :outcome="message.turnOutcome"
+      />
     </div>
     <div v-if="!shareMode" class="msg-user-actions">
       <button
@@ -95,9 +107,10 @@
 </template>
 
 <script setup lang="ts">
-import { computed, reactive } from 'vue'
+import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import TurnOutcomeStatus from '@/components/chat/TurnOutcomeStatus.vue'
 import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
 import { useRelativeNow } from '@/composables/useRelativeNow'
 import type { ChatRenderedMessage, DisplayAttachment } from '@/types/chat'
@@ -114,6 +127,7 @@ const props = defineProps<{
   stripTimePrefix: (text: string) => string
   copyMessage: (message: ChatRenderedMessage) => Promise<boolean>
   downloadAttachment: (attachment: DisplayAttachment) => Promise<boolean>
+  showTurnOutcome?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -132,6 +146,50 @@ const timeIso = computed(() => isoTime(props.message.ts))
 const timeAbs = computed(() => absoluteTime(props.message.ts))
 const timeRel = computed(() => relativeTime(props.message.ts, now.value))
 const timeFull = computed(() => fullTime(props.message.ts))
+const STEER_WAIT_DETAIL_DELAY_MS = 700
+const showSteerWaitDetail = ref(false)
+let steerWaitDetailTimer: ReturnType<typeof setTimeout> | undefined
+
+function syncSteerWaitDetail(disposition: ChatRenderedMessage['inputDisposition']) {
+  if (steerWaitDetailTimer !== undefined) {
+    clearTimeout(steerWaitDetailTimer)
+    steerWaitDetailTimer = undefined
+  }
+  showSteerWaitDetail.value = false
+  if (disposition !== 'steering') return
+  steerWaitDetailTimer = setTimeout(() => {
+    steerWaitDetailTimer = undefined
+    if (props.message.inputDisposition === 'steering') {
+      showSteerWaitDetail.value = true
+    }
+  }, STEER_WAIT_DETAIL_DELAY_MS)
+}
+
+watch(
+  () => props.message.inputDisposition,
+  disposition => syncSteerWaitDetail(disposition),
+  { immediate: true },
+)
+
+onBeforeUnmount(() => {
+  if (steerWaitDetailTimer !== undefined) clearTimeout(steerWaitDetailTimer)
+})
+
+const steerStatusLabel = computed(() => {
+  const disposition = props.message.inputDisposition
+  if (!disposition) return ''
+  if (disposition === 'steering') {
+    return showSteerWaitDetail.value
+      ? `${t('chat.steerMode')} · ${t('chat.steerStatus.waiting')}`
+      : t('chat.steerMode')
+  }
+  if (disposition === 'applied') return t('chat.steerMode')
+  return t({
+    promoted: 'chat.steerStatus.promoted',
+    cancelled: 'chat.steerStatus.notApplied',
+    rejected: 'chat.steerStatus.notApplied',
+  }[disposition])
+})
 const downloadingAttachments = reactive(new Set<string>())
 const failedDownloads = reactive(new Set<string>())
 
@@ -269,6 +327,16 @@ function attachmentMeta(attachment: DisplayAttachment): string {
   align-items: flex-end;
   gap: 0.375rem;
   min-width: 0;
+}
+
+.msg-user-steer-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 1.25rem;
+  padding-inline: 0.25rem;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  line-height: 1.3;
 }
 
 /* Arrival feedback stays local to the destination instead of washing the full

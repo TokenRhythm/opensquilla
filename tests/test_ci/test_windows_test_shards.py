@@ -51,6 +51,7 @@ OFFLINE_MARKER_EXCLUSIONS = {
 RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/unit/cli/tui/test_keys_cheatsheet.py",
     "tests/unit/cli/tui/test_opentui_prefs.py",
+    "tests/test_cli/test_gateway_client_steer.py",
     "tests/test_channels/test_admission_reason_persistence.py",
     "tests/test_channels/test_channel_admission.py",
     "tests/test_channels/test_channel_certification.py",
@@ -76,6 +77,7 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_engine/test_agent_canonical_text_contract.py",
     "tests/test_engine/test_done_text_snapshot_consumers.py",
     "tests/test_engine/test_provider_request_correlation.py",
+    "tests/test_engine/test_route_plan.py",
     "tests/test_engine/turn_runner/test_canonical_text_contract.py",
     "tests/test_gateway/test_api_chat.py",
     "tests/test_gateway/test_channel_turn_ingress.py",
@@ -88,6 +90,7 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_gateway/test_rpc_migration.py",
     "tests/test_gateway/test_rpc_memory_import.py",
     "tests/test_gateway/test_rpc_storage_busy.py",
+    "tests/test_gateway/test_steer_restart_recovery.py",
     "tests/test_gateway/test_task_runtime_reservations.py",
     "tests/test_gateway/test_turn_ingress_fork.py",
     "tests/test_gateway/test_turn_ingress_intents.py",

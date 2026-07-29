@@ -58,6 +58,7 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
   retryStartup: () => ipcRenderer.invoke('desktop:boot:retry'),
   quitApp: () => ipcRenderer.invoke('desktop:boot:quit'),
   getRecoveryState: () => ipcRenderer.invoke('desktop:recovery:state'),
+  retryProfileConsolidation: () => ipcRenderer.invoke('desktop:recovery:retry-consolidation'),
   chooseRecoveryWorkspace: (payload: unknown) => ipcRenderer.invoke('desktop:recovery:choose-workspace', payload),
   chooseLegacyAgentDataLocation: (payload: unknown) => ipcRenderer.invoke('desktop:recovery:choose-legacy-agent-data', payload),
   recoverProfileTransaction: () => ipcRenderer.invoke('desktop:recovery:recover-transaction'),

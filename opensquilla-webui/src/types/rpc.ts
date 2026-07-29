@@ -27,10 +27,18 @@ export interface RawSessionChannelContext {
 
 export interface RawSessionTask {
   status?: string
+  task_id?: string
+  taskId?: string
+  turn_id?: string
+  turnId?: string
   started_at?: number | string
   startedAt?: number | string
   finished_at?: number | string
   finishedAt?: number | string
+  turn_outcome?: Record<string, unknown>
+  turnOutcome?: Record<string, unknown>
+  steer_capability?: import('./chat').ChatSteerCapability
+  steerCapability?: import('./chat').ChatSteerCapability
 }
 
 export interface RawSessionCron {
@@ -209,6 +217,8 @@ export interface StreamEventEnvelope {
 export interface SessionEventPayload extends StreamEventEnvelope {
   task_id?: string
   taskId?: string
+  turn_id?: string
+  turnId?: string
   started_at?: number
   emitted_at?: number
   reason?: string
@@ -415,6 +425,54 @@ export interface ChatSendResponse {
   reason?: string
 }
 
+export interface SessionSteerV2Params {
+  key: string
+  message: string
+  expected_turn_id: string
+  client_request_id: string
+  client_message_id: string
+  surface_id?: string
+  _source?: { elevated?: string; runMode?: 'standard' | 'trusted' | 'full' }
+}
+
+export interface SessionSteerV2Response {
+  accepted?: boolean
+  replayed?: boolean
+  session_key?: string
+  turn_id?: string
+  user_message_id?: string
+  client_request_id?: string
+  client_message_id?: string
+  disposition?: import('./chat').ChatSteerDisposition
+  revision?: number
+  promoted_turn_id?: string
+  promoted_from_turn_id?: string
+  applied_iteration?: number
+  model_call_id?: string
+  fallback_safe?: boolean
+  failure_code?: string
+  retryable?: boolean
+  recovery?: string
+  reason?: string
+}
+
+export interface InputDispositionPayload extends SessionEventPayload {
+  target_turn_id?: string
+  client_request_id?: string
+  client_message_id?: string
+  user_message_id?: string
+  disposition?: import('./chat').ChatSteerDisposition
+  promoted_from_turn_id?: string
+  promoted_turn_id?: string
+  applied_iteration?: number
+  model_call_id?: string
+  failure_code?: string
+  retryable?: boolean
+  recovery?: string
+  fallback_safe?: boolean
+  revision?: number
+}
+
 export interface ChatHistoryAttachmentPayload {
   type?: unknown
   mime?: unknown
@@ -475,6 +533,16 @@ export interface ChatHistoryResponse {
   canonicalComplete?: boolean
   limit?: number
   returned?: number
+  turn_outcomes?: ChatHistoryTurnOutcome[]
+}
+
+export interface ChatHistoryTurnOutcome {
+  turn_id?: string
+  task_id?: string
+  status?: string
+  started_at?: string | number
+  finished_at?: string | number
+  outcome?: Record<string, unknown>
 }
 
 export interface RouterDecisionPayload extends SessionEventPayload {
@@ -613,6 +681,7 @@ export interface RpcEventMap {
   'session.event.run_heartbeat': SessionEventPayload
   'session.event.compaction': CompactionPayload
   'session.event.warning': SessionEventPayload
+  'session.event.input_disposition': InputDispositionPayload
   'session.epoch_changed': SessionEventPayload
   'sessions.changed': SessionEventPayload
   'task.queued': SessionEventPayload

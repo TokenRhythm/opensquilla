@@ -9,10 +9,10 @@ import type { ChatHistoryMessage, ChatHistoryResponse } from '@/types/rpc'
 import { normalizeDisplayAttachments } from '@/utils/chat/attachments'
 import {
   historyWindowsOverlap,
-  reconcileClientStopNotices,
   reconcileClientTerminalNotices,
   reconcileHistoryWindow,
   reconcileRunningHistoryMessages,
+  rehomePromotedSteerRows,
 } from '@/utils/chat/historyMerge'
 import {
   captureVisibleMessageAnchor,
@@ -30,6 +30,8 @@ import {
   type SessionPhaseResult,
 } from '@/composables/chat/sessionBootstrapContract'
 import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
+import { normalizeTurnOutcome } from '@/utils/chat/turnOutcome'
+import { interleaveHistoryModelCallSegments } from '@/utils/chat/historyModelCallSegments'
 
 type RpcClient = {
   policy?: Record<string, unknown> | null
@@ -68,8 +70,74 @@ function usagePayload(value: unknown): ChatUsagePayload | undefined {
 
 function historyTurnId(value: unknown): string | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
-  const turnId = (value as Record<string, unknown>).turn_id
+  const context = value as Record<string, unknown>
+  const turnId = context.disposition === 'promoted'
+    ? context.promoted_turn_id ?? context.turn_id ?? context.target_turn_id
+    : context.turn_id
   return typeof turnId === 'string' && turnId ? turnId : undefined
+}
+
+function historyContextText(value: unknown, key: string): string | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const raw = (value as Record<string, unknown>)[key]
+  return typeof raw === 'string' && raw ? raw : undefined
+}
+
+function historyHasSteerEvidence(value: unknown): boolean {
+  const disposition = historyContextText(value, 'disposition')
+  const intent = historyContextText(value, 'intent')
+  return intent === 'steer'
+    || disposition === 'steering'
+    || disposition === 'promoted'
+    || disposition === 'cancelled'
+    || disposition === 'rejected'
+    || Boolean(historyContextText(value, 'client_request_id'))
+    || Boolean(historyContextText(value, 'model_call_id'))
+    || historyContextInteger(value, 'applied_iteration') !== undefined
+}
+
+function historyInputDisposition(value: unknown): ChatMessage['inputDisposition'] {
+  const disposition = historyContextText(value, 'disposition')
+  if (!historyHasSteerEvidence(value)) return undefined
+  return ['steering', 'applied', 'promoted', 'cancelled', 'rejected'].includes(
+    disposition || '',
+  )
+    ? disposition as NonNullable<ChatMessage['inputDisposition']>
+    : undefined
+}
+
+function historyDispositionRevision(value: unknown): number | undefined {
+  if (
+    !historyHasSteerEvidence(value)
+    || !value
+    || typeof value !== 'object'
+    || Array.isArray(value)
+  ) return undefined
+  const revision = Number((value as Record<string, unknown>).revision)
+  return Number.isInteger(revision) && revision >= 0 ? revision : undefined
+}
+
+function historyContextInteger(value: unknown, key: string): number | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const number = Number((value as Record<string, unknown>)[key])
+  return Number.isInteger(number) && number >= 0 ? number : undefined
+}
+
+function attachHistoryTurnOutcomes(
+  messages: ChatMessage[],
+  data: ChatHistoryResponse,
+): ChatMessage[] {
+  const byTurnId = new Map(
+    (data.turn_outcomes || [])
+      .map(normalizeTurnOutcome)
+      .filter(outcome => outcome !== undefined)
+      .map(outcome => [outcome.turnId, outcome] as const),
+  )
+  if (byTurnId.size === 0) return messages
+  return messages.map(message => {
+    const outcome = message.turnId ? byTurnId.get(message.turnId) : undefined
+    return outcome ? { ...message, turnOutcome: outcome } : message
+  })
 }
 
 export interface UseChatHistoryOptions {
@@ -187,6 +255,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     // thinking duration; live turn records re-fill seconds after sync.
     const reasoningText = typeof msg.reasoning_content === 'string' ? msg.reasoning_content.trim() : ''
     const messageId = msg.message_id || msg.id || ''
+    const steerContext = historyHasSteerEvidence(msg.turn_context)
     return {
       role: msg.role || 'assistant',
       text: msg.role === 'user' ? options.stripTimePrefix(msg.text || '') : msg.text || '',
@@ -202,6 +271,23 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       provenanceSourceSessionKey: msg.provenance_source_session_key || '',
       provenanceSourceTool: msg.provenance_source_tool || '',
       turnId: historyTurnId(msg.turn_context),
+      inputDisposition: historyInputDisposition(msg.turn_context),
+      inputDispositionRevision: historyDispositionRevision(msg.turn_context),
+      steerClientRequestId: steerContext
+        ? historyContextText(msg.turn_context, 'client_request_id')
+        : undefined,
+      steerClientMessageId: steerContext
+        ? historyContextText(msg.turn_context, 'client_message_id')
+        : undefined,
+      steerModelCallId: steerContext
+        ? historyContextText(msg.turn_context, 'model_call_id')
+        : undefined,
+      steerAppliedIteration: steerContext
+        ? historyContextInteger(msg.turn_context, 'applied_iteration')
+        : undefined,
+      promotedFromTurnId: steerContext
+        ? historyContextText(msg.turn_context, 'promoted_from_turn_id')
+        : undefined,
       usage: usagePayload(msg.usage) || usagePayload(msg.turn_usage),
       model: msg.model || undefined,
       input: msg.input || msg.input_tokens || undefined,
@@ -212,7 +298,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   }
 
   function messageKey(msg: ChatMessage): string {
-    return msg.messageId || `${msg.role}:${msg.ts || ''}:${msg.text || ''}`
+    return msg.messageId || msg.clientId || `${msg.role}:${msg.ts || ''}:${msg.text || ''}`
   }
 
   function hasLocalOptimisticRows(messages: ChatMessage[]): boolean {
@@ -392,7 +478,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         }
       }
 
-      let mapped = msgs.map(mapHistoryMessage)
+      let mapped = attachHistoryTurnOutcomes(msgs.map(mapHistoryMessage), data)
       const previousMessages = crossedSession ? [] : options.messages.value
       let historyData = data
       let bridgeContinuationNeeded = false
@@ -460,7 +546,10 @@ export function useChatHistory(options: UseChatHistoryOptions) {
             return { ok: false }
           }
 
-          const page = (bridgeData.messages || []).map(mapHistoryMessage)
+          const page = attachHistoryTurnOutcomes(
+            (bridgeData.messages || []).map(mapHistoryMessage),
+            bridgeData,
+          )
           for (const message of page) {
             const keyValue = messageKey(message)
             if (bridgedKeys.has(keyValue)) continue
@@ -550,10 +639,12 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       const prependFallbackHeight = prependAnchor ? 0 : prependContainer?.scrollHeight ?? 0
       if (params.prepend) {
         const existing = new Set(options.messages.value.map(messageKey))
-        options.messages.value = [
-          ...mapped.filter(msg => !existing.has(messageKey(msg))),
-          ...options.messages.value,
-        ]
+        options.messages.value = interleaveHistoryModelCallSegments(
+          rehomePromotedSteerRows([
+            ...mapped.filter(msg => !existing.has(messageKey(msg))),
+            ...options.messages.value,
+          ]),
+        )
       } else {
         const refreshedWindow = reconcileHistoryWindow(previousMessages, mapped)
         let nextMessages: ChatMessage[]
@@ -562,9 +653,10 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         } else {
           nextMessages = refreshedWindow
         }
-        options.messages.value = reconcileClientTerminalNotices(
-          previousMessages,
-          reconcileClientStopNotices(previousMessages, nextMessages),
+        options.messages.value = interleaveHistoryModelCallSegments(
+          rehomePromotedSteerRows(
+            reconcileClientTerminalNotices(previousMessages, nextMessages),
+          ),
         )
       }
 

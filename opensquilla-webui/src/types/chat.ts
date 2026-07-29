@@ -53,6 +53,12 @@ export interface ChatPendingItem {
   hiddenClientMessageId?: string
   /** The visible confirmation bubble was already rendered optimistically. */
   hiddenVisibleCommitted?: boolean
+  /** Stable identity for retrying a same-turn steer without creating a second input. */
+  steerClientRequestId?: string
+  steerClientMessageId?: string
+  steerExpectedTurnId?: string
+  /** The optimistic user row already exists in the transcript surface. */
+  steerVisibleCommitted?: boolean
 }
 
 export interface ChatRouterCell {
@@ -143,6 +149,32 @@ export type ChatRunStatusState =
   | 'timeout'
   | 'cancelled'
 
+export type ChatSteerDisposition =
+  | 'steering'
+  | 'applied'
+  | 'promoted'
+  | 'cancelled'
+  | 'rejected'
+
+export interface ChatSteerCapability {
+  mode: 'same_turn' | 'queue_only' | 'disabled'
+  expected_turn_id?: string
+  input_kinds?: string[]
+  reason?: string
+}
+
+export interface ChatTurnOutcome {
+  turnId: string
+  taskId?: string
+  status: string
+  kind?: string
+  reason?: string
+  cancellationSource?: string
+  startedAt?: number | string
+  finishedAt?: number | string
+  retryable?: boolean
+}
+
 export interface ChatRunTask {
   status?: string
   task_id?: string
@@ -155,6 +187,12 @@ export interface ChatRunTask {
   terminalReason?: string
   task_group_count?: number
   taskGroupCount?: number
+  turn_id?: string
+  turnId?: string
+  steer_capability?: ChatSteerCapability
+  steerCapability?: ChatSteerCapability
+  turn_outcome?: Record<string, unknown>
+  turnOutcome?: Record<string, unknown>
 }
 
 export interface ChatRunStatus {
@@ -202,6 +240,16 @@ export interface ChatTimelineSegment extends Record<string, unknown> {
   approval_id?: string
 }
 
+export interface ChatModelCallSegment {
+  model_call_id?: string
+  modelCallId?: string
+  iteration?: number
+  start_codepoint?: number
+  startCodepoint?: number
+  end_codepoint?: number
+  endCodepoint?: number
+}
+
 export interface ChatUsagePayload {
   model?: string
   routed_model?: string
@@ -227,6 +275,10 @@ export interface ChatUsagePayload {
   modelUsageBreakdown?: ChatEnsembleUsageRow[]
   ensemble_trace?: ChatEnsembleTrace
   ensembleTrace?: ChatEnsembleTrace
+  route_plan?: Record<string, unknown>
+  routePlan?: Record<string, unknown>
+  model_call_segments?: ChatModelCallSegment[]
+  modelCallSegments?: ChatModelCallSegment[]
   /** V017 routing-decision id — presence is what makes a turn rateable. */
   decision_id?: string
   __savings_ui_suppressed?: boolean
@@ -332,6 +384,21 @@ export interface ChatMessage {
   provenanceSourceTool?: string
   /** Durable causal turn identity restored from transcript turn_context. */
   turnId?: string
+  /** Same-turn input lifecycle, sourced only from durable context or typed events. */
+  inputDisposition?: ChatSteerDisposition
+  /** Monotonic server revision for the disposition state machine. */
+  inputDispositionRevision?: number
+  steerClientRequestId?: string
+  steerClientMessageId?: string
+  /** Physical model call that durably applied this same-turn adjustment. */
+  steerModelCallId?: string
+  steerAppliedIteration?: number
+  steerRestored?: boolean
+  /** Local Stop was requested; the server disposition remains authoritative. */
+  steerStopRequested?: boolean
+  /** Original turn when this accepted adjustment was promoted into a follow-up. */
+  promotedFromTurnId?: string
+  turnOutcome?: ChatTurnOutcome
   interrupted?: boolean
   routerState?: string
   routerSettled?: boolean
@@ -392,6 +459,9 @@ export interface ChatRenderedMessage {
   messageId?: string
   /** Stable identity of the owning user turn for client-only UI continuity. */
   turnKey?: string
+  inputDisposition?: ChatSteerDisposition
+  inputDispositionRevision?: number
+  turnOutcome?: ChatTurnOutcome
   hasAttachments?: boolean
   attachments?: DisplayAttachment[]
   toolCalls?: ChatToolCall[]

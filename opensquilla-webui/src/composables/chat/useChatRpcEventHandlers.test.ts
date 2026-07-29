@@ -2,7 +2,12 @@ import { describe, expect, it, vi } from 'vitest'
 import { effectScope, nextTick, ref } from 'vue'
 import { useChatRpcEventHandlers, type ChatRpcStreamApi } from './useChatRpcEventHandlers'
 import type { SessionBootstrapRun } from './useChatSessionBootstrap'
-import type { ChatMessage, ChatRunStatus, ChatRunStatusSource } from '@/types/chat'
+import type {
+  ChatMessage,
+  ChatPendingItem,
+  ChatRunStatus,
+  ChatRunStatusSource,
+} from '@/types/chat'
 
 function createHarness(options: {
   messages?: ChatMessage[]
@@ -11,12 +16,15 @@ function createHarness(options: {
   handleSessionConnectionState?: (state: string) => SessionBootstrapRun | undefined
   loadCurrentSessionUsage?: () => void
   refreshRunModePreference?: () => void | Promise<void>
+  pendingQueue?: ChatPendingItem[]
+  restoreSteerIntoComposer?: (text: string) => void
 } = {}) {
   const messages = ref<ChatMessage[]>(options.messages ?? [])
   const sessionKey = ref('agent:main:test')
   const lastStreamSeq = ref(0)
   const activeTaskGroups = ref(new Set<string>())
   const activeStreamTaskId = ref('')
+  const pendingQueue = ref<ChatPendingItem[]>(options.pendingQueue ?? [])
   const applySessionRunState = vi.fn()
   const stream: ChatRpcStreamApi = {
     isStreaming: ref(true),
@@ -49,6 +57,7 @@ function createHarness(options: {
   )
   const loadCurrentSessionUsage = vi.fn(options.loadCurrentSessionUsage ?? (() => {}))
   const refreshRunModePreference = vi.fn(options.refreshRunModePreference ?? (() => {}))
+  const restoreSteerIntoComposer = vi.fn(options.restoreSteerIntoComposer ?? (() => {}))
   const scope = effectScope()
   const api = scope.run(() => useChatRpcEventHandlers({
     sessionKey,
@@ -58,7 +67,7 @@ function createHarness(options: {
     activeStreamTaskId,
     aborted: ref(false),
     messages,
-    pendingQueue: ref([]),
+    pendingQueue,
     usageAccum: ref({
       input: 0,
       output: 0,
@@ -84,6 +93,7 @@ function createHarness(options: {
     scheduleHistorySync,
     schedulePendingDrainAfterTerminal,
     popAllPendingIntoComposer: vi.fn(() => false),
+    restoreSteerIntoComposer,
     saveWidgetState: vi.fn(),
     handleSessionConnectionState,
     loadCurrentSessionUsage,
@@ -97,6 +107,7 @@ function createHarness(options: {
     stream,
     activeTaskGroups,
     activeStreamTaskId,
+    pendingQueue,
     applySessionRunState,
     markEnsembleHandoff,
     schedulePendingDrainAfterTerminal,
@@ -105,11 +116,33 @@ function createHarness(options: {
     handleSessionConnectionState,
     loadCurrentSessionUsage,
     refreshRunModePreference,
+    restoreSteerIntoComposer,
     stop: () => scope.stop(),
   }
 }
 
 describe('useChatRpcEventHandlers live snapshot restoration', () => {
+  it('does not replace live task state for a recents-only session change', () => {
+    const {
+      api,
+      activeStreamTaskId,
+      applySessionRunState,
+      stop,
+    } = createHarness()
+    try {
+      activeStreamTaskId.value = 'task-live'
+
+      api.handlers.onSessionsChanged({
+        session_key: 'agent:main:test',
+        reason: 'title_changed',
+      })
+
+      expect(applySessionRunState).not.toHaveBeenCalled()
+    } finally {
+      stop()
+    }
+  })
+
   it('rebuilds the unfinished turn while advancing to the authoritative cursor', () => {
     const {
       api,
@@ -287,6 +320,268 @@ describe('useChatRpcEventHandlers durable out-of-band messages', () => {
       expect(showWarningToast).toHaveBeenCalledOnce()
       expect(showWarningToast).toHaveBeenCalledWith('Provider is degraded')
       expect(messages.value).toHaveLength(0)
+    } finally {
+      stop()
+    }
+  })
+})
+
+describe('useChatRpcEventHandlers steer disposition', () => {
+  it('does not paint primary send lifecycle events as same-turn steer status', () => {
+    const { api, messages, stop } = createHarness({
+      messages: [{
+        role: 'user',
+        text: 'ordinary queued follow-up',
+        ts: 'now',
+        clientId: 'client-send',
+        turnId: 'turn-send',
+      }],
+    })
+
+    try {
+      api.handlers.onInputDisposition({
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        client_message_id: 'client-send',
+        user_message_id: 'user-send',
+        turn_id: 'turn-send',
+        intent: 'send',
+        disposition: 'applied',
+        revision: 1,
+      })
+
+      expect(messages.value[0]).not.toHaveProperty('inputDisposition')
+      expect(messages.value[0]).not.toHaveProperty('inputDispositionRevision')
+    } finally {
+      stop()
+    }
+  })
+
+  it('moves a promoted adjustment to its explicit new turn and clears its retry lease', () => {
+    const steer: ChatMessage = {
+      role: 'user',
+      text: 'use the new constraint',
+      ts: 'now',
+      turnId: 'turn-old',
+      inputDisposition: 'steering',
+      steerClientRequestId: 'request-1',
+      steerClientMessageId: 'client-1',
+    }
+    const pending: ChatPendingItem = {
+      text: steer.text,
+      attachments: [],
+      intent: null,
+      deliveryState: 'retryable',
+      steerClientRequestId: 'request-1',
+      steerClientMessageId: 'client-1',
+      steerExpectedTurnId: 'turn-old',
+    }
+    const { api, messages, pendingQueue, scheduleHistorySync, stop } = createHarness({
+      messages: [
+        {
+          role: 'user',
+          text: 'original request',
+          ts: 'before',
+          messageId: 'user-old',
+          turnId: 'turn-old',
+        },
+        steer,
+        {
+          role: 'assistant',
+          text: 'completed old-turn output',
+          ts: 'after',
+          messageId: 'assistant-old',
+          turnId: 'turn-old',
+        },
+        {
+          role: 'router',
+          text: '',
+          ts: 'new',
+          messageId: 'router-new',
+          turnId: 'turn-new',
+        },
+      ],
+      pendingQueue: [pending],
+    })
+
+    try {
+      api.handlers.onInputDisposition({
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        client_request_id: 'request-1',
+        client_message_id: 'client-1',
+        user_message_id: 'user-1',
+        turn_id: 'turn-old',
+        promoted_turn_id: 'turn-new',
+        promoted_from_turn_id: 'turn-old',
+        disposition: 'promoted',
+        revision: 2,
+      })
+      api.handlers.onInputDisposition({
+        session_key: 'agent:main:test',
+        stream_seq: 2,
+        client_request_id: 'request-1',
+        turn_id: 'turn-old',
+        disposition: 'steering',
+        revision: 1,
+      })
+
+      expect(messages.value.map(message => message.messageId)).toEqual([
+        'user-old',
+        'assistant-old',
+        'user-1',
+        'router-new',
+      ])
+      expect(messages.value[2]).toMatchObject({
+        messageId: 'user-1',
+        turnId: 'turn-new',
+        promotedFromTurnId: 'turn-old',
+        inputDisposition: 'promoted',
+        inputDispositionRevision: 2,
+      })
+      expect(pendingQueue.value).toEqual([])
+      expect(scheduleHistorySync).toHaveBeenCalledOnce()
+    } finally {
+      stop()
+    }
+  })
+
+  it.each([
+    {
+      disposition: 'cancelled' as const,
+      retryable: false,
+      recovery: 'restore_to_composer',
+    },
+    {
+      disposition: 'rejected' as const,
+      retryable: true,
+      recovery: 'resend_after_queue_drains',
+    },
+  ])('restores $disposition steer text once and leaves a muted durable row', ({
+    disposition,
+    retryable,
+    recovery,
+  }) => {
+    const { api, messages, restoreSteerIntoComposer, stop } = createHarness({
+      messages: [{
+        role: 'user',
+        text: 'preserve this adjustment',
+        ts: 'now',
+        turnId: 'turn-current',
+        inputDisposition: 'steering',
+        steerClientRequestId: 'request-restore',
+      }],
+    })
+
+    try {
+      api.handlers.onInputDisposition({
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        client_request_id: 'request-restore',
+        disposition,
+        retryable,
+        recovery,
+        revision: 2,
+      })
+      api.handlers.onInputDisposition({
+        session_key: 'agent:main:test',
+        stream_seq: 2,
+        client_request_id: 'request-restore',
+        disposition,
+        retryable,
+        recovery,
+        revision: 2,
+      })
+
+      expect(messages.value[0]).toMatchObject({
+        inputDisposition: disposition,
+        steerRestored: true,
+      })
+      expect(restoreSteerIntoComposer).toHaveBeenCalledOnce()
+      expect(restoreSteerIntoComposer).toHaveBeenCalledWith('preserve this adjustment')
+    } finally {
+      stop()
+    }
+  })
+
+  it('lets an authoritative applied revision win a local Stop race without restoring text', () => {
+    const { api, messages, restoreSteerIntoComposer, stop } = createHarness({
+      messages: [{
+        role: 'user',
+        text: 'already reached the model',
+        ts: 'now',
+        turnId: 'turn-current',
+        inputDisposition: 'steering',
+        steerStopRequested: true,
+        steerClientRequestId: 'request-applied',
+      }],
+    })
+
+    try {
+      api.handlers.onInputDisposition({
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        client_request_id: 'request-applied',
+        disposition: 'applied',
+        revision: 2,
+        applied_iteration: 2,
+        model_call_id: '2.0',
+      })
+
+      expect(messages.value[0]).toMatchObject({
+        inputDisposition: 'applied',
+        inputDispositionRevision: 2,
+        steerStopRequested: false,
+      })
+      expect(restoreSteerIntoComposer).not.toHaveBeenCalled()
+    } finally {
+      stop()
+    }
+  })
+
+  it('restores multiple authoritatively cancelled steers in event FIFO order', () => {
+    const { api, restoreSteerIntoComposer, stop } = createHarness({
+      messages: [
+        {
+          role: 'user',
+          text: 'first adjustment',
+          ts: 1,
+          turnId: 'turn-current',
+          inputDisposition: 'steering',
+          steerStopRequested: true,
+          steerClientRequestId: 'request-first',
+        },
+        {
+          role: 'user',
+          text: 'second adjustment',
+          ts: 2,
+          turnId: 'turn-current',
+          inputDisposition: 'steering',
+          steerStopRequested: true,
+          steerClientRequestId: 'request-second',
+        },
+      ],
+    })
+
+    try {
+      for (const [streamSeq, clientRequestId] of [
+        [1, 'request-first'],
+        [2, 'request-second'],
+      ] as const) {
+        api.handlers.onInputDisposition({
+          session_key: 'agent:main:test',
+          stream_seq: streamSeq,
+          client_request_id: clientRequestId,
+          disposition: 'cancelled',
+          revision: 2,
+          recovery: 'restore_to_composer',
+        })
+      }
+
+      expect(restoreSteerIntoComposer.mock.calls).toEqual([
+        ['first adjustment'],
+        ['second adjustment'],
+      ])
     } finally {
       stop()
     }

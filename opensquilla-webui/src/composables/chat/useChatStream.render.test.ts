@@ -5,7 +5,7 @@ import {
   streamIdleTimeoutFromPolicy,
   useChatStream,
 } from './useChatStream'
-import type { ChatMessage } from '@/types/chat'
+import type { ChatMessage, ChatRunStatus } from '@/types/chat'
 import type { InterruptViewState } from '@/types/parts'
 
 // Focused coverage for the streaming render coalescer: stream deltas are
@@ -19,12 +19,15 @@ function makeStream(
 ) {
   const scrollToBottom = vi.fn()
   const messages = ref<ChatMessage[]>([])
+  const runStatus = ref<ChatRunStatus>({ status: 'idle', label: '', task: null })
+  const applySessionRunState = vi.fn()
   const api = useChatStream({
     messages,
     lastHeaderRole: ref(''),
     aborted: ref(false),
     autoScroll: ref(true),
-    applySessionRunState: vi.fn(),
+    runStatus,
+    applySessionRunState,
     renderMarkdown: renderMarkdown as never,
     stripDirectiveTags: (t: string) => t,
     stripGeneratedArtifactMarkers: (t: string) => t,
@@ -32,7 +35,14 @@ function makeStream(
     rpcPolicy,
     interruptState,
   })
-  return { api, messages, scrollToBottom, renderMarkdown }
+  return {
+    api,
+    messages,
+    runStatus,
+    applySessionRunState,
+    scrollToBottom,
+    renderMarkdown,
+  }
 }
 
 describe('useChatStream render coalescing', () => {
@@ -70,6 +80,63 @@ describe('useChatStream render coalescing', () => {
     policy = { webui_stream_idle_grace_ms: 900_000 }
     api.resetStreamIdleTimer()
     expect(api.streamIdleTimeoutMs.value).toBe(900_000)
+    api.cleanup()
+  })
+
+  it('preserves the authoritative active-task steer capability when streaming starts late', () => {
+    const { api, runStatus, applySessionRunState } = makeStream()
+    runStatus.value = {
+      status: 'running',
+      label: 'Running',
+      task: {
+        status: 'running',
+        task_id: 'turn-current',
+        steer_capability: {
+          mode: 'same_turn',
+          expected_turn_id: 'turn-current',
+          input_kinds: ['text'],
+        },
+      },
+    }
+
+    api.startStreaming()
+
+    expect(applySessionRunState).toHaveBeenLastCalledWith({
+      run_status: 'running',
+      active_task: expect.objectContaining({
+        status: 'running',
+        task_id: 'turn-current',
+        steer_capability: expect.objectContaining({
+          mode: 'same_turn',
+          expected_turn_id: 'turn-current',
+        }),
+      }),
+    })
+    api.cleanup()
+  })
+
+  it('does not carry a completed task capability into a fresh stream', () => {
+    const { api, runStatus, applySessionRunState } = makeStream()
+    runStatus.value = {
+      status: 'idle',
+      label: 'Completed',
+      task: {
+        status: 'succeeded',
+        task_id: 'turn-old',
+        steer_capability: {
+          mode: 'same_turn',
+          expected_turn_id: 'turn-old',
+          input_kinds: ['text'],
+        },
+      },
+    }
+
+    api.startStreaming()
+
+    expect(applySessionRunState).toHaveBeenLastCalledWith({
+      run_status: 'running',
+      active_task: { status: 'running' },
+    })
     api.cleanup()
   })
 
@@ -163,6 +230,112 @@ describe('useChatStream render coalescing', () => {
     api.endStreaming()
 
     expect(messages.value[0]?.text).toBe('prefixsuffix')
+    api.cleanup()
+  })
+
+  it('checkpoints visible output before a same-turn steer without duplicating final text', () => {
+    const { api, messages } = makeStream()
+
+    api.appendDelta('before')
+    api.checkpointForUserMessage('turn-steered')
+    messages.value.push({
+      role: 'user',
+      text: 'adjust',
+      ts: new Date().toISOString(),
+      turnId: 'turn-steered',
+      inputDisposition: 'steering',
+    })
+    api.appendDelta('after')
+    api.reconcileFinalText('beforeafter')
+    api.endStreaming()
+
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['assistant', 'before'],
+      ['user', 'adjust'],
+      ['assistant', 'after'],
+    ])
+    expect(messages.value.every(message => message.turnId === 'turn-steered')).toBe(true)
+    api.cleanup()
+  })
+
+  it('keeps the live activity timeline visible across a same-turn steer checkpoint', () => {
+    const { api, messages } = makeStream()
+
+    api.appendDelta('before')
+    api.appendToolCall({
+      tool_use_id: 'tool-running',
+      tool_name: 'web_search',
+      input: { query: 'before steer' },
+    })
+    const phaseBeforeSteer = api.streamPhaseLabel.value
+
+    api.checkpointForUserMessage('turn-steered')
+
+    expect(messages.value).toHaveLength(1)
+    expect(messages.value[0]).toMatchObject({
+      role: 'assistant',
+      text: 'before',
+      turnId: 'turn-steered',
+      timeline: [{ type: 'text', raw: 'before' }],
+    })
+    expect(messages.value[0]?.tool_calls).toBeUndefined()
+    expect(messages.value[0]?.statusHistory).toBeUndefined()
+    expect(api.streamHasVisibleOutput.value).toBe(true)
+    expect(api.streamPhaseLabel.value).toBe(phaseBeforeSteer)
+    expect(api.foldedTurn.value.rawText).toBe('')
+    expect(api.foldedTurn.value.toolCalls).toEqual([
+      expect.objectContaining({
+        toolId: 'tool-running',
+        name: 'web_search',
+        isRunning: true,
+      }),
+    ])
+    expect(api.foldedTurn.value.statusHistory.length).toBeGreaterThan(0)
+    expect(api.streamTimelineItems.value).toEqual([
+      expect.objectContaining({ type: 'tool-group' }),
+    ])
+
+    api.appendToolResult({
+      tool_use_id: 'tool-running',
+      tool_name: 'web_search',
+      result: 'ok',
+    })
+    api.appendDelta('after')
+    api.reconcileFinalText('beforeafter')
+    api.endStreaming()
+
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['assistant', 'before'],
+      ['assistant', 'after'],
+    ])
+    expect(messages.value[1]?.tool_calls).toEqual([
+      expect.objectContaining({
+        tool_use_id: 'tool-running',
+        result: 'ok',
+      }),
+    ])
+    api.cleanup()
+  })
+
+  it('does not create an empty assistant row when a steer lands during a tool-only segment', () => {
+    const { api, messages } = makeStream()
+
+    api.appendToolCall({
+      tool_use_id: 'tool-only',
+      tool_name: 'exec_command',
+      input: { cmd: 'sleep 30' },
+    })
+
+    api.checkpointForUserMessage('turn-tool-only')
+
+    expect(messages.value).toEqual([])
+    expect(api.streamHasVisibleOutput.value).toBe(true)
+    expect(api.foldedTurn.value.toolCalls).toEqual([
+      expect.objectContaining({
+        toolId: 'tool-only',
+        isRunning: true,
+      }),
+    ])
     api.cleanup()
   })
 

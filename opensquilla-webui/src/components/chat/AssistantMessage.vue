@@ -35,6 +35,14 @@
         @implement-new="$emit('planImplementNew', $event)"
         @replan="$emit('planReplan', $event)"
       />
+      <TurnOutcomeStatus
+        v-if="
+          showTurnOutcome
+          && message.turnOutcome
+          && !hasActivity
+        "
+        :outcome="message.turnOutcome"
+      />
       <template v-if="activityProjection.canSeparateActivity">
         <ActivityDisclosure
           v-if="hasActivity"
@@ -323,6 +331,7 @@ import PlanCard from '@/components/chat/PlanCard.vue'
 import ReasoningPart from '@/components/chat/parts/ReasoningPart.vue'
 import StatusHistoryPart from '@/components/chat/parts/StatusHistoryPart.vue'
 import TextPart from '@/components/chat/parts/TextPart.vue'
+import TurnOutcomeStatus from '@/components/chat/TurnOutcomeStatus.vue'
 import { useChatRouteFeedback } from '@/composables/chat/useChatRouteFeedback'
 import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
 import { useRelativeNow } from '@/composables/useRelativeNow'
@@ -349,6 +358,10 @@ import {
   writeAssistantActivityDuration,
 } from '@/utils/chat/activityDisclosureState'
 import { absoluteTime, fullTime, isoTime, relativeTime } from '@/utils/messageTime'
+import {
+  turnOutcomeDurationSeconds,
+  turnOutcomePresentation,
+} from '@/utils/chat/turnOutcome'
 
 const props = defineProps<{
   message: ChatRenderedMessage
@@ -374,6 +387,7 @@ const props = defineProps<{
   forkBusy?: boolean
   planActionPending?: PlanCardAction | null
   planActionsDisabled?: boolean
+  showTurnOutcome?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -460,6 +474,7 @@ const planParts = computed(
 // The persisted activity timeline for this finished turn. Empty (fold hidden)
 // for OFF-mode turns and reloaded threads, which carry no snapshot.
 const statusHistory = computed(() => props.message.statusHistory ?? [])
+const outcomePresentation = computed(() => turnOutcomePresentation(props.message.turnOutcome))
 
 function epochMilliseconds(value: string | number | null | undefined): number {
   if (value == null) return 0
@@ -601,6 +616,10 @@ const legacyTimelineItems = computed<ChatStreamTimelineItem[]>(() => {
 })
 
 const activityLifecycle = computed<AssistantActivityLifecycle>(() => {
+  if (outcomePresentation.value === 'stopped') return 'interrupted'
+  if (outcomePresentation.value === 'interrupted') return 'interrupted'
+  if (outcomePresentation.value === 'timeout') return 'failed'
+  if (outcomePresentation.value === 'failed') return 'failed'
   if (props.message.interrupted) return 'interrupted'
   if (props.message.terminalFailure) return 'failed'
   const hasTerminalFailure = !props.message.text.trim()
@@ -730,6 +749,8 @@ const activityContinuityKey = computed(() =>
     : '',
 )
 const activityDurationSeconds = computed(() => {
+  const outcomeDuration = turnOutcomeDurationSeconds(props.message.turnOutcome)
+  if (outcomeDuration > 0) return outcomeDuration
   const measured = measuredActivityDurationSeconds.value
   if (measured > 0) return measured
   const persisted = readAssistantActivityDuration(
@@ -802,6 +823,16 @@ const activityDetailLabel = computed(() => {
 })
 
 const activitySummaryLabel = computed(() => {
+  if (outcomePresentation.value !== 'completed') {
+    const label = String(t({
+      stopped: 'sessions.status.cancelled',
+      interrupted: 'sessions.status.interrupted',
+      timeout: 'sessions.status.timeout',
+      failed: 'sessions.status.failed',
+      completed: 'chat.activity.lifecycle.settled',
+    }[outcomePresentation.value]))
+    return [label, activityCompactElapsedLabel.value].filter(Boolean).join(' · ')
+  }
   if (activityCompletionConfirmed.value) {
     return [
       String(t('chat.activity.lifecycle.settled')),

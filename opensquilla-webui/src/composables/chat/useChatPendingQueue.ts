@@ -25,6 +25,14 @@ export interface PendingQueuePayload {
   intent?: string | null
 }
 
+export interface PendingSteerRetryPayload {
+  text: string
+  clientRequestId: string
+  clientMessageId: string
+  expectedTurnId: string
+  visibleCommitted: boolean
+}
+
 export interface UseChatPendingQueueOptions {
   sessionKey: Ref<string>
   ownerContext?: Readonly<Ref<PendingQueueOwnerContext | null>>
@@ -161,6 +169,25 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       ...(item.visibleCommitted ? { hiddenVisibleCommitted: true } : {}),
     })
     flushDeferredPendingDrain()
+    return true
+  }
+
+  function enqueuePendingSteerRetry(payload: PendingSteerRetryPayload) {
+    if (pendingQueue.value.length >= MAX_PENDING) {
+      console.warn(`Pending queue full (${MAX_PENDING})`)
+      return false
+    }
+    pendingQueue.value.push({
+      text: payload.text,
+      attachments: [],
+      intent: null,
+      ownerSessionKey: options.sessionKey.value,
+      deliveryState: 'retryable',
+      steerClientRequestId: payload.clientRequestId,
+      steerClientMessageId: payload.clientMessageId,
+      steerExpectedTurnId: payload.expectedTurnId,
+      steerVisibleCommitted: payload.visibleCommitted,
+    })
     return true
   }
 
@@ -445,6 +472,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     enqueuePendingPayload,
     enqueuePendingInput,
     enqueueHiddenControl,
+    enqueuePendingSteerRetry,
     removePendingChip,
     beginPendingDelivery,
     settlePendingDelivery,

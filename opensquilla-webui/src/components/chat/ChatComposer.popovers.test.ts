@@ -64,40 +64,17 @@ beforeEach(() => {
 })
 
 describe('ChatComposer popovers', () => {
-  it('keeps busy delivery controls on queued messages instead of the composer footer', async () => {
-    const { app, el } = await mountComposer()
-    await app.unmount()
-
-    const streamingEl = document.createElement('div')
-    document.body.appendChild(streamingEl)
-    const streamingApp = createApp(ChatComposer, {
-      modelValue: '',
-      'onUpdate:modelValue': () => {},
-      attachments: [],
-      busySendMode: 'queue',
-      hasSendContent: false,
+  it('preserves the original single stop control while streaming', async () => {
+    const { app, el } = await mountComposer({
       isStreaming: true,
-      isNewLanding: false,
-      placeholder: 'Send a message',
-      sendButtonTitle: 'Send',
-      runMode: 'trusted',
-      allowedRunModes: ['standard', 'trusted', 'full'],
-      modelRoutingMode: 'off',
-      modelRoutingSettingsBusy: false,
-      routerVisualEffectsEnabled: true,
-      codingModeEnabled: false,
-      codingModeSettingsBusy: false,
-      voiceBusy: false,
-      voiceRecording: false,
-      voiceReady: true,
+      canStop: true,
+      hasSendContent: true,
     })
-    streamingApp.use(i18n)
-    streamingApp.mount(streamingEl)
-    await nextTick()
 
     expect(el.querySelector('.chat-busy-mode')).toBeNull()
-    expect(streamingEl.querySelector('.chat-busy-mode')).toBeNull()
-    streamingApp.unmount()
+    expect(el.querySelector('.chat-input-actions--right .btn--primary')).toBeNull()
+    expect(el.querySelectorAll('.chat-input-actions--right .btn--danger')).toHaveLength(1)
+    app.unmount()
   })
 
   it('closes the more-actions menu on outside pointerdown', async () => {

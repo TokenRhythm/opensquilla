@@ -192,6 +192,11 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     reconcileActiveTaskGroups(res)
     if (liveTaskSnapshot && !options.isStreaming.value) {
       options.startStreaming()
+      // startStreaming establishes the live bubble with a generic running
+      // placeholder. Restore the authoritative active-task payload (including
+      // steer_capability) that came from hydration instead of waiting for a
+      // later task.running event to repair it.
+      applySessionRunState(res)
     }
     if (liveTaskSnapshot) {
       const activeTask = (res.active_task || res.activeTask) as {
@@ -613,7 +618,32 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
   }
 
   function applySessionRunState(source: ChatRunStatusSource | null | undefined) {
-    options.runStatus.value = options.sessionRunStatus(source)
+    const next = options.sessionRunStatus(source)
+    const current = options.runStatus.value
+    if (
+      LIVE_RUN_STATES.includes(current.status)
+      && LIVE_RUN_STATES.includes(next.status)
+      && current.task
+      && next.task
+    ) {
+      const currentTaskId = current.task.task_id
+        || current.task.taskId
+        || current.task.turn_id
+        || current.task.turnId
+        || ''
+      const nextTaskId = next.task.task_id
+        || next.task.taskId
+        || next.task.turn_id
+        || next.task.turnId
+        || ''
+      if (currentTaskId && (!nextTaskId || nextTaskId === currentTaskId)) {
+        // Lifecycle broadcasts are intentionally compact and can follow the
+        // richer task.running frame for the same task. Preserve authoritative
+        // fields such as steer_capability when the compact frame omits them.
+        next.task = { ...current.task, ...next.task }
+      }
+    }
+    options.runStatus.value = next
   }
 
   function reconcileActiveTaskGroups(res: SessionMessagesSubscribeResponse) {

@@ -170,7 +170,10 @@ function baseMessage(overrides: Partial<ChatRenderedMessage> = {}): ChatRendered
   }
 }
 
-function mountMessage(message: ChatRenderedMessage): HTMLElement {
+function mountMessage(
+  message: ChatRenderedMessage,
+  showTurnOutcome = false,
+): HTMLElement {
   const el = document.createElement('div')
   document.body.appendChild(el)
   const app = createApp({
@@ -181,6 +184,7 @@ function mountMessage(message: ChatRenderedMessage): HTMLElement {
       shareMode: false,
       shareSelected: false,
       shareMessageId: 'assistant-1',
+      showTurnOutcome,
       renderMarkdown: (text: string) => `<p>${text}</p>`,
       fmtTok: (value: number) => String(value),
       toolCallGroups: () => [],
@@ -212,6 +216,23 @@ afterEach(() => {
 })
 
 describe('AssistantMessage activity disclosure', () => {
+  it('shows completed in the task-status position for a simple successful turn', async () => {
+    const el = mountMessage(baseMessage({
+      timelineItems: [],
+      parts: [],
+      statusHistory: [],
+      turnOutcome: {
+        turnId: 'turn-success',
+        status: 'succeeded',
+        kind: 'completed',
+      },
+    }), true)
+    await nextTick()
+
+    expect(el.querySelector('[data-testid="turn-outcome-completed"]')?.textContent)
+      .toContain('Completed')
+  })
+
   it('keeps the canonical answer outside activity and hides failed tool content', async () => {
     const el = mountMessage(baseMessage())
     await nextTick()

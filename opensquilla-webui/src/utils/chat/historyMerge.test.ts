@@ -4,6 +4,7 @@ import {
   reconcileHistoryMessages,
   reconcileHistoryWindow,
   reconcileRunningHistoryMessages,
+  rehomePromotedSteerRows,
 } from './historyMerge'
 import type { ChatMessage, ChatReasoning } from '@/types/chat'
 
@@ -11,6 +12,38 @@ function msg(overrides: Partial<ChatMessage>): ChatMessage {
   return { role: 'assistant', text: '', ts: null, ...overrides } as ChatMessage
 }
 const reasoning = (seconds: number): ChatReasoning => ({ text: '', seconds })
+
+describe('rehomePromotedSteerRows', () => {
+  it('moves promoted rows after completed output and preserves FIFO before the new turn', () => {
+    const rows = [
+      msg({ role: 'user', messageId: 'user-old', turnId: 'turn-old' }),
+      msg({
+        role: 'user',
+        messageId: 'steer-1',
+        turnId: 'turn-new',
+        promotedFromTurnId: 'turn-old',
+        inputDisposition: 'promoted',
+      }),
+      msg({
+        role: 'user',
+        messageId: 'steer-2',
+        turnId: 'turn-new',
+        promotedFromTurnId: 'turn-old',
+        inputDisposition: 'promoted',
+      }),
+      msg({ role: 'assistant', messageId: 'assistant-old', turnId: 'turn-old' }),
+      msg({ role: 'router', messageId: 'router-new', turnId: 'turn-new' }),
+    ]
+
+    expect(rehomePromotedSteerRows(rows).map(row => row.messageId)).toEqual([
+      'user-old',
+      'assistant-old',
+      'steer-1',
+      'steer-2',
+      'router-new',
+    ])
+  })
+})
 
 describe('mergeLiveOnlyFields', () => {
   it('keeps the optimistic identity across the first authoritative replacement', () => {
@@ -64,6 +97,29 @@ describe('mergeLiveOnlyFields', () => {
     expect(mergeLiveOnlyFields(msg({ interrupted: true }), msg({ interrupted: undefined })).interrupted).toBe(true)
     // server defines it (even as false) → the server value wins
     expect(mergeLiveOnlyFields(msg({ interrupted: true }), msg({ interrupted: false })).interrupted).toBe(false)
+  })
+
+  it('does not let stale history regress a terminal steer disposition', () => {
+    const merged = mergeLiveOnlyFields(
+      msg({
+        role: 'user',
+        turnId: 'turn-new',
+        inputDisposition: 'promoted',
+        inputDispositionRevision: 2,
+      }),
+      msg({
+        role: 'user',
+        turnId: 'turn-old',
+        inputDisposition: 'steering',
+        inputDispositionRevision: 1,
+      }),
+    )
+
+    expect(merged).toMatchObject({
+      turnId: 'turn-new',
+      inputDisposition: 'promoted',
+      inputDispositionRevision: 2,
+    })
   })
 
   it('preserves prev reasoning whenever the server row measured none, independent of prev.role', () => {
@@ -381,5 +437,43 @@ describe('reconcileRunningHistoryMessages', () => {
 
     expect(out.map(message => message.messageId)).toEqual(['u1', 'a1'])
     expect(out[1].routerSettled).toBe(true)
+  })
+
+  it('preserves the full live tail when the last user row is a same-turn steer', () => {
+    const prev = [
+      msg({ role: 'user', text: 'build it', messageId: 'u1', turnId: 'turn-1' }),
+      msg({ role: 'router', text: '', turnId: 'turn-1' }),
+      msg({ role: 'assistant', text: 'first segment', turnId: 'turn-1' }),
+      msg({
+        role: 'user',
+        text: 'also update tests',
+        clientId: 'steer-local',
+        turnId: 'turn-1',
+        inputDisposition: 'steering',
+        inputDispositionRevision: 1,
+      }),
+    ]
+    const incoming = [
+      msg({
+        role: 'user',
+        text: 'build it',
+        messageId: 'u1',
+        turnId: 'turn-1',
+        restoredFromHistory: true,
+      }),
+    ]
+
+    const out = reconcileRunningHistoryMessages(prev, incoming)
+
+    expect(out.map(message => [message.role, message.text])).toEqual([
+      ['user', 'build it'],
+      ['router', ''],
+      ['assistant', 'first segment'],
+      ['user', 'also update tests'],
+    ])
+    expect(out[3]).toMatchObject({
+      clientId: 'steer-local',
+      inputDisposition: 'steering',
+    })
   })
 })

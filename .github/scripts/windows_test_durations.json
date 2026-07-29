@@ -1191,6 +1191,9 @@
     "tests/unit/test_env.py": 0.049,
     "tests/unit/test_env_loading.py": 0.023,
     "tests/unit/test_ui.py": 0.051,
-    "tests/test_gateway/test_websocket_request_concurrency.py": 0.01
+    "tests/test_gateway/test_websocket_request_concurrency.py": 0.01,
+    "tests/test_cli/test_gateway_client_steer.py": 0.01,
+    "tests/test_engine/test_route_plan.py": 0.01,
+    "tests/test_gateway/test_steer_restart_recovery.py": 0.01
   }
 }
