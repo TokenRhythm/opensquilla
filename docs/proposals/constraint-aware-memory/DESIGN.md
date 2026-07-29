@@ -1,7 +1,7 @@
 # Constraint-Aware Memory: 设计提案
 
 > **Status**: Active development — L0/D12/L1/L2 ✅ implemented, L3 🔶 pending
-> **Version**: v1.2 (2026-07-29)
+> **Version**: v1.3 (2026-07-29)
 > **Branch**: `feature/constraint-aware-memory`
 > **Base**: `origin/main`
 > **Date**: 2026-07-29
@@ -136,9 +136,9 @@ L3 (sufficiency)    ── 依赖 L2（需要路由后的结果）
 | D12 | ✅ 已实现 | `6038ff55` | `compaction.anchor_enabled` | 20 tests |
 | L1 | ✅ 已实现 | `ef5fc037` | `memory.experimental.constraint_annotation` | 55 tests |
 | L2 | ✅ 已实现 | `69d7fdd8` | `memory.experimental.constraint_routing` | 43 tests |
-| L3 | 🔶 待实现 | — | `memory.experimental.sufficiency_check` | — |
+| L3 | ✅ 已实现 | `9de891cb` | `memory.experimental.sufficiency_check` | 37 tests |
 
-**全套件**: 159 passed, 6 skipped, 0 failures
+**全套件**: 278 passed, 6 skipped, 0 failures
 
 ---
 
@@ -577,7 +577,7 @@ score = (
 | L1 约束类型标注 | 55 | ✅ 全部通过 |
 | L2 约束感知检索路由 | 43 | ✅ 全部通过 |
 | D12 Compaction Anchor | 20 | ✅ 全部通过 |
-| 回归（全套件） | 159 passed, 6 skipped | ✅ 0 failures |
+| 回归（全套件） | 278 passed, 6 skipped | ✅ 0 failures |
 
 ### 计划测试矩阵
 
@@ -621,11 +621,10 @@ score = (
 | K-way merge | 多源检索融合 | vector + FTS + constraint boost + temporal |
 
 ## Appendix B: 关键源文件
-
 | 文件 | 角色 |
 |------|------|
 | `src/opensquilla/memory/store.py` | SQLite + FTS5 + sqlite-vec 存储 |
-| `src/opensquilla/memory/retrieval.py` | Hybrid 检索 + temporal decay + MMR |
+| `src/opensquilla/memory/retrieval.py` | Hybrid 检索 + temporal decay + MMR + L2/L3 接口 |
 | `src/opensquilla/memory/types.py` | MemorySource, SearchMode, SearchIntent |
 | `src/opensquilla/memory/sync_manager.py` | Sync 触发器（6 个触发点） |
 | `src/opensquilla/memory/session_source.py` | Session → 衍生 .md 文档 |
@@ -637,6 +636,15 @@ score = (
 | `src/opensquilla/session/compaction_state.py` | 结构化摘要 + obligation |
 | `src/opensquilla/memory/constraint_classifier.py` | L1: Signal Gate + LLM/启发式分类 |
 | `src/opensquilla/memory/constraint_routing.py` | L2: QueryIntent 分类 + boost + D9 marker |
+| `src/opensquilla/memory/sufficiency_check.py` | L3: 检索充分性检查核心模块 |
+| `src/opensquilla/tools/builtin/memory_tools.py` | memory_search 工具 + L3 注入点 |
+| `src/opensquilla/memory/manager.py` | MemoryManager 配置接线 |
 | `src/opensquilla/gateway/config.py` | MemoryExperimentalConfig (L1/L2/L3 flags) |
 | `tests/test_memory/test_constraint_annotation.py` | L1: 55 tests |
 | `tests/test_memory/test_constraint_routing.py` | L2: 43 tests |
+| `tests/test_sufficiency_check.py` | L3: 37 tests |
+| `docs/proposals/constraint-aware-memory/SPEC_L0_ARCHIVED_SEARCH.md` | L0 实现规格 |
+| `docs/proposals/constraint-aware-memory/SPEC_D12_COMPACTION_ANCHOR.md` | D12 实现规格 |
+| `docs/proposals/constraint-aware-memory/SPEC_L1_CONSTRAINT_ANNOTATION.md` | L1 实现规格 |
+| `docs/proposals/constraint-aware-memory/SPEC_L2_CONSTRAINT_ROUTING.md` | L2 实现规格 |
+| `docs/proposals/constraint-aware-memory/SPEC_L3_SUFFICIENCY_CHECK.md` | L3 实现规格 |

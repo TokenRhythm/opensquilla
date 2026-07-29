@@ -1,6 +1,6 @@
 # Constraint-Aware Memory: 进度跟踪
 
-> **Last updated**: 2026-07-29 (L2 implemented)
+> **Last updated**: 2026-07-29 (L3 implemented)
 > **Branch**: `feature/constraint-aware-memory`
 
 ---
@@ -13,7 +13,7 @@
 | D12 | Compaction Anchor | ✅ 已实现 | `6038ff55` | `compaction.anchor_enabled` |
 | L1 | 约束类型标注 | ✅ 已实现 | `ef5fc037` | `memory.experimental.constraint_annotation` |
 | L2 | 约束感知检索路由 | ✅ 已实现 | pending | `memory.experimental.constraint_routing` |
-| L3 | 检索充分性检查 | ⬜ 待实现 | — | `memory.experimental.sufficiency_check` |
+| L3 | 检索充分性检查 | ✅ 已实现 | `9de891cb` | `memory.experimental.sufficiency_check` |
 
 ---
 
@@ -139,7 +139,7 @@ Total: 75 passed
 tests/test_memory/test_constraint_routing.py: 43 passed
 tests/test_memory/test_constraint_annotation.py: 55 passed (no regression)
 tests/test_session/test_compaction_anchor.py: 20 passed (no regression)
-Total: 159 passed, 6 skipped, 0 failures
+Total: 278 passed, 6 skipped, 0 failures
 ```
 
 ---
