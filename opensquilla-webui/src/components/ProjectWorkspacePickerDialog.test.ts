@@ -10,7 +10,7 @@ const PICKER_KEY = 'agent:main:webchat:picker'
 const mocks = vi.hoisted(() => ({
   platform: {
     files: {} as {
-      chooseProjectDirectory?: () => Promise<{ path: string } | null>
+      chooseProjectDirectory?: (request?: { initialPath?: string }) => Promise<{ path: string } | null>
     },
   },
   rpcCall: vi.fn(),
@@ -483,10 +483,13 @@ describe('ProjectWorkspacePickerDialog', () => {
 
   it('uses the native desktop picker and closes on cancellation', async () => {
     mocks.platform.files.chooseProjectDirectory = vi.fn(async () => null)
-    const { events } = await mountPicker()
+    const { events } = await mountPicker({ initialPath: '/repos/current' })
     await flushPromises()
 
     expect(mocks.platform.files.chooseProjectDirectory).toHaveBeenCalledOnce()
+    expect(mocks.platform.files.chooseProjectDirectory).toHaveBeenCalledWith({
+      initialPath: '/repos/current',
+    })
     expect(events.choose).not.toHaveBeenCalled()
     expect(events.close).toHaveBeenCalledOnce()
     expect(mocks.rpcCall).not.toHaveBeenCalled()

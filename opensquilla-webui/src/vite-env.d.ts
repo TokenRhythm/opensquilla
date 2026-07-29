@@ -18,6 +18,7 @@ import type {
   NativeWorkbenchSurfaceEvent,
   NativeWorkbenchSurfaceRectRequest,
   NativeWorkbenchSurfaceResult,
+  ProjectDirectoryPickerRequest,
   WorkbenchPreviewMode,
 } from './platform/types'
 
@@ -85,7 +86,9 @@ declare global {
     abandonCleanupTransaction?: () => Promise<unknown>
     setNativeTheme?: (payload: { source: 'light' | 'dark' | 'system' }) => Promise<unknown>
     openArtifact: (payload: ArtifactOpenRequest) => Promise<ArtifactNativeOpenResult>
-    chooseProjectDirectory: () => Promise<{ path: string } | null>
+    chooseProjectDirectory: (
+      request?: ProjectDirectoryPickerRequest,
+    ) => Promise<{ path: string } | null>
     createWorkbenchSurface?: (
       payload: NativeWorkbenchCreateSurfaceRequest,
     ) => Promise<NativeWorkbenchSurfaceResult>
