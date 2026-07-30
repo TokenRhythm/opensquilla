@@ -116,6 +116,22 @@ def _format_chunk_for_llm(chunk: list[dict[str, Any]]) -> str:
 
 **不包含 session_id**：因为 anchor 出现在当前 session 的 summary 中，session_id 是隐含的。这使格式更短、更可读。
 
+### Persistence and lookup invariants
+
+- Inline compaction may emit recoverable anchors only after obtaining the next
+  database-derived compaction index. If identity is unavailable, compaction
+  continues with anchors disabled.
+- The persistence event carries removed and kept provider-visible entries.
+  The durable transcript must match that complete preimage before the atomic
+  rewrite; a concurrent tail or content change rejects the rewrite.
+- `extracted_anchors` is authoritative when present. In particular, `[]`
+  means validation declared no usable anchors and summary text is not reparsed.
+- Legacy rows with NULL metadata may parse summary text only when the declared
+  index matches the summary index and `entry_NNN` is inside the archived count.
+- Lookup has exactly three local outcomes: `RESOLVED`,
+  `DECLARED_UNAVAILABLE`, and `UNKNOWN`. No new persistent integrity state
+  machine is introduced.
+
 ### 3.2 `entry_anchor_id` 方案选择
 
 | 方案 | 值 | 优点 | 缺点 |

@@ -202,6 +202,7 @@ def mark_evidence_skipped(
 ) -> None:
     entry = store.entries.get(candidate_id)
     if entry is not None:
+        entry.status = "skipped"
         entry.last_skip_reason = reason
 
 

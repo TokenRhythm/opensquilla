@@ -2586,6 +2586,41 @@ async def test_persist_compaction_result_stores_summary_out_of_band(manager):
 
 
 @pytest.mark.asyncio
+async def test_persist_compaction_rejects_stale_full_preimage(manager):
+    node = await manager.create("agent:main:main")
+    for index in range(4):
+        await manager.append_message(node.session_key, "user", f"msg {index}")
+
+    removed = [
+        {"role": "user", "content": "msg 0"},
+        {"role": "user", "content": "msg 1"},
+    ]
+    kept = [
+        {"role": "user", "content": "msg 2"},
+        {"role": "user", "content": "msg 3"},
+    ]
+    await manager.append_message(node.session_key, "assistant", "concurrent tail")
+
+    await manager.persist_compaction_result(
+        node.session_key,
+        "stale summary",
+        kept,
+        removed_count=2,
+        removed_entries=removed,
+    )
+
+    transcript = await manager.get_transcript(node.session_key)
+    assert [entry.content for entry in transcript] == [
+        "msg 0",
+        "msg 1",
+        "msg 2",
+        "msg 3",
+        "concurrent tail",
+    ]
+    assert await manager.get_summaries(node.session_key) == []
+
+
+@pytest.mark.asyncio
 async def test_canonical_transcript_page_crosses_multiple_compaction_boundaries(manager):
     node = await manager.create("agent:main:main")
     for index in range(10):

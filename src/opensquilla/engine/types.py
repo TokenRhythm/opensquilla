@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal
@@ -409,7 +409,11 @@ class CompactionEvent:
     summary: str = ""
     kept_entries: list[dict] = field(default_factory=list)
     kept_count: int = 0
-    removed_count: int = 0
+    removed_count: int | None = None
+    removed_entries: list[dict] | None = None
+    compaction_index: int | None = None
+    extracted_anchors: list[dict[str, Any]] | None = None
+    anchor_enabled: bool = False
 
 
 @dataclass
@@ -421,7 +425,11 @@ class CompactionOutcome:
     summary: str = ""
     kept_entries: list[dict] = field(default_factory=list)
     removed_count: int = 0
+    removed_entries: list[dict] = field(default_factory=list)
     compaction_id: str | None = None
+    compaction_index: int | None = None
+    extracted_anchors: list[dict[str, Any]] | None = None
+    anchor_enabled: bool = False
     request_context_insert_index: int | None = None
     runtime_context_insert_index: int | None = None
     protected_turn_start_index: int | None = None
@@ -550,6 +558,10 @@ class AgentConfig:
     compaction_fallback_summary_max_tokens: int = 3000
     compaction_previous_summary_max_tokens: int = 2000
     compaction_total_summary_max_tokens: int = 5000
+    # Database-owned identity for persistent inline compaction. The callback is
+    # invoked immediately before each compaction; callers must not cache its
+    # result across compactions.
+    compaction_identity_provider: Callable[[], Awaitable[int | None]] | None = None
     repair_enabled: bool = True
     repair_interval_seconds: float = 60.0
     repair_max_items_per_tick: int = 5

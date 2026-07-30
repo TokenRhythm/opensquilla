@@ -318,13 +318,14 @@ class Dream:
         # D10: deduplicate only touch-only rewrites of the same source.
         # Identical content in another source is recurrence evidence.
         d10_known_observations: set[tuple[str, str]] | None = None
+        existing_evidence_store = None
         try:
             from opensquilla.memory.dream.evidence import load_evidence_store
 
-            _ev_store = load_evidence_store(self.workspace)
+            existing_evidence_store = load_evidence_store(self.workspace)
             d10_known_observations = {
                 (e.source_path, e.content_sha256 or e.snippet_sha256)
-                for e in _ev_store.entries.values()
+                for e in existing_evidence_store.entries.values()
                 if e.source_path and (e.content_sha256 or e.snippet_sha256)
             }
         except Exception:  # noqa: BLE001
@@ -345,7 +346,17 @@ class Dream:
         raw_candidates = candidate_scan.candidates
         result.files_considered = candidate_scan.files_considered
         result.files_skipped_unchanged = candidate_scan.files_skipped_unchanged
-        if len(raw_candidates) < getattr(self.config, "min_batch_size", 1):
+        has_pending_evidence = bool(
+            existing_evidence_store is not None
+            and any(
+                entry.status == "candidate"
+                for entry in existing_evidence_store.entries.values()
+            )
+        )
+        if (
+            len(raw_candidates) < getattr(self.config, "min_batch_size", 1)
+            and not has_pending_evidence
+        ):
             if (
                 not raw_candidates
                 and result.files_skipped_unchanged
@@ -449,18 +460,39 @@ class Dream:
                 self.memory_md.read_text(encoding="utf-8") if self.memory_md.exists() else ""
             )
             expected_memory_sha = memory_content_sha256(current_memory)
-            prompt = promotion_patch_prompt(current_memory, ranked)
-            result.promotion_prompt_chars = len(prompt)
-            text = await _run_complete(self.provider, [Message(role="user", content=prompt)], 4096)
-            patch = parse_promotion_patch(text, ranked)
-            result.provider_calls = 1
-
             live_candidate_ids: set[str] = set()
+            live_ranked = []
             for candidate in ranked:
                 rehydrated = rehydrate_candidate(self.workspace, candidate)
                 if rehydrated.ok:
                     live_candidate_ids.add(candidate.candidate_id)
+                    live_ranked.append(candidate)
                 else:
+                    reason = rehydrated.reason or "rehydrate_failed"
+                    skipped_candidates.append(
+                        {"candidate_id": candidate.candidate_id, "reason": reason}
+                    )
+                    mark_evidence_skipped(store, candidate.candidate_id, reason)
+
+            if live_ranked:
+                prompt = promotion_patch_prompt(current_memory, live_ranked)
+                result.promotion_prompt_chars = len(prompt)
+                text = await _run_complete(
+                    self.provider,
+                    [Message(role="user", content=prompt)],
+                    4096,
+                )
+                patch = parse_promotion_patch(text, live_ranked)
+                result.provider_calls = 1
+            else:
+                patch = PromotionPatch()
+
+            # The source may change while the provider is running. Revalidate
+            # immediately before accepting operations derived from its prompt.
+            for candidate in live_ranked:
+                rehydrated = rehydrate_candidate(self.workspace, candidate)
+                if not rehydrated.ok:
+                    live_candidate_ids.discard(candidate.candidate_id)
                     reason = rehydrated.reason or "rehydrate_failed"
                     skipped_candidates.append(
                         {"candidate_id": candidate.candidate_id, "reason": reason}
@@ -497,7 +529,18 @@ class Dream:
             if not result.dry_run:
                 promoted_ids: list[str] = []
                 represented_ids: list[str] = []
+                skipped_ids: list[tuple[str, str]] = []
                 for applied_operation in applied.applied_operations:
+                    if applied_operation.get("op") == "skip":
+                        reason = str(applied_operation.get("reason") or "model_skip")
+                        raw_candidate_ids = applied_operation.get("candidate_ids", [])
+                        if isinstance(raw_candidate_ids, list):
+                            skipped_ids.extend(
+                                (candidate_id, reason)
+                                for candidate_id in raw_candidate_ids
+                                if isinstance(candidate_id, str)
+                            )
+                        continue
                     if applied_operation.get("op") not in {"upsert", "merge"}:
                         continue
                     raw_candidate_ids = applied_operation.get("candidate_ids", [])
@@ -520,6 +563,8 @@ class Dream:
                 ]
                 mark_evidence_promoted(store, promoted_ids, now_iso)
                 mark_evidence_represented(store, represented_ids, "no_curated_change")
+                for candidate_id, reason in skipped_ids:
+                    mark_evidence_skipped(store, candidate_id, reason)
                 write_evidence_store(self.workspace, store)
                 max_mtime = candidate_scan.cursor_high_watermark
                 result.files_processed = len(raw_candidates)

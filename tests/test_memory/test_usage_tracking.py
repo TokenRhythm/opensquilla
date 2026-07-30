@@ -147,6 +147,59 @@ class TestRecordChunkUsage:
         finally:
             await store.close()
 
+    @pytest.mark.asyncio
+    async def test_cancelled_usage_write_rolls_back_open_transaction(
+        self, tmp_path, monkeypatch
+    ):
+        from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.store import LongTermMemoryStore
+        from opensquilla.memory.types import MemorySource
+
+        store = LongTermMemoryStore(
+            db_path=str(tmp_path / "test.db"),
+            embedding_provider=NullEmbeddingProvider(),
+        )
+        await store.initialize()
+        try:
+            await store.index_file(
+                "memory/test.md", "Original decision.", source=MemorySource.memory
+            )
+            async with store._db.execute(
+                "SELECT id FROM chunks WHERE path = ?", ("memory/test.md",)
+            ) as cur:
+                chunk_id = (await cur.fetchone())[0]
+
+            original_execute = store._db.execute
+            insert_started = asyncio.Event()
+            never_finish = asyncio.Event()
+
+            async def blocking_execute(sql, parameters=None):
+                if sql.startswith("INSERT INTO chunk_usage"):
+                    insert_started.set()
+                    await never_finish.wait()
+                if parameters is None:
+                    return await original_execute(sql)
+                return await original_execute(sql, parameters)
+
+            monkeypatch.setattr(store._db, "execute", blocking_execute)
+            task = asyncio.create_task(
+                store.record_chunk_usage([chunk_id], intent="continue_task")
+            )
+            await insert_started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            monkeypatch.setattr(store._db, "execute", original_execute)
+            await store.index_file(
+                "memory/test.md",
+                "Replacement decision.",
+                source=MemorySource.memory,
+            )
+            assert store._db.in_transaction is False
+        finally:
+            await store.close()
+
 
 class TestDominantConstraintTypes:
     @pytest.mark.asyncio
@@ -319,6 +372,43 @@ class TestRetrieverUsageTracking:
                 "WHERE chunk_id NOT IN (SELECT id FROM chunks)"
             ) as cur:
                 assert (await cur.fetchone())[0] == 0
+        finally:
+            await store.close()
+
+    @pytest.mark.asyncio
+    async def test_reindex_preserves_usage_for_unchanged_chunk_ids(self, tmp_path):
+        from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.store import LongTermMemoryStore
+        from opensquilla.memory.types import MemorySource
+
+        store = LongTermMemoryStore(
+            db_path=str(tmp_path / "test.db"),
+            embedding_provider=NullEmbeddingProvider(),
+        )
+        await store.initialize()
+        try:
+            original = "Stable decision that remains byte-for-byte identical."
+            await store.index_file(
+                "memory/test.md", original, source=MemorySource.memory
+            )
+            async with store._db.execute(
+                "SELECT id FROM chunks WHERE path = ?", ("memory/test.md",)
+            ) as cur:
+                chunk_id = (await cur.fetchone())[0]
+            await store.record_chunk_usage([chunk_id], intent="continue_task")
+
+            await store.index_file(
+                "memory/test.md", original, source=MemorySource.memory
+            )
+
+            async with store._db.execute(
+                "SELECT recall_count FROM chunk_usage "
+                "WHERE chunk_id = ? AND intent = ?",
+                (chunk_id, "continue_task"),
+            ) as cur:
+                row = await cur.fetchone()
+            assert row is not None
+            assert row[0] == 1
         finally:
             await store.close()
 

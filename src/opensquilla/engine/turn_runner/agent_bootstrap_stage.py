@@ -20,6 +20,7 @@ future AgentConfig-validation early-yield branch.
 from __future__ import annotations
 
 import os
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
@@ -642,6 +643,10 @@ class AgentBootstrapStageInput:
         default=None,
         repr=False,
     )
+    compaction_identity_provider: Callable[[], Awaitable[int | None]] | None = field(
+        default=None,
+        repr=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -876,6 +881,7 @@ class AgentBootstrapStage:
             compaction_total_summary_max_tokens=(
                 aux.compaction_total_summary_max_tokens
             ),
+            compaction_identity_provider=inp.compaction_identity_provider,
             flush_workspace_dir=aux.flush_workspace_dir,
             model_capabilities=catalog.capabilities,
             thinking=aux.thinking,

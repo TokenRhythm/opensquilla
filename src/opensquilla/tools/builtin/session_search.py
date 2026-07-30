@@ -51,10 +51,23 @@ async def _lookup_anchor(
     compaction_index = int(compaction_index_text)
     declared = False
     for summary in await storage.get_all_summaries(session_id):
-        anchors = list(summary.extracted_anchors or [])
-        # Legacy summaries may predate the extracted_anchors column while
-        # still carrying valid references in their text.
-        anchors.extend(extract_anchors_from_summary(summary.summary_text))
+        if summary.extracted_anchors is None:
+            # Only NULL is legacy. An explicit empty list is an authoritative
+            # statement that validation found no usable declarations. Legacy
+            # rows may not have reliable removed_count metadata, so their text
+            # remains the compatibility authority.
+            anchors = [
+                candidate
+                for candidate in extract_anchors_from_summary(summary.summary_text)
+                if candidate.get("compaction_index") == summary.compaction_index
+                and (
+                    summary.removed_count <= 0
+                    or int(str(candidate.get("entry_anchor_id", "")).removeprefix("entry_"))
+                    < summary.removed_count
+                )
+            ]
+        else:
+            anchors = list(summary.extracted_anchors)
         if any(
             candidate.get("compaction_index") == compaction_index
             and candidate.get("entry_anchor_id") == entry_anchor_id

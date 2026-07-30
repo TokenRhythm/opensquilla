@@ -348,6 +348,54 @@ class TestScanDeduplication:
             "memory/2026-07-30.md"
         ]
 
+    def test_transient_read_failure_does_not_advance_cursor_past_source(
+        self, tmp_path, monkeypatch
+    ):
+        workspace = tmp_path / "ws"
+        memory_dir = workspace / "memory"
+        memory_dir.mkdir(parents=True)
+        failed = memory_dir / "a.md"
+        later = memory_dir / "b.md"
+        failed.write_text("First durable observation.", encoding="utf-8")
+        later.write_text("Second durable observation.", encoding="utf-8")
+        os.utime(failed, ns=(1_000_000_000, 1_000_000_000))
+        os.utime(later, ns=(2_000_000_000, 2_000_000_000))
+        original_read_text = type(failed).read_text
+
+        def fail_first_read(path, *args, **kwargs):
+            if path == failed:
+                raise OSError("temporarily unavailable")
+            return original_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(type(failed), "read_text", fail_first_read)
+        scan = scan_dream_candidate_batch(
+            workspace,
+            cursor=0.0,
+            cursor_position=(0, ""),
+            max_batch_size=20,
+            agent_id="main",
+        )
+
+        assert scan.transient_failures == 1
+        assert [item.source_path for item in scan.candidates] == ["memory/b.md"]
+        assert (scan.cursor_high_watermark_ns, scan.cursor_high_watermark_path) == (
+            0,
+            "",
+        )
+
+        monkeypatch.setattr(type(failed), "read_text", original_read_text)
+        retry = scan_dream_candidate_batch(
+            workspace,
+            cursor=0.0,
+            cursor_position=(0, ""),
+            max_batch_size=20,
+            agent_id="main",
+        )
+        assert [item.source_path for item in retry.candidates] == [
+            "memory/a.md",
+            "memory/b.md",
+        ]
+
     @pytest.mark.asyncio
     async def test_unchanged_only_run_advances_cursor(self, tmp_path, monkeypatch):
         """An unchanged-only Dream run must not rescan the observation forever."""

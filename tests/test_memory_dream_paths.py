@@ -93,10 +93,10 @@ async def test_dream_reports_apply_error_when_cursor_cleanup_fails(tmp_path, mon
     )
     dream = _dream(tmp_path)
 
-    def fail_save(_ts: float) -> None:
+    def fail_save(_position) -> None:
         raise OSError("cursor denied")
 
-    monkeypatch.setattr(dream.cursor, "save", fail_save)
+    monkeypatch.setattr(dream.cursor, "save_position", fail_save)
 
     result = await dream.run()
 

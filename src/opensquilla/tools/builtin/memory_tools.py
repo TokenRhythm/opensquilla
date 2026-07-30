@@ -699,9 +699,22 @@ def create_memory_tools(
             min_score=normalize_memory_search_min_score(min_score),
             source=source_filter,
         )
-        outcome = await r.retriever.search_with_context(
-            query, opts, intent=SearchIntent.TOOL
-        )
+        search_with_context = getattr(r.retriever, "search_with_context", None)
+        if callable(search_with_context):
+            outcome = await search_with_context(
+                query, opts, intent=SearchIntent.TOOL
+            )
+        else:
+            # Compatibility for custom retrievers implementing the original
+            # list-only protocol. Request-scoped L2/L3 metadata is unavailable,
+            # so this path is intentionally metadata-neutral.
+            from opensquilla.memory.retrieval import MemoryRetrievalOutcome
+
+            outcome = MemoryRetrievalOutcome(
+                results=await r.retriever.search(
+                    query, opts, intent=SearchIntent.TOOL
+                )
+            )
         results = [
             result
             for result in outcome.results

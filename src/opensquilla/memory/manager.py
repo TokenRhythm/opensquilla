@@ -575,7 +575,14 @@ async def build_memory_managers(
     # If provider_selector is unavailable or resolve() fails, constraint_llm_call
     # stays None and store falls back to heuristic-only classification.
     constraint_llm_call = None
-    if provider_selector is not None:
+    constraint_annotation_enabled = bool(
+        getattr(
+            getattr(cfg, "experimental", None),
+            "constraint_annotation",
+            False,
+        )
+    )
+    if constraint_annotation_enabled and provider_selector is not None:
         try:
             _resolver = getattr(provider_selector, "resolve", None)
             _provider = _resolver() if callable(_resolver) else None
@@ -623,11 +630,7 @@ async def build_memory_managers(
                 query_embedding_cache_mode=getattr(
                     getattr(cfg, "cost", None), "query_embedding_cache", "on"
                 ),
-                constraint_annotation_enabled=getattr(
-                    getattr(cfg, "experimental", None),
-                    "constraint_annotation",
-                    False,
-                ),
+                constraint_annotation_enabled=constraint_annotation_enabled,
                 constraint_llm_call=constraint_llm_call,
             )
             await in_flight_store.initialize()

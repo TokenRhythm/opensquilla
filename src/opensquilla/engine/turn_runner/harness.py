@@ -981,6 +981,11 @@ class _TurnRunnerCompactionPersistAdapter(CompactionPersistPort):
         summary: str,
         kept_entries: list[Any],
         compaction_id: str | None = None,
+        removed_count: int | None = None,
+        removed_entries: list[Any] | None = None,
+        compaction_index: int | None = None,
+        extracted_anchors: list[dict[str, Any]] | None = None,
+        anchor_enabled: bool = False,
     ) -> None:
         from opensquilla.engine.cache_break_monitor import notify_compaction
         from opensquilla.session.compaction_lifecycle import (
@@ -996,14 +1001,21 @@ class _TurnRunnerCompactionPersistAdapter(CompactionPersistPort):
         persist_method = session_manager.persist_compaction_result
         params = inspect.signature(persist_method).parameters
         persist_kwargs: dict[str, Any] = {}
-        if "compaction_id" in params or any(
+        forwarded = {
+            "compaction_id": compaction_id,
+            "trigger_reason": "agent_inline_overflow",
+            "removed_count": removed_count,
+            "removed_entries": removed_entries,
+            "compaction_index": compaction_index,
+            "extracted_anchors": extracted_anchors,
+            "anchor_enabled": anchor_enabled,
+        }
+        accepts_kwargs = any(
             p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
-        ):
-            persist_kwargs["compaction_id"] = compaction_id
-        if "trigger_reason" in params or any(
-            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
-        ):
-            persist_kwargs["trigger_reason"] = "agent_inline_overflow"
+        )
+        for name, value in forwarded.items():
+            if value is not None and (name in params or accepts_kwargs):
+                persist_kwargs[name] = value
         async with self._runner._session_write_context(session_key):
             await persist_method(
                 session_key,

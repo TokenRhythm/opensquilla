@@ -23,6 +23,7 @@ class DreamCandidateScan:
     cursor_high_watermark: float
     cursor_high_watermark_ns: int = 0
     cursor_high_watermark_path: str = ""
+    transient_failures: int = 0
 
 
 def _workspace_relative(workspace: Path, path: Path) -> str:
@@ -83,6 +84,8 @@ def scan_dream_candidate_batch(
         return DreamCandidateScan([], 0, 0, cursor)
     candidates: list[tuple[int, str, RawDreamCandidate]] = []
     unchanged_positions: list[tuple[int, str]] = []
+    transient_failures = 0
+    cursor_blocking_failures = 0
     resolved_memory_dir = memory_dir.resolve()
     for path in memory_dir.rglob("*.md"):
         try:
@@ -90,7 +93,8 @@ def scan_dream_candidate_batch(
                 continue
             path.resolve().relative_to(resolved_memory_dir)
             stat = path.stat()
-        except (FileNotFoundError, ValueError):
+        except (OSError, ValueError):
+            transient_failures += 1
             continue
         rel_path = _workspace_relative(workspace, path)
         if (
@@ -110,6 +114,8 @@ def scan_dream_candidate_batch(
         try:
             raw = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
+            transient_failures += 1
+            cursor_blocking_failures += 1
             continue
         if quarantine_enabled and is_quarantined_text(raw):
             continue
@@ -164,8 +170,18 @@ def scan_dream_candidate_batch(
         *(unchanged_positions if len(selected) == len(candidates) else ()),
     ]
     high_position = max(eligible_positions, default=starting_position)
+    # A temporarily unreadable source is epistemically different from an
+    # unchanged source. Keep the cursor in place so a later source cannot make
+    # the failed one permanently unreachable. Already-seen later sources are
+    # cheap on the next scan because content-hash dedup suppresses them.
+    if cursor_blocking_failures:
+        high_position = starting_position
     high_watermark = high_position[0] / 1_000_000_000
-    if cursor_position is None and len(selected) < len(candidates):
+    if (
+        not cursor_blocking_failures
+        and cursor_position is None
+        and len(selected) < len(candidates)
+    ):
         first_deferred_seconds = candidates[len(selected)][0] / 1_000_000_000
         high_watermark = max(cursor, math.nextafter(first_deferred_seconds, -math.inf))
 
@@ -176,6 +192,7 @@ def scan_dream_candidate_batch(
         cursor_high_watermark=high_watermark,
         cursor_high_watermark_ns=high_position[0],
         cursor_high_watermark_path=high_position[1],
+        transient_failures=transient_failures,
     )
 
 

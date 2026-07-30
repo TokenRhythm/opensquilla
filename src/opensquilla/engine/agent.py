@@ -8279,6 +8279,10 @@ class Agent:
                                 kept_entries=overflow_outcome.kept_entries,
                                 kept_count=len(overflow_outcome.messages),
                                 removed_count=overflow_outcome.removed_count,
+                                removed_entries=overflow_outcome.removed_entries,
+                                compaction_index=overflow_outcome.compaction_index,
+                                extracted_anchors=overflow_outcome.extracted_anchors,
+                                anchor_enabled=overflow_outcome.anchor_enabled,
                             )
                             _call_attempt += 1
                             continue
@@ -8476,6 +8480,10 @@ class Agent:
                         kept_entries=overflow_outcome.kept_entries,
                         kept_count=len(overflow_outcome.messages),
                         removed_count=overflow_outcome.removed_count,
+                        removed_entries=overflow_outcome.removed_entries,
+                        compaction_index=overflow_outcome.compaction_index,
+                        extracted_anchors=overflow_outcome.extracted_anchors,
+                        anchor_enabled=overflow_outcome.anchor_enabled,
                     )
                     overflow_retries = 0  # reset on success
                     # Rebuild chat_cfg so next LLM call uses refreshed system
@@ -13857,6 +13865,10 @@ class Agent:
             return None, "no_safe_cut"
 
         compaction_config = self._build_compaction_config()
+        # This path produces a temporary provider request view and deliberately
+        # emits no CompactionEvent. A recoverable anchor would therefore be a
+        # lie: there is no durable archive row to expand.
+        compaction_config.anchor_enabled = False
         protected_tail_count = len(messages) - protected_start
         compaction_config.protected_recent_messages = max(
             int(compaction_config.protected_recent_messages or 0),
@@ -14438,11 +14450,31 @@ class Agent:
                 }
             )
 
+        compaction_config = self._build_compaction_config()
+        compaction_index: int | None = None
+        if compaction_config.anchor_enabled:
+            identity_provider = self.config.compaction_identity_provider
+            if identity_provider is not None:
+                try:
+                    compaction_index = await identity_provider()
+                except Exception as exc:  # noqa: BLE001 - anchors degrade, compaction lives
+                    logger.warning(
+                        "compaction.anchor_identity_unavailable",
+                        error=str(exc),
+                    )
+            if compaction_index is None:
+                logger.warning(
+                    "compaction.anchor_identity_unavailable",
+                    reason="missing_identity_provider",
+                )
+                compaction_config.anchor_enabled = False
+
         request = CompactionRequest(
             session_id="agent-turn",
             entries=entries,
             context_window_tokens=window_tokens,
-            config=self._build_compaction_config(),
+            config=compaction_config,
+            compaction_index=compaction_index,
             provider_request_correlation=derive_provider_request_correlation(
                 self._provider_request_correlation,
                 execution_id=uuid.uuid4().hex,
@@ -14629,7 +14661,14 @@ class Agent:
             summary=result.summary,
             kept_entries=kept_entries,
             removed_count=result.removed_count,
+            removed_entries=[
+                {"role": entry["role"], "content": entry["content"]}
+                for entry in entries[: result.removed_count]
+            ],
             compaction_id=compaction_id,
+            compaction_index=compaction_index,
+            extracted_anchors=getattr(result, "extracted_anchors", None),
+            anchor_enabled=compaction_config.anchor_enabled,
             request_context_insert_index=adjusted_request_idx,
             runtime_context_insert_index=adjusted_runtime_idx,
             protected_turn_start_index=adjusted_protected_idx,

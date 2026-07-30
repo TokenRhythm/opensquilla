@@ -7,6 +7,25 @@
 
 ## 2026-07-30 结构性加固
 
+### Strict-review closure
+
+- [x] Full-preimage CAS for inline compaction persistence; stale rewrites leave
+  the durable transcript unchanged.
+- [x] Inline anchor identity and validated anchor metadata reach the atomic
+  archive rewrite; legacy events retain removed-count inference.
+- [x] Anchor lookup keeps the three epistemic states local to
+  `session_search`; explicit empty metadata never reparses decorative text.
+- [x] Pending Dream evidence retries after transient apply failure, while
+  explicit skip and invalid source snapshots terminate without repeated LLM
+  calls.
+- [x] Dream cursor does not cross a known unreadable source and does not freeze
+  forever on an unstatable path.
+- [x] Shared SQLite operations are serialized and cancellation-safe; stable
+  chunk usage survives reindex and cleanup is path-local.
+- [x] L1 provider escalation has a timeout, concurrency bound, batching, and a
+  per-file circuit breaker to heuristic fallback.
+- [x] Prefix fork is atomic.
+
 - L3 intent/confidence 改为 request-scoped outcome，消除并发串线。
 - compaction index 由数据库 identity 决定，并在持久化事务内复核。
 - anchor 在写入前校验 compaction 与 entry 范围。

@@ -3539,6 +3539,19 @@ class TurnRunner:
                 input_mode=input_mode,
                 turn_metadata=turn.metadata,
             )
+
+            async def _next_inline_compaction_index() -> int | None:
+                if self._session_manager is None:
+                    return None
+                get_index = getattr(
+                    self._session_manager,
+                    "get_next_compaction_index",
+                    None,
+                )
+                if not callable(get_index):
+                    return None
+                return await get_index(session_key)
+
             ab_outcome = await self._agent_bootstrap_stage.run(
                 AgentBootstrapStageInput(
                     provider=provider,
@@ -3566,6 +3579,7 @@ class TurnRunner:
                     run_kind=run_kind,
                     session_epoch=self._usage_session_epoch_by_key.get(session_key, 0),
                     provider_request_correlation=provider_request_correlation,
+                    compaction_identity_provider=_next_inline_compaction_index,
                 )
             )
             ab_out = ab_outcome.require_output()

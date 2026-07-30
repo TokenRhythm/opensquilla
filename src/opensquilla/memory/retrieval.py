@@ -11,6 +11,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import structlog
+
 from .constraint_routing import QueryIntent, apply_constraint_boost, classify_query_intent
 from .source_paths import is_searchable_source_path
 from .store import LongTermMemoryStore
@@ -27,6 +29,7 @@ from .types import (
 # The date must prefix the basename; embedded dates elsewhere do not match.
 _DATED_FILENAME_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})(?:-[a-z0-9][a-z0-9_-]*)?\.md")
 _MAX_PENDING_USAGE_WRITES = 32
+logger = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -201,6 +204,7 @@ class MemoryRetriever:
         self._sufficiency_check_enabled = sufficiency_check_enabled
         self._usage_tracking_enabled = usage_tracking_enabled
         self._usage_tasks: set[asyncio.Task[None]] = set()
+        self._usage_writes_dropped = 0
 
     async def search(
         self,
@@ -327,6 +331,18 @@ class MemoryRetriever:
                     )
                     self._usage_tasks.add(task)
                     task.add_done_callback(self._finish_usage_write)
+                else:
+                    self._usage_writes_dropped += 1
+                    # Power-of-two sampling keeps saturation visible without
+                    # turning a degraded statistics path into a log storm.
+                    if self._usage_writes_dropped & (
+                        self._usage_writes_dropped - 1
+                    ) == 0:
+                        logger.warning(
+                            "memory.usage_write_dropped",
+                            dropped=self._usage_writes_dropped,
+                            pending=len(self._usage_tasks),
+                        )
             except RuntimeError:
                 pass  # No running event loop (e.g. sync test) — skip
 

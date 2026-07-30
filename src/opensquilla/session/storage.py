@@ -7533,6 +7533,34 @@ class SessionStorage:
                 values,
             )
 
+    async def create_prefix_fork(
+        self,
+        *,
+        child: SessionNode,
+        entries: list[TranscriptEntry],
+    ) -> None:
+        """Atomically create a child and its active canonical prefix."""
+        child.session_key = canonicalize_session_key(child.session_key)
+        child.agent_id = normalize_agent_id(child.agent_id)
+        async with self._write_transaction("create_prefix_fork") as conn:
+            for entry in entries:
+                entry.session_id = child.session_id
+                entry.session_key = child.session_key
+                await self._insert_transcript_entry(
+                    conn,
+                    entry,
+                    expected_epoch=None,
+                )
+
+            data = child.model_dump()
+            columns = list(data)
+            placeholders = ", ".join("?" for _ in columns)
+            values = [_serialize(data[column]) for column in columns]
+            await conn.execute(
+                f"INSERT INTO sessions ({', '.join(columns)}) VALUES ({placeholders})",
+                values,
+            )
+
     @_serialized_read
     async def count_transcript_entries(self, session_id: str) -> int:
         async with self.conn.execute(

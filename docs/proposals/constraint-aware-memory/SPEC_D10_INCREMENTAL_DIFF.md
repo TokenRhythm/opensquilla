@@ -12,6 +12,19 @@
 > while legacy timestamp-only cursor files remain readable. Tied mtimes cannot
 > starve deferred files even when evidence loading is unavailable.
 
+### Cursor failure semantics
+
+- A file whose `(mtime_ns, source_path)` is known to be after the cursor but
+  whose content is temporarily unreadable prevents cursor advancement for that
+  scan. Later files may still be processed and content-hash dedup makes their
+  retry cheap.
+- A path that cannot be resolved or stat'ed has no provable position relative
+  to the cursor. It is counted as a transient failure but does not freeze the
+  global cursor indefinitely.
+- Pending evidence is independent of new raw candidates. A transient provider
+  or apply failure leaves it as `candidate` for a later run; model-declared
+  skips and failed source rehydration become terminal `skipped` evidence.
+
 ## v1.1 semantic identity correction
 
 Deduplication is scoped to an observation identity, not a global content hash:

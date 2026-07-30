@@ -50,6 +50,35 @@ if TYPE_CHECKING:
     from opensquilla.provider.types import ProviderRequestCorrelation
 
 _SANDBOX_RUN_CONTEXT_ORIGIN_KEY = "sandbox_run_context"
+_COMPACTION_ANCHOR_RE = re.compile(r"\s*\[anchor:(\d+):entry_\d+\]")
+
+
+def _strip_compaction_anchors(summary: str, compaction_index: int | None) -> str:
+    """Remove decorative anchors when no matching durable archive can exist."""
+    if compaction_index is None:
+        return summary
+    return _COMPACTION_ANCHOR_RE.sub(
+        lambda match: "" if int(match.group(1)) == compaction_index else match.group(0),
+        summary,
+    )
+
+
+def _entry_matches_compaction_preimage(
+    durable: TranscriptEntry, expected: dict[str, Any]
+) -> bool:
+    """Compare the provider-visible identity carried by a compaction event."""
+    return (
+        durable.role == expected.get("role")
+        and (durable.content or "") == expected.get("content", "")
+        and (
+            "tool_calls" not in expected
+            or durable.tool_calls == expected.get("tool_calls")
+        )
+        and (
+            "tool_call_id" not in expected
+            or durable.tool_call_id == expected.get("tool_call_id")
+        )
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -469,6 +498,13 @@ class SessionManager:
 
         session_key = canonicalize_session_key(session_key)
         return await self._storage.get_session(session_key)
+
+    async def get_next_compaction_index(self, session_key: str) -> int | None:
+        """Read the database-owned identity for the next persistent compaction."""
+        node = await self.get_session(session_key)
+        if node is None:
+            return None
+        return await self._storage.get_next_compaction_index(node.session_id)
 
     async def get_agent_config(self, agent_id: str) -> dict[str, Any] | None:
         """Return the registry entry for ``agent_id``, or None when unavailable.
@@ -1008,26 +1044,32 @@ class SessionManager:
                         child=child,
                     )
                 else:
+                    forked_entries: list[TranscriptEntry] = []
                     for entry in parent_entries:
-                        forked = TranscriptEntry(
-                            session_id=child.session_id,
-                            session_key=new_session_key,
-                            role=entry.role,
-                            content=entry.content,
-                            tool_calls=entry.tool_calls,
-                            tool_call_id=entry.tool_call_id,
-                            reasoning_content=entry.reasoning_content,
-                            turn_usage=entry.turn_usage,
-                            turn_context=entry.turn_context,
-                            created_at=entry.created_at,
-                            token_count=entry.token_count,
-                            provenance_kind=entry.provenance_kind,
-                            provenance_origin_session_id=entry.provenance_origin_session_id,
-                            provenance_source_session_key=entry.provenance_source_session_key,
-                            provenance_source_channel=entry.provenance_source_channel,
-                            provenance_source_tool=entry.provenance_source_tool,
+                        forked_entries.append(
+                            TranscriptEntry(
+                                session_id=child.session_id,
+                                session_key=new_session_key,
+                                role=entry.role,
+                                content=entry.content,
+                                tool_calls=entry.tool_calls,
+                                tool_call_id=entry.tool_call_id,
+                                reasoning_content=entry.reasoning_content,
+                                turn_usage=entry.turn_usage,
+                                turn_context=entry.turn_context,
+                                created_at=entry.created_at,
+                                token_count=entry.token_count,
+                                provenance_kind=entry.provenance_kind,
+                                provenance_origin_session_id=entry.provenance_origin_session_id,
+                                provenance_source_session_key=entry.provenance_source_session_key,
+                                provenance_source_channel=entry.provenance_source_channel,
+                                provenance_source_tool=entry.provenance_source_tool,
+                            )
                         )
-                        await self._storage.append_transcript_entry(forked)
+                    await self._storage.create_prefix_fork(
+                        child=child,
+                        entries=forked_entries,
+                    )
                 materials_copied = await self._copy_fork_materials(
                     parent.session_id, child.session_id, new_session_key
                 )
@@ -1807,6 +1849,11 @@ class SessionManager:
         compaction_id: str | None = None,
         trigger_reason: str | None = None,
         flush_receipt_status: str | None = None,
+        removed_count: int | None = None,
+        removed_entries: list[dict[str, Any]] | None = None,
+        compaction_index: int | None = None,
+        extracted_anchors: list[dict[str, Any]] | None = None,
+        anchor_enabled: bool = False,
     ) -> None:
         """Persist a pre-computed compaction result directly (no LLM re-compaction).
 
@@ -1825,13 +1872,48 @@ class SessionManager:
             return
 
         entries = await self._storage.get_transcript(node.session_id)
-        removed_entries = entries[: max(0, len(entries) - len(kept_entries))]
-        preserved_entries = entries[len(removed_entries) :]
-        if removed_entries and not summary:
+        persisted_removed_count = (
+            max(0, int(removed_count))
+            if removed_count is not None
+            else max(0, len(entries) - len(kept_entries))
+        )
+        durable_removed_entries = entries[:persisted_removed_count]
+        preserved_entries = entries[len(durable_removed_entries) :]
+        if removed_entries is not None and removed_count is not None:
+            expected_preimage = [*removed_entries, *kept_entries]
+            preimage_matches = (
+                len(entries) == len(expected_preimage)
+                and len(removed_entries) == persisted_removed_count
+                and all(
+                    _entry_matches_compaction_preimage(durable, expected)
+                    for durable, expected in zip(
+                        entries,
+                        expected_preimage,
+                        strict=True,
+                    )
+                )
+            )
+            if not preimage_matches:
+                _log.warning(
+                    "persist_compaction.stale_preimage",
+                    session_key=session_key,
+                    expected=len(expected_preimage),
+                    durable=len(entries),
+                )
+                return
+        elif anchor_enabled:
+            # Legacy producers did not carry a full transcript preimage. They
+            # may still compact, but cannot create a durable exact-recovery
+            # claim without evidence tying the summary to archived entries.
+            anchor_enabled = False
+            extracted_anchors = []
+            summary = _strip_compaction_anchors(summary, compaction_index)
+
+        if durable_removed_entries and not summary:
             _log.warning(
                 "persist_compaction.empty_summary_not_persisted",
                 session_key=session_key,
-                removed=len(removed_entries),
+                removed=len(durable_removed_entries),
                 kept=len(kept_entries),
             )
             return
@@ -1850,7 +1932,7 @@ class SessionManager:
                     "tool_calls": entry.tool_calls,
                     "tool_call_id": entry.tool_call_id,
                 }
-                for entry in removed_entries
+                for entry in durable_removed_entries
             ]
             obligations = extract_compaction_obligations(raw_removed_entries)
             structured_summary, coverage = build_structured_summary_from_text(summary, obligations)
@@ -1865,13 +1947,13 @@ class SessionManager:
                 coverage_status=coverage.status,
                 missing_obligations=coverage.missing_obligations,
                 critical_carry_forward=coverage.critical_carry_forward,
-                removed_count=len(removed_entries),
+                removed_count=len(durable_removed_entries),
                 kept_count=len(kept_entries),
                 flush_receipt_status=_compaction_flush_status_for_persistence(
                     flush_receipt_status
                 ),
-                covered_through_id=max((entry.id or 0) for entry in removed_entries)
-                if removed_entries
+                covered_through_id=max((entry.id or 0) for entry in durable_removed_entries)
+                if durable_removed_entries
                 else 0,
             )
 
@@ -1903,9 +1985,10 @@ class SessionManager:
             summary=summary_record,
             entries=rewritten_entries,
             context_states=[context_state] if context_state is not None else None,
-            archived_entries=removed_entries if summary_record is not None else None,
-            anchor_enabled=False,
-            extracted_anchors=None,
+            archived_entries=durable_removed_entries if summary_record is not None else None,
+            anchor_enabled=anchor_enabled,
+            extracted_anchors=extracted_anchors,
+            expected_compaction_index=compaction_index if anchor_enabled else None,
         )
         _log.info(
             "persist_compaction.done",

@@ -434,6 +434,82 @@ async def test_session_search_reports_unknown_for_undeclared_anchor(tmp_path) ->
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("summary_index", "removed_count", "anchor"),
+    [
+        (1, 2, "0:entry_000"),
+        (0, 1, "0:entry_001"),
+    ],
+)
+async def test_legacy_anchor_text_must_fit_summary_archive_bounds(
+    tmp_path, summary_index, removed_count, anchor
+) -> None:
+    storage = await _setup_storage(tmp_path)
+    try:
+        session_key = "agent:main:webchat:legacy-anchor-bounds"
+        node = _node(session_key, "sid-legacy-anchor-bounds")
+        await storage.upsert_session(node)
+        await storage.save_summary(
+            SessionSummary(
+                session_id=node.session_id,
+                session_key=session_key,
+                compaction_index=summary_index,
+                removed_count=removed_count,
+                summary_text=f"Untrusted [anchor:{anchor}]",
+                extracted_anchors=None,
+            ),
+            preserve_compaction_index=True,
+        )
+        registry = ToolRegistry()
+        create_session_search_tool(storage, registry=registry)
+        registered = registry.get("session_search")
+        assert registered is not None
+
+        output = await registered.handler(session_id=node.session_id, anchor=anchor)
+
+        assert json.loads(output)["anchor_resolution"] == "unknown"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_session_search_does_not_resurrect_rejected_anchor_from_text(
+    tmp_path,
+) -> None:
+    """Persisted metadata is authoritative once an anchor gate has run."""
+    storage = await _setup_storage(tmp_path)
+    try:
+        session_key = "agent:main:webchat:anchor-rejected"
+        node = _node(session_key, "sid-anchor-rejected")
+        await storage.upsert_session(node)
+        await storage.save_summary(
+            SessionSummary(
+                session_id=node.session_id,
+                session_key=session_key,
+                compaction_index=0,
+                summary_text="Hallucinated [anchor:0:entry_999]",
+                extracted_anchors=[],
+            ),
+            preserve_compaction_index=True,
+        )
+        registry = ToolRegistry()
+        create_session_search_tool(storage, registry=registry)
+        registered = registry.get("session_search")
+        assert registered is not None
+
+        output = await registered.handler(
+            session_id=node.session_id,
+            anchor="0:entry_999",
+        )
+
+        payload = json.loads(output)
+        assert payload["anchor_resolution"] == "unknown"
+        assert payload["results"] == []
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_anchor_ids_are_sequential(tmp_path) -> None:
     """Anchor IDs are assigned sequentially based on (created_at, id) order."""
     storage = await _setup_storage(tmp_path)

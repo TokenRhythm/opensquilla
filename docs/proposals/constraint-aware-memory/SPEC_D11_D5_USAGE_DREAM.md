@@ -14,6 +14,15 @@
   shutdown, and orphan rows are removed with replaced/deleted chunks.
 - Dream loads D5 signals for every pending evidence entry, not only the
   current scan batch.
+- Cancellation after `BEGIN` rolls back before releasing the shared connection
+  lock. Runtime reads use the same operation boundary and cannot observe a
+  half-reindexed file.
+- Reindex preserves usage rows for stable chunk IDs and deletes only IDs
+  removed from the edited path; it does not scan or clear the whole usage
+  table.
+- The bounded fire-and-forget queue logs sampled saturation counts. Dropping
+  usage statistics protects retrieval latency and never changes search
+  results.
 
 ---
 

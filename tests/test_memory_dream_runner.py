@@ -49,6 +49,14 @@ class _FailIfCalledProvider:
         raise AssertionError("provider should not be called")
 
 
+class _FailOnceProvider(_PatchProvider):
+    async def complete(self, *, messages, max_tokens):
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("temporary provider failure")
+        return _Response(self.text)
+
+
 def _dream(workspace, *, provider=None, preview=False):
     config = SimpleNamespace(
         max_batch_size=10,
@@ -85,6 +93,64 @@ async def test_dream_records_evidence_and_writes_curated_memory(tmp_path):
     assert "User Preferences" in (tmp_path / "MEMORY.md").read_text(encoding="utf-8")
     assert (memory_dir / ".dream_state" / "promotion_evidence.json").exists()
     assert (memory_dir / "note.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_dream_retries_pending_evidence_after_apply_failure(tmp_path):
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    (memory_dir / "note.md").write_text(
+        "User prefers provider-backed benchmarks over toy simulations.",
+        encoding="utf-8",
+    )
+    provider = _FailOnceProvider()
+    dream = _dream(tmp_path, provider=provider)
+
+    failed = await dream.run()
+    retried = await dream.run()
+
+    assert failed.apply_status == "error"
+    assert retried.apply_status == "ok"
+    assert provider.calls == 2
+    assert "User Preferences" in (tmp_path / "MEMORY.md").read_text(encoding="utf-8")
+    assert all(
+        entry.status != "candidate"
+        for entry in load_evidence_store(tmp_path).entries.values()
+    )
+
+
+@pytest.mark.asyncio
+async def test_dream_model_skip_is_terminal_without_repeated_provider_calls(tmp_path):
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    (memory_dir / "note.md").write_text(
+        "User prefers a one-off experimental label.",
+        encoding="utf-8",
+    )
+    provider = _PatchProvider(
+        text=json.dumps(
+            {
+                "operations": [
+                    {
+                        "op": "skip",
+                        "candidate_ids": ["auto"],
+                        "reason": "not durable",
+                    }
+                ]
+            }
+        )
+    )
+    dream = _dream(tmp_path, provider=provider)
+
+    first = await dream.run()
+    second = await dream.run()
+
+    assert first.apply_status == "ok"
+    assert second.apply_status == "skipped"
+    assert provider.calls == 1
+    assert {
+        entry.status for entry in load_evidence_store(tmp_path).entries.values()
+    } == {"skipped"}
 
 
 @pytest.mark.asyncio
@@ -234,7 +300,7 @@ async def test_dream_does_not_promote_stale_candidate_from_mixed_operation(tmp_p
     ]
 
     assert result.apply_status == "ok"
-    assert stale_entries and stale_entries[0].status == "candidate"
+    assert stale_entries and stale_entries[0].status == "skipped"
     assert stale_entries[0].last_skip_reason == "source_missing"
     assert live_entries and live_entries[0].status == "promoted"
 
