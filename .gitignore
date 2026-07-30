@@ -56,7 +56,9 @@ GEMINI.md
 /progress.txt
 /plans/
 /docs/plans/
-/docs/proposals/
+/docs/proposals/*
+!/docs/proposals/constraint-aware-memory/
+!/docs/proposals/constraint-aware-memory/**
 /docs/superpowers/
 # Local-only tree. To publish one doc, force-add it once:
 #   git add -f docs/superpowers/specs/<filename>.md

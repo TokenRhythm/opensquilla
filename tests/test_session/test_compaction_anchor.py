@@ -7,6 +7,7 @@ and end-to-end compaction → anchor → expand flow.
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import pytest
 
@@ -218,6 +219,59 @@ async def test_anchor_archive_and_lookup(tmp_path) -> None:
             anchor="0:entry_099",
         )
         assert results3 == []
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_migration_adds_compaction_indexes_to_legacy_schema(tmp_path) -> None:
+    """Anchor index creation must succeed for pre-compaction-index databases."""
+    db_path = tmp_path / "legacy-sessions.db"
+    connection = sqlite3.connect(db_path)
+    connection.executescript(
+        """
+        CREATE TABLE compacted_transcript_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            session_key TEXT NOT NULL,
+            compaction_id TEXT,
+            original_entry_id INTEGER,
+            message_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE session_summaries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            session_key TEXT NOT NULL,
+            summary_text TEXT NOT NULL,
+            covered_through_id INTEGER NOT NULL DEFAULT 0
+        );
+        """
+    )
+    connection.close()
+
+    storage = SessionStorage(str(db_path))
+    await storage.connect()
+    try:
+        async with storage.conn.execute(
+            "PRAGMA table_info(compacted_transcript_entries)"
+        ) as cur:
+            compacted_columns = {row[1] for row in await cur.fetchall()}
+        assert {"compaction_index", "compaction_anchor_id"} <= compacted_columns
+
+        async with storage.conn.execute(
+            "PRAGMA table_info(session_summaries)"
+        ) as cur:
+            summary_columns = {row[1] for row in await cur.fetchall()}
+        assert {"compaction_index", "extracted_anchors"} <= summary_columns
+
+        async with storage.conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'index' AND name = 'idx_compacted_anchor_lookup'"
+        ) as cur:
+            assert await cur.fetchone() is not None
     finally:
         await storage.close()
 

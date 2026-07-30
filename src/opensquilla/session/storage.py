@@ -2008,28 +2008,45 @@ class SessionStorage:
     async def _migrate_compaction_anchor_columns(self) -> None:
         """Idempotently add compaction anchor columns (D12).
 
-        Adds ``compaction_anchor_id`` to ``compacted_transcript_entries`` and
-        ``extracted_anchors`` to ``session_summaries``, plus the composite
-        lookup index.  Safe to call on every startup.
+        Legacy databases can predate both ``compaction_index`` columns even
+        though current fresh schemas include them. Add those columns before
+        creating the anchor lookup index, then add the D12 anchor metadata.
+        Safe to call on every startup.
         """
         assert self._conn is not None
-        # compacted_transcript_entries.compaction_anchor_id
         async with self._conn.execute(
             "PRAGMA table_info(compacted_transcript_entries)"
         ) as cur:
             cte_columns = {row[1] for row in await cur.fetchall()}
-        if "compaction_anchor_id" not in cte_columns:
-            await self._conn.execute(
+        cte_additions = {
+            "compaction_index": (
+                "ALTER TABLE compacted_transcript_entries "
+                "ADD COLUMN compaction_index INTEGER"
+            ),
+            "compaction_anchor_id": (
                 "ALTER TABLE compacted_transcript_entries "
                 "ADD COLUMN compaction_anchor_id TEXT"
-            )
-        # session_summaries.extracted_anchors
+            ),
+        }
+        for column, sql in cte_additions.items():
+            if column not in cte_columns:
+                await self._conn.execute(sql)
+
         async with self._conn.execute("PRAGMA table_info(session_summaries)") as cur:
             ss_columns = {row[1] for row in await cur.fetchall()}
-        if "extracted_anchors" not in ss_columns:
-            await self._conn.execute(
+        summary_additions = {
+            "compaction_index": (
+                "ALTER TABLE session_summaries "
+                "ADD COLUMN compaction_index INTEGER NOT NULL DEFAULT 0"
+            ),
+            "extracted_anchors": (
                 "ALTER TABLE session_summaries ADD COLUMN extracted_anchors TEXT"
-            )
+            ),
+        }
+        for column, sql in summary_additions.items():
+            if column not in ss_columns:
+                await self._conn.execute(sql)
+
         # Composite lookup index
         await self._conn.execute(_CREATE_IDX_COMPACTED_ANCHOR_LOOKUP)
         await self._conn.commit()
