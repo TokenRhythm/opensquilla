@@ -385,7 +385,7 @@ Sync 时解析 frontmatter → 覆盖 LLM 分类结果。
 | Heuristic (low conf < 0.6) | 0.4–0.5 | 弱匹配 / 默认 fact |
 | Signal Gate skip | None | 未标注 |
 
-**成本估算**（典型 50 chunk reindex）：Signal Gate 过滤 ~35% → 启发式接受 ~40% → 需 LLM 升级 ~25%（~13 次调用，~2,665 tokens）。对比 Mem0（每 chunk 2 次 LLM），约为其 **1/4**。
+**成本估算**（典型 50 chunk reindex）：Signal Gate 过滤 ~35% → 启发式接受 ~40% → 需 LLM 升级 ~25%（~13 次调用，~2,665 tokens）。
 
 **测试**：6 个新测试（含 LLM mock 验证跳过逻辑），全量 172 passed
 

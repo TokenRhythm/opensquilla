@@ -5,6 +5,13 @@
 > **Scope**: Dream candidate 扫描阶段的内容去重
 > **Depends on**: evidence store (existing)
 
+> **Implementation invariant update (2026-07-30)**: observation identity is
+> `(source_path, SHA-256(full file content))`; the bounded head/tail snippet is
+> only LLM input and never defines whether a file changed. Discovery recursively
+> follows `memory/**/*.md`. Progress uses `(mtime_ns, normalized_source_path)`,
+> while legacy timestamp-only cursor files remain readable. Tied mtimes cannot
+> starve deferred files even when evidence loading is unavailable.
+
 ## v1.1 semantic identity correction
 
 Deduplication is scoped to an observation identity, not a global content hash:

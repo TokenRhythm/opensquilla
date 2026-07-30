@@ -33,8 +33,11 @@ def rehydrate_candidate(workspace: Path, candidate: PromotionCandidate) -> Rehyd
         return RehydrateResult(ok=False, reason="source_missing")
     except OSError:
         return RehydrateResult(ok=False, reason="source_unreadable")
-    if _normalize_text(candidate.snippet) not in _normalize_text(raw):
-        return RehydrateResult(ok=False, reason="snippet_missing")
     if _sha256(candidate.snippet) != candidate.snippet_sha256:
         return RehydrateResult(ok=False, reason="hash_mismatch")
+    if candidate.content_sha256:
+        if _sha256(raw) != candidate.content_sha256:
+            return RehydrateResult(ok=False, reason="source_changed")
+    elif _normalize_text(candidate.snippet) not in _normalize_text(raw):
+        return RehydrateResult(ok=False, reason="snippet_missing")
     return RehydrateResult(ok=True)

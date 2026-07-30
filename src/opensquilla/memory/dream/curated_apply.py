@@ -9,6 +9,7 @@ from opensquilla.memory.dream.models import (
     PromotionPatch,
     PromotionPatchOperation,
 )
+from opensquilla.memory.file_mutation import atomic_write_text
 
 
 def _section_heading(section: str) -> str:
@@ -60,6 +61,7 @@ def apply_promotion_patch(
     patch: PromotionPatch,
     *,
     dry_run: bool,
+    expected_content_sha256: str | None = None,
 ) -> ApplyPromotionResult:
     memory_path = workspace / "MEMORY.md"
     try:
@@ -96,8 +98,11 @@ def apply_promotion_patch(
         )
     changed = next_content != content
     if changed and not dry_run:
-        memory_path.parent.mkdir(parents=True, exist_ok=True)
-        memory_path.write_text(next_content, encoding="utf-8")
+        atomic_write_text(
+            memory_path,
+            next_content,
+            expected_sha256=expected_content_sha256,
+        )
     return ApplyPromotionResult(
         applied=0 if dry_run else applied,
         skipped=skipped,

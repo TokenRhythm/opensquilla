@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import math
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -24,6 +26,16 @@ from .types import (
 # Matches YYYY-MM-DD.md or YYYY-MM-DD-<slug>.md at the basename.
 # The date must prefix the basename; embedded dates elsewhere do not match.
 _DATED_FILENAME_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})(?:-[a-z0-9][a-z0-9_-]*)?\.md")
+_MAX_PENDING_USAGE_WRITES = 32
+
+
+@dataclass(frozen=True)
+class MemoryRetrievalOutcome:
+    """Request-scoped retrieval results and the metadata used to rank them."""
+
+    results: list[MemorySearchResult]
+    query_intent: QueryIntent | None = None
+    query_confidence: float | None = None
 
 
 def _match_dated_basename(path: str) -> re.Match[str] | None:
@@ -189,9 +201,6 @@ class MemoryRetriever:
         self._sufficiency_check_enabled = sufficiency_check_enabled
         self._usage_tracking_enabled = usage_tracking_enabled
         self._usage_tasks: set[asyncio.Task[None]] = set()
-        # L3: cache last classified intent/confidence for sufficiency check
-        self._last_query_intent: QueryIntent | None = None
-        self._last_query_confidence: float | None = None
 
     async def search(
         self,
@@ -200,6 +209,18 @@ class MemoryRetriever:
         *,
         intent: SearchIntent = SearchIntent.TOOL,
     ) -> list[MemorySearchResult]:
+        """Backward-compatible result-only retrieval API."""
+        outcome = await self.search_with_context(query, opts, intent=intent)
+        return outcome.results
+
+    async def search_with_context(
+        self,
+        query: str,
+        opts: MemorySearchOpts | None = None,
+        *,
+        intent: SearchIntent = SearchIntent.TOOL,
+    ) -> MemoryRetrievalOutcome:
+        """Retrieve results with request-local intent metadata."""
         if self._sync_manager is not None:
             await self._sync_manager.sync(reason=f"search:{intent.value}")
         opts = opts or MemorySearchOpts()
@@ -259,14 +280,13 @@ class MemoryRetriever:
 
         # L2/L3: Constraint-aware routing (experimental, default off)
         query_intent: QueryIntent | None = None
+        query_confidence: float | None = None
         if (
             self._constraint_routing_enabled
             or self._sufficiency_check_enabled
             or self._usage_tracking_enabled
         ):
             query_intent, query_confidence = classify_query_intent(query)
-            self._last_query_intent = query_intent
-            self._last_query_confidence = query_confidence
             if self._constraint_routing_enabled:
                 filtered = apply_constraint_boost(filtered, query_intent)
                 filtered.sort(
@@ -301,15 +321,20 @@ class MemoryRetriever:
             chunk_ids = [r.chunk_id for r in k_selected]
             try:
                 loop = asyncio.get_running_loop()
-                task = loop.create_task(
-                    self._store.record_chunk_usage(chunk_ids, intent=intent_str)
-                )
-                self._usage_tasks.add(task)
-                task.add_done_callback(self._usage_tasks.discard)
+                if len(self._usage_tasks) < _MAX_PENDING_USAGE_WRITES:
+                    task = loop.create_task(
+                        self._store.record_chunk_usage(chunk_ids, intent=intent_str)
+                    )
+                    self._usage_tasks.add(task)
+                    task.add_done_callback(self._finish_usage_write)
             except RuntimeError:
                 pass  # No running event loop (e.g. sync test) — skip
 
-        return k_selected
+        return MemoryRetrievalOutcome(
+            results=k_selected,
+            query_intent=query_intent,
+            query_confidence=query_confidence,
+        )
 
     @property
     def constraint_routing_enabled(self) -> bool:
@@ -326,19 +351,14 @@ class MemoryRetriever:
         """Whether D11 chunk usage tracking is active."""
         return self._usage_tracking_enabled
 
-    @property
-    def last_query_intent(self) -> QueryIntent | None:
-        """Intent classified during the most recent search (L3)."""
-        return self._last_query_intent
-
-    @property
-    def last_query_confidence(self) -> float | None:
-        """Confidence of the most recent intent classification (L3)."""
-        return self._last_query_confidence
-
     async def close(self) -> None:
         if self._usage_tasks:
             await asyncio.gather(*tuple(self._usage_tasks), return_exceptions=True)
+
+    def _finish_usage_write(self, task: asyncio.Task[None]) -> None:
+        self._usage_tasks.discard(task)
+        with contextlib.suppress(asyncio.CancelledError):
+            task.exception()
 
     def effective_retrieval_metadata(self) -> dict[str, str]:
         effective_mode = "fts_only" if self._vector_weight == 0.0 else "hybrid"

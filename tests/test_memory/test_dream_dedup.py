@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from types import SimpleNamespace
@@ -150,6 +151,51 @@ class TestScanDeduplication:
         )
         assert len(candidates) == 3
 
+    def test_scan_recurses_into_nested_memory_sources(self, tmp_path):
+        workspace = tmp_path / "ws"
+        nested = workspace / "memory" / "projects"
+        nested.mkdir(parents=True)
+        (nested / "decision.md").write_text(
+            "We decided to preserve nested memory.",
+            encoding="utf-8",
+        )
+
+        candidates = scan_dream_candidates(
+            workspace,
+            cursor=0.0,
+            max_batch_size=20,
+            agent_id="main",
+        )
+
+        assert [candidate.source_path for candidate in candidates] == [
+            "memory/projects/decision.md"
+        ]
+
+    def test_full_content_hash_detects_change_beyond_snippet_prefix(self, tmp_path):
+        workspace = tmp_path / "ws"
+        memory_dir = workspace / "memory"
+        memory_dir.mkdir(parents=True)
+        path = memory_dir / "long.md"
+        path.write_text("A" * 5000 + "old tail", encoding="utf-8")
+        first = scan_dream_candidates(
+            workspace,
+            cursor=0.0,
+            max_batch_size=20,
+            agent_id="main",
+        )[0]
+        path.write_text("A" * 5000 + "new tail", encoding="utf-8")
+
+        changed = scan_dream_candidates(
+            workspace,
+            cursor=0.0,
+            max_batch_size=20,
+            agent_id="main",
+            known_observations={(first.source_path, first.content_sha256)},
+        )
+
+        assert len(changed) == 1
+        assert changed[0].content_sha256 != first.content_sha256
+
     def test_scan_reports_unchanged_high_watermark(self, tmp_path):
         """Hash-equivalent files remain visible as consumed scan observations."""
         workspace = tmp_path / "ws"
@@ -206,7 +252,71 @@ class TestScanDeduplication:
         )
 
         assert [item.source_path for item in scan.candidates] == ["memory/first.md"]
-        assert scan.cursor_high_watermark == 100.0
+        assert scan.cursor_high_watermark < 200.0
+
+    def test_high_watermark_stays_below_tied_deferred_mtime(self, tmp_path):
+        """Files sharing the batch-boundary mtime remain eligible next run."""
+        workspace = tmp_path / "ws"
+        memory_dir = workspace / "memory"
+        memory_dir.mkdir(parents=True)
+        first = memory_dir / "a.md"
+        deferred = memory_dir / "b.md"
+        first.write_text("First changed content.", encoding="utf-8")
+        deferred.write_text("Deferred changed content.", encoding="utf-8")
+        os.utime(first, (100.0, 100.0))
+        os.utime(deferred, (100.0, 100.0))
+
+        scan = scan_dream_candidate_batch(
+            workspace,
+            cursor=0.0,
+            max_batch_size=1,
+            agent_id="main",
+        )
+
+        assert [item.source_path for item in scan.candidates] == ["memory/a.md"]
+        assert scan.cursor_high_watermark == math.nextafter(100.0, -math.inf)
+
+        next_scan = scan_dream_candidate_batch(
+            workspace,
+            cursor=scan.cursor_high_watermark,
+            max_batch_size=1,
+            agent_id="main",
+            known_observations={
+                (scan.candidates[0].source_path, scan.candidates[0].snippet_sha256)
+            },
+        )
+        assert [item.source_path for item in next_scan.candidates] == ["memory/b.md"]
+
+    def test_composite_cursor_advances_across_tied_mtimes_without_evidence(self, tmp_path):
+        workspace = tmp_path / "ws"
+        memory_dir = workspace / "memory"
+        memory_dir.mkdir(parents=True)
+        for name in ("a.md", "b.md"):
+            path = memory_dir / name
+            path.write_text(f"Changed content from {name}.", encoding="utf-8")
+            os.utime(path, ns=(100_000_000_000, 100_000_000_000))
+
+        first = scan_dream_candidate_batch(
+            workspace,
+            cursor=0.0,
+            cursor_position=(0, ""),
+            max_batch_size=1,
+            agent_id="main",
+        )
+        second = scan_dream_candidate_batch(
+            workspace,
+            cursor=first.cursor_high_watermark,
+            cursor_position=(
+                first.cursor_high_watermark_ns,
+                first.cursor_high_watermark_path,
+            ),
+            max_batch_size=1,
+            agent_id="main",
+            known_observations=None,
+        )
+
+        assert [item.source_path for item in first.candidates] == ["memory/a.md"]
+        assert [item.source_path for item in second.candidates] == ["memory/b.md"]
 
     def test_identical_content_in_another_source_is_recurrence(self, tmp_path):
         """Content equality across files must preserve source diversity evidence."""

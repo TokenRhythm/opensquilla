@@ -6,6 +6,13 @@
 > **作者**: KunYu + OpenSquilla
 > **日期**: 2026-07-29
 
+> **Implementation invariant update (2026-07-30)**: the database computes the
+> next compaction index before summary generation and validates it again inside
+> the rewrite transaction. Cross-compaction and out-of-range anchors are
+> discarded before persistence. Full-fork SQLite lineage copying and child
+> creation are one transaction. Fallback previews have a hard token budget and
+> direct omitted-detail recovery to `session_search`.
+
 ---
 
 ## 1. 设计目标

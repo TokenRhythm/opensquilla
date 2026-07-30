@@ -222,6 +222,7 @@ def apply_constraint_boost(
         return results
 
     for result in results:
+        result.metadata["constraint_base_score"] = str(result.score)
         boost = compute_boost(result, query_intent, confidence_threshold=confidence_threshold)
         if boost != 1.0:
             result.score *= boost

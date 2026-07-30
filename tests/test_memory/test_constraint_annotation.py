@@ -790,6 +790,37 @@ class TestA13StoreLlmInjection:
             await store.close()
 
     @pytest.mark.asyncio
+    async def test_classification_cache_reuses_chunk_identity_across_files(self, tmp_path):
+        from opensquilla.memory.embedding import NullEmbeddingProvider
+        from opensquilla.memory.store import LongTermMemoryStore
+        from opensquilla.memory.types import MemorySource
+
+        llm_calls = 0
+
+        async def mock_llm(_prompt: str) -> str:
+            nonlocal llm_calls
+            llm_calls += 1
+            return "event"
+
+        store = LongTermMemoryStore(
+            db_path=str(tmp_path / "test_memory.db"),
+            embedding_provider=NullEmbeddingProvider(),
+            constraint_annotation_enabled=True,
+            constraint_llm_call=mock_llm,
+        )
+        await store.initialize()
+        content = (
+            "Yesterday we deployed the new version of the production "
+            "environment system to the online server."
+        )
+        try:
+            await store.index_file("memory/a.md", content, source=MemorySource.memory)
+            await store.index_file("memory/b.md", content, source=MemorySource.memory)
+            assert llm_calls == 1
+        finally:
+            await store.close()
+
+    @pytest.mark.asyncio
     async def test_llm_skipped_for_high_confidence(self, tmp_path):
         """High-confidence heuristic text (>= 0.6) skips LLM entirely."""
         from opensquilla.memory.embedding import NullEmbeddingProvider

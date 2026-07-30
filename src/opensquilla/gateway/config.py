@@ -1312,6 +1312,9 @@ class CompactionLlmConfig(BaseSettings):
     compaction_profile: Literal["conversation", "coding", "research", "support"] = "conversation"
     protected_recent_messages: int = Field(default=0, ge=0)
     anchor_enabled: bool = False  # D12: compaction anchor references
+    fallback_summary_max_tokens: int = Field(default=3000, ge=256)
+    previous_summary_max_tokens: int = Field(default=2000, ge=256)
+    total_summary_max_tokens: int = Field(default=5000, ge=512)
 
 
 class SessionNamingConfig(BaseSettings):

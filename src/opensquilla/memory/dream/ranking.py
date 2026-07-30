@@ -193,6 +193,7 @@ def rank_promotion_candidates(
                 score=score,
                 reasons=reasons,
                 signal_counts=_signal_counts(entry),
+                content_sha256=entry.content_sha256,
             )
         )
     ranked.sort(

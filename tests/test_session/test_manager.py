@@ -981,6 +981,54 @@ async def test_full_fork_preserves_compaction_anchor_mapping(manager):
 
 
 @pytest.mark.asyncio
+async def test_full_fork_database_copy_rolls_back_as_one_transaction(manager):
+    parent = await manager.create("agent:main:atomic-parent")
+    await manager.append_message(parent.session_key, "user", "archived parent row")
+    archived = await manager.get_transcript(parent.session_key)
+    await manager._storage.rewrite_compacted_session(
+        node=parent,
+        summary=SessionSummary(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            summary_text="parent summary",
+        ),
+        entries=[],
+        archived_entries=archived,
+    )
+    await manager._storage.conn.execute(
+        """
+        CREATE TRIGGER fail_child_summary
+        BEFORE INSERT ON session_summaries
+        BEGIN
+            SELECT RAISE(ABORT, 'injected full fork failure');
+        END
+        """
+    )
+    await manager._storage.conn.commit()
+
+    with pytest.raises(Exception, match="injected full fork failure"):
+        await manager.branch(
+            parent.session_key,
+            "agent:main:atomic-child",
+            fork_transcript=True,
+        )
+
+    assert await manager._storage.get_session("agent:main:atomic-child") is None
+    for table in (
+        "compacted_transcript_entries",
+        "transcript_entries",
+        "session_summaries",
+        "session_context_states",
+    ):
+        async with manager._storage.conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE session_id <> ?",
+            (parent.session_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert int(row[0]) == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("parent_state", ["complete", "incomplete", "missing"])
 async def test_legacy_zero_evidence_fork_fails_closed(
     manager,

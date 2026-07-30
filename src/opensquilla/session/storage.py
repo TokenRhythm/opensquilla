@@ -7485,6 +7485,54 @@ class SessionStorage:
                 (target_session_id, target_session_key, source_session_id),
             )
 
+    async def create_full_fork(
+        self,
+        *,
+        source_session_id: str,
+        child: SessionNode,
+    ) -> None:
+        """Atomically copy all SQLite-backed lineage and create the child row."""
+        child.session_key = canonicalize_session_key(child.session_key)
+        child.agent_id = normalize_agent_id(child.agent_id)
+        async with self._write_transaction("create_full_fork") as conn:
+            for table in (
+                "compacted_transcript_entries",
+                "transcript_entries",
+                "session_summaries",
+                "session_context_states",
+            ):
+                async with conn.execute(f'PRAGMA table_info("{table}")') as cur:
+                    table_info = await cur.fetchall()
+                columns = [str(row["name"]) for row in table_info if row["name"] != "id"]
+                quoted_columns = ", ".join(f'"{column}"' for column in columns)
+                select_expressions: list[str] = []
+                parameters: list[Any] = []
+                for column in columns:
+                    if column == "session_id":
+                        select_expressions.append("?")
+                        parameters.append(child.session_id)
+                    elif column == "session_key":
+                        select_expressions.append("?")
+                        parameters.append(child.session_key)
+                    else:
+                        select_expressions.append(f'"{column}"')
+                parameters.append(source_session_id)
+                await conn.execute(
+                    f'INSERT INTO "{table}" ({quoted_columns}) '
+                    f"SELECT {', '.join(select_expressions)} "
+                    f'FROM "{table}" WHERE session_id = ?',
+                    parameters,
+                )
+
+            data = child.model_dump()
+            columns = list(data)
+            placeholders = ", ".join("?" for _ in columns)
+            values = [_serialize(data[column]) for column in columns]
+            await conn.execute(
+                f"INSERT INTO sessions ({', '.join(columns)}) VALUES ({placeholders})",
+                values,
+            )
+
     @_serialized_read
     async def count_transcript_entries(self, session_id: str) -> int:
         async with self.conn.execute(
@@ -7672,6 +7720,17 @@ class SessionStorage:
                 summary.id = cur.lastrowid
         return summary
 
+    @_serialized_read
+    async def get_next_compaction_index(self, session_id: str) -> int:
+        """Return the database-owned ordinal for the next compaction."""
+        async with self.conn.execute(
+            "SELECT COALESCE(MAX(compaction_index), -1) + 1 "
+            "FROM session_summaries WHERE session_id = ?",
+            (session_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row[0]) if row else 0
+
     async def _archive_transcript_entries(
         self,
         *,
@@ -7727,6 +7786,7 @@ class SessionStorage:
         archived_entries: list[TranscriptEntry] | None = None,
         anchor_enabled: bool = False,
         extracted_anchors: list[dict[str, Any]] | None = None,
+        expected_compaction_index: int | None = None,
     ) -> None:
         """Atomically persist a compaction rewrite for one session."""
         node.session_key = canonicalize_session_key(node.session_key)
@@ -7742,7 +7802,17 @@ class SessionStorage:
                     (summary.session_id,),
                 ) as cur:
                     row = await cur.fetchone()
-                summary.compaction_index = row[0] if row else 0
+                allocated_compaction_index = int(row[0]) if row else 0
+                if (
+                    expected_compaction_index is not None
+                    and allocated_compaction_index != expected_compaction_index
+                ):
+                    raise RuntimeError(
+                        "Compaction identity changed before persistence: "
+                        f"expected {expected_compaction_index}, "
+                        f"allocated {allocated_compaction_index}"
+                    )
+                summary.compaction_index = allocated_compaction_index
                 if extracted_anchors is not None:
                     summary.extracted_anchors = extracted_anchors
 

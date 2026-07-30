@@ -7,6 +7,13 @@
 > **作者**: KunYu + OpenSquilla
 > **日期**: 2026-07-29
 
+> **Implementation invariant update (2026-07-30)**: intent and confidence are
+> returned in a request-scoped `MemoryRetrievalOutcome`. They are never stored
+> as mutable `last_query_*` state on the shared retriever. The advisory is a
+> low-evidence heuristic, not a proof of semantic sufficiency: one strong exact
+> result suppresses it, while weak or duplicate evidence may still trigger it.
+> Any older flow below that mentions `last_query_*` is superseded by this rule.
+
 ---
 
 ## 1. 设计目标
@@ -22,12 +29,12 @@
 
 ## 2. 设计决策（已对齐，2026-07-29）
 
-| # | 决策 | 选择 | 参考模式 |
-|---|------|------|---------|
-| D1 | 注入位置 | `memory_tools.py` 返回层（结果格式化后追加） | OpenHuman `MemoryAccessSection`（section 追加在结果后） |
+| # | 决策 | 选择 | 理由 |
+|---|------|------|------|
+| D1 | 注入位置 | `memory_tools.py` 返回层（结果格式化后追加） | 保持结构化检索层与模型可见文本层职责分离 |
 | D2 | 语言策略 | 跟随 query 语言（CJK 比例 > 0.3 → 中文） | 和约束 ontology 双语设计一致 |
-| D3 | 注入格式 | `<memory_sufficiency_note>` 有界 XML 标记 | Codex `ContextualUserFragment`（有界、可识别、不可变） |
-| D4 | 提示强度 | 区分"无结果"(results=0)和"不充分"(0<results<3) | 反转 OpenHuman 静默-section 模式：无结果时反而告知 |
+| D3 | 注入格式 | `<memory_sufficiency_note>` 有界 XML 标记 | 有界、可识别，避免与检索正文混淆 |
+| D4 | 提示强度 | 区分"无结果"(results=0)和"不充分"(0<results<3) | 两种状态需要不同的后续决策 |
 | D5 | 触发条件 | `results < 3 AND intent_confidence >= 0.7` | 接受真实分类器最高置信度，同时保持低置信度不自扰 |
 
 ### 2.1 为何不注入到 `retrieval.py` 内部

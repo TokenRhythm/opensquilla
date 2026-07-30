@@ -1,7 +1,21 @@
 # Constraint-Aware Memory: 进度跟踪
 
-> **Last updated**: 2026-07-29 (A1 + B6 implemented)
+> **Last updated**: 2026-07-30 (structural invariant hardening)
 > **Branch**: `feature/constraint-aware-memory`
+
+---
+
+## 2026-07-30 结构性加固
+
+- L3 intent/confidence 改为 request-scoped outcome，消除并发串线。
+- compaction index 由数据库 identity 决定，并在持久化事务内复核。
+- anchor 在写入前校验 compaction 与 entry 范围。
+- Dream 使用完整内容 hash、递归扫描和 `(mtime_ns, path)` 复合 cursor。
+- `MEMORY.md` apply 使用短临界区、内容 CAS 与原子替换。
+- fallback/previous summary 受 token budget 约束，优先恢复窗口可用性。
+- full fork 的 SQLite lineage copy 与 child row 创建收敛为单事务。
+- constraint classification 增加有界并发与 chunk-hash cache；usage
+  后台写入有上限；L3 advisory 考虑证据强度与重复度。
 
 ---
 
@@ -57,7 +71,7 @@ f65304da docs: mark L0 as implemented, update DoD checklist
 
 ```
 6038ff55 feat(session): implement D12 compaction anchor mechanism
-c7cef6fe docs(constraint-aware-memory): add alignment record, Codex comparison, and D12 anchor spec
+c7cef6fe docs(constraint-aware-memory): add alignment record and D12 anchor spec
 ```
 
 ---

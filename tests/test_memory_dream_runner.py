@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -84,6 +85,24 @@ async def test_dream_records_evidence_and_writes_curated_memory(tmp_path):
     assert "User Preferences" in (tmp_path / "MEMORY.md").read_text(encoding="utf-8")
     assert (memory_dir / ".dream_state" / "promotion_evidence.json").exists()
     assert (memory_dir / "note.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_dream_waits_for_agent_session_lock(tmp_path):
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    lock = asyncio.Lock()
+    await lock.acquire()
+    dream = _dream(tmp_path)
+    dream.session_lock = lock
+
+    task = asyncio.create_task(dream.run())
+    await asyncio.sleep(0)
+    assert not task.done()
+
+    lock.release()
+    result = await task
+    assert result.evidence_status == "skipped"
 
 
 @pytest.mark.asyncio

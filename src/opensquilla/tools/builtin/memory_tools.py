@@ -518,14 +518,26 @@ def create_memory_tools(
         return snapshots
 
     def _write_content(mem_path: Path, content: str, mode: str) -> None:
+        from opensquilla.memory.file_mutation import (
+            atomic_write_text,
+            memory_content_sha256,
+        )
+
         mem_path.parent.mkdir(parents=True, exist_ok=True)
+        current_content = (
+            mem_path.read_text(encoding="utf-8") if mem_path.exists() else ""
+        )
         if mode == "replace":
-            mem_path.write_text(content, encoding="utf-8")
-        elif mem_path.exists():
-            with open(mem_path, "a", encoding="utf-8") as handle:
-                handle.write("\n\n" + content)
+            next_content = content
+        elif current_content:
+            next_content = current_content + "\n\n" + content
         else:
-            mem_path.write_text(content, encoding="utf-8")
+            next_content = content
+        atomic_write_text(
+            mem_path,
+            next_content,
+            expected_sha256=memory_content_sha256(current_content),
+        )
 
     async def _rollback_snapshots(
         r: ResolvedAgent,
@@ -544,7 +556,9 @@ def create_memory_tools(
             try:
                 if snapshot.existed:
                     snapshot.abs_path.parent.mkdir(parents=True, exist_ok=True)
-                    snapshot.abs_path.write_text(snapshot.content or "", encoding="utf-8")
+                    from opensquilla.memory.file_mutation import atomic_write_text
+
+                    atomic_write_text(snapshot.abs_path, snapshot.content or "")
                 elif snapshot.abs_path.exists():
                     snapshot.abs_path.unlink()
             except Exception:
@@ -586,12 +600,22 @@ def create_memory_tools(
         raise RuntimeError(message) from exc
 
     async def _apply_memory_writes(r: ResolvedAgent, plans: list[PlannedWrite]) -> dict[str, int]:
-        from opensquilla.memory.types import MemorySource
+        from opensquilla.memory.file_mutation import get_memory_mutation_lock
 
         if not plans:
             return {}
 
         workspace_dir = _workspace_path(r)
+        async with get_memory_mutation_lock(workspace_dir):
+            return await _apply_memory_writes_locked(r, plans, workspace_dir)
+
+    async def _apply_memory_writes_locked(
+        r: ResolvedAgent,
+        plans: list[PlannedWrite],
+        workspace_dir: Path,
+    ) -> dict[str, int]:
+        from opensquilla.memory.types import MemorySource
+
         await _maybe_prune(r)
 
         snapshots = _snapshot_paths(workspace_dir, plans)
@@ -675,17 +699,20 @@ def create_memory_tools(
             min_score=normalize_memory_search_min_score(min_score),
             source=source_filter,
         )
+        outcome = await r.retriever.search_with_context(
+            query, opts, intent=SearchIntent.TOOL
+        )
         results = [
             result
-            for result in await r.retriever.search(query, opts, intent=SearchIntent.TOOL)
+            for result in outcome.results
             if (source_filter is None or result.source == source_filter)
             and is_searchable_source_path(result.source, str(result.path))
             and not _is_checkpoint_sidecar_path(str(result.path))
         ]
-        # L3: sufficiency check state (read once, used at both exit points)
+        # L3 metadata belongs to this retrieval request, never the shared retriever.
         _sufficiency_on = getattr(r.retriever, "sufficiency_check_enabled", False)
-        _l3_intent = getattr(r.retriever, "last_query_intent", None)
-        _l3_conf = getattr(r.retriever, "last_query_confidence", None)
+        _l3_intent = outcome.query_intent
+        _l3_conf = outcome.query_confidence
 
         if not results:
             empty_msg = "No results found."
@@ -718,6 +745,21 @@ def create_memory_tools(
             formatted = maybe_append_sufficiency_note(
                 query, len(results), formatted, _l3_intent, _l3_conf,
                 enabled=True,
+                max_score=max(
+                    float(
+                        result.metadata.get(
+                            "constraint_base_score",
+                            result.score,
+                        )
+                    )
+                    for result in results
+                ),
+                distinct_evidence_count=len(
+                    {
+                        (result.path, result.start_line, result.end_line)
+                        for result in results
+                    }
+                ),
             )
         return formatted
 

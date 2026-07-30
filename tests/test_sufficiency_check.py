@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from opensquilla.memory.constraint_routing import QueryIntent, classify_query_intent
 from opensquilla.memory.sufficiency_check import (
     format_sufficiency_note,
@@ -55,6 +57,28 @@ class TestShouldEmit:
 
     def test_one_result_high_confidence(self):
         assert should_emit_sufficiency_note(1, 0.9) is True
+
+    def test_one_strong_exact_result_suppresses_low_evidence_note(self):
+        assert (
+            should_emit_sufficiency_note(
+                1,
+                0.9,
+                max_score=0.93,
+                distinct_evidence_count=1,
+            )
+            is False
+        )
+
+    def test_three_weak_duplicate_results_still_emit(self):
+        assert (
+            should_emit_sufficiency_note(
+                3,
+                0.9,
+                max_score=0.4,
+                distinct_evidence_count=1,
+            )
+            is True
+        )
 
     def test_sufficient_results_boundary(self):
         # results == 3 → NOT < 3 → False
@@ -218,14 +242,15 @@ class TestMaybeAppend:
 
 
 class TestRetrieverIntegration:
-    """Test that retriever correctly exposes L3 properties."""
+    """Test that retriever exposes L3 metadata on each outcome."""
 
-    def test_retriever_has_sufficiency_properties(self):
+    def test_retriever_has_request_scoped_search(self):
         from opensquilla.memory.retrieval import MemoryRetriever
 
         assert hasattr(MemoryRetriever, "sufficiency_check_enabled")
-        assert hasattr(MemoryRetriever, "last_query_intent")
-        assert hasattr(MemoryRetriever, "last_query_confidence")
+        assert hasattr(MemoryRetriever, "search_with_context")
+        assert not hasattr(MemoryRetriever, "last_query_intent")
+        assert not hasattr(MemoryRetriever, "last_query_confidence")
 
     def test_retriever_init_defaults(self):
         from opensquilla.memory.retrieval import MemoryRetriever
@@ -235,8 +260,6 @@ class TestRetrieverIntegration:
 
         retriever = MemoryRetriever(FakeStore())  # type: ignore[arg-type]
         assert retriever.sufficiency_check_enabled is False
-        assert retriever.last_query_intent is None
-        assert retriever.last_query_confidence is None
 
     def test_retriever_init_with_sufficiency_enabled(self):
         from opensquilla.memory.retrieval import MemoryRetriever
@@ -249,6 +272,36 @@ class TestRetrieverIntegration:
             sufficiency_check_enabled=True,
         )
         assert retriever.sufficiency_check_enabled is True
+
+    async def test_concurrent_searches_keep_intent_request_scoped(self):
+        from opensquilla.memory.retrieval import MemoryRetriever
+
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+
+        class FakeStore:
+            async def search(self, *, query, **_kwargs):
+                if query == "continue the previous task":
+                    first_started.set()
+                    await release_first.wait()
+                else:
+                    await first_started.wait()
+                    release_first.set()
+                return [], "fts"
+
+        retriever = MemoryRetriever(
+            FakeStore(),  # type: ignore[arg-type]
+            sufficiency_check_enabled=True,
+        )
+        continued, avoided = await asyncio.gather(
+            retriever.search_with_context("continue the previous task"),
+            retriever.search_with_context("avoid that failure again"),
+        )
+
+        assert continued.query_intent == QueryIntent.continue_task
+        assert avoided.query_intent == QueryIntent.avoid_failure
+        assert continued.query_confidence is not None
+        assert avoided.query_confidence is not None
 
     def test_effective_metadata_includes_sufficiency(self):
         from opensquilla.memory.retrieval import MemoryRetriever

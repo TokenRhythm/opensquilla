@@ -36,6 +36,10 @@ from opensquilla.memory.dream.prompts import parse_promotion_patch, promotion_pa
 from opensquilla.memory.dream.ranking import rank_promotion_candidates
 from opensquilla.memory.dream.receipts import write_dream_receipt
 from opensquilla.memory.dream.rehydrate import rehydrate_candidate
+from opensquilla.memory.file_mutation import (
+    get_memory_mutation_lock,
+    memory_content_sha256,
+)
 from opensquilla.memory.protocols import MemoryProviderCapability
 from opensquilla.provider.protocol import provider_metadata
 from opensquilla.provider.types import Message
@@ -102,33 +106,80 @@ async def _run_complete(
     return "".join(chunks)
 
 
-class DreamCursor:
-    """Timestamp (UTC epoch seconds) of the last successful Dream batch.
+@dataclass(frozen=True)
+class DreamCursorPosition:
+    mtime_ns: int = 0
+    source_path: str = ""
 
-    Persisted at ``<memory_dir>/.dream_cursor``. Files with mtime greater
-    than the cursor are candidates for the next Dream run.
+    @property
+    def timestamp(self) -> float:
+        return self.mtime_ns / 1_000_000_000
+
+
+class DreamCursor:
+    """Stable ``(mtime_ns, source_path)`` cursor of the last successful batch.
+
+    Legacy timestamp-only cursor files remain readable.
     """
 
     def __init__(self, memory_dir: Path) -> None:
         self._path = memory_dir / ".dream_cursor"
 
     def load(self) -> float:
+        return self.load_position().timestamp
+
+    def load_position(self) -> DreamCursorPosition:
         if not self._path.exists():
-            return 0.0
+            return DreamCursorPosition()
         try:
-            return float(self._path.read_text(encoding="utf-8").strip())
-        except (ValueError, OSError):
-            return 0.0
+            text = self._path.read_text(encoding="utf-8").strip()
+            try:
+                raw = json.loads(text)
+            except json.JSONDecodeError:
+                return DreamCursorPosition(mtime_ns=int(float(text) * 1_000_000_000))
+            if not isinstance(raw, dict):
+                return DreamCursorPosition()
+            return DreamCursorPosition(
+                mtime_ns=max(0, int(raw.get("mtime_ns") or 0)),
+                source_path=str(raw.get("source_path") or ""),
+            )
+        except (TypeError, ValueError, OSError):
+            return DreamCursorPosition()
 
     def save(self, ts: float) -> None:
+        self.save_position(
+            DreamCursorPosition(mtime_ns=max(0, int(ts * 1_000_000_000)))
+        )
+
+    def save_position(self, position: DreamCursorPosition) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(f"{ts}\n", encoding="utf-8")
+        payload = {
+            "version": 2,
+            "mtime_ns": position.mtime_ns,
+            "source_path": position.source_path,
+        }
+        temporary = self._path.with_suffix(self._path.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps(payload, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(self._path)
 
     def reset(self) -> None:
         try:
             self._path.unlink()
         except FileNotFoundError:
             pass
+
+
+def _cursor_position_from_scan(scan: Any) -> DreamCursorPosition:
+    mtime_ns = int(getattr(scan, "cursor_high_watermark_ns", 0) or 0)
+    if mtime_ns <= 0:
+        mtime_ns = int(float(scan.cursor_high_watermark) * 1_000_000_000)
+    return DreamCursorPosition(
+        mtime_ns=mtime_ns,
+        source_path=str(getattr(scan, "cursor_high_watermark_path", "") or ""),
+    )
 
 
 @dataclass
@@ -230,10 +281,15 @@ class Dream:
         return self._workspace_relative(backup_path)
 
     def pending_candidate_count(self) -> int:
+        cursor_position = self.cursor.load_position()
         return len(
             scan_dream_candidates(
                 self.workspace,
-                cursor=self.cursor.load(),
+                cursor=cursor_position.timestamp,
+                cursor_position=(
+                    cursor_position.mtime_ns,
+                    cursor_position.source_path,
+                ),
                 max_batch_size=getattr(self.config, "max_batch_size", 20),
                 agent_id=getattr(self, "agent_id", "main"),
                 quarantine_enabled=getattr(self.config, "evidence_quarantine_enabled", True),
@@ -245,8 +301,9 @@ class Dream:
         import time
         from datetime import UTC, datetime
 
+        cursor_position = self.cursor.load_position()
         result = DreamResult(
-            cursor_before=self.cursor.load(),
+            cursor_before=cursor_position.timestamp,
             memory_md_sha_before=(
                 hashlib.sha256(self.memory_md.read_bytes()).hexdigest()
                 if self.memory_md.exists()
@@ -266,9 +323,9 @@ class Dream:
 
             _ev_store = load_evidence_store(self.workspace)
             d10_known_observations = {
-                (e.source_path, e.snippet_sha256)
+                (e.source_path, e.content_sha256 or e.snippet_sha256)
                 for e in _ev_store.entries.values()
-                if e.source_path and e.snippet_sha256
+                if e.source_path and (e.content_sha256 or e.snippet_sha256)
             }
         except Exception:  # noqa: BLE001
             pass  # D10 is best-effort; degrade to full scan
@@ -280,6 +337,10 @@ class Dream:
             agent_id=getattr(self, "agent_id", "main"),
             quarantine_enabled=getattr(self.config, "evidence_quarantine_enabled", True),
             known_observations=d10_known_observations,
+            cursor_position=(
+                cursor_position.mtime_ns,
+                cursor_position.source_path,
+            ),
         )
         raw_candidates = candidate_scan.candidates
         result.files_considered = candidate_scan.files_considered
@@ -290,7 +351,7 @@ class Dream:
                 and result.files_skipped_unchanged
                 and not result.dry_run
             ):
-                self.cursor.save(candidate_scan.cursor_high_watermark)
+                self.cursor.save_position(_cursor_position_from_scan(candidate_scan))
                 result.cursor_after = candidate_scan.cursor_high_watermark
             else:
                 result.cursor_after = result.cursor_before
@@ -353,7 +414,7 @@ class Dream:
             if not result.dry_run:
                 write_evidence_store(self.workspace, store)
                 result.files_processed = len(raw_candidates)
-                self.cursor.save(max_mtime)
+                self.cursor.save_position(_cursor_position_from_scan(candidate_scan))
                 result.cursor_after = max_mtime
             else:
                 result.cursor_after = result.cursor_before
@@ -387,6 +448,7 @@ class Dream:
             current_memory = (
                 self.memory_md.read_text(encoding="utf-8") if self.memory_md.exists() else ""
             )
+            expected_memory_sha = memory_content_sha256(current_memory)
             prompt = promotion_patch_prompt(current_memory, ranked)
             result.promotion_prompt_chars = len(prompt)
             text = await _run_complete(self.provider, [Message(role="user", content=prompt)], 4096)
@@ -424,12 +486,14 @@ class Dream:
                 self.config, "evidence_curated_writes_enabled", True
             ):
                 memory_backup_path = self._backup_memory_md(artifact_id)
-            applied = apply_promotion_patch(
-                self.workspace,
-                filtered_patch,
-                dry_run=result.dry_run
-                or not getattr(self.config, "evidence_curated_writes_enabled", True),
-            )
+            async with get_memory_mutation_lock(self.workspace):
+                applied = apply_promotion_patch(
+                    self.workspace,
+                    filtered_patch,
+                    dry_run=result.dry_run
+                    or not getattr(self.config, "evidence_curated_writes_enabled", True),
+                    expected_content_sha256=expected_memory_sha,
+                )
             if not result.dry_run:
                 promoted_ids: list[str] = []
                 represented_ids: list[str] = []
@@ -459,7 +523,7 @@ class Dream:
                 write_evidence_store(self.workspace, store)
                 max_mtime = candidate_scan.cursor_high_watermark
                 result.files_processed = len(raw_candidates)
-                self.cursor.save(max_mtime)
+                self.cursor.save_position(_cursor_position_from_scan(candidate_scan))
                 result.cursor_after = max_mtime
             else:
                 result.cursor_after = result.cursor_before
@@ -499,4 +563,7 @@ class Dream:
 
     async def run(self) -> DreamResult:
         """Run the single evidence-gated Dream consolidation path."""
+        if self.session_lock is not None:
+            async with self.session_lock:
+                return await self._run_evidence_consolidation()
         return await self._run_evidence_consolidation()

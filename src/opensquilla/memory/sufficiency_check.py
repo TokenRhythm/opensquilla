@@ -50,6 +50,8 @@ def should_emit_sufficiency_note(
     confidence: float,
     *,
     enabled: bool = True,
+    max_score: float | None = None,
+    distinct_evidence_count: int | None = None,
 ) -> bool:
     """Return True if a sufficiency note should be injected.
 
@@ -62,7 +64,18 @@ def should_emit_sufficiency_note(
         return False
     if confidence < SUFFICIENCY_CONFIDENCE_THRESHOLD:
         return False
-    return result_count < SUFFICIENCY_RESULT_THRESHOLD
+    if result_count == 0:
+        return True
+    if max_score is not None and max_score >= 0.85:
+        return False
+    effective_count = (
+        distinct_evidence_count
+        if distinct_evidence_count is not None
+        else result_count
+    )
+    if effective_count < SUFFICIENCY_RESULT_THRESHOLD:
+        return True
+    return max_score is not None and max_score < 0.45
 
 
 # ── Note formatting ───────────────────────────────────────────────────────
@@ -134,12 +147,20 @@ def maybe_append_sufficiency_note(
     confidence: float,
     *,
     enabled: bool = True,
+    max_score: float | None = None,
+    distinct_evidence_count: int | None = None,
 ) -> str:
     """Append a sufficiency note to ``text`` if trigger conditions are met.
 
     Returns ``text`` unchanged if no note should be emitted.
     """
-    if not should_emit_sufficiency_note(result_count, confidence, enabled=enabled):
+    if not should_emit_sufficiency_note(
+        result_count,
+        confidence,
+        enabled=enabled,
+        max_score=max_score,
+        distinct_evidence_count=distinct_evidence_count,
+    ):
         return text
     note = format_sufficiency_note(query, result_count, intent, confidence)
     return f"{text}\n\n{note}"

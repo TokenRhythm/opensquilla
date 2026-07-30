@@ -14,9 +14,12 @@ import pytest
 from opensquilla.session.compaction import (
     CompactionConfig,
     CompactionRequest,
+    _estimate_tokens,
     _format_chunk_for_llm,
+    _summarize_chunk_fallback,
     compact_context,
     extract_anchors_from_summary,
+    validate_compaction_anchors,
 )
 from opensquilla.session.models import (
     SessionNode,
@@ -102,6 +105,41 @@ class TestExtractAnchorsFromSummary:
         assert len(result) == 2
         assert result[0]["compaction_index"] == 0
         assert result[1]["compaction_index"] == 1
+
+    def test_validation_rejects_wrong_compaction_and_out_of_range_entry(self):
+        anchors = [
+            {"compaction_index": 4, "entry_anchor_id": "entry_001"},
+            {"compaction_index": 3, "entry_anchor_id": "entry_001"},
+            {"compaction_index": 4, "entry_anchor_id": "entry_999"},
+        ]
+
+        assert validate_compaction_anchors(
+            anchors,
+            compaction_index=4,
+            removed_count=3,
+        ) == [{"compaction_index": 4, "entry_anchor_id": "entry_001"}]
+
+
+async def test_rewrite_rejects_changed_compaction_identity(tmp_path) -> None:
+    storage = await _setup_storage(tmp_path)
+    node = _node("agent:main:test", "session-identity")
+    await storage.upsert_session(node)
+    summary = SessionSummary(
+        session_id=node.session_id,
+        session_key=node.session_key,
+        summary_text="summary [anchor:1:entry_000]",
+    )
+    try:
+        with pytest.raises(RuntimeError, match="Compaction identity changed"):
+            await storage.rewrite_compacted_session(
+                node=node,
+                summary=summary,
+                entries=[],
+                expected_compaction_index=1,
+            )
+        assert await storage.get_all_summaries(node.session_id) == []
+    finally:
+        await storage.close()
 
 
 # ── Unit: _format_chunk_for_llm with anchors ─────────────────────────────
@@ -311,7 +349,86 @@ async def test_session_search_anchor_defaults_to_current_session(tmp_path) -> No
             current_tool_context.reset(token)
 
         payload = json.loads(output)
+        assert payload["anchor_resolution"] == "resolved"
         assert payload["results"][0]["snippet"] == "exact original decision"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("declaration_source", ["metadata", "legacy_text"])
+async def test_session_search_distinguishes_declared_unavailable_anchor(
+    tmp_path, declaration_source
+) -> None:
+    storage = await _setup_storage(tmp_path)
+    try:
+        session_key = "agent:main:webchat:anchor-unavailable"
+        node = _node(session_key, "sid-anchor-unavailable")
+        await storage.upsert_session(node)
+        anchors = [{"compaction_index": 0, "entry_anchor_id": "entry_000"}]
+        await storage.save_summary(
+            SessionSummary(
+                session_id=node.session_id,
+                session_key=session_key,
+                compaction_index=0,
+                summary_text="Decision [anchor:0:entry_000]",
+                extracted_anchors=(
+                    anchors if declaration_source == "metadata" else None
+                ),
+            ),
+            preserve_compaction_index=True,
+        )
+        registry = ToolRegistry()
+        create_session_search_tool(storage, registry=registry)
+        registered = registry.get("session_search")
+        assert registered is not None
+
+        output = await registered.handler(
+            session_id=node.session_id,
+            anchor="0:entry_000",
+        )
+
+        payload = json.loads(output)
+        assert payload["anchor_resolution"] == "declared_unavailable"
+        assert payload["results"] == []
+        assert "archived source is unavailable" in payload["note"]
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_session_search_reports_unknown_for_undeclared_anchor(tmp_path) -> None:
+    storage = await _setup_storage(tmp_path)
+    try:
+        session_key = "agent:main:webchat:anchor-unknown"
+        node = _node(session_key, "sid-anchor-unknown")
+        await storage.upsert_session(node)
+        await storage.save_summary(
+            SessionSummary(
+                session_id=node.session_id,
+                session_key=session_key,
+                compaction_index=0,
+                summary_text="Decision [anchor:0:entry_000]",
+                extracted_anchors=[
+                    {"compaction_index": 0, "entry_anchor_id": "entry_000"}
+                ],
+            ),
+            preserve_compaction_index=True,
+        )
+        registry = ToolRegistry()
+        create_session_search_tool(storage, registry=registry)
+        registered = registry.get("session_search")
+        assert registered is not None
+
+        output = await registered.handler(
+            session_id=node.session_id,
+            anchor="0:entry_999",
+        )
+
+        payload = json.loads(output)
+        assert payload["anchor_resolution"] == "unknown"
+        assert payload["results"] == []
+        assert "not declared by the current session" in payload["note"]
     finally:
         await storage.close()
 
@@ -521,6 +638,59 @@ async def test_compaction_with_anchor_enabled(monkeypatch) -> None:
     assert len(calls) >= 1
     assert "[entry_000 |" in calls[0]["chunk_text"]
     assert calls[0]["compaction_index"] == 0
+
+
+@pytest.mark.asyncio
+async def test_fallback_compaction_keeps_exact_recovery_anchors(monkeypatch) -> None:
+    """LLM failure must not sever the summary-to-archive recovery path."""
+
+    async def failed_llm(**_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "opensquilla.session.compaction.call_compaction_llm", failed_llm
+    )
+    entries = [
+        {"role": "user", "content": f"message {i} " + "x" * 400, "token_count": 100}
+        for i in range(20)
+    ]
+
+    result = await compact_context(
+        CompactionRequest(
+            session_id="s1",
+            entries=entries,
+            context_window_tokens=500,
+            config=CompactionConfig(
+                api_key="sk-test",
+                model="test-model",
+                anchor_enabled=True,
+            ),
+            compaction_index=3,
+        )
+    )
+
+    assert result.summary_source == "fallback"
+    assert result.extracted_anchors
+    assert "older messages omitted" in result.summary
+    assert "[anchor:3:" in result.summary
+
+
+def test_fallback_preview_obeys_token_budget_and_keeps_recovery_hint() -> None:
+    entries = [
+        {"role": "user", "content": f"message {index} " + "x" * 500}
+        for index in range(100)
+    ]
+
+    summary = _summarize_chunk_fallback(
+        entries,
+        "off",
+        compaction_index=7,
+        max_tokens=200,
+    )
+
+    assert _estimate_tokens(summary) <= 220
+    assert "older messages omitted" in summary
+    assert "[anchor:7:" in summary
 
 
 @pytest.mark.asyncio

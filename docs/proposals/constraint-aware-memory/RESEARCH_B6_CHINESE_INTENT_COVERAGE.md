@@ -64,7 +64,7 @@
 | 方法 | 代表 | 中文效果 | 延迟 | 依赖 | 可控性 | 适用场景 |
 |------|------|---------|------|------|--------|---------|
 | **正则关键词**（当前） | 本方案 | 受限于词表覆盖 | <1ms | 零 | 高（确定性） | 精确匹配、高优先级意图 |
-| **TF-IDF + 分类器** | Rasa DIET (pre-BERT) | 中等 | ~10ms | jieba + sklearn | 中 | 有标注数据 |
+| **TF-IDF + 分类器** | 轻量文本分类 | 中等 | ~10ms | jieba + sklearn | 中 | 有标注数据 |
 | **BERT 微调** | bert-base-chinese + softmax | 优秀 | ~50ms | torch + 模型 | 低（黑箱） | 大量标注数据 + GPU |
 | **Cross-lingual embedding** | multilingual-E5 / BGE-M3 | 优秀 | ~30ms | sentence-transformers | 中 | 零样本跨语言 |
 | **LLM zero-shot** | GPT/Claude prompt | 优秀 | ~500ms | API | 低（成本高） | 快速原型、低 QPS |
@@ -107,49 +107,9 @@
 
 ---
 
-## 3. 开源项目多语言策略
+## 3. 方案评估
 
-### 3.1 Agent Memory 项目
-
-| 项目 | 多语言意图分类 | 中文策略 | 可借鉴点 |
-|------|-------------|---------|---------|
-| **Mem0** | ❌ 无意图分类 | 纯语义向量检索，依赖 embedding 多语言能力 | 无显式 intent |
-| **Letta** | ❌ 无意图分类 | Agent 自主决策，靠 LLM 黑箱 | 无 |
-| **Cognee** | ❌ 无意图分类 | LLM 提取实体（LLM 自身多语言） | 无 |
-| **Zep** | ❌ 无意图分类 | 1024D 语义嵌入，不显式做 intent | 无 |
-| **Rasa** | ✅ DIET + BERT | jieba 分词 → BERT → intent+entity 联合 | pipeline 可配置 |
-
-**核心发现**：没有任何开源 agent memory 项目显式做 query intent classification 的中文适配——它们要么不分类（Mem0/Cognee/Zep），要么靠 LLM 黑箱（Letta）。我们的正则方案是业界唯一的轻量级显式 intent router。
-
-### 3.2 中文 NLU 开源项目
-
-| 项目 | 方法 | 语言 | 许可证 | 借鉴 |
-|------|------|------|--------|------|
-| `taishan1994/pytorch_bert_intent_classification` | BERT 微调 | 中文 | MIT | 中文 intent 分类参考架构 |
-| `lhr0909/rasa-v2-nlu-bert-chinese` | Rasa + BERT Chinese | 中文 | MIT | Rasa pipeline 中文配置 |
-| CLUE Benchmark | 多模型评估 | 中文 | 各项目 | 中文 NLU 评估数据集 |
-| Rasa DIET | 关键词 + 模型混合 | 多语言 | Apache 2.0 | 双层 fallback 设计 |
-
-### 3.3 Rasa 的混合策略（最接近我们）
-
-Rasa 的中文意图识别 pipeline：
-```
-JiebaTokenizer → RegexFeaturizer → LexicalSyntacticFeaturizer → DIETClassifier
-                                                                    ↓
-                                                        KeywordIntentClassifier (fallback)
-```
-
-**借鉴**：
-- ✅ 关键词 + 模型混合的双层设计
-- ✅ `JiebaTokenizer` 的分词预处理（我们已有 `_needs_jieba_segmentation` 和 `_segment_for_fts`）
-- ✅ RegexFeaturizer 作为特征输入（不是唯一判据）
-- ✅ 置信度阈值 + fallback 链
-
----
-
-## 4. 方案评估
-
-### 4.1 方案 A：扩展正则词表（最小改动）
+### 3.1 方案 A：扩展正则词表（最小改动）
 
 **思路**：补充缺失的中文关键词变体到现有正则
 
@@ -167,7 +127,7 @@ JiebaTokenizer → RegexFeaturizer → LexicalSyntacticFeaturizer → DIETClassi
 
 **适合**：v0.7 阶段快速改进，作为 baseline
 
-### 4.2 方案 B：正则快路径 + embedding 慢路径（分层）
+### 3.2 方案 B：正则快路径 + embedding 慢路径（分层）
 
 **思路**：
 ```
@@ -197,7 +157,7 @@ embedding 相似度匹配（~30ms）──→ 返回 intent
 
 **适合**：v0.8+ 如果零依赖约束放松
 
-### 4.3 方案 C：正则 + LLM zero-shot fallback
+### 3.3 方案 C：正则 + LLM zero-shot fallback
 
 **思路**：
 ```
@@ -222,7 +182,7 @@ LLM zero-shot prompt ──→ 返回 intent
 
 **适合**：如果查询 QPS 低且 LLM 延迟可接受
 
-### 4.4 方案 D：混合方案（A + C 组合，推荐评估）
+### 3.4 方案 D：混合方案（A + C 组合，推荐评估）
 
 **思路**：
 ```
@@ -247,9 +207,9 @@ query
 
 ---
 
-## 5. 建议路径
+## 4. 建议路径
 
-### 5.1 短期（v0.7 — 本次 PR 后）
+### 4.1 短期（v0.7 — 本次 PR 后）
 
 **执行方案 A（扩展正则词表）**：
 
@@ -261,7 +221,7 @@ query
 
 **预估改动量**：~60 行代码 + ~80 行测试。
 
-### 5.2 中期（v0.8 — 后续迭代）
+### 4.2 中期（v0.8 — 后续迭代）
 
 **评估方案 D（混合方案）**：
 
@@ -270,7 +230,7 @@ query
 3. 如果 QPS 低（< 10/s），LLM fallback 成本可忽略
 4. 实现时复用 A1 的 `LlmCallFn` 注入模式
 
-### 5.3 长期（v0.9+ — 如果需要）
+### 4.3 长期（v0.9+ — 如果需要）
 
 **评估方案 B（embedding 分层）**：
 
@@ -281,9 +241,9 @@ query
 
 ---
 
-## 6. 附录：中文关键词扩展草案
+## 5. 附录：中文关键词扩展草案
 
-### 6.1 avoid_failure 补充
+### 5.1 avoid_failure 补充
 
 当前：`问题|错误|失败|崩溃|故障|异常|报错`
 
@@ -294,7 +254,7 @@ query
 - `排查`、`调试`、`排错`、`修复`
 - `warning`（中文场景常用英文）
 
-### 6.2 continue_task 补充
+### 5.2 continue_task 补充
 
 当前：`继续|接着|上次|接下来|下一步|接着做`
 
@@ -304,7 +264,7 @@ query
 - `接着上次的`、`从上次停的地方`、`接着来`
 - `回到刚才`、`继续弄`、`继续刚才`
 
-### 6.3 retrieve_rationale 补充
+### 5.3 retrieve_rationale 补充
 
 当前：`为什么|原因|怎么回事|为何|理由`
 
@@ -314,7 +274,7 @@ query
 - `为啥`、`怎么会`、`什么道理`、`依据`
 - `什么意思`、`什么情况`、`怎么解释`
 
-### 6.4 transfer_knowledge 补充
+### 5.4 transfer_knowledge 补充
 
 当前：`类似|有没有经验|以前|之前做过|同样`
 
@@ -324,7 +284,7 @@ query
 - `上次也是`、`以前也遇到过`、`有没有先例`
 - `同类`、`相仿`、`类似的方案`
 
-### 6.5 否定检测设计
+### 5.5 否定检测设计
 
 ```python
 _NEGATION_PREFIX_RE = re.compile(
@@ -339,9 +299,9 @@ def _has_negation_before(text: str, match_start: int) -> bool:
 
 ---
 
-## 7. 评估方法（后续）
+## 6. 评估方法（后续）
 
-### 7.1 评估数据集
+### 6.1 评估数据集
 
 建议从真实查询中构建：
 ```jsonl
@@ -352,7 +312,7 @@ def _has_negation_before(text: str, match_start: int) -> bool:
 {"query": "没有问题", "intent": "general"}
 ```
 
-### 7.2 评估指标
+### 6.2 评估指标
 
 | 指标 | 说明 |
 |------|------|
@@ -361,7 +321,7 @@ def _has_negation_before(text: str, match_start: int) -> bool:
 | 精确率 (Precision) | 每个 intent 预测正确的比例 |
 | 误报率 | 非目标 intent 被错误分类的比例（否定表达） |
 
-### 7.3 影子模式
+### 6.3 影子模式
 
 - 新分类器并行运行，记录但不影响结果
 - 对比旧版本和新版本的指标差异
@@ -369,7 +329,7 @@ def _has_negation_before(text: str, match_start: int) -> bool:
 
 ---
 
-## 8. 待确认设计决策
+## 7. 待确认设计决策
 
 | # | 问题 | KunYu 决定 |
 |---|------|-----------|
@@ -382,15 +342,13 @@ def _has_negation_before(text: str, match_start: int) -> bool:
 
 ---
 
-## 9. 参考资源
+## 8. 参考资源
 
 | 资源 | 链接 | 说明 |
 |------|------|------|
 | Multilingual E5 论文 | arxiv.org/abs/2402.05672 | 多语言 embedding SOTA，MIT |
 | BGE-M3 | huggingface.co/BAAI/bge-m3 | 多语言 + 多粒度 embedding，MIT |
-| Rasa NLU | rasa.com | 开源对话 NLU，关键词 + DIET 混合 |
 | CLUE Benchmark | cluebenchmarks.com | 中文 NLU 基准 |
-| Mem0 论文 | arxiv.org/abs/2504.19413 | 无启发式门控，全 LLM 驱动 |
 | MTEB Benchmark | huggingface.co/mteb | 多语言 embedding 评估 |
 | ACM Multilingual Intent | dl.acm.org/doi/10.1145/3688400 | LLM 多语言意图发现 |
 | bert-base-chinese | huggingface.co/google-bert/bert-base-chinese | 中文 BERT 基座 |

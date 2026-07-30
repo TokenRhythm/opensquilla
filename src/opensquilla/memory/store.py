@@ -223,6 +223,9 @@ class LongTermMemoryStore:
         # A1-3: LLM call for tiered escalation classification in index_file.
         # None → falls back to heuristic-only (classify_constraint_sync).
         self._constraint_llm_call = constraint_llm_call
+        self._constraint_classification_cache: dict[
+            str, tuple[ConstraintType, float | None]
+        ] = {}
         self._embedding_usage: dict[str, Any] = _zero_embedding_usage(self._provider)
 
     async def initialize(self) -> None:
@@ -929,21 +932,46 @@ class LongTermMemoryStore:
         # must not hold the DB lock). Mirrors the embeddings pattern above.
         constraint_results: list[tuple[ConstraintType, float | None]] | None = None
         if self._constraint_annotation_enabled:
-            constraint_results = []
             file_override = parse_frontmatter_constraint(content)
-            for _cid, _p, _src, _sl, _el, _h, _mdl, txt, _ts in chunk_records:
-                ct: ConstraintType
-                conf: float | None
-                if file_override is not None:
-                    ct, conf = file_override, 1.0
-                else:
-                    try:
-                        ct, conf = await classify_constraint(
-                            txt, llm_call=self._constraint_llm_call
-                        )
-                    except Exception:
-                        ct, conf = classify_constraint_sync(txt)
-                constraint_results.append((ct, conf))
+            if file_override is not None:
+                constraint_results = [
+                    (file_override, 1.0) for _record in chunk_records
+                ]
+            else:
+                classification_slots = asyncio.Semaphore(4)
+
+                async def _classify_record(
+                    record: tuple[Any, ...],
+                ) -> tuple[ConstraintType, float | None]:
+                    text_hash = str(record[5])
+                    text = str(record[7])
+                    cached = self._constraint_classification_cache.get(text_hash)
+                    if cached is not None:
+                        return cached
+                    async with classification_slots:
+                        try:
+                            result = await classify_constraint(
+                                text,
+                                llm_call=self._constraint_llm_call,
+                            )
+                        except Exception:
+                            result = classify_constraint_sync(text)
+                    if len(self._constraint_classification_cache) >= 4096:
+                        oldest = next(iter(self._constraint_classification_cache))
+                        self._constraint_classification_cache.pop(oldest, None)
+                    self._constraint_classification_cache[text_hash] = result
+                    return result
+
+                unique_records: dict[str, tuple[Any, ...]] = {}
+                for record in chunk_records:
+                    unique_records.setdefault(str(record[5]), record)
+                unique_results = await asyncio.gather(
+                    *(_classify_record(record) for record in unique_records.values())
+                )
+                classified_by_hash = dict(zip(unique_records, unique_results, strict=True))
+                constraint_results = [
+                    classified_by_hash[str(record[5])] for record in chunk_records
+                ]
 
         # Wrap all SQLite mutations in an explicit transaction so a crash mid-operation
         # leaves the DB in a consistent state (either fully updated or fully rolled back).
