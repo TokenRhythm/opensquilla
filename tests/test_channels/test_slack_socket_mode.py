@@ -54,6 +54,18 @@ def test_transport_name_follows_connection_mode() -> None:
     assert _mk(connection_mode="socket").transport_name == "websocket"
 
 
+async def test_webhook_mode_requires_signing_secret_before_authentication() -> None:
+    ch = _mk(connection_mode="webhook")
+    fake = _FakeClient()
+    ch._get_client = lambda: fake  # type: ignore[method-assign]
+
+    with pytest.raises(SlackAuthError, match="requires signing_secret"):
+        await ch.start()
+
+    assert fake.calls == []
+    assert ch.is_connected() is False
+
+
 async def test_socket_mode_requires_app_token() -> None:
     ch = _mk(connection_mode="socket")  # no app_token
     ch._get_client = lambda: _FakeClient()  # type: ignore[method-assign]

@@ -73,7 +73,17 @@ function fulfillPng(route: Route) {
   return route.fulfill({ status: 200, contentType: 'image/png', body: PNG_1x1 })
 }
 
-async function openSeeded(page: Page, artifacts?: object[]) {
+async function openSeeded(
+  page: Page,
+  artifacts?: object[],
+  options: { workbenchEnabled?: boolean } = {},
+) {
+  await page.addInitScript(({ workbenchEnabled }) => {
+    window.OPENSQUILLA_FEATURES = {
+      ...(window.OPENSQUILLA_FEATURES || {}),
+      artifactWorkbench: workbenchEnabled,
+    }
+  }, { workbenchEnabled: options.workbenchEnabled !== false })
   await seedHistory(page, artifacts)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
   await page.waitForSelector('.conn-pill', { timeout: 10000 })
@@ -159,6 +169,16 @@ test.describe('Artifact preview performance and slow-network states', () => {
     await expect(dialog.getByRole('button', { name: /Download/ })).toBeVisible()
     // The lightbox shows the full image, never navigating away.
     await expect(dialog.locator('.deliv-preview__image')).toBeVisible({ timeout: 10000 })
+    await expect(page.getByTestId('workbench-host')).toHaveCount(0)
+
+    // Focus enters the dialog and wraps in both directions.
+    const close = dialog.getByRole('button', { name: /Close preview/ })
+    const download = dialog.getByRole('button', { name: /Download/ })
+    await expect(close).toBeFocused()
+    await page.keyboard.press('Shift+Tab')
+    await expect(download).toBeFocused()
+    await page.keyboard.press('Tab')
+    await expect(close).toBeFocused()
 
     // Escape closes the lightbox and returns focus to the invoking image.
     await page.keyboard.press('Escape')
@@ -216,8 +236,9 @@ test.describe('Artifact preview performance and slow-network states', () => {
     expect(before).not.toBeNull()
 
     const srcBefore = await image.getAttribute('src')
-    await dialog.getByRole('button', { name: 'Next image' }).click()
+    await page.keyboard.press('ArrowRight')
     await expect(image).toBeVisible({ timeout: 10000 })
+    await expect(dialog.locator('.deliv-preview__title')).toHaveText('large.svg')
     // The full image is served as a fresh blob URL, so a changed src proves
     // the second image actually rendered before we measure.
     await expect.poll(() => image.getAttribute('src'), { timeout: 10000 }).not.toBe(srcBefore)
@@ -226,6 +247,20 @@ test.describe('Artifact preview performance and slow-network states', () => {
     expect(after).not.toBeNull()
     expect(Math.round(after!.width)).toBe(Math.round(before!.width))
     expect(Math.round(after!.height)).toBe(Math.round(before!.height))
+
+    await page.keyboard.press('ArrowLeft')
+    await expect(dialog.locator('.deliv-preview__title')).toHaveText('small.svg')
+  })
+
+  test('the legacy Workbench kill switch still keeps image preview in the Lightbox', async ({ page }) => {
+    await page.route('**/api/v1/artifacts/**', route => fulfillPng(route))
+    await openSeeded(page, undefined, { workbenchEnabled: false })
+
+    await expect(page.locator('.msg-media-card__img img')).toBeVisible({ timeout: 10000 })
+    await page.locator('.msg-media-card__img').click()
+
+    await expect(page.locator('.deliv-preview[role="dialog"]')).toBeVisible()
+    await expect(page.getByTestId('workbench-host')).toHaveCount(0)
   })
 
   test('the caption Download control works regardless of preview state', async ({ page }) => {

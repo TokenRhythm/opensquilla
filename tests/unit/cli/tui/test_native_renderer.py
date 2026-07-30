@@ -36,6 +36,56 @@ async def test_native_renderer_writes_answer_text_to_terminal_output() -> None:
 
 
 @pytest.mark.asyncio
+async def test_native_conflicting_final_snapshot_prints_unambiguous_correction_after_tools() -> (
+    None
+):
+    output = _RecordingOutputHandle()
+    renderer = NativeStreamRenderer(output_handle=output)
+
+    await renderer.aappend_text("stale preview")
+    await renderer.atool_start("lookup", tool_use_id="t1")
+    await renderer.atool_finished("t1", success=True)
+    await renderer.areconcile_final_text("canonical answer")
+    await renderer.afinalize(None)
+
+    rendered = "".join(output.writes)
+    assert renderer.buffer == "canonical answer"
+    assert "earlier streamed preview was superseded" in rendered
+    assert "canonical answer" in rendered
+    assert rendered.index("lookup") < rendered.index("canonical answer")
+    # Plain-terminal scrollback cannot safely erase the preview, so the visible
+    # correction—not a silent buffer mutation—is the terminal contract.
+    assert rendered.index("stale preview") < rendered.index("superseded")
+
+
+@pytest.mark.asyncio
+async def test_native_explicit_empty_snapshot_visibly_withdraws_streamed_preview() -> None:
+    output = _RecordingOutputHandle()
+    renderer = NativeStreamRenderer(output_handle=output)
+
+    await renderer.aappend_text("preview to withdraw")
+    await renderer.areconcile_final_text("")
+    await renderer.afinalize(None)
+
+    rendered = "".join(output.writes)
+    assert renderer.buffer == ""
+    assert "preview to withdraw" in rendered
+    assert "Streamed preview withdrawn; the final answer is empty." in rendered
+
+
+@pytest.mark.asyncio
+async def test_native_strict_snapshot_extension_prints_only_the_missing_suffix() -> None:
+    output = _RecordingOutputHandle()
+    renderer = NativeStreamRenderer(output_handle=output)
+
+    await renderer.aappend_text("prefix")
+    await renderer.areconcile_final_text("prefix suffix")
+
+    assert renderer.buffer == "prefix suffix"
+    assert output.writes == ["prefix", " suffix"]
+
+
+@pytest.mark.asyncio
 async def test_native_tool_start_separates_from_midline_answer_text() -> None:
     # A common "I'll check…" + tool-call sequence: aappend_text streams prose with
     # no trailing newline, so atool_start must break to a fresh line or the glyph

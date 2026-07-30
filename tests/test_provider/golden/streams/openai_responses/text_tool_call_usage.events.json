@@ -33,10 +33,12 @@
     "model": "gpt-test-1",
     "model_usage_breakdown": [],
     "output_tokens": 11,
+    "provider": "openai_responses",
     "reasoning_content": null,
     "reasoning_tokens": 2,
     "stop_reason": "tool_use",
     "thinking_signature": null,
-    "type": "DoneEvent"
+    "type": "DoneEvent",
+    "usage_missing_count": 0
   }
 ]

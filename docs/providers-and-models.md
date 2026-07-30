@@ -108,6 +108,117 @@ base URL (`https://api.openai.com/v1`):
 Both read the same key and base URL, so switching between them needs only a
 `provider` change.
 
+### Qwen Token Plan: OpenAI and Anthropic protocols
+
+Token Plan is separate from regular DashScope and Bailian Coding Plan. Use its
+dedicated `sk-sp-...` key; a standard Model Studio key cannot consume Token
+Plan Credits.
+
+OpenSquilla exposes the mainland China service through two verified provider
+ids:
+
+- `qwen_token_plan` — OpenAI-compatible Chat Completions at
+  `https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`.
+- `qwen_token_plan_anthropic` — Anthropic Messages at
+  `https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic`
+  (+ `/v1/messages`), using bearer authentication.
+
+Both read `QWEN_TOKEN_PLAN_API_KEY` and default to
+`qwen3.8-max-preview`:
+
+```sh
+export QWEN_TOKEN_PLAN_API_KEY="sk-sp-..."
+opensquilla configure provider \
+  --provider qwen_token_plan \
+  --model qwen3.8-max-preview \
+  --api-key-env QWEN_TOKEN_PLAN_API_KEY
+```
+
+The packaged model catalog is the documented team-plan superset. Personal
+plans can use `qwen3.8-max-preview`, `qwen3.7-max`, `qwen3.7-plus`,
+`qwen3.6-flash`, `glm-5.2`, and `deepseek-v4-pro`; team plans additionally
+include `qwen3.6-plus`, DeepSeek V4 Flash / V3.2, Kimi K2.7 / K2.6 / K2.5,
+GLM 5.1 / 5, and MiniMax M2.5. Entitlement is enforced by the service.
+Settings and onboarding query the verified OpenAI-compatible `/models`
+endpoint so suggestions reflect the current key's entitlement. The Anthropic
+profile deliberately uses that same account catalog instead of presenting the
+packaged superset as a live result.
+
+The OpenAI-compatible adapter applies the model-family wire contracts required
+by this mixed catalog: forced thinking and the 0.6 temperature floor for
+Qwen 3.8, DeepSeek V4 effort and reasoning replay, Kimi tool-call reasoning
+replay, GLM `tool_stream`, and thinking-mode tool-choice normalization. The
+Anthropic adapter preserves signed thinking blocks and clamps Qwen 3.8's
+temperature floor. The included inline SquillaRouter preset uses Qwen 3.6
+Flash → Qwen 3.7 Plus → Qwen 3.7 Max → Qwen 3.8 Max Preview, with Qwen 3.7
+Plus as the image route.
+
+Token Plan also exposes native image generation through OpenSquilla's
+`image_generate` tool. This is separate from the router's image route: the
+router image model understands image *inputs*, while Wan creates new image
+artifacts. Configure either `wan2.7-image` or `wan2.7-image-pro`:
+
+```toml
+[image_generation]
+enabled = true
+primary = "qwen_token_plan/wan2.7-image"
+size = "768x768"
+
+[image_generation.providers.qwen_token_plan]
+api_key_env = "QWEN_TOKEN_PLAN_API_KEY"
+base_url = "https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1"
+```
+
+The native adapter uses the documented multimodal-generation request shape,
+converts OpenSquilla's `WIDTHxHEIGHT` size to the service's `WIDTH*HEIGHT`
+form, and securely downloads the temporary signed result URL. When Token Plan
+is also the active LLM provider, the image provider can reuse its credential
+because both official endpoints have the same HTTPS origin; it does not reuse
+the incompatible chat API path.
+
+Token Plan is licensed for supported interactive AI programming and agent
+tools. It is not a replacement credential for unattended application
+backends or generic batch API workloads; follow the current plan terms for
+your subscription.
+
+### Custom OpenAI- and Anthropic-compatible endpoints
+
+Use `custom` for an OpenAI Chat Completions endpoint and
+`custom_anthropic` for an Anthropic Messages endpoint. Both require an
+explicit model and base URL; API keys are optional:
+
+```toml
+[llm]
+provider = "custom_anthropic"
+model = "vendor-model"
+base_url = "https://llm.example.com/anthropic"
+api_key_env = "CUSTOM_ANTHROPIC_API_KEY"
+```
+
+`custom_anthropic` appends `/v1/messages` and sends a bearer token.
+`custom` appends `/chat/completions` to versioned base URLs and reads
+`CUSTOM_LLM_API_KEY`.
+
+Unknown custom models keep the conservative 8k context default for upgrade
+compatibility. Declare the endpoint's real window under
+`[models.custom."<model>"]` or
+`[models.custom_anthropic."<model>"]`; this is important for both remote
+gateways and local servers with larger windows.
+
+The current custom-provider boundary is intentionally explicit:
+
+- protocol selection is available through the two fixed provider ids;
+- provider-scoped model overrides, base URL, proxy, and optional bearer key
+  are supported;
+- arbitrary user-named provider ids and arbitrary request headers are not yet
+  part of the persisted provider contract;
+- custom Anthropic auth is currently optional bearer only (`x-api-key` and
+  custom auth modes are not configurable), and custom protocol choices do not
+  yet include OpenAI Responses or native Gemini;
+- endpoint-wide `extra_body` / request-transform configuration is not exposed;
+- reasoning dialects are never inferred from an untrusted custom host—set
+  provider-scoped model metadata only when the endpoint contract is known.
+
 ### Volcengine Ark: regular vs coding-plan endpoints
 
 Use `volcengine` for regular Ark chat/completions models. Its default base URL

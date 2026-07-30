@@ -25,26 +25,63 @@
     <div class="msg-user-stack">
       <div v-if="message.attachments?.length" class="msg-attachments">
         <template v-for="attachment in message.attachments" :key="attachment.renderKey">
-          <img
+          <button
             v-if="isImageDisplayAttachment(attachment) && (attachment.dataUrl || attachment.data)"
-            class="msg-thumb"
-            :src="attachmentImageSrc(attachment)"
-            :alt="attachment.name"
-          />
-          <span v-else class="msg-file-chip" :title="attachment.name">
+            type="button"
+            class="msg-thumb-button"
+            :title="attachmentDownloadLabel(attachment)"
+            :aria-label="attachmentDownloadLabel(attachment)"
+            :aria-busy="downloadingAttachments.has(attachment.renderKey)"
+            :disabled="downloadingAttachments.has(attachment.renderKey)"
+            @click.stop="downloadAttachment(attachment)"
+          >
+            <img
+              class="msg-thumb"
+              :src="attachmentImageSrc(attachment)"
+              :alt="attachment.name"
+            />
+            <span v-if="downloadingAttachments.has(attachment.renderKey)" class="msg-thumb-button__busy" aria-hidden="true">
+              <span class="spinner msg-file-chip__spinner" />
+            </span>
+          </button>
+          <button
+            v-else
+            type="button"
+            class="msg-file-chip"
+            :class="{ 'msg-file-chip--failed': failedDownloads.has(attachment.renderKey) }"
+            :title="attachmentDownloadLabel(attachment)"
+            :aria-label="attachmentDownloadLabel(attachment)"
+            :aria-busy="downloadingAttachments.has(attachment.renderKey)"
+            :disabled="downloadingAttachments.has(attachment.renderKey)"
+            @click.stop="downloadAttachment(attachment)"
+          >
             <span class="msg-file-chip__icon" aria-hidden="true">
-              <Icon name="fileText" :size="16" />
+              <span v-if="downloadingAttachments.has(attachment.renderKey)" class="spinner msg-file-chip__spinner" />
+              <Icon v-else-if="failedDownloads.has(attachment.renderKey)" name="refresh" :size="16" />
+              <Icon v-else name="fileText" :size="16" />
             </span>
             <span class="msg-file-chip__body">
               <span class="msg-file-chip__name">{{ attachment.name }}</span>
               <span class="msg-file-chip__meta">{{ attachmentMeta(attachment) }}</span>
             </span>
-          </span>
+          </button>
         </template>
       </div>
       <div v-if="message.text" class="msg-user-bubble">
         {{ stripTimePrefix(message.text) }}
       </div>
+      <span
+        v-if="steerStatusLabel"
+        class="msg-user-steer-status"
+        :class="`msg-user-steer-status--${message.inputDisposition}`"
+        role="status"
+      >
+        {{ steerStatusLabel }}
+      </span>
+      <TurnOutcomeStatus
+        v-if="showTurnOutcome && message.turnOutcome"
+        :outcome="message.turnOutcome"
+      />
     </div>
     <div v-if="!shareMode" class="msg-user-actions">
       <button
@@ -62,17 +99,18 @@
       </button>
       <time v-if="timeIso" class="msg-time" :datetime="timeIso" :title="timeFull">
         <span class="msg-time__abs">{{ timeAbs }}</span>
-        <span class="msg-time__dot" aria-hidden="true">·</span>
-        <span class="msg-time__rel">{{ timeRel }}</span>
+        <span v-if="timeRel" class="msg-time__dot" aria-hidden="true">·</span>
+        <span v-if="timeRel" class="msg-time__rel">{{ timeRel }}</span>
       </time>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import TurnOutcomeStatus from '@/components/chat/TurnOutcomeStatus.vue'
 import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
 import { useRelativeNow } from '@/composables/useRelativeNow'
 import type { ChatRenderedMessage, DisplayAttachment } from '@/types/chat'
@@ -88,6 +126,8 @@ const props = defineProps<{
   shareMessageId: string
   stripTimePrefix: (text: string) => string
   copyMessage: (message: ChatRenderedMessage) => Promise<boolean>
+  downloadAttachment: (attachment: DisplayAttachment) => Promise<boolean>
+  showTurnOutcome?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -106,6 +146,52 @@ const timeIso = computed(() => isoTime(props.message.ts))
 const timeAbs = computed(() => absoluteTime(props.message.ts))
 const timeRel = computed(() => relativeTime(props.message.ts, now.value))
 const timeFull = computed(() => fullTime(props.message.ts))
+const STEER_WAIT_DETAIL_DELAY_MS = 700
+const showSteerWaitDetail = ref(false)
+let steerWaitDetailTimer: ReturnType<typeof setTimeout> | undefined
+
+function syncSteerWaitDetail(disposition: ChatRenderedMessage['inputDisposition']) {
+  if (steerWaitDetailTimer !== undefined) {
+    clearTimeout(steerWaitDetailTimer)
+    steerWaitDetailTimer = undefined
+  }
+  showSteerWaitDetail.value = false
+  if (disposition !== 'steering') return
+  steerWaitDetailTimer = setTimeout(() => {
+    steerWaitDetailTimer = undefined
+    if (props.message.inputDisposition === 'steering') {
+      showSteerWaitDetail.value = true
+    }
+  }, STEER_WAIT_DETAIL_DELAY_MS)
+}
+
+watch(
+  () => props.message.inputDisposition,
+  disposition => syncSteerWaitDetail(disposition),
+  { immediate: true },
+)
+
+onBeforeUnmount(() => {
+  if (steerWaitDetailTimer !== undefined) clearTimeout(steerWaitDetailTimer)
+})
+
+const steerStatusLabel = computed(() => {
+  const disposition = props.message.inputDisposition
+  if (!disposition) return ''
+  if (disposition === 'steering') {
+    return showSteerWaitDetail.value
+      ? `${t('chat.steerMode')} · ${t('chat.steerStatus.waiting')}`
+      : t('chat.steerMode')
+  }
+  if (disposition === 'applied') return t('chat.steerMode')
+  return t({
+    promoted: 'chat.steerStatus.promoted',
+    cancelled: 'chat.steerStatus.notApplied',
+    rejected: 'chat.steerStatus.notApplied',
+  }[disposition])
+})
+const downloadingAttachments = reactive(new Set<string>())
+const failedDownloads = reactive(new Set<string>())
 
 function onMessageClick(event: MouseEvent) {
   if (!props.shareMode) return
@@ -115,6 +201,26 @@ function onMessageClick(event: MouseEvent) {
 
 function attachmentImageSrc(attachment: DisplayAttachment): string {
   return attachment.dataUrl || `data:${attachment.mime || 'image/png'};base64,${attachment.data || ''}`
+}
+
+function attachmentDownloadLabel(attachment: DisplayAttachment): string {
+  return failedDownloads.has(attachment.renderKey)
+    ? `${t('chat.retry')} ${attachment.name}`
+    : t('chat.downloadTitle', { title: attachment.name })
+}
+
+async function downloadAttachment(attachment: DisplayAttachment) {
+  const key = attachment.renderKey
+  if (downloadingAttachments.has(key)) return
+  downloadingAttachments.add(key)
+  failedDownloads.delete(key)
+  try {
+    if (!await props.downloadAttachment(attachment)) failedDownloads.add(key)
+  } catch {
+    failedDownloads.add(key)
+  } finally {
+    downloadingAttachments.delete(key)
+  }
 }
 
 function attachmentMeta(attachment: DisplayAttachment): string {
@@ -221,6 +327,16 @@ function attachmentMeta(attachment: DisplayAttachment): string {
   align-items: flex-end;
   gap: 0.375rem;
   min-width: 0;
+}
+
+.msg-user-steer-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 1.25rem;
+  padding-inline: 0.25rem;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  line-height: 1.3;
 }
 
 /* Arrival feedback stays local to the destination instead of washing the full
@@ -370,11 +486,41 @@ function attachmentMeta(attachment: DisplayAttachment): string {
 /* Bare media object: the 1px border keeps white-ish screenshots from
    dissolving into a light canvas. */
 .msg-thumb {
+  display: block;
   max-width: 200px;
   max-height: 200px;
   border: 1px solid var(--msg-obj-border);
   border-radius: var(--radius-card);
   object-fit: cover;
+}
+
+.msg-thumb-button {
+  position: relative;
+  appearance: none;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-card);
+  background: transparent;
+  cursor: pointer;
+}
+
+.msg-thumb-button:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.msg-thumb-button:disabled {
+  cursor: wait;
+}
+
+.msg-thumb-button__busy {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  border-radius: var(--radius-card);
+  background: color-mix(in srgb, var(--bg-surface) 72%, transparent);
+  color: var(--accent);
 }
 
 .msg-file-chip__icon {
@@ -390,6 +536,7 @@ function attachmentMeta(attachment: DisplayAttachment): string {
 }
 
 .msg-file-chip {
+  appearance: none;
   display: inline-flex;
   align-items: center;
   gap: 0.625rem;
@@ -399,8 +546,35 @@ function attachmentMeta(attachment: DisplayAttachment): string {
   border: 1px solid var(--msg-obj-border);
   border-radius: var(--radius-card);
   background: var(--bg-surface);
+  color: inherit;
+  font: inherit;
   font-size: 0.8125rem;
   text-align: left;
+  cursor: pointer;
+}
+
+.msg-file-chip:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-sm);
+}
+
+.msg-file-chip:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.msg-file-chip:disabled {
+  cursor: wait;
+  opacity: 0.72;
+}
+
+.msg-file-chip--failed {
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+}
+
+.msg-file-chip__spinner {
+  width: 1rem;
+  height: 1rem;
 }
 
 .msg-file-chip__body {

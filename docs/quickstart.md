@@ -8,7 +8,8 @@ UI, SquillaRouter, memory/search support, and safe local defaults.
 
 - Python 3.12 or newer for terminal installs.
 - `uv` for the recommended terminal install.
-- Git and Git LFS only when installing from source.
+- Git, Git LFS, Node.js 22.12+, and npm only when installing or developing
+  from source.
 - A provider API key unless you use a local provider such as Ollama.
 
 ## Recommended Install
@@ -16,7 +17,7 @@ UI, SquillaRouter, memory/search support, and safe local defaults.
 Install the current release wheel with the recommended extras:
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.0rc4/opensquilla-0.5.0rc4-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.2/opensquilla-0.5.2-py3-none-any.whl"
 ```
 
 The `recommended` extra includes SquillaRouter dependencies and memory/search
@@ -213,16 +214,31 @@ git lfs pull --include="src/opensquilla/squilla_router/models/**"
 bash scripts/install_source.sh
 ```
 
+The source installer runs `npm ci` and builds the Vue control console before
+installing Python. Official release wheels and Desktop installers already
+contain that console and do not require Node.js or npm.
+
 For development, use the repository virtual environment:
 
 ```sh
+cd opensquilla-webui
+npm ci
+npm run build
+cd ..
 uv sync --extra recommended --extra dev
 uv run opensquilla --help
 uv run opensquilla gateway run
 ```
 
 When developing from source, prefix commands with `uv run` so they use the
-checkout you are editing.
+checkout you are editing. Rebuild after changing Web UI sources. Standard
+wheel and sdist builds reject a missing or stale console; backend-only editable
+`uv sync` remains available without it.
+
+Direct `pip install .`, `uv tool install .`, and VCS URL installs are low-level
+source-build paths. A local checkout must have a verified Web UI artifact first,
+while a VCS URL checkout has none; use the source installer or an official
+release wheel instead.
 
 ---
 

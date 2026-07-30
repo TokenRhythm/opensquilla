@@ -44,6 +44,19 @@ class _ReasoningProvider:
         return []
 
 
+class _EmptyThenReasoningProvider(_ReasoningProvider):
+    async def _stream(self) -> AsyncIterator[Any]:
+        yield ProviderReasoning(text="")
+        yield ProviderReasoning(text="first")
+        yield ProviderReasoning(text=" second")
+        yield ProviderDone(
+            stop_reason="stop",
+            input_tokens=2,
+            output_tokens=2,
+            reasoning_content="first second",
+        )
+
+
 def test_agent_reemits_reasoning_as_thinking_event() -> None:
     import asyncio
 
@@ -55,6 +68,8 @@ def test_agent_reemits_reasoning_as_thinking_event() -> None:
 
     thinking = [e for e in events if isinstance(e, ThinkingEvent)]
     assert [t.text for t in thinking] == ["Let me ", "think."]
+    assert thinking[0].started_at > 0
+    assert thinking[1].started_at == thinking[0].started_at
 
     # reasoning must NOT be folded into the assistant answer text
     answer = "".join(
@@ -62,6 +77,28 @@ def test_agent_reemits_reasoning_as_thinking_event() -> None:
     )
     assert answer == "The answer."
     assert "think" not in answer
+
+
+def test_reasoning_timer_starts_on_first_nonempty_delta() -> None:
+    import asyncio
+
+    async def run() -> list[Any]:
+        agent = Agent(provider=_EmptyThenReasoningProvider(), config=AgentConfig(max_iterations=1))
+        return [event async for event in agent.run_turn("hi")]
+
+    thinking = [
+        event
+        for event in asyncio.run(run())
+        if isinstance(event, ThinkingEvent)
+    ]
+
+    assert [event.started_at for event in thinking[:1]] == [0]
+    assert thinking[1].started_at > 0
+    assert thinking[2].started_at == thinking[1].started_at
+
+
+def test_thinking_event_keeps_legacy_default_start_time() -> None:
+    assert ThinkingEvent(text="legacy").started_at == 0
 
 
 from opensquilla.engine import ToolResult  # noqa: E402

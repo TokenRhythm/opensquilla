@@ -1,14 +1,18 @@
-"""Boot-time advisory for importable legacy OpenSquilla homes.
+"""Boot-time advisory hint for importable legacy OpenSquilla homes.
 
-``_warn_legacy_home_detected`` must warn exactly once on the fresh-home +
+``_warn_legacy_home_detected`` must log exactly once on the fresh-home +
 candidate combination and stay silent (without even running detection) on an
-established home. Structured warnings are captured by monkeypatching the boot
-module's ``log.warning``, the same technique as the workspace/state mismatch
-test in ``test_router_boot.py``.
+established home. Migration itself stays settings- and CLI-only: the hint is
+the single log line pointing headless operators at ``opensquilla migrate
+opensquilla`` and Settings → Advanced → Data maintenance. Structured warnings
+are captured by monkeypatching the boot module's ``log.warning``, the same
+technique as the workspace/state mismatch test in ``test_router_boot.py``.
 """
 
 from __future__ import annotations
 
+import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +40,7 @@ def _config(tmp_path: Path) -> GatewayConfig:
     )
 
 
-def test_fresh_home_with_candidate_warns_once(
+def test_fresh_home_with_candidate_logs_hint_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -54,12 +58,12 @@ def test_fresh_home_with_candidate_warns_once(
     _warn_legacy_home_detected(_config(tmp_path))
 
     assert len(warnings) == 1
-    assert warnings[0] == {
-        "event": "build_services.legacy_home_detected",
-        "legacy_home": str(legacy),
-        "kind": "cli-home",
-        "migrate_command": legacy_detect.suggested_migrate_command(candidate),
-    }
+    assert warnings[0]["event"] == "build_services.legacy_home_detected"
+    assert warnings[0]["legacy_home"] == str(legacy)
+    assert warnings[0]["kind"] == "cli-home"
+    # The hint must name both import surfaces without executing either.
+    assert "opensquilla migrate opensquilla" in warnings[0]["detail"]
+    assert "Data maintenance" in warnings[0]["detail"]
     # Detection ran once, against the home the gateway actually booted from.
     assert seen_targets == [(tmp_path / "home").resolve()]
 
@@ -83,6 +87,45 @@ def test_established_home_is_silent_and_skips_detection(
 
     assert warnings == []
     assert calls == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length path contract")
+def test_extended_length_established_home_skips_legacy_detection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.persistence.migrator import _native_sqlite_path
+
+    warnings = _capture_warnings(monkeypatch)
+    long_root = tmp_path / "long-home"
+    state_dir = long_root
+    index = 0
+    while len(str(state_dir / "sessions.db")) < 280:
+        state_dir /= f"state-segment-{index:02d}-0123456789"
+        index += 1
+    native_state = _native_sqlite_path(state_dir)
+    os.makedirs(native_state)
+    with open(_native_sqlite_path(state_dir / "sessions.db"), "wb") as handle:
+        handle.write(b"")
+    calls: list[Path | None] = []
+    monkeypatch.setattr(
+        legacy_detect,
+        "detect_legacy_home",
+        lambda target=None: calls.append(target),
+    )
+    config = GatewayConfig(
+        state_dir=str(state_dir),
+        config_path=str(tmp_path / "home" / "config.toml"),
+    )
+    try:
+        _warn_legacy_home_detected(config)
+
+        assert warnings == []
+        assert calls == []
+    finally:
+        native_root = _native_sqlite_path(long_root)
+        if os.path.exists(native_root):
+            shutil.rmtree(native_root)
 
 
 def test_fresh_home_without_candidate_is_silent(

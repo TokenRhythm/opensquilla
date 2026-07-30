@@ -242,7 +242,7 @@ class TranscriptAppendPort(Protocol):
         reasoning_content: str | None,
         turn_usage: dict[str, Any] | None,
         token_count: int | None,
-    ) -> bool: ...
+    ) -> TranscriptAppendResult | bool: ...
 
 @runtime_checkable
 class TurnMemoryCapturePort(Protocol):
@@ -272,6 +272,7 @@ def _turn_usage_payload(
     done_event: Any | None,
     *,
     resolved_model: str | None,
+    persisted_text: str | None = None,
 ) -> dict[str, Any] | None:
     if done_event is None:
         return None
@@ -285,6 +286,9 @@ def _turn_usage_payload(
         "cost_usd": float(done_event.cost_usd or 0.0),
         "billed_cost": float(done_event.billed_cost or 0.0),
         "cost_source": done_event.cost_source or "none",
+        "missing_cost_entries": int(
+            getattr(done_event, "missing_cost_entries", 0) or 0
+        ),
         "model": model,
         "routed_model": done_event.routed_model or "",
         "routed_tier": done_event.routed_tier or None,
@@ -305,8 +309,15 @@ def _turn_usage_payload(
         # feedback (router.feedback.submit) to this exact routing decision.
         # None when no decision was staged (router off / bypass / no writer).
         "decision_id": getattr(done_event, "decision_id", None),
+        "route_plan": getattr(done_event, "route_plan", None),
+        "execution_legs": list(getattr(done_event, "execution_legs", []) or []),
+        "model_call_segments": _model_call_segments_for_persisted_text(
+            done_event,
+            persisted_text=persisted_text,
+        ),
     }
     optional_fields = {
+        "provider": getattr(done_event, "provider", None),
         "image_route_reason": getattr(done_event, "image_route_reason", None),
         "vision_followup_gate_decision": getattr(
             done_event,
@@ -356,6 +367,107 @@ def _turn_usage_payload(
         payload["ensemble_trace"] = dict(ensemble_trace)
     return payload
 
+
+def _model_call_segments_for_persisted_text(
+    done_event: Any,
+    *,
+    persisted_text: str | None,
+) -> list[dict[str, Any]]:
+    """Rebase model-call codepoint ranges after persistence-only formatting."""
+
+    raw_segments = [
+        dict(segment)
+        for segment in (getattr(done_event, "model_call_segments", []) or [])
+        if isinstance(segment, dict)
+    ]
+    if not raw_segments:
+        return []
+
+    original_text = str(
+        getattr(done_event, "text_snapshot", None)
+        if getattr(done_event, "text_snapshot", None) is not None
+        else getattr(done_event, "text", "")
+    )
+    target_text = original_text if persisted_text is None else persisted_text
+    original_length = len(original_text)
+
+    normalized: list[dict[str, Any]] = []
+    seen_call_ids: set[str] = set()
+    previous_end: int | None = None
+    for segment in raw_segments:
+        call_id = str(segment.get("model_call_id") or "").strip()
+        raw_iteration = segment.get("iteration")
+        raw_start = segment.get("start_codepoint")
+        raw_end = segment.get("end_codepoint")
+        if raw_iteration is None or raw_start is None or raw_end is None:
+            return []
+        try:
+            iteration = int(raw_iteration)
+            start = int(raw_start)
+            end = int(raw_end)
+        except (TypeError, ValueError):
+            return []
+        if (
+            not call_id
+            or call_id in seen_call_ids
+            or iteration < 1
+            or start < 0
+            or end < start
+            or end > original_length
+            or (previous_end is not None and start != previous_end)
+        ):
+            return []
+        seen_call_ids.add(call_id)
+        previous_end = end
+        normalized.append(
+            {
+                "model_call_id": call_id,
+                "iteration": iteration,
+                "start_codepoint": start,
+                "end_codepoint": end,
+            }
+        )
+    if normalized[-1]["end_codepoint"] != original_length:
+        return []
+    if target_text == original_text:
+        return normalized
+
+    def _rebase_boundary(boundary: int) -> int | None:
+        original_index = 0
+        target_index = 0
+        while original_index < boundary:
+            expected = original_text[original_index]
+            while target_index < len(target_text) and target_text[target_index] != expected:
+                target_index += 1
+            if target_index >= len(target_text):
+                return None
+            original_index += 1
+            target_index += 1
+        return target_index
+
+    # Persistence may add paragraph separators or a terminal notice, but it
+    # must not delete/rewrite the model text for these ranges to stay causal.
+    if _rebase_boundary(original_length) is None:
+        return []
+    rebased_starts: list[int] = []
+    for segment in normalized:
+        rebased_start = _rebase_boundary(int(segment["start_codepoint"]))
+        if rebased_start is None:
+            return []
+        rebased_starts.append(rebased_start)
+    return [
+        {
+            **segment,
+            "start_codepoint": rebased_starts[index],
+            "end_codepoint": (
+                rebased_starts[index + 1]
+                if index + 1 < len(rebased_starts)
+                else len(target_text)
+            ),
+        }
+        for index, segment in enumerate(normalized)
+    ]
+
 @runtime_checkable
 class SessionTotalsPort(Protocol):
     """Roll up session token + cost + cache totals from a DoneEvent.
@@ -399,9 +511,29 @@ class TurnErrorPersistPort(Protocol):
         event: ErrorEvent | None,
     ) -> None: ...
 
+
+@runtime_checkable
+class UsageTelemetryPort(Protocol):
+    """Best-effort local aggregation for a completed top-level turn."""
+
+    async def record_turn(self, *, run_kind: str, done_event: DoneEvent | None) -> None: ...
+
+
+class _NullUsageTelemetryPort:
+    async def record_turn(self, *, run_kind: str, done_event: DoneEvent | None) -> None:
+        return None
+
 # ---------------------------------------------------------------------------
-# Cost-rollup result -- exposed for equivalence-harness pinning
+# Finalizer result values
 # ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TranscriptAppendResult:
+    """Assistant transcript persistence result from the concrete adapter."""
+
+    appended: bool
+    message_id: str | None = None
+
 
 @dataclass(frozen=True)
 class CostRollupResult:
@@ -494,8 +626,41 @@ class TurnFinalizerStageOutput:
     cost_rollup: CostRollupResult | None
     # Did the assistant turn actually persist?
     transcript_appended: bool
+    # Exact assistant row and payload persisted for this turn. The gateway
+    # stores these on channel tasks so delivery never has to infer ownership
+    # from whichever assistant row happens to be newest.
+    assistant_message_id: str | None
+    assistant_message_content: str | None
     # Did the memory capture fire?
     memory_captured: bool
+
+
+def _readable_tool_boundary_text(
+    final_text: str,
+    turn_segments: list[dict],
+) -> str:
+    """Preserve paragraph boundaries between separate assistant narrations."""
+
+    text_segments = [
+        str(segment.get("text") or "")
+        for segment in turn_segments
+        if isinstance(segment, dict)
+        and segment.get("type") == "text"
+        and str(segment.get("text") or "")
+    ]
+    if len(text_segments) < 2:
+        return final_text
+    compact = "".join(text_segments)
+    if not final_text.startswith(compact):
+        return final_text
+    readable = text_segments[0]
+    for segment in text_segments[1:]:
+        if readable[-1:].isspace() or segment[:1].isspace():
+            readable += segment
+        else:
+            readable += f"\n\n{segment}"
+    return readable + final_text[len(compact) :]
+
 
 # ---------------------------------------------------------------------------
 # Outer stage class
@@ -541,11 +706,13 @@ class TurnFinalizerStage:
         turn_memory_capture: TurnMemoryCapturePort,
         session_totals: SessionTotalsPort,
         turn_error_persist: TurnErrorPersistPort,
+        usage_telemetry: UsageTelemetryPort | None = None,
     ) -> None:
         self._transcript_append = transcript_append
         self._turn_memory_capture = turn_memory_capture
         self._session_totals = session_totals
         self._turn_error_persist = turn_error_persist
+        self._usage_telemetry = usage_telemetry or _NullUsageTelemetryPort()
 
     async def run(
         self,
@@ -561,7 +728,10 @@ class TurnFinalizerStage:
         from opensquilla.engine.turn_runner.outcome import StageOutcome
 
         # 1. Heartbeat-normalize.
-        final_text = "".join(inp.final_text_parts)
+        final_text = _readable_tool_boundary_text(
+            "".join(inp.final_text_parts),
+            inp.turn_segments,
+        )
         original_final_text = final_text
         final_text = _normalize_heartbeat_text(
             final_text,
@@ -569,7 +739,15 @@ class TurnFinalizerStage:
             heartbeat_ack_max_chars=inp.heartbeat_ack_max_chars,
         )
         turn_segments = inp.turn_segments
-        if (
+        if inp.run_kind == "heartbeat" and original_final_text != final_text:
+            turn_segments = [
+                segment
+                for segment in turn_segments
+                if not (isinstance(segment, dict) and segment.get("type") == "text")
+            ]
+            if final_text:
+                turn_segments.append({"type": "text", "text": final_text})
+        elif (
             original_final_text
             and not final_text
             and turn_segments
@@ -583,6 +761,8 @@ class TurnFinalizerStage:
         final_text = _with_unconfirmed_action_notice(final_text, turn_segments)
 
         transcript_appended = False
+        assistant_message_id: str | None = None
+        assistant_message_content: str | None = None
         memory_captured = False
 
         # 2. Transcript append + 3. memory capture (paired -- memory
@@ -605,10 +785,19 @@ class TurnFinalizerStage:
                 )
             ):
                 reasoning_content = inp.done_event.reasoning_content
-            token_count = (
-                inp.done_event.output_tokens if inp.done_event is not None else None
-            )
-            transcript_appended = await self._transcript_append.append_message(
+            token_count = None
+            if inp.done_event is not None:
+                message_output_tokens = getattr(
+                    inp.done_event,
+                    "message_output_tokens",
+                    None,
+                )
+                token_count = (
+                    message_output_tokens
+                    if message_output_tokens is not None
+                    else inp.done_event.output_tokens
+                )
+            append_result = await self._transcript_append.append_message(
                 inp.session_key,
                 role="assistant",
                 content=persisted_content,
@@ -617,9 +806,19 @@ class TurnFinalizerStage:
                 turn_usage=_turn_usage_payload(
                     inp.done_event,
                     resolved_model=inp.resolved_model,
+                    persisted_text=final_text,
                 ),
                 token_count=token_count,
             )
+            if isinstance(append_result, TranscriptAppendResult):
+                transcript_appended = append_result.appended
+                assistant_message_id = append_result.message_id
+            else:
+                # Backward compatibility for third-party/direct stage adapters
+                # that implement the original boolean port contract.
+                transcript_appended = bool(append_result)
+            if transcript_appended:
+                assistant_message_content = persisted_content
             if transcript_appended:
                 try:
                     await self._turn_memory_capture.capture_turn(
@@ -669,6 +868,16 @@ class TurnFinalizerStage:
                     error=str(exc),
                 )
 
+        # 6. Aggregate telemetry governed by the unified privacy switch. The
+        # port stores counters only; failures must never alter the turn result.
+        try:
+            await self._usage_telemetry.record_turn(
+                run_kind=inp.run_kind,
+                done_event=inp.done_event,
+            )
+        except Exception as exc:  # noqa: BLE001 - log-and-continue intentional
+            log.warning("turn_runner.usage_telemetry_persist_failed", error=str(exc))
+
         return StageOutcome.success(
             TurnFinalizerStageOutput(
                 final_text=final_text,
@@ -679,6 +888,8 @@ class TurnFinalizerStage:
                 done_event=inp.done_event,
                 cost_rollup=cost_rollup,
                 transcript_appended=transcript_appended,
+                assistant_message_id=assistant_message_id,
+                assistant_message_content=assistant_message_content,
                 memory_captured=memory_captured,
             )
         )

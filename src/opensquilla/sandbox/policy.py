@@ -14,10 +14,13 @@ layer can call them without side effects.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 from opensquilla.sandbox.config import SandboxSettings
+from opensquilla.sandbox.permissions import FileSystemPermissionProfile
+from opensquilla.sandbox.platform_permissions import current_platform_context
 from opensquilla.sandbox.types import (
     SANDBOX_WORKSPACE_PATH,
     MountSpec,
@@ -193,6 +196,15 @@ def _collect_mounts(
     mounts from settings come after so their precedence is unambiguous.
     """
     mounts: list[MountSpec] = []
+    if sys.platform.startswith("linux") and settings.host_root_readonly:
+        mounts.append(
+            MountSpec(
+                host_path=Path("/"),
+                sandbox_path=Path("/"),
+                mode="ro",
+                required=True,
+            )
+        )
     workspace_rw = level != SecurityLevel.LOCKED
     mounts.append(
         MountSpec(
@@ -227,6 +239,32 @@ def _describe(level: SecurityLevel, action_kind: str) -> str:
     return f"{level.label} policy for action {action_kind!r}"
 
 
+def _configured_denied_read_roots(
+    workspace: Path,
+    settings: SandboxSettings,
+) -> tuple[Path, ...]:
+    roots: list[Path] = []
+    for raw in settings.denied_read_roots:
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = workspace / path
+        roots.append(path.absolute())
+    return tuple(roots)
+
+
+def _configured_denied_read_globs(
+    workspace: Path,
+    settings: SandboxSettings,
+) -> tuple[str, ...]:
+    patterns: list[str] = []
+    for raw in settings.denied_read_globs:
+        pattern = Path(raw).expanduser()
+        if not pattern.is_absolute():
+            pattern = workspace / pattern
+        patterns.append(pattern.as_posix())
+    return tuple(patterns)
+
+
 def build_policy(
     level: SecurityLevel,
     action_kind: str,
@@ -253,13 +291,50 @@ def build_policy(
         raise ValueError(f"workspace must be an absolute path, got {workspace!r}")
 
     mounts, workspace_rw = _collect_mounts(level, workspace, settings, session_mounts)
+    declared_writable_roots = tuple(mount.host_path for mount in mounts if mount.mode == "rw")
+    platform_context = current_platform_context(
+        cwd=workspace,
+        writable_roots=declared_writable_roots,
+    )
     limits = _resolve_limits(level, settings)
     network = _resolve_network(level, action_kind, settings, hints)
     tmp_writable = level != SecurityLevel.LOCKED
+    denied_read_roots = _configured_denied_read_roots(workspace, settings)
+    denied_read_globs = _configured_denied_read_globs(workspace, settings)
 
     require_approval = level >= SecurityLevel.STRICT and (
         level == SecurityLevel.LOCKED or not trusted
     )
+
+    if level == SecurityLevel.DISABLED:
+        file_system = FileSystemPermissionProfile.full_access()
+    elif workspace_rw:
+        readable_roots = tuple(mount.host_path for mount in mounts if mount.mode == "ro")
+        writable_roots = tuple(
+            mount.host_path
+            for mount in mounts
+            if mount.mode == "rw" and mount.host_path != workspace
+        )
+        file_system = FileSystemPermissionProfile.workspace(
+            workspace=workspace,
+            readable_roots=readable_roots,
+            writable_roots=writable_roots,
+            denied_read_roots=denied_read_roots,
+            denied_read_globs=denied_read_globs,
+            host_root_readonly=settings.host_root_readonly,
+            tmp_writable=tmp_writable and not settings.exclude_slash_tmp,
+            tmpdir_env_writable=(tmp_writable and not settings.exclude_tmpdir_env_var),
+            platform_context=platform_context,
+        )
+    else:
+        readonly_mount_roots = [mount.host_path for mount in mounts]
+        file_system = FileSystemPermissionProfile.read_only(
+            readable_roots=readonly_mount_roots,
+            denied_read_roots=denied_read_roots,
+            denied_read_globs=denied_read_globs,
+            host_root_readonly=settings.host_root_readonly,
+            platform_context=platform_context,
+        )
 
     return SandboxPolicy(
         level=level,
@@ -271,6 +346,7 @@ def build_policy(
         env_allowlist=_DEFAULT_ENV_ALLOWLIST,
         require_approval=require_approval,
         description=_describe(level, action_kind),
+        file_system=file_system,
     )
 
 

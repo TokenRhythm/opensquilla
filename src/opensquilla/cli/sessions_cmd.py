@@ -13,6 +13,7 @@ import typer
 from rich.table import Table
 
 from opensquilla.cli.chat.session_state import messages_to_markdown
+from opensquilla.cli.gateway_client import session_history_all
 from opensquilla.cli.gateway_rpc import run_gateway_sync
 from opensquilla.cli.output import print_json
 from opensquilla.cli.ui import ACCENT, ACCENT_HEADER, console, error_panel
@@ -296,7 +297,7 @@ def sessions_export(
         resolved = await client.resolve_session(session_id)
         key = _resolved_key(resolved, session_id)
         preview = await client.preview_sessions(keys=[key])
-        history = await client.session_history(key, limit=1000)
+        history = await session_history_all(client.session_history, key)
         return {"resolved": resolved, "preview": preview, "history": history}
 
     result: dict[str, Any] | None = asyncio.run(_with_client(_run))

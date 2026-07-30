@@ -34,7 +34,7 @@ from opensquilla.router_control import router_control_payload_terminates_turn
 from opensquilla.safety.secret_redaction import redact_secret_value
 from opensquilla.tool_boundary import ToolCall, ToolResult
 from opensquilla.tools.envelope import build_tool_failure_envelope, is_denial_payload
-from opensquilla.tools.types import InteractionMode, ToolContext
+from opensquilla.tools.types import CallerKind, InteractionMode, ToolContext
 
 log = structlog.get_logger("opensquilla.tools.dispatch")
 
@@ -45,8 +45,44 @@ _PENDING_APPROVAL_STATUSES: frozenset[str] = frozenset(
 
 _DISPATCH_TRUNCATION_RETRIEVE_HINT = (
     "This tool result was truncated before entering model context. "
-    "Use retrieve_tool_result with tool_result_handle to inspect the original raw output."
+    "Use retrieve_tool_result with handle=<tool_result_handle> to inspect the original raw output."
 )
+
+
+def _registered_terminates_turn(registered: Any) -> bool:
+    return bool(getattr(getattr(registered, "spec", None), "terminates_turn", False))
+
+
+def _plan_checkpoint_terminates_turn(tool_name: str, content: Any) -> bool:
+    """A blocked checkpoint is a hard execution boundary."""
+
+    if tool_name != "plan_run_checkpoint":
+        return False
+    try:
+        payload = json.loads(content) if isinstance(content, str) else content
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    run = payload.get("plan_run")
+    return isinstance(run, dict) and run.get("status") == "blocked"
+
+
+def _user_input_terminates_turn(tool_name: str, content: Any) -> bool:
+    """Fallback surfaces without a deferred broker stop at the request."""
+
+    if tool_name != "request_user_input":
+        return False
+    try:
+        payload = json.loads(content) if isinstance(content, str) else content
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("status") == "input_required"
+        and payload.get("kind") == "user_input"
+        and payload.get("paused") is True
+    )
 
 
 def _store_dispatch_truncated_snapshot(
@@ -148,7 +184,32 @@ def _denial_reason(content: Any) -> str:
     return "denied"
 
 def _has_live_approval_surface(ctx: ToolContext | None) -> bool:
-    return ctx is None or ctx.interaction_mode is InteractionMode.INTERACTIVE
+    return (
+        ctx is None
+        or ctx.interaction_mode is InteractionMode.INTERACTIVE
+        # Channel turns are unattended from the process perspective, but the
+        # channel approval notifier delivers a card/text decision back to the
+        # originating sender. Treat that as an approval-capable surface.
+        or ctx.caller_kind is CallerKind.CHANNEL
+    )
+
+
+def _uses_automatic_review(payload: dict[str, Any]) -> bool:
+    approval_id = payload.get("approval_id")
+    if not isinstance(approval_id, str) or not approval_id:
+        return False
+    try:
+        from opensquilla.gateway.approval_queue import get_approval_queue
+
+        entry = get_approval_queue().get(approval_id)
+    except (KeyError, RuntimeError):
+        return False
+    return bool(
+        entry.namespace == "exec"
+        and entry.params.get("reviewer") == "auto_review"
+        and entry.params.get("humanActionable") is False
+    )
+
 
 async def finalize(
     call: ToolCall,
@@ -198,6 +259,7 @@ async def finalize(
                 content=json.dumps(payload),
                 is_error=False,
                 execution_status=normalize_execution_status(status),
+                terminates_turn=False,
             )
 
         envelope = redact_secret_value(
@@ -233,6 +295,7 @@ async def finalize(
             content=json.dumps(envelope),
             is_error=True,
             execution_status=normalize_execution_status(status),
+            terminates_turn=False,
         )
 
     result = redact_secret_value(raw_result)
@@ -240,7 +303,7 @@ async def finalize(
     # ---------------- Approval-on-unsupported-surface branch ----------------
     if not _has_live_approval_surface(ctx):
         pending = _extract_pending_approval(result)
-        if pending is not None:
+        if pending is not None and not _uses_automatic_review(pending):
             surface = ctx.caller_kind.value if ctx else "unknown"
             log.warning(
                 "dispatch.approval_required_unsupported_surface",
@@ -279,6 +342,7 @@ async def finalize(
                 content=json.dumps(envelope),
                 is_error=False,
                 execution_status=normalize_execution_status(status),
+                terminates_turn=False,
             )
 
     # ---------------- Standard branch (success or denial payload) ----------------
@@ -360,7 +424,12 @@ async def finalize(
         artifacts=artifacts,
         execution_status=execution_status,
         terminates_turn=(
-            call.tool_name == "router_control"
-            and router_control_payload_terminates_turn(content)
+            (_registered_terminates_turn(registered) and not is_error)
+            or _plan_checkpoint_terminates_turn(call.tool_name, content)
+            or _user_input_terminates_turn(call.tool_name, content)
+            or (
+                call.tool_name == "router_control"
+                and router_control_payload_terminates_turn(content)
+            )
         ),
     )

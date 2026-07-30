@@ -8,6 +8,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from opensquilla.search.registry import register_provider
+from opensquilla.search.retry_policy import is_retryable_http_status
 from opensquilla.search.types import SearchErrorKind, SearchProviderError, SearchResult
 
 _DDHTML_URL = "https://html.duckduckgo.com/html"
@@ -68,7 +69,7 @@ class DuckDuckGoProvider:
                 retryable = True
             elif isinstance(exc, httpx.HTTPStatusError):
                 kind = "http"
-                retryable = 500 <= exc.response.status_code < 600
+                retryable = is_retryable_http_status(exc.response.status_code)
             else:
                 kind = "network"
                 retryable = True
@@ -89,7 +90,7 @@ class DuckDuckGoProvider:
                 provider=self.name,
                 kind="blocked",
                 message="DuckDuckGo returned an anti-bot challenge.",
-                retryable=True,
+                retryable=False,
                 status_code=response.status_code,
             )
 
@@ -133,7 +134,7 @@ class DuckDuckGoProvider:
                 provider=self.name,
                 kind="parse",
                 message="DuckDuckGo search response did not contain parseable results.",
-                retryable=True,
+                retryable=False,
                 status_code=response.status_code,
             )
 

@@ -262,7 +262,7 @@ def make_runtime_e2e_context(
 ) -> dict[str, Any]:
     """Build the runner/judge context used by the creator runtime E2E gate."""
 
-    from opensquilla.engine.types import DoneEvent, TextDeltaEvent
+    from opensquilla.engine.types import DoneEvent, TextDeltaEvent, done_text_snapshot
     from opensquilla.execution_status import runtime_execution_status
     from opensquilla.skills.meta.inputs import make_meta_inputs
     from opensquilla.skills.meta.orchestrator import (
@@ -355,15 +355,16 @@ def make_runtime_e2e_context(
                 tool_context=tool_context,
             )
             parts: list[str] = []
+            done_text_present = False
             done_text = ""
             async for event in baseline_agent.run_turn(prompt):
                 if isinstance(event, TextDeltaEvent):
                     parts.append(event.text)
                 elif isinstance(event, DoneEvent):
-                    done_text = event.text
+                    done_text_present, done_text = done_text_snapshot(event)
             return {
                 "route": "baseline",
-                "text": (done_text or "".join(parts)).strip(),
+                "text": (done_text if done_text_present else "".join(parts)).strip(),
                 "model": selected_baseline_model,
             }
 

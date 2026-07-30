@@ -35,22 +35,23 @@
           </template>
           <template v-for="row in sortedRows" :key="rowKey(row.raw)">
             <tr>
-              <td data-label="Session">
+              <td :data-label="t('usageLogs.columns.session')">
                 <a
                   v-if="row.sessionKey"
                   href="#"
                   class="usage-sess-link"
-                  :title="t('usageLogs.sessions.openChat', { session: row.sessionKey })"
+                  :title="t('usageLogs.sessions.openChat', { task: row.sessionLabel })"
+                  :aria-label="t('usageLogs.sessions.openChat', { task: row.sessionLabel })"
                   @click.prevent="emit('openSession', row.sessionKey)"
-                >{{ row.sessionKey }}</a>
-                <span v-else>-</span>
+                >{{ row.sessionLabel }}</a>
+                <span v-else>{{ row.sessionLabel }}</span>
               </td>
               <td data-label="Modified" class="usage-mono usage-dim">{{ row.modified }}</td>
               <td data-label="Input" class="usage-mono">{{ row.inputTokens != null ? row.inputTokens.toLocaleString() : '-' }}</td>
               <td data-label="Output" class="usage-mono">{{ row.outputTokens != null ? row.outputTokens.toLocaleString() : '-' }}</td>
               <td data-label="Cache R" class="usage-mono usage-dim">{{ row.cacheReadTokens != null ? row.cacheReadTokens.toLocaleString() : '-' }}</td>
               <td data-label="Cache W" class="usage-mono usage-dim">{{ row.cacheWriteTokens != null ? row.cacheWriteTokens.toLocaleString() : '-' }}</td>
-              <td data-label="Cost" class="usage-mono usage-cost">{{ fmtCost(row.cost) }}</td>
+              <td data-label="Cost" class="usage-mono usage-cost">{{ fmtCost(row.cost, { source: row.raw }) }}</td>
               <td data-label="Source">
                 <span
                   class="usage-source"
@@ -62,7 +63,7 @@
                 <button
                   v-if="row.hasModelBreakdown"
                   class="usage-model-toggle"
-                  :class="{ open: expandedSessions.has(row.sessionKey || '') }"
+                  :class="{ open: expandedSessions.has(row.rowIdentity) }"
                   @click="emit('toggleModelExpand', row)"
                 >
                   <span>{{ modelDisplayLabel(row.raw) }}</span><span class="usage-model-caret">▾</span>
@@ -70,12 +71,13 @@
                 <span v-else class="usage-model-text">{{ modelDisplayLabel(row.raw) }}</span>
               </td>
             </tr>
-            <tr v-if="expandedSessions.has(row.sessionKey || '')" class="usage-expand-row">
+            <tr v-if="expandedSessions.has(row.rowIdentity)" class="usage-expand-row">
               <td class="usage-expand-cell" :colspan="tableColumns.length">
                 <UsageModelBreakdown
                   :rows="rowBreakdown(row.raw)"
                   :total-tokens="rowBreakdownTotalTokens(row.raw)"
                   :total-cost="rowBreakdownTotalCost(row.raw)"
+                  :native-source="row.raw"
                   :any-prorated="rowBreakdownAnyProrated(row.raw)"
                   :fmt-cost="fmtCost"
                   :cost-source-classes="costSourceClassesForBreakdown"
@@ -107,7 +109,10 @@ defineProps<{
   sortedRows: SortedRow[]
   sessionsMeta: string
   expandedSessions: Set<string>
-  fmtCost: (cost: number | null | undefined, opts?: { decimals?: number }) => string
+  fmtCost: (
+    cost: number | null | undefined,
+    opts?: { decimals?: number; source?: object },
+  ) => string
   costSourceLabel: (row: SessionRow) => string
   costSourceTooltip: (row: SessionRow) => string
   costSourceClasses: (row: SessionRow) => Record<string, boolean>

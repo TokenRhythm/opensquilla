@@ -9,8 +9,33 @@ from typing import Any
 
 import httpx
 
+from opensquilla.endpoint_identity import credential_env_for_endpoint
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.secrets import clean_header_secret
+
+_ELEVENLABS_DEFAULT_API_KEY_ENV = "ELEVENLABS_API_KEY"
+_ELEVENLABS_DEFAULT_BASE_URL = "https://api.elevenlabs.io"
+
+
+def resolve_elevenlabs_api_key_env(provider_config: object | None) -> str:
+    """Resolve the audio env source without moving its default across origins."""
+
+    fields_set = getattr(provider_config, "model_fields_set", None)
+    return credential_env_for_endpoint(
+        configured_env=str(
+            getattr(provider_config, "api_key_env", _ELEVENLABS_DEFAULT_API_KEY_ENV)
+            or ""
+        ),
+        configured_explicitly=(
+            isinstance(fields_set, set) and "api_key_env" in fields_set
+        ),
+        default_env=_ELEVENLABS_DEFAULT_API_KEY_ENV,
+        default_base_url=_ELEVENLABS_DEFAULT_BASE_URL,
+        effective_base_url=str(
+            getattr(provider_config, "base_url", _ELEVENLABS_DEFAULT_BASE_URL)
+            or _ELEVENLABS_DEFAULT_BASE_URL
+        ),
+    )
 
 
 def _normalize_base_url(base_url: str) -> str:

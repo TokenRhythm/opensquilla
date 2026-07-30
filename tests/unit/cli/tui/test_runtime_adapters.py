@@ -7,7 +7,10 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import subprocess
 import sys
+from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -18,6 +21,11 @@ from opensquilla.cli.chat.turn import TurnResult, UsageSummary
 from opensquilla.cli.tui.adapters import native_bridge, slash_standalone
 from opensquilla.cli.tui.backend.contracts import TuiOutputHandle
 from opensquilla.engine.commands import Surface
+from opensquilla.gateway.config import GatewayConfig
+from opensquilla.project_workspaces import project_path_key
+from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
+from opensquilla.session.manager import SessionManager
+from opensquilla.session.storage import SessionStorage
 
 
 class _FakeSessionManager:
@@ -26,9 +34,14 @@ class _FakeSessionManager:
 
 
 class _FakeServices:
-    def __init__(self) -> None:
-        self.config = None
-        self.session_manager = _FakeSessionManager()
+    def __init__(
+        self,
+        *,
+        config: Any = None,
+        session_manager: Any = None,
+    ) -> None:
+        self.config = config
+        self.session_manager = session_manager or _FakeSessionManager()
 
     async def close(self) -> None:
         return None
@@ -40,6 +53,42 @@ class _RecordingConsole:
 
     def print(self, *args: Any, **kwargs: Any) -> None:
         self.payloads.extend(args)
+
+
+def _retarget_directory_link(link: Path, target: Path, backup: Path) -> None:
+    link.rename(backup)
+    if os.name != "nt":
+        link.symlink_to(target, target_is_directory=True)
+        return
+    result = subprocess.run(
+        [
+            "cmd",
+            "/d",
+            "/s",
+            "/c",
+            "mklink",
+            "/J",
+            str(link),
+            str(target),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        backup.rename(link)
+        pytest.skip(f"could not create junction: {result.stderr or result.stdout}")
+
+
+def _restore_retargeted_directory(link: Path, backup: Path) -> None:
+    if not backup.exists():
+        return
+    if os.path.lexists(link):
+        if os.name == "nt":
+            os.rmdir(link)
+        else:
+            link.unlink()
+    backup.rename(link)
 
 
 def _standalone_deps(
@@ -231,6 +280,373 @@ async def test_standalone_dispatch_never_feeds_routed_model_back(
     assert models_seen == [None, None]
     # The routed model is still mirrored to display state for the HUD.
     assert captured["scope_model"] == "router/turn-pick"
+
+
+@pytest.mark.asyncio
+async def test_standalone_dispatch_uses_bound_project_workspace_over_tampered_origin(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.cli.tui import standalone_runtime
+
+    storage = await SessionStorage.open(str(tmp_path / "tui-project.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    project_path = tmp_path / "project"
+    outside = tmp_path / "outside"
+    project_path.mkdir()
+    outside.mkdir()
+    project = await storage.create_or_restore_project_workspace(
+        path=str(project_path.resolve()),
+        path_key=project_path_key(project_path, strict=True),
+        display_name="project",
+        trusted_at=1,
+    )
+    key = "agent:main:standalone:project"
+    await manager.create(
+        key,
+        workspace_id=project.workspace_id,
+        origin={
+            RUN_CONTEXT_ORIGIN_KEY: {
+                "run_mode": "standard",
+                "workspace": str(outside),
+            }
+        },
+    )
+    services = _FakeServices(
+        config=GatewayConfig(workspace_dir=str(tmp_path / "default")),
+        session_manager=manager,
+    )
+
+    async def fake_build_services() -> _FakeServices:
+        return services
+
+    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
+    monkeypatch.setattr(
+        "opensquilla.gateway.build_turn_runner_from_services",
+        lambda _services: object(),
+    )
+    captured_contexts: list[Any] = []
+
+    async def stream_response(
+        turn_runner: object,
+        session_key: str,
+        tool_ctx: object,
+        message: str,
+        model: str | None = None,
+        svc: object = None,
+        timeout: float | None = None,
+        **kwargs: Any,
+    ) -> TurnResult:
+        captured_contexts.append(tool_ctx)
+        return TurnResult(
+            text="reply",
+            usage=UsageSummary(input_tokens=1, output_tokens=1),
+            model_after=None,
+        )
+
+    async def run_repl(*, surface: Surface, scope: Any, dispatch: Any) -> None:
+        assert await dispatch("pwd") is True
+
+    deps = _standalone_deps(
+        stream_response=stream_response,
+        run_concurrent_repl=run_repl,
+        output_console=_RecordingConsole(),
+        error_panel_factory=lambda message: message,
+    )
+    try:
+        await standalone_runtime.run_standalone_chat(
+            model=None,
+            session_id=key,
+            deps=deps,
+        )
+    finally:
+        await storage.close()
+
+    assert captured_contexts[0].workspace_dir == project.path
+
+
+@pytest.mark.asyncio
+async def test_standalone_dispatch_refreshes_unbound_saved_context(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.cli.tui import standalone_runtime
+
+    storage = await SessionStorage.open(str(tmp_path / "tui-unbound.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    saved_workspace = tmp_path / "saved-workspace"
+    saved_workspace.mkdir()
+    key = "agent:main:standalone:unbound"
+    await manager.create(
+        key,
+        origin={
+            RUN_CONTEXT_ORIGIN_KEY: {
+                "run_mode": "standard",
+                "run_mode_source": "user",
+                "workspace": str(saved_workspace),
+                "domains": [
+                    {
+                        "domain": "saved.example",
+                        "scope": "chat",
+                        "source": "manual",
+                    }
+                ],
+            }
+        },
+    )
+    services = _FakeServices(
+        config=GatewayConfig(workspace_dir=str(tmp_path / "default")),
+        session_manager=manager,
+    )
+
+    async def fake_build_services() -> _FakeServices:
+        return services
+
+    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
+    monkeypatch.setattr(
+        "opensquilla.gateway.build_turn_runner_from_services",
+        lambda _services: object(),
+    )
+    captured_contexts: list[Any] = []
+
+    async def stream_response(
+        turn_runner: object,
+        session_key: str,
+        tool_ctx: object,
+        message: str,
+        model: str | None = None,
+        svc: object = None,
+        timeout: float | None = None,
+        **kwargs: Any,
+    ) -> TurnResult:
+        captured_contexts.append(tool_ctx)
+        return TurnResult(
+            text="reply",
+            usage=UsageSummary(input_tokens=1, output_tokens=1),
+            model_after=None,
+        )
+
+    async def run_repl(*, surface: Surface, scope: Any, dispatch: Any) -> None:
+        assert await dispatch("pwd") is True
+
+    deps = _standalone_deps(
+        stream_response=stream_response,
+        run_concurrent_repl=run_repl,
+        output_console=_RecordingConsole(),
+        error_panel_factory=lambda message: message,
+    )
+    try:
+        await standalone_runtime.run_standalone_chat(
+            model=None,
+            session_id=key,
+            deps=deps,
+        )
+    finally:
+        await storage.close()
+
+    tool_context = captured_contexts[0]
+    assert tool_context.run_mode == "standard"
+    assert tool_context.workspace_dir == str(saved_workspace.resolve())
+    assert tool_context.sandbox_run_context.run_mode_source == "user"
+    assert [grant.domain for grant in tool_context.sandbox_run_context.domains] == [
+        "saved.example"
+    ]
+    assert getattr(tool_context, "_sandbox_run_context_fresh", False) is True
+
+
+@pytest.mark.asyncio
+async def test_standalone_dispatch_revalidates_project_on_every_input(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.cli.tui import standalone_runtime
+
+    storage = await SessionStorage.open(str(tmp_path / "tui-retarget.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    project_path = tmp_path / "project"
+    project_backup = tmp_path / "project-old"
+    replacement = tmp_path / "replacement"
+    project_path.mkdir()
+    replacement.mkdir()
+    project = await storage.create_or_restore_project_workspace(
+        path=str(project_path.resolve()),
+        path_key=project_path_key(project_path, strict=True),
+        display_name="project",
+        trusted_at=1,
+    )
+    key = "agent:main:standalone:retarget"
+    await manager.create(
+        key,
+        workspace_id=project.workspace_id,
+        origin={
+            RUN_CONTEXT_ORIGIN_KEY: {
+                "run_mode": "standard",
+                "workspace": project.path,
+            }
+        },
+    )
+    services = _FakeServices(
+        config=GatewayConfig(workspace_dir=str(tmp_path / "default")),
+        session_manager=manager,
+    )
+
+    async def fake_build_services() -> _FakeServices:
+        return services
+
+    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
+    monkeypatch.setattr(
+        "opensquilla.gateway.build_turn_runner_from_services",
+        lambda _services: object(),
+    )
+    calls: list[str] = []
+    output = _RecordingConsole()
+
+    async def stream_response(
+        turn_runner: object,
+        session_key: str,
+        tool_ctx: object,
+        message: str,
+        model: str | None = None,
+        svc: object = None,
+        timeout: float | None = None,
+        **kwargs: Any,
+    ) -> TurnResult:
+        calls.append(message)
+        return TurnResult(
+            text="unsafe",
+            usage=UsageSummary(input_tokens=1, output_tokens=1),
+            model_after=None,
+        )
+
+    async def run_repl(*, surface: Surface, scope: Any, dispatch: Any) -> None:
+        _retarget_directory_link(project_path, replacement, project_backup)
+        assert await dispatch("pwd") is True
+
+    deps = _standalone_deps(
+        stream_response=stream_response,
+        run_concurrent_repl=run_repl,
+        output_console=output,
+        error_panel_factory=lambda message: message,
+    )
+    try:
+        await standalone_runtime.run_standalone_chat(
+            model=None,
+            session_id=key,
+            deps=deps,
+        )
+    finally:
+        _restore_retargeted_directory(project_path, project_backup)
+        await storage.close()
+
+    assert calls == []
+    assert any("canonical_changed" in str(payload) for payload in output.payloads)
+
+
+@pytest.mark.asyncio
+async def test_standalone_revalidates_session_replaced_by_slash_command_before_execution(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.cli.tui import standalone_runtime
+
+    storage = await SessionStorage.open(str(tmp_path / "tui-replaced-session.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    project_path = tmp_path / "project"
+    project_backup = tmp_path / "project-old"
+    replacement = tmp_path / "replacement"
+    project_path.mkdir()
+    replacement.mkdir()
+    project = await storage.create_or_restore_project_workspace(
+        path=str(project_path.resolve()),
+        path_key=project_path_key(project_path, strict=True),
+        display_name="project",
+        trusted_at=1,
+    )
+    initial_key = "agent:main:standalone:before-new"
+    original_get_or_create = manager.get_or_create
+
+    async def bind_replacement_session(
+        session_key: str,
+        agent_id: str = "main",
+        **kwargs: Any,
+    ):
+        session, created = await original_get_or_create(
+            session_key,
+            agent_id=agent_id,
+            **kwargs,
+        )
+        if session_key != initial_key:
+            session = await manager.update(
+                session_key,
+                workspace_id=project.workspace_id,
+                origin={
+                    RUN_CONTEXT_ORIGIN_KEY: {
+                        "run_mode": "standard",
+                        "workspace": project.path,
+                    }
+                },
+            )
+        return session, created
+
+    manager.get_or_create = bind_replacement_session  # type: ignore[method-assign]
+    services = _FakeServices(
+        config=GatewayConfig(workspace_dir=str(tmp_path / "default")),
+        session_manager=manager,
+    )
+
+    async def fake_build_services() -> _FakeServices:
+        return services
+
+    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
+    monkeypatch.setattr(
+        "opensquilla.gateway.build_turn_runner_from_services",
+        lambda _services: object(),
+    )
+    calls: list[tuple[str, str]] = []
+    output = _RecordingConsole()
+
+    async def stream_response(
+        turn_runner: object,
+        session_key: str,
+        tool_ctx: object,
+        message: str,
+        **kwargs: Any,
+    ) -> TurnResult:
+        del turn_runner, tool_ctx, kwargs
+        calls.append((session_key, message))
+        return TurnResult(
+            text="unsafe",
+            usage=UsageSummary(input_tokens=1, output_tokens=1),
+            model_after=None,
+        )
+
+    async def run_repl(*, surface: Surface, scope: Any, dispatch: Any) -> None:
+        assert await dispatch("/new") is True
+        assert scope["session_key"] != initial_key
+        _retarget_directory_link(project_path, replacement, project_backup)
+        assert await dispatch("pwd") is True
+
+    deps = replace(
+        _standalone_deps(
+            stream_response=stream_response,
+            run_concurrent_repl=run_repl,
+            output_console=output,
+            error_panel_factory=lambda message: message,
+        ),
+        slash_services_factory=standalone_runtime.standalone_slash_services_from_runtime,
+    )
+    try:
+        await standalone_runtime.run_standalone_chat(
+            model=None,
+            session_id=initial_key,
+            deps=deps,
+        )
+    finally:
+        _restore_retargeted_directory(project_path, project_backup)
+        await storage.close()
+
+    assert calls == []
+    assert any("canonical_changed" in str(payload) for payload in output.payloads)
 
 
 @pytest.mark.asyncio

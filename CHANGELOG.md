@@ -6,6 +6,144 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-07-30
+
+### Added
+
+- Versioned same-turn steering now works consistently across the Web UI, CLI,
+  Gateway, and shared runtime for supported single-model and router turns.
+  Accepted input is idempotent and survives reconnects and eligible provider
+  fallback without rerouting the logical turn; older clients and gateways keep
+  their legacy or visible queue compatibility paths.
+
+### Fixed
+
+- Desktop and Gateway startup no longer wait on unnecessary recovery scans,
+  legacy-recovery maintenance, repeated ownership readiness windows, or
+  historical usage backfill.
+- Retained session history loads independently from interactive controls, so
+  navigation, controls, existing messages, and message sending remain usable
+  during hydration and recovery.
+- Recovery consolidation preserves historical usage for deduplicated sessions,
+  and usage backfill uses smaller transactions with bounded SQLite contention
+  handling.
+- Windows Desktop validates the Electron profile marker for sandbox setup, and
+  the macOS project picker supports folder creation, system-localized text, and
+  the intended initial directory.
+- Desktop HTML artifacts render when their native preview surface appears, and
+  preview mode switches no longer require an extra confirmation or overwrite
+  the saved default.
+- Custom compatible providers expose their Base URL fields again, the Usage
+  currency toggle applies consistently, and provider/usage presentation avoids
+  clipped or ambiguous actions.
+- Model Ensemble activity timing remains stable across generic channel
+  heartbeats, and the Desktop startup loader rotates in the expected direction.
+
+## [0.5.1] - 2026-07-29
+
+### Added
+
+- Durable Plan mode, project workspaces, native macOS project-folder creation,
+  desktop deep links, richer artifact workbench previews, and general pasted
+  file attachments.
+- Qwen Token Plan and custom Anthropic-compatible providers.
+- Recoverable Desktop profile import and bounded primary-profile
+  consolidation.
+- New agent tool `audio_config`: configures the audio (TTS) provider through
+  the same validated path as onboarding — atomic UTF-8 persistence with
+  backup, live hot-apply, and `restartRequired: false`. Agent-driven setup is
+  restricted to the registered ElevenLabs endpoint and credential environment
+  variable; advanced endpoint settings remain operator-managed. API keys are
+  stored but omitted from tool results and validation errors.
+
+### Fixed
+
+- Local-owner `bypass` again resolves to Full host execution consistently
+  across Web, CLI, TaskRuntime, and Cron. Full file, Shell, and Git operations
+  no longer initialize a sandbox worker or apply sandbox path checks.
+- Cron creation is atomically idempotent for identical tool requests, and
+  owner jobs preserve their host execution target.
+- Frozen macOS filesystem workers start through the packaged gateway's
+  dedicated worker entry point, while frozen Windows gateways resolve sandbox
+  setup paths correctly.
+- First-install provider and model routing state, long-session recovery,
+  reasoning timers, subagent usage accounting, and session deletion lifecycle
+  handling are more reliable.
+- Settings overlays cover the viewport, Skills navigation remains stable, and
+  project/chat activity, onboarding, assistant activity, and provider settings
+  are clearer.
+- The `gateway` tool no longer advertises capabilities it cannot deliver:
+  `restart` and `config_set` now report their actual availability, audio
+  settings point to `audio_config`, and `config_get` uses the canonical
+  public-config redactor instead of echoing credentials.
+- Shell commands that would terminate the gateway's own process
+  (`Stop-Process -Id <gateway pid>`, `taskkill /PID`, `kill`, and
+  name-targeted variants) are structurally refused in every host mode,
+  before any configurable policy layer; other processes stay manageable.
+- Config persistence explicitly routes non-UTF-8 (e.g. GBK-corrupted)
+  config files into the backup-then-rewrite recovery path, with regression
+  coverage for corrupt-file recovery, CJK round-trips, and mid-write
+  failures leaving the original bytes untouched.
+
+### Changed
+
+- The packaged Desktop gateway carries its CA trust bundle, channel
+  administration approvals are aligned, and coding/delivery guidance now
+  reflects actual runtime capability.
+- Desktop now consolidates data from legacy recovery profiles into the single
+  primary profile before startup. Existing primary settings remain
+  authoritative; when the primary profile has no settings, the newest legacy
+  recovery settings are adopted automatically. Desktop no longer creates or
+  asks users to confirm isolated recovery profiles.
+- Closing the Desktop main window now preserves the live Control UI on macOS
+  and keeps Windows reachable from a system tray icon. Explicit **Quit
+  OpenSquilla** still drains and stops the local Gateway, and the close behavior
+  can be changed in Runtime settings.
+
+## [0.5.0] - 2026-07-23
+
+OpenSquilla 0.5.0 is the first stable release of the 0.5 line, collecting the
+0.5.0rc1–rc4 preview work below plus the changes since Preview 4.
+
+### Added
+
+- Source checkouts can opt into the full-screen OpenTUI chat with shared
+  Gateway sessions, turn/tool/reasoning presentation, Router/Ensemble controls,
+  and guarded terminal restoration. Companion hosts remain development-only:
+  this change does not add release assets or alter the release installer.
+
+### Changed
+
+- Telegram edited messages no longer start a new agent turn. Previously,
+  editing an earlier message re-triggered the bot; edited updates are now
+  dropped deliberately so an edit is not double-billed as a new request. In
+  private chats the bot replies once per chat explaining that edits are
+  ignored and the corrected text should be sent as a new message.
+- `opensquilla chat` uses automatic renderer selection without treating stale
+  internal backend environment state as a user request. Release installs keep
+  the Python-native chat when no compatible host is installed.
+- Generated Vue control-console files are no longer tracked in Git. Release
+  wheels, Desktop installers, and container images still include the CI-built
+  console and require no Node.js at install time. Source installs and wheelhouse
+  builds now require Node.js 22.12+ with npm and build the console from the
+  locked frontend dependencies before packaging.
+- Optional profile migration is now available only from **Settings → Advanced
+  → Data maintenance**. Onboarding, the sidebar, Doctor, and native upgrade
+  prompts stay silent; gateway startup logs a single advisory line when a
+  fresh profile boots beside importable legacy data so headless operators can
+  find their previous home. Desktop can still preview and apply a guarded
+  whole-profile replacement, while Web administrators receive a path-free,
+  read-only preview.
+
+### Fixed
+
+- OpenSquilla profile transfers now leave machine-local `code-task` run
+  worktrees in the source and preserve lexically contained relative workspace
+  links on POSIX without dereferencing them. Existing-profile backup and
+  restore keeps canonical and historical workspace links as no-follow leaves;
+  source imports still fail closed on absolute or escaping workspace links and
+  Windows reparse points.
+
 ## [0.5.0rc4] - 2026-07-13
 
 ### Added

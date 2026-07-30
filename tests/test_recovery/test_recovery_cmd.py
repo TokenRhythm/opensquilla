@@ -48,6 +48,8 @@ def test_recovery_command_surface_is_registered_with_complete_offline_actions() 
         "recover-settings",
         "restore-profile",
         "recover-transaction",
+        "consolidate-profiles",
+        "acknowledge-profile-credential",
         "abandon-cleanup",
         "cleanup-inspect",
         "cleanup-apply",

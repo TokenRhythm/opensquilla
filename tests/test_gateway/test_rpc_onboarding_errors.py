@@ -84,3 +84,23 @@ def test_provider_configure_invalid_provider_yields_stable_code(tmp_path, monkey
     assert res.error.code == "onboarding.provider.invalid"
     # the granular code carries the original English detail, not a blank message
     assert res.error.message
+
+
+def test_channel_error_carries_structured_field_details():
+    from opensquilla.onboarding.mutations import ChannelValidationError
+
+    with pytest.raises(RpcHandlerError) as ei:
+        with _channel_error():
+            raise ChannelValidationError(
+                "invalid channel entry: name: Field required",
+                [{"field": "name", "message": "Field required"}],
+            )
+    assert ei.value.code == "onboarding.channel.invalid"
+    assert ei.value.details == {"fields": [{"field": "name", "message": "Field required"}]}
+
+
+def test_channel_error_plain_valueerror_has_no_details():
+    with pytest.raises(RpcHandlerError) as ei:
+        with _channel_error():
+            raise ValueError("unknown channel type")
+    assert ei.value.details is None

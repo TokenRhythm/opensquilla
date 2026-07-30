@@ -11,36 +11,13 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, Protocol
 
-from opensquilla.engine.commands import Surface
+from opensquilla.engine.commands import CommandPresentation, Surface
 from opensquilla.tools.builtin.filesystem import _is_sensitive_access_path
 
-from .messages import CompletionCandidate, CompletionContext
-
-SETTING_TOGGLES: tuple[CompletionCandidate, ...] = (
-    CompletionCandidate(
-        label="Model",
-        description="Switch or inspect the active model.",
-        insert_text="/model ",
-        category="setting",
-    ),
-    CompletionCandidate(
-        label="Permissions",
-        description="Show or change the session permission override.",
-        insert_text="/permissions ",
-        category="setting",
-    ),
-    CompletionCandidate(
-        label="Cost",
-        description="Show current session usage and cost.",
-        insert_text="/cost",
-        category="setting",
-    ),
-    CompletionCandidate(
-        label="Resume",
-        description="Resume an existing session.",
-        insert_text="/resume ",
-        category="setting",
-    ),
+from .messages import (
+    CompletionArgumentChoice,
+    CompletionCandidate,
+    CompletionContext,
 )
 
 _SEGMENT_SEPARATORS = frozenset("/\\._- ")
@@ -119,16 +96,10 @@ def build_completion_catalog(
 ) -> list[CompletionCandidate]:
     """Build command, skill, and setting rows for slash completion."""
 
-    catalog: list[CompletionCandidate] = []
-    catalog.extend(_command_candidates(surface))
-    catalog.extend(_skill_candidates(skill_loader, workspace_dir=workspace_dir))
-    # A toggle whose command the registry already exposes on this surface would
-    # render as a duplicate menu row under a second label; keep the registry row.
-    taken = {candidate.insert_text.strip() for candidate in catalog}
-    catalog.extend(
-        toggle for toggle in SETTING_TOGGLES if toggle.insert_text.strip() not in taken
-    )
-    return catalog
+    return [
+        *_command_candidates(surface),
+        *_skill_candidates(skill_loader, workspace_dir=workspace_dir),
+    ]
 
 
 def build_completion_context(
@@ -184,9 +155,7 @@ def _score_candidate(query: str, candidate: str) -> float | None:
     segments = _path_segments(text)
     if text.startswith("/") and segments and segments[0].startswith(query):
         score += 90
-    prefix_segment = next(
-        (segment for segment in segments if segment.startswith(query)), None
-    )
+    prefix_segment = next((segment for segment in segments if segment.startswith(query)), None)
     if prefix_segment is not None:
         score += 60
         score += max(0.0, 24.0 - (len(prefix_segment) * 2.0))
@@ -266,9 +235,7 @@ def _git_files(root: Path) -> list[str] | None:
     if result.returncode != 0:
         return None
     return [
-        Path(_decode_git_path(entry)).as_posix()
-        for entry in result.stdout.split(b"\0")
-        if entry
+        Path(_decode_git_path(entry)).as_posix() for entry in result.stdout.split(b"\0") if entry
     ]
 
 
@@ -376,14 +343,35 @@ def _pattern_matches(rel: str, parts: list[str], pattern: str) -> bool:
 def _command_candidates(surface: Surface | str) -> list[CompletionCandidate]:
     from opensquilla.engine.commands import DEFAULT_REGISTRY
 
+    commands = list(DEFAULT_REGISTRY.for_surface(surface))
+    commands.sort(key=lambda command: getattr(command, "order", 10_000))
     return [
         CompletionCandidate(
             label=command.name,
-            description=command.description,
+            description=command.description_for(surface),
             insert_text=f"{command.name} ",
-            category="command",
+            category=str(getattr(command, "category", "command")),
+            usage=command.usage_for(surface),
+            aliases=tuple(command.aliases),
+            argument_choices=tuple(
+                CompletionArgumentChoice(
+                    value=choice.value,
+                    description=choice.description,
+                )
+                for choice in command.argument_choices_for(surface)
+            ),
+            visible_by_default=bool(getattr(command, "visible_by_default", True)),
+            deprecated=bool(getattr(command, "deprecated", False)),
+            submit_behavior=(
+                "complete"
+                if "<" in command.usage_for(surface)
+                and command.presentation is not CommandPresentation.PICKER
+                else "submit"
+            ),
+            busy_policy=str(getattr(command, "busy_policy", "immediate")),
+            presentation=str(getattr(command, "presentation", "notice")),
         )
-        for command in DEFAULT_REGISTRY.for_surface(surface)
+        for command in commands
     ]
 
 
@@ -393,8 +381,10 @@ def _skill_candidates(
     workspace_dir: Path | None,
 ) -> list[CompletionCandidate]:
     try:
-        loader = skill_loader if skill_loader is not None else _build_skill_loader(
-            workspace_dir=workspace_dir
+        loader = (
+            skill_loader
+            if skill_loader is not None
+            else _build_skill_loader(workspace_dir=workspace_dir)
         )
         skills = loader.get_user_invocable()
     except Exception:
@@ -409,10 +399,11 @@ def _skill_candidates(
             continue
         candidates.append(
             CompletionCandidate(
-                label=f"/{name.lstrip('/')}",
+                label=f"/skill:{name.lstrip('/')}",
                 description=str(getattr(skill, "description", "")),
                 insert_text=f"use the {name.lstrip('/')} skill: ",
                 category="skill",
+                submit_behavior="complete",
             )
         )
     return candidates
@@ -433,9 +424,7 @@ def _build_skill_loader(*, workspace_dir: Path | None = None) -> SkillCompletion
         if config.workspace_dir
         else None
     )
-    workspace_override = (
-        Path(config.skills.workspace_dir) if config.skills.workspace_dir else None
-    )
+    workspace_override = Path(config.skills.workspace_dir) if config.skills.workspace_dir else None
     layer_dirs = resolve_skill_layer_dirs(
         allow_bundled=config.skills.allow_bundled,
         workspace_root=workspace_root,

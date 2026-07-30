@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import hashlib
 import io
@@ -11,6 +12,10 @@ from pathlib import Path
 from typing import Any
 from xml.sax.saxutils import escape
 
+from opensquilla.artifact_validation import (
+    ArtifactValidationError,
+    validate_artifact_for_delivery,
+)
 from opensquilla.artifacts import (
     DEFAULT_ARTIFACT_DISK_BUDGET_BYTES,
     DEFAULT_ARTIFACT_MAX_BYTES,
@@ -20,7 +25,7 @@ from opensquilla.artifacts import (
 )
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
 from opensquilla.tools.registry import tool
-from opensquilla.tools.types import ToolError, current_tool_context
+from opensquilla.tools.types import RetryableToolInputError, ToolError, current_tool_context
 
 _CSV_MIME = "text/csv"
 _XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -198,7 +203,7 @@ def _pdf_markup_text(value: Any, *, base_font: str, cjk_font: str | None) -> str
     return "".join(parts)
 
 
-def _published_response(
+async def _published_response(
     *,
     payload: bytes,
     name: str,
@@ -212,6 +217,20 @@ def _published_response(
         raise ToolError("artifact storage is not configured for this turn")
     if not ctx.artifact_session_id or not ctx.session_key:
         raise ToolError("artifact session scope is not configured for this turn")
+
+    try:
+        # PPTX validation inflates and parses the whole deck; run it off the
+        # gateway event loop so concurrent sessions stay responsive.
+        await asyncio.to_thread(
+            validate_artifact_for_delivery,
+            payload,
+            source_name=name,
+            name=name,
+            mime=mime,
+            source=source,
+        )
+    except ArtifactValidationError as exc:
+        raise RetryableToolInputError(exc.user_message) from exc
 
     target_sha256 = hashlib.sha256(payload).hexdigest()
     for published in reversed(ctx.published_artifacts):
@@ -314,7 +333,7 @@ async def create_csv(rows: list[list[Any]], name: str | None = None) -> str:
     output = io.StringIO(newline="")
     writer = csv.writer(output, lineterminator="\n")
     writer.writerows(_rows(rows, field_name="rows"))
-    return _published_response(
+    return await _published_response(
         payload=output.getvalue().encode("utf-8-sig"),
         name=_ensure_name(name, default="generated.csv", suffix=".csv"),
         mime=_CSV_MIME,
@@ -358,7 +377,7 @@ async def create_xlsx(sheets: list[dict[str, Any]], name: str | None = None) -> 
 
     output = io.BytesIO()
     workbook.save(output)
-    return _published_response(
+    return await _published_response(
         payload=output.getvalue(),
         name=_ensure_name(name, default="generated.xlsx", suffix=".xlsx"),
         mime=_XLSX_MIME,
@@ -428,7 +447,7 @@ async def create_pptx(slides: list[dict[str, Any]], name: str | None = None) -> 
 
     output = io.BytesIO()
     presentation.save(output)
-    return _published_response(
+    return await _published_response(
         payload=_normalize_zip_timestamps(output.getvalue()),
         name=_ensure_name(name, default="generated.pptx", suffix=".pptx"),
         mime=_PPTX_MIME,
@@ -527,7 +546,7 @@ async def create_pdf_report(
         story.append(Paragraph("No report body was provided.", styles["BodyText"]))
 
     doc.build(story)
-    return _published_response(
+    return await _published_response(
         payload=output.getvalue(),
         name=_ensure_name(name, default="generated.pdf", suffix=".pdf"),
         mime=_PDF_MIME,

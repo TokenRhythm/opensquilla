@@ -48,6 +48,52 @@ def approval_status_rpc_payload(
     }
 
 
+def approval_lookup_status_rpc_payload(
+    queue: ApprovalQueue,
+    approval_id: str,
+    *,
+    namespace: str,
+) -> dict[str, Any]:
+    """Return reconnect-safe status for one approval id.
+
+    Unlike the historical resolve payload, this lookup distinguishes an
+    actively claimed resolution from both a normally pending request and a
+    settled result.  Missing ids are a normal recovery outcome, while looking
+    an id up through the wrong namespace is rejected so exec/plugin semantics
+    cannot be crossed accidentally.
+    """
+
+    try:
+        entry = queue.get(approval_id)
+    except KeyError:
+        return {
+            "found": False,
+            "id": approval_id,
+            "namespace": namespace,
+            "pending": False,
+            "resolutionInProgress": False,
+            "resolved": False,
+        }
+
+    if entry.namespace != namespace:
+        raise ValueError(f"Approval does not belong to {namespace} namespace: {approval_id}")
+
+    resolution_in_progress = entry.claim_token is not None
+    resolved = bool(entry.resolved and not resolution_in_progress)
+    return {
+        "found": True,
+        "id": entry.approval_id,
+        "namespace": entry.namespace,
+        "pending": bool(not entry.resolved and not resolution_in_progress),
+        "resolutionInProgress": resolution_in_progress,
+        "resolved": resolved,
+        "approved": bool(entry.approved) if resolved else False,
+        "resolution": str(entry.resolution or "") if resolved else "",
+        "consumed": bool(entry.consumed) if resolved else False,
+        "deadline": entry.deadline,
+    }
+
+
 def approval_request_rpc_payload(
     queue: ApprovalQueue,
     *,
@@ -136,6 +182,7 @@ def approval_resolve_rpc_payload(
 __all__ = [
     "approval_extend_rpc_payload",
     "approval_forget_rpc_payload",
+    "approval_lookup_status_rpc_payload",
     "approval_request_rpc_payload",
     "approval_resolve_rpc_payload",
     "approval_settings_rpc_payload",

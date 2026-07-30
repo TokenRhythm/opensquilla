@@ -54,12 +54,8 @@ def test_update_endpoint_returns_fixed_uncached_shape(monkeypatch) -> None:
 
 
 def test_update_endpoint_returns_empty_fixed_shape(monkeypatch) -> None:
-    monkeypatch.setattr(
-        update_check, "start_background_update_check", lambda **_kwargs: None
-    )
-    monkeypatch.setattr(
-        update_check, "get_cached_update_info", lambda **_kwargs: None
-    )
+    monkeypatch.setattr(update_check, "start_background_update_check", lambda **_kwargs: None)
+    monkeypatch.setattr(update_check, "get_cached_update_info", lambda **_kwargs: None)
 
     with TestClient(create_gateway_app(GatewayConfig())) as client:
         response = client.get("/api/system/update")
@@ -141,12 +137,8 @@ def test_update_endpoint_does_not_wait_for_background_release_lookup(
 
 
 def test_update_endpoint_inherits_gateway_auth(monkeypatch) -> None:
-    monkeypatch.setattr(
-        update_check, "start_background_update_check", lambda **_kwargs: None
-    )
-    monkeypatch.setattr(
-        update_check, "get_cached_update_info", lambda **_kwargs: None
-    )
+    monkeypatch.setattr(update_check, "start_background_update_check", lambda **_kwargs: None)
+    monkeypatch.setattr(update_check, "get_cached_update_info", lambda **_kwargs: None)
     config = GatewayConfig(auth=AuthConfig(mode="token", token="secret"))
 
     with TestClient(create_gateway_app(config)) as client:
@@ -161,12 +153,8 @@ def test_update_endpoint_inherits_gateway_auth(monkeypatch) -> None:
 
 
 def test_update_endpoint_is_not_exempt_from_normal_rate_limiting(monkeypatch) -> None:
-    monkeypatch.setattr(
-        update_check, "start_background_update_check", lambda **_kwargs: None
-    )
-    monkeypatch.setattr(
-        update_check, "get_cached_update_info", lambda **_kwargs: None
-    )
+    monkeypatch.setattr(update_check, "start_background_update_check", lambda **_kwargs: None)
+    monkeypatch.setattr(update_check, "get_cached_update_info", lambda **_kwargs: None)
     config = GatewayConfig(
         rate_limit=RateLimitConfig(enabled=True, max_requests=1, window_seconds=60)
     )

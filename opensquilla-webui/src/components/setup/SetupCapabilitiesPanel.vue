@@ -37,6 +37,7 @@ interface CapabilitiesPanelContract {
     imageProvider: string
     imagePrimary: string
     imageApiKey: string
+    imageKeyConfigured: boolean
     imageApiKeyEnv: string
     imageBaseUrl: string
     imageEnabled: boolean
@@ -100,7 +101,7 @@ const emit = defineEmits<{
   updateField: [group: 'search' | 'memory' | 'image' | 'audio', key: string, value: string | number | boolean]
   searchProviderChange: []
   memoryProviderChange: []
-  imageProviderChange: []
+  imageProviderChange: [providerId: string]
   saveSearch: []
   saveMemory: []
   saveImage: []
@@ -119,8 +120,7 @@ function onMemoryProviderSelect(event: Event) {
 }
 
 function onImageProviderSelect(event: Event) {
-  emit('updateField', 'image', 'provider', (event.target as HTMLSelectElement).value)
-  emit('imageProviderChange')
+  emit('imageProviderChange', (event.target as HTMLSelectElement).value)
 }
 </script>
 
@@ -314,9 +314,13 @@ function onImageProviderSelect(event: Event) {
           </div>
         </label>
         <label class="control-row">
-          <div class="control-row__label-block"><span class="control-row__label">{{ t('setup.common.apiKey') }}</span></div>
+          <div class="control-row__label-block">
+            <span class="control-row__label">{{ t('setup.common.apiKey') }}</span>
+            <!-- Saved-key state for the write-only field: the key itself is never rendered. -->
+            <span class="control-row__desc">{{ panel.form.imageKeyConfigured ? t('setup.capabilities.imageKeyConfigured') : t('setup.capabilities.imageKeyMissing') }}</span>
+          </div>
           <div class="control-row__control">
-            <input class="control-input" :value="panel.form.imageApiKey" name="setup_image_api_key" type="password" :placeholder="t('setup.common.leaveBlankKeep')" @input="emit('updateField', 'image', 'apiKey', ($event.target as HTMLInputElement).value)">
+            <input class="control-input" :value="panel.form.imageApiKey" name="setup_image_api_key" type="password" :placeholder="panel.form.imageKeyConfigured ? t('setup.capabilities.imageKeyPlaceholderKeep') : t('setup.capabilities.imageKeyPlaceholderNew')" @input="emit('updateField', 'image', 'apiKey', ($event.target as HTMLInputElement).value)">
           </div>
         </label>
         <label class="control-row">

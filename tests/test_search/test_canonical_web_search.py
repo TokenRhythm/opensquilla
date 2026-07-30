@@ -120,6 +120,52 @@ class NetworkFailProvider:
         raise SearchProviderError("tavily", "network", "Network failed", retryable=True)
 
 
+class NamedNetworkFailProvider:
+    def __init__(self, name: str, calls: list[str]) -> None:
+        self.name = name
+        self._calls = calls
+
+    async def search(self, query: str, max_results: int = 5) -> list[SearchResult]:
+        self._calls.append(self.name)
+        raise SearchProviderError(
+            self.name,
+            "network",
+            f"{self.name} network failed",
+            retryable=True,
+        )
+
+
+class NamedSuccessProvider:
+    def __init__(self, name: str, calls: list[str]) -> None:
+        self.name = name
+        self._calls = calls
+
+    async def search(self, query: str, max_results: int = 5) -> list[SearchResult]:
+        self._calls.append(self.name)
+        return [
+            SearchResult(
+                title=f"{self.name} result",
+                url=f"https://{self.name}.example/result",
+                snippet=f"{self.name} snippet",
+                provider=self.name,
+                source=self.name,
+            )
+        ][:max_results]
+
+
+class NonRetryableHttpProvider:
+    name = "tavily"
+
+    async def search(self, query: str, max_results: int = 5) -> list[SearchResult]:
+        raise SearchProviderError(
+            self.name,
+            "http",
+            "Bad request",
+            retryable=False,
+            status_code=400,
+        )
+
+
 class BlockedProvider:
     def __init__(self, name: str = "duckduckgo") -> None:
         self.name = name
@@ -360,6 +406,8 @@ async def test_canonical_web_search_primary_auth_failure_does_not_silent_fallbac
 
     assert payload["ok"] is False
     assert payload["error_kind"] == "auth"
+    assert payload["provider_retryable"] is False
+    assert payload["retry_allowed"] is False
     assert payload["provider_attempts"] == [{"provider": "tavily", "status": "auth_failed"}]
 
 
@@ -579,6 +627,162 @@ async def test_canonical_web_search_falls_back_on_retryable_network_error() -> N
     ]
     assert payload["diagnostics"]["fallback_from"] == "tavily"
     assert payload["results"][0]["provider"] == "duckduckgo"
+    assert "retry_allowed" not in payload
+    assert "provider_retryable" not in payload
+
+
+@pytest.mark.asyncio
+async def test_canonical_web_search_auto_network_attempts_at_most_two_ranked_providers(
+    monkeypatch,
+) -> None:
+    for key in (
+        "BOCHA_SEARCH_API_KEY",
+        "TAVILY_API_KEY",
+        "BRAVE_SEARCH_API_KEY",
+        "EXA_API_KEY",
+        "IQS_SEARCH_API_KEY",
+    ):
+        monkeypatch.setenv(key, f"{key.lower()}-value")
+    calls: list[str] = []
+    runtime = resolve_search_runtime(
+        SearchRuntimeConfig(provider="duckduckgo", fallback_policy="network")
+    )
+
+    payload = await run_canonical_web_search(
+        SearchOptions(query="bounded fallback", fetch_top_k=0),
+        runtime=runtime,
+        provider_factory=lambda name: NamedNetworkFailProvider(name, calls),
+    )
+
+    assert payload["ok"] is False
+    assert payload["retry_allowed"] is False
+    assert payload["provider_retryable"] is True
+    assert calls == ["bocha", "tavily"]
+    assert payload["provider_attempts"] == [
+        {"provider": "bocha", "status": "error", "error_kind": "network"},
+        {"provider": "tavily", "status": "error", "error_kind": "network"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_canonical_web_search_auto_network_skips_runtime_missing_key_to_backup(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("EXA_API_KEY", "stale-exa-key")
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "brave-key")
+    monkeypatch.delenv("BOCHA_SEARCH_API_KEY", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.delenv("IQS_SEARCH_API_KEY", raising=False)
+    attempted: list[str] = []
+
+    def provider_factory(name: str) -> MissingKeyAuthProvider | NamedSuccessProvider:
+        attempted.append(name)
+        if name == "exa":
+            return MissingKeyAuthProvider()
+        return NamedSuccessProvider(name, [])
+
+    payload = await run_canonical_web_search(
+        SearchOptions(query="python sqlite api docs", mode="technical", fetch_top_k=0),
+        runtime=resolve_search_runtime(
+            SearchRuntimeConfig(provider="duckduckgo", fallback_policy="network")
+        ),
+        provider_factory=provider_factory,
+    )
+
+    assert payload["ok"] is True
+    assert attempted == ["exa", "brave"]
+    assert payload["provider_attempts"] == [
+        {"provider": "exa", "status": "auth_missing"},
+        {"provider": "brave", "status": "success"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_canonical_web_search_auto_off_skips_local_auth_missing_once(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("EXA_API_KEY", "stale-exa-key")
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "brave-key")
+    monkeypatch.delenv("BOCHA_SEARCH_API_KEY", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.delenv("IQS_SEARCH_API_KEY", raising=False)
+    attempted: list[str] = []
+
+    def provider_factory(name: str) -> MissingKeyAuthProvider | NamedSuccessProvider:
+        attempted.append(name)
+        if name == "exa":
+            return MissingKeyAuthProvider()
+        return NamedSuccessProvider(name, [])
+
+    payload = await run_canonical_web_search(
+        SearchOptions(query="python sqlite api docs", mode="technical", fetch_top_k=0),
+        runtime=resolve_search_runtime(
+            SearchRuntimeConfig(provider="duckduckgo", fallback_policy="off")
+        ),
+        provider_factory=provider_factory,
+    )
+
+    assert payload["ok"] is True
+    assert attempted == ["exa", "brave"]
+    assert payload["provider_attempts"] == [
+        {"provider": "exa", "status": "auth_missing"},
+        {"provider": "brave", "status": "success"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_canonical_web_search_auto_off_does_not_network_fallback(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("BOCHA_SEARCH_API_KEY", "bocha-key")
+    monkeypatch.setenv("TAVILY_API_KEY", "tavily-key")
+    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
+    monkeypatch.delenv("EXA_API_KEY", raising=False)
+    monkeypatch.delenv("IQS_SEARCH_API_KEY", raising=False)
+    calls: list[str] = []
+
+    payload = await run_canonical_web_search(
+        SearchOptions(query="bounded off", fetch_top_k=0),
+        runtime=resolve_search_runtime(
+            SearchRuntimeConfig(provider="duckduckgo", fallback_policy="off")
+        ),
+        provider_factory=lambda name: NamedNetworkFailProvider(name, calls),
+    )
+
+    assert payload["ok"] is False
+    assert calls == ["bocha"]
+    assert payload["provider_attempts"] == [
+        {"provider": "bocha", "status": "error", "error_kind": "network"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_canonical_web_search_network_policy_respects_non_retryable_error() -> None:
+    attempted: list[str] = []
+
+    def provider_factory(name: str) -> NonRetryableHttpProvider | FallbackProvider:
+        attempted.append(name)
+        if name == "tavily":
+            return NonRetryableHttpProvider()
+        return FallbackProvider()
+
+    payload = await run_canonical_web_search(
+        SearchOptions(query="q", provider="tavily", fetch_top_k=0),
+        runtime=resolve_search_runtime(
+            SearchRuntimeConfig(
+                provider="tavily",
+                api_key="tavily-key",
+                fallback_policy="network",
+            )
+        ),
+        provider_factory=provider_factory,
+    )
+
+    assert payload["ok"] is False
+    assert payload["error_kind"] == "http"
+    assert payload["provider_retryable"] is False
+    assert payload["retry_allowed"] is False
+    assert attempted == ["tavily"]
 
 
 @pytest.mark.asyncio
@@ -612,6 +816,8 @@ async def test_canonical_web_search_surfaces_blocked_provider_failure() -> None:
 
     assert payload["ok"] is False
     assert payload["error_kind"] == "blocked"
+    assert payload["provider_retryable"] is True
+    assert payload["retry_allowed"] is False
     assert payload["provider_attempts"] == [
         {"provider": "duckduckgo", "status": "error", "error_kind": "blocked"}
     ]
@@ -619,8 +825,11 @@ async def test_canonical_web_search_surfaces_blocked_provider_failure() -> None:
 
 
 @pytest.mark.asyncio
-async def test_canonical_web_search_falls_back_on_retryable_blocked_error() -> None:
+async def test_canonical_web_search_does_not_fallback_on_retryable_blocked_error() -> None:
+    calls: list[str] = []
+
     def provider_factory(name: str) -> BlockedProvider | FallbackProvider:
+        calls.append(name)
         if name == "tavily":
             return BlockedProvider(name)
         return FallbackProvider()
@@ -633,12 +842,12 @@ async def test_canonical_web_search_falls_back_on_retryable_blocked_error() -> N
         provider_factory=provider_factory,
     )
 
-    assert payload["ok"] is True
+    assert payload["ok"] is False
+    assert payload["retry_allowed"] is False
     assert payload["provider_attempts"] == [
         {"provider": "tavily", "status": "error", "error_kind": "blocked"},
-        {"provider": "duckduckgo", "status": "success"},
     ]
-    assert payload["results"][0]["provider"] == "duckduckgo"
+    assert calls == ["tavily"]
 
 
 @pytest.mark.asyncio
@@ -772,7 +981,9 @@ async def test_canonical_web_search_no_key_auto_recency_uses_duckduckgo_soft_deg
 
 
 @pytest.mark.asyncio
-async def test_canonical_web_search_technical_mode_prefers_exa_then_brave(monkeypatch) -> None:
+async def test_canonical_web_search_technical_mode_off_uses_top_ranked_provider_once(
+    monkeypatch,
+) -> None:
     monkeypatch.setenv("EXA_API_KEY", "exa-key")
     monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "brave-key")
     monkeypatch.setenv("TAVILY_API_KEY", "tavily-key")
@@ -781,11 +992,9 @@ async def test_canonical_web_search_technical_mode_prefers_exa_then_brave(monkey
     monkeypatch.delenv("BOCHA_SEARCH_API_KEY", raising=False)
     attempted: list[str] = []
 
-    def provider_factory(name: str) -> MissingKeyAuthProvider | FallbackProvider:
+    def provider_factory(name: str) -> NamedSuccessProvider:
         attempted.append(name)
-        if name == "exa":
-            return MissingKeyAuthProvider()
-        return FallbackProvider()
+        return NamedSuccessProvider(name, [])
 
     payload = await run_canonical_web_search(
         SearchOptions(query="python sqlite api docs", mode="technical", fetch_top_k=0),
@@ -793,10 +1002,9 @@ async def test_canonical_web_search_technical_mode_prefers_exa_then_brave(monkey
     )
 
     assert payload["ok"] is True
-    assert attempted == ["exa", "brave"]
+    assert attempted == ["exa"]
     assert payload["provider_attempts"] == [
-        {"provider": "exa", "status": "auth_missing"},
-        {"provider": "brave", "status": "success"},
+        {"provider": "exa", "status": "success"},
     ]
 
 
@@ -966,3 +1174,43 @@ async def test_canonical_web_search_caches_complete_payload_for_repeated_request
     assert first["diagnostics"]["cache_status"] == "miss"
     assert second["diagnostics"]["cache_status"] == "hit"
     assert second["results"][0]["excerpt"] == "Fetched cache body"
+
+
+@pytest.mark.asyncio
+async def test_canonical_web_search_cache_key_includes_execution_plan(monkeypatch) -> None:
+    canonical_module.clear_canonical_web_search_cache_for_tests()
+    for key in (
+        "BOCHA_SEARCH_API_KEY",
+        "TAVILY_API_KEY",
+        "BRAVE_SEARCH_API_KEY",
+        "EXA_API_KEY",
+        "IQS_SEARCH_API_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("BOCHA_SEARCH_API_KEY", "bocha-key")
+    monkeypatch.setenv("TAVILY_API_KEY", "tavily-key")
+    calls: list[str] = []
+    options = SearchOptions(query="plan cache", fetch_top_k=0)
+
+    first = await run_canonical_web_search(
+        options,
+        runtime=resolve_search_runtime(
+            SearchRuntimeConfig(provider="duckduckgo", fallback_policy="network")
+        ),
+        provider_factory=lambda name: NamedSuccessProvider(name, calls),
+        use_cache=True,
+    )
+    second = await run_canonical_web_search(
+        options,
+        runtime=resolve_search_runtime(
+            SearchRuntimeConfig(provider="duckduckgo", fallback_policy="off")
+        ),
+        provider_factory=lambda name: NamedSuccessProvider(name, calls),
+        use_cache=True,
+    )
+
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert calls == ["bocha", "bocha"]
+    assert first["diagnostics"]["cache_status"] == "miss"
+    assert second["diagnostics"]["cache_status"] == "miss"

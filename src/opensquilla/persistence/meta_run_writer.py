@@ -13,9 +13,9 @@ Fail-open: persistence is observability; all writes are try/except → log.warni
 so a writer failure cannot fail a meta-skill turn.
 
 Retention: every ``prune_every`` (default 64) ``begin_run_sync`` calls the
-writer runs one opportunistic ``DELETE FROM meta_skill_runs WHERE
-started_at_ms < now - retention_days AND status NOT IN ('running',
-'awaiting_user')`` so the table stays bounded without a background job.
+writer runs one opportunistic, bounded delete of at most ``prune_batch``
+(default 1000) terminal rows older than ``retention_days`` so the table stays
+bounded without a background job or a long foreground write lock.
 Live (``running``) and parked (``awaiting_user``) runs are never pruned
 regardless of age; step rows follow their run via FK ``ON DELETE CASCADE``.
 """
@@ -46,6 +46,7 @@ _REDACTOR_PER_STRING_BYTES = 4 * 1024
 # opportunistic write-time prune, no background job, no config keys.
 _DEFAULT_RETENTION_DAYS = 90
 _DEFAULT_PRUNE_EVERY = 64
+_DEFAULT_PRUNE_BATCH = 1_000
 _DAY_MS = 24 * 60 * 60 * 1000
 
 _SECRET_KEY_RE = re.compile(
@@ -477,6 +478,7 @@ class MetaRunWriter:
         max_field_bytes: int = _DEFAULT_MAX_FIELD_BYTES,
         retention_days: int = _DEFAULT_RETENTION_DAYS,
         prune_every: int = _DEFAULT_PRUNE_EVERY,
+        prune_batch: int = _DEFAULT_PRUNE_BATCH,
         clock: Callable[[], int] = lambda: int(time.time() * 1000),
         id_gen: Callable[[], str] = _gen_ulid,
         pid_fn: Callable[[], int] = os.getpid,
@@ -486,6 +488,7 @@ class MetaRunWriter:
         self._max_field_bytes = max_field_bytes
         self._retention_days = max(1, int(retention_days))
         self._prune_every = max(1, int(prune_every))
+        self._prune_batch = max(1, int(prune_batch))
         self._begin_run_count = 0
         self._clock = clock
         self._id_gen = id_gen
@@ -561,10 +564,18 @@ class MetaRunWriter:
         try:
             with self._lock:
                 cur = self._conn.execute(
-                    "DELETE FROM meta_skill_runs "
-                    "WHERE started_at_ms < ? "
-                    "AND status NOT IN ('running', 'awaiting_user')",
-                    (cutoff,),
+                    """
+                    DELETE FROM meta_skill_runs
+                    WHERE run_id IN (
+                        SELECT run_id
+                        FROM meta_skill_runs
+                        WHERE started_at_ms < ?
+                        AND status NOT IN ('running', 'awaiting_user')
+                        ORDER BY started_at_ms, run_id
+                        LIMIT ?
+                    )
+                    """,
+                    (cutoff, self._prune_batch),
                 )
                 self._conn.commit()
             if cur.rowcount:

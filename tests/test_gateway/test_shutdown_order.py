@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from opensquilla.gateway.boot import GatewayServer
+from opensquilla.gateway.boot import GatewayServer, ServiceContainer
+from opensquilla.gateway.config import GatewayConfig
 
 
 @pytest.mark.asyncio
@@ -103,3 +105,38 @@ async def test_close_stops_server_even_if_teardown_raises() -> None:
     mock_services.close.assert_awaited_once()
     mock_pid_lock.release.assert_called_once()  # pid lock always released
     assert server._task.done()  # serve task awaited, not leaked
+
+
+@pytest.mark.parametrize(
+    "writer_field",
+    ["meta_run_writer", "router_decision_writer", "turn_error_writer"],
+)
+@pytest.mark.asyncio
+async def test_service_close_does_not_block_event_loop_on_sidecar_writer(
+    writer_field: str,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    class _BlockingWriter:
+        def close(self) -> None:
+            started.set()
+            release.wait(timeout=1.0)
+
+    services = ServiceContainer(
+        config=GatewayConfig(),
+        **{writer_field: _BlockingWriter()},
+    )
+    release_timer = threading.Timer(0.4, release.set)
+    close_task = asyncio.create_task(services.close())
+    release_timer.start()
+    try:
+        await asyncio.sleep(0.05)
+        assert started.is_set()
+        assert not close_task.done()
+        release.set()
+        await asyncio.wait_for(close_task, timeout=1.0)
+    finally:
+        release_timer.cancel()
+        release.set()
+        await close_task

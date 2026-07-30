@@ -27,6 +27,9 @@ from opensquilla.memory.types import (
     normalize_memory_search_min_score,
     normalize_memory_source_filter,
 )
+from opensquilla.observability.network_policy import (
+    provider_request_correlation_disabled,
+)
 from opensquilla.session.keys import normalize_agent_id
 from opensquilla.tools.builtin.memory_tools import _is_memory_source_path
 
@@ -86,25 +89,14 @@ def _is_safety_error_receipt(row: Any) -> bool:
 
 async def _recent_durable_receipts(storage: Any, *, agent_id: str) -> list[Any]:
     agent_prefix = _agent_session_key_prefix(agent_id)
-    conn = getattr(storage, "conn", None)
-    if conn is not None:
-        agent_clause = ""
-        params: list[Any] = []
-        if agent_prefix is not None:
-            agent_clause = "WHERE substr(session_key, 1, ?) = ?"
-            params.extend((len(agent_prefix), agent_prefix))
-        params.append(_HEALTH_SCAN_LIMIT)
-        async with conn.execute(
-            f"""
-            SELECT * FROM memory_durable_receipts
-            {agent_clause}
-            ORDER BY created_at DESC, rowid DESC
-            LIMIT ?
-            """,
-            params,
-        ) as cur:
-            sql_rows = await cur.fetchall()
-        return list(sql_rows)
+    list_recent = getattr(storage, "list_recent_memory_durable_receipts", None)
+    if callable(list_recent):
+        return list(
+            await list_recent(
+                limit=_HEALTH_SCAN_LIMIT,
+                session_key_prefix=agent_prefix,
+            )
+        )
 
     list_receipts = getattr(storage, "list_memory_durable_receipts", None)
     if not callable(list_receipts):
@@ -769,5 +761,8 @@ async def _handle_memory_repair_run(
         limit=limit,
         params=params,
         scan_limit=_REPAIR_SCAN_LIMIT,
+        provider_request_correlation_enabled=(
+            not provider_request_correlation_disabled(config=ctx.config)
+        ),
     )
     return {"agentId": agent_id, "count": len(results), "results": results}

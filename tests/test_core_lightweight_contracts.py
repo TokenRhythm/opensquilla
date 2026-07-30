@@ -61,7 +61,7 @@ def test_minimax_tool_call_text_is_removed_as_machine_payload() -> None:
     assert strip_synthetic_tool_call_suffix(text, ["web_search"]) == ""
 
 
-def test_malformed_text_tool_protocol_is_removed_before_user_display() -> None:
+def test_deprecated_protocol_strip_preserves_protocol_like_html() -> None:
     text = (
         "Let me write the dashboard now.\n\n"
         '<tvoe_calls><invoke name="write_file">'
@@ -70,10 +70,10 @@ def test_malformed_text_tool_protocol_is_removed_before_user_display() -> None:
         "</parameter></invoke></tvoe_calls>"
     )
 
-    assert strip_protocol_text_leak(text) == "Let me write the dashboard now."
+    assert strip_protocol_text_leak(text) == text
 
 
-def test_dsml_text_tool_protocol_is_removed_before_user_display() -> None:
+def test_deprecated_protocol_strip_preserves_dsml_text() -> None:
     text = (
         "Let me create the printable daily record sheet as well:\n\n"
         '<｜DSML｜tool_calls><｜DSML｜invoke name="create_xlsx">'
@@ -85,12 +85,10 @@ def test_dsml_text_tool_protocol_is_removed_before_user_display() -> None:
         "</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>"
     )
 
-    assert strip_protocol_text_leak(text) == (
-        "Let me create the printable daily record sheet as well:"
-    )
+    assert strip_protocol_text_leak(text) == text
 
 
-def test_tool_scaffold_details_summary_is_removed_before_user_display() -> None:
+def test_deprecated_protocol_strip_preserves_details_text() -> None:
     text = (
         "Let me read the specific problematic areas to fix them.\n\n"
         "<details>"
@@ -99,72 +97,63 @@ def test_tool_scaffold_details_summary_is_removed_before_user_display() -> None:
         "I see two real HTML issues."
     )
 
-    assert strip_protocol_text_leak(text) == (
-        "Let me read the specific problematic areas to fix them."
-    )
+    assert strip_protocol_text_leak(text) == text
 
 
-def test_streaming_protocol_guard_holds_split_tool_protocol() -> None:
+def test_deprecated_streaming_guard_passes_split_tool_protocol_without_buffering() -> None:
     guard = ProtocolTextLeakGuard()
 
-    assert guard.push("Let me write the dashboard now.\n\n<tvoe") == (
-        "Let me write the dashboard now."
+    first = "Let me write the dashboard now.\n\n<tvoe"
+    second = (
+        '_calls><invoke name="write_file">'
+        '<parameter name="content"><!DOCTYPE html><html></html>'
     )
-    assert (
-        guard.push(
-            '_calls><invoke name="write_file">'
-            '<parameter name="content"><!DOCTYPE html><html></html>'
-        )
-        == ""
-    )
+    assert guard.push(first) == first
+    assert guard.push(second) == second
     assert guard.flush() == ""
 
 
-def test_streaming_protocol_guard_holds_split_dsml_tool_protocol() -> None:
+def test_deprecated_streaming_guard_passes_split_dsml_without_buffering() -> None:
     guard = ProtocolTextLeakGuard()
 
-    assert guard.push("Let me make the sheet.\n\n<｜DS") == "Let me make the sheet."
-    assert (
-        guard.push(
-            'ML｜tool_calls><｜DSML｜invoke name="create_xlsx">'
-            '<｜DSML｜parameter name="sheets">[]</｜DSML｜parameter>'
-        )
-        == ""
+    first = "Let me make the sheet.\n\n<｜DS"
+    second = (
+        'ML｜tool_calls><｜DSML｜invoke name="create_xlsx">'
+        '<｜DSML｜parameter name="sheets">[]</｜DSML｜parameter>'
     )
+    assert guard.push(first) == first
+    assert guard.push(second) == second
     assert guard.flush() == ""
 
 
-def test_streaming_protocol_guard_releases_unconfirmed_literal_marker() -> None:
+def test_deprecated_streaming_guard_passes_partial_marker_immediately() -> None:
     guard = ProtocolTextLeakGuard()
 
-    assert guard.push("Explain literal <invoke") == "Explain literal"
-    assert guard.flush() == " <invoke"
+    assert guard.push("Explain literal <invoke") == "Explain literal <invoke"
+    assert guard.flush() == ""
 
 
-def test_streaming_protocol_guard_drops_tool_scaffold_before_tool_use() -> None:
+def test_deprecated_streaming_guard_does_not_change_behavior_at_tool_boundary() -> None:
     guard = ProtocolTextLeakGuard()
 
-    assert guard.push("Let me read the specific problematic areas.\n\n<details>") == (
-        "Let me read the specific problematic areas."
+    first = "Let me read the specific problematic areas.\n\n<details>"
+    second = (
+        "<summary>View areas around line 10393, 14751, and nearby</summary>"
     )
-    assert (
-        guard.push(
-            "<summary>View areas around line 10393, 14751, and nearby</summary>"
-        )
-        == ""
-    )
+    assert guard.push(first) == first
+    assert guard.push(second) == second
     assert guard.flush_before_tool_use() == ""
     assert guard.push("Fixed the issues.") == "Fixed the issues."
 
 
-def test_streaming_protocol_guard_releases_regular_details_without_tool_use() -> None:
+def test_deprecated_streaming_guard_passes_regular_details_without_buffering() -> None:
     guard = ProtocolTextLeakGuard()
 
-    assert guard.push("Here is a collapsible note.\n\n<details>") == (
-        "Here is a collapsible note."
-    )
-    assert guard.push("<summary>More</summary>Visible note.</details>") == ""
-    assert guard.flush() == "\n\n<details><summary>More</summary>Visible note.</details>"
+    first = "Here is a collapsible note.\n\n<details>"
+    second = "<summary>More</summary>Visible note.</details>"
+    assert guard.push(first) == first
+    assert guard.push(second) == second
+    assert guard.flush() == ""
 
 
 def test_session_sanitize_removes_block_metadata_without_mutating_original_content() -> None:

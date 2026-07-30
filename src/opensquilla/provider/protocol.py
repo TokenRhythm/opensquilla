@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from .types import (
     ChatConfig,
+    ErrorEvent,
     Message,
     ModelInfo,
     ProviderMessageCountProjection,
@@ -28,6 +29,11 @@ class ProviderMetadata:
     provider_kind: str = ""
     model: str = ""
     base_url: str = ""
+    # Configured registry identity (for example ``dashscope`` or
+    # ``minimax_global``).  This is deliberately separate from
+    # ``provider_name``, which identifies the adapter family, and
+    # ``provider_kind``, which selects a wire-compatibility policy.
+    provider_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -89,6 +95,7 @@ def provider_metadata(provider: object | None) -> ProviderMetadata:
             return metadata
 
     provider_name = _string_value(getattr(provider, "provider_name", ""))
+    provider_id = _string_value(getattr(provider, "provider_id", ""))
     provider_kind = _string_value(getattr(provider, "provider_kind", ""))
     model = _string_value(getattr(provider, "model", ""))
     base_url = _string_value(getattr(provider, "base_url", ""))
@@ -102,7 +109,22 @@ def provider_metadata(provider: object | None) -> ProviderMetadata:
         provider_kind=provider_kind,
         model=model,
         base_url=base_url,
+        provider_id=provider_id or provider_name,
     )
+
+
+def configured_provider_id(provider: object | None) -> str:
+    """Return the operator-facing registry identity for a provider instance.
+
+    Generic adapters intentionally keep their family ``provider_name`` (for
+    example ``openai`` or ``anthropic``) because compatibility, error
+    classification, and catalog logic rely on it.  Runtime telemetry must use
+    the configured deployment identity instead, when one was supplied by the
+    selector factory.
+    """
+
+    metadata = provider_metadata(provider)
+    return metadata.provider_id or metadata.provider_name
 
 
 def provider_connection_config(provider: object | None) -> ProviderConnectionConfig:
@@ -154,6 +176,34 @@ def project_provider_message_count(
     except Exception:  # noqa: BLE001 - optional capability must stay best-effort
         return None
     return projection if isinstance(projection, ProviderMessageCountProjection) else None
+
+
+def validate_provider_chat_request(
+    provider: object | None,
+    messages: list[Message],
+) -> ErrorEvent | None:
+    """Run an optional, side-effect-free provider request preflight.
+
+    Validation is deliberately duck-typed instead of widening
+    :class:`LLMProvider`: ordinary providers keep the established chat
+    contract, while composite providers may reject requests before any
+    physical model call or usage-accounting envelope starts.
+
+    A missing, raising, or invalid optional implementation is ignored.  The
+    provider remains the authoritative fallback boundary and must repeat its
+    own validation immediately before starting work.
+    """
+
+    if provider is None:
+        return None
+    validation_fn = getattr(provider, "validate_chat_request", None)
+    if not callable(validation_fn):
+        return None
+    try:
+        validation_error = validation_fn(messages)
+    except Exception:  # noqa: BLE001 - optional preflight must stay best-effort
+        return None
+    return validation_error if isinstance(validation_error, ErrorEvent) else None
 
 
 @runtime_checkable

@@ -165,16 +165,26 @@ def test_anthropic_compatible_endpoints_use_authorization_bearer(
     )
     assert isinstance(provider, AnthropicProvider)
 
-    async def _collect() -> None:
-        async for _ in provider.chat([Message(role="user", content="hi")], config=ChatConfig()):
-            pass
+    async def _collect() -> DoneEvent:
+        done: DoneEvent | None = None
+        async for event in provider.chat(
+            [Message(role="user", content="hi")], config=ChatConfig()
+        ):
+            if isinstance(event, DoneEvent):
+                done = event
+        assert done is not None
+        return done
 
-    asyncio.run(_collect())
+    done = asyncio.run(_collect())
 
     headers = captured["headers"]
     assert captured["url"] == f"{expected_base_url}/v1/messages"
     assert headers["Authorization"] == "Bearer test-key"
     assert "x-api-key" not in headers
+    assert provider.provider_name == "anthropic"  # adapter family stays stable
+    assert provider.provider_id == provider_id
+    assert done.provider == provider_id
+    assert done.model == "MiniMax-M2.7"
 
 
 def test_direct_construction_defaults_to_x_api_key(monkeypatch) -> None:
@@ -209,15 +219,24 @@ def test_direct_construction_defaults_to_x_api_key(monkeypatch) -> None:
 
     provider = AnthropicProvider(api_key="test-key", model="claude-test")
 
-    async def _collect() -> None:
-        async for _ in provider.chat([Message(role="user", content="hi")], config=ChatConfig()):
-            pass
+    async def _collect() -> DoneEvent:
+        done: DoneEvent | None = None
+        async for event in provider.chat(
+            [Message(role="user", content="hi")], config=ChatConfig()
+        ):
+            if isinstance(event, DoneEvent):
+                done = event
+        assert done is not None
+        return done
 
-    asyncio.run(_collect())
+    done = asyncio.run(_collect())
 
     headers = captured["headers"]
     assert headers["x-api-key"] == "test-key"
     assert "Authorization" not in headers
+    assert provider.provider_name == "anthropic"
+    assert provider.provider_id == "anthropic"
+    assert done.provider == "anthropic"
 
 
 def test_anthropic_done_event_carries_cache_write_tokens(monkeypatch) -> None:
@@ -481,6 +500,127 @@ def test_anthropic_done_event_cache_write_handles_both_shapes(
 
     done = asyncio.run(_collect())
     assert done.cache_write_tokens == expected
+
+
+def test_anthropic_split_message_delta_frames_merge_into_one_terminal(monkeypatch) -> None:
+    """Anthropic-shaped endpoints may send usage and stop_reason across two
+    message_delta frames; the second frame must merge, not fail the stream,
+    and a sparse epilogue must not regress earlier usage or stop_reason."""
+
+    sse_events = [
+        {
+            "type": "message_start",
+            "message": {
+                "id": "msg_1",
+                "model": "claude-opus-4-7",
+                "usage": {"input_tokens": 10},
+            },
+        },
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "ok"},
+        },
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_delta", "delta": {}, "usage": {"output_tokens": 5}},
+        {"type": "message_delta", "delta": {"stop_reason": "tool_use"}},
+        {"type": "message_stop"},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse_body(sse_events),
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr("opensquilla.provider.anthropic.httpx.AsyncClient", patched_async_client)
+
+    provider = AnthropicProvider(api_key="test", model="claude-opus-4-7")
+
+    async def _collect() -> list[object]:
+        return [
+            event
+            async for event in provider.chat(
+                [Message(role="user", content="hi")],
+                config=ChatConfig(),
+            )
+        ]
+
+    events = asyncio.run(_collect())
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    (done,) = [event for event in events if isinstance(event, DoneEvent)]
+    assert done.stop_reason == "tool_use"
+    assert done.input_tokens == 10
+    assert done.output_tokens == 5
+
+
+def test_anthropic_stop_reason_survives_a_usage_only_epilogue_delta(monkeypatch) -> None:
+    sse_events = [
+        {
+            "type": "message_start",
+            "message": {
+                "id": "msg_1",
+                "model": "claude-opus-4-7",
+                "usage": {"input_tokens": 10},
+            },
+        },
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "ok"},
+        },
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use"},
+            "usage": {"output_tokens": 5},
+        },
+        {"type": "message_delta", "delta": {}, "usage": {"cache_read_input_tokens": 3}},
+        {"type": "message_stop"},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse_body(sse_events),
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr("opensquilla.provider.anthropic.httpx.AsyncClient", patched_async_client)
+
+    provider = AnthropicProvider(api_key="test", model="claude-opus-4-7")
+
+    async def _collect() -> DoneEvent:
+        done: DoneEvent | None = None
+        async for ev in provider.chat([Message(role="user", content="hi")], config=ChatConfig()):
+            assert not isinstance(ev, ErrorEvent)
+            if isinstance(ev, DoneEvent):
+                done = ev
+        assert done is not None
+        return done
+
+    done = asyncio.run(_collect())
+    assert done.stop_reason == "tool_use"
+    assert done.output_tokens == 5
+    assert done.cached_tokens == 3
 
 
 def test_anthropic_http_error_with_non_utf8_body_yields_error_event(monkeypatch) -> None:

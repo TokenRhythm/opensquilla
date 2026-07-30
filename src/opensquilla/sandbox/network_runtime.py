@@ -14,12 +14,17 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol
 
+from opensquilla.sandbox.elevation import (
+    ApprovalReviewerName,
+    effective_approval_reviewer,
+)
 from opensquilla.sandbox.escalation import (
     build_network_approval_params,
     consume_persisted_temporary_network_grant,
     consume_temporary_network_grant,
     context_with_temporary_network_grants,
-    has_temporary_network_grant,
+    current_tool_run_context,
+    discard_approval_run_context_authority,
     request_sandbox_approval,
 )
 from opensquilla.sandbox.governance import action_fingerprint
@@ -89,7 +94,7 @@ class NetworkApprovalService:
     consume_temporary_grants: bool = True
     session_key_override: str | None = None
     workspace_override: str | None = None
-    approval_requester: Callable[..., dict[str, object]] = request_sandbox_approval
+    approval_requester: Callable[..., dict[str, object] | None] = request_sandbox_approval
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
     _pending: dict[HostApprovalKey, _PendingHostApproval] = field(
         default_factory=dict,
@@ -154,6 +159,7 @@ class NetworkApprovalService:
             session_key=self.session_key,
             workspace=self.workspace,
             fingerprint=self.fingerprint,
+            reviewer=self.approval_reviewer,
         )
         if params is None:
             return self._blocked(policy_request, decision.reason)
@@ -165,6 +171,8 @@ class NetworkApprovalService:
                 "grants. Resolve this approval to continue the current request."
             ),
         )
+        if payload is None:
+            return self._blocked(policy_request, "approval_missing")
         status = str(payload.get("status") or "")
         if status == "approval_denied":
             return self._blocked(policy_request, "denied")
@@ -174,28 +182,137 @@ class NetworkApprovalService:
 
         from opensquilla.gateway.approval_queue import get_approval_queue
 
-        approved = await get_approval_queue().wait(
-            approval_id,
-            timeout=self.approval_timeout_seconds,
-        )
+        if params.get("reviewer") == "auto_review":
+            await self._run_auto_review(payload, approval_id)
+        queue = get_approval_queue()
+        try:
+            approved = await queue.wait(
+                approval_id,
+                timeout=self.approval_timeout_seconds,
+            )
+        except asyncio.CancelledError:
+            # The originating client/proxy request is gone, so there is no
+            # continuation left for this card to resume.
+            try:
+                queue.expire_pending(approval_id)
+            except (KeyError, ValueError):
+                pass
+            discard_approval_run_context_authority(approval_id)
+            raise
         if not approved:
-            return self._blocked(policy_request, "denied")
+            try:
+                entry = queue.get(approval_id)
+                rationale = str(entry.params.get("reviewRationale") or "").strip()
+            except KeyError:
+                rationale = ""
+            return self._blocked(policy_request, rationale or "denied")
+        if not self._current_execution_allows_approved_target(policy_request):
+            return self._blocked(
+                policy_request,
+                "approval_authority_unavailable",
+            )
 
-        return NetworkDecision(
+        approved_decision = NetworkDecision(
             status="allow",
             normalized_host=decision.normalized_host,
             reason="approval",
             source="approval:sandbox_network",
         )
+        await self._consume_temporary_grant_if_needed(approved_decision)
+        return approved_decision
+
+    def _current_execution_allows_approved_target(
+        self,
+        policy_request: NetworkPolicyRequest,
+    ) -> bool:
+        from opensquilla.tools.types import current_tool_context
+
+        ctx = current_tool_context.get()
+        if ctx is None:
+            return False
+        if (
+            str(getattr(ctx, "session_key", None) or "").strip()
+            != str(self.session_key or "").strip()
+        ):
+            return False
+        context = current_tool_run_context()
+        if context is None:
+            return False
+        effective = context_with_temporary_network_grants(
+            context,
+            fingerprint=self.fingerprint,
+        )
+        return decide_network_access(
+            policy_request.host,
+            effective,
+        ).status == "allow"
+
+    async def _run_auto_review(
+        self,
+        payload: dict[str, object],
+        approval_id: str,
+    ) -> None:
+        from opensquilla.tools.types import current_tool_context
+
+        ctx = current_tool_context.get()
+        callback = getattr(ctx, "on_sandbox_auto_review", None) if ctx is not None else None
+        if callable(callback):
+            try:
+                await callback(payload)
+            except Exception as exc:
+                self._fail_auto_review_closed(
+                    approval_id,
+                    f"Automatic network review failed closed: {str(exc) or type(exc).__name__}",
+                )
+                return
+            from opensquilla.gateway.approval_queue import get_approval_queue
+
+            try:
+                entry = get_approval_queue().get(approval_id)
+            except KeyError:
+                return
+            if not entry.resolved:
+                if (
+                    entry.params.get("reviewer") == "user"
+                    and entry.params.get("humanActionable") is True
+                ):
+                    return
+                self._fail_auto_review_closed(
+                    approval_id,
+                    "Automatic network review returned without a decision and failed closed.",
+                )
+            return
+        self._fail_auto_review_closed(
+            approval_id,
+            "Automatic network review was unavailable and failed closed.",
+        )
+
+    @staticmethod
+    def _fail_auto_review_closed(approval_id: str, rationale: str) -> None:
+        from opensquilla.gateway.approval_queue import get_approval_queue
+
+        queue = get_approval_queue()
+        try:
+            entry = queue.get(approval_id)
+        except KeyError:
+            return
+        if entry.resolved:
+            return
+        params = dict(entry.params)
+        params.update(
+            {
+                "reviewRiskLevel": "high",
+                "reviewAuthorization": "unknown",
+                "reviewOutcome": "deny",
+                "reviewStatus": "failed_closed",
+                "reviewRationale": rationale,
+            }
+        )
+        queue.update_params(approval_id, params)
+        queue.resolve(approval_id, False)
 
     async def _consume_temporary_grant_if_needed(self, decision: NetworkDecision) -> None:
         if not self.consume_temporary_grants:
-            return
-        if not has_temporary_network_grant(
-            self.context,
-            host=decision.normalized_host,
-            fingerprint=self.fingerprint,
-        ):
             return
         consume_temporary_network_grant(
             session_key=self.session_key,
@@ -237,6 +354,15 @@ class NetworkApprovalService:
         if candidate:
             return str(candidate)
         return str(self.request.cwd) if self.request.cwd else None
+
+    @property
+    def approval_reviewer(self) -> ApprovalReviewerName:
+        settings = getattr(self.runtime, "settings", None)
+        reviewer = str(getattr(settings, "approvals_reviewer", "user") or "user")
+        return effective_approval_reviewer(
+            reviewer,
+            self.context.run_mode,
+        )
 
 
 async def call_network_policy_decider(

@@ -87,7 +87,7 @@ opensquilla diagnostics on
 
 Interactive terminal chat can surface routing decisions through a TUI Router HUD
 when router metadata is present and the selected backend supports the structured
-UI/plugin surface. In the current implementation, the OpenTUI preview footer is
+UI/plugin surface. In the current implementation, the OpenTUI footer is
 the primary terminal display for this HUD. The HUD is display-only: it consumes
 the same turn metadata and does not change model selection.
 

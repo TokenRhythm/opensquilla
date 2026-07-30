@@ -76,7 +76,15 @@ def check_ci_results(env: Mapping[str, str]) -> list[str]:
 
     full = flags["full_required"]
     conditional_results = (
-        ("RESULT_FRONTEND", "Frontend build and typecheck", flags["frontend_changed"] or full),
+        (
+            "RESULT_FRONTEND",
+            "Frontend build, tests, and artifact",
+            flags["frontend_changed"]
+            or flags["build_wheel_required"]
+            or flags["platform_sensitive_changed"]
+            or flags["desktop_changed"]
+            or full,
+        ),
         ("RESULT_TUI", "OpenTUI package tests", flags["tui_changed"] or full),
         ("RESULT_DESKTOP", "Desktop Electron unit tests", flags["desktop_changed"] or full),
         ("RESULT_UBUNTU", "Ubuntu quality gate", flags["python_changed"] or full),

@@ -34,6 +34,7 @@ __all__ = [
     "output_binding",
     "plugins",
     "renderers",
+    "source_checkout",
     "runtime_bridge",
     "slash_adapter",
     "slash_bridge",

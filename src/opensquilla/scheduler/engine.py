@@ -131,6 +131,8 @@ class SchedulerEngine:
         creator_session_key: str = "",
         creator_sender_id: str = "",
         creator_is_owner: bool = False,
+        run_mode: str = "",
+        idempotency_key: str = "",
     ) -> CronJob:
         """Create and persist a new job; compute initial next_run_at.
 
@@ -155,6 +157,8 @@ class SchedulerEngine:
             creator_session_key=creator_session_key,
             creator_sender_id=creator_sender_id,
             creator_is_owner=creator_is_owner,
+            run_mode=run_mode,
+            idempotency_key=idempotency_key,
             schedule_kind=schedule_kind,
             schedule_value=schedule_value,
             schedule_tz=schedule_tz,

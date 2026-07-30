@@ -19,25 +19,33 @@ Lock ordering invariant:
 from __future__ import annotations
 
 import asyncio
+import builtins
+import contextlib
+import inspect
 import time
+import uuid
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import structlog
 
+from opensquilla.engine.agent_injection import PendingInputProvider
 from opensquilla.engine.outcome import completed_outcome, outcome_from_error
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.session_lifecycle import TaskLifecycleEvent, TaskLifecycleListener
 from opensquilla.session.keys import canonicalize_session_key, normalize_agent_id, parse_agent_id
-from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus
+from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus, QueueMode
 from opensquilla.session.terminal_reply import (
     build_terminal_reply,
     is_context_payload_too_large,
     sanitize_agent_error,
 )
+
+if TYPE_CHECKING:
+    from opensquilla.provider.types import ProviderRequestCorrelation
 
 log = structlog.get_logger(__name__)
 
@@ -71,6 +79,49 @@ TERMINAL_STATUSES = frozenset(
 )
 
 TaskStreamEventSink = Callable[[Any], Awaitable[None]]
+_CollectResult = TypeVar("_CollectResult")
+
+
+def _task_identity_payload(
+    envelope: RouteEnvelope,
+    task_id: str,
+    *,
+    user_message_id: str | None = None,
+) -> dict[str, str]:
+    payload = {"turn_id": task_id}
+    session_id = getattr(envelope, "session_id", None)
+    if isinstance(session_id, str) and session_id:
+        payload["session_id"] = session_id
+    metadata = getattr(envelope, "metadata", None)
+    if isinstance(metadata, dict):
+        for field in ("client_message_id", "surface_id"):
+            value = metadata.get(field)
+            if isinstance(value, str) and value:
+                payload[field] = value
+    if isinstance(user_message_id, str) and user_message_id:
+        payload["user_message_id"] = user_message_id
+    return payload
+
+
+def _accepted_run_mode_payload(override: Any) -> dict[str, str] | None:
+    from opensquilla.gateway.project_workspace_runtime import AcceptedRunModeOverride
+
+    if not isinstance(override, AcceptedRunModeOverride):
+        return None
+    payload = {"run_mode": override.run_mode.value}
+    if isinstance(override.run_mode_source, str) and override.run_mode_source:
+        payload["run_mode_source"] = override.run_mode_source
+    return payload
+
+
+def _reusable_route_envelope(envelope: RouteEnvelope) -> RouteEnvelope:
+    """Detach one route for reuse without execution-scoped freshness."""
+
+    return replace(
+        envelope,
+        metadata=dict(envelope.metadata),
+        sandbox_run_context_fresh=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -78,6 +129,42 @@ class TaskHandle:
     task_id: str
     session_key: str
     status: AgentTaskStatus
+
+
+@dataclass(frozen=True)
+class SteerAdmissionResult:
+    """Result of one expected-turn same-turn input admission."""
+
+    accepted: bool
+    task_id: str | None = None
+    persisted: Any | None = None
+    failure_code: str | None = None
+    capability: dict[str, Any] | None = None
+
+
+@dataclass
+class TaskReservation:
+    """Reversible in-memory admission held until durable acceptance commits."""
+
+    reservation_id: str
+    task_record: AgentTaskRecord
+    runtime_task: _RuntimeTask
+    overflow_victim: _RuntimeTask | None = None
+    update_envelope_cache: bool = True
+    activated: bool = False
+    aborted: bool = False
+
+    @property
+    def task_id(self) -> str:
+        return self.task_record.task_id
+
+    @property
+    def session_key(self) -> str:
+        return self.task_record.session_key
+
+    @property
+    def status(self) -> AgentTaskStatus:
+        return self.task_record.status
 
 
 @dataclass(frozen=True)
@@ -103,6 +190,11 @@ class TaskRun:
     # the ingress surface. Kept off RouteEnvelope.metadata so cached envelopes
     # cannot leak stale one-turn ids into later runtime sends.
     persisted_user_message_id: str | None = None
+    # Every persisted user entry folded into this run, in transcript order.
+    # ``persisted_user_message_id`` remains the earliest id and therefore the
+    # history boundary; this collection is used for multi-message cleanup when
+    # the provider rejects the request before a turn can start.
+    persisted_user_message_ids: tuple[str, ...] = ()
     # True when the ingress surface observed an empty user transcript before
     # persisting this turn's user message.
     fresh_user_session: bool = False
@@ -111,6 +203,23 @@ class TaskRun:
     # same live text stream that WebUI already receives without changing
     # the public WS event payload.
     stream_event_sink: TaskStreamEventSink | None = None
+    pending_input_provider: PendingInputProvider | None = None
+    # Immutable-at-acceptance projection used by the Gateway turn handler.
+    # This is deliberately off RouteEnvelope.metadata so cached envelopes can
+    # never leak one turn's strategy into a later proactive send.
+    accepted_config: Any | None = None
+    # Ingress-vetted per-turn run-mode selection. This remains off mutable
+    # RouteEnvelope.metadata so execution cannot manufacture authority from an
+    # arbitrary or cached envelope.
+    accepted_run_mode_override: Any | None = None
+    provider_request_correlation: ProviderRequestCorrelation | None = field(
+        default=None,
+        repr=False,
+    )
+    # Synchronous finalizer callback carrying the exact assistant transcript
+    # row and content produced by this turn. Channel tasks persist it for
+    # durable delivery after terminal commit; other run kinds leave it unset.
+    assistant_message_sink: Callable[[str | None, str], None] | None = None
 
     @property
     def session_key(self) -> str:
@@ -161,6 +270,17 @@ class SubagentCompletionEvent:
         return payload
 
 
+@dataclass(frozen=True)
+class _CollectedPrimaryInput:
+    """One durable prompt coalesced into an already queued collect turn."""
+
+    persisted_user_message_id: str | None
+    client_message_id: str | None
+    surface_id: str | None
+    intent: str = "send"
+    revision: int = 2
+
+
 @dataclass
 class _RuntimeTask:
     task_id: str
@@ -170,25 +290,213 @@ class _RuntimeTask:
     queue_mode: str
     run_kind: str
     no_memory_capture: bool
+    pending_input_provider: _SteerPendingInputProvider = field(
+        default_factory=lambda: _SteerPendingInputProvider()
+    )
     status: AgentTaskStatus = AgentTaskStatus.QUEUED
     asyncio_task: asyncio.Task[None] | None = None
     ingress_pipeline_steps: tuple[Any, ...] = ()
     semantic_message: str | None = None
     persisted_user_message_id: str | None = None
+    persisted_user_message_ids: list[str] = field(default_factory=list)
+    message_count: int = 1
     fresh_user_session: bool = False
+    terminal_assistant_message_id: str | None = None
+    terminal_assistant_message_content: str | None = None
     stream_event_sink: TaskStreamEventSink | None = None
+    accepted_config: Any | None = None
+    provider_request_correlation: ProviderRequestCorrelation | None = field(
+        default=None,
+        repr=False,
+    )
+    accepted_config_captured: bool = False
+    accepted_run_mode_override: Any | None = None
     done: asyncio.Event = field(default_factory=asyncio.Event)
     terminal_emitted: bool = False
     cancel_requested: bool = False
+    execution_started: bool = False
     acquired_slot: bool = False
     overflow_dropped: bool = False
     cancel_source: str | None = None
     cancel_reason: str | None = None
+    # True only while an identity-aware primary input is still represented as
+    # ``queued`` in transcript/live state.  The flag is cleared when execution
+    # publishes ``applied`` or when a terminal path claims the input for a
+    # canonical ``cancelled``/``rejected`` transition.
+    primary_input_pending: bool = False
+    # Public ``queueMode=collect`` may bind several durable prompt rows to one
+    # runtime turn. Keep every additional identity until it reaches an applied
+    # or terminal disposition so hydrate and live projection stay equivalent.
+    collected_primary_inputs: list[_CollectedPrimaryInput] = field(default_factory=list)
+    # Serializes collect persistence/application with this task's running and
+    # terminal transitions. It is intentionally per-task: a slow SQLite write
+    # for one session must never hold the runtime-wide state lock.
+    collect_claim: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    # Serializes same-turn durable acceptance with cancellation and terminal
+    # closure. The storage transaction is intentionally outside _state_lock,
+    # while this per-task gate prevents a terminal path from overtaking it.
+    steer_claim: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+
+    def capture_terminal_assistant_message(
+        self,
+        message_id: str | None,
+        content: str,
+    ) -> None:
+        self.terminal_assistant_message_id = message_id
+        self.terminal_assistant_message_content = content
+
+
+@dataclass(frozen=True)
+class _SteeredInput:
+    text: str
+    semantic_message: str | None = None
+    persisted_user_message_id: str | None = None
+    client_request_id: str | None = None
+    client_message_id: str | None = None
+    surface_id: str | None = None
+    accepted_at_ms: int | None = None
+    applied_iteration: int | None = None
+    model_call_id: str | None = None
+
+
+class _SteerPendingInputProvider:
+    """Pending-input provider that can reclaim an undrained late steer.
+
+    Agent drains this provider only at a safe tool-result boundary. If a turn
+    finishes before reaching another boundary, TaskRuntime promotes the
+    remaining item into a normal follow-up task so an accepted user message is
+    never silently lost.
+    """
+
+    def __init__(self) -> None:
+        self._pending: list[_SteeredInput] = []
+        self._claimed: list[_SteeredInput] = []
+        self._applied: list[_SteeredInput] = []
+        self._applied_recorder: (
+            Callable[
+                [Sequence[_SteeredInput]],
+                Awaitable[Sequence[_SteeredInput]],
+            ]
+            | None
+        ) = None
+
+    def set_applied_recorder(
+        self,
+        recorder: Callable[
+            [Sequence[_SteeredInput]],
+            Awaitable[Sequence[_SteeredInput]],
+        ],
+    ) -> None:
+        """Attach the runtime callback that durably publishes application."""
+
+        self._applied_recorder = recorder
+
+    def append(self, item: _SteeredInput) -> None:
+        if item.text.strip():
+            self._pending.append(item)
+
+    def peek_pending(self) -> list[str]:
+        """Return the next FIFO batch without claiming or mutating it."""
+
+        if self._claimed:
+            return []
+        return [item.text for item in self._pending]
+
+    def drain_pending(self) -> list[str]:
+        if self._claimed:
+            return []
+        items = list(self._pending)
+        self._pending = []
+        # Draining only claims the input for construction of a later provider
+        # request. It is not ``applied`` until the engine confirms that request
+        # has actually started through ``mark_applied``.
+        self._claimed.extend(items)
+        return [item.text for item in items]
+
+    def mark_applied(
+        self,
+        *,
+        iteration: int,
+        model_call_id: str,
+    ) -> Awaitable[None] | None:
+        """Confirm and immediately publish inputs that entered a provider call."""
+
+        if not self._claimed:
+            return None
+        items = [
+            replace(
+                item,
+                applied_iteration=iteration,
+                model_call_id=model_call_id,
+            )
+            for item in self._claimed
+        ]
+        self._claimed = []
+        self._applied.extend(items)
+        applied_recorder = self._applied_recorder
+        if applied_recorder is None:
+            return None
+
+        async def _record_and_acknowledge() -> None:
+            acknowledged = await applied_recorder(items)
+            item_ids = {id(item) for item in acknowledged}
+            self._applied = [
+                item for item in self._applied if id(item) not in item_ids
+            ]
+
+        return _record_and_acknowledge()
+
+    def pending_applied(self) -> list[_SteeredInput]:
+        """Return applied inputs still awaiting durable acknowledgement."""
+
+        return list(self._applied)
+
+    def acknowledge_applied(
+        self,
+        items: Sequence[_SteeredInput],
+    ) -> None:
+        """Forget only applications whose durable transition succeeded."""
+
+        item_ids = {id(item) for item in items}
+        self._applied = [
+            item for item in self._applied if id(item) not in item_ids
+        ]
+
+    def reclaim_pending(self) -> list[_SteeredInput]:
+        pending = [*self._claimed, *self._pending]
+        self._claimed = []
+        self._pending = []
+        return pending
+
+    def reclaim_drained(self) -> list[_SteeredInput]:
+        applied = list(self._applied)
+        self._applied = []
+        return applied
+
+    def reclaim_all(self) -> list[_SteeredInput]:
+        items = [*self._applied, *self._claimed, *self._pending]
+        self._applied = []
+        self._claimed = []
+        self._pending = []
+        return items
 
 
 TaskHandler = Callable[[TaskRun], Awaitable[Any]]
 EventEmitter = Callable[[str, str, dict[str, Any]], Awaitable[None]]
 TerminalListener = Callable[[SubagentCompletionEvent], Awaitable[None]]
+
+
+def _ordered_message_ids(
+    primary: str | None,
+    message_ids: Iterable[str] | None = None,
+) -> list[str]:
+    """Return stable, non-empty, de-duplicated persisted message ids."""
+
+    ordered: list[str] = []
+    for value in (primary, *(message_ids or ())):
+        if isinstance(value, str) and value and value not in ordered:
+            ordered.append(value)
+    return ordered
 
 
 class PendingOverflowPolicy(StrEnum):
@@ -220,6 +528,10 @@ class TaskQueueFullError(RuntimeError):
         self.max_pending = max_pending
 
 
+class _CollectIdentityRebindError(RuntimeError):
+    """Legacy collect could not durably bind its prompt to the queued turn."""
+
+
 class _TurnHardDeadlineExceeded(TimeoutError):  # noqa: N818
     """Internal breaker error raised when a turn exceeds its hard deadline.
 
@@ -229,9 +541,7 @@ class _TurnHardDeadlineExceeded(TimeoutError):  # noqa: N818
     """
 
     def __init__(self, *, deadline_s: float) -> None:
-        super().__init__(
-            f"turn exceeded hard deadline of {deadline_s:g}s"
-        )
+        super().__init__(f"turn exceeded hard deadline of {deadline_s:g}s")
         self.deadline_s = deadline_s
 
 
@@ -239,10 +549,7 @@ def _clean_cancel_detail(value: str | None, default: str) -> str:
     text = str(value or "").strip()
     if not text:
         return default
-    safe = "".join(
-        ch if ch.isalnum() or ch in {"_", "-", ".", ":"} else "_"
-        for ch in text
-    )
+    safe = "".join(ch if ch.isalnum() or ch in {"_", "-", ".", ":"} else "_" for ch in text)
     return (safe.strip("_") or default)[:80]
 
 
@@ -259,6 +566,13 @@ class TaskRuntime:
         cover model streaming, tool execution, slot waits, or approval waits.
     """
 
+    supported_queue_modes = frozenset(mode.value for mode in QueueMode)
+
+    @classmethod
+    def supports_queue_mode(cls, mode: str) -> bool:
+        """Return whether ``enqueue`` implements the exact queue-mode value."""
+        return mode in cls.supported_queue_modes
+
     def __init__(
         self,
         *,
@@ -272,6 +586,7 @@ class TaskRuntime:
         subagent_reserved_slots: int = 0,
         turn_hard_deadline_s: float | None = None,
         running_heartbeat_interval_s: float | None = 30.0,
+        accepted_config_provider: Callable[[], Any] | None = None,
         pending_overflow_policy: PendingOverflowPolicy | str = (
             PendingOverflowPolicy.REJECT_NEWEST
         ),
@@ -290,9 +605,7 @@ class TaskRuntime:
             pending_overflow_policy = PendingOverflowPolicy(pending_overflow_policy)
         except ValueError as exc:
             valid = ", ".join(member.value for member in PendingOverflowPolicy)
-            raise ValueError(
-                f"pending_overflow_policy must be one of {{{valid}}}"
-            ) from exc
+            raise ValueError(f"pending_overflow_policy must be one of {{{valid}}}") from exc
         # Clamp so subagents can always acquire eventually. A reservation that
         # consumes the entire pool would deadlock the subagent lane.
         if subagent_reserved_slots >= max_concurrency:
@@ -315,7 +628,11 @@ class TaskRuntime:
         self._subagent_reserved_slots = subagent_reserved_slots
         self._turn_hard_deadline_s = turn_hard_deadline_s
         self._running_heartbeat_interval_s = running_heartbeat_interval_s
+        self._accepted_config_provider = accepted_config_provider
         self._pending_overflow_policy = pending_overflow_policy
+        from opensquilla.gateway.user_input_broker import StructuredUserInputBroker
+
+        self._user_input_broker = StructuredUserInputBroker()
         # Per-session write locks shared with TurnRunner and RPC ingress on
         # gateway-dispatched turns. These guard short transcript/session state
         # mutations only.
@@ -325,10 +642,26 @@ class TaskRuntime:
         # status updates behind external I/O.
         self._session_execution_locks: dict[str, asyncio.Lock] = {}
         self._tasks: dict[str, _RuntimeTask] = {}
+        # Driver tasks remain tracked until their whole coroutine returns.
+        # ``_mark_terminal`` intentionally sets ``task.done`` before the
+        # subagent notification tail, so waiters that must fence every possible
+        # follow-up write cannot rely on the durable-task event alone.
+        self._driver_tasks_by_session: dict[str, set[asyncio.Task[None]]] = {}
+        self._driver_state_changed = asyncio.Event()
+        self._terminal_fallback_records: dict[str, AgentTaskRecord] = {}
         self._pending_by_session: dict[str, list[_RuntimeTask]] = {}
         self._running_by_session: dict[str, _RuntimeTask] = {}
+        self._reservations_by_session: dict[str, list[TaskReservation]] = {}
+        self._reserved_overflow_victims: set[str] = set()
         self._last_envelope_by_session: dict[str, RouteEnvelope] = {}
+        self._last_envelope_task_id_by_session: dict[str, str] = {}
         self._state_lock = asyncio.Lock()
+        # Admission is per session so durable RPC ingress crosses reserve,
+        # commit, and activation in order. This prevents resets from overtaking
+        # committed-but-inert reservations; collect also uses the same gate so
+        # two sends cannot both miss a candidate and create separate tasks. The
+        # lower-level try_collect_atomically deliberately does not re-enter it.
+        self._collect_admission_locks: dict[str, asyncio.Lock] = {}
         # In-flight counters track tasks that have actually acquired a slot.
         # They drive the reserved-slot fairness gate for subagent runs.
         self._global_in_flight = 0
@@ -365,16 +698,21 @@ class TaskRuntime:
         self,
         envelope: RouteEnvelope,
         message: str,
-        attachments: list[dict[str, Any]] | None = None,
+        attachments: builtins.list[dict[str, Any]] | None = None,
         mode: str | None = None,
         run_kind: str = "default",
         no_memory_capture: bool = False,
         ingress_pipeline_steps: tuple[Any, ...] | list[Any] | None = None,
         semantic_message: str | None = None,
         persisted_user_message_id: str | None = None,
+        persisted_user_message_ids: builtins.list[str] | tuple[str, ...] | None = None,
+        message_count: int = 1,
         fresh_user_session: bool = False,
         stream_event_sink: TaskStreamEventSink | None = None,
+        accepted_run_mode_override: Any | None = None,
         *,
+        task_id: str | None = None,
+        provider_request_correlation: ProviderRequestCorrelation | None = None,
         update_envelope_cache: bool = True,
         overflow_policy: PendingOverflowPolicy | str | None = None,
     ) -> TaskHandle:
@@ -383,38 +721,383 @@ class TaskRuntime:
             agent_id=normalize_agent_id(envelope.agent_id),
             session_key=canonicalize_session_key(envelope.session_key),
         )
-        queue_mode = mode or "followup"
-        if queue_mode == "collect":
-            collected = await self._try_collect(
-                envelope=envelope,
-                message=message,
+        queue_mode = mode or QueueMode.FOLLOWUP.value
+        if not self.supports_queue_mode(queue_mode):
+            valid = ", ".join(sorted(self.supported_queue_modes))
+            raise ValueError(f"mode must be one of {{{valid}}}")
+        async with self.collect_admission(envelope.session_key):
+            if queue_mode == "collect":
+                collected = await self._try_collect(
+                    envelope=envelope,
+                    message=message,
+                    attachments=attachments,
+                    run_kind=run_kind,
+                    no_memory_capture=no_memory_capture,
+                    semantic_message=semantic_message,
+                    persisted_user_message_id=persisted_user_message_id,
+                    persisted_user_message_ids=persisted_user_message_ids,
+                    message_count=message_count,
+                    accepted_run_mode_override=accepted_run_mode_override,
+                )
+                if collected is not None:
+                    return collected
+            return await self._reserve_persist_and_activate(
+                envelope,
+                message,
+                attachments=attachments,
+                mode=queue_mode,
                 run_kind=run_kind,
                 no_memory_capture=no_memory_capture,
-            )
-            if collected is not None:
-                return collected
-        if queue_mode == "interrupt":
-            await self.cancel(
-                session_key=envelope.session_key,
-                source="queue_interrupt",
-                reason="queue_mode_interrupt",
-            )
-        elif self._max_pending_per_session is not None:
-            effective_policy = self._pending_overflow_policy
-            if overflow_policy is not None:
-                try:
-                    effective_policy = PendingOverflowPolicy(overflow_policy)
-                except ValueError as exc:
-                    valid = ", ".join(member.value for member in PendingOverflowPolicy)
-                    raise ValueError(
-                        f"overflow_policy must be one of {{{valid}}}"
-                    ) from exc
-            await self._apply_overflow_policy(
-                envelope.session_key,
-                policy=effective_policy,
+                ingress_pipeline_steps=ingress_pipeline_steps,
+                semantic_message=semantic_message,
+                persisted_user_message_id=persisted_user_message_id,
+                persisted_user_message_ids=persisted_user_message_ids,
+                message_count=message_count,
+                fresh_user_session=fresh_user_session,
+                stream_event_sink=stream_event_sink,
+                accepted_run_mode_override=accepted_run_mode_override,
+                task_id=task_id,
+                provider_request_correlation=provider_request_correlation,
+                update_envelope_cache=update_envelope_cache,
+                overflow_policy=overflow_policy,
             )
 
+    @contextlib.asynccontextmanager
+    async def collect_admission(self, session_key: str) -> AsyncIterator[None]:
+        """Serialize one session's durable ingress and collect decisions.
+
+        Callers that own durable ingress hold this around reserve -> commit ->
+        activate for every queue mode. Collect callers also keep it around
+        ``try_collect_atomically`` so a miss and the following reservation are
+        one admission decision. The lower-level helper does not acquire the gate
+        because ``asyncio.Lock`` is not re-entrant.
+        """
+
+        key = canonicalize_session_key(session_key)
+        lock = self._collect_admission_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            yield
+
+    @contextlib.asynccontextmanager
+    async def quiesce_sessions(
+        self,
+        session_keys: Iterable[str],
+    ) -> AsyncIterator[None]:
+        """Fence runtime work for a stable, ordered set of sessions.
+
+        Cancellation first drains the real ``_execute`` driver coroutines,
+        including their post-terminal notification/promotion tails. Execution
+        and admission locks are then acquired in stable key order. A final
+        state check closes commit-before-activate and reservation races; if
+        anything appeared while the drivers were draining, every lock is
+        released and the sequence retries.
+        """
+
+        keys = tuple(
+            sorted(
+                {
+                    canonicalize_session_key(session_key)
+                    for session_key in session_keys
+                }
+            )
+        )
+        if not keys:
+            yield
+            return
+
+        key_set = frozenset(keys)
+        while True:
+            await self._cancel_and_drain_session_drivers(keys, key_set)
+
+            async with contextlib.AsyncExitStack() as fences:
+                for session_key in keys:
+                    execution_lock = self._session_execution_locks.setdefault(
+                        session_key,
+                        asyncio.Lock(),
+                    )
+                    await self._acquire_execution_lock_while_quiescing(
+                        execution_lock,
+                        keys,
+                        key_set,
+                    )
+                    fences.callback(execution_lock.release)
+                for session_key in keys:
+                    await fences.enter_async_context(
+                        self.collect_admission(session_key)
+                    )
+
+                async with self._state_lock:
+                    active = any(
+                        self._driver_tasks_by_session.get(session_key)
+                        for session_key in keys
+                    )
+                    if not active:
+                        active = any(
+                            task.envelope.session_key in key_set
+                            for task in self._tasks.values()
+                        )
+                    if not active:
+                        active = any(
+                            self._reservations_by_session.get(session_key)
+                            for session_key in keys
+                        )
+                if active:
+                    continue
+
+                yield
+                return
+
+    async def _acquire_execution_lock_while_quiescing(
+        self,
+        execution_lock: asyncio.Lock,
+        keys: Sequence[str],
+        key_set: frozenset[str],
+    ) -> None:
+        """Acquire one execution fence without waiting behind an uncancelled driver."""
+
+        acquiring = asyncio.create_task(execution_lock.acquire())
+        changed: asyncio.Task[bool] | None = None
+        try:
+            while not acquiring.done():
+                # Capture the current generation's broadcast event before the
+                # state snapshot. A mutation swaps in a fresh event and sets
+                # this one, so concurrent quiescers cannot erase each other's
+                # wake-up by clearing shared state.
+                driver_state_changed = self._driver_state_changed
+                await self._cancel_and_drain_session_drivers(keys, key_set)
+                if acquiring.done():
+                    break
+                if driver_state_changed.is_set():
+                    continue
+
+                changed = asyncio.create_task(driver_state_changed.wait())
+                try:
+                    await asyncio.wait(
+                        {acquiring, changed},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    if not changed.done():
+                        changed.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await changed
+                    changed = None
+            await acquiring
+        except BaseException:
+            if changed is not None and not changed.done():
+                changed.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await changed
+            if acquiring.done():
+                try:
+                    acquiring.result()
+                except BaseException:
+                    pass
+                else:
+                    execution_lock.release()
+            else:
+                acquiring.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await acquiring
+            raise
+
+    def _signal_driver_state_changed(self) -> None:
+        """Broadcast one driver-state generation change."""
+
+        changed = self._driver_state_changed
+        self._driver_state_changed = asyncio.Event()
+        changed.set()
+
+    async def _cancel_and_drain_session_drivers(
+        self,
+        keys: Sequence[str],
+        key_set: frozenset[str],
+    ) -> None:
+        async with self._state_lock:
+            runtime_tasks = [
+                task
+                for task in self._tasks.values()
+                if task.envelope.session_key in key_set
+                and task.status not in TERMINAL_STATUSES
+            ]
+            drivers = {
+                driver
+                for session_key in keys
+                for driver in self._driver_tasks_by_session.get(
+                    session_key,
+                    (),
+                )
+                if not driver.done()
+            }
+
+        if runtime_tasks:
+            await self._cancel_runtime_tasks(
+                runtime_tasks,
+                source="workspace_history_delete",
+                reason="project_history_deleted",
+            )
+        if drivers:
+            await asyncio.gather(*drivers, return_exceptions=True)
+            for driver in drivers:
+                for session_key in keys:
+                    self._discard_session_driver(session_key, driver)
+
+    def _discard_session_driver(
+        self,
+        session_key: str,
+        driver: asyncio.Task[None],
+    ) -> None:
+        drivers = self._driver_tasks_by_session.get(session_key)
+        if drivers is None:
+            return
+        drivers.discard(driver)
+        if not drivers:
+            self._driver_tasks_by_session.pop(session_key, None)
+        self._signal_driver_state_changed()
+
+    async def _reserve_persist_and_activate(
+        self,
+        envelope: RouteEnvelope,
+        message: str,
+        attachments: builtins.list[dict[str, Any]] | None = None,
+        mode: str | None = None,
+        run_kind: str = "default",
+        no_memory_capture: bool = False,
+        ingress_pipeline_steps: tuple[Any, ...] | list[Any] | None = None,
+        semantic_message: str | None = None,
+        persisted_user_message_id: str | None = None,
+        persisted_user_message_ids: builtins.list[str] | tuple[str, ...] | None = None,
+        message_count: int = 1,
+        fresh_user_session: bool = False,
+        stream_event_sink: TaskStreamEventSink | None = None,
+        accepted_run_mode_override: Any | None = None,
+        *,
+        task_id: str | None = None,
+        provider_request_correlation: ProviderRequestCorrelation | None = None,
+        update_envelope_cache: bool = True,
+        overflow_policy: PendingOverflowPolicy | str | None = None,
+    ) -> TaskHandle:
+        """Persist and activate one direct enqueue without cancellation drift."""
+
+        reservation = await self.reserve(
+            envelope,
+            message,
+            attachments=attachments,
+            mode=mode,
+            run_kind=run_kind,
+            no_memory_capture=no_memory_capture,
+            ingress_pipeline_steps=ingress_pipeline_steps,
+            semantic_message=semantic_message,
+            persisted_user_message_id=persisted_user_message_id,
+            persisted_user_message_ids=persisted_user_message_ids,
+            message_count=message_count,
+            fresh_user_session=fresh_user_session,
+            stream_event_sink=stream_event_sink,
+            accepted_run_mode_override=accepted_run_mode_override,
+            task_id=task_id,
+            provider_request_correlation=provider_request_correlation,
+            update_envelope_cache=update_envelope_cache,
+            overflow_policy=overflow_policy,
+        )
+        try:
+            await self._storage.create_agent_task(reservation.task_record)
+        except asyncio.CancelledError:
+            # The shared storage layer may finish COMMIT after its caller is
+            # cancelled. Settle the operation, read back by task_id, and cross
+            # exactly one in-memory boundary: persisted tasks activate; absent
+            # tasks release their inert reservation.
+            persisted = await self._wait_for_task_settlement(
+                asyncio.create_task(self._storage.get_agent_task(reservation.task_id))
+            )
+            if persisted is None:
+                await self._wait_for_task_settlement(
+                    asyncio.create_task(self.abort_reservation(reservation))
+                )
+            else:
+                await self._wait_for_task_settlement(
+                    asyncio.create_task(self.activate(reservation))
+                )
+            raise
+        except BaseException:
+            await self.abort_reservation(reservation)
+            raise
+        try:
+            return await self.activate(reservation)
+        except asyncio.CancelledError:
+            # Persistence has definitely returned successfully. If cancellation
+            # arrived before ``activate`` crossed its in-memory boundary, finish
+            # activation in a fresh child; otherwise the reservation already owns
+            # the live task and only the caller cancellation remains to propagate.
+            if not reservation.activated:
+                await self._wait_for_task_settlement(
+                    asyncio.create_task(self.activate(reservation))
+                )
+            raise
+
+    @staticmethod
+    async def _wait_for_task_settlement[T](task: asyncio.Task[T]) -> T:
+        """Wait for a child operation without forwarding caller cancellation."""
+
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+        return task.result()
+
+    async def reserve(
+        self,
+        envelope: RouteEnvelope,
+        message: str,
+        attachments: builtins.list[dict[str, Any]] | None = None,
+        mode: str | None = None,
+        run_kind: str = "default",
+        no_memory_capture: bool = False,
+        ingress_pipeline_steps: tuple[Any, ...] | list[Any] | None = None,
+        semantic_message: str | None = None,
+        persisted_user_message_id: str | None = None,
+        persisted_user_message_ids: builtins.list[str] | tuple[str, ...] | None = None,
+        message_count: int = 1,
+        fresh_user_session: bool = False,
+        stream_event_sink: TaskStreamEventSink | None = None,
+        accepted_run_mode_override: Any | None = None,
+        *,
+        task_id: str | None = None,
+        provider_request_correlation: ProviderRequestCorrelation | None = None,
+        update_envelope_cache: bool = True,
+        overflow_policy: PendingOverflowPolicy | str | None = None,
+    ) -> TaskReservation:
+        """Reserve queue admission without persistence, cancellation, or execution."""
+
+        envelope = replace(
+            envelope,
+            agent_id=normalize_agent_id(envelope.agent_id),
+            session_key=canonicalize_session_key(envelope.session_key),
+        )
+        queue_mode = mode or "followup"
+        normalized_message_ids = _ordered_message_ids(
+            persisted_user_message_id,
+            persisted_user_message_ids,
+        )
+        persisted_user_message_id = (
+            normalized_message_ids[0] if normalized_message_ids else None
+        )
+        message_count = max(1, int(message_count))
+        effective_policy = self._pending_overflow_policy
+        if overflow_policy is not None:
+            try:
+                effective_policy = PendingOverflowPolicy(overflow_policy)
+            except ValueError as exc:
+                valid = ", ".join(member.value for member in PendingOverflowPolicy)
+                raise ValueError(
+                    f"overflow_policy must be one of {{{valid}}}"
+                ) from exc
+
+        record_kwargs: dict[str, Any] = {}
+        if task_id is not None:
+            record_kwargs["task_id"] = task_id
         record = AgentTaskRecord(
+            **record_kwargs,
             session_key=envelope.session_key,
             agent_id=envelope.agent_id,
             source_kind=envelope.source_kind.value,
@@ -427,10 +1110,24 @@ class TaskRuntime:
                 "no_memory_capture": no_memory_capture,
                 "metadata": envelope.metadata,
                 "persisted_user_message_id": persisted_user_message_id,
+                "persisted_user_message_ids": normalized_message_ids,
+                "message_count": message_count,
                 "fresh_user_session": fresh_user_session,
             },
         )
-        await self._storage.create_agent_task(record)
+        record.details = {
+            **(record.details or {}),
+            **_task_identity_payload(
+                envelope,
+                record.task_id,
+                user_message_id=persisted_user_message_id,
+            ),
+        }
+        accepted_run_mode_payload = _accepted_run_mode_payload(
+            accepted_run_mode_override,
+        )
+        if accepted_run_mode_payload is not None:
+            record.details["accepted_run_mode"] = accepted_run_mode_payload
         runtime_task = _RuntimeTask(
             task_id=record.task_id,
             envelope=envelope,
@@ -442,15 +1139,237 @@ class TaskRuntime:
             ingress_pipeline_steps=tuple(ingress_pipeline_steps or ()),
             semantic_message=semantic_message,
             persisted_user_message_id=persisted_user_message_id,
+            persisted_user_message_ids=normalized_message_ids,
+            message_count=message_count,
             fresh_user_session=fresh_user_session,
             stream_event_sink=stream_event_sink,
+            accepted_run_mode_override=accepted_run_mode_override,
+            provider_request_correlation=provider_request_correlation,
+            primary_input_pending=bool(
+                (persisted_user_message_id or envelope.metadata.get("client_message_id"))
+                and envelope.metadata.get("turn_context_disposition", "queued") == "queued"
+            ),
         )
+
+        async def _record_applied_steers(
+            items: Sequence[_SteeredInput],
+        ) -> Sequence[_SteeredInput]:
+            return await self._record_steer_dispositions(
+                runtime_task,
+                items,
+                disposition="applied",
+                turn_id=runtime_task.task_id,
+                revision=2,
+            )
+
+        runtime_task.pending_input_provider.set_applied_recorder(
+            _record_applied_steers
+        )
+        reservation = TaskReservation(
+            reservation_id=str(uuid.uuid4()),
+            task_record=record,
+            runtime_task=runtime_task,
+            update_envelope_cache=update_envelope_cache,
+        )
+
         async with self._state_lock:
-            self._tasks[record.task_id] = runtime_task
-            self._pending_by_session.setdefault(envelope.session_key, []).append(runtime_task)
-            # Register session in per-agent RR deque (if not already).
-            agent_id = envelope.agent_id
-            session_key = envelope.session_key
+            if (
+                queue_mode not in {QueueMode.STEER.value, QueueMode.INTERRUPT.value}
+                and self._max_pending_per_session is not None
+            ):
+                pending = [
+                    task
+                    for task in self._pending_by_session.get(envelope.session_key, [])
+                    if task.task_id not in self._reserved_overflow_victims
+                ]
+                reservations = self._reservations_by_session.get(envelope.session_key, [])
+                if len(pending) + len(reservations) >= self._max_pending_per_session:
+                    victim: _RuntimeTask | None = None
+                    if effective_policy is PendingOverflowPolicy.DROP_OLDEST:
+                        victim = next(
+                            (
+                                task
+                                for task in pending
+                                if task.status == AgentTaskStatus.QUEUED
+                            ),
+                            None,
+                        )
+                    if victim is None:
+                        _emit_metric(
+                            "queue_full_errors_total",
+                            value=1,
+                            session_key=envelope.session_key,
+                            policy=str(effective_policy),
+                        )
+                        raise TaskQueueFullError(
+                            session_key=envelope.session_key,
+                            max_pending=self._max_pending_per_session,
+                        )
+                    reservation.overflow_victim = victim
+                    self._reserved_overflow_victims.add(victim.task_id)
+            self._reservations_by_session.setdefault(envelope.session_key, []).append(
+                reservation
+            )
+        return reservation
+
+    async def abort_reservation(self, reservation: TaskReservation) -> None:
+        """Release a reservation after its persistence transaction fails."""
+
+        async with self._state_lock:
+            if reservation.activated or reservation.aborted:
+                return
+            reservations = self._reservations_by_session.get(reservation.session_key, [])
+            with contextlib.suppress(ValueError):
+                reservations.remove(reservation)
+            if not reservations:
+                self._reservations_by_session.pop(reservation.session_key, None)
+            if reservation.overflow_victim is not None:
+                self._reserved_overflow_victims.discard(
+                    reservation.overflow_victim.task_id
+                )
+            reservation.aborted = True
+
+    async def _emit_queued_activation(
+        self,
+        envelope: RouteEnvelope,
+        *,
+        task_id: str,
+        queue_depth: int,
+        queue_position: int,
+        run_kind: str,
+        user_message_id: str | None = None,
+    ) -> None:
+        """Publish the queued lifecycle after irreversible activation."""
+
+        await self._emit(
+            envelope.session_key,
+            "task.queued",
+            {
+                "task_id": task_id,
+                "session_key": envelope.session_key,
+                "queue_depth": queue_depth,
+                "queue_position": queue_position,
+                **_task_identity_payload(
+                    envelope,
+                    task_id,
+                    user_message_id=user_message_id,
+                ),
+            },
+        )
+        await self._notify_task_lifecycle(
+            TaskLifecycleEvent(
+                phase="queued",
+                session_key=envelope.session_key,
+                task_id=task_id,
+                task_status=AgentTaskStatus.QUEUED,
+                run_kind=run_kind,
+            )
+        )
+
+    async def activate(
+        self,
+        reservation: TaskReservation,
+        *,
+        persisted_user_message_id: str | None = None,
+        persisted_user_message_ids: list[str] | tuple[str, ...] | None = None,
+        fresh_user_session: bool | None = None,
+    ) -> TaskHandle:
+        """Idempotently activate a reservation after its DB transaction commits."""
+
+        interrupt_targets: list[_RuntimeTask] = []
+        victim: _RuntimeTask | None = None
+        async with self._state_lock:
+            if reservation.aborted:
+                raise RuntimeError("Cannot activate an aborted task reservation")
+            if reservation.activated:
+                return TaskHandle(
+                    task_id=reservation.task_id,
+                    session_key=reservation.session_key,
+                    status=reservation.status,
+                )
+            reservations = self._reservations_by_session.get(reservation.session_key, [])
+            if reservation not in reservations:
+                raise RuntimeError("Unknown task reservation")
+
+            runtime_task = reservation.runtime_task
+            if not runtime_task.accepted_config_captured:
+                accepted_config = (
+                    self._accepted_config_provider()
+                    if self._accepted_config_provider is not None
+                    else None
+                )
+                runtime_task.accepted_config = accepted_config
+                runtime_task.accepted_config_captured = True
+
+            reservations.remove(reservation)
+            if not reservations:
+                self._reservations_by_session.pop(reservation.session_key, None)
+
+            activated_message_ids = _ordered_message_ids(
+                runtime_task.persisted_user_message_id,
+                (
+                    *runtime_task.persisted_user_message_ids,
+                    *([persisted_user_message_id] if persisted_user_message_id else []),
+                    *(persisted_user_message_ids or ()),
+                ),
+            )
+            runtime_task.persisted_user_message_ids = activated_message_ids
+            runtime_task.persisted_user_message_id = (
+                activated_message_ids[0] if activated_message_ids else None
+            )
+            if fresh_user_session is not None:
+                runtime_task.fresh_user_session = fresh_user_session
+            if (
+                not runtime_task.primary_input_pending
+                and (
+                    runtime_task.persisted_user_message_id
+                    or runtime_task.envelope.metadata.get("client_message_id")
+                )
+                and runtime_task.envelope.metadata.get(
+                    "turn_context_disposition", "queued"
+                )
+                == "queued"
+            ):
+                runtime_task.primary_input_pending = True
+
+            if runtime_task.queue_mode in {
+                QueueMode.STEER.value,
+                QueueMode.INTERRUPT.value,
+            }:
+                interrupt_targets = [
+                    task
+                    for task in self._tasks.values()
+                    if task.envelope.session_key == reservation.session_key
+                    and task.status not in TERMINAL_STATUSES
+                ]
+                for target in interrupt_targets:
+                    target.cancel_requested = True
+                    target.cancel_source = f"queue_{runtime_task.queue_mode}"
+                    target.cancel_reason = f"queue_mode_{runtime_task.queue_mode}"
+
+            victim = reservation.overflow_victim
+            if victim is not None:
+                self._reserved_overflow_victims.discard(victim.task_id)
+                pending = self._pending_by_session.get(reservation.session_key, [])
+                if (
+                    victim.status != AgentTaskStatus.QUEUED
+                    or victim not in pending
+                ):
+                    # The durable acceptance window may be long enough for the
+                    # reserved victim to start running. DROP_OLDEST only evicts
+                    # waiting work; once the victim has left the pending queue,
+                    # its slot has already made room for this replacement.
+                    victim = None
+                else:
+                    victim.cancel_requested = True
+                    victim.overflow_dropped = True
+
+            self._tasks[reservation.task_id] = runtime_task
+            self._pending_by_session.setdefault(reservation.session_key, []).append(
+                runtime_task
+            )
+            agent_id = runtime_task.envelope.agent_id
+            session_key = runtime_task.envelope.session_key
             if agent_id not in self._agent_session_rr:
                 self._agent_session_rr[agent_id] = deque()
                 self._agent_active_sessions[agent_id] = set()
@@ -459,42 +1378,87 @@ class TaskRuntime:
             if session_key not in active:
                 active.add(session_key)
                 rr.append(session_key)
-            if update_envelope_cache:
-                self._last_envelope_by_session[envelope.session_key] = envelope
-            runtime_task.asyncio_task = asyncio.create_task(self._execute(runtime_task))
-            _queue_depth = len(self._pending_by_session.get(envelope.session_key, []))
-            _queue_position = _queue_depth
+            if reservation.update_envelope_cache:
+                self._last_envelope_by_session[session_key] = (
+                    _reusable_route_envelope(runtime_task.envelope)
+                )
+                self._last_envelope_task_id_by_session[session_key] = (
+                    runtime_task.task_id
+                )
+            driver = asyncio.create_task(self._execute(runtime_task))
+            runtime_task.asyncio_task = driver
+            self._driver_tasks_by_session.setdefault(session_key, set()).add(driver)
+            self._signal_driver_state_changed()
+
+            def _discard_driver(completed: asyncio.Task[None]) -> None:
+                self._discard_session_driver(session_key, completed)
+
+            driver.add_done_callback(_discard_driver)
+            reservation.activated = True
+            queue_depth = len(self._pending_by_session.get(session_key, []))
+            queue_position = queue_depth
+            envelope = runtime_task.envelope
+
+        for target in interrupt_targets:
+            asyncio_task = target.asyncio_task
+            if asyncio_task is not None and not asyncio_task.done():
+                asyncio_task.cancel()
+        if victim is not None:
+            asyncio_task = victim.asyncio_task
+            if asyncio_task is not None and not asyncio_task.done():
+                asyncio_task.cancel()
+            try:
+                await self._mark_terminal(
+                    victim,
+                    AgentTaskStatus.CANCELLED,
+                    terminal_reason="dropped_by_overflow",
+                )
+            except Exception as exc:  # noqa: BLE001 - new task is already active.
+                # Activation has crossed its irreversible boundary: the newly
+                # accepted task is registered and executing. A best-effort
+                # terminal update for the evicted task must not make callers
+                # treat that accepted task as rejected or leave the victim's
+                # waiters hanging forever.
+                log.warning(
+                    "task_runtime.overflow_victim_terminal_failed",
+                    task_id=victim.task_id,
+                    session_key=victim.envelope.session_key,
+                    error=str(exc),
+                )
+            finally:
+                victim.done.set()
+
         _emit_metric(
             "opensquilla_queue_depth",
-            value=_queue_depth,
-            session_key=envelope.session_key,
+            value=queue_depth,
+            session_key=reservation.session_key,
         )
-        await self._emit(
-            envelope.session_key,
-            "task.queued",
-            {
-                "task_id": record.task_id,
-                "session_key": envelope.session_key,
-                "queue_depth": _queue_depth,
-                "queue_position": _queue_position,
-            },
-        )
-        await self._notify_task_lifecycle(
-            TaskLifecycleEvent(
-                phase="queued",
-                session_key=envelope.session_key,
-                task_id=record.task_id,
-                task_status=AgentTaskStatus.QUEUED,
-                run_kind=run_kind,
+        try:
+            await self._emit_queued_activation(
+                envelope,
+                task_id=reservation.task_id,
+                queue_depth=queue_depth,
+                queue_position=queue_position,
+                run_kind=runtime_task.run_kind,
+                user_message_id=runtime_task.persisted_user_message_id,
             )
-        )
+        except Exception:  # noqa: BLE001 - acceptance is already durable.
+            log.warning(
+                "task_runtime.activation_notification_failed",
+                task_id=reservation.task_id,
+                session_key=reservation.session_key,
+                exc_info=True,
+            )
         return TaskHandle(
-            task_id=record.task_id,
-            session_key=envelope.session_key,
+            task_id=reservation.task_id,
+            session_key=reservation.session_key,
             status=AgentTaskStatus.QUEUED,
         )
 
     async def status(self, task_id: str) -> AgentTaskRecord:
+        fallback = self._terminal_fallback_records.get(task_id)
+        if fallback is not None:
+            return fallback
         record = await self._storage.get_agent_task(task_id)
         if record is None:
             raise KeyError(f"Agent task not found: {task_id}")
@@ -512,6 +1476,279 @@ class TaskRuntime:
             await self._storage.list_agent_tasks(session_key=session_key, status=status),
         )
 
+    async def active_task_id(self, session_key: str) -> str | None:
+        """Return the currently running turn id for one canonical session."""
+
+        session_key = canonicalize_session_key(session_key)
+        async with self._state_lock:
+            task = self._running_by_session.get(session_key)
+            if (
+                task is None
+                or task.terminal_emitted
+                or task.cancel_requested
+                or task.status is not AgentTaskStatus.RUNNING
+            ):
+                return None
+            return task.task_id
+
+    @staticmethod
+    def _steer_capability_for_task(task: _RuntimeTask) -> dict[str, Any]:
+        """Describe whether the active task accepts first-phase same-turn input."""
+
+        if task.run_kind == "channel_turn":
+            return {
+                "mode": "queue_only",
+                "expected_turn_id": task.task_id,
+                "input_kinds": ["text"],
+                "reason": "restart_recovery_unavailable",
+            }
+
+        interactive_run_kinds = {"default", "session_turn", "web_turn"}
+        if task.run_kind not in interactive_run_kinds:
+            return {
+                "mode": "disabled",
+                "expected_turn_id": task.task_id,
+                "input_kinds": [],
+                "reason": "task_kind_not_steerable",
+            }
+
+        from opensquilla.gateway.model_routing import model_routing_snapshot
+
+        routing = model_routing_snapshot(task.accepted_config)
+        if routing.get("mode") == "ensemble":
+            return {
+                "mode": "queue_only",
+                "expected_turn_id": task.task_id,
+                "input_kinds": ["text"],
+                "reason": "ensemble_requires_followup_turn",
+            }
+        return {
+            "mode": "same_turn",
+            "expected_turn_id": task.task_id,
+            "input_kinds": ["text"],
+            "reason": None,
+        }
+
+    async def steer_capability(self, session_key: str) -> dict[str, Any]:
+        """Return the authoritative capability of one currently running task."""
+
+        session_key = canonicalize_session_key(session_key)
+        async with self._state_lock:
+            task = self._running_by_session.get(session_key)
+            if task is None:
+                return {
+                    "mode": "disabled",
+                    "expected_turn_id": None,
+                    "input_kinds": [],
+                    "reason": "no_active_turn",
+                }
+            if (
+                task.terminal_emitted
+                or task.cancel_requested
+                or task.status is not AgentTaskStatus.RUNNING
+            ):
+                return {
+                    "mode": "disabled",
+                    "expected_turn_id": task.task_id,
+                    "input_kinds": [],
+                    "reason": "turn_closing",
+                }
+            return self._steer_capability_for_task(task)
+
+    async def admit_steer(
+        self,
+        session_key: str,
+        expected_turn_id: str,
+        message: str,
+        *,
+        persist: Callable[[str], Awaitable[Any]],
+        semantic_message: str | None = None,
+        client_request_id: str | None = None,
+        client_message_id: str | None = None,
+        surface_id: str | None = None,
+    ) -> SteerAdmissionResult:
+        """Atomically persist and attach text to one explicitly named live turn.
+
+        The per-task gate spans the durable persistence callback and in-memory
+        append. Cancellation and terminalization take the same gate, so an
+        accepted transcript row can never require an optimistic rollback.
+        """
+
+        session_key = canonicalize_session_key(session_key)
+        async with self._state_lock:
+            task = self._running_by_session.get(session_key)
+            if task is None:
+                return SteerAdmissionResult(
+                    accepted=False,
+                    failure_code="NO_ACTIVE_TURN",
+                    capability={
+                        "mode": "disabled",
+                        "expected_turn_id": None,
+                        "input_kinds": [],
+                        "reason": "no_active_turn",
+                    },
+                )
+            if task.task_id != expected_turn_id:
+                return SteerAdmissionResult(
+                    accepted=False,
+                    task_id=task.task_id,
+                    failure_code="EXPECTED_TURN_MISMATCH",
+                    capability=self._steer_capability_for_task(task),
+                )
+
+        async with task.steer_claim:
+            async with self._state_lock:
+                current = self._running_by_session.get(session_key)
+                if current is not task:
+                    return SteerAdmissionResult(
+                        accepted=False,
+                        failure_code="NO_ACTIVE_TURN",
+                        capability={
+                            "mode": "disabled",
+                            "expected_turn_id": None,
+                            "input_kinds": [],
+                            "reason": "no_active_turn",
+                        },
+                    )
+                if (
+                    task.terminal_emitted
+                    or task.cancel_requested
+                    or task.status is not AgentTaskStatus.RUNNING
+                ):
+                    return SteerAdmissionResult(
+                        accepted=False,
+                        task_id=task.task_id,
+                        failure_code="ACTIVE_TURN_NOT_STEERABLE",
+                        capability={
+                            "mode": "disabled",
+                            "expected_turn_id": task.task_id,
+                            "input_kinds": [],
+                            "reason": "turn_closing",
+                        },
+                    )
+                capability = self._steer_capability_for_task(task)
+                if capability["mode"] != "same_turn":
+                    return SteerAdmissionResult(
+                        accepted=False,
+                        task_id=task.task_id,
+                        failure_code="ACTIVE_TURN_NOT_STEERABLE",
+                        capability=capability,
+                    )
+
+            persisted = await persist(task.task_id)
+            replayed = bool(getattr(persisted, "replayed", False))
+            if not replayed:
+                task.pending_input_provider.append(
+                    _SteeredInput(
+                        text=message,
+                        semantic_message=semantic_message,
+                        persisted_user_message_id=getattr(
+                            getattr(persisted, "receipt", None),
+                            "message_id",
+                            None,
+                        ),
+                        client_request_id=client_request_id,
+                        client_message_id=client_message_id,
+                        surface_id=surface_id,
+                        accepted_at_ms=getattr(
+                            getattr(persisted, "receipt", None),
+                            "accepted_at",
+                            None,
+                        ),
+                    )
+                )
+            return SteerAdmissionResult(
+                accepted=True,
+                task_id=task.task_id,
+                persisted=persisted,
+                capability=capability,
+            )
+
+    async def resolve_user_input(
+        self,
+        *,
+        session_key: str,
+        request_id: str,
+        fields: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Resolve one structured interaction without creating a new turn."""
+
+        return self._user_input_broker.resolve(
+            session_key=session_key,
+            request_id=request_id,
+            fields=fields,
+        )
+
+    def pending_user_inputs(
+        self,
+        session_key: str,
+    ) -> builtins.list[dict[str, Any]]:
+        """Return public pending-interaction payloads for reconnect hydration."""
+
+        return self._user_input_broker.pending_for_session(session_key)
+
+    async def _update_transcript_turn_context(
+        self,
+        session_key: str,
+        message_id: str | None,
+        turn_context: dict[str, Any],
+    ) -> bool:
+        update = getattr(self._storage, "update_transcript_turn_context", None)
+        if not message_id or not callable(update):
+            return False
+        result = update(session_key, message_id, turn_context)
+        if inspect.isawaitable(result):
+            result = await result
+        return bool(result)
+
+    async def steer(
+        self,
+        session_key: str,
+        message: str,
+        *,
+        semantic_message: str | None = None,
+        persisted_user_message_id: str | None = None,
+        client_request_id: str | None = None,
+        client_message_id: str | None = None,
+        surface_id: str | None = None,
+    ) -> str | None:
+        """Inject input into a running turn at its next safe model boundary.
+
+        Returns the active turn id when accepted. A turn that ends before the
+        next provider call starts promotes it to a follow-up in ``_execute``.
+        """
+
+        session_key = canonicalize_session_key(session_key)
+        async with self._state_lock:
+            task = self._running_by_session.get(session_key)
+            if (
+                task is None
+                or task.terminal_emitted
+                or task.cancel_requested
+                or task.status is not AgentTaskStatus.RUNNING
+            ):
+                return None
+        async with task.steer_claim:
+            async with self._state_lock:
+                if (
+                    self._running_by_session.get(session_key) is not task
+                    or task.terminal_emitted
+                    or task.cancel_requested
+                    or task.status is not AgentTaskStatus.RUNNING
+                ):
+                    return None
+                task.pending_input_provider.append(
+                    _SteeredInput(
+                        text=message,
+                        semantic_message=semantic_message,
+                        persisted_user_message_id=persisted_user_message_id,
+                        client_request_id=client_request_id,
+                        client_message_id=client_message_id,
+                        surface_id=surface_id,
+                    )
+                )
+                return task.task_id
+
     async def cancel(
         self,
         task_id: str | None = None,
@@ -524,20 +1761,94 @@ class TaskRuntime:
             raise ValueError("task_id or session_key is required")
         if session_key is not None:
             session_key = canonicalize_session_key(session_key)
-        async with self._state_lock:
-            tasks = [
-                task
-                for task in self._tasks.values()
-                if (task_id is None or task.task_id == task_id)
-                and (session_key is None or task.envelope.session_key == session_key)
-                and task.status not in TERMINAL_STATUSES
-            ]
+        candidates = [
+            task
+            for task in list(self._tasks.values())
+            if (task_id is None or task.task_id == task_id)
+            and (session_key is None or task.envelope.session_key == session_key)
+        ]
+        return await self._cancel_runtime_tasks(
+            candidates,
+            source=source,
+            reason=reason,
+        )
+
+    async def _cancel_runtime_tasks(
+        self,
+        candidates: Sequence[_RuntimeTask],
+        *,
+        source: str | None,
+        reason: str | None,
+    ) -> int:
+        """Atomically close cancellation and same-turn acceptance for a batch."""
+
+        queued_tasks: list[_RuntimeTask] = []
+        ordered_candidates = sorted(
+            {task.task_id: task for task in candidates}.values(),
+            key=lambda task: task.task_id,
+        )
+        async with contextlib.AsyncExitStack() as steer_fences:
+            for task in ordered_candidates:
+                await steer_fences.enter_async_context(task.steer_claim)
+            async with self._state_lock:
+                tasks = [
+                    task
+                    for task in ordered_candidates
+                    if self._tasks.get(task.task_id) is task
+                    and task.status not in TERMINAL_STATUSES
+                ]
+                for task in tasks:
+                    if (
+                        task.status == AgentTaskStatus.QUEUED
+                        and not task.execution_started
+                    ):
+                        queued_tasks.append(task)
+                    task.cancel_requested = True
+                    task.cancel_source = _clean_cancel_detail(source, "unknown")
+                    task.cancel_reason = _clean_cancel_detail(reason, "cancelled")
+            # Persist the user/system cancellation distinction before signalling
+            # the coroutine. If the process dies during disposition cleanup,
+            # startup recovery can still decide whether pending steer text must
+            # be restored to the composer or promoted as system-abandoned work.
             for task in tasks:
-                task.cancel_requested = True
-                task.cancel_source = _clean_cancel_detail(source, "unknown")
-                task.cancel_reason = _clean_cancel_detail(reason, "cancelled")
+                try:
+                    existing = await self._storage.get_agent_task(task.task_id)
+                    details_raw = getattr(existing, "details", None)
+                    details = (
+                        dict(details_raw)
+                        if isinstance(details_raw, dict)
+                        else {}
+                    )
+                    details["cancellation_requested"] = {
+                        "source": task.cancel_source,
+                        "reason": task.cancel_reason,
+                    }
+                    await self._storage.update_agent_task(
+                        task.task_id,
+                        details=details,
+                    )
+                except Exception:  # noqa: BLE001 - cancellation must still proceed
+                    log.warning(
+                        "task_runtime.cancellation_request_persist_failed",
+                        task_id=task.task_id,
+                        session_key=task.envelope.session_key,
+                        exc_info=True,
+                    )
+            for task in tasks:
                 if task.asyncio_task is not None and not task.asyncio_task.done():
                     task.asyncio_task.cancel()
+        # A coroutine cancelled before its first event-loop step never enters
+        # ``_execute`` and therefore cannot run its CancelledError cleanup.
+        # Finalise only tasks whose coroutine never started. A started task may
+        # still report QUEUED while it waits for a collect claim; synchronously
+        # waiting for that same claim here would deadlock cancel() against the
+        # collector. Started tasks finish through _execute's cancellation path.
+        for task in queued_tasks:
+            await self._mark_terminal(
+                task,
+                AgentTaskStatus.CANCELLED,
+                terminal_reason="cancelled_before_start",
+            )
         return len(tasks)
 
     async def send(
@@ -547,6 +1858,7 @@ class TaskRuntime:
         provenance: dict[str, Any] | None = None,
         stream_event_sink: TaskStreamEventSink | None = None,
     ) -> TaskHandle:
+        """Enqueue a system follow-up without classifying it as a user turn."""
         session_key = canonicalize_session_key(session_key)
         cached = self._last_envelope_by_session.get(session_key)
         if cached is None:
@@ -561,13 +1873,16 @@ class TaskRuntime:
                 envelope,
                 message,
                 mode="followup",
+                run_kind="runtime_send",
                 stream_event_sink=stream_event_sink,
             )
+        cached = _reusable_route_envelope(cached)
         if provenance is None:
             return await self.enqueue(
                 cached,
                 message,
                 mode="followup",
+                run_kind="runtime_send",
                 stream_event_sink=stream_event_sink,
             )
         # Caller-provided provenance is a one-shot override: build an
@@ -580,7 +1895,35 @@ class TaskRuntime:
             ephemeral,
             message,
             mode="followup",
+            run_kind="runtime_send",
             stream_event_sink=stream_event_sink,
+            update_envelope_cache=False,
+        )
+
+    async def send_with_envelope(
+        self,
+        envelope: RouteEnvelope,
+        message: str,
+        provenance: dict[str, Any] | None = None,
+        stream_event_sink: TaskStreamEventSink | None = None,
+        accepted_run_mode_override: Any | None = None,
+    ) -> TaskHandle:
+        """Send a follow-up while preserving authoritative routing and mode context."""
+        if not isinstance(envelope, RouteEnvelope):
+            raise TypeError("envelope must be a RouteEnvelope")
+        canonical_session_key = canonicalize_session_key(envelope.session_key)
+        routed = replace(
+            envelope,
+            session_key=canonical_session_key,
+            agent_id=parse_agent_id(canonical_session_key),
+            input_provenance=provenance or envelope.input_provenance,
+        )
+        return await self.enqueue(
+            _reusable_route_envelope(routed),
+            message,
+            mode="followup",
+            stream_event_sink=stream_event_sink,
+            accepted_run_mode_override=accepted_run_mode_override,
             update_envelope_cache=False,
         )
 
@@ -646,8 +1989,16 @@ class TaskRuntime:
             tasks = [t for t in tasks if not t.done()]
 
         if cancel:
-            for task in tasks:
-                task.cancel()
+            runtime_tasks = [
+                runtime_task
+                for runtime_task in list(self._tasks.values())
+                if runtime_task.asyncio_task in tasks
+            ]
+            await self._cancel_runtime_tasks(
+                runtime_tasks,
+                source="gateway_shutdown",
+                reason=("graceful_timeout" if graceful else "shutdown"),
+            )
         if tasks:
             done, pending = await asyncio.wait(tasks, timeout=timeout)
             for task in pending:
@@ -681,9 +2032,7 @@ class TaskRuntime:
                 resolved = PendingOverflowPolicy(policy)
             except ValueError as exc:
                 valid = ", ".join(member.value for member in PendingOverflowPolicy)
-                raise ValueError(
-                    f"overflow_policy must be one of {{{valid}}}"
-                ) from exc
+                raise ValueError(f"overflow_policy must be one of {{{valid}}}") from exc
         await self._apply_overflow_policy(
             canonicalize_session_key(session_key),
             policy=resolved,
@@ -716,11 +2065,7 @@ class TaskRuntime:
             if pending_count >= self._max_pending_per_session:
                 if policy == PendingOverflowPolicy.DROP_OLDEST:
                     victim = next(
-                        (
-                            task
-                            for task in pending
-                            if task.status == AgentTaskStatus.QUEUED
-                        ),
+                        (task for task in pending if task.status == AgentTaskStatus.QUEUED),
                         None,
                     )
                 if policy != PendingOverflowPolicy.DROP_OLDEST or victim is None:
@@ -766,9 +2111,161 @@ class TaskRuntime:
         *,
         envelope: RouteEnvelope,
         message: str,
+        attachments: builtins.list[dict[str, Any]] | None = None,
         run_kind: str,
         no_memory_capture: bool,
+        semantic_message: str | None = None,
+        persisted_user_message_id: str | None = None,
+        persisted_user_message_ids: builtins.list[str] | tuple[str, ...] | None = None,
+        message_count: int = 1,
+        accepted_run_mode_override: Any | None = None,
     ) -> TaskHandle | None:
+        async def persist(
+            handle: TaskHandle,
+            details: dict[str, Any],
+        ) -> None:
+            identity_rebound = False
+            metadata = envelope.metadata
+            if persisted_user_message_id:
+                try:
+                    revision = max(
+                        2,
+                        int(metadata.get("turn_context_revision", 1) or 1) + 1,
+                    )
+                except (TypeError, ValueError):
+                    revision = 2
+                try:
+                    identity_rebound = await self._update_transcript_turn_context(
+                        envelope.session_key,
+                        persisted_user_message_id,
+                        {
+                            "turn_id": handle.task_id,
+                            "client_message_id": metadata.get("client_message_id"),
+                            "surface_id": metadata.get("surface_id"),
+                            "intent": metadata.get("turn_context_intent", "send"),
+                            "disposition": "queued",
+                            "target_turn_id": handle.task_id,
+                            "revision": revision,
+                        },
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "task_runtime.collect_identity_rebind_failed",
+                        session_key=envelope.session_key,
+                        candidate_task_id=handle.task_id,
+                        message_id=persisted_user_message_id,
+                        exc_info=True,
+                    )
+                    raise _CollectIdentityRebindError from exc
+                if not identity_rebound:
+                    raise _CollectIdentityRebindError
+            try:
+                await self._storage.update_agent_task(handle.task_id, details=details)
+            except Exception:
+                # Collect acceptance is owned by the queued runtime task (and,
+                # for identity-aware input, the transcript rebind above).
+                # Agent-task details are diagnostic only. Surfacing their write
+                # failure would invite the caller to retry an input that this
+                # process has already accepted and will execute.
+                log.warning(
+                    "task_runtime.collect_details_update_failed",
+                    session_key=envelope.session_key,
+                    task_id=handle.task_id,
+                    exc_info=True,
+                )
+
+        try:
+            collected = await self.try_collect_atomically(
+                envelope=envelope,
+                message=message,
+                attachments=attachments,
+                run_kind=run_kind,
+                no_memory_capture=no_memory_capture,
+                semantic_message=semantic_message,
+                persisted_user_message_id=persisted_user_message_id,
+                persisted_user_message_ids=persisted_user_message_ids,
+                message_count=message_count,
+                accepted_run_mode_override=accepted_run_mode_override,
+                persist=persist,
+            )
+        except _CollectIdentityRebindError:
+            return None
+        return collected[0] if collected is not None else None
+
+    async def try_collect_atomically(
+        self,
+        *,
+        envelope: RouteEnvelope,
+        message: str,
+        attachments: builtins.list[dict[str, Any]] | None = None,
+        run_kind: str,
+        no_memory_capture: bool,
+        semantic_message: str | None = None,
+        persisted_user_message_id: str | None = None,
+        persisted_user_message_ids: builtins.list[str] | tuple[str, ...] | None = None,
+        message_count: int = 1,
+        accepted_run_mode_override: Any | None = None,
+        persist: Callable[
+            [TaskHandle, dict[str, Any]], Awaitable[_CollectResult]
+        ],
+    ) -> tuple[TaskHandle, _CollectResult] | None:
+        """Persist and apply one collect while the candidate remains queued.
+
+        Persistence runs under a per-task claim, never the runtime-wide state
+        lock. Running and terminal transitions for the candidate wait for that
+        claim; unrelated sessions continue reserving, cancelling, and
+        finalising normally. A raised persistence error leaves the candidate
+        unchanged. Receipt replays are returned without applying the input a
+        second time.
+        """
+
+        operation = asyncio.create_task(
+            self._try_collect_atomically_impl(
+                envelope=envelope,
+                message=message,
+                attachments=attachments,
+                run_kind=run_kind,
+                no_memory_capture=no_memory_capture,
+                semantic_message=semantic_message,
+                persisted_user_message_id=persisted_user_message_id,
+                persisted_user_message_ids=persisted_user_message_ids,
+                message_count=message_count,
+                accepted_run_mode_override=accepted_run_mode_override,
+                persist=persist,
+            )
+        )
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            # Once collection begins, settle both persistence and the matching
+            # runtime apply before propagating cancellation to the caller.
+            await self._wait_for_task_settlement(operation)
+            raise
+
+    async def _try_collect_atomically_impl(
+        self,
+        *,
+        envelope: RouteEnvelope,
+        message: str,
+        attachments: builtins.list[dict[str, Any]] | None,
+        run_kind: str,
+        no_memory_capture: bool,
+        semantic_message: str | None,
+        persisted_user_message_id: str | None,
+        persisted_user_message_ids: builtins.list[str] | tuple[str, ...] | None,
+        message_count: int,
+        accepted_run_mode_override: Any | None,
+        persist: Callable[
+            [TaskHandle, dict[str, Any]], Awaitable[_CollectResult]
+        ],
+    ) -> tuple[TaskHandle, _CollectResult] | None:
+        """Claim, persist, then apply one collection operation."""
+
+        envelope = replace(
+            envelope,
+            agent_id=normalize_agent_id(envelope.agent_id),
+            session_key=canonicalize_session_key(envelope.session_key),
+        )
         async with self._state_lock:
             pending = self._pending_by_session.get(envelope.session_key, [])
             candidate = next(
@@ -781,42 +2278,128 @@ class TaskRuntime:
             )
             if candidate is None:
                 return None
-            if (
-                no_memory_capture
-                or candidate.run_kind != run_kind
-                or candidate.envelope.input_provenance != envelope.input_provenance
-            ):
-                candidate.no_memory_capture = True
-            candidate.message = f"{candidate.message}\n{message}"
-            details = {
-                "source_name": candidate.envelope.source_name,
-                "input_provenance": candidate.envelope.input_provenance,
-                "metadata": candidate.envelope.metadata,
-                "collected": True,
-                "message_count": candidate.message.count("\n") + 1,
-                "no_memory_capture": candidate.no_memory_capture,
-            }
-        await self._storage.update_agent_task(candidate.task_id, details=details)
-        return TaskHandle(
-            task_id=candidate.task_id,
-            session_key=envelope.session_key,
-            status=AgentTaskStatus.QUEUED,
-        )
+
+        async with candidate.collect_claim:
+            # The task may have crossed into RUNNING while this coroutine was
+            # waiting for an earlier per-task claim. Re-check under the state
+            # lock before any durable side effect.
+            async with self._state_lock:
+                pending = self._pending_by_session.get(envelope.session_key, [])
+                if (
+                    candidate not in pending
+                    or candidate.queue_mode != "collect"
+                    or candidate.status != AgentTaskStatus.QUEUED
+                ):
+                    return None
+                if (
+                    candidate.accepted_run_mode_override
+                    != accepted_run_mode_override
+                ):
+                    return None
+                collected_no_memory_capture = candidate.no_memory_capture
+                if (
+                    no_memory_capture
+                    or candidate.run_kind != run_kind
+                    or candidate.envelope.input_provenance != envelope.input_provenance
+                ):
+                    collected_no_memory_capture = True
+                collected_message = f"{candidate.message}\n{message}"
+                if candidate.semantic_message is not None or semantic_message is not None:
+                    first_semantic = (
+                        candidate.semantic_message
+                        if candidate.semantic_message is not None
+                        else candidate.message
+                    )
+                    next_semantic = (
+                        semantic_message if semantic_message is not None else message
+                    )
+                    collected_semantic_message = f"{first_semantic}\n\n{next_semantic}"
+                else:
+                    collected_semantic_message = None
+                collected_message_ids = _ordered_message_ids(
+                    candidate.persisted_user_message_id,
+                    (
+                        *candidate.persisted_user_message_ids,
+                        *(
+                            [persisted_user_message_id]
+                            if persisted_user_message_id
+                            else []
+                        ),
+                        *(persisted_user_message_ids or ()),
+                    ),
+                )
+                collected_message_count = candidate.message_count + max(
+                    1, int(message_count)
+                )
+                metadata = envelope.metadata
+                collected_identity: _CollectedPrimaryInput | None = None
+                if persisted_user_message_id or metadata.get("client_message_id"):
+                    try:
+                        revision = max(
+                            2,
+                            int(metadata.get("turn_context_revision", 1) or 1) + 1,
+                        )
+                    except (TypeError, ValueError):
+                        revision = 2
+                    collected_identity = _CollectedPrimaryInput(
+                        persisted_user_message_id=persisted_user_message_id,
+                        client_message_id=metadata.get("client_message_id"),
+                        surface_id=metadata.get("surface_id"),
+                        intent=metadata.get("turn_context_intent", "send"),
+                        revision=revision,
+                    )
+                details = {
+                    "source_name": candidate.envelope.source_name,
+                    "input_provenance": candidate.envelope.input_provenance,
+                    "metadata": candidate.envelope.metadata,
+                    "collected": True,
+                    "message_count": collected_message_count,
+                    "no_memory_capture": collected_no_memory_capture,
+                    "persisted_user_message_id": (
+                        collected_message_ids[0] if collected_message_ids else None
+                    ),
+                    "persisted_user_message_ids": collected_message_ids,
+                    "fresh_user_session": candidate.fresh_user_session,
+                }
+                handle = TaskHandle(
+                    task_id=candidate.task_id,
+                    session_key=envelope.session_key,
+                    status=AgentTaskStatus.QUEUED,
+                )
+
+            persisted = await persist(handle, details)
+            if getattr(persisted, "replayed", False) is not True:
+                # The claim prevents running/terminal transitions while the DB
+                # operation settles. Apply every aggregate field together only
+                # after a non-replay commit.
+                async with self._state_lock:
+                    candidate.no_memory_capture = collected_no_memory_capture
+                    candidate.message = collected_message
+                    candidate.attachments.extend(list(attachments or []))
+                    candidate.semantic_message = collected_semantic_message
+                    candidate.persisted_user_message_ids = collected_message_ids
+                    candidate.persisted_user_message_id = (
+                        collected_message_ids[0] if collected_message_ids else None
+                    )
+                    candidate.message_count = collected_message_count
+                    if collected_identity is not None:
+                        candidate.collected_primary_inputs.append(collected_identity)
+            return handle, persisted
 
     async def _execute(self, task: _RuntimeTask) -> None:
+        # Set before the first await so cancellation can distinguish a
+        # never-started coroutine from one that owns runtime cleanup, even
+        # while its durable status is still QUEUED.
+        task.execution_started = True
         session_key = task.envelope.session_key
         write_lock = self._session_locks.setdefault(session_key, asyncio.Lock())
         execution_lock = self._session_execution_locks.setdefault(session_key, asyncio.Lock())
         try:
             async with execution_lock:
                 if task.cancel_requested:
-                    reason = (
-                        "overflow_drop" if task.overflow_dropped else "user_cancel"
-                    )
+                    reason = "overflow_drop" if task.overflow_dropped else "user_cancel"
                     terminal_reason = (
-                        "dropped_by_overflow"
-                        if task.overflow_dropped
-                        else "cancelled_before_start"
+                        "dropped_by_overflow" if task.overflow_dropped else "cancelled_before_start"
                     )
                     _emit_metric(
                         "turn_cancellations_total",
@@ -838,7 +2421,67 @@ class TaskRuntime:
                     acquired = True
                     async with write_lock:
                         pass
+                    await self._freeze_collaboration_context(task)
                     heartbeat_task = self._start_running_heartbeat(task)
+                    metadata = task.envelope.metadata
+                    turn_context = {
+                        "turn_id": task.task_id,
+                        "client_message_id": metadata.get("client_message_id"),
+                        "surface_id": metadata.get("surface_id"),
+                        "intent": metadata.get("turn_context_intent", "send"),
+                        "disposition": metadata.get(
+                            "turn_context_disposition",
+                            "applied",
+                        ),
+                        "revision": int(metadata.get("turn_context_revision", 1) or 1),
+                    }
+                    if (
+                        metadata.get("collaboration_mode") == "plan"
+                        or int(metadata.get("collaboration_revision", 0) or 0) > 0
+                        or metadata.get("active_plan_revision_id")
+                        or metadata.get("plan_run_id")
+                    ):
+                        turn_context["collaboration_mode"] = metadata.get(
+                            "collaboration_mode",
+                            "default",
+                        )
+                        turn_context["collaboration_revision"] = int(
+                            metadata.get("collaboration_revision", 0) or 0
+                        )
+                    if metadata.get("active_plan_revision_id"):
+                        turn_context["active_plan_revision_id"] = metadata[
+                            "active_plan_revision_id"
+                        ]
+                    if metadata.get("plan_run_id"):
+                        turn_context["plan_run_id"] = metadata["plan_run_id"]
+                    for field in ("target_turn_id", "promoted_from_turn_id"):
+                        value = metadata.get(field)
+                        if isinstance(value, str) and value:
+                            turn_context[field] = value
+                    # Promotion updates every merged steer before this queued
+                    # follow-up can acquire the same-session execution lock.
+                    # Do not publish the same transition twice at start.
+                    identity_tracked = bool(
+                        task.persisted_user_message_id
+                        or metadata.get("client_message_id")
+                    )
+                    if turn_context["disposition"] != "promoted" and identity_tracked:
+                        await self._update_transcript_turn_context(
+                            task.envelope.session_key,
+                            task.persisted_user_message_id,
+                            turn_context,
+                        )
+                        await self._emit(
+                            task.envelope.session_key,
+                            "session.event.input_disposition",
+                            {
+                                "session_key": task.envelope.session_key,
+                                "user_message_id": task.persisted_user_message_id,
+                                **turn_context,
+                            },
+                        )
+                        task.primary_input_pending = False
+                    await self._record_collected_primary_inputs_applied(task)
                     run = TaskRun(
                         task_id=task.task_id,
                         envelope=task.envelope,
@@ -850,13 +2493,30 @@ class TaskRuntime:
                         ingress_pipeline_steps=task.ingress_pipeline_steps,
                         semantic_message=task.semantic_message,
                         persisted_user_message_id=task.persisted_user_message_id,
+                        persisted_user_message_ids=tuple(
+                            task.persisted_user_message_ids
+                        ),
                         fresh_user_session=task.fresh_user_session,
                         stream_event_sink=task.stream_event_sink,
+                        pending_input_provider=task.pending_input_provider,
+                        accepted_config=task.accepted_config,
+                        accepted_run_mode_override=task.accepted_run_mode_override,
+                        provider_request_correlation=task.provider_request_correlation,
+                        assistant_message_sink=(
+                            task.capture_terminal_assistant_message
+                            if task.run_kind == "channel_turn"
+                            else None
+                        ),
                     )
-                    await self._run_turn_handler_with_write_lock_bypass(
-                        run,
-                        write_lock=write_lock,
-                    )
+                    from opensquilla.session.turn_context import turn_context_scope
+
+                    with turn_context_scope(turn_context):
+                        await self._run_turn_handler_with_write_lock_bypass(
+                            run,
+                            write_lock=write_lock,
+                        )
+                    await self._emit_plan_revision_if_changed(task)
+                    await self._record_drained_steers(task)
                     if heartbeat_task is not None:
                         await self._stop_running_heartbeat(heartbeat_task)
                         heartbeat_task = None
@@ -868,6 +2528,13 @@ class TaskRuntime:
                         AgentTaskStatus.SUCCEEDED,
                         terminal_reason="completed",
                     )
+                    # Close the TaskRuntime acceptance window before reclaiming.
+                    # Otherwise a steer can land between reclaim_pending() and
+                    # _mark_terminal() and never reach either this turn or a
+                    # follow-up.
+                    undrained_steers = task.pending_input_provider.reclaim_pending()
+                    if undrained_steers:
+                        await self._promote_undrained_steers(task, undrained_steers)
                 finally:
                     if heartbeat_task is not None:
                         await self._stop_running_heartbeat(heartbeat_task)
@@ -875,20 +2542,51 @@ class TaskRuntime:
                         await self._release_slot(task)
         except asyncio.CancelledError:
             reason = "overflow_drop" if task.overflow_dropped else "interrupt"
-            terminal_reason = (
-                "dropped_by_overflow" if task.overflow_dropped else "cancelled"
-            )
+            terminal_reason = "dropped_by_overflow" if task.overflow_dropped else "cancelled"
             _emit_metric(
                 "turn_cancellations_total",
                 value=1,
                 reason=reason,
                 session_key=task.envelope.session_key,
             )
+            # Close steer acceptance atomically before reclaiming inputs or
+            # awaiting their durable disposition writes. Otherwise a steer can
+            # land after reclaim_all() and remain permanently ``steering`` once
+            # _mark_terminal() removes the task.
+            async with self._state_lock:
+                if not task.terminal_emitted:
+                    task.status = AgentTaskStatus.CANCELLED
+            system_cancel_sources = {
+                "gateway_shutdown",
+                "parent_session_kill",
+                "queue_interrupt",
+                "queue_steer",
+                "sessions_reset",
+            }
+            # An unspecified direct TaskRuntime.cancel() is retained as the
+            # historical user-stop behavior. System callers must identify
+            # themselves so accepted steer text is promoted instead.
+            explicit_user_stop = task.cancel_source not in system_cancel_sources
+            if explicit_user_stop:
+                await self._record_cancelled_steers(task)
+            else:
+                # System cancellation does not discard an accepted user steer.
+                # Persist already-applied inputs, close this task, then transfer
+                # pending ownership to one follow-up.
+                await self._record_drained_steers(task)
             await self._mark_terminal(
                 task,
                 AgentTaskStatus.CANCELLED,
                 terminal_reason=terminal_reason,
             )
+            if not explicit_user_stop:
+                pending = task.pending_input_provider.reclaim_pending()
+                if pending:
+                    await self._promote_undrained_steers(
+                        task,
+                        pending,
+                        activate=task.cancel_source != "gateway_shutdown",
+                    )
         except _TurnHardDeadlineExceeded as exc:
             _emit_metric(
                 "turn_cancellations_total",
@@ -896,6 +2594,7 @@ class TaskRuntime:
                 reason="hard_deadline",
                 session_key=task.envelope.session_key,
             )
+            await self._record_drained_steers(task)
             await self._mark_terminal(
                 task,
                 AgentTaskStatus.TIMEOUT,
@@ -903,6 +2602,7 @@ class TaskRuntime:
                 error_class=type(exc).__name__,
                 error_message=str(exc),
             )
+            await self._promote_reclaimed_steers(task)
         except TimeoutError as exc:
             _emit_metric(
                 "turn_cancellations_total",
@@ -910,6 +2610,7 @@ class TaskRuntime:
                 reason="timeout",
                 session_key=task.envelope.session_key,
             )
+            await self._record_drained_steers(task)
             await self._mark_terminal(
                 task,
                 AgentTaskStatus.TIMEOUT,
@@ -917,13 +2618,13 @@ class TaskRuntime:
                 error_class=type(exc).__name__,
                 error_message=str(exc),
             )
+            await self._promote_reclaimed_steers(task)
         except Exception as exc:  # noqa: BLE001 - runtime ledger records the class.
             terminal_reason = str(getattr(exc, "terminal_reason", None) or "error")
             status = (
-                AgentTaskStatus.TIMEOUT
-                if terminal_reason == "timeout"
-                else AgentTaskStatus.FAILED
+                AgentTaskStatus.TIMEOUT if terminal_reason == "timeout" else AgentTaskStatus.FAILED
             )
+            await self._record_drained_steers(task)
             await self._mark_terminal(
                 task,
                 status,
@@ -931,6 +2632,1069 @@ class TaskRuntime:
                 error_class=str(getattr(exc, "code", None) or type(exc).__name__),
                 error_message=str(exc),
             )
+            await self._promote_reclaimed_steers(task)
+        finally:
+            self._user_input_broker.cancel_task(task.task_id)
+            await self._settle_attached_plan_run(task)
+
+    async def _freeze_collaboration_context(self, task: _RuntimeTask) -> None:
+        """Snapshot session collaboration state at the actual turn boundary.
+
+        A queued task intentionally does not capture Plan/Default at admission:
+        a user may toggle while earlier work is still running. Once this task
+        owns both the same-session execution lane and a global slot, the
+        snapshot is immutable for the complete provider/tool loop.
+        """
+
+        metadata = dict(task.envelope.metadata)
+        getter = getattr(self._storage, "get_session", None)
+        node = None
+        if callable(getter):
+            candidate = getter(task.envelope.session_key)
+            node = await candidate if inspect.isawaitable(candidate) else candidate
+        stored_mode = getattr(node, "collaboration_mode", None)
+        stored_revision = getattr(node, "collaboration_revision", None)
+        if stored_mode in {"default", "plan"} and isinstance(stored_revision, int):
+            metadata["collaboration_mode"] = stored_mode
+            metadata["collaboration_revision"] = stored_revision
+            active_revision = getattr(node, "active_plan_revision_id", None)
+            if isinstance(active_revision, str) and active_revision:
+                metadata["active_plan_revision_id"] = str(active_revision)
+            else:
+                metadata.pop("active_plan_revision_id", None)
+        else:
+            metadata.setdefault("collaboration_mode", "default")
+            metadata.setdefault("collaboration_revision", 0)
+        required_mode = metadata.get("required_collaboration_mode")
+        if required_mode is not None:
+            if required_mode not in {"default", "plan"}:
+                raise RuntimeError("Invalid required collaboration mode")
+            # Explicit Plan operations own their turn capability. A sticky mode
+            # toggle made while they wait applies to later ordinary turns; it
+            # cannot turn an implementation into a read-only Plan turn, or a
+            # replan into a write-capable Default turn.
+            metadata["collaboration_mode"] = required_mode
+        required_revision = metadata.get("required_collaboration_revision")
+        if required_revision is not None:
+            if (
+                not isinstance(required_revision, int)
+                or isinstance(required_revision, bool)
+                or required_revision < 0
+            ):
+                raise RuntimeError("Invalid required collaboration revision")
+            metadata["collaboration_revision"] = required_revision
+        metadata["task_id"] = task.task_id
+        runtime_services = {
+            **task.envelope.runtime_services,
+            "plan_storage": self._storage,
+            "plan_event_emitter": self._emit,
+        }
+        # WebChat has a request-id response RPC and reconnect hydration. Other
+        # interactive surfaces retain the terminating compatibility protocol
+        # until they expose the same reply transport; injecting a waiter there
+        # would strand the turn behind its own session execution lock.
+        if task.envelope.source_kind is SourceKind.WEB:
+            runtime_services["user_input_provider"] = self._user_input_broker
+        attached_run_id = str(metadata.get("plan_run_id") or "").strip()
+        if attached_run_id and not str(
+            metadata.get("plan_revision_id") or ""
+        ).strip():
+            get_plan_run = getattr(self._storage, "get_plan_run", None)
+            if not callable(get_plan_run):
+                raise RuntimeError("PlanRun storage is unavailable")
+            run_candidate = get_plan_run(attached_run_id)
+            attached_run = (
+                await run_candidate
+                if inspect.isawaitable(run_candidate)
+                else run_candidate
+            )
+            if attached_run is None:
+                raise RuntimeError("The accepted PlanRun no longer exists")
+            if str(getattr(attached_run, "session_key", "") or "") != (
+                task.envelope.session_key
+            ):
+                raise RuntimeError("The accepted PlanRun belongs to another session")
+            derived_revision_id = str(
+                getattr(attached_run, "plan_revision_id", "") or ""
+            ).strip()
+            if not derived_revision_id:
+                raise RuntimeError("The accepted PlanRun lost its PlanRevision binding")
+            # Goal controllers only need to attach their durable run id. The
+            # immutable revision is derived authoritatively instead of copied
+            # into every future attempt envelope.
+            metadata["plan_revision_id"] = derived_revision_id
+        requested_revision_id = str(
+            metadata.get("plan_revision_id")
+            or (
+                metadata.get("active_plan_revision_id")
+                if metadata.get("collaboration_mode") == "plan"
+                else ""
+            )
+            or ""
+        ).strip()
+        if requested_revision_id:
+            active_revision_id = str(
+                getattr(node, "active_plan_revision_id", "") or ""
+            )
+            if (
+                bool(metadata.get("require_current_plan_revision"))
+                and active_revision_id != requested_revision_id
+            ):
+                raise RuntimeError(
+                    "The selected plan revision is no longer current"
+                )
+            get_revision = getattr(self._storage, "get_plan_revision", None)
+            if not callable(get_revision):
+                raise RuntimeError("PlanRevision storage is unavailable")
+            revision_candidate = get_revision(requested_revision_id)
+            plan_revision = (
+                await revision_candidate
+                if inspect.isawaitable(revision_candidate)
+                else revision_candidate
+            )
+            if plan_revision is None:
+                raise RuntimeError("The selected plan revision no longer exists")
+            runtime_services["plan_revision"] = plan_revision
+        previous_envelope = task.envelope
+        task.envelope = replace(
+            task.envelope,
+            metadata=metadata,
+            runtime_services=runtime_services,
+        )
+        # ``_last_envelope_by_session`` uses identity to avoid deleting a
+        # newer queued envelope during terminal cleanup.  Preserve that
+        # invariant when this turn replaces its envelope with the frozen
+        # collaboration snapshot.
+        async with self._state_lock:
+            if (
+                self._last_envelope_by_session.get(task.envelope.session_key)
+                is previous_envelope
+            ):
+                self._last_envelope_by_session[task.envelope.session_key] = task.envelope
+        if metadata["collaboration_mode"] == "plan":
+            task.no_memory_capture = True
+        plan_run = await self._start_attached_plan_run(task)
+        if plan_run is not None:
+            previous_envelope = task.envelope
+            task.envelope = replace(
+                task.envelope,
+                runtime_services={
+                    **task.envelope.runtime_services,
+                    "plan_run": plan_run,
+                },
+            )
+            async with self._state_lock:
+                if (
+                    self._last_envelope_by_session.get(task.envelope.session_key)
+                    is previous_envelope
+                ):
+                    self._last_envelope_by_session[task.envelope.session_key] = task.envelope
+
+    async def _start_attached_plan_run(self, task: _RuntimeTask) -> Any | None:
+        run_id = str(task.envelope.metadata.get("plan_run_id") or "").strip()
+        if not run_id:
+            return None
+        getter = getattr(self._storage, "get_plan_run", None)
+        mark_running = getattr(self._storage, "mark_plan_run_running", None)
+        if not callable(getter) or not callable(mark_running):
+            raise RuntimeError("PlanRun storage is unavailable")
+        current = await getter(run_id)
+        if current is None:
+            raise RuntimeError("The accepted PlanRun no longer exists")
+        if str(getattr(current, "session_key", "") or "") != (
+            task.envelope.session_key
+        ):
+            raise RuntimeError("The accepted PlanRun belongs to another session")
+        expected_revision_id = str(
+            task.envelope.metadata.get("plan_revision_id") or ""
+        ).strip()
+        if (
+            expected_revision_id
+            and str(getattr(current, "plan_revision_id", "") or "")
+            != expected_revision_id
+        ):
+            raise RuntimeError("The accepted PlanRun changed its PlanRevision binding")
+        updated = await mark_running(
+            run_id,
+            expected_state_revision=int(current.state_revision),
+            active_task_id=task.task_id,
+        )
+        await self._emit_plan_run(task.envelope.session_key, updated)
+        if str(getattr(updated, "status", "")) != "running":
+            raise RuntimeError("The selected plan revision is no longer executable")
+        return updated
+
+    async def _settle_attached_plan_run(self, task: _RuntimeTask) -> None:
+        """Pause an unfinished manual run when its single turn terminates."""
+
+        run_id = str(task.envelope.metadata.get("plan_run_id") or "").strip()
+        if not run_id:
+            return
+        getter = getattr(self._storage, "get_plan_run", None)
+        complete = getattr(self._storage, "complete_plan_run", None)
+        pause = getattr(self._storage, "pause_plan_run", None)
+        cancel = getattr(self._storage, "cancel_plan_run", None)
+        if not callable(getter):
+            return
+        try:
+            current = await getter(run_id)
+            if current is None:
+                return
+            status = str(getattr(current, "status", ""))
+            if status == "queued" and callable(cancel):
+                updated = await cancel(
+                    run_id,
+                    expected_state_revision=int(current.state_revision),
+                    reason="implementation_turn_ended_before_start",
+                    expected_active_task_id=task.task_id,
+                )
+            elif status == "running" and callable(pause):
+                driver_kind = str(getattr(current, "driver_kind", "manual"))
+                step_states = list(getattr(current, "step_states", []) or [])
+                delivery_ready = (
+                    getattr(current, "current_step_id", None) is None
+                    and bool(step_states)
+                    and all(
+                        isinstance(state, dict)
+                        and str(state.get("status") or "")
+                        in {"completed", "skipped"}
+                        for state in step_states
+                    )
+                )
+                if (
+                    task.status == AgentTaskStatus.SUCCEEDED
+                    and delivery_ready
+                    and callable(complete)
+                ):
+                    updated = await complete(
+                        run_id,
+                        expected_state_revision=int(current.state_revision),
+                        expected_active_task_id=task.task_id,
+                    )
+                    await self._emit_plan_run(task.envelope.session_key, updated)
+                    return
+                task_outcome = str(
+                    getattr(task.status, "value", task.status) or "unknown"
+                )
+                updated = await pause(
+                    run_id,
+                    expected_state_revision=int(current.state_revision),
+                    reason=(
+                        (
+                            "manual_turn_finished"
+                            if driver_kind == "manual"
+                            else "goal_turn_finished"
+                        )
+                        if task.status == AgentTaskStatus.SUCCEEDED
+                        else f"{driver_kind}_turn_{task_outcome}"
+                    ),
+                    expected_active_task_id=task.task_id,
+                    expected_driver_kind=driver_kind,
+                    expected_driver_id=(
+                        str(getattr(current, "driver_id", "") or "") or None
+                    ),
+                )
+            else:
+                return
+            await self._emit_plan_run(task.envelope.session_key, updated)
+        except Exception:  # noqa: BLE001 - plan overlay must not mask task terminal state
+            log.warning(
+                "task_runtime.plan_run_settle_failed",
+                session_key=task.envelope.session_key,
+                task_id=task.task_id,
+                plan_run_id=run_id,
+                exc_info=True,
+            )
+
+    async def _emit_plan_run(self, session_key: str, run: Any) -> None:
+        from opensquilla.session.plans import plan_run_snapshot
+
+        await self._emit(
+            session_key,
+            "session.event.plan_run",
+            {
+                "session_key": session_key,
+                "plan_run": plan_run_snapshot(run),
+            },
+        )
+
+    async def _emit_plan_revision_if_changed(self, task: _RuntimeTask) -> None:
+        getter = getattr(self._storage, "get_session", None)
+        get_revision = getattr(self._storage, "get_plan_revision", None)
+        if not callable(getter) or not callable(get_revision):
+            return
+        try:
+            node_candidate = getter(task.envelope.session_key)
+            node = (
+                await node_candidate
+                if inspect.isawaitable(node_candidate)
+                else node_candidate
+            )
+            if getattr(node, "active_plan_revision_id", None) is not None and not isinstance(
+                getattr(node, "active_plan_revision_id", None),
+                str,
+            ):
+                return
+            current_id = (
+                str(getattr(node, "active_plan_revision_id", "") or "")
+                if node is not None
+                else ""
+            )
+            starting_id = str(
+                task.envelope.metadata.get("active_plan_revision_id") or ""
+            )
+            if not current_id or current_id == starting_id:
+                return
+            revision_candidate = get_revision(current_id)
+            revision = (
+                await revision_candidate
+                if inspect.isawaitable(revision_candidate)
+                else revision_candidate
+            )
+            if revision is None:
+                return
+            from opensquilla.session.plans import plan_revision_snapshot
+
+            await self._emit(
+                task.envelope.session_key,
+                "session.event.plan_revision",
+                {
+                    "session_key": task.envelope.session_key,
+                    "plan_revision": plan_revision_snapshot(
+                        revision,
+                        current=True,
+                    ),
+                    "collaboration": {
+                        "mode": str(
+                            getattr(node, "collaboration_mode", "default")
+                            or "default"
+                        ),
+                        "revision": int(
+                            getattr(node, "collaboration_revision", 0) or 0
+                        ),
+                    },
+                },
+            )
+            # Committing a revision also advances the collaboration CAS
+            # revision.  Publish the authoritative snapshot so clients do not
+            # have to guess that increment before their next mode mutation.
+            await self._emit(
+                task.envelope.session_key,
+                "session.event.collaboration_mode",
+                {
+                    "session_key": task.envelope.session_key,
+                    "collaboration": {
+                        "mode": str(
+                            getattr(node, "collaboration_mode", "default")
+                            or "default"
+                        ),
+                        "revision": int(
+                            getattr(node, "collaboration_revision", 0) or 0
+                        ),
+                        "appliesTo": "next_turn",
+                    },
+                },
+            )
+        except Exception:  # noqa: BLE001 - observer must not change task result
+            log.warning(
+                "task_runtime.plan_revision_emit_failed",
+                session_key=task.envelope.session_key,
+                task_id=task.task_id,
+                exc_info=True,
+            )
+
+    async def _promote_reclaimed_steers(self, task: _RuntimeTask) -> None:
+        """Preserve accepted input when a non-cancel terminal path wins a race."""
+
+        items = task.pending_input_provider.reclaim_pending()
+        if items:
+            await self._promote_undrained_steers(task, items)
+
+    @staticmethod
+    def _is_explicit_user_cancelled_task(task: AgentTaskRecord) -> bool:
+        if task.status not in {
+            AgentTaskStatus.CANCELLED,
+            AgentTaskStatus.ABANDONED,
+        }:
+            return False
+        details = task.details if isinstance(task.details, dict) else {}
+        cancellation_requested = details.get("cancellation_requested")
+        if isinstance(cancellation_requested, dict):
+            if cancellation_requested.get("reason") == "user_abort":
+                return True
+            source = str(cancellation_requested.get("source") or "")
+            if source in {
+                "sessions_abort",
+                "webui_abort",
+                "webui_escape",
+                "webui_stop",
+            }:
+                return True
+        cancellation = details.get("cancellation")
+        if isinstance(cancellation, dict):
+            if cancellation.get("reason") == "user_abort":
+                return True
+            source = str(cancellation.get("source") or "")
+            if source in {
+                "sessions_abort",
+                "webui_abort",
+                "webui_escape",
+                "webui_stop",
+            }:
+                return True
+        outcome = details.get("turn_outcome")
+        if isinstance(outcome, dict):
+            return str(outcome.get("cancellation_source") or "") in {
+                "sessions_abort",
+                "webui_abort",
+                "webui_escape",
+                "webui_stop",
+            }
+        return False
+
+    @staticmethod
+    def _restart_recovery_envelope(
+        target_task: AgentTaskRecord,
+        entries: Sequence[Any],
+    ) -> RouteEnvelope | None:
+        """Rebuild only route kinds whose authority does not need live handles."""
+
+        try:
+            source_kind = SourceKind(str(target_task.source_kind))
+        except ValueError:
+            return None
+        if source_kind not in {SourceKind.WEB, SourceKind.CLI, SourceKind.SYSTEM}:
+            return None
+        if not entries:
+            return None
+        details = target_task.details if isinstance(target_task.details, dict) else {}
+        metadata_raw = details.get("metadata")
+        metadata = dict(metadata_raw) if isinstance(metadata_raw, dict) else {}
+        recovery_target_turn_id = str(
+            metadata.get("promoted_from_turn_id")
+            or metadata.get("target_turn_id")
+            or target_task.task_id
+        )
+        contexts = [
+            entry.turn_context
+            for entry in entries
+            if isinstance(getattr(entry, "turn_context", None), dict)
+        ]
+        last_context = contexts[-1] if contexts else {}
+        revisions: list[int] = []
+        for context in contexts:
+            try:
+                revisions.append(int(context.get("revision", 1) or 1))
+            except (TypeError, ValueError):
+                revisions.append(1)
+        metadata.update(
+            {
+                "client_message_id": last_context.get("client_message_id"),
+                "surface_id": last_context.get("surface_id"),
+                "turn_context_intent": "steer",
+                "turn_context_disposition": "promoted",
+                "turn_context_revision": max([1, *revisions]) + 1,
+                "target_turn_id": recovery_target_turn_id,
+                "promoted_from_turn_id": recovery_target_turn_id,
+                "steer_restart_recovery": True,
+            }
+        )
+        metadata.pop("task_id", None)
+        input_provenance_raw = details.get("input_provenance")
+        input_provenance = (
+            dict(input_provenance_raw)
+            if isinstance(input_provenance_raw, dict)
+            else {"kind": "steer_restart_recovery"}
+        )
+        source_name = str(details.get("source_name") or "steer_restart_recovery")
+        first_entry = entries[0]
+        return RouteEnvelope(
+            source_kind=source_kind,
+            source_name=source_name,
+            agent_id=target_task.agent_id,
+            session_key=target_task.session_key,
+            session_id=getattr(first_entry, "session_id", None),
+            input_provenance=input_provenance,
+            metadata=metadata,
+        )
+
+    async def _recovery_entries_for_task(
+        self,
+        task: AgentTaskRecord,
+    ) -> builtins.list[Any]:
+        details = task.details if isinstance(task.details, dict) else {}
+        message_ids = _ordered_message_ids(
+            details.get("persisted_user_message_id"),
+            details.get("persisted_user_message_ids"),
+        )
+        session_id = details.get("session_id")
+        get_entry = getattr(self._storage, "get_canonical_transcript_entry", None)
+        if (
+            not message_ids
+            or not isinstance(session_id, str)
+            or not inspect.iscoroutinefunction(get_entry)
+        ):
+            return []
+        entries: builtins.list[Any] = []
+        for message_id in message_ids:
+            entry = await get_entry(session_id, message_id)
+            if entry is None:
+                return []
+            entries.append(entry)
+        return entries
+
+    async def _resume_never_started_steer_recovery_tasks(
+        self,
+        result: dict[str, Any],
+    ) -> None:
+        list_tasks = getattr(self._storage, "list_retryable_steer_recovery_tasks", None)
+        requeue = getattr(self._storage, "requeue_steer_recovery_task", None)
+        if (
+            not inspect.iscoroutinefunction(list_tasks)
+            or not inspect.iscoroutinefunction(requeue)
+        ):
+            return
+        for task in await list_tasks():
+            entries = await self._recovery_entries_for_task(task)
+            envelope = self._restart_recovery_envelope(task, entries)
+            texts = [
+                entry.content
+                for entry in entries
+                if isinstance(getattr(entry, "content", None), str)
+                and entry.content.strip()
+            ]
+            if envelope is None or len(texts) != len(entries):
+                result["rejected"] += len(entries)
+                continue
+            details = task.details if isinstance(task.details, dict) else {}
+            message_ids = [entry.message_id for entry in entries]
+            try:
+                reservation = await self.reserve(
+                    envelope,
+                    "\n\n".join(texts),
+                    mode="followup",
+                    run_kind=task.run_kind,
+                    no_memory_capture=bool(details.get("no_memory_capture", False)),
+                    semantic_message="\n\n".join(texts),
+                    persisted_user_message_id=message_ids[0],
+                    persisted_user_message_ids=message_ids,
+                    message_count=len(message_ids),
+                    fresh_user_session=False,
+                    task_id=task.task_id,
+                    update_envelope_cache=False,
+                )
+            except TaskQueueFullError:
+                result["rejected"] += len(entries)
+                continue
+            if not await requeue(task.task_id):
+                await self.abort_reservation(reservation)
+                continue
+            try:
+                handle = await self.activate(reservation)
+            except BaseException:
+                if not reservation.activated:
+                    await self.abort_reservation(reservation)
+                raise
+            result["resumed"] += len(entries)
+            result["task_ids"].append(handle.task_id)
+
+    async def recover_stranded_steers(self) -> dict[str, Any]:
+        """Recover every durable ``steering`` input left by process death.
+
+        Promotion ownership moves in the same transaction that creates the new
+        queued task. A second startup therefore either resumes that exact
+        never-started task or observes the already-promoted terminal evidence;
+        it never creates a duplicate follow-up.
+        """
+
+        result: dict[str, Any] = {
+            "applied": 0,
+            "promoted": 0,
+            "cancelled": 0,
+            "rejected": 0,
+            "resumed": 0,
+            "task_ids": [],
+        }
+        await self._resume_never_started_steer_recovery_tasks(result)
+        list_inputs = getattr(self._storage, "list_stranded_steer_inputs", None)
+        close_inputs = getattr(self._storage, "close_stranded_steer_inputs", None)
+        promote_inputs = getattr(self._storage, "promote_stranded_steer_inputs", None)
+        if (
+            not inspect.iscoroutinefunction(list_inputs)
+            or not inspect.iscoroutinefunction(close_inputs)
+            or not inspect.iscoroutinefunction(promote_inputs)
+        ):
+            return result
+
+        grouped: dict[str, list[Any]] = {}
+        for item in await list_inputs():
+            grouped.setdefault(item.target_task.task_id, []).append(item)
+
+        for target_task_id, items in grouped.items():
+            items.sort(
+                key=lambda item: (
+                    (
+                        0,
+                        int(item.entry.id),
+                    )
+                    if getattr(item.entry, "id", None) is not None
+                    else (
+                        1,
+                        int(getattr(item.receipt, "accepted_at", 0) or 0),
+                        str(getattr(item.receipt, "receipt_id", "")),
+                    )
+                )
+            )
+            target_task = items[0].target_task
+            target_details = (
+                target_task.details if isinstance(target_task.details, dict) else {}
+            )
+            evidence_rows = target_details.get("applied_steer_evidence")
+            evidence_by_id = {
+                str(row["message_id"]): dict(row)
+                for row in (evidence_rows if isinstance(evidence_rows, list) else [])
+                if isinstance(row, dict)
+                and isinstance(row.get("message_id"), str)
+            }
+            applied_message_ids = [
+                item.entry.message_id
+                for item in items
+                if item.entry.message_id in evidence_by_id
+            ]
+            if applied_message_ids:
+                changed = await close_inputs(
+                    target_task_id=target_task_id,
+                    message_ids=applied_message_ids,
+                    disposition="applied",
+                    recovery="terminal_task_evidence",
+                    application_evidence=evidence_by_id,
+                )
+                changed_set = set(changed)
+                result["applied"] += len(changed)
+                items = [
+                    item
+                    for item in items
+                    if item.entry.message_id not in changed_set
+                ]
+                if not items:
+                    continue
+            message_ids = [item.entry.message_id for item in items]
+            if self._is_explicit_user_cancelled_task(target_task):
+                changed = await close_inputs(
+                    target_task_id=target_task_id,
+                    message_ids=message_ids,
+                    disposition="cancelled",
+                    failure_code="TURN_CANCELLED",
+                    retryable=True,
+                    recovery="restore_to_composer",
+                )
+                result["cancelled"] += len(changed)
+                continue
+
+            entries = [item.entry for item in items]
+            envelope = self._restart_recovery_envelope(target_task, entries)
+            texts = [
+                entry.content
+                for entry in entries
+                if isinstance(entry.content, str) and entry.content.strip()
+            ]
+            if envelope is None or len(texts) != len(entries):
+                changed = await close_inputs(
+                    target_task_id=target_task_id,
+                    message_ids=message_ids,
+                    disposition="rejected",
+                    failure_code="STEER_RESTART_ROUTE_UNAVAILABLE",
+                    retryable=True,
+                    recovery="resend_as_followup",
+                )
+                result["rejected"] += len(changed)
+                continue
+
+            details = (
+                target_task.details if isinstance(target_task.details, dict) else {}
+            )
+            try:
+                reservation = await self.reserve(
+                    envelope,
+                    "\n\n".join(texts),
+                    mode="followup",
+                    run_kind=target_task.run_kind,
+                    no_memory_capture=bool(details.get("no_memory_capture", False)),
+                    semantic_message="\n\n".join(texts),
+                    persisted_user_message_id=message_ids[0],
+                    persisted_user_message_ids=message_ids,
+                    message_count=len(message_ids),
+                    fresh_user_session=False,
+                    update_envelope_cache=False,
+                )
+            except TaskQueueFullError:
+                changed = await close_inputs(
+                    target_task_id=target_task_id,
+                    message_ids=message_ids,
+                    disposition="rejected",
+                    failure_code="STEER_PROMOTION_QUEUE_FULL",
+                    retryable=True,
+                    recovery="resend_after_queue_drains",
+                )
+                result["rejected"] += len(changed)
+                continue
+
+            claimed = await promote_inputs(
+                target_task_id=target_task_id,
+                message_ids=message_ids,
+                task_record=reservation.task_record,
+            )
+            if len(claimed) != len(message_ids):
+                await self.abort_reservation(reservation)
+                continue
+            try:
+                handle = await self.activate(reservation)
+            except BaseException:
+                if not reservation.activated:
+                    await self.abort_reservation(reservation)
+                raise
+            result["promoted"] += len(claimed)
+            result["task_ids"].append(handle.task_id)
+        return result
+
+    async def _promote_undrained_steers(
+        self,
+        completed_task: _RuntimeTask,
+        items: Sequence[_SteeredInput],
+        *,
+        activate: bool = True,
+    ) -> None:
+        """Turn a too-late steer into one durable follow-up task."""
+
+        if not items:
+            return
+        last = items[-1]
+        message_ids = [
+            item.persisted_user_message_id
+            for item in items
+            if item.persisted_user_message_id
+        ]
+        metadata = dict(completed_task.envelope.metadata)
+        if last.client_message_id:
+            metadata["client_message_id"] = last.client_message_id
+        if last.surface_id:
+            metadata["surface_id"] = last.surface_id
+        metadata.update(
+            {
+                "turn_context_intent": "steer",
+                "turn_context_disposition": "promoted",
+                "target_turn_id": completed_task.task_id,
+                "promoted_from_turn_id": completed_task.task_id,
+                "turn_context_revision": 2,
+                # A process may stop after the durable ownership transfer but
+                # before this queued follow-up reaches RUNNING. Startup recovery
+                # must resume that exact task instead of creating another one.
+                "steer_restart_recovery": True,
+            }
+        )
+        envelope = _reusable_route_envelope(
+            replace(completed_task.envelope, metadata=metadata)
+        )
+        message = "\n\n".join(item.text for item in items if item.text.strip())
+        semantic_parts = [
+            item.semantic_message or item.text for item in items if item.text.strip()
+        ]
+        reservation: TaskReservation | None = None
+        promoted_task_id: str | None = None
+        promotion_committed = False
+        promote_inputs = getattr(
+            self._storage,
+            "promote_stranded_steer_inputs",
+            None,
+        )
+        atomic_promotion = (
+            len(message_ids) == len(items)
+            and all(item.client_request_id for item in items)
+            and inspect.iscoroutinefunction(promote_inputs)
+        )
+        try:
+            reservation = await self.reserve(
+                envelope,
+                message,
+                mode="followup",
+                run_kind=completed_task.run_kind,
+                no_memory_capture=completed_task.no_memory_capture,
+                semantic_message="\n\n".join(semantic_parts),
+                persisted_user_message_id=message_ids[0] if message_ids else None,
+                persisted_user_message_ids=message_ids,
+                message_count=max(1, len(message_ids)),
+                fresh_user_session=False,
+                update_envelope_cache=False,
+            )
+            if atomic_promotion:
+                promote_inputs_fn = cast(
+                    Callable[..., Awaitable[builtins.list[str]]],
+                    promote_inputs,
+                )
+                claimed = await promote_inputs_fn(
+                    target_task_id=completed_task.task_id,
+                    message_ids=message_ids,
+                    task_record=reservation.task_record,
+                    recovery="late_steer_followup",
+                )
+                if len(claimed) != len(message_ids):
+                    await self.abort_reservation(reservation)
+                    log.warning(
+                        "task_runtime.steer_followup_promotion_claim_lost",
+                        session_key=completed_task.envelope.session_key,
+                        completed_task_id=completed_task.task_id,
+                        count=len(items),
+                    )
+                    return
+            else:
+                await self._storage.create_agent_task(reservation.task_record)
+            promotion_committed = True
+            promoted_task_id = reservation.task_id
+        except Exception as exc:  # noqa: BLE001 - accepted input must leave evidence
+            if reservation is not None and not reservation.activated:
+                await self.abort_reservation(reservation)
+            if promotion_committed:
+                # The ownership transfer already committed. Never rewrite it
+                # as rejected merely because in-memory activation failed; the
+                # exact queued task is restart-recoverable.
+                log.exception(
+                    "task_runtime.steer_followup_activation_failed",
+                    session_key=completed_task.envelope.session_key,
+                    completed_task_id=completed_task.task_id,
+                    promoted_task_id=promoted_task_id,
+                )
+                return
+            failure_code = (
+                "STEER_PROMOTION_QUEUE_FULL"
+                if isinstance(exc, TaskQueueFullError)
+                else "STEER_PROMOTION_FAILED"
+            )
+            await self._record_steer_dispositions(
+                completed_task,
+                items,
+                disposition="rejected",
+                turn_id=completed_task.task_id,
+                revision=2,
+                promoted_from_turn_id=completed_task.task_id,
+                event_details={
+                    "failure_code": failure_code,
+                    "retryable": isinstance(exc, TaskQueueFullError),
+                    "recovery": (
+                        "resend_after_queue_drains"
+                        if isinstance(exc, TaskQueueFullError)
+                        else "inspect_transcript_and_resend"
+                    ),
+                },
+            )
+            log.exception(
+                "task_runtime.steer_followup_promotion_failed",
+                session_key=completed_task.envelope.session_key,
+                completed_task_id=completed_task.task_id,
+                count=len(items),
+                failure_code=failure_code,
+            )
+            return
+
+        assert reservation is not None
+        assert promoted_task_id is not None
+        # The atomic path already committed every transcript transition and
+        # receipt rebind with the queued task. The legacy compatibility path
+        # still persists the transition here.
+        await self._record_steer_dispositions(
+            completed_task,
+            items,
+            disposition="promoted",
+            turn_id=promoted_task_id,
+            revision=2,
+            promoted_from_turn_id=completed_task.task_id,
+            event_details={"recovery": "late_steer_followup"},
+            persist=not atomic_promotion,
+        )
+        if activate:
+            try:
+                await self.activate(reservation)
+            except BaseException:
+                if not reservation.activated:
+                    await self.abort_reservation(reservation)
+                # The queued task and its ownership transfer are durable. A
+                # later process resumes the same task; do not reclassify it.
+                log.exception(
+                    "task_runtime.steer_followup_activation_failed",
+                    session_key=completed_task.envelope.session_key,
+                    completed_task_id=completed_task.task_id,
+                    promoted_task_id=promoted_task_id,
+                )
+        else:
+            # Gateway shutdown must not start fresh model work. Leave the
+            # durable QUEUED task for startup recovery and release only the
+            # in-process reservation.
+            await self.abort_reservation(reservation)
+        log.info(
+            "task_runtime.steer_promoted_to_followup",
+            session_key=completed_task.envelope.session_key,
+            completed_task_id=completed_task.task_id,
+            promoted_task_id=promoted_task_id,
+            count=len(items),
+            activated=activate,
+        )
+
+    async def _record_drained_steers(self, task: _RuntimeTask) -> None:
+        """Persist steer input confirmed as part of a started provider call."""
+
+        items = task.pending_input_provider.pending_applied()
+        if not items:
+            return
+        acknowledged = await self._record_steer_dispositions(
+            task,
+            items,
+            disposition="applied",
+            turn_id=task.task_id,
+            revision=2,
+        )
+        task.pending_input_provider.acknowledge_applied(acknowledged)
+
+    async def _record_cancelled_steers(self, task: _RuntimeTask) -> None:
+        """Close applied and still-pending steer input on cancellation."""
+
+        applied = task.pending_input_provider.pending_applied()
+        if applied:
+            acknowledged = await self._record_steer_dispositions(
+                task,
+                applied,
+                disposition="applied",
+                turn_id=task.task_id,
+                revision=2,
+            )
+            task.pending_input_provider.acknowledge_applied(acknowledged)
+        pending = task.pending_input_provider.reclaim_pending()
+        if pending:
+            await self._record_steer_dispositions(
+                task,
+                pending,
+                disposition="cancelled",
+                turn_id=task.task_id,
+                revision=2,
+                event_details={
+                    "failure_code": "TURN_CANCELLED",
+                    "retryable": True,
+                    "recovery": "restore_to_composer",
+                    "fallback_safe": True,
+                },
+            )
+
+    async def _record_steer_dispositions(
+        self,
+        task: _RuntimeTask,
+        items: Sequence[_SteeredInput],
+        *,
+        disposition: str,
+        turn_id: str,
+        revision: int,
+        promoted_from_turn_id: str | None = None,
+        event_details: dict[str, Any] | None = None,
+        persist: bool = True,
+    ) -> builtins.list[_SteeredInput]:
+        """Durably transition accepted steer inputs before publishing them.
+
+        Items whose durable row could not be updated remain unacknowledged in
+        the pending-input provider so terminal cleanup can retry. Observer
+        failures stay best-effort after persistence succeeds.
+        """
+
+        acknowledged: builtins.list[_SteeredInput] = []
+        for item in items:
+            context: dict[str, Any] = {
+                "turn_id": turn_id,
+                "client_message_id": item.client_message_id,
+                "surface_id": item.surface_id,
+                "intent": "steer",
+                "disposition": disposition,
+                "target_turn_id": task.task_id,
+                "revision": revision,
+            }
+            if item.client_request_id:
+                context["client_request_id"] = item.client_request_id
+            if promoted_from_turn_id:
+                context["promoted_from_turn_id"] = promoted_from_turn_id
+            if disposition == "promoted":
+                context["promoted_turn_id"] = turn_id
+            if disposition == "applied":
+                if item.applied_iteration is not None:
+                    context["applied_iteration"] = item.applied_iteration
+                if item.model_call_id:
+                    context["model_call_id"] = item.model_call_id
+            if event_details:
+                context.update(event_details)
+            durable = not item.persisted_user_message_id or not persist
+            if persist and item.persisted_user_message_id:
+                try:
+                    durable = await self._update_transcript_turn_context(
+                        task.envelope.session_key,
+                        item.persisted_user_message_id,
+                        context,
+                    )
+                    if not durable:
+                        log.warning(
+                            "task_runtime.steer_disposition_persist_missed",
+                            session_key=task.envelope.session_key,
+                            task_id=task.task_id,
+                            message_id=item.persisted_user_message_id,
+                            disposition=disposition,
+                        )
+                except Exception:  # noqa: BLE001 - terminal cleanup retries it
+                    log.warning(
+                        "task_runtime.steer_disposition_persist_failed",
+                        session_key=task.envelope.session_key,
+                        task_id=task.task_id,
+                        message_id=item.persisted_user_message_id,
+                        disposition=disposition,
+                        exc_info=True,
+                    )
+                    durable = False
+            if not durable:
+                continue
+            acknowledged.append(item)
+            try:
+                await self._emit(
+                    task.envelope.session_key,
+                    "session.event.input_disposition",
+                    {
+                        "key": task.envelope.session_key,
+                        "session_key": task.envelope.session_key,
+                        "task_id": task.task_id,
+                        "user_message_id": item.persisted_user_message_id,
+                        **context,
+                    },
+                )
+            except Exception:  # noqa: BLE001 - terminal flow must continue
+                log.warning(
+                    "task_runtime.steer_disposition_emit_failed",
+                    session_key=task.envelope.session_key,
+                    task_id=task.task_id,
+                    message_id=item.persisted_user_message_id,
+                    disposition=disposition,
+                    exc_info=True,
+                )
+            log.info(
+                "task_runtime.steer_disposition",
+                session_key=task.envelope.session_key,
+                task_id=task.task_id,
+                disposition=disposition,
+                client_request_id=item.client_request_id,
+            )
+            _emit_metric(
+                "steer_inputs_total",
+                value=1,
+                disposition=disposition,
+                session_key=task.envelope.session_key,
+            )
+            if disposition == "applied" and item.accepted_at_ms is not None:
+                _emit_metric(
+                    "steer_application_latency_ms",
+                    value=max(0, _epoch_time_ms() - item.accepted_at_ms),
+                    session_key=task.envelope.session_key,
+                )
+        return acknowledged
 
     async def _run_turn_handler_with_write_lock_bypass(
         self,
@@ -1041,8 +3805,18 @@ class TaskRuntime:
                 task.acquired_slot = True
                 break
 
-        # Update storage and emit running metric outside the condition lock.
-        await self._mark_running(task)
+        # Update storage and emit running metric outside the condition lock. A
+        # collect claim can keep this await open; if cancellation or persistence
+        # failure wins that race, release the slot claimed above before the
+        # caller's ``acquired`` flag has been set.
+        try:
+            marked_running = await self._mark_running(task)
+        except BaseException:
+            await self._release_slot(task)
+            raise
+        if not marked_running:
+            await self._release_slot(task)
+            raise asyncio.CancelledError
         _emit_metric(
             "in_flight_turns_total",
             value=1,
@@ -1057,10 +3831,7 @@ class TaskRuntime:
             return
         cond = self._ensure_slot_cond()
         async with cond:
-            while (
-                self._max_concurrency - self._global_in_flight
-                <= self._subagent_reserved_slots
-            ):
+            while self._max_concurrency - self._global_in_flight <= self._subagent_reserved_slots:
                 await cond.wait()
 
     async def _release_slot(self, task: _RuntimeTask) -> None:
@@ -1097,9 +3868,7 @@ class TaskRuntime:
         """
         return self._session_locks.setdefault(session_key, asyncio.Lock())
 
-    def _start_running_heartbeat(
-        self, task: _RuntimeTask
-    ) -> asyncio.Task[None] | None:
+    def _start_running_heartbeat(self, task: _RuntimeTask) -> asyncio.Task[None] | None:
         interval = self._running_heartbeat_interval_s
         if interval is None:
             return None
@@ -1143,8 +3912,20 @@ class TaskRuntime:
                     error=str(exc),
                 )
 
-    async def _mark_running(self, task: _RuntimeTask) -> None:
+    async def _mark_running(self, task: _RuntimeTask) -> bool:
+        """Move one task to RUNNING after any active collect claim settles."""
+
+        async with task.collect_claim:
+            return await self._mark_running_claimed(task)
+
+    async def _mark_running_claimed(self, task: _RuntimeTask) -> bool:
         async with self._state_lock:
+            if (
+                task.terminal_emitted
+                or task.status in TERMINAL_STATUSES
+                or task.cancel_requested
+            ):
+                return False
             task.status = AgentTaskStatus.RUNNING
             self._remove_pending(task)
             self._running_by_session[task.envelope.session_key] = task
@@ -1156,7 +3937,16 @@ class TaskRuntime:
         await self._emit(
             task.envelope.session_key,
             "task.running",
-            {"task_id": task.task_id, "session_key": task.envelope.session_key},
+            {
+                "task_id": task.task_id,
+                "session_key": task.envelope.session_key,
+                "steer_capability": self._steer_capability_for_task(task),
+                **_task_identity_payload(
+                    task.envelope,
+                    task.task_id,
+                    user_message_id=task.persisted_user_message_id,
+                ),
+            },
         )
         await self._notify_task_lifecycle(
             TaskLifecycleEvent(
@@ -1167,6 +3957,7 @@ class TaskRuntime:
                 run_kind=task.run_kind,
             )
         )
+        return True
 
     async def _mark_terminal(
         self,
@@ -1177,16 +3968,54 @@ class TaskRuntime:
         error_class: str | None = None,
         error_message: str | None = None,
     ) -> None:
+        """Finalize one task after collect and same-turn admissions settle."""
+
+        async with task.collect_claim:
+            async with task.steer_claim:
+                await self._mark_terminal_claimed(
+                    task,
+                    status,
+                    terminal_reason=terminal_reason,
+                    error_class=error_class,
+                    error_message=error_message,
+                )
+
+    async def _mark_terminal_claimed(
+        self,
+        task: _RuntimeTask,
+        status: AgentTaskStatus,
+        *,
+        terminal_reason: str,
+        error_class: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        record_primary_terminal_disposition = False
+        collected_terminal_inputs: list[_CollectedPrimaryInput] = []
         async with self._state_lock:
             if task.terminal_emitted:
                 return
             task.terminal_emitted = True
+            if task.primary_input_pending:
+                task.primary_input_pending = False
+                record_primary_terminal_disposition = True
+            if task.collected_primary_inputs:
+                collected_terminal_inputs = list(task.collected_primary_inputs)
+                task.collected_primary_inputs.clear()
             task.status = status
             self._remove_pending(task)
             if self._running_by_session.get(task.envelope.session_key) is task:
                 self._running_by_session.pop(task.envelope.session_key, None)
-            self._tasks.pop(task.task_id, None)
-            self._last_envelope_by_session.pop(task.envelope.session_key, None)
+            if (
+                self._last_envelope_task_id_by_session.get(
+                    task.envelope.session_key
+                )
+                == task.task_id
+            ):
+                self._last_envelope_by_session.pop(task.envelope.session_key, None)
+                self._last_envelope_task_id_by_session.pop(
+                    task.envelope.session_key,
+                    None,
+                )
             # Keep the short write lock stable for this session. Popping it can
             # split callers across old/new lock objects while callbacks or
             # late lifecycle events still reference the old one. The dict grows
@@ -1211,6 +4040,37 @@ class TaskRuntime:
                     if not active:
                         self._agent_active_sessions.pop(agent_id, None)
                         self._agent_session_rr.pop(agent_id, None)
+        if record_primary_terminal_disposition:
+            await self._record_primary_terminal_disposition(
+                task,
+                status=status,
+                terminal_reason=terminal_reason,
+            )
+        # The per-session execution lock makes this task the only possible live
+        # continuation for approvals owned by its session. At terminal state,
+        # any remaining request is orphaned and must fail closed.
+        try:
+            from opensquilla.application.approval_queue import get_approval_queue
+
+            get_approval_queue().expire_pending_for_session(
+                task.envelope.session_key,
+            )
+        except Exception as exc:  # noqa: BLE001 - terminalization must continue.
+            log.warning(
+                "task_runtime.approval_cleanup_failed",
+                task_id=task.task_id,
+                session_key=task.envelope.session_key,
+                error=str(exc),
+            )
+        for collected_input in collected_terminal_inputs:
+            await self._record_collected_primary_input_disposition(
+                task,
+                collected_input,
+                disposition=(
+                    "cancelled" if status == AgentTaskStatus.CANCELLED else "rejected"
+                ),
+                terminal_reason=terminal_reason,
+            )
         terminal_payload = {
             "status": status,
             "terminal_reason": terminal_reason,
@@ -1218,16 +4078,10 @@ class TaskRuntime:
             "error_message": error_message,
         }
         if (
-            (
-                status == AgentTaskStatus.TIMEOUT
-                and terminal_reason != "hard_deadline_exceeded"
-            )
+            (status == AgentTaskStatus.TIMEOUT and terminal_reason != "hard_deadline_exceeded")
             or terminal_reason == "timeout"
             or is_context_payload_too_large(terminal_payload)
-            or (
-                terminal_reason == "output_truncated"
-                or error_class == "provider_output_truncated"
-            )
+            or (terminal_reason == "output_truncated" or error_class == "provider_output_truncated")
         ):
             error_class, error_message = sanitize_agent_error(
                 terminal_payload,
@@ -1236,42 +4090,82 @@ class TaskRuntime:
             )
             terminal_payload["error_class"] = error_class
             terminal_payload["error_message"] = error_message
-        await self._storage.update_agent_task(
-            task.task_id,
-            status=status,
-            finished_at=_epoch_time_ms(),
-            terminal_reason=terminal_reason,
-            error_class=error_class,
-            error_message=error_message,
-            **await self._terminal_details_update(
-                task,
-                status=status,
-                terminal_reason=terminal_reason,
-                error_class=error_class,
-                error_message=error_message,
-            ),
-        )
-        payload: dict[str, Any] = {
-            "task_id": task.task_id,
-            "session_key": task.envelope.session_key,
+        terminal_update: dict[str, Any] = {
+            "status": status,
+            "finished_at": _epoch_time_ms(),
             "terminal_reason": terminal_reason,
+            "error_class": error_class,
+            "error_message": error_message,
         }
-        if status != AgentTaskStatus.SUCCEEDED:
-            payload["terminal_message"] = build_terminal_reply(terminal_payload)
-        await self._emit(task.envelope.session_key, f"task.{status.value}", payload)
-        await self._notify_task_lifecycle(
-            TaskLifecycleEvent(
-                phase="terminal",
-                session_key=task.envelope.session_key,
-                task_id=task.task_id,
-                task_status=status,
-                run_kind=task.run_kind,
-                terminal_reason=terminal_reason,
-                error_class=error_class,
-                error_message=error_message,
+        try:
+            terminal_update.update(
+                await self._terminal_details_update(
+                    task,
+                    status=status,
+                    terminal_reason=terminal_reason,
+                    error_class=error_class,
+                    error_message=error_message,
+                )
             )
-        )
-        task.done.set()
+        except Exception as exc:  # noqa: BLE001 - terminal feedback still matters.
+            log.warning(
+                "task_runtime.terminal_details_failed",
+                task_id=task.task_id,
+                session_key=task.envelope.session_key,
+                error=str(exc),
+            )
+        try:
+            try:
+                await self._storage.update_agent_task(
+                    task.task_id,
+                    **terminal_update,
+                )
+            except Exception as exc:  # noqa: BLE001 - do not strand the UI in running.
+                log.warning(
+                    "task_runtime.terminal_persist_failed",
+                    task_id=task.task_id,
+                    session_key=task.envelope.session_key,
+                    status=status,
+                    error=str(exc),
+                )
+                await self._cache_terminal_fallback_record(
+                    task,
+                    status=status,
+                    terminal_update=terminal_update,
+                )
+            payload: dict[str, Any] = {
+                "task_id": task.task_id,
+                "session_key": task.envelope.session_key,
+                "terminal_reason": terminal_reason,
+                **_task_identity_payload(
+                    task.envelope,
+                    task.task_id,
+                    user_message_id=task.persisted_user_message_id,
+                ),
+            }
+            if status != AgentTaskStatus.SUCCEEDED:
+                payload["terminal_message"] = build_terminal_reply(terminal_payload)
+            await self._emit(task.envelope.session_key, f"task.{status.value}", payload)
+            await self._notify_task_lifecycle(
+                TaskLifecycleEvent(
+                    phase="terminal",
+                    session_key=task.envelope.session_key,
+                    task_id=task.task_id,
+                    task_status=status,
+                    run_kind=task.run_kind,
+                    terminal_reason=terminal_reason,
+                    error_class=error_class,
+                    error_message=error_message,
+                )
+            )
+        finally:
+            # Keep the runtime task discoverable until the durable status is
+            # settled. Otherwise wait() can race the state pop and return the
+            # previous persisted status (for example RUNNING after cancellation).
+            task.done.set()
+            async with self._state_lock:
+                if self._tasks.get(task.task_id) is task:
+                    self._tasks.pop(task.task_id, None)
         await self._notify_subagent_terminal(
             task,
             status,
@@ -1279,6 +4173,161 @@ class TaskRuntime:
             error_class=error_class,
             error_message=error_message,
         )
+
+    async def _record_primary_terminal_disposition(
+        self,
+        task: _RuntimeTask,
+        *,
+        status: AgentTaskStatus,
+        terminal_reason: str,
+    ) -> None:
+        """Close an identity-aware input that never reached ``applied``.
+
+        Explicit cancellation (including overflow eviction) is ``cancelled``;
+        other pre-application terminal outcomes are ``rejected``.  Persistence
+        and live projection are attempted independently so one observer failure
+        cannot strand the task ledger or suppress the other canonical signal.
+        """
+
+        metadata = task.envelope.metadata
+        disposition = "cancelled" if status == AgentTaskStatus.CANCELLED else "rejected"
+        try:
+            base_revision = int(metadata.get("turn_context_revision", 1) or 1)
+        except (TypeError, ValueError):
+            base_revision = 1
+        context: dict[str, Any] = {
+            "turn_id": task.task_id,
+            "client_message_id": metadata.get("client_message_id"),
+            "surface_id": metadata.get("surface_id"),
+            "intent": metadata.get("turn_context_intent", "send"),
+            "disposition": disposition,
+            "revision": max(2, base_revision + 1),
+        }
+        for context_field in ("target_turn_id", "promoted_from_turn_id"):
+            value = metadata.get(context_field)
+            if isinstance(value, str) and value:
+                context[context_field] = value
+
+        try:
+            updated = await self._update_transcript_turn_context(
+                task.envelope.session_key,
+                task.persisted_user_message_id,
+                context,
+            )
+            if task.persisted_user_message_id and not updated:
+                log.warning(
+                    "task_runtime.primary_input_terminal_persist_missed",
+                    session_key=task.envelope.session_key,
+                    task_id=task.task_id,
+                    message_id=task.persisted_user_message_id,
+                    disposition=disposition,
+                )
+        except Exception:  # noqa: BLE001 - live evidence must still be emitted
+            log.warning(
+                "task_runtime.primary_input_terminal_persist_failed",
+                session_key=task.envelope.session_key,
+                task_id=task.task_id,
+                message_id=task.persisted_user_message_id,
+                disposition=disposition,
+                exc_info=True,
+            )
+        try:
+            await self._emit(
+                task.envelope.session_key,
+                "session.event.input_disposition",
+                {
+                    "session_key": task.envelope.session_key,
+                    "user_message_id": task.persisted_user_message_id,
+                    **context,
+                    "terminal_reason": terminal_reason,
+                },
+            )
+        except Exception:  # noqa: BLE001 - task terminal cleanup must continue
+            log.warning(
+                "task_runtime.primary_input_terminal_emit_failed",
+                session_key=task.envelope.session_key,
+                task_id=task.task_id,
+                message_id=task.persisted_user_message_id,
+                disposition=disposition,
+                exc_info=True,
+            )
+
+    async def _record_collected_primary_inputs_applied(self, task: _RuntimeTask) -> None:
+        """Advance every durable prompt coalesced into this turn to applied."""
+
+        while task.collected_primary_inputs:
+            item = task.collected_primary_inputs[0]
+            await self._record_collected_primary_input_disposition(
+                task,
+                item,
+                disposition="applied",
+            )
+            # There is deliberately no await between the successful observer
+            # writes and removal. Cancellation therefore either leaves the
+            # identity pending for terminal cleanup or sees it fully applied.
+            task.collected_primary_inputs.pop(0)
+
+    async def _record_collected_primary_input_disposition(
+        self,
+        task: _RuntimeTask,
+        item: _CollectedPrimaryInput,
+        *,
+        disposition: str,
+        terminal_reason: str | None = None,
+    ) -> None:
+        context: dict[str, Any] = {
+            "turn_id": task.task_id,
+            "client_message_id": item.client_message_id,
+            "surface_id": item.surface_id,
+            "intent": item.intent,
+            "disposition": disposition,
+            "target_turn_id": task.task_id,
+            "revision": item.revision,
+        }
+        try:
+            updated = await self._update_transcript_turn_context(
+                task.envelope.session_key,
+                item.persisted_user_message_id,
+                context,
+            )
+            if item.persisted_user_message_id and not updated:
+                log.warning(
+                    "task_runtime.collected_input_disposition_persist_missed",
+                    session_key=task.envelope.session_key,
+                    task_id=task.task_id,
+                    message_id=item.persisted_user_message_id,
+                    disposition=disposition,
+                )
+        except Exception:  # noqa: BLE001 - live evidence must still be emitted
+            log.warning(
+                "task_runtime.collected_input_disposition_persist_failed",
+                session_key=task.envelope.session_key,
+                task_id=task.task_id,
+                message_id=item.persisted_user_message_id,
+                disposition=disposition,
+                exc_info=True,
+            )
+        event_details = {"terminal_reason": terminal_reason} if terminal_reason else {}
+        try:
+            await self._emit(
+                task.envelope.session_key,
+                "session.event.input_disposition",
+                {
+                    "session_key": task.envelope.session_key,
+                    "user_message_id": item.persisted_user_message_id,
+                    **context,
+                    **event_details,
+                },
+            )
+        except Exception:  # noqa: BLE001 - task cleanup must continue
+            log.warning(
+                "task_runtime.collected_input_disposition_emit_failed",
+                session_key=task.envelope.session_key,
+                task_id=task.task_id,
+                message_id=item.persisted_user_message_id,
+                disposition=disposition,
+                exc_info=True,
+            )
 
     async def _mark_unfinished_abandoned(self) -> None:
         async with self._state_lock:
@@ -1366,6 +4415,23 @@ class TaskRuntime:
         existing = await self._storage.get_agent_task(task.task_id)
         current_details = getattr(existing, "details", None)
         details = dict(current_details) if isinstance(current_details, dict) else {}
+        pending_applied = task.pending_input_provider.pending_applied()
+        if pending_applied:
+            # If transcript persistence was temporarily unavailable after a
+            # provider call started, commit enough evidence with the terminal
+            # task row for startup recovery to close the input as ``applied``
+            # instead of replaying it as a follow-up.
+            details["applied_steer_evidence"] = [
+                {
+                    "message_id": item.persisted_user_message_id,
+                    "applied_iteration": item.applied_iteration,
+                    "model_call_id": item.model_call_id,
+                }
+                for item in pending_applied
+                if item.persisted_user_message_id
+            ]
+        else:
+            details.pop("applied_steer_evidence", None)
         cancellation: dict[str, str] | None = None
         if status == AgentTaskStatus.CANCELLED:
             cancellation = {
@@ -1375,8 +4441,20 @@ class TaskRuntime:
                 or ("overflow_drop" if task.overflow_dropped else terminal_reason),
             }
             details["cancellation"] = cancellation
+        details.pop("cancellation_requested", None)
         if status == AgentTaskStatus.SUCCEEDED:
             details["turn_outcome"] = completed_outcome().to_dict()
+            if task.terminal_assistant_message_content is not None:
+                # This is a compact durable channel outbox payload. It keeps
+                # delivery exact after compaction/reset and avoids inferring
+                # ownership from unrelated assistant writers in the session.
+                details["terminal_assistant_message_content"] = (
+                    task.terminal_assistant_message_content
+                )
+                if task.terminal_assistant_message_id is not None:
+                    details["terminal_assistant_message_id"] = (
+                        task.terminal_assistant_message_id
+                    )
         else:
             turn_outcome = outcome_from_error(
                 code=terminal_reason if terminal_reason != "error" else error_class,
@@ -1394,6 +4472,43 @@ class TaskRuntime:
             if disclosure_required is True:
                 details["runtime_partial_failure_disclosure_required"] = True
         return {"details": details}
+
+    async def _cache_terminal_fallback_record(
+        self,
+        task: _RuntimeTask,
+        *,
+        status: AgentTaskStatus,
+        terminal_update: dict[str, Any],
+    ) -> None:
+        try:
+            existing = await self._storage.get_agent_task(task.task_id)
+        except Exception as exc:  # noqa: BLE001 - fallback must not fail terminalization.
+            log.warning(
+                "task_runtime.terminal_fallback_read_failed",
+                task_id=task.task_id,
+                session_key=task.envelope.session_key,
+                error=str(exc),
+            )
+            existing = None
+        if existing is not None:
+            record = existing.model_copy(deep=True)
+        else:
+            now = _epoch_time_ms()
+            record = AgentTaskRecord(
+                task_id=task.task_id,
+                session_key=task.envelope.session_key,
+                agent_id=task.envelope.agent_id,
+                source_kind=task.envelope.source_kind.value,
+                queue_mode=task.queue_mode,
+                run_kind=task.run_kind,
+                status=status,
+                created_at=now,
+                updated_at=now,
+            )
+        for key, value in terminal_update.items():
+            if hasattr(record, key):
+                setattr(record, key, value)
+        self._terminal_fallback_records[task.task_id] = record
 
 
 def _subagent_group_outcome_from_provenance(

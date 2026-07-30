@@ -1,6 +1,7 @@
 ---
 name: http-fetch
 description: "Fetch a URL via HTTP/HTTPS and return the response body as text. Lightweight entrypoint replacement for `sub-agent` steps whose only job is a single GET/POST. Supports GET (default), POST/PUT/DELETE with a stdin-piped body, configurable timeout, and a max-bytes cap — no LLM agent loop, no custom-header injection (request goes out with urllib defaults). Use for simple data-fetch steps in meta-skill DAGs; for crawling, JS-rendered pages, or complex auth chains use sub-agent + scrapling instead."
+description_zh: "通过HTTP/HTTPS抓取URL并以文本返回响应体。作为仅执行单次GET/POST的 sub-agent 步骤的轻量替代入口。支持GET（默认）、带stdin管道请求体的POST/PUT/DELETE、可配置超时和最大字节上限，无LLM代理循环、无自定义请求头注入。适合meta-skill DAG中简单的数据抓取步骤；爬取、JS渲染页面或复杂认证链请改用 sub-agent + scrapling。"
 provenance:
   origin: opensquilla-original
   license: Apache-2.0

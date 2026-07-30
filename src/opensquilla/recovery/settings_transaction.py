@@ -20,6 +20,7 @@ from typing import Any
 from opensquilla.recovery.atomic import (
     PathIdentity,
     _chmod_open_file,
+    _native_io_path,
     native_move_no_replace,
 )
 from opensquilla.recovery.config_patch import ConfigSnapshot
@@ -49,9 +50,17 @@ def settings_transaction_journal(home: str | Path) -> Path:
     return home_path.parent / f".{home_path.name}.desktop-settings-transaction.json"
 
 
+def _lexists(path: str | Path) -> bool:
+    return os.path.lexists(_native_io_path(path))
+
+
+def _native_lstat(path: str | Path) -> os.stat_result:
+    return os.lstat(_native_io_path(path))
+
+
 def settings_transaction_exists(home: str | Path) -> bool:
     try:
-        return os.path.lexists(settings_transaction_journal(home))
+        return _lexists(settings_transaction_journal(home))
     except OSError:
         return True
 
@@ -97,7 +106,7 @@ def _write_no_replace(path: Path, data: bytes, *, mode: int = 0o600) -> PathIden
         | getattr(os, "O_CLOEXEC", 0)
     )
     flags |= getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags, mode)
+    fd = os.open(_native_io_path(path), flags, mode)
     try:
         with contextlib.suppress(OSError):
             _chmod_open_file(fd, mode)
@@ -107,7 +116,7 @@ def _write_no_replace(path: Path, data: bytes, *, mode: int = 0o600) -> PathIden
     except BaseException:
         os.close(fd)
         with contextlib.suppress(OSError):
-            path.unlink()
+            os.unlink(_native_io_path(path))
         raise
     os.close(fd)
     _fsync_directory(path.parent)
@@ -121,7 +130,7 @@ def _restrict_existing_credential_to_owner(path: Path) -> None:
     can_harden_posix_mode = callable(getattr(os, "fchmod", None))
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags)
+    fd = os.open(_native_io_path(path), flags)
     try:
         if PathIdentity.from_stat(os.fstat(fd)) != snapshot.identity:
             raise AtomicStateUnknownError("Desktop credential changed before backup hardening")
@@ -169,7 +178,7 @@ def _identity_matches(path: Path, expected: object) -> bool:
     if not isinstance(expected, dict):
         return False
     try:
-        value = path.lstat()
+        value = _native_lstat(path)
     except OSError:
         return False
     attributes = int(getattr(value, "st_file_attributes", 0))
@@ -182,9 +191,12 @@ def _identity_matches(path: Path, expected: object) -> bool:
 
 def _plain_directory(path: Path, *, create: bool = False) -> None:
     if create:
-        path.mkdir(mode=0o700, parents=False, exist_ok=True)
+        try:
+            os.mkdir(_native_io_path(path), mode=0o700)
+        except FileExistsError:
+            pass
     try:
-        value = path.lstat()
+        value = _native_lstat(path)
     except OSError as exc:
         raise RecoveryError(
             "Desktop settings parent is unavailable",
@@ -411,7 +423,7 @@ def _artifact_paths(
 
 def _old_destination_matches(path: Path, expected: object) -> bool:
     if expected is None:
-        return not os.path.lexists(path)
+        return not _lexists(path)
     return _identity_matches(path, expected)
 
 
@@ -421,14 +433,14 @@ def _park_old_destination(
     expected_old: object,
 ) -> None:
     if expected_old is None:
-        if os.path.lexists(live) or os.path.lexists(backup):
+        if _lexists(live) or _lexists(backup):
             raise AtomicStateUnknownError("settings destination changed before publication")
         return
     if _identity_matches(backup, expected_old):
-        if os.path.lexists(live):
+        if _lexists(live):
             raise AtomicStateUnknownError("settings destination was recreated after parking")
         return
-    if os.path.lexists(backup) or not _identity_matches(live, expected_old):
+    if _lexists(backup) or not _identity_matches(live, expected_old):
         raise AtomicStateUnknownError("settings destination changed before it could be parked")
     _durable_move_no_replace(live, backup)
     if not _identity_matches(backup, expected_old):
@@ -442,7 +454,7 @@ def _publish(
 ) -> None:
     if not _identity_matches(source, expected):
         raise AtomicStateUnknownError("settings transaction candidate identity is ambiguous")
-    if os.path.lexists(destination):
+    if _lexists(destination):
         raise AtomicStateUnknownError("settings transaction destination changed before publication")
     _durable_move_no_replace(source, destination)
     if not _identity_matches(destination, expected):
@@ -475,7 +487,7 @@ def _cleanup_committed(journal: Path, payload: dict[str, Any], paths: dict[str, 
         expected = identities.get(role)
         if expected is not None and _identity_matches(paths[role], expected):
             with contextlib.suppress(OSError):
-                paths[role].unlink()
+                os.unlink(_native_io_path(paths[role]))
                 _fsync_directory(paths[role].parent)
     _fsync_directory(paths["journal_committed"].parent)
 
@@ -490,12 +502,12 @@ def _rollback_one(
     backup_identity: object,
 ) -> None:
     if _identity_matches(live, new_identity):
-        if os.path.lexists(staged):
+        if _lexists(staged):
             raise AtomicStateUnknownError("settings rollback destination is occupied")
         _durable_move_no_replace(live, staged)
     elif (
         old_identity is not None
-        and not os.path.lexists(live)
+        and not _lexists(live)
         and _identity_matches(backup, backup_identity)
     ):
         # The old file was parked, but this role's candidate was not published.
@@ -505,7 +517,7 @@ def _rollback_one(
         raise AtomicStateUnknownError("settings rollback live identity is ambiguous")
 
     if old_identity is None:
-        if os.path.lexists(live):
+        if _lexists(live):
             raise AtomicStateUnknownError("settings rollback could not restore missing state")
         return
     if _identity_matches(live, old_identity):
@@ -609,15 +621,11 @@ def _assert_recovery_phase_state(
         old_identity = identities.get(f"old_{role}")
         new_identity = identities.get(f"{role}_new")
         if old_identity is None:
-            old_is_safe = not os.path.lexists(backup)
-            old_unpublished = old_is_safe and not os.path.lexists(live)
+            old_is_safe = not _lexists(backup)
+            old_unpublished = old_is_safe and not _lexists(live)
         else:
-            old_at_live = _identity_matches(live, old_identity) and not os.path.lexists(
-                backup
-            )
-            old_at_backup = _identity_matches(backup, old_identity) and not os.path.lexists(
-                live
-            )
+            old_at_live = _identity_matches(live, old_identity) and not _lexists(backup)
+            old_at_backup = _identity_matches(backup, old_identity) and not _lexists(live)
             old_is_safe = _identity_matches(backup, old_identity)
             old_unpublished = old_at_live or old_at_backup
         unpublished = (
@@ -625,7 +633,7 @@ def _assert_recovery_phase_state(
         )
         published = (
             _identity_matches(live, new_identity)
-            and not os.path.lexists(staged)
+            and not _lexists(staged)
             and old_is_safe
         )
         return unpublished, published
@@ -754,7 +762,7 @@ def apply_desktop_settings(
 
     with ProfileOperationLock(home_path, timeout=lock_timeout):
         with LegacyGatewayLock(home_path, timeout=lock_timeout):
-            if os.path.lexists(journal):
+            if _lexists(journal):
                 raise RecoveryError(
                     "An interrupted Desktop settings transaction must be recovered first",
                     stable_code="settings_transaction_incomplete",
@@ -773,14 +781,14 @@ def apply_desktop_settings(
                 )
 
             _plain_directory(home_path.parent)
-            if not home_path.exists():
+            if not _lexists(home_path):
                 _plain_directory(home_path, create=True)
             else:
                 _plain_directory(home_path)
             operation_id = str(uuid.uuid4())
             paths = _artifact_paths(home_path, operation_id, import_transaction_id)
             if import_transaction_id:
-                if os.path.lexists(paths["credential_backup"]):
+                if _lexists(paths["credential_backup"]):
                     raise RecoveryError(
                         "The imported Desktop credential backup already exists",
                         stable_code="settings_credential_backup_exists",

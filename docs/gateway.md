@@ -88,6 +88,13 @@ opensquilla gateway run --listen 0.0.0.0 --port 18791
 Do not expose a gateway to an untrusted network without token auth and a network
 boundary you understand.
 
+When a wildcard-bound gateway is reached through a custom DNS name or reverse
+proxy, list the exact browser origin in `cors.allowed_origins` (for example,
+`https://control.example`). IP-literal and localhost authorities work without
+that entry. OpenSquilla intentionally does not trust arbitrary `Host` values on
+a wildcard listener, because doing so would permit DNS rebinding; `"*"` is not
+accepted for this purpose.
+
 ## Configuration Path
 
 Use a specific config file:

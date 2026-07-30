@@ -1,5 +1,9 @@
 import { computed, ref, watch } from 'vue'
 
+import {
+  waitForSessionRpcConnection,
+} from '@/composables/chat/sessionBootstrapAdmission'
+import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
 import { SANDBOX_RUN_MODES, isSandboxRunMode, type SandboxRunMode } from '@/types/sandbox'
 
 export const RUN_MODE_STORAGE_KEY = 'opensquilla.chat.runMode'
@@ -12,6 +16,48 @@ export interface RunModePolicy {
 
 interface UseChatRunModePreferenceOptions {
   runModePolicy: () => RunModePolicy | null | undefined
+  rpc: RunModePreferenceRpc
+  hydrateCallOptions?: RpcCallOptions
+}
+
+interface RunModePreferenceRpc {
+  waitForConnection: (
+    timeoutMs?: number,
+    signal?: AbortSignal,
+    actions?: RpcConnectionWaitOptions,
+  ) => Promise<void>
+  call: (
+    method: string,
+    params?: Record<string, unknown>,
+    callOptions?: RpcCallOptions,
+  ) => Promise<unknown>
+}
+
+interface RunModeRpc {
+  waitForConnection: () => Promise<unknown>
+  call: (
+    method: string,
+    params?: Record<string, unknown>,
+  ) => Promise<unknown>
+}
+
+interface PersistMaterializedSessionRunModeOptions {
+  rpc: RunModeRpc
+  sessionKey: string
+  isDraft: boolean
+  runMode: SandboxRunMode
+}
+
+export async function persistMaterializedSessionRunMode(
+  options: PersistMaterializedSessionRunModeOptions,
+): Promise<void> {
+  const sessionKey = options.sessionKey.trim()
+  if (options.isDraft || !sessionKey) return
+  await options.rpc.waitForConnection()
+  await options.rpc.call('sandbox.run_context.set', {
+    sessionKey,
+    runMode: options.runMode,
+  })
 }
 
 function availableStorage(): Storage | null {
@@ -64,6 +110,7 @@ export function useChatRunModePreference(options: UseChatRunModePreferenceOption
   // coerces disallowed modes, so this does not weaken the sandbox boundary.
   const runMode = ref<SandboxRunMode>('full')
   const runModeUserSelected = ref(false)
+  const runModeHydrated = ref(false)
 
   const currentRunModePolicy = computed(() => {
     const policy = options.runModePolicy()
@@ -84,37 +131,99 @@ export function useChatRunModePreference(options: UseChatRunModePreferenceOption
     return allowed.length > 0 ? allowed : [...SANDBOX_RUN_MODES]
   })
 
+  let initialized = false
   watch([allowedRunModes, runModePolicyDefault], ([modes, defaultMode]) => {
-    const storedMode = readStoredRunMode()
-    if (storedMode && modes.includes(storedMode)) {
-      runMode.value = storedMode
-      runModeUserSelected.value = true
+    if (!initialized) {
+      initialized = true
+      const storedMode = readStoredRunMode()
+      if (storedMode && modes.includes(storedMode)) {
+        runMode.value = storedMode
+        runModeUserSelected.value = true
+        return
+      }
+      if (storedMode) clearStoredRunMode()
+      runMode.value = preferredRunMode(modes, defaultMode)
       return
     }
-    if (storedMode) clearStoredRunMode()
-
-    if (runModeUserSelected.value && modes.includes(runMode.value)) return
-
+    if (modes.includes(runMode.value)) return
+    const fallback = preferredRunMode(modes, defaultMode)
+    runMode.value = fallback
     runModeUserSelected.value = false
-    runMode.value = preferredRunMode(modes, defaultMode)
+    if (runModeHydrated.value) writeStoredRunMode(fallback)
   }, { immediate: true })
 
-  function setRunMode(mode: SandboxRunMode): SandboxRunMode {
-    const next = modesSafeIncludes(allowedRunModes.value, mode)
-      ? mode
+  function normalizePreference(mode: unknown): SandboxRunMode {
+    const candidate = isSandboxRunMode(mode) ? mode : runModePolicyDefault.value
+    return modesSafeIncludes(allowedRunModes.value, candidate)
+      ? candidate
       : preferredRunMode(allowedRunModes.value, runModePolicyDefault.value)
+  }
+
+  function applyConfirmedPreference(
+    mode: unknown,
+    options: { selected: boolean },
+  ): SandboxRunMode {
+    const next = normalizePreference(mode)
     runMode.value = next
-    runModeUserSelected.value = true
+    runModeUserSelected.value = options.selected
+    runModeHydrated.value = true
     writeStoredRunMode(next)
     return next
+  }
+
+  function modeFromPayload(payload: unknown): unknown {
+    if (!payload || typeof payload !== 'object') return undefined
+    return (payload as Record<string, unknown>).runMode
+  }
+
+  async function hydrateRunModePreference(): Promise<SandboxRunMode> {
+    await waitForSessionRpcConnection(options.rpc, options.hydrateCallOptions)
+    const payload = options.hydrateCallOptions
+      ? await options.rpc.call(
+          'sandbox.run_mode.preference.get',
+          undefined,
+          options.hydrateCallOptions,
+        )
+      : await options.rpc.call('sandbox.run_mode.preference.get')
+    const source = payload && typeof payload === 'object'
+      ? (payload as Record<string, unknown>).source
+      : null
+    return applyConfirmedPreference(
+      modeFromPayload(payload),
+      { selected: source === 'preference' },
+    )
+  }
+
+  async function setGlobalRunMode(mode: SandboxRunMode): Promise<SandboxRunMode> {
+    const requested = modesSafeIncludes(allowedRunModes.value, mode)
+      ? mode
+      : preferredRunMode(allowedRunModes.value, runModePolicyDefault.value)
+    await options.rpc.waitForConnection()
+    const payload = await options.rpc.call('sandbox.run_mode.preference.set', {
+      runMode: requested,
+    })
+    return applyConfirmedPreference(
+      modeFromPayload(payload),
+      { selected: true },
+    )
+  }
+
+  function applyRunModePreferenceChanged(payload: unknown): SandboxRunMode {
+    return applyConfirmedPreference(
+      modeFromPayload(payload),
+      { selected: true },
+    )
   }
 
   return {
     runMode,
     runModeUserSelected,
+    runModeHydrated,
     runModePolicyDefault,
     allowedRunModes,
-    setRunMode,
+    hydrateRunModePreference,
+    setGlobalRunMode,
+    applyRunModePreferenceChanged,
   }
 }
 

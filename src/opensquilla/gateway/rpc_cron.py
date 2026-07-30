@@ -31,6 +31,7 @@ from opensquilla.scheduler.types import (
 )
 
 _d = get_dispatcher()
+_MAX_IDEMPOTENCY_KEY_LENGTH = 256
 
 
 def _require_scheduler(ctx: RpcContext) -> Any:
@@ -108,7 +109,27 @@ def _job_to_wire(j: Any) -> dict[str, Any]:
         "consecutive_errors": d.get("consecutive_errors", 0),
         "delivery": _delivery_to_wire(delivery),
         "toolPolicy": _tool_policy_to_wire(d.get("tool_policy")),
+        "runMode": d.get("run_mode", "") or "",
+        "elevated": d.get("elevated", "") or "",
+        "executionTarget": d.get("execution_target", "") or "",
+        "deduplicated": bool(d.get("deduplicated", False)),
     }
+
+
+def _idempotency_key_from_params(params: dict[str, Any]) -> str:
+    raw = params.get("idempotencyKey", params.get("idempotency_key"))
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        raise ValueError("idempotencyKey must be a string")
+    key = raw.strip()
+    if not key:
+        raise ValueError("idempotencyKey must not be empty")
+    if len(key) > _MAX_IDEMPOTENCY_KEY_LENGTH:
+        raise ValueError(
+            f"idempotencyKey must be at most {_MAX_IDEMPOTENCY_KEY_LENGTH} characters"
+        )
+    return key
 
 
 def _failure_destination_to_wire(fd: Any) -> dict[str, Any] | None:
@@ -625,6 +646,8 @@ async def _finalize_cron_add(
         tz=tz_value,
         jitter_seconds=jitter_seconds,
         creator_is_owner=True,
+        run_mode="full",
+        idempotency_key=_idempotency_key_from_params(params),
         schedule_kind=schedule_kind,
         schedule_value=schedule_value,
         schedule_tz=tz_value,

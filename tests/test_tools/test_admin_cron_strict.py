@@ -22,9 +22,11 @@ from opensquilla.tools.types import ToolContext, ToolError, current_tool_context
 class _ToolFakeScheduler:
     def __init__(self) -> None:
         self.added_kwargs: dict[str, Any] | None = None
+        self.added_calls: list[dict[str, Any]] = []
 
     async def add_job(self, **kwargs):
         self.added_kwargs = kwargs
+        self.added_calls.append(kwargs)
         from types import SimpleNamespace
 
         return SimpleNamespace(
@@ -54,7 +56,99 @@ async def test_admin_cron_accepts_structured_cron_schedule() -> None:
     assert fake.added_kwargs is not None
     assert fake.added_kwargs["schedule_value"] == "*/5 * * * *"
     assert fake.added_kwargs["creator_is_owner"] is True
+    assert fake.added_kwargs["idempotency_key"] == ""
     assert json.loads(raw)["schedule_value"] == "*/5 * * * *"
+
+
+@pytest.mark.asyncio
+async def test_admin_cron_generates_stable_per_task_idempotency_key() -> None:
+    fake = _ToolFakeScheduler()
+    admin_mod.set_scheduler(fake)
+    token = current_tool_context.set(
+        ToolContext(
+            is_owner=True,
+            task_id="task-123",
+            session_key="agent:main:webchat:owner",
+            sender_id="owner",
+            run_mode="full",
+        )
+    )
+    try:
+        for _ in range(2):
+            await cron_tool(
+                action="add",
+                schedule={"kind": "cron", "expr": "*/5 * * * *"},
+                task="ping",
+                job_kind="agent_turn",
+                session_target="isolated",
+            )
+    finally:
+        current_tool_context.reset(token)
+        admin_mod.set_scheduler(None)  # type: ignore[arg-type]
+
+    first_key = fake.added_calls[0]["idempotency_key"]
+    assert first_key.startswith("cron-tool:")
+    assert len(first_key) == len("cron-tool:") + 64
+    assert fake.added_calls[1]["idempotency_key"] == first_key
+    assert fake.added_calls[0]["run_mode"] == "full"
+
+
+@pytest.mark.asyncio
+async def test_admin_cron_normalizes_schedule_for_idempotency() -> None:
+    fake = _ToolFakeScheduler()
+    admin_mod.set_scheduler(fake)
+    token = current_tool_context.set(
+        ToolContext(
+            is_owner=True,
+            task_id="task-123",
+            session_key="agent:main:webchat:owner",
+            sender_id="owner",
+        )
+    )
+    try:
+        for expression in ("0   9 * * *", "0 9 * * *"):
+            await cron_tool(
+                action="add",
+                schedule={"kind": "cron", "expr": expression},
+                task="ping",
+                job_kind="agent_turn",
+                session_target="isolated",
+            )
+    finally:
+        current_tool_context.reset(token)
+        admin_mod.set_scheduler(None)  # type: ignore[arg-type]
+
+    assert fake.added_calls[0]["idempotency_key"] == fake.added_calls[1]["idempotency_key"]
+
+
+@pytest.mark.asyncio
+async def test_admin_cron_scopes_idempotency_to_task_id() -> None:
+    fake = _ToolFakeScheduler()
+    admin_mod.set_scheduler(fake)
+    try:
+        for task_id in ("task-123", "task-456"):
+            token = current_tool_context.set(
+                ToolContext(
+                    is_owner=True,
+                    task_id=task_id,
+                    session_key="agent:main:webchat:owner",
+                    sender_id="owner",
+                )
+            )
+            try:
+                await cron_tool(
+                    action="add",
+                    schedule={"kind": "cron", "expr": "0 9 * * *"},
+                    task="ping",
+                    job_kind="agent_turn",
+                    session_target="isolated",
+                )
+            finally:
+                current_tool_context.reset(token)
+    finally:
+        admin_mod.set_scheduler(None)  # type: ignore[arg-type]
+
+    assert fake.added_calls[0]["idempotency_key"] != fake.added_calls[1]["idempotency_key"]
 
 
 @pytest.mark.asyncio

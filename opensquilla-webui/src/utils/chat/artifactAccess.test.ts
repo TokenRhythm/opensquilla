@@ -138,6 +138,21 @@ describe('openArtifactViaGateway', () => {
 })
 
 describe('fetchArtifactBlob', () => {
+  it('forwards an AbortSignal to the authenticated fetch', async () => {
+    const controller = new AbortController()
+    const fetchImpl = vi.fn(async () => new Response('hello', { status: 200 }))
+
+    await fetchArtifactBlob(artifact(), {
+      baseOrigin: 'http://127.0.0.1:18793',
+      signal: controller.signal,
+      fetchImpl,
+    })
+
+    expect(fetchImpl).toHaveBeenCalledWith('/api/v1/artifacts/art-report', expect.objectContaining({
+      signal: controller.signal,
+    }))
+  })
+
   it('fetches the sanitized artifact URL with WebUI headers', async () => {
     const fetchImpl = vi.fn(async () => new Response('hello', {
       status: 200,
@@ -159,6 +174,7 @@ describe('fetchArtifactBlob', () => {
         Authorization: 'Bearer secret',
       },
       credentials: 'same-origin',
+      signal: undefined,
     })
     if (result.ok) {
       expect(await result.blob.text()).toBe('hello')
@@ -187,6 +203,7 @@ describe('fetchArtifactBlob', () => {
       method: 'GET',
       headers: {},
       credentials: 'omit',
+      signal: undefined,
     })
   })
 

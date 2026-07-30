@@ -1,6 +1,7 @@
 ---
 name: voiceover-studio
 description: "Generate narration, product voiceover, IVR prompts, podcast reads, or short-video VOICEOVER audio through OpenSquilla audio tools. Use when the user asks for TTS, 配音, 旁白, 口播, audio narration, or wants script text turned into a playable audio artifact."
+description_zh: "通过OpenSquilla音频工具生成旁白、产品配音、IVR提示、播客朗读或短视频VOICEOVER音频。当用户需要TTS、配音、旁白、口播、音频解说，或想将脚本文字转为可播放音频时使用。"
 triggers:
   - "tts"
   - "text to speech"

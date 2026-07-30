@@ -12,6 +12,7 @@ from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.scopes import METHOD_SCOPES, WRITE_SCOPE
+from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import SessionStatus
 from opensquilla.session.storage import SessionStorage
@@ -165,6 +166,38 @@ async def test_fork_without_title_copies_parent_title_verbatim(dispatcher, ctx, 
     assert res.ok is True
     child = await manager.get_session(res.payload["key"])
     assert child.display_name == "Budget planning"
+
+
+@pytest.mark.asyncio
+async def test_fork_preserves_sandbox_workspace_run_context(dispatcher, ctx, manager, tmp_path):
+    workspace = tmp_path / "project-gamma"
+    workspace.mkdir()
+    await manager.create(
+        PARENT_KEY,
+        agent_id="main",
+        origin={
+            RUN_CONTEXT_ORIGIN_KEY: {
+                "workspace": str(workspace),
+                "run_mode": "trusted",
+            }
+        },
+    )
+
+    res = await dispatcher.dispatch("r1", "sessions.fork", {"key": PARENT_KEY}, ctx)
+
+    assert res.ok is True
+    child = await manager.get_session(res.payload["key"])
+    assert child is not None
+    assert child.origin == {
+        RUN_CONTEXT_ORIGIN_KEY: {
+            "workspace": str(workspace),
+            "run_mode": "trusted",
+        }
+    }
+    list_res = await dispatcher.dispatch("r2", "sessions.list", None, ctx)
+    child_row = _list_row(list_res, res.payload["key"])
+    assert child_row["workspace"] == str(workspace)
+    assert child_row["workspaceLabel"] == "project-gamma"
 
 
 @pytest.mark.asyncio

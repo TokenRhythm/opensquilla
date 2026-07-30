@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
 from typing import Any
@@ -65,9 +66,10 @@ def _make_runtime(
     *,
     event_emitter: Callable[[str, str, dict[str, Any]], Awaitable[None]] | None = None,
     terminal_listener: Callable[[SubagentCompletionEvent], Awaitable[None]] | None = None,
+    storage: Any | None = None,
 ) -> TaskRuntime:
     return TaskRuntime(
-        storage=_make_storage(),
+        storage=storage or _make_storage(),
         turn_handler=turn_handler,
         event_emitter=event_emitter,
         terminal_listener=terminal_listener,
@@ -104,6 +106,40 @@ async def test_mark_terminal_emits_additive_terminal_message_for_timeout_payload
     assert record.details is not None
     assert record.details["turn_outcome"]["kind"] == "interrupted"
     assert record.details["turn_outcome"]["error_class"] == "TimeoutError"
+
+
+@pytest.mark.asyncio
+async def test_terminal_event_still_emits_when_terminal_persistence_is_locked() -> None:
+    emitted: list[tuple[str, str, dict[str, Any]]] = []
+    storage = _make_storage()
+    base_update = storage.update_agent_task
+
+    async def _locked_terminal_update(task_id: str, **kwargs: Any) -> None:
+        if kwargs.get("finished_at") is not None:
+            raise sqlite3.OperationalError("database is locked")
+        await base_update(task_id, **kwargs)
+
+    storage.update_agent_task = _locked_terminal_update
+
+    async def _failing_handler(_run: Any) -> None:
+        raise RuntimeError("boom")
+
+    async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        emitted.append((session_key, event_name, payload))
+
+    runtime = _make_runtime(_failing_handler, event_emitter=_emitter, storage=storage)
+    handle = await runtime.enqueue(_make_envelope(), "hello")
+
+    record = await runtime.wait(handle.task_id, timeout=2.0)
+
+    assert record.status == AgentTaskStatus.FAILED
+    assert record.terminal_reason == "error"
+    terminal_events = [event for event in emitted if event[1] == "task.failed"]
+    assert len(terminal_events) == 1
+    payload = terminal_events[0][2]
+    assert payload["task_id"] == handle.task_id
+    assert payload["terminal_reason"] == "error"
+    assert "failed" in payload["terminal_message"].lower()
 
 
 @pytest.mark.asyncio
@@ -456,15 +492,26 @@ async def test_task_runtime_rolls_back_persisted_user_on_provider_budget_error()
     class RecordingSessionManager:
         def __init__(self) -> None:
             self.removed: list[tuple[str, str]] = []
+            self.rollback_lock: asyncio.Lock | None = None
+            self.rollback_lock_states: list[bool] = []
 
         async def get_session(self, session_key: str) -> Any:  # noqa: ARG002
             return None
 
         async def remove_message(self, session_key: str, message_id: str) -> bool:
+            self.rollback_lock_states.append(
+                self.rollback_lock is not None and self.rollback_lock.locked()
+            )
             self.removed.append((session_key, message_id))
             return True
 
     class ProviderBudgetErrorRunner:
+        def __init__(self) -> None:
+            self.lock = asyncio.Lock()
+
+        def _get_session_lock(self, session_key: str) -> asyncio.Lock:  # noqa: ARG002
+            return self.lock
+
         async def run(self, message: str, session_key: str, **kwargs: Any):  # noqa: ARG002
             yield ErrorEvent(
                 message='{"fallback_reason":"provider_request_budget_exhausted"}',
@@ -475,6 +522,8 @@ async def test_task_runtime_rolls_back_persisted_user_on_provider_budget_error()
         emitted.append((session_key, event_name, payload))
 
     manager = RecordingSessionManager()
+    runner = ProviderBudgetErrorRunner()
+    manager.rollback_lock = runner.lock
     run = SimpleNamespace(
         agent_id="main",
         task_id="task-1",
@@ -488,6 +537,7 @@ async def test_task_runtime_rolls_back_persisted_user_on_provider_budget_error()
         ingress_pipeline_steps=[],
         semantic_message=None,
         persisted_user_message_id="msg-1",
+        persisted_user_message_ids=("msg-1", "msg-2", "msg-3"),
         stream_event_sink=None,
     )
 
@@ -499,12 +549,17 @@ async def test_task_runtime_rolls_back_persisted_user_on_provider_budget_error()
                 agent_stream_idle_timeout_seconds=1.0,
             ),
             session_manager=manager,
-            turn_runner=ProviderBudgetErrorRunner(),
+            turn_runner=runner,
             event_emitter=_emitter,
         )
 
     assert exc_info.value.code == "provider_request_too_large"
-    assert manager.removed == [("agent:main:test", "msg-1")]
+    assert manager.removed == [
+        ("agent:main:test", "msg-1"),
+        ("agent:main:test", "msg-2"),
+        ("agent:main:test", "msg-3"),
+    ]
+    assert manager.rollback_lock_states == [True, True, True]
     payload = emitted[0][2]
     assert payload["code"] == "provider_request_too_large"
     assert "too large" in payload["terminal_message"]

@@ -192,6 +192,34 @@ async def test_operation_runtime_bypasses_for_full_host_access(tmp_path) -> None
 
 
 @pytest.mark.asyncio
+async def test_operation_runtime_never_sandboxes_full_run_mode(tmp_path) -> None:
+    class _Backend:
+        name = "windows_default"
+
+        def operation_domains_supported(self) -> frozenset[str]:
+            return frozenset({"filesystem"})
+
+        async def run_operation(self, operation: SandboxOperation) -> SandboxOperationResult:
+            raise AssertionError(f"full host operation reached sandbox backend: {operation}")
+
+    runtime = SimpleNamespace(
+        effective=SimpleNamespace(sandbox_enabled=True),
+        backend=_Backend(),
+    )
+    operation = SandboxOperation.filesystem(
+        kind="read_file",
+        workspace=tmp_path,
+        run_mode="full",
+        path=tmp_path / "file.txt",
+        paths=(tmp_path / "file.txt",),
+    )
+
+    result = await SandboxOperationRuntime(runtime).run(operation)
+
+    assert result is None
+
+
+@pytest.mark.asyncio
 async def test_operation_runtime_filesystem_fails_closed_without_backend_worker(tmp_path) -> None:
     runtime = SimpleNamespace(
         effective=SimpleNamespace(sandbox_enabled=True),

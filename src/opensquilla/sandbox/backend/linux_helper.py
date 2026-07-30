@@ -33,6 +33,11 @@ from opensquilla.sandbox.backend.linux_protected_create import (
 from opensquilla.sandbox.backend.linux_proxy_bridge import ENV_PROXY_PORT, ENV_PROXY_UDS
 from opensquilla.sandbox.backend.linux_proxy_routing import proxy_env_for_inner_port
 from opensquilla.sandbox.backend.linux_readiness import is_proc_mount_failure, probe_bwrap
+from opensquilla.sandbox.permissions import (
+    FileSystemAccess,
+    FileSystemPermissionEntry,
+    FileSystemPermissionProfile,
+)
 from opensquilla.sandbox.types import (
     MountSpec,
     NetworkMode,
@@ -284,6 +289,7 @@ def _policy_from_payload(policy_payload: dict[str, object]) -> SandboxPolicy:
     env_allowlist = raw_env_allowlist if isinstance(raw_env_allowlist, list) else []
     raw_unreadable_globs = policy_payload.get("unreadableGlobs", [])
     unreadable_globs = raw_unreadable_globs if isinstance(raw_unreadable_globs, list) else []
+    file_system = _filesystem_profile_from_payload(policy_payload.get("fileSystem"))
     limits = _resource_limits_from_payload(policy_payload)
     return SandboxPolicy(
         level=SecurityLevel.STANDARD,
@@ -295,6 +301,61 @@ def _policy_from_payload(policy_payload: dict[str, object]) -> SandboxPolicy:
         env_allowlist=tuple(str(item) for item in env_allowlist),
         require_approval=False,
         unreadable_globs=tuple(str(item) for item in unreadable_globs),
+        file_system=file_system,
+    )
+
+
+def _filesystem_profile_from_payload(
+    raw_profile: object,
+) -> FileSystemPermissionProfile | None:
+    if not isinstance(raw_profile, dict):
+        return None
+    raw_entries = raw_profile.get("entries")
+    if not isinstance(raw_entries, list):
+        raise ValueError("linux helper filesystem profile entries are invalid")
+    entries: list[FileSystemPermissionEntry] = []
+    for raw_entry in raw_entries:
+        if not isinstance(raw_entry, dict):
+            raise ValueError("linux helper filesystem profile entry is invalid")
+        try:
+            path = Path(str(raw_entry["path"]))
+            access = FileSystemAccess(str(raw_entry["access"]))
+        except (KeyError, ValueError) as exc:
+            raise ValueError("linux helper filesystem profile entry is invalid") from exc
+        if not path.is_absolute():
+            raise ValueError("linux helper filesystem profile path must be absolute")
+        raw_logical_path = raw_entry.get("logicalPath")
+        logical_path: Path | None = None
+        if raw_logical_path is not None:
+            if not isinstance(raw_logical_path, str) or not raw_logical_path:
+                raise ValueError(
+                    "linux helper filesystem profile logicalPath must be a non-empty absolute path"
+                )
+            logical_path = Path(raw_logical_path)
+            if not logical_path.is_absolute():
+                raise ValueError(
+                    "linux helper filesystem profile logicalPath must be a non-empty absolute path"
+                )
+        entries.append(
+            FileSystemPermissionEntry(
+                path=path,
+                access=access,
+                logical_path=logical_path,
+            )
+        )
+    raw_globs = raw_profile.get("deniedReadGlobs", [])
+    if not isinstance(raw_globs, list):
+        raise ValueError("linux helper denied-read globs are invalid")
+    try:
+        default_access = FileSystemAccess(
+            str(raw_profile.get("defaultAccess", FileSystemAccess.DENY.value))
+        )
+    except ValueError as exc:
+        raise ValueError("linux helper filesystem profile default access is invalid") from exc
+    return FileSystemPermissionProfile(
+        entries=tuple(entries),
+        denied_read_globs=tuple(str(item) for item in raw_globs),
+        default_access=default_access,
     )
 
 
@@ -342,6 +403,7 @@ def _helper_runtime_mounts() -> list[MountSpec]:
             )
         )
     return mounts
+
 
 def _python_symlink_runtime_roots(executable: Path) -> list[Path]:
     roots: list[Path] = []

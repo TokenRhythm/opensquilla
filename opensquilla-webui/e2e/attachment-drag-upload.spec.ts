@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Download, type Page } from '@playwright/test'
 
 const CONTROL_URL = '/control/chat/new'
 const HISTORY_IMAGE_DATA = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII='
@@ -130,7 +130,7 @@ function historyAttachmentsFromSend(params: CapturedSend, fixture: HistoryAttach
       name: String(first.name || 'quarterly-report.pdf'),
       mime: String(first.mime || 'application/pdf'),
       size: 2_000_001,
-      download_url: `/api/v1/attachments/${'b'.repeat(64)}`,
+      download_url: `/api/v1/attachments/${'b'.repeat(64)}?token=legacy&sessionKey=legacy&variant=download`,
     }]
   }
   return (params.attachments || []).map(att => ({
@@ -138,6 +138,14 @@ function historyAttachmentsFromSend(params: CapturedSend, fixture: HistoryAttach
     name: att.name,
     data: att.data,
   }))
+}
+
+async function readDownloadBytes(download: Download): Promise<Buffer> {
+  const stream = await download.createReadStream()
+  if (!stream) throw new Error('download stream unavailable')
+  const chunks: Buffer[] = []
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk))
+  return Buffer.concat(chunks)
 }
 
 async function openMockedChat(page: Page, capturedSends: CapturedSend[], options: MockRpcOptions = {}) {
@@ -361,6 +369,12 @@ test.describe('attachment drag upload', () => {
 
     await expect(page.locator('.msg-attachments .msg-file-chip')).toContainText('preview.html')
     await expect(page.locator('.msg-attachments .msg-thumb')).toHaveCount(0)
+
+    const downloadPromise = page.waitForEvent('download')
+    await page.getByRole('button', { name: 'Download preview.html' }).click()
+    const download = await downloadPromise
+    expect(download.suggestedFilename()).toBe('preview.html')
+    expect(await readDownloadBytes(download)).toEqual(Buffer.from('<html>'))
   })
 
   test('keeps image history replay attachments as thumbnails', async ({ page }) => {
@@ -392,6 +406,11 @@ test.describe('attachment drag upload', () => {
     const capturedSends: CapturedSend[] = []
     const historyRequests: Array<Record<string, unknown>> = []
     const uploadRequests: Array<{ url: string; authorization?: string }> = []
+    const downloadRequests: Array<{
+      authorization?: string
+      sessionKey?: string
+      url: string
+    }> = []
     await page.addInitScript(() => {
       sessionStorage.setItem('opensquilla.wsToken', 'token-e2e')
     })
@@ -410,6 +429,22 @@ test.describe('attachment drag upload', () => {
           mime: 'application/pdf',
           size: 2_000_001,
         }),
+      })
+    })
+    await page.route('**/api/v1/attachments/**', route => {
+      const request = route.request()
+      downloadRequests.push({
+        authorization: request.headers().authorization,
+        sessionKey: request.headers()['x-opensquilla-session-key'],
+        url: request.url(),
+      })
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/pdf',
+        headers: {
+          'content-disposition': 'attachment; filename="server-quarterly-report.pdf"',
+        },
+        body: Buffer.from('staged attachment bytes'),
       })
     })
     await openMockedChat(page, capturedSends, {
@@ -458,5 +493,18 @@ test.describe('attachment drag upload', () => {
     })
     expect(attachment.data).toBeUndefined()
     expect(JSON.stringify(capturedSends[0])).not.toContain('/Users/')
+
+    const downloadPromise = page.waitForEvent('download')
+    await page.getByRole('button', { name: `Download ${longName}` }).click()
+    const download = await downloadPromise
+    expect(download.suggestedFilename()).toBe('server-quarterly-report.pdf')
+    expect(await readDownloadBytes(download)).toEqual(Buffer.from('staged attachment bytes'))
+    expect(downloadRequests).toHaveLength(1)
+    expect(downloadRequests[0].authorization).toBe('Bearer token-e2e')
+    expect(downloadRequests[0].sessionKey).toBe(capturedSends[0].sessionKey)
+    const requested = new URL(downloadRequests[0].url)
+    expect(requested.searchParams.get('variant')).toBe('download')
+    expect(requested.searchParams.has('token')).toBe(false)
+    expect(requested.searchParams.has('sessionKey')).toBe(false)
   })
 })

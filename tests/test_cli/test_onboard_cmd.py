@@ -73,7 +73,9 @@ def test_onboard_noninteractive_provider(tmp_path, monkeypatch):
     assert "openrouter ·" not in result.stdout
     assert "OpenSquilla Setup Handoff" in result.stdout
     assert "Provider Configured" not in result.stdout
-    assert "LLM: openrouter / deepseek/deepseek-v4-pro" in result.stdout
+    # The explicitly selected direct/fallback model is independent from the
+    # Router default tier and must survive onboarding unchanged.
+    assert "LLM: openrouter / deepseek/deepseek-v4-flash" in result.stdout
 
 
 def test_onboard_finish_commands_remain_copyable_with_long_config_path(
@@ -1746,7 +1748,7 @@ def test_configure_provider_can_omit_model_for_router_profile(tmp_path, monkeypa
     assert data["llm"]["model"] == "deepseek-v4-flash"
 
 
-def test_configure_provider_recomputes_existing_router_profile(tmp_path, monkeypatch):
+def test_configure_provider_fails_closed_for_unclassified_foreign_router(tmp_path, monkeypatch):
     target = tmp_path / "c.toml"
     target.write_text(
         '[llm]\nprovider = "deepseek"\nmodel = "deepseek-chat"\n'
@@ -1769,11 +1771,13 @@ def test_configure_provider_recomputes_existing_router_profile(tmp_path, monkeyp
         ],
     )
 
-    assert result.exit_code == 0, result.stdout
+    assert result.exit_code == 2
+    assert "custom Router tiers reference provider(s)" in result.output
     data = tomllib.loads(target.read_text())
-    assert data["llm"]["provider"] == "openai"
-    assert data["squilla_router"]["tier_profile"] == "openai"
-    assert "tiers" not in data["squilla_router"]
+    # A legacy config has no explicit ownership binding, so a headless client
+    # cannot assume consent to replace the ladder. The failed switch is atomic.
+    assert data["llm"]["provider"] == "deepseek"
+    assert data["squilla_router"]["tier_profile"] == "deepseek"
 
 
 def test_configure_saved_path_escapes_rich_markup_chars(tmp_path, monkeypatch):

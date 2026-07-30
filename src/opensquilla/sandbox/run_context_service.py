@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
@@ -121,6 +122,32 @@ async def set_workspace(
     return await persist_run_context(session_manager, session_key, updated)
 
 
+def validated_mount_grant(
+    context: RunContext,
+    *,
+    path: str,
+    access: str,
+    scope: str,
+    workspace: str | None,
+) -> MountGrant:
+    """Validate one requested mount and return its normalized grant."""
+
+    mount_access = normalize_mount_access(access)
+    decision = decide_path_access(
+        path,
+        workspace=context.workspace or workspace,
+        mounts=context.mounts,
+        write=mount_access == "rw",
+    )
+    if decision.status == "blocked":
+        raise ValueError(decision.reason or "mount_blocked")
+    return MountGrant(
+        path=_mount_grant_storage_path(path),
+        access=mount_access,
+        scope=normalize_scope(scope),
+    )
+
+
 async def add_mount_grant(
     session_manager: Any,
     session_key: str,
@@ -137,25 +164,36 @@ async def add_mount_grant(
         config=config,
         workspace=workspace,
     )
-    mount_access = normalize_mount_access(access)
-    decision = decide_path_access(
-        path,
-        workspace=existing.workspace or workspace,
-        mounts=existing.mounts,
-        write=mount_access == "rw",
-    )
-    if decision.status == "blocked":
-        raise ValueError(decision.reason or "mount_blocked")
-    storage_path = _mount_grant_storage_path(path)
-    grant = MountGrant(
-        path=storage_path,
-        access=mount_access,
-        scope=normalize_scope(scope),
+    grant = validated_mount_grant(
+        existing,
+        path=path,
+        access=access,
+        scope=scope,
+        workspace=workspace,
     )
     apply_user_store = None
     if grant.scope == "workspace":
         def apply_user_store(grant: MountGrant = grant) -> None:
             _upsert_user_mount_grant(grant)
+
+    if grant.scope == "once":
+        grant_key = os.path.normcase(grant.path)
+        mounts = tuple(
+            existing_grant
+            for existing_grant in existing.mounts
+            if not (
+                existing_grant.scope == "once"
+                and os.path.normcase(
+                    _mount_grant_storage_path(existing_grant.path)
+                )
+                == grant_key
+            )
+        ) + (grant,)
+        return replace(
+            existing,
+            mounts=mounts,
+            source="resolved_overlay",
+        )
 
     if grant in existing.mounts:
         if apply_user_store is not None:
@@ -529,4 +567,5 @@ __all__ = [
     "remove_domain_grant",
     "remove_mount_grant",
     "set_workspace",
+    "validated_mount_grant",
 ]

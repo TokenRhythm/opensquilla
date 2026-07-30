@@ -35,7 +35,13 @@ from opensquilla.search.types import (
 )
 from opensquilla.tools.path_policy import reject_foreign_host_path
 from opensquilla.tools.registry import tool
-from opensquilla.tools.types import ToolError, UnsupportedURLSchemeError, current_tool_context
+from opensquilla.tools.run_mode import full_host_access_active
+from opensquilla.tools.types import (
+    PlanAccess,
+    ToolError,
+    UnsupportedURLSchemeError,
+    current_tool_context,
+)
 
 
 def _validate_http_url(url: str) -> None:
@@ -114,6 +120,73 @@ def _network_search_request(args: Mapping[str, Any]) -> NetworkOperationRequest:
         host="",
         body=str(args.get("query", "") or ""),
     )
+
+
+def _web_search_sandbox_argv(args: Mapping[str, Any]) -> tuple[str, ...]:
+    return (
+        "web_search",
+        str(args.get("query", "")),
+        str(args.get("fetch_top_k", "")),
+        _search_plan_argv_token(args, tool_name="web_search"),
+    )
+
+
+def _web_discover_sandbox_argv(args: Mapping[str, Any]) -> tuple[str, ...]:
+    return (
+        "web_discover",
+        str(args.get("query", "")),
+        str(args.get("max_results", "")),
+        _search_plan_argv_token(args, tool_name="web_discover"),
+    )
+
+
+def _search_plan_argv_token(args: Mapping[str, Any], *, tool_name: str) -> str:
+    """Encode only planned provider ids for managed-network domain grants."""
+
+    try:
+        from opensquilla.search.runtime_config import get_resolved_search_runtime
+
+        provider_value = args.get("provider")
+        provider = (
+            str(provider_value)
+            if isinstance(provider_value, str) and provider_value not in {"", "auto"}
+            else None
+        )
+        if (
+            tool_name == "web_discover"
+            and provider is None
+            and _active_provider not in _VALID_SEARCH_PROVIDERS
+        ):
+            provider = _active_provider
+        raw_mode = str(args.get("mode") or "auto")
+        mode = raw_mode if raw_mode in _VALID_SEARCH_MODES else "auto"
+        raw_recency = args.get("recency")
+        recency = (
+            str(raw_recency)
+            if isinstance(raw_recency, str) and raw_recency in _VALID_SEARCH_RECENCIES
+            else None
+        )
+        options = SearchOptions(
+            query=str(args.get("query") or ""),
+            mode=cast(SearchMode, mode),
+            include_domains=_search_plan_domains(args.get("include_domains")),
+            exclude_domains=_search_plan_domains(args.get("exclude_domains")),
+            recency=cast(Recency | None, recency),
+            provider=provider,
+        )
+        plan = get_resolved_search_runtime().execution_plan(options)
+        provider_names = plan.provider_names
+    except Exception:  # pragma: no cover - fail closed to the legacy known-provider grant
+        provider_names = (_active_provider,)
+        if _active_search_fallback_policy == "network" and _active_provider != "duckduckgo":
+            provider_names += ("duckduckgo",)
+    return "providers=" + ",".join(provider_names)
+
+
+def _search_plan_domains(value: object) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(str(item) for item in value if isinstance(item, str))
 
 
 def _search_benchmark_blocklist_enabled() -> bool:
@@ -215,6 +288,8 @@ class _BenchmarkBlocklistSearchProvider:
 
 
 def _sensitive_body_marker(body: str | None) -> str | None:
+    if full_host_access_active():
+        return None
     if not body:
         return None
     if _PEM_PRIVATE_KEY_RE.search(body):
@@ -590,6 +665,7 @@ def _search_failure_payload(payload: dict, *, retryable: bool = False) -> dict:
     error_kind = str(result.get("error_kind") or "unknown")
     error_class = str(result.get("error_class") or "")
     result["ok"] = False
+    result["retry_allowed"] = False
     result["errorMessage"] = message
     result["error"] = {
         "kind": error_kind,
@@ -650,7 +726,6 @@ async def run_web_discover_payload(
     from opensquilla.search.runtime_config import get_resolved_search_runtime
 
     _ensure_builtin_search_providers()
-    explicit_provider = provider_name is not None
     display_provider = provider_name or _active_provider
     runtime = get_resolved_search_runtime()
     marker = _sensitive_body_marker(query)
@@ -676,93 +751,110 @@ async def run_web_discover_payload(
     # an out-of-range configured/active value cannot ask an uncapped provider
     # (e.g. duckduckgo) for an unbounded number of results.
     limit = min(max(max_results or _active_max_results, 1), MAX_SEARCH_RESULTS)
-    provider_names = _web_discover_provider_order(
-        runtime,
+    effective_provider = provider_name
+    if effective_provider is None and _active_provider not in _VALID_SEARCH_PROVIDERS:
+        effective_provider = _active_provider
+    options = SearchOptions(
         query=query,
         max_results=limit,
-        provider_name=provider_name,
+        fetch_top_k=0,
+        provider=effective_provider,
     )
-    attempts: list[dict[str, str]] | None = [] if _active_search_diagnostics else None
-    terminal_provider = provider_names[0] if provider_names else display_provider
-    terminal_exc: Exception | None = None
-    fallback_from = ""
+    blocklist_meta: dict[str, Any] = {}
 
-    for candidate_provider in provider_names:
-        try:
-            provider = get_provider(
-                candidate_provider,
-                **_search_provider_kwargs(candidate_provider),
-            )
-            results = await provider.search(query, max_results=limit)
-            results, blocklist_meta = _filter_search_benchmark_results(
-                results,
-                terms=blocklist_terms,
-            )
-            if attempts is not None:
-                attempts.append({"provider": candidate_provider, "status": "success"})
-            return _search_success_payload(
-                _search_payload(
-                    query,
-                    candidate_provider,
-                    fallback_from=fallback_from,
-                    attempts=attempts,
-                    results=results,
-                ) | blocklist_meta
-            )
-        except Exception as exc:  # noqa: BLE001 - converted to structured payload below
-            terminal_provider = candidate_provider
-            terminal_exc = exc
-            classified = _classify_search_error(candidate_provider, exc)
-            if attempts is not None:
-                attempts.append(
-                    {
-                        "provider": candidate_provider,
-                        "status": "error",
-                        "error_kind": classified.kind if classified else "unknown",
-                    }
-                )
-
-            should_fallback = (
-                classified is not None
-                and runtime.should_fallback(classified, explicit_provider=explicit_provider)
-            )
-            if should_fallback:
-                fallback_from = fallback_from or candidate_provider
-                continue
-            return _search_failure_payload(
-                _search_error_payload(query, candidate_provider, exc, attempts=attempts),
-                retryable=bool(classified and classified.retryable),
-            )
-
-    if terminal_exc is None:
-        terminal_exc = ValueError("No search provider available for web_discover.")
-    classified = _classify_search_error(terminal_provider, terminal_exc)
-    return _search_failure_payload(
-        _search_error_payload(query, terminal_provider, terminal_exc, attempts=attempts),
-        retryable=bool(classified and classified.retryable),
-    )
-
-
-def _web_discover_provider_order(
-    runtime: Any,
-    *,
-    query: str,
-    max_results: int,
-    provider_name: str | None,
-) -> tuple[str, ...]:
-    order = runtime.provider_order(
-        SearchOptions(
-            query=query,
-            max_results=max_results,
-            fetch_top_k=0,
-            provider=provider_name,
+    def provider_factory(candidate_provider: str) -> Any:
+        provider = get_provider(
+            candidate_provider,
+            **_search_provider_kwargs(candidate_provider),
         )
+        if not blocklist_terms:
+            return provider
+        return _BenchmarkBlocklistSearchProvider(
+            provider,
+            terms=blocklist_terms,
+            meta=blocklist_meta,
+        )
+
+    canonical = await run_canonical_web_search(
+        options,
+        runtime=runtime,
+        provider_factory=provider_factory,
     )
-    if provider_name is None and _active_provider not in _VALID_SEARCH_PROVIDERS:
-        if runtime.fallback_policy == "network" and _active_provider != "duckduckgo":
-            return (_active_provider, "duckduckgo")
-        return (_active_provider,)
-    return order or (provider_name or _active_provider,)
+    canonical.update(blocklist_meta)
+    return _web_discover_payload_from_canonical(canonical, display_provider=display_provider)
+
+
+def _web_discover_payload_from_canonical(
+    payload: Mapping[str, Any],
+    *,
+    display_provider: str,
+) -> dict[str, Any]:
+    diagnostics = payload.get("diagnostics")
+    diagnostic_payload = diagnostics if isinstance(diagnostics, Mapping) else {}
+    raw_attempts = payload.get("provider_attempts")
+    attempts = list(raw_attempts) if isinstance(raw_attempts, list) else []
+    selected_provider = str(diagnostic_payload.get("selected_provider") or "")
+    terminal_provider = _last_search_attempt_provider(attempts)
+    provider = selected_provider or terminal_provider or display_provider
+    result: dict[str, Any] = {
+        "query": str(payload.get("query") or ""),
+        "provider": provider,
+        "results": [],
+    }
+    if _active_search_diagnostics:
+        result["attempts"] = attempts
+    for key in ("benchmark_blocklist_enabled", "blocked_query", "blocked_count"):
+        if key in payload:
+            result[key] = payload[key]
+
+    if payload.get("ok") is True:
+        raw_results = payload.get("results")
+        if isinstance(raw_results, list):
+            result["results"] = [
+                _lightweight_search_result(item)
+                for item in raw_results
+                if isinstance(item, Mapping)
+            ]
+        fallback_from = str(diagnostic_payload.get("fallback_from") or "")
+        if fallback_from:
+            result["fallback_from"] = fallback_from
+        return _search_success_payload(result)
+
+    result.update(
+        {
+            "error_class": str(payload.get("error_class") or "SearchProviderError"),
+            "error_kind": str(payload.get("error_kind") or "unknown"),
+            "error": str(payload.get("error") or "Search provider failed."),
+            "provider_attempts": attempts,
+            "diagnostics": dict(diagnostic_payload),
+        }
+    )
+    return _search_failure_payload(
+        result,
+        retryable=bool(payload.get("provider_retryable")),
+    )
+
+
+def _last_search_attempt_provider(attempts: list[Any]) -> str:
+    for attempt in reversed(attempts):
+        if isinstance(attempt, Mapping):
+            provider = str(attempt.get("provider") or "")
+            if provider:
+                return provider
+    return ""
+
+
+def _lightweight_search_result(item: Mapping[str, Any]) -> dict[str, object]:
+    result: dict[str, object] = {
+        "title": str(item.get("title") or ""),
+        "url": str(item.get("url") or ""),
+        "snippet": str(item.get("snippet") or ""),
+    }
+    for key in ("provider", "published_at", "score", "domain", "canonical_url"):
+        value = item.get(key)
+        if value not in (None, ""):
+            result[key] = value
+    return result
 
 
 async def run_web_search_payload(
@@ -901,6 +993,7 @@ def _invalid_search_request_payload(message: str) -> dict[str, object]:
         "ok": False,
         "error_kind": "invalid_request",
         "error": message,
+        "retry_allowed": False,
     }
 
 
@@ -1061,14 +1154,11 @@ def _search_error_payload(
         },
     },
     required=["query"],
+    plan_access=PlanAccess.READ_ONLY,
     result_budget_class="external",
     sandbox=SandboxToolDescriptor.network(
         kind="web.fetch",
-        argv_factory=lambda a: (
-            "web_search",
-            str(a.get("query", "")),
-            str(a.get("fetch_top_k", "")),
-        ),
+        argv_factory=_web_search_sandbox_argv,
         request_factory=_network_search_request,
         record_payload=False,
     ),
@@ -1109,14 +1199,11 @@ async def web_search(
         },
     },
     required=["query"],
+    plan_access=PlanAccess.READ_ONLY,
     result_budget_class="external",
     sandbox=SandboxToolDescriptor.network(
         kind="web.fetch",
-        argv_factory=lambda a: (
-            "web_discover",
-            str(a.get("query", "")),
-            str(a.get("max_results", "")),
-        ),
+        argv_factory=_web_discover_sandbox_argv,
         request_factory=_network_search_request,
         record_payload=False,
     ),
@@ -1124,9 +1211,10 @@ async def web_search(
 async def web_discover(query: str, max_results: int | None = None) -> str:
     payload = await run_web_discover_payload(query, max_results)
     tool_payload = dict(payload)
-    tool_payload.pop("ok", None)
-    tool_payload.pop("fallbackFrom", None)
-    tool_payload.pop("errorMessage", None)
+    if tool_payload.get("ok") is True:
+        tool_payload.pop("ok", None)
+        tool_payload.pop("fallbackFrom", None)
+        tool_payload.pop("errorMessage", None)
     if isinstance(tool_payload.get("error"), dict):
         tool_payload["error"] = tool_payload["error"].get("message", "")
     return json.dumps(tool_payload, ensure_ascii=False, indent=2)

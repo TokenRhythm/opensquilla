@@ -10,14 +10,29 @@ import {
   DEFAULT_ROUTER_VISUAL_MODE,
   normalizeRouterVisualMode,
 } from '@/utils/chat/routerVisualMode'
+import { useRouterVisualEffectsPreference } from '@/composables/useRouterVisualEffectsPreference'
+import {
+  waitForSessionRpcConnection,
+} from '@/composables/chat/sessionBootstrapAdmission'
+import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
 
 type RpcClient = {
-  waitForConnection: () => Promise<void>
-  call: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
+  waitForConnection: (
+    timeoutMs?: number,
+    signal?: AbortSignal,
+    actions?: RpcConnectionWaitOptions,
+  ) => Promise<void>
+  call: <T = unknown>(
+    method: string,
+    params?: Record<string, unknown>,
+    callOptions?: RpcCallOptions,
+  ) => Promise<T>
+  on?: (event: string, handler: (payload: unknown) => void) => () => void
 }
 
 export interface UseChatFeatureTogglesOptions {
   rpc: RpcClient
+  readCallOptions?: RpcCallOptions
   setGlobalElevatedMode: (mode: string) => void
   loadCurrentSessionUsage: () => void | Promise<void>
 }
@@ -47,18 +62,19 @@ interface ChatFeatureConfig {
   }
 }
 
-const ROUTER_FX_PREF_KEY = 'opensquilla.routerFx'
-const ROUTER_SHAPE_KEY = 'opensquilla.router.shape'
-const ROUTER_INDEPENDENT_ENSEMBLE_MODES = new Set([
-  'static_openrouter_b5',
-  'static_tokenrhythm_b5',
-  'custom_b5',
-])
+interface ModelRoutingSnapshot {
+  mode?: 'direct' | 'router' | 'ensemble'
+  selection_mode?: string
+}
 
+const ROUTER_SHAPE_KEY = 'opensquilla.router.shape'
 export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
   const { pushToast } = useToasts()
   const routerEnabled = ref(false)
-  const routerVisualEffectsEnabled = ref(true)
+  const {
+    enabled: routerVisualEffectsEnabled,
+    setEnabled: setRouterVisualEffectsEnabled,
+  } = useRouterVisualEffectsPreference()
   const routerVisualMode = ref(DEFAULT_ROUTER_VISUAL_MODE)
   const routerSettingsBusy = ref(false)
   const codingModeEnabled = ref(false)
@@ -76,6 +92,21 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     return routerEnabled.value ? 'squilla_router' : 'off'
   })
 
+  function applyModelRoutingSnapshot(snapshot: ModelRoutingSnapshot | undefined) {
+    const mode = snapshot?.mode
+    if (!mode) return false
+    llmEnsembleEnabled.value = mode === 'ensemble'
+    // The product control remains one three-state selector. The existing
+    // routerEnabled ref means "routing feature active" to ChatView, so Ensemble
+    // remains active here even when its static selection mode bypasses the
+    // SquillaRouter implementation internally.
+    routerEnabled.value = mode !== 'direct'
+    if (typeof snapshot.selection_mode === 'string') {
+      llmEnsembleSelectionMode.value = snapshot.selection_mode
+    }
+    return true
+  }
+
   // Seed the last-known router shape synchronously so the router-strip reserve
   // twin can hold its slot on the first turn, before config.get resolves.
   hydrateRouterShape()
@@ -89,8 +120,6 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     llmEnsembleEnabled.value = ensembleEnabled
     llmEnsembleSelectionMode.value = String(cfg?.llm_ensemble?.selection_mode || '')
     routerVisualMode.value = normalizeRouterVisualMode(router.visual_mode)
-    loadRouterVisualEffectsPreference()
-
     const tiers = router.tiers
     const tierKeys: string[] = []
     const tierModels: Record<string, string> = {}
@@ -126,9 +155,28 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
 
   async function loadFeatureToggles() {
     try {
-      await options.rpc.waitForConnection()
-      const cfg = await options.rpc.call<ChatFeatureConfig>('config.get')
+      await waitForSessionRpcConnection(options.rpc, options.readCallOptions)
+      const cfg = options.readCallOptions
+        ? await options.rpc.call<ChatFeatureConfig>(
+            'config.get',
+            undefined,
+            options.readCallOptions,
+          )
+        : await options.rpc.call<ChatFeatureConfig>('config.get')
       await applyFeatureConfig(cfg, { refreshUsage: true })
+      try {
+        const routing = options.readCallOptions
+          ? await options.rpc.call<ModelRoutingSnapshot>(
+              'models.routing.get',
+              undefined,
+              options.readCallOptions,
+            )
+          : await options.rpc.call<ModelRoutingSnapshot>('models.routing.get')
+        applyModelRoutingSnapshot(routing)
+      } catch {
+        // Older Gateways have no canonical routing RPC; the config projection
+        // applied above remains the read-only compatibility snapshot.
+      }
     } catch {
       // Feature toggles are optional for older gateways.
     }
@@ -162,39 +210,12 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     } catch {}
   }
 
-  function loadRouterVisualEffectsPreference() {
-    try {
-      const saved = localStorage.getItem(ROUTER_FX_PREF_KEY)
-      if (!saved) return
-      const parsed = JSON.parse(saved) as { enabled?: unknown }
-      if (typeof parsed.enabled === 'boolean') {
-        routerVisualEffectsEnabled.value = parsed.enabled
-      }
-    } catch {}
-  }
-
-  function saveRouterVisualEffectsPreference() {
-    try {
-      localStorage.setItem(ROUTER_FX_PREF_KEY, JSON.stringify({
-        enabled: routerVisualEffectsEnabled.value,
-        variant: 'default',
-      }))
-    } catch {}
-  }
-
-  function setRouterVisualEffectsEnabled(enabled: boolean) {
-    routerVisualEffectsEnabled.value = Boolean(enabled)
-    saveRouterVisualEffectsPreference()
-    const savingsFx = (window as unknown as { SavingsFX?: { setEnabled?: (enabled: boolean) => void } }).SavingsFX
-    savingsFx?.setEnabled?.(routerVisualEffectsEnabled.value)
-  }
-
   async function setRouterEnabled(enabled: boolean) {
     await setModelRoutingMode(enabled ? 'squilla_router' : 'off')
   }
 
-  async function setCodingModeEnabled(enabled: boolean) {
-    if (codingModeSettingsBusy.value) return
+  async function setCodingModeEnabled(enabled: boolean): Promise<boolean> {
+    if (codingModeSettingsBusy.value) return false
     const nextEnabled = Boolean(enabled)
     const previous = codingModeEnabled.value
     codingModeSettingsBusy.value = true
@@ -207,9 +228,11 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
       })
       const cfg = await options.rpc.call<ChatFeatureConfig>('config.get')
       await applyFeatureConfig(cfg)
+      return codingModeEnabled.value === nextEnabled
     } catch (err) {
       codingModeEnabled.value = previous
       console.warn('Failed to update Coding mode:', err instanceof Error ? err.message : String(err))
+      return false
     } finally {
       codingModeSettingsBusy.value = false
     }
@@ -225,31 +248,21 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     const previousRouter = routerEnabled.value
     const previousEnsemble = llmEnsembleEnabled.value
     const nextEnsemble = nextMode === 'llm_ensemble'
-    // Only known static/custom ensembles are independent of the router. Legacy
-    // router_dynamic and unknown modes keep the pre-PR router-on behavior so a
-    // slow/older config.get cannot disable a routing dependency.
-    const nextRouter = nextMode === 'squilla_router'
-      || (
-        nextEnsemble
-        && !ROUTER_INDEPENDENT_ENSEMBLE_MODES.has(llmEnsembleSelectionMode.value)
-      )
 
-    routerEnabled.value = nextEnsemble || nextRouter
+    // This is only optimistic presentation. The Gateway owns the actual
+    // direct/router/ensemble transition (including ensemble dependency rules)
+    // and the post-write config refresh remains authoritative.
+    routerEnabled.value = nextMode !== 'off'
     llmEnsembleEnabled.value = nextEnsemble
     modelRoutingSettingsBusy.value = true
     routerSettingsBusy.value = true
     llmEnsembleSettingsBusy.value = true
     try {
       await options.rpc.waitForConnection()
-      await options.rpc.call('config.patch.safe', {
-        patches: {
-          'llm_ensemble.enabled': nextEnsemble,
-          'squilla_router.enabled': nextRouter,
-          // 'observe' only for a real off. Independent ensembles keep the
-          // router disabled but leave its phase at 'full', so re-enabling it
-          // from any surface routes immediately instead of shadowing.
-          'squilla_router.rollout_phase': nextMode === 'off' ? 'observe' : 'full',
-        },
+      await options.rpc.call('models.routing.set', {
+        mode: nextMode === 'off'
+          ? 'direct'
+          : nextMode === 'squilla_router' ? 'router' : 'ensemble',
       })
       await loadFeatureToggles()
     } catch (err) {
@@ -277,12 +290,19 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
       if (document.visibilityState === 'visible') schedule()
     }
     const onFocus = () => schedule()
+    const unbindRouting = options.rpc.on?.('models.routing.changed', (payload) => {
+      if (payload && typeof payload === 'object') {
+        applyModelRoutingSnapshot(payload as ModelRoutingSnapshot)
+        scheduleHistorySync?.()
+      }
+    })
     document.addEventListener('visibilitychange', onVisibility)
     window.addEventListener('focus', onFocus)
     return () => {
       if (timer) clearTimeout(timer)
       document.removeEventListener('visibilitychange', onVisibility)
       window.removeEventListener('focus', onFocus)
+      unbindRouting?.()
     }
   }
 
@@ -296,6 +316,7 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     codingModeEnabled,
     codingModeSettingsBusy,
     llmEnsembleEnabled,
+    llmEnsembleSelectionMode,
     llmEnsembleSettingsBusy,
     routerSlots,
     routerModels,

@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 const distDir = resolve(import.meta.dirname, '../../src/opensquilla/gateway/static/dist')
@@ -48,6 +48,10 @@ function normalizeFile(path) {
 function walk(dir) {
   for (const entry of readdirSync(dir)) {
     const path = resolve(dir, entry)
+    if (entry === '.DS_Store') {
+      rmSync(path, { force: true, recursive: true })
+      continue
+    }
     const stat = statSync(path)
     if (stat.isDirectory()) {
       walk(path)

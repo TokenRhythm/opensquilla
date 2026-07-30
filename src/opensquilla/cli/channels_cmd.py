@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
 from pathlib import Path
 from typing import Any
 
@@ -472,3 +474,226 @@ def channels_describe(
             ",".join(f.choices) if f.choices else "—",
         )
     console.print(table)
+
+
+@channels_app.command("certify")
+def channels_certify(
+    providers: list[str] = typer.Option(
+        [],
+        "--provider",
+        "-p",
+        help="Channel type to certify; repeat to select multiple (default: all).",
+    ),
+    timeout: float = typer.Option(
+        15.0,
+        "--timeout",
+        min=0.1,
+        help="Per-provider operation timeout in seconds.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit redacted machine-readable evidence.",
+    ),
+    send_test_message: bool = typer.Option(
+        False,
+        "--send-test-message",
+        help="Send one fixed test message after a successful safe auth probe.",
+    ),
+    allow_side_effects: bool = typer.Option(
+        False,
+        "--allow-side-effects",
+        help="Required acknowledgement for side-effecting certification.",
+    ),
+    targets: list[str] = typer.Option(
+        [],
+        "--target",
+        help="Explicit provider=destination; required for every delivery test.",
+    ),
+) -> None:
+    """Run ephemeral, environment-driven live channel certification.
+
+    Credentials are accepted only through ``OPENSQUILLA_CHANNEL_CERT_*``
+    environment variables. The default mode calls adapter-specific safe auth
+    probes and never starts ingress or sends messages. No credential values
+    are written to config or included in the evidence output.
+    """
+    from opensquilla.onboarding.channel_certification import (
+        CertificationUsageError,
+        certify_channels,
+        evidence_passed,
+        parse_targets,
+    )
+
+    try:
+        target_map = parse_targets(targets)
+        evidence = asyncio.run(
+            certify_channels(
+                providers,
+                environ=os.environ,
+                timeout=timeout,
+                send_test_message=send_test_message,
+                allow_side_effects=allow_side_effects,
+                targets=target_map,
+            )
+        )
+    except CertificationUsageError as exc:
+        if json_output:
+            print_json({"error": {"code": "invalid_certification_request", "message": str(exc)}})
+        else:
+            typer.secho(f"Error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+
+    if json_output:
+        print_json(evidence)
+    else:
+        table = Table(title="Channel certification", show_header=True)
+        table.add_column("Provider")
+        table.add_column("Operation")
+        table.add_column("Status")
+        table.add_column("Authenticated")
+        table.add_column("Latency", justify="right")
+        table.add_column("Detail")
+        for row in evidence["providers"]:
+            detail = str(row.get("detail") or "")
+            missing = row.get("missingEnvironment")
+            if isinstance(missing, list) and missing:
+                detail = "missing: " + ", ".join(str(value) for value in missing)
+            table.add_row(
+                str(row.get("provider") or ""),
+                str(row.get("operation") or ""),
+                str(row.get("status") or ""),
+                str(bool(row.get("authenticated"))),
+                f"{row.get('latencyMs', 0)} ms",
+                detail,
+            )
+        Console(width=180, force_terminal=False).print(table)
+
+    if not evidence_passed(evidence):
+        raise typer.Exit(code=1)
+
+
+pairings_app = typer.Typer(help="Review and decide channel pairing requests.")
+channels_app.add_typer(pairings_app, name="pairings")
+
+
+def _render_pairings_table(records: list[dict[str, Any]], *, channel: str) -> None:
+    table = Table(title=f"Pairing requests: {channel}", header_style=ACCENT_HEADER)
+    table.add_column("Code")
+    table.add_column("Sender")
+    table.add_column("Status")
+    table.add_column("Requested")
+    table.add_column("Approved")
+    for record in records:
+        sender = str(record.get("senderName") or record.get("senderId") or "")
+        table.add_row(
+            str(record.get("pairingCode") or ""),
+            sender,
+            str(record.get("status") or ""),
+            str(record.get("createdAt") or ""),
+            str(record.get("approvedAt") or ""),
+        )
+    Console(width=140, force_terminal=False).print(table)
+    if not records:
+        typer.echo("No pairing requests.")
+
+
+@pairings_app.command("list")
+def pairings_list(
+    channel: str = typer.Argument(..., help="Channel name to inspect"),
+    status: str | None = typer.Option(
+        None, "--status", help="Filter by status: pending, approved, or revoked"
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+    config_path: Path | None = typer.Option(None, "--config", help="Override config path."),
+) -> None:
+    """List pairing requests for a channel, newest first."""
+
+    async def _run(client):
+        params: dict[str, Any] = {"channelName": channel}
+        if status:
+            params["status"] = status
+        return await client.call("channels.pairings", params)
+
+    payload = run_gateway_sync(_run, json_output=json_output, config_path=config_path)
+    if json_output:
+        print_json(payload)
+        return
+    _render_pairings_table(list(payload.get("pairings") or []), channel=channel)
+
+
+@pairings_app.command("approve")
+def pairings_approve(
+    channel: str = typer.Argument(..., help="Channel name"),
+    pairing: str = typer.Argument(..., help="Pairing code (8 chars) or full pairing id"),
+    admin: bool = typer.Option(
+        False,
+        "--admin",
+        help=(
+            "Also mark this sender as a channel admin (full tool surface; "
+            "privileged commands still confirm per call). Use for yourself "
+            "or someone you trust with the host."
+        ),
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+    config_path: Path | None = typer.Option(None, "--config", help="Override config path."),
+) -> None:
+    """Approve a pairing request; the sender is notified they can start."""
+
+    access = (
+        "The sender gains conversational access AND channel-admin privileges."
+        if admin
+        else "The sender gains conversational access."
+    )
+    confirm_or_exit(
+        f"Approve pairing {pairing!r} on channel {channel!r}? {access}",
+        yes=yes,
+        json_output=json_output,
+    )
+
+    async def _run(client):
+        request: dict[str, object] = {"channelName": channel, "pairingCode": pairing}
+        if admin:
+            request["asAdmin"] = True
+        return await client.call("channels.pairing.approve", request)
+
+    payload = run_gateway_sync(_run, json_output=json_output, config_path=config_path)
+    if json_output:
+        print_json(payload)
+        return
+    record = payload.get("pairing") or {}
+    sender = str(record.get("senderName") or record.get("senderId") or "")
+    suffix = " [admin]" if payload.get("adminGranted") else ""
+    typer.echo(f"Pairing approved: {record.get('pairingCode', pairing)} ({sender}){suffix}")
+
+
+@pairings_app.command("revoke")
+def pairings_revoke(
+    channel: str = typer.Argument(..., help="Channel name"),
+    pairing: str = typer.Argument(..., help="Pairing code (8 chars) or full pairing id"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+    config_path: Path | None = typer.Option(None, "--config", help="Override config path."),
+) -> None:
+    """Revoke a pairing; the sender loses conversational access."""
+
+    confirm_or_exit(
+        f"Revoke pairing {pairing!r} on channel {channel!r}? "
+        "The sender loses conversational access.",
+        yes=yes,
+        json_output=json_output,
+    )
+
+    async def _run(client):
+        return await client.call(
+            "channels.pairing.revoke",
+            {"channelName": channel, "pairingCode": pairing},
+        )
+
+    payload = run_gateway_sync(_run, json_output=json_output, config_path=config_path)
+    if json_output:
+        print_json(payload)
+        return
+    record = payload.get("pairing") or {}
+    typer.echo(f"Pairing revoked: {record.get('pairingCode', pairing)}")

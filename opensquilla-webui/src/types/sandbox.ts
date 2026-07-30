@@ -1,4 +1,13 @@
 export type SandboxRunMode = 'standard' | 'trusted' | 'full'
+export type SandboxSetupState = 'not_setup' | 'setting_up' | 'ready' | 'failed' | 'unavailable'
+
+export interface SandboxSetupStatusPayload {
+  state: SandboxSetupState
+  platform: string
+  message: string
+  requiresAdmin: boolean
+  detail?: string
+}
 
 export const SANDBOX_RUN_MODES: readonly SandboxRunMode[] = ['standard', 'trusted', 'full']
 

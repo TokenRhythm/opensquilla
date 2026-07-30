@@ -8,6 +8,7 @@ from typing import Any
 import httpx
 
 from opensquilla.search.registry import register_provider
+from opensquilla.search.retry_policy import is_retryable_http_status
 from opensquilla.search.types import Recency, SearchErrorKind, SearchProviderError, SearchResult
 from opensquilla.secrets import clean_header_secret
 
@@ -113,7 +114,22 @@ class TavilySearchProvider:
                 retryable=True,
             ) from exc
 
-        data = response.json()
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise SearchProviderError(
+                provider=self.name,
+                kind="parse",
+                message="Tavily search returned malformed JSON.",
+                retryable=False,
+            ) from exc
+        if not isinstance(data, dict):
+            raise SearchProviderError(
+                provider=self.name,
+                kind="parse",
+                message="Tavily search returned an invalid response payload.",
+                retryable=False,
+            )
         return [
             _result_from_item(item, data) for item in (data.get("results") or [])[:result_limit]
         ]
@@ -128,11 +144,8 @@ def _classify_status(status_code: int) -> SearchErrorKind:
 
 
 def _is_retryable_status(status_code: int, kind: SearchErrorKind) -> bool:
-    if status_code == 429:
-        return True
-    if kind == "http":
-        return True
-    return False
+    del kind
+    return is_retryable_http_status(status_code)
 
 
 def _result_from_item(item: dict[str, Any], response_data: dict[str, Any]) -> SearchResult:

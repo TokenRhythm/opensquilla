@@ -60,15 +60,17 @@ from opensquilla.onboarding.provider_specs import (  # noqa: E402
 # Verified: the full agent stack has been exercised against these providers.
 EXPECTED_VERIFIED = {
     "openrouter", "openai", "openai_responses", "anthropic", "ollama", "deepseek",
-    "gemini", "dashscope", "moonshot", "zhipu", "qianfan",
+    "gemini", "dashscope", "qwen_token_plan", "qwen_token_plan_anthropic",
+    "moonshot", "zhipu", "qianfan",
     "volcengine", "byteplus", "tokenrhythm",
 }
 # Experimental: registry-runnable, offered with a visible caveat.
 EXPECTED_EXPERIMENTAL = {
-    "azure", "bailian_coding", "kimi_coding_openai", "kimi_coding_anthropic",
-    "minimax", "minimax_openai", "minimax_coding_openai",
+    "azure", "bailian_coding", "bailian_coding_cn", "kimi_coding_openai",
+    "kimi_coding_anthropic", "minimax", "minimax_openai", "minimax_coding_openai",
     "minimax_coding_anthropic", "minimax_cn", "minimax_global", "mimo_openai",
     "mimo_anthropic", "mistral", "groq", "aihubmix", "vllm", "custom",
+    "custom_anthropic",
     "lm_studio", "siliconflow", "ovms", "litellm_proxy", "openai_codex",
     "volcengine_coding_plan", "volcengine_coding_plan_anthropic",
     "byteplus_coding_plan", "byteplus_coding_plan_anthropic",
@@ -126,8 +128,30 @@ def test_openrouter_has_correct_default_base_url():
     assert spec.default_base_url == "https://openrouter.ai/api/v1"
 
 
+def test_bailian_coding_regions_are_explicit_provider_choices():
+    international = get_provider_setup_spec("bailian_coding")
+    mainland = get_provider_setup_spec("bailian_coding_cn")
+
+    assert international.label.startswith("Bailian Coding (International)")
+    assert international.default_base_url == "https://coding-intl.dashscope.aliyuncs.com/v1"
+    assert mainland.label.startswith("Bailian Coding (Mainland China)")
+    assert mainland.default_base_url == "https://coding.dashscope.aliyuncs.com/v1"
+    assert international.provider_kind == mainland.provider_kind == "bailian_coding"
+    assert international.env_key == mainland.env_key == "BAILIAN_API_KEY"
+
+    for spec in (international, mainland):
+        assert spec.default_direct_model == "qwen3.7-plus"
+        assert any("sk-sp-" in need for need in spec.what_you_need)
+        model_field = next(field for field in spec.fields if field.name == "model")
+        assert model_field.default == "qwen3.7-plus"
+        api_field = next(field for field in spec.fields if field.name == "api_key")
+        assert "sk-sp-" in api_field.description
+        assert "not interchangeable" in api_field.description
+
+
 def test_ollama_does_not_require_api_key_in_setup_spec():
     spec = get_provider_setup_spec("ollama")
+    assert spec.accepts_api_key is True
     assert spec.requires_api_key is False
     api_field = next(f for f in spec.fields if f.name == "api_key")
     assert api_field.required is False
@@ -247,6 +271,7 @@ def test_custom_provider_is_a_first_class_self_hosted_endpoint():
     base_field = next(f for f in spec.fields if f.name == "base_url")
     assert base_field.required is True
 
+    assert spec.accepts_api_key is True
     assert spec.requires_api_key is False
     assert spec.env_key == "CUSTOM_LLM_API_KEY"
     api_field = next(f for f in spec.fields if f.name == "api_key")
@@ -262,6 +287,7 @@ def test_custom_provider_catalog_payload_semantics():
     )
 
     assert row["runtimeSupported"] is True
+    assert row["acceptsApiKey"] is True
     assert row["requiresApiKey"] is False
     assert row["requiresBaseUrl"] is True
     assert row["envKey"] == "CUSTOM_LLM_API_KEY"
@@ -269,6 +295,74 @@ def test_custom_provider_catalog_payload_semantics():
     fields = {f["name"]: f for f in row["fields"]}
     assert fields["base_url"]["required"] is True
     assert fields["api_key"]["required"] is False
+
+
+def test_custom_anthropic_provider_is_a_first_class_messages_endpoint():
+    spec = get_provider_setup_spec("custom_anthropic")
+
+    assert spec.runtime_supported is True
+    assert spec.backend == "anthropic"
+    assert spec.provider_kind == "anthropic"
+    assert spec.deployment == "custom"
+    assert spec.label.startswith("Custom Anthropic-compatible endpoint")
+    assert spec.requires_base_url is True
+    assert spec.default_base_url == ""
+    assert spec.accepts_api_key is True
+    assert spec.requires_api_key is False
+    assert spec.env_key == "CUSTOM_ANTHROPIC_API_KEY"
+
+    fields = {field.name: field for field in spec.fields}
+    assert fields["model"].required is True
+    assert fields["base_url"].required is True
+    assert fields["api_key"].required is False
+
+
+@pytest.mark.parametrize(
+    ("provider_id", "backend", "base_url"),
+    [
+        (
+            "qwen_token_plan",
+            "openai_compat",
+            "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        ),
+        (
+            "qwen_token_plan_anthropic",
+            "anthropic",
+            "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
+        ),
+    ],
+)
+def test_qwen_token_plan_setup_contract(
+    provider_id: str,
+    backend: str,
+    base_url: str,
+) -> None:
+    spec = get_provider_setup_spec(provider_id)
+
+    assert spec.runtime_supported is True
+    assert spec.verification == "verified"
+    assert spec.backend == backend
+    assert spec.env_key == "QWEN_TOKEN_PLAN_API_KEY"
+    assert spec.default_base_url == base_url
+    assert spec.requires_api_key is True
+    assert spec.requires_base_url is False
+    assert spec.default_direct_model == "qwen3.8-max-preview"
+    assert any("sk-sp-" in item for item in spec.what_you_need)
+
+    fields = {field.name: field for field in spec.fields}
+    assert fields["model"].default == "qwen3.8-max-preview"
+    assert fields["api_key"].required is True
+    assert "not interchangeable" in fields["api_key"].description
+    assert fields["api_key_env"].default == "QWEN_TOKEN_PLAN_API_KEY"
+    assert fields["base_url"].default == base_url
+
+
+def test_oauth_provider_does_not_accept_an_api_key():
+    spec = get_provider_setup_spec("openai_codex")
+
+    assert spec.env_key == "OAuth"
+    assert spec.accepts_api_key is False
+    assert spec.requires_api_key is False
 
 
 def test_unknown_provider_raises():

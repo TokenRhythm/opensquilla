@@ -9,7 +9,7 @@
         class="hub-attention-clear__cost"
         @click="emit('open-usage')"
       >
-        {{ t('sessions.attention.costToday', { amount: '$' + costUsd.toFixed(2) }) }}
+        {{ t(costPeriod === 'today' ? 'sessions.attention.costToday' : 'sessions.attention.costTotal', { amount: '$' + costUsd.toFixed(2) }) }}
       </button>
     </template>
   </p>
@@ -49,7 +49,7 @@
       class="control-stat control-stat--clickable hub-attention__tile"
       @click="emit('open-usage')"
     >
-      <span class="control-stat__label">{{ t('sessions.attention.costToDate') }}</span>
+      <span class="control-stat__label">{{ t(costPeriod === 'today' ? 'sessions.attention.costTodayLabel' : 'sessions.attention.costToDate') }}</span>
       <span class="control-stat__value control-stat__value--mono">${{ costUsd.toFixed(2) }}</span>
       <span class="control-stat__hint">{{ t('sessions.attention.viewUsage') }}</span>
     </button>
@@ -67,6 +67,7 @@ const props = defineProps<{
   runningCount: number
   queuedCount: number
   costUsd: number | null
+  costPeriod: 'today' | 'total'
 }>()
 
 const emit = defineEmits<{

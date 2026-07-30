@@ -25,6 +25,7 @@ class RunModeConfigPatch:
 _RUN_MODE_ALIASES = {
     "on": RunMode.STANDARD,
     "off": RunMode.STANDARD,
+    "bypass": RunMode.FULL,
     "standard": RunMode.STANDARD,
     "standard-sandbox": RunMode.STANDARD,
     "standard_sandbox": RunMode.STANDARD,
@@ -95,9 +96,9 @@ def legacy_state_to_run_mode(
     permissions_default_mode: Any,
 ) -> RunMode:
     permission_mode = str(permissions_default_mode or "").strip().lower()
-    if permission_mode == "full":
+    if permission_mode in {"bypass", "full"}:
         return RunMode.FULL
-    if permission_mode in {"bypass", "off", "on", ""}:
+    if permission_mode in {"off", "on", ""}:
         return RunMode.TRUSTED
     if permission_mode in {"standard", "standard-sandbox", "standard_sandbox", "restricted"}:
         return RunMode.STANDARD
@@ -116,7 +117,7 @@ def config_run_mode(config: Any) -> RunMode:
 
     permissions = getattr(config, "permissions", None)
     permission_mode = str(getattr(permissions, "default_mode", "off") or "").strip().lower()
-    if permission_mode == "full":
+    if permission_mode in {"bypass", "full"}:
         return RunMode.FULL
     if _field_was_set(sandbox, "sandbox") and not bool(getattr(sandbox, "sandbox", False)):
         return RunMode.FULL
@@ -140,6 +141,32 @@ def _field_was_set(model: Any, field_name: str) -> bool:
     return field_name in fields_set if fields_set is not None else False
 
 
+def _full_mode_is_explicit(config: Any) -> bool:
+    sandbox = getattr(config, "sandbox", None)
+    permissions = getattr(config, "permissions", None)
+    configured_run_mode = getattr(sandbox, "run_mode", None)
+    if configured_run_mode is not None:
+        return normalize_run_mode(configured_run_mode) is RunMode.FULL
+    sandbox_enabled = getattr(sandbox, "sandbox", None)
+    if _field_was_set(sandbox, "sandbox") and not bool(sandbox_enabled):
+        return True
+    # ``bypass`` is the owner/project default host mode, but the process still
+    # keeps a sandbox-capable runtime for explicit Standard/Trusted calls.
+    # Only an explicit ``full`` selection disables that process-wide capability.
+    return str(getattr(permissions, "default_mode", "")).strip().lower() == "full"
+
+
+def project_default_run_mode(config: Any) -> RunMode:
+    return config_run_mode(config)
+
+
+def sandbox_runtime_capability_mode(config: Any) -> RunMode:
+    configured = config_run_mode(config)
+    if configured is RunMode.FULL and not _full_mode_is_explicit(config):
+        return RunMode.STANDARD
+    return configured
+
+
 __all__ = [
     "RunMode",
     "RunModeConfigPatch",
@@ -149,5 +176,7 @@ __all__ = [
     "execution_target",
     "legacy_state_to_run_mode",
     "normalize_run_mode",
+    "project_default_run_mode",
     "run_mode_config_patch",
+    "sandbox_runtime_capability_mode",
 ]

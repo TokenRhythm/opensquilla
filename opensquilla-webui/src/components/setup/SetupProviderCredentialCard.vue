@@ -9,8 +9,12 @@ const { t } = useI18n()
 interface ProviderCredentialPanelContract {
   providerLabel: string
   providerSelected: boolean
+  acceptsApiKey: boolean
+  requiresApiKey: boolean
   source: string
   available: boolean
+  removable: boolean
+  removing: boolean
   envKey: string
   masked: string
   revealAllowed: boolean
@@ -19,32 +23,59 @@ interface ProviderCredentialPanelContract {
   replacing: boolean
   apiKeyValue: string
   apiKeyEnvValue: string
+  draftCredentialSource?: '' | 'key' | 'env'
+  probeReady: boolean
+  probeDisabledReason: string
+  probeButtonLabel: string
   connection: ConnectionState
 }
 
 const props = defineProps<{
   panel: ProviderCredentialPanelContract
+  compact?: boolean
+  showVerification?: boolean
 }>()
 
 const emit = defineEmits<{
   reveal: []
+  hideReveal: []
   replace: []
   cancelReplace: []
+  removeCredential: []
   testConnection: []
   updateField: [name: string, value: string]
 }>()
 
 const showApiKey = ref(false)
 const detailsOpen = ref(false)
+const draftCredentialSource = computed(() => (
+  props.panel.draftCredentialSource
+  || (props.panel.apiKeyValue.trim().length > 0 ? 'key' : '')
+))
 
 const title = computed(() => t('setup.provider.credentialTitle', { provider: props.panel.providerLabel }))
-const statusText = computed(() => (
-  props.panel.available
-    ? t('setup.provider.credentialConnected')
+const statusText = computed(() => {
+  if (draftCredentialSource.value === 'key') return t('setup.provider.credentialDraftReady')
+  if (draftCredentialSource.value === 'env') return t('setup.provider.credentialEnvDraftReady')
+  if (props.panel.source === 'not_required') {
+    return props.panel.acceptsApiKey
+      ? t('setup.provider.credentialOptional')
+      : t('setup.provider.credentialNotRequired')
+  }
+  return props.panel.available
+    ? t('setup.provider.credentialReady')
     : t('setup.provider.credentialNeedsKey')
-))
-const statusTone = computed(() => (props.panel.available ? 'control-pill--ok' : 'control-pill--warn'))
+})
+const statusTone = computed(() => {
+  if (draftCredentialSource.value) return 'control-pill--warn'
+  if (props.panel.source === 'not_required') return ''
+  return props.panel.available ? 'control-pill--ok' : 'control-pill--warn'
+})
 const sourceText = computed(() => {
+  if (draftCredentialSource.value === 'key') return t('setup.provider.credentialSourceDraft')
+  if (draftCredentialSource.value === 'env') {
+    return t('setup.provider.credentialSourceEnvDraft', { envKey: props.panel.apiKeyEnvValue })
+  }
   switch (props.panel.source) {
     case 'explicit':
       return t('setup.provider.credentialSourceExplicit')
@@ -53,20 +84,62 @@ const sourceText = computed(() => {
     case 'missing_env':
       return t('setup.provider.credentialSourceMissingEnv', { envKey: props.panel.envKey })
     case 'not_required':
-      return t('setup.provider.credentialSourceNotRequired')
+      return props.panel.acceptsApiKey
+        ? t('setup.provider.credentialSourceOptional')
+        : t('setup.provider.credentialSourceNotRequired')
     default:
       return t('setup.provider.credentialSourceNone')
   }
 })
 const displayValue = computed(() => props.panel.revealed || props.panel.masked || '')
 const showRevealButton = computed(() => props.panel.revealAllowed && Boolean(props.panel.masked))
-const showPublicHint = computed(() => !props.panel.revealAllowed && Boolean(props.panel.masked))
-const showCredentialControls = computed(() => props.panel.providerSelected && props.panel.source !== 'not_required')
+const credentialRevealed = computed(() => Boolean(props.panel.revealed))
+const credentialToggleLabel = computed(() => (
+  credentialRevealed.value ? t('setup.provider.hideApiKey') : t('setup.provider.showApiKey')
+))
+const writeOnlySavedCredential = computed(() => (
+  props.panel.available && !props.panel.revealAllowed && !props.panel.masked
+))
+const showPublicHint = computed(() => (
+  !props.panel.revealAllowed && (Boolean(props.panel.masked) || props.panel.available)
+))
+const showCredentialControls = computed(() => props.panel.providerSelected && props.panel.acceptsApiKey)
+const hasRemovableCredential = computed(() => (
+  showCredentialControls.value
+  && !props.compact
+  && props.panel.removable
+))
+const removeCredentialLabel = computed(() => t(
+  props.panel.removing
+    ? 'setup.provider.removingCredential'
+    : 'setup.provider.removeCredential',
+))
+const removeCredentialAriaLabel = computed(() => (
+  `${removeCredentialLabel.value} — ${props.panel.providerLabel}`
+))
+const apiKeyLabel = computed(() => (
+  props.panel.requiresApiKey
+    ? t('setup.common.apiKey')
+    : t('setup.provider.optionalApiKeyLabel')
+))
+const apiKeyHelper = computed(() => (
+  props.panel.requiresApiKey
+    ? ''
+    : t('setup.provider.optionalApiKeyHelper')
+))
 // The masked/readonly display plus the "Replace key" guard only make sense
 // when a saved secret actually exists; an empty credential must be directly
 // typable (first-run setup would otherwise dead-end on a locked input).
 const hasSavedKey = computed(() => Boolean(props.panel.masked))
 const editingCredential = computed(() => props.panel.replacing || !hasSavedKey.value)
+const credentialInputPlaceholder = computed(() => {
+  if (writeOnlySavedCredential.value && !props.panel.replacing) {
+    return t('setup.provider.credentialWriteOnlyPlaceholder')
+  }
+  return props.panel.replacing
+    ? t('setup.provider.credentialReplacePlaceholder')
+    : t('setup.provider.credentialEnterPlaceholder')
+})
 
 // A secret input must always start hidden. The plaintext toggle is local
 // state on a card that stays mounted across saves and provider switches, so
@@ -78,6 +151,9 @@ watch(editingCredential, editing => {
 })
 watch(() => props.panel.providerLabel, () => { showApiKey.value = false })
 const probing = computed(() => props.panel.connection.phase === 'probing')
+const probeHintId = computed(() => (
+  `setup-provider-probe-hint-${props.panel.providerLabel.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`
+))
 
 const FAILURE_SENTENCE_KEYS: Record<string, string> = {
   auth_invalid: 'setup.provider.failureAuth',
@@ -89,6 +165,12 @@ const FAILURE_SENTENCE_KEYS: Record<string, string> = {
   bad_request: 'setup.provider.failureBadRequest',
 }
 
+const PROTOCOL_FAILURE_KINDS = new Set([
+  'malformed_response',
+  'invalid_stream_frame',
+  'invalid_stream_order',
+])
+
 function failureSentence(connection: ConnectionState): string {
   const key = FAILURE_SENTENCE_KEYS[connection.failureKind]
   if (key) return t(key)
@@ -98,10 +180,20 @@ function failureSentence(connection: ConnectionState): string {
 
 const connectionPill = computed(() => {
   const connection = props.panel.connection
+  if (connection.phase === 'unverified') {
+    return { tone: '', text: t('setup.provider.currentSettingsNotTested'), title: '' }
+  }
   if (connection.phase === 'verified') {
-    return { tone: 'control-pill--ok', text: t('setup.provider.connected'), title: '' }
+    return { tone: 'control-pill--ok', text: t('setup.provider.endpointVerified'), title: '' }
   }
   const title = [connection.failureKind, connection.detail].filter(Boolean).join(' — ')
+  if (PROTOCOL_FAILURE_KINDS.has(connection.failureKind)) {
+    return {
+      tone: 'control-pill--warn',
+      text: t('setup.provider.streamIncompatible'),
+      title,
+    }
+  }
   if (connection.phase === 'key_invalid') {
     return {
       tone: 'control-pill--danger',
@@ -119,17 +211,28 @@ const connectionPill = computed(() => {
   return null
 })
 
-// Verdict line under the pill: latency, and (when discovery returned live
-// models) the model count plus up to 3 sample ids.
-const latencyText = computed(() => {
-  const ms = props.panel.connection.latencyMs
-  return typeof ms === 'number' && Number.isFinite(ms) ? `${Math.round(ms)}ms` : ''
-})
+function roundedMilliseconds(value: number | null): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? Math.round(value)
+    : null
+}
 
-// Latency shown next to a failure pill (verified latency lives in the verdict line).
-const failureLatencyText = computed(() => {
+// A model probe has two distinct clocks. First response describes perceived
+// model responsiveness; total duration proves the stream also terminated
+// correctly. An older gateway supplies only latencyMs, which the composable
+// maps to totalMs and is therefore never mislabeled as first response.
+const firstResponseText = computed(() => {
+  const duration = roundedMilliseconds(props.panel.connection.firstResponseMs)
+  return duration == null ? '' : t('setup.provider.firstModelResponse', { duration })
+})
+const completeProbeText = computed(() => {
+  const duration = roundedMilliseconds(props.panel.connection.totalMs)
+  return duration == null ? '' : t('setup.provider.completeProbeDuration', { duration })
+})
+const hasProbeTimings = computed(() => Boolean(firstResponseText.value || completeProbeText.value))
+const failureProbeTimings = computed(() => {
   const phase = props.panel.connection.phase
-  return phase === 'key_invalid' || phase === 'unreachable' ? latencyText.value : ''
+  return phase === 'key_invalid' || phase === 'unreachable'
 })
 
 const verdictModelsText = computed(() => {
@@ -143,8 +246,12 @@ const verdictModelsText = computed(() => {
 </script>
 
 <template>
-  <section class="setup-provider-credential">
-    <div class="setup-provider-credential__head">
+  <section
+    class="setup-provider-credential"
+    :class="{ 'setup-provider-credential--compact': compact }"
+    :aria-busy="panel.removing ? 'true' : undefined"
+  >
+    <div v-if="!compact" class="setup-provider-credential__head">
       <div>
         <h4 class="setup-provider-credential__title">{{ title }}</h4>
         <p class="setup-provider-credential__source">{{ sourceText }}</p>
@@ -156,7 +263,8 @@ const verdictModelsText = computed(() => {
       <template v-if="!editingCredential">
         <label v-if="showCredentialControls" class="control-row control-row--stack setup-provider-credential__field">
           <div class="control-row__label-block">
-            <span class="control-row__label">{{ t('setup.common.apiKey') }}</span>
+            <span class="control-row__label">{{ apiKeyLabel }}</span>
+            <span v-if="apiKeyHelper" class="control-row__desc">{{ apiKeyHelper }}</span>
           </div>
           <div class="control-row__control setup-provider-credential__field-row">
             <div class="setup-provider-credential__input-shell">
@@ -172,24 +280,40 @@ const verdictModelsText = computed(() => {
                 v-if="showRevealButton"
                 type="button"
                 class="setup-provider-credential__input-action"
-                :aria-label="t('setup.provider.viewCredential')"
-                :title="t('setup.provider.viewCredential')"
-                @click="emit('reveal')"
+                :aria-label="credentialToggleLabel"
+                :title="credentialToggleLabel"
+                @click="credentialRevealed ? emit('hideReveal') : emit('reveal')"
               >
-                <Icon name="eye" :size="14" />
+                <Icon :name="credentialRevealed ? 'eye-off' : 'eye'" :size="14" />
               </button>
             </div>
-            <button type="button" class="btn setup-provider-credential__replace" @click="emit('replace')">{{ t('setup.provider.replaceCredential') }}</button>
+            <button
+              type="button"
+              class="btn setup-provider-credential__replace"
+              @click="emit('replace')"
+            >{{ t('setup.provider.replaceCredential') }}</button>
+            <button
+              v-if="hasRemovableCredential"
+              type="button"
+              class="btn btn--ghost setup-provider-credential__remove"
+              :disabled="panel.removing"
+              :aria-busy="panel.removing ? 'true' : undefined"
+              :aria-label="removeCredentialAriaLabel"
+              @click="emit('removeCredential')"
+            >
+              <span v-if="panel.removing" class="setup-connection__spinner" aria-hidden="true"></span>
+              {{ removeCredentialLabel }}
+            </button>
           </div>
         </label>
-        <p v-if="showPublicHint" class="control-row__desc">{{ t('setup.provider.credentialPublicHint') }}</p>
         <p v-if="panel.revealError" class="setup-provider-credential__error">{{ panel.revealError }}</p>
       </template>
 
       <template v-else>
         <label v-if="showCredentialControls" class="control-row control-row--stack setup-provider-credential__field">
           <div class="control-row__label-block">
-            <span class="control-row__label">{{ t('setup.common.apiKey') }}</span>
+            <span class="control-row__label">{{ apiKeyLabel }}</span>
+            <span v-if="apiKeyHelper" class="control-row__desc">{{ apiKeyHelper }}</span>
           </div>
           <div class="control-row__control setup-provider-credential__field-row">
             <div class="setup-provider-credential__input-shell">
@@ -198,7 +322,7 @@ const verdictModelsText = computed(() => {
                 :value="panel.apiKeyValue"
                 name="setup_provider_api_key"
                 :type="showApiKey ? 'text' : 'password'"
-                :placeholder="panel.replacing ? t('setup.provider.credentialReplacePlaceholder') : t('setup.provider.credentialEnterPlaceholder')"
+                :placeholder="credentialInputPlaceholder"
                 autocomplete="off"
                 @input="emit('updateField', 'api_key', ($event.target as HTMLInputElement).value)"
               >
@@ -218,33 +342,85 @@ const verdictModelsText = computed(() => {
               class="btn setup-provider-credential__replace"
               @click="emit('cancelReplace')"
             >{{ t('common.cancel') }}</button>
+            <button
+              v-else-if="hasRemovableCredential"
+              type="button"
+              class="btn btn--ghost setup-provider-credential__remove"
+              :disabled="panel.removing"
+              :aria-busy="panel.removing ? 'true' : undefined"
+              :aria-label="removeCredentialAriaLabel"
+              @click="emit('removeCredential')"
+            >
+              <span v-if="panel.removing" class="setup-connection__spinner" aria-hidden="true"></span>
+              {{ removeCredentialLabel }}
+            </button>
           </div>
         </label>
       </template>
+      <p v-if="showPublicHint && !compact" class="control-row__desc">{{ t('setup.provider.credentialPublicHint') }}</p>
     </div>
 
-    <div class="setup-provider-credential__footer">
+    <div v-if="compact && showVerification" class="setup-provider-credential__compact-verification">
+      <button
+        type="button"
+        class="btn"
+        :disabled="!panel.providerSelected || !panel.probeReady || probing"
+        :title="!panel.probeReady ? panel.probeDisabledReason : undefined"
+        :aria-busy="probing ? 'true' : undefined"
+        @click="emit('testConnection')"
+      >
+        <span v-if="probing" class="setup-connection__spinner" aria-hidden="true"></span>
+        {{ probing ? t('setup.provider.testing') : t('setup.provider.verifyAndConnect') }}
+      </button>
+      <span
+        v-if="connectionPill && panel.connection.phase !== 'unverified'"
+        class="setup-provider-credential__compact-result"
+        :class="{
+          'is-success': panel.connection.phase === 'verified',
+          'is-error': panel.connection.phase === 'key_invalid' || panel.connection.phase === 'unreachable',
+        }"
+        role="status"
+        aria-live="polite"
+      >{{ connectionPill.text }}</span>
+    </div>
+
+    <div v-else-if="!compact" class="setup-provider-credential__footer">
       <div class="control-row__label-block">
         <span class="control-row__label">{{ t('setup.provider.connectionLabel') }}</span>
         <span class="control-row__desc">{{ t('setup.provider.connectionDesc') }}</span>
       </div>
       <div class="control-row__control control-row__control--stack">
         <div class="setup-connection__actions">
-          <button type="button" class="btn" :disabled="!panel.providerSelected || probing" @click="emit('testConnection')">
+          <button
+            type="button"
+            class="btn"
+            :disabled="!panel.providerSelected || !panel.probeReady || probing"
+            :title="!panel.probeReady ? panel.probeDisabledReason : undefined"
+            :aria-busy="probing ? 'true' : undefined"
+            :aria-describedby="panel.probeDisabledReason ? probeHintId : undefined"
+            @click="emit('testConnection')"
+          >
             <span v-if="probing" class="setup-connection__spinner" aria-hidden="true"></span>
-            {{ probing ? t('setup.provider.testing') : t('setup.provider.testConnection') }}
+            {{ probing ? t('setup.provider.testing') : (panel.probeButtonLabel || t('setup.provider.testConnection')) }}
           </button>
-          <strong
-            v-if="connectionPill"
-            class="control-pill"
-            :class="connectionPill.tone"
-            :title="connectionPill.title || undefined"
-          >{{ connectionPill.text }}</strong>
-          <span v-if="failureLatencyText" class="setup-connection__latency">· {{ failureLatencyText }}</span>
+          <span role="status" aria-live="polite" aria-atomic="true">
+            <strong
+              v-if="connectionPill"
+              class="control-pill"
+              :class="connectionPill.tone"
+              :title="connectionPill.title || undefined"
+            >{{ connectionPill.text }}</strong>
+            <template v-if="failureProbeTimings && hasProbeTimings">
+              <span v-if="firstResponseText" class="setup-connection__timing setup-connection__timing--primary">· {{ firstResponseText }}</span>
+              <span v-if="completeProbeText" class="setup-connection__timing setup-connection__timing--secondary">· {{ completeProbeText }}</span>
+            </template>
+          </span>
         </div>
+        <span v-if="panel.probeDisabledReason" :id="probeHintId" class="setup-connection__hint">{{ panel.probeDisabledReason }}</span>
         <div class="setup-connection__verdict" aria-live="polite">
           <template v-if="panel.connection.phase === 'verified'">
-            <span v-if="latencyText" class="setup-connection__latency">· {{ latencyText }}</span>
+            <span v-if="firstResponseText" class="setup-connection__timing setup-connection__timing--primary">{{ firstResponseText }}</span>
+            <span v-if="completeProbeText" class="setup-connection__timing setup-connection__timing--secondary">{{ firstResponseText ? '· ' : '' }}{{ completeProbeText }}</span>
             <span v-if="verdictModelsText" class="setup-connection__verdict-models">· {{ verdictModelsText }}</span>
           </template>
         </div>
@@ -255,8 +431,8 @@ const verdictModelsText = computed(() => {
       </div>
     </div>
 
-    <details v-if="showCredentialControls" class="setup-provider-credential__details" :open="detailsOpen">
-      <summary class="setup-provider-credential__summary" @click.prevent="detailsOpen = !detailsOpen">{{ t('setup.provider.credentialAdvanced') }}</summary>
+    <details v-if="showCredentialControls && !compact" class="setup-provider-credential__details" :open="detailsOpen">
+      <summary class="setup-provider-credential__summary" @click.prevent="detailsOpen = !detailsOpen">{{ t('setup.provider.credentialSourceOptions') }}</summary>
       <label v-if="detailsOpen" class="control-row control-row--stack">
         <div class="control-row__label-block">
           <span class="control-row__label">{{ t('setup.common.apiKeyEnv') }}</span>
@@ -281,6 +457,12 @@ const verdictModelsText = computed(() => {
   padding: var(--sp-2) 0;
   border-block: 1px solid var(--border);
   background: transparent;
+}
+
+.setup-provider-credential--compact {
+  border: 0;
+  margin: 0;
+  padding: 0;
 }
 
 .setup-provider-credential__head {
@@ -314,6 +496,33 @@ const verdictModelsText = computed(() => {
 .setup-provider-credential__footer {
   display: grid;
   gap: var(--sp-1);
+}
+
+.setup-provider-credential__compact-verification {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
+}
+
+.setup-provider-credential__compact-verification .btn {
+  align-items: center;
+  display: inline-flex;
+  gap: var(--sp-2);
+}
+
+.setup-provider-credential__compact-result {
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+}
+
+.setup-provider-credential__compact-result.is-success {
+  color: var(--ok);
+}
+
+.setup-provider-credential__compact-result.is-error {
+  color: var(--danger);
 }
 
 .setup-provider-credential__footer {
@@ -380,6 +589,20 @@ const verdictModelsText = computed(() => {
   white-space: nowrap;
 }
 
+.setup-provider-credential__remove {
+  align-items: center;
+  color: var(--danger);
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: var(--sp-1);
+  white-space: nowrap;
+}
+
+.setup-provider-credential__remove.btn--ghost:not(:disabled):hover {
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+  color: var(--danger);
+}
+
 .setup-connection__actions {
   align-items: center;
   display: flex;
@@ -409,8 +632,7 @@ const verdictModelsText = computed(() => {
   to { transform: rotate(360deg); }
 }
 
-/* Verdict line under the pill: latency + discovered-model summary. The latency
-   figure is tabular mono so successive probes don't jitter the layout. */
+/* Verdict line under the pill: probe timings + discovered-model summary. */
 .setup-connection__verdict {
   color: var(--text-muted);
   display: flex;
@@ -420,12 +642,16 @@ const verdictModelsText = computed(() => {
   justify-content: flex-end;
 }
 
-.setup-connection__latency {
+.setup-connection__timing {
   color: var(--text-muted);
   font-family: var(--font-mono);
   font-size: var(--fs-xs);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+}
+
+.setup-connection__timing--primary {
+  color: var(--text);
 }
 
 .setup-connection__verdict-models {
@@ -463,37 +689,54 @@ const verdictModelsText = computed(() => {
 
   .setup-provider-credential__footer {
     align-items: flex-start;
-    flex-direction: row;
-    flex-wrap: wrap;
+    flex-direction: column;
+    flex-wrap: nowrap;
     gap: var(--sp-2);
   }
 
   .setup-provider-credential__footer > .control-row__label-block {
-    flex: 1 1 240px;
+    flex: 0 0 auto;
     min-width: 0;
+    width: 100%;
   }
 
   .setup-provider-credential__footer > .control-row__control {
     align-items: flex-start;
     flex: 0 0 auto;
     justify-content: flex-start;
-    width: auto;
+    width: 100%;
   }
 
   .setup-provider-credential__footer .control-row__desc {
     display: block;
     max-width: 100%;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    overflow-wrap: anywhere;
+    white-space: normal;
   }
 
   .setup-provider-credential__replace {
     width: auto;
   }
 
+  .setup-provider-credential__field-row {
+    flex-wrap: wrap;
+  }
+
+  .setup-provider-credential__field-row .setup-provider-credential__input-shell {
+    flex-basis: 100%;
+  }
+
+  .setup-provider-credential__remove {
+    width: auto;
+  }
+
   .setup-connection__actions {
     justify-content: flex-start;
+  }
+
+  .setup-connection__hint {
+    max-width: 100%;
+    overflow-wrap: anywhere;
   }
 }
 </style>

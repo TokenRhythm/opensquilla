@@ -71,6 +71,30 @@ def test_sensitive_expansion_is_denied_in_trusted(tmp_path: Path) -> None:
     assert plan.denied[0].reason == "user_secret"
 
 
+def test_policy_grants_bypass_legacy_marker_but_expansions_do_not(tmp_path: Path) -> None:
+    from opensquilla.sandbox.backend.windows_default_acl import (
+        AclAccess,
+        AclGrant,
+        AclGrantKind,
+        plan_acl_refresh,
+    )
+
+    policy = AclGrant(tmp_path / "policy", AclAccess.RX, AclGrantKind.POLICY)
+    expansion = AclGrant(tmp_path / "expansion", AclAccess.RWX, AclGrantKind.EXPANSION)
+
+    plan = plan_acl_refresh(
+        run_mode=RunMode.TRUSTED,
+        required=(),
+        policy=(policy,),
+        expansion=(expansion,),
+        sensitive_marker=lambda _path: "legacy_sensitive",
+        required_policy_sensitive_marker=lambda _path: None,
+    )
+
+    assert plan.auto_grants == (policy,)
+    assert [item.grant for item in plan.denied] == [expansion]
+
+
 def test_full_host_access_has_no_acl_refresh(tmp_path: Path) -> None:
     from opensquilla.sandbox.backend.windows_default_acl import (
         AclAccess,

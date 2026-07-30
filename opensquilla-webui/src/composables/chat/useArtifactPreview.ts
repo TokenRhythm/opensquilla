@@ -132,6 +132,7 @@ export function createArtifactPreview(options: ArtifactPreviewOptions): Artifact
   let observedEl: Element | null = null
   let inFlight = false
   let disposed = false
+  let activeAbortController: AbortController | null = null
 
   function setObjectUrl(next: string) {
     const prev = objectUrl.value
@@ -164,6 +165,7 @@ export function createArtifactPreview(options: ArtifactPreviewOptions): Artifact
     }
 
     const controller = new AbortController()
+    activeAbortController = controller
     const timer = window.setTimeout(() => controller.abort('timeout'), timeoutMs)
     let timedOut = false
 
@@ -193,6 +195,7 @@ export function createArtifactPreview(options: ArtifactPreviewOptions): Artifact
       state.value = timedOut ? 'timeout' : 'error'
     } finally {
       window.clearTimeout(timer)
+      if (activeAbortController === controller) activeAbortController = null
       releaseSlot()
       inFlight = false
     }
@@ -246,6 +249,8 @@ export function createArtifactPreview(options: ArtifactPreviewOptions): Artifact
   function release() {
     cancelObserve()
     runSeq += 1
+    activeAbortController?.abort('cancelled')
+    activeAbortController = null
     if (fullSize) {
       untrackFullUrl(lruToken)
     } else if (objectUrl.value) {

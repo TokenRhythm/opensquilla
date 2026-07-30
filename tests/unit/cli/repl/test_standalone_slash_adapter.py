@@ -8,6 +8,7 @@ import pytest
 from opensquilla.cli.repl.session_state import ChatSessionState
 from opensquilla.cli.repl.stream import TurnResult
 from opensquilla.cli.tui.contracts import TuiOutputHandle
+from opensquilla.provider.types import ProviderRequestCorrelation
 
 
 class _StandaloneSlashHarness:
@@ -321,3 +322,71 @@ async def test_standalone_slash_adapter_compact_uses_typed_compact_handles() -> 
     assert compact_session_key == session_key
     assert context_window == 4321
     assert compaction_config is not None
+
+
+@pytest.mark.asyncio
+async def test_standalone_compact_correlates_flush_and_compaction_to_durable_session() -> None:
+    from opensquilla.cli.repl.standalone_slash_adapter import (
+        StandaloneSlashContext,
+        StandaloneSlashServices,
+        handle_standalone_slash_command,
+    )
+
+    harness = _StandaloneSlashHarness()
+    session_key = "agent:main:standalone:test"
+    harness.transcripts[session_key] = [SimpleNamespace(role="user", content="persisted")]
+    compact_kwargs: dict[str, object] = {}
+
+    async def get_session(_session_key: str) -> object:
+        return SimpleNamespace(session_id="durable-session-1")
+
+    async def compact_with_result(
+        _session_key: str,
+        _context_window_tokens: int,
+        _compaction_config: object,
+        **kwargs: object,
+    ) -> object:
+        compact_kwargs.update(kwargs)
+        return SimpleNamespace(
+            summary="summary",
+            tokens_before=100,
+            tokens_after=20,
+            remaining_budget_tokens=80,
+            summary_source="llm",
+        )
+
+    state = ChatSessionState(session_key=session_key, model="tokenrhythm/test")
+    context = StandaloneSlashContext(
+        state=state,
+        session_key=session_key,
+        model=state.model,
+        tool_ctx=object(),
+        slash_services=StandaloneSlashServices(
+            get_session=get_session,
+            read_transcript=harness.read_transcript,
+            compact_with_result=compact_with_result,
+            flush_transcript=harness.flush_transcript,
+            config=SimpleNamespace(context_budget_tokens=100),
+        ),
+        turn_runner=object(),
+        build_tool_ctx=lambda _session_key: object(),
+        replace_session=lambda **_updates: None,
+    )
+
+    assert await handle_standalone_slash_command("/compact", context) is True
+
+    flush_correlation = cast(
+        ProviderRequestCorrelation,
+        harness.flush_calls[0]["kwargs"]["provider_request_correlation"],
+    )
+    compact_correlation = cast(
+        ProviderRequestCorrelation,
+        compact_kwargs["provider_request_correlation"],
+    )
+    assert flush_correlation.session_id == "durable-session-1"
+    assert compact_correlation.session_id == "durable-session-1"
+    assert flush_correlation.turn_id == compact_correlation.turn_id
+    assert compact_kwargs["compaction_id"] == compact_correlation.turn_id
+    assert flush_correlation.execution_id != compact_correlation.execution_id
+    assert flush_correlation.call_kind == "auxiliary.session_flush"
+    assert compact_correlation.call_kind == "auxiliary.compaction"

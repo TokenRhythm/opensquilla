@@ -1,10 +1,7 @@
 *.sh text eol=lf
+opensquilla-webui/** text=auto eol=lf
+opensquilla-webui/.node-version text eol=lf
 tests/test_provider/golden/requests/**/*.json text eol=lf
-
-src/opensquilla/gateway/static/dist/**/*.css text eol=lf
-src/opensquilla/gateway/static/dist/**/*.html text eol=lf
-src/opensquilla/gateway/static/dist/**/*.js text eol=lf
-src/opensquilla/gateway/static/dist/**/*.map text eol=lf
 
 src/opensquilla/squilla_router/models/*.pkl filter=lfs diff=lfs merge=lfs -text
 src/opensquilla/squilla_router/models/*.txt filter=lfs diff=lfs merge=lfs -text

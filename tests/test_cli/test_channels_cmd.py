@@ -308,3 +308,139 @@ def test_channels_add_echoes_resolved_path_and_source(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.stdout
     assert str(project / "opensquilla.toml") in result.stdout
     assert "cwd" in result.stdout.lower()
+
+
+class _FakePairingGatewayClient:
+    """Records pairing RPC calls and replays canned payloads."""
+
+    calls: list[tuple[str, dict]] = []
+    payloads: dict[str, dict] = {}
+
+    async def connect(self, url: str, *, token=None) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+    async def call(self, method: str, params: dict | None = None) -> dict:
+        type(self).calls.append((method, params or {}))
+        return type(self).payloads.get(method, {})
+
+
+def _install_fake_gateway(monkeypatch) -> type[_FakePairingGatewayClient]:
+    _FakePairingGatewayClient.calls = []
+    monkeypatch.setattr(
+        "opensquilla.cli.gateway_client.GatewayClient", _FakePairingGatewayClient
+    )
+    return _FakePairingGatewayClient
+
+
+def test_pairings_list_renders_codes_and_passes_status_filter(tmp_path, monkeypatch):
+    _setenv(monkeypatch, tmp_path)
+    fake = _install_fake_gateway(monkeypatch)
+    fake.payloads = {
+        "channels.pairings": {
+            "pairings": [
+                {
+                    "pairingId": "abcdef1234567890",
+                    "pairingCode": "abcdef12",
+                    "channelName": "telegram-main",
+                    "senderId": "user-42",
+                    "senderName": "Alice",
+                    "status": "pending",
+                    "createdAt": "2026-07-16T09:00:00+00:00",
+                    "approvedAt": None,
+                }
+            ]
+        }
+    }
+
+    result = runner.invoke(
+        app,
+        ["channels", "pairings", "list", "telegram-main", "--status", "pending"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert fake.calls == [
+        ("channels.pairings", {"channelName": "telegram-main", "status": "pending"})
+    ]
+    assert "abcdef12" in result.stdout
+    assert "Alice" in result.stdout
+
+
+def test_pairings_approve_requires_confirmation_and_sends_code(tmp_path, monkeypatch):
+    _setenv(monkeypatch, tmp_path)
+    fake = _install_fake_gateway(monkeypatch)
+    fake.payloads = {
+        "channels.pairing.approve": {
+            "pairing": {"pairingCode": "abcdef12", "senderId": "user-42", "status": "approved"}
+        }
+    }
+
+    # --json without --yes must refuse before any RPC happens.
+    refused = runner.invoke(
+        app, ["channels", "pairings", "approve", "telegram-main", "abcdef12", "--json"]
+    )
+    assert refused.exit_code == 2
+    assert fake.calls == []
+
+    result = runner.invoke(
+        app, ["channels", "pairings", "approve", "telegram-main", "abcdef12", "--yes"]
+    )
+    assert result.exit_code == 0, result.output
+    assert fake.calls == [
+        (
+            "channels.pairing.approve",
+            {"channelName": "telegram-main", "pairingCode": "abcdef12"},
+        )
+    ]
+    assert "approved" in result.stdout.lower()
+
+
+def test_pairings_revoke_uses_the_revoke_rpc(tmp_path, monkeypatch):
+    _setenv(monkeypatch, tmp_path)
+    fake = _install_fake_gateway(monkeypatch)
+    fake.payloads = {
+        "channels.pairing.revoke": {"pairing": {"pairingCode": "abcdef12", "status": "revoked"}}
+    }
+
+    result = runner.invoke(
+        app, ["channels", "pairings", "revoke", "telegram-main", "abcdef12", "--yes"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert fake.calls == [
+        (
+            "channels.pairing.revoke",
+            {"channelName": "telegram-main", "pairingCode": "abcdef12"},
+        )
+    ]
+    assert "revoked" in result.stdout.lower()
+
+
+def test_pairings_approve_admin_flag_passes_as_admin(tmp_path, monkeypatch):
+    _setenv(monkeypatch, tmp_path)
+    fake = _install_fake_gateway(monkeypatch)
+    fake.payloads = {
+        "channels.pairing.approve": {
+            "pairing": {"pairingCode": "abcdef12", "senderId": "user-42", "status": "approved"},
+            "adminGranted": True,
+        }
+    }
+
+    result = runner.invoke(
+        app,
+        [
+            "channels", "pairings", "approve", "telegram-main", "abcdef12",
+            "--admin", "--yes",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert fake.calls == [
+        (
+            "channels.pairing.approve",
+            {"channelName": "telegram-main", "pairingCode": "abcdef12", "asAdmin": True},
+        )
+    ]
+    assert "[admin]" in result.stdout

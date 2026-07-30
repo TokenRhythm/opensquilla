@@ -548,6 +548,131 @@ supports_tools = true
 supports_vision = false
 reasoning_format = "none"
 
+# qwen_token_plan: exact subscription allowlist shared by the OpenAI and
+# Anthropic protocol profiles. The Anthropic profile resolves through this
+# table via model_catalog's corrections alias. Costs stay unset because
+# Credits are subscription quota, not per-token USD billing.
+
+[qwen_token_plan."qwen3.8-max-preview"]
+context_window = 983616
+max_output_tokens = 131072
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "qwen_token_plan_qwen"
+
+[qwen_token_plan."qwen3.7-max"]
+context_window = 1000000
+max_output_tokens = 65536
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "qwen_token_plan_qwen"
+
+[qwen_token_plan."qwen3.7-plus"]
+context_window = 1000000
+max_output_tokens = 65536
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "qwen_token_plan_qwen"
+
+[qwen_token_plan."qwen3.6-plus"]
+context_window = 1000000
+max_output_tokens = 65536
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "qwen_token_plan_qwen"
+
+[qwen_token_plan."qwen3.6-flash"]
+context_window = 1000000
+max_output_tokens = 65536
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "qwen_token_plan_qwen"
+
+[qwen_token_plan."deepseek-v4-pro"]
+context_window = 1000000
+max_output_tokens = 393216
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "qwen_token_plan_deepseek"
+
+[qwen_token_plan."deepseek-v4-flash"]
+context_window = 1000000
+max_output_tokens = 393216
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "qwen_token_plan_deepseek"
+
+[qwen_token_plan."deepseek-v3.2"]
+context_window = 131072
+max_output_tokens = 65536
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "qwen_token_plan"
+
+[qwen_token_plan."kimi-k2.7-code"]
+context_window = 262144
+max_output_tokens = 16384
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "qwen_token_plan_kimi"
+
+[qwen_token_plan."kimi-k2.6"]
+context_window = 262144
+max_output_tokens = 98304
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "qwen_token_plan_kimi"
+
+[qwen_token_plan."kimi-k2.5"]
+context_window = 262144
+max_output_tokens = 32768
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "qwen_token_plan_kimi"
+
+[qwen_token_plan."glm-5.2"]
+context_window = 1000000
+max_output_tokens = 131072
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "qwen_token_plan_glm"
+
+[qwen_token_plan."glm-5.1"]
+context_window = 202752
+max_output_tokens = 131072
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "qwen_token_plan_glm"
+
+[qwen_token_plan."glm-5"]
+context_window = 202752
+max_output_tokens = 16384
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "qwen_token_plan_glm"
+
+[qwen_token_plan."minimax-m2.5"]
+context_window = 196608
+max_output_tokens = 32768
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "qwen_token_plan"
+
 # tokenrhythm (TokenRhythm aggregator, tokenrhythm.studio): not on
 # models.dev, so these rows are the offline metadata for its catalog —
 # the fallback beneath the boot-time live ingest of the platform's public
@@ -569,9 +694,9 @@ supports_reasoning = true
 supports_tools = true
 supports_vision = false
 reasoning_format = "none"
-input_cost_per_mtok = 0.14
-output_cost_per_mtok = 0.29
-cache_read_cost_per_mtok = 0.03
+input_cost_per_mtok = 0.14336917562724014
+output_cost_per_mtok = 0.2867383512544803
+cache_read_cost_per_mtok = 0.02867383512544803
 
 [tokenrhythm."deepseek-v4-pro"]
 context_window = 1000000
@@ -580,9 +705,9 @@ supports_reasoning = true
 supports_tools = true
 supports_vision = false
 reasoning_format = "none"
-input_cost_per_mtok = 1.72
-output_cost_per_mtok = 3.44
-cache_read_cost_per_mtok = 0.14
+input_cost_per_mtok = 0.43010752688172044
+output_cost_per_mtok = 0.8602150537634409
+cache_read_cost_per_mtok = 0.0035842293906810036
 
 [tokenrhythm."glm-5"]
 context_window = 1000000
@@ -591,9 +716,9 @@ supports_reasoning = true
 supports_tools = true
 supports_vision = false
 reasoning_format = "none"
-input_cost_per_mtok = 0.86
-output_cost_per_mtok = 3.15
-cache_read_cost_per_mtok = 0.22
+input_cost_per_mtok = 0.8602150537634409
+output_cost_per_mtok = 3.154121863799283
+cache_read_cost_per_mtok = 0.21505376344086022
 
 [tokenrhythm."glm-5.1"]
 context_window = 200000
@@ -602,9 +727,9 @@ supports_reasoning = true
 supports_tools = true
 supports_vision = false
 reasoning_format = "none"
-input_cost_per_mtok = 1.15
-output_cost_per_mtok = 4.01
-cache_read_cost_per_mtok = 0.29
+input_cost_per_mtok = 1.1469534050179212
+output_cost_per_mtok = 4.014336917562724
+cache_read_cost_per_mtok = 0.2867383512544803
 
 [tokenrhythm."glm-5.2"]
 context_window = 1000000
@@ -613,9 +738,9 @@ supports_reasoning = true
 supports_tools = true
 supports_vision = false
 reasoning_format = "none"
-input_cost_per_mtok = 1.15
-output_cost_per_mtok = 4.01
-cache_read_cost_per_mtok = 0.29
+input_cost_per_mtok = 1.1469534050179212
+output_cost_per_mtok = 4.014336917562724
+cache_read_cost_per_mtok = 0.2867383512544803
 
 # minimax/mimo publish near-window output caps (input + output share the
 # window). Passing those through as max_tokens would trip
@@ -629,8 +754,8 @@ supports_reasoning = true
 supports_tools = true
 supports_vision = false
 reasoning_format = "none"
-input_cost_per_mtok = 0.30
-output_cost_per_mtok = 1.20
+input_cost_per_mtok = 0.3010752688172043
+output_cost_per_mtok = 1.2043010752688172
 
 [tokenrhythm."minimax-m2.7"]
 context_window = 200000
@@ -639,8 +764,8 @@ supports_reasoning = true
 supports_tools = true
 supports_vision = false
 reasoning_format = "none"
-input_cost_per_mtok = 0.30
-output_cost_per_mtok = 1.20
+input_cost_per_mtok = 0.3010752688172043
+output_cost_per_mtok = 1.2043010752688172
 
 [tokenrhythm."kimi-k2.5"]
 context_window = 256000
@@ -649,9 +774,9 @@ supports_reasoning = true
 supports_tools = true
 supports_vision = true
 reasoning_format = "none"
-input_cost_per_mtok = 0.57
-output_cost_per_mtok = 3.01
-cache_read_cost_per_mtok = 0.11
+input_cost_per_mtok = 0.5734767025089605
+output_cost_per_mtok = 3.010752688172043
+cache_read_cost_per_mtok = 0.11469534050179211
 
 [tokenrhythm."kimi-k2.6"]
 context_window = 256000
@@ -660,9 +785,9 @@ supports_reasoning = true
 supports_tools = true
 supports_vision = true
 reasoning_format = "none"
-input_cost_per_mtok = 0.93
-output_cost_per_mtok = 3.87
-cache_read_cost_per_mtok = 0.19
+input_cost_per_mtok = 0.931899641577061
+output_cost_per_mtok = 3.870967741935484
+cache_read_cost_per_mtok = 0.1863799283154122
 
 [tokenrhythm."kimi-k2.7-code"]
 context_window = 256000
@@ -671,8 +796,9 @@ supports_reasoning = true
 supports_tools = true
 supports_vision = true
 reasoning_format = "none"
-input_cost_per_mtok = 0.93
-output_cost_per_mtok = 3.87
+input_cost_per_mtok = 0.931899641577061
+output_cost_per_mtok = 3.870967741935484
+cache_read_cost_per_mtok = 0.1863799283154122
 
 [tokenrhythm."mimo-v2.5-pro"]
 context_window = 256000
@@ -681,19 +807,19 @@ supports_reasoning = true
 supports_tools = true
 supports_vision = false
 reasoning_format = "none"
-input_cost_per_mtok = 0.43
-output_cost_per_mtok = 0.86
+input_cost_per_mtok = 0.43010752688172044
+output_cost_per_mtok = 0.8602150537634409
 
 [tokenrhythm."qwen3.7-max"]
 context_window = 1000000
-max_output_tokens = 256000
+max_output_tokens = 131072
 supports_reasoning = true
 supports_tools = true
 supports_vision = false
 reasoning_format = "none"
-input_cost_per_mtok = 1.72
-output_cost_per_mtok = 5.16
-cache_read_cost_per_mtok = 0.34
+input_cost_per_mtok = 0.8602150537634409
+output_cost_per_mtok = 2.5806451612903225
+cache_read_cost_per_mtok = 0.17204301075268819
 
 # Catch-all for models TokenRhythm adds later: everything on this relay
 # so far streams reasoning and takes tools; vision stays off until

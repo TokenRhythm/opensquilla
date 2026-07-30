@@ -27,7 +27,7 @@ from test_tools.dispatch_corpus import ALL_CASES
 import opensquilla.tools.dispatch as _dispatch_module
 from opensquilla.engine.hooks import NoopToolHook
 from opensquilla.result_budget import ToolRunBudgetExceededError, ToolRunBudgetPolicy
-from opensquilla.tool_boundary import ToolCall
+from opensquilla.tool_boundary import ToolCall, ToolContinuation
 from opensquilla.tools.dispatch import build_tool_handler
 from opensquilla.tools.registry import ToolRegistry
 from opensquilla.tools.types import ToolContext, ToolSpec, current_tool_context
@@ -142,10 +142,12 @@ def _collect_executed_lines() -> set[int]:
             tool_name: str,
             handler_exc: BaseException,
             hooks: tuple,
+            continuation: ToolContinuation | None = None,
+            arguments: dict[str, object] | None = None,
         ) -> None:
             registry = ToolRegistry()
 
-            async def _handler() -> str:
+            async def _handler(approval_id: str | None = None) -> str:
                 raise handler_exc
 
             registry.register(
@@ -153,6 +155,15 @@ def _collect_executed_lines() -> set[int]:
                     name=tool_name,
                     description="coverage-only branch driver",
                     parameters={},
+                    runtime_only_arguments=(
+                        frozenset({"approval_id"})
+                        if tool_name
+                        in {
+                            "coverage_runtime_approval_id",
+                            "coverage_runtime_continuation",
+                        }
+                        else frozenset()
+                    ),
                     result_budget_class="external",
                 ),
                 _handler,
@@ -176,7 +187,8 @@ def _collect_executed_lines() -> set[int]:
                     ToolCall(
                         tool_use_id=f"tc-{tool_name}",
                         tool_name=tool_name,
-                        arguments={},
+                        arguments=dict(arguments or {}),
+                        continuation=continuation,
                     )
                 )
             except BaseException:
@@ -189,6 +201,37 @@ def _collect_executed_lines() -> set[int]:
                 tool_name="coverage_cancel",
                 handler_exc=asyncio.CancelledError(),
                 hooks=hooks,
+                continuation=ToolContinuation(
+                    approval_id="approval-coverage",
+                    tool_use_id="tc-coverage_cancel",
+                    session_key="",
+                ),
+            )
+            await _run_coverage_only(
+                tool_name="coverage_runtime_approval_id",
+                handler_exc=RuntimeError("must not execute"),
+                hooks=hooks,
+                arguments={"approval_id": "provider-supplied"},
+            )
+            await _run_coverage_only(
+                tool_name="coverage_runtime_continuation",
+                handler_exc=RuntimeError("continuation reached handler"),
+                hooks=hooks,
+                continuation=ToolContinuation(
+                    approval_id="approval-runtime",
+                    tool_use_id="tc-coverage_runtime_continuation",
+                    session_key="",
+                ),
+            )
+            await _run_coverage_only(
+                tool_name="coverage_continuation_mismatch",
+                handler_exc=RuntimeError("must not execute"),
+                hooks=hooks,
+                continuation=ToolContinuation(
+                    approval_id="approval-mismatch",
+                    tool_use_id="another-call",
+                    session_key="another-session",
+                ),
             )
             await _run_coverage_only(
                 tool_name="coverage_budget_exhausted",

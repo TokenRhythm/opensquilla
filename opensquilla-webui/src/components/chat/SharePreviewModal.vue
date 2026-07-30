@@ -99,9 +99,10 @@
 </template>
 
 <script setup lang="ts">
-import { nextTick, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import { useDialogLayer } from '@/composables/useDialogA11y'
 
 const { t } = useI18n()
 
@@ -130,6 +131,7 @@ const emit = defineEmits<{
 const panelRef = ref<HTMLElement | null>(null)
 const closeBtn = ref<HTMLButtonElement | null>(null)
 const titleId = `share-preview-title-${Math.random().toString(36).slice(2, 9)}`
+const isTopmost = useDialogLayer(computed(() => props.open))
 
 let invokerEl: HTMLElement | null = null
 
@@ -155,6 +157,7 @@ function trapFocus(event: KeyboardEvent, rootEl: HTMLElement | null) {
 
 function onDocumentKeydown(event: KeyboardEvent) {
   if (!props.open) return
+  if (!isTopmost.value) return
   if (event.key === 'Escape') {
     event.preventDefault()
     emit('close')

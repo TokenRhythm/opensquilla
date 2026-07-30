@@ -26,6 +26,14 @@ class _FakeScheduler:
 
     async def add_job(self, **kwargs) -> CronJob:
         self.added = kwargs
+        idempotency_key = kwargs.get("idempotency_key", "")
+        if (
+            self.job is not None
+            and idempotency_key
+            and self.job.idempotency_key == idempotency_key
+        ):
+            self.job.deduplicated = True
+            return self.job
         kind = kwargs.get("schedule_kind") or ScheduleKind.CRON
         value = kwargs.get("schedule_value", "")
         self.job = CronJob(
@@ -42,6 +50,10 @@ class _FakeScheduler:
             delivery=kwargs.get("delivery") or DeliveryConfig(),
             tz=kwargs.get("schedule_tz") or kwargs.get("tz", "") or "",
             creator_is_owner=bool(kwargs.get("creator_is_owner", False)),
+            run_mode=kwargs.get("run_mode", ""),
+            elevated="full" if kwargs.get("run_mode") == "full" else "",
+            execution_target="host" if kwargs.get("run_mode") == "full" else "sandbox",
+            idempotency_key=idempotency_key,
         )
         return self.job
 
@@ -85,6 +97,65 @@ async def test_rpc_create_with_structured_cron_returns_normalized_expression() -
     assert result["expression"] == "*/5 * * * *"
     assert result["scheduleRaw"] == "*/5 * * * *"
     assert result["scheduleKind"] == "cron"
+
+
+@pytest.mark.asyncio
+async def test_rpc_create_accepts_explicit_idempotency_key() -> None:
+    scheduler = _FakeScheduler()
+
+    result = await _handle_cron_add(
+        {
+            "name": "five",
+            "schedule": {"kind": "cron", "expr": "*/5 * * * *"},
+            "payloadKind": AGENT_TURN_KIND,
+            "text": "ping",
+            "agentId": "main",
+            "idempotencyKey": "client-request-123",
+        },
+        RpcContext(conn_id="test", cron_scheduler=scheduler),
+    )
+
+    assert scheduler.added is not None
+    assert scheduler.added["idempotency_key"] == "client-request-123"
+    assert scheduler.added["run_mode"] == "full"
+    assert result["runMode"] == "full"
+    assert result["executionTarget"] == "host"
+    assert result["deduplicated"] is False
+
+
+@pytest.mark.asyncio
+async def test_rpc_retry_returns_existing_job_as_deduplicated() -> None:
+    scheduler = _FakeScheduler()
+    params = {
+        "name": "five",
+        "schedule": {"kind": "cron", "expr": "*/5 * * * *"},
+        "payloadKind": AGENT_TURN_KIND,
+        "text": "ping",
+        "agentId": "main",
+        "idempotency_key": "client-request-123",
+    }
+    context = RpcContext(conn_id="test", cron_scheduler=scheduler)
+
+    first = await _handle_cron_add(params, context)
+    retry = await _handle_cron_add(params, context)
+
+    assert first["id"] == retry["id"] == "rpc-strict-1"
+    assert first["deduplicated"] is False
+    assert retry["deduplicated"] is True
+
+
+@pytest.mark.asyncio
+async def test_rpc_create_rejects_oversized_idempotency_key() -> None:
+    with pytest.raises(ValueError, match="at most 256"):
+        await _handle_cron_add(
+            {
+                "schedule": {"kind": "cron", "expr": "*/5 * * * *"},
+                "payloadKind": AGENT_TURN_KIND,
+                "text": "ping",
+                "idempotencyKey": "x" * 257,
+            },
+            RpcContext(conn_id="test", cron_scheduler=_FakeScheduler()),
+        )
 
 
 @pytest.mark.asyncio

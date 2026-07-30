@@ -4,9 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import shutil
-import signal
-import sys
 from collections import deque
 from collections.abc import Mapping
 from contextlib import suppress
@@ -17,8 +14,18 @@ from typing import Any
 
 import structlog
 
+from opensquilla import __version__
 from opensquilla.cli.tui.backend.transcript import ViewportProjection
+from opensquilla.cli.tui.opentui.host_runtime import (
+    HostArtifact,
+    HostArtifactResolver,
+    HostFailureReason,
+    HostProcessController,
+    HostRuntimeError,
+    source_host_requested,
+)
 from opensquilla.cli.tui.opentui.messages import (
+    OPENTUI_SCREEN_MODE,
     HostError,
     HostReady,
     HostToPythonMessage,
@@ -27,14 +34,14 @@ from opensquilla.cli.tui.opentui.messages import (
     host_message_from_json,
     python_message_to_json,
 )
+from opensquilla.cli.tui.opentui.prefs import load_theme_preference
+from opensquilla.cli.tui.opentui.terminal import create_terminal_guardian
+from opensquilla.cli.tui.opentui.themes import THEME_ENV_VAR
+from opensquilla.cli.tui.opentui.transport import HostConnection
 from opensquilla.cli.tui.renderers.selection import (
     RendererBackendAvailability,
+    RendererBackendUnavailableReason,
 )
-
-try:
-    import termios
-except ImportError:  # pragma: no cover - Windows: the fd bridge is unsupported there
-    termios = None  # type: ignore[assignment]
 
 DEFAULT_HOST_PACKAGE_DIR = Path(__file__).resolve().parent / "package"
 DEFAULT_READY_TIMEOUT_SECONDS = 5.0
@@ -45,18 +52,31 @@ _MAX_CONSECUTIVE_MALFORMED_LINES = 64
 # far faster than Python produces, so hitting this bound means the host stopped
 # reading; erroring beats growing the queue without limit.
 _WRITE_QUEUE_MAX_FRAMES = 8192
-# Best-effort tty sanity reset for an abnormally dead host: leave the alternate
-# screen, disable mouse tracking (incl. SGR mode) and bracketed paste, show the
-# cursor, and clear attributes. Every sequence is a no-op when already off.
-_TERMINAL_RESET_SEQUENCE = (
-    b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?25h\x1b[0m"
+# These capabilities are semantic product contracts, not decorative handshake
+# metadata. An older host may render basic text but cannot safely preserve turn
+# identity/scroll anchors or expose the shared routing controls. Refuse that
+# mixed-version surface explicitly instead of silently presenting a partially
+# writable TUI.
+REQUIRED_INTERACTIVE_HOST_CAPABILITIES = frozenset(
+    {
+        "turn.identity.v2",
+        "scroll.anchor.v1",
+        "model.routing.control.v1",
+    }
 )
-
 log = structlog.get_logger(__name__)
 
 
-class OpenTuiBridgeError(RuntimeError):
+class OpenTuiBridgeError(HostRuntimeError):
     """Raised when the OpenTUI host process cannot be used."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: HostFailureReason = HostFailureReason.TRANSPORT,
+    ) -> None:
+        super().__init__(message, reason=reason)
 
 
 @dataclass(frozen=True)
@@ -64,58 +84,86 @@ class OpenTuiHostPaths:
     package_dir: Path = DEFAULT_HOST_PACKAGE_DIR
     main_script: Path = DEFAULT_HOST_PACKAGE_DIR / "src" / "main.mjs"
 
-    @property
-    def opentui_core_dir(self) -> Path:
-        return self.package_dir / "node_modules" / "@opentui" / "core"
+
+def _host_handshake_mismatches(
+    artifact: HostArtifact,
+    message: HostReady,
+) -> list[str]:
+    mismatches: list[str] = []
+    if message.protocol != artifact.protocol_version:
+        mismatches.append(
+            f"protocol expected={artifact.protocol_version!r} got={message.protocol!r}"
+        )
+    for label, expected, actual in (
+        ("product", artifact.product_version, message.product_version),
+        ("host", artifact.host_version, message.host_version),
+        ("platform", artifact.platform, message.platform),
+        ("arch", artifact.arch, message.arch),
+        ("build", artifact.build_id, message.build_id),
+        ("screen", OPENTUI_SCREEN_MODE, message.screen_mode),
+    ):
+        if actual != expected:
+            mismatches.append(f"{label} expected={expected!r} got={actual!r}")
+    missing_capabilities = sorted(
+        REQUIRED_INTERACTIVE_HOST_CAPABILITIES.difference(message.capabilities)
+    )
+    if missing_capabilities:
+        mismatches.append(
+            "required interactive capabilities missing=" + ",".join(missing_capabilities)
+        )
+    return mismatches
+
+
+def apply_theme_preference_env(env: dict[str, str]) -> None:
+    """Fill ``OPENSQUILLA_TUI_THEME`` from the persisted /theme choice.
+
+    A NON-EMPTY explicit environment value wins, preserving the documented
+    OPENSQUILLA_TUI_THEME contract. An empty exported value counts as unset —
+    the host maps it to the default theme anyway, so letting it mask the
+    preference would only make /theme appear to save and then never apply.
+    """
+    if env.get(THEME_ENV_VAR):
+        return
+    saved_theme = load_theme_preference()
+    if saved_theme:
+        env[THEME_ENV_VAR] = saved_theme
 
 
 def check_opentui_host_available(
     *,
     package_dir: Path = DEFAULT_HOST_PACKAGE_DIR,
     runtime_bin: str | None = None,
+    use_source_host: bool | None = None,
+    companion_module: Any | None = None,
 ) -> RendererBackendAvailability:
-    """Check whether the local Bun/OpenTUI host can be launched."""
-
-    if os.name == "nt":
-        return RendererBackendAvailability(
-            available=False,
-            reason="OpenTUI file-descriptor bridge is not supported on Windows yet",
-        )
-
-    if runtime_bin:
-        # Validate a caller-supplied runtime the same way the default is probed,
-        # so a bogus binary surfaces here as an actionable reason instead of a
-        # raw FileNotFoundError out of the spawn.
-        if not shutil.which(runtime_bin):
-            return RendererBackendAvailability(
-                available=False,
-                reason=f"OpenTUI host runtime is not executable: {runtime_bin}",
-            )
-    elif not shutil.which("bun"):
-        return RendererBackendAvailability(
-            available=False,
-            reason="Bun is not installed or is not on PATH",
-        )
-
+    """Check whether an exact companion or explicit source host can launch."""
     paths = OpenTuiHostPaths(package_dir=package_dir)
-    if not paths.opentui_core_dir.exists():
+    resolver = HostArtifactResolver(
+        package_dir=paths.package_dir,
+        main_script=paths.main_script,
+        runtime_bin=runtime_bin,
+        use_source_host=(source_host_requested() if use_source_host is None else use_source_host),
+        companion_module=companion_module,
+    )
+    try:
+        resolver.resolve()
+    except HostRuntimeError as exc:
+        try:
+            reason_code = RendererBackendUnavailableReason(exc.reason.value)
+        except ValueError:
+            # Keep a future host-runtime failure additive: an older core may
+            # still explain the failure without crashing its auto fallback.
+            reason_code = RendererBackendUnavailableReason.UNKNOWN
         return RendererBackendAvailability(
             available=False,
-            reason=(
-                "OpenTUI host dependency @opentui/core is not installed. "
-                f"Run: bun install --cwd {package_dir}"
-            ),
-        )
-    if not paths.main_script.exists():
-        return RendererBackendAvailability(
-            available=False,
-            reason=f"OpenTUI host entrypoint is missing: {paths.main_script}",
+            reason=str(exc),
+            reason_code=reason_code,
         )
     return RendererBackendAvailability(available=True)
 
 
 class OpenTuiBridge:
-    """fd-based JSON-line IPC bridge to the Bun/OpenTUI footer host."""
+    """Authenticated loopback JSON-line bridge to the OpenTUI footer host."""
 
     def __init__(
         self,
@@ -124,100 +172,90 @@ class OpenTuiBridge:
         package_dir: Path = DEFAULT_HOST_PACKAGE_DIR,
         env: Mapping[str, str] | None = None,
         ready_timeout: float = DEFAULT_READY_TIMEOUT_SECONDS,
+        connection: HostConnection | None = None,
+        process_controller: HostProcessController | None = None,
+        artifact_resolver: HostArtifactResolver | None = None,
+        use_source_host: bool | None = None,
     ) -> None:
-        # No literal fallback here: when Bun is missing this stays None so
-        # start()'s availability check reports the friendly reason instead of
-        # the spawn failing with a raw FileNotFoundError.
-        self.runtime_bin = runtime_bin or shutil.which("bun")
+        # Supplying a runtime is an explicit source-host developer override.
+        # Normal installs leave this unset and resolve the packaged companion.
+        self.runtime_bin = runtime_bin
         self.paths = OpenTuiHostPaths(package_dir=package_dir)
         self.env = dict(env or {})
         self.ready_timeout = ready_timeout
+        self._connection = connection
+        self._process_controller = process_controller or HostProcessController()
+        self._artifact_resolver = artifact_resolver
+        self._use_source_host = use_source_host
+        self._terminal_guardian = create_terminal_guardian()
+        self._host_artifact: HostArtifact | None = None
         self._process: asyncio.subprocess.Process | None = None
-        self._to_host_file: Any | None = None
-        self._from_host_file: Any | None = None
         self._stderr_lines: deque[str] = deque(maxlen=50)
         self._stderr_task: asyncio.Task[None] | None = None
         self._closing = False
         self._write_queue: asyncio.Queue[str | None] | None = None
         self._writer_task: asyncio.Task[None] | None = None
         self._write_error: OpenTuiBridgeError | None = None
-        self._tty_fd: int | None = None
-        self._saved_termios: list[Any] | None = None
-        self._terminal_restored = False
 
     async def start(self) -> None:
-        runtime_bin = self.runtime_bin or shutil.which("bun")
-        availability = check_opentui_host_available(
+        resolver = self._artifact_resolver or HostArtifactResolver(
             package_dir=self.paths.package_dir,
-            runtime_bin=runtime_bin,
+            main_script=self.paths.main_script,
+            runtime_bin=self.runtime_bin,
+            use_source_host=(
+                source_host_requested() if self._use_source_host is None else self._use_source_host
+            ),
         )
-        if runtime_bin is None or not availability.available:
-            raise OpenTuiBridgeError(availability.reason or "OpenTUI host unavailable")
+        try:
+            artifact = resolver.resolve()
+        except HostRuntimeError as exc:
+            raise OpenTuiBridgeError(str(exc), reason=exc.reason) from exc
+        self._host_artifact = artifact
 
-        to_host_read, to_host_write = os.pipe()
-        from_host_read, from_host_write = os.pipe()
-        for fd in (to_host_read, from_host_write):
-            os.set_inheritable(fd, True)
-        for fd in (to_host_write, from_host_read):
-            os.set_inheritable(fd, False)
+        connection = self._connection or HostConnection(auth_timeout=self.ready_timeout)
+        self._connection = connection
+        try:
+            await connection.listen()
+        except HostRuntimeError as exc:
+            raise OpenTuiBridgeError(str(exc), reason=exc.reason) from exc
 
         env = os.environ.copy()
         env.update(self.env)
-        env["OPENSQUILLA_OPENTUI_FROM_PYTHON_FD"] = str(to_host_read)
-        env["OPENSQUILLA_OPENTUI_TO_PYTHON_FD"] = str(from_host_write)
+        apply_theme_preference_env(env)
+        env.update(connection.environment)
+        env["OPENSQUILLA_PRODUCT_VERSION"] = __version__
+        env["OPENSQUILLA_OPENTUI_HOST_VERSION"] = artifact.host_version
+        env["OPENSQUILLA_OPENTUI_BUILD_ID"] = artifact.build_id
+        env["OPENSQUILLA_OPENTUI_HOST_PLATFORM"] = artifact.platform
+        env["OPENSQUILLA_OPENTUI_HOST_ARCH"] = artifact.arch
 
         # The host owns the shared tty (raw mode, alternate screen, mouse
-        # tracking). Snapshot the current termios now so an abnormal host death
-        # can restore a usable shell.
+        # tracking). Snapshot termios now so an abnormal host death can restore
+        # a usable shell.
         self._save_terminal_state()
 
         try:
-            self._process = await asyncio.create_subprocess_exec(
-                runtime_bin,
-                str(self.paths.main_script),
-                cwd=str(self.paths.package_dir),
-                env=env,
-                pass_fds=(to_host_read, from_host_write),
-                stderr=asyncio.subprocess.PIPE,
-            )
-        except FileNotFoundError as exc:
-            _close_fds(to_host_read, to_host_write, from_host_read, from_host_write)
-            raise OpenTuiBridgeError(
-                f"OpenTUI host runtime is not executable: {runtime_bin}"
-            ) from exc
-        except Exception:
-            _close_fds(to_host_read, to_host_write, from_host_read, from_host_write)
+            self._process = await self._process_controller.spawn(artifact, env=env)
+        except HostRuntimeError as exc:
+            await connection.close()
+            self._connection = None
+            raise OpenTuiBridgeError(str(exc), reason=exc.reason) from exc
+
+        # Capture stderr immediately so a process that fails before opening the
+        # socket still yields an actionable crash reason.
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
+        self._log_host_version(artifact)
+        try:
+            await self._wait_for_host_connection(connection)
+        except BaseException:
+            await self.close()
             raise
 
-        os.close(to_host_read)
-        os.close(from_host_write)
-        # errors="backslashreplace" so a lone surrogate (e.g. a surrogateescape-
-        # decoded non-UTF-8 filename flowing into completion items) never raises
-        # a hard UnicodeEncodeError mid-write; the host sees an escaped byte
-        # instead of the session tearing down.
-        self._to_host_file = os.fdopen(
-            to_host_write, "w", encoding="utf-8", errors="backslashreplace", buffering=1
-        )
-        # errors="replace" so a corrupted byte from the host never raises a hard
-        # UnicodeDecodeError mid-read; the line is still delivered (and skipped if
-        # it no longer parses) instead of tearing down the UI.
-        self._from_host_file = os.fdopen(from_host_read, "r", encoding="utf-8", errors="replace")
         # All frames go through a single queue-draining writer task: send stays
         # non-blocking on the event loop even when the host stops reading and
-        # the pipe fills, and the one queue preserves global frame order.
+        # the socket fills, and the one queue preserves global frame order.
         self._write_queue = asyncio.Queue(maxsize=_WRITE_QUEUE_MAX_FRAMES)
         self._writer_task = asyncio.create_task(self._drain_writes())
-        # Capture the host's stderr so a crash leaves a diagnosable reason instead
-        # of corrupting the terminal or vanishing. Draining it also keeps the
-        # child from blocking on a full stderr pipe.
-        self._stderr_task = asyncio.create_task(self._drain_stderr())
-
-        # Record which main.mjs this Bun host actually loaded. A stale, still-running
-        # host keeps serving the JS it spawned with, so a "fixed" frontend can look
-        # broken until the old process is killed. Logging the script's mtime + the
-        # child PID at spawn makes "old process running old code" diagnosable: compare
-        # the logged mtime against the source file's current mtime.
-        self._log_host_version()
 
         try:
             message = await asyncio.wait_for(self.next_message(), timeout=self.ready_timeout)
@@ -225,21 +263,67 @@ class OpenTuiBridge:
             detail = await self._stderr_tail()
             await self.close()
             reason = f"OpenTUI host did not become ready within {self.ready_timeout:.1f}s"
-            raise OpenTuiBridgeError(f"{reason} ({detail})" if detail else reason) from None
+            raise OpenTuiBridgeError(
+                f"{reason} ({detail})" if detail else reason,
+                reason=HostFailureReason.READY_TIMEOUT,
+            ) from None
         except BaseException:
             # next_message already surfaces a crash reason (incl. captured stderr);
             # make sure we never leak the child process or stderr drain task.
             await self.close()
             raise
         if isinstance(message, HostReady):
+            mismatches = _host_handshake_mismatches(artifact, message)
+            if mismatches:
+                await self.close()
+                raise OpenTuiBridgeError(
+                    "OpenTUI host handshake mismatch: " + "; ".join(mismatches),
+                    reason=HostFailureReason.VERSION_MISMATCH,
+                )
             return
         await self.close()
         if isinstance(message, HostError):
-            raise OpenTuiBridgeError(message.message)
-        raise OpenTuiBridgeError(f"OpenTUI host did not become ready: {message!r}")
+            raise OpenTuiBridgeError(message.message, reason=HostFailureReason.TRANSPORT)
+        raise OpenTuiBridgeError(
+            f"OpenTUI host did not become ready: {message!r}",
+            reason=HostFailureReason.TRANSPORT,
+        )
 
-    def _log_host_version(self) -> None:
-        script = self.paths.main_script
+    async def _wait_for_host_connection(self, connection: HostConnection) -> None:
+        """Wait for either an authenticated socket or an early process exit."""
+        process = self._process
+        if process is None:
+            raise OpenTuiBridgeError(
+                "OpenTUI host process is not started",
+                reason=HostFailureReason.SPAWN,
+            )
+        connect_task = asyncio.create_task(connection.wait_for_client(timeout=self.ready_timeout))
+        process_task = asyncio.create_task(process.wait())
+        done, _pending = await asyncio.wait(
+            {connect_task, process_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if connect_task in done:
+            process_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await process_task
+            try:
+                await connect_task
+            except HostRuntimeError as exc:
+                raise OpenTuiBridgeError(str(exc), reason=exc.reason) from exc
+            return
+        connect_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await connect_task
+        await process_task
+        detail = await self._stderr_tail()
+        returncode = process.returncode
+        message = f"OpenTUI host exited with code {returncode}"
+        if detail:
+            message = f"{message}: {detail}"
+        raise OpenTuiBridgeError(message, reason=HostFailureReason.RUNTIME_CRASH)
+
+    def _log_host_version(self, artifact: HostArtifact) -> None:
+        script = artifact.main_script or Path(artifact.command[0])
         try:
             mtime = script.stat().st_mtime
             mtime_iso = datetime.fromtimestamp(mtime, tz=UTC).isoformat()
@@ -251,44 +335,43 @@ class OpenTuiBridge:
             main_script=str(script),
             main_script_mtime=mtime_iso,
             host_pid=pid,
+            host_source=artifact.source,
+            host_version=artifact.host_version,
+            host_build_id=artifact.build_id,
+            screen_mode=OPENTUI_SCREEN_MODE,
         )
 
     async def send(self, message_type: str, payload: object | None = None) -> None:
         self.send_nowait(message_type, payload)
 
     def send_nowait(self, message_type: str, payload: object | None = None) -> None:
-        if self._to_host_file is None:
-            raise OpenTuiBridgeError("OpenTUI bridge is not started")
+        if self._connection is None:
+            raise OpenTuiBridgeError(
+                "OpenTUI bridge is not started",
+                reason=HostFailureReason.TRANSPORT,
+            )
         if self._write_error is not None:
-            raise OpenTuiBridgeError("OpenTUI host IPC write failed") from self._write_error
+            raise OpenTuiBridgeError(
+                "OpenTUI host IPC write failed",
+                reason=HostFailureReason.TRANSPORT,
+            ) from self._write_error
         frame = python_message_to_json(message_type, payload)
         queue = self._write_queue
         writer = self._writer_task
         if queue is None or writer is None or writer.done():
-            # No writer task (bridge wired up without start(), or already
-            # draining down): fall back to a direct synchronous write.
-            self._write_frame_blocking(frame)
-            return
+            raise OpenTuiBridgeError(
+                "OpenTUI bridge writer is not running",
+                reason=HostFailureReason.TRANSPORT,
+            )
         # Enqueueing synchronously (no await point) keeps frame order exactly
         # equal to call order, even for fire-and-forget sender tasks.
         try:
             queue.put_nowait(frame)
         except asyncio.QueueFull:
             raise OpenTuiBridgeError(
-                "OpenTUI host stopped reading IPC frames (write queue overflow)"
+                "OpenTUI host stopped reading IPC frames (write queue overflow)",
+                reason=HostFailureReason.TRANSPORT,
             ) from None
-
-    def _write_frame_blocking(self, frame: str) -> None:
-        file = self._to_host_file
-        if file is None:
-            raise OpenTuiBridgeError("OpenTUI bridge is not started")
-        try:
-            file.write(frame)
-            file.flush()
-        except (OSError, ValueError) as exc:
-            # ValueError covers writes on a closed file and any residual
-            # UnicodeError the backslashreplace pipe encoding does not absorb.
-            raise OpenTuiBridgeError("OpenTUI host IPC write failed") from exc
 
     async def _drain_writes(self) -> None:
         """Writer task: drain queued frames to the host off the event loop."""
@@ -301,11 +384,19 @@ class OpenTuiBridge:
                 if frame is None:
                     return
                 try:
-                    await asyncio.to_thread(self._write_frame_blocking, frame)
-                except OpenTuiBridgeError as exc:
+                    connection = self._connection
+                    if connection is None:
+                        raise OpenTuiBridgeError(
+                            "OpenTUI bridge is not started",
+                            reason=HostFailureReason.TRANSPORT,
+                        )
+                    await connection.send_frame(frame)
+                except (OpenTuiBridgeError, HostRuntimeError) as exc:
                     # Remember the failure so the next send raises it; frames
-                    # still queued are undeliverable and dropped with the pipe.
-                    self._write_error = exc
+                    # still queued are undeliverable and dropped with the socket.
+                    self._write_error = OpenTuiBridgeError(
+                        str(exc), reason=HostFailureReason.TRANSPORT
+                    )
                     return
             finally:
                 queue.task_done()
@@ -322,11 +413,18 @@ class OpenTuiBridge:
             await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
 
     async def next_message(self) -> HostToPythonMessage | None:
-        if self._from_host_file is None:
-            raise OpenTuiBridgeError("OpenTUI bridge is not started")
+        connection = self._connection
+        if connection is None:
+            raise OpenTuiBridgeError(
+                "OpenTUI bridge is not started",
+                reason=HostFailureReason.TRANSPORT,
+            )
         malformed = 0
         while True:
-            line = await asyncio.to_thread(self._from_host_file.readline)
+            try:
+                line = await connection.readline()
+            except HostRuntimeError as exc:
+                raise OpenTuiBridgeError(str(exc), reason=exc.reason) from exc
             if line == "":
                 await self._raise_if_host_crashed()
                 return None
@@ -388,12 +486,12 @@ class OpenTuiBridge:
         message = f"OpenTUI host exited with code {returncode}"
         if detail:
             message = f"{message}: {detail}"
-        raise OpenTuiBridgeError(message)
+        raise OpenTuiBridgeError(message, reason=HostFailureReason.RUNTIME_CRASH)
 
     async def close(self) -> None:
         self._closing = True
         process = self._process
-        if self._to_host_file is not None:
+        if self._connection is not None:
             with suppress(Exception):
                 self.send_nowait("shutdown")
             # Deliver everything still queued (including the shutdown frame) so
@@ -402,19 +500,8 @@ class OpenTuiBridge:
         if process is not None and process.returncode is None:
             with suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(process.wait(), timeout=0.5)
-        # Terminate the child BEFORE closing the pipe files. A blocked reader
-        # (or writer) thread holds the file's internal lock while parked in the
-        # pipe syscall, so file.close() would deadlock the event loop until the
-        # host produced data; killing the child first EOF/EPIPEs the pipes and
-        # releases those threads.
         if process is not None and process.returncode is None:
-            with suppress(ProcessLookupError):
-                process.send_signal(signal.SIGTERM)
-            with suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(process.wait(), timeout=1.0)
-            if process.returncode is None:
-                process.kill()
-                await process.wait()
+            await self._process_controller.stop(process)
         writer_task = self._writer_task
         if writer_task is not None:
             if not writer_task.done():
@@ -423,14 +510,10 @@ class OpenTuiBridge:
                 await writer_task
             self._writer_task = None
         self._write_queue = None
-        if self._to_host_file is not None:
-            with suppress(Exception):
-                self._to_host_file.close()
-            self._to_host_file = None
-        if self._from_host_file is not None:
-            with suppress(Exception):
-                self._from_host_file.close()
-            self._from_host_file = None
+        connection = self._connection
+        if connection is not None:
+            await connection.close()
+            self._connection = None
         stderr_task = self._stderr_task
         if stderr_task is not None:
             stderr_task.cancel()
@@ -442,54 +525,17 @@ class OpenTuiBridge:
             # terminal it owned. A clean exit (0) already restored it.
             self._restore_terminal()
         self._process = None
+        self._host_artifact = None
 
     def _save_terminal_state(self) -> None:
-        self._terminal_restored = False
-        self._tty_fd = None
-        self._saved_termios = None
-        fd = _controlling_tty_fd()
-        if fd is None:
-            return
-        self._tty_fd = fd
-        if termios is None:
-            return
-        with suppress(Exception):
-            self._saved_termios = termios.tcgetattr(fd)
+        self._terminal_guardian.capture()
 
     def _restore_terminal(self) -> None:
         """Best-effort tty reset after the host died without its own teardown."""
-        if self._terminal_restored:
-            return
-        self._terminal_restored = True
-        fd = self._tty_fd
-        if fd is None:
-            return
-        if termios is not None and self._saved_termios is not None:
-            with suppress(Exception):
-                termios.tcsetattr(fd, termios.TCSADRAIN, self._saved_termios)
-        with suppress(Exception):
-            os.write(fd, _TERMINAL_RESET_SEQUENCE)
+        self._terminal_guardian.restore()
 
     async def write_scrollback(self, payload: str) -> None:
         await self.send("scrollback.write", ScrollbackWrite(text=payload))
-
-
-def _close_fds(*fds: int) -> None:
-    for fd in fds:
-        with suppress(OSError):
-            os.close(fd)
-
-
-def _controlling_tty_fd() -> int | None:
-    """Locate a tty fd shared with the host, or None when not on a terminal."""
-    for stream in (sys.stdout, sys.stderr, sys.stdin):
-        try:
-            fd = stream.fileno()
-        except (AttributeError, OSError, ValueError):
-            continue
-        if os.isatty(fd):
-            return fd
-    return None
 
 
 @dataclass
@@ -509,6 +555,10 @@ class OpenTuiReplayRenderer:
         else:
             self.buffer += delta
         self.flush_count += 1
+
+    async def areconcile_final_text(self, text: str) -> None:
+        self.buffer = text
+        self.intermediate_buffer = ""
 
     async def aappend_reasoning(self, delta: str) -> None:
         self.reasoning_buffer += delta

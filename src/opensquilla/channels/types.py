@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Protocol, runtime_checkable
+from enum import StrEnum
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
 
@@ -34,6 +35,60 @@ class Attachment(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class IngressVerification(StrEnum):
+    """How a channel adapter authenticated an inbound event.
+
+    ``LEGACY_UNVERIFIED`` is deliberately the default so existing adapters do
+    not accidentally acquire trusted status simply by constructing an
+    :class:`IncomingMessage`. Adapters may opt into a stronger value only
+    after completing the corresponding provider verification step.
+    """
+
+    LEGACY_UNVERIFIED = "legacy_unverified"
+    WEBHOOK_SIGNATURE = "webhook_signature"
+    WEBHOOK_TOKEN = "webhook_token"
+    SDK_SESSION = "sdk_session"
+    OAUTH_TOKEN = "oauth_token"
+    INTERNAL = "internal"
+
+
+@dataclass(frozen=True, slots=True)
+class AuthenticatedPrincipal:
+    """Immutable provider identity established by an authenticated transport."""
+
+    subject_id: str
+    kind: Literal["user", "bot", "system", "unknown"] = "user"
+    display_name: str | None = None
+    tenant_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class IngressProvenance:
+    """Immutable authentication and replay identity for an inbound event.
+
+    Empty fields preserve compatibility with adapters that have not yet
+    adopted the authenticated-ingress contract. Such messages remain usable,
+    but are explicitly represented as legacy and unverified.
+    """
+
+    provider: str = ""
+    account_id: str = ""
+    transport: str = "legacy"
+    verification: IngressVerification = IngressVerification.LEGACY_UNVERIFIED
+    event_id: str | None = None
+    principal: AuthenticatedPrincipal | None = None
+
+    @property
+    def authenticated(self) -> bool:
+        """Whether both a verified transport and provider principal exist."""
+
+        return (
+            self.verification != IngressVerification.LEGACY_UNVERIFIED
+            and self.principal is not None
+            and bool(self.principal.subject_id)
+        )
+
+
 class IncomingMessage(BaseModel):
     """Normalized inbound message from any channel.
 
@@ -53,16 +108,17 @@ class IncomingMessage(BaseModel):
     sender_id: str
     channel_id: str
     content: str
-    attachments: list[Attachment] = []
-    metadata: dict[str, Any] = {}
+    attachments: list[Attachment] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    provenance: IngressProvenance = Field(default_factory=IngressProvenance)
 
 
 class OutgoingMessage(BaseModel):
     """Normalized outbound message to any channel."""
 
     content: str
-    attachments: list[Attachment] = []
-    metadata: dict[str, Any] = {}
+    attachments: list[Attachment] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
     reply_to: str | None = None
 
 

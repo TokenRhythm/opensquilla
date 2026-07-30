@@ -10,8 +10,7 @@ It covers:
   agent runtime to invoke them and is documented here for transparency.
 - The local SquillaRouter V4 Phase 3 model bundle under
   `src/opensquilla/squilla_router/models/v4.2_phase3_inference/`.
-- Static frontend vendor assets and fonts distributed with the gateway Control
-  UI and generated Web UI assets.
+- Web UI runtime dependencies, bundled fonts, and generated Control UI assets.
 - The Web UI "Arctic" theme color palette, adapted from the Nord palette under
   the MIT license; see the dedicated section below.
 - The built-in tokenjuice tool-result projection backend and bundled
@@ -20,31 +19,100 @@ It covers:
   reference material; the MIT notice is reproduced below for conservative
   attribution.
 
-## Static frontend vendor assets and fonts
+## Web UI dependencies and bundled fonts
 
-OpenSquilla distributes a built Control UI and selected static assets in the
-gateway package. These assets are used for markdown rendering, math rendering,
-syntax highlighting, sanitization, and local typography. They are not
-proprietary components.
+OpenSquilla builds the Vue Control UI from npm dependencies and locally bundled
+fonts. Release artifacts contain the generated browser assets under
+`src/opensquilla/gateway/static/dist/`; the dependency sources and exact
+resolved versions are recorded by `opensquilla-webui/package.json` and
+`opensquilla-webui/package-lock.json`.
 
 | Component | Distributed files | License and attribution |
 |---|---|---|
-| KaTeX | `src/opensquilla/gateway/static/vendor/katex.min.js`, `src/opensquilla/gateway/static/vendor/katex.min.css`, generated `KaTeX_*` font files under `src/opensquilla/gateway/static/dist/assets/fonts/` | MIT. Copyright (c) 2013-2020 Khan Academy and other contributors. |
-| PrismJS | `src/opensquilla/gateway/static/vendor/prism-core.min.js`, `prism-autoloader.min.js`, and `prism-langs/*.min.js` | MIT. Copyright (c) 2012 Lea Verou. |
-| marked | `src/opensquilla/gateway/static/vendor/marked.min.js` | MIT. Copyright (c) 2011-2025, Christopher Jeffrey. |
-| DOMPurify | `src/opensquilla/gateway/static/vendor/purify.min.js` | MPL-2.0 OR Apache-2.0. OpenSquilla distributes this asset under the Apache-2.0 option. Copyright belongs to Cure53 and other contributors. |
+| Vue.js (`vue`, `@vue/reactivity`, `@vue/runtime-core`, `@vue/runtime-dom`, `@vue/shared`) | Vue runtime in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2018-present, Yuxi (Evan) You. |
+| Pinia (`pinia`) | State-management runtime in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2019-present Eduardo San Martin Morote. |
+| Vue Router (`vue-router`) | Client-side routing runtime in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2019-present Eduardo San Martin Morote. |
+| Vue I18n (`vue-i18n`, `@intlify/core-base`, `@intlify/message-compiler`, `@intlify/shared`) | Localization runtime in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2020 kazuya kawaguchi. |
+| html-to-image (`html-to-image`) | Image-export runtime in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2017-2025 W.Y. |
+| KaTeX (`katex`) | npm dependency used by `opensquilla-webui/src/composables/chat/useChatTextRendering.ts`; generated JavaScript, CSS, and `KaTeX_*` fonts under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2013-2020 Khan Academy and other contributors. |
+| marked (`marked`) | npm dependency used by `opensquilla-webui/src/composables/chat/useChatTextRendering.ts`; generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2018+, MarkedJS and Copyright (c) 2011-2018, Christopher Jeffrey. The bundled Markdown-derived portion carries the John Gruber notice reproduced below. |
+| DOMPurify (`dompurify`) | npm dependency used by `opensquilla-webui/src/composables/chat/useChatTextRendering.ts`; generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MPL-2.0 OR Apache-2.0. OpenSquilla distributes this component under the Apache-2.0 option. Copyright belongs to Cure53 and other contributors. |
+| highlight.js (`highlight.js`) | npm dependency used by `opensquilla-webui/src/composables/chat/useChatTextRendering.ts`; generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | BSD-3-Clause. Copyright (c) 2006, Ivan Sagalaev. |
 | IBM Plex Sans and IBM Plex Mono | `opensquilla-webui/src/assets/fonts/ibm-plex-*.woff2` and generated Web UI font assets | SIL Open Font License 1.1. Copyright 2017 IBM Corp. with Reserved Font Name "Plex". |
 | Space Grotesk | `opensquilla-webui/src/assets/fonts/space-grotesk-*.woff2` and generated Web UI font assets | SIL Open Font License 1.1. Copyright 2020 The Space Grotesk Project Authors. |
-| Inter | `src/opensquilla/gateway/static/fonts/Inter-Variable.woff2` | SIL Open Font License 1.1. Copyright (c) 2016 The Inter Project Authors. |
-| JetBrains Mono | `src/opensquilla/gateway/static/fonts/JetBrainsMono-Variable.woff2` | SIL Open Font License 1.1. Copyright 2020 The JetBrains Mono Project Authors. |
+| Fraunces | `opensquilla-webui/src/themes/out-of-register/fonts/fraunces-*.woff2` and generated Web UI font assets | SIL Open Font License 1.1. Copyright 2020 The Fraunces Project Authors (https://github.com/undercasetype/Fraunces). |
+| Newsreader | `opensquilla-webui/src/themes/out-of-register/fonts/newsreader-*.woff2` and generated Web UI font assets | SIL Open Font License 1.1. Copyright 2020 The Newsreader Project Authors. |
 
-Current static vendor files are audited as distributed assets. Some manually
-vendored files intentionally record their own upstream version in-file; for
-example, the static `marked.min.js` header identifies marked 15.0.7,
-`purify.min.js` identifies DOMPurify 3.2.5, and `katex.min.css` identifies
-KaTeX 0.16.21. The Web UI npm lockfile may contain newer build-time dependency
-versions. Future updates should either regenerate these files from npm or
-record the exact vendored source and version here.
+The Web UI lockfile is the version authority for these dependencies. The build
+pipeline regenerates the browser bundle from that lockfile; no separate
+hand-maintained copies of these libraries are shipped by the gateway.
+
+### marked Markdown notice
+
+```text
+Copyright (c) 2004, John Gruber
+http://daringfireball.net/
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice,
+  this list of conditions and the following disclaimer.
+* Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+* Neither the name "Markdown" nor the names of its contributors may be used to
+  endorse or promote products derived from this software without specific
+  prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+```
+
+### highlight.js BSD-3-Clause license
+
+```text
+BSD 3-Clause License
+
+Copyright (c) 2006, Ivan Sagalaev.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors
+   may be used to endorse or promote products derived from this software
+   without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+```
 
 ## Feather Icons
 

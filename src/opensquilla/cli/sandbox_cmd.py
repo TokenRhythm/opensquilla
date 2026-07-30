@@ -81,14 +81,22 @@ def sandbox_status(
 def sandbox_bypass(
     config_path: Path | None = typer.Option(None, "--config"),
 ) -> None:
-    """Removed legacy command."""
+    """Use Full Host Access for owner calls while retaining sandbox capability."""
 
+    target = _resolve_path(config_path)
+    config = load_config(target)
+    capability = run_mode_config_patch(RunMode.STANDARD)
+    config.sandbox.run_mode = None
+    config.sandbox.sandbox = capability.sandbox
+    config.sandbox.security_grading = capability.security_grading
+    config.sandbox.network_default = capability.network_default
+    config.permissions.default_mode = "bypass"
+    persist_config(config, path=target, restart_required=True)
+    payload = _status_payload(config, restart_required=True)
     typer.echo(
-        "`sandbox bypass` was removed because it used to disable sandboxing.\n"
-        "Use `opensquilla sandbox trust` to stay sandboxed with fewer prompts,\n"
-        "or `opensquilla sandbox full` for full host access."
+        "Sandbox run mode set to "
+        f"{payload['run_mode_label']}. Restart the gateway for running processes to apply it."
     )
-    raise typer.Exit(1)
 
 
 @sandbox_app.command("full")
@@ -124,4 +132,4 @@ def sandbox_reset(
 ) -> None:
     """Reset sandbox posture to OpenSquilla defaults."""
 
-    _write_run_mode(config_path, RunMode.FULL)
+    sandbox_bypass(config_path)

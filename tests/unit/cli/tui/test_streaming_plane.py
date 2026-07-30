@@ -9,6 +9,7 @@ from opensquilla.cli.chat.turn_stream import (
     TurnStreamDependencies,
     handle_image_command_turnrunner,
     stream_response_gateway,
+    stream_response_turnrunner,
 )
 from opensquilla.cli.tui.backend.domain_events import (
     KIND_DONE,
@@ -326,3 +327,113 @@ def test_image_command_turnrunner_uses_tui_streaming_plane_and_events(
     assert sum(1 for event in events if event.kind == KIND_TEXT_FLUSH) == len(
         renderer.append_calls
     )
+
+
+def test_gateway_done_snapshot_replaces_streamed_preview() -> None:
+    renderer_factory = _RendererFactory()
+    deps = TurnStreamDependencies(
+        renderer_factory=renderer_factory,
+        stream_wrapper=lambda stream, _svc: stream,
+        approval_handler=lambda *_args, **_kwargs: asyncio.sleep(0),
+        cancel_clearer=lambda: None,
+        image_attachment_builder=lambda _command: ("", []),
+        output_console=object(),
+        error_panel_factory=lambda message: message,
+    )
+
+    result = asyncio.run(
+        stream_response_gateway(
+            _FakeGatewayClient(
+                [
+                    {"event": "session.event.text_delta", "text": "stale"},
+                    {
+                        "event": "session.event.done",
+                        "text": "canonical",
+                        "text_snapshot": "canonical",
+                    },
+                ]
+            ),
+            "session-1",
+            "hello",
+            deps=deps,
+        )
+    )
+
+    assert result.text == "canonical"
+    assert renderer_factory.created[0].buffer == "canonical"
+
+
+def test_local_done_snapshot_can_authoritatively_clear_streamed_preview(
+    monkeypatch,
+) -> None:
+    events = [
+        TextDeltaEvent(text="stale"),
+        DoneEvent(text="", text_snapshot=""),
+    ]
+    turn_runner = _ImageTurnRunner(events)
+    monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", _ImageTurnRunner)
+    renderer_factory = _RendererFactory()
+    deps = TurnStreamDependencies(
+        renderer_factory=renderer_factory,
+        stream_wrapper=lambda stream, _svc: stream,
+        approval_handler=lambda *_args, **_kwargs: asyncio.sleep(0),
+        cancel_clearer=lambda: None,
+        image_attachment_builder=lambda _command: ("", []),
+        output_console=object(),
+        error_panel_factory=lambda message: message,
+    )
+    tool_ctx = ToolContext(
+        caller_kind=CallerKind.CLI,
+        channel_kind="cli",
+        channel_id="cli:chat",
+    )
+
+    result = asyncio.run(
+        stream_response_turnrunner(
+            turn_runner,
+            "agent:main:test",
+            tool_ctx,
+            "hello",
+            deps=deps,
+        )
+    )
+
+    assert result.text == ""
+    assert renderer_factory.created[0].buffer == ""
+
+
+def test_image_done_snapshot_replaces_streamed_preview(monkeypatch) -> None:
+    events = [
+        TextDeltaEvent(text="stale"),
+        DoneEvent(text="canonical", text_snapshot="canonical"),
+    ]
+    turn_runner = _ImageTurnRunner(events)
+    monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", _ImageTurnRunner)
+    renderer_factory = _RendererFactory()
+    deps = TurnStreamDependencies(
+        renderer_factory=renderer_factory,
+        stream_wrapper=lambda stream, _svc: stream,
+        approval_handler=lambda *_args, **_kwargs: asyncio.sleep(0),
+        cancel_clearer=lambda: None,
+        image_attachment_builder=lambda _command: ("describe image", []),
+        output_console=object(),
+        error_panel_factory=lambda message: message,
+    )
+    tool_ctx = ToolContext(
+        caller_kind=CallerKind.CLI,
+        channel_kind="cli",
+        channel_id="cli:chat",
+    )
+
+    result = asyncio.run(
+        handle_image_command_turnrunner(
+            turn_runner,
+            "agent:main:image",
+            tool_ctx,
+            "/image /tmp/image.png",
+            deps=deps,
+        )
+    )
+
+    assert result.text == "canonical"
+    assert renderer_factory.created[0].buffer == "canonical"

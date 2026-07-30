@@ -30,6 +30,53 @@ Create a one-page HTML dashboard from this data and publish it as an artifact.
 Generate a PDF briefing with sources and publish the final file.
 ```
 
+### HTML projects and webpage preview
+
+`publish_artifact` can preserve a generated HTML project instead of publishing
+only its entry file:
+
+```text
+publish_artifact(
+  path="site/index.html",
+  bundle="directory",
+  bundle_root="site",
+)
+```
+
+- `bundle="auto"` (the default) follows statically identifiable local
+  references from HTML, CSS, and JavaScript. Missing or rejected references are
+  reported as a partial bundle.
+- `bundle="directory"` snapshots the complete dedicated project directory and
+  fails atomically if it contains a rejected path or sensitive file.
+- `bundle="none"` preserves the legacy single-file behavior.
+
+Historical single-file HTML remains readable without migration. If it refers
+to local CSS, scripts, or other files that were never stored, the preview is
+reported as partial instead of silently claiming that every resource loaded.
+
+Generated web projects should use a dedicated subdirectory and `directory`
+mode. Bundles are static sites: OpenSquilla does not start Vite, webpack, HMR,
+or a project backend for them. Open an already-running development server in
+the Desktop side browser when the project needs those services.
+
+Desktop and a loopback Web UI default to a full-network preview. This runs the
+page in a temporary, isolated browser context: normal browser JavaScript,
+modules, workers, WebAssembly, WebGL, fonts, media, HTTP(S), WebSocket, and
+page-level CORS/CSP rules still apply, but the page receives no OpenSquilla
+credentials, Node/Electron APIs, host files, or system-browser login state.
+Desktop offline mode keeps JavaScript enabled while restricting network access
+to the artifact itself, including blocking WebRTC/TURN/STUN and speculative
+DNS. A browser-hosted offline preview cannot enforce that all-protocol boundary
+against arbitrary page JavaScript. It therefore runs bundle scripts in an
+opaque sandbox with a restrictive response policy; external network access is
+blocked, while workers, service workers, persistent storage, and root-absolute
+paths are not guaranteed. A Web UI reached from another machine is always
+forced to this visibly limited offline preview.
+
+Set `OPENSQUILLA_PREVIEW_FORCE_OFFLINE=1` before starting the Desktop app or
+gateway to disable full-network artifact previews as an incident-response
+measure.
+
 ## When to Use Artifacts Instead of Chat
 
 Use artifacts for:
@@ -76,6 +123,11 @@ Configure image generation:
 ```sh
 opensquilla configure image-generation
 ```
+
+Supported built-in image providers include OpenAI Images, OpenRouter Images,
+and Qwen Token Plan (`wan2.7-image` / `wan2.7-image-pro`). Token Plan uses
+`QWEN_TOKEN_PLAN_API_KEY`; its image-generation provider is distinct from the
+Qwen model used to analyze image inputs.
 
 Then ask for images in chat:
 

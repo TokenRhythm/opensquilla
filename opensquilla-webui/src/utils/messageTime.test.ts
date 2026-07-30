@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { absoluteTime, fullTime, isoTime, messageDate, relativeTime } from './messageTime'
+import {
+  absoluteTime,
+  fullTime,
+  isoTime,
+  localizedRelativeTime,
+  messageDate,
+  relativeTime,
+} from './messageTime'
 
 const MS_2026 = Date.UTC(2026, 5, 23, 4, 10, 23) // 1750648223000, well above 1e12
 
@@ -42,7 +49,9 @@ describe('relativeTime', () => {
     expect(relativeTime(now - 5_000, now)).toBe('just now')
     expect(relativeTime(now - 5 * 60_000, now)).toBe('5m ago')
     expect(relativeTime(now - 2 * 3_600_000, now)).toBe('2h ago')
-    expect(relativeTime(now - 3 * 86_400_000, now)).toBe('3d ago')
+    expect(relativeTime(now - 23 * 3_600_000, now)).toBe('23h ago')
+    expect(relativeTime(now - 86_400_000, now)).toBe('')
+    expect(relativeTime(now - 3 * 86_400_000, now)).toBe('')
   })
 
   it('clamps a future timestamp (clock skew) to "just now"', () => {
@@ -53,6 +62,31 @@ describe('relativeTime', () => {
     // Mirrors the e2e seed: Math.floor(Date.now()/1000) - 120.
     const seedSeconds = Math.floor(now / 1000) - 120
     expect(relativeTime(seedSeconds, now)).toBe('2m ago')
+  })
+})
+
+describe('localizedRelativeTime', () => {
+  const now = MS_2026
+
+  it('is empty for missing or invalid timestamps', () => {
+    expect(localizedRelativeTime(null, 'en', now)).toBe('')
+    expect(localizedRelativeTime('garbage', 'en', now)).toBe('')
+  })
+
+  it('renders locale-aware buckets', () => {
+    expect(localizedRelativeTime(now - 5 * 60_000, 'en', now)).toBe('5 minutes ago')
+    expect(localizedRelativeTime(now - 5 * 60_000, 'zh-Hans', now)).toBe('5分钟前')
+    expect(localizedRelativeTime(now - 2 * 3_600_000, 'en', now)).toBe('2 hours ago')
+    expect(localizedRelativeTime(now - 3 * 86_400_000, 'en', now)).toBe('3 days ago')
+  })
+
+  it('clamps future timestamps and floors sub-minute ages to seconds', () => {
+    expect(localizedRelativeTime(now + 60_000, 'en', now)).toBe('1 second ago')
+    expect(localizedRelativeTime(now - 30_000, 'en', now)).toBe('30 seconds ago')
+  })
+
+  it('falls back to English for an invalid locale tag', () => {
+    expect(localizedRelativeTime(now - 5 * 60_000, '!!bad!!', now)).toBe('5 minutes ago')
   })
 })
 
@@ -68,6 +102,10 @@ describe('absoluteTime', () => {
 
   it('produces a non-empty, digit-bearing local label', () => {
     expect(absoluteTime(Date.now())).toMatch(/\d/)
+  })
+
+  it('always includes the full local calendar year', () => {
+    expect(absoluteTime(MS_2026)).toContain(String(new Date(MS_2026).getFullYear()))
   })
 })
 

@@ -81,6 +81,8 @@ def test_exclude_file_written(monkeypatch, tmp_path, source_repo):
     body = exclude.read_text()
     assert "__pycache__/" in body
     assert "*.egg-info/" in body
+    assert "!*/build/" in body
+    assert "!*/build/**" in body
 
 
 # --- empty/unborn source repo: build mode scaffolding from scratch ---

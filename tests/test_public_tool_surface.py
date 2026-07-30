@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from pathlib import Path
 
 import opensquilla.tool_boundary as tool_boundary
 from opensquilla.engine.types import ToolCall
@@ -91,16 +90,3 @@ async def test_removed_tools_are_not_dispatchable_by_name() -> None:
         result = await handler(ToolCall(tool_use_id=f"tc-{name}", tool_name=name, arguments={}))
         assert result.is_error is True
         assert '"error_class": "ToolNotFound"' in result.content
-
-
-def test_web_ui_tool_icon_map_avoids_removed_wrapper_tools() -> None:
-    source = Path("src/opensquilla/gateway/static/js/views/chat.js").read_text(
-        encoding="utf-8"
-    )
-    start = source.index("const _TOOL_EMOJI = {")
-    end = source.index("  function _toolEmoji", start)
-    tool_display_map = source[start:end]
-
-    for name in REMOVED_TOOL_NAMES:
-        assert name not in tool_display_map
-    assert "http_request" in tool_display_map

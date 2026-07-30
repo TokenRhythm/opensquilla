@@ -40,6 +40,11 @@ class _SequenceProvider:
         return []
 
 
+class _CompositeSequenceProvider(_SequenceProvider):
+    provider_name = "ensemble"
+    retry_failed_call_safe = False
+
+
 def _reasoning_only_done() -> ProviderDone:
     return ProviderDone(
         stop_reason="stop",
@@ -224,6 +229,61 @@ async def test_timeout_error_code_retries_when_message_lacks_timeout_token() -> 
     assert len(provider.calls) == 2
     assert any(event.kind == "done" and event.text == "ok" for event in events)
     assert not any(event.kind == "error" and event.code == "timeout" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_composite_timeout_surfaces_without_replaying_full_call() -> None:
+    provider = _CompositeSequenceProvider(
+        [
+            [ProviderError(message="Request timed out: ", code="timeout")],
+            [ProviderText(text="should-not-run"), _ok_done()],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_provider_retries=3,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 1
+    assert any(event.kind == "error" and event.code == "timeout" for event in events)
+    assert not any(
+        event.kind == "text_delta" and event.text == "should-not-run"
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_composite_partial_timeout_does_not_duplicate_visible_text() -> None:
+    provider = _CompositeSequenceProvider(
+        [
+            [
+                ProviderText(text="partial"),
+                ProviderError(message="Request timed out: ", code="timeout"),
+            ],
+            [ProviderText(text="duplicate"), _ok_done()],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_provider_retries=3,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 1
+    visible = [event.text for event in events if event.kind == "text_delta"]
+    assert visible == ["partial"]
+    assert any(event.kind == "error" and event.code == "timeout" for event in events)
 
 
 @pytest.mark.asyncio

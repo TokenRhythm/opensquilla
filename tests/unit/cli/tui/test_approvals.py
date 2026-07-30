@@ -91,6 +91,12 @@ class _FakeConsole:
         return self._answers.pop(0)
 
 
+class _ExternalResolution:
+    approved = True
+    choice = None
+    resolved_externally = True
+
+
 class _FakeResponse:
     def __init__(self, approved: bool, choice: str | None = None) -> None:
         self.approved = approved
@@ -98,9 +104,10 @@ class _FakeResponse:
 
 
 class _Resolver:
-    def __init__(self, error: Exception | None = None) -> None:
+    def __init__(self, error: Exception | None = None, result: Any = None) -> None:
         self.calls: list[tuple[str, bool, str | None]] = []
         self._error = error
+        self._result = result
 
     async def __call__(
         self,
@@ -108,10 +115,11 @@ class _Resolver:
         approved: bool,
         *,
         choice: str | None = None,
-    ) -> None:
+    ) -> Any:
         self.calls.append((approval_id, approved, choice))
         if self._error is not None:
             raise self._error
+        return self._result
 
 
 def _sandbox_envelope_payload() -> dict[str, Any]:
@@ -306,9 +314,39 @@ async def test_handler_routes_through_host_overlay_and_resolves_approval() -> No
             "tool": "sandbox_network",
             "summary": "network access to packages.example.test",
             "choices": ["allow_once", "allow_same_type", "deny"],
+            "message": "Network access needs approval.",
         }
     ]
     assert resolver.calls == [("appr-1", True, "allow_once")]
+
+
+async def test_host_payload_omits_message_when_it_already_is_the_summary() -> None:
+    handler = tui_approval_handler(output_console=_FakeConsole())
+    resolver = _Resolver()
+    handle = _HostOutputHandle(_FakeResponse(True, choice=None))
+    renderer = _RecordingRenderer(handle)
+
+    # No command/path/host: the summary falls back to the message itself, so
+    # forwarding the message too would render the same line twice.
+    await handler(
+        {
+            "status": "approval_required",
+            "approval_id": "appr-3",
+            "tool": "custom_tool",
+            "message": "Custom action needs approval.",
+        },
+        renderer,
+        resolver,
+    )
+
+    assert handle.requests == [
+        {
+            "id": "appr-3",
+            "tool": "custom_tool",
+            "summary": "Custom action needs approval.",
+            "choices": [],
+        }
+    ]
 
 
 async def test_handler_host_choice_response_is_authoritative() -> None:
@@ -334,6 +372,17 @@ async def test_handler_denies_on_host_timeout() -> None:
     assert resolver.calls == [("appr-1", False, "deny")]
 
 
+async def test_handler_does_not_reresolve_approval_completed_in_webui() -> None:
+    handler = tui_approval_handler(output_console=_FakeConsole())
+    resolver = _Resolver()
+    renderer = _RecordingRenderer(_HostOutputHandle(_ExternalResolution()))
+
+    await handler(_sandbox_envelope_payload(), renderer, resolver)
+
+    assert resolver.calls == []
+    assert any("another client" in message for message, _style in renderer.statuses)
+
+
 async def test_handler_denies_on_dead_bridge() -> None:
     handler = tui_approval_handler(output_console=_FakeConsole())
     resolver = _Resolver()
@@ -354,6 +403,40 @@ async def test_handler_survives_resolver_failure() -> None:
 
     assert resolver.calls == [("appr-2", True, None)]
     assert any("failed to resolve" in message for message, _style in renderer.statuses)
+
+
+async def test_handler_uses_canonical_cross_surface_resolution() -> None:
+    handler = tui_approval_handler(output_console=_FakeConsole())
+    resolver = _Resolver(result={"resolved": True, "pending": False, "approved": True})
+    renderer = _RecordingRenderer(_HostOutputHandle(_FakeResponse(False)))
+
+    await handler(_exec_envelope_payload(), renderer, resolver)
+
+    assert resolver.calls == [("appr-2", False, None)]
+    assert renderer.statuses[-1] == (
+        "approval approved by another surface — shell",
+        "green",
+    )
+
+
+async def test_handler_renders_inflight_cross_surface_resolution_neutrally() -> None:
+    handler = tui_approval_handler(output_console=_FakeConsole())
+    resolver = _Resolver(
+        result={
+            "resolved": False,
+            "pending": True,
+            "approved": False,
+            "resolutionInProgress": True,
+        }
+    )
+    renderer = _RecordingRenderer(_HostOutputHandle(_FakeResponse(True)))
+
+    await handler(_exec_envelope_payload(), renderer, resolver)
+
+    assert renderer.statuses[-1] == (
+        "approval is being resolved on another surface — shell",
+        "yellow",
+    )
 
 
 async def test_handler_ignores_wrapped_handle_without_host_capability() -> None:
@@ -449,9 +532,7 @@ async def test_cancelled_console_prompt_denies_and_reaps_the_reader() -> None:
             reader_finished.set()
         return "y"
 
-    handler = tui_approval_handler(
-        output_console=_FakeConsole(), prompt_reader=blocking_reader
-    )
+    handler = tui_approval_handler(output_console=_FakeConsole(), prompt_reader=blocking_reader)
     resolver = _Resolver()
     renderer = _RecordingRenderer(_NativeOutputHandle())
 
@@ -478,9 +559,7 @@ async def test_cancelled_console_prompt_reaps_reader_even_when_deny_rpc_fails() 
         await release_reader.wait()
         return "y"
 
-    handler = tui_approval_handler(
-        output_console=_FakeConsole(), prompt_reader=blocking_reader
-    )
+    handler = tui_approval_handler(output_console=_FakeConsole(), prompt_reader=blocking_reader)
     resolver = _Resolver(error=RuntimeError("rpc down"))
     renderer = _RecordingRenderer(_NativeOutputHandle())
 
@@ -540,9 +619,7 @@ def test_default_turn_stream_dependencies_keeps_explicit_handler() -> None:
     async def explicit_handler(*_args: Any, **_kwargs: Any) -> None:
         return None
 
-    deps = turn_stream_defaults.default_turn_stream_dependencies(
-        approval_handler=explicit_handler
-    )
+    deps = turn_stream_defaults.default_turn_stream_dependencies(approval_handler=explicit_handler)
 
     assert deps.approval_handler is explicit_handler
 
@@ -567,3 +644,33 @@ async def test_default_handler_resolves_through_host_capable_renderer() -> None:
 
     assert [request["id"] for request in handle.requests] == ["appr-2"]
     assert resolver.calls == [("appr-2", True, None)]
+
+
+async def test_host_payload_strips_control_bytes_and_dedups_after_sanitizing() -> None:
+    handler = tui_approval_handler(output_console=_FakeConsole())
+    resolver = _Resolver()
+    handle = _HostOutputHandle(_FakeResponse(True, choice=None))
+    renderer = _RecordingRenderer(handle)
+
+    # The message differs from the summary only by embedded control bytes:
+    # after sanitizing they render identically, so no message is forwarded.
+    await handler(
+        {
+            "status": "approval_required",
+            "approval_id": "appr-4",
+            "tool": "shell",
+            "command": "echo\x1b[31m ok\x07",
+            "message": "echo ok",
+        },
+        renderer,
+        resolver,
+    )
+
+    assert handle.requests == [
+        {
+            "id": "appr-4",
+            "tool": "shell",
+            "summary": "echo ok",
+            "choices": [],
+        }
+    ]

@@ -1,8 +1,6 @@
 export const TOOL_INDENT = " ";
 export const TIMELINE_WRAP_GUARD_CELLS = 6;
-// A single codex-style result-preview corner under a tool row, and the dim
-// separator before a completed tool's duration (e.g. "✓ grep foo · 0.2s").
-export const RESULT_CORNER = "└ ";
+// Dim separator before a completed tool's duration (e.g. "✓ grep foo · 0.2s").
 export const DURATION_SEP = " · ";
 
 // Clamp the footer height to the terminal: never taller than the screen (a short
@@ -62,6 +60,36 @@ export function textWidth(text) {
   let width = 0;
   for (let i = 0; i < chars.length; i += 1) width += cellWidth(chars[i], chars[i + 1]);
   return width;
+}
+
+// Greedy soft-wrap a logical line into rows of at most `cells` columns,
+// breaking after the last space that fits so words stay whole; a single
+// overwide word hard-breaks at the budget so wrapping always makes progress.
+export function wrapToCells(line, cells) {
+  const budget = Math.max(1, cells);
+  const rows = [];
+  let rest = Array.from(line);
+  while (rest.length) {
+    let used = 0;
+    let cut = 0;
+    let lastSpace = -1;
+    while (cut < rest.length) {
+      const width = cellWidth(rest[cut], rest[cut + 1]);
+      if (used + width > budget) break;
+      used += width;
+      cut += 1;
+      if (rest[cut - 1] === " ") lastSpace = cut;
+    }
+    if (cut >= rest.length) {
+      rows.push(rest.join(""));
+      break;
+    }
+    const breakAt = lastSpace > 0 ? lastSpace : Math.max(1, cut);
+    rows.push(rest.slice(0, breakAt).join("").trimEnd());
+    rest = rest.slice(breakAt);
+    while (rest.length && rest[0] === " ") rest.shift();
+  }
+  return rows.length ? rows : [""];
 }
 
 export function clipToCells(text, cells) {

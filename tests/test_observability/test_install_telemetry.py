@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
+import time
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 from typing import Any
 
@@ -212,6 +217,43 @@ def test_privacy_config_disable_skips_without_creating_state(tmp_path, monkeypat
     assert not state_path.exists()
 
 
+def test_hot_privacy_opt_out_before_post_starts_no_request(tmp_path, monkeypatch):
+    _enable_telemetry_for_test(monkeypatch)
+    monkeypatch.setenv(telemetry.TELEMETRY_ENDPOINT_ENV, TEST_ENDPOINT)
+    _set_stable_sources(monkeypatch, macs=["02:00:00:00:00:11"])
+    state_path = tmp_path / "install_telemetry.json"
+    config = SimpleNamespace(
+        privacy=SimpleNamespace(disable_network_observability=False),
+    )
+    original_build_payload = telemetry._build_payload
+    post_calls = 0
+
+    def build_payload(*args, **kwargs):
+        payload = original_build_payload(*args, **kwargs)
+        config.privacy.disable_network_observability = True
+        return payload
+
+    def unexpected_post(*args, **kwargs):
+        nonlocal post_calls
+        post_calls += 1
+        return True, None
+
+    monkeypatch.setattr(telemetry, "_build_payload", build_payload)
+    monkeypatch.setattr(telemetry, "_post_payload", unexpected_post)
+
+    result = telemetry.collect_install_telemetry(
+        config=config,
+        state_path=state_path,
+        version="1.0.0",
+    )
+
+    assert result.disabled is True
+    assert result.sent is False
+    assert result.skipped_reason == "disabled"
+    assert post_calls == 0
+    assert not state_path.exists()
+
+
 def test_github_actions_env_skips_without_creating_state(tmp_path, monkeypatch):
     _enable_telemetry_for_test(monkeypatch)
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
@@ -397,3 +439,212 @@ def test_loopback_endpoint_host_does_not_influence_install_id(tmp_path, monkeypa
     expected = telemetry._stable_install_id("ip", ["10.0.0.9"])
     assert _load(state_path)["install_id"] == expected
     assert calls[0]["install_id"] == expected
+
+
+def test_background_collection_does_not_wait_for_blocked_post_and_preserves_state(
+    tmp_path,
+    monkeypatch,
+):
+    _enable_telemetry_for_test(monkeypatch)
+    monkeypatch.setenv(telemetry.TELEMETRY_ENDPOINT_ENV, TEST_ENDPOINT)
+    _set_stable_sources(monkeypatch, macs=["02:00:00:00:00:10"])
+    state_path = tmp_path / "install_telemetry.json"
+    post_started = Event()
+    release_post = Event()
+    payloads: list[dict[str, Any]] = []
+    results: list[telemetry.InstallTelemetryResult] = []
+
+    def blocking_post(
+        endpoint: str,
+        payload: dict[str, Any],
+        *,
+        timeout: float,
+    ) -> tuple[bool, str | None]:
+        payloads.append(payload)
+        post_started.set()
+        if not release_post.wait(timeout=2):
+            return False, "test_release_timeout"
+        return True, None
+
+    monkeypatch.setattr(telemetry, "_post_payload", blocking_post)
+    thread = telemetry.start_background_install_telemetry(
+        state_path=state_path,
+        version="1.0.0",
+        on_result=results.append,
+    )
+    try:
+        assert thread is not None
+        assert thread.daemon is True
+        assert post_started.wait(timeout=1)
+        assert thread.is_alive()
+
+        # The worker persisted its install id before entering network I/O, so a
+        # concurrent usage uploader sees the same id and valid JSON.
+        install_id = telemetry.ensure_install_telemetry_id(state_path=state_path)
+        assert install_id == payloads[0]["install_id"]
+        assert _load(state_path)["install_id"] == install_id
+    finally:
+        release_post.set()
+        if thread is not None:
+            thread.join(timeout=2)
+
+    assert thread is not None and not thread.is_alive()
+    assert len(results) == 1
+    assert results[0].uploaded is True
+    state = _load(state_path)
+    assert state["uploaded_install"] is True
+    assert state["uploaded_versions"] == ["1.0.0"]
+
+
+def test_background_collection_honors_privacy_without_thread_or_state(
+    tmp_path,
+    monkeypatch,
+):
+    _enable_telemetry_for_test(monkeypatch)
+    monkeypatch.setenv(telemetry.TELEMETRY_ENDPOINT_ENV, TEST_ENDPOINT)
+    state_path = tmp_path / "install_telemetry.json"
+    config = SimpleNamespace(
+        privacy=SimpleNamespace(disable_network_observability=True),
+    )
+    results: list[telemetry.InstallTelemetryResult] = []
+    post_calls = 0
+
+    def unexpected_post(*args, **kwargs):
+        nonlocal post_calls
+        post_calls += 1
+        return True, None
+
+    monkeypatch.setattr(telemetry, "_post_payload", unexpected_post)
+    thread = telemetry.start_background_install_telemetry(
+        config=config,
+        state_path=state_path,
+        version="1.0.0",
+        on_result=results.append,
+    )
+
+    assert thread is None
+    assert post_calls == 0
+    assert not state_path.exists()
+    assert len(results) == 1
+    assert results[0].disabled is True
+    assert results[0].skipped_reason == "disabled"
+
+
+def test_concurrent_process_results_merge_without_holding_lock_across_network(
+    tmp_path,
+    monkeypatch,
+):
+    _enable_telemetry_for_test(monkeypatch)
+    state_path = tmp_path / "state" / "install_telemetry.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "install_id": "synthetic-install-id",
+                "install_id_source": "stable-v2-mac",
+                "first_seen_at": "2026-01-01T00:00:00Z",
+                "uploaded_install": True,
+                "uploaded_versions": ["0.9.0"],
+                "future_field": {"preserve": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENSQUILLA_TEST_PROFILE_LOCK_ROOT", "1")
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "lock-state"))
+    from opensquilla.profile_operation_lock import ProfileOperationLock
+
+    # Seed the stable lock inode before the workers race. ProfileOperationLock
+    # deliberately fails closed if two untrusted paths race first creation;
+    # the daemon/restart overlap modelled here starts after an earlier collector
+    # has already established this exact telemetry lock.
+    with ProfileOperationLock(state_path):
+        pass
+
+    go_path = tmp_path / "go"
+    ready_paths = [tmp_path / "ready-a", tmp_path / "ready-b"]
+    worker_source = """
+import json
+import sys
+import time
+from pathlib import Path
+
+from opensquilla.observability import install_telemetry as telemetry
+
+state_path = Path(sys.argv[1])
+ready_path = Path(sys.argv[2])
+go_path = Path(sys.argv[3])
+version = sys.argv[4]
+
+def blocked_post(endpoint, payload, *, timeout):
+    ready_path.write_text("ready", encoding="utf-8")
+    deadline = time.monotonic() + 10
+    while not go_path.exists():
+        if time.monotonic() >= deadline:
+            return False, "barrier_timeout"
+        time.sleep(0.01)
+    return True, None
+
+telemetry._post_payload = blocked_post
+result = telemetry.collect_install_telemetry(
+    state_path=state_path,
+    version=version,
+)
+print(json.dumps({"uploaded": result.uploaded, "error": result.error}))
+"""
+    env = os.environ.copy()
+    env[telemetry.TELEMETRY_ENDPOINT_ENV] = TEST_ENDPOINT
+    workers = [
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                worker_source,
+                str(state_path),
+                str(ready_path),
+                str(go_path),
+                version,
+            ],
+            cwd=str(Path(__file__).resolve().parents[2]),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for ready_path, version in zip(
+            ready_paths,
+            ("1.0.0", "2.0.0"),
+            strict=True,
+        )
+    ]
+    outputs: list[tuple[str, str]] = []
+    try:
+        deadline = time.monotonic() + 10
+        while not all(path.exists() for path in ready_paths):
+            for worker in workers:
+                if worker.poll() is not None:
+                    stdout, stderr = worker.communicate()
+                    raise AssertionError(
+                        "telemetry worker exited before the network barrier: "
+                        f"rc={worker.returncode}, stdout={stdout!r}, stderr={stderr!r}"
+                    )
+            if time.monotonic() >= deadline:
+                raise AssertionError("both workers must reach the network barrier")
+            time.sleep(0.01)
+        # Both workers reaching this barrier proves the process lock is not held
+        # across the simulated network operation.
+        go_path.write_text("go", encoding="utf-8")
+        outputs = [worker.communicate(timeout=10) for worker in workers]
+    finally:
+        for worker in workers:
+            if worker.poll() is None:
+                worker.terminate()
+                worker.wait(timeout=5)
+
+    for worker, (stdout, stderr) in zip(workers, outputs, strict=True):
+        assert worker.returncode == 0, stderr
+        assert json.loads(stdout)["uploaded"] is True
+    state = _load(state_path)
+    assert set(state["uploaded_versions"]) == {"0.9.0", "1.0.0", "2.0.0"}
+    assert state["future_field"] == {"preserve": True}

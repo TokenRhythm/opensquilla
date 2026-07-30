@@ -1481,6 +1481,80 @@ async def test_rpc_search_query_allows_search_provider_endpoint_under_managed_ne
 
 
 @pytest.mark.asyncio
+async def test_rpc_search_query_grants_only_auto_execution_plan_providers(
+    monkeypatch: pytest.MonkeyPatch,
+    managed_context: ToolContext,
+) -> None:
+    seen: dict[str, object] = {}
+
+    class FakeProxy:
+        host = "127.0.0.1"
+        port = 28080
+
+        def __init__(self, decide: object, **kwargs: object) -> None:
+            self._decide = decide
+
+        async def start(self) -> None:
+            for host in ("api.bochaai.com", "api.tavily.com"):
+                decision = self._decide(host)
+                assert isinstance(decision, NetworkDecision)
+                seen[host] = decision.status
+            duckduckgo = self._decide("html.duckduckgo.com")
+            assert isinstance(duckduckgo, NetworkDecision)
+            seen["html.duckduckgo.com"] = duckduckgo.status
+            seen["html.duckduckgo.com.reason"] = duckduckgo.reason
+
+        async def stop(self) -> None:
+            return None
+
+    async def fake_search(*args: object, **kwargs: object) -> dict[str, object]:
+        seen["search_called"] = True
+        return {
+            "ok": True,
+            "query": "python packages",
+            "provider": "bocha",
+            "results": [],
+        }
+
+    for key in (
+        "BOCHA_SEARCH_API_KEY",
+        "BRAVE_SEARCH_API_KEY",
+        "IQS_SEARCH_API_KEY",
+        "TAVILY_API_KEY",
+        "EXA_API_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("BOCHA_SEARCH_API_KEY", "bocha-key")
+    monkeypatch.setenv("TAVILY_API_KEY", "tavily-key")
+    monkeypatch.setattr(rpc_tools, "run_web_search_payload", fake_search)
+    monkeypatch.setattr(integration_mod, "SandboxProxyServer", FakeProxy)
+    web_mod.configure_search("duckduckgo", fallback_policy="network")
+    ctx = RpcContext(
+        conn_id="c",
+        principal=Principal(
+            role="operator",
+            scopes=frozenset(["operator.write", "operator.read"]),
+            is_owner=True,
+            authenticated=True,
+        ),
+    )
+
+    try:
+        result = await rpc_tools._handle_search_query({"query": "python packages"}, ctx)
+    finally:
+        web_mod.reset_search_runtime()
+
+    assert result["ok"] is True
+    assert seen == {
+        "api.bochaai.com": "allow",
+        "api.tavily.com": "allow",
+        "html.duckduckgo.com": "allow",
+        "html.duckduckgo.com.reason": "default_allowlist",
+        "search_called": True,
+    }
+
+
+@pytest.mark.asyncio
 async def test_rpc_search_query_without_runtime_uses_provider_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

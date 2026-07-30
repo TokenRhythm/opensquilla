@@ -163,6 +163,7 @@ async def test_task_timeout_terminalizes_running_session_and_broadcasts_change()
         "task.queued",
         {
             "task_id": handle.task_id,
+            "turn_id": handle.task_id,
             "session_key": session.session_key,
             "queue_depth": 1,
             "queue_position": 1,
@@ -182,8 +183,18 @@ async def test_task_timeout_terminalizes_running_session_and_broadcasts_change()
     assert events[2] == (
         session.session_key,
         "task.running",
-        {"task_id": handle.task_id, "session_key": session.session_key},
-    )
+            {
+                "task_id": handle.task_id,
+                "turn_id": handle.task_id,
+                "session_key": session.session_key,
+                "steer_capability": {
+                    "mode": "same_turn",
+                    "expected_turn_id": handle.task_id,
+                    "input_kinds": ["text"],
+                    "reason": None,
+                },
+            },
+        )
     assert events[3] == (
         session.session_key,
         "sessions.changed",
@@ -200,6 +211,7 @@ async def test_task_timeout_terminalizes_running_session_and_broadcasts_change()
         "task.timeout",
         {
             "task_id": handle.task_id,
+            "turn_id": handle.task_id,
             "session_key": session.session_key,
             "terminal_reason": "timeout",
             "terminal_message": "The task timed out before it could finish.",
@@ -401,6 +413,7 @@ async def test_task_running_reactivates_terminal_session_before_next_turn() -> N
         "task.queued",
         {
             "task_id": handle.task_id,
+            "turn_id": handle.task_id,
             "session_key": session.session_key,
             "queue_depth": 1,
             "queue_position": 1,
@@ -420,8 +433,18 @@ async def test_task_running_reactivates_terminal_session_before_next_turn() -> N
     assert events[2] == (
         session.session_key,
         "task.running",
-        {"task_id": handle.task_id, "session_key": session.session_key},
-    )
+            {
+                "task_id": handle.task_id,
+                "turn_id": handle.task_id,
+                "session_key": session.session_key,
+                "steer_capability": {
+                    "mode": "same_turn",
+                    "expected_turn_id": handle.task_id,
+                    "input_kinds": ["text"],
+                    "reason": None,
+                },
+            },
+        )
     assert events[3] == (
         session.session_key,
         "sessions.changed",
@@ -454,6 +477,7 @@ async def test_task_running_reactivates_terminal_session_before_next_turn() -> N
         "task.succeeded",
         {
             "task_id": handle.task_id,
+            "turn_id": handle.task_id,
             "session_key": session.session_key,
             "terminal_reason": "completed",
         },

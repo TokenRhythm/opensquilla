@@ -5,9 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "npm run typecheck && vite build && node scripts/normalize-dist.mjs && node scripts/check-theme-bundle.mjs",
+    "build": "npm run typecheck && npm run build:artifact",
+    "build:artifact": "vite build && node scripts/normalize-dist.mjs && node scripts/check-theme-bundle.mjs && node scripts/check-runtime-bundle.mjs && node scripts/verify-dist.mjs --write",
+    "verify:dist": "node scripts/verify-dist.mjs",
+    "verify:release-dist": "node scripts/verify-dist.mjs --forbid-personal-bgm",
     "preview": "vite preview",
-    "check:architecture": "node scripts/check-architecture.mjs && node scripts/check-chat-security.mjs && node scripts/check-webui-colors.mjs && node scripts/check-webui-motion.mjs && node scripts/check-webui-radius.mjs && node scripts/check-theme-contract.mjs && node scripts/check-theme-scope.mjs && node scripts/check-cross-surface-tokens.mjs && node scripts/check-i18n.mjs && node scripts/check-readme-locales.mjs",
+    "check:architecture": "node scripts/check-architecture.mjs && node scripts/check-chat-security.mjs && node scripts/check-webui-colors.mjs && node scripts/check-webui-motion.mjs && node scripts/check-webui-radius.mjs && node scripts/check-theme-contract.mjs && node scripts/check-theme-scope.mjs && node scripts/check-cross-surface-tokens.mjs && node scripts/check-i18n.mjs && node scripts/check-channel-catalog-i18n.mjs && node scripts/check-readme-locales.mjs",
     "check:readme-locales": "node scripts/check-readme-locales.mjs",
     "typecheck": "npm run check:architecture && vue-tsc --noEmit",
     "test:unit": "vitest run",
@@ -17,7 +20,7 @@
     "test:e2e:debug": "playwright test --debug"
   },
   "engines": {
-    "node": "^20.19.0 || >=22.12.0"
+    "node": ">=22.12.0"
   },
   "dependencies": {
     "@types/dompurify": "^3.0.5",
@@ -27,7 +30,7 @@
     "katex": "^0.17.0",
     "marked": "^18.0.4",
     "pinia": "^2.1.7",
-    "vue": "^3.4.21",
+    "vue": "^3.5.0",
     "vue-i18n": "^11.4.6",
     "vue-router": "^4.3.0"
   },

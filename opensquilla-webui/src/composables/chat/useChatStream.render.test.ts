@@ -5,7 +5,8 @@ import {
   streamIdleTimeoutFromPolicy,
   useChatStream,
 } from './useChatStream'
-import type { ChatMessage } from '@/types/chat'
+import type { ChatMessage, ChatRunStatus } from '@/types/chat'
+import type { InterruptViewState } from '@/types/parts'
 
 // Focused coverage for the streaming render coalescer: stream deltas are
 // batched onto the frame clock (requestAnimationFrame) and the live reveal
@@ -14,23 +15,34 @@ import type { ChatMessage } from '@/types/chat'
 function makeStream(
   renderMarkdown = vi.fn((t: string, _o?: { highlight?: boolean }) => `<p>${t}</p>`),
   rpcPolicy?: () => Record<string, unknown> | undefined,
+  interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map()),
 ) {
   const scrollToBottom = vi.fn()
   const messages = ref<ChatMessage[]>([])
+  const runStatus = ref<ChatRunStatus>({ status: 'idle', label: '', task: null })
+  const applySessionRunState = vi.fn()
   const api = useChatStream({
     messages,
     lastHeaderRole: ref(''),
     aborted: ref(false),
     autoScroll: ref(true),
-    applySessionRunState: vi.fn(),
+    runStatus,
+    applySessionRunState,
     renderMarkdown: renderMarkdown as never,
     stripDirectiveTags: (t: string) => t,
     stripGeneratedArtifactMarkers: (t: string) => t,
-    stripProtocolTextLeak: (t: string) => t,
     scrollToBottom,
     rpcPolicy,
+    interruptState,
   })
-  return { api, messages, scrollToBottom, renderMarkdown }
+  return {
+    api,
+    messages,
+    runStatus,
+    applySessionRunState,
+    scrollToBottom,
+    renderMarkdown,
+  }
 }
 
 describe('useChatStream render coalescing', () => {
@@ -68,6 +80,63 @@ describe('useChatStream render coalescing', () => {
     policy = { webui_stream_idle_grace_ms: 900_000 }
     api.resetStreamIdleTimer()
     expect(api.streamIdleTimeoutMs.value).toBe(900_000)
+    api.cleanup()
+  })
+
+  it('preserves the authoritative active-task steer capability when streaming starts late', () => {
+    const { api, runStatus, applySessionRunState } = makeStream()
+    runStatus.value = {
+      status: 'running',
+      label: 'Running',
+      task: {
+        status: 'running',
+        task_id: 'turn-current',
+        steer_capability: {
+          mode: 'same_turn',
+          expected_turn_id: 'turn-current',
+          input_kinds: ['text'],
+        },
+      },
+    }
+
+    api.startStreaming()
+
+    expect(applySessionRunState).toHaveBeenLastCalledWith({
+      run_status: 'running',
+      active_task: expect.objectContaining({
+        status: 'running',
+        task_id: 'turn-current',
+        steer_capability: expect.objectContaining({
+          mode: 'same_turn',
+          expected_turn_id: 'turn-current',
+        }),
+      }),
+    })
+    api.cleanup()
+  })
+
+  it('does not carry a completed task capability into a fresh stream', () => {
+    const { api, runStatus, applySessionRunState } = makeStream()
+    runStatus.value = {
+      status: 'idle',
+      label: 'Completed',
+      task: {
+        status: 'succeeded',
+        task_id: 'turn-old',
+        steer_capability: {
+          mode: 'same_turn',
+          expected_turn_id: 'turn-old',
+          input_kinds: ['text'],
+        },
+      },
+    }
+
+    api.startStreaming()
+
+    expect(applySessionRunState).toHaveBeenLastCalledWith({
+      run_status: 'running',
+      active_task: { status: 'running' },
+    })
     api.cleanup()
   })
 
@@ -164,6 +233,154 @@ describe('useChatStream render coalescing', () => {
     api.cleanup()
   })
 
+  it('checkpoints visible output before a same-turn steer without duplicating final text', () => {
+    const { api, messages } = makeStream()
+
+    api.appendDelta('before')
+    api.checkpointForUserMessage('turn-steered')
+    messages.value.push({
+      role: 'user',
+      text: 'adjust',
+      ts: new Date().toISOString(),
+      turnId: 'turn-steered',
+      inputDisposition: 'steering',
+    })
+    api.appendDelta('after')
+    api.reconcileFinalText('beforeafter')
+    api.endStreaming()
+
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['assistant', 'before'],
+      ['user', 'adjust'],
+      ['assistant', 'after'],
+    ])
+    expect(messages.value.every(message => message.turnId === 'turn-steered')).toBe(true)
+    api.cleanup()
+  })
+
+  it('keeps the live activity timeline visible across a same-turn steer checkpoint', () => {
+    const { api, messages } = makeStream()
+
+    api.appendDelta('before')
+    api.appendToolCall({
+      tool_use_id: 'tool-running',
+      tool_name: 'web_search',
+      input: { query: 'before steer' },
+    })
+    const phaseBeforeSteer = api.streamPhaseLabel.value
+
+    api.checkpointForUserMessage('turn-steered')
+
+    expect(messages.value).toHaveLength(1)
+    expect(messages.value[0]).toMatchObject({
+      role: 'assistant',
+      text: 'before',
+      turnId: 'turn-steered',
+      timeline: [{ type: 'text', raw: 'before' }],
+    })
+    expect(messages.value[0]?.tool_calls).toBeUndefined()
+    expect(messages.value[0]?.statusHistory).toBeUndefined()
+    expect(api.streamHasVisibleOutput.value).toBe(true)
+    expect(api.streamPhaseLabel.value).toBe(phaseBeforeSteer)
+    expect(api.foldedTurn.value.rawText).toBe('')
+    expect(api.foldedTurn.value.toolCalls).toEqual([
+      expect.objectContaining({
+        toolId: 'tool-running',
+        name: 'web_search',
+        isRunning: true,
+      }),
+    ])
+    expect(api.foldedTurn.value.statusHistory.length).toBeGreaterThan(0)
+    expect(api.streamTimelineItems.value).toEqual([
+      expect.objectContaining({ type: 'tool-group' }),
+    ])
+
+    api.appendToolResult({
+      tool_use_id: 'tool-running',
+      tool_name: 'web_search',
+      result: 'ok',
+    })
+    api.appendDelta('after')
+    api.reconcileFinalText('beforeafter')
+    api.endStreaming()
+
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['assistant', 'before'],
+      ['assistant', 'after'],
+    ])
+    expect(messages.value[1]?.tool_calls).toEqual([
+      expect.objectContaining({
+        tool_use_id: 'tool-running',
+        result: 'ok',
+      }),
+    ])
+    api.cleanup()
+  })
+
+  it('does not create an empty assistant row when a steer lands during a tool-only segment', () => {
+    const { api, messages } = makeStream()
+
+    api.appendToolCall({
+      tool_use_id: 'tool-only',
+      tool_name: 'exec_command',
+      input: { cmd: 'sleep 30' },
+    })
+
+    api.checkpointForUserMessage('turn-tool-only')
+
+    expect(messages.value).toEqual([])
+    expect(api.streamHasVisibleOutput.value).toBe(true)
+    expect(api.foldedTurn.value.toolCalls).toEqual([
+      expect.objectContaining({
+        toolId: 'tool-only',
+        isRunning: true,
+      }),
+    ])
+    api.cleanup()
+  })
+
+  it('commits resolved approvals into the finished assistant timeline', () => {
+    const interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map([
+      ['approval-1', { resolution: null, busy: false, error: '' }],
+    ]))
+    const { api, messages } = makeStream(undefined, undefined, interruptState)
+
+    api.startStreaming()
+    api.appendDelta('before')
+    api.appendInterruptFrame({
+      interruptKind: 'approval',
+      approvalId: 'approval-1',
+      data: {
+        approvalId: 'approval-1',
+        namespace: 'exec',
+        toolName: 'sandbox elevation',
+        command: 'python -c pass',
+        approvalKind: 'sandbox_elevation',
+        args: null,
+        warning: '',
+        agent: 'main',
+        sessionKey: 'agent:main:web',
+        deadline: 0,
+      },
+      at: 1000,
+    })
+    interruptState.value = new Map([
+      ['approval-1', { resolution: 'approved', busy: false, error: '' }],
+    ])
+    api.appendDelta('after')
+    api.endStreaming()
+
+    expect(messages.value[0]?.timeline?.map(segment => segment.type)).toEqual([
+      'text',
+      'interrupt',
+      'text',
+    ])
+    expect((messages.value[0] as any)?.interrupts).toMatchObject([
+      { interruptKind: 'approval', resolution: 'approved' },
+    ])
+    api.cleanup()
+  })
+
   it('keeps cumulative-looking text before a tool boundary unchanged', () => {
     const { api, messages } = makeStream()
 
@@ -175,6 +392,83 @@ describe('useChatStream render coalescing', () => {
     api.endStreaming()
 
     expect(messages.value[0]?.text).toBe('prefixprefixsuffix')
+    api.cleanup()
+  })
+
+  it('commits a conflicting terminal snapshot into the tool timeline', () => {
+    const { api, messages } = makeStream()
+
+    api.appendDelta('stale preface')
+    api.appendToolCall({ tool_use_id: 'tool-1', tool_name: 'web_search' })
+    api.appendToolResult({ tool_use_id: 'tool-1', tool_name: 'web_search', result: 'ok' })
+    api.appendDelta('stale retry')
+    api.reconcileFinalText('Canonical answer')
+
+    expect(api.foldedTurn.value.rawText).toBe('Canonical answer')
+    expect(api.foldedTurn.value.timelineItems.map(item => item.type)).toEqual(['tool-group', 'text'])
+
+    api.endStreaming()
+
+    expect(messages.value[0]?.text).toBe('Canonical answer')
+    expect(messages.value[0]?.timeline).toEqual([
+      { type: 'tool-group', groupId: 'stream:tool-group:web.search:0', operationKey: 'web.search' },
+      { type: 'text', raw: 'Canonical answer' },
+    ])
+    expect(messages.value[0]?.tool_calls?.[0]).toMatchObject({
+      tool_use_id: 'tool-1',
+      result: 'ok',
+    })
+    api.cleanup()
+  })
+
+  it('clears stale text on an authoritative empty snapshot but keeps tools', () => {
+    const { api, messages } = makeStream()
+
+    api.appendDelta('stale text')
+    api.appendToolCall({ tool_use_id: 'tool-1', tool_name: 'web_search' })
+    api.appendToolResult({ tool_use_id: 'tool-1', tool_name: 'web_search', result: 'ok' })
+    api.reconcileFinalText('')
+
+    expect(api.foldedTurn.value.rawText).toBe('')
+    expect(api.foldedTurn.value.timelineItems.map(item => item.type)).toEqual(['tool-group'])
+
+    api.endStreaming()
+
+    expect(messages.value[0]?.text).toBe('')
+    expect(messages.value[0]?.timeline).toEqual([
+      { type: 'tool-group', groupId: 'stream:tool-group:web.search:0', operationKey: 'web.search' },
+    ])
+    expect(messages.value[0]?.tool_calls?.[0]).toMatchObject({ tool_use_id: 'tool-1' })
+    api.cleanup()
+  })
+
+  it('keeps streamed text when the terminal event has no snapshot', () => {
+    const { api, messages } = makeStream()
+
+    api.appendDelta('streamed fallback')
+    api.reconcileFinalText(null)
+    api.endStreaming()
+
+    expect(messages.value[0]?.text).toBe('streamed fallback')
+    expect(messages.value[0]?.timeline).toEqual([{ type: 'text', raw: 'streamed fallback' }])
+    api.cleanup()
+  })
+
+  it.each([
+    'Document the literal `<tool_calls>` marker and keep this suffix.',
+    '```xml\n<tool_calls><invoke name="demo"></invoke></tool_calls>\n```\nAfter the fence.',
+    'Keep `<｜DSML｜tool_calls><｜DSML｜invoke name="demo">` and continue.',
+    '<details><summary>View areas around line 10</summary>Visible note.</details>\n\nAfter details.',
+  ])('commits canonical protocol-shaped text without destructive filtering: %s', (text) => {
+    const { api, messages } = makeStream()
+    const split = Math.max(1, Math.floor(text.length / 2))
+
+    api.appendDelta(text.slice(0, split))
+    api.appendDelta(text.slice(split))
+    api.reconcileFinalText(text)
+    api.endStreaming()
+
+    expect(messages.value[0]?.text).toBe(text)
     api.cleanup()
   })
 

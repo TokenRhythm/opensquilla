@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import uuid
 from collections.abc import Awaitable
 from typing import Any
 
@@ -14,9 +15,11 @@ from opensquilla.cli.tui.backend.contracts import (
     TuiInputKind,
     TuiRuntimeConfig,
     TuiRuntimeHooks,
+    TuiSubmittedInput,
     TuiSurfaceFactory,
 )
 from opensquilla.cli.tui.backend.events import TuiEvent, TuiEventKind, TuiEventSink
+from opensquilla.cli.tui.backend.input_identity import tui_input_identity_scope
 from opensquilla.cli.tui.backend.state import TuiRuntimeState
 
 # Ceiling on the shutdown drain of in-flight abort RPCs: a wedged gateway
@@ -27,6 +30,17 @@ _ABORT_DRAIN_TIMEOUT_S = 5.0
 def _emit(event_sink: TuiEventSink | None, event: TuiEvent) -> None:
     if event_sink is not None:
         event_sink(event)
+
+
+def _steer_fallback_is_safe(exc: Exception) -> bool:
+    error_data = getattr(exc, "data", None)
+    if isinstance(error_data, dict) and error_data.get("fallback_safe") is True:
+        return True
+    return str(getattr(exc, "code", "") or "").upper() == "METHOD_NOT_FOUND"
+
+
+def _steer_should_retry(exc: Exception) -> bool:
+    return bool(getattr(exc, "retryable", False)) or not _steer_fallback_is_safe(exc)
 
 
 async def run_tui_runtime(
@@ -47,6 +61,11 @@ async def run_tui_runtime(
         # cancel RPC is never garbage-collected mid-flight or abandoned while
         # still pending when the runtime returns.
         abort_tasks: set[asyncio.Task[None]] = set()
+        # These items have crossed the v2 transport boundary without a
+        # definitive response. They remain in the normal FIFO for visibility
+        # and ordering, but may only be retried as the exact same steer request;
+        # they must never be promoted directly to sessions.send.
+        pending_steer_retry_ids: set[str] = set()
 
         async def _schedule_abort(abort_turn: Awaitable[None]) -> None:
             with contextlib.suppress(Exception):
@@ -73,6 +92,7 @@ async def run_tui_runtime(
             if task is not None and not task.done():
                 abort_task: asyncio.Task[None] | None = None
                 _notice_queue_discarded(runtime_state.clear_pending())
+                pending_steer_retry_ids.clear()
                 with contextlib.suppress(Exception):
                     abort_turn = hooks.on_cancel_active_turn()
                     abort_task = asyncio.create_task(_schedule_abort(abort_turn))
@@ -103,11 +123,15 @@ async def run_tui_runtime(
 
         task_name = config.task_name
 
-        async def _run_dispatch(user_input: str) -> bool:
+        async def _run_dispatch(
+            user_input: str,
+            client_message_id: str | None = None,
+        ) -> bool:
             runtime_state.mark_turn_started(user_input)
             _emit(config.event_sink, TuiEvent(TuiEventKind.TURN_STARTED, input_text=user_input))
             try:
-                return await dispatch(user_input)
+                with tui_input_identity_scope(client_message_id):
+                    return await dispatch(user_input)
             finally:
                 runtime_state.mark_turn_finished()
                 _emit(
@@ -139,12 +163,61 @@ async def run_tui_runtime(
                 turn_task = None
             return keep_going
 
+        async def _next_dispatchable_pending() -> tuple[str, str | None] | None:
+            """Resolve pending steer retries before promoting ordinary work."""
+
+            while True:
+                promoted = runtime_state.promote_next_with_identity()
+                if promoted is None:
+                    return None
+                queued, queued_client_message_id = promoted
+                if (
+                    queued_client_message_id is None
+                    or queued_client_message_id not in pending_steer_retry_ids
+                ):
+                    return promoted
+
+                try:
+                    with tui_input_identity_scope(queued_client_message_id):
+                        steered = await hooks.on_steer_active_turn(queued)
+                except Exception as exc:
+                    if _steer_should_retry(exc):
+                        runtime_state.enqueue_front(
+                            queued,
+                            client_message_id=queued_client_message_id,
+                        )
+                        if hooks.notice is not None:
+                            hooks.notice(
+                                "[yellow]Steer response is still unknown; "
+                                "input remains pending for a safe retry.[/yellow]"
+                            )
+                        return None
+                    steered = False
+
+                pending_steer_retry_ids.discard(queued_client_message_id)
+                if steered:
+                    if hooks.notice is not None:
+                        hooks.notice(
+                            "[bold]Pending steer confirmed with its original "
+                            "request ID.[/bold]"
+                        )
+                    # A replayed receipt confirms this input already belongs to
+                    # the original turn; it must not become a second turn.
+                    continue
+
+                if hooks.notice is not None:
+                    hooks.notice(
+                        "[dim]Steer no longer applies; queued for the next turn.[/dim]"
+                    )
+                return promoted
+
         async def _run_shutdown_drain() -> bool:
             nonlocal turn_task
             while runtime_state.pending_size:
-                queued = runtime_state.promote_next()
-                if queued is None:
+                promoted = await _next_dispatchable_pending()
+                if promoted is None:
                     break
+                queued, queued_client_message_id = promoted
                 try:
                     await hooks.on_queued_turn_start(tui_surface)
                 except Exception as exc:
@@ -154,13 +227,16 @@ async def run_tui_runtime(
                     config.event_sink,
                     TuiEvent(TuiEventKind.QUEUED_INPUT_PROMOTED, input_text=queued),
                 )
-                turn_task = asyncio.create_task(_run_dispatch(queued), name=task_name)
+                turn_task = asyncio.create_task(
+                    _run_dispatch(queued, queued_client_message_id),
+                    name=task_name,
+                )
                 keep_going = await _await_turn_or_cancel()
                 if not keep_going:
                     return False
             return True
 
-        next_line_task: asyncio.Task[str | None] | None = None
+        next_line_task: asyncio.Task[TuiSubmittedInput | str | None] | None = None
 
         async def _ensure_next_line_task() -> None:
             nonlocal next_line_task
@@ -206,8 +282,9 @@ async def run_tui_runtime(
                     if not keep_going:
                         await _drop_next_line()
                         return runtime_state
-                    queued = runtime_state.promote_next()
-                    if queued is not None:
+                    promoted = await _next_dispatchable_pending()
+                    if promoted is not None:
+                        queued, queued_client_message_id = promoted
                         try:
                             await hooks.on_queued_turn_start(tui_surface)
                         except Exception as exc:
@@ -217,7 +294,10 @@ async def run_tui_runtime(
                             config.event_sink,
                             TuiEvent(TuiEventKind.QUEUED_INPUT_PROMOTED, input_text=queued),
                         )
-                        turn_task = asyncio.create_task(_run_dispatch(queued), name=task_name)
+                        turn_task = asyncio.create_task(
+                            _run_dispatch(queued, queued_client_message_id),
+                            name=task_name,
+                        )
                         continue
                     if next_line_task is None or not next_line_task.done():
                         continue
@@ -225,7 +305,7 @@ async def run_tui_runtime(
                 if next_line_task is None or not next_line_task.done():
                     continue
                 try:
-                    user_input = next_line_task.result()
+                    submitted = next_line_task.result()
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -243,7 +323,7 @@ async def run_tui_runtime(
                     return runtime_state
                 next_line_task = None
 
-                if user_input is None:
+                if submitted is None:
                     if turn_task is not None and not turn_task.done():
                         try:
                             await turn_task
@@ -258,6 +338,21 @@ async def run_tui_runtime(
                         hooks.notice("[yellow]Goodbye.[/yellow]")
                     return runtime_state
 
+                if isinstance(submitted, TuiSubmittedInput):
+                    user_input = submitted.text
+                    submit_intent = submitted.intent
+                    client_message_id = submitted.client_message_id
+                else:
+                    # Compatibility for native/test surfaces that predate the
+                    # additive intent field.
+                    user_input = submitted
+                    submit_intent = "auto"
+                    client_message_id = None
+                if submit_intent == "steer" and client_message_id is None:
+                    # A retry must reuse the exact v2 idempotency identity even
+                    # for compatibility surfaces that did not allocate one.
+                    client_message_id = uuid.uuid4().hex
+
                 # A blank line is never a message: dispatching it would echo an
                 # empty prompt card and queue a phantom entry behind a running
                 # turn. Surfaces guard this too; this is the backend's defense
@@ -267,11 +362,32 @@ async def run_tui_runtime(
 
                 category = config.classify_input(user_input)
 
-                if category is TuiInputKind.LOCAL:
-                    # Host-only UI command (e.g. /theme): act now, inline on the
-                    # loop, with no prompt echo and no queue — the in-flight turn
-                    # keeps streaming. A single host IPC frame is atomic, so it
-                    # cannot interleave with the streaming turn.
+                if (
+                    category is TuiInputKind.COMMAND_REQUIRES_IDLE
+                    and turn_task is not None
+                    and not turn_task.done()
+                ):
+                    # Session navigation/mutation that cannot safely race a
+                    # running turn is rejected at the command boundary. It must
+                    # never masquerade as a queued user message.
+                    if hooks.notice is not None:
+                        hooks.notice(
+                            "[yellow]Command requires an idle session. "
+                            "Wait for the current turn to finish.[/yellow]"
+                        )
+                    continue
+
+                if category in (
+                    TuiInputKind.LOCAL,
+                    TuiInputKind.CONTROL,
+                    TuiInputKind.COMMAND,
+                    TuiInputKind.COMMAND_REQUIRES_IDLE,
+                ):
+                    # Host UI, Gateway control, and deterministic slash
+                    # commands act now, inline on the loop, with no prompt echo
+                    # and no queue. The in-flight turn keeps its captured
+                    # runtime strategy; a control write applies only to the
+                    # next accepted turn.
                     try:
                         keep_going = await dispatch(user_input)
                     except Exception as exc:
@@ -281,6 +397,81 @@ async def run_tui_runtime(
                         return runtime_state
                     continue
 
+                steer_fell_back = False
+                if (
+                    submit_intent == "steer"
+                    and category is TuiInputKind.NORMAL
+                    and turn_task is not None
+                    and not turn_task.done()
+                    # Slash/shell commands are control-plane input, never text
+                    # to inject into the model's current reasoning loop.
+                    and not user_input.lstrip().startswith(("/", "!"))
+                ):
+                    assert client_message_id is not None
+                    try:
+                        # The optimistic prompt, sessions.steer, a safe queue
+                        # fallback, and any later sessions.send promotion must
+                        # all retain the composer-allocated identity.
+                        with tui_input_identity_scope(client_message_id):
+                            steered = await hooks.on_steer_active_turn(user_input)
+                    except Exception as exc:
+                        # Once the request crossed the transport boundary, a
+                        # missing response is ambiguous: the Gateway may have
+                        # durably accepted the steer already.  Re-sending it as
+                        # a queued message could repeat a tool effect, so fail
+                        # closed unless the server explicitly declares the
+                        # failure safe.  METHOD_NOT_FOUND is the one legacy
+                        # exception because an older Gateway cannot have run a
+                        # handler that it does not expose.
+                        if _steer_should_retry(exc):
+                            try:
+                                with tui_input_identity_scope(client_message_id):
+                                    await hooks.on_user_input_echo(tui_surface, user_input)
+                            except Exception as surface_exc:
+                                _notice_surface_error(surface_exc)
+                                return runtime_state
+                            _emit(
+                                config.event_sink,
+                                TuiEvent(
+                                    TuiEventKind.USER_INPUT_ACCEPTED,
+                                    input_text=user_input,
+                                ),
+                            )
+                            runtime_state.enqueue(
+                                user_input,
+                                client_message_id=client_message_id,
+                            )
+                            pending_steer_retry_ids.add(client_message_id)
+                            if hooks.notice is not None:
+                                hooks.notice(
+                                    "[yellow]Steer response is unknown; input "
+                                    "was retained for a safe retry with the same "
+                                    "request ID.[/yellow]"
+                                )
+                            continue
+                        if hooks.notice is not None:
+                            hooks.notice(
+                                f"[red]Steer failed: {_escape(str(exc))}[/red]"
+                            )
+                        steered = False
+                    if steered:
+                        try:
+                            with tui_input_identity_scope(client_message_id):
+                                await hooks.on_user_input_echo(tui_surface, user_input)
+                        except Exception as exc:
+                            _notice_surface_error(exc)
+                            return runtime_state
+                        _emit(
+                            config.event_sink,
+                            TuiEvent(TuiEventKind.USER_INPUT_ACCEPTED, input_text=user_input),
+                        )
+                        if hooks.notice is not None:
+                            hooks.notice(
+                                "[bold]Steering the running turn at its next safe boundary.[/bold]"
+                            )
+                        continue
+                    steer_fell_back = True
+
                 # A full queue rejects new typed-ahead BEFORE it is echoed —
                 # otherwise the message appears accepted in the transcript yet
                 # never runs. Destructive/exit commands are exempt: they purge or
@@ -288,8 +479,10 @@ async def run_tui_runtime(
                 # them.
                 if (
                     category not in (TuiInputKind.DESTRUCTIVE, TuiInputKind.EXIT)
-                    and turn_task is not None
-                    and not turn_task.done()
+                    and (
+                        (turn_task is not None and not turn_task.done())
+                        or runtime_state.pending_size > 0
+                    )
                     and runtime_state.pending_size >= config.queue_max_size
                 ):
                     if hooks.notice is not None:
@@ -300,7 +493,8 @@ async def run_tui_runtime(
                     continue
 
                 try:
-                    await hooks.on_user_input_echo(tui_surface, user_input)
+                    with tui_input_identity_scope(client_message_id):
+                        await hooks.on_user_input_echo(tui_surface, user_input)
                 except Exception as exc:
                     # An echo failure means the surface itself is broken (the
                     # write goes through host IPC), so degrade like a read
@@ -319,6 +513,7 @@ async def run_tui_runtime(
 
                 if category is TuiInputKind.DESTRUCTIVE:
                     _notice_queue_discarded(runtime_state.clear_pending())
+                    pending_steer_retry_ids.clear()
                     if turn_task is not None and not turn_task.done():
                         abort_task = _cancel_inflight_turn()
                         try:
@@ -332,7 +527,7 @@ async def run_tui_runtime(
                             await abort_task
                         turn_task = None
                     try:
-                        keep_going = await _run_dispatch(user_input)
+                        keep_going = await _run_dispatch(user_input, client_message_id)
                     except Exception as exc:
                         _notice_turn_failed(exc)
                         keep_going = True
@@ -353,7 +548,7 @@ async def run_tui_runtime(
                     if not await _run_shutdown_drain():
                         return runtime_state
                     try:
-                        keep_going = await _run_dispatch(user_input)
+                        keep_going = await _run_dispatch(user_input, client_message_id)
                     except Exception as exc:
                         # The user asked to leave: a failing exit dispatch must
                         # not trap them in the loop.
@@ -366,21 +561,64 @@ async def run_tui_runtime(
                 if turn_task is not None and not turn_task.done():
                     # Fullness was already rejected before the echo above, so the
                     # queue has room here.
-                    runtime_state.enqueue(user_input)
+                    runtime_state.enqueue(
+                        user_input,
+                        client_message_id=client_message_id,
+                    )
                     # The message was echoed like a normal submission, but it did
                     # NOT start a turn — tell the user it is queued behind the
                     # running one (it will run next, or steer the turn if it makes
                     # a tool call) so "did my message send?" is never ambiguous.
                     if hooks.notice is not None:
                         position = runtime_state.pending_size
+                        prefix = "Steer unavailable; queued" if steer_fell_back else "Queued"
                         hooks.notice(
-                            f"[dim]Queued (#{position}) behind the running turn.[/dim]"
+                            f"[dim]{prefix} (#{position}) behind the running turn.[/dim]"
+                        )
+                    continue
+
+                if runtime_state.pending_size:
+                    # An ambiguous steer can outlive the original local turn
+                    # while its v2 receipt is being recovered. Preserve FIFO:
+                    # retain this new submission behind it, retry the steer
+                    # first, and only start a normal turn after that retry has a
+                    # definitive outcome.
+                    runtime_state.enqueue(
+                        user_input,
+                        client_message_id=client_message_id,
+                    )
+                    if hooks.notice is not None:
+                        hooks.notice(
+                            f"[dim]Queued (#{runtime_state.pending_size}) behind "
+                            "a pending steer retry.[/dim]"
+                        )
+                    promoted = await _next_dispatchable_pending()
+                    if promoted is not None:
+                        queued, queued_client_message_id = promoted
+                        try:
+                            await hooks.on_queued_turn_start(tui_surface)
+                        except Exception as exc:
+                            _notice_surface_error(exc)
+                            return runtime_state
+                        _emit(
+                            config.event_sink,
+                            TuiEvent(
+                                TuiEventKind.QUEUED_INPUT_PROMOTED,
+                                input_text=queued,
+                            ),
+                        )
+                        turn_task = asyncio.create_task(
+                            _run_dispatch(queued, queued_client_message_id),
+                            name=task_name,
                         )
                     continue
 
                 if config.concurrent_input_during_turn:
                     await _ensure_next_line_task()
-                turn_task = asyncio.create_task(_run_dispatch(user_input), name=task_name)
+                turn_task = asyncio.create_task(
+                    _run_dispatch(user_input, client_message_id),
+                    name=task_name,
+                )
         finally:
             if hooks.clear_exposed_surface is not None:
                 hooks.clear_exposed_surface()

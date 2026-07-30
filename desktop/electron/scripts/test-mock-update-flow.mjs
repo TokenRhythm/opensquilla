@@ -145,8 +145,12 @@ try {
   }, 'mock update available renderer state')
   assert.equal(availableState.latestVersion, mockVersion)
 
-  await page.locator('[data-testid="desktop-update-indicator"]').waitFor({ state: 'visible', timeout: 30_000 })
-  await page.locator('[data-testid="desktop-update-indicator"]').click()
+  const updateIndicator = page.locator('[data-testid="desktop-update-indicator"]')
+  await updateIndicator.waitFor({ state: 'visible', timeout: 30_000 })
+  // The desktop header can still be settling while the newly discovered update
+  // changes its width. Force the already-visible control so this test exercises
+  // the update flow instead of Playwright's transient layout-stability heuristic.
+  await updateIndicator.click({ force: true })
   await page.locator('[data-testid="desktop-update-download"]').click()
 
   const downloadedState = await waitFor(async () => {

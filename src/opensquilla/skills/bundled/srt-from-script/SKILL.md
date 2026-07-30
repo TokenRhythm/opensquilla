@@ -1,6 +1,7 @@
 ---
 name: srt-from-script
 description: "Build an SRT subtitle file from a 3-shot short-drama script (ai-video-script OUTPUT FORMAT). Reads each SHOT_N block's DURATION_S + VOICEOVER, emits cumulative-timestamped SRT cues. Pure text-processing, no LLM, no network. Used by meta-short-drama between merge and the final subtitle-burn step."
+description_zh: "从3镜头短剧脚本（ai-video-script输出格式）构建SRT字幕文件。读取每个SHOT_N块的DURATION_S和VOICEOVER，输出带累计时间戳的SRT字幕。纯文本处理，无LLM、无网络。由meta-short-drama在合并与最终字幕烧录步骤之间使用。"
 user-invocable: false
 disable-model-invocation: true
 provenance:

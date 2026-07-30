@@ -168,25 +168,28 @@ def test_control_ui_loads_in_real_browser(tmp_path: Path) -> None:
                 waitUntil: "domcontentloaded",
                 timeout: 30000,
               });
-              await page.waitForFunction(
-                () => document.querySelector("#conn-pill")?.textContent === "Connected",
-                { timeout: 15000 }
-              );
-              await page.locator('a[data-path="/skills"]').click();
-              await page.waitForSelector('[data-proposal-show="deadbeef"]', {
-                state: "attached",
-                timeout: 15000,
+              await page.waitForSelector(".conn-pill.connected", { timeout: 15000 });
+              const proposalRow = page.locator(".sk-proposal-row").filter({
+                hasText: "deadbeef",
               });
-              await page.locator('[data-proposal-show="deadbeef"]').click();
-              await page.waitForSelector('dialog[open] .sk-audit-grid', { timeout: 15000 });
-              const auditText = await page.locator('dialog[open]').innerText();
+              await proposalRow.waitFor({ state: "visible", timeout: 15000 });
+              const showButton = proposalRow.getByRole("button", {
+                name: "Show",
+                exact: true,
+              });
+              await showButton.click();
+              const proposalDialog = page.locator("dialog.sk-dialog[open]");
+              await proposalDialog.locator(".sk-audit-grid").waitFor({ timeout: 15000 });
+              const auditText = await proposalDialog.innerText();
               const result = {
                 status: response ? response.status() : 0,
                 title: await page.title(),
+                path: new URL(page.url()).pathname,
                 appCount: await page.locator("#app").count(),
                 basePath: await page.locator("#opensquilla-data").getAttribute("data-base-path"),
                 authMode: await page.locator("#opensquilla-data").getAttribute("data-auth-mode"),
-                proposalButtons: await page.locator('[data-proposal-show="deadbeef"]').count(),
+                proposalRows: await proposalRow.count(),
+                proposalShowButtons: await showButton.count(),
                 auditText,
                 pageErrors: errors,
               };
@@ -216,7 +219,7 @@ def test_control_ui_loads_in_real_browser(tmp_path: Path) -> None:
     try:
         _wait_for_health(port, server)
         _install_playwright(tmp_path)
-        browser_env = dict(env, TARGET_URL=f"http://127.0.0.1:{port}/control/")
+        browser_env = dict(env, TARGET_URL=f"http://127.0.0.1:{port}/control/skills")
         result = subprocess.run(
             [_node(), str(browser_script)],
             cwd=tmp_path,
@@ -232,11 +235,13 @@ def test_control_ui_loads_in_real_browser(tmp_path: Path) -> None:
         _stop_process(server)
 
     assert payload["status"] == 200
-    assert payload["title"] == "OpenSquilla Control"
+    assert payload["title"] == "Skills — OpenSquilla"
+    assert payload["path"] == "/control/skills"
     assert payload["appCount"] == 1
     assert payload["basePath"] == "/control"
     assert payload["authMode"] == "none"
-    assert payload["proposalButtons"] == 1
+    assert payload["proposalRows"] == 1
+    assert payload["proposalShowButtons"] == 1
     assert "Auto-enable Audit" in payload["auditText"]
     assert "static-safety-v2" in payload["auditText"]
     assert "medium / low" in payload["auditText"]

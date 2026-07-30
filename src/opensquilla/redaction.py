@@ -10,6 +10,7 @@ hosting this helper inside ``onboarding`` would create an import cycle.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 
 _MASK = "***"
 
@@ -41,17 +42,37 @@ _LONG_RUN_RE = re.compile(r"[A-Za-z0-9+/=_-]{21,}")
 _MIN_SCAN_WINDOW = 2048
 
 
-def redact_error_text(text: str, *, max_len: int = 200) -> str:
+def redact_error_text(
+    text: str,
+    *,
+    max_len: int = 200,
+    known_secrets: Iterable[str] = (),
+) -> str:
     """Truncate ``text`` and mask credential-shaped material for safe logging.
 
-    Masks bearer tokens, ``sk-``-style keys, ``key=``/``api_key=``/``token=``
-    style values, URL userinfo, and long unbroken base64/hex runs. The policy
-    is deliberately conservative: secret-shaped runs are masked even when they
+    Masks exact ``known_secrets`` first, then bearer tokens, ``sk-``-style
+    keys, ``key=``/``api_key=``/``token=`` style values, URL userinfo, and
+    long unbroken base64/hex runs. Exact replacement protects provider keys
+    whose shape is not recognizable (including short or ``AIza``-prefixed
+    credentials) when an upstream echoes them in an error. The policy is
+    deliberately conservative: secret-shaped runs are masked even when they
     might be innocuous identifiers.
     """
     if not text:
         return ""
-    out = text[: max(_MIN_SCAN_WINDOW, max_len * 4)]
+    secrets = tuple(
+        sorted(
+            {secret for secret in known_secrets if isinstance(secret, str) and secret},
+            key=len,
+            reverse=True,
+        )
+    )
+    scan_window = max(_MIN_SCAN_WINDOW, max_len * 4)
+    # Include one maximum secret length beyond the scan boundary so a secret
+    # beginning inside the bounded prefix cannot be split before replacement.
+    out = text[: scan_window + max((len(secret) for secret in secrets), default=0)]
+    for secret in secrets:
+        out = out.replace(secret, _MASK)
     out = _URL_USERINFO_RE.sub(f"{_MASK}@", out)
     out = _BEARER_RE.sub(f"Bearer {_MASK}", out)
     out = _KEY_VALUE_RE.sub(rf"\g<1>{_MASK}", out)

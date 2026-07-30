@@ -21,70 +21,28 @@
       </div>
     </div>
 
-    <!-- Header -->
-    <div v-if="!isNewChatLanding" class="chat-header">
-      <div class="chat-header-left">
-        <label class="chat-label" :title="sessionKey">{{ currentChatTitle }}</label>
-        <button
-          class="chat-session-copy-btn"
-          :class="{ 'chat-session-copy-btn--ok': sessionCopyState === 'ok' }"
-          :title="sessionCopyState === 'ok' ? t('chat.copied') : t('chat.copySessionKey')"
-          :aria-label="sessionCopyState === 'ok' ? t('chat.copied') : t('chat.copySessionKey')"
-          @click="onSessionCopyClick"
-        >
-          <Icon :name="sessionCopyIcon" :size="14" />
-        </button>
-        <span class="chat-copy-live" aria-live="polite">{{ sessionCopyLiveText }}</span>
-      </div>
-      <div class="chat-header-right">
-        <button
-          v-if="sessionArtifacts.length > 0"
-          type="button"
-          class="chat-share-btn chat-deliverables-btn"
-          :title="t('chat.deliverablesCount', { count: sessionArtifacts.length })"
-          :aria-label="t('chat.deliverablesCount', { count: sessionArtifacts.length })"
-          @click="openDeliverables"
-        >
-          <Icon name="download" :size="14" />
-          <span class="chat-share-btn__label">{{ t('chat.deliverablesCount', { count: sessionArtifacts.length }) }}</span>
-        </button>
-        <button
-          v-if="appStore.features.metaRuns"
-          type="button"
-          class="chat-share-btn"
-          :title="t('chat.metaRunHistory')"
-          :aria-label="t('chat.metaRunHistory')"
-          @click="metaRunsHistoryOpen = true"
-        >
-          <Icon name="clock" :size="14" />
-          <span class="chat-share-btn__label">{{ t('chat.runs') }}</span>
-        </button>
-        <button
-          v-if="!shareMode"
-          ref="shareEntryBtnRef"
-          type="button"
-          class="chat-share-btn"
-          :disabled="shareableMessageCount === 0"
-          :title="shareableMessageCount === 0 ? t('chat.shareSendFirst') : t('chat.shareSelectHint')"
-          :aria-label="shareableMessageCount === 0 ? t('chat.shareSendFirst') : t('chat.share')"
-          @click="startShareMode"
-        >
-          <Icon name="share" :size="14" />
-          <span class="chat-share-btn__label">{{ t('chat.share') }}</span>
-        </button>
-        <span
-          v-if="contextWarning"
-          class="chat-chip chat-ctx-warn"
-          :title="t('chat.contextPressureTitle', { used: contextWarning.usedK, window: contextWarning.windowK, pct: contextWarning.pct })"
-        >{{ t('chat.contextPressure', { pct: contextWarning.pct }) }}</span>
-        <span class="chat-chip" :class="runStatusChipClass" :title="runStatusTitle">{{ runStatusLabel }}</span>
-      </div>
-    </div>
+    <!-- Chat owns the actions; App owns their stable, in-flow shell position. -->
+    <Teleport to="#app-route-header">
+      <ChatHeaderActions
+        v-if="!isNewChatLanding"
+        ref="chatHeaderActionsRef"
+        :title="currentChatTitle"
+        :session-key="sessionKey"
+        :copy-state="sessionCopyState"
+        :copy-icon="sessionCopyIcon"
+        :copy-live-text="sessionCopyLiveText"
+        :deliverable-count="headerDeliverableCount"
+        :share-mode="shareMode"
+        :shareable-message-count="shareableMessageCount"
+        @open-deliverables="openDeliverables"
+        @start-share="startShareMode"
+        @copy-session-key="onSessionCopyClick"
+      />
+    </Teleport>
 
     <!-- Thread -->
     <div class="chat-body">
-      <!-- Share-mode banner: pinned above the scrolling thread, below the
-           header, so it can never collide with the floating topbar cluster. -->
+      <!-- Share-mode banner stays pinned above the scrolling thread. -->
       <div
         v-if="shareMode"
         ref="shareBannerRef"
@@ -115,73 +73,53 @@
           ref="threadRef"
           class="chat-thread"
           role="region"
+          tabindex="0"
           :aria-label="t('chat.conversation')"
           :aria-busy="isStreaming"
           @scroll="onThreadScroll"
         >
         <template v-if="isNewChatLanding">
-          <div ref="agentSwitcherRef" class="chat-landing-agent">
-            <button
-              type="button"
-              class="chat-landing-agent__btn"
-              aria-haspopup="menu"
-              :aria-expanded="agentSwitcherOpen"
-              :title="t('chat.agentLabel', { name: landingAgentName })"
-              @click.stop="toggleAgentSwitcher"
-            >
-              <Icon name="agents" :size="14" />
-              <span class="chat-landing-agent__name">{{ landingAgentName }}</span>
-              <Icon class="chat-landing-agent__chevron" name="chevronDown" :size="13" />
-            </button>
-            <div
-              v-if="agentSwitcherOpen"
-              class="chat-landing-agent__menu"
-              role="menu"
-              :aria-label="t('chat.chooseAgent')"
-              @keydown="onAgentSwitcherKeydown"
-            >
-              <button
-                v-for="agent in selectableAgents"
-                :key="agent.id"
-                type="button"
-                class="chat-landing-agent__item"
-                role="menuitemradio"
-                :aria-checked="agent.id === landingAgentId"
-                @click.stop="pickDraftAgent(agent.id)"
-              >
-                <span class="chat-landing-agent__item-name">{{ agent.name }}</span>
-                <Icon
-                  v-if="agent.id === landingAgentId"
-                  class="chat-landing-agent__check"
-                  name="check"
-                  :size="14"
-                />
-              </button>
-              <button
-                type="button"
-                class="chat-landing-agent__item chat-landing-agent__item--create"
-                role="menuitem"
-                @click.stop="createAgentFromSwitcher"
-              >
-                <Icon name="plus" :size="14" />
-                <span>{{ t('chat.createAgent') }}</span>
-              </button>
-            </div>
-          </div>
           <div class="chat-landing-brand" :aria-label="t('chat.newChatBrand')">
             <EmptyStateChips
               :key="landingAgentId"
               :agent-id="landingAgentId"
-              :suppressed="landingPrefilled"
+              :suppressed="landingSuggestionsHidden"
+              :disabled="landingSuggestionsDisabled"
               @pick="applyLandingSuggestion"
             />
           </div>
         </template>
-        <div v-else-if="messages.length === 0 && !isStreaming" class="chat-empty">{{ t('chat.noMessagesYet') }}</div>
-        <ChatHistoryScopeRow
+        <ChatSessionRecoveryStatus
+          v-if="visibleHistoryRecoveryState"
+          :key="`${sessionKey}:history`"
+          :state="visibleHistoryRecoveryState"
+          @retry="retryHistory"
+        />
+        <ChatSessionRecoveryStatus
+          v-if="liveRecoveryState"
+          :key="`${sessionKey}:live`"
+          :state="liveRecoveryState"
+          @retry="retryLive"
+        />
+        <div
+          v-if="showConfirmedEmptySession"
+          class="chat-empty"
+        >
+          {{ t('chat.noMessagesYet') }}
+        </div>
+        <HistoryLoadSentinel
           v-if="!isNewChatLanding"
-          :state="historyState"
+          :scroll-container="threadRef"
+          :has-more="historyState.hasMore"
+          :loading="historyState.loadingEarlier"
+          :blocked="historyState.loading"
+          :error="historyState.loadEarlierError"
+          :canonical-available="historyState.canonicalAvailable"
+          :canonical-complete="historyState.canonicalComplete"
+          :cursor="historyState.oldestCursor"
+          :session-key="sessionKey"
           @load-earlier="loadEarlierHistory"
+          @retry="retryHistory"
         />
 
         <ChatMessageList
@@ -189,6 +127,7 @@
           :session-key="sessionKey"
           :auth-token="readAuthToken()"
           :artifact-navigation-items="sessionArtifacts"
+          :workbench-enabled="workbenchEnabled"
           :share-mode="shareMode"
           :selected-message-ids="selectedShareMessageIds"
           :strip-time-prefix="stripTimePrefix"
@@ -203,12 +142,16 @@
           :tool-status-text="toolStatusText"
           :tool-secondary-text="toolSecondaryText"
           :copy-message="copyMessage"
+          :download-attachment="downloadAttachment"
           :fork-busy="forkInFlight"
+          :plan-action-pending="planCardPendingAction"
+          :plan-actions-disabled="planActionsDisabled"
           @fork-conversation="forkConversation"
           @edit-message="editMessage"
           @regenerate-message="regenerateMessage"
           @toggle-share-message="toggleShareMessage"
           @download-artifact="downloadArtifact"
+          @open-artifact="openArtifact"
           @toggle-tool-group="toggleToolGroup"
           @toggle-tool-item="toggleToolItem"
           @show-tool-result="showToolResultModal"
@@ -217,14 +160,27 @@
           @clarify-submit="submitClarify"
           @clarify-dismiss="dismissClarify"
           @resume-sandbox="resumeSandbox"
+          @plan-implement-current="implementCurrentPlan"
+          @plan-implement-new="implementPlanInNewTask"
+          @plan-replan="beginPlanRevision"
         >
           <template #router-strip="{ message: msg }">
             <RouterFxStrip v-if="shouldRenderRouterStrip(msg)" :message="msg" />
           </template>
         </ChatMessageList>
 
-        <!-- Pre-reveal router phase: shown only before the live work-card owns
-             the turn. Once the work-card is visible, execution status becomes
+        <PlanCard
+          v-if="currentPlan && !currentPlanInHistory"
+          :plan="currentPlan"
+          :disabled="planActionsDisabled"
+          :pending-action="planCardPendingAction"
+          @implement-current="implementCurrentPlan"
+          @implement-new="implementPlanInNewTask"
+          @replan="beginPlanRevision"
+        />
+
+        <!-- Pre-reveal router phase: shown only before the live activity owns
+             the turn. Once activity is visible, execution status becomes
              the single primary progress surface. -->
         <RouterFxStrip
           v-if="routerStripReserve"
@@ -251,65 +207,79 @@
           />
         </template>
 
-        <!-- Streaming AI message: the live run is promoted into a centered
-             work card so it owns the focus while the agent works. -->
-        <div v-if="isStreaming && streamBubble && answerRevealOpen" class="msg-ai" data-history-role="assistant" aria-live="polite">
+        <!-- Streaming AI message: activity stays open and flat while the turn
+             is live. The trailing text segment is rendered below it as the
+             current answer candidate; if a later tool starts, that text moves
+             back into the chronological activity transcript. -->
+        <!-- No blanket aria-live here: the phase label inside ActivityDisclosure
+             is the single live announcement point, so streaming DOM churn (tool
+             rows, answer tokens) is not read out mutation-by-mutation. -->
+        <div v-if="isStreaming && streamBubble && answerRevealOpen" class="msg-ai" data-history-role="assistant">
           <div class="msg-ai-main">
-            <section
-              class="work-card"
-              :class="{ 'work-card--stale': streamActivityStale }"
-              role="status"
-              aria-live="polite"
+            <ActivityDisclosure
+              :lifecycle="liveAnswerPart ? 'answering' : 'working'"
+              :step-count="executionDockRun?.status === 'running' ? 0 : liveActivityStepCount"
+              :failure-count="liveActivityFailureCount"
+              :phase-label="liveActivityPhaseLabel"
+              :elapsed-label="streamPhaseElapsed"
+              :stale="streamActivityStale"
             >
-              <header v-if="streamActivityVisible" class="work-card__head stream-activity">
-                <span class="work-card__dot" aria-hidden="true" />
-                <span class="work-card__phase" :class="{ 'activity-shimmer': !streamActivityStale }">{{ liveWorkCardPhaseLabel }}</span>
-                <span v-if="streamPhaseElapsed" class="work-card__elapsed">{{ streamPhaseElapsed }}</span>
-                <span class="work-card__step">{{ liveWorkCardStepLabel }}</span>
-              </header>
+              <!-- Reasoning remains available as a flat, secondary disclosure,
+                   rendered by the same part component settled turns use so the
+                   chevron affordance and wording stay consistent; `live`
+                   selects the streaming "Thinking · Ns" label. -->
+              <ReasoningPart v-if="liveReasoningPart" :part="liveReasoningPart" live />
 
-              <!-- Live model reasoning: collapsed by default, expandable mid-turn -->
-              <details v-if="liveThinkingText" class="thinking-fold">
-                <summary class="thinking-fold__summary">
-                  <Icon class="thinking-fold__chevron" name="chevronRight" :size="12" />
-                  <span>{{ t('chat.thinking') }} · {{ streamThinkingElapsedText }}</span>
-                </summary>
-                <div class="thinking-fold__body">{{ liveThinkingText }}</div>
-              </details>
-
-              <ToolCallTimeline
-                v-if="liveTimelineItems.length"
-                class="work-card__timeline"
+              <AssistantActivityTimeline
+                v-if="
+                  liveActivityTimelineItems.length
+                  || liveActivityProjection.statusSteps.length
+                "
                 variant="checklist"
-                :items="liveTimelineItems"
+                :projection="liveActivityProjection"
+                :timeline-items="liveActivityTimelineItems"
+                :state-scope="liveToolStateScope"
                 :is-tool-group-open="isToolGroupOpen"
                 :is-tool-item-open="isToolItemOpen"
                 :tool-group-status-text="toolGroupStatusText"
                 :tool-status-text="toolStatusText"
                 :tool-secondary-text="toolSecondaryText"
-                :tool-elapsed-text="streamToolElapsedText"
+                :tool-elapsed-text="liveToolElapsedText"
                 @toggle-group="toggleToolGroup"
                 @toggle-item="toggleToolItem"
                 @show-result="showToolResultModal"
-              />
+              >
+                <template #interrupt="{ part }">
+                  <InterruptPart
+                    v-if="part.resolution"
+                    :part="part"
+                    timeline
+                    @resolve="resolveInterrupt"
+                    @extend="extendInterrupt"
+                    @clarify-submit="(fields, request) => submitClarify(fields, request)"
+                    @clarify-dismiss="dismissClarify"
+                  />
+                </template>
+              </AssistantActivityTimeline>
+            </ActivityDisclosure>
 
-              <!-- Live typing caret: a blinking "still generating" affordance at
-                   the tail of the streamed output. Only once real output exists
-                   (never a lone bar under the header), and hidden when stale. -->
-              <span v-if="!streamActivityStale && streamHasVisibleOutput" class="stream-caret" aria-hidden="true" />
-            </section>
-
-            <!-- Live inline interrupts (fold-driven): approval / clarify cards
-                 that block the in-flight turn, rendered after the work-card body
-                 and before the deliverables. -->
-            <InterruptPart
-              v-for="part in liveInterruptParts"
-              :key="part.key"
-              :part="part"
-              @resolve="resolveInterrupt"
-              @extend="extendInterrupt"
-              @clarify-submit="(fields, request) => submitClarify(fields, request)"
-              @clarify-dismiss="dismissClarify"
+            <!-- Provisional answer candidate: the left rule + draft tag mark
+                 it as not-final, because a later tool start moves this text
+                 back into the activity transcript. The tag sits outside the
+                 candidate box so the candidate's own text stays the answer. -->
+            <template v-if="liveAnswerPart">
+              <span class="live-answer-candidate-tag">{{ t('chat.metaRuns.draft') }}</span>
+              <div class="live-answer-candidate">
+                <TextPart
+                  :part="liveAnswerPart"
+                  :sources="[]"
+                />
+              </div>
+            </template>
+            <span
+              v-if="liveAnswerPart && !streamActivityStale"
+              class="stream-caret"
+              aria-hidden="true"
             />
 
             <ChatArtifactList
@@ -317,11 +287,26 @@
               :navigation-artifacts="sessionArtifacts"
               :session-key="sessionKey"
               :auth-token="readAuthToken()"
+              :prefer-workbench="workbenchEnabled"
               @download="downloadArtifact"
+              @open="openArtifact"
             />
 
           </div>
         </div>
+
+        <!-- Pending controls stay outside the collapsible activity timeline at
+             the live edge. A resolution removes this card and leaves its compact
+             outcome in chronological history. -->
+        <InterruptPart
+          v-for="part in livePendingInterruptParts"
+          :key="part.key"
+          :part="part"
+          @resolve="resolveInterrupt"
+          @extend="extendInterrupt"
+          @clarify-submit="(fields, request) => submitClarify(fields, request)"
+          @clarify-dismiss="dismissClarify"
+        />
 
         <!-- Soft long-running banner: content events crossed the high watchdog
              threshold while no backend-deadline-owned phase (tool, approval,
@@ -383,21 +368,11 @@
           :strip-time-prefix="stripTimePrefix"
           :session-key="sessionKey"
           :history-has-more="historyState.hasMore"
-          :history-loading="historyState.loading"
           @navigate="onHistoryNavigate"
           @navigate-end="onHistoryNavigateEnd"
-          @load-earlier="loadEarlierHistory"
         />
       </div>
     </div>
-
-    <PendingQueue
-      :items="pendingQueue"
-      :max-pending="maxPending"
-      :mode="isStreaming ? busySendMode : null"
-      @clear="clearPendingQueue"
-      @remove="removePendingChip"
-    />
 
     <!-- Compaction maintenance card -->
     <div v-if="compactStatus.visible" class="chat-compact-status" :class="`chat-compact-status--${compactStatus.tone}`" role="status" aria-live="polite">
@@ -423,11 +398,35 @@
       </div>
     </div>
 
+    <SandboxSetupBanner
+      v-if="sandboxSetupVisible"
+      :status="sandboxSetupStatus"
+      :can-setup="sandboxSetupCanSetup"
+      :ensuring="sandboxSetupEnsuring"
+      :error="sandboxSetupError"
+      @setup="ensureSandboxSetup"
+      @dismiss="dismissSandboxSetup"
+    />
+
     <!-- Composer dock: positioning context so the slash menu anchors directly
          above the composer in any layout. The new-chat landing centers the
          composer instead of pinning it to the bottom, so the menu must not
          anchor to the chat container's bottom edge. -->
     <div class="chat-composer-dock">
+    <!-- Durable execution progress belongs to the work surface, not to the
+         transcript. Keeping it immediately above the composer also lets a
+         future goal driver reuse this dock across multiple turns. -->
+    <Transition name="plan-run-dock">
+      <div v-if="executionDockRun" class="plan-run-dock">
+        <PlanRunRibbon
+          :run="executionDockRun"
+          :cancel-busy="planActionPending === 'cancel-run'"
+          :disabled="planModeBusy || planActionPending !== null"
+          @cancel="cancelActivePlanRun"
+          @focus-return="focusComposerAfterPlanRun"
+        />
+      </div>
+    </Transition>
     <!-- Jump-to-latest: floats above the composer once the reader has scrolled up
          off the live edge, so a long streaming answer is never lost below the fold. -->
     <Transition name="jump-latest">
@@ -453,30 +452,54 @@
         @click="selectSlashCmd(cmd)"
       >
         <span class="chat-slash-cmd">{{ cmd.cmd }}</span>
-        <span class="chat-slash-desc">{{ cmd.desc }}</span>
+        <span class="chat-slash-desc" :title="cmd.desc">{{ cmd.desc }}</span>
       </div>
     </div>
+
+    <PendingQueue
+      :items="pendingQueue"
+      :max-pending="maxPending"
+      :image-blocked-message="queuedImageSendBlockedMessage"
+      :steer-available="sameTurnSteerAvailable"
+      @clear="clearPendingQueue"
+      @edit="editPendingMessage"
+      @remove="removePendingChip"
+      @steer="steerPendingMessage"
+    />
 
     <ChatComposer
       ref="composerRef"
       v-model="inputText"
       :attachments="pendingAttachments"
       :busy-send-mode="busySendMode"
-      :has-send-content="hasSendContent"
+      :has-send-content="composerHasSendContent"
       :is-streaming="isStreaming"
+      :can-stop="canStop"
+      :stop-targets-plan-run="composerStopsPlanRun"
       :is-new-landing="isNewChatLanding"
       :placeholder="composerPlaceholder"
       :send-button-title="sendButtonTitle"
+      :send-blocked-message="composerSendBlockedMessage"
       :run-mode="runMode"
       :allowed-run-modes="allowedRunModes"
+      :run-mode-locked="runModeLocked"
+      :run-mode-lock-message="t('chat.composer.runModeLocked')"
       :model-routing-mode="modelRoutingMode"
       :model-routing-settings-busy="modelRoutingSettingsBusy"
-      :router-visual-effects-enabled="routerVisualEffectsEnabled"
-      :coding-mode-enabled="codingModeEnabled"
-      :coding-mode-settings-busy="codingModeSettingsBusy"
       :voice-busy="voiceBusy"
       :voice-recording="voiceRecording"
       :voice-ready="voiceReady"
+      :project-workspace="activeWorkspace"
+      :project-workspace-status="activeWorkspaceStatus"
+      :project-status-message="activeProjectStatusMessage"
+      :can-close-project="isDraftRoute() && pendingWorkspaceId !== null"
+      :can-choose-project="rpc.canChooseProject"
+      :plan-mode-available="planUiAvailable"
+      :collaboration-mode="collaboration.mode"
+      :plan-mode-busy="planModeBusy"
+      :plan-mode-disabled="planActionPending !== null"
+      :plan-mode-applies-next-turn="planModeAppliesNextTurn"
+      :replan-active="replanActive"
       @composition-change="composing = $event"
       @beforeinput="onTextareaBeforeInput"
       @file-change="onFileInputChange"
@@ -487,13 +510,24 @@
       @set-busy-send-mode="busySendMode = $event"
       @set-run-mode="setComposerRunMode"
       @set-model-routing-mode="setComposerModelRoutingMode"
-      @set-visual-effects-enabled="setComposerVisualEffectsEnabled"
-      @set-coding-mode-enabled="setComposerCodingModeEnabled"
+      @set-collaboration-mode="setCollaborationMode"
+      @cancel-replan="cancelPlanRevision"
       @voice-input="onVoiceInput"
       @voice-setup="onVoiceSetup"
       @export-markdown="exportMarkdown"
-      @send="onSend"
-      @stop="onStop"
+      @send="onComposerSend"
+      @stop="onComposerStop"
+      @choose-project="openProjectPicker"
+      @close-project="closeProjectDraft"
+    />
+    <ProjectWorkspacePickerDialog
+      v-if="rpc.canChooseProject"
+      :open="projectPickerOpen"
+      :enabled="rpc.canChooseProject"
+      :session-key="sessionKey"
+      :initial-path="activeWorkspace?.path"
+      @close="projectPickerOpen = false"
+      @choose="chooseProjectPath"
     />
     </div>
 
@@ -510,16 +544,8 @@
       :artifacts="sessionArtifacts"
       :session-key="sessionKey"
       :auth-token="readAuthToken()"
-      @close="deliverablesOpen = false"
+      @close="closeDeliverables"
       @download="downloadArtifact"
-    />
-
-    <MetaRunHistoryDrawer
-      v-if="appStore.features.metaRuns"
-      :open="metaRunsHistoryOpen"
-      :rpc="rpc"
-      :session-key="sessionKey"
-      @close="metaRunsHistoryOpen = false"
     />
 
     <SharePreviewModal
@@ -534,6 +560,13 @@
       @copy="onShareCopy"
       @set-theme="onShareSetTheme"
     />
+
+    <!-- Persistent completion announcer: the live block's role="status" phase
+         label unmounts with the block when streaming ends, so on its own the
+         settle would never reach a screen reader. This region stays mounted
+         across the streaming boundary; it fills when a live turn settles and
+         clears when the next turn starts so repeat turns announce again. -->
+    <span class="chat-turn-settled-announcer" role="status" aria-live="polite">{{ turnSettledAnnouncement }}</span>
   </div>
 </template>
 
@@ -544,26 +577,36 @@ import { useRouter } from 'vue-router'
 import { useRpcStore } from '@/stores/rpc'
 import { useRpcCall } from '@/composables/useRpc'
 import { useAppStore } from '@/stores/app'
+import { useWorkbenchStore } from '@/workbench/store'
+import { usePlatform } from '@/platform'
 import ApprovalCard from '@/components/chat/ApprovalCard.vue'
+import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
+import AssistantActivityTimeline from '@/components/chat/AssistantActivityTimeline.vue'
 import ChatArtifactList from '@/components/chat/ChatArtifactList.vue'
+import ChatHeaderActions from '@/components/chat/ChatHeaderActions.vue'
 import DeliverablesDrawer from '@/components/chat/DeliverablesDrawer.vue'
 import ChatComposer from '@/components/chat/ChatComposer.vue'
-import ChatHistoryScopeRow from '@/components/chat/ChatHistoryScopeRow.vue'
+import ProjectWorkspacePickerDialog from '@/components/ProjectWorkspacePickerDialog.vue'
 import ChatMessageList from '@/components/chat/ChatMessageList.vue'
+import ChatSessionRecoveryStatus from '@/components/chat/ChatSessionRecoveryStatus.vue'
 import ChatStallNotice from '@/components/chat/ChatStallNotice.vue'
 import ClarifyCard from '@/components/chat/ClarifyCard.vue'
 import ConversationMinimap from '@/components/chat/ConversationMinimap.vue'
 import EmptyStateChips from '@/components/chat/EmptyStateChips.vue'
 import InterruptPart from '@/components/chat/parts/InterruptPart.vue'
+import ReasoningPart from '@/components/chat/parts/ReasoningPart.vue'
+import TextPart from '@/components/chat/parts/TextPart.vue'
 import MetaPreflightCard from '@/components/chat/MetaPreflightCard.vue'
 import MetaRibbon from '@/components/chat/MetaRibbon.vue'
-import MetaRunHistoryDrawer from '@/components/chat/MetaRunHistoryDrawer.vue'
 import PendingQueue from '@/components/chat/PendingQueue.vue'
+import PlanCard from '@/components/chat/PlanCard.vue'
+import PlanRunRibbon from '@/components/chat/PlanRunRibbon.vue'
 import RouterFxStrip from '@/components/chat/RouterFxStrip.vue'
+import SandboxSetupBanner from '@/components/chat/SandboxSetupBanner.vue'
 import SharePreviewModal from '@/components/chat/SharePreviewModal.vue'
-import ToolCallTimeline from '@/components/chat/ToolCallTimeline.vue'
 import ToolResultModal from '@/components/chat/ToolResultModal.vue'
 import Icon from '@/components/Icon.vue'
+import HistoryLoadSentinel from '@/components/HistoryLoadSentinel.vue'
 import { useChatApprovals } from '@/composables/chat/useChatApprovals'
 import { useChatAttachments } from '@/composables/chat/useChatAttachments'
 import { useChatCompaction } from '@/composables/chat/useChatCompaction'
@@ -574,7 +617,10 @@ import { useChatFeatureToggles } from '@/composables/chat/useChatFeatureToggles'
 import { useChatHistory } from '@/composables/chat/useChatHistory'
 import { useChatMarkdownExport } from '@/composables/chat/useChatMarkdownExport'
 import { useChatMessageActions } from '@/composables/chat/useChatMessageActions'
-import { useChatPendingQueue } from '@/composables/chat/useChatPendingQueue'
+import {
+  useChatPendingQueue,
+  type PendingQueueOwnerContext,
+} from '@/composables/chat/useChatPendingQueue'
 import { useChatShareExport } from '@/composables/chat/useChatShareExport'
 import type { ShareExportTheme } from '@/composables/chat/useChatShareExport'
 import { useMediaQuery } from '@/composables/chat/useMediaQuery'
@@ -583,18 +629,29 @@ import {
   truncate,
   useChatRenderedMessages,
 } from '@/composables/chat/useChatRenderedMessages'
-import { messagesWithStoppedOutputNotice } from '@/composables/chat/stoppedOutputNotice'
 import { useChatRouterDecisionRuntime } from '@/composables/chat/useChatRouterDecisionRuntime'
 import { useChatAnswerReveal } from '@/composables/chat/useChatAnswerReveal'
 import { useChatRpcEventHandlers } from '@/composables/chat/useChatRpcEventHandlers'
 import { useChatRpcSubscriptions } from '@/composables/chat/useChatRpcSubscriptions'
-import { useChatSend } from '@/composables/chat/useChatSend'
+import { useChatSend, type ChatSendOutcome } from '@/composables/chat/useChatSend'
+import { useSandboxSetupRecovery } from '@/composables/chat/useSandboxSetupRecovery'
 import { useChatStallWatchdog } from '@/composables/chat/useChatStallWatchdog'
+import { useArtifactImageLightbox } from '@/composables/chat/useArtifactImageLightbox'
 import { useMetaRuns } from '@/composables/chat/useMetaRuns'
-import { useAgentOptions } from '@/composables/useAgentOptions'
+import { useChatPlans } from '@/composables/chat/useChatPlans'
 import { runStatusLabelText as sessionRunStatusLabelText } from '@/composables/useSessions'
 import { useChatSessionRoute } from '@/composables/chat/useChatSessionRoute'
-import { useChatRunModePreference, type RunModePolicy } from '@/composables/chat/useChatRunModePreference'
+import {
+  useChatRunModePreference,
+  type RunModePolicy,
+} from '@/composables/chat/useChatRunModePreference'
+import { useChatSessionBootstrap } from '@/composables/chat/useChatSessionBootstrap'
+import { autoSendDraftIsUnchanged } from '@/composables/chat/sessionBootstrapContract'
+import {
+  acquireSessionBootstrapAdmission,
+  claimSessionBootstrapAdmission,
+  optionalSessionRpcCallOptions,
+} from '@/composables/chat/sessionBootstrapAdmission'
 import { useChatSessionRuntime } from '@/composables/chat/useChatSessionRuntime'
 import { useChatSessionSubscription } from '@/composables/chat/useChatSessionSubscription'
 import { useChatSlashCommands } from '@/composables/chat/useChatSlashCommands'
@@ -603,25 +660,67 @@ import { useChatTextRendering } from '@/composables/chat/useChatTextRendering'
 import { useChatUsageWidget } from '@/composables/chat/useChatUsageWidget'
 import { useVoiceInput } from '@/composables/chat/useVoiceInput'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
+import { hasOpenDialogLayer } from '@/composables/useDialogA11y'
 import { useToasts } from '@/composables/useToasts'
+import { useConfirm } from '@/composables/useConfirm'
+import {
+  useProjectWorkspaces,
+  type ProjectWorkspaceItem,
+} from '@/composables/useProjectWorkspaces'
+import {
+  createDraftProjectHydrationGuard,
+  useActiveProjectWorkspace,
+  type ActiveProjectWorkspaceSnapshot,
+} from '@/composables/useActiveProjectWorkspace'
+import { useFreshTaskDraft } from '@/composables/useFreshTaskDraft'
 import type {
+  Attachment,
   ChatMessage,
+  ChatPendingItem,
   ChatRenderedMessage,
   ChatRunStatus,
   ChatRunStatusSource,
   ChatRunStatusState,
+  ChatStreamTimelineItem,
+  ChatToolCall,
+  DisplayAttachment,
   ToolResultContext,
 } from '@/types/chat'
 import type {
   ArtifactPayload,
   SessionEventPayload,
+  SessionMessagesSnapshotResponse,
 } from '@/types/rpc'
 import type { ModelRoutingMode } from '@/types/modelRouting'
-import type { SandboxRunMode } from '@/types/sandbox'
-import type { InterruptViewState } from '@/types/parts'
-import { artifactDownloadUrl } from '@/utils/chat/artifacts'
+import { isSandboxRunMode, type SandboxRunMode } from '@/types/sandbox'
+import type { ChatPart, InterruptViewState } from '@/types/parts'
+import type {
+  CollaborationMode,
+  PlanCardAction,
+  PlanCardActionTarget,
+  PlanRunSnapshot,
+} from '@/types/plans'
+import {
+  artifactCategory,
+  artifactDownloadUrl,
+  isInlineMediaArtifact,
+} from '@/utils/chat/artifacts'
+import {
+  artifactFromWorkbenchItem,
+  createArtifactPreviewWorkbenchItem,
+} from '@/workbench/artifactItems'
+import {
+  artifactUsesWorkbenchPreview,
+  artifactWorkbenchPreviewKind,
+} from '@/utils/workbench/artifactPreview'
+import { focusArtifactInTranscript } from '@/utils/chat/artifactFocus'
+import { fetchDisplayAttachmentBlob } from '@/utils/chat/attachmentAccess'
 import { createHistoryNavigationScrollLock } from '@/utils/chat/historyNavigationScrollLock'
-import { isCurrentSessionPayload as payloadIsCurrentSession } from '@/utils/chat/streamEvents'
+import {
+  PENDING_STREAM_TASK_ID,
+  STOPPED_STREAM_TASK_ID,
+  isCurrentSessionPayload as payloadIsCurrentSession,
+} from '@/utils/chat/streamEvents'
 import { copyTextWithFallback, copyImageToClipboard, downloadBlob, shareCopyImageSupported } from '@/utils/browser'
 import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
 import { recordSessionNavigationDiag } from '@/utils/chat/sessionNavigationDiag'
@@ -631,9 +730,26 @@ import {
   toolSecondaryText,
   toolStatusText,
 } from '@/utils/chat/toolDisplay'
-import { isSendableAttachment } from '@/utils/chat/attachments'
+import {
+  collectClipboardFiles,
+  hasSendableModelInputImageAttachment,
+  isSendableAttachment,
+  shouldCaptureFilePaste,
+} from '@/utils/chat/attachments'
 import { isShareableChatMessage } from '@/utils/chat/messageIdentity'
-import { agentIdFromSessionKey, normalizeAgentId } from '@/utils/chat/sessionKeys'
+import { agentIdFromSessionKey } from '@/utils/chat/sessionKeys'
+import { shouldDisableLandingSuggestions } from '@/utils/chat/landingSuggestions'
+import { clearAssistantActivityExpansionState } from '@/utils/chat/activityDisclosureState'
+import {
+  resolveChatHistoryRecoveryState,
+  shouldShowConfirmedEmptySession,
+  visibleChatHistoryRecoveryState,
+} from '@/utils/chat/sessionLoadState'
+import {
+  isSemanticActivityStatusStep,
+  projectAssistantActivityTimeline,
+  splitLiveAssistantTimeline,
+} from '@/utils/chat/assistantActivity'
 
 /* ── Types ─────────────────────────────────────────────────────────── */
 
@@ -672,10 +788,38 @@ const toolResultModal = ref<{
 /* ── Stores / Router ───────────────────────────────────────────────── */
 
 const rpc = useRpcStore()
+// Setup runs before this view's/ancestor children's mounted hooks. Holding the
+// admission gate here prevents global onboarding/workspace metadata calls from
+// entering the serialized Gateway queue ahead of session recovery.
+let releaseOptionalRpcAdmission: (() => void) | null =
+  claimSessionBootstrapAdmission()
+let optionalRpcAdmissionGeneration = 0
 const appStore = useAppStore()
+const workbenchStore = useWorkbenchStore()
+const artifactImageLightbox = useArtifactImageLightbox()
+const platform = usePlatform()
 const router = useRouter()
 const { t } = useI18n()
 const { pushToast } = useToasts()
+const { confirm } = useConfirm()
+const projectWorkspaces = useProjectWorkspaces()
+const activeProjectWorkspace = useActiveProjectWorkspace()
+const draftProjectHydration = createDraftProjectHydrationGuard()
+const {
+  pendingWorkspaceId,
+  boundWorkspaceId,
+  activeWorkspace,
+  status: activeWorkspaceStatus,
+  sendBlockedReason: activeWorkspaceSendBlockedReason,
+} = activeProjectWorkspace
+const projectPickerOpen = ref(false)
+let activeProjectValidationController: AbortController | null = null
+
+function cancelActiveProjectValidation() {
+  activeProjectValidationController?.abort()
+  activeProjectValidationController = null
+}
+
 const isCompactViewport = useMediaQuery('(max-width: 480px)')
 const isDesktopViewport = useMediaQuery('(min-width: 769px)')
 const landingAgentId = computed(() => agentIdFromSessionKey(sessionKey.value))
@@ -691,11 +835,17 @@ const pendingAutoSend = ref('')
 
 const threadRef = ref<HTMLElement | null>(null)
 const composerRef = ref<ChatComposerHandle | null>(null)
+type ChatHeaderActionsHandle = {
+  focusAction: (action: 'deliverables' | 'runs' | 'share' | 'copy-session-key') => boolean
+}
+const chatHeaderActionsRef = ref<ChatHeaderActionsHandle | null>(null)
 
 /* ── State ─────────────────────────────────────────────────────────── */
 
 const sessionKey = ref('')
+const workbenchEnabled = computed(() => appStore.features.artifactWorkbench === true)
 const inputText = ref('')
+const composerRevision = ref(0)
 const aborted = ref(false)
 const autoScroll = ref(true)
 const historyNavigationScrollLock = createHistoryNavigationScrollLock(autoScroll)
@@ -711,7 +861,6 @@ const shareMode = ref(false)
 const shareSaving = ref(false)
 const selectedShareMessageIds = ref<Set<string>>(new Set())
 const shareBannerRef = ref<HTMLElement | null>(null)
-const shareEntryBtnRef = ref<HTMLButtonElement | null>(null)
 // Preview-before-download: Save renders the PNG to a blob and opens the modal
 // instead of downloading blind. The view owns the object-URL lifecycle.
 const sharePreview = ref<{ url: string; blob: Blob; filename: string } | null>(null)
@@ -734,15 +883,59 @@ const {
 } = chatElevatedMode
 
 const {
-  runMode,
+  runMode: globalRunMode,
   allowedRunModes,
-  setRunMode: setPersistedRunMode,
+  hydrateRunModePreference,
+  setGlobalRunMode,
+  applyRunModePreferenceChanged,
 } = useChatRunModePreference({
+  rpc,
+  hydrateCallOptions: optionalSessionRpcCallOptions,
   runModePolicy: () => {
     const auth = rpc.auth as RpcAuthPayload | null
     return auth?.runModePolicy
   },
 })
+async function refreshRunModePreference() {
+  try {
+    await hydrateRunModePreference()
+  } catch (cause) {
+    console.warn(
+      'Failed to hydrate global sandbox run mode:',
+      cause instanceof Error ? cause.message : String(cause),
+    )
+  }
+}
+const activeRunModeLock = ref<SandboxRunMode | null>(null)
+const runMode = computed<SandboxRunMode>(
+  () => activeRunModeLock.value ?? globalRunMode.value,
+)
+
+const sandboxSetupRecovery = useSandboxSetupRecovery({
+  rpc: {
+    call: (method, params) =>
+      rpc.call(method, params, optionalSessionRpcCallOptions),
+  },
+  connectionState: computed(() => rpc.state),
+  runMode,
+  autoRefresh: false,
+})
+const {
+  status: sandboxSetupStatus,
+  ensuring: sandboxSetupEnsuring,
+  error: sandboxSetupError,
+  visible: sandboxSetupVisible,
+  canSetup: sandboxSetupCanSetup,
+  ensureSetup: ensureSandboxSetup,
+  dismiss: dismissSandboxSetup,
+} = sandboxSetupRecovery
+
+async function refreshPostBootstrapMetadata() {
+  await refreshRunModePreference()
+  if (!chatViewDisposed && rpc.state === 'connected') {
+    await sandboxSetupRecovery.refresh()
+  }
+}
 
 // Run status
 const runStatus = ref<ChatRunStatus>({ status: 'idle', label: t('chat.status.idle'), task: null })
@@ -755,10 +948,26 @@ const activeTaskGroups = ref<Set<string>>(new Set())
 // current turn so a prior task can't leak into it (issue 344).
 const activeStreamTaskId = ref<string>('')
 const activeStreamSessionKey = ref<string>('')
+let bindActiveStreamTask = (taskId: string) => { activeStreamTaskId.value = taskId }
+let restoreLiveTurnSnapshot = (_snapshot: SessionMessagesSnapshotResponse) => {}
 
 // Pending session intent
 const pendingSessionIntent = ref<string | null>(null)
 const pendingForkBeforeMessageId = ref<string | null>(null)
+const freshTaskDraft = useFreshTaskDraft()
+
+function activeSnapshot(workspace: ProjectWorkspaceItem): ActiveProjectWorkspaceSnapshot {
+  return {
+    id: workspace.id,
+    name: workspace.name,
+    path: workspace.path,
+    available: workspace.available,
+    removed: false,
+    ...(workspace.availabilityReason
+      ? { availabilityReason: workspace.availabilityReason }
+      : {}),
+  }
+}
 let applySessionRunState: (source: ChatRunStatusSource | null | undefined) => void = () => {}
 let resetComposerInputHistory: () => void = () => {}
 
@@ -768,7 +977,6 @@ const {
   sanitizeCopyText,
   stripDirectiveTags,
   stripGeneratedArtifactMarkers,
-  stripProtocolTextLeak,
   stripTimePrefix,
 } = chatTextRendering
 
@@ -783,11 +991,11 @@ const chatStream = useChatStream({
   lastHeaderRole,
   aborted,
   autoScroll,
+  runStatus,
   applySessionRunState: source => applySessionRunState(source),
   renderMarkdown,
   stripDirectiveTags,
   stripGeneratedArtifactMarkers,
-  stripProtocolTextLeak,
   scrollToBottom,
   interruptState,
   rpcPolicy: () => rpc.policy,
@@ -798,11 +1006,9 @@ const {
   streamBubble,
   streamHasVisibleOutput,
   streamTimelineItems,
-  streamActivityVisible,
   streamActivityStale,
   streamPhaseLabel,
   streamPhaseElapsed,
-  streamStepLabel,
   streamToolElapsedText,
   streamIdleTimeoutMs,
   thinkingVisible,
@@ -823,10 +1029,10 @@ const {
   appendInterruptFrame,
   ensureInterruptBubble,
 } = chatStream
-
 const chatAttachments = useChatAttachments()
 const {
   pendingAttachments,
+  attachmentWorkBusy,
   onFileInputChange,
   addAttachments,
   removeAttachment,
@@ -834,39 +1040,89 @@ const {
   hasPendingAttachmentWork,
   prepareAttachmentsForSend,
 } = chatAttachments
+watch(
+  [inputText, pendingAttachments],
+  () => {
+    composerRevision.value += 1
+  },
+  { deep: true, flush: 'sync' },
+)
 
 let sendCurrentInput: () => void = () => {}
+let sendAutomaticInput: () => void = () => {}
 // Late-bound: dispatchHiddenSend is created below (useChatSend) but the /meta
 // slash handler (useChatSlashCommands, created earlier) needs it at call time.
 let dispatchHiddenForMeta: (providerText: string, displayText: string) => void = () => {}
+let dispatchPlanComposerPrompt: (prompt: string, composerText: string) => void = () => {}
 let isCompactInFlightForCurrentSession: () => boolean = () => false
-let dispatchHiddenControl: (providerText: string, displayText: string) => void = () => {}
+let isQueuedDeliveryBlocked: () => boolean = () => false
+let isLiveDeliveryBlocked: () => boolean = () => true
+let dispatchHiddenControl: (
+  providerText: string,
+  displayText: string,
+  ownerSessionKey?: string,
+  queuedItem?: ChatPendingItem,
+) => Promise<ChatSendOutcome> = async () => 'not_sent'
+let dispatchQueuedItem: (
+  item: ChatPendingItem,
+  ownerSessionKey?: string,
+) => Promise<ChatSendOutcome> = async () => 'not_sent'
+const pendingQueueOwnerContext = ref<PendingQueueOwnerContext | null>(null)
 const chatPendingQueue = useChatPendingQueue({
+  sessionKey,
+  ownerContext: pendingQueueOwnerContext,
   inputText,
   pendingAttachments,
   pendingSessionIntent,
   isStreaming,
-  isBlocked: () => isCompactInFlightForCurrentSession(),
+  isBlocked: () => (
+    isCompactInFlightForCurrentSession()
+    || isQueuedDeliveryBlocked()
+    || isLiveDeliveryBlocked()
+    || ['resolving', 'unavailable', 'removed', 'error'].includes(
+      activeWorkspaceStatus.value,
+    )
+    || hasPendingAttachmentWork()
+    || pendingQueueOwnerContext.value?.sessionKey === sessionKey.value
+  ),
   autoResizeTextarea,
   sendCurrentInput: () => sendCurrentInput(),
   resetInputHistory: () => resetComposerInputHistory(),
   hasComposer: () => Boolean(composerRef.value),
-  dispatchHiddenControl: (providerText, displayText) => dispatchHiddenControl(providerText, displayText),
+  dispatchHiddenControl: (item, ownerSessionKey) =>
+    dispatchHiddenControl(
+      item.text,
+      item.displayTextOverride || '',
+      ownerSessionKey,
+      item,
+    ),
+  dispatchPendingItem: (item, ownerSessionKey) =>
+    dispatchQueuedItem(item, ownerSessionKey),
 })
 const {
   pendingQueue,
   canQueueMore,
   busySendMode,
   maxPending,
+  enqueuePendingPayload,
   enqueuePendingInput,
   enqueueHiddenControl,
+  enqueuePendingSteerRetry,
   removePendingChip,
+  beginPendingDelivery,
+  settlePendingDelivery,
   clearPendingQueue,
+  switchPendingQueue,
+  adoptPendingQueue,
   popPendingTail,
   popAllPendingIntoComposer,
   schedulePendingDrainAfterTerminal,
+  flushDeferredPendingDrain,
   cleanup: cleanupPendingQueue,
 } = chatPendingQueue
+watch(attachmentWorkBusy, (busy) => {
+  if (!busy) flushDeferredPendingDrain()
+})
 
 const chatCompaction = useChatCompaction({
   sessionKey,
@@ -891,13 +1147,13 @@ const compactGaugeVisible = computed(() =>
 
 const chatUsageWidget = useChatUsageWidget({
   rpc,
+  readCallOptions: optionalSessionRpcCallOptions,
   sessionKey,
   tokenVizEnabled: () => appStore.features.tokenViz,
 })
 const {
   usageAccum,
   usageModel,
-  contextWarning,
   resetSavingsPopupCooldown,
   saveWidgetState,
   restoreWidgetState,
@@ -906,6 +1162,7 @@ const {
 
 const chatFeatureToggles = useChatFeatureToggles({
   rpc,
+  readCallOptions: optionalSessionRpcCallOptions,
   setGlobalElevatedMode,
   loadCurrentSessionUsage,
 })
@@ -918,14 +1175,28 @@ const {
   routerVisualEffectsEnabled,
   routerVisualMode,
   codingModeEnabled,
-  codingModeSettingsBusy,
   routerTierConfigs,
   loadFeatureToggles,
   setModelRoutingMode,
   setCodingModeEnabled,
-  setRouterVisualEffectsEnabled,
   bindFeatureRefresh,
 } = chatFeatureToggles
+isQueuedDeliveryBlocked = () => (
+  modelRoutingSettingsBusy.value
+  && hasSendableModelInputImageAttachment(pendingQueue.value[0]?.attachments || [])
+)
+watch(
+  [modelRoutingMode, modelRoutingSettingsBusy],
+  ([mode, busy], [previousMode, wasBusy]) => {
+    const routingUnblocked = (
+      (previousMode === 'llm_ensemble' && mode !== 'llm_ensemble')
+      || (wasBusy && !busy)
+    )
+    if (!routingUnblocked || pendingQueue.value.length === 0) return
+    schedulePendingDrainAfterTerminal()
+    flushDeferredPendingDrain()
+  },
+)
 
 const chatRouterDecisionRuntime = useChatRouterDecisionRuntime({
   messages,
@@ -970,96 +1241,43 @@ const {
   hasLegacyNewChatQuery,
   isDraftRoute,
   persistSession,
+  readProjectFromUrl,
   resolveInitialSession,
 } = chatSessionRoute
 
-// In-draft agent switcher (new-chat landing): lets the user swap the draft's
-// agent before the first message. Shares one agents.list path with the sidebar.
-const { selectableAgents, loadAgents: loadAgentOptions } = useAgentOptions()
-const agentSwitcherOpen = ref(false)
-const agentSwitcherRef = ref<HTMLElement | null>(null)
-
-const landingAgentName = computed(() => {
-  const id = landingAgentId.value
-  const match = selectableAgents.value.find(agent => agent.id === id)
-  return match?.name || (id === 'main' ? t('chat.mainAgent') : id)
-})
-
-function toggleAgentSwitcher() {
-  agentSwitcherOpen.value = !agentSwitcherOpen.value
-  if (agentSwitcherOpen.value && selectableAgents.value.length <= 1) {
-    void loadAgentOptions()
-  }
-  if (agentSwitcherOpen.value) {
-    // Land focus on the checked agent if present, else the first item, so the
-    // menu is keyboard-operable the moment it opens.
-    nextTick(() => {
-      const menu = agentSwitcherRef.value?.querySelector('.chat-landing-agent__menu')
-      const items = menu?.querySelectorAll<HTMLElement>('.chat-landing-agent__item')
-      if (!items?.length) return
-      const checked = menu?.querySelector<HTMLElement>('[aria-checked="true"]')
-      ;(checked ?? items[0]).focus()
-    })
-  }
-}
-
-function closeAgentSwitcher() {
-  agentSwitcherOpen.value = false
-}
-
-// Arrow keys rove between the agent items (including "Create agent…"), wrapping
-// at the ends; Escape closes and restores focus to the switcher trigger.
-function onAgentSwitcherKeydown(e: KeyboardEvent) {
-  if (e.key === 'Escape') {
-    e.preventDefault()
-    closeAgentSwitcher()
-    nextTick(() => agentSwitcherRef.value?.querySelector<HTMLElement>('.chat-landing-agent__btn')?.focus())
-    return
-  }
-  // Tab must dismiss the open menu (WAI-ARIA menu pattern) and let focus move on
-  // naturally — the outside-click handler does not fire on a keyboard Tab.
-  if (e.key === 'Tab') {
-    closeAgentSwitcher()
-    return
-  }
-  if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return
-  const menu = agentSwitcherRef.value?.querySelector('.chat-landing-agent__menu')
-  const items = Array.from(menu?.querySelectorAll<HTMLElement>('.chat-landing-agent__item') ?? [])
-  if (!items.length) return
-  e.preventDefault()
-  const current = items.indexOf(document.activeElement as HTMLElement)
-  const delta = e.key === 'ArrowDown' ? 1 : -1
-  const next = (current + delta + items.length) % items.length
-  items[next]?.focus()
-}
-
-// Selecting an agent re-enters the draft for it. The draft carries no messages
-// yet, so swapping with replace semantics is safe and leaves no history entry.
-function pickDraftAgent(agentId: string) {
-  closeAgentSwitcher()
-  const id = normalizeAgentId(agentId)
-  if (id === landingAgentId.value) return
-  goToDraft({ agentId: id, replace: true })
-}
-
-function createAgentFromSwitcher() {
-  closeAgentSwitcher()
-  router.push('/agents')
-}
-
-useDocumentEvent('click', (e) => {
-  if (!agentSwitcherOpen.value) return
-  const host = agentSwitcherRef.value
-  if (host && e.target instanceof Node && !host.contains(e.target)) closeAgentSwitcher()
-})
-
-const renderSourceMessages = computed(() =>
-  messagesWithStoppedOutputNotice(
-    messages.value,
-    runStatus.value,
-    t('sessions.status.outputInterrupted'),
+let switchToPlanSession: (key: string) => void | Promise<unknown> = () => {}
+let planMutationAccepted: () => void = () => {}
+const chatPlans = useChatPlans({
+  rpc,
+  sessionKey,
+  currentEpoch,
+  isStreaming,
+  inputText,
+  createSessionKey,
+  agentId: () => agentIdFromSessionKey(sessionKey.value),
+  switchToSession: key => switchToPlanSession(key),
+  focusComposer: () => composerRef.value?.focusTextarea(),
+  notifyError: message => pushToast(
+    t('chat.plan.actionFailed', { error: message }),
+    { tone: 'danger', duration: 8000 },
   ),
-)
+  onMutationAccepted: () => planMutationAccepted(),
+  isDraft: () => isDraftRoute() && pendingSessionIntent.value === 'new_chat',
+})
+const {
+  collaboration,
+  initialCollaborationMode,
+  currentPlan,
+  currentPlanRevisionId,
+  activePlanRun,
+  modeBusy: planModeBusy,
+  modeAppliesNextTurn: planModeAppliesNextTurn,
+  pendingAction: planActionPending,
+  replanTarget,
+  replanActive,
+} = chatPlans
+
+const renderSourceMessages = computed(() => messages.value)
 const chatRenderedMessages = useChatRenderedMessages({
   messages: renderSourceMessages,
   interruptState,
@@ -1071,6 +1289,7 @@ const chatRenderedMessages = useChatRenderedMessages({
   routerVisualMode,
   modelRoutingMode,
   isStreaming,
+  currentPlanRevisionId,
   renderMarkdown,
   stripGeneratedArtifactMarkers,
   stripTimePrefix,
@@ -1078,16 +1297,9 @@ const chatRenderedMessages = useChatRenderedMessages({
 })
 const { renderedMessages, routerDecisionCells } = chatRenderedMessages
 
-// The live ensemble strip owns the synthesizing narrative — it reveals members
-// as they run and settles in place — so the work-card runs its normal execution
-// phase alongside it. The two are independent progress surfaces on purpose: the
-// strip answers "which models are synthesizing", the work-card "what step now".
-const liveWorkCardPhaseLabel = streamPhaseLabel
-const liveWorkCardStepLabel = streamStepLabel
-
 function shouldRenderRouterStrip(_message: ChatRenderedMessage): boolean {
   // Always surface the router strip — the live ensemble strip is the primary
-  // surface for the synthesizing process and no longer defers to the work-card.
+  // surface for the synthesizing process and no longer defers to activity.
   return true
 }
 
@@ -1099,10 +1311,14 @@ function shouldRenderRouterStrip(_message: ChatRenderedMessage): boolean {
 const routerStripReserve = computed<ChatRenderedMessage | null>(() => {
   if (!isStreaming.value || !routerEnabled.value || !routerVisualEffectsEnabled.value) return null
   const rendered = renderedMessages.value
+  const liveTurnKey = [...rendered]
+    .reverse()
+    .find(message => message.displayRole === 'user')
+    ?.turnKey
   for (let i = rendered.length - 1; i >= 0; i--) {
     const msg = rendered[i]
-    if (msg.isRouterStrip) return null
-    if (msg.displayRole === 'user') break
+    if (msg.isRouterStrip && (!liveTurnKey || msg.turnKey === liveTurnKey)) return null
+    if (msg.displayRole === 'user' && msg.turnKey !== liveTurnKey) break
   }
   if (modelRoutingMode.value === 'llm_ensemble') {
     return {
@@ -1144,9 +1360,12 @@ const routerStripReserve = computed<ChatRenderedMessage | null>(() => {
   }
 })
 
+const aiGeneratedLabel = computed(() => t('chat.aiGeneratedLabel'))
+
 const chatShareExport = useChatShareExport({
   threadRef,
   title: shareTitle,
+  aiGeneratedLabel: () => aiGeneratedLabel.value,
 })
 
 const preserveHistoryLiveTail = computed(() =>
@@ -1169,9 +1388,13 @@ const {
   historyState,
   loadHistory,
   loadEarlierHistory,
+  retryHistory: retryHistoryRequest,
   scheduleHistorySync,
+  cancelAnchorStabilization,
+  cancelActiveHistory,
   cleanup: cleanupHistory,
 } = chatHistory
+planMutationAccepted = () => scheduleHistorySync()
 
 const voiceInput = useVoiceInput()
 const {
@@ -1186,7 +1409,11 @@ const {
 // (including env-var keys the browser can't see), so audioConfigured is a true
 // "voice will work" signal — this keeps the button from being clicked into a
 // guaranteed failure. It's the same snapshot the empty-state chips read.
-const voiceCapability = useRpcCall<{ audioConfigured?: boolean }>('onboarding.status')
+const voiceCapability = useRpcCall<{ audioConfigured?: boolean }>(
+  'onboarding.status',
+  undefined,
+  { callOptions: optionalSessionRpcCallOptions },
+)
 const voiceReady = computed(() => voiceCapability.data.value?.audioConfigured === true)
 
 const chatMessageActions = useChatMessageActions({
@@ -1199,6 +1426,14 @@ const chatMessageActions = useChatMessageActions({
   sendCurrentInput: () => sendCurrentInput(),
   focusComposer: () => composerRef.value?.focusTextarea(),
   pendingForkBeforeMessageId,
+  aiGeneratedLabel: () => aiGeneratedLabel.value,
+  canDeliver: () => !composerSendBlockedMessage.value,
+  notifyDeliveryBlocked: () => {
+    if (liveSendBlockedReason.value) {
+      pushToast(liveSendBlockedReason.value, { tone: 'info' })
+    }
+  },
+  notifyMessagePending: () => pushToast(t('chat.toast.messageStillSaving'), { tone: 'info' }),
 })
 const {
   copyMessage,
@@ -1206,6 +1441,7 @@ const {
   editMessage,
 } = chatMessageActions
 
+let applyPendingUserInputSnapshot: typeof chatPlans.applyBootstrap = () => {}
 const chatSessionSubscription = useChatSessionSubscription({
   rpc,
   sessionKey,
@@ -1214,16 +1450,231 @@ const chatSessionSubscription = useChatSessionSubscription({
   isStreaming,
   hasActiveInterrupt: computed(() =>
     Array.from(interruptState.value.values()).some(state => !state.resolution)),
+  activeStreamTaskId,
+  activeTaskGroups,
   sessionRunStatus,
+  startStreaming,
   loadHistory,
   resetStreamIdleTimer,
   resetStreamLiveTurnState,
+  onLiveSnapshot: snapshot => restoreLiveTurnSnapshot(snapshot),
+  onAuthoritativeIdle: () => {
+    if (pendingQueueOwnerContext.value?.sessionKey !== sessionKey.value) {
+      activeRunModeLock.value = null
+    }
+    const taskId = activeStreamTaskId.value
+    if (
+      taskId
+      && taskId !== PENDING_STREAM_TASK_ID
+      && taskId !== STOPPED_STREAM_TASK_ID
+    ) {
+      schedulePendingDrainAfterTerminal()
+    }
+  },
+  onRunModeLock: lock => {
+    if (lock.locked === false) return
+    if (isSandboxRunMode(lock.runMode)) {
+      activeRunModeLock.value = lock.runMode
+    } else if (activeRunModeLock.value === null) {
+      activeRunModeLock.value = globalRunMode.value
+    }
+  },
+  beginSessionMetadataResolution: key =>
+    pendingSessionIntent.value === 'new_chat'
+      ? -1
+      : activeProjectWorkspace.beginSessionResolution(key),
+  onSessionMetadata: (key, generation, metadata) => {
+    if (generation < 0) return
+    activeProjectWorkspace.applySessionSnapshot(key, generation, metadata)
+  },
+  onSessionMetadataError: (key, generation) => {
+    if (generation < 0) return
+    activeProjectWorkspace.failSessionResolution(key, generation)
+  },
+  onSnapshot: snapshot => {
+    chatPlans.applyBootstrap(snapshot)
+    applyPendingUserInputSnapshot(snapshot)
+  },
 })
 const {
   subscribeSession,
+  retrySessionMetadata,
   unsubscribeSession,
+  cancelActiveSubscription,
 } = chatSessionSubscription
 applySessionRunState = chatSessionSubscription.applySessionRunState
+
+const chatSessionBootstrap = useChatSessionBootstrap({
+  sessionKey,
+  loadHistory: async (context, retry) => (
+    retry
+      ? await retryHistoryRequest(context)
+      : await loadHistory({}, context)
+  ),
+  subscribeSession,
+  cancelHistory: cancelActiveHistory,
+  cancelSubscription: cancelActiveSubscription,
+  unsubscribeSession,
+})
+const {
+  livePhase,
+  startSessionBootstrap: startSessionBootstrapCoordinator,
+  cancelSessionBootstrap: cancelSessionBootstrapCoordinator,
+  retryHistory: retryHistoryCoordinator,
+  retryLive: retryLiveCoordinator,
+  handleConnectionState: handleSessionConnectionStateCoordinator,
+  isSessionBootstrapCurrent,
+} = chatSessionBootstrap
+
+function holdOptionalRpcAdmission() {
+  if (!releaseOptionalRpcAdmission) {
+    releaseOptionalRpcAdmission = acquireSessionBootstrapAdmission()
+  }
+  return ++optionalRpcAdmissionGeneration
+}
+
+function releaseOptionalRpcAdmissionAfter(
+  promises: readonly Promise<unknown>[],
+  admissionGeneration: number,
+) {
+  void Promise.allSettled(promises).then(() => {
+    if (admissionGeneration !== optionalRpcAdmissionGeneration) return
+    releaseOptionalRpcAdmission?.()
+    releaseOptionalRpcAdmission = null
+  })
+}
+
+function trackSessionBootstrapAdmission<T extends {
+  criticalRequestsQueued: Promise<void>
+}>(run: T): T {
+  const admissionGeneration = holdOptionalRpcAdmission()
+  releaseOptionalRpcAdmissionAfter(
+    [run.criticalRequestsQueued],
+    admissionGeneration,
+  )
+  return run
+}
+
+let postBootstrapMetadataStarted = false
+function schedulePostBootstrapMetadata(
+  run: {
+    generation: number
+    criticalRequestsQueued: Promise<void>
+  },
+  key: string,
+) {
+  if (postBootstrapMetadataStarted) return
+  void run.criticalRequestsQueued.then(() => {
+    if (
+      postBootstrapMetadataStarted
+      || chatViewDisposed
+      || sessionKey.value !== key
+      || !isSessionBootstrapCurrent(run.generation, key)
+    ) return
+    postBootstrapMetadataStarted = true
+    void refreshPostBootstrapMetadata()
+    void loadFeatureToggles().then(() => {
+      if (!chatViewDisposed) unsubs.push(bindFeatureRefresh(scheduleHistorySync))
+    })
+    loadSlashCommands()
+  })
+}
+
+function startSessionBootstrap(options?: {
+  includeHistory?: boolean
+  force?: boolean
+}) {
+  const key = sessionKey.value
+  const run = trackSessionBootstrapAdmission(
+    startSessionBootstrapCoordinator(options),
+  )
+  schedulePostBootstrapMetadata(run, key)
+  return run
+}
+
+function retryHistory() {
+  return retryHistoryCoordinator()
+}
+
+function retryLive() {
+  return retryLiveCoordinator()
+}
+
+function cancelSessionBootstrap() {
+  optionalRpcAdmissionGeneration += 1
+  cancelSessionBootstrapCoordinator()
+}
+
+function handleSessionConnectionState(
+  state: string,
+  includeHistory = true,
+) {
+  const run = handleSessionConnectionStateCoordinator(state, includeHistory)
+  if (
+    run
+    && (historyState.value.initialLoadStatus === 'loading'
+      || livePhase.value === 'connecting')
+  ) {
+    return trackSessionBootstrapAdmission(run)
+  }
+  return run
+}
+
+const isSessionHydrating = computed(() => livePhase.value === 'connecting')
+const liveSendBlockedReason = computed<string | null>(() => {
+  if (!sessionKey.value || livePhase.value === 'ready') return null
+  return t(
+    livePhase.value === 'degraded'
+      ? 'chat.liveSendBlockedDegraded'
+      : 'chat.liveSendBlockedConnecting',
+  )
+})
+isLiveDeliveryBlocked = () => Boolean(liveSendBlockedReason.value)
+watch(livePhase, (phase, previousPhase) => {
+  if (
+    phase !== 'ready'
+    || previousPhase === 'ready'
+    || pendingQueue.value.length === 0
+  ) return
+  schedulePendingDrainAfterTerminal()
+  flushDeferredPendingDrain()
+})
+watch(activeWorkspaceStatus, (status, previousStatus) => {
+  if (
+    status !== 'ready'
+    || previousStatus === 'ready'
+    || pendingQueue.value.length === 0
+  ) return
+  schedulePendingDrainAfterTerminal()
+  flushDeferredPendingDrain()
+})
+
+const sessionHasActiveWork = computed(() => (
+  isStreaming.value
+  || activeTaskGroups.value.size > 0
+  || ['queued', 'running', 'approval_pending'].includes(runStatus.value.status)
+  || activePlanRun.value?.status === 'queued'
+  || activePlanRun.value?.status === 'running'
+  || pendingQueueOwnerContext.value?.sessionKey === sessionKey.value
+))
+const canStop = computed(() => !isSessionHydrating.value && sessionHasActiveWork.value)
+const runModeLocked = computed(
+  () => isSessionHydrating.value
+    || sessionHasActiveWork.value
+    || activeRunModeLock.value !== null,
+)
+
+watch(sessionHasActiveWork, active => {
+  if (active && activeRunModeLock.value === null) {
+    activeRunModeLock.value = globalRunMode.value
+  } else if (!active && !isSessionHydrating.value) {
+    activeRunModeLock.value = null
+  }
+}, { flush: 'sync' })
+
+watch(sessionKey, () => {
+  activeRunModeLock.value = null
+})
 
 const chatSessionRuntime = useChatSessionRuntime({
   sessionKey,
@@ -1240,35 +1691,71 @@ const chatSessionRuntime = useChatSessionRuntime({
   usageModel,
   createSessionKey,
   persistSession,
-  unsubscribeSession,
-  subscribeSession,
-  loadHistory,
+  cancelSessionBootstrap: () => {
+    // Retire draft-project work on the old socket before the next session's
+    // coordinator can start, so its abort/reconnect cannot tear down B.
+    draftProjectHydration.invalidate()
+    cancelActiveProjectValidation()
+    cancelSessionBootstrap()
+  },
+  startSessionBootstrap,
   loadCurrentSessionUsage,
   applySessionRunState,
   setCompactInFlight,
   hideCompactStatus,
   clearPendingQueue,
+  switchPendingQueue,
+  adoptPendingQueue,
   resetSavingsPopupCooldown,
   restoreWidgetState,
   resetStreamLiveTurnState,
+  resetDraftComposer: () => {
+    inputText.value = ''
+    pendingAttachments.value = []
+    resetComposerInputHistory()
+    autoResizeTextarea()
+  },
 })
 const {
   resetCurrentSessionAfterSlash,
   startDraftSession,
-  switchToSession,
+  switchToSession: switchRuntimeToSession,
+  adoptResponseSession,
 } = chatSessionRuntime
+switchToPlanSession = switchToSession
+
+function switchToSession(nextSessionKey: string) {
+  if (nextSessionKey !== sessionKey.value) {
+    activeProjectWorkspace.beginSessionResolution(nextSessionKey)
+  }
+  return switchRuntimeToSession(nextSessionKey)
+}
 
 const chatSlashCommands = useChatSlashCommands({
   rpc,
+  catalogCallOptions: optionalSessionRpcCallOptions,
   inputText,
   sessionKey,
   autoResizeTextarea,
-  newSession: () => goToDraft({ agentId: agentIdFromSessionKey(sessionKey.value) }),
-  resetCurrentSession: resetCurrentSessionAfterSlash,
+  newSession: () => {
+    freshTaskDraft.requestFreshTask('main')
+    goToDraft({ agentId: 'main' })
+  },
+  resetCurrentSession: () => {
+    resetCurrentSessionAfterSlash()
+    chatPlans.reset()
+  },
   setCompactInFlight,
   showCompactStatus,
   notify: (message: string) => pushToast(message, { duration: 6000 }),
   dispatchHidden: (providerText: string, displayText: string) => dispatchHiddenForMeta(providerText, displayText),
+  dispatchPlanPrompt: (prompt: string, composerText: string) => {
+    dispatchPlanComposerPrompt(prompt, composerText)
+  },
+  activatePlanMode: () => chatPlans.setMode('plan'),
+  planModeAvailable: () => planUiAvailable.value,
+  codingModeEnabled,
+  setCodingModeEnabled,
 })
 const {
   slashOpen,
@@ -1308,51 +1795,190 @@ resetComposerInputHistory = chatComposerShortcuts.resetInputHistory
 
 const chatSend = useChatSend({
   rpc,
+  supportsMethod: method => rpc.supportsMethod(method),
+  activeSteerCapability: computed(() => {
+    const task = runStatus.value.task
+    return task?.steer_capability || task?.steerCapability || null
+  }),
   inputText,
   messages,
   sessionKey,
+  pendingQueueOwnerContext,
   busySendMode,
+  modelRoutingMode,
+  modelRoutingSettingsBusy,
   elevatedMode,
   runMode,
   pendingAttachments,
+  composerRevision,
   pendingSessionIntent,
+  pendingWorkspaceId,
+  sendBlockedReason: liveSendBlockedReason,
+  validateActiveProjectBeforeSend,
+  acceptPendingWorkspaceBinding: activeProjectWorkspace.acceptPendingBinding,
+  initialCollaborationMode,
   pendingForkBeforeMessageId,
+  materializeDraftSession: key => {
+    if (!isDraftRoute()) return
+    const workspaceId = pendingWorkspaceId.value
+    if (workspaceId) {
+      freshTaskDraft.bindMaterializedProjectTask(key, workspaceId)
+    }
+    persistSession(key, { source: 'chatView.draftAccepted' })
+  },
   aborted,
   activeStreamTaskId,
   activeStreamSessionKey,
   autoScroll,
   stream: chatStream,
+  canStop: () => canStop.value,
   normalizeElevatedMode,
-  persistSession,
+  adoptResponseSession: async (key, ownerRequestId) => {
+    const sourceKey = sessionKey.value
+    const workspaceId = freshTaskDraft.materializedWorkspaceBySession.value[sourceKey]
+      || boundWorkspaceId.value
+    if (workspaceId && key !== sourceKey) {
+      freshTaskDraft.bindMaterializedProjectTask(key, workspaceId)
+      freshTaskDraft.forgetMaterializedProjectTask(sourceKey)
+    }
+    return adoptResponseSession(key, ownerRequestId)
+  },
+  scheduleHistorySync,
+  schedulePendingDrainAfterTerminal,
+  flushDeferredPendingDrain,
+  bindActiveStreamTask: taskId => bindActiveStreamTask(taskId),
   isCompactInFlightForCurrentSession,
   hasPendingAttachmentWork,
   prepareAttachmentsForSend,
   enqueuePendingInput,
+  enqueuePendingPayload,
   enqueueHiddenControl,
+  enqueuePendingSteerRetry,
+  restoreSteerIntoComposer: text => appendComposerText(text),
   popAllPendingIntoComposer,
   executeSlashCommand,
   closeSlashMenu,
   autoResizeTextarea,
   scrollToBottom,
 })
-const { onSend, onStop, dispatchHiddenSend, sendHiddenMetaPreflightConfirmation } = chatSend
-sendCurrentInput = onSend
-dispatchHiddenForMeta = dispatchHiddenSend
-dispatchHiddenControl = dispatchHiddenSend
+const {
+  onSend,
+  onStop,
+  sendQueuedSteer,
+  sendQueuedFollowup,
+  dispatchComposerPrompt,
+  dispatchHiddenSend,
+  sendHiddenMetaPreflightConfirmation,
+} = chatSend
+const sameTurnSteerAvailable = computed(() => (
+  isStreaming.value
+  && chatSend.supportsSameTurnSteer()
+))
+const composerSameTurnSteerAvailable = computed(() => (
+  sameTurnSteerAvailable.value
+  && pendingAttachments.value.length === 0
+  && !pendingSessionIntent.value
+  && !pendingForkBeforeMessageId.value
+))
+watch(composerSameTurnSteerAvailable, (available) => {
+  if (!available && busySendMode.value === 'steer') {
+    busySendMode.value = 'queue'
+  }
+})
 
-// Deny notes ride the normal send path: queued while the turn is streaming,
-// sent immediately otherwise.
-function queueDenyFeedback(note: string) {
-  if (isStreaming.value || isCompactInFlightForCurrentSession()) {
-    enqueuePendingInput(note)
+async function onComposerSend() {
+  // All composer submission modes, including keyboard-driven plan revision,
+  // share the same fail-closed delivery gate.
+  if (composerSendBlockedMessage.value) return
+  // Serialize an existing-session mode mutation before accepting another
+  // composer turn, so the send cannot race the collaboration CAS update.
+  if (planModeBusy.value) return
+  const target = replanTarget.value
+  if (!target) {
+    onSend()
     return
   }
-  const prior = inputText.value
-  inputText.value = note
-  void onSend()
-  if (prior.trim()) {
-    inputText.value = prior
+  const prompt = inputText.value.trim()
+  if (!prompt) return
+  const submittedRevision = composerRevision.value
+  const accepted = await chatPlans.revise({ ...target, prompt })
+  if (!accepted) return
+  if (composerRevision.value === submittedRevision) {
+    inputText.value = ''
     autoResizeTextarea()
+  }
+}
+
+sendCurrentInput = onComposerSend
+sendAutomaticInput = () => {
+  void onSend({ cancelIfComposerChanged: true })
+}
+dispatchHiddenForMeta = dispatchHiddenSend
+dispatchPlanComposerPrompt = (prompt, composerText) => {
+  void dispatchComposerPrompt(prompt, composerText)
+}
+dispatchHiddenControl = dispatchHiddenSend
+dispatchQueuedItem = sendQueuedFollowup
+
+function takeVisiblePendingItem(index: number) {
+  const item = pendingQueue.value[index]
+  if (!item || item.hiddenControl || item.deliveryState) return null
+  pendingQueue.value.splice(index, 1)
+  return item
+}
+
+function editPendingMessage(index: number) {
+  const item = takeVisiblePendingItem(index)
+  if (!item) return
+  inputText.value = [item.text, inputText.value].filter(text => text.trim()).join('\n')
+  pendingAttachments.value = [...(item.attachments || []), ...pendingAttachments.value]
+  pendingSessionIntent.value = item.intent || pendingSessionIntent.value
+  autoResizeTextarea()
+  nextTick(() => composerRef.value?.focusTextarea())
+}
+
+async function steerPendingMessage(index: number) {
+  const candidate = pendingQueue.value[index]
+  const item = beginPendingDelivery(index, candidate?.hiddenControl === true)
+  if (!item) return
+
+  let outcome: ChatSendOutcome = 'retryable_failure'
+  try {
+    outcome = item.hiddenControl
+      ? await dispatchHiddenSend(
+          item.text,
+          item.displayTextOverride || '',
+          item.ownerSessionKey || sessionKey.value,
+          item,
+        )
+      : await sendQueuedSteer(item)
+  } finally {
+    settlePendingDelivery(item, outcome)
+  }
+}
+
+// Deny notes are immutable queue payloads. They never borrow or clear the
+// operator's editable composer, even if project validation or live recovery
+// delays delivery.
+function queueDenyFeedback(note: string) {
+  const context = pendingQueueOwnerContext.value
+  const owner = context?.sessionKey === sessionKey.value
+    ? { ownerRequestId: context.ownerRequestId }
+    : undefined
+  const queued = enqueuePendingPayload({
+    text: note,
+    attachments: [],
+    intent: null,
+  }, owner)
+  if (!queued) {
+    inputText.value = [note, inputText.value].filter(text => text.trim()).join('\n')
+    autoResizeTextarea()
+    pushToast(t('chat.toast.queueFull'), { tone: 'info' })
+    return
+  }
+  if (!isStreaming.value && !isCompactInFlightForCurrentSession()) {
+    schedulePendingDrainAfterTerminal()
+    flushDeferredPendingDrain()
   }
 }
 
@@ -1377,7 +2003,9 @@ const {
   extendInterrupt,
   submitClarify,
   dismissClarify,
+  applyUserInputBootstrap,
 } = chatApprovals
+applyPendingUserInputSnapshot = applyUserInputBootstrap
 
 const rpcEventHandlers = useChatRpcEventHandlers({
   sessionKey,
@@ -1401,14 +2029,19 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   clearPendingRouterDecision,
   handleRouterControlReplay,
   showCompactionToast,
+  showWarningToast: message => pushToast(message || t('chat.warning.default'), { tone: 'warn', duration: 5000 }),
   scheduleHistorySync,
   schedulePendingDrainAfterTerminal,
   popAllPendingIntoComposer,
+  restoreSteerIntoComposer: text => appendComposerText(text),
   saveWidgetState,
-  subscribeSession,
-  loadHistory,
+  handleSessionConnectionState: state =>
+    handleSessionConnectionState(state, !isDraftRoute()),
   loadCurrentSessionUsage,
+  refreshRunModePreference: refreshPostBootstrapMetadata,
 })
+bindActiveStreamTask = rpcEventHandlers.bindActiveStreamTask
+restoreLiveTurnSnapshot = rpcEventHandlers.restoreLiveTurnSnapshot
 const {
   streamThinkingText,
   streamThinkingElapsedText,
@@ -1418,27 +2051,103 @@ const {
 // live-turn shadow parity: in DEV/SHADOW, re-check the fold against the legacy
 // live surface whenever a frame lands (the fold and legacy refs are tracked by
 // assertLiveParity). Injects the thinking text owned by the event handlers.
-// No-op in prod/OFF; render stays legacy unless the fold is authoritative (ON).
+// In production ON mode this is a no-op; DEV/SHADOW performs the parity check,
+// while explicit OFF keeps the compatibility renderer without fold assertions.
 watchEffect(() => assertLiveParity(streamThinkingText))
 
-// flag-selected live render source. Only when the fold is
-// authoritative (useReducer === true, opt-in via opensquilla.chat.foldLiveTurn=1)
-// does the work-card body render from the fold; OFF and SHADOW return the
-// IDENTICAL legacy refs, so with the flag off the render is byte-identical.
-// The work-card head (phase/elapsed/step) stays on the legacy activity refs.
+// Flag-selected live render source. In production the fold is authoritative by
+// default; only opensquilla.chat.foldLiveTurn=0 restores legacy. SHADOW and OFF
+// return the IDENTICAL legacy refs, so with the flag off the render is byte-identical.
+// The activity head (phase/elapsed) stays on the legacy activity refs.
 const liveTimelineItems = computed(() =>
   foldLiveTurnMode.value === true ? foldedTurn.value.timelineItems : streamTimelineItems.value,
 )
+const liveTimelineSplit = computed(() => splitLiveAssistantTimeline(liveTimelineItems.value))
+const liveAnswerPart = computed<Extract<ChatPart, { type: 'text' }> | null>(() => {
+  const candidate = liveTimelineSplit.value.answerItem
+  if (!candidate) return null
+  return {
+    type: 'text',
+    key: `${candidate.key}:answer-candidate`,
+    html: candidate.html,
+    rawText: candidate.rawText || '',
+  }
+})
+const liveActivityTimelineItems = computed<ChatStreamTimelineItem[]>(() =>
+  liveTimelineSplit.value.activityItems,
+)
+const liveActivityStatusHistory = computed(() =>
+  foldLiveTurnMode.value === false ? [] : foldedTurn.value.statusHistory,
+)
+const liveActivityProjection = computed(() =>
+  projectAssistantActivityTimeline(liveActivityTimelineItems.value, {
+    lifecycle: liveAnswerPart.value ? 'answering' : 'working',
+    statusHistory: liveActivityStatusHistory.value,
+  }),
+)
+const liveActivityPhaseLabel = computed(() => {
+  if (streamActivityStale.value) return streamPhaseLabel.value
+  const currentStatus = [...liveActivityProjection.value.statusSteps]
+    .reverse()
+    .find(step => step.isCurrent)
+  if (
+    currentStatus
+    && !currentStatus.label.code.startsWith('chat.activity.lifecycle.')
+    && !liveActivityProjection.value.currentClusterKey
+  ) {
+    return String(t(currentStatus.label.code, currentStatus.label.params))
+  }
+  return String(t(
+    liveAnswerPart.value
+      ? 'chat.activity.lifecycle.answering'
+      : 'chat.activity.lifecycle.working',
+  ))
+})
+const liveToolStateScope = computed(() => JSON.stringify([sessionKey.value || '', 'stream']))
+// Elapsed readouts in the live turn round to whole seconds ("4s"), matching
+// streamPhaseElapsed and streamThinkingElapsedText. The shared tool formatter
+// (streamToolElapsedText, useChatStream.ts) emits tenths, so normalise its
+// output here at the call site instead of changing the shared formatter —
+// except sub-second finished tools, which keep their tenths so they never
+// read as a nonsensical "0s".
+function liveToolElapsedText(call: Pick<ChatToolCall, 'toolId'>): string {
+  return streamToolElapsedText(call).replace(/^([1-9]\d*)\.\d+s$/, '$1s')
+}
 const liveArtifacts = computed(() =>
   foldLiveTurnMode.value === true ? foldedTurn.value.artifacts : streamArtifacts.value,
 )
 const liveThinkingText = computed(() =>
   foldLiveTurnMode.value === true ? foldedTurn.value.thinkingText : streamThinkingText.value,
 )
+// Live reasoning rendered through the shared part component, so the live turn
+// and settled turns use one wording and one disclosure affordance. The seconds
+// derive from the ticking elapsed text, which is always `${seconds}s` live.
+const liveReasoningPart = computed<Extract<ChatPart, { type: 'reasoning' }> | null>(() => {
+  if (!liveThinkingText.value) return null
+  const seconds = Number.parseInt(streamThinkingElapsedText.value, 10)
+  return {
+    type: 'reasoning',
+    key: 'live-reasoning',
+    text: liveThinkingText.value,
+    seconds: Number.isFinite(seconds) ? seconds : 0,
+  }
+})
+// No clamp and no raw status count: the header chip must agree with the
+// visible body, which renders clusters plus only the semantic status steps.
+// A text-only turn therefore counts 0 and the disclosure's stepCount > 0
+// gate hides the chip instead of claiming "step 1" over an empty body.
+const liveActivityStepCount = computed(() =>
+  liveActivityProjection.value.activityClusters.length
+    + liveActivityProjection.value.statusSteps.filter(isSemanticActivityStatusStep).length
+    + (liveThinkingText.value ? 1 : 0),
+)
+const liveActivityFailureCount = computed(() =>
+  liveActivityProjection.value.activityClusters.filter(cluster => cluster.isFailure).length,
+)
 // Inline interrupt parts for the live turn come from the fold whenever it is
 // active (ON or SHADOW — frames are appended in both). Only the foldLiveTurn=0
 // OFF rollback renders the legacy standalone ApprovalCard/ClarifyCard block, so
-// the two never both show. Unlike the work-card body (which has a legacy ref to
+// the two never both show. Unlike the activity body (which has a legacy ref to
 // fall back to in SHADOW), interrupts have no legacy live ref, so SHADOW must
 // also render them from the fold.
 const liveInterruptParts = computed(() =>
@@ -1448,6 +2157,60 @@ const liveInterruptParts = computed(() =>
         (part): part is Extract<typeof part, { type: 'interrupt' }> => part.type === 'interrupt',
       ),
 )
+const livePendingInterruptParts = computed(() =>
+  liveInterruptParts.value.filter(part => !part.resolution),
+)
+
+const visiblePendingInterruptKeys = computed(() => {
+  const keys = new Set(livePendingInterruptParts.value.map(part => part.key))
+  for (const message of renderedMessages.value) {
+    for (const part of message.parts ?? []) {
+      if (part.type === 'interrupt' && !part.resolution) keys.add(part.key)
+    }
+  }
+  return [...keys]
+})
+
+async function focusPendingApprovalCard() {
+  const request = appStore.approvalFocusRequest
+  if (!request || request.sessionKey !== sessionKey.value) return
+
+  await nextTick()
+  if (
+    appStore.approvalFocusRequest?.requestId !== request.requestId
+    || request.sessionKey !== sessionKey.value
+  ) return
+
+  const card = [...(threadRef.value?.querySelectorAll<HTMLElement>('[data-approval-id]') ?? [])]
+    .find(element => element.dataset.approvalId === request.approvalId)
+  if (!card) return
+
+  card.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  card.focus({ preventScroll: true })
+  appStore.clearApprovalFocusRequest(request.requestId)
+}
+
+watch(
+  [
+    () => appStore.approvalFocusRequest?.requestId ?? 0,
+    sessionKey,
+    () => visiblePendingInterruptKeys.value.join('\u0000'),
+  ],
+  () => { void focusPendingApprovalCard() },
+  { flush: 'post', immediate: true },
+)
+
+// Feeds the persistent visually-hidden status region in the template. It only
+// fills on the true→false streaming transition (a live turn actually settled),
+// and empties as soon as the next turn starts so that setting the same
+// "Completed" text again is a fresh mutation screen readers re-announce.
+const turnSettledAnnouncement = ref('')
+watch(isStreaming, (streaming, wasStreaming) => {
+  if (streaming) turnSettledAnnouncement.value = ''
+  else if (wasStreaming) {
+    turnSettledAnnouncement.value = String(t('chat.activity.lifecycle.settled'))
+  }
+})
 
 // Soft content-silence watchdog: after the high negotiated threshold, surface
 // a neutral long-running notice. Backend-deadline-owned Ensemble phases remain
@@ -1470,7 +2233,10 @@ const chatRpcSubscriptions = useChatRpcSubscriptions(rpc, {
 })
 
 // Session switches drop the previous session's stall tracking entirely.
-watch(sessionKey, () => stallWatchdog.reset())
+watch(sessionKey, () => {
+  stallWatchdog.reset()
+  clearAssistantActivityExpansionState()
+})
 
 // MetaSkill run UI: preflight checkpoint + run-progress ribbon, driven by the
 // four session.event.meta_* frames (delivered via the '*' wildcard, so this
@@ -1492,13 +2258,39 @@ const metaRuns = useMetaRuns({
   pushToast,
 })
 
-// Refill the composer with `text` and fire the send path (mirrors vanilla's
-// retry/replay tail: `_textarea.value = text; _autoResizeTextarea(); _onSend()`).
+// Meta retries/replays and landing suggestions must never overwrite an
+// operator-owned draft. Occupied composers keep the generated prompt as an
+// immutable queue item; an empty but blocked composer stages it for explicit
+// retry without pretending it was sent.
 function sendComposerText(text: string) {
   const next = String(text || '')
   if (!next) return
+  if (inputText.value.trim() || pendingAttachments.value.length > 0) {
+    const context = pendingQueueOwnerContext.value
+    const owner = context?.sessionKey === sessionKey.value
+      ? { ownerRequestId: context.ownerRequestId }
+      : undefined
+    const queued = enqueuePendingPayload({
+      text: next,
+      attachments: [],
+      intent: null,
+    }, owner)
+    if (!queued) {
+      pushToast(t('chat.toast.queueFull'), { tone: 'info' })
+      return
+    }
+    if (!isStreaming.value && !isCompactInFlightForCurrentSession()) {
+      schedulePendingDrainAfterTerminal()
+      flushDeferredPendingDrain()
+    }
+    return
+  }
   inputText.value = next
   autoResizeTextarea()
+  if (composerSendBlockedMessage.value) {
+    composerRef.value?.focusTextarea()
+    return
+  }
   void sendCurrentInput()
 }
 
@@ -1536,25 +2328,10 @@ watch(messages, () => attachTurnReasoning())
 
 // Unsubscribers
 let unsubs: (() => void)[] = []
+let chatViewDisposed = false
 let composerResizeObserver: ResizeObserver | null = null
 
 /* ── Computed ──────────────────────────────────────────────────────── */
-
-const runStatusLabel = computed(() => runStatus.value.label)
-const runStatusChipClass = computed(() => {
-  const cls: Record<string, string> = {
-    queued: 'chat-chip-warn', running: 'chat-chip-ok', approval_pending: 'chat-chip-warn', interrupted: 'chat-chip-warn',
-    failed: 'chat-chip-danger', timeout: 'chat-chip-warn',
-  }
-  return cls[runStatus.value.status] || ''
-})
-const runStatusTitle = computed(() => {
-  const task = runStatus.value.task
-  const parts = [runStatus.value.label]
-  if (task?.task_id) parts.push(task.task_id)
-  if (task?.terminal_reason) parts.push(task.terminal_reason)
-  return parts.filter(Boolean).join(' - ')
-})
 
 const isNewChatLanding = computed(() => {
   // Only the draft route (/chat/new — bare /chat redirects here) shows the
@@ -1568,7 +2345,40 @@ const isNewChatLanding = computed(() => {
     !compactStatus.value.visible
 })
 
+const historyRecoveryState = computed(() => {
+  return resolveChatHistoryRecoveryState({
+    isDraftLanding: isNewChatLanding.value,
+    initialHistoryStatus: historyState.value.initialLoadStatus,
+    retrying: historyState.value.retrying,
+    recoveryError: historyState.value.recoveryError,
+  })
+})
+
+const visibleHistoryRecoveryState = computed(() => (
+  visibleChatHistoryRecoveryState(historyRecoveryState.value)
+))
+
+const liveRecoveryState = computed(() => {
+  if (livePhase.value === 'degraded') return 'live-degraded' as const
+  if (
+    livePhase.value === 'connecting'
+    && historyRecoveryState.value === null
+  ) {
+    return 'live-connecting' as const
+  }
+  return null
+})
+
+const showConfirmedEmptySession = computed(() => shouldShowConfirmedEmptySession({
+  isDraftLanding: isNewChatLanding.value,
+  isStreaming: isStreaming.value,
+  messageCount: messages.value.length,
+  initialHistoryStatus: historyState.value.initialLoadStatus,
+}))
+
 const composerPlaceholder = computed(() => {
+  if (replanActive.value) return t('chat.plan.revisePromptPlaceholder')
+  if (collaboration.value.mode === 'plan') return t('chat.planMode.placeholder')
   if (isNewChatLanding.value) return t('chat.placeholderLanding')
   return isCompactViewport.value ? t('chat.placeholderCompact') : t('chat.placeholder')
 })
@@ -1576,16 +2386,195 @@ const composerPlaceholder = computed(() => {
 const hasSendContent = computed(() => {
   return inputText.value.trim().length > 0 || pendingAttachments.value.some(isSendableAttachment)
 })
+const composerHasSendContent = computed(() =>
+  replanActive.value ? inputText.value.trim().length > 0 : hasSendContent.value,
+)
+
+// A mixed-version gateway may know plans.setMode but not the atomic first-send
+// contract. Hide Plan rather than claim a read-only turn that would run Default.
+const planUiAvailable = computed(() =>
+  rpc.supportsMethod('plans.setMode')
+  && rpc.supportsMethod('plans.capabilities'),
+)
+const planCardPendingAction = computed<PlanCardAction | null>(() => {
+  const action = planActionPending.value
+  if (action === 'revise') return 'replan'
+  return action === 'implement-current' || action === 'implement-new' || action === 'replan'
+    ? action
+    : null
+})
+const planActionsDisabled = computed(() =>
+  isStreaming.value
+  || planModeBusy.value
+  || Boolean(liveSendBlockedReason.value)
+  || planActionPending.value !== null
+  || activePlanRun.value?.status === 'queued'
+  || activePlanRun.value?.status === 'running',
+)
+const PLAN_RUN_TERMINAL_HOLD_MS = 2000
+const executionDockRun = ref<PlanRunSnapshot | null>(null)
+const composerStopsPlanRun = computed(() =>
+  executionDockRun.value?.status === 'queued'
+  || executionDockRun.value?.status === 'running',
+)
+let executionDockHideTimer: ReturnType<typeof setTimeout> | null = null
+
+function clearExecutionDockHideTimer() {
+  if (executionDockHideTimer === null) return
+  clearTimeout(executionDockHideTimer)
+  executionDockHideTimer = null
+}
+
+function syncExecutionDockRun() {
+  const run = activePlanRun.value
+  clearExecutionDockHideTimer()
+  if (!run) {
+    executionDockRun.value = null
+    return
+  }
+  if (['queued', 'running', 'paused', 'blocked'].includes(run.status)) {
+    executionDockRun.value = run
+    return
+  }
+  if (executionDockRun.value?.runId !== run.runId) {
+    executionDockRun.value = null
+    return
+  }
+  executionDockRun.value = run
+  executionDockHideTimer = setTimeout(() => {
+    if (executionDockRun.value?.runId === run.runId) {
+      executionDockRun.value = null
+    }
+    executionDockHideTimer = null
+  }, PLAN_RUN_TERMINAL_HOLD_MS)
+}
+
+watch(
+  () => [
+    activePlanRun.value?.runId,
+    activePlanRun.value?.status,
+    activePlanRun.value?.stateRevision,
+  ],
+  syncExecutionDockRun,
+  { immediate: true },
+)
+const currentPlanInHistory = computed(() => {
+  const revisionId = currentPlan.value?.revisionId
+  if (!revisionId) return false
+  return renderedMessages.value.some(message =>
+    message.planRevisions?.some(plan => plan.revisionId === revisionId),
+  )
+})
+
+const landingSuggestionsHidden = computed(() => landingPrefilled.value)
+const landingSuggestionsDisabled = computed(() => shouldDisableLandingSuggestions({
+  landingPrefilled: landingPrefilled.value,
+  composerText: inputText.value,
+  attachmentCount: pendingAttachments.value.length,
+}))
+
+const queuedImageSendBlockedMessage = computed(() => {
+  if (modelRoutingSettingsBusy.value) {
+    return t('chat.composer.routingUpdateImageBlocked')
+  }
+  return modelRoutingMode.value === 'llm_ensemble'
+    ? t('chat.composer.ensembleImageUnsupported')
+    : ''
+})
+
+const modelImageSendBlockedMessage = computed(() => {
+  return hasSendableModelInputImageAttachment(pendingAttachments.value)
+    ? queuedImageSendBlockedMessage.value
+    : ''
+})
+
+const activeProjectStatusMessage = computed(() => {
+  switch (activeWorkspaceStatus.value) {
+    case 'resolving':
+      return t('workspaces.activeProjectResolving')
+    case 'unavailable':
+      return t('workspaces.activeProjectUnavailable')
+    case 'removed':
+      return t('workspaces.activeProjectRemoved')
+    case 'unknown':
+    case 'error':
+      return t('workspaces.activeProjectBlocksSending')
+    default:
+      return ''
+  }
+})
+
+const activeProjectComposerBlockMessage = computed(() => {
+  switch (activeWorkspaceStatus.value) {
+    case 'resolving':
+    case 'unavailable':
+    case 'removed':
+      return activeProjectStatusMessage.value
+    default:
+      return ''
+  }
+})
+
+const composerSendBlockedMessage = computed(() =>
+  modelImageSendBlockedMessage.value
+  || liveSendBlockedReason.value
+  || activeProjectComposerBlockMessage.value,
+)
 
 const sendButtonTitle = computed(() => {
+  if (replanActive.value) return t('chat.plan.reviseSend')
+  if (composerSendBlockedMessage.value) return composerSendBlockedMessage.value
   if (isCompactInFlightForCurrentSession()) return t('chat.sendQueuesUntilCompaction')
   if (isStreaming.value) {
-    return busySendMode.value === 'steer'
+    return busySendMode.value === 'steer' && composerSameTurnSteerAvailable.value
       ? t('chat.sendSteers')
       : t('chat.sendQueues')
   }
   return t('chat.send')
 })
+
+function implementCurrentPlan(target: PlanCardActionTarget) {
+  if (liveSendBlockedReason.value) return
+  void chatPlans.implement(target, false)
+}
+
+function implementPlanInNewTask(target: PlanCardActionTarget) {
+  if (liveSendBlockedReason.value) return
+  void chatPlans.implement(target, true)
+}
+
+function beginPlanRevision(target: PlanCardActionTarget) {
+  if (pendingAttachments.value.length > 0) {
+    pushToast(t('chat.plan.attachmentsUnavailable'), { tone: 'warn' })
+    return
+  }
+  chatPlans.beginReplan(target)
+}
+
+function cancelPlanRevision() {
+  chatPlans.cancelReplan()
+}
+
+function cancelActivePlanRun() {
+  void chatPlans.cancelRun()
+}
+
+function focusComposerAfterPlanRun() {
+  composerRef.value?.focusTextarea()
+}
+
+function onComposerStop() {
+  const run = executionDockRun.value
+  if (run && (run.status === 'queued' || run.status === 'running')) {
+    void chatPlans.cancelRun()
+    return
+  }
+  onStop()
+}
+
+function setCollaborationMode(mode: CollaborationMode) {
+  void chatPlans.setMode(mode)
+}
 
 const currentChatTitle = computed(() => {
   const firstUser = messages.value.find(msg => msg.role === 'user' && stripTimePrefix(msg.text || '').trim())
@@ -1600,6 +2589,7 @@ const currentChatTitle = computed(() => {
 const chatMarkdownExport = useChatMarkdownExport({
   messages: renderedMessages,
   currentTitle: currentChatTitle,
+  aiGeneratedLabel,
 })
 const { exportMarkdown } = chatMarkdownExport
 
@@ -1616,8 +2606,16 @@ function readAuthToken(): string {
   }
 }
 
-function setComposerRunMode(mode: SandboxRunMode) {
-  setPersistedRunMode(mode)
+async function setComposerRunMode(mode: SandboxRunMode) {
+  if (runModeLocked.value) return
+  try {
+    await setGlobalRunMode(mode)
+    void sandboxSetupRecovery.refresh()
+  } catch (cause) {
+    const detail = cause instanceof Error ? cause.message : String(cause)
+    console.warn('Failed to persist sandbox run mode:', detail)
+    pushToast(detail, { tone: 'danger' })
+  }
 }
 
 async function setComposerModelRoutingMode(mode: ModelRoutingMode) {
@@ -1625,21 +2623,12 @@ async function setComposerModelRoutingMode(mode: ModelRoutingMode) {
   scheduleHistorySync()
 }
 
-function setComposerVisualEffectsEnabled(enabled: boolean) {
-  setRouterVisualEffectsEnabled(enabled)
-  scheduleHistorySync()
-}
-
-async function setComposerCodingModeEnabled(enabled: boolean) {
-  await setCodingModeEnabled(enabled)
-}
-
-// A landing suggestion chip replaces the draft composer text; the user still
-// reviews and sends it themselves.
+// A suggestion chip is an explicit task choice. Route it through the same
+// composer-backed send path as every other message so routing, attachments,
+// optimistic state, and recovery behavior stay identical.
 function applyLandingSuggestion(text: string) {
-  inputText.value = text
-  autoResizeTextarea()
-  composerRef.value?.focusTextarea()
+  if (landingSuggestionsDisabled.value) return
+  sendComposerText(text)
 }
 
 function appendComposerText(text: string) {
@@ -1727,6 +2716,24 @@ function subagentBody(text: string): string {
 
 /* ── Artifacts ─────────────────────────────────────────────────────── */
 
+async function downloadAttachment(attachment: DisplayAttachment): Promise<boolean> {
+  const result = await fetchDisplayAttachmentBlob(attachment, {
+    baseOrigin: window.location.origin,
+    sessionKey: sessionKey.value,
+    authToken: readAuthToken(),
+  })
+  if (!result.ok) {
+    if (result.status > 0) {
+      pushToast(t('chat.toast.downloadFailedHttp', { status: result.status }), { tone: 'danger' })
+    } else {
+      pushToast(t('chat.toast.downloadFailed'), { tone: 'danger' })
+    }
+    return false
+  }
+  downloadBlob(result.blob, result.filename)
+  return true
+}
+
 async function downloadArtifact(artifact: ArtifactPayload) {
   const token = readAuthToken()
   const url = artifactDownloadUrl(artifact, window.location.origin, {
@@ -1779,12 +2786,126 @@ const sessionArtifacts = computed<ArtifactPayload[]>(() => {
   return collected
 })
 
+const sessionWorkbenchArtifacts = computed(() =>
+  sessionArtifacts.value.filter(artifactUsesWorkbenchPreview),
+)
+
+const headerDeliverableCount = computed(() =>
+  workbenchEnabled.value
+    ? sessionWorkbenchArtifacts.value.length
+    : sessionArtifacts.value.length,
+)
+
 const deliverablesOpen = ref(false)
-const metaRunsHistoryOpen = ref(false)
+
+function focusHeaderAction(
+  action: 'deliverables' | 'share' | 'copy-session-key',
+) {
+  void nextTick(() => chatHeaderActionsRef.value?.focusAction(action))
+}
 
 function openDeliverables() {
   if (sessionArtifacts.value.length === 0) return
+  if (workbenchEnabled.value) {
+    const recentPreview = workbenchStore.findMostRecentItem(item => {
+      if (
+        item.kind !== 'artifact-preview'
+        || item.scope.type !== 'session'
+        || item.scope.id !== sessionKey.value
+      ) return false
+      const artifact = artifactFromWorkbenchItem(item)
+      if (!artifact) return false
+      return artifactUsesWorkbenchPreview(artifact)
+    })
+    if (recentPreview) {
+      workbenchStore.activateItem(recentPreview.id)
+      workbenchStore.setExpanded(true)
+      return
+    }
+
+    for (let index = sessionWorkbenchArtifacts.value.length - 1; index >= 0; index -= 1) {
+      const artifact = sessionWorkbenchArtifacts.value[index]
+      if (!artifact) continue
+      openArtifact(artifact)
+      return
+    }
+
+    const latestArtifact = sessionArtifacts.value[sessionArtifacts.value.length - 1]
+    if (latestArtifact && artifactCategory(latestArtifact) === 'visual') {
+      openArtifact(latestArtifact)
+      return
+    }
+    if (latestArtifact) focusInlineDeliverable(latestArtifact)
+    return
+  }
   deliverablesOpen.value = true
+}
+
+function focusInlineDeliverable(artifact: ArtifactPayload): boolean {
+  const reduceMotion = typeof window !== 'undefined'
+    && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+  return focusArtifactInTranscript(
+    threadRef.value,
+    artifact,
+    reduceMotion ? 'auto' : 'smooth',
+  )
+}
+
+watch(sessionArtifacts, artifacts => {
+  if (!sessionKey.value) return
+  artifactImageLightbox.updateNavigation(artifacts, sessionKey.value)
+  if (!workbenchEnabled.value) return
+  for (const item of workbenchStore.items) {
+    if (
+      item.kind !== 'artifact-preview'
+      || item.scope.type !== 'session'
+      || item.scope.id !== sessionKey.value
+    ) continue
+    const artifact = artifactFromWorkbenchItem(item)
+    if (!artifact) continue
+    workbenchStore.updateItem(createArtifactPreviewWorkbenchItem({
+      artifact,
+      navigationArtifacts: artifacts,
+      nativeHtml: item.hostKind === 'native-webcontents',
+      sessionKey: sessionKey.value,
+    }))
+  }
+})
+
+function openArtifact(artifact: ArtifactPayload): boolean {
+  if (
+    isInlineMediaArtifact(artifact)
+    || artifactWorkbenchPreviewKind(artifact) === 'unsupported'
+  ) {
+    return focusInlineDeliverable(artifact)
+  }
+  if (artifactCategory(artifact) === 'visual' && sessionKey.value) {
+    artifactImageLightbox.open({
+      artifact,
+      navigationArtifacts: sessionArtifacts.value,
+      sessionKey: sessionKey.value,
+    })
+    return true
+  }
+  if (!workbenchEnabled.value || !sessionKey.value) return false
+  const opened = workbenchStore.openItem(createArtifactPreviewWorkbenchItem({
+    artifact,
+    navigationArtifacts: sessionArtifacts.value,
+    nativeHtml: Boolean(
+      platform.capabilities.hasNativeWorkbenchSurfaces
+      && platform.workbench.native,
+    ),
+    sessionKey: sessionKey.value,
+  }))
+  if (!opened) {
+    pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+  }
+  return opened
+}
+
+function closeDeliverables() {
+  deliverablesOpen.value = false
+  focusHeaderAction('deliverables')
 }
 
 /* ── Fork ──────────────────────────────────────────────────────────── */
@@ -1872,7 +2993,7 @@ function endShareMode() {
     URL.revokeObjectURL(sharePreview.value.url)
     sharePreview.value = null
   }
-  if (modeUiHadFocus) nextTick(() => shareEntryBtnRef.value?.focus())
+  if (modeUiHadFocus) focusHeaderAction('share')
 }
 
 function toggleShareMessage(messageId: string) {
@@ -1895,14 +3016,14 @@ async function saveShareImage() {
       theme: shareTheme.value,
     })
     if (!result) {
-      pushToast(t('chat.toast.shareExportFailed'), { tone: 'danger' })
+      pushToast(t('chat.toast.shareSaveFailed'), { tone: 'danger' })
       return
     }
     const url = URL.createObjectURL(result.blob)
     sharePreview.value = { url, blob: result.blob, filename: result.filename }
   } catch (err) {
     console.warn('Share image export failed:', err)
-    pushToast(t('chat.toast.shareExportFailed'), { tone: 'danger' })
+    pushToast(t('chat.toast.shareSaveFailed'), { tone: 'danger' })
   } finally {
     shareSaving.value = false
   }
@@ -1913,12 +3034,11 @@ function onShareDownload() {
   if (!preview) return
   downloadBlob(preview.blob, preview.filename)
   pushToast(t('chat.toast.saved', { filename: preview.filename }), { duration: 4000 })
-  // endShareMode revokes the preview URL and drops the modal, then exits share
-  // mode (which remounts the header Share button); focus lands back on it. The
-  // modal's Download button held focus, outside the banner, so endShareMode's
-  // own conditional restore does not fire — focus the entry button explicitly.
+  // endShareMode revokes the preview URL and drops the modal. The modal's
+  // Download button held focus outside the banner, so restore the best visible
+  // Share entry (or the stable session-actions trigger) explicitly.
   endShareMode()
-  nextTick(() => shareEntryBtnRef.value?.focus())
+  focusHeaderAction('share')
 }
 
 async function onShareCopy() {
@@ -1942,7 +3062,7 @@ async function onShareSetTheme(next: ShareExportTheme) {
   try {
     const result = await chatShareExport.buildShareImage(selectedShareMessageIds.value, { theme: next })
     if (!result) {
-      pushToast(t('chat.toast.shareExportFailed'), { tone: 'danger' })
+      pushToast(t('chat.toast.sharePreviewUpdateFailed'), { tone: 'danger' })
       return
     }
     const previous = sharePreview.value
@@ -1954,7 +3074,9 @@ async function onShareSetTheme(next: ShareExportTheme) {
     if (previous) URL.revokeObjectURL(previous.url)
   } catch (err) {
     console.warn('Share image re-render failed:', err)
-    pushToast(t('chat.toast.shareExportFailed'), { tone: 'danger' })
+    // Not shareSaveFailed: nothing was being saved here — the theme switch
+    // only re-renders the preview, so the copy must name that action.
+    pushToast(t('chat.toast.sharePreviewUpdateFailed'), { tone: 'danger' })
   } finally {
     shareSaving.value = false
   }
@@ -1971,7 +3093,7 @@ function closeSharePreview() {
   sharePreview.value = null
   nextTick(() => {
     if (shareMode.value) shareBannerRef.value?.focus()
-    else shareEntryBtnRef.value?.focus()
+    else chatHeaderActionsRef.value?.focusAction('share')
   })
 }
 
@@ -2004,6 +3126,7 @@ function onThreadScroll() {
 }
 
 function onHistoryNavigate() {
+  cancelAnchorStabilization()
   historyNavigationScrollLock.start()
 }
 
@@ -2019,6 +3142,7 @@ function onHistoryNavigateEnd() {
 // Re-pinning autoScroll lets the stream resume following the bottom.
 const showJumpToLatest = computed(() => !autoScroll.value && messages.value.length > 0)
 function jumpToLatest() {
+  cancelAnchorStabilization()
   historyNavigationScrollLock.finish()
   autoScroll.value = true
   scrollToBottom()
@@ -2040,6 +3164,7 @@ function dragEventHasFiles(e: DragEvent): boolean {
 function onChatDragEnter(e: DragEvent) {
   if (!dragEventHasFiles(e)) return
   e.preventDefault()
+  if (replanActive.value) return
   threadDragDepth.value += 1
   threadDragOver.value = true
 }
@@ -2047,6 +3172,10 @@ function onChatDragEnter(e: DragEvent) {
 function onChatDragOver(e: DragEvent) {
   if (!dragEventHasFiles(e)) return
   e.preventDefault()
+  if (replanActive.value) {
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'none'
+    return
+  }
   if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
   threadDragOver.value = true
 }
@@ -2064,6 +3193,10 @@ function onChatDrop(e: DragEvent) {
   threadDragDepth.value = 0
   threadDragOver.value = false
   if (!dragEventHasFiles(e)) return
+  if (replanActive.value) {
+    pushToast(t('chat.plan.attachmentsUnavailable'), { tone: 'warn' })
+    return
+  }
   const files = Array.from(e.dataTransfer?.files || [])
   if (files.length === 0) return
   void addAttachments(files)
@@ -2079,25 +3212,26 @@ function autoResizeTextarea() {
 /* ── Clipboard paste ───────────────────────────────────────────────── */
 
 function onDocumentPaste(e: ClipboardEvent) {
-  const items = e.clipboardData?.items
-  if (!items) return
-  const files: File[] = []
-  let attachedImage = false
-  for (let i = 0; i < items.length; i++) {
-    if (items[i].type.startsWith('image/')) {
-      const file = items[i].getAsFile()
-      if (file) {
-        files.push(file)
-        attachedImage = true
-      }
-    }
+  // Pastes aimed at another editable surface (clarify/approval inputs, the
+  // command palette) or at an open dialog keep their default behavior — only
+  // composer-bound pastes claim clipboard files, mirroring onDocumentKeydown.
+  if (!shouldCaptureFilePaste(e.target, {
+    composerTextareaFocused: composerRef.value?.isTextareaFocused() ?? false,
+    dialogLayerOpen: hasOpenDialogLayer(),
+  })) return
+  const files = collectClipboardFiles(e.clipboardData)
+  if (files.length === 0) return
+  if (replanActive.value) {
+    e.preventDefault()
+    pushToast(t('chat.plan.attachmentsUnavailable'), { tone: 'warn' })
+    return
   }
-  if (files.length > 0) void addAttachments(files)
-  // Screenshot tools put both the image and its local file path on the
-  // clipboard; once we have attached the image, suppress the default paste so
-  // the path text is not also dumped into the composer (and then sent to the
-  // agent). Plain-text pastes with no image fall through unchanged.
-  if (attachedImage) e.preventDefault()
+  void addAttachments(files)
+  // File managers and screenshot tools put both the file and its name/path as
+  // text on the clipboard; once we have attached the files, suppress the
+  // default paste so that text is not also dumped into the composer (and then
+  // sent to the agent). Plain-text pastes with no file fall through unchanged.
+  e.preventDefault()
 }
 
 /* ── Document keydown (ESC) ────────────────────────────────────────── */
@@ -2105,14 +3239,7 @@ function onDocumentPaste(e: ClipboardEvent) {
 function onDocumentKeydown(e: KeyboardEvent) {
   if (e.key !== 'Escape') return
   if (e.defaultPrevented) return
-
-  // The landing agent switcher closes first and hands focus back to its trigger.
-  if (agentSwitcherOpen.value) {
-    e.preventDefault()
-    closeAgentSwitcher()
-    nextTick(() => agentSwitcherRef.value?.querySelector<HTMLElement>('.chat-landing-agent__btn')?.focus())
-    return
-  }
+  if (hasOpenDialogLayer()) return
 
   // The share preview modal owns Escape while it is open: it closes only the
   // preview (share mode stays active) via its own handler, so bail here and let
@@ -2125,9 +3252,16 @@ function onDocumentKeydown(e: KeyboardEvent) {
     return
   }
 
-  if (isStreaming.value) {
+  const target = e.target
+  const editableTarget = target instanceof HTMLInputElement
+    || target instanceof HTMLSelectElement
+    || (target instanceof HTMLTextAreaElement && !composerRef.value?.isTextareaFocused())
+    || (target instanceof HTMLElement && target.isContentEditable)
+  if (editableTarget) return
+
+  if (canStop.value) {
     e.preventDefault()
-    onStop()
+    onComposerStop()
     return
   }
 
@@ -2156,6 +3290,171 @@ function consumeDraftPrefill() {
   } catch { /* ignore */ }
 }
 
+async function chooseProjectPath(path: string) {
+  projectPickerOpen.value = false
+  if (!rpc.canChooseProject) return
+  const trusted = await confirm({
+    title: t('workspaces.trustTitle'),
+    body: t('workspaces.trustBody', { path }),
+    primaryLabel: t('workspaces.trustConfirm'),
+    primaryClass: 'btn--primary',
+  })
+  if (!trusted) return
+  try {
+    const workspace = await projectWorkspaces.openWorkspace(path)
+    if (!workspace) return
+    freshTaskDraft.requestFreshTask(draftAgentId(), workspace.id)
+    goToDraft({
+      agentId: draftAgentId(),
+      projectId: workspace.id,
+      replace: true,
+    })
+  } catch (cause) {
+    const detail = cause instanceof Error ? cause.message : String(cause)
+    pushToast(t('workspaces.openFailed', { error: detail }), { tone: 'warn' })
+  }
+}
+
+function openProjectPicker() {
+  if (!rpc.canChooseProject) return
+  projectPickerOpen.value = true
+}
+
+function closeProjectDraft() {
+  activeProjectWorkspace.clearDraft()
+  freshTaskDraft.requestFreshTask(draftAgentId())
+  goToDraft({
+    agentId: draftAgentId(),
+    projectId: null,
+    replace: true,
+  })
+}
+
+async function validateActiveProjectBeforeSend(): Promise<string | null> {
+  const key = sessionKey.value
+  const deadlineAt = Date.now() + 7_000
+  cancelActiveProjectValidation()
+  const controller = new AbortController()
+  activeProjectValidationController = controller
+  let workspaceId = boundWorkspaceId.value
+  try {
+    if (
+      !workspaceId
+      && activeWorkspaceStatus.value === 'error'
+    ) {
+      const recovered = await retrySessionMetadata({
+        timeoutMs: Math.max(1, deadlineAt - Date.now()),
+        signal: controller.signal,
+        timeoutAction: 'reconnect',
+        abortAction: 'reconnect',
+      })
+      if (!recovered) {
+        if (!controller.signal.aborted && sessionKey.value === key) {
+          pushToast(t('workspaces.activeProjectBlocksSending'), { tone: 'warn' })
+        }
+        return activeWorkspaceSendBlockedReason.value || 'error'
+      }
+      workspaceId = boundWorkspaceId.value
+    }
+    if (!workspaceId) return activeWorkspaceSendBlockedReason.value
+    if (!rpc.canManageProjectWorkspaces) {
+      return activeWorkspaceSendBlockedReason.value
+    }
+    const workspaces = await projectWorkspaces.loadWorkspaces({
+      timeoutMs: Math.max(1, deadlineAt - Date.now()),
+      signal: controller.signal,
+      timeoutAction: 'reconnect',
+      abortAction: 'reconnect',
+    })
+    if (sessionKey.value !== key || boundWorkspaceId.value !== workspaceId) {
+      return activeWorkspaceSendBlockedReason.value || 'resolving'
+    }
+    const workspace = workspaces.find(item => item.id === workspaceId) || null
+    activeProjectWorkspace.applyWorkspaceRefresh(
+      workspace ? activeSnapshot(workspace) : null,
+    )
+  } catch {
+    if (
+      !controller.signal.aborted
+      && sessionKey.value === key
+      && boundWorkspaceId.value === workspaceId
+    ) {
+      activeProjectWorkspace.failWorkspaceRefresh()
+    }
+  } finally {
+    if (activeProjectValidationController === controller) {
+      activeProjectValidationController = null
+    }
+  }
+  return activeWorkspaceSendBlockedReason.value
+}
+
+function draftProjectHydrationIsCurrent(
+  generation: number,
+  workspaceId: string | null,
+): boolean {
+  return draftProjectHydration.isCurrent(generation)
+    && isDraftRoute()
+    && readProjectFromUrl() === workspaceId
+}
+
+async function syncDraftProjectFromRoute(generation: number): Promise<boolean> {
+  const deadlineAt = Date.now() + 7_000
+  const workspaceId = readProjectFromUrl()
+  if (!draftProjectHydrationIsCurrent(generation, workspaceId)) return false
+  if (!workspaceId) {
+    activeProjectWorkspace.clearDraft()
+    return true
+  }
+  if (!rpc.canChooseProject) {
+    activeProjectWorkspace.clearDraft()
+    freshTaskDraft.requestFreshTask(draftAgentId())
+    goToDraft({
+      agentId: draftAgentId(),
+      projectId: null,
+      replace: true,
+    })
+    return true
+  }
+  const cached = projectWorkspaces.byId.value.get(workspaceId)
+  if (cached) {
+    activeProjectWorkspace.beginProjectDraft(activeSnapshot(cached))
+    return true
+  }
+  activeProjectWorkspace.beginUnknownProjectDraft(workspaceId)
+  const controller = draftProjectHydration.createController(generation)
+  if (!controller) return false
+  try {
+    await rpc.waitForConnection(
+      Math.max(1, deadlineAt - Date.now()),
+      controller.signal,
+      { timeoutAction: 'reconnect', abortAction: 'reconnect' },
+    )
+    if (!draftProjectHydrationIsCurrent(generation, workspaceId)) return false
+    await projectWorkspaces.loadWorkspaces({
+      timeoutMs: Math.max(1, deadlineAt - Date.now()),
+      signal: controller.signal,
+      timeoutAction: 'reconnect',
+      abortAction: 'reconnect',
+    })
+    if (!draftProjectHydrationIsCurrent(generation, workspaceId)) return false
+    const workspace = projectWorkspaces.byId.value.get(workspaceId)
+    if (workspace) {
+      activeProjectWorkspace.beginProjectDraft(activeSnapshot(workspace))
+    } else {
+      activeProjectWorkspace.beginUnknownProjectDraft(workspaceId)
+    }
+  } catch (cause) {
+    if (!draftProjectHydrationIsCurrent(generation, workspaceId)) return false
+    activeProjectWorkspace.failWorkspaceRefresh()
+    const detail = cause instanceof Error ? cause.message : String(cause)
+    pushToast(t('workspaces.loadFailed', { error: detail }), { tone: 'warn' })
+  } finally {
+    draftProjectHydration.complete(generation, controller)
+  }
+  return true
+}
+
 // Reset to a clean draft for the agent requested by the draft route. The
 // provisional key stays out of the URL and storage until the first send.
 function enterDraft() {
@@ -2171,33 +3470,59 @@ function enterDraft() {
 }
 
 onMounted(async () => {
+  chatViewDisposed = false
   // Initialize session key. Without an explicit ?session= the view opens as a
   // draft instead of restoring a previous session.
   const initialSession = resolveInitialSession()
   sessionKey.value = initialSession.sessionKey
+  let initialDraftProjectGeneration: number | null = null
+  let initialAutoSendSnapshot: {
+    text: string
+    revision: number
+    attachments: Attachment[]
+  } | null = null
   if (initialSession.draft) {
     pendingSessionIntent.value = 'new_chat'
-    if (!isDraftRoute() || hasLegacyNewChatQuery()) goToDraft({ replace: true })
+    initialDraftProjectGeneration = draftProjectHydration.begin()
+    // Apply the hand-off before any asynchronous project/live work. A later
+    // completion must never overwrite text the operator typed while waiting.
     consumeDraftPrefill()
+    if (pendingAutoSend.value) {
+      initialAutoSendSnapshot = {
+        text: pendingAutoSend.value,
+        revision: composerRevision.value,
+        attachments: [...pendingAttachments.value],
+      }
+    }
   } else {
+    activeProjectWorkspace.beginSessionResolution(initialSession.sessionKey)
     persistSession(sessionKey.value, { updateRoute: false, source: 'chatView.initialSession' })
   }
 
   // Load elevated mode
   loadElevatedMode()
 
-  // Resolve agent display names for the in-draft switcher.
-  void loadAgentOptions()
+  unsubs.push(rpc.on(
+    'sandbox.run_mode.preference.changed',
+    payload => applyRunModePreferenceChanged(payload),
+  ))
 
-  // Load feature toggles
-  await loadFeatureToggles()
-  unsubs.push(bindFeatureRefresh(scheduleHistorySync))
-
-  // Subscribe to RPC events
+  // Register event handlers before sessions.messages.subscribe can replay
+  // buffered events, then start the two critical phases before any optional
+  // config, usage, slash-command, or project-list RPC can enter the Gateway's
+  // serialized dispatch queue.
   unsubs.push(chatRpcSubscriptions.subscribe())
   unsubs.push(chatApprovals.subscribe())
   unsubs.push(metaRuns.subscribe())
-
+  unsubs.push(chatPlans.subscribe())
+  const sessionBootstrap = startSessionBootstrap({
+    includeHistory: !initialSession.draft,
+  })
+  const initialDraftProjectSync = initialDraftProjectGeneration === null
+    ? Promise.resolve(true)
+    : sessionBootstrap.live.then(() =>
+        syncDraftProjectFromRoute(initialDraftProjectGeneration!),
+      )
   // Composer resize observer
   const composerEl = composerRef.value?.composerElement()
   if (composerEl) {
@@ -2208,29 +3533,60 @@ onMounted(async () => {
     composerResizeObserver.observe(composerEl)
   }
 
-  // Load the requested chat state. Drafts subscribe so the first send can
-  // stream, but have no history to load.
-  const sessionSubscription = subscribeSession()
-  if (!initialSession.draft) loadHistory()
-  loadSlashCommands()
-
   // Focus textarea on desktop
   if (isDesktopViewport.value) {
     composerRef.value?.focusTextarea()
   }
 
+  if (initialDraftProjectGeneration !== null) {
+    const synced = await initialDraftProjectSync
+    if (synced) {
+      if (!isDraftRoute() || hasLegacyNewChatQuery()) goToDraft({ replace: true })
+    }
+  }
+
   // Sessions Hub "Start task" hand-off: send the prefilled draft in one step.
   // Wait for the subscription first so the first turn streams into this view
   // rather than being missed before sessions.messages.subscribe registers.
-  if (pendingAutoSend.value) {
-    const text = pendingAutoSend.value
+  if (pendingAutoSend.value && initialAutoSendSnapshot) {
+    const text = initialAutoSendSnapshot.text
+    const autoSendSessionKey = sessionKey.value
+    const autoSendGeneration = sessionBootstrap.generation
+    const subscription = await sessionBootstrap.live
     pendingAutoSend.value = ''
-    await sessionSubscription
-    sendComposerText(text)
+    const composerUnchanged = autoSendDraftIsUnchanged(
+      text,
+      inputText.value,
+      initialAutoSendSnapshot.attachments,
+      pendingAttachments.value,
+      initialAutoSendSnapshot.revision,
+      composerRevision.value,
+    )
+    if (
+      !chatViewDisposed
+      && sessionKey.value === autoSendSessionKey
+      && isSessionBootstrapCurrent(autoSendGeneration, autoSendSessionKey)
+      && subscription.authoritative
+      && livePhase.value === 'ready'
+      && composerUnchanged
+    ) {
+      sendAutomaticInput()
+    } else {
+      // Fail closed: the Sessions Hub hand-off remains an editable draft. The
+      // inline live-recovery state owns retry and explains why sending paused.
+      composerRef.value?.focusTextarea()
+    }
   }
 })
 
 onUnmounted(() => {
+  chatViewDisposed = true
+  draftProjectHydration.invalidate()
+  cancelSessionBootstrap()
+  releaseOptionalRpcAdmission?.()
+  releaseOptionalRpcAdmission = null
+  cancelActiveProjectValidation()
+  clearExecutionDockHideTimer()
   unsubs.forEach(fn => fn())
   unsubs = []
   cleanupPendingQueue()
@@ -2247,7 +3603,6 @@ onUnmounted(() => {
     URL.revokeObjectURL(sharePreview.value.url)
     sharePreview.value = null
   }
-  unsubscribeSession()
 })
 
 useDocumentEvent('paste', onDocumentPaste)
@@ -2266,25 +3621,67 @@ watch(() => route.query.session, (newSession) => {
 })
 
 // Entering the draft route resets to a clean draft for the requested agent.
-watch(() => [route.path, route.query.agent], () => {
-  if (isDraftRoute()) enterDraft()
+watch(() => [route.path, route.query.agent, route.query.project], async () => {
+  const generation = draftProjectHydration.begin()
+  if (!isDraftRoute()) return
+  if (!await syncDraftProjectFromRoute(generation)) return
+  enterDraft()
 })
+
+// Explicit new-task actions must reset even when navigation targets the exact
+// draft URL already on screen (for example, clicking the same project pencil).
+watch(freshTaskDraft.request, request => {
+  if (!request) return
+  draftProjectHydration.invalidate()
+  landingPrefilled.value = false
+  if (request.workspaceId && rpc.canChooseProject) {
+    const workspace = projectWorkspaces.byId.value.get(request.workspaceId)
+    if (workspace) {
+      activeProjectWorkspace.beginProjectDraft(activeSnapshot(workspace))
+    } else {
+      activeProjectWorkspace.beginUnknownProjectDraft(request.workspaceId)
+    }
+  } else {
+    activeProjectWorkspace.clearDraft()
+  }
+  startDraftSession(request.agentId)
+  if (isDesktopViewport.value) composerRef.value?.focusTextarea()
+})
+
+watch(projectWorkspaces.workspaces, workspaces => {
+  if (!rpc.canManageProjectWorkspaces) return
+  const workspaceId = boundWorkspaceId.value
+  if (!workspaceId) return
+  const workspace = workspaces.find(item => item.id === workspaceId) || null
+  activeProjectWorkspace.applyWorkspaceRefresh(
+    workspace ? activeSnapshot(workspace) : null,
+  )
+})
+
+watch(
+  () => rpc.canChooseProject,
+  allowed => {
+    if (allowed) return
+    projectPickerOpen.value = false
+    if (!isDraftRoute() || !readProjectFromUrl()) return
+    activeProjectWorkspace.clearDraft()
+    freshTaskDraft.requestFreshTask(draftAgentId())
+    goToDraft({
+      agentId: draftAgentId(),
+      projectId: null,
+      replace: true,
+    })
+  },
+)
 
 // Legacy ?newChat=1 / ?new=1 links land on the draft route, then the params disappear.
 watch(() => [route.query.newChat, route.query.new], () => {
   if (hasLegacyNewChatQuery()) goToDraft({ replace: true })
 })
 
-// A draft materializes its session key in the URL only when the first message
-// actually goes out.
-watch(pendingSessionIntent, (intent, previous) => {
-  if (previous !== 'new_chat' || intent !== null) return
-  if (!isDraftRoute()) return
-  persistSession(sessionKey.value, { source: 'chatView.draftMaterialized' })
-})
-
 watch(sessionKey, () => {
   pendingForkBeforeMessageId.value = null
+  if (workbenchEnabled.value) workbenchStore.setSessionScope(sessionKey.value || null)
   if (shareMode.value) endShareMode()
   deliverablesOpen.value = false
 })
@@ -2293,21 +3690,43 @@ watch(shareableMessageCount, (count) => {
   if (count === 0 && shareMode.value) endShareMode()
 })
 
-// Router-led turns hold the live answer/work-card reveal back for [MIN,MAX] ms,
+// Router-led turns hold the live answer/activity reveal back for [MIN,MAX] ms,
 // then mount a block of content at once. Re-pin the thread on that reveal so it
 // lands at the bottom instead of below the fold.
 watch(answerRevealOpen, (open) => {
   if (open && autoScroll.value) scrollToBottom()
 })
 
-// An approval/clarify interrupt is a user-blocking control, not answer content,
-// so it must not sit behind the router-lead reveal window. With the fold
-// authoritative (default), the gated work-card is the only interrupt surface,
-// so reveal immediately when a live interrupt part appears — otherwise the card
-// can stay invisible for up to the MAX backstop when no router decision lands.
-watch(() => liveInterruptParts.value.length, (n, prev) => {
-  if (n > (prev ?? 0)) revealNow()
-})
+// An approval/clarify interrupt is a user-blocking control, not answer content.
+// Reveal it immediately, re-pin the live edge, and keep it outside the
+// collapsible activity surface so it cannot disappear while the backend waits.
+watch(
+  () => visiblePendingInterruptKeys.value,
+  (keys, previousKeys = []) => {
+    if (!keys.some(key => !previousKeys.includes(key))) return
+    revealNow()
+    autoScroll.value = true
+    scrollToBottom()
+  },
+  { flush: 'post' },
+)
 </script>
 
 <style scoped src="../styles/chat-view.css"></style>
+
+<style scoped>
+/* No shared sr-only utility exists in this repo (each component scopes its
+   own), so the completion announcer's clip-out lives here: zero visual
+   footprint, still exposed to assistive tech. */
+.chat-turn-settled-announcer {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+</style>

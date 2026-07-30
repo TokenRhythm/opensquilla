@@ -9,7 +9,18 @@ in the wild:
 - Absent: returns 0 cleanly.
 """
 
-from opensquilla.provider.openai import _provider_billed_cost, _usage_fields
+from decimal import Decimal
+
+import pytest
+
+from opensquilla.provider.openai import (
+    _billing_result,
+    _exact_provider_billing_payload,
+    _provider_billed_cost,
+    _ProviderBillingAccumulator,
+    _usage_fields,
+    _UsageSnapshotAccumulator,
+)
 
 
 def test_usage_fields_returns_zero_when_usage_missing() -> None:
@@ -274,3 +285,218 @@ def test_usage_fields_write_priority_orders_prompt_details_over_top_level_alias(
 
     *_, cache_write_t, _ = _usage_fields(usage)
     assert cache_write_t == 100
+
+
+def test_usage_snapshot_accumulator_merges_fields_without_adding_snapshots() -> None:
+    usage = _UsageSnapshotAccumulator()
+    usage.update(
+        {
+            "prompt_tokens": 6,
+            "completion_tokens": 9,
+            "completion_tokens_details": {"reasoning_tokens": 6},
+            "prompt_tokens_details": {"cached_tokens": 4},
+        }
+    )
+    usage.update({"prompt_tokens": 7, "completion_tokens": 10})
+
+    assert usage.fields() == (7, 10, 6, 4, 0, 0.0)
+
+
+def test_usage_snapshot_accumulator_treats_later_zero_as_replacement() -> None:
+    usage = _UsageSnapshotAccumulator()
+    usage.update(
+        {
+            "prompt_tokens": 6,
+            "completion_tokens": 9,
+            "completion_tokens_details": {"reasoning_tokens": 6},
+            "prompt_tokens_details": {"cached_tokens": 4},
+            "cache_creation_input_tokens": 3,
+        }
+    )
+    usage.update(
+        {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "completion_tokens_details": {"reasoning_tokens": 0},
+            "prompt_tokens_details": {"cached_tokens": 0},
+            "cache_creation_input_tokens": 0,
+        }
+    )
+
+    assert usage.fields() == (0, 0, 0, 0, 0, 0.0)
+
+
+def _tokenrhythm_billing_result(
+    *,
+    pending: object = False,
+    cost: object = 0.000021,
+    base_url: str = "https://tokenrhythm.studio/v1",
+    include_pending: bool = True,
+    include_cost: bool = True,
+):
+    billing = _ProviderBillingAccumulator()
+    chunk: dict[str, object] = {}
+    if include_pending:
+        chunk["billing_pending"] = pending
+    if include_cost:
+        chunk["cost_cny"] = cost
+    billing.update("tokenrhythm", chunk)
+    return _billing_result(
+        provider_kind="tokenrhythm",
+        base_url=base_url,
+        usage=_UsageSnapshotAccumulator(),
+        billing=billing,
+        model="synthetic-model",
+    )
+
+
+def test_tokenrhythm_confirmed_receipt_preserves_cny_and_normalizes_usd() -> None:
+    billed_cost, cost_source, receipt = _tokenrhythm_billing_result()
+
+    assert billed_cost == 0.000003011
+    assert cost_source == "provider_billed"
+    assert receipt is not None
+    assert receipt.currency == "CNY"
+    assert receipt.status == "confirmed"
+    assert receipt.amount_nanos == 21_000
+    assert receipt.usd_equivalent_nanos == 3_011
+    assert receipt.fx_native_per_usd_nanos == 6_975_000_000
+
+
+def test_tokenrhythm_native_money_is_reparsed_without_float_rounding() -> None:
+    raw = '{"cost_cny":0.123456789499999999,"billing_pending":false}'
+    payload = _exact_provider_billing_payload(
+        "tokenrhythm",
+        {"cost_cny": 0.1234567895, "billing_pending": False},
+        raw,
+    )
+
+    assert payload["cost_cny"] == Decimal("0.123456789499999999")
+    billing = _ProviderBillingAccumulator()
+    billing.update("tokenrhythm", payload)
+    _, source, receipt = _billing_result(
+        provider_kind="tokenrhythm",
+        base_url="https://tokenrhythm.studio/v1",
+        usage=_UsageSnapshotAccumulator(),
+        billing=billing,
+        model="synthetic-model",
+    )
+    assert source == "provider_billed"
+    assert receipt is not None
+    assert receipt.amount_nanos == 123_456_789
+
+
+def test_tokenrhythm_confirmed_zero_is_still_provider_billed() -> None:
+    billed_cost, cost_source, receipt = _tokenrhythm_billing_result(cost=0)
+
+    assert billed_cost == 0.0
+    assert cost_source == "provider_billed"
+    assert receipt is not None
+    assert receipt.amount_nanos == 0
+    assert receipt.usd_equivalent_nanos == 0
+
+
+@pytest.mark.parametrize("include_cost", [False, True])
+def test_tokenrhythm_pending_receipt_is_not_added_to_billed_cost(
+    include_cost: bool,
+) -> None:
+    billed_cost, cost_source, receipt = _tokenrhythm_billing_result(
+        pending=True,
+        cost=0.000021,
+        include_cost=include_cost,
+    )
+
+    assert billed_cost == 0.0
+    assert cost_source == "none"
+    assert receipt is not None
+    assert receipt.status == "pending"
+    assert receipt.amount_nanos == (21_000 if include_cost else None)
+    assert receipt.usd_equivalent_nanos is None
+
+
+def test_tokenrhythm_pending_receipt_discards_malformed_provisional_amount() -> None:
+    billed_cost, cost_source, receipt = _tokenrhythm_billing_result(
+        pending=True,
+        cost=-1,
+    )
+
+    assert billed_cost == 0.0
+    assert cost_source == "none"
+    assert receipt is not None
+    assert receipt.status == "pending"
+    assert receipt.amount_nanos is None
+    assert receipt.usd_equivalent_nanos is None
+
+
+def test_tokenrhythm_pending_receipt_discards_out_of_range_provisional_amount() -> None:
+    billed_cost, cost_source, receipt = _tokenrhythm_billing_result(
+        pending=True,
+        cost=10_000_000_000,
+    )
+
+    assert billed_cost == 0.0
+    assert cost_source == "none"
+    assert receipt is not None
+    assert receipt.status == "pending"
+    assert receipt.amount_nanos is None
+    assert receipt.usd_equivalent_nanos is None
+
+
+@pytest.mark.parametrize(
+    ("pending", "cost", "include_pending", "include_cost"),
+    [
+        (False, 0.1, False, True),
+        ("false", 0.1, True, True),
+        (False, -0.1, True, True),
+        (False, float("nan"), True, True),
+        (False, float("inf"), True, True),
+        (False, True, True, True),
+        (False, "0.1", True, True),
+        (False, 10_000_000_000, True, True),
+        (False, 1e20, True, True),
+        (False, 0.1, True, False),
+    ],
+)
+def test_tokenrhythm_invalid_or_incomplete_confirmed_billing_is_untrusted(
+    pending: object,
+    cost: object,
+    include_pending: bool,
+    include_cost: bool,
+) -> None:
+    billed_cost, cost_source, receipt = _tokenrhythm_billing_result(
+        pending=pending,
+        cost=cost,
+        include_pending=include_pending,
+        include_cost=include_cost,
+    )
+
+    assert (billed_cost, cost_source, receipt) == (0.0, "none", None)
+
+
+def test_tokenrhythm_billing_metadata_is_ignored_on_unofficial_host() -> None:
+    assert _tokenrhythm_billing_result(base_url="https://example.test/v1") == (
+        0.0,
+        "none",
+        None,
+    )
+
+
+def test_openrouter_positive_usage_cost_produces_usd_receipt() -> None:
+    usage = _UsageSnapshotAccumulator()
+    usage.update({"cost": 0.012})
+
+    billed_cost, cost_source, receipt = _billing_result(
+        provider_kind="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+        usage=usage,
+        billing=_ProviderBillingAccumulator(),
+        model="synthetic-model",
+    )
+
+    assert billed_cost == 0.012
+    assert cost_source == "provider_billed"
+    assert receipt is not None
+    assert receipt.currency == "USD"
+    assert receipt.amount_nanos == 12_000_000
+    assert receipt.usd_equivalent_nanos == 12_000_000
+    assert receipt.fx_native_per_usd_nanos == 1_000_000_000

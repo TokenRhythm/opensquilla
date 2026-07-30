@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+from collections.abc import AsyncIterator, Iterable
 from typing import Any
 
 from opensquilla.gateway.session_lifecycle import session_status_for_task_status
@@ -89,6 +91,51 @@ def set_background_completion_manager(manager: Any | None) -> None:
     _background_completion_manager = manager
 
 
+@contextlib.asynccontextmanager
+async def quiesce_background_completion_sessions(
+    session_keys: Iterable[str],
+) -> AsyncIterator[None]:
+    """Fence parent-wake delivery when a manager is installed."""
+
+    manager = _background_completion_manager
+    quiesce = getattr(manager, "quiesce_sessions", None)
+    if not callable(quiesce):
+        yield
+        return
+    async with quiesce(session_keys):
+        yield
+
+
+async def cancel_background_completion_for_session(parent_session_key: str) -> int:
+    """Block pending child completions from reviving an aborted parent session."""
+    cancel_session = getattr(_background_completion_manager, "cancel_session", None)
+    if not callable(cancel_session):
+        return 0
+    return int(await cancel_session(parent_session_key))
+
+
+async def active_background_completion_group_ids(parent_session_key: str) -> list[str]:
+    """Return active background groups for session subscription hydration."""
+    active_group_ids = getattr(_background_completion_manager, "active_group_ids", None)
+    if not callable(active_group_ids):
+        return []
+    return list(await active_group_ids(parent_session_key))
+
+
+async def active_background_completion_run_mode_override(
+    parent_session_key: str,
+) -> Any | None:
+    """Return the accepted mode retained by an active background group."""
+    active_override = getattr(
+        _background_completion_manager,
+        "active_run_mode_override",
+        None,
+    )
+    if not callable(active_override):
+        return None
+    return await active_override(parent_session_key)
+
+
 async def announce_subagent_completion(
     event: SubagentCompletionEvent,
     *,
@@ -103,6 +150,7 @@ async def announce_subagent_completion(
     has a durable parent-session record behind it.
     """
     payload = event.to_payload()
+    event_payload = payload
     parent = None
     parent_task_id = event.parent_task_id
     parent_wake_payloads: list[dict[str, Any]] | None = None
@@ -124,7 +172,7 @@ async def announce_subagent_completion(
             parent = await get_session(event.parent_session_key)
         append_message = getattr(session_manager, "append_message", None)
         if callable(append_message):
-            await append_message(
+            persisted_entry = await append_message(
                 event.parent_session_key,
                 role="system",
                 content=json.dumps(payload, ensure_ascii=False),
@@ -134,6 +182,12 @@ async def announce_subagent_completion(
                     "source_tool": "subagent_completion",
                 },
             )
+            persisted_message_id = str(getattr(persisted_entry, "message_id", "") or "").strip()
+            if persisted_message_id:
+                # The durable transcript id is a delivery correlation field,
+                # not part of the subagent business payload consumed by parent
+                # wake/channel paths.
+                event_payload = {**payload, "message_id": persisted_message_id}
         if task_runtime is not None:
             if parent_task_id and not _group_closed(event.parent_session_key, parent_task_id):
                 parent_wake_payloads = None
@@ -149,7 +203,7 @@ async def announce_subagent_completion(
         await event_emitter(
             event.parent_session_key,
             "session.event.subagent_completion",
-            payload,
+            event_payload,
         )
 
     if channel_manager is not None and parent is not None:
@@ -272,6 +326,23 @@ async def close_subagent_spawn_group(
         completion_manager=_background_completion_manager,
     )
     return True
+
+
+async def subagent_spawn_group_exists(
+    parent_session_key: str,
+    parent_task_id: str,
+    *,
+    session_manager: Any,
+) -> bool:
+    """Return whether the current parent task actually spawned any children."""
+    if not parent_session_key or not parent_task_id:
+        return False
+    rows = await _list_spawn_group_sessions(
+        parent_session_key=parent_session_key,
+        parent_task_id=parent_task_id,
+        session_manager=session_manager,
+    )
+    return bool(rows)
 
 
 async def _read_parent_task_id(

@@ -119,6 +119,7 @@ def _install_orchestrator_spy(
     monkeypatch: pytest.MonkeyPatch,
     *,
     result: Any,
+    streamed_events: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Monkeypatch ``_build_meta_orchestrator`` with a spy and stub
     ``parse_meta_plan`` so the synthetic spec is accepted.
@@ -129,6 +130,8 @@ def _install_orchestrator_spy(
 
     class _FakeOrch:
         async def iter_events(self, _match: Any):
+            for event in streamed_events or []:
+                yield event
             yield result
 
     def _spy_build_meta_orchestrator(*, workspace_dir, triggered_by, skill_loader):
@@ -219,6 +222,47 @@ async def test_run_meta_launch_dispatches_and_yields_done_event(
     assert "meta_launch" not in (agent.config.metadata or {})
     # awaiting-guard was consulted with the agent's session key.
     assert writer.peek_calls == [{"session_id": "agent:main:test-launch"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("streamed", "terminal", "expected_live"),
+    [
+        ("PREFIX", "PREFIX-SUFFIX", "PREFIX-SUFFIX"),
+        ("STALE", "CANONICAL", "STALE"),
+    ],
+)
+async def test_run_meta_launch_never_reemits_a_terminal_prefix_or_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+    streamed: str,
+    terminal: str,
+    expected_live: str,
+) -> None:
+    """Only a strict terminal suffix may be published as another delta.
+
+    Conflicting terminal text is carried by the authoritative Done snapshot,
+    allowing surfaces to replace the stale preview without first displaying an
+    invalid concatenation.
+    """
+    from opensquilla.engine.types import TextDeltaEvent
+    from opensquilla.skills.meta.types import MetaResult
+
+    spec = _meta_spec("meta-tiny")
+    agent = _build_agent(loader=_StubLoader(spec), writer=_StubWriter())
+    agent._current_turn_message = "run it"  # type: ignore[attr-defined]
+    _install_orchestrator_spy(
+        agent,
+        monkeypatch,
+        streamed_events=[TextDeltaEvent(text=streamed)],
+        result=MetaResult(ok=True, final_text=terminal),
+    )
+
+    events = await _drain(agent, "meta-tiny")
+
+    assert _streamed_text(events) == expected_live
+    done = _done_event_of(events)
+    assert done.text == terminal
+    assert done.text_snapshot == terminal
 
 
 @pytest.mark.asyncio

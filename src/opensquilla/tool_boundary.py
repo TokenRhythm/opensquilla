@@ -9,6 +9,21 @@ from typing import Any
 from opensquilla.execution_status import ExecutionStatus
 
 
+@dataclass(frozen=True)
+class ToolContinuation:
+    """Runtime-only authority used to resume one suspended tool request."""
+
+    approval_id: str
+    tool_use_id: str
+    session_key: str
+    sandbox_override: str = "danger_full_access"
+
+    def matches(self, *, tool_use_id: str, session_key: str | None) -> bool:
+        return self.tool_use_id == tool_use_id and self.session_key == str(
+            session_key or ""
+        )
+
+
 @dataclass
 class ToolCall:
     tool_use_id: str
@@ -19,6 +34,9 @@ class ToolCall:
     # Populated by the agent when available; consulted by tools.dispatch to
     # refuse calls whose origin lies inside an <untrusted> envelope.
     origin_trace: str | None = None
+    # Never serialized into provider-visible tool arguments. The Agent sets
+    # this only after the exact suspended request has been approved.
+    continuation: ToolContinuation | None = None
 
 
 @dataclass

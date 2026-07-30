@@ -17,7 +17,7 @@ import os
 import sys
 from pathlib import Path
 
-from opensquilla.paths import default_opensquilla_home
+from opensquilla.paths import default_opensquilla_home, native_io_path
 
 log = logging.getLogger(__name__)
 
@@ -62,10 +62,11 @@ def _parse_env_file(path: Path) -> dict[str, str]:
     ``~/.opensquilla/.env`` must not kill every command (including the
     onboarding wizard that could repair the file).
     """
-    if not path.is_file():
+    native_path = native_io_path(path)
+    if not native_path.is_file():
         return {}
     try:
-        raw = path.read_text(encoding="utf-8")
+        raw = native_path.read_text(encoding="utf-8")
     except (UnicodeDecodeError, OSError) as exc:
         if str(path) not in _warned_unloadable_files:
             _warned_unloadable_files.add(str(path))

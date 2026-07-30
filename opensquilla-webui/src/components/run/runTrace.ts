@@ -57,6 +57,7 @@ function stepFromRenderItem(
     id: call.renderKey,
     parentId,
     title: call.displayName,
+    toolName: call.name,
     operationKey: operationKey || toolOperationKey(call.name),
     state: toolState(call),
     elapsedMs: null,
@@ -134,6 +135,7 @@ export function nodeStepsFromHistoryMessage(msg: ChatHistoryMessage): NodeStep[]
       id: pending.id,
       parentId: null,
       title: toolDisplayName(name, pending.input),
+      toolName: name,
       operationKey: toolOperationKey(name),
       // History is always terminal — no live running state (toParts.ts:9).
       state: toolState({ isRunning: false, status, result: output, isError }),

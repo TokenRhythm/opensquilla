@@ -14,6 +14,7 @@ export function useUsageSessionRows(options: {
   sessionTimestamp: (row: SessionRow) => number | null
   relTime: (timestamp: number | string) => string
   sortVal: (row: SessionRow, key: string) => string | number
+  taskName: (row: SessionRow) => string
 }) {
   const sortedRows = computed((): SortedRow[] => {
     const sorted = [...options.visibleSessions.value].sort((a, b) => {
@@ -26,7 +27,8 @@ export function useUsageSessionRows(options: {
     })
 
     return sorted.map(row => {
-      const sessionKey = (options.rowVal(row, 'session', 'sessionKey', 'key') || '') as string
+      const sessionKey = (options.rowVal(row, 'sessionKey', 'key') || '') as string
+      const sessionLabel = options.taskName(row)
       const cost = options.rowVal(row, 'cost_usd', 'costUsd')
       const timestamp = options.sessionTimestamp(row)
       const modified = timestamp != null ? options.relTime(timestamp) : '-'
@@ -36,6 +38,8 @@ export function useUsageSessionRows(options: {
       return {
         raw: row,
         sessionKey,
+        sessionLabel,
+        rowIdentity: sessionKey || sessionLabel,
         modified,
         inputTokens: options.numericRowVal(row, 'input_tokens', 'inputTokens'),
         outputTokens: options.numericRowVal(row, 'output_tokens', 'outputTokens'),

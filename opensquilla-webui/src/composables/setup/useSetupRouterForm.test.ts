@@ -26,16 +26,83 @@ describe('useSetupRouterForm — openrouter-mix round-trip', () => {
     expect(f.payload().mode).toBe('custom')
   })
 
-  it('classifies an openrouter config WITH a tier_profile as recommended', () => {
+  it('classifies an explicit follow-primary binding as recommended', () => {
     const f = useSetupRouterForm()
-    f.initFromConfig({ enabled: true, tier_profile: 'openrouter' }, {}, 'openrouter')
+    f.initFromConfig({ enabled: true, tier_profile: 'openrouter' }, {}, 'openrouter', 'follow_primary')
     expect(f.mode.value).toBe('recommended')
   })
 
-  it('does NOT mistake a non-openrouter provider for openrouter-mix', () => {
+  it('uses the active provider preset instead of materialized defaults for follow-primary', () => {
     const f = useSetupRouterForm()
-    f.initFromConfig({ enabled: true, tier_profile: null }, {}, 'openai')
+    f.initFromConfig(
+      {
+        enabled: false,
+        tiers: {
+          c0: { provider: 'openrouter', model: 'materialized-default' },
+        },
+      },
+      {
+        c0: { provider: 'deepseek', model: 'deepseek-chat' },
+      },
+      'deepseek',
+      'follow_primary',
+    )
+
+    f.enableFromSavedBinding()
+
     expect(f.mode.value).toBe('recommended')
+    expect(f.payload()).toMatchObject({
+      mode: 'recommended',
+      tiers: {
+        c0: { provider: 'deepseek', model: 'deepseek-chat' },
+      },
+    })
+  })
+
+  it('preserves explicit historical tiers when re-enabling a legacy router', () => {
+    const f = useSetupRouterForm()
+    f.initFromConfig(
+      {
+        enabled: false,
+        tiers: {
+          c0: { provider: 'openrouter', model: 'legacy-model' },
+        },
+      },
+      {
+        c0: { provider: 'deepseek', model: 'deepseek-chat' },
+      },
+      'deepseek',
+      'legacy',
+    )
+
+    f.enableFromSavedBinding()
+
+    expect(f.mode.value).toBe('custom')
+    expect(f.payload()).toMatchObject({
+      mode: 'custom',
+      tiers: {
+        c0: { provider: 'openrouter', model: 'legacy-model' },
+      },
+    })
+  })
+
+  it('round-trips a legacy non-OpenRouter ladder conservatively as custom', () => {
+    const f = useSetupRouterForm()
+    f.initFromConfig({ enabled: true, tier_profile: null }, {}, 'openai', 'legacy')
+    expect(f.mode.value).toBe('custom')
+    expect(f.payload().mode).toBe('custom')
+  })
+
+  it('keeps an explicit custom binding custom even when its shape resembles a preset', () => {
+    const f = useSetupRouterForm()
+    f.initFromConfig(
+      { enabled: true, tier_profile: 'openai' },
+      {},
+      'openai',
+      'custom',
+    )
+    expect(f.mode.value).toBe('custom')
+    expect(f.payload().mode).toBe('custom')
   })
 
   it('classifies a disabled config as disabled regardless of provider', () => {
@@ -58,7 +125,7 @@ describe('useSetupRouterForm — openrouter-mix round-trip', () => {
     expect(makePanel(f, false, true).value.ensembleProfileActive).toBe(true)
   })
 
-  it('keeps tier provider values in the save payload even when the panel renders them read-only', () => {
+  it('keeps tier provider values in the save payload', () => {
     const f = useSetupRouterForm()
     f.initFromConfig({
       enabled: true,
@@ -122,7 +189,12 @@ describe('useSetupRouterForm — openrouter-mix round-trip', () => {
 
   it('marks standard router configuration read-only while LLM ensemble routing is active', () => {
     const f = useSetupRouterForm()
-    f.initFromConfig({ enabled: true, tier_profile: 'openai' }, {}, 'openai')
+    f.initFromConfig(
+      { enabled: true, tier_profile: 'openai' },
+      {},
+      'openai',
+      'follow_primary',
+    )
 
     const panel = makePanel(f, false, true)
     expect(panel.value.routerMode).toBe('recommended')
@@ -203,6 +275,28 @@ describe('useSetupRouterForm - model strategy semantics', () => {
       mode: 'custom',
       crossProviderTiers: true,
       tierProviderMismatch: 'veto',
+    })
+  })
+
+  it('atomically clears a provider-scoped model when the tier provider changes', () => {
+    const f = useSetupRouterForm()
+    f.initFromConfig({
+      enabled: true,
+      tier_profile: 'openrouter',
+      tiers: {
+        c0: { provider: 'openrouter', model: 'deepseek/deepseek-v4-flash' },
+      },
+    }, {}, 'openrouter')
+
+    f.updateTierField('c0', 'provider', ' DeepSeek ')
+
+    expect(f.payload()).toMatchObject({
+      mode: 'custom',
+      crossProviderTiers: true,
+      tierProviderMismatch: 'veto',
+      tiers: {
+        c0: { provider: 'deepseek', model: '' },
+      },
     })
   })
 

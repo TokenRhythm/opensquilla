@@ -85,15 +85,30 @@ def providers_status(
     table.add_column("buildable", no_wrap=True)
     table.add_column("model")
     table.add_column("error")
+    if probe_models:
+        table.add_column("probe")
     for row in payload.get("providers", []):
-        table.add_row(
+        values = [
             str(row.get("providerId") or ""),
             "yes" if row.get("active") else "no",
             "yes" if row.get("configured") else "no",
             "yes" if row.get("buildable") else "no",
             str(row.get("model") or ""),
             str(row.get("error") or ""),
-        )
+        ]
+        if probe_models:
+            probe = row.get("modelProbe") or {}
+            status = str(probe.get("status") or "unavailable")
+            if status == "ok":
+                probe_text = f"ok ({int(probe.get('count') or 0)} models)"
+            elif status in {"error", "degraded"}:
+                kind = str(probe.get("failureKind") or status)
+                detail = str(probe.get("error") or "")
+                probe_text = f"{kind} — {detail}" if detail else kind
+            else:
+                probe_text = status
+            values.append(probe_text)
+        table.add_row(*values)
     console.print(table)
 
 

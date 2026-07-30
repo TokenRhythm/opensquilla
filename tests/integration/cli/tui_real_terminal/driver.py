@@ -13,6 +13,11 @@ from itertools import count
 from pathlib import Path
 from typing import Literal, Protocol
 
+from tui_real_terminal.framebuffer import (
+    StyledFramebuffer,
+    parse_tmux_styled_framebuffer,
+)
+
 try:
     import pty
 except ImportError:  # pragma: no cover - exercised only on platforms without pty
@@ -64,11 +69,26 @@ class RealTerminalSession(Protocol):
 
     def paste(self, text: str) -> None: ...
 
+    def mouse_scroll(
+        self,
+        direction: Literal["up", "down"],
+        *,
+        ticks: int = 1,
+        x: int = 4,
+        y: int = 4,
+    ) -> None: ...
+
     def resize(self, size: TerminalSize) -> None: ...
 
     def capture_text(self, checkpoint: str) -> TerminalFrame: ...
 
+    def capture_framebuffer(self, checkpoint: str) -> StyledFramebuffer | None: ...
+
     def capture_scrollback_text(self, checkpoint: str) -> TerminalFrame: ...
+
+    def cursor_position(self) -> tuple[int, int] | None: ...
+
+    def alternate_screen_active(self) -> bool: ...
 
     def wait_for_text(
         self,
@@ -203,6 +223,27 @@ class TmuxTerminalSession(_BaseTerminalSession):
             check=True,
         )
 
+    def mouse_scroll(
+        self,
+        direction: Literal["up", "down"],
+        *,
+        ticks: int = 1,
+        x: int = 4,
+        y: int = 4,
+    ) -> None:
+        """Send real SGR mouse-wheel reports through the child PTY."""
+
+        if direction not in {"up", "down"}:
+            raise ValueError("mouse scroll direction must be up or down")
+        button = 64 if direction == "up" else 65
+        report = f"\x1b[<{button};{max(1, x)};{max(1, y)}M".encode()
+        hex_bytes = [f"{byte:02x}" for byte in report]
+        for _ in range(max(1, ticks)):
+            subprocess.run(
+                ["tmux", "send-keys", "-H", "-t", self.run_id, *hex_bytes],
+                check=True,
+            )
+
     def resize(self, size: TerminalSize) -> None:
         self.size = size
         subprocess.run(
@@ -230,6 +271,26 @@ class TmuxTerminalSession(_BaseTerminalSession):
         self._append_log(f"\n--- {checkpoint} ---\n{frame.text}")
         return frame
 
+    def capture_framebuffer(self, checkpoint: str) -> StyledFramebuffer:
+        # Default capture reads the currently visible screen. `-a` would read
+        # tmux's saved normal screen while the TUI is in alternate-screen mode,
+        # so it is deliberately absent. `-J` is likewise absent because it
+        # joins wrapped rows and destroys exact cell geometry.
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-t", self.run_id, "-e", "-N", "-p"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        )
+        captured_at_ms = _now_ms()
+        return parse_tmux_styled_framebuffer(
+            result.stdout,
+            checkpoint=checkpoint,
+            cols=self.size.cols,
+            rows=self.size.rows,
+            captured_at_ms=captured_at_ms,
+        )
+
     def capture_scrollback_text(self, checkpoint: str) -> TerminalFrame:
         result = subprocess.run(
             ["tmux", "capture-pane", "-t", self.run_id, "-S", "-", "-p", "-J"],
@@ -240,6 +301,23 @@ class TmuxTerminalSession(_BaseTerminalSession):
         frame = TerminalFrame(checkpoint, result.stdout, _now_ms(), self.size)
         self._append_log(f"\n--- {checkpoint} scrollback ---\n{frame.text}")
         return frame
+
+    def cursor_position(self) -> tuple[int, int]:
+        result = subprocess.run(
+            [
+                "tmux",
+                "display-message",
+                "-p",
+                "-t",
+                self.run_id,
+                "#{cursor_x},#{cursor_y}",
+            ],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        )
+        x, y = result.stdout.strip().split(",", 1)
+        return int(x), int(y)
 
     def alternate_screen_active(self) -> bool:
         # tmux tracks the pane's alternate-screen mode itself, so this probes
@@ -341,6 +419,20 @@ class PtyTerminalSession(_BaseTerminalSession):
         payload = f"\x1b[200~{text}\x1b[201~"
         self._write(payload.encode("utf-8"))
 
+    def mouse_scroll(
+        self,
+        direction: Literal["up", "down"],
+        *,
+        ticks: int = 1,
+        x: int = 4,
+        y: int = 4,
+    ) -> None:
+        if direction not in {"up", "down"}:
+            raise ValueError("mouse scroll direction must be up or down")
+        button = 64 if direction == "up" else 65
+        report = f"\x1b[<{button};{max(1, x)};{max(1, y)}M".encode()
+        self._write(report * max(1, ticks))
+
     def resize(self, size: TerminalSize) -> None:
         self.size = size
         if self._master_fd is not None:
@@ -353,8 +445,21 @@ class PtyTerminalSession(_BaseTerminalSession):
         self._append_log(f"\n--- {checkpoint} ---\n{frame.text}")
         return frame
 
+    def capture_framebuffer(self, checkpoint: str) -> None:
+        # A byte-accumulating PTY is not a terminal emulator and cannot report
+        # the current cell grid after cursor movement or alternate-screen use.
+        return None
+
+    def alternate_screen_active(self) -> bool:
+        return False
+
     def capture_scrollback_text(self, checkpoint: str) -> TerminalFrame:
         return self.capture_text(checkpoint)
+
+    def cursor_position(self) -> None:
+        # The PTY driver records an append-only byte stream; without a terminal
+        # emulator it cannot observe the physical hardware cursor.
+        return None
 
     def wait_for_text(
         self,

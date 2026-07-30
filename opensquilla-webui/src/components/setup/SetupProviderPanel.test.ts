@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
+import { readFileSync } from 'node:fs'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { createApp, nextTick } from 'vue'
+import { createApp, nextTick, reactive } from 'vue'
 import i18n from '@/i18n'
 import zhHans from '@/locales/zh-Hans.json'
 import SetupProviderPanel from './SetupProviderPanel.vue'
@@ -11,6 +12,8 @@ function connection(overrides: Partial<ConnectionState> = {}): ConnectionState {
     phase: 'unverified',
     failureKind: '',
     detail: '',
+    firstResponseMs: null,
+    totalMs: null,
     latencyMs: null,
     models: [],
     modelSource: 'none',
@@ -32,6 +35,7 @@ const DISCOVERED: DiscoveredModel[] = [
 ]
 
 const TOKENRHYTHM_REGISTRATION_URL = 'https://tokenrhythm.studio/register'
+const TOKENRHYTHM_CATALOG_URL = 'https://tokenrhythm.studio/'
 const TOKENRHYTHM_PROVIDER = { providerId: 'tokenrhythm', label: 'TokenRhythm' }
 const OPENROUTER_PROVIDER = { providerId: 'openrouter', label: 'OpenRouter' }
 
@@ -40,6 +44,27 @@ function panel(overrides: Record<string, unknown> = {}) {
     providerSummary: 'OpenAI',
     providerSelected: 'openai',
     runtimeProviders: [{ providerId: 'openai', label: 'OpenAI' }],
+    configuredProviders: [],
+    credentialRemovalPending: false,
+    editingPrimary: true,
+    selectedStoredProfile: false,
+    editingNew: false,
+    profileSaveSupported: true,
+    primaryProviderRemovalSupported: true,
+    routingEnabled: false,
+    routerEnabled: false,
+    routerBinding: 'legacy',
+    crossProviderRoutingEnabled: false,
+    ensembleEnabled: false,
+    activationRouterConflict: false,
+    configuredProviderProbes: {},
+    activation: {
+      providerId: '',
+      phase: 'idle',
+      models: [],
+      suggestedModel: '',
+      error: '',
+    },
     routerSupportTone: 'is-ready',
     routerSupportText: 'SquillaRouter ready',
     canConfigureRouter: false,
@@ -51,7 +76,11 @@ function panel(overrides: Record<string, unknown> = {}) {
     credentialPanel: {
       providerLabel: 'OpenAI',
       providerSelected: true,
+      acceptsApiKey: true,
+      requiresApiKey: true,
       available: true,
+      removable: false,
+      removing: false,
       source: 'explicit',
       envKey: 'OPENAI_API_KEY',
       masked: 'sk-••••1234',
@@ -61,6 +90,9 @@ function panel(overrides: Record<string, unknown> = {}) {
       replacing: false,
       apiKeyValue: '',
       apiKeyEnvValue: '',
+      probeReady: true,
+      probeDisabledReason: '',
+      probeButtonLabel: 'Verify current configuration',
       connection: connection(),
       onReveal: vi.fn(),
       onReplace: vi.fn(),
@@ -73,6 +105,7 @@ function panel(overrides: Record<string, unknown> = {}) {
     llmTimeoutSeconds: 120,
     contextWindowTokens: '',
     contextWindowGlobal: null,
+    effectiveMaxTokens: null,
     providerIsLocal: false,
     connection: connection(),
     providerFieldValue: () => '',
@@ -81,6 +114,21 @@ function panel(overrides: Record<string, unknown> = {}) {
   const credentialPanel = (base.credentialPanel as Record<string, unknown>) || {}
   return {
     ...base,
+    configuredProviders: ((overrides.configuredProviders as Array<Record<string, unknown>> | undefined) ?? [{
+      providerId: String(base.providerSelected || 'openai'),
+      label: String((base.credentialPanel as Record<string, unknown>)?.providerLabel || base.providerSelected),
+      active: true,
+      ready: true,
+      credentialSource: 'explicit',
+      credentialEnv: '',
+      endpointSource: 'registry',
+      reason: '',
+    }]).map(provider => ({
+      primaryEligible: provider.active !== true,
+      primaryBlockReason: provider.active === true ? 'already_active' : '',
+      probeModelAvailable: true,
+      ...provider,
+    })),
     credentialPanel: {
       ...credentialPanel,
       providerSelected: (overrides.providerSelected as string | undefined) !== undefined
@@ -94,16 +142,17 @@ function panel(overrides: Record<string, unknown> = {}) {
 async function mountPanel(props: Record<string, unknown> = {}, listeners: Record<string, unknown> = {}) {
   const el = document.createElement('div')
   document.body.appendChild(el)
-  const app = createApp(SetupProviderPanel, { panel: panel(props), ...listeners })
+  const panelState = reactive(panel(props))
+  const app = createApp(SetupProviderPanel, { panel: panelState, ...listeners })
   app.use(i18n)
   app.mount(el)
   await nextTick()
-  return { app, el }
+  return { app, el, panelState }
 }
 
 function testButton(el: HTMLElement): HTMLButtonElement | null {
-  return Array.from(el.querySelectorAll<HTMLButtonElement>('button.btn'))
-    .find(btn => (btn.textContent || '').includes('Test connection') || (btn.textContent || '').includes('Testing')) || null
+  return Array.from(el.querySelectorAll<HTMLButtonElement>('.setup-provider-credential button.btn'))
+    .find(btn => (btn.textContent || '').includes('Verify current configuration') || (btn.textContent || '').includes('Verifying')) || null
 }
 
 beforeEach(() => {
@@ -126,8 +175,8 @@ beforeEach(() => {
   document.body.innerHTML = ''
 })
 
-describe('SetupProviderPanel — test connection', () => {
-  it('emits probeConnection when the Test connection button is clicked', async () => {
+describe('SetupProviderPanel — verify configuration', () => {
+  it('emits probeConnection when Verify current configuration is clicked', async () => {
     const onProbeConnection = vi.fn()
     const { app, el } = await mountPanel({}, { onProbeConnection })
     const button = testButton(el)
@@ -139,21 +188,41 @@ describe('SetupProviderPanel — test connection', () => {
 
   it('disables the button with no provider selected and while probing', async () => {
     const noProvider = await mountPanel({ providerSelected: '' })
-    expect(testButton(noProvider.el)?.disabled).toBe(true)
+    expect(testButton(noProvider.el)).toBeNull()
     noProvider.app.unmount()
 
     const probing = await mountPanel({ connection: connection({ phase: 'probing' }) })
     const button = testButton(probing.el)
     expect(button?.disabled).toBe(true)
-    expect(button?.textContent).toContain('Testing connection')
+    expect(button?.textContent).toContain('Verifying configuration')
     expect(probing.el.querySelector('.setup-connection__spinner')).toBeTruthy()
     probing.app.unmount()
   })
 
-  it('shows the Connected pill when verified', async () => {
+  it('does not emit a probe while required provider fields are missing', async () => {
+    const onProbeConnection = vi.fn()
+    const reason = 'Complete required fields before verifying: Model, Base URL.'
+    const { app, el } = await mountPanel({
+      credentialPanel: {
+        ...(panel().credentialPanel as Record<string, unknown>),
+        probeReady: false,
+        probeDisabledReason: reason,
+      },
+    }, { onProbeConnection })
+
+    const button = testButton(el)
+    expect(button?.disabled).toBe(true)
+    expect(button?.title).toBe(reason)
+    button?.click()
+    expect(onProbeConnection).not.toHaveBeenCalled()
+    expect(el.textContent).toContain(reason)
+    app.unmount()
+  })
+
+  it('shows Configuration verified for the current editor settings when verified', async () => {
     const { app, el } = await mountPanel({ connection: connection({ phase: 'verified' }) })
     const pill = el.querySelector('.setup-connection__actions .control-pill.control-pill--ok')
-    expect(pill?.textContent).toContain('✓ Connected')
+    expect(pill?.textContent).toContain('Configuration verified')
     app.unmount()
   })
 
@@ -188,15 +257,24 @@ describe('SetupProviderPanel — test connection', () => {
 })
 
 describe('SetupProviderPanel — model field', () => {
-  it('renders the plain text field when no models were discovered', async () => {
-    const { app, el } = await mountPanel()
-    expect(el.querySelector('.setup-model-combobox')).toBeNull()
-    expect(el.querySelector('input[name="setup_provider_model"]')).toBeTruthy()
+  it('keeps the shared model picker as a manual text input when no catalog is available', async () => {
+    const onUpdateProviderField = vi.fn()
+    const { app, el } = await mountPanel({ configuredProviders: [] }, { onUpdateProviderField })
+    const input = el.querySelector<HTMLInputElement>('input[name="setup_provider_model"]')
+
+    expect(el.querySelector('.setup-model-combobox')).toBeTruthy()
+    expect(input?.getAttribute('role')).toBeNull()
+    expect(el.querySelector('[data-testid="setup-model-options-toggle"]')).toBeNull()
+
+    input!.value = 'my/manual-model'
+    input!.dispatchEvent(new Event('input', { bubbles: true }))
+    expect(onUpdateProviderField).toHaveBeenCalledWith('model', 'my/manual-model')
     app.unmount()
   })
 
-  it('upgrades only the model field to the combobox when discovery returned models', async () => {
+  it('enables catalog behavior in the same model picker when discovery returned models', async () => {
     const { app, el } = await mountPanel({
+      configuredProviders: [],
       connection: connection({ phase: 'verified', models: DISCOVERED, modelSource: 'live' }),
     })
     const combobox = el.querySelector('.setup-model-combobox input[role="combobox"]')
@@ -217,7 +295,1230 @@ describe('SetupProviderPanel — model field', () => {
 
     expect(el.querySelector('[data-name="api_key"]')).toBeNull()
     expect(el.querySelector('[data-name="api_key_env"]')).toBeNull()
-    expect(el.textContent).toContain('OpenAI credential')
+    expect(el.textContent).toContain('OpenAI authentication')
+
+    app.unmount()
+  })
+})
+
+describe('SetupProviderPanel — configured provider management', () => {
+  const configured = [
+    {
+      providerId: 'openai',
+      label: 'OpenAI',
+      active: true,
+      ready: true,
+      credentialSource: 'explicit',
+      credentialEnv: '',
+      endpointSource: 'registry',
+      reason: '',
+    },
+    {
+      providerId: 'deepseek',
+      label: 'DeepSeek',
+      active: false,
+      ready: false,
+      credentialSource: 'missing_env',
+      credentialEnv: 'DEEPSEEK_API_KEY',
+      endpointSource: 'registry',
+      reason: 'missing_credentials',
+    },
+  ]
+
+  it('keeps provider state accessible while the visible list stays quiet', async () => {
+    const { app, el } = await mountPanel({
+      configuredProviders: configured,
+      providerSelected: 'deepseek',
+      editingPrimary: false,
+      selectedStoredProfile: true,
+      credentialPanel: {
+        ...(panel().credentialPanel as Record<string, unknown>),
+        providerLabel: 'DeepSeek',
+      },
+    })
+
+    const active = el.querySelector<HTMLElement>('[data-provider-id="openai"]')!
+    const editing = el.querySelector<HTMLElement>('[data-provider-id="deepseek"]')!
+    const activeIdentity = active.querySelector<HTMLButtonElement>('.setup-provider-card__select')!
+    const editingIdentity = editing.querySelector<HTMLButtonElement>('.setup-provider-card__select')!
+    expect(active.textContent).not.toContain('Active')
+    expect(activeIdentity.getAttribute('aria-label')).toContain('Active')
+    expect(active.querySelector('.setup-provider-card__select')?.getAttribute('aria-current')).toBeNull()
+    expect(editing.textContent).not.toContain('Active')
+    expect(editing.textContent).not.toContain('Editing')
+    expect(editingIdentity.getAttribute('aria-current')).toBeNull()
+
+    editingIdentity.click()
+    await nextTick()
+
+    expect(editingIdentity.getAttribute('aria-current')).toBe('true')
+    expect(editingIdentity.getAttribute('aria-label')).toContain('Editing')
+    expect(document.body.querySelector('[role="dialog"]')).toBeTruthy()
+    expect(editing.querySelector('.setup-provider-card__name')?.getAttribute('aria-current')).toBeNull()
+    expect(editing.getAttribute('aria-current')).toBeNull()
+
+    app.unmount()
+  })
+
+  it.each([
+    ['custom', 'Custom OpenAI-compatible endpoint'],
+    ['custom_anthropic', 'Custom Anthropic-compatible endpoint'],
+  ])('exposes and edits the Base URL for %s in the provider dialog', async (providerId, label) => {
+    const onUpdateProviderField = vi.fn()
+    const savedBaseUrl = `https://${providerId}.example.test/v1`
+    const { app, el } = await mountPanel({
+      providerSelected: providerId,
+      providerSummary: label,
+      runtimeProviders: [{ providerId, label }],
+      configuredProviders: [{
+        providerId,
+        label,
+        active: true,
+        ready: true,
+        credentialSource: 'explicit',
+        credentialEnv: '',
+        endpointSource: 'explicit',
+        reason: '',
+      }],
+      providerCoreFields: [{ name: 'model', label: 'Model', required: true }],
+      providerAdvancedFields: [
+        { name: 'base_url', label: 'Base URL', required: true },
+      ],
+      providerFieldValue: (field: { name: string }) => ({
+        model: 'test-model',
+        base_url: savedBaseUrl,
+      })[field.name] || '',
+      credentialPanel: {
+        ...(panel().credentialPanel as Record<string, unknown>),
+        providerLabel: label,
+        requiresApiKey: false,
+      },
+    }, { onUpdateProviderField })
+
+    el.querySelector<HTMLButtonElement>(
+      `[data-provider-id="${providerId}"] .setup-provider-card__select`,
+    )?.click()
+    await nextTick()
+
+    const endpoint = document.body.querySelector<HTMLElement>(
+      '[role="dialog"] [data-testid="setup-provider-modal-endpoint"]',
+    )
+    const input = endpoint?.querySelector<HTMLInputElement>(
+      'input[name="setup_provider_base_url"]',
+    )
+    expect(input?.value).toBe(savedBaseUrl)
+
+    input!.value = `https://${providerId}.new.example.test/v1`
+    input!.dispatchEvent(new Event('input', { bubbles: true }))
+    expect(onUpdateProviderField).toHaveBeenCalledWith(
+      'base_url',
+      `https://${providerId}.new.example.test/v1`,
+    )
+
+    app.unmount()
+  })
+
+  it('selects the editor from the full information block with native click and Enter semantics', async () => {
+    const onSelectConfiguredProvider = vi.fn()
+    const { app, el } = await mountPanel({ configuredProviders: configured }, {
+      onSelectConfiguredProvider,
+    })
+    const row = el.querySelector<HTMLElement>('[data-provider-id="deepseek"]')!
+    const select = row.querySelector<HTMLButtonElement>('.setup-provider-card__select')!
+
+    expect(select.tagName).toBe('BUTTON')
+    expect(select.type).toBe('button')
+    expect(row.getAttribute('role')).toBeNull()
+    expect(select.querySelector('.setup-provider-card__name')?.textContent).toBe('DeepSeek')
+
+    select.click()
+    expect(onSelectConfiguredProvider).toHaveBeenCalledWith('deepseek')
+
+    onSelectConfiguredProvider.mockClear()
+    select.focus()
+    const keydown = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })
+    if (select.dispatchEvent(keydown)) select.click()
+    select.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }))
+    expect(document.activeElement).toBe(select)
+    expect(onSelectConfiguredProvider).toHaveBeenCalledOnce()
+    expect(onSelectConfiguredProvider).toHaveBeenCalledWith('deepseek')
+
+    app.unmount()
+  })
+
+  it('keeps credential readiness and verification state in the accessible row label', async () => {
+    const { app, el } = await mountPanel({
+      configuredProviders: [configured[0]],
+    })
+    const row = el.querySelector<HTMLElement>('[data-provider-id="openai"]')!
+    const test = row.querySelector<HTMLButtonElement>('.setup-provider-card__test')
+
+    const identityLabel = row.querySelector('.setup-provider-card__identity')?.getAttribute('aria-label')
+    expect(row.textContent).not.toContain('Credentials ready')
+    expect(row.textContent).not.toContain('Not verified')
+    expect(identityLabel).toContain('Credentials ready')
+    expect(identityLabel).toContain('Not verified')
+    expect(row.textContent).not.toContain('Configuration verified')
+    expect(test?.textContent?.trim()).toBe('Verify saved configuration')
+    expect(test?.getAttribute('aria-describedby')).toBe('setup-provider-configured-desc')
+    expect(el.querySelector('#setup-provider-configured-desc')?.textContent).toContain(
+      'Testing sends one small model request.',
+    )
+
+    app.unmount()
+  })
+
+  it('shows first model response before complete probe duration for a saved provider', async () => {
+    const { app, el } = await mountPanel({
+      configuredProviders: [configured[0]],
+      configuredProviderProbes: {
+        openai: connection({
+          phase: 'verified',
+          firstResponseMs: 123,
+          totalMs: 412,
+        }),
+      },
+    })
+    const row = el.querySelector<HTMLElement>('[data-provider-id="openai"]')!
+
+    expect(row.textContent).toContain('✓ Configuration verified')
+    expect(row.textContent).toContain('First model response · 123 ms')
+    expect(row.textContent).toContain('Complete probe · 412 ms')
+    expect(row.textContent?.indexOf('First model response'))
+      .toBeLessThan(row.textContent?.indexOf('Complete probe') ?? 0)
+
+    app.unmount()
+  })
+
+  it('labels an old gateway latency only as complete probe duration', async () => {
+    const { app, el } = await mountPanel({
+      configuredProviders: [configured[0]],
+      configuredProviderProbes: {
+        openai: connection({
+          phase: 'verified',
+          firstResponseMs: null,
+          totalMs: 4082,
+          latencyMs: 4082,
+        }),
+      },
+    })
+    const row = el.querySelector<HTMLElement>('[data-provider-id="openai"]')!
+
+    expect(row.textContent).toContain('Complete probe · 4082 ms')
+    expect(row.textContent).not.toContain('First model response')
+    expect(row.textContent).not.toContain('Connected · 4082')
+
+    app.unmount()
+  })
+
+  it('shows the classified reason when saved configuration verification fails', async () => {
+    const { app, el } = await mountPanel({
+      configuredProviders: [configured[0]],
+      configuredProviderProbes: {
+        openai: connection({
+          phase: 'unreachable',
+          failureKind: 'insufficient_credits',
+          detail: 'billing account rejected the request',
+        }),
+      },
+    })
+    const row = el.querySelector<HTMLElement>('[data-provider-id="openai"]')!
+
+    expect(row.textContent).toContain("✗ Couldn't connect — This account has no credits left.")
+    expect(row.textContent).not.toContain('Connection unavailable')
+    expect(row.textContent).not.toContain('insufficient_credits')
+
+    app.unmount()
+  })
+
+  it('reports a malformed saved-provider stream without calling it unreachable', async () => {
+    const { app, el } = await mountPanel({
+      configuredProviders: [configured[0]],
+      configuredProviderProbes: {
+        openai: connection({
+          phase: 'unreachable',
+          failureKind: 'malformed_response',
+          detail: 'invalid_stream_order',
+        }),
+      },
+    })
+    const row = el.querySelector<HTMLElement>('[data-provider-id="openai"]')!
+
+    expect(row.textContent).toContain('Streaming response incompatible')
+    expect(row.textContent).not.toContain("Couldn't connect")
+    expect(row.textContent).not.toContain('invalid_stream_order')
+
+    app.unmount()
+  })
+
+  it('keeps the full catalog hidden until Add provider opens a searchable list', async () => {
+    const onAddProvider = vi.fn()
+    const { app, el } = await mountPanel({
+      configuredProviders: configured,
+      runtimeProviders: [
+        { providerId: 'openai', label: 'OpenAI' },
+        { providerId: 'deepseek', label: 'DeepSeek' },
+        { providerId: 'gemini', label: 'Google Gemini' },
+      ],
+    }, { onAddProvider })
+
+    expect(el.querySelector('select[name="setup_provider"]')).toBeNull()
+    expect(el.querySelector('[data-testid="configured-provider-list"]')?.textContent).toContain('OpenAI')
+    expect(el.querySelector('[data-testid="configured-provider-list"]')?.textContent).toContain('DeepSeek')
+    expect(document.body.querySelector('[data-testid="provider-catalog-picker"]')).toBeNull()
+
+    const add = Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === 'Add provider')
+    add?.click()
+    await nextTick()
+
+    expect(el.querySelector('[data-provider-picker-trigger]')?.getAttribute('aria-expanded')).toBe('true')
+    expect(document.body.querySelector('[role="dialog"]')).toBeTruthy()
+    expect(document.body.querySelector('[data-testid="provider-catalog-picker"]')).toBeTruthy()
+    expect(document.body.querySelector('input[name="setup_provider_search"]')).toBeTruthy()
+    const options = Array.from(document.body.querySelectorAll<HTMLButtonElement>('.provider-picker__option'))
+    expect(options.map(option => option.textContent)).toEqual([expect.stringContaining('Google Gemini')])
+
+    options[0]?.click()
+    expect(onAddProvider).toHaveBeenCalledWith('gemini')
+    app.unmount()
+  })
+
+  it('opens the TokenRhythm limited-time offer without selecting the provider', async () => {
+    const onAddProvider = vi.fn()
+    const { app, el } = await mountPanel({
+      configuredProviders: [],
+      runtimeProviders: [TOKENRHYTHM_PROVIDER, OPENROUTER_PROVIDER],
+    }, { onAddProvider })
+
+    Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === 'Add provider')?.click()
+    await nextTick()
+    await nextTick()
+
+    const offer = document.body.querySelector<HTMLAnchorElement>('.provider-picker__offer')
+    expect(offer?.href).toBe(TOKENRHYTHM_CATALOG_URL)
+    expect(offer?.getAttribute('target')).toBe('_blank')
+    expect(offer?.getAttribute('rel')).toBe('noopener noreferrer')
+    expect(offer?.getAttribute('aria-label')).toContain('opens in a new tab')
+    expect(offer?.textContent).toContain('Limited-time free access')
+
+    offer?.addEventListener('click', event => event.preventDefault(), { once: true })
+    offer?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    await nextTick()
+
+    expect(onAddProvider).not.toHaveBeenCalled()
+    expect(document.body.querySelector('[data-testid="provider-catalog-picker"]')).toBeTruthy()
+    app.unmount()
+  })
+
+  it('keeps the TokenRhythm offer visible in the editor for a configured provider', async () => {
+    const onAddProvider = vi.fn()
+    const onUpdateProviderField = vi.fn()
+    const { app, el } = await mountPanel({
+      providerSelected: 'tokenrhythm',
+      runtimeProviders: [TOKENRHYTHM_PROVIDER, OPENROUTER_PROVIDER],
+      configuredProviders: [{
+        providerId: 'tokenrhythm',
+        label: 'TokenRhythm',
+        active: true,
+        ready: true,
+        credentialSource: 'explicit',
+        credentialEnv: '',
+        endpointSource: 'registry',
+        reason: '',
+      }],
+      credentialPanel: {
+        ...(panel().credentialPanel as Record<string, unknown>),
+        providerLabel: 'TokenRhythm',
+        envKey: 'TOKENRHYTHM_API_KEY',
+        masked: 'tr-••••1234',
+      },
+    }, { onAddProvider, onUpdateProviderField })
+
+    expect(el.querySelector('[data-testid="tokenrhythm-recommendation"]')).toBeNull()
+
+    el.querySelector<HTMLButtonElement>(
+      '[data-provider-id="tokenrhythm"] .setup-provider-card__select',
+    )?.click()
+    await nextTick()
+
+    const dialog = document.body.querySelector<HTMLElement>('[role="dialog"]')!
+    const offer = dialog.querySelector<HTMLElement>('[data-testid="tokenrhythm-recommendation"]')
+    const link = offer?.querySelector<HTMLAnchorElement>('a')
+
+    expect(offer?.classList.contains('setup-provider-recommendation--compact')).toBe(true)
+    expect(offer?.textContent).toContain('Recommended: TokenRhythm')
+    expect(offer?.textContent).toContain('TokenRhythm API calls are free for a limited time.')
+    expect(offer?.querySelector('[data-testid="tokenrhythm-recommendation-step"]')).toBeNull()
+    expect(link?.href).toBe(TOKENRHYTHM_REGISTRATION_URL)
+    expect(link?.getAttribute('target')).toBe('_blank')
+    expect(link?.getAttribute('rel')).toBe('noopener noreferrer')
+    expect(link?.getAttribute('aria-label')).toContain('opens in a new tab')
+
+    link?.addEventListener('click', event => event.preventDefault(), { once: true })
+    link?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    await nextTick()
+
+    expect(onAddProvider).not.toHaveBeenCalled()
+    expect(onUpdateProviderField).not.toHaveBeenCalled()
+    expect(document.body.querySelector('[role="dialog"]')).toBeTruthy()
+    app.unmount()
+  })
+
+  it('closes the inline picker with Escape and restores focus to Add provider', async () => {
+    const { app, el } = await mountPanel({
+      runtimeProviders: [
+        { providerId: 'openai', label: 'OpenAI' },
+        { providerId: 'deepseek', label: 'DeepSeek' },
+      ],
+    })
+    const add = Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === 'Add provider')!
+    add.click()
+    await nextTick()
+    await nextTick()
+    const search = document.body.querySelector<HTMLInputElement>('input[name="setup_provider_search"]')!
+    expect(document.activeElement).toBe(search)
+
+    search.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))
+    await nextTick()
+
+    await vi.waitFor(() => {
+      expect(document.body.querySelector('[data-testid="provider-catalog-picker"]')).toBeNull()
+    })
+    const restoredAdd = el.querySelector<HTMLButtonElement>('[data-provider-picker-trigger]')!
+    expect(restoredAdd.getAttribute('aria-expanded')).toBe('false')
+    expect(document.activeElement).toBe(restoredAdd)
+    app.unmount()
+  })
+
+  it('closes from the modal backdrop and restores focus to Add provider', async () => {
+    const { app, el } = await mountPanel({
+      runtimeProviders: [
+        { providerId: 'openai', label: 'OpenAI' },
+        { providerId: 'deepseek', label: 'DeepSeek' },
+      ],
+    })
+    Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === 'Add provider')?.click()
+    await nextTick()
+    await nextTick()
+    const backdrop = document.body.querySelector<HTMLElement>('.setup-provider-modal-overlay')!
+    backdrop.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }))
+
+    await vi.waitFor(() => {
+      expect(document.body.querySelector('[data-testid="provider-catalog-picker"]')).toBeNull()
+    })
+    expect(document.activeElement).toBe(el.querySelector('[data-provider-picker-trigger]'))
+    app.unmount()
+  })
+
+  it('opens the selected provider directly below the picker and focuses its API key', async () => {
+    const el = document.createElement('div')
+    document.body.appendChild(el)
+    const panelState = reactive(panel({
+      providerSelected: '',
+      configuredProviders: [],
+      runtimeProviders: [
+        { providerId: 'tokenrhythm', label: 'TokenRhythm' },
+        { providerId: 'deepseek', label: 'DeepSeek' },
+      ],
+    }))
+    const mutablePanelState = panelState as unknown as Record<string, unknown>
+    const app = createApp(SetupProviderPanel, {
+      panel: panelState,
+      onAddProvider: (providerId: string) => {
+        panelState.providerSelected = providerId
+        panelState.editingPrimary = true
+        mutablePanelState.providerNeeds = ['API key via DEEPSEEK_API_KEY or a one-time paste.']
+        mutablePanelState.credentialPanel = {
+          providerLabel: 'DeepSeek',
+          providerSelected: true,
+          acceptsApiKey: true,
+          requiresApiKey: true,
+          available: false,
+          source: 'none',
+          envKey: 'DEEPSEEK_API_KEY',
+          masked: '',
+          revealAllowed: false,
+          revealed: '',
+          revealError: '',
+          replacing: false,
+          apiKeyValue: '',
+          apiKeyEnvValue: '',
+          probeReady: false,
+          probeDisabledReason: 'Add an API key before verifying this provider.',
+          probeButtonLabel: 'Add key to verify',
+          connection: connection(),
+          onReveal: vi.fn(),
+          onReplace: vi.fn(),
+          onCancelReplace: vi.fn(),
+        }
+      },
+    })
+    app.use(i18n)
+    app.mount(el)
+    await nextTick()
+
+    Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === 'Add provider')?.click()
+    await nextTick()
+    await nextTick()
+    Array.from(document.body.querySelectorAll<HTMLButtonElement>('.provider-picker__option'))
+      .find(option => option.textContent?.includes('DeepSeek'))?.click()
+    await nextTick()
+    await nextTick()
+
+    expect(document.body.querySelector('[data-testid="provider-catalog-picker"]')).toBeNull()
+    expect(document.body.querySelector('.setup-provider-modal__form')).toBeTruthy()
+    expect(document.activeElement)
+      .toBe(document.body.querySelector(
+        '.setup-provider-modal__form input[name="setup_provider_api_key"]',
+      ))
+    app.unmount()
+  })
+
+  it('shows an explicit Save changes action for a new provider draft', async () => {
+    const el = document.createElement('div')
+    document.body.appendChild(el)
+    const panelState = reactive(panel({
+      providerSelected: '',
+      configuredProviders: [],
+      runtimeProviders: [OPENROUTER_PROVIDER],
+    }))
+    const mutablePanelState = panelState as unknown as Record<string, unknown>
+    const onSaveProvider = vi.fn()
+    const app = createApp(SetupProviderPanel, {
+      panel: panelState,
+      dirty: true,
+      onSaveProvider,
+      onAddProvider: (providerId: string) => {
+        panelState.providerSelected = providerId
+        panelState.editingNew = true
+        mutablePanelState.credentialPanel = {
+          ...(panelState.credentialPanel as Record<string, unknown>),
+          providerLabel: 'OpenRouter',
+          providerSelected: true,
+        }
+      },
+    })
+    app.use(i18n)
+    app.mount(el)
+    await nextTick()
+
+    Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === 'Add provider')?.click()
+    await nextTick()
+    Array.from(document.body.querySelectorAll<HTMLButtonElement>('.provider-picker__option'))
+      .find(option => option.textContent?.includes('OpenRouter'))?.click()
+    await nextTick()
+    await nextTick()
+
+    const save = Array.from(
+      document.body.querySelectorAll<HTMLButtonElement>('.setup-provider-modal__footer button'),
+    ).find(button => button.textContent?.trim() === 'Save changes')
+    expect(save?.disabled).toBe(false)
+    save?.click()
+    expect(onSaveProvider).toHaveBeenCalledOnce()
+
+    app.unmount()
+  })
+
+  it('offers a verified replace-current flow on a single-provider Gateway', async () => {
+    const el = document.createElement('div')
+    document.body.appendChild(el)
+    const panelState = reactive(panel({
+      providerSelected: '',
+      configuredProviders: [],
+      runtimeProviders: [OPENROUTER_PROVIDER],
+      profileSaveSupported: false,
+      connection: connection({ phase: 'verified' }),
+    }))
+    const mutablePanelState = panelState as unknown as Record<string, unknown>
+    const onSaveProvider = vi.fn()
+    const app = createApp(SetupProviderPanel, {
+      panel: panelState,
+      dirty: true,
+      onSaveProvider,
+      onAddProvider: (providerId: string) => {
+        panelState.providerSelected = providerId
+        panelState.editingPrimary = false
+        panelState.editingNew = true
+        mutablePanelState.credentialPanel = {
+          ...(panelState.credentialPanel as Record<string, unknown>),
+          providerLabel: 'OpenRouter',
+          providerSelected: true,
+        }
+      },
+    })
+    app.use(i18n)
+    app.mount(el)
+    await nextTick()
+
+    Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === 'Add provider')?.click()
+    await nextTick()
+    Array.from(document.body.querySelectorAll<HTMLButtonElement>('.provider-picker__option'))
+      .find(option => option.textContent?.includes('OpenRouter'))?.click()
+    await nextTick()
+    await nextTick()
+
+    expect(document.body.querySelector('.setup-provider-modal__compat-warning')?.textContent)
+      .toContain('replaces the current provider')
+    const save = Array.from(
+      document.body.querySelectorAll<HTMLButtonElement>('.setup-provider-modal__footer button'),
+    ).find(button => button.textContent?.trim() === 'Save changes')
+    expect(save?.disabled).toBe(false)
+    save?.click()
+    expect(onSaveProvider).toHaveBeenCalledOnce()
+
+    app.unmount()
+  })
+
+  it('hides delete when the Gateway cannot store a replacement profile', async () => {
+    const { app, el } = await mountPanel({ profileSaveSupported: false })
+
+    expect(el.querySelector('.setup-provider-card__delete')).toBeNull()
+
+    app.unmount()
+  })
+
+  it('hides only the active delete action when atomic removal is unsupported', async () => {
+    const { app, el } = await mountPanel({
+      configuredProviders: configured,
+      primaryProviderRemovalSupported: false,
+    })
+
+    expect(
+      el.querySelector('[data-provider-id="openai"] .setup-provider-card__delete'),
+    ).toBeNull()
+    expect(
+      el.querySelector('[data-provider-id="deepseek"] .setup-provider-card__delete'),
+    ).not.toBeNull()
+
+    app.unmount()
+  })
+
+  it('tests saved config without switching the editor and keeps edit/delete visible', async () => {
+    const onSelectConfiguredProvider = vi.fn()
+    const onProbeConfiguredProvider = vi.fn()
+    const onRemoveProviderProfile = vi.fn()
+    const readyConfigured = configured.map(row => row.providerId === 'deepseek' ? { ...row, ready: true } : row)
+    const { app, el } = await mountPanel({ configuredProviders: readyConfigured }, {
+      onSelectConfiguredProvider,
+      onProbeConfiguredProvider,
+      onRemoveProviderProfile,
+    })
+    const deepseek = el.querySelector<HTMLElement>('[data-provider-id="deepseek"]')!
+    const buttons = Array.from(deepseek.querySelectorAll<HTMLButtonElement>('button'))
+
+    buttons.find(button => button.textContent?.trim() === 'Verify saved configuration')?.click()
+    expect(onSelectConfiguredProvider).not.toHaveBeenCalled()
+    expect(onProbeConfiguredProvider).toHaveBeenCalledWith('deepseek')
+
+    expect(onSelectConfiguredProvider).not.toHaveBeenCalled()
+    expect(buttons.find(button => button.textContent?.trim() === 'Edit')).toBeTruthy()
+    expect(buttons.find(button => button.textContent?.trim() === 'Set active')).toBeUndefined()
+    buttons.find(button => button.textContent?.trim() === 'Delete')?.click()
+    await nextTick()
+    expect(onRemoveProviderProfile).toHaveBeenCalledWith('deepseek')
+    expect(onSelectConfiguredProvider).not.toHaveBeenCalled()
+    expect(Array.from(el.querySelectorAll<HTMLButtonElement>('[data-provider-id="openai"] button'))
+      .some(button => button.textContent?.trim() === 'Delete')).toBe(true)
+    app.unmount()
+  })
+
+  it('summarizes the active model usage without presenting inactive features as settings', async () => {
+    const onGoToSection = vi.fn()
+    const { app, el } = await mountPanel({
+      configuredProviders: configured,
+      providerSelected: 'deepseek',
+      editingPrimary: false,
+      selectedStoredProfile: true,
+      routingEnabled: false,
+    }, { onGoToSection })
+
+    const summary = el.querySelector<HTMLElement>('[data-testid="provider-model-usage"]')!
+    expect(summary.textContent).toContain('Model usage')
+    expect(summary.textContent).toContain('Fixed model')
+    expect(summary.textContent).not.toContain('Cross-provider')
+    expect(summary.textContent).not.toContain('Ensemble · Off')
+    const cta = Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.includes('Set up model routing'))
+    cta?.click()
+    expect(onGoToSection).toHaveBeenCalledWith('modelStrategy')
+    app.unmount()
+  })
+
+  it('hides the model-usage summary while the configured primary model card is shown', async () => {
+    const { app, el } = await mountPanel({ configuredProviders: configured })
+
+    expect(el.querySelector('[data-testid="configured-primary-model-readonly"]')).toBeTruthy()
+    expect(el.querySelector('[data-testid="provider-model-usage"]')).toBeNull()
+    expect(Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
+      .filter(button => button.textContent?.includes('Set up model routing'))).toHaveLength(1)
+
+    app.unmount()
+  })
+
+  it('keeps the model-usage summary during a primary draft, where no model card is shown', async () => {
+    const { app, el } = await mountPanel({
+      configuredProviders: configured,
+      providerSelected: 'deepseek',
+      editingPrimary: true,
+    })
+
+    expect(el.querySelector('[data-testid="configured-primary-model-readonly"]')).toBeNull()
+    expect(el.querySelector('[data-testid="provider-model-usage"]')).toBeTruthy()
+
+    app.unmount()
+  })
+
+  it('renders the persisted verification state when no in-session probe ran', async () => {
+    const at = new Date(Date.now() - 5 * 60_000).toISOString()
+    const rows = [
+      { ...configured[0], lastProbe: { ok: true, at, configChanged: false, failureKind: '' } },
+      {
+        ...configured[1],
+        ready: true,
+        lastProbe: { ok: false, at, configChanged: false, failureKind: 'auth_invalid' },
+      },
+    ]
+    const { app, el } = await mountPanel({ configuredProviders: rows })
+
+    const openai = el.querySelector<HTMLElement>('[data-provider-id="openai"]')!
+    const deepseek = el.querySelector<HTMLElement>('[data-provider-id="deepseek"]')!
+    expect(openai.textContent).toContain('Verified ·')
+    expect(openai.textContent).toContain('minutes ago')
+    expect(openai.querySelector('.setup-provider-card__probe')?.classList.contains('is-ready'))
+      .toBe(true)
+    expect(deepseek.textContent).toContain('Last verification failed ·')
+    expect(deepseek.querySelector('.setup-provider-card__probe')?.classList.contains('is-warn'))
+      .toBe(true)
+
+    app.unmount()
+  })
+
+  it('prompts for re-verification when the saved config changed since the last probe', async () => {
+    const rows = [{
+      ...configured[0],
+      lastProbe: { ok: true, at: new Date().toISOString(), configChanged: true, failureKind: '' },
+    }]
+    const { app, el } = await mountPanel({ configuredProviders: rows })
+
+    const probe = el.querySelector<HTMLElement>(
+      '[data-provider-id="openai"] .setup-provider-card__probe',
+    )!
+    expect(probe.textContent).toContain('Configuration changed since verification')
+    expect(probe.classList.contains('is-warn')).toBe(false)
+    expect(probe.classList.contains('is-ready')).toBe(false)
+
+    app.unmount()
+  })
+
+  it('keeps the plain not-verified fallback in the accessible label until a probe runs', async () => {
+    const { app, el } = await mountPanel({ configuredProviders: configured })
+
+    const probe = el.querySelector<HTMLElement>(
+      '[data-provider-id="openai"] .setup-provider-card__probe',
+    )
+    const identity = el.querySelector<HTMLElement>(
+      '[data-provider-id="openai"] .setup-provider-card__identity',
+    )
+    expect(probe).toBeNull()
+    expect(identity?.getAttribute('aria-label')).toContain('Not verified')
+
+    app.unmount()
+  })
+
+  it('shows a concise readiness summary for one saved deployment', async () => {
+    const { app, el } = await mountPanel({
+      configuredProviders: [configured[0]],
+    })
+
+    expect(el.textContent).toContain('1 of 1 ready')
+    expect(el.textContent).not.toContain('Multi-provider features')
+
+    app.unmount()
+  })
+
+  it('keeps the zero-provider state focused on the first connection', async () => {
+    const { app, el } = await mountPanel({
+      configuredProviders: [],
+      providerSelected: '',
+    })
+
+    const empty = el.querySelector<HTMLElement>('[data-testid="provider-empty-state"]')!
+    expect(empty.textContent).toContain('Add your first model provider')
+    expect(empty.textContent).toContain('one provider can still route between multiple models')
+    expect(el.querySelector('[data-testid="provider-model-usage"]')).toBeNull()
+    expect(el.textContent).not.toContain('Multi-provider features')
+    expect(Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
+      .filter(button => button.textContent?.includes('Add provider'))).toHaveLength(1)
+
+    app.unmount()
+  })
+
+  it('shows every row through four and collapses five or more to the first three', async () => {
+    const five = ['openai', 'deepseek', 'gemini', 'openrouter', 'tokenrhythm'].map((providerId, index) => ({
+      providerId,
+      label: providerId,
+      active: index === 0,
+      ready: true,
+      credentialSource: 'explicit',
+      credentialEnv: '',
+      endpointSource: 'registry',
+      reason: '',
+    }))
+    const { app, el } = await mountPanel({ configuredProviders: five })
+
+    expect(el.querySelectorAll('[data-provider-id]')).toHaveLength(3)
+    const viewAll = Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.includes('View all (5)'))
+    viewAll?.click()
+    await nextTick()
+    expect(el.querySelectorAll('[data-provider-id]')).toHaveLength(5)
+
+    app.unmount()
+  })
+
+  it('keeps unknown old-gateway status honest and disables its saved-config test', async () => {
+    const unavailable = [{
+      ...configured[1],
+      reason: 'profile_status_unavailable',
+      ready: false,
+      probeModelAvailable: false,
+    }]
+    const { app, el } = await mountPanel({ configuredProviders: unavailable, providerSelected: '' })
+    const row = el.querySelector<HTMLElement>('[data-provider-id="deepseek"]')!
+    const test = row.querySelector<HTMLButtonElement>('.setup-provider-card__test')
+
+    expect(row.textContent).toContain('Status unavailable')
+    expect(test?.disabled).toBe(true)
+    expect(test?.getAttribute('aria-label')).toBe('Status unavailable — DeepSeek')
+    expect(test?.title).toContain('status is unavailable')
+
+    app.unmount()
+  })
+
+  it('names the disabled no-key action from its visible label and provider', async () => {
+    const missing = [{
+      ...configured[1],
+      ready: false,
+      reason: 'missing_credentials',
+      probeModelAvailable: true,
+    }]
+    const { app, el } = await mountPanel({ configuredProviders: missing, providerSelected: '' })
+    const test = el.querySelector<HTMLButtonElement>('[data-provider-id="deepseek"] .setup-provider-card__test')
+
+    expect(test?.disabled).toBe(true)
+    expect(test?.textContent?.trim()).toBe('Add key to verify')
+    expect(test?.getAttribute('aria-label')).toBe('Add key to verify — DeepSeek')
+
+    app.unmount()
+  })
+
+  it('exposes verify, edit, and delete as native buttons without an overflow menu', async () => {
+    const ready = configured.map(row => row.providerId === 'deepseek'
+      ? { ...row, ready: true, primaryEligible: true, probeModelAvailable: true }
+      : row)
+    const { app, el } = await mountPanel({ configuredProviders: ready })
+    const row = el.querySelector<HTMLElement>('[data-provider-id="deepseek"]')!
+    const labels = Array.from(row.querySelectorAll<HTMLButtonElement>('button'))
+      .map(button => button.textContent?.trim())
+
+    expect(labels).toContain('Verify saved configuration')
+    expect(labels).toContain('Edit')
+    expect(labels).toContain('Delete')
+    expect(labels).not.toContain('Set active')
+    expect(row.querySelector('[aria-haspopup="menu"]')).toBeNull()
+    expect(row.querySelector('.setup-provider-card__identity')?.getAttribute('aria-label'))
+      .toBe('Edit DeepSeek — Credentials ready — Not verified')
+    expect(row.querySelector('.setup-provider-card__delete')?.getAttribute('aria-label'))
+      .toBe('Remove provider — DeepSeek')
+
+    app.unmount()
+  })
+
+  it('disables the complete provider interaction surface while activation is in progress', async () => {
+    const ready = configured.map(row => row.providerId === 'deepseek'
+      ? { ...row, ready: true, primaryEligible: true, probeModelAvailable: true }
+      : row)
+    const { app, el } = await mountPanel({
+      configuredProviders: ready,
+      activation: {
+        providerId: 'deepseek',
+        phase: 'activating',
+        models: [],
+        suggestedModel: '',
+        error: '',
+      },
+    })
+
+    const interactions = el.querySelector<HTMLFieldSetElement>('.setup-provider-interactions')
+    expect(interactions?.disabled).toBe(true)
+    expect(interactions?.getAttribute('aria-busy')).toBe('true')
+    expect(el.querySelector('[data-provider-id="deepseek"] .setup-provider-card__activate'))
+      .toBeNull()
+
+    app.unmount()
+  })
+
+  it('disables provider interactions while removing a credential and restores credential focus', async () => {
+    const { app, el, panelState } = await mountPanel({
+      credentialRemovalPending: true,
+      credentialPanel: {
+        ...(panel().credentialPanel as Record<string, unknown>),
+        removable: true,
+        removing: true,
+      },
+    })
+    const interactions = el.querySelector<HTMLFieldSetElement>('.setup-provider-interactions')
+
+    expect(interactions?.disabled).toBe(true)
+    expect(interactions?.getAttribute('aria-busy')).toBe('true')
+    expect(el.querySelector('.setup-provider-credential__remove')?.textContent)
+      .toContain('Removing saved key')
+
+    const mutablePanel = panelState as unknown as {
+      credentialRemovalPending: boolean
+      credentialPanel: Record<string, unknown>
+    }
+    mutablePanel.credentialPanel.removing = false
+    mutablePanel.credentialPanel.masked = ''
+    mutablePanel.credentialPanel.available = false
+    mutablePanel.credentialPanel.source = 'none'
+    mutablePanel.credentialPanel.removable = false
+    mutablePanel.credentialRemovalPending = false
+    await nextTick()
+    await nextTick()
+
+    expect(interactions?.disabled).toBe(false)
+    expect(document.activeElement)
+      .toBe(el.querySelector<HTMLInputElement>('input[name="setup_provider_api_key"]'))
+
+    app.unmount()
+  })
+
+  it('opens a provider editor from the list without activating it', async () => {
+    const ready = configured.map(row => row.providerId === 'deepseek'
+      ? { ...row, ready: true, primaryEligible: true, probeModelAvailable: true }
+      : row)
+    const onActivateProvider = vi.fn()
+    const { app, el } = await mountPanel({
+      configuredProviders: ready,
+    }, { onActivateProvider })
+    const row = el.querySelector<HTMLElement>('[data-provider-id="deepseek"]')!
+    const trigger = row.querySelector<HTMLButtonElement>('.setup-provider-card__select')!
+    trigger.click()
+    await nextTick()
+
+    expect(onActivateProvider).not.toHaveBeenCalled()
+    expect(document.body.querySelector('[role="dialog"]')).toBeTruthy()
+    app.unmount()
+  })
+
+  it('keeps activation out of the list while allowing deletion of the active provider', async () => {
+    const { app, el } = await mountPanel({ configuredProviders: configured })
+    const row = el.querySelector<HTMLElement>('[data-provider-id="openai"]')!
+    const labels = Array.from(row.querySelectorAll<HTMLButtonElement>('button'))
+      .map(button => button.textContent?.trim())
+
+    expect(labels).not.toContain('Set active')
+    expect(labels).toContain('Delete')
+    app.unmount()
+  })
+
+  it('opens the complete scrollable catalog, prioritizes featured providers, and excludes configured providers', async () => {
+    const onAddProvider = vi.fn()
+    const { app, el } = await mountPanel({
+      configuredProviders: [configured[0]],
+      runtimeProviders: [
+        { providerId: 'openai', label: 'OpenAI' },
+        { providerId: 'tokenrhythm', label: 'TokenRhythm' },
+        { providerId: 'deepseek', label: 'DeepSeek' },
+        { providerId: 'gemini', label: 'Gemini' },
+        { providerId: 'custom', label: 'Custom endpoint' },
+        { providerId: 'anthropic', label: 'Anthropic' },
+      ],
+    }, { onAddProvider })
+    Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === 'Add provider')?.click()
+    await nextTick()
+
+    const initial = Array.from(document.body.querySelectorAll<HTMLElement>('.provider-picker__option'))
+      .map(option => option.textContent)
+    expect(initial).toEqual([
+      expect.stringContaining('TokenRhythm'),
+      expect.stringContaining('DeepSeek'),
+      expect.stringContaining('Gemini'),
+      expect.stringContaining('Anthropic'),
+      expect.stringContaining('Custom endpoint'),
+    ])
+    expect(initial.join(' ')).not.toContain('OpenAI')
+    expect(document.body.querySelector('.provider-picker__list')).toBeTruthy()
+    expect(Array.from(document.body.querySelectorAll<HTMLButtonElement>('button'))
+      .some(button => button.textContent?.includes('Browse all providers'))).toBe(false)
+    expect(document.body.querySelector('.provider-picker__offer')?.textContent)
+      .toContain('Limited-time free access')
+
+    const search = document.body.querySelector<HTMLInputElement>('input[name="setup_provider_search"]')!
+    search.value = 'custom'
+    search.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+    const result = document.body.querySelector<HTMLButtonElement>('.provider-picker__option')!
+    expect(result.textContent).toContain('Custom endpoint')
+    result.click()
+    expect(onAddProvider).toHaveBeenCalledWith('custom')
+
+    app.unmount()
+  })
+
+  it('keeps listbox options out of the Tab order and selects the active option with Enter', async () => {
+    const onAddProvider = vi.fn()
+    const { app, el } = await mountPanel({
+      configuredProviders: [configured[0]],
+      runtimeProviders: [
+        { providerId: 'openai', label: 'OpenAI' },
+        { providerId: 'tokenrhythm', label: 'TokenRhythm' },
+        { providerId: 'deepseek', label: 'DeepSeek' },
+        { providerId: 'gemini', label: 'Gemini' },
+      ],
+    }, { onAddProvider })
+    Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === 'Add provider')?.click()
+    await nextTick()
+    await nextTick()
+    await nextTick()
+
+    const options = Array.from(document.body.querySelectorAll<HTMLButtonElement>('.provider-picker__option'))
+    expect(options).toHaveLength(3)
+    expect(options.every(option => option.tabIndex === -1)).toBe(true)
+    const search = document.body.querySelector<HTMLInputElement>('input[name="setup_provider_search"]')!
+    // Wait for the catalog's scheduled focus before driving ArrowDown. Under a
+    // loaded full-suite worker, dispatching first lets the delayed focus handler
+    // reset activeIndex back to zero after the key event.
+    await vi.waitFor(() => expect(document.activeElement).toBe(search))
+    search.focus()
+    search.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }))
+    await vi.waitFor(() => {
+      expect(search.getAttribute('aria-activedescendant')).toBe('setup-provider-catalog-option-1')
+    })
+    search.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))
+    expect(onAddProvider).toHaveBeenCalledWith('deepseek')
+
+    app.unmount()
+  })
+
+  it('keeps Router conflicts out of the provider-list editing flow', async () => {
+    const onActivateProvider = vi.fn()
+    const ready = configured.map(row => row.providerId === 'deepseek'
+      ? { ...row, ready: true, primaryEligible: true, probeModelAvailable: true }
+      : row)
+    const { app, el } = await mountPanel({
+      configuredProviders: ready,
+      routerEnabled: true,
+      routerBinding: 'custom',
+      activationRouterConflict: true,
+    }, { onActivateProvider })
+    const row = el.querySelector<HTMLElement>('[data-provider-id="deepseek"]')!
+    row.querySelector<HTMLButtonElement>('.setup-provider-card__select')?.click()
+    await nextTick()
+
+    expect(onActivateProvider).not.toHaveBeenCalled()
+    expect(el.textContent).not.toContain('Resolve Model Routing')
+    expect(document.body.querySelector('[role="dialog"]')).toBeTruthy()
+    app.unmount()
+  })
+
+  it('keeps backend activation eligibility out of the quiet provider list', async () => {
+    const onActivateProvider = vi.fn()
+    const ready = configured.map(row => row.providerId === 'deepseek'
+      ? {
+          ...row,
+          ready: true,
+          primaryEligible: true,
+          probeModelAvailable: true,
+        }
+      : row)
+    const { app, el } = await mountPanel({ configuredProviders: ready }, { onActivateProvider })
+
+    const row = el.querySelector<HTMLElement>('[data-provider-id="deepseek"]')!
+    const edit = row.querySelector<HTMLButtonElement>('.setup-provider-card__select')!
+
+    expect(row.querySelector('.setup-provider-card__activate')).toBeNull()
+    edit.click()
+    await nextTick()
+    expect(onActivateProvider).not.toHaveBeenCalled()
+    expect(row.textContent).not.toContain('Choose and save a model below')
+    expect(document.body.querySelector('[role="dialog"]')).toBeTruthy()
+    app.unmount()
+  })
+
+  it('keeps a provider without a saved or default model in the editor flow', async () => {
+    const onActivateProvider = vi.fn()
+    const rows = configured.map(row => row.providerId === 'deepseek'
+      ? {
+          ...row,
+          ready: true,
+          primaryEligible: false,
+          primaryBlockReason: 'missing_model',
+          probeModelAvailable: true,
+        }
+      : row)
+    const { app, el } = await mountPanel({ configuredProviders: rows }, { onActivateProvider })
+
+    const row = el.querySelector<HTMLElement>('[data-provider-id="deepseek"]')!
+    const edit = row.querySelector<HTMLButtonElement>('.setup-provider-card__select')!
+    expect(row.querySelector('.setup-provider-card__activate')).toBeNull()
+    expect(row.textContent).not.toContain('Choose and save a model below')
+    edit.click()
+    await nextTick()
+    expect(document.body.querySelector('[role="dialog"]')).toBeTruthy()
+    expect(onActivateProvider).not.toHaveBeenCalled()
+    app.unmount()
+  })
+})
+
+describe('SetupProviderPanel — editor scope', () => {
+  it('keeps the editor heading in normal document flow', () => {
+    const source = readFileSync('src/components/setup/SetupProviderPanel.vue', 'utf8')
+    const editorHeadingRule = source.match(/\.setup-provider-editor-head \{([\s\S]*?)\n\}/)?.[1] || ''
+
+    expect(editorHeadingRule).not.toContain('position: sticky')
+    expect(editorHeadingRule).not.toMatch(/^\s*top\s*:/m)
+    expect(editorHeadingRule).not.toMatch(/^\s*z-index\s*:/m)
+  })
+
+  const fields = {
+    providerCoreFields: [{ name: 'model', label: 'Model' }],
+    providerAdvancedFields: [
+      { name: 'base_url', label: 'Base URL' },
+      { name: 'proxy', label: 'HTTP proxy' },
+    ],
+    providerAdvancedOpen: true,
+    providerFieldValue: (field: { name: string }) => ({
+      model: 'deepseek-chat',
+      base_url: 'https://api.deepseek.com',
+      proxy: '',
+    })[field.name] || '',
+  }
+
+  it('labels a saved profile direct model without showing gateway-wide timeout', async () => {
+    const { app, el } = await mountPanel({
+      ...fields,
+      providerSelected: 'deepseek',
+      providerSummary: 'DeepSeek',
+      editingPrimary: false,
+      selectedStoredProfile: true,
+      editingNew: false,
+      credentialPanel: {
+        ...(panel().credentialPanel as Record<string, unknown>),
+        providerLabel: 'DeepSeek',
+        probeButtonLabel: 'Verify current configuration',
+      },
+    })
+
+    const scope = el.querySelector('[data-testid="provider-editor-scope"]')
+    expect(scope?.textContent).toContain('Edit DeepSeek')
+    expect(scope?.textContent).toContain('Routing profile')
+    expect(scope?.textContent).toContain('does not make it active')
+    expect(el.textContent).toContain('DeepSeek endpoint & advanced options')
+    expect(el.textContent).toContain('DeepSeek endpoint')
+    expect(el.textContent).toContain('Direct and fallback model for DeepSeek')
+    expect(el.textContent).toContain('Direct / fallback model')
+    expect(el.textContent).toContain('Saved with this provider')
+    expect(el.querySelector('input[name="setup_provider_model"]')?.closest('details')).toBeNull()
+    expect(el.querySelector('input[name="setup_provider_request_timeout"]')).toBeNull()
+
+    app.unmount()
+  })
+
+  it('labels a newly added provider as unsaved and explains the save effect', async () => {
+    const { app, el } = await mountPanel({
+      ...fields,
+      providerSelected: 'deepseek',
+      editingPrimary: false,
+      selectedStoredProfile: false,
+      editingNew: true,
+      configuredProviders: [],
+      credentialPanel: {
+        ...(panel().credentialPanel as Record<string, unknown>),
+        providerLabel: 'DeepSeek',
+      },
+    })
+
+    const scope = el.querySelector('[data-testid="provider-editor-scope"]')
+    expect(scope?.textContent).toContain('Not saved')
+    expect(scope?.textContent).toContain('Saving makes this provider available to Routing and Ensemble')
+    expect(scope?.textContent).toContain('will not become active')
+    expect(el.textContent).toContain('Direct / fallback model')
+
+    app.unmount()
+  })
+
+  it('does not call the first provider active before its initial save', async () => {
+    const { app, el } = await mountPanel({
+      ...fields,
+      providerSelected: 'deepseek',
+      providerSummary: 'DeepSeek',
+      editingPrimary: true,
+      selectedStoredProfile: false,
+      editingNew: false,
+      configuredProviders: [],
+      credentialPanel: {
+        ...(panel().credentialPanel as Record<string, unknown>),
+        providerLabel: 'DeepSeek',
+      },
+    })
+
+    const scope = el.querySelector('[data-testid="provider-editor-scope"]')
+    expect(scope?.textContent).toContain('New active provider')
+    expect(scope?.textContent).toContain('Saving will make this provider active')
+    expect(scope?.textContent).not.toContain('Used for direct requests')
+    expect(el.querySelector('input[name="setup_provider_model"]')).toBeTruthy()
+
+    app.unmount()
+  })
+
+  it('keeps the configured active model owned by Model Routing and timeout gateway-wide', async () => {
+    const onGoToSection = vi.fn()
+    const { app, el } = await mountPanel({
+      ...fields,
+      providerSelected: 'deepseek',
+      providerSummary: 'DeepSeek',
+      editingPrimary: true,
+      selectedStoredProfile: false,
+      editingNew: false,
+      credentialPanel: {
+        ...(panel().credentialPanel as Record<string, unknown>),
+        providerLabel: 'DeepSeek',
+      },
+    }, { onGoToSection })
+
+    const scope = el.querySelector('[data-testid="provider-editor-scope"]')
+    expect(scope?.textContent).toContain('Active provider')
+    expect(scope?.textContent).toContain('primary fallback')
+    expect(el.textContent).toContain('Model for DeepSeek')
+    expect(el.textContent).toContain('Fixed model mode: every request uses the model below.')
+    expect(el.textContent).not.toContain('A recommended model is prefilled when available')
+    expect(el.textContent).not.toContain('Saved with this provider')
+    expect(el.querySelector('input[name="setup_provider_model"]')).toBeNull()
+    const modelOwner = el.querySelector<HTMLElement>('[data-testid="configured-primary-model-readonly"]')
+    expect(modelOwner?.textContent).toContain('Current model')
+    expect(modelOwner?.textContent).toContain('Fixed model')
+    expect(modelOwner?.textContent).toContain('deepseek-chat')
+    expect(el.querySelector('[data-testid="provider-model-usage"]')).toBeNull()
+    const routingLink = modelOwner?.querySelector<HTMLButtonElement>('button')
+    expect(routingLink?.textContent).toContain('Set up model routing')
+    routingLink?.click()
+    expect(onGoToSection).toHaveBeenCalledWith('modelStrategy')
+    expect(el.textContent).toContain('Context window · DeepSeek / deepseek-chat')
+    const timeout = el.querySelector<HTMLInputElement>('input[name="setup_provider_request_timeout"]')
+    expect(timeout).toBeTruthy()
+    expect(timeout?.closest('details')?.textContent).toContain('Runtime defaults · All providers')
+    expect(timeout?.closest('details')?.textContent).toContain('shared by every normal model request')
 
     app.unmount()
   })
@@ -244,7 +1545,7 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
     }
   }
 
-  it('keeps OpenRouter selected while showing exactly one TokenRhythm recommendation', async () => {
+  it('keeps OpenRouter selected while the optional recommendation stays out of the primary page', async () => {
     const onUpdateProviderSelected = vi.fn()
     const onProviderChange = vi.fn()
     const onUpdateProviderField = vi.fn()
@@ -252,6 +1553,17 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
       {
         providerSelected: 'openrouter',
         runtimeProviders: [OPENROUTER_PROVIDER, TOKENRHYTHM_PROVIDER],
+        // The acquisition promo only renders while no provider is ready.
+        configuredProviders: [{
+          providerId: 'openrouter',
+          label: 'OpenRouter',
+          active: true,
+          ready: false,
+          credentialSource: 'missing_env',
+          credentialEnv: 'OPENROUTER_API_KEY',
+          endpointSource: 'registry',
+          reason: 'missing_credentials',
+        }],
         credentialPanel: {
           ...(panel().credentialPanel as Record<string, unknown>),
           providerLabel: 'OpenRouter',
@@ -264,27 +1576,31 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
     const recommendations = el.querySelectorAll('[data-testid="tokenrhythm-recommendation"]')
     const link = el.querySelector<HTMLAnchorElement>(`a[href="${TOKENRHYTHM_REGISTRATION_URL}"]`)
 
-    expect(select?.value).toBe('openrouter')
+    expect(select).toBeNull()
+    expect(el.querySelector('[data-provider-id="openrouter"]')).toBeTruthy()
     expect(recommendations).toHaveLength(1)
+    const recommendationCard = recommendation(el)!
+    expect(recommendationCard.closest('[hidden]')).toBeTruthy()
+    expect(recommendationCard.querySelector('.setup-provider-recommendation__scope')?.textContent)
+      .toContain('OpenSquilla recommendation · Optional')
+    expect(el.querySelector('.setup-provider-global-block__eyebrow')).toBeNull()
     expect(recommendation(el)?.textContent).toContain('Recommended: TokenRhythm')
     expect(recommendation(el)?.textContent)
       .toContain('TokenRhythm API calls are free for a limited time.')
-    expect(recommendation(el)?.textContent)
-      .toContain('During the promotion, register and get an API key to call DeepSeek, GLM, MiniMax, Kimi, and other leading models for free.')
     expect(
       Array.from(recommendation(el)?.querySelectorAll('[data-testid="tokenrhythm-recommendation-step"]') || [])
         .map(step => step.textContent?.replace(/\s+/g, ' ').trim()),
     ).toEqual([
       '1 Create a TokenRhythm account',
       '2 Copy your API key',
-      '3 Select TokenRhythm above, then paste your API key',
+      '3 Choose Add provider, select TokenRhythm, then paste your API key',
     ])
 
     link?.addEventListener('click', event => event.preventDefault(), { once: true })
     link?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
     await nextTick()
 
-    expect(select?.value).toBe('openrouter')
+    expect(select).toBeNull()
     expect(onUpdateProviderSelected).not.toHaveBeenCalled()
     expect(onProviderChange).not.toHaveBeenCalled()
     expect(onUpdateProviderField).not.toHaveBeenCalled()
@@ -295,6 +1611,7 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
     const { app, el } = await mountPanel({
       providerSelected: 'openrouter',
       runtimeProviders: [OPENROUTER_PROVIDER, TOKENRHYTHM_PROVIDER],
+      configuredProviders: [],
     })
     const card = recommendation(el)
     const link = card?.querySelector<HTMLAnchorElement>('a')
@@ -313,6 +1630,7 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
     const { app, el } = await mountPanel({
       providerSelected: 'tokenrhythm',
       runtimeProviders: [OPENROUTER_PROVIDER, TOKENRHYTHM_PROVIDER],
+      configuredProviders: [],
       credentialPanel: tokenRhythmCredential(),
     })
     const card = recommendation(el)
@@ -339,6 +1657,7 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
     const { app, el } = await mountPanel({
       providerSelected: 'tokenrhythm',
       runtimeProviders: [OPENROUTER_PROVIDER, TOKENRHYTHM_PROVIDER],
+      configuredProviders: [],
       credentialPanel: tokenRhythmCredential(),
     })
 
@@ -351,6 +1670,7 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
     const { app, el } = await mountPanel({
       providerSelected: 'tokenrhythm',
       runtimeProviders: [OPENROUTER_PROVIDER, TOKENRHYTHM_PROVIDER],
+      configuredProviders: [],
       credentialPanel: tokenRhythmCredential({
         available: true,
         source: 'explicit',
@@ -381,6 +1701,7 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
     const { app, el } = await mountPanel({
       providerSelected: 'tokenrhythm',
       runtimeProviders: [OPENROUTER_PROVIDER, TOKENRHYTHM_PROVIDER],
+      configuredProviders: [],
       credentialPanel: tokenRhythmCredential({ apiKeyValue: 'tr-test-key' }),
     })
 
@@ -402,6 +1723,7 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
     const { app, el } = await mountPanel({
       providerSelected: 'tokenrhythm',
       runtimeProviders: [OPENROUTER_PROVIDER, TOKENRHYTHM_PROVIDER],
+      configuredProviders: [],
       credentialPanel: tokenRhythmCredential({
         available: true,
         source: 'explicit',
@@ -436,12 +1758,29 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
     app.unmount()
   })
 
+  it('shows the full recommendation even before an editor provider is selected', async () => {
+    const { app, el } = await mountPanel({
+      providerSelected: '',
+      runtimeProviders: [TOKENRHYTHM_PROVIDER],
+      configuredProviders: [],
+      credentialPanel: null,
+    })
+
+    expect(recommendation(el)).toBeTruthy()
+    expect(el.querySelector('.setup-provider-editor-head')).toBeNull()
+    expect(recommendation(el)?.querySelectorAll('[data-testid="tokenrhythm-recommendation-step"]'))
+      .toHaveLength(3)
+
+    app.unmount()
+  })
+
   it('renders the approved zh-Hans copy exactly', async () => {
     i18n.global.setLocaleMessage('zh-Hans', zhHans)
     i18n.global.locale.value = 'zh-Hans'
     const { app, el } = await mountPanel({
       providerSelected: 'openrouter',
       runtimeProviders: [OPENROUTER_PROVIDER, TOKENRHYTHM_PROVIDER],
+      configuredProviders: [],
     })
     const card = recommendation(el)
 
@@ -449,18 +1788,41 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
       .toBe('推荐使用 TokenRhythm')
     expect(card?.querySelector('[data-testid="tokenrhythm-recommendation-value"]')?.textContent)
       .toBe('TokenRhythm API 调用限时免费。')
-    expect(card?.querySelector('[data-testid="tokenrhythm-recommendation-registration"]')?.textContent)
-      .toBe('活动期间，注册并获取 API Key，即可免费调用 DeepSeek、GLM、MiniMax、Kimi 等主流模型。')
+    // The mist declutter pass dropped the second promo paragraph.
+    expect(card?.querySelector('[data-testid="tokenrhythm-recommendation-registration"]')).toBeNull()
     expect(
       Array.from(card?.querySelectorAll('[data-testid="tokenrhythm-recommendation-step"]') || [])
         .map(step => step.textContent?.replace(/\s+/g, ' ').trim()),
     ).toEqual([
       '1 注册 TokenRhythm 账户',
       '2 复制你的 API Key',
-      '3 先在上方选择 TokenRhythm，再粘贴 API Key',
+      '3 点击“添加服务商”，选择 TokenRhythm，然后粘贴 API Key',
     ])
     expect(card?.querySelector('a')?.textContent?.trim()).toBe('注册并获取 API Key')
     expect(card?.querySelector('a')?.getAttribute('aria-label')).toContain('在新标签页中打开')
+    app.unmount()
+  })
+})
+
+describe('SetupProviderPanel — effective output limit', () => {
+  it('shows the exact effective limit and its catalog source', async () => {
+    const { app, el } = await mountPanel({
+      effectiveMaxTokens: { value: 131072, source: 'catalog' },
+    })
+
+    const readout = el.querySelector('[data-testid="setup-effective-max-tokens"]')
+    expect(readout?.textContent).toContain('131,072 tokens')
+    expect(readout?.textContent).toContain('model catalog')
+    expect(readout?.getAttribute('aria-live')).toBe('polite')
+
+    app.unmount()
+  })
+
+  it('hides the readout when no identity-matched effective value is supplied', async () => {
+    const { app, el } = await mountPanel({ effectiveMaxTokens: null })
+
+    expect(el.querySelector('[data-testid="setup-effective-max-tokens"]')).toBeNull()
+
     app.unmount()
   })
 })
@@ -604,7 +1966,7 @@ describe('SetupProviderPanel — context-window override', () => {
 })
 
 describe('SetupProviderPanel — model strategy wayfinding', () => {
-  it('shows exactly one compact Model Routing entry without SquillaRouter wording', async () => {
+  it('shows the active smart-routing mode on the model card with a single routing entry', async () => {
     const onGoToSection = vi.fn()
     const preset = {
       hasPreset: true,
@@ -616,18 +1978,29 @@ describe('SetupProviderPanel — model strategy wayfinding', () => {
       routerMode: 'custom',
       routerCustomized: true,
     }
-    const { app, el } = await mountPanel({ canConfigureRouter: true }, { preset, onGoToSection })
+    const { app, el } = await mountPanel({
+      canConfigureRouter: true,
+      routerEnabled: true,
+      crossProviderRoutingEnabled: true,
+    }, { preset, onGoToSection })
     const routingLinks = Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
-      .filter(btn => /Model Routing/.test(btn.textContent || ''))
+      .filter(btn => /Set up model routing/.test(btn.textContent || ''))
 
     expect(routingLinks).toHaveLength(1)
-    expect(routingLinks[0]?.textContent).toContain('Open Model Routing')
+    const modelOwner = el.querySelector<HTMLElement>('[data-testid="configured-primary-model-readonly"]')
+    expect(modelOwner?.textContent).toContain('Fallback model')
+    expect(modelOwner?.textContent).toContain('Intelligent model routing')
+    expect(modelOwner?.textContent).toContain('Cross-provider routing included')
+    expect(el.querySelector('[data-testid="provider-model-usage"]')).toBeNull()
+    expect(el.textContent).toContain('Intelligent model routing mode:')
     expect(el.textContent).not.toContain('SquillaRouter ready')
+    expect(el.textContent).not.toContain('Multi-provider features')
     expect(el.textContent).not.toContain('Routing template:')
     expect(el.textContent).not.toContain('Model Routing already uses')
 
-    routingLinks[0]?.click()
+    routingLinks.forEach(link => link.click())
 
+    expect(onGoToSection).toHaveBeenCalledTimes(1)
     expect(onGoToSection).toHaveBeenCalledWith('modelStrategy')
     app.unmount()
   })

@@ -211,6 +211,7 @@ const CONTRAST_CHECKS = [
   { fg: 'text', bg: 'bg', min: 4.5 },
   { fg: 'text', bg: 'bg-surface', min: 4.5 },
   { fg: 'text-muted', bg: 'bg', min: 4.5 },
+  { fg: 'text-muted', bg: 'bg-surface', min: 4.5 },
   { fg: 'text-dim', bg: 'bg', min: 3.0 },
   { fg: 'accent-foreground', bg: 'accent', min: 3.0 },
   ...INK_TEXT.flatMap((fg) => [

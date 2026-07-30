@@ -9,21 +9,11 @@ export interface ReadinessSectionDetail {
   detail?: string
 }
 
-/** Read-only detection of a legacy OpenSquilla home reported by the gateway. */
-export interface LegacyDataInfo {
-  path: string
-  /** "cli-home" | "windows-portable" (open set — render, don't branch). */
-  kind: string
-  /** Suggested `opensquilla migrate …` invocation to import the home. */
-  command: string
-}
-
 export interface ReadinessStatus {
   needsOnboarding?: boolean
   hasConfig?: boolean
   llmSource?: string
   sectionDetails?: Record<string, ReadinessSectionDetail>
-  legacyData?: LegacyDataInfo | null
 }
 
 /** Pure predicate shared by the Settings dialog and the sidebar banner. */
@@ -45,22 +35,6 @@ export function readinessActionCount(status: ReadinessStatus | null | undefined)
   if (status.llmSource === 'missing_env' && !details.llm && !details.provider) n += 1
   if (status.needsOnboarding && n === 0) n = 1
   return n
-}
-
-/**
- * Normalizes the optional `legacyData` block of `onboarding.status`. Gateways
- * that predate legacy-home detection never send the field, so absence — and
- * any malformed payload — degrades to null (no advisory) instead of throwing.
- */
-export function readinessLegacyData(
-  status: ReadinessStatus | null | undefined,
-): LegacyDataInfo | null {
-  const raw: unknown = status?.legacyData
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
-  const { path, kind, command } = raw as Record<string, unknown>
-  if (typeof path !== 'string' || !path.trim()) return null
-  if (typeof command !== 'string' || !command.trim()) return null
-  return { path, kind: typeof kind === 'string' ? kind : '', command }
 }
 
 export function useReadinessSummary(status: Ref<ReadinessStatus | null>) {

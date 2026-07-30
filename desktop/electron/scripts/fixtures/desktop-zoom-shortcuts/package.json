@@ -1,0 +1,6 @@
+{
+  "name": "desktop-zoom-shortcuts-fixture",
+  "private": true,
+  "type": "module",
+  "main": "main.mjs"
+}
