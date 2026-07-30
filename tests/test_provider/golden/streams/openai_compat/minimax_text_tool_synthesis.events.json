@@ -1,17 +1,5 @@
 [
   {
-    "text": "<minimax:tool_call>\n<invoke name=\"lookup\">\n",
-    "type": "TextDeltaEvent"
-  },
-  {
-    "text": "<parameter name=\"q\">cache status</parameter>\n",
-    "type": "TextDeltaEvent"
-  },
-  {
-    "text": "</invoke>\n</minimax:tool_call>",
-    "type": "TextDeltaEvent"
-  },
-  {
     "synthetic_from_text": true,
     "tool_name": "lookup",
     "tool_use_id": "minimax_compat_000000000000",
@@ -36,10 +24,12 @@
     "model": "minimax-test-1",
     "model_usage_breakdown": [],
     "output_tokens": 22,
+    "provider": "openai",
     "reasoning_content": null,
     "reasoning_tokens": 0,
     "stop_reason": "stop",
     "thinking_signature": null,
-    "type": "DoneEvent"
+    "type": "DoneEvent",
+    "usage_missing_count": 0
   }
 ]

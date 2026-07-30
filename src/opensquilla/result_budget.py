@@ -20,6 +20,11 @@ from enum import StrEnum
 from typing import Any, TypeGuard
 
 from opensquilla.search.normalize import canonicalize_query_key
+from opensquilla.search_tool_outcome import (
+    WebRetrievalSemanticKey,
+    parse_web_tool_outcome,
+    web_retrieval_semantic_key,
+)
 
 WEB_FETCH_MIN_MAX_CHARS = 100
 WEB_SEARCH_MIN_MAX_CHARS_PER_SOURCE = 200
@@ -193,6 +198,28 @@ class ToolRunBudgetExceededError(RuntimeError):
         self.tool_name = tool_name
 
 
+class DuplicateRetrievalInFlightError(RuntimeError):
+    """Raised when the same semantic search is already executing this turn."""
+
+    def __init__(self, tool_name: str) -> None:
+        super().__init__(
+            f"Tool '{tool_name}' skipped a duplicate retrieval already in flight."
+        )
+        self.tool_name = tool_name
+
+
+class TerminalRetrievalReplayError(RuntimeError):
+    """Raised when a semantic search already ended in a terminal failure."""
+
+    def __init__(self, tool_name: str, *, error_kind: str) -> None:
+        super().__init__(
+            f"Tool '{tool_name}' skipped a retrieval that already failed "
+            "without retry permission this turn."
+        )
+        self.tool_name = tool_name
+        self.error_kind = error_kind
+
+
 @dataclass(frozen=True)
 class ToolRunBudgetReservation:
     tool_name: str
@@ -202,6 +229,7 @@ class ToolRunBudgetReservation:
     counted_as_search: bool = False
     counted_as_external_text: bool = False
     retrieval_key: RetrievalKey | None = None
+    semantic_retrieval_key: WebRetrievalSemanticKey | None = None
 
 
 class ToolRunBudgetTracker:
@@ -215,6 +243,8 @@ class ToolRunBudgetTracker:
         self._external_text_chars_used = 0
         self._external_text_chars_reserved = 0
         self._retrieval_keys_used: dict[RetrievalKey, int] = {}
+        self._inflight_retrieval_keys: set[WebRetrievalSemanticKey] = set()
+        self._terminal_retrieval_keys: dict[WebRetrievalSemanticKey, str] = {}
 
     async def reserve_tool_call(
         self,
@@ -225,6 +255,15 @@ class ToolRunBudgetTracker:
         args = dict(arguments)
         if tool_name in {"web_search", "web_discover"}:
             async with self._lock:
+                semantic_key = web_retrieval_semantic_key(args)
+                terminal_error_kind = self._terminal_retrieval_keys.get(semantic_key)
+                if terminal_error_kind is not None:
+                    raise TerminalRetrievalReplayError(
+                        tool_name,
+                        error_kind=terminal_error_kind,
+                    )
+                if semantic_key in self._inflight_retrieval_keys:
+                    raise DuplicateRetrievalInFlightError(tool_name)
                 self._check_call_budget(
                     tool_name=tool_name,
                     used=self._web_search_calls_used,
@@ -232,6 +271,7 @@ class ToolRunBudgetTracker:
                 )
                 self._check_external_text_available(tool_name)
                 retrieval_key = self._reserve_retrieval_key(tool_name, args)
+                self._inflight_retrieval_keys.add(semantic_key)
                 self._web_search_calls_used += 1
             return ToolRunBudgetReservation(
                 tool_name=tool_name,
@@ -239,6 +279,7 @@ class ToolRunBudgetTracker:
                 counted_as_search=True,
                 counted_as_external_text=True,
                 retrieval_key=retrieval_key,
+                semantic_retrieval_key=semantic_key,
             )
 
         if tool_name not in EXTERNAL_TOOL_NAMES:
@@ -268,9 +309,15 @@ class ToolRunBudgetTracker:
         if not reservation.counted_as_external_text:
             return
         text = content if isinstance(content, str) else str(content)
+        web_outcome = parse_web_tool_outcome(reservation.tool_name, content)
         async with self._lock:
             self._release_external_reservation(reservation)
             self._external_text_chars_used += len(text)
+            semantic_key = reservation.semantic_retrieval_key
+            if semantic_key is not None:
+                self._inflight_retrieval_keys.discard(semantic_key)
+                if web_outcome is not None and web_outcome.retry_allowed is False:
+                    self._terminal_retrieval_keys[semantic_key] = web_outcome.error_kind
 
     async def abort_tool_result(self, reservation: ToolRunBudgetReservation) -> None:
         if (
@@ -281,6 +328,10 @@ class ToolRunBudgetTracker:
             return
         async with self._lock:
             self._release_external_reservation(reservation)
+            if reservation.semantic_retrieval_key is not None:
+                self._inflight_retrieval_keys.discard(
+                    reservation.semantic_retrieval_key
+                )
             if reservation.counted_as_fetch:
                 self._web_fetch_calls_used = max(0, self._web_fetch_calls_used - 1)
             if reservation.counted_as_search and reservation.tool_name in {

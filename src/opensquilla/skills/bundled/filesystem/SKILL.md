@@ -1,6 +1,7 @@
 ---
 name: filesystem
 description: Advanced filesystem operations - listing, searching, batch processing, and directory analysis for Clawdbot
+description_zh: "高级文件系统操作——为Clawdbot提供列举、搜索、批量处理和目录分析。"
 homepage: https://clawhub.ai/gtrusler/clawdbot-filesystem
 provenance:
   origin: clawhub-mit

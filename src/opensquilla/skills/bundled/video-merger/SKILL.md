@@ -1,6 +1,7 @@
 ---
 name: video-merger
 description: "Concatenate a directory of numbered MP4 segments (1_*.mp4, 2_*.mp4, ...) into one MP4 with optional fade transitions, unified resolution/fps/codec. Pure ffmpeg wrapper, no LLM. Trigger when a workflow has produced several short clips that need stitching into a final reel."
+description_zh: "将一个目录中编号的MP4片段（1_*.mp4, 2_*.mp4, ...）拼接为一个MP4，可选淡入淡出转场，统一分辨率/帧率/编码。纯ffmpeg封装，无LLM。当工作流已产出多个需拼成成片的短片段时触发。"
 provenance:
   origin: clawhub-mit0
   license: MIT-0

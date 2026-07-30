@@ -41,6 +41,7 @@ def __getattr__(name: str) -> Any:
 def run_chat(
     model: str = typer.Option("", "--model", "-m", help="Model override (provider/model)"),
     session_id: str = typer.Option("", "--session", "-s", help="Resume session ID"),
+    ui: str | None = None,
     standalone: bool = typer.Option(False, "--standalone", help="Direct Agent without gateway"),
     workspace: str = typer.Option("", "--workspace", help="Workspace root for standalone tools"),
     workspace_strict: bool | None = typer.Option(
@@ -60,6 +61,7 @@ def run_chat(
         _ChatCommandRequest(
             model=model,
             session_id=session_id,
+            ui=ui,
             standalone=standalone,
             workspace=workspace,
             workspace_strict=workspace_strict,

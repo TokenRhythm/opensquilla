@@ -6,9 +6,17 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any
 
+from opensquilla.channels.admission import (
+    CHANNEL_ADMIN_VERIFIED_METADATA_KEY,
+    has_verified_channel_admin_stamp,
+)
 from opensquilla.channels.types import IncomingMessage
-from opensquilla.sandbox.run_context import normalize_scope, run_context_from_origin_payload
-from opensquilla.sandbox.run_mode import RunMode, normalize_run_mode
+from opensquilla.sandbox.run_context import (
+    normalize_scope,
+    run_context_for_subagent,
+    run_context_from_origin_payload,
+)
+from opensquilla.sandbox.run_mode import RunMode, execution_target, normalize_run_mode
 from opensquilla.session.keys import normalize_agent_id, parse_agent_id
 from opensquilla.tools.policy import apply_tool_policy_layer
 from opensquilla.tools.types import (
@@ -66,6 +74,13 @@ class RouteEnvelope:
     metadata: dict[str, Any] = field(default_factory=dict)
     interaction_mode: InteractionMode = InteractionMode.INTERACTIVE
     sandbox_run_context_fresh: bool = False
+    # Process-local services attached only after durable acceptance. Keeping
+    # them out of ``metadata`` prevents serialization of live handles.
+    runtime_services: dict[str, Any] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
 
     def delivery_fields(self) -> dict[str, Any]:
         """Return session routing fields derived from the reply target."""
@@ -108,6 +123,11 @@ def build_channel_route_envelope(
 ) -> RouteEnvelope:
     """Build a route for a normalized inbound channel message."""
     metadata = dict(msg.metadata or {})
+    # Channel adapters provide transport metadata, not authorization claims.
+    # ``channel_dispatch`` stamps this after authenticating the sender against
+    # the configured channel-admin mapping.
+    metadata.pop("principal_is_owner", None)
+    metadata.pop(CHANNEL_ADMIN_VERIFIED_METADATA_KEY, None)
     metadata.setdefault("run_mode", RunMode.TRUSTED.value)
     resolved_agent_id = _agent_id(agent_id, session_key)
     resolved_channel_type = channel_type or session_prefix
@@ -252,6 +272,17 @@ def build_cron_route_envelope(
     if creator_is_owner:
         metadata["principal_is_owner"] = True
         metadata["cron_trusted_owner"] = True
+    job_run_mode = getattr(job, "run_mode", "")
+    if job_run_mode:
+        try:
+            normalized_job_run_mode = normalize_run_mode(job_run_mode)
+        except ValueError:
+            normalized_job_run_mode = None
+        if normalized_job_run_mode is not None:
+            metadata["run_mode"] = normalized_job_run_mode.value
+            metadata["execution_target"] = execution_target(normalized_job_run_mode)
+            if normalized_job_run_mode is RunMode.FULL and creator_is_owner:
+                metadata["elevated"] = "full"
     tool_policy = getattr(job, "tool_policy", None)
     if isinstance(tool_policy, dict) and tool_policy:
         metadata["tool_policy"] = dict(tool_policy)
@@ -306,15 +337,82 @@ def build_subagent_route_envelope(
     parent_task_id: str | None = None,
     spawn_depth: int = 0,
     origin: str = "sessions_spawn",
+    principal_is_owner: bool | None = None,
+    elevated: str | None = None,
+    run_mode: str | RunMode | None = None,
+    sandbox_run_context: Any | None = None,
+    sandbox_mounts: list[dict[str, Any]] | None = None,
 ) -> RouteEnvelope:
     """Build a route for a child subagent run."""
-    metadata = {
+    metadata: dict[str, Any] = {
         "parent_session_key": parent_session_key,
         "run_id": run_id,
         "parent_task_id": parent_task_id,
         "spawn_depth": spawn_depth,
         "origin": origin,
     }
+    if principal_is_owner is not None:
+        metadata["principal_is_owner"] = bool(principal_is_owner)
+    if elevated in ("on", "bypass", "full"):
+        metadata["elevated"] = elevated
+    normalized_run_mode: RunMode | None = None
+    if run_mode is not None:
+        try:
+            normalized_run_mode = normalize_run_mode(
+                run_mode.value if isinstance(run_mode, RunMode) else str(run_mode)
+            )
+        except ValueError:
+            normalized_run_mode = None
+    run_context_payload: dict[str, Any] | None = None
+    if sandbox_run_context is not None:
+        to_origin_payload = getattr(sandbox_run_context, "to_origin_payload", None)
+        if callable(to_origin_payload):
+            raw_payload = to_origin_payload()
+            if isinstance(raw_payload, dict):
+                run_context_payload = dict(raw_payload)
+        elif isinstance(sandbox_run_context, dict):
+            run_context_payload = dict(sandbox_run_context)
+    if run_context_payload is not None:
+        hydrated_context = run_context_from_origin_payload(
+            run_context_payload,
+            source="subagent_parent",
+            preserve_materialized_user_grants=True,
+        )
+        if hydrated_context is not None:
+            run_context_payload = run_context_for_subagent(
+                hydrated_context
+            ).to_origin_payload()
+        else:
+            for grant_key in ("mounts", "domains", "bundles", "public_network"):
+                raw_grants = run_context_payload.get(grant_key)
+                if isinstance(raw_grants, list):
+                    run_context_payload[grant_key] = [
+                        dict(item)
+                        for item in raw_grants
+                        if isinstance(item, dict)
+                        and normalize_scope(item.get("scope"), "chat") != "once"
+                    ]
+            run_context_payload["temporary_grants"] = []
+    if normalized_run_mode is None and run_context_payload is not None:
+        try:
+            normalized_run_mode = normalize_run_mode(run_context_payload.get("run_mode"))
+        except ValueError:
+            normalized_run_mode = None
+    if normalized_run_mode is not None:
+        metadata["run_mode"] = normalized_run_mode.value
+    if run_context_payload is not None:
+        metadata["sandbox_run_context"] = run_context_payload
+    if sandbox_mounts is not None:
+        metadata["sandbox_mounts"] = [
+            dict(item)
+            for item in sandbox_mounts
+            if isinstance(item, dict)
+            and normalize_scope(item.get("scope"), "chat") != "once"
+        ]
+    if normalized_run_mode is not None:
+        metadata["run_mode"] = normalized_run_mode.value
+        if normalized_run_mode is RunMode.FULL and principal_is_owner:
+            metadata["elevated"] = "full"
     return RouteEnvelope(
         source_kind=SourceKind.SUBAGENT,
         source_name="subagent",
@@ -331,6 +429,7 @@ def build_subagent_route_envelope(
         },
         metadata=metadata,
         interaction_mode=InteractionMode.UNATTENDED,
+        sandbox_run_context_fresh=run_context_payload is not None,
     )
 
 
@@ -371,6 +470,17 @@ def tool_context_from_envelope(
 ) -> ToolContext:
     """Build the runtime ToolContext from the canonical route envelope."""
     caller_kind = _caller_kind(envelope.source_kind)
+    channel_admin_verified = (
+        caller_kind is CallerKind.CHANNEL
+        and is_owner
+        and has_verified_channel_admin_stamp(envelope)
+    )
+    if caller_kind is CallerKind.CHANNEL:
+        # A Channel caller can gain owner capabilities only through the
+        # authenticated ingress stamp.  Do this before profile and run-mode
+        # resolution so a generic ``is_owner=True`` cannot widen a Channel
+        # context if a future caller forgets the ingress boundary.
+        is_owner = channel_admin_verified
     allowed_tools: set[str] | None = None
     denied_tools: set[str] = set()
     interaction_mode = _interaction_mode(envelope.interaction_mode)
@@ -397,17 +507,17 @@ def tool_context_from_envelope(
             run_mode = None
         if run_mode == RunMode.FULL and not is_owner:
             run_mode = RunMode.TRUSTED
-    elif legacy_elevated in ("on", "bypass") and is_owner:
+    elif legacy_elevated == "on" and is_owner:
         run_mode = RunMode.TRUSTED
-    elif legacy_elevated == "full" and is_owner:
+    elif legacy_elevated in ("bypass", "full") and is_owner:
         run_mode = RunMode.FULL
-    elif default_elevated == "full" and is_owner:
+    elif default_elevated in ("bypass", "full") and is_owner:
         run_mode = RunMode.FULL
     else:
         run_mode = None
     if run_mode == RunMode.FULL and is_owner:
         elevated = "full"
-    elif legacy_elevated in ("on", "bypass") and is_owner:
+    elif legacy_elevated == "on" and is_owner:
         elevated = legacy_elevated
     sandbox_run_context_fresh = bool(
         getattr(envelope, "sandbox_run_context_fresh", False)
@@ -416,6 +526,11 @@ def tool_context_from_envelope(
         envelope.metadata.get("sandbox_run_context"),
         source="route_metadata",
         preserve_materialized_user_grants=sandbox_run_context_fresh,
+    )
+    effective_workspace_dir = (
+        sandbox_run_context.workspace
+        if sandbox_run_context is not None and sandbox_run_context.workspace
+        else workspace_dir
     )
     if (
         sandbox_run_context is not None
@@ -431,11 +546,12 @@ def tool_context_from_envelope(
         )
     ctx = ToolContext(
         is_owner=is_owner,
+        channel_admin_verified=channel_admin_verified,
         caller_kind=caller_kind,
         interaction_mode=interaction_mode,
         subagent_depth=int(envelope.metadata.get("spawn_depth") or 0),
         agent_id=envelope.agent_id,
-        workspace_dir=workspace_dir,
+        workspace_dir=effective_workspace_dir,
         workspace_strict=workspace_strict,
         run_mode=run_mode.value if run_mode is not None else None,
         sandbox_mounts=sandbox_mounts,
@@ -452,7 +568,38 @@ def tool_context_from_envelope(
         tool_policy=(
             envelope.metadata.get("tool_policy") if cron_trusted_owner else None
         ),
+        task_id=(
+            str(envelope.metadata["task_id"])
+            if envelope.metadata.get("task_id")
+            else None
+        ),
+        collaboration_mode=str(
+            envelope.metadata.get("collaboration_mode") or "default"
+        ),
+        collaboration_revision=int(
+            envelope.metadata.get("collaboration_revision") or 0
+        ),
+        active_plan_revision_id=(
+            str(envelope.metadata["active_plan_revision_id"])
+            if envelope.metadata.get("active_plan_revision_id")
+            else None
+        ),
+        plan_run_id=(
+            str(envelope.metadata["plan_run_id"])
+            if envelope.metadata.get("plan_run_id")
+            else None
+        ),
+        plan_storage=envelope.runtime_services.get("plan_storage"),
+        plan_event_emitter=envelope.runtime_services.get("plan_event_emitter"),
+        user_input_provider=envelope.runtime_services.get("user_input_provider"),
+        plan_revision=envelope.runtime_services.get("plan_revision"),
+        plan_run=envelope.runtime_services.get("plan_run"),
     )
+    if sandbox_run_context_fresh:
+        # Runtime-only authority marker copied from the RouteEnvelope field,
+        # never from mutable metadata. Execution-time workspace validation is
+        # the only ingress that sets this field for ordinary turns.
+        setattr(ctx, "_sandbox_run_context_fresh", True)
     if caller_kind is CallerKind.CRON:
         if not cron_trusted_owner:
             ctx = apply_tool_policy_layer(

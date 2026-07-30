@@ -98,8 +98,10 @@ def _fields_for(spec: SearchProviderSpec) -> tuple[SearchProviderSetupField, ...
             default="off",
             choices=("off", "network"),
             description=(
-                "network retries with DuckDuckGo only after timeout/network errors; "
-                "off surfaces the original provider error."
+                "network tries at most one additional configured, compatible provider "
+                "after a transient failure, using DuckDuckGo when no keyed fallback is "
+                "available; off sends at most one provider request and never switches "
+                "after a network failure."
             ),
         ),
         SearchProviderSetupField(

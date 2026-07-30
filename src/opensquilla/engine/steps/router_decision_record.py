@@ -27,7 +27,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -51,6 +51,12 @@ _decision_writer: RouterDecisionWriter | None = None
 # before the writer's connection closes — otherwise a turn finishing near
 # shutdown loses its record (task cancelled) or writes on a closed connection.
 _pending_flush_tasks: set[asyncio.Task[None]] = set()
+_pending_flush_session_keys: dict[asyncio.Task[None], str] = {}
+
+
+def _discard_pending_flush(task: asyncio.Task[None]) -> None:
+    _pending_flush_tasks.discard(task)
+    _pending_flush_session_keys.pop(task, None)
 
 
 def set_decision_writer(writer: RouterDecisionWriter | None) -> None:
@@ -64,12 +70,12 @@ def get_decision_writer() -> RouterDecisionWriter | None:
 
 
 async def drain_pending_flushes(timeout: float = 2.0) -> None:
-    """Wait briefly for in-flight decision flushes, cancelling stragglers.
+    """Wait briefly for in-flight decision flushes, then settle stragglers.
 
     Called at gateway shutdown before the writer's connection is closed.
-    Best-effort like the flushes themselves: a straggler past *timeout* is
-    cancelled (its record is lost, which the fail-open contract permits)
-    rather than left to race the connection close.
+    A straggler past *timeout* receives a cancellation request, but its worker
+    thread cannot be stopped safely. Keep the writer open until that thread
+    settles so it can never race a closed connection.
     """
     pending = {task for task in _pending_flush_tasks if not task.done()}
     if not pending:
@@ -83,6 +89,25 @@ async def drain_pending_flushes(timeout: float = 2.0) -> None:
             cancelled=len(still_pending),
             flushed=len(done),
         )
+        await asyncio.gather(*still_pending, return_exceptions=True)
+
+
+async def drain_pending_flushes_for_sessions(session_keys: Collection[str]) -> None:
+    """Drain exactly *session_keys* without timing out or cancelling flushes.
+
+    Re-snapshot after each batch so flushes scheduled while an earlier batch
+    settles are included. Work for unrelated sessions is never awaited.
+    """
+    target_session_keys = frozenset(session_keys)
+    while True:
+        pending = {
+            task
+            for task in _pending_flush_tasks
+            if not task.done() and _pending_flush_session_keys.get(task) in target_session_keys
+        }
+        if not pending:
+            return
+        await asyncio.wait(pending)
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +248,8 @@ def stage_router_decision(
             "probs": extra.get("probabilities"),
             "flags": extra.get("flags"),
             "final_tier": _token(extra.get("final_tier")) or _token(decision.tier),
+            "requested_provider": _token(metadata.get("routed_provider")),
+            "requested_model": _token(getattr(decision, "model", None)),
             "provider": _token(metadata.get("routed_provider")),
             "model": _token(getattr(decision, "model", None)),
             "thinking_level": _token(metadata.get("thinking_level")),
@@ -265,12 +292,54 @@ def _complete_pending_record(
             profile = _token(ensemble_trace.get("profile"))
         record["ensemble_profile"] = profile
         record["fallback_hops"] = int(metadata.get(FALLBACK_HOPS_METADATA_KEY) or 0)
-        if not ensemble_enabled:
-            # Selector fallback realigns metadata["routed_model"] to the model
-            # that actually ran — keep the record naming the executed model.
-            executed_model = _token(metadata.get("routed_model"))
-            if executed_model is not None:
-                record["model"] = executed_model
+        executed_provider = _token(metadata.get("executed_provider"))
+        executed_model = _token(metadata.get("executed_model"))
+        if ensemble_enabled and isinstance(ensemble_trace, Mapping):
+            final_request = ensemble_trace.get("final_request")
+            execution = (
+                final_request.get("execution")
+                if isinstance(final_request, Mapping)
+                else None
+            )
+            if isinstance(execution, Mapping):
+                executed_provider = _token(execution.get("provider")) or executed_provider
+                executed_model = _token(execution.get("model")) or executed_model
+        if executed_provider is None:
+            executed_provider = (
+                _token(metadata.get("routed_provider_applied"))
+                or _token(metadata.get("routed_provider_fallback_provider"))
+                or _token(record.get("requested_provider"))
+                or _token(record.get("provider"))
+            )
+        if executed_model is None:
+            executed_model = (
+                _token(metadata.get("routed_provider_fallback_model"))
+                or _token(metadata.get("routed_model"))
+                or _token(record.get("requested_model"))
+                or _token(record.get("model"))
+            )
+        record["executed_provider"] = executed_provider
+        record["executed_model"] = executed_model
+        fallback_reason = _token(metadata.get("routed_provider_fallback_reason"))
+        if fallback_reason is None and record["fallback_hops"]:
+            fallback_reason = _token(metadata.get("router_fallback_reason")) or "selector_fallback"
+        if (
+            fallback_reason is None
+            and ensemble_enabled
+            and isinstance(ensemble_trace, Mapping)
+            and bool(ensemble_trace.get("fallback_used"))
+        ):
+            fallback_reason = (
+                _token(ensemble_trace.get("fallback_code"))
+                or _token(ensemble_trace.get("fallback_reason"))
+                or "ensemble_fallback_single"
+            )
+        record["fallback_reason"] = fallback_reason
+        if not ensemble_enabled and executed_model is not None:
+            # Preserve the legacy model column's existing executed-model
+            # semantics while the additive requested/executed fields expose
+            # both sides explicitly.
+            record["model"] = executed_model
     except Exception:  # noqa: BLE001 — decision records must never fail a turn
         log.warning("router_decision_record.flush_failed", exc_info=True)
         return None
@@ -285,10 +354,19 @@ def _write_record(writer: RouterDecisionWriter, record: dict[str, Any]) -> None:
 
 
 async def _write_record_off_loop(writer: RouterDecisionWriter, record: dict[str, Any]) -> None:
+    write_task = asyncio.create_task(asyncio.to_thread(writer.record_decision, record))
+    cancelled = False
     try:
-        await asyncio.to_thread(writer.record_decision, record)
+        while not write_task.done():
+            try:
+                await asyncio.shield(write_task)
+            except asyncio.CancelledError:
+                cancelled = True
+        write_task.result()
     except Exception:  # noqa: BLE001 — decision records must never fail a turn
         log.warning("router_decision_record.flush_failed", exc_info=True)
+    if cancelled:
+        raise asyncio.CancelledError
 
 
 def flush_router_decision(
@@ -346,7 +424,10 @@ def schedule_router_decision_flush(
     task = create_background_task(_write_record_off_loop(writer, record))
     if isinstance(task, asyncio.Task):
         _pending_flush_tasks.add(task)
-        task.add_done_callback(_pending_flush_tasks.discard)
+        session_key = record.get("session_key")
+        if isinstance(session_key, str):
+            _pending_flush_session_keys[task] = session_key
+        task.add_done_callback(_discard_pending_flush)
         return task
     return None
 

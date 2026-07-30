@@ -152,20 +152,24 @@ def test_architecture_prompt_renders_tools_and_chinese_output(
     assert "架构" in rendered_output
     # Fullscreen alt-screen viewport: the conversation lives in a ScrollBox, so
     # assertions cover the markers visible in the final frame. The assistant
-    # turn renders as ONE card with width-independent chrome (a short
-    # "╭ squilla" label, continuous left gutter, and a "╰ <usage>" footer that
-    # carries the usage receipt); each tool shows a "✓ <name> <args> · <dur>"
-    # invocation row plus a single collapsed "└ line1 · line2 · line3" result
-    # corner (the read_file preview is clipped to width, so only its leading
-    # summary is pinned). The prompt echoes as bare "│ <text>" rows with no
-    # header of its own.
-    assert "╭ squilla" in rendered_output
-    assert "│ 帮我分析这个代码长的架构" in rendered_output
+    # turn renders as ONE card with width-independent chrome (a canonical
+    # Agent label, continuous left gutter, and a "╰ <usage>" footer that carries
+    # the usage receipt). Each tool shows a "✓ <name> <args> · <dur>" invocation
+    # row, a compact args disclosure, and a multiline result preview with an
+    # explicit hidden-line receipt. The prompt uses the transcript's explicit
+    # user-role contract: one brand rail, a `you` label, and the prompt text on
+    # a dedicated low-contrast surface.
+    assert "╭ main" in rendered_output
+    assert "│ you  帮我分析这个代码长的架构" in rendered_output
     assert "╭─ prompt" not in rendered_output
     assert "✓ list_dir /workspace/opensquilla · 0.0s" in rendered_output
     assert "✓ read_file" in rendered_output
-    assert "└ top-level repository layout · AGENTS.md · pyproject.toml" in rendered_output
-    assert "└ OpenTUI runtime owns the chat surface factory" in rendered_output
+    assert rendered_output.count("args · 3 lines hidden · expand details") >= 2
+    assert "├ top-level repository layout" in rendered_output
+    assert "├ AGENTS.md" in rendered_output
+    assert "more output lines · expand details" in rendered_output
+    assert "├ OpenTUI runtime owns the chat surface factory" in rendered_output
+    assert "├ structured output handle" in rendered_output
     assert "╰ in 1 / out 2 · fake-opentui" in rendered_output
     assert "tool_output" not in rendered_output
     assert "stdout:" not in rendered_output

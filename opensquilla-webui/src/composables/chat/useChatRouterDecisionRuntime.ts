@@ -8,6 +8,9 @@ import {
   shortModelName,
 } from '@/composables/chat/useChatRenderedMessages'
 
+const LEGACY_QUORUM_CANCELLED_ERROR =
+  /^proposer cancelled after \d+(?:\.\d+)?s ensemble quorum grace$/
+
 export interface UseChatRouterDecisionRuntimeOptions {
   messages: Ref<ChatMessage[]>
   sessionKey: Ref<string>
@@ -41,6 +44,36 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     scrollToBottomIfFollowing()
   }
 
+  function payloadTurnId(payload: RouterDecisionPayload | EnsembleProgressPayload): string {
+    return String(payload.turn_id || payload.turnId || payload.task_id || payload.taskId || '').trim()
+  }
+
+  function latestExplicitTurnId(): string {
+    for (let i = options.messages.value.length - 1; i >= 0; i--) {
+      const turnId = String(options.messages.value[i]?.turnId || '').trim()
+      if (turnId) return turnId
+    }
+    return ''
+  }
+
+  function findRouterMessageForTurn(targetTurnId: string): ChatMessage | undefined {
+    for (let i = options.messages.value.length - 1; i >= 0; i--) {
+      const message = options.messages.value[i]
+      if (
+        message.role === 'router'
+        && message.provenanceKind === 'router_decision'
+        && (!targetTurnId || message.turnId === targetTurnId)
+      ) {
+        return message
+      }
+      if (
+        message.role === 'user'
+        && (!targetTurnId || !message.turnId || message.turnId !== targetTurnId)
+      ) break
+    }
+    return undefined
+  }
+
   function appendRouterDecision(payload: RouterDecisionPayload, decision = normalizeRouterDecision(payload)) {
     if (!decision) return
     const messageId = payload?.stream_seq
@@ -49,18 +82,17 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     const last = options.messages.value[options.messages.value.length - 1]
     if (last?.messageId === messageId) return
 
+    const turnId = payloadTurnId(payload)
     if (options.isStreaming.value) {
-      for (let i = options.messages.value.length - 1; i >= 0; i--) {
-        const message = options.messages.value[i]
-        if (message.role === 'user') break
-        if (message.role === 'router' && message.provenanceKind === 'router_decision') {
-          message.routerDecision = decision
-          message.messageId = messageId
-          message.ts = new Date().toISOString()
-          message.routerSettled = true
-          scrollToBottomIfFollowing()
-          return
-        }
+      const message = findRouterMessageForTurn(turnId)
+      if (message) {
+        message.routerDecision = decision
+        message.messageId = messageId
+        message.ts = new Date().toISOString()
+        message.routerSettled = true
+        if (turnId) message.turnId = turnId
+        scrollToBottomIfFollowing()
+        return
       }
     }
 
@@ -71,6 +103,7 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
       routerDecision: decision,
       provenanceKind: 'router_decision',
       messageId,
+      ...(turnId ? { turnId } : {}),
     })
     scrollToBottomIfFollowing()
   }
@@ -119,6 +152,9 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     const label = String(payload.proposer_label || '').trim() || (isAggregator ? 'aggregator' : 'proposer')
     const finished = payload.event_type === 'proposer_finish' || payload.event_type === 'aggregator_finish'
     const error = String(payload.error || '').trim()
+    const explicitErrorCode = String(payload.error_code || '').trim()
+    const errorCode = explicitErrorCode
+      || (LEGACY_QUORUM_CANCELLED_ERROR.test(error) ? 'quorum_cancelled' : '')
     return {
       role: isAggregator ? 'aggregator' : label,
       label,
@@ -128,9 +164,16 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
       input: Number(payload.input_tokens || 0),
       output: Number(payload.output_tokens || 0),
       costUsd: Number(payload.cost_usd || 0),
-      status: finished ? (error ? 'failed' : 'done') : 'running',
+      status: finished
+        ? errorCode === 'quorum_cancelled'
+          ? 'skipped'
+          : error
+            ? 'failed'
+            : 'done'
+        : 'running',
       elapsedMs: Math.max(0, Number(payload.elapsed_ms || 0)),
       error: error || undefined,
+      errorCode: errorCode || undefined,
     }
   }
 
@@ -154,19 +197,13 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     return source.includes('ensemble') || options.modelRoutingMode.value === 'llm_ensemble' || Boolean(message.ensemble)
   }
 
-  function findLiveRouterMessage(): ChatMessage | undefined {
+  function findLiveRouterMessage(targetTurnId = latestExplicitTurnId()): ChatMessage | undefined {
     if (!options.isStreaming.value) return undefined
-    for (let i = options.messages.value.length - 1; i >= 0; i--) {
-      const message = options.messages.value[i]
-      if (message.role === 'user') break
-      if (message.role === 'router' && message.provenanceKind === 'router_decision') {
-        return message
-      }
-    }
-    return undefined
+    return findRouterMessageForTurn(targetTurnId)
   }
 
   function synthesizeHandoffRouterMessage(): ChatMessage {
+    const turnId = latestExplicitTurnId()
     const message: ChatMessage = {
       role: 'router',
       text: '',
@@ -175,6 +212,7 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
       provenanceKind: 'router_decision',
       messageId: `router-${options.sessionKey.value}-ensemble-handoff`,
       routerState: 'handoff',
+      ...(turnId ? { turnId } : {}),
     }
     options.messages.value.push(message)
     return message
@@ -199,7 +237,8 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     const member = memberFromEnsembleProgress(payload)
     if (!member) return
 
-    let target = findLiveRouterMessage()
+    const turnId = payloadTurnId(payload)
+    let target = findLiveRouterMessage(turnId)
 
     if (!target) {
       options.messages.value.push({
@@ -210,6 +249,7 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
         provenanceKind: 'router_decision',
         messageId: `router-${options.sessionKey.value}-ensemble`,
         ensemble: emptyEnsemble(),
+        ...(turnId ? { turnId } : {}),
       })
       // Re-read through the reactive array so nested mutations below trigger.
       target = options.messages.value[options.messages.value.length - 1]

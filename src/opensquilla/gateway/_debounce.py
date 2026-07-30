@@ -54,8 +54,27 @@ class _DefaultDebounceCoordinator:
             first = state.buffer[0]
             content = "\n".join(m.content for m in state.buffer)
             attachments = [a for m in state.buffer for a in (m.attachments or [])]
-            msg = IncomingMessage(sender_id=first.sender_id, channel_id=first.channel_id, content=content, attachments=attachments, metadata=dict(first.metadata or {}))
-            combined = SimpleNamespace(content=content, attachments=attachments, message=msg, coalesced_count=len(state.buffer))
+            metadata = dict(first.metadata or {})
+            native_ids: list[str] = []
+            aliases = ("native_message_id", "message_id", "msg_id", "event_id", "activity_id", "update_id", "ts")
+            for buffered in state.buffer:
+                buffered_metadata = dict(buffered.metadata or {})
+                for alias in aliases:
+                    value = buffered_metadata.get(alias)
+                    if value is not None and str(value).strip():
+                        native_ids.append(f"{alias}:{str(value).strip()}")
+                        break
+            if len(native_ids) == len(state.buffer):
+                metadata["_opensquilla_debounce_native_message_ids"] = native_ids
+            else:
+                # A partial aggregate cannot be identified by its known subset:
+                # a later batch could reuse those ids with different no-id
+                # messages and collide. Preserve the first message's native
+                # routing metadata, but force the whole batch onto one generated
+                # fallback identity instead of falling through to that alias.
+                metadata["_opensquilla_debounce_native_ids_incomplete"] = True
+            msg = IncomingMessage(sender_id=first.sender_id, channel_id=first.channel_id, content=content, attachments=attachments, metadata=metadata, provenance=first.provenance)
+            combined = SimpleNamespace(content=content, attachments=attachments, message=msg, source_messages=tuple(state.buffer), coalesced_count=len(state.buffer))
             log.info("channel.debounce_coalesced", session_key=session_key, coalesced_count=combined.coalesced_count)
             await state.on_fire(combined)
         except asyncio.CancelledError:

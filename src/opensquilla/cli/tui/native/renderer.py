@@ -98,6 +98,46 @@ class NativeStreamRenderer:
         self._saw_output = True
         await self._write(_escape(visible))
 
+    async def areconcile_final_text(self, text: str) -> None:
+        """Make an authoritative terminal snapshot unambiguous in scrollback.
+
+        A plain terminal cannot reliably erase arbitrary output once tool rows or
+        wrapping have moved it into scrollback.  Exact snapshots therefore need
+        no work, strict extensions can still stream normally, and a conflicting
+        snapshot is rendered as an explicit correction.  The correction keeps
+        prior tool rows intact while making it clear that the earlier preview is
+        no longer the answer.
+        """
+
+        previous = self.buffer
+        if text == previous:
+            return
+        if text.startswith(previous):
+            await self.aappend_text(text[len(previous) :])
+            return
+
+        # Do not flush an ambiguous directive prefix from the superseded preview.
+        # The authoritative snapshot starts a fresh directive stream.
+        self._directive_filter = StreamDirectiveFilter()
+        self.buffer = text
+        await self._close_reasoning()
+        await self._ensure_line_start()
+        self._saw_output = True
+        if not text:
+            await self._write(
+                "[yellow]↻ Streamed preview withdrawn; the final answer is empty.[/yellow]\n"
+            )
+            return
+
+        await self._write(
+            "[yellow]↻ Final answer corrected; an earlier streamed preview was "
+            "superseded.[/yellow]\n"
+        )
+        visible = self._directive_filter.feed(text)
+        if visible:
+            await self._write(_escape(visible))
+        await self._flush_directive_tail()
+
     async def _flush_directive_tail(self) -> None:
         """Print a held tail that never completed into a directive tag."""
         tail = self._directive_filter.flush()

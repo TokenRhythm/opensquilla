@@ -23,6 +23,7 @@ import opensquilla.gateway.rpc_config as rpc_config
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc import RpcContext
 from opensquilla.gateway.rpc_config import (
+    _handle_config_apply,
     _handle_config_patch_safe,
     _handle_config_set,
 )
@@ -65,6 +66,55 @@ async def test_config_set_is_sparse_and_preserves_foreign_disk_keys(cfg_path) ->
     assert "[memory]" not in text
     assert "host =" not in text
     assert len(text.splitlines()) < before_lines + 10
+
+
+async def test_config_apply_force_persists_explicit_default_provider(cfg_path) -> None:
+    cfg_path.write_text(
+        '[llm]\napi_key = "sk_tr_abcdefghijklmnop"\n',
+        encoding="utf-8",
+    )
+    cfg = GatewayConfig.load(str(cfg_path))
+    payload = cfg.model_dump(mode="python")
+    payload["config_path"] = str(cfg_path)
+    payload["llm"]["provider"] = "tokenrhythm"
+
+    await _handle_config_apply({"config": payload}, _ctx(cfg))
+
+    persisted = tomllib.loads(cfg_path.read_text())
+    assert persisted["llm"]["provider"] == "tokenrhythm"
+
+
+async def test_config_apply_accepts_public_ensemble_activation_fields(cfg_path) -> None:
+    cfg = GatewayConfig(config_path=str(cfg_path))
+    payload = cfg.to_public_dict()
+
+    await _handle_config_apply({"config": payload}, _ctx(cfg))
+
+    assert cfg.llm_ensemble.enabled is False
+    persisted = tomllib.loads(cfg_path.read_text())
+    ensemble = persisted.get("llm_ensemble", {})
+    assert "selection_configured" not in ensemble
+    assert "activation_preview" not in ensemble
+
+
+async def test_config_set_and_patch_accept_public_ensemble_slice(cfg_path) -> None:
+    cfg = GatewayConfig(config_path=str(cfg_path))
+    public_ensemble = dict(cfg.to_public_dict()["llm_ensemble"])
+    public_ensemble["min_successful_proposers"] = 2
+
+    await _handle_config_set(
+        {"path": "llm_ensemble", "value": public_ensemble},
+        _ctx(cfg),
+    )
+    assert cfg.llm_ensemble.min_successful_proposers == 2
+
+    public_ensemble = dict(cfg.to_public_dict()["llm_ensemble"])
+    public_ensemble["min_successful_proposers"] = 3
+    await rpc_config._handle_config_patch(
+        {"patch": {"llm_ensemble": public_ensemble}},
+        _ctx(cfg),
+    )
+    assert cfg.llm_ensemble.min_successful_proposers == 3
 
 
 async def test_config_set_preserves_known_field_edited_after_gateway_load(cfg_path) -> None:
@@ -161,15 +211,32 @@ async def test_routing_mode_toggle_persists_only_its_paths(cfg_path) -> None:
     }
     data = tomllib.loads(cfg_path.read_text())
     assert data["llm_ensemble"]["enabled"] is True
-    # Values equal to the model default (router enabled/full) may be omitted
-    # by the sparse diff; the round-trip contract is what matters.
+    # First activation materializes a provider-aware custom lineup, which is
+    # independent of Router execution. Canonical reconciliation therefore
+    # overrides the legacy conflicting router=true field while preserving
+    # the explicit full rollout marker.
     reloaded = GatewayConfig.load(str(cfg_path))
     assert reloaded.llm_ensemble.enabled is True
-    assert reloaded.squilla_router.enabled is True
+    assert reloaded.squilla_router.enabled is False
     assert reloaded.squilla_router.rollout_phase == "full"
     # No default-bake: sections the toggle never touched stay absent.
     assert "memory" not in data
     assert "auth" not in data
+
+
+async def test_safe_patch_persists_the_gateway_channel_notice_locale(cfg_path) -> None:
+    _write_small_config(cfg_path)
+    cfg = GatewayConfig.load(str(cfg_path))
+
+    result = await _handle_config_patch_safe(
+        {"patches": {"control_ui.default_locale": "zh-Hans"}},
+        _ctx(cfg),
+    )
+
+    assert result["restartRequired"] is False
+    assert cfg.control_ui.default_locale == "zh-Hans"
+    data = tomllib.loads(cfg_path.read_text())
+    assert data["control_ui"]["default_locale"] == "zh-Hans"
 
 
 # --- set-heartbeats (third _persist_config caller) -----------------------------
@@ -298,7 +365,13 @@ async def test_onboarding_live_snapshot_advances_after_successful_persist(cfg_pa
 
     await rpc_onboarding._ensemble_configure({"enabled": True}, ctx)
     assert cfg._persist_baseline["llm_ensemble"]["enabled"] is True
-    cfg_path.write_text(cfg_path.read_text().replace("enabled = true", "enabled = false"))
+    cfg_path.write_text(
+        cfg_path.read_text().replace(
+            "[llm_ensemble]\nenabled = true",
+            "[llm_ensemble]\nenabled = false",
+            1,
+        )
+    )
 
     await rpc_onboarding._search_configure({"providerId": "duckduckgo"}, ctx)
 
@@ -323,7 +396,13 @@ async def test_onboarding_first_save_establishes_path_and_snapshot(
 
     assert cfg.config_path == str(target)
     assert cfg._persist_baseline["llm_ensemble"]["enabled"] is True
-    target.write_text(target.read_text().replace("enabled = true", "enabled = false"))
+    target.write_text(
+        target.read_text().replace(
+            "[llm_ensemble]\nenabled = true",
+            "[llm_ensemble]\nenabled = false",
+            1,
+        )
+    )
 
     await rpc_onboarding._search_configure({"providerId": "duckduckgo"}, ctx)
 

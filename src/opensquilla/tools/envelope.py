@@ -20,6 +20,7 @@ keys are a breaking change; additions go through a new slice.
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any, Final
 
@@ -89,11 +90,38 @@ _USER_MESSAGES: Final[dict[str, str]] = {
     "ConnectError": "The tool could not connect to the remote service.",
     "JSONDecodeError": "The tool received an invalid response payload.",
     "ToolRunBudgetExceededError": "The tool run budget for this turn is exhausted.",
+    "SandboxBackendError": (
+        "The sandbox environment could not run this operation. Do not retry with another "
+        "tool; report the sandbox failure once."
+    ),
     "policy_denial": "The action was blocked by policy. See user-facing reason for details.",
 }
 
 _TRACEBACK_FRAME_RE = re.compile(r'^\s+File ".+?", line \d+, in .+$', re.MULTILINE)
 _USER_MESSAGE_MAX_CHARS: Final[int] = 500
+# Engine-authored messages — explicit overrides and SafeToolUserMessage payloads
+# (denial guidance, retry hints) — carry actionable, sometimes multi-line detail
+# that a 500-char cap would truncate mid-instruction. Give them a wider bound; the
+# generic canned lines above are all far shorter than either cap, so this only
+# affects deliberately-authored text.
+_CURATED_USER_MESSAGE_MAX_CHARS: Final[int] = 2000
+# Opt-in cap override for policy-gate denial envelopes (off by default).
+# Policy gates author remediation guidance whose tail carries the binding
+# instruction; the default cap can sever it while the sibling block-payload
+# path delivers the same text in full. Gates mark their SafeToolError with a
+# ``policy_gate_denial`` attribute before raising; non-marked errors keep the
+# curated/default cap even when the lever is set.
+_POLICY_DENY_MAX_CHARS_ENV = "OPENSQUILLA_TOOL_ENVELOPE_POLICY_DENY_MAX_CHARS"
+
+
+def _policy_deny_max_chars() -> int:
+    raw = os.environ.get(_POLICY_DENY_MAX_CHARS_ENV, "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
 
 
 def _exception_class_name(exc: BaseException) -> str:
@@ -178,13 +206,21 @@ def build_tool_failure_envelope(
     if not isinstance(tool_name, str) or not tool_name:
         tool_name = "<unknown>"
 
+    curated = user_message_override is not None or isinstance(exc, SafeToolUserMessage)
     user_message = user_message_override or _sanitise_user_message(tool_name, exc)
     # Defense in depth: belt-and-braces guard against a future caller
     # pre-rendering a traceback into the sanitiser output.
     user_message = _TRACEBACK_FRAME_RE.sub("", user_message).strip()
     user_message = user_message.replace("\n", " ").strip() or (f"The tool {tool_name!r} failed.")
-    if len(user_message) > _USER_MESSAGE_MAX_CHARS:
-        user_message = user_message[: _USER_MESSAGE_MAX_CHARS - len("...[truncated]")]
+    max_chars = _CURATED_USER_MESSAGE_MAX_CHARS if curated else _USER_MESSAGE_MAX_CHARS
+    if getattr(exc, "policy_gate_denial", False):
+        override_max_chars = _policy_deny_max_chars()
+        # Caps that cannot fit the truncation marker would replace content
+        # with marker text; treat them as off like the other invalid values.
+        if override_max_chars > len("...[truncated]"):
+            max_chars = override_max_chars
+    if len(user_message) > max_chars:
+        user_message = user_message[: max_chars - len("...[truncated]")]
         user_message = f"{user_message}...[truncated]"
 
     return {

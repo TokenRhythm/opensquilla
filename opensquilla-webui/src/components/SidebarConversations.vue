@@ -46,13 +46,20 @@ import { useConfirm } from '@/composables/useConfirm'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { shouldShowAgentFilterBadge } from '@/utils/sidebarConversations'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   sections: SidebarSection[]
   error: boolean
   loading: boolean
   currentKey: string
   contractDebugEnabled: boolean
-}>()
+  /** Command-palette chord, shown in the search button's tooltip. */
+  searchHint: string
+  canManageProjects?: boolean
+  canCreateProjects?: boolean
+}>(), {
+  canManageProjects: false,
+  canCreateProjects: false,
+})
 
 const emit = defineEmits<{
   (e: 'select', key: string): void
@@ -61,6 +68,13 @@ const emit = defineEmits<{
   (e: 'delete', key: string): void
   (e: 'bulk-delete', keys: string[]): void
   (e: 'new-chat'): void
+  (e: 'new-project'): void
+  (e: 'new-project-task', workspaceId: string): void
+  (e: 'project-pin', payload: { workspaceId: string; pinned: boolean }): void
+  (e: 'project-edit', workspaceId: string): void
+  (e: 'project-delete-history', workspaceId: string): void
+  (e: 'project-remove', workspaceId: string): void
+  (e: 'search'): void
 }>()
 
 const { confirm } = useConfirm()
@@ -91,6 +105,38 @@ function agentInitial(name: string): string {
   return name.trim().charAt(0).toUpperCase() || '?'
 }
 
+function isWorkspaceRow(row: SidebarConversationItem): boolean {
+  return row.rowKind === 'workspace'
+}
+
+function filterChatRowsByAgent(rows: SidebarConversationItem[], agentId: string): SidebarConversationItem[] {
+  const result: SidebarConversationItem[] = []
+  let pendingWorkspace: SidebarConversationItem | null = null
+  let pendingWorkspaceHasMatch = false
+
+  const flushPendingWorkspace = () => {
+    if (pendingWorkspace && pendingWorkspaceHasMatch) result.push(pendingWorkspace)
+    pendingWorkspace = null
+    pendingWorkspaceHasMatch = false
+  }
+
+  for (const row of rows) {
+    if (isWorkspaceRow(row)) {
+      flushPendingWorkspace()
+      pendingWorkspace = row
+      continue
+    }
+    if (row.effectiveAgentId !== agentId) continue
+    if (pendingWorkspace && !pendingWorkspaceHasMatch) {
+      result.push(pendingWorkspace)
+      pendingWorkspaceHasMatch = true
+    }
+    result.push(row)
+  }
+  flushPendingWorkspace()
+  return result
+}
+
 /* ── Collapsible sections ──────────────────────────────────────────── */
 
 // Persisted collapse state, keyed by family. A family is open unless an
@@ -107,26 +153,133 @@ function toggleSection(family: SidebarFamilyId) {
   writeSidebarCollapsedState(next)
 }
 
+function projectCollapseKey(workspaceId: string): string {
+  return `project:${workspaceId}`
+}
+
+function isProjectCollapsed(row: SidebarConversationItem): boolean {
+  return Boolean(row.workspaceId && collapsed.value[projectCollapseKey(row.workspaceId)] === true)
+}
+
+function toggleProject(row: SidebarConversationItem) {
+  if (!row.workspaceId) return
+  const key = projectCollapseKey(row.workspaceId)
+  const next = { ...collapsed.value, [key]: !isProjectCollapsed(row) }
+  collapsed.value = next
+  writeSidebarCollapsedState(next)
+}
+
+function startProjectTask(row: SidebarConversationItem) {
+  if (!row.workspaceId || row.workspaceAvailable === false) return
+  const key = projectCollapseKey(row.workspaceId)
+  const next = { ...collapsed.value, [key]: false }
+  collapsed.value = next
+  writeSidebarCollapsedState(next)
+  emit('new-project-task', row.workspaceId)
+}
+
+function filterCollapsedProjectRows(rows: SidebarConversationItem[]): SidebarConversationItem[] {
+  const hiddenProjects = new Set<string>()
+  const result: SidebarConversationItem[] = []
+  for (const row of rows) {
+    if (row.rowKind === 'workspace') {
+      if (row.workspaceId && isProjectCollapsed(row)) hiddenProjects.add(row.workspaceId)
+      result.push(row)
+      continue
+    }
+    if (row.workspaceId && hiddenProjects.has(row.workspaceId)) continue
+    result.push(row)
+  }
+  return result
+}
+
 // Sections with at least one row, honoring the agent filter inside Chats.
 const visibleSections = computed(() => {
   return props.sections
-    .map(section => ({
-      ...section,
-      rows: section.family === 'chats' && agentFilter.value
-        ? section.rows.filter(row => row.effectiveAgentId === agentFilter.value)
-        : section.rows,
-    }))
+    .map(section => {
+      const filteredRows = section.family === 'chats' && agentFilter.value
+        ? filterChatRowsByAgent(section.rows, agentFilter.value)
+        : section.rows
+      return {
+        ...section,
+        rows: filterCollapsedProjectRows(filteredRows)
+          .filter(row => row.rowKind !== 'workspace-empty'),
+      }
+    })
     .filter(section => section.rows.length > 0)
 })
+
+const visibleProjectCount = computed(() =>
+  visibleSections.value.reduce(
+    (sum, section) => sum + section.rows.filter(row => row.rowKind === 'workspace').length,
+    0,
+  ),
+)
+
+/**
+ * `arrangeSidebarSections` emits project rows as a small ordered ledger:
+ * a workspace header followed by its task rows. Track those task keys without
+ * treating every session cwd as a project — ordinary tasks can still carry a
+ * workspace path even when they are not bound to a persisted project.
+ */
+const projectRowKeys = computed(() => {
+  const keys = new Set<string>()
+  const chats = props.sections.find(section => section.family === 'chats')
+  let project: SidebarConversationItem | null = null
+
+  for (const row of chats?.rows || []) {
+    if (row.rowKind === 'workspace') {
+      project = row
+      keys.add(row.key)
+      continue
+    }
+    if (row.rowKind === 'workspace-empty') {
+      if (project) keys.add(row.key)
+      continue
+    }
+    const belongsToProject = Boolean(
+      project
+      && (
+        project.workspaceId
+          ? row.workspaceId === project.workspaceId
+          : Boolean(project.workspace && row.workspace === project.workspace)
+      ),
+    )
+    if (belongsToProject) keys.add(row.key)
+    else project = null
+  }
+  return keys
+})
+
+const firstRecentRowKey = computed(() => {
+  for (const section of visibleSections.value) {
+    const row = section.rows.find(item =>
+      item.rowKind === 'session' && !projectRowKeys.value.has(item.key),
+    )
+    if (row) return row.key
+  }
+  return ''
+})
+
+const hasVisibleRecentRows = computed(() =>
+  visibleSections.value.some(section =>
+    section.rows.some(row =>
+      row.rowKind === 'session' && !projectRowKeys.value.has(row.key),
+    ),
+  ),
+)
 
 // Total rendered rows: drives the onboarding empty-state and the filter's
 // "No matches" message separately from a true first-run empty list.
 const totalRows = computed(() =>
-  props.sections.reduce((sum, section) => sum + section.rows.length, 0),
+  props.sections.reduce(
+    (sum, section) => sum + section.rows.filter(row => row.rowKind === 'session').length,
+    0,
+  ),
 )
 
 const hasFilterMatches = computed(() =>
-  visibleSections.value.some(section => section.rows.length > 0),
+  visibleSections.value.some(section => section.rows.some(row => !isWorkspaceRow(row))),
 )
 
 /* ── Bulk selection ───────────────────────────────────────────────── */
@@ -135,7 +288,11 @@ const selectedKeys = ref<Set<string>>(new Set())
 const selectionMode = ref(false)
 
 const visibleSelectableRows = computed(() =>
-  visibleSections.value.flatMap(section => isCollapsed(section.family) ? [] : section.rows),
+  visibleSections.value.flatMap(section =>
+    isCollapsed(section.family)
+      ? []
+      : section.rows.filter(row => row.rowKind === 'session' && !row.provisional),
+  ),
 )
 
 const visibleSelectableKeySet = computed(() =>
@@ -180,10 +337,24 @@ function clearSelection() {
   selectedKeys.value = new Set()
 }
 
-function toggleSelectionMode() {
-  selectionMode.value = !selectionMode.value
-  if (!selectionMode.value) clearSelection()
+function exitSelectionMode() {
+  selectionMode.value = false
+  clearSelection()
 }
+
+function toggleSelectionMode() {
+  if (selectionMode.value) {
+    exitSelectionMode()
+    return
+  }
+  selectionMode.value = true
+}
+
+useDocumentEvent('keydown', (event) => {
+  if (event.key !== 'Escape' || !selectionMode.value) return
+  event.preventDefault()
+  exitSelectionMode()
+})
 
 async function requestBulkDelete() {
   closeMenu()
@@ -239,12 +410,18 @@ function toggleMenu(key: string, event?: Event) {
   // near the viewport bottom so the Delete item is never clipped off-screen.
   if (menuTriggerEl.value) {
     const r = menuTriggerEl.value.getBoundingClientRect()
-    const openUp = r.bottom + 100 > window.innerHeight
+    const openUp = r.bottom + 220 > window.innerHeight
+    const isProjectMenu = Boolean(
+      menuTriggerEl.value.closest('.sidebar-history-row--workspace'),
+    )
+    const openProjectMenuRight = isProjectMenu && r.right + 160 < window.innerWidth
     menuStyle.value = {
       position: 'fixed',
-      left: `${r.right}px`,
+      left: `${openProjectMenuRight ? r.right + 6 : r.right}px`,
       top: `${openUp ? r.top : r.bottom + 4}px`,
-      transform: openUp ? 'translate(-100%, -100%)' : 'translateX(-100%)',
+      transform: openProjectMenuRight
+        ? (openUp ? 'translateY(-100%)' : 'none')
+        : (openUp ? 'translate(-100%, -100%)' : 'translateX(-100%)'),
     }
   }
   // Move focus into the menu so keyboard users land on an actionable item.
@@ -339,7 +516,43 @@ async function requestDelete(row: SidebarConversationItem) {
   emit('delete', row.key)
 }
 
+function emitProjectPin(row: SidebarConversationItem) {
+  closeMenu()
+  if (!row.workspaceId) return
+  emit('project-pin', {
+    workspaceId: row.workspaceId,
+    pinned: !row.workspacePinned,
+  })
+}
+
+function emitProjectEdit(row: SidebarConversationItem) {
+  closeMenu()
+  if (row.workspaceId) emit('project-edit', row.workspaceId)
+}
+
+async function requestProjectHistoryDelete(row: SidebarConversationItem) {
+  closeMenu()
+  if (!row.workspaceId) return
+  const ok = await confirm({
+    title: t('workspaces.deleteHistoryTitle'),
+    body: t('workspaces.deleteHistoryBody', {
+      count: row.workspaceTaskCount ?? 0,
+      name: row.title,
+    }),
+    primaryLabel: t('workspaces.deleteHistoryConfirm'),
+    primaryClass: 'btn--danger',
+  })
+  if (ok) emit('project-delete-history', row.workspaceId)
+}
+
+function emitProjectRemove(row: SidebarConversationItem) {
+  closeMenu()
+  if (row.workspaceId) emit('project-remove', row.workspaceId)
+}
+
 function onSelectRow(row: SidebarConversationItem) {
+  if (row.rowKind !== 'session') return
+  if (row.provisional) return
   if (renamingKey.value === row.key) return
   if (selectionMode.value) {
     setRowSelected(row.key, !isRowSelected(row.key))
@@ -351,8 +564,12 @@ function onSelectRow(row: SidebarConversationItem) {
 
 <template>
   <div
+    v-if="error || totalRows > 0 || visibleProjectCount > 0 || props.canManageProjects"
     class="sidebar-section sidebar-history"
-    :class="{ 'is-selecting': selectionMode }"
+    :class="{
+      'is-selecting': selectionMode,
+      'has-projects': visibleProjectCount > 0,
+    }"
     :aria-label="t('shared.sidebar.recentConversations')"
   >
     <div class="sidebar-recents-header">
@@ -362,15 +579,40 @@ function onSelectRow(row: SidebarConversationItem) {
             ? selectedCount > 0
               ? t('shared.sidebar.selectedCountLabel', { count: selectedCount })
               : t('shared.sidebar.selectionModeLabel')
-            : visibleSections.length === 1
-              ? visibleSections[0].label
+            : props.canManageProjects
+              ? t('workspaces.projects')
               : t('shared.sidebar.recents')
         }}
       </span>
       <span
-        v-if="!selectionMode && visibleSections.length === 1 && totalRows > 0"
+        v-if="!selectionMode && visibleProjectCount === 0 && totalRows > 0"
         class="sidebar-recents-count"
       >{{ totalRows }}</span>
+      <button
+        v-if="!selectionMode && props.canManageProjects && props.canCreateProjects"
+        type="button"
+        class="sidebar-project-create-btn"
+        data-testid="sidebar-create-project"
+        :aria-label="t('workspaces.createProject')"
+        :title="t('workspaces.createProject')"
+        @click="emit('new-project')"
+      >
+        <Icon name="plus" :size="13" />
+      </button>
+      <!-- Conversation search lives on the recents header, beside the selection
+           and refresh controls, because the palette's hits are these rows.
+           Hidden while selecting: that mode owns the header's spare width. -->
+      <button
+        v-if="!selectionMode"
+        type="button"
+        class="sidebar-cmd-btn"
+        :aria-label="`${t('chrome.searchChats')} (${props.searchHint})`"
+        :title="`${t('chrome.searchChats')} (${props.searchHint})`"
+        aria-haspopup="dialog"
+        @click="emit('search')"
+      >
+        <Icon name="search" :size="13" />
+      </button>
       <button
         v-if="selectionMode"
         type="button"
@@ -383,9 +625,10 @@ function onSelectRow(row: SidebarConversationItem) {
         {{ allVisibleSelected ? t('shared.sidebar.clearAllShort') : t('shared.sidebar.selectAllShort') }}
       </button>
       <button
-        v-if="selectionMode && selectedCount > 0"
+        v-if="selectionMode"
         type="button"
         class="sidebar-bulk-delete-btn"
+        :disabled="selectedCount === 0"
         :aria-label="t('shared.sidebar.deleteSelectedAria', { count: selectedCount })"
         :title="t('shared.sidebar.deleteSelectedAria', { count: selectedCount })"
         @click="requestBulkDelete"
@@ -393,25 +636,24 @@ function onSelectRow(row: SidebarConversationItem) {
         <Icon name="trash" :size="12" />
       </button>
       <button
-        v-if="totalRows > 0"
+        v-if="selectionMode"
         type="button"
-        class="sidebar-bulk-mode-btn"
-        :class="{ 'is-active': selectionMode }"
-        :aria-pressed="selectionMode"
-        :aria-label="selectionMode ? t('shared.sidebar.exitSelectionMode') : t('shared.sidebar.enterSelectionMode')"
-        :title="selectionMode ? t('shared.sidebar.exitSelectionMode') : t('shared.sidebar.enterSelectionMode')"
-        @click="toggleSelectionMode"
+        class="sidebar-selection-done-btn"
+        :aria-label="t('shared.sidebar.exitSelectionMode')"
+        :title="t('shared.sidebar.exitSelectionMode')"
+        @click="exitSelectionMode"
       >
-        <Icon :name="selectionMode ? 'x' : 'listChecks'" :size="13" />
+        {{ t('shared.sidebar.selectionDone') }}
       </button>
       <button
-        class="sidebar-refresh-btn"
-        :title="t('shared.sidebar.refresh')"
-        :aria-label="t('shared.sidebar.refresh')"
-        :class="{ spinning: loading }"
-        @click="emit('refresh')"
+        v-if="totalRows > 0 && !selectionMode"
+        type="button"
+        class="sidebar-bulk-mode-btn"
+        :aria-label="t('shared.sidebar.enterSelectionMode')"
+        :title="t('shared.sidebar.enterSelectionMode')"
+        @click="toggleSelectionMode"
       >
-        <Icon name="refresh" :size="12" />
+        <Icon name="listChecks" :size="13" />
       </button>
     </div>
 
@@ -426,26 +668,23 @@ function onSelectRow(row: SidebarConversationItem) {
       </button>
     </div>
 
+    <!-- The header no longer carries a standing refresh control, so the retry
+         lives here — the one moment it is actually needed. -->
     <div v-if="error" class="sidebar-history-empty">
-      {{ t('shared.sidebar.loadError') }}
+      <p>{{ t('shared.sidebar.loadError') }}</p>
+      <button
+        type="button"
+        class="sidebar-history-retry"
+        :disabled="loading"
+        @click="emit('refresh')"
+      >
+        {{ t('shared.sidebar.refresh') }}
+      </button>
     </div>
 
     <!-- Filtered to nothing within the Chats agent filter -->
     <div v-else-if="agentFilter && !hasFilterMatches" class="sidebar-history-empty">
       {{ t('shared.sidebar.noMatches') }}
-    </div>
-
-    <!-- First-run onboarding: no sessions exist yet -->
-    <div v-else-if="totalRows === 0" class="sidebar-onboarding">
-      <p class="sidebar-onboarding__lead">{{ t('shared.sidebar.noConversations') }}</p>
-      <button type="button" class="sidebar-onboarding__cta" @click="emit('new-chat')">
-        <Icon name="plus" :size="14" />
-        <span>{{ t('shared.sidebar.startChat') }}</span>
-      </button>
-      <div class="sidebar-onboarding__links">
-        <router-link to="/sessions" class="sidebar-onboarding__link">{{ t('shared.sidebar.linkSessions') }}</router-link>
-        <router-link to="/overview" class="sidebar-onboarding__link">{{ t('shared.sidebar.linkOverview') }}</router-link>
-      </div>
     </div>
 
     <div v-else class="sidebar-history-list">
@@ -472,25 +711,118 @@ function onSelectRow(row: SidebarConversationItem) {
           <span class="sidebar-group__count">{{ section.rows.length }}</span>
         </button>
 
-        <div
+        <TransitionGroup
           v-show="visibleSections.length === 1 || !isCollapsed(section.family)"
           :id="`sidebar-group-${section.family}`"
+          name="sidebar-row"
+          tag="div"
           class="sidebar-group__body"
         >
           <div
             v-for="row in section.rows"
             :key="row.key"
             class="sidebar-history-row"
-            :class="{ 'is-selected': isRowSelected(row.key) }"
+            :class="{
+              'is-selected': row.rowKind === 'session' && isRowSelected(row.key),
+              'sidebar-history-row--workspace': row.rowKind === 'workspace',
+              'sidebar-history-row--workspace-empty': row.rowKind === 'workspace-empty',
+              'sidebar-history-row--recent-start': row.key === firstRecentRowKey,
+              'is-unavailable': row.rowKind === 'workspace' && row.workspaceAvailable === false,
+            }"
             :data-family="section.family"
+            :data-sidebar-zone="projectRowKeys.has(row.key) ? 'projects' : 'recents'"
+            :data-zone-label="row.key === firstRecentRowKey ? t('shared.sidebar.recents') : undefined"
             :data-depth="row.depth"
+            :data-session-key="row.rowKind === 'session' ? row.key : undefined"
             :style="{ '--row-depth': row.depth }"
           >
-            <span v-if="row.depth > 0" class="sidebar-history-rail" aria-hidden="true" />
+            <div
+              v-if="row.rowKind === 'workspace'"
+              class="sidebar-workspace-header"
+            >
+              <div class="sidebar-project-info-wrap">
+                <button
+                  type="button"
+                  class="sidebar-project-info"
+                  data-testid="project-workspace-info"
+                  :aria-label="t('workspaces.projectInfo', {
+                    path: row.workspaceDisplayPath || row.workspace || row.title,
+                    count: row.workspaceTaskCount ?? 0,
+                  })"
+                >
+                  <Icon name="folder" :size="15" />
+                </button>
+                <div class="sidebar-project-info-popover" role="tooltip">
+                  <span class="sidebar-project-info-path">
+                    {{ row.workspaceDisplayPath || row.workspace || row.title }}
+                  </span>
+                  <span>{{ t('workspaces.taskCount', { count: row.workspaceTaskCount ?? 0 }) }}</span>
+                  <span v-if="row.workspaceAvailable === false" class="sidebar-project-unavailable">
+                    {{ t('workspaces.unavailable') }}
+                  </span>
+                </div>
+              </div>
+              <button
+                type="button"
+                class="sidebar-project-disclosure"
+                data-testid="project-workspace-disclosure"
+                :aria-expanded="!isProjectCollapsed(row)"
+                :aria-label="row.title"
+                @click="toggleProject(row)"
+              >
+                <Icon class="sidebar-project-chevron" name="chevronRight" :size="12" />
+                <span class="sidebar-workspace-label">{{ row.title }}</span>
+              </button>
+              <div
+                v-if="!selectionMode && props.canManageProjects && row.workspaceId"
+                class="sidebar-project-actions"
+              >
+                <button
+                  type="button"
+                  class="sidebar-project-action sidebar-project-action--new-task"
+                  data-testid="project-workspace-new-task"
+                  :aria-label="row.workspaceAvailable === false
+                    ? t('workspaces.unavailableProjectCannotStartTask')
+                    : t('workspaces.newTask')"
+                  :title="row.workspaceAvailable === false
+                    ? t('workspaces.unavailableProjectCannotStartTask')
+                    : t('workspaces.newTask')"
+                  :disabled="row.workspaceAvailable === false"
+                  @click.stop="startProjectTask(row)"
+                >
+                  <Icon name="plus" :size="13" />
+                </button>
+                <button
+                  type="button"
+                  class="sidebar-project-action sidebar-row-menu-btn"
+                  data-testid="project-workspace-more"
+                  aria-haspopup="menu"
+                  :aria-expanded="openMenuKey === row.key"
+                  :aria-label="t('workspaces.moreActions')"
+                  :title="t('workspaces.moreActions')"
+                  @click.stop="toggleMenu(row.key, $event)"
+                >
+                  <Icon name="moreHorizontal" :size="14" />
+                </button>
+              </div>
+            </div>
+
+            <span
+              v-if="row.depth > 0 && row.rowKind !== 'workspace'"
+              class="sidebar-history-rail"
+              aria-hidden="true"
+            />
+
+            <div
+              v-if="row.rowKind === 'workspace-empty'"
+              class="sidebar-workspace-empty"
+            >
+              {{ row.title }}
+            </div>
 
             <!-- Inline rename input replaces the row button while editing -->
             <input
-              v-if="renamingKey === row.key"
+              v-if="row.rowKind === 'session' && renamingKey === row.key"
               :ref="setRenameInput"
               v-model="renameDraft"
               class="sidebar-history-rename"
@@ -502,28 +834,21 @@ function onSelectRow(row: SidebarConversationItem) {
             />
 
             <button
-              v-else
+              v-else-if="row.rowKind === 'session'"
               class="sidebar-history-item"
               :class="{ 'is-current': row.key === currentKey }"
               :title="row.title"
-              :aria-pressed="selectionMode ? isRowSelected(row.key) : undefined"
+              :aria-pressed="selectionMode && !row.provisional ? isRowSelected(row.key) : undefined"
               @click="onSelectRow(row)"
             >
               <span
-                v-if="selectionMode"
+                v-if="selectionMode && !row.provisional"
                 class="sidebar-selection-box"
                 :class="{ 'is-checked': isRowSelected(row.key) }"
                 aria-hidden="true"
               >
                 <Icon v-if="isRowSelected(row.key)" name="check" :size="11" />
               </span>
-              <span
-                v-else
-                class="sidebar-history-dot"
-                :class="`status--${row.runStatus}`"
-                role="img"
-                :aria-label="t('shared.sidebar.statusLabel', { status: row.runLabel })"
-              />
               <span class="sidebar-history-title">{{ row.title }}</span>
               <span
                 v-if="contractDebugEnabled && row.hasContractGaps"
@@ -535,8 +860,71 @@ function onSelectRow(row: SidebarConversationItem) {
             </button>
 
             <!-- Chat-only ⋯ menu: rename + delete -->
+            <Teleport to="body">
+              <div
+                v-if="
+                  props.canManageProjects
+                  && row.rowKind === 'workspace'
+                  && openMenuKey === row.key
+                "
+                :ref="setOpenMenu"
+                class="sidebar-row-menu sidebar-project-menu"
+                :style="menuStyle"
+                role="menu"
+                :aria-label="t('workspaces.moreActions')"
+                @keydown="onMenuKeydown"
+              >
+                <button
+                  type="button"
+                  class="sidebar-row-menu__item"
+                  data-project-action="pin"
+                  role="menuitem"
+                  @click.stop="emitProjectPin(row)"
+                >
+                  <Icon name="arrowUp" :size="13" />
+                  <span>{{ row.workspacePinned ? t('workspaces.unpin') : t('workspaces.pin') }}</span>
+                </button>
+                <button
+                  type="button"
+                  class="sidebar-row-menu__item"
+                  data-project-action="edit"
+                  role="menuitem"
+                  @click.stop="emitProjectEdit(row)"
+                >
+                  <Icon name="pencil" :size="13" />
+                  <span>{{ t('workspaces.editProject') }}</span>
+                </button>
+                <button
+                  type="button"
+                  class="sidebar-row-menu__item"
+                  data-project-action="delete-history"
+                  role="menuitem"
+                  @click.stop="requestProjectHistoryDelete(row)"
+                >
+                  <Icon name="trash" :size="13" />
+                  <span>{{ t('workspaces.menuDeleteHistory') }}</span>
+                </button>
+                <button
+                  type="button"
+                  class="sidebar-row-menu__item"
+                  data-project-action="remove"
+                  role="menuitem"
+                  @click.stop="emitProjectRemove(row)"
+                >
+                  <Icon name="x" :size="13" />
+                  <span>{{ t('workspaces.menuRemove') }}</span>
+                </button>
+              </div>
+            </Teleport>
+
             <div
-              v-if="row.sessionKind === 'chat' && renamingKey !== row.key && !selectionMode"
+              v-if="
+                row.rowKind === 'session'
+                && row.sessionKind === 'chat'
+                && !row.provisional
+                && renamingKey !== row.key
+                && !selectionMode
+              "
               class="sidebar-row-menu-wrap"
             >
               <button
@@ -584,7 +972,13 @@ function onSelectRow(row: SidebarConversationItem) {
 
             <!-- Agent-initial badge: indicator + click-to-filter (Chats only) -->
             <button
-              v-else-if="shouldShowAgentFilterBadge(section.family, row) && renamingKey !== row.key && !selectionMode"
+              v-else-if="
+                row.rowKind === 'session'
+                && !row.provisional
+                && shouldShowAgentFilterBadge(section.family, row)
+                && renamingKey !== row.key
+                && !selectionMode
+              "
               type="button"
               class="sidebar-agent-badge"
               :class="{ 'is-active': agentFilter === row.effectiveAgentId }"
@@ -596,7 +990,14 @@ function onSelectRow(row: SidebarConversationItem) {
               {{ agentInitial(row.agentName) }}
             </button>
           </div>
-        </div>
+        </TransitionGroup>
+      </div>
+      <div
+        v-if="visibleProjectCount > 0 && !hasVisibleRecentRows"
+        class="sidebar-zone-empty"
+      >
+        <div class="sidebar-zone-empty__label">{{ t('shared.sidebar.recents') }}</div>
+        <div class="sidebar-zone-empty__body">{{ t('shared.sidebar.noConversations') }}</div>
       </div>
     </div>
   </div>

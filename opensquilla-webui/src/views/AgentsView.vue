@@ -2,7 +2,11 @@
   <div class="ag-stage control-stage">
     <header class="ag-stage__header control-stage__header">
       <div class="ag-stage__title-block control-stage__title-block">
-        <h1 class="ag-stage__title control-stage__title">{{ t('console.agents.title') }}</h1>
+        <h1
+          id="agents-page-title"
+          class="ag-stage__title control-stage__title"
+          tabindex="-1"
+        >{{ t('console.agents.title') }}</h1>
         <p class="ag-stage__subtitle control-stage__subtitle">{{ t('console.agents.subtitle') }}</p>
       </div>
       <div class="ag-stage__actions control-stage__actions">
@@ -161,7 +165,7 @@
     <!-- Drawer -->
     <Teleport to="body">
       <Transition name="drawer">
-        <div v-if="drawerOpen" class="drawer-overlay" @click="onOverlayClick">
+        <div v-if="drawerOpen" class="drawer-overlay" @click="requestCloseDrawer">
           <div
             ref="drawerRef"
             class="drawer"
@@ -173,7 +177,7 @@
           >
             <div class="drawer__header">
               <h3 id="agents-drawer-title" class="drawer__title">{{ drawerTitle }}</h3>
-              <button class="drawer__close" :aria-label="t('common.close')" @click="closeDrawer">
+              <button class="drawer__close" :aria-label="t('common.close')" @click="requestCloseDrawer">
                 <Icon name="x" :size="20" />
               </button>
             </div>
@@ -229,7 +233,7 @@
             </div>
             <div class="drawer__footer">
               <template v-if="drawerMode === 'view'">
-                <button class="btn btn--ghost" @click="closeDrawer">{{ t('common.close') }}</button>
+                <button class="btn btn--ghost" @click="requestCloseDrawer">{{ t('common.close') }}</button>
                 <button v-if="drawerIsBuiltin" class="btn btn--primary" @click="customizeFromBuiltin(drawerAgentId)">
                   <Icon name="plus" :size="16" />
                   <span>{{ t('console.agents.customize') }}&hellip;</span>
@@ -327,15 +331,14 @@ const {
   toolsInput,
   advancedOpen,
   openDrawer,
-  closeDrawer,
+  requestCloseDrawer,
   enterEditMode,
-  onOverlayClick,
   onCancelEdit,
   buildSavePayload,
   applyUpdatedAgent,
 } = useAgentDrawer(agents, confirmDiscard)
 
-useDialogA11y(drawerRef, drawerOpen, closeDrawer)
+useDialogA11y(drawerRef, drawerOpen, () => { void requestCloseDrawer() })
 useDialogA11y(confirmRef, confirmOpen, cancelConfirm, { initialFocus: confirmCancelBtn })
 
 // ---------------------------------------------------------------------------

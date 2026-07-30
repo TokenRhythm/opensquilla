@@ -14,6 +14,24 @@
 #     start because the in-container bind is a wildcard by design — that is
 #     the intended signal to operators running the image.
 
+FROM --platform=$BUILDPLATFORM node:22.12.0-bookworm-slim AS webui-builder
+
+ARG OPENSQUILLA_FORBID_PERSONAL_BGM=0
+
+WORKDIR /build/opensquilla-webui
+
+# Cache dependency installation independently from application source. Vite
+# writes the verified bundle to /build/src/.../static/dist; the final Python
+# stage copies only that artifact, never Node.js or node_modules.
+COPY opensquilla-webui/package.json opensquilla-webui/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm,sharing=locked npm ci
+COPY opensquilla-webui/ ./
+RUN npm run build:artifact \
+    && if [ "${OPENSQUILLA_FORBID_PERSONAL_BGM}" = "1" ]; then \
+        npm run verify:release-dist; \
+    fi
+
+
 FROM python:3.13-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -40,8 +58,14 @@ RUN apt-get update \
 
 # Copy minimal build context — everything else is in .dockerignore.
 COPY pyproject.toml README.md README.release.md ./
+COPY hatch_build.py ./
+COPY scripts/verify_webui_artifact.py ./scripts/verify_webui_artifact.py
+COPY opensquilla-webui/ ./opensquilla-webui/
 COPY src/ ./src/
 COPY migrations/ ./migrations/
+COPY --from=webui-builder \
+    /build/src/opensquilla/gateway/static/dist/ \
+    ./src/opensquilla/gateway/static/dist/
 
 RUN python - <<'PY'
 from pathlib import Path
@@ -71,7 +95,8 @@ if missing or pointers:
     )
 PY
 
-RUN pip install ".[recommended]"
+RUN pip install ".[recommended]" \
+    && rm -rf hatch_build.py scripts opensquilla-webui
 
 # Persisted state root. The gateway writes config, state, logs, and the
 # workspace under OPENSQUILLA_STATE_DIR — mounting a volume here (see

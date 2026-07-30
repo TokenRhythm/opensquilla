@@ -27,7 +27,11 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from opensquilla.engine.pricing import ModelPrice, lookup_price
+from opensquilla.engine.pricing import (
+    ModelPrice,
+    estimate_cost,
+    resolve_model_price,
+)
 from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
 from opensquilla.provider.protocol import provider_metadata
 from opensquilla.provider.types import (
@@ -169,19 +173,19 @@ class BenchmarkReport:
 # ---------------------------------------------------------------------------
 
 
-def pricing_price_lookup(model_id: str) -> ModelPrice | None:
+def pricing_price_lookup(model_id: str, provider: str = "") -> ModelPrice | None:
     """Per-token price for ``model_id`` from :mod:`opensquilla.engine.pricing`.
 
-    A read-only adapter over ``pricing.lookup_price`` (which returns USD per 1M
-    tokens) into the per-token :class:`ModelPrice` the harness sums. This is a
-    separate measurement estimate; it deliberately does not touch the router's
-    savings/cost calculation. Unqualified model ids (no ``/``) resolve from the
-    static table without any network call.
+    A read-only adapter over the layered, provider-aware price resolver into
+    the legacy per-token :class:`ModelPrice` shape accepted by injected test
+    lookups. The built-in benchmark path recognizes this adapter and uses the
+    full four-bucket estimator directly. This is a separate measurement
+    estimate; it deliberately does not touch the router's savings calculation.
     """
     model = (model_id or "").strip()
     if not model:
         return None
-    entry = lookup_price(model)
+    entry = resolve_model_price(model, provider).entry
     return ModelPrice(
         input_per_token=entry.input_per_m / 1_000_000,
         output_per_token=entry.output_per_m / 1_000_000,
@@ -240,13 +244,62 @@ def _estimate_cost(
     model: str,
     input_tokens: int,
     output_tokens: int,
+    *,
+    provider: str = "",
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
 ) -> float | None:
     if price_lookup is None or not model:
         return None
+    if price_lookup is pricing_price_lookup:
+        return estimate_cost(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+            price=resolve_model_price(model, provider).entry,
+        ).cost_usd
     price = price_lookup(model)
     if price is None:
         return None
     return input_tokens * price.input_per_token + output_tokens * price.output_per_token
+
+
+def _estimate_done_cost(
+    price_lookup: PriceLookup | None,
+    done: DoneEvent,
+    *,
+    provider_hint: str,
+    model_hint: str,
+) -> float | None:
+    rows = done.model_usage_breakdown
+    if isinstance(rows, list) and rows and all(isinstance(row, dict) for row in rows):
+        estimates: list[float] = []
+        for row in rows:
+            estimated = _estimate_cost(
+                price_lookup,
+                str(row.get("model") or model_hint),
+                int(row.get("input_tokens") or 0),
+                int(row.get("output_tokens") or 0),
+                provider=str(row.get("provider") or provider_hint),
+                cache_read_tokens=int(
+                    row.get("cache_read_tokens") or row.get("cached_tokens") or 0
+                ),
+                cache_write_tokens=int(row.get("cache_write_tokens") or 0),
+            )
+            if estimated is None:
+                return None
+            estimates.append(estimated)
+        return sum(estimates)
+    return _estimate_cost(
+        price_lookup,
+        done.model or model_hint,
+        done.input_tokens,
+        done.output_tokens,
+        provider=done.provider or provider_hint,
+        cache_read_tokens=done.cached_tokens,
+        cache_write_tokens=done.cache_write_tokens,
+    )
 
 
 async def run_single(
@@ -260,6 +313,7 @@ async def run_single(
     price_lookup: PriceLookup | None = None,
     injector: FailureInjector | None = None,
     model_hint: str = "",
+    provider_hint: str = "",
 ) -> RunOutcome:
     """Run one prompt through one provider as a black box and classify it.
 
@@ -325,7 +379,12 @@ async def run_single(
     successful, total, fallback, mode = _read_ensemble_trace(done)
     priced_model = (done.model if done is not None and done.model else "") or model_hint
     estimated = (
-        _estimate_cost(price_lookup, priced_model, input_tokens, output_tokens)
+        _estimate_done_cost(
+            price_lookup,
+            done,
+            provider_hint=provider_hint or name,
+            model_hint=priced_model,
+        )
         if done is not None
         else None
     )
@@ -362,6 +421,7 @@ async def run_arm(
     price_lookup: PriceLookup | None = None,
     injector: FailureInjector | None = None,
     model_hint: str = "",
+    provider_hint: str = "",
 ) -> list[RunOutcome]:
     """Run every prompt (``repeat`` times each) through one provider arm."""
     outcomes: list[RunOutcome] = []
@@ -379,6 +439,7 @@ async def run_arm(
                     price_lookup=price_lookup,
                     injector=injector,
                     model_hint=model_hint,
+                    provider_hint=provider_hint,
                 )
             )
     return outcomes
@@ -499,6 +560,8 @@ async def run_benchmark(
     baseline_label: str = "baseline",
     ensemble_model_hint: str = "",
     baseline_model_hint: str = "",
+    ensemble_provider_hint: str = "",
+    baseline_provider_hint: str = "",
     repeat: int = 1,
     base_config: ChatConfig | None = None,
     clock: Clock = time.monotonic,
@@ -517,6 +580,7 @@ async def run_benchmark(
         price_lookup=price_lookup,
         injector=ensemble_injector,
         model_hint=ensemble_model_hint,
+        provider_hint=ensemble_provider_hint,
     )
     baseline_runs = await run_arm(
         baseline_provider,
@@ -528,6 +592,7 @@ async def run_benchmark(
         price_lookup=price_lookup,
         injector=baseline_injector,
         model_hint=baseline_model_hint,
+        provider_hint=baseline_provider_hint,
     )
     return build_report(
         aggregate_arm(ensemble_label, ensemble_runs),

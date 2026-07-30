@@ -1,6 +1,7 @@
 ---
 name: paper-section-author
 description: "Write one publication-style research-paper section as a bounded, citation-grounded LaTeX fragment from a writing plan, outline, citation plan, and optional figure/table context."
+description_zh: "根据写作计划、提纲、引用计划及可选的图表上下文，将一个出版级研究论文章节撰写为有边界、基于引用的LaTeX片段。"
 user-invocable: false
 disable-model-invocation: true
 provenance:

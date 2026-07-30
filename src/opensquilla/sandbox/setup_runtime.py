@@ -35,16 +35,28 @@ async def ensure_sandbox_setup_auto(config: Any) -> SetupResult:
 
     async with _LOCK:
         _SETTING_UP = True
+        setup_result: SetupResult | None = None
         try:
-            result = await ensure_sandbox_setup(config)
-            _LAST_RESULT = result
-            return result
+            setup_result = await ensure_sandbox_setup(config)
+            if (
+                setup_result.state is SandboxSetupState.READY
+                and setup_result.platform == "win32"
+            ):
+                from opensquilla.sandbox.integration import (
+                    refresh_runtime_backend_after_setup,
+                )
+
+                refresh_runtime_backend_after_setup()
+            _LAST_RESULT = setup_result
+            return setup_result
         except Exception as exc:  # noqa: BLE001
             result = SetupResult(
                 state=SandboxSetupState.FAILED,
-                platform="auto",
+                platform=setup_result.platform if setup_result is not None else "auto",
                 message="Sandbox setup failed.",
-                requires_admin=False,
+                requires_admin=(
+                    setup_result.requires_admin if setup_result is not None else False
+                ),
                 detail=str(exc),
             )
             _LAST_RESULT = result

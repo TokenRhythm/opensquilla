@@ -19,6 +19,8 @@ SearchErrorKind = Literal[
 ]
 SearchMode = Literal["auto", "news", "technical", "broad"]
 Recency = Literal["day", "week", "month", "year"]
+SearchSelectionMode = Literal["automatic", "explicit"]
+SearchFallbackMode = Literal["none", "auth_missing", "network"]
 
 # Single source of truth for the web-search result count.
 # DEFAULT_SEARCH_MAX_RESULTS is the count used when a caller does not request an
@@ -83,6 +85,35 @@ class SearchOptions:
         )
         object.__setattr__(self, "include_domains", _normalize_domains(self.include_domains))
         object.__setattr__(self, "exclude_domains", _normalize_domains(self.exclude_domains))
+
+
+@dataclass(frozen=True)
+class SearchExecutionPlan:
+    """Bounded provider sequence for one canonical search execution."""
+
+    provider_names: tuple[str, ...] = ()
+    selection_mode: SearchSelectionMode = "automatic"
+    fallback_mode: SearchFallbackMode = "none"
+
+    def __post_init__(self) -> None:
+        if len(self.provider_names) > 2:
+            raise ValueError("Search execution plans support at most two providers.")
+        if len(set(self.provider_names)) != len(self.provider_names):
+            raise ValueError("Search execution plans must not repeat providers.")
+        if self.fallback_mode != "none" and len(self.provider_names) < 2:
+            raise ValueError("A search fallback mode requires a fallback provider.")
+
+    @property
+    def primary_provider(self) -> str | None:
+        return self.provider_names[0] if self.provider_names else None
+
+    @property
+    def fallback_provider(self) -> str | None:
+        return self.provider_names[1] if len(self.provider_names) > 1 else None
+
+    @property
+    def planned_provider_ids(self) -> tuple[str, ...]:
+        return self.provider_names
 
 
 def _normalize_domains(value: str | Iterable[str]) -> tuple[str, ...]:

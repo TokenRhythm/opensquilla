@@ -55,17 +55,19 @@ def plan_acl_refresh(
     policy: Iterable[AclGrant],
     expansion: Iterable[AclGrant],
     sensitive_marker: Callable[[Path], str | None],
+    required_policy_sensitive_marker: Callable[[Path], str | None] | None = None,
 ) -> AclRefreshPlan:
     mode = normalize_run_mode(run_mode)
     if mode is RunMode.FULL:
         return AclRefreshPlan(auto_grants=(), approval_required=(), denied=())
 
+    base_marker = required_policy_sensitive_marker or sensitive_marker
     auto: list[AclGrant] = []
     ask: list[AclGrant] = []
     denied: list[AclDeniedGrant] = []
 
     for grant in _dedupe_grants((*required, *policy)):
-        marker = sensitive_marker(grant.path)
+        marker = base_marker(grant.path)
         if marker:
             denied.append(AclDeniedGrant(grant=grant, reason=marker))
         else:

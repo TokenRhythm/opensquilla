@@ -18,6 +18,23 @@ REDACTED_PLACEHOLDER = "***"
 _PROVIDER_SECRET_FIELDS = frozenset({"api_key"})
 
 
+def is_redacted_secret_sentinel(value: object) -> bool:
+    """True when a secret value is a round-tripped redaction mask.
+
+    Every redacted payload echo in this module uses ``REDACTED_PLACEHOLDER``,
+    and status surfaces render all-asterisk masks of varying width, so any
+    all-asterisk string can only be a display value a client read back —
+    never a real credential. Mutation and probe paths treat it server-side as
+    "keep the stored secret" (or reject it when nothing is stored), the same
+    trust boundary the channel-secret merge enforces, so a read-modify-write
+    RPC/CLI client cannot destroy a stored key by echoing its mask.
+    """
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    return bool(text) and set(text) == {"*"}
+
+
 def redact_provider_payload(payload: dict[str, Any]) -> dict[str, Any]:
     out = dict(payload)
     for key in _PROVIDER_SECRET_FIELDS:
@@ -117,7 +134,13 @@ def redact_channel_entry(type_name: str, payload: dict[str, Any]) -> dict[str, A
     try:
         spec = get_channel_setup_spec(type_name)
     except KeyError:
-        return dict(payload)
+        # Fail closed for types without a setup spec (entry-point plugin
+        # adapters): without declared secret fields, redact anything
+        # secret-shaped rather than returning credentials verbatim.
+        return {
+            key: (REDACTED_PLACEHOLDER if _is_secret_like_tier_key(key) and value else value)
+            for key, value in payload.items()
+        }
     secret_names = {f.name for f in spec.fields if f.secret}
     out = dict(payload)
     for key in secret_names:

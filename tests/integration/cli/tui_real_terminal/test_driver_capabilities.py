@@ -200,6 +200,8 @@ def test_tmux_session_uses_owned_session_commands(
         calls.append((args, kwargs))
         if args[:2] == ["tmux", "capture-pane"]:
             return subprocess.CompletedProcess(args, 0, stdout="ready screen")
+        if args[:2] == ["tmux", "display-message"]:
+            return subprocess.CompletedProcess(args, 0, stdout="7,28\n")
         if args[:2] == ["tmux", "has-session"]:
             return subprocess.CompletedProcess(args, 0)
         return subprocess.CompletedProcess(args, 0)
@@ -218,8 +220,10 @@ def test_tmux_session_uses_owned_session_commands(
     session.send_text("hello")
     session.send_key("C-c")
     session.paste("line 1\nline 2")
+    session.mouse_scroll("up", ticks=2, x=7, y=9)
     session.resize(TerminalSize(cols=120, rows=40))
     frame = session.wait_for_text("ready", timeout_s=0.1, checkpoint="ready")
+    cursor = session.cursor_position()
     alive = session.is_alive()
     session.terminate()
 
@@ -236,11 +240,19 @@ def test_tmux_session_uses_owned_session_commands(
     ]
     paste_call = next(call for call in calls if call[0][:3] == ["tmux", "load-buffer", "-b"])
     assert paste_call[1]["input"] == "line 1\nline 2"
+    wheel = [
+        call
+        for call, _ in calls
+        if call[:5] == ["tmux", "send-keys", "-H", "-t", "opensquilla-tui-owned-1"]
+    ]
+    assert len(wheel) == 2
+    assert wheel[0][5:] == [f"{byte:02x}" for byte in b"\x1b[<64;7;9M"]
     assert ["tmux", "resize-window", "-t", "opensquilla-tui-owned-1", "-x", "120", "-y", "40"] in [
         call for call, _ in calls
     ]
     assert frame.text == "ready screen"
     assert frame.size == TerminalSize(cols=120, rows=40)
+    assert cursor == (7, 28)
     assert alive is True
     assert calls[-1][0] == ["tmux", "kill-session", "-t", "opensquilla-tui-owned-1"]
 
@@ -282,6 +294,7 @@ def test_pty_session_drives_text_process_and_cleans_up(tmp_path: Path) -> None:
         assert "ECHO:hello" in echoed.text
         assert "ECHO:draft" in pasted.text
         assert session.size == TerminalSize(cols=90, rows=20)
+        assert session.cursor_position() is None
         assert session.is_alive() is True
     finally:
         session.terminate()
@@ -321,6 +334,48 @@ def test_tmux_alternate_screen_probe_reads_pane_flag(
 
     assert session.alternate_screen_active() is True
     assert session.alternate_screen_active() is False
+
+
+def test_tmux_styled_capture_reads_current_screen_without_joining_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = "\x1b[48;2;18;18;18m    \n    \n"
+
+    def fake_run(
+        args: list[str],
+        **kwargs: Any,
+    ) -> subprocess.CompletedProcess[str]:
+        assert args == [
+            "tmux",
+            "capture-pane",
+            "-t",
+            "opensquilla-tui-styled",
+            "-e",
+            "-N",
+            "-p",
+        ]
+        # In particular, `-a` (saved normal screen) and `-J` (joined wrapped
+        # rows) must never enter the exact-cell framebuffer command.
+        assert "-a" not in args
+        assert "-J" not in args
+        return subprocess.CompletedProcess(args, 0, stdout=raw)
+
+    monkeypatch.setattr(driver.subprocess, "run", fake_run)
+    session = TmuxTerminalSession(
+        command=["python", "-c", "print('ready')"],
+        cwd=tmp_path,
+        env={},
+        run_id="opensquilla-tui-styled",
+        size=TerminalSize(cols=4, rows=2),
+        terminal_log=tmp_path / "terminal.log",
+    )
+
+    framebuffer = session.capture_framebuffer("styled")
+
+    assert framebuffer.cols == 4
+    assert framebuffer.rows == 2
+    assert framebuffer.text == "    \n    "
 
 
 def test_wait_for_text_times_out_with_last_screen(

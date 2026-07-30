@@ -2,8 +2,9 @@
 """Build a platform-local OpenSquilla wheelhouse release zip.
 
 The output is intentionally not a source checkout and not a macOS DMG. It is a
-zip containing the OpenSquilla wheel, dependency wheels for the current
-platform/Python, install scripts, a manifest, and operator-facing README.
+zip containing the OpenSquilla wheel, its freshly built Web UI, dependency
+wheels for the current platform/Python, install scripts, a manifest, and an
+operator-facing README.
 """
 
 from __future__ import annotations
@@ -87,6 +88,7 @@ TEXT_RELEASE_SUFFIXES = {
     ".yaml",
     ".yml",
 }
+WEBUI_DIRECTORY = "opensquilla-webui"
 
 
 @dataclass(frozen=True)
@@ -126,6 +128,67 @@ def build_subprocess_env(work_dir: Path, *, repo_root: Path | None = None) -> di
     env["UV_CACHE_DIR"] = str(uv_cache)
     env["PIP_CACHE_DIR"] = str(pip_cache)
     return env
+
+
+def _parse_version_triplet(raw: str, *, label: str) -> tuple[int, int, int]:
+    value = raw.strip().removeprefix("v")
+    parts = value.split(".")
+    if len(parts) < 2:
+        raise SystemExit(f"Could not parse {label} version: {raw!r}")
+    try:
+        parsed = tuple(int(part) for part in parts[:3])
+    except ValueError as exc:
+        raise SystemExit(f"Could not parse {label} version: {raw!r}") from exc
+    if len(parsed) == 2:
+        return parsed + (0,)
+    return parsed
+
+
+def build_webui(repo_root: Path, env: dict[str, str]) -> None:
+    """Install locked frontend dependencies and build the release Web UI."""
+
+    webui_dir = repo_root / WEBUI_DIRECTORY
+    required_version_path = webui_dir / ".node-version"
+    if not required_version_path.is_file():
+        raise SystemExit(f"Required Node.js version file is missing: {required_version_path}")
+    required_version = _parse_version_triplet(
+        required_version_path.read_text(encoding="utf-8"), label="required Node.js"
+    )
+
+    search_path = env.get("PATH")
+    node = shutil.which("node", path=search_path)
+    npm = shutil.which("npm", path=search_path)
+    if node is None or npm is None:
+        minimum = ".".join(str(part) for part in required_version)
+        raise SystemExit(
+            f"Building the wheelhouse requires Node.js >= {minimum} and npm so the "
+            "Web UI can be packaged. Official wheels and Desktop installers do not "
+            "require Node.js."
+        )
+
+    try:
+        probe = subprocess.run(
+            [node, "--version"],
+            cwd=repo_root,
+            check=True,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(f"Could not query Node.js version (exit {exc.returncode}).") from exc
+    installed_version = _parse_version_triplet(probe.stdout, label="installed Node.js")
+    if installed_version < required_version:
+        required_text = ".".join(str(part) for part in required_version)
+        installed_text = ".".join(str(part) for part in installed_version)
+        raise SystemExit(
+            f"Building the wheelhouse requires Node.js >= {required_text}; "
+            f"found {installed_text}."
+        )
+
+    run([npm, "ci"], cwd=webui_dir, env=env)
+    run([npm, "run", "build"], cwd=webui_dir, env=env)
+    run([npm, "run", "verify:release-dist"], cwd=webui_dir, env=env)
 
 
 def copy_release_notices(release_root: Path, repo_root: Path | None = None) -> None:
@@ -1728,9 +1791,14 @@ def main(argv: list[str] | None = None) -> int:
     runtime_root: Path | None = None
     runtime_asset = ""
 
+    if args.bundle_python_runtime and sys.version_info[:2] != (3, 12):
+        raise SystemExit("Portable release builds currently require Python 3.12.")
+
+    # Fail on missing frontend build prerequisites before downloading or
+    # extracting an optional portable Python runtime.
+    build_webui(repo_root, env)
+
     if args.bundle_python_runtime:
-        if sys.version_info[:2] != (3, 12):
-            raise SystemExit("Portable release builds currently require Python 3.12.")
         if args.python_runtime_archive:
             runtime_archive = args.python_runtime_archive.resolve()
             runtime_asset = runtime_archive.name

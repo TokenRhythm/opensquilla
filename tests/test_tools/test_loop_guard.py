@@ -3,6 +3,8 @@ from __future__ import annotations
 import pytest
 
 from opensquilla.result_budget import (
+    DuplicateRetrievalInFlightError,
+    TerminalRetrievalReplayError,
     ToolRunBudgetExceededError,
     ToolRunBudgetPolicy,
     ToolRunBudgetTracker,
@@ -118,7 +120,7 @@ async def test_loop_guard_blocks_repeated_identical_web_search() -> None:
         ToolRunBudgetPolicy(max_repeated_retrievals_per_turn=2)
     )
 
-    await tracker.reserve_tool_call(
+    first = await tracker.reserve_tool_call(
         tool_name="web_search",
         arguments={
             "query": "  Python   Release  ",
@@ -126,10 +128,12 @@ async def test_loop_guard_blocks_repeated_identical_web_search() -> None:
             "mode": "auto",
         },
     )
-    await tracker.reserve_tool_call(
+    await tracker.commit_tool_result(first, '{"ok": true, "results": []}')
+    second = await tracker.reserve_tool_call(
         tool_name="web_search",
         arguments={"query": "python release", "provider": "tavily", "mode": "auto"},
     )
+    await tracker.commit_tool_result(second, '{"ok": true, "results": []}')
 
     with pytest.raises(ToolRunBudgetExceededError) as exc_info:
         await tracker.reserve_tool_call(
@@ -151,10 +155,11 @@ async def test_loop_guard_counts_web_search_repeated_queries_too() -> None:
         ToolRunBudgetPolicy(max_repeated_retrievals_per_turn=1)
     )
 
-    await tracker.reserve_tool_call(
+    first = await tracker.reserve_tool_call(
         tool_name="web_search",
         arguments={"query": "OpenSquilla"},
     )
+    await tracker.commit_tool_result(first, '{"ok": true, "results": []}')
 
     with pytest.raises(ToolRunBudgetExceededError):
         await tracker.reserve_tool_call(
@@ -169,10 +174,11 @@ async def test_loop_guard_counts_web_discover_repeated_queries_too() -> None:
         ToolRunBudgetPolicy(max_repeated_retrievals_per_turn=1)
     )
 
-    await tracker.reserve_tool_call(
+    first = await tracker.reserve_tool_call(
         tool_name="web_discover",
         arguments={"query": "OpenSquilla"},
     )
+    await tracker.commit_tool_result(first, '{"ok": true, "results": []}')
 
     with pytest.raises(ToolRunBudgetExceededError):
         await tracker.reserve_tool_call(
@@ -204,3 +210,159 @@ async def test_loop_guard_snapshot_exposes_counts() -> None:
             "count": 1,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_semantic_guard_blocks_duplicate_retrieval_while_first_is_in_flight() -> None:
+    tracker = ToolRunBudgetTracker()
+    first = await tracker.reserve_tool_call(
+        tool_name="web_search",
+        arguments={
+            "query": "  Python   Release ",
+            "mode": "news",
+            "recency": "week",
+            "include_domains": ["Example.COM", "docs.example.com"],
+            "provider": "tavily",
+            "max_results": 3,
+        },
+    )
+
+    with pytest.raises(DuplicateRetrievalInFlightError) as exc_info:
+        await tracker.reserve_tool_call(
+            tool_name="web_discover",
+            arguments={
+                "query": "python release",
+                "mode": "news",
+                "recency": "week",
+                "include_domains": ["docs.example.com", "example.com"],
+                "provider": "duckduckgo",
+                "max_results": 10,
+                "fetch_top_k": 0,
+            },
+        )
+
+    assert exc_info.value.tool_name == "web_discover"
+    await tracker.abort_tool_result(first)
+
+    replacement = await tracker.reserve_tool_call(
+        tool_name="web_discover",
+        arguments={
+            "query": "python release",
+            "mode": "news",
+            "recency": "week",
+            "include_domains": ["example.com", "docs.example.com"],
+        },
+    )
+    assert replacement.counted_as_search is True
+
+
+@pytest.mark.asyncio
+async def test_semantic_guard_replays_terminal_non_retryable_failure() -> None:
+    tracker = ToolRunBudgetTracker()
+    reservation = await tracker.reserve_tool_call(
+        tool_name="web_search",
+        arguments={
+            "query": "OpenSquilla release",
+            "mode": "auto",
+            "exclude_domains": ["EXAMPLE.com"],
+            "provider": "tavily",
+            "max_results": 3,
+        },
+    )
+    await tracker.commit_tool_result(
+        reservation,
+        '{"ok": false, "error_kind": "auth", "retry_allowed": false}',
+    )
+
+    with pytest.raises(TerminalRetrievalReplayError) as exc_info:
+        await tracker.reserve_tool_call(
+            tool_name="web_discover",
+            arguments={
+                "query": " opensquilla   RELEASE ",
+                "exclude_domains": ["example.com"],
+                "provider": "duckduckgo",
+                "max_results": 10,
+            },
+        )
+
+    assert exc_info.value.tool_name == "web_discover"
+    assert exc_info.value.error_kind == "auth"
+
+
+@pytest.mark.asyncio
+async def test_semantic_guard_does_not_ledger_success_or_retryable_failure() -> None:
+    tracker = ToolRunBudgetTracker(
+        ToolRunBudgetPolicy(max_repeated_retrievals_per_turn=None)
+    )
+    first = await tracker.reserve_tool_call(
+        tool_name="web_search",
+        arguments={"query": "OpenSquilla"},
+    )
+    await tracker.commit_tool_result(first, '{"ok": true, "results": []}')
+
+    second = await tracker.reserve_tool_call(
+        tool_name="web_search",
+        arguments={"query": "opensquilla", "provider": "duckduckgo"},
+    )
+    await tracker.commit_tool_result(
+        second,
+        '{"ok": false, "error_kind": "network", "retry_allowed": true}',
+    )
+
+    third = await tracker.reserve_tool_call(
+        tool_name="web_search",
+        arguments={"query": "opensquilla"},
+    )
+    assert third.counted_as_search is True
+
+
+@pytest.mark.asyncio
+async def test_semantic_guard_key_includes_mode_recency_and_domain_filters() -> None:
+    base = {
+        "query": "OpenSquilla",
+        "mode": "auto",
+        "recency": "week",
+        "include_domains": ["example.com"],
+        "exclude_domains": ["blocked.example"],
+    }
+
+    for changed in (
+        {**base, "query": "OpenSquilla docs"},
+        {**base, "mode": "technical"},
+        {**base, "recency": "month"},
+        {**base, "include_domains": ["docs.example.com"]},
+        {**base, "exclude_domains": ["other.example"]},
+    ):
+        tracker = ToolRunBudgetTracker()
+        terminal = await tracker.reserve_tool_call(tool_name="web_search", arguments=base)
+        await tracker.commit_tool_result(
+            terminal,
+            '{"ok": false, "error_kind": "blocked", "retry_allowed": false}',
+        )
+
+        allowed = await tracker.reserve_tool_call(
+            tool_name="web_search",
+            arguments=changed,
+        )
+        assert allowed.counted_as_search is True
+
+
+@pytest.mark.asyncio
+async def test_semantic_guard_isolated_between_trackers() -> None:
+    first_turn = ToolRunBudgetTracker()
+    reservation = await first_turn.reserve_tool_call(
+        tool_name="web_search",
+        arguments={"query": "OpenSquilla"},
+    )
+    await first_turn.commit_tool_result(
+        reservation,
+        '{"ok": false, "error_kind": "blocked", "retry_allowed": false}',
+    )
+
+    next_turn = ToolRunBudgetTracker()
+    allowed = await next_turn.reserve_tool_call(
+        tool_name="web_search",
+        arguments={"query": "OpenSquilla"},
+    )
+
+    assert allowed.counted_as_search is True

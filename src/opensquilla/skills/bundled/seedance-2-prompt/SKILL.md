@@ -1,6 +1,7 @@
 ---
 name: seedance-2-prompt
 description: "Render a single 3-15s video clip via Seedance 2.0. Supports two backends: OpenRouter (default, model bytedance/seedance-2.0) and the official Volcengine ARK / BytePlus ModelArk endpoint (model doubao-seedance-2-0-260128 / dreamina-seedance-2-0-260128). Accepts a structured English video prompt, optional first-frame image, and optional identity/style reference image. Trigger when the user asks for AI video clip generation, 分镜视频, seedance, or wants a short cinematic shot from a prompt + frame."
+description_zh: "通过Seedance 2.0渲染单个3-15秒视频片段。支持两种后端：OpenRouter（默认，模型 bytedance/seedance-2.0）和官方火山引擎ARK / BytePlus ModelArk端点（模型 doubao-seedance-2-0-260128 / dreamina-seedance-2-0-260128）。接受结构化英文视频提示词、可选首帧图像和可选身份/风格参考图。当用户需要AI视频片段生成、分镜视频、seedance，或想根据提示词+画面生成短电影镜头时触发。"
 provenance:
   origin: clawhub-mit0
   license: MIT-0

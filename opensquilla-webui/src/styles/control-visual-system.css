@@ -72,12 +72,14 @@
   grid-template-columns: repeat(var(--control-stat-columns, 4), minmax(0, 1fr));
 }
 
+/* Flat card, single frame. The tonal step from the field (#F5F6F7) to the card
+   (#FFFFFF) plus one hairline border is the whole separation — --elev-1 also
+   carries a 1px ring, so keeping both drew the card twice. */
 .control-stat {
   animation: control-fade-up var(--dur-enter) var(--ease-out) both;
   background: var(--bg-surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-card);
-  box-shadow: var(--elev-1);
   color: var(--text);
   display: flex;
   flex-direction: column;
@@ -87,7 +89,7 @@
   padding: var(--sp-4);
   position: relative;
   text-align: left;
-  transition: border-color var(--transition), box-shadow var(--transition), transform var(--dur-base) var(--ease-standard);
+  transition: border-color var(--transition), background var(--transition);
 }
 
 .control-stat--clickable {
@@ -649,6 +651,7 @@ summary.control-row--divider:focus-visible {
   gap: var(--sp-2);
   justify-content: flex-end;
   margin-top: var(--sp-4);
+  flex-wrap: wrap;
 }
 
 /* Grouped left-nav block (Settings rail) — quiet uppercase eyebrow over a row
@@ -891,57 +894,6 @@ summary.control-row--divider:focus-visible {
   color: var(--danger);
 }
 
-/* ── Sidebar: first-run onboarding empty-state ─────────────────────── */
-
-.sidebar-onboarding {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: var(--sp-2);
-  padding: var(--sp-4) var(--sp-3);
-  text-align: center;
-}
-
-.sidebar-onboarding__lead {
-  margin: 0;
-  font-size: var(--fs-xs);
-  color: var(--sidebar-text-soft);
-}
-
-.sidebar-onboarding__cta {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--sp-1);
-  padding: 6px 14px;
-  border: 1px solid color-mix(in srgb, var(--accent) 36%, var(--sidebar-border));
-  border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--accent) 14%, transparent);
-  color: var(--sidebar-text-strong);
-  font-size: var(--fs-sm);
-  font-weight: 600;
-  cursor: pointer;
-  transition: background var(--dur-fast), border-color var(--dur-fast);
-}
-.sidebar-onboarding__cta:hover {
-  background: color-mix(in srgb, var(--accent) 22%, transparent);
-}
-
-.sidebar-onboarding__links {
-  display: flex;
-  gap: var(--sp-3);
-}
-
-.sidebar-onboarding__link {
-  font-size: var(--fs-xs);
-  font-weight: 600;
-  color: var(--sidebar-text-soft);
-  text-decoration: none;
-  transition: color var(--dur-fast);
-}
-.sidebar-onboarding__link:hover {
-  color: var(--sidebar-text-strong);
-}
-
 /* Canonical toggle switch.
    A native <input type="checkbox"> styled as a switch: it keeps real form
    semantics (name, :checked), native keyboard support (Space), and stays a
@@ -998,5 +950,18 @@ summary.control-row--divider:focus-visible {
   .control-switch,
   .control-switch::before {
     transition: none;
+  }
+}
+
+/* Below ~560px the two-column control-row would crush the control; stack it
+   so channel-composer and edit fields stay usable on phones. */
+@media (max-width: 560px) {
+  .control-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .control-row__control {
+    justify-content: stretch;
+    width: 100%;
   }
 }

@@ -1,6 +1,7 @@
 ---
 name: video-still-animator
 description: "Turn a single still image (PNG/JPG) into a short MP4 with a slow Ken-Burns zoom and a silent audio track. Pure ffmpeg wrapper. Designed as the on_failure substitute for AI video-gen steps that get blocked by content moderation: when seedance refuses, this skill emits a valid replacement clip from the already-generated still so a downstream merge can still produce a complete deliverable."
+description_zh: "将单张静态图片（PNG/JPG）转为带缓慢Ken-Burns缩放和静音音轨的短MP4。纯ffmpeg封装。设计为AI视频生成步骤因内容审核受阻时的on_failure替代：当seedance拒绝时，本技能从已生成的静图产出有效的替代片段，使下游合并仍能产出完整交付物。"
 provenance:
   origin: opensquilla-original
   license: Apache-2.0

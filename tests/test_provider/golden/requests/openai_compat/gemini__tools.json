@@ -89,5 +89,5 @@
   },
   "content_type": "application/json",
   "method": "POST",
-  "url": "https://generativelanguage.googleapis.com/v1beta/openai/v1/chat/completions"
+  "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 }

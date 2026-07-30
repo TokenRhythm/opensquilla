@@ -80,6 +80,23 @@ async def test_effective_reflects_config_overrides(
     assert fields["llm.max_tokens"] == {"value": 2_048, "source": "config"}
 
 
+async def test_effective_reports_tokenrhythm_qwen_output_limit(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "state"))
+    config = GatewayConfig(
+        config_path=str(tmp_path / "opensquilla.toml"),
+        llm={"provider": "tokenrhythm", "model": "qwen3.7-max"},
+    )
+
+    result = await rpc_config._handle_config_effective(None, _ctx(config))
+
+    assert result["fields"]["llm.max_tokens"] == {
+        "value": 131_072,
+        "source": "catalog",
+    }
+
+
 async def test_effective_requires_config() -> None:
     with pytest.raises(ValueError, match="No config available"):
         await rpc_config._handle_config_effective(None, _ctx(None))

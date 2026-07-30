@@ -65,13 +65,30 @@ export function useChatSessionRoute(sessionKey: Ref<string>) {
     return routeStringParam(route.query.agent)
   }
 
+  function readProjectFromUrl(): string {
+    return routeStringParam(route.query.project)
+  }
+
   function draftAgentId(): string {
     return readAgentFromUrl() || 'main'
   }
 
-  function goToDraft(options: { agentId?: string; replace?: boolean } = {}) {
+  function goToDraft(options: {
+    agentId?: string
+    projectId?: string | null
+    replace?: boolean
+  } = {}) {
     const agent = options.agentId || readAgentFromUrl()
-    const target = { path: DRAFT_CHAT_PATH, query: agent ? { agent } : {} }
+    const project = options.projectId === undefined
+      ? readProjectFromUrl()
+      : options.projectId || ''
+    const target = {
+      path: DRAFT_CHAT_PATH,
+      query: {
+        ...(agent ? { agent } : {}),
+        ...(project ? { project } : {}),
+      },
+    }
     const navigation = options.replace ? router.replace(target) : router.push(target)
     navigation.catch(() => {})
   }
@@ -100,6 +117,7 @@ export function useChatSessionRoute(sessionKey: Ref<string>) {
     isDraftRoute,
     persistSession,
     readAgentFromUrl,
+    readProjectFromUrl,
     readSessionFromUrl,
     resolveInitialSession,
   }

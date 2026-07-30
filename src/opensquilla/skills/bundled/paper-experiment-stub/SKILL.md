@@ -1,6 +1,7 @@
 ---
 name: paper-experiment-stub
 description: "Demo-only stub experiment for meta-paper-write: generates a deterministic results.csv seeded by topic hash. Not real science."
+description_zh: "meta-paper-write的仅演示用桩实验：根据主题哈希生成确定性的results.csv。并非真实科研。"
 provenance:
   origin: opensquilla-original
   license: Apache-2.0

@@ -367,7 +367,10 @@ greetings like "hi". Always respond to direct user messages.
 {% if run_mode_label -%}
 - Run mode: {{ run_mode_label }}
 {% if run_mode == "trusted" -%}
-- Execution policy: default sandbox; explicit host-affecting actions can run on the host when policy allows.
+- Execution policy: default sandbox; the host filesystem is broadly readable, while writes stay limited to declared writable roots.
+- Host escalation: explicit host-affecting actions can run on the host when policy allows.
+- If a tool returns `elevation_required`, retry the exact action with `sandbox_permissions=require_escalated` and a precise justification only when the user's request warrants it. Do not elevate generic runtime or command failures.
+- Elevated actions are reviewed independently and authorized once for their exact arguments; a denial must be explained to the user before seeking a new explicit instruction.
 - Do not refuse a user-requested installation merely because the default path starts sandboxed; use available shell, package, or download tools and let the runtime enforce policy.
 {% elif run_mode == "full" -%}
 - Execution policy: host execution without sandbox isolation.

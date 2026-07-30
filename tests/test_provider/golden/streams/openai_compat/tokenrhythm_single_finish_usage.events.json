@@ -1,0 +1,36 @@
+[
+  {
+    "text": "Synthetic reasoning.",
+    "type": "ReasoningDeltaEvent"
+  },
+  {
+    "text": "OK",
+    "type": "TextDeltaEvent"
+  },
+  {
+    "billed_cost": 5e-06,
+    "billing_receipt": {
+      "amount_nanos": 34875,
+      "currency": "CNY",
+      "fx_native_per_usd_nanos": 6975000000,
+      "schema_version": 1,
+      "status": "confirmed",
+      "usd_equivalent_nanos": 5000
+    },
+    "cache_write_tokens": 0,
+    "cached_tokens": 5,
+    "cost_source": "provider_billed",
+    "ensemble_trace": null,
+    "input_tokens": 13,
+    "model": "deepseek-v4-flash",
+    "model_usage_breakdown": [],
+    "output_tokens": 17,
+    "provider": "openai",
+    "reasoning_content": "Synthetic reasoning.",
+    "reasoning_tokens": 8,
+    "stop_reason": "stop",
+    "thinking_signature": null,
+    "type": "DoneEvent",
+    "usage_missing_count": 0
+  }
+]

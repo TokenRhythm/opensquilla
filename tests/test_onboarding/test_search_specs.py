@@ -75,6 +75,7 @@ def test_search_catalog_explains_fallback_and_diagnostics_fields():
     fields = {field.name: field for field in spec.fields}
 
     assert "DuckDuckGo" in fields["fallback_policy"].description
+    assert "at most one additional" in fields["fallback_policy"].description
     assert "attempt/error details" in fields["diagnostics"].description
 
 

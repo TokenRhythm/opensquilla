@@ -41,6 +41,59 @@ async def test_scheduler_persistence_round_trips_tool_policy(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_open_migrates_legacy_jobs_without_deduplicating_existing_rows(tmp_path) -> None:
+    db_path = tmp_path / "legacy-scheduler.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE scheduler_jobs (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                cron_expr TEXT NOT NULL,
+                handler_key TEXT NOT NULL,
+                payload TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_run_at TEXT,
+                next_run_at TEXT,
+                run_count INTEGER NOT NULL DEFAULT 0,
+                error_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                max_retries INTEGER NOT NULL DEFAULT 3,
+                jitter_seconds REAL NOT NULL DEFAULT 0.0
+            )
+            """
+        )
+        for job_id in ("legacy-a", "legacy-b"):
+            conn.execute(
+                """
+                INSERT INTO scheduler_jobs
+                    (id, name, cron_expr, handler_key, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    "duplicate",
+                    "*/5 * * * *",
+                    "agent_run",
+                    "2026-01-01T00:00:00+00:00",
+                    "2026-01-01T00:00:00+00:00",
+                ),
+            )
+
+    store = JobStore(str(db_path))
+    await store.open()
+    try:
+        jobs = await store.list_active()
+    finally:
+        await store.close()
+
+    assert {job.id for job in jobs} == {"legacy-a", "legacy-b"}
+    assert {job.idempotency_key for job in jobs} == {""}
+
+
+@pytest.mark.asyncio
 async def test_due_checks_treat_offset_timestamps_as_absolute_time(tmp_path) -> None:
     store = JobStore(str(tmp_path / "scheduler.db"))
     await store.open()

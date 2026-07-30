@@ -34,14 +34,21 @@ def build_session_view_item(
     task_rows: list[Any],
     now_ms: int,
     transcript_title: str | None = None,
+    channel_types: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Return additive Web UI contract fields for one session row."""
+    """Return additive Web UI contract fields for one session row.
+
+    ``channel_types`` maps configured channel NAMES (lowercased) to their
+    platform type. Operators name channels freely ("飞书", "slack-eng"), so
+    surface classification by the type vocabulary alone would misfile every
+    custom-named channel's sessions as unknown.
+    """
 
     key = str(getattr(session, "session_key", "") or "")
     origin = getattr(session, "origin", None)
     origin_map = origin if isinstance(origin, dict) else {}
     effective_agent_id = _effective_agent_id(session, key)
-    surface = _surface(session, key, origin_map)
+    surface = _surface(session, key, origin_map, channel_types)
     session_kind = _session_kind(session, key, surface, origin_map)
     conversation_kind = _conversation_kind(session, key, session_kind)
     run_status = _run_status(task_rows)
@@ -90,11 +97,23 @@ def _effective_agent_id(session: Any, key: str) -> str:
     return stored
 
 
-def _surface(session: Any, key: str, origin: dict[str, Any]) -> str:
+def _surface(
+    session: Any,
+    key: str,
+    origin: dict[str, Any],
+    channel_types: dict[str, str] | None = None,
+) -> str:
     last_channel = _lower(getattr(session, "last_channel", None))
     channel = _lower(getattr(session, "channel", None))
     origin_kind = _lower(origin.get("kind"))
 
+    named = channel_types or {}
+    # The configured name→type map may carry plugin types outside the pinned
+    # surface enum; those must degrade to the fall-through checks (ending in
+    # "unknown") rather than widen the contract's closed union.
+    mapped = named.get(last_channel) or named.get(channel)
+    if mapped in _CHANNEL_SURFACES:
+        return mapped
     if last_channel in _CHANNEL_SURFACES:
         return last_channel
     if channel in _CHANNEL_SURFACES:

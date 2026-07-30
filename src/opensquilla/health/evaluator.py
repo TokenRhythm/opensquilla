@@ -91,6 +91,26 @@ def _channel_last_error(row: dict[str, Any]) -> dict[str, Any] | None:
     return last_error if isinstance(last_error, dict) else None
 
 
+def _channel_outbox_unknown(row: dict[str, Any]) -> dict[str, Any] | None:
+    """The outbox 'unknown' bucket for a channel row, if it has entries."""
+    diagnostics = row.get("diagnostics")
+    if not isinstance(diagnostics, dict):
+        return None
+    delivery = diagnostics.get("delivery")
+    if not isinstance(delivery, dict):
+        return None
+    outbox = delivery.get("outbox")
+    if not isinstance(outbox, dict):
+        return None
+    unknown = outbox.get("unknown")
+    if not isinstance(unknown, dict):
+        return None
+    count = unknown.get("count")
+    if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+        return None
+    return unknown
+
+
 def evaluate_provider(payload: dict[str, Any]) -> list[HealthFinding]:
     raw_rows = payload.get("providers")
     if not isinstance(raw_rows, list):
@@ -330,16 +350,60 @@ def evaluate_provider(payload: dict[str, Any]) -> list[HealthFinding]:
                 )
             )
         else:
-            findings.append(
-                HealthFinding(
-                    id="provider.active.ready",
-                    severity="ok",
-                    surface="provider",
-                    title="Active provider ready",
-                    detail=f"{provider_id} is configured and buildable.",
-                    evidence={"providerId": provider_id, "model": active_row.get("model")},
+            probe = active_row.get("modelProbe")
+            attempted = isinstance(probe, dict) and bool(probe.get("attempted"))
+            probe_status = str(probe.get("status") or "") if isinstance(probe, dict) else ""
+            if attempted and probe_status in {"error", "degraded"}:
+                failure_kind = str(probe.get("failureKind") or "unknown")
+                blocking = failure_kind in {"auth_invalid", "insufficient_credits"}
+                findings.append(
+                    HealthFinding(
+                        id=f"provider.active.probe.{failure_kind}",
+                        severity="error" if blocking else "warn",
+                        readiness_impact="blocks_ready" if blocking else "degrades",
+                        surface="provider",
+                        title="Active provider probe failed",
+                        detail=str(
+                            probe.get("error")
+                            or "The provider model-list probe did not succeed."
+                        ),
+                        evidence={
+                            "providerId": provider_id,
+                            "failureKind": failure_kind,
+                            "probeStatus": probe_status,
+                        },
+                        fix_steps=[
+                            FixStep(
+                                label="Inspect provider probe",
+                                command=(
+                                    "opensquilla providers status "
+                                    f"{provider_id} --probe-models"
+                                ),
+                            ),
+                            FixStep(
+                                label="Reconfigure provider",
+                                command=(
+                                    "opensquilla providers configure "
+                                    f"{provider_id} --api-key {_API_KEY_PLACEHOLDER}"
+                                ),
+                            ),
+                        ],
+                    )
                 )
-            )
+            else:
+                findings.append(
+                    HealthFinding(
+                        id="provider.active.ready",
+                        severity="ok",
+                        surface="provider",
+                        title="Active provider ready",
+                        detail=f"{provider_id} is configured and buildable.",
+                        evidence={
+                            "providerId": provider_id,
+                            "model": active_row.get("model"),
+                        },
+                    )
+                )
     return findings
 
 
@@ -1322,6 +1386,7 @@ def evaluate_channels(payload: dict[str, Any]) -> list[HealthFinding]:
                     ),
                     evidence={
                         "name": name,
+                        "channelName": name,
                         "status": status,
                         "type": row.get("type"),
                         "errorClass": "auth_invalid",
@@ -1352,7 +1417,12 @@ def evaluate_channels(payload: dict[str, Any]) -> list[HealthFinding]:
                     surface="channels",
                     title=f"Channel {name} is disabled",
                     detail="The channel is configured but disabled on disk.",
-                    evidence={"name": name, "status": status, "type": row.get("type")},
+                    evidence={
+                        "name": name,
+                        "channelName": name,
+                        "status": status,
+                        "type": row.get("type"),
+                    },
                     fix_steps=[
                         FixStep(
                             label="Enable channel",
@@ -1372,7 +1442,12 @@ def evaluate_channels(payload: dict[str, Any]) -> list[HealthFinding]:
                     surface="channels",
                     title=f"Channel {name} is {status}",
                     detail="The configured channel is not able to receive or send messages.",
-                    evidence={"name": name, "status": status, "type": row.get("type")},
+                    evidence={
+                        "name": name,
+                        "channelName": name,
+                        "status": status,
+                        "type": row.get("type"),
+                    },
                     fix_steps=[
                         FixStep(
                             label="Restart channel",
@@ -1393,7 +1468,12 @@ def evaluate_channels(payload: dict[str, Any]) -> list[HealthFinding]:
                     surface="channels",
                     title=f"Channel {name} is stopped",
                     detail="The channel is configured and enabled but is not connected.",
-                    evidence={"name": name, "status": status, "type": row.get("type")},
+                    evidence={
+                        "name": name,
+                        "channelName": name,
+                        "status": status,
+                        "type": row.get("type"),
+                    },
                     fix_steps=[
                         FixStep(
                             label="Inspect channels",
@@ -1414,7 +1494,12 @@ def evaluate_channels(payload: dict[str, Any]) -> list[HealthFinding]:
                     surface="channels",
                     title=f"Channel {name} is restarting",
                     detail="The channel is recovering after dispatch errors.",
-                    evidence={"name": name, "status": status, "type": row.get("type")},
+                    evidence={
+                        "name": name,
+                        "channelName": name,
+                        "status": status,
+                        "type": row.get("type"),
+                    },
                     fix_steps=[
                         FixStep(
                             label="Inspect channels",
@@ -1434,7 +1519,12 @@ def evaluate_channels(payload: dict[str, Any]) -> list[HealthFinding]:
                         f"The channel reported status {status}, which is not recognized "
                         "as a ready state."
                     ),
-                    evidence={"name": name, "status": status, "type": row.get("type")},
+                    evidence={
+                        "name": name,
+                        "channelName": name,
+                        "status": status,
+                        "type": row.get("type"),
+                    },
                     fix_steps=[
                         FixStep(
                             label="Inspect channels",
@@ -1443,6 +1533,91 @@ def evaluate_channels(payload: dict[str, Any]) -> list[HealthFinding]:
                         FixStep(
                             label="Restart channel",
                             command=f"opensquilla channels restart {name_arg} --yes",
+                        ),
+                    ],
+                )
+            )
+        # Action items ride alongside the status finding: a connected channel
+        # can still be silently gating senders or losing replies, and "ready"
+        # must not paper over either.
+        pending_pairings = row.get("pendingPairings")
+        if (
+            isinstance(pending_pairings, int)
+            and not isinstance(pending_pairings, bool)
+            and pending_pairings > 0
+        ):
+            findings.append(
+                HealthFinding(
+                    id=f"channel.{name}.pending_pairings",
+                    severity="warn",
+                    # Awaiting a human decision, not a malfunction: surface it
+                    # without downgrading overall readiness.
+                    readiness_impact="optional",
+                    surface="channels",
+                    title=f"Channel {name} has pairing requests awaiting approval",
+                    detail=(
+                        f"{pending_pairings} sender(s) asked to pair and were told to "
+                        "wait for operator approval. Until someone approves or revokes "
+                        "the requests, their messages get no replies."
+                    ),
+                    evidence={
+                        "name": name,
+                        "channelName": name,
+                        "pendingPairings": pending_pairings,
+                    },
+                    fix_steps=[
+                        FixStep(
+                            label="Review pending pairings",
+                            command=f"opensquilla channels pairings list {name_arg}",
+                            detail=(
+                                "Approve or revoke each request from this list or "
+                                "the control console Channels page."
+                            ),
+                        ),
+                        FixStep(
+                            label="Inspect channels",
+                            command=f"opensquilla channels status {name_arg} --json",
+                        ),
+                    ],
+                )
+            )
+        outbox_unknown = _channel_outbox_unknown(row)
+        if outbox_unknown is not None:
+            unknown_count = int(outbox_unknown["count"])
+            findings.append(
+                HealthFinding(
+                    id=f"channel.{name}.sends_unknown_outcome",
+                    severity="warn",
+                    # Unknown-outcome rows are terminal until a human resolves
+                    # them; letting them degrade readiness would flag the
+                    # channel forever after a single lost send.
+                    readiness_impact="optional",
+                    surface="channels",
+                    title=f"Channel {name} has sends with unknown outcome",
+                    detail=(
+                        f"{unknown_count} outbound send(s) raised mid-delivery, so "
+                        "whether they reached the recipient is unknown. These rows "
+                        "are kept for a human decision; nothing retries them "
+                        "automatically."
+                    ),
+                    evidence={
+                        "name": name,
+                        "channelName": name,
+                        "unknownSends": unknown_count,
+                        "oldestAt": outbox_unknown.get("oldest_at"),
+                    },
+                    fix_steps=[
+                        FixStep(
+                            label="Inspect channels",
+                            command=f"opensquilla channels status {name_arg} --json",
+                        ),
+                        FixStep(
+                            label="Confirm delivery with the recipient",
+                            detail=(
+                                "Check the conversation on the provider side; the "
+                                "outbox diagnostics carry an error class per "
+                                "affected send."
+                            ),
                         ),
                     ],
                 )
@@ -1768,58 +1943,5 @@ def evaluate_squilla_router_runtime(payload: dict[str, Any]) -> list[HealthFindi
             evidence=evidence,
             fix_steps=fix_steps,
             restart_required=True,
-        )
-    ]
-
-
-def evaluate_legacy_home(payload: dict[str, Any]) -> list[HealthFinding]:
-    """Advisory finding when importable legacy OpenSquilla data is detected.
-
-    Detection is a read-only path scan and safe under a running gateway; the
-    import itself needs a quiesced gateway, so the fix steps hand the operator
-    the exact CLI invocations instead of offering any in-gateway action. No
-    candidate detected → no findings, matching how the other advisory
-    surfaces (``evaluate_llm_ensemble``, ``evaluate_squilla_router_runtime``)
-    express absence: they stay silent when there is nothing to report.
-    """
-    if not bool(payload.get("detected")):
-        return []
-    path = str(payload.get("path") or "")
-    if not path:
-        return []
-    kind = str(payload.get("kind") or "cli-home")
-    target_fresh = bool(payload.get("targetFresh"))
-    # The collector supplies the ready-quoted command so this package never
-    # imports the migration machinery (health stays cycle-free in the package
-    # import graph); the inline form is a display-only fallback.
-    preview_command = str(
-        payload.get("command") or f"opensquilla migrate opensquilla --kind {kind} --source {path}"
-    )
-    if target_fresh:
-        detail = (
-            f"A legacy OpenSquilla home ({kind}) was found at {path}, and this "
-            "install holds no session data yet. Stop the gateway and run the "
-            "migrate command to import it; the preview is a dry run that "
-            "changes nothing."
-        )
-    else:
-        detail = (
-            f"A legacy OpenSquilla home ({kind}) was found at {path}. Stop the "
-            "gateway and run the migrate command to import it; the preview is "
-            "a dry run that changes nothing."
-        )
-    return [
-        HealthFinding(
-            id="migration.legacy_home_detected",
-            severity="warn",
-            surface="migration",
-            title=f"Legacy OpenSquilla data found at {path}",
-            detail=detail,
-            evidence={"path": path, "kind": kind, "target_fresh": target_fresh},
-            fix_steps=[
-                FixStep(label="Preview the import", command=preview_command),
-                FixStep(label="Apply the import", command=f"{preview_command} --apply"),
-            ],
-            restart_required=False,
         )
     ]

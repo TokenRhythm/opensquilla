@@ -115,6 +115,51 @@ async def test_load_history_skips_legacy_summary_marker_and_returns_dynamic_cont
 
 
 @pytest.mark.asyncio
+async def test_load_history_surfaces_cancelled_subagent_as_terminal_runtime_notice(
+    session_manager: SessionManager,
+) -> None:
+    key = "agent:main:parent"
+    await session_manager.create(key)
+    await session_manager.append_message(key, "assistant", "Waiting for the child.")
+    await session_manager.append_message(
+        key,
+        "system",
+        json.dumps(
+            {
+                "type": "subagent_completion",
+                "child_session_key": "agent:main:subagent:cancelled",
+                "status": "cancelled",
+                "terminal_reason": "user_abort",
+            }
+        ),
+        provenance={
+            "kind": "internal_system",
+            "source_tool": "subagent_completion",
+        },
+    )
+    await session_manager.append_message(key, "user", "continue")
+    await session_manager.append_message(key, "assistant", "The child is still running.")
+    await session_manager.append_message(key, "user", "continue again")
+
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=session_manager)
+    agent = Agent(provider=_CapturingProvider(), config=AgentConfig(system_prompt="stable base"))
+
+    await runner._load_history(agent, key)
+
+    assert [message.role for message in agent._history] == [
+        "assistant",
+        "user",
+        "assistant",
+        "assistant",
+    ]
+    notice = str(agent._history[-1].content)
+    assert "agent:main:subagent:cancelled" in notice
+    assert "cancelled" in notice
+    assert "no longer running" in notice
+    assert "sessions_yield" in notice
+
+
+@pytest.mark.asyncio
 async def test_load_history_prefers_valid_structured_context_state(
     session_manager: SessionManager,
 ) -> None:

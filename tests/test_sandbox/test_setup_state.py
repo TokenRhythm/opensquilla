@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -209,6 +211,59 @@ async def test_ensure_windows_setup_requires_admin_before_mutating(
     assert result.requires_admin is False
     assert helper_calls == [marker]
     assert calls == []
+
+
+async def test_ensure_windows_setup_keeps_event_loop_responsive_during_elevation(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from opensquilla.sandbox import setup_state
+
+    marker = tmp_path / "setup_marker.json"
+
+    monkeypatch.setattr(setup_state.sys, "platform", "win32")
+    monkeypatch.setattr(setup_state, "_windows_setup_marker_path", lambda: marker)
+    monkeypatch.setattr(setup_state, "_windows_process_is_admin", lambda: False)
+    monkeypatch.setattr(
+        setup_state,
+        "_probe_windows_sandbox_support",
+        lambda: setup_state.WindowsSetupSupport(
+            default_backend_available=False,
+            ctypes_available=True,
+            token_api_available=True,
+            acl_api_available=True,
+            setup_ready=False,
+            proxy_allowlist_enforced=False,
+        ),
+    )
+
+    def slow_elevated_helper(_marker_path) -> None:
+        time.sleep(0.25)
+
+    monkeypatch.setattr(
+        setup_state,
+        "_run_windows_setup_helper_elevated",
+        slow_elevated_helper,
+    )
+    monkeypatch.setattr(
+        setup_state,
+        "_windows_default_setup_result",
+        lambda: setup_state.SetupResult(
+            state=setup_state.SandboxSetupState.READY,
+            platform="win32",
+            message="Windows default sandbox is ready.",
+            requires_admin=False,
+        ),
+    )
+
+    started = time.perf_counter()
+    task = asyncio.create_task(setup_state.ensure_sandbox_setup(SimpleNamespace()))
+    await asyncio.sleep(0.02)
+    scheduler_delay = time.perf_counter() - started
+    result = await task
+
+    assert scheduler_delay < 0.15
+    assert result.state is setup_state.SandboxSetupState.READY
 
 
 async def test_ensure_windows_setup_reports_elevated_helper_failure(

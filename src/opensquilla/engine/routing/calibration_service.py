@@ -135,18 +135,18 @@ class RouterCalibrationService:
         self._task = None
         if task is None:
             return
-        task.cancel()
         try:
+            # ``asyncio.to_thread`` cancellation cannot stop the worker. Let
+            # the current calibration finish before callers close its writer,
+            # then the stop event prevents another interval from starting.
             await task
-        except asyncio.CancelledError:
-            pass
         except Exception as exc:  # noqa: BLE001 - shutdown must not raise
             log.warning("router_calibration.stop_failed", error=str(exc))
 
     async def _loop(self) -> None:
         while not self._stop_event.is_set():
             try:
-                self.run_once()
+                await asyncio.to_thread(self.run_once)
             except Exception as exc:  # noqa: BLE001 - a tick must never kill the loop
                 log.warning("router_calibration.tick_failed", error=str(exc))
             try:

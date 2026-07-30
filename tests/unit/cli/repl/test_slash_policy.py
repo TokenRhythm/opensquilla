@@ -1,4 +1,4 @@
-"""Slash-command classification table.
+"""Registry-backed slash-command scheduling contract.
 
 The concurrent REPL spawns each user input as a child turn task while the
 input task keeps accepting keystrokes. When new input arrives mid-turn,
@@ -8,8 +8,9 @@ the policy split routes the command by category:
   pending queue, cancel the active turn, then run synchronously.
 * ``EXIT`` (``/exit`` / ``/quit``) — drain the pending queue then exit
   the loop (mirroring Ctrl-D semantics).
-* ``PURE_INFO`` / ``STATE_MUTATION`` — both enqueue identically.
-* ``NON_SLASH`` — runs as a normal turn.
+* ``COMMAND`` / ``CONTROL`` — execute immediately without prompt echo.
+* ``REQUIRE_IDLE`` — execute only while no turn is active.
+* ``TURN`` / ``NON_SLASH`` — retain normal turn and queue behaviour.
 
 These tests pin the classification surface so the runtime split in
 ``chat_cmd._run_concurrent_repl`` can rely on it.
@@ -120,49 +121,40 @@ def test_exit_set_matches_plan_lock() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Enqueue set (pure-info and state-mutation — both enqueue identically)       #
+# Canonical command-plane and turn classifications                            #
 # --------------------------------------------------------------------------- #
 
 
 @pytest.mark.parametrize(
-    "command",
+    ("command", "expected"),
     [
-        "/help",
-        "/version",
-        "/cost",
-        "/usage",
-        "/save",
-        "/approvals",
-        "/permissions",
-        "/forget",
-        "/sessions",
-        "/resume some-id",
-        "/delete other-id",
-        "/file /tmp/path.txt",
-        "/new",
-        "/model gpt-5",
-        "/image /tmp/pic.png",
-        "/path /tmp/file.md",
-        "/models",
-        "/status",
-        "/session",
+        ("/help", SlashCategory.COMMAND),
+        ("/version", SlashCategory.COMMAND),
+        ("/cost", SlashCategory.COMMAND),
+        ("/usage", SlashCategory.COMMAND),
+        ("/save", SlashCategory.COMMAND),
+        ("/forget", SlashCategory.COMMAND),
+        ("/sessions", SlashCategory.COMMAND),
+        ("/models", SlashCategory.COMMAND),
+        ("/status", SlashCategory.COMMAND),
+        ("/session", SlashCategory.COMMAND),
+        ("/approvals", SlashCategory.CONTROL),
+        ("/permissions", SlashCategory.CONTROL),
+        ("/model gpt-5", SlashCategory.CONTROL),
+        ("/new", SlashCategory.REQUIRE_IDLE),
+        ("/resume some-id", SlashCategory.REQUIRE_IDLE),
+        ("/delete other-id", SlashCategory.REQUIRE_IDLE),
+        ("/file /tmp/path.txt", SlashCategory.TURN),
+        ("/image /tmp/pic.png", SlashCategory.TURN),
+        ("/path /tmp/file.md", SlashCategory.TURN),
+        ("/meta", SlashCategory.TURN),
     ],
 )
-def test_classify_pure_info_or_state_mutation(command: str) -> None:
-    """Pure-info and state-mutation commands both enqueue.
-
-    The two enqueue subcategories share the same runtime behavior (append
-    to pending FIFO, run after current turn finishes). The classifier
-    reports the more specific category so callers that want telemetry
-    differentiation can subset, but the dispatch loop never branches on
-    this distinction.
-    """
-    category = classify(command)
-    assert category in {SlashCategory.PURE_INFO, SlashCategory.STATE_MUTATION}
-    # Sanity: must NOT be destructive / exit / non-slash for this set.
-    assert category is not SlashCategory.DESTRUCTIVE
-    assert category is not SlashCategory.EXIT
-    assert category is not SlashCategory.NON_SLASH
+def test_classify_projects_registry_metadata(
+    command: str,
+    expected: SlashCategory,
+) -> None:
+    assert classify(command) is expected
 
 
 # --------------------------------------------------------------------------- #
@@ -235,23 +227,9 @@ def test_classify_destructive_and_exit_are_case_sensitive() -> None:
     assert classify("/Help") in {SlashCategory.PURE_INFO, SlashCategory.STATE_MUTATION}
 
 
-def test_classify_unknown_slash_is_enqueue() -> None:
-    """Unknown slash words fall through to an enqueue category.
-
-    The destructive set is explicitly closed (``/clear``,
-    ``/reset``, ``/compact`` only); anything else starting with ``/`` and
-    not in the exit set MUST NOT cancel the active turn. The chosen
-    behavior is to route through the enqueue path so the existing slash-
-    handler chain surfaces the canonical
-    ``"Unknown command. Use /help."`` notice without disturbing the
-    in-flight turn. This locks the safe default.
-    """
-    category = classify("/foobar")
-    assert category is not SlashCategory.DESTRUCTIVE
-    assert category is not SlashCategory.EXIT
-    assert category is not SlashCategory.NON_SLASH
-    # Documented choice: route through the enqueue path.
-    assert category in {SlashCategory.PURE_INFO, SlashCategory.STATE_MUTATION}
+def test_classify_unknown_slash_is_immediate_command() -> None:
+    """Unknown slash input reports its error without echoing or queueing."""
+    assert classify("/foobar") is SlashCategory.COMMAND
 
 
 # --------------------------------------------------------------------------- #

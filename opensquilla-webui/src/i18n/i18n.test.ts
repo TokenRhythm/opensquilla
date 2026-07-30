@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest'
 import { setActivePinia, createPinia } from 'pinia'
+import { nextTick } from 'vue'
 import en from '@/locales/en.json'
 import zhHans from '@/locales/zh-Hans.json'
 import de from '@/locales/de.json'
@@ -13,6 +14,8 @@ import i18n, {
   isSupportedLocale,
 } from '@/i18n'
 import { useAppStore } from '@/stores/app'
+import { useRpcStore } from '@/stores/rpc'
+import { useToasts } from '@/composables/useToasts'
 
 function flatten(obj: Record<string, unknown>, prefix = '', out: Record<string, unknown> = {}) {
   for (const [k, v] of Object.entries(obj)) {
@@ -110,8 +113,13 @@ describe('appStore locale state', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
     localStorage.clear()
+    useToasts().toasts.value = []
     i18n.global.locale.value = 'en'
     document.documentElement.removeAttribute('lang')
+  })
+
+  afterEach(() => {
+    ;(window as unknown as { opensquillaDesktop?: unknown }).opensquillaDesktop = undefined
   })
 
   it('setLocale loads the chunk, persists, and applies all side effects', async () => {
@@ -126,6 +134,86 @@ describe('appStore locale state', () => {
     expect(i18n.global.t('nav.sessions')).toBe('会话')
   })
 
+  it('syncs an explicit language selection to the Gateway channel-notice locale', async () => {
+    const rpc = useRpcStore()
+    rpc.state = 'connected'
+    rpc.methods = ['config.patch.safe']
+    const call = vi.spyOn(rpc, 'call').mockResolvedValue({})
+    const store = useAppStore()
+
+    await store.setLocale('zh-Hans')
+
+    expect(call).toHaveBeenCalledWith('config.patch.safe', {
+      patches: { 'control_ui.default_locale': 'zh-Hans' },
+    })
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+    expect(localStorage.getItem('opensquilla-locale-sync-pending')).toBeNull()
+  })
+
+  it('keeps a disconnected explicit selection and syncs it after reconnect', async () => {
+    const rpc = useRpcStore()
+    rpc.state = 'disconnected'
+    rpc.methods = ['config.patch.safe']
+    const call = vi.spyOn(rpc, 'call').mockResolvedValue({})
+    const store = useAppStore()
+
+    await store.setLocale('zh-Hans')
+
+    expect(call).not.toHaveBeenCalled()
+    expect(store.pendingChannelNoticeLocale).toBe('zh-Hans')
+    expect(localStorage.getItem('opensquilla-locale-sync-pending')).toBe('zh-Hans')
+    const toasts = useToasts().toasts.value
+    expect(toasts[toasts.length - 1]).toMatchObject({ tone: 'warn' })
+
+    rpc.state = 'connected'
+    await nextTick()
+    await vi.waitFor(() => expect(call).toHaveBeenCalledTimes(1))
+
+    expect(call).toHaveBeenCalledWith('config.patch.safe', {
+      patches: { 'control_ui.default_locale': 'zh-Hans' },
+    })
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+  })
+
+  it('retries a pending locale sync after the connected handshake publishes methods', async () => {
+    const rpc = useRpcStore()
+    rpc.state = 'disconnected'
+    const call = vi.spyOn(rpc, 'call').mockResolvedValue({})
+    const store = useAppStore()
+
+    await store.setLocale('zh-Hans')
+    rpc.state = 'connected'
+    await nextTick()
+    expect(call).not.toHaveBeenCalled()
+
+    rpc.methods = ['config.patch.safe']
+    await vi.waitFor(() => expect(call).toHaveBeenCalledTimes(1))
+    expect(call).toHaveBeenCalledWith('config.patch.safe', {
+      patches: { 'control_ui.default_locale': 'zh-Hans' },
+    })
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+  })
+
+  it('retains a failed locale sync without rolling back the local interface', async () => {
+    const rpc = useRpcStore()
+    rpc.state = 'connected'
+    rpc.methods = ['config.patch.safe']
+    const call = vi.spyOn(rpc, 'call').mockRejectedValue(new Error('disk full'))
+    const store = useAppStore()
+
+    await store.setLocale('zh-Hans')
+
+    expect(store.locale).toBe('zh-Hans')
+    expect(store.pendingChannelNoticeLocale).toBe('zh-Hans')
+    const toasts = useToasts().toasts.value
+    expect(toasts[toasts.length - 1]).toMatchObject({ tone: 'warn' })
+
+    call.mockResolvedValueOnce({})
+    await store.syncLocaleToGateway()
+
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+  })
+
   it('setLocale ignores unsupported codes (no throw, stays en)', async () => {
     const store = useAppStore()
     await store.setLocale('ko' as never)
@@ -138,6 +226,41 @@ describe('appStore locale state', () => {
     await store.initLocale()
     expect(store.locale).toBe('zh-Hans')
     expect(document.documentElement.getAttribute('lang')).toBe('zh-Hans')
+  })
+
+  it('initLocale never writes the Gateway locale from browser-local state', async () => {
+    const rpc = useRpcStore()
+    rpc.state = 'connected'
+    rpc.methods = ['config.patch.safe']
+    const call = vi.spyOn(rpc, 'call').mockResolvedValue({})
+    localStorage.setItem('opensquilla-locale', 'zh-Hans')
+    const store = useAppStore()
+
+    await store.initLocale()
+
+    expect(store.locale).toBe('zh-Hans')
+    expect(call).not.toHaveBeenCalled()
+  })
+
+  it('syncs the Desktop client locale to the Gateway on startup', async () => {
+    const rpc = useRpcStore()
+    rpc.state = 'connected'
+    rpc.methods = ['config.patch.safe']
+    const call = vi.spyOn(rpc, 'call').mockResolvedValue({})
+    ;(window as unknown as { opensquillaDesktop?: unknown }).opensquillaDesktop = {
+      getOsLocale: async () => 'zh-CN',
+    }
+    const store = useAppStore()
+
+    await store.initLocale()
+
+    expect(store.locale).toBe('zh-Hans')
+    await vi.waitFor(() => {
+      expect(call).toHaveBeenCalledWith('config.patch.safe', {
+        patches: { 'control_ui.default_locale': 'zh-Hans' },
+      })
+    })
+    expect(store.pendingChannelNoticeLocale).toBeNull()
   })
 })
 
@@ -186,41 +309,77 @@ describe('catalog parity', () => {
     })
   })
 
+  it('describes model strategies by user outcome instead of product rank', () => {
+    expect({
+      en: [
+        en.setup.modelStrategy.cards.router.badge,
+        en.setup.modelStrategy.cards.single.badge,
+        en.setup.modelStrategy.cards.ensemble.badge,
+      ],
+      zhHans: [
+        zhHans.setup.modelStrategy.cards.router.badge,
+        zhHans.setup.modelStrategy.cards.single.badge,
+        zhHans.setup.modelStrategy.cards.ensemble.badge,
+      ],
+      ja: [
+        ja.setup.modelStrategy.cards.router.badge,
+        ja.setup.modelStrategy.cards.single.badge,
+        ja.setup.modelStrategy.cards.ensemble.badge,
+      ],
+      fr: [
+        fr.setup.modelStrategy.cards.router.badge,
+        fr.setup.modelStrategy.cards.single.badge,
+        fr.setup.modelStrategy.cards.ensemble.badge,
+      ],
+      de: [
+        de.setup.modelStrategy.cards.router.badge,
+        de.setup.modelStrategy.cards.single.badge,
+        de.setup.modelStrategy.cards.ensemble.badge,
+      ],
+      es: [
+        es.setup.modelStrategy.cards.router.badge,
+        es.setup.modelStrategy.cards.single.badge,
+        es.setup.modelStrategy.cards.ensemble.badge,
+      ],
+    }).toEqual({
+      en: ['Token-efficient', 'Predictable', 'Capability-first'],
+      zhHans: ['按需省 Token', '稳定可控', '能力优先'],
+      ja: ['トークン効率重視', '安定・予測可能', '能力重視'],
+      fr: ['Économe en tokens', 'Prévisible', 'Capacités prioritaires'],
+      de: ['Token-effizient', 'Vorhersehbar', 'Leistung im Fokus'],
+      es: ['Uso eficiente de tokens', 'Predecible', 'Prioriza capacidad'],
+    })
+  })
+
   it('ships localized TokenRhythm recommendation copy with exact English and zh-Hans wording', () => {
     expect(en.setup.provider.recommendation).toEqual({
       title: 'Recommended: TokenRhythm',
       value: 'TokenRhythm API calls are free for a limited time.',
-      registration: 'During the promotion, register and get an API key to call DeepSeek, GLM, MiniMax, Kimi, and other leading models for free.',
       cta: 'Register and get an API key',
       externalLabel: 'Register and get an API key — TokenRhythm (opens in a new tab)',
       stepsLabel: 'How to connect TokenRhythm',
       stepRegister: 'Create a TokenRhythm account',
       stepCopy: 'Copy your API key',
       stepPaste: 'Paste it into the API key field below',
-      stepSelectAndPaste: 'Select TokenRhythm above, then paste your API key',
+      stepSelectAndPaste: 'Choose Add provider, select TokenRhythm, then paste your API key',
       stepReplaceAndPaste: 'Choose Replace key below, then paste your API key',
     })
     expect(zhHans.setup.provider.recommendation).toEqual({
       title: '推荐使用 TokenRhythm',
       value: 'TokenRhythm API 调用限时免费。',
-      registration: '活动期间，注册并获取 API Key，即可免费调用 DeepSeek、GLM、MiniMax、Kimi 等主流模型。',
       cta: '注册并获取 API Key',
       externalLabel: '注册并获取 API Key — TokenRhythm（在新标签页中打开）',
       stepsLabel: '如何接入 TokenRhythm',
       stepRegister: '注册 TokenRhythm 账户',
       stepCopy: '复制你的 API Key',
       stepPaste: '粘贴到下方 API key 输入框',
-      stepSelectAndPaste: '先在上方选择 TokenRhythm，再粘贴 API Key',
+      stepSelectAndPaste: '点击“添加服务商”，选择 TokenRhythm，然后粘贴 API Key',
       stepReplaceAndPaste: '先点击下方「更换密钥」，再粘贴 API Key',
     })
 
     for (const messages of [en, zhHans, ja, fr, de, es]) {
       const copy = messages.setup.provider.recommendation
       expect(copy.title).toContain('TokenRhythm')
-      expect(copy.registration).toContain('DeepSeek')
-      expect(copy.registration).toContain('GLM')
-      expect(copy.registration).toContain('MiniMax')
-      expect(copy.registration).toContain('Kimi')
       expect(copy.cta).toBeTruthy()
       expect(copy.externalLabel).toBeTruthy()
       expect(copy.externalLabel).toContain(copy.cta)

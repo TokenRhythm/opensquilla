@@ -3,11 +3,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createWebPlatform } from './web'
 import { createDesktopPlatform } from './desktop'
 
-// The update banner suppresses itself only when the host applies updates
-// NATIVELY. These tests pin that decision per platform so the transitional
-// behaviour (browser + unsigned Windows keep the notice; macOS hides it) — and
-// its forward path (Windows hides it automatically once native update turns on)
-// — can't silently regress.
+// Native installation and shell-owned update presentation are separate
+// capabilities: unsigned Windows uses a managed manual-installer flow, while an
+// older Windows shell still falls back to the passive gateway banner.
 
 function setDesktopApi(api: unknown): void {
   ;(window as unknown as { opensquillaDesktop?: unknown }).opensquillaDesktop = api
@@ -47,6 +45,35 @@ describe('nativeAutoUpdateEnabled', () => {
   })
 })
 
+describe('desktopUpdateManaged', () => {
+  it('is false on web', async () => {
+    expect(await createWebPlatform().desktopUpdateManaged()).toBe(false)
+  })
+
+  it('is true for a managed unsigned Windows shell without native installation', async () => {
+    setDesktopApi({
+      isAutoUpdateEnabled: async () => false,
+      isDesktopUpdateManaged: async () => true,
+    })
+    expect(await createDesktopPlatform().desktopUpdateManaged()).toBe(true)
+  })
+
+  it('uses native capability for an older shell without the managed bridge', async () => {
+    setDesktopApi({ isAutoUpdateEnabled: async () => false })
+    expect(await createDesktopPlatform().desktopUpdateManaged()).toBe(false)
+  })
+
+  it('fails closed when an exposed managed bridge throws', async () => {
+    setDesktopApi({
+      isAutoUpdateEnabled: async () => false,
+      isDesktopUpdateManaged: async () => {
+        throw new Error('ipc boom')
+      },
+    })
+    expect(await createDesktopPlatform().desktopUpdateManaged()).toBe(true)
+  })
+})
+
 describe('desktop update platform bridge', () => {
   it('web exposes an inert update API with a non-native idle state', async () => {
     const state = await createWebPlatform().updates.getState()
@@ -55,7 +82,9 @@ describe('desktop update platform bridge', () => {
       status: 'idle',
       currentVersion: '',
       latestVersion: null,
+      canCheck: false,
       canNativeInstall: false,
+      installMode: 'unsupported',
     })
   })
 
@@ -67,6 +96,7 @@ describe('desktop update platform bridge', () => {
     const dismissUpdate = vi.fn(async () => ({ status: 'available', snoozedUntil: '2026-07-04T00:00:00.000Z' }))
     setDesktopApi({
       isAutoUpdateEnabled: async () => true,
+      isDesktopUpdateManaged: async () => true,
       getUpdateState: async () => ({
         status: 'available',
         currentVersion: '1.0.0',
@@ -74,9 +104,14 @@ describe('desktop update platform bridge', () => {
         progress: null,
         checkedAt: null,
         error: null,
+        errorCode: null,
         snoozedUntil: null,
+        canCheck: true,
         canNativeInstall: true,
+        installMode: 'native',
         releaseUrl: null,
+        source: 'github',
+        fallbackUsed: false,
       }),
       checkForUpdates,
       downloadUpdate,
@@ -96,5 +131,87 @@ describe('desktop update platform bridge', () => {
     expect(relaunchToUpdate).toHaveBeenCalledTimes(1)
     expect(dismissUpdate).toHaveBeenCalledTimes(1)
     expect(updates.onState(() => undefined)).toBe(unsubscribe)
+  })
+
+  it('normalizes a managed Windows state without claiming native installation', async () => {
+    setDesktopApi({
+      isAutoUpdateEnabled: async () => false,
+      isDesktopUpdateManaged: async () => true,
+      getUpdateState: async () => ({
+        status: 'available',
+        currentVersion: '1.0.0',
+        latestVersion: '2.0.0',
+        canCheck: true,
+        canNativeInstall: false,
+        installMode: 'manual',
+        errorCode: null,
+        source: 'oss',
+        fallbackUsed: true,
+      }),
+    })
+
+    expect(await createDesktopPlatform().updates.getState()).toMatchObject({
+      status: 'available',
+      canCheck: true,
+      canNativeInstall: false,
+      installMode: 'manual',
+      source: 'oss',
+      fallbackUsed: true,
+    })
+  })
+
+  it('preserves structured checksum and integrity failures from the shell', async () => {
+    setDesktopApi({
+      isAutoUpdateEnabled: async () => false,
+      isDesktopUpdateManaged: async () => true,
+      getUpdateState: async () => ({
+        status: 'error',
+        currentVersion: '1.0.0',
+        canCheck: true,
+        canNativeInstall: false,
+        installMode: 'manual',
+        errorCode: 'checksum_unavailable',
+      }),
+    })
+
+    expect(await createDesktopPlatform().updates.getState()).toMatchObject({
+      status: 'error',
+      errorCode: 'checksum_unavailable',
+      installMode: 'manual',
+    })
+  })
+
+  it('derives the legacy state contract from an older shell capability', async () => {
+    setDesktopApi({
+      isAutoUpdateEnabled: async () => true,
+      getUpdateState: async () => ({
+        status: 'available',
+        currentVersion: '1.0.0',
+        latestVersion: '2.0.0',
+      }),
+    })
+
+    expect(await createDesktopPlatform().updates.getState()).toMatchObject({
+      status: 'available',
+      canCheck: true,
+      canNativeInstall: true,
+      installMode: 'native',
+      errorCode: null,
+      source: null,
+      fallbackUsed: false,
+    })
+  })
+
+  it('keeps an older non-native Windows shell on the passive update path', async () => {
+    setDesktopApi({
+      isAutoUpdateEnabled: async () => false,
+      getUpdateState: async () => ({ status: 'idle', currentVersion: '1.0.0' }),
+    })
+
+    expect(await createDesktopPlatform().updates.getState()).toMatchObject({
+      canCheck: false,
+      canNativeInstall: false,
+      installMode: 'unsupported',
+    })
   })
 })

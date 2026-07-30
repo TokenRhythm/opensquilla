@@ -41,12 +41,22 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         action="store",
         default=".artifacts/tui-real-terminal/runs",
     )
+    parser.addoption(
+        "--tui-require-capabilities",
+        action="store_true",
+        default=False,
+        help="fail instead of skipping when a requested real-terminal capability is missing",
+    )
 
 
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
         "tui_real_terminal: real terminal TUI integration tests driven through tmux or PTY",
+    )
+    config.addinivalue_line(
+        "markers",
+        "tui_gateway_e2e: installed TUI companion with a real deterministic Gateway",
     )
 
 
@@ -70,19 +80,25 @@ def run_real_terminal_scenario(
     artifact_root: Path,
     tui_backend: str,
     tui_driver: DriverSelection,
+    pytestconfig: pytest.Config,
 ) -> Callable[[TuiScenario], ScenarioResult]:
+    require_capabilities = bool(pytestconfig.getoption("--tui-require-capabilities"))
+
+    def capability_miss(reason: str) -> None:
+        if require_capabilities:
+            pytest.fail(f"required real-terminal capability is unavailable: {reason}")
+        pytest.skip(reason)
+
     def _run(scenario: TuiScenario) -> ScenarioResult:
         if tui_backend == "live-opentui":
             if scenario.family != "live_prompt":
                 pytest.skip("live-opentui backend only runs live_prompt scenarios")
             if os.environ.get("OPENSQUILLA_TUI_LIVE_REAL") != "1":
-                pytest.skip(
-                    "set OPENSQUILLA_TUI_LIVE_REAL=1 to run the real CLI/OpenTUI smoke"
-                )
+                pytest.skip("set OPENSQUILLA_TUI_LIVE_REAL=1 to run the real CLI/OpenTUI smoke")
 
         capabilities = probe_terminal_capabilities()
         if capabilities.preferred_driver == "none":
-            pytest.skip(capabilities.skip_reason or "real-terminal capabilities unavailable")
+            capability_miss(capabilities.skip_reason or "real-terminal capabilities unavailable")
 
         evidence = EvidenceBundle.create(
             artifact_root,
@@ -99,14 +115,12 @@ def run_real_terminal_scenario(
             ),
         )
         if not target.available:
-            pytest.skip(target.skip_reason or f"TUI backend {tui_backend!r} unavailable")
+            capability_miss(target.skip_reason or f"TUI backend {tui_backend!r} unavailable")
         if (
             target.backend_id == "live-opentui"
             and os.environ.get("OPENSQUILLA_TUI_LIVE_REAL") != "1"
         ):
-            pytest.skip(
-                "set OPENSQUILLA_TUI_LIVE_REAL=1 to run the real CLI/OpenTUI smoke"
-            )
+            pytest.skip("set OPENSQUILLA_TUI_LIVE_REAL=1 to run the real CLI/OpenTUI smoke")
         if (
             scenario.required_backend_id is not None
             and target.backend_id != scenario.required_backend_id
@@ -115,12 +129,18 @@ def run_real_terminal_scenario(
                 f"scenario {scenario.scenario_id!r} requires "
                 f"--tui-backend={scenario.required_backend_id}"
             )
+        if target.backend_id in {"opentui", "live-opentui"}:
+            from opensquilla.cli.tui.opentui.bridge import check_opentui_host_available
+
+            availability = check_opentui_host_available()
+            if not availability.available:
+                pytest.skip(availability.reason or "OpenTUI host unavailable")
         scenario_driver = tui_driver
         if scenario.requires_tmux:
             if not capabilities.tmux_available:
-                pytest.skip(f"scenario {scenario.scenario_id!r} requires tmux")
+                capability_miss(f"scenario {scenario.scenario_id!r} requires tmux")
             if tui_driver == "pty":
-                pytest.skip(f"scenario {scenario.scenario_id!r} requires tmux")
+                capability_miss(f"scenario {scenario.scenario_id!r} requires tmux, not PTY")
             scenario_driver = "tmux"
 
         session = open_real_terminal_session(

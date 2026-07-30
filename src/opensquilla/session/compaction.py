@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import json
 from dataclasses import dataclass, field
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import httpx
 import structlog
@@ -14,10 +15,16 @@ import structlog
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.provider.app_attribution import provider_app_headers
 from opensquilla.provider.protocol import provider_connection_config
+from opensquilla.provider.tokenrhythm_correlation import (
+    tokenrhythm_correlation_headers,
+)
 from opensquilla.session.compaction_state import (
     build_structured_summary_from_text,
     extract_compaction_obligations,
 )
+
+if TYPE_CHECKING:
+    from opensquilla.provider.types import ProviderRequestCorrelation
 
 log = structlog.get_logger(__name__)
 
@@ -38,6 +45,7 @@ class CompactionConfig:
     api_key: str = ""
     base_url: str = "https://openrouter.ai/api/v1"
     timeout_seconds: float = 90.0
+    provider: str = ""
     coverage_blocking: bool = False
     compaction_profile: CompactionProfile = "conversation"
     protected_recent_messages: int = 0
@@ -57,6 +65,10 @@ class CompactionRequest:
     forced_prefix_cut: int | None = None
     trigger: CompactionTrigger = "token_budget"
     reason: str | None = None
+    provider_request_correlation: ProviderRequestCorrelation | None = field(
+        default=None,
+        repr=False,
+    )
 
 
 @dataclass
@@ -124,6 +136,7 @@ def build_compaction_config_from_provider(
 
     cfg.api_key = api_key
     cfg.model = configured_model or model_override or model or default_model
+    cfg.provider = connection_config.provider_kind
     if base_url:
         cfg.base_url = base_url
     return cfg
@@ -163,12 +176,36 @@ async def call_compact_with_optional_config(
     session_key: str,
     context_window_tokens: int,
     config: CompactionConfig | None,
+    *,
+    provider_request_correlation: ProviderRequestCorrelation | None = None,
 ) -> str:
     """Call compact with config only when the target supports the argument."""
 
+    kwargs: dict[str, Any] = {}
+    try:
+        parameters = tuple(inspect.signature(compact_fn).parameters.values())
+    except (TypeError, ValueError):
+        parameters = ()
+    if provider_request_correlation is not None and any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        or parameter.name == "provider_request_correlation"
+        for parameter in parameters
+    ):
+        kwargs["provider_request_correlation"] = provider_request_correlation
     if config is not None and compact_accepts_config(compact_fn):
-        return cast(str, await compact_fn(session_key, context_window_tokens, config))
-    return cast(str, await compact_fn(session_key, context_window_tokens))
+        return cast(
+            str,
+            await compact_fn(
+                session_key,
+                context_window_tokens,
+                config,
+                **kwargs,
+            ),
+        )
+    return cast(
+        str,
+        await compact_fn(session_key, context_window_tokens, **kwargs),
+    )
 
 
 def _estimate_tokens(text: str) -> int:
@@ -546,6 +583,8 @@ async def call_compaction_llm(
     base_url: str = "https://openrouter.ai/api/v1",
     timeout: float = _COMPACTION_TIMEOUT,
     custom_instructions: str | None = None,
+    provider: str = "",
+    provider_request_correlation: ProviderRequestCorrelation | None = None,
 ) -> str | None:
     """Call LLM to summarize a conversation chunk. Returns None on failure."""
     if not api_key:
@@ -590,14 +629,44 @@ async def call_compaction_llm(
         "Content-Type": "application/json",
     }
     headers.update(provider_app_headers(url))
+    headers.update(
+        tokenrhythm_correlation_headers(
+            provider,
+            url,
+            provider_request_correlation,
+        )
+    )
+
+    # Keep this import local: engine types import session lifecycle helpers
+    # while the session package initializes this module.
+    from opensquilla.engine.usage_http import reserve_direct_usage_call
+
+    usage = await reserve_direct_usage_call(
+        provider=provider
+        or ("openrouter" if "openrouter.ai" in url.lower() else "openai_compat"),
+        model=model,
+        base_url=url,
+    )
 
     try:
-        async with httpx.AsyncClient(timeout=timeout, trust_env=_trust_env()) as client:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            trust_env=_trust_env(),
+            follow_redirects=False,
+        ) as client:
             resp = await client.post(url, json=payload, headers=headers)
             resp.raise_for_status()
             data = resp.json()
+            await usage.finalize_openai_response(
+                data,
+                raw_json=str(getattr(resp, "text", "") or ""),
+            )
             return cast(str, data["choices"][0]["message"]["content"])
+    except asyncio.CancelledError:
+        await usage.mark_unknown("cancelled")
+        raise
     except Exception as exc:
+        await usage.mark_unknown("direct_request_failed")
         log.warning("compaction.llm_call_failed", model=model, error=str(exc))
         return None
 
@@ -829,6 +898,11 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
     fallback_chunks = 0
     for chunk in chunks:
         if cfg.api_key and cfg.model:
+            llm_kwargs: dict[str, Any] = {}
+            if request.provider_request_correlation is not None:
+                llm_kwargs["provider_request_correlation"] = (
+                    request.provider_request_correlation
+                )
             llm_result = await call_compaction_llm(
                 chunk_text=_format_chunk_for_llm(chunk),
                 identifier_instruction=id_instruction,
@@ -837,6 +911,8 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
                 base_url=cfg.base_url,
                 timeout=cfg.timeout_seconds,
                 custom_instructions=custom_instructions or None,
+                provider=cfg.provider,
+                **llm_kwargs,
             )
             if llm_result:
                 summaries.append(llm_result)

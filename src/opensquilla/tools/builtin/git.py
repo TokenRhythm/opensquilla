@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import os
+from dataclasses import replace
 from pathlib import Path
 
 from opensquilla.sandbox.integration import get_runtime, run_under_backend
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
+from opensquilla.sandbox.permissions import (
+    FileSystemAccess,
+    FileSystemPermissionProfile,
+)
 from opensquilla.sandbox.policy import build_policy, select_level
 from opensquilla.tools.path_policy import reject_foreign_host_path
 from opensquilla.tools.registry import tool
@@ -70,8 +75,25 @@ async def _run_git(*args: str, cwd: str | None = None) -> str:
             runtime.settings,
             trusted=True,
         )
+        request_args = args
+        profile = (
+            ctx.sandbox_file_system_profile if ctx is not None else None
+        )
+        if isinstance(profile, FileSystemPermissionProfile):
+            read_only = not any(
+                entry.access is FileSystemAccess.WRITE for entry in profile.entries
+            )
+            policy = replace(policy, file_system=profile)
+            if read_only:
+                policy = replace(
+                    policy,
+                    mounts=tuple(mount.with_mode("ro") for mount in policy.mounts),
+                    workspace_rw=False,
+                    tmp_writable=False,
+                )
+                request_args = _harden_read_only_git_args(args)
         result = await run_under_backend(
-            build_request_for_git(args, workspace, action_kind, policy),
+            build_request_for_git(request_args, workspace, action_kind, policy),
             runtime=runtime,
         )
         output = result.stdout + result.stderr
@@ -92,6 +114,21 @@ async def _run_git(*args: str, cwd: str | None = None) -> str:
     if proc.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed (exit {proc.returncode}):\n{output}")
     return output
+
+
+def _harden_read_only_git_args(args: tuple[str, ...]) -> tuple[str, ...]:
+    """Disable repository-controlled helpers for read-only git execution."""
+
+    global_options = ("--no-optional-locks", "-c", "core.fsmonitor=false")
+    if args and args[0] == "diff":
+        return (
+            *global_options,
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            *args[1:],
+        )
+    return (*global_options, *args)
 
 
 def build_request_for_git(args: tuple[str, ...], cwd: Path, action_kind: str, policy):

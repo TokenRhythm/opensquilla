@@ -1,6 +1,7 @@
 ---
 name: openrouter-video-generator
 description: "Generate or declare a configured OpenRouter video asset for AwesomeWebpageMetaSkill. Use only when the meta skill needs a local webpage video and the provider, model, API key, and output directory come from config."
+description_zh: "为AwesomeWebpageMetaSkill生成或声明一个配置好的OpenRouter视频资产。仅当元技能需要本地网页视频，且提供商、模型、API密钥和输出目录均来自配置时使用。"
 homepage: ""
 user-invocable: false
 disable-model-invocation: true

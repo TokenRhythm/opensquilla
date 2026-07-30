@@ -27,6 +27,9 @@
 # agent_stream_heartbeat_interval_seconds = 15.0
 # agent_stream_idle_timeout_seconds = 180.0
 # webui_stream_idle_grace_seconds = 210.0
+# Optional absolute Agent deadline for ordinary interactive Web chat turns.
+# Disabled by default; set a positive value such as 1800.0 to enable the cap.
+# web_chat_runtime_timeout_seconds = 0.0
 
 # WebSocket per-connection outbound writer queue. When enabled (default),
 # each WS connection gets a bounded asyncio queue + dedicated writer task.
@@ -55,10 +58,10 @@
 # diagnostics_enabled = false
 
 [control_ui]
-# Vue is the product UI. Use "legacy" only as a maintainer rollback fallback
-# for the frozen vanilla-JS frontend; changing this requires a gateway restart.
-# Env override: OPENSQUILLA_CONTROL_UI_FRONTEND=vue|legacy
-frontend = "vue"
+# Vue is the only Control UI. The optional frontend key is retained temporarily
+# for config compatibility; historical "legacy" values are deprecated and are
+# treated as "vue" rather than selecting the retired vanilla-JS client.
+# frontend = "vue"
 
 # Web search settings
 # Use DuckDuckGo for the no-key path, or configure Bocha, Brave, IQS, Tavily, or Exa.
@@ -156,6 +159,13 @@ base_url = "https://tokenrhythm.studio/v1"
 # # api_key is optional: set env CUSTOM_LLM_API_KEY (or api_key here) only if
 # # your endpoint enforces one. Declare the endpoint's real context window via
 # # [models.custom."qwen3-32b-awq"] — see the per-model overrides section below.
+#
+# Example custom Anthropic Messages endpoint:
+# provider = "custom_anthropic"
+# base_url = "https://llm.example.com/anthropic"
+# model = "vendor-model"
+# # api_key is optional; env CUSTOM_ANTHROPIC_API_KEY also works. The adapter
+# # appends /v1/messages and uses Authorization: Bearer when a key is present.
 
 # Pin each model to its native upstream provider on OpenRouter.
 # Sends provider.only=[slug] + allow_fallbacks=true per request.
@@ -208,8 +218,10 @@ enabled = true
 # "custom_b5": an explicit user-authored lineup from [[llm_ensemble.candidates]]
 #   — 2-6 enabled proposer rows plus at most one role = "aggregator" row (the
 #   member that fuses drafts into the final answer; omitted = the current chat
-#   model fuses). Proposer roles ("primary", "contrast", "fast_check",
-#   "critic") are advisory labels shown in the UI and decision trace.
+#   model fuses). The Web UI presents only Proposer and Aggregator. Released
+#   proposer role values ("primary", "contrast", "fast_check", "critic")
+#   remain accepted and preserved as advisory decision-trace labels; they all
+#   run and appear in the settings panel as Proposer.
 # "router_dynamic": legacy automatic selection; kept readable for existing
 #   configs but no longer offered in the Web UI.
 selection_mode = "static_openrouter_b5"
@@ -217,7 +229,7 @@ selection_mode = "static_openrouter_b5"
 # [[llm_ensemble.candidates]]
 # provider = "volcengine"
 # model = "doubao-2.0-pro"
-# role = "primary"
+# No role is needed for a proposer.
 # [[llm_ensemble.candidates]]
 # provider = "volcengine"
 # model = "deepseek-v4-pro"
@@ -244,7 +256,7 @@ all_failed_policy = "fallback_single"
 
 # Advanced knobs — TOML-only (not on the configure RPC surface). Defaults:
 # mode = "b5_fusion"                  # only supported ensemble mode
-# proposer_tools = false              # allow tool calls inside proposer turns
+# proposer_tools = false              # expose tool schemas as non-executable advice
 # candidate_max_chars = 24000         # per-candidate transcript budget (0 = unlimited)
 # proposer_timeout_seconds = 3600.0
 # aggregator_timeout_seconds = 3600.0
@@ -279,17 +291,25 @@ all_failed_policy = "fallback_single"
 # max_output_tokens = 8192
 # supports_tools = true
 #
-# The generic `custom` provider (any self-hosted OpenAI-compatible endpoint;
-# see the [llm] example above) uses the same override table, keyed by its
-# served model id:
+# The generic `custom` and `custom_anthropic` providers use the same override
+# table shape, keyed by the served model id. Unknown custom models retain the
+# conservative 8k fallback for upgrade compatibility; both remote gateways
+# and local servers should declare their actual window:
 # [models.custom."qwen3-32b-awq"]
+# context_window = 131072
+# max_output_tokens = 8192
+# supports_tools = true
+#
+# [models.custom_anthropic."vendor-model"]
 # context_window = 131072
 # max_output_tokens = 8192
 # supports_tools = true
 #
 # [models.openrouter."z-ai/glm-5.2"]
 # # reasoning_format: openrouter | openai | deepseek | gemini | zai |
-# #                   dashscope | moonshot | volcengine | none
+# #                   dashscope | moonshot | volcengine | qwen_token_plan |
+# #                   qwen_token_plan_qwen | qwen_token_plan_deepseek |
+# #                   qwen_token_plan_glm | qwen_token_plan_kimi | none
 # reasoning_format = "openrouter"
 # supports_reasoning = true
 # input_cost_per_mtok = 0.5        # USD per million input tokens (example value)
@@ -443,6 +463,20 @@ image_only = true
 #
 # [squilla_router]
 # tier_profile = "dashscope"
+
+# Example: Qwen Token Plan native image generation. This uses the same
+# QWEN_TOKEN_PLAN_API_KEY as the qwen_token_plan LLM provider, but a distinct
+# official API path.
+#
+# [image_generation]
+# enabled = true
+# primary = "qwen_token_plan/wan2.7-image"
+# size = "768x768"
+# output_format = "png"
+#
+# [image_generation.providers.qwen_token_plan]
+# api_key_env = "QWEN_TOKEN_PLAN_API_KEY"
+# base_url = "https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Tool policy

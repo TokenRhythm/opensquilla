@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -29,6 +30,7 @@ def make_memory_dream_handler(
     build_dream: BuildDreamFn,
     should_skip: DreamGuardFn | None = None,
     post_dream_hook: PostDreamHookFn | None = None,
+    usage_event_sink: Any | None = None,
 ) -> Callable[[CronJob], Awaitable[HandlerResult]]:
     """Factory: returns an async cron handler that runs Dream per agent.
 
@@ -53,7 +55,32 @@ def make_memory_dream_handler(
             return HandlerResult(summary=summary, delivery_status="skipped")
         try:
             dream = build_dream(agent_id)
-            result = await dream.run()
+            usage_scope = None
+            if usage_event_sink is not None:
+                from opensquilla.engine.usage_accounting import (
+                    UsageAccountingScope,
+                    UsageExecutionContext,
+                )
+
+                execution_id = uuid.uuid4().hex
+                usage_scope = UsageAccountingScope(
+                    sink=usage_event_sink,
+                    context=UsageExecutionContext(
+                        execution_id=execution_id,
+                        agent_run_id=execution_id,
+                        turn_id=execution_id,
+                        session_id=uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            f"opensquilla:system:memory-dream:{agent_id}",
+                        ).hex,
+                        agent_id=agent_id,
+                        run_kind="memory_dream",
+                    ),
+                )
+            from opensquilla.engine.usage_accounting import bind_usage_accounting_scope
+
+            with bind_usage_accounting_scope(usage_scope):
+                result = await dream.run()
             summary = (
                 f"dream agent={agent_id} "
                 f"processed={result.files_processed} "

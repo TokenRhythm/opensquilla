@@ -131,7 +131,16 @@ def resolve_runtime_tool_surface(
     if ctx.interaction_mode is InteractionMode.UNATTENDED:
         if not caps.channel_backing:
             denied_tools |= set(_CHANNEL_RUNTIME_TOOL_NAMES)
-        denied_tools |= set(_ADMIN_RUNTIME_TOOL_NAMES)
+        # A Channel turn is unattended at the process level, but an
+        # authenticated channel administrator is the same principal as the
+        # WebUI owner. Keep operator-only tools available for that verified
+        # identity; ordinary channel callers, cron jobs, and subagents retain
+        # the unattended denylist.
+        verified_channel_admin = (
+            ctx.caller_kind is CallerKind.CHANNEL and ctx.channel_admin_verified
+        )
+        if not verified_channel_admin:
+            denied_tools |= set(_ADMIN_RUNTIME_TOOL_NAMES)
     if private_memory_read_tools_blocked(ctx):
         denied_tools |= set(_PRIVATE_MEMORY_READ_TOOL_NAMES)
 

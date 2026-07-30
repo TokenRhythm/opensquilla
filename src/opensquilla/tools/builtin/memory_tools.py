@@ -38,7 +38,7 @@ from opensquilla.memory.types import (
     normalize_memory_source_filter,
 )
 from opensquilla.tools.registry import tool
-from opensquilla.tools.types import ToolError, current_tool_context
+from opensquilla.tools.types import PlanAccess, ToolError, current_tool_context
 
 if TYPE_CHECKING:
     from opensquilla.memory.retrieval import MemoryRetriever
@@ -386,6 +386,13 @@ def create_memory_tools(
         else:
             md = memory_dir
             wd = memory_dir  # fallback: use memory_dir as workspace in test/legacy mode
+        # These paths stay inside the tool closures. Keep user-facing results
+        # relative while bypassing legacy Windows MAX_PATH for every read,
+        # write, rollback, retention, and delete operation.
+        from opensquilla.memory.manager import _native_io_path
+
+        md = str(_native_io_path(md)) if md is not None else None
+        wd = str(_native_io_path(wd)) if wd is not None else None
         return ResolvedAgent(store=s, retriever=r, memory_dir=md, workspace_dir=wd)
 
     @dataclass(frozen=True)
@@ -642,6 +649,7 @@ def create_memory_tools(
             },
         },
         required=["query"],
+        plan_access=PlanAccess.READ_ONLY,
         registry=registry,
     )
     async def memory_search(
@@ -757,6 +765,7 @@ def create_memory_tools(
             "lines": {"type": "integer", "description": "Number of lines to return (optional)"},
         },
         required=["path"],
+        plan_access=PlanAccess.READ_ONLY,
         registry=registry,
     )
     async def memory_get(

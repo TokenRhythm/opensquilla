@@ -1,10 +1,35 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
+
+import pytest
 
 from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.sandbox.policy import LevelHints, build_policy
-from opensquilla.sandbox.types import NetworkMode, SecurityLevel
+from opensquilla.sandbox.types import MountSpec, NetworkMode, SecurityLevel
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="host root read-only mount is implemented by the Linux backend first",
+)
+def test_linux_policy_mounts_root_readonly_before_workspace(tmp_path: Path) -> None:
+    policy = build_policy(
+        SecurityLevel.STANDARD,
+        "shell.exec",
+        tmp_path,
+        SandboxSettings(),
+    )
+
+    assert policy.mounts[0] == MountSpec(
+        host_path=Path("/"),
+        sandbox_path=Path("/"),
+        mode="ro",
+        required=True,
+    )
+    assert policy.mounts[1].host_path == tmp_path
+    assert policy.mounts[1].mode == "rw"
 
 
 def test_standard_network_http_uses_managed_allowlist_by_default(tmp_path: Path) -> None:

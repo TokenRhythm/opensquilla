@@ -3,6 +3,7 @@ import { foldTurn } from './foldTurn'
 import type { ChatToolCall, ChatToolCallGroup } from '@/types/chat'
 import type { ArtifactPayload } from '@/types/rpc'
 import type { Frame } from '@/types/turnlog'
+import type { InterruptViewState } from '@/types/parts'
 
 // Pure stubs: the reducer's full-result / terminal-state / accumulation
 // invariants are independent of markdown rendering and tool grouping, so the
@@ -58,6 +59,45 @@ describe('foldTurn — tool result preservation', () => {
 })
 
 describe('foldTurn — text, thinking, status, artifacts', () => {
+  it('keeps a resolved approval in its true position between later timeline events', () => {
+    const interruptState = new Map<string, InterruptViewState>([
+      ['approval-1', { resolution: 'approved', busy: false, error: '' }],
+    ])
+    const f = foldTurn([
+      { kind: 'text', seq: 0, text: 'before' },
+      {
+        kind: 'interrupt',
+        seq: 1,
+        interruptKind: 'approval',
+        approvalId: 'approval-1',
+        data: {
+          approvalId: 'approval-1',
+          namespace: 'exec',
+          toolName: 'sandbox elevation',
+          command: 'python -c pass',
+          approvalKind: 'sandbox_elevation',
+          args: null,
+          warning: '',
+          agent: 'main',
+          sessionKey: 'agent:main:web',
+          deadline: 0,
+        },
+        at: 1000,
+      },
+      { kind: 'text', seq: 2, text: 'after' },
+    ], renderMarkdown, toolCallGroups, 'stream', interruptState)
+
+    expect(f.timelineItems.map(item => item.type)).toEqual(['text', 'interrupt', 'text'])
+    expect(f.timelineItems[1]).toMatchObject({
+      type: 'interrupt',
+      part: {
+        interruptKind: 'approval',
+        resolution: 'approved',
+      },
+    })
+    expect(f.parts.map(part => part.type)).toEqual(['text', 'interrupt', 'text'])
+  })
+
   it('accumulates streamed text and lets final-text override it', () => {
     expect(fold([
       { kind: 'text', seq: 0, text: 'Hello ' },
@@ -69,6 +109,47 @@ describe('foldTurn — text, thinking, status, artifacts', () => {
       { kind: 'text', seq: 1, text: 'world' },
       { kind: 'final-text', seq: 2, text: 'Final answer' },
     ]).rawText).toBe('Final answer')
+  })
+
+  it('replaces stale text around tools with one canonical terminal segment', () => {
+    const f = fold([
+      { kind: 'text', seq: 0, text: 'stale preface' },
+      { kind: 'tool-start', seq: 1, toolId: 't', name: 'bash', input: '{}', at: 1 },
+      { kind: 'tool-result', seq: 2, toolId: 't', name: 'bash', result: 'ok', isError: false, input: '{}', at: 2 },
+      { kind: 'text', seq: 3, text: 'stale retry' },
+      { kind: 'final-text', seq: 4, text: 'Canonical answer' },
+    ])
+
+    expect(f.rawText).toBe('Canonical answer')
+    expect(f.timelineItems.map(item => item.type)).toEqual(['tool-group', 'text'])
+    expect(f.timelineItems[1]).toMatchObject({ type: 'text', html: 'Canonical answer' })
+    expect(f.toolCalls[0]).toMatchObject({ toolId: 't', status: 'success', result: 'ok' })
+  })
+
+  it('treats an empty terminal snapshot as an authoritative text clear', () => {
+    const f = fold([
+      { kind: 'text', seq: 0, text: 'stale text' },
+      { kind: 'tool-start', seq: 1, toolId: 't', name: 'bash', input: '{}', at: 1 },
+      { kind: 'tool-result', seq: 2, toolId: 't', name: 'bash', result: 'ok', isError: false, input: '{}', at: 2 },
+      { kind: 'final-text', seq: 3, text: '' },
+    ])
+
+    expect(f.rawText).toBe('')
+    expect(f.timelineItems.map(item => item.type)).toEqual(['tool-group'])
+    expect(f.toolCalls[0]).toMatchObject({ toolId: 't', status: 'success' })
+  })
+
+  it('adds a strict terminal extension after the last tool group', () => {
+    const f = fold([
+      { kind: 'text', seq: 0, text: 'Canonical prefix' },
+      { kind: 'tool-start', seq: 1, toolId: 't', name: 'bash', input: '{}', at: 1 },
+      { kind: 'tool-result', seq: 2, toolId: 't', name: 'bash', result: 'ok', isError: false, input: '{}', at: 2 },
+      { kind: 'final-text', seq: 3, text: 'Canonical prefix and suffix' },
+    ])
+
+    expect(f.rawText).toBe('Canonical prefix and suffix')
+    expect(f.timelineItems.map(item => item.type)).toEqual(['text', 'tool-group', 'text'])
+    expect(f.timelineItems[2]).toMatchObject({ type: 'text', html: ' and suffix' })
   })
 
   it('accumulates thinking text separately from raw text', () => {

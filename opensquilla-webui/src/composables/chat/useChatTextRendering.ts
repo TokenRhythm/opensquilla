@@ -5,7 +5,6 @@ import katex from 'katex'
 
 const DIRECTIVE_TAG_RE = /\[\[\s*(?:reply_to_current|reply_to\s*:\s*[^\]\n]+)\s*\]\]\s*/g
 const GENERATED_ARTIFACT_MARKER_RE = /(?:^|\s*)\[generated artifact omitted:\s*[^\]\n]+?\]\s*/gi
-const PROTOCOL_TEXT_MARKER_RE = /<\s*(?:minimax:tool_call|tool_calls?|tvoe_calls|invoke\b|parameter\b|effect_calls\b|details\b|angle\s+brackets\b)/i
 const TIME_PREFIX_RE = /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}[+\-]\d{2}:\d{2} (?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) [A-Za-z0-9_+\-/]+\]\n/
 
 const MARKDOWN_CACHE_MAX = 500
@@ -217,20 +216,17 @@ export function useChatTextRendering() {
     return text.replace(/\r\n/g, '\n').replace(GENERATED_ARTIFACT_MARKER_RE, '').replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim()
   }
 
-  function stripProtocolTextLeak(text: string): string {
-    text = String(text || '')
-    if (!text) return text
-    const match = PROTOCOL_TEXT_MARKER_RE.exec(text)
-    if (!match) return text
-    return text.slice(0, match.index).trimEnd()
-  }
-
   function stripTimePrefix(text: string): string {
     return typeof text === 'string' ? text.replace(TIME_PREFIX_RE, '') : text
   }
 
   function renderMarkdown(text: string, opts?: { highlight?: boolean }): string {
-    text = stripProtocolTextLeak(stripDirectiveTags(stripGeneratedArtifactMarkers(text)))
+    // Tool-protocol compatibility belongs to the shared backend stream. The UI
+    // cannot infer intent from user-visible Markdown: `<tool_calls>` may be
+    // documentation inside inline/fenced code, and cutting at that marker loses
+    // the rest of an otherwise valid answer. Keep canonical text here and apply
+    // only the established directive/artifact presentation transforms.
+    text = stripDirectiveTags(stripGeneratedArtifactMarkers(text))
     if (!text) return ''
 
     // Cache key is namespaced by highlight mode so a plain streaming render is
@@ -265,8 +261,8 @@ export function useChatTextRendering() {
   }
 
   function sanitizeCopyText(text: string): string {
-    return stripProtocolTextLeak(
-      stripDirectiveTags(stripGeneratedArtifactMarkers(stripTimePrefix(String(text || '')))),
+    return stripDirectiveTags(
+      stripGeneratedArtifactMarkers(stripTimePrefix(String(text || ''))),
     ).trim()
   }
 
@@ -275,7 +271,6 @@ export function useChatTextRendering() {
     sanitizeCopyText,
     stripDirectiveTags,
     stripGeneratedArtifactMarkers,
-    stripProtocolTextLeak,
     stripTimePrefix,
   }
 }

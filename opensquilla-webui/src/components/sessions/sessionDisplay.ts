@@ -7,6 +7,26 @@ export interface SessionStatusBadge {
   cls: string
 }
 
+export interface SessionAgentIdentity {
+  kind: 'unknown' | 'known' | 'raw' | 'deleted'
+  value: string
+}
+
+/** Only call an agent deleted after one authoritative agents.list succeeded. */
+export function sessionAgentIdentity(
+  id: string | null | undefined,
+  agentNames: ReadonlyMap<string, string>,
+  agentsLoaded: boolean,
+): SessionAgentIdentity {
+  const normalized = String(id || '').trim()
+  if (!normalized || normalized === 'unknown') return { kind: 'unknown', value: '' }
+  const known = agentNames.get(normalized)
+  if (known) return { kind: 'known', value: known }
+  return agentsLoaded
+    ? { kind: 'deleted', value: normalized }
+    : { kind: 'raw', value: normalized }
+}
+
 export type SessionStatusBadgeClasses = Partial<Record<
   'needsInput' | 'running' | 'queued' | 'failed' | 'timeout' | 'interrupted' | 'cancelled',
   string

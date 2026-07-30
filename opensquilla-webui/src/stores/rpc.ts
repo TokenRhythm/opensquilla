@@ -1,6 +1,11 @@
 import { ref, computed } from 'vue'
 import { defineStore } from 'pinia'
-import { RpcClient, type RpcEventHandler } from '@/lib/rpc'
+import {
+  RpcClient,
+  type RpcCallOptions,
+  type RpcConnectionWaitOptions,
+  type RpcEventHandler,
+} from '@/lib/rpc'
 
 const WS_URL_KEY = 'opensquilla.wsUrl'
 const WS_TOKEN_KEY = 'opensquilla.wsToken'
@@ -75,10 +80,27 @@ export const useRpcStore = defineStore('rpc', () => {
   const state = ref<'disconnected' | 'connecting' | 'connected'>('disconnected')
   const policy = ref<Record<string, unknown> | null>(null)
   const auth = ref<Record<string, unknown> | null>(null)
+  const methods = ref<string[]>([])
+  const unavailableMethods = ref<Set<string>>(new Set())
   const error = ref<string | null>(null)
 
   const isConnected = computed(() => state.value === 'connected')
   const isConnecting = computed(() => state.value === 'connecting')
+  const isLocalOwner = computed(() => {
+    if (!isConnected.value) return false
+    const principal = auth.value?.principal
+    return Boolean(
+      principal
+      && typeof principal === 'object'
+      && (principal as Record<string, unknown>).isOwner === true,
+    )
+  })
+  const canManageProjectWorkspaces = computed(() =>
+    isLocalOwner.value
+    && supportsMethod('workspaces.list'))
+  const canChooseProject = computed(() =>
+    canManageProjectWorkspaces.value
+    && supportsMethod('workspaces.open'))
 
   function init() {
     const rpc = new RpcClient()
@@ -86,11 +108,25 @@ export const useRpcStore = defineStore('rpc', () => {
 
     rpc.on('_state', (s: 'disconnected' | 'connecting' | 'connected') => {
       state.value = s
+      if (s !== 'connected') {
+        policy.value = null
+        auth.value = null
+        methods.value = []
+        unavailableMethods.value = new Set()
+      }
     })
 
-    rpc.on('_hello', (data: { policy?: Record<string, unknown>; auth?: Record<string, unknown> }) => {
+    rpc.on('_hello', (data: {
+      policy?: Record<string, unknown>
+      auth?: Record<string, unknown>
+      features?: { methods?: unknown }
+    }) => {
       policy.value = data.policy || null
       auth.value = data.auth || null
+      methods.value = Array.isArray(data.features?.methods)
+        ? data.features.methods.filter((method): method is string => typeof method === 'string')
+        : []
+      unavailableMethods.value = new Set()
     })
 
     rpc.on('_gap', (detail: unknown) => {
@@ -120,6 +156,8 @@ export const useRpcStore = defineStore('rpc', () => {
       error.value = null
       policy.value = null
       auth.value = null
+      methods.value = []
+      unavailableMethods.value = new Set()
       client.value.connect(settings.url, settings.token)
     }
     return true
@@ -130,14 +168,33 @@ export const useRpcStore = defineStore('rpc', () => {
     state.value = 'disconnected'
     policy.value = null
     auth.value = null
+    methods.value = []
+    unavailableMethods.value = new Set()
   }
 
-  async function call<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T> {
+  function supportsMethod(method: string): boolean {
+    return methods.value.includes(method) && !unavailableMethods.value.has(method)
+  }
+
+  function markMethodUnavailable(method: string): void {
+    if (!method) return
+    unavailableMethods.value = new Set([...unavailableMethods.value, method])
+  }
+
+  async function call<T = unknown>(
+    method: string,
+    params?: Record<string, unknown>,
+    options?: RpcCallOptions,
+  ): Promise<T> {
     if (!client.value) throw new Error('RPC client not initialized')
     if (state.value !== 'connected') {
       throw new Error(`Cannot call ${method}: not connected (state: ${state.value})`)
     }
-    return client.value.call(method, params) as Promise<T>
+    return (
+      options
+        ? client.value.call(method, params, options)
+        : client.value.call(method, params)
+    ) as Promise<T>
   }
 
   function on(event: string, handler: RpcEventHandler): () => void {
@@ -148,10 +205,13 @@ export const useRpcStore = defineStore('rpc', () => {
     return client.value.on(event, handler)
   }
 
-  function waitForConnection(timeoutMs?: number): Promise<void> {
+  function waitForConnection(
+    timeoutMs?: number,
+    signal?: AbortSignal,
+    actions?: RpcConnectionWaitOptions,
+  ): Promise<void> {
     if (!client.value) return Promise.reject(new Error('RPC client not initialized'))
-    if (state.value === 'connected') return Promise.resolve()
-    return client.value.waitForConnection(timeoutMs)
+    return client.value.waitForConnection(timeoutMs, signal, actions)
   }
 
   return {
@@ -159,13 +219,19 @@ export const useRpcStore = defineStore('rpc', () => {
     state,
     policy,
     auth,
+    methods,
     error,
     isConnected,
     isConnecting,
+    isLocalOwner,
+    canManageProjectWorkspaces,
+    canChooseProject,
     init,
     connect,
     applyLinkTokenFromUrl,
     disconnect,
+    supportsMethod,
+    markMethodUnavailable,
     call,
     on,
     waitForConnection,

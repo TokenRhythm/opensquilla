@@ -1,31 +1,42 @@
-import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, safeStorage, shell } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, protocol, safeStorage, shell, Tray } from 'electron'
 import electronUpdater from 'electron-updater'
 import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { appendFileSync, createWriteStream, existsSync, lstatSync, mkdirSync, opendirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync, type Stats } from 'node:fs'
-import { access, constants, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
+import { access, constants, open, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import net from 'node:net'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { DESKTOP_LOCALES, resolveLocaleFromTags, type DesktopLocale } from './desktop-locale.js'
 import {
-  classifyDesktopOnboardingDataFlow,
-  isProvenFreshPrimaryDesktopProfile,
-} from './desktop-data-flow.js'
+  DESKTOP_LOCALES,
+  normalizeGatewayLocale,
+  resolveLocaleFromTags,
+  type DesktopLocale,
+} from './desktop-locale.js'
 import {
-  allProfileContexts as enumerateDesktopProfileContexts,
-  contextForProfile,
-  desktopProfileContextPath,
+  allProfileContexts as enumerateLegacyDesktopProfiles,
   isRecoveryProfileId,
-  loadDesktopProfileContext,
-  profileKindEnvironment,
-  updateDesktopProfileContextFile,
-  type DesktopAttentionAcknowledgement,
-  type DesktopProfileContext,
+  primaryProfilePaths,
   type DesktopProfilePaths,
 } from './desktop-profile-context.js'
 import { DesktopWriterAdmission } from './desktop-writer-admission.js'
+import {
+  createDesktopGatewayInstanceNonce,
+  desktopGatewayOwnershipMatchesLaunch,
+  desktopProfileFingerprint,
+  loadDesktopGatewayOwnershipRecord,
+  requestVerifiedDesktopGatewayShutdown,
+  waitForDesktopGatewayOwnershipRelease,
+  type DesktopGatewayOwnershipRecord,
+} from './desktop-gateway-ownership.js'
+import {
+  DesktopGatewayOwnershipVerificationCoordinator,
+} from './desktop-gateway-ownership-verification.js'
+import {
+  lifecycleAllowsProcessSpawn,
+  stopAndJoinLifecycleProcesses,
+} from './gateway-lifecycle.js'
 import { buildCliInvocation } from './cli-invocation.js'
 import {
   cleanupSelectorArgs,
@@ -40,14 +51,72 @@ import {
   type TrustedDesktopCleanupPreview,
 } from './desktop-cleanup.js'
 import { secretStorageBackendForPolicy, shouldUseChromiumMockKeychainForPolicy } from './secret-storage-policy.js'
+import { parseOpenSquillaReleaseTag } from './update-feed-resolver.js'
 import {
-  GITHUB_UPDATE_OWNER,
-  GITHUB_UPDATE_REPO,
-  parseOpenSquillaReleaseTag,
-  selectMacPrereleaseCandidate,
-  type ReleaseSummary,
-} from './update-feed-resolver.js'
+  candidateFromUpdateChannel,
+  orderedUpdateSources,
+  updateAssetUrl,
+  updateChannelManifestFromReleaseInventory,
+  updateChannelManifestUrl,
+  updateChannelPathForVersion,
+  updateFeedBaseUrl,
+  UPDATE_GITHUB_RELEASES_API_URL,
+  UpdateChannelError,
+  type DesktopUpdateCandidate,
+  type DesktopUpdatePlatform,
+  type DesktopUpdateSource,
+} from './update-channel.js'
+import {
+  parseSha256SumsForAsset,
+  readResponseTextWithLimit,
+  streamResponseToVerifiedFile,
+} from './update-verification.js'
 import { isUpdateCheckAllowed, UpdateCheckScheduler } from './update-check-scheduler.js'
+import {
+  canRevealDesktopApp,
+  defaultDesktopPreferences,
+  mainWindowCloseAction,
+  normalizeDesktopPreferences,
+  serializeDesktopPreferences,
+  type DesktopExitPhase,
+  type DesktopMainWindowCloseBehavior,
+  type DesktopPreferencesFile,
+  type DesktopWorkbenchPreviewMode,
+} from './desktop-window-lifecycle.js'
+import {
+  DESKTOP_DEEP_LINK_SCHEME,
+  desktopDeepLinkArguments,
+  parseDesktopDeepLink,
+} from './desktop-deep-link.js'
+import { projectDirectoryDialogOptions } from './project-directory-picker.js'
+import {
+  NATIVE_WORKBENCH_CAPABILITIES,
+  NATIVE_WORKBENCH_ARTIFACT_SCHEME,
+  parseNativeWorkbenchCreateRequest,
+  parseNativeWorkbenchNavigationRequest,
+  parseNativeWorkbenchPermissionResponse,
+  parseNativeWorkbenchSurfaceId,
+  parseNativeWorkbenchSurfaceRectRequest,
+  type NativeWorkbenchSurfaceEvent,
+} from './native-workbench-surface-contract.js'
+import {
+  NativeWorkbenchSurfaceManager,
+} from './native-workbench-surface.js'
+import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
+import {
+  ArtifactPreviewLeaseBroker,
+} from './artifact-preview-lease-broker.js'
+
+protocol.registerSchemesAsPrivileged([{
+  scheme: NATIVE_WORKBENCH_ARTIFACT_SCHEME,
+  privileges: {
+    standard: true,
+    secure: true,
+    supportFetchAPI: true,
+    corsEnabled: true,
+    stream: true,
+  },
+}])
 
 interface GatewayState {
   url: string
@@ -132,6 +201,20 @@ interface OnboardingPayload {
   locale?: unknown
 }
 
+interface OnboardingProbePayload {
+  provider?: unknown
+  model?: unknown
+  baseUrl?: unknown
+  apiKey?: unknown
+}
+
+interface OnboardingProbeResult {
+  ok: boolean
+  failureKind: string
+  message: string
+  latencyMs: number
+}
+
 interface DesktopSettingsPayload extends OnboardingPayload {}
 
 interface DesktopSettingsSnapshot {
@@ -153,6 +236,23 @@ interface DesktopSettingsSnapshot {
   gateway: GatewayState
 }
 
+interface DesktopPreferencesPayload {
+  mainWindowCloseBehavior?: unknown
+  workbenchPreviewMode?: unknown
+  workbenchPreviewNoticeShown?: unknown
+}
+
+interface DesktopPreferencesSnapshot {
+  schemaVersion: 2
+  mainWindowCloseBehavior: DesktopMainWindowCloseBehavior
+  workbenchPreviewMode: DesktopWorkbenchPreviewMode
+  effectiveWorkbenchPreviewMode: DesktopWorkbenchPreviewMode
+  workbenchPreviewNoticeShown: boolean
+  workbenchPreviewForcedOffline: boolean
+  canRunInBackground: boolean
+  platform: 'darwin' | 'win32' | 'linux' | 'other'
+}
+
 interface RuntimeLaunch {
   command: string
   args: string[]
@@ -160,7 +260,7 @@ interface RuntimeLaunch {
   mode: 'bundled' | 'dev'
 }
 
-type RecoveryOutcome = 'ready' | 'attention' | 'recovery_required' | 'recovery_profile'
+type RecoveryOutcome = 'ready' | 'attention' | 'recovery_required'
 
 interface RecoveryCandidate {
   kind: string
@@ -184,14 +284,36 @@ interface RecoveryProtocolResult {
   revision: number
 }
 
+type DesktopProfileConsolidationOutcome = 'noop' | 'consolidated' | 'blocked'
+type DesktopCredentialAdoptionStatus = 'pending' | 'complete' | 'not_required'
+
+interface DesktopProfileConsolidationResult {
+  schema_version: 1
+  outcome: DesktopProfileConsolidationOutcome
+  stable_code: string
+  primary_home: string
+  configuration_source_recovery_id: string | null
+  configuration_source_credential_path: string | null
+  configuration_source_credential_sha256: string | null
+  configuration_source_credential_size: number | null
+  consumed_recovery_ids: string[]
+  backup_path: string | null
+  receipt_path: string | null
+  credential_adoption_status: DesktopCredentialAdoptionStatus
+  revision: number
+  errors: string[]
+}
+
+interface DesktopProfileConsolidationMaintenance {
+  kind: 'profile-consolidation'
+  stable_code: string
+  retryable: true
+  recovery_profile_count: number
+}
+
 interface DesktopRecoveryViewState {
   inspection: RecoveryProtocolResult | null
-  activeProfile: {
-    kind: 'primary' | 'recovery'
-    recoveryId: string | null
-    home: string
-  }
-  recoveryProfiles: { id: string; home: string }[]
+  maintenance: DesktopProfileConsolidationMaintenance | null
   blocked: boolean
   busy: boolean
   error: string | null
@@ -227,8 +349,30 @@ const shouldUseNativeApplicationMenu = process.platform === 'darwin'
 
 let mainWindow: BrowserWindow | null = null
 let onboardingWindow: BrowserWindow | null = null
+let windowsTray: Tray | null = null
+let appExitPhase: DesktopExitPhase = 'running'
+let systemSessionEnding = false
+let windowsSessionEndPreviousPhase: DesktopExitPhase | null = null
+let windowsSessionEndResetTimer: NodeJS.Timeout | null = null
+let mainWindowClosePrompt: Promise<void> | null = null
+let pendingDesktopDeepLinkOpen = false
+let desktopDeepLinkActivationReady = false
+let desktopPreferencesCache: {
+  value: DesktopPreferencesFile
+  writable: boolean
+} | null = null
+let desktopPreferencesWritePromise: Promise<void> = Promise.resolve()
 
 type DesktopNativeThemeSource = 'light' | 'dark' | 'system'
+
+const DESKTOP_LIGHT_BACKGROUND_COLOR = '#F7F7F8'
+const DESKTOP_DARK_BACKGROUND_COLOR = '#18181A'
+
+function desktopWindowBackgroundColor(): string {
+  return nativeTheme.shouldUseDarkColors
+    ? DESKTOP_DARK_BACKGROUND_COLOR
+    : DESKTOP_LIGHT_BACKGROUND_COLOR
+}
 
 function normalizeDesktopNativeThemeSource(payload: unknown): DesktopNativeThemeSource {
   const source = typeof payload === 'string'
@@ -241,7 +385,7 @@ function normalizeDesktopNativeThemeSource(payload: unknown): DesktopNativeTheme
 
 function applyDesktopNativeTheme(source: DesktopNativeThemeSource): { source: DesktopNativeThemeSource; shouldUseDarkColors: boolean } {
   nativeTheme.themeSource = source
-  const backgroundColor = nativeTheme.shouldUseDarkColors ? '#08080A' : '#F7F6F3'
+  const backgroundColor = desktopWindowBackgroundColor()
   for (const window of [mainWindow, onboardingWindow]) {
     if (window && !window.isDestroyed()) window.setBackgroundColor(backgroundColor)
   }
@@ -250,6 +394,16 @@ function applyDesktopNativeTheme(source: DesktopNativeThemeSource): { source: De
 let gatewayProcess: ChildProcessWithoutNullStreams | null = null
 let gatewayProfileKey: string | null = null
 let isQuitting = false
+// A child remains lifecycle-owned until its exit event, even after stopGateway
+// clears the current slot so a replacement cannot accidentally reuse it. Quit,
+// update, cleanup, and recovery all join this set before Electron may exit.
+const gatewayStoppingProcesses = new Set<ChildProcessWithoutNullStreams>()
+const gatewayProcessOwnershipContexts = new WeakMap<ChildProcessWithoutNullStreams, {
+  nonce: string
+  ownershipDir: string
+  profileFingerprint: string
+  port: number
+}>()
 // Opt stopGateway into the Windows HTTP graceful-drain path even while isQuitting
 // is set, for the update/uninstall flows that keep the main process alive and
 // await the child's exit (so the fire-and-forget drain is not racing app teardown).
@@ -271,15 +425,26 @@ function desktopLog(event: string, detail?: Record<string, unknown>): void {
   }
 }
 
+function nativeWorkbenchFailureReason(event: NativeWorkbenchSurfaceEvent): string {
+  if (event.type === 'error') return 'load-failed'
+  const reason = event.detail?.reason
+  if (
+    reason === 'unresponsive'
+    || reason === 'owner-unresponsive'
+    || reason === 'clean-exit'
+    || reason === 'abnormal-exit'
+    || reason === 'killed'
+    || reason === 'crashed'
+    || reason === 'oom'
+    || reason === 'launch-failed'
+    || reason === 'integrity-failure'
+  ) return reason
+  return 'unknown'
+}
+
 let gatewayStartPromise: Promise<GatewayState> | null = null
 let resolveOnboarding: ((credential: DesktopConnection) => void) | null = null
 let rejectOnboarding: ((error: Error) => void) | null = null
-// Legacy home detected for the CURRENT onboarding run. The onboarding migrate
-// IPC handlers read the source path/kind from here (main-process truth), never
-// from the renderer payload.
-let onboardingMigrationCandidates: LegacyImportCandidate[] = []
-let onboardingMigrationCandidate: LegacyImportCandidate | null = null
-let onboardingMigrationPreviewApprovedAt = 0
 let secretStorageBackendCache: SecretEncryption | null = null
 let macCodeSignatureDiagnosticCache: string | null = null
 let bootStatus: BootStatus = {
@@ -293,8 +458,6 @@ let recoveryInspection: RecoveryProtocolResult | null = null
 let primaryRecoveryInspection: RecoveryProtocolResult | null = null
 let recoveryOperationBusy = false
 let recoveryOperationError: string | null = null
-let attentionPromptInFlight: Promise<void> | null = null
-let attentionPromptedThisSession = ''
 const desktopCleanupPreviews = new DesktopCleanupPreviewStore()
 let desktopCleanupBusy = false
 // Keep the post-exit delete-all helper and its open stdin pipe strongly
@@ -328,59 +491,52 @@ const gatewayState: GatewayState = {
   logPath: '',
 }
 
-let desktopProfileContextCache: DesktopProfileContext | null = null
-// A persisted recovery choice is offered after restart, but a fresh Electron
-// process must not start that writer until the user explicitly confirms it.
-let activeRecoveryProfileConfirmedThisProcess = false
+const artifactPreviewLeaseBroker = new ArtifactPreviewLeaseBroker({
+  getOwnedGatewayUrl: () => (
+    gatewayState.owned && gatewayState.status === 'ready'
+      ? gatewayState.url
+      : null
+  ),
+})
 
-function desktopProfileContext(): DesktopProfileContext {
-  if (!desktopProfileContextCache) {
-    desktopProfileContextCache = loadDesktopProfileContext(app.getPath('userData'))
-  }
-  return desktopProfileContextCache
-}
-
+const nativeWorkbenchSurfaces = new NativeWorkbenchSurfaceManager({
+  forceArtifactPreviewsOffline: process.env.OPENSQUILLA_PREVIEW_FORCE_OFFLINE === '1',
+  getPrivilegedGatewayUrl: () => (
+    gatewayState.status === 'ready' && gatewayState.url
+      ? gatewayState.url
+      : null
+  ),
+  getWindow: () => currentMainWindow(),
+  emit: event => {
+    if (event.type === 'error' || event.type === 'crashed') {
+      desktopLog('native_workbench_surface_failed', {
+        platform: process.platform,
+        type: event.type,
+        reason: nativeWorkbenchFailureReason(event),
+      })
+    }
+    const window = currentMainWindow()
+    if (
+      !window
+      || !gatewayState.owned
+      || !gatewayState.url
+      || !isCurrentWindowAtControlUi(window, gatewayState.url)
+    ) return
+    window.webContents.send('desktop:workbench:surface-event', event)
+  },
+})
 function activeDesktopProfile(): DesktopProfilePaths {
-  return desktopProfileContext().active
+  return primaryProfilePaths(app.getPath('userData'))
 }
 
 function primaryDesktopProfile(): DesktopProfilePaths {
-  return desktopProfileContext().primary
+  return primaryProfilePaths(app.getPath('userData'))
 }
 
-function allProfileContexts(): DesktopProfilePaths[] {
-  return enumerateDesktopProfileContexts(app.getPath('userData'))
-}
-
-async function updateDesktopProfileContext(
-  updater: (current: DesktopProfileContext) => DesktopProfileContext,
-): Promise<DesktopProfileContext> {
-  const finishWriter = recoveryOperationBusy
-    ? () => {}
-    : beginDesktopWriterOperation('update Desktop profile context')
-  try {
-    const context = await updateDesktopProfileContextFile(app.getPath('userData'), updater)
-    desktopProfileContextCache = context
-    return context
-  } finally {
-    finishWriter()
-  }
-}
-
-async function selectDesktopProfile(
-  kind: 'primary' | 'recovery',
-  recoveryId: string | null = null,
-): Promise<void> {
-  invalidateDesktopOpenFlow()
-  await updateDesktopProfileContext((current) => contextForProfile(
-    app.getPath('userData'),
-    kind,
-    recoveryId,
-    new Date().toISOString(),
-    current.persisted.attention_acknowledgement,
-  ))
-  activeRecoveryProfileConfirmedThisProcess = kind === 'recovery'
-  createApplicationMenu()
+function legacyRecoveryProfiles(): DesktopProfilePaths[] {
+  return enumerateLegacyDesktopProfiles(app.getPath('userData')).filter(
+    (profile) => profile.kind === 'recovery',
+  )
 }
 
 function desktopHome(): string {
@@ -399,6 +555,18 @@ function desktopStateDir(): string {
   return join(desktopHome(), 'state')
 }
 
+function desktopGatewayOwnershipDir(profile = activeDesktopProfile()): string {
+  // Keep lifecycle control metadata out of the profile's data state directory.
+  // A config may intentionally point state_dir elsewhere, and creating a
+  // previously-missing H/state here would change legacy-lock exclusion during
+  // upgrades. userData is process-control state, keyed by the canonical profile.
+  return join(
+    app.getPath('userData'),
+    'gateway-ownership',
+    desktopProfileFingerprint(profile.home),
+  )
+}
+
 function credentialPath(): string {
   return activeDesktopProfile().credentialPath
 }
@@ -408,39 +576,20 @@ function desktopLogsDir(): string {
 }
 
 function desktopProfileKey(profile = activeDesktopProfile()): string {
-  return profile.kind === 'primary' ? 'primary' : `recovery:${profile.recoveryId}`
+  return profile.kind
 }
-
-const PROFILE_SCOPED_DATA_ENV = [
-  'OPENSQUILLA_HOME',
-  'OPENSQUILLA_GATEWAY_STATE_DIR',
-  'OPENSQUILLA_GATEWAY_WORKSPACE_DIR',
-  'OPENSQUILLA_WORKSPACE_DIR',
-  'OPENSQUILLA_MEMORY_DIR',
-  'OPENSQUILLA_SESSION_ARCHIVE_DIR',
-  'OPENSQUILLA_LOG_DIR',
-  'OPENSQUILLA_TURN_CALL_LOG_DIR',
-  'OPENSQUILLA_LLM_TRACE_PATH',
-  'OPENSQUILLA_RUNTIME_EVENTS_PATH',
-  'OPENSQUILLA_PATCH_EVIDENCE_LEDGER_PATH',
-] as const
 
 function desktopChildEnvironment(
   profile: DesktopProfilePaths,
   additions: NodeJS.ProcessEnv = {},
 ): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = { ...process.env }
-  if (profile.kind === 'recovery') {
-    // Recovery profiles are isolated homes and must not inherit primary or
-    // external live data roots from the Desktop process environment.
-    for (const name of PROFILE_SCOPED_DATA_ENV) delete environment[name]
-  }
   return {
     ...environment,
     ...additions,
     OPENSQUILLA_DESKTOP: '1',
     OPENSQUILLA_INSTALL_METHOD: 'desktop',
-    OPENSQUILLA_PROFILE_KIND: profileKindEnvironment(profile.kind),
+    OPENSQUILLA_PROFILE_KIND: 'desktop-primary',
     OPENSQUILLA_GATEWAY_CONFIG_PATH: join(profile.home, 'config.toml'),
     // Historical name retained for compatibility: this is H, never H/state.
     OPENSQUILLA_STATE_DIR: profile.home,
@@ -910,6 +1059,27 @@ function canonicalTierKey(name: string): string {
 const ROUTER_PROFILE_IDS = new Set(['tokenrhythm', 'openrouter', 'dashscope', 'deepseek', 'gemini', 'volcengine', 'openai', 'zhipu', 'moonshot'])
 const INLINE_ROUTER_PROFILE_IDS = new Set(['tokenrhythm'])
 const TOKENRHYTHM_REGISTER_URL = 'https://tokenrhythm.studio/register'
+const DESKTOP_ENSEMBLE_PROFILES: Record<StaticEnsembleSelectionMode, {
+  provider: string
+  proposers: string[]
+  aggregator: string
+}> = {
+  static_tokenrhythm_b5: {
+    provider: 'tokenrhythm',
+    proposers: ['deepseek-v4-pro', 'glm-5.2', 'kimi-k2.7-code', 'qwen3.7-max'],
+    aggregator: 'glm-5.2',
+  },
+  static_openrouter_b5: {
+    provider: 'openrouter',
+    proposers: [
+      'deepseek/deepseek-v4-pro',
+      'z-ai/glm-5.2',
+      'moonshotai/kimi-k2.7-code',
+      'qwen/qwen3.7-max',
+    ],
+    aggregator: 'z-ai/glm-5.2',
+  },
+}
 
 const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
   {
@@ -979,6 +1149,28 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     routerSupported: true,
     deployment: 'cloud',
     note: 'Qwen tier profile for Mainland-friendly access.',
+  },
+  {
+    id: 'bailian_coding_cn',
+    label: 'Bailian Coding (Mainland China)',
+    model: 'qwen3.7-plus',
+    baseUrl: 'https://coding.dashscope.aliyuncs.com/v1',
+    apiKeyEnv: 'BAILIAN_API_KEY',
+    requiresApiKey: true,
+    routerSupported: false,
+    deployment: 'cloud',
+    note: 'Mainland China Coding Plan. Requires a dedicated sk-sp- API key.',
+  },
+  {
+    id: 'bailian_coding',
+    label: 'Bailian Coding (International)',
+    model: 'qwen3.7-plus',
+    baseUrl: 'https://coding-intl.dashscope.aliyuncs.com/v1',
+    apiKeyEnv: 'BAILIAN_API_KEY',
+    requiresApiKey: true,
+    routerSupported: false,
+    deployment: 'cloud',
+    note: 'International Coding Plan. Requires a dedicated sk-sp- API key.',
   },
   {
     id: 'deepseek',
@@ -1560,11 +1752,32 @@ function ensembleConfigTomlLines(credential: DesktopConnection): string[] {
   if (!selectionMode) {
     throw new Error(`LLM Ensemble is not supported for provider ${credential.provider}.`)
   }
+  const profile = DESKTOP_ENSEMBLE_PROFILES[selectionMode]
+  const roles = ['primary', 'contrast', 'fast_check', 'critic']
+  const candidates = profile.proposers.flatMap((model, index) => [
+    '',
+    '[[llm_ensemble.candidates]]',
+    `provider = ${tomlString(profile.provider)}`,
+    `model = ${tomlString(model)}`,
+    'source = "custom"',
+    'enabled = true',
+    `role = ${tomlString(roles[index] || '')}`,
+  ])
+  candidates.push(
+    '',
+    '[[llm_ensemble.candidates]]',
+    `provider = ${tomlString(profile.provider)}`,
+    `model = ${tomlString(profile.aggregator)}`,
+    'source = "custom"',
+    'enabled = true',
+    'role = "aggregator"',
+  )
   return [
     '',
     '[llm_ensemble]',
     'enabled = true',
-    `selection_mode = ${tomlString(selectionMode)}`,
+    'selection_mode = "custom_b5"',
+    ...candidates,
   ]
 }
 
@@ -1721,6 +1934,45 @@ function normalizeDesktopCredential(parsed: Partial<DesktopConnection>): Desktop
   }
 }
 
+const DESKTOP_CREDENTIAL_CONFIGURATION_FIELDS = [
+  'provider',
+  'model',
+  'baseUrl',
+  'apiKeyEnv',
+  'encryptedApiKey',
+  'modelRoutingMode',
+  'routerMode',
+  'routerDefaultTier',
+  'routerTiers',
+  'searchProvider',
+  'searchApiKeyEnv',
+  'encryptedSearchApiKey',
+  'disableNetworkObservability',
+  'configAuthority',
+  'importTransactionId',
+] as const
+
+function desktopCredentialHasUserConfiguration(raw: string): boolean {
+  try {
+    const parsed = recoveryRecord(JSON.parse(raw))
+    if (!parsed) return true
+    return DESKTOP_CREDENTIAL_CONFIGURATION_FIELDS.some((field) => {
+      if (!Object.prototype.hasOwnProperty.call(parsed, field)) return false
+      const value = parsed[field]
+      if (typeof value === 'string') return Boolean(value.trim())
+      if (typeof value === 'boolean') return true
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        return Object.keys(value).length > 0
+      }
+      // Preserve malformed-but-present configuration fields instead of
+      // overwriting bytes that may contain the user's only setup.
+      return value !== null && value !== undefined
+    })
+  } catch {
+    return true
+  }
+}
+
 // Write via a temp file + atomic rename so a crash, power loss, or full disk
 // mid-write cannot leave a truncated credential (silent re-onboarding + lost
 // key) or a truncated config.toml (which, since it is only reseeded when
@@ -1734,6 +1986,148 @@ async function atomicWriteFile(filePath: string, data: string, mode: number): Pr
     await rm(tmpPath, { force: true }).catch(() => null)
     throw err
   }
+}
+
+function desktopPreferencesPath(): string {
+  return join(app.getPath('userData'), 'desktop-preferences.json')
+}
+
+function desktopPlatformName(): DesktopPreferencesSnapshot['platform'] {
+  if (process.platform === 'darwin' || process.platform === 'win32' || process.platform === 'linux') {
+    return process.platform
+  }
+  return 'other'
+}
+
+function canRunDesktopInBackground(): boolean {
+  return process.platform === 'darwin' || (process.platform === 'win32' && windowsTray !== null)
+}
+
+function loadDesktopPreferencesRecord(): {
+  value: DesktopPreferencesFile
+  writable: boolean
+} {
+  if (desktopPreferencesCache) return desktopPreferencesCache
+  try {
+    const parsed = JSON.parse(readFileSync(desktopPreferencesPath(), 'utf8')) as unknown
+    desktopPreferencesCache = normalizeDesktopPreferences(parsed, process.platform)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      desktopLog('desktop_preferences_load_failed', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+    desktopPreferencesCache = {
+      value: defaultDesktopPreferences(process.platform),
+      writable: true,
+    }
+  }
+  return desktopPreferencesCache
+}
+
+function desktopPreferencesSnapshot(): DesktopPreferencesSnapshot {
+  const preferences = loadDesktopPreferencesRecord().value
+  const previewForcedOffline = process.env.OPENSQUILLA_PREVIEW_FORCE_OFFLINE === '1'
+  return {
+    schemaVersion: 2,
+    mainWindowCloseBehavior: preferences.main_window_close_behavior,
+    workbenchPreviewMode: preferences.workbench_preview_mode,
+    effectiveWorkbenchPreviewMode: previewForcedOffline
+      ? 'offline'
+      : preferences.workbench_preview_mode,
+    workbenchPreviewNoticeShown: preferences.workbench_preview_notice_shown,
+    workbenchPreviewForcedOffline: previewForcedOffline,
+    canRunInBackground: canRunDesktopInBackground(),
+    platform: desktopPlatformName(),
+  }
+}
+
+function enqueueDesktopPreferencesUpdate(
+  update: (current: DesktopPreferencesFile) => DesktopPreferencesFile,
+): Promise<DesktopPreferencesSnapshot> {
+  const operation = desktopPreferencesWritePromise.then(async () => {
+    const loaded = loadDesktopPreferencesRecord()
+    if (!loaded.writable) {
+      throw new Error(
+        'Desktop preferences were written by a newer OpenSquilla version and were not changed.',
+      )
+    }
+    const previous = loaded.value
+    const next = update(previous)
+    try {
+      await atomicWriteFile(
+        desktopPreferencesPath(),
+        serializeDesktopPreferences(next),
+        0o600,
+      )
+      desktopPreferencesCache = { value: next, writable: true }
+    } catch (error) {
+      desktopPreferencesCache = { value: previous, writable: true }
+      throw error
+    }
+    return desktopPreferencesSnapshot()
+  })
+  desktopPreferencesWritePromise = operation.then(() => undefined, () => undefined)
+  return operation
+}
+
+async function saveDesktopPreferences(
+  payload: DesktopPreferencesPayload,
+): Promise<DesktopPreferencesSnapshot> {
+  const behavior = payload?.mainWindowCloseBehavior
+  const previewMode = payload?.workbenchPreviewMode
+  const previewNoticeShown = payload?.workbenchPreviewNoticeShown
+  if (
+    behavior !== undefined
+    && behavior !== 'background'
+    && behavior !== 'quit'
+    && behavior !== 'ask'
+  ) {
+    throw new Error('Choose a supported main-window close behavior.')
+  }
+  if (behavior !== undefined && behavior !== 'quit' && !canRunDesktopInBackground()) {
+    throw new Error('Background window mode is unavailable because no restore surface is active.')
+  }
+  if (previewMode !== undefined && previewMode !== 'full' && previewMode !== 'offline') {
+    throw new Error('Choose a supported Workbench preview mode.')
+  }
+  if (previewNoticeShown !== undefined && typeof previewNoticeShown !== 'boolean') {
+    throw new Error('The Workbench preview notice state is invalid.')
+  }
+  if (
+    behavior === undefined
+    && previewMode === undefined
+    && previewNoticeShown === undefined
+  ) {
+    throw new Error('No supported Desktop preference was provided.')
+  }
+  return await enqueueDesktopPreferencesUpdate((current) => ({
+    ...current,
+    ...(behavior !== undefined ? { main_window_close_behavior: behavior } : {}),
+    ...(previewMode !== undefined ? { workbench_preview_mode: previewMode } : {}),
+    ...(previewNoticeShown !== undefined
+      ? { workbench_preview_notice_shown: previewNoticeShown }
+      : {}),
+  }))
+}
+
+function markBackgroundCloseNoticeShown(): void {
+  const loaded = loadDesktopPreferencesRecord()
+  if (!loaded.writable || loaded.value.background_close_notice_shown) return
+  // Update the in-memory snapshot immediately so repeated close events in the
+  // same session cannot emit duplicate balloons while the atomic write queues.
+  desktopPreferencesCache = {
+    value: { ...loaded.value, background_close_notice_shown: true },
+    writable: true,
+  }
+  void enqueueDesktopPreferencesUpdate((current) => ({
+    ...current,
+    background_close_notice_shown: true,
+  })).catch((error) => {
+    desktopLog('background_close_notice_persist_failed', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+  })
 }
 
 async function loadDesktopCredential(): Promise<DesktopConnection | null> {
@@ -1799,6 +2193,7 @@ async function saveDesktopCredential(
   const disableNetworkObservability = Object.prototype.hasOwnProperty.call(payload, 'disableNetworkObservability')
     ? normalizeBooleanSetting(payload.disableNetworkObservability, existing?.disableNetworkObservability ?? false)
     : configDisableNetworkObservability ?? existing?.disableNetworkObservability ?? false
+  const configLocale = desktopLocaleChoice(payload.locale) ?? desktopLocale
 
   if (defaults.requiresApiKey && !encryptedApiKey) throw new Error('API key is required.')
   if (modelRoutingMode === 'llm_ensemble' && !modelRoutingModeAllowed(modelRoutingMode, provider)) {
@@ -1842,6 +2237,7 @@ async function saveDesktopCredential(
       JSON.stringify(credential, null, 2),
       expectedCredential,
       writerReserved,
+      configLocale,
     )
     return credential
   } finally {
@@ -1885,9 +2281,6 @@ async function saveImportedDesktopCredential(
   writerReserved = false,
 ): Promise<DesktopConnection> {
   const profile = primaryDesktopProfile()
-  if (activeDesktopProfile().kind !== 'primary') {
-    throw new Error('Imported credentials can be adopted only into the primary profile.')
-  }
   const expectedCredential = await readOptionalDesktopText(profile.credentialPath)
   const importedConfig = await readOptionalDesktopText(join(profile.home, 'config.toml'))
   if (importedConfig === null) {
@@ -1988,6 +2381,27 @@ function foreignConfigPreambleLines(raw: string): string[] {
   return out
 }
 
+// The Desktop owns the control-ui section's boot fields, while the Gateway
+// owns the operator's persisted notice locale. Preserve only that scalar
+// instead of retaining a whole section whose other settings Desktop
+// must regenerate deterministically.
+function persistedControlUiDefaultLocale(raw: string | null): DesktopLocale | null {
+  if (raw === null) return null
+  let inControlUi = false
+  for (const rawLine of raw.split(/\r?\n/)) {
+    const header = rawLine.trim().match(/^\[\s*([^\]]+?)\s*\](?:\s*#.*)?$/)
+    if (header) {
+      inControlUi = header[1] === 'control_ui'
+      continue
+    }
+    if (!inControlUi) continue
+    const match = rawLine.match(/^\s*default_locale\s*=\s*["']([^"']*)["']\s*(?:#.*)?$/)
+    if (!match) continue
+    return normalizeGatewayLocale(match[1])
+  }
+  return null
+}
+
 async function readOptionalDesktopText(path: string): Promise<string | null> {
   try {
     return await readFile(path, 'utf8')
@@ -2018,9 +2432,11 @@ function renderDesktopConfigAfterPreflight(
   credential: DesktopConnection,
   inspection: RecoveryProtocolResult,
   existingRaw: string | null,
+  defaultLocale: DesktopLocale,
 ): string {
   let preservedForeignSections: string[] = []
   let preservedForeignPreamble: string[] = []
+  const preservedControlUiLocale = persistedControlUiDefaultLocale(existingRaw)
   if (existingRaw !== null) {
     preservedForeignSections = foreignConfigSectionLines(existingRaw)
     preservedForeignPreamble = foreignConfigPreambleLines(existingRaw)
@@ -2050,6 +2466,7 @@ function renderDesktopConfigAfterPreflight(
     '[control_ui]',
     'enabled = true',
     'base_path = "/control"',
+    `default_locale = ${tomlString(preservedControlUiLocale ?? defaultLocale)}`,
     '',
     ...(preservedForeignSections.length ? [...preservedForeignSections, ''] : []),
   ].join('\n')
@@ -2061,6 +2478,7 @@ async function applyDesktopSettingsPair(
   candidateCredential: string,
   expectedCredential: string | null,
   writerReserved = false,
+  defaultLocale = desktopLocale,
 ): Promise<RecoveryProtocolResult> {
   const targetProfileKey = desktopProfileKey(profile)
   if (desktopProfileKey() !== targetProfileKey) {
@@ -2087,6 +2505,7 @@ async function applyDesktopSettingsPair(
       credential,
       inspection,
       expectedConfig,
+      defaultLocale,
     )
     const result = await runRecoveryCli(
       profile,
@@ -2106,7 +2525,7 @@ async function applyDesktopSettingsPair(
       writerReserved,
     )
     recoveryInspection = result
-    if (profile.kind === 'primary') primaryRecoveryInspection = result
+    primaryRecoveryInspection = result
     restartSafe = result.outcome !== 'recovery_required'
     publishRecoveryState()
     if (!restartSafe) {
@@ -2118,7 +2537,7 @@ async function applyDesktopSettingsPair(
       if (!restartSafe) {
         const after = await inspectDesktopProfile(profile)
         recoveryInspection = after
-        if (profile.kind === 'primary') primaryRecoveryInspection = after
+        primaryRecoveryInspection = after
         restartSafe = after.outcome !== 'recovery_required'
       }
       if (restartSafe) {
@@ -2195,6 +2614,7 @@ async function saveDesktopSettings(payload: DesktopSettingsPayload): Promise<Des
 }
 
 function clearReusableGatewayState(): void {
+  artifactPreviewLeaseBroker.clear()
   gatewayState.url = ''
   gatewayState.port = 0
   gatewayState.owned = false
@@ -2481,10 +2901,17 @@ function desktopLocalePath(): string {
 function loadPersistedDesktopLocale(): DesktopLocale | null {
   try {
     const raw = readFileSync(desktopLocalePath(), 'utf8').trim()
-    return DESKTOP_LOCALES.includes(raw as DesktopLocale) ? (raw as DesktopLocale) : null
+    return desktopLocaleChoice(raw)
   } catch {
     return null
   }
+}
+
+function desktopLocaleChoice(raw: unknown): DesktopLocale | null {
+  const requested = String(raw ?? '')
+  return DESKTOP_LOCALES.includes(requested as DesktopLocale)
+    ? requested as DesktopLocale
+    : null
 }
 
 function persistDesktopLocale(locale: DesktopLocale): void {
@@ -2497,11 +2924,12 @@ function persistDesktopLocale(locale: DesktopLocale): void {
 }
 
 function applyDesktopLocaleChoice(raw: unknown): void {
-  const requested = String(raw ?? '')
-  if (!DESKTOP_LOCALES.includes(requested as DesktopLocale)) return
+  const requested = desktopLocaleChoice(raw)
+  if (requested === null) return
   if (requested !== desktopLocale) {
-    desktopLocale = requested as DesktopLocale
+    desktopLocale = requested
     createApplicationMenu()
+    rebuildWindowsTrayMenu()
   }
   persistDesktopLocale(desktopLocale)
 }
@@ -2514,19 +2942,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'menu.checkForUpdates': 'Check for Updates…',
     'menu.relaunchToUpdate': 'Relaunch to Update',
     'menu.downloadDiagnostics': 'Download Diagnostics…',
-    'menu.profile': 'Profile',
-    'menu.showProfile': 'Show Active Profile',
-    'menu.reviewProfile': 'Review Profile Paths…',
-    'menu.switchRecovery': 'Switch to Recovery Profile',
-    'menu.returnPrimary': 'Return to Primary Profile',
-    'attention.title': 'An upgrade workspace was found',
-    'attention.message': 'OpenSquilla is safely using your current workspace. Chats are not affected by this choice.',
-    'attention.detail': 'If the agent identity or memory looks unfamiliar, review the other workspace. OpenSquilla will not delete, merge, or move either workspace.',
-    'attention.currentWorkspace': 'Current workspace',
-    'attention.otherWorkspace': 'Other detected workspace',
-    'attention.later': 'Review Later',
-    'attention.keepCurrent': 'Continue with Current Workspace',
-    'attention.chooseWorkspace': 'Review Other Workspace…',
+    'tray.open': 'Open OpenSquilla',
+    'tray.running': 'OpenSquilla is running in the background',
+    'tray.quit': 'Quit OpenSquilla',
+    'tray.backgroundTitle': 'OpenSquilla is still running',
+    'tray.backgroundDetail': 'Tasks, schedules, and connected channels continue in the background. Open or quit OpenSquilla from the system tray.',
+    'closePrompt.title': 'Close OpenSquilla?',
+    'closePrompt.message': 'What should happen when the main window closes?',
+    'closePrompt.detail': 'Background mode keeps tasks, schedules, and connected channels running. Explicit Quit safely stops the local runtime.',
+    'closePrompt.background': 'Keep running in background',
+    'closePrompt.quit': 'Quit OpenSquilla',
+    'closePrompt.cancel': 'Cancel',
+    'closePrompt.remember': 'Remember my choice',
     'update.newVersionTitle': 'A new version is available',
     'update.newVersionDetail': 'OpenSquilla {version} is available. Download it now?',
     'update.download': 'Download',
@@ -2537,6 +2964,12 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.upToDateTitle': "You're up to date",
     'update.upToDateDetail': 'OpenSquilla {version} is the latest version.',
     'update.errorTitle': 'Update check failed',
+    'update.manifestInvalid': 'The update information is invalid. Please try again later.',
+    'update.sourceUnavailable': 'The update service is temporarily unavailable. Please try again later.',
+    'update.checksumUnavailable': 'The installer cannot be verified because the canonical GitHub checksum is unavailable. No installer was opened.',
+    'update.integrityFailed': 'The downloaded installer failed integrity verification and was deleted.',
+    'update.downloadFailed': 'The update could not be downloaded. Please try again.',
+    'update.installFailed': 'The update installer could not be opened. Please try again.',
     'update.moveToApplications': 'Move OpenSquilla to your Applications folder to enable automatic updates, then try again.',
     'update.gatewayShutdownTimeout': 'OpenSquilla could not stop the local runtime. Try relaunching to update again.',
     'update.mockInstallTitle': 'Mock update restart',
@@ -2550,7 +2983,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.cancel': 'Cancel',
     'cleanup.deleteProfileConfirm': 'Delete profile',
     'cleanup.deleteProfileTitle': 'Delete the current profile?',
-    'cleanup.deleteProfileMessage': 'This permanently deletes the listed current profile data, credential, and logs. Other recovery profiles and backups are kept.',
+    'cleanup.deleteProfileMessage': 'This permanently deletes the listed primary profile data, credential, and logs. Backups are kept.',
     'cleanup.deleteAllConfirm': 'Delete all data',
     'cleanup.deleteAllTitle': 'Delete all OpenSquilla user data?',
     'cleanup.deleteAllMessage': 'OpenSquilla will close first. The deletion starts only after the app and local runtime have fully exited.',
@@ -2558,26 +2991,6 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.abandonTitle': 'Leave the interrupted cleanup?',
     'cleanup.abandonMessage': 'OpenSquilla will preserve every surviving file and archive only the cleanup transaction record.',
     'cleanup.abandonDetail': 'Nothing else will be deleted. Review the remaining profile before continuing to use it.',
-    'migration.nav.title': 'Portable data',
-    'migration.nav.sub': 'Optional copy',
-    'migration.step.badge': 'Optional',
-    'migration.step.heading': 'Legacy Windows Portable data found',
-    'migration.step.subtitle': 'Copy your chats, Agents, and settings into this Desktop app.',
-    'migration.step.assurance': 'Your original Portable data will not be modified or deleted.',
-    'migration.step.sourceLabel': 'Choose Portable data',
-    'migration.step.selectionHint': 'Select a source, then review what will be copied.',
-    'migration.step.candidateVersion': 'Version {version}',
-    'migration.step.candidateSessions': '{n} chats',
-    'migration.step.candidateActivity': 'Last activity {value}',
-    'migration.step.manualTypeLabel': 'Portable data not listed?',
-    'migration.step.manualTypePlaceholder': 'Choose Portable data',
-    'migration.source.cli': 'OpenSquilla CLI',
-    'migration.source.desktop': 'OpenSquilla Desktop',
-    'migration.source.portable': 'Legacy Windows Portable',
-    'migration.step.browse': 'Choose Portable data folder…',
-    'migration.step.preview': 'Review this data',
-    'migration.step.import': 'Copy and continue',
-    'migration.step.skip': 'Not now',
     'migration.overwriteTitle': 'Replace conflicting desktop data?',
     'migration.overwriteMessage': 'The selected installation will replace the current Desktop data.',
     'migration.overwriteDetail': 'A complete timestamped backup will be retained. Confirm the source below before continuing.',
@@ -2625,18 +3038,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.quit': 'Quit',
     'onboarding.step1.continue': 'Continue',
     'onboarding.step2.badge': 'Required',
-    'onboarding.step2.heading': 'Connect a provider',
-    'onboarding.step2.subtitle': 'Choose the provider account the local runtime uses for model calls.',
-    'onboarding.step2.tokenrhythmTitle': 'Recommended: TokenRhythm',
+    'onboarding.step2.heading': 'Model service setup',
+    'onboarding.step2.subtitle': 'Enter an API key to get started.',
+    'onboarding.step2.tokenrhythmTitle': 'TokenRhythm limited-time offer',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm API calls are free for a limited time.',
-    'onboarding.step2.tokenrhythmRegistration': 'During the promotion, register and get an API key to call DeepSeek, GLM, MiniMax, Kimi, and other leading models for free.',
-    'onboarding.step2.tokenrhythmCta': 'Register and get an API key',
-    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Register and get an API key — TokenRhythm (opens in external browser)',
+    'onboarding.step2.tokenrhythmRegistration': 'Register to claim ¥68 in free tokens.',
+    'onboarding.step2.tokenrhythmCta': 'Claim for free',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Claim for free (opens in external browser)',
     'onboarding.step2.otherProviders': 'Other providers',
     'onboarding.step2.apiKey': 'API key',
     'onboarding.step2.endpointSummary': 'Endpoint and direct model',
     'onboarding.step2.baseUrl': 'Base URL',
-    'onboarding.step2.directModel': 'Direct model',
+    'onboarding.step2.directModel': 'Model name',
     'onboarding.step2.back': 'Back',
     'onboarding.step2.next': 'Next',
     'onboarding.step3.badge': 'Advanced',
@@ -2665,19 +3078,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'menu.checkForUpdates': '检查更新…',
     'menu.relaunchToUpdate': '重启以更新',
     'menu.downloadDiagnostics': '下载诊断信息…',
-    'menu.profile': '配置',
-    'menu.showProfile': '显示当前配置',
-    'menu.reviewProfile': '检查配置路径…',
-    'menu.switchRecovery': '切换到恢复配置',
-    'menu.returnPrimary': '返回主配置',
-    'attention.title': '发现升级前的工作区',
-    'attention.message': 'OpenSquilla 正在安全地使用当前工作区，聊天记录不受此选择影响。',
-    'attention.detail': '如果 Agent 的身份或记忆看起来陌生，可以核对另一个工作区。OpenSquilla 不会删除、合并或移动任何一边。',
-    'attention.currentWorkspace': '当前工作区',
-    'attention.otherWorkspace': '检测到的其他工作区',
-    'attention.later': '稍后核对',
-    'attention.keepCurrent': '继续使用当前工作区',
-    'attention.chooseWorkspace': '核对其他工作区…',
+    'tray.open': '打开 OpenSquilla',
+    'tray.running': 'OpenSquilla 正在后台运行',
+    'tray.quit': '退出 OpenSquilla',
+    'tray.backgroundTitle': 'OpenSquilla 仍在运行',
+    'tray.backgroundDetail': '任务、定时任务和已连接渠道会继续在后台运行。可从系统托盘打开或退出 OpenSquilla。',
+    'closePrompt.title': '关闭 OpenSquilla？',
+    'closePrompt.message': '关闭主窗口时要执行什么操作？',
+    'closePrompt.detail': '后台模式会继续运行任务、定时任务和已连接渠道；显式退出会安全停止本地运行时。',
+    'closePrompt.background': '继续在后台运行',
+    'closePrompt.quit': '退出 OpenSquilla',
+    'closePrompt.cancel': '取消',
+    'closePrompt.remember': '记住我的选择',
     'update.newVersionTitle': '有新版本可用',
     'update.newVersionDetail': 'OpenSquilla {version} 已发布，现在下载吗？',
     'update.download': '下载',
@@ -2688,6 +3100,12 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.upToDateTitle': '已是最新版本',
     'update.upToDateDetail': 'OpenSquilla {version} 已是最新版本。',
     'update.errorTitle': '检查更新失败',
+    'update.manifestInvalid': '更新信息无效，请稍后重试。',
+    'update.sourceUnavailable': '更新服务暂时不可用，请稍后重试。',
+    'update.checksumUnavailable': '无法获取 GitHub 官方校验和，因此不能验证安装包；未打开任何安装包。',
+    'update.integrityFailed': '下载的安装包未通过完整性校验，已将其删除。',
+    'update.downloadFailed': '更新下载安装失败，请重试。',
+    'update.installFailed': '无法打开更新安装包，请重试。',
     'update.moveToApplications': '请先将 OpenSquilla 移动到"应用程序"文件夹以启用自动更新，然后重试。',
     'update.gatewayShutdownTimeout': 'OpenSquilla 无法停止本地运行时。请再次尝试重启以更新。',
     'update.mockInstallTitle': '模拟重启更新',
@@ -2701,7 +3119,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.cancel': '取消',
     'cleanup.deleteProfileConfirm': '删除配置文件',
     'cleanup.deleteProfileTitle': '删除当前配置文件？',
-    'cleanup.deleteProfileMessage': '这会永久删除列出的当前配置文件数据、凭据和日志。其他恢复配置文件和备份会保留。',
+    'cleanup.deleteProfileMessage': '这会永久删除列出的主配置数据、凭据和日志。备份会保留。',
     'cleanup.deleteAllConfirm': '删除全部数据',
     'cleanup.deleteAllTitle': '删除全部 OpenSquilla 用户数据？',
     'cleanup.deleteAllMessage': 'OpenSquilla 会先退出。只有应用和本地运行时完全退出后，删除才会开始。',
@@ -2709,26 +3127,6 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.abandonTitle': '结束未完成的清理？',
     'cleanup.abandonMessage': 'OpenSquilla 会保留所有仍存在的文件，仅归档清理事务记录。',
     'cleanup.abandonDetail': '不会继续删除任何内容。继续使用前请检查剩余的配置文件。',
-    'migration.nav.title': 'Portable 数据',
-    'migration.nav.sub': '可选复制',
-    'migration.step.badge': '可选',
-    'migration.step.heading': '发现旧版 Windows Portable 数据',
-    'migration.step.subtitle': '可以将原来的聊天、Agent 和设置复制到当前桌面安装版。',
-    'migration.step.assurance': '原 Portable 数据不会被修改或删除。',
-    'migration.step.sourceLabel': '选择 Portable 数据',
-    'migration.step.selectionHint': '选择一个来源后，先核对将复制的内容。',
-    'migration.step.candidateVersion': '版本 {version}',
-    'migration.step.candidateSessions': '{n} 个聊天',
-    'migration.step.candidateActivity': '最近活动 {value}',
-    'migration.step.manualTypeLabel': '没有找到 Portable 数据？',
-    'migration.step.manualTypePlaceholder': '选择 Portable 数据',
-    'migration.source.cli': 'OpenSquilla 终端安装版',
-    'migration.source.desktop': 'OpenSquilla 桌面安装版',
-    'migration.source.portable': '旧版 Windows Portable',
-    'migration.step.browse': '选择 Portable 数据目录…',
-    'migration.step.preview': '核对这套数据',
-    'migration.step.import': '复制并继续',
-    'migration.step.skip': '暂不转移',
     'migration.overwriteTitle': '替换冲突的桌面数据？',
     'migration.overwriteMessage': '所选安装的数据将替换当前桌面数据。',
     'migration.overwriteDetail': '系统会保留完整的时间戳备份。继续前请确认下方的数据来源。',
@@ -2776,18 +3174,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.quit': '退出',
     'onboarding.step1.continue': '继续',
     'onboarding.step2.badge': '必填',
-    'onboarding.step2.heading': '连接提供商',
-    'onboarding.step2.subtitle': '选择本地运行时用于模型调用的提供商账户。',
-    'onboarding.step2.tokenrhythmTitle': '推荐使用 TokenRhythm',
+    'onboarding.step2.heading': '模型服务配置',
+    'onboarding.step2.subtitle': '输入 API 密钥即可开始使用',
+    'onboarding.step2.tokenrhythmTitle': 'TokenRhythm 限时福利',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm API 调用限时免费。',
-    'onboarding.step2.tokenrhythmRegistration': '活动期间，注册并获取 API Key，即可免费调用 DeepSeek、GLM、MiniMax、Kimi 等主流模型。',
-    'onboarding.step2.tokenrhythmCta': '注册并获取 API Key',
-    'onboarding.step2.tokenrhythmCtaExternalLabel': '注册并获取 API Key — TokenRhythm（在外部浏览器中打开）',
+    'onboarding.step2.tokenrhythmRegistration': '注册即领价值 68 元 Token',
+    'onboarding.step2.tokenrhythmCta': '免费领取',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': '免费领取价值 68 元 TokenRhythm Token（在外部浏览器中打开）',
     'onboarding.step2.otherProviders': '其他提供商',
     'onboarding.step2.apiKey': 'API 密钥',
     'onboarding.step2.endpointSummary': '端点和直连模型',
     'onboarding.step2.baseUrl': 'Base URL',
-    'onboarding.step2.directModel': '直连模型',
+    'onboarding.step2.directModel': '模型名称',
     'onboarding.step2.back': '返回',
     'onboarding.step2.next': '下一步',
     'onboarding.step3.badge': '高级',
@@ -2816,19 +3214,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'menu.checkForUpdates': 'アップデートを確認…',
     'menu.relaunchToUpdate': '再起動してアップデート',
     'menu.downloadDiagnostics': '診断情報をダウンロード…',
-    'menu.profile': 'プロファイル',
-    'menu.showProfile': '使用中のプロファイルを表示',
-    'menu.reviewProfile': 'プロファイルパスを確認…',
-    'menu.switchRecovery': '復旧プロファイルに切り替え',
-    'menu.returnPrimary': 'プライマリプロファイルに戻る',
-    'attention.title': 'アップグレード前のワークスペースが見つかりました',
-    'attention.message': 'OpenSquilla は現在のワークスペースを安全に使用しています。チャット履歴はこの選択の影響を受けません。',
-    'attention.detail': 'エージェントの本人情報や記憶に違和感がある場合は、もう一方のワークスペースを確認してください。どちらも削除、結合、移動されません。',
-    'attention.currentWorkspace': '現在のワークスペース',
-    'attention.otherWorkspace': '検出された別のワークスペース',
-    'attention.later': '後で確認',
-    'attention.keepCurrent': '現在のワークスペースを使う',
-    'attention.chooseWorkspace': '別のワークスペースを確認…',
+    'tray.open': 'OpenSquilla を開く',
+    'tray.running': 'OpenSquilla はバックグラウンドで実行中です',
+    'tray.quit': 'OpenSquilla を終了',
+    'tray.backgroundTitle': 'OpenSquilla は引き続き実行中です',
+    'tray.backgroundDetail': 'タスク、スケジュール、接続済みチャンネルはバックグラウンドで続行します。システムトレイから開くか終了できます。',
+    'closePrompt.title': 'OpenSquilla を閉じますか？',
+    'closePrompt.message': 'メインウィンドウを閉じるときの動作を選択してください。',
+    'closePrompt.detail': 'バックグラウンドモードではタスク、スケジュール、接続済みチャンネルが継続します。明示的に終了するとローカルランタイムを安全に停止します。',
+    'closePrompt.background': 'バックグラウンドで続行',
+    'closePrompt.quit': 'OpenSquilla を終了',
+    'closePrompt.cancel': 'キャンセル',
+    'closePrompt.remember': 'この選択を記憶する',
     'update.newVersionTitle': '新しいバージョンが利用可能です',
     'update.newVersionDetail': 'OpenSquilla {version} が利用可能です。今すぐダウンロードしますか？',
     'update.download': 'ダウンロード',
@@ -2839,6 +3236,12 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.upToDateTitle': '最新の状態です',
     'update.upToDateDetail': 'OpenSquilla {version} が最新バージョンです。',
     'update.errorTitle': 'アップデートの確認に失敗しました',
+    'update.manifestInvalid': 'アップデート情報が無効です。しばらくしてから再試行してください。',
+    'update.sourceUnavailable': 'アップデートサービスを一時的に利用できません。後でもう一度お試しください。',
+    'update.checksumUnavailable': 'GitHub の正規チェックサムを取得できないため、インストーラを検証できません。インストーラは開かれていません。',
+    'update.integrityFailed': 'ダウンロードしたインストーラは整合性検証に失敗したため削除されました。',
+    'update.downloadFailed': 'アップデートをダウンロードできませんでした。もう一度お試しください。',
+    'update.installFailed': 'アップデートインストーラを開けませんでした。もう一度お試しください。',
     'update.moveToApplications': '自動アップデートを有効にするには、OpenSquilla を「アプリケーション」フォルダに移動してから再試行してください。',
     'update.gatewayShutdownTimeout': 'ローカルランタイムを停止できませんでした。もう一度、再起動してアップデートをお試しください。',
     'uninstall.confirmTitle': 'ローカルの OpenSquilla デスクトップデータを削除しますか？',
@@ -2850,7 +3253,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.cancel': 'キャンセル',
     'cleanup.deleteProfileConfirm': 'プロファイルを削除',
     'cleanup.deleteProfileTitle': '現在のプロファイルを削除しますか？',
-    'cleanup.deleteProfileMessage': '一覧の現在のプロファイルデータ、認証情報、ログを完全に削除します。他のリカバリープロファイルとバックアップは保持されます。',
+    'cleanup.deleteProfileMessage': '一覧のプライマリプロファイルデータ、認証情報、ログを完全に削除します。バックアップは保持されます。',
     'cleanup.deleteAllConfirm': 'すべてのデータを削除',
     'cleanup.deleteAllTitle': 'OpenSquilla のすべてのユーザーデータを削除しますか？',
     'cleanup.deleteAllMessage': 'OpenSquilla を先に終了します。アプリとローカルランタイムが完全に終了した後にのみ削除を開始します。',
@@ -2858,26 +3261,6 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.abandonTitle': '中断したクリーンアップを終了しますか？',
     'cleanup.abandonMessage': '残っているすべてのファイルを保持し、クリーンアップのトランザクション記録だけをアーカイブします。',
     'cleanup.abandonDetail': 'これ以上は削除しません。使用を続ける前に残りのプロファイルを確認してください。',
-    'migration.nav.title': 'Portable データ',
-    'migration.nav.sub': '任意のコピー',
-    'migration.step.badge': '任意',
-    'migration.step.heading': '旧 Windows Portable データが見つかりました',
-    'migration.step.subtitle': 'チャット、Agent、設定をこの Desktop アプリにコピーできます。',
-    'migration.step.assurance': '元の Portable データは変更も削除もされません。',
-    'migration.step.sourceLabel': 'Portable データを選択',
-    'migration.step.selectionHint': 'コピー元を選択してから、コピー内容を確認してください。',
-    'migration.step.candidateVersion': 'バージョン {version}',
-    'migration.step.candidateSessions': '{n} 件のチャット',
-    'migration.step.candidateActivity': '最終利用 {value}',
-    'migration.step.manualTypeLabel': 'Portable データが表示されない場合',
-    'migration.step.manualTypePlaceholder': 'Portable データを選択',
-    'migration.source.cli': 'OpenSquilla CLI',
-    'migration.source.desktop': 'OpenSquilla Desktop',
-    'migration.source.portable': '旧 Windows Portable',
-    'migration.step.browse': 'Portable データフォルダーを選択…',
-    'migration.step.preview': 'このデータを確認',
-    'migration.step.import': 'コピーして続行',
-    'migration.step.skip': '今は転送しない',
     'migration.overwriteTitle': '競合するデスクトップデータを置き換えますか？',
     'migration.overwriteMessage': '選択したインストールのデータで現在の Desktop データを置き換えます。',
     'migration.overwriteDetail': 'タイムスタンプ付きの完全なバックアップが保持されます。続行する前に以下の移行元を確認してください。',
@@ -2922,18 +3305,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.quit': '終了',
     'onboarding.step1.continue': '続行',
     'onboarding.step2.badge': '必須',
-    'onboarding.step2.heading': 'プロバイダーを接続',
-    'onboarding.step2.subtitle': 'ローカルランタイムがモデル呼び出しに使用するプロバイダーアカウントを選択します。',
-    'onboarding.step2.tokenrhythmTitle': '推奨：TokenRhythm',
+    'onboarding.step2.heading': 'モデルサービス設定',
+    'onboarding.step2.subtitle': 'API キーを入力して利用を開始します。',
+    'onboarding.step2.tokenrhythmTitle': 'TokenRhythm 期間限定特典',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm API は期間限定で無料です。',
-    'onboarding.step2.tokenrhythmRegistration': 'キャンペーン期間中に登録して API キーを取得すると、DeepSeek、GLM、MiniMax、Kimi などの主要モデルを無料で利用できます。',
-    'onboarding.step2.tokenrhythmCta': '登録して API キーを取得',
-    'onboarding.step2.tokenrhythmCtaExternalLabel': '登録して API キーを取得 — TokenRhythm（外部ブラウザーで開きます）',
+    'onboarding.step2.tokenrhythmRegistration': '登録で68元相当のTokenを無料進呈',
+    'onboarding.step2.tokenrhythmCta': '無料で受け取る',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': '無料で受け取る（外部ブラウザーで開きます）',
     'onboarding.step2.otherProviders': 'その他のプロバイダー',
     'onboarding.step2.apiKey': 'API キー',
     'onboarding.step2.endpointSummary': 'エンドポイントと直接モデル',
     'onboarding.step2.baseUrl': 'Base URL',
-    'onboarding.step2.directModel': '直接モデル',
+    'onboarding.step2.directModel': 'モデル名',
     'onboarding.step2.back': '戻る',
     'onboarding.step2.next': '次へ',
     'onboarding.nav.routing.title': 'ルーティング',
@@ -2965,19 +3348,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'menu.checkForUpdates': 'Rechercher les mises à jour…',
     'menu.relaunchToUpdate': 'Relancer pour mettre à jour',
     'menu.downloadDiagnostics': 'Télécharger le diagnostic…',
-    'menu.profile': 'Profil',
-    'menu.showProfile': 'Afficher le profil actif',
-    'menu.reviewProfile': 'Vérifier les chemins du profil…',
-    'menu.switchRecovery': 'Basculer vers un profil de récupération',
-    'menu.returnPrimary': 'Revenir au profil principal',
-    'attention.title': 'Un espace de travail antérieur a été trouvé',
-    'attention.message': 'OpenSquilla utilise en toute sécurité votre espace de travail actuel. Les discussions ne sont pas affectées par ce choix.',
-    'attention.detail': 'Si l’identité ou la mémoire de l’agent semble inhabituelle, vérifiez l’autre espace de travail. Aucun espace ne sera supprimé, fusionné ou déplacé.',
-    'attention.currentWorkspace': 'Espace de travail actuel',
-    'attention.otherWorkspace': 'Autre espace détecté',
-    'attention.later': 'Vérifier plus tard',
-    'attention.keepCurrent': 'Continuer avec l’espace actuel',
-    'attention.chooseWorkspace': 'Vérifier l’autre espace…',
+    'tray.open': 'Ouvrir OpenSquilla',
+    'tray.running': 'OpenSquilla fonctionne en arrière-plan',
+    'tray.quit': 'Quitter OpenSquilla',
+    'tray.backgroundTitle': 'OpenSquilla fonctionne toujours',
+    'tray.backgroundDetail': 'Les tâches, planifications et canaux connectés continuent en arrière-plan. Ouvrez ou quittez OpenSquilla depuis la zone de notification.',
+    'closePrompt.title': 'Fermer OpenSquilla ?',
+    'closePrompt.message': 'Que doit-il se passer à la fermeture de la fenêtre principale ?',
+    'closePrompt.detail': 'Le mode arrière-plan maintient les tâches, planifications et canaux connectés. Quitter explicitement arrête le runtime local en toute sécurité.',
+    'closePrompt.background': 'Continuer en arrière-plan',
+    'closePrompt.quit': 'Quitter OpenSquilla',
+    'closePrompt.cancel': 'Annuler',
+    'closePrompt.remember': 'Mémoriser mon choix',
     'update.newVersionTitle': 'Une nouvelle version est disponible',
     'update.newVersionDetail': 'OpenSquilla {version} est disponible. Télécharger maintenant ?',
     'update.download': 'Télécharger',
@@ -2988,6 +3370,12 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.upToDateTitle': 'Vous êtes à jour',
     'update.upToDateDetail': 'OpenSquilla {version} est la dernière version.',
     'update.errorTitle': 'Échec de la recherche de mises à jour',
+    'update.manifestInvalid': 'Les informations de mise à jour sont invalides. Réessayez plus tard.',
+    'update.sourceUnavailable': 'Le service de mise à jour est temporairement indisponible. Réessayez plus tard.',
+    'update.checksumUnavailable': 'Le programme d’installation ne peut pas être vérifié car la somme de contrôle GitHub officielle est indisponible. Aucun programme n’a été ouvert.',
+    'update.integrityFailed': 'Le programme d’installation téléchargé a échoué au contrôle d’intégrité et a été supprimé.',
+    'update.downloadFailed': 'Impossible de télécharger la mise à jour. Réessayez.',
+    'update.installFailed': 'Impossible d’ouvrir le programme d’installation. Réessayez.',
     'update.moveToApplications': 'Déplacez OpenSquilla dans votre dossier Applications pour activer les mises à jour automatiques, puis réessayez.',
     'update.gatewayShutdownTimeout': 'OpenSquilla n\'a pas pu arrêter le runtime local. Réessayez de relancer la mise à jour.',
     'uninstall.confirmTitle': 'Supprimer les données locales du bureau OpenSquilla ?',
@@ -2999,7 +3387,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.cancel': 'Annuler',
     'cleanup.deleteProfileConfirm': 'Supprimer le profil',
     'cleanup.deleteProfileTitle': 'Supprimer le profil actuel ?',
-    'cleanup.deleteProfileMessage': 'Cette action supprime définitivement les données, l’identifiant et les journaux listés du profil actuel. Les autres profils de récupération et sauvegardes sont conservés.',
+    'cleanup.deleteProfileMessage': 'Cette action supprime définitivement les données, l’identifiant et les journaux listés du profil principal. Les sauvegardes sont conservées.',
     'cleanup.deleteAllConfirm': 'Supprimer toutes les données',
     'cleanup.deleteAllTitle': 'Supprimer toutes les données utilisateur OpenSquilla ?',
     'cleanup.deleteAllMessage': 'OpenSquilla va d’abord se fermer. La suppression ne commence qu’après l’arrêt complet de l’application et de l’environnement local.',
@@ -3007,26 +3395,6 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.abandonTitle': 'Quitter le nettoyage interrompu ?',
     'cleanup.abandonMessage': 'OpenSquilla conserve tous les fichiers restants et archive uniquement l’enregistrement de transaction du nettoyage.',
     'cleanup.abandonDetail': 'Aucun autre élément ne sera supprimé. Vérifiez le profil restant avant de continuer à l’utiliser.',
-    'migration.nav.title': 'Données Portable',
-    'migration.nav.sub': 'Copie facultative',
-    'migration.step.badge': 'Facultatif',
-    'migration.step.heading': 'Données Windows Portable anciennes détectées',
-    'migration.step.subtitle': 'Copiez vos discussions, Agents et réglages dans cette application Desktop.',
-    'migration.step.assurance': 'Les données Portable d’origine ne seront ni modifiées ni supprimées.',
-    'migration.step.sourceLabel': 'Choisir les données Portable',
-    'migration.step.selectionHint': 'Sélectionnez une source, puis vérifiez ce qui sera copié.',
-    'migration.step.candidateVersion': 'Version {version}',
-    'migration.step.candidateSessions': '{n} discussions',
-    'migration.step.candidateActivity': 'Dernière activité {value}',
-    'migration.step.manualTypeLabel': 'Données Portable absentes ?',
-    'migration.step.manualTypePlaceholder': 'Choisir des données Portable',
-    'migration.source.cli': 'OpenSquilla CLI',
-    'migration.source.desktop': 'OpenSquilla Desktop',
-    'migration.source.portable': 'Ancien Windows Portable',
-    'migration.step.browse': 'Choisir le dossier de données Portable…',
-    'migration.step.preview': 'Vérifier ces données',
-    'migration.step.import': 'Copier et continuer',
-    'migration.step.skip': 'Pas maintenant',
     'migration.overwriteTitle': 'Remplacer les données de bureau en conflit ?',
     'migration.overwriteMessage': 'L’installation sélectionnée remplacera les données Desktop actuelles.',
     'migration.overwriteDetail': 'Une sauvegarde complète horodatée sera conservée. Vérifiez la source ci-dessous avant de continuer.',
@@ -3071,18 +3439,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.quit': 'Quitter',
     'onboarding.step1.continue': 'Continuer',
     'onboarding.step2.badge': 'Requis',
-    'onboarding.step2.heading': 'Connecter un fournisseur',
-    'onboarding.step2.subtitle': 'Choisissez le compte fournisseur utilisé par le runtime local pour les appels de modèle.',
-    'onboarding.step2.tokenrhythmTitle': 'Recommandé : TokenRhythm',
+    'onboarding.step2.heading': 'Configuration du service de modèles',
+    'onboarding.step2.subtitle': 'Saisissez une clé API pour commencer.',
+    'onboarding.step2.tokenrhythmTitle': 'Offre limitée TokenRhythm',
     'onboarding.step2.tokenrhythmValue': 'Les appels à l’API TokenRhythm sont gratuits pendant une durée limitée.',
-    'onboarding.step2.tokenrhythmRegistration': 'Pendant l’offre, inscrivez-vous et obtenez une clé API pour appeler gratuitement DeepSeek, GLM, MiniMax, Kimi et d’autres modèles majeurs.',
-    'onboarding.step2.tokenrhythmCta': 'S’inscrire et obtenir une clé API',
-    'onboarding.step2.tokenrhythmCtaExternalLabel': 'S’inscrire et obtenir une clé API — TokenRhythm (s’ouvre dans le navigateur externe)',
+    'onboarding.step2.tokenrhythmRegistration': 'Inscrivez-vous pour recevoir 68 ¥ de tokens gratuits.',
+    'onboarding.step2.tokenrhythmCta': 'Obtenir gratuitement',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Obtenir gratuitement (s’ouvre dans le navigateur externe)',
     'onboarding.step2.otherProviders': 'Autres fournisseurs',
     'onboarding.step2.apiKey': 'Clé API',
     'onboarding.step2.endpointSummary': 'Point de terminaison et modèle direct',
     'onboarding.step2.baseUrl': 'Base URL',
-    'onboarding.step2.directModel': 'Modèle direct',
+    'onboarding.step2.directModel': 'Nom du modèle',
     'onboarding.step2.back': 'Retour',
     'onboarding.step2.next': 'Suivant',
     'onboarding.nav.routing.title': 'Routage',
@@ -3114,19 +3482,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'menu.checkForUpdates': 'Nach Updates suchen…',
     'menu.relaunchToUpdate': 'Zum Aktualisieren neu starten',
     'menu.downloadDiagnostics': 'Diagnose herunterladen…',
-    'menu.profile': 'Profil',
-    'menu.showProfile': 'Aktives Profil anzeigen',
-    'menu.reviewProfile': 'Profilpfade prüfen…',
-    'menu.switchRecovery': 'Zum Wiederherstellungsprofil wechseln',
-    'menu.returnPrimary': 'Zum Hauptprofil zurückkehren',
-    'attention.title': 'Ein früherer Arbeitsbereich wurde gefunden',
-    'attention.message': 'OpenSquilla verwendet den aktuellen Arbeitsbereich sicher weiter. Chats werden von dieser Auswahl nicht beeinflusst.',
-    'attention.detail': 'Wenn Identität oder Erinnerung des Agenten ungewohnt wirken, prüfen Sie den anderen Arbeitsbereich. Keiner wird gelöscht, zusammengeführt oder verschoben.',
-    'attention.currentWorkspace': 'Aktueller Arbeitsbereich',
-    'attention.otherWorkspace': 'Anderer erkannter Arbeitsbereich',
-    'attention.later': 'Später prüfen',
-    'attention.keepCurrent': 'Aktuellen Arbeitsbereich verwenden',
-    'attention.chooseWorkspace': 'Anderen Arbeitsbereich prüfen…',
+    'tray.open': 'OpenSquilla öffnen',
+    'tray.running': 'OpenSquilla wird im Hintergrund ausgeführt',
+    'tray.quit': 'OpenSquilla beenden',
+    'tray.backgroundTitle': 'OpenSquilla wird weiter ausgeführt',
+    'tray.backgroundDetail': 'Aufgaben, Zeitpläne und verbundene Kanäle laufen im Hintergrund weiter. Öffnen oder beenden Sie OpenSquilla über den Infobereich.',
+    'closePrompt.title': 'OpenSquilla schließen?',
+    'closePrompt.message': 'Was soll beim Schließen des Hauptfensters geschehen?',
+    'closePrompt.detail': 'Im Hintergrundmodus laufen Aufgaben, Zeitpläne und verbundene Kanäle weiter. Beim expliziten Beenden wird die lokale Laufzeit sicher gestoppt.',
+    'closePrompt.background': 'Im Hintergrund weiter ausführen',
+    'closePrompt.quit': 'OpenSquilla beenden',
+    'closePrompt.cancel': 'Abbrechen',
+    'closePrompt.remember': 'Auswahl merken',
     'update.newVersionTitle': 'Eine neue Version ist verfügbar',
     'update.newVersionDetail': 'OpenSquilla {version} ist verfügbar. Jetzt herunterladen?',
     'update.download': 'Herunterladen',
@@ -3137,6 +3504,12 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.upToDateTitle': 'Sie sind auf dem neuesten Stand',
     'update.upToDateDetail': 'OpenSquilla {version} ist die neueste Version.',
     'update.errorTitle': 'Update-Prüfung fehlgeschlagen',
+    'update.manifestInvalid': 'Die Update-Informationen sind ungültig. Versuchen Sie es später erneut.',
+    'update.sourceUnavailable': 'Der Update-Dienst ist vorübergehend nicht verfügbar. Versuchen Sie es später erneut.',
+    'update.checksumUnavailable': 'Das Installationsprogramm kann nicht geprüft werden, weil die offizielle GitHub-Prüfsumme nicht verfügbar ist. Es wurde nichts geöffnet.',
+    'update.integrityFailed': 'Das heruntergeladene Installationsprogramm hat die Integritätsprüfung nicht bestanden und wurde gelöscht.',
+    'update.downloadFailed': 'Das Update konnte nicht heruntergeladen werden. Versuchen Sie es erneut.',
+    'update.installFailed': 'Das Update-Installationsprogramm konnte nicht geöffnet werden. Versuchen Sie es erneut.',
     'update.moveToApplications': 'Verschieben Sie OpenSquilla in Ihren Programme-Ordner, um automatische Updates zu aktivieren, und versuchen Sie es erneut.',
     'update.gatewayShutdownTimeout': 'OpenSquilla konnte die lokale Laufzeitumgebung nicht stoppen. Versuchen Sie erneut, zum Aktualisieren neu zu starten.',
     'uninstall.confirmTitle': 'Lokale OpenSquilla-Desktop-Daten löschen?',
@@ -3148,7 +3521,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.cancel': 'Abbrechen',
     'cleanup.deleteProfileConfirm': 'Profil löschen',
     'cleanup.deleteProfileTitle': 'Aktuelles Profil löschen?',
-    'cleanup.deleteProfileMessage': 'Die aufgeführten Daten, Zugangsdaten und Protokolle des aktuellen Profils werden dauerhaft gelöscht. Andere Wiederherstellungsprofile und Sicherungen bleiben erhalten.',
+    'cleanup.deleteProfileMessage': 'Die aufgeführten Daten, Zugangsdaten und Protokolle des Hauptprofils werden dauerhaft gelöscht. Sicherungen bleiben erhalten.',
     'cleanup.deleteAllConfirm': 'Alle Daten löschen',
     'cleanup.deleteAllTitle': 'Alle OpenSquilla-Benutzerdaten löschen?',
     'cleanup.deleteAllMessage': 'OpenSquilla wird zuerst beendet. Die Löschung beginnt erst, wenn App und lokale Laufzeit vollständig beendet sind.',
@@ -3156,26 +3529,6 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.abandonTitle': 'Unterbrochene Bereinigung verlassen?',
     'cleanup.abandonMessage': 'OpenSquilla behält alle verbliebenen Dateien und archiviert nur den Transaktionsdatensatz der Bereinigung.',
     'cleanup.abandonDetail': 'Es wird nichts weiter gelöscht. Prüfen Sie das verbleibende Profil, bevor Sie es weiter verwenden.',
-    'migration.nav.title': 'Portable-Daten',
-    'migration.nav.sub': 'Optionale Kopie',
-    'migration.step.badge': 'Optional',
-    'migration.step.heading': 'Ältere Windows-Portable-Daten gefunden',
-    'migration.step.subtitle': 'Kopieren Sie Chats, Agents und Einstellungen in diese Desktop-App.',
-    'migration.step.assurance': 'Die ursprünglichen Portable-Daten werden weder geändert noch gelöscht.',
-    'migration.step.sourceLabel': 'Portable-Daten auswählen',
-    'migration.step.selectionHint': 'Wählen Sie eine Quelle und prüfen Sie dann, was kopiert wird.',
-    'migration.step.candidateVersion': 'Version {version}',
-    'migration.step.candidateSessions': '{n} Chats',
-    'migration.step.candidateActivity': 'Letzte Aktivität {value}',
-    'migration.step.manualTypeLabel': 'Portable-Daten fehlen?',
-    'migration.step.manualTypePlaceholder': 'Portable-Daten auswählen',
-    'migration.source.cli': 'OpenSquilla CLI',
-    'migration.source.desktop': 'OpenSquilla Desktop',
-    'migration.source.portable': 'Älteres Windows Portable',
-    'migration.step.browse': 'Portable-Datenordner auswählen…',
-    'migration.step.preview': 'Diese Daten prüfen',
-    'migration.step.import': 'Kopieren und fortfahren',
-    'migration.step.skip': 'Jetzt nicht',
     'migration.overwriteTitle': 'Konfliktierende Desktop-Daten ersetzen?',
     'migration.overwriteMessage': 'Die ausgewählte Installation ersetzt die aktuellen Desktop-Daten.',
     'migration.overwriteDetail': 'Eine vollständige Sicherung mit Zeitstempel bleibt erhalten. Prüfen Sie vor dem Fortfahren die Quelle unten.',
@@ -3220,18 +3573,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.quit': 'Beenden',
     'onboarding.step1.continue': 'Weiter',
     'onboarding.step2.badge': 'Erforderlich',
-    'onboarding.step2.heading': 'Anbieter verbinden',
-    'onboarding.step2.subtitle': 'Wählen Sie das Anbieterkonto, das die lokale Laufzeitumgebung für Modellaufrufe verwendet.',
-    'onboarding.step2.tokenrhythmTitle': 'Empfohlen: TokenRhythm',
+    'onboarding.step2.heading': 'Modellservice konfigurieren',
+    'onboarding.step2.subtitle': 'Geben Sie einen API-Schlüssel ein, um zu beginnen.',
+    'onboarding.step2.tokenrhythmTitle': 'TokenRhythm-Aktion',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm-API-Aufrufe sind für kurze Zeit kostenlos.',
-    'onboarding.step2.tokenrhythmRegistration': 'Während der Aktion registrieren, API-Schlüssel erhalten und DeepSeek, GLM, MiniMax, Kimi und weitere führende Modelle kostenlos aufrufen.',
-    'onboarding.step2.tokenrhythmCta': 'Registrieren und API-Schlüssel erhalten',
-    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Registrieren und API-Schlüssel erhalten — TokenRhythm (wird im externen Browser geöffnet)',
+    'onboarding.step2.tokenrhythmRegistration': 'Registrieren und 68 ¥ Gratis-Token erhalten.',
+    'onboarding.step2.tokenrhythmCta': 'Kostenlos erhalten',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Kostenlos erhalten (wird im externen Browser geöffnet)',
     'onboarding.step2.otherProviders': 'Weitere Anbieter',
     'onboarding.step2.apiKey': 'API-Schlüssel',
     'onboarding.step2.endpointSummary': 'Endpunkt und direktes Modell',
     'onboarding.step2.baseUrl': 'Base URL',
-    'onboarding.step2.directModel': 'Direktes Modell',
+    'onboarding.step2.directModel': 'Modellname',
     'onboarding.step2.back': 'Zurück',
     'onboarding.step2.next': 'Weiter',
     'onboarding.nav.routing.title': 'Routing',
@@ -3263,19 +3616,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'menu.checkForUpdates': 'Buscar actualizaciones…',
     'menu.relaunchToUpdate': 'Reiniciar para actualizar',
     'menu.downloadDiagnostics': 'Descargar diagnóstico…',
-    'menu.profile': 'Perfil',
-    'menu.showProfile': 'Mostrar perfil activo',
-    'menu.reviewProfile': 'Revisar rutas del perfil…',
-    'menu.switchRecovery': 'Cambiar al perfil de recuperación',
-    'menu.returnPrimary': 'Volver al perfil principal',
-    'attention.title': 'Se encontró un espacio de trabajo anterior',
-    'attention.message': 'OpenSquilla está usando de forma segura el espacio de trabajo actual. Los chats no se ven afectados por esta elección.',
-    'attention.detail': 'Si la identidad o la memoria del agente parecen extrañas, revisa el otro espacio de trabajo. Ninguno se eliminará, combinará ni moverá.',
-    'attention.currentWorkspace': 'Espacio de trabajo actual',
-    'attention.otherWorkspace': 'Otro espacio detectado',
-    'attention.later': 'Revisar más tarde',
-    'attention.keepCurrent': 'Continuar con el espacio actual',
-    'attention.chooseWorkspace': 'Revisar el otro espacio…',
+    'tray.open': 'Abrir OpenSquilla',
+    'tray.running': 'OpenSquilla se ejecuta en segundo plano',
+    'tray.quit': 'Salir de OpenSquilla',
+    'tray.backgroundTitle': 'OpenSquilla sigue en ejecución',
+    'tray.backgroundDetail': 'Las tareas, programaciones y canales conectados continúan en segundo plano. Abre o cierra OpenSquilla desde la bandeja del sistema.',
+    'closePrompt.title': '¿Cerrar OpenSquilla?',
+    'closePrompt.message': '¿Qué debe ocurrir al cerrar la ventana principal?',
+    'closePrompt.detail': 'El modo en segundo plano mantiene las tareas, programaciones y canales conectados. Salir explícitamente detiene el entorno local de forma segura.',
+    'closePrompt.background': 'Seguir ejecutando en segundo plano',
+    'closePrompt.quit': 'Salir de OpenSquilla',
+    'closePrompt.cancel': 'Cancelar',
+    'closePrompt.remember': 'Recordar mi elección',
     'update.newVersionTitle': 'Hay una nueva versión disponible',
     'update.newVersionDetail': 'OpenSquilla {version} está disponible. ¿Descargar ahora?',
     'update.download': 'Descargar',
@@ -3286,6 +3638,12 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.upToDateTitle': 'Estás al día',
     'update.upToDateDetail': 'OpenSquilla {version} es la última versión.',
     'update.errorTitle': 'Error al buscar actualizaciones',
+    'update.manifestInvalid': 'La información de actualización no es válida. Inténtalo más tarde.',
+    'update.sourceUnavailable': 'El servicio de actualizaciones no está disponible temporalmente. Inténtalo más tarde.',
+    'update.checksumUnavailable': 'No se puede verificar el instalador porque la suma de comprobación oficial de GitHub no está disponible. No se abrió ningún instalador.',
+    'update.integrityFailed': 'El instalador descargado no superó la verificación de integridad y se eliminó.',
+    'update.downloadFailed': 'No se pudo descargar la actualización. Inténtalo de nuevo.',
+    'update.installFailed': 'No se pudo abrir el instalador de la actualización. Inténtalo de nuevo.',
     'update.moveToApplications': 'Mueve OpenSquilla a tu carpeta de Aplicaciones para habilitar las actualizaciones automáticas e inténtalo de nuevo.',
     'update.gatewayShutdownTimeout': 'OpenSquilla no pudo detener el runtime local. Intenta reiniciar para actualizar de nuevo.',
     'uninstall.confirmTitle': '¿Eliminar los datos locales de escritorio de OpenSquilla?',
@@ -3297,7 +3655,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.cancel': 'Cancelar',
     'cleanup.deleteProfileConfirm': 'Eliminar perfil',
     'cleanup.deleteProfileTitle': '¿Eliminar el perfil actual?',
-    'cleanup.deleteProfileMessage': 'Esto elimina permanentemente los datos, la credencial y los registros enumerados del perfil actual. Se conservan otros perfiles de recuperación y copias de seguridad.',
+    'cleanup.deleteProfileMessage': 'Esto elimina permanentemente los datos, la credencial y los registros enumerados del perfil principal. Se conservan las copias de seguridad.',
     'cleanup.deleteAllConfirm': 'Eliminar todos los datos',
     'cleanup.deleteAllTitle': '¿Eliminar todos los datos de usuario de OpenSquilla?',
     'cleanup.deleteAllMessage': 'OpenSquilla se cerrará primero. La eliminación solo comienza cuando la app y el entorno local hayan terminado por completo.',
@@ -3305,26 +3663,6 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.abandonTitle': '¿Salir de la limpieza interrumpida?',
     'cleanup.abandonMessage': 'OpenSquilla conserva todos los archivos restantes y archiva únicamente el registro de transacción de limpieza.',
     'cleanup.abandonDetail': 'No se eliminará nada más. Revisa el perfil restante antes de seguir usándolo.',
-    'migration.nav.title': 'Datos Portable',
-    'migration.nav.sub': 'Copia opcional',
-    'migration.step.badge': 'Opcional',
-    'migration.step.heading': 'Se encontraron datos de Windows Portable anterior',
-    'migration.step.subtitle': 'Copia tus chats, Agents y ajustes en esta aplicación de escritorio.',
-    'migration.step.assurance': 'Los datos Portable originales no se modificarán ni eliminarán.',
-    'migration.step.sourceLabel': 'Elegir datos Portable',
-    'migration.step.selectionHint': 'Selecciona una fuente y revisa qué se copiará.',
-    'migration.step.candidateVersion': 'Versión {version}',
-    'migration.step.candidateSessions': '{n} chats',
-    'migration.step.candidateActivity': 'Última actividad {value}',
-    'migration.step.manualTypeLabel': '¿No aparecen los datos Portable?',
-    'migration.step.manualTypePlaceholder': 'Elegir datos Portable',
-    'migration.source.cli': 'OpenSquilla CLI',
-    'migration.source.desktop': 'OpenSquilla Desktop',
-    'migration.source.portable': 'Windows Portable anterior',
-    'migration.step.browse': 'Elegir carpeta de datos Portable…',
-    'migration.step.preview': 'Revisar estos datos',
-    'migration.step.import': 'Copiar y continuar',
-    'migration.step.skip': 'Ahora no',
     'migration.overwriteTitle': '¿Reemplazar los datos de escritorio en conflicto?',
     'migration.overwriteMessage': 'La instalación seleccionada reemplazará los datos actuales de Desktop.',
     'migration.overwriteDetail': 'Se conservará una copia de seguridad completa con marca de tiempo. Confirma la fuente indicada abajo antes de continuar.',
@@ -3369,18 +3707,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.quit': 'Salir',
     'onboarding.step1.continue': 'Continuar',
     'onboarding.step2.badge': 'Obligatorio',
-    'onboarding.step2.heading': 'Conectar un proveedor',
-    'onboarding.step2.subtitle': 'Elige la cuenta de proveedor que usa el runtime local para las llamadas a modelos.',
-    'onboarding.step2.tokenrhythmTitle': 'Recomendado: TokenRhythm',
+    'onboarding.step2.heading': 'Configuración del servicio de modelos',
+    'onboarding.step2.subtitle': 'Introduce una clave API para empezar.',
+    'onboarding.step2.tokenrhythmTitle': 'Oferta limitada de TokenRhythm',
     'onboarding.step2.tokenrhythmValue': 'Las llamadas a la API de TokenRhythm son gratis por tiempo limitado.',
-    'onboarding.step2.tokenrhythmRegistration': 'Durante la promoción, regístrate y obtén una clave API para usar gratis DeepSeek, GLM, MiniMax, Kimi y otros modelos líderes.',
-    'onboarding.step2.tokenrhythmCta': 'Registrarse y obtener una clave API',
-    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Registrarse y obtener una clave API — TokenRhythm (se abre en el navegador externo)',
+    'onboarding.step2.tokenrhythmRegistration': 'Regístrate y recibe 68 ¥ en tokens gratis.',
+    'onboarding.step2.tokenrhythmCta': 'Obtener gratis',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Obtener gratis (se abre en el navegador externo)',
     'onboarding.step2.otherProviders': 'Otros proveedores',
     'onboarding.step2.apiKey': 'Clave API',
     'onboarding.step2.endpointSummary': 'Endpoint y modelo directo',
     'onboarding.step2.baseUrl': 'Base URL',
-    'onboarding.step2.directModel': 'Modelo directo',
+    'onboarding.step2.directModel': 'Nombre del modelo',
     'onboarding.step2.back': 'Atrás',
     'onboarding.step2.next': 'Siguiente',
     'onboarding.nav.routing.title': 'Enrutamiento',
@@ -3429,28 +3767,34 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelNote: 'Smart Router is off. Every request uses this model directly.',
     defaultPill: 'default',
     providerField: 'Provider',
+    selectProviderPlaceholder: 'Choose a provider',
+    providerGroupRecommended: 'Recommended',
+    providerGroupCloud: 'Cloud services',
+    providerGroupLocal: 'Local services',
+    limitedFreeBadge: 'Limited-time free',
+    recommendedModel: 'Recommended model',
+    editModel: 'Edit',
+    doneEditingModel: 'Done',
     modelField: 'Model',
     customizeTiers: 'Customize tier models',
     requiresApiKey: 'Requires an API key.',
     noKeyRequired: 'No key required.',
     searchAvailable: '{label} will be available to browser-capable agents.',
     searchHintDefault: 'DuckDuckGo is enough to start.',
+    billingFree: 'Free',
+    billingPaid: 'Paid',
+    searchFreeGroup: 'Free search',
+    searchPaidGroup: 'Paid search services',
     apiKeyRequired: '{label} API key is required.',
+    verifyConfiguration: 'Verify configuration',
+    verifyingConfiguration: 'Verifying…',
+    configurationVerified: 'Configuration verified',
+    configurationVerifiedWithLatency: 'Verified · {ms} ms',
+    configurationVerificationFailed: 'Verification failed: {detail}',
     directModelRequiredDisabled: 'Direct model is required when Smart Router is disabled.',
     directModelRequiredDirect: 'Direct model is required for Direct single model mode.',
     defaultTierRequiresModel: 'Default router tier requires a model.',
     searchApiKeyRequired: '{label} search API key is required.',
-    migrationPreviewRunning: 'Checking the existing data…',
-    migrationApplyRunning: 'Copying Portable data… this can take a few minutes.',
-    migrationReady: '{n} data groups are ready to copy.',
-    migrationSkippedDetails: '{n} inapplicable items will stay excluded.',
-    migrationTechnicalDetails: 'Technical details',
-    migrationPausedJobs: 'Scheduler jobs to copy (arrive paused): {n}',
-    migrationDisk: 'Disk: {required} required, {free} free',
-    migrationNotesLabel: 'Notes',
-    migrationPreviewFailed: 'Preview failed: {detail}',
-    migrationApplyFailed: 'Copy failed: {detail}',
-    migrationDone: 'Copy complete. {n} scheduler job(s) arrived paused — re-enable them in the Cron view. Your original Portable data remains unchanged at {path}.',
     stepLabel: 'Step {n}',
   },
   'zh-Hans': {
@@ -3469,28 +3813,34 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelNote: 'Smart Router 已关闭。每个请求都直接使用此模型。',
     defaultPill: '默认',
     providerField: '提供商',
+    selectProviderPlaceholder: '选择提供商',
+    providerGroupRecommended: '推荐',
+    providerGroupCloud: '云端服务',
+    providerGroupLocal: '本地服务',
+    limitedFreeBadge: '限时免费',
+    recommendedModel: '推荐模型',
+    editModel: '修改',
+    doneEditingModel: '完成',
     modelField: '模型',
     customizeTiers: '自定义层级模型',
     requiresApiKey: '需要 API 密钥。',
     noKeyRequired: '无需密钥。',
     searchAvailable: '{label} 将可供具备浏览能力的 agent 使用。',
     searchHintDefault: 'DuckDuckGo 足以开始使用。',
+    billingFree: '免费',
+    billingPaid: '付费',
+    searchFreeGroup: '免费搜索',
+    searchPaidGroup: '付费搜索服务',
     apiKeyRequired: '需要 {label} API 密钥。',
+    verifyConfiguration: '验证配置',
+    verifyingConfiguration: '正在验证…',
+    configurationVerified: '配置验证成功',
+    configurationVerifiedWithLatency: '验证成功 · {ms} ms',
+    configurationVerificationFailed: '验证失败：{detail}',
     directModelRequiredDisabled: '禁用 Smart Router 时需要直连模型。',
     directModelRequiredDirect: '直连单模型模式需要直连模型。',
     defaultTierRequiresModel: '默认路由层级需要一个模型。',
     searchApiKeyRequired: '需要 {label} 搜索 API 密钥。',
-    migrationPreviewRunning: '正在检查现有数据……',
-    migrationApplyRunning: '正在复制 Portable 数据……可能需要几分钟。',
-    migrationReady: '已核对：{n} 类数据可以复制。',
-    migrationSkippedDetails: '{n} 项不适用内容将保持排除。',
-    migrationTechnicalDetails: '技术详情',
-    migrationPausedJobs: '将复制的计划任务（复制后为暂停状态）：{n}',
-    migrationDisk: '磁盘：需要 {required}，可用 {free}',
-    migrationNotesLabel: '备注',
-    migrationPreviewFailed: '预览失败：{detail}',
-    migrationApplyFailed: '复制失败：{detail}',
-    migrationDone: '复制完成。{n} 个计划任务已以暂停状态复制——请在 Cron 视图中重新启用。原 Portable 数据仍原样保留在 {path}。',
     stepLabel: '步骤 {n}',
   },
   ja: {
@@ -3510,27 +3860,33 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelNote: 'Smart Router はオフです。すべてのリクエストでこのモデルを直接使用します。',
     defaultPill: 'デフォルト',
     providerField: 'プロバイダー',
+    selectProviderPlaceholder: 'プロバイダーを選択',
+    providerGroupRecommended: 'おすすめ',
+    providerGroupCloud: 'クラウドサービス',
+    providerGroupLocal: 'ローカルサービス',
+    limitedFreeBadge: '期間限定無料',
+    recommendedModel: '推奨モデル',
+    editModel: '編集',
+    doneEditingModel: '完了',
     modelField: 'モデル',
     customizeTiers: 'ティアモデルをカスタマイズ',
     requiresApiKey: 'API キーが必要です。',
     noKeyRequired: 'キーは不要です。',
     searchAvailable: '{label} はブラウザ対応のエージェントで利用できるようになります。',
     searchHintDefault: 'DuckDuckGo で始めるには十分です。',
+    billingFree: '無料',
+    billingPaid: '有料',
+    searchFreeGroup: '無料検索',
+    searchPaidGroup: '有料検索サービス',
     apiKeyRequired: '{label} の API キーが必要です。',
+    verifyConfiguration: '構成を検証',
+    verifyingConfiguration: '検証中…',
+    configurationVerified: '構成を検証しました',
+    configurationVerifiedWithLatency: '検証済み · {ms} ms',
+    configurationVerificationFailed: '検証に失敗しました：{detail}',
     directModelRequiredDisabled: 'Smart Router を無効にする場合は直接モデルが必要です。',
     defaultTierRequiresModel: 'デフォルトのルーターティアにはモデルが必要です。',
     searchApiKeyRequired: '{label} の検索 API キーが必要です。',
-    migrationPreviewRunning: '既存データを確認しています…',
-    migrationApplyRunning: 'Portable データをコピーしています… 数分かかることがあります。',
-    migrationReady: '{n} 種類のデータをコピーできます。',
-    migrationSkippedDetails: '対象外の {n} 件は除外されます。',
-    migrationTechnicalDetails: '技術詳細',
-    migrationPausedJobs: 'コピーされるスケジュールジョブ（一時停止状態）: {n}',
-    migrationDisk: 'ディスク: 必要 {required} / 空き {free}',
-    migrationNotesLabel: '補足',
-    migrationPreviewFailed: 'プレビューに失敗しました: {detail}',
-    migrationApplyFailed: 'コピーに失敗しました: {detail}',
-    migrationDone: 'コピーが完了しました。{n} 件のスケジュールジョブは一時停止状態です — Cron ビューで再度有効にしてください。元の Portable データは {path} にそのまま残っています。',
     stepLabel: 'ステップ {n}',
   },
   fr: {
@@ -3550,27 +3906,33 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelNote: 'Smart Router est désactivé. Chaque requête utilise directement ce modèle.',
     defaultPill: 'par défaut',
     providerField: 'Fournisseur',
+    selectProviderPlaceholder: 'Choisir un fournisseur',
+    providerGroupRecommended: 'Recommandé',
+    providerGroupCloud: 'Services cloud',
+    providerGroupLocal: 'Services locaux',
+    limitedFreeBadge: 'Gratuit temporairement',
+    recommendedModel: 'Modèle recommandé',
+    editModel: 'Modifier',
+    doneEditingModel: 'Terminé',
     modelField: 'Modèle',
     customizeTiers: 'Personnaliser les modèles de niveau',
     requiresApiKey: 'Nécessite une clé API.',
     noKeyRequired: 'Aucune clé requise.',
     searchAvailable: '{label} sera disponible pour les agents capables de naviguer.',
     searchHintDefault: 'DuckDuckGo suffit pour démarrer.',
+    billingFree: 'Gratuit',
+    billingPaid: 'Payant',
+    searchFreeGroup: 'Recherche gratuite',
+    searchPaidGroup: 'Services de recherche payants',
     apiKeyRequired: 'La clé API {label} est requise.',
+    verifyConfiguration: 'Vérifier la configuration',
+    verifyingConfiguration: 'Vérification…',
+    configurationVerified: 'Configuration vérifiée',
+    configurationVerifiedWithLatency: 'Vérifiée · {ms} ms',
+    configurationVerificationFailed: 'Échec de la vérification : {detail}',
     directModelRequiredDisabled: 'Un modèle direct est requis lorsque Smart Router est désactivé.',
     defaultTierRequiresModel: 'Le niveau de routeur par défaut nécessite un modèle.',
     searchApiKeyRequired: 'La clé API de recherche {label} est requise.',
-    migrationPreviewRunning: 'Vérification des données existantes…',
-    migrationApplyRunning: 'Copie des données Portable… cela peut prendre quelques minutes.',
-    migrationReady: '{n} groupes de données sont prêts à être copiés.',
-    migrationSkippedDetails: '{n} éléments non applicables resteront exclus.',
-    migrationTechnicalDetails: 'Détails techniques',
-    migrationPausedJobs: 'Tâches planifiées à copier (arrivent en pause) : {n}',
-    migrationDisk: 'Disque : {required} requis, {free} libres',
-    migrationNotesLabel: 'Remarques',
-    migrationPreviewFailed: "Échec de l'aperçu : {detail}",
-    migrationApplyFailed: 'Échec de la copie : {detail}',
-    migrationDone: "Copie terminée. {n} tâche(s) planifiée(s) sont arrivées en pause — réactivez-les dans la vue Cron. Vos données Portable d'origine restent intactes dans {path}.",
     stepLabel: 'Étape {n}',
   },
   de: {
@@ -3590,27 +3952,33 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelNote: 'Smart Router ist aus. Jede Anfrage verwendet dieses Modell direkt.',
     defaultPill: 'Standard',
     providerField: 'Anbieter',
+    selectProviderPlaceholder: 'Anbieter auswählen',
+    providerGroupRecommended: 'Empfohlen',
+    providerGroupCloud: 'Cloud-Dienste',
+    providerGroupLocal: 'Lokale Dienste',
+    limitedFreeBadge: 'Zeitlich kostenlos',
+    recommendedModel: 'Empfohlenes Modell',
+    editModel: 'Ändern',
+    doneEditingModel: 'Fertig',
     modelField: 'Modell',
     customizeTiers: 'Stufenmodelle anpassen',
     requiresApiKey: 'Erfordert einen API-Schlüssel.',
     noKeyRequired: 'Kein Schlüssel erforderlich.',
     searchAvailable: '{label} wird für browserfähige Agenten verfügbar sein.',
     searchHintDefault: 'DuckDuckGo reicht für den Start.',
+    billingFree: 'Kostenlos',
+    billingPaid: 'Kostenpflichtig',
+    searchFreeGroup: 'Kostenlose Suche',
+    searchPaidGroup: 'Kostenpflichtige Suchdienste',
     apiKeyRequired: 'Der API-Schlüssel für {label} ist erforderlich.',
+    verifyConfiguration: 'Konfiguration überprüfen',
+    verifyingConfiguration: 'Wird überprüft…',
+    configurationVerified: 'Konfiguration überprüft',
+    configurationVerifiedWithLatency: 'Überprüft · {ms} ms',
+    configurationVerificationFailed: 'Überprüfung fehlgeschlagen: {detail}',
     directModelRequiredDisabled: 'Ein direktes Modell ist erforderlich, wenn Smart Router deaktiviert ist.',
     defaultTierRequiresModel: 'Die Standard-Routerstufe erfordert ein Modell.',
     searchApiKeyRequired: 'Der Such-API-Schlüssel für {label} ist erforderlich.',
-    migrationPreviewRunning: 'Vorhandene Daten werden geprüft…',
-    migrationApplyRunning: 'Portable-Daten werden kopiert… das kann einige Minuten dauern.',
-    migrationReady: '{n} Datengruppen können kopiert werden.',
-    migrationSkippedDetails: '{n} nicht zutreffende Elemente bleiben ausgeschlossen.',
-    migrationTechnicalDetails: 'Technische Details',
-    migrationPausedJobs: 'Zu kopierende Scheduler-Jobs (kommen pausiert an): {n}',
-    migrationDisk: 'Speicher: {required} benötigt, {free} frei',
-    migrationNotesLabel: 'Hinweise',
-    migrationPreviewFailed: 'Vorschau fehlgeschlagen: {detail}',
-    migrationApplyFailed: 'Kopieren fehlgeschlagen: {detail}',
-    migrationDone: 'Kopieren abgeschlossen. {n} Scheduler-Job(s) sind pausiert angekommen — aktivieren Sie sie in der Cron-Ansicht wieder. Ihre ursprünglichen Portable-Daten bleiben unverändert unter {path}.',
     stepLabel: 'Schritt {n}',
   },
   es: {
@@ -3630,27 +3998,33 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelNote: 'Smart Router está desactivado. Cada solicitud usa este modelo directamente.',
     defaultPill: 'predeterminado',
     providerField: 'Proveedor',
+    selectProviderPlaceholder: 'Elegir un proveedor',
+    providerGroupRecommended: 'Recomendado',
+    providerGroupCloud: 'Servicios en la nube',
+    providerGroupLocal: 'Servicios locales',
+    limitedFreeBadge: 'Gratis por tiempo limitado',
+    recommendedModel: 'Modelo recomendado',
+    editModel: 'Editar',
+    doneEditingModel: 'Listo',
     modelField: 'Modelo',
     customizeTiers: 'Personalizar modelos de nivel',
     requiresApiKey: 'Requiere una clave API.',
     noKeyRequired: 'No se requiere clave.',
     searchAvailable: '{label} estará disponible para los agentes con capacidad de navegación.',
     searchHintDefault: 'DuckDuckGo es suficiente para empezar.',
+    billingFree: 'Gratis',
+    billingPaid: 'De pago',
+    searchFreeGroup: 'Búsqueda gratuita',
+    searchPaidGroup: 'Servicios de búsqueda de pago',
     apiKeyRequired: 'Se requiere la clave API de {label}.',
+    verifyConfiguration: 'Verificar configuración',
+    verifyingConfiguration: 'Verificando…',
+    configurationVerified: 'Configuración verificada',
+    configurationVerifiedWithLatency: 'Verificada · {ms} ms',
+    configurationVerificationFailed: 'Error de verificación: {detail}',
     directModelRequiredDisabled: 'Se requiere un modelo directo cuando Smart Router está desactivado.',
     defaultTierRequiresModel: 'El nivel de enrutador predeterminado requiere un modelo.',
     searchApiKeyRequired: 'Se requiere la clave API de búsqueda de {label}.',
-    migrationPreviewRunning: 'Comprobando los datos existentes…',
-    migrationApplyRunning: 'Copiando datos Portable… esto puede tardar unos minutos.',
-    migrationReady: '{n} grupos de datos están listos para copiarse.',
-    migrationSkippedDetails: '{n} elementos no aplicables seguirán excluidos.',
-    migrationTechnicalDetails: 'Detalles técnicos',
-    migrationPausedJobs: 'Tareas programadas a copiar (llegan en pausa): {n}',
-    migrationDisk: 'Disco: {required} necesarios, {free} libres',
-    migrationNotesLabel: 'Notas',
-    migrationPreviewFailed: 'Error en la vista previa: {detail}',
-    migrationApplyFailed: 'Error al copiar: {detail}',
-    migrationDone: 'Copia completada. {n} tarea(s) programada(s) llegaron en pausa: vuelve a activarlas en la vista Cron. Tus datos Portable originales permanecen intactos en {path}.',
     stepLabel: 'Paso {n}',
   },
 }
@@ -3660,15 +4034,7 @@ function desktopT(key: string): string {
 }
 
 function createApplicationMenu(): void {
-  const recoveryProfileActive = activeDesktopProfile().kind === 'recovery'
-  const attentionActive = recoveryInspection?.outcome === 'attention'
-  const availableRecoveryProfiles = allProfileContexts().filter((profile) => (
-    profile.kind === 'recovery' && profile.recoveryId
-  ))
-  const profileMenuActive = recoveryProfileActive
-    || attentionActive
-    || availableRecoveryProfiles.length > 0
-  if (!shouldUseNativeApplicationMenu && !profileMenuActive) {
+  if (!shouldUseNativeApplicationMenu) {
     Menu.setApplicationMenu(null)
     return
   }
@@ -3704,81 +4070,11 @@ function createApplicationMenu(): void {
   )
   appSubmenu.push({ type: 'separator' }, { role: 'quit' })
 
-  const profileSubmenu: Electron.MenuItemConstructorOptions[] = [
-    {
-      label: desktopT('menu.showProfile'),
-      click: () => {
-        const home = activeDesktopProfile().home
-        if (existsSync(home)) void shell.showItemInFolder(home)
-        else void shell.openPath(dirname(home)).catch(() => null)
-      },
-    },
-  ]
-  if (attentionActive && recoveryInspection) {
-    profileSubmenu.push({
-      label: desktopT('menu.reviewProfile'),
-      click: () => {
-        if (recoveryInspection) void showAttentionPrompt(recoveryInspection, true)
-      },
-    })
-  }
-  if (availableRecoveryProfiles.length > 0) {
-    profileSubmenu.push(
-      { type: 'separator' },
-      {
-        label: desktopT('menu.switchRecovery'),
-        submenu: availableRecoveryProfiles.map((profile) => ({
-          label: `Recovery ${profile.recoveryId?.slice(0, 8)}`,
-          enabled: profile.recoveryId !== activeDesktopProfile().recoveryId,
-          click: () => {
-            void withRecoveryOperation(() => launchRecoveryProfile({
-              mode: 'continue',
-              recoveryId: profile.recoveryId,
-              copyPrimaryCredential: false,
-            })).then((result) => {
-              if (result.ok) return
-              void dialog.showMessageBox({
-                type: 'warning',
-                buttons: ['OK'],
-                message: desktopT('menu.switchRecovery'),
-                detail: result.error,
-              })
-            })
-          },
-        })),
-      },
-    )
-  }
-  if (recoveryProfileActive) {
-    profileSubmenu.push(
-      { type: 'separator' },
-      {
-        label: desktopT('menu.returnPrimary'),
-        click: () => {
-          void withRecoveryOperation(retryOrReturnPrimaryProfile).then((result) => {
-            if (!result.ok || result.value.outcome !== 'recovery_required') return
-            void dialog.showMessageBox({
-              type: 'warning',
-              buttons: ['OK'],
-              message: desktopT('menu.returnPrimary'),
-              detail: result.value.stable_code,
-            })
-          })
-        },
-      },
-    )
-  }
-
   const template: Electron.MenuItemConstructorOptions[] = [
     {
       label: app.name,
       submenu: appSubmenu,
     },
-    ...(profileMenuActive ? [{
-      label: desktopT('menu.profile'),
-      submenu: profileSubmenu,
-      enabled: currentOnboardingWindow() === null,
-    }] : []),
     {
       label: desktopT('menu.edit'),
       submenu: [
@@ -3843,6 +4139,270 @@ function focusMainWindow(): boolean {
   return true
 }
 
+function setAppExitPhase(next: DesktopExitPhase, reason: string): void {
+  if (appExitPhase === next) return
+  desktopLog('desktop_exit_phase', { from: appExitPhase, to: next, reason })
+  appExitPhase = next
+  rebuildWindowsTrayMenu()
+}
+
+function destroyWindowsTray(): void {
+  if (!windowsTray) return
+  windowsTray.destroy()
+  windowsTray = null
+}
+
+function rebuildWindowsTrayMenu(): void {
+  if (!windowsTray) return
+  windowsTray.setContextMenu(Menu.buildFromTemplate([
+    {
+      label: desktopT('tray.open'),
+      enabled: canRevealDesktopApp(appExitPhase),
+      click: () => revealDesktopApp(),
+    },
+    {
+      label: desktopT('tray.running'),
+      enabled: false,
+    },
+    { type: 'separator' },
+    {
+      label: desktopT('tray.quit'),
+      click: () => app.quit(),
+    },
+  ]))
+}
+
+function createWindowsTray(): boolean {
+  if (process.platform !== 'win32') return false
+  if (windowsTray) return true
+  try {
+    const tray = new Tray(appIconPath())
+    windowsTray = tray
+    tray.setToolTip('OpenSquilla')
+    tray.on('click', () => revealDesktopApp())
+    tray.on('balloon-click', () => revealDesktopApp())
+    rebuildWindowsTrayMenu()
+    desktopLog('windows_tray_ready')
+    return true
+  } catch (error) {
+    windowsTray = null
+    desktopLog('windows_tray_failed', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return false
+  }
+}
+
+function showWindowsBackgroundCloseNotice(): void {
+  if (process.platform !== 'win32' || !windowsTray) return
+  const preferences = loadDesktopPreferencesRecord()
+  if (preferences.value.background_close_notice_shown) return
+  try {
+    windowsTray.displayBalloon({
+      title: desktopT('tray.backgroundTitle'),
+      content: desktopT('tray.backgroundDetail'),
+      iconType: 'info',
+      noSound: true,
+      respectQuietTime: true,
+    })
+    markBackgroundCloseNoticeShown()
+  } catch (error) {
+    desktopLog('windows_tray_notice_failed', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }
+}
+
+function hideMainWindow(window: BrowserWindow): void {
+  if (!window.webContents.isDestroyed()) {
+    window.webContents.send('desktop:window:hidden')
+  }
+  window.hide()
+  desktopLog('main_window_hidden', { platform: process.platform })
+  showWindowsBackgroundCloseNotice()
+}
+
+async function activateMainWindow(source = 'desktop-activation'): Promise<void> {
+  if (!canRevealDesktopApp(appExitPhase)) {
+    desktopLog('main_window_activation_ignored', { source, appExitPhase })
+    return
+  }
+
+  // Surface an existing window immediately while any single-flight startup or
+  // Gateway recovery continues in the background.
+  if (process.platform === 'darwin') app.focus({ steal: true })
+  const focusedImmediately = focusMainWindow()
+
+  // Profile migration, cleanup, update, and quit drains may safely reveal an
+  // existing renderer, but must not create a replacement window or Gateway.
+  if (isQuitting) {
+    desktopLog('main_window_activation_during_shutdown', {
+      source,
+      focused: focusedImmediately,
+    })
+    return
+  }
+
+  // Activating an existing window is complete after the synchronous focus
+  // sequence above. Starting another open flow here can invalidate a startup
+  // that is still settling and later re-show a window the user has hidden.
+  if (focusedImmediately) {
+    desktopLog('main_window_activated', {
+      source,
+      created: false,
+      focused: true,
+    })
+    return
+  }
+
+  await openOrResumeDesktopApp()
+
+  // openOrResumeDesktopApp creates the window when it was absent. Repeat the
+  // idempotent focus sequence after that asynchronous boundary.
+  if (process.platform === 'darwin') app.focus({ steal: true })
+  const focused = focusMainWindow()
+  desktopLog('main_window_activated', {
+    source,
+    created: true,
+    focused,
+  })
+}
+
+function revealDesktopApp(): void {
+  void activateMainWindow('desktop-reveal')
+}
+
+function handleDeepLink(rawUrl: unknown, source = 'unknown'): boolean {
+  const action = parseDesktopDeepLink(rawUrl)
+  if (action !== 'open') {
+    // Never persist an untrusted URL: query strings may contain credentials or
+    // other private browser state even though this parser rejects them.
+    desktopLog('deep_link_ignored', { source })
+    return false
+  }
+
+  desktopLog('deep_link_accepted', {
+    source,
+    action,
+    activationReady: desktopDeepLinkActivationReady,
+  })
+  if (!desktopDeepLinkActivationReady) {
+    pendingDesktopDeepLinkOpen = true
+    return true
+  }
+
+  void activateMainWindow(`deep-link:${source}`)
+  return true
+}
+
+function handleDeepLinksFromCommandLine(
+  commandLine: readonly string[],
+  source: string,
+): boolean {
+  const candidates = desktopDeepLinkArguments(commandLine)
+  for (const candidate of candidates) handleDeepLink(candidate, source)
+  return candidates.length > 0
+}
+
+function activatePendingDesktopDeepLink(): boolean {
+  if (!pendingDesktopDeepLinkOpen) return false
+  pendingDesktopDeepLinkOpen = false
+  void activateMainWindow('deep-link:pending')
+  return true
+}
+
+function registerDesktopDeepLinkProtocolClient(): void {
+  if (!app.isPackaged) {
+    desktopLog('deep_link_protocol_registration_skipped', { reason: 'development' })
+    return
+  }
+  try {
+    const registered = app.setAsDefaultProtocolClient(DESKTOP_DEEP_LINK_SCHEME)
+    desktopLog('deep_link_protocol_registered', { registered })
+  } catch (error) {
+    desktopLog('deep_link_protocol_registration_failed', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }
+}
+
+async function promptForMainWindowClose(window: BrowserWindow): Promise<void> {
+  if (mainWindowClosePrompt) return await mainWindowClosePrompt
+  mainWindowClosePrompt = (async () => {
+    const result = await dialog.showMessageBox(window, {
+      type: 'question',
+      title: desktopT('closePrompt.title'),
+      message: desktopT('closePrompt.message'),
+      detail: desktopT('closePrompt.detail'),
+      buttons: [
+        desktopT('closePrompt.background'),
+        desktopT('closePrompt.quit'),
+        desktopT('closePrompt.cancel'),
+      ],
+      defaultId: 0,
+      cancelId: 2,
+      checkboxLabel: desktopT('closePrompt.remember'),
+      checkboxChecked: false,
+      noLink: true,
+    })
+    if (window.isDestroyed() || appExitPhase !== 'running') return
+    if (result.response === 0) {
+      if (result.checkboxChecked) {
+        await saveDesktopPreferences({
+          mainWindowCloseBehavior: 'background',
+        }).catch((error) => {
+          desktopLog('desktop_preferences_save_failed', {
+            error: error instanceof Error ? error.message : String(error),
+          })
+        })
+      }
+      hideMainWindow(window)
+      return
+    }
+    if (result.response === 1) {
+      if (result.checkboxChecked) {
+        await saveDesktopPreferences({
+          mainWindowCloseBehavior: 'quit',
+        }).catch((error) => {
+          desktopLog('desktop_preferences_save_failed', {
+            error: error instanceof Error ? error.message : String(error),
+          })
+        })
+      }
+      app.quit()
+    }
+  })().finally(() => {
+    mainWindowClosePrompt = null
+  })
+  return await mainWindowClosePrompt
+}
+
+function handleMainWindowClose(window: BrowserWindow, event: Electron.Event): void {
+  const action = mainWindowCloseAction({
+    platform: process.platform,
+    exitPhase: appExitPhase,
+    systemSessionEnding,
+    onboardingOpen: currentOnboardingWindow() !== null,
+    behavior: loadDesktopPreferencesRecord().value.main_window_close_behavior,
+    windowsTrayReady: windowsTray !== null,
+  })
+  if (action === 'allow') return
+  event.preventDefault()
+  if (action === 'focus-onboarding') {
+    focusOnboardingWindow()
+    return
+  }
+  if (action === 'hide') {
+    hideMainWindow(window)
+    return
+  }
+  if (action === 'quit') {
+    app.quit()
+    return
+  }
+  void promptForMainWindowClose(window)
+}
+
 function installEditingContextMenu(window: BrowserWindow): void {
   window.webContents.on('context-menu', (_event, params) => {
     if (!params.isEditable) return
@@ -3877,13 +4437,8 @@ function localeOptionsHtml(): string {
 }
 
 function onboardingHtml(
-  detections: LegacyImportCandidate[] = [],
   pendingProviderSetup: MigrationProviderPrefill | null = null,
-  portableTransferEnabled = false,
 ): string {
-  const migrationStepEnabled = portableTransferEnabled
-    && detections.length > 0
-    && detections.every((candidate) => candidate.kind === 'windows-portable')
   return `<!doctype html>
 <html lang="${desktopLocale}">
 <head>
@@ -3894,16 +4449,21 @@ function onboardingHtml(
     :root {
       color-scheme: light;
       font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
-      --bg: #f5f2eb;
-      --paper: rgba(255, 254, 249, 0.96);
-      --ink: #20231f;
-      --muted: #646961;
-      --dim: #8c9189;
-      --line: rgba(32, 35, 31, 0.12);
-      --accent: #F26A1B;
-      --accent-dark: #D95A11;
-      --accent-soft: rgba(242, 106, 27, 0.08);
-      --green: #25633a;
+      --bg: #F4F5F7;
+      --paper: #FFFFFF;
+      --surface-subtle: #F8F9FA;
+      --ink: #15181C;
+      --muted: #565D66;
+      --dim: #7A818A;
+      --line: #E1E4E8;
+      --line-strong: #C9CED5;
+      --accent: #BA4D0F;
+      --accent-hover: #A5440C;
+      --accent-deep: #8E3A0A;
+      --accent-secondary: #B6501C;
+      --accent-soft: rgba(186, 77, 15, 0.035);
+      --primary: #343A40;
+      --primary-hover: #272C31;
       color: var(--ink);
     }
     * { box-sizing: border-box; }
@@ -3911,125 +4471,71 @@ function onboardingHtml(
       margin: 0;
       min-height: 100vh;
       overflow: hidden;
-      background: linear-gradient(135deg, #fbfaf6 0%, var(--bg) 52%, #ece8de 100%);
+      background: var(--bg);
     }
     main {
       min-height: 100vh;
       display: grid;
-      grid-template-columns: 250px minmax(0, 1fr);
-      padding: 24px;
-      gap: 20px;
+      grid-template-rows: auto minmax(0, 1fr);
+      padding: 20px 28px 28px;
+      gap: 16px;
     }
-    .rail {
-      display: grid;
-      grid-template-rows: auto 1fr auto;
-      border-radius: 8px;
-      background: rgba(255, 252, 246, 0.5);
-      border: 1px solid rgba(30,34,30,0.09);
-      padding: 20px;
-    }
-    .rail h1 {
-      margin: 0 0 8px;
-      font-size: 23px;
-      font-weight: 650;
-      line-height: 1.08;
-      letter-spacing: 0;
-    }
-    .rail p {
-      margin: 0;
-      color: var(--muted);
-      font-size: 13px;
-      line-height: 1.48;
-    }
-    .progress {
-      align-self: center;
+    .topbar {
+      width: min(700px, 100%);
+      min-height: 36px;
+      margin: 0 auto;
       display: flex;
-      flex-direction: column;
-      gap: 10px;
-    }
-    .step {
-      appearance: none;
-      display: grid;
-      grid-template-columns: 26px 1fr;
-      gap: 10px;
+      justify-content: space-between;
       align-items: center;
-      border: 0;
-      border-radius: 8px;
-      background: transparent;
-      color: var(--dim);
-      cursor: pointer;
-      min-height: 48px;
-      padding: 5px;
-      text-align: left;
+      gap: 18px;
     }
-    .step:hover {
-      background: rgba(255,255,255,0.5);
-    }
-    .step-index {
-      width: 26px;
-      height: 26px;
-      display: grid;
-      place-items: center;
-      border: 1px solid var(--line);
-      border-radius: 7px;
-      background: rgba(255,255,255,0.58);
-      color: inherit;
-      font-size: 11px;
-      font-weight: 650;
-    }
-    .step strong {
-      display: block;
-      color: inherit;
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      color: var(--ink);
       font-size: 13px;
-      font-weight: 650;
+      font-weight: 620;
+      letter-spacing: -0.01em;
     }
-    .step span:last-child {
-      display: block;
-      margin-top: 1px;
-      font-size: 11px;
-      font-weight: 600;
-    }
-    .step.active, .step.done { color: var(--ink); }
-    .step.simple-hidden {
-      display: none;
-    }
-    .step.active .step-index {
-      border-color: var(--accent);
+    .brand-mark {
+      width: 7px;
+      height: 7px;
+      border-radius: 2px;
       background: var(--accent);
-      color: #fff;
-      box-shadow: 0 9px 18px rgba(242, 106, 27, 0.2);
-    }
-    .step.done .step-index {
-      border-color: rgba(35,106,58,0.32);
-      background: rgba(35,106,58,0.1);
-      color: var(--green);
-    }
-    .rail-foot {
-      color: var(--dim);
-      font-size: 11px;
-      font-weight: 600;
-      line-height: 1.4;
-    }
-    .rail-bottom {
-      display: grid;
-      gap: 14px;
     }
     .language-picker {
-      display: grid;
-      gap: 7px;
-      color: #565c54;
-      font-size: 11px;
-      font-weight: 700;
+      display: inline-flex;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 520;
     }
     .language-picker select {
-      min-height: 34px;
-      border-radius: 8px;
+      width: auto;
+      min-width: 112px;
+      min-height: 32px;
+      border-color: var(--line);
+      border-radius: 7px;
+      background: var(--paper);
       font-size: 12px;
-      font-weight: 650;
-      padding: 0 10px;
+      font-weight: 520;
+      padding: 0 28px 0 10px;
+    }
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
     }
     .deck {
       position: relative;
+      width: min(700px, 100%);
+      margin: 0 auto;
       min-width: 0;
       min-height: 0;
       display: grid;
@@ -4037,9 +4543,9 @@ function onboardingHtml(
     }
     .deck > .error {
       position: absolute;
-      left: 30px;
-      right: 30px;
-      bottom: 18px;
+      left: 32px;
+      right: 32px;
+      bottom: 20px;
       z-index: 3;
     }
     [hidden] {
@@ -4049,88 +4555,128 @@ function onboardingHtml(
       position: absolute;
       top: 50%;
       left: 50%;
-      width: min(780px, calc(100% - 34px));
-      height: min(760px, calc(100vh - 48px));
+      width: 100%;
+      height: min(700px, 100%);
       display: grid;
       grid-template-rows: auto 1fr auto;
-      gap: 18px;
-      border: 1px solid rgba(30,34,30,0.1);
-      border-radius: 8px;
-      background:
-        linear-gradient(180deg, rgba(255,255,255,0.9), rgba(255,254,249,0.96)),
-        var(--paper);
-      box-shadow: 0 24px 70px rgba(35, 32, 26, 0.13), inset 0 1px 0 rgba(255,255,255,0.8);
+      gap: 22px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--paper);
+      box-shadow: 0 18px 48px rgba(16, 20, 26, 0.06);
       opacity: 0;
       pointer-events: none;
-      transform: translate(calc(-50% + 18px), -50%) scale(0.985);
-      transition: opacity 180ms ease, transform 220ms cubic-bezier(.2,.8,.2,1);
-      padding: 28px 28px 26px;
+      transform: translate(-50%, calc(-50% + 8px));
+      transition: opacity 160ms ease, transform 180ms cubic-bezier(.2,.8,.2,1);
+      padding: 32px;
     }
     .setup-card.active {
       opacity: 1;
       pointer-events: auto;
-      transform: translate(-50%, -50%) scale(1);
+      transform: translate(-50%, -50%);
     }
     .setup-card.leaving {
       opacity: 0;
       pointer-events: none;
-      transform: translate(calc(-50% - 18px), -50%) scale(0.985);
+      transform: translate(-50%, calc(-50% - 4px));
     }
     .card-head {
-      display: flex;
-      justify-content: space-between;
-      gap: 20px;
+      display: block;
     }
-    .eyebrow {
-      margin: 0 0 9px;
-      color: var(--accent);
-      font-size: 10px;
+    .context-label {
+      margin: 0 0 8px;
+      color: var(--dim);
+      font-size: 11px;
       font-weight: 650;
-      letter-spacing: 0.14em;
-      text-transform: uppercase;
+      letter-spacing: 0.04em;
     }
     h2 {
       margin: 0;
-      max-width: 460px;
-      font-size: 30px;
-      font-weight: 650;
-      line-height: 1.08;
-      letter-spacing: 0;
+      max-width: 540px;
+      font-size: 26px;
+      font-weight: 610;
+      line-height: 1.2;
+      letter-spacing: -0.02em;
     }
     p {
       color: var(--muted);
-      font-size: 14px;
+      font-size: 13px;
       line-height: 1.55;
-      margin: 10px 0 0;
-    }
-    .card-badge {
-      align-self: start;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      background: rgba(255,255,255,0.68);
-      color: var(--muted);
-      font-size: 10px;
-      font-weight: 650;
-      letter-spacing: 0.08em;
-      padding: 7px 10px;
-      text-transform: uppercase;
+      margin: 8px 0 0;
     }
     .card-body {
       display: grid;
-      gap: 14px;
+      gap: 16px;
       align-content: start;
       min-height: 0;
       overflow-x: hidden;
       overflow-y: auto;
-      padding-right: 2px;
+      padding-right: 4px;
+      scrollbar-width: thin;
+      scrollbar-color: var(--line-strong) transparent;
     }
-    .setup-card[data-screen="0"] .card-body {
-      overflow: visible;
+    .provider-promo-copy {
+      min-width: 0;
+      display: flex;
+      align-items: baseline;
+      justify-self: start;
+      gap: 8px;
+      overflow: hidden;
+      white-space: nowrap;
+    }
+    .provider-promo-copy strong {
+      color: var(--accent);
+      font-size: 10.5px;
+      font-weight: 560;
+      line-height: 1.35;
+    }
+    .provider-promo-copy span {
+      color: var(--accent);
+      font-size: 10.5px;
+      font-weight: 420;
+      line-height: 1.4;
+    }
+    .provider-promo-cta {
+      display: inline-flex;
+      min-height: 30px;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      border: 0;
+      border-radius: 7px;
+      background: var(--accent);
+      box-shadow: 0 3px 10px rgba(186, 77, 15, 0.14);
+      color: #FFFFFF;
+      font-size: 10.5px;
+      font-weight: 600;
+      padding: 0 13px;
+      text-decoration: none;
+      white-space: nowrap;
+      transition: background 150ms ease, box-shadow 150ms ease, transform 150ms ease;
+    }
+    .provider-promo-cta::after {
+      content: "↗";
+      font-size: 11px;
+      line-height: 1;
+    }
+    .provider-promo-cta:hover {
+      background: var(--accent-hover);
+      box-shadow: 0 5px 14px rgba(165, 68, 12, 0.18);
+      color: #FFFFFF;
+      transform: translateY(-1px);
+    }
+    .provider-promo-cta:focus-visible {
+      outline: 2px solid rgba(186, 77, 15, 0.42);
+      outline-offset: 2px;
     }
     .provider-grid {
       display: grid;
-      gap: 10px;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 0;
+      grid-template-columns: 1fr;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--paper);
     }
     .provider-feature {
       position: relative;
@@ -4138,27 +4684,17 @@ function onboardingHtml(
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
       align-items: center;
-      gap: 18px;
+      gap: 20px;
       border: 1px solid var(--line);
-      border-radius: 8px;
-      background: rgba(255,255,255,0.62);
-      padding: 17px 18px;
-      transition: border-color 160ms ease, box-shadow 160ms ease, background 160ms ease;
+      border-radius: 10px;
+      background: var(--paper);
+      padding: 18px 20px;
+      transition: border-color 150ms ease, background 150ms ease, box-shadow 150ms ease;
     }
     .provider-feature.active {
-      border-color: var(--accent);
-      background: #fffaf4;
-      box-shadow: 0 12px 26px rgba(54, 42, 28, 0.065);
-    }
-    .provider-feature.active::after {
-      content: "";
-      position: absolute;
-      top: 11px;
-      right: 11px;
-      width: 7px;
-      height: 7px;
-      border-radius: 999px;
-      background: var(--accent);
+      border-color: var(--line);
+      background: var(--paper);
+      box-shadow: inset 2px 0 0 var(--accent);
     }
     .provider-feature-select {
       appearance: none;
@@ -4173,21 +4709,21 @@ function onboardingHtml(
       text-align: left;
     }
     .provider-feature-select strong {
-      padding-right: 12px;
-      font-size: 17px;
-      font-weight: 700;
-      line-height: 1.25;
+      padding-right: 8px;
+      font-size: 15px;
+      font-weight: 600;
+      line-height: 1.3;
     }
     .provider-feature-value {
       color: var(--ink);
-      font-size: 13px;
-      font-weight: 550;
+      font-size: 11.5px;
+      font-weight: 500;
       line-height: 1.45;
     }
     .provider-feature-registration {
       color: var(--muted);
-      font-size: 11px;
-      font-weight: 500;
+      font-size: 10.5px;
+      font-weight: 400;
       line-height: 1.4;
     }
     .provider-feature-cta {
@@ -4195,21 +4731,34 @@ function onboardingHtml(
       min-height: 38px;
       align-items: center;
       justify-content: center;
+      gap: 8px;
+      border: 1px solid var(--line-strong);
       border-radius: 8px;
-      background: var(--accent-dark);
-      color: #fff;
-      font-size: 12px;
-      font-weight: 700;
+      background: var(--paper);
+      color: #39414A;
+      box-shadow: none;
+      font-size: 11.5px;
+      font-weight: 560;
       padding: 0 14px;
       text-decoration: none;
       white-space: nowrap;
+      transition: background 150ms ease, border-color 150ms ease, box-shadow 150ms ease, transform 150ms ease;
+    }
+    .provider-feature-cta::after {
+      content: "↗";
+      font-size: 13px;
+      font-weight: 500;
+      line-height: 1;
     }
     .provider-feature-cta:hover {
-      background: var(--accent);
+      border-color: #AEB4BB;
+      background: var(--surface-subtle);
+      box-shadow: 0 4px 12px rgba(16, 20, 24, 0.06);
+      transform: translateY(-1px);
     }
     .provider-disclosure {
       display: grid;
-      gap: 10px;
+      gap: 8px;
     }
     .provider-disclosure-toggle {
       appearance: none;
@@ -4218,16 +4767,33 @@ function onboardingHtml(
       display: flex;
       align-items: center;
       gap: 9px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: rgba(255,255,255,0.46);
-      color: #565c54;
+      border: 0;
+      border-radius: 7px;
+      background: transparent;
+      color: var(--muted);
       cursor: pointer;
       font: inherit;
-      font-size: 12px;
-      font-weight: 650;
-      padding: 0 13px;
+      font-size: 11.5px;
+      font-weight: 520;
+      padding: 0 4px;
       text-align: left;
+    }
+    .provider-disclosure-toggle:hover {
+      color: var(--ink);
+    }
+    .provider-disclosure-selection {
+      min-width: 0;
+      overflow: hidden;
+      color: var(--ink);
+      font-weight: 560;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .provider-disclosure-selection::before {
+      content: "·";
+      margin-right: 7px;
+      color: var(--dim);
+      font-weight: 450;
     }
     .provider-disclosure-toggle::before {
       content: "";
@@ -4239,158 +4805,636 @@ function onboardingHtml(
       transition: transform 180ms ease, border-color 180ms ease;
     }
     .provider-disclosure-toggle[aria-expanded="true"]::before {
-      border-color: var(--accent-dark);
+      border-color: var(--ink);
       transform: rotate(45deg);
+    }
+    .provider-select-field {
+      display: grid;
+      gap: 0;
+    }
+    .provider-field-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      color: var(--muted);
+      font-size: 11.5px;
+      font-weight: 540;
+    }
+    .provider-inline-cta {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      color: var(--accent-deep);
+      font-size: 10.5px;
+      font-weight: 520;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+    .provider-inline-cta::after {
+      content: "↗";
+      font-size: 11px;
+      line-height: 1;
+    }
+    .provider-inline-cta:hover {
+      color: var(--ink);
+    }
+    .provider-combobox {
+      position: relative;
+      z-index: 4;
+    }
+    .provider-combobox-toggle {
+      appearance: none;
+      width: 100%;
+      min-height: 42px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      border: 0;
+      border-radius: 8px;
+      background: #F7F8F7;
+      color: var(--ink);
+      cursor: pointer;
+      font: inherit;
+      padding: 8px 11px;
+      text-align: left;
+      transition: background 150ms ease, box-shadow 150ms ease;
+    }
+    .provider-combobox-toggle:hover {
+      background: #F2F3F2;
+    }
+    .provider-combobox-toggle[aria-expanded="true"] {
+      background: #F2F3F2;
+      box-shadow: 0 0 0 2px rgba(86, 93, 102, 0.12);
+    }
+    .provider-combobox-label {
+      flex: 0 0 auto;
+      color: var(--dim);
+      font-size: 11.5px;
+      font-weight: 500;
+    }
+    .provider-combobox-value {
+      min-width: 0;
+      flex: 1;
+      overflow: hidden;
+      color: #343A40;
+      font-size: 11.5px;
+      font-weight: 540;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .provider-selected-badges,
+    .provider-option-badges {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      flex: 0 0 auto;
+    }
+    .provider-badge {
+      display: inline-flex;
+      min-height: 18px;
+      align-items: center;
+      border-radius: 999px;
+      padding: 1px 7px;
+      font-size: 9.5px;
+      font-weight: 560;
+      line-height: 1.4;
+      white-space: nowrap;
+    }
+    .provider-badge.free {
+      border: 1px solid #E8D8CE;
+      background: #F8F1EC;
+      color: var(--accent-deep);
+    }
+    .provider-combobox-chevron {
+      position: relative;
+      width: 14px;
+      height: 14px;
+      flex: 0 0 auto;
+      transition: transform 160ms ease;
+    }
+    .provider-combobox-chevron::before {
+      content: "";
+      position: absolute;
+      top: 2px;
+      left: 3px;
+      width: 6px;
+      height: 6px;
+      border-right: 1.5px solid #6E756F;
+      border-bottom: 1.5px solid #6E756F;
+      transform: rotate(45deg);
+    }
+    .provider-combobox-toggle[aria-expanded="true"] .provider-combobox-chevron {
+      transform: rotate(180deg);
+    }
+    .provider-select-panel {
+      position: absolute;
+      z-index: 30;
+      top: calc(100% + 6px);
+      left: 0;
+      width: 100%;
+      max-height: min(330px, 46vh);
+      overflow: hidden;
+      border: 1px solid #D6D9DC;
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.98);
+      box-shadow: 0 18px 44px rgba(22, 27, 31, 0.13), 0 3px 10px rgba(22, 27, 31, 0.05);
+    }
+    .provider-options {
+      max-height: min(330px, 46vh);
+      overflow-y: auto;
+      padding: 5px;
+      scrollbar-width: thin;
+      scrollbar-color: #C9CDD1 transparent;
+    }
+    .provider-option-group + .provider-option-group {
+      margin-top: 5px;
+      padding-top: 5px;
+      border-top: 1px solid #F0F1F2;
+    }
+    .provider-option-group-label {
+      padding: 5px 8px 4px;
+      color: #858B91;
+      font-size: 9.5px;
+      font-weight: 560;
+      letter-spacing: 0.04em;
+    }
+    .provider-option {
+      appearance: none;
+      width: 100%;
+      min-height: 36px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      border: 0;
+      border-radius: 6px;
+      background: transparent;
+      color: #252A2F;
+      cursor: pointer;
+      font: inherit;
+      font-size: 11.5px;
+      font-weight: 450;
+      padding: 6px 8px;
+      text-align: left;
+    }
+    .provider-option:hover,
+    .provider-option:focus-visible {
+      background: #F5F6F6;
+      outline: none;
+    }
+    .provider-option[aria-selected="true"] {
+      background: #F8F3EF;
+      color: var(--accent-deep);
+    }
+    .provider-option-label {
+      min-width: 0;
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .provider-option-check {
+      width: 16px;
+      flex: 0 0 16px;
+      color: var(--accent-secondary);
+      font-size: 13px;
+      text-align: center;
+    }
+    .provider-options-empty {
+      padding: 24px 12px;
+      color: var(--muted);
+      font-size: 11px;
+      text-align: center;
+    }
+    .provider-combobox-toggle:focus-visible {
+      outline: 2px solid rgba(86, 93, 102, 0.36);
+      outline-offset: 2px;
     }
     .provider:focus-visible,
     .provider-feature-select:focus-visible,
     .provider-feature-cta:focus-visible,
     .provider-disclosure-toggle:focus-visible {
-      outline: 3px solid rgba(242, 106, 27, 0.35);
+      outline: 2px solid rgba(186, 77, 15, 0.48);
       outline-offset: 2px;
     }
     .provider-picker {
       min-height: 0;
-      max-height: min(310px, 42vh);
+      max-height: min(228px, 31vh);
       overflow-x: hidden;
       overflow-y: auto;
-      padding-right: 3px;
+      scrollbar-width: thin;
+      scrollbar-color: var(--line-strong) transparent;
     }
     .provider-picker .provider-grid {
-      padding-bottom: 2px;
+      margin-right: 3px;
     }
     .provider-grid.single-provider {
       grid-template-columns: 1fr;
     }
-    .setup-mode-grid {
-      display: grid;
-      gap: 12px;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-    .setup-mode-grid .choice {
-      min-height: 152px;
-      padding: 18px;
-      align-content: start;
-    }
-    .setup-mode-grid .choice strong {
-      font-size: 18px;
-      line-height: 1.15;
-    }
-    .setup-mode-grid .choice small {
-      max-width: 250px;
-      font-size: 12px;
-      line-height: 1.45;
-    }
-    .provider, .choice, .tier-button {
+    .provider, .choice {
       appearance: none;
       position: relative;
       display: grid;
       gap: 4px;
-      min-height: 82px;
+      min-height: 64px;
       border: 1px solid var(--line);
-      border-radius: 8px;
-      background: rgba(255,255,255,0.62);
+      border-radius: 9px;
+      background: var(--paper);
       color: var(--ink);
       cursor: pointer;
-      padding: 13px 12px;
+      padding: 12px 14px;
       text-align: left;
-      transition: border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease, background 160ms ease;
+      transition: border-color 150ms ease, background 150ms ease, box-shadow 150ms ease;
     }
     .provider {
-      min-height: 68px;
-      padding: 11px 13px;
+      min-height: 54px;
+      grid-template-columns: minmax(180px, 0.7fr) minmax(0, 1.3fr);
+      align-items: center;
+      gap: 16px;
+      border: 0;
+      border-bottom: 1px solid var(--line);
+      border-radius: 0;
+      padding: 10px 13px;
     }
-    .provider:hover, .choice:hover, .tier-button:hover {
-      border-color: rgba(242,106,27,0.3);
-      transform: translateY(-1px);
+    .provider:last-child { border-bottom: 0; }
+    .provider:hover, .choice:hover {
+      border-color: var(--line-strong);
+      background: var(--surface-subtle);
     }
-    .provider.active, .choice.active, .tier-button.active {
-      border-color: var(--accent);
-      background: #fffaf4;
-      box-shadow: 0 12px 26px rgba(54, 42, 28, 0.065);
-    }
-    .provider.active::after, .choice.active::after, .tier-button.active::after {
-      content: "";
-      position: absolute;
-      top: 10px;
-      right: 10px;
-      width: 7px;
-      height: 7px;
-      border-radius: 999px;
-      background: var(--accent);
+    .provider.active, .choice.active {
+      border-color: var(--line-strong);
+      background: var(--accent-soft);
+      box-shadow: inset 3px 0 0 var(--accent);
     }
     .provider:disabled, .choice:disabled {
       opacity: 0.48;
       cursor: not-allowed;
       transform: none;
     }
-    .provider strong, .choice strong, .tier-button strong {
+    .provider strong, .choice strong {
       display: block;
-      padding-right: 12px;
-      font-size: 14px;
-      font-weight: 650;
+      padding-right: 8px;
+      font-size: 13px;
+      font-weight: 580;
     }
-    .provider small, .choice small, .tier-button small {
+    .choice {
+      padding-right: 72px;
+    }
+    .search-provider-billing {
+      position: absolute;
+      top: 12px;
+      right: 14px;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      color: var(--dim);
+      font-size: 10px;
+      font-weight: 520;
+      line-height: 1;
+    }
+    .search-provider-billing::before {
+      content: "";
+      width: 4px;
+      height: 4px;
+      border-radius: 50%;
+      background: currentColor;
+      opacity: 0.72;
+    }
+    .search-provider-billing.free {
+      color: #4F7865;
+    }
+    .search-provider-billing.paid {
+      color: #7A6657;
+    }
+    .provider small, .choice small {
       color: var(--muted);
       display: block;
-      padding-right: 5px;
-      font-size: 11px;
+      padding-right: 4px;
+      font-size: 10.5px;
       font-weight: 450;
       line-height: 1.38;
     }
-    .provider-tag {
-      width: fit-content;
-      border: 1px solid rgba(242,106,27,0.14);
-      border-radius: 999px;
-      background: rgba(242,106,27,0.06);
-      color: var(--accent-dark);
-      font-size: 9px;
-      font-weight: 750;
-      letter-spacing: 0.06em;
-      padding: 3px 6px;
-      text-transform: uppercase;
+    .choice-row {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: 1fr;
     }
-    .choice-row, .tier-defaults {
+    .search-provider-list {
+      display: grid;
+      gap: 8px;
+    }
+    .inline-search-section {
       display: grid;
       gap: 10px;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      border-top: 1px solid var(--line);
+      margin-top: 8px;
+      padding-top: 20px;
     }
-    .tier-defaults {
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+    .inline-search-toggle {
+      appearance: none;
+      width: 100%;
+      min-height: 32px;
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      border: 0;
+      border-radius: 7px;
+      background: transparent;
+      cursor: pointer;
+      font: inherit;
+      padding: 0;
+      text-align: left;
     }
-    .tier-button {
-      min-height: 62px;
-      min-width: 0;
-      overflow: hidden;
+    .inline-search-title {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      color: #343A40;
+      font-size: 12.5px;
+      font-weight: 580;
+      line-height: 1.4;
     }
-    .tier-button small {
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
+    .inline-search-title::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-right: 1.5px solid #737A82;
+      border-bottom: 1.5px solid #737A82;
+      transform: rotate(-45deg);
+      transition: transform 160ms ease, border-color 160ms ease;
+    }
+    .inline-search-toggle[aria-expanded="true"] .inline-search-title::before {
+      border-color: var(--ink);
+      transform: rotate(45deg);
+    }
+    .inline-search-toggle:hover .inline-search-title {
+      color: var(--ink);
+    }
+    .inline-search-toggle:focus-visible {
+      outline: 2px solid rgba(186, 77, 15, 0.36);
+      outline-offset: 3px;
+    }
+    .inline-search-optional {
+      color: var(--dim);
+      font-size: 9.5px;
+      font-weight: 500;
+    }
+    .inline-search-panel {
+      display: grid;
+      gap: 8px;
+      padding-top: 2px;
+    }
+    .inline-search-section .choice {
+      min-height: 52px;
+      padding: 9px 64px 9px 12px;
+    }
+    .inline-search-section .choice.active {
+      border-color: #D9DCDE;
+      background: #F7F8F7;
+      box-shadow: none;
+    }
+    .inline-search-section .search-provider-billing {
+      top: 11px;
+      right: 12px;
+    }
+    .inline-search-section .search-provider-billing.free {
+      color: var(--accent-deep);
+    }
+    .inline-search-section .search-paid-toggle {
+      min-height: 32px;
+    }
+    .search-provider-group-label {
+      margin: 0 4px -2px;
+      color: var(--dim);
+      font-size: 10.5px;
+      font-weight: 520;
+      line-height: 1.4;
+    }
+    .search-paid-disclosure {
+      display: grid;
+      gap: 8px;
+    }
+    .search-paid-toggle {
+      appearance: none;
+      width: 100%;
+      min-height: 38px;
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      font: inherit;
+      font-size: 11.5px;
+      font-weight: 520;
+      padding: 0 4px;
+      text-align: left;
+    }
+    .search-paid-toggle::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-right: 2px solid #7A818A;
+      border-bottom: 2px solid #7A818A;
+      transform: rotate(-45deg);
+      transition: transform 180ms ease, border-color 180ms ease;
+    }
+    .search-paid-toggle[aria-expanded="true"]::before {
+      border-color: var(--ink);
+      transform: rotate(45deg);
+    }
+    .search-paid-toggle:hover {
+      color: var(--ink);
+    }
+    .search-paid-count {
+      color: var(--dim);
+      font-size: 10px;
+      font-weight: 450;
+    }
+    .search-paid-panel {
+      display: grid;
+      gap: 8px;
+    }
+    .search-provider-option {
+      display: grid;
+      gap: 8px;
+    }
+    .search-provider-option .choice {
+      width: 100%;
+    }
+    .search-key-field {
+      padding: 0 4px 4px;
     }
     label {
       display: grid;
-      gap: 8px;
-      color: #565c54;
+      gap: 7px;
+      color: var(--muted);
+      font-size: 11.5px;
+      font-weight: 540;
+    }
+    .field-label-text {
+      display: inline-flex;
+      align-items: baseline;
+      gap: 3px;
+      width: fit-content;
+    }
+    .required-marker {
+      color: #C2382E;
       font-size: 12px;
-      font-weight: 600;
+      font-weight: 620;
+      line-height: 1;
     }
     input, select {
       width: 100%;
-      min-height: 42px;
-      border: 1px solid #d8d1c3;
+      min-height: 40px;
+      border: 1px solid #D9DCDE;
       border-radius: 8px;
-      background: rgba(255,255,255,0.74);
-      color: #1f231f;
+      background: #FCFCFB;
+      color: var(--ink);
       font: inherit;
-      font-size: 14px;
+      font-size: 13px;
       font-weight: 450;
-      padding: 0 13px;
+      padding: 0 12px;
       outline: none;
     }
     input:focus, select:focus {
-      border-color: var(--accent);
-      box-shadow: 0 0 0 3px rgba(242, 106, 27, 0.12);
+      border-color: #B8A69A;
+      box-shadow: 0 0 0 3px rgba(186, 77, 15, 0.07);
+    }
+    input[aria-invalid="true"] {
+      border-color: #C2382E;
+      box-shadow: 0 0 0 3px rgba(194, 56, 46, 0.08);
+    }
+    .api-key-field {
+      display: grid;
+      gap: 7px;
+    }
+    .api-key-head {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 14px;
+      padding-left: 11px;
+    }
+    .api-key-label {
+      display: inline-flex;
+      align-items: baseline;
+      color: var(--muted);
+      font-size: 11.5px;
+      font-weight: 540;
+    }
+    .field-error {
+      min-height: 16px;
+      margin-top: -1px;
+      color: #B42318;
+      font-size: 11px;
+      font-weight: 560;
+      line-height: 1.4;
+    }
+    .field-error:empty {
+      display: none;
+    }
+    .model-config {
+      display: grid;
+    }
+    .model-summary {
+      min-height: 42px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      border-radius: 8px;
+      background: #F7F8F7;
+      padding: 8px 11px;
+    }
+    .model-summary-copy {
+      min-width: 0;
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+    }
+    .model-summary-label {
+      flex: 0 0 auto;
+      color: var(--dim);
+      font-size: 11.5px;
+      font-weight: 500;
+    }
+    .model-summary-value {
+      min-width: 0;
+      overflow: hidden;
+      color: #343A40;
+      font-size: 11.5px;
+      font-weight: 540;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .model-summary-edit,
+    .model-editor-done {
+      appearance: none;
+      min-height: 28px;
+      flex: 0 0 auto;
+      border: 0;
+      border-radius: 6px;
+      background: transparent;
+      color: #6D5547;
+      cursor: pointer;
+      font: inherit;
+      font-size: 10.5px;
+      font-weight: 520;
+      padding: 0 7px;
+      transition: background 150ms ease, color 150ms ease;
+    }
+    .model-summary-edit:hover,
+    .model-editor-done:hover:not(:disabled) {
+      background: rgba(186, 77, 15, 0.06);
+      color: var(--accent-deep);
+    }
+    .model-summary-edit:focus-visible,
+    .model-editor-done:focus-visible {
+      outline: 2px solid rgba(186, 77, 15, 0.36);
+      outline-offset: 1px;
+    }
+    .model-summary-edit {
+      width: 28px;
+      height: 28px;
+      color: #7A818A;
+      padding: 0;
+    }
+    .model-summary-edit:hover {
+      background: #ECEEEE;
+      color: #50575F;
+    }
+    .model-summary-edit:focus-visible {
+      outline-color: rgba(86, 93, 102, 0.36);
+    }
+    .model-summary-edit svg {
+      width: 14px;
+      height: 14px;
+      display: block;
+      margin: auto;
+      fill: none;
+      stroke: currentColor;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      stroke-width: 1.7;
+    }
+    .model-editor {
+      display: grid;
+      gap: 7px;
+    }
+    .model-editor-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .model-editor-head label {
+      display: inline-flex;
+    }
+    .model-editor-done:disabled {
+      cursor: not-allowed;
+      opacity: 0.4;
     }
 	    details {
 	      border: 1px solid #e2e0da;
@@ -4405,16 +5449,14 @@ function onboardingHtml(
 	      font-weight: 600;
 	    }
 	    .endpoint-panel {
-	      border: 1px solid #e2e0da;
-	      border-radius: 8px;
-	      background: rgba(255,255,255,0.46);
+	      border: 0;
+	      border-radius: 7px;
+	      background: transparent;
 	      overflow: hidden;
-	      transition: border-color 180ms ease, background 180ms ease, box-shadow 180ms ease;
 	    }
 	    .endpoint-panel.open {
-	      border-color: rgba(242,106,27,0.22);
-	      background: rgba(255,255,255,0.68);
-	      box-shadow: 0 10px 24px rgba(44,38,28,0.05);
+	      background: transparent;
+	      box-shadow: none;
 	    }
 	    .endpoint-summary {
 	      appearance: none;
@@ -4425,12 +5467,12 @@ function onboardingHtml(
 	      gap: 9px;
 	      border: 0;
 	      background: transparent;
-	      color: #656b64;
+	      color: var(--muted);
 	      cursor: pointer;
 	      font: inherit;
-	      font-size: 12px;
-	      font-weight: 650;
-	      padding: 0 13px;
+	      font-size: 11.5px;
+	      font-weight: 520;
+	      padding: 0 4px;
 	      text-align: left;
 	    }
 	    .endpoint-summary::before {
@@ -4443,12 +5485,12 @@ function onboardingHtml(
 	      transition: transform 180ms ease, border-color 180ms ease;
 	    }
 	    .endpoint-panel.open .endpoint-summary::before {
-	      border-color: var(--accent-dark);
+	      border-color: var(--ink);
 	      transform: rotate(45deg);
 	    }
 	    .endpoint-summary:focus-visible {
 	      outline: none;
-	      box-shadow: inset 0 0 0 3px rgba(242, 106, 27, 0.12);
+	      box-shadow: inset 0 0 0 3px rgba(186, 77, 15, 0.12);
 	    }
 	    .endpoint-content {
 	      display: grid;
@@ -4467,222 +5509,77 @@ function onboardingHtml(
 	      overflow: hidden;
 	    }
 	    .endpoint-fields {
-	      padding: 2px 13px 13px;
+	      padding: 4px 4px 4px 20px;
 	    }
 	    .field-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
-    .tier-list { display: grid; gap: 8px; }
-    .tier-item {
-      display: grid;
-      grid-template-columns: 88px minmax(0, 1fr) auto;
-      gap: 12px;
-      align-items: center;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: rgba(255,255,255,0.55);
-      padding: 11px 12px;
-    }
-    .tier-name { color: var(--accent-dark); font-size: 13px; font-weight: 750; }
-    #tierBody { min-width: 0; }
-    .tier-model { min-width: 0; }
-    .tier-model strong {
-      display: block;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      font-size: 13px;
-      font-weight: 650;
-    }
-    .tier-model small { color: var(--muted); font-size: 11px; }
-    .pill {
-      border: 1px solid rgba(37,99,58,0.2);
-      border-radius: 999px;
-      background: rgba(37,99,58,0.08);
-      color: var(--green);
-      font-size: 10px;
-      font-weight: 700;
-      padding: 5px 8px;
-      text-transform: uppercase;
-    }
-    .editor-grid { display: grid; gap: 12px; margin-top: 12px; }
-    .editor-row {
-      border-top: 1px solid rgba(32,35,31,0.08);
-      padding-top: 11px;
-    }
-    .muted-line { color: var(--dim); font-size: 12px; }
-    .note {
-      border: 1px solid rgba(242,106,27,0.13);
-      border-radius: 8px;
-      background: rgba(242,106,27,0.055);
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 500;
-      line-height: 1.45;
-      padding: 10px 12px;
-    }
     .actions {
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 10px;
-      min-height: 42px;
+      min-height: 40px;
+      border-top: 1px solid var(--line);
+      padding-top: 16px;
     }
     button {
-      min-height: 40px;
+      min-height: 36px;
       border: 1px solid transparent;
       cursor: pointer;
-      font-size: 14px;
-      font-weight: 650;
-      padding: 0 17px;
+      font-size: 13px;
+      font-weight: 570;
+      padding: 0 15px;
     }
     .secondary {
       background: transparent;
-      color: #656b64;
+      color: var(--muted);
     }
     .secondary:hover { color: var(--ink); }
     .primary {
-      background: linear-gradient(135deg, var(--accent), var(--accent-dark));
+      background: var(--primary);
       border-radius: 8px;
       color: #fff;
-      box-shadow: 0 13px 28px rgba(242, 106, 27, 0.22);
-      min-width: 150px;
+      box-shadow: none;
+      min-width: 112px;
     }
     .primary:hover {
-      transform: translateY(-1px);
+      background: var(--primary-hover);
     }
     .primary:disabled { opacity: 0.55; cursor: not-allowed; }
-    .migration-buttons {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-    .migration-assurance {
-      border-color: rgba(37,99,58,0.18);
-      background: rgba(37,99,58,0.06);
-      color: #36533d;
-    }
-    .migration-section-label {
-      margin: 0;
-      color: #454b44;
-      font-size: 12px;
-      font-weight: 700;
-    }
-    .migration-candidate-list {
-      display: grid;
-      gap: 9px;
-    }
-    .migration-candidate-row {
-      display: grid;
-      gap: 5px;
-    }
-    .migration-candidate-row > details {
-      margin: 0 8px;
-      padding: 7px 10px;
-    }
-    .migration-candidate {
-      appearance: none;
-      width: 100%;
-      min-height: 62px;
-      display: grid;
-      gap: 6px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: rgba(255,255,255,0.62);
-      color: var(--ink);
-      padding: 12px 13px;
-      text-align: left;
-      transition: border-color 160ms ease, box-shadow 160ms ease, background 160ms ease;
-    }
-    .migration-candidate:hover {
-      border-color: rgba(242,106,27,0.34);
-      background: rgba(255,255,255,0.88);
-    }
-    .migration-candidate[aria-pressed="true"] {
-      border-color: var(--accent);
-      background: #fffaf4;
-      box-shadow: 0 10px 22px rgba(54,42,28,0.06);
-    }
-    .migration-candidate:focus-visible {
-      outline: 3px solid rgba(242,106,27,0.3);
-      outline-offset: 2px;
-    }
-    .migration-candidate:disabled {
-      cursor: wait;
-      opacity: 0.62;
-    }
-    .migration-candidate-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-    }
-    .migration-candidate-head strong {
-      font-size: 13px;
-      font-weight: 700;
-    }
-    .migration-candidate-meta {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 5px 12px;
-      color: var(--muted);
-      font-size: 11px;
-      line-height: 1.35;
-    }
-    .migration-selection-hint {
-      margin: 0;
-      color: var(--muted);
-      font-size: 11px;
-      line-height: 1.4;
-    }
-    .migration-manual-controls {
-      display: grid;
-      gap: 9px;
-      margin-top: 11px;
-    }
-    .migration-manual-controls button {
-      border-radius: 8px;
-      white-space: nowrap;
-    }
-    .migration-status {
-      display: flex;
-      align-items: center;
-      gap: 9px;
-    }
-    .migration-spinner {
-      width: 14px;
-      height: 14px;
-      flex: none;
-      border: 2px solid rgba(242, 106, 27, 0.25);
-      border-top-color: var(--accent);
-      border-radius: 999px;
-      animation: migration-spin 0.8s linear infinite;
-    }
-    @keyframes migration-spin {
-      to { transform: rotate(360deg); }
-    }
-    .migration-path {
-      display: block;
-      margin-top: 5px;
-      font-size: 12px;
-      word-break: break-all;
-    }
     .error {
       min-height: 18px;
       color: #b42318;
       font-size: 12px;
       font-weight: 750;
     }
+    .error:empty {
+      display: none;
+    }
     @media (max-width: 680px) {
       main {
-        grid-template-columns: 1fr;
+        padding: 14px;
         overflow: auto;
       }
-      .rail { display: none; }
-      .setup-card { position: relative; min-height: 620px; height: auto; }
-      .provider-grid, .setup-mode-grid, .choice-row, .tier-defaults, .field-pair { grid-template-columns: 1fr; }
+      .topbar { width: 100%; }
+      .deck { width: 100%; }
+      .setup-card { position: relative; min-height: 620px; height: auto; padding: 24px 20px; }
+      .provider, .field-pair { grid-template-columns: 1fr; gap: 4px; }
       .provider-feature { grid-template-columns: 1fr; }
       .provider-feature-cta { width: 100%; }
-      .migration-manual-controls { grid-template-columns: 1fr; }
-      .migration-buttons { width: 100%; flex-wrap: wrap; justify-content: flex-end; }
+      .provider-promo-copy {
+        grid-column: 1 / -1;
+        grid-row: 2;
+        flex-wrap: wrap;
+        white-space: normal;
+      }
+      .api-key-head {
+        grid-template-columns: auto minmax(0, 1fr);
+        row-gap: 7px;
+      }
+      .provider-promo-cta {
+        grid-column: 2;
+        grid-row: 1;
+        justify-self: end;
+      }
     }
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after {
@@ -4696,231 +5593,92 @@ function onboardingHtml(
 </head>
 <body>
   <main>
-    <aside class="rail">
-      <section>
-        <h1 data-i18n="onboarding.rail.title">${ot('onboarding.rail.title')}</h1>
-        <p data-i18n="onboarding.rail.subtitle">${ot('onboarding.rail.subtitle')}</p>
-      </section>
-      <nav class="progress" aria-label="${ot('onboarding.aria.setupSteps')}" data-i18n-aria="onboarding.aria.setupSteps">
-        ${migrationStepEnabled ? `<button class="step active" type="button" data-step-label="5">
-          <span class="step-index">1</span>
-          <span><strong data-i18n="migration.nav.title">${ot('migration.nav.title')}</strong><span data-i18n="migration.nav.sub">${ot('migration.nav.sub')}</span></span>
-        </button>` : ''}
-        <button class="step${migrationStepEnabled ? '' : ' active'}" type="button" data-step-label="0">
-          <span class="step-index">1</span>
-          <span><strong data-i18n="onboarding.nav.mode.title">${ot('onboarding.nav.mode.title')}</strong><span data-i18n="onboarding.nav.mode.sub">${ot('onboarding.nav.mode.sub')}</span></span>
-        </button>
-        <button class="step" type="button" data-step-label="1">
-          <span class="step-index">2</span>
-          <span><strong data-i18n="onboarding.nav.provider.title">${ot('onboarding.nav.provider.title')}</strong><span data-i18n="onboarding.nav.provider.sub">${ot('onboarding.nav.provider.sub')}</span></span>
-        </button>
-        <button class="step" type="button" data-step-label="2" data-advanced-step>
-          <span class="step-index">3</span>
-          <span><strong data-i18n="onboarding.nav.routing.title">${ot('onboarding.nav.routing.title')}</strong><span data-i18n="onboarding.nav.routing.sub">${ot('onboarding.nav.routing.sub')}</span></span>
-        </button>
-        <button class="step" type="button" data-step-label="3" data-advanced-step>
-          <span class="step-index">4</span>
-          <span><strong data-i18n="onboarding.nav.tiers.title">${ot('onboarding.nav.tiers.title')}</strong><span data-i18n="onboarding.nav.tiers.sub">${ot('onboarding.nav.tiers.sub')}</span></span>
-        </button>
-        <button class="step" type="button" data-step-label="4">
-          <span class="step-index">4</span>
-          <span><strong data-i18n="onboarding.nav.search.title">${ot('onboarding.nav.search.title')}</strong><span data-i18n="onboarding.nav.search.sub">${ot('onboarding.nav.search.sub')}</span></span>
-        </button>
-      </nav>
-      <div class="rail-bottom">
-        <label class="language-picker" for="onboardingLocale">
-          <span data-i18n="onboarding.language.label">${ot('onboarding.language.label')}</span>
-          <select id="onboardingLocale" aria-label="${ot('onboarding.aria.language')}" data-i18n-aria="onboarding.aria.language">
-            ${localeOptionsHtml()}
-          </select>
-        </label>
-        <div class="rail-foot" data-i18n="onboarding.rail.foot">${ot('onboarding.rail.foot')}</div>
-      </div>
-    </aside>
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark" aria-hidden="true"></span><span>OpenSquilla</span></div>
+      <label class="language-picker" for="onboardingLocale">
+        <span class="sr-only" data-i18n="onboarding.language.label">${ot('onboarding.language.label')}</span>
+        <select id="onboardingLocale" aria-label="${ot('onboarding.aria.language')}" data-i18n-aria="onboarding.aria.language">
+          ${localeOptionsHtml()}
+        </select>
+      </label>
+    </header>
     <form id="setup-form" class="deck">
-      ${migrationStepEnabled ? `<section class="setup-card active" data-screen="5">
+      <section class="setup-card active" data-screen="1">
         <header class="card-head">
-          <div>
-            <p class="eyebrow">Step 01</p>
-            <h2 data-i18n="migration.step.heading">${ot('migration.step.heading')}</h2>
-            <p data-i18n="migration.step.subtitle">${ot('migration.step.subtitle')}</p>
-          </div>
-          <span class="card-badge" data-i18n="migration.step.badge">${ot('migration.step.badge')}</span>
+          <h2 data-i18n="onboarding.step2.heading">${ot('onboarding.step2.heading')}</h2>
+          <p data-i18n="onboarding.step2.subtitle">${ot('onboarding.step2.subtitle')}</p>
         </header>
         <div class="card-body">
-          <div class="note migration-assurance" data-i18n="migration.step.assurance">${ot('migration.step.assurance')}</div>
-          <p class="migration-section-label" id="migrationSourceLabel" data-i18n="migration.step.sourceLabel">${ot('migration.step.sourceLabel')}</p>
-          <div class="migration-candidate-list" id="migrationCandidateList" role="group" aria-labelledby="migrationSourceLabel" aria-describedby="migrationSelectionHint"></div>
-          <input id="migrationSource" type="hidden" value="" />
-          <p class="migration-selection-hint" id="migrationSelectionHint" data-i18n="migration.step.selectionHint">${ot('migration.step.selectionHint')}</p>
-          <details>
-            <summary data-i18n="migration.step.manualTypeLabel">${ot('migration.step.manualTypeLabel')}</summary>
-            <div class="migration-manual-controls">
-              <button class="secondary" type="button" id="migrationBrowse" data-i18n="migration.step.browse">${ot('migration.step.browse')}</button>
+        <input id="provider" type="hidden" value="tokenrhythm" />
+        <input id="routerMode" type="hidden" value="disabled" />
+        <input id="modelRoutingMode" type="hidden" value="direct" />
+        <div class="provider-select-field">
+          <div class="provider-combobox" id="providerCombobox">
+            <button class="provider-combobox-toggle" id="providerSelectToggle" type="button" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-controls="providerSelectPanel" aria-labelledby="providerSelectLabel providerSelectValue">
+              <span class="provider-combobox-label" id="providerSelectLabel" data-i18n="onboarding.nav.provider.title">${ot('onboarding.nav.provider.title')}</span>
+              <span class="provider-combobox-value" id="providerSelectValue"></span>
+              <span class="provider-selected-badges" id="providerSelectedBadges"></span>
+              <span class="provider-combobox-chevron" aria-hidden="true"></span>
+            </button>
+            <div class="provider-select-panel" id="providerSelectPanel" hidden>
+              <div class="provider-options" id="providerOptions" role="listbox" aria-labelledby="providerSelectLabel"></div>
             </div>
-          </details>
-          <div class="note migration-status" id="migrationStatus" role="status" aria-live="polite" hidden><span class="migration-spinner"></span><span id="migrationStatusLabel"></span></div>
-          <div class="note" id="migrationSummary" hidden></div>
-          <div class="note" id="migrationDoneNote" hidden></div>
+          </div>
         </div>
-        <footer class="actions">
-          <button class="secondary" type="button" id="migrationSkip" data-i18n="migration.step.skip">${ot('migration.step.skip')}</button>
-          <div class="migration-buttons">
-            <button class="primary" type="button" id="migrationPreview" data-i18n="migration.step.preview">${ot('migration.step.preview')}</button>
-            <button class="primary" type="button" id="migrationImport" data-i18n="migration.step.import" hidden>${ot('migration.step.import')}</button>
+        <div class="api-key-field">
+          <div class="api-key-head">
+            <label class="api-key-label" for="apiKey">
+              <span class="field-label-text"><span data-i18n="onboarding.step2.apiKey">${ot('onboarding.step2.apiKey')}</span><span class="required-marker" id="apiKeyRequiredMarker" aria-hidden="true">*</span></span>
+            </label>
+            <div class="provider-promo-copy">
+              <strong data-i18n="onboarding.step2.tokenrhythmTitle">${ot('onboarding.step2.tokenrhythmTitle')}</strong>
+              <span data-i18n="onboarding.step2.tokenrhythmRegistration">${ot('onboarding.step2.tokenrhythmRegistration')}</span>
+            </div>
+            <a class="provider-promo-cta" id="tokenrhythmRegister" href="${TOKENRHYTHM_REGISTER_URL}" target="_blank" rel="noopener noreferrer" data-i18n="onboarding.step2.tokenrhythmCta" data-i18n-aria="onboarding.step2.tokenrhythmCtaExternalLabel" aria-label="${ot('onboarding.step2.tokenrhythmCtaExternalLabel')}">${ot('onboarding.step2.tokenrhythmCta')}</a>
           </div>
-        </footer>
-      </section>` : ''}
-      <section class="setup-card${migrationStepEnabled ? '' : ' active'}" data-screen="0">
-        <header class="card-head">
-          <div>
-            <p class="eyebrow">Step 01</p>
-            <h2 data-i18n="onboarding.step1.heading">${ot('onboarding.step1.heading')}</h2>
-            <p data-i18n="onboarding.step1.subtitle">${ot('onboarding.step1.subtitle')}</p>
+          <input id="apiKey" name="apiKey" type="password" autocomplete="off" placeholder="sk-..." aria-describedby="apiKeyError" />
+          <span class="field-error" id="apiKeyError" role="alert" aria-live="polite"></span>
+        </div>
+        <input id="baseUrl" name="baseUrl" type="hidden" />
+        <div class="model-config" id="modelConfig">
+          <div class="model-summary" id="modelSummary">
+            <div class="model-summary-copy">
+              <span class="model-summary-label" id="modelSummaryLabel"></span>
+              <strong class="model-summary-value" id="modelSummaryValue"></strong>
+            </div>
+            <button class="model-summary-edit" id="modelEditToggle" type="button"></button>
           </div>
-          <span class="card-badge" data-i18n="onboarding.step1.badge">${ot('onboarding.step1.badge')}</span>
-        </header>
-        <div class="card-body">
-          <div class="setup-mode-grid" role="radiogroup" aria-label="${ot('onboarding.aria.setupDepth')}" data-i18n-aria="onboarding.aria.setupDepth">
-            <button class="choice active" type="button" data-setup-mode="simple">
-              <strong data-i18n="onboarding.step1.simpleTitle">${ot('onboarding.step1.simpleTitle')}</strong>
-              <small data-i18n="onboarding.step1.simpleDesc">${ot('onboarding.step1.simpleDesc')}</small>
-            </button>
-            <button class="choice" type="button" data-setup-mode="advanced">
-              <strong data-i18n="onboarding.step1.advancedTitle">${ot('onboarding.step1.advancedTitle')}</strong>
-              <small data-i18n="onboarding.step1.advancedDesc">${ot('onboarding.step1.advancedDesc')}</small>
-            </button>
+          <div class="model-editor" id="modelEditor" hidden>
+            <div class="model-editor-head">
+              <label for="model">
+                <span class="field-label-text"><span data-i18n="onboarding.step2.directModel">${ot('onboarding.step2.directModel')}</span><span class="required-marker" id="modelRequiredMarker" aria-hidden="true" hidden>*</span></span>
+              </label>
+              <button class="model-editor-done" id="modelEditDone" type="button"></button>
+            </div>
+            <input id="model" name="model" autocomplete="off" placeholder="Auto" aria-describedby="modelError" />
+            <span class="field-error" id="modelError" role="alert" aria-live="polite"></span>
           </div>
-          <input id="setupMode" type="hidden" value="simple" />
-          <div class="note" data-i18n="onboarding.step1.note">${ot('onboarding.step1.note')}</div>
+        </div>
+        <section class="inline-search-section" aria-labelledby="inlineSearchHeading">
+          <button class="inline-search-toggle" id="inlineSearchToggle" type="button" aria-expanded="false" aria-controls="inlineSearchPanel">
+            <span class="inline-search-title" id="inlineSearchHeading" data-i18n="onboarding.step5.heading">${ot('onboarding.step5.heading')}</span>
+            <span class="inline-search-optional" data-i18n="onboarding.step5.badge">${ot('onboarding.step5.badge')}</span>
+          </button>
+          <div class="inline-search-panel" id="inlineSearchPanel" hidden>
+            <div class="search-provider-list" id="searchProviderGrid" role="radiogroup" aria-label="${ot('onboarding.aria.searchProvider')}" data-i18n-aria="onboarding.aria.searchProvider"></div>
+            <input id="searchProvider" type="hidden" value="duckduckgo" />
+            <div id="searchKeyParking" hidden>
+              <label class="search-key-field" id="searchKeyLabel" for="searchApiKey" hidden>
+                <span class="field-label-text"><span data-i18n="onboarding.step5.searchKey">${ot('onboarding.step5.searchKey')}</span><span class="required-marker" aria-hidden="true">*</span></span>
+                <input id="searchApiKey" name="searchApiKey" type="password" autocomplete="off" placeholder="SEARCH_API_KEY" aria-describedby="searchApiKeyError" aria-required="true" />
+                <span class="field-error" id="searchApiKeyError" role="alert" aria-live="polite"></span>
+              </label>
+            </div>
+          </div>
+        </section>
         </div>
         <footer class="actions">
           <button class="secondary" type="button" id="cancel" data-i18n="onboarding.step1.quit">${ot('onboarding.step1.quit')}</button>
-          <button class="primary next-button" type="button" data-i18n="onboarding.step1.continue">${ot('onboarding.step1.continue')}</button>
-        </footer>
-      </section>
-      <section class="setup-card" data-screen="1">
-        <header class="card-head">
-          <div>
-            <p class="eyebrow">Step 02</p>
-            <h2 data-i18n="onboarding.step2.heading">${ot('onboarding.step2.heading')}</h2>
-            <p data-i18n="onboarding.step2.subtitle">${ot('onboarding.step2.subtitle')}</p>
-          </div>
-          <span class="card-badge" data-i18n="onboarding.step2.badge">${ot('onboarding.step2.badge')}</span>
-        </header>
-        <div class="card-body">
-        <div class="provider-feature active" data-provider-feature="tokenrhythm">
-          <button class="provider-feature-select" type="button" data-provider="tokenrhythm" aria-pressed="true">
-            <strong data-i18n="onboarding.step2.tokenrhythmTitle" data-tokenrhythm-title>${ot('onboarding.step2.tokenrhythmTitle')}</strong>
-            <span class="provider-feature-value" data-i18n="onboarding.step2.tokenrhythmValue" data-tokenrhythm-value>${ot('onboarding.step2.tokenrhythmValue')}</span>
-            <span class="provider-feature-registration" data-i18n="onboarding.step2.tokenrhythmRegistration" data-tokenrhythm-registration>${ot('onboarding.step2.tokenrhythmRegistration')}</span>
-          </button>
-          <a class="provider-feature-cta" id="tokenrhythmRegister" href="${TOKENRHYTHM_REGISTER_URL}" target="_blank" rel="noopener noreferrer" data-i18n="onboarding.step2.tokenrhythmCta" data-i18n-aria="onboarding.step2.tokenrhythmCtaExternalLabel" aria-label="${ot('onboarding.step2.tokenrhythmCtaExternalLabel')}">${ot('onboarding.step2.tokenrhythmCta')}</a>
-        </div>
-        <div class="provider-disclosure">
-          <button class="provider-disclosure-toggle" id="providerMoreToggle" type="button" aria-expanded="false" aria-controls="providerMorePanel">
-            <span data-i18n="onboarding.step2.otherProviders">${ot('onboarding.step2.otherProviders')}</span>
-          </button>
-          <div id="providerMorePanel" hidden>
-            <div class="provider-picker">
-              <div class="provider-grid" id="providerGrid"></div>
-            </div>
-          </div>
-        </div>
-        <input id="provider" type="hidden" value="tokenrhythm" />
-        <input id="routerMode" type="hidden" value="disabled" />
-        <label>
-          <span data-i18n="onboarding.step2.apiKey">${ot('onboarding.step2.apiKey')}</span>
-          <input id="apiKey" name="apiKey" type="password" autocomplete="off" placeholder="sk-..." />
-        </label>
-        <div class="endpoint-panel" id="endpointPanel">
-          <button class="endpoint-summary" id="endpointToggle" type="button" aria-expanded="false" aria-controls="endpointContent">
-            <span data-i18n="onboarding.step2.endpointSummary">${ot('onboarding.step2.endpointSummary')}</span>
-          </button>
-          <div class="endpoint-content" id="endpointContent" aria-hidden="true">
-            <div class="endpoint-content-clip">
-              <div class="field-pair endpoint-fields">
-                <label>
-                  <span data-i18n="onboarding.step2.baseUrl">${ot('onboarding.step2.baseUrl')}</span>
-                  <input id="baseUrl" name="baseUrl" autocomplete="off" />
-                </label>
-                <label>
-                  <span data-i18n="onboarding.step2.directModel">${ot('onboarding.step2.directModel')}</span>
-                  <input id="model" name="model" autocomplete="off" />
-                </label>
-              </div>
-            </div>
-          </div>
-        </div>
-        <div class="note" id="providerHint"></div>
-        </div>
-        <footer class="actions">
-          <button class="secondary back-button" type="button" data-i18n="onboarding.step2.back">${ot('onboarding.step2.back')}</button>
-          <button class="primary next-button" type="button" data-i18n="onboarding.step2.next">${ot('onboarding.step2.next')}</button>
-        </footer>
-      </section>
-      <section class="setup-card" data-screen="2">
-        <header class="card-head">
-          <div>
-            <p class="eyebrow">Step 03</p>
-            <h2 data-i18n="onboarding.step3.heading">${ot('onboarding.step3.heading')}</h2>
-            <p data-i18n="onboarding.step3.subtitle">${ot('onboarding.step3.subtitle')}</p>
-          </div>
-          <span class="card-badge" data-i18n="onboarding.step3.badge">${ot('onboarding.step3.badge')}</span>
-        </header>
-        <div class="card-body">
-          <div class="choice-row" id="modelRoutingModeGrid" role="radiogroup" aria-label="${ot('onboarding.aria.modelRoutingMode')}" data-i18n-aria="onboarding.aria.modelRoutingMode"></div>
-          <input id="modelRoutingMode" type="hidden" value="direct" />
-          <div id="directModelPanel" hidden>
-            <label>
-              <span data-i18n="onboarding.step3.directModel">${ot('onboarding.step3.directModel')}</span>
-              <input id="directModelRoute" autocomplete="off" />
-            </label>
-            <div class="note" id="directModelHint"></div>
-          </div>
-        </div>
-        <footer class="actions">
-          <button class="secondary back-button" type="button" data-i18n="onboarding.step3.back">${ot('onboarding.step3.back')}</button>
-          <button class="primary next-button" type="button" data-i18n="onboarding.step3.next">${ot('onboarding.step3.next')}</button>
-        </footer>
-      </section>
-      <section class="setup-card" data-screen="3">
-        <header class="card-head">
-          <div>
-            <p class="eyebrow">Step 03</p>
-            <h2 data-i18n="onboarding.step4.heading">${ot('onboarding.step4.heading')}</h2>
-            <p data-i18n="onboarding.step4.subtitle">${ot('onboarding.step4.subtitle')}</p>
-          </div>
-          <span class="card-badge" data-i18n="onboarding.step4.badge">${ot('onboarding.step4.badge')}</span>
-        </header>
-        <div class="card-body">
-          <div id="tierBody"></div>
-        </div>
-        <footer class="actions">
-          <button class="secondary back-button" type="button" data-i18n="onboarding.step4.back">${ot('onboarding.step4.back')}</button>
-          <button class="primary next-button" type="button" data-i18n="onboarding.step4.next">${ot('onboarding.step4.next')}</button>
-        </footer>
-      </section>
-      <section class="setup-card" data-screen="4">
-        <header class="card-head">
-          <div>
-            <p class="eyebrow">Step 04</p>
-            <h2 data-i18n="onboarding.step5.heading">${ot('onboarding.step5.heading')}</h2>
-            <p data-i18n="onboarding.step5.subtitle">${ot('onboarding.step5.subtitle')}</p>
-          </div>
-          <span class="card-badge" data-i18n="onboarding.step5.badge">${ot('onboarding.step5.badge')}</span>
-        </header>
-        <div class="card-body">
-        <div class="choice-row" id="searchProviderGrid" role="radiogroup" aria-label="${ot('onboarding.aria.searchProvider')}" data-i18n-aria="onboarding.aria.searchProvider"></div>
-        <input id="searchProvider" type="hidden" value="duckduckgo" />
-        <label id="searchKeyLabel" hidden>
-          <span data-i18n="onboarding.step5.searchKey">${ot('onboarding.step5.searchKey')}</span>
-          <input id="searchApiKey" name="searchApiKey" type="password" autocomplete="off" placeholder="SEARCH_API_KEY" />
-        </label>
-        <div class="note" id="searchHint" data-i18n="onboarding.step5.searchHintDefault">${ot('onboarding.step5.searchHintDefault')}</div>
-        </div>
-        <footer class="actions">
-          <button class="secondary back-button" type="button" data-i18n="onboarding.step5.back">${ot('onboarding.step5.back')}</button>
           <button class="primary" type="button" id="finish" data-i18n="onboarding.step5.finish">${ot('onboarding.step5.finish')}</button>
         </footer>
       </section>
@@ -4930,7 +5688,6 @@ function onboardingHtml(
   <script>
     const desktopMessages = ${inlineScriptJson(DESKTOP_MESSAGES)};
     const onboardingMessageCatalog = ${inlineScriptJson(ONBOARDING_SCRIPT_MESSAGES)};
-    const providerNoteCatalog = ${inlineScriptJson(PROVIDER_NOTE_MESSAGES)};
     const searchNoteCatalog = ${inlineScriptJson(SEARCH_PROVIDER_NOTE_MESSAGES)};
     let activeLocale = ${inlineScriptJson(desktopLocale)};
     let t = messagesFor(activeLocale);
@@ -4945,67 +5702,52 @@ function onboardingHtml(
       if (vars) for (const name of Object.keys(vars)) out = out.split('{' + name + '}').join(String(vars[name]));
       return out;
     }
-    function desktopFmt(key, vars) {
-      let out = desktopMessage(activeLocale, key);
-      if (vars) for (const name of Object.keys(vars)) out = out.split('{' + name + '}').join(String(vars[name]));
-      return out;
-    }
     const providers = ${inlineScriptJson(PROVIDER_CATALOG)};
     const searchProviders = ${inlineScriptJson(SEARCH_PROVIDER_CATALOG)};
     const routerProfiles = ${inlineScriptJson(ROUTER_PROFILES)};
-    const textTiers = ${inlineScriptJson(TEXT_ROUTER_TIERS)};
-    const migrationCandidates = ${inlineScriptJson(detections)};
-    const migrationStepEnabled = ${inlineScriptJson(migrationStepEnabled)};
-    let migrationCandidate = null;
-    let renderMigrationCandidates = () => {};
-    let renderMigrationPreviewSummary = () => {};
     const initialProviderPrefill = ${inlineScriptJson(pendingProviderSetup)};
-    let step = ${migrationStepEnabled ? 5 : 0};
+    let searchPaidOpen = false;
+    let searchSectionOpen = false;
     let routerTiers = clone(routerProfiles.openrouter);
-    const setupMode = document.getElementById('setupMode');
+    let modelEditorOpen = false;
     const provider = document.getElementById('provider');
     const baseUrl = document.getElementById('baseUrl');
     const model = document.getElementById('model');
-    const providerHint = document.getElementById('providerHint');
     const modelRoutingMode = document.getElementById('modelRoutingMode');
-    const modelRoutingModeGrid = document.getElementById('modelRoutingModeGrid');
-    const directModelPanel = document.getElementById('directModelPanel');
-    const directModelRoute = document.getElementById('directModelRoute');
-    const directModelHint = document.getElementById('directModelHint');
     const routerMode = document.getElementById('routerMode');
-    const tierBody = document.getElementById('tierBody');
-    const searchHint = document.getElementById('searchHint');
     const errorBox = document.getElementById('error');
+    const apiKey = document.getElementById('apiKey');
+    const apiKeyError = document.getElementById('apiKeyError');
+    const apiKeyRequiredMarker = document.getElementById('apiKeyRequiredMarker');
+    const modelError = document.getElementById('modelError');
+    const modelRequiredMarker = document.getElementById('modelRequiredMarker');
+    const modelSummary = document.getElementById('modelSummary');
+    const modelSummaryLabel = document.getElementById('modelSummaryLabel');
+    const modelSummaryValue = document.getElementById('modelSummaryValue');
+    const modelEditToggle = document.getElementById('modelEditToggle');
+    const modelEditor = document.getElementById('modelEditor');
+    const modelEditDone = document.getElementById('modelEditDone');
+    const searchApiKey = document.getElementById('searchApiKey');
+    const searchApiKeyError = document.getElementById('searchApiKeyError');
     const finish = document.getElementById('finish');
     const searchProvider = document.getElementById('searchProvider');
 	    const searchProviderGrid = document.getElementById('searchProviderGrid');
 	    const searchKeyLabel = document.getElementById('searchKeyLabel');
+	    const searchKeyParking = document.getElementById('searchKeyParking');
+      const inlineSearchToggle = document.getElementById('inlineSearchToggle');
+      const inlineSearchPanel = document.getElementById('inlineSearchPanel');
 	    const onboardingLocale = document.getElementById('onboardingLocale');
-	    const endpointPanel = document.getElementById('endpointPanel');
-	    const endpointToggle = document.getElementById('endpointToggle');
-	    const endpointContent = document.getElementById('endpointContent');
-    const tokenRhythmFeature = document.querySelector('[data-provider-feature="tokenrhythm"]');
-    const tokenRhythmProviderButton = tokenRhythmFeature.querySelector('[data-provider="tokenrhythm"]');
-    const providerMoreToggle = document.getElementById('providerMoreToggle');
-    const providerMorePanel = document.getElementById('providerMorePanel');
+    const providerCombobox = document.getElementById('providerCombobox');
+    const providerSelectToggle = document.getElementById('providerSelectToggle');
+    const providerSelectValue = document.getElementById('providerSelectValue');
+    const providerSelectedBadges = document.getElementById('providerSelectedBadges');
+    const providerSelectPanel = document.getElementById('providerSelectPanel');
+    const providerOptions = document.getElementById('providerOptions');
     function clone(value) {
       return JSON.parse(JSON.stringify(value || {}));
     }
     function currentProvider() {
       return providers.find((item) => item.id === provider.value) || providers[0];
-    }
-    function providerNote(item) {
-      return (providerNoteCatalog[activeLocale] && providerNoteCatalog[activeLocale][item.id])
-        || (providerNoteCatalog.en && providerNoteCatalog.en[item.id])
-        || item.note
-        || '';
-    }
-    function modelRoutingCapabilities(selected) {
-      return {
-        squilla_router: Boolean(selected.routerSupported),
-        direct: true,
-        llm_ensemble: Boolean(selected.ensembleSelectionMode),
-      };
     }
     function defaultModelRoutingModeFor(selected) {
       return selected.routerSupported ? 'squilla_router' : 'direct';
@@ -5013,145 +5755,124 @@ function onboardingHtml(
     function syncRouterModeFromModelRouting() {
       routerMode.value = modelRoutingMode.value === 'direct' ? 'disabled' : 'recommended';
     }
+    function renderModelField() {
+      const value = model.value.trim();
+      const showEditor = modelEditorOpen || !value;
+      modelSummary.hidden = showEditor;
+      modelEditor.hidden = !showEditor;
+      modelSummaryLabel.textContent = t.recommendedModel;
+      modelSummaryValue.textContent = value || t.noModel;
+      modelEditToggle.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L18.5 9.5a2.12 2.12 0 0 0-3-3L5 17v3Z"></path><path d="m13.5 6.5 3 3"></path></svg>';
+      modelEditToggle.setAttribute('aria-label', t.editModel);
+      modelEditToggle.setAttribute('title', t.editModel);
+      modelEditDone.textContent = t.doneEditingModel;
+      modelEditDone.disabled = !value;
+    }
 	    function profileKeyForMode() {
 	      return provider.value;
 	    }
-	    function setEndpointPanelOpen(open) {
-	      endpointPanel.classList.toggle('open', open);
-	      endpointToggle.setAttribute('aria-expanded', String(open));
-	      endpointContent.setAttribute('aria-hidden', String(!open));
-	    }
-	    function setProviderDisclosureOpen(open) {
-	      providerMoreToggle.setAttribute('aria-expanded', String(open));
-	      providerMorePanel.hidden = !open;
-	    }
 	    function syncProviderDefaults(resetRouter) {
 	      const selected = currentProvider();
+	      apiKeyRequiredMarker.hidden = !selected.requiresApiKey;
+	      apiKey.setAttribute('aria-required', String(selected.requiresApiKey));
+	      apiKey.disabled = !selected.requiresApiKey;
+	      apiKey.placeholder = selected.requiresApiKey ? 'sk-...' : t.noKeyRequired;
 	      if (resetRouter) {
 	        baseUrl.value = selected.baseUrl || '';
 	        model.value = selected.model || '';
+          modelEditorOpen = !model.value.trim();
 	      } else {
 	        if (!baseUrl.value && selected.baseUrl) baseUrl.value = selected.baseUrl;
 	        if (!model.value && selected.model) model.value = selected.model;
 	      }
-	      providerHint.textContent = providerNote(selected);
 	      if (resetRouter) {
 	        modelRoutingMode.value = defaultModelRoutingModeFor(selected);
 	        syncRouterModeFromModelRouting();
 	        routerTiers = clone(routerProfiles[profileKeyForMode()]);
-	        setEndpointPanelOpen(routerMode.value === 'disabled' && !model.value.trim());
 	      }
-	      renderModelRoutingModeGrid();
-	      renderTiers();
-	    }
+	      const modelRequired = modelRoutingMode.value === 'direct';
+      modelRequiredMarker.hidden = !modelRequired;
+      model.setAttribute('aria-required', String(modelRequired));
+      renderModelField();
+    }
     function selectProvider(nextProvider) {
       const next = nextProvider || 'tokenrhythm';
-      // Re-clicking the already-active provider must not reset base URL, model,
-      // routing mode, and customized tiers back to catalog defaults.
+      // Re-clicking the active provider must preserve any endpoint overrides.
       if (next === provider.value) return;
       provider.value = next;
-      errorBox.textContent = '';
+      apiKey.value = '';
+      clearValidationErrors();
       syncProviderDefaults(true);
       renderProviderGrid();
       render();
     }
     function renderProviderGrid() {
-      const grid = document.getElementById('providerGrid');
-      const otherProviders = providers.filter((item) => item.id !== 'tokenrhythm');
-      const tokenRhythmSelected = provider.value === 'tokenrhythm';
-      tokenRhythmFeature.classList.toggle('active', tokenRhythmSelected);
-      tokenRhythmProviderButton.setAttribute('aria-pressed', String(tokenRhythmSelected));
-      tokenRhythmProviderButton.onclick = () => selectProvider('tokenrhythm');
-      grid.classList.toggle('single-provider', otherProviders.length === 1);
-      grid.innerHTML = otherProviders.map((item) => (
-        '<button class="provider' + (item.id === provider.value ? ' active' : '') + '" type="button" data-provider="' + escapeAttr(item.id) + '" aria-pressed="' + String(item.id === provider.value) + '">' +
-        '<span class="provider-tag">' + escapeHtml(t.providerField) + '</span><strong>' + escapeHtml(item.label) + '</strong><small>' + escapeHtml(providerNote(item)) + '</small></button>'
-      )).join('');
-      const bindProviderButton = (button) => {
-        button.addEventListener('click', () => selectProvider(button.dataset.provider || 'tokenrhythm'));
-      };
-      grid.querySelectorAll('.provider').forEach(bindProviderButton);
-    }
-    function renderModelRoutingModeGrid() {
       const selected = currentProvider();
-      const capabilities = modelRoutingCapabilities(selected);
-      if (!capabilities[modelRoutingMode.value]) {
-        modelRoutingMode.value = defaultModelRoutingModeFor(selected);
-      }
-      syncRouterModeFromModelRouting();
-      const modes = [
-        { id: 'squilla_router', title: t.modeSmartRouterTitle, desc: t.modeSmartRouterDesc, disabledReason: t.modeSmartRouterUnavailable },
-        { id: 'direct', title: t.modeDirectTitle, desc: t.modeDirectDesc, disabledReason: '' },
-        { id: 'llm_ensemble', title: t.modeEnsembleTitle, desc: t.modeEnsembleDesc, disabledReason: t.modeEnsembleUnavailable },
-      ];
-      modelRoutingModeGrid.innerHTML = modes.map((mode) => {
-        const enabled = Boolean(capabilities[mode.id]);
-        const active = mode.id === modelRoutingMode.value;
-        const desc = enabled ? mode.desc : mode.disabledReason;
-        return '<button class="choice' + (active ? ' active' : '') + '" type="button" data-model-routing-mode="' + escapeAttr(mode.id) + '"' + (enabled ? '' : ' disabled') + '>' +
-          '<strong>' + escapeHtml(mode.title) + '</strong><small>' + escapeHtml(desc) + '</small></button>';
-      }).join('');
-      modelRoutingModeGrid.querySelectorAll('[data-model-routing-mode]').forEach((button) => {
-        button.addEventListener('click', () => {
-          if (button.disabled) return;
-          modelRoutingMode.value = button.dataset.modelRoutingMode || 'squilla_router';
-          syncRouterModeFromModelRouting();
-          if (modelRoutingMode.value === 'direct') setEndpointPanelOpen(true);
-          errorBox.textContent = '';
-          renderModelRoutingModeGrid();
-          render();
-        });
-      });
-      directModelPanel.hidden = modelRoutingMode.value !== 'direct';
-      directModelRoute.value = model.value;
-      directModelHint.textContent = t.directModelPrompt;
+      providerSelectValue.textContent = selected.label;
+      providerSelectedBadges.innerHTML = '';
+      renderProviderOptions();
     }
-    function renderTiers() {
-      if (routerMode.value === 'disabled') {
-        tierBody.innerHTML =
-          '<label>' + escapeHtml(t.directModelLabel) + '<input id="directModelActive" autocomplete="off" value="' + escapeAttr(model.value) + '" /></label>' +
-          '<div class="note">' + escapeHtml(t.directModelNote) + '</div>';
-        document.getElementById('directModelActive').addEventListener('input', (event) => {
-          model.value = event.target.value;
+    function providerBadgesHtml(item) {
+      if (!item || item.id !== 'tokenrhythm') return '';
+      return '<span class="provider-badge free">' + escapeHtml(t.limitedFreeBadge) + '</span>';
+    }
+    function providerGroupFor(item) {
+      if (item.id === 'tokenrhythm') return 'recommended';
+      return item.deployment === 'local' ? 'local' : 'cloud';
+    }
+    function renderProviderOptions() {
+      const groups = [
+        { id: 'recommended', label: t.providerGroupRecommended },
+        { id: 'cloud', label: t.providerGroupCloud },
+        { id: 'local', label: t.providerGroupLocal },
+      ];
+      const html = groups.map((group) => {
+        const items = providers.filter((item) => providerGroupFor(item) === group.id);
+        if (!items.length) return '';
+        return '<div class="provider-option-group" data-provider-group="' + group.id + '">'
+          + '<div class="provider-option-group-label">' + escapeHtml(group.label) + '</div>'
+          + items.map((item) => {
+            const isSelected = item.id === provider.value;
+            return '<button class="provider-option" type="button" role="option" data-provider-option="' + escapeAttr(item.id) + '" aria-selected="' + String(isSelected) + '">'
+              + '<span class="provider-option-label">' + escapeHtml(item.label) + '</span>'
+              + '<span class="provider-option-badges">' + providerBadgesHtml(item) + '</span>'
+              + '<span class="provider-option-check" aria-hidden="true">' + (isSelected ? '✓' : '') + '</span>'
+              + '</button>';
+          }).join('')
+          + '</div>';
+      }).join('');
+      providerOptions.innerHTML = html;
+      providerOptions.querySelectorAll('[data-provider-option]').forEach((option) => {
+        option.addEventListener('click', () => {
+          selectProvider(option.dataset.providerOption);
+          setProviderPickerOpen(false);
+          providerSelectToggle.focus();
         });
-        return;
+        option.addEventListener('keydown', (event) => {
+          const options = Array.from(providerOptions.querySelectorAll('[data-provider-option]'));
+          const index = options.indexOf(option);
+          if (event.key === 'ArrowDown' && options[index + 1]) {
+            event.preventDefault();
+            options[index + 1].focus();
+          } else if (event.key === 'ArrowUp') {
+            event.preventDefault();
+            (options[index - 1] || providerSelectToggle).focus();
+          } else if (event.key === 'Escape') {
+            event.preventDefault();
+            setProviderPickerOpen(false);
+            providerSelectToggle.focus();
+          }
+        });
+      });
+    }
+    function setProviderPickerOpen(open) {
+      providerSelectToggle.setAttribute('aria-expanded', String(open));
+      providerSelectPanel.hidden = !open;
+      if (open) {
+        renderProviderOptions();
+        const selectedOption = providerOptions.querySelector('[aria-selected="true"]');
+        (selectedOption || providerOptions.querySelector('[data-provider-option]'))?.focus();
       }
-      const defaultTier = document.getElementById('routerDefaultTier')?.value || 'c1';
-      const tierButtons = textTiers.map((tier) => (
-        '<button class="tier-button' + (tier === defaultTier ? ' active' : '') + '" type="button" data-default-tier="' + tier + '">' +
-        '<strong>' + tier.toUpperCase() + '</strong><small title="' + escapeAttr(routerTiers[tier]?.model || t.noModel) + '">' + escapeHtml(shortModel(routerTiers[tier]?.model || t.noModel)) + '</small></button>'
-      )).join('');
-      const names = Object.keys(routerTiers).filter((name) => textTiers.includes(name) || name === 'image_model');
-      const tierList = names.map((name) => {
-        const tier = routerTiers[name] || {};
-        return '<div class="tier-item"><div class="tier-name">' + name + '</div><div class="tier-model"><strong>' + escapeHtml(tier.model || '') + '</strong><small>' + escapeHtml(tier.provider || '') + '</small></div>' +
-          (name === defaultTier ? '<span class="pill">' + escapeHtml(t.defaultPill) + '</span>' : '<span></span>') + '</div>';
-      }).join('');
-      const editor = names.map((name) => {
-        const tier = routerTiers[name] || {};
-        return '<div class="editor-row"><div class="muted-line">' + name + '</div><div class="field-pair">' +
-          '<label>' + escapeHtml(t.providerField) + '<input data-tier-provider="' + name + '" value="' + escapeAttr(tier.provider || '') + '" /></label>' +
-          '<label>' + escapeHtml(t.modelField) + '<input data-tier-model="' + name + '" value="' + escapeAttr(tier.model || '') + '" /></label></div></div>';
-      }).join('');
-      tierBody.innerHTML =
-        '<input id="routerDefaultTier" type="hidden" value="' + defaultTier + '" />' +
-        '<div class="tier-defaults">' + tierButtons + '</div>' +
-        '<div class="tier-list">' + tierList + '</div>' +
-        '<details><summary>' + escapeHtml(t.customizeTiers) + '</summary><div class="editor-grid">' + editor + '</div></details>';
-      tierBody.querySelectorAll('[data-default-tier]').forEach((button) => {
-        button.addEventListener('click', () => {
-          document.getElementById('routerDefaultTier').value = button.dataset.defaultTier || 'c1';
-          renderTiers();
-        });
-      });
-      tierBody.querySelectorAll('[data-tier-provider], [data-tier-model]').forEach((input) => {
-        input.addEventListener('input', () => {
-          const tierName = input.dataset.tierProvider || input.dataset.tierModel;
-          routerTiers[tierName] = routerTiers[tierName] || {};
-          if (input.dataset.tierProvider) routerTiers[tierName].provider = input.value.trim();
-          if (input.dataset.tierModel) routerTiers[tierName].model = input.value.trim();
-        });
-      });
     }
     function escapeHtml(value) {
       return String(value).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
@@ -5171,17 +5892,12 @@ function onboardingHtml(
       document.querySelectorAll('[data-i18n-aria]').forEach((element) => {
         element.setAttribute('aria-label', desktopMessage(locale, element.dataset.i18nAria));
       });
+      clearValidationErrors();
       renderProviderGrid();
       renderSearchProviderGrid();
-      renderMigrationCandidates();
-      renderMigrationPreviewSummary();
       syncProviderDefaults(false);
+      renderModelField();
       render();
-    }
-    function shortModel(value) {
-      const text = String(value || '');
-      const parts = text.split('/');
-      return parts[parts.length - 1] || text;
     }
     function currentSearchProvider() {
       return searchProviders.find((item) => item.providerId === searchProvider.value) || searchProviders[0];
@@ -5193,13 +5909,38 @@ function onboardingHtml(
         || (item.requiresApiKey ? t.requiresApiKey : t.noKeyRequired);
     }
     function renderSearchProviderGrid() {
-      searchProviderGrid.innerHTML = searchProviders.map((item) => (
-        '<button class="choice' + (item.providerId === searchProvider.value ? ' active' : '') + '" type="button" data-search-provider="' + escapeAttr(item.providerId) + '">' +
-        '<strong>' + escapeHtml(item.label) + '</strong><small>' + escapeHtml(searchProviderNote(item)) + '</small></button>'
-      )).join('');
+      searchKeyParking.appendChild(searchKeyLabel);
+      searchKeyLabel.hidden = true;
+      const renderSearchChoice = (item) => (
+        '<div class="search-provider-option" data-search-provider-option="' + escapeAttr(item.providerId) + '">' +
+        '<button class="choice' + (item.providerId === searchProvider.value ? ' active' : '') + '" type="button" data-search-provider="' + escapeAttr(item.providerId) + '" aria-pressed="' + String(item.providerId === searchProvider.value) + '">' +
+        '<strong>' + escapeHtml(item.label) + '</strong><small>' + escapeHtml(searchProviderNote(item)) + '</small>' +
+        '<span class="search-provider-billing ' + (item.requiresApiKey ? 'paid' : 'free') + '">' + escapeHtml(item.requiresApiKey ? t.billingPaid : t.billingFree) + '</span>' +
+        '</button></div>'
+      );
+      const freeProviders = searchProviders.filter((item) => !item.requiresApiKey);
+      const paidProviders = searchProviders.filter((item) => item.requiresApiKey);
+      searchProviderGrid.innerHTML =
+        '<div class="search-provider-group-label">' + escapeHtml(t.searchFreeGroup) + '</div>' +
+        freeProviders.map(renderSearchChoice).join('') +
+        '<div class="search-paid-disclosure">' +
+          '<button class="search-paid-toggle" id="searchPaidToggle" type="button" aria-expanded="' + String(searchPaidOpen) + '" aria-controls="searchPaidPanel">' +
+            '<span>' + escapeHtml(t.searchPaidGroup) + '</span><span class="search-paid-count">' + paidProviders.length + '</span>' +
+          '</button>' +
+          '<div class="search-paid-panel" id="searchPaidPanel"' + (searchPaidOpen ? '' : ' hidden') + '>' +
+            paidProviders.map(renderSearchChoice).join('') +
+          '</div>' +
+        '</div>';
+      document.getElementById('searchPaidToggle').addEventListener('click', () => {
+        searchPaidOpen = !searchPaidOpen;
+        renderSearchProviderGrid();
+        render();
+      });
       searchProviderGrid.querySelectorAll('[data-search-provider]').forEach((button) => {
         button.addEventListener('click', () => {
           searchProvider.value = button.dataset.searchProvider || 'duckduckgo';
+          if (currentSearchProvider().requiresApiKey) searchPaidOpen = true;
+          clearFieldError(searchApiKey, searchApiKeyError);
           renderSearchProviderGrid();
           render();
         });
@@ -5207,185 +5948,120 @@ function onboardingHtml(
     }
     function syncSearchProviderControls() {
       const selected = currentSearchProvider();
-      searchKeyLabel.hidden = !selected.requiresApiKey;
+      const selectedButton = searchProviderGrid.querySelector('[data-search-provider="' + selected.providerId + '"]');
+      const selectedOption = selectedButton && selectedButton.closest('.search-provider-option');
+      if (selected.requiresApiKey && selectedOption) {
+        selectedOption.appendChild(searchKeyLabel);
+        searchKeyLabel.hidden = false;
+      } else {
+        searchKeyParking.appendChild(searchKeyLabel);
+        searchKeyLabel.hidden = true;
+      }
       const input = document.getElementById('searchApiKey');
       if (input) input.placeholder = selected.keyPlaceholder || selected.envKey || 'SEARCH_API_KEY';
-      searchHint.textContent = searchProviderNote(selected);
     }
-    function isSimpleSetup() {
-      return setupMode.value === 'simple';
-    }
-    function routeSteps() {
-      const base = isSimpleSetup()
-        ? [0, 1, 4]
-        : modelRoutingMode.value === 'squilla_router'
-          ? [0, 1, 2, 3, 4]
-          : [0, 1, 2, 4];
-      // The migration step (screen 5) leads the route only when a legacy home
-      // was detected; render() renumbers and hides rail entries automatically.
-      return migrationStepEnabled ? [5, ...base] : base;
-    }
-    function routePosition(targetStep) {
-      return routeSteps().indexOf(targetStep);
-    }
-    function nextRouteStep(currentStep) {
-      const route = routeSteps();
-      const index = Math.max(0, route.indexOf(currentStep));
-      return route[Math.min(route.length - 1, index + 1)];
-    }
-    function previousRouteStep(currentStep) {
-      const route = routeSteps();
-      const index = Math.max(0, route.indexOf(currentStep));
-      return route[Math.max(0, index - 1)];
-    }
-    function focusStepHeading(screen) {
-      if (!screen) return;
-      window.requestAnimationFrame(() => {
-        const heading = screen.querySelector('h2');
-        if (!heading) return;
-        heading.setAttribute('tabindex', '-1');
-        heading.focus({ preventScroll: true });
-      });
-    }
-    function setStep(nextStep) {
-      const current = document.querySelector('.setup-card.active');
-      const route = routeSteps();
-      step = route.includes(nextStep) ? nextStep : route[0];
-      document.querySelectorAll('.setup-card').forEach((screen) => {
-        screen.classList.remove('active', 'leaving');
-      });
-      if (current) current.classList.add('leaving');
-      const nextScreen = document.querySelector('[data-screen="' + step + '"]');
-      nextScreen.classList.add('active');
-      render();
-      focusStepHeading(nextScreen);
+    function setSearchSectionOpen(open) {
+      searchSectionOpen = Boolean(open);
+      inlineSearchToggle.setAttribute('aria-expanded', String(searchSectionOpen));
+      inlineSearchPanel.hidden = !searchSectionOpen;
     }
     function render() {
-      const route = routeSteps();
-      const currentRouteIndex = route.indexOf(step);
-      document.querySelectorAll('[data-advanced-step]').forEach((item) => {
-        item.classList.toggle('simple-hidden', isSimpleSetup());
-      });
-	      document.querySelectorAll('.step').forEach((item) => {
-	        const labelStep = Number(item.dataset.stepLabel || 0);
-	        const itemRouteIndex = route.indexOf(labelStep);
-	        const index = item.querySelector('.step-index');
-	        item.hidden = itemRouteIndex < 0;
-	        if (index && itemRouteIndex >= 0) index.textContent = String(itemRouteIndex + 1);
-	        item.classList.toggle('active', labelStep === step);
-	        item.classList.toggle('done', itemRouteIndex >= 0 && itemRouteIndex < currentRouteIndex);
-	      });
-      document.querySelectorAll('.setup-card').forEach((screen) => {
-        const screenStep = Number(screen.dataset.screen || 0);
-        const screenRouteIndex = route.indexOf(screenStep);
-        const eyebrow = screen.querySelector('.eyebrow');
-        if (eyebrow && screenRouteIndex >= 0) {
-          eyebrow.textContent = fmt('stepLabel', { n: String(screenRouteIndex + 1).padStart(2, '0') });
-        }
-      });
-      if (step === 1) {
-        syncProviderDefaults(false);
-      }
-      renderModelRoutingModeGrid();
-      if (step === 3) renderTiers();
+      syncProviderDefaults(false);
       syncSearchProviderControls();
     }
-    document.querySelectorAll('.step').forEach((button) => {
-      button.addEventListener('click', () => {
-        const target = Number(button.dataset.stepLabel || 0);
-        const currentPosition = routePosition(step);
-        const targetPosition = routePosition(target);
-        if (targetPosition < 0) return;
-        if (targetPosition > currentPosition) {
-          const message = validateStep();
-          if (message) {
-            errorBox.textContent = message;
-            return;
-          }
-        }
-        errorBox.textContent = '';
-        setStep(target);
-      });
-    });
-    document.querySelectorAll('[data-setup-mode]').forEach((button) => {
-      button.addEventListener('click', () => {
-        setupMode.value = button.dataset.setupMode || 'simple';
-        document.querySelectorAll('[data-setup-mode]').forEach((item) => item.classList.toggle('active', item === button));
-        errorBox.textContent = '';
-        render();
-      });
-    });
 	    onboardingLocale.addEventListener('change', () => {
-	      errorBox.textContent = '';
 	      applyLocale(onboardingLocale.value);
 	    });
-	    providerMoreToggle.addEventListener('click', () => {
-	      setProviderDisclosureOpen(providerMoreToggle.getAttribute('aria-expanded') !== 'true');
-	    });
-	    endpointToggle.addEventListener('click', () => {
-	      setEndpointPanelOpen(!endpointPanel.classList.contains('open'));
-	    });
-	    directModelRoute.addEventListener('input', () => {
-	      model.value = directModelRoute.value;
-	    });
+      providerSelectToggle.addEventListener('click', () => {
+        setProviderPickerOpen(providerSelectToggle.getAttribute('aria-expanded') !== 'true');
+      });
+      providerSelectToggle.addEventListener('keydown', (event) => {
+        if (event.key === 'ArrowDown') {
+          event.preventDefault();
+          setProviderPickerOpen(true);
+        }
+      });
+      inlineSearchToggle.addEventListener('click', () => {
+        setSearchSectionOpen(!searchSectionOpen);
+      });
+      document.addEventListener('pointerdown', (event) => {
+        if (!providerCombobox.contains(event.target)) setProviderPickerOpen(false);
+      });
+      function clearFieldError(input, output) {
+        output.textContent = '';
+        input.removeAttribute('aria-invalid');
+      }
+      function clearValidationErrors() {
+        errorBox.textContent = '';
+        clearFieldError(apiKey, apiKeyError);
+        clearFieldError(model, modelError);
+        clearFieldError(searchApiKey, searchApiKeyError);
+      }
+      function presentValidationIssue(issue) {
+        issue.output.textContent = issue.message;
+        issue.input.setAttribute('aria-invalid', 'true');
+        if (issue.input === model) {
+          modelEditorOpen = true;
+          renderModelField();
+        }
+        if (issue.input === searchApiKey) {
+          setSearchSectionOpen(true);
+        }
+        issue.input.focus({ preventScroll: false });
+      }
 	    function validateStep() {
       const selected = currentProvider();
       const selectedSearch = currentSearchProvider();
-      if (step === 1 && selected.requiresApiKey && !document.getElementById('apiKey').value.trim()) return fmt('apiKeyRequired', { label: selected.label });
-      // Direct mode needs a model. In Simple setup the routing screen (step 2) is
-      // not in the route, so the model is entered on the provider screen (step 1);
-      // validate on whichever step is actually reachable, or the check silently
-      // never runs and the save fails late with a raw main-process error.
+      if (selected.requiresApiKey && !apiKey.value.trim()) {
+        return { input: apiKey, output: apiKeyError, message: fmt('apiKeyRequired', { label: selected.label }) };
+      }
       if (modelRoutingMode.value === 'direct' && !model.value.trim()) {
-        if (isSimpleSetup() && step === 1) return t.directModelRequiredDirect;
-        if (!isSimpleSetup() && step === 2) return t.directModelRequiredDirect;
+        return { input: model, output: modelError, message: t.directModelRequiredDirect };
       }
-      if (step === 3 && modelRoutingMode.value === 'squilla_router') {
-        const defaultTier = document.getElementById('routerDefaultTier')?.value || 'c1';
-        if (!routerTiers[defaultTier] || !routerTiers[defaultTier].model) return t.defaultTierRequiresModel;
+      if (selectedSearch.requiresApiKey && !searchApiKey.value.trim()) {
+        return { input: searchApiKey, output: searchApiKeyError, message: fmt('searchApiKeyRequired', { label: selectedSearch.label }) };
       }
-      if (step === 4 && selectedSearch.requiresApiKey && !document.getElementById('searchApiKey').value.trim()) return fmt('searchApiKeyRequired', { label: selectedSearch.label });
-      return '';
+      return null;
     }
+    [[apiKey, apiKeyError], [model, modelError], [searchApiKey, searchApiKeyError]].forEach(([input, output]) => {
+      input.addEventListener('input', () => {
+        clearFieldError(input, output);
+        if (input === model) renderModelField();
+      });
+    });
+    modelEditToggle.addEventListener('click', () => {
+      modelEditorOpen = true;
+      renderModelField();
+      model.focus({ preventScroll: true });
+    });
+    modelEditDone.addEventListener('click', () => {
+      if (!model.value.trim()) return;
+      modelEditorOpen = false;
+      renderModelField();
+      modelEditToggle.focus({ preventScroll: true });
+    });
     document.getElementById('cancel').addEventListener('click', () => {
       window.opensquillaDesktop.cancelOnboarding();
     });
-    document.querySelectorAll('.back-button').forEach((button) => button.addEventListener('click', () => {
-      errorBox.textContent = '';
-      setStep(previousRouteStep(step));
-    }));
-    document.querySelectorAll('.next-button').forEach((button) => button.addEventListener('click', () => {
-      errorBox.textContent = '';
-      const message = validateStep();
-      if (message) {
-        errorBox.textContent = message;
-        return;
-      }
-      setStep(nextRouteStep(step));
-    }));
     finish.addEventListener('click', async () => {
-      errorBox.textContent = '';
-      for (const index of routeSteps()) {
-        step = index;
-        const message = validateStep();
-        if (message) {
-          setStep(index);
-          errorBox.textContent = message;
-          return;
-        }
+      clearValidationErrors();
+      const issue = validateStep();
+      if (issue) {
+        presentValidationIssue(issue);
+        return;
       }
       try {
         await window.opensquillaDesktop.saveOnboarding({
           provider: provider.value,
-          apiKey: document.getElementById('apiKey').value,
+          apiKey: apiKey.value,
           baseUrl: baseUrl.value,
           model: model.value,
           modelRoutingMode: modelRoutingMode.value,
           routerMode: routerMode.value,
-          routerDefaultTier: document.getElementById('routerDefaultTier')?.value || 'c1',
+          routerDefaultTier: 'c1',
           routerTiers,
           searchProvider: searchProvider.value,
-          searchApiKey: document.getElementById('searchApiKey').value,
+          searchApiKey: searchApiKey.value,
           locale: activeLocale,
         });
       } catch (error) {
@@ -5399,324 +6075,28 @@ function onboardingHtml(
         provider.value = nextProvider;
         syncProviderDefaults(true);
       }
-      if (nextProvider && nextProvider !== 'tokenrhythm') setProviderDisclosureOpen(true);
       if (prefill.baseUrl) baseUrl.value = String(prefill.baseUrl);
       if (prefill.model) model.value = String(prefill.model);
       if (prefill.apiKey) document.getElementById('apiKey').value = String(prefill.apiKey);
       syncProviderDefaults(false);
+      modelEditorOpen = !model.value.trim();
+      renderModelField();
       renderProviderGrid();
       render();
     }
-    if (migrationStepEnabled) {
-      const migrationSource = document.getElementById('migrationSource');
-      const migrationCandidateList = document.getElementById('migrationCandidateList');
-      const migrationSelectionHint = document.getElementById('migrationSelectionHint');
-      const migrationBrowseButton = document.getElementById('migrationBrowse');
-      const migrationPreviewButton = document.getElementById('migrationPreview');
-      const migrationImportButton = document.getElementById('migrationImport');
-      const migrationSkipButton = document.getElementById('migrationSkip');
-      const migrationStatus = document.getElementById('migrationStatus');
-      const migrationStatusLabel = document.getElementById('migrationStatusLabel');
-      const migrationSummary = document.getElementById('migrationSummary');
-      const migrationDoneNote = document.getElementById('migrationDoneNote');
-      let migrationBusy = false;
-      let migrationPreviewOk = false;
-      let migrationLastReport = null;
-      migrationPreviewButton.disabled = true;
-      function migrationSourceLabel() {
-        return desktopMessage(activeLocale, 'migration.source.portable');
-      }
-      function migrationCandidateName(candidate, index) {
-        const name = String(candidate.path || '').replace(/\\\\/g, '/').split('/').filter(Boolean).pop();
-        return name
-          ? migrationSourceLabel() + ' · ' + name
-          : migrationSourceLabel() + ' ' + String(index + 1);
-      }
-      function migrationCandidateMeta(candidate) {
-        const parts = [];
-        if (candidate.version) {
-          parts.push(desktopFmt('migration.step.candidateVersion', { version: candidate.version }));
-        }
-        if (
-          candidate.session_count !== null
-          && candidate.session_count !== undefined
-          && Number.isFinite(Number(candidate.session_count))
-        ) {
-          parts.push(desktopFmt('migration.step.candidateSessions', { n: candidate.session_count }));
-        }
-        if (candidate.estimated_activity_at) {
-          const date = new Date(candidate.estimated_activity_at);
-          if (!Number.isNaN(date.getTime())) {
-            parts.push(desktopFmt('migration.step.candidateActivity', {
-              value: new Intl.DateTimeFormat(activeLocale, { dateStyle: 'medium' }).format(date),
-            }));
-          }
-        }
-        return parts;
-      }
-      renderMigrationCandidates = () => {
-        const selectedPath = migrationSource.value;
-        migrationCandidateList.innerHTML = migrationCandidates.map((candidate, index) => {
-          const selected = candidate.path === selectedPath;
-          const meta = migrationCandidateMeta(candidate);
-          return '<div class="migration-candidate-row">'
-            + '<button class="migration-candidate" type="button" data-migration-candidate="' + index
-            + '" aria-pressed="' + String(selected) + '"' + (migrationBusy ? ' disabled' : '') + '>'
-            + '<span class="migration-candidate-head"><strong>' + escapeHtml(migrationCandidateName(candidate, index)) + '</strong></span>'
-            + (meta.length ? '<span class="migration-candidate-meta">' + meta.map((item) => '<span>' + escapeHtml(item) + '</span>').join('') + '</span>' : '')
-            + '</button>'
-            + '<details><summary>' + escapeHtml(t.migrationTechnicalDetails) + '</summary>'
-            + '<span class="migration-path">' + escapeHtml(candidate.path) + '</span></details>'
-            + '</div>';
-        }).join('');
-        migrationCandidateList.querySelectorAll('[data-migration-candidate]').forEach((button) => {
-          button.addEventListener('click', () => {
-            const index = Number(button.dataset.migrationCandidate);
-            const candidate = migrationCandidates[index];
-            if (!candidate || migrationBusy) return;
-            migrationSource.value = candidate.path;
-            renderMigrationCandidates();
-            migrationSource.dispatchEvent(new Event('change'));
-          });
-        });
-        migrationSelectionHint.hidden = migrationPreviewOk;
-      };
-      function resetMigrationPreview() {
-        migrationPreviewOk = false;
-        migrationImportButton.disabled = true;
-        migrationImportButton.hidden = true;
-        migrationPreviewButton.hidden = false;
-        migrationLastReport = null;
-        migrationSummary.hidden = true;
-        migrationDoneNote.hidden = true;
-        migrationSelectionHint.hidden = false;
-      }
-      migrationSource.addEventListener('change', async () => {
-        resetMigrationPreview();
-        errorBox.textContent = '';
-        const selected = migrationCandidates.find((item) => item.path === migrationSource.value) || null;
-        migrationCandidate = null;
-        migrationPreviewButton.disabled = true;
-        if (!selected) {
-          renderMigrationCandidates();
-          await window.opensquillaDesktop.selectOnboardingMigration({ source: '' });
-          return;
-        }
-        const requestedSource = selected.path;
-        const result = await window.opensquillaDesktop.selectOnboardingMigration({ source: selected.path });
-        if (migrationSource.value !== requestedSource) return;
-        if (!result || !result.ok) {
-          migrationSource.value = '';
-          renderMigrationCandidates();
-          errorBox.textContent = result && result.error ? String(result.error) : 'Could not select that Portable data.';
-          return;
-        }
-        migrationCandidate = selected;
-        migrationPreviewButton.disabled = false;
-        renderMigrationCandidates();
-      });
-      migrationBrowseButton.addEventListener('click', async () => {
-        if (migrationBusy) return;
-        errorBox.textContent = '';
-        const result = await window.opensquillaDesktop.browseOnboardingMigration();
-        if (!result || result.aborted) return;
-        if (!result.ok || !result.candidate) {
-          errorBox.textContent = result && result.error ? String(result.error) : 'Could not inspect that profile folder.';
-          return;
-        }
-        const candidate = result.candidate;
-        const existing = migrationCandidates.findIndex((item) => item.path === candidate.path);
-        if (existing >= 0) migrationCandidates[existing] = candidate;
-        else migrationCandidates.push(candidate);
-        migrationSource.value = candidate.path;
-        renderMigrationCandidates();
-        migrationSource.dispatchEvent(new Event('change'));
-      });
-      function setMigrationStatus(label) {
-        if (label) {
-          migrationStatusLabel.textContent = label;
-          migrationStatus.hidden = false;
-        } else {
-          migrationStatus.hidden = true;
-        }
-      }
-      function formatMigrationBytes(value) {
-        const bytes = Number(value);
-        if (!Number.isFinite(bytes) || bytes < 0) return '?';
-        if (bytes >= 1024 * 1024 * 1024) return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
-        if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
-        if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
-        return String(Math.round(bytes)) + ' B';
-      }
-      function migrationErrorDetail(result, errors) {
-        if (result && result.error) return String(result.error);
-        if (errors && errors.length) {
-          return errors.map((item) => String((item && (item.reason || item.kind)) || '')).filter(Boolean).join('; ');
-        }
-        if (result && result.raw) return String(result.raw).slice(-400);
-        return '';
-      }
-      function renderMigrationReport(report) {
-        if (!report || typeof report !== 'object') {
-          migrationLastReport = null;
-          migrationSummary.hidden = true;
-          return [];
-        }
-        migrationLastReport = report;
-        const items = Array.isArray(report.items) ? report.items : [];
-        const readyCount = items.filter((item) => (
-          item && (item.status === 'planned' || item.status === 'migrated')
-        )).length;
-        const skippedCount = items.filter((item) => item && item.status === 'skipped').length;
-        const pausedCount = Array.isArray(report.paused_jobs) ? report.paused_jobs.length : 0;
-        const preflight = (report.preflight && typeof report.preflight === 'object') ? report.preflight : {};
-        const diskRequired = Number(preflight.disk_required_bytes);
-        const diskFree = Number(preflight.disk_free_bytes);
-        const hasDiskEstimate = Number.isFinite(diskRequired) && diskRequired >= 0
-          && Number.isFinite(diskFree) && diskFree >= 0;
-        const lines = [
-          fmt('migrationReady', { n: readyCount }),
-          ...(pausedCount > 0 ? [fmt('migrationPausedJobs', { n: pausedCount })] : []),
-          ...(hasDiskEstimate ? [fmt('migrationDisk', {
-            required: formatMigrationBytes(diskRequired),
-            free: formatMigrationBytes(diskFree),
-          })] : []),
-        ];
-        const notes = Array.isArray(report.notes) ? report.notes : [];
-        const technicalLines = [
-          ...(skippedCount > 0 ? [fmt('migrationSkippedDetails', { n: skippedCount })] : []),
-          ...(notes.length
-            ? [t.migrationNotesLabel + ': ' + notes.map((note) => String(note)).join(' | ')]
-            : []),
-        ];
-        migrationSummary.innerHTML = lines.map((line) => '<div>' + escapeHtml(line) + '</div>').join('')
-          + (technicalLines.length
-            ? '<details><summary>' + escapeHtml(t.migrationTechnicalDetails) + '</summary>'
-              + technicalLines.map((line) => '<div>' + escapeHtml(line) + '</div>').join('')
-              + '</details>'
-            : '');
-        migrationSummary.hidden = false;
-        return items.filter((item) => item && item.status === 'error');
-      }
-      renderMigrationPreviewSummary = () => {
-        if (migrationLastReport) renderMigrationReport(migrationLastReport);
-      };
-      if (typeof window.opensquillaDesktop.onMigrationProgress === 'function') {
-        window.opensquillaDesktop.onMigrationProgress((payload) => {
-          const phase = payload && payload.phase;
-          if (phase === 'preview') setMigrationStatus(t.migrationPreviewRunning);
-          else if (phase === 'applying') setMigrationStatus(t.migrationApplyRunning);
-          else setMigrationStatus('');
-        });
-      }
-      migrationPreviewButton.addEventListener('click', async () => {
-        if (migrationBusy || !migrationCandidate) return;
-        migrationBusy = true;
-        migrationPreviewOk = false;
-        errorBox.textContent = '';
-        migrationDoneNote.hidden = true;
-        migrationPreviewButton.disabled = true;
-        migrationImportButton.disabled = true;
-        migrationSource.disabled = true;
-        migrationBrowseButton.disabled = true;
-        renderMigrationCandidates();
-        setMigrationStatus(t.migrationPreviewRunning);
-        try {
-          const result = await window.opensquillaDesktop.previewOnboardingMigration();
-          const errors = renderMigrationReport(result && result.report);
-          if (result && result.ok && errors.length === 0) {
-            migrationPreviewOk = true;
-          } else {
-            errorBox.textContent = fmt('migrationPreviewFailed', { detail: migrationErrorDetail(result, errors) });
-          }
-        } catch (error) {
-          errorBox.textContent = fmt('migrationPreviewFailed', { detail: error && error.message ? error.message : String(error) });
-        } finally {
-          migrationBusy = false;
-          setMigrationStatus('');
-          migrationPreviewButton.disabled = false;
-          migrationImportButton.disabled = !migrationPreviewOk;
-          migrationPreviewButton.hidden = migrationPreviewOk;
-          migrationImportButton.hidden = !migrationPreviewOk;
-          migrationSource.disabled = false;
-          migrationBrowseButton.disabled = false;
-          renderMigrationCandidates();
-        }
-      });
-      migrationImportButton.addEventListener('click', async () => {
-        if (migrationBusy || !migrationPreviewOk) return;
-        migrationBusy = true;
-        errorBox.textContent = '';
-        migrationPreviewButton.disabled = true;
-        migrationImportButton.disabled = true;
-        migrationSkipButton.disabled = true;
-        migrationSource.disabled = true;
-        migrationBrowseButton.disabled = true;
-        renderMigrationCandidates();
-        setMigrationStatus(t.migrationApplyRunning);
-        let imported = false;
-        try {
-          const result = await window.opensquillaDesktop.applyOnboardingMigration();
-          const errors = renderMigrationReport(result && result.report);
-          if (result && result.ok && errors.length === 0) {
-            imported = true;
-            const pausedCount = result.report && Array.isArray(result.report.paused_jobs)
-              ? result.report.paused_jobs.length
-              : 0;
-            migrationDoneNote.textContent = fmt('migrationDone', { n: pausedCount, path: migrationCandidate.path });
-            migrationDoneNote.hidden = false;
-            applyMigrationPrefill(result.prefill);
-          } else {
-            errorBox.textContent = fmt('migrationApplyFailed', { detail: migrationErrorDetail(result, errors) });
-          }
-        } catch (error) {
-          errorBox.textContent = fmt('migrationApplyFailed', { detail: error && error.message ? error.message : String(error) });
-        } finally {
-          migrationBusy = false;
-          setMigrationStatus('');
-          migrationSkipButton.disabled = false;
-          migrationSource.disabled = false;
-          migrationBrowseButton.disabled = false;
-          renderMigrationCandidates();
-          if (imported) {
-            // Leave the completion note readable for a beat, then continue to
-            // the provider step with the imported connection prefilled. The
-            // migration card stays reachable from the rail to re-read the note.
-            setTimeout(() => {
-              errorBox.textContent = '';
-              setStep(1);
-            }, 1800);
-          } else {
-            migrationPreviewOk = false;
-            migrationPreviewButton.disabled = false;
-            migrationPreviewButton.hidden = false;
-            migrationImportButton.disabled = true;
-            migrationImportButton.hidden = true;
-          }
-        }
-      });
-      migrationSkipButton.addEventListener('click', () => {
-        if (migrationBusy) return;
-        errorBox.textContent = '';
-        setStep(nextRouteStep(step));
-      });
-      renderMigrationCandidates();
-    }
     renderProviderGrid();
     renderSearchProviderGrid();
+    setSearchSectionOpen(false);
     syncProviderDefaults(true);
     applyMigrationPrefill(initialProviderPrefill);
     render();
-    focusStepHeading(document.querySelector('.setup-card.active'));
   </script>
 </body>
 </html>`
 }
 
 async function runOnboarding(): Promise<DesktopConnection> {
-  const pendingProviderSetup = activeDesktopProfile().kind === 'primary'
-    ? await loadPendingMigrationProviderSetup()
-    : null
+  const pendingProviderSetup = await loadPendingMigrationProviderSetup()
   const existing = await loadDesktopCredential()
   // A saved credential encrypted with the OS keychain that this session cannot
   // read (keychain locked or unavailable) must not be treated as "no credential":
@@ -5746,31 +6126,6 @@ async function runOnboarding(): Promise<DesktopConnection> {
     }
     return existing
   }
-
-  // First-run transfer is a narrow Windows Portable upgrade path. CLI homes and
-  // other Desktop profiles are always explicit Settings actions, even when the
-  // recovery engine has proved the current Desktop H empty.
-  const onboardingDataInput = {
-    platform: process.platform,
-    profileKind: activeDesktopProfile().kind,
-    pendingProviderSetup: pendingProviderSetup !== null,
-    inspection: recoveryInspection,
-  } as const
-  const detectedCandidates = (
-    process.platform === 'win32'
-    && isProvenFreshPrimaryDesktopProfile(onboardingDataInput)
-  )
-    ? await enrichLegacyImportCandidates(detectWindowsPortableImportCandidates())
-    : []
-  const onboardingDataFlow = classifyDesktopOnboardingDataFlow({
-    ...onboardingDataInput,
-    candidateKinds: detectedCandidates.map((candidate) => candidate.kind),
-  })
-  onboardingMigrationCandidates = onboardingDataFlow === 'portable-transfer'
-    ? detectedCandidates
-    : []
-  onboardingMigrationCandidate = null
-  onboardingMigrationPreviewApprovedAt = 0
 
   return new Promise((resolveCredential, rejectCredential) => {
     resolveOnboarding = resolveCredential
@@ -5837,9 +6192,7 @@ async function runOnboarding(): Promise<DesktopConnection> {
     })
 
     onboardingWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(onboardingHtml(
-      onboardingMigrationCandidates,
       pendingProviderSetup,
-      onboardingDataFlow === 'portable-transfer',
     ))}`).catch((error) => {
       rejectCredential(error instanceof Error ? error : new Error(String(error)))
     })
@@ -5950,6 +6303,117 @@ async function resolveGatewayRuntime(): Promise<RuntimeLaunch> {
   }
 }
 
+const ONBOARDING_PROBE_STDOUT_LIMIT = 256 * 1024
+const ONBOARDING_PROBE_TIMEOUT_MS = 40_000
+
+function onboardingProbeString(value: unknown, maxLength: number): string {
+  return typeof value === 'string' ? value.trim().slice(0, maxLength) : ''
+}
+
+async function probeOnboardingProvider(
+  payload: OnboardingProbePayload,
+): Promise<OnboardingProbeResult> {
+  const providerId = onboardingProbeString(payload?.provider, 120).toLowerCase()
+  const selected = PROVIDER_CATALOG.find((entry) => entry.id === providerId)
+  if (!selected) {
+    return {
+      ok: false,
+      failureKind: 'invalid_config',
+      message: 'Choose a supported provider.',
+      latencyMs: 0,
+    }
+  }
+  const model = onboardingProbeString(payload?.model, 500)
+  if (!model) {
+    return {
+      ok: false,
+      failureKind: 'invalid_config',
+      message: 'Enter a model before verifying the configuration.',
+      latencyMs: 0,
+    }
+  }
+  const apiKey = onboardingProbeString(payload?.apiKey, 64 * 1024)
+  if (selected.requiresApiKey && !apiKey) {
+    return {
+      ok: false,
+      failureKind: 'auth_invalid',
+      message: `Enter the ${selected.label} API key before verifying the configuration.`,
+      latencyMs: 0,
+    }
+  }
+
+  const runtime = await resolveGatewayRuntime()
+  const prefix = runtime.args.slice(0, -2)
+  const input = JSON.stringify({
+    providerId,
+    model,
+    apiKey,
+    baseUrl: onboardingProbeString(payload?.baseUrl, 2_048) || selected.baseUrl,
+    timeout: 30,
+  })
+  const activeProfile = activeDesktopProfile()
+
+  return await new Promise<OnboardingProbeResult>((resolveResult, rejectResult) => {
+    const child = spawn(runtime.command, [...prefix, 'models', 'probe-draft'], {
+      cwd: runtime.cwd,
+      windowsHide: true,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: desktopChildEnvironment(activeProfile, {
+        PYTHONUNBUFFERED: '1',
+        PYTHONUTF8: '1',
+        PYTHONIOENCODING: 'utf-8:replace',
+      }),
+    })
+    let stdout = ''
+    let settled = false
+    const timeout = setTimeout(() => {
+      child.kill()
+      finish(new Error('Configuration verification timed out.'))
+    }, ONBOARDING_PROBE_TIMEOUT_MS)
+    timeout.unref()
+
+    const finish = (error?: Error, result?: OnboardingProbeResult) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      if (error) rejectResult(error)
+      else resolveResult(result as OnboardingProbeResult)
+    }
+
+    child.once('error', (error) => finish(error))
+    child.stdin.once('error', () => {})
+    child.stdin.end(input)
+    child.stdout.on('data', (chunk) => {
+      if (stdout.length > ONBOARDING_PROBE_STDOUT_LIMIT) return
+      stdout += String(chunk)
+      if (stdout.length > ONBOARDING_PROBE_STDOUT_LIMIT) {
+        child.kill()
+        finish(new Error('Configuration verification returned too much data.'))
+      }
+    })
+    // Provider and runtime diagnostics may contain local details. The renderer
+    // receives only the parsed, redacted JSON protocol from stdout.
+    child.stderr.resume()
+    child.once('close', () => {
+      if (settled) return
+      try {
+        const parsed = JSON.parse(stdout) as Record<string, unknown>
+        const ok = parsed.ok === true
+        finish(undefined, {
+          ok,
+          failureKind: ok ? '' : onboardingProbeString(parsed.kind, 120) || 'probe_failed',
+          message: ok ? '' : onboardingProbeString(parsed.detail, 2_000) || 'Configuration verification failed.',
+          latencyMs: Number.isFinite(Number(parsed.latency_ms))
+            ? Math.max(0, Math.round(Number(parsed.latency_ms)))
+            : 0,
+        })
+      } catch {
+        finish(new Error('Configuration verification did not return a valid result.'))
+      }
+    })
+  })
+}
+
 const RECOVERY_PROTOCOL_SCHEMA_VERSION = 1
 const RECOVERY_STDOUT_LIMIT = 2 * 1024 * 1024
 const RECOVERY_COMMAND_TIMEOUT_MS = 60_000
@@ -5957,7 +6421,6 @@ const RECOVERY_OUTCOMES = new Set<RecoveryOutcome>([
   'ready',
   'attention',
   'recovery_required',
-  'recovery_profile',
 ])
 
 function recoveryRecord(value: unknown): Record<string, unknown> | null {
@@ -6035,6 +6498,383 @@ function parseRecoveryProtocol(value: unknown): RecoveryProtocolResult {
   }
 }
 
+const DESKTOP_PROFILE_CONSOLIDATION_OUTCOMES = new Set<DesktopProfileConsolidationOutcome>([
+  'noop',
+  'consolidated',
+  'blocked',
+])
+const DESKTOP_CREDENTIAL_ADOPTION_STATUSES = new Set<DesktopCredentialAdoptionStatus>([
+  'pending',
+  'complete',
+  'not_required',
+])
+
+function parseDesktopProfileConsolidationProtocol(
+  value: unknown,
+): DesktopProfileConsolidationResult {
+  const record = recoveryRecord(value)
+  if (!record || record.schema_version !== 1) {
+    throw new Error('Desktop profile consolidation returned an unsupported protocol schema.')
+  }
+  const outcome = String(record.outcome || '') as DesktopProfileConsolidationOutcome
+  if (!DESKTOP_PROFILE_CONSOLIDATION_OUTCOMES.has(outcome)) {
+    throw new Error('Desktop profile consolidation returned an invalid outcome.')
+  }
+  if (typeof record.stable_code !== 'string' || !record.stable_code) {
+    throw new Error('Desktop profile consolidation omitted its stable code.')
+  }
+  if (typeof record.primary_home !== 'string' || !record.primary_home) {
+    throw new Error('Desktop profile consolidation omitted the primary home.')
+  }
+  const credentialAdoptionStatus = String(
+    record.credential_adoption_status || '',
+  ) as DesktopCredentialAdoptionStatus
+  if (!DESKTOP_CREDENTIAL_ADOPTION_STATUSES.has(credentialAdoptionStatus)) {
+    throw new Error('Desktop profile consolidation returned an invalid credential adoption status.')
+  }
+  const nullableStringFields = [
+    'configuration_source_recovery_id',
+    'configuration_source_credential_path',
+    'configuration_source_credential_sha256',
+    'backup_path',
+    'receipt_path',
+  ] as const
+  for (const field of nullableStringFields) {
+    if (record[field] !== null && typeof record[field] !== 'string') {
+      throw new Error(`Desktop profile consolidation returned an invalid ${field}.`)
+    }
+  }
+  const sourceRecoveryId = record.configuration_source_recovery_id as string | null
+  const sourceCredentialPath = record.configuration_source_credential_path as string | null
+  const sourceCredentialSha256 = record.configuration_source_credential_sha256 as string | null
+  const sourceCredentialSize = record.configuration_source_credential_size
+  if (
+    (sourceRecoveryId !== null && !isRecoveryProfileId(sourceRecoveryId))
+    || (sourceCredentialPath !== null && sourceRecoveryId === null)
+    || (
+      sourceCredentialSha256 !== null
+      && !/^[0-9a-f]{64}$/.test(sourceCredentialSha256)
+    )
+    || (
+      sourceCredentialSize !== null
+      && (
+        !Number.isSafeInteger(sourceCredentialSize)
+        || Number(sourceCredentialSize) < 0
+      )
+    )
+  ) {
+    throw new Error('Desktop profile consolidation returned an invalid credential source.')
+  }
+  if (!Array.isArray(record.consumed_recovery_ids)) {
+    throw new Error('Desktop profile consolidation returned invalid consumed profile ids.')
+  }
+  const consumedRecoveryIds = record.consumed_recovery_ids.map((item) => {
+    if (!isRecoveryProfileId(item)) {
+      throw new Error('Desktop profile consolidation returned an invalid consumed profile id.')
+    }
+    return item
+  })
+  if (new Set(consumedRecoveryIds).size !== consumedRecoveryIds.length) {
+    throw new Error('Desktop profile consolidation returned duplicate consumed profile ids.')
+  }
+  if (
+    sourceRecoveryId !== null
+    && !consumedRecoveryIds.some((item) => (
+      item.toLowerCase() === sourceRecoveryId.toLowerCase()
+    ))
+  ) {
+    throw new Error('Desktop profile consolidation returned an unconsumed configuration source.')
+  }
+  if (!Number.isSafeInteger(record.revision) || Number(record.revision) < 0) {
+    throw new Error('Desktop profile consolidation returned an invalid revision.')
+  }
+  if (
+    !Array.isArray(record.errors)
+    || record.errors.some((item) => typeof item !== 'string')
+  ) {
+    throw new Error('Desktop profile consolidation returned invalid errors.')
+  }
+  const backupPath = record.backup_path as string | null
+  const receiptPath = record.receipt_path as string | null
+  if (
+    (backupPath === null) !== (receiptPath === null)
+    || (sourceCredentialPath !== null && backupPath === null)
+    || (
+      sourceCredentialPath === null
+      && (sourceCredentialSha256 !== null || sourceCredentialSize !== null)
+    )
+    || (
+      sourceCredentialPath !== null
+      && (sourceCredentialSha256 === null || sourceCredentialSize === null)
+    )
+    || (
+      credentialAdoptionStatus === 'pending'
+      && (sourceCredentialPath === null || backupPath === null)
+    )
+    || (
+      credentialAdoptionStatus === 'not_required'
+      && sourceCredentialPath !== null
+    )
+    || (
+      outcome === 'consolidated'
+      && (
+        backupPath === null
+        || consumedRecoveryIds.length === 0
+        || (
+          sourceCredentialPath === null
+            ? credentialAdoptionStatus !== 'not_required'
+            : credentialAdoptionStatus !== 'pending'
+        )
+      )
+    )
+    || (
+      outcome === 'blocked'
+      && (
+        sourceRecoveryId !== null
+        || sourceCredentialPath !== null
+        || consumedRecoveryIds.length > 0
+        || backupPath !== null
+        || credentialAdoptionStatus !== 'not_required'
+      )
+    )
+  ) {
+    throw new Error('Desktop profile consolidation returned inconsistent outcome metadata.')
+  }
+  return {
+    schema_version: 1,
+    outcome,
+    stable_code: record.stable_code,
+    primary_home: record.primary_home,
+    configuration_source_recovery_id: sourceRecoveryId,
+    configuration_source_credential_path: sourceCredentialPath,
+    configuration_source_credential_sha256: sourceCredentialSha256,
+    configuration_source_credential_size: (
+      sourceCredentialSize === null ? null : Number(sourceCredentialSize)
+    ),
+    consumed_recovery_ids: consumedRecoveryIds,
+    backup_path: backupPath,
+    receipt_path: receiptPath,
+    credential_adoption_status: credentialAdoptionStatus,
+    revision: Number(record.revision),
+    errors: record.errors as string[],
+  }
+}
+
+function requirePlainConsolidationDirectory(path: string, label: string): string {
+  try {
+    const info = lstatSync(path)
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('unsafe directory')
+    return realpathSync(path)
+  } catch {
+    throw new Error(`Desktop profile consolidation returned an unsafe ${label}.`)
+  }
+}
+
+function requirePlainConsolidationFile(path: string, label: string): string {
+  try {
+    const info = lstatSync(path)
+    if (!info.isFile() || info.isSymbolicLink()) throw new Error('unsafe file')
+    return realpathSync(path)
+  } catch {
+    throw new Error(`Desktop profile consolidation returned an unsafe ${label}.`)
+  }
+}
+
+function validateDesktopProfileConsolidationPaths(
+  result: DesktopProfileConsolidationResult,
+  primary: DesktopProfilePaths,
+): void {
+  if (!resolvedPathsEqual(result.primary_home, primary.home)) {
+    throw new Error('Desktop profile consolidation returned a different primary home.')
+  }
+  // Historical receipt metadata is informational once credential adoption is
+  // acknowledged. In particular, a user may delete an archived credential or
+  // backup after the primary has become authoritative; startup must not depend
+  // on that archive forever. A pending noop is different: it is the durable
+  // retry record for a crash between consolidation and credential adoption, so
+  // its archive must pass the same boundary checks as a fresh consolidation.
+  if (
+    result.outcome !== 'consolidated'
+    && result.credential_adoption_status !== 'pending'
+  ) return
+  if (result.backup_path === null) return
+  if (result.receipt_path === null) {
+    throw new Error('Desktop profile consolidation omitted its receipt path.')
+  }
+
+  const userData = app.getPath('userData')
+  const backups = join(userData, 'backups')
+  const consolidationRoot = join(backups, 'profile-consolidation')
+  const transactionId = basename(result.backup_path)
+  if (
+    !isRecoveryProfileId(transactionId)
+    || !resolvedPathsEqual(dirname(result.backup_path), consolidationRoot)
+    || !resolvedPathsEqual(result.receipt_path, join(result.backup_path, 'receipt.json'))
+  ) {
+    throw new Error('Desktop profile consolidation returned an unexpected backup path.')
+  }
+
+  const userDataReal = requirePlainConsolidationDirectory(userData, 'userData root')
+  const backupsReal = requirePlainConsolidationDirectory(backups, 'backup root')
+  const consolidationRootReal = requirePlainConsolidationDirectory(
+    consolidationRoot,
+    'profile consolidation root',
+  )
+  const backupReal = requirePlainConsolidationDirectory(
+    result.backup_path,
+    'profile consolidation backup',
+  )
+  const receiptReal = requirePlainConsolidationFile(
+    result.receipt_path,
+    'profile consolidation receipt',
+  )
+  if (
+    !resolvedPathsEqual(dirname(backupsReal), userDataReal)
+    || !resolvedPathsEqual(dirname(consolidationRootReal), backupsReal)
+    || !resolvedPathsEqual(dirname(backupReal), consolidationRootReal)
+    || !resolvedPathsEqual(dirname(receiptReal), backupReal)
+  ) {
+    throw new Error('Desktop profile consolidation backup escaped its trusted root.')
+  }
+}
+
+async function runDesktopProfileConsolidationCli(
+  profile: DesktopProfilePaths,
+  commandArgs: string[] = [
+    'consolidate-profiles',
+    '--user-data', app.getPath('userData'),
+    '--primary-home', profile.home,
+    '--json',
+  ],
+): Promise<DesktopProfileConsolidationResult> {
+  const runtime = await resolveGatewayRuntime()
+  const prefix = runtime.args.slice(0, -2)
+  return await new Promise((resolveResult, rejectResult) => {
+    const child = spawn(runtime.command, [
+      ...prefix,
+      'recovery',
+      ...commandArgs,
+    ], {
+      cwd: runtime.cwd,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: desktopChildEnvironment(profile, {
+        OPENSQUILLA_RECOVERY_OFFLINE: '1',
+        PYTHONUNBUFFERED: '1',
+        PYTHONUTF8: '1',
+        PYTHONIOENCODING: 'utf-8:replace',
+      }),
+    })
+    let stdout = ''
+    let oversized = false
+    let settled = false
+    const finish = (
+      error?: Error,
+      result?: DesktopProfileConsolidationResult,
+    ) => {
+      if (settled) return
+      settled = true
+      if (error) rejectResult(error)
+      else resolveResult(result as DesktopProfileConsolidationResult)
+    }
+    child.stdout.on('data', (chunk) => {
+      if (oversized) return
+      stdout += String(chunk)
+      if (stdout.length > RECOVERY_STDOUT_LIMIT) oversized = true
+    })
+    // The protocol result is the only trusted diagnostic surface. stderr can
+    // contain local profile paths and is deliberately drained without exposure.
+    child.stderr.resume()
+    child.once('error', (error) => finish(
+      error instanceof Error ? error : new Error(String(error)),
+    ))
+    child.once('close', (code) => {
+      if (oversized) {
+        return finish(new Error('Desktop profile consolidation output exceeded its limit.'))
+      }
+      let result: DesktopProfileConsolidationResult
+      try {
+        result = parseDesktopProfileConsolidationProtocol(JSON.parse(stdout))
+      } catch (error) {
+        if (code !== 0) {
+          return finish(new Error(
+            `Desktop profile consolidation failed with exit code ${code ?? 'unknown'}.`,
+          ))
+        }
+        return finish(error instanceof Error ? error : new Error(String(error)))
+      }
+      const expectedExitCode = result.outcome === 'blocked' ? 2 : 0
+      if (code !== expectedExitCode) {
+        return finish(new Error(
+          `Desktop profile consolidation returned ${result.outcome} with exit code ${code ?? 'unknown'}.`,
+        ))
+      }
+      return finish(undefined, result)
+    })
+  })
+}
+
+async function acknowledgeConsolidatedDesktopCredential(
+  consolidation: DesktopProfileConsolidationResult,
+): Promise<void> {
+  if (
+    consolidation.credential_adoption_status !== 'pending'
+    || consolidation.backup_path === null
+    || consolidation.receipt_path === null
+  ) {
+    throw new Error('Desktop credential adoption acknowledgement was not pending.')
+  }
+  const primary = primaryDesktopProfile()
+  const transactionId = basename(consolidation.backup_path)
+  const acknowledged = await runDesktopProfileConsolidationCli(primary, [
+    'acknowledge-profile-credential',
+    '--user-data', app.getPath('userData'),
+    '--primary-home', primary.home,
+    '--transaction-id', transactionId,
+    '--json',
+  ])
+  validateDesktopProfileConsolidationPaths(acknowledged, primary)
+  const sourceIdsMatch = (
+    acknowledged.configuration_source_recovery_id?.toLowerCase()
+    === consolidation.configuration_source_recovery_id?.toLowerCase()
+  )
+  const sourcePathsMatch = (
+    acknowledged.configuration_source_credential_path !== null
+    && consolidation.configuration_source_credential_path !== null
+    && resolvedPathsEqual(
+      acknowledged.configuration_source_credential_path,
+      consolidation.configuration_source_credential_path,
+    )
+  )
+  const sourceIntegrityMatches = (
+    acknowledged.configuration_source_credential_sha256
+      === consolidation.configuration_source_credential_sha256
+    && acknowledged.configuration_source_credential_size
+      === consolidation.configuration_source_credential_size
+  )
+  const consumedIdsMatch = (
+    acknowledged.consumed_recovery_ids.length === consolidation.consumed_recovery_ids.length
+    && acknowledged.consumed_recovery_ids.every((item, index) => (
+      item.toLowerCase() === consolidation.consumed_recovery_ids[index]?.toLowerCase()
+    ))
+  )
+  if (
+    acknowledged.outcome !== 'noop'
+    || acknowledged.credential_adoption_status !== 'complete'
+    || acknowledged.backup_path === null
+    || acknowledged.receipt_path === null
+    || !resolvedPathsEqual(acknowledged.backup_path, consolidation.backup_path)
+    || !resolvedPathsEqual(acknowledged.receipt_path, consolidation.receipt_path)
+    || !sourceIdsMatch
+    || !sourcePathsMatch
+    || !sourceIntegrityMatches
+    || !consumedIdsMatch
+    || acknowledged.revision !== consolidation.revision
+  ) {
+    throw new Error('Desktop credential adoption acknowledgement changed its receipt metadata.')
+  }
+}
+
 function recoveryFailureResult(home: string, stableCode: string): RecoveryProtocolResult {
   return {
     schema_version: RECOVERY_PROTOCOL_SCHEMA_VERSION,
@@ -6044,9 +6884,6 @@ function recoveryFailureResult(home: string, stableCode: string): RecoveryProtoc
     effective_workspace: null,
     candidates: [],
     allowed_actions: [
-      'continue-recovery-profile',
-      'create-recovery-profile',
-      'retry-primary-profile',
       'show-backups',
       'copy-diagnostics',
     ],
@@ -6065,7 +6902,7 @@ async function runRecoveryCli(
   const kindAwareCommands = new Set(['inspect', 'reconcile', 'choose-workspace'])
   const effectiveArgs = kindAwareCommands.has(commandArgs[0] || '')
     && !commandArgs.includes('--profile-kind')
-    ? [...commandArgs, '--profile-kind', profileKindEnvironment(profile.kind)]
+    ? [...commandArgs, '--profile-kind', 'desktop-primary']
     : commandArgs
   const finishWriter = mutating && !recoveryOperationBusy && !writerReserved
     ? beginDesktopWriterOperation(`recovery ${commandArgs[0] || 'operation'}`)
@@ -6145,24 +6982,390 @@ async function inspectDesktopProfile(profile: DesktopProfilePaths): Promise<Reco
       error: error instanceof Error ? error.message : 'unknown error',
     })
     return recoveryFailureResult(
-      profile.kind === 'primary' ? profile.home : primaryDesktopProfile().home,
+      profile.home,
       'desktop_recovery_inspect_failed',
     )
   }
 }
 
+async function recoverInspectedProfileTransaction(
+  profile: DesktopProfilePaths,
+  inspection: RecoveryProtocolResult,
+): Promise<RecoveryProtocolResult> {
+  if (
+    !inspection.allowed_actions.includes('recover-transaction')
+    || !inspection.transaction_id
+  ) {
+    throw new Error('The interrupted profile operation cannot be recovered automatically.')
+  }
+  return await runRecoveryCli(profile, [
+    'recover-transaction',
+    '--home', profile.home,
+    '--transaction-id', inspection.transaction_id,
+    '--expected-revision', String(inspection.revision),
+    '--json',
+  ])
+}
+
+async function readVerifiedConsolidatedCredential(
+  path: string,
+  expectedRealPath: string,
+  expectedSha256: string,
+  expectedSize: number,
+): Promise<string> {
+  const handle = await open(path, 'r')
+  let raw: Buffer
+  try {
+    const before = await handle.stat()
+    if (!before.isFile() || before.size !== expectedSize) {
+      throw new Error('The archived Desktop credential no longer matches its receipt.')
+    }
+    raw = await handle.readFile()
+    const after = await handle.stat()
+    if (
+      before.dev !== after.dev
+      || before.ino !== after.ino
+      || before.mode !== after.mode
+      || before.size !== after.size
+      || before.mtimeMs !== after.mtimeMs
+    ) {
+      throw new Error('The archived Desktop credential changed while it was being read.')
+    }
+  } finally {
+    await handle.close()
+  }
+  const currentRealPath = requirePlainConsolidationFile(
+    path,
+    'archived Desktop credential',
+  )
+  const digest = createHash('sha256').update(raw).digest('hex')
+  if (
+    !resolvedPathsEqual(currentRealPath, expectedRealPath)
+    || raw.length !== expectedSize
+    || digest !== expectedSha256
+  ) {
+    throw new Error('The archived Desktop credential no longer matches its receipt.')
+  }
+  return raw.toString('utf8')
+}
+
+async function adoptConsolidatedDesktopCredential(
+  consolidation: DesktopProfileConsolidationResult,
+): Promise<void> {
+  // A fresh consolidation and a noop returned from an explicitly pending
+  // receipt are both eligible. Completed/no-op receipts are never replayed, so
+  // deleting a primary credential later cannot resurrect an archived secret.
+  if (consolidation.credential_adoption_status !== 'pending') return
+  const sourceRecoveryId = consolidation.configuration_source_recovery_id
+  const sourceCredentialPath = consolidation.configuration_source_credential_path
+  const sourceCredentialSha256 = consolidation.configuration_source_credential_sha256
+  const sourceCredentialSize = consolidation.configuration_source_credential_size
+  if (
+    sourceRecoveryId === null
+    || sourceCredentialPath === null
+    || sourceCredentialSha256 === null
+    || sourceCredentialSize === null
+    || consolidation.backup_path === null
+  ) {
+    throw new Error('Desktop profile consolidation returned an incomplete credential source.')
+  }
+
+  const expectedSourcePath = join(
+    consolidation.backup_path,
+    'recovery-profiles',
+    sourceRecoveryId,
+    'desktop-credential.json',
+  )
+  if (!resolvedPathsEqual(sourceCredentialPath, expectedSourcePath)) {
+    throw new Error('Desktop profile consolidation returned an unexpected credential path.')
+  }
+  const recoveryContainer = join(consolidation.backup_path, 'recovery-profiles')
+  const recoveryRoot = join(recoveryContainer, sourceRecoveryId)
+  const backupReal = requirePlainConsolidationDirectory(
+    consolidation.backup_path,
+    'profile consolidation backup',
+  )
+  const recoveryContainerReal = requirePlainConsolidationDirectory(
+    recoveryContainer,
+    'archived recovery container',
+  )
+  const recoveryRootReal = requirePlainConsolidationDirectory(
+    recoveryRoot,
+    'archived recovery profile',
+  )
+  const sourceReal = requirePlainConsolidationFile(
+    sourceCredentialPath,
+    'archived Desktop credential',
+  )
+  if (
+    !resolvedPathsEqual(dirname(recoveryContainerReal), backupReal)
+    || !resolvedPathsEqual(dirname(recoveryRootReal), recoveryContainerReal)
+    || !resolvedPathsEqual(dirname(sourceReal), recoveryRootReal)
+    || !resolvedPathsEqual(sourceReal, expectedSourcePath)
+  ) {
+    throw new Error('The consolidated Desktop credential changed before it could be adopted.')
+  }
+  // Bind credential adoption to the exact bytes recorded by the offline
+  // consolidation receipt. Parsing/decryption errors in those verified bytes
+  // can fall back to onboarding; an integrity mismatch must remain pending and
+  // block adoption instead of silently acknowledging a different secret.
+  const sourceCredential = await readVerifiedConsolidatedCredential(
+    sourceCredentialPath,
+    sourceReal,
+    sourceCredentialSha256,
+    sourceCredentialSize,
+  )
+
+  const finishWriter = beginDesktopWriterOperation('adopt consolidated Desktop credential')
+  try {
+    const primary = primaryDesktopProfile()
+    const currentCredential = await readOptionalDesktopText(primary.credentialPath)
+    let disposition: 'adopted' | 'primary_exists' | 'source_unusable' | null = null
+    if (
+      currentCredential !== null
+      && desktopCredentialHasUserConfiguration(currentCredential)
+    ) {
+      // A primary credential that appeared while consolidation ran is
+      // authoritative; path validation above still runs before we acknowledge
+      // the historical source.
+      disposition = 'primary_exists'
+    } else {
+      let credential: DesktopConnection | null = null
+      let credentialPhase: 'parse' | 'decrypt' = 'parse'
+      try {
+        const raw = sourceCredential
+        const parsed = recoveryRecord(JSON.parse(raw))
+        if (!parsed) throw new Error('credential is not an object')
+        const stringFields = [
+          'provider',
+          'model',
+          'baseUrl',
+          'apiKeyEnv',
+          'encryptedApiKey',
+          'modelRoutingMode',
+          'routerMode',
+          'routerDefaultTier',
+          'searchProvider',
+          'searchApiKeyEnv',
+          'encryptedSearchApiKey',
+          'encryption',
+          'configAuthority',
+          'importTransactionId',
+          'createdAt',
+          'updatedAt',
+        ] as const
+        if (stringFields.some((field) => (
+          Object.prototype.hasOwnProperty.call(parsed, field)
+          && typeof parsed[field] !== 'string'
+        ))) {
+          throw new Error('credential contains an invalid string field')
+        }
+        if (
+          Object.prototype.hasOwnProperty.call(parsed, 'disableNetworkObservability')
+          && typeof parsed.disableNetworkObservability !== 'boolean'
+        ) {
+          throw new Error('credential contains an invalid boolean field')
+        }
+        if (
+          Object.prototype.hasOwnProperty.call(parsed, 'routerTiers')
+          && !recoveryRecord(parsed.routerTiers)
+        ) {
+          throw new Error('credential contains invalid router tiers')
+        }
+        const candidateCredential = normalizeDesktopCredential(
+          parsed as Partial<DesktopConnection>,
+        )
+        credentialPhase = 'decrypt'
+        // Validate OS-keychain ciphertext before publishing it at the primary path.
+        // Unusable historical secrets are skipped so normal onboarding can collect
+        // a fresh credential instead of permanently blocking every startup.
+        if (
+          candidateCredential.encryptedApiKey
+          && !decryptApiKey(candidateCredential)
+        ) {
+          throw new Error('provider credential decrypted to an empty value')
+        }
+        if (
+          candidateCredential.encryptedSearchApiKey
+          && !decryptSearchApiKey(candidateCredential)
+        ) {
+          throw new Error('search credential decrypted to an empty value')
+        }
+        // Publish eligibility is assigned only after both safeStorage/plaintext
+        // validations complete. A decryption exception must leave this null so
+        // the historical source is skipped rather than copied into primary.
+        credential = candidateCredential
+      } catch {
+        const stableCode = credentialPhase === 'parse'
+          ? 'archived_credential_invalid'
+          : 'archived_credential_decryption_failed'
+        desktopLog('desktop_profile_consolidation_credential_skipped', {
+          sourceRecoveryId,
+          stableCode,
+        })
+        disposition = 'source_unusable'
+      }
+
+      if (credential !== null) {
+        const expectedConfig = await readOptionalDesktopText(join(primary.home, 'config.toml'))
+        if (expectedConfig === null) {
+          // A credential-only legacy recovery has no profile config authority
+          // to preserve. Generate the canonical primary config and publish it
+          // with the credential through the existing paired settings
+          // transaction, so a crash cannot expose only one half.
+          credential = normalizeDesktopCredential({
+            ...credential,
+            configAuthority: 'generated',
+            importTransactionId: '',
+          })
+          await applyDesktopSettingsPair(
+            primary,
+            credential,
+            JSON.stringify(credential, null, 2),
+            currentCredential,
+            true,
+          )
+        } else {
+          const inspection = await inspectDesktopProfile(primary)
+          if (inspection.outcome === 'recovery_required' || !inspection.transaction_id) {
+            throw new Error(
+              `The consolidated primary config is not ready for credential adoption (${inspection.stable_code}).`,
+            )
+          }
+          const result = await runRecoveryCli(
+            primary,
+            [
+              'apply-settings',
+              '--home', primary.home,
+              '--transaction-id', inspection.transaction_id,
+              '--expected-revision', String(inspection.revision),
+              '--json',
+            ],
+            JSON.stringify({
+              expected_config: expectedConfig,
+              config: expectedConfig,
+              expected_credential: currentCredential,
+              credential: JSON.stringify(credential, null, 2),
+            }),
+            true,
+          )
+          if (result.outcome === 'recovery_required') {
+            throw new Error(
+              `The consolidated Desktop credential was not adopted (${result.stable_code}).`,
+            )
+          }
+        }
+        // Force the normal loader to validate the bytes at their final primary path.
+        if (!await loadDesktopCredential()) {
+          throw new Error('The consolidated Desktop credential was not published.')
+        }
+        desktopLog('desktop_profile_consolidation_credential_adopted', {
+          sourceRecoveryId,
+        })
+        disposition = 'adopted'
+      }
+    }
+
+    if (disposition === null) {
+      throw new Error('Desktop credential adoption did not reach a terminal disposition.')
+    }
+    await acknowledgeConsolidatedDesktopCredential(consolidation)
+    desktopLog('desktop_profile_consolidation_credential_acknowledged', {
+      sourceRecoveryId,
+      disposition,
+    })
+  } finally {
+    finishWriter()
+  }
+}
+
+let desktopProfilesConsolidatedThisProcess = false
+let desktopProfileConsolidationPromise: Promise<DesktopProfileConsolidationResult | null> | null = null
+let pendingDesktopCredentialConsolidation: DesktopProfileConsolidationResult | null = null
+let desktopProfileConsolidationMaintenance: DesktopProfileConsolidationMaintenance | null = null
+let desktopProfileConsolidationFailureDetail = ''
+
+// A blocked fan-in is maintenance, not a startup verdict. The independent
+// primary inspector decides whether the product can open. This flag only stops
+// window reopens from repeating the same maintenance command in one process; an
+// explicit in-app repair clears it for one safe retry.
+let desktopProfileConsolidationDeferredThisProcess = false
+
+async function consolidateLegacyRecoveryProfilesBeforeStartup(
+): Promise<DesktopProfileConsolidationResult | null> {
+  if (desktopProfileConsolidationDeferredThisProcess) return null
+  if (desktopProfilesConsolidatedThisProcess) return null
+  if (desktopProfileConsolidationPromise) return await desktopProfileConsolidationPromise
+
+  desktopProfileConsolidationPromise = (async () => {
+    const exclusive = desktopWriters.tryBeginExclusive('consolidate legacy Desktop profiles')
+    if (!exclusive) {
+      throw new Error('OpenSquilla is finishing another profile operation. Try startup again.')
+    }
+    try {
+      await waitForDesktopWriterOperations(1)
+      const primary = primaryDesktopProfile()
+      const recoveryProfiles = legacyRecoveryProfiles()
+      // An Electron crash can leave a verified Gateway serving any historical
+      // profile. Stop only instances proven by the owner record + HMAC challenge
+      // before the offline fan-in takes source and target locks.
+      for (const profile of [...recoveryProfiles, primary]) {
+        await recoverVerifiedOrphanGatewayBeforeSpawn(profile)
+      }
+      const result = await runDesktopProfileConsolidationCli(primary)
+      validateDesktopProfileConsolidationPaths(result, primary)
+      desktopLog('desktop_profile_consolidation_completed', {
+        outcome: result.outcome,
+        stableCode: result.stable_code,
+        recoveryProfileCount: recoveryProfiles.length,
+        consumedRecoveryProfileCount: result.consumed_recovery_ids.length,
+      })
+      if (result.outcome === 'blocked') {
+        return result
+      }
+      desktopProfileConsolidationMaintenance = null
+      desktopProfileConsolidationFailureDetail = ''
+      pendingDesktopCredentialConsolidation = (
+        result.credential_adoption_status === 'pending'
+      )
+        ? result
+        : null
+      desktopProfilesConsolidatedThisProcess = true
+      return null
+    } finally {
+      exclusive.finish()
+      desktopWriters.reopen(exclusive.admissionToken)
+    }
+  })().finally(() => {
+    desktopProfileConsolidationPromise = null
+  })
+  return await desktopProfileConsolidationPromise
+}
+
+function deferProfileConsolidationMaintenance(
+  result: DesktopProfileConsolidationResult,
+): void {
+  desktopProfileConsolidationDeferredThisProcess = true
+  desktopProfileConsolidationFailureDetail = (
+    result.errors.find((value) => value.trim())?.trim() ?? ''
+  )
+  desktopProfileConsolidationMaintenance = {
+    kind: 'profile-consolidation',
+    stable_code: result.stable_code,
+    retryable: true,
+    recovery_profile_count: legacyRecoveryProfiles().length,
+  }
+  desktopLog('desktop_profile_consolidation_deferred', {
+    stableCode: result.stable_code,
+    detail: desktopProfileConsolidationFailureDetail,
+    recoveryProfileCount: desktopProfileConsolidationMaintenance.recovery_profile_count,
+  })
+}
+
 function recoveryStateSnapshot(): DesktopRecoveryViewState {
-  const active = activeDesktopProfile()
   return {
     inspection: recoveryInspection,
-    activeProfile: {
-      kind: active.kind,
-      recoveryId: active.recoveryId,
-      home: active.home,
-    },
-    recoveryProfiles: allProfileContexts()
-      .filter((profile) => profile.kind === 'recovery' && profile.recoveryId)
-      .map((profile) => ({ id: profile.recoveryId as string, home: profile.home })),
+    maintenance: desktopProfileConsolidationMaintenance,
     blocked: recoveryInspection?.outcome === 'recovery_required',
     busy: recoveryOperationBusy,
     error: recoveryOperationError,
@@ -6187,13 +7390,25 @@ function sanitizedRecoveryDiagnostics(): string {
     }
     return '<EXTERNAL_PATH>'
   }
+  const redactText = (value: string | undefined): string | null => {
+    if (!value) return null
+    return value
+      .split(app.getPath('userData')).join('<USER_DATA>')
+      .split(homedir()).join('<HOME>')
+  }
   return JSON.stringify({
     schema_version: RECOVERY_PROTOCOL_SCHEMA_VERSION,
     app_version: app.getVersion(),
     platform: process.platform,
-    profile_kind: activeDesktopProfile().kind,
+    profile_kind: 'primary',
     outcome: report?.outcome ?? 'recovery_required',
     stable_code: report?.stable_code ?? 'desktop_recovery_state_unavailable',
+    maintenance: desktopProfileConsolidationMaintenance
+      ? {
+          ...desktopProfileConsolidationMaintenance,
+          detail: redactText(desktopProfileConsolidationFailureDetail),
+        }
+      : null,
     primary_home: redactPath(report?.primary_home ?? primaryDesktopProfile().home),
     effective_workspace: redactPath(report?.effective_workspace ?? null),
     candidates: (report?.candidates ?? []).map((candidate) => ({
@@ -6207,98 +7422,6 @@ function sanitizedRecoveryDiagnostics(): string {
     transaction_id: report?.transaction_id ?? null,
     revision: report?.revision ?? 0,
   }, null, 2)
-}
-
-function attentionAcknowledgementFor(
-  report: RecoveryProtocolResult,
-): DesktopAttentionAcknowledgement {
-  return {
-    stable_code: report.stable_code,
-    candidates: report.candidates
-      .filter((candidate) => ['canonical', 'legacy', 'external'].includes(candidate.kind))
-      .map((candidate) => ({
-        path: candidate.path,
-        identity: candidate.identity ?? null,
-        modified_at_ns: candidate.modified_at_ns ?? null,
-      }))
-      .sort((left, right) => left.path.localeCompare(right.path)),
-  }
-}
-
-async function persistAttentionAcknowledgement(
-  acknowledgement: DesktopAttentionAcknowledgement,
-): Promise<void> {
-  await updateDesktopProfileContext((current) => contextForProfile(
-    app.getPath('userData'),
-    current.active.kind,
-    current.active.recoveryId,
-    new Date().toISOString(),
-    acknowledgement,
-  ))
-}
-
-async function showAttentionPrompt(
-  report: RecoveryProtocolResult,
-  force = false,
-): Promise<void> {
-  if (report.outcome !== 'attention' || activeDesktopProfile().kind !== 'primary') return
-  const acknowledgement = attentionAcknowledgementFor(report)
-  const identity = JSON.stringify(acknowledgement)
-  const persisted = desktopProfileContext().persisted.attention_acknowledgement
-  if (!force && (JSON.stringify(persisted) === identity || attentionPromptedThisSession === identity)) {
-    return
-  }
-  if (attentionPromptInFlight) return attentionPromptInFlight
-  attentionPromptedThisSession = identity
-  attentionPromptInFlight = (async () => {
-    const currentWorkspace = report.effective_workspace
-    const otherWorkspacePaths = report.candidates
-      .filter((candidate) => (
-        ['canonical', 'legacy', 'external'].includes(candidate.kind)
-        && candidate.exists
-        && (!currentWorkspace || !resolvedPathsEqual(candidate.path, currentWorkspace))
-      ))
-      .map((candidate) => candidate.path)
-    const workspaceLines = [
-      ...(currentWorkspace
-        ? [`${desktopT('attention.currentWorkspace')}: ${currentWorkspace}`]
-        : []),
-      ...otherWorkspacePaths.map((path) => `${desktopT('attention.otherWorkspace')}: ${path}`),
-    ]
-    const options: Electron.MessageBoxOptions = {
-      type: 'info',
-      buttons: [
-        desktopT('attention.later'),
-        desktopT('attention.keepCurrent'),
-        desktopT('attention.chooseWorkspace'),
-      ],
-      defaultId: 1,
-      cancelId: 0,
-      title: desktopT('attention.title'),
-      message: desktopT('attention.message'),
-      detail: [desktopT('attention.detail'), ...workspaceLines].join('\n\n'),
-    }
-    const window = currentMainWindow()
-    const result = window
-      ? await dialog.showMessageBox(window, options)
-      : await dialog.showMessageBox(options)
-    if (result.response === 1) {
-      await persistAttentionAcknowledgement(acknowledgement)
-    } else if (result.response === 2) {
-      const choice = await withRecoveryOperation(() => choosePrimaryWorkspace(null))
-      if (!choice.ok && choice.error !== 'Workspace selection was cancelled.') {
-        await dialog.showMessageBox({
-          type: 'error',
-          buttons: ['OK'],
-          message: desktopT('attention.title'),
-          detail: choice.error,
-        })
-      }
-    }
-  })().finally(() => {
-    attentionPromptInFlight = null
-  })
-  return attentionPromptInFlight
 }
 
 const GATEWAY_PORT_FIRST = 18791
@@ -6395,7 +7518,28 @@ function gatewayExitLooksLikePortInUse(output: string): boolean {
     || /:\d+\s+is already in use/i.test(output)
 }
 
+function gatewayExitLooksLikeProfileInUse(output: string): boolean {
+  return /OPENSQUILLA_PROFILE_IN_USE/i.test(output)
+}
+
+function desktopGatewayStillRunningMessage(): string {
+  return (
+    'OPENSQUILLA_PROFILE_IN_USE: A previous Desktop Gateway has not exited. ' +
+    'Wait for it to finish, or quit every OpenSquilla app or terminal using this profile, ' +
+    'then try again. If it will not exit, restart the computer. ' +
+    'Do not delete profile lock files.'
+  )
+}
+
 function classifyGatewayExitMessage(message: string, outputTail: string): string {
+  if (gatewayExitLooksLikeProfileInUse(outputTail)) {
+    return (
+      message +
+      '\n\nAnother OpenSquilla runtime is still using this profile. ' +
+      'Quit every OpenSquilla app or terminal using it, then try again. ' +
+      'If an older process will not exit, restart the computer. Do not delete profile lock files.'
+    )
+  }
   if (!gatewayExitLooksLikeNewerConfig(outputTail)) return message
   return (
     message +
@@ -6440,6 +7584,22 @@ function hasGatewayProcessExited(process: ChildProcessWithoutNullStreams | null)
   return Boolean(process && (process.exitCode !== null || process.signalCode !== null))
 }
 
+function trackStoppingGatewayProcess(child: ChildProcessWithoutNullStreams): void {
+  if (hasGatewayProcessExited(child) || gatewayStoppingProcesses.has(child)) return
+  gatewayStoppingProcesses.add(child)
+  child.once('exit', () => {
+    gatewayStoppingProcesses.delete(child)
+    if (updateGatewayShutdownProcess === child) updateGatewayShutdownProcess = null
+  })
+}
+
+function liveLifecycleOwnedGatewayProcesses(): ChildProcessWithoutNullStreams[] {
+  const children = new Set(gatewayStoppingProcesses)
+  if (gatewayProcess && gatewayState.owned) children.add(gatewayProcess)
+  if (updateGatewayShutdownProcess) children.add(updateGatewayShutdownProcess)
+  return [...children].filter((child) => !hasGatewayProcessExited(child))
+}
+
 async function reuseHealthyGatewayState(): Promise<GatewayState | null> {
   if (gatewayProfileKey !== desktopProfileKey()) return null
   if (!gatewayState.url) return null
@@ -6459,11 +7619,111 @@ async function reuseHealthyGatewayState(): Promise<GatewayState | null> {
   return null
 }
 
+const VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS = 80_000
+const desktopGatewayOwnershipVerification = new DesktopGatewayOwnershipVerificationCoordinator({
+  onPidRecycled: (record) => {
+    desktopLog('gateway_ownership_pid_recycled', { pid: record.pid, port: record.port })
+  },
+})
+
+function verifiedOrphanGatewayError(detail: string): Error {
+  return new Error(
+    'OPENSQUILLA_PROFILE_IN_USE: ' + detail + ' ' +
+    'The existing Gateway was left by an earlier Desktop process. ' +
+    'Do not delete profile lock files; quit that Gateway and try again.',
+  )
+}
+
+async function verifyDesktopGatewayOwnershipWhenReady(
+  ownershipDir: string,
+  record: DesktopGatewayOwnershipRecord,
+): Promise<boolean> {
+  return await desktopGatewayOwnershipVerification.verifyWhenReady(ownershipDir, record)
+}
+
+/**
+ * A fresh Electron process has no ChildProcess handle for a Gateway left by a
+ * crashed predecessor. Recover only when the profile-scoped record and the
+ * loopback HMAC challenge both identify that exact Desktop instance. A health
+ * check, occupied port, or PID by itself never grants stop authority.
+ */
+async function recoverVerifiedOrphanGatewayBeforeSpawn(
+  profile = activeDesktopProfile(),
+): Promise<void> {
+  const ownershipDir = desktopGatewayOwnershipDir(profile)
+  const loaded = loadDesktopGatewayOwnershipRecord(ownershipDir)
+  if (loaded.status !== 'valid') {
+    if (loaded.status === 'invalid') {
+      desktopLog('gateway_ownership_record_untrusted')
+    }
+    return
+  }
+
+  const record: DesktopGatewayOwnershipRecord = loaded.record
+  await desktopGatewayOwnershipVerification.runRecovery(ownershipDir, record, async (current) => {
+    if (current.profile_fingerprint !== desktopProfileFingerprint(profile.home)) {
+      desktopLog('gateway_ownership_profile_mismatch', {
+        pid: current.pid,
+        port: current.port,
+      })
+      return
+    }
+    if (!await verifyDesktopGatewayOwnershipWhenReady(ownershipDir, current)) {
+      // A stale record after SIGKILL is harmless: the OS has already released the
+      // profile lock and the next admitted Gateway will replace the record. Do
+      // not unlink it or infer authority over whatever now owns the PID/port.
+      desktopLog('gateway_ownership_not_verified', { pid: current.pid, port: current.port })
+      return
+    }
+
+    desktopLog('gateway_orphan_verified', {
+      pid: current.pid,
+      port: current.port,
+      version: current.version,
+    })
+    const accepted = await requestVerifiedDesktopGatewayShutdown(current)
+    if (!accepted) {
+      // The verified process may have completed shutdown between the challenge
+      // and the authenticated request. The ownership record is removed only
+      // after its writer leases are released, so that disappearance is sufficient.
+      if (loadDesktopGatewayOwnershipRecord(ownershipDir).status === 'missing') return
+      throw verifiedOrphanGatewayError('The verified Gateway rejected the shutdown request.')
+    }
+    const released = await waitForDesktopGatewayOwnershipRelease(ownershipDir, current, {
+      timeoutMs: VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS,
+    })
+    desktopLog('gateway_orphan_shutdown_complete', {
+      pid: current.pid,
+      port: current.port,
+      released,
+    })
+    if (!released) {
+      throw verifiedOrphanGatewayError('The verified Gateway did not finish shutting down.')
+    }
+  })
+}
+
 async function startGateway(): Promise<GatewayState> {
   const reusableGateway = forceOnboardingOnNextStartup ? null : await reuseHealthyGatewayState()
   if (reusableGateway) return reusableGateway
+  artifactPreviewLeaseBroker.clear()
 
   assertSupportedMacInstallLocation()
+
+  // Retry, recovery, update, or quit may already have moved a child out of the
+  // current slot while its graceful shutdown still owns the profile lock. A
+  // separate activate/second-instance open flow must not bypass that drain and
+  // publish a replacement. Retry remains the explicit join operation; ordinary
+  // resume entry points fail closed until the tracked child has exited.
+  const alreadyStoppingGateways = liveLifecycleOwnedGatewayProcesses().filter(
+    (child) => child !== gatewayProcess,
+  )
+  if (alreadyStoppingGateways.length > 0) {
+    desktopLog('gateway_spawn_blocked_by_stopping_processes', {
+      pids: alreadyStoppingGateways.map((child) => child.pid),
+    })
+    throw new Error(desktopGatewayStillRunningMessage())
+  }
 
   if (gatewayProcess && gatewayState.owned) {
     if (hasGatewayProcessExited(gatewayProcess)) {
@@ -6476,18 +7736,17 @@ async function startGateway(): Promise<GatewayState> {
       // fails with an unclassified error.
       const previousChild = gatewayProcess
       stopGateway()
-      await waitForGatewayProcessExit(previousChild)
+      const exited = await waitForGatewayProcessExit(previousChild)
+      if (!exited) {
+        throw new Error(desktopGatewayStillRunningMessage())
+      }
     }
     gatewayState.status = 'stopped'
     gatewayState.error = undefined
   }
 
   const activeProfile = activeDesktopProfile()
-  // A recovery profile must always launch its own isolated Desktop gateway; a
-  // developer override may point at a primary/CLI runtime with different data.
-  const overrideUrl = activeProfile.kind === 'primary'
-    ? process.env.OPENSQUILLA_DESKTOP_GATEWAY_URL
-    : undefined
+  const overrideUrl = process.env.OPENSQUILLA_DESKTOP_GATEWAY_URL
   if (overrideUrl) {
     sendBootStatus('gateway-health')
     gatewayState.url = overrideUrl.replace(/\/$/, '')
@@ -6500,6 +7759,9 @@ async function startGateway(): Promise<GatewayState> {
     }
     return gatewayState
   }
+
+  sendBootStatus('gateway-health')
+  await recoverVerifiedOrphanGatewayBeforeSpawn()
 
   sendBootStatus('profile')
   const connection = await runOnboarding()
@@ -6520,6 +7782,21 @@ async function startGateway(): Promise<GatewayState> {
   const runtime = await resolveGatewayRuntime()
 
   const port = await findGatewayPort()
+  // This is the final await before spawn. Update, quit, cleanup, and recovery
+  // close writer/lifecycle admission before draining current children; an
+  // in-flight start that had not published its child must not appear after an
+  // empty stop/join snapshot and race the installer or a profile write.
+  const liveOwnedGatewayCount = liveLifecycleOwnedGatewayProcesses().length
+  if (!lifecycleAllowsProcessSpawn(
+    isQuitting,
+    desktopWriters.closed,
+    liveOwnedGatewayCount,
+  )) {
+    if (liveOwnedGatewayCount > 0) {
+      throw new Error(desktopGatewayStillRunningMessage())
+    }
+    throw new Error('Gateway startup was cancelled by an active lifecycle or profile operation.')
+  }
   const url = `http://127.0.0.1:${port}`
   const logDir = desktopLogsDir()
   mkdirSync(logDir, { recursive: true })
@@ -6547,12 +7824,17 @@ async function startGateway(): Promise<GatewayState> {
 
   const nodeBinCandidates = desktopNodeBinCandidates()
   const childPath = desktopChildPath(nodeBinCandidates)
+  const gatewayInstanceNonce = createDesktopGatewayInstanceNonce()
+  const gatewayOwnershipDir = desktopGatewayOwnershipDir(activeProfile)
+  const gatewayProfileFingerprint = desktopProfileFingerprint(activeProfile.home)
   const childEnv = desktopChildEnvironment(activeProfile, {
     PATH: childPath,
     ...(process.platform === 'win32' ? { Path: childPath } : {}),
     ...(connection.apiKeyEnv && apiKey ? { [connection.apiKeyEnv]: apiKey } : {}),
     ...(connection.searchApiKeyEnv && searchApiKey ? { [connection.searchApiKeyEnv]: searchApiKey } : {}),
     OPENSQUILLA_NODE_BIN_DIR: nodeBinCandidates.join(pathDelimiter()),
+    OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_NONCE: gatewayInstanceNonce,
+    OPENSQUILLA_DESKTOP_GATEWAY_OWNERSHIP_DIR: gatewayOwnershipDir,
     // desktopChildEnvironment pins OPENSQUILLA_STATE_DIR to H. RC4's Python
     // recovery engine has already validated/reconciled the historical nested
     // layout before this writer is admitted.
@@ -6575,6 +7857,12 @@ async function startGateway(): Promise<GatewayState> {
     }
   )
   gatewayProcess = child
+  gatewayProcessOwnershipContexts.set(child, {
+    nonce: gatewayInstanceNonce,
+    ownershipDir: gatewayOwnershipDir,
+    profileFingerprint: gatewayProfileFingerprint,
+    port,
+  })
   gatewayProfileKey = desktopProfileKey(activeProfile)
   desktopLog('gateway_spawned', {
     profileKind: activeProfile.kind,
@@ -6592,7 +7880,10 @@ async function startGateway(): Promise<GatewayState> {
   child.stderr.on('data', rememberGatewayOutput)
   child.stdout.pipe(logStream, { end: false })
   child.stderr.pipe(logStream, { end: false })
-  child.once('exit', (code, signal) => {
+  // Classify startup failures only after stdio has closed. Node may emit
+  // 'exit' before the final stdout/stderr chunks, which can otherwise drop the
+  // stable OPENSQUILLA_PROFILE_IN_USE marker printed immediately before exit.
+  child.once('close', (code, signal) => {
     const message = `gateway exited code=${code ?? 'null'} signal=${signal ?? 'null'}`
     const portConflictExit = gatewayExitLooksLikePortInUse(gatewayOutputTail)
     const exitMessage = portConflictExit ? `${message}\nGateway port is already in use.` : message
@@ -6744,8 +8035,8 @@ async function createMainWindow(): Promise<BrowserWindow> {
     show: false,
     // Paint the window in the app's base color from the first frame so launch
     // never flashes white before the splash/app paints. The app theme defaults
-    // to 'system', so match the OS; these are the base.css --bg tokens.
-    backgroundColor: nativeTheme.shouldUseDarkColors ? '#08080A' : '#F7F6F3',
+    // to 'system', so match the Control UI's canonical light/dark canvas.
+    backgroundColor: desktopWindowBackgroundColor(),
     webPreferences: {
       preload: join(__dirname, 'preload.cjs'),
       contextIsolation: true,
@@ -6754,6 +8045,11 @@ async function createMainWindow(): Promise<BrowserWindow> {
     },
   })
   mainWindow = window
+  installDesktopZoomShortcuts(
+    window.webContents,
+    window.webContents,
+    () => nativeWorkbenchSurfaces.refreshBounds(window),
+  )
   installEditingContextMenu(window)
 
   window.webContents.setWindowOpenHandler(({ url }) => {
@@ -6782,6 +8078,52 @@ async function createMainWindow(): Promise<BrowserWindow> {
   }
   window.webContents.on('will-navigate', guardMainWindowNavigation)
   window.webContents.on('will-redirect', guardMainWindowNavigation)
+  window.webContents.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
+    // Native child views sit above the renderer DOM. A full document change
+    // must remove them before boot/recovery/another Control UI can become
+    // visible; same-document SPA navigation keeps the Workbench lifecycle in
+    // Vue and is intentionally left alone.
+    if (isMainFrame && !isInPlace) void nativeWorkbenchSurfaces.destroyAll()
+  })
+
+  window.on('close', (event) => handleMainWindowClose(window, event))
+  if (process.platform === 'win32') {
+    const commitSystemSessionEnd = () => {
+      if (!systemSessionEnding) windowsSessionEndPreviousPhase = appExitPhase
+      systemSessionEnding = true
+      setAppExitPhase('committed', 'windows session ending')
+    }
+    window.on('query-session-end', () => {
+      commitSystemSessionEnd()
+      if (windowsSessionEndResetTimer) clearTimeout(windowsSessionEndResetTimer)
+      // Windows can abandon a shutdown/logout because another application
+      // vetoed it, but Electron exposes no matching cancellation event. Do not
+      // leave this instance permanently committed and unrevealable.
+      windowsSessionEndResetTimer = setTimeout(() => {
+        windowsSessionEndResetTimer = null
+        if (!systemSessionEnding) return
+        const previousPhase = windowsSessionEndPreviousPhase ?? 'running'
+        windowsSessionEndPreviousPhase = null
+        systemSessionEnding = false
+        if (appExitPhase === 'committed') {
+          setAppExitPhase(previousPhase, 'Windows session end was not committed')
+        }
+      }, 15_000)
+      windowsSessionEndResetTimer.unref()
+    })
+    window.on('session-end', () => {
+      if (windowsSessionEndResetTimer) clearTimeout(windowsSessionEndResetTimer)
+      windowsSessionEndResetTimer = null
+      windowsSessionEndPreviousPhase = null
+      commitSystemSessionEnd()
+      // Electron does not emit app.before-quit for Windows shutdown, restart,
+      // or logout. Release the tray and exact owned child from this
+      // BrowserWindow event, which is guaranteed for that lifecycle.
+      isQuitting = true
+      destroyWindowsTray()
+      stopGateway()
+    })
+  }
 
   window.once('ready-to-show', () => {
     if (!window.isDestroyed()) window.show()
@@ -6846,48 +8188,24 @@ async function restoreMainWindowToBootPage(): Promise<void> {
 }
 
 async function stopOwnedGatewayAndWait(): Promise<void> {
-  const child = gatewayProcess && gatewayState.owned
-    ? gatewayProcess
-    : updateGatewayShutdownProcess
-  if (!child) {
-    clearReusableGatewayState()
-    return
-  }
-  if (gatewayProcess === child && gatewayState.owned) stopGateway()
-  const exited = await waitForGatewayProcessExit(child)
+  const exited = await stopAndJoinAllLifecycleOwnedGateways()
   if (!exited) throw new Error('The Desktop gateway did not stop before the recovery operation.')
-  if (updateGatewayShutdownProcess === child) updateGatewayShutdownProcess = null
+  updateGatewayShutdownProcess = null
   clearReusableGatewayState()
 }
 
 async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
-  const context = desktopProfileContext()
-  if (context.issue) {
-    recoveryOperationError = null
-    recoveryInspection = recoveryFailureResult(context.primary.home, context.issue)
-    if (gatewayProcess && gatewayState.owned) await stopOwnedGatewayAndWait()
-    bootError = null
-    await restoreMainWindowToBootPage()
-    publishRecoveryState()
-    createApplicationMenu()
-    return false
-  }
-
-  if (context.active.kind === 'recovery' && !activeRecoveryProfileConfirmedThisProcess) {
-    recoveryOperationError = null
-    recoveryInspection = recoveryFailureResult(
-      context.primary.home,
-      'desktop_recovery_profile_confirmation_required',
-    )
-    if (gatewayProcess && gatewayState.owned) await stopOwnedGatewayAndWait()
-    bootError = null
-    await restoreMainWindowToBootPage()
-    publishRecoveryState()
-    createApplicationMenu()
-    return false
-  }
-
+  const consolidationFailure = await consolidateLegacyRecoveryProfilesBeforeStartup()
   const active = activeDesktopProfile()
+  // On a hard Electron crash, the Python Gateway can remain healthy and keep
+  // the profile writer lease. Prove and stop that exact prior Desktop instance
+  // before profile inspection; otherwise the inspector reports profile_lock_busy
+  // and strands startup on the manual recovery screen before startGateway() can
+  // run. Never apply this to a developer override or this process's own child.
+  const overrideUrl = process.env.OPENSQUILLA_DESKTOP_GATEWAY_URL
+  if (!overrideUrl && liveLifecycleOwnedGatewayProcesses().length === 0) {
+    await recoverVerifiedOrphanGatewayBeforeSpawn(active)
+  }
   recoveryOperationError = null
   let inspection = await inspectDesktopProfile(active)
   if (
@@ -6907,19 +8225,27 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
     }
   }
 
-  const provenLegacyAttention = inspection.outcome === 'attention'
-    && ['legacy_workspace_pinned', 'legacy_workspace_deferred'].includes(inspection.stable_code)
-    && inspection.allowed_actions.some((action) => (
-      action === 'reconcile' || action === 'finalize-layout'
-    ))
+  if (
+    inspection.outcome === 'recovery_required'
+    && inspection.allowed_actions.includes('recover-transaction')
+    && inspection.transaction_id
+  ) {
+    if (gatewayProcess && gatewayState.owned) await stopOwnedGatewayAndWait()
+    try {
+      inspection = await recoverInspectedProfileTransaction(active, inspection)
+    } catch (error) {
+      desktopLog('profile_transaction_auto_recovery_failed', {
+        error: error instanceof Error ? error.message : 'unknown error',
+      })
+      inspection = recoveryFailureResult(active.home, 'profile_transaction_auto_recovery_failed')
+    }
+  }
+
   const provenReconcile = inspection.outcome === 'recovery_required'
     && inspection.allowed_actions.includes('reconcile')
   const safeLayoutFinalize = inspection.outcome === 'ready'
     && inspection.allowed_actions.includes('finalize-layout')
-  if (
-    active.kind === 'primary'
-    && (provenReconcile || provenLegacyAttention || safeLayoutFinalize)
-  ) {
+  if (provenReconcile || safeLayoutFinalize) {
     if (gatewayProcess && gatewayState.owned) await stopOwnedGatewayAndWait()
     try {
       inspection = await runRecoveryCli(active, [
@@ -6933,7 +8259,7 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
     }
   }
 
-  if (active.kind === 'primary' && inspection.outcome !== 'recovery_required') {
+  if (inspection.outcome !== 'recovery_required') {
     try {
       // A whole-profile transaction may have committed immediately before the
       // Electron process stopped. The narrow layout receipt is the authority
@@ -6948,18 +8274,32 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
     }
   }
 
-  if (!existsSync(desktopProfileContextPath(app.getPath('userData')))) {
-    await updateDesktopProfileContext((current) => contextForProfile(
-      app.getPath('userData'),
-      current.active.kind,
-      current.active.recoveryId,
-      new Date().toISOString(),
-      current.persisted.attention_acknowledgement,
-    ))
+  if (
+    inspection.outcome !== 'recovery_required'
+    && pendingDesktopCredentialConsolidation
+  ) {
+    const pending = pendingDesktopCredentialConsolidation
+    await adoptConsolidatedDesktopCredential(pending)
+    pendingDesktopCredentialConsolidation = null
+    // apply-settings advances the recovery revision even though it preserves
+    // config.toml bytes. Refresh the authoritative primary state before the
+    // boot page or any later repair action consumes it.
+    inspection = await inspectDesktopProfile(active)
+  }
+
+  if (consolidationFailure) {
+    if (inspection.outcome === 'recovery_required') {
+      desktopLog('desktop_profile_consolidation_primary_blocked', {
+        consolidationStableCode: consolidationFailure.stable_code,
+        primaryStableCode: inspection.stable_code,
+      })
+    } else {
+      deferProfileConsolidationMaintenance(consolidationFailure)
+    }
   }
 
   recoveryInspection = inspection
-  if (active.kind === 'primary') primaryRecoveryInspection = inspection
+  primaryRecoveryInspection = inspection
   publishRecoveryState()
   createApplicationMenu()
   if (inspection.outcome !== 'recovery_required') return true
@@ -6991,9 +8331,6 @@ async function openOrResumeDesktopApp(): Promise<void> {
             const gateway = reusableGateway ?? await ensureGatewayStarted()
             if (revision === desktopOpenFlowRevision && requestedProfileKey === desktopProfileKey()) {
               await loadControlUiIntoCurrentWindow(gateway.url)
-              if (recoveryInspection?.outcome === 'attention') {
-                void showAttentionPrompt(recoveryInspection)
-              }
             }
           }
         }
@@ -7003,7 +8340,7 @@ async function openOrResumeDesktopApp(): Promise<void> {
           gatewayState.error = error instanceof Error ? error.message : String(error)
         }
         desktopLog('desktop_open_failed', {
-          profileKind: activeDesktopProfile().kind,
+          profileKind: 'primary',
           gatewayPid: gatewayProcess?.pid,
           gatewayStatus: gatewayState.status,
           error: error instanceof Error ? error.message : String(error),
@@ -7050,6 +8387,35 @@ async function requestGatewayShutdown(url: string): Promise<boolean> {
   } catch {
     return false
   }
+}
+
+// Prefer the instance-bound Desktop protocol so token-authenticated profiles can
+// still drain without exposing their API token to the Electron shell. The
+// nonce, PID, profile fingerprint, and port must all match the child we spawned;
+// a stale record or an unrelated healthy listener never grants stop authority.
+async function requestOwnedGatewayShutdown(
+  child: ChildProcessWithoutNullStreams,
+  url: string,
+): Promise<boolean> {
+  const context = gatewayProcessOwnershipContexts.get(child)
+  const loaded = context
+    ? loadDesktopGatewayOwnershipRecord(context.ownershipDir)
+    : { status: 'missing' as const, record: null }
+  if (
+    context
+    && loaded.status === 'valid'
+    && desktopGatewayOwnershipMatchesLaunch(loaded.record, {
+      instanceNonce: context.nonce,
+      profileFingerprint: context.profileFingerprint,
+      port: context.port,
+    })
+  ) {
+    if (await requestVerifiedDesktopGatewayShutdown(loaded.record)) return true
+  }
+  // Backward compatibility for a child from an older runtime that predates the
+  // Desktop ownership protocol. Failure falls back to signaling this exact
+  // ChildProcess handle, never to PID-file or port-based process discovery.
+  return await requestGatewayShutdown(url)
 }
 
 // Fetch a diagnostics bundle from the child gateway (loopback owner, no token
@@ -7147,9 +8513,11 @@ function terminateGatewayProcess(
 }
 
 function stopGateway(): void {
+  artifactPreviewLeaseBroker.clear()
   if (!gatewayProcess || !gatewayState.owned) return
   const child = gatewayProcess
   const url = gatewayState.url
+  trackStoppingGatewayProcess(child)
   gatewayProcess = null
 
   const hardTerminate = () => {
@@ -7171,7 +8539,7 @@ function stopGateway(): void {
     child.once('exit', () => {
       exited = true
     })
-    void requestGatewayShutdown(url).then((accepted) => {
+    void requestOwnedGatewayShutdown(child, url).then((accepted) => {
       if (!accepted && !exited) hardTerminate()
     })
     setTimeout(() => {
@@ -7187,20 +8555,27 @@ function stopGateway(): void {
   hardTerminateGatewayProcess(child, GATEWAY_SHUTDOWN_KILL_AFTER_MS)
 }
 
-// ── Auto-update (electron-updater) ──────────────────────────────────────────
-// Phase 1 scope is macOS only. macOS release builds are Developer-ID signed +
-// notarized and ship the zip + latest-mac.yml feed that Squirrel.Mac consumes,
-// so in-place auto-update is safe. Windows builds are currently UNSIGNED, which
-// would make silent NSIS updates trip SmartScreen/UAC — so Windows stays on the
-// manual-download path (the in-app web notice) until a code-signing certificate
-// is in place. OPENSQUILLA_DESKTOP_ENABLE_WIN_UPDATE=1 opts in for local testing
-// only; OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE=1 turns the feature off entirely.
+// ── Desktop updates ──────────────────────────────────────────────────────────
+// macOS release builds are Developer-ID signed + notarized and ship the zip +
+// latest-mac.yml feed that Squirrel.Mac consumes, so in-place auto-update is
+// safe. Windows builds are currently unsigned, so the desktop shell discovers
+// the release but opens its exact versioned NSIS installer for an explicit
+// manual install. OPENSQUILLA_DESKTOP_ENABLE_WIN_UPDATE=1 opts in to native
+// Windows updating for local tests only; OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE
+// disables all shell-managed discovery.
 const { autoUpdater } = electronUpdater
 
 let autoUpdaterReady = false
 let updateDownloadInProgress = false
+let manualInstallerActionInProgress = false
 let updateApplying = false
+// A user/system quit that arrives while an update is still draining writers or
+// the gateway is deferred until that phase either fails safely or reaches the
+// updater-owned handoff. Only quitAndInstall may set handoff ready.
+let updateInstallHandoffReady = false
+let quitRequestedDuringUpdateDrain = false
 let downloadedUpdateVersion: string | null = null
+let verifiedManualInstallerPath: string | null = null
 let updateGatewayShutdownProcess: ChildProcessWithoutNullStreams | null = null
 let mockDownloadedUpdate = false
 let mockUpdatePromptActive = false
@@ -7219,6 +8594,16 @@ type DesktopUpdateStatus =
   | 'error'
   | 'applying'
 
+type DesktopUpdateInstallMode = 'native' | 'manual' | 'unsupported'
+type DesktopUpdateErrorCode =
+  | 'source_unreachable'
+  | 'manifest_invalid'
+  | 'checksum_unavailable'
+  | 'integrity_failed'
+  | 'download_failed'
+  | 'install_failed'
+  | null
+
 interface DesktopUpdateState {
   status: DesktopUpdateStatus
   currentVersion: string
@@ -7226,29 +8611,57 @@ interface DesktopUpdateState {
   progress: number | null
   checkedAt: string | null
   error: string | null
+  errorCode: DesktopUpdateErrorCode
   snoozedUntil: string | null
+  canCheck: boolean
   canNativeInstall: boolean
+  installMode: DesktopUpdateInstallMode
   releaseUrl: string | null
+  source: DesktopUpdateSource | null
+  fallbackUsed: boolean
+}
+
+interface DesktopUpdateFailureFallback {
+  state: DesktopUpdateState
+  candidate: DesktopUpdateCandidate | null
+}
+
+interface NativeUpdateReady {
+  tag: string
+  version: string
+  source: DesktopUpdateSource
 }
 
 interface DesktopUpdatePersistedState {
   snoozedVersion?: string
   snoozedUntil?: string
+  lastSuccessfulSource?: DesktopUpdateSource
 }
 
 const UPDATE_SNOOZE_MS = 24 * 60 * 60 * 1000
 const UPDATE_CHECK_INITIAL_DELAY_MS = 12_000
 const MOCK_UPDATE_CHECK_INITIAL_DELAY_MS = 1_000
 const UPDATE_CHECK_REPEAT_DELAY_MS = 24 * 60 * 60 * 1000
+const UPDATE_CHECKSUM_MAX_BYTES = 1024 * 1024
+const UPDATE_INSTALLER_MAX_BYTES = 4 * 1024 * 1024 * 1024
+const UPDATE_INSTALLER_DOWNLOAD_TIMEOUT_MS = 60 * 60 * 1000
 
 let desktopUpdateStatus: DesktopUpdateStatus = 'idle'
 let desktopUpdateLatestVersion: string | null = null
 let desktopUpdateProgress: number | null = null
 let desktopUpdateCheckedAt: string | null = null
 let desktopUpdateError: string | null = null
+let desktopUpdateErrorCode: DesktopUpdateErrorCode = null
+let desktopUpdateReleaseUrl: string | null = null
+let desktopUpdateSource: DesktopUpdateSource | null = null
+let desktopUpdateFallbackUsed = false
+let desktopUpdateCandidate: DesktopUpdateCandidate | null = null
+let nativeUpdateReady: NativeUpdateReady | null = null
+let lastSuccessfulUpdateSource: DesktopUpdateSource | null = null
 let desktopUpdateSnoozedVersion: string | null = null
 let desktopUpdateSnoozedUntil: string | null = null
 let desktopUpdatePersistenceLoaded = false
+let desktopUpdatePersistenceWrite: Promise<void> = Promise.resolve()
 
 const NETWORK_OBSERVABILITY_DISABLE_ENV_KEYS = [
   'OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY',
@@ -7331,13 +8744,19 @@ function mockUpdateVersion(): string | null {
 }
 
 function desktopUpdateMenuEnabled(): boolean {
-  return autoUpdateSupported() || mockUpdateVersion() !== null
+  return desktopUpdateManaged() || mockUpdateVersion() !== null
 }
 
-function autoUpdateSupported(): boolean {
+function desktopUpdateManaged(): boolean {
   if (!app.isPackaged) return false
   if (desktopNetworkObservabilityDisabled()) return false
   if (process.env.OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE === '1') return false
+  return process.platform === 'darwin' || process.platform === 'win32'
+}
+
+function autoUpdateSupported(): boolean {
+  if (desktopNetworkObservabilityDisabled()) return false
+  if (!desktopUpdateManaged()) return false
   if (process.platform === 'darwin') return true
   if (process.platform === 'win32' && process.env.OPENSQUILLA_DESKTOP_ENABLE_WIN_UPDATE === '1') {
     return true
@@ -7347,6 +8766,12 @@ function autoUpdateSupported(): boolean {
 
 function nativeAutoUpdateEnabled(): boolean {
   return mockUpdateVersion() !== null || (autoUpdateSupported() && macUpdateLocationOk())
+}
+
+function desktopUpdateInstallMode(): DesktopUpdateInstallMode {
+  if (nativeAutoUpdateEnabled()) return 'native'
+  if (desktopUpdateManaged() && process.platform === 'win32') return 'manual'
+  return 'unsupported'
 }
 
 function desktopUpdateStatePath(): string {
@@ -7362,6 +8787,9 @@ function loadDesktopUpdatePersistence(): void {
     const path = desktopUpdateStatePath()
     if (!existsSync(path)) return
     const parsed = JSON.parse(readFileSync(path, 'utf8')) as DesktopUpdatePersistedState
+    if (parsed.lastSuccessfulSource === 'oss' || parsed.lastSuccessfulSource === 'github') {
+      lastSuccessfulUpdateSource = parsed.lastSuccessfulSource
+    }
     const snoozedVersion = String(parsed.snoozedVersion || '').trim()
     const snoozedUntil = String(parsed.snoozedUntil || '').trim()
     if (!snoozedVersion || !snoozedUntil) return
@@ -7374,24 +8802,28 @@ function loadDesktopUpdatePersistence(): void {
   }
 }
 
-async function persistDesktopUpdateSnooze(): Promise<void> {
-  try {
-    mkdirSync(app.getPath('userData'), { recursive: true })
-    await writeFile(
-      desktopUpdateStatePath(),
-      JSON.stringify(
-        {
-          snoozedVersion: desktopUpdateSnoozedVersion || undefined,
-          snoozedUntil: desktopUpdateSnoozedUntil || undefined,
-        },
-        null,
-        2,
-      ),
-      { mode: 0o600 },
-    )
-  } catch (err) {
-    console.warn('[updater] failed to persist update snooze', err)
-  }
+function persistDesktopUpdateState(): Promise<void> {
+  desktopUpdatePersistenceWrite = desktopUpdatePersistenceWrite.then(async () => {
+    try {
+      mkdirSync(app.getPath('userData'), { recursive: true })
+      await atomicWriteFile(
+        desktopUpdateStatePath(),
+        JSON.stringify(
+          {
+            snoozedVersion: desktopUpdateSnoozedVersion || undefined,
+            snoozedUntil: desktopUpdateSnoozedUntil || undefined,
+            lastSuccessfulSource: lastSuccessfulUpdateSource || undefined,
+          },
+          null,
+          2,
+        ),
+        0o600,
+      )
+    } catch (err) {
+      console.warn('[updater] failed to persist update state', err)
+    }
+  })
+  return desktopUpdatePersistenceWrite
 }
 
 function activeDesktopUpdateSnoozeFor(version: string | null): string | null {
@@ -7401,7 +8833,7 @@ function activeDesktopUpdateSnoozeFor(version: string | null): string | null {
   if (Date.parse(desktopUpdateSnoozedUntil) <= Date.now()) {
     desktopUpdateSnoozedVersion = null
     desktopUpdateSnoozedUntil = null
-    void persistDesktopUpdateSnooze()
+    void persistDesktopUpdateState()
     return null
   }
   return desktopUpdateSnoozedUntil
@@ -7412,11 +8844,12 @@ function clearDesktopUpdateSnoozeIfVersionChanged(version: string | null): void 
   if (!version || !desktopUpdateSnoozedVersion || desktopUpdateSnoozedVersion === version) return
   desktopUpdateSnoozedVersion = null
   desktopUpdateSnoozedUntil = null
-  void persistDesktopUpdateSnooze()
+  void persistDesktopUpdateState()
 }
 
 function desktopUpdateSnapshot(): DesktopUpdateState {
   const latestVersion = desktopUpdateLatestVersion || downloadedUpdateVersion
+  const installMode = desktopUpdateInstallMode()
   return {
     status: desktopUpdateStatus,
     currentVersion: app.getVersion(),
@@ -7424,9 +8857,14 @@ function desktopUpdateSnapshot(): DesktopUpdateState {
     progress: desktopUpdateProgress,
     checkedAt: desktopUpdateCheckedAt,
     error: desktopUpdateError,
+    errorCode: desktopUpdateErrorCode,
     snoozedUntil: activeDesktopUpdateSnoozeFor(latestVersion),
-    canNativeInstall: nativeAutoUpdateEnabled(),
-    releaseUrl: null,
+    canCheck: desktopUpdateManaged() || mockUpdateVersion() !== null,
+    canNativeInstall: installMode === 'native',
+    installMode,
+    releaseUrl: desktopUpdateReleaseUrl,
+    source: desktopUpdateSource,
+    fallbackUsed: desktopUpdateFallbackUsed,
   }
 }
 
@@ -7443,17 +8881,35 @@ function setDesktopUpdateState(patch: Partial<DesktopUpdateState>): DesktopUpdat
   if ('latestVersion' in patch) desktopUpdateLatestVersion = patch.latestVersion ?? null
   if ('progress' in patch) desktopUpdateProgress = patch.progress ?? null
   if ('checkedAt' in patch) desktopUpdateCheckedAt = patch.checkedAt ?? null
-  if ('error' in patch) desktopUpdateError = patch.error ?? null
+  if ('error' in patch) {
+    desktopUpdateError = patch.error ?? null
+    if (patch.error == null && !('errorCode' in patch)) desktopUpdateErrorCode = null
+  }
+  if ('errorCode' in patch) desktopUpdateErrorCode = patch.errorCode ?? null
+  if ('releaseUrl' in patch) desktopUpdateReleaseUrl = patch.releaseUrl ?? null
+  if ('source' in patch) desktopUpdateSource = patch.source ?? null
+  if ('fallbackUsed' in patch) desktopUpdateFallbackUsed = patch.fallbackUsed ?? false
   clearDesktopUpdateSnoozeIfVersionChanged(desktopUpdateLatestVersion || downloadedUpdateVersion)
   return publishDesktopUpdateState()
 }
 
 async function dismissDesktopUpdate(): Promise<DesktopUpdateState> {
   const latestVersion = desktopUpdateLatestVersion || downloadedUpdateVersion
+  if (!latestVersion && desktopUpdateStatus === 'error') {
+    return setDesktopUpdateState({
+      status: 'idle',
+      progress: null,
+      error: null,
+      errorCode: null,
+      releaseUrl: null,
+      source: null,
+      fallbackUsed: false,
+    })
+  }
   if (latestVersion) {
     desktopUpdateSnoozedVersion = latestVersion
     desktopUpdateSnoozedUntil = new Date(Date.now() + UPDATE_SNOOZE_MS).toISOString()
-    await persistDesktopUpdateSnooze()
+    await persistDesktopUpdateState()
   }
   return publishDesktopUpdateState()
 }
@@ -7498,22 +8954,57 @@ function showUpdateDialog(
   return win ? dialog.showMessageBox(win, options) : dialog.showMessageBox(options)
 }
 
-function showUpdateError(err: unknown): void {
+function classifyDesktopUpdateError(err: unknown): Exclude<DesktopUpdateErrorCode, null> {
+  if (err instanceof UpdateChannelError) {
+    if (err.code === 'manifest_invalid' || err.code === 'current_version_invalid') return 'manifest_invalid'
+    if (err.code === 'checksum_unavailable') return 'checksum_unavailable'
+    if (err.code === 'integrity_failed') return 'integrity_failed'
+    if (err.code === 'download_failed') return 'download_failed'
+    if (err.code === 'install_failed') return 'install_failed'
+    return 'source_unreachable'
+  }
+  return updateDownloadInProgress ? 'download_failed' : 'source_unreachable'
+}
+
+function desktopUpdateErrorMessage(code: Exclude<DesktopUpdateErrorCode, null>): string {
+  if (code === 'manifest_invalid') return desktopT('update.manifestInvalid')
+  if (code === 'checksum_unavailable') return desktopT('update.checksumUnavailable')
+  if (code === 'integrity_failed') return desktopT('update.integrityFailed')
+  if (code === 'download_failed') return desktopT('update.downloadFailed')
+  if (code === 'install_failed') return desktopT('update.installFailed')
+  return desktopT('update.sourceUnavailable')
+}
+
+function showUpdateError(
+  err: unknown,
+  silentFallback: DesktopUpdateFailureFallback | null = null,
+): void {
   const shouldNotify = desktopUpdateCheckScheduler.consumeManualRequest() || updateDownloadInProgress
+  const errorCode = classifyDesktopUpdateError(err)
   updateDownloadInProgress = false
   if (!shouldNotify) {
-    // electron-updater delivers each failure twice (it emits 'error' AND rejects
-    // the promise our try/catch awaits). The first delivery publishes the visible
-    // error and clears the notify flags; without this guard the second, now-silent
-    // delivery would clobber that error back to idle and wipe the known
-    // latestVersion. Leave an already-published error in place.
-    if (desktopUpdateStatus === 'error') return
+    if (silentFallback && !['checking', 'downloading', 'applying'].includes(silentFallback.state.status)) {
+      desktopUpdateCandidate = silentFallback.candidate
+      setDesktopUpdateState({
+        status: silentFallback.state.status,
+        latestVersion: silentFallback.state.latestVersion,
+        progress: silentFallback.state.progress,
+        checkedAt: silentFallback.state.checkedAt,
+        error: silentFallback.state.error,
+        errorCode: silentFallback.state.errorCode,
+        releaseUrl: silentFallback.state.releaseUrl,
+        source: silentFallback.state.source,
+        fallbackUsed: silentFallback.state.fallbackUsed,
+      })
+      return
+    }
     setDesktopUpdateState({
       status: downloadedUpdateVersion ? 'downloaded' : 'idle',
       latestVersion: downloadedUpdateVersion,
       progress: downloadedUpdateVersion ? 100 : null,
       checkedAt: new Date().toISOString(),
       error: null,
+      errorCode: null,
     })
     return
   }
@@ -7521,7 +9012,8 @@ function showUpdateError(err: unknown): void {
     status: 'error',
     progress: null,
     checkedAt: new Date().toISOString(),
-    error: String(err instanceof Error ? err.message : err ?? ''),
+    error: desktopUpdateErrorMessage(errorCode),
+    errorCode,
   })
 }
 
@@ -7553,7 +9045,30 @@ async function runMockUpdateFlow(version: string): Promise<void> {
 }
 
 async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
-  if (updateDownloadInProgress || updateApplying || desktopUpdateStatus === 'downloaded') {
+  if (
+    desktopUpdateInstallMode() === 'manual'
+    && desktopUpdateStatus === 'downloaded'
+    && verifiedManualInstallerPath
+  ) {
+    try {
+      shell.showItemInFolder(verifiedManualInstallerPath)
+    } catch (err) {
+      console.error('[updater] failed to reveal verified manual installer', err)
+      return setDesktopUpdateState({
+        status: 'error',
+        progress: null,
+        error: desktopUpdateErrorMessage('install_failed'),
+        errorCode: 'install_failed',
+      })
+    }
+    return desktopUpdateSnapshot()
+  }
+  if (
+    updateDownloadInProgress
+    || manualInstallerActionInProgress
+    || updateApplying
+    || desktopUpdateStatus === 'downloaded'
+  ) {
     return desktopUpdateSnapshot()
   }
 
@@ -7582,27 +9097,108 @@ async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
     })
   }
 
+  if (desktopUpdateInstallMode() === 'manual') {
+    manualInstallerActionInProgress = true
+    try {
+      if (desktopUpdateStatus === 'checking') await checkForUpdates(true)
+      if (!desktopUpdateCandidate) await checkForUpdates(true)
+      const candidate = desktopUpdateCandidate
+      if (!candidate || desktopUpdateStatus !== 'available') return desktopUpdateSnapshot()
+      updateDownloadInProgress = true
+      verifiedManualInstallerPath = null
+
+      let chosen: { source: DesktopUpdateSource; fallbackUsed: boolean }
+      try {
+        chosen = await chooseDesktopUpdateSource(candidate, candidate.installer)
+      } catch (err) {
+        console.error('[updater] manual installer sources are unreachable', err)
+        return setDesktopUpdateState({
+          status: 'error',
+          progress: null,
+          checkedAt: new Date().toISOString(),
+          error: desktopUpdateErrorMessage('source_unreachable'),
+          errorCode: 'source_unreachable',
+        })
+      }
+
+      const installerUrl = updateAssetUrl(candidate, chosen.source)
+      setDesktopUpdateState({
+        status: 'downloading',
+        latestVersion: candidate.version,
+        progress: 0,
+        releaseUrl: installerUrl,
+        source: chosen.source,
+        fallbackUsed: chosen.fallbackUsed,
+        error: null,
+        errorCode: null,
+      })
+      try {
+        const expectedSha256 = await fetchCanonicalWindowsInstallerDigest(candidate)
+        const verified = await downloadVerifiedWindowsInstallerWithFallback(
+          candidate,
+          chosen,
+          expectedSha256,
+        )
+        verifiedManualInstallerPath = verified.path
+        rememberSuccessfulUpdateSource(verified.source)
+        setDesktopUpdateState({
+          status: 'downloaded',
+          latestVersion: candidate.version,
+          progress: 100,
+          checkedAt: new Date().toISOString(),
+          releaseUrl: updateAssetUrl(candidate, verified.source),
+          source: verified.source,
+          fallbackUsed: verified.fallbackUsed,
+          error: null,
+          errorCode: null,
+        })
+        try {
+          shell.showItemInFolder(verified.path)
+        } catch (err) {
+          throw new UpdateChannelError(
+            'install_failed',
+            `The verified installer could not be shown: ${String(err instanceof Error ? err.message : err)}`,
+          )
+        }
+      } catch (err) {
+        console.error('[updater] failed to prepare verified manual installer', err)
+        showUpdateError(err)
+        return desktopUpdateSnapshot()
+      }
+      return desktopUpdateSnapshot()
+    } finally {
+      updateDownloadInProgress = false
+      manualInstallerActionInProgress = false
+    }
+  }
+
   if (!autoUpdateSupported()) return desktopUpdateSnapshot()
   if (!macUpdateLocationOk()) {
     return setDesktopUpdateState({
       status: 'error',
       progress: null,
       error: desktopT('update.moveToApplications'),
+      errorCode: null,
     })
   }
 
   initAutoUpdater()
-  if (!desktopUpdateLatestVersion) await checkForUpdates(true)
-  if (!desktopUpdateLatestVersion) return desktopUpdateSnapshot()
+  let candidate = desktopUpdateCandidate
+  if (!candidate || !nativeUpdateReadyFor(candidate)) {
+    await checkForUpdates(true)
+    candidate = desktopUpdateCandidate
+  }
+  if (!candidate || !nativeUpdateReadyFor(candidate)) return desktopUpdateSnapshot()
 
   updateDownloadInProgress = true
   setDesktopUpdateState({
     status: 'downloading',
+    latestVersion: candidate.version,
     progress: 0,
     error: null,
   })
   try {
-    await autoUpdater.downloadUpdate()
+    await downloadNativeDesktopUpdateWithFallback()
   } catch (err) {
     console.error('[updater] download failed', err)
     showUpdateError(err)
@@ -7619,6 +9215,13 @@ function initAutoUpdater(): void {
   // restart path so applyDownloadedUpdate() can drain the owned gateway first.
   autoUpdater.autoDownload = false
   autoUpdater.autoInstallOnAppQuit = false
+  // electron-updater generates a persistent per-install staging UUID even
+  // when no staged rollout is configured. Override the outbound header with a
+  // fixed, non-user-specific value; OpenSquilla channels do not use rollout
+  // bucketing and update checks should not add a cross-request identifier.
+  autoUpdater.requestHeaders = {
+    'x-user-staging-id': '00000000-0000-4000-8000-000000000000',
+  }
   autoUpdater.logger = {
     info: (m: unknown) => console.log('[updater]', m),
     warn: (m: unknown) => console.warn('[updater]', m),
@@ -7627,26 +9230,11 @@ function initAutoUpdater(): void {
   }
 
   autoUpdater.on('update-available', (info) => {
-    const version = String(info?.version ?? '')
-    updateDownloadInProgress = false
-    setDesktopUpdateState({
-      status: 'available',
-      latestVersion: version || null,
-      progress: null,
-      checkedAt: new Date().toISOString(),
-      error: null,
-    })
+    console.log('[updater] provider reports update available', String(info?.version ?? ''))
   })
 
-  autoUpdater.on('update-not-available', () => {
-    updateDownloadInProgress = false
-    setDesktopUpdateState({
-      status: 'not-available',
-      latestVersion: app.getVersion(),
-      progress: null,
-      checkedAt: new Date().toISOString(),
-      error: null,
-    })
+  autoUpdater.on('update-not-available', (info) => {
+    console.log('[updater] provider reports no update', String(info?.version ?? ''))
   })
 
   autoUpdater.on('download-progress', (progress) => {
@@ -7675,59 +9263,496 @@ function initAutoUpdater(): void {
 
   autoUpdater.on('error', (err) => {
     console.error('[updater] error', err)
-    showUpdateError(err)
+    // electron-updater also rejects the active check/download promise. The
+    // promise owner performs source fallback and publishes at most one final
+    // error after both sources have failed.
   })
 }
 
-// ── macOS prerelease update discovery ───────────────────────────────────────
-// The tag-parsing + candidate-selection logic lives in ./update-feed-resolver so
-// it can be unit-tested without Electron; the pieces below are the Electron-bound
-// glue (current version, GitHub fetch, feed wiring).
+// ── Static release-channel discovery and regional source selection ─────────
+// GitHub Release remains the source of truth, but clients discover the moving
+// stable / same-base preview channel from a small OSS JSON manifest. Once the
+// strict tag is known, metadata and installers can come from either the OSS
+// version directory or the matching GitHub Release without using the anonymous
+// GitHub Releases API.
 
-// The running app version if it is a prerelease we can resolve upgrades for.
-function currentPrereleaseReleaseTarget(): { base: string; rc: number } | null {
-  const parsed = parseOpenSquillaReleaseTag(app.getVersion())
-  return parsed && parsed.rc !== null ? { base: parsed.base, rc: parsed.rc } : null
+interface ResolvedDesktopUpdate {
+  candidate: DesktopUpdateCandidate
+  source: DesktopUpdateSource
+  fallbackUsed: boolean
 }
 
-async function fetchGithubReleaseSummaries(): Promise<ReleaseSummary[]> {
-  const url = `https://api.github.com/repos/${GITHUB_UPDATE_OWNER}/${GITHUB_UPDATE_REPO}/releases?per_page=50`
-  const response = await fetch(url, {
-    headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'OpenSquilla-Desktop' },
-    signal: AbortSignal.timeout(8000),
-  })
-  if (!response.ok) throw new Error(`GitHub releases request failed: ${response.status}`)
-  const data = await response.json()
-  return Array.isArray(data) ? (data as ReleaseSummary[]) : []
+function desktopUpdatePlatform(): DesktopUpdatePlatform | null {
+  if (process.platform === 'darwin' && process.arch === 'arm64') return 'darwin-arm64'
+  if (process.platform === 'win32' && process.arch === 'x64') return 'win32-x64'
+  return null
 }
 
-// Returns 'default' to leave the built-in GitHub provider in place (stable
-// builds, non-macOS, dev), 'configured' after pointing a generic feed at the
-// resolved candidate, or 'up-to-date' when no newer same-base release exists.
-async function configureDesktopUpdateFeed(): Promise<'default' | 'configured' | 'up-to-date'> {
-  // Default (stable builds, GitHub provider path): never silently downgrade.
+function desktopUpdateLocaleTags(): string[] {
+  const preferred = typeof app.getPreferredSystemLanguages === 'function'
+    ? app.getPreferredSystemLanguages()
+    : []
+  return [...preferred, app.getLocale()]
+}
+
+async function fetchDesktopUpdateChannelFromRoot(root?: string): Promise<unknown> {
+  const url = updateChannelManifestUrl(app.getVersion(), root)
+  if (!url) {
+    throw new UpdateChannelError('manifest_invalid', 'The installed version has no supported update channel.')
+  }
+  let response: Response
+  try {
+    response = await fetch(url, {
+      headers: { Accept: 'application/json', 'User-Agent': 'OpenSquilla-Desktop' },
+      signal: AbortSignal.timeout(8000),
+      cache: 'no-store',
+    })
+  } catch (err) {
+    throw new UpdateChannelError(
+      'source_unreachable',
+      `The update channel is temporarily unreachable: ${String(err instanceof Error ? err.message : err)}`,
+    )
+  }
+  if (!response.ok) {
+    throw new UpdateChannelError('source_unreachable', 'The update channel is temporarily unavailable.')
+  }
+  try {
+    return await response.json()
+  } catch {
+    throw new UpdateChannelError('manifest_invalid', 'The update channel returned invalid JSON.')
+  }
+}
+
+async function fetchDesktopUpdateChannelFromGithubReleases(): Promise<unknown> {
+  let response: Response
+  try {
+    response = await fetch(UPDATE_GITHUB_RELEASES_API_URL, {
+      headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'OpenSquilla-Desktop' },
+      signal: AbortSignal.timeout(8000),
+      cache: 'no-store',
+    })
+  } catch (err) {
+    throw new UpdateChannelError(
+      'source_unreachable',
+      `The GitHub release inventory is temporarily unreachable: ${String(err instanceof Error ? err.message : err)}`,
+    )
+  }
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => {})
+    throw new UpdateChannelError('source_unreachable', 'The GitHub release inventory is temporarily unavailable.')
+  }
+  let inventory: unknown
+  try {
+    inventory = await response.json()
+  } catch {
+    throw new UpdateChannelError('manifest_invalid', 'The GitHub release inventory returned invalid JSON.')
+  }
+  const manifest = updateChannelManifestFromReleaseInventory(app.getVersion(), inventory)
+  if (!manifest) {
+    throw new UpdateChannelError(
+      'source_unreachable',
+      'The GitHub release inventory has no release for this update channel.',
+    )
+  }
+  return manifest
+}
+
+async function fetchDesktopUpdateChannel(): Promise<unknown> {
+  if (!updateChannelPathForVersion(app.getVersion())) {
+    throw new UpdateChannelError('manifest_invalid', 'The installed version has no supported update channel.')
+  }
+  const rootOverride = (process.env.OPENSQUILLA_DESKTOP_UPDATE_CHANNEL_ROOT || '').trim()
+  if (rootOverride) return await fetchDesktopUpdateChannelFromRoot(rootOverride)
+  loadDesktopUpdatePersistence()
+  // Discovery itself is dual-sourced: the mirrored channel manifest and the
+  // GitHub release inventory are tried in the same order as asset downloads,
+  // so an unreachable mirror cannot disable update checks outright.
+  const order = orderedUpdateSources(
+    desktopUpdateLocaleTags(),
+    lastSuccessfulUpdateSource,
+    process.env.OPENSQUILLA_DESKTOP_UPDATE_SOURCE,
+  )
+  let lastError: unknown = null
+  for (const source of order) {
+    try {
+      return source === 'oss'
+        ? await fetchDesktopUpdateChannelFromRoot()
+        : await fetchDesktopUpdateChannelFromGithubReleases()
+    } catch (err) {
+      lastError = err
+      desktopLog('update_channel_discovery_failed', {
+        source,
+        error: String(err instanceof Error ? err.message : err),
+      })
+    }
+  }
+  if (lastError instanceof UpdateChannelError) throw lastError
+  throw new UpdateChannelError('source_unreachable', 'No desktop update discovery source is reachable.')
+}
+
+async function probeDesktopUpdateSource(
+  candidate: DesktopUpdateCandidate,
+  source: DesktopUpdateSource,
+  asset = candidate.feed,
+): Promise<void> {
+  const url = updateAssetUrl(candidate, source, asset)
+  let response: Response
+  try {
+    response = await fetch(url, {
+      headers: { Accept: 'application/octet-stream', Range: 'bytes=0-0', 'User-Agent': 'OpenSquilla-Desktop' },
+      signal: AbortSignal.timeout(5000),
+      cache: 'no-store',
+    })
+  } catch (err) {
+    throw new UpdateChannelError(
+      'source_unreachable',
+      `${source} update source is unreachable: ${String(err instanceof Error ? err.message : err)}`,
+    )
+  }
+  if (!response.ok) {
+    throw new UpdateChannelError('source_unreachable', `${source} update source is unavailable.`)
+  }
+  await response.body?.cancel().catch(() => {})
+}
+
+async function chooseDesktopUpdateSource(
+  candidate: DesktopUpdateCandidate,
+  asset = candidate.feed,
+): Promise<{ source: DesktopUpdateSource; fallbackUsed: boolean }> {
+  loadDesktopUpdatePersistence()
+  const order = orderedUpdateSources(
+    desktopUpdateLocaleTags(),
+    lastSuccessfulUpdateSource,
+    process.env.OPENSQUILLA_DESKTOP_UPDATE_SOURCE,
+  )
+  let lastError: unknown = null
+  for (let index = 0; index < order.length; index += 1) {
+    const source = order[index]
+    try {
+      await probeDesktopUpdateSource(candidate, source, asset)
+      return { source, fallbackUsed: index > 0 }
+    } catch (err) {
+      lastError = err
+      desktopLog('update_source_probe_failed', {
+        source,
+        error: String(err instanceof Error ? err.message : err),
+      })
+    }
+  }
+  if (lastError instanceof UpdateChannelError) throw lastError
+  throw new UpdateChannelError('source_unreachable', 'No desktop update source is reachable.')
+}
+
+function rememberSuccessfulUpdateSource(source: DesktopUpdateSource): void {
+  if (lastSuccessfulUpdateSource === source) return
+  lastSuccessfulUpdateSource = source
+  void persistDesktopUpdateState()
+}
+
+async function fetchCanonicalWindowsInstallerDigest(
+  candidate: DesktopUpdateCandidate,
+): Promise<string> {
+  const checksumUrl = updateAssetUrl(candidate, 'github', 'SHA256SUMS')
+  let response: Response
+  try {
+    response = await fetch(checksumUrl, {
+      headers: { Accept: 'text/plain', 'User-Agent': 'OpenSquilla-Desktop' },
+      signal: AbortSignal.timeout(10_000),
+      cache: 'no-store',
+    })
+  } catch (err) {
+    throw new UpdateChannelError(
+      'checksum_unavailable',
+      `The canonical GitHub checksum is unreachable: ${String(err instanceof Error ? err.message : err)}`,
+    )
+  }
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => {})
+    throw new UpdateChannelError(
+      'checksum_unavailable',
+      `The canonical GitHub checksum returned HTTP ${response.status}.`,
+    )
+  }
+  try {
+    const contents = await readResponseTextWithLimit(response, UPDATE_CHECKSUM_MAX_BYTES)
+    return parseSha256SumsForAsset(contents, candidate.installer)
+  } catch (err) {
+    if (err instanceof UpdateChannelError) throw err
+    throw new UpdateChannelError(
+      'integrity_failed',
+      `The canonical GitHub checksum could not be parsed: ${String(err instanceof Error ? err.message : err)}`,
+    )
+  }
+}
+
+async function downloadVerifiedWindowsInstaller(
+  candidate: DesktopUpdateCandidate,
+  source: DesktopUpdateSource,
+  expectedSha256: string,
+): Promise<string> {
+  const installerUrl = updateAssetUrl(candidate, source)
+  let response: Response
+  try {
+    response = await fetch(installerUrl, {
+      headers: { Accept: 'application/octet-stream', 'User-Agent': 'OpenSquilla-Desktop' },
+      signal: AbortSignal.timeout(UPDATE_INSTALLER_DOWNLOAD_TIMEOUT_MS),
+      cache: 'no-store',
+    })
+  } catch (err) {
+    throw new UpdateChannelError(
+      'download_failed',
+      `The installer download failed: ${String(err instanceof Error ? err.message : err)}`,
+    )
+  }
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => {})
+    throw new UpdateChannelError('download_failed', `The installer returned HTTP ${response.status}.`)
+  }
+
+  const destinationPath = join(
+    app.getPath('userData'),
+    'update-downloads',
+    candidate.installer,
+  )
+  let lastProgress = -1
+  let reportedUnknownLength = false
+  try {
+    const result = await streamResponseToVerifiedFile(
+      response,
+      destinationPath,
+      expectedSha256,
+      {
+        maxBytes: UPDATE_INSTALLER_MAX_BYTES,
+        onProgress(receivedBytes, totalBytes) {
+          if (totalBytes === null || totalBytes <= 0) {
+            if (reportedUnknownLength) return
+            reportedUnknownLength = true
+            setDesktopUpdateState({ status: 'downloading', progress: null, error: null })
+            return
+          }
+          const progress = Math.max(0, Math.min(100, Math.floor((receivedBytes / totalBytes) * 100)))
+          if (progress === lastProgress) return
+          lastProgress = progress
+          setDesktopUpdateState({ status: 'downloading', progress, error: null })
+        },
+      },
+    )
+    return result.path
+  } catch (err) {
+    if (err instanceof UpdateChannelError) throw err
+    throw new UpdateChannelError(
+      'download_failed',
+      `The installer download could not be saved: ${String(err instanceof Error ? err.message : err)}`,
+    )
+  }
+}
+
+interface VerifiedManualInstaller {
+  path: string
+  source: DesktopUpdateSource
+  fallbackUsed: boolean
+}
+
+async function downloadVerifiedWindowsInstallerWithFallback(
+  candidate: DesktopUpdateCandidate,
+  chosen: { source: DesktopUpdateSource; fallbackUsed: boolean },
+  expectedSha256: string,
+): Promise<VerifiedManualInstaller> {
+  const attempts: DesktopUpdateSource[] = [
+    chosen.source,
+    alternateDesktopUpdateSource(chosen.source),
+  ]
+  let lastError: unknown = null
+  let integrityError: UpdateChannelError | null = null
+  for (let index = 0; index < attempts.length; index += 1) {
+    const source = attempts[index]
+    const fallbackUsed = chosen.fallbackUsed || index > 0
+    setDesktopUpdateState({
+      status: 'downloading',
+      progress: 0,
+      releaseUrl: updateAssetUrl(candidate, source),
+      source,
+      fallbackUsed,
+      error: null,
+      errorCode: null,
+    })
+    try {
+      const path = await downloadVerifiedWindowsInstaller(candidate, source, expectedSha256)
+      return { path, source, fallbackUsed }
+    } catch (err) {
+      lastError = err
+      if (err instanceof UpdateChannelError && err.code === 'integrity_failed') {
+        integrityError = err
+      }
+      const retryable = err instanceof UpdateChannelError
+        && (err.code === 'download_failed' || err.code === 'integrity_failed')
+      desktopLog('update_manual_download_failed', {
+        source,
+        retrying: retryable && index + 1 < attempts.length,
+        error: String(err instanceof Error ? err.message : err),
+      })
+      if (!retryable) throw err
+    }
+  }
+  if (integrityError) throw integrityError
+  if (lastError instanceof Error) throw lastError
+  throw new UpdateChannelError('download_failed', 'No verified Windows installer source is reachable.')
+}
+
+function alternateDesktopUpdateSource(source: DesktopUpdateSource): DesktopUpdateSource {
+  return source === 'oss' ? 'github' : 'oss'
+}
+
+function nativeUpdateReadyFor(candidate: DesktopUpdateCandidate): boolean {
+  return nativeUpdateReady?.tag === candidate.tag
+    && nativeUpdateReady.version === candidate.version
+    && nativeUpdateReady.source === desktopUpdateSource
+}
+
+async function resolveDesktopUpdate(): Promise<ResolvedDesktopUpdate | null> {
+  const platform = desktopUpdatePlatform()
+  if (!platform) {
+    throw new UpdateChannelError('manifest_invalid', 'This desktop architecture has no update feed.')
+  }
+  const manifest = await fetchDesktopUpdateChannel()
+  const candidate = candidateFromUpdateChannel(app.getVersion(), manifest, platform)
+  if (!candidate) return null
+  const chosen = await chooseDesktopUpdateSource(candidate)
+  return { candidate, ...chosen }
+}
+
+function configureDesktopUpdateFeed(resolved: ResolvedDesktopUpdate): void {
   autoUpdater.allowDowngrade = false
-  if (process.platform !== 'darwin' || !app.isPackaged) return 'default'
-  const current = currentPrereleaseReleaseTarget()
-  if (!current) return 'default'
-  const candidate = selectMacPrereleaseCandidate(current, await fetchGithubReleaseSummaries())
-  if (!candidate) return 'up-to-date'
-  // Generic provider + channel 'latest' fetches latest-mac.yml from this exact
-  // release; the yml's version is then gated by electron-updater's isUpdateAvailable.
-  autoUpdater.setFeedURL({ provider: 'generic', url: candidate.feedUrl, channel: 'latest' })
-  // The resolver already decided this candidate is the correct forward move by
-  // NUMERIC rc order. electron-updater's gate uses semver.gt, which sorts rc
-  // identifiers as strings — so 0.5.0-rc10 ranks BELOW 0.5.0-rc9/rc2 and the
-  // update would be wrongly rejected. Allow the "downgrade": we only ever point
-  // the feed at a genuinely newer release, never an older one.
-  autoUpdater.allowDowngrade = true
-  desktopLog('update_feed_resolved', { tag: candidate.tag, version: candidate.version })
-  return 'configured'
+  autoUpdater.setFeedURL({
+    provider: 'generic',
+    url: updateFeedBaseUrl(resolved.candidate, resolved.source),
+    channel: 'latest',
+  })
+  // The strict manifest resolver already proved a same-base RC is a forward
+  // move. electron-updater compares identifiers such as rc9/rc10 lexically, so
+  // allow its apparent "downgrade" only for that validated prerelease path.
+  const current = parseOpenSquillaReleaseTag(app.getVersion())
+  autoUpdater.allowDowngrade = current?.rc !== null && current?.rc !== undefined
+  desktopLog('update_feed_resolved', {
+    tag: resolved.candidate.tag,
+    version: resolved.candidate.version,
+    source: resolved.source,
+    fallbackUsed: resolved.fallbackUsed,
+  })
+}
+
+async function checkNativeDesktopUpdate(resolved: ResolvedDesktopUpdate): Promise<void> {
+  nativeUpdateReady = null
+  const attempts: ResolvedDesktopUpdate[] = [
+    resolved,
+    {
+      candidate: resolved.candidate,
+      source: alternateDesktopUpdateSource(resolved.source),
+      fallbackUsed: true,
+    },
+  ]
+  let lastError: unknown = null
+  for (let index = 0; index < attempts.length; index += 1) {
+    const attempt = attempts[index]
+    try {
+      if (index > 0) await probeDesktopUpdateSource(attempt.candidate, attempt.source)
+      configureDesktopUpdateFeed(attempt)
+      const result = await autoUpdater.checkForUpdates()
+      const feedVersion = String(result?.updateInfo?.version ?? '').trim()
+      if (result?.isUpdateAvailable !== true || feedVersion !== attempt.candidate.version) {
+        throw new UpdateChannelError(
+          'manifest_invalid',
+          `Update feed did not offer the expected version ${attempt.candidate.version} (received ${feedVersion || '<missing>'}).`,
+        )
+      }
+      rememberSuccessfulUpdateSource(attempt.source)
+      desktopUpdateCandidate = attempt.candidate
+      nativeUpdateReady = {
+        tag: attempt.candidate.tag,
+        version: attempt.candidate.version,
+        source: attempt.source,
+      }
+      setDesktopUpdateState({
+        status: 'available',
+        latestVersion: attempt.candidate.version,
+        progress: null,
+        checkedAt: new Date().toISOString(),
+        releaseUrl: attempt.candidate.releaseUrl,
+        source: attempt.source,
+        fallbackUsed: resolved.fallbackUsed || attempt.fallbackUsed,
+        error: null,
+        errorCode: null,
+      })
+      return
+    } catch (err) {
+      lastError = err
+      desktopLog('update_native_check_failed', {
+        source: attempt.source,
+        error: String(err instanceof Error ? err.message : err),
+      })
+    }
+  }
+  throw lastError ?? new UpdateChannelError('source_unreachable', 'No desktop update source is reachable.')
+}
+
+async function downloadNativeDesktopUpdateWithFallback(): Promise<void> {
+  const readyCandidate = desktopUpdateCandidate
+  if (!readyCandidate || !nativeUpdateReadyFor(readyCandidate)) {
+    throw new UpdateChannelError('manifest_invalid', 'The selected native update feed is not verified.')
+  }
+  try {
+    await autoUpdater.downloadUpdate()
+    return
+  } catch (firstError) {
+    const candidate = desktopUpdateCandidate
+    const currentSource = desktopUpdateSource
+    if (!candidate || !currentSource) throw firstError
+    nativeUpdateReady = null
+
+    const fallback: ResolvedDesktopUpdate = {
+      candidate,
+      source: alternateDesktopUpdateSource(currentSource),
+      fallbackUsed: true,
+    }
+    desktopLog('update_native_download_retry', {
+      from: currentSource,
+      to: fallback.source,
+      error: String(firstError instanceof Error ? firstError.message : firstError),
+    })
+    await probeDesktopUpdateSource(candidate, fallback.source)
+    configureDesktopUpdateFeed(fallback)
+    const result = await autoUpdater.checkForUpdates()
+    const feedVersion = String(result?.updateInfo?.version ?? '').trim()
+    if (result?.isUpdateAvailable !== true || feedVersion !== candidate.version) {
+      throw new UpdateChannelError(
+        'manifest_invalid',
+        `Fallback update feed did not offer ${candidate.version} (received ${feedVersion || '<missing>'}).`,
+      )
+    }
+    rememberSuccessfulUpdateSource(fallback.source)
+    nativeUpdateReady = {
+      tag: candidate.tag,
+      version: candidate.version,
+      source: fallback.source,
+    }
+    updateDownloadInProgress = true
+    setDesktopUpdateState({
+      status: 'downloading',
+      latestVersion: candidate.version,
+      progress: 0,
+      source: fallback.source,
+      fallbackUsed: true,
+      releaseUrl: candidate.releaseUrl,
+      error: null,
+      errorCode: null,
+    })
+    await autoUpdater.downloadUpdate()
+  }
 }
 
 function desktopUpdateCheckAllowed(): boolean {
   return isUpdateCheckAllowed({
-    downloading: updateDownloadInProgress,
+    downloading: updateDownloadInProgress || (manualInstallerActionInProgress && desktopUpdateCandidate !== null),
     applying: updateApplying,
     downloaded: downloadedUpdateVersion !== null || desktopUpdateStatus === 'downloaded',
   })
@@ -7751,55 +9776,84 @@ async function runDesktopUpdateCheck(): Promise<void> {
     return
   }
 
-  if (!autoUpdateSupported()) {
+  if (!desktopUpdateManaged()) {
     if (desktopUpdateCheckScheduler.manualRequestPending) {
       setDesktopUpdateState({
         status: 'error',
         progress: null,
         checkedAt: new Date().toISOString(),
         error: desktopT('update.errorTitle'),
+        errorCode: 'source_unreachable',
       })
     }
     return
   }
 
   // Guide the user to /Applications first, otherwise the in-place swap fails.
-  if (!macUpdateLocationOk()) {
+  if (process.platform === 'darwin' && !macUpdateLocationOk()) {
     setDesktopUpdateState({
       status: 'error',
       progress: null,
       checkedAt: new Date().toISOString(),
       error: desktopT('update.moveToApplications'),
+      errorCode: null,
     })
     return
   }
 
-  initAutoUpdater()
+  if (nativeAutoUpdateEnabled()) initAutoUpdater()
+  const failureFallback: DesktopUpdateFailureFallback = {
+    state: desktopUpdateSnapshot(),
+    candidate: desktopUpdateCandidate,
+  }
+  if (desktopUpdateInstallMode() === 'native') nativeUpdateReady = null
   setDesktopUpdateState({
     status: 'checking',
     progress: null,
     checkedAt: new Date().toISOString(),
     error: null,
+    errorCode: null,
   })
   try {
-    const feed = await configureDesktopUpdateFeed()
-    if (feed === 'up-to-date') {
-      // A packaged macOS prerelease with no newer same-base release. Report
-      // up-to-date directly — the default GitHub provider would find nothing
-      // (the rc tags are PEP440, not npm semver) and raise a spurious error.
+    const resolved = await resolveDesktopUpdate()
+    if (!resolved) {
+      desktopUpdateCandidate = null
+      nativeUpdateReady = null
+      verifiedManualInstallerPath = null
       setDesktopUpdateState({
         status: 'not-available',
         latestVersion: app.getVersion(),
         progress: null,
         checkedAt: new Date().toISOString(),
         error: null,
+        errorCode: null,
+        releaseUrl: null,
+        source: null,
+        fallbackUsed: false,
       })
       return
     }
-    await autoUpdater.checkForUpdates()
+    const manualInstall = desktopUpdateInstallMode() === 'manual'
+    if (manualInstall) {
+      verifiedManualInstallerPath = null
+      desktopUpdateCandidate = resolved.candidate
+      setDesktopUpdateState({
+        status: 'available',
+        latestVersion: resolved.candidate.version,
+        progress: null,
+        checkedAt: new Date().toISOString(),
+        releaseUrl: updateAssetUrl(resolved.candidate, resolved.source),
+        source: resolved.source,
+        fallbackUsed: resolved.fallbackUsed,
+        error: null,
+        errorCode: null,
+      })
+      return
+    }
+    await checkNativeDesktopUpdate(resolved)
   } catch (err) {
     console.error('[updater] checkForUpdates failed', err)
-    showUpdateError(err)
+    showUpdateError(err, failureFallback)
   }
 }
 
@@ -7811,14 +9865,6 @@ const desktopUpdateCheckScheduler = new UpdateCheckScheduler({
 
 function checkForUpdates(manual: boolean): Promise<void> {
   return desktopUpdateCheckScheduler.request(manual)
-}
-
-function gatewayProcessForUpdateInstall(): ChildProcessWithoutNullStreams | null {
-  const child = gatewayProcess && gatewayState.owned ? gatewayProcess : updateGatewayShutdownProcess
-  if (!child) return null
-  if (!hasGatewayProcessExited(child)) return child
-  if (updateGatewayShutdownProcess === child) updateGatewayShutdownProcess = null
-  return null
 }
 
 async function waitForGatewayProcessExit(
@@ -7840,20 +9886,42 @@ async function waitForGatewayProcessExit(
   })
 }
 
+async function stopAndJoinAllLifecycleOwnedGateways(
+  stopCurrentProcess: (child: ChildProcessWithoutNullStreams) => void = () => stopGateway(),
+): Promise<boolean> {
+  return await stopAndJoinLifecycleProcesses({
+    currentProcess: () => (
+      gatewayProcess && gatewayState.owned && !hasGatewayProcessExited(gatewayProcess)
+        ? gatewayProcess
+        : null
+    ),
+    stopCurrentProcess,
+    liveProcesses: liveLifecycleOwnedGatewayProcesses,
+    waitForExit: (child) => waitForGatewayProcessExit(child),
+  })
+}
+
 function restoreDownloadedUpdateRetryState(
   pendingVersion: string | null,
   writerAdmissionToken: symbol | null = null,
-): void {
+): boolean {
   if (writerAdmissionToken) desktopWriters.reopen(writerAdmissionToken)
   downloadedUpdateVersion = pendingVersion
   updateApplying = false
+  updateInstallHandoffReady = false
   isQuitting = false
+  setAppExitPhase('running', 'update handoff did not commit')
+  createWindowsTray()
   createApplicationMenu()
   setDesktopUpdateState({
     status: pendingVersion ? 'downloaded' : 'error',
     latestVersion: pendingVersion,
     progress: pendingVersion ? 100 : null,
   })
+  if (!quitRequestedDuringUpdateDrain) return false
+  quitRequestedDuringUpdateDrain = false
+  setImmediate(() => app.quit())
+  return true
 }
 
 // Stop the owned gateway child and WAIT for it to exit before handing control to
@@ -7862,6 +9930,7 @@ function restoreDownloadedUpdateRetryState(
 // orphaning it breaks the next launch. Mirrors the uninstall quiesce path.
 async function applyDownloadedUpdate(): Promise<void> {
   if (updateApplying) return
+  if (isQuitting || desktopWriters.closed) return
   if (!mockDownloadedUpdate && !downloadedUpdateVersion) return
 
   if (mockDownloadedUpdate) {
@@ -7891,11 +9960,16 @@ async function applyDownloadedUpdate(): Promise<void> {
         progress: 100,
         error: null,
       })
+      if (quitRequestedDuringUpdateDrain) {
+        quitRequestedDuringUpdateDrain = false
+        setImmediate(() => app.quit())
+      }
     }
     return
   }
   const pendingVersion = downloadedUpdateVersion
   updateApplying = true
+  setAppExitPhase('deferred', 'preparing downloaded update')
   // Never interrupt a reconcile/workspace/settings transaction after it has
   // been admitted. Close new writers and wait for existing operations to
   // finish naturally before the installer handoff.
@@ -7910,22 +9984,27 @@ async function applyDownloadedUpdate(): Promise<void> {
     error: null,
   })
   isQuitting = true
-  const child = gatewayProcessForUpdateInstall()
-  if (child) {
-    if (gatewayProcess === child && gatewayState.owned) {
-      updateGatewayShutdownProcess = child
-      // We stay alive and await the exit below, so let the gateway take its
-      // Windows HTTP graceful drain instead of an immediate TerminateProcess.
-      allowGracefulShutdownWhileQuitting = true
-      try {
-        stopGateway()
-      } finally {
-        allowGracefulShutdownWhileQuitting = false
-      }
+  setAppExitPhase('draining', 'stopping Gateway for downloaded update')
+  const exited = await stopAndJoinAllLifecycleOwnedGateways((child) => {
+    updateGatewayShutdownProcess = child
+    // We stay alive and await the exit below, so let the gateway take its
+    // Windows HTTP graceful drain instead of an immediate TerminateProcess.
+    allowGracefulShutdownWhileQuitting = true
+    try {
+      stopGateway()
+    } finally {
+      allowGracefulShutdownWhileQuitting = false
     }
-    const exited = await waitForGatewayProcessExit(child)
-    if (!exited) {
-      restoreDownloadedUpdateRetryState(pendingVersion, updateWriterAdmission)
+  })
+  // Re-read the shared ownership set immediately before handoff. There is no
+  // await between this check and quitAndInstall, so a child already stopping
+  // for Retry/recovery cannot be skipped by the installer lifecycle.
+  if (!exited || liveLifecycleOwnedGatewayProcesses().length > 0) {
+    const quitResumed = restoreDownloadedUpdateRetryState(
+      pendingVersion,
+      updateWriterAdmission,
+    )
+    if (!quitResumed) {
       void showUpdateDialog({
         type: 'error',
         buttons: ['OK'],
@@ -7933,36 +10012,43 @@ async function applyDownloadedUpdate(): Promise<void> {
         message: desktopT('update.errorTitle'),
         detail: desktopT('update.gatewayShutdownTimeout'),
       })
-      return
     }
-    if (updateGatewayShutdownProcess === child) updateGatewayShutdownProcess = null
+    return
   }
+  updateGatewayShutdownProcess = null
   // isSilent=false (show the platform installer UI where applicable),
   // isForceRunAfter=true (relaunch after install).
   try {
+    updateInstallHandoffReady = true
+    setAppExitPhase('committed', 'handing off to desktop updater')
     autoUpdater.quitAndInstall(false, true)
   } catch (err) {
-    restoreDownloadedUpdateRetryState(pendingVersion, updateWriterAdmission)
-    void showUpdateDialog({
-      type: 'error',
-      buttons: ['OK'],
-      title: desktopT('update.errorTitle'),
-      message: desktopT('update.errorTitle'),
-      detail: String(err instanceof Error ? err.message : err ?? ''),
-    })
+    const quitResumed = restoreDownloadedUpdateRetryState(
+      pendingVersion,
+      updateWriterAdmission,
+    )
+    if (!quitResumed) {
+      void showUpdateDialog({
+        type: 'error',
+        buttons: ['OK'],
+        title: desktopT('update.errorTitle'),
+        message: desktopT('update.errorTitle'),
+        detail: String(err instanceof Error ? err.message : err ?? ''),
+      })
+    }
     // The owned gateway was stopped for the (now-failed) handoff and its exit was
     // swallowed as intentional (isQuitting was true). restoreDownloadedUpdateRetryState
     // cleared isQuitting, so bring the runtime back up instead of leaving the
     // window stranded on the dead gateway's Control UI.
-    void openOrResumeDesktopApp()
+    if (!quitResumed) void openOrResumeDesktopApp()
   }
 }
 
-// Lets the gateway-served Control UI know whether THIS desktop runtime can
-// apply updates natively right now. The web "a newer version is available"
-// banner suppresses itself only when this is true, so unsupported platforms
-// (e.g. unsigned Windows, or macOS running outside /Applications) still show
-// the passive notice.
+// Lets the gateway-served Control UI know whether this desktop owns update
+// discovery. Discovery ownership and native installation are deliberately separate:
+// unsigned Windows builds use the managed exact-installer flow, while macOS
+// can install the verified archive in place.
+ipcMain.handle('desktop:update:managed', () => desktopUpdateManaged() || mockUpdateVersion() !== null)
 ipcMain.handle('desktop:update:supported', () => nativeAutoUpdateEnabled())
 ipcMain.handle('desktop:update:state', () => desktopUpdateSnapshot())
 ipcMain.handle('desktop:update:check', async () => {
@@ -8013,7 +10099,108 @@ ipcMain.handle('desktop:settings:reset', async (event) => {
   if (!trustedRecoveryIpc(event)) throw new Error('Untrusted Desktop reset request.')
   return await resetDesktopSettingsThroughCleanup()
 })
+ipcMain.handle('desktop:preferences:get', (event) => {
+  if (!trustedMainWindowControlIpc(event)) throw new Error('Untrusted Desktop preferences request.')
+  return desktopPreferencesSnapshot()
+})
+ipcMain.handle('desktop:preferences:save', async (event, payload: DesktopPreferencesPayload) => {
+  if (!trustedMainWindowControlIpc(event)) throw new Error('Untrusted Desktop preferences request.')
+  return await saveDesktopPreferences(payload)
+})
 ipcMain.handle('desktop:artifact:open', async (_event, payload: ArtifactOpenRequest) => openArtifactWithDefaultApp(payload))
+ipcMain.handle('desktop:workspace:choose-directory', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) return null
+  const choice = await dialog.showOpenDialog(
+    currentMainWindow()!,
+    projectDirectoryDialogOptions(process.platform, payload),
+  )
+  if (choice.canceled || choice.filePaths.length !== 1) return null
+  return { path: resolve(choice.filePaths[0]!) }
+})
+ipcMain.handle('desktop:workbench:capabilities', (event) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  return process.env.OPENSQUILLA_PREVIEW_FORCE_OFFLINE === '1'
+    ? { ...NATIVE_WORKBENCH_CAPABILITIES, modes: ['offline'] as const }
+    : NATIVE_WORKBENCH_CAPABILITIES
+})
+ipcMain.handle('desktop:workbench:preview-lease:create', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  return await artifactPreviewLeaseBroker.create(payload)
+})
+ipcMain.handle('desktop:workbench:preview-lease:renew', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  return await artifactPreviewLeaseBroker.renew(payload)
+})
+ipcMain.handle('desktop:workbench:preview-lease:revoke', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  return await artifactPreviewLeaseBroker.revoke(payload)
+})
+ipcMain.handle('desktop:workbench:surface:create', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  try {
+    const request = parseNativeWorkbenchCreateRequest(payload)
+    if (
+      request.kind === 'artifact-preview'
+      && !artifactPreviewLeaseBroker.authorizesSurface(request.payload)
+    ) {
+      return {
+        ok: false,
+        message: 'The artifact preview lease is not authorized by this Desktop Gateway.',
+      }
+    }
+    return await nativeWorkbenchSurfaces.createSurface(request)
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
+})
+ipcMain.handle('desktop:workbench:surface:navigate', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  try {
+    return await nativeWorkbenchSurfaces.navigateSurface(
+      parseNativeWorkbenchNavigationRequest(payload),
+    )
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
+})
+ipcMain.handle('desktop:workbench:permission:respond', (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  try {
+    return nativeWorkbenchSurfaces.respondToPermission(
+      parseNativeWorkbenchPermissionResponse(payload),
+    )
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
+})
+ipcMain.handle('desktop:workbench:surface:set-rect', (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  try {
+    return nativeWorkbenchSurfaces.setSurfaceRect(
+      parseNativeWorkbenchSurfaceRectRequest(payload),
+    )
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
+})
+ipcMain.handle('desktop:workbench:surface:activate', (event, surfaceId: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  try {
+    return nativeWorkbenchSurfaces.activateSurface(parseNativeWorkbenchSurfaceId(surfaceId))
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
+})
+ipcMain.handle('desktop:workbench:surface:destroy', async (event, surfaceId: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
+  try {
+    return await nativeWorkbenchSurfaces.destroySurface(
+      parseNativeWorkbenchSurfaceId(surfaceId),
+    )
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
+})
 
 // ── Desktop data cleanup ───────────────────────────────────────────────────
 // Python owns inventory, locking, CAS, no-follow deletion, and partial recovery.
@@ -8026,12 +10213,9 @@ const DESKTOP_CLEANUP_APPROVAL_LIMIT = 512 * 1024
 const DELETE_ALL_CONFIRMATION = 'DELETE ALL OPENSQUILLA DATA'
 
 function currentDesktopCleanupSelection(mode: DesktopCleanupMode): DesktopCleanupSelection {
-  const profile = activeDesktopProfile()
   return {
     mode,
-    profileKind: profile.kind,
-    recoveryId: profile.recoveryId,
-    profileKey: desktopProfileKey(profile),
+    profileKey: desktopProfileKey(),
   }
 }
 
@@ -8104,7 +10288,7 @@ async function inspectDesktopCleanup(mode: DesktopCleanupMode): Promise<{
   ok: boolean
   previewId: string | null
   report: DesktopCleanupReport
-  profile: { kind: 'primary' | 'recovery'; recoveryId: string | null }
+  profile: { kind: 'primary'; recoveryId: null }
 }> {
   desktopCleanupPreviews.clear()
   const profile = activeDesktopProfile()
@@ -8122,7 +10306,7 @@ async function inspectDesktopCleanup(mode: DesktopCleanupMode): Promise<{
     ok: report.outcome === 'ready',
     previewId: preview?.id ?? null,
     report,
-    profile: { kind: profile.kind, recoveryId: profile.recoveryId },
+    profile: { kind: 'primary', recoveryId: null },
   }
 }
 
@@ -8243,7 +10427,7 @@ async function restoreAfterIncompleteCleanup(
   clearReusableGatewayState()
   const inspection = await inspectDesktopProfile(profile)
   recoveryInspection = inspection
-  if (profile.kind === 'primary') primaryRecoveryInspection = inspection
+  primaryRecoveryInspection = inspection
   bootError = null
   if (!preserveControlUi || inspection.outcome === 'recovery_required') {
     await restoreMainWindowToBootPage()
@@ -8333,7 +10517,7 @@ async function applyApprovedDesktopCleanup(
         ok: false,
         previewId: replacement?.id ?? null,
         report: refreshed,
-        profile: { kind: active.kind, recoveryId: active.recoveryId },
+        profile: { kind: 'primary', recoveryId: null },
         detail: 'The cleanup locations changed while the local runtime stopped. Review them again.',
       }
     }
@@ -8388,6 +10572,10 @@ async function applyApprovedDesktopCleanup(
     // deleted, Electron must not reopen writer admission or recreate any path
     // inside the confirmed scope. Only a failed/cancelled operation may reopen.
     if (shouldQuit) {
+      // Do not call setAppExitPhase here: its durable lifecycle log would
+      // recreate userData/logs after an approved delete operation removed it.
+      appExitPhase = 'committed'
+      destroyWindowsTray()
       app.exit(0)
     } else {
       desktopWriters.reopen(exclusive.admissionToken)
@@ -9185,8 +11373,7 @@ function normalizeOwnedDesktopTargetGatewayPreview(
 ): Record<string, unknown> {
   const preflight = migrationRecord(report.preflight)
   if (
-    activeDesktopProfile().kind !== 'primary'
-    || !gatewayProcess
+    !gatewayProcess
     || !gatewayState.owned
     || hasGatewayProcessExited(gatewayProcess)
     || gatewayProfileKey !== desktopProfileKey(primaryDesktopProfile())
@@ -9319,8 +11506,8 @@ function migrationCandidateWithPreview(
 }
 
 ipcMain.handle('desktop:migration:browse-source', async (event, payload?: unknown) => {
-  if (!trustedRecoveryIpc(event) || activeDesktopProfile().kind !== 'primary') {
-    return { ok: false, error: 'Data transfer is available only in the primary profile.' }
+  if (!trustedRecoveryIpc(event)) {
+    return { ok: false, error: 'Data transfer is available only from the trusted desktop window.' }
   }
   const sourceKind = parseMigrationSourceKind(payload)
   if (!sourceKind) {
@@ -9347,14 +11534,6 @@ ipcMain.handle('desktop:migration:browse-source', async (event, payload?: unknow
 ipcMain.handle('desktop:migration:summary', async (event, payload?: { source?: unknown }) => {
   if (!trustedRecoveryIpc(event)) {
     return { ok: false, candidate: null, report: null, raw: 'Untrusted data transfer request.' }
-  }
-  if (activeDesktopProfile().kind !== 'primary') {
-    return {
-      ok: false,
-      candidate: null,
-      report: null,
-      raw: 'Return to the primary profile before transferring data.',
-    }
   }
   trustedDesktopMigrationPreview = null
   const candidates = await enrichLegacyImportCandidates(detectLegacyImportCandidates())
@@ -9406,13 +11585,6 @@ ipcMain.handle('desktop:migration:run', async (
 ) => {
   if (!trustedRecoveryIpc(event)) {
     return { ok: false, report: null, detail: 'Untrusted data transfer request.' }
-  }
-  if (activeDesktopProfile().kind !== 'primary') {
-    return {
-      ok: false,
-      report: null,
-      detail: 'Return to the primary profile before transferring data.',
-    }
   }
   const preview = trustedDesktopMigrationPreview
   if (
@@ -9706,15 +11878,29 @@ function trustedRecoveryIpc(event: Electron.IpcMainInvokeEvent): boolean {
     if (sender.protocol === 'file:') {
       return resolve(fileURLToPath(sender)) === resolve(bootPagePath())
     }
-    if (!gatewayState.owned || !gatewayState.url) return false
-    const gateway = new URL(gatewayState.url)
-    return (
-      sender.origin === gateway.origin
-      && (sender.pathname === '/control' || sender.pathname.startsWith('/control/'))
-    )
+    return trustedControlUiIpc(event)
   } catch {
     return false
   }
+}
+
+function trustedMainWindowControlIpc(event: Electron.IpcMainInvokeEvent): boolean {
+  const window = currentMainWindow()
+  if (!window || event.sender !== window.webContents || !gatewayState.url) {
+    return false
+  }
+  try {
+    const sender = new URL(event.senderFrame?.url || event.sender.getURL())
+    const gateway = new URL(gatewayState.url)
+    return sender.origin === gateway.origin
+      && (sender.pathname === '/control' || sender.pathname.startsWith('/control/'))
+  } catch {
+    return false
+  }
+}
+
+function trustedControlUiIpc(event: Electron.IpcMainInvokeEvent): boolean {
+  return gatewayState.owned && trustedMainWindowControlIpc(event)
 }
 
 function trustedOnboardingIpc(event: Electron.IpcMainInvokeEvent): boolean {
@@ -9769,123 +11955,41 @@ async function withRecoveryOperation<T>(
   return { ...outcome, state: recoveryStateSnapshot() }
 }
 
-async function copyPrimaryCredentialToRecovery(profile: DesktopProfilePaths): Promise<void> {
-  const raw = await readFile(primaryDesktopProfile().credentialPath, 'utf8')
-  const credential = normalizeDesktopCredential(JSON.parse(raw) as Partial<DesktopConnection>)
-  if (credential.encryptedApiKey && !decryptApiKey(credential)) {
-    throw new Error('The primary provider credential cannot be decrypted on this device.')
-  }
-  if (credential.encryptedSearchApiKey && !decryptSearchApiKey(credential)) {
-    throw new Error('The primary search credential cannot be decrypted on this device.')
-  }
-  const now = new Date().toISOString()
-  const recoveryCredential: DesktopConnection = {
-    ...credential,
-    configAuthority: 'generated',
-    importTransactionId: '',
-    createdAt: now,
-    updatedAt: now,
-  }
-  await atomicWriteFile(profile.credentialPath, JSON.stringify(recoveryCredential, null, 2), 0o600)
-}
-
-async function createRecoveryProfile(copyPrimaryCredential: boolean): Promise<DesktopProfilePaths> {
-  const recoveryId = randomUUID()
-  const context = contextForProfile(app.getPath('userData'), 'recovery', recoveryId)
-  const profile = context.active
-  const recoveryRoot = join(app.getPath('userData'), 'recovery-profiles')
-  mkdirSync(recoveryRoot, { recursive: true, mode: 0o700 })
-  const rootInfo = lstatSync(recoveryRoot)
-  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) {
-    throw new Error('The recovery profile directory is not a safe local directory.')
-  }
-  const profileRoot = dirname(profile.home)
-  mkdirSync(profileRoot, { recursive: false, mode: 0o700 })
-  mkdirSync(profile.home, { recursive: false, mode: 0o700 })
-  mkdirSync(profile.logsDir, { recursive: false, mode: 0o700 })
-  if (copyPrimaryCredential) await copyPrimaryCredentialToRecovery(profile)
-  return profile
-}
-
-async function launchRecoveryProfile(
-  payload: { mode?: unknown; recoveryId?: unknown; copyPrimaryCredential?: unknown } | null,
-): Promise<DesktopProfilePaths> {
-  const mode = payload?.mode === 'continue'
-    ? 'continue'
-    : payload?.mode === 'create'
-      ? 'create'
-      : null
-  if (!mode) throw new Error('Choose whether to create or continue a recovery profile.')
-  let profile: DesktopProfilePaths
-  if (mode === 'create') {
-    profile = await createRecoveryProfile(payload?.copyPrimaryCredential === true)
-  } else {
-    const recoveryId = payload?.recoveryId
-    if (!isRecoveryProfileId(recoveryId)) throw new Error('Choose an existing recovery profile.')
-    const existing = allProfileContexts().find((item) => (
-      item.kind === 'recovery' && item.recoveryId === recoveryId
-    ))
-    if (!existing) throw new Error('The selected recovery profile is no longer available.')
-    profile = existing
-  }
-
-  await stopOwnedGatewayAndWait()
-  await selectDesktopProfile('recovery', profile.recoveryId)
-  clearReusableGatewayState()
-  recoveryInspection = null
-  bootError = null
-  await currentMainWindow()?.loadFile(bootPagePath()).catch(() => null)
-  void openOrResumeDesktopApp()
-  return profile
-}
-
-async function inspectPrimaryForReturn(): Promise<RecoveryProtocolResult> {
+async function inspectPrimaryForRepair(): Promise<RecoveryProtocolResult> {
   const inspection = await inspectDesktopProfile(primaryDesktopProfile())
   primaryRecoveryInspection = inspection
   return inspection
 }
 
-async function retryOrReturnPrimaryProfile(): Promise<RecoveryProtocolResult> {
-  const inspection = await inspectPrimaryForReturn()
-  if (inspection.outcome === 'recovery_required') {
-    recoveryInspection = inspection
-    publishRecoveryState()
-    return inspection
-  }
+async function retryDeferredProfileConsolidation(): Promise<{
+  ok: boolean
+  error?: string
+}> {
+  if (!desktopProfileConsolidationMaintenance) return { ok: true }
+  const exited = await stopAndJoinAllLifecycleOwnedGateways()
+  if (!exited) return { ok: false, error: desktopGatewayStillRunningMessage() }
 
-  await stopOwnedGatewayAndWait()
-  await selectDesktopProfile('primary')
+  desktopProfileConsolidationDeferredThisProcess = false
+  desktopProfileConsolidationMaintenance = null
+  desktopProfileConsolidationFailureDetail = ''
   clearReusableGatewayState()
-  recoveryInspection = inspection
   bootError = null
+  publishRecoveryState()
   await currentMainWindow()?.loadFile(bootPagePath()).catch(() => null)
   void openOrResumeDesktopApp()
-  return inspection
+  return { ok: true }
 }
 
 async function recoverPrimaryProfileTransaction(): Promise<RecoveryProtocolResult> {
   const primary = primaryDesktopProfile()
   let inspection = primaryRecoveryInspection
-  if (!inspection) inspection = await inspectPrimaryForReturn()
-  if (
-    !inspection.allowed_actions.includes('recover-transaction')
-    || !inspection.transaction_id
-  ) {
-    throw new Error('The interrupted profile operation cannot be recovered automatically.')
-  }
+  if (!inspection) inspection = await inspectPrimaryForRepair()
 
   await stopOwnedGatewayAndWait()
-  const result = await runRecoveryCli(primary, [
-    'recover-transaction',
-    '--home', primary.home,
-    '--transaction-id', inspection.transaction_id,
-    '--expected-revision', String(inspection.revision),
-    '--json',
-  ])
+  const result = await recoverInspectedProfileTransaction(primary, inspection)
   primaryRecoveryInspection = result
   recoveryInspection = result
   if (result.outcome !== 'recovery_required') {
-    await selectDesktopProfile('primary')
     clearReusableGatewayState()
     bootError = null
     await currentMainWindow()?.loadFile(bootPagePath()).catch(() => null)
@@ -9930,7 +12034,7 @@ async function abandonActiveCleanupTransaction(): Promise<RecoveryProtocolResult
   // cached transaction/revision.
   inspection = await inspectDesktopProfile(profile)
   recoveryInspection = inspection
-  if (profile.kind === 'primary') primaryRecoveryInspection = inspection
+  primaryRecoveryInspection = inspection
   publishRecoveryState()
   if (
     inspection.stable_code !== 'cleanup_transaction_incomplete'
@@ -9943,24 +12047,15 @@ async function abandonActiveCleanupTransaction(): Promise<RecoveryProtocolResult
     'abandon-cleanup',
     '--user-data', app.getPath('userData'),
     '--home', profile.home,
-    '--profile-kind', profileKindEnvironment(profile.kind),
+    '--profile-kind', 'desktop-primary',
     '--transaction-id', inspection.transaction_id,
     '--expected-revision', String(inspection.revision),
     '--json',
   ])
   recoveryInspection = result
-  if (profile.kind === 'primary') primaryRecoveryInspection = result
+  primaryRecoveryInspection = result
   publishRecoveryState()
   if (result.outcome !== 'recovery_required') {
-    if (!existsSync(desktopProfileContextPath(app.getPath('userData')))) {
-      await updateDesktopProfileContext((current) => contextForProfile(
-        app.getPath('userData'),
-        profile.kind,
-        profile.recoveryId,
-        new Date().toISOString(),
-        current.persisted.attention_acknowledgement,
-      ))
-    }
     clearReusableGatewayState()
     bootError = null
     await currentMainWindow()?.loadFile(bootPagePath()).catch(() => null)
@@ -9971,10 +12066,11 @@ async function abandonActiveCleanupTransaction(): Promise<RecoveryProtocolResult
 
 async function choosePrimaryWorkspace(
   requestedWorkspace: unknown,
+  presentation: 'workspace' | 'legacy-agent-data' = 'workspace',
 ): Promise<RecoveryProtocolResult> {
   const primary = primaryDesktopProfile()
   let inspection = primaryRecoveryInspection
-  if (!inspection) inspection = await inspectPrimaryForReturn()
+  if (!inspection) inspection = await inspectPrimaryForRepair()
 
   let workspace = ''
   if (typeof requestedWorkspace === 'string' && requestedWorkspace) {
@@ -9984,23 +12080,35 @@ async function choosePrimaryWorkspace(
       && item.exists
       && item.valid
     ))
-    if (!candidate) throw new Error('The selected workspace is not an inspected valid candidate.')
+    if (!candidate) {
+      throw new Error(presentation === 'legacy-agent-data'
+        ? 'The selected Agent data location is not an inspected valid candidate.'
+        : 'The selected workspace is not an inspected valid candidate.')
+    }
     workspace = candidate.path
   } else {
     const window = currentMainWindow()
     const options: Electron.OpenDialogOptions = {
-      title: 'Choose an OpenSquilla workspace',
+      title: presentation === 'legacy-agent-data'
+        ? 'Choose legacy OpenSquilla Agent data'
+        : 'Choose an OpenSquilla workspace',
       properties: ['openDirectory'],
     }
     const choice = window
       ? await dialog.showOpenDialog(window, options)
       : await dialog.showOpenDialog(options)
     if (choice.canceled || choice.filePaths.length !== 1) {
-      throw new Error('Workspace selection was cancelled.')
+      throw new Error(presentation === 'legacy-agent-data'
+        ? 'Agent data location selection was cancelled.'
+        : 'Workspace selection was cancelled.')
     }
     workspace = choice.filePaths[0] || ''
   }
-  if (!workspace) throw new Error('Choose a workspace directory.')
+  if (!workspace) {
+    throw new Error(presentation === 'legacy-agent-data'
+      ? 'Choose an Agent data directory.'
+      : 'Choose a workspace directory.')
+  }
   if (!inspection.transaction_id) {
     throw new Error('Recovery inspection did not provide a transaction id.')
   }
@@ -10017,7 +12125,6 @@ async function choosePrimaryWorkspace(
   primaryRecoveryInspection = result
   recoveryInspection = result
   if (result.outcome !== 'recovery_required') {
-    await selectDesktopProfile('primary')
     clearReusableGatewayState()
     bootError = null
     await currentMainWindow()?.loadFile(bootPagePath()).catch(() => null)
@@ -10028,6 +12135,12 @@ async function choosePrimaryWorkspace(
 }
 
 ipcMain.handle('desktop:recovery:state', () => recoveryStateSnapshot())
+ipcMain.handle('desktop:recovery:retry-consolidation', async (event) => {
+  if (!trustedControlUiIpc(event)) {
+    return { ok: false, error: 'Automatic repair is available only inside OpenSquilla.' }
+  }
+  return await retryDeferredProfileConsolidation()
+})
 ipcMain.handle('desktop:recovery:choose-workspace', async (
   event,
   payload?: { workspace?: unknown },
@@ -10036,6 +12149,28 @@ ipcMain.handle('desktop:recovery:choose-workspace', async (
     return { ok: false, error: 'Recovery actions are available only from the recovery page.' }
   }
   return withRecoveryOperation(() => choosePrimaryWorkspace(payload?.workspace))
+})
+ipcMain.handle('desktop:recovery:choose-legacy-agent-data', async (
+  event,
+  payload?: { workspace?: unknown },
+) => {
+  const inspection = recoveryInspection
+  if (
+    !trustedControlUiIpc(event)
+    || inspection?.outcome !== 'attention'
+    || ![
+      'legacy_workspace_pinned',
+      'legacy_workspace_deferred',
+      'workspace_conflict',
+    ].includes(inspection.stable_code)
+    || !inspection.allowed_actions.includes('choose-workspace')
+  ) {
+    return { ok: false, error: 'No legacy Agent data location can be selected from this page.' }
+  }
+  return withRecoveryOperation(() => choosePrimaryWorkspace(
+    payload?.workspace,
+    'legacy-agent-data',
+  ))
 })
 ipcMain.handle('desktop:recovery:recover-transaction', async (event) => {
   if (!trustedRecoveryIpc(event)) {
@@ -10049,37 +12184,14 @@ ipcMain.handle('desktop:recovery:abandon-cleanup', async (event) => {
   }
   return withRecoveryOperation(abandonActiveCleanupTransaction)
 })
-ipcMain.handle('desktop:recovery:launch-safe', async (
-  event,
-  payload?: { mode?: unknown; recoveryId?: unknown; copyPrimaryCredential?: unknown },
-) => {
-  if (!trustedRecoveryIpc(event)) {
-    return { ok: false, error: 'Recovery actions are available only from the recovery page.' }
-  }
-  return withRecoveryOperation(() => launchRecoveryProfile(payload || null))
-})
-ipcMain.handle('desktop:recovery:retry-primary', async (event) => {
-  if (!trustedRecoveryIpc(event)) {
-    return { ok: false, error: 'Recovery actions are available only from the recovery page.' }
-  }
-  return withRecoveryOperation(retryOrReturnPrimaryProfile)
-})
-ipcMain.handle('desktop:recovery:return-primary', async (event) => {
-  if (!trustedRecoveryIpc(event)) {
-    return { ok: false, error: 'Recovery actions are available only from the recovery page.' }
-  }
-  return withRecoveryOperation(retryOrReturnPrimaryProfile)
-})
 ipcMain.handle('desktop:recovery:reveal-path', async (
   event,
   payload?: { target?: unknown },
 ) => {
   if (!trustedRecoveryIpc(event)) return false
-  const target = payload?.target === 'active'
-    ? activeDesktopProfile().home
-    : payload?.target === 'backups'
-      ? app.getPath('userData')
-      : primaryDesktopProfile().home
+  const target = payload?.target === 'backups'
+    ? app.getPath('userData')
+    : primaryDesktopProfile().home
   if (existsSync(target)) await shell.showItemInFolder(target)
   else await shell.openPath(dirname(target)).catch(() => null)
   return true
@@ -10108,13 +12220,22 @@ ipcMain.handle('desktop:boot:retry', async () => {
   }
 
   // Otherwise force a real runtime restart. "Restart runtime" must relaunch the
-  // child even when the current gateway is healthy, so always tear an owned
-  // gateway down and wait for it to release its port + PID lock before
-  // openOrResumeDesktopApp respawns it — never reuse the existing one here.
-  if (gatewayProcess && gatewayState.owned) {
-    const previousChild = gatewayProcess
-    stopGateway()
-    await waitForGatewayProcessExit(previousChild)
+  // child even when the current gateway is healthy, so join every lifecycle-
+  // owned child before openOrResumeDesktopApp may respawn. This includes a
+  // child whose stop was already initiated by another flow. Timeout fails
+  // closed: spawning while any previous writer is live would race the profile
+  // lock and recreate the startup failure this recovery action is meant to fix.
+  const exited = await stopAndJoinAllLifecycleOwnedGateways()
+  if (!exited) {
+    const message = desktopGatewayStillRunningMessage()
+    gatewayState.status = 'error'
+    gatewayState.error = message
+    desktopLog('gateway_restart_wait_timeout', {
+      pids: liveLifecycleOwnedGatewayProcesses().map((child) => child.pid),
+    })
+    sendBootError(message)
+    await restoreMainWindowToBootPage()
+    return { ok: false, error: message }
   }
   clearReusableGatewayState()
   bootError = null
@@ -10138,6 +12259,26 @@ ipcMain.handle('desktop:onboarding:defaults', () => ({
     profiles: ROUTER_PROFILES,
   },
 }))
+ipcMain.handle('desktop:onboarding:probe', async (event, payload: OnboardingProbePayload) => {
+  if (!resolveOnboarding || !trustedOnboardingIpc(event)) {
+    return {
+      ok: false,
+      failureKind: 'unavailable',
+      message: 'No trusted onboarding is in progress.',
+      latencyMs: 0,
+    } satisfies OnboardingProbeResult
+  }
+  try {
+    return await probeOnboardingProvider(payload || {})
+  } catch (error) {
+    return {
+      ok: false,
+      failureKind: 'unavailable',
+      message: error instanceof Error ? error.message : 'Configuration verification failed.',
+      latencyMs: 0,
+    } satisfies OnboardingProbeResult
+  }
+})
 ipcMain.handle('desktop:onboarding:save', async (event, payload: OnboardingPayload) => {
   // Only honor this while an onboarding flow is actually awaiting a result. The
   // same preload bridge is attached to the Control UI window, so without this
@@ -10146,10 +12287,7 @@ ipcMain.handle('desktop:onboarding:save', async (event, payload: OnboardingPaylo
   if (!resolveOnboarding || !trustedOnboardingIpc(event)) {
     return { ok: false, error: 'No trusted onboarding is in progress.' }
   }
-  if (
-    activeDesktopProfile().kind === 'primary'
-    && await refreshPrimaryRecoveryAfterImportAttempt()
-  ) {
+  if (await refreshPrimaryRecoveryAfterImportAttempt()) {
     return {
       ok: false,
       error: 'The primary profile requires recovery before setup can write to it.',
@@ -10195,236 +12333,103 @@ ipcMain.handle('desktop:onboarding:cancel', () => {
   app.quit()
   return { ok: true }
 })
-function onboardingPortableTransferError(): string | null {
-  if (process.platform !== 'win32') {
-    return 'Windows Portable transfer is available only in the Windows Desktop app.'
-  }
-  if (activeDesktopProfile().kind !== 'primary') {
-    return 'Recovery profiles cannot copy another profile.'
-  }
-  if (
-    recoveryInspection?.outcome !== 'ready'
-    || recoveryInspection.stable_code !== 'fresh_profile'
-  ) {
-    return 'This Desktop profile is no longer empty. Finish setup, then use Settings to transfer data.'
-  }
-  if (onboardingMigrationCandidates.some((candidate) => candidate.kind !== 'windows-portable')) {
-    return 'Only legacy Windows Portable data can be copied during first setup.'
-  }
-  return null
-}
-
-function onboardingTargetNotEmptyError(
-  report: Record<string, unknown> | null,
-  raw = '',
-): string | null {
-  const blockedByReport = report !== null
-    && migrationReportErrors(report).some((item) => item.kind === 'preflight/target')
-  const blockedBeforeReport = raw.includes('target home contains real data;')
-  return blockedByReport || blockedBeforeReport
-    ? 'This Desktop profile is no longer empty. Finish setup, then use Settings to transfer data safely.'
-    : null
-}
-
-ipcMain.handle('desktop:onboarding:migrate:browse', async (event) => {
-  if (!resolveOnboarding || !trustedOnboardingIpc(event)) {
-    return { ok: false, error: 'No trusted Portable copy is in progress.' }
-  }
-  const guardError = onboardingPortableTransferError()
-  if (guardError) return { ok: false, error: guardError }
-  const window = currentOnboardingWindow()
-  const choice = window
-    ? await dialog.showOpenDialog(window, {
-        title: 'Choose legacy Windows Portable data',
-        properties: ['openDirectory'],
-      })
-    : { canceled: true, filePaths: [] }
-  if (choice.canceled || choice.filePaths.length !== 1) return { ok: false, aborted: true }
-  const path = choice.filePaths[0] || ''
-  if (!path || !looksLikeOpenSquillaHome(path) || resolvedPathsEqual(path, primaryDesktopHome())) {
-    return { ok: false, error: 'Choose a plain legacy Windows Portable data directory.' }
-  }
-  const candidate = await inspectLegacyImportCandidate(
-    legacyImportCandidate('windows-portable', path),
-  )
-  const existing = onboardingMigrationCandidates.findIndex((value) => (
-    resolvedPathsEqual(value.path, candidate.path)
-  ))
-  if (existing >= 0) onboardingMigrationCandidates[existing] = candidate
-  else onboardingMigrationCandidates.push(candidate)
-  onboardingMigrationCandidate = candidate
-  onboardingMigrationPreviewApprovedAt = 0
-  return { ok: true, candidate }
-})
-
-ipcMain.handle('desktop:onboarding:migrate:select', (event, payload?: { source?: unknown }) => {
-  if (!resolveOnboarding || !trustedOnboardingIpc(event)) {
-    return { ok: false, error: 'No trusted Portable copy is in progress.' }
-  }
-  const guardError = onboardingPortableTransferError()
-  if (guardError) return { ok: false, error: guardError }
-  const source = typeof payload?.source === 'string' ? payload.source : ''
-  const candidate = onboardingMigrationCandidates.find((value) => (
-    value.kind === 'windows-portable' && value.path === source
-  )) || null
-  onboardingMigrationCandidate = candidate
-  onboardingMigrationPreviewApprovedAt = 0
-  return candidate
-    ? { ok: true, candidate }
-    : { ok: false, error: 'Choose one of the inspected OpenSquilla profiles.' }
-})
-
-ipcMain.handle('desktop:onboarding:migrate:preview', async (event) => {
-  // Same guard as desktop:onboarding:save: the preload bridge is also attached
-  // to the Control UI window, so these only respond while onboarding awaits.
-  // The source path/kind come from the main process's own detection, never
-  // from the renderer.
-  if (!resolveOnboarding || !trustedOnboardingIpc(event)) {
-    return { ok: false, error: 'No trusted Portable copy is in progress.' }
-  }
-  const guardError = onboardingPortableTransferError()
-  if (guardError) return { ok: false, error: guardError }
-  const candidate = onboardingMigrationCandidate
-  if (!candidate || candidate.kind !== 'windows-portable') {
-    return { ok: false, error: 'No legacy Windows Portable data was selected.' }
-  }
-  onboardingMigrationPreviewApprovedAt = 0
-  publishDesktopMigrationProgress('preview')
-  const { report, raw } = await migrateSummaryJson([
-    '--source', candidate.path, '--kind', candidate.kind,
-  ])
-  const validationError = migrationReportValidationError(report, {
-    source: candidate.path,
-    sourceKind: candidate.kind,
-    target: primaryDesktopHome(),
-    apply: false,
-  })
-  const targetNotEmptyError = onboardingTargetNotEmptyError(report, raw)
-  const approved = report !== null
-    && validationError === null
-    && migrationReportErrors(report).length === 0
-  if (approved) {
-    onboardingMigrationPreviewApprovedAt = Date.now()
-  }
-  const detail = validationError || targetNotEmptyError || undefined
-  publishDesktopMigrationProgress(approved ? 'done' : 'error', detail)
-  return validationError
-    ? { ok: false, report: null, raw: validationError }
-    : {
-        ok: approved,
-        report,
-        raw,
-        ...(targetNotEmptyError ? { error: targetNotEmptyError } : {}),
-      }
-})
-ipcMain.handle('desktop:onboarding:migrate:apply', async (event) => {
-  if (!resolveOnboarding || !trustedOnboardingIpc(event)) {
-    return { ok: false, error: 'No trusted Portable copy is in progress.' }
-  }
-  const guardError = onboardingPortableTransferError()
-  if (guardError) return { ok: false, error: guardError }
-  const candidate = onboardingMigrationCandidate
-  if (!candidate || candidate.kind !== 'windows-portable') {
-    return { ok: false, error: 'No legacy Windows Portable data was selected.' }
-  }
-  if (
-    !onboardingMigrationPreviewApprovedAt
-    || Date.now() - onboardingMigrationPreviewApprovedAt > DESKTOP_MIGRATION_PREVIEW_TTL_MS
-  ) {
-    onboardingMigrationPreviewApprovedAt = 0
-    return { ok: false, error: 'Review the Portable data again before copying it.' }
-  }
-  onboardingMigrationPreviewApprovedAt = 0
-  const exclusive = desktopWriters.tryBeginExclusive('onboarding complete profile import')
-  if (!exclusive) {
-    return { ok: false, error: 'Another profile operation, update, or quit is already in progress.' }
-  }
-  try {
-    await waitForDesktopWriterOperations(1)
-  // Onboarding runs before the first gateway spawn, so there is nothing to
-  // quiesce here — the import lands before boot creates sessions.db and before
-  // scheduler jobs (imported paused) are scanned.
-  publishDesktopMigrationProgress('applying')
-  let intent: PendingMigrationProviderSetup | null = null
-  try {
-    intent = await beginMigrationReconciliationIntent(candidate)
-    const result = await migrateSummaryJson([
-      '--source', candidate.path, '--kind', candidate.kind, '--apply',
-    ], true)
-    const validationError = migrationReportValidationError(result.report, {
-      source: candidate.path,
-      sourceKind: candidate.kind,
-      target: primaryDesktopHome(),
-      apply: true,
-    })
-    const receipt = await findAppliedReceiptForIntent(
-      intent,
-      migrationTransactionIdFromReport(result.report),
-    )
-    if (!receipt) {
-      await clearPendingMigrationProviderSetup()
-      const detail = onboardingTargetNotEmptyError(result.report, result.raw)
-        || validationError
-        || result.raw
-        || 'Copy did not publish a valid receipt.'
-      const recoveryRequired = await refreshPrimaryRecoveryAfterImportAttempt()
-      publishDesktopMigrationProgress('error', detail)
-      return { ok: false, error: detail, report: result.report, raw: detail, prefill: null, recoveryRequired }
-    }
-
-    intent = await bindMigrationIntentToReceipt(intent, receipt)
-    intent = await prepareImportedCredentialBackup(intent)
-    const prefill = migrationProviderPrefill(intent)
-    await writePendingMigrationProviderSetup(prefill, intent)
-    const outputVerified = result.ok
-      && result.report !== null
-      && validationError === null
-      && migrationReportErrors(result.report).length === 0
-    // The target-side receipt is the crash-safe publication authority. If the
-    // child lost stdout after commit, continue onboarding from that validated
-    // receipt rather than offering a destructive retry against imported data.
-    publishDesktopMigrationProgress('done')
-    return {
-      ok: true,
-      report: outputVerified ? result.report : receipt.report,
-      raw: outputVerified ? result.raw : (validationError || result.raw),
-      prefill,
-    }
-  } catch (error) {
-    const rawDetail = error instanceof Error ? error.message : String(error)
-    const detail = onboardingTargetNotEmptyError(null, rawDetail) || rawDetail
-    if (intent) {
-      const receipt = await findAppliedReceiptForIntent(intent).catch(() => null)
-      if (receipt) {
-        intent = await bindMigrationIntentToReceipt(intent, receipt)
-        intent = await prepareImportedCredentialBackup(intent)
-        const prefill = migrationProviderPrefill(intent)
-        await writePendingMigrationProviderSetup(prefill, intent)
-        publishDesktopMigrationProgress('done')
-        return { ok: true, report: receipt.report, raw: detail, prefill }
-      }
-      await clearPendingMigrationProviderSetup().catch(() => null)
-    }
-    const recoveryRequired = await refreshPrimaryRecoveryAfterImportAttempt()
-    publishDesktopMigrationProgress('error', detail)
-    return { ok: false, error: detail, report: null, raw: detail, prefill: null, recoveryRequired }
-  }
-  } finally {
-    exclusive.finish()
-    desktopWriters.reopen(exclusive.admissionToken)
-  }
-})
-
-// Set once the Windows graceful-drain-on-quit sequence has run so the re-issued
-// quit (after app.exit is deferred) is not intercepted a second time.
-let windowsQuitDrainDone = false
+// Keep the normal app-quit gateway drain single-flight. Every supported
+// platform must keep Electron alive until its owned child has actually exited;
+// otherwise a slow POSIX SIGTERM drain can outlive the parent and retain the
+// profile writer lock across the next Desktop launch.
+let quitGatewayDrainPromise: Promise<boolean> | null = null
 let quitDeferredForDesktopWriters = false
 let quitWriterAdmission: symbol | null = null
 
+async function drainOwnedGatewayForQuit(
+  child: ChildProcessWithoutNullStreams,
+  url: string,
+  requestShutdown: boolean,
+): Promise<boolean> {
+  if (hasGatewayProcessExited(child)) return true
+  const accepted = requestShutdown ? await requestOwnedGatewayShutdown(child, url) : null
+  desktopLog('quit_gateway_shutdown_requested', { accepted, alreadyStopping: !requestShutdown })
+  let hardTerminated = false
+  let exited = false
+  if (accepted === null) {
+    // Another lifecycle operation already initiated the full graceful stop.
+    // Join it instead of issuing a second request against a possibly replaced
+    // ownership record or shortening its drain deadline.
+    exited = await waitForGatewayProcessExit(child)
+  } else if (!accepted) {
+    hardTerminated = true
+    // POSIX SIGTERM is itself the graceful shutdown trigger and must retain the
+    // full gateway drain budget. Windows TerminateProcess is immediate, so only
+    // that platform uses the short observation backstop here.
+    const signalBackstop = process.platform === 'win32'
+      ? GATEWAY_HARD_KILL_BACKSTOP_MS
+      : GATEWAY_SHUTDOWN_KILL_AFTER_MS
+    hardTerminateGatewayProcess(child, signalBackstop)
+    exited = await waitForGatewayProcessExit(child, signalBackstop + 1_000)
+    if (process.platform === 'win32') await clearKnownOwnedGatewayPidFile()
+  } else {
+    exited = await waitForGatewayProcessExit(child)
+    if (!exited) {
+      hardTerminated = true
+      hardTerminateGatewayProcess(child)
+      exited = await waitForGatewayProcessExit(
+        child,
+        GATEWAY_HARD_KILL_BACKSTOP_MS + 1_000,
+      )
+      if (process.platform === 'win32') await clearKnownOwnedGatewayPidFile()
+    }
+  }
+  // hardTerminateGatewayProcess schedules SIGKILL at the backstop. In case the
+  // exit event is delayed past that timer, issue one final tree-aware SIGKILL
+  // and wait again before allowing the Electron parent to disappear.
+  if (!exited && !hasGatewayProcessExited(child)) {
+    terminateGatewayProcess(child, 'SIGKILL')
+    exited = await waitForGatewayProcessExit(child, GATEWAY_HARD_KILL_BACKSTOP_MS)
+  }
+  desktopLog('quit_gateway_exit', { exited, hardTerminated })
+  return exited || hasGatewayProcessExited(child)
+}
+
 app.on('before-quit', (event) => {
   desktopUpdateCheckScheduler.stop()
+  artifactPreviewLeaseBroker.clear()
+  // Remove native child views immediately so they cannot outlive the trusted
+  // Control UI while the gateway/writer shutdown drain keeps Electron alive.
+  void nativeWorkbenchSurfaces.destroyAll()
+  // Windows session shutdown cannot wait on our normal asynchronous quit
+  // drain. Let the OS-owned close proceed and synchronously signal the current
+  // child so the window can never be converted back into background mode.
+  if (systemSessionEnding) {
+    isQuitting = true
+    setAppExitPhase('committed', 'Windows session ending')
+    destroyWindowsTray()
+    stopGateway()
+    return
+  }
+  // An updater drain owns the lifecycle until every writer and gateway has
+  // exited. A user Quit or repeated signal during this phase is remembered and
+  // resumed if the update cannot hand off. Only quitAndInstall's synchronous
+  // handoff is allowed through this guard.
+  if (updateApplying) {
+    if (updateInstallHandoffReady) {
+      setAppExitPhase('committed', 'desktop updater owns exit')
+      destroyWindowsTray()
+      return
+    }
+    event.preventDefault()
+    setAppExitPhase('deferred', 'waiting for desktop update handoff')
+    quitRequestedDuringUpdateDrain = true
+    desktopLog('quit_deferred_for_update_drain')
+    return
+  }
+  if (quitGatewayDrainPromise) {
+    event.preventDefault()
+    setAppExitPhase('draining', 'Gateway quit drain already in progress')
+    return
+  }
   if (desktopWriters.activeCount > 0 || quitDeferredForDesktopWriters) {
     event.preventDefault()
+    setAppExitPhase('deferred', 'waiting for desktop writers')
     if (!quitDeferredForDesktopWriters) {
       quitDeferredForDesktopWriters = true
       quitWriterAdmission ??= desktopWriters.close('quit')
@@ -10440,72 +12445,95 @@ app.on('before-quit', (event) => {
     return
   }
   quitWriterAdmission ??= desktopWriters.close('quit')
-  desktopLog('before_quit', { platform: process.platform, drained: windowsQuitDrainDone })
+  desktopLog('before_quit', {
+    platform: process.platform,
+    gatewayDrainInFlight: quitGatewayDrainPromise !== null,
+  })
   isQuitting = true
-  // On Windows there is no real SIGTERM, so the normal close path would
-  // TerminateProcess the gateway with no drain (unlike the update/uninstall
-  // paths which already wait for a graceful exit). Give the daily close path the
-  // same graceful drain: defer the quit once, ask the gateway to shut down over
-  // HTTP, wait for the child to exit (bounded), then exit for real. Fall back to
-  // a hard terminate on timeout via stopGateway's own backstop.
-  if (
-    process.platform === 'win32' &&
-    !windowsQuitDrainDone &&
-    gatewayProcess &&
-    gatewayState.owned &&
-    !hasGatewayProcessExited(gatewayProcess)
-  ) {
+  // Defer the normal quit on every platform until every lifecycle-owned child
+  // has exited. This includes a child already draining for restart, recovery,
+  // cleanup, or update after stopGateway cleared the current process slot.
+  const currentChild = gatewayProcess && gatewayState.owned
+    && !hasGatewayProcessExited(gatewayProcess)
+    ? gatewayProcess
+    : null
+  const children = liveLifecycleOwnedGatewayProcesses()
+  if (children.length > 0) {
     event.preventDefault()
-    const child = gatewayProcess
-    void (async () => {
-      try {
-        const accepted = await requestGatewayShutdown(gatewayState.url || '')
-        desktopLog('quit_gateway_shutdown_requested', { accepted })
-        let hardTerminated = false
-        let exited = false
-        if (!accepted) {
-          hardTerminated = true
-          hardTerminateGatewayProcess(child)
-          exited = await waitForGatewayProcessExit(child, GATEWAY_HARD_KILL_BACKSTOP_MS)
-          await clearKnownOwnedGatewayPidFile()
-        } else {
-          exited = await waitForGatewayProcessExit(child)
-          if (!exited) {
-            hardTerminated = true
-            hardTerminateGatewayProcess(child)
-            exited = await waitForGatewayProcessExit(child, GATEWAY_HARD_KILL_BACKSTOP_MS)
-            await clearKnownOwnedGatewayPidFile()
-          }
-        }
-        desktopLog('quit_gateway_exit', { exited, hardTerminated })
-      } finally {
-        windowsQuitDrainDone = true
+    setAppExitPhase('draining', 'stopping lifecycle-owned Gateway')
+    const drain = Promise.all(children.map((child) => drainOwnedGatewayForQuit(
+      child,
+      currentChild === child ? gatewayState.url || '' : '',
+      currentChild === child,
+    )))
+      .then((results) => results.every(Boolean))
+      .catch((error) => {
+        desktopLog('quit_gateway_drain_failed', {
+          error: error instanceof Error ? error.message : String(error),
+        })
+        return false
+      })
+    quitGatewayDrainPromise = drain
+    void drain.then((exited) => {
+      if (exited) {
+        setAppExitPhase('committed', 'all lifecycle-owned Gateways exited')
+        destroyWindowsTray()
         app.exit(0)
+        return
       }
-    })()
+      // Fail closed: keep Electron alive while a child we own is still live.
+      // A later Quit retries the same exact handles; it never guesses via a PID
+      // file, occupied port, or health response.
+      quitGatewayDrainPromise = null
+      isQuitting = false
+      setAppExitPhase('running', 'Gateway quit drain failed safely')
+      if (quitWriterAdmission) {
+        desktopWriters.reopen(quitWriterAdmission)
+        quitWriterAdmission = null
+      }
+      desktopLog('quit_gateway_still_running', {
+        pids: liveLifecycleOwnedGatewayProcesses().map((child) => child.pid),
+      })
+      dialog.showErrorBox(
+        'OpenSquilla could not quit safely',
+        'The local Gateway is still shutting down. OpenSquilla stayed open to avoid leaving a background process; try Quit again.',
+      )
+    })
     return
   }
+  setAppExitPhase('committed', 'no lifecycle-owned Gateway remains')
+  destroyWindowsTray()
   stopGateway()
 })
 
 function shutdownFromSignal(): void {
   isQuitting = true
-  stopGateway()
+  // before-quit owns the child handle until its single-flight drain finishes.
+  // Clearing it here would recreate the orphaned-gateway race on SIGINT/SIGTERM.
   app.quit()
 }
 
-process.once('SIGINT', shutdownFromSignal)
-process.once('SIGTERM', shutdownFromSignal)
+// Keep repeated signals inside the same idempotent before-quit drain. Using
+// once() would restore Node's default termination behavior after the first
+// signal and let a second Ctrl-C/SIGTERM orphan the Gateway.
+process.on('SIGINT', shutdownFromSignal)
+process.on('SIGTERM', shutdownFromSignal)
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
 })
 
 app.on('activate', () => {
-  void openOrResumeDesktopApp()
+  revealDesktopApp()
 })
 
+app.on('will-quit', destroyWindowsTray)
+
 configureChromiumKeychainPolicy()
+
+const initialDesktopDeepLinkArguments = process.platform === 'win32'
+  ? desktopDeepLinkArguments(process.argv)
+  : []
 
 // Bounded retry for the single-instance lock. A relaunch immediately after
 // closing the previous instance can race that instance's teardown (Electron
@@ -10527,6 +12555,14 @@ function acquireSingleInstanceLockWithRetry(): boolean {
       desktopLog('single_instance_lock_acquired', { attempt })
       return true
     }
+    // A Windows protocol launch targets the current instance and does not need
+    // the normal close/relaunch race retry. The failed lock request has already
+    // delivered its command line through second-instance; exit the forwarding
+    // process immediately instead of sending the same deep link for five seconds.
+    if (initialDesktopDeepLinkArguments.length > 0) {
+      desktopLog('single_instance_deep_link_forwarded', { attempt })
+      return false
+    }
     const remaining = deadline - Date.now()
     if (remaining <= 0) {
       desktopLog('single_instance_lock_unavailable', { attempt })
@@ -10536,6 +12572,11 @@ function acquireSingleInstanceLockWithRetry(): boolean {
   }
 }
 
+app.on('open-url', (event, rawUrl) => {
+  event.preventDefault()
+  handleDeepLink(rawUrl, 'open-url')
+})
+
 desktopLog('launch', { platform: process.platform, argv: process.argv.length })
 const gotSingleInstanceLock = acquireSingleInstanceLockWithRetry()
 
@@ -10544,34 +12585,47 @@ if (!gotSingleInstanceLock) {
   // to surface its window (the second-instance handler calls
   // openOrResumeDesktopApp), show an explicit dialog so the launch is never a
   // silent no-op, then quit.
-  desktopLog('launch_aborted_lock_held')
-  try {
-    // This runs before app.whenReady, so app.getLocale() is unreliable; fall back
-    // to the persisted onboarding locale (a plain file read) for this dialog.
-    desktopLocale = loadPersistedDesktopLocale() ?? desktopLocale
-    dialog.showErrorBox(
-      desktopT('launch.alreadyRunningTitle'),
-      desktopT('launch.alreadyRunningMessage'),
-    )
-  } catch {
-    // Dialog is best-effort; the diagnostic log is the durable record.
+  desktopLog('launch_aborted_lock_held', {
+    deepLinkHandoff: initialDesktopDeepLinkArguments.length > 0,
+  })
+  if (initialDesktopDeepLinkArguments.length === 0) {
+    try {
+      // This runs before app.whenReady, so app.getLocale() is unreliable; fall back
+      // to the persisted onboarding locale (a plain file read) for this dialog.
+      desktopLocale = loadPersistedDesktopLocale() ?? desktopLocale
+      dialog.showErrorBox(
+        desktopT('launch.alreadyRunningTitle'),
+        desktopT('launch.alreadyRunningMessage'),
+      )
+    } catch {
+      // Dialog is best-effort; the diagnostic log is the durable record.
+    }
   }
   app.quit()
 } else {
-  app.on('second-instance', () => {
-    desktopLog('second_instance')
-    void openOrResumeDesktopApp()
+  if (process.platform === 'win32') {
+    handleDeepLinksFromCommandLine(process.argv, 'initial-argv')
+  }
+
+  app.on('second-instance', (_event, commandLine) => {
+    const hadDeepLink = handleDeepLinksFromCommandLine(commandLine, 'second-instance')
+    desktopLog('second_instance', { hadDeepLink })
+    if (hadDeepLink) return
+    revealDesktopApp()
   })
 
   void app.whenReady().then(async () => {
     app.name = 'OpenSquilla'
     desktopLocale = loadPersistedDesktopLocale() ?? resolveDesktopLocale()
     createApplicationMenu()
-    void openOrResumeDesktopApp()
+    createWindowsTray()
+    registerDesktopDeepLinkProtocolClient()
+    desktopDeepLinkActivationReady = true
+    if (!activatePendingDesktopDeepLink()) void openOrResumeDesktopApp()
     initAutoUpdater()
     if (mockUpdateVersion() !== null) {
       desktopUpdateCheckScheduler.start(MOCK_UPDATE_CHECK_INITIAL_DELAY_MS)
-    } else if (autoUpdateSupported()) {
+    } else if (desktopUpdateManaged()) {
       // Delay the silent startup check so it doesn't compete with gateway boot.
       desktopUpdateCheckScheduler.start(UPDATE_CHECK_INITIAL_DELAY_MS)
     }

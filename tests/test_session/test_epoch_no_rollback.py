@@ -116,6 +116,58 @@ async def test_direct_upsert_with_stale_epoch_preserves_db_epoch(storage):
     )
 
 
+@pytest.mark.asyncio
+async def test_upsert_session_generation_fence_does_not_recreate_deleted_row(storage):
+    key = "agent:main:generation-deleted"
+    stale = SessionNode(session_key=key, session_id="sid-old", display_name="Old")
+    await storage.upsert_session(stale)
+    await storage.delete_session(key)
+    stale.display_name = "Late title"
+
+    with pytest.raises(KeyError, match="Session generation changed"):
+        await storage.upsert_session(stale, expected_session_id=stale.session_id)
+
+    assert await storage.get_session(key) is None
+
+
+@pytest.mark.asyncio
+async def test_upsert_session_generation_fence_does_not_overwrite_reused_key(storage):
+    key = "agent:main:generation-reused"
+    stale = SessionNode(session_key=key, session_id="sid-old", display_name="Old")
+    await storage.upsert_session(stale)
+    await storage.delete_session(key)
+    current = SessionNode(session_key=key, session_id="sid-new", display_name="New")
+    await storage.upsert_session(current)
+    stale.display_name = "Late title"
+
+    with pytest.raises(KeyError, match="Session generation changed"):
+        await storage.upsert_session(stale, expected_session_id=stale.session_id)
+
+    persisted = await storage.get_session(key)
+    assert persisted is not None
+    assert persisted.session_id == current.session_id
+    assert persisted.display_name == "New"
+
+
+@pytest.mark.asyncio
+async def test_upsert_session_generation_fence_rejects_mismatched_payload(storage):
+    key = "agent:main:generation-payload-mismatch"
+    current = SessionNode(session_key=key, session_id="sid-current", display_name="Current")
+    await storage.upsert_session(current)
+    stale = SessionNode(session_key=key, session_id="sid-stale", display_name="Late title")
+
+    with pytest.raises(KeyError, match="Session generation changed"):
+        await storage.upsert_session(
+            stale,
+            expected_session_id=current.session_id,
+        )
+
+    persisted = await storage.get_session(key)
+    assert persisted is not None
+    assert persisted.session_id == current.session_id
+    assert persisted.display_name == "Current"
+
+
 # ── AC-R3-EPOCH-4 ─────────────────────────────────────────────────────────────
 
 

@@ -126,6 +126,45 @@ def test_awesome_webpage_meta_skill_loads_and_references_fixed_skills(tmp_path: 
     assert filesystem.metadata.requires.bins == []
 
 
+def test_webpage_skills_publish_only_the_dedicated_project_bundle() -> None:
+    fm = _frontmatter()
+    steps = {step["id"]: step for step in fm["composition"]["steps"]}
+    publish = steps["publish_webpage"]
+    project_root = (
+        "{{ inputs.get('config', {}).get('awesome_webpage', {}).get('output_dir') "
+        "or (inputs.workspace_dir ~ '/awesome-webpage-output') }}/"
+        "{{ outputs.project_slug | slugify }}/project"
+    )
+
+    assert publish["kind"] == "tool_call"
+    assert publish["tool"] == "publish_artifact"
+    assert publish["tool_allowlist"] == ["publish_artifact"]
+    assert publish["depends_on"] == ["quick_validate"]
+    assert publish["tool_args"] == {
+        "path": f"{project_root}/index.html",
+        "mime": "text/html",
+        "bundle": "directory",
+        "bundle_root": project_root,
+    }
+    assert steps["delivery_guide"]["depends_on"] == [
+        "quick_validate",
+        "publish_webpage",
+    ]
+    delivery_task = steps["delivery_guide"]["with"]["task"]
+    assert "outputs.publish_webpage | truncate(1500)" in delivery_task
+    assert "do not invent or print an artifact URL" in delivery_task
+
+    html_coder = (BUNDLED / "html-coder" / "SKILL.md").read_text(encoding="utf-8")
+    assert "## OpenSquilla Webpage Delivery" in html_coder
+    assert "never place a generated site directly in the\n   workspace root" in html_coder
+    assert '"path": "webpage-<topic-slug>/index.html"' in html_coder
+    assert '"bundle": "directory"' in html_coder
+    assert '"bundle_root": "webpage-<topic-slug>"' in html_coder
+    assert "Do not bundle the entire workspace." in html_coder
+    assert "source-only output" in html_coder
+    assert "AwesomeWebpageMetaSkill" in html_coder
+
+
 def test_audio_cog_is_openrouter_compatible_without_cellcog_key(
     tmp_path: Path, monkeypatch,
 ) -> None:
@@ -1559,6 +1598,7 @@ def test_awesome_webpage_rendered_steps_resolve_output_dir(tmp_path: Path) -> No
             "webpage_write",
             "media_bind_validate",
             "quick_validate",
+            "publish_webpage",
         ]
     }
 
@@ -1578,7 +1618,12 @@ def test_awesome_webpage_rendered_steps_resolve_output_dir(tmp_path: Path) -> No
         assert "/tmp/osq-workspace/awesome-webpage-output" not in text
 
     fm_steps = {step["id"]: step for step in _frontmatter()["composition"]["steps"]}
-    for step_id in ["media_assets_collect", "webpage_write", "media_bind_validate"]:
+    for step_id in [
+        "media_assets_collect",
+        "webpage_write",
+        "media_bind_validate",
+        "publish_webpage",
+    ]:
         rendered = render_with_args(
             fm_steps[step_id]["tool_args"],
             inputs=inputs,
@@ -1587,6 +1632,18 @@ def test_awesome_webpage_rendered_steps_resolve_output_dir(tmp_path: Path) -> No
         text = "\n".join(str(value) for value in rendered.values())
         assert "/tmp/custom-awesome-output" in text
         assert "/tmp/osq-workspace/awesome-webpage-output" not in text
+
+    rendered_publish = render_with_args(
+        fm_steps["publish_webpage"]["tool_args"],
+        inputs=inputs,
+        outputs=outputs,
+    )
+    assert rendered_publish == {
+        "path": "/tmp/custom-awesome-output/project_slug/project/index.html",
+        "mime": "text/html",
+        "bundle": "directory",
+        "bundle_root": "/tmp/custom-awesome-output/project_slug/project",
+    }
 
     for step_id in ["quick_validate", "delivery_guide"]:
         step = next(step for step in plan.steps if step.id == step_id)

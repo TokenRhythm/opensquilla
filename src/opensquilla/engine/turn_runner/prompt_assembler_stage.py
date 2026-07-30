@@ -22,13 +22,16 @@ future prompt-failure early-yield branch.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+from opensquilla.provider.protocol import configured_provider_id
 
 if TYPE_CHECKING:
     from opensquilla.engine.turn_runner.outcome import StageOutcome
     from opensquilla.observability.decision_log import PipelineStepRecord
     from opensquilla.observability.prompt_report import PromptReport
+    from opensquilla.provider.types import ProviderRequestCorrelation
     from opensquilla.tools.types import ToolContext
 
 # ---------------------------------------------------------------------------
@@ -74,6 +77,12 @@ class RunPipelineRequest:
     tool_context: ToolContext | None = None
     normalization_metadata: dict[str, Any] | None = None
     input_provenance: dict[str, Any] | str | None = None
+    skill_catalog: Any | None = None
+    usage_execution_context: Any | None = None
+    provider_request_correlation: ProviderRequestCorrelation | None = field(
+        default=None,
+        repr=False,
+    )
 
 # ---------------------------------------------------------------------------
 # Ports — narrow Protocols so the stage is unit-testable without the full
@@ -102,6 +111,7 @@ class PromptAssemblerPort(Protocol):
         prompt_metadata: dict[str, Any],
         bootstrap_context_mode: str | None,
         fresh_user_session: bool = False,
+        workspace_dir: str | None = None,
     ) -> str | tuple[str, str]: ...
 
 @runtime_checkable
@@ -240,6 +250,12 @@ class PromptAssemblerStageInput:
     ingress_pipeline_steps: list[PipelineStepRecord] | None = None
     normalization_metadata: dict[str, Any] | None = None
     input_provenance: dict[str, Any] | str | None = None
+    skill_catalog: Any | None = None
+    usage_execution_context: Any | None = None
+    provider_request_correlation: ProviderRequestCorrelation | None = field(
+        default=None,
+        repr=False,
+    )
 
 @dataclass(frozen=True)
 class PromptAssemblerStageOutput:
@@ -363,6 +379,7 @@ class PromptAssemblerStage:
             prompt_metadata=prompt_metadata,
             bootstrap_context_mode=inp.bootstrap_context_mode,
             fresh_user_session=inp.fresh_user_session,
+            workspace_dir=getattr(inp.effective_tool_context, "workspace_dir", None),
         )
 
         # 2. Fetch router context (transcript-driven)
@@ -432,6 +449,9 @@ class PromptAssemblerStage:
             tool_context=inp.effective_tool_context,
             normalization_metadata=inp.normalization_metadata,
             input_provenance=inp.input_provenance,
+            skill_catalog=inp.skill_catalog,
+            usage_execution_context=inp.usage_execution_context,
+            provider_request_correlation=inp.provider_request_correlation,
         )
         turn, provider = await self._pipeline_executor.run_pipeline(request)
 
@@ -506,9 +526,41 @@ class PromptAssemblerStage:
                 )
             except Exception:  # noqa: BLE001 - defensive
                 selector_model = ""
-        resolved_model = getattr(turn, "model", None) or inp.model or selector_model
+        # ``turn.model`` is the router's requested model.  When a
+        # cross-provider deployment cannot be resolved, apply_model_override
+        # deliberately keeps the selector on its primary deployment and
+        # records ``routed_provider_blocked``.  In that fail-closed branch the
+        # selector is authoritative for execution; letting the stale routed
+        # model win here would pair the primary provider with a foreign model
+        # id in AgentConfig and turn-call records.
+        if turn.metadata.get("routed_provider_blocked") and selector_model:
+            resolved_model = selector_model
+        else:
+            resolved_model = getattr(turn, "model", None) or inp.model or selector_model
+        # Turn-call records describe the configured deployment, not the
+        # generic adapter family.  A DashScope/DeepSeek deployment runs through
+        # OpenAIProvider and a MiniMax deployment may run through
+        # AnthropicProvider; attributing those as ``openai`` / ``anthropic``
+        # makes cross-provider execution evidence false even when routing was
+        # correct.  The cloned selector is authoritative for the active link;
+        # direct provider construction falls back to its additive provider_id.
+        selector_provider_id = ""
+        if inp.cloned_selector is not None:
+            selector_provider_id = str(
+                getattr(inp.cloned_selector, "active_provider_id", "") or ""
+            ).strip()
+            if not selector_provider_id:
+                try:
+                    selector_provider_id = str(
+                        getattr(inp.cloned_selector.current_config, "provider", "")
+                        or ""
+                    ).strip()
+                except Exception:  # noqa: BLE001 - telemetry fallback only
+                    selector_provider_id = ""
         provider_name = (
-            getattr(provider, "provider_name", "") or type(provider).__name__
+            selector_provider_id
+            or configured_provider_id(provider)
+            or type(provider).__name__
         )
 
         return StageOutcome.success(

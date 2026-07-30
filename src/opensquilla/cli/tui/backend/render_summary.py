@@ -136,6 +136,76 @@ def summarize_result(result: Any | None, *, max_chars: int = 220) -> str:
     return preview
 
 
+def tool_args_detail(args: dict[str, Any] | None) -> str:
+    """Return complete terminal-safe tool arguments for explicit disclosure.
+
+    Compact rows should continue to use :func:`summarize_args`; this payload is
+    the retained source shown only when the user expands process details.
+    """
+
+    if not args:
+        return ""
+    try:
+        rendered = json.dumps(
+            _terminal_safe_payload(args),
+            ensure_ascii=False,
+            indent=2,
+            default=lambda value: sanitize_terminal_text(str(value)),
+        )
+    except (TypeError, ValueError):
+        rendered = str(args)
+    return sanitize_terminal_text(rendered)
+
+
+def tool_result_detail(result: Any | None) -> str:
+    """Return the complete terminal-safe result payload without preview clipping."""
+
+    if result is None:
+        return ""
+    if isinstance(result, str):
+        rendered = result
+    else:
+        # Pure ``[{type: msg, msg: ...}, ...]`` streams are transport wrappers;
+        # show every payload in order.  A mixed list is serialized whole so a
+        # non-msg event can never disappear behind the convenience unwrap.
+        payloads: list[Any] | None = None
+        if isinstance(result, dict):
+            payload = _msg_event_payload(result)
+            payloads = [payload] if payload is not None else None
+        elif isinstance(result, list) and result:
+            candidates = [_msg_event_payload(item) for item in result]
+            if all(payload is not None for payload in candidates):
+                payloads = candidates
+        if payloads is not None:
+            rendered = "\n".join(_stringify_result_value(payload) for payload in payloads)
+        else:
+            try:
+                rendered = json.dumps(
+                    _terminal_safe_payload(result),
+                    ensure_ascii=False,
+                    indent=2,
+                    default=lambda value: sanitize_terminal_text(str(value)),
+                )
+            except (TypeError, ValueError):
+                rendered = str(result)
+    return sanitize_terminal_text(rendered)
+
+
+def _terminal_safe_payload(value: Any) -> Any:
+    """Recursively remove executable terminal controls before JSON escaping."""
+
+    if isinstance(value, str):
+        return sanitize_terminal_text(value)
+    if isinstance(value, dict):
+        return {
+            sanitize_terminal_text(str(key)): _terminal_safe_payload(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list | tuple):
+        return [_terminal_safe_payload(item) for item in value]
+    return value
+
+
 def sanitize_terminal_text(text: str) -> str:
     """Strip ANSI escape sequences and C0/C1 controls from preview text."""
     return _C0_RE.sub("", _ANSI_RE.sub("", text))

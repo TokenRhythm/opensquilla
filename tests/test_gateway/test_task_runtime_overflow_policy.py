@@ -13,10 +13,12 @@ Tests use ``max_concurrency=1`` plus a gating event so the running
 task stays running while the queue fills, isolating overflow behaviour
 from execution scheduling.
 """
+
 from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -166,6 +168,82 @@ async def test_drop_oldest_evicts_oldest_pending_and_accepts_new() -> None:
     # "second" is the only one that never reaches the handler.
     assert "second" not in seen_messages
     assert seen_messages == ["first", "third", "fourth"]
+
+
+@pytest.mark.asyncio
+async def test_drop_oldest_closes_evicted_input_disposition() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    context_updates: list[tuple[str, str, dict[str, Any]]] = []
+    events: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def slow_handler(run: Any) -> None:
+        if run.message == "first":
+            started.set()
+            await release.wait()
+
+    async def update_turn_context(
+        session_key: str,
+        message_id: str,
+        context: dict[str, Any],
+    ) -> bool:
+        context_updates.append((session_key, message_id, dict(context)))
+        return True
+
+    async def emit(session_key: str, name: str, payload: dict[str, Any]) -> None:
+        events.append((session_key, name, payload))
+
+    storage = _make_storage()
+    storage.update_transcript_turn_context = update_turn_context
+    rt = TaskRuntime(
+        storage=storage,
+        turn_handler=slow_handler,
+        event_emitter=emit,
+        max_concurrency=1,
+        max_pending_per_session=1,
+        pending_overflow_policy=PendingOverflowPolicy.DROP_OLDEST,
+    )
+    env = _make_envelope("agent-1::sess-drop-identity")
+    first = await rt.enqueue(env, "first")
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    victim_env = replace(
+        env,
+        metadata={"client_message_id": "client-victim", "surface_id": "tui:test"},
+    )
+    victim = await rt.enqueue(
+        victim_env,
+        "victim",
+        task_id="turn-overflow-victim",
+        persisted_user_message_id="message-overflow-victim",
+    )
+
+    replacement = await rt.enqueue(env, "replacement")
+    victim_record = await rt.wait(victim.task_id, timeout=2.0)
+    assert victim_record.status == AgentTaskStatus.CANCELLED
+    assert context_updates == [
+        (
+            env.session_key,
+            "message-overflow-victim",
+            {
+                "turn_id": victim.task_id,
+                "client_message_id": "client-victim",
+                "surface_id": "tui:test",
+                "intent": "send",
+                "disposition": "cancelled",
+                "revision": 2,
+            },
+        )
+    ]
+    disposition = next(
+        payload for _session, name, payload in events if name == "session.event.input_disposition"
+    )
+    assert disposition["turn_id"] == victim.task_id
+    assert disposition["disposition"] == "cancelled"
+    assert disposition["terminal_reason"] == "dropped_by_overflow"
+
+    release.set()
+    await rt.wait(first.task_id, timeout=2.0)
+    await rt.wait(replacement.task_id, timeout=2.0)
 
 
 @pytest.mark.asyncio

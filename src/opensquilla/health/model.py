@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -81,7 +82,14 @@ def _readiness_impact(finding: HealthFinding) -> ReadinessImpact:
     return finding.readiness_impact or _DEFAULT_IMPACT_BY_SEVERITY[finding.severity]
 
 
-def _summary(impact_counts: dict[ReadinessImpact, int]) -> str:
+def summarize_impact_counts(impact_counts: Mapping[str, int], *, attention_count: int = 0) -> str:
+    """Human summary line for a readiness report.
+
+    Shared with the CLI's local readiness refresh so the operator-facing
+    wording cannot drift between the gateway report and ``opensquilla doctor``.
+    ``attention_count`` is the number of warn-severity optional-impact
+    findings — operator action items, labeled distinctly from setup items.
+    """
     parts: list[str] = []
     if impact_counts["blocks_ready"]:
         label = "action" if impact_counts["blocks_ready"] == 1 else "actions"
@@ -95,12 +103,22 @@ def _summary(impact_counts: dict[ReadinessImpact, int]) -> str:
     if parts:
         return ", ".join(parts)
     if impact_counts["optional"]:
-        label = "item" if impact_counts["optional"] == 1 else "items"
-        return f"Ready, {impact_counts['optional']} optional setup {label}"
+        # An optional-impact warn is an operator action item (senders waiting
+        # on approval, sends needing confirmation) — calling it a "setup item"
+        # would mislabel work someone is actively blocked on.
+        setup_count = impact_counts["optional"] - attention_count
+        segments: list[str] = []
+        if attention_count:
+            label = "item" if attention_count == 1 else "items"
+            segments.append(f"{attention_count} {label} awaiting operator action")
+        if setup_count:
+            label = "item" if setup_count == 1 else "items"
+            segments.append(f"{setup_count} optional setup {label}")
+        return "Ready, " + ", ".join(segments)
     return "Ready"
 
 
-def _status(impact_counts: dict[ReadinessImpact, int]) -> HealthStatus:
+def _status(impact_counts: Mapping[str, int]) -> HealthStatus:
     # "unavailable" is reserved for callers that cannot reach doctor.status at all.
     if impact_counts["blocks_ready"]:
         return "action_required"
@@ -111,10 +129,15 @@ def _status(impact_counts: dict[ReadinessImpact, int]) -> HealthStatus:
 
 def build_report(findings: list[HealthFinding]) -> dict[str, Any]:
     counts: dict[HealthSeverity, int] = {key: 0 for key in _COUNT_KEYS}
-    impact_counts: dict[ReadinessImpact, int] = {key: 0 for key in _IMPACT_KEYS}
+    # str-keyed so the shared summary helper (Mapping[str, int]) accepts it;
+    # writes still come only from _IMPACT_KEYS.
+    impact_counts: dict[str, int] = {key: 0 for key in _IMPACT_KEYS}
+    attention_count = 0
     for finding in findings:
         counts[finding.severity] += 1
         impact_counts[_readiness_impact(finding)] += 1
+        if finding.severity == "warn" and _readiness_impact(finding) == "optional":
+            attention_count += 1
     status = _status(impact_counts)
     ordered_findings = sorted(
         enumerate(findings),
@@ -127,7 +150,7 @@ def build_report(findings: list[HealthFinding]) -> dict[str, Any]:
     return {
         "status": status,
         "ready": impact_counts["blocks_ready"] == 0,
-        "summary": _summary(impact_counts),
+        "summary": summarize_impact_counts(impact_counts, attention_count=attention_count),
         "counts": counts,
         "impactCounts": impact_counts,
         "findings": [finding.to_dict() for _, finding in ordered_findings],

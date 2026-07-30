@@ -24,11 +24,27 @@ from opensquilla.sandbox.backend.linux_protected_create import (
     register_protected_create_targets,
     register_synthetic_mount_targets,
 )
+from opensquilla.sandbox.permissions import FileSystemAccess
 
 pytestmark = pytest.mark.skipif(
     not sys.platform.startswith("linux"),
     reason="Linux helper tests require POSIX process-group and seccomp semantics",
 )
+
+
+def test_filesystem_profile_from_legacy_payload_defaults_to_deny() -> None:
+    policy = linux_helper._policy_from_payload(
+        {
+            "fileSystem": {
+                "entries": [{"path": "/", "access": "read"}],
+                "deniedReadGlobs": [],
+            }
+        }
+    )
+
+    assert policy.file_system is not None
+    assert policy.file_system.default_access is FileSystemAccess.DENY
+    assert policy.file_system.entries[0].logical_path is None
 
 
 @pytest.mark.asyncio
@@ -169,9 +185,7 @@ async def test_run_process_payload_times_out(tmp_path) -> None:
         cwd=str(tmp_path),
         env={},
         policy={"wallTimeoutS": 0.01},
-        process=ProcessHelperPayload(
-            argv=[sys.executable, "-c", "import time; time.sleep(5)"]
-        ),
+        process=ProcessHelperPayload(argv=[sys.executable, "-c", "import time; time.sleep(5)"]),
         filesystem=None,
     )
 
@@ -462,7 +476,7 @@ def test_linux_helper_outer_mode_runs_bwrap_and_prints_inner_json(
             available=True,
             message="ready",
             path="bwrap",
-            ),
+        ),
     )
     monkeypatch.setattr(
         linux_helper.asyncio,

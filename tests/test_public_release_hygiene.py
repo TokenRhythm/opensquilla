@@ -54,6 +54,9 @@ PATH_POLICY_FIXTURE_FILES = {
     "tests/test_migration/fixtures/homes/desktop-0.5rc/config.toml",
     "tests/test_provider_image_generation.py",
     "tests/test_sandbox/test_operation_profile.py",
+    "tests/test_sandbox/test_path_access.py",
+    "tests/test_sandbox/test_permission_profiles.py",
+    "tests/test_sandbox/test_platform_permissions.py",
     "tests/test_sandbox/test_windows_default_cache.py",
     "tests/test_tools/test_apply_patch_gates.py",
     "tests/test_tools/test_filesystem_read_workspace.py",
@@ -62,6 +65,9 @@ PATH_POLICY_FIXTURE_FILES = {
     "tests/test_tools/test_shell_sensitive.py",
     "tests/test_tools/test_web_http_request.py",
     "tests/test_observability/test_decision_log_contract.py",
+    "opensquilla-webui/src/components/SupportDiagnosticsMenu.test.ts",
+    "opensquilla-webui/src/composables/chat/useChatShareExport.test.ts",
+    "opensquilla-webui/src/utils/chat/activityToolDetails.test.ts",
     "opensquilla-webui/src/utils/overviewDiagnostics.test.ts",
     "opensquilla-webui/src/views/OverviewView.diagnostics.test.ts",
 }
@@ -73,8 +79,16 @@ def _tracked_text_files() -> list[Path]:
     for rel in raw.splitlines():
         path = Path(rel)
         if path.suffix.lower() in {
-            ".bin", ".onnx", ".pkl", ".joblib", ".woff2",
-            ".png", ".jpg", ".jpeg", ".gif", ".ico",
+            ".bin",
+            ".onnx",
+            ".pkl",
+            ".joblib",
+            ".woff2",
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".gif",
+            ".ico",
         }:
             continue
         if not path.exists():
@@ -165,10 +179,7 @@ def test_pull_request_template_uses_structured_governance_fields() -> None:
         "Scope boundary",
         "Non-goals",
         "Base branch: main | staging/collaboration",
-        (
-            "Target exception: N/A | release | hotfix | staging/collaboration "
-            "| maintainer-approved"
-        ),
+        ("Target exception: N/A | release | hotfix | staging/collaboration | maintainer-approved"),
         "Linked issue: Fixes #... | Refs #... | None",
         "If None, reason",
         "Release note: NONE |",
@@ -202,7 +213,7 @@ def test_release_sop_documents_github_only_validation_boundary() -> None:
 
     required_phrases = [
         "GitHub-only release checks",
-        "0.5.x preview releases publish Electron desktop installers",
+        "0.5.x releases (previews and the stable) publish Electron desktop installers",
         "must not be marked as Latest",
         "do not publish Windows portable zips",
         "portable latest aliases",
@@ -225,7 +236,13 @@ def test_release_sop_documents_github_only_validation_boundary() -> None:
 def test_readme_documents_quick_and_manual_terminal_install_commands() -> None:
     text = Path("README.md").read_text(encoding="utf-8")
 
-    assert 'uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com' in text
+    assert "uv tool install --python 3.12" in text
+    assert '"opensquilla[recommended] @ https://github.com' in text
+    assert "https://opensquilla.ai/install.sh" not in text
+    assert "https://opensquilla.ai/install.ps1" not in text
+    assert "Starting with Preview 5" not in text
+    assert "predates the packaged TUI companion" not in text
+    assert "opensquilla_tui_host-0.5.0rc4" not in text
     assert "curl -LsSf https://astral.sh/uv/install.sh | sh" in text
     assert '. "$HOME/.local/bin/env"' in text
     assert 'powershell -c "irm https://astral.sh/uv/install.ps1 | iex"' in text

@@ -1,5 +1,9 @@
 import { ref } from 'vue'
-import { SETTINGS_SECTIONS, type SettingsSectionId } from '@/composables/setup/settingsSections'
+import {
+  NESTED_SETTINGS_SECTION_IDS,
+  SETTINGS_SECTIONS,
+  type SettingsSectionId,
+} from '@/composables/setup/settingsSections'
 
 const DEFAULT_SECTION: SettingsSectionId = 'provider'
 const SECTION_ALIASES: Record<string, SettingsSectionId> = {
@@ -12,6 +16,8 @@ function sectionIdFor(value: unknown): SettingsSectionId | null {
   if (typeof value !== 'string') return null
   const canonical = SETTINGS_SECTIONS.find(s => s.id === value)
   if (canonical) return canonical.id
+  const nested = NESTED_SETTINGS_SECTION_IDS.find(id => id === value)
+  if (nested) return nested
   return SECTION_ALIASES[value] || null
 }
 

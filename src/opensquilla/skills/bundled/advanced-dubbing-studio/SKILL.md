@@ -1,6 +1,7 @@
 ---
 name: advanced-dubbing-studio
 description: "Submit audio or video for multilingual dubbing, poll status, and download dubbed audio. Use when the user asks for dubbing, 多语言配音, 视频翻译配音, 译制片, or wants a source clip dubbed into another language."
+description_zh: "提交音频或视频进行多语言配音，轮询状态并下载配音后的音频。当用户需要配音、多语言配音、视频翻译配音、译制片，或想把源片段配成另一种语言时使用。"
 triggers:
   - "dubbing"
   - "dub this"

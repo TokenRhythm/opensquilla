@@ -20,9 +20,10 @@ _CATALOG_SOURCE_WAIVERS: frozenset[str] = frozenset(
         "lm_studio",
         "ovms",
         "vllm",
-        # Generic self-hosted OpenAI-compatible endpoint id: the model set is
-        # whatever the operator serves; no models.dev source exists.
+        # Generic custom endpoint ids: the model set is whatever the operator
+        # serves; no models.dev source exists.
         "custom",
+        "custom_anthropic",
         # Deployment-defined aggregation proxy: the model set is whatever
         # the operator's LiteLLM instance routes; no stable public catalog.
         "litellm_proxy",
@@ -40,6 +41,11 @@ _CATALOG_SOURCE_WAIVERS: frozenset[str] = frozenset(
         # (deepseek, zhipuai, ...) here would vendor entire foreign tables
         # with the origin providers' prices under this id.
         "tokenrhythm",
+        # Qwen Token Plan's exact subscription allowlist and service-specific
+        # limits ship in catalog_overrides.toml. Importing the general
+        # Alibaba catalog would expose models outside the subscription.
+        "qwen_token_plan",
+        "qwen_token_plan_anthropic",
         # OAuth-only ChatGPT-backend provider: models are fixed by the
         # Codex subscription, not a public catalog.
         "openai_codex",
@@ -68,6 +74,7 @@ _EXPECTED_CATALOG_SOURCES: dict[str, tuple[str, ...]] = {
     "gemini": ("google",),
     "dashscope": ("alibaba-cn", "alibaba"),
     "bailian_coding": ("alibaba", "alibaba-cn"),
+    "bailian_coding_cn": ("alibaba-cn", "alibaba"),
     "moonshot": ("moonshotai",),
     "zhipu": ("zhipuai", "zai"),
     "minimax": ("minimax",),
@@ -120,16 +127,34 @@ def test_catalog_sources_match_the_migrated_script_mapping() -> None:
 
 
 def test_selectable_model_catalog_is_enabled_only_for_verified_providers() -> None:
-    """A picker must never turn an unverified/static adapter list into truth."""
+    """A picker must never turn an unverified adapter list into truth."""
     trusted = {
         spec.provider_id
         for spec in list_provider_specs()
         if spec.selectable_model_catalog == "verified_live"
     }
-    assert trusted == {"openrouter", "tokenrhythm"}
+    assert trusted == {
+        "openrouter",
+        "qwen_token_plan",
+        "qwen_token_plan_anthropic",
+        "tokenrhythm",
+    }
 
     assert get_provider_spec("openrouter").compat.official_host == "openrouter.ai"
     assert get_provider_spec("tokenrhythm").compat.official_host == "tokenrhythm.studio"
+    assert (
+        get_provider_spec("qwen_token_plan").compat.official_host
+        == "token-plan.cn-beijing.maas.aliyuncs.com"
+    )
+    token_plan_anthropic = get_provider_spec("qwen_token_plan_anthropic")
+    assert (
+        token_plan_anthropic.compat.official_host
+        == "token-plan.cn-beijing.maas.aliyuncs.com"
+    )
+    assert (
+        token_plan_anthropic.selectable_model_discovery_provider_id
+        == "qwen_token_plan"
+    )
 
 
 def test_anthropic_backend_auth_header_styles() -> None:

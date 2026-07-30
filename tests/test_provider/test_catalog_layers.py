@@ -269,6 +269,7 @@ def test_packaged_corrections_file_parses_with_expected_tables() -> None:
         "qianfan",
         "tencent_tokenhub",
         "tencent_token_plan",
+        "qwen_token_plan",
         "tokenrhythm",
         "kimi_coding_openai",
         "kimi_coding_anthropic",

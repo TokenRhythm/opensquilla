@@ -467,6 +467,14 @@ def _localize_command(command: str, repo: Path, target: Path) -> str:
 
 _BASH_PROBE_SENTINEL = "__opensquilla_bash_probe_ok__"
 _BASH_PROBE_TIMEOUT = 5.0
+# Probe classification: native bash (usable as-is), a WSL launcher (real bash,
+# but a Linux userland — last-resort fallback only), or unusable (stub,
+# busybox, broken).
+_BASH_KIND_NATIVE = "native"
+_BASH_KIND_WSL = "wsl"
+_BASH_KIND_UNUSABLE = "unusable"
+# Exit code the probe script reserves for "real bash, but Linux userland".
+_BASH_PROBE_WSL_EXIT = 42
 # Process-level cache: bash location is stable for the gateway's lifetime.
 # Tuple form (resolved, path) so a cached "not found" doesn't keep re-probing.
 _BASH_RESOLVED: bool = False
@@ -526,18 +534,30 @@ def _windows_bash_candidates() -> list[str]:
     return out
 
 
-def _probe_bash(path: str) -> bool:
-    """True iff ``path`` is real bash (not a stub or busybox).
+def _probe_bash_kind(path: str) -> str:
+    """Classify ``path``: native bash, a WSL launcher, or unusable.
 
     Runs ``-lc`` with a bash-specific invariant (``$BASH_VERSION`` is set
-    by every real bash and unset by busybox, dash, the WSL launcher stub,
-    and a ``bash.cmd`` wrapper that calls ``exit /b``). Requires both
-    returncode 0 AND the sentinel in stdout so a stub that happens to
-    exit 0 but echoes nothing — or echoes garbage — is rejected.
+    by every real bash and unset by busybox, dash, and a ``bash.cmd`` wrapper
+    that calls ``exit /b``). A real bash whose ``uname -s`` reports Linux is
+    the WSL-launcher class on Windows: real bash, but without native Windows
+    path and ``-lc`` command-line variable semantics, so it is only eligible
+    as a loudly-warned last resort (see :func:`_resolve_bash`). Native
+    requires both returncode 0 AND the sentinel in stdout so a stub that
+    happens to exit 0 but echoes nothing — or echoes garbage — is rejected.
     """
     try:
         proc = subprocess.run(
-            [path, "-lc", f'test -n "$BASH_VERSION" && echo {_BASH_PROBE_SENTINEL}'],
+            [
+                path,
+                "-lc",
+                (
+                    'test -n "$BASH_VERSION" && '
+                    'case "$(uname -s 2>/dev/null)" in Linux*) '
+                    f"exit {_BASH_PROBE_WSL_EXIT};; esac && "
+                    f"echo {_BASH_PROBE_SENTINEL}"
+                ),
+            ],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -545,8 +565,17 @@ def _probe_bash(path: str) -> bool:
             timeout=_BASH_PROBE_TIMEOUT,
         )
     except (OSError, subprocess.SubprocessError):
-        return False
-    return proc.returncode == 0 and _BASH_PROBE_SENTINEL in (proc.stdout or "")
+        return _BASH_KIND_UNUSABLE
+    if proc.returncode == 0 and _BASH_PROBE_SENTINEL in (proc.stdout or ""):
+        return _BASH_KIND_NATIVE
+    if proc.returncode == _BASH_PROBE_WSL_EXIT:
+        return _BASH_KIND_WSL
+    return _BASH_KIND_UNUSABLE
+
+
+def _probe_bash(path: str) -> bool:
+    """True iff ``path`` is native bash (not a stub, busybox, or WSL)."""
+    return _probe_bash_kind(path) == _BASH_KIND_NATIVE
 
 
 def _resolve_bash() -> str | None:
@@ -557,23 +586,39 @@ def _resolve_bash() -> str | None:
     busybox/WSL-stub class of failure is Windows-only and any caching layer
     would diverge from the old behavior if ``PATH`` changes mid-process.
     Windows enumerates candidates, probes each (see
-    :func:`_windows_bash_candidates`, :func:`_probe_bash`), and memoizes the
-    result for the gateway's lifetime so per-shell-call probe cost stays at
-    one round-trip total.
+    :func:`_windows_bash_candidates`, :func:`_probe_bash_kind`), and memoizes
+    the result for the gateway's lifetime so per-shell-call probe cost stays
+    at one round-trip total. Native bash is preferred regardless of candidate
+    order; when no native candidate probes successfully, a WSL bash launcher
+    is used as a loudly-warned last resort so Windows setups whose
+    verification commands ran under WSL keep working.
     """
     if os.name != "nt":
         return shutil.which("bash")
     global _BASH_RESOLVED, _BASH_CACHED
     if _BASH_RESOLVED:
         return _BASH_CACHED
+    wsl_fallback: str | None = None
     for cand in _windows_bash_candidates():
-        if _probe_bash(cand):
+        kind = _probe_bash_kind(cand)
+        if kind == _BASH_KIND_NATIVE:
             _BASH_CACHED = cand
             _BASH_RESOLVED = True
             return cand
+        if kind == _BASH_KIND_WSL and wsl_fallback is None:
+            wsl_fallback = cand
+    if wsl_fallback is not None:
+        logger.warning(
+            "code-task verification found no native Windows bash; falling "
+            "back to the WSL bash launcher at %s. Windows paths and "
+            "`bash -lc` variable semantics may not behave natively under "
+            "WSL — install Git Bash (or point OPENSQUILLA_BASH at a native "
+            "bash.exe) for full support.",
+            wsl_fallback,
+        )
+    _BASH_CACHED = wsl_fallback
     _BASH_RESOLVED = True
-    _BASH_CACHED = None
-    return None
+    return _BASH_CACHED
 
 
 def _reset_bash_cache() -> None:
@@ -607,8 +652,11 @@ def _write_python_shim(shim_dir: Path, name: str, venv_python: Path) -> None:
         return
     except OSError:
         pass
-    script = f'#!/usr/bin/env bash\nexec {shlex.quote(_bash_path_entry(venv_python))} "$@"\n'
-    target.write_text(script, encoding="utf-8")
+    script = (
+        "#!/usr/bin/env bash\n"
+        f'exec {shlex.quote(_bash_path_entry(venv_python))} "$@"\n'
+    )
+    target.write_text(script, encoding="utf-8", newline="\n")
     try:
         target.chmod(0o755)
     except OSError:
@@ -622,8 +670,12 @@ def _run_shell(
 
     Verification commands the agent records use POSIX shell semantics
     (``VAR=val command``, pipelines, ``&&``). We require ``bash`` to honor
-    them. On Windows the user must have Git Bash / WSL installed; we surface
-    a clear error instead of an opaque ``FileNotFoundError`` if it is not.
+    them. On Windows the user should install Git Bash; when only a WSL bash
+    launcher is available it is used as a loudly-warned last resort (it does
+    not provide native Windows path and ``-lc`` variable semantics, but it is
+    the shell such setups already ran their commands under). We surface a
+    clear error instead of an opaque ``FileNotFoundError`` if no usable bash
+    is available at all.
     """
     bash = _resolve_bash()
     if bash is None:
@@ -631,8 +683,8 @@ def _run_shell(
             hint = (
                 "no working bash found (install Git Bash, or set "
                 "OPENSQUILLA_BASH to a working bash.exe; fake bash.cmd "
-                "stubs and an unconfigured WSL launcher are skipped "
-                "automatically)"
+                "stubs and a broken or unconfigured WSL launcher are "
+                "skipped automatically)"
             )
         else:
             # Bit-equivalent to the original message on Linux/Mac.

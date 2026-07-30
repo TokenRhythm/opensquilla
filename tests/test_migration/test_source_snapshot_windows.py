@@ -134,6 +134,40 @@ def _add_gateway_authority(api: _FakeWindowsApi) -> None:
     )
 
 
+def _add_reparse_descendant(
+    api: _FakeWindowsApi,
+    *,
+    top_level: str,
+) -> Path:
+    """Add a representative generated tree ending in a Windows reparse point."""
+
+    top = api.root / top_level
+    repository = top / "run-1" / "repo"
+    reparse = repository / ".venv" / "Scripts" / "python.exe"
+    directories = (
+        top,
+        top / "run-1",
+        repository,
+        repository / ".venv",
+        repository / ".venv" / "Scripts",
+    )
+    next_inode = max(value.identity.inode for value in api.nodes.values()) + 1
+    for offset, directory in enumerate(directories):
+        api.nodes[directory] = _information(next_inode + offset, directory=True)
+    api.nodes[reparse] = _information(
+        next_inode + len(directories),
+        directory=False,
+        attributes=windows_snapshot._FILE_ATTRIBUTE_REPARSE_POINT,
+    )
+    api.children[api.root] = tuple(sorted({*api.children[api.root], top_level}))
+    api.children[top] = ("run-1",)
+    api.children[top / "run-1"] = ("repo",)
+    api.children[repository] = (".venv",)
+    api.children[repository / ".venv"] = ("Scripts",)
+    api.children[repository / ".venv" / "Scripts"] = ("python.exe",)
+    return reparse
+
+
 def test_public_scan_and_copy_use_pinned_api_for_sqlite_bundle(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -196,6 +230,58 @@ def test_scan_excludes_transient_sqlite_shm_without_reading_it(
     assert files == {"state/sessions.db", "state/sessions.db-wal"}
     assert shm not in api.read_paths
     assert snapshot.excluded_leaf_suffixes == ("-shm",)
+
+
+@pytest.mark.parametrize("top_level", ["code-task", "profiles"])
+def test_scan_excludes_non_imported_tree_before_opening_its_reparse_descendant(
+    monkeypatch: pytest.MonkeyPatch,
+    top_level: str,
+) -> None:
+    api = _FakeWindowsApi()
+    reparse = _add_reparse_descendant(api, top_level=top_level)
+    excluded_root = api.root / top_level
+    monkeypatch.setattr(windows_snapshot, "_new_api", lambda: api)
+
+    snapshot = windows_snapshot.scan_windows_source_tree(
+        api.root,
+        destination_prefix=Path(),
+        role="primary",
+        excluded={Path(top_level)},
+    )
+
+    assert snapshot.excluded == frozenset({Path(top_level)})
+    assert all(
+        Path(top_level) not in entry.relative.parents
+        and entry.relative != Path(top_level)
+        for entry in snapshot.entries
+    )
+    assert excluded_root not in api.open_order
+    assert reparse not in api.open_order
+    assert not api.open_handles
+
+
+def test_scan_still_rejects_reparse_outside_excluded_code_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = _FakeWindowsApi()
+    _add_reparse_descendant(api, top_level="code-task")
+    workspace_reparse = _add_reparse_descendant(api, top_level="workspace")
+    monkeypatch.setattr(windows_snapshot, "_new_api", lambda: api)
+
+    with pytest.raises(
+        windows_snapshot.WindowsSourceSnapshotError,
+        match="reparse point",
+    ):
+        windows_snapshot.scan_windows_source_tree(
+            api.root,
+            destination_prefix=Path(),
+            role="primary",
+            excluded={Path("code-task")},
+        )
+
+    assert api.root / "code-task" not in api.open_order
+    assert workspace_reparse in api.open_order
+    assert not api.open_handles
 
 
 def test_win32_read_error_keeps_the_specific_source_path(

@@ -85,6 +85,7 @@ def test_ci_result_gate_requires_ubuntu_full_matrix_only_for_full_ci() -> None:
     targeted[_flag_env("runtime_changed")] = "true"
     targeted[_flag_env("python_changed")] = "true"
     targeted[_flag_env("build_wheel_required")] = "true"
+    targeted["RESULT_FRONTEND"] = "success"
     targeted["RESULT_UBUNTU"] = "success"
     targeted["RESULT_WINDOWS_SMOKE"] = "success"
     assert check_ci_results(targeted) == []
@@ -96,6 +97,20 @@ def test_ci_result_gate_requires_ubuntu_full_matrix_only_for_full_ci() -> None:
         errors = check_ci_results(env)
 
         assert any("Ubuntu full test matrix" in error for error in errors)
+
+
+def test_ci_result_gate_requires_verified_frontend_for_wheel_builds() -> None:
+    env = _base_env()
+    env[_flag_env("docs_only")] = "false"
+    env[_flag_env("runtime_changed")] = "true"
+    env[_flag_env("python_changed")] = "true"
+    env[_flag_env("build_wheel_required")] = "true"
+    env["RESULT_UBUNTU"] = "success"
+    env["RESULT_WINDOWS_SMOKE"] = "success"
+
+    errors = check_ci_results(env)
+
+    assert any("Frontend build, tests, and artifact" in error for error in errors)
 
 
 def test_ci_result_gate_rejects_failure_cancellation_and_missing_results() -> None:

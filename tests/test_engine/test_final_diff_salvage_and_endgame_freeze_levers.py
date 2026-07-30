@@ -488,6 +488,182 @@ async def test_final_diff_salvage_stops_when_time_budget_exhausted(
     ]
 
 
+def _unlost(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Model a candidate whose path diff vanished without an observed revert."""
+
+    candidate["lost"] = False
+    candidate["lost_reason"] = None
+    candidate["lost_command"] = None
+    return candidate
+
+
+def _salvage_events(events_path: Path) -> list[dict[str, Any]]:
+    return [
+        json.loads(line)
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+        if '"final_diff_salvage' in line
+    ]
+
+
+@pytest.mark.asyncio
+async def test_final_diff_salvage_veto_skips_lost_candidate(tmp_path: Path) -> None:
+    # The agent explicitly reverted this candidate; with the veto lever on,
+    # salvage must not resurrect edits the agent chose to abandon.
+    repo, target = _init_repo(tmp_path)
+    candidate = _candidate(repo, target, "value = 2\n", candidate_id="srcdiff-1")
+    events_path = tmp_path / "events.jsonl"
+    agent = Agent(
+        provider=_SequenceProvider([_final_text()]),
+        config=AgentConfig(
+            final_diff_salvage=True,
+            final_diff_salvage_veto=True,
+            runtime_events_path=str(events_path),
+        ),
+        tool_context=_ctx(repo, [candidate]),
+    )
+
+    events = [event async for event in agent.run_turn("fix the bug")]
+
+    assert any(event.kind == "done" for event in events)
+    assert target.read_text(encoding="utf-8") == "value = 1\n"
+    assert candidate["restored"] is False
+    assert [event["action"] for event in _salvage_events(events_path)] == ["vetoed_lost"]
+
+
+@pytest.mark.asyncio
+async def test_final_diff_salvage_veto_skips_instrumentation_only_candidate(
+    tmp_path: Path,
+) -> None:
+    # An instrumentation-only candidate is leftover diagnostic output, not a
+    # fix; salvaging it would pollute the collected patch with debug prints.
+    repo, target = _init_repo(tmp_path)
+    candidate = _unlost(
+        _candidate(
+            repo,
+            target,
+            'value = 1\nprint("debug")\n',
+            candidate_id="srcdiff-1",
+        )
+    )
+    events_path = tmp_path / "events.jsonl"
+    agent = Agent(
+        provider=_SequenceProvider([_final_text()]),
+        config=AgentConfig(
+            final_diff_salvage=True,
+            final_diff_salvage_veto=True,
+            runtime_events_path=str(events_path),
+        ),
+        tool_context=_ctx(repo, [candidate]),
+    )
+
+    events = [event async for event in agent.run_turn("fix the bug")]
+
+    assert any(event.kind == "done" for event in events)
+    assert target.read_text(encoding="utf-8") == "value = 1\n"
+    assert candidate["restored"] is False
+    assert [event["action"] for event in _salvage_events(events_path)] == [
+        "vetoed_instrumentation"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_final_diff_salvage_veto_falls_back_to_older_clean_candidate(
+    tmp_path: Path,
+) -> None:
+    # Vetoed candidates must not mark their path handled: an older candidate
+    # that was never reverted may still carry the real fix.
+    repo, target = _init_repo(tmp_path)
+    older = _unlost(_candidate(repo, target, "value = 2\n", candidate_id="srcdiff-1"))
+    newer = _candidate(repo, target, "value = 3\n", candidate_id="srcdiff-2")
+    events_path = tmp_path / "events.jsonl"
+    agent = Agent(
+        provider=_SequenceProvider([_final_text()]),
+        config=AgentConfig(
+            final_diff_salvage=True,
+            final_diff_salvage_veto=True,
+            runtime_events_path=str(events_path),
+        ),
+        tool_context=_ctx(repo, [older, newer]),
+    )
+
+    events = [event async for event in agent.run_turn("fix the bug")]
+
+    assert any(event.kind == "done" for event in events)
+    assert target.read_text(encoding="utf-8") == "value = 2\n"
+    assert newer["restored"] is False
+    assert older["restored"] is True
+    assert [event["action"] for event in _salvage_events(events_path)] == [
+        "vetoed_lost",
+        "applied",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_final_diff_salvage_veto_still_applies_substantive_clean_candidate(
+    tmp_path: Path,
+) -> None:
+    # The veto narrows salvage; it must not disable it. A substantive
+    # candidate that was never explicitly reverted still applies.
+    repo, target = _init_repo(tmp_path)
+    candidate = _unlost(_candidate(repo, target, "value = 2\n", candidate_id="srcdiff-1"))
+    agent = Agent(
+        provider=_SequenceProvider([_final_text()]),
+        config=AgentConfig(final_diff_salvage=True, final_diff_salvage_veto=True),
+        tool_context=_ctx(repo, [candidate]),
+    )
+
+    events = [event async for event in agent.run_turn("fix the bug")]
+
+    assert any(event.kind == "done" for event in events)
+    assert target.read_text(encoding="utf-8") == "value = 2\n"
+    assert candidate["restored"] is True
+
+
+@pytest.mark.asyncio
+async def test_endgame_git_freeze_arms_instrumentation_exempt_flag() -> None:
+    # The exempt flag rides the freeze reset: with both levers on, the tools
+    # see the exemption as soon as the turn starts.
+    ctx = ToolContext(
+        is_owner=True, caller_kind=CallerKind.CLI, session_key="agent:main:test"
+    )
+    provider = _SequenceProvider([_final_text()])
+    agent = _echo_agent(
+        provider,
+        AgentConfig(
+            timeout=30.0,
+            endgame_git_freeze_margin_seconds=60,
+            endgame_git_freeze_instrumentation_exempt=True,
+        ),
+        tool_context=ctx,
+    )
+
+    events = [event async for event in agent.run_turn("fix the bug")]
+
+    assert any(event.kind == "done" for event in events)
+    assert ctx.endgame_git_freeze_instrumentation_exempt is True
+
+
+@pytest.mark.asyncio
+async def test_endgame_git_freeze_resets_stale_exempt_flag() -> None:
+    # Same lifetime rule as the freeze flag itself: the context outlives the
+    # turn, so a stale exemption must be cleared when the config says off.
+    ctx = ToolContext(
+        is_owner=True, caller_kind=CallerKind.CLI, session_key="agent:main:test"
+    )
+    ctx.endgame_git_freeze_instrumentation_exempt = True
+    provider = _SequenceProvider([_final_text()])
+    agent = _echo_agent(
+        provider,
+        AgentConfig(timeout=3600.0, endgame_git_freeze_margin_seconds=60),
+        tool_context=ctx,
+    )
+
+    events = [event async for event in agent.run_turn("fix the bug")]
+
+    assert any(event.kind == "done" for event in events)
+    assert ctx.endgame_git_freeze_instrumentation_exempt is False
+
+
 @pytest.mark.asyncio
 async def test_endgame_git_freeze_arms_tool_context_flag() -> None:
     ctx = ToolContext(

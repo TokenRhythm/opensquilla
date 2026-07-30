@@ -1,5 +1,12 @@
 <template>
-  <div ref="traceRoot" class="tool-timeline" :class="{ 'tool-timeline--checklist': variant === 'checklist' }">
+  <div
+    ref="traceRoot"
+    class="tool-timeline"
+    :class="{
+      'tool-timeline--checklist': variant === 'checklist',
+      'tool-timeline--activity': presentation === 'activity',
+    }"
+  >
   <section
     v-if="summary"
     class="run-trace__summary control-stat-grid control-stat-grid--fixed"
@@ -50,8 +57,39 @@
     </div>
   </section>
   <TransitionGroup name="tool-row" tag="div" class="tool-row-group">
-  <template v-for="item in visibleItems" :key="item.key">
-    <div v-if="item.type === 'text'" class="msg-ai-text" v-html="item.html" />
+  <template v-for="item in displayItems" :key="item.key">
+    <div
+      v-if="item.type === 'bulk-control'"
+      class="tool-timeline__toolbar"
+      data-testid="run-trace-bulk-toolbar"
+      data-share-control
+    >
+      <span class="tool-timeline__summary">
+        <Icon name="listChecks" :size="13" aria-hidden="true" />
+        <span>{{ t('shared.runTrace.callsCount', { count: item.callCount }) }}</span>
+      </span>
+      <button
+        type="button"
+        class="tool-timeline__bulk-action"
+        data-testid="run-trace-bulk-toggle"
+        :title="bulkToggleLabel"
+        @click="toggleAllTools"
+      >
+        <span>{{ bulkToggleLabel }}</span>
+        <Icon
+          v-if="presentation !== 'activity'"
+          name="chevronDown"
+          :size="13"
+          class="tool-timeline__bulk-icon"
+          :class="{ 'is-collapse': anyBulkTargetOpen }"
+          aria-hidden="true"
+        />
+      </button>
+    </div>
+    <div v-else-if="item.type === 'text'" class="msg-ai-text" v-html="item.html" />
+    <div v-else-if="item.type === 'interrupt'" class="run-trace__interrupt">
+      <slot name="interrupt" :part="item.part" />
+    </div>
     <button
       v-else-if="item.type === 'overflow'"
       type="button"
@@ -77,15 +115,34 @@
             class="tool-row tool-row--group"
             :data-op="item.group.operationKey"
             :aria-expanded="groupOpen(item.group)"
-            @click="$emit('toggleGroup', item.group.groupId)"
+            @click="toggleGroupDisclosure(item.group)"
           >
-            <span class="tool-row__bullet" :class="groupBulletClass(item.group)" aria-hidden="true" />
+            <Icon
+              v-if="presentation === 'activity'"
+              class="tool-row__activity-icon"
+              :class="activityGroupIconClass(item.group)"
+              :name="item.group.iconName"
+              :size="14"
+              aria-hidden="true"
+            />
+            <span v-else class="tool-row__bullet" :class="groupBulletClass(item.group)" aria-hidden="true" />
             <span class="tool-row__label">{{ item.group.label }}</span>
-            <span class="step-count">{{ t('shared.runTrace.callsCount', { count: item.group.calls.length }) }}</span>
+            <!-- Activity groups already carry the call count in their footprint
+                 secondary ("2 web actions"), so the raw call-count pill would
+                 repeat it. -->
+            <span v-if="presentation !== 'activity'" class="step-count">{{ t('shared.runTrace.callsCount', { count: item.group.calls.length }) }}</span>
             <span v-if="item.group.secondary" class="tool-row__arg">{{ item.group.secondary }}</span>
+            <Icon
+              v-if="presentation === 'activity'"
+              class="step-chevron tool-row__activity-arrow"
+              name="chevronRight"
+              :size="13"
+              data-share-control
+              aria-hidden="true"
+            />
             <span class="tool-row__trailing">
-              <span class="tool-row__status">{{ resolvedGroupStatusText(item.group) }}</span>
-              <Icon class="step-chevron" name="chevronRight" :size="14" />
+              <span v-if="showGroupStatus(item.group)" class="tool-row__status">{{ resolvedGroupStatusText(item.group) }}</span>
+              <Icon v-if="presentation !== 'activity'" class="step-chevron" name="chevronRight" :size="14" />
             </span>
           </button>
           <div v-if="groupOpen(item.group)" class="step-group-members">
@@ -96,21 +153,54 @@
                 :class="rowClass(call)"
                 :data-op="operationKey(call)"
                 :aria-expanded="callOpen(call)"
-                @click="$emit('toggleItem', call.renderKey)"
+                @click="toggleItemDisclosure(call)"
               >
-                <span class="tool-row__bullet" :class="bulletClass(call)" aria-hidden="true" />
+                <Icon
+                  v-if="presentation === 'activity'"
+                  class="tool-row__activity-icon"
+                  :class="activityIconClass(call)"
+                  :name="toolIconName(call.name)"
+                  :size="14"
+                  aria-hidden="true"
+                />
+                <span v-else class="tool-row__bullet" :class="bulletClass(call)" aria-hidden="true" />
                 <span class="tool-row__label tool-row__label--member">{{ call.displayName }}</span>
                 <span v-if="resolvedSecondaryText(call)" class="tool-row__arg">{{ resolvedSecondaryText(call) }}</span>
+                <Icon
+                  v-if="presentation === 'activity' && callHasDetails(call)"
+                  class="step-chevron tool-row__activity-arrow"
+                  name="chevronRight"
+                  :size="13"
+                  data-share-control
+                  aria-hidden="true"
+                />
                 <span class="tool-row__trailing">
+                  <!-- Failure text is plain row content on purpose: it joins the
+                       button's accessible name, which screen readers announce when
+                       the row is reached. A live region mounted already-populated
+                       would never announce. -->
+                  <span v-if="activityTerminalStatusText(call)" class="tool-row__status">{{ activityTerminalStatusText(call) }}</span>
                   <span v-if="resultCountText(call)" class="tool-row__status">{{ resultCountText(call) }}</span>
                   <span v-if="elapsedFor(call)" class="tool-row__elapsed">{{ elapsedFor(call) }}</span>
-                  <Icon v-if="iconFor(call).glyph === 'check'" class="tool-row__state-icon tool-row__state-icon--ok" name="check" :size="13" />
-                  <Icon v-else-if="iconFor(call).glyph === 'x'" class="tool-row__state-icon tool-row__state-icon--err" name="x" :size="13" />
-                  <Icon class="step-chevron" name="chevronRight" :size="14" />
+                  <Icon v-if="presentation !== 'activity' && iconFor(call).glyph === 'check'" class="tool-row__state-icon tool-row__state-icon--ok" name="check" :size="13" />
+                  <Icon v-else-if="presentation !== 'activity' && iconFor(call).glyph === 'x'" class="tool-row__state-icon tool-row__state-icon--err" name="x" :size="13" />
+                  <Icon v-if="presentation !== 'activity'" class="step-chevron" name="chevronRight" :size="14" />
                 </span>
               </button>
               <div v-if="callOpen(call)" class="tool-row-body">
-                <ToolRowSections :call="call" :label="call.displayName" @show-result="forwardShowResult" />
+                <ActivityToolDetails
+                  v-if="presentation === 'activity'"
+                  :call="call"
+                  :label="call.displayName"
+                  :operation-key="operationKey(call)"
+                  @show-result="forwardShowResult"
+                />
+                <ToolRowSections
+                  v-else
+                  :call="call"
+                  :label="call.displayName"
+                  @show-result="forwardShowResult"
+                />
               </div>
             </div>
           </div>
@@ -123,21 +213,52 @@
               :class="rowClass(call)"
               :data-op="operationKey(call)"
               :aria-expanded="callOpen(call)"
-              @click="$emit('toggleItem', call.renderKey)"
+              @click="toggleItemDisclosure(call)"
             >
-              <span class="tool-row__bullet" :class="bulletClass(call)" aria-hidden="true" />
+              <Icon
+                v-if="presentation === 'activity'"
+                class="tool-row__activity-icon"
+                :class="activityIconClass(call)"
+                :name="item.group.iconName"
+                :size="14"
+                aria-hidden="true"
+              />
+              <span v-else class="tool-row__bullet" :class="bulletClass(call)" aria-hidden="true" />
               <span class="tool-row__label">{{ item.group.label }}</span>
-              <span v-if="resolvedSecondaryText(call)" class="tool-row__arg">{{ resolvedSecondaryText(call) }}</span>
+              <span v-if="singleCallSecondary(item.group, call)" class="tool-row__arg">
+                {{ singleCallSecondary(item.group, call) }}
+              </span>
+              <Icon
+                v-if="presentation === 'activity' && callHasDetails(call)"
+                class="step-chevron tool-row__activity-arrow"
+                name="chevronRight"
+                :size="13"
+                data-share-control
+                aria-hidden="true"
+              />
               <span class="tool-row__trailing">
+                <span v-if="activityTerminalStatusText(call)" class="tool-row__status">{{ activityTerminalStatusText(call) }}</span>
                 <span v-if="resultCountText(call)" class="tool-row__status">{{ resultCountText(call) }}</span>
                 <span v-if="elapsedFor(call)" class="tool-row__elapsed">{{ elapsedFor(call) }}</span>
-                <Icon v-if="iconFor(call).glyph === 'check'" class="tool-row__state-icon tool-row__state-icon--ok" name="check" :size="13" />
-                <Icon v-else-if="iconFor(call).glyph === 'x'" class="tool-row__state-icon tool-row__state-icon--err" name="x" :size="13" />
-                <Icon class="step-chevron" name="chevronRight" :size="14" />
+                <Icon v-if="presentation !== 'activity' && iconFor(call).glyph === 'check'" class="tool-row__state-icon tool-row__state-icon--ok" name="check" :size="13" />
+                <Icon v-else-if="presentation !== 'activity' && iconFor(call).glyph === 'x'" class="tool-row__state-icon tool-row__state-icon--err" name="x" :size="13" />
+                <Icon v-if="presentation !== 'activity'" class="step-chevron" name="chevronRight" :size="14" />
               </span>
             </button>
             <div v-if="callOpen(call)" class="tool-row-body">
-              <ToolRowSections :call="call" :label="item.group.label" @show-result="forwardShowResult" />
+              <ActivityToolDetails
+                v-if="presentation === 'activity'"
+                :call="call"
+                :label="item.group.label"
+                :operation-key="operationKey(call)"
+                @show-result="forwardShowResult"
+              />
+              <ToolRowSections
+                v-else
+                :call="call"
+                :label="item.group.label"
+                @show-result="forwardShowResult"
+              />
             </div>
           </div>
         </template>
@@ -441,6 +562,7 @@ export default { components: { ToolRowSections } }
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import Icon from '@/components/Icon.vue'
+import ActivityToolDetails from '@/components/chat/ActivityToolDetails.vue'
 import type {
   ChatStreamTimelineItem,
   ChatToolCallGroup,
@@ -449,14 +571,18 @@ import type { NodeStep, RunTraceStatus, RunTraceSummary } from '@/types/runTrace
 import {
   toolGroupStatusText as defaultToolGroupStatusText,
   toolSecondaryText as defaultToolSecondaryText,
+  toolStatusText as defaultToolStatusText,
+  toolIconName,
   toolOperationKey,
   toolResultCount,
 } from '@/utils/chat/toolDisplay'
 import { toolState } from '@/utils/chat/toParts'
 import { composeTree, statusVisual, type StatusVisual } from '@/components/run/runTrace'
 import { copyTextWithFallback } from '@/utils/browser'
+import { useToolDetailPreference } from '@/composables/useToolDetailPreference'
 
 const { t } = useI18n()
+const { mode: toolDetailDisplayMode } = useToolDetailPreference()
 
 const MAX_TOOL_ROWS = 30
 
@@ -468,6 +594,10 @@ const COLLAPSED_BY_DEFAULT = new Set(['web.discover', 'web.search', 'web.read', 
 type TimelineRenderItem =
   | ChatStreamTimelineItem
   | { type: 'overflow'; key: string; hiddenCount: number }
+
+type TimelineDisplayItem =
+  | TimelineRenderItem
+  | { type: 'bulk-control'; key: string; callCount: number }
 
 const props = defineProps<{
   // Chat path: the proven timeline shape (full group data). The lifted markup
@@ -492,6 +622,21 @@ const props = defineProps<{
   // pulsing ring, a completed row dims, an error row stays open. History
   // omits this, keeping the default pill timeline untouched.
   variant?: 'checklist'
+  // Chat activity disclosures opt into a quieter visual treatment. This is
+  // presentation-only: disclosure state and tool behavior stay unchanged.
+  presentation?: 'activity'
+  // Chat enables the turn-level bulk control through ToolCallTimeline. Direct
+  // RunTrace consumers such as Logs and Session Inspect keep their current UI.
+  showBulkToggle?: boolean
+  // History can preserve provider group and tool ids that repeat across
+  // messages. Scope only ephemeral disclosure keys; render ids stay unchanged.
+  stateScope?: string
+}>()
+
+defineSlots<{
+  interrupt?: (props: {
+    part: Extract<import('@/types/parts').ChatPart, { type: 'interrupt' }>
+  }) => unknown
 }>()
 
 const emit = defineEmits<{
@@ -598,9 +743,51 @@ function decorateCodeBlocks() {
 // Chat passes `items` (proven group data); non-chat surfaces pass flat steps,
 // which compose into the same tool-group timeline shape so the markup never
 // branches on input source.
+function withoutFailedActivityRows(
+  items: ChatStreamTimelineItem[],
+): ChatStreamTimelineItem[] {
+  if (props.presentation !== 'activity') return items
+
+  return items.flatMap((item): ChatStreamTimelineItem[] => {
+    if (item.type !== 'tool-group') return [item]
+
+    const failedCalls = item.group.calls.filter(
+      call => call.isError || call.status === 'error',
+    )
+    // Restored histories can retain only the group-level failure marker. In
+    // that case none of the calls is safe to present as completed activity.
+    if (
+      (item.group.isError || item.group.status === 'error')
+      && failedCalls.length === 0
+    ) {
+      return []
+    }
+
+    const calls = item.group.calls.filter(
+      call => !call.isError && call.status !== 'error',
+    )
+    if (calls.length === 0) return []
+
+    const isRunning = calls.some(call => call.isRunning)
+    return [{
+      ...item,
+      group: {
+        ...item.group,
+        calls,
+        isRunning,
+        isError: false,
+        status: isRunning
+          ? ''
+          : calls.every(call => call.status === 'success')
+            ? 'success'
+            : '',
+      },
+    }]
+  })
+}
+
 const resolvedItems = computed<ChatStreamTimelineItem[]>(() => {
-  if (props.items) return props.items
-  return composeTree(props.steps ?? []).map((node): ChatStreamTimelineItem => {
+  const items = props.items ?? composeTree(props.steps ?? []).map((node): ChatStreamTimelineItem => {
     const members = node.children.length ? node.children.map(child => child.step) : [node.step]
     const calls = members.map(stepToRenderItem)
     const isError = calls.some(call => call.isError || call.status === 'error')
@@ -621,6 +808,7 @@ const resolvedItems = computed<ChatStreamTimelineItem[]>(() => {
     }
     return { type: 'tool-group', key: node.step.id, group }
   })
+  return withoutFailedActivityRows(items)
 })
 
 function stepToRenderItem(step: NodeStep): ChatToolCallRenderItem {
@@ -630,7 +818,7 @@ function stepToRenderItem(step: NodeStep): ChatToolCallRenderItem {
   return {
     toolId: step.id,
     renderKey: step.id,
-    name: step.operationKey,
+    name: step.toolName || step.operationKey,
     displayName: step.title,
     inputRaw: step.input,
     inputPreview: step.inputPreview ?? '',
@@ -668,6 +856,152 @@ const visibleItems = computed<TimelineRenderItem[]>(() => {
   return out
 })
 
+type BulkToggleTarget =
+  | { kind: 'group'; id: string; open: boolean }
+  | { kind: 'item'; id: string; open: boolean }
+
+type DefaultOpenSnapshot = {
+  groups: Map<string, boolean>
+  items: Map<string, boolean>
+  topLevel: Map<string, DefaultOpenTarget>
+}
+
+type DefaultOpenTarget = {
+  kind: 'group' | 'item'
+  id: string
+  defaultOpen: boolean
+}
+
+// A multi-call batch exposes one group disclosure; a single-call batch exposes
+// the call itself. Use the effective state that RunTrace renders, not the
+// caller-owned toggle bits that invert each row's default.
+const bulkToggleTargets = computed<BulkToggleTarget[]>(() => {
+  const targets: BulkToggleTarget[] = []
+  for (const item of visibleItems.value) {
+    if (item.type !== 'tool-group' || item.group.calls.length === 0) continue
+    if (item.group.calls.length > 1) {
+      targets.push({
+        kind: 'group',
+        id: groupStateId(item.group.groupId),
+        open: groupOpen(item.group),
+      })
+      continue
+    }
+    const call = item.group.calls[0]
+    targets.push({ kind: 'item', id: itemStateId(call.renderKey), open: callOpen(call) })
+  }
+  return targets
+})
+
+// Multi-call groups have a second disclosure level. Bulk expand/collapse owns
+// those member details too, while the button label follows the visible
+// top-level disclosures so a closed group never looks partially open.
+const bulkMemberTargets = computed<BulkToggleTarget[]>(() => visibleItems.value.flatMap(item => {
+  if (item.type !== 'tool-group' || item.group.calls.length <= 1) return []
+  return item.group.calls.map(call => ({
+    kind: 'item' as const,
+    id: itemStateId(call.renderKey),
+    open: callOpen(call),
+  }))
+}))
+
+const showBulkControl = computed(
+  () => props.showBulkToggle === true && bulkToggleTargets.value.length > 1,
+)
+const anyBulkTargetOpen = computed(() => bulkToggleTargets.value.some(target => target.open))
+const bulkToggleLabel = computed(() => t(
+  anyBulkTargetOpen.value ? 'chat.tool.collapseAll' : 'chat.tool.expandAll',
+))
+const visibleToolCallCount = computed(() => visibleItems.value.reduce(
+  (count, item) => item.type === 'tool-group' ? count + item.group.calls.length : count,
+  0,
+))
+
+// Keep the action next to the tools it controls without moving any preceding
+// assistant text. A synthetic keyed item also keeps TransitionGroup children
+// stable as the control appears during streaming.
+const displayItems = computed<TimelineDisplayItem[]>(() => {
+  const items: TimelineDisplayItem[] = [...visibleItems.value]
+  if (!showBulkControl.value) return items
+  const firstToolIndex = items.findIndex(item => item.type === 'tool-group')
+  if (firstToolIndex < 0) return items
+  items.splice(firstToolIndex, 0, {
+    type: 'bulk-control',
+    key: '__run-trace-bulk-control__',
+    callCount: visibleToolCallCount.value,
+  })
+  return items
+})
+
+const defaultOpenSnapshot = computed<DefaultOpenSnapshot>(() => {
+  const groups = new Map<string, boolean>()
+  const items = new Map<string, boolean>()
+  const topLevel = new Map<string, DefaultOpenTarget>()
+  for (const item of resolvedItems.value) {
+    if (item.type !== 'tool-group') continue
+    for (const call of item.group.calls) {
+      items.set(itemStateId(call.renderKey), callDefaultOpen(call))
+    }
+    if (item.group.calls.length > 1) {
+      const defaultOpen = groupDefaultOpen(item.group)
+      const stateId = groupStateId(item.group.groupId)
+      groups.set(stateId, defaultOpen)
+      topLevel.set(stateId, {
+        kind: 'group',
+        id: stateId,
+        defaultOpen,
+      })
+    } else if (item.group.calls.length === 1) {
+      const call = item.group.calls[0]
+      topLevel.set(groupStateId(item.group.groupId), {
+        kind: 'item',
+        id: itemStateId(call.renderKey),
+        defaultOpen: callDefaultOpen(call),
+      })
+    }
+  }
+  return { groups, items, topLevel }
+})
+
+// Toggle sets encode an inversion of the current default. When an error state
+// or the global display preference changes that default, adjust existing bits
+// so an explicit user choice does not flip underneath them.
+watch(defaultOpenSnapshot, (current, previous) => {
+  // A live operation starts as a single row and can become a group when a
+  // second call arrives. Carry an explicit override to the disclosure that
+  // replaces it; otherwise an expanded single row can suddenly collapse.
+  for (const [groupId, target] of current.topLevel) {
+    const previousTarget = previous.topLevel.get(groupId)
+    if (!previousTarget
+      || previousTarget.kind !== 'item'
+      || target.kind !== 'group'
+      || !hasToggleOverride(previousTarget)) {
+      continue
+    }
+    const previousOpen = !previousTarget.defaultOpen
+    const targetOverride = target.defaultOpen !== previousOpen
+    if (hasToggleOverride(target) === targetOverride) continue
+    toggleTargetOverride(target)
+  }
+
+  for (const [id, defaultOpen] of current.groups) {
+    const previousDefault = previous.groups.get(id)
+    if (previousDefault !== undefined
+      && previousDefault !== defaultOpen
+      && isGroupOpen(id)) {
+      emit('toggleGroup', id)
+    }
+  }
+  for (const [id, defaultOpen] of current.items) {
+    const previousDefault = previous.items.get(id)
+    if (previousDefault !== undefined
+      && previousDefault !== defaultOpen
+      && isItemOpen(id)) {
+      emit('toggleItem', id)
+    }
+  }
+}, { flush: 'sync' })
+
 const codeBlockDecorationSignature = computed(() => visibleItems.value
   .map(item => item.type === 'text' ? `${item.key}:${item.html}` : item.key)
   .join('|'))
@@ -692,18 +1026,32 @@ function operationKey(call: ChatToolCallRenderItem): string {
 
 function callDefaultOpen(call: ChatToolCallRenderItem): boolean {
   if (call.isError || call.status === 'error') return true
+  if (props.presentation === 'activity') return false
+  if (toolDetailDisplayMode.value === 'compact') return false
+  if (toolDetailDisplayMode.value === 'expanded') return true
   return !COLLAPSED_BY_DEFAULT.has(operationKey(call))
 }
 
 function callOpen(call: ChatToolCallRenderItem): boolean {
   // A recorded toggle inverts the default, so error auto-expand still honors
   // an explicit user collapse.
-  return callDefaultOpen(call) !== isItemOpen(call.renderKey)
+  return callDefaultOpen(call) !== isItemOpen(itemStateId(call.renderKey))
+}
+
+function groupDefaultOpen(group: ChatToolCallGroup): boolean {
+  return group.calls.some(callDefaultOpen)
+}
+
+function groupStateId(groupId: string): string {
+  return props.stateScope ? `${props.stateScope}:${groupId}` : groupId
+}
+
+function itemStateId(renderKey: string): string {
+  return props.stateScope ? `${props.stateScope}:${renderKey}` : renderKey
 }
 
 function groupOpen(group: ChatToolCallGroup): boolean {
-  const defaultOpen = group.calls.some(callDefaultOpen)
-  return defaultOpen !== isGroupOpen(group.groupId)
+  return groupDefaultOpen(group) !== isGroupOpen(groupStateId(group.groupId))
 }
 
 function isGroupOpen(groupId: string): boolean {
@@ -712,6 +1060,33 @@ function isGroupOpen(groupId: string): boolean {
 
 function isItemOpen(renderKey: string): boolean {
   return props.isToolItemOpen?.(renderKey) ?? false
+}
+
+function hasToggleOverride(target: DefaultOpenTarget): boolean {
+  return target.kind === 'group' ? isGroupOpen(target.id) : isItemOpen(target.id)
+}
+
+function toggleTargetOverride(target: DefaultOpenTarget) {
+  if (target.kind === 'group') emit('toggleGroup', target.id)
+  else emit('toggleItem', target.id)
+}
+
+function toggleGroupDisclosure(group: ChatToolCallGroup) {
+  emit('toggleGroup', groupStateId(group.groupId))
+}
+
+function toggleItemDisclosure(call: ChatToolCallRenderItem) {
+  emit('toggleItem', itemStateId(call.renderKey))
+}
+
+function toggleAllTools() {
+  const targetOpen = !anyBulkTargetOpen.value
+  const targets = [...bulkToggleTargets.value, ...bulkMemberTargets.value]
+  for (const target of targets) {
+    if (target.open === targetOpen) continue
+    if (target.kind === 'group') emit('toggleGroup', target.id)
+    else emit('toggleItem', target.id)
+  }
 }
 
 function iconFor(call: ChatToolCallRenderItem): StatusVisual {
@@ -729,7 +1104,7 @@ function rowClass(call: ChatToolCallRenderItem) {
 function bulletClass(call: ChatToolCallRenderItem) {
   return {
     'tool-row__bullet--running': call.isRunning,
-    'tool-row__bullet--ok': call.status === 'success',
+    'tool-row__bullet--ok': props.presentation !== 'activity' && call.status === 'success',
     'tool-row__bullet--err': call.status === 'error' || call.isError,
   }
 }
@@ -737,14 +1112,52 @@ function bulletClass(call: ChatToolCallRenderItem) {
 function groupBulletClass(group: ChatToolCallGroup) {
   return {
     'tool-row__bullet--running': group.isRunning,
-    'tool-row__bullet--ok': group.status === 'success',
+    'tool-row__bullet--ok': props.presentation !== 'activity' && group.status === 'success',
     'tool-row__bullet--err': group.isError,
   }
 }
 
+function activityIconClass(call: ChatToolCallRenderItem) {
+  return {
+    'tool-row__activity-icon--running': call.isRunning,
+    'tool-row__activity-icon--error': call.status === 'error' || call.isError,
+  }
+}
+
+function activityGroupIconClass(group: ChatToolCallGroup) {
+  return {
+    'tool-row__activity-icon--running': group.isRunning,
+    'tool-row__activity-icon--error': group.isError,
+  }
+}
+
+function callHasDetails(call: ChatToolCallRenderItem): boolean {
+  return Boolean(
+    call.inputRaw
+    || call.inputPreview
+    || call.result
+    || call.resultPreview,
+  )
+}
+
+function showGroupStatus(group: ChatToolCallGroup): boolean {
+  return props.presentation !== 'activity'
+    || group.isError
+    || group.status === 'error'
+}
+
+function singleCallSecondary(
+  group: ChatToolCallGroup,
+  call: ChatToolCallRenderItem,
+): string {
+  return props.presentation === 'activity'
+    ? group.secondary
+    : resolvedSecondaryText(call)
+}
+
 function resultCountText(call: ChatToolCallRenderItem): string {
   if (call.isRunning || call.isError) return ''
-  const count = toolResultCount(call.result)
+  const count = toolResultCount(call.result, call.name)
   return count === null ? '' : t('shared.runTrace.resultsCount', { count })
 }
 
@@ -753,11 +1166,32 @@ function elapsedFor(call: ChatToolCallRenderItem): string {
 }
 
 function resolvedGroupStatusText(group: ChatToolCallGroup): string {
-  return (props.toolGroupStatusText ?? defaultToolGroupStatusText)(group)
+  const fallback = defaultToolGroupStatusText(group)
+  const injected = (props.toolGroupStatusText ?? defaultToolGroupStatusText)(group).trim()
+  if (
+    props.presentation === 'activity'
+    && group.isError
+    && (!injected || injected === fallback)
+  ) {
+    return t('shared.runTrace.activityNotCompleted')
+  }
+  return injected || fallback
 }
 
 function resolvedSecondaryText(call: ChatToolCallRenderItem): string {
   return (props.toolSecondaryText ?? defaultToolSecondaryText)(call)
+}
+
+function activityTerminalStatusText(call: ChatToolCallRenderItem): string {
+  if (props.presentation !== 'activity' || (!call.isError && call.status !== 'error')) {
+    return ''
+  }
+  const fallback = defaultToolStatusText(call)
+  const injected = props.toolStatusText?.(call)?.trim()
+  if (!injected || injected === fallback) {
+    return t('shared.runTrace.activityNotCompleted')
+  }
+  return injected
 }
 
 function forwardShowResult(content: string, title: string, context?: ToolResultContext) {
@@ -914,6 +1348,72 @@ function fmtTok(n?: number | null): string {
   border-radius: var(--radius-md);
 }
 
+.tool-timeline__toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  width: 100%;
+  min-width: 0;
+  min-height: 2rem;
+  padding: 0 var(--sp-1) var(--sp-1);
+  border-bottom: 1px solid var(--hairline);
+  color: var(--text-dim);
+}
+
+.tool-timeline__summary,
+.tool-timeline__bulk-action {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  font-size: var(--fs-xs);
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.tool-timeline__summary {
+  min-width: 0;
+}
+
+.tool-timeline__bulk-action {
+  flex: 0 0 auto;
+  min-height: 2rem;
+  padding: 0 var(--sp-1);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    background var(--dur-fast) var(--ease-standard),
+    color var(--dur-fast) var(--ease-standard);
+}
+
+.tool-timeline__bulk-action:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.tool-timeline__bulk-action:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring-inset);
+}
+
+.tool-timeline__bulk-icon {
+  transition: transform var(--dur-fast) var(--ease-standard);
+}
+
+.tool-timeline__bulk-icon.is-collapse {
+  transform: rotate(180deg);
+}
+
+.tool-timeline__toolbar + .step-card {
+  margin-top: var(--sp-1);
+}
+
 .tool-overflow-note {
   display: block;
   margin: 0.375rem 0;
@@ -922,7 +1422,7 @@ function fmtTok(n?: number | null): string {
   background: transparent;
   font: inherit;
   font-size: 0.8125rem;
-  color: var(--text-dim);
+  color: var(--text-muted);
   cursor: pointer;
   text-align: left;
 }
@@ -1178,6 +1678,10 @@ function fmtTok(n?: number | null): string {
   gap: 0.125rem;
 }
 
+.tool-timeline--checklist .tool-timeline__toolbar {
+  margin-bottom: var(--sp-1);
+}
+
 /* Flatten the per-group card chrome so the rows read as one running list. */
 .tool-timeline--checklist .step-card {
   margin: 0;
@@ -1204,6 +1708,178 @@ function fmtTok(n?: number | null): string {
   animation: checklistCheckIn var(--dur-base) var(--ease-press, ease-out) both;
 }
 
+/* ── Activity presentation (chat's intermediate work) ─────────────────
+   State is expressed through type strength and the status dot, never another
+   nested card. Values are direct colors rather than parent opacity so muted
+   rows do not get dimmed twice. */
+.tool-timeline--activity .step-card {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.tool-timeline--activity .step-group {
+  border-radius: 0;
+}
+
+.tool-timeline--activity .tool-row,
+.tool-timeline--activity .tool-row--running,
+.tool-timeline--activity .tool-row--error {
+  min-height: 1.75rem;
+  padding: 0.25rem 0.125rem;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.tool-timeline--activity.tool-timeline--checklist
+  .tool-row:not(.tool-row--running):not(.tool-row--error):not(.is-open),
+.tool-timeline--activity.tool-timeline--checklist
+  .tool-row:not(.tool-row--running):not(.tool-row--error):not(.is-open):hover {
+  opacity: 1;
+}
+
+.tool-timeline--activity .tool-row__label {
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+}
+
+.tool-timeline--activity .tool-row__arg,
+.tool-timeline--activity .tool-row__trailing,
+.tool-timeline--activity .tool-row__status {
+  color: var(--text-muted);
+}
+
+.tool-timeline--activity .tool-row--error .tool-row__status {
+  color: var(--warn);
+}
+
+.tool-timeline--activity .tool-row__arg {
+  flex: 0 1 auto;
+}
+
+.tool-timeline--activity .tool-row__trailing {
+  margin-left: 0;
+}
+
+.tool-timeline--activity .tool-row__activity-icon {
+  color: color-mix(in srgb, var(--text) 46%, transparent);
+  transition: color var(--dur-fast) var(--ease-standard);
+}
+
+.tool-timeline--activity .tool-row:hover .tool-row__activity-icon,
+.tool-timeline--activity .tool-row:focus-visible .tool-row__activity-icon,
+.tool-timeline--activity .tool-row.is-open .tool-row__activity-icon {
+  color: color-mix(in srgb, var(--text) 62%, transparent);
+}
+
+/* The header dot is the single working signal for a live turn; the running
+   row's icon identifies itself with the static accent colour alone. */
+.tool-timeline--activity .tool-row__activity-icon--running {
+  color: var(--accent);
+}
+
+.tool-timeline--activity .tool-row__activity-icon--error {
+  color: var(--warn);
+}
+
+.tool-timeline--activity .tool-row__activity-arrow {
+  flex: 0 0 auto;
+  color: color-mix(in srgb, var(--text) 46%, transparent);
+  opacity: 0;
+  transform: translateX(-0.125rem);
+  transition:
+    color var(--dur-fast) var(--ease-standard),
+    opacity var(--dur-fast) var(--ease-standard),
+    transform var(--dur-fast) var(--ease-standard);
+}
+
+.tool-timeline--activity .tool-row:hover .tool-row__activity-arrow,
+.tool-timeline--activity .tool-row:focus-visible .tool-row__activity-arrow {
+  opacity: 0.8;
+  transform: translateX(0);
+}
+
+.tool-timeline--activity .tool-row.is-open .tool-row__activity-arrow,
+.tool-timeline--activity
+  .step-group.is-open
+  > .tool-row--group
+  .tool-row__activity-arrow {
+  opacity: 0.55;
+  transform: rotate(90deg);
+}
+
+.tool-timeline--activity .tool-row.is-open:hover .tool-row__activity-arrow,
+.tool-timeline--activity .tool-row.is-open:focus-visible .tool-row__activity-arrow,
+.tool-timeline--activity
+  .step-group.is-open
+  > .tool-row--group:hover
+  .tool-row__activity-arrow,
+.tool-timeline--activity
+  .step-group.is-open
+  > .tool-row--group:focus-visible
+  .tool-row__activity-arrow {
+  opacity: 0.8;
+}
+
+.tool-timeline--activity .tool-row--running .tool-row__label {
+  color: var(--text);
+}
+
+.tool-timeline--activity .tool-row--running .tool-row__arg {
+  color: var(--text-muted);
+}
+
+.tool-timeline--activity .tool-row__elapsed,
+.tool-timeline--activity .tool-row--running .tool-row__elapsed {
+  padding: 0;
+  background: transparent;
+}
+
+.tool-timeline--activity
+  .tool-row:not(.tool-row--running):not(.tool-row--error).is-open,
+.tool-timeline--activity
+  .step-group:not(.step-group--running):not(.step-group--error).is-open
+  > .tool-row--group {
+  background: transparent;
+}
+
+/* One indent scale for the whole fold: a row's text starts after its icon at
+   0.125rem padding + 0.875rem icon + 0.625rem gap = 1.625rem, and everything
+   subordinate to that row (detail bodies, narration, member rows) aligns to
+   the same origin. Each nesting level therefore adds 1.5rem (icon + gap);
+   the fold's containment comes from the disclosure body's single left rule,
+   not from per-level rules here. */
+.tool-timeline--activity .tool-row-body {
+  padding: 0 0 0.125rem 1.625rem;
+}
+
+.tool-timeline--activity .step-group-members {
+  padding-left: 1.5rem;
+}
+
+.tool-timeline--activity .step-group-members::before {
+  display: none;
+}
+
+.tool-timeline--activity .msg-ai-text {
+  margin: 0.125rem 0 0.25rem 1.625rem;
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+  line-height: 1.55;
+}
+
+.tool-timeline--activity .msg-ai-text :deep(p) {
+  margin: 0;
+}
+
+.tool-timeline--activity .msg-ai-text + .msg-ai-text {
+  margin-top: 0.5rem;
+}
+
 /* Completed, non-open rows soften and tuck in — kept for traceability, not
    deleted — so the running row reads as the live focus. */
 .tool-timeline--checklist .tool-row-wrap:has(.tool-row--running) {
@@ -1224,6 +1900,11 @@ function fmtTok(n?: number | null): string {
 .tool-timeline--checklist .tool-row--error {
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--danger) 36%, transparent);
   border-radius: var(--radius-md);
+}
+
+.tool-timeline--activity.tool-timeline--checklist .tool-row--error {
+  border-radius: 0;
+  box-shadow: none;
 }
 
 @keyframes checklistCheckIn {
@@ -1252,9 +1933,25 @@ function fmtTok(n?: number | null): string {
     transform var(--dur-base) var(--ease-out);
 }
 
+/* Touch devices have no hover to reveal the activity chevron, so rest it at
+   a visible opacity there — otherwise the row reads as inert text. The
+   higher-specificity .is-open rules above still win, keeping an open row's
+   rotated chevron. */
+@media (hover: none) {
+  .tool-timeline--activity .tool-row__activity-arrow {
+    opacity: 0.55;
+    transform: translateX(0);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .tool-row__bullet--running {
     animation: none;
+  }
+
+  .tool-row__activity-icon,
+  .tool-row__activity-arrow {
+    transition: none;
   }
 
   .tool-timeline--checklist .tool-row--running,
@@ -1278,6 +1975,11 @@ function fmtTok(n?: number | null): string {
   }
 
   .tool-row-enter-active {
+    transition: none;
+  }
+
+  .tool-timeline__bulk-action,
+  .tool-timeline__bulk-icon {
     transition: none;
   }
 }

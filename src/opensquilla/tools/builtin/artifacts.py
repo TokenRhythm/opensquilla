@@ -2,29 +2,56 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
 from difflib import SequenceMatcher
 from pathlib import Path
+from typing import Any
 
+from opensquilla.artifact_validation import (
+    ArtifactValidationError,
+    is_pptx_candidate,
+    validate_artifact_for_delivery,
+)
 from opensquilla.artifacts import (
     DEFAULT_ARTIFACT_DISK_BUDGET_BYTES,
     DEFAULT_ARTIFACT_MAX_BYTES,
     ArtifactBudgetError,
+    ArtifactBundleManifest,
+    ArtifactIntegrityError,
+    ArtifactPathError,
     ArtifactStore,
+    artifact_bundle_manifest,
     artifact_mime_for_name,
     artifact_payload,
     artifact_publish_max_bytes_for_name,
+    collect_artifact_bundle,
 )
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
 from opensquilla.tools.path_aliases import resolve_workspace_alias
 from opensquilla.tools.path_policy import reject_foreign_host_path
 from opensquilla.tools.registry import tool
-from opensquilla.tools.types import CallerKind, ToolContext, ToolError, current_tool_context
+from opensquilla.tools.types import (
+    CallerKind,
+    RetryableToolInputError,
+    ToolContext,
+    ToolError,
+    current_tool_context,
+)
 
 _MAX_MISSING_FILE_CANDIDATES = 5
 _MAX_MISSING_FILE_SCAN = 2000
+
+
+def _bundle_result(manifest: ArtifactBundleManifest) -> dict[str, object]:
+    return {
+        "collection_status": manifest.collection_status,
+        "warning_codes": list(manifest.warning_codes),
+        "file_count": manifest.file_count,
+        "total_bytes": manifest.total_size,
+    }
 
 
 def _normalized_filename(value: str) -> str:
@@ -155,6 +182,68 @@ def _publish_artifact_metadata(
     return artifact_name, artifact_mime
 
 
+def _plan_run_steps_ready_for_delivery(run: Any) -> bool:
+    current_step_id = str(getattr(run, "current_step_id", "") or "")
+    step_states = list(getattr(run, "step_states", []) or [])
+    return (
+        not current_step_id
+        and bool(step_states)
+        and all(
+            isinstance(state, dict)
+            and str(state.get("status") or "") in {"completed", "skipped"}
+            for state in step_states
+        )
+    )
+
+
+async def _require_plan_run_ready_for_publish(ctx: ToolContext) -> None:
+    """Keep artifact delivery behind the authoritative final checkpoint."""
+
+    run_id = str(getattr(ctx, "plan_run_id", "") or "").strip()
+    if not run_id:
+        return
+    storage = getattr(ctx, "plan_storage", None)
+    get_plan_run = getattr(storage, "get_plan_run", None)
+    if not callable(get_plan_run):
+        raise ToolError("PlanRun storage is unavailable for artifact publication")
+    run = await get_plan_run(run_id)
+    if run is None:
+        raise ToolError("The active PlanRun no longer exists")
+    status = str(getattr(run, "status", "") or "")
+    task_id = str(getattr(ctx, "task_id", "") or "").strip()
+    active_task_id = str(getattr(run, "active_task_id", "") or "").strip()
+    if status == "completed":
+        return
+    if status == "running":
+        if not task_id or active_task_id != task_id:
+            raise ToolError(
+                "Artifact publication is unavailable because this task no longer "
+                "owns the attached PlanRun."
+            )
+        if _plan_run_steps_ready_for_delivery(run):
+            return
+    current_step_id = str(getattr(run, "current_step_id", "") or "")
+    current_detail = (
+        f" The current step is {current_step_id}."
+        if current_step_id
+        else ""
+    )
+    message = (
+        "publish_artifact was not executed because the attached PlanRun is "
+        f"{status or 'unavailable'}.{current_detail}"
+    )
+    if status == "running":
+        raise RetryableToolInputError(
+            f"{message} Record truthful checkpoints for the current step in plan "
+            "order, then retry publish_artifact only after the final checkpoint "
+            "returns no current step."
+        )
+    raise ToolError(
+        f"{message} Artifact publication is unavailable for this terminal or "
+        "unowned PlanRun state."
+    )
+
+
 @tool(
     name="publish_artifact",
     description=(
@@ -176,6 +265,21 @@ def _publish_artifact_metadata(
             "type": "string",
             "description": "Optional MIME type. Defaults to a filename guess.",
         },
+        "bundle": {
+            "type": "string",
+            "enum": ["auto", "directory", "none"],
+            "description": (
+                "Static webpage packaging mode. auto follows literal local dependencies "
+                "for HTML, directory snapshots bundle_root, and none publishes one file. "
+                "Defaults to auto."
+            ),
+        },
+        "bundle_root": {
+            "type": "string",
+            "description": (
+                "Dedicated workspace subdirectory to snapshot when bundle=directory."
+            ),
+        },
     },
     required=["path"],
     sandbox=SandboxToolDescriptor.artifact(kind="artifact.publish"),
@@ -184,10 +288,13 @@ async def publish_artifact(
     path: str,
     name: str | None = None,
     mime: str | None = None,
+    bundle: str = "auto",
+    bundle_root: str | None = None,
 ) -> str:
     ctx = current_tool_context.get()
     if ctx is None:
         raise ToolError("publish_artifact requires tool context")
+    await _require_plan_run_ready_for_publish(ctx)
     if not ctx.workspace_dir:
         raise ToolError("publish_artifact requires an active workspace")
     if not ctx.artifact_media_root:
@@ -199,9 +306,10 @@ async def publish_artifact(
     reject_foreign_host_path(path, platform=os.name, workspace=workspace)
     raw_path = Path(path)
     alias_target = resolve_workspace_alias(raw_path, workspace)
-    target = (
+    target_candidate = (
         alias_target or (raw_path if raw_path.is_absolute() else workspace / raw_path)
-    ).resolve()
+    )
+    target = target_candidate.resolve()
     try:
         target.relative_to(workspace)
     except ValueError as exc:
@@ -211,9 +319,113 @@ async def publish_artifact(
     if not target.is_file():
         raise ToolError(f"artifact path is not a file: {path}")
 
-    target_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
+    bundle_root_candidate: Path | None = None
+    if bundle_root is not None:
+        reject_foreign_host_path(bundle_root, platform=os.name, workspace=workspace)
+        raw_bundle_root = Path(bundle_root)
+        alias_bundle_root = resolve_workspace_alias(raw_bundle_root, workspace)
+        bundle_root_candidate = alias_bundle_root or (
+            raw_bundle_root
+            if raw_bundle_root.is_absolute()
+            else workspace / raw_bundle_root
+        )
+        resolved_bundle_root = bundle_root_candidate.resolve()
+        try:
+            resolved_bundle_root.relative_to(workspace)
+        except ValueError as exc:
+            raise ToolError(
+                f"artifact bundle root is outside workspace: {bundle_root}"
+            ) from exc
+
+    artifact_name, artifact_mime = _publish_artifact_metadata(
+        target=target,
+        name=name,
+        mime=mime,
+    )
+    target_is_pptx = is_pptx_candidate(
+        source_name=target.name,
+        name=artifact_name,
+        mime=artifact_mime,
+    )
+    configured_max_bytes = (
+        ctx.artifact_max_bytes
+        if ctx.artifact_max_bytes is not None
+        else DEFAULT_ARTIFACT_MAX_BYTES
+    )
+    max_bytes = artifact_publish_max_bytes_for_name(
+        artifact_name,
+        configured_max_bytes,
+    )
+    target_payload: bytes | None = None
+    if target_is_pptx:
+        target_size = target.stat().st_size
+        if max_bytes is not None and target_size > max_bytes:
+            budget_error = ArtifactBudgetError(
+                "artifact exceeds per-file budget "
+                f"({target_size} > {max_bytes})"
+            )
+            raise ToolError(str(budget_error)) from budget_error
+        # Inflation plus full-deck parsing is CPU-bound; keep it off the
+        # gateway event loop so concurrent sessions stay responsive.
+        target_payload = await asyncio.to_thread(target.read_bytes)
+        try:
+            await asyncio.to_thread(
+                validate_artifact_for_delivery,
+                target_payload,
+                source_name=target.name,
+                name=artifact_name,
+                mime=artifact_mime,
+                source="publish_artifact",
+            )
+        except ArtifactValidationError as exc:
+            raise RetryableToolInputError(exc.user_message) from exc
+
+    target_sha256 = hashlib.sha256(
+        target_payload if target_payload is not None else target.read_bytes()
+    ).hexdigest()
+    try:
+        bundle_snapshot = await asyncio.to_thread(
+            collect_artifact_bundle,
+            target_candidate,
+            workspace_root=workspace,
+            mode=bundle,
+            bundle_root=bundle_root_candidate,
+            entry_mime=artifact_mime,
+        )
+    except (ArtifactBudgetError, ArtifactPathError, OSError) as exc:
+        raise ToolError(str(exc)) from exc
+    bundle_manifest = (
+        artifact_bundle_manifest(bundle_snapshot)
+        if bundle_snapshot is not None
+        else None
+    )
+    if bundle_manifest is not None:
+        target_sha256 = next(
+            item.sha256
+            for item in bundle_manifest.files
+            if item.path == bundle_manifest.entrypoint
+        )
+    store = ArtifactStore(ctx.artifact_media_root)
     for published in reversed(ctx.published_artifacts):
         if published.get("sha256") != target_sha256:
+            continue
+        artifact_id = published.get("id")
+        if not isinstance(artifact_id, str):
+            continue
+        try:
+            published_manifest = store.describe_preview_bundle(
+                artifact_id,
+                session_id=ctx.artifact_session_id,
+            )
+        except (ArtifactIntegrityError, ArtifactPathError, ValueError):
+            continue
+        if bundle_manifest is None:
+            if published_manifest is not None:
+                continue
+        elif (
+            published_manifest is None
+            or published_manifest.bundle_digest != bundle_manifest.bundle_digest
+        ):
             continue
         llm_artifact = _llm_artifact_payload(
             published,
@@ -221,28 +433,25 @@ async def publish_artifact(
             workspace=workspace,
             target=target,
         )
-        return json.dumps(
-            {
-                "status": "already_published",
-                "artifact": llm_artifact,
-                "note": _publish_note(ctx, already_published=True),
-            },
-            ensure_ascii=False,
-        )
+        result: dict[str, object] = {
+            "status": "already_published",
+            "artifact": llm_artifact,
+            "note": _publish_note(ctx, already_published=True),
+        }
+        if published_manifest is not None:
+            result["bundle"] = _bundle_result(published_manifest)
+        return json.dumps(result, ensure_ascii=False)
 
-    artifact_name, artifact_mime = _publish_artifact_metadata(
-        target=target,
-        name=name,
-        mime=mime,
-    )
-
-    store = ArtifactStore(ctx.artifact_media_root)
     existing = store.find_existing_ref(
         session_id=ctx.artifact_session_id,
         session_key=ctx.session_key,
         sha256=target_sha256,
         name=artifact_name,
         mime=artifact_mime,
+        bundle_digest=(
+            bundle_manifest.bundle_digest if bundle_manifest is not None else None
+        ),
+        require_single_file=bundle_manifest is None,
     )
     if existing is not None:
         payload = artifact_payload(existing)
@@ -254,35 +463,54 @@ async def publish_artifact(
             workspace=workspace,
             target=target,
         )
-        return json.dumps(
-            {
-                "status": "already_published",
-                "artifact": llm_artifact,
-                "note": _publish_note(ctx, already_published=True),
-            },
-            ensure_ascii=False,
-        )
-    configured_max_bytes = (
-        ctx.artifact_max_bytes
-        if ctx.artifact_max_bytes is not None
-        else DEFAULT_ARTIFACT_MAX_BYTES
+        result = {
+            "status": "already_published",
+            "artifact": llm_artifact,
+            "note": _publish_note(ctx, already_published=True),
+        }
+        if bundle_manifest is not None:
+            result["bundle"] = _bundle_result(bundle_manifest)
+        return json.dumps(result, ensure_ascii=False)
+    disk_budget_bytes = (
+        ctx.artifact_disk_budget_bytes
+        if ctx.artifact_disk_budget_bytes is not None
+        else DEFAULT_ARTIFACT_DISK_BUDGET_BYTES
     )
     try:
-        ref = store.publish_file(
-            target,
-            session_id=ctx.artifact_session_id,
-            session_key=ctx.session_key,
-            name=artifact_name,
-            mime=artifact_mime,
-            source="publish_artifact",
-            max_bytes=artifact_publish_max_bytes_for_name(
-                artifact_name,
-                configured_max_bytes,
-            ),
-            disk_budget_bytes=ctx.artifact_disk_budget_bytes
-            if ctx.artifact_disk_budget_bytes is not None
-            else DEFAULT_ARTIFACT_DISK_BUDGET_BYTES,
-        )
+        if bundle_snapshot is not None:
+            ref = store.publish_bundle(
+                bundle_snapshot,
+                session_id=ctx.artifact_session_id,
+                session_key=ctx.session_key,
+                name=artifact_name,
+                mime=artifact_mime,
+                source="publish_artifact",
+                max_bytes=max_bytes,
+                disk_budget_bytes=disk_budget_bytes,
+            )
+        elif target_is_pptx:
+            assert target_payload is not None
+            ref = store.publish_bytes(
+                target_payload,
+                session_id=ctx.artifact_session_id,
+                session_key=ctx.session_key,
+                name=artifact_name,
+                mime=artifact_mime,
+                source="publish_artifact",
+                max_bytes=max_bytes,
+                disk_budget_bytes=disk_budget_bytes,
+            )
+        else:
+            ref = store.publish_file(
+                target,
+                session_id=ctx.artifact_session_id,
+                session_key=ctx.session_key,
+                name=artifact_name,
+                mime=artifact_mime,
+                source="publish_artifact",
+                max_bytes=max_bytes,
+                disk_budget_bytes=disk_budget_bytes,
+            )
     except ArtifactBudgetError as exc:
         raise ToolError(str(exc)) from exc
     except FileNotFoundError as exc:
@@ -298,11 +526,11 @@ async def publish_artifact(
         workspace=workspace,
         target=target,
     )
-    return json.dumps(
-        {
+    result = {
             "status": "published",
             "artifact": llm_artifact,
             "note": _publish_note(ctx),
-        },
-        ensure_ascii=False,
-    )
+    }
+    if bundle_manifest is not None:
+        result["bundle"] = _bundle_result(bundle_manifest)
+    return json.dumps(result, ensure_ascii=False)

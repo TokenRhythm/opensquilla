@@ -15,6 +15,8 @@ from opensquilla.sandbox.backend import bubblewrap as bubblewrap_mod
 from opensquilla.sandbox.backend.bubblewrap import BubblewrapBackend, build_bwrap_argv
 from opensquilla.sandbox.backend.linux_readiness import probe_bwrap
 from opensquilla.sandbox.backend.seatbelt import render_seatbelt_profile
+from opensquilla.sandbox.config import SandboxSettings
+from opensquilla.sandbox.policy import build_policy
 from opensquilla.sandbox.run_context import DomainGrant, RunContext
 from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.sandbox.types import (
@@ -435,7 +437,72 @@ async def test_real_bubblewrap_network_none_cannot_reach_host_loopback(
 
 @_BWRAP_PROXY_BRIDGE_LINUX_ONLY
 @pytest.mark.asyncio
-async def test_real_bubblewrap_masks_dynamic_sensitive_system_paths(
+async def test_real_bubblewrap_root_read_workspace_write_and_external_readonly(
+    tmp_path: Path,
+) -> None:
+    probe = probe_bwrap()
+    if not probe.available:
+        pytest.skip(probe.message)
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    policy = build_policy(
+        SecurityLevel.STANDARD,
+        "shell.exec",
+        workspace,
+        SandboxSettings(
+            backend="bubblewrap",
+            network_default="none",
+            exclude_slash_tmp=True,
+            exclude_tmpdir_env_var=True,
+        ),
+    )
+    policy = dataclasses.replace(
+        policy,
+        network=NetworkMode.NONE,
+        limits=dataclasses.replace(policy.limits, wall_timeout_s=5.0),
+    )
+    workspace_probe = workspace / "inside.txt"
+    outside_probe = outside / "outside.txt"
+    code = (
+        "from pathlib import Path\n"
+        "print('ROOT_LISTED', Path('/etc').is_dir())\n"
+        "print('HOST_READ', bool(Path('/etc/hosts').read_text(encoding='utf-8')))\n"
+        f"Path({str(workspace_probe)!r}).write_text('inside', encoding='utf-8')\n"
+        "print('WORKSPACE_WRITTEN')\n"
+        "try:\n"
+        f"    Path({str(outside_probe)!r}).write_text('outside', encoding='utf-8')\n"
+        "    print('EXTERNAL_WRITTEN')\n"
+        "except OSError as exc:\n"
+        "    print('EXTERNAL_BLOCKED', type(exc).__name__)\n"
+    )
+
+    result = await BubblewrapBackend().run(
+        SandboxRequest(
+            argv=(sys.executable, "-c", code),
+            cwd=workspace,
+            action_kind="shell.exec",
+            policy=policy,
+            env={},
+            session_id="root-read-acceptance",
+            run_mode="standard",
+        )
+    )
+
+    assert result.returncode == 0
+    assert "ROOT_LISTED True" in result.stdout
+    assert "HOST_READ True" in result.stdout
+    assert "WORKSPACE_WRITTEN" in result.stdout
+    assert "EXTERNAL_BLOCKED" in result.stdout
+    assert "EXTERNAL_WRITTEN" not in result.stdout
+    assert workspace_probe.read_text(encoding="utf-8") == "inside"
+    assert not outside_probe.exists()
+
+
+@_BWRAP_PROXY_BRIDGE_LINUX_ONLY
+@pytest.mark.asyncio
+async def test_real_bubblewrap_leaves_unreadable_system_file_to_os_permissions(
     tmp_path: Path,
 ) -> None:
     probe = probe_bwrap()
@@ -448,7 +515,7 @@ async def test_real_bubblewrap_masks_dynamic_sensitive_system_paths(
         "try:\n"
         "    print(target.read_text(encoding='utf-8')[:32])\n"
         "except Exception as exc:\n"
-        "    print('SENSITIVE_BLOCKED', type(exc).__name__)\n"
+        "    print('OS_READ_BLOCKED', type(exc).__name__)\n"
     )
 
     result = await BubblewrapBackend().run(
@@ -464,7 +531,7 @@ async def test_real_bubblewrap_masks_dynamic_sensitive_system_paths(
     )
 
     assert result.returncode == 0
-    assert result.stdout == "\n"
+    assert "OS_READ_BLOCKED PermissionError" in result.stdout
     assert "root:" not in result.stdout
 
 

@@ -5,9 +5,10 @@ approvals, channels, logs, agents, usage, and operational status. It is the
 best surface when you want browser-based chat, visible tool activity, durable
 approvals, and a quick view of runtime health.
 
-The default Control UI in the 0.4 release line is the Vue product UI served by the gateway.
-The legacy frontend is kept only as a maintainer rollback fallback, not as the
-normal user path.
+The Control UI is the Vue product UI served by the gateway. The historical
+`control_ui.frontend = "legacy"` setting is accepted temporarily so existing
+profiles still start, but it is deprecated, normalized to `"vue"`, and no
+longer activates the vanilla-JS client.
 
 ## Start the Web UI
 
@@ -34,6 +35,40 @@ The default gateway binds to `127.0.0.1` for safety.
 
 For gateway lifecycle, host/port, and exposure details, see
 [`gateway.md`](gateway.md).
+
+## Packaged and Source Installs
+
+Official Python wheels, Desktop installers, and container images already
+include the built Vue console. Those install paths do not require Node.js or
+npm on the user's machine.
+
+A Git checkout contains the Web UI sources instead of a committed build tree.
+The source installers run the following automatically and then package the
+result with OpenSquilla:
+
+```sh
+cd opensquilla-webui
+npm ci
+npm run build
+```
+
+Source installers and contributors therefore need Node.js 22.12+ and npm.
+Every source reinstall runs `npm ci` and rebuilds the console; the first run
+normally downloads the most, while a warm npm cache reduces later network use
+but not all build time or disk writes. Contributors should rerun the build after
+Web UI changes. A standard wheel build rejects a missing or stale console rather
+than silently producing a wheel with an empty `/control/` page.
+
+That fail-closed rule also applies to direct `pip install .`,
+`uv tool install .`, and VCS URL installs. Build the Web UI first when working
+from a local checkout; VCS URL users should clone the repository and run the
+source installer, or install the official release wheel.
+
+Standard source archives (`sdist`) also reject ignored personal BGM files so a
+shareable archive cannot accidentally leak private or copyrighted audio. A
+direct locally built wheel or local Docker image can still contain an explicitly
+customized library; official release artifacts always require the tracked
+playlist to remain empty.
 
 ## Main Areas
 
@@ -107,6 +142,25 @@ cards for:
 Artifact cards may include thumbnails or preview metadata, and the deliverables
 drawer keeps published outputs discoverable after the originating turn has
 scrolled away.
+
+HTML artifact previews always show whether they are using full network access
+or offline mode. A local Web UI may request either mode; a remotely reached Web
+UI is forced offline and runs bundle scripts in an opaque sandbox while
+explicitly reporting that workers, persistent storage, and root-absolute paths
+are not guaranteed. Ordinary web links continue to open in a separate browser
+tab with `noopener,noreferrer`. The Desktop app additionally offers an explicit
+action to open an HTTP(S) link in its isolated side browser.
+
+The full Desktop preview is intentionally browser-like, not a privileged
+Electron view. Each open item has a separate temporary cookie/storage/cache
+partition and no Node, preload, IPC, host filesystem, OpenSquilla identity, or
+system-browser session. Closing an item clears its temporary state. Device
+permissions, user-initiated downloads, popups, and external protocols remain
+host-mediated; client certificates from the operating-system store are never
+offered to preview pages. The active OpenSquilla Gateway is also unreachable
+inside side previews, preventing network proximity from becoming an ambient
+OpenSquilla identity; users can still open an explicit link in the system
+browser.
 
 For channel delivery limits and artifact recovery, see
 [`artifacts-and-media.md`](artifacts-and-media.md).

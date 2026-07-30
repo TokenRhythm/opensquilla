@@ -75,6 +75,38 @@ async def test_post_dream_hook_invoked_on_successful_run() -> None:
 
 
 @pytest.mark.asyncio
+async def test_memory_dream_handler_binds_synthetic_usage_scope() -> None:
+    from opensquilla.engine.usage_accounting import current_usage_accounting_scope
+
+    observed = []
+
+    class _StubDream:
+        async def run(self) -> object:
+            scope = current_usage_accounting_scope()
+            assert scope is not None
+            observed.append(scope.context)
+
+            class _R:
+                files_processed = 0
+                evidence_status = "ok"
+                apply_status = "ok"
+
+            return _R()
+
+    handler = make_memory_dream_handler(
+        build_dream=lambda _aid: _StubDream(),
+        usage_event_sink=object(),
+    )
+    result = await handler(CronJob(id="dream-worker", payload={"agent_id": "worker"}))
+
+    assert result.summary.startswith("dream agent=worker")
+    assert len(observed) == 1
+    assert observed[0].agent_id == "worker"
+    assert observed[0].run_kind == "memory_dream"
+    assert observed[0].session_id
+
+
+@pytest.mark.asyncio
 async def test_post_dream_hook_exception_does_not_poison_handler_result() -> None:
     """Hook failure logs an exception but the dream's HandlerResult
     must still reflect the successful dream — observability cannot

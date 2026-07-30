@@ -14,7 +14,12 @@ import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
-from opensquilla.engine.types import AgentEvent, TextDeltaEvent, ToolResultEvent
+from opensquilla.engine.types import (
+    AgentEvent,
+    TextDeltaEvent,
+    ToolResultEvent,
+    done_text_snapshot,
+)
 from opensquilla.skills.meta.events import _StepDone
 from opensquilla.skills.meta.templating import (
     _expand_skill_placeholders,
@@ -115,6 +120,7 @@ async def run_step_with_skill_stream(
     )
 
     final_text_parts: list[str] = []
+    done_text_present = False
     done_text = ""
     last_error_tool_result: str = ""
     async for event in agent_runner(system_prompt, user_message):
@@ -124,8 +130,7 @@ async def run_step_with_skill_stream(
         from opensquilla.engine.types import DoneEvent as _DoneEvent
 
         if isinstance(event, _DoneEvent):
-            if event.text:
-                done_text = event.text
+            done_text_present, done_text = done_text_snapshot(event)
             continue
         if isinstance(event, TextDeltaEvent):
             final_text_parts.append(event.text)
@@ -144,7 +149,7 @@ async def run_step_with_skill_stream(
 
     text = _normalize_agent_step_output(
         effective_skill,
-        ("".join(final_text_parts) or done_text).strip(),
+        (done_text if done_text_present else "".join(final_text_parts)).strip(),
     )
     if text:
         yield _StepDone(text=text)

@@ -7,6 +7,7 @@ import os
 import httpx
 
 from opensquilla.search.registry import register_provider
+from opensquilla.search.retry_policy import is_retryable_http_status
 from opensquilla.search.types import Recency, SearchErrorKind, SearchProviderError, SearchResult
 from opensquilla.secrets import clean_header_secret
 
@@ -96,7 +97,7 @@ class BraveSearchProvider:
                 provider=self.name,
                 kind=kind,
                 message=str(exc) or f"Brave search failed with HTTP {status_code}.",
-                retryable=kind in {"rate_limit", "http"},
+                retryable=is_retryable_http_status(status_code),
                 status_code=status_code,
             ) from exc
         except httpx.HTTPError as exc:
@@ -107,7 +108,22 @@ class BraveSearchProvider:
                 retryable=True,
             ) from exc
 
-        data = response.json()
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise SearchProviderError(
+                provider=self.name,
+                kind="parse",
+                message="Brave search returned malformed JSON.",
+                retryable=False,
+            ) from exc
+        if not isinstance(data, dict):
+            raise SearchProviderError(
+                provider=self.name,
+                kind="parse",
+                message="Brave search returned an invalid response payload.",
+                retryable=False,
+            )
         results: list[SearchResult] = []
 
         for item in (data.get("web", {}).get("results") or [])[:max_results]:

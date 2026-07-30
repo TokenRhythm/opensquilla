@@ -46,6 +46,7 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
+import { useI18n } from 'vue-i18n'
 import ControlSwitch from '@/components/ControlSwitch.vue'
 
 interface FieldSpec {
@@ -83,7 +84,13 @@ const inputType = computed(() => {
   if (props.field.type === 'int' || props.field.type === 'float') return 'number'
   return 'text'
 })
-const placeholder = computed(() => props.field.placeholder || (isSecret.value ? 'leave blank to keep current' : ''))
+const { t } = useI18n()
+// Secrets keep the blank-keeps-current contract, translated.
+const placeholder = computed(() => {
+  if (props.field.placeholder) return props.field.placeholder
+  if (!isSecret.value) return ''
+  return t('setup.field.keepCurrentPlaceholder')
+})
 const showWhenAttr = computed(() => {
   if (!props.field.showWhen || Object.keys(props.field.showWhen).length === 0) return ''
   return JSON.stringify(props.field.showWhen)

@@ -29,6 +29,7 @@ log = structlog.get_logger(__name__)
 
 _DEFAULT_RETENTION_DAYS = 30
 _DEFAULT_PRUNE_EVERY = 64
+_DEFAULT_PRUNE_BATCH = 1_000
 _DAY_MS = 24 * 60 * 60 * 1000
 _MAX_MESSAGE_CHARS = 4_000
 _MAX_TRACEBACK_CHARS = 20_000
@@ -87,12 +88,14 @@ class TurnErrorWriter:
         *,
         retention_days: int = _DEFAULT_RETENTION_DAYS,
         prune_every: int = _DEFAULT_PRUNE_EVERY,
+        prune_batch: int = _DEFAULT_PRUNE_BATCH,
         clock: Callable[[], int] = lambda: int(time.time() * 1000),
     ) -> None:
         self._conn = connection
         self._lock = threading.Lock()
         self._retention_days = max(1, int(retention_days))
         self._prune_every = max(1, int(prune_every))
+        self._prune_batch = max(1, int(prune_batch))
         self._clock = clock
         self._insert_count = 0
 
@@ -166,8 +169,17 @@ class TurnErrorWriter:
         try:
             with self._lock:
                 cur = self._conn.execute(
-                    "DELETE FROM turn_errors WHERE ts_ms < ?",
-                    (cutoff,),
+                    """
+                    DELETE FROM turn_errors
+                    WHERE rowid IN (
+                        SELECT rowid
+                        FROM turn_errors
+                        WHERE ts_ms < ?
+                        ORDER BY ts_ms, error_id
+                        LIMIT ?
+                    )
+                    """,
+                    (cutoff, self._prune_batch),
                 )
                 self._conn.commit()
             if cur.rowcount:

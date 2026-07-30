@@ -97,6 +97,36 @@ async def test_agents_rpc_list_without_registry_returns_empty() -> None:
 
 
 @pytest.mark.asyncio
+async def test_agent_identity_get_uses_production_agent_registry(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "IDENTITY.md").write_text(
+        "Name: Mira\nEmoji: 🦐\nTheme: ember\nAvatar: assets/mira.png\n",
+        encoding="utf-8",
+    )
+    cfg = GatewayConfig(workspace_dir=str(workspace))
+    registry = AgentRegistry(cfg, persist_changes=False)
+
+    result = await get_dispatcher().dispatch(
+        "r1",
+        "agent.identity.get",
+        {"agentId": "main"},
+        _ctx(cfg, registry),
+    )
+
+    assert result.error is None, result.error
+    assert result.payload == {
+        "agent_id": "main",
+        "name": "Mira",
+        "emoji": "🦐",
+        "creature": None,
+        "vibe": None,
+        "theme": "ember",
+        "avatar": "assets/mira.png",
+    }
+
+
+@pytest.mark.asyncio
 async def test_models_rpc_list_without_provider_selector_returns_empty() -> None:
     result = await get_dispatcher().dispatch(
         "r1",

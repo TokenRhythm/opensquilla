@@ -5,6 +5,7 @@ import type {
   ChatStreamTimelineItem,
 } from '@/types/chat'
 import { copyTextWithFallback } from '@/utils/browser'
+import { resolveAssistantAnswer } from '@/utils/chat/assistantActivity'
 
 export interface UseChatMessageActionsOptions {
   messages: Ref<ChatMessage[]>
@@ -16,6 +17,16 @@ export interface UseChatMessageActionsOptions {
   sendCurrentInput: () => void
   focusComposer: () => void
   pendingForkBeforeMessageId: Ref<string | null>
+  aiGeneratedLabel?: () => string
+  canDeliver?: () => boolean
+  notifyDeliveryBlocked?: () => void
+  /**
+   * User-visible feedback when regenerate/edit cannot run because the anchor
+   * user message has no durable server id yet (chat.send ack lost, or an
+   * older gateway omitted the id). Without it the buttons look dead: the
+   * only trace of the refusal would be a console warning.
+   */
+  notifyMessagePending?: () => void
 }
 
 export function useChatMessageActions(options: UseChatMessageActionsOptions) {
@@ -25,6 +36,21 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     // text (e.g. "<details>") that is visible on screen.
     if ((message.displayRole || message.role) === 'user') {
       return options.stripTimePrefix(message.text || '').trim()
+    }
+    const answer = resolveAssistantAnswer(
+      message,
+      message.timelineItems ?? [],
+      message.interrupted || message.terminalFailure
+        ? 'interrupted'
+        : message.isStreaming
+          ? 'working'
+          : 'settled',
+    )
+    // The same structurally proven PlanRun answer shown outside the collapsed
+    // activity must also be what Copy returns. Otherwise the compact completed
+    // state would silently copy the entire execution narration.
+    if (answer.source === 'terminal-control-boundary') {
+      return options.sanitizeCopyText(answer.text)
     }
     // Tool-bearing turns render text as separate timeline segments; the raw
     // message text concatenates them without separators, so rebuild from the
@@ -39,7 +65,10 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
 
   async function copyMessage(msg: ChatRenderedMessage): Promise<boolean> {
     try {
-      await copyTextWithFallback(copyableMessageText(msg))
+      const text = copyableMessageText(msg)
+      const isAssistant = (msg.displayRole || msg.role) === 'assistant'
+      const label = isAssistant ? options.aiGeneratedLabel?.().trim() : ''
+      await copyTextWithFallback(label && text ? `${text}\n\n${label}` : text)
       return true
     } catch (err) {
       console.warn('Copy failed:', err instanceof Error ? err.message : String(err))
@@ -70,6 +99,13 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
       console.warn('Wait for the current response to finish')
       return
     }
+    // Regenerate is a send action that also truncates local history and
+    // replaces the composer. Fail closed before any of those mutations when
+    // live delivery cannot receive the resulting turn.
+    if (options.canDeliver && !options.canDeliver()) {
+      options.notifyDeliveryBlocked?.()
+      return
+    }
     const assistantIndex = sourceMessageIndex(message)
     const userMsgIndex = previousUserMessageIndex(assistantIndex)
     if (userMsgIndex < 0) {
@@ -77,8 +113,15 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
       return
     }
 
-    const userText = options.messages.value[userMsgIndex]?.text || ''
-    options.pendingForkBeforeMessageId.value = options.messages.value[userMsgIndex]?.messageId || null
+    const userMessage = options.messages.value[userMsgIndex]
+    const forkBeforeMessageId = userMessage?.messageId || ''
+    if (!forkBeforeMessageId) {
+      console.warn('Wait for the message to finish saving before regenerating')
+      options.notifyMessagePending?.()
+      return
+    }
+    const userText = userMessage?.text || ''
+    options.pendingForkBeforeMessageId.value = forkBeforeMessageId
     options.messages.value = options.messages.value.slice(0, userMsgIndex)
     options.inputText.value = userText
     options.autoResizeTextarea()
@@ -93,8 +136,15 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     const msgIndex = sourceMessageIndex(message)
     if (msgIndex < 0) return
     if (options.messages.value[msgIndex]?.role !== 'user') return
-    const text = options.messages.value[msgIndex].text || ''
-    options.pendingForkBeforeMessageId.value = options.messages.value[msgIndex]?.messageId || null
+    const sourceMessage = options.messages.value[msgIndex]
+    const forkBeforeMessageId = sourceMessage?.messageId || ''
+    if (!forkBeforeMessageId) {
+      console.warn('Wait for the message to finish saving before editing')
+      options.notifyMessagePending?.()
+      return
+    }
+    const text = sourceMessage.text || ''
+    options.pendingForkBeforeMessageId.value = forkBeforeMessageId
     options.messages.value = options.messages.value.slice(0, msgIndex)
     options.inputText.value = text
     options.autoResizeTextarea()

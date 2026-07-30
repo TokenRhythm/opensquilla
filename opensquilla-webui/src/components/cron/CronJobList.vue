@@ -11,62 +11,13 @@
       </div>
     </div>
 
-    <div v-if="jobs.length === 0" class="state">
-      <template v-if="totalJobs === 0">
-        <div class="cron-empty__clock" aria-hidden="true">
-          <svg viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">
-            <defs>
-              <radialGradient id="cg" cx="50%" cy="50%" r="50%">
-                <stop offset="0%" stop-color="color-mix(in srgb, var(--accent) 20%, transparent)" />
-                <stop offset="60%" stop-color="color-mix(in srgb, var(--accent) 5%, transparent)" />
-                <stop offset="100%" stop-color="transparent" />
-              </radialGradient>
-            </defs>
-            <circle cx="60" cy="60" r="58" fill="url(#cg)" />
-            <circle cx="60" cy="60" r="44" fill="none" stroke="currentColor" stroke-opacity="0.18" stroke-width="1" />
-            <circle cx="60" cy="60" r="44" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="2 6" class="cron-empty__ring" />
-            <line
-              v-for="deg in [0,30,60,90,120,150,180,210,240,270,300,330]"
-              :key="deg"
-              :x1="60 + Math.cos(deg * Math.PI / 180) * 40"
-              :y1="60 + Math.sin(deg * Math.PI / 180) * 40"
-              :x2="60 + Math.cos(deg * Math.PI / 180) * (deg % 90 === 0 ? 32 : 36)"
-              :y2="60 + Math.sin(deg * Math.PI / 180) * (deg % 90 === 0 ? 32 : 36)"
-              stroke="currentColor"
-              :stroke-opacity="deg % 90 === 0 ? 0.5 : 0.25"
-              :stroke-width="deg % 90 === 0 ? 1.5 : 1"
-            />
-            <line x1="60" y1="60" x2="60" y2="28" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" class="cron-empty__hand" />
-            <line x1="60" y1="60" x2="84" y2="60" stroke="currentColor" stroke-opacity="0.6" stroke-width="2" stroke-linecap="round" />
-            <circle cx="60" cy="60" r="3" fill="var(--accent)" />
-          </svg>
-        </div>
-        <div class="cron-empty__title">{{ t('cronSkills.list.emptyTitle') }}</div>
-        <p class="cron-empty__msg">{{ t('cronSkills.list.emptyMsg') }}</p>
-        <button class="btn btn--primary cron-empty__cta" @click="emit('create')">
-          <Icon name="plus" :size="16" /><span>{{ t('cronSkills.list.createFirst') }}</span>
-        </button>
-        <div class="cron-empty__hints">
-          <span class="cron-empty__hints-label">{{ t('cronSkills.list.tryPreset') }}</span>
-          <button
-            v-for="preset in presets"
-            :key="preset.name"
-            class="cron-empty-hint"
-            @click="emit('preset', preset)"
-          >
-            <code>{{ preset.expression }}</code>
-            <span>{{ preset.label }}</span>
-          </button>
-        </div>
-      </template>
-      <template v-else>
-        <div class="state-icon"><Icon name="search" :size="48" /></div>
-        <div class="state-title">{{ t('cronSkills.list.noMatchesTitle') }}</div>
-        <p class="state-text">{{ t('cronSkills.list.noMatchesText') }}</p>
-      </template>
+    <div v-if="jobs.length === 0 && totalJobs > 0" class="state">
+      <div class="state-icon"><Icon name="search" :size="48" /></div>
+      <div class="state-title">{{ t('cronSkills.list.noMatchesTitle') }}</div>
+      <p class="state-text">{{ t('cronSkills.list.noMatchesText') }}</p>
     </div>
 
-    <div v-else-if="viewMode === 'cards'" class="cron-card-grid control-card-grid" style="--control-card-min: 340px">
+    <div v-else-if="viewMode === 'cards'" class="cron-card-grid control-card-grid" style="--control-card-min: 300px">
       <article
         v-for="(job, i) in jobs"
         :key="job.id"
@@ -76,101 +27,70 @@
         :data-cron-row="job.id"
       >
         <header class="cron-card__head">
+          <input
+            v-if="bulkMode"
+            class="cron-bulk-check"
+            type="checkbox"
+            :checked="selectedJobIds.has(job.id)"
+            :aria-label="t('cronSkills.list.selectJob', { name: displayJobName(job) })"
+            @change="emit('toggle-selection', job.id)"
+          >
           <span class="cron-card__dot" :class="dotClass(job)" />
           <button type="button" class="cron-card__name" :title="t('cronSkills.list.showRunHistory')" @click="emit('select', job.id)">
-            {{ job.name || job.id }}
+            {{ displayJobName(job) }}
           </button>
-          <span class="cron-pill" :class="`cron-pill--${jobKindClass(job)}`">{{ jobKindLabel(job) }}</span>
         </header>
-        <div class="cron-card__schedule">
-          <code class="cron-expr">{{ job.expression || job.schedule || '—' }}</code>
-          <span v-if="explainCron(job.expression || '')" class="cron-card__human">{{ explainCron(job.expression || '') }}</span>
+        <div class="cron-card__timing">
+          <span class="cron-card__schedule-text">
+            <Icon name="clock" :size="14" />
+            {{ explainCron(job.expression || '') || job.expression || job.schedule || '—' }}
+          </span>
+          <span class="cron-card__next" :class="{ 'is-paused': !job.enabled }">
+            {{ job.enabled ? nextRunText(job, now) : t('cronSkills.list.paused') }}
+          </span>
         </div>
-        <dl class="cron-card__meta">
-          <div><dt>{{ t('cronSkills.list.metaTarget') }}</dt><dd>{{ job.sessionTarget || job.session_target || '—' }}</dd></div>
-          <div>
-            <dt>{{ t('cronSkills.list.metaLastRun') }}</dt>
-            <dd>
-              {{ job.last_run ? humanCountdownPast(new Date(job.last_run), now) : '—' }}
-              <span v-if="job.last_status">
-                &middot; <span :class="`status status--${job.last_status === 'ok' || job.last_status === 'success' ? 'ok' : 'err'}`">{{ job.last_status }}</span>
-              </span>
-            </dd>
-          </div>
-          <div>
-            <dt>{{ t('cronSkills.list.metaNextRun') }}</dt>
-            <dd>
-              <template v-if="job.enabled">
-                <span class="cron-mono">{{ nextRunText(job, now) }}</span>
-                <span v-if="nextRunAbs(job, now)" class="cron-card__abs"> &middot; {{ nextRunAbs(job, now) }}</span>
-              </template>
-              <span v-else class="cron-muted">{{ t('cronSkills.list.paused') }}</span>
-            </dd>
-          </div>
-          <div v-if="(job.message || job.prompt || '').trim()" class="cron-card__message">
-            <dt>{{ t('cronSkills.list.metaPrompt') }}</dt>
-            <dd>{{ truncate(job.message || job.prompt || '') }}</dd>
-          </div>
-        </dl>
         <footer class="cron-card__actions">
-          <button class="cron-iconbtn cron-iconbtn--accent" :title="t('cronSkills.list.runNow')" :disabled="runningJobIds.has(job.id)" @click="emit('run', job.id)">
+          <button class="cron-iconbtn cron-iconbtn--accent" :aria-label="t('cronSkills.list.runNow')" :title="t('cronSkills.list.runNow')" :disabled="runningJobIds.has(job.id)" @click="emit('run', job.id)">
             <span v-if="runningJobIds.has(job.id)" class="cron-spinner" aria-hidden="true"></span>
-            <Icon v-else name="send" :size="16" />
-            <span>{{ runningJobIds.has(job.id) ? t('cronSkills.list.running') : t('cronSkills.list.run') }}</span>
+            <Icon v-else name="send" :size="15" />
+
           </button>
-          <button class="cron-iconbtn" :title="job.enabled ? t('cronSkills.list.pause') : t('cronSkills.list.resume')" @click="emit('toggle', job)">
-            <Icon :name="job.enabled ? 'stop' : 'send'" :size="16" /><span>{{ job.enabled ? t('cronSkills.list.pause') : t('cronSkills.list.resume') }}</span>
+          <button class="cron-iconbtn" :aria-label="t('cronSkills.list.edit')" :title="t('cronSkills.list.edit')" @click="emit('edit', job)">
+            <Icon name="edit" :size="15" />
           </button>
-          <button class="cron-iconbtn" :title="t('cronSkills.list.edit')" @click="emit('edit', job)">
-            <Icon name="edit" :size="16" /><span>{{ t('cronSkills.list.edit') }}</span>
+          <button class="cron-iconbtn cron-iconbtn--sm" :aria-label="job.enabled ? t('cronSkills.list.pause') : t('cronSkills.list.resume')" :title="job.enabled ? t('cronSkills.list.pause') : t('cronSkills.list.resume')" @click="emit('toggle', job)">
+            <Icon :name="job.enabled ? 'pause' : 'play'" :size="14" />
           </button>
-          <button class="cron-iconbtn cron-iconbtn--danger" :title="t('cronSkills.list.delete')" @click="emit('delete', job)">
-            <Icon name="trash" :size="16" />
+          <button class="cron-iconbtn cron-iconbtn--sm cron-iconbtn--danger" :aria-label="t('cronSkills.list.delete')" :title="t('cronSkills.list.delete')" @click="emit('delete', job)">
+            <Icon name="trash" :size="14" />
           </button>
         </footer>
       </article>
     </div>
 
     <div v-else class="cron-table-wrap">
-      <table class="cron-table">
+      <table class="cron-table cron-table--tasks">
         <thead>
           <tr>
-            <th v-for="col in tableCols" :key="col.key" :class="{ 'cron-th-sort': sortableCols.includes(col.key) }" @click="sortableCols.includes(col.key) ? emit('sort', col.key) : undefined">
+            <th v-if="bulkMode" class="cron-table__check"></th>
+            <th v-for="col in tableCols" :key="col.key" :class="{ 'cron-th-sort': sortableCols.includes(col.key), 'cron-table__actions-head': col.key === '_actions' }" @click="sortableCols.includes(col.key) ? emit('sort', col.key) : undefined">
               {{ col.label }}
-              <span v-if="sortCol === col.key" class="cron-table__arrow">{{ sortAsc ? ' ▲' : ' ▼' }}</span>
+              <span v-if="sortableCols.includes(col.key) && sortCol === col.key" class="cron-table__arrow">{{ sortAsc ? ' ▲' : ' ▼' }}</span>
             </th>
           </tr>
         </thead>
         <tbody>
           <tr v-for="job in jobs" :key="job.id" :class="{ 'is-selected': selectedId === job.id, 'is-imminent': isImminent(job, now) }" :data-cron-row="job.id">
-            <td>
-              <span class="cron-card__dot" :class="dotClass(job)" />
-              <button class="cron-link" @click="emit('select', job.id)">{{ job.name || job.id }}</button>
-            </td>
-            <td><span class="cron-pill" :class="`cron-pill--${jobKindClass(job)}`">{{ jobKindLabel(job) }}</span></td>
-            <td>{{ job.sessionTarget || job.session_target || '—' }}</td>
-            <td><code class="cron-expr cron-expr--inline">{{ job.expression || job.schedule || '—' }}</code></td>
-            <td>
-              <span v-if="job.enabled" class="status status--ok">{{ t('cronSkills.list.enabled') }}</span>
-              <span v-else class="status status--off">{{ t('cronSkills.list.paused') }}</span>
-            </td>
-            <td class="cron-mono">{{ job.last_run ? humanCountdownPast(new Date(job.last_run), now) : '—' }}</td>
-            <td class="cron-mono">{{ job.enabled ? nextRunText(job, now) : '—' }}</td>
-            <td class="cron-table__actions">
-              <button class="cron-iconbtn cron-iconbtn--sm" :title="runningJobIds.has(job.id) ? t('cronSkills.list.running') : t('cronSkills.list.runNow')" :disabled="runningJobIds.has(job.id)" @click="emit('run', job.id)">
-                <span v-if="runningJobIds.has(job.id)" class="cron-spinner" aria-hidden="true"></span>
-                <Icon v-else name="send" :size="14" />
-              </button>
-              <button class="cron-iconbtn cron-iconbtn--sm" :title="job.enabled ? t('cronSkills.list.pause') : t('cronSkills.list.resume')" @click="emit('toggle', job)">
-                <Icon :name="job.enabled ? 'stop' : 'send'" :size="14" />
-              </button>
-              <button class="cron-iconbtn cron-iconbtn--sm" :title="t('cronSkills.list.edit')" @click="emit('edit', job)">
-                <Icon name="edit" :size="14" />
-              </button>
-              <button class="cron-iconbtn cron-iconbtn--sm cron-iconbtn--danger" :title="t('cronSkills.list.delete')" @click="emit('delete', job)">
-                <Icon name="trash" :size="14" />
-              </button>
-            </td>
+            <td v-if="bulkMode" class="cron-table__check"><input class="cron-bulk-check" type="checkbox" :checked="selectedJobIds.has(job.id)" :aria-label="t('cronSkills.list.selectJob', { name: displayJobName(job) })" @change="emit('toggle-selection', job.id)"></td>
+            <td class="cron-table__task"><div class="cron-table__task-content"><span class="cron-card__dot" :class="dotClass(job)" /><button class="cron-link" @click="emit('select', job.id)">{{ displayJobName(job) }}</button></div></td>
+            <td class="cron-table__schedule"><div class="cron-table__schedule-content"><Icon name="clock" :size="14" /><span>{{ explainCron(job.expression || '') || job.expression || job.schedule || '—' }}</span></div></td>
+            <td class="cron-table__time cron-table__next">{{ job.enabled ? nextRunText(job, now) : t('cronSkills.list.paused') }}</td>
+            <td class="cron-table__actions"><div class="cron-table__actions-content">
+              <button class="cron-iconbtn cron-iconbtn--sm cron-iconbtn--accent" :aria-label="runningJobIds.has(job.id) ? t('cronSkills.list.running') : t('cronSkills.list.runNow')" :title="runningJobIds.has(job.id) ? t('cronSkills.list.running') : t('cronSkills.list.runNow')" :disabled="runningJobIds.has(job.id)" @click="emit('run', job.id)"><span v-if="runningJobIds.has(job.id)" class="cron-spinner" aria-hidden="true"></span><Icon v-else name="send" :size="14" /></button>
+              <button class="cron-iconbtn cron-iconbtn--sm" :aria-label="job.enabled ? t('cronSkills.list.pause') : t('cronSkills.list.resume')" :title="job.enabled ? t('cronSkills.list.pause') : t('cronSkills.list.resume')" @click="emit('toggle', job)"><Icon :name="job.enabled ? 'pause' : 'play'" :size="14" /></button>
+              <button class="cron-iconbtn cron-iconbtn--sm" :aria-label="t('cronSkills.list.edit')" :title="t('cronSkills.list.edit')" @click="emit('edit', job)"><Icon name="edit" :size="14" /></button>
+              <button class="cron-iconbtn cron-iconbtn--sm cron-iconbtn--danger" :aria-label="t('cronSkills.list.delete')" :title="t('cronSkills.list.delete')" @click="emit('delete', job)"><Icon name="trash" :size="14" /></button>
+            </div></td>
           </tr>
         </tbody>
       </table>
@@ -181,13 +101,14 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { localizedCronJobName } from '@/utils/cron/templateNames'
 import Icon from '@/components/Icon.vue'
 import type { CronJob, CronPanelTemplate } from '@/types/cron'
 import { explainCron } from '@/utils/cron/schedule'
-import { humanCountdownPast } from '@/utils/cron/time'
-import { dotClass, isImminent, jobKindClass, jobKindLabel, nextRunAbs, nextRunText } from '@/composables/cron/useCronJobs'
+import { dotClass, isImminent, nextRunText } from '@/composables/cron/useCronJobs'
 
 const { t } = useI18n()
+const displayJobName = (job: CronJob) => localizedCronJobName(job.name, job.id, t)
 
 defineProps<{
   jobs: CronJob[]
@@ -199,10 +120,13 @@ defineProps<{
   sortAsc: boolean
   now: number
   runningJobIds: Set<string>
+  bulkMode: boolean
+  selectedJobIds: Set<string>
 }>()
 
 const emit = defineEmits<{
   'update:viewMode': [mode: 'cards' | 'table']
+  'toggle-selection': [id: string]
   create: []
   preset: [template: CronPanelTemplate]
   select: [id: string]
@@ -215,27 +139,10 @@ const emit = defineEmits<{
 
 const tableCols = computed(() => [
   { key: 'name', label: t('cronSkills.list.colName') },
-  { key: 'payloadKind', label: t('cronSkills.list.colKind') },
-  { key: 'sessionTarget', label: t('cronSkills.list.colTarget') },
   { key: 'expression', label: t('cronSkills.list.colSchedule') },
-  { key: 'enabled', label: t('cronSkills.list.colStatus') },
-  { key: 'last_run', label: t('cronSkills.list.colLastRun') },
   { key: 'next_run', label: t('cronSkills.list.colNextRun') },
   { key: '_actions', label: '' },
 ])
-const sortableCols = ['name', 'payloadKind', 'sessionTarget', 'expression', 'last_run', 'next_run']
+const sortableCols = ['name', 'expression']
 
-// Preset seed values (name/message/expression) are written into a new job as
-// default content, so they are treated as example data and left untranslated;
-// only the UI hint `label` is localized.
-const presets = computed<Array<CronPanelTemplate & { label: string }>>(() => [
-  { name: 'Daily standup nudge', expression: '0 9 * * 1-5', payloadKind: 'reminder', message: 'Good morning! Time for standup.', label: t('cronSkills.list.presetWeekdayMorning') },
-  { name: 'Hourly health check', expression: '0 * * * *', payloadKind: 'agent_turn', message: 'Run a quick system health check and report any anomalies.', label: t('cronSkills.list.presetHourlyAgent') },
-  { name: 'Friday wrap-up', expression: '0 17 * * 5', payloadKind: 'agent_turn', message: "Summarize this week's work and propose next week's priorities.", label: t('cronSkills.list.presetFridayWrapup') },
-])
-
-function truncate(value: string): string {
-  const text = value.trim()
-  return text.length > 140 ? text.slice(0, 140) + '…' : text
-}
 </script>

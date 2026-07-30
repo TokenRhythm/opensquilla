@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import platform
@@ -328,6 +329,9 @@ def test_desktop_lifecycle_rejects_config_outside_profile_before_write(
     assert result.ok is False
     assert result.code == "DESKTOP_PROFILE_RECOVERY_REQUIRED"
     assert result.details["stableCode"] == "desktop_config_outside_profile"
+    assert result.details["allowedActions"] == ["retry-primary"]
+    assert "launch-recovery-profile" not in result.details["allowedActions"]
+    assert "primary profile" in result.message
     assert _profile_tree_snapshot(home) == before
     assert not user_state.exists()
 
@@ -352,6 +356,46 @@ def test_desktop_gateway_run_rejects_config_outside_profile_before_loading_it(
 
     assert result.exit_code == 1
     assert "DESKTOP_CONFIG_OUTSIDE_PROFILE" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "lock_error_name",
+    ["ProfileLockBusyError", "LegacyGatewayRunningError"],
+)
+def test_gateway_run_emits_stable_profile_in_use_error_without_sensitive_path(
+    tmp_path: Path,
+    monkeypatch,
+    lock_error_name: str,
+) -> None:
+    from opensquilla import recovery
+
+    sensitive_profile = tmp_path / "customer-private-profile"
+    lock_error = getattr(recovery, lock_error_name)
+
+    @contextlib.contextmanager
+    def busy_profile_guard():
+        raise lock_error(
+            f"profile is in use by another writer: {sensitive_profile}"
+        )
+        yield  # pragma: no cover - contextmanager shape only
+
+    def fail_run_gateway(**_kwargs) -> None:
+        raise AssertionError("gateway must not start without the profile lock")
+
+    monkeypatch.setattr(recovery, "guarded_desktop_profile", busy_profile_guard)
+    monkeypatch.setattr(gateway_cmd, "run_gateway", fail_run_gateway)
+
+    result = runner.invoke(app, ["gateway", "run"])
+
+    assert result.exit_code == 1
+    output = result.stdout + (result.stderr or "")
+    assert output.count("OPENSQUILLA_PROFILE_IN_USE") == 1
+    assert "Another OpenSquilla process is still using this profile" in output
+    assert "restart the computer" in output
+    assert "Do not delete profile lock files" in output
+    assert str(sensitive_profile) not in output
+    assert lock_error_name not in output
+    assert "Traceback" not in output
 
 
 def test_gateway_help_lists_lifecycle_commands() -> None:
@@ -638,8 +682,11 @@ def test_gateway_run_uses_config_host_port_when_flags_are_omitted(
         async def close(self, _reason):
             return None
 
-    async def fake_start_gateway_server(*, config, subscription_manager, run):
+    async def fake_start_gateway_server(
+        *, config, subscription_manager, run, _startup_started_at
+    ):
         captured["config"] = config
+        captured["startup_started_at"] = _startup_started_at
 
         async def done():
             return None
@@ -661,6 +708,7 @@ def test_gateway_run_uses_config_host_port_when_flags_are_omitted(
 
     assert captured["config"].host == "127.0.0.2"
     assert captured["config"].port == 19999
+    assert isinstance(captured["startup_started_at"], float)
 
 
 def test_gateway_run_records_cli_flags_as_runtime_overrides(
@@ -680,7 +728,9 @@ def test_gateway_run_records_cli_flags_as_runtime_overrides(
         async def close(self, _reason):
             return None
 
-    async def fake_start_gateway_server(*, config, subscription_manager, run):
+    async def fake_start_gateway_server(
+        *, config, subscription_manager, run, _startup_started_at
+    ):
         captured["config"] = config
 
         async def done():
@@ -725,7 +775,9 @@ def test_gateway_run_flags_do_not_leak_into_config_via_unrelated_persist(
         async def close(self, _reason):
             return None
 
-    async def fake_start_gateway_server(*, config, subscription_manager, run):
+    async def fake_start_gateway_server(
+        *, config, subscription_manager, run, _startup_started_at
+    ):
         captured["config"] = config
 
         async def done():
@@ -783,7 +835,9 @@ def test_gateway_run_keeps_missing_explicit_config_path_for_setup(
         async def close(self, _reason):
             return None
 
-    async def fake_start_gateway_server(*, config, subscription_manager, run):
+    async def fake_start_gateway_server(
+        *, config, subscription_manager, run, _startup_started_at
+    ):
         captured["config"] = config
 
         async def done():
@@ -1125,7 +1179,7 @@ class _ShutdownProbeServer:
 
 
 def _install_fake_start(server, holder, monkeypatch) -> None:
-    async def fake_start(*, config, subscription_manager, run):
+    async def fake_start(*, config, subscription_manager, run, _startup_started_at):
         server.spawn()
         holder["server"] = server
         return server

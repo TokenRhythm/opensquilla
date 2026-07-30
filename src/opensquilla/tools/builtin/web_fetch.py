@@ -27,7 +27,7 @@ from opensquilla.tools.registry import tool
 from opensquilla.tools.ssrf import environment_proxy_url as _environment_proxy_url
 from opensquilla.tools.ssrf import pinned_transport as _pinned_transport
 from opensquilla.tools.ssrf import validate_http_url_for_fetch
-from opensquilla.tools.types import SSRFBlockedError, current_tool_context
+from opensquilla.tools.types import PlanAccess, SSRFBlockedError, current_tool_context
 
 log = structlog.get_logger(__name__)
 
@@ -507,6 +507,7 @@ async def run_web_fetch_payload(
         },
     },
     required=["url"],
+    plan_access=PlanAccess.READ_ONLY,
     result_budget_class="external",
     sandbox=SandboxToolDescriptor.network(
         kind="web.fetch",

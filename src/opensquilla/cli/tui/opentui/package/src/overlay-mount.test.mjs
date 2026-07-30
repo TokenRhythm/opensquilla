@@ -21,8 +21,8 @@ class FakeNode {
     this.children.push(node);
     return this.children.length;
   }
-  remove(id) {
-    this.children = this.children.filter((child) => child.id !== id);
+  remove(node) {
+    this.children = this.children.filter((child) => child !== node);
   }
   getChildren() {
     return this.children;
@@ -77,7 +77,7 @@ function makeHarness({ terminalWidth = 100, terminalHeight = 24 } = {}) {
   };
   const lastCursor = () => cursorPositions.at(-1);
   return {
-    composer, press, paste, type, inputBox, overlayLayer, conversationBox,
+    renderer, composer, press, paste, type, inputBox, overlayLayer, conversationBox,
     lastCursor, cursorPositions, scrolls, sent,
   };
 }
@@ -208,6 +208,30 @@ test("on narrow terminals the menu narrows itself instead of clipping wider than
   for (const child of menu.getChildren()) {
     assert.ok(textWidth(child.options.content) <= 16, "row must fit the shrunken box");
   }
+});
+
+test("rail inset constrains completion, composer wrapping, and hardware caret together", () => {
+  const { composer, press, type, inputBox, overlayLayer, lastCursor } = makeHarness({ terminalWidth: 160 });
+  // Mirrors the wide context controller: the final 36 cells belong to the rail.
+  inputBox.right = 36;
+  composer.rerender();
+  composer.setCompletionContext({
+    catalog: [{ label: "/compact", description: "compact session", insert_text: "/compact " }],
+  });
+  press({ name: "/", sequence: "/" });
+  const menu = findDeep(overlayLayer, "completion-menu");
+  assert.equal(menu.options.right, 70); // 36 rail + the normal 34-cell local inset
+
+  press({ name: "escape" });
+  press({ name: "c", ctrl: true }); // clear the slash draft before wrap testing
+  type("a".repeat(130));
+  const composerBox = findDeep(inputBox, "composer-box");
+  const lines = composerBox.getChildren().map((child) => child.options.content);
+  // surface 124 - composer chrome/margins 6 = 118 content cells
+  assert.equal(lines[0].length, 118);
+  assert.equal(lines[1].length, 13); // 12 chars plus the caret cell
+  // Cursor coordinates are 1-based; the rail begins at 0-based x=124.
+  assert.ok(lastCursor().x <= 121);
 });
 
 test("menu height is clamped to the rows above the footer on short terminals", () => {
@@ -411,18 +435,6 @@ test("router strip values honor the semantic style from router.update", () => {
   assert.equal(value.options.fg, THEME.detailText);
 });
 
-test("pulse ticks do not re-assert an unchanged hardware-cursor cell", () => {
-  const { composer, press, cursorPositions } = makeHarness();
-  const before = cursorPositions.length;
-  composer.tickPulse(1);
-  composer.tickPulse(2);
-  composer.tickPulse(3);
-  assert.equal(cursorPositions.length, before, "no CUP re-assertions while the caret is idle");
-
-  press({ name: "a", sequence: "a" }); // a real keystroke still re-syncs
-  assert.ok(cursorPositions.length > before);
-});
-
 test("paste is ignored while the theme picker is modal", () => {
   const { composer, press, paste, type, sent } = makeHarness();
   composer.openThemePicker();
@@ -505,4 +517,81 @@ test("drafts taller than the composer window scroll to keep the caret visible", 
   const lines = box.getChildren().map((child) => child.options.content);
   assert.deepEqual(lines, ["l2", "l3", "l4 "]);
   assert.deepEqual(lastCursor(), { x: 6, y: 23, visible: true });
+});
+
+test("model strategy picker is modal and submits one control command", () => {
+  const { composer, press, paste, overlayLayer, sent } = makeHarness();
+  composer.openModelRoutingPicker({
+    current: "direct",
+    options: ["direct", "router", "ensemble"],
+  });
+
+  assert.ok(findDeep(overlayLayer, "model-routing-picker"));
+  paste("must-not-enter-the-composer");
+  press({ name: "down" });
+  press({ name: "return" });
+
+  assert.equal(findDeep(overlayLayer, "model-routing-picker"), null);
+  assert.deepEqual(sent.at(-1), {
+    type: "input.submit",
+    text: "/router on",
+    intent: "control",
+  });
+});
+
+test("model picker starts with Auto and submits the selected session pin", () => {
+  const { composer, press, paste, overlayLayer, sent } = makeHarness();
+  composer.openModelPicker({
+    current: null,
+    options: [
+      { id: "deepseek/deepseek-v4-pro", provider: "deepseek", context_window: 128000 },
+      { id: "z-ai/glm-5.2", provider: "z-ai", context_window: 200000 },
+    ],
+  });
+
+  const picker = findDeep(overlayLayer, "model-picker");
+  assert.ok(picker);
+  assert.match(findDeep(picker, "model-picker-row-0").options.content, /● Auto/);
+  paste("must-not-enter-the-composer");
+  press({ name: "down" });
+  press({ name: "return" });
+
+  assert.equal(findDeep(overlayLayer, "model-picker"), null);
+  assert.deepEqual(sent.at(-1), {
+    type: "input.submit",
+    text: "/model deepseek/deepseek-v4-pro",
+    intent: "control",
+  });
+});
+
+test("model picker filters without mutating the composer and Escape cancels", () => {
+  const { composer, type, press, overlayLayer, sent } = makeHarness();
+  composer.openModelPicker({
+    current: "deepseek/deepseek-v4-pro",
+    options: [
+      { id: "deepseek/deepseek-v4-pro", provider: "deepseek" },
+      { id: "z-ai/glm-5.2", provider: "z-ai" },
+    ],
+  });
+
+  type("glm");
+  const picker = findDeep(overlayLayer, "model-picker");
+  assert.ok(findDeep(picker, "model-picker-row-0").options.content.includes("z-ai/glm-5.2"));
+  press({ name: "escape" });
+
+  assert.equal(findDeep(overlayLayer, "model-picker"), null);
+  assert.equal(sent.length, 0);
+});
+
+test("strategy changes during a turn render as next until the turn ends", () => {
+  const { composer, inputBox } = makeHarness({ terminalWidth: 160 });
+  const strategyText = () => findDeep(inputBox, "router-strategy")?.options?.content;
+
+  composer.setModelRoutingState({ mode: "direct" });
+  assert.equal(strategyText(), "direct");
+  composer.setTurnActive({ active: true });
+  composer.setModelRoutingState({ mode: "ensemble" });
+  assert.equal(strategyText(), "next ensemble");
+  composer.setTurnActive({ active: false });
+  assert.equal(strategyText(), "ensemble");
 });

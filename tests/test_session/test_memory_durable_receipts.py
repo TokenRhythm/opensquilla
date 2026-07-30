@@ -8,7 +8,7 @@ from opensquilla.memory.checkpoint import checkpoint_coverage_hash, checkpoint_t
 from opensquilla.memory.session_flush import FlushReceipt, SessionFlushService
 from opensquilla.provider import Message
 from opensquilla.session.manager import SessionManager
-from opensquilla.session.models import MemoryDurableReceipt
+from opensquilla.session.models import MemoryDurableReceipt, SessionNode
 from opensquilla.session.storage import SessionStorage
 from opensquilla.tool_boundary import ToolCall, ToolResult
 
@@ -40,6 +40,111 @@ async def test_memory_durable_receipt_upsert_is_idempotent(tmp_path):
         )
         assert len(rows) == 1
         assert rows[0].status == "checkpoint_saved"
+    finally:
+        await storage.close()
+
+
+async def test_memory_durable_receipt_generation_fence_rejects_deleted_session(tmp_path):
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    try:
+        session_key = "agent:main:webchat:deleted"
+        session_id = "session-old"
+        await storage.upsert_session(
+            SessionNode(session_key=session_key, session_id=session_id)
+        )
+        await storage.delete_session(session_key)
+
+        with pytest.raises(KeyError, match="Session generation changed"):
+            await storage.upsert_memory_durable_receipt(
+                MemoryDurableReceipt(
+                    receipt_id="stale-deleted",
+                    session_key=session_key,
+                    session_id=session_id,
+                    scope="checkpoint",
+                    idempotency_key="checkpoint:stale-deleted",
+                    status="checkpoint_saved",
+                ),
+                expected_session_id=session_id,
+            )
+
+        assert await storage.list_memory_durable_receipts(session_key=session_key) == []
+    finally:
+        await storage.close()
+
+
+async def test_memory_durable_receipt_generation_fence_preserves_reused_key(tmp_path):
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    try:
+        session_key = "agent:main:webchat:reused"
+        old_session_id = "session-old"
+        new_session_id = "session-new"
+        idempotency_key = "checkpoint:shared-idempotency-key"
+        await storage.upsert_session(
+            SessionNode(session_key=session_key, session_id=old_session_id)
+        )
+        await storage.delete_session(session_key)
+        await storage.upsert_session(
+            SessionNode(session_key=session_key, session_id=new_session_id)
+        )
+        current = await storage.upsert_memory_durable_receipt(
+            MemoryDurableReceipt(
+                receipt_id="current",
+                session_key=session_key,
+                session_id=new_session_id,
+                scope="checkpoint",
+                idempotency_key=idempotency_key,
+                status="checkpoint_saved",
+            )
+        )
+
+        with pytest.raises(KeyError, match="Session generation changed"):
+            await storage.upsert_memory_durable_receipt(
+                MemoryDurableReceipt(
+                    receipt_id="stale",
+                    session_key=session_key,
+                    session_id=old_session_id,
+                    scope="checkpoint",
+                    idempotency_key=idempotency_key,
+                    status="checkpoint_failed",
+                    reason="stale callback",
+                ),
+                expected_session_id=old_session_id,
+            )
+
+        rows = await storage.list_memory_durable_receipts(session_key=session_key)
+        assert [row.receipt_id for row in rows] == [current.receipt_id]
+        assert rows[0].session_id == new_session_id
+        assert rows[0].status == "checkpoint_saved"
+        assert rows[0].reason is None
+    finally:
+        await storage.close()
+
+
+async def test_memory_durable_receipt_generation_fence_rejects_mismatched_payload(
+    tmp_path,
+):
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    try:
+        session_key = "agent:main:webchat:payload-mismatch"
+        current_session_id = "session-current"
+        await storage.upsert_session(
+            SessionNode(session_key=session_key, session_id=current_session_id)
+        )
+
+        with pytest.raises(KeyError, match="Session generation changed"):
+            await storage.upsert_memory_durable_receipt(
+                MemoryDurableReceipt(
+                    receipt_id="stale-payload",
+                    session_key=session_key,
+                    session_id="session-stale",
+                    scope="checkpoint",
+                    idempotency_key="checkpoint:stale-payload",
+                    status="checkpoint_saved",
+                ),
+                expected_session_id=current_session_id,
+            )
+
+        assert await storage.list_memory_durable_receipts(session_key=session_key) == []
     finally:
         await storage.close()
 
@@ -215,6 +320,43 @@ async def test_record_memory_checkpoint_preserves_operation_and_coverage_ids(tmp
             limit=1,
         )
         assert [row.receipt_id for row in rows] == [receipt.receipt_id]
+    finally:
+        await storage.close()
+
+
+async def test_record_memory_checkpoint_does_not_restore_deleted_session_receipt(
+    tmp_path,
+    monkeypatch,
+):
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    manager = SessionManager(storage, checkpoint_workspace_dir=tmp_path / "workspace")
+    try:
+        session_key = "agent:main:webchat:checkpoint-race"
+        session = await manager.create(session_key)
+        await manager.append_message(session_key, role="user", content="checkpoint body")
+        original_upsert = storage.upsert_memory_durable_receipt
+
+        async def delete_before_receipt_upsert(receipt, **kwargs):
+            await storage.delete_session(session_key)
+            return await original_upsert(receipt, **kwargs)
+
+        monkeypatch.setattr(
+            storage,
+            "upsert_memory_durable_receipt",
+            delete_before_receipt_upsert,
+        )
+
+        with pytest.raises(KeyError, match="Session generation changed"):
+            await manager.record_memory_checkpoint(session_key, turn_id="turn-race")
+
+        assert await storage.get_session(session_key) is None
+        assert (
+            await storage.list_memory_durable_receipts(
+                session_key=session_key,
+                session_id=session.session_id,
+            )
+            == []
+        )
     finally:
         await storage.close()
 

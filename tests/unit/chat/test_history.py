@@ -124,6 +124,51 @@ def test_transcript_entries_to_chat_messages_hides_marker_only_preflight_confirm
     assert messages[0]["text"] == ""
 
 
+def test_transcript_entries_to_chat_messages_hides_legacy_generated_plan_control() -> None:
+    entry = SimpleNamespace(
+        id=46,
+        message_id="m-plan",
+        role="user",
+        content=(
+            "[2026-07-27T20:14+08:00 Mon Asia/Shanghai]\n"
+            "Implement the approved plan “Site refresh”. "
+            "Work through its ordered steps and record truthful checkpoints."
+        ),
+        created_at="now",
+        provenance_kind=None,
+        provenance_source_session_key=None,
+        provenance_source_tool=None,
+        turn_context={"plan_run_id": "run-1"},
+        turn_usage=None,
+        tool_calls=None,
+    )
+
+    messages = transcript_entries_to_chat_messages([entry])
+
+    assert messages[0]["text"] == ""
+    assert messages[0]["turn_context"]["plan_run_id"] == "run-1"
+
+
+def test_transcript_entries_to_chat_messages_keeps_explicit_plan_implementation_text() -> None:
+    entry = SimpleNamespace(
+        id=47,
+        message_id="m-plan-custom",
+        role="user",
+        content="Implement only the first two approved steps, then stop.",
+        created_at="now",
+        provenance_kind=None,
+        provenance_source_session_key=None,
+        provenance_source_tool=None,
+        turn_context={"plan_run_id": "run-2"},
+        turn_usage=None,
+        tool_calls=None,
+    )
+
+    messages = transcript_entries_to_chat_messages([entry])
+
+    assert messages[0]["text"] == "Implement only the first two approved steps, then stop."
+
+
 def _assistant_entry(**overrides: object) -> SimpleNamespace:
     entry = SimpleNamespace(
         id=7,

@@ -136,6 +136,20 @@ _OPENAI_COMPAT_CASES: list[Case] = [
     ("openai", None, "", "invalid_request_error: bad payload", K.BAD_REQUEST),
     # Family miss falls through to the shared tail.
     ("openai", None, "", "malformed chunk received", K.MALFORMED_RESPONSE),
+    (
+        "tokenrhythm",
+        None,
+        "invalid_stream_order",
+        "TokenRhythm stream mutated state after finish_reason",
+        K.MALFORMED_RESPONSE,
+    ),
+    (
+        "openai",
+        None,
+        "invalid_stream_frame",
+        "Provider stream returned an invalid choice batch",
+        K.MALFORMED_RESPONSE,
+    ),
     ("openrouter", None, "", "request error: connection reset by peer", K.TRANSPORT_TRANSIENT),
     ("openai", None, "timeout", "Request timed out: ", K.TRANSPORT_TRANSIENT),
 ]
@@ -216,6 +230,51 @@ _GENERIC_TAIL_CASES: list[Case] = [
     (_UNREGISTERED, None, "", "malformed response after timeout", K.MALFORMED_RESPONSE),
 ]
 
+# --- shared tail: adapter-synthesized terminal-evidence codes ---
+# These raw codes are emitted locally when a stream ends without terminal
+# evidence or a native tool call arrives without usable arguments. They must
+# classify as retryable for every family and for unregistered providers.
+_TERMINAL_EVIDENCE_CASES: list[Case] = [
+    (
+        "openai",
+        None,
+        "incomplete_stream",
+        "SomeBackend stream ended before a finish reason",
+        K.TRANSPORT_TRANSIENT,
+    ),
+    (
+        "anthropic",
+        None,
+        "incomplete_stream",
+        "Anthropic stream ended before message_stop",
+        K.TRANSPORT_TRANSIENT,
+    ),
+    (_UNREGISTERED, None, "incomplete_stream", "", K.TRANSPORT_TRANSIENT),
+    (
+        "openai",
+        None,
+        "incomplete_tool_call",
+        "SomeBackend returned invalid native tool arguments",
+        K.TRANSPORT_TRANSIENT,
+    ),
+    (
+        "anthropic",
+        None,
+        "incomplete_tool_call",
+        "Anthropic response ended with an incomplete tool call",
+        K.TRANSPORT_TRANSIENT,
+    ),
+    # The raw-code row outranks the tail's "malformed" substring row, which
+    # would otherwise downgrade recovery to SURFACE.
+    (
+        "ollama",
+        None,
+        "incomplete_tool_call",
+        "Ollama stream contained malformed tool calls",
+        K.TRANSPORT_TRANSIENT,
+    ),
+]
+
 # --- inputs that must keep falling through to UNKNOWN ---
 _UNKNOWN_CASES: list[Case] = [
     (_UNREGISTERED, 401, "", "", K.UNKNOWN),
@@ -242,6 +301,7 @@ CORPUS: list[Case] = (
     + _ANTHROPIC_CASES
     + _OLLAMA_CASES
     + _GENERIC_TAIL_CASES
+    + _TERMINAL_EVIDENCE_CASES
     + _UNKNOWN_CASES
 )
 

@@ -25,6 +25,13 @@ from .types import (
     SessionTarget,
 )
 
+_RUN_MODE_ALIASES = {
+    "bypass": "full",
+    "standard-sandbox": "standard",
+    "standard_sandbox": "standard",
+}
+_PERSISTED_RUN_MODES = frozenset({"standard", "trusted", "full"})
+
 
 def _validate_structured_schedule(
     kind: ScheduleKind | str,
@@ -63,6 +70,20 @@ def _coerce_wake_mode(value: CronWakeMode | str) -> CronWakeMode:
     if isinstance(value, CronWakeMode):
         return value
     return CronWakeMode(str(value or CronWakeMode.NOW.value).strip().lower())
+
+
+def _persisted_run_mode(value: str, *, creator_is_owner: bool) -> str:
+    """Resolve the already-authorized execution mode at the scheduler boundary."""
+
+    normalized = str(value or "").strip().lower()
+    normalized = _RUN_MODE_ALIASES.get(normalized, normalized)
+    if not normalized:
+        normalized = "full" if creator_is_owner else "trusted"
+    if normalized not in _PERSISTED_RUN_MODES:
+        raise ValueError(f"unsupported cron run_mode: {value!r}")
+    if normalized == "full" and not creator_is_owner:
+        return "trusted"
+    return normalized
 
 
 def _delivery_requested(delivery: DeliveryConfig | None) -> bool:
@@ -145,6 +166,8 @@ class SchedulerOps:
         creator_session_key: str = "",
         creator_sender_id: str = "",
         creator_is_owner: bool = False,
+        run_mode: str = "",
+        idempotency_key: str = "",
     ) -> CronJob:
         """Validate the structured schedule, compute jitter, persist a new CronJob.
 
@@ -199,6 +222,10 @@ class SchedulerOps:
             delivery=delivery or DeliveryConfig(),
             explicit_delivery=delivery is not None,
         )
+        effective_run_mode = _persisted_run_mode(
+            run_mode,
+            creator_is_owner=creator_is_owner,
+        )
 
         job = CronJob(
             name=name,
@@ -220,6 +247,10 @@ class SchedulerOps:
             creator_session_key=creator_session_key or "",
             creator_sender_id=creator_sender_id or "",
             creator_is_owner=bool(creator_is_owner),
+            run_mode=effective_run_mode,
+            elevated="full" if effective_run_mode == "full" else "",
+            execution_target="host" if effective_run_mode == "full" else "sandbox",
+            idempotency_key=idempotency_key,
         )
 
         if kind == ScheduleKind.AT:
@@ -234,8 +265,7 @@ class SchedulerOps:
             # CRON or EVERY with cron expression: scan forward
             job.next_run_at = _next_run(job, now)
 
-        await self._store.save(job)
-        return job
+        return await self._store.create_or_get(job)
 
     async def update(self, job_id: str, **patch) -> CronJob | None:
         """Apply a partial update to an existing job. Returns None if not found."""

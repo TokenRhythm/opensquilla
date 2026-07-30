@@ -23,14 +23,18 @@ Policy (matches the bundle-route precedent):
 
 from __future__ import annotations
 
+import ipaddress
 from urllib.parse import urlsplit
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from starlette.websockets import WebSocket
 
 from opensquilla.gateway.config import GatewayConfig
 
 _DEFAULT_SCHEME_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
+_BROWSER_ORIGIN_SCHEMES = frozenset({"http", "https"})
+_WILDCARD_BIND_HOSTS = frozenset({"0.0.0.0", "::"})
 
 
 def extract_http_token(request: Request | None) -> str | None:
@@ -65,6 +69,142 @@ def _effective_port(scheme: str, port: int | None) -> int | None:
     return _DEFAULT_SCHEME_PORTS.get(scheme)
 
 
+def _http_equivalent_scheme(scheme: str) -> str:
+    return {"ws": "http", "wss": "https"}.get(scheme, scheme)
+
+
+def _normalized_hostname(hostname: str | None) -> str | None:
+    if hostname is None:
+        return None
+    value = hostname.strip().rstrip(".").casefold()
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1]
+    if not value:
+        return None
+    try:
+        return ipaddress.ip_address(value.split("%", 1)[0]).compressed
+    except ValueError:
+        return value
+
+
+def _is_loopback_hostname(hostname: str | None) -> bool:
+    normalized = _normalized_hostname(hostname)
+    if normalized is None:
+        return False
+    if normalized == "localhost" or normalized.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_ip_literal(hostname: str | None) -> bool:
+    normalized = _normalized_hostname(hostname)
+    if normalized is None:
+        return False
+    try:
+        ipaddress.ip_address(normalized)
+    except ValueError:
+        return False
+    return True
+
+
+def _request_authority_matches_config(
+    *,
+    request_scheme: str,
+    request_hostname: str,
+    request_port: int | None,
+    config: GatewayConfig,
+) -> bool:
+    """Validate Host against the configured bind instead of trusting it.
+
+    A browser-controlled DNS name can resolve to loopback and make both Host
+    and Origin agree (DNS rebinding).  Same-origin comparison is therefore
+    meaningful only after the request authority is proven to be one the
+    gateway is expected to serve.
+    """
+
+    request_host = _normalized_hostname(request_hostname)
+    bind_host = _normalized_hostname(config.host)
+    if request_host is None or bind_host is None:
+        return False
+    if bind_host in _WILDCARD_BIND_HOSTS:
+        # A wildcard listener has no configured DNS authority. Trusting an
+        # arbitrary same-origin Host here would let a hostile hostname that
+        # resolves to the gateway pass both the Host and Origin comparison
+        # (DNS rebinding). IP literals and localhost names are unambiguous;
+        # operators using a custom hostname or reverse proxy must list that
+        # exact browser origin in ``cors.allowed_origins``.
+        if _effective_port(_http_equivalent_scheme(request_scheme), request_port) != config.port:
+            return False
+        return _is_ip_literal(request_host) or _is_loopback_hostname(request_host)
+    if _effective_port(_http_equivalent_scheme(request_scheme), request_port) != config.port:
+        return False
+    if _is_loopback_hostname(bind_host):
+        return _is_loopback_hostname(request_host)
+    if _is_ip_literal(bind_host):
+        return request_host == bind_host
+    return request_host == bind_host
+
+
+def _parsed_browser_origin(origin: str):
+    """Parse a serialized browser Origin, rejecting non-origin URL material."""
+    if not origin or origin == "null":
+        return None
+    try:
+        parsed = urlsplit(origin)
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme not in _BROWSER_ORIGIN_SCHEMES
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    return parsed, port
+
+
+def _origin_allowed(
+    *,
+    origin: str | None,
+    request_scheme: str,
+    request_hostname: str | None,
+    request_port: int | None,
+    config: GatewayConfig | None,
+) -> bool:
+    if origin is None:
+        return True
+    parsed_origin = _parsed_browser_origin(origin)
+    if parsed_origin is None or request_hostname is None:
+        return False
+    parsed, parsed_port = parsed_origin
+    if config is not None and any(
+        allowed == origin for allowed in config.cors.allowed_origins if allowed != "*"
+    ):
+        return True
+    normalized_request_scheme = _http_equivalent_scheme(request_scheme)
+    if config is not None and not _request_authority_matches_config(
+        request_scheme=normalized_request_scheme,
+        request_hostname=request_hostname,
+        request_port=request_port,
+        config=config,
+    ):
+        return False
+    return (
+        parsed.scheme == normalized_request_scheme
+        and _normalized_hostname(parsed.hostname)
+        == _normalized_hostname(request_hostname)
+        and _effective_port(parsed.scheme, parsed_port)
+        == _effective_port(normalized_request_scheme, request_port)
+    )
+
+
 def request_origin_allowed(request: Request, config: GatewayConfig | None = None) -> bool:
     """Reject browser requests whose Origin is not the gateway itself.
 
@@ -75,25 +215,44 @@ def request_origin_allowed(request: Request, config: GatewayConfig | None = None
     Origins the operator explicitly listed in ``cors.allowed_origins`` pass
     too, except the ``"*"`` wildcard, which never bypasses the guard.
     """
-    origin = request.headers.get("origin")
-    if origin is None:
-        return True
-    if config is not None and any(
-        allowed == origin for allowed in config.cors.allowed_origins if allowed != "*"
-    ):
-        return True
+    request_url = request.url
     try:
-        parsed = urlsplit(origin)
+        request_port = request_url.port
     except ValueError:
         return False
-    request_url = request.url
-    if not parsed.scheme or parsed.hostname is None or request_url.hostname is None:
-        return False  # includes the opaque "null" origin
-    return (
-        parsed.scheme == request_url.scheme
-        and parsed.hostname == request_url.hostname
-        and _effective_port(parsed.scheme, parsed.port)
-        == _effective_port(request_url.scheme, request_url.port)
+    return _origin_allowed(
+        origin=request.headers.get("origin"),
+        request_scheme=request_url.scheme,
+        request_hostname=request_url.hostname,
+        request_port=request_port,
+        config=config,
+    )
+
+
+def websocket_origin_allowed(websocket: WebSocket, config: GatewayConfig | None = None) -> bool:
+    """Apply the HTTP same-origin policy to a WebSocket upgrade.
+
+    Browser WebSocket handshakes carry the embedding page's HTTP(S) Origin
+    while the request URL itself uses WS(S), so the request scheme is mapped
+    to its HTTP equivalent before comparison. Origin-less native clients
+    remain compatible.
+    """
+
+    headers = getattr(websocket, "headers", None)
+    origin = headers.get("origin") if headers is not None else None
+    url = getattr(websocket, "url", None)
+    if url is None:
+        return origin is None
+    try:
+        request_port = getattr(url, "port", None)
+    except ValueError:
+        return False
+    return _origin_allowed(
+        origin=origin,
+        request_scheme=str(getattr(url, "scheme", "") or ""),
+        request_hostname=getattr(url, "hostname", None),
+        request_port=request_port,
+        config=config,
     )
 
 

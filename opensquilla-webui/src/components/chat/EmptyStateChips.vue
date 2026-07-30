@@ -1,15 +1,21 @@
 <template>
   <div class="empty-state">
     <p class="empty-state__greeting">{{ greeting }}</p>
-    <p class="empty-state__identity">{{ identityLine }}</p>
-    <div v-if="!suppressed" class="empty-state__chips" role="group" :aria-label="t('chat.suggestedTasks')">
+    <div
+      v-if="!suppressed"
+      class="empty-state__chips"
+      role="group"
+      :aria-label="t('chat.suggestedTasks')"
+      :aria-disabled="disabled || undefined"
+    >
       <button
         v-for="chip in chips"
-        :key="chip"
+        :key="chip.label"
         type="button"
         class="empty-state__chip"
-        @click="emit('pick', chip)"
-      >{{ chip }}</button>
+        :disabled="disabled"
+        @click="emit('pick', chip.prompt)"
+      >{{ chip.label }}</button>
     </div>
   </div>
 </template>
@@ -18,6 +24,7 @@
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRpcCall } from '@/composables/useRpc'
+import { optionalSessionRpcCallOptions } from '@/composables/chat/sessionBootstrapAdmission'
 
 const { t } = useI18n()
 
@@ -28,29 +35,46 @@ interface CapabilityStatus {
   imageGenerationEnabled?: boolean
 }
 
-interface AgentIdentityPayload {
-  name?: string | null
-}
-
-const props = defineProps<{
+withDefaults(defineProps<{
   agentId: string
   suppressed?: boolean
-}>()
+  disabled?: boolean
+}>(), {
+  suppressed: false,
+  disabled: false,
+})
 
 const emit = defineEmits<{
   pick: [text: string]
 }>()
 
+interface SuggestionChip {
+  label: string
+  prompt: string
+}
+
+function ordinaryChip(label: string): SuggestionChip {
+  return { label, prompt: label }
+}
+
+const buildGameChip = computed<SuggestionChip>(() => ({
+  label: t('chat.chips.buildGame'),
+  prompt: t('chat.chips.buildGamePrompt'),
+}))
+
 // Rendered immediately so a late capability lookup swaps labels in place
 // instead of shifting the landing layout, and kept whenever the lookup fails.
 const FALLBACK_CHIPS = computed(() => [
-  t('chat.chips.whatCanYouDo'),
-  t('chat.chips.summarizeWebpage'),
-  t('chat.chips.planWeek'),
+  buildGameChip.value,
+  ordinaryChip(t('chat.chips.summarizeWebpage')),
+  ordinaryChip(t('chat.chips.planWeek')),
 ])
 
-const capabilityStatus = useRpcCall<CapabilityStatus>('onboarding.status')
-const identity = useRpcCall<AgentIdentityPayload>('agent.identity.get', { agentId: props.agentId })
+const capabilityStatus = useRpcCall<CapabilityStatus>(
+  'onboarding.status',
+  undefined,
+  { callOptions: optionalSessionRpcCallOptions },
+)
 
 const greeting = computed(() => {
   const hour = new Date().getHours()
@@ -59,22 +83,19 @@ const greeting = computed(() => {
   return t('chat.greetingEvening')
 })
 
-const identityLine = computed(() => {
-  const name = identity.data.value?.name
-  const label = typeof name === 'string' && name.trim() ? name.trim() : props.agentId
-  return t('chat.identityReady', { label })
-})
-
 const chips = computed(() => {
   const status = capabilityStatus.data.value
   if (!status) return FALLBACK_CHIPS.value
-  const derived: string[] = []
-  if (status.searchConfigured) derived.push(t('chat.chips.searchAiNews'))
+  const derived: SuggestionChip[] = []
+  if (status.searchConfigured) derived.push(ordinaryChip(t('chat.chips.searchAiNews')))
   if (status.imageGenerationConfigured && status.imageGenerationEnabled !== false) {
-    derived.push(t('chat.chips.generateImage'))
+    derived.push(ordinaryChip(t('chat.chips.generateImage')))
   }
-  derived.push(t('chat.chips.summarizeWebpage'), t('chat.chips.whatCanYouDo'))
-  if (derived.length < 3) derived.push(t('chat.chips.planWeek'))
+  derived.push(
+    ordinaryChip(t('chat.chips.summarizeWebpage')),
+    buildGameChip.value,
+  )
+  if (derived.length < 3) derived.push(ordinaryChip(t('chat.chips.planWeek')))
   return derived.slice(0, 4)
 })
 </script>
@@ -87,10 +108,26 @@ const chips = computed(() => {
   flex-direction: column;
   align-items: center;
   gap: var(--sp-2);
+  position: relative;
   text-align: center;
 }
 
+/* Dawn halo behind the greeting — themes without --atmosphere-dawn simply
+   render no halo. Kept behind text via z-index, never intercepts input. */
+.empty-state::before {
+  background: var(--atmosphere-dawn, transparent);
+  border-radius: var(--radius-full);
+  content: '';
+  filter: blur(48px);
+  inset: -34% -16%;
+  opacity: 0.55;
+  pointer-events: none;
+  position: absolute;
+  z-index: -1;
+}
+
 .empty-state__greeting {
+  animation: empty-state-greeting-reveal calc(var(--dur-base) * 2.5) var(--ease-out) both;
   margin: var(--sp-2) 0 0;
   font-family: var(--font-display);
   font-size: clamp(1.75rem, 1rem + 1.8vw, 2.25rem);
@@ -99,11 +136,17 @@ const chips = computed(() => {
   color: var(--text);
 }
 
-.empty-state__identity {
-  margin: 0;
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
-  color: var(--text-dim);
+@keyframes empty-state-greeting-reveal {
+  from {
+    filter: blur(5px);
+    opacity: 0;
+    transform: translateY(7px);
+  }
+  to {
+    filter: blur(0);
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .empty-state__chips {
@@ -137,6 +180,17 @@ const chips = computed(() => {
   color: var(--text);
 }
 
+.empty-state__chip:disabled {
+  cursor: default;
+  opacity: 0.72;
+}
+
+.empty-state__chip:disabled:hover {
+  background: var(--bg-elevated);
+  border-color: var(--border);
+  color: var(--text-muted);
+}
+
 .empty-state__chip:focus-visible {
   outline: none;
   box-shadow: var(--focus-ring);
@@ -150,11 +204,17 @@ const chips = computed(() => {
   .empty-state__chips {
     min-height: 2.75rem;
   }
+
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .empty-state__greeting {
+    animation: none;
+  }
+
   .empty-state__chip {
     transition: none;
   }
+
 }
 </style>

@@ -23,6 +23,20 @@ export interface SetupTierRow extends SetupTierValue {
   name: string
 }
 
+export interface SetupProviderOption {
+  providerId: string
+  label: string
+  disabled?: boolean
+}
+
+export interface SetupProviderCredentialStatus {
+  provider: string
+  available: boolean
+  source?: string
+  envKey?: string
+  reason?: string
+}
+
 export type RouterConfigDisabledReason = 'single-model' | 'ensemble' | null
 export type VisibleRouterModeChoice = 'router' | 'single'
 export type TierTemplateState = 'recommended' | 'custom' | 'disabled'
@@ -65,6 +79,7 @@ interface TierConfig {
 
 interface RouterConfig {
   enabled?: boolean
+  preset_binding?: 'follow_primary' | 'custom'
   default_tier?: string
   visual_mode?: string
   tier_profile?: string | null
@@ -72,6 +87,8 @@ interface RouterConfig {
   tier_provider_mismatch?: string
   tiers?: Record<string, TierConfig>
 }
+
+export type RouterBinding = 'follow_primary' | 'custom' | 'legacy'
 
 interface RouterPanelContext {
   routerSummary: ComputedRef<string>
@@ -83,6 +100,8 @@ interface RouterPanelContext {
   // Optional provider-scoped catalogs so mixed-provider tier rows never share
   // model ids. Missing/empty catalogs keep the existing free-text input.
   discoveredModelsByProvider?: ComputedRef<DiscoveredModelsByProvider>
+  providerOptions?: ComputedRef<SetupProviderOption[]>
+  providerCredentialStatus?: ComputedRef<SetupProviderCredentialStatus[]>
 }
 
 export function useSetupRouterForm() {
@@ -91,6 +110,7 @@ export function useSetupRouterForm() {
   const routerVisualMode = ref<RouterVisualMode>(DEFAULT_ROUTER_VISUAL_MODE)
   const tierValues = ref<Record<string, SetupTierValue>>({})
   const activeProvider = ref('')
+  const savedBinding = ref<RouterBinding>('legacy')
   const crossProviderTiers = ref(false)
   const tierProviderMismatch = ref<'route' | 'veto'>('route')
   const mode = computed(() => routerMode.value)
@@ -142,24 +162,35 @@ export function useSetupRouterForm() {
     router: RouterConfig,
     profileTiers: Record<string, TierConfig>,
     provider = '',
+    statusBinding?: RouterBinding,
   ) {
     activeProvider.value = provider.toLowerCase()
     crossProviderTiers.value = router.cross_provider_tiers === true
     tierProviderMismatch.value = router.tier_provider_mismatch === 'veto' ? 'veto' : 'route'
-    // openrouter-mix is the only enabled router mode whose tier_profile is null,
-    // and it is only valid for the openrouter LLM provider; recommended carries
-    // tier_profile = the provider. Anything else enabled is recommended.
+    // Ownership is a server contract, not a shape inferred from tier_profile.
+    // Missing ownership is an historical/older-Gateway config and must be
+    // treated conservatively: editing it may explicitly adopt `custom`, but it
+    // must never silently become a follow-primary preset.
+    const binding: RouterBinding = statusBinding
+      || router.preset_binding
+      || 'legacy'
+    savedBinding.value = binding
     if (router.enabled === false) {
       routerMode.value = 'disabled'
-    } else if (provider.toLowerCase() === 'openrouter' && !router.tier_profile) {
+    } else if (binding === 'follow_primary') {
+      routerMode.value = 'recommended'
+    } else if (binding === 'legacy' && provider.toLowerCase() === 'openrouter' && !router.tier_profile) {
       routerMode.value = 'openrouter-mix'
     } else {
-      routerMode.value = 'recommended'
+      routerMode.value = 'custom'
     }
     routerDefaultTier.value = normalizeRouterTier(router.default_tier || '') || DEFAULT_TEXT_TIER
     routerVisualMode.value = normalizeRouterVisualMode(router.visual_mode)
 
-    const tiers = Object.assign({}, profileTiers || {}, router.tiers || {})
+    const hasProfileTiers = Object.keys(profileTiers || {}).length > 0
+    const tiers = binding === 'follow_primary' && hasProfileTiers
+      ? { ...profileTiers }
+      : Object.assign({}, profileTiers || {}, router.tiers || {})
     const next: Record<string, SetupTierValue> = {}
     Object.entries(tiers).forEach(([name, tier]) => {
       const tierName = normalizeRouterTier(name) || name
@@ -178,6 +209,19 @@ export function useSetupRouterForm() {
   function updateTierField(name: string, key: keyof SetupTierValue, value: string | boolean) {
     const tier = tierValues.value[name]
     if (!tier) return
+    if (key === 'provider') {
+      const provider = String(value || '').trim().toLowerCase()
+      const currentProvider = String(tier.provider || '').trim().toLowerCase()
+      if (provider === currentProvider) return
+      // Provider and model form one routing identity. Replace the whole row in
+      // one reactive assignment so no observer can see a foreign model id
+      // paired with the newly selected provider.
+      tierValues.value = {
+        ...tierValues.value,
+        [name]: { ...tier, provider, model: '' },
+      }
+      return
+    }
     if (key === 'supportsImage') {
       tier.supportsImage = Boolean(value)
     } else {
@@ -199,6 +243,10 @@ export function useSetupRouterForm() {
 
   function setRouterMode(value: string) {
     routerMode.value = value
+  }
+
+  function enableFromSavedBinding() {
+    routerMode.value = savedBinding.value === 'follow_primary' ? 'recommended' : 'custom'
   }
 
   function setRouterDefaultTier(value: string) {
@@ -253,6 +301,8 @@ export function useSetupRouterForm() {
         tierLabel: context.tierLabel,
         hasMixedTierProviders: hasMixedTierProviders.value,
         discoveredModelsByProvider: context.discoveredModelsByProvider?.value ?? {},
+        providerOptions: context.providerOptions?.value ?? [],
+        providerCredentialStatus: context.providerCredentialStatus?.value ?? [],
       }
     })
   }
@@ -268,6 +318,7 @@ export function useSetupRouterForm() {
     isDirty,
     initFromConfig,
     setRouterMode,
+    enableFromSavedBinding,
     setRouterDefaultTier,
     setRouterVisualMode,
     updateTierField,

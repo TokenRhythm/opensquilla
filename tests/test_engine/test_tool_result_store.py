@@ -179,8 +179,11 @@ def test_cleanup_ignores_non_record_directories(tmp_path: Path) -> None:
     (stray / "content.txt").write_text("foreign file", encoding="utf-8")
     os.utime(stray / "content.txt", (1_000.0, 1_000.0))  # ancient -> would expire if scanned
 
-    # A fresh write with aggressive retention triggers cleanup.
-    _write(store, "new output", tool_use_id="t2", retention_seconds=1)
+    # A fresh write triggers cleanup. Keep the retention window comfortably
+    # above slow Windows filesystem/antivirus scans so the record written just
+    # above cannot expire while this test prepares the stray directory. The
+    # 1970 timestamp remains old enough to prove a stray path is never scanned.
+    _write(store, "new output", tool_use_id="t2", retention_seconds=60)
 
     assert (stray / "content.txt").read_text(encoding="utf-8") == "foreign file"
     assert store.read(record.handle, session_id=_SESSION_ID).content == "kept output"

@@ -1,20 +1,12 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 import pytest
 
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
-
-# Bound before the autouse hermeticity stub replaces the module attribute, so
-# the collector tests exercise the real implementation.
-from opensquilla.gateway.rpc_doctor import _legacy_home_payload
 from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE
-from opensquilla.health.evaluator import evaluate_legacy_home
-from opensquilla.migration import legacy_detect
-from opensquilla.migration.legacy_detect import LegacyHomeCandidate
 
 
 async def _ready_memory(params: dict[str, Any], ctx: RpcContext) -> dict[str, Any]:
@@ -122,20 +114,6 @@ def _reset_router_strategy_cache():
     yield
     squilla_router_step._strategy = None
     squilla_router_step._strategy_key = None
-
-
-@pytest.fixture(autouse=True)
-def _no_legacy_home(monkeypatch: pytest.MonkeyPatch):
-    # The migration surface scans real host paths (~/.opensquilla, portable
-    # bases); stub the collector so these tests stay hermetic on developer
-    # machines. Tests that exercise the surface re-patch it themselves.
-    import opensquilla.gateway.rpc_doctor as rpc_doctor
-
-    monkeypatch.setattr(
-        rpc_doctor,
-        "_legacy_home_payload",
-        lambda ctx: {"detected": False, "targetFresh": False},
-    )
 
 
 @pytest.mark.asyncio
@@ -603,6 +581,45 @@ async def test_doctor_status_can_skip_deep_memory_diagnostics(monkeypatch) -> No
 
     assert response.ok is True
     assert seen_memory_params == {"agentId": "main", "deep": False}
+
+
+@pytest.mark.asyncio
+async def test_doctor_provider_probe_is_disabled_by_default_and_opt_in(
+    monkeypatch,
+) -> None:
+    import opensquilla.gateway.rpc_doctor as rpc_doctor
+
+    seen_probe_values: list[bool] = []
+
+    async def provider_status(params: dict[str, Any], ctx: RpcContext) -> dict[str, Any]:
+        seen_probe_values.append(bool(params.get("probeModels")))
+        return {
+            "activeProvider": "openrouter",
+            "providers": [
+                {
+                    "providerId": "openrouter",
+                    "active": True,
+                    "configured": True,
+                    "buildable": True,
+                }
+            ],
+        }
+
+    _patch_ready_support_surfaces(monkeypatch, rpc_doctor)
+    monkeypatch.setattr(rpc_doctor, "_handle_providers_status", provider_status)
+    ctx = RpcContext(conn_id="test", config=GatewayConfig())
+
+    first = await get_dispatcher().dispatch("req-default", "doctor.status", {}, ctx)
+    second = await get_dispatcher().dispatch(
+        "req-probe",
+        "doctor.status",
+        {"probeProviders": True},
+        ctx,
+    )
+
+    assert first.ok is True
+    assert second.ok is True
+    assert seen_probe_values == [False, True]
 
 
 @pytest.mark.asyncio
@@ -1249,82 +1266,8 @@ async def test_doctor_status_skips_router_runtime_surface_when_router_disabled(
     ]
 
 
-# ---------------------------------------------------------------------------
-# Migration surface — legacy-home detection (advisory only).
-# ---------------------------------------------------------------------------
-
-
-def test_evaluate_legacy_home_emits_migration_finding() -> None:
-    findings = evaluate_legacy_home(
-        {
-            "detected": True,
-            "targetFresh": True,
-            "path": "/tmp/legacy-home",
-            "kind": "cli-home",
-        }
-    )
-
-    assert len(findings) == 1
-    finding = findings[0]
-    assert finding.id == "migration.legacy_home_detected"
-    assert finding.severity == "warn"
-    assert finding.surface == "migration"
-    assert "/tmp/legacy-home" in finding.title
-    assert "cli-home" in finding.detail
-    assert finding.evidence == {
-        "path": "/tmp/legacy-home",
-        "kind": "cli-home",
-        "target_fresh": True,
-    }
-    preview = "opensquilla migrate opensquilla --kind cli-home --source /tmp/legacy-home"
-    assert [(step.label, step.command) for step in finding.fix_steps] == [
-        ("Preview the import", preview),
-        ("Apply the import", f"{preview} --apply"),
-    ]
-    assert finding.restart_required is False
-
-
-def test_evaluate_legacy_home_is_silent_without_candidate() -> None:
-    assert evaluate_legacy_home({"detected": False, "targetFresh": True}) == []
-    assert evaluate_legacy_home({"detected": False, "targetFresh": False}) == []
-
-
-def test_legacy_home_payload_reads_config_home_and_freshness(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    seen_targets: list[Path | None] = []
-    candidate = LegacyHomeCandidate(
-        path=tmp_path / "legacy-home", kind="windows-portable"
-    )
-
-    def _detect(target: Path | None = None) -> LegacyHomeCandidate:
-        seen_targets.append(target)
-        return candidate
-
-    monkeypatch.setattr(legacy_detect, "detect_legacy_home", _detect)
-    cfg = GatewayConfig(state_dir=str(tmp_path / "home" / "state"))
-    ctx = RpcContext(conn_id="test", config=cfg)
-
-    payload = _legacy_home_payload(ctx)
-
-    assert payload == {
-        "detected": True,
-        "targetFresh": True,
-        "path": str(candidate.path),
-        "kind": candidate.kind,
-        "command": legacy_detect.suggested_migrate_command(candidate),
-    }
-    # Detection targeted the home the gateway actually runs from.
-    assert seen_targets == [(tmp_path / "home").resolve()]
-
-    (tmp_path / "home" / "state").mkdir(parents=True)
-    (tmp_path / "home" / "state" / "sessions.db").write_bytes(b"")
-    assert _legacy_home_payload(ctx)["targetFresh"] is False
-
-
 @pytest.mark.asyncio
-async def test_doctor_status_reports_detected_legacy_home(monkeypatch) -> None:
+async def test_doctor_status_has_no_migration_discovery_surface(monkeypatch) -> None:
     import opensquilla.gateway.rpc_doctor as rpc_doctor
 
     async def provider_status(params: dict[str, Any], ctx: RpcContext) -> dict[str, Any]:
@@ -1342,69 +1285,6 @@ async def test_doctor_status_reports_detected_legacy_home(monkeypatch) -> None:
 
     monkeypatch.setattr(rpc_doctor, "_handle_providers_status", provider_status)
     _patch_ready_support_surfaces(monkeypatch, rpc_doctor)
-    monkeypatch.setattr(
-        rpc_doctor,
-        "_legacy_home_payload",
-        lambda ctx: {
-            "detected": True,
-            "targetFresh": True,
-            "path": "/tmp/legacy-home",
-            "kind": "cli-home",
-        },
-    )
-
-    response = await get_dispatcher().dispatch(
-        "req-1",
-        "doctor.status",
-        {},
-        RpcContext(conn_id="test", config=GatewayConfig()),
-    )
-
-    assert response.ok is True
-    finding = next(
-        finding
-        for finding in response.payload["findings"]
-        if finding["id"] == "migration.legacy_home_detected"
-    )
-    assert finding["surface"] == "migration"
-    assert finding["severity"] == "warn"
-    assert finding["restartRequired"] is False
-    assert finding["evidence"] == {
-        "path": "/tmp/legacy-home",
-        "kind": "cli-home",
-        "target_fresh": True,
-    }
-    preview = "opensquilla migrate opensquilla --kind cli-home --source /tmp/legacy-home"
-    # `opensquilla migrate` is not config-aware, so the recovery-step config
-    # scoping must leave the commands untouched.
-    assert [step["command"] for step in finding["fixSteps"]] == [
-        preview,
-        f"{preview} --apply",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_doctor_status_migration_surface_is_silent_without_candidate(
-    monkeypatch,
-) -> None:
-    import opensquilla.gateway.rpc_doctor as rpc_doctor
-
-    async def provider_status(params: dict[str, Any], ctx: RpcContext) -> dict[str, Any]:
-        return {
-            "activeProvider": "openrouter",
-            "providers": [
-                {
-                    "providerId": "openrouter",
-                    "active": True,
-                    "configured": True,
-                    "buildable": True,
-                }
-            ],
-        }
-
-    monkeypatch.setattr(rpc_doctor, "_handle_providers_status", provider_status)
-    _patch_ready_support_surfaces(monkeypatch, rpc_doctor)
-    # The autouse _no_legacy_home stub already reports no candidate.
 
     response = await get_dispatcher().dispatch(
         "req-1",
@@ -1418,4 +1298,5 @@ async def test_doctor_status_migration_surface_is_silent_without_candidate(
         finding
         for finding in response.payload["findings"]
         if finding["surface"] == "migration"
+        or finding["id"] == "migration.legacy_home_detected"
     ]

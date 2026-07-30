@@ -6,6 +6,8 @@ import json
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any
 
+OPENTUI_SCREEN_MODE = "alternate-screen"
+
 
 class HostToPythonMessageError(ValueError):
     """Raised when the OpenTUI host emits an invalid control message."""
@@ -28,8 +30,42 @@ class RouterPluginState:
 
 
 @dataclass(frozen=True)
+class ContextUpdate:
+    """Canonical task identity and runtime context projected into the host.
+
+    This is intentionally a small display contract.  It never carries raw
+    identity documents, attachment bytes, credentials, or full workspace
+    paths; those remain owned by the Gateway/runtime.
+    """
+
+    agent: dict[str, str | None]
+    task: str
+    surface: str
+    gateway: str
+    model: str
+    permission: str
+    workspace: str
+    queue: str
+    context: str = ""
+
+
+@dataclass(frozen=True)
+class ModelRoutingState:
+    """Canonical Gateway-owned strategy projected into the host."""
+
+    mode: str
+    router_enabled: bool = False
+    ensemble_enabled: bool = False
+    selection_mode: str = ""
+    rollout_phase: str = "observe"
+    applies_to: str = "next_accepted_turn"
+    busy: bool = False
+
+
+@dataclass(frozen=True)
 class TurnBegin:
     id: str
+    client_message_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -41,6 +77,14 @@ class TurnEnd:
 @dataclass(frozen=True)
 class PromptEcho:
     text: str
+    client_message_id: str | None = None
+
+
+@dataclass(frozen=True)
+class PromptState:
+    turn_id: str
+    client_message_id: str
+    disposition: str = "accepted"
 
 
 @dataclass(frozen=True)
@@ -80,11 +124,84 @@ class ComposerState:
 
 
 @dataclass(frozen=True)
+class AttachmentState:
+    """One sanitized attachment chip owned by the composer."""
+
+    id: str
+    kind: str
+    label: str
+    status: str
+    message: str = ""
+
+
+@dataclass(frozen=True)
+class AttachmentUpdate:
+    id: str
+    status: str
+    message: str = ""
+
+
+@dataclass(frozen=True)
+class AttachmentRemove:
+    id: str
+
+
+@dataclass(frozen=True)
+class AttachmentClear:
+    status: str | None = None
+
+
+@dataclass(frozen=True)
+class HistoryMessage:
+    """One canonical durable transcript row projected into the host."""
+
+    id: str
+    role: str
+    text: str = ""
+    timestamp: str | int | float | None = None
+    reasoning: str = ""
+    attachments: tuple[dict[str, Any], ...] = ()
+    artifacts: tuple[dict[str, Any], ...] = ()
+    tool_calls: tuple[dict[str, Any], ...] = ()
+    usage: dict[str, Any] | None = None
+    turn_context: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class HistoryReplace:
+    """Atomically replace the host transcript with one bootstrap snapshot."""
+
+    session_key: str
+    history_scope: str = "complete"
+    has_more: bool = False
+    loaded_count: int = 0
+    canonical_available: bool = False
+    messages: tuple[HistoryMessage, ...] = ()
+    compaction_summaries: tuple[dict[str, Any], ...] = ()
+
+
+@dataclass(frozen=True)
+class CompletionArgumentChoice:
+    """One structured value offered after a slash command's name."""
+
+    value: str
+    description: str = ""
+
+
+@dataclass(frozen=True)
 class CompletionCandidate:
     label: str
     description: str
     insert_text: str
     category: str
+    usage: str = ""
+    aliases: tuple[str, ...] = ()
+    argument_choices: tuple[CompletionArgumentChoice, ...] = ()
+    visible_by_default: bool = True
+    deprecated: bool = False
+    submit_behavior: str = "submit"
+    busy_policy: str = "immediate"
+    presentation: str = "notice"
 
 
 @dataclass(frozen=True)
@@ -133,12 +250,23 @@ class ApprovalDismiss:
 
 @dataclass(frozen=True)
 class HostReady:
-    pass
+    protocol: int = 1
+    product_version: str = "unknown"
+    host_version: str = "unknown"
+    platform: str = "unknown"
+    arch: str = "unknown"
+    build_id: str = "source"
+    # Static compatibility/diagnostic field. OpenTUI has one supported terminal
+    # lifecycle; this is not a user-selectable renderer mode.
+    screen_mode: str = OPENTUI_SCREEN_MODE
+    capabilities: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class HostInputSubmit:
     text: str
+    intent: str = "auto"
+    client_message_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -190,6 +318,18 @@ class HostApprovalResponse:
     choice: str | None = None
 
 
+@dataclass(frozen=True)
+class HostThemeSelected:
+    """Theme kept in the host's interactive picker.
+
+    The ``/theme <name>`` command path persists CLI-side because Python knows
+    the name it sent; a picker confirmation happens entirely in the host, so
+    it reports the kept name for the same persistence.
+    """
+
+    name: str
+
+
 type HostToPythonMessage = (
     HostReady
     | HostInputSubmit
@@ -200,6 +340,7 @@ type HostToPythonMessage = (
     | HostError
     | HostProtocolUnknown
     | HostApprovalResponse
+    | HostThemeSelected
 )
 
 
@@ -213,10 +354,20 @@ PYTHON_TO_HOST_TYPES: dict[str, type | None] = {
     "turn.begin": TurnBegin,
     "turn.end": TurnEnd,
     "turn.status": TurnStatusState,
+    "prompt.state": PromptState,
     "composer.set": ComposerState,
+    "attachment.add": AttachmentState,
+    "attachment.update": AttachmentUpdate,
+    "attachment.remove": AttachmentRemove,
+    "attachment.clear": AttachmentClear,
+    "history.replace": HistoryReplace,
     "completion.context": CompletionContext,
     "completion.response": None,
+    "context.update": ContextUpdate,
     "router.update": RouterPluginState,
+    "model.routing.state": ModelRoutingState,
+    "model.routing.picker": None,
+    "model.picker": None,
     "block.begin": BlockBegin,
     "block.append": BlockAppend,
     "block.update": BlockUpdate,
@@ -227,6 +378,7 @@ PYTHON_TO_HOST_TYPES: dict[str, type | None] = {
     "notice.write": NoticeWrite,
     "theme.set": None,
     "theme.pick": None,
+    "session.pick": None,
     "approval.request": None,
     "approval.dismiss": ApprovalDismiss,
     "shutdown": None,
@@ -242,6 +394,7 @@ HOST_TO_PYTHON_TYPES: dict[str, type] = {
     "error": HostError,
     "protocol.unknown": HostProtocolUnknown,
     "approval.response": HostApprovalResponse,
+    "theme.selected": HostThemeSelected,
 }
 
 
@@ -269,9 +422,27 @@ def host_message_from_json(raw: str) -> HostToPythonMessage:
         raise HostToPythonMessageError("OpenTUI host message requires string field 'type'")
 
     if message_type == "ready":
-        return HostReady()
+        return HostReady(
+            protocol=_optional_int(payload, "protocol", default=1),
+            product_version=_optional_str(payload, "productVersion") or "unknown",
+            host_version=_optional_str(payload, "hostVersion") or "unknown",
+            platform=_optional_str(payload, "platform") or "unknown",
+            arch=_optional_str(payload, "arch") or "unknown",
+            build_id=_optional_str(payload, "buildId") or "source",
+            screen_mode=_optional_str(payload, "screenMode") or OPENTUI_SCREEN_MODE,
+            capabilities=_optional_str_tuple(payload, "capabilities"),
+        )
     if message_type == "input.submit":
-        return HostInputSubmit(text=_required_str(payload, "input.submit.text", "text"))
+        intent = _optional_str(payload, "intent") or "auto"
+        if intent not in {"auto", "steer", "queue", "control"}:
+            raise HostToPythonMessageError(
+                "OpenTUI input.submit.intent must be auto, steer, queue, or control"
+            )
+        return HostInputSubmit(
+            text=_required_str(payload, "input.submit.text", "text"),
+            intent=intent,
+            client_message_id=_optional_str(payload, "clientMessageId"),
+        )
     if message_type == "input.cancel":
         return HostInputCancel()
     if message_type == "input.eof":
@@ -302,6 +473,8 @@ def host_message_from_json(raw: str) -> HostToPythonMessage:
             approved=_required_bool(payload, "approval.response.approved", "approved"),
             choice=_optional_str(payload, "choice"),
         )
+    if message_type == "theme.selected":
+        return HostThemeSelected(name=_required_str(payload, "theme.selected.name", "name"))
 
     raise HostToPythonMessageError(f"Unknown OpenTUI host message type: {message_type}")
 
@@ -311,9 +484,7 @@ def _payload_dict(payload: object) -> dict[str, Any]:
         return asdict(payload)
     if isinstance(payload, dict):
         return dict(payload)
-    raise TypeError(
-        "OpenTUI Python message payload must be a dataclass instance or mapping"
-    )
+    raise TypeError("OpenTUI Python message payload must be a dataclass instance or mapping")
 
 
 def _required_str(payload: dict[str, Any], label: str, key: str) -> str:
@@ -337,6 +508,22 @@ def _required_int(payload: dict[str, Any], label: str, key: str) -> int:
     if not isinstance(value, int):
         raise HostToPythonMessageError(f"OpenTUI host message requires {label}")
     return value
+
+
+def _optional_int(payload: dict[str, Any], key: str, *, default: int) -> int:
+    value = payload.get(key, default)
+    if not isinstance(value, int):
+        raise HostToPythonMessageError(f"OpenTUI host message field {key} must be an integer")
+    return value
+
+
+def _optional_str_tuple(payload: dict[str, Any], key: str) -> tuple[str, ...]:
+    value = payload.get(key, ())
+    if not isinstance(value, list | tuple) or not all(isinstance(item, str) for item in value):
+        raise HostToPythonMessageError(
+            f"OpenTUI host message field {key} must be a list of text values"
+        )
+    return tuple(value)
 
 
 def _required_bool(payload: dict[str, Any], label: str, key: str) -> bool:

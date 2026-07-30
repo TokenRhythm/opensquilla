@@ -8,6 +8,8 @@ import secrets
 from pathlib import Path
 from typing import Any
 
+from opensquilla.paths import native_io_path
+
 ATTACHMENT_REF_KIND = "attachment_ref"
 TRANSCRIPT_MATERIAL_STORE = "transcript"
 
@@ -41,10 +43,11 @@ def transcript_material_path(media_root: Path, session_id: str, sha256: str) -> 
 
 def _media_disk_usage_bytes(media_root: Path) -> int:
     root = Path(media_root) / "transcripts"
-    if not root.exists():
+    native_root = native_io_path(root)
+    if not native_root.exists():
         return 0
     total = 0
-    for path in root.rglob("*"):
+    for path in native_root.rglob("*"):
         try:
             if path.is_file():
                 total += path.stat().st_size
@@ -54,17 +57,17 @@ def _media_disk_usage_bytes(media_root: Path) -> int:
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    native_io_path(path.parent).mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f".{secrets.token_hex(4)}")
     try:
-        with open(tmp_path, "wb") as f:
+        with open(native_io_path(tmp_path), "wb") as f:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_path, path)
+        os.replace(native_io_path(tmp_path), native_io_path(path))
     except BaseException:
         try:
-            tmp_path.unlink(missing_ok=True)
+            native_io_path(tmp_path).unlink(missing_ok=True)
         except OSError:
             pass
         raise
@@ -80,13 +83,13 @@ def _link_or_copy(src: Path, dst: Path) -> None:
     copy fallback covers cross-device links, filesystems/platforms without hardlink
     support, and any other ``OSError`` from ``os.link``.
     """
-    dst.parent.mkdir(parents=True, exist_ok=True)
+    native_io_path(dst.parent).mkdir(parents=True, exist_ok=True)
     try:
-        os.link(src, dst)
+        os.link(native_io_path(src), native_io_path(dst))
         return
     except OSError:
         pass
-    _atomic_write_bytes(dst, src.read_bytes())
+    _atomic_write_bytes(dst, native_io_path(src).read_bytes())
 
 
 def write_transcript_material(
@@ -100,7 +103,7 @@ def write_transcript_material(
 
     sha = hashlib.sha256(payload).hexdigest()
     path = transcript_material_path(media_root, session_id, sha)
-    if path.exists():
+    if native_io_path(path).exists():
         return sha, path, False
 
     if disk_budget_bytes is not None:
@@ -111,7 +114,6 @@ def write_transcript_material(
                 f"({current} + {len(payload)} > {disk_budget_bytes})"
             )
 
-    path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_bytes(path, payload)
     return sha, path, True
 
@@ -132,11 +134,12 @@ def copy_transcript_material(
     copy failures are skipped). Returns the count of files materialized.
     """
     source_dir = transcript_material_dir(media_root, source_session_id)
-    if not source_dir.is_dir():
+    native_source_dir = native_io_path(source_dir)
+    if not native_source_dir.is_dir():
         return 0
     target_dir = transcript_material_dir(media_root, target_session_id)
     copied = 0
-    for source_path in sorted(source_dir.iterdir()):
+    for source_path in sorted(native_source_dir.iterdir()):
         if not source_path.is_file():
             continue
         name = source_path.name
@@ -145,7 +148,7 @@ def copy_transcript_material(
         if len(name) != 64 or any(ch not in "0123456789abcdef" for ch in name):
             continue
         target_path = target_dir / name
-        if target_path.exists():
+        if native_io_path(target_path).exists():
             continue
         try:
             _link_or_copy(source_path, target_path)
@@ -201,7 +204,7 @@ def read_attachment_ref_bytes(ref: dict[str, Any], *, media_root: Path) -> bytes
         raise ValueError("attachment ref scope is required")
     sha = _validate_sha256(ref.get("sha256") or ref.get("material_id"))
     path = transcript_material_path(media_root, scope, sha)
-    payload = path.read_bytes()
+    payload = native_io_path(path).read_bytes()
     actual_sha = hashlib.sha256(payload).hexdigest()
     if actual_sha != sha:
         raise ValueError("attachment material hash mismatch")

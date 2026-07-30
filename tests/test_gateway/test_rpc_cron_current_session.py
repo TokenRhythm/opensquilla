@@ -87,9 +87,16 @@ class _FakeSessionManager:
 
 
 class _FakeTurnRunner:
-    def __init__(self, session_manager: _FakeSessionManager, text: str = "drink logged") -> None:
+    def __init__(
+        self,
+        session_manager: _FakeSessionManager,
+        text: str = "drink logged",
+        *,
+        events: list[object] | None = None,
+    ) -> None:
         self.session_manager = session_manager
         self.text = text
+        self.events = events
         self.calls = []
 
     def run(self, **kwargs):
@@ -101,6 +108,10 @@ class _FakeTurnRunner:
                 role="assistant",
                 content=self.text,
             )
+            if self.events is not None:
+                for event in self.events:
+                    yield event
+                return
             yield SimpleNamespace(kind="message", text=self.text)
             yield SimpleNamespace(kind="done")
 
@@ -568,6 +579,48 @@ async def test_current_session_agent_run_uses_bound_session_transcript_without_f
         {"role": "assistant", "content": "drink logged"},
     ]
     assert forward_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("snapshot", "expected_text", "expected_summary"),
+    [
+        ("canonical answer", "canonical answer", "canonical answer"),
+        ("", "", None),
+    ],
+)
+async def test_agent_run_delivery_prefers_authoritative_terminal_text_snapshot(
+    snapshot: str,
+    expected_text: str,
+    expected_summary: str | None,
+) -> None:
+    session_manager = _FakeSessionManager()
+    turn_runner = _FakeTurnRunner(
+        session_manager,
+        text=snapshot,
+        events=[
+            SimpleNamespace(kind="text_delta", text="stale retry preview"),
+            SimpleNamespace(kind="done", text=snapshot, text_snapshot=snapshot),
+        ],
+    )
+    delivery_chain = _RecordingDeliveryChain()
+    job = CronJob(
+        id="snapshot",
+        name="Snapshot",
+        handler_key="agent_run",
+        payload={"kind": AGENT_TURN_KIND, "task": "synthetic task", "agent_id": "main"},
+        session_target=SessionTarget.ISOLATED,
+    )
+    handler = make_agent_run_handler(
+        delivery_chain,  # type: ignore[arg-type]
+        turn_runner_ref=lambda: turn_runner,
+        session_manager_ref=lambda: session_manager,
+    )
+
+    result = await handler(job)
+
+    assert delivery_chain.deliveries[-1]["result_text"] == expected_text
+    assert result.summary == expected_summary
 
 
 @pytest.mark.asyncio

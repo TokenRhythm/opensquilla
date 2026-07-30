@@ -19,7 +19,13 @@ class _PaginatingStorage:
     async def get_session(self, session_key: str):
         return self.sessions.get(session_key)
 
-    async def upsert_session(self, node: SessionNode) -> None:
+    async def upsert_session(
+        self,
+        node: SessionNode,
+        *,
+        expected_session_id: str | None = None,
+    ) -> None:
+        assert expected_session_id is None or expected_session_id == node.session_id
         self.sessions[node.session_key] = node
 
     async def list_sessions(

@@ -9,6 +9,17 @@ execution-level command ran after its final source edit, or (e) a
 self-written reproduction/diagnostic script never passed (still red, or
 deleted before a passing run was observed).
 
+Strict mode (``OPENSQUILLA_FINALIZE_EVIDENCE_STRICT``) adds one finalize-time
+trigger on top of the same machinery: (f) ``zero_verification`` — no
+execution-level command survived skip filtering at any point in the run, so
+the change being shipped was never exercised at all. Red-first bookkeeping
+(``red_first_satisfied`` / candidate counts, fed by the same deselection
+profile machinery) is still tracked and reported for offline replay
+diagnostics, but it does NOT gate: transcript replay over real runs showed
+that "never observed failing then passing" is common on legitimately solved
+runs (direct fix + existing suite green), so a trigger on it would challenge
+correct finishes far too often.
+
 Polarity contract: a failing self-written reproduction is BINDING evidence and
 green results from unrelated suites do not override it; the challenge never
 demands patch minimality, never devalues self-written repros, fires only at
@@ -248,7 +259,7 @@ _REPRO_STEM_MARKERS: frozenset[str] = frozenset(
 )
 _STEM_TOKEN_SPLIT_RE = re.compile(r"[^a-z0-9]+")
 _SCRIPT_EXTENSION_RE = re.compile(
-    r"\.(py|js|mjs|cjs|ts|rb|php|sh|bash|zsh|pl|go|rs|java|c|cc|cpp|exp)$",
+    r"\.(py|js|mjs|cjs|ts|rb|php|sh|bash|zsh|pl|go|rs|java|c|cc|cpp|exp|tcl)$",
     re.I,
 )
 _SCRATCH_DIR_MARKERS: tuple[str, ...] = ("/squilla-scratch/", "/tmp/", "/var/tmp/")
@@ -279,6 +290,13 @@ def _basename_marks_repro(basename: str) -> bool:
     stem = basename.rsplit(".", 1)[0].lower()
     tokens = [token for token in _STEM_TOKEN_SPLIT_RE.split(stem) if token]
     return any(token in _REPRO_STEM_MARKERS for token in tokens)
+
+
+def is_repro_script_path(path: str) -> bool:
+    """Return whether *path* has an executable repro-script extension."""
+
+    normalized = str(path or "").strip().replace("\\", "/")
+    return bool(normalized and _SCRIPT_EXTENSION_RE.search(normalized))
 
 
 def looks_repro_artifact_path(path: str) -> bool:
@@ -721,6 +739,67 @@ def green_profiles_deselect_red(
     return False
 
 
+def _positional_bases(positionals: frozenset[str]) -> frozenset[str]:
+    """Positional targets normalized to their base path.
+
+    Strips pytest-style ``::node`` selectors so ``tests/test_x.py::test_a``
+    (the focused red repro) and ``tests/test_x.py`` (the full-file green
+    re-run) compare as the same target, and leading ``./`` so relative
+    spellings compare equal.
+    """
+
+    bases: set[str] = set()
+    for token in positionals:
+        base = token.split("::", 1)[0]
+        if base.startswith("./"):
+            base = base[2:]
+        bases.add(base.rstrip("/"))
+    return frozenset(bases)
+
+
+def _bases_cover(green_bases: frozenset[str], red_bases: frozenset[str]) -> bool:
+    """Every red base equals a green base or sits under a green directory."""
+
+    for red_base in red_bases:
+        if not any(
+            red_base == green_base or red_base.startswith(f"{green_base}/")
+            for green_base in green_bases
+        ):
+            return False
+    return True
+
+
+def green_profiles_recover_red(
+    green: Sequence[_SegmentProfile],
+    red: Sequence[_SegmentProfile],
+) -> bool:
+    """True when a green run re-covers a red run's targets without deselection.
+
+    The strict-mode red-first resolution rule: same runner, all of the red
+    run's positional targets re-covered (compared by base path, so a focused
+    ``file::node`` red matches a full-file or full-directory green re-run),
+    and no ADDED deselection narrowing. A green that passes by excluding the
+    failing case is the deselection false-green signature
+    (``green_profiles_deselect_red``), not a resolution, so it never counts
+    here. Zero-positional matching errs toward suppression: a bare runner
+    invocation (``pytest``) re-covers everything.
+    """
+
+    for red_segment in red:
+        red_bases = _positional_bases(red_segment.positionals)
+        for green_segment in green:
+            if green_segment.head != red_segment.head:
+                continue
+            green_bases = _positional_bases(green_segment.positionals)
+            if green_bases and not _bases_cover(green_bases, red_bases):
+                continue
+            added = green_segment.narrowing - red_segment.narrowing
+            if any(_narrowing_is_deselection(entry) for entry in added):
+                continue
+            return True
+    return False
+
+
 def is_detector_findings_exit(
     command: str,
     exit_code: int | None,
@@ -840,6 +919,20 @@ class _ReproArtifact:
     deleted: bool = False
 
 
+@dataclass
+class _RedFirstCandidate:
+    """A red observed without the patch applied.
+
+    Either a red before the first source edit or a red taken on a
+    stash-reverted tree: both demonstrate the failure the run is supposed to
+    fix. A later green on the patched tree that re-covers the candidate's
+    shape (or re-runs one of its tracked artifacts) resolves red-first.
+    """
+
+    profiles: list[_SegmentProfile]
+    artifact_paths: list[str]
+
+
 @dataclass(frozen=True)
 class FinalizeEvidenceObservation:
     """Finalize-time summary of unresolved red evidence."""
@@ -856,6 +949,13 @@ class FinalizeEvidenceObservation:
     post_edit_red_count: int
     source_edit_seen: bool
     has_workspace_diff: bool
+    # Strict-mode evidence summary. Computed in both modes so offline replay
+    # can compare trigger sets on the same traces; the strict TRIGGERS only
+    # fire when the tracker runs with strict=True.
+    verification_command_count: int = 0
+    red_first_satisfied: bool = False
+    red_first_candidate_count: int = 0
+    strict: bool = False
 
     @property
     def should_challenge(self) -> bool:
@@ -881,6 +981,10 @@ class FinalizeEvidenceObservation:
             "post_edit_red_count": self.post_edit_red_count,
             "source_edit_seen": self.source_edit_seen,
             "has_workspace_diff": self.has_workspace_diff,
+            "verification_command_count": self.verification_command_count,
+            "red_first_satisfied": self.red_first_satisfied,
+            "red_first_candidate_count": self.red_first_candidate_count,
+            "strict": self.strict,
         }
 
 
@@ -888,13 +992,22 @@ class FinalizeEvidenceTracker:
     """Pure in-run state machine feeding the finalize-time evidence gate."""
 
     _MAX_POST_EDIT_EXECUTIONS = 200
+    _MAX_RED_FIRST_CANDIDATES = 50
 
-    def __init__(self) -> None:
+    def __init__(self, *, strict: bool = False) -> None:
+        self._strict = bool(strict)
         self._source_edit_seen = False
         self._post_edit_executions: list[GateExecutionRecord] = []
         self._artifacts: dict[str, _ReproArtifact] = {}
         self._sequence = 0
         self._tree_stashed = False
+        # Strict-mode evidence state. Tracked in both modes (cheap, and it
+        # lets offline replay compare strict trigger sets on the same traces);
+        # the strict triggers themselves only fire when ``strict=True``.
+        self._verification_command_count = 0
+        self._red_first_candidates: list[_RedFirstCandidate] = []
+        self._red_first_candidate_count = 0
+        self._red_first_satisfied = False
 
     def observe_write(
         self,
@@ -947,8 +1060,16 @@ class FinalizeEvidenceTracker:
         status_reason: str | None = None,
         failure_anchors: Sequence[str] = (),
         iteration: int = 0,
+        evidence_credit: bool = True,
     ) -> None:
-        """Record an execution-tool call (``exec_command``-like)."""
+        """Record an execution-tool call (``exec_command``-like).
+
+        ``evidence_credit=False`` (scratch verify-mirror hash guard) keeps
+        side-effect tracking — deletions and stash state — but withholds all
+        verification crediting: the command ran against mirror copies that
+        no longer match their workspace originals, so its outcome says
+        nothing about the workspace in either polarity.
+        """
 
         command_text = str(command or "")
         if status_reason in _NON_VERIFICATION_STATUS_REASONS:
@@ -969,10 +1090,30 @@ class FinalizeEvidenceTracker:
         )
         if classify_gate_command(command_text) != "execution":
             return
+        if not evidence_credit:
+            # Hash-guarded mirror run against diverged copies: side effects
+            # above still counted, but the outcome is not verification
+            # evidence — no verification count, no red-first candidacy, no
+            # post-edit record. Green here must not satisfy red-first and
+            # red here must not become an outstanding failure.
+            return
         if ran_while_stashed:
             # The fix is deliberately stashed away: red here confirms the bug
             # reproduces WITHOUT the patch and green would say nothing about
-            # it. Neither polarity is evidence about the current workspace.
+            # it. Neither polarity is evidence about the current workspace —
+            # but a red on the reverted tree demonstrates the failure without
+            # the patch, which is exactly what strict red-first asks for, so
+            # it registers a red-first candidate (and the run still counts as
+            # execution activity for zero-verification).
+            if not (exit_code in _COMMAND_FORM_ERROR_EXITS and not timed_out):
+                self._verification_command_count += 1
+                if bool(red) and not is_detector_findings_exit(
+                    command_text, exit_code, timed_out
+                ):
+                    self._note_red_first_candidate(
+                        command_execution_profiles(command_text),
+                        self._referenced_artifacts(command_text),
+                    )
             return
         if exit_code in _COMMAND_FORM_ERROR_EXITS and not timed_out:
             # Command-not-found / not-executable says nothing about the
@@ -1003,10 +1144,57 @@ class FinalizeEvidenceTracker:
                 artifact.red_run_count += 1
             else:
                 artifact.ever_green = True
+        self._verification_command_count += 1
+        if record.red:
+            # Any surviving red demonstrates a failure the run can later show
+            # resolved; a later patched-tree green matching it satisfies
+            # red-first. Pre-edit, post-edit, and stash-reverted reds all
+            # qualify — restricting to pre-first-edit reds would fire on the
+            # legitimate edit-then-reproduce flow.
+            self._note_red_first_candidate(record.profiles, record.artifact_paths)
+        elif self._source_edit_seen:
+            self._resolve_red_first(record)
         if self._source_edit_seen:
             self._post_edit_executions.append(record)
             if len(self._post_edit_executions) > self._MAX_POST_EDIT_EXECUTIONS:
                 del self._post_edit_executions[0]
+
+    def _note_red_first_candidate(
+        self,
+        profiles: Sequence[_SegmentProfile],
+        artifact_paths: Sequence[str],
+    ) -> None:
+        self._red_first_candidate_count += 1
+        if self._red_first_satisfied:
+            return
+        if len(self._red_first_candidates) < self._MAX_RED_FIRST_CANDIDATES:
+            self._red_first_candidates.append(
+                _RedFirstCandidate(
+                    profiles=list(profiles),
+                    artifact_paths=list(artifact_paths),
+                )
+            )
+
+    def _resolve_red_first(self, record: GateExecutionRecord) -> None:
+        """Match a patched-tree green against demonstrated-failure candidates."""
+
+        if self._red_first_satisfied or not self._red_first_candidates:
+            return
+        for candidate in self._red_first_candidates:
+            if candidate.artifact_paths and any(
+                path in record.artifact_paths for path in candidate.artifact_paths
+            ):
+                self._red_first_satisfied = True
+                return
+            if candidate.profiles:
+                if green_profiles_recover_red(record.profiles, candidate.profiles):
+                    self._red_first_satisfied = True
+                    return
+            elif not candidate.artifact_paths:
+                # A red with no comparable shape cannot be re-matched; err
+                # toward suppression and let any patched-tree green resolve it.
+                self._red_first_satisfied = True
+                return
 
     def build_observation(self, *, has_workspace_diff: bool) -> FinalizeEvidenceObservation:
         triggers: list[str] = []
@@ -1050,6 +1238,13 @@ class FinalizeEvidenceTracker:
                 triggers.append("never_green_repro_deleted")
             if not self._post_edit_executions:
                 triggers.append("no_execution_after_final_edit")
+            if self._strict:
+                # The strict trigger appends AFTER the base ones so base-mode
+                # primary reasons (and their dedup keys) are unperturbed.
+                # Red-first state is reported but deliberately not a trigger:
+                # green-only runs are routinely legitimate.
+                if self._verification_command_count == 0:
+                    triggers.append("zero_verification")
         return FinalizeEvidenceObservation(
             triggers=triggers,
             red_command=red_record.command if red_record else None,
@@ -1063,6 +1258,10 @@ class FinalizeEvidenceTracker:
             post_edit_red_count=len(post_edit_red),
             source_edit_seen=self._source_edit_seen,
             has_workspace_diff=bool(has_workspace_diff),
+            verification_command_count=self._verification_command_count,
+            red_first_satisfied=self._red_first_satisfied,
+            red_first_candidate_count=self._red_first_candidate_count,
+            strict=self._strict,
         )
 
     def _outstanding_red_repro_record(self) -> GateExecutionRecord | None:
@@ -1155,7 +1354,17 @@ class FinalizeEvidenceTracker:
 
 
 def finalize_evidence_gate_key(observation: FinalizeEvidenceObservation) -> str:
-    """Dedup key: the same unresolved red state never re-fires the gate."""
+    """Dedup key: the same unresolved red state never re-fires the gate.
+
+    The key is derived purely from the red *evidence* (reason, triggers, the
+    failing command and its exit code, failure anchors, and deleted-repro
+    paths). It deliberately excludes volatile progress counters such as
+    ``post_edit_execution_count``: once the caller has challenged a given red
+    state and recorded its key, running further commands that leave the same
+    evidence in place must not mint a fresh key and re-fire the challenge. This
+    is what makes the caller's ``keys.add(key)`` guard a genuine one-shot latch
+    per red state rather than a counter that quietly resets on every execution.
+    """
 
     payload = {
         "primary_reason": observation.primary_reason,
@@ -1164,7 +1373,6 @@ def finalize_evidence_gate_key(observation: FinalizeEvidenceObservation) -> str:
         "red_exit_code": observation.red_exit_code,
         "red_failure_anchors": observation.red_failure_anchors,
         "deleted_never_green_repro_paths": observation.deleted_never_green_repro_paths,
-        "post_edit_execution_count": observation.post_edit_execution_count,
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
@@ -1174,6 +1382,15 @@ _BINDING_SENTENCE = (
     "A failing reproduction or verification you ran yourself is binding evidence "
     "that the issue is not fixed yet; green results from other tests, builds, or "
     "suites do not override it."
+)
+
+# Model-visible one-shot contract. Paired with the caller's per-red-state latch
+# (see finalize_evidence_gate_key), this tells the model the check will not
+# repeat for the same failing state, so it should resolve or justify it now
+# instead of treating a recurring challenge as pressure to keep re-finalizing.
+_ONE_SHOT_NOTICE = (
+    " This evidence check is one-shot for this exact failing state: it will not "
+    "repeat for the same evidence, so resolve it or justify finishing now."
 )
 
 
@@ -1230,7 +1447,7 @@ def finalize_evidence_challenge_message(observation: FinalizeEvidenceObservation
             "use its output to revise the source fix and re-run until it passes. "
             "Only if the command itself is invalid (wrong path, stale script, or "
             "expectations that contradict the issue report) may you finish, and "
-            "then explicitly justify that in your final answer."
+            "then explicitly justify that in your final answer." + _ONE_SHOT_NOTICE
         )
     if reason == "never_green_repro_deleted":
         paths = ", ".join(observation.deleted_never_green_repro_paths[:3])
@@ -1241,7 +1458,21 @@ def finalize_evidence_challenge_message(observation: FinalizeEvidenceObservation
             f"observed. {_BINDING_SENTENCE} Do not finalize yet. Recreate or "
             "re-run a reproduction that follows the issue report against the "
             "current workspace state and confirm it passes; if it fails, use its "
-            "output to revise the source fix first."
+            "output to revise the source fix first." + _ONE_SHOT_NOTICE
+        )
+    if "zero_verification" in observation.triggers:
+        # ``zero_verification`` implies ``no_execution_after_final_edit`` (a
+        # zero-count run has an empty post-edit window), so it never becomes
+        # the primary reason; it enriches the no-execution shape instead.
+        return (
+            "[Finalize evidence check]\n"
+            "You are about to finish, but no execution-level command ran at any "
+            "point in this run: the patch you are shipping has never been "
+            "exercised. Do not finalize yet. Write and run a reproduction of "
+            "the reported issue against the current workspace state; confirm it "
+            "fails without your change (for example after `git stash`) and "
+            "passes with it (after `git stash pop`), and use any failure output "
+            f"to revise the source fix first. {_BINDING_SENTENCE}"
         )
     return (
         "[Finalize evidence check]\n"
@@ -1249,5 +1480,5 @@ def finalize_evidence_challenge_message(observation: FinalizeEvidenceObservation
         "final source edit, so the patch you are shipping is unverified in its "
         "current state. Do not finalize yet. Re-run your reproduction of the "
         "issue, or the most relevant focused test, against the current workspace "
-        f"state and confirm it passes. {_BINDING_SENTENCE}"
+        f"state and confirm it passes. {_BINDING_SENTENCE}" + _ONE_SHOT_NOTICE
     )

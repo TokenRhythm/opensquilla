@@ -17,6 +17,14 @@ def test_full_host_access_tool_context_is_visible_to_model_prompt() -> None:
     assert "Run mode: Full Host Access" in execution_context
     assert "Execution target: host" in execution_context
     assert "Sandbox: disabled for tool execution" in execution_context
+    assert (
+        "Writes outside the workspace do not require OpenSquilla sandbox approval"
+        in execution_context
+    )
+    assert (
+        "Do not use sandbox_permissions=require_escalated in Full Host Access"
+        in execution_context
+    )
 
 
 def test_managed_execution_prompt_allows_explicit_host_actions() -> None:

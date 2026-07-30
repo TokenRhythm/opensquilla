@@ -57,7 +57,12 @@ mark_release_changed() {
 }
 
 mark_frontend_changed() {
+  # WebUI source becomes runtime wheel content, but it is neither Python nor
+  # platform-native code. Build the exact wheel without waking unrelated
+  # Python/Windows jobs for a frontend-only pull request.
   mark_non_docs_changed
+  runtime_changed=true
+  build_wheel_required=true
   frontend_changed=true
 }
 
@@ -110,12 +115,11 @@ while IFS= read -r path || [[ -n "${path}" ]]; do
       mark_frontend_changed
       ;;
     src/opensquilla/gateway/static/dist/*)
-      # The committed Web UI bundle is runtime package data, but changing the
-      # generated bundle alone does not make platform-native recovery paths risky.
+      # Generated WebUI files are forbidden in Git. Route a force-added file to
+      # the frontend job, whose tracked-artifact guard reports the violation.
       mark_frontend_changed
-      mark_runtime_changed
       ;;
-    src/opensquilla/cli/tui/opentui/package/*)
+    src/opensquilla/cli/tui/opentui/package/* | packages/opensquilla-tui-host/* | scripts/build_tui_host_companion.py | scripts/smoke_tui_host_companion.py)
       mark_tui_changed
       ;;
     .github/workflows/ci.yml | .github/scripts/classify-ci-changes.sh | .github/scripts/check_ci_results.py | .github/scripts/windows_test_shards.py)

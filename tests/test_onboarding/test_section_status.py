@@ -178,6 +178,44 @@ def test_ensemble_status_reports_candidate_provider_credentials(cfg, monkeypatch
     )
 
 
+def test_ensemble_status_uses_profile_credential_resolution(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    cfg = GatewayConfig(
+        llm={
+            "provider": "deepseek",
+            "model": "deepseek-v4-flash",
+            "api_key": "sk-deepseek",
+        },
+        llm_profiles={
+            "OpenAI": {
+                "api_key": "sk-profile",
+            }
+        },
+    )
+    cfg.llm_ensemble.enabled = True
+    cfg.llm_ensemble.selection_mode = "router_dynamic"
+    cfg.llm_ensemble.candidates = [
+        {
+            "provider": "openai",
+            "model": "gpt-5-mini",
+            "source": "custom",
+            "enabled": True,
+        }
+    ]
+
+    status = get_onboarding_status(cfg)
+
+    by_provider = {
+        str(row["provider"]): row for row in status.ensemble_credential_status
+    }
+    assert by_provider["openai"] == {
+        "provider": "openai",
+        "available": True,
+        "source": "explicit",
+        "envKey": "OPENAI_API_KEY",
+    }
+
+
 def test_llm_credential_status_reports_explicit_key(cfg):
     cfg.llm = LlmProviderConfig(
         provider="deepseek",
@@ -223,6 +261,7 @@ def test_llm_credential_status_reports_env_key(cfg, monkeypatch):
 
 def test_llm_credential_status_reports_missing_env(cfg, monkeypatch):
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.setenv("OPENSQUILLA_LLM_API_KEY", "synthetic-generic-key")
     cfg.llm = LlmProviderConfig(
         provider="deepseek",
         model="deepseek-v4-flash",
@@ -264,6 +303,114 @@ def test_llm_credential_status_treats_runtime_secret_cache_as_env(cfg, monkeypat
     assert cred["masked"] != "sk-runtime-cache"
     assert cred["masked"].endswith("rent")
     assert cred["revealAllowed"] is False
+
+
+def test_llm_credential_status_hides_runtime_cache_when_env_missing(cfg, monkeypatch):
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("OPENSQUILLA_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("OPENSQUILLA_LLM_API_KEY_ENV", raising=False)
+    cfg.llm = LlmProviderConfig(
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        api_key="sk-runtime-cache",
+        api_key_env="DEEPSEEK_API_KEY",
+        base_url="https://api.deepseek.com",
+    )
+    cfg.mark_runtime_secret("llm.api_key")
+
+    status = get_onboarding_status(cfg)
+
+    assert status.llm_credential_status == {
+        "provider": "deepseek",
+        "available": False,
+        "source": "missing_env",
+        "envKey": "DEEPSEEK_API_KEY",
+        "masked": "",
+        "revealAllowed": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("provider", "base_url"),
+    [
+        ("custom", "https://custom.example.test/v1"),
+        ("ollama", "http://localhost:11434"),
+        ("lm_studio", "http://localhost:1234/v1"),
+        ("ovms", "http://localhost:8000/v3"),
+        ("vllm", "http://localhost:8000/v1"),
+    ],
+)
+def test_optional_llm_credential_status_reports_explicit_key(
+    cfg, monkeypatch, provider, base_url
+):
+    monkeypatch.delenv("CUSTOM_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
+    cfg.llm = LlmProviderConfig(
+        provider=provider,
+        model="test-model",
+        api_key="sk-optional-secret-123456",
+        base_url=base_url,
+    )
+
+    cred = get_onboarding_status(cfg).llm_credential_status
+
+    assert cred["available"] is True
+    assert cred["source"] == "explicit"
+    assert cred["masked"] != "sk-optional-secret-123456"
+    assert cred["masked"].endswith("3456")
+
+
+def test_optional_llm_credential_status_uses_visible_default_env(cfg, monkeypatch):
+    monkeypatch.setenv("CUSTOM_LLM_API_KEY", "sk-custom-env-654321")
+    cfg.llm = LlmProviderConfig(
+        provider="custom",
+        model="test-model",
+        api_key="",
+        api_key_env="",
+        base_url="https://custom.example.test/v1",
+    )
+
+    cred = get_onboarding_status(cfg).llm_credential_status
+
+    assert cred["available"] is True
+    assert cred["source"] == "env"
+    assert cred["envKey"] == "CUSTOM_LLM_API_KEY"
+    assert cred["masked"].endswith("4321")
+
+
+def test_optional_llm_credential_status_without_key_is_not_required(cfg, monkeypatch):
+    monkeypatch.delenv("CUSTOM_LLM_API_KEY", raising=False)
+    cfg.llm = LlmProviderConfig(
+        provider="custom",
+        model="test-model",
+        api_key="",
+        api_key_env="",
+        base_url="https://custom.example.test/v1",
+    )
+
+    cred = get_onboarding_status(cfg).llm_credential_status
+
+    assert cred["available"] is True
+    assert cred["source"] == "not_required"
+    assert cred["masked"] == ""
+
+
+def test_optional_llm_credential_status_reports_configured_missing_env(cfg, monkeypatch):
+    monkeypatch.delenv("PRIVATE_CUSTOM_KEY", raising=False)
+    monkeypatch.setenv("OPENSQUILLA_LLM_API_KEY", "synthetic-generic-key")
+    cfg.llm = LlmProviderConfig(
+        provider="custom",
+        model="test-model",
+        api_key="",
+        api_key_env="PRIVATE_CUSTOM_KEY",
+        base_url="https://custom.example.test/v1",
+    )
+
+    cred = get_onboarding_status(cfg).llm_credential_status
+
+    assert cred["available"] is False
+    assert cred["source"] == "missing_env"
+    assert cred["envKey"] == "PRIVATE_CUSTOM_KEY"
 
 
 # ── search ──────────────────────────────────────────────────────────────────
@@ -361,7 +508,15 @@ def test_image_generation_unknown_provider_reference_is_unknown(cfg, monkeypatch
     cfg.image_generation.enabled = True
     cfg.image_generation.primary = "no-such-provider/no-such-model"
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    status = get_onboarding_status(cfg)
+
     assert image_generation_section_status(cfg) is SectionStatus.UNKNOWN
+    assert status.image_generation_configured is False
+    assert status.image_generation_provider == "no-such-provider"
+    assert status.section_details["image_generation"]["detail"] == (
+        "no-such-provider (unknown image provider)"
+    )
 
 
 def test_image_generation_env_key_reference_missing_is_degraded(cfg, monkeypatch):
@@ -407,6 +562,138 @@ def test_image_generation_custom_default_primary_is_not_masked_by_other_provider
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
     assert image_generation_section_status(cfg) is SectionStatus.DEGRADED
+
+
+def test_image_generation_official_endpoint_provider_mismatch_is_degraded(cfg):
+    cfg.image_generation.enabled = True
+    cfg.image_generation.primary = "openrouter/google/gemini-3.1-flash-image-preview"
+    openrouter_provider = cfg.image_generation.providers.openrouter
+    openrouter_provider.api_key = "sk-synthetic-image"
+    openrouter_provider.base_url = "https://api.openai.com/v1"
+
+    status = get_onboarding_status(cfg)
+
+    assert image_generation_section_status(cfg) is SectionStatus.DEGRADED
+    assert status.image_generation_configured is False
+    assert status.image_generation_provider == "openrouter"
+    assert status.image_generation_source == "explicit"
+    detail = status.section_details["image_generation"]
+    assert detail["status"] == "degraded"
+    assert detail["actionRequired"] is True
+    assert detail["blocking"] is False
+    assert detail["detail"] == (
+        "openrouter (endpoint/provider mismatch: configured openai official endpoint)"
+    )
+
+
+def test_image_generation_custom_compatible_endpoint_remains_ok(cfg):
+    cfg.image_generation.enabled = True
+    cfg.image_generation.primary = "openrouter/google/gemini-3.1-flash-image-preview"
+    openrouter_provider = cfg.image_generation.providers.openrouter
+    openrouter_provider.api_key = "sk-synthetic-image"
+    openrouter_provider.base_url = "https://images.example.test/v1"
+
+    assert image_generation_section_status(cfg) is SectionStatus.OK
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "not-a-url",
+        " https://openrouter.ai/api/v1 ",
+        "https://openrouter.ai:invalid/v1",
+        "https://openrouter.ai:99999/v1",
+        "https://openrouter.ai/api/v1?tenant=test",
+        "https://openrouter.ai/api/v1#fragment",
+        "https://user:secret@openrouter.ai/api/v1",
+    ],
+)
+def test_image_generation_invalid_endpoint_is_degraded(cfg, base_url):
+    cfg.image_generation.enabled = True
+    cfg.image_generation.primary = "openrouter/google/gemini-3.1-flash-image-preview"
+    openrouter_provider = cfg.image_generation.providers.openrouter
+    openrouter_provider.api_key = "sk-synthetic-image"
+    openrouter_provider.base_url = base_url
+
+    status = get_onboarding_status(cfg)
+
+    assert image_generation_section_status(cfg) is SectionStatus.DEGRADED
+    assert status.image_generation_configured is False
+    assert status.section_details["image_generation"]["detail"] == (
+        "openrouter (invalid image endpoint; use an absolute http:// or https:// URL)"
+    )
+
+
+def test_image_generation_malformed_legacy_model_ref_is_unknown(cfg):
+    cfg.image_generation.enabled = True
+    cfg.image_generation.primary = "openrouter/"
+    cfg.image_generation.providers.openrouter.api_key = "sk-synthetic-image"
+
+    status = get_onboarding_status(cfg)
+
+    assert image_generation_section_status(cfg) is SectionStatus.UNKNOWN
+    assert status.image_generation_configured is False
+    assert status.section_details["image_generation"]["detail"] == (
+        "invalid image provider/model reference"
+    )
+
+
+def test_image_generation_mismatch_is_not_hidden_by_a_healthy_fallback(cfg):
+    cfg.image_generation.enabled = True
+    cfg.image_generation.primary = "openrouter/google/gemini-3.1-flash-image-preview"
+    cfg.image_generation.fallbacks = ["openai/gpt-image-1"]
+    cfg.image_generation.providers.openrouter.api_key = "sk-synthetic-openrouter"
+    cfg.image_generation.providers.openrouter.base_url = "https://api.openai.com/v1"
+    cfg.image_generation.providers.openai.api_key = "sk-synthetic-openai"
+
+    assert image_generation_section_status(cfg) is SectionStatus.DEGRADED
+
+
+def test_image_generation_default_env_does_not_apply_to_custom_endpoint(cfg, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-default-origin-key")
+    cfg.image_generation.enabled = True
+    cfg.image_generation.primary = "openrouter/google/gemini-3.1-flash-image-preview"
+    cfg.image_generation.providers.openrouter.base_url = "https://images.example.test/v1"
+    cfg.llm = LlmProviderConfig(provider="openai", model="m", api_key="")
+
+    assert image_generation_section_status(cfg) is SectionStatus.MISSING
+
+
+def test_image_generation_inherited_llm_endpoint_mismatch_is_degraded(cfg):
+    cfg.image_generation.enabled = True
+    cfg.image_generation.primary = "openrouter/google/gemini-3.1-flash-image-preview"
+    cfg.image_generation.providers.openrouter.api_key = "sk-synthetic-image"
+    cfg.llm = LlmProviderConfig(
+        provider="openrouter",
+        model="m",
+        api_key="sk-synthetic-llm",
+        base_url="https://api.openai.com/v1",
+    )
+
+    assert image_generation_section_status(cfg) is SectionStatus.DEGRADED
+
+
+def test_image_generation_cross_origin_llm_key_is_degraded(cfg, monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    cfg.image_generation.enabled = True
+    cfg.image_generation.primary = "openrouter/google/gemini-3.1-flash-image-preview"
+    cfg.image_generation.providers.openrouter.base_url = "https://images.example.test/v1"
+    cfg.llm = LlmProviderConfig(
+        provider="openrouter",
+        model="m",
+        api_key="sk-synthetic-llm",
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    status = get_onboarding_status(cfg)
+
+    assert image_generation_section_status(cfg) is SectionStatus.DEGRADED
+    assert status.image_generation_configured is False
+    assert status.image_generation_source == "none"
+    assert status.image_generation_provider == "openrouter"
+    assert status.section_details["image_generation"]["detail"] == (
+        "openrouter (LLM key cannot be reused across image endpoint origins)"
+    )
 
 
 # ── memory embedding ────────────────────────────────────────────────────────

@@ -6,18 +6,18 @@ const ChatView = () => import('@/views/ChatView.vue')
 const CronView = () => import('@/views/CronView.vue')
 const AgentsView = () => import('@/views/AgentsView.vue')
 const SessionsView = () => import('@/views/SessionsView.vue')
-const SkillsView = () => import('@/views/SkillsView.vue')
 const ChangelogView = () => import('@/views/ChangelogView.vue')
-// Hosts Overview / Channels / Usage / Logs as tabbed sections of one Monitor
-// destination (the four views stay intact inside it).
-const MonitorHubView = () => import('@/views/MonitorHubView.vue')
+const OverviewHubView = () => import('@/views/OverviewHubView.vue')
+const LogsView = () => import('@/views/LogsView.vue')
+const SkillsChannelsHubView = () => import('@/views/SkillsChannelsHubView.vue')
 
 export function defaultRootRedirect(): string {
   if (detectPlatformId() === 'desktop') return '/chat'
   const saved = readLastRoute()
   if (saved) return saved
-  const isMobile = window.matchMedia('(max-width: 768px)').matches
-  return isMobile ? '/chat' : '/sessions'
+  // Chat on every form factor: Sessions is no longer a navigation destination,
+  // so landing there would open on a page the sidebar cannot get back to.
+  return '/chat'
 }
 
 export const sharedRoutes: RouteRecordRaw[] = [
@@ -30,27 +30,32 @@ export const sharedRoutes: RouteRecordRaw[] = [
       return defaultRootRedirect()
     },
   },
-  { path: '/chat',      name: 'chat',      component: ChatView,      meta: { title: 'Chat', group: 'Work', icon: 'chat', nav: 'primary', navOrder: 10, platforms: ['web', 'desktop'] } },
+  { path: '/chat',      name: 'chat',      component: ChatView,      meta: { title: 'Chat', group: 'Work', icon: 'chat', nav: 'primary', navOrder: 10, platforms: ['web', 'desktop'], viewKey: 'chat' } },
   // Draft state: a clean composer with no session key until the first send.
-  { path: '/chat/new',  name: 'chat-new',  component: ChatView,      meta: { title: 'Chat', group: 'Work', icon: 'chat', platforms: ['web', 'desktop'] } },
-  { path: '/sessions',  name: 'sessions',  component: SessionsView,  meta: { title: 'Sessions', group: 'Work', icon: 'sessions', nav: 'primary', navOrder: 20, platforms: ['web', 'desktop'], keepAlive: true } },
-  // Monitor hub: Overview/Channels/Usage/Logs are one destination with four
-  // tabbed sections. All four canonical URLs stay valid (the tabs are routes);
-  // only /overview carries the rail entry. Shared viewKey keeps one live
-  // instance across the four paths so tab switches never remount the hub.
-  { path: '/overview',  name: 'overview',  component: MonitorHubView, meta: { title: 'Overview', group: 'Work', icon: 'home', nav: 'primary', navOrder: 30, platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'monitor-hub' } },
-  { path: '/channels',  name: 'channels',  component: MonitorHubView, meta: { title: 'Channels', icon: 'channels', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'monitor-hub' } },
-  { path: '/usage',     name: 'usage',     component: MonitorHubView, meta: { title: 'Usage', icon: 'usage', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'monitor-hub' } },
-  { path: '/logs',      name: 'logs',      component: MonitorHubView, meta: { title: 'Logs', icon: 'logs', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'monitor-hub' } },
+  { path: '/chat/new',  name: 'chat-new',  component: ChatView,      meta: { title: 'Chat', group: 'Work', icon: 'chat', platforms: ['web', 'desktop'], viewKey: 'chat' } },
+  // Task ledger: still routed (deep links, the Not Found fallback, /approvals)
+  // but off the nav — "New task" owns the top of the sidebar and the recents
+  // list below it covers day-to-day session access.
+  { path: '/sessions',  name: 'sessions',  component: SessionsView,  meta: { title: 'Sessions', titleKey: 'sessions.title', group: 'Work', icon: 'sessions', platforms: ['web', 'desktop'], keepAlive: true } },
+  // Status and Usage share the Overview destination. Runtime logs remain a
+  // kept-alive diagnostic deep link rather than a peer navigation tab.
+  { path: '/overview',  name: 'overview',  component: OverviewHubView, meta: { title: 'Status', titleKey: 'nav.status', icon: 'home', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'overview-hub' } },
+  { path: '/usage',     name: 'usage',     component: OverviewHubView, meta: { title: 'Usage', group: 'Work', icon: 'usage', nav: 'primary', navOrder: 60, navLabelKey: 'nav.viewUsage', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'overview-hub' } },
+  { path: '/logs',      name: 'logs',      component: LogsView, meta: { title: 'Logs', icon: 'logs', platforms: ['web', 'desktop'], keepAlive: true } },
   // Approvals retired as a front-end destination: the pending queue resolves
   // inline in the chat transcript (ApprovalCard) and via the topbar interrupt
   // pill. The old deep link redirects to Sessions so bookmarks and the pill
   // degrade gracefully
   // (openBlockedApprovalSession() routes straight to the blocked chat first).
   { path: '/approvals', redirect: '/sessions' },
-  { path: '/agents',    name: 'agents',    component: AgentsView,    meta: { title: 'Agents', group: 'Operate', icon: 'agents', nav: 'primary', navOrder: 40, platforms: ['web', 'desktop'], keepAlive: true } },
-  { path: '/cron',      name: 'cron',      component: CronView,      meta: { title: 'Cron', group: 'Operate', icon: 'cron', nav: 'primary', navOrder: 55, platforms: ['web', 'desktop'], keepAlive: true } },
-  { path: '/skills',    name: 'skills',    component: SkillsView,    meta: { title: 'Skills', group: 'Operate', icon: 'skills', nav: 'primary', navOrder: 45, platforms: ['web', 'desktop'], keepAlive: true } },
+  // Agent administration remains available as an advanced deep link, but is
+  // intentionally absent from primary navigation and cold-start restoration.
+  { path: '/agents',    name: 'agents',    component: AgentsView,    meta: { title: 'Agents', icon: 'agents', platforms: ['web', 'desktop'], keepAlive: true } },
+  // Skills and Channels form one primary destination. /skills remains the
+  // rail target while both canonical routes share the same kept-alive hub.
+  { path: '/skills',    name: 'skills',    component: SkillsChannelsHubView, meta: { title: 'Skills', group: 'Work', icon: 'skills', nav: 'primary', navOrder: 40, navLabelKey: 'nav.skillsChannels', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'skills-channels-hub' } },
+  { path: '/channels',  name: 'channels',  component: SkillsChannelsHubView, meta: { title: 'Channels', icon: 'channels', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'skills-channels-hub' } },
+  { path: '/cron',      name: 'cron',      component: CronView,      meta: { title: 'Cron', group: 'Work', icon: 'cron', nav: 'primary', navOrder: 50, platforms: ['web', 'desktop'], keepAlive: true } },
   // Editorial surface (read, not operated): the first route to opt into an
   // Axis-B expressive skin. Not in the primary nav — reached by URL / links.
   { path: '/changelog', name: 'changelog', component: ChangelogView, meta: { title: 'Changelog', platforms: ['web', 'desktop'], skin: 'out-of-register' } },

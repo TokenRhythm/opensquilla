@@ -831,7 +831,9 @@ def provider_mismatch_veto(
     turn actually executes on the active provider's credentials (a tier
     naming the active provider, or naming none). When no such tier exists
     it falls back to the configured default tier; without a usable default
-    it abstains, leaving the flag-only route-and-warn behavior in effect.
+    it abstains, and the selector-apply boundary then fails closed on the
+    primary deployment (provider *and* model) — veto mode never runs a
+    foreign model id on the active provider's credentials.
     """
     outcome = provider_mismatch(
         tiers=tiers,

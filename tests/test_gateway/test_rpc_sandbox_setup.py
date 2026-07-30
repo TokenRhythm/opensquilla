@@ -92,7 +92,7 @@ async def test_sandbox_setup_ensure_returns_platform_payload(monkeypatch) -> Non
             requires_admin=True,
         )
 
-    monkeypatch.setattr(rpc_sandbox, "ensure_sandbox_setup", fake_ensure)
+    monkeypatch.setattr(rpc_sandbox, "ensure_sandbox_setup_auto", fake_ensure)
 
     payload = await rpc_sandbox._handle_sandbox_setup_ensure({}, _ctx())
 

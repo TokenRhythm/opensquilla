@@ -221,6 +221,7 @@ async def test_replayed_turn_keeps_user_message_binding(monkeypatch) -> None:
         tool_registry=get_default_registry(),
         config=cfg,
     )
+    captured_assistant: list[tuple[str | None, str]] = []
 
     events = [
         event
@@ -232,12 +233,16 @@ async def test_replayed_turn_keeps_user_message_binding(monkeypatch) -> None:
             history_has_persisted_user=True,
             bound_user_message_id=entry_a.message_id,
             no_memory_capture=True,
+            assistant_message_sink=lambda message_id, content: captured_assistant.append(
+                (message_id, content)
+            ),
         )
     ]
 
     replay_events = [event for event in events if isinstance(event, RouterControlReplayEvent)]
     assert len(replay_events) == 1
     assert len(provider.message_calls) == 2
+    assert captured_assistant == [("m4", "new final")]
 
     for call in provider.message_calls:
         users = [m.content for m in call if m.role == "user" and isinstance(m.content, str)]

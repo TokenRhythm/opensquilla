@@ -14,6 +14,7 @@ import pytest
 
 PYPROJECT = Path(__file__).resolve().parents[2] / "pyproject.toml"
 UV_LOCK = Path(__file__).resolve().parents[2] / "uv.lock"
+FORMULA = Path(__file__).resolve().parents[2] / "Formula" / "opensquilla.rb"
 
 
 @pytest.fixture(scope="module")
@@ -149,3 +150,33 @@ def test_html_coder_reference_files_are_packaged() -> None:
         assert (
             force_include[source] == source.removeprefix("src/")
         ), f"{source} should be packaged at its import-time skill path"
+
+
+def test_standard_distributions_require_verified_generated_webui() -> None:
+    data = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    build = data["build-system"]
+    hatch = data["tool"]["hatch"]["build"]
+    artifact_rule = "src/opensquilla/gateway/static/dist/**"
+
+    assert build["requires"] == ["hatchling>=1.31,<2"]
+    assert "custom" in hatch["hooks"]
+    assert artifact_rule in hatch["targets"]["wheel"]["artifacts"]
+    assert artifact_rule in hatch["targets"]["sdist"]["artifacts"]
+    assert "opensquilla-webui/public/music/**" not in hatch["targets"]["sdist"][
+        "artifacts"
+    ]
+    assert (PYPROJECT.parent / "hatch_build.py").is_file()
+    assert (PYPROJECT.parent / "scripts" / "verify_webui_artifact.py").is_file()
+
+
+def test_homebrew_head_install_builds_the_generated_webui_before_python() -> None:
+    formula = FORMULA.read_text(encoding="utf-8")
+
+    assert 'depends_on "node" => :build' in formula
+    assert 'require "language/node"' in formula
+    npm_ci = formula.index(
+        'system "npm", "ci", "--#{Language::Node.npm_cache_config}"'
+    )
+    npm_build = formula.index('system "npm", "run", "build"')
+    pip_install = formula.index("venv.pip_install_and_link buildpath")
+    assert npm_ci < npm_build < pip_install

@@ -21,7 +21,19 @@ from opensquilla.session.storage import SessionStorage
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 
-TABLES = ("sessions", "transcript_entries", "session_summaries")
+TABLES = (
+    "sessions",
+    "transcript_entries",
+    "session_summaries",
+    "usage_events",
+    "usage_event_items",
+    "usage_item_billing_receipts",
+    "usage_billing_receipt_state",
+    "usage_ledger_state",
+    "usage_legacy_baselines",
+    "plan_revisions",
+    "plan_runs",
+)
 
 # Synthetic approximation of the oldest supported on-disk shape. It is the
 # current storage.py DDL with the columns REMOVED that yoyo migrations add
@@ -32,6 +44,8 @@ TABLES = ("sessions", "transcript_entries", "session_summaries")
 #   - V009__transcript_reasoning_content: reasoning_content
 #     (transcript_entries)
 #   - V010__transcript_turn_usage: turn_usage (transcript_entries)
+#   - V025__session_collaboration_state: collaboration_mode,
+#     collaboration_revision, active_plan_revision_id (sessions)
 # session_summaries is not mutated by any yoyo migration (its later columns
 # arrive via SessionStorage connect-time shims), so its legacy DDL matches
 # the current one; it is still compared below to catch a future one-sided

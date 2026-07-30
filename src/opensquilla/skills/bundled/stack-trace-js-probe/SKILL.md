@@ -1,6 +1,7 @@
 ---
 name: stack-trace-js-probe
 description: "Internal helper for meta-stack-trace-investigator. Use when a JavaScript or TypeScript stack trace needs npm/node/tsc-specific checks, reproduction guidance, and patch targets."
+description_zh: "meta-stack-trace-investigator的内部辅助工具。当JavaScript或TypeScript堆栈跟踪需要npm/node/tsc特定的检查、复现指引和补丁目标时使用。"
 user-invocable: false
 disable-model-invocation: true
 provenance:

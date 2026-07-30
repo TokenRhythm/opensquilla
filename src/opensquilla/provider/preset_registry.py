@@ -52,7 +52,9 @@ LEGACY_PROVIDER_PRESET_IDS: frozenset[str] = frozenset(
 # ``squilla_router.tier_profile`` id: the accepted set stays pinned to the
 # legacy nine (downgrade contract), so provider saves and boot defaults apply
 # these ladders as inline tiers instead.
-CURATED_INLINE_PRESET_IDS: frozenset[str] = frozenset({"tokenrhythm"})
+CURATED_INLINE_PRESET_IDS: frozenset[str] = frozenset(
+    {"qwen_token_plan", "tokenrhythm"}
+)
 
 _PRESETS_SUBDIR = "presets"
 

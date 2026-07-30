@@ -47,6 +47,21 @@ class SessionIntent(StrEnum):
     RESET_SAME_KEY = "reset_same_key"
 
 
+class CollaborationMode(StrEnum):
+    DEFAULT = "default"
+    PLAN = "plan"
+
+
+class PlanRunStatus(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    PAUSED = "paused"
+    BLOCKED = "blocked"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    SUPERSEDED = "superseded"
+
+
 class AgentTaskStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
@@ -69,6 +84,23 @@ def _now_ms() -> int:
 
 def _new_uuid() -> str:
     return str(uuid.uuid4())
+
+
+class ProjectWorkspace(SQLModel, table=True):
+    """A user-selected project directory that exists independently of sessions."""
+
+    __tablename__ = "project_workspaces"
+
+    workspace_id: str = Field(default_factory=_new_uuid, primary_key=True)
+    path: str
+    path_key: str = Field(unique=True)
+    display_name: str
+    created_at: int = Field(default_factory=_now_ms)
+    updated_at: int = Field(default_factory=_now_ms)
+    position_at: int = Field(default_factory=_now_ms)
+    pinned_at: int | None = None
+    removed_at: int | None = None
+    trusted_at: int | None = None
 
 
 class SessionNode(SQLModel, table=True):
@@ -138,6 +170,9 @@ class SessionNode(SQLModel, table=True):
     reasoning_level: str | None = None
     send_policy: str = Field(default=SendPolicy.ALLOW)
     queue_mode: str = Field(default=QueueMode.STEER)
+    collaboration_mode: str = Field(default=CollaborationMode.DEFAULT)
+    collaboration_revision: int = 0
+    active_plan_revision_id: str | None = None
 
     # Labels
     label: str | None = Field(default=None, max_length=512)
@@ -152,6 +187,10 @@ class SessionNode(SQLModel, table=True):
 
     # Origin metadata (JSON blob)
     origin: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
+
+    # Optional user-selected project workspace. Ordinary tasks keep this NULL
+    # and continue to resolve the Agent/default OpenSquilla workspace.
+    workspace_id: str | None = Field(default=None, index=True)
 
     # Agent id for multi-agent support
     agent_id: str = "main"
@@ -180,6 +219,9 @@ class TranscriptEntry(SQLModel, table=True):
     tool_call_id: str | None = None
     reasoning_content: str | None = None
     turn_usage: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
+    # Gateway-owned causal identity shared by every durable row in one turn.
+    # Additive JSON keeps older readers and pre-identity transcript rows valid.
+    turn_context: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
     created_at: int = Field(default_factory=_now_ms)
     token_count: int | None = None
 
@@ -191,6 +233,55 @@ class TranscriptEntry(SQLModel, table=True):
     provenance_source_tool: str | None = None
 
     # Schema generation (S-MIGRATE).
+    schema_version: int = 1
+
+
+class PlanRevisionRecord(SQLModel, table=True):
+    """Immutable, structured plan proposed for a session."""
+
+    __tablename__ = "plan_revisions"
+
+    revision_id: str = Field(default_factory=_new_uuid, primary_key=True)
+    plan_id: str = Field(default_factory=_new_uuid, index=True)
+    parent_revision_id: str | None = Field(default=None, index=True)
+    generation: int = 1
+    source_session_key: str = Field(index=True, max_length=512)
+    source_session_id: str = Field(index=True)
+    source_epoch: int = 0
+    source_turn_id: str | None = Field(default=None, index=True)
+    source_message_id: str | None = Field(default=None, index=True)
+    title: str
+    markdown: str
+    steps: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    content_hash: str = Field(index=True, max_length=128)
+    created_at: int = Field(default_factory=_now_ms)
+    schema_version: int = 1
+
+
+class PlanRunRecord(SQLModel, table=True):
+    """Server-authoritative execution overlay for one immutable plan revision."""
+
+    __tablename__ = "plan_runs"
+
+    run_id: str = Field(default_factory=_new_uuid, primary_key=True)
+    session_key: str = Field(index=True, max_length=512)
+    session_id: str = Field(index=True)
+    session_epoch: int = 0
+    plan_revision_id: str = Field(index=True)
+    supersedes_run_id: str | None = Field(default=None, index=True)
+    driver_kind: str = "manual"
+    driver_id: str | None = Field(default=None, index=True)
+    status: str = Field(default=PlanRunStatus.QUEUED, index=True)
+    step_states: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    current_step_id: str | None = None
+    state_revision: int = 0
+    active_task_id: str | None = Field(default=None, index=True)
+    pause_reason: str | None = None
+    terminal_reason: str | None = None
+    created_at: int = Field(default_factory=_now_ms)
+    updated_at: int = Field(default_factory=_now_ms)
+    started_at: int | None = None
+    finished_at: int | None = None
     schema_version: int = 1
 
 
@@ -299,4 +390,22 @@ class AgentTaskRecord(SQLModel, table=True):
     error_message: str | None = None
     details: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
 
+    schema_version: int = 1
+
+
+class TurnIngressReceipt(SQLModel, table=True):
+    """Durable idempotency receipt for one accepted inbound turn."""
+
+    __tablename__ = "turn_ingress_receipts"
+
+    receipt_id: str = Field(default_factory=_new_uuid, primary_key=True)
+    source_scope: str = Field(index=True, max_length=256)
+    request_session_key: str = Field(index=True, max_length=512)
+    client_request_id: str = Field(max_length=256)
+    request_fingerprint: str = Field(max_length=128)
+    accepted_session_key: str = Field(index=True, max_length=512)
+    session_id: str = Field(index=True)
+    message_id: str
+    task_id: str | None = Field(default=None, index=True)
+    accepted_at: int = Field(default_factory=_now_ms)
     schema_version: int = 1

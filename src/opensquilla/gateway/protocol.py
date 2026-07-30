@@ -50,6 +50,7 @@ class ErrorShape(BaseModel):
     details: Any | None = None
     retryable: bool | None = None
     retry_after_ms: int | None = None
+    accepted: bool | None = None
 
 
 class ResFrame(BaseModel):
@@ -141,6 +142,7 @@ class PolicyInfo(BaseModel):
     max_payload: int = MAX_PAYLOAD_BYTES
     max_buffered_bytes: int = MAX_BUFFERED_BYTES
     tick_interval_ms: int = TICK_INTERVAL_MS
+    concurrent_history_reads: bool = False
     agent_stream_heartbeat_interval_ms: int = 15_000
     agent_stream_idle_timeout_ms: int = 600_000
     webui_stream_idle_grace_ms: int = 630_000
@@ -178,11 +180,20 @@ def make_error_res(
     message: str,
     retryable: bool = False,
     details: Any | None = None,
+    retry_after_ms: int | None = None,
+    accepted: bool | None = None,
 ) -> ResFrame:
     return ResFrame(
         id=req_id,
         ok=False,
-        error=ErrorShape(code=code, message=message, retryable=retryable, details=details),
+        error=ErrorShape(
+            code=code,
+            message=message,
+            retryable=retryable,
+            retry_after_ms=retry_after_ms,
+            accepted=accepted,
+            details=details,
+        ),
     )
 
 

@@ -7,6 +7,7 @@ import json
 import os
 import signal
 import socket
+import time
 from collections.abc import Callable
 
 import typer
@@ -125,6 +126,7 @@ def run_gateway(
     honoured as the fallback when no CLI flag or env var is supplied,
     matching what the field name promises.
     """
+    gateway_startup_started_at = time.monotonic()
     requested_config = config_path or os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH")
     if not desktop_config_path_is_profile_local(requested_config):
         console.print("DESKTOP_CONFIG_OUTSIDE_PROFILE")
@@ -213,6 +215,7 @@ def run_gateway(
             config=config,
             subscription_manager=subscription_mgr,
             run=True,
+            _startup_started_at=gateway_startup_started_at,
         )
         assert server._task is not None
 
@@ -237,7 +240,13 @@ def run_gateway(
         # Windows, where SIGTERM maps to an immediate TerminateProcess.
         app = getattr(server, "app", None)
         if app is not None and hasattr(app, "state"):
-            app.state.request_shutdown = _request_shutdown
+            install_shutdown_handler = getattr(
+                app.state, "install_shutdown_handler", None
+            )
+            if callable(install_shutdown_handler):
+                install_shutdown_handler(_request_shutdown)
+            else:
+                app.state.request_shutdown = _request_shutdown
         server_task = server._task
         waiter = asyncio.ensure_future(shutdown.wait())
         try:

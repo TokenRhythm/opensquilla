@@ -34,6 +34,7 @@ def _python_shell_command(script: str) -> str:
 class _FakeStdin:
     def __init__(self) -> None:
         self.closed = False
+        self.close_waited = False
         self.writes: list[bytes] = []
 
     def is_closing(self) -> bool:
@@ -49,7 +50,7 @@ class _FakeStdin:
         self.closed = True
 
     async def wait_closed(self) -> None:
-        return None
+        self.close_waited = True
 
 
 @dataclass
@@ -167,6 +168,43 @@ def test_bg_session_payload_surfaces_codetask_status_with_spaced_path(tmp_path) 
     assert code_task["log_paths"] == {"stdout": str(run_dir / "agent_stdout.log")}
 
 
+def test_verified_channel_admin_can_manage_background_sessions_across_sessions() -> None:
+    own = _session("own", "agent:main:feishu:direct:owner")
+    other = _session("other", "agent:main:feishu:direct:other")
+    shell._bg_sessions.update({own.session_id: own, other.session_id: other})
+    token = current_tool_context.set(
+        ToolContext(
+            is_owner=True,
+            channel_admin_verified=True,
+            caller_kind=CallerKind.CHANNEL,
+            session_key=own.session_key,
+        )
+    )
+    try:
+        assert shell._iter_visible_bg_sessions() == [own, other]
+        assert shell.get_bg_session(other.session_id) is other
+    finally:
+        current_tool_context.reset(token)
+
+
+def test_unverified_channel_owner_cannot_manage_other_background_sessions() -> None:
+    own = _session("own", "agent:main:feishu:direct:owner")
+    other = _session("other", "agent:main:feishu:direct:other")
+    shell._bg_sessions.update({own.session_id: own, other.session_id: other})
+    token = current_tool_context.set(
+        ToolContext(
+            is_owner=True,
+            caller_kind=CallerKind.CHANNEL,
+            session_key=own.session_key,
+        )
+    )
+    try:
+        assert shell._iter_visible_bg_sessions() == [own]
+        assert shell.get_bg_session(other.session_id) is None
+    finally:
+        current_tool_context.reset(token)
+
+
 @pytest.mark.skipif(os.name != "posix", reason="process group behavior is POSIX-specific")
 @pytest.mark.asyncio
 async def test_exec_command_returns_when_shell_exits_even_if_descendant_holds_pipe() -> None:
@@ -230,11 +268,23 @@ async def test_exec_command_writes_optional_stdin() -> None:
         "import sys; data = sys.stdin.read(); print('STDIN:' + data)"
     )
 
-    result = await shell.exec_command(command, stdin="payload", timeout=1.0)
+    result = await shell.exec_command(command, stdin="payload", timeout=5.0)
 
     exit_line, stdout = result.split("\n", 1)
     assert exit_line == "exit_code=0"
     assert stdout.splitlines() == ["STDIN:payload"]
+
+
+@pytest.mark.asyncio
+async def test_write_exec_stdin_waits_until_eof_is_delivered() -> None:
+    stdin = _FakeStdin()
+    proc = SimpleNamespace(stdin=stdin)
+
+    await shell._write_exec_stdin(proc, b"payload")
+
+    assert stdin.writes == [b"payload"]
+    assert stdin.closed is True
+    assert stdin.close_waited is True
 
 
 @pytest.mark.asyncio

@@ -110,7 +110,12 @@ const DEFAULT_ALL_FAILED_POLICY = 'fallback_single'
 const STATIC_B5_EFFECTIVE_QUORUM = 3
 const STATIC_B5_PROPOSER_TIMEOUT_SECONDS = 300
 const STATIC_B5_AGGREGATOR_TIMEOUT_SECONDS = 480
-const STATIC_B5_QUORUM_GRACE_SECONDS = 30
+const STATIC_B5_QUORUM_GRACE_SECONDS = 10
+// The gateway builder substitutes the static-B5 timeout defaults above ONLY
+// when the stored value still equals this legacy default; an explicit
+// operator override (e.g. proposer_timeout_seconds = 600 in TOML) runs as
+// configured and must be surfaced as such.
+const LEGACY_ENSEMBLE_TIMEOUT_SECONDS = 3600
 
 export type EnsembleScheme = 'preset' | 'custom' | 'legacy'
 
@@ -129,6 +134,7 @@ export interface EnsembleCredentialStatus {
   available: boolean
   source: 'explicit' | 'env' | 'missing_env' | 'not_required' | 'none' | string
   envKey?: string
+  reason?: string
 }
 
 export interface EnsembleCandidateView {
@@ -180,10 +186,20 @@ export interface EnsembleCustomLineupView {
 export interface EnsembleConfigSlice {
   enabled?: boolean
   selection_mode?: string
+  selection_configured?: boolean
+  activation_preview?: {
+    selection_mode?: string
+    candidates?: EnsembleCandidateConfig[]
+    blocked_reason?: string | null
+  }
   model_options?: string[]
   candidates?: EnsembleCandidateConfig[]
   min_successful_proposers?: number
   all_failed_policy?: string
+  // Read-only in this form (no editor yet): consumed so effectiveFacts can
+  // report an explicit operator override instead of the static default.
+  proposer_timeout_seconds?: number
+  aggregator_timeout_seconds?: number
 }
 
 interface EnsembleTierCandidate {
@@ -217,6 +233,11 @@ function normalizeAllFailedPolicy(value: unknown): string {
 function normalizeMinSuccessful(value: unknown): number {
   const num = Math.trunc(Number(value))
   return Number.isFinite(num) && num >= 1 ? num : DEFAULT_MIN_SUCCESSFUL_PROPOSERS
+}
+
+function normalizeStoredTimeoutSeconds(value: unknown): number {
+  const num = Number(value)
+  return Number.isFinite(num) && num > 0 ? num : LEGACY_ENSEMBLE_TIMEOUT_SECONDS
 }
 
 function normalizeModelOptions(value: unknown): string[] {
@@ -254,7 +275,7 @@ export function normalizeCandidateRole(value: unknown): EnsembleCandidateRole {
 
 function normalizeCandidates(value: unknown): EnsembleCandidateConfig[] {
   if (!Array.isArray(value)) return []
-  const seen = new Set<string>()
+  const seen = new Map<string, number>()
   const out: EnsembleCandidateConfig[] = []
   for (const entry of value) {
     if (!entry || typeof entry !== 'object') continue
@@ -265,18 +286,30 @@ function normalizeCandidates(value: unknown): EnsembleCandidateConfig[] {
     const source = normalizeCandidateSource(raw.source)
     const role = normalizeCandidateRole(raw.role)
     // The aggregator row may legitimately duplicate a proposer row (the same
-    // model can both draft and fuse), so the identity includes the
-    // aggregator/proposer distinction.
-    const key = `${provider}\n${model}\n${source}\n${role === 'aggregator' ? 'aggregator' : 'proposer'}`
-    if (seen.has(key)) continue
-    seen.add(key)
-    out.push({
+    // model can both draft and fuse), so the identity includes only the
+    // aggregator/proposer distinction -- provenance is metadata, not identity.
+    const key = `${provider}\n${model}\n${role === 'aggregator' ? 'aggregator' : 'proposer'}`
+    const normalized: EnsembleCandidateConfig = {
       provider,
       model,
       source,
       enabled: raw.enabled === false ? false : true,
       role,
-    })
+    }
+    const existingIndex = seen.get(key)
+    if (existingIndex === undefined) {
+      seen.set(key, out.length)
+      out.push(normalized)
+      continue
+    }
+    // Historical configs may contain a disabled row before an enabled row for
+    // the same deployment. Explicit add/import/replace actions append or
+    // produce the enabled row, which must win instead of being swallowed by a
+    // first-wins dedupe pass. Otherwise the UI reports success while the member
+    // silently remains disabled (or the replaced proposer disappears).
+    if (out[existingIndex]?.enabled === false && normalized.enabled) {
+      out[existingIndex] = normalized
+    }
   }
   return out
 }
@@ -361,7 +394,11 @@ function uniqueCandidateViews(candidates: EnsembleCandidateView[]): EnsembleCand
   const seen = new Set<string>()
   const out: EnsembleCandidateView[] = []
   for (const candidate of candidates) {
-    const key = `${candidate.provider}\n${candidate.model}`
+    // One deployment may legitimately occupy both a proposer slot and the
+    // aggregator slot. Keep those views distinct while still collapsing
+    // duplicate proposer rows from legacy + structured inputs.
+    const slot = candidate.role === 'aggregator' ? 'aggregator' : 'proposer'
+    const key = `${candidate.provider}\n${candidate.model}\n${slot}`
     if (seen.has(key)) continue
     seen.add(key)
     out.push(candidate)
@@ -376,6 +413,11 @@ export function useSetupEnsembleForm() {
   const candidates = ref<EnsembleCandidateConfig[]>([])
   const minSuccessfulProposers = ref(DEFAULT_MIN_SUCCESSFUL_PROPOSERS)
   const allFailedPolicy = ref(DEFAULT_ALL_FAILED_POLICY)
+  // Stored timeout values mirrored from config (read-only here — the panel
+  // has no editor for them, but effectiveFacts must reflect explicit
+  // operator overrides instead of always claiming the static defaults).
+  const storedProposerTimeoutSeconds = ref(LEGACY_ENSEMBLE_TIMEOUT_SECONDS)
+  const storedAggregatorTimeoutSeconds = ref(LEGACY_ENSEMBLE_TIMEOUT_SECONDS)
 
   // Per-key baselines: partial payloads need to know WHICH keys changed, not
   // just that something did. Seeded from the initial state so the pristine
@@ -428,13 +470,33 @@ export function useSetupEnsembleForm() {
 
   function initFromConfig(config: EnsembleConfigSlice) {
     enabled.value = config.enabled === true
-    selectionMode.value = normalizeSelectionMode(config.selection_mode)
+    const usePlannedActivation = (
+      config.enabled !== true && config.selection_configured === false
+    )
+    const plannedActivation = usePlannedActivation
+      ? config.activation_preview
+      : undefined
+    selectionMode.value = (
+      usePlannedActivation
+        ? normalizeSelectionMode(
+            plannedActivation?.selection_mode ?? CUSTOM_B5_SELECTION_MODE,
+          )
+        : normalizeSelectionMode(config.selection_mode)
+    )
     modelOptions.value = normalizeModelOptions(config.model_options)
-    candidates.value = normalizeCandidates(config.candidates)
+    candidates.value = normalizeCandidates(
+      plannedActivation?.candidates ?? config.candidates,
+    )
     minSuccessfulProposers.value = normalizeMinSuccessful(
       config.min_successful_proposers ?? DEFAULT_MIN_SUCCESSFUL_PROPOSERS,
     )
     allFailedPolicy.value = normalizeAllFailedPolicy(config.all_failed_policy)
+    storedProposerTimeoutSeconds.value = normalizeStoredTimeoutSeconds(
+      config.proposer_timeout_seconds,
+    )
+    storedAggregatorTimeoutSeconds.value = normalizeStoredTimeoutSeconds(
+      config.aggregator_timeout_seconds,
+    )
     snapshotBaseline()
   }
 
@@ -528,6 +590,93 @@ export function useSetupEnsembleForm() {
     clampQuorumToLineup()
   }
 
+  function replaceCandidate(
+    candidate: { provider: string; model: string; source?: string; role?: string },
+    provider: string,
+    model: string,
+  ) {
+    const currentProvider = normalizeProvider(candidate.provider)
+    const currentModel = normalizeModel(candidate.model)
+    const nextProvider = normalizeProvider(provider)
+    const nextModel = normalizeModel(model)
+    const source = normalizeCandidateSource(candidate.source)
+    const slot = normalizeCandidateRole(candidate.role) === 'aggregator' ? 'aggregator' : 'proposer'
+    if (
+      !currentProvider
+      || !currentModel
+      || !nextProvider
+      || !nextModel
+      || (currentProvider === nextProvider && currentModel === nextModel)
+      || slot === 'aggregator'
+    ) {
+      return
+    }
+
+    const duplicate = candidates.value.some(entry => (
+      entry.enabled !== false
+      && normalizeCandidateRole(entry.role) !== 'aggregator'
+      && normalizeProvider(entry.provider) === nextProvider
+      && normalizeModel(entry.model) === nextModel
+    ))
+    if (duplicate) return
+
+    let replaced = false
+    const next = candidates.value.map((entry) => {
+      const matches = (
+        !replaced
+        && normalizeProvider(entry.provider) === currentProvider
+        && normalizeModel(entry.model) === currentModel
+        && normalizeCandidateSource(entry.source) === source
+        && normalizeCandidateRole(entry.role) !== 'aggregator'
+      )
+      if (!matches) return entry
+      replaced = true
+      return { ...entry, provider: nextProvider, model: nextModel }
+    })
+    if (!replaced) return
+
+    ensureCustomMode()
+    // Replace in one assignment so an unchanged proposer count cannot
+    // transiently clamp an explicit quorum or collapse a duplicate row.
+    candidates.value = normalizeCandidates(next)
+    clampQuorumToLineup()
+  }
+
+  function setAggregator(provider: string, model: string) {
+    const cleanProvider = normalizeProvider(provider)
+    const cleanModel = normalizeModel(model)
+    if (!cleanProvider || !cleanModel) return
+    ensureCustomMode()
+
+    const currentAggregator = candidates.value.find(candidate => (
+      candidate.enabled !== false
+      && normalizeCandidateRole(candidate.role) === 'aggregator'
+    ))
+    if (
+      currentAggregator
+      && normalizeProvider(currentAggregator.provider) === cleanProvider
+      && normalizeModel(currentAggregator.model) === cleanModel
+    ) return
+
+    // The same model may draft and aggregate in separate slots. Replacing the
+    // aggregator must not consume the selected proposer or demote the previous
+    // aggregator into the proposer lineup.
+    const next = candidates.value.filter(candidate => (
+      normalizeCandidateRole(candidate.role) !== 'aggregator'
+    ))
+    next.push({
+      provider: cleanProvider,
+      model: cleanModel,
+      // Replacing the model in an existing aggregator slot must not rewrite
+      // its provenance. An inherited aggregator has no stored row, so a newly
+      // materialized slot is custom by definition.
+      source: currentAggregator?.source || 'custom',
+      enabled: currentAggregator?.enabled !== false,
+      role: 'aggregator',
+    })
+    candidates.value = normalizeCandidates(next)
+  }
+
   function setCandidateRole(
     candidate: { provider: string; model: string; source?: string; role?: string },
     role: EnsembleCandidateRole,
@@ -557,8 +706,12 @@ export function useSetupEnsembleForm() {
     clampQuorumToLineup()
   }
 
-  function importTierCandidates(tierCandidates: readonly EnsembleTierCandidate[]) {
+  function importTierCandidates(
+    tierCandidates: readonly EnsembleTierCandidate[],
+    providerRestriction?: unknown,
+  ) {
     ensureCustomMode()
+    const allowedProvider = normalizeProvider(providerRestriction)
     const existing = new Set(
       enabledProposerConfigs.value.map(entry => `${entry.provider}\n${entry.model}`),
     )
@@ -569,6 +722,7 @@ export function useSetupEnsembleForm() {
       const provider = normalizeProvider(row.provider)
       const model = normalizeModel(row.model)
       if (!provider || !model) continue
+      if (allowedProvider && provider !== allowedProvider) continue
       const key = `${provider}\n${model}`
       if (existing.has(key)) continue
       existing.add(key)
@@ -620,36 +774,53 @@ export function useSetupEnsembleForm() {
     }
   }
 
-  // Default activation when the ensemble strategy is switched on: providers
-  // with an official preset land on it; every other provider gets an explicit
-  // custom lineup seeded from the router tiers (the models the user already
-  // configured), never the hidden legacy dynamic mode.
+  // Default activation when the ensemble strategy is switched on: every
+  // provider lands on the single editable custom path. Providers with a
+  // curated static profile use that profile only as the initial seed; other
+  // providers seed from the router tiers the user already configured.
   function activateForProvider(provider: unknown, tierCandidates: readonly EnsembleTierCandidate[] = []) {
     const presetMode = staticB5ModeForProvider(provider)
-    if (presetMode) {
-      selectionMode.value = presetMode
+    selectionMode.value = CUSTOM_B5_SELECTION_MODE
+    if (candidates.value.some(candidate => candidate.enabled !== false)) return
+    const profile = presetMode ? STATIC_B5_PROFILES[presetMode] : null
+    if (profile) {
+      candidates.value = customSeedFromProfile(profile)
       return
     }
-    selectionMode.value = CUSTOM_B5_SELECTION_MODE
-    if (!candidates.value.some(candidate => candidate.enabled !== false)) {
-      importTierCandidates(tierCandidates)
-    }
+    importTierCandidates(tierCandidates)
   }
 
   // One-click migration off the hidden legacy router_dynamic mode: fold the
   // legacy inputs (structured candidates + model_options + tier rows) into an
   // explicit custom lineup, capped at the proposer maximum.
-  function migrateLegacyToCustom(tierCandidates: readonly EnsembleTierCandidate[] = []) {
+  function migrateLegacyToCustom(
+    tierCandidates: readonly EnsembleTierCandidate[] = [],
+    activeProvider: unknown = '',
+  ) {
     const rows: EnsembleCandidateConfig[] = []
     const seen = new Set<string>()
+    let proposerCount = 0
+    const legacyProvider = normalizeProvider(activeProvider)
     const push = (provider: string, model: string, role: EnsembleCandidateRole = '') => {
       const cleanProvider = normalizeProvider(provider)
       const cleanModel = normalizeModel(model)
       if (!cleanProvider || !cleanModel) return
-      const key = `${cleanProvider}\n${cleanModel}`
-      if (seen.has(key) || rows.length >= CUSTOM_B5_MAX_PROPOSERS) return
+      const cleanRole = normalizeCandidateRole(role)
+      const slot = cleanRole === 'aggregator' ? 'aggregator' : 'proposer'
+      const key = `${cleanProvider}\n${cleanModel}\n${slot}`
+      if (seen.has(key)) return
+      // The ceiling is for proposer calls. The structurally separate
+      // aggregator remains valid in addition to all six proposers.
+      if (slot === 'proposer' && proposerCount >= CUSTOM_B5_MAX_PROPOSERS) return
       seen.add(key)
-      rows.push({ provider: cleanProvider, model: cleanModel, source: 'custom', enabled: true, role })
+      if (slot === 'proposer') proposerCount += 1
+      rows.push({
+        provider: cleanProvider,
+        model: cleanModel,
+        source: 'custom',
+        enabled: true,
+        role: cleanRole,
+      })
     }
     for (const candidate of candidates.value) {
       if (candidate.enabled === false) continue
@@ -657,7 +828,7 @@ export function useSetupEnsembleForm() {
     }
     if (!legacyDefaultModelOptions(modelOptions.value)) {
       for (const model of modelOptions.value) {
-        push(model.includes('/') ? 'openrouter' : '', model)
+        push(model.includes('/') ? 'openrouter' : legacyProvider, model)
       }
     }
     for (const row of tierCandidates || []) {
@@ -711,13 +882,28 @@ export function useSetupEnsembleForm() {
       configuredQuorum === DEFAULT_MIN_SUCCESSFUL_PROPOSERS ? autoQuorum : configuredQuorum,
       Math.max(1, proposerCount),
     )
+    // Mirrors the gateway builder: static presets and custom_b5 lineups get
+    // the static defaults only while the stored value still equals the legacy
+    // default; an explicit override runs (and reads) as configured. The
+    // hidden legacy router_dynamic mode runs the stored values untouched and
+    // has no quorum grace.
+    const staticDefaultsApply = isPreset || selectionMode.value !== 'router_dynamic'
+    const substituteLegacy = (stored: number, staticDefault: number): number => (
+      staticDefaultsApply && stored === LEGACY_ENSEMBLE_TIMEOUT_SECONDS ? staticDefault : stored
+    )
     return {
       perTurnCalls: proposerCount + 1,
       quorum,
       proposerCount,
-      proposerTimeoutSeconds: STATIC_B5_PROPOSER_TIMEOUT_SECONDS,
-      aggregatorTimeoutSeconds: STATIC_B5_AGGREGATOR_TIMEOUT_SECONDS,
-      quorumGraceSeconds: STATIC_B5_QUORUM_GRACE_SECONDS,
+      proposerTimeoutSeconds: substituteLegacy(
+        storedProposerTimeoutSeconds.value,
+        STATIC_B5_PROPOSER_TIMEOUT_SECONDS,
+      ),
+      aggregatorTimeoutSeconds: substituteLegacy(
+        storedAggregatorTimeoutSeconds.value,
+        STATIC_B5_AGGREGATOR_TIMEOUT_SECONDS,
+      ),
+      quorumGraceSeconds: staticDefaultsApply ? STATIC_B5_QUORUM_GRACE_SECONDS : 0,
     }
   }
 
@@ -727,6 +913,13 @@ export function useSetupEnsembleForm() {
       const activeProvider = normalizeProvider(context.activeProvider.value)
       const activeModel = normalizeModel(context.activeModel?.value ?? '')
       const providerStaticMode = staticB5ModeForProvider(activeProvider)
+      // The STORED selection mode is what the runtime builder keys off: a
+      // static preset saved for one provider keeps running its own lineup
+      // even after the active provider changes (its members resolve
+      // credentials through the profile provider's env key).
+      const storedStaticMode = selectionMode.value in STATIC_B5_PROFILES
+        ? selectionMode.value
+        : null
 
       const scheme: EnsembleScheme = (
         selectionMode.value === 'router_dynamic'
@@ -762,10 +955,14 @@ export function useSetupEnsembleForm() {
         })
       const customCandidates = uniqueCandidateViews([...structuredCandidates, ...legacyCandidates])
 
+      // Render the preset card from the STORED profile, not the active
+      // provider's own preset: when they disagree, the stored lineup is the
+      // one that runs (and bills), so showing the active provider's lineup
+      // would misreport every turn's members.
       const activeStaticProfile = (
-        scheme === 'preset' && providerStaticMode !== null
+        scheme === 'preset' && storedStaticMode !== null
       )
-        ? STATIC_B5_PROFILES[providerStaticMode]
+        ? STATIC_B5_PROFILES[storedStaticMode]
         : null
       const fixedProfile: EnsembleFixedProfileView | null = activeStaticProfile
         ? {
@@ -820,6 +1017,15 @@ export function useSetupEnsembleForm() {
         customCandidates,
         custom: customLineup,
         fixedProfile,
+        // True when the stored preset belongs to a different provider than
+        // the active one (both have static profiles): the stored lineup
+        // still runs, so the panel flags the divergence instead of quietly
+        // relabelling it.
+        presetProviderMismatch: (
+          scheme === 'preset'
+          && storedStaticMode !== null
+          && storedStaticMode !== providerStaticMode
+        ),
         presetFacts: effectiveFacts(
           activeStaticProfile ? activeStaticProfile.proposers.length : 4,
           true,
@@ -864,6 +1070,8 @@ export function useSetupEnsembleForm() {
     removeModelOption,
     addCandidate,
     removeCandidate,
+    replaceCandidate,
+    setAggregator,
     setCandidateRole,
     importTierCandidates,
     resetModelOptions,

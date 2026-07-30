@@ -47,13 +47,6 @@ def _get_agent_registry(ctx: RpcContext):
     return agent_registry
 
 
-def _get_identity_service(ctx: RpcContext):
-    identity_service = getattr(ctx, "identity_service", None)
-    if identity_service is None:
-        raise RpcUnavailableError("Agent identity service not available")
-    return identity_service
-
-
 def _workspace_file_root(ctx: RpcContext, agent_id: str) -> Path | None:
     config = getattr(ctx, "config", None)
     if not getattr(config, "workspace_dir", None):
@@ -374,6 +367,6 @@ async def _handle_agents_files_set(params: dict | None, ctx: RpcContext) -> dict
 async def _handle_agent_identity_get(params: dict | None, ctx: RpcContext) -> dict:
     agent_id = normalize_agent_id((params or {}).get("agentId", "main"))
 
-    identity_service = _get_identity_service(ctx)
-    identity = await identity_service.get_identity(agent_id)
+    agent_registry = _get_agent_registry(ctx)
+    identity = await agent_registry.get_identity(agent_id)
     return cast(dict, identity)

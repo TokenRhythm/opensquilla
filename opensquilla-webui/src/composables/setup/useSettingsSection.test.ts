@@ -14,11 +14,23 @@ describe('settings section IA', () => {
     expect(ids.indexOf('modelStrategy')).toBeLessThan(ids.indexOf('capabilities'))
   })
 
+  it('keeps data maintenance as a nested route instead of a first-level rail section', () => {
+    expect(SETTINGS_SECTIONS.map(s => s.id)).not.toContain('dataMigration')
+    expect(sectionFromRouteParam('dataMigration')).toBe('dataMigration')
+    expect(isKnownSectionParam('dataMigration')).toBe(true)
+  })
+
   it('retires the obsolete approval-policy Safety section', () => {
     const ids = SETTINGS_SECTIONS.map(s => s.id)
     expect(ids).not.toContain('safety')
     expect(sectionFromRouteParam('safety')).toBe('provider')
     expect(isKnownSectionParam('safety')).toBe(false)
+  })
+
+  it('keeps Channels out of Settings while the router owns its legacy deep link', () => {
+    expect(SETTINGS_SECTIONS.map(s => s.id)).not.toContain('channels')
+    expect(sectionFromRouteParam('channels')).toBe('provider')
+    expect(isKnownSectionParam('channels')).toBe(false)
   })
 
   it('does not ship copy for retired approval-policy destinations', () => {
@@ -45,6 +57,18 @@ describe('settings section IA', () => {
     expect(en.settings.rail.provider).toBe('Model Service')
     expect(zhHans.settings.rail.provider).toBe('模型服务')
     expect(SETTINGS_SECTIONS.find(s => s.id === 'provider')?.label).toBe('Model Service')
+  })
+
+  it('keeps Memory & Profile as a first-level action panel outside global save state', () => {
+    const memory = SETTINGS_SECTIONS.find(s => s.id === 'memory')
+    expect(memory).toMatchObject({
+      label: 'Memory & Profile',
+      group: 'preferences',
+      client: true,
+      desktopOnly: false,
+    })
+    expect(en.settings.rail.memory).toBe('Memory & Profile')
+    expect(zhHans.settings.rail.memory).toBe('记忆与画像')
   })
 
   it('aliases stale Router and Ensemble deep links to Model Strategy', () => {

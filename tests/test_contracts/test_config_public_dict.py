@@ -131,7 +131,7 @@ def test_secret_keys_are_redacted_not_leaked(tmp_path, monkeypatch: pytest.Monke
 def test_privacy_carries_the_effective_network_observability_flag(
     public_config: GatewayConfig,
 ) -> None:
-    # to_public_dict injects the *effective* (config + env) network
-    # observability answer; the Web UI privacy panel reads this exact key.
+    # to_public_dict injects the unified config/dedicated-env answer. Legacy
+    # telemetry/update env vars must not make the UI imply correlation is off.
     privacy = public_config.to_public_dict()["privacy"]
     assert "network_observability_disabled_effective" in privacy

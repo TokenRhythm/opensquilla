@@ -407,13 +407,13 @@ class GatewayLifecycleManager:
                 ok=False,
                 code=DESKTOP_PROFILE_RECOVERY_REQUIRED,
                 message=(
-                    "Desktop gateway refused a config outside the selected profile. "
-                    "Choose or repair the profile through Desktop recovery."
+                    "Desktop gateway refused a config outside the primary profile. "
+                    "Repair the primary profile through Desktop before retrying."
                 ),
                 details={
                     "stableCode": DESKTOP_CONFIG_OUTSIDE_PROFILE,
                     "outcome": "recovery_required",
-                    "allowedActions": ["retry-primary", "launch-recovery-profile"],
+                    "allowedActions": ["retry-primary"],
                 },
                 exit_code_value=1,
             )

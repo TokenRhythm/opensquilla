@@ -210,7 +210,7 @@ class SandboxProxyServer:
             else:
                 await _write_response(
                     writer,
-                    _response(403, "Forbidden", b"Network access denied.\n"),
+                    _response(403, "Forbidden", _network_denial_body(decision)),
                 )
         except (
             TimeoutError,
@@ -254,7 +254,6 @@ class SandboxProxyServer:
         if self._decide is None:
             raise ValueError("missing_network_decider")
         return self._decide(request.host)
-
     async def _open_upstream(
         self,
         request: _ParsedRequest,
@@ -911,6 +910,13 @@ def _response(status_code: int, reason: str, body: bytes) -> bytes:
         "Connection: close\r\n"
         "\r\n"
     ).encode("ascii") + body
+
+
+def _network_denial_body(decision: NetworkDecision) -> bytes:
+    reason = " ".join(str(decision.reason or "").split())[:500]
+    if not reason or reason in {"denied", "not_allowed"}:
+        return b"Network access denied.\n"
+    return f"Network access denied: {reason}\n".encode("utf-8", errors="replace")
 
 
 __all__ = ["SandboxProxyServer"]

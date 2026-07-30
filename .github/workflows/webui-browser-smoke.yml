@@ -32,7 +32,17 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version-file: opensquilla-webui/.node-version
+          cache: npm
+          cache-dependency-path: opensquilla-webui/package-lock.json
+
+      - name: Install Web UI dependencies
+        working-directory: opensquilla-webui
+        run: npm ci
+
+      - name: Build and verify Web UI
+        working-directory: opensquilla-webui
+        run: npm run build
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v5

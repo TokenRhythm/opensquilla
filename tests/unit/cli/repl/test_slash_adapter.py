@@ -30,6 +30,24 @@ class _FakeGatewayClient:
     async def resolve_session(self, key: str) -> dict[str, Any]:
         raise AssertionError("resolve_session is not used by these tests")
 
+    async def bootstrap_session(
+        self,
+        key: str,
+        *,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        del limit
+        return {
+            "session": {"session_key": key, "model": "openai/test"},
+            "history": {
+                "messages": [],
+                "history_scope": "complete",
+                "loaded_count": 0,
+                "canonical_available": True,
+            },
+            "stream_cursor": 0,
+        }
+
     async def delete_sessions(self, keys: list[str]) -> dict[str, Any]:
         raise AssertionError("delete_sessions is not used by these tests")
 

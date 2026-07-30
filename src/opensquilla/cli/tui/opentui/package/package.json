@@ -7,14 +7,14 @@
     "start": "bun src/main.mjs",
     "smoke": "bun src/main.mjs --help",
     "test": "node --test --test-force-exit $(find src -name '*.test.mjs' ! -name '*.bun.test.mjs')",
-    "test:bun": "bun test src/*.bun.test.mjs",
+    "test:bun": "node scripts/run-bun-tests.mjs",
     "test:all": "npm run test && npm run test:bun"
   },
   "dependencies": {
-    "@opentui/core": "0.3.0"
+    "@opentui/core": "0.4.3"
   },
   "engines": {
-    "bun": ">=1.0.0",
+    "bun": "1.3.14",
     "node": ">=20.14"
   }
 }

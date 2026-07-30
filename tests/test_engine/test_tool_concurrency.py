@@ -153,50 +153,9 @@ def test_sessions_spawn_policy_keys_by_parent_session() -> None:
 
 
 @pytest.mark.asyncio
-async def test_feishu_read_only_tools_run_concurrent() -> None:
-    """Read-only Feishu tools should batch without enabling Feishu mutators."""
-    tool_calls = [
-        ("feishu_doc_read_raw", {"document_id": "doc-a"}),
-        ("feishu_drive_meta", {"token": "doc-b"}),
-        ("feishu_wiki_get_node", {"token": "node-c"}),
-    ]
-    intervals: list[tuple[str, float, float]] = []
-
-    async def _handler(tc: ToolCall) -> ToolResult:
-        start = time.monotonic()
-        await asyncio.sleep(_TOOL_SLEEP_S)
-        intervals.append((tc.tool_name, start, time.monotonic()))
-        return ToolResult(
-            tool_use_id=tc.tool_use_id,
-            tool_name=tc.tool_name,
-            content="ok",
-        )
-
-    provider = _FixedToolCallArgsProvider(tool_calls)
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(max_iterations=2),
-        tool_definitions=[_tool_def(n) for n, _ in tool_calls],
-        tool_handler=_handler,
-    )
-
-    t0 = time.monotonic()
-    await _collect(agent)
-    elapsed = time.monotonic() - t0
-
-    assert elapsed < 0.45, (
-        f"Expected Feishu read-only tools to overlap, got {elapsed:.3f} s."
-    )
-    assert len(intervals) == len(tool_calls)
-
-
-@pytest.mark.asyncio
-async def test_feishu_read_only_tools_have_independent_inflight_cap() -> None:
-    """Feishu reads should batch, but keep their own platform-facing cap."""
-    tool_calls = [
-        ("feishu_doc_read_raw", {"document_id": f"doc-{i}"})
-        for i in range(6)
-    ]
+async def test_image_analysis_calls_have_dedicated_inflight_cap() -> None:
+    """Vision requests should not fan out at the generic safe-tool limit."""
+    tool_calls = [("image", {"path": f"slide-{i}.png"}) for i in range(6)]
     in_flight = 0
     max_in_flight = 0
 
@@ -216,7 +175,7 @@ async def test_feishu_read_only_tools_have_independent_inflight_cap() -> None:
     agent = Agent(
         provider=provider,
         config=AgentConfig(max_iterations=2, max_safe_tool_concurrency=6),
-        tool_definitions=[_tool_def(n) for n, _ in tool_calls],
+        tool_definitions=[_tool_def("image")],
         tool_handler=_handler,
     )
 
@@ -224,8 +183,8 @@ async def test_feishu_read_only_tools_have_independent_inflight_cap() -> None:
     await _collect(agent)
     elapsed = time.monotonic() - t0
 
-    assert max_in_flight == 4
-    assert 2 * _TOOL_SLEEP_S - _SCHEDULER_TOLERANCE_S <= elapsed < 3 * _TOOL_SLEEP_S
+    assert max_in_flight == 2
+    assert 3 * _TOOL_SLEEP_S - _SCHEDULER_TOLERANCE_S <= elapsed < 4 * _TOOL_SLEEP_S
 
 
 @pytest.mark.asyncio

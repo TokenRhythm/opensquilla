@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+from opensquilla.execution_status import execution_status_for_tool_result
 from opensquilla.provider.anthropic import _build_message_payload
 from opensquilla.provider.openai import _build_openai_messages
 from opensquilla.provider.types import ContentBlockToolResult, Message
@@ -65,3 +66,36 @@ def test_openai_failure_tool_result_includes_bounded_execution_status_envelope()
     }
     assert tool_content["output"].startswith("failure details")
     assert len(tool_content["output"]) < len(large_output)
+
+
+def test_search_failure_status_projects_as_provider_visible_tool_error() -> None:
+    content = json.dumps(
+        {
+            "ok": False,
+            "error_kind": "auth",
+            "retry_allowed": False,
+            "results": [],
+        }
+    )
+    status = execution_status_for_tool_result("web_search", content)
+    assert status is not None
+    message = Message(
+        role="user",
+        content=[
+            ContentBlockToolResult(
+                tool_use_id="call_search_failure",
+                content=content,
+                is_error=False,
+                execution_status=status,
+            )
+        ],
+    )
+
+    anthropic_payload = _build_message_payload(message)
+    openai_payload = _build_openai_messages(message)
+    openai_content = json.loads(openai_payload[0]["content"])
+
+    assert anthropic_payload["content"][0]["is_error"] is True
+    assert openai_content["execution_status"]["status"] == "error"
+    assert openai_content["execution_status"]["reason"] == "search_auth"
+    assert json.loads(openai_content["output"])["ok"] is False

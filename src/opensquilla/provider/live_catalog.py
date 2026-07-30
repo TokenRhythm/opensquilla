@@ -19,7 +19,9 @@ corrections ladder (a relay's streaming dialect is not listing data).
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Iterable, Mapping
+from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -28,6 +30,7 @@ import structlog
 from opensquilla.env import trust_env as _trust_env
 
 from .app_attribution import provider_app_headers
+from .fx import TOKENRHYTHM_CNY_PER_USD
 from .model_catalog import DEFAULT_MAX_TOKENS as _NEAR_WINDOW_MARGIN
 from .registry import UnknownProviderError, get_provider_spec
 
@@ -41,8 +44,11 @@ LIVE_CATALOG_TIMEOUT_SECONDS = 5.0
 
 # TokenRhythm publishes CNY prices per billingUnit tokens (1M so far);
 # catalog costs are USD per-Mtok. Same documented conversion the packaged
-# corrections rows use (catalog_overrides.toml, ~6.975 CNY/USD).
-_TOKENRHYTHM_CNY_PER_USD = 6.975
+# corrections rows use (catalog_overrides.toml) and the billing receipts
+# record — one canonical rate in ``provider/fx.py``.
+_TOKENRHYTHM_CNY_PER_USD = float(TOKENRHYTHM_CNY_PER_USD)
+_TOKENRHYTHM_CNY_PER_USD_DECIMAL = TOKENRHYTHM_CNY_PER_USD
+_TOKENS_PER_MTOK = Decimal("1000000")
 
 
 def _coerce_positive_int(value: object) -> int:
@@ -70,20 +76,44 @@ def _coerce_positive_int(value: object) -> int:
 
 def _tokenrhythm_cost_per_mtok(value: object, billing_unit: object) -> float | None:
     """CNY-per-``billing_unit``-tokens (string or number) → USD per-Mtok."""
-    if billing_unit is None:
-        billing_unit = 1_000_000
     if not isinstance(value, (str, int, float)) or isinstance(value, bool):
         return None
     if not isinstance(billing_unit, (str, int, float)) or isinstance(billing_unit, bool):
         return None
     try:
-        price = float(value)  # the platform serves prices as strings
-        unit = float(billing_unit)
-    except ValueError:
+        price = Decimal(str(value).strip())
+        unit = Decimal(str(billing_unit).strip())
+    except (InvalidOperation, ValueError):
         return None
-    if price <= 0 or unit <= 0:
+    if not price.is_finite() or not unit.is_finite() or price < 0 or unit <= 0:
         return None
-    return round((price * (1_000_000 / unit)) / _TOKENRHYTHM_CNY_PER_USD, 4)
+    converted = (price * (_TOKENS_PER_MTOK / unit)) / _TOKENRHYTHM_CNY_PER_USD_DECIMAL
+    try:
+        result = float(converted)
+    except (OverflowError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _tokenrhythm_bucket_cost(
+    row: Mapping[str, Any],
+    *,
+    effective_key: str,
+    discount_key: str,
+    standard_key: str,
+    billing_unit: object,
+) -> float | None:
+    keys = [effective_key]
+    if row.get("hasDiscount") is True:
+        keys.append(discount_key)
+    keys.append(standard_key)
+    for key in keys:
+        if key not in row:
+            continue
+        cost = _tokenrhythm_cost_per_mtok(row.get(key), billing_unit)
+        if cost is not None:
+            return cost
+    return None
 
 
 def parse_tokenrhythm_models(payload: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
@@ -139,12 +169,33 @@ def parse_tokenrhythm_models(payload: Mapping[str, Any]) -> dict[str, dict[str, 
                     fields[field_name] = flag
         if str(row.get("currency") or "").strip().upper() == "CNY":
             billing_unit = row.get("billingUnit")
-            for listing_key, field_name in (
-                ("inputPrice", "input_cost_per_mtok"),
-                ("outputPrice", "output_cost_per_mtok"),
-                ("cacheReadPrice", "cache_read_cost_per_mtok"),
+            for effective_key, discount_key, listing_key, field_name in (
+                (
+                    "effectiveInputPrice",
+                    "discountInputPrice",
+                    "inputPrice",
+                    "input_cost_per_mtok",
+                ),
+                (
+                    "effectiveOutputPrice",
+                    "discountOutputPrice",
+                    "outputPrice",
+                    "output_cost_per_mtok",
+                ),
+                (
+                    "effectiveCacheReadPrice",
+                    "discountCacheReadPrice",
+                    "cacheReadPrice",
+                    "cache_read_cost_per_mtok",
+                ),
             ):
-                cost = _tokenrhythm_cost_per_mtok(row.get(listing_key), billing_unit)
+                cost = _tokenrhythm_bucket_cost(
+                    row,
+                    effective_key=effective_key,
+                    discount_key=discount_key,
+                    standard_key=listing_key,
+                    billing_unit=billing_unit,
+                )
                 if cost is not None:
                     fields[field_name] = cost
         if fields:

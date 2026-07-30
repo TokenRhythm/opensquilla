@@ -132,6 +132,62 @@ describe('appendEnsembleProgress', () => {
     })
   })
 
+  it('classifies a quorum-cancelled candidate as skipped instead of failed', () => {
+    const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0 }])
+
+    runtime.appendEnsembleProgress({
+      event_type: 'proposer_finish',
+      proposer_index: 3,
+      proposer_label: 'critic',
+      proposer_provider: 'openrouter',
+      proposer_model: 'z-ai/glm-5.2',
+      elapsed_ms: 21_000,
+      error: 'proposer cancelled after ensemble quorum grace',
+      error_code: 'quorum_cancelled',
+    })
+
+    const model = messagesRef.value.find(message => message.role === 'router')?.ensemble?.models[0]
+    expect(model).toMatchObject({
+      role: 'critic',
+      status: 'skipped',
+      elapsedMs: 21_000,
+      errorCode: 'quorum_cancelled',
+    })
+  })
+
+  it('narrowly recognizes the legacy quorum-grace message without matching embedded text', () => {
+    const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0 }])
+
+    runtime.appendEnsembleProgress({
+      event_type: 'proposer_finish',
+      proposer_index: 2,
+      proposer_label: 'legacy',
+      proposer_provider: 'openrouter',
+      proposer_model: 'legacy-model',
+      error: 'proposer cancelled after 5.5s ensemble quorum grace',
+    })
+    runtime.appendEnsembleProgress({
+      event_type: 'proposer_finish',
+      proposer_index: 3,
+      proposer_label: 'upstream',
+      proposer_provider: 'openrouter',
+      proposer_model: 'upstream-model',
+      error: 'upstream said: proposer cancelled after 5.5s ensemble quorum grace',
+    })
+
+    const models = messagesRef.value.find(message => message.role === 'router')?.ensemble?.models
+    expect(models?.[0]).toMatchObject({
+      model: 'legacy-model',
+      status: 'skipped',
+      errorCode: 'quorum_cancelled',
+    })
+    expect(models?.[1]).toMatchObject({
+      model: 'upstream-model',
+      status: 'failed',
+    })
+    expect(models?.[1]?.errorCode).toBeUndefined()
+  })
+
   it('attaches members to the existing live router message instead of duplicating it', () => {
     const existing: ChatMessage = {
       role: 'router',

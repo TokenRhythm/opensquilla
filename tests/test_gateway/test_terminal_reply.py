@@ -126,6 +126,15 @@ RAW_INTERNAL_STRINGS = (
             },
             "budget limit",
         ),
+        (
+            {
+                "status": "failed",
+                "terminal_reason": "error",
+                "error_class": "ensemble_multimodal_unsupported",
+                "error_message": "internal provider validation detail",
+            },
+            "single-model routing mode",
+        ),
     ],
 )
 def test_build_terminal_reply_returns_user_readable_messages(
@@ -156,6 +165,22 @@ def test_sandbox_pause_reply_is_distinct_from_generic_failure() -> None:
     )
     assert paused != generic
     assert "resume" in paused.lower()
+
+
+def test_ensemble_multimodal_reply_is_actionable_and_stable() -> None:
+    reply = build_terminal_reply(
+        {
+            "status": "failed",
+            "terminal_reason": "error",
+            "error_class": "ensemble_multimodal_unsupported",
+            "error_message": "raw detail must not win",
+        }
+    )
+
+    assert reply == (
+        "Ensemble does not support image input yet. "
+        "Switch to a single-model routing mode and try again."
+    )
 
 
 def test_build_terminal_reply_accepts_agent_task_record_like_objects() -> None:

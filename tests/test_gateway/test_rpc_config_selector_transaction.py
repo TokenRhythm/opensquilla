@@ -14,8 +14,10 @@ from opensquilla.gateway.rpc import RpcContext
 from opensquilla.gateway.rpc_config import (
     _handle_config_apply,
     _handle_config_patch,
+    _handle_config_reload,
     _handle_config_set,
 )
+from opensquilla.provider.model_catalog import ModelCatalog, set_shared_catalog
 
 
 class _RecordingSelector:
@@ -44,6 +46,92 @@ async def _mutate_model(kind: str, ctx: RpcContext, model: str) -> dict[str, Any
     payload = ctx.config.model_dump(mode="python")
     payload["llm"]["model"] = model
     return await _handle_config_apply({"config": payload}, ctx)
+
+
+async def _save_tokenrhythm_key(kind: str, ctx: RpcContext) -> None:
+    if kind == "set":
+        await _handle_config_set(
+            {"path": "llm.api_key", "value": "dummy-tokenrhythm-key"}, ctx
+        )
+        return
+    if kind == "patch":
+        await _handle_config_patch(
+            {"patches": {"llm.api_key": "dummy-tokenrhythm-key"}}, ctx
+        )
+        return
+    payload = ctx.config.model_dump(mode="python")
+    payload["llm"]["api_key"] = "dummy-tokenrhythm-key"
+    await _handle_config_apply({"config": payload}, ctx)
+
+
+@pytest.mark.parametrize("kind", ["set", "patch", "apply"])
+async def test_config_hot_apply_refreshes_when_live_catalog_key_becomes_available(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    fetches: list[tuple[str, str]] = []
+
+    async def fake_fetch(url: str, shape: str, **kwargs: Any) -> dict:
+        fetches.append((url, shape))
+        return {"qwen3.7-max": {"max_output_tokens": 131_072}}
+
+    monkeypatch.setattr(
+        "opensquilla.provider.live_catalog.fetch_live_catalog_entries",
+        fake_fetch,
+    )
+    config = GatewayConfig(
+        config_path=str(tmp_path / "config.toml"),
+        llm={"provider": "tokenrhythm", "model": "qwen3.7-max"},
+    )
+    catalog = ModelCatalog()
+    set_shared_catalog(catalog)
+    ctx = RpcContext(conn_id="test", config=config)
+
+    try:
+        await _save_tokenrhythm_key(kind, ctx)
+
+        assert fetches == [("https://tokenrhythm.studio/api/models", "tokenrhythm")]
+        assert catalog.resolve_entry("qwen3.7-max", provider="tokenrhythm").source == "live"
+        assert catalog.resolve_max_tokens("qwen3.7-max", provider="tokenrhythm") == 131_072
+
+        # Model and unrelated UI settings do not affect a public catalog fetch.
+        await _handle_config_set({"path": "llm.model", "value": "glm-5"}, ctx)
+        await _handle_config_set({"path": "naming.enabled", "value": False}, ctx)
+        assert len(fetches) == 1
+    finally:
+        set_shared_catalog(None)
+
+
+async def test_config_reload_is_explicit_live_catalog_retry(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[llm]\nprovider = "tokenrhythm"\nmodel = "qwen3.7-max"\n'
+        'api_key = "dummy-tokenrhythm-key"\n',
+        encoding="utf-8",
+    )
+    config = GatewayConfig.load(path)
+    catalog = ModelCatalog()
+    set_shared_catalog(catalog)
+    fetches: list[str] = []
+
+    async def fake_fetch(url: str, shape: str, **kwargs: Any) -> dict:
+        fetches.append(url)
+        return {"qwen3.7-max": {"max_output_tokens": 131_072}}
+
+    monkeypatch.setattr(
+        "opensquilla.provider.live_catalog.fetch_live_catalog_entries",
+        fake_fetch,
+    )
+
+    try:
+        result = await _handle_config_reload(None, RpcContext(conn_id="test", config=config))
+
+        assert result["ok"] is True
+        assert fetches == ["https://tokenrhythm.studio/api/models"]
+        assert catalog.resolve_entry("qwen3.7-max", provider="tokenrhythm").source == "live"
+    finally:
+        set_shared_catalog(None)
 
 
 @pytest.mark.parametrize("kind", ["set", "patch", "apply"])

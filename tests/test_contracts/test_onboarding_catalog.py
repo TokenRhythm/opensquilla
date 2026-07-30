@@ -48,6 +48,10 @@ PROVIDER_ENTRY_KEYS = frozenset(
         "verification",
         "envKey",
         "defaultBaseUrl",
+        # Deliberate additive credential-capability metadata: unlike
+        # requiresApiKey, this distinguishes optional API-key support from
+        # OAuth providers that do not accept an API key at all.
+        "acceptsApiKey",
         "requiresApiKey",
         "requiresBaseUrl",
         "routerSupported",
@@ -115,7 +119,7 @@ FROZEN_ROUTER_PROFILE_IDS = frozenset(
 # Curated presets that are NOT persistable tier_profile ids: packaged tier
 # data applied as inline tiers (synthesized=False on the wire, but the id
 # stays outside FROZEN_ROUTER_PROFILE_IDS).
-FROZEN_CURATED_INLINE_PRESET_IDS = frozenset({"tokenrhythm"})
+FROZEN_CURATED_INLINE_PRESET_IDS = frozenset({"qwen_token_plan", "tokenrhythm"})
 
 
 async def test_onboarding_catalog_top_level_sections_are_frozen() -> None:

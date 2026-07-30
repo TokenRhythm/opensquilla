@@ -42,7 +42,6 @@ _TOOL_GROUPS: Mapping[str, frozenset[str]] = {
             "create_pdf_report",
             "create_pptx",
             "create_xlsx",
-            "feishu_media_upload_artifact",
             "image",
             "image_generate",
             "audio_provider_capabilities",
@@ -62,9 +61,6 @@ _TOOL_GROUPS: Mapping[str, frozenset[str]] = {
     "channel:doc": frozenset(
         {
             "create_pdf_report",
-            "feishu_doc_create",
-            "feishu_doc_list_blocks",
-            "feishu_doc_read_raw",
             "web_discover",
             "web_fetch",
             "web_search",
@@ -72,9 +68,6 @@ _TOOL_GROUPS: Mapping[str, frozenset[str]] = {
     ),
     "channel:wiki": frozenset(
         {
-            "feishu_wiki_get_node",
-            "feishu_wiki_list_nodes",
-            "feishu_wiki_list_spaces",
             "web_discover",
             "web_fetch",
             "web_search",
@@ -86,13 +79,10 @@ _TOOL_GROUPS: Mapping[str, frozenset[str]] = {
             "create_pdf_report",
             "create_pptx",
             "create_xlsx",
-            "feishu_drive_meta",
-            "feishu_drive_search",
-            "feishu_drive_upload_artifact",
         }
     ),
-    "channel:scopes": frozenset({"feishu_scopes_status"}),
-    "channel:perm": frozenset({"feishu_perm_grant_member"}),
+    "channel:scopes": frozenset(),
+    "channel:perm": frozenset(),
     # Trusted host/gateway tools intentionally do not imply OS sandbox
     # execution. They remain addressable for explicit allow/deny policy so the
     # sandboxed-agent tool surface is not confused with operator-owned host

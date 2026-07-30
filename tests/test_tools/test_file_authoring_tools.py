@@ -10,13 +10,19 @@ from pptx import Presentation
 from pypdf import PdfReader
 
 from opensquilla.artifacts import ArtifactStore
+from opensquilla.tools.builtin import file_authoring
 from opensquilla.tools.builtin.file_authoring import (
     create_csv,
     create_pdf_report,
     create_pptx,
     create_xlsx,
 )
-from opensquilla.tools.types import CallerKind, ToolContext, current_tool_context
+from opensquilla.tools.types import (
+    CallerKind,
+    RetryableToolInputError,
+    ToolContext,
+    current_tool_context,
+)
 
 
 def _channel_artifact_context(tmp_path: Path) -> ToolContext:
@@ -123,6 +129,69 @@ async def test_create_pptx_publishes_channel_artifact(tmp_path: Path) -> None:
     slide = presentation.slides[0]
     assert slide.shapes.title.text == "Launch Readiness"
     assert "Group reply works" in slide.placeholders[1].text
+
+
+@pytest.mark.asyncio
+async def test_create_pptx_rejects_payload_that_fails_delivery_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _channel_artifact_context(tmp_path)
+    monkeypatch.setattr(
+        file_authoring,
+        "_normalize_zip_timestamps",
+        lambda _payload: b"not a PowerPoint package",
+    )
+    token = current_tool_context.set(ctx)
+    try:
+        with pytest.raises(RetryableToolInputError) as exc_info:
+            await create_pptx(
+                name="broken.pptx",
+                slides=[{"title": "Broken", "body": "This must not be published."}],
+            )
+    finally:
+        current_tool_context.reset(token)
+
+    assert "not attached" in exc_info.value.user_message
+    assert "regenerate" in exc_info.value.user_message.casefold()
+    assert ctx.published_artifacts == []
+    assert not (tmp_path / "media").exists()
+
+
+@pytest.mark.asyncio
+async def test_create_pptx_runs_delivery_validation_off_the_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    ctx = _channel_artifact_context(tmp_path)
+    validation_threads: list[threading.Thread] = []
+    real_validate = file_authoring.validate_artifact_for_delivery
+
+    def recording_validate(*args: object, **kwargs: object) -> None:
+        validation_threads.append(threading.current_thread())
+        real_validate(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        file_authoring,
+        "validate_artifact_for_delivery",
+        recording_validate,
+    )
+    loop_thread = threading.current_thread()
+    token = current_tool_context.set(ctx)
+    try:
+        result = await create_pptx(
+            name="offloaded.pptx",
+            slides=[{"title": "Offloaded", "body": "Validated off the loop."}],
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    payload = json.loads(result)
+    assert payload["status"] == "published"
+    assert validation_threads
+    assert all(thread is not loop_thread for thread in validation_threads)
 
 
 @pytest.mark.asyncio

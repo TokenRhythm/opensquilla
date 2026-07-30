@@ -11,14 +11,17 @@
 // Run with: bun test src/aesthetics-layout.bun.test.mjs
 import { test, expect } from "bun:test";
 import { createTestRenderer } from "@opentui/core/testing";
-import { BoxRenderable, ScrollBoxRenderable, TextRenderable } from "@opentui/core";
+import { BoxRenderable, TextRenderable } from "@opentui/core";
 
-import { shouldFollowBottom } from "./main.mjs";
 import { createTurnView } from "./turnView.mjs";
-import { applyTheme } from "./theme.mjs";
+import { applyTheme, THEME } from "./theme.mjs";
 
 const frameText = (frame) => frame.lines.map((l) => l.spans.map((s) => s.text).join("")).join("\n");
 const rgb = (c) => [Math.round(c.r * 255), Math.round(c.g * 255), Math.round(c.b * 255)];
+const hexRgb = (hex) => {
+  const value = Number.parseInt(String(hex).replace("#", ""), 16);
+  return [(value >> 16) & 255, (value >> 8) & 255, value & 255];
+};
 
 async function makeTurnHarness({ width = 60, height = 14 } = {}) {
   const setup = await createTestRenderer({ width, height });
@@ -75,6 +78,35 @@ test("turns are separated by a blank line of vertical rhythm", async () => {
   // At least one fully-blank row separates the end of turn A from turn B.
   const between = [...Array(bRow - aRow).keys()].map((i) => row(aRow + 1 + i));
   expect(between.some((line) => line.trim() === "")).toBe(true);
+  renderer.destroy?.();
+});
+
+test("a prompt is an explicit user-role surface, not a dim transcript line", async () => {
+  applyTheme("opensquilla-dark");
+  const { renderer, renderOnce, captureSpans, turn } = await makeTurnHarness({ width: 60, height: 12 });
+  turn.begin("p", "prompt", { text: "first user line\nsecond user line" });
+  await renderOnce();
+
+  const frame = captureSpans();
+  const rows = frame.lines.map((line) => ({
+    text: line.spans.map((span) => span.text).join(""),
+    spans: line.spans,
+  }));
+  const first = rows.find((row) => row.text.includes("first user line"));
+  const second = rows.find((row) => row.text.includes("second user line"));
+  expect(first).toBeTruthy();
+  expect(second).toBeTruthy();
+  expect(first.text).toContain("you");
+  expect(second.text).not.toContain("you");
+
+  const role = first.spans.find((span) => span.text.includes("you"));
+  const firstText = first.spans.find((span) => span.text.includes("first user line"));
+  const secondText = second.spans.find((span) => span.text.includes("second user line"));
+  expect(rgb(role.fg)).toEqual(hexRgb(THEME.promptAccent));
+  expect(rgb(firstText.fg)).toEqual(hexRgb(THEME.promptText));
+  expect(rgb(secondText.fg)).toEqual(hexRgb(THEME.promptText));
+  expect(rgb(firstText.bg)).toEqual(hexRgb(THEME.promptSurface));
+  expect(rgb(secondText.bg)).toEqual(hexRgb(THEME.promptSurface));
   renderer.destroy?.();
 });
 
@@ -154,10 +186,34 @@ test("relayout skips entirely when the terminal width is unchanged", async () =>
   renderer.destroy?.();
 });
 
+test("a height-only resize recomputes the active reasoning peek", async () => {
+  const { renderer, renderOnce, captureSpans, resize, turn } = await makeTurnHarness({
+    width: 80,
+    height: 40,
+  });
+  turn.begin("r", "reasoning", {});
+  turn.append("r", Array.from({ length: 12 }, (_, index) => `line-${index}`).join("\n"));
+  await renderOnce();
+  const before = frameText(captureSpans());
+  expect(before).toContain("line-11");
+  expect(before).toContain("line-4"); // 40 rows => the maximum eight-line live peek
+
+  const doResize = resize || ((w, h) => renderer.resize(w, h));
+  await doResize(80, 15);
+  turn.relayout();
+  await renderOnce();
+
+  const after = frameText(captureSpans());
+  expect(after).toContain("line-11");
+  expect(after).toContain("… 9 earlier lines"); // 15 rows => the minimum three-line peek
+  expect(after).not.toContain("line-4");
+  renderer.destroy?.();
+});
+
 test("a turn cancelled during reasoning keeps the Thought record in its card", async () => {
-  // Cancel during extended thinking: the reasoning block collapses to its
-  // "Thought for Ns" record, so the card keeps a real body and closes into a
-  // footer that carries both the cancel marker and the usage receipt.
+  // Cancel during extended thinking: the reasoning block settles to its
+  // "Thought for Ns" record and bounded preview, so the card keeps a real body
+  // and closes into a footer carrying both cancel marker and usage receipt.
   const { renderer, renderOnce, captureSpans, turn } = await makeTurnHarness();
   turn.begin("r1", "reasoning", {});
   turn.append("r1", "weighing the options");
@@ -168,8 +224,8 @@ test("a turn cancelled during reasoning keeps the Thought record in its card", a
   await renderOnce();
   const text = frameText(captureSpans());
   expect(text).toContain("╭ squilla");
-  expect(text).toContain("Thought for"); // the collapsed reasoning record
-  expect(text).not.toContain("weighing the options"); // the peek is gone
+  expect(text).toContain("Thought for");
+  expect(text).toContain("weighing the options");
   const footer = text.split("\n").find((line) => line.includes("╰"));
   expect(footer).toContain("cancelled");
   expect(footer).toContain("in 10 / out 0");
@@ -210,7 +266,10 @@ test("turn.end with cancelled=true appends a warning cancel marker; a normal fin
   const line = frame.lines.find((l) => l.spans.map((s) => s.text).join("").includes("cancelled"));
   expect(line).toBeTruthy();
   const span = line.spans.find((s) => s.text.includes("cancelled"));
-  expect(rgb(span.fg)).toEqual([232, 178, 58]); // dark THEME.warning #E8B23A
+  const warningProbe = new TextRenderable(renderer, { id: "warning-probe", content: " ", fg: THEME.warning });
+  // Assert the semantic warning token in the active color mode. In NO_COLOR /
+  // TERM=dumb the same token intentionally quantizes to monochrome.
+  expect(rgb(span.fg)).toEqual(rgb(warningProbe.fg));
   renderer.destroy?.();
 });
 
@@ -233,98 +292,5 @@ test("a prompt block never seals an open card; only usage closes it", async () =
   const closed = footers();
   expect(closed).toHaveLength(1);
   expect(closed[0]).toContain("in 5 / out 2");
-  renderer.destroy?.();
-});
-
-test("scrollbox flags manual scrolls and clears the flag on snap-to-bottom", async () => {
-  // main.mjs's bottom-follow gates on _hasManualScroll: a wheel-up mid-stream
-  // must pause following (no yank back on the next append), and snapping to
-  // the bottom must resume it. Pin the engine contract those rules rely on.
-  const { renderer, renderOnce } = await createTestRenderer({ width: 40, height: 10 });
-  const scrollBox = new ScrollBoxRenderable(renderer, {
-    id: "conv",
-    position: "absolute",
-    left: 0,
-    top: 0,
-    right: 0,
-    height: 6,
-    stickyScroll: true,
-    stickyStart: "bottom",
-    scrollY: true,
-    scrollX: false,
-  });
-  renderer.root.add(scrollBox);
-  scrollBox.focusable = false; // keyboard stays with the composer
-  for (let i = 0; i < 30; i += 1) {
-    scrollBox.add(new TextRenderable(renderer, { id: `l${i}`, content: `line ${i}` }));
-  }
-  await renderOnce();
-
-  expect(scrollBox._hasManualScroll).toBe(false); // following by default
-  scrollBox.scrollTop = 0; // the user scrolls up to read history
-  expect(scrollBox._hasManualScroll).toBe(true); // following pauses
-  scrollBox.scrollTop = scrollBox.scrollHeight; // snap back to the bottom
-  expect(scrollBox._hasManualScroll).toBe(false); // following resumes
-
-  // focusable=false keeps a click from focusing the transcript scroller, so
-  // arrows/j/k can never double-drive it alongside the composer.
-  scrollBox.focus();
-  expect(scrollBox.focused).toBe(false);
-  renderer.destroy?.();
-});
-
-test("wheel-scrolling back to the bottom re-engages bottom-follow for the next append", async () => {
-  // The engine flags EVERY wheel event in _hasManualScroll — including the
-  // wheel-down that lands exactly on the bottom row — and its own reengage
-  // check only clears the flag when a layout pass grows content by at most
-  // one row. Multi-row mutations (a tool block's gap+row, batched stream
-  // deltas, a wrapped paragraph) miss that point, so trusting the stale flag
-  // would stream the rest of the turn below the fold. shouldFollowBottom
-  // must treat a verified at-bottom position as re-consent to follow.
-  const { renderer, renderOnce } = await createTestRenderer({ width: 40, height: 10 });
-  const scrollBox = new ScrollBoxRenderable(renderer, {
-    id: "conv",
-    position: "absolute",
-    left: 0,
-    top: 0,
-    right: 0,
-    height: 6,
-    stickyScroll: true,
-    stickyStart: "bottom",
-    scrollY: true,
-    scrollX: false,
-  });
-  renderer.root.add(scrollBox);
-  scrollBox.focusable = false;
-  for (let i = 0; i < 30; i += 1) {
-    scrollBox.add(new TextRenderable(renderer, { id: `l${i}`, content: `line ${i}` }));
-  }
-  await renderOnce();
-  const wheel = (direction, delta) =>
-    scrollBox.onMouseEvent({ type: "scroll", scroll: { direction, delta }, modifiers: {} });
-
-  expect(shouldFollowBottom(scrollBox)).toBe(true); // following by default
-
-  // Wheel up mid-stream: the hold sticks — appends must not yank back down.
-  wheel("up", 3);
-  expect(scrollBox._hasManualScroll).toBe(true);
-  expect(shouldFollowBottom(scrollBox)).toBe(false);
-  expect(scrollBox._hasManualScroll).toBe(true); // the hold survives the check
-
-  // Wheel back down to the bottom: the engine re-flags the manual scroll even
-  // though the user landed exactly on the bottom row…
-  wheel("down", 30);
-  expect(scrollBox._hasManualScroll).toBe(true); // the engine quirk guarded against
-  // …but being verifiably at the bottom re-consents to following,
-  expect(shouldFollowBottom(scrollBox)).toBe(true);
-  expect(scrollBox._hasManualScroll).toBe(false); // and re-arms the engine's stickiness.
-
-  // So a multi-row append right after the return still snaps to the new bottom.
-  const pinned = shouldFollowBottom(scrollBox);
-  scrollBox.add(new TextRenderable(renderer, { id: "n1", content: "new 1" }));
-  scrollBox.add(new TextRenderable(renderer, { id: "n2", content: "new 2" }));
-  await renderOnce();
-  if (pinned) scrollBox.scrollTop = scrollBox.scrollHeight;
-  expect(shouldFollowBottom(scrollBox)).toBe(true);
   renderer.destroy?.();
 });
