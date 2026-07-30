@@ -6,10 +6,23 @@ import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 
-from .jobs import HandlerFn, _next_run, apply_reserved_result, execute_with_timeout
+from .jobs import (
+    HandlerFn,
+    _next_run,
+    apply_reserved_result,
+    execute_with_timeout,
+    notify_terminal_result,
+)
 from .persistence import JobStore
 from .stagger import spread_jobs
-from .types import CronJob, JobReservation, JobStatus, ScheduleKind, clear_reservation
+from .types import (
+    CronJob,
+    JobExecution,
+    JobReservation,
+    JobStatus,
+    ScheduleKind,
+    clear_reservation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -221,16 +234,28 @@ class SchedulerTimer:
         handler = self._handlers.get(job.handler_key)
 
         if handler is None:
+            error = f"No handler registered for key '{job.handler_key}'"
             await self._store.finalize_reserved_missing_handler(
                 job.id,
                 reservation.token,
-                error=f"No handler registered for key '{job.handler_key}'",
+                error=error,
             )
+            finished_at = datetime.now(UTC)
+            exe = JobExecution(
+                job_id=job.id,
+                started_at=finished_at,
+                finished_at=finished_at,
+                success=False,
+                error=error,
+            )
+            await self._store.save_execution(exe)
+            await notify_terminal_result(job, exe)
             return
 
         exe = await execute_with_timeout(job, handler)
         await self._store.save_execution(exe)
         await apply_reserved_result(job.id, reservation.token, exe, self._store)
+        await notify_terminal_result(job, exe)
 
     # ------------------------------------------------------------------
     # Main loop

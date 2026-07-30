@@ -526,6 +526,63 @@ async def test_remove_restores_identity_and_history_delete_keeps_project(
 
 
 @pytest.mark.asyncio
+async def test_remove_pauses_and_preserves_linked_cron_jobs(
+    workspace_ctx,
+    tmp_path,
+) -> None:
+    from opensquilla.gateway import rpc_workspaces
+
+    ctx, _storage = workspace_ctx
+    project = tmp_path / "linked-cron"
+    project.mkdir()
+    opened = (
+        await rpc_workspaces._handle_workspaces_open(
+            {"path": str(project), "trusted": True},
+            ctx,
+        )
+    )["workspace"]
+    linked = SimpleNamespace(
+        id="linked",
+        payload={
+            "_workspace_id": opened["id"],
+            "_workspace_name": opened["name"],
+        },
+    )
+    unrelated = SimpleNamespace(
+        id="unrelated",
+        payload={"_workspace_id": "other"},
+    )
+
+    class FakeScheduler:
+        def __init__(self) -> None:
+            self.updated: list[tuple[str, dict]] = []
+            self.paused: list[str] = []
+
+        async def list_jobs(self):
+            return [linked, unrelated]
+
+        async def update_job(self, job_id, **patch):
+            self.updated.append((job_id, patch))
+
+        async def pause_job(self, job_id):
+            self.paused.append(job_id)
+
+    scheduler = FakeScheduler()
+    ctx.cron_scheduler = scheduler
+
+    result = await rpc_workspaces._handle_workspaces_remove(
+        {"workspaceId": opened["id"]},
+        ctx,
+    )
+
+    assert result["pausedCronJobIds"] == ["linked"]
+    assert result["pausedCronJobCount"] == 1
+    assert scheduler.paused == ["linked"]
+    assert scheduler.updated[0][1]["payload"]["_workspace_unavailable"] == "removed"
+    assert linked.payload["_workspace_id"] == opened["id"]
+
+
+@pytest.mark.asyncio
 async def test_history_delete_maps_transactional_missing_to_workspace_not_found(
     workspace_ctx,
     monkeypatch: pytest.MonkeyPatch,

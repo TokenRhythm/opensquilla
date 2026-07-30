@@ -527,12 +527,22 @@ def test_delivery_sanitizes_reply_directives_across_cron_outputs() -> None:
             session_key=CRON_SESSION_KEY,
         )
     )
+    asyncio.run(
+        chain.notify_finished(
+            job,
+            success=True,
+            summary="[[reply_to_current]]Here is the scheduled reply",
+            session_key=CRON_SESSION_KEY,
+            run_id="run-1",
+        )
+    )
 
     assert report.channel_status == "delivered"
-    assert report.ws_status == "delivered"
+    assert report.ws_status == "skipped"
     assert report.session_status == "skipped"
     assert cm.adapter.sent[0].content == "Here is the scheduled reply"
     assert ws_events[0][2]["summary"] == "Here is the scheduled reply"
+    assert ws_events[0][2]["runId"] == "run-1"
     assert forward_calls == []
 
     forward_job = CronJob(

@@ -56,6 +56,7 @@
     "deleteHistoryFailed": "プロジェクトのタスク履歴を削除できませんでした: {error}",
     "removeTitle": "このプロジェクトを削除しますか？",
     "removeBody": "{name} はサイドバーから消えますが、タスク履歴とファイルは保持されます。",
+    "removeBodyWithCronJobs": "{name} はサイドバーから消えます。関連する {count} 件のスケジュールタスクは一時停止して保持され、再関連付けまたは削除を待ちます。タスク履歴とファイルは保持されます。",
     "removeConfirm": "プロジェクトを削除",
     "removeFailed": "プロジェクトを削除できませんでした: {error}"
   },

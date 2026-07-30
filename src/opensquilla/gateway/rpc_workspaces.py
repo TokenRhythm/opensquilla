@@ -183,8 +183,28 @@ async def _handle_workspaces_remove(
     workspace_id = _workspace_id(params)
     storage = _storage(ctx)
     await _active_workspace(storage, workspace_id)
+    scheduler = getattr(ctx, "cron_scheduler", None)
+    affected_job_ids: list[str] = []
+    if scheduler is not None:
+        jobs = await scheduler.list_jobs()
+        affected = [
+            job
+            for job in jobs
+            if (getattr(job, "payload", None) or {}).get("_workspace_id") == workspace_id
+        ]
+        for job in affected:
+            payload = dict(job.payload)
+            payload["_workspace_unavailable"] = "removed"
+            await scheduler.update_job(job.id, payload=payload)
+            await scheduler.pause_job(job.id)
+            affected_job_ids.append(job.id)
     await storage.remove_project_workspace(workspace_id)
-    return {"removed": True, "workspaceId": workspace_id}
+    return {
+        "removed": True,
+        "workspaceId": workspace_id,
+        "pausedCronJobIds": affected_job_ids,
+        "pausedCronJobCount": len(affected_job_ids),
+    }
 
 
 @_d.method("workspaces.history.delete", scope="operator.write")

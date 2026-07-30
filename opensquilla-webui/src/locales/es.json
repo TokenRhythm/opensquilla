@@ -56,6 +56,7 @@
     "deleteHistoryFailed": "No se pudo eliminar el historial de tareas: {error}",
     "removeTitle": "¿Quitar este proyecto?",
     "removeBody": "{name} desaparecerá de la barra lateral. Se conservarán el historial y los archivos.",
+    "removeBodyWithCronJobs": "{name} desaparecerá de la barra lateral. Se pausarán y conservarán {count} tarea(s) programada(s) vinculada(s) hasta que se vuelvan a vincular o se eliminen. Se conservarán el historial y los archivos.",
     "removeConfirm": "Quitar proyecto",
     "removeFailed": "No se pudo quitar el proyecto: {error}"
   },

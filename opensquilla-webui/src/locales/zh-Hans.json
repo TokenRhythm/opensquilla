@@ -56,6 +56,7 @@
     "deleteHistoryFailed": "无法删除项目任务历史：{error}",
     "removeTitle": "移除这个项目？",
     "removeBody": "{name} 将从侧栏消失，但任务历史和文件都会保留。",
+    "removeBodyWithCronJobs": "{name} 将从侧栏消失。关联的 {count} 个定时任务会被暂停并保留，等待重新绑定或删除；任务历史和文件都会保留。",
     "removeConfirm": "移除项目",
     "removeFailed": "无法移除项目：{error}"
   },

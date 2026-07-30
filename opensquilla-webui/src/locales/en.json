@@ -56,6 +56,7 @@
     "deleteHistoryFailed": "Could not delete project task history: {error}",
     "removeTitle": "Remove this project?",
     "removeBody": "{name} will disappear from the sidebar. Its task history and files will be preserved.",
+    "removeBodyWithCronJobs": "{name} will disappear from the sidebar. {count} linked scheduled task(s) will be paused and kept until you rebind or delete them. Task history and files will be preserved.",
     "removeConfirm": "Remove project",
     "removeFailed": "Could not remove the project: {error}"
   },

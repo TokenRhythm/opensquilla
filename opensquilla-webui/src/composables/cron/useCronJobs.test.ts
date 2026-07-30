@@ -11,9 +11,9 @@ describe('cron job recovery helpers', () => {
   })
 
   it('recognizes failed jobs for the retry action', () => {
-    expect(isJobFailed({ id: 'a', last_status: 'error' })).toBe(true)
-    expect(isJobFailed({ id: 'b', last_status: 'fail' })).toBe(true)
-    expect(isJobFailed({ id: 'c', last_status: 'ok' })).toBe(false)
+    expect(isJobFailed({ id: 'a', lastStatus: 'error', lastResult: 'boom', error_count: 1 })).toBe(true)
+    expect(isJobFailed({ id: 'b', lastStatus: 'fail', lastResult: 'boom', error_count: 1 })).toBe(true)
+    expect(isJobFailed({ id: 'c', lastStatus: 'ok', lastResult: null, error_count: 0 })).toBe(false)
   })
 
   it('suppresses duplicate completion toasts for the same recent run', () => {

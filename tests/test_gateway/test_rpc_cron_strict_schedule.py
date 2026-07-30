@@ -356,6 +356,78 @@ async def test_rpc_update_via_legacy_expression_returns_normalized_wire() -> Non
 
 
 @pytest.mark.asyncio
+async def test_legacy_text_only_update_preserves_workspace_and_template() -> None:
+    scheduler = _FakeScheduler()
+    scheduler.job = CronJob(
+        id="job-A",
+        name="project check",
+        cron_expr="0 9 * * *",
+        schedule_kind=ScheduleKind.CRON,
+        handler_key="agent_run",
+        payload={
+            "kind": AGENT_TURN_KIND,
+            "task": "before",
+            "agent_id": "main",
+            "_workspace_id": "project-123",
+            "_workspace_name": "Customer portal",
+            "_template_id": "project-risk",
+        },
+    )
+
+    await _handle_cron_update(
+        {"id": "job-A", "text": "changed"},
+        RpcContext(conn_id="test", cron_scheduler=scheduler),
+    )
+
+    assert scheduler.updated is not None
+    assert scheduler.updated["payload"]["task"] == "changed"
+    assert scheduler.updated["payload"]["_workspace_id"] == "project-123"
+    assert scheduler.updated["payload"]["_workspace_name"] == "Customer portal"
+    assert scheduler.updated["payload"]["_template_id"] == "project-risk"
+
+
+@pytest.mark.asyncio
+async def test_explicit_empty_workspace_unbinds_non_project_template() -> None:
+    scheduler = _FakeScheduler()
+    scheduler.job = CronJob(
+        id="job-A",
+        handler_key="agent_run",
+        payload={
+            "kind": AGENT_TURN_KIND,
+            "task": "daily brief",
+            "agent_id": "main",
+            "_workspace_id": "project-123",
+            "_workspace_name": "Customer portal",
+            "_template_id": "daily-ai-brief",
+        },
+    )
+
+    await _handle_cron_update(
+        {"id": "job-A", "workspaceId": ""},
+        RpcContext(conn_id="test", cron_scheduler=scheduler),
+    )
+
+    assert scheduler.updated is not None
+    assert "_workspace_id" not in scheduler.updated["payload"]
+    assert "_workspace_name" not in scheduler.updated["payload"]
+
+
+def test_job_to_wire_exposes_authoritative_last_status() -> None:
+    never_run = _job_to_wire(CronJob(id="never"))
+    failed = _job_to_wire(
+        CronJob(
+            id="failed",
+            last_run_at=SimpleNamespace(isoformat=lambda: "2026-07-30T10:00:00+00:00"),
+            last_error="boom",
+        )
+    )
+
+    assert never_run["lastStatus"] is None
+    assert failed["lastStatus"] == "error"
+    assert failed["last_status"] == "error"
+
+
+@pytest.mark.asyncio
 async def test_rpc_update_tz_only_recomputes_existing_cron_schedule() -> None:
     scheduler = _FakeScheduler()
     scheduler.job = CronJob(

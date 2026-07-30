@@ -56,6 +56,7 @@
     "deleteHistoryFailed": "Projektaufgabenverlauf konnte nicht gelöscht werden: {error}",
     "removeTitle": "Dieses Projekt entfernen?",
     "removeBody": "{name} verschwindet aus der Seitenleiste. Aufgabenverlauf und Dateien bleiben erhalten.",
+    "removeBodyWithCronJobs": "{name} verschwindet aus der Seitenleiste. {count} verknüpfte geplante Aufgabe(n) werden pausiert und bis zur erneuten Bindung oder Löschung beibehalten. Aufgabenverlauf und Dateien bleiben erhalten.",
     "removeConfirm": "Projekt entfernen",
     "removeFailed": "Projekt konnte nicht entfernt werden: {error}"
   },

@@ -7,7 +7,12 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from .jobs import HandlerFn, apply_reserved_result, execute_with_timeout
+from .jobs import (
+    HandlerFn,
+    apply_reserved_result,
+    execute_with_timeout,
+    notify_terminal_result,
+)
 from .ops import SchedulerOps
 from .parser import CronExpression
 from .persistence import JobStore
@@ -179,6 +184,7 @@ class SchedulerEngine:
 
     async def pause_job(self, job_id: str) -> CronJob | None:
         """Pause a job."""
+        self._timer.cancel_running(job_id)
         return await self._ops.pause(job_id)
 
     async def resume_job(self, job_id: str) -> CronJob | None:
@@ -228,6 +234,7 @@ class SchedulerEngine:
         exe = await execute_with_timeout(job, handler)
         await self._store.save_execution(exe)
         await apply_reserved_result(job.id, reservation.token, exe, self._store)
+        await notify_terminal_result(job, exe)
         return ManualRunResult(status=ManualRunStatus.ACCEPTED, execution=exe)
 
     # ------------------------------------------------------------------

@@ -58,8 +58,9 @@ export function useCronJobs() {
     const ts = job.last_run ? new Date(job.last_run) : null
     if (ts && !isNaN(ts.getTime()) && now.value - ts.getTime() < 24 * 3600 * 1000) {
       acc.runs += 1
-      if (job.last_status === 'ok' || job.last_status === 'success') acc.ok += 1
-      if (job.last_status === 'error' || job.last_status === 'fail') acc.err += 1
+      const lastStatus = job.lastStatus || job.last_status
+      if (lastStatus === 'ok' || lastStatus === 'success') acc.ok += 1
+      if (lastStatus === 'error' || lastStatus === 'fail') acc.err += 1
     }
     return acc
   }, { runs: 0, ok: 0, err: 0 }))
@@ -143,8 +144,8 @@ export function useCronJobs() {
   async function runJob(id: string) {
     runningJobIds.value = new Set(runningJobIds.value).add(id)
     try {
-      const res = await rpc.call<{ reply?: string; error?: string }>('cron.run', { id })
-      if (!wasCronFinishNotified(id)) {
+      const res = await rpc.call<{ runId?: string; reply?: string; error?: string }>('cron.run', { id })
+      if (!res?.runId || !wasCronFinishNotified(res.runId)) {
         if (res?.error) pushToast(t('cronSkills.jobs.toastRunFailed', { error: res.error }), { tone: 'danger' })
         else pushToast(res?.reply ? t('cronSkills.jobs.toastRunComplete', { reply: res.reply.substring(0, 120) }) : t('cronSkills.jobs.toastTriggered'), { tone: 'ok' })
       }
@@ -244,7 +245,7 @@ export function nextRunAbs(job: CronJob, now = Date.now()): string {
 
 export function dotClass(job: CronJob): string {
   if (!job.enabled) return 'is-off'
-  const lastStatus = job.last_status || (job.last_run ? 'ok' : null)
+  const lastStatus = job.lastStatus || job.last_status || (job.last_run ? 'ok' : null)
   if (lastStatus === 'error' || lastStatus === 'fail') return 'is-error'
   return 'is-on'
 }
@@ -275,5 +276,6 @@ export function isConnectionRecycleError(message: string): boolean {
 }
 
 export function isJobFailed(job: CronJob): boolean {
-  return job.last_status === 'error' || job.last_status === 'fail'
+  const status = job.lastStatus || job.last_status
+  return status === 'error' || status === 'fail'
 }

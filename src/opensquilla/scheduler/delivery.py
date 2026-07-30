@@ -131,23 +131,18 @@ class DeliveryChain:
         result_text = strip_reply_directives(result_text) or ""
         summary = strip_reply_directives(summary)
         ch_coro = self._deliver_channel(job, result_text, envelope, session_key)
-        ws_coro = self._notify_ws(
-            job,
-            success=success,
-            summary=summary,
-            session_key=session_key,
-        )
         fwd_coro = self._forward_to_session(job, result_text, session_key)
-        ch_result, ws_result, fwd_result = await asyncio.gather(
+        ch_result, fwd_result = await asyncio.gather(
             ch_coro,
-            ws_coro,
             fwd_coro,
             return_exceptions=True,
         )
 
         report = DeliveryReport()
         report.channel_status = ch_result if isinstance(ch_result, str) else "delivery_failed"
-        report.ws_status = ws_result if isinstance(ws_result, str) else "skipped"
+        # The scheduler emits the single authoritative terminal event only
+        # after execution history and final job state have been persisted.
+        report.ws_status = "skipped"
         report.session_status = fwd_result if isinstance(fwd_result, str) else "forward_failed"
         return report
 
@@ -164,6 +159,26 @@ class DeliveryChain:
             )
         except Exception:
             pass
+
+    async def notify_finished(
+        self,
+        job: CronJob,
+        *,
+        success: bool,
+        summary: str | None,
+        session_key: str,
+        run_id: str = "",
+        error: str | None = None,
+    ) -> str:
+        """Emit the scheduler-owned authoritative terminal event."""
+        return await self._notify_ws(
+            job,
+            success=success,
+            summary=summary,
+            session_key=session_key,
+            run_id=run_id,
+            error=error,
+        )
 
     async def _deliver_channel(
         self,
@@ -400,6 +415,8 @@ class DeliveryChain:
         success: bool,
         summary: str | None,
         session_key: str,
+        run_id: str = "",
+        error: str | None = None,
     ) -> str:
         if not self._ws_emitter:
             return "skipped"
@@ -410,7 +427,9 @@ class DeliveryChain:
             "jobName": job.name,
             "success": success,
             "summary": summary,
+            "error": error,
             "sessionKey": session_key,
+            "runId": run_id,
             "finishedAt": datetime.now(UTC).isoformat(),
         }
         try:

@@ -105,6 +105,7 @@ _KNOWN_HANDLER_KEYS = frozenset({"agent_run", "static_message", "system_event"})
 _PERSISTED_EXTENSION_KEYS = (
     "_workspace_id",
     "_workspace_name",
+    "_workspace_unavailable",
     "_template_id",
 )
 

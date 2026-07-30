@@ -557,6 +557,7 @@ const webConfigEnabled = getPlatform().capabilities.hasWebConfig
 interface AppCronRunFinishedPayload {
   jobId?: string
   jobName?: string
+  runId?: string
   success?: boolean
 }
 
@@ -565,9 +566,9 @@ let unsubscribeCronFinished: (() => void) | null = null
 function handleCronRunFinished(payload: unknown) {
   if (!payload || typeof payload !== 'object') return
   const event = payload as AppCronRunFinishedPayload
-  const jobId = typeof event.jobId === 'string' ? event.jobId : ''
+  const runId = typeof event.runId === 'string' ? event.runId : ''
   const jobName = event.jobName?.trim() || t('cronSkills.jobs.unnamedTask')
-  markCronFinishNotified(jobId)
+  markCronFinishNotified(runId)
   if (event.success === false) {
     pushToast(t('cronSkills.jobs.toastBackgroundFailed', { name: jobName }), {
       tone: 'danger',
@@ -1206,9 +1207,26 @@ async function onProjectRemove(workspaceId: string) {
   if (!rpcStore.canManageProjectWorkspaces) return
   const project = projectWorkspaces.byId.value.get(workspaceId)
   if (!project) return
+  let affectedCronJobs = 0
+  try {
+    const jobs = await rpcStore.call<Array<{ workspaceId?: string }>>(
+      'cron.list',
+      {},
+    )
+    affectedCronJobs = (jobs || []).filter(
+      job => job.workspaceId === workspaceId,
+    ).length
+  } catch {
+    // The backend still enforces the pause atomically during removal.
+  }
   const approved = await confirm({
     title: t('workspaces.removeTitle'),
-    body: t('workspaces.removeBody', { name: project.name }),
+    body: affectedCronJobs > 0
+      ? t('workspaces.removeBodyWithCronJobs', {
+          name: project.name,
+          count: affectedCronJobs,
+        })
+      : t('workspaces.removeBody', { name: project.name }),
     primaryLabel: t('workspaces.removeConfirm'),
   })
   if (!approved) return

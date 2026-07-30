@@ -5,7 +5,10 @@ export interface CronJob {
   status?: string
   next_run?: string
   last_run?: string
+  lastStatus?: string | null
   last_status?: string
+  lastResult?: string | null
+  error_count?: number
   expression?: string
   schedule?: string
   payloadKind?: string
@@ -24,6 +27,7 @@ export interface CronJob {
   agentId?: string
   workspaceId?: string
   workspaceName?: string
+  workspaceUnavailable?: boolean
   templateId?: string
   delivery?: DeliveryConfig
   originSessionKey?: string

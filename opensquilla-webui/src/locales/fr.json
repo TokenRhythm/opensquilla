@@ -56,6 +56,7 @@
     "deleteHistoryFailed": "Impossible de supprimer l’historique des tâches : {error}",
     "removeTitle": "Retirer ce projet ?",
     "removeBody": "{name} disparaîtra de la barre latérale. Son historique et ses fichiers seront conservés.",
+    "removeBodyWithCronJobs": "{name} disparaîtra de la barre latérale. {count} tâche(s) planifiée(s) liée(s) seront suspendues et conservées jusqu’à leur réassociation ou suppression. L’historique et les fichiers seront conservés.",
     "removeConfirm": "Retirer le projet",
     "removeFailed": "Impossible de retirer le projet : {error}"
   },

@@ -3794,9 +3794,19 @@ async def start_gateway_server(
         # FailureDestination at runtime. Without this wire the dispatch
         # plumbing is dead in production even though unit tests cover the
         # hook directly.
-        from opensquilla.scheduler.jobs import set_failure_dispatcher
+        from opensquilla.scheduler.jobs import set_failure_dispatcher, set_terminal_notifier
 
         set_failure_dispatcher(delivery_chain.dispatch_failure_alert)
+        set_terminal_notifier(
+            lambda job, execution: delivery_chain.notify_finished(
+                job,
+                success=execution.success,
+                summary=execution.summary,
+                session_key=execution.session_key,
+                run_id=execution.id,
+                error=execution.error,
+            )
+        )
 
         def _cron_workspace_resolver(agent_id: str) -> tuple[str | None, bool]:
             workspace_dir = resolve_agent_workspace_dir(agent_id, config)

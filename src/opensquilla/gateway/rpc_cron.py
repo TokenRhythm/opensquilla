@@ -82,6 +82,12 @@ def _job_to_wire(j: Any) -> dict[str, Any]:
         if hasattr(schedule_kind_value, "value")
         else str(schedule_kind_value)
     )
+    last_run = d.get("last_run_at")
+    last_status = (
+        "error"
+        if d.get("last_error")
+        else ("ok" if last_run is not None else None)
+    )
     return {  # noqa: PIE810 — wire schema favors flat literal dict
         "id": d.get("id"),
         "name": d.get("name", ""),
@@ -95,13 +101,16 @@ def _job_to_wire(j: Any) -> dict[str, Any]:
         "agentId": payload_agent_id(payload, "main"),
         "workspaceId": payload.get("_workspace_id", ""),
         "workspaceName": payload.get("_workspace_name", ""),
+        "workspaceUnavailable": bool(payload.get("_workspace_unavailable")),
         "templateId": payload.get("_template_id", ""),
         "status": status_str,
+        "lastStatus": last_status,
+        "last_status": last_status,
         "enabled": (
             bool(d.get("enabled", True)) and status_str not in ("paused", "disabled", "deleted")
         ),
         "next_run": _iso(d.get("next_run_at")),
-        "last_run": _iso(d.get("last_run_at")),
+        "last_run": _iso(last_run),
         "lastResult": d.get("last_error"),
         "run_count": d.get("run_count", 0),
         "error_count": d.get("error_count", 0),
@@ -139,6 +148,7 @@ async def _apply_workspace_binding(
     workspace_id = raw.strip() if isinstance(raw, str) else ""
     payload.pop("_workspace_id", None)
     payload.pop("_workspace_name", None)
+    payload.pop("_workspace_unavailable", None)
     if not workspace_id:
         return
     storage = get_session_storage(getattr(ctx, "session_manager", None))
@@ -290,6 +300,7 @@ def _manual_run_to_wire(result: Any) -> dict[str, Any]:
         return {
             "success": execution.success,
             "status": status_str,
+            "runId": execution.id,
             "reply": execution.summary,
             "error": execution.error,
             "duration_ms": (
@@ -844,6 +855,17 @@ async def _handle_cron_update(params: dict | None, ctx: RpcContext) -> dict[str,
             session_target,
             require_text=False,
         )
+        # Preserve trusted scheduler metadata when legacy clients rebuild only
+        # the task payload. Explicit workspace/template patches below remain
+        # authoritative and can replace or remove the inherited values.
+        for key in (
+            "_workspace_id",
+            "_workspace_name",
+            "_workspace_unavailable",
+            "_template_id",
+        ):
+            if key in current_job.payload:
+                payload[key] = current_job.payload[key]
         patch["handler_key"] = _handler_key_for_payload_kind(payload_kind_name)
         patch["payload"] = payload
         patch["session_target"] = session_target
@@ -865,6 +887,13 @@ async def _handle_cron_update(params: dict | None, ctx: RpcContext) -> dict[str,
             template_payload["_template_id"] = current_job.payload["_template_id"]
         _apply_template_contract(params, template_payload)
         patch["payload"] = template_payload
+
+    if "payload" in patch:
+        effective_template = patch["payload"].get("_template_id", "")
+        _apply_template_contract(
+            {"templateId": effective_template},
+            patch["payload"],
+        )
 
     if "timeout" in params:
         patch["timeout_seconds"] = float(params["timeout"])
